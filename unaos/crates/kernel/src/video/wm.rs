@@ -7756,17 +7756,97 @@ static BLIT_ACTIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::Atomic
 /// F4 — RAII registration for an in-flight composite. Constructed under the table lock (so it is
 /// ordered against teardown's own lock acquisition) and dropped when the blit is done, on every exit
 /// path including the early `!fb.is_ready()` return.
-struct BlitGuard;
+struct BlitGuard {
+    /// BLITWHO — the core this guard was entered on. Kept in the guard rather than re-read at drop
+    /// because a task-context holder can migrate mid-blit: the per-core net below is "live guards
+    /// ENTERED on this core", which is the reading the give-up arms need.
+    #[cfg(feature = "witness")]
+    core: usize,
+}
+
+/// BLITWHO — live-guard net per enter-core. At a give-up, the nonzero slot names the core whose
+/// holder never retired; all-zero with `BLIT_ACTIVE` nonzero is itself a verdict (a leaked guard —
+/// a holder killed off-CPU never runs its drop). Signed on purpose: an inconsistency would print as
+/// a negative rather than wrap silently.
+#[cfg(feature = "witness")]
+static BLIT_NET_CORE: [core::sync::atomic::AtomicI64; 8] = [
+    core::sync::atomic::AtomicI64::new(0),
+    core::sync::atomic::AtomicI64::new(0),
+    core::sync::atomic::AtomicI64::new(0),
+    core::sync::atomic::AtomicI64::new(0),
+    core::sync::atomic::AtomicI64::new(0),
+    core::sync::atomic::AtomicI64::new(0),
+    core::sync::atomic::AtomicI64::new(0),
+    core::sync::atomic::AtomicI64::new(0),
+];
+
+/// BLITWHO — the most recent enterer's task name (first 8 bytes of `sched::current_name()`, packed
+/// LE into one word; 0 = no task context) and core. `current_name()` is the one identity accessor
+/// both arch schedulers expose, and one atomic word cannot tear the way a (ptr,len) pair could.
+/// Last-writer-wins is enough: the depth the wire has measured is 3, and the give-up arm wants A
+/// name to start from, not the full set — the per-core net above carries the set.
+#[cfg(feature = "witness")]
+static BLIT_LAST_ENTER_NAME: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static BLIT_LAST_ENTER_CORE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// BLITWHO — pack a task name's first 8 bytes into a word for the atomic above.
+#[cfg(feature = "witness")]
+fn blitwho_pack_name(n: Option<&'static str>) -> u64 {
+    let mut w = 0u64;
+    if let Some(s) = n {
+        for (i, b) in s.as_bytes().iter().take(8).enumerate() {
+            w |= (*b as u64) << (i * 8);
+        }
+    }
+    w
+}
+
+/// BLITWHO — one line, printed only from the two give-up arms (never the hot path): the raw
+/// `BLIT_ACTIVE` word beside everything derived from it, the per-core net, and the last enterer.
+#[cfg(feature = "witness")]
+fn blitwho_report(spin_core: usize) {
+    let net: [i64; 8] = core::array::from_fn(|i| {
+        BLIT_NET_CORE[i].load(core::sync::atomic::Ordering::Relaxed)
+    });
+    let raw = BLIT_LAST_ENTER_NAME.load(core::sync::atomic::Ordering::Relaxed);
+    let bytes = raw.to_le_bytes();
+    let len = bytes.iter().position(|&b| b == 0).unwrap_or(8);
+    let name = core::str::from_utf8(&bytes[..len]).unwrap_or("?");
+    serial_println!(
+        ":: [wedge1] BLITWHO active={} net=[{},{},{},{},{},{},{},{}] last_enter={}@c{} spin_core={} ::",
+        BLIT_ACTIVE.load(core::sync::atomic::Ordering::Acquire),
+        net[0], net[1], net[2], net[3], net[4], net[5], net[6], net[7],
+        if name.is_empty() { "no-task" } else { name },
+        BLIT_LAST_ENTER_CORE.load(core::sync::atomic::Ordering::Relaxed),
+        spin_core
+    );
+}
 
 impl BlitGuard {
     fn enter() -> Self {
         BLIT_ACTIVE.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-        BlitGuard
+        #[cfg(feature = "witness")]
+        {
+            let core = crate::arch::sched::meter_current_cpu().min(7);
+            BLIT_NET_CORE[core].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            BLIT_LAST_ENTER_NAME.store(
+                blitwho_pack_name(crate::arch::sched::current_name()),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            BLIT_LAST_ENTER_CORE.store(core, core::sync::atomic::Ordering::Relaxed);
+            BlitGuard { core }
+        }
+        #[cfg(not(feature = "witness"))]
+        BlitGuard {}
     }
 }
 
 impl Drop for BlitGuard {
     fn drop(&mut self) {
+        #[cfg(feature = "witness")]
+        BLIT_NET_CORE[self.core].fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
         BLIT_ACTIVE.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
     }
 }
@@ -8275,6 +8355,12 @@ impl DrainBarrier {
                             DRAIN_PENDING.load(Ordering::Acquire),
                             spins
                         );
+                        // BLITWHO — name the holder while the stall is live. PA44 metal (2026-08-18)
+                        // photographed this arm with three candidate mechanisms still standing:
+                        // pinned-holder starved by this very spin, cross-core starvation, or a guard
+                        // leaked by an off-CPU kill. The per-core net + last-enterer discriminate.
+                        #[cfg(feature = "witness")]
+                        blitwho_report(crate::arch::sched::meter_current_cpu());
                     }
                 } else {
                     DRAIN_ABANDONED.fetch_add(1, Ordering::Relaxed);
@@ -8286,6 +8372,11 @@ impl DrainBarrier {
                             DRAIN_PENDING.load(Ordering::Acquire),
                             spins
                         );
+                        // BLITWHO — same discriminator on the teardown arm: boot5's multi-minute
+                        // vug-close freeze paid this bound serially with kill_offcpu=3 on the
+                        // ledger, which is the leak-shaped candidate this line can convict.
+                        #[cfg(feature = "witness")]
+                        blitwho_report(crate::arch::sched::meter_current_cpu());
                     }
                 }
                 break;
