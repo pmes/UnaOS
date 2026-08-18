@@ -8376,3 +8376,76 @@ F/G/H with no baseline), then for each of F, G and H in turn: its eleven `[v3d10
 `[v3d100] ref-digest` lines and the `[v3d100] ref-witness` summary, its head dumps, its
 `[v3d100] CONTENT ARITHMETIC` line, and finally its `VERDICT`. **The first leg whose verdict differs from
 leg E's is where content enters.**
+
+### 49.25 `bincontent`, read on metal — content enters at PRIMITIVE DISPATCH, and the wall has its smallest name yet (PI-V3D-100 verdict, boot11/PA48 reflight, 2026-08-18)
+
+#### 49.25.1 The capture, and what kind of boot it was
+
+Capture `pi4-pi0-b2/ttyACM1.log`, mark `R24 boot11` (2026-08-18T12:18Z), a cold power-cycle of the
+PA48 image (fp 1306708, `Loaded 0x13f054`). Boot10 — the first PA48 flight — was LOST to the stale
+reader-fd hazard (the ACM node re-enumerated and the reader held the dead descriptor); boot11 is its
+reflight and the hazard's fix is now process law. Eight CT0 kicks flew: legs A/B/C/D/E exactly as
+§49.20–§49.23 defined them, then F/G/H per §49.24. Every leg's V2a discipline held (violation pair
+read once, first), and the hygiene gate did its job at the end.
+
+#### 49.25.2 The verdicts, leg by leg
+
+| leg | list | verdict |
+|---|---|---|
+| E (empty control) | 14 B, production bases + armed prologue | **`OUTCOME E1`** — third consecutive boot. Closed, no fault, 20 pool words, 48 tile-state words. The content legs have their baseline |
+| F (state, NO prims) | 66 B: full fixed-function state + `GL_SHADER_STATE` | **`OUTCOME C2` — CLOSED-EMPTY.** `BFC` Δ1, no fault, wrote *exactly* the empty close's 20/48 words, refs 0/11 changed, collars 0. The whole state block — shader record included — is consumed without disturbing the close |
+| G (F + `VERTEX_ARRAY_PRIMS`, NULL coord shader) | 76 B | **FRAME NEVER CLOSED.** `waited=500000us` timeout; `BFC` Δ0; `CT0CA == EA` (list fully consumed); **`CT0PC=3`** (the CLE counted all three vertices' primitives); `PCS.BMACTIVE=1` held; **0 pool words, 0 tile-state words** (the close-time writes legs E/F both made were never made); `INT_STS=0x00010000` (the closing legs read `0x00000002` — the set bit is not the frame-done family; decode owed); no MMU fault; refs 0/11 changed; collars 0 |
+| H (one real triangle) | — | **STOOD DOWN** by the CT0-hygiene gate, correctly: leg G left a frame open, so H on a dirty CT0 would carry no information |
+
+#### 49.25.3 What boot11 proves
+
+**The wall statement, at its narrowest ever:** the bin frame stops closing **the instant a primitive
+dispatches**, and *before shader output matters* — leg G's coord shader is the NULL shader, a real
+dispatching thread that writes nothing to VPM, and the freeze is indifferent to that. Combined with
+leg F: every byte of fixed-function state plus the shader record parses and closes clean; adding the
+one `VERTEX_ARRAY_PRIMS` packet converts a closing frame into a dead-open one. And the failure is
+not a refusal — no fault latches, no referenced region is touched, the list is consumed to its end,
+and the primitive counter advances to 3. The machine accepts everything and then never finishes.
+
+Three prior readings are sharpened by this:
+
+- **§49.8 boot8's `m4` station is reproduced under full instrumentation** — `OUTCOME C3b`'s shape
+  with `CT0PC` NONZERO. Per §49.24's pre-written split, primitives-fed-with-no-output points at the
+  **PTB's primitive-to-list-bytes stage or the stations feeding it** (VCD attribute fetch → coord
+  thread → VPM → PTB), not at CLE parsing and not at the close stage.
+- **The close stage is fully exonerated** (§49.23–§49.24 already closed it; leg F re-proves it on
+  the same boot content fails on).
+- **Memory refusal is excluded as the mechanism**: 0/11 referenced regions changed and no fault —
+  the VCD either never issued its attribute reads, or issued them invisibly to every instrument we
+  hold. Which of those it is, is precisely the next rung's question.
+
+#### 49.25.4 The next rung: `dispatchdisc` (PI-V3D-101) — where between VCD and PTB does dispatch die?
+
+Leg G leaves exactly one span of pipeline in the dark: `VERTEX_ARRAY_PRIMS` accepted (CT0PC=3) →
+…nothing… → no pool/tile-state write, frame open. The stations inside that span: VCD attribute DMA,
+coord-thread launch on a QPU, VPM write-back, PTB intake. The two questions the baton names — *does
+the coord thread start?* and *does FLDONE wait on a VPM delivery the VCD never makes?* — are both
+answerable with the V3D performance-counter block (`PCTR`), which is ARM-readable, requires no new
+memory surface, and rides the proven leg G shape unchanged:
+
+- Program 4–8 `PCTR` slots before leg G's kick with sources covering: FEP valid primitives,
+  QPU active/instruction cycles (coord class), VCD/VCM events, and VPM writes. Read them after the
+  bounded wait, and read the SAME slots across legs E and F as in-boot zero-baselines.
+- Pre-written outcomes, one per span station: **D1** QPU cycles Δ0 ⇒ the coord thread NEVER LAUNCHES
+  (the wall is thread dispatch itself — shader-record fetch or TSDA); **D2** QPU Δ>0, VPM writes Δ0
+  ⇒ the thread runs and delivers nothing (NULL-shader leg reads this as CORRECT thread behavior —
+  re-run against leg H's real shader before concluding); **D3** VPM writes Δ>0, pool words 0 ⇒ the
+  PTB receives and discards — the wall is PTB intake; **D4** every counter Δ0 including FEP ⇒ the
+  CLE counted primitives it never forwarded, and CT0PC's meaning itself is the finding.
+- Also owed on the same boot, for free: decode `INT_STS=0x00010000` (one register read against the
+  databook's INT bit table) — if that bit names an error family, it may answer the rung before the
+  counters do.
+
+Knob `UNAOS_V3D_DISPATCHDISC=1`, feature `v3d_dispatchdisc`, implying `v3d_bincontent`'s chain,
+default OFF, same family law (the boot returns before `probe_job`; never beside QPU/DISPLAY_DONE
+sends). Image = **PA49**. Leg H remains stood down until G closes; the discriminator is measured on
+the leg that fails, not the leg that would.
+
+*Fold discipline note:* boot11 flew and was read the same sitting; this fold was written by the
+successor session (pi 1) from the capture per the baton's explicit no-folds-at-close order — the
+capture, not this prose, is the evidence of record.
