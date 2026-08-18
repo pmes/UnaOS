@@ -5614,6 +5614,122 @@ static CLICK_REPRESS_X86: AtomicU64 = AtomicU64::new(0);
 /// close line. The recovery itself is uncapped; only the serial line is.
 const CLICK_REPRESS_LOG_MAX_X86: u64 = 128;
 
+/// CLICK-BAND (GR27 Boot B): `[clickroute]` lines emitted for presses the FURNITURE bands consumed
+/// (`band=menu` / `band=dock`), against [`CLICK_BAND_LOG_MAX_X86`]. Before this, a press the crystal
+/// or dock arm consumed left no `[clickroute]` row at all — the router's own witness covered every
+/// WINDOW arm and the miss arm, so a band press was indistinguishable on the wire from a press that
+/// never reached the router, which is exactly the mis-read GR27's "menubar press inert" round was
+/// built on. One line per consumed band press, human-rate by construction, capped like the rest.
+#[cfg(feature = "wc")]
+static CLICK_BAND_LOG_X86: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "wc")]
+const CLICK_BAND_LOG_MAX_X86: u64 = 128;
+
+/// CLICK-BAND — the band witness: one bounded line naming WHICH band consumed the press and the
+/// outcome the band itself reported. Shares the `[clickroute] press` vocabulary so a capture greps
+/// one tag for every routed press, banded or windowed.
+#[cfg(feature = "wc")]
+fn clickband_witness(x: i32, y: i32, band: &str, outcome: &str) {
+    if CLICK_BAND_LOG_X86.fetch_add(1, Ordering::Relaxed) < CLICK_BAND_LOG_MAX_X86 {
+        serial_println!(
+            "[clickroute] press at ({},{}) band={} -> {} deliver=0",
+            x, y, band, outcome
+        );
+    }
+}
+
+/// CLICK-BAND fixture — **the band lines fire from the LIVE router, not only from the seams.**
+///
+/// `crystal::selftest` and `dock::selftest` call `press_at` directly, so before this leg no gate had
+/// ever driven [`wc_click_route_at`]'s crystal or dock ARM — the exact two arms whose silence GR27's
+/// "menubar press inert" round could not distinguish from a press that never arrived. Three presses
+/// through the real router, each owing one `band=` line ([`CLICK_BAND_LOG_X86`] is the count of lines
+/// OWED, so the assertion holds past the serial budget):
+///
+/// 1. **the crystal** — consumed by the menu band, outcome `open`.
+/// 2. **outside the open menu** — still the menu band (a modal dropdown owns every point while open),
+///    outcome `dismiss`. This is also what keeps the fixture side-effect-free: the press that would
+///    otherwise hit a window is spent dismissing.
+/// 3. **the dock strip's bottom-left corner** — the dock band, whatever outcome the tile layout gives
+///    that pixel (`background`/`raise`/`shell-reopen`). A `shell-reopen` latch is drained so a later
+///    desktop loop cannot service a reopen no operator asked for.
+///
+/// Every press is paired with its release through the same router, so the mask latch leaves as it
+/// arrived; the bar is restored to its prior state.
+#[cfg(all(feature = "witness", feature = "wc"))]
+fn clickband_selftest() {
+    use core::sync::atomic::AtomicBool;
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let (pw, ph) = {
+        let info = crate::video::WRITER.lock().info();
+        (info.width, info.height)
+    };
+    let saved_bar = crate::video::menubar::enabled();
+    crate::video::menubar::set_enabled(true);
+    // A clean edge for the first press — the precedent every routing fixture above follows.
+    CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+
+    let press = |x: i32, y: i32| -> bool {
+        let hit = wc_click_route_at(crate::pal::Event::Button(1), x, y);
+        let _ = wc_click_route_at(crate::pal::Event::Button(0), x, y);
+        hit
+    };
+    let n0 = CLICK_BAND_LOG_X86.load(Ordering::Relaxed);
+
+    // Leg 1 — the crystal, through the router: menu band, outcome `open`.
+    let (menu_hit, menu_out) = match crate::video::menubar::crystal_box_abs(pw, ph) {
+        Some((cx, cy, cw, ch)) => {
+            let hit = press((cx + cw / 2) as i32, (cy + ch / 2) as i32);
+            (hit, crate::video::crystal::last_press_outcome())
+        }
+        None => (false, "no-crystal"),
+    };
+
+    // Leg 2 — outside the open menu: still the menu band, outcome `dismiss`. `(pw-1, ph/2)` is
+    // outside the dropdown (it hangs at the panel's left) and, spent on the dismissal, reaches no
+    // window arm.
+    let out_hit = press((pw - 1) as i32, (ph / 2) as i32);
+    let out_out = crate::video::crystal::last_press_outcome();
+
+    // Leg 3 — the dock band, at the strip's CENTRE. On an emptied dock the one tile there is the
+    // PINNED shell tile (the console's way back), so this press latches `SHELL_REOPEN` — and the
+    // SCHED-X86 render loop's `take_shell_reopen` (main.rs) races this selftest on another core and
+    // could win that latch mid-ladder, reopening a shell and moving focus before `wmdirect_selftest`
+    // runs: deterministic arming, probabilistic flake. So the latch is drained UNCONDITIONALLY the
+    // instant the press edge returns — before the outcome read and before the release — closing the
+    // window to nothing the render loop can service. The `band=dock` line and the outcome word
+    // (`shell-reopen`, the true routing result) are unaffected; only the side effect is disarmed.
+    let (dock_hit, dock_out) = match crate::video::dock::strip_rect(pw, ph) {
+        Some((dx, dy, dw, dh)) => {
+            let hit = wc_click_route_at(crate::pal::Event::Button(1), (dx + dw / 2) as i32, (dy + dh / 2) as i32);
+            let _ = crate::video::dock::take_shell_reopen();
+            let _ = wc_click_route_at(crate::pal::Event::Button(0), (dx + dw / 2) as i32, (dy + dh / 2) as i32);
+            (hit, crate::video::dock::last_press_outcome())
+        }
+        None => (false, "no-dock"),
+    };
+
+    crate::video::menubar::set_enabled(saved_bar);
+    CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+    CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+
+    let owed = CLICK_BAND_LOG_X86.load(Ordering::Relaxed) - n0;
+    let ok = menu_hit
+        && menu_out == "open"
+        && out_hit
+        && out_out == "dismiss"
+        && dock_hit
+        && owed == 3;
+    serial_println!(
+        ":: CLICK-BAND: routed menu={}({}) outside={}({}) dock={}({}) band_lines={} :: {} ::",
+        menu_hit, menu_out, out_hit, out_out, dock_hit, dock_out, owed,
+        if ok { "PASS" } else { "FAIL" }
+    );
+}
+
 /// CLICK-X86: `(presses, delivered)` — every press edge the router judged, and how many of them were
 /// addressed to a ring-3 ring. The difference is the count of presses that belonged to the shell.
 pub fn click_stats() -> (u64, u64) {
@@ -6423,11 +6539,31 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
     if mask & !prev != 0 || repress {
         // PRESS edge (or a recovered stationary re-press — see CLICK-REPRESS above).
         CLICK_PRESSES.fetch_add(1, Ordering::Relaxed);
+<<<<<<< HEAD
         // FURNITURE — **the crystal menu, then the dock, both ahead of EVERY window arm**, because
         // both are composited on top of the window layer and the painter that owns the pixel owns the
         // press. `wm::hit_test` knows nothing of either strip: it answers from the window table, and a
         // window lying under the dock would take a press the operator can see landed on a dock tile.
         // Asking furniture first is the chrome arm's own ordering rule, one layer up.
+=======
+        // CRYSTAL — **judged FIRST, ahead of the dock and every window arm.** The SHARD menu, when
+        // open, is a modal dropdown composited on top of everything, so its press must be tested
+        // before any layer beneath it; when closed, the only point it claims is the crystal box in
+        // the menu bar, which the bar owns anyway (the bar composites above the windows). It declines
+        // every other point (`false`), so the dock and window arms are not starved. Consumed with the
+        // target set to DROP so the matching RELEASE is dropped rather than delivered into whatever
+        // holds focus — the rule the dock, close and chrome arms below already follow.
+        #[cfg(feature = "wc")]
+        if crate::video::crystal::press_at(x, y) {
+            // CLICK-BAND — the band + outcome on the router's own witness, so a consumed menu press
+            // is distinguishable on the wire from a press that never reached the router (the GR27
+            // "menubar press inert" mis-read).
+            clickband_witness(x, y, "menu", crate::video::crystal::last_press_outcome());
+            CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+            return true;
+        }
+        // DOCK — **judged before EVERY window arm, because the dock is composited on top of them.**
+>>>>>>> origin/UnaOS-gemini
         //
         // Neither side can be starved. The crystal declines every point but the open dropdown and the
         // crystal box in the bar (which the bar owns anyway); the dock declines every point outside
@@ -6452,7 +6588,13 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
         // delivered into whatever holds focus after the raise — the rule the close and chrome arms
         // below already follow for the same reason.
         #[cfg(feature = "wc")]
+<<<<<<< HEAD
         if crate::video::strip::press_route(x, y) {
+=======
+        if crate::video::dock::press_at(x, y) {
+            // CLICK-BAND — as the menu arm above: band + outcome, bounded.
+            clickband_witness(x, y, "dock", crate::video::dock::last_press_outcome());
+>>>>>>> origin/UnaOS-gemini
             CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
             return true;
         }
@@ -16284,6 +16426,13 @@ fn winx_launcher(demo_cpu: usize) {
     // own proof). See `crystal::selftest`.
     #[cfg(all(feature = "witness", feature = "wc"))]
     crate::video::crystal::selftest();
+    // CLICK-BAND — the band witness, PROVEN able to fire. `crystal::selftest` and `dock::selftest`
+    // both call their `press_at` seams DIRECTLY, so nothing in the battery drove the ROUTER's band
+    // arms — the very lines GR27's "menubar press inert" round was missing would themselves have
+    // been unfired witnesses. This drives `wc_click_route_at` (the live seam) at the crystal, at a
+    // point outside the open menu, and at the dock strip, and asserts one `band=` line per press.
+    #[cfg(all(feature = "witness", feature = "wc"))]
+    clickband_selftest();
     // WMDIRECT — third and last of the click family, and deliberately last: it MOVES a row (a drag
     // is a `move_to`, which pins the row against the tiler) and closes it under a live drag, so it
     // is the most disruptive of the three. Running it after the other two means neither of them can

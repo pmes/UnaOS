@@ -1647,14 +1647,45 @@ fn budget_left(i: usize) -> bool {
 /// from `wm::present`, after the table lock is dropped and before the composite.
 pub fn on_present(id: u32, surf: usize, surf_len: usize) {
     let i = id as usize;
+    if i >= IDS {
+        return;
+    }
+    // WCG-CHUNK — a part-paid chunked sample keeps the `app` leg live past the last budget spend:
+    // sample 4 spends `TAKEN` at its FIRST chunk, so `budget_left` goes false while the cursor is
+    // still mid-box, and without this the leg would go dark for the rest of that sample's chunks.
+    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    let live = budget_left(i) || WCG_CUR[i].load(Ordering::Relaxed) != 0;
+    #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
+    let live = budget_left(i);
     // WC-G/M3 — `paygo_arm` is the deferral gate's other end, and it is not an optimisation: without
     // it this checksum would run on every present for the whole deferral window, because a deferred
     // window's budget stays unspent and `budget_left` therefore stays true. See [`paygo_arm`]. It is
     // `true` and folds away on every build but an x86 `wcg-paygo` one.
-    if i >= IDS || !budget_left(i) || !paygo_arm(i) {
+    if !live || !paygo_arm(i) {
+        return;
+    }
+    // WCG-CHUNK — full-coverage samples (everything past sample 1) are paid in chunks, so the `app`
+    // leg checksums the BAND the next chunk will bracket rather than the whole surface. This is not
+    // only symmetry with [`begin`]'s band trio — it is the cost cap that makes chunking viable at
+    // all: a chunked sample of the console window spans hundreds of PRESENTS, and a full-surface
+    // FNV here would put ~5.7 ms back on every one of them, which is the disease relocated rather
+    // than removed. The offset is published beside the hash so `begin` can refuse to compare hashes
+    // of different bytes — see [`APP_OFF`].
+    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    if TAKEN[i].load(Ordering::Relaxed) > 0 {
+        let cur = WCG_CUR[i].load(Ordering::Relaxed) as usize;
+        let lo = cur.min(surf_len);
+        let hi = cur.saturating_add(WCG_CHUNK_BYTES).min(surf_len);
+        let cks =
+            if surf == 0 { FNV_BASIS } else { checksum(surf + lo, hi.saturating_sub(lo)) };
+        APP_CKS[i].store(cks, Ordering::Relaxed);
+        APP_OFF[i].store(cur as u64, Ordering::Relaxed);
+        APP_SEQ[i].fetch_add(1, Ordering::Relaxed);
         return;
     }
     APP_CKS[i].store(checksum(surf, surf_len), Ordering::Relaxed);
+    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    APP_OFF[i].store(u64::MAX, Ordering::Relaxed);
     APP_SEQ[i].fetch_add(1, Ordering::Relaxed);
 }
 
@@ -1685,6 +1716,17 @@ pub struct Probe {
     /// field is off the aarch64 wire that `pi4-regression.spec` reads.
     #[cfg(target_arch = "x86_64")]
     occ_before: super::wm::OccSnap,
+    /// WCG-CHUNK — this probe is one CHUNK of a full-coverage sample: the checksums walked
+    /// `band_off..band_off + band_len` of the surface, the read-back resumes at the row that offset
+    /// names, and [`end`] banks rather than prints unless the chunk closes the sample or convicts.
+    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    chunk: bool,
+    /// WCG-CHUNK — the band's byte offset into the surface (0 and `surf_len` for an unchunked
+    /// sample, so every non-chunk path reads the whole surface exactly as before).
+    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    band_off: usize,
+    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    band_len: usize,
 }
 
 // ---- WC-G/M3 — the glass read-back, and paying for it as it is used ----------------------------
@@ -1703,6 +1745,13 @@ pub struct Probe {
 /// and any x86 build without the `wcg-paygo` knob — which makes the lattice arithmetic fold away to
 /// the original `for col in 0..cols` loop. See [`paygo_open`] for what a `step > 1` pass is and, on
 /// the module note, for what it can and cannot catch.
+///
+/// WCG-CHUNK — `row0..row_cap` is the source-row window THIS invocation may walk and `bounded` arms
+/// the time stop; the walk reports how far it actually got (`rows_done`) and the box's whole extent
+/// (`rows_total`), so [`end`] can advance the cursor and tell a chunk that closed its band from one
+/// that closed the box. Every path that existed before the chunking passes `(0, usize::MAX, false)`
+/// — the clamp folds to `rows`, the stop is compiled out or dead, and the walk is the old one byte
+/// for byte.
 #[allow(clippy::too_many_arguments)]
 fn readback(
     fb: &FrameBuffer,
@@ -1717,9 +1766,14 @@ fn readback(
     stride: usize,
     scale: usize,
     step: usize,
+    row0: usize,
+    row_cap: usize,
+    bounded: bool,
     #[cfg(target_arch = "x86_64")] occ_before: super::wm::OccSnap,
     #[cfg(target_arch = "x86_64")] occ_after: super::wm::OccSnap,
-) -> (usize, usize, usize, usize) {
+) -> (usize, usize, usize, usize, usize, usize) {
+    #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
+    let _ = bounded;
     let mut checked = 0usize;
     let mut bad = 0usize;
     // GR21/WCD-OCC — probes that mismatch AND lie under a higher window. Charged to neither `bad`
@@ -1730,7 +1784,7 @@ fn readback(
     #[cfg(not(target_arch = "x86_64"))]
     let occluded = 0usize;
     if x >= pw || y >= ph || scale == 0 || stride < 4 || step == 0 {
-        return (bad, checked, step, occluded);
+        return (bad, checked, step, occluded, row0, 0);
     }
     let cols = (pw - x).div_ceil(scale).min(w).min(stride / 4);
     let rows = (ph - y).div_ceil(scale).min(h).min(surf_len / stride);
@@ -1748,7 +1802,32 @@ fn readback(
     // is derived from what the walk actually did rather than from what was asked for — the same rule
     // that put the step in a static rather than recomputing it in `end`.
     let step = if cols < step { 1 } else { step };
-    for row in 0..rows {
+    // WCG-CHUNK — the walk's window, and its progress report. `r1` clamps the ask to the box;
+    // `rows_done` starts at the plan and is pulled back by the time stop. With `row0 = 0` and an
+    // uncapped `row_cap` this is `0..rows`, the loop this always was.
+    let r1 = rows.min(row_cap);
+    // `mut` is dead where the time stop folds away (aarch64, x86 without the knob) — allowed rather
+    // than cfg-forked, so the binding stays one line on every build.
+    #[allow(unused_mut)]
+    let mut rows_done = r1.max(row0);
+    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    let t_walk0 = now_cycles();
+    for row in row0..r1 {
+        // WCG-CHUNK — the time stop. Whole rows only (checked between rows, never mid-row, so an
+        // upscale cell is always probed whole), and at least one row per chunk (`row > row0`) so a
+        // chunk always makes progress and the cursor cannot wedge. WALL time, deliberately: on
+        // metal a Kepler-BAR row of the console costs ~0.8 ms and a chunk stops after two or three
+        // rows; under QEMU the probes are RAM reads and [`WCG_CHUNK_BYTES`]' row cap is what sets
+        // the chunk size instead — either way no composite holds the gate past ~[`WCG_CHUNK_US`]
+        // plus one row's overshoot.
+        #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+        if bounded
+            && row > row0
+            && cycles_to_us(now_cycles().saturating_sub(t_walk0)) >= WCG_CHUNK_US
+        {
+            rows_done = row;
+            break;
+        }
         let row_base = row * stride;
         let dy = y + row * scale;
         // PAYGO — the lattice's per-row phase. A full pass (`step == 1`) starts at column 0, which is
@@ -1798,7 +1877,7 @@ fn readback(
             col += step;
         }
     }
-    (bad, checked, step, occluded)
+    (bad, checked, step, occluded, rows_done, rows)
 }
 
 /// WC-G/M3 (x86 only) — a one-word window over the WC-mapped glass, so a destination row's probes
@@ -2121,15 +2200,146 @@ static PAYGO_LASTCENSUS: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
 static PAYGO_CLOSED: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 
+// ---- WCG-CHUNK — the full-coverage glass read-back, paid in time-bounded chunks -----------------
+
+/// WCG-CHUNK — the wc-g half of the GR27 launch-stall law: no composite pass may hold the gate —
+/// IRQs masked, on the presenting app's own core — for an unbounded glass read-back.
+///
+/// Boot A/Ab (metal, 2026-08-12) measured this instrument's own full-coverage passes on the console
+/// window at `readback_us=488744..732797` PER witnessed present (`wit_us=1616524` over the battery)
+/// — the same disease the wc-d stage-2 verify had at ~1.26 s, one instrument over, and the launch
+/// arc's commit (24ac6b79) named it for this one. The cost hides in the boot burst today only
+/// because the fixtures pre-pay the slots; any live full sample lands it on a present.
+///
+/// So a FULL-coverage sample (samples 2..[`SAMPLES`], the ones the deferral gate matures) is now
+/// paid in CHUNKS: each admitted blit brackets a BAND of the surface — the checksums walk the band's
+/// bytes, the read-back walks the band's rows from a per-id resume cursor for at most this many
+/// microseconds (whole source rows, at least one) — banks the clean counts, and hands the budget
+/// back; the sample line prints ONCE, cumulative, when the cursor closes the box, so the wire keeps
+/// one line per sample and every gate pattern its shape. An exceptional chunk (COHER, RACE, BLIT)
+/// prints immediately, chunk-local, ` band=` naming the rows it walked, and closes the sample the
+/// way one bad verdict always has. Sample 1 keeps its LATTICE single pass — the small term (~100 ms
+/// on the console, against ~600+ ms per full pass) and the shape x86-witness.spec REQUIREs first
+/// (`seq=0 … coverage=lattice16`) — exactly as wc-d's stage 1 kept its band-clipped single pass.
+/// aarch64 and non-paygo x86 are the old walk byte for byte.
+///
+/// Unlike wc-d, NO band-containment decline is needed: wc-d's reference is frozen pre-blit for the
+/// band the present offered, but wc-g re-derives `want` from the LIVE surface at read-back time, and
+/// the compositor's contract is that the glass agrees with the surface after every composite — so
+/// any admitted composite can carry a chunk over any rows, and progress rides every present.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+const WCG_CHUNK_US: u64 = 2_000;
+
+/// WCG-CHUNK — the per-chunk CHECKSUM band, in bytes. Two jobs, mirroring `wm::WCD_CHUNK_ROWS_MAX`:
+///
+/// * it bounds what the `blit`/`civac`/`after` legs (and [`on_present`]'s `app` leg) walk per chunk.
+///   The trio is cacheable RAM at ~1.5 ns/byte, so 32 KiB is ~50 us per leg — noise against the
+///   glass walk the time stop governs — where re-running the FULL-surface trio per chunk would have
+///   put ~17 ms of RAM reads on every chunk of the console window and multiplied the total checksum
+///   work by the chunk count. The legs adjudicate the SAME questions band-scoped: `blit != civac`
+///   is an alias-attribute mismatch in the band, `blit != after` is the owner writing the band
+///   mid-copy — which is exactly the race that would invalidate this chunk's `want` re-derivation —
+///   and across the battery the cursor covers every byte of the surface. What narrows is only the
+///   incidental wider net (a mid-copy write to rows this chunk is NOT verifying), and those rows
+///   get their own bracket when their chunk arrives.
+/// * it caps the read-back rows a chunk may claim on hosts where probes are RAM-fast and the time
+///   stop never fires (QEMU): `32 KiB / stride` rows — six rows of the 1312-px console, a whole box
+///   for anything smaller — each still a bounded hold.
+///
+/// The widest panel this kernel drives is 8192 px = 32 KiB of stride, so the band always covers at
+/// least one whole source row and the "whole rows, at least one" law needs no second mechanism.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+const WCG_CHUNK_BYTES: usize = 32 * 1024;
+
+/// WCG-CHUNK — per-id: the SURFACE BYTE OFFSET the running full sample's next chunk resumes at.
+/// Always a whole-row multiple of the stride the advancing chunk saw; `0` doubles as "no chunked
+/// sample in flight" (the first chunk of a sample is the one that starts at 0, and it resets the
+/// banked sums). Advanced only by a clean banked chunk; reset by every sample close and by
+/// [`paygo_recycle`].
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+static WCG_CUR: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+
+/// WCG-CHUNK — per-id: a chunk is between [`begin`] and [`end`] RIGHT NOW. The single-walker latch:
+/// `wcd_admit`'s CAS serializes wc-d's chunks, but `begin` has no state machine and
+/// `paygo_service`'s own note records that two lanes can composite one window at once — two chunks
+/// walking the same cursor would double-bank `checked` and print a denominator the box does not
+/// have. Claimed before the budget spend, released on every exit of `end`.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+static WCG_BUSY: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+
+/// WCG-CHUNK — per-id telemetry for the paygo `-> PAID` terminal: `chunks=` and `hold_max_us=`,
+/// AFTER the verdict token (the suffix position `wm::wcd_paygo_note`'s B1 review fixed — the bench
+/// serial-analyzer's `PAYGO_RE` matches `clock=(\w+) taken=(\d+)` contiguously with no `$` anchor,
+/// and the gate's PAID REQUIRE ends at `-> PAID`, so a suffix is invisible to both consumers).
+///
+/// THE FALSIFIER: Boot A/Ab measured the unchunked read-back at 488 744–732 797 us per pass, so the
+/// next metal boot's `hold_max_us` must sit two orders below that (a few thousand us:
+/// [`WCG_CHUNK_US`] plus one source row's overshoot plus ~150 us of band checksums) or the fix did
+/// not land.
+///
+/// SPAN, stated: `hold_max_us` is the max over chunks of `cks_blit_us + civac_us + cks_after_us +
+/// readback_us` — the witness's own four phases, the same sum `wit_us=` accumulates. It excludes
+/// the copy itself (`us=`, work the composite does witness or no witness) and [`on_present`]'s
+/// band checksum (bounded by [`WCG_CHUNK_BYTES`], paid at present entry outside the composite).
+/// Reset at recycle only — the pair describes the tenant's whole battery, all chunked samples.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+static WCG_CHUNKS: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+static WCG_HOLD_MAX_US: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+
+/// WCG-CHUNK — per-id banked sums for the cumulative closing line: silent clean chunks add their
+/// `checked`/`occluded` here (their `bad` is zero — that is what kept them silent), the `prof`
+/// phases and bytes sum beside them, and `USMAX` carries the worst single copy (`us=`) so the
+/// closing line's `slow=` is drawn from the sample's worst blit rather than its last. Single-writer
+/// by construction ([`WCG_BUSY`]), so `Relaxed` throughout; reset by the first chunk of each sample
+/// (cursor at 0).
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+static WCG_ACC_CHECKED: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+static WCG_ACC_OCC: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+static WCG_ACC_USMAX: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+static WCG_ACC_BYTES: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+static WCG_ACC_BLITUS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+static WCG_ACC_CIVACUS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+static WCG_ACC_AFTERUS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+static WCG_ACC_RBUS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+
+/// WCG-CHUNK — per-id: the byte offset [`on_present`]'s `app` checksum covered, or `u64::MAX` for
+/// the whole surface (the pre-chunk meaning, and the initial state). [`begin`] consults it before
+/// arming the `app` leg: a chunk whose band does not match what `on_present` checksummed — a cursor
+/// that moved between the present and the blit, or a present that straddled the sample-1 → sample-2
+/// boundary — compares two hashes of different bytes, and a divergence there would be a fabricated
+/// RACE-PRESENT. The mismatched chunk runs with `own=no`, exactly the reading the paygo
+/// threshold-straddle seam already established: `own=yes` on the wire MEANS the `app=` hash is
+/// consultable against `blit=`.
+#[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+static APP_OFF: [AtomicU64; IDS] = [const { AtomicU64::new(u64::MAX) }; IDS];
+
 /// PAYGO-TERM — a new tenant landed on this slot: re-arm the terminal. See [`PAYGO_CLOSED`].
 ///
-/// Only that cell. The battery (`TAKEN`, `PAYGO_SAID`) and the census (`PAYGO_EMIT`,
-/// `PAYGO_DEFERRED`) are deliberately left alone — the first because it is per-slot by design, the
-/// second because `emit=` has to stay monotone per id across a recycle.
+/// Only that cell — plus the WCG-CHUNK cursor and its telemetry, which travel with the battery they
+/// describe: a new tenant's read-back starts at byte 0 and its `chunks=`/`hold_max_us=` must not
+/// inherit a predecessor's, and a stale `APP_OFF` would arm the next tenant's `app` leg against a
+/// band the previous tenant's present checksummed. The battery (`TAKEN`, `PAYGO_SAID`) and the
+/// census (`PAYGO_EMIT`, `PAYGO_DEFERRED`) are deliberately left alone — the first because it is
+/// per-slot by design, the second because `emit=` has to stay monotone per id across a recycle.
+/// The banked sums (`WCG_ACC_*`) need no reset here — the first chunk of each sample clears them,
+/// and a recycle puts the cursor at 0, which IS that condition.
 #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
 pub(super) fn paygo_recycle(i: usize) {
     if i < IDS {
         PAYGO_CLOSED[i].store(0, Ordering::Relaxed);
+        WCG_CUR[i].store(0, Ordering::Relaxed);
+        WCG_BUSY[i].store(0, Ordering::Relaxed);
+        WCG_CHUNKS[i].store(0, Ordering::Relaxed);
+        WCG_HOLD_MAX_US[i].store(0, Ordering::Relaxed);
+        APP_OFF[i].store(u64::MAX, Ordering::Relaxed);
     }
 }
 
@@ -2258,11 +2468,20 @@ static PAYGO_FORCE: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// behaviour and predates the deferral entirely — and forcing samples onto it would be inventing
 /// composites for a window nobody is drawing. Only a window the DEFERRAL GATE turned away has an
 /// obligation this arc created, and only those are taken.
+///
+/// WCG-CHUNK — **and a PART-PAID sample is pending too, `SAID` or not** (the same M1 fix
+/// `wm::wcd_pending` took). A window's FOURTH sample spends `TAKEN` at its first chunk, so a battery
+/// parked mid-box on sample 4 reads `TAKEN == SAMPLES`; and a window launched past the deferral
+/// threshold is never declined, so `SAID` can be 0 with a cursor mid-box. Either shape was invisible
+/// to the 4 Hz taker and to `paygo_at_close`'s UNSPENT terminal — no DEFERRED, no PAID, no UNSPENT,
+/// the forbidden silent close. `WCG_CUR != 0` is precisely "a chunk banked without closing", so the
+/// taker's whole-box mark now reaches every part-paid sample and drives its cursor home.
 #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
 pub(super) fn paygo_pending(i: usize) -> bool {
     i < IDS
-        && PAYGO_SAID[i].load(Ordering::Relaxed) != 0
-        && TAKEN[i].load(Ordering::Relaxed) < SAMPLES
+        && ((PAYGO_SAID[i].load(Ordering::Relaxed) != 0
+            && TAKEN[i].load(Ordering::Relaxed) < SAMPLES)
+            || WCG_CUR[i].load(Ordering::Relaxed) != 0)
 }
 
 /// PAYGO-TERM — is this window's deferred sample owed AND payable right now? The service-pass taker's
@@ -2362,6 +2581,25 @@ impl core::fmt::Display for OccNote {
     }
 }
 
+/// WCG-CHUNK — the ` band=r0..r1` SUFFIX a chunk-local exceptional line carries AFTER its terminal
+/// verdict, naming the source rows the convicting chunk actually walked. A suffix and not an
+/// insertion, per the wc-d B1 rule: the pi4 gate's sample pattern ends at `->` and the bench
+/// analyzer's `WCG_PASS_RE` matches only the line's head, so a suffix is invisible to both, while
+/// the `-> COHER`/`-> RACE`/`-> BLIT` FORBIDs (`.*->` forms, no anchor) still fire through it.
+/// `None` writes NOTHING — every cumulative close, every unchunked sample, and the whole aarch64
+/// wire are byte-identical. A `Display` shim like [`BandFmt`](super::wm) and [`OccNote`], so a
+/// zero-cost verdict pays no allocation it could fail.
+struct BandNote(Option<(usize, usize)>);
+
+impl core::fmt::Display for BandNote {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some((r0, r1)) => write!(f, " band={}..{}", r0, r1),
+            None => Ok(()),
+        }
+    }
+}
+
 /// PAYGO — the rollup's policy marker, inserted after `scope=window`. The pi4 gate matches
 /// `scope=window ` with a trailing space so its pattern cannot match `scope=window-band`; an
 /// insertion after the key preserves that, and the empty string preserves the line exactly.
@@ -2379,8 +2617,14 @@ const PAYGO_ROLLUP_NOTE: &str = "";
 /// and a field that track does not read is not worth a chance of breaking it. It fires exactly twice
 /// per window at most — once when the deferral starts (`state=waiting`), once when the battery
 /// completes (`state=complete`) — so it is bounded without needing a budget of its own.
+/// WCG-CHUNK — `chunks` rides only the COMPLETE line ([`paygo_complete`] passes `Some`): the pair
+/// is meaningless before the battery closes, and it goes AFTER the `-> PAID` terminal, the suffix
+/// position `wm::wcd_paygo_note`'s B1 review established — the bench serial-analyzer's `PAYGO_RE`
+/// matches `clock=(\w+) taken=(\d+)` CONTIGUOUSLY with no `$` anchor, and the x86-witness gate's
+/// PAID REQUIRE ends at `-> PAID`, so a suffix is invisible to both existing consumers where an
+/// insertion between matched keys broke the analyzer's PAID accounting on the wc-d side.
 #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
-fn paygo_note(id: u32, i: usize, state: &str, verdict: &str) {
+fn paygo_note(id: u32, i: usize, state: &str, verdict: &str, chunks: Option<(u32, u64)>) {
     let deferred = PAYGO_DEFERRED[i].load(Ordering::Relaxed);
     let emit = PAYGO_EMIT[i].fetch_add(1, Ordering::Relaxed) + 1;
     // `clock=` disambiguates a real zero from an absent one. `since_entry_ms=0 clock=unarmed` says
@@ -2389,20 +2633,38 @@ fn paygo_note(id: u32, i: usize, state: &str, verdict: &str) {
     // entry. A fabricated zero that could mean either is the kind of field this module keeps
     // convicting.
     let (since_ms, clock, _) = paygo_clock();
-    serial_println!(
-        "[wc-g] paygo win={} state={} emit={} lattice_n={} deferred={} defer_ms={} since_entry_ms={} clock={} taken={} budget={} -> {}",
-        id,
-        state,
-        emit,
-        PAYGO_LATTICE_N,
-        deferred,
-        PAYGO_DEFER_MS,
-        since_ms,
-        clock,
-        TAKEN[i].load(Ordering::Relaxed).min(SAMPLES),
-        SAMPLES,
-        verdict
-    );
+    match chunks {
+        None => serial_println!(
+            "[wc-g] paygo win={} state={} emit={} lattice_n={} deferred={} defer_ms={} since_entry_ms={} clock={} taken={} budget={} -> {}",
+            id,
+            state,
+            emit,
+            PAYGO_LATTICE_N,
+            deferred,
+            PAYGO_DEFER_MS,
+            since_ms,
+            clock,
+            TAKEN[i].load(Ordering::Relaxed).min(SAMPLES),
+            SAMPLES,
+            verdict
+        ),
+        Some((n, hold_max_us)) => serial_println!(
+            "[wc-g] paygo win={} state={} emit={} lattice_n={} deferred={} defer_ms={} since_entry_ms={} clock={} taken={} budget={} -> {} chunks={} hold_max_us={}",
+            id,
+            state,
+            emit,
+            PAYGO_LATTICE_N,
+            deferred,
+            PAYGO_DEFER_MS,
+            since_ms,
+            clock,
+            TAKEN[i].load(Ordering::Relaxed).min(SAMPLES),
+            SAMPLES,
+            verdict,
+            n,
+            hold_max_us
+        ),
+    }
     // Re-arm the refresh from AFTER the serial write, so `CENSUS_PERIOD_US` bounds the duty cycle
     // this instrument imposes on the composite path and not merely the gap between line starts —
     // the same accounting `stage_rollup` uses. Both stores happen on EVERY emission, including the
@@ -2432,7 +2694,7 @@ fn paygo_flush(id: u32, i: usize) {
         return;
     }
     if PAYGO_PEND[i].swap(0, Ordering::AcqRel) != 0 {
-        paygo_note(id, i, "waiting", "DEFERRED");
+        paygo_note(id, i, "waiting", "DEFERRED", None);
         return;
     }
     // Only while this window is actually deferring. Nothing before its first decline, and nothing
@@ -2451,7 +2713,7 @@ fn paygo_flush(id: u32, i: usize) {
     if PAYGO_LASTROLL[i].compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed).is_err() {
         return;
     }
-    paygo_note(id, i, "waiting", "DEFERRED");
+    paygo_note(id, i, "waiting", "DEFERRED", None);
 }
 
 #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
@@ -2464,7 +2726,11 @@ fn paygo_flush(_id: u32, _i: usize) {}
 #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
 #[inline]
 fn paygo_complete(id: u32, i: usize) {
-    paygo_note(id, i, "complete", "PAID");
+    // WCG-CHUNK — the falsifier rides the terminal: how many chunks the battery's full samples took
+    // and the worst single gate-held witness span any of them imposed. See [`WCG_CHUNKS`].
+    let chunks = WCG_CHUNKS[i].load(Ordering::Relaxed);
+    let hold = WCG_HOLD_MAX_US[i].load(Ordering::Relaxed);
+    paygo_note(id, i, "complete", "PAID", Some((chunks, hold)));
 }
 
 /// PAYGO-TERM — the OTHER terminal: this window was closed with its battery still owed, and the
@@ -2503,7 +2769,7 @@ pub(super) fn paygo_closed(id: u32, i: usize) {
     if PAYGO_CLOSED[i].swap(1, Ordering::AcqRel) != 0 {
         return;
     }
-    paygo_note(id, i, "closed", "UNSPENT");
+    paygo_note(id, i, "closed", "UNSPENT", None);
 }
 
 #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
@@ -2529,34 +2795,92 @@ pub fn begin(
     if compat || surf == 0 || surf_len == 0 || i >= IDS {
         return None;
     }
+    // WCG-CHUNK — is this admission a CHUNK of a full-coverage sample? `TAKEN > 0` means the next
+    // sample is a full-coverage one (sample 1 is the lattice), and `WCG_CUR > 0` means one is
+    // already mid-box; either way the single-walker latch is claimed FIRST, before any budget is
+    // spent, so a losing lane declines without a spend to unwind. A fresh full sample (cursor at 0)
+    // still runs the deferral gate and the budget spend exactly as before — the deferral census,
+    // `state=waiting -> DEFERRED`, and the saturate law are all unchanged — and a RESUMED chunk
+    // bypasses both, because its sample was admitted and paid for at its first chunk.
+    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    let (chunk, band_off, band_len) = {
+        let cur = WCG_CUR[i].load(Ordering::Relaxed) as usize;
+        if cur > 0 || TAKEN[i].load(Ordering::Relaxed) > 0 {
+            if WCG_BUSY[i].swap(1, Ordering::AcqRel) != 0 {
+                return None;
+            }
+            if cur == 0 {
+                if !paygo_open(id, i) {
+                    WCG_BUSY[i].store(0, Ordering::Release);
+                    return None;
+                }
+                if TAKEN[i].fetch_add(1, Ordering::Relaxed) >= SAMPLES {
+                    TAKEN[i].store(SAMPLES, Ordering::Relaxed);
+                    WCG_BUSY[i].store(0, Ordering::Release);
+                    return None;
+                }
+            }
+            let lo = cur.min(surf_len);
+            let hi = cur.saturating_add(WCG_CHUNK_BYTES).min(surf_len);
+            (true, lo, hi.saturating_sub(lo))
+        } else {
+            // Sample 1, the lattice: admitted and bracketed whole, exactly as before.
+            if !paygo_open(id, i) {
+                return None;
+            }
+            if TAKEN[i].fetch_add(1, Ordering::Relaxed) >= SAMPLES {
+                TAKEN[i].store(SAMPLES, Ordering::Relaxed);
+                return None;
+            }
+            (false, 0, surf_len)
+        }
+    };
     // WC-G/M3 — PAYGO's coverage gate, and it must stay ABOVE the budget test: a deferred blit is
     // one this pass declines to SAMPLE, not one it spends a sample on. Compiles to `true` and folds
-    // away whenever the knob is off or the arch is not x86. See [`paygo_open`].
-    if !paygo_open(id, i) {
-        return None;
+    // away whenever the knob is off or the arch is not x86. See [`paygo_open`]. (On the `wcg-paygo`
+    // build both gates run inside the WCG-CHUNK admission above instead, in the same order.)
+    #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
+    {
+        if !paygo_open(id, i) {
+            return None;
+        }
+        if TAKEN[i].fetch_add(1, Ordering::Relaxed) >= SAMPLES {
+            // Saturate rather than wrap: the counter is also the budget test in `budget_left`.
+            TAKEN[i].store(SAMPLES, Ordering::Relaxed);
+            return None;
+        }
     }
-    if TAKEN[i].fetch_add(1, Ordering::Relaxed) >= SAMPLES {
-        // Saturate rather than wrap: the counter is also the budget test in `budget_left`.
-        TAKEN[i].store(SAMPLES, Ordering::Relaxed);
-        return None;
-    }
+    // WCG-CHUNK — what the checksum trio walks: the chunk's band, or the whole surface on every
+    // path that existed before the chunking (band_off = 0, band_len = surf_len there).
+    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    let (cs_at, cs_len) = (surf + band_off, band_len);
+    #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
+    let (cs_at, cs_len) = (surf, surf_len);
     // WC-G/M1 — phase timestamps around the EXISTING operations, all of them BEFORE `t0` is set.
     // Four clock reads on a path that already does two full-surface volatile reads is arithmetic
     // next to the work being measured, and — this is the load-bearing part — none of it lands
     // between the `t0` assignment and the return, so the ordering law below is untouched and `us=`
     // still contains the copy and nothing else.
     let tp0 = now_cycles();
-    let cks_blit = checksum(surf, surf_len);
+    let cks_blit = checksum(cs_at, cs_len);
     let tp1 = now_cycles();
     // The coherency leg. See the module note on why this cleans as well as invalidates.
-    clean_invalidate_surface(surf, surf_len);
-    let cks_civac = checksum(surf, surf_len);
+    clean_invalidate_surface(cs_at, cs_len);
+    let cks_civac = checksum(cs_at, cs_len);
     let tp2 = now_cycles();
     let cks_blit_us = cycles_to_us(tp1.saturating_sub(tp0));
     let civac_us = cycles_to_us(tp2.saturating_sub(tp1));
 
     let seq = APP_SEQ[i].load(Ordering::Relaxed);
     let own = SEEN_SEQ[i].swap(seq, Ordering::Relaxed) != seq;
+    // WCG-CHUNK — the `app` leg is consultable only if [`on_present`] checksummed the SAME bytes
+    // this probe's `blit` leg walked; otherwise the chunk runs `own=no` — the reading the paygo
+    // threshold-straddle seam already established, and the guard that keeps a hash comparison of
+    // DIFFERENT byte ranges from fabricating a RACE-PRESENT. See [`APP_OFF`].
+    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    let own = own
+        && APP_OFF[i].load(Ordering::Relaxed)
+            == if chunk { band_off as u64 } else { u64::MAX };
 
     Some(Probe {
         id,
@@ -2573,6 +2897,13 @@ pub fn begin(
         // work, and above the `t0` assignment so the ordering law below is untouched.
         #[cfg(target_arch = "x86_64")]
         occ_before,
+        // WCG-CHUNK — three more plain moves, above `t0` for the same reason.
+        #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+        chunk,
+        #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+        band_off,
+        #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+        band_len,
         // LOAD-BEARING ORDERING: the clock starts AFTER the `civac` re-read, and must stay there.
         // `clean_invalidate_range` drops every line of the surface, and the `cks_civac` checksum
         // immediately re-reads all of it — which is precisely what re-warms the source for the blit
@@ -2609,10 +2940,17 @@ pub fn end(
     #[cfg(target_arch = "x86_64")] occ_after: super::wm::OccSnap,
 ) {
     let us = cycles_to_us(now_cycles().saturating_sub(p.t0));
+    // WCG-CHUNK — the `after` leg walks the SAME bytes the `blit`/`civac` legs walked in [`begin`]:
+    // the chunk's band, or the whole surface on every pre-chunk path (`band_off = 0`,
+    // `band_len = surf_len` there).
+    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    let (cs_at, cs_len) = (p.surf + p.band_off, p.band_len);
+    #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
+    let (cs_at, cs_len) = (p.surf, p.surf_len);
     // WC-G/M1 — `us=` above is computed FIRST and from `p.t0` alone, exactly as it always was. Every
     // phase clock below starts after it, so no profiling read can enter the timing verdict's bracket.
     let tp0 = now_cycles();
-    let cks_after = checksum(p.surf, p.surf_len);
+    let cks_after = checksum(cs_at, cs_len);
     let tp1 = now_cycles();
     let cks_after_us = cycles_to_us(tp1.saturating_sub(tp0));
 
@@ -2630,6 +2968,25 @@ pub fn end(
     // WC-G/M3 — the terms this sample was admitted on. Read OUTSIDE the bracket below: it is one
     // relaxed load, but the bracket's job is to contain the walk and nothing else.
     let step = probe_step(p.id as usize);
+    // WCG-CHUNK — the chunk's row window, derived from the band the checksums bracketed. The band
+    // offset is a whole-row multiple of the stride the ADVANCING chunk saw, so a non-multiple here
+    // means the geometry changed under a part-paid sample; the walk is declined (`row0 = cap`, an
+    // empty window) and the banking block below closes the sample `coverage=shrunk` rather than
+    // comparing rows the band never covered. `.max(row0 + 1)` is the "whole rows, at least one" law
+    // — unreachable while [`WCG_CHUNK_BYTES`] covers any real panel's stride, and stated anyway.
+    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    let (rb_row0, rb_cap, rb_bounded) = if p.chunk {
+        if stride >= 4 && p.band_off % stride == 0 {
+            let row0 = p.band_off / stride;
+            (row0, ((p.band_off + p.band_len) / stride).max(row0 + 1), true)
+        } else {
+            (usize::MAX, usize::MAX, true)
+        }
+    } else {
+        (0, usize::MAX, false)
+    };
+    #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
+    let (rb_row0, rb_cap, rb_bounded) = (0usize, usize::MAX, false);
     // WC-G/M1 — the read-back's own bracket. On x86 the glass is WC-mapped PCIe memory and every
     // probe is an uncached round trip to the device, so this walk is the phase most likely to
     // dominate the pass — which is exactly why it could not go on being reported as part of an
@@ -2643,13 +3000,123 @@ pub fn end(
     // GR21/WCD-OCC — on x86 the read-back excuses probes a higher window owns and returns their
     // count as a fourth element; aarch64 keeps the three-element return and its byte-identical wire.
     #[cfg(target_arch = "x86_64")]
-    let (bad, checked, step_eff, occluded) = readback(
-        fb, p.surf, p.surf_len, pw, ph, x, y, w, h, stride, scale, step, p.occ_before, occ_after,
+    let (bad, checked, step_eff, occluded, rows_done, rows_total) = readback(
+        fb, p.surf, p.surf_len, pw, ph, x, y, w, h, stride, scale, step, rb_row0, rb_cap,
+        rb_bounded, p.occ_before, occ_after,
     );
     #[cfg(not(target_arch = "x86_64"))]
-    let (bad, checked, step_eff, _) =
-        readback(fb, p.surf, p.surf_len, pw, ph, x, y, w, h, stride, scale, step);
+    let (bad, checked, step_eff, _, rows_done, rows_total) = readback(
+        fb, p.surf, p.surf_len, pw, ph, x, y, w, h, stride, scale, step, rb_row0, rb_cap,
+        rb_bounded,
+    );
     let readback_us = cycles_to_us(now_cycles().saturating_sub(tp2));
+    #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
+    let _ = (rows_done, rows_total);
+
+    // WCG-CHUNK — bank this chunk, and decide whether it CLOSES the sample.
+    //
+    // A clean chunk that did not reach the box's last row prints NOTHING and returns: the cursor
+    // advances, the counts are banked, chunk progress re-arms the service taker's liveness bound
+    // (`wm::PAYGO_SVC_TRIES` caps marks WITHOUT progress — its anti-wedge purpose — and a sample
+    // that now takes a box in hundreds of chunks would exhaust a fixed cap of 16 while doing
+    // exactly what it was asked to), and the next admitted composite resumes the walk. The sample
+    // line speaks once, cumulative, when the closing chunk lands — one line per sample on the wire,
+    // exactly as before, `coverage=full` because the cursor walked the box contiguously from row 0.
+    //
+    // An EXCEPTIONAL chunk — a checksum leg diverged (COHER / RACE-BLIT / RACE-PRESENT, all
+    // adjudicated over this chunk's own band and bracket) or a chargeable probe (`bad != 0`) —
+    // prints immediately, chunk-local, `coverage=band` with ` band=` naming the rows it walked
+    // AFTER the terminal verdict (a suffix, invisible to the pi4 gate's `fbbad=.* slow=.* ->`
+    // pattern and to the analyzer's `WCG_PASS_RE`, while every `-> COHER`/`RACE`/`BLIT` FORBID
+    // still fires through the `.*`). It closes the sample the way one bad verdict always has — the
+    // battery keeps its remaining budget, exactly as an unchunked bad sample leaves it.
+    //
+    // A box that SHRANK (or re-strode) under a part-paid sample closes with the banked sums and
+    // `coverage=shrunk` — satisfying no gate's `full` REQUIRE and no FORBID — rather than wedging
+    // the cursor past a row extent that no longer exists; every banked chunk was clean, so the
+    // verdict those sums support is the one printed.
+    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    let (bad, checked, occluded, us, cov_over, band_note) = if !p.chunk {
+        (bad, checked, occluded, us, None, BandNote(None))
+    } else {
+        let wi = p.id as usize;
+        // The falsifier's raw material: this chunk's gate-held witness span, the same four phases
+        // `wit_us=` sums. See [`WCG_CHUNKS`] for the span statement.
+        let hold = p
+            .cks_blit_us
+            .saturating_add(p.civac_us)
+            .saturating_add(cks_after_us)
+            .saturating_add(readback_us);
+        WCG_CHUNKS[wi].fetch_add(1, Ordering::Relaxed);
+        WCG_HOLD_MAX_US[wi].fetch_max(hold, Ordering::Relaxed);
+        if p.band_off == 0 {
+            // First chunk of a sample: the banked sums start clean. Single-writer by construction
+            // ([`WCG_BUSY`] is held), so plain stores.
+            WCG_ACC_CHECKED[wi].store(0, Ordering::Relaxed);
+            WCG_ACC_OCC[wi].store(0, Ordering::Relaxed);
+            WCG_ACC_USMAX[wi].store(0, Ordering::Relaxed);
+            WCG_ACC_BYTES[wi].store(0, Ordering::Relaxed);
+            WCG_ACC_BLITUS[wi].store(0, Ordering::Relaxed);
+            WCG_ACC_CIVACUS[wi].store(0, Ordering::Relaxed);
+            WCG_ACC_AFTERUS[wi].store(0, Ordering::Relaxed);
+            WCG_ACC_RBUS[wi].store(0, Ordering::Relaxed);
+        }
+        let acc_checked =
+            WCG_ACC_CHECKED[wi].fetch_add(checked as u64, Ordering::Relaxed) + checked as u64;
+        let acc_occ =
+            WCG_ACC_OCC[wi].fetch_add(occluded as u64, Ordering::Relaxed) + occluded as u64;
+        let acc_us = WCG_ACC_USMAX[wi].fetch_max(us, Ordering::Relaxed).max(us);
+        WCG_ACC_BYTES[wi].fetch_add(p.band_len as u64, Ordering::Relaxed);
+        WCG_ACC_BLITUS[wi].fetch_add(p.cks_blit_us, Ordering::Relaxed);
+        WCG_ACC_CIVACUS[wi].fetch_add(p.civac_us, Ordering::Relaxed);
+        WCG_ACC_AFTERUS[wi].fetch_add(cks_after_us, Ordering::Relaxed);
+        WCG_ACC_RBUS[wi].fetch_add(readback_us, Ordering::Relaxed);
+        // The per-window ledger keeps counting per chunk — a part-paid sample's witness time must
+        // not vanish if the box never closes. The unchunked add below is skipped for chunks.
+        W_WITUS[wi].fetch_add(hold, Ordering::Relaxed);
+        let exceptional = p.cks_blit != p.cks_civac
+            || p.cks_blit != cks_after
+            || (p.own && p.cks_app != p.cks_blit)
+            || bad != 0;
+        if exceptional {
+            WCG_CUR[wi].store(0, Ordering::Relaxed);
+            WCG_BUSY[wi].store(0, Ordering::Release);
+            (
+                bad,
+                checked,
+                occluded,
+                us,
+                Some(" coverage=band"),
+                BandNote(Some((rb_row0, rows_done))),
+            )
+        } else if rb_row0 >= rows_total {
+            // Shrunk (or re-strode, `rb_row0 = usize::MAX` above): every row the box still has was
+            // walked by the banked chunks. Close, cumulative, coverage named honestly.
+            WCG_CUR[wi].store(0, Ordering::Relaxed);
+            WCG_BUSY[wi].store(0, Ordering::Release);
+            (
+                0,
+                acc_checked as usize,
+                acc_occ as usize,
+                acc_us,
+                Some(" coverage=shrunk"),
+                BandNote(None),
+            )
+        } else if rows_done >= rows_total {
+            // The closing chunk: the cursor reached the box's last row.
+            WCG_CUR[wi].store(0, Ordering::Relaxed);
+            WCG_BUSY[wi].store(0, Ordering::Release);
+            (0, acc_checked as usize, acc_occ as usize, acc_us, Some(" coverage=full"), BandNote(None))
+        } else {
+            // Silent clean chunk: bank, advance, hand the budget back. No line, no verdict count.
+            WCG_CUR[wi].store((rows_done * stride) as u64, Ordering::Relaxed);
+            super::wm::paygo_svc_progress(wi);
+            WCG_BUSY[wi].store(0, Ordering::Release);
+            return;
+        }
+    };
+    #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
+    let (cov_over, band_note): (Option<&'static str>, BandNote) = (None, BandNote(None));
 
     // Attribution, most specific first. A source that moved under the copy invalidates the
     // read-back's expectation (it was re-derived from bytes the blit never saw), so RACE outranks
@@ -2711,7 +3178,10 @@ pub fn end(
         // [`coverage_note`] for why a sampled pass may not print a bare `fbbad=0/…`.
         // GR21/WCD-OCC — `occluded=`/`occ=` is a second such insertion, in the SAME window (between
         // `coverage=` and `us=`, still inside the pi4 pattern's `.*`), and empty on aarch64.
-        "[wc-g] win={} seq={} own={} scale={}x app={:#018x} blit={:#018x} civac={:#018x} after={:#018x} fbbad={}/{}{}{} us={} rectscan_us={} slow={} -> {}",
+        // WCG-CHUNK — a chunked sample's closing line overrides the marker (`full`, or the honest
+        // `band`/`shrunk` on the exceptional and shrunk closes), and ` band=` rides AFTER the
+        // terminal verdict as a suffix, empty everywhere but a chunk-local exceptional line.
+        "[wc-g] win={} seq={} own={} scale={}x app={:#018x} blit={:#018x} civac={:#018x} after={:#018x} fbbad={}/{}{}{} us={} rectscan_us={} slow={} -> {}{}",
         p.id,
         p.seq,
         if p.own { "yes" } else { "no" },
@@ -2722,12 +3192,13 @@ pub fn end(
         cks_after,
         bad,
         checked,
-        coverage_note(step_eff),
+        cov_over.unwrap_or(coverage_note(step_eff)),
         occ_note,
         us,
         rectscan_us,
         if slow { "yes" } else { "no" },
-        verdict
+        verdict,
+        band_note
     );
 
     // WC-G/M1 — WHERE THE PASS ACTUALLY GOES.
@@ -2770,27 +3241,56 @@ pub fn end(
     //
     // It leads with `[wc-g] ` deliberately: `fbcon`'s `PANEL_MUTE_TAGS` mutes serial tags from the
     // panel by that prefix, so an x86 witness build keeps this line off the glass it is measuring.
+    // WCG-CHUNK — a chunked sample's `prof` line is CUMULATIVE, like the sample line it rides
+    // behind: the four phases sum over every chunk (this one banked itself above), `probes=` is the
+    // banked `checked`, and `surf_bytes=` is the bytes the checksum trio actually walked — the
+    // banded sums, which land within one band of `surf_len` on a closing chunk and honestly smaller
+    // on an exceptional or shrunk one. One `prof` per sample, exactly as before; silent chunks
+    // print nothing.
+    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    let (pf_bytes, pf_blit_us, pf_civac_us, pf_after_us, pf_probes, pf_rb_us) = if p.chunk {
+        (
+            WCG_ACC_BYTES[w].load(Ordering::Relaxed),
+            WCG_ACC_BLITUS[w].load(Ordering::Relaxed),
+            WCG_ACC_CIVACUS[w].load(Ordering::Relaxed),
+            WCG_ACC_AFTERUS[w].load(Ordering::Relaxed),
+            WCG_ACC_CHECKED[w].load(Ordering::Relaxed),
+            WCG_ACC_RBUS[w].load(Ordering::Relaxed),
+        )
+    } else {
+        (p.surf_len as u64, p.cks_blit_us, p.civac_us, cks_after_us, checked as u64, readback_us)
+    };
+    #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
+    let (pf_bytes, pf_blit_us, pf_civac_us, pf_after_us, pf_probes, pf_rb_us) =
+        (p.surf_len, p.cks_blit_us, p.civac_us, cks_after_us, checked, readback_us);
     serial_println!(
         "[wc-g] prof win={} seq={} surf_bytes={} cks_blit_us={} civac_us={} cks_after_us={} probes={} readback_us={}",
         p.id,
         p.seq,
-        p.surf_len,
-        p.cks_blit_us,
-        p.civac_us,
-        cks_after_us,
-        checked,
-        readback_us
+        pf_bytes,
+        pf_blit_us,
+        pf_civac_us,
+        pf_after_us,
+        pf_probes,
+        pf_rb_us
     );
     // The per-window ledger the rollup's `wit_us=` reports. Accumulated AFTER the prints, so a
     // window's total is the sum of the four measured phases and carries no serial time. See
-    // [`W_WITUS`].
-    W_WITUS[w].fetch_add(
-        p.cks_blit_us
-            .saturating_add(p.civac_us)
-            .saturating_add(cks_after_us)
-            .saturating_add(readback_us),
-        Ordering::Relaxed,
-    );
+    // [`W_WITUS`]. WCG-CHUNK — a chunk already banked its phases into the ledger above (a part-paid
+    // sample's time must not vanish), so it is skipped here.
+    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    let wit_here = !p.chunk;
+    #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
+    let wit_here = true;
+    if wit_here {
+        W_WITUS[w].fetch_add(
+            p.cks_blit_us
+                .saturating_add(p.civac_us)
+                .saturating_add(cks_after_us)
+                .saturating_add(readback_us),
+            Ordering::Relaxed,
+        );
+    }
 
     // This window's rollup, once, when it spends its budget. Scoped to ONE window and deterministic
     // — no timer, and no claim about any window but this one. See [`W_SAMPLES`] for why there is no

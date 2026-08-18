@@ -50,6 +50,7 @@
 //! | clock, right | [`crate::clock::try_unix_now`], UTC `HH:MM` | [`theme::TITLE_TEXT_INACTIVE`] |
 //!
 //! **The bar's one press target is the CRYSTAL.** This module still registers nothing with the click
+<<<<<<< HEAD
 //! router itself; the SHARD menu ([`super::crystal`]) claims the crystal box through the ONE shared
 //! furniture router [`strip::press_route`], which both arch routers call ahead of every window arm.
 //! Every other point on the bar falls through to whatever is behind it. The witness line says so
@@ -66,6 +67,15 @@
 //! generalised to tenant #2, and on aarch64 it is not a belt: `wm::occ_clip` is `x86_64`-only, so a
 //! window blit crossing the top strip is NOT withheld there and the bar's pixels are destroyed with
 //! nothing in its own damage test able to notice. `clob=` on the ledger line is the falsifier.
+=======
+//! router itself; the SHARD menu ([`super::crystal`]) claims the crystal box through the router's
+//! menu-band arm, and every other point on the bar falls through to whatever is behind it. The
+//! witness line says so (`press=crystal`) — it read `press=inert` from the arc when the bar had no
+//! press seam at all, and that stale word survived into GR27, where it was read as "press routing
+//! latched off" during an investigation whose real defect was elsewhere. A witness term must track
+//! the code it describes. Opening APP menus is still the protocol arc's job; the design ledger at
+//! the foot of this file is what it will be built from.
+>>>>>>> origin/UnaOS-gemini
 //!
 //! # The crystal — UnaOS's mark, where macOS puts its apple
 //!
@@ -113,9 +123,12 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// The bar's height — [`theme::TITLE_HEIGHT`]. The same strip a window head is, for the same job.
 const BAR_H: usize = theme::TITLE_HEIGHT;
 
-/// The glyph cell text is drawn at — [`wm::TITLE_CELL`], the same cell the window caption and the
-/// dock tile resolve to. One definition, so a kit text-size change moves all three together.
-const CELL: usize = wm::TITLE_CELL;
+/// The glyph advance and cell height text is drawn at — [`wm::TITLE_CELL_W`]/[`wm::TITLE_CELL_H`],
+/// the same face metrics the window caption and the dock tile resolve to. One definition, so a
+/// face change moves all three together. FONT (GR27): the cell stopped being square when the
+/// 1-bit bitmap gave way to the shared anti-aliased face, so the two axes are named separately.
+const CELL_W: usize = wm::TITLE_CELL_W;
+const CELL_H: usize = wm::TITLE_CELL_H;
 
 /// The clock's rendered width in glyphs: `HH:MM`.
 const CLOCK_GLYPHS: usize = 5;
@@ -172,11 +185,11 @@ const FLOOR_H: usize = BAR_H + super::dock::STRIP_H + 2 * strip::PAD;
 /// The `+ CRYSTAL_W` term is the brand mark's own left slot: the crystal pushes the title inset right,
 /// so the floor that guarantees "crystal, one title glyph, and the clock all fit" grows by exactly the
 /// crystal's width. Still far below every suite panel (160 vs 640/1280/1920), so no gate declines.
-const FLOOR_W: usize = 4 * strip::PAD + CRYSTAL_W + (CLOCK_GLYPHS + 1) * CELL;
+const FLOOR_W: usize = 4 * strip::PAD + CRYSTAL_W + (CLOCK_GLYPHS + 1) * CELL_W;
 
 const _: () = {
     // The caption must fit inside the bar it is centred in, or there is nothing to draw.
-    assert!(CELL <= BAR_H);
+    assert!(CELL_H <= BAR_H);
     // The bevel is drawn under the bar's top edge and must not reach its keyline.
     assert!(theme::BEVEL < BAR_H);
     // A bar that declines on every panel this kernel drives would be an inert file pretending to be a
@@ -194,13 +207,13 @@ const _: () = {
     assert!(CRYSTAL_CROWN_H < CRYSTAL_H);
     assert!(CRYSTAL_W >= 4);
     // The crystal and the clock must not collide on the SMALLEST panel the bar draws on. The crystal
-    // occupies `[PAD, PAD + CRYSTAL_W)` and the clock `[FLOOR_W - PAD - CLOCK_GLYPHS*CELL, FLOOR_W - PAD)`;
+    // occupies `[PAD, PAD + CRYSTAL_W)` and the clock `[FLOOR_W - PAD - CLOCK_GLYPHS*CELL_W, FLOOR_W - PAD)`;
     // this is the gap between them staying positive, so a future metric change that would overlap them
     // fails the BUILD rather than painting the gem over the time.
-    assert!(strip::PAD + CRYSTAL_W < FLOOR_W - strip::PAD - CLOCK_GLYPHS * CELL);
+    assert!(strip::PAD + CRYSTAL_W < FLOOR_W - strip::PAD - CLOCK_GLYPHS * CELL_W);
     // The title, shifted past the crystal, must still leave room for at least one glyph before the
     // clock on the floor panel.
-    assert!(TITLE_X0 + CELL <= FLOOR_W - strip::PAD - CLOCK_GLYPHS * CELL);
+    assert!(TITLE_X0 + CELL_W <= FLOOR_W - strip::PAD - CLOCK_GLYPHS * CELL_W);
 };
 
 // ---------------------------------------------------------------------------
@@ -498,9 +511,14 @@ pub fn compose() -> bool {
         None => 0,
     };
     LEDGER.pass(crate::arch::now_cycles().saturating_sub(t0));
+<<<<<<< HEAD
     LEDGER.tick("menubar", format_args!("press=crystal crystal={}x{} clob={} toggles={} off_passes={}",
         CRYSTAL_W, CRYSTAL_H, CLOBBERS.load(Ordering::Relaxed),
         TOGGLES.load(Ordering::Relaxed), OFF_PASSES.load(Ordering::Relaxed)));
+=======
+    LEDGER.tick("menubar", format_args!("press=crystal crystal={}x{} toggles={} off_passes={}",
+        CRYSTAL_W, CRYSTAL_H, TOGGLES.load(Ordering::Relaxed), OFF_PASSES.load(Ordering::Relaxed)));
+>>>>>>> origin/UnaOS-gemini
 
     // The damage conditions, in the order the dock states them: a signature that MATCHES and a pass
     // that did not touch the strip is the common case and returns here having read no pixel.
@@ -643,52 +661,29 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     }
 
     // The two texts share a baseline: vertically centred in the bar.
-    let ty0 = (h - CELL) / 2;
-    if j < ty0 || j >= ty0 + CELL {
+    let ty0 = (h - CELL_H) / 2;
+    if j < ty0 || j >= ty0 + CELL_H {
         return;
     }
-    let scale = wm::TITLE_SCALE.max(1);
-    let sy = (j - ty0) / scale;
-    if sy >= 8 {
-        return;
-    }
+    let sy = j - ty0;
 
     // Title, at [`TITLE_X0`] — past the crystal, as macOS puts its app menus to the right of the logo.
     // The focused window's caption; nothing when nothing is focused, which is an empty bar rather than
     // a placeholder.
+    //
+    // FONT (GR27) — the shared anti-aliased face, alpha-composited over the row the bar already
+    // painted (a RAM scratch row — the read the blend does is cached, never a panel mapping).
+    // BOLD, the weight macOS gives the menu bar's app name; the clock stays regular, the same
+    // primary/secondary split the two inks already draw.
     let cols = m.title_len.min(TITLE_GLYPHS);
-    draw_text(out, w, &m.title[..cols], TITLE_X0, sy, scale, theme::TITLE_TEXT_ACTIVE);
+    super::font::draw_row(out, w, &m.title[..cols], TITLE_X0, sy, theme::TITLE_TEXT_ACTIVE, true);
 
     // Clock, right, at one PAD from the far edge. Secondary ink: the title is what the operator is
     // reading, the clock is what they glance at.
     if let Some(c) = m.clock {
-        let cw = CLOCK_GLYPHS * CELL;
+        let cw = CLOCK_GLYPHS * CELL_W;
         if w > cw + strip::PAD {
-            draw_text(out, w, &c, w - strip::PAD - cw, sy, scale, theme::TITLE_TEXT_INACTIVE);
-        }
-    }
-}
-
-/// Overlay one row of an ASCII byte string at `x0`, scaled, in `ink`. The dock's glyph loop, kept
-/// here rather than shared because it is six lines and the strip primitive has no opinion about text.
-fn draw_text(out: &mut [u32], w: usize, s: &[u8], x0: usize, sy: usize, scale: usize, ink: u32) {
-    for (c, &b) in s.iter().enumerate() {
-        let ch = if (0x20..0x7f).contains(&b) { b } else { b' ' };
-        let bits = font8x8::legacy::BASIC_LEGACY[ch as usize][sy];
-        if bits == 0 {
-            continue;
-        }
-        let gx = x0 + c * CELL;
-        for rx in 0..8usize {
-            if bits & (1 << rx) == 0 {
-                continue;
-            }
-            for sx in 0..scale {
-                let i = gx + rx * scale + sx;
-                if i < w {
-                    out[i] = ink;
-                }
-            }
+            super::font::draw_row(out, w, &c, w - strip::PAD - cw, sy, theme::TITLE_TEXT_INACTIVE, false);
         }
     }
 }
@@ -701,7 +696,11 @@ pub fn rollup(scope: &str) {
         "menubar",
         scope,
         format_args!(
+<<<<<<< HEAD
             "press=crystal crystal={}x{} clob={} toggles={} off_passes={}",
+=======
+            "press=crystal crystal={}x{} toggles={} off_passes={}",
+>>>>>>> origin/UnaOS-gemini
             CRYSTAL_W,
             CRYSTAL_H,
             CLOBBERS.load(Ordering::Relaxed),

@@ -104,28 +104,23 @@ pub const TITLE_H: usize = super::theme::TITLE_HEIGHT;
 /// between them. See [`paint_window`] for the layering.
 pub const BORDER: usize = super::theme::FRAME;
 
-/// The bitmap font's cell edge, in source pixels. A property of `font8x8`, not of the kit — the kit
-/// has no glyph-cell metric because it assumes a rasterizer. Named rather than spelled `8` at each
-/// use so [`TITLE_CELL`]'s derivation below reads as arithmetic instead of as two magic numbers.
-const FONT_CELL: usize = 8;
-
-/// CRISPYWIRE-REVIEW — the integer scale the 8-px font cell is drawn at so the caption lands as
-/// close to the kit's `metrics.text_px` as a BITMAP font can get.
+/// FONT (GR27) — the caption glyph's ADVANCE, in panel pixels: [`font::CELL_W`], the mono face's
+/// own metric. The unit every width budget (the caption painter's, [`controls`]'s decline
+/// threshold, the dock's tile sizing, the crystal menu's width) is counted in.
 ///
-/// The kit asks for 15 px of text. `font8x8` has one size, so the only honest freedom is an integer
-/// replication factor, and the nearest one is `round(TEXT_PX / FONT_CELL)` — written in integer
-/// arithmetic as `(TEXT_PX + FONT_CELL/2) / FONT_CELL`, floored at 1 so a small future `text_px`
-/// cannot erase the caption. At the kit's `15` that is `(15 + 4) / 8 = 2`, i.e. **16 px drawn for 15
-/// px asked**. Reaching 15 exactly needs a rasterizer the kernel does not have; the derivation is
-/// here, in code, so a kit change moves the caption instead of leaving a bare `2` behind.
-pub const TITLE_SCALE: usize = {
-    let s = (super::theme::TEXT_PX + FONT_CELL / 2) / FONT_CELL;
-    if s < 1 { 1 } else { s }
-};
+/// This retires `FONT_CELL`/`TITLE_SCALE`: the kit's `metrics.text_px = 15` used to be honoured
+/// by the nearest INTEGER replication of an 8-px 1-bit cell (16 px drawn for 15 asked — the
+/// "needs a rasterizer" note that lived here). The kernel now has pre-rasterized 16 px
+/// anti-aliased glyphs, so the cell is the FACE's, width and height separately, and the square
+/// `TITLE_CELL` is split into the two metrics it was conflating.
+pub const TITLE_CELL_W: usize = super::font::CELL_W;
 
-/// The drawn width (and height) of one caption glyph, in panel pixels — the unit both the caption
-/// painter's width budget and [`controls`]'s decline threshold are counted in.
-pub const TITLE_CELL: usize = FONT_CELL * TITLE_SCALE;
+/// FONT (GR27) — the caption glyph cell's HEIGHT, in panel pixels: [`font::CELL_H`] (16 — the
+/// same drawn height `TITLE_SCALE = 2` produced, so every vertical centring lands where it did).
+pub const TITLE_CELL_H: usize = super::font::CELL_H;
+// REVIEW (GR27 fonts): back the draw_title comment's "cell shorter than the strip" claim on every
+// arch (menubar's CELL_H<=BAR_H assert is x86+wc-only). draw_title clamps anyway, but assert it.
+const _: () = assert!(TITLE_CELL_H <= TITLE_H, "title glyph cell must fit the caption strip");
 
 /// CRISPYWIRE-REVIEW — the strip width the three-disc control cluster RESERVES, measured from the
 /// inner edge of the LEFT frame (WMCTRL, Peter 2026-08-09: the cluster is left-aligned, macOS-side;
@@ -161,16 +156,17 @@ const CTRL_RESERVE: usize = 3 * super::theme::CONTROL_BOX + 4 * GAP;
 /// at every scale, since `spawn_geometry`'s box width `w * scale + 2 * BORDER` is monotone in
 /// `scale`.
 ///
-/// [`controls`] declines a box narrower than `2*BORDER + GAP + CTRL_RESERVE + TITLE_CELL`, and a
+/// [`controls`] declines a box narrower than `2*BORDER + GAP + CTRL_RESERVE + TITLE_CELL_W`, and a
 /// window's box is `w * scale + 2 * BORDER`, so the `2*BORDER` cancels and the condition on the
-/// source width alone is `w >= GAP + CTRL_RESERVE + TITLE_CELL` — **148 px** at the current metrics
-/// (`12 + 120 + 16`), 112 before the size ruling.
+/// source width alone is `w >= GAP + CTRL_RESERVE + TITLE_CELL_W` — **139 px** at the current
+/// metrics (`12 + 120 + 7`; it was 148 when the glyph advance was the square 16 px bitmap cell),
+/// 112 before the size ruling.
 ///
 /// This exists because that threshold has now moved TWICE and both times a fixture surface was left
 /// behind it, turning a close-control gate into a silent SKIP (CRISPYWIRE sized one from 8 to 32,
 /// CRISPYWIRE-REVIEW from 96 to 128). Every fixture that needs a cluster sizes itself against this
 /// constant with a `const` assertion, so the third move fails the BUILD instead of the gate.
-pub const CLUSTER_MIN_SRC_W: usize = GAP + CTRL_RESERVE + TITLE_CELL;
+pub const CLUSTER_MIN_SRC_W: usize = GAP + CTRL_RESERVE + TITLE_CELL_W;
 
 /// A window identifier. Ids are `1..=MAX_WINDOWS`; `0` is never a valid window and is the
 /// fail-closed return for every operation that could not be satisfied.
@@ -1070,6 +1066,15 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>, expect_owner: Option<
     // the same table acquisition as the damage mark, like `skip`.
     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
     let pace_exempt;
+    // WPACE-TEXT — the shadow-refresh source, captured under the same table acquisition as the
+    // damage mark: `(surf, stride, surf_len, sy0, sy1)`, where `[sy0, sy1)` is the band this
+    // present declared, resolved by the same rule `damage_rows`/`damage_all` just applied. Read
+    // here because the copy itself runs after the lock drops (a surface read is not something to
+    // hold the window table across — the WC-G probe above sets the precedent, and the same
+    // argument covers the lifetime: the owner is parked inside the present syscall, so its
+    // address space cannot be unmapped underneath the copy).
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    let pace_src;
     {
         let mut t = table();
         let owner = match row_mut(&mut t, id) {
@@ -1094,6 +1099,16 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>, expect_owner: Option<
                     _ => r.damage_all(),
                 }
                 r.presented = true;
+                // WPACE-TEXT — the resolved band, by the exact rule the damage mark above applied:
+                // a valid `[y0, y1)` inside the surface is itself; anything else is the whole box.
+                #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+                {
+                    let (sy0, sy1) = match band {
+                        Some((y0, y1)) if y1 > y0 && y1 <= r.h => (y0, y1),
+                        _ => (0, r.h),
+                    };
+                    pace_src = (r.surf, r.stride, r.surf_len, sy0, sy1);
+                }
                 #[cfg(feature = "witness")]
                 if !r.compat {
                     probe = Some((r.surf, r.surf_len));
@@ -1131,6 +1146,21 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>, expect_owner: Option<
     // the frame nor raise a pending bit.
     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
     let pace_go = skip || pace_admit(id, pace_exempt);
+    // WPACE-TEXT — refresh this window's present-boundary shadow, NOW, while the owner is provably
+    // parked inside the syscall (the one moment the surface is quiescent — the same argument WC-G's
+    // `probe` rests on). A coalesced present's pixels reach the panel on a LATER, asynchronous pass
+    // (the ~1 kHz tail drain, or another window's frame-edge composite), and by then the owner is
+    // mid-draw of its NEXT frame — a live-surface read there catches a half-cleared glyph row, which
+    // is the GR27 metal text flicker. The shadow is the fix: every byte in it was copied at a
+    // present boundary, so the asynchronous blit composites a FINISHED frame by construction.
+    // Created lazily on the first coalesce (`!pace_go`), so a window the pacer never defers pays
+    // nothing; thereafter every present (admitted, coalesced, or suppressed) keeps it current with
+    // one bounded memcpy of the declared band. See [`pace_shadow_refresh`].
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    if !pace_exempt {
+        let (surf, stride, surf_len, sy0, sy1) = pace_src;
+        pace_shadow_refresh(id, surf, stride, surf_len, sy0, sy1, !pace_go);
+    }
     #[cfg(feature = "witness")]
     if let Some((surf, surf_len)) = probe {
         // WC-G's checksum is the OWNER's declaration of its own surface and is independent of whether
@@ -1395,6 +1425,248 @@ pub fn pace_service() {
     }
 }
 
+// ---- WPACE-TEXT — the present-boundary shadow (x86 + `wc`) --------------------------------------
+//
+// ### The defect (GR27 round 2, metal): text inside vug windows flickers under the pacer
+// `user-vug`'s HUD painter (`draw_num`) is CLEAR-THEN-REDRAW: it wipes its backing box to the
+// background and then stamps the digits. Pre-pacer, every present composited synchronously inside
+// the owner's own `SYS_WIN_PRESENT` — the one moment the owner is provably not writing — so the
+// compositor only ever read finished frames. WPACE-PANEL made the dominant carrier of a storming
+// window's damage ASYNCHRONOUS: the ~1 kHz tail drain (arbitrary app time) and frame-edge
+// composites riding another window's present. Those blits read the LIVE surface while the app is
+// mid-draw of its NEXT frame; land between the clear and the stamp and the readout blinks blank.
+// The crystal body barely shows it (`render_solid` is one-pass, every cell written once with its
+// final value — a mid-draw read is at worst a one-frame orientation seam); the text shows it hard,
+// because a half-drawn glyph row is BACKGROUND. WC-G predicted exactly this class: its review
+// established that a tail/frame-edge blit reads the surface the owner has since rewritten
+// (`own=no`).
+//
+// ### The fix: blit what the owner declared finished, never what it is drawing
+// One shadow per paced window, refreshed by a bounded memcpy at every present — i.e. only ever
+// while the owner is parked in the syscall and the surface is quiescent — and read by the
+// composite pass in place of the live surface. Every byte the panel sees was captured at a present
+// boundary, so a torn glyph is impossible by construction, from ANY pass (tail drain, foreign
+// frame-edge, drag-exposure repaints — the last of which could tear even pre-pacer). No app is
+// ever slept: the refresh is a memcpy of the declared band, and the pass side uses `try_lock`
+// with a provably-safe live fallback (contention means the owner is inside `pace_shadow_refresh`,
+// i.e. parked, i.e. the live surface is a finished frame at that instant).
+//
+// ### Memory (SHELLWIN-OOM rule)
+// Allocated FALLIBLY (`try_reserve`) on a window's first coalesced present only — a window the
+// pacer never defers allocates nothing — sized to `surf_len` (the full mapped slot: WC-G's
+// checksums and cache maintenance read that length off whatever address they are handed), bounded
+// by `MAX_WINDOWS` buffers total. On OOM the window simply stays on the live-read path (the pre-fix
+// regime: paced and correct, tearing text) and the decline is counted (`WPACE_SHDW_OOM`). The
+// buffers are slot-pooled statics, never freed: the validity bit is cleared when a slot is
+// re-issued (`create_inner`), and a stale-but-valid buffer for a dead row is unreachable because
+// the pass only reads rows that are `used`.
+
+/// WPACE-TEXT — the per-slot shadow buffers. All content access (fill and read) is under the
+/// per-slot lock, so a refresh can never realloc or write a buffer a pass is blitting from.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PACE_SHADOW: [Mutex<alloc::vec::Vec<u8>>; MAX_WINDOWS] =
+    [const { Mutex::new(alloc::vec::Vec::new()) }; MAX_WINDOWS];
+
+/// WPACE-TEXT — one bit per slot: the shadow holds a full copy of the surface as of some present
+/// boundary. Set only by [`pace_shadow_refresh`] after a whole-surface fill; cleared when the slot
+/// is re-issued (see [`create_inner`]), which covers every close path with one line.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PACE_SHADOW_OK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// WPACE-TEXT witness — shadow creations declined for want of heap. A nonzero count means some
+/// window is on the live-read (tearing-text) path; the wire says so instead of the operator's eyes.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+static WPACE_SHDW_OOM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WPACE-TEXT witness — refresh copies per slot, on the `[wpace]` line as `shdw=`. Zero on a line
+/// whose window never coalesced (no shadow exists) — that is the field saying "this window still
+/// composites its live surface, synchronously, and cannot tear". NOTE-5: counts only copies that
+/// moved bytes — a degenerate empty band ([`pace_shadow_refresh`]'s `off1 <= off0`) does not
+/// tick it, so `shdw` stays comparable to `paced + coalesced`.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+static WPACE_SHDW: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
+
+/// WPACE-TEXT witness — passes DEFERRED for a contended shadow lock, per slot, on the `[wpace]`
+/// line as `defer=`. The MAJOR-1 residual made visible: a nonzero count is the drain and the
+/// owner's next present colliding on one window's shadow, each collision costing one window one
+/// extra ~1 ms frame — never a torn glyph, never a live read.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+static WPACE_SHDW_DEFER: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
+
+/// WPACE-TEXT — refresh window `id`'s shadow from its (quiescent) surface. Called from
+/// [`present_banded`] only, i.e. with the owner parked in the present syscall; that parking is the
+/// entire correctness argument, so this function must never grow another caller that cannot make it.
+///
+/// `create` is "this present was coalesced": the first coalesce allocates (fallibly) and copies the
+/// whole readable extent; thereafter every present copies only the declared band `[sy0, sy1)` —
+/// prior bands were copied at their own presents, so the shadow is always the union of everything
+/// the owner has declared finished. A window that has no shadow and was not coalesced returns
+/// without touching the lock word beyond one load: the admitted present it belongs to composites
+/// synchronously from the live surface, which is quiescent right now — the pre-pacer path, safe.
+///
+/// The `lock()` (not `try_lock`) is deliberate and bounded: the only other holder is a composite
+/// pass blitting this same window's shadow, so the spin is at most one window's staged blit (plus
+/// its budgeted one-shot witnesses on the handful of passes that run them). That is a bounded
+/// busy-wait, not a sleep — the renderer is never parked — and it is paid only when the drain and
+/// the owner's next present actually collide on one window.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[allow(clippy::too_many_arguments)]
+fn pace_shadow_refresh(
+    id: WinId,
+    surf: usize,
+    stride: usize,
+    surf_len: usize,
+    sy0: usize,
+    sy1: usize,
+    create: bool,
+) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let slot = (id as usize).wrapping_sub(1);
+    if slot >= MAX_WINDOWS || surf == 0 || stride == 0 {
+        return;
+    }
+    let bit = 1u32 << slot;
+    let valid = PACE_SHADOW_OK.load(Relaxed) & bit != 0;
+    if !valid && !create {
+        return;
+    }
+    // The WHOLE mapped slot, not `h * stride`: the blit itself reads at most `h` rows at the row
+    // stride (F1), but WC-G's `blit`/`after`/`civac` checksums read — and its cache maintenance
+    // walks — `surf_len` bytes of whatever address they are handed, and after the swap that
+    // address is this buffer. Undersizing it would be an out-of-bounds read on every witness
+    // pass; sizing to `surf_len` also keeps `cks_blit` byte-comparable to the `cks_app` the
+    // owner's present declared over the same length.
+    if surf_len == 0 {
+        return;
+    }
+    let mut buf = PACE_SHADOW[slot].lock();
+    // NOTE-5 — count only copies that moved bytes, so `shdw` stays comparable to `paced +
+    // coalesced` and a degenerate empty band does not inflate it.
+    #[cfg_attr(not(feature = "witness"), allow(unused_variables))]
+    let copied;
+    if !valid {
+        if buf.len() < surf_len {
+            // SHELLWIN-OOM — fallible, from present context. A decline leaves the window on the
+            // live-read path: paced, correct, text may tear — strictly the pre-fix regime.
+            let add = surf_len - buf.len();
+            if buf.try_reserve(add).is_err() {
+                #[cfg(feature = "witness")]
+                WPACE_SHDW_OOM.fetch_add(1, Relaxed);
+                return;
+            }
+            buf.resize(surf_len, 0);
+        }
+        // First fill is the WHOLE extent, not the band: the pass reads any row the geometry
+        // reaches, and a band-only fill would put the allocator's zeros on the panel for every
+        // row outside the first present's declaration.
+        unsafe {
+            core::ptr::copy_nonoverlapping(surf as *const u8, buf.as_mut_ptr(), surf_len);
+        }
+        PACE_SHADOW_OK.fetch_or(bit, Relaxed);
+        copied = true;
+    } else {
+        let off0 = (sy0.saturating_mul(stride)).min(surf_len).min(buf.len());
+        let off1 = (sy1.saturating_mul(stride)).min(surf_len).min(buf.len());
+        if off1 > off0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (surf + off0) as *const u8,
+                    buf.as_mut_ptr().add(off0),
+                    off1 - off0,
+                );
+            }
+            copied = true;
+        } else {
+            copied = false;
+        }
+    }
+    #[cfg(feature = "witness")]
+    if copied {
+        WPACE_SHDW[slot].fetch_add(1, Relaxed);
+    }
+}
+
+/// WPACE-TEXT — the outcome of asking a window for its blit source. See [`pace_shadow_source`].
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+enum ShadowSrc {
+    /// The row's `surf` was swapped onto the shadow; the guard pins that buffer for the whole
+    /// blit and its bracketing witnesses. Composite from `r` unchanged.
+    Shadow(MutexGuard<'static, alloc::vec::Vec<u8>, SpinRelax>),
+    /// No shadow governs this window's pixels, and reading its LIVE surface is honest: an exempt
+    /// row (furniture/compat — never paced, present-synchronous), a window that has never been
+    /// coalesced (every composite of it runs inside its own present syscall, quiescent), or an
+    /// OOM-declined creation (the documented degraded mode — paced, text may tear). Composite
+    /// from `r` as-is.
+    Live,
+    /// A shadow is VALID for this window but its lock is held right now — the owner is inside
+    /// [`pace_shadow_refresh`]'s memcpy. Reading the live surface here would be UNSOUND: the
+    /// refresh completes in µs and the coalesced present returns without a `COMP_GATE` park, so
+    /// the owner can resume its clear-then-redraw while this pass is still in
+    /// `draw_window`/WC-G/WC-D — the exact torn-glyph the shadow exists to prevent, plus a
+    /// live-read the two witnesses would misjudge. The pass DEFERS this window (skips it and
+    /// re-raises its damage + `PACE_PENDING`), and the ~1 ms drain carries it next pass when the
+    /// µs-long refresh is done. Never a blocking spin: an owner PREEMPTED mid-refresh would make
+    /// the spin scheduling-length.
+    Defer,
+}
+
+/// WPACE-TEXT — decide a window's blit source: shadow, honest live, or defer. See [`ShadowSrc`]
+/// for why the three arms are exactly these and why the contended arm cannot fall back to live.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn pace_shadow_source(r: &mut Window) -> ShadowSrc {
+    use core::sync::atomic::Ordering::Relaxed;
+    if r.compat || r.owner_asid == 0 || is_kernel_owner(r.owner_asid) {
+        return ShadowSrc::Live;
+    }
+    let slot = (r.id as usize).wrapping_sub(1);
+    if slot >= MAX_WINDOWS || PACE_SHADOW_OK.load(Relaxed) & (1u32 << slot) == 0 {
+        // No shadow yet (never coalesced) — the live surface is quiescent, honest.
+        return ShadowSrc::Live;
+    }
+    // Shadow VALID from here on: a live read is only sound if we hold the lock. A miss DEFERS.
+    let g = match PACE_SHADOW[slot].try_lock() {
+        Some(g) => g,
+        None => return ShadowSrc::Defer,
+    };
+    // `surf_len`, not `h * stride`: WC-G's checksums and cache maintenance read the full mapped
+    // length off whatever `surf` they are handed — see [`pace_shadow_refresh`]'s sizing note. An
+    // OOM-declined buffer (shorter than the extent) is the honest live degraded mode, not a
+    // defer: the shadow bit is not set for it, so this branch is reached only if a valid shadow
+    // is somehow undersized, which the sizing invariant forbids — treat it as live defensively.
+    if r.surf_len == 0 || g.len() < r.surf_len {
+        return ShadowSrc::Live;
+    }
+    r.surf = g.as_ptr() as usize;
+    ShadowSrc::Shadow(g)
+}
+
+/// WPACE-TEXT — the contended-shadow deferral: re-raise this window's whole-box damage and its
+/// pacer pending bit so the ~1 ms tail drain ([`pace_service`]) re-attempts the blit next pass,
+/// by which time the µs-long refresh that held the lock has finished. Runs in the composite blit
+/// loop, which holds no table lock (the pass snapshotted and released it), so taking `table()`
+/// here is a fresh, un-nested acquisition — the same ordering `move_to`/`close` use when they
+/// re-damage. Whole box (`damage_all`), not the pass's band: conservative, and the next carrier
+/// re-derives its own band from the owner's presents in the interim.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn pace_shadow_defer(id: WinId) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let slot = (id as usize).wrapping_sub(1);
+    if slot >= MAX_WINDOWS {
+        return;
+    }
+    {
+        let mut t = table();
+        if let Some(r) = row_mut(&mut t, id) {
+            r.damage_all();
+        }
+    }
+    PACE_PENDING.fetch_or(1u32 << slot, Relaxed);
+    #[cfg(feature = "witness")]
+    WPACE_SHDW_DEFER[slot].fetch_add(1, Relaxed);
+}
+
 /// WPACE-PANEL witness — presents that composited in present context under the pacer (frame-edge
 /// admissions of pace-eligible rows). Exempt rows are not counted on either counter: their line is
 /// `[wcn]`'s, unchanged.
@@ -1433,20 +1705,39 @@ fn wpace_emit(ident: &[(u64, bool, bool, u32); MAX_WINDOWS]) {
         let paced = WPACE_PACED[slot].swap(0, Relaxed);
         let coalesced = WPACE_COALESCED[slot].swap(0, Relaxed);
         let tail = WPACE_TAIL[slot].swap(0, Relaxed);
-        if paced == 0 && coalesced == 0 && tail == 0 {
+        // WPACE-TEXT — `shdw=` is refresh copies this span, `defer=` is contended-shadow skips.
+        // Both are swapped unconditionally (before the traffic test) so their counters never
+        // straddle a span, and `defer` joins the traffic test so a window that only deferred this
+        // span still prints its line.
+        let shdw = WPACE_SHDW[slot].swap(0, Relaxed);
+        let defer = WPACE_SHDW_DEFER[slot].swap(0, Relaxed);
+        if paced == 0 && coalesced == 0 && tail == 0 && defer == 0 {
             continue;
         }
+        // Healthy paced steady state: `shdw ≈ paced + coalesced` (every non-suppressed present
+        // refreshes once a shadow exists); `shdw=0` with `coalesced>0` means the shadow could not
+        // be created (see the `shadow-oom` line) and this window's text can still tear. `defer=`
+        // is the MAJOR-1 residual: each is one window costing one extra ~1 ms frame, never a torn
+        // glyph.
         let (asid, live, _, _) = ident[slot];
         serial_println!(
-            "[wpace] win={} asid={:#x} live={} mode=panel paced={} coalesced={} tail={} frame_us={}",
+            "[wpace] win={} asid={:#x} live={} mode=panel paced={} coalesced={} tail={} shdw={} defer={} frame_us={}",
             slot + 1,
             asid,
             if live { "yes" } else { "no" },
             paced,
             coalesced,
             tail,
+            shdw,
+            defer,
             PACE_FRAME_US
         );
+    }
+    // WPACE-TEXT — the OOM decline count, its own line and only when nonzero: it is the one state
+    // in which the flicker this block exists to kill is still possible.
+    let oom = WPACE_SHDW_OOM.swap(0, Relaxed);
+    if oom > 0 {
+        serial_println!("[wpace] shadow-oom declines={} mode=panel", oom);
     }
 }
 
@@ -3229,6 +3520,18 @@ static PAYGO_SVC_BUSY: core::sync::atomic::AtomicBool =
 static PAYGO_SVC_TRIES: [core::sync::atomic::AtomicU32; WCD_IDS] =
     [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
 
+/// WCG-CHUNK — chunk PROGRESS re-arms the taker's liveness bound, the same rule the wc-d chunking
+/// applies at its own banking site: [`PAYGO_SVC_TRIES`] caps marks WITHOUT progress (its anti-wedge
+/// purpose), and a wc-g sample that now takes the console box in hundreds of chunks would exhaust a
+/// fixed cap of 16 while doing exactly what it was asked to. Called by `wcg::end` when a clean
+/// chunk banks and advances its cursor; the counter lives here beside the taker that reads it.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+pub(super) fn paygo_svc_progress(i: usize) {
+    if i < WCD_IDS {
+        PAYGO_SVC_TRIES[i].store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// PAYGO-TERM — per-id: this tenant's taker has already said it gave up.
 ///
 /// The STOP-NOTE's one-shot, and it is a latch rather than the equality `tries == PAYGO_SVC_MAX + 1`
@@ -3636,7 +3939,13 @@ pub fn composite() {
         while !masked && rounds < COMP_RERUN_MAX && COMP_PENDING.swap(false, AcqRel) {
             let dmg = any_damaged();
             let owed = deferred_owed();
-            if !dmg && !owed {
+            // MENU-DRIVE / REVIEW — the SHARD menu is a third thing a declined pass can owe, and one
+            // `any_damaged`/`deferred_owed` structurally cannot see (an open menu is no row and no
+            // queued box). Without it this loop's `!dmg && !owed` break stranded an open-in-state
+            // menu; with it the gate holder is the guaranteed painter and the crystal arc's in-place
+            // retry is belt-and-braces. `deferred_owed`'s cost and shape.
+            let menu = menu_paint_owed();
+            if !dmg && !owed && !menu {
                 break; // the decliner's damage was already absorbed by the round above
             }
             // WC-K2r — a pass taken ONLY because the erase queue was non-empty. Counted because the
@@ -3646,6 +3955,13 @@ pub fn composite() {
             #[cfg(feature = "witness")]
             if !dmg && owed {
                 super::wcg::erase_wakeup_rescue();
+            }
+            // MENU-DRIVE / REVIEW — the same rescue accounting for the menu term: a pass the holder
+            // ran ONLY because the menu owed a paint/erase. `menu` (not `!dmg && !owed && menu`) so a
+            // pass that carries a menu paint alongside window damage still records the menu was owed.
+            #[cfg(all(feature = "witness", feature = "wc"))]
+            if menu {
+                super::crystal::menu_wakeup_rescue();
             }
             rounds += 1;
             #[cfg(feature = "witness")]
@@ -3670,13 +3986,23 @@ pub fn composite() {
             if COMP_PENDING.swap(false, AcqRel) {
                 let dmg = any_damaged();
                 let owed = deferred_owed();
-                if dmg || owed {
+                // MENU-DRIVE / REVIEW — the menu term on the lost-wakeup gate too. A fix applied to
+                // only the loop above would leave the strand on the rarer path — and it is the one a
+                // STATIC desktop takes: the close-the-last-window gesture publishes `COMP_PENDING`
+                // after the loop's last `swap` exactly when there is no window left to make `dmg`
+                // true, which is Boot B's own sequence.
+                let menu = menu_paint_owed();
+                if dmg || owed || menu {
                     // WC-K2r — same rescue count, same reason; this is the other gate that consumes
                     // the wakeup, and a fix applied to only one of them would leave the defect on the
                     // rarer path, which is the one a static desktop actually takes.
                     #[cfg(feature = "witness")]
                     if !dmg && owed {
                         super::wcg::erase_wakeup_rescue();
+                    }
+                    #[cfg(all(feature = "witness", feature = "wc"))]
+                    if menu {
+                        super::crystal::menu_wakeup_rescue();
                     }
                     #[cfg(feature = "witness")]
                     WCSER_RERUNS.fetch_add(1, Relaxed);
@@ -3737,6 +4063,25 @@ struct Owed {
 /// same values. No stash exists to be read or written, and `composite_tail_owed` is a no-op there.
 /// That is what lets WCSER's re-run loop keep calling this in a loop: every round is still a full
 /// pass with its own inline cursor tail, exactly as the loop's correctness argument requires.
+/// MENU-DRIVE / REVIEW — is the SHARD dropdown owed a paint or an erase? The THIRD term in the "is
+/// anything OWED" tests, beside [`any_damaged`] and [`deferred_owed`]. The open menu is neither a
+/// dirty window nor a queued erase box, so without this term the gate holder's re-run loop would
+/// break on `!dmg && !owed` and strand an open-in-state menu with nothing committed to painting it
+/// — the exact residual the crystal arc's in-place retry could not close when a holder keeps the
+/// gate for milliseconds. `feature = "wc"` only, where the crystal (and this hazard) exist; a
+/// no-`wc` build has no menu and answers `false` on a bare load.
+#[cfg(target_arch = "x86_64")]
+fn menu_paint_owed() -> bool {
+    #[cfg(feature = "wc")]
+    {
+        super::crystal::paint_owed()
+    }
+    #[cfg(not(feature = "wc"))]
+    {
+        false
+    }
+}
+
 fn composite_once() {
     // ENGAGE — TAKE THE ARM ONCE, FOR THIS PASS, AND BEFORE ANYTHING ELSE CAN SPEND IT.
     //
@@ -4453,6 +4798,27 @@ fn composite_inner() -> CursorTail {
         // per window rather than once per pass because the set is relative to the painter; the scan
         // is `MAX_WINDOWS` rows against a call that is about to copy a box.
         let clip = occ_clip(&rows, i, shell, fb.info().width, fb.info().height);
+        // WPACE-TEXT — blit from the present-boundary shadow when this window has one: `rw` is the
+        // pass's working copy of the row, with `surf` swapped onto the shadow buffer, and the guard
+        // pins that buffer (against refresh and refill) for the whole of the draw AND of the WC-G /
+        // WC-D witnesses around it — they must checksum the bytes the blit consumed, not whatever
+        // the owner writes next. Everything below this line reads `rw`, never `rows[i]`. On aarch64
+        // and `wc`-off x86 `rw` IS `rows[i]`, bit for bit.
+        #[allow(unused_mut)]
+        let mut rw = rows[i];
+        // WPACE-TEXT — three outcomes (see [`ShadowSrc`]): blit from the shadow (guard pins it
+        // across the draw and its witnesses), blit the honest live surface (no shadow, or the
+        // OOM degraded mode), or DEFER a valid-but-contended shadow — skip this window and let
+        // the ~1 ms drain carry it, never a live read that could tear.
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+        let _shadow_pin = match pace_shadow_source(&mut rw) {
+            ShadowSrc::Shadow(g) => Some(g),
+            ShadowSrc::Live => None,
+            ShadowSrc::Defer => {
+                pace_shadow_defer(rows[i].id);
+                continue;
+            }
+        };
         // WC-D — the REFERENCE, taken BEFORE the blit. See `verify_reference` and the WCD-PRE section
         // of `verify_window`'s ledger for why it cannot be taken any later: the read-back's reference
         // used to be snapshotted from inside `verify_window`, which runs after `wcg::end` and
@@ -4467,7 +4833,7 @@ fn composite_inner() -> CursorTail {
         // charged to `[wc-g] us=` — manufacturing a `slow=yes` tear report out of this witness's own
         // cost. WC-G's bracket must still contain the copy and nothing else.
         #[cfg(feature = "witness")]
-        let wcd_ref = verify_reference(&fb, &rows[i], bands[i], &clip);
+        let wcd_ref = verify_reference(&fb, &rw, bands[i], &clip);
         // WC-G — bracket the blit. `begin` must be the last thing before `draw_window` and `end` the
         // first thing after it: the `blit`/`after` checksums mean "the surface as the copy found it"
         // and "as the copy left it", and anything inserted between them widens the interval they
@@ -4477,15 +4843,15 @@ fn composite_inner() -> CursorTail {
         // keeps the four-argument call and its byte-identical wire.
         #[cfg(all(feature = "witness", target_arch = "x86_64"))]
         let wcg_probe = super::wcg::begin(
-            rows[i].id,
-            rows[i].surf,
-            rows[i].surf_len,
-            rows[i].compat,
+            rw.id,
+            rw.surf,
+            rw.surf_len,
+            rw.compat,
             // WC-K3 — the excuse, widened to whatever the blit is about to withhold.
-            occ_excuse(rows[i].z, rows[i].id, &clip),
+            occ_excuse(rw.z, rw.id, &clip),
         );
         #[cfg(all(feature = "witness", not(target_arch = "x86_64")))]
-        let wcg_probe = super::wcg::begin(rows[i].id, rows[i].surf, rows[i].surf_len, rows[i].compat);
+        let wcg_probe = super::wcg::begin(rw.id, rw.surf, rw.surf_len, rw.compat);
         // CURSOR-3 — WHICH WINDOWS MAY CARRY THE SPRITE. WC-I's invariant "no verified pixel is ever
         // read with the sprite on the panel" is preserved here rather than weakened: this pass may
         // read this window's destination pixels back and compare them against its SOURCE surface —
@@ -4519,7 +4885,7 @@ fn composite_inner() -> CursorTail {
         // the read-back rather than of the latch.
         #[cfg(feature = "witness")]
         {
-            let r = &rows[i];
+            let r = &rw;
             if !r.compat && r.presented && r.id < 32 {
                 let bit = 1u32 << r.id;
                 if wcd_ref.is_some()
@@ -4540,8 +4906,8 @@ fn composite_inner() -> CursorTail {
         // keeps a compat row (owner ASID 0) from matching it by accident.
         overlaid |= draw_window(
             &fb,
-            &rows[i],
-            focus != 0 && focus == rows[i].owner_asid,
+            &rw,
+            focus != 0 && focus == rw.owner_asid,
             plan,
             may_overlay,
             // CURSOR-7 — `disturbed`, not `plan.is_some()`: the question the present-overlap test has
@@ -4558,7 +4924,7 @@ fn composite_inner() -> CursorTail {
         );
         #[cfg(feature = "witness")]
         if let Some(p) = wcg_probe {
-            let r = &rows[i];
+            let r = &rw;
             // GR21/WCD-OCC — the read-back-time occluder set, unioned in `end` with the pre-blit set
             // carried in the probe. x86 only; aarch64 keeps the eight-argument call.
             #[cfg(target_arch = "x86_64")]
@@ -4572,7 +4938,7 @@ fn composite_inner() -> CursorTail {
         // `wcg::end`: this emits to the serial UART, and inside the bracket it would be charged to
         // `[wc-g] us=`. See `wcg::stage_flush`.
         #[cfg(feature = "witness")]
-        super::wcg::stage_flush(rows[i].id);
+        super::wcg::stage_flush(rw.id);
         // WC-D — verify this window's blit against the scan-out, once per window id, from inside the pass
         // that drew it (the only place both the source surface and the destination rows are known).
         //
@@ -4582,7 +4948,7 @@ fn composite_inner() -> CursorTail {
         // meantime no longer matters: the reference was frozen before the blit.
         #[cfg(feature = "witness")]
         if let Some(vr) = wcd_ref {
-            verify_window(&fb, &rows[i], vr, &clip);
+            verify_window(&fb, &rw, vr, &clip);
         }
         // WC-N — pixels on glass for this window id. The only writer of `comp`.
         // WCN-CAUSE — `!seed[i]` is the cause: this row was not dirty at the table snapshot, so the
@@ -4859,6 +5225,26 @@ fn tail_of(disturbed: bool, session: bool, deferred: bool) -> CursorTail {
 #[cfg(feature = "witness")]
 #[allow(unused_variables)]
 fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccClip) {
+    // COMP2-WCD — charge everything this function does to [`C2_WCD_CYC`], on EVERY exit path (the
+    // teardown abort, the silent banked chunk, the verdicts), so `[comp2] wcd_us=` can name this
+    // witness on the wire when a pass's `blit_us` spikes. A drop guard rather than per-exit charges:
+    // the abort arm and the banked-chunk arm both `return` mid-function, and a counter that missed
+    // them would exonerate exactly the passes it exists to convict. The span deliberately includes
+    // the repair redraw and the verdict's own UART time — the question the field answers is "how
+    // much of this pass was WC-D", not "how much was probes". GR27 Boot B: the shell reopen's
+    // stage-1 lattice verdict (79 470 probes x 2 read-back passes through the panel BAR) was a
+    // single max_us=302134 composite pass that read as a 20x panel-bandwidth collapse in `[comp2]`
+    // — `blit_us=154550` against `compose_us+present_us=10389` — and nothing on the wire named it.
+    struct WcdClock(u64);
+    impl Drop for WcdClock {
+        fn drop(&mut self) {
+            C2_WCD_CYC.fetch_add(
+                crate::arch::now_cycles().saturating_sub(self.0),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+    let _wcd_clock = WcdClock(crate::arch::now_cycles());
     let info = fb.info();
     let VerifyRef { row0, row1, cols, banded, cksum_pre, want, step, running,
         #[cfg(target_arch = "x86_64")] seq,
@@ -5095,22 +5481,63 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
         }
     };
 
-    // WCD-CHUNK — the time stop arms for the STAGE-2 read-back only; stage 1 keeps its whole-band
-    // single-pass shape (see the stage line in [`verify_reference`]'s cursor block).
+    // WCD-CHUNK — `chunked` selects the stage-2 CUMULATIVE machinery only (the resume cursor, the
+    // banked sums, the one closing verdict). The TIME STOP is armed for EVERY read-back now —
+    // stage 1 included — which is WCD-CLIP1 (GR27 Boot B): the stage-1 exemption rested on "stage 1
+    // is the small term, ~78 ms on Boot Ab", and that premise was measured on a 128x128 window. On
+    // a panel-scale window it is false by an order of magnitude: the 1440x883 shell's stage-1
+    // lattice verdict is 79 470 probes x 2 read-back passes at ~1.9 us/probe ≈ 302 ms, held under
+    // `COMP_GATE` with IRQs masked inside the reopening present ([comp2] max_us=302134,
+    // [flick2] down_max=300ms -> SLOW), and the boot-log console's is 500-760 ms. Every window
+    // CREATE pays it — including every dock reopen, whose recycled id resets [`WCD_STATE`].
+    //
+    // Stage 1 keeps its single-pass, verdict-now shape: no cursor, no banking, no termination
+    // dependency on later presents (the objections that kept it unchunked). The stop simply CLIPS
+    // the verdict to the rows the budget covered, and `band=` says so on the wire — the same
+    // honesty WCD-BAND already applies when a banded present narrows the ask. Stage 2's chunked
+    // full-coverage walk still adjudicates the whole box afterwards, so no coverage is lost to the
+    // clip, only deferred to the stage that was built to pay for it incrementally. On QEMU the
+    // probes are RAM-fast and the stop never fires, so the regression wire is SPEC-identical and,
+    // on a fast host, byte-identical; a slow TCG host whose per-pass wall sits near `WCD_CHUNK_US`
+    // can trip the stop and print stage-1 lines as `band=0..N`, still spec-green because nothing
+    // anchors on `band=` (the REQUIREs match `coverage=` and the `-> PASS`/`-> FAIL` terminals).
+    //
+    // THE HONEST RESIDUAL, named rather than buried: a clip DEFERS the unwalked rows to stage 2,
+    // it does not verify them now. So a genuine blit defect below the clipped extent — roughly
+    // below row 12 of a panel-scale window at the metal probe rate — is INVISIBLE on the launch
+    // instant and stays so until this window's stage-2 battery matures: the deferral gate opens at
+    // 15 s of uptime, or a `paygo_service` whole-box mark / pay-at-close forces it earlier. That is
+    // the price of not holding `COMP_GATE` for a third of a second; it is the same deferral WC-D's
+    // stage split already accepted for the FULL verdict, now extended to the top-of-box rows too.
     #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
     let chunked = running == WCD_ST_FULL_RUN;
     #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
     let chunked = false;
+    // WCD-CLIP1 — the ask, kept so the clip below can be told from a full walk. `chunked` still
+    // feeds the banking arm; `true` here is what arms the time stop for stage 1 as well (dead on
+    // every build without the chunking, where `pass` ignores its `bounded` argument).
+    let row1_ask = row1;
     #[cfg(target_arch = "x86_64")]
     let (rows_done, checked, bad_cache, moved_cache, nonzero, first_cache, firstmv_cache, occ_cache, spr_cache) =
-        pass(fb, row1, chunked);
+        pass(fb, row1, true);
     #[cfg(not(target_arch = "x86_64"))]
     let (rows_done, checked, bad_cache, moved_cache, nonzero, first_cache, firstmv_cache, spr_cache) =
-        pass(fb, row1, chunked);
+        pass(fb, row1, true);
     // WCD-CHUNK — from here on, `row1` IS the rows the first pass actually walked: the invalidate,
     // the second pass, the `band=` field, the interlock rect and the cursor all describe the chunk,
     // not the ask. A no-op rebind on every build without the chunking (`rows_done == row1` there).
     let row1 = rows_done;
+    // WCD-CLIP1 — the distinct CLIP fact: the time stop cut this walk short of the rows it asked
+    // for. `banded` folds it in for the wire, but the terminal-vs-defer decision below needs it
+    // apart from a present that was banded for other reasons (a genuinely narrow damage band that
+    // the stop did NOT cut is a full verdict of what it promised; a stopped walk is not).
+    let clipped = row1 < row1_ask;
+    // WCD-CLIP1 — a walk the time stop cut is a BANDED verdict whatever the present declared: the
+    // rows past the cursor were not adjudicated, and a `band=none` line over them would claim a
+    // clearance nothing bought. Also closes a pre-existing gap in stage 2: the FIRST chunk of a
+    // box at most [`WCD_CHUNK_ROWS_MAX`] rows tall entered with `banded=false`, so a FAIL inside it
+    // printed `band=none` while having walked only the rows the stop allowed.
+    let banded = banded || clipped;
 
     // Discard, never clean — see the doc comment. Bare `IVAC` is what makes `bad_ram` able to fail.
     // WCD-BAND: the extent follows the verified rows, not the whole window, so a banded verdict
@@ -5168,7 +5595,10 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
     // WC-D/PAYGO — `checked` is the honest denominator and always was, but a denominator does not say WHY
     // it is small. This does, positionally, right beside the count it qualifies. Empty on every build but
     // an x86 `wcg-paygo` one, so the three lines below stay byte-identical elsewhere.
-    let coverage = wcd_coverage_note(step);
+    // WCD-CLIP1 — `clipped` is part of the derivation now: a collapsed lattice (`step == 1`) whose
+    // walk the stop CUT did not reach full coverage, so it must not print `coverage=full`. See
+    // [`wcd_coverage_note`].
+    let coverage = wcd_coverage_note(step, clipped);
     // WCD-TEARDOWN — close the panel-write window. Taken AFTER the last probe and before the first
     // print, so it covers exactly the interval the verdict rests on and nothing this function does
     // to the panel afterwards. x86 only; see the WCD-TEARDOWN ledger for why the arch gate is a
@@ -5421,15 +5851,27 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
         );
     }
     // WC-D/PAYGO — the battery's terminal line, emitted right behind the verdict that closed it. `step ==
-    // 1` is exactly "this pass ran at full coverage", which is the condition `wcd_commit` sealed
-    // `VERIFIED_FULL` on, so the two cannot disagree about whether the window still owes a verdict. A
-    // sampled pass prints nothing here — its `coverage=lattice16` marker already says what it was, and the
-    // `state=waiting` census will speak from the first composite this window is declined on.
+    // 1` is "this pass ran at full HORIZONTAL coverage", and `full` adds "and reached the box's last
+    // row" — the pair is exactly the condition `wcd_commit` seals `VERIFIED_FULL` on, so the two cannot
+    // disagree about whether the window still owes a verdict. A sampled pass prints nothing here — its
+    // `coverage=lattice16` marker already says what it was, and the `state=waiting` census will speak
+    // from the first composite this window is declined on.
+    //
+    // WCD-CLIP1 — `full` demotes the one dishonest terminal: a COLLAPSED lattice (`step == 1`, a rect
+    // narrower than the step) whose STAGE-1 walk the time stop CUT short. Sealing it would close the
+    // battery over rows it never adjudicated (`coverage=full band=0..3 -> PASS` then `-> PAID`, the
+    // terminal-over-partial the module forbids). Instead it commits as a first verdict — no
+    // `VERIFIED_FULL`, no `-> PAID` — and stage 2's cursor walk buys the rest. An uncollapsed stage-1
+    // pass runs `step > 1` and already commits non-terminally, so this only ever fires for the collapse;
+    // a stage-2 pass reaches here only after its cursor closed the box (`row1 < full_rows` returns
+    // early), so `running == WCD_ST_FIRST_RUN` keeps it out. Geometrically near-unreachable (a rect
+    // narrow enough to collapse the lattice cannot burn 2 ms of probes), but the type system allows it.
     // WC-D — the verdict is published; advance the window and set the flags the rest of the module
     // reads. After the print, so a `[wc-a]`-ordering reader sees verdict-then-transition.
-    wcd_commit(wi, running, step);
+    let full = !(clipped && running == WCD_ST_FIRST_RUN && step == 1);
+    wcd_commit(wi, running, step, full);
     #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
-    if step == 1 {
+    if step == 1 && full {
         wcd_complete(r.id, wi);
     }
 
@@ -5616,15 +6058,21 @@ fn verify_reference(
     // termination ride on them); and a cursor at or past the box's whole extent means the box SHRANK
     // under a part-paid battery, which closes it as PAID rather than wedging it — every row the box
     // still has was walked, and `-> UNPAID` silence is the convicted shape this module forbids.
-    // STAGE 2 ONLY, and that is a semantic line, not a cost call. Stage 1's lattice verdict has
-    // always been "the band this present offered, once" — band-clipped, immediate, closed on its
-    // first pass — and the x86 gate REQUIREs its line early in the boot. Chunking it would quietly
-    // promote it to "the whole box, cumulatively", whose termination then depends on presents that
-    // contain the cursor row — a dependency a band-only presenter (the routed console presents
-    // 0..64-row bands for stretches) never satisfies for stage 1, because `paygo_service`'s
-    // whole-box rescue only reaches DECLINED (stage-2) windows. Stage 1 is also the small term on
-    // the launch instant — ~78 ms against stage 2's ~1.26 s on Boot Ab — so it keeps today's shape
-    // to the byte, and the time stop below never arms for it.
+    // THE CURSOR is STAGE 2 ONLY, and that is a semantic line, not a cost call. Stage 1's lattice
+    // verdict has always been "the band this present offered, once" — band-clipped, immediate,
+    // closed on its first pass — and the x86 gate REQUIREs its line early in the boot. Making it
+    // CUMULATIVE would quietly promote it to "the whole box", whose termination then depends on
+    // presents that contain the cursor row — a dependency a band-only presenter (the routed
+    // console presents 0..64-row bands for stretches) never satisfies for stage 1, because
+    // `paygo_service`'s whole-box rescue only reaches DECLINED (stage-2) windows.
+    //
+    // WCD-CLIP1 (GR27 Boot B) — the TIME STOP, however, now arms for stage 1 too, WITHOUT the
+    // cursor: a stopped stage-1 walk closes its verdict immediately over the rows it reached, with
+    // `band=` naming them (see the clip note at the `pass` call in [`verify_window`]). The old
+    // exemption also leaned on "stage 1 is the small term, ~78 ms on Boot Ab" — measured on a
+    // 128x128 window; a panel-scale window's stage-1 lattice verdict is 300-760 ms under
+    // `COMP_GATE`, paid on every window create and every dock reopen, and was Boot B's 20x
+    // "panel bandwidth collapse" in `[comp2]`.
     #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
     let (row0, row1, banded) = if running != WCD_ST_FULL_RUN {
         (row0, row1, banded)
@@ -5648,7 +6096,9 @@ fn verify_reference(
                     WCD_ACC_OCC[i].load(Relaxed), surface_checksum(r),
                     if mv > 0 { "LIVE (unverifiable)" } else { "PASS" }
                 );
-                wcd_commit(i, running, 1);
+                // WCD-CLIP1 — `full = true`: this is a STAGE-2 close over every row the shrunk box
+                // still has, cumulative from row 0, so it legitimately earns the terminal state.
+                wcd_commit(i, running, 1, true);
                 wcd_complete(r.id, i);
             } else {
                 wcd_unwind(i, running);
@@ -6289,9 +6739,13 @@ static WCD_LASTROLL: [core::sync::atomic::AtomicU64; WCD_IDS] =
 /// measures since KERNEL entry, so it takes the cost off the boot burst and leaves it on every
 /// launch after 15 s of uptime — which is all of them.
 ///
-/// The STAGE-2 verdict is therefore paid in CHUNKS (stage 1 keeps its band-clipped single pass —
-/// the small term, ~78 ms on Boot Ab, and the shape the gates REQUIRE early; see the stage line in
-/// [`verify_reference`]). Each admitted pass walks the glass from a per-id resume cursor for at
+/// The STAGE-2 verdict is therefore paid in CHUNKS. Stage 1 keeps its single-pass verdict-now
+/// shape (the shape the gates REQUIRE early; see the stage line in [`verify_reference`]) but is
+/// TIME-BOUNDED by the same stop since WCD-CLIP1: "~78 ms on Boot Ab" was a 128x128 window, and a
+/// panel-scale window's stage-1 walk is 300-760 ms — Boot B's shell-reopen freeze. A stopped
+/// stage-1 walk closes immediately over the rows it reached, `band=` naming them; stage 2's
+/// cursor walk buys the whole box afterwards. Each admitted stage-2 pass walks the glass from a
+/// per-id resume cursor for at
 /// most this many microseconds per read-back pass (whole source rows, at least one), banks the
 /// clean counts, hands the reference back, and the next admitted composite resumes where it
 /// stopped. The verdict line prints ONCE, cumulative, when the cursor closes the box — one PASS on
@@ -6730,18 +7184,29 @@ fn wcd_cas(i: usize, from: u32, to: u32) -> bool {
 /// lattice correct rather than merely tolerable: a rect narrower than the step is walked at full
 /// coverage (see [`verify_reference`]), so it earned the terminal state on its first pass and must
 /// not be re-verified later to say the same thing again.
+///
+/// WCD-CLIP1 — `full` is what makes "walked at full coverage" a FACT rather than an inference from
+/// `step`. A collapsed lattice runs `step == 1` (the terminal condition) but a stage-1 pass the
+/// time stop CUT short did NOT reach the box's last row — so sealing `VERIFIED_FULL` + `DONE` on
+/// it terminally closes the battery over rows it never adjudicated, and stage 2 never runs to buy
+/// them. The caller passes `full == false` for exactly that case (`clipped && stage 1 && step ==
+/// 1`), which routes it through the stage-1→stage-2 transition below instead: a first verdict, no
+/// `VERIFIED_FULL`, cursor reset, stage 2 owed. Every other pass passes `full == true` and the
+/// behaviour is byte-for-byte what it was.
 #[cfg(feature = "witness")]
-fn wcd_commit(i: usize, running: u32, step: usize) {
+fn wcd_commit(i: usize, running: u32, step: usize, full: bool) {
     let bit = 1u32 << i;
     VERIFIED.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
     #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
     {
-        if step == 1 {
+        if step == 1 && full {
             VERIFIED_FULL.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
             WCD_STATE[i].store(WCD_ST_DONE, core::sync::atomic::Ordering::Release);
         } else {
             // WCD-CHUNK — stage 2 walks the box from the top; the cursor is stage-scoped state and
-            // this transition is where a stage ends with another owed.
+            // this transition is where a stage ends with another owed. WCD-CLIP1 routes a clipped
+            // collapsed stage-1 pass here too, so its unwalked rows are owed to stage 2 rather than
+            // sealed away.
             WCD_CUR[i].store(0, core::sync::atomic::Ordering::Relaxed);
             WCD_STATE[i].store(WCD_ST_FULL, core::sync::atomic::Ordering::Release);
         }
@@ -6749,7 +7214,8 @@ fn wcd_commit(i: usize, running: u32, step: usize) {
     }
     #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
     {
-        let _ = (running, step);
+        // No chunking on this build, so no time stop and no clip: `full` is always true here.
+        let _ = (running, step, full);
         WCD_STATE[i].store(WCD_ST_DONE, core::sync::atomic::Ordering::Release);
     }
 }
@@ -6932,11 +7398,23 @@ fn wcd_complete(id: u32, i: usize) {
 /// Derived from the step the walk ACTUALLY used, never from the step that was asked for — see
 /// [`verify_reference`]'s collapse. A `coverage=` that misreports its own pass is worse than no
 /// marker at all.
+///
+/// WCD-CLIP1 — and from `clipped`, for the same reason. A collapsed lattice (`step == 1`, a rect
+/// narrower than the lattice step) that the time stop CUT short walked its columns fully but only a
+/// prefix of its rows, so `coverage=full` beside a `band=0..3` on an 8-row box is the exact
+/// self-contradiction the reviewer named. It prints `coverage=clipped` instead — the honest label
+/// for "full horizontal coverage of the rows this pass reached, and no more". Unreachable in
+/// practice (a rect narrow enough to collapse the lattice is far too small to burn 2 ms of probes),
+/// but the type system allows it and an honest marker costs one branch. A lattice pass (`step > 1`)
+/// that clips keeps `coverage=lattice16`: it was already partial-by-design and `band=` carries the
+/// row extent, so nothing there misreports.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
 #[inline]
-fn wcd_coverage_note(step: usize) -> &'static str {
+fn wcd_coverage_note(step: usize, clipped: bool) -> &'static str {
     if step > 1 {
         " coverage=lattice16"
+    } else if clipped {
+        " coverage=clipped"
     } else {
         " coverage=full"
     }
@@ -6944,7 +7422,7 @@ fn wcd_coverage_note(step: usize) -> &'static str {
 
 #[cfg(all(feature = "witness", not(all(target_arch = "x86_64", feature = "wcg-paygo"))))]
 #[inline]
-fn wcd_coverage_note(_step: usize) -> &'static str {
+fn wcd_coverage_note(_step: usize, _clipped: bool) -> &'static str {
     ""
 }
 
@@ -8766,6 +9244,17 @@ static C2_DMG_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 /// area of. Never used as a denominator; it exists so the line can be read against itself.
 #[cfg(feature = "witness")]
 static C2_BOX_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// COMP2-WCD — cycles spent inside [`verify_window`] this span: the WC-D witness's glass read-back
+/// (both passes), its attribution walks, its repair redraw and its verdict UART, charged by a drop
+/// guard so every exit path pays. Printed as `wcd_us=`, a TOTAL for the span like `straddle_us`
+/// (a per-pass mean would dilute a one-pass spike by the span's healthy passes, and a spike is the
+/// only thing the field exists to name). GR27 Boot B is the motivating capture: a shell-reopen
+/// span read `passes=2 pass_us=154766 max_us=302134` — a 20x "bandwidth collapse" that was really
+/// one stage-1 verify — and no field on the line said so. Now the collapsed regime names its
+/// cause: `wcd_us` ≈ the spike convicts the witness; `wcd_us` ≈ 0 with the same spike convicts
+/// the compositor.
+#[cfg(feature = "witness")]
+static C2_WCD_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 // ---- COMP2-SPLIT — the two halves of `blit_us`, because only one of them is offloadable ----------
 //
@@ -8962,6 +9451,20 @@ static C2_STRADDLE_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 /// terminal, `rate=` still last-but-one), because it is the correction term a reader needs in hand
 /// when reading `util_pct`. The analyzer's position is unchanged: it parses no field of this line.
 ///
+/// COMP2-WCD — `wcd_us` is inserted immediately AFTER `straddle_us` under the same rule (`span=`
+/// terminal, `rate=` last-but-one). It is a TOTAL like its neighbour, and it is the residual's
+/// biggest single explanation when it fires: a verify pass lands in `blit_us` but in neither half
+/// of COMP2-SPLIT's pair, so a span whose `blit_us` dwarfs `compose_us + present_us` is either the
+/// direct fallback or this witness — and this field is what says which. `tools/serial-analyzer.py`
+/// still parses no field of this line.
+///
+/// ARCH — this line is `#[cfg(feature = "witness")]`, NOT arch-gated, so `wcd_us=` lands on the
+/// aarch64 `[comp2]` wire too. That is correct — `verify_window` runs on both arches and its glass
+/// read-back is a real per-pass cost on Pi 4 as much as on x86 — and it is a LINE-FORMAT change for
+/// the aarch64 wire, recorded here beside the x86 one because a Pi reader diffing the field list
+/// will see it. No `[comp2]`-anchored `pi4-regression.spec` pattern parses past `blit_us` by
+/// position, so the insertion moves nothing that gate matches.
+///
 /// COMP2-SPLIT — `compose_us` and `present_us` are inserted immediately AFTER `blit_us` under the
 /// same rule (`span=` terminal, `rate=` last-but-one). Adjacency is the point rather than a
 /// preference: they are a DECOMPOSITION of `blit_us`, their residual against it is the instrument's
@@ -8996,6 +9499,10 @@ fn comp2_emit(span: u64) {
     let bytes = C2_BYTES.swap(0, Relaxed);
     let dmg_px = C2_DMG_PX.swap(0, Relaxed);
     let box_px = C2_BOX_PX.swap(0, Relaxed);
+    // COMP2-WCD — drained with the sweep; a verify only ever runs inside a pass, so the
+    // `passes == 0` discard below can lose at most the sliver of a pass straddling the drain,
+    // which is the standing property of every counter this early return already discards.
+    let wcd_cyc = C2_WCD_CYC.swap(0, Relaxed);
     if passes == 0 {
         return;
     }
@@ -9047,7 +9554,7 @@ fn comp2_emit(span: u64) {
             .saturating_div(span_us)
     };
     serial_println!(
-        "[comp2] rollup passes={} pass_us={} max_us={} sprite_us={} wait_us={} blit_us={} compose_us={} present_us={} cache_us={} bytes_pp={} dmg_px_pp={} box_px_pp={} straddle_us={} util_pct={} rate={}.{}/s span={}ms",
+        "[comp2] rollup passes={} pass_us={} max_us={} sprite_us={} wait_us={} blit_us={} compose_us={} present_us={} cache_us={} bytes_pp={} dmg_px_pp={} box_px_pp={} straddle_us={} wcd_us={} util_pct={} rate={}.{}/s span={}ms",
         passes,
         us(pass_cyc),
         super::wcg::cycles_to_us(max_cyc),
@@ -9071,6 +9578,9 @@ fn comp2_emit(span: u64) {
         // COMP2-STRADDLE — a TOTAL for the span, not a per-pass mean: it is the correction term for
         // the PREVIOUS line's `util_pct`, and a mean would not add to anything.
         super::wcg::cycles_to_us(straddle_cyc),
+        // COMP2-WCD — also a TOTAL: the field exists to name a one-pass spike, and a mean would
+        // dilute it by the span's healthy passes. See [`C2_WCD_CYC`].
+        super::wcg::cycles_to_us(wcd_cyc),
         util_pct,
         passes.saturating_mul(10_000) / span.max(1) / 10,
         passes.saturating_mul(10_000) / span.max(1) % 10,
@@ -10353,7 +10863,7 @@ fn control_disc(r: &Window, which: Ctrl) -> Option<(usize, usize, usize)> {
 ///
 /// It is [`CLUSTER_MIN_SRC_W`] plus the frame the SOURCE width does not include, so the two move
 /// together by construction: `bw = w * scale + 2*BORDER` for every non-compat row, hence
-/// `bw >= CLUSTER_MIN_BOX_W` is exactly `w * scale >= CLUSTER_MIN_SRC_W`. 158 px at the current
+/// `bw >= CLUSTER_MIN_BOX_W` is exactly `w * scale >= CLUSTER_MIN_SRC_W`. 149 px at the current
 /// metrics. It existed as an inline sum in one place and as prose in three; the witness below puts
 /// it on the wire, so it needs a single symbol that cannot drift from the test that uses it.
 ///
@@ -10365,7 +10875,7 @@ fn control_disc(r: &Window, which: Ctrl) -> Option<(usize, usize, usize)> {
 /// wide, so the tiler's first column is on-panel exactly when
 ///
 /// ```text
-/// pw > CLUSTER_MIN_BOX_W + GAP     = 158 + 12 = 170 px
+/// pw > CLUSTER_MIN_BOX_W + GAP     = 149 + 12 = 161 px
 /// ```
 ///
 /// which no panel this kernel runs on comes near failing: the smallest is the 640x480 QEMU gate
@@ -10578,8 +11088,8 @@ fn controls_declined_drain() {
 ///
 /// Every number here is a metric: [`BORDER`] is `theme::FRAME`, [`GAP`] is `theme::GAP`, the
 /// diameter is `theme::CONTROL_BOX`, and the vertical centring is against [`TITLE_H`] =
-/// `theme::TITLE_HEIGHT`. The single non-theme quantity is [`TITLE_CELL`], the drawn size of one
-/// caption glyph — a property of `font8x8` scaled to `theme::TEXT_PX`, not of the kit — and it
+/// `theme::TITLE_HEIGHT`. The single non-theme quantity is [`TITLE_CELL_W`], the advance of one
+/// caption glyph — a property of the shared face (`video::font`), not of the kit — and it
 /// appears only in the "is there room for a caption at all" test.
 ///
 /// ### CRISPYWIRE-REVIEW — the threshold now equals the painter's own budget
@@ -10590,8 +11100,8 @@ fn controls_declined_drain() {
 /// and everything the cluster reserves, is one whole glyph left?"*:
 ///
 /// ```text
-/// 2*BORDER + GAP + CTRL_RESERVE + TITLE_CELL
-///   = 2*5    + 12  + 120          + 16        = 158 px
+/// 2*BORDER + GAP + CTRL_RESERVE + TITLE_CELL_W
+///   = 2*5    + 12  + 120          + 7         = 149 px
 /// ```
 ///
 /// against the 102 the arithmetic used to produce (and the 106 the painter actually needed before a
@@ -14590,11 +15100,12 @@ fn paint_window(
         // CRISPYWIRE — the caption: inset one `GAP` from the frame, vertically centred in the
         // strip, and inked with the kit's focused/unfocused title text role.
         //
-        // CRISPYWIRE-REVIEW — drawn at `TITLE_SCALE`, so the caption honours `metrics.text_px`
-        // (15 px asked, 16 px drawn — the nearest integer scale of the 8-px bitmap cell; see
-        // `TITLE_SCALE` for the derivation and for why exact 15 needs a rasterizer). The centring
-        // is against the SCALED cell height, and the width budget is counted in scaled glyphs by
-        // `draw_title` itself, so both moved with it.
+        // FONT (GR27) — drawn with the shared anti-aliased face (`video::font`), BOLD, the weight
+        // macOS gives a window title. `TITLE_SCALE` and its "exact 15 needs a rasterizer" apology
+        // are retired: the kernel has a 16 px rasterized cell now, and the centring is against the
+        // face's real cell height. The glyph edges alpha-composite against the strip's own
+        // per-row gradient colour (`title_row_color`) — computed, never read back, so the caption
+        // stays write-only on every mapping (see `draw_title`).
         // WMCTRL — the caption starts AFTER the cluster now that the cluster is on the LEFT.
         // `CTRL_RESERVE` is exactly `GAP + cluster + GAP` — the inset from the frame, the discs, and
         // the separation from the text — so `BORDER + CTRL_RESERVE` is the first caption column, and
@@ -14605,10 +15116,11 @@ fn paint_window(
             dst,
             r,
             cap_x,
-            lby + BORDER as isize + (TITLE_H.saturating_sub(TITLE_CELL) / 2) as isize,
+            lby + BORDER as isize + (TITLE_H.saturating_sub(TITLE_CELL_H) / 2) as isize,
             bw.saturating_sub(2 * BORDER + GAP + ctrl_w),
             title_ink(focused),
-            TITLE_SCALE,
+            lby + BORDER as isize,
+            focused,
         );
     }
 
@@ -15606,22 +16118,25 @@ fn stage_fill(
     true
 }
 
-/// Draw the kernel's copy of the window title into the title strip, 8x8 glyphs, clipped to `max_w`
-/// pixels. Non-printable bytes render as a space, so a hostile title can only ever paint blanks.
+/// Draw the kernel's copy of the window title into the title strip, clipped to `max_w` pixels.
+/// Non-printable bytes render as a space (`font::glyph`'s containment), so a hostile title can
+/// only ever paint blanks.
 /// WC-M — `y` is SIGNED because a chunked stage paints the box into one row-band at a time and the
 /// title sits in the box's first rows, above every band but the first. Glyph rows landing above the
 /// destination are dropped; the rest are drawn at their true position, and `put_pixel` clips the
-/// bottom as it always did. For `y >= 0` — the direct path, and any stage that fits in one band —
-/// this is byte-for-byte the pre-WC-M loop.
+/// bottom as it always did.
 ///
 /// CRISPYWIRE — the ink is a PARAMETER, not a constant: Crispy carries two title-text roles
 /// (`title_text_active` / `title_text_inactive`) and the caller resolves which through
 /// [`title_ink`]. WC-A's single `CHROME_TITLE_FG` is gone.
 ///
-/// CRISPYWIRE-REVIEW — and the cell is drawn at `scale`, a nearest-integer replication of the 8-px
-/// bitmap toward the kit's `metrics.text_px` (see [`TITLE_SCALE`]). `max_w` stays in PANEL pixels
-/// and the column count divides by the SCALED cell, so a caller's budget means the same thing at
-/// every scale. `scale = 1` is byte-for-byte the pre-review loop.
+/// FONT (GR27) — the caption is the shared anti-aliased face (`video::font`), BOLD weight, and
+/// the `scale` parameter is retired with the 1-bit bitmap it replicated. Each covered pixel
+/// alpha-composites `ink` against the strip's OWN colour at that row — `ceramic::shade` over
+/// [`title_row_color`], the exact expression the strip fill above used — so the blend needs the
+/// two extra parameters (`strip_y0`, the strip's first row, and `focused`) and NO read-back:
+/// every write stays write-only on every mapping, WC/UC included. `max_w` stays in PANEL pixels;
+/// the column count divides by the face's advance.
 fn draw_title(
     fb: &super::FrameBuffer,
     r: &Window,
@@ -15629,31 +16144,31 @@ fn draw_title(
     y: isize,
     max_w: usize,
     ink: u32,
-    scale: usize,
+    strip_y0: isize,
+    focused: bool,
 ) {
-    let scale = scale.max(1); // a zero scale would draw nothing and divide by zero below
-    let cell = FONT_CELL * scale;
-    let cols = max_w / cell;
+    let cols = max_w / TITLE_CELL_W;
     for (i, &b) in r.title[..r.title_len].iter().enumerate() {
         if i >= cols {
             break;
         }
-        let ch = if (0x20..0x7f).contains(&b) { b } else { b' ' };
-        let bitmap = font8x8::legacy::BASIC_LEGACY[ch as usize];
-        for (ry, byte) in bitmap.iter().enumerate() {
-            // WC-M's clip, per SCALED row: each source row of the glyph now occupies `scale`
-            // destination rows, and each is dropped independently if it lands above the band.
-            for sy in 0..scale {
-                let dy = y + (ry * scale + sy) as isize;
-                if dy < 0 {
-                    continue;
-                }
-                for rx in 0..FONT_CELL {
-                    if byte & (1 << rx) != 0 {
-                        for sx in 0..scale {
-                            fb.put_pixel(x + i * cell + rx * scale + sx, dy as usize, ink);
-                        }
-                    }
+        for (ry, row) in super::font::glyph(b, true).iter().enumerate() {
+            // WC-M's clip, per row: a row landing above the band is dropped independently.
+            let dy = y + ry as isize;
+            if dy < 0 {
+                continue;
+            }
+            // The strip pixel this row sits on. Rows past the strip's height keep the last
+            // gradient stop — the glyph cell is const-asserted shorter than the strip, so this
+            // arm is form rather than expectation.
+            let j = (dy - strip_y0).max(0) as usize;
+            let bg = super::ceramic::shade(
+                title_row_color(j.min(TITLE_H - 1), TITLE_H, focused),
+                BORDER + j.min(TITLE_H - 1),
+            );
+            for (rx, &a) in row.iter().enumerate() {
+                if a != 0 {
+                    fb.put_pixel(x + i * TITLE_CELL_W + rx, dy as usize, super::font::blend(bg, ink, a));
                 }
             }
         }
@@ -17060,6 +17575,15 @@ fn create_inner(
     let z = t.next_z;
     t.next_z = t.next_z.wrapping_add(1).max(1);
     let id = (slot + 1) as WinId;
+    // WPACE-TEXT — a re-issued slot must not inherit the dead tenant's shadow: the validity bit
+    // comes down here, under the same table lock that publishes the row, which is the single point
+    // every close path funnels through on its way to reuse. The buffer itself is not touched: it is
+    // pooled, and every access to its contents — including the whole-surface refill that precedes
+    // the bit going back up — is serialized by the per-slot lock, so even a pass that snapshotted
+    // the DEAD tenant's row moments ago and is still blitting its shadow cannot race the new
+    // tenant's fill (that pass holds the lock; the fill waits).
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    PACE_SHADOW_OK.fetch_and(!(1u32 << slot), core::sync::atomic::Ordering::Relaxed);
     let mut row = Window::empty();
     row.used = true;
     row.id = id;

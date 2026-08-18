@@ -1360,3 +1360,14 @@ FORBID :: MENUBAR: .* :: FAIL ::
 # --- the line reds this rule instead of silently narrowing what it asserts.
 REQUIRE :: DOCK: strip tiles=.* model=true geom=true restore=true specific=true miss=true vacate=true furniture park=parked/true :: PASS ::
 FORBID :: DOCK: .* :: FAIL ::
+
+# --- CLICK-BAND: A CONSUMED FURNITURE PRESS SAYS SO ON THE ROUTER'S OWN WITNESS ------------------
+# --- GR27 Boot B: presses the crystal/dock arms consumed left NO `[clickroute]` row, so a band
+# --- press was indistinguishable on the wire from a press that never reached the router — the
+# --- mis-read the "menubar press inert" round was built on. `clickband_selftest` drives the LIVE
+# --- router (`wc_click_route_at`, not the `press_at` seams the other fixtures call directly) at the
+# --- crystal, at a point outside the open menu, and at the dock strip, and asserts one bounded
+# --- `band=` line per consumed press. `band_lines=3` is pinned: the count of lines OWED, so the
+# --- claim holds past the serial budget.
+REQUIRE :: CLICK-BAND: routed menu=true\(open\) outside=true\(dismiss\) dock=true\(.*\) band_lines=3 :: PASS ::
+FORBID :: CLICK-BAND: .* :: FAIL ::

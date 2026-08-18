@@ -31,6 +31,10 @@
 //! each is serialised by its own lock.
 
 pub mod fbcon;
+// FONT (GR27) — the shared anti-aliased text face: the Noto Sans Mono alpha atlas plus the
+// alpha-compositing blits every chrome text path (captions, menu bar, dock, crystal menu, panel
+// console) draws through. Unconditional on both arches: pure rodata + pure functions.
+pub mod font;
 pub mod framebuffer;
 // CRISPY-PI: the Crispy theme lifted from `kits/crispy/theme.json` (@ us-crispy 08b42ede) into a
 // (theme is declared below with its CRISPY-PI authorship note — a duplicate declaration here was

@@ -165,16 +165,17 @@ const ROWS: [Row; 5] = [
 // Metrics — all derived, none guessed
 // ---------------------------------------------------------------------------
 
-/// The glyph cell the menu draws text in — [`wm::TITLE_CELL`], the same 16 px the bar caption and the
-/// dock tiles resolve to, so a kit text-size change moves all of them together.
-const CELL: usize = wm::TITLE_CELL;
-
-/// The integer scale the 8-px font is replicated at — [`wm::TITLE_SCALE`].
-const SCALE: usize = wm::TITLE_SCALE;
+/// The glyph advance and cell height the menu draws text in — [`wm::TITLE_CELL_W`] /
+/// [`wm::TITLE_CELL_H`], the same face metrics the bar caption and the dock tiles resolve to, so a
+/// face change moves all of them together. FONT (GR27): the shared anti-aliased face's cell is not
+/// square, so the two axes are named separately (the old square `CELL` and its `SCALE` are retired
+/// with the 1-bit bitmap they described).
+const CELL_W: usize = wm::TITLE_CELL_W;
+const CELL_H: usize = wm::TITLE_CELL_H;
 
 /// An item row's height, px: the glyph cell plus 8 px of clearance split top and bottom, so a 16 px
 /// glyph sits with 4 px of air above and below in a 24 px row. Pinned by the const-assert below.
-const ITEM_H: usize = CELL + 8;
+const ITEM_H: usize = CELL_H + 8;
 
 /// A separator row's height, px — a thin band carrying one keyline, centred.
 const SEP_H: usize = 7;
@@ -213,7 +214,7 @@ const fn menu_height() -> usize {
 }
 
 /// The menu's width, px: both borders, both insets, and the widest label.
-const MENU_W: usize = 2 * BORDER + 2 * PADX + max_label_glyphs() * CELL;
+const MENU_W: usize = 2 * BORDER + 2 * PADX + max_label_glyphs() * CELL_W;
 
 /// The menu's height, px.
 const MENU_H: usize = menu_height();
@@ -234,7 +235,7 @@ const ITEM_COUNT: usize = item_count();
 
 const _: () = {
     // The row height must clear the glyph it centres, or the label is cut.
-    assert!(ITEM_H >= CELL);
+    assert!(ITEM_H >= CELL_H);
     assert!(ITEM_H == 24);
     // The separator band must hold its keyline with air either side.
     assert!(SEP_H >= 3);
@@ -269,22 +270,32 @@ static DISMISSES: AtomicU64 = AtomicU64::new(0);
 static PICKS: AtomicU64 = AtomicU64::new(0);
 static LAST_VERB: AtomicU8 = AtomicU8::new(0xFF);
 
+<<<<<<< HEAD
 /// CLICK-BAND — **what the LAST consumed press did.** [`press_at`] answers the router `true`, and a
 /// caller that could not say WHAT the menu did with the press could name the band and nothing else —
 /// which is exactly the reading gap PA41's "the crystal ignores clicks" round was built on. Written by
 /// every consuming arm of [`press_at`], read by [`last_press_outcome`] immediately after the call on
 /// the same task; no cross-core reader.
+=======
+/// CLICK-BAND — what the LAST consumed press did, for the router's `band=menu` witness line: the
+/// router sees only `true` from [`press_at`], and a band line that could not say WHAT the band did
+/// would name the band and nothing else. Written by every consuming arm of [`press_at`], read by
+/// [`last_press_outcome`] immediately after the call on the same task — no cross-core reader.
+>>>>>>> origin/UnaOS-gemini
 static PRESS_OUTCOME: AtomicU8 = AtomicU8::new(0);
 const OUT_OPEN: u8 = 1;
 const OUT_PICK: u8 = 2;
 const OUT_KEPT: u8 = 3;
 const OUT_DISMISS: u8 = 4;
 
+<<<<<<< HEAD
 /// CLOBBER-REPAIR (PA41) — passes in which a window the compositor painted had intersected the rows
 /// the OPEN dropdown last painted. The bar's and the dock's counter, on the same terms; `clob=` on the
 /// `[crystal]` ledger line is the falsifier for "the menu survives a window blit crossing it".
 static CLOBBERS: AtomicU64 = AtomicU64::new(0);
 
+=======
+>>>>>>> origin/UnaOS-gemini
 /// CLICK-BAND — the last consumed press's outcome, as the witness word.
 pub fn last_press_outcome() -> &'static str {
     match PRESS_OUTCOME.load(Ordering::Relaxed) {
@@ -296,6 +307,7 @@ pub fn last_press_outcome() -> &'static str {
     }
 }
 
+<<<<<<< HEAD
 /// MENU-DRIVE / CLOBBER-REPAIR — **does the dropdown owe a paint or an erase that only a composite can
 /// discharge?** Two relaxed loads, no lock.
 ///
@@ -310,6 +322,8 @@ pub fn paint_owed() -> bool {
     OPEN.load(Ordering::Relaxed) != (SLOT.packed() != 0)
 }
 
+=======
+>>>>>>> origin/UnaOS-gemini
 // ---------------------------------------------------------------------------
 // Geometry — the dropdown rect, and the row layout inside it
 // ---------------------------------------------------------------------------
@@ -358,6 +372,55 @@ pub fn open_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
     }
     menu_rect(pw, ph)
 }
+
+/// MENU-DRIVE / REVIEW — **does the SHARD menu owe a paint or an erase that only a composite can
+/// discharge?** The third term in [`super::wm::composite`]'s "is anything OWED" tests, beside
+/// `any_damaged` (a dirty window) and `deferred_owed` (a queued erase box).
+///
+/// Two relaxed loads, no lock — the same shape and cost as `deferred_owed`, and for the same reason:
+/// it runs on the re-run loop and the lost-wakeup gate of every present, on every core.
+///
+/// ### The gap it closes, and why the in-place retry could not
+///
+/// [`open`]/[`dismiss`] flip `OPEN` and then call `wm::composite()` themselves, with one verified
+/// retry. That retry recovers the case where the FIRST pass declined but the holder released before
+/// the second — but if a holder keeps `COMP_GATE` for milliseconds (a `[wc-d] verify` on a witness
+/// build holds it over a second), BOTH the pass and its retry decline, `COMP_PENDING` is published,
+/// and the holder runs its re-run loop. That loop is the guaranteed painter for a dirty window or a
+/// queued erase — but an open menu is NEITHER, so before this term the loop's `if !dmg && !owed`
+/// broke and the menu stayed open-in-state, invisible on glass: the exact pre-fix Boot B signature
+/// (`crystal_press=open`, no `[crystal]` rollup), reachable by Boot B's own gesture — close the last
+/// window (that close is the gate holder), then immediately press the crystal.
+///
+/// The condition is the paint contract [`compose`] itself acts on, read the other way round:
+///  * **OPEN and the slot is EMPTY** — the dropdown is in state but not yet on the panel: a PAINT is
+///    owed.
+///  * **CLOSED and the slot is NON-EMPTY** — the dropdown was dismissed but its pixels are still on
+///    the panel: an ERASE is owed.
+/// Either way the next `compose` discharges it; this makes the gate holder run that `compose`.
+pub fn paint_owed() -> bool {
+    let open = OPEN.load(Ordering::Relaxed);
+    let owns_pixels = SLOT.packed() != 0;
+    open != owns_pixels
+}
+
+/// MENU-DRIVE / REVIEW — count a composite the gate holder ran ONLY because the SHARD menu owed a
+/// paint or erase, and name the first one on the wire. The `wcg::erase_wakeup_rescue` precedent: a
+/// rescue is the mechanism working (not a FORBID), but it must be shown REACHABLE — a boot with
+/// `menu_rescues=0` never exercised the holder-paints-the-menu path, and one with `>0` is a boot
+/// where the pre-fix in-place retry would have stranded the menu.
+#[cfg(feature = "witness")]
+static MENU_RESCUES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "witness")]
+pub fn menu_wakeup_rescue() {
+    let n = MENU_RESCUES.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 {
+        serial_println!("[crystal] rollup scope=wakeup menu_rescues={} -> RESCUED", n);
+    }
+}
+#[cfg(not(feature = "witness"))]
+#[inline]
+pub fn menu_wakeup_rescue() {}
 
 /// The top of row `idx` as an offset from the menu's top edge, in px — border plus every earlier row.
 fn row_top(idx: usize) -> usize {
@@ -422,6 +485,7 @@ fn open(pw: usize, ph: usize) {
         ":: SHARD-MENU: crystal_press=open menu={}x{}+{}+{} items={} ::",
         mw, mh, mx, my, ITEM_COUNT
     );
+<<<<<<< HEAD
     // MENU-DRIVE (x86 trunk 122ed63e, ported; PA41 on the Pi) — **an open menu must DRIVE the pass
     // that paints it.** [`compose`] runs only from `strip::compose_all` at the tail of
     // `wm::composite_once`, and every OTHER state-changing gesture (a close, a drag, a zoom, a
@@ -441,6 +505,26 @@ fn open(pw: usize, ph: usize) {
     // retry runs iff the first pass did not land. On x86 this also closes the narrow window where the
     // pass was declined into a concurrent `COMP_GATE` holder that has since released.
     if paint_owed() {
+=======
+    // MENU-DRIVE (GR27 Boot B) — **an open menu must DRIVE the pass that paints it.** [`compose`]
+    // runs only from `wm::composite_once`'s strip tail, and every OTHER state-changing gesture
+    // (close, drag, zoom, minimise, a dock raise) runs a composite itself — this one did not. On the
+    // emptied late-boot desktop nothing else composites (the render lane blocks on its channel; the
+    // backdrop's timer flush carries no damage; `service_damage` returns with no damaged row), so
+    // the operator's crystal presses opened the menu IN STATE while the glass never changed: Boot B
+    // shows `crystal_press=open` at 300194 ms with no `[crystal]`/`[menubar]`/`[dock]` rollup for
+    // the following 30 s — zero passes, an invisible menu, "the crystal ignores clicks". Task
+    // context only (the click router and the fixtures), so the composite is taken directly.
+    super::wm::composite();
+    // BELT-AND-BRACES retry. The x86 gate may DECLINE this pass into a concurrent holder; the
+    // GUARANTEED painter is that holder, whose re-run loop and lost-wakeup gate now test
+    // [`paint_owed`] ([`super::wm::menu_paint_owed`]) alongside window damage and the erase queue —
+    // so a menu the holder held the gate through (a `[wc-d] verify` holds it over a second) is
+    // painted by the holder on release, not stranded. This immediate retry closes only the narrow
+    // window where the first pass declined but the holder has ALREADY released — cheaper than
+    // waiting for the holder's loop when no one is holding. The slot confirms the paint LANDED.
+    if SLOT.packed() == 0 {
+>>>>>>> origin/UnaOS-gemini
         super::wm::composite();
     }
 }
@@ -455,6 +539,7 @@ fn dismiss(reason: &str) {
     }
     DISMISSES.fetch_add(1, Ordering::Relaxed);
     serial_println!(":: SHARD-MENU: crystal_press=dismiss reason={} ::", reason);
+<<<<<<< HEAD
     // MENU-DRIVE — the mirrored half of [`open`]'s rule. The erase ([`compose`]'s closed path, which
     // also hands the vacated rows back to their owners through [`repaint_vacated`]) runs only from a
     // composite, and on a static desktop no other pass is coming — an on-glass dropdown would outlive
@@ -462,6 +547,19 @@ fn dismiss(reason: &str) {
     // pass is one bounded walk.
     super::wm::composite();
     if paint_owed() {
+=======
+    // MENU-DRIVE — the mirrored half of [`open`]'s rule: the erase ([`compose`]'s closed path, which
+    // also hands the vacated rows back through [`repaint_vacated`]) runs only from a composite, and
+    // on a static desktop no other pass is coming — an on-glass dropdown would outlive its Escape.
+    // Every caller is task context (the click router, the Escape arm, `set_enabled(false)`, the
+    // fixtures); a dismiss of a menu that never painted erases nothing (the slot is clear) and the
+    // pass is one bounded walk.
+    super::wm::composite();
+    // BELT-AND-BRACES retry — the mirror of [`open`]: [`paint_owed`] reports `!OPEN && SLOT!=0` as
+    // an owed ERASE, so the gate holder discharges a declined dismiss too; this closes only the
+    // already-released window. The slot is non-zero exactly while an erase is owed.
+    if SLOT.packed() != 0 {
+>>>>>>> origin/UnaOS-gemini
         super::wm::composite();
     }
 }
@@ -799,41 +897,17 @@ fn compose_row(out: &mut [u32], r: strip::Rect, j: usize) {
         }
         // An item: its label, vertically centred in the row, at PADX from the inner edge.
         Some(_) => {
-            let vpad = (ITEM_H - 8 * SCALE) / 2;
+            let vpad = (ITEM_H - CELL_H) / 2;
             let gtop = top + vpad;
-            if j < gtop || j >= gtop + 8 * SCALE {
+            if j < gtop || j >= gtop + CELL_H {
                 return;
             }
-            let sy = (j - gtop) / SCALE;
-            if sy >= 8 {
-                return;
-            }
+            let sy = j - gtop;
+            // FONT (GR27) — the shared anti-aliased face, blended over the row fill the loop above
+            // painted (RAM scratch — the blend's read is cached). Regular weight: menu items are
+            // body text, not a caption.
             let label = ROWS[row].label.as_bytes();
-            draw_text(out, w, label, BORDER + PADX, sy, SCALE, theme::TITLE_TEXT_ACTIVE);
-        }
-    }
-}
-
-/// Overlay one scaled row of an ASCII byte string at `x0`, in `ink` — the bar's glyph loop, kept
-/// local because it is six lines and the strip primitive has no opinion about text.
-fn draw_text(out: &mut [u32], w: usize, s: &[u8], x0: usize, sy: usize, scale: usize, ink: u32) {
-    for (c, &b) in s.iter().enumerate() {
-        let ch = if (0x20..0x7f).contains(&b) { b } else { b' ' };
-        let bits = font8x8::legacy::BASIC_LEGACY[ch as usize][sy];
-        if bits == 0 {
-            continue;
-        }
-        let gx = x0 + c * CELL;
-        for rx in 0..8usize {
-            if bits & (1 << rx) == 0 {
-                continue;
-            }
-            for sx in 0..scale {
-                let i = gx + rx * scale + sx;
-                if i < w {
-                    out[i] = ink;
-                }
-            }
+            super::font::draw_row(out, w, label, BORDER + PADX, sy, theme::TITLE_TEXT_ACTIVE, false);
         }
     }
 }

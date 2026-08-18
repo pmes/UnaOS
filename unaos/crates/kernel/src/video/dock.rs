@@ -257,10 +257,13 @@ pub const STRIP_H: usize = TILE_H + 2 * PAD;
 /// module the size ruling touched, and it was touched because the alternative was a red tree.
 const IND_D: usize = theme::GAP / 2;
 
-/// The glyph cell the caption is drawn at — [`wm::TITLE_CELL`], i.e. the kit's `text_px` resolved to
-/// the nearest integer scale of the bitmap font, exactly as the window caption resolves it. One
-/// definition, so a kit text-size change moves the window caption and the dock caption together.
-const CELL: usize = wm::TITLE_CELL;
+/// The glyph advance and cell height the caption is drawn at — [`wm::TITLE_CELL_W`] /
+/// [`wm::TITLE_CELL_H`], the shared anti-aliased face's own metrics, exactly as the window caption
+/// resolves them. One definition, so a face change moves the window caption and the dock caption
+/// together. FONT (GR27): the cell stopped being square with the 1-bit bitmap's retirement, so the
+/// two axes are named separately — widths budget in `CELL_W`, vertical centring in `CELL_H`.
+const CELL_W: usize = wm::TITLE_CELL_W;
+const CELL_H: usize = wm::TITLE_CELL_H;
 
 /// The longest caption a tile will ever show, in glyphs. Bounded by [`wm::MAX_TITLE`]; capped at 8
 /// because a dock is a row of many small things and a tile wide enough for a whole 16-byte title
@@ -271,7 +274,8 @@ const LABEL_MAX: usize = 8;
 ///
 /// The dock's own worst case is unchanged and is still what the `const` proof below checks: a full
 /// table of [`wm::MAX_WINDOWS`] tiles at [`LABEL_MAX`] glyphs is
-/// `2*PAD + 12*(2*PAD + 8*CELL) + 11*PAD` = `24 + 12*152 + 132` = 1980 px. STRIPFACTOR raised the
+/// `2*PAD + 12*(2*PAD + 8*CELL_W) + 11*PAD` px — comfortably inside the shared bound at the
+/// face's 7 px advance. STRIPFACTOR raised the
 /// shared bound to 4096 for the flush tenants; the dock neither needs nor is affected by the extra
 /// width, and it no longer owns the scratch that provides it.
 const MAX_STRIP_W: usize = strip::MAX_STRIP_W;
@@ -279,10 +283,10 @@ const MAX_STRIP_W: usize = strip::MAX_STRIP_W;
 /// The layout cannot ask for a strip the scratch cannot hold. A `const` proof rather than a runtime
 /// clamp, so a future `LABEL_MAX` or `MAX_WINDOWS` raise fails the BUILD.
 const _: () = {
-    assert!(2 * PAD + wm::MAX_WINDOWS * (2 * PAD + LABEL_MAX * CELL) + (wm::MAX_WINDOWS - 1) * PAD
+    assert!(2 * PAD + wm::MAX_WINDOWS * (2 * PAD + LABEL_MAX * CELL_W) + (wm::MAX_WINDOWS - 1) * PAD
         <= MAX_STRIP_W);
     // The caption must fit inside the tile it is centred in, or there is nothing to draw.
-    assert!(CELL <= TILE_H);
+    assert!(CELL_H <= TILE_H);
     // The indicator must fit in the padding band below the tile.
     assert!(IND_D < PAD);
     // Both of a tile's corners must fit within its own height — the kit asserts this for buttons and
@@ -332,7 +336,7 @@ impl Layout {
         }
         let mut glyphs = LABEL_MAX;
         loop {
-            let tile_w = 2 * PAD + glyphs * CELL;
+            let tile_w = 2 * PAD + glyphs * CELL_W;
             let w = 2 * PAD + n * tile_w + (n - 1) * PAD;
             // STRIPFACTOR — the anchoring, the margin and BOTH floors are the primitive's
             // `frame_centred`: `ph < STRIP_H + 2*PAD`, `w + 2*PAD > pw` and `w > MAX_STRIP_W` were
@@ -537,6 +541,24 @@ static LEDGER: strip::Ledger = strip::Ledger::new();
 static PRESSES_N: AtomicU64 = AtomicU64::new(0);
 static RAISES: AtomicU64 = AtomicU64::new(0);
 static UNHIDES: AtomicU64 = AtomicU64::new(0);
+
+/// CLICK-BAND — what the LAST consumed press did, for the router's `band=dock` witness line (the
+/// crystal's `PRESS_OUTCOME` twin; see `crystal.rs`). Written by every consuming arm of
+/// [`press_at`], read by [`last_press_outcome`] immediately after the call on the same task.
+static PRESS_OUTCOME: AtomicU64 = AtomicU64::new(0);
+const DOCK_OUT_BACKGROUND: u64 = 1;
+const DOCK_OUT_REOPEN: u64 = 2;
+const DOCK_OUT_RAISE: u64 = 3;
+
+/// CLICK-BAND — the last consumed press's outcome, as the witness word.
+pub fn last_press_outcome() -> &'static str {
+    match PRESS_OUTCOME.load(Ordering::Relaxed) {
+        DOCK_OUT_BACKGROUND => "background",
+        DOCK_OUT_REOPEN => "shell-reopen",
+        DOCK_OUT_RAISE => "raise",
+        _ => "none",
+    }
+}
 /// WCK5 — **passes in which a window had painted over the strip.** The repaint this arc is removing.
 ///
 /// `paints` conflates the two damage conditions: a MODEL change (a window opened, closed, was renamed
@@ -814,41 +836,21 @@ fn compose_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32
         // The caption, overlaid. Vertically centred in the tile, left-padded by one `PAD`, and
         // truncated to the layout's glyph budget — the budget the layout SIZED the tile from, so the
         // text can never overrun the box it is in.
-        let ty0 = by + (th - CELL) / 2;
-        if j < ty0 || j >= ty0 + CELL {
+        let ty0 = by + (th - CELL_H) / 2;
+        if j < ty0 || j >= ty0 + CELL_H {
             continue;
         }
-        let scale = wm::TITLE_SCALE.max(1);
-        let sy = (j - ty0) / scale;
-        if sy >= 8 {
-            continue;
-        }
+        let sy = j - ty0;
         let ink = if r.focused {
             theme::TITLE_TEXT_ACTIVE
         } else {
             theme::TITLE_TEXT_INACTIVE
         };
+        // FONT (GR27) — the shared anti-aliased face, alpha-composited over the tile face the row
+        // loop above just painted (a RAM scratch row, so the blend's read is cached). Regular
+        // weight: a dock label is a secondary surface beside the caption and the bar.
         let cols = l.glyphs.min(r.title_len);
-        for c in 0..cols {
-            let b = r.title[c];
-            let ch = if (0x20..0x7f).contains(&b) { b } else { b' ' };
-            let bits = font8x8::legacy::BASIC_LEGACY[ch as usize][sy];
-            if bits == 0 {
-                continue;
-            }
-            let gx = bx + PAD + c * CELL;
-            for rx in 0..8usize {
-                if bits & (1 << rx) == 0 {
-                    continue;
-                }
-                for sx in 0..scale {
-                    let i = gx + rx * scale + sx;
-                    if i < l.w {
-                        out[i] = ink;
-                    }
-                }
-            }
-        }
+        super::font::draw_row(out, l.w, &r.title[..cols], bx + PAD, sy, ink, false);
     }
 }
 
@@ -903,6 +905,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
     }
     PRESSES_N.fetch_add(1, Ordering::Relaxed);
     let Some(t) = l.tile_at(px, py) else {
+        PRESS_OUTCOME.store(DOCK_OUT_BACKGROUND, Ordering::Relaxed);
         serial_println!("[dock] press at ({},{}) -> strip tiles={} raised=none", x, y, n);
         return true; // the dock's own background: consumed, raises nothing.
     };
@@ -925,6 +928,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
         return true;
     }
     if r.id == SHELL_PIN_ID {
+        PRESS_OUTCOME.store(DOCK_OUT_REOPEN, Ordering::Relaxed);
         SHELL_REOPEN.store(true, Ordering::Release);
         serial_println!(
             "[dock] press at ({},{}) tile={}/{} shell=pin -> reopen requested",
@@ -932,6 +936,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
         );
         return true;
     }
+    PRESS_OUTCOME.store(DOCK_OUT_RAISE, Ordering::Relaxed);
     let was_hidden = !r.visible;
     PRESSED.store(r.id, Ordering::Release);
     if crate::video::wm::is_kernel_owner(r.owner_asid) {
