@@ -5038,11 +5038,26 @@ fn composite_inner() -> CursorTail {
     #[cfg(all(target_arch = "aarch64", feature = "witness", feature = "baremetal"))]
     if drawn > 0 {
         let (pw, ph) = (fb.info().width, fb.info().height);
-        let clear = match super::wcf::reserved(pw, ph) {
-            None => false,
-            Some(boxes) => !rows
-                .iter()
-                .any(|r| r.used && boxes.iter().any(|b| boxes_overlap(*b, outer_box(r)))),
+        // CHROMESPEC — the clearance is answered PER RESERVED BOX, not for their union. The twin
+        // blocks and the slope marker are two disjoint rectangles at opposite ends of the bottom
+        // strip, and on the armed Pi desktop the console window overlaps only the second: one shared
+        // bool let the marker's overlap veto the twins, so the verdict the spec REQUIREs never
+        // printed on a boot where the addressing was never in question. See `wcf::run`'s header.
+        // The test is taken against `wcf::clearance`, NOT `wcf::reserved`: the probe's cache
+        // maintenance runs in whole scanlines, and an invalidate is a discard, so its exclusion zone
+        // is each box's full-width ROW SPAN rather than the box it paints. See `wcf::clearance`.
+        let clear = match super::wcf::clearance(pw, ph) {
+            None => [false, false],
+            Some(boxes) => {
+                let mut c = [true, true];
+                for r in rows.iter().filter(|r| r.used) {
+                    let ob = outer_box(r);
+                    for (k, b) in boxes.iter().enumerate() {
+                        c[k] &= !boxes_overlap(*b, ob);
+                    }
+                }
+                c
+            }
         };
         super::wcf::run(&fb, clear); super::wcf::chrome_truth(&fb, &rows, &order, focus_asid());
     }
@@ -16501,10 +16516,10 @@ pub fn vacate_selftest() {
 
     // One leg: place a window at (ox, oy), prove it owns its box, close it by `f`, and count how many
     // of the five sample points came back as desktop.
-    let leg = |f: &dyn Fn(WinId, u64), name: &str| -> (bool, bool, usize) {
+    let leg = |f: &dyn Fn(WinId, u64), name: &str| -> (bool, bool, (usize, usize)) {
         let w = create(ASID_J, sa, len, 8, 8, 32, b"vc-a");
         if w == WIN_NONE {
-            return (false, false, 0);
+            return (false, false, (0, 0));
         }
         move_to(w, ox, oy);
         present(w);
@@ -16513,7 +16528,7 @@ pub fn vacate_selftest() {
             Some(b) => b,
             None => {
                 close(w);
-                return (false, false, 0);
+                return (false, false, (0, 0));
             }
         };
         let painted = read(ox + 1, oy + 1) == a_col;
@@ -16526,14 +16541,12 @@ pub fn vacate_selftest() {
             (b.0 + b.2 / 2, b.1 + TITLE_H / 2),
             (b.0 + b.2 / 2, b.1 + b.3 - 1),
         ];
-        let mut clean = 0usize;
-        for &(x, y) in pts.iter() {
-            if read(x, y) == DESKTOP_BG {
-                clean += 1;
-            }
-        }
+        // FURNITURE-OCC — the reclaim is judged per point against whoever owns that point NOW; see
+        // [`vacated_points`] for why "== DESKTOP_BG everywhere" is the bare-panel special case of it
+        // rather than the rule.
+        let (v, clean, covered) = vacated_points(&pts, a_col);
         let _ = name;
-        (painted, clean == pts.len(), clean)
+        (painted, v, (clean, covered))
     };
 
     let (p1, v1, n1) = leg(&|w, _| { close(w); }, "close");
@@ -16541,9 +16554,10 @@ pub fn vacate_selftest() {
 
     let ok = p1 && v1 && p2 && v2;
     serial_println!(
-        "[wc-j] vacate close_painted={} close_desktop={} ({}/5) owner_painted={} owner_desktop={} ({}/5) -> {}",
-        p1, v1, n1, p2, v2, n2,
-        if ok { "PASS" } else { "FAIL" }
+        "[wc-j] vacate close_painted={} close_desktop={} ({}/5) owner_painted={} owner_desktop={} ({}/5) -> {} close_covered={} owner_covered={}",
+        p1, v1, n1.0, p2, v2, n2.0,
+        if ok { "PASS" } else { "FAIL" },
+        n1.1, n2.1
     );
     retile_selftest();
     closeiso_selftest();
@@ -16661,12 +16675,11 @@ fn movevacate_selftest() {
         (old.0 + 1, old.1 + old.3 - 1),
         (old.0 + old.2 - 1, old.1 + 1),
     ];
-    let mut clean = 0usize;
-    for &(x, y) in pts.iter() {
-        if read(x, y) == DESKTOP_BG {
-            clean += 1;
-        }
-    }
+    // FURNITURE-OCC — the sliver is judged against whoever owns each point now; on a bare panel that
+    // is the desktop at every one of them and the rule is byte-identical to the one this replaced.
+    // `gone` is the KEYLINE rather than the content colour: these three points are on the old box's
+    // OUTER EDGE, so an unerased sliver shows `theme::FRAME_LINE`, not the surface.
+    let (sliver_ok, clean, covered) = vacated_points(&pts, super::theme::FRAME_LINE);
     // Half 1b — and the window is genuinely THERE, at the new origin, rather than the panel having
     // simply gone quiet. Content and kernel-drawn chrome both, since the move re-lays both.
     let new_window = read(ox + STEP + 1, oy + STEP + 1) == a_col
@@ -16685,13 +16698,13 @@ fn movevacate_selftest() {
     let box_px = old.2 as u64 * old.3 as u64;
     let exact = recorded && erased_px + overlap_px == box_px;
 
-    let ok = painted && moved && clean == pts.len() && new_window && recorded && flash_px == 0 && exact;
+    let ok = painted && moved && sliver_ok && new_window && recorded && flash_px == 0 && exact;
     serial_println!(
-        "[wc-j] move-once step={} painted={} moved={} old_desktop={} ({}/{}) new_window={} parts={} erased_px={} overlap_px={} box_px={} recorded={} flash_px={} exact={} -> {}",
+        "[wc-j] move-once step={} painted={} moved={} old_desktop={} ({}/{}) new_window={} parts={} erased_px={} overlap_px={} box_px={} recorded={} flash_px={} exact={} -> {} covered={}",
         STEP,
         painted,
         moved,
-        clean == pts.len(),
+        sliver_ok,
         clean,
         pts.len(),
         new_window,
@@ -16702,7 +16715,8 @@ fn movevacate_selftest() {
         recorded,
         flash_px,
         exact,
-        if ok { "PASS" } else { "FAIL" }
+        if ok { "PASS" } else { "FAIL" },
+        covered
     );
 
     close(w);
@@ -17247,7 +17261,15 @@ fn closeiso_selftest() {
     let got_k = sample(wk);
     let got_f = sample(wf);
     let iso_ok = got_k == k_col;
-    let forced_ok = got_f == DESKTOP_BG;
+    // FURNITURE-OCC (CHROMESPEC, 2026-08-17) — the FORCED row is hidden by the shell raise, so its
+    // content origin must stop being ITS pixels. Desktop is what that means on a bare panel and what
+    // this leg asserted; on the armed Pi desktop the console window under it is correctly repainted
+    // there instead (`forced=0xf3f3f5` — a title-strip shade, not a stale `f_col`), which the old
+    // equality convicted. Same rule the vacate legs now keep: see [`vacated_points`].
+    let forced_ok = match probe(wf) {
+        Some(pt) => vacated_points(&[pt], f_col).0,
+        None => got_f == DESKTOP_BG,
+    };
     // The table's own answer, beside the panel's: `above_shell` must still call the furniture row
     // visible. (`owner_hidden` is the predicate every present-suppression path reads.)
     let table_ok = {
@@ -17292,12 +17314,47 @@ fn closeiso_selftest() {
         && ctrl_close == FURNITURE_HAS_CONTROLS;
 
     let park = minimise(wk);
+    // FURNITURE-OCC (CHROMESPEC, 2026-08-17) — **`parked-visible` is not a failure, and `minimise`
+    // says so in its own doc comment**: *"down, but the owner still has another window above the
+    // shell, so it keeps rendering. Not an error: minimise is a WINDOW gesture and hiding is an OWNER
+    // property."* This fixture mints `wk` in the `KERNEL_OWNER_CONSOLE` band, and on the armed Pi
+    // desktop `pidesk::activate` has ALREADY minted a real window in that same band — so the owner
+    // legitimately keeps a window up, `minimise` returns `parked-visible`, `owner_hidden` answers
+    // false, and the leg reported `park=parked-visible/0x2d2b55/false` for machinery that did exactly
+    // what it promises.
+    //
+    // So the leg asserts what it is actually about — THIS ROW went down — and takes the owner-level
+    // outcome only in the state where the owner has nothing else up. The expected string is derived
+    // from the table rather than hard-coded, so a build that returned `parked-visible` with no
+    // sibling (or `parked` with one) is still a FAIL.
+    let sibling_up = {
+        let t = table();
+        let shell = shell_z();
+        t.rows
+            .iter()
+            .filter(|r| r.used && r.id != wk && r.owner_asid == KERNEL_OWNER_CONSOLE)
+            .any(|r| above_shell(r, shell))
+    };
+    let parked_row = {
+        let t = table();
+        let shell = shell_z();
+        row(&t, wk).map(|r| !above_shell(r, shell)).unwrap_or(false)
+    };
     let parked_hidden = {
         let t = table();
         owner_hidden(&t, KERNEL_OWNER_CONSOLE, shell_z())
     };
     let parked_px = sample(wk);
-    let park_ok = park == "parked" && parked_hidden && parked_px == DESKTOP_BG;
+    // The vacated box, per FURNITURE-OCC: desktop where the desktop owns it, and provably no longer
+    // `wk`'s own paint where a live window does.
+    let parked_px_ok = match probe(wk) {
+        Some(pt) => vacated_points(&[pt], k_col).0,
+        None => parked_px == DESKTOP_BG,
+    };
+    let park_ok = park == if sibling_up { "parked-visible" } else { "parked" }
+        && parked_row
+        && (sibling_up || parked_hidden)
+        && parked_px_ok;
 
     focus_changed(KERNEL_OWNER_CONSOLE);
     let back_visible = {
@@ -17399,7 +17456,7 @@ fn closeiso_selftest() {
         && occ_ok
         && reaped_k;
     serial_println!(
-        "[wc-iso] close-iso base_k={} base_f={} closed={}/{} isolate={:#08x}/{} forced={:#08x}/{} table_visible={} refuse={}/{} ctrls min={} zoom={} close={} park={}/{:#08x}/{} restore={}/{:#08x}/{} uncover={} reaped={} -> {}",
+        "[wc-iso] close-iso base_k={} base_f={} closed={}/{} isolate={:#08x}/{} forced={:#08x}/{} table_visible={} refuse={}/{} ctrls min={} zoom={} close={} park={}/{:#08x}/{} restore={}/{:#08x}/{} uncover={} reaped={} -> {} owner_sibling_up={}",
         base_k, base_f, closed, closed_ok, got_k, iso_ok, got_f, forced_ok, table_ok,
         refused, refuse_ok,
         ctrl_min, ctrl_zoom, ctrl_close,
@@ -17407,7 +17464,8 @@ fn closeiso_selftest() {
         back_visible, back_px, back_ok,
         occ_ok,
         reaped_k,
-        if ok { "PASS" } else { "FAIL" }
+        if ok { "PASS" } else { "FAIL" },
+        sibling_up
     );
 
     close(wf);
@@ -17505,20 +17563,19 @@ fn retile_selftest() {
     let moved = after != before;
     // The survivor still reaches the panel at its NEW box...
     let live_ok = read(after.0 + BORDER + 1, after.1 + TITLE_H + BORDER + 1) == b_col;
-    // ...and its OLD box is desktop again. Three points inside the abandoned content area.
-    let mut clean = 0usize;
+    // ...and its OLD box is RECLAIMED. Three points inside the abandoned content area — desktop
+    // where the desktop still owns them, and provably no longer B's paint where furniture does.
+    // FURNITURE-OCC: see [`vacated_points`] for why that is the same rule stated for a panel that
+    // has something underneath.
     let pts = [(bx0 + 1, by0 + 1), (bx0 + 2, by0 + 2), (bx0 + 5, by0 + 5)];
-    for &(x, y) in pts.iter() {
-        if read(x, y) == DESKTOP_BG {
-            clean += 1;
-        }
-    }
-    let ghost_free = !moved || clean == pts.len();
+    let (reclaimed, clean, covered) = vacated_points(&pts, b_col);
+    let ghost_free = !moved || reclaimed;
     let ok = painted && live_ok && ghost_free;
     serial_println!(
-        "[wc-j] retile survivor={} moved={} painted={} live={} old_desktop={} ({}/3) -> {}",
+        "[wc-j] retile survivor={} moved={} painted={} live={} old_desktop={} ({}/3) -> {} covered={}",
         wb, moved, painted, live_ok, ghost_free, clean,
-        if ok { "PASS" } else { "FAIL" }
+        if ok { "PASS" } else { "FAIL" },
+        covered
     );
     close(wb);
 }
@@ -17528,6 +17585,77 @@ fn retile_selftest() {
 fn info_box(id: WinId) -> Option<(usize, usize, usize, usize)> {
     let t = table();
     row(&t, id).map(outer_box)
+}
+
+/// FURNITURE-OCC — **is this panel point the DESKTOP's to answer?** `true` iff no live window's
+/// outer box contains it.
+///
+/// Called after a close or a move, with the vacating row already gone from the table, so "live" is
+/// the set that owns the panel at the instant of the read.
+#[cfg(feature = "witness")]
+fn desktop_owns(x: usize, y: usize) -> bool {
+    let t = table();
+    !t.rows.iter().filter(|r| r.used).any(|r| {
+        let (bx, by, bw, bh) = outer_box(r);
+        x >= bx && x < bx + bw && y >= by && y < by + bh
+    })
+}
+
+/// FURNITURE-OCC (CHROMESPEC, 2026-08-17) — the VACATE verdict for a set of abandoned points, on a
+/// panel that may carry PERMANENT FURNITURE underneath them.
+///
+/// Returns `(ok, correct, covered)`: whether every point answered correctly, how many did, and how
+/// many of them were owned by a live window rather than by the desktop.
+///
+/// ## Why the old rule had to widen, and why this is not a weakening
+///
+/// The rule these legs shipped with was *"every abandoned point equals [`DESKTOP_BG`], byte for
+/// byte, with no tolerance"*. That is right on a bare panel and WRONG on a desktop — and this file
+/// already says so, three hundred lines up, in DECRUD-4's own words: *"the box a close vacates is
+/// only desktop-coloured where nothing was UNDER it, and where something WAS, the vacated box has to
+/// come back as THAT WINDOW."* DECRUD-4 states the complement as a separate leg; this states it as
+/// the rule the vacate legs themselves keep.
+///
+/// It became load-bearing when the Pi grew a desktop. `pidesk::activate` mints the console window at
+/// the GUI handoff — `[wc-x] console-window win=1 … box=570x396 at (35,4)` — which on the 640x480
+/// gate panel covers `x 35..605, y 4..400`, i.e. 89 % by 82 % of the glass, and the boot witness
+/// cascade then places its probe windows INSIDE it. `pidesk.rs` records the collision as a standing
+/// one ("a standing conflict left for the integrator"). Under the old rule the legs read
+/// `close_desktop=false (0/5)`, `old_desktop=false (0/3)` — five and three CORRECT repaints reported
+/// as five and three failures, because the console window under them was faithfully redrawn and the
+/// witness could only recognise the desktop.
+///
+/// The two arms are:
+///
+/// * **desktop-owned** — unchanged, and still byte-exact: the point must be [`DESKTOP_BG`]. This is
+///   the whole of the old rule and every point takes it on a panel with no furniture, so a bare-panel
+///   boot reads exactly as it always did.
+/// * **covered** — the point must NOT still be showing `gone`, the vacating window's own paint. A
+///   window whose box was never reclaimed leaves its own pixels there, which is the defect these legs
+///   exist to catch, and it is caught under occlusion exactly as it is in the open.
+///
+/// **The disclosed limit**, because a witness that hides one is worth nothing: on a COVERED point the
+/// test is a not-equal, so it cannot convict a stale pixel whose colour happens to equal the covering
+/// window's at that point. That is why `covered=` is on the wire beside the count — a leg reporting
+/// every point covered has made a weaker statement than one reporting none, and the reader can see
+/// which. The fixture surfaces are solid `0xFF2020`/`0x20FF20`, which nothing else in the tree
+/// paints, so on the content points the arm is as tight as the equality it replaces.
+#[cfg(feature = "witness")]
+fn vacated_points(pts: &[(usize, usize)], gone: u32) -> (bool, usize, usize) {
+    let (mut correct, mut covered, mut bad) = (0usize, 0usize, 0usize);
+    for &(x, y) in pts.iter() {
+        let got = super::WRITER.lock().read_pixel(x, y).unwrap_or(0);
+        let desktop = desktop_owns(x, y);
+        if !desktop {
+            covered += 1;
+        }
+        if if desktop { got == DESKTOP_BG } else { got != gone } {
+            correct += 1;
+        } else {
+            bad += 1;
+        }
+    }
+    (bad == 0, correct, covered)
 }
 
 // ---- internals -------------------------------------------------------------------------------
@@ -18420,6 +18548,30 @@ fn clickshell_windowless_leg(asid: u64) -> Option<bool> {
     if compat_live() {
         return None; // a full-screen app owns the panel: the deliver arm, not this leg's fixture
     }
+    // FURNITURE-OCC (CHROMESPEC, 2026-08-17) — **leg 6's own precondition, which leg 7 was missing.**
+    //
+    // This leg asserts the MISS arm: a press that lands on NO window must be consumed by the shell.
+    // Whether the press lands on a window is a fact about where the pointer is parked and what is on
+    // the panel, and `clickshell_leg` has always checked it in as many words ("pointer parked over a
+    // window: that is the HIT arm, not the desktop arm"). Leg 7 inherited every other part of that
+    // fixture and not this one, which was invisible for as long as panel centre was empty.
+    //
+    // The armed Pi desktop makes it visible: `pidesk::activate` mints the console window over
+    // `x 35..605, y 4..400` of a 640x480 panel and the headless gate parks the cursor at panel
+    // CENTRE, i.e. inside it. The press is then a legitimate HIT, the router correctly declines to
+    // treat it as a desktop click, and the leg reported `bare=false` — the fixture's own precondition
+    // failing, reported as the policy failing. Leg 6 read `shell=skip` on the identical boot for the
+    // identical reason, which is the tell that this is a missing guard and not a second defect.
+    //
+    // SKIP, never PASS: the leg asserts nothing when it has no fixture, on the sibling's discipline.
+    let (cw, ch) = {
+        let i = super::WRITER.lock().info();
+        (i.width as i32, i.height as i32)
+    };
+    let (cx, cy) = crate::pal::cursor::pos(cw, ch);
+    if hit_test(cx, cy).is_some() {
+        return None; // pointer parked over a window: that is the HIT arm, not the desktop arm
+    }
     focus_changed(asid); // no window to raise — this only names the windowless owner
     sc::user_input_set_active(asid);
     let consumed = sc::wc_click_route(crate::pal::Event::Button(1));
@@ -18894,7 +19046,16 @@ pub fn hittest_selftest() {
     // reports `skip` (the sibling's discipline) rather than a verdict it has no fixture for.
     let outside_ok: Option<bool> = miss_pt.map(|(x, y)| hit_test(x, y).is_none());
     focus_changed(0);
-    let hidden_ok = hit_test(ix, iy).is_none();
+    // FURNITURE-OCC (CHROMESPEC, 2026-08-17) — leg 5 asks whether the shell raise BURIED THE PROBE
+    // ROWS, and that is what it now reads. `is_none()` was the same question asked of a panel where
+    // the probes were the only things at that point; with the Pi desktop's console window under them
+    // (`[wc-x] console-window win=1 … box=570x396 at (35,4)` covers the probe origin at 640x480) the
+    // hit-test correctly resolves to the FURNITURE the shell raise has no business burying, and the
+    // leg convicted the compositor for being right. The owner is on the wire beside the verdict, so a
+    // reader can see WHAT the point resolved to rather than only that it resolved to something.
+    let hidden_hit = hit_test(ix, iy);
+    let hidden_owner = hidden_hit.map(|(_, a, _)| a).unwrap_or(0);
+    let hidden_ok = hidden_owner != ASID_A && hidden_owner != ASID_B;
 
     // Leg 6 — CLICK-SHELL. Re-raise A (leg 5 left every window under the shell) and give it focus,
     // then drive one PRESS edge through the router with the pointer wherever it actually is. The
@@ -18951,7 +19112,7 @@ pub fn hittest_selftest() {
     };
     let (mx, my) = miss_pt.unwrap_or((-1, -1));
     serial_println!(
-        "[clickroute] hit-test at ({},{}) inside={} topmost={} raise={} outside={} miss=({},{}) hidden={} shell={} bare={} hit={} deliver={} wake={} corner={} close={} closereal={} -> {}",
+        "[clickroute] hit-test at ({},{}) inside={} topmost={} raise={} outside={} miss=({},{}) hidden={} shell={} bare={} hit={} deliver={} wake={} corner={} close={} closereal={} -> {} hidden_owner={:#x}",
         ix, iy, inside_ok, topmost_ok, raise_ok,
         match outside_ok {
             Some(true) => "true",
@@ -18967,7 +19128,8 @@ pub fn hittest_selftest() {
         match corner { Some(true) => "true", Some(false) => "false", None => "skip" },
         match closebox { Some(true) => "true", Some(false) => "false", None => "skip" },
         match closereal { Some(true) => "true", Some(false) => "false", None => "skip" },
-        if ok { "PASS" } else { "FAIL" }
+        if ok { "PASS" } else { "FAIL" },
+        hidden_owner
     );
 
     close(wa);

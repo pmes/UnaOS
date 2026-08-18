@@ -13762,3 +13762,156 @@ falsifier is WC-G's own classifier: the MAJOR-1 note above established that a pu
 bytes of a declared-finished frame, so RACE-PRESENT verdicts on paced vug windows should disappear
 from the capture, and the HUD digits should hold steady on glass. Either lying on the next metal
 boot falsifies the design, not the instrument.
+
+---
+
+## CHROMESPEC — the armed Pi gate's witnesses, made honest against permanent furniture (2026-08-17)
+
+`UNAOS_PIDESK=1 UNAOS_QUARRY=1 ./arroyo kernel8-test 300` was red on the merged trunk: **106/111
+required witnesses**, and *not one* of the five missing ones was about the thing it convicted. The
+whole family had one cause with two faces — a Pi desktop that puts **permanent furniture on the
+glass before the boot witness cascade has finished reading it** — and `video/pidesk.rs` had already
+written the rule down and named the exception:
+
+> *A desktop that appears before the boot witness cascade has released the panel is not early, it is
+> wrong.* … `activate`'s own console window is the counter-example that proves the rule … **a
+> standing conflict left for the integrator.**
+
+This is that conflict discharged **at the witness**. No theme constant, no compositor behaviour and
+no FORBID moved; the desktop paints exactly what it painted before.
+
+### Face 1 — a contested panel, read by a ONE-SHOT: `[chrome-truth]`
+
+`chrome_truth` spends its single reading on the first composite pass that finds chrome. On the armed
+desktop that pass is the console window's own `create_at`, **inside**
+`fbcon::panel_console_window_open` — and the glyph route is not installed until that function
+*returns*, so at that instant `fbcon` is still painting the **panel** directly from every core that
+prints, over the chrome that was correct when it was written. Two consecutive armed runs of the same
+image on the same host:
+
+```text
+run 1: pt=title_bot want=0xefeff1 got=0x000000   <- fbcon BG_DEFAULT
+       pt=face_left want=0xededef got=0xc0c0c0   <- fbcon FG_DEFAULT: a console GLYPH
+       verdict wins=1 hits=3/5 ... -> FAIL
+run 2: verdict wins=1 hits=5/5 title_grad=5 ... -> PASS
+```
+
+A coin flip on who reached the pixel last. **The fix is a bounded deferral, not a retry-until-green**
+(`CHROME_TRUTH_DEFER_BUDGET = 32`, `[wc-f] twin`'s one-token-then-silence discipline): a contested
+pass is skipped while the budget lasts, and *the budget's exhaustion latches the FAIL*. The reads are
+now buffered in one pass and printed in another, so the line an operator reads can never describe a
+different instant from the verdict, and `chrome_probes` is the single arithmetic both halves use.
+
+Three of the five expectations were already the *material's* — `ceramic::shade` of the role colour at
+the row the painter used — so the brushed grain is asserted, not tolerated. The other two are flat
+because `draw_window` says the keyline and bevel hairlines are deliberately **not** machined; a flat
+expectation there is the texture spec's own answer.
+
+The anti-weakening pin is in the spec, not in prose: `exhausted=false` is REQUIRED and
+`exhausted=true` is FORBIDDEN, so *reaching green through the deferral is itself a red*. Live proof
+from an ordinary armed run — the flake caught and cured in the same boot:
+
+```text
+[chrome-truth] defer wins=1 hits=0/5 budget=32 (chrome read back contested — ...)
+[chrome-truth] defers=1 budget=32 exhausted=false
+[chrome-truth] verdict wins=1 hits=5/5 title_grad=5 ... -> PASS
+```
+
+### Face 2 — FURNITURE-OCC: `old_desktop=` was asking the wrong question
+
+`pidesk::activate` mints `[wc-x] console-window win=1 … box=570x396 at (35,4)` — **89 % by 82 % of a
+640x480 panel** — and the cascade then places its probe windows *inside* it. The vacate legs asserted
+`== DESKTOP_BG` byte-for-byte at eleven points and read `(0/5)`, `(0/3)`, `(0/3)`: eleven correct
+repaints reported as eleven failures, because the compositor was doing the right thing — erase, then
+re-composite **the row underneath** — and the legs could only recognise the desktop.
+
+The tree already contained the correction, in `[wc-iso]`'s DECRUD-4 leg: *"the box a close vacates is
+only desktop-coloured where nothing was UNDER it, and where something WAS, the vacated box has to come
+back as THAT WINDOW."* `wm::vacated_points` makes that the rule the vacate legs themselves keep:
+
+| the point is owned by | the assertion |
+| --- | --- |
+| the **desktop** (no live window's outer box contains it) | `== DESKTOP_BG`, byte for byte — the *whole* of the old rule, and every point takes this arm on a bare panel |
+| a **live window** | `!= gone`, the vacating window's own paint — a box that was never reclaimed keeps its own pixels, which is the P61 defect, caught under occlusion as in the open |
+
+The disclosed limit is on the wire, not in a comment: `covered=` / `close_covered=` / `owner_covered=`
+say how many points took the weaker arm, and the spec REQUIREs them so they cannot quietly stop
+printing. The go-red run shows the limit *and* the conviction in one number — an injected build that
+never closes the window reads `close_desktop=false (2/5) … close_covered=5`: three of five points
+convict, and the two that do not are the chrome points where `gone` is the content colour.
+
+Two more legs were fixture preconditions rather than policy, and both are now stated the way their own
+siblings already stated them:
+
+* `[clickroute]` **leg 5** asked `hit_test(probe).is_none()` after the shell raise; with furniture
+  under the probe origin the point correctly resolves to the console window, so it now asks whether
+  either **probe row** answers there, and publishes `hidden_owner=` beside the verdict.
+* `[clickroute]` **leg 7** was missing **leg 6's own guard** — verbatim in `clickshell_leg`, *"pointer
+  parked over a window: that is the HIT arm, not the desktop arm"*. Leg 6 read `shell=skip` on the
+  same boot for the same reason, which is the tell. It reads `bare=skip` now: SKIP, never PASS.
+* `[wc-iso]` legs 5/6: `minimise` returns `parked-visible` when the owner has another window up, and
+  its own doc says *"Not an error"*. The fixture mints a `KERNEL_OWNER_CONSOLE` row and the armed
+  desktop already has one, so the expected string is now **derived from the table** — a build that
+  returns `parked-visible` with no sibling, or `parked` with one, is still a FAIL.
+
+### Face 3 — `[wc-f]`: two reserved boxes, one veto
+
+`wcf::reserved` returns two disjoint rectangles in the bottom strip — twins hard right
+`(480,400,144x64)`, slope marker hard left `(16,208,264x256)` at 640x480. The caller answered "is the
+region clear?" for their **union**, so the console window (which misses the twin box by exactly one
+row and overlaps the marker across a third of its height) vetoed both, and `[wc-f] twin -> PASS` — a
+REQUIRED witness — never printed on any armed boot. Judged per box, the twins run and the marker
+defers on its own line.
+
+Splitting them exposed a rule that the union had been hiding by accident, so it is now written down:
+the probe's exclusion zone is **`wcf::clearance`, the full-width ROW SPAN of each box**, not the box
+it paints. The cache maintenance is per-scanline (the direct half is raw byte arithmetic and has no
+column to clip to) and an invalidate is a *discard* — a line another core dirtied between our clean
+and our invalidate is thrown away, which on the panel is somebody else's window losing pixels.
+
+### Gates
+
+| gate | result |
+| --- | --- |
+| `./arroyo check` (12 cfg legs, both arches) | **green** |
+| `UNAOS_WC=1 ./arroyo check` | **green** |
+| `./arroyo kernel8-test 210` (knob-off) | **PASS 117/117, 0 forbidden** |
+| `UNAOS_PIDESK=1 UNAOS_QUARRY=1 ./arroyo kernel8-test 300` (armed) | all five previously-missing REQUIREs green; the residue is the host-load family documented in `scripts/specs/pi4-regression.spec` under **THE ARMED-GATE HOST-LOAD RESIDUE** |
+
+The spec gained **six REQUIREs and one FORBID** (111 → 117 required witnesses) and lost nothing: the
+deferral's honesty pin, the three `covered=` censuses and `hidden_owner=`.
+
+### Go-red, all four, one injected build
+
+| witness | injection | line it printed |
+| --- | --- | --- |
+| `[chrome-truth]` | one probe's expectation corrupted | `defer … budget=32` → `defers=33 budget=32 exhausted=true` → `verdict wins=4 hits=12/20 … -> FAIL` |
+| `[wc-j] vacate` | leg 1 never closes the window | `close_desktop=false (2/5) … close_covered=5 -> FAIL` |
+| `[wc-j] move-once` | probe the NEW box's outer edge (a live keyline) | `old_desktop=false (2/3) -> FAIL` |
+| `[clickroute]` | skip the shell burial | `hidden=false … hidden_owner=0xc0a -> FAIL` |
+
+Every added directive fired: `FORBID [chrome-truth] defers=.*exhausted=true`, both `REQUIRE
+[chrome-truth]` lines, and the three vacate/hit-test REQUIREs.
+
+### Two things the gate itself caught, recorded rather than smoothed over
+
+**`[chrome-truth]` was briefly a two-shot, and the gate said so.** One capture carried *two* verdict
+lines. The early-out at the top of `chrome_truth` is a `load`, and it always was; what the read/print
+split changed is the SIZE of the window between that load and the latch — PASS 1's reads, the
+deferral decision and PASS 2's fourteen serial lines now all sit inside it, and composite runs on any
+core. The latch is a `compare_exchange` now, on `wcf::run`'s own precedent in the same file (*"two
+could otherwise clear a `load` that had not yet been `store`d and both proceed"*). A duplicated
+one-shot is a witness lying about being one, and its extra serial traffic perturbs the pass it prints
+from.
+
+**`[wc-c] side-by-side windows=2 drawn=1` is OPEN and NOT attributed.** Counts: baseline 2/2
+`drawn=2`, knob-off 2/2 `drawn=2`, armed-with-this-arc 3 of 7 `drawn=1`. Not significant at these
+sample sizes, and nothing in this arc's diff reaches `drawn` — every change runs at the *tail* of
+`composite_inner`, after the `[wc-c]` block. But `[wc-f] twin` now genuinely runs on the armed gate
+where it used to defer forever, and that pass is measurably slower, so a timing perturbation cannot be
+ruled out either. The underlying hazard is the witness's own shape: `drawn` counts what this PASS
+blitted, while the claim is about the PANEL, and a row whose pixels are already correct and undamaged
+is legitimately not redrawn. A defer-and-retry like CHROME-TRUTH's is the obvious repair and was
+deliberately not taken — `real` only grows, so deferring past the two-window moment would latch
+`windows=3` and turn an intermittent red into a systematic one. Left for the integrator with the
+numbers, in `scripts/specs/pi4-regression.spec` under THE ARMED-GATE HOST-LOAD RESIDUE.
