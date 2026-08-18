@@ -116,6 +116,17 @@ The rungs, in order — each is an arc-sized deliverable, none skips the one bef
 | **SH-4 smart install/debug** | The installer consults an AI through Vein to auto-diagnose metal bring-up on new hardware from the serial verdicts — new machines onboard themselves. **Provider-agnostic by charter (Peter, 2026-08-17): a person sets up THEIR OWN API — Claude or whatever AI they connect — and gets the whole experience.** Vein owns the provider abstraction, Principia owns the settings surface, Holocron owns the credentials; no provider is hardwired. **Offline arm (Peter, 2026-08-17): when the installer itself cannot reach the internet, the smart half runs on UnaOS-ON-HOST — the host-native userspace on `libs/gneiss_pal` (already running well on macOS and Linux today; Windows someday) as the connected companion that drives the target's bring-up over the wire. The rMBP's open hardware bugs are the installer's first test corpus — hardware testing continues WITH the installer as the tester (Peter, 2026-08-17).** | orin (design), all |
 | **SH-5 self-build** | The far rung, named honestly: UnaOS builds UnaOS. Requires a native toolchain story (bandy-on-metal §3b is the seed) — sequenced after the desktop chain, not before. | future |
 
+**The deliverable has a name (Peter, 2026-08-17): the `UnaOS_Installer` VESSEL** —
+what people download. Two faces of one program: (a) install UnaOS itself onto a machine
+or card; (b) install and run individual UnaOS **vessels** on the foreign host (macOS,
+Linux, Windows someday) — so a person can adopt the native suite one vessel at a time
+without committing to a whole OS. The bet stated with it: the vessels will outgrow their
+host-app rivals because of the formal native suite behind them. It lives in `vessels/`
+(per the naming law), is built on the host-native userspace (`libs/gneiss_pal`), carries
+the Vein AI socket (user's own provider), and IS the alien-host companion of SH-4 —
+one program, downloadable, that is simultaneously the front door to the OS and the
+distribution channel for its applications.
+
 The witness discipline applies: each rung lands with a boot-time witness proving it on
 the wire (the ONECARD witness is SH-2's Pi-side ancestor and the pattern to follow).
 
