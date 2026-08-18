@@ -4074,6 +4074,38 @@ fn composite_inner() -> CursorTail {
             }
             hit |= reserved_hit;
         }
+        // MENU-UNDER — the open SHARD dropdown is the x86 member of the same exclusion class, for
+        // the inverse reason: WC-F's probe paints the FRONT over pixels the layer would deliver;
+        // the dropdown makes the layer NOT deliver pixels the plan would claim. `occ_clip` carries
+        // the menu (MENU-OCC), so a window under the open menu presents its rows with the menu's
+        // columns WITHHELD by the span walk — but `compose_into` would still paint the arrow into
+        // that window's back layer and take its save-under from the LAYER, i.e. window content,
+        // where the glass holds the dropdown. The session's coverage then claims pixels the present
+        // never published, and the next restore stamps window content over the open menu — Boot C,
+        // operator: "the mouse erases the crystal menu". Declining the overlay takes CURSOR-3's
+        // whole-sprite bracket instead: the tail's draw re-saves from the FRONT, which is the
+        // dropdown, and the restore hands the menu back its own pixels.
+        //
+        // Not folded into `hit`: the menu is static — with no window under the sprite nothing
+        // presents there, the front-sourced sprite draw is already correct, and a bracket would be
+        // pure duty cycle. The dock and bar need no arm at all because `wm::place` keeps every
+        // window out of their rows — no window under them, no overlay session to poison; the
+        // dropdown is the one piece of furniture that hangs over the work area.
+        //
+        // `open_rect` is one relaxed load on every boot with the menu closed, so the closed-menu
+        // cost of this block is the `WRITER` read it shares with the arm above's shape.
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+        {
+            let fb = *super::WRITER.lock();
+            if fb.is_ready() {
+                let info = fb.info();
+                if let Some(b) = super::crystal::open_rect(info.width, info.height) {
+                    if b.2 != 0 && b.3 != 0 && boxes_overlap(sbox, b) {
+                        reserved_hit = true;
+                    }
+                }
+            }
+        }
         // CURSOR-12 — the sprite was up but nothing was under it. Counted before the `hit` branch so
         // the terms stay mutually exclusive and sum to `passes`.
         #[cfg(feature = "witness")]
@@ -4109,22 +4141,29 @@ fn composite_inner() -> CursorTail {
                 #[cfg(feature = "witness")]
                 CUR3_PLANNED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             } else if reserved_hit {
-                // WC-F's probe paints the FRONT at the tail of this pass, OUTSIDE any window box, so
-                // the paint set below does not describe what it will touch and `repair` (which
-                // damages windows) could not mend a sprite pixel it took. The whole sprite comes off,
-                // as it has since CURSOR-3. Witness/baremetal-only, one region.
+                // WC-F's probe (aarch64) paints the FRONT at the tail of this pass, OUTSIDE any
+                // window box, so the paint set below does not describe what it will touch and
+                // `repair` (which damages windows) could not mend a sprite pixel it took. The whole
+                // sprite comes off, as it has since CURSOR-3.
+                //
+                // MENU-UNDER (x86) takes this arm for the open dropdown: the layer under the menu's
+                // withheld columns will not reach the glass, so the plan must not claim them (see
+                // the arming block above). Same response, inverse hazard.
                 //
                 // CURSOR-9 — and the probe is one of the two front-buffer painters that do NOT reach
                 // `draw_window`, so it arms the repair explicitly rather than being heard about
                 // through `note_present_over_sprite`. Without this the probe's pixels inside the
                 // sprite box would be restored over without the affected windows being damaged.
+                // (Harmless over-arming on the MENU-UNDER arm: the tail repaint it requests is the
+                // repair that arm wants anyway.)
                 super::cursor::note_sprite_touched();
                 super::cursor::undraw();
                 #[cfg(feature = "witness")]
                 {
                     CUR3_DECL_BUDGET.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    // CURSOR-12 — attributed to the WC-F probe specifically, so `[cursor12]`'s
-                    // `reserved` can be read against `budget`, which also carries the per-window
+                    // CURSOR-12 — `reserved` counts the WC-F probe on aarch64 and MENU-UNDER's open-
+                    // dropdown decline on x86 (each is structurally 0 on the other arch), so the
+                    // field can be read against `budget`, which also carries the per-window
                     // `may_overlay` exclusions.
                     CUR12_RESERVED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     // CURSOR-11 — a pass whose arrow left the glass. Kept, not fixed: the probe paints
@@ -7971,7 +8010,9 @@ static CUR12_HIDDEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 static CUR12_NOHIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// CURSOR-12 — a WC-F reserved box overlapped the sprite, so the pass took CURSOR-3's whole-sprite
-/// bracket deliberately. aarch64 witness+baremetal only; must be 0 on x86.
+/// bracket deliberately. On aarch64 (witness+baremetal) this is the WC-F probe; on x86 (`wc`) it is
+/// MENU-UNDER's open-dropdown decline — each is structurally 0 on the other arch, so the field
+/// never mixes the two.
 #[cfg(feature = "witness")]
 static CUR12_RESERVED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
