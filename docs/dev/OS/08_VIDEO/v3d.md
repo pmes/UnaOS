@@ -7500,3 +7500,437 @@ leaves leg D with nothing to explain), then leg D's `VIOLATION` and `VERDICT`, t
 pool-head` blocks.
 
 ---
+
+### 49.23 `tsaim`, read on metal — the unarmed close COMPLETES, and the second write is the tile-state write (PI-V3D-98 verdict, boot8/PA46, 2026-08-18)
+
+Leg D returned `OUTCOME D1`. `CT0QTS.ENABLE` gates the tile-state write's **base**, not its existence:
+with the bit clear the write fires at a base of zero and the MMU refuses it at `VA 0x0`; with the bit set
+the same write lands at `CT0QTS`, no fault latches anywhere, and the illegal-address catcher — which
+absorbed 48 words on each of the three legs before it — comes back **pristine**. Both close-time writes of
+an unarmed frame-close have now been read as **completed** writes on one leg. That is a campaign first,
+and it is what §49.22.5 pre-wrote as the success case of the single cut it recommended first.
+
+This section folds that boot, executes §49.22.5's R-next-2 (the landed header, decoded from the four
+`[v3d98] pool-head` dumps the leg carried for free), and records R-next-3 (`armedclose`) as built.
+
+#### 49.23.1 The capture, and what kind of boot it was
+
+`~/unaos-bench/capture/pi4-pi0-b1/ttyACM0.log`, past the mark
+
+```
+=== SQUAWK MARK 2026-08-18T05:09:20Z R24 boot8 pi4 — PA46 v3d98 tsaim one-bit cut, hw-pi4@d99bec68, fp 1268820 ===
+```
+
+625 lines, 162 of them `[v3d…]`. Banked sliced at `~/unaos-bench/scratch/pi0-b1b2/boot8-full.log` (the whole
+boot), `boot8-v3d.log` (the V3D lines) and `boot8-key.log` (the 97 verdict/violation/scan/dump lines). A
+short, deliberately shallow capture: the rung returns before `probe_job`, so there is no `[v3d48]` ladder,
+no M4, no visible battery and no `[v3d75]`/`[v3d80]`/`[v3d81]` tail. **It must never be diffed
+line-for-line against a deep boot.**
+
+Four closes off one CT0 that was virgin at leg A, and the wire proves they are four and not one:
+`BFC 0x0→0x1→0x2→0x3→0x4`, one Δ1 per leg, and `CT0LC 0x10000 / 0x20000 / 0x30000 / 0x40000` — the CLE's
+own kick counter stepping once per leg. Every leg audited `submit_sound=1`, `idled=1`, `FLDONE` latched
+in the raw status, and `CT0CA` walked `BA → EA`.
+
+#### 49.23.2 The verdicts, each with its wire line and each with its exclusion
+
+**W1 — the pad self-check held, on this boot, on its own terms.**
+
+```
+[v3d97] pad-selfcheck — build_bin_cl_content_geom(Empty) len=14 vs build_bin_cl_emptyunarm_padded(pad=0)
+        len=14 first_diff=[-1] identical=1
+```
+
+*Excludes:* "leg B varies two things". R3's control value is established on this boot and is not inherited
+from boot7. *Does not exclude:* anything about the legs themselves.
+
+**W2 — leg B cleared the instrument a second time, on a second image.**
+
+```
+[v3d97] LEG B VERDICT — list len=46 (0x2e) | VIO_ADDR=0x0000000e VIO_ID=0x00000020 RAW -> client PTB @ VA 0x00000070
+        poison touched: decoy-pool=0/4096 decoy-ts=0/1024 real-ts=0/64 real-pool=0/8192
+```
+
+`VIO_ADDR` is `0xe` again on a 46-byte list. The raw word does not track list length. §49.20's `VA 0x70`
+reading now survives its own control **twice**, across two boots and two images. *Excludes:* the
+instrument-artifact hypothesis, permanently. *Does not exclude:* any reading of what the VA points at.
+
+**W3 — leg C reproduced boot7's leg C exactly, which is what entitles leg D to be read.**
+
+```
+[v3d56] poison (v3d97 R1 basedaim) R1 decoy POOL window (CT0QMA target) iova=0x0027b000 words=4096 —
+        INTACT=4076 ZEROED=19 OVERWRITTEN=1 touched=20 | first_touched=[0] (got 0x00000012 expected 0xa5a5a5a5)
+        last_touched=[31] | byte span [0x0,0x7f]
+[v3d97] LEG C VERDICT — bases QMA=0x0027b000 QMS=0x00003000 QTS=0x002b1000 (ENABLE=0) |
+        VIO_ADDR=0x00000000 VIO_ID=0x00000020 RAW -> client PTB @ VA 0x00000000 fault=1 |
+        poison touched: decoy-pool=20/4096 decoy-ts=0/1024 real-ts=0/64 real-pool=0/8192
+```
+
+Same twenty words, same `word0 = 0x12`, same `[0x0,0x7f]` span, same residual PTB refusal at `VA 0x0`,
+same `STRAY` landing on arena page 4 (`0x4000` = the pool decoy). §49.22 was not reading a one-boot
+accident. *Excludes:* every "boot7 leg C was a fluke" reading. *Does not exclude:* the identification of
+the residual — that is leg D's job.
+
+**W4 — `OUTCOME D1`, verbatim from leg D's own `VERDICT` line.**
+
+```
+[v3d97] LEG D VERDICT (v3d98 R-next-1 tsaim (mapped bases, CT0QTS.ENABLE=1, 14-byte list)) — list len=14 (0xe)
+        | frame-closed=1 (retired=1 FRDONE=0 BFC 0x00000003->0x00000004 Δ1) submit_sound=1 idled=1
+        | bases QMA=0x0027b000 QMS=0x00003000 QTS=0x002b1002 (ENABLE=1) POST-moved=0
+        | VIO_ADDR=0x00000000 VIO_ID=0x00000000 RAW -> client L2T @ VA 0x00000000 fault=0
+        | poison touched: decoy-pool=20/4096 decoy-ts=48/1024 real-ts=0/64 real-pool=0/8192 (drain completed=1)
+        — OUTCOME D1 — NO FAULT, AND THE TILE-STATE DECOY TOOK THE WRITE.
+```
+
+and the scan that carries it:
+
+```
+[v3d56] poison (v3d98 R-next-1 tsaim) R1 decoy TILE-STATE page (CT0QTS target) iova=0x002b1000 words=1024 —
+        INTACT=976 ZEROED=45 OVERWRITTEN=3 touched=48 | first_touched=[0] (got 0x00000000 expected 0xa5a5a5a5)
+        last_touched=[47] | byte span [0x0,0xbf] | L2T write-back completed=1
+```
+
+Forty-eight contiguous words at the tile-state base, three of them non-zero. §49.8 boot6's **48 of 64**.
+And the pool decoy on the same leg reads `touched=20`, byte-identical in pattern to leg C's — §49.8
+boot6's **20**. **Both banked armed numbers, reproduced by an unarmed close with three registers and one
+bit programmed.** *Excludes:* `OUTCOME D2` (the identification is not refuted), `D3` (the base is honoured
+at offset zero, not at some other offset), `D4` (`ENABLE` aims the write, it does not suppress it), and
+`D1b`. *Does not exclude:* anything about the armed path — see §49.23.6.
+
+**W5 — the catcher went from 48 to 0, and that is the conservation statement.**
+
+```
+[v3d62] fault (v3d95 unarmed close)   — … scratch page 0x265000: dirty words=48/1024
+[v3d62] fault (v3d97 R3 lenvary)      — … scratch page 0x265000: dirty words=48/1024
+[v3d62] fault (v3d97 R1 basedaim)     — … scratch page 0x265000: dirty words=48/1024
+[v3d62] fault (v3d98 R-next-1 tsaim)  — MMU_CTL=0x060d0c01 fault-latched=0x00000000 (PT_INVALID=0
+        WRITE_VIOLATION=0 CAP_EXCEEDED=0) … HUB_INT_STS=0x00000000 MMU-int bits=0x00000000
+        … scratch page 0x265000: dirty words=0/1024
+```
+
+Three legs at 48, then one bit is set and the count is zero — while a window that never took a byte
+before takes exactly 48. The words did not vanish; they moved from the catcher to `CT0QTS`. This is a
+*quantitative* confirmation and it is stronger than the `OUTCOME D1` selector, which only tests
+"fault == 0 && tile-state touched". *Excludes:* the reading that `ENABLE` merely silenced the latch —
+the catcher is a memory witness, not a latch, and it is armed and re-seeded per leg. *Does not exclude:*
+the possibility that some *third* refused write exists below the catcher's resolution; nothing observed
+requires one.
+
+**W6 — the real windows are intact on all four legs, so the aim is derived from the registers.**
+
+Every leg: `real-ts=0/64 real-pool=0/8192`, and every `[v3d56]` real-region scan reads
+`INTACT=64 … touched=0` / `INTACT=8192 … touched=0` after a completed write-back. The decoys are what
+moved, on the two legs that programmed decoy bases. *Excludes:* "the write happens to land where the pool
+already is". *Does not exclude:* the production values behaving differently — again §49.23.6.
+
+**W7 — leg D's landing digest names exactly two pages in the whole arena, and both are the decoys.**
+
+```
+[v3d56] landing (v3d98 R-next-1 tsaim) — arena 64 pages (0x40000 B @ 0x00277000, the ENTIRE address space
+        the V3D MMU grants this job) | changed=2 expected=0 STRAY=2 | per-region: tile-state (bin output)
+        p[17..17]=0 · tile-alloc pool (bin output) p[18..25]=0 · probe TMU scratch (expected) p[52..52]=0 ·
+        PTB overspill (expected) p[54..55]=0 | first_stray_page=4 (off 0x4000) last_stray_page=58
+```
+
+Page 4 is `arena + 0x4000` = the pool decoy; page 58 is `arena + 0x3a000` = the tile-state decoy. The
+digest's "STRAY" wording is the instrument's, and on this leg it is a **naming artifact, not a finding**:
+the per-region table knows only the four *real* regions, so a decoy hit can only ever be reported as
+stray. Two writes, two pages, nothing else in the 256 KiB the MMU grants this job. *Excludes:* a scatter
+of collateral writes anywhere in the arena. *Does not exclude:* writes outside the arena — but there are
+none, because the catcher is clean.
+
+**W8 — leg D's `BPCA` is uninterpretable, and the file says so rather than reading it.**
+
+```
+[v3d41] v3d98 R-next-1 tsaim CLE feed + PTB pointer — BPCA 0x0027e000->0x0027e000 (stale)
+        (pool base 0x0027b000) BPCS=0x00000000 BPOA=0x00000000 BPOS=0x00000000
+```
+
+Leg C left `BPCA` at `0x27e000` = `QMA + QMS`, the pool end, and nothing resets it between legs, so leg D's
+"unchanged" is the frozen-register case §48 named. The pool write on leg D nevertheless **landed** — the
+poison says so. *The lesson is banked as a rule:* on a multi-leg rung, `BPCA` is only readable on the leg
+that first moves it; the poison scans are the deciding instrument on every other leg, exactly as the
+`[v3d41]` line's own text says.
+
+**An honesty note that must ride with W4.** Leg D's `VIOLATION` line reads
+`VIO_ADDR=0x00000000 VIO_ID=0x00000000 RAW, decoded client L2T @ VA 0x00000000` — with `fault=0`. **With no
+fault latched the pair carries no information, and "client L2T" is the zero-`VIO_ID` decode artifact
+§49.20.2's V2a law was written about.** It is not an attribution and must never be quoted as one. The V2a
+law's read-once discipline is what makes the *other* legs' pairs trustworthy; it does not make a pair
+meaningful on a leg that had nothing to report.
+
+#### 49.23.3 The catcher's 48, explained — and what the count can and cannot carry
+
+§49.22 retired the reading of the catcher as a *census* of one write. **That retirement stands**, and
+boot8 now supplies the positive replacement, with no free parameters.
+
+The catcher redirects every refused access to one 4 KiB scratch page, so overlapping refused writes
+overlap *in the catcher too* and the dirty-word count is a **union**, not a sum. Taking the two writes as
+boot8 measured them — the pool write occupying pool-relative words `{0..15} ∪ {28..31}` (§49.23.4) and the
+tile-state write occupying `{0..47}` — the arithmetic on each leg is:
+
+| leg | pool write | tile-state write | catcher predicted | catcher measured |
+|---|---|---|---|---|
+| A (zero bases) | refused, base 0 → words 0–15, 28–31 | refused, base 0 → words 0–47 | union = **48** | `48/1024` |
+| B (zero bases, 46 B) | refused, base 0 | refused, base 0 | union = **48** | `48/1024` |
+| C (mapped bases, `ENABLE=0`) | **lands** at `CT0QMA` | refused, base 0 → words 0–47 | **48** | `48/1024` |
+| D (mapped bases, `ENABLE=1`) | **lands** at `CT0QMA` | **lands** at `CT0QTS` | **0** | `0/1024` |
+
+Every row is predicted. But note precisely what carries the argument: on legs A and B the pool write's
+footprint is a **subset** of the tile-state write's, so 48 there is consistent with one write *or* two and
+proves nothing about the count. **The decisive legs are C and D** — C, where the pool write demonstrably
+went somewhere else and the catcher still read 48, so those 48 belong wholly to the *other* write; and D,
+where the other write landed and the catcher read zero.
+
+#### 49.23.4 R-next-2, executed — the landed pool header, decoded as far as the bytes honestly take it
+
+The `[v3d98] pool-head` dump rode all four legs, as designed. Verbatim, the `0x80`-byte window at
+`CT0QMA`:
+
+**Leg B (zero bases — the negative control).** All thirty-two words carry `0xA5A5A5A5 ^ index` exactly
+(`a5a5a5a5 a5a5a5a4 a5a5a5a7 a5a5a5a6 a5a5a5a1 …`, verified word by word against the model). **The
+instrument reads poison as poison.** No dump may be read without this control, and it passed.
+
+**Legs C and D — byte-identical to each other:**
+
+```
++0x000: 00000012 00000000 00000000 00000000 00000000 00000000 00000000 00000000
++0x020: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
++0x040: a5a5a5b5 a5a5a5b4 a5a5a5b7 a5a5a5b6 a5a5a5b1 a5a5a5b0 a5a5a5b3 a5a5a5b2
++0x060: a5a5a5bd a5a5a5bc a5a5a5bf a5a5a5be 00000000 00000000 00000000 00000000
+```
+
+Reading the poison model off the bytes: words 0–15 written, words 16–27 **never written**, words 28–31
+written. That is `1 + 15 + 4 = 20` words, one of them non-zero — which is the `[v3d56]` scan's
+`OVERWRITTEN=1 ZEROED=19 touched=20`, `first_touched=[0]`, `last_touched=[31]`, `byte span [0x0,0x7f]`,
+independently and exactly. **The dump and the scan corroborate each other**; neither is being trusted
+alone.
+
+Four things follow, in descending order of confidence.
+
+**(1) The pool write is TWO disjoint blocks, not one span.** `[0x00,0x3f]` — 64 bytes — and `[0x70,0x7f]`
+— 16 bytes — with 48 bytes of untouched poison between them at `[0x40,0x6f]`. The `[v3d56]` scan could
+never say this: it reports endpoints and a count, and its span `[0x0,0x7f]` is the *hull* of two blocks,
+not a written region. **This is the finding the dump was built for.**
+
+**(2) The `0x70` is a pool offset, and the campaign's oldest number is retired as a mystery.** The second
+block begins at exactly `CT0QMA + 0x70`. On a zero base that is absolute `VA 0x70` — the address the MMU
+refused on boot11, on boot4's leg A, and on this boot's legs A and B. It is not structural, not an
+instrument artifact and not a decode error: **it is where the second half of the pool write goes**, read
+off landed bytes on a mapped base. And the latch's reported VA across the four legs now reads as one
+consistent sequence:
+
+| leg | pool write | tile-state write | latched VA | why |
+|---|---|---|---|---|
+| A, B | refused | refused | `0x70` | the pool write's second block, at base 0 |
+| C | lands | refused | `0x0` | only the tile-state write is left to refuse, at base 0 |
+| D | lands | lands | — (`fault=0`) | nothing to refuse |
+
+**(3) `word[0] = 0x00000012` decodes, byte-wise, as an empty tile's tile list — one corroborating source,
+nothing guessed past byte 0.** V3D control-list packets are byte-granular with **byte 0 as the opcode**;
+that packing convention, and the opcode table this driver uses, are transcribed verbatim in
+`arch/aarch64/v3d.rs` from Mesa `src/broadcom/cle/v3d_packet_v33.xml` (`gen="3.3" max_ver="42"` — the V3D
+4.2 variants, which is this part). Little-endian, `0x00000012` is the byte sequence `12 00 00 00`. In that
+table `18` — `0x12` — is `P_RETURN_FROM_SUB_LIST`, a **one-byte** packet; `0x00` is `Halt`. So the pool
+head reads as **`RETURN_FROM_SUB_LIST` followed by Halt padding**, which is precisely the per-tile list an
+*empty* tile has: the binner allocated the first tile's list block at the pool base and wrote the only
+thing an empty tile's list can contain — return immediately.
+
+Two independent things support the packet reading over the arithmetic reading (`0x12` = 18 = some count):
+the byte sits at offset 0 of a pool whose consumer is the **CLE**, and this file already records the
+render-side symptom of that fetch — §49.11a / the `invalidate_gpu_caches` note describes M4's render
+fetching `opcode 0x00 = Halt` from the tile-alloc base when the L2T left it stale, i.e. the CLE
+*does* fetch packets from exactly this address. **Status: decode ADOPTED for byte 0, on one corroborating
+source.** No other field is named. If a second source ever contradicts it, this paragraph is where the
+correction is appended.
+
+**(4) The 64-byte first block is one cache line's worth, and the four zero words at `+0x70` are
+unidentified.** 64 bytes is the V3D L2T line size, so a payload of one useful byte plausibly appears as a
+full written line; the *content* beyond byte 0 is fifteen zero words and nothing distinguishes "written
+zero" from "written zero as padding". The `[0x70,0x7f]` quad is sixteen bytes of zeros. Candidates that
+suggest themselves — a second tile's list slot, a pool free-pointer, an end-of-list descriptor — are
+**not adopted**: no source consulted corroborates a field, and this file does not guess values.
+
+**What R-next-2 did not answer, and the instrument gap it exposed.** `[v3d98]` dumps the `CT0QMA` window
+only. Leg D reported 48 tile-state words touched of which **three are non-zero**, and no line on the wire
+says which three or what they hold — the tile-state payload, the more interesting of the two, is the one
+this campaign has never seen. `[v3d99] head` closes that gap and is described in §49.23.7.
+
+#### 49.23.5 What these verdicts retire, and the corrections appended elsewhere
+
+| item | status after boot8 |
+|---|---|
+| §49.22.5's residual OPEN item — "what is the PTB's second close-time write, and what is its base?" | **ANSWERED.** It is the **tile-state write**; its base is `CT0QTS`; `CT0QTS.ENABLE` gates the base, not the write's existence (W4, W5) |
+| §49.22.3(a) — the tile-state identification of the `VA 0` residual | **CONFIRMED** by the one experiment that could have refuted it |
+| §49.22.5's wall statement | **SUPERSEDED** — see §49.23.6 |
+| §49.21.4's generic leg rows, on leg D | **none fired**; leg D's own rows took precedence exactly as §49.22.6 designed. Legs B and C printed §49.21.4's text unchanged |
+| catcher-as-census (retired in §49.22) | **retirement stands**, now with a positive replacement model that predicts all four legs (§49.23.3) |
+| "structural `0x70`" | already **REFUTED** in §49.22 for the pool write; now additionally **EXPLAINED** — `0x70` is a pool-relative offset visible in landed bytes (§49.23.4 item 2) |
+| whether an **armed** close writes | **STILL OPEN.** Re-opened by §49.22.3, unaddressed by this boot, and the reason R-next-3 is built here (§49.23.7) |
+| §49.8 boot6's `48`-of-64 and `20` | **REPRODUCED** by an unarmed close on mapped bases with `ENABLE` set — the two paths now agree on both counts |
+
+**Corrections appended elsewhere, per the append-corrections law — pointers, not rewrites.**
+
+1. **`[v3d62]`'s fixed no-fault text.** On leg D the catcher line prints "the bin frame's missing PTB write
+   was therefore neither refused by translation nor silently absorbed by the catcher". That sentence was
+   written for a leg with a *missing* write. On leg D the writes are present and landed, and the sentence
+   is true but misleading read alone. **The `[v3d62]` line must be read against the same leg's `[v3d56]`
+   scans**, never on its own. §49.20.2's instrument-text discipline is extended to cover it.
+
+2. **§49.20.2 V2a — the zero-pair artifact, restated as a positive rule.** V2a made every leg read the
+   violation pair once and first. Boot8 adds the complementary rule: **on a leg with `fault = 0` the pair
+   is meaningless and its decode must be discarded**, including the `client L2T` that a zero `VIO_ID`
+   produces. Recorded at §49.23.2's honesty note.
+
+3. **§48's frozen-register rule, extended to multi-leg rungs.** `BPCA` carries a verdict only on the leg
+   that first moves it; on later legs of the same rung it is residue (W8).
+
+4. **§49.22.3's two-write model.** Its clause (a) is promoted from *leading candidate* to **confirmed**;
+   its clauses (b) and (c) are not refuted but are no longer needed to explain anything observed.
+
+#### 49.23.6 The wall statement, corrected — three registers and one bit
+
+Before this boot (§49.22.5): *"what is the PTB's second close-time write, and what is its base?"*
+
+That question is answered. The corrected statement, and it is a statement rather than a question for the
+first time in this campaign:
+
+> **An unarmed empty bin frame closes correctly given three registers and one bit.** With `CT0QMA`,
+> `CT0QMS` and `CT0QTS` programmed to mapped addresses and `CT0QTS.ENABLE` set, the frame closes
+> (`BFC` Δ1, `FLDONE` latched, `CT0CA` walks `BA→EA`), the PTB emits **both** of its close-time
+> writes — 20 words of tile list at `CT0QMA`, 48 words of tile state at `CT0QTS` — the MMU refuses
+> nothing, and the illegal-address catcher stays pristine. **The wall is no longer at frame close.**
+
+Two things remain, and they are of different kinds.
+
+**(a) The ARMED path's close has still never been read this way.** §49.22.3's reconciliation of the armed
+path was written as an explicit conditional and boot8 does not discharge it: every leg of boot8 is an
+*unarmed* submit with registers programmed by hand. The production path additionally writes `BPOS = 0`,
+runs the pre-kick L2T invalidate, and uses different values. **R-next-3 (`armedclose`) is built in
+§49.23.7 and it is the next rung**, exactly as §49.22.5's recommended order said it would be —
+"whatever leg D says, because the reconciliation needs it either way".
+
+**(b) Bin CONTENT — the `m4` and `rcl` classes.** §49.8's bracket already localised these to *different*
+stations from the empty class: `rcl` wedged at the first fetch, `m4` consumed its list and left the frame
+open. Neither is a close-stage defect, and after boot8 the close stage is no longer a plausible common
+cause for them. If `armedclose` returns `OUTCOME E1`, this is the whole of the remaining surface.
+
+**Order, unchanged from §49.22.5 except that R-next-1 and R-next-2 are now struck as DONE:**
+~~R-next-1~~ (done, this section) · ~~R-next-2~~ (done, §49.23.4) · **R-next-3 `armedclose` next** ·
+R-next-1b `poolbig`/`spillaim` **de-prioritised** (its whole motivation was `OUTCOME D2`, which did not
+fire) · R2 `mapzero` **de-prioritised further** (candidate (c) is not what remains) · R4 (the bunker)
+unchanged, and weakened again by a third ARM-visible defect resolved without any firmware theory.
+
+#### 49.23.7 Leg E (`armedclose`), built — the wire pre-written, and the gates
+
+This subsection records R-next-3 as **built**, on the same terms §49.21 recorded `basedaim` and §49.22.6
+recorded `tsaim`: it is a **design note, not a verdict**. QEMU raspi4b models no V3D, so nothing below has
+been observed; the gates are compile, presence-in-artifact and knob-off byte-identity, and the reading
+belongs to the next metal sitting.
+
+**What was built.** One more leg on the `[v3d97]` scaffolding — five closes now — placed **after** leg D so
+all four unarmed legs stay in-boot anchors and the unarmed and armed closes are compared inside one
+capture, on one image, off one CT0 that was virgin at leg A.
+
+| leg | list | `CT0QMA`/`CT0QMS`/`CT0QTS` | prologue | what it is |
+|---|---|---|---|---|
+| A | 14 B `emptyunarm` | untouched (zero residue) | none | the `[v3d95]` kick, unchanged |
+| B | 46 B | untouched | none | R3 `lenvary` — the instrument control |
+| C | 14 B `emptyunarm` | decoy bases, `ENABLE = 0` | none | R1 `basedaim` — the base cut |
+| D | 14 B `emptyunarm` | leg C's values, `ENABLE = 1` | none | R-next-1 `tsaim` — one bit |
+| **E** | 14 B `emptyunarm` | **REAL pool / `0x8000` / REAL tile-state `\| ENABLE`** | **`BPOS = 0`, then pre-kick L2T invalidate** | **R-next-3 `armedclose` — the production close** |
+
+**Leg E is the one leg of the five that is not unarmed**, and the `[v3d95]` header's "NO `CT0QMA`, NO
+`CT0QMS`, NO `CT0QTS`, NO `BPOS=0`, NO pre-kick L2T invalidate" is FALSE of it by design. A
+`[v3d99] CORRECTION TO ALL THREE LINES ABOVE` says so on the wire, in front of every leg, so no reader
+ever holds a wrong shape for the capture.
+
+The submit order is `v3d_bin_job_run`'s own, as `[v3d57]` transcribed it: `BPOS = 0` **first**, then the
+per-job cache invalidate, then `CT0QMA → CT0QMS → CT0QTS|ENABLE → CT0QBA → CT0QEA`. No `BPOA` is written
+— which is the *opposite* of §19/§33's stale-overflow hazard, not an instance of it.
+
+**The role inversion, stated once.** On legs C and D the two decoy windows are the targets and the two
+real regions are the negative controls. **On leg E it is the other way round**: `CT0QMA`/`CT0QTS` name the
+real tile-alloc pool and the real tile-state array, and the two decoys — re-poisoned by leg E like every
+other leg — are leg E's negative controls. A decoy hit on leg E is therefore `OUTCOME E1b`, and it would
+mean the aim is not derived from the registers that leg programmed.
+
+**The new instrument: `[v3d99] head`.** `[v3d98]` dumps the `CT0QMA` window and nothing else, and
+`OUTCOME D1` turned that into the live gap (§49.23.4). `[v3d99] head` dumps the **tile-state** window
+verbatim on every leg, and on leg E additionally dumps both real targets. It is a pure read of arena
+memory the scan's write-back and invalidate have already made coherent: no register is touched and no
+verdict is drawn by it. It rides every leg for the same reason the pool dump does — the legs that write
+nothing supply their own negative control.
+
+Knob: **`UNAOS_V3D_ARMEDCLOSE=1`**, cargo feature `v3d_armedclose`, which **implies `v3d_tsaim`** (and
+through it `v3d_basedaim`, `v3d_unarmclose` and `v3d`), declared in `Cargo.toml` and armed by the `arroyo`
+block so the operator cannot arm half of it. Default OFF and fully uncompiled when off. The family law
+holds structurally, as for `[v3d95]`/`[v3d97]`/`[v3d98]`: the boot returns long before `[v3d75]`'s
+`ENABLE_QPU` and `[v3d80]`/`[v3d81d]`'s `DISPLAY_DONE` sends, so this knob can never sit beside them.
+
+**Leg E's outcomes, pre-written verbatim on its own `VERDICT` line.** They take precedence over **both**
+§49.21.4's generic rows and `[v3d98]`'s leg-D rows — leg E's `CT0QTS` also carries `ENABLE`, so leg D's
+selector would otherwise claim it and report it against a decoy window leg E does not aim at. The two
+void-branches (`submit_sound = 0`, `frame_closed = 0`) are still taken first, as on every leg.
+
+| leg E reads | verdict begins | conclusion |
+|---|---|---|
+| **no fault, both real windows written, 20 pool / 48 tile-state** | `OUTCOME E1` | the armed empty close is **healthy and boot6's shape to the word**, now read with the poison, the catcher and the V2a pair boot6 did not have. §49.22.3's conditional reconciliation is **DISCHARGED**; the historic armed wall is **not** a close-stage artifact and the remaining surface is bin CONTENT — the `m4`/`rcl` classes |
+| **fault, client PTB, `VA 0x0`** | `OUTCOME E2` | leg C's residual reappearing on the path that ships, on a boot where leg D showed the same bit removes it. The variable is then **not** `ENABLE` but the base VALUES or the armed prologue; remove them one at a time. `OUTCOME D1` still stands as measured — what it would not license is the inference that the armed close is healthy |
+| **fault, client PTB, VA inside `[CT0QMA, CT0QMA+CT0QMS)`** | `OUTCOME E2b` | refused **inside its own pool**, a span the MMU maps — a **translation** question, not an aim question. Subtract `CT0QMA` on the line, then read the pool scan and the head dump for how far the write got |
+| **fault, client PTB, VA inside the tile-state array** | `OUTCOME E2c` | the base is honoured and the refusal is at an offset within the 256-byte array. An offset at or past the array's end is a **geometry** finding and a driver fix — and it would explain the armed wall with no MMU theory at all |
+| **no fault, a DECOY window moved** | `OUTCOME E1b` | the decoys are leg E's negative controls, so this means the aim is not derived from the registers leg E programmed — the tile-memory registers would be latch-once rather than per-kick. Voids the E1/E3 readings |
+| **no fault, both real windows written, other counts** | `OUTCOME E5` | close completes, aim correct, **amount** differs. Read the counts against 20/48, then the byte spans and the head dumps |
+| **no fault, exactly one of the two landed** | `OUTCOME E3` | a **PARTIAL** close. Pool without tile-state ⇒ `ENABLE` does not gate on production values what leg D says it gates; tile-state without pool ⇒ the binner emitted no per-tile list, which is a bin-content statement. Neither E1 nor E2 may be quoted |
+| **no fault, nothing anywhere** | `OUTCOME E4` | contradicts §49.8 boot6 on the path boot6 measured. Check the `[v3d62]` catcher **first**, then the landing digest; if both are clean the difference from boot6 is the LIST |
+| fault, client not PTB | — | attribution belongs to whichever unit `VIO_ID` names; no close-stage verdict |
+| fault, VA none of the above | `OUTCOME E6` | §49.20.6's last row governs — subtract against all three bases printed on the same line |
+
+**What leg E deliberately does NOT do.** It writes no `BPOA` (only `BPOS = 0`, `v3d_bin_job_run`'s own
+first write). It edits no page table (still R2's). It sends no mailbox tag. It changes no arena geometry —
+it reuses every compile-time assertion §49.21.2 carries and adds one (`TILE_STATE_BYTES == 8 × 32`, so the
+real tile-state dump is exactly the array). It leaves `CT0QMA`/`CT0QMS`/`CT0QTS` at its production values,
+which is the safest of the five endings — they are exactly what a later armed kick would program anyway —
+and nothing runs after the rung in any case.
+
+**Gates.**
+
+`./arroyo check` and `UNAOS_WC=1 ./arroyo check` green for both arches (`v3d_armedclose` appended to the
+`arm-pi` leg, so both polarities of every new `#[cfg]` are compiled). `./arroyo kernel8-test` green at its
+banked standing on a quiet host. Presence in the builder-path artifact, per the full-knob law.
+
+**Measured, this arc** (worktree `unaos-wt-exec-v3dfold3`, baseline `d99bec68`):
+
+| gate | result |
+|---|---|
+| `./arroyo check` | green, both arches; `kernel cfg coverage OK (12 legs)`, `arm-pi` green |
+| `UNAOS_WC=1 ./arroyo check` | green, both arches |
+| knob-off `./arroyo kernel8-test 210` | **MBENCH PASS 117/117**, 0 forbidden, 22 424 lines scanned |
+| knob-off byte-identity, `UNAOS_PI=1 ./arroyo kernel8` | arc-applied `e8ee5e33…` **==** baseline `e8ee5e33…` (baseline built in the same worktree at `d99bec68` before the edits; no stash, per `CLAUDE.md`) |
+| armed build banner | all five knobs echo: `UNAOS_V3D`, `UNAOS_V3D_UNARMCLOSE`, `UNAOS_V3D_BASEDAIM`, `UNAOS_V3D_TSAIM`, `UNAOS_V3D_ARMEDCLOSE` |
+| strings-proof, armed image `2b952813…` | `v3d99] ARMEDCLOSE LEG` 1 · `v3d99] ARMEDCLOSE COMPLETE` 1 · `v3d99] CORRECTION TO ALL THREE` 1 · `v3d99] LEG` 1 (the armed-prologue line) · `v3d99] head` 4 · `OUTCOME E1` 1 · `E1b` 1 · `E2` 1 · `E2b` 1 · `E2c` 2 · `E3`/`E4`/`E5`/`E6` 1 each · `v3d98] TSAIM LEG` 1 · `v3d98] pool-head` 2 · `OUTCOME D1` 5 (leg D's row, `D1b`, and three cross-references) |
+
+*Scope of the byte-identity claim, stated honestly.* A `UNAOS_V3D_TSAIM=1` build is **not** claimed
+byte-identical across this arc: `v3d97_leg` gained an `armed` parameter and leg E's outcome selector, and
+the `[v3d99] head` dump is compiled into the shared leg. What is claimed, and gated, is that **every build
+that does not arm `v3d_armedclose` is byte-identical to the pre-arc build** — which covers every boot that
+is not a V3D experiment. One note on the suite: the first `kernel8-test 210` run of this arc failed on the
+known quiet-host present-pacing flake (`[wc-k] rollup … torn=1 … maxpresent_us=16294 frame_us=16667 ->
+AT-RISK`, 116/117), and passed 117/117 on a quiet re-run with nothing else building. The arc is knob-off
+byte-identical, so it cannot be the cause; recorded rather than hidden.
+
+**What the sitting needs.** One image:
+
+```
+UNAOS_V3D=1 UNAOS_V3D_UNARMCLOSE=1 UNAOS_V3D_BASEDAIM=1 UNAOS_V3D_TSAIM=1 UNAOS_V3D_ARMEDCLOSE=1 UNAOS_PI=1 ./arroyo kernel8
+```
+
+(`UNAOS_V3D_ARMEDCLOSE=1` alone suffices — the feature implies the rest — but the full line is what the
+capture should record.) A **cold** power-cycle, as boot4, boot7 and boot8 were. One short capture,
+labelled, never diffed line-for-line against a deep boot. **Read in this order:** `[v3d97] pad-selfcheck`,
+leg B's `VERDICT`, leg C's `VERDICT`, leg D's `VIOLATION` and `VERDICT` (leg E's whole value is the
+comparison against leg D — a boot whose leg D did not return `OUTCOME D1` leaves leg E without its
+baseline), then leg E's `[v3d99] LEG E armed prologue`, its `VIOLATION`, its four `[v3d56]` scans, its
+`[v3d98] pool-head` and `[v3d99] head` dumps, and finally its `VERDICT`.
+
+---

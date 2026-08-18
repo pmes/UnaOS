@@ -99,6 +99,12 @@ NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=c
 # `[v3d98]` tsaim leg, v3d.md §49.22.5's R-next-1. It rides the `[v3d97]` rung as ONE more leg (D) and
 # therefore implies `v3d_basedaim` (declared in Cargo.toml and armed here), so `UNAOS_V3D_TSAIM=1`
 # alone is sufficient. See the kernel8 knob block below and v3d.md §49.22.
+#
+# PI-V3D-99: UNAOS_V3D_ARMEDCLOSE=1 is a plain arming knob (no value) for the `v3d_armedclose` feature
+# — the `[v3d99]` armedclose leg, v3d.md §49.23's R-next-3. It rides the `[v3d97]` rung as ONE more leg
+# (E) and therefore implies `v3d_tsaim` (declared in Cargo.toml and armed here), so
+# `UNAOS_V3D_ARMEDCLOSE=1` alone is sufficient. Leg E is the ONE leg of the five that is NOT unarmed.
+# See the kernel8 knob block below and v3d.md §49.23.
 KERNEL_FEATURES=""
 _feats=""
 # DEFAULT-QUIET: UNAOS_WITNESS=1 arms the `witness` fixture-battery feature (auto-set above for the battery
@@ -1586,7 +1592,7 @@ KERNEL_CFG_MATRIX=(
   # PI-DESK (`pidesk` — the desktop furniture family on the Pi panel; this leg carries `witness`, so it
   # is also the only place the dock/menubar/crystal FIXTURES are type-checked on aarch64).
   # Cannot carry the tegra family — see the mutual-exclusion note above.
-  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,pidesk,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim"
+  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,pidesk,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose"
   # aarch64 board leg 2 — Jetson Orin Nano (Tegra234), plus the board-neutral aarch64 features that
   # would otherwise ride nothing: ORIN-SMP (tegrasmp/smpprobe), the four XCARVE levers, ORIN-NET-1..4
   # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET
@@ -2831,6 +2837,40 @@ kernel8() {
     if [ -n "${UNAOS_V3D_TSAIM:-}" ]; then
         K8_FEATS="${K8_FEATS},v3d_tsaim,v3d_basedaim,v3d_unarmclose,v3d"
         echo -e "${COLOR_YELLOW}  • UNAOS_V3D_TSAIM: the [v3d98] tsaim leg — ONE more CT0 kick after [v3d97]'s leg C, leg C's bases with CT0QTS.ENABLE set and NOTHING else changed, to identify leg C's residual VA-0 PTB refusal (⚠ implies UNAOS_V3D_BASEDAIM; short capture — do not diff against a deep boot)${COLOR_RESET}"
+    fi
+    # PI-V3D-99: UNAOS_V3D_ARMEDCLOSE=1 adds the `v3d_armedclose` feature — v3d.md §49.23's R-next-3
+    # (`armedclose`), built as ONE MORE leg (E) on the [v3d97] rung. It therefore IMPLIES
+    # UNAOS_V3D_TSAIM (and UNAOS_V3D_BASEDAIM, UNAOS_V3D_UNARMCLOSE, UNAOS_V3D): the cargo feature
+    # declares `v3d_armedclose = ["v3d_tsaim"]` so the implication cannot be forgotten, and this block
+    # arms the whole chain itself.
+    # WHY: boot8/PA46 flew legs A/B/C/D. The pad self-check held (identical=1), leg B cleared the
+    # instrument a second time (VIO_ADDR = 0xe on a 46-byte list), leg C reproduced boot7's shape
+    # exactly (decoy pool touched 20/4096, residual PTB refusal at VA 0x0), and LEG D returned
+    # OUTCOME D1: fault=0, decoy tile-state 48/1024, decoy pool 20/4096, both real controls INTACT,
+    # BFC Δ1, and the [v3d62] catcher PRISTINE at 0/1024 where legs A/B/C each absorbed 48 words. The
+    # 48 words moved from the catcher to CT0QTS: CT0QTS.ENABLE gates the tile-state write's BASE, not
+    # its existence, and both close-time writes of an UNARMED close completed on one leg — 20 and 48,
+    # §49.8 boot6's ARMED numbers exactly. §49.22.3's reconciliation of the ARMED path was written as
+    # an explicit CONDITIONAL because that path's close has never been read under these instruments.
+    # LEG E DISCHARGES IT, and it is the ONE leg of the five that is NOT unarmed: BPOS=0 first, then
+    # the per-job L2T invalidate, then CT0QMA (the REAL tile-alloc pool) -> CT0QMS (0x8000) ->
+    # CT0QTS|ENABLE (the REAL tile-state array) -> CT0QBA -> CT0QEA — v3d_bin_job_run's own order —
+    # around the same 14-byte `emptyunarm` list, with the V2a read-once pair, the [v3d62] catcher, four
+    # poisoned windows, the landing digest and the verbatim head dumps. ROLE INVERSION: on leg E the
+    # two REAL regions are the TARGETS and the two decoys are the negative controls.
+    # Wire outcomes are pre-written on leg E's own VERDICT line: E1 = healthy and boot6's shape to the
+    # word (the armed wall is NOT a close-stage artifact; the remaining surface is bin CONTENT, the
+    # m4/rcl classes); E2/E2b/E2c = a refusal at VA 0 / inside the pool span / inside the tile-state
+    # array (a first-class finding on the only path that ships); E3 = a PARTIAL close, one write of two;
+    # E4 = nothing landed; E5 = both landed at other counts; E1b = a decoy moved; E6 = §49.20.6's last
+    # row. No page table is edited, no mailbox tag is sent, no BPOA is written.
+    # ⚠ an armed boot deliberately produces a SHORT capture missing every banked witness: label it and
+    # NEVER diff it line-for-line against a full deep boot. QEMU raspi4b models no V3D, so [v3d95]
+    # prints its hub-absent SKIPPED line and returns before any of these legs is reached — kernel8-test
+    # green means no regression and nothing more; the verdict is attended metal.
+    if [ -n "${UNAOS_V3D_ARMEDCLOSE:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_armedclose,v3d_tsaim,v3d_basedaim,v3d_unarmclose,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_ARMEDCLOSE: the [v3d99] armedclose leg — ONE more CT0 kick after [v3d98]'s leg D, the PRODUCTION submit (real pool/size/tile-state|ENABLE + BPOS=0 + pre-kick L2T invalidate) under tonight's full instrument set, to read whether the ARMED close also completes (⚠ implies UNAOS_V3D_TSAIM; the only non-unarmed leg; short capture — do not diff against a deep boot)${COLOR_RESET}"
     fi
     # VUG-PAR: UNAOS_VUGPAR=1 adds the `vugpar` feature — band-parallel Screen::flush that splits the
     # damaged row-copy blit into disjoint scanline bands dispatched to free secondary cores (sched::

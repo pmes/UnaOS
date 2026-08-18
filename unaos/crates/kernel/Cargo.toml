@@ -1137,6 +1137,40 @@ v3d_basedaim = ["v3d_unarmclose"]
 # a full deep boot. See docs/dev/OS/08_VIDEO/v3d.md §49.22.
 v3d_tsaim = ["v3d_basedaim"]
 
+# PI-V3D-99: the ARMEDCLOSE leg — v3d.md §49.23's R-next-3, built as ONE MORE leg (E) on the `[v3d97]`
+# scaffolding (hence the feature IMPLIES `v3d_tsaim`, and through it `v3d_basedaim` and
+# `v3d_unarmclose`; it cannot be armed alone). WHY: boot8/PA46's leg D returned `OUTCOME D1` — with
+# `CT0QTS.ENABLE` set, an UNARMED close completed BOTH of its close-time writes (20 pool words off
+# `CT0QMA`, 48 tile-state words off `CT0QTS`, no fault, the `[v3d62]` catcher pristine at 0/1024 after
+# three legs at 48/1024), and those two counts are §49.8 boot6's ARMED empty-frame numbers exactly.
+# §49.22.3's reconciliation of the ARMED path was written as an explicit CONDITIONAL: it said in terms
+# that the armed path's close has never been read under these instruments. LEG E DISCHARGES IT.
+#   LEG E is the production submit and it is the ONE leg of the five that is not unarmed: `BPOS = 0`
+#   first, then the per-job L2T invalidate, then `CT0QMA` (the REAL tile-alloc pool) -> `CT0QMS`
+#   (0x8000) -> `CT0QTS | ENABLE` (the REAL tile-state array) -> `CT0QBA` -> `CT0QEA`, which is
+#   `v3d_bin_job_run`'s own order, around the same 14-byte `emptyunarm` list. It carries the whole
+#   instrument set: the §49.20.2 V2a read-once violation pair, the `[v3d62]` catcher re-armed and
+#   re-seeded, four poisoned windows scanned, the arena landing digest, and the `[v3d98]`/`[v3d99]`
+#   verbatim head dumps. Note the ROLE INVERSION: on leg E the two REAL regions are the targets and the
+#   two decoys are the negative controls, the opposite of legs C/D.
+#   Outcomes are pre-written on leg E's own VERDICT line: E1 = no fault, both real windows written, 20
+#   and 48 — the armed empty close is HEALTHY and boot6's shape to the word, so the historic armed wall
+#   is NOT a close-stage artifact and the remaining surface is bin CONTENT (the m4/rcl classes);
+#   E2/E2b/E2c = a refusal at VA 0, inside the pool span, or inside the tile-state array — a first-class
+#   finding on the only path that ships, and one the 2026-08-02 pre-catcher instruments could not have
+#   seen; E3 = only one of the two writes landed (a PARTIAL close); E4 = nothing landed at all; E5 =
+#   both landed at counts other than 20/48; E1b = a decoy moved, so the aim is not derived from the
+#   registers this leg programmed; E6 = a fault at a VA none of the rows predicts (§49.20.6's last row).
+# PI-V3D-99 also adds the `[v3d99] head` dump — the TILE-STATE window verbatim, on every leg — because
+# `OUTCOME D1` reported 48 tile-state words touched of which THREE were non-zero and no instrument said
+# which. No page table is edited, no mailbox tag is sent, no `BPOA` is written (only `BPOS = 0`, which
+# is the OPPOSITE of §19/§33's stale-overflow hazard), and the arena geometry is untouched. Default OFF
+# and fully uncompiled when off. Enable via `UNAOS_V3D=1 UNAOS_V3D_UNARMCLOSE=1 UNAOS_V3D_BASEDAIM=1
+# UNAOS_V3D_TSAIM=1 UNAOS_V3D_ARMEDCLOSE=1 UNAOS_PI=1 ./arroyo kernel8`. ⚠ an armed boot deliberately
+# produces a SHORT capture missing every banked witness; it must never be diffed line-for-line against
+# a full deep boot. See docs/dev/OS/08_VIDEO/v3d.md §49.23.
+v3d_armedclose = ["v3d_tsaim"]
+
 # PI-USB-1: the BCM2711 PCIe root complex + VL805 xHCI attach (arch/aarch64/piusb.rs) — brcmstb RC
 # bridge reset / link-up / MEM-window + inbound-BAR config, VL805 (1106:3483) enumeration + BAR sizing,
 # the NOTIFY_XHCI_RESET mailbox, and the polled shared-xHCI attach to the "controller halted-but-decoding

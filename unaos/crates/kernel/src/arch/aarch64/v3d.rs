@@ -15433,6 +15433,13 @@ fn v3d95_unarmed_close_rung() {
     serial_println!(
         ":: V3D: [v3d98] CORRECTION TO BOTH LINES ABOVE — UNAOS_V3D_TSAIM=1 is armed on top of them, so this boot takes FOUR CT0 kicks, not three and not one. Legs A/B/C are exactly as the line above describes them and are unchanged; [v3d98] then takes LEG D (v3d.md §49.22.5 R-next-1 `tsaim` — leg C's CT0QMA/CT0QMS/CT0QTS with CT0QTS.ENABLE set, and that one bit is the only difference between the two legs). Everything else both headers say still holds, including the boot RETURNING before probe_job ::"
     );
+    // PI-V3D-99: and one line further still, because `UNAOS_V3D_ARMEDCLOSE=1` makes it FIVE — and the
+    // fifth is the only one of them that is NOT unarmed, so the [v3d95] header's "NO CT0QMA, NO BPOS=0,
+    // NO pre-kick L2T invalidate" sentence has to be corrected for that leg explicitly.
+    #[cfg(feature = "v3d_armedclose")]
+    serial_println!(
+        ":: V3D: [v3d99] CORRECTION TO ALL THREE LINES ABOVE — UNAOS_V3D_ARMEDCLOSE=1 is armed on top of them, so this boot takes FIVE CT0 kicks. Legs A/B/C/D are exactly as the two lines above describe them and are UNCHANGED; [v3d99] then takes LEG E (v3d.md §49.23 R-next-3 `armedclose` — the PRODUCTION close: CT0QMA/CT0QMS/CT0QTS at the REAL tile-alloc pool base, the real 0x8000 size and the REAL tile-state array WITH ENABLE, plus BPOS=0 and the pre-kick L2T invalidate, in v3d_bin_job_run's own order). LEG E IS THE ONE LEG OF THE FIVE THAT IS NOT UNARMED: the [v3d95] header's 'NO CT0QMA, NO CT0QMS, NO CT0QTS, NO BPOS=0, NO pre-kick L2T invalidate' describes legs A-D and is FALSE of leg E, by design. Everything else all three headers say still holds, including the boot RETURNING before probe_job ::"
+    );
     match probe_hub_ident0() {
         V3dPresence::Up(_) => {}
         V3dPresence::Down => {
@@ -15871,11 +15878,132 @@ fn v3d98_tsaim_verdict(
     })
 }
 
+// ── PI-V3D-99 — `armedclose`, v3d.md §49.23's R-next-3. ────────────────────────────────────────────
+//
+// WHY THIS LEG EXISTS. Boot8/PA46's leg D returned `OUTCOME D1`: with `CT0QTS.ENABLE` set, an UNARMED
+// close completed BOTH of its close-time writes — 20 pool words off `CT0QMA`, 48 tile-state words off
+// `CT0QTS`, no fault, the `[v3d62]` catcher pristine — and those two counts are §49.8 boot6's ARMED
+// empty-frame numbers exactly. §49.22.3's reconciliation of the armed path was written as a
+// CONDITIONAL: it argued that neither mechanism offered for the second write can apply on the armed
+// path, and it said in terms that the armed path's close has never been read under these instruments.
+// This leg discharges that condition. It is the production submit — the real pool, the real size, the
+// real tile-state array with `ENABLE`, `BPOS = 0` and the pre-kick L2T invalidate, in `v3d_bin_job_run`
+// order — carrying tonight's whole instrument set: the V2a read-once violation pair, the `[v3d62]`
+// catcher armed and re-seeded per leg, four poisoned windows scanned, the arena landing digest, and
+// the verbatim head dumps.
+//
+// THE ROLE INVERSION, STATED ONCE SO NO READER MISREADS THE SCAN LINES. On legs C and D the two DECOY
+// windows are the targets and the two REAL regions are the negative controls. On leg E it is the other
+// way round: the REAL tile-alloc pool and the REAL tile-state array are what `CT0QMA`/`CT0QTS` name, and
+// the two decoys — which legs C and D wrote into, and which this leg RE-POISONS like every other leg —
+// become leg E's negative controls. A decoy hit on leg E therefore means the aim is not derived from
+// the registers this leg programmed, which is `OUTCOME E1b`.
+//
+// WHAT IT DELIBERATELY DOES NOT DO. It writes no `BPOA` (only `BPOS = 0`, which is `v3d_bin_job_run`'s
+// own first write and the opposite of §19/§33's stale-overflow hazard). It edits no page table. It
+// sends no mailbox tag. It changes no arena geometry. It runs LAST, after leg D, so all four unarmed
+// legs stay in-boot anchors read off one CT0 that was virgin at leg A; and because the rung returns
+// before `probe_job`, nothing whatsoever runs in front of the production values it leaves standing.
+
+/// §49.8 boot6's ARMED empty-frame word counts, banked here as the numbers leg E is checked against.
+/// `OUTCOME E1` is precisely "leg E reproduced these two".
+#[cfg(feature = "v3d_armedclose")]
+const V3D99_BOOT6_POOL_WORDS: u32 = 20;
+#[cfg(feature = "v3d_armedclose")]
+const V3D99_BOOT6_TS_WORDS: u32 = 48;
+/// The real tile-state array is 64 words; boot6's 48 is 48-of-64, so a full dump of it is 8 rows.
+#[cfg(feature = "v3d_armedclose")]
+const _: () = assert!(TILE_STATE_BYTES == 8 * 32);
+
+/// PI-V3D-99 — a verbatim head dump of any poisoned window, on the model of `[v3d98] pool-head`.
+///
+/// `[v3d98]` dumps the `CT0QMA` window and nothing else, and boot8 leg D turned that into the live
+/// instrument gap: `OUTCOME D1` reported 48 tile-state words touched of which THREE were non-zero, and
+/// no line on the wire said which three or what they held. This is one more pure read of arena memory
+/// the scan's L2T write-back and invalidate have already made coherent — no register is touched, no
+/// verdict is drawn here. Rides every leg, so a leg that wrote nothing supplies its own negative
+/// control: a window that took no write must still read pure `0xA5A5A5A5 ^ index` poison.
+#[cfg(feature = "v3d_armedclose")]
+fn v3d99_dump_head(tag: &str, what: &str, base: u32, rows: usize) {
+    for row in 0..rows {
+        let mut w = [0u32; 8];
+        for i in 0..8usize {
+            w[i] = unsafe {
+                core::ptr::read_volatile((base as usize + (row * 8 + i) * 4) as *const u32)
+            };
+        }
+        serial_println!(
+            "::   [v3d99] head ({}) {} @{:#010x} +{:#05x}: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} ::",
+            tag, what, base, row * 32, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]
+        );
+    }
+    serial_println!(
+        "::   [v3d99] head ({}) {} — the window verbatim. Poison is 0xA5A5A5A5^i, so any word still carrying its own index encoding was NEVER written and every other word is the block's. This line records the bytes; it decodes nothing ::",
+        tag, what
+    );
+}
+
+/// PI-V3D-99 — leg E (`armedclose`) reads its OWN pre-written outcomes, ahead of BOTH §49.21.4's
+/// generic rows and `[v3d98]`'s leg-D rows. It has to take precedence over leg D's: leg E's `CT0QTS`
+/// also carries `ENABLE`, so `v3d98_tsaim_verdict` would otherwise claim this leg and report it in
+/// terms of a decoy window leg E does not aim at.
+///
+/// The question, stated once: does the PRODUCTION close complete cleanly under honest instruments?
+/// If it does, the historic armed wall is not at the close stage at all and the campaign's remaining
+/// surface is the `m4`/`rcl` classes — bin CONTENT, not frame close. If instead a refusal appears here,
+/// it is one the 2026-08-02 pre-catcher, pre-poison instruments could not have seen, and it is a
+/// first-class finding on the only path that ships.
+#[cfg(feature = "v3d_armedclose")]
+fn v3d99_armedclose_verdict(
+    fault: u32,
+    client: &str,
+    va: u64,
+    qma: u32,
+    qms: u32,
+    qts: u32,
+    pool_words: u32,
+    ts_words: u32,
+    decoy_words: u32,
+) -> &'static str {
+    let ts_base = (qts & !V3D_CLE_CT0QTS_ENABLE) as u64;
+    if fault != 0 && client != "PTB" {
+        return "A FAULT LATCHED ON THE PRODUCTION LEG BUT THE CLIENT IS NOT THE PTB — attribution belongs to whichever unit VIO_ID names, and neither §49.20's PTB reading nor leg D's completed close is what this leg reproduced. Read the raw pair; no close-stage verdict from this line";
+    }
+    if fault != 0 {
+        if va == 0 {
+            return "OUTCOME E2 — THE ARMED CLOSE IS REFUSED AT VA 0x0, WITH EVERY PRODUCTION BASE MAPPED AND CT0QTS.ENABLE SET. This is leg C's residual reappearing on the path that ships, on a leg where leg D showed the same bit makes the refusal go away — so the variable is NOT the ENABLE bit but the base VALUES or the armed prologue (BPOS=0 / the pre-kick L2T invalidate), and the next cut is to remove them one at a time. Boot8's OUTCOME D1 stands as measured; what it does NOT then license is the inference that the armed close is healthy";
+        }
+        if va >= qma as u64 && va < qma as u64 + qms as u64 {
+            return "OUTCOME E2b — THE ARMED CLOSE IS REFUSED INSIDE ITS OWN TILE-ALLOC POOL. The VA falls in [CT0QMA, CT0QMA+CT0QMS), a span the V3D MMU maps for this job, so this is a TRANSLATION question and not an aim question: subtract CT0QMA on the line to name the offset, then read the pool scan and the [v3d99] head dump to see how far the write got before the refusal. The small answer space is the one §49.22's OUTCOME-1 text named — PTE visibility at that instant, L2T/TLB staleness against a page table written before MMU enable, or a permission/cap field left at POR";
+        }
+        if va >= ts_base && va < ts_base + (TILE_STATE_BYTES as u64) {
+            return "OUTCOME E2c — THE ARMED CLOSE IS REFUSED INSIDE ITS OWN TILE-STATE ARRAY. The base IS honoured (the VA moved with CT0QTS) and the refusal is at an offset within the 256-byte array this driver allocates. Subtract the base on the line: an offset at or past the array's END is a GEOMETRY finding and a driver fix — the tile-state region is too small for what the block writes — and it would explain the armed wall without any MMU theory at all";
+        }
+        return "OUTCOME E6 — A FAULT ON THE PRODUCTION LEG AT A VA NONE OF THESE ROWS PREDICTS: not zero, not inside the pool span, not inside the tile-state array. §49.20.6's last row governs — do the subtraction against CT0QMA, CT0QMA+CT0QMS and CT0QTS, all three printed on this same line, before concluding anything";
+    }
+    if decoy_words > 0 {
+        return "OUTCOME E1b — NO FAULT, BUT A DECOY WINDOW MOVED. On this leg the decoys are the NEGATIVE controls (the roles are inverted from legs C/D), so bytes in a decoy under production bases mean the close-time write is not aimed by the registers this leg programmed — it went where leg C/D's values pointed, which would make the tile-memory registers latch-once rather than per-kick. Read the four [v3d56] scan lines and the landing digest in order; this is a first-class finding and it voids the E1/E3 readings";
+    }
+    if pool_words > 0 && ts_words > 0 {
+        if pool_words == V3D99_BOOT6_POOL_WORDS && ts_words == V3D99_BOOT6_TS_WORDS {
+            return "OUTCOME E1 — THE ARMED EMPTY CLOSE IS HEALTHY, AND IT IS BOOT6's SHAPE TO THE WORD. No fault, the catcher pristine, both real windows written, 20 pool words and 48 tile-state words — §49.8 boot6's ARMED numbers exactly, now read with the poison, the catcher and the V2a pair that boot6 did not have. §49.22.3's conditional reconciliation is DISCHARGED: the production close-time write path completes, so the historic armed wall is NOT a close-stage artifact and the campaign's remaining surface is bin CONTENT — the m4/rcl classes. The unarmed close (leg D) and the armed close now agree on both write counts, which also retires the last reason to suspect the unarmed rung of measuring something the real path does not do";
+        }
+        return "OUTCOME E5 — NO FAULT AND BOTH REAL WINDOWS WERE WRITTEN, BUT NOT IN BOOT6's NUMBERS. The close completes and the aim is right; the AMOUNT differs. Read the two counts on this line against 20 (pool) and 48 (tile-state), then the byte spans on the [v3d56] scan lines and the [v3d99] head dumps: a larger tile-state count against a 64-word array is the geometry finding OUTCOME E2c would have caught as a fault had the array been smaller, and a different pool count is a bin-content difference between this list and boot6's";
+    }
+    if pool_words > 0 || ts_words > 0 {
+        return "OUTCOME E3 — NO FAULT, BUT ONLY ONE OF THE TWO CLOSE-TIME WRITES LANDED. The armed close is PARTIAL: read which of the two scan lines moved. A pool write without a tile-state write means CT0QTS.ENABLE did not gate what leg D says it gates on the production values; a tile-state write without a pool write means the binner emitted no per-tile list at all for this empty frame, which is a bin-content statement and not a close-stage one. Either way this is the discriminator §49.22.3 was missing, and neither E1 nor E2 may be quoted";
+    }
+    "OUTCOME E4 — NO FAULT AND NOTHING LANDED ANYWHERE THIS INSTRUMENT LOOKS. The production close wrote neither its pool nor its tile-state array and the MMU did not object, which contradicts §49.8 boot6 on the very path boot6 measured. Check the [v3d62] catcher line on this leg FIRST — a catcher that absorbed words means the writes happened and were refused without latching — and check the [v3d56] landing digest for any changed arena page. If both are clean, the difference between this leg and boot6 is the LIST (14-byte empty vs boot6's), and that is where the next cut goes"
+}
+
 /// PI-V3D-97 — one leg. `pad` selects the list (0 = the 14-byte `emptyunarm` shape, `V3D97_PAD_FLUSHES`
 /// = the 46-byte R3 list); `bases` is `None` for R3 (nothing programmed, bases stay at leg A's zero) and
-/// `Some` for R1. Everything else — the catcher, the poison, the submit, the wait — is leg A's, verbatim.
+/// `Some` for R1. `armed` is PI-V3D-99's leg E and it is the one leg that is not unarmed: it adds
+/// `v3d_bin_job_run`'s `BPOS = 0` and pre-kick L2T invalidate in front of the register latch, and its
+/// bases are the production ones. Everything else — the catcher, the poison, the submit, the wait, the
+/// scans, the digest — is leg A's, verbatim, on every leg.
 #[cfg(feature = "v3d_basedaim")]
-fn v3d97_leg(leg: &str, tag: &str, pad: usize, bases: Option<V3d96Bases>) {
+fn v3d97_leg(leg: &str, tag: &str, pad: usize, bases: Option<V3d96Bases>, armed: bool) {
     let cl_len = build_bin_cl_emptyunarm_padded(OFF_PROBE_BIN_CL, pad);
     cache::clean_range(arena_phys() + OFF_PROBE_BIN_CL, cl_len);
     let ba = (arena_phys() + OFF_PROBE_BIN_CL) as u32;
@@ -15889,6 +16017,8 @@ fn v3d97_leg(leg: &str, tag: &str, pad: usize, bases: Option<V3d96Bases>) {
         leg, tag, ba, ea, cl_len, cl_len, pad,
         match bases {
             None => "NONE (leg A's zero residue is left standing; this leg varies list length ONLY)",
+            Some(_) if armed =>
+                "CT0QMA/CT0QMS/CT0QTS at PRODUCTION values (the REAL tile-alloc pool base, the real 0x8000 size, the REAL tile-state array | ENABLE) PLUS BPOS=0 and the pre-kick L2T invalidate, in v3d_bin_job_run's order — THIS LEG IS NOT UNARMED, and on it the two REAL regions are the targets while the two decoys are the negative controls",
             Some(b) if b.qts & V3D_CLE_CT0QTS_ENABLE != 0 =>
                 "CT0QMA/CT0QMS/CT0QTS WITH QTS.ENABLE=1 (no BPOS=0, no pre-kick L2T invalidate, no BPOA/BPOS) — leg C's three values with EXACTLY ONE BIT changed",
             Some(_) => "CT0QMA/CT0QMS/CT0QTS ONLY (no BPOS=0, no pre-kick L2T invalidate, no QTS.ENABLE)",
@@ -15916,11 +16046,31 @@ fn v3d97_leg(leg: &str, tag: &str, pad: usize, bases: Option<V3d96Bases>) {
     v3d56_poison_region(OFF_V3D97_POOL, V3D97_POOL_BYTES);
     v3d56_poison_region(OFF_V3D97_TS, V3D97_TS_BYTES);
 
+    // ── PI-V3D-99 — the PRODUCTION prologue, and ONLY on leg E. Kernel order, per `v3d_bin_job_run`
+    // (v3d_sched.c) as `[v3d57]` transcribed it: `BPOS = 0` is the FIRST write of a bin job, then the
+    // per-job cache invalidate, and only THEN the CT0QMA/QMS/QTS latch below. Legs A–D take none of it
+    // by design — that is what "unarmed" means in this rung — so these two steps plus the register
+    // VALUES are the ONLY differences between leg E and leg D.
+    #[cfg(feature = "v3d_armedclose")]
+    if armed {
+        bin_prejob_bpos_clear(tag);
+        invalidate_gpu_caches("L2T flush (v3d99 armedclose pre-kick)");
+        serial_println!(
+            ":: V3D: [v3d99] LEG {} armed prologue — BPOS=0 FIRST, then the pre-kick L2T invalidate, BEFORE the CT0QMA/QMS/QTS latch (v3d_bin_job_run's own order). BPOA={:#010x} BPOS={:#010x} L2TCACTL={:#010x} — no BPOA is written, so the PTB enters this frame with NO overflow block, which is the opposite of the §19/§33 stale-overflow hazard ::",
+            leg,
+            mmio_read(V3D_CORE0_BASE, V3D_PTB_BPOA),
+            mmio_read(V3D_CORE0_BASE, V3D_PTB_BPOS),
+            mmio_read(V3D_CORE0_BASE, V3D_CTL_L2TCACTL)
+        );
+    }
+
     // ── The ONLY registers this rung ever programs, and only on the R1 leg. ────────────────────
     if let Some(b) = bases {
         mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMA, b.qma);
         mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QMS, b.qms);
-        mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QTS, b.qts); // bare base — ENABLE deliberately NOT set
+        // The word the CALLER built: leg C's bare base (ENABLE deliberately clear), leg D's base with
+        // the one bit set, leg E's real tile-state array with the bit the production path sets.
+        mmio_write(V3D_CORE0_BASE, V3D_CLE_CT0QTS, b.qts);
         dsb();
     }
     let qma_pre = mmio_read(V3D_CORE0_BASE, V3D_CLE_CT0QMA);
@@ -15997,6 +16147,19 @@ fn v3d97_leg(leg: &str, tag: &str, pad: usize, bases: Option<V3d96Bases>) {
     // supply their own negative control: a window that took no write must still read pure poison here.
     #[cfg(feature = "v3d_tsaim")]
     v3d98_dump_pool_head(tag, decoy_pool);
+    // PI-V3D-99 — the companion dumps `[v3d98]` never had. The pool head has been on the wire verbatim
+    // since boot8; the TILE-STATE window never has, and OUTCOME D1 made that the live gap (48 words
+    // touched, THREE of them non-zero, and no line said which). Rides every leg for the same reason the
+    // pool dump does: the legs that touch nothing supply their own negative control. On leg E the two
+    // REAL regions are the targets, so they are dumped too.
+    #[cfg(feature = "v3d_armedclose")]
+    {
+        v3d99_dump_head(tag, "decoy TILE-STATE window (CT0QTS target on legs C/D)", decoy_ts, 8);
+        if armed {
+            v3d99_dump_head(tag, "REAL tile-alloc pool (leg E's CT0QMA)", tile_alloc, 4);
+            v3d99_dump_head(tag, "REAL tile-state array (leg E's CT0QTS)", ts, 8);
+        }
+    }
     v3d56_emit_landing(tag, &arena_pre, &v3d56_arena_digest());
     ptb_frame_witness(tag, bfc_pre, rfc_pre, bpca_pre, if bases.is_some() { qma_pre } else { tile_alloc });
 
@@ -16024,11 +16187,36 @@ fn v3d97_leg(leg: &str, tag: &str, pad: usize, bases: Option<V3d96Bases>) {
     #[cfg(not(feature = "v3d_tsaim"))]
     let tsaim_row: Option<&str> = None;
 
+    // ── PI-V3D-99: leg E's own rows, which take precedence over BOTH sets above. They MUST be taken
+    // ahead of leg D's: leg E's `CT0QTS` also carries `ENABLE`, so `v3d98_tsaim_verdict` would
+    // otherwise claim this leg and report it against a decoy window leg E does not aim at.
+    #[cfg(feature = "v3d_armedclose")]
+    let armed_row: Option<&str> = if armed {
+        Some(v3d99_armedclose_verdict(
+            fault,
+            client,
+            va,
+            qma_pre,
+            qms_pre,
+            qts_pre,
+            pool_scan.zeroed + pool_scan.overwritten,
+            ts_scan.zeroed + ts_scan.overwritten,
+            dpool_scan.zeroed + dpool_scan.overwritten + dts_scan.zeroed + dts_scan.overwritten,
+        ))
+    } else {
+        None
+    };
+    #[cfg(not(feature = "v3d_armedclose"))]
+    let armed_row: Option<&str> = None;
+
     // ── The verdict. §49.20.6's four rows, pre-written, plus the branches that void them. ────────
     let verdict: &str = if !submit_sound {
         "THE SUBMIT DID NOT AUDIT SOUND — [v3d54] says the latched [BA,EA) is not the one intended, so nothing on this leg is about the list it names. Re-take; no verdict"
     } else if !frame_closed {
         "NO FRAME CLOSED ON THIS LEG, so the question was never put. §49.20's V1 established that an unarmed submit closes a bin frame (BFC Δ1); this leg did not close one, so there is no close whose write could be aimed anywhere. NOT a verdict on the aim — read leg A's BFC above: if leg A closed and this leg did not, the ONE variable this leg changed is what stopped it, and THAT is the finding"
+    } else if let Some(row) = armed_row {
+        // Leg E (PI-V3D-99) — the production leg's own rows, ahead of leg D's for the reason above.
+        row
     } else if let Some(row) = tsaim_row {
         // Leg D (PI-V3D-98) — its own pre-written rows, taken only after the two void-branches above.
         row
@@ -16107,7 +16295,7 @@ fn v3d97_basedaim_legs() {
 
     // LEG B first — §49.20.6: "Run R3's leg FIRST (it validates the instrument), then R1's leg (it
     // answers the question)". Bases are untouched, so this leg still sits on leg A's zero residue.
-    v3d97_leg("B", "v3d97 R3 lenvary (zero bases, 46-byte list)", V3D97_PAD_FLUSHES, None);
+    v3d97_leg("B", "v3d97 R3 lenvary (zero bases, 46-byte list)", V3D97_PAD_FLUSHES, None, false);
 
     // LEG C — the cut.
     let bases = V3d96Bases {
@@ -16115,7 +16303,7 @@ fn v3d97_basedaim_legs() {
         qms: V3D97_QMS,
         qts: (arena_phys() + OFF_V3D97_TS) as u32, // bare base: ENABLE (bit1) stays 0 by design
     };
-    v3d97_leg("C", "v3d97 R1 basedaim (nonzero mapped bases, 14-byte list)", 0, Some(bases));
+    v3d97_leg("C", "v3d97 R1 basedaim (nonzero mapped bases, 14-byte list)", 0, Some(bases), false);
 
     // ── PI-V3D-98 — LEG D (`tsaim`). v3d.md §49.22.5's R-next-1: leg C's three values with EXACTLY
     // one bit changed, `CT0QTS.ENABLE`. Runs AFTER leg C so leg C stays the in-boot anchor and the
@@ -16131,9 +16319,35 @@ fn v3d97_basedaim_legs() {
             // THE ONLY DIFFERENCE FROM LEG C, and it is one bit.
             qts: (arena_phys() + OFF_V3D97_TS) as u32 | V3D_CLE_CT0QTS_ENABLE,
         };
-        v3d97_leg("D", "v3d98 R-next-1 tsaim (mapped bases, CT0QTS.ENABLE=1, 14-byte list)", 0, Some(tsaim));
+        v3d97_leg("D", "v3d98 R-next-1 tsaim (mapped bases, CT0QTS.ENABLE=1, 14-byte list)", 0, Some(tsaim), false);
         serial_println!(
             ":: V3D: [v3d98] TSAIM COMPLETE — leg D taken and nothing else. Read leg C's VERDICT before it: leg D's whole question is leg C's residual, and a leg C that did not reproduce boot7's shape (pool decoy touched, fault at VA 0x0) leaves leg D with no residual to explain. CT0QMA/CT0QMS/CT0QTS are LEFT PROGRAMMED at leg D's values, ENABLE included, for the same reason leg C left its own: nothing runs after this rung ::"
+        );
+    }
+
+    // ── PI-V3D-99 — LEG E (`armedclose`). v3d.md §49.23's R-next-3, and the only leg of the five that
+    // is NOT unarmed. Runs LAST so all four unarmed legs stay in-boot anchors, read off one CT0 that
+    // was virgin at leg A: leg D's OUTCOME D1 and leg E's outcome are taken within one capture, on one
+    // image, so the unarmed and armed closes are compared without a boot boundary between them.
+    #[cfg(feature = "v3d_armedclose")]
+    {
+        serial_println!(
+            ":: V3D: [v3d99] ARMEDCLOSE LEG — READ THIS FIFTH, AND LAST. UNAOS_V3D_ARMEDCLOSE=1 adds ONE more CT0 kick after leg D, so this capture carries FIVE closes: A (zero bases, 14 B), B (zero bases, 46 B), C (mapped decoy bases, ENABLE=0, 14 B), D (leg C's bases with CT0QTS.ENABLE=1, 14 B) and E (PRODUCTION bases + BPOS=0 + pre-kick L2T invalidate, 14 B). WHY: boot8/PA46's leg D returned OUTCOME D1 — an UNARMED close completed BOTH close-time writes, 20 pool words and 48 tile-state words, §49.8 boot6's ARMED numbers exactly — and §49.22.3's reconciliation of the armed path was written as an explicit CONDITIONAL because the armed path's close has never been read under these instruments. LEG E DISCHARGES THAT CONDITION. It is the real v3d_bin_job_run submit — BPOS=0 first, then the per-job L2T invalidate, then CT0QMA (real pool) -> CT0QMS (0x8000) -> CT0QTS|ENABLE (real tile-state array) -> CT0QBA -> CT0QEA — carrying the V2a read-once violation pair, the [v3d62] catcher, four poisoned windows and the landing digest. NOTE THE ROLE INVERSION: on leg E the two REAL regions are the TARGETS and the two decoys are the negative controls, the opposite of legs C/D. Outcomes are pre-written on leg E's own VERDICT line (E1 healthy and boot6's shape to the word; E2/E2b/E2c a refusal the 2026-08-02 instruments could not have seen; E3 a partial close; E4 nothing at all; E5 both landed at other counts; E1b a decoy hit). §49.20.2's V2a law rides unchanged ::"
+        );
+        let production = V3d96Bases {
+            qma: (arena_phys() + OFF_BIN_TILEALLOC) as u32,
+            qms: BIN_TILEALLOC_BYTES as u32,
+            qts: (arena_phys() + OFF_TILESTATE) as u32 | V3D_CLE_CT0QTS_ENABLE,
+        };
+        v3d97_leg(
+            "E",
+            "v3d99 R-next-3 armedclose (PRODUCTION bases, BPOS=0 + pre-kick L2T invalidate, 14-byte list)",
+            0,
+            Some(production),
+            true,
+        );
+        serial_println!(
+            ":: V3D: [v3d99] ARMEDCLOSE COMPLETE — leg E taken and nothing else. Read legs C and D BEFORE it: leg E's whole value is the COMPARISON, and a boot whose leg D did not return OUTCOME D1 leaves leg E without the unarmed baseline it is being read against. CT0QMA/CT0QMS/CT0QTS are LEFT PROGRAMMED at leg E's PRODUCTION values, which is the safest of the five endings — they are exactly what a later armed kick would program anyway — and nothing runs after this rung in any case: the boot returns before probe_job ::"
         );
     }
 
