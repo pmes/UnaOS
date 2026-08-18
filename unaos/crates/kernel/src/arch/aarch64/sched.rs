@@ -210,9 +210,9 @@ pub struct Task {
     /// at `user_entry` with SP_EL0 = `user_sp`. 0 / unused for ordinary kernel tasks. Read only by
     /// `user_task_trampoline` (baremetal-only); on the `virt` build every task is a kernel thread, so
     /// these stay 0 and unread (`spawn_inner` still initialises them for the shared struct layout).
-    #[cfg_attr(not(feature = "baremetal"), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "baremetal", feature = "tegra_el0")), allow(dead_code))]
     user_entry: u64,
-    #[cfg_attr(not(feature = "baremetal"), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "baremetal", feature = "tegra_el0")), allow(dead_code))]
     user_sp: u64,
     /// M6d: the TTBR0_EL1 value (`root_pa | asid << 48`) that installs this task's address space, or 0
     /// for a kernel task (no switch — kernel mappings are Global and byte-identical in every root, so a
@@ -1252,7 +1252,7 @@ extern "C" fn task_trampoline() -> ! {
 /// Placeholder `entry` for user tasks: `spawn_user` sets `Task.entry` to this, but `user_task_trampoline`
 /// never calls it (it `eret`s to EL0 instead). Panics loudly if a path ever reaches it. EL0/user machinery
 /// is baremetal-only (the `virt` JC3 path runs kernel-thread CAPSTONE, no EL0 — see the module gate).
-#[cfg(feature = "baremetal")]
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 fn user_never(_: usize) {
     unreachable!("user task's kernel `entry` was called");
 }
@@ -1270,7 +1270,7 @@ fn user_never(_: usize) {
 /// have headroom for the SVC/IRQ frame (256 GPR + 528 FP + 32 banked + the Rust handler) — it does;
 /// this trampoline uses only a shallow prologue. The msr+eret are one `noreturn` asm block so nothing
 /// runs after the drop. Baremetal-only (EL0/user machinery — the `virt` path has no EL0 this arc).
-#[cfg(feature = "baremetal")]
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 extern "C" fn user_task_trampoline() -> ! {
     let cpu = percpu::this_cpu().cpu_index as usize;
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
@@ -2821,16 +2821,16 @@ pub fn spawn_auto(name: &'static str, entry: fn(usize), arg: usize) -> u64 {
 ///
 /// EL0/user spawn machinery (this and `spawn_user_slot`/`spawn_user_inner`) is baremetal-only: it reaches
 /// into `super::boot` (the Pi-gated user MMU), and the `virt` JC3 path runs kernel-thread CAPSTONE only.
-#[cfg(feature = "baremetal")]
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 pub fn spawn_user(name: &'static str, user_entry: u64, user_sp: u64, cpu: usize) -> u64 {
-    spawn_user_inner(name, user_entry, user_sp, super::boot::boot_ttbr0(), cpu)
+    spawn_user_inner(name, user_entry, user_sp, super::uslots::boot_ttbr0(), cpu)
 }
 
 /// Like `spawn_user`, but the task runs in its OWN per-task address space (M6d): `user_ttbr0` is the
 /// slot root `slot_l1_pa | (asid << 48)` from `boot::slot_ttbr0`. `dispatch_next` installs it on
 /// dispatch; `exit` tears the slot down. This is what lets an EL0 program write its own (slot-private)
 /// stack without disturbing any other task.
-#[cfg(feature = "baremetal")]
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 pub fn spawn_user_slot(
     name: &'static str,
     user_entry: u64,
@@ -2841,7 +2841,7 @@ pub fn spawn_user_slot(
     spawn_user_inner(name, user_entry, user_sp, user_ttbr0, cpu)
 }
 
-#[cfg(feature = "baremetal")]
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 fn spawn_user_inner(
     name: &'static str,
     user_entry: u64,
@@ -2923,7 +2923,7 @@ fn spawn_user_inner(
 /// cores run under the same root/ASID; nG user leaves are ASID-tagged and TLB maintenance is Inner-Shareable
 /// broadcast; and `teardown_user_slot` now repoints EACH exiting thread's core off the slot root, so the
 /// final ASID flush races no live root on any other core. Baremetal-only (reaches the Pi-gated user MMU).
-#[cfg(feature = "baremetal")]
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 pub fn spawn_user_thread(
     name: &'static str,
     user_entry: u64,
@@ -3479,7 +3479,7 @@ static ASID_THREADS: [AtomicU32; KILL_ASID_SLOTS] =
 /// Count a freshly spawned EL0 task against its slot. Called from both user-task spawn paths BEFORE the
 /// run-queue push, so the task is countable before it can ever be dispatched. Kernel tasks (ASID 0) and
 /// out-of-range ASIDs are ignored, which makes this inert on `virt` (every task there is a kernel thread).
-#[cfg_attr(not(feature = "baremetal"), allow(dead_code))] // both user-spawn paths are baremetal-only
+#[cfg_attr(not(any(feature = "baremetal", feature = "tegra_el0")), allow(dead_code))] // both user-spawn paths are baremetal-only
 fn asid_thread_enter(user_ttbr0: u64) {
     let asid = (user_ttbr0 >> 48) as usize;
     if asid != 0 && asid < KILL_ASID_SLOTS {
@@ -3553,7 +3553,7 @@ fn kill_settle(idx: usize, tid: u64, remaining: u32) {
     if remaining > 0 {
         return; // siblings still live under this ASID — the request stays armed for them
     }
-    #[cfg(feature = "baremetal")]
+    #[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
     super::syscall::note_killed_task_retired(tid);
     #[cfg(not(feature = "baremetal"))]
     let _ = tid;
@@ -3802,11 +3802,11 @@ fn retire_killed(idx: usize, task: Box<Task>) {
     // M6d: the same slot retirement `exit()` performs, executed on the scheduler stack. Legal here for
     // the same reason it is legal there — the kernel half of every root is Global and identical, so
     // repointing TTBR0 to the boot root pulls nothing out from under the running (scheduler) context.
-    #[cfg(feature = "baremetal")]
+    #[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
     {
         let asid = task.user_ttbr0 >> 48;
         if asid != 0 {
-            unsafe { super::boot::teardown_user_slot(asid) };
+            unsafe { super::uslots::teardown_user_slot(asid) };
         }
     }
     // Release any joiner: a killed task must not leave a `JoinHandle` blocked forever. Same single-post
@@ -3837,11 +3837,11 @@ pub fn exit() -> ! {
         // root does not pull the stack out from under us. Shared-window (ASID 0) and kernel (ttbr0 = 0)
         // tasks skip it. On `virt` (JC3) every task is a kernel thread (user_ttbr0 == 0), so there is no
         // slot to retire and the whole block is compiled out (it reaches into the Pi-gated `super::boot`).
-        #[cfg(feature = "baremetal")]
+        #[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
         {
             let asid = (*raw).user_ttbr0 >> 48;
             if asid != 0 {
-                super::boot::teardown_user_slot(asid);
+                super::uslots::teardown_user_slot(asid);
             }
         }
         // Signal completion to any joiner — the SINGLE post point for `done_sem`, covering BOTH a kernel
@@ -4426,13 +4426,13 @@ fn drain_due_sleepers(cpu: usize) {
 /// tightest liveness bound it has to satisfy (UVUG-8r2's 2 s takeover heartbeat) and far below what a load
 /// meter can resolve, which is the whole point: the vug keeps its old "I am still polling" contract with
 /// the watchdogs while costing effectively nothing.
-#[cfg(feature = "baremetal")]
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 const INPUT_WAIT_BACKSTOP_TICKS: u64 = 64;
 
 /// VUGPAUSE-2: the tick at which the next backstop pass is due. Global rather than per-CPU, and claimed by
 /// CAS, so the cadence is ONE pass per period across the whole machine and not one per core — six cores
 /// each waking every parked vug would be six times the work for exactly the same effect.
-#[cfg(feature = "baremetal")]
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 static INPUT_WAIT_BACKSTOP_DUE: AtomicU64 = AtomicU64::new(0);
 
 /// VUGPAUSE-2: run the input-wait backstop if its period has elapsed. Called from the scheduler loop top,
@@ -4449,15 +4449,15 @@ static INPUT_WAIT_BACKSTOP_DUE: AtomicU64 = AtomicU64::new(0);
 /// input ring, nothing can park on one, and the backstop has nothing to do.
 #[inline]
 fn input_wait_backstop() {
-    #[cfg(not(feature = "baremetal"))]
+    #[cfg(not(any(feature = "baremetal", feature = "tegra_el0")))]
     return;
-    #[cfg(feature = "baremetal")]
+    #[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
     {
         input_wait_backstop_inner();
     }
 }
 
-#[cfg(feature = "baremetal")]
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 #[inline]
 fn input_wait_backstop_inner() {
     let now = super::timer::ticks();
@@ -5881,7 +5881,7 @@ pub fn fluid3_drain() -> (u64, u64, u64, [u32; FL3_BUCKETS]) {
 /// `note_killed_task_retired` already uses.
 fn kill_wake_parked() -> u32 {
     let mut n = futex_wake_killed();
-    #[cfg(feature = "baremetal")]
+    #[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
     {
         n += super::syscall::kill_wake_parked_semaphores();
     }

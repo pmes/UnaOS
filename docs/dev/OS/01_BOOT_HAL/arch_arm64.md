@@ -8685,3 +8685,185 @@ compile a scheduler into a configuration that has no boot path to run it, tradin
 compile error for a silently-buildable artifact nobody flashes. `pi` without `baremetal` is an
 **unsupported combination**; the honest compile failure is the intended behaviour. Treat
 `./arroyo kernel8` / `kernel8-test` as the only supported carriers of `UNAOS_PI=1`.
+
+## JETSON-EL0 — the EL0/userspace chain on the Jetson Orin Nano (Arc M1b, `UNAOS_TEGRA_EL0`)
+
+### Where M1a left the tegra path
+
+Through M1a the Orin reached EL1 and the scheduler: `mmu_tegra::init` installs the kernel's own
+translation regime, `boot_tegra::drop_to_el1` drops EL2 → EL1 onto the EL1-precise table `L1_EL1`, and
+`tegra_early_stop` ends in `sched::run_capstone_boot_core`. It never reached EL0. The reason was not a
+missing feature flag but a missing half of the machinery: every EL0 consumer —
+`arch::aarch64::syscall`, `arch::aarch64::bus`, and `sched`'s `spawn_user*` / `user_task_trampoline` /
+slot-teardown arms — was gated `#[cfg(feature = "baremetal")]`, because the per-task address-space
+slots they consume live in `arch/aarch64/boot.rs`, which is BCM2711 MMU code end to end (it owns the
+Pi's `L1`, builds the whole identity map, performs its own EL2 → EL1 drop and turns the MMU on).
+
+`tegra_el0` supplies the missing half and widens exactly those gates. It implies `tegra`. Default OFF:
+every widened gate reads `baremetal` again, the new module is not compiled, the spawn block vanishes,
+and the jetson media is byte-identical to baseline.
+
+### The port: `arch/aarch64/mmu_tegra_el0.rs`
+
+The M6d slot system re-implemented against the tegra EL1 regime, exposing the same public shape
+`boot.rs` exposes. Per-slot private L1/L2/L3 branches, ASIDs 1..=8, all user leaves `nG`, and the same
+W^X leaf recipe (code = read-only at both ELs + EL0-executable + PXN; data = EL0/EL1-RW + UXN|PXN).
+`SCTLR_EL1.WXN` is left exactly as `boot_tegra` set it — the recipe is WXN-compatible by construction,
+since no leaf is ever both writable and executable.
+
+It diverges from `boot.rs` in three places, each forced by the platform:
+
+1. **The user window cannot live in GiB 0.** The Pi demotes `L1[0]` to a table and identity-maps a BSS
+   `USER_REGION` inside it. On Tegra234 the low 1 GiB is the **Device** window — UARTC, the GIC-600 and
+   the rest of the peripheral MMIO. Since `build_slot` copies the root table per slot and patches the
+   user entry, patching `L1[0]` would swap the kernel's own UART out from under it the moment a slot
+   root went live in `TTBR0_EL1`. The window therefore occupies an otherwise-unused 1 GiB entry —
+   `USER_GIB = 480`, VA `0x78_0000_0000` — chosen to sit above every address the kernel can map
+   (`map_mmio_window`/`map_fb_region` map identity under a 64 GiB output ceiling, or ~200 GiB of PCIe
+   ECAM with `pcie3`) and below the 512 GiB / 39-bit VA ceiling `TCR_EL1.T0SZ = 25` gives. `install`
+   **verifies** the entry is invalid before claiming it rather than asserting it in a comment.
+   Consequence: user VA ≠ backing PA, so every kernel-side write goes through `slot_backing_ptr` (the
+   identity-mapped PA), never the user VA.
+
+   The root table is obtained by reading the **live `TTBR0_EL1`** (ASID field stripped) and latching it
+   in `BOOT_ROOT`, not by exporting `mmu_tegra`'s private `L1_EL1`. That is better on the merits — it is
+   the root the hardware is actually walking, so it cannot drift from what `boot_tegra` installed — and
+   it means **`mmu_tegra.rs` is not modified by this arc at all**. It is latched once rather than re-read
+   on demand because `boot_ttbr0()` is called from `teardown_user_slot`, where the calling core's live
+   `TTBR0_EL1` may be a *slot* root; a fresh read there would hand teardown the very address space it is
+   trying to leave.
+
+2. **The backing comes off the heap, not BSS.** Putting it in BSS would be a live bug: `mmu_tegra`
+   **unmaps** the SNOC-firewalled carveout windows (the XCARVE-3/6/8/9 set), and BSS is placed wherever
+   the linker put the image with nothing keeping it clear of them — a backing frame inside a hole has
+   no translation, so the first EL0 touch would fault. The heap is already vetted (`select_heap_region`
+   seats it clear of every hole), so backings are `alloc_zeroed`ed from it, as the xHCI structures are.
+   `carveout_overlaps` re-checks each backing against the live hole set anyway and refuses the
+   allocation on a hit, so the dependency on another module's invariant is checked rather than assumed.
+
+3. **The ASID grant issues a conservative TLBI.** `boot.rs` argues no TLBI is needed on a fresh ASID.
+   That argument is sound on the A72 and probably sound on the A78AE — but "probably" is doing real
+   work in it, the Orin has its own errata surface (`mmu_tegra::a78ae_errata_probe`), and this chain is
+   metal-owed and un-QEMU-able, so a latent stale-TLB bug would surface as an unreproducible bench
+   fault. One broadcast `tlbi aside1is` per slot grant costs nothing on a per-launch path and makes the
+   grant's correctness independent of the teardown argument. Deliberate; do not remove without metal
+   evidence.
+
+One hazard is **sharper** here than on the Pi. Per-slot roots freeze the kernel map at copy time, and
+`mmu_tegra` has three routines that edit `L1_EL1` after boot — `map_mmio_window`, `map_fb_region`,
+`install_net4b_nc`. Today the EL0 chain comes up at the very end of `tegra_early_stop`, after all three
+have run, so no live slot can miss a window; **a future arc that maps an MMIO window later than the
+first slot build must mirror it into every live slot L1.** (The carveout L2 splits are safe by
+construction — those L1 entries are copied as pointers into `L2_POOL_EL1`, so slots share the tables
+rather than snapshotting them.)
+
+### PAN — a load-bearing precondition that holds by configuration, not by absence
+
+`syscall::setup()` copies `USER_BLOB` in through the shared window's user VA, `sys_write` **reads** the
+caller's message buffer, and `probe_slot_isolation` does real EL1 loads of a user VA. All three need
+EL1 to be able to touch EL0-accessible pages. `boot.rs` justifies that with "the PAN-less A72" —
+literally true there, since Armv8.0 has no PAN.
+
+**That justification does not transfer.** The Orin's Cortex-A78AE is Armv8.2 and has PAN. The accesses
+are still legal, but for a more fragile reason: two configuration facts currently set in `boot_tegra`.
+
+* `SPSR_EL2 = 0x3c5` at the EL2 → EL1 `eret`. Bit 22 (PAN) is clear, so the kernel lands at EL1 with
+  `PSTATE.PAN == 0`.
+* `SCTLR_EL1.SPAN` (bit 23) is set in `SCTLR_EL1_VAL`, meaning `PSTATE.PAN` is left **unchanged** on
+  exception entry to EL1 — so the `SVC` from an EL0 task arrives with PAN still 0.
+
+**STOP tripwire.** Clearing SPAN, or setting SPSR_EL2 bit 22, turns every one of those accesses into a
+permission fault — presenting as an EL0 program that "mysteriously" faults inside the kernel, with
+nothing in the symptom pointing at PAN. If a future arc wants PAN enforcement (a genuine hardening
+win), the right move is to gate those specific accesses behind `AT S1E1RP`-style checks or explicit
+`msr PAN, #0` windows, not to leave the dependency implicit. Recorded because it was previously written
+down nowhere.
+
+### The facade: `arch::aarch64::uslots`
+
+Two modules implement one user-address-space API: `boot.rs` for the Pi, `mmu_tegra_el0.rs` for the
+Orin. `mod.rs` re-exports whichever the active feature selects. This is what let the EL0 chain reach
+the Orin without editing a line of logic in either consumer — `syscall.rs`'s 308 call sites and
+`sched.rs`'s 5 changed **module path only** (`super::boot::` → `super::uslots::`).
+
+### Call-site placement, and why it is not where the arc brief put it
+
+The brief specified the spawn before `timer::set_not_live()`. It cannot go there. The user window hangs
+off `L1_EL1`, which is not the live root until `boot_tegra::drop_to_el1` installs it; a pre-drop
+`syscall::setup()` would copy `USER_BLOB` through a user VA that translates to nothing under the EL2
+`L1` and fault into the Part-C vector. `set_not_live()` is on the very next line after that drop, so
+"after the drop" is necessarily "after the disarm". Nothing is lost: the disarm retires the timer
+**interrupt** (CNTP_CTL=0 at the drop), while the verdict's bound is CNTPCT, which free-runs. The block
+sits after `exceptions::install()` — that is what puts the real `VBAR_EL1` in place for the `SVC` the
+EL0 task takes; `mmu_tegra::arm_el1_fault_vector()` is a syndrome-printing landing vector, not a
+syscall handler.
+
+### What this arc claims, and what it does not
+
+The **first rung only**: one EL0 task (`el0-hello`, the `USER_BLOB` payload), one `SYS_WRITE`, exit 0.
+`syscall::tegra_el0_verdict` asserts `exited_ok == 1` with `exited_err`, `killed_expected` and
+`killed_unexpected` all zero — the three zero terms are load-bearing, so a hello that faulted and was
+killed reads FAIL rather than passing on "something terminated". The Pi's `verdict` is deliberately not
+reused: it demands the full M6b split (`exited=1 killed=3`), and this boot spawns no fault fixtures, so
+it would report FAIL on a correct machine. EL0 **fault isolation** on the Orin is a later rung.
+
+Witness lines:
+
+```
+:: TEGRA-EL0: user window installed — VA 0x7800000000 (L1_EL1[480]), backing PA <pa>, 8 slots ::
+:: TEGRA-EL0: el0-hello spawned at EL0 (boot core), verdict armed — entry <va> sp <va> ::
+:: TEGRA-EL0: el0-hello round-trip -> PASS ::
+```
+
+### Verification status
+
+`./arroyo check` is green for both arches knob-off (`UNAOS_TEGRA=1`) and knob-on (`UNAOS_TEGRA_EL0=1`).
+
+**Byte-identity: the substantive property holds; the literal sha256 test does not.** Measured against a
+from-scratch `UNAOS_TEGRA=1 ./arroyo esp-jetson` build of the pre-arc tree (baseline `9616bc7f…`,
+reproduced twice — once fresh, once by reverting a dirtied tree back to HEAD, so the harness itself is
+known-good):
+
+| segment | contents | result |
+|---|---|---|
+| `R-X` | **all executable code** | **bit-identical** |
+| `RW-` (both) | initialised data + BSS image | **bit-identical** |
+| `R--` | ELF headers, `.dynsym`/`.dynstr`/`.symtab`/`.strtab` | differs |
+| whole file | `sha256(kernel.elf)` | `2f6985a6…` ≠ baseline |
+
+The differing segment carries no code. The symbol **name sets are identical** in both `.dynsym` and
+`.symtab` (a set-diff of both tables returns zero differences); what changed is the linker's
+string-table *packing* — `.strtab` came out 44 bytes shorter, i.e. LLD tail-merged the same strings
+differently. So the shipped instructions and data are provably unchanged, and only link metadata moved.
+
+Two things fell out of chasing this that are worth keeping:
+
+* **A 35-line inline block in `main.rs` really did move the media hash**, exactly as the RAST-TEGRA
+  comment warns, by shifting `panic::Location` line numbers into rodata. The fix is the established
+  convention — tail-defined helper, same-line call, zero added lines before any Location — and with it
+  `main.rs` alone rebuilds to the baseline hash *exactly*. That part of the byte-identity law is real
+  and was verified, not assumed.
+* **A pure append to `mmu_tegra.rs` of 30 fully `#[cfg(feature = "tegra_el0")]`-gated lines also moved
+  the whole-file hash** (reproduced twice), with `.text` bit-identical — the same metadata-only effect.
+  That edit has since been removed entirely (see the `BOOT_ROOT` note above), so it is moot for this
+  arc, but it is recorded because it means **`sha256(kernel.elf)` is a stricter test than "the shipped
+  code is unchanged"**, and a future arc that trips it should compare PT_LOAD segments before
+  concluding it has a real regression.
+
+**QEMU cannot exercise any of this**: the `tegra` feature has no QEMU model (the virt gate is a
+different machine with a different MMU regime and no Tegra234 carveouts), so the round-trip witness is
+**metal-owed on an attended bench**. Note also that the `nG` isolation probe (`probe_slot_isolation`) is
+structurally meaningless under emulation — QEMU models no TLB and re-walks every access, so it always
+returns `true`; its verdict counts only on silicon.
+
+### Build dependency: `target/user_blob.bin`
+
+An armed jetson image compiles `syscall.rs`, which `include_bytes!`es `target/user_blob.bin` (the
+el0-hello payload). That artifact is produced by `build_user_blob`, which before this arc ran **only**
+from the Pi `kernel8` path — so the first `UNAOS_TEGRA_EL0=1 ./arroyo esp-jetson` in a tree that had
+never built a Pi image failed outright with `couldn't read .../target/user_blob.bin`. An in-tree build
+with a stale blob left over from an earlier Pi build masks this, which is exactly why it needed wiring
+rather than luck. The block was lifted verbatim out of `kernel8()` into `build_user_blob()` (both now
+call it) and `esp_jetson` invokes it **only when `tegra_el0` is armed** — the disarmed path does not
+compile `syscall.rs`, so an unconditional blob build would slow every ordinary jetson build and churn
+the kernel's rebuild via the blob's refreshed mtime for nothing.

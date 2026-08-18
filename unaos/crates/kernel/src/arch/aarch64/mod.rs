@@ -39,11 +39,16 @@ pub mod boot_tegra;
     all(target_arch = "aarch64", feature = "tegra")
 ))]
 pub mod sched;
-#[cfg(feature = "baremetal")]
+// JETSON-EL0 (M1b): widened from `baremetal` to also cover `tegra_el0`. The module body is unchanged
+// except for the `uslots` facade (below) it now names instead of `super::boot` — the Pi keeps the
+// BCM2711 slot system in `boot.rs`, the Orin gets the tegra port in `mmu_tegra_el0.rs`, and syscall.rs
+// compiles against whichever one the active feature selects.
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 pub mod syscall;
 // BANDY-1 (ROADMAP §3b arc 1): the on-UnaOS SMessage bus — v1 subset codec (wire layer of the
-// SYS_MSEND/SYS_MRECV transport in syscall.rs). Baremetal-gated like syscall.rs (Pi 4 lane).
-#[cfg(feature = "baremetal")]
+// SYS_MSEND/SYS_MRECV transport in syscall.rs). Gated like syscall.rs — JETSON-EL0 (M1b) widened both
+// from `baremetal` to `any(baremetal, tegra_el0)` together, since the bus IS syscall.rs's wire layer.
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 pub mod bus;
 // JM3: Jetson Orin Nano (Tegra234) kernel-owned MMU. The tegra/UEFI build maps RAM Normal-WB + the
 // Tegra device windows Device-nGnRE before touching any peripheral MMIO (the R4 UARTC-fault fix).
@@ -51,6 +56,29 @@ pub mod bus;
 // `map_mmio_window` reach ceiling there; on virt the L1 statics are inert, not the active regime.)
 #[cfg(any(feature = "tegra", feature = "pcie3"))]
 pub mod mmu_tegra;
+// JETSON-EL0 (M1b): the EL0 user address-space machinery for the tegra EL1 regime — the M6d slot system
+// (`boot.rs`) re-implemented against `mmu_tegra`'s `L1_EL1` instead of the Pi's BCM2711 identity map.
+// See the module header for the three places it necessarily diverges from `boot.rs`.
+#[cfg(feature = "tegra_el0")]
+pub mod mmu_tegra_el0;
+
+// JETSON-EL0 (M1b): THE FACADE. `syscall.rs` and `sched.rs` consume one user-address-space API — the
+// slot pool, the user window VA, the W^X leaf flips, the FB surface hole, ASID teardown. Two modules
+// implement it: `boot.rs` for the Pi (BCM2711, `baremetal`) and `mmu_tegra_el0.rs` for the Orin
+// (Tegra234, `tegra_el0`). Routing the consumers through this one re-export is what let the EL0 chain
+// reach the Orin WITHOUT editing a single line of logic in either consumer — `syscall.rs`'s 308 call
+// sites changed module path only (`super::boot::` -> `super::uslots::`), and `sched.rs`'s five changed
+// the same way. The two features are mutually exclusive in practice (`baremetal` implies `pi`,
+// `tegra_el0` implies `tegra`, and `pi`/`tegra` are mutually exclusive), but `baremetal` is written to
+// win the arm explicitly so a nonsensical both-on build picks one deterministically instead of
+// colliding on a duplicate glob import.
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+pub mod uslots {
+    #[cfg(feature = "baremetal")]
+    pub use super::boot::*;
+    #[cfg(all(feature = "tegra_el0", not(feature = "baremetal")))]
+    pub use super::mmu_tegra_el0::*;
+}
 // JB1a: bounded read-only FDT walker — prints the BPMP IPC geometry (shmem/mboxes/reserved-memory)
 // from the firmware DTB, the verified starting line for the BPMP IVC arc (JB1).
 // (ORIN-NET-1/-2 also reuse this walker's `Fdt`/`for_each_prop` for their read-only PCIe census, so it

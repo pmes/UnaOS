@@ -2456,7 +2456,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     }
     unaos_kernel::arch::percpu::init(0);
     unaos_kernel::arch::exceptions::install();
-    tegra_rast_demo_maybe(); unaos_kernel::arch::sched::run_capstone_boot_core(0); // RAST-TEGRA demo (no-op unless UNAOS_RAST=1) on the same line as the terminus so the wire-in adds ZERO source lines before any panic Location — the tegra knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helper defined at file tail.
+    tegra_el0_start_maybe(); tegra_rast_demo_maybe(); unaos_kernel::arch::sched::run_capstone_boot_core(0); // RAST-TEGRA demo (no-op unless UNAOS_RAST=1) on the same line as the terminus so the wire-in adds ZERO source lines before any panic Location — the tegra knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helper defined at file tail.
 }
 
 /// Handle one keyboard byte against the console: printable ASCII extends the input line, backspace
@@ -5119,3 +5119,60 @@ fn tegra_rast_demo_maybe() {
 #[cfg(all(feature = "tegra", not(feature = "rast"), target_arch = "aarch64"))]
 #[inline(always)]
 fn tegra_rast_demo_maybe() {}
+
+// ── JETSON-EL0 (M1b): the Orin's first EL0 round trip ───────────────────────────────────────────────
+//
+// Bring the user address space up, load the `USER_BLOB` hello program into it, seal the code page W^X,
+// and enqueue one EL0 task plus its verdict — the `run_capstone_boot_core` terminus dispatches both
+// (a spawn only pushes to the run queue).
+//
+// WHY IT LIVES AT THE FILE TAIL, CALLED ON THE TERMINUS LINE. Exactly the RAST-TEGRA convention above,
+// for exactly the RAST-TEGRA reason (PI-V3D-1, bisect-proven): `panic!`/`assert!`/bounds-check sites
+// bake a `core::panic::Location` — file AND LINE — into rodata, so inserting even a comment line ahead
+// of them shifts every later Location and the knob-off image stops being byte-identical. A tail
+// definition plus a same-line call adds ZERO source lines before any Location, which is what keeps the
+// disarmed jetson media bit-for-bit equal to baseline. (Found the hard way: the first cut of this arc
+// put a 35-line block inline here and moved the media hash with the knob OFF.)
+//
+// WHY IT SITS AFTER `timer::set_not_live()` — a deviation from the M1b brief, recorded because it is
+// load-bearing. The brief put the spawn BEFORE that disarm. It cannot go there: the user window hangs
+// off `L1_EL1`, and `L1_EL1` is not the live root until `boot_tegra::drop_to_el1` installs it in
+// TTBR0_EL1, so a pre-drop `syscall::setup()` would copy the blob through a user VA that translates to
+// NOTHING under the EL2 `L1` and fault into the Part-C vector. `set_not_live()` is on the very next
+// line after that drop, so "after the drop" is necessarily "after the disarm". Nothing is lost: the
+// disarm retires the timer INTERRUPT (CNTP_CTL=0 at the drop), while the verdict's bound is CNTPCT,
+// which free-runs. The site is also after `exceptions::install()` on purpose — that is what puts the
+// real `VBAR_EL1` in place for the `SVC` the EL0 task takes; `mmu_tegra::arm_el1_fault_vector()` is a
+// syndrome-printing landing vector, not a syscall handler.
+#[cfg(all(feature = "tegra_el0", target_arch = "aarch64"))]
+fn tegra_el0_start_maybe() {
+    if !unaos_kernel::arch::mmu_tegra_el0::install() {
+        // `install` already printed WHY it refused; this is the machine-checkable FAIL line, so a
+        // capture never has to infer the outcome from the absence of a PASS.
+        serial_println!(":: TEGRA-EL0: el0-hello round-trip -> FAIL — user window not installed ::");
+        return;
+    }
+    let demo = unaos_kernel::arch::syscall::setup();
+    unaos_kernel::arch::syscall::protect();
+    // Pinned to the boot core (cpu 0, not CPU_AUTO): `pick_cpu_slot` short-circuits a non-AUTO request,
+    // so the EL0 task cannot be placed on a secondary. That pin is load-bearing — the boot core is the
+    // one this function has just proven is at EL1 with the real `VBAR_EL1` installed.
+    unaos_kernel::arch::sched::spawn_user("el0-hello", demo.hello, demo.sp, 0);
+    unaos_kernel::arch::sched::spawn(
+        "tegra-el0-verdict",
+        unaos_kernel::arch::syscall::tegra_el0_verdict,
+        0,
+        0,
+    );
+    serial_println!(
+        ":: TEGRA-EL0: el0-hello spawned at EL0 (boot core), verdict armed — entry {:#x} sp {:#x} ::",
+        demo.hello,
+        demo.sp
+    );
+}
+
+// Knob-off tegra build: the wire-in compiles to nothing. `#[inline(always)]` on an empty body means the
+// call on the terminus line emits zero instructions, so the tegra image stays byte-identical.
+#[cfg(all(feature = "tegra", not(feature = "tegra_el0"), target_arch = "aarch64"))]
+#[inline(always)]
+fn tegra_el0_start_maybe() {}
