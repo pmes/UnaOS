@@ -7092,11 +7092,133 @@ be permanently vacuous. Two things exist instead:
   paying a pump budget for any of them. It makes storage unusable by design, so every fixture
   downstream of a mounted disk fails on such a run — never enable it on media.
 
+### R24 — the floor did not latch on metal, twice, and why (2026-08-17)
+
+`BOT: PARKED` never printed on boot5 (41 pump timeouts) or boot6 (84), against a 45 s wall-clock
+clause. It was not a threshold set too high. **The whole ledger was switched off for the one device
+it was built for**, and the mechanism is one line:
+
+```rust
+if s.vid == 0 && s.pid == 0 { return None; }   // bot_ident, pre-R24
+```
+
+`slots[].vid/pid` are written in exactly ONE place — the intercepted device-descriptor event on the
+**root** enumeration path. A hub-downstream device never reaches it. boot6's capture contains one
+`>>> VENDOR ID` banner in its entirety, `[2109]` for the VIA Labs hub, and none for the wedged
+'Generic USB SD Reader' hanging off it. So `bot_ident` returned `None` for that reader on every
+call, and every BOT-PARK hook begins with that call: `bot_park_charge`, `bot_park_note_ladder`,
+`bot_park_note_surrender`, `bot_park_budget_cap`, `bot_park_gate`, the census. All no-ops, all boot.
+
+The capture convicts it three ways, each independently sufficient:
+
+| observation in boot6 | what it rules out |
+|---|---|
+| 60 × `park yield` — the ladder WAS entered 60 times | the wedge failing to reach the escalation ladder. `bot_park_note_ladder` runs *before* the yield and charged none of 60 against `LADDER_MAX=6` |
+| 97 × `pump budget=450000000`, no other value | the dead-ring budget cut having engaged at all — `bot_park_budget_cap` was `None` every time, so `dead_streak` was never even incremented |
+| no `park census` / `park rollup` line at all | an account existing but sitting under threshold |
+
+**The fix: the account is keyed on the ATTACHMENT POINT.** `BotDevIdent` equality is now root port +
+route string and nothing else (`same_place`); VID:PID is carried, printed and upgraded in place when
+it is learned, but is never part of the key. Port + route is what a re-enumeration reproduces and
+what this driver can always observe; VID:PID is what it happens to have parsed. `bot_ident` now
+requires only an active slot with a root port — a device the driver is running BOT transfers against
+has been addressed, configured and endpoint-probed, and refusing to hold it to account because a
+descriptor banner never printed is the bug. Selftest clause `place=` is this property.
+
+Two further defects the same capture exposes:
+
+* **The verdict sat on the ladder's critical path.** `verdict()` was consulted only in
+  `bot_park_note_ladder`, i.e. only on a ladder ENTRY — while the wall-clock and dead-ring clauses
+  are charged by the PUMP, which runs whether or not a ladder follows. It is now read in
+  `bot_park_gate`, the one place every transfer and every bring-up passes through. A park reached
+  there also surrenders, against the current publish generation, since no ladder will do it.
+* **The per-pass cap's pass never ended.** boot6's `pass_ladders=` climbs `2,3,4 … 33` with no reset:
+  the SCSI probe chains that reach the ladder are straight-line sequences inside one desktop
+  iteration and never return through `poll_events`. A per-pass cap whose pass never ends is an off
+  switch — after the first entry every ladder yielded at the top, so no rung ran and no surrender was
+  ever reached, while the pump went on paying a full budget per attempt. `bot_pass_roll` now ends a
+  pass on `BOT_PARK_PASS_MS` as well.
+
+### R24 — the desktop throttle
+
+boot6's vug ran at wf=1-2 against PA42's 25-41 on the same build, because each wedged attempt eats a
+multi-second pump budget **on the desktop's own thread** (`main.rs` → `service_storage`). The bound
+is `BOT_PARK_PASS_PUMP_MS = 2000`: the pump wall-clock one main-loop pass may spend, summed across
+all slots.
+
+* Charged **only on the timeout arm** of `pump_until_bot_done`. A completion costs nothing, so the
+  FAT layer walking a large file through dozens of sequential READ(10)s in one frame can never trip
+  it, however much work it does. What is bounded is the pass's *unproductive* time.
+* Enforced at `bot_transfer_body`'s entry — every BOT transaction in the driver funnels through it —
+  and **not** gated on the identity having an account, unlike `BOT_PARK_PASS_MS`. The first wedged
+  attempt on a device the ledger has never heard of is exactly the metal case.
+* Second half in the pump: for an identity that already HAS an account, the pass remainder is
+  `min`-ed into the budget, floored at `hw_wait_budget()` so no rung's retry is ever starved below
+  the base metal-earned handshake budget. A device with no history keeps
+  `hw_wait_budget() * BOT_BUDGET_SCALE_FIRST` untouched — nothing here shortens a healthy wait.
+
+Worst case per pass, therefore: **one** first-attempt budget for an unknown device, decaying to
+`1/BOT_PARK_DEAD_DIV` of it the moment the dead-ring streak opens the account, then to nothing at
+PARKED. boot6's several-budgets-per-pass composition is unreachable.
+
+The census is also printed at the verdict now, not only from `log_summary_once` — that fires on the
+main loop's 2000th pass, and boot6 never got there.
+
+### R24 — the fixture reaches the verdict
+
+`UNAOS_BOTWEDGE=1` returns `Timeout` without pumping, so it accrued nothing: the ledger's wall-clock
+clause was unreachable in QEMU by construction, which is why the previous gate could only watch the
+back-off decline attempts. The injection now charges the wait it stands in for
+(`hw_wait_budget() * bot_budget_scale`, classified `dead` — the injected wedge IS the `[piusb40]`
+signature), and credits the same fictional span against the back-off deadline, because the ledger
+must not accrue on one clock while the gate refuses on another. Both credits are `cfg`-gated to the
+feature; on metal a real ~7.2 s wait outlasts `BOT_PARK_BACKOFF_MAX_MS` on its own.
+
+Measured, `UNAOS_BOTWEDGE=1 ./arroyo test-arm`:
+
+```
+:: BOT: park account-open port=1 route=0x0 vid=46f4 pid=0001 named=yes anon_total=0 … ::
+:: BOT: PARKED slot=1 port=1 route=0x0 vid=46f4 pid=0001 why=cycles cause=Timeout ladders=4/6
+   surrenders=0/2 gens=0 cycles=3600000000 ms=57600 max_ms=45000 dead_streak=8 … parked_total=1 ::
+:: BOT: park rollup accounts=1 parked=1 … backoff_refused=3 … yields=2 pump_refused=0 anon=0 … ::
+```
+
+Go-red, plain `./arroyo test-arm` on a healthy `usb-storage`: `xHCI: storage ready.` and
+`accounts=0 parked=0 refused=0 backoff_refused=0 pass_refused=0 aborts=0 capped=0 yields=0
+pump_refused=0 anon=0`. The ledger opens nothing and the throttle refuses nothing on a clean boot;
+the selftest proves the arithmetic in both directions on every boot of both arches.
+
 ### Owed on metal
 
-The park verdict itself (`:: BOT: PARKED … why=cycles ::` on a real wedge, and the core coming back
-to the desktop) is metal-owed: reproducing it needs the wedging reader from the `pi0-b1b2` sitting,
-which is the only known instance of the fault.
+The park verdict on a REAL wedge — `:: BOT: PARKED … ::` naming the reader's own port and route, its
+census line immediately after, and the core coming back to the desktop — is still metal-owed; QEMU
+proves the mechanism, not the fault. boot7 must print `park account-open … named=no` for the
+hub-downstream reader (the direct falsification of the R24 miss), then PARKED, then a bounded
+`pump_refused=` instead of 84 uncut budgets, with the vug back in PA42's 25-41 wf band.
+
+### Open: the reader may be MULTI-LUN, and we never ask (R24, unfixed)
+
+Peter's hardware note — the wedging device is a **multi-format** reader, several card slots, "may
+show up funny with a bunch of blank slots". Convicted from code, not yet fixed:
+
+* **`GET MAX LUN` (`bmRequestType 0xA1`, `bRequest 0xFE`, BBB §3.2) is never issued anywhere in this
+  driver.** No occurrence in `drivers/xhci/`.
+* **`bCBWLUN` is hardwired to 0** — one write, `*cbw_buf.add(13) = 0` in `build_cbw`. Every CBW this
+  OS has ever sent went to LUN 0.
+
+If the seated card is on any other LUN, every media-dependent command addresses an empty slot. The
+boot6 evidence lines up exactly: INQUIRY (no media dependence) always completes — `[piusb40]`'s
+post-wedge INQUIRY control returns `Ok`, so the bulk pipes are demonstrably alive *after* the wedge —
+while READ CAPACITY / READ(10) always wedge. And `[piusb41]` caught the desync in the act:
+`READ CAPACITY reply REJECTED — block_size=83886080 last_lba=0x55534253`. `0x55534253` is `USBS`,
+the CSW signature: the device declined the data phase and answered with status, and the driver read
+that status into the capacity buffer — a device saying "nothing here" in the one way we do not parse.
+
+The wire-in — `GET MAX LUN`, then per-LUN `TEST UNIT READY` to find the seated slot, then CBWs
+addressed there — is the named follow-up. It **composes with** this section rather than replacing it:
+an all-slots-empty reader must still PARK cleanly instead of grinding, which is what the floor above
+now guarantees.
+
 ## 27. BT-SSP — Secure Simple Pairing: the link becomes a bond (`UNAOS_BTC=1`, 2026-08-12)
 
 §24's L2CAP attempt named its own successor: a speaker that answers `CONNECTION_RESPONSE` with
