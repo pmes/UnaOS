@@ -272,6 +272,12 @@ const OUT_OPEN: u8 = 1;
 const OUT_PICK: u8 = 2;
 const OUT_KEPT: u8 = 3;
 const OUT_DISMISS: u8 = 4;
+/// CLICK-HOLD — a press this call REFUSED to act on because it is a duplicate of the live hold.
+const OUT_DUP: u8 = 5;
+
+/// CLICK-HOLD — the release generation ([`crate::pal::cursor::button_up_gen`]) of the press this
+/// menu last ACTED on. `u64::MAX` = none yet, a value no generation can reach.
+static ACTED_GEN: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// CLICK-BAND — the last consumed press's outcome, as the witness word.
 pub fn last_press_outcome() -> &'static str {
@@ -280,6 +286,7 @@ pub fn last_press_outcome() -> &'static str {
         OUT_PICK => "pick",
         OUT_KEPT => "kept-open",
         OUT_DISMISS => "dismiss",
+        OUT_DUP => "dup-hold",
         _ => "none",
     }
 }
@@ -566,7 +573,38 @@ pub fn press_at(x: i32, y: i32) -> bool {
         (fb.width(), fb.height())
     };
 
+    // CLICK-HOLD — **one physical click must move this toggle exactly once.**
+    //
+    // Two arms in the input path manufacture a press EDGE from a report taken while the button is
+    // still DOWN: `ehci::note_buttons`'s quiet-gap recovery (a pad that reports only on change is
+    // silent through a still hold, so the first drift after 120 ms reads as a new press) and
+    // `wc_click_route_at`'s stale-latch recovery (`mask == prev` is routed as a press by design).
+    // Every other press target is idempotent under that — a raise raises, a grab grabs — so the
+    // duplicate has been invisible until now. This menu is the kernel's only TOGGLE: the second
+    // edge lands on the crystal box, which is ABOVE `menu_rect` and therefore "outside" an open
+    // menu, and dismisses it. One click then opens and closes the dropdown and the operator sees
+    // nothing — "1 click to activate and 1 to open" (bench, 2026-08-18).
+    //
+    // The discriminator is the LEVEL, not an edge: `set_button_level` runs on every decoded
+    // report, so a genuinely new press always carries a release GENERATION its predecessor did
+    // not, even when the `Button(0)` edge itself was lost — the exact case the two recoveries
+    // exist for, and they keep working. A press that shares the live hold's generation is the
+    // same press: it is CONSUMED (the release pairing is unchanged) and changes nothing.
+    let upgen = crate::pal::cursor::button_up_gen();
+    if crate::pal::cursor::button_down() && ACTED_GEN.load(Ordering::Acquire) == upgen {
+        let owns = OPEN.load(Ordering::Acquire)
+            || menubar::crystal_box_abs(pw, ph).is_some_and(|(cx, cy, cw, ch)| {
+                px >= cx && px < cx + cw && py >= cy && py < cy + ch
+            });
+        if owns {
+            PRESS_OUTCOME.store(OUT_DUP, Ordering::Relaxed);
+        }
+        return owns;
+    }
+
     if OPEN.load(Ordering::Acquire) {
+        // CLICK-HOLD — this call is about to act on the press; claim the gesture.
+        ACTED_GEN.store(upgen, Ordering::Release);
         if let Some(r) = menu_rect(pw, ph) {
             if menu_contains(r, px, py) {
                 return match item_at(r, px, py) {
@@ -601,6 +639,8 @@ pub fn press_at(x: i32, y: i32) -> bool {
     // Closed: the only press we own is one on the crystal box itself.
     if let Some((cx, cy, cw, ch)) = menubar::crystal_box_abs(pw, ph) {
         if px >= cx && px < cx + cw && py >= cy && py < cy + ch {
+            // CLICK-HOLD — acting; claim the gesture.
+            ACTED_GEN.store(upgen, Ordering::Release);
             PRESS_OUTCOME.store(OUT_OPEN, Ordering::Relaxed);
             open(pw, ph);
             return true;
