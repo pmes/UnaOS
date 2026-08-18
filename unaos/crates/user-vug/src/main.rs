@@ -13,6 +13,8 @@
 //      kernel-drawn chrome, tiled beside whatever else is on the panel, rather than the single 32x32
 //      full-screen-centred compat surface SYS_FB_MAP exposed. 288x288 is `FB_WIN_MAX_W/H` (one
 //      324 KiB window slot, CRYSTAL-HD, both arches); the crystal projection is screen-space-scaled to it.
+//      288-as-committed STANDS (Peter, PA44 sitting 2026-08-18: sharper and smaller on glass, "which is
+//      fine") — the 256-at-2x-density alternative from the CRYSTAL-HD arc is retired, not pending.
 //   2. Spawns TWO PERSISTENT EL0 worker threads via SYS_THREAD_SPAWN — one co-located, one on a SIBLING
 //      CORE — each of which rasterises a BAND of the surface (worker A: rows 0..108, worker B: 108..216,
 //      the parent 216..288 — CRYSTAL-HD's 3-way split):
