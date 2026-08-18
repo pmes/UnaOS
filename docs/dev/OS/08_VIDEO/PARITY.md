@@ -768,10 +768,64 @@ flat loader, and a real verb still beats a program of the same name. **No spec l
 in `pi4-regression.spec` anchors on "Unknown command" (the string reaches the console only, never
 serial), and knob-off `kernel8-test 210` is 117/117, 0 forbidden.
 
-**Not done here.** The Pi's regression suite still cannot type, so none of the above is *gated* — it
+**Not done here** — ~~The Pi's regression suite still cannot type, so none of the above is *gated* — it
 is a reproducible manual witness, not a REQUIRE. `mbench.py` already has the `--inject`/`--follow`
 machinery (metal-bridge only today); wiring a bidirectional chardev into `test_kernel8` and adding a
-BARENAME script would turn this proof into a standing gate, and is the obvious follow-up.
+BARENAME script would turn this proof into a standing gate, and is the obvious follow-up.~~
+**DONE — `exec-suitetype`, see §6.6a-typed.**
+
+#### 6.6a-typed — the suite can type, and the bare name is now a REQUIRE
+
+`exec-suitetype` closes the hole §6.6a-closed named. `test_kernel8` gains an OPTIONAL typed-input
+mode, **default off**: `UNAOS_K8_SCRIPT=<file>` swaps UART0's write-only `-serial file:` for
+`-chardev socket,…,logfile=<same log>` + `-serial chardev:` — bidirectional, and still writing
+*exactly* the capture mbench replays, because QEMU's own chardev `logfile=` does the writing.
+Nothing downstream of the chardev can tell the difference, and knob-off the qemu argv is
+byte-for-byte the argv it has always been. `scripts/k8_type.py` is the typist; it reads
+`mbench.py`'s **existing** inject-script grammar (`SLEEP` / `WAIT <secs> <regex>` / a line to type),
+so `scripts/specs/pi4-barename.inject` drives QEMU here and the metal bridge via `mbench --inject`
+without a second dialect. Harness and spec only — no kernel source was touched.
+
+**The three witnesses are in a SECOND spec** (`scripts/specs/pi4-barename.spec`), not in
+`pi4-regression.spec`. A REQUIRE for a typed line cannot be satisfied by a run that types nothing,
+so putting it in the base spec would red the classic gate for behaving correctly — the same argument
+the `pidesk`-gated `[dragperf]`/`[dragwedge]` families make there, taken one step further: those had
+to settle for a FORBID because there was one spec and one battery, whereas a second spec asserted
+*additionally* and only when the knob is armed keeps the base count fixed and still gets real
+REQUIREs. **The suite floor**: knob off, **117/117** required / 0 forbidden, unchanged; knob on,
+**117/117 and then 3/3** — 120 required witnesses across the two batteries. The base spec runs first
+and owns the COMPLETE markers, so it alone can say TRUNCATED, and a non-PASS base verdict
+short-circuits: the typed spec is only ever consulted on a capture already called complete and clean.
+
+**The negative control the base capture supplies for free**: in the knob-off 26359-line capture,
+`BAREXEC`, `tracked job(s) after the sweep` and `nosuchprogram` appear **zero** times. All three
+REQUIREs are therefore typing-only by measurement, not by assumption.
+
+**Readiness was re-anchored, and the old anchor was wrong.** The §6.6a-closed repro waited on
+`[click2] depth`; measured on this arc's knob-off baseline, that line first appears at **line 210** —
+before the fixture cascade starts — and accounts for **25529 of 26359** lines. It proves the input
+pump exists and nothing about the boot being finished, so typing 12 s after it means typing *into*
+the cascade. The script now waits on `:: BANDY-ACL:`, the base spec's LAST REQUIRED witness (line
+1432 of that capture; everything after is steady-state `[sched6]`/`[prio]`/`[pstrip]` noise), then
+settles 12 s. Measured on the gate run (host load average 18.9 at launch): readiness at **t=17.0 s**,
+`vug` typed at t=29.1 s, `nosuchprogram` at t=43.3 s, `jobs` at t=58.0 s — the script is done inside
+~70 s, so the typed window's cost over the classic 210 is margin rather than need. Gate at 300.
+
+**Gate result** (`UNAOS_K8_SCRIPT=scripts/specs/pi4-barename.inject ./arroyo kernel8-test 300`):
+base `117/117 required, 0 forbidden, 43891 lines`, then typed `3/3 required, 0 forbidden`. The
+three lines are the same three §6.6a-closed quotes, now produced by the suite rather than by hand:
+
+```
+:: BAREXEC: /fat/VUG.ELF (typed 'vug') — loaded 12568 bytes, entry 0x600000, pid=152 slot=1 DETACHED, left RUNNING ::
+:: [midden] cmd="nosuchprogram" -> TerminalError len=44 ::
+:: BGRUN: jobs — 1 tracked job(s) after the sweep ::
+```
+
+Classic knob-off `kernel8-test 210` was run before and after the change on the same tree: `117/117,
+0 forbidden` both times, and the only stdout difference between the two consoles is the firmware
+fetch the first run had to do and the second took from cache. The serial captures differ by 1074
+lines, of which 1072 are the free-running `[click2] depth` flood; the 480 distinct line SHAPES are
+identical modulo run-to-run counter values.
 
 #### 6.6b-closed — three images on the Pi FAT, and the falsifier that proves the pin travelled
 

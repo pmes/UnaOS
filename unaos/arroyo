@@ -891,6 +891,11 @@ fi
 # any other value is a path override. QEMU attaches the card to the LEGACY SDHCI (the driver's fallback
 # base); real Pi 4 silicon routes the slot to EMMC2 (the driver's first-tried base).
 #
+# UNAOS_K8_SCRIPT (kernel8-test only): arms TYPED INPUT — UART0 becomes a bidirectional socket
+# chardev (still logging to the same target/serial-pi.log) and scripts/k8_type.py types the named
+# script at the shell. DEFAULT OFF; unset, the QEMU argv is byte-for-byte what it has always been.
+# UNAOS_K8_SPEC / UNAOS_K8_PORT tune the extra spec and the socket port. See test_kernel8().
+#
 # UNAOS_FATIMG swaps the usb-storage backing to a FAT image (scripts/make-fat-img.sh) so the
 # kernel's read-only FAT reader can be exercised on aarch64 QEMU too. Mirrors the x86 builder knob
 # (builder/src/main.rs). Unset -> usb.img (the raw UNA-OS pattern image). Build with `./arroyo fat-img`.
@@ -3338,6 +3343,49 @@ test_kernel8() {
     # mechanism that actually turns a lost race into a named, bounded retry instead of a false green.
     local qmp_port="${UNAOS_QMP_PORT:-4463}"
     while lsof -iTCP:"$qmp_port" -sTCP:LISTEN >/dev/null 2>&1; do qmp_port=$((qmp_port + 1)); done
+    # ── SUITETYPE: the OPTIONAL TYPED-INPUT MODE (default OFF) ────────────────────────────────
+    # The hole this closes: the first UART above is attached `-serial file:` — WRITE-ONLY. The
+    # guest can talk; nothing can talk back. So every interactive path on the Pi (bare-name
+    # launch, the unknown-command refusal, `jobs`) has been un-gateable, and `exec-barename`
+    # could only prove its arc by hand-driving a bidirectional chardev outside the suite
+    # (PARITY.md §6.6a-closed, "the Pi's regression suite still cannot type").
+    #
+    # `UNAOS_K8_SCRIPT=<file>` arms it. The file is an inject script in `mbench.py`'s EXISTING
+    # grammar (SLEEP / WAIT <secs> <regex> / a bare line to type) so ONE script drives both QEMU
+    # here and the metal bridge via `mbench --inject`; `scripts/k8_type.py` is the typist.
+    #
+    # WHY THE CAPTURE PATH IS UNCHANGED: a socket chardev takes QEMU's own `logfile=`, so the
+    # guest's bytes still land in exactly `$logf` and mbench still replays exactly that file.
+    # Nothing downstream of the chardev knows the difference. Knob OFF, the qemu argv below is
+    # BYTE-FOR-BYTE the argv it has always been — the array is built once and expanded once.
+    #
+    # SECOND SPEC, not extra REQUIREs in the first one: the three typed witnesses cannot exist in
+    # a run that types nothing, so putting them in `pi4-regression.spec` would red the classic
+    # gate for behaving correctly. That is the same argument the `[dragperf]`/`[dragwedge]`
+    # knob-gated families make in that spec, and it reaches the same conclusion — the base spec's
+    # REQUIRED COUNT MUST NOT MOVE. Where those families had to settle for a FORBID (one spec,
+    # one battery), typed mode gets real REQUIREs by asserting a SECOND spec, additionally, only
+    # when the knob is armed. See scripts/specs/pi4-barename.spec.
+    local k8_script="${UNAOS_K8_SCRIPT:-}"
+    local k8_spec="${UNAOS_K8_SPEC:-${WORKSPACE_DIR}/scripts/specs/pi4-barename.spec}"
+    local type_port="" tpid=""
+    local -a SERIAL_ARGS
+    if [ -n "$k8_script" ]; then
+        if [ ! -f "$k8_script" ]; then
+            echo -e "${COLOR_RED}✖ kernel8-test: UNAOS_K8_SCRIPT=${k8_script} does not exist.${COLOR_RESET}"
+            return 2
+        fi
+        # Same check-then-bind caveat as the QMP port above, same narrowing measure; the liveness
+        # gate below is what actually turns a lost race into a bounded retry.
+        type_port="${UNAOS_K8_PORT:-4801}"
+        while lsof -iTCP:"$type_port" -sTCP:LISTEN >/dev/null 2>&1; do type_port=$((type_port + 1)); done
+        SERIAL_ARGS=(-chardev "socket,id=k8u0,host=127.0.0.1,port=${type_port},server=on,wait=off,logfile=${logf}" \
+                     -serial chardev:k8u0 -serial null -display none)
+        echo -e "${COLOR_CYAN}⚡ TYPED MODE armed — UART0 is a bidirectional socket on 127.0.0.1:${type_port}"
+        echo -e "  script: ${k8_script}    extra spec: ${k8_spec}${COLOR_RESET}"
+    else
+        SERIAL_ARGS=(-serial "file:${logf}" -serial null -display none)
+    fi
     # FLAKE-1 liveness gate: within UNAOS_K8T_LIVE_SECS (default 5) of launch, the QEMU pid must be
     # ALIVE and $logf must exist and be GROWING PAST 0 BYTES. A QEMU that lost the QMP bind (or died
     # on a bad arg) fails both within milliseconds. 2 retries, each on the next port up.
@@ -3349,11 +3397,20 @@ test_kernel8() {
         qemu-system-aarch64 \
             -machine raspi4b \
             -kernel "$KERNEL8_DIR/kernel8.img" \
-            -serial "file:${logf}" -serial null -display none \
+            "${SERIAL_ARGS[@]}" \
             ${SD_DRIVE} \
             -qmp tcp:127.0.0.1:${qmp_port},server,nowait \
             ${UNAOS_QEMU_EXTRA:-} &
         qpid=$!
+        # SUITETYPE: attach the typist IMMEDIATELY, before the liveness poll. A socket chardev
+        # whose peer never reads backs up, and the guest's console writes then block or drop —
+        # which would corrupt the very capture we are about to assert. k8_type retries the
+        # connect, so starting it ahead of QEMU's bind is fine and starting it late is not.
+        if [ -n "$k8_script" ]; then
+            python3 "${WORKSPACE_DIR}/scripts/k8_type.py" --port "$type_port" \
+                --script "$k8_script" --budget "$secs" &
+            tpid=$!
+        fi
         # Poll at 10 Hz so a healthy launch costs a fraction of a second, not the whole window.
         local ticks=$((live_secs * 10)) t=0
         while [ "$t" -lt "$ticks" ]; do
@@ -3365,7 +3422,15 @@ test_kernel8() {
         if [ "$launched" -eq 1 ]; then break; fi
         kill "$qpid" 2>/dev/null || true                       # reap the remnant before retrying
         wait "$qpid" 2>/dev/null || true
+        if [ -n "$tpid" ]; then kill "$tpid" 2>/dev/null || true; wait "$tpid" 2>/dev/null || true; tpid=""; fi
         if [ "$attempt" -lt "$max_tries" ]; then
+            # SUITETYPE: the typist's port moves with the retry for the same reason the QMP port does.
+            if [ -n "$k8_script" ]; then
+                type_port=$((type_port + 1))
+                while lsof -iTCP:"$type_port" -sTCP:LISTEN >/dev/null 2>&1; do type_port=$((type_port + 1)); done
+                SERIAL_ARGS=(-chardev "socket,id=k8u0,host=127.0.0.1,port=${type_port},server=on,wait=off,logfile=${logf}" \
+                             -serial chardev:k8u0 -serial null -display none)
+            fi
             echo -e "${COLOR_YELLOW}⚠ kernel8-test: QEMU launch flake (port ${qmp_port}) — retrying on $((qmp_port + 1))${COLOR_RESET}"
             qmp_port=$((qmp_port + 1))
             while lsof -iTCP:"$qmp_port" -sTCP:LISTEN >/dev/null 2>&1; do qmp_port=$((qmp_port + 1)); done
@@ -3378,11 +3443,13 @@ test_kernel8() {
         echo -e "  This run carries NO verdict: not a pass, not a regression, not a truncation. Exit 4."
         echo -e "  Usual cause is a lost QMP-port race against a concurrent worktree gate, or a bad"
         echo -e "  UNAOS_QEMU_EXTRA. Re-run when the host is quieter, or pin UNAOS_QMP_PORT to a free port.${COLOR_RESET}"
+        if [ -n "$tpid" ]; then kill "$tpid" 2>/dev/null || true; wait "$tpid" 2>/dev/null || true; fi
         return 4
     fi
     python3 "${WORKSPACE_DIR}/scripts/qmp_shoot.py" --port "$qmp_port" --wait "$((secs - 1))" --out "$png" 2>/dev/null || sleep "$secs"
     kill "$qpid" 2>/dev/null || true
     wait "$qpid" 2>/dev/null || true
+    if [ -n "$tpid" ]; then kill "$tpid" 2>/dev/null || true; wait "$tpid" 2>/dev/null || true; tpid=""; fi
     echo -e "${COLOR_GREEN}✅ Serial:${COLOR_RESET} ${logf}    ${COLOR_GREEN}Screen:${COLOR_RESET} ${png}"
 
     # MBENCH-HONEST: ASSERT the capture we just took, and make this command's EXIT STATUS say so.
@@ -3419,6 +3486,28 @@ test_kernel8() {
             echo -e "${COLOR_YELLOW}  The needed window scales with HOST LOAD: concurrent builds/QEMU gates slow the boot, so a"
             echo -e "  window that passed on a quiet host truncates on a busy one (bench precedent 2026-07-28: 150 s"
             echo -e "  TRUNCATED under load, 210 s clean). Try './arroyo kernel8-test 210', or re-run when quieter.${COLOR_RESET}"
+        fi
+        # SUITETYPE: the typed battery, asserted SECOND and ONLY when the knob is armed.
+        # Ordering is the honesty argument: the base spec owns the COMPLETE markers, so it is the
+        # one that can say TRUNCATED. A typed run whose boot never reached steady state has no
+        # business reporting "the bare name did not launch" — the typist had nothing to type at.
+        # So a non-PASS base verdict short-circuits and is returned unchanged; the typed spec is
+        # only ever consulted on a capture the base spec already called complete and clean.
+        if [ -n "$k8_script" ] && [ "$mrc" -eq 0 ]; then
+            if [ ! -f "$k8_spec" ]; then
+                echo -e "${COLOR_RED}✖ kernel8-test: typed mode armed but ${k8_spec} is missing — nothing gates the typing.${COLOR_RESET}"
+                return 2
+            fi
+            echo -e "${COLOR_CYAN}⚡ mbench: asserting the TYPED battery against ${k8_spec#${WORKSPACE_DIR}/}${COLOR_RESET}"
+            python3 "${WORKSPACE_DIR}/scripts/mbench.py" --replay "$logf" \
+                --spec "$k8_spec" --platform pi || mrc=$?
+            if [ "$mrc" -ne 0 ]; then
+                echo -e "${COLOR_RED}✖ kernel8-test: the base spec PASSED and the TYPED battery did not."
+                echo -e "  The boot is fine; what failed is an interactive path — or the typing itself never"
+                echo -e "  landed. Check the '→ k8_type: typing' lines above: no typing means the socket peer"
+                echo -e "  never attached (a harness fault), typing with no witness means a real regression"
+                echo -e "  in the path that word takes. Script: ${k8_script}${COLOR_RESET}"
+            fi
         fi
         return $mrc
     fi
