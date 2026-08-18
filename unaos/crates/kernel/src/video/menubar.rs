@@ -50,7 +50,6 @@
 //! | clock, right | [`crate::clock::try_unix_now`], UTC `HH:MM` | [`theme::TITLE_TEXT_INACTIVE`] |
 //!
 //! **The bar's one press target is the CRYSTAL.** This module still registers nothing with the click
-<<<<<<< HEAD
 //! router itself; the SHARD menu ([`super::crystal`]) claims the crystal box through the ONE shared
 //! furniture router [`strip::press_route`], which both arch routers call ahead of every window arm.
 //! Every other point on the bar falls through to whatever is behind it. The witness line says so
@@ -67,15 +66,6 @@
 //! generalised to tenant #2, and on aarch64 it is not a belt: `wm::occ_clip` is `x86_64`-only, so a
 //! window blit crossing the top strip is NOT withheld there and the bar's pixels are destroyed with
 //! nothing in its own damage test able to notice. `clob=` on the ledger line is the falsifier.
-=======
-//! router itself; the SHARD menu ([`super::crystal`]) claims the crystal box through the router's
-//! menu-band arm, and every other point on the bar falls through to whatever is behind it. The
-//! witness line says so (`press=crystal`) — it read `press=inert` from the arc when the bar had no
-//! press seam at all, and that stale word survived into GR27, where it was read as "press routing
-//! latched off" during an investigation whose real defect was elsewhere. A witness term must track
-//! the code it describes. Opening APP menus is still the protocol arc's job; the design ledger at
-//! the foot of this file is what it will be built from.
->>>>>>> origin/UnaOS-gemini
 //!
 //! # The crystal — UnaOS's mark, where macOS puts its apple
 //!
@@ -511,14 +501,9 @@ pub fn compose() -> bool {
         None => 0,
     };
     LEDGER.pass(crate::arch::now_cycles().saturating_sub(t0));
-<<<<<<< HEAD
     LEDGER.tick("menubar", format_args!("press=crystal crystal={}x{} clob={} toggles={} off_passes={}",
         CRYSTAL_W, CRYSTAL_H, CLOBBERS.load(Ordering::Relaxed),
         TOGGLES.load(Ordering::Relaxed), OFF_PASSES.load(Ordering::Relaxed)));
-=======
-    LEDGER.tick("menubar", format_args!("press=crystal crystal={}x{} toggles={} off_passes={}",
-        CRYSTAL_W, CRYSTAL_H, TOGGLES.load(Ordering::Relaxed), OFF_PASSES.load(Ordering::Relaxed)));
->>>>>>> origin/UnaOS-gemini
 
     // The damage conditions, in the order the dock states them: a signature that MATCHES and a pass
     // that did not touch the strip is the common case and returns here having read no pixel.
@@ -696,11 +681,7 @@ pub fn rollup(scope: &str) {
         "menubar",
         scope,
         format_args!(
-<<<<<<< HEAD
             "press=crystal crystal={}x{} clob={} toggles={} off_passes={}",
-=======
-            "press=crystal crystal={}x{} toggles={} off_passes={}",
->>>>>>> origin/UnaOS-gemini
             CRYSTAL_W,
             CRYSTAL_H,
             CLOBBERS.load(Ordering::Relaxed),

@@ -12134,7 +12134,6 @@ load MIGRATES to the USB-pump service lane (`pace_service`'s caller), bounded at
   composite (also keeping the proxy from spanning an idle gap after a storm's final,
   drain-carried frame and reporting a false spike).
 
-<<<<<<< HEAD
 ## PI-DESK — the desktop furniture crosses to the Pi panel (aarch64 `pidesk`, 2026-08-12)
 
 The code named this arc before it was scheduled. `video/theme.rs`'s header called full chrome
@@ -13674,7 +13673,6 @@ discriminator; this shows it is neither.
   forbidden hit before this change, every one of them excluded on the field.
 
 ---
-=======
 ### WPACE-TEXT — the present-boundary shadow (GR27 round 2)
 
 **The defect (metal, GR27 round 2): text inside vug windows flickers under the pacer; the crystal
@@ -13764,4 +13762,3 @@ falsifier is WC-G's own classifier: the MAJOR-1 note above established that a pu
 bytes of a declared-finished frame, so RACE-PRESENT verdicts on paced vug windows should disappear
 from the capture, and the HUD digits should hold steady on glass. Either lying on the next metal
 boot falsifies the design, not the instrument.
->>>>>>> origin/UnaOS-gemini

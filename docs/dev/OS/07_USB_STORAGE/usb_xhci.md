@@ -6992,7 +6992,6 @@ existing `bt_l3_await`, whose `armed` threading is what preserves the invariant 
 
 ---
 
-<<<<<<< HEAD
 ## 27. BOT-PARK — the retry ladder had no floor a slot id could not walk around (2026-08-17)
 
 ### The capture
@@ -7098,7 +7097,6 @@ be permanently vacuous. Two things exist instead:
 The park verdict itself (`:: BOT: PARKED … why=cycles ::` on a real wedge, and the core coming back
 to the desktop) is metal-owed: reproducing it needs the wedging reader from the `pi0-b1b2` sitting,
 which is the only known instance of the fault.
-=======
 ## 27. BT-SSP — Secure Simple Pairing: the link becomes a bond (`UNAOS_BTC=1`, 2026-08-12)
 
 §24's L2CAP attempt named its own successor: a speaker that answers `CONNECTION_RESPONSE` with
@@ -7193,7 +7191,6 @@ invariant broke.** The stage adds no `bt_arm_read` call site; every read rides `
 What C3 (audio) still needs is not more security: AVDTP `SET_CONFIGURATION`/`OPEN`/`START` on the
 SEP §24 discovers, an SBC encoder, and the ACL data path at streaming rate — plus, eventually, the
 deferred-write path that turns this session bond into a persistent one.
->>>>>>> origin/UnaOS-gemini
 
 ---
 

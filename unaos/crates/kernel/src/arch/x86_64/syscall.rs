@@ -6539,13 +6539,6 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
     if mask & !prev != 0 || repress {
         // PRESS edge (or a recovered stationary re-press — see CLICK-REPRESS above).
         CLICK_PRESSES.fetch_add(1, Ordering::Relaxed);
-<<<<<<< HEAD
-        // FURNITURE — **the crystal menu, then the dock, both ahead of EVERY window arm**, because
-        // both are composited on top of the window layer and the painter that owns the pixel owns the
-        // press. `wm::hit_test` knows nothing of either strip: it answers from the window table, and a
-        // window lying under the dock would take a press the operator can see landed on a dock tile.
-        // Asking furniture first is the chrome arm's own ordering rule, one layer up.
-=======
         // CRYSTAL — **judged FIRST, ahead of the dock and every window arm.** The SHARD menu, when
         // open, is a modal dropdown composited on top of everything, so its press must be tested
         // before any layer beneath it; when closed, the only point it claims is the crystal box in
@@ -6563,7 +6556,6 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
             return true;
         }
         // DOCK — **judged before EVERY window arm, because the dock is composited on top of them.**
->>>>>>> origin/UnaOS-gemini
         //
         // Neither side can be starved. The crystal declines every point but the open dropdown and the
         // crystal box in the bar (which the bar owns anyway); the dock declines every point outside
@@ -6581,20 +6573,18 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
         // gate able to see it (the symptom of a stale order is a press landing on the wrong layer).
         //
         // **Nothing about this arch's behaviour changed**: same two surfaces, same order, same
-        // consume-and-drop, one call instead of two. What stays here is genuinely per-arch — the edge
+        // consume-and-drop. (GR27's CLICK-BAND witness re-split the two arms ON THIS ARCH so each
+        // consumed press names its band on the wire; the shared ordering law itself lives on in
+        // strip::press_route, which the aarch64 router calls.) What stays here is genuinely per-arch — the edge
         // detection above, the press-target latch, and this file's input rings. (Line-NEUTRAL by
         // construction; see the aarch64 twin for why that matters to the Pi's identity proof.)
         // Consumed with the target set to DROP so the matching RELEASE is dropped rather than
         // delivered into whatever holds focus after the raise — the rule the close and chrome arms
         // below already follow for the same reason.
         #[cfg(feature = "wc")]
-<<<<<<< HEAD
-        if crate::video::strip::press_route(x, y) {
-=======
         if crate::video::dock::press_at(x, y) {
             // CLICK-BAND — as the menu arm above: band + outcome, bounded.
             clickband_witness(x, y, "dock", crate::video::dock::last_press_outcome());
->>>>>>> origin/UnaOS-gemini
             CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
             return true;
         }

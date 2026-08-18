@@ -270,32 +270,22 @@ static DISMISSES: AtomicU64 = AtomicU64::new(0);
 static PICKS: AtomicU64 = AtomicU64::new(0);
 static LAST_VERB: AtomicU8 = AtomicU8::new(0xFF);
 
-<<<<<<< HEAD
 /// CLICK-BAND — **what the LAST consumed press did.** [`press_at`] answers the router `true`, and a
 /// caller that could not say WHAT the menu did with the press could name the band and nothing else —
 /// which is exactly the reading gap PA41's "the crystal ignores clicks" round was built on. Written by
 /// every consuming arm of [`press_at`], read by [`last_press_outcome`] immediately after the call on
 /// the same task; no cross-core reader.
-=======
-/// CLICK-BAND — what the LAST consumed press did, for the router's `band=menu` witness line: the
-/// router sees only `true` from [`press_at`], and a band line that could not say WHAT the band did
-/// would name the band and nothing else. Written by every consuming arm of [`press_at`], read by
-/// [`last_press_outcome`] immediately after the call on the same task — no cross-core reader.
->>>>>>> origin/UnaOS-gemini
 static PRESS_OUTCOME: AtomicU8 = AtomicU8::new(0);
 const OUT_OPEN: u8 = 1;
 const OUT_PICK: u8 = 2;
 const OUT_KEPT: u8 = 3;
 const OUT_DISMISS: u8 = 4;
 
-<<<<<<< HEAD
 /// CLOBBER-REPAIR (PA41) — passes in which a window the compositor painted had intersected the rows
 /// the OPEN dropdown last painted. The bar's and the dock's counter, on the same terms; `clob=` on the
 /// `[crystal]` ledger line is the falsifier for "the menu survives a window blit crossing it".
 static CLOBBERS: AtomicU64 = AtomicU64::new(0);
 
-=======
->>>>>>> origin/UnaOS-gemini
 /// CLICK-BAND — the last consumed press's outcome, as the witness word.
 pub fn last_press_outcome() -> &'static str {
     match PRESS_OUTCOME.load(Ordering::Relaxed) {
@@ -307,7 +297,6 @@ pub fn last_press_outcome() -> &'static str {
     }
 }
 
-<<<<<<< HEAD
 /// MENU-DRIVE / CLOBBER-REPAIR — **does the dropdown owe a paint or an erase that only a composite can
 /// discharge?** Two relaxed loads, no lock.
 ///
@@ -322,8 +311,6 @@ pub fn paint_owed() -> bool {
     OPEN.load(Ordering::Relaxed) != (SLOT.packed() != 0)
 }
 
-=======
->>>>>>> origin/UnaOS-gemini
 // ---------------------------------------------------------------------------
 // Geometry — the dropdown rect, and the row layout inside it
 // ---------------------------------------------------------------------------
@@ -485,7 +472,6 @@ fn open(pw: usize, ph: usize) {
         ":: SHARD-MENU: crystal_press=open menu={}x{}+{}+{} items={} ::",
         mw, mh, mx, my, ITEM_COUNT
     );
-<<<<<<< HEAD
     // MENU-DRIVE (x86 trunk 122ed63e, ported; PA41 on the Pi) — **an open menu must DRIVE the pass
     // that paints it.** [`compose`] runs only from `strip::compose_all` at the tail of
     // `wm::composite_once`, and every OTHER state-changing gesture (a close, a drag, a zoom, a
@@ -505,26 +491,6 @@ fn open(pw: usize, ph: usize) {
     // retry runs iff the first pass did not land. On x86 this also closes the narrow window where the
     // pass was declined into a concurrent `COMP_GATE` holder that has since released.
     if paint_owed() {
-=======
-    // MENU-DRIVE (GR27 Boot B) — **an open menu must DRIVE the pass that paints it.** [`compose`]
-    // runs only from `wm::composite_once`'s strip tail, and every OTHER state-changing gesture
-    // (close, drag, zoom, minimise, a dock raise) runs a composite itself — this one did not. On the
-    // emptied late-boot desktop nothing else composites (the render lane blocks on its channel; the
-    // backdrop's timer flush carries no damage; `service_damage` returns with no damaged row), so
-    // the operator's crystal presses opened the menu IN STATE while the glass never changed: Boot B
-    // shows `crystal_press=open` at 300194 ms with no `[crystal]`/`[menubar]`/`[dock]` rollup for
-    // the following 30 s — zero passes, an invisible menu, "the crystal ignores clicks". Task
-    // context only (the click router and the fixtures), so the composite is taken directly.
-    super::wm::composite();
-    // BELT-AND-BRACES retry. The x86 gate may DECLINE this pass into a concurrent holder; the
-    // GUARANTEED painter is that holder, whose re-run loop and lost-wakeup gate now test
-    // [`paint_owed`] ([`super::wm::menu_paint_owed`]) alongside window damage and the erase queue —
-    // so a menu the holder held the gate through (a `[wc-d] verify` holds it over a second) is
-    // painted by the holder on release, not stranded. This immediate retry closes only the narrow
-    // window where the first pass declined but the holder has ALREADY released — cheaper than
-    // waiting for the holder's loop when no one is holding. The slot confirms the paint LANDED.
-    if SLOT.packed() == 0 {
->>>>>>> origin/UnaOS-gemini
         super::wm::composite();
     }
 }
@@ -539,7 +505,6 @@ fn dismiss(reason: &str) {
     }
     DISMISSES.fetch_add(1, Ordering::Relaxed);
     serial_println!(":: SHARD-MENU: crystal_press=dismiss reason={} ::", reason);
-<<<<<<< HEAD
     // MENU-DRIVE — the mirrored half of [`open`]'s rule. The erase ([`compose`]'s closed path, which
     // also hands the vacated rows back to their owners through [`repaint_vacated`]) runs only from a
     // composite, and on a static desktop no other pass is coming — an on-glass dropdown would outlive
@@ -547,19 +512,6 @@ fn dismiss(reason: &str) {
     // pass is one bounded walk.
     super::wm::composite();
     if paint_owed() {
-=======
-    // MENU-DRIVE — the mirrored half of [`open`]'s rule: the erase ([`compose`]'s closed path, which
-    // also hands the vacated rows back through [`repaint_vacated`]) runs only from a composite, and
-    // on a static desktop no other pass is coming — an on-glass dropdown would outlive its Escape.
-    // Every caller is task context (the click router, the Escape arm, `set_enabled(false)`, the
-    // fixtures); a dismiss of a menu that never painted erases nothing (the slot is clear) and the
-    // pass is one bounded walk.
-    super::wm::composite();
-    // BELT-AND-BRACES retry — the mirror of [`open`]: [`paint_owed`] reports `!OPEN && SLOT!=0` as
-    // an owed ERASE, so the gate holder discharges a declined dismiss too; this closes only the
-    // already-released window. The slot is non-zero exactly while an erase is owed.
-    if SLOT.packed() != 0 {
->>>>>>> origin/UnaOS-gemini
         super::wm::composite();
     }
 }
