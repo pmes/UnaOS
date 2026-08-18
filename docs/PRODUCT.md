@@ -8,21 +8,23 @@ Cell values: **yes** (verified on that platform) · **no** (verified absent) · 
 
 | Experience | x86 (rMBP) | Pi 4 | Notes / evidence |
 |---|---|---|---|
-| Boot to graphical desktop | ? | yes | Pi: PA38 metal session 2026-08-13 |
-| Crispy theme paints (chrome/materials) | ? | yes | Pi: chrome-truth glass probes 5/5 HIT; materials 5–9/255 amplitude |
+| Boot to graphical desktop | ? | yes | Pi: PA44 metal 2026-08-18 — desktop-clear 1920x1200 bg 0x2d2b55 HIT, DESKHOLD holds the mirror |
+| Crispy theme paints (chrome/materials) | ? | yes | Pi: PA44 metal chrome-truth 5/5 HIT with textured chrome (ceramic_pp=8, knurl_pp=9) |
+| AA font rendering (Noto Sans Mono) | ? | yes | x86 landed it first (fa193e6f, unverified this seat); Pi: PA44 metal faces noto20-aa (chrome) + noto16-aa (console) |
 | Paper texture on content surfaces | ? | no | only call site is x86-gated instgui; Pi has no kernel content surface yet |
 | App windows (create/present/composite) | ? | yes | Pi: 3 live windows @~100 comps/s on metal |
-| Window drag by title bar | ? | **no** | Pi arm never wired (drag_begin has 1 caller, x86); port in flight |
+| Window drag by title bar | ? | partial | Pi: DRAG-PI wired + coalesced (16ms, box damage), QEMU-verified — but PA42 boot5 metal drags REFUSED: DRAGWEDGE latch held by the stuck-BLIT_ACTIVE defect (open, baton pi-1 #6) |
 | Window close (app windows) | ? | yes | Pi: close grammar exercised on metal |
 | Close refusal on kernel furniture (no freeze) | ? | yes | drain-stall fix 49b3a5fe; wedge1 tripwire verified |
 | Dock (window switcher) | ? | yes | Pi: [dock] census on metal; press verdict awaits a bench click |
-| Menu bar visible live | no | no | ENABLED=false everywhere outside fixtures; port in flight |
-| Crystal (SHARD) menu reachable live | no | no | same gate as menu bar; About works in fixtures only |
-| Shell as typeable window | yes? | no | x86: trunk commits 3c182692/8564ae0d/ce5bf4d7 (unverified this seat); Pi port in flight |
-| Boot-log console window | yes? | no | x86: panel_console_window_open (unverified this seat); Pi port in flight |
+| Menu bar visible live | no | yes | Pi: PA44 metal menubar ENABLED + PAINTED owns_pixels=true; x86 row awaits its seat's verify |
+| Crystal (SHARD) menu reachable live | no | yes | Pi: PA42 boot5 press=crystal PASS (bar completes without mouse motion); PA44 crystal LIVE |
+| Shell as typeable window | yes? | yes | Pi: SHELLWIN landed; PA42 boot5 SHARD-PRESS full chain PASS on metal |
+| Boot-log console window | yes? | partial | Pi: console window exists + routed=true (PA44), but content is a frozen snapshot — live console (render core consumes console_service) still owed, M3 |
+| Pulse instrument window (dual-view) | ? | yes | Pi: PULSEWIN; PA42 boot5 window + View toggle verified on metal |
 | Mouse pointer (move/click) | ? | yes | Pi: MOUSE-1 + piusb24 on metal |
 | Cursor never vanishes | ? | yes | fix 2977899c; awaits next metal session to confirm |
-| Keyboard to shell | ? | yes | Pi: typematic + midden verbs on metal |
+| Keyboard to shell | ? | yes | Pi: typematic + midden verbs on metal; serial shell drive with a GUI window focused = SERIAL-FOCUS PASS, PA42 boot5 (storm bounded, GUI untouched) |
 | USB storage disk mint (incl. stuck-reader cure) | ? | partial | Pi: mint works after replug; hub-cycle rung refused port-shared once (ghost fix 7b87e045 unflown) |
 | Boots + runs from ONE card (no data card) | ? | yes | Pi: ONECARD witness + ELF1/EXEC1/K2/K3/K4 all off the internal card, no USB attached (QEMU raspi4b default) |
 | FAT read/write | ? | yes | Pi: midden write/rm/mv byte-exact on metal |
@@ -36,7 +38,7 @@ Cell values: **yes** (verified on that platform) · **no** (verified absent) · 
 | Multi-core scheduling (SMP) | ? | yes | Pi: 4 cores on metal |
 | EL0 process isolation + ACL persistence | ? | yes | Pi: K2 metal-confirmed 2026-07-11 |
 | Reboot-surviving filesystem (CoW, power-cut safe) | ? | yes | Pi: K8a/K8b metal-confirmed |
-| File manager (Quarry: volume tree + detailed list) | no | partial | `UNAOS_QUARRY=1`. Module type-checks on BOTH arches, but its data source is the VFS mount table, which `fs/vfs.rs` gates to aarch64 — x86 opens on an empty volume list until the x86 VFS adoption lands (vfs.md §12.4). Pi: opens and reads `/` at bench geometry in QEMU; declines at 640x480 by the CONSOLEWIN law; metal eyeball unflown. docs/dev/OS/05_USER_EXPERIENCE/quarry.md |
+| File manager (Quarry: volume tree + detailed list) | no | partial | `UNAOS_QUARRY=1`. x86 empty until VFS adoption (vfs.md §12.4). Pi: PA42 boot5 metal — opens 1152x720, 2 volumes, dock-pinned, FAT contents load; open defects: listing VERY slow (linear FAT walk), /fat listed twice, hover flashing, no launch verb (v2 headline), /usb rows absent. docs/dev/OS/05_USER_EXPERIENCE/quarry.md |
 | Scrolling (any list, anywhere) | no | partial | Quarry only, and app-owned: no wheel (the xHCI HID decoder drops the byte), no content offset in `wm`, no scrollbar widget, no rect-scoped blit. quarry.md §4 |
 
 x86 column is mostly **?** because this seat has never verified that bench; the x86 seat's
