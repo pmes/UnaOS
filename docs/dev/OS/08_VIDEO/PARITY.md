@@ -85,8 +85,10 @@ until someone proves a safe non-powergated vblank source.
 - The XUSB/tegra xHCI quirks (CRCR wall, JB-series), the GICv3 parameterization,
   the A78AE erratum heal, `sdmmc_tegra`: all (c), owned by this track.
 - RAST-TEGRA's spinning-cube demo (`rast` feature) is this seat's proven
-  pixels-on-panel path (30.303 fps metal) — the renderer above it is arch-neutral
-  (M3 statement is separate).
+  pixels-on-panel path (metal record: 90 frames / 91 ms unpaced on the 1920×1200
+  scanout; the oft-quoted 30.303 fps is RAST-PACE's pacing TARGET, its visible
+  metal sitting still staged — see `09_PLATFORM/orin-3d.md`). The renderer above
+  it is arch-neutral.
 
 ### §8.4 What this section does NOT claim
 
