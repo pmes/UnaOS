@@ -391,7 +391,7 @@ impl ChatBoxManager {
                             msg_lbl.set_selectable(true);
                         } else {
                             let mut truncated = String::with_capacity(550);
-                            if let Some(byte_idx) = gneiss_pal::types::calculate_truncation(&cont, 7, 500) {
+                            if let Some(byte_idx) = gneiss_pal::calculate_truncation(&cont, 7, 500) {
                                 truncated.push_str(&cont[..byte_idx]);
                                 truncated.push_str("\n...");
                             } else {

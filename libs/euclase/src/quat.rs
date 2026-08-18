@@ -203,21 +203,72 @@ impl Mul<Quat> for Quat {
 mod tests {
     use super::*;
 
+    const EPSILON: f32 = 1e-5;
+
+    fn assert_f32_eq(a: f32, b: f32) {
+        assert!((a - b).abs() < EPSILON, "{} != {}", a, b);
+    }
+
+    fn assert_quat_eq(q1: Quat, q2: Quat) {
+        assert_f32_eq(q1.x, q2.x);
+        assert_f32_eq(q1.y, q2.y);
+        assert_f32_eq(q1.z, q2.z);
+        assert_f32_eq(q1.w, q2.w);
+    }
+
     #[test]
     fn test_quat_identity() {
         let q = Quat::identity();
         assert_eq!(q.w, 1.0);
         assert_eq!(q.x, 0.0);
+        assert_eq!(q.y, 0.0);
+        assert_eq!(q.z, 0.0);
+    }
+
+    #[test]
+    fn test_quat_from_axis_angle() {
+        let q = Quat::from_axis_angle(Vec3::unit_x(), core::f32::consts::PI);
+        assert_f32_eq(q.w, 0.0);
+        assert_f32_eq(q.x, 1.0);
+        assert_f32_eq(q.y, 0.0);
+        assert_f32_eq(q.z, 0.0);
     }
 
     #[test]
     fn test_quat_mul() {
-        // Rotating 90 degrees around X, then 90 around Y.
         let q1 = Quat::from_axis_angle(Vec3::unit_x(), core::f32::consts::FRAC_PI_2);
         let q2 = Quat::from_axis_angle(Vec3::unit_y(), core::f32::consts::FRAC_PI_2);
-        let q3 = q2 * q1; // Apply q1 then q2
-        // We expect specific values.
-        // But mainly just checking it compiles and runs without panic for now.
-        let _ = q3.normalize();
+        let q3 = q2 * q1;
+        // FRAC_PI_2 half angle is PI/4 (0.707)
+        let s = core::f32::consts::FRAC_PI_4.sin();
+        let c = core::f32::consts::FRAC_PI_4.cos();
+        assert_f32_eq(q1.x, s);
+        assert_f32_eq(q1.w, c);
+        
+        // Ensure multiplication isn't commutative
+        let q4 = q1 * q2;
+        assert!((q3.x - q4.x).abs() > EPSILON || (q3.y - q4.y).abs() > EPSILON || (q3.z - q4.z).abs() > EPSILON);
+    }
+
+    #[test]
+    fn test_quat_normalize_and_dot() {
+        let q = Quat { x: 2.0, y: 0.0, z: 0.0, w: 0.0 };
+        assert_f32_eq(q.dot(q), 4.0);
+        let qn = q.normalize();
+        assert_f32_eq(qn.x, 1.0);
+        assert_f32_eq(qn.dot(qn), 1.0);
+    }
+    
+    #[test]
+    fn test_quat_slerp() {
+        let q1 = Quat::identity();
+        let q2 = Quat::from_axis_angle(Vec3::unit_x(), core::f32::consts::FRAC_PI_2);
+        
+        let q_mid = q1.slerp(q2, 0.5);
+        // Midpoint of 90 deg rotation is 45 deg rotation
+        assert_f32_eq(q_mid.w, core::f32::consts::FRAC_PI_8.cos());
+        assert_f32_eq(q_mid.x, core::f32::consts::FRAC_PI_8.sin());
+        assert_f32_eq(q_mid.y, 0.0);
+        assert_f32_eq(q_mid.z, 0.0);
     }
 }

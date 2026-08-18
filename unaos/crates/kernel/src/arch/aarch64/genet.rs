@@ -1920,7 +1920,8 @@ Connection: close\r\nServer: UnaOS/genet\r\n\r\n",
     // request re-mounts the volume through `fat::mount_source(BlockSource::Usb)` — the mount reads a
     // handful of sectors straight through the xHCI controller (independent of the SD backend that owns
     // the global block device), so no state is cached between requests and a hot-swapped stick is picked
-    // up on the next GET. Strictly read-only: `BlockSource::Usb` refuses every write at the sector layer.
+    // up on the next GET. This ROUTE is read-only (it serves GETs and issues no write), but USBFALL F3:
+    // `BlockSource::Usb` itself has been writable since USB-WRITE — the sector layer no longer refuses it.
     // A file beyond the same 64 KiB `fs_cap()` NET-15 uses is refused 413 rather than read into RAM.
 
     /// PI-FS-4: format a FAT last-write timestamp (decoded from the on-disk date/time words per the FAT

@@ -251,7 +251,21 @@ and the rx ring is drained (end-of-stream). Nothing blocks.
 `type = SOCK_DGRAM(2)` → UDP (unchanged). `connect`'s peer address is the same 8-byte header shape SENDTO
 uses (`[ip[4]][port u16 LE][pad]`); send/recv carry **no** per-call address (a stream is connected). A UDP
 handle routed to a stream syscall (or vice versa) is rejected on the `SockKind` tag as `-EACCES` **before**
-smoltcp's typed accessor can panic. Next free syscall number: **26**.
+smoltcp's typed accessor can panic. Next free syscall number: **49**.
+
+> **SOCKNUM (WINX-1, 2026-07-29) — the family moved from 19–27 to 40–48.** The numbers quoted throughout
+> this document are the CURRENT ones. The socket verbs originally opened at 19 and grew to 27, which
+> silently violated the **cross-arch shared-number law**: a syscall number names the same verb on every
+> arch (the ABI is Linux-style and shared; ring-3 code above the per-arch asm stubs is arch-neutral Rust
+> that names verbs by number). aarch64 had already spent that range — 19 `MSEND`, 20 `MRECV`,
+> 21 `THREAD_SPAWN`, 22 `THREAD_EXIT`, 23 `THREAD_JOIN`, 24 `FB_MAP`, 25 `FB_PRESENT`, 26 `FUTEX`,
+> 27 `INPUT_POLL`. Nothing caught it because the two families never had to coexist: x86 compiled no
+> window/thread verbs and aarch64 compiles no socket verbs. Bringing the WINDOW verbs up on x86 made the
+> collision load-bearing (`SYS_INPUT_POLL` and `SYS_ACCEPT` would both have had to be 27 in one
+> dispatch), so the x86-ONLY family — the arch alone in using these ids — moved to a free contiguous
+> block at 40–48 with its relative order preserved. 19–27 now mean on x86 exactly what they mean on
+> aarch64. Every caller was in-tree (the inline-asm fixtures), and the SOCK-2/3/4/6 + zeolite legs of
+> the headless suite are the completeness proof.
 
 ### The round-trip witnesses
 
@@ -276,7 +290,7 @@ runs on an AP; a stolen segment is handled by the same non-blocking poll/retry d
 
 SOCK-4 (scope B) makes a socket **capability movable to another process** — the socket analogue of the
 U7x/U8x console-cap transfer. Same `smolnet` feature (default-on), x86-only, byte-identical knob-off / aarch64. It
-adds **no new syscall** (next free number stays **26**): a socket rides the existing `SYS_XFER` (13) /
+adds **no new syscall** (next free number stays **49**): a socket rides the existing `SYS_XFER` (13) /
 `SYS_RECV` (14) transfer machinery, which already special-cased `KIND_SOCKET` — this arc makes that path
 actually *work* and proves it safe.
 
@@ -356,7 +370,7 @@ Before this arc, the persistent smoltcp interface was configured with a *static*
 `e1000::hw_addr()` — an address the **hand-rolled** `crates/net` DHCP client had obtained. SOCK-5 gives
 the smoltcp stack **its own** `dhcpv4::Socket`, so knob-on it acquires and applies its lease
 autonomously. Same `smolnet` feature (default-on), x86-only, byte-identical knob-off / aarch64. **No new
-syscall** (next free number stays **26**) and **no new ring-3 surface**: DHCP is a kernel-internal
+syscall** (next free number stays **49**) and **no new ring-3 surface**: DHCP is a kernel-internal
 interface-configuration function, not a capability ring 3 can invoke.
 
 ### The mechanism
@@ -765,8 +779,8 @@ alongside `sntp_x86_gate` (x86 + `witness` + `smolnet`). No new syscall.
 | Arc | Content |
 | :--- | :--- |
 | SOCK-1 | smoltcp dep + `Device` adapter + `ping`/`arp`/`netinfo` + ICMP witness, knob-gated |
-| SOCK-2 | the UDP socket syscall family (`sys_socket`/`bind`/`sendto`/`recvfrom`, #19–22) + persistent `SocketSet`, ring 3 reaches the network |
-| SOCK-3 | TCP client sockets (`sys_connect`/`sys_send`/`sys_sock_recv`, #23–25) + gen-fenced socket handles + chunked-lock TCP pump, ring 3 gets a byte stream |
+| SOCK-2 | the UDP socket syscall family (`sys_socket`/`bind`/`sendto`/`recvfrom`, #40–43 — see SOCKNUM; #19–22 as landed) + persistent `SocketSet`, ring 3 reaches the network |
+| SOCK-3 | TCP client sockets (`sys_connect`/`sys_send`/`sys_sock_recv`, #44–46 — see SOCKNUM; #23–25 as landed) + gen-fenced socket handles + chunked-lock TCP pump, ring 3 gets a byte stream |
 | SOCK-4 | transferable sockets — `sys_socket` mints `CAP_GRANT`, `sys_recv` migrates socket ownership, a socket cap moves cross-row (gen-fenced, single-owner); no new syscall |
 | SOCK-5 | DHCP via smoltcp — the persistent stack leases its own address with `dhcpv4::Socket`; no new syscall, no ring-3 surface, static fallback |
 | SOCK-6 | TCP server/listen sockets (`sys_listen`/`sys_accept`, #26–27) — ring 3 accepts inbound TCP; accept mints a fresh gen-fenced socket cap; net-inject `UNAOS_NET=socket` witness |

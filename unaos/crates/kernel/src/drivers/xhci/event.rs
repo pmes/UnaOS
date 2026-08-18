@@ -42,6 +42,10 @@ pub struct EventRing {
     pub trbs: [Trb; EVENT_RING_SIZE],
     pub dequeue_index: usize,
     pub cycle_bit: bool, // What we expect the hardware to write
+    /// PIUSB-43: total TRBs ever consumed from this ring (monotonic, wrap-proof — `dequeue_index`
+    /// alone is mod-256 and cannot distinguish "no events" from "exactly 256k events"). Read-only
+    /// telemetry for the enum-portsc witness; costs one integer increment per pop.
+    pub popped: u64,
 }
 
 unsafe impl Send for EventRing {}
@@ -53,6 +57,7 @@ impl EventRing {
             trbs: [Trb::new(); EVENT_RING_SIZE],
             dequeue_index: 0,
             cycle_bit: true, // xHCI starts writing 1s
+            popped: 0,
         }
     }
 
@@ -97,6 +102,7 @@ impl EventRing {
         let trb = unsafe { core::ptr::read_volatile(&self.trbs[self.dequeue_index]) };
 
         // Advance
+        self.popped = self.popped.wrapping_add(1); // PIUSB-43 consumed-count witness
         self.dequeue_index += 1;
         if self.dequeue_index >= EVENT_RING_SIZE {
             self.dequeue_index = 0;
@@ -113,9 +119,39 @@ impl EventRing {
         self.trbs.as_ptr() as u64
     }
 
+    /// BOT-RESCUE M2: return the event ring to its post-`new()` state — every TRB zeroed AND the
+    /// consumer position/colour reset to the xHCI initial expectation (index 0, expecting cycle 1).
+    ///
+    /// Two latent bugs fixed here. `write_bytes(ptr, 0, EVENT_RING_SIZE)` zeroed 256 **bytes**, not
+    /// 256 **TRBs** — 16 of the 256 slots, leaving 240 stale entries whose cycle bits still read as
+    /// the colour the consumer expects, so the next `has_event()` would report a fresh event that is
+    /// a replay of an old one. And it reset neither `dequeue_index` nor `cycle_bit`, so even a fully
+    /// zeroed ring would be consumed from the middle with the wrong expected colour.
+    ///
+    /// Currently UNCALLED: nothing in the driver clears the event ring after bring-up (the ring is
+    /// created once by `EventRing::new` and consumed for the life of the boot). It is fixed anyway
+    /// because a two-line "clear the ring" helper that silently corrupts the consumer handshake is
+    /// exactly the trap a future controller-reset path would step in, and it costs nothing to close.
+    /// The ERDP is NOT written here: the caller owns re-publishing the dequeue pointer to hardware
+    /// (`advance_erdp`), and a helper that touched MMIO would not be safe to call before the
+    /// interrupter exists.
     pub fn clear(&mut self) {
         unsafe {
-            core::ptr::write_bytes(self.trbs.as_mut_ptr(), 0, EVENT_RING_SIZE);
+            core::ptr::write_bytes(
+                self.trbs.as_mut_ptr() as *mut u8,
+                0,
+                EVENT_RING_SIZE * core::mem::size_of::<Trb>(),
+            );
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            // XHCI-COHERENCE: the controller DMA-writes this ring; push the zeros out to DRAM so a
+            // non-snooping master does not later fetch our dirty lines over its own events. No-op x86.
+            dma_coherency::clean(
+                self.trbs.as_ptr() as usize,
+                EVENT_RING_SIZE * core::mem::size_of::<Trb>(),
+            );
         }
+        self.dequeue_index = 0;
+        self.cycle_bit = true;
+        self.popped = 0;
     }
 }

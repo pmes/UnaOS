@@ -1,0 +1,17 @@
+[package]
+name = "aether-shell"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+
+[dependencies]
+aether = { path = "../../handlers/aether" }
+tokio = { version = "1", features = ["full"] }
+quartzite = { path = "../../libs/quartzite" }
+bandy = { path = "../../libs/bandy" }
+
+[features]
+default = []
+gtk = ["quartzite/gtk"]
+gnome = ["quartzite/gnome"]
+qt = ["quartzite/qt"]

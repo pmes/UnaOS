@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 The Architect & Una
+#
+# `una-abi` — THE syscall ABI. One crate, zero dependencies, no_std, no code: the syscall numbers,
+# the flag/sub-op encodings, the packed-event layout and the shared magic values that cross the
+# ring-0/ring-3 boundary, declared EXACTLY ONCE.
+#
+# Before this crate the table was declared in eight places (both kernel `arch/*/syscall.rs`, and
+# again, partially, in every `user-*` crate) and had already drifted — see the DIVERGENCE LEDGER in
+# src/lib.rs. It is a member of the kernel workspace AND a path dependency of each `user-*` crate
+# (which are their own workspace roots); a path dep across workspaces is fine, and it means both
+# sides of every syscall are compiled against the same literal.
+#
+# NO dependencies, ever, and nothing but `const`/`const fn` in it: it is linked into 4 KiB flat EL0
+# blobs whose page budget `arroyo kernel8` asserts, so it must contribute zero bytes of code.
+[package]
+name = "una-abi"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"

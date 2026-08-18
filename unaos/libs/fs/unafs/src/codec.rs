@@ -144,10 +144,19 @@ pub fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
 /// more than a block's worth of payload is corrupt by definition and fails
 /// before any allocation (see the module docs).
 pub fn deserialize_block<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
+    deserialize_block_prefix(bytes).map(|(value, _len)| value)
+}
+
+/// Like [`deserialize_block`], but also returns the number of bytes the decoded
+/// value consumed. The spilled-inode reader needs the consumed length to locate
+/// the indirect trailer that follows the inode's own bytes inside the same
+/// 4096 B block (an inline inode has only zero padding there — no trailer).
+pub fn deserialize_block_prefix<T: DeserializeOwned>(
+    bytes: &[u8],
+) -> Result<(T, usize), CodecError> {
     bincode::serde::decode_from_slice(
         bytes,
         bincode::config::legacy().with_limit::<BLOCK_RECORD_LIMIT>(),
     )
-    .map(|(value, _len)| value)
     .map_err(CodecError::Decode)
 }

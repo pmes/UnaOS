@@ -44,7 +44,7 @@ struct SdtHeader {
     creator_revision: u32,
 }
 
-const SDT_HEADER_LEN: usize = 36;
+pub(crate) const SDT_HEADER_LEN: usize = 36;
 /// MADT layout: SdtHeader (36) + Local APIC address (u32) + Flags (u32); entries follow at 44.
 const MADT_ENTRIES_OFFSET: usize = 44;
 
@@ -86,10 +86,86 @@ impl Topology {
 
 static TOPOLOGY: spin::Once<Topology> = spin::Once::new();
 
+/// Physical RSDP address as handed to `init`, or 0 when the bootloader found none. See `init`.
+static RSDP_ADDR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The RSDP address `init` was given (0 = no ACPI / discovery never ran).
+pub fn rsdp_addr() -> u64 {
+    RSDP_ADDR.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Decode the RSDP and return `(root SDT physical address, entry pointer size)` — 8 for an
+/// ACPI 2.0+ XSDT, 4 for an ACPI 1.0 RSDT. `None` when there is no RSDP or its signature is
+/// wrong. This is the same three-line decode `parse` / `dmar_report` / `pm_timer` each open
+/// with, factored out for the table consumers that arrived later.
+pub(crate) fn root_sdt(rsdp_addr: u64) -> Option<(u64, usize)> {
+    if rsdp_addr == 0 {
+        return None;
+    }
+    // SAFETY: the bootloader identity-maps all firmware tables (physical_memory_offset 0) and
+    // vouches that this address came from the UEFI configuration table. Unaligned read because
+    // the RSDP is byte-packed and firmware places it on no particular boundary.
+    let rsdp = unsafe { (rsdp_addr as *const Rsdp).read_unaligned() };
+    if &rsdp.signature != b"RSD PTR " {
+        return None;
+    }
+    if rsdp.revision >= 2 && rsdp.xsdt_addr != 0 {
+        Some((rsdp.xsdt_addr, 8))
+    } else {
+        Some((rsdp.rsdt_addr as u64, 4))
+    }
+}
+
+/// `length` field of any system description table at `addr`.
+///
+/// SAFETY: `addr` must point at a mapped ACPI table header.
+pub(crate) unsafe fn table_len(addr: u64) -> usize {
+    (addr as *const SdtHeader).read_unaligned().length as usize
+}
+
+/// Visit every table listed in the XSDT/RSDT, in firmware order, passing each table's physical
+/// address and 4-byte signature to `f`. Stops early when `f` returns `true`. Used both by
+/// `find_table` (first match by signature) and by the S5 scan, which needs *every* SSDT rather
+/// than just the first — vendors routinely park `_S5_` in a secondary table.
+///
+/// SAFETY: `sdt_addr` must be a mapped XSDT/RSDT and `entry_size` must match it (8 / 4).
+pub(crate) unsafe fn each_table(
+    sdt_addr: u64,
+    entry_size: usize,
+    mut f: impl FnMut(u64, &[u8; 4]) -> bool,
+) {
+    let length = table_len(sdt_addr);
+    let n = length.saturating_sub(SDT_HEADER_LEN) / entry_size;
+    let entries_base = sdt_addr + SDT_HEADER_LEN as u64;
+
+    for i in 0..n {
+        let slot = entries_base + (i * entry_size) as u64;
+        let table_addr: u64 = if entry_size == 8 {
+            (slot as *const u64).read_unaligned()
+        } else {
+            (slot as *const u32).read_unaligned() as u64
+        };
+        if table_addr == 0 {
+            continue;
+        }
+        let sig = (table_addr as *const SdtHeader).read_unaligned().signature;
+        if f(table_addr, &sig) {
+            return;
+        }
+    }
+}
+
 /// Parse the ACPI tables and record the CPU topology. `rsdp_addr` is the physical RSDP address
 /// the bootloader found in the UEFI config table (0 if none). Always succeeds: anything missing
 /// or malformed degrades gracefully to "this CPU only". Prints the discovered topology.
 pub fn init(rsdp_addr: u64) {
+    // Remember the RSDP for subsystems that need ACPI *after* early boot has forgotten the
+    // `boot_info` reference — the S5 soft-off path (`acpi_power`) runs from a keystroke handler
+    // deep in the video stack, where threading an `rsdp_addr` argument down from `kernel_main`
+    // would mean touching every frame in between. Written once here on the BSP before any other
+    // CPU or subsystem can observe it; read-only thereafter, so a relaxed atomic is sufficient
+    // (there is no other datum whose visibility is ordered against it).
+    RSDP_ADDR.store(rsdp_addr, core::sync::atomic::Ordering::Relaxed);
     let topo = TOPOLOGY.call_once(|| parse(rsdp_addr));
     serial_println!(
         "ACPI: {} CPU(s) discovered, local APIC @ {:#x}, apic ids {:?}",
@@ -169,26 +245,17 @@ pub fn find_acpi_table(sig: &[u8; 4]) -> Option<u64> {
 
 /// Walk the XSDT/RSDT entry list looking for a table with the given 4-byte signature.
 /// `entry_size` is 8 for an XSDT (64-bit pointers) or 4 for an RSDT (32-bit pointers).
-unsafe fn find_table(sdt_addr: u64, entry_size: usize, sig: &[u8; 4]) -> Option<u64> {
-    let hdr = (sdt_addr as *const SdtHeader).read_unaligned();
-    let length = hdr.length as usize;
-    let n = length.saturating_sub(SDT_HEADER_LEN) / entry_size;
-    let entries_base = sdt_addr + SDT_HEADER_LEN as u64;
-
-    for i in 0..n {
-        let slot = entries_base + (i * entry_size) as u64;
-        let table_addr: u64 = if entry_size == 8 {
-            (slot as *const u64).read_unaligned()
+pub(crate) unsafe fn find_table(sdt_addr: u64, entry_size: usize, sig: &[u8; 4]) -> Option<u64> {
+    let mut found = None;
+    each_table(sdt_addr, entry_size, |addr, s| {
+        if s == sig {
+            found = Some(addr);
+            true
         } else {
-            (slot as *const u32).read_unaligned() as u64
-        };
-        let th = (table_addr as *const SdtHeader).read_unaligned();
-        let th_sig = th.signature;
-        if &th_sig == sig {
-            return Some(table_addr);
+            false
         }
-    }
-    None
+    });
+    found
 }
 
 /// Parse the MADT (Multiple APIC Description Table) into a CPU topology by walking its

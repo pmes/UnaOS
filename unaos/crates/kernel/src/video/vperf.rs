@@ -108,7 +108,18 @@ fn raw_print(args: core::fmt::Arguments) {
     crate::arch::without_interrupts(|| {
         if let Some(mut guard) = crate::arch::serial::SERIAL1.try_lock() {
             if let Some(uart) = guard.as_mut() {
-                let _ = uart.write_fmt(args);
+                // CLOCK-2b: this leg bypasses `serial::_print` (see above) but writes the SAME UART
+                // byte-stream, so it must apply the same wrap — and, more sharply, must maintain the
+                // shared `logts::AT_LINE_START` flag. A vperf fragment written bare would leave the
+                // flag stale and misplace the prefix on the next `_print` line.
+                #[cfg(feature = "logts")]
+                {
+                    let _ = crate::logts::PrefixWriter { inner: uart }.write_fmt(args);
+                }
+                #[cfg(not(feature = "logts"))]
+                {
+                    let _ = uart.write_fmt(args);
+                }
             }
         }
         // The SAME leg 3 `serial::_print` uses (never legs 2/4 = fbcon/selftest) — metal visibility.

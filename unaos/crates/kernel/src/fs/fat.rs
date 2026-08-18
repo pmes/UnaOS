@@ -42,7 +42,8 @@
 
 use alloc::string::String;
 use core::sync::atomic::{AtomicBool, Ordering};
-#[cfg(target_arch = "aarch64")]
+// aarch64: the F2 M3 witness counter. x86 + `witness`: the roster tripwire's overlap tallies.
+#[cfg(any(target_arch = "aarch64", feature = "witness"))]
 use core::sync::atomic::AtomicU32;
 
 /// Logical sector size we support. This equals the USB block device's block size (512 on every
@@ -69,6 +70,18 @@ pub enum FatError {
     /// U10: no free space — the free-cluster search found no free cluster (volume full), or a directory has
     /// no free slot for a new entry (root-directory-chain extension is out of scope). Surfaces as `-ENOSPC`.
     NoSpace,
+    /// PARTITION (GR9): a derived LBA fell outside THIS volume's own extent (`part_lba .. part_lba +
+    /// vol_sectors`). Distinct from [`FatError::Io`] on purpose: `Io` means the medium refused a legal
+    /// access, this means the filesystem asked for a sector that is not its to touch — a bug or a corrupt
+    /// on-disk field, caught before it reached the medium. Never returned on a healthy volume, because
+    /// [`parse_bpb`] rejects at mount time any BPB whose total-sector claim exceeds its partition.
+    OutOfVolume,
+    /// WEDGE-8 (F3): the storage driver is busy (the xHCI controller loan is held by another
+    /// context) and this call refused to wait for it — a masked span must NEVER block on a driver
+    /// lock (that wait is the F3 deadlock), and an unmasked one already waited its bounded budget.
+    /// The RMW wrappers ([`with_fat_lock_src`]/[`with_dir_lock_src`]) retry it OUTSIDE the masked
+    /// span; exhaustion surfaces as `-EAGAIN` — the caller may retry, nothing was mutated.
+    Busy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -511,6 +524,24 @@ pub struct FatFs {
     /// globally-registered device (SD on the Pi); `Usb` for a read-only mount of the USB stick read
     /// straight through the xHCI controller.
     source: BlockSource,
+    /// PARTITION (GR9): this volume's extent in sectors, measured from `part_lba`. It is the BPB's
+    /// own `tot_sec`, and at mount time it was proven `<=` the containing partition's declared length
+    /// (see [`parse_bpb`]), so `part_lba .. part_lba + vol_sectors` is a sub-range of the partition.
+    /// Every sector access this file makes is checked against it by [`FatFs::in_extent`] — that check,
+    /// not the arithmetic, is what makes a FAT on partition 1 incapable of reaching partition 2.
+    vol_sectors: u64,
+    /// PARTITION (GR9): the MBR primary slot this volume was mounted from (1..=4), or 0 for a volume
+    /// that did not come from an MBR entry (a superfloppy at LBA 0, or a GPT partition). Carried for
+    /// the mount witness and `describe()` only; nothing keys behaviour off it.
+    part_slot: u8,
+    /// PARTITION (GR9): the containing partition as the block layer describes it, when this volume
+    /// was found through a partition entry (`None` for a superfloppy — there is no container). It is
+    /// consulted by [`FatFs::in_extent`] as a SECOND, independent bound: `vol_sectors` is what the
+    /// volume's own BPB claims, this is what the partition table claims, and the two are written by
+    /// different tools at different times. Agreeing at mount time (`parse_bpb` refuses a BPB larger
+    /// than its partition) does not make one redundant at access time — a derived address is checked
+    /// against both, so a wrong `vol_sectors` cannot by itself let an access leave the partition.
+    range: Option<crate::drivers::block::PartitionRange>,
 }
 
 // ---- little-endian field readers ------------------------------------------------------------
@@ -537,12 +568,144 @@ fn u64le(b: &[u8], off: usize) -> u64 {
 /// (`crate::drivers::block::read_block` — the microSD on the Pi, the USB stick on x86/QEMU); `Usb` reads the
 /// USB mass-storage stick DIRECTLY through the xHCI controller (`read_block_usb`), independent of the block
 /// layer's backend selector — so on the Pi (where the SD backend owns the global device) the USB stick can be
-/// mounted read-only alongside the SD-hosted unafs volume. A `Usb`-sourced mount is STRICTLY read-only: the
-/// write path (`write_sector`) refuses the `Usb` source, so no FAT/dir/data write can ever reach the stick.
+/// mounted alongside the SD-hosted unafs volume.
+///
+/// USBFALL F3 (was PIUSB-27): a `Usb`-sourced mount is NO LONGER read-only — USB-WRITE routed `write_sector`'s
+/// `Usb` arm to the verified BOT WRITE(10) path (`drivers::block::write_block_usb`), so FAT, directory and data
+/// writes DO reach the stick. Two consequences the rest of this file now states explicitly rather than assuming
+/// away: the per-source lock-span cost documented on [`with_fat_lock`] (a `Usb` RMW is held under masked IRQs
+/// for up to the BOT deadline, not for a polled sector transfer), and USBFALL F1 in `drivers::block`, which
+/// stops a missing SD backend from silently redirecting `Default` writes onto this same stick.
+///
+/// SDHC-4b: `Sdhc` reads the card in the machine's INTERNAL SD slot directly through the SDHCI driver
+/// (`drivers::block::read_block_sdhc`), independent of the backend selector — so on x86 the internal card
+/// can be mounted alongside the USB stick that IS the boot volume, without either of them moving.
+/// **It is READ-ONLY, unconditionally, in this arc**: [`write_sector`] and [`write_sectors`] refuse it with
+/// a one-shot witness. That is the same blanket refusal PIUSB-27 shipped for `Usb`, and it is here for the
+/// reason set out at length in `flight_recorder.rs` §SINGLE FAT WRITER — [`with_fat_lock`] / [`with_dir_lock`]
+/// are INERT on x86, so a second FAT/directory MUTATOR on this target is a proven corruption generator
+/// (A/B-measured cross-linked chains and stolen delete-witness snapshots), and adding a second mountable
+/// volume must not quietly recreate it. As a READER a `Sdhc` mount cannot interact with anything: it is a
+/// separate by-value `FatFs` sharing no state with the boot volume's mount, and the one cross-volume global
+/// in this file (`ALLOC_HINT`) is read only by the cluster ALLOCATOR, which a read-only mount never enters.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BlockSource {
     Default,
     Usb,
+    /// SDHC-4b (x86, `sdhcblk` knob): the internal SD card, READ-ONLY. See the note above.
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    Sdhc,
+}
+
+impl BlockSource {
+    /// FATVERB: this handle's name, spelled exactly as [`crate::drivers::block::SourceCensus`]
+    /// spells it — so a refusal that prints both reads as one sentence
+    /// ("source=sdhc ... handles=global=absent sdhc=present") instead of in two vocabularies.
+    pub fn name(&self) -> &'static str {
+        match self {
+            BlockSource::Default => "global",
+            BlockSource::Usb => "usb",
+            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+            BlockSource::Sdhc => "sdhc",
+        }
+    }
+
+    /// FATVERB: may an ORDINARY FILE MUTATION (create / write / delete / mkdir) reach a volume
+    /// mounted through this source? `None` = yes. `Some(reason)` = no, and the reason names the
+    /// mechanism that says no.
+    ///
+    /// **On the source, not on the volume, and there is exactly one of these.** It answers a
+    /// question about the HANDLE, not about any particular BPB, so a `FatFs` and a
+    /// [`crate::fs::vfs::FatBackend`] mounted through the same handle cannot disagree about whether
+    /// it is writable — which they could, and did, when `FatBackend::read_only` carried its own copy
+    /// of the `Default` arm. [`FatFs::write_veto`] and `FatBackend::read_only` are both forwards to
+    /// this function now.
+    ///
+    /// Why it exists: LAUNCH-AR pointed the exec legs at [`mount_program_source`], and FATVERB
+    /// pointed the shell's twenty-five file verbs at the same call, because a shell where `ls` and
+    /// `vug` disagree about which volume is the volume is not a shell. On a machine booted from the
+    /// internal SD reader that call binds [`BlockSource::Sdhc`], which is READ-ONLY outside the
+    /// reserved flight-recorder extent. Without a gate, `rm FOO` there would walk a real directory
+    /// mutation down to [`write_sector`], collect [`FatError::Unsupported`] from SDHC-4c's permit,
+    /// and surface as a per-sector I/O error on a volume that was never writable — and a multi-step
+    /// verb (`write`'s delete-then-recreate, `mv`) would get PART-WAY. This is the layer that can
+    /// say no in advance, before a half-finished mutation exists to be rolled back.
+    ///
+    /// **A prediction of the block layer's answer, not a second copy of it.** The `Default` arm
+    /// asks [`crate::drivers::block::default_writable`] — the same predicate `write_block` itself
+    /// enforces — so it cannot drift from it. The `Sdhc` arm is NOT a forward: it states SDHC-4c's
+    /// standing answer for a span OUTSIDE the reserved extent, which is every span a file verb can
+    /// name (the reserved file is staged by the host; the kernel never creates, grows or deletes
+    /// it). The `Usb` arm defers to nothing at all — it is a flat assertion that USB-WRITE F3's BOT
+    /// WRITE(10) path is verified and routed, and if that ever stops being true this arm is where
+    /// the lie will be, not in the block layer.
+    ///
+    /// Conservative in one direction only. A `Some` can cost a write the permit would in principle
+    /// have admitted (a file verb landing inside the reserved extent — unreachable, since reaching
+    /// it means mutating the FAT or a directory entry, which SDHC-4c counts as a finding). A `None`
+    /// cannot admit a write the block layer would refuse: `Default` defers, `Sdhc` never returns
+    /// `None`, and `Usb` has an unconditional write path.
+    pub fn write_veto(&self) -> Option<&'static str> {
+        match self {
+            // USBFALL F1 / FRGUARD: the global slot is refused in exactly one state — the boot
+            // volume positively found on the OTHER handle. `unknown` and `unproven` fail OPEN.
+            BlockSource::Default => {
+                if crate::drivers::block::default_writable() {
+                    None
+                } else {
+                    Some(DEFAULT_VETO)
+                }
+            }
+            // USB-WRITE (F3): the stick's BOT WRITE(10) path is verified and routed.
+            BlockSource::Usb => None,
+            // SDHC-4b/4c: the internal reader admits CMD24 only inside the reserved flight-recorder
+            // extent, which no file verb can name. See [`crate::fs::sdhc4c`].
+            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+            BlockSource::Sdhc => Some(
+                "the internal SD reader is mounted READ-ONLY \u{2014} only the reserved \
+                 flight-recorder extent admits a write (SDHC-4c), and no file verb can name it",
+            ),
+        }
+    }
+}
+
+// FATVERB: the `Default` refusal names the guard that ACTUALLY refuses on this target, because
+// there are two of them and they refuse for different reasons. Naming the wrong one in an operator-
+// facing line sends the reader to the wrong forensics: on the Pi the question is "is the SD backend
+// selected", on the rMBP it is "did the boot volume turn up on the other handle". A single blended
+// string would have been false on both.
+/// FRGUARD (x86 + `sdhcblk`): the boot volume was positively found on the other handle.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+const DEFAULT_VETO: &str = "the boot volume was found on another handle, so the block layer \
+                            refuses writes through the global slot (FRGUARD / USBFALL F1)";
+/// USBFALL F1 (aarch64 bare-metal): no SD backend is selected, so `write_block` fails closed
+/// rather than substituting the USB stick.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+const DEFAULT_VETO: &str = "the SD backend is not selected, so the block layer fails writes closed \
+                            rather than substituting the USB stick (USBFALL F1)";
+/// Targets with no canonical backend outside the global slot: `default_writable()` is a constant
+/// `true` there, so this arm is unreachable and the string is never printed. Present for totality.
+#[cfg(not(any(
+    all(target_arch = "x86_64", feature = "sdhcblk"),
+    all(target_arch = "aarch64", feature = "baremetal")
+)))]
+const DEFAULT_VETO: &str = "the block layer refuses writes through the global slot";
+
+/// SDHC-4c: the internal SD card's write decision, in ONE place — superseding SDHC-4b's
+/// `refuse_sdhc_write`, which returned `Unsupported` unconditionally from these same two call sites.
+///
+/// The seam is deliberately unchanged in shape: one function, both write entry points go through
+/// it, one-shot witness, [`FatError::Unsupported`] on refusal (a refusal is policy, not a device
+/// fault). What changed is the answer — it is now "yes IF the span lies inside the reserved
+/// extent", which is a STRICTER statement than 4b's blanket no was a loose one: 4b refused at the
+/// FAT layer and left `PartitionRange::write_block` as an unbounded route to the card, while this
+/// bound is checked in absolute LBAs at the point the CMD24 is about to be issued.
+///
+/// See [`crate::fs::sdhc4c`] for the writable set and why it is closed.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+#[inline]
+fn permit_sdhc_write(site: &str, lba: u64, count: u64) -> Result<(), FatError> {
+    crate::fs::sdhc4c::permit_write(site, lba, count)
 }
 
 /// Read one 512-byte sector at absolute `lba` into `buf` from `source`. Treats a short copy as I/O error, so
@@ -551,9 +714,15 @@ fn read_sector(source: BlockSource, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> Re
     let r = match source {
         BlockSource::Default => crate::drivers::block::read_block(lba, buf),
         BlockSource::Usb => crate::drivers::block::read_block_usb(lba, buf),
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        BlockSource::Sdhc => crate::drivers::block::read_block_sdhc(lba, buf),
     };
     match r {
         Ok(n) if n >= SECTOR_SIZE => Ok(()),
+        // WEDGE-8 (F3): Busy is not an I/O failure — the controller is loaned out and this context
+        // refused (masked) or exhausted (unmasked) its wait. Kept distinct so the RMW wrappers can
+        // retry outside the masked span and user mode sees `-EAGAIN`, never a false `-EIO`.
+        Err(crate::drivers::block::BlockError::Busy) => Err(FatError::Busy),
         _ => Err(FatError::Io),
     }
 }
@@ -565,11 +734,134 @@ fn read_sector(source: BlockSource, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> Re
 /// BOT WRITE(10) path (`write_block_usb`, MISSION-gated with an RMW+restore witness); any source
 /// without a verified write path would still be refused here.
 fn write_sector(source: BlockSource, lba: u64, buf: &[u8; SECTOR_SIZE]) -> Result<(), FatError> {
+    // SDHC-4c: the internal SD card admits a write ONLY inside the reserved extent. Checked BEFORE
+    // the block call, so a refused write issues no CMD24 and takes no card lock, however the volume
+    // was mounted. Unarmed (the default, and every failure of the reserve pass) => refuses exactly
+    // as SDHC-4b did.
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    if source == BlockSource::Sdhc {
+        permit_sdhc_write("write_sector", lba, 1)?;
+    }
     let r = match source {
         BlockSource::Default => crate::drivers::block::write_block(lba, buf),
         BlockSource::Usb => crate::drivers::block::write_block_usb(lba, buf),
+        // Reachable ONLY with the permit armed and this exact LBA inside the reserved extent — the
+        // guard above returned otherwise.
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        BlockSource::Sdhc => crate::drivers::block::write_block_sdhc(lba, buf),
     };
-    r.map_err(|_| FatError::Io)
+    r.map_err(|e| match e {
+        // WEDGE-8 (F3): see `read_sector` — Busy stays Busy so it can be retried, not mourned.
+        crate::drivers::block::BlockError::Busy => FatError::Busy,
+        _ => FatError::Io,
+    })
+}
+
+// ===================== MULTIBLK (2026-07-29) — counted sector runs =====================
+//
+// Every writer below this point used to be a per-sector read-modify-write loop, and
+// usb_xhci.md §12.1 priced exactly what that costs on real hardware: one flight-recorder
+// reservation is ~730 BOT transactions and ~1460 awaited USB completion events, because the driver
+// could move 512 bytes per round trip and this file dutifully asked it to, one sector at a time.
+// That amplification (mechanism M1) is not itself the wedge — mechanism M2, a LOST completion event,
+// is, and it remains unexplained. What M1 does is multiply M2's per-transaction hazard by a thousand
+// until it is certain to be hit. Cutting the transaction count is therefore the structural repair
+// available to us while M2's cause is still open, and it shrinks the exposure proportionally.
+//
+// Two independent wins, and it is worth keeping them separate because they compound:
+//   1. CONTIGUITY — sectors inside one cluster are always consecutive on disk, and consecutive
+//      clusters are consecutive LBAs, so a run can be handed to the block layer as ONE counted
+//      transfer instead of N.
+//   2. NO READ ON A FULL-SECTOR OVERWRITE — the old loop read every sector before writing it, even
+//      when the caller's data covered the whole sector. That read exists only to preserve the bytes
+//      OUTSIDE the written range, so it is needed only for a partial head or tail sector. Dropping
+//      it on the interior is a further 2x on every data write.
+//
+// The seam is deliberately narrow: `read_sector` / `write_sector` above are untouched and still
+// serve every partial-sector RMW, every FAT-entry mutation and every directory-slot mutation, so
+// those paths keep the exact shape they were audited in. Only whole-sector RUNS come through here.
+
+/// MULTIBLK: where the next `alloc_cluster` free search STARTS. This is the in-memory equivalent of
+/// FAT32's FSInfo `FSI_Nxt_Free` field, and it exists for the reason every real driver keeps one:
+/// restarting the scan at cluster 2 for every allocation makes allocating a run of clusters
+/// quadratic in FAT sector reads, and on a USB stick each of those reads is a full BOT transaction.
+/// It is advisory ONLY — `alloc_cluster` validates it into range, wraps back to cluster 2 when it
+/// reaches the end, and still claims under the F3-M1 compare-and-claim — so a stale value (including
+/// one left by a different volume, since this is a single global) can cost an extra wrap and can
+/// never cost correctness. Deliberately not persisted to FSInfo: writing that sector would be a new
+/// on-disk mutation on the destructive path, which this arc does not take.
+static ALLOC_HINT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(2);
+
+/// MULTIBLK: read a run of whole sectors starting at absolute `lba` into `buf`, chunked against the
+/// block layer's published `MAX_BLOCKS_PER_OP`. `buf.len()` must be a non-zero multiple of
+/// [`SECTOR_SIZE`]; anything else is a caller bug and returns `Io` rather than a partial result.
+fn read_sectors(source: BlockSource, lba: u64, buf: &mut [u8]) -> Result<(), FatError> {
+    if buf.is_empty() || buf.len() % SECTOR_SIZE != 0 {
+        return Err(FatError::Io);
+    }
+    let step = crate::drivers::block::MAX_BLOCKS_PER_OP * SECTOR_SIZE;
+    let mut off = 0usize;
+    while off < buf.len() {
+        let take = core::cmp::min(step, buf.len() - off);
+        let at = lba + (off / SECTOR_SIZE) as u64;
+        let chunk = &mut buf[off..off + take];
+        let r = match source {
+            BlockSource::Default => crate::drivers::block::read_blocks(at, chunk),
+            BlockSource::Usb => crate::drivers::block::read_blocks_usb(at, chunk),
+            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+            BlockSource::Sdhc => crate::drivers::block::read_blocks_sdhc(at, chunk),
+        };
+        match r {
+            Ok(n) if n == take => {}
+            _ => return Err(FatError::Io), // short read == error, exactly as `read_sector`
+        }
+        off += take;
+    }
+    Ok(())
+}
+
+/// MULTIBLK: write a run of whole sectors starting at absolute `lba` from `buf`, chunked against
+/// `MAX_BLOCKS_PER_OP`. The write twin of [`read_sectors`], with the same whole-sector precondition.
+/// Callers reach this ONLY for spans they have proven are fully covered by `buf`, which is what
+/// makes it sound to issue the write with no preceding read.
+fn write_sectors(source: BlockSource, lba: u64, buf: &[u8]) -> Result<(), FatError> {
+    if buf.is_empty() || buf.len() % SECTOR_SIZE != 0 {
+        return Err(FatError::Io);
+    }
+    // SDHC-4c: the WHOLE run is checked against the reserved extent before the loop starts, so a run
+    // that is only partly inside it is refused ENTIRELY rather than half-written and then stopped.
+    // Each chunk is then re-checked inside the loop against the same predicate — the run check is
+    // the atomicity property, the per-chunk check is the bound, and neither is derived from the
+    // other. See `write_sector`.
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    if source == BlockSource::Sdhc {
+        crate::fs::sdhc4c::permit_span(
+            "write_sectors(run)",
+            lba,
+            (buf.len() / SECTOR_SIZE) as u64,
+        )?;
+    }
+    let step = crate::drivers::block::MAX_BLOCKS_PER_OP * SECTOR_SIZE;
+    let mut off = 0usize;
+    while off < buf.len() {
+        let take = core::cmp::min(step, buf.len() - off);
+        let at = lba + (off / SECTOR_SIZE) as u64;
+        let chunk = &buf[off..off + take];
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        if source == BlockSource::Sdhc {
+            permit_sdhc_write("write_sectors", at, (take / SECTOR_SIZE) as u64)?;
+        }
+        let r = match source {
+            BlockSource::Default => crate::drivers::block::write_blocks(at, chunk),
+            BlockSource::Usb => crate::drivers::block::write_blocks_usb(at, chunk),
+            // Reachable ONLY with the permit armed and this chunk inside the reserved extent.
+            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+            BlockSource::Sdhc => crate::drivers::block::write_blocks_sdhc(at, chunk),
+        };
+        r.map_err(|_| FatError::Io)?;
+        off += take;
+    }
+    Ok(())
 }
 
 /// F2 (SMP-hardening): the FAT-table mutation lock. Serializes the read-modify-write of a FAT sector so two
@@ -577,11 +869,23 @@ fn write_sector(source: BlockSource, lba: u64, buf: &[u8; SECTOR_SIZE]) -> Resul
 /// so the mirrored FAT copies never diverge under concurrency. See [`with_fat_lock`] for the lock-span and the
 /// arch reasoning; the flag it closes is the U11-M2b reaper's downstream `set_fat_entry` RMW (docs/MILESTONES).
 ///
-/// aarch64-only on purpose: the aarch64 storage path is fully POLLED (an emmc2 busy-poll on metal; a spin-loop
-/// under the QEMU raspi4b/virt models, which deliver no timer IRQ so `hlt` degrades to a spin), so the lock can
-/// span the bounded RMW block I/O without ever yielding the scheduler. x86 is EXCLUDED because its FAT path
-/// `hlt`s awaiting an async xHCI transfer event and a `hlt` under a cleared IF never wakes — masking IRQs
-/// across it would hang; the x86 side carries its own U11x concurrency model in `arch/x86_64` regardless.
+/// aarch64-only on purpose. ⚠ PH-3 (2026-07-27) CORRECTED the reason: this comment previously claimed "the
+/// aarch64 storage path is fully POLLED (emmc2)". That is NOT an invariant of any aarch64 build — the xHCI
+/// BOT path IS reachable under this lock. `with_fat_lock` is gated on `target_arch` alone (no `baremetal`),
+/// while `block::write_block`/`read_block` route to `emmc2` only under `cfg(baremetal)` AND only once the
+/// runtime `BACKEND` atomic has been flipped by `emmc2::finish` → `block::register_sd`. So on aarch64-virt
+/// (no `emmc2` compiled at all) BOT is the ONLY path, and on Pi metal a failed card init leaves BACKEND_XHCI
+/// with a later-enumerated USB stick owning `BLOCK_DEVICE` (`block::publish_usb_geometry`).
+///
+/// THE REAL INVARIANT that makes the IRQ-masked span safe on aarch64 — it holds for BOTH backends:
+///   (a) emmc2 is a bounded busy-poll; and
+///   (b) the xHCI BOT pump (`xhci::pump_until_bot_done`) drains its event ring by POLLING, never from an IRQ
+///       handler, and is bounded by a `now_cycles`/`hw_wait_budget` WALL-CLOCK deadline (CNTVCT keeps
+///       advancing with the timer masked); its idle step is `arch::hlt`, whose `wfi` WAKES ON A PENDING
+///       PHYSICAL INTERRUPT EVEN WITH PSTATE.I SET, and which is never a scheduler yield.
+/// x86 is EXCLUDED because its `hlt` under a cleared IF never wakes — masking IRQs across it would hang; the
+/// x86 side carries its own U11x concurrency model in `arch/x86_64` regardless. Full traced citation chain:
+/// `docs/dev/OS/01_BOOT_HAL/arch_arm64.md` ("PH-3 — is the aarch64 block-write path 'fully polled emmc2'?").
 #[cfg(target_arch = "aarch64")]
 static FAT_MUTATION: spin::Mutex<()> = spin::Mutex::new(());
 
@@ -596,8 +900,30 @@ static FAT_MUTATION: spin::Mutex<()> = spin::Mutex::new(());
 ///
 /// LOCK SPAN: callers hold this ONLY across a single FAT-sector RMW (`set_fat_entry`'s bounded `num_fats`
 /// read+write loop) — never across a free-search (`alloc_cluster`), a data-cluster zero-fill/write loop, or a
-/// `mount()`. That is why "held across block I/O" is safe here: the aarch64 I/O is polled, so the span is a
-/// couple of bounded polled sector transfers with no scheduler yield, not an unbounded wait.
+/// `mount()`. That structural rule is unchanged; what the span COSTS, however, is a property of the
+/// [`BlockSource`] the RMW runs through, and USBFALL F2 states it per-source rather than as one blanket claim:
+///
+/// - [`BlockSource::Default`] — the pre-USB-WRITE premise, and still true. On Pi bare-metal the backend is the
+///   microSD (`emmc2`, a polled CMD17/CMD24 busy-poll; USBFALL F1 now REFUSES a `Default` write when no SD
+///   registered, so this arm can no longer be silently substituted by the stick). Under the QEMU raspi4b/virt
+///   models the spin-loop degrades to a spin. Either way: a couple of bounded polled sector transfers, no
+///   scheduler yield, microsecond-to-millisecond scale.
+/// - [`BlockSource::Usb`] — NOT "a couple of bounded polled sector transfers". USB-WRITE made this source
+///   writable (`write_sector` → `drivers::block::write_block_usb` → `xhci.storage_write10` → `scsi_write10` →
+///   `bot_transfer` → `pump_until_bot_done`), whose wall-clock deadline is `arch::hw_wait_budget() * 3`
+///   = 450_000_000 CNTVCT ticks (~8 s at the Pi's 54 MHz CNTFRQ), and whose pump body calls `crate::hlt()` —
+///   i.e. a `wfi` executed with `PSTATE.I` MASKED by this very hold. It is bounded and it is NOT a deadlock
+///   (WFI wakes on a pending physical interrupt even with I set — `arch/aarch64/mod.rs`), and the deadline is
+///   honoured, so the volume stays consistent. But on a FAILING transfer the worst case is a multi-second,
+///   non-preemptible hold (×`num_fats`): the scheduler cannot run, user mode is frozen, panel/input tasks stall.
+///
+/// The span is therefore honest-but-expensive on `Usb`, not "safe because polled". This is deliberately left
+/// as a documented cost rather than a restructure: narrowing the span for one source would fork the RMW's
+/// atomicity argument, and shortening the deadline belongs to the xHCI/BOT layer (out of this lane). What
+/// USBFALL adds instead is EVIDENCE — see [`note_masked_usb_hold`], which witnesses the first masked-IRQ hold
+/// taken on a `Usb` source so the cost is observable at the bench instead of inferred. Callers reach the lock
+/// through [`with_fat_lock_src`]/[`with_dir_lock_src`], which carry the source explicitly: any NEW
+/// `BlockSource` must answer this paragraph before it can be held across the RMW.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 fn with_fat_lock<R>(f: impl FnOnce() -> R) -> R {
@@ -609,10 +935,51 @@ fn with_fat_lock<R>(f: impl FnOnce() -> R) -> R {
 
 /// Non-aarch64 (x86): the FAT-mutation lock is inert — see [`FAT_MUTATION`] for why masking IRQs across the
 /// x86 `hlt`-driven xHCI FAT path would hang. Byte-identical to the pre-F2 behaviour (a zero-cost passthrough).
-#[cfg(not(target_arch = "aarch64"))]
+///
+/// ⚠ THE X86 INVARIANT, STATED HONESTLY (2026-07-26; ROSTER AUDITED 2026-07-27 — see the block below).
+/// Because this is a passthrough, x86 has NO in-`fat.rs` serialization of FAT/directory mutation. What keeps
+/// the volume consistent is a discipline held ABOVE `fat.rs`, by its callers. That discipline is now written
+/// down as a ROSTER, because it is caller-side and therefore only as good as the next caller added to it.
+///
+/// # THE X86 FAT-MUTATOR ROSTER (every x86 path that allocates/frees a cluster, writes a FAT entry, or
+/// RMWs a directory sector). Full derivation + the interleavings in
+/// `docs/dev/OS/07_USB_STORAGE/x86_interrupt_storage.md` ("x86 FAT concurrency audit").
+///
+/// | # | Mutator | Context (core) | Gate | Serialized by |
+/// |---|---------|----------------|------|---------------|
+/// | 1 | `flight_recorder::reserve_log` — `delete_located` + `create_in_root` + one `write_grow` | BSP main loop, IF=1, NOT a scheduled task | always (x86); ONE-SHOT for the whole boot | PROGRAM ORDER: its call site (`main.rs`) precedes every `U*_probe_once` and `install_probe_once` in the same iteration, and all of them gate on the same `block::info()` that has only just become `Some`. No other mutator can exist yet. |
+/// | 2 | `flight_recorder::write_log` — `write_at` only | BSP main loop | always | NOT A MUTATOR. Bounded to clusters already in the reserved chain; writes no FAT entry and no directory sector, so it cannot interact with any writer at all. |
+/// | 3 | storage service task — `create_in_root` / `write_grow` / `delete_located` / `write_at` (`drivers/xhci/irqstorage.rs`) | `storage-svc` task, AP[0], PRIO_HIGH | `irqstorage` | ONE task draining `REQ_QUEUE` one request at a time; every submitter blocks on the request's `done` semaphore. A real single writer for everything that reaches it. |
+/// | 4 | demo-chain pre-flights — `u10x_preflight_grow_file`, `u10_preflight_absent` (`arch/x86_64/syscall.rs`) | the `u6bx-launch`/`u7x-launch` LAUNCHER task, AP[1], PRIO_NORMAL | `witness` **and** `HELLO_STAGED` | PROGRAM ORDER on the ONE launcher task: each stage spins on the previous stage's `*_LAUNCH_DONE` before it starts, and mutates only BEFORE it spawns its fixture. |
+/// | 5 | demo-chain drains — `u10_drain_{grow,create_grow,create_grow_delete,delete}`, `flush_drain_one` | same launcher task | `witness` | ditto — reached only after the launcher has observed its fixture's teardown (`cleared`). |
+/// | 6 | `openf_release` / `u11m2_phase` — `submit_grow` / `submit_delete` | launcher task / fixture teardown | `irqstorage` | routed through row 3 (they are submitters, not mutators). |
+/// | 7 | **`shell::dispatch_command`** — `create_in_dir`, `create_dir`, `write_grow`, `delete_located`, `remove_dir`, `rename_entry`, `move_entry`, and a raw `write <lba> <byte>` | **BSP GUI main loop, INLINE** (`main.rs`'s `handle_key`), NOT a scheduled task | **NONE — compiled unconditionally** | **NOTHING.** See the rule below. |
+/// | 8 | `install::write_sectors` — raw GPT/FAT32 format writes | BSP main loop | `installdemo` | PROGRAM ORDER on the BSP loop; its blank-scratch-disk configuration leaves `HELLO_STAGED` false (rows 4/5 skip) and permanently fails row 1's reserve. |
+///
+/// VERDICT: rows 1–6 and 8 are genuinely sequenced. Row 7 is NOT — the shell mutates the volume from the BSP
+/// main loop with nothing between it and rows 3/4/5, which run on APs. It is unreachable in the QEMU
+/// batteries (headless `-display none`: no HID key event ever reaches `handle_key` on x86 — the `poll_input`
+/// feed in the main loop is aarch64-only) and harmless in shipping GUI/media builds (DEFAULT-QUIET leaves
+/// `witness` OFF, so rows 4–6 do not exist and the shell is the sole writer). It becomes a REAL second-writer
+/// window in exactly one configuration: an attended GUI boot built WITH `witness` (and/or `irqstorage`),
+/// where a keystroke dispatched while the launcher chain is mid-`write_grow` interleaves two unsynchronized
+/// cluster-chain mutations. Do not "fix" that here — see the rule.
+///
+/// THE RULE FOR A NEW X86 FAT WRITER: join one of the schemes above (submit through the storage service task,
+/// or run in program order on the BSP main loop ahead of the launchers), and add yourself to this roster.
+/// Do NOT make this lock real here: masking IRQs across the `hlt`-driven xHCI BOT pump would hang the core.
+#[cfg(all(not(target_arch = "aarch64"), not(feature = "witness")))]
 #[inline(always)]
 fn with_fat_lock<R>(f: impl FnOnce() -> R) -> R {
     f()
+}
+
+/// Witness-build x86 [`with_fat_lock`]: the passthrough PLUS the roster tripwire (see
+/// [`x86_rmw_tripwire`]). Behaviourally identical — it only counts.
+#[cfg(all(not(target_arch = "aarch64"), feature = "witness"))]
+#[inline]
+fn with_fat_lock<R>(f: impl FnOnce() -> R) -> R {
+    x86_rmw_tripwire(&FAT_RMW_INFLIGHT, &FAT_RMW_OVERLAPS, "FAT-table", f)
 }
 
 /// F3-M2: the DIRECTORY-sector mutation lock — the twin of [`FAT_MUTATION`] for the three directory-sector
@@ -627,8 +994,11 @@ static DIR_MUTATION: spin::Mutex<()> = spin::Mutex::new(());
 
 /// Run `f` under the directory-sector mutation lock (aarch64), or unchanged (other arches). Same IRQ-masked,
 /// non-preemptible discipline as [`with_fat_lock`] (see its doc for the deadlock reasoning). LOCK SPAN: only
-/// a single directory-sector RMW (one bounded polled read + one write) — never a directory SCAN
-/// (`find_free_root_slot` / `find_located` stay outside; the F3-M3 namespace lock serializes those sequences).
+/// a single directory-sector RMW (one read + one write) — never a directory SCAN (`find_free_root_slot` /
+/// `find_located` stay outside; the F3-M3 namespace lock serializes those sequences). USBFALL F2: "one bounded
+/// POLLED read + one write" holds for [`BlockSource::Default`] only — on a `Usb` source the same span rides the
+/// BOT deadline with `wfi` under masked IRQs. See [`with_fat_lock`]'s LOCK SPAN paragraph for the per-source
+/// statement; call sites take this lock through [`with_dir_lock_src`], which carries the source.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 fn with_dir_lock<R>(f: impl FnOnce() -> R) -> R {
@@ -638,11 +1008,222 @@ fn with_dir_lock<R>(f: impl FnOnce() -> R) -> R {
     })
 }
 
-/// Non-aarch64 (x86): the directory-mutation lock is inert — the [`with_fat_lock`] passthrough reasoning.
-#[cfg(not(target_arch = "aarch64"))]
+/// Non-aarch64 (x86): the directory-mutation lock is inert — the [`with_fat_lock`] passthrough reasoning,
+/// including its "THE X86 INVARIANT, STATED HONESTLY" note and the MUTATOR ROSTER there (the caller-level
+/// discipline is what serializes x86 directory-sector RMWs; there is no lock here).
+#[cfg(all(not(target_arch = "aarch64"), not(feature = "witness")))]
 #[inline(always)]
 fn with_dir_lock<R>(f: impl FnOnce() -> R) -> R {
     f()
+}
+
+/// Witness-build x86 [`with_dir_lock`]: the passthrough PLUS the roster tripwire (see [`x86_rmw_tripwire`]).
+#[cfg(all(not(target_arch = "aarch64"), feature = "witness"))]
+#[inline]
+fn with_dir_lock<R>(f: impl FnOnce() -> R) -> R {
+    x86_rmw_tripwire(&DIR_RMW_INFLIGHT, &DIR_RMW_OVERLAPS, "directory-sector", f)
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// X86 ROSTER TRIPWIRE (`witness` builds only) — make a violation of the caller-side single-writer discipline
+// documented on `with_fat_lock` SELF-REPORTING instead of showing up as a mystery cross-linked chain three
+// arcs later.
+//
+// WHAT IT WATCHES: the two seams that ARE real locks on aarch64 — the FAT-sector RMW (`with_fat_lock`) and the
+// directory-sector RMW (`with_dir_lock`). Those are precisely the spans where a second concurrent mutator
+// corrupts the volume, and they are provably NON-NESTING, so a nonzero in-flight count at entry means a
+// genuinely concurrent second mutator, never re-entrancy:
+//   * `with_fat_lock` is taken at exactly two sites — `set_fat_entry` and `alloc_cluster`'s compare-and-claim
+//     — and the claim body calls the lock-FREE `set_fat_entry_inner`, never `set_fat_entry` (that factoring
+//     exists because the aarch64 lock is non-reentrant, so a nest would DEADLOCK there — the invariant is
+//     enforced by aarch64, not merely assumed).
+//   * `with_dir_lock`'s six bodies are pure single-sector read-modify-writes; none calls another (composites
+//     like `create_dir`/`delete_located` call them SEQUENTIALLY), and `create_in_dir` dispatches to
+//     `create_in_root` BEFORE taking the lock. The two locks are also never nested in each other.
+//
+// COST WHEN OFF: none. The whole family (statics, helper, and the tripwire-flavoured `with_*_lock`) is behind
+// `feature = "witness"`, and the knob-off definitions above are the byte-identical `#[inline(always)]`
+// passthroughs — the DEFAULT-QUIET rule (boot/media builds leave `witness` off).
+// COST WHEN ON: two relaxed atomics per sector RMW. It NEVER prints in a correct run, so it cannot perturb a
+// battery verdict; the one line it can emit fires only when the roster has actually been violated.
+// aarch64 is untouched by design — it holds REAL locks, and this is an x86-only invariant.
+// ---------------------------------------------------------------------------------------------------------
+
+/// Mutators currently inside a FAT-sector RMW (`with_fat_lock`). See the block above.
+#[cfg(all(not(target_arch = "aarch64"), feature = "witness"))]
+static FAT_RMW_INFLIGHT: AtomicU32 = AtomicU32::new(0);
+/// Mutators currently inside a directory-sector RMW (`with_dir_lock`).
+#[cfg(all(not(target_arch = "aarch64"), feature = "witness"))]
+static DIR_RMW_INFLIGHT: AtomicU32 = AtomicU32::new(0);
+/// Sticky count of FAT-sector RMWs that began while another was already in flight.
+#[cfg(all(not(target_arch = "aarch64"), feature = "witness"))]
+static FAT_RMW_OVERLAPS: AtomicU32 = AtomicU32::new(0);
+/// Sticky count of directory-sector RMWs that began while another was already in flight.
+#[cfg(all(not(target_arch = "aarch64"), feature = "witness"))]
+static DIR_RMW_OVERLAPS: AtomicU32 = AtomicU32::new(0);
+/// One-shot latch so the tripwire reports at most ONE serial line per boot (a corrupting interleave tends to
+/// repeat, and a spamming witness is a worse witness).
+#[cfg(all(not(target_arch = "aarch64"), feature = "witness"))]
+static RMW_TRIPPED: AtomicBool = AtomicBool::new(false);
+
+/// Run one sector RMW with the roster tripwire around it: bump the in-flight count, and if it was ALREADY
+/// nonzero, record the overlap (and report it once). Purely observational — `f` runs unchanged either way.
+#[cfg(all(not(target_arch = "aarch64"), feature = "witness"))]
+#[inline]
+fn x86_rmw_tripwire<R>(
+    inflight: &AtomicU32,
+    overlaps: &AtomicU32,
+    what: &str,
+    f: impl FnOnce() -> R,
+) -> R {
+    if inflight.fetch_add(1, Ordering::AcqRel) != 0 {
+        overlaps.fetch_add(1, Ordering::Relaxed);
+        if !RMW_TRIPPED.swap(true, Ordering::Relaxed) {
+            serial_println!(
+                ":: FATRACE: SECOND CONCURRENT x86 {} MUTATOR DETECTED — the caller-side single-writer roster (see fs/fat.rs `with_fat_lock`) has been violated; expect cross-linked chains ::",
+                what
+            );
+        }
+    }
+    let r = f();
+    inflight.fetch_sub(1, Ordering::AcqRel);
+    r
+}
+
+/// Roster-tripwire tallies `(FAT-sector overlaps, directory-sector overlaps)` for the boot. Both `0` is the
+/// expected reading — it is the evidence that the caller-side discipline held for every RMW that actually ran.
+#[cfg(all(not(target_arch = "aarch64"), feature = "witness"))]
+pub fn x86_rmw_overlaps() -> (u32, u32) {
+    (
+        FAT_RMW_OVERLAPS.load(Ordering::Relaxed),
+        DIR_RMW_OVERLAPS.load(Ordering::Relaxed),
+    )
+}
+
+/// USBFALL F2: one-shot latch for [`note_masked_usb_hold`].
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static USBFALL_MASKED_USB_HOLD: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// USBFALL F2 witness: record the FIRST time a FAT/dir sector RMW takes the masked-IRQ mutation lock on a
+/// [`BlockSource::Usb`] volume — the case the [`with_fat_lock`] LOCK SPAN paragraph calls out as bounded but
+/// expensive (a `pump_until_bot_done` deadline of `hw_wait_budget()*3`, with `wfi` inside, held under
+/// `PSTATE.I` masked). One line, once per boot, so the cost is OBSERVED at the bench rather than inferred;
+/// the quantity still owed from metal is the actual stall on a FAILING BOT write, which QEMU cannot produce.
+/// Behind the `witness` feature (UNAOS_WITNESS) — a default-quiet build compiles this away entirely and the
+/// hold is byte-identical to pre-USBFALL.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+#[inline]
+fn note_masked_usb_hold(source: BlockSource, site: &str) {
+    if source != BlockSource::Usb {
+        return;
+    }
+    if !USBFALL_MASKED_USB_HOLD.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        serial_println!(
+            ":: USBFALL: masked-IRQ FAT hold on the Usb source ({}) — span bounded by the BOT deadline, not by polled I/O ::",
+            site
+        );
+    }
+}
+
+/// USBFALL F2: default-quiet / non-aarch64 build — the witness is compiled out.
+#[cfg(not(all(target_arch = "aarch64", feature = "witness")))]
+#[inline(always)]
+fn note_masked_usb_hold(_source: BlockSource, _site: &str) {}
+
+/// WEDGE-8 (F3): retry bounds for a `Busy` FAT/dir RMW — the masked closure found the storage
+/// driver's controller loaned out and returned instantly (a masked context must never wait on a
+/// driver lock; that wait IS the F3 deadlock). Each retry re-runs the WHOLE closure from outside
+/// the `without_interrupts` span, with a `hlt()` between attempts so the scheduler can run the loan
+/// holder to completion. Both bounds are needed: the attempt cap keeps the aarch64 masked path
+/// (instant-`Busy` attempts, one timer tick apart) from spinning unbounded, and the wall-clock cap
+/// keeps the x86 path (whose block layer already waits its own bounded budget per attempt) from
+/// multiplying that budget by the attempt count. Exhaustion surfaces `FatError::Busy` → `-EAGAIN`:
+/// the RMW never started, nothing was mutated, the caller may retry.
+const RMW_BUSY_ATTEMPTS: u32 = 64;
+
+/// USBFALL F2: [`with_fat_lock`], with the [`BlockSource`] the guarded RMW will run through made EXPLICIT.
+/// Every `FatFs` call site uses this form so the span's per-source cost (see [`with_fat_lock`]'s LOCK SPAN
+/// paragraph) is visible at the point the lock is taken, and so a newly added source cannot inherit the
+/// "polled, therefore cheap" premise by accident.
+///
+/// WEDGE-8 (F3): the closure is now `Result`-typed and a `FatError::Busy` from inside it is RETRIED
+/// here, OUTSIDE the masked span (see [`RMW_BUSY_ATTEMPTS`]). The invariant this establishes for
+/// every span in `fs/`: no `without_interrupts` closure ever blocks on a driver lock — it fails
+/// fast with `Busy` and the wait (a `hlt`, schedulable, unmasked) happens out here.
+/// SDHC-4c: the FAT-MUTATION INSTRUMENT for the internal SD card.
+///
+/// [`with_fat_lock_src`] and [`with_dir_lock_src`] are the two wrappers EVERY FAT-table RMW
+/// (`set_fat_entry`, `alloc_cluster`'s compare-and-claim) and EVERY directory RMW (all six
+/// `with_dir_lock` bodies: `write_dir_entry_fields`, `..._mtime`, `create_in_root`, `create_in_dir`,
+/// `write_dir_entry_name`, `mark_dir_deleted`) in this file passes through. Counting here therefore
+/// counts the complete mutator surface with two call sites instead of eight, and — the property
+/// that matters for the instrument-baseline law — it can print NON-ZERO: any future code that
+/// mutates the card's FAT or directory is caught by construction, whether or not the write beneath
+/// it is then refused.
+///
+/// Costs one integer comparison on every RMW on every source; the `Sdhc` variant does not exist
+/// outside `x86_64 + sdhcblk`, so this compiles to nothing at all elsewhere.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+#[inline]
+fn note_sdhc_mutation(source: BlockSource, site: &str) {
+    if source == BlockSource::Sdhc {
+        crate::fs::sdhc4c::note_fat_mutation(site);
+    }
+}
+
+/// No `Sdhc` source exists in this build, so there is nothing to instrument. Byte-identical to
+/// pre-4c on every other target.
+#[cfg(not(all(target_arch = "x86_64", feature = "sdhcblk")))]
+#[inline(always)]
+fn note_sdhc_mutation(_source: BlockSource, _site: &str) {}
+
+#[inline]
+fn with_fat_lock_src<R>(
+    source: BlockSource,
+    site: &str,
+    mut f: impl FnMut() -> Result<R, FatError>,
+) -> Result<R, FatError> {
+    note_masked_usb_hold(source, site);
+    note_sdhc_mutation(source, site);
+    let start = crate::arch::now_cycles();
+    let budget = crate::arch::hw_wait_budget();
+    for _ in 0..RMW_BUSY_ATTEMPTS {
+        match with_fat_lock(&mut f) {
+            Err(FatError::Busy) => {}
+            other => return other,
+        }
+        if crate::arch::now_cycles().wrapping_sub(start) >= budget {
+            break;
+        }
+        crate::hlt(); // unmasked here — the mask ended with the closure; let the holder run
+    }
+    Err(FatError::Busy)
+}
+
+/// USBFALL F2: the [`with_dir_lock`] twin of [`with_fat_lock_src`] — same reasoning, directory
+/// sectors; WEDGE-8 (F3): same `Busy` retry-outside-the-mask discipline.
+#[inline]
+fn with_dir_lock_src<R>(
+    source: BlockSource,
+    site: &str,
+    mut f: impl FnMut() -> Result<R, FatError>,
+) -> Result<R, FatError> {
+    note_masked_usb_hold(source, site);
+    note_sdhc_mutation(source, site);
+    let start = crate::arch::now_cycles();
+    let budget = crate::arch::hw_wait_budget();
+    for _ in 0..RMW_BUSY_ATTEMPTS {
+        match with_dir_lock(&mut f) {
+            Err(FatError::Busy) => {}
+            other => return other,
+        }
+        if crate::arch::now_cycles().wrapping_sub(start) >= budget {
+            break;
+        }
+        crate::hlt();
+    }
+    Err(FatError::Busy)
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -705,10 +1286,18 @@ fn f2_witness_step() {
 /// also what distinguishes a superfloppy BPB from an MBR boot sector — an MBR's bootstrap bytes
 /// won't pass the jump-instruction, sector-size, and geometry-consistency gates. FAT12 and
 /// non-512-byte sectors are rejected as `Unsupported`.
+///
+/// PARTITION (GR9): `range` is the containing partition as the block layer describes it, when this
+/// volume was found through a partition entry (`None` for a superfloppy, where the device is the
+/// volume). Its declared length is a hard gate — see the `tot_sec` check below — and it is retained
+/// in the mount so every later access is bound-checked against it. `part_slot` is carried only so
+/// the mount witness can name which MBR slot the volume came from.
 fn parse_bpb(
     sec: &[u8; SECTOR_SIZE],
     part_lba: u64,
     dev_blocks: u64,
+    range: Option<crate::drivers::block::PartitionRange>,
+    part_slot: u8,
     source: BlockSource,
 ) -> Result<FatFs, FatError> {
     // BS_JmpBoot (offset 0): a FAT VBR starts with EB xx 90 or E9 xx xx. Strong VBR discriminator.
@@ -805,6 +1394,21 @@ fn parse_bpb(
         return Err(FatError::NotFat);
     }
 
+    // PARTITION (GR9): consistency vs the CONTAINING PARTITION. The gate above only proves the
+    // volume fits the DISK — which is exactly what a FAT volume that overruns its partition and
+    // runs on into the next one also satisfies. Nothing on the medium guarantees `tot_sec` agrees
+    // with the partition entry that pointed here: they are two independent claims written by
+    // (possibly) two different tools, and a mismatch is either a formatting bug or a deliberate
+    // attempt to have partition 1's filesystem address partition 2's sectors. Refuse the mount
+    // rather than clamp `tot_sec` down to the partition length: a volume whose own header disagrees
+    // with its container is not a volume we understand, and silently shrinking it would leave a
+    // filesystem whose FAT and cluster count describe sectors we then refuse to serve.
+    if let Some(r) = range {
+        if r.start_lba != part_lba || tot_sec as u64 > r.sector_count {
+            return Err(FatError::NotFat);
+        }
+    }
+
     let root_cluster = if kind == FatKind::Fat32 {
         u32le(sec, 44) & 0x0FFF_FFFF
     } else {
@@ -846,6 +1450,11 @@ fn parse_bpb(
         vol_id,
         vol_label,
         source,
+        // PARTITION (GR9): the volume's own extent. `tot_sec` — proven above to fit the disk, to fit
+        // the 32-bit LBA space, and (when this came from a partition entry) to fit the partition.
+        vol_sectors: tot_sec as u64,
+        part_slot,
+        range,
     })
 }
 
@@ -856,6 +1465,43 @@ pub fn mount() -> Result<FatFs, FatError> {
     mount_source(BlockSource::Default)
 }
 
+/// APPLOAD: mount the volume a PROGRAM should be loaded from — the global block device if one is
+/// registered, else (x86 + `sdhcblk`) the card in the machine's internal SD slot.
+///
+/// This is [`mount`] for the one class of caller that means "wherever I can find an executable",
+/// rather than "the device the system is bound to". The distinction had no consequences while the
+/// only readable medium was the boot stick; it acquired one the moment SDHC-4b gave the internal
+/// reader a handle of its own, because a machine booted from that reader has a mounted, listed,
+/// program-bearing volume and an EMPTY global slot at the same time.
+///
+/// Precedence and its compatibility argument live on [`crate::drivers::block::program_source`]; the
+/// short form is that the global wins whenever it exists, so this is identical to [`mount`] on every
+/// boot that already worked.
+///
+/// **The read path follows the handle, by construction.** The handle is mapped to the matching
+/// [`BlockSource`] here and every subsequent read — the BPB probe, the partition scan, each directory
+/// sector, each data cluster — routes through `read_sector` / `read_sectors`, which already dispatch
+/// per source (`Sdhc` -> `read_block_sdhc` / `read_blocks_sdhc`, bypassing the backend selector).
+/// No second read mechanism is introduced and none is needed.
+pub fn mount_program_source() -> Result<FatFs, FatError> {
+    let (_dev, handle) = crate::drivers::block::program_source().ok_or(FatError::NoDisk)?;
+    mount_source(source_of(handle))
+}
+
+/// APPLOAD: the inverse of [`handle_of`] — which [`BlockSource`] reads a given registry handle.
+///
+/// Total by construction, so a handle added to the block layer without a source here is a compile
+/// error rather than a silent mis-route. `Usb` is mapped for totality only:
+/// [`crate::drivers::block::program_source`] never returns it (see the precedence note there).
+fn source_of(handle: crate::drivers::block::BlockHandle) -> BlockSource {
+    match handle {
+        crate::drivers::block::BlockHandle::Global => BlockSource::Default,
+        crate::drivers::block::BlockHandle::Usb => BlockSource::Usb,
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        crate::drivers::block::BlockHandle::Sdhc => BlockSource::Sdhc,
+    }
+}
+
 /// PIUSB-27: mount a FAT volume from a chosen block `source`. `Default` is the globally-registered device
 /// (SD on the Pi); `Usb` reads the USB stick directly through the xHCI controller so it can be browsed
 /// read-only even while the SD backend owns the global block device. Geometry comes from the matching
@@ -864,6 +1510,8 @@ pub fn mount_source(source: BlockSource) -> Result<FatFs, FatError> {
     let dev = match source {
         BlockSource::Default => crate::drivers::block::info(),
         BlockSource::Usb => crate::drivers::block::usb_info(),
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        BlockSource::Sdhc => crate::drivers::block::sdhc_info(),
     }
     .ok_or(FatError::NoDisk)?;
     if dev.block_size != SECTOR_SIZE as u32 {
@@ -874,8 +1522,21 @@ pub fn mount_source(source: BlockSource) -> Result<FatFs, FatError> {
     let mut sec = [0u8; SECTOR_SIZE];
     read_sector(source, 0, &mut sec)?;
 
+    // PARTITION (GR9): the raw census, before any of the three interpretations below. It prints at
+    // most once per handle per boot and returns the decoded table either way, so this call is both
+    // the witness and the table the MBR branch uses — one decode, one printed opinion, no chance of
+    // the log describing a table the mount did not use.
+    let table = crate::drivers::block::mbr_census(handle_of(source), &sec, dev_blocks);
+
     // 1) Superfloppy: LBA 0 is itself the BPB.
-    if let Ok(fs) = parse_bpb(&sec, 0, dev_blocks, source) {
+    //
+    //    Tried FIRST, and that ordering is load-bearing: a FAT superfloppy also carries 0x55AA at
+    //    offset 510, and the bootstrap code occupying bytes 446..510 can decode as plausible-looking
+    //    partition entries. Only the BPB gates (jump instruction, sector size, geometry consistency)
+    //    tell the two apart, so they run before any partition-table reading is trusted. `None` for
+    //    the partition length: there is no container — the device IS the volume, and the
+    //    `part_lba + tot_sec <= dev_blocks` gate inside `parse_bpb` is its bound.
+    if let Ok(fs) = parse_bpb(&sec, 0, dev_blocks, None, 0, source) {
         return Ok(fs);
     }
 
@@ -886,26 +1547,23 @@ pub fn mount_source(source: BlockSource) -> Result<FatFs, FatError> {
         return Ok(fs);
     }
 
-    // 3) MBR-partitioned: 0x55AA signature + a partition table at offset 446. Scan the four
-    //    primary entries; for each non-empty, non-extended entry, try to parse a BPB at its start
-    //    LBA. First one that validates wins.
-    if sec[510] == 0x55 && sec[511] == 0xAA {
-        for i in 0..4 {
-            let e = 446 + i * 16;
-            let ptype = sec[e + 4];
-            let start = u32le(&sec, e + 8);
-            // Skip empty (0x00) and extended-partition containers (0x05 CHS / 0x0F LBA).
-            if ptype == 0x00 || ptype == 0x05 || ptype == 0x0F || start == 0 {
-                continue;
-            }
-            if start as u64 >= dev_blocks {
-                continue;
-            }
+    // 3) MBR-partitioned — the UnaOS layout of record: partition 1 = ESP (FAT), partition 2 = UnaFS.
+    //    Walk the ACCEPTED entries in slot order, so partition 1 is what a FAT mount binds when it is
+    //    a FAT volume, and each candidate is parsed under ITS OWN partition length. That length is
+    //    the difference between this and mounting off the raw device: a BPB claiming more sectors
+    //    than its partition holds is refused here rather than becoming a volume that can address its
+    //    neighbour. `decode_mbr` has already dropped empty, extended, zero-length, out-of-range,
+    //    overlapping and GPT-protective slots, so anything reaching this loop is a disjoint,
+    //    in-bounds extent on this medium.
+    if let Some(t) = table {
+        for p in t.iter() {
             let mut pbs = [0u8; SECTOR_SIZE];
-            if read_sector(source, start as u64, &mut pbs).is_err() {
+            if read_sector(source, p.start_lba, &mut pbs).is_err() {
                 continue;
             }
-            if let Ok(fs) = parse_bpb(&pbs, start as u64, dev_blocks, source) {
+            let range = crate::drivers::block::PartitionRange::new(handle_of(source), &p);
+            if let Ok(fs) = parse_bpb(&pbs, p.start_lba, dev_blocks, Some(range), p.slot, source) {
+                mount_witness(&fs);
                 return Ok(fs);
             }
         }
@@ -914,24 +1572,202 @@ pub fn mount_source(source: BlockSource) -> Result<FatFs, FatError> {
     Err(FatError::NotFat)
 }
 
+/// PARTITION (GR9): which block-layer registry handle a FAT [`BlockSource`] reads through. The two
+/// enums are deliberately separate types (one names a FAT read path, the other a registry slot);
+/// this is the single place they are related, so the census can never be attributed to the wrong
+/// device.
+fn handle_of(source: BlockSource) -> crate::drivers::block::BlockHandle {
+    match source {
+        BlockSource::Default => crate::drivers::block::BlockHandle::Global,
+        BlockSource::Usb => crate::drivers::block::BlockHandle::Usb,
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        BlockSource::Sdhc => crate::drivers::block::BlockHandle::Sdhc,
+    }
+}
+
+/// PARTITION (GR9): announce a FAT volume mounted from an MBR slot, once per slot per boot.
+///
+/// INSTRUMENT NOTE (healthy-but-idle): the latch below reads 0 before the first partition-hosted FAT
+/// mount and then holds whichever slot bits have been announced. It gates printing only — the mount
+/// itself is unconditional — so a missing line means "already announced this boot", never "did not
+/// mount". On the layout of record exactly one line appears, naming slot 1.
+fn mount_witness(fs: &FatFs) {
+    static ANNOUNCED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    if fs.part_slot == 0 || fs.part_slot > 4 {
+        return;
+    }
+    let bit = 1u8 << (fs.part_slot - 1);
+    if ANNOUNCED.fetch_or(bit, Ordering::Relaxed) & bit != 0 {
+        return;
+    }
+    let (start, end) = fs.extent();
+    serial_println!(
+        ":: PART: fat mounted from MBR slot {} — extent LBA {}..{} ({} sectors), {} ::",
+        fs.part_slot, start, end, fs.vol_sectors, fs.describe()
+    );
+}
+
+/// The candidate volume-start LBAs named by a classic MBR partition table in `sec` (LBA 0). Empty if
+/// `sec` carries no 0x55AA signature. Empty (0x00) and extended-partition containers (0x05 CHS /
+/// 0x0F LBA) are skipped, as are starts at 0 or past the end of the device.
+///
+/// Extracted from `mount_source` so the INSTALL-SELF serial enumerator
+/// ([`volume_serials`]) walks the exact same candidate set the mount path does — one table walk, so
+/// the guard can never see a partition the mount would not, or miss one it would.
+///
+/// PARTITION (GR9): this walk stays DELIBERATELY BROADER than
+/// [`crate::drivers::block::decode_mbr`], which the mount path now uses. `decode_mbr` additionally
+/// drops entries whose extent overruns the device or overlaps an accepted neighbour; those drops are
+/// right for "which volume do I mount" and WRONG for "which volumes might this disk be", because the
+/// only failure mode that matters to the boot-device guard is missing a serial — that would offer
+/// the boot disk as an erase target. Enumerating a SUPERSET of the mount's candidates keeps the
+/// error in the safe direction (more refusals, never fewer), which is the property `volume_serials`'
+/// doc comment above states. It is therefore not a drift between two parsers: it is the same rule
+/// set minus the two rules that only make sense when choosing a volume to trust.
+fn mbr_volume_starts(sec: &[u8; SECTOR_SIZE], dev_blocks: u64) -> alloc::vec::Vec<u64> {
+    let mut out = alloc::vec::Vec::new();
+    if sec[510] != 0x55 || sec[511] != 0xAA {
+        return out;
+    }
+    for i in 0..4 {
+        let e = 446 + i * 16;
+        let ptype = sec[e + 4];
+        let start = u32le(sec, e + 8);
+        if ptype == 0x00 || ptype == 0x05 || ptype == 0x0F || start == 0 {
+            continue;
+        }
+        if start as u64 >= dev_blocks {
+            continue;
+        }
+        out.push(start as u64);
+    }
+    out
+}
+
+/// INSTALL-SELF: every FAT volume serial (`BS_VolID`) discoverable on `source`, in the same
+/// superfloppy → GPT → MBR order [`mount_source`] scans, with duplicates collapsed.
+///
+/// [`mount_source`] is first-match-wins: it returns the FIRST volume that parses and stops. That is
+/// the right rule for "mount the boot media", and the WRONG rule for "is this disk the one we booted
+/// from" — a device whose second partition is the ESP we booted would go unrecognized and be offered
+/// as an erase target. So the guard enumerates ALL of them. The direction of the difference is the
+/// safe one: a superset of serials can only ever cause MORE candidates to be refused, never fewer.
+///
+/// Read-only, bounded (≤ 1 superfloppy + ≤ 128 GPT entries + ≤ 4 MBR entries), and every parse goes
+/// through the same [`parse_bpb`] gates the mount path trusts. Errors degrade to "fewer serials
+/// found", never to a panic; the caller treats an empty result as "no FAT here, cannot be the boot
+/// device".
+pub fn volume_serials(source: BlockSource) -> alloc::vec::Vec<u32> {
+    let mut out: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    let dev = match source {
+        BlockSource::Default => crate::drivers::block::info(),
+        BlockSource::Usb => crate::drivers::block::usb_info(),
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        BlockSource::Sdhc => crate::drivers::block::sdhc_info(),
+    };
+    let Some(dev) = dev else { return out };
+    if dev.block_size != SECTOR_SIZE as u32 {
+        return out;
+    }
+    let dev_blocks = dev.num_blocks;
+
+    let mut sec = [0u8; SECTOR_SIZE];
+    if read_sector(source, 0, &mut sec).is_err() {
+        return out;
+    }
+
+    // 1) Superfloppy: LBA 0 is itself the BPB.
+    //
+    // PARTITION (GR9): every parse here passes `None` for the containing-partition length ON PURPOSE.
+    // This function does not mount anything — it only reads `BS_VolID` — and applying the partition
+    // gate would drop a volume whose BPB overruns its entry, i.e. would make the boot-device guard
+    // recognize FEWER disks as "the disk we booted from". The gate's job is to keep an untrustworthy
+    // volume from being MOUNTED; the guard's job is to recognize as many volumes as possible so it
+    // can refuse them as install targets. Same reasoning as the broader MBR walk below.
+    if let Ok(fs) = parse_bpb(&sec, 0, dev_blocks, None, 0, source) {
+        push_unique(&mut out, fs.vol_id);
+    }
+
+    // 2) + 3) Every partition start either table names.
+    let mut starts: alloc::vec::Vec<u64> =
+        gpt_volume_spans(dev_blocks, source).into_iter().map(|(s, _)| s).collect();
+    starts.extend_from_slice(&mbr_volume_starts(&sec, dev_blocks));
+    for start in starts {
+        let mut pbs = [0u8; SECTOR_SIZE];
+        if read_sector(source, start, &mut pbs).is_err() {
+            continue;
+        }
+        if let Ok(fs) = parse_bpb(&pbs, start, dev_blocks, None, 0, source) {
+            push_unique(&mut out, fs.vol_id);
+        }
+    }
+    out
+}
+
+/// Append `v` only if absent. The serial list is at most a handful of entries, so a linear scan is
+/// both the simplest and the fastest thing here.
+fn push_unique(out: &mut alloc::vec::Vec<u32>, v: u32) {
+    if !out.contains(&v) {
+        out.push(v);
+    }
+}
+
 /// Look for a GUID Partition Table: a header at LBA 1 with the `EFI PART` signature, then walk its
 /// partition entry array for the first entry whose start LBA holds a valid FAT BPB. Returns NotFat
 /// if there is no GPT or no FAT partition. Read-only; the scan is bounded (≤128 entries), and only
 /// entry sizes that divide a 512-byte sector (128 / 256) are handled so no entry straddles a read.
 fn scan_gpt(dev_blocks: u64, source: BlockSource) -> Result<FatFs, FatError> {
+    for (first_lba, sectors) in gpt_volume_spans(dev_blocks, source) {
+        let mut pbs = [0u8; SECTOR_SIZE];
+        if read_sector(source, first_lba, &mut pbs).is_err() {
+            continue;
+        }
+        // PARTITION (GR9): bounded by the GPT entry's own extent, exactly as the MBR branch is
+        // bounded by the primary entry's — a GPT partition is no more entitled to overrun into its
+        // neighbour than an MBR one. `part_slot` stays 0: GPT entries are not MBR primary slots and
+        // conflating the two numbers in a witness line would be a lie.
+        let range = crate::drivers::block::PartitionRange {
+            handle: handle_of(source),
+            start_lba: first_lba,
+            sector_count: sectors,
+        };
+        if let Ok(fs) = parse_bpb(&pbs, first_lba, dev_blocks, Some(range), 0, source) {
+            return Ok(fs);
+        }
+    }
+    Err(FatError::NotFat)
+}
+
+/// The candidate volume spans `(first_lba, sector_count)` named by a GUID Partition Table on
+/// `source`, in entry order. Empty if there is no `EFI PART` header at LBA 1 or its geometry fields
+/// are implausible.
+///
+/// Extracted from [`scan_gpt`] so the INSTALL-SELF serial enumerator ([`volume_serials`]) walks the
+/// exact same entry set the mount path does. Bounded at 128 entries regardless of a corrupt count,
+/// and only entry sizes that divide a 512-byte sector (128 / 256) are handled so no entry straddles a
+/// read. A read failure mid-array stops the walk (as it always did); an implausible entry is skipped.
+///
+/// PARTITION (GR9): the entry's `last_lba` is now read alongside `first_lba` so the mount path can
+/// bound the volume by its partition. Both are on-disk claims: an entry whose `last < first`, or
+/// whose extent runs past the device, is SKIPPED rather than clamped — the same rule the MBR decoder
+/// applies, for the same reason.
+fn gpt_volume_spans(dev_blocks: u64, source: BlockSource) -> alloc::vec::Vec<(u64, u64)> {
+    let mut out = alloc::vec::Vec::new();
     if dev_blocks < 3 {
-        return Err(FatError::NotFat);
+        return out;
     }
     let mut hdr = [0u8; SECTOR_SIZE];
-    read_sector(source, 1, &mut hdr)?;
+    if read_sector(source, 1, &mut hdr).is_err() {
+        return out;
+    }
     if &hdr[0..8] != b"EFI PART" {
-        return Err(FatError::NotFat);
+        return out;
     }
     let entries_lba = u64le(&hdr, 72);
     let num_entries = u32le(&hdr, 80);
     let entry_size = u32le(&hdr, 84);
     if !(entry_size == 128 || entry_size == 256) || entries_lba == 0 || entries_lba >= dev_blocks {
-        return Err(FatError::NotFat);
+        return out;
     }
     let num = num_entries.min(128); // bound the scan regardless of a corrupt count
     let per_sec = SECTOR_SIZE as u32 / entry_size; // 4 or 2 — exact, no straddle
@@ -957,15 +1793,22 @@ fn scan_gpt(dev_blocks: u64, source: BlockSource) -> Result<FatFs, FatError> {
         if first_lba == 0 || first_lba >= dev_blocks {
             continue;
         }
-        let mut pbs = [0u8; SECTOR_SIZE];
-        if read_sector(source, first_lba, &mut pbs).is_err() {
+        // PARTITION (GR9): `last_lba` is INCLUSIVE in the UEFI entry format, so the length is
+        // `last - first + 1`. Every step is checked: a reversed pair, an overflowing sum, or an
+        // extent past the medium drops the entry.
+        let last_lba = u64le(&buf, off + 40);
+        if last_lba < first_lba {
             continue;
         }
-        if let Ok(fs) = parse_bpb(&pbs, first_lba, dev_blocks, source) {
-            return Ok(fs);
+        let Some(sectors) = last_lba.checked_sub(first_lba).and_then(|d| d.checked_add(1)) else {
+            continue;
+        };
+        match first_lba.checked_add(sectors) {
+            Some(end) if end <= dev_blocks => out.push((first_lba, sectors)),
+            _ => continue,
         }
     }
-    Err(FatError::NotFat)
+    out
 }
 
 impl FatFs {
@@ -976,12 +1819,13 @@ impl FatFs {
     /// One-line human summary of the parsed geometry (for `fatinfo` / boot log).
     pub fn describe(&self) -> String {
         let head = alloc::format!(
-            "FAT{} vol@LBA{} bps={} spc={} nfat={} fatsz={}sec reserved={} fat@LBA{} data@LBA{} clusters={}",
+            "FAT{} vol@LBA{} volsec={} bps={} spc={} nfat={} fatsz={}sec reserved={} fat@LBA{} data@LBA{} clusters={}",
             match self.kind {
                 FatKind::Fat16 => 16,
                 FatKind::Fat32 => 32,
             },
             self.part_lba,
+            self.vol_sectors,
             self.bytes_per_sec,
             self.sec_per_clus,
             self.num_fats,
@@ -997,6 +1841,82 @@ impl FatFs {
                 alloc::format!("{head} rootdir@LBA{} ({}sec)", self.root_dir_lba, self.root_dir_sectors)
             }
         }
+    }
+
+    // --- PARTITION (GR9): the volume-extent gate every sector access passes through ---
+
+    /// One past the last sector of this volume, absolute. Cannot overflow: `parse_bpb` already
+    /// proved `part_lba + tot_sec <= u32::MAX + 1`.
+    fn vol_end(&self) -> u64 {
+        self.part_lba.saturating_add(self.vol_sectors)
+    }
+
+    /// Refuse an absolute span that is not entirely inside this volume.
+    ///
+    /// The FAT geometry checks in [`parse_bpb`] already make every DERIVED address (FAT sector,
+    /// root-dir sector, cluster sector) fall inside `tot_sec` by construction. This gate is the
+    /// second, independent layer: it does not reason about geometry at all, it just compares the
+    /// address that is actually about to be handed to the block layer against the volume's own
+    /// bounds. That is the layer that still holds if a future geometry derivation is wrong, if an
+    /// on-disk field is corrupt, or if a caller hands in an LBA it computed itself — which is
+    /// exactly the class of bug that writes into the neighbouring partition. Cheap: two compares per
+    /// sector op, against a path that costs a USB round trip.
+    fn in_extent(&self, lba: u64, sectors: u64) -> Result<(), FatError> {
+        let end = lba.checked_add(sectors).ok_or(FatError::OutOfVolume)?;
+        if sectors == 0 || lba < self.part_lba || end > self.vol_end() {
+            return Err(FatError::OutOfVolume);
+        }
+        // The partition's own bound, as the block layer states it — a separate claim from a separate
+        // on-disk structure. `contains_absolute` re-derives nothing from this file's fields.
+        if let Some(r) = self.range {
+            if !r.contains_absolute(lba, sectors) {
+                return Err(FatError::OutOfVolume);
+            }
+        }
+        Ok(())
+    }
+
+    /// Extent-checked [`read_sector`].
+    fn rd_sector(&self, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> Result<(), FatError> {
+        self.in_extent(lba, 1)?;
+        read_sector(self.source, lba, buf)
+    }
+
+    /// Extent-checked [`write_sector`]. The write side matters most: a read that escapes the volume
+    /// returns wrong bytes, a write that escapes it destroys a neighbour.
+    fn wr_sector(&self, lba: u64, buf: &[u8; SECTOR_SIZE]) -> Result<(), FatError> {
+        self.in_extent(lba, 1)?;
+        write_sector(self.source, lba, buf)
+    }
+
+    /// Extent-checked [`read_sectors`] — the whole run is checked, not just its first sector.
+    fn rd_sectors(&self, lba: u64, buf: &mut [u8]) -> Result<(), FatError> {
+        if buf.is_empty() || buf.len() % SECTOR_SIZE != 0 {
+            return Err(FatError::Io);
+        }
+        self.in_extent(lba, (buf.len() / SECTOR_SIZE) as u64)?;
+        read_sectors(self.source, lba, buf)
+    }
+
+    /// Extent-checked [`write_sectors`].
+    fn wr_sectors(&self, lba: u64, buf: &[u8]) -> Result<(), FatError> {
+        if buf.is_empty() || buf.len() % SECTOR_SIZE != 0 {
+            return Err(FatError::Io);
+        }
+        self.in_extent(lba, (buf.len() / SECTOR_SIZE) as u64)?;
+        write_sectors(self.source, lba, buf)
+    }
+
+    /// PARTITION (GR9): this volume's extent as absolute LBAs `[start, end)` — for witnesses and
+    /// for a caller that wants to assert two mounted volumes do not overlap.
+    pub fn extent(&self) -> (u64, u64) {
+        (self.part_lba, self.vol_end())
+    }
+
+    /// PARTITION (GR9): the MBR primary slot this volume came from (1..=4), or 0 if it did not come
+    /// from an MBR entry.
+    pub fn partition_slot(&self) -> u8 {
+        self.part_slot
     }
 
     // --- cluster / FAT-chain helpers ---
@@ -1051,7 +1971,7 @@ impl FatFs {
         }
         let within = (offset % SECTOR_SIZE as u64) as usize;
         let mut buf = [0u8; SECTOR_SIZE];
-        read_sector(self.source, self.fat_start + fat as u64 * self.fat_sz as u64 + sec, &mut buf)?;
+        self.rd_sector(self.fat_start + fat as u64 * self.fat_sz as u64 + sec, &mut buf)?;
         Ok(match self.kind {
             FatKind::Fat16 => u16le(&buf, within) as u32,
             FatKind::Fat32 => u32le(&buf, within) & 0x0FFF_FFFF,
@@ -1099,6 +2019,18 @@ impl FatFs {
         }
     }
 
+    /// FATVERB: the registry handle this volume reads through, spelled exactly as
+    /// [`crate::drivers::block::SourceCensus`] spells it. Forwards to [`BlockSource::name`].
+    pub fn source_name(&self) -> &'static str {
+        self.source.name()
+    }
+
+    /// FATVERB: may an ORDINARY FILE MUTATION reach this volume? Forwards to
+    /// [`BlockSource::write_veto`], which is the single definition — see it for the argument.
+    pub fn write_veto(&self) -> Option<&'static str> {
+        self.source.write_veto()
+    }
+
     /// The end-of-chain marker to write into a terminal cluster's FAT entry (`>= 0xFFF8` / `>= 0x0FFFFFF8`
     /// both read as EOC; write the canonical all-ones form).
     fn eoc_value(&self) -> u32 {
@@ -1115,10 +2047,12 @@ impl FatFs {
     fn set_fat_entry(&self, cluster: u32, next: u32) -> Result<(), FatError> {
         // F2: serialize the WHOLE all-copies RMW under `FAT_MUTATION`. A concurrent writer mutating a
         // different entry in this same sector (or the other FAT copy) can no longer read-before-our-write and
-        // then clobber our update. The lock spans ONLY the bounded `num_fats` read-modify-write, so on aarch64
-        // the hold is a couple of polled sector transfers with no scheduler yield (see `with_fat_lock`). On
-        // x86 `with_fat_lock` is a zero-cost passthrough.
-        with_fat_lock(|| self.set_fat_entry_inner(cluster, next))
+        // then clobber our update. The lock spans ONLY the bounded `num_fats` read-modify-write — never a
+        // free-search or a data-cluster loop. USBFALL F2: what that span COSTS depends on `self.source`, and
+        // the claim is stated per-source on `with_fat_lock`'s LOCK SPAN paragraph (`Default` = bounded polled
+        // sector transfers; `Usb` = the BOT deadline with `wfi` under masked IRQs). Read it there rather than
+        // assuming "polled" here. On x86 `with_fat_lock` is a zero-cost passthrough.
+        with_fat_lock_src(self.source, "set_fat_entry", || self.set_fat_entry_inner(cluster, next))
     }
 
     /// F3: the lock-FREE body of [`FatFs::set_fat_entry`] — the all-copies FAT-sector RMW with NO
@@ -1138,7 +2072,7 @@ impl FatFs {
         let mut buf = [0u8; SECTOR_SIZE];
         for f in 0..self.num_fats as u64 {
             let lba = self.fat_start + f * self.fat_sz as u64 + sec;
-            read_sector(self.source, lba, &mut buf)?;
+            self.rd_sector(lba, &mut buf)?;
             match self.kind {
                 FatKind::Fat16 => {
                     let v = (next & 0xFFFF) as u16;
@@ -1150,7 +2084,7 @@ impl FatFs {
                     buf[within..within + 4].copy_from_slice(&v.to_le_bytes());
                 }
             }
-            write_sector(self.source, lba, &buf)?;
+            self.wr_sector(lba, &buf)?;
         }
         Ok(())
     }
@@ -1158,13 +2092,31 @@ impl FatFs {
     /// U10: zero-fill every sector of a data cluster. Called BEFORE a freshly allocated cluster joins a chain,
     /// so no stale bytes from a previously-freed file can leak into a grown/created region (an information-
     /// disclosure invariant).
+    ///
+    /// MULTIBLK: a cluster's sectors are consecutive on disk BY DEFINITION, and every one of them is
+    /// written in full, so this is the purest case for a counted transfer — the whole cluster goes
+    /// out as one run (chunked only by the block layer's `MAX_BLOCKS_PER_OP`). It used to be
+    /// `sec_per_clus` separate WRITE(10)s, which on the 32 KiB clusters real sticks are formatted
+    /// with is 64 USB round trips per allocated cluster; §12.1 counted ~192 of them in a single
+    /// flight-recorder reservation. The zeroing is otherwise unchanged, and so is its ORDER relative
+    /// to the claim in `alloc_cluster` — the information-disclosure invariant is untouched.
     fn zero_cluster(&self, cluster: u32) -> Result<(), FatError> {
         if !self.valid_cluster(cluster) {
             return Err(FatError::BadChain);
         }
-        let zeros = [0u8; SECTOR_SIZE];
-        for s in 0..self.sec_per_clus as u64 {
-            write_sector(self.source, self.cluster_lba(cluster) + s, &zeros)?;
+        let step = core::cmp::min(
+            self.sec_per_clus as usize,
+            crate::drivers::block::MAX_BLOCKS_PER_OP,
+        );
+        let zeros = alloc::vec![0u8; step * SECTOR_SIZE];
+        let mut done = 0u64;
+        while done < self.sec_per_clus as u64 {
+            let n = core::cmp::min(step as u64, self.sec_per_clus as u64 - done);
+            self.wr_sectors(
+                self.cluster_lba(cluster) + done,
+                &zeros[..n as usize * SECTOR_SIZE],
+            )?;
+            done += n;
         }
         Ok(())
     }
@@ -1185,20 +2137,48 @@ impl FatFs {
     /// EOC-reserved but UNLINKED during the fill, so no reader path can walk onto its stale bytes). Error path:
     /// a zero-fill failure AFTER the claim orphans `c` (EOC, unlinked — a benign lost cluster, chkdsk-
     /// reclaimable), never an aliased or stale-visible one.
+    ///
+    /// MULTIBLK (2026-07-29) — THE ROTATING START, and why it is the biggest single amplifier here.
+    /// The search used to restart at cluster 2 on EVERY call. Allocating a run of N clusters is then
+    /// quadratic in the FAT sectors it reads: the flight recorder's 66048-byte reservation on a
+    /// 512-byte-cluster volume allocates 129 clusters, and if the free region starts around cluster
+    /// 2530 each of those 129 searches re-reads the ~20 FAT sectors in front of it — ~2580 sector
+    /// reads, which measured as the LARGEST source of BOT transactions in the QEMU FAT battery,
+    /// larger than every data transfer put together. Starting the scan where the last successful
+    /// claim left off makes the same reservation cost ~2 FAT sector reads, because a FAT32 sector
+    /// holds 128 entries and consecutive allocations stay inside it.
+    ///
+    /// CORRECTNESS IS UNCHANGED, and deliberately so — this alters the ORDER of the search, nothing
+    /// else. Every cluster in `[2, count + 2)` is still visited at most once per call (the scan wraps
+    /// exactly once, back to cluster 2), so "the volume is full" still means the volume is full and
+    /// `NoSpace` cannot be returned early. The claim is still the F3-M1 compare-and-claim under
+    /// `FAT_MUTATION`, so two cores cannot alias a cluster no matter where their searches began; a
+    /// stale or nonsensical hint (e.g. carried over from a different volume) is validated back into
+    /// range and costs at most one extra wrap, never a bad allocation. The zero-fill-after-claim
+    /// order, and with it the information-disclosure invariant, is untouched.
     fn alloc_cluster(&self) -> Result<u32, FatError> {
         let entry_bytes: u64 = if self.kind == FatKind::Fat32 { 4 } else { 2 };
         let last = self.count_of_clusters + 2; // exclusive: valid data clusters are 2 ..= count+1
+        if last <= 2 {
+            return Err(FatError::NoSpace);
+        }
         let mut buf = [0u8; SECTOR_SIZE];
         let mut loaded = u64::MAX;
-        let mut c = 2u32;
-        while c < last {
+        // Where to begin. A hint outside this volume's cluster range is meaningless, not dangerous —
+        // clamp it back to the classic start and carry on.
+        let hint = ALLOC_HINT.load(core::sync::atomic::Ordering::Relaxed);
+        let mut c = if hint < 2 || hint >= last { 2 } else { hint };
+        let span = last - 2; // clusters that exist; the scan visits each at most once
+        let mut visited = 0u32;
+        while visited < span {
+            visited += 1;
             let offset = c as u64 * entry_bytes;
             let sec = offset / SECTOR_SIZE as u64;
             if sec >= self.fat_sz as u64 {
                 break; // past the FAT region (defensive — parse_bpb already gates this)
             }
             if sec != loaded {
-                read_sector(self.source, self.fat_start + sec, &mut buf)?;
+                self.rd_sector(self.fat_start + sec, &mut buf)?;
                 loaded = sec;
             }
             let within = (offset % SECTOR_SIZE as u64) as usize;
@@ -1210,10 +2190,11 @@ impl FatFs {
                 // Candidate. COMPARE-AND-CLAIM under FAT_MUTATION: re-read the entry inside the lock and
                 // claim (EOC) only if still free — a racing allocator that claimed it first loses us nothing
                 // but this re-check. The whole hold is one sector read + the bounded all-copies RMW (the
-                // `with_fat_lock` span rule). On x86 the lock is inert (single FAT writer by construction).
-                let claimed = with_fat_lock(|| -> Result<bool, FatError> {
+                // `with_fat_lock` span rule). On x86 the lock is INERT — see `with_fat_lock` for what
+                // actually holds the x86 side together (it is NOT "one writer by construction").
+                let claimed = with_fat_lock_src(self.source, "alloc_cluster", || -> Result<bool, FatError> {
                     let mut cbuf = [0u8; SECTOR_SIZE];
-                    read_sector(self.source, self.fat_start + sec, &mut cbuf)?;
+                    self.rd_sector(self.fat_start + sec, &mut cbuf)?;
                     let cur = match self.kind {
                         FatKind::Fat16 => u16le(&cbuf, within) as u32,
                         FatKind::Fat32 => u32le(&cbuf, within) & 0x0FFF_FFFF,
@@ -1225,6 +2206,11 @@ impl FatFs {
                     Ok(true)
                 })?;
                 if claimed {
+                    // MULTIBLK: publish the hint BEFORE the zero-fill, so a zero-fill failure (which
+                    // orphans `c`) still moves the next search past it rather than re-finding a
+                    // cluster that is now EOC-marked and will simply be skipped.
+                    let next = if c + 1 >= last { 2 } else { c + 1 };
+                    ALLOC_HINT.store(next, core::sync::atomic::Ordering::Relaxed);
                     // Zero AFTER the claim (see the doc comment): EOC-reserved but unlinked, so no reader can
                     // see stale bytes; a failure here orphans `c` (benign lost cluster) rather than aliasing.
                     self.zero_cluster(c)?;
@@ -1232,7 +2218,14 @@ impl FatFs {
                 }
                 loaded = u64::MAX; // our search buffer is stale (a concurrent writer mutated this sector)
             }
+            // MULTIBLK: advance, wrapping ONCE back to cluster 2 — `visited`/`span` is what bounds
+            // the loop now, so wrapping cannot spin. The sector cache is dropped on a wrap because
+            // the scan jumps to a different part of the FAT.
             c += 1;
+            if c >= last {
+                c = 2;
+                loaded = u64::MAX;
+            }
         }
         Err(FatError::NoSpace)
     }
@@ -1292,52 +2285,108 @@ impl FatFs {
         }
     }
 
+    /// MULTIBLK: feed a directory's sectors to `visit` in disk order, reading them in CONTIGUOUS RUNS
+    /// instead of one sector per USB round trip. `start_cluster` is `None` for the FAT16 fixed root
+    /// (one contiguous run of `root_dir_sectors`, no chain at all) and `Some(c)` for a cluster-chain
+    /// directory (the FAT32 root or any subdirectory). `visit(lba, sector)` returns true to STOP —
+    /// which is how the "0x00 end-of-directory" terminator, a name match and a free-slot hit all
+    /// terminate the walk without this function knowing what any of them mean.
+    ///
+    /// This replaces six near-identical hand-rolled walks (read/locate/free-slot × fixed-root/chain),
+    /// each of which was one `read_sector` per directory sector PLUS one `fat_entry` sector read per
+    /// cluster hop — i.e. two USB transactions per 512 bytes of directory on a 512-byte-cluster
+    /// volume. `collect_chain` caches the FAT sector, so the hops now cost ~1 read for the whole
+    /// chain, and the sectors themselves come back in runs.
+    ///
+    /// ### Why the chunk size GROWS instead of being fixed at the maximum
+    /// A directory scan very often stops in its first sector — `locate_in_dir_chain` finding a name,
+    /// `free_slot_in_dir_chain` finding the terminator. Reading `MAX_BLOCKS_PER_OP` sectors up front
+    /// would make the common case fetch 64 sectors to look at one. Starting at one sector and
+    /// doubling gives the early exit its old cost exactly, and a full scan a logarithmic number of
+    /// transfers instead of a linear one — the right shape for both, with no caller having to choose.
+    ///
+    /// Guards are `collect_chain`'s, unchanged from the walks this replaces: a bad/free/out-of-range
+    /// cluster is `BadChain`, a chain longer than the volume has clusters is `BadChain`, and an EOC
+    /// simply ends the walk (the caller then reports `NotFound` / `NoSpace` / the entries it got).
+    ///
+    /// ONE deliberate divergence, on corrupt media only: because the chain is collected before the
+    /// first sector is scanned, a directory whose 0x00 terminator sits early but whose FAT chain is
+    /// damaged LATER now reports `BadChain`, where the old lazy walk would have stopped at the
+    /// terminator and never seen the damage. That is the stricter direction — the volume really is
+    /// corrupt — and it cannot arise on a well-formed one, where a chain is walked to its EOC.
+    fn walk_dir_sectors(
+        &self,
+        start_cluster: Option<u32>,
+        mut visit: impl FnMut(u64, &[u8; SECTOR_SIZE]) -> bool,
+    ) -> Result<(), FatError> {
+        // 1. The runs, as (first LBA, sector count). Consecutive clusters are consecutive LBAs, so a
+        //    contiguously-allocated directory collapses to a single run.
+        let runs: alloc::vec::Vec<(u64, u64)> = match start_cluster {
+            None => alloc::vec![(self.root_dir_lba, self.root_dir_sectors as u64)],
+            Some(start) => {
+                let clusters = self.collect_chain(start, self.count_of_clusters as usize + 1)?;
+                let spc = self.sec_per_clus as u64;
+                let mut runs = alloc::vec::Vec::new();
+                let mut i = 0usize;
+                while i < clusters.len() {
+                    let base = self.cluster_lba(clusters[i]);
+                    let mut n = spc;
+                    while i + 1 < clusters.len() && clusters[i + 1] == clusters[i] + 1 {
+                        n += spc;
+                        i += 1;
+                    }
+                    runs.push((base, n));
+                    i += 1;
+                }
+                runs
+            }
+        };
+
+        // 2. Walk them, growing the transfer size as the scan proves it is going to be a long one.
+        //    The cap is DELIBERATELY below `MAX_BLOCKS_PER_OP`: this buffer is allocated per scan and
+        //    directory scans are frequent (every path resolution runs one), so 8 KiB is the right
+        //    trade — it already covers 256 directory slots per transfer, which is more than any
+        //    directory this filesystem creates, and it keeps the per-scan allocation small.
+        let cap = core::cmp::min(crate::drivers::block::MAX_BLOCKS_PER_OP, 16);
+        let mut chunk = 1usize;
+        let mut buf = alloc::vec![0u8; cap * SECTOR_SIZE];
+        for (base, count) in runs {
+            let mut done = 0u64;
+            while done < count {
+                let n = core::cmp::min(chunk as u64, count - done) as usize;
+                self.rd_sectors(base + done, &mut buf[..n * SECTOR_SIZE])?;
+                for k in 0..n {
+                    let sec: &[u8; SECTOR_SIZE] = buf[k * SECTOR_SIZE..(k + 1) * SECTOR_SIZE]
+                        .try_into()
+                        .map_err(|_| FatError::Io)?;
+                    if visit(base + done + k as u64, sec) {
+                        return Ok(());
+                    }
+                }
+                done += n as u64;
+                chunk = core::cmp::min(chunk * 2, cap);
+            }
+        }
+        Ok(())
+    }
+
     /// FAT16 fixed root directory: a contiguous run of sectors, no cluster chain.
     fn read_fixed_root16(&self) -> Result<alloc::vec::Vec<DirEntry>, FatError> {
         let mut out = alloc::vec::Vec::new();
-        let mut buf = [0u8; SECTOR_SIZE];
         let mut lfn = LfnBuf::new();
-        for s in 0..self.root_dir_sectors as u64 {
-            read_sector(self.source, self.root_dir_lba + s, &mut buf)?;
-            if scan_dir_sector(&buf, &mut out, &mut lfn) {
-                break;
-            }
-        }
+        self.walk_dir_sectors(None, |_lba, sec| scan_dir_sector(sec, &mut out, &mut lfn))?;
         Ok(out)
     }
 
     /// Walk a directory stored as a cluster chain (the FAT32 root, or any subdirectory), collecting
     /// its entries. Stops at the 0x00 terminator or end-of-chain; guards against bad/free clusters
-    /// and a chain longer than the whole volume (loop protection).
+    /// and a chain longer than the whole volume (loop protection) — all now inside `walk_dir_sectors`
+    /// / `collect_chain`, so this and its five siblings cannot drift apart on them.
     fn read_dir_chain(&self, start: u32) -> Result<alloc::vec::Vec<DirEntry>, FatError> {
         let mut out = alloc::vec::Vec::new();
-        let mut cluster = start;
-        let mut hops = 0u32;
-        let mut buf = [0u8; SECTOR_SIZE];
         let mut lfn = LfnBuf::new();
-        loop {
-            if !self.valid_cluster(cluster) {
-                return Err(FatError::BadChain);
-            }
-            for s in 0..self.sec_per_clus as u64 {
-                read_sector(self.source, self.cluster_lba(cluster) + s, &mut buf)?;
-                if scan_dir_sector(&buf, &mut out, &mut lfn) {
-                    return Ok(out);
-                }
-            }
-            let next = self.fat_entry(cluster)?;
-            if self.is_eoc(next) {
-                return Ok(out);
-            }
-            if self.is_bad(next) || next < 2 {
-                return Err(FatError::BadChain);
-            }
-            cluster = next;
-            hops += 1;
-            if hops > self.count_of_clusters {
-                return Err(FatError::BadChain); // chain longer than the volume has clusters -> loop
-            }
-        }
+        self.walk_dir_sectors(Some(start), |_lba, sec| scan_dir_sector(sec, &mut out, &mut lfn))?;
+        Ok(out)
     }
 
     /// Find a top-level entry by 8.3 name (case-insensitive).
@@ -1354,12 +2403,28 @@ impl FatFs {
     /// `de.size`, `max_bytes`, or end-of-chain (whichever comes first). Guards against bad/free
     /// clusters and chain loops. Rejects a directory. A file whose chain ends before `de.size` (a
     /// malformed volume) yields a short read rather than an error — `out.len()` tells the caller.
+    ///
+    /// FATREAD-1: `out` is REPLACED, never appended to — on return `out` holds exactly the bytes
+    /// read and nothing else, so `out.len()` is the read length for ANY caller. The body copies with
+    /// `extend_from_slice`, which means a caller that hands in a NON-EMPTY buffer used to get its old
+    /// contents with the file appended after them. Every caller that pre-sized its buffer from the
+    /// directory (`vec![0u8; de.size]` — a natural reading of "read the file into this") therefore got
+    /// a result of exactly `2 * de.size`, silently, with the file's real bytes sitting behind a run of
+    /// zeros. That is the doubling that blocked `bg /fat/STAT.ELF` and `bg /fat/VUG.ELF` on x86: the
+    /// directory said 8472 / 12568 and the loader was handed 16944 / 25136 — past the 16 KiB user
+    /// window, so both were rejected as oversize. It read as time-dependent (early boot fine, later
+    /// broken) only because the doubling is invisible until `2 * size` crosses a caller's cap: U2's
+    /// 72-byte HELLO.BIN doubles to 144 and still fits, an 8472-byte ELF does not. Clearing here is
+    /// the fix at the definition rather than at each call site, because the contract — not the
+    /// callers — was what was ambiguous. It is a no-op for every caller that already passed an empty
+    /// `Vec` (which is all of them on aarch64), so this is byte-inert on that arch.
     pub fn read_file(
         &self,
         de: &DirEntry,
         out: &mut alloc::vec::Vec<u8>,
         max_bytes: usize,
     ) -> Result<(), FatError> {
+        out.clear(); // FATREAD-1: "into `out`" means REPLACE — see the doc note above.
         if de.is_dir {
             return Err(FatError::IsDirectory);
         }
@@ -1370,35 +2435,17 @@ impl FatFs {
         if !self.valid_cluster(de.first_cluster) {
             return Err(FatError::BadChain);
         }
-        let mut cluster = de.first_cluster;
-        let mut hops = 0u32;
-        let mut buf = [0u8; SECTOR_SIZE];
-        'chain: loop {
-            if !self.valid_cluster(cluster) {
-                return Err(FatError::BadChain);
-            }
-            for s in 0..self.sec_per_clus as u64 {
-                read_sector(self.source, self.cluster_lba(cluster) + s, &mut buf)?;
-                let take = core::cmp::min(remaining, SECTOR_SIZE);
-                out.extend_from_slice(&buf[..take]);
-                remaining -= take;
-                if remaining == 0 {
-                    break 'chain;
-                }
-            }
-            let next = self.fat_entry(cluster)?;
-            if self.is_eoc(next) {
-                break; // chain ended before de.size (malformed) — return the short read
-            }
-            if self.is_bad(next) || next < 2 {
-                return Err(FatError::BadChain);
-            }
-            cluster = next;
-            hops += 1;
-            if hops > self.count_of_clusters {
-                return Err(FatError::BadChain); // chain longer than the volume has clusters -> loop
-            }
-        }
+        // MULTIBLK: collect the chain, then read it in contiguous runs. This is the path
+        // `load_program_into_slot` uses for every user program on the volume, so it is exactly the
+        // path the boot-time `FS: 8472 STAT.ELF` / `FS: 12568 VUG.ELF` reads run down: 17 and 25
+        // sectors respectively, previously 17 and 25 separate READ(10)s plus one FAT sector read per
+        // cluster hop. Guards unchanged and now single-sourced in `collect_chain`: bad/free cluster
+        // and chain loop are `BadChain`, an early EOC returns the short read.
+        let clus_bytes = self.sec_per_clus as usize * SECTOR_SIZE;
+        let need = (remaining + clus_bytes - 1) / clus_bytes;
+        let clusters = self.collect_chain(de.first_cluster, need)?;
+        remaining = core::cmp::min(remaining, clusters.len().saturating_mul(clus_bytes));
+        self.read_span(&clusters, 0, remaining, out)?;
         Ok(())
     }
 
@@ -1409,10 +2456,18 @@ impl FatFs {
     /// bytes. Read-only — never writes the FAT, directory, or data. Stops at `size`, `start + max`, or
     /// end-of-chain; guards against bad/free clusters and chain loops exactly as `read_file`.
     ///
-    /// This is the offset-aware twin of `read_file`; `read_file` is deliberately left untouched (its
-    /// M6g/U4 `load_program_into_slot` caller reads whole programs from offset 0 and must stay
-    /// byte-identical). `read_at(fc, size, 0, out, max)` delivers the same bytes `read_file` would for a
-    /// non-directory entry, so the two share no code by design, not by divergence.
+    /// This is the offset-aware twin of `read_file`. ⚠ MULTIBLK (2026-07-29) SUPERSEDES the note that
+    /// stood here — it said the two "share no code by design, not by divergence", because `read_file`
+    /// was being held byte-identical for its M6g/U4 `load_program_into_slot` caller. They now share
+    /// `collect_chain` + `read_span`, which is the stronger form of the same guarantee: the twins
+    /// cannot diverge on bounds, on the short-read rule or on the FATREAD-1 replace contract, because
+    /// there is only one implementation of each. `read_at(fc, size, 0, out, max)` still delivers
+    /// exactly the bytes `read_file` would for a non-directory entry.
+    ///
+    /// FATREAD-1: `out` is REPLACED, never appended to — the same contract `read_file` now states,
+    /// for the same reason, so the twins cannot diverge on it. Every current caller already hands in
+    /// an empty `Vec`, so the clear is byte-inert on both arches; it exists so the next caller that
+    /// reasonably pre-sizes its buffer does not silently get a double-length result.
     pub fn read_at(
         &self,
         first_cluster: u32,
@@ -1421,6 +2476,7 @@ impl FatFs {
         out: &mut alloc::vec::Vec<u8>,
         max: usize,
     ) -> Result<(), FatError> {
+        out.clear(); // FATREAD-1: "into `out`" means REPLACE — see the doc note above.
         if start >= size {
             return Ok(()); // at or past EOF — nothing to read (a legal 0-byte result)
         }
@@ -1428,7 +2484,6 @@ impl FatFs {
         // above, so `end > start` and `want >= 1` here.
         let end = core::cmp::min(size as usize, (start as usize).saturating_add(max));
         let mut want = end - start as usize;
-        let mut skip = start as usize; // bytes still to skip before the first delivered byte
         if want == 0 {
             return Ok(()); // caller requested 0 bytes
         }
@@ -1436,46 +2491,20 @@ impl FatFs {
             return Err(FatError::BadChain);
         }
         let clus_bytes = self.sec_per_clus as usize * SECTOR_SIZE;
-        let mut cluster = first_cluster;
-        let mut hops = 0u32;
-        let mut buf = [0u8; SECTOR_SIZE];
-        'chain: loop {
-            if !self.valid_cluster(cluster) {
-                return Err(FatError::BadChain);
-            }
-            if skip >= clus_bytes {
-                // The whole cluster is before `start` — skip it without touching the disk.
-                skip -= clus_bytes;
-            } else {
-                for s in 0..self.sec_per_clus as u64 {
-                    if skip >= SECTOR_SIZE {
-                        skip -= SECTOR_SIZE; // this whole sector is still before `start`
-                        continue;
-                    }
-                    read_sector(self.source, self.cluster_lba(cluster) + s, &mut buf)?;
-                    let from = skip; // nonzero only on the first partially-skipped sector
-                    skip = 0;
-                    let take = core::cmp::min(want, SECTOR_SIZE - from);
-                    out.extend_from_slice(&buf[from..from + take]);
-                    want -= take;
-                    if want == 0 {
-                        break 'chain;
-                    }
-                }
-            }
-            let next = self.fat_entry(cluster)?;
-            if self.is_eoc(next) {
-                break; // chain ended before `end` (malformed vs `size`) — return the short read
-            }
-            if self.is_bad(next) || next < 2 {
-                return Err(FatError::BadChain);
-            }
-            cluster = next;
-            hops += 1;
-            if hops > self.count_of_clusters {
-                return Err(FatError::BadChain); // chain longer than the volume has clusters -> loop
-            }
+        // MULTIBLK: collect the chain up to the cluster the LAST wanted byte falls in, then read
+        // spans over it. `skip` is no longer a running subtraction — `read_span` addresses the file
+        // by byte offset directly, and clusters entirely before `start` are simply never visited
+        // (the old loop's "skip it without touching the disk" is now "never index it"). Every guard
+        // is preserved inside `collect_chain`: bad/free cluster and chain loop are `BadChain`, an
+        // early EOC yields a short read.
+        let need = (end + clus_bytes - 1) / clus_bytes;
+        let clusters = self.collect_chain(first_cluster, need)?;
+        let covered = clusters.len().saturating_mul(clus_bytes);
+        if covered <= start as usize {
+            return Ok(()); // the chain ends before `start` — a legal short (empty) read
         }
+        want = core::cmp::min(want, covered - start as usize);
+        self.read_span(&clusters, start as usize, want, out)?;
         Ok(())
     }
 
@@ -1494,6 +2523,207 @@ impl FatFs {
     ///     that re-`mount`s and `find_in_root`s the file sees the same size and chain head afterwards.
     /// Guards against bad/free clusters and chain loops exactly as `read_at`. A chain that ends before `size`
     /// (a malformed volume) yields a SHORT write (the returned count) rather than writing outside the chain.
+    /// MULTIBLK: walk the cluster chain from `first`, collecting up to `max_clusters` clusters in
+    /// order, and CACHE the FAT sector across hops.
+    ///
+    /// Two things it buys over the lazy `fat_entry`-per-hop walk it replaces in the span callers:
+    ///   * the chain arrives as a slice, which is what makes contiguity detectable at all — you
+    ///     cannot coalesce a run you are discovering one element at a time; and
+    ///   * a FAT32 sector holds 128 entries and a FAT16 sector 256, so a file laid down contiguously
+    ///     by any formatter costs ONE FAT read for its whole chain instead of one per cluster. On the
+    ///     QEMU fixture volumes (512-byte clusters) that alone dominates: a 12568-byte VUG.ELF is 25
+    ///     clusters, i.e. 25 FAT sector reads before this and 1 after.
+    ///
+    /// Bounds are the read walkers' bounds, unchanged: a free/bad/out-of-range cluster is
+    /// `BadChain`, a chain longer than the volume has clusters is `BadChain` (loop guard), and an
+    /// EOC before `max_clusters` simply ends the walk — the caller sees a SHORT chain and short-reads
+    /// or short-writes against it, exactly as the lazy walkers did.
+    ///
+    /// The cache is per-CALL and never outlives the walk, so it introduces no new coherence claim: a
+    /// chain walk was never atomic with respect to a concurrent FAT mutation before this either.
+    fn collect_chain(&self, first: u32, max_clusters: usize) -> Result<alloc::vec::Vec<u32>, FatError> {
+        let mut out = alloc::vec::Vec::new();
+        if max_clusters == 0 {
+            return Ok(out);
+        }
+        if !self.valid_cluster(first) {
+            return Err(FatError::BadChain);
+        }
+        let entry_bytes: u64 = if self.kind == FatKind::Fat32 { 4 } else { 2 };
+        let mut buf = [0u8; SECTOR_SIZE];
+        let mut loaded = u64::MAX; // which FAT sector `buf` currently holds (u64::MAX = none)
+        let mut cluster = first;
+        let mut hops = 0u32;
+        loop {
+            out.push(cluster);
+            if out.len() >= max_clusters {
+                return Ok(out);
+            }
+            let offset = cluster as u64 * entry_bytes;
+            let sec = offset / SECTOR_SIZE as u64;
+            if sec >= self.fat_sz as u64 {
+                return Err(FatError::BadChain); // outside the FAT region — same guard as fat_entry_copy
+            }
+            if sec != loaded {
+                self.rd_sector(self.fat_start + sec, &mut buf)?;
+                loaded = sec;
+            }
+            let within = (offset % SECTOR_SIZE as u64) as usize;
+            let next = match self.kind {
+                FatKind::Fat16 => u16le(&buf, within) as u32,
+                FatKind::Fat32 => u32le(&buf, within) & 0x0FFF_FFFF,
+            };
+            if self.is_eoc(next) {
+                return Ok(out); // chain ended early — the caller short-reads/short-writes
+            }
+            if self.is_bad(next) || next < 2 || !self.valid_cluster(next) {
+                return Err(FatError::BadChain);
+            }
+            cluster = next;
+            hops += 1;
+            if hops > self.count_of_clusters {
+                return Err(FatError::BadChain); // longer than the volume has clusters -> a loop
+            }
+        }
+    }
+
+    /// MULTIBLK: how many sectors, starting at `clusters[ci]` sector `s0`, are CONSECUTIVE on disk.
+    ///
+    /// Within one cluster the answer is trivially "the rest of the cluster". Across clusters it holds
+    /// only while the chain is physically contiguous, i.e. `clusters[i + 1] == clusters[i] + 1` —
+    /// which for FAT is exactly the condition `cluster_lba(c + 1) == cluster_lba(c) + sec_per_clus`,
+    /// since cluster LBAs are a linear function of the cluster number. Files a formatter has just
+    /// laid down are usually one long contiguous run, so this is the common case, not the lucky one;
+    /// a fragmented file simply gets several runs and still beats one transfer per sector.
+    fn contiguous_sectors(&self, clusters: &[u32], ci: usize, s0: u64) -> u64 {
+        let spc = self.sec_per_clus as u64;
+        let mut n = spc - s0;
+        let mut i = ci;
+        while i + 1 < clusters.len() && clusters[i + 1] == clusters[i] + 1 {
+            n += spc;
+            i += 1;
+        }
+        n
+    }
+
+    /// MULTIBLK: write `data` into the byte range `[pos, pos + data.len())` of a file whose chain is
+    /// `clusters` (element `i` covering file bytes `[i * clus_bytes, (i + 1) * clus_bytes)`).
+    /// Returns the number of bytes written; a `pos` past what `clusters` covers is a short write.
+    ///
+    /// This is the shape that replaces the per-sector read-modify-write loop, and it splits the span
+    /// into at most three pieces per contiguous run:
+    ///   * a HEAD partial sector (only when `pos` is not sector-aligned) — one sector RMW, because
+    ///     the bytes before `pos` inside that sector must survive;
+    ///   * a BODY of whole sectors — issued as ONE counted `write_sectors` with NO preceding read at
+    ///     all, since `data` covers every byte of it. This is where both wins land;
+    ///   * a TAIL partial sector (only when fewer than 512 bytes remain) — one sector RMW, for the
+    ///     mirror-image reason to the head.
+    /// A partial sector still costs a read; that is not an oversight, it is the only way to preserve
+    /// the untouched bytes, and it is why the two RMWs are kept and only the interior is optimised.
+    fn write_span(&self, clusters: &[u32], start: usize, data: &[u8]) -> Result<usize, FatError> {
+        let clus_bytes = self.sec_per_clus as usize * SECTOR_SIZE;
+        let mut done = 0usize;
+        let mut pos = start;
+        let mut buf = [0u8; SECTOR_SIZE];
+        while done < data.len() {
+            let ci = pos / clus_bytes;
+            let Some(&cluster) = clusters.get(ci) else {
+                break; // the chain does not reach this far — a short write, never a write off-chain
+            };
+            if !self.valid_cluster(cluster) {
+                return Err(FatError::BadChain);
+            }
+            let in_clus = pos % clus_bytes;
+            let s0 = (in_clus / SECTOR_SIZE) as u64;
+            let in_sec = in_clus % SECTOR_SIZE;
+            let lba = self.cluster_lba(cluster) + s0;
+            let remaining = data.len() - done;
+
+            if in_sec != 0 {
+                // HEAD: partial sector — read, patch, write back. Exactly the old loop body.
+                let take = core::cmp::min(remaining, SECTOR_SIZE - in_sec);
+                self.rd_sector(lba, &mut buf)?;
+                buf[in_sec..in_sec + take].copy_from_slice(&data[done..done + take]);
+                self.wr_sector(lba, &buf)?;
+                done += take;
+                pos += take;
+                continue;
+            }
+
+            let full = (remaining / SECTOR_SIZE) as u64;
+            if full == 0 {
+                // TAIL: fewer than a whole sector left — read, patch, write back.
+                self.rd_sector(lba, &mut buf)?;
+                buf[..remaining].copy_from_slice(&data[done..]);
+                self.wr_sector(lba, &buf)?;
+                done += remaining;
+                pos += remaining;
+                continue;
+            }
+
+            // BODY: the longest run that is contiguous on disk, still covered by `data`, and still
+            // inside the chain we were given. No read — `data` supplies every byte.
+            let run = core::cmp::min(full, self.contiguous_sectors(clusters, ci, s0));
+            let bytes = run as usize * SECTOR_SIZE;
+            self.wr_sectors(lba, &data[done..done + bytes])?;
+            done += bytes;
+            pos += bytes;
+        }
+        Ok(done)
+    }
+
+    /// MULTIBLK: the read twin of [`FatFs::write_span`] — append `len` bytes from byte offset `start`
+    /// of the file whose chain is `clusters` onto `out`. Returns the number of bytes delivered (short
+    /// if the chain ends first). Reads coalesce over the same contiguous runs; there is no
+    /// read-modify-write asymmetry here, so the only split is "partial sector" vs "whole-sector run".
+    fn read_span(
+        &self,
+        clusters: &[u32],
+        start: usize,
+        len: usize,
+        out: &mut alloc::vec::Vec<u8>,
+    ) -> Result<usize, FatError> {
+        let clus_bytes = self.sec_per_clus as usize * SECTOR_SIZE;
+        let mut done = 0usize;
+        let mut pos = start;
+        let mut buf = [0u8; SECTOR_SIZE];
+        while done < len {
+            let ci = pos / clus_bytes;
+            let Some(&cluster) = clusters.get(ci) else {
+                break; // chain ended before `len` — return the short read, as the walkers always did
+            };
+            if !self.valid_cluster(cluster) {
+                return Err(FatError::BadChain);
+            }
+            let in_clus = pos % clus_bytes;
+            let s0 = (in_clus / SECTOR_SIZE) as u64;
+            let in_sec = in_clus % SECTOR_SIZE;
+            let lba = self.cluster_lba(cluster) + s0;
+            let remaining = len - done;
+
+            if in_sec != 0 || remaining < SECTOR_SIZE {
+                // A partial sector at either end: one sector read, copy out the covered slice.
+                let take = core::cmp::min(remaining, SECTOR_SIZE - in_sec);
+                self.rd_sector(lba, &mut buf)?;
+                out.extend_from_slice(&buf[in_sec..in_sec + take]);
+                done += take;
+                pos += take;
+                continue;
+            }
+
+            let full = (remaining / SECTOR_SIZE) as u64;
+            let run = core::cmp::min(full, self.contiguous_sectors(clusters, ci, s0));
+            let bytes = run as usize * SECTOR_SIZE;
+            // Extend `out` in place and read the whole run straight into it — one transfer.
+            let at = out.len();
+            out.resize(at + bytes, 0);
+            self.rd_sectors(lba, &mut out[at..at + bytes])?;
+            done += bytes;
+            pos += bytes;
+        }
+        Ok(done)
+    }
+
     pub fn write_at(
         &self,
         first_cluster: u32,
@@ -1516,55 +2746,30 @@ impl FatFs {
             return Err(FatError::BadChain);
         }
         let clus_bytes = self.sec_per_clus as usize * SECTOR_SIZE;
-        let mut cluster = first_cluster;
-        let mut hops = 0u32;
-        let mut buf = [0u8; SECTOR_SIZE];
-        let mut skip = start as usize; // bytes still to skip before the first written byte
-        let mut src_off = 0usize; // bytes of `data` already written
-        'chain: loop {
-            if !self.valid_cluster(cluster) {
-                return Err(FatError::BadChain);
-            }
-            if skip >= clus_bytes {
-                // The whole cluster is before `start` — skip it without touching the disk.
-                skip -= clus_bytes;
-            } else {
-                for s in 0..self.sec_per_clus as u64 {
-                    if skip >= SECTOR_SIZE {
-                        skip -= SECTOR_SIZE; // this whole sector is still before `start`
-                        continue;
-                    }
-                    let lba = self.cluster_lba(cluster) + s;
-                    let from = skip; // nonzero only on the first partially-skipped sector
-                    skip = 0;
-                    let take = core::cmp::min(want, SECTOR_SIZE - from);
-                    // Read-modify-write: read the sector, overwrite [from..from+take], write it back. Even a
-                    // full-sector overwrite reads first (uniform RMW — the brief's "read-modify-write the
-                    // touched sectors"; a partial first/last sector's untouched bytes MUST be preserved).
-                    read_sector(self.source, lba, &mut buf)?;
-                    buf[from..from + take].copy_from_slice(&data[src_off..src_off + take]);
-                    write_sector(self.source, lba, &buf)?;
-                    src_off += take;
-                    want -= take;
-                    if want == 0 {
-                        break 'chain;
-                    }
-                }
-            }
-            let next = self.fat_entry(cluster)?;
-            if self.is_eoc(next) {
-                break; // chain ended before `end` (malformed vs `size`) — return the short write
-            }
-            if self.is_bad(next) || next < 2 {
-                return Err(FatError::BadChain);
-            }
-            cluster = next;
-            hops += 1;
-            if hops > self.count_of_clusters {
-                return Err(FatError::BadChain); // chain longer than the volume has clusters -> loop
-            }
+
+        // MULTIBLK: the lazy per-cluster `fat_entry` walk that used to live here has been replaced by
+        // "collect the chain, then write spans over it". EVERY bound this function documents is
+        // preserved, and each is now enforced in exactly one place:
+        //   * never grows        — `end` is still clamped to `size` above, and `write_span` refuses to
+        //                          step past the clusters it was handed;
+        //   * never allocates    — `collect_chain` only READS the FAT; nothing here writes it;
+        //   * never touches dirs — unchanged, there is no directory access in this function;
+        //   * bad/free cluster, chain loop -> `BadChain` — `collect_chain` carries the identical
+        //     guards (`is_bad`, `< 2`, `valid_cluster`, hop count vs `count_of_clusters`);
+        //   * a chain that ends before `size` yields a SHORT write — `collect_chain` returns the short
+        //     chain and `write_span` stops at its end, returning what it managed.
+        let need = (end + clus_bytes - 1) / clus_bytes; // clusters the write's END byte reaches into
+        let clusters = self.collect_chain(first_cluster, need)?;
+        // Clamp to what the collected chain actually covers, so a truncated chain short-writes rather
+        // than the caller being told bytes landed that never did.
+        let covered = clusters.len().saturating_mul(clus_bytes);
+        if covered <= start as usize {
+            return Ok(0);
         }
-        Ok(total - want)
+        want = core::cmp::min(want, covered - start as usize);
+        let wrote = self.write_span(&clusters, start as usize, &data[..want])?;
+        debug_assert!(wrote <= total);
+        Ok(wrote)
     }
 
     /// U10: like [`FatFs::find_in_root`] but also returns the on-disk LOCATION of the matched 8.3 entry — the
@@ -1581,63 +2786,43 @@ impl FatFs {
     /// FAT16 fixed root directory: a contiguous run of sectors, no cluster chain. Returns the matched entry
     /// with its (LBA, slot-offset). Stops at the 0x00 end marker exactly as `read_fixed_root16`.
     fn locate_in_fixed_root16(&self, name: &str) -> Result<(DirEntry, u64, usize), FatError> {
-        let mut buf = [0u8; SECTOR_SIZE];
-        for s in 0..self.root_dir_sectors as u64 {
-            let lba = self.root_dir_lba + s;
-            read_sector(self.source, lba, &mut buf)?;
-            for i in 0..(SECTOR_SIZE / 32) {
-                match classify_dir_slot(&buf[i * 32..i * 32 + 32]) {
-                    DirSlot::End => return Err(FatError::NotFound),
-                    DirSlot::Skip => continue,
-                    DirSlot::Entry(de) => {
-                        if de.eq_name(name) {
-                            return Ok((de, lba, i * 32));
-                        }
-                    }
-                }
-            }
-        }
-        Err(FatError::NotFound)
+        self.locate_in_dir_sectors(None, name)
     }
 
     /// A directory stored as a cluster chain (the FAT32 root, or any subdirectory): the located twin of
     /// `read_dir_chain`. Same bounded walk + bad/free-cluster + loop guards.
     fn locate_in_dir_chain(&self, start: u32, name: &str) -> Result<(DirEntry, u64, usize), FatError> {
-        let mut cluster = start;
-        let mut hops = 0u32;
-        let mut buf = [0u8; SECTOR_SIZE];
-        loop {
-            if !self.valid_cluster(cluster) {
-                return Err(FatError::BadChain);
-            }
-            for s in 0..self.sec_per_clus as u64 {
-                let lba = self.cluster_lba(cluster) + s;
-                read_sector(self.source, lba, &mut buf)?;
-                for i in 0..(SECTOR_SIZE / 32) {
-                    match classify_dir_slot(&buf[i * 32..i * 32 + 32]) {
-                        DirSlot::End => return Err(FatError::NotFound),
-                        DirSlot::Skip => continue,
-                        DirSlot::Entry(de) => {
-                            if de.eq_name(name) {
-                                return Ok((de, lba, i * 32));
-                            }
+        self.locate_in_dir_sectors(Some(start), name)
+    }
+
+    /// MULTIBLK: the one implementation behind [`FatFs::locate_in_fixed_root16`] and
+    /// [`FatFs::locate_in_dir_chain`] — they differed only in how they enumerated sectors, which is
+    /// now [`FatFs::walk_dir_sectors`]'s job. Semantics are preserved exactly: the first 0x00 slot
+    /// ends the directory and yields `NotFound` even if later sectors still hold data (that is what
+    /// "end of directory" means on FAT), a 0xE5/LFN slot is skipped, and the first short-name match
+    /// wins with its (LBA, slot-offset).
+    fn locate_in_dir_sectors(
+        &self,
+        start_cluster: Option<u32>,
+        name: &str,
+    ) -> Result<(DirEntry, u64, usize), FatError> {
+        let mut found: Option<(DirEntry, u64, usize)> = None;
+        self.walk_dir_sectors(start_cluster, |lba, sec| {
+            for i in 0..(SECTOR_SIZE / 32) {
+                match classify_dir_slot(&sec[i * 32..i * 32 + 32]) {
+                    DirSlot::End => return true, // end of directory — stop, `found` stays None
+                    DirSlot::Skip => continue,
+                    DirSlot::Entry(de) => {
+                        if de.eq_name(name) {
+                            found = Some((de, lba, i * 32));
+                            return true;
                         }
                     }
                 }
             }
-            let next = self.fat_entry(cluster)?;
-            if self.is_eoc(next) {
-                return Err(FatError::NotFound);
-            }
-            if self.is_bad(next) || next < 2 {
-                return Err(FatError::BadChain);
-            }
-            cluster = next;
-            hops += 1;
-            if hops > self.count_of_clusters {
-                return Err(FatError::BadChain);
-            }
-        }
+            false
+        })?;
+        found.ok_or(FatError::NotFound)
     }
 
     /// U10: publish a directory entry's `first_cluster` (bytes 20-21 hi, 26-27 lo) and `size` (bytes 28-31) at
@@ -1657,15 +2842,15 @@ impl FatFs {
         }
         // F3-M2: the whole sector RMW under DIR_MUTATION — a concurrent RMW of a NEIGHBOURING slot in this
         // same sector can no longer read-before-our-write and clobber this publish (or vice versa).
-        with_dir_lock(|| {
+        with_dir_lock_src(self.source, "write_dir_entry_fields", || {
             let mut buf = [0u8; SECTOR_SIZE];
-            read_sector(self.source, lba, &mut buf)?;
+            self.rd_sector(lba, &mut buf)?;
             let hi = (first_cluster >> 16) as u16;
             let lo = (first_cluster & 0xFFFF) as u16;
             buf[off + 20..off + 22].copy_from_slice(&hi.to_le_bytes());
             buf[off + 26..off + 28].copy_from_slice(&lo.to_le_bytes());
             buf[off + 28..off + 32].copy_from_slice(&size.to_le_bytes());
-            write_sector(self.source, lba, &buf)?;
+            self.wr_sector(lba, &buf)?;
             Ok(())
         })
     }
@@ -1688,9 +2873,9 @@ impl FatFs {
         if off + 32 > SECTOR_SIZE {
             return Err(FatError::Io); // a slot never straddles a sector; a bad offset is a caller bug
         }
-        with_dir_lock(|| {
+        with_dir_lock_src(self.source, "write_dir_entry_fields_mtime", || {
             let mut buf = [0u8; SECTOR_SIZE];
-            read_sector(self.source, lba, &mut buf)?;
+            self.rd_sector(lba, &mut buf)?;
             let hi = (first_cluster >> 16) as u16;
             let lo = (first_cluster & 0xFFFF) as u16;
             buf[off + 20..off + 22].copy_from_slice(&hi.to_le_bytes());
@@ -1701,7 +2886,7 @@ impl FatFs {
                 buf[off + 22..off + 24].copy_from_slice(&mt.to_le_bytes());
                 buf[off + 24..off + 26].copy_from_slice(&md.to_le_bytes());
             }
-            write_sector(self.source, lba, &buf)?;
+            self.wr_sector(lba, &buf)?;
             Ok(())
         })
     }
@@ -1764,22 +2949,20 @@ impl FatFs {
         // 3. RMW the data across the chain. `start <= size <= end`, and the chain now covers [0, needed*clus),
         //    so every byte in [start, end) maps to an existing cluster. A partial sector preserves its other
         //    bytes; a freshly allocated cluster's untouched bytes stay zero (from step 2's zero-fill).
-        let mut written = 0usize;
-        let mut pos = start as usize;
-        let mut buf = [0u8; SECTOR_SIZE];
-        while written < data.len() {
-            let ci = pos / clus_bytes;
-            let cluster = *chain.get(ci).ok_or(FatError::BadChain)?;
-            let in_clus = pos % clus_bytes;
-            let sec_in_clus = (in_clus / SECTOR_SIZE) as u64;
-            let in_sec = in_clus % SECTOR_SIZE;
-            let lba = self.cluster_lba(cluster) + sec_in_clus;
-            let take = core::cmp::min(data.len() - written, SECTOR_SIZE - in_sec);
-            read_sector(self.source, lba, &mut buf)?;
-            buf[in_sec..in_sec + take].copy_from_slice(&data[written..written + take]);
-            write_sector(self.source, lba, &buf)?;
-            written += take;
-            pos += take;
+        //    MULTIBLK: this was a per-sector read-modify-write loop, and §12.1 counted it as 129
+        //    READ(10) + 129 WRITE(10) for a single 66048-byte flight-recorder reservation. `write_span`
+        //    keeps the RMW for the head and tail partial sectors — those bytes outside the write MUST
+        //    be preserved — and issues the whole-sector interior as counted, contiguous, READ-FREE
+        //    writes. Step 2 has just guaranteed the chain covers `[0, needed * clus_bytes)`, so
+        //    `write_span` can never run off its end here; it returns a short count only if handed a
+        //    short chain, which is why the total is checked below rather than assumed.
+        let written = self.write_span(&chain, start as usize, data)?;
+        if written != data.len() {
+            // The chain we just ensured covers the range did not, in fact, cover it. That is a
+            // corrupt-volume / lost-race condition, not a legal short write for a GROWING write:
+            // reporting fewer bytes while step 4 below publishes `new_size` would claim a size the
+            // data does not back. Fail instead, leaving the OLD size on disk (the safe order).
+            return Err(FatError::BadChain);
         }
 
         // 4. LAST: publish size (+ chain head if it changed) to the directory — data + FAT already
@@ -1802,9 +2985,9 @@ impl FatFs {
         // F3-M2: the slot WRITE is a sector RMW under DIR_MUTATION (the free-slot SCAN above stays outside —
         // per the with_dir_lock span rule; the scan-then-claim slot race itself is the F3-M3 namespace lock's).
         // JD6: this with_dir_lock slot-write body is TWINNED VERBATIM in `create_in_dir` — keep the two in sync.
-        with_dir_lock(|| {
+        with_dir_lock_src(self.source, "create_in_root", || {
             let mut buf = [0u8; SECTOR_SIZE];
-            read_sector(self.source, lba, &mut buf)?;
+            self.rd_sector(lba, &mut buf)?;
             // Write a fresh 32-byte entry: 11-byte name, attr, everything else zero (NTRes/times = 0,
             // first_cluster hi@20 lo@26 = 0, size@28 = 0). Never set the volume-label bit — a file/dir entry.
             for b in buf[off..off + 32].iter_mut() {
@@ -1817,7 +3000,7 @@ impl FatFs {
             let (mt, md) = crate::clock::fat_stamp();
             buf[off + 22..off + 24].copy_from_slice(&mt.to_le_bytes());
             buf[off + 24..off + 26].copy_from_slice(&md.to_le_bytes());
-            write_sector(self.source, lba, &buf)?;
+            self.wr_sector(lba, &buf)?;
             // Re-parse the slot we just wrote so the returned DirEntry is byte-for-byte what a reader sees.
             match classify_dir_slot(&buf[off..off + 32]) {
                 DirSlot::Entry(de) => Ok((de, lba, off)),
@@ -1877,9 +3060,9 @@ impl FatFs {
         // F3-M2: the slot WRITE is a sector RMW under DIR_MUTATION — the free-slot SCAN above stays
         // outside, exactly as in `create_in_root`.
         // ⚠ VERBATIM TWIN of `create_in_root`'s with_dir_lock block — keep in sync (seat review diffs these).
-        with_dir_lock(|| {
+        with_dir_lock_src(self.source, "create_in_dir", || {
             let mut buf = [0u8; SECTOR_SIZE];
-            read_sector(self.source, lba, &mut buf)?;
+            self.rd_sector(lba, &mut buf)?;
             // Write a fresh 32-byte entry: 11-byte name, attr, everything else zero (NTRes/times = 0,
             // first_cluster hi@20 lo@26 = 0, size@28 = 0). Never set the volume-label bit — a file/dir entry.
             for b in buf[off..off + 32].iter_mut() {
@@ -1892,7 +3075,7 @@ impl FatFs {
             let (mt, md) = crate::clock::fat_stamp();
             buf[off + 22..off + 24].copy_from_slice(&mt.to_le_bytes());
             buf[off + 24..off + 26].copy_from_slice(&md.to_le_bytes());
-            write_sector(self.source, lba, &buf)?;
+            self.wr_sector(lba, &buf)?;
             // Re-parse the slot we just wrote so the returned DirEntry is byte-for-byte what a reader sees.
             match classify_dir_slot(&buf[off..off + 32]) {
                 DirSlot::Entry(de) => Ok((de, lba, off)),
@@ -1910,7 +3093,7 @@ impl FatFs {
     // `FAT_MUTATION`/`DIR_MUTATION`. Consumed by the aarch64 panel's `mkdir`/`rmdir` (JD7) AFTER this
     // arc merges: call, never edit.
     //
-    // LOCKING (invariant 5 — SOUND WITHOUT the syscall-layer NAMESPACE lock, because EL1 shell callers
+    // LOCKING (invariant 5 — SOUND WITHOUT the syscall-layer NAMESPACE lock, because kernel shell callers
     // reach fat.rs directly): every SECTOR mutation is SMP-atomic via the existing per-RMW locks, and
     // `DIR_MUTATION` is never widened past its documented single-sector-RMW span (holding it across a
     // directory SCAN or across `free_chain`'s block I/O would break the IRQ-masked-non-preemptible span
@@ -1919,9 +3102,9 @@ impl FatFs {
     // two-cores-mid-syscall interleave: `remove_dir`'s emptiness-scan -> `delete_located` is not atomic
     // against a concurrent `create_in_dir` INTO the same target directory (a file linked between the
     // scan and the free is orphaned in a freed chain). EXCLUDED_BY_SEQUENCING today — the only FS
-    // mutators are the single-threaded EL1 panel shell, EL0 syscalls (serialized by the syscall
+    // mutators are the single-threaded kernel panel shell, user syscalls (serialized by the syscall
     // NAMESPACE lock), and the await-verdict-sequenced reaper; none races another FS mutator. The fix
-    // when concurrent EL1 mutators appear is a fat.rs namespace lock spanning both sequences — a future
+    // when concurrent kernel mutators appear is a fat.rs namespace lock spanning both sequences — a future
     // seam change that would have to touch `create_in_dir`, so it is out of this additive grant.
     // =============================================================================================
 
@@ -1962,7 +3145,7 @@ impl FatFs {
         buf[56..58].copy_from_slice(&md.to_le_bytes()); //  ".." date @0x18 (entry base 32 + 24)
         // size@28..32 and @60..64 stay 0 (directories report size 0); the rest of the cluster is already
         // zero (alloc_cluster), so this one sector fully initializes the directory.
-        write_sector(self.source, self.cluster_lba(self_cluster), &buf)
+        self.wr_sector(self.cluster_lba(self_cluster), &buf)
     }
 
     /// FATDIRS: create a subdirectory `name` in the directory at `parent_first_cluster` (`0` ⇒ the volume
@@ -2041,7 +3224,7 @@ impl FatFs {
     ///
     /// CONCURRENCY (invariant 3): the emptiness-scan -> `delete_located` is NOT atomic against a
     /// concurrent `create_in_dir` into THIS target (check-then-delete TOCTOU). Honest-scope,
-    /// EXCLUDED_BY_SEQUENCING today (no concurrent EL1 FS mutators; EL0 sequences ride the syscall
+    /// EXCLUDED_BY_SEQUENCING today (no concurrent kernel FS mutators; user sequences ride the syscall
     /// NAMESPACE lock) — ledgered in SECURITY.md alongside F3's residual; see the FATDIRS block comment.
     pub fn remove_dir(
         &self,
@@ -2102,15 +3285,15 @@ impl FatFs {
     // LOCKING (invariants 4/5 — SOUND WITHOUT the syscall-layer NAMESPACE lock, the FATDIRS bar):
     // every SECTOR mutation rides the existing per-RMW `DIR_MUTATION` span, and `DIR_MUTATION` is
     // NEVER widened to span both of MOVE's two dir-sector RMWs at once (its documented contract is
-    // single-sector; cross-sector atomicity of the two writes is EXCLUDED_BY_SEQUENCING for EL1
+    // single-sector; cross-sector atomicity of the two writes is EXCLUDED_BY_SEQUENCING for kernel
     // callers). The composite locate->mutate sequences are therefore NOT held under one lock; the
-    // residual is the SAME class FATDIRS ledgered (no concurrent EL1 FS mutators today; EL0 rides the
+    // residual is the SAME class FATDIRS ledgered (no concurrent kernel FS mutators today; user rides the
     // syscall NAMESPACE lock) — see SECURITY.md's FATMOVE entry.
     //
     // U6/ACL (invariant 5): `fat.rs` is ACL-blind by layering — the `OWNED_FILES` ACL keys by
     // `(dir_lba, dir_off)` up in aarch64 `syscall.rs`. A rename/move CHANGES that key, so a future
-    // EL0 rename/move path MUST re-key or refuse an OWNED file (ledgered in SECURITY.md + the JD10
-    // brief). This arc builds NO EL0 plumbing; the EL1 panel runs as ASID 0 (the PUBLIC principal),
+    // user rename/move path MUST re-key or refuse an OWNED file (ledgered in SECURITY.md + the JD10
+    // brief). This arc builds NO user-mode plumbing; the kernel panel runs as ASID 0 (the PUBLIC principal),
     // so a panel-driven rename/move touches no ACL row.
     //
     // ERRNO FIDELITY: the seam reuses existing `FatError` variants (adding one would break the
@@ -2132,11 +3315,11 @@ impl FatFs {
         if off + 32 > SECTOR_SIZE {
             return Err(FatError::Io); // a slot never straddles a sector; a bad offset is a caller bug
         }
-        with_dir_lock(|| {
+        with_dir_lock_src(self.source, "write_dir_entry_name", || {
             let mut buf = [0u8; SECTOR_SIZE];
-            read_sector(self.source, lba, &mut buf)?;
+            self.rd_sector(lba, &mut buf)?;
             buf[off..off + 11].copy_from_slice(raw);
-            write_sector(self.source, lba, &buf)?;
+            self.wr_sector(lba, &buf)?;
             Ok(())
         })
     }
@@ -2244,7 +3427,7 @@ impl FatFs {
         // move. A plain read of the source slot; the mutations below take their own DIR_MUTATION locks.
         let attr = {
             let mut sbuf = [0u8; SECTOR_SIZE];
-            read_sector(self.source, src_lba, &mut sbuf)?;
+            self.rd_sector(src_lba, &mut sbuf)?;
             sbuf[src_off + 11]
         };
         // 1. Publish the DESTINATION entry FIRST (crash order). `create_in_dir` writes a fresh
@@ -2276,51 +3459,33 @@ impl FatFs {
     }
 
     fn free_slot_in_fixed_root16(&self) -> Result<(u64, usize), FatError> {
-        let mut buf = [0u8; SECTOR_SIZE];
-        for s in 0..self.root_dir_sectors as u64 {
-            let lba = self.root_dir_lba + s;
-            read_sector(self.source, lba, &mut buf)?;
-            for i in 0..(SECTOR_SIZE / 32) {
-                let b0 = buf[i * 32];
-                if b0 == 0x00 || b0 == 0xE5 {
-                    return Ok((lba, i * 32));
-                }
-            }
-        }
-        Err(FatError::NoSpace) // fixed root full — no extension possible
+        // MULTIBLK: `NoSpace` on exhaustion, exactly as before — a fixed root cannot be extended.
+        self.free_slot_in_dir_sectors(None)
     }
 
-    fn free_slot_in_dir_chain(&self, start: u32) -> Result<(u64, usize), FatError> {
-        let mut cluster = start;
-        let mut hops = 0u32;
-        let mut buf = [0u8; SECTOR_SIZE];
-        loop {
-            if !self.valid_cluster(cluster) {
-                return Err(FatError::BadChain);
-            }
-            for s in 0..self.sec_per_clus as u64 {
-                let lba = self.cluster_lba(cluster) + s;
-                read_sector(self.source, lba, &mut buf)?;
-                for i in 0..(SECTOR_SIZE / 32) {
-                    let b0 = buf[i * 32];
-                    if b0 == 0x00 || b0 == 0xE5 {
-                        return Ok((lba, i * 32));
-                    }
+    /// MULTIBLK: the one implementation behind [`FatFs::free_slot_in_fixed_root16`] and
+    /// [`FatFs::free_slot_in_dir_chain`]. Unchanged rule: the first slot whose first byte is 0x00
+    /// (end marker) or 0xE5 (deleted) wins. Writing into the first 0x00 slot still preserves the
+    /// terminator, because every slot after it is also 0x00.
+    fn free_slot_in_dir_sectors(&self, start_cluster: Option<u32>) -> Result<(u64, usize), FatError> {
+        let mut found: Option<(u64, usize)> = None;
+        self.walk_dir_sectors(start_cluster, |lba, sec| {
+            for i in 0..(SECTOR_SIZE / 32) {
+                let b0 = sec[i * 32];
+                if b0 == 0x00 || b0 == 0xE5 {
+                    found = Some((lba, i * 32));
+                    return true;
                 }
             }
-            let next = self.fat_entry(cluster)?;
-            if self.is_eoc(next) {
-                return Err(FatError::NoSpace); // directory chain full (root or subdir); extending it is out of scope
-            }
-            if self.is_bad(next) || next < 2 {
-                return Err(FatError::BadChain);
-            }
-            cluster = next;
-            hops += 1;
-            if hops > self.count_of_clusters {
-                return Err(FatError::BadChain);
-            }
-        }
+            false
+        })?;
+        found.ok_or(FatError::NoSpace)
+    }
+
+    /// A directory stored as a cluster chain. `NoSpace` when the chain holds no free slot — extending
+    /// a directory chain remains out of scope, exactly as before MULTIBLK.
+    fn free_slot_in_dir_chain(&self, start: u32) -> Result<(u64, usize), FatError> {
+        self.free_slot_in_dir_sectors(Some(start))
     }
 
     /// U11-M2: mark a directory entry deleted (first byte -> `0xE5`) via RMW, preserving the rest of the sector.
@@ -2335,11 +3500,11 @@ impl FatFs {
         }
         // F3-M2: the sector RMW under DIR_MUTATION — a racing size-publish RMW of a sibling slot in this
         // sector can no longer resurrect the `0xE5` (lost-delete), nor this delete clobber its publish.
-        with_dir_lock(|| {
+        with_dir_lock_src(self.source, "mark_dir_deleted", || {
             let mut buf = [0u8; SECTOR_SIZE];
-            read_sector(self.source, dir_lba, &mut buf)?;
+            self.rd_sector(dir_lba, &mut buf)?;
             buf[dir_off] = 0xE5;
-            write_sector(self.source, dir_lba, &buf)?;
+            self.wr_sector(dir_lba, &buf)?;
             Ok(())
         })
     }
@@ -2399,7 +3564,7 @@ impl FatFs {
                 break;
             }
             if sec != loaded {
-                read_sector(self.source, self.fat_start + sec, &mut buf)?;
+                self.rd_sector(self.fat_start + sec, &mut buf)?;
                 loaded = sec;
             }
             let within = (offset % SECTOR_SIZE as u64) as usize;
@@ -2433,6 +3598,10 @@ pub fn probe_once() {
     match mount() {
         Ok(fs) => {
             serial_println!("FS: FAT mounted: {}", fs.describe());
+            // BPACE: the boot volume is readable. `d=` from `stor-ready` is the BPB + FAT read cost
+            // — the first real filesystem I/O of the boot, and the gate every fixture waits on.
+            // Inside `probe_once`'s one-shot, so it can only ever record once.
+            crate::bootpace::record("fat-mount");
             match fs.read_root() {
                 Ok(entries) => {
                     serial_println!("FS: root directory ({} entries):", entries.len());
@@ -2470,6 +3639,530 @@ pub fn probe_once() {
     }
 }
 
+/// SDHC-4b: one-shot boot probe for the INTERNAL SD card — the witness that says whether the block
+/// backend added by this arc actually reaches a filesystem.
+///
+/// Mirrors [`probe_once`] exactly (a `PROBED` latch, a registry check that no-ops until the device is
+/// there, then one mount and one report), and it runs from the x86 main loop for the same reason
+/// PIUSB-27's mount does: it must fire with no driver lock held, and `sdhc::bring_up` holds the card
+/// lock through its own witnesses.
+///
+/// **This is a READER and nothing else.** It mounts, prints, lists the root, and drops the `FatFs`.
+/// It creates no file, reserves nothing, and writes no sector — see `BlockSource::Sdhc` and
+/// `flight_recorder.rs` §SINGLE FAT WRITER for why that is load-bearing rather than merely modest.
+///
+/// It is able to say NO in three distinguishable ways, which is the point of printing all of them:
+/// * no line at all → `register_sdhc` did not publish a device. BOOT-STORAGE (GR26): this bullet
+///   used to read "i.e. no card was identified", and that inference was WRONG — GR26 Boot D
+///   identified a 60 GiB card, verified three ADMA-vs-PIO windows against it and parsed its MBR,
+///   and still printed no line here, because the image carried no `sdhcblk` and the call site was
+///   compiled out. Do not read the silence: read `:: SDHCREG: … ::`, which `sdhc::bring_up` now
+///   emits from both cfg arms and which names `handle=built register=ok/REFUSED` vs
+///   `handle=UNBUILT` directly;
+/// * `no FAT volume … (NotFat)` → the card is readable but carries no BPB this reader accepts. The
+///   `:: PART: mbr-raw handle=sdhc …` census that `mount_source` emits just above is the raw evidence;
+/// * `no FAT volume … (Io)` → the registry has the card but a read of LBA 0 failed, which contradicts
+///   the bring-up read witnesses and is a real finding about the driver, not about the medium.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+pub fn sdhc_probe_once() {
+    static PROBED: AtomicBool = AtomicBool::new(false);
+    if PROBED.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(dev) = crate::drivers::block::sdhc_info() else {
+        return; // no card registered under the Sdhc handle (yet, or at all this boot)
+    };
+    PROBED.store(true, Ordering::Relaxed);
+
+    let size_mib = dev.num_blocks.saturating_mul(dev.block_size as u64) / (1024 * 1024);
+    match mount_source(BlockSource::Sdhc) {
+        Ok(fs) => {
+            serial_println!(
+                ":: SDHCBLK: FAT mounted READ-ONLY on the internal SD card ({} MiB): {} ::",
+                size_mib, fs.describe()
+            );
+            match fs.read_root() {
+                Ok(entries) => {
+                    serial_println!(
+                        ":: SDHCBLK: sdhc root directory ({} entries) ::",
+                        entries.len()
+                    );
+                    for de in &entries {
+                        if de.is_dir {
+                            serial_println!(":: SDHCBLK:   <DIR>              {} ::", de.name());
+                        } else {
+                            serial_println!(":: SDHCBLK:   {:>12}       {} ::", de.size, de.name());
+                        }
+                    }
+                }
+                Err(e) => serial_println!(
+                    ":: SDHCBLK: sdhc root directory read error ({:?}) ::", e
+                ),
+            }
+            // SDHC-4c: the reserve pass runs HERE, on the mount this function already has, for two
+            // reasons. (1) Exclusivity: `sdhc_probe_once` is called from the x86 main loop ahead of
+            // `flight_recorder::service()` and every `U*_probe_once` on the same pass, so no other
+            // FAT writer of any volume can be running — the same program-order argument
+            // `flight_recorder.rs` §SINGLE FAT WRITER makes for roster row 1, inherited verbatim.
+            // (2) Cost: a second `mount_source` would re-read the MBR and BPB for nothing.
+            // It is still a one-shot: `PROBED` above latched before the mount.
+            if crate::fs::sdhc4c::claim_reserve_pass() {
+                if let Some((first, sectors)) = fs.sdhc4c_reserve() {
+                    fs.sdhc4c_write_verify(first, sectors);
+                }
+                // The tally closes the pass on EVERY outcome, so "armed and wrote", "refused" and
+                // "the pass never ran" are three distinguishable states in a capture rather than
+                // two states and a silence.
+                crate::fs::sdhc4c::tally();
+            }
+        }
+        Err(e) => {
+            serial_println!(
+                ":: SDHCBLK: no FAT volume on the internal SD card ({} MiB, {:?}) ::", size_mib, e
+            );
+            // SDHC-4c: no volume means no reservation to adopt. Say so — a silent skip here would
+            // be indistinguishable from a pass that ran and found nothing.
+            //
+            // WITNESS HONESTY: the three ways a mount fails are three different findings about
+            // three different layers, and one shared reason ("no FAT volume") made them read as the
+            // same one. They are separated here so a capture never has to be re-flown to learn
+            // which layer said no. The FOURTH state — the internal reader has no medium at all —
+            // never reaches this arm: `sdhc_probe_once` returns above without latching `PROBED`
+            // when `sdhc_info()` is `None`, so an empty slot prints NO `SDHCBLK:`/`SDHC4C:` line of
+            // any kind and the reserve pass does not run. Absence of the whole block is that
+            // state's signature, and the `[sdhc]` bring-up lines say why the card was never
+            // registered.
+            if crate::fs::sdhc4c::claim_reserve_pass() {
+                crate::fs::sdhc4c::disarm(
+                    crate::fs::sdhc4c::RESERVE_NAME,
+                    match e {
+                        // The handle was published when the probe latched and is gone now — a
+                        // medium/registry disappearance, NOT a filesystem verdict.
+                        FatError::NoDisk => {
+                            "the internal SD backend has NO registered medium — the card handle \
+                             vanished between the probe and the mount; nothing was searched"
+                        }
+                        // A read of LBA 0 failed. This says nothing about what the card contains.
+                        FatError::Io => {
+                            "reading LBA 0 of the internal SD card FAILED — this is a driver/medium \
+                             read failure, NOT evidence about the card's contents"
+                        }
+                        // The card read fine and simply is not a filesystem this reader mounts.
+                        _ => {
+                            "a medium IS present and readable on the internal SD card, but it \
+                             carries no FAT volume this reader accepts (see the PART mbr-raw census \
+                             above) — no root directory was searched"
+                        }
+                    },
+                );
+                crate::fs::sdhc4c::tally();
+            }
+        }
+    }
+}
+
+// ===================== SDHC-4c — the reserve-once flight-recorder writer =====================
+//
+// The FIRST persistent write UnaOS makes. Read `fs/sdhc4c.rs` first: it owns the permit, the
+// writable sector set, and the argument for why that set is closed. This section owns the pass that
+// derives the set and then exercises it, in four steps that are deliberately in this order:
+//
+//   RESERVE -> ARM (+ self-test) -> WRITE -> READ BACK
+//
+// ADOPT-ONLY is the whole safety idea. The kernel does not create, grow, delete, rename or truncate
+// the reserved file, on this volume or any other: it LOCATES a file the host staged, proves the
+// chain it already has is one contiguous run wholly inside the data region, and publishes that run
+// as the writable set. Every one of `create_in_root`, `write_grow`, `delete_located` and
+// `alloc_cluster` remains unreachable with `source == Sdhc`, so the card acquires a writer that is
+// not a FAT mutator — the same class the flight recorder became on the boot volume, minus the
+// bootstrap window the recorder still has to reason about (`flight_recorder.rs` §SINGLE FAT
+// WRITER, cases B and C). There is no bootstrap window here because there is no bootstrap.
+//
+// Every failure lands on `sdhc4c::disarm`, which is permanent for the boot and leaves the card in
+// exactly the SDHC-4b state: mounted, readable, and unwritable. The worst outcome this pass has is
+// "refused, nothing written".
+
+/// SDHC-4c: how many bytes the verify pass writes and reads back — one whole sector, at offset 0 of
+/// the reserved file. A whole aligned sector is chosen so `write_span` needs no read-modify-write
+/// and the card sees exactly one CMD24, which makes `cmd24=1` a falsifiable prediction rather than
+/// an approximation.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+const SDHC4C_RECORD_BYTES: usize = SECTOR_SIZE;
+
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+impl FatFs {
+    /// SDHC-4c: ONE bounded line saying which volume the reserve pass searched and what its root
+    /// walk actually saw. Printed only on the not-found / lookup-failed path, so a healthy boot pays
+    /// nothing and a refusal is self-explanatory in the capture without a second boot.
+    ///
+    /// Three facts the bare `NotFound` could not carry, each of which has cost a boot:
+    ///   * **volume identity** — kind, extent, label and `BS_VolID`. The internal SDHCI slot and the
+    ///     medium this kernel booted from are separate block handles; a refusal that does not name
+    ///     the volume cannot distinguish "the host staged nothing" from "the host staged onto the
+    ///     other device".
+    ///   * **read failure vs genuine absence** — the walk's `Result` is reported verbatim. A
+    ///     truncated or failed sector read stops a walk early and is NOT evidence of absence.
+    ///   * **where the walk stopped** — the 0x00 end-of-directory slot index, or `none` if the walk
+    ///     ran off the end of the chain. A terminator at slot 0 means an empty (or unreadable-as-
+    ///     directory) root, which reads very differently from a terminator after 200 entries.
+    ///
+    /// Bounded by construction: at most `WITNESS_NAMES` short names are rendered, counters are
+    /// `u32`, and the whole thing is one line issued at most once per boot (the reserve pass is a
+    /// one-shot). It re-walks the root rather than instrumenting `locate_in_dir_sectors`, so the
+    /// hot lookup path every path resolution runs stays exactly as it was.
+    fn sdhc4c_root_witness(&self, name: &str) {
+        /// How many short names the line carries. Eight is what fits alongside the identity fields
+        /// without wrapping the FTDI ring's useful width, and is enough to recognise a staging set.
+        const WITNESS_NAMES: u32 = 8;
+
+        let start = match self.kind {
+            FatKind::Fat32 => Some(self.root_cluster),
+            FatKind::Fat16 => None,
+        };
+        let mut sectors = 0u32;
+        let mut slots = 0u32;
+        let mut entries = 0u32;
+        let mut shown = 0u32;
+        let mut term: Option<u32> = None;
+        let mut names = String::new();
+
+        let walk = self.walk_dir_sectors(start, |_lba, sec| {
+            sectors += 1;
+            for i in 0..(SECTOR_SIZE / 32) {
+                match classify_dir_slot(&sec[i * 32..i * 32 + 32]) {
+                    DirSlot::End => {
+                        term = Some(slots);
+                        return true;
+                    }
+                    DirSlot::Skip => slots += 1,
+                    DirSlot::Entry(de) => {
+                        slots += 1;
+                        entries += 1;
+                        if shown < WITNESS_NAMES {
+                            if shown > 0 {
+                                names.push(' ');
+                            }
+                            names.push_str(de.short_name());
+                            shown += 1;
+                        }
+                    }
+                }
+            }
+            false
+        });
+
+        let label = self.label();
+        serial_println!(
+            ":: SDHC4C-ROOT: NAME={} not matched on vol=FAT{}@LBA{} volsec={} label={} \
+             serial=0x{:08x} | walk: read={} sectors={} slots={} entries={} terminator={} | \
+             first{}: {} ::",
+            name,
+            match self.kind {
+                FatKind::Fat16 => 16,
+                FatKind::Fat32 => 32,
+            },
+            self.part_lba,
+            self.vol_sectors,
+            if label.is_empty() { "-" } else { label.as_str() },
+            self.vol_id,
+            match walk {
+                Ok(()) => String::from("OK"),
+                // A failed walk means the counters below are a PREFIX, not a census — say so in the
+                // same field that carries the error, so the two can never be read apart.
+                Err(e) => alloc::format!("FAILED({:?})-counts-are-a-PREFIX", e),
+            },
+            sectors,
+            slots,
+            entries,
+            match term {
+                Some(at) => alloc::format!("slot#{}", at),
+                None => String::from("none(ran-off-the-end)"),
+            },
+            shown,
+            if names.is_empty() { "(none)" } else { names.as_str() },
+        );
+    }
+
+    /// SDHC-4c step 1+2: ADOPT the host-staged reservation and publish its LBA extent, or refuse.
+    ///
+    /// Returns the `(first_cluster, sectors)` of the armed extent on success. Every `return` before
+    /// the `arm` call has already named its reason on the wire through `disarm`.
+    fn sdhc4c_reserve(&self) -> Option<(u32, u64)> {
+        use crate::fs::sdhc4c as permit;
+        const NAME: &str = crate::fs::sdhc4c::RESERVE_NAME;
+
+        // The pass is only ever driven for the card, but state that as a check rather than as a
+        // comment: a future caller that hands it the boot volume must be refused, not trusted.
+        if self.source != BlockSource::Sdhc {
+            permit::disarm(NAME, "internal error: reserve pass invoked on a non-Sdhc volume");
+            return None;
+        }
+
+        // --- locate. ADOPT-ONLY: absent is a refusal, never a create. ---
+        let de = match self.find_located(NAME) {
+            Ok((de, _lba, _slot)) => de,
+            Err(FatError::NotFound) => {
+                // SDHC4C-ROOT: "not found" alone cannot say WHICH volume was searched, and on this
+                // machine that is the whole question — the internal SDHCI slot and the boot medium
+                // are two different devices, and the host stages onto one of them. Name the volume
+                // and what the walk saw before refusing. Boot AR (2026-08-08) refused here while
+                // the staged file sat on the boot volume: the Sdhc handle held a 29 MiB FAT16 card
+                // (11 entries, no UNALOG.BIN) and the 59.5 GB FAT32 card was mounted on `Default`.
+                self.sdhc4c_root_witness(NAME);
+                permit::disarm(
+                    NAME,
+                    "absent from the root directory of the volume mounted on the internal SD card \
+                     (identified on the SDHC4C-ROOT line above) — the HOST stages this file; the \
+                     kernel never creates it, because a create is a directory mutation",
+                );
+                return None;
+            }
+            Err(e) => {
+                serial_println!(
+                    ":: SDHC4C: reserve NAME={} lookup failed ({:?}) ::", NAME, e
+                );
+                self.sdhc4c_root_witness(NAME);
+                permit::disarm(
+                    NAME,
+                    "root-directory lookup FAILED — this is a read/geometry failure, NOT evidence \
+                     that the file is absent (SDHC4C-ROOT above says where the walk stopped)",
+                );
+                return None;
+            }
+        };
+        if de.is_dir {
+            permit::disarm(NAME, "the name is a DIRECTORY on this card, not a file");
+            return None;
+        }
+        if de.size < crate::fs::sdhc4c::RESERVE_BYTES {
+            serial_println!(
+                ":: SDHC4C: reserve NAME={} size={} < required {} ::",
+                NAME, de.size, crate::fs::sdhc4c::RESERVE_BYTES
+            );
+            permit::disarm(
+                NAME,
+                "the staged file is SHORTER than the reservation; adopting it would mean growing \
+                 it later, and a grow is a FAT mutation",
+            );
+            return None;
+        }
+        let first = de.first_cluster;
+        if !self.valid_cluster(first) {
+            serial_println!(
+                ":: SDHC4C: reserve NAME={} first_cluster={} is not a valid data cluster (2..{}) ::",
+                NAME, first, self.count_of_clusters + 2
+            );
+            permit::disarm(NAME, "the staged file has no valid cluster chain head");
+            return None;
+        }
+
+        // --- walk the chain the file ALREADY has. `collect_chain` only READS the FAT. ---
+        // The extent covers exactly the clusters `RESERVE_BYTES` needs, NOT the whole file: it is
+        // the tightest closed set, and it agrees with the `size` the writer below passes to
+        // `write_at`, so the two independent bounds (LBA extent, byte clamp) describe the same
+        // region rather than one being slack against the other.
+        let clus_bytes = self.sec_per_clus as usize * SECTOR_SIZE;
+        let need = (crate::fs::sdhc4c::RESERVE_BYTES as usize).div_ceil(clus_bytes);
+        let clusters = match self.collect_chain(first, need) {
+            Ok(c) => c,
+            Err(e) => {
+                serial_println!(":: SDHC4C: reserve NAME={} chain walk failed ({:?}) ::", NAME, e);
+                permit::disarm(NAME, "the staged file's cluster chain is malformed");
+                return None;
+            }
+        };
+        if clusters.len() < need {
+            serial_println!(
+                ":: SDHC4C: reserve NAME={} chain covers {} clusters, needs {} ::",
+                NAME, clusters.len(), need
+            );
+            permit::disarm(NAME, "the cluster chain ends before the reservation does");
+            return None;
+        }
+        // CONTIGUITY. Not an optimisation: a single run is what lets the writable set be ONE
+        // interval, and one interval is what makes the bound a single comparison that a reader can
+        // check by eye. A fragmented file is refused rather than described by a list of ranges.
+        let mut runs = 1usize;
+        for i in 1..clusters.len() {
+            if clusters[i] != clusters[i - 1] + 1 {
+                runs += 1;
+            }
+        }
+        if runs != 1 {
+            serial_println!(
+                ":: SDHC4C: reserve NAME={} cluster={} size={} runs={} contiguous=0 ::",
+                NAME, first, de.size, runs
+            );
+            permit::disarm(
+                NAME,
+                "the staged file is FRAGMENTED; the permit describes exactly one LBA interval",
+            );
+            return None;
+        }
+
+        // --- prove the interval before publishing it. Four independent bounds. ---
+        let nsec = need as u64 * self.sec_per_clus as u64;
+        let a = self.cluster_lba(clusters[0]);
+        let b = a + nsec;
+
+        // (1) THE load-bearing one: the extent starts at or after the first data sector. On FAT the
+        // boot sector, the reserved sectors, both FAT copies and the FAT16 fixed root directory all
+        // live BELOW `data_start`, so this single inequality puts every one of them permanently out
+        // of reach of a permitted write — whatever the chain walk returned, and whether or not the
+        // BPB is honest about anything else.
+        if a < self.data_start {
+            serial_println!(
+                ":: SDHC4C: reserve NAME={} lba={} is BELOW data_start={} ::",
+                NAME, a, self.data_start
+            );
+            permit::disarm(NAME, "the derived extent reaches metadata sectors");
+            return None;
+        }
+        // (2) and it ends at or before the last addressable data sector.
+        let data_end = self.data_start + self.count_of_clusters as u64 * self.sec_per_clus as u64;
+        if b > data_end {
+            serial_println!(
+                ":: SDHC4C: reserve NAME={} end={} is PAST the data region end={} ::",
+                NAME, b, data_end
+            );
+            permit::disarm(NAME, "the derived extent runs past the data region");
+            return None;
+        }
+        // (3) the volume's and the partition's own extents — two separate on-disk claims, checked
+        // by the same `in_extent` every read of this volume is checked against.
+        if let Err(e) = self.in_extent(a, nsec) {
+            serial_println!(
+                ":: SDHC4C: reserve NAME={} extent=[{}..{}) rejected by in_extent ({:?}) ::",
+                NAME, a, b, e
+            );
+            permit::disarm(NAME, "the derived extent leaves the volume or the partition");
+            return None;
+        }
+        // (4) the device's own capacity, asked of the block layer rather than derived from the BPB.
+        let dev_blocks = crate::drivers::block::sdhc_info()
+            .map(|d| d.num_blocks)
+            .unwrap_or(0);
+        if b > dev_blocks {
+            serial_println!(
+                ":: SDHC4C: reserve NAME={} end={} is PAST the card's num_blocks={} ::",
+                NAME, b, dev_blocks
+            );
+            permit::disarm(NAME, "the derived extent runs past the end of the card");
+            return None;
+        }
+
+        if !permit::arm(
+            NAME,
+            first,
+            de.size,
+            runs,
+            a,
+            b,
+            crate::drivers::block::boot_volume_serial(),
+            self.vol_id,
+        ) {
+            return None;
+        }
+        // The bound, tested through the bound's own predicate, before anything is written.
+        permit::selftest_bounds();
+        if !permit::armed() {
+            return None; // the self-test disarmed it; it printed why
+        }
+        Some((first, nsec))
+    }
+
+    /// SDHC-4c step 3+4: write one record in place at offset 0 of the reserved extent and READ IT
+    /// BACK, checksumming both. An echo that cannot fail proves nothing, so the verdict is a
+    /// comparison of two FNV-1a hashes over bytes that made a round trip through the card.
+    #[cfg(feature = "sdw")]
+    fn sdhc4c_write_verify(&self, first: u32, _sectors: u64) {
+        use crate::fs::sdhc4c as permit;
+        let (a, b) = permit::extent();
+
+        // The record. Fixed length, one whole sector, ASCII, newline-terminated so a host `head -c
+        // 512` on the file is readable without tooling. `cy=` is the raw cycle counter — the only
+        // clock this pass can be sure of — so two boots produce different bytes and a stale-file
+        // read cannot be mistaken for a fresh write.
+        let body = alloc::format!(
+            ":: SDHC4C-REC: unaos first-persistent-write cy={} cluster={} lba=[{}..{}) vol=0x{:08x} ::\n",
+            crate::arch::now_cycles(),
+            first,
+            a,
+            b,
+            self.vol_id
+        );
+        let mut rec = alloc::vec![b' '; SDHC4C_RECORD_BYTES];
+        let n = core::cmp::min(body.len(), SDHC4C_RECORD_BYTES);
+        rec[..n].copy_from_slice(&body.as_bytes()[..n]);
+        rec[SDHC4C_RECORD_BYTES - 1] = b'\n';
+        let want = permit::fnv1a(&rec);
+
+        // `size` is RESERVE_BYTES, not the file's on-disk size: `write_at` clamps to it, so the
+        // writer's byte bound and the permit's LBA bound describe the same region.
+        let wrote = match self.write_at(first, crate::fs::sdhc4c::RESERVE_BYTES, 0, &rec) {
+            Ok(w) => w,
+            Err(e) => {
+                serial_println!(
+                    ":: SDHC4C: in-place write FAILED ({:?}) lba=[{}..{}) — nothing is claimed to \
+                     have landed ::",
+                    e, a, b
+                );
+                return;
+            }
+        };
+        if wrote != rec.len() {
+            serial_println!(
+                ":: SDHC4C: in-place write SHORT wrote={} of {} lba=[{}..{}) ::",
+                wrote, rec.len(), a, b
+            );
+            return;
+        }
+
+        // READ BACK from the medium. Same extent, same offset, through the ordinary read path.
+        let mut back = alloc::vec::Vec::new();
+        if let Err(e) = self.read_at(
+            first,
+            crate::fs::sdhc4c::RESERVE_BYTES,
+            0,
+            &mut back,
+            SDHC4C_RECORD_BYTES,
+        ) {
+            serial_println!(
+                ":: SDHC4C: read-back FAILED ({:?}) — the write is UNVERIFIED lba=[{}..{}) ::",
+                e, a, b
+            );
+            return;
+        }
+        let got = permit::fnv1a(&back);
+        if back.len() == rec.len() && got == want && back[..] == rec[..] {
+            serial_println!(
+                ":: SDHC4C: in-place write ok bytes={} lba=[{}..{}) readback=MATCH fnv=0x{:08x} ::",
+                wrote, a, b, got
+            );
+        } else {
+            serial_println!(
+                ":: SDHC4C: !! read-back MISMATCH bytes={} got={} fnv-want=0x{:08x} \
+                 fnv-got=0x{:08x} lba=[{}..{}) — the card did NOT return what was written ::",
+                wrote, back.len(), want, got, a, b
+            );
+        }
+    }
+
+    /// SDHC-4c: without `sdw` this image contains no CMD24 ladder at all (SDHC-4a's property, and
+    /// the default x86 polarity), so the honest report is that the permit armed and the write leg is
+    /// absent — not silence, and not a fabricated success.
+    #[cfg(not(feature = "sdw"))]
+    fn sdhc4c_write_verify(&self, _first: u32, _sectors: u64) {
+        let (a, b) = crate::fs::sdhc4c::extent();
+        serial_println!(
+            ":: SDHC4C: in-place write SKIPPED lba=[{}..{}) — this build carries no `sdw` feature, \
+             so it contains no CMD24 ladder for the internal SD card; the permit is armed and the \
+             extent is published, but nothing can write to it (UNAOS_SDW=1 arms the write leg) ::",
+            a, b
+        );
+    }
+}
+
 /// PIUSB-27: map a [`FatError`] to a short human reason for the mount witness line.
 #[cfg(target_arch = "aarch64")]
 pub fn fat_reason(e: FatError) -> &'static str {
@@ -2485,14 +4178,16 @@ pub fn fat_reason(e: FatError) -> &'static str {
     }
 }
 
-/// PIUSB-27: mount the USB stick's FAT volume READ-ONLY and emit the storage-ready witness. Called from
+/// PIUSB-27: mount the USB stick's FAT volume and emit the storage-ready witness. Called from
 /// the xHCI storage bring-up event (`service_storage`) so it fires ONCE per bring-up and again on every
-/// hot-plug re-enumeration. Strictly read-only: the mount reads through [`BlockSource::Usb`] (the xHCI
-/// direct path), so it works even when the microSD owns the global block device. On success it prints the
+/// hot-plug re-enumeration. The mount reads through [`BlockSource::Usb`] (the xHCI direct path), so it works
+/// even when the microSD owns the global block device. USBFALL F3: that source is WRITABLE since USB-WRITE —
+/// this particular witness only reads, but nothing about `Usb` makes it read-only. On success it prints the
 /// geometry (FAT type / size / cluster size) and the first-level entry list; on failure an honest reason.
 /// The live `GET /fs/usb` HTTP route re-mounts per request — this line is the boot/hot-plug evidence.
 /// PIUSB-27: main-loop hook — when the xHCI bring-up has raised the USB storage-ready edge, mount the
-/// stick's FAT volume read-only and emit the witness. Runs with the xHCI controller lock RELEASED (the
+/// stick's FAT volume and emit the witness (USBFALL F3: the mount is writable since USB-WRITE; only this
+/// witness path is read-only in practice, because it merely reads geometry and the root listing). Runs with the xHCI controller lock RELEASED (the
 /// mount re-locks it briefly through `read_block_usb`), exactly like `probe_once`; the edge re-arms on
 /// every hot-plug re-enumeration, so a re-inserted stick is re-mounted and re-witnessed. Safe to call
 /// every main-loop iteration — it no-ops until the edge is raised, then fires once per raise.
@@ -2503,11 +4198,12 @@ pub fn piusb27_service() {
     }
 }
 
-/// PIUSB-27: mount the USB stick's FAT volume READ-ONLY and emit the storage-ready witness — the
+/// PIUSB-27: mount the USB stick's FAT volume and emit the storage-ready witness — the
 /// geometry (FAT type / size / cluster size) and the first-level entry list on success, an honest reason
 /// on failure. The live `GET /fs/usb` HTTP route re-mounts per request; this line is the boot/hot-plug
-/// evidence. Strictly read-only: the mount reads through [`BlockSource::Usb`] (the xHCI direct path), so
-/// it works even when the microSD owns the global block device.
+/// evidence. The mount reads through [`BlockSource::Usb`] (the xHCI direct path), so it works even when the
+/// microSD owns the global block device. USBFALL F3: this witness READS only — the `Usb` source itself has
+/// been writable since USB-WRITE.
 #[cfg(target_arch = "aarch64")]
 pub fn piusb27_mount_witness() {
     match mount_source(BlockSource::Usb) {

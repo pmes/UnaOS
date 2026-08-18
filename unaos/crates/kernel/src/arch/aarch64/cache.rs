@@ -49,6 +49,31 @@ pub fn clean_range(addr: usize, len: usize) {
     unsafe { asm!("dsb sy", options(nostack, preserves_flags)) };
 }
 
+/// COMPOSITE-2 — clean (write back) `rows` strided spans of `row_len` bytes, starting at `addr`
+/// and stepping `stride` bytes per row, then ONE `dsb sy` for the lot. The rectangular form of
+/// [`clean_range`]: the compositor's post-blit clean covers a window's BOX, whose rows are
+/// sub-spans of the panel's scanlines, and cleaning them as one contiguous range forces the
+/// full-width margins into the sweep — 3.7x the bytes for the bench's 514-wide box. Per-row
+/// `clean_range` calls would instead pay one `DSB` per row; the barrier belongs to the rect, not
+/// the row, which is why this is its own primitive rather than a loop at the call site.
+#[inline]
+pub fn clean_rows(addr: usize, row_len: usize, rows: usize, stride: usize) {
+    if row_len == 0 || rows == 0 {
+        return;
+    }
+    let line = dcache_line_size();
+    for r in 0..rows {
+        let start = addr + r * stride;
+        let mut p = start & !(line - 1);
+        let end = start + row_len;
+        while p < end {
+            unsafe { asm!("dc cvac, {}", in(reg) p, options(nostack, preserves_flags)) };
+            p += line;
+        }
+    }
+    unsafe { asm!("dsb sy", options(nostack, preserves_flags)) };
+}
+
 /// Invalidate the data cache over `[addr, addr+len)` to the PoC, then `dsb sy`. Call before
 /// reading a buffer the GPU/DMA just wrote, so the next read misses our (now stale) cached copy
 /// and re-fetches from RAM.

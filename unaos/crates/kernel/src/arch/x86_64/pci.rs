@@ -189,7 +189,611 @@ fn enable_intel_xhci_ports(bus: u8, dev: u8, func: u8) {
     }
 }
 
+// ── PCI-CENSUS (GR20) — the complete, READ-ONLY bus witness ─────────────────────────────────────
+//
+// WHY THIS EXISTS. Every PCI walk this kernel performs is TARGETED: `PciScanner::enumerate_buses`
+// returns on the first class 0x0C/0x03/0x30 (xHCI) hit; `PciScanner::storage_inventory` prints only
+// class 0x01 and 0x08/0x05; `gpu::detect` looks at class 0x03; `PciScanner::find_device(0x02,0x00)`
+// returns the FIRST Ethernet-subclass function and stops. The consequence is that no line in any
+// capture this project has ever taken enumerates the machine. Boot AC is the proof: the scan
+// announces itself (`PCI: Commencing motherboard scan...`) and the very next PCI line is already the
+// xHCI at 0:20.0. A function that matches none of those filters — an audio codec, a PCIe root port,
+// an Apple I/O bridge, or the WiFi radio a driver arc would need — is invisible to us on metal.
+//
+// This pass answers the only question worth asking first: WHAT IS ACTUALLY THERE.
+//
+// HARD PROPERTIES (each is a property of the code, not an intention):
+//
+//   * STRICTLY READ-ONLY. Every access below is `read_config_16`/`read_config_32`. There is no
+//     `write_config_*` call anywhere in this block, and there is no BAR SIZING: sizing requires the
+//     write-all-ones / read-mask / restore dance, which transiently moves a live device's decode
+//     window while other devices are already decoding, and cannot be made safe mid-boot on a machine
+//     whose firmware assignments we do not own. BARs are therefore printed RAW, exactly as firmware
+//     left them, with only the low-bit TYPE decode (which is free) applied. A reader who wants sizes
+//     must arm a separate, deliberately-scoped arc for them; this one does not write.
+//
+//   * BOUNDED. The walk is the same shape the two existing passes already run every boot — 256
+//     buses x 32 devices, with functions 1..7 probed ONLY when the function-0 header type has the
+//     multi-function bit (0x80) set. That is 8192 config reads in the worst case plus a handful per
+//     present function, i.e. the cost of ONE more `storage_inventory`. Output is capped at
+//     `CENSUS_MAX_FUNCS` printed lines (serial, not the reads, is what a census could actually spend
+//     a boot on); past the cap the counting continues and the summary reports `truncated=1`, so a
+//     capped run says so rather than looking like a small machine.
+//
+//   * NO BRIDGE RECURSION. None is needed and none is performed: the brute-force bus sweep visits
+//     every bus number a bridge could have been programmed with, so it is a superset of what
+//     following secondary-bus registers would reach. Bridges are printed (header type 1) with their
+//     primary/secondary/subordinate numbers AND their three forwarding windows (I/O, memory,
+//     prefetchable memory — see `census_print_bridge_windows`), so the topology is readable from the
+//     lines alone in BOTH senses: which bus numbers a bridge claims, and which addresses it lets
+//     through. The second was missing until GR20's Boot AF needed it and could not get it.
+//
+//   * KNOB-GATED, DEFAULT OFF (`UNAOS_PCICENSUS=1` -> feature `pcicensus`). Knob off, this function
+//     and its helpers do not exist and no call site is emitted, so default media are byte-identical.
+//     Wired in BOTH `unaos/arroyo` AND `unaos/builder/src/main.rs`: the builder rebuilds the x86
+//     kernel from its own env-derived feature list, so a knob wired only in arroyo ships disabled
+//     while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson).
+//
+//   * OUTSIDE THE GPACE TILING. The call site sits BEFORE the GPACE anchor (`pci::init`'s
+//     `last_stamp()` read), so not one of the seven GPACE classes and not `span` changes shape. The
+//     census's own cost lands in the BPACE `pci-scan` delta on knob-ON builds only, and the census
+//     reports that cost itself (`elapsed=`) so it cannot hide inside somebody else's number.
+//
+// A NOTE ON WHAT AN ABSENT BAR MEANS. A BAR that reads all-zero is omitted from the line. Zero is
+// "unimplemented, or implemented and left unassigned by firmware" — the two are indistinguishable
+// without a write, and this pass does not write. Omission is therefore the honest rendering; a
+// printed `bar3=0x0` would invite a reader to conclude the BAR exists.
+
+/// Printed-line cap. The rMBP is expected to present on the order of 20-30 functions and QEMU fewer;
+/// 128 is far above either, so hitting it is itself information (and is reported).
+#[cfg(feature = "pcicensus")]
+const CENSUS_MAX_FUNCS: u32 = 128;
+
+/// How many network-class functions the capability follow-up will dump. Bounded so a pathological
+/// machine cannot turn the follow-up into the expensive half of the census.
+#[cfg(feature = "pcicensus")]
+const CENSUS_MAX_NET: usize = 8;
+
+/// Base-class / subclass to a short human tag. Deliberately coarse: the numeric triple is on the
+/// line already, and the tag exists so a human reading a capture can find the interesting rows
+/// without a PCI code table. `?` is an honest "we do not name this class", not an error.
+#[cfg(feature = "pcicensus")]
+fn census_class_name(class: u8, sub: u8) -> &'static str {
+    match (class, sub) {
+        (0x00, _) => "legacy",
+        (0x01, 0x01) => "stor:ide",
+        (0x01, 0x06) => "stor:sata",
+        (0x01, 0x08) => "stor:nvm",
+        (0x01, _) => "stor",
+        (0x02, 0x00) => "net:ethernet",
+        (0x02, 0x80) => "net:other",
+        (0x02, _) => "net",
+        (0x03, 0x00) => "display:vga",
+        (0x03, 0x02) => "display:3d",
+        (0x03, _) => "display",
+        (0x04, 0x01) => "media:audio-legacy",
+        (0x04, 0x03) => "media:hda",
+        (0x04, _) => "media",
+        (0x05, _) => "memory",
+        (0x06, 0x00) => "bridge:host",
+        (0x06, 0x01) => "bridge:isa",
+        (0x06, 0x04) => "bridge:pci-pci",
+        (0x06, 0x09) => "bridge:pci-pci-sd",
+        (0x06, _) => "bridge",
+        (0x07, _) => "comm",
+        (0x08, 0x05) => "sys:sdhci",
+        (0x08, _) => "sys",
+        (0x09, _) => "input",
+        (0x0A, _) => "dock",
+        (0x0B, _) => "cpu",
+        (0x0C, 0x03) => "serialbus:usb",
+        (0x0C, 0x05) => "serialbus:smbus",
+        (0x0C, _) => "serialbus",
+        (0x0D, _) => "wireless",
+        (0x0E, _) => "intelligent-io",
+        (0x0F, _) => "satellite",
+        (0x10, _) => "crypto",
+        (0x11, _) => "signal",
+        (0x12, _) => "accel",
+        (0xFF, _) => "unassigned",
+        _ => "?",
+    }
+}
+
+/// Append this function's non-zero BARs to the census line already in progress.
+///
+/// `n_bars` is 6 for a header-type-0 function, 2 for a bridge (header type 1) and 0 for CardBus
+/// (header type 2, whose 0x10 window is a socket-registers pointer, not a BAR array — printing it
+/// as a BAR would be a lie).
+///
+/// Type decode is the free part of a BAR and is the only interpretation applied: bit 0 selects I/O
+/// vs memory; for memory, bits 2:1 == 0b10 means the BAR is 64-bit and CONSUMES THE NEXT SLOT (whose
+/// dword is the high half, not a BAR of its own — a walker that missed this would report a phantom
+/// BAR at a garbage address); bit 3 is prefetchable. No write, so no size.
+#[cfg(feature = "pcicensus")]
+fn census_print_bars(bus: u8, dev: u8, func: u8, n_bars: u8) {
+    let mut i = 0u8;
+    while i < n_bars {
+        let off = 0x10 + i * 4;
+        let raw = unsafe { read_config_32(bus, dev, func, off) };
+        if raw == 0 {
+            i += 1;
+            continue;
+        }
+        if (raw & 1) != 0 {
+            // I/O space BAR: address is bits 31:2.
+            serial_print!(" bar{}=io@{:#x}", i, raw & 0xFFFF_FFFC);
+            i += 1;
+        } else {
+            let ty = (raw >> 1) & 0x3;
+            let pf = if ((raw >> 3) & 1) != 0 { "p" } else { "" };
+            let lo = (raw & 0xFFFF_FFF0) as u64;
+            if ty == 0x2 && i + 1 < n_bars {
+                let hi = unsafe { read_config_32(bus, dev, func, off + 4) } as u64;
+                serial_print!(" bar{}=mem64{}@{:#x}", i, pf, lo | (hi << 32));
+                i += 2; // the next slot is this BAR's high half, not a BAR
+            } else if ty == 0x1 {
+                // Below-1M memory BAR (obsolete since PCI 3.0, still legal to encounter).
+                serial_print!(" bar{}=mem1m{}@{:#x}", i, pf, lo);
+                i += 1;
+            } else {
+                serial_print!(" bar{}=mem32{}@{:#x}", i, pf, lo);
+                i += 1;
+            }
+        }
+    }
+}
+
+/// Append a header-type-1 bridge's three FORWARDING WINDOWS to the census line already in progress.
+///
+/// WHY. A bridge's `pri/sec/sub` triple says which BUS NUMBERS it claims; it says nothing about
+/// which ADDRESSES it forwards downstream. Those are three separate window registers, and a device
+/// on the far side of a bridge whose memory window does not contain that device's BAR is a device
+/// whose registers read all-ones no matter how correctly the driver maps them. GR20's Boot AF hit
+/// exactly that question — `14e4:4331`'s BAR0 at `0xc1900000` sits behind `0:28.1`, and the census
+/// could not say whether `0:28.1` forwards `0xc1900000` — and could not answer it, because these
+/// registers were never printed. They are printed now.
+///
+/// Layout (PCI-to-PCI Bridge Architecture 1.2, header type 1):
+///
+/// * 0x1C byte 0/1 — I/O base/limit, granularity 4 KiB, address in bits 7:4. Bits 3:0 == 1 means
+///   32-bit I/O addressing and the UPPER 16 bits of each live at 0x30 (base lo16, limit hi16).
+/// * 0x20 — memory base (lo16) / limit (hi16), granularity 1 MiB, address in bits 15:4.
+/// * 0x24 — prefetchable memory base/limit, same shape; bits 3:0 == 1 means 64-bit, and the upper
+///   32 bits of base and limit live at 0x28 and 0x2C.
+///
+/// In every window the LIMIT is inclusive and carries an implicit all-ones tail (0xFFF for I/O,
+/// 0xFFFFF for memory). `base > limit` is the architecturally-defined encoding for "this window is
+/// CLOSED" — firmware writes base=0xFFF0/limit=0x0000 for a bridge that forwards nothing — so it is
+/// rendered as `closed` rather than as an inverted range a reader would have to decode themselves.
+///
+/// Read-only: three config reads for the windows plus two more only when the 64-bit prefetch or
+/// 32-bit I/O encodings say those registers are implemented.
+#[cfg(feature = "pcicensus")]
+fn census_print_bridge_windows(bus: u8, dev: u8, func: u8) {
+    // ── I/O window (0x1C low half; the high half of that dword is SECONDARY STATUS) ─────────────
+    let io_reg = unsafe { read_config_32(bus, dev, func, 0x1C) };
+    let io_b = (io_reg & 0xFF) as u32;
+    let io_l = ((io_reg >> 8) & 0xFF) as u32;
+    let sec_sts = ((io_reg >> 16) & 0xFFFF) as u16;
+    let mut io_base = (io_b & 0xF0) << 8;
+    let mut io_limit = ((io_l & 0xF0) << 8) | 0xFFF;
+    let io32 = (io_b & 0x0F) == 0x01;
+    if io32 {
+        let up = unsafe { read_config_32(bus, dev, func, 0x30) };
+        io_base |= (up & 0xFFFF) << 16;
+        io_limit |= (up & 0xFFFF_0000) as u32;
+    }
+    if io_base > io_limit {
+        serial_print!(" io=closed");
+    } else {
+        serial_print!(" io=[{:#x},{:#x}]{}", io_base, io_limit, if io32 { "/32" } else { "/16" });
+    }
+
+    // ── Non-prefetchable memory window (0x20) — the one a plain BAR is forwarded through ────────
+    let m = unsafe { read_config_32(bus, dev, func, 0x20) };
+    let m_base = ((m & 0xFFF0) as u32) << 16;
+    let m_limit = ((((m >> 16) & 0xFFF0) as u32) << 16) | 0xF_FFFF;
+    if m_base > m_limit {
+        serial_print!(" mem=closed");
+    } else {
+        serial_print!(" mem=[{:#x},{:#x}]", m_base, m_limit);
+    }
+
+    // ── Prefetchable memory window (0x24, + 0x28/0x2C when 64-bit) ──────────────────────────────
+    let p = unsafe { read_config_32(bus, dev, func, 0x24) };
+    let mut p_base = (((p & 0xFFF0) as u32) << 16) as u64;
+    let mut p_limit = (((((p >> 16) & 0xFFF0) as u32) << 16) as u64) | 0xF_FFFF;
+    let p64 = (p & 0x000F) == 0x0001;
+    if p64 {
+        p_base |= (unsafe { read_config_32(bus, dev, func, 0x28) } as u64) << 32;
+        p_limit |= (unsafe { read_config_32(bus, dev, func, 0x2C) } as u64) << 32;
+    }
+    if p_base > p_limit {
+        serial_print!(" pref=closed");
+    } else {
+        serial_print!(" pref=[{:#x},{:#x}]{}", p_base, p_limit, if p64 { "/64" } else { "/32" });
+    }
+
+    // Secondary status is free (it came in the same dword as the I/O window) and it is the bridge's
+    // own error ledger: bit 13 signalled target-abort, bit 12 received target-abort, bit 11 received
+    // master-abort. A downstream read that ended in all-ones because nothing claimed it leaves a
+    // mark here, which is the difference between "the device answered 0xffffffff" and "nobody
+    // answered at all".
+    serial_print!(" secsts={:#06x}", sec_sts);
+}
+
+/// The full census. One line per function present, plus a capability dump for every network-class
+/// function (the reason this arc exists) and a self-reporting summary.
+///
+/// Uses this module's own config-space accessors — the same `read_config_16`/`read_config_32`
+/// `PciScanner` calls through `crate::arch::pci` — so there is exactly one CF8/CFC implementation in
+/// the tree and this pass cannot drift from the targeted scans it complements.
+#[cfg(feature = "pcicensus")]
+pub fn full_census() {
+    let t0 = crate::arch::now_cycles();
+    serial_println!(
+        "[PCI-CENSUS] full enumeration: bus 0..=255 dev 0..=31 fn 0..=7 (MF-gated) — config READS only, no BAR sizing, no config writes; bdf printed DECIMAL (lspci prints hex: our 0:20.0 is lspci's 00:14.0)"
+    );
+
+    let mut n_dev = 0u32;
+    let mut n_fn = 0u32;
+    let mut n_printed = 0u32;
+    let mut truncated = false;
+    let mut net: [(u8, u8, u8); CENSUS_MAX_NET] = [(0, 0, 0); CENSUS_MAX_NET];
+    let mut n_net = 0usize;
+    let mut n_net_seen = 0u32;
+
+    for bus in 0u16..256 {
+        for dev in 0u8..32 {
+            // Function 0 absent => the whole device is absent. This is the same gate the two
+            // existing passes use, and it is what keeps the sweep at ~8192 reads.
+            let v0 = unsafe { read_config_16(bus as u8, dev, 0, 0x00) };
+            if v0 == 0xFFFF {
+                continue;
+            }
+            n_dev += 1;
+
+            // Multi-function bit lives in bit 7 of the header-type byte of FUNCTION 0 only. Probing
+            // functions 1..7 on a single-function device is architecturally undefined — on some
+            // silicon it aliases function 0 and would print seven phantom copies of the same part.
+            let hdr0 = ((unsafe { read_config_32(bus as u8, dev, 0, 0x0C) } >> 16) & 0xFF) as u8;
+            let max_func: u8 = if (hdr0 & 0x80) != 0 { 7 } else { 0 };
+
+            for func in 0..=max_func {
+                let vend = unsafe { read_config_16(bus as u8, dev, func, 0x00) };
+                if vend == 0xFFFF {
+                    continue;
+                }
+                n_fn += 1;
+
+                let devid = unsafe { read_config_16(bus as u8, dev, func, 0x02) };
+                let class_reg = unsafe { read_config_32(bus as u8, dev, func, 0x08) };
+                let class = ((class_reg >> 24) & 0xFF) as u8;
+                let sub = ((class_reg >> 16) & 0xFF) as u8;
+                let progif = ((class_reg >> 8) & 0xFF) as u8;
+                let rev = (class_reg & 0xFF) as u8;
+                let hdr_reg = unsafe { read_config_32(bus as u8, dev, func, 0x0C) };
+                let hdr = ((hdr_reg >> 16) & 0xFF) as u8;
+                let hdr_type = hdr & 0x7F;
+                let cmd_sts = unsafe { read_config_32(bus as u8, dev, func, 0x04) };
+
+                // Remember network-class functions for the capability follow-up below. Both
+                // subclasses matter: 0x02/0x00 is Ethernet and 0x02/0x80 ("other network
+                // controller") is what most Broadcom WiFi parts report — and the kernel's existing
+                // `find_device(0x02, 0x00)` can match ONLY the former, which is precisely why a WiFi
+                // radio could be sitting in this machine unseen.
+                if class == 0x02 {
+                    n_net_seen += 1;
+                    if n_net < CENSUS_MAX_NET {
+                        net[n_net] = (bus as u8, dev, func);
+                        n_net += 1;
+                    }
+                }
+
+                if n_printed >= CENSUS_MAX_FUNCS {
+                    truncated = true;
+                    continue; // keep COUNTING; stop spending serial
+                }
+                n_printed += 1;
+
+                serial_print!(
+                    "[PCI-CENSUS] bdf {}:{}.{} {:04x}:{:04x} class={:02x} sub={:02x} progif={:02x} ({}) rev={:02x} hdr={:#04x}(t={},mf={}) cmd={:#06x} sts={:#06x}",
+                    bus, dev, func, vend, devid, class, sub, progif,
+                    census_class_name(class, sub), rev, hdr, hdr_type, (hdr >> 7) & 1,
+                    (cmd_sts & 0xFFFF) as u16, (cmd_sts >> 16) as u16
+                );
+
+                match hdr_type {
+                    0x00 => {
+                        // Subsystem vendor/device at 0x2C identifies the BOARD, not the silicon —
+                        // on a Mac these read back Apple (0x106b), which is how an Apple-branded
+                        // Broadcom part is told from a generic one.
+                        let ss = unsafe { read_config_32(bus as u8, dev, func, 0x2C) };
+                        let intr = unsafe { read_config_32(bus as u8, dev, func, 0x3C) };
+                        let pin = ((intr >> 8) & 0xFF) as u8;
+                        serial_print!(
+                            " ssid={:04x}:{:04x} irq={} pin={}",
+                            (ss & 0xFFFF) as u16, (ss >> 16) as u16, (intr & 0xFF) as u8,
+                            if pin == 0 { '-' } else { (b'A' + pin.saturating_sub(1)) as char }
+                        );
+                        census_print_bars(bus as u8, dev, func, 6);
+                    }
+                    0x01 => {
+                        // PCI-to-PCI bridge: the bus-number triple at 0x18 is the topology.
+                        let bn = unsafe { read_config_32(bus as u8, dev, func, 0x18) };
+                        serial_print!(
+                            " pri={} sec={} sub={}",
+                            (bn & 0xFF) as u8, ((bn >> 8) & 0xFF) as u8, ((bn >> 16) & 0xFF) as u8
+                        );
+                        census_print_bars(bus as u8, dev, func, 2);
+                        // ...and the three FORWARDING windows. The bus triple says which bus numbers
+                        // this bridge claims; these say which ADDRESSES it lets through, which is
+                        // the half of the topology a driver whose BAR reads all-ones actually needs.
+                        census_print_bridge_windows(bus as u8, dev, func);
+                    }
+                    _ => {
+                        // CardBus (0x02) or an unknown header layout: everything past the common
+                        // 0x00..0x0F region has a different meaning, so nothing further is decoded.
+                        serial_print!(" (header layout not decoded)");
+                    }
+                }
+                serial_println!();
+            }
+        }
+    }
+
+    // Capability follow-up for the network-class functions only — reusing the existing
+    // `[PCI-PROBE]` diagnostic verbatim rather than re-implementing a capability walk. This is the
+    // block a WiFi/NIC driver arc reads first: it says whether the part offers MSI/MSI-X, what INTx
+    // line firmware assigned it, and whether it is a PCIe endpoint at all.
+    let mut k = 0usize;
+    while k < n_net {
+        let (b, d, f) = net[k];
+        serial_println!("[PCI-CENSUS] caps for network-class function {}:{}.{} follow", b, d, f);
+        crate::drivers::pci::PciScanner::probe_irq_caps(b, d, f);
+        k += 1;
+    }
+
+    let (ev, eu) = gpace_fmt(crate::arch::now_cycles().wrapping_sub(t0));
+    serial_println!(
+        "[PCI-CENSUS] done: devices={} functions={} printed={} truncated={} net-class=0x02:{} (caps dumped {}) elapsed={}{}",
+        n_dev, n_fn, n_printed, if truncated { 1 } else { 0 }, n_net_seen, n_net, ev, eu
+    );
+}
+
+// ── GPACE — the inside of the BPACE `pci-usb` delta ─────────────────────────────────────────────
+// The s60 metal ledger read `pci-usb d=4620ms` — the largest single block in that boot, and an
+// undivided delta nothing had ever split. Two things about it are easy to get wrong, and this
+// instrument exists to make both of them impossible to get wrong again:
+//
+//   1. **`pci-usb` is not a USB block.** BPACE stamps it after `pci::init` RETURNS, and `d=` is
+//      always the delta from the previous stamp — which, because `xhci.start()` kicks port-1
+//      enumeration before returning, is `enum:p1`. So the window covers the `start_next_port`
+//      tail, the BENCH-RIDE probes, `gpu::detect`, `igpu::init`, `kepler::init`, `sdhc::probe`
+//      and the NIC block. The xHCI bring-up itself is upstream of it, already subdivided by the
+//      BOOTPACE M4 tags.
+//   2. **Most of that 4620 ms is not in a default build.** The s60 stick was armed with
+//      `UNAOS_KEPLER` / `UNAOS_KEPLER_TAKEOVER` / `UNAOS_IVB` / `UNAOS_WC`; the 2026-07-30 metal
+//      baseline, with none of them, reads `pci-usb … 113 ms`. A split that did not say WHICH BUILD
+//      it measured would let a reader charge a default boot for 4.5 s it never pays, so the report
+//      names the compiled knob set on its own line (`build=`), and a knobless build prints
+//      `build=default(no-gpu-knobs)`.
+//
+// Design follows the EPACE precedent (`drivers/ehci/mod.rs`): cycle accumulators per phase CLASS,
+// converted to ms only at PRINT time, printed as two lines at the one unconditional exit of
+// `pci::init`. Deliberately NOT more `bootpace::record` stamps — the ring is at n=31 of CAP=64 with
+// drop-NEWEST, and seven more stamps would spend headroom the late boot tags need.
+//
+// Instrument honesty (the can-this-lie-while-looking-right check):
+//   * **The self-check is structural, not aspirational.** `span` is measured from
+//     `bootpace::last_stamp()` — the very stamp BPACE will compute `pci-usb d=` against, captured
+//     at the instant the xHCI block ends — to the report. Anchoring on the LAST stamp rather than
+//     on the literal tag `enum:p1` is what makes `span == pci-usb d=` a property of the
+//     construction instead of a coincidence of this machine's topology; the tag that actually
+//     anchored is printed as `anchor=` so a reader can see when the topology changes.
+//   * **A short-counting class cannot hide.** The named classes are disjoint, sequential spans
+//     inside `span`, and `resid = span - Σ(classes)` over the PRINTED millisecond values, so the
+//     row a reader adds up closes on `span` exactly rather than to within a per-class flooring
+//     error. A class that under-measures therefore INFLATES `resid` — the arithmetic still closes,
+//     so the lie surfaces as unattributed time rather than as a clean-looking total.
+//   * **The one reading that would convict the tiling is not clamped into looking healthy.**
+//     `Σ > span` in the CYCLE domain means the classes overlap, the anchor is wrong, or
+//     `now_cycles()` went backwards across cores. A `saturating_sub` would render all three as
+//     `resid=0ms` — indistinguishable from health. The cycle comparison is kept as an explicit
+//     tripwire that prints `:: GPACE: OVERLAP … ::` ahead of the report instead.
+//   * **`bench`'s count is resolvable.** It is the only class with more than one call site, so the
+//     three BENCH-RIDE probes are named individually in `build=` (`therm+`/`pcilink+`/`vrom+`);
+//     `bench=..ms(n=2)` would otherwise not say WHICH two ran.
+//   * **Zero and never-ran are structurally distinct.** Every class prints `<v><unit>(n=<count>)`.
+//     `0ms(n=0)` is "this code was not compiled in / never reached"; `0ms(n=1)` is "it ran and cost
+//     nothing". This project has twice been bitten by conflating the two.
+//   * **It can execute in every state it reports on.** The NIC block used to `return` early on a
+//     non-Intel part — which this machine's Broadcom 0x14e4 takes on EVERY boot — so a report
+//     placed after it would never have run on the machine it exists to measure. That block is now
+//     `init_network()`, and its early exit returns from the helper; `pci::init` has exactly one
+//     exit, and the report sits on it.
+//   * **Same clock as BPACE.** Conversion goes through `bootpace::origin_hz()`, the rate the ledger
+//     divides its own `d=` by, so the two instruments cannot disagree merely by arithmetic. `hz=0`
+//     prints raw counter ticks with a `cy` suffix, never a fabricated millisecond.
+//
+// Three readings that differ (the baseline law):
+//   * bench media, GPU knobs armed — `span` ≈ 4600 ms with `kepler=` dominant;
+//   * default `./arroyo esp-x86` — the line STILL prints, with `igpu=0ms(n=0) kepler=0ms(n=0)`,
+//     `detect=0ms(n=0)`, `build=default(no-gpu-knobs)` and `span` ≈ 100 ms. That is what proves the
+//     numbers report the GPU path rather than the reporter's own liveness;
+//   * `UNAOS_SKIP_XHCI=1` — the line is ABSENT entirely, because `pci::init` is never called.
+const G_XTAIL: usize = 0; // enum:p1 → end of the xHCI block: the `start_next_port` tail
+const G_BENCH: usize = 1; // the knob-gated BENCH-RIDE probes (therm / pcilink / vrom)
+const G_DETECT: usize = 2; // gpu::detect::detect_gpus() — the class-0x03 census
+const G_IGPU: usize = 3; // gpu::igpu::init, per Ivy Bridge IGD found
+const G_KEPLER: usize = 4; // gpu::kepler::init, per GK107 found
+const G_SDHC: usize = 5; // drivers::sdhc::probe() — the read-only SDHC census
+const G_NIC: usize = 6; // init_network(): the class-0x02 lookup + e1000 bring-up or the skip
+const N_GPACE: usize = 7;
+const GPACE_TAGS: [&str; N_GPACE] =
+    ["xtail", "bench", "detect", "igpu", "kepler", "sdhc", "nic"];
+
+#[derive(Clone, Copy)]
+struct Gpace {
+    cy: [u64; N_GPACE],
+    n: [u32; N_GPACE],
+}
+
+impl Gpace {
+    const fn new() -> Self {
+        Gpace { cy: [0; N_GPACE], n: [0; N_GPACE] }
+    }
+    /// Close a span opened at `t0` (a `now_cycles()` reading) into class `class`, and count it.
+    /// `n` is incremented on the CLOSE, so a class only ever reports a count for work that actually
+    /// ran to completion here.
+    fn add(&mut self, class: usize, t0: u64) {
+        self.cy[class] =
+            self.cy[class].wrapping_add(crate::arch::now_cycles().wrapping_sub(t0));
+        self.n[class] = self.n[class].saturating_add(1);
+    }
+    /// Σ of every named class — the subtrahend of `resid`.
+    fn sum(&self) -> u64 {
+        let mut s = 0u64;
+        let mut k = 0;
+        while k < N_GPACE {
+            s = s.wrapping_add(self.cy[k]);
+            k += 1;
+        }
+        s
+    }
+}
+
+/// Cycles → whole ms at print time via the BPACE ledger's own rate, or raw ticks when that rate is
+/// still unknown. Never fabricates a millisecond out of a guessed frequency (the `[vugfps]` lesson).
+///
+/// The expression is `cy / (hz / 1000)` — deliberately `bootpace::Dur`'s formula and NOT EPACE's
+/// `cy * 1000 / hz`. The two can differ by one millisecond, but only just barely: at this machine's
+/// `hz=2693848854` the relative gap is ≈3.2e-7 (~0.0006 ms over a 1845 ms reading), so it changes a
+/// printed digit only when it straddles a floor boundary, on the order of 1e-6 per reading. This is
+/// not a bug being fixed. It is that the whole deliverable is `span` versus the ledger's own
+/// rendered `pci-usb d=`, and identical-by-construction is worth having over almost-always-equal
+/// when it costs one expression: it makes "the same clock" true of the printed digits and not
+/// merely of the counter. The `hz >= 1000` guard is `Dur`'s too, so a sub-kHz rate falls to raw
+/// ticks in both places rather than dividing by zero in one of them; it also retires the
+/// `saturating_mul` ceiling the old form carried.
+fn gpace_fmt(cy: u64) -> (u64, &'static str) {
+    let hz = crate::bootpace::origin_hz();
+    if hz >= 1000 { (cy / (hz / 1000), "ms") } else { (cy, "cy") }
+}
+
+// The compiled knob set, as `&'static str` fragments a `no_std` format can concatenate without an
+// allocator. This is the field that stops a bench-media 4600 ms from being read as something a
+// default boot pays.
+#[cfg(feature = "nvidia-kepler")]
+const GB_KEPLER: &str = "kepler+";
+#[cfg(not(feature = "nvidia-kepler"))]
+const GB_KEPLER: &str = "";
+#[cfg(feature = "nvidia-kepler-takeover")]
+const GB_TAKEOVER: &str = "takeover+";
+#[cfg(not(feature = "nvidia-kepler-takeover"))]
+const GB_TAKEOVER: &str = "";
+#[cfg(feature = "nvidia-kepler-fifo")]
+const GB_FIFO: &str = "fifo+";
+#[cfg(not(feature = "nvidia-kepler-fifo"))]
+const GB_FIFO: &str = "";
+#[cfg(feature = "intel-ivb")]
+const GB_IVB: &str = "ivb+";
+#[cfg(not(feature = "intel-ivb"))]
+const GB_IVB: &str = "";
+#[cfg(feature = "wc")]
+const GB_WC: &str = "wc+";
+#[cfg(not(feature = "wc"))]
+const GB_WC: &str = "";
+#[cfg(feature = "smc")]
+const GB_SMC: &str = "smc+";
+#[cfg(not(feature = "smc"))]
+const GB_SMC: &str = "";
+// The three BENCH-RIDE probes are named INDIVIDUALLY rather than rolled into one `benchride+`.
+// `bench` is the only class whose `n=` counts more than one call site, so a single fragment left
+// `bench=..ms(n=2)` unresolvable — two of three ran, and no reading said which two. Every other
+// class is disambiguated by its own fragment (`kepler=0ms(n=0)` against `kepler+`), and this was
+// the one place the none-vs-zero rule broke. Worse, `thermprobe` pulls in `smc`, so it was already
+// showing up twice in `build=` under two different names. With three fragments, `bench`'s `n=` is
+// fully determined by `build=`.
+#[cfg(feature = "thermprobe")]
+const GB_THERM: &str = "therm+";
+#[cfg(not(feature = "thermprobe"))]
+const GB_THERM: &str = "";
+#[cfg(feature = "pcilink")]
+const GB_PCILINK: &str = "pcilink+";
+#[cfg(not(feature = "pcilink"))]
+const GB_PCILINK: &str = "";
+#[cfg(feature = "vromprobe")]
+const GB_VROM: &str = "vrom+";
+#[cfg(not(feature = "vromprobe"))]
+const GB_VROM: &str = "";
+/// Prints in place of the fragments when NONE of them is compiled in, so "default build" is a
+/// positive statement in the log rather than an empty field a reader has to interpret.
+const GB_NONE: &str = if cfg!(any(
+    feature = "nvidia-kepler",
+    feature = "nvidia-kepler-takeover",
+    feature = "nvidia-kepler-fifo",
+    feature = "intel-ivb",
+    feature = "wc",
+    feature = "smc",
+    feature = "thermprobe",
+    feature = "pcilink",
+    feature = "vromprobe",
+)) {
+    ""
+} else {
+    "default(no-gpu-knobs)"
+};
+
+/// The class-0x02 network block, lifted out of `init` verbatim.
+///
+/// It is a separate function for one reason: it contains an early `return` on a non-Intel NIC, and
+/// this machine's Broadcom 0x14e4 takes that branch on EVERY boot. While the block was inline, any
+/// report placed after it was unreachable on the very machine it existed to measure — an instrument
+/// that cannot run in the state it reports on. The `return` now leaves the HELPER; `pci::init` has
+/// exactly one exit, and the GPACE report sits on it.
+fn init_network() {
+    // Network controller (PCI class 0x02 = Network, subclass 0x00 = Ethernet).
+    // QEMU's e1000 (82540EM) lands here; bring it up for polled RX.
+    if let Some((bus, slot, func)) = crate::drivers::pci::PciScanner::find_device(0x02, 0x00) {
+        let vendor = unsafe { read_config_16(bus, slot, func, 0x00) };
+        serial_println!(
+            ":: x86_64 PCI: Found network controller (class 0x02) vendor {:#06x} at {}:{}.{} ::",
+            vendor, bus, slot, func
+        );
+        // Only the Intel e1000/e1000e family is supported. On a real 2012 MacBook Pro the NIC is a
+        // Broadcom Wi-Fi part (vendor 0x14e4) that also reports class 0x02 — poking it with e1000
+        // register writes is wrong and its RX/TX bring-up (+ DHCP) just stalls. Gate to Intel.
+        if vendor != 0x8086 {
+            serial_println!(":: x86_64 PCI: non-Intel NIC ({:#06x}) — no e1000 driver, skipping ::", vendor);
+            return;
+        }
+        crate::drivers::e1000::init(bus, slot, func);
+        // Route the NIC's RX interrupt to the BSP local APIC via MSI (IDT vector 0x41),
+        // the same local-APIC delivery the xHCI uses. The e1000e keeps its MSI-X table in
+        // BAR3 (not mappable by enable_msix), so plain MSI is used.
+        let msg_addr = 0xFEE0_0000u32 | ((crate::arch::apic::apic_id() as u32) << 12);
+        crate::drivers::e1000::enable_interrupts(
+            bus, slot, func, msg_addr,
+            crate::arch::interrupts::NIC_MSI_VECTOR as u32,
+        );
+    } else {
+        serial_println!(":: x86_64 PCI: No network controller (class 0x02) found ::");
+    }
+}
+
 pub fn init(_dtb_addr: u64, _dtb_size: usize) {
+    // GPACE: the phase accumulators for everything BPACE lumps into `pci-usb d=`. Plain memory,
+    // no lock, no allocation — see the module block above `G_XTAIL`.
+    let mut pace = Gpace::new();
+
+    // BPACE (M4): entry to the whole PCI/USB bring-up. Placed FIRST so that `d=` from `sched` is
+    // step 4e (`apic::report_tick_rate` — a 50 ms PM-timer window) and nothing else, and so a boot
+    // that dies anywhere below still shows that it got this far. Everything from here to
+    // `pci-usb` used to be one undivided delta; see `docs/dev/OS/01_BOOT_HAL/bootpace.md` §6a.
+    crate::bootpace::record("pci-enter");
+
     // VPERF (bench builds only): read-only display diagnostics — the effective framebuffer memory
     // type (MTRR + live PTE + PAT) and which class-0x03 device's BAR owns the fb address. Rides
     // the PCI-init point so the lines land once, early, in every knob-ON boot log.
@@ -223,8 +827,16 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
     // poll. Runs BEFORE the PORTSW flip + xhci::init below: the internal HID sit on NON-switchable
     // EHCI-only ports (PORTSW-1 §7f), so the port sets are disjoint by hardware and the two stacks
     // coexist permanently. Never touches an xHCI register. Opt-out => this call + the module unlink.
+    //
+    // BPACE (M4): stamped on BOTH sides. `ehci::init` is default-ON on the metal build, walks all
+    // 256 PCI buses of config space, then runs a wake + port-reset + synchronous EP0 enumeration per
+    // EHCI function — every one of those waits is `wait_bounded`, so the phase can legitimately cost
+    // hundreds of ms and a boot that dies inside it must still show that it ENTERED it. A single
+    // trailing stamp could not tell "EHCI was slow" from "EHCI never ran".
+    crate::bootpace::record("ehci-hid");
     #[cfg(feature = "ehcihid")]
     crate::drivers::ehci::init();
+    crate::bootpace::record("ehci-hid-done");
 
     // BATMON-1 (UNAOS_SMC=1): fire the Apple SMC key-inventory scout once, here at the early x86
     // bring-up point (like the EHCI scout above) so its `:: SMC-SCOUT: ... ::` lines land once in
@@ -239,7 +851,36 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
         crate::drivers::smc::battery::refresh_if_due();
     }
 
-    if let Some((xhci_phys_addr, bus, dev, func)) = crate::drivers::pci::PciScanner::scan() {
+    // PCI-CENSUS (GR20, UNAOS_PCICENSUS=1): the complete READ-ONLY enumeration witness — one line
+    // per function present on the machine. Placed HERE, before the xHCI scan and therefore before
+    // the GPACE anchor, for three reasons: (1) it is upstream of every wedge-prone bring-up below,
+    // so a boot that dies in xHCI/GPU/SDHC still carries the inventory; (2) it leaves the GPACE
+    // tiling and its `resid` closure untouched — the census is outside `span` by construction, not
+    // by an adjustment; (3) its cost is self-reported on its own `elapsed=` field, so it cannot hide
+    // inside the BPACE `pci-scan` delta it lands in. Knob OFF => this call does not exist.
+    #[cfg(feature = "pcicensus")]
+    full_census();
+
+    // BCMA-RECON (GR20, UNAOS_BCMARECON=1): STRICTLY READ-ONLY reconnaissance of the Broadcom WiFi
+    // radio — class 0x02 SUBCLASS 0x80, the subclass `find_device(0x02, 0x00)` below structurally
+    // cannot match, which is why the line this function has printed on every rMBP boot ("Found
+    // network controller … 0x14e4 at 3:0.0") names the BCM57765 Ethernet MAC and not the radio.
+    // Placed HERE, immediately after the census and BEFORE the GPACE anchor, for the census's own
+    // three reasons: upstream of every wedge-prone bring-up below, outside the GPACE tiling by
+    // construction, and self-reporting its own `elapsed=`. Config reads + BAR0 reads only; it maps
+    // BAR0 (a page-table edit, not a device access) and issues no config or register WRITE — every
+    // fact that needs one is printed as a `REFUSED reg=…` line instead. Knob OFF => this call and
+    // the module do not exist.
+    #[cfg(feature = "bcmarecon")]
+    crate::drivers::bcma::recon();
+
+    // BPACE (M4): the xHCI bus scan. Split from the `if let` so the stamp lands whether or not a
+    // controller was found — on a machine with no xHCI the tag is still present and `pci-usb`
+    // follows it directly, which is how the ledger distinguishes "no controller" from "the scan
+    // hung". Config-space reads only, no waits: a single trailing stamp is sufficient here.
+    let xhci_found = crate::drivers::pci::PciScanner::scan();
+    crate::bootpace::record("pci-scan");
+    if let Some((xhci_phys_addr, bus, dev, func)) = xhci_found {
         serial_println!(":: x86_64 PCI Init: Found xHCI at {:#x} ::", xhci_phys_addr);
 
         // DIAGNOSTIC (read-only): dump interrupt line/pin + capability list to plan
@@ -258,6 +899,13 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
         // config-space write is issued (the no-routing EHCI-internal/xHCI-external topology).
         #[cfg(not(feature = "noportsw"))]
         enable_intel_xhci_ports(bus, dev, func);
+
+        // BPACE (M4): the PCI-side preamble to the controller — `probe_irq_caps`,
+        // `enable_bus_master`, and the PORTSW-1 routing flip. All config-space I/O with no
+        // handshake wait, so `d=` here should be ~0; on a `noportsw` build the tag still records
+        // (the flip is what is absent, not the stamp) and `d=` is the two capability accesses
+        // alone. Immediately precedes `xhci::init`, so it doubles as that call's entry marker.
+        crate::bootpace::record("portsw");
 
         // Initialize xHCI
         crate::drivers::xhci::init(xhci_phys_addr); // Reset and command ring
@@ -293,38 +941,209 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
             );
 
             xhci.init_pointers(command_ring_phys);
+
+            // BPACE (M4): the ring/interrupter programming is done and RS has NOT been set yet.
+            // `d=` from `xhci-cnr` covers the heap allocation of the command + event rings,
+            // `init_interrupter` (which re-runs `wait_for_cnr_clear`, a `hw_wait_budget()`-bounded
+            // wait), the MSI-X programming and `init_pointers`. Stamped before `start()` so a boot
+            // that wedges inside `start()` still shows the controller was fully programmed.
+            crate::bootpace::record("xhci-ptrs");
+
             xhci.start();
 
             // Store globally
-            *crate::drivers::xhci::XHCI_CONTROLLER.lock() = Some(xhci);
+            crate::drivers::xhci::install(xhci);
         }
     }
 
-    // Network controller (PCI class 0x02 = Network, subclass 0x00 = Ethernet).
-    // QEMU's e1000 (82540EM) lands here; bring it up for polled RX.
-    if let Some((bus, slot, func)) = crate::drivers::pci::PciScanner::find_device(0x02, 0x00) {
-        let vendor = unsafe { read_config_16(bus, slot, func, 0x00) };
-        serial_println!(
-            ":: x86_64 PCI: Found network controller (class 0x02) vendor {:#06x} at {}:{}.{} ::",
-            vendor, bus, slot, func
-        );
-        // Only the Intel e1000/e1000e family is supported. On a real 2012 MacBook Pro the NIC is a
-        // Broadcom Wi-Fi part (vendor 0x14e4) that also reports class 0x02 — poking it with e1000
-        // register writes is wrong and its RX/TX bring-up (+ DHCP) just stalls. Gate to Intel.
-        if vendor != 0x8086 {
-            serial_println!(":: x86_64 PCI: non-Intel NIC ({:#06x}) — no e1000 driver, skipping ::", vendor);
-            return;
+    // ── GPACE anchor ────────────────────────────────────────────────────────────────────────────
+    // Everything measured from here on is what BPACE will charge to `pci-usb d=`. The anchor is the
+    // ledger's LAST stamp at this instant — the one BPACE itself will subtract — read out of the
+    // ring without adding to it. On this machine that is `enum:p1`, because `xhci.start()` kicks
+    // port-1 enumeration before returning; with no xHCI present it is `pci-scan`, and the arithmetic
+    // is unchanged. `anchor=` is printed so the reader never has to assume which it was.
+    //
+    // `xtail` therefore holds the `start_next_port` tail: whatever `xhci.start()` did after its last
+    // stamp, plus publishing the controller into `XHCI_CONTROLLER`.
+    let (anchor_cy, anchor_tag) = crate::bootpace::last_stamp()
+        .unwrap_or((crate::arch::now_cycles(), "none"));
+    pace.add(G_XTAIL, anchor_cy);
+
+    // BENCH-RIDE probes run here — serial is live (post-xHCI) and the GPU dispatch hasn't run,
+    // so their evidence survives a GPU-init wedge. All read-only, knob-gated, one-shot.
+    // GPACE: each probe closes into `bench`, so `n=` counts how many of the three were compiled in
+    // — `0ms(n=0)` on the media that carries none of them, which is the default.
+    #[cfg(all(target_arch = "x86_64", feature = "thermprobe"))]
+    {
+        let t = crate::arch::now_cycles();
+        crate::drivers::bench_ride::therm_snapshot();
+        pace.add(G_BENCH, t);
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "pcilink"))]
+    {
+        let t = crate::arch::now_cycles();
+        crate::drivers::bench_ride::pcilink_snapshot();
+        pace.add(G_BENCH, t);
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "vromprobe"))]
+    {
+        let t = crate::arch::now_cycles();
+        crate::drivers::bench_ride::vrom_sniff();
+        pace.add(G_BENCH, t);
+    }
+
+    // GPU init runs AFTER the xHCI block: bench serial on the rMBP is the usbdebug FTDI behind
+    // xHCI, so any GPU-init wedge before this point is invisible (zero serial from power-on —
+    // sitting #7 boot 2 hard-hang signature). After xHCI is up, a wedge leaves breadcrumbs.
+    // GPACE: the GPU dispatch is measured entirely from OUT HERE, at its call sites. `detect`,
+    // `igpu` and `kepler` are wall-clock spans around calls this file already makes; not one line
+    // is added to `gpu/detect.rs`, `gpu/igpu.rs` or `gpu/kepler.rs`, which belong to other lanes.
+    // Each span therefore contains everything its callee did — MMIO, settles, AND the serial
+    // printing of its own witness lines. When the whole block is compiled out (a default build) all
+    // three classes read `0ms(n=0)`: never measured, not measured-as-zero.
+    #[cfg(all(target_arch = "x86_64", any(feature = "nvidia-kepler", feature = "intel-ivb")))]
+    {
+        let t_detect = crate::arch::now_cycles();
+        let gpus = crate::drivers::gpu::detect::detect_gpus();
+        pace.add(G_DETECT, t_detect);
+        let mut kepler_found = false;
+        for gpu in &gpus {
+            match gpu.gpu_type {
+                #[cfg(feature = "nvidia-kepler")]
+                crate::drivers::gpu::detect::GpuType::NvidiaKepler => {
+                    kepler_found = true;
+                    let t = crate::arch::now_cycles();
+                    crate::drivers::gpu::kepler::init(gpu);
+                    pace.add(G_KEPLER, t);
+                }
+                #[cfg(feature = "intel-ivb")]
+                crate::drivers::gpu::detect::GpuType::IntelIvyBridge => {
+                    let t = crate::arch::now_cycles();
+                    crate::drivers::gpu::igpu::init(gpu);
+                    pace.add(G_IGPU, t);
+                }
+                _ => {}
+            }
         }
-        crate::drivers::e1000::init(bus, slot, func);
-        // Route the NIC's RX interrupt to the BSP local APIC via MSI (IDT vector 0x41),
-        // the same local-APIC delivery the xHCI uses. The e1000e keeps its MSI-X table in
-        // BAR3 (not mappable by enable_msix), so plain MSI is used.
-        let msg_addr = 0xFEE0_0000u32 | ((crate::arch::apic::apic_id() as u32) << 12);
-        crate::drivers::e1000::enable_interrupts(
-            bus, slot, func, msg_addr,
-            crate::arch::interrupts::NIC_MSI_VECTOR as u32,
+        #[cfg(feature = "nvidia-kepler")]
+        if !kepler_found {
+            serial_println!(":: kepler: no-device ::");
+        }
+
+        #[cfg(all(feature = "gmux_igd", feature = "intel-ivb"))]
+        unsafe { crate::drivers::gpu::igpu::gmux_igd_switch() };
+    }
+
+    // SDHC-1 (milestone 1): storage-class PCI census + the read-only SD Host Controller
+    // version/capability probe. Runs HERE — after the GPU dispatch (paging + the frame allocator
+    // the MMIO mapping needs are long up) and BEFORE the network block, whose non-Intel early exit
+    // would otherwise have swallowed the witness on the 2012 rMBP (Broadcom Wi-Fi). GPACE moved
+    // that exit into `init_network()`, so the ordering is no longer load-bearing for THIS witness —
+    // but it stays, because the sequence is what the metal baselines were taken against.
+    // Read-only end to end: no reset, no clock/power programming, no command, no config write.
+    {
+        let t = crate::arch::now_cycles();
+        crate::drivers::sdhc::probe();
+        pace.add(G_SDHC, t);
+    }
+
+    // GPACE: the network block is `init_network()` precisely so its non-Intel early exit cannot
+    // swallow the report below — see the helper's doc comment. `n=1` always; a Broadcom skip is a
+    // measured, cheap `nic=`, not an absence.
+    {
+        let t = crate::arch::now_cycles();
+        init_network();
+        pace.add(G_NIC, t);
+    }
+
+    // ── GPACE report — the one unconditional exit of `pci::init` ────────────────────────────────
+    // Two lines (three when the tripwire fires). The first is the split; the second is the
+    // self-check plus the build identity.
+    //
+    // `resid = span - Σ(classes)` closes over the PRINTED MILLISECOND VALUES, not over the cycle
+    // counts. That distinction is the whole point of the field. Each class is floored to ms
+    // independently, so a cycle-domain residual then floored a ninth time leaves the printed row
+    // short of the printed `span` by up to `N_GPACE + 1` ms — noise against the 4620 ms armed
+    // block, but up to 8% of the ~100 ms default-build baseline that §9a calls load-bearing, and
+    // sitting in exactly the field whose job is to prove nothing went unattributed. A reader adds
+    // up the line; the line must add up. `Σfloor(x_k) ≤ floor(Σx_k) ≤ floor(span)` makes the
+    // printed-domain subtraction non-negative by construction, so the flooring loss lands in
+    // `resid` — which already means "unattributed" — and the row closes exactly.
+    //
+    // A class that under-counts therefore still shows up as unattributed time rather than as a
+    // tidy-looking total. `span` must equal the independent BPACE `pci-usb d=` to the millisecond:
+    // same anchor stamp, same `hz`, and since `gpace_fmt` now shares `Dur`'s divisor, the same
+    // rendering. The only slack is these two lines' own print cost, which lands inside `pci-usb`
+    // and outside `span` — measured at 1 ms (§9).
+    {
+        let now = crate::arch::now_cycles();
+        let span = now.wrapping_sub(anchor_cy);
+
+        // TRIPWIRE. The cycle comparison survives here — not as the printed residual, but as the
+        // one reading that can convict the tiling. `Σ > span` is what overlapping spans, a wrong
+        // anchor, or a non-monotonic `now_cycles()` across cores would produce; the previous
+        // `saturating_sub` rendered every one of those as `resid=0ms`, which is ALSO the healthy
+        // reading. Clamping a broken instrument into the shape of a working one is this seat's
+        // recurring defect, and it had no business living inside the instrument built to avoid it.
+        // One branch, never taken in a sound build, turns that mask into a conviction.
+        let sum_cy = pace.sum();
+        if sum_cy > span {
+            serial_println!(
+                ":: GPACE: OVERLAP sum>span by {}cy — classes are not disjoint ::",
+                sum_cy - span
+            );
+        }
+
+        let mut v = [0u64; N_GPACE];
+        let mut unit = "ms";
+        let mut k = 0;
+        while k < N_GPACE {
+            let (val, u) = gpace_fmt(pace.cy[k]);
+            v[k] = val;
+            unit = u;
+            k += 1;
+        }
+        let (sv, su) = gpace_fmt(span);
+        // Printed-domain closure: `resid` is what the printed span has left after the printed
+        // classes. In a sound build — equivalently, whenever the tripwire above stayed silent —
+        // the row sums to `span` exactly, for any `hz`, including the `cy` case (which floors
+        // nothing, so `rv = span - Σ` outright). The OVERLAP case is the deliberate exception: the
+        // row does NOT close there and `resid=0ms` still prints, which is precisely why that
+        // condition gets a line of its own rather than being left to this subtraction. The
+        // `saturating_sub` is therefore never silent — `named > sv` implies `Σcy > span`, which is
+        // exactly the tripwire's condition.
+        let mut named = 0u64;
+        let mut j = 0;
+        while j < N_GPACE {
+            named = named.saturating_add(v[j]);
+            j += 1;
+        }
+        let rv = sv.saturating_sub(named);
+        serial_println!(
+            ":: GPACE: {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) resid={}{} == witness ::",
+            GPACE_TAGS[G_XTAIL], v[G_XTAIL], unit, pace.n[G_XTAIL],
+            GPACE_TAGS[G_BENCH], v[G_BENCH], unit, pace.n[G_BENCH],
+            GPACE_TAGS[G_DETECT], v[G_DETECT], unit, pace.n[G_DETECT],
+            GPACE_TAGS[G_IGPU], v[G_IGPU], unit, pace.n[G_IGPU],
+            GPACE_TAGS[G_KEPLER], v[G_KEPLER], unit, pace.n[G_KEPLER],
+            GPACE_TAGS[G_SDHC], v[G_SDHC], unit, pace.n[G_SDHC],
+            GPACE_TAGS[G_NIC], v[G_NIC], unit, pace.n[G_NIC],
+            rv, unit
         );
-    } else {
-        serial_println!(":: x86_64 PCI: No network controller (class 0x02) found ::");
+        // `since-entry=` correlates this line with the ledger's `t=` column. `entry` is the boot's
+        // first stamp and cannot legitimately be missing here; if it ever is, the unit prints `?`
+        // rather than a zero that would read as a real measurement.
+        let (tv, tu) = match crate::bootpace::cycles_of("entry") {
+            Some(e) => gpace_fmt(now.wrapping_sub(e)),
+            None => (0, "?"),
+        };
+        serial_println!(
+            ":: GPACE: span={}{} anchor={} since-entry={}{} hz={} build={}{}{}{}{}{}{}{}{}{} == the pci-usb d= split ::",
+            sv, su, anchor_tag, tv, tu, crate::bootpace::origin_hz(),
+            GB_NONE, GB_KEPLER, GB_TAKEOVER, GB_FIFO, GB_IVB, GB_WC, GB_SMC,
+            GB_THERM, GB_PCILINK, GB_VROM
+        );
+        #[cfg(feature = "intel-ivb")]
+        crate::drivers::gpu::igpu::print_blt_stats();
     }
 }

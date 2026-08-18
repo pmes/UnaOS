@@ -30,56 +30,56 @@ use spin::Mutex as SpinMutex;
 // --- Syscall numbers. WRITE/EXIT are the M6a/M6b core; REPORT is the M6d demo channel; YIELD/SLEEP_MS/
 // GETPID/GETINFO are the M6f "real" surface (all thin over existing scheduler/timer primitives). The
 // numbering is common across arches (documented in userspace.md) so the x86 U-side port stays aligned. ---
-const SYS_WRITE: u64 = 1;
-const SYS_EXIT: u64 = 2;
+use una_abi::SYS_WRITE;
+use una_abi::SYS_EXIT;
 /// M6d demo: report a u64 value to the kernel, keyed by the calling task's name (see `m6d_report`).
 /// Demo-only accounting channel — a real OS would not have this; it lets an EL0 program hand the kernel
 /// the value it read from its own (slot-private) address space so the verdict can check isolation.
-const SYS_REPORT: u64 = 3;
+use una_abi::SYS_REPORT;
 /// M6f: cooperatively give up the CPU — thin over `sched::yield_now()`. Returns 0.
-const SYS_YIELD: u64 = 4;
+use una_abi::SYS_YIELD;
 /// M6f: sleep ~`a0` milliseconds — thin over `sched::sleep_ticks()` (ms→ticks at the 250 Hz tick, round
 /// up). Returns 0. QEMU has no delivered timer IRQ, so it falls back to a cooperative yield there.
-const SYS_SLEEP_MS: u64 = 5;
+use una_abi::SYS_SLEEP_MS;
 /// M6f: return the calling task's id (pid) in x0.
-const SYS_GETPID: u64 = 6;
+use una_abi::SYS_GETPID;
 /// M6f: write a fixed {pid, ticks} struct to the user pointer in x0 via `copy_to_user`. Returns 0 or -EFAULT.
-const SYS_GETINFO: u64 = 7;
+use una_abi::SYS_GETINFO;
 /// M7/U4: load the fixed on-disk program (`HELLO.BIN`) into a fresh per-task slot, run it at EL0 as a CHILD,
 /// and return a HANDLE index into the CALLER's per-process handle table (U4 — not the raw pid), or a negative
 /// errno. No args this arc — arbitrary program-by-name is M8 (it needs a validated `copy_from_user` name).
 /// See `sys_spawn`.
-const SYS_SPAWN: u64 = 8;
+use una_abi::SYS_SPAWN;
 /// M7/U4: block the caller until the child referred to by the HANDLE in `a0` exits, then return its exit
 /// status (or -ECHILD if that handle is not in the caller's table — structural ownership). Woken by the
 /// child's `done.post()` — a scheduler wake, so it works under QEMU. See `sys_wait`.
-const SYS_WAIT: u64 = 9;
+use una_abi::SYS_WAIT;
 /// U5: operate on the caller's OWN handle table as capabilities. `a0` selects the sub-op
 /// (`CAP_OP_GRANT`/`CAP_OP_REVOKE`); the remaining args are op-specific (see `sys_cap`). GRANT mints a new,
 /// rights-attenuated handle to the same target as a source handle the caller holds `CAP_GRANT` on; REVOKE
 /// clears a handle the caller owns. The enforcement layer sits at the handle lookup (`handle_resolve`).
-const SYS_CAP: u64 = 10;
+use una_abi::SYS_CAP;
 /// `SYS_CAP` sub-ops (in `a0`). GRANT: `a1`=source handle idx, `a2`=requested rights mask -> new handle idx
 /// (attenuated) or a negative errno. REVOKE: `a1`=handle idx to drop -> 0 or a negative errno.
-const CAP_OP_GRANT: u64 = 0;
-const CAP_OP_REVOKE: u64 = 1;
+use una_abi::CAP_OP_GRANT;
+use una_abi::CAP_OP_REVOKE;
 /// U7: revoke a TRANSFER the caller previously made with `SYS_XFER` (`a1` = the transfer id SYS_XFER
 /// returned). Sender-only (the transfer RECORD is sender-owned); single-level — revoking a transfer makes
 /// the RECEIVED capability stale at its next `handle_resolve` (and discards it if still pending in the
 /// recipient's inbox), but does NOT cascade through further re-transfers (revocation TREES are deferred).
-const CAP_OP_XREVOKE: u64 = 2;
+use una_abi::CAP_OP_XREVOKE;
 /// U6b: open a disk file BY NAME under the object table. `a0`=name ptr (EL0), `a1`=name len -> a HANDLE
 /// index naming a `File` object carrying `CAP_READ`, or a negative errno. `copy_from_user`s the (bounded)
 /// name, mounts the single FAT volume, finds the top-level 8.3 entry, allocates a per-task file descriptor,
 /// and installs the File handle first-free. Read-only, flat root, one volume — the capability precursor to
 /// UnaFS grants. See `sys_open`.
-const SYS_OPEN: u64 = 11;
+use una_abi::SYS_OPEN;
 /// U6b: read from an open File handle. `a0`=handle idx, `a1`=dest buf (EL0, writable), `a2`=len -> the byte
 /// count (`0` = EOF), or a negative errno. The CHECK: `handle_resolve(asid, handle, CAP_READ)` must yield a
 /// `File` — a missing right, a non-File kind, or no handle all give `-EACCES` (the object-table enforcement
 /// point, the twin of `sys_write`'s Console+CAP_WRITE). Sequential — the descriptor's offset advances by the
 /// count returned. See `sys_read`.
-const SYS_READ: u64 = 12;
+use una_abi::SYS_READ;
 // U7: cross-process capability transfer — the FIRST cross-process op on the object table. XFER(dest,
 // src, req_rights) deposits an ATTENUATED copy of a capability the caller holds into the recipient's
 // per-ASID transfer INBOX (the one deliberately cross-ASID surface, CAS-managed); the recipient names
@@ -87,14 +87,14 @@ const SYS_READ: u64 = 12;
 // process namespace). RECV() pulls a pending capability out of the CALLER's own inbox into the CALLER's
 // own handle row — so every handle-table row keeps its single writer (the sender NEVER writes the
 // recipient's row). Returns: XFER -> a transfer id (for a later CAP_OP_XREVOKE), RECV -> a handle index.
-const SYS_XFER: u64 = 13;
-const SYS_RECV: u64 = 14;
+use una_abi::SYS_XFER;
+use una_abi::SYS_RECV;
 /// U9: absolute seek on an open File descriptor. `a0`=handle idx, `a1`=absolute byte offset -> the new offset,
 /// or a negative errno. The CHECK: `handle_resolve` must yield a `File` carrying ANY of `CAP_READ|CAP_WRITE`
 /// (a non-File kind / no handle / a revoked-ancestor cap all give `-EACCES`); a request past the file's `size`
 /// is `-EINVAL` (seeking TO `size`, the EOF position, is legal). Sets `FILE_OFFSET` (the U6b sidecar). Both a
 /// later `SYS_READ` and a File `SYS_WRITE` resume from the seeked offset. See `sys_seek`.
-const SYS_SEEK: u64 = 15;
+use una_abi::SYS_SEEK;
 
 /// U10: DELETE (unlink) the file an open File+`CAP_WRITE` handle refers to. `a0`=handle idx -> `0`, or a
 /// negative errno. The CHECK is `sys_write`'s: `handle_resolve(asid, fd, CAP_WRITE)` must yield a `File` (a
@@ -102,7 +102,7 @@ const SYS_SEEK: u64 = 15;
 /// by the SAME single write CHECK. Frees the file's cluster chain (every FAT entry -> 0, ALL copies) and marks
 /// its directory entry deleted (0xE5), then invalidates the descriptor + handle. Dir mark FIRST, then free, so a
 /// crash mid-delete leaves lost clusters (benign), never a live entry pointing at freed/re-allocated clusters.
-const SYS_UNLINK: u64 = 16;
+use una_abi::SYS_UNLINK;
 
 /// U11: CLOSE an open `File` — `a0`=handle idx -> `0`, or a negative errno. Frees the handle's descriptor slot
 /// (bumping the slot's GENERATION so any lingering sibling handle to the same slot goes stale, not re-bound to a
@@ -111,7 +111,7 @@ const SYS_UNLINK: u64 = 16;
 /// `-EINVAL` (Console/Socket are not closeable this arc; never silently corrupted); an unresolvable / already-
 /// closed / stale-slot handle is `-EBADF` (double-close returns cleanly; use-after-close is denied). Only the
 /// CALLER's own descriptor is freed — a cross-process open is unaffected (that lifetime is the open-file refcount).
-const SYS_CLOSE: u64 = 17;
+use una_abi::SYS_CLOSE;
 
 /// U6: GRANT (or revoke) another principal access to a PRIVATE file the caller OWNS — the delegation half of
 /// the UnaFS owner/grants ACL. `a0`=a `File` handle the caller holds (names the file by its on-disk identity),
@@ -120,7 +120,7 @@ const SYS_CLOSE: u64 = 17;
 /// or a negative errno. Only the file's current owner may grant; the grant is an ACL edge on the FILE (nothing
 /// is delivered to the grantee's table) — the grantee simply opens the name and the SYS_OPEN ACL admits it. A
 /// handle a grantee already holds survives a revoke (the ACL gates ACQUISITION, not held caps). See `sys_fgrant`.
-const SYS_FGRANT: u64 = 18;
+use una_abi::SYS_FGRANT;
 
 /// BANDY-1 M2: the on-UnaOS SMessage bus transport (ROADMAP §3b arc 1). SYS_MSEND(frame_ptr,
 /// frame_len) submits ONE v1 request frame (arch/aarch64/bus.rs wire layout); the kernel
@@ -129,8 +129,8 @@ const SYS_FGRANT: u64 = 18;
 /// EXISTING FAT/ACL machinery under the invoker's grants (verdict D — no impersonation, no new
 /// model), and enqueues the reply into the SENDER's bounded mailbox. SYS_MRECV(buf_ptr, buf_len)
 /// dequeues the next reply, blocking on the sys_wait Semaphore idiom while the mailbox is empty.
-const SYS_MSEND: u64 = 19;
-const SYS_MRECV: u64 = 20;
+use una_abi::SYS_MSEND;
+use una_abi::SYS_MRECV;
 
 /// ELF-2: the EL0-threading syscalls (first rung of the thread ladder). Unlike `SYS_SPAWN` (a new PROCESS —
 /// fresh slot/ttbr0/ASID, its own address space), these create/reap THREADS that SHARE the caller's address
@@ -142,9 +142,9 @@ const SYS_MRECV: u64 = 20;
 ///     JoinHandle completion Semaphore. -ESRCH if the handle is not the caller's live thread.
 ///   SYS_THREAD_EXIT(): terminate the calling thread — posts its completion, decrements the slot refcount
 ///     (teardown only on the LAST thread), never returns.
-const SYS_THREAD_SPAWN: u64 = 21;
-const SYS_THREAD_EXIT: u64 = 22;
-const SYS_THREAD_JOIN: u64 = 23;
+use una_abi::SYS_THREAD_SPAWN;
+use una_abi::SYS_THREAD_EXIT;
+use una_abi::SYS_THREAD_JOIN;
 
 /// ELF-3: give EL0 something to draw on + real synchronisation.
 ///   SYS_FB_MAP() -> surface VA >= 0 / -errno
@@ -161,12 +161,12 @@ const SYS_THREAD_JOIN: u64 = 23;
 ///     op=0 FUTEX_WAIT: block iff *uaddr == val, keyed by the physical address of uaddr (bounded queue).
 ///     op=1 FUTEX_WAKE: wake up to `val` waiters on that key; returns the count woken. Enough for a
 ///     userspace mutex/condvar. `uaddr` is validated to lie in the caller's writable user window.
-const SYS_FB_MAP: u64 = 24;
-const SYS_FB_PRESENT: u64 = 25;
-const SYS_FUTEX: u64 = 26;
+use una_abi::SYS_FB_MAP;
+use una_abi::SYS_FB_PRESENT;
+use una_abi::SYS_FUTEX;
 /// SYS_FUTEX sub-ops (in x1).
-const FUTEX_WAIT: u64 = 0;
-const FUTEX_WAKE: u64 = 1;
+use una_abi::FUTEX_WAIT;
+use una_abi::FUTEX_WAKE;
 
 /// ELF-5: input into EL0 — the next ladder rung after surface + threads + futex. An interactive EL0
 /// app needs keys/mouse.
@@ -175,15 +175,24 @@ const FUTEX_WAKE: u64 = 1;
 ///     ACTIVE app — the router only enqueues into the active process's ring), or `-EAGAIN` when the ring
 ///     is empty. The event is a packed u64 (bit 63 always clear, so it never collides with a negative
 ///     errno): [55:48] = type (see `INPUT_EV_*`), payload in the low 32 bits — key ASCII / button mask in
-///     [7:0], mouse dx/x in [31:16] (i16), dy/y in [15:0] (i16). The router seam is `el0_input_enqueue`
-///     (mirroring ELF-3's present seam); active-process registration is `el0_input_set_active`.
-const SYS_INPUT_POLL: u64 = 27;
-/// SYS_INPUT_WAIT = 28 is DEFERRED (documented at `sys_input_poll`) — a blocking variant on a per-ASID
-/// Semaphore that `el0_input_enqueue` posts; QEMU has no real input source, so POLL is the QEMU-provable
-/// rung this arc lands.
+///     [7:0], mouse dx/x in [31:16] (i16), dy/y in [15:0] (i16). The router seam is `user_input_enqueue`
+///     (mirroring ELF-3's present seam); active-process registration is `user_input_set_active`.
+use una_abi::SYS_INPUT_POLL;
+/// VUGPAUSE-2: the reserved id 28 is now SPENT — `SYS_INPUT_WAIT`, the BLOCKING half of the pair.
+///   SYS_INPUT_WAIT() -> 0 / -EINVAL
+///     Block the calling task until its input ring is (or may be) non-empty, then return 0. It does NOT
+///     dequeue: the caller's next `SYS_INPUT_POLL` drain sees the event, so the two syscalls compose
+///     without a "wait consumed my event" hazard. Returns 0 immediately when the ring is already
+///     non-empty, and `-EINVAL` off a private slot (ASID 0) or off a schedulable task.
+///
+/// Implemented on the SAME kill-aware futex the barrier uses (`sched::futex_wait/_wake`), keyed by
+/// `input_futex_key(asid)` — a synthetic key outside the physical-address space that `sys_futex`'s user
+/// keys occupy, so an EL0 word can never alias an input key. The compare word is the ring's own TAIL,
+/// read at EL1 under the bucket lock, which is what makes the wait race-free against `user_input_push`.
+use una_abi::SYS_INPUT_WAIT;
 
 /// WC-B: the WINDOW verbs — the multi-surface successor to the single-surface `SYS_FB_MAP`/`SYS_FB_PRESENT`
-/// pair. Numbers start at 29 (28 is the reserved-DEFERRED `SYS_INPUT_WAIT` id, deliberately left unused).
+/// pair. Numbers start at 29 (28 is `SYS_INPUT_WAIT`, reserved by ELF-5 and spent by VUGPAUSE-2).
 ///
 ///   SYS_WIN_CREATE(w, h) -> win id (0..WIN_MAX) / -errno
 ///     Allocate a window owned by the CALLER's ASID and map its surface into the caller's EL0 window.
@@ -200,10 +209,10 @@ const SYS_INPUT_POLL: u64 = 27;
 ///   SYS_WIN_CLOSE(win) -> 0 / -errno
 ///     Unmap the surface (leaves revert to the reserved EL1-only identity descriptors) and free the
 ///     window. Same ownership gate. Teardown (`clear_handle_row`) closes every window an ASID still owns.
-const SYS_WIN_CREATE: u64 = 29;
-const SYS_WIN_PRESENT: u64 = 30;
-const SYS_WIN_MOVE: u64 = 31;
-const SYS_WIN_CLOSE: u64 = 32;
+use una_abi::SYS_WIN_CREATE;
+use una_abi::SYS_WIN_PRESENT;
+use una_abi::SYS_WIN_MOVE;
+use una_abi::SYS_WIN_CLOSE;
 
 /// M6e demo: the sentinel `sys_exit` status the preemption spinner uses so its exit is accounted to
 /// `EL0_SPIN_DONE` and never perturbs the M6b `exited/killed` counters. Demo-only — there is no real
@@ -1157,8 +1166,22 @@ unsafe extern "C" {
 // separate slots (each slot gets the whole blob; only the entry differs). Both are register-only (they write
 // no user stack; their only data reads are the RO code page and the launcher-owned GO word at window +0x3000,
 // which the KERNEL writes through the slot backing — the fixtures never store to it). Both poll cooperatively
-// (SYS_YIELD between attempts, bounded budgets), so the demo is deterministic under QEMU's cooperative
-// scheduling — no reliance on timer preemption.
+// (bounded budgets, one syscall between attempts), so the demo needs no timer preemption to make progress.
+//
+// U7FIX — the park primitive is `SYS_SLEEP_MS(1)`, NOT a bare `SYS_YIELD`, and that choice is load-bearing.
+// Every one of these budgets is a HANG GUARD whose only job is to outlast the LAUNCHER, and every launcher
+// deadline (`wait_while_secs(5/5/8)`) is denominated in WALL CLOCK. A bare-yield budget is denominated in
+// ITERATIONS, and the two currencies do not convert at a fixed rate: under QEMU an EL0 yield round trip is
+// emulated and costs ~1 ms, so 0x8000 of them outlast 30 s (measured); on real hardware, with a genuinely
+// idle sibling core, the same 0x8000 retire in single-digit MILLISECONDS. That is the whole of the P63
+// metal-only U7 failure: the child's GO park expired before the launcher — which had a full user-window
+// scrub and a ~110-character PL011 line at 115200 baud still to do — ever released GO. The child exited
+// with an empty witness, its teardown wiped the inbox the parent's t1 deposit was sitting in (so the
+// launcher's deposit poll then found nothing: `snap=false`), `U7_CHILD_USED` never rose, and the parent's
+// own iteration-bounded park expired across the launcher's 5 s timeout, reporting the partial `0x3`.
+// `SYS_SLEEP_MS` puts the fixtures back in the launcher's currency: it is a real 250 Hz tick sleep on metal
+// (0x8000 iterations ~= 131 s) and degrades to a cooperative yield on QEMU (~1 ms), so the budget comfortably
+// outlasts the launcher's ~18 s worst case in BOTH environments — and a parked fixture no longer spins a core.
 //
 // PARENT (`el0-u7parent`, pre-endowed: U7_DEST_IDX = a Child handle naming the child fixture; U7_SRC_IDX = a
 // full Console cap CAP_WRITE|CAP_GRANT):
@@ -1209,10 +1232,11 @@ __u7_prog_parent:
     add  x9, x9, #0x1000
     add  x9, x9, #0x1000
     add  x9, x9, #0x1000                   // x9 = GO VA (base + 0x3000; adds keep every imm in range)
-    movz x24, #0x8000                      // bounded poll budget
+    movz x24, #0x8000                      // bounded poll budget — see U7FIX: ~1 ms per iteration EVERYWHERE
 3:  ldr  x10, [x9]
     cbnz x10, 4f
-    mov  x8, #4                            // SYS_YIELD — cooperative, deterministic under QEMU
+    mov  x8, #5                            // SYS_SLEEP_MS(1) — a WALL-CLOCK tick, not a bare yield (U7FIX)
+    mov  x0, #1
     svc  #0
     subs x24, x24, #1
     b.ne 3b
@@ -1256,7 +1280,8 @@ __u7_prog_child:
     movz x24, #0x8000
 10: ldr  x10, [x11]
     cbnz x10, 11f
-    mov  x8, #4                            // SYS_YIELD
+    mov  x8, #5                            // SYS_SLEEP_MS(1) — wall-clock park (U7FIX)
+    mov  x0, #1
     svc  #0
     subs x24, x24, #1
     b.ne 10b
@@ -1268,7 +1293,8 @@ __u7_prog_child:
     svc  #0
     tbnz x0, #63, 13f                      // negative -> yield + retry (bounded)
     b    14f
-13: mov  x8, #4                            // SYS_YIELD
+13: mov  x8, #5                            // SYS_SLEEP_MS(1) — wall-clock park (U7FIX)
+    mov  x0, #1
     svc  #0
     subs x24, x24, #1
     b.ne 12b
@@ -1296,7 +1322,8 @@ __u7_prog_child:
     tbnz x0, #63, 17f
     add  x23, x23, #4                      // b2: t2 received
     b    18f
-17: mov  x8, #4                            // SYS_YIELD
+17: mov  x8, #5                            // SYS_SLEEP_MS(1) — wall-clock park (U7FIX)
+    mov  x0, #1
     svc  #0
     subs x24, x24, #1
     b.ne 16b
@@ -2915,10 +2942,30 @@ const PORPHANED: u8 = 3;
 
 /// The process table: parent + up to a few children. Static so it OUTLIVES each child's `Task` Box (which is
 /// freed on exit) and each child's slot teardown — the reap accounting must survive both. `MAX_PROCS` is a
-/// small cap « USER_SLOTS (8): if it exhausts, sys_spawn returns `-EAGAIN`, never grows the slot pool (a STOP
-/// tripwire). `done` is posted exactly once by the child (its exit OR its kill path) and waited exactly once
-/// by the parent's sys_wait, so a reaped-then-reused entry always starts at 0 permits (no drain needed).
-const MAX_PROCS: usize = 4;
+/// cap strictly below USER_SLOTS (8): if it exhausts, sys_spawn returns `-EAGAIN`, never grows the slot pool (a
+/// STOP tripwire). `done` is posted exactly once by the child (its exit OR its kill path) and waited exactly
+/// once by the parent's sys_wait, so a reaped-then-reused entry always starts at 0 permits (no drain needed).
+///
+/// PROCS-6 — raised 4 -> 6, so the operator can fill the panel with background vugs. What the raise had to
+/// clear, and why 6 and not more:
+///   * EVERY consumer is parametric. The reserve/free/find/census loops are `0..MAX_PROCS`, the reap
+///     accounting is per-row CAS, and both scavenges (BGRUN-SCAV's PEXITED reclaim, KILLBOUND's PORPHANED
+///     reclaim behind its quiescence witness) sweep the same range. There is no bitmask, no packed index,
+///     no fixed-width field anywhere keyed on the old 4 — nothing to widen.
+///   * ADDRESS SPACES still bind last, not first. Each live row costs one EL0 slot/ASID out of
+///     `USER_SLOTS` = 8, so 6 concurrent background programs leave 2 free for a foreground `run` and for
+///     the launcher fixtures' scratch tenancies. 8 would make the Proc table and the slot pool exhaust
+///     together and turn every slot-pressure failure into a table-full one; 6 keeps the pool the honest
+///     backstop it was designed to be. That headroom is the reason this is 6.
+///   * WINDOWS fit. `video::wm::MAX_WINDOWS` is 12 (shared raise; aarch64 claims at most its own WIN_MAX=8) and only EL0 programs mint windows (the shell console
+///     is desktop-level, not a wm row), so 6 windowed bg programs sit inside the compositor table with
+///     room to spare, and the tiler's wrap-and-stack keeps every box clear of the `ui_status` chrome.
+///   * SHELL side fits. `shell::BG_JOBS` is 8 rows, still strictly above this cap.
+///   * COST is two more static rows (`Proc` is two atomics, a status, a state byte and a `Semaphore`) plus
+///     the two extra `done.init()` waiter reservations of `WAIT_CAPACITY` boxes — a few hundred bytes of
+///     BSS and heap, entirely off the per-slot `SLOT_BACKING` budget, which `USER_SLOTS` governs and this
+///     change does not touch.
+const MAX_PROCS: usize = 6;
 struct Proc {
     /// The child task id; the sys_wait key. 0 while an entry is FREE or a claim's pid is not yet stored.
     pid: AtomicU64,
@@ -2943,6 +2990,35 @@ static PROCS: [Proc; MAX_PROCS] = [const {
         done: super::sched::Semaphore::new(0),
     }
 }; MAX_PROCS];
+
+/// PROCS-6 — the cap's two structural neighbours, enforced at compile time rather than left to a comment.
+/// A row that cannot be given an address space is a row that can only ever hand back `-EAGAIN` from deeper
+/// in the launch, and a kernel row the shell cannot record is a job the operator can neither see nor reap
+/// (`bg` kills such a spawn rather than leak it). Both must stay strictly above the cap.
+///
+/// SCOPE, so nobody reads more into a green `arroyo check` than is there: this module is gated behind
+/// `baremetal`, so these asserts are evaluated by the `kernel8` build and NOT by `check` (which builds
+/// aarch64 without the feature). That is the right place for them — it is the only configuration in
+/// which a `Proc` table, an EL0 slot pool and a kill table all exist — but `check` alone does not
+/// witness them. Each was verified to fire by negative test rather than assumed.
+const _: () = {
+    // Strictly below, by the margin the doc actually promises: two slots kept free so a foreground
+    // `run` and the launcher fixtures' scratch tenancies can still get an address space with every
+    // background row occupied. `< USER_SLOTS` alone would have permitted 7, which satisfies the letter
+    // of "leaves slots free" while starving exactly the two callers that need one.
+    assert!(MAX_PROCS <= super::boot::USER_SLOTS - 2, "MAX_PROCS must leave 2 EL0 slots free");
+    assert!(MAX_PROCS <= crate::video::wm::MAX_WINDOWS, "every bg program must be able to own a window");
+    // The KILL table, which is coupled to this one in the FAILURE direction: a row that can be killed
+    // needs a slot to be killed through, or `bg_kill` arms nothing, falls back to PORPHANED and parks
+    // the row — recoverable then only via KILLBOUND's narrower quiescence witness. `sched.rs` cannot
+    // name `MAX_PROCS` (it compiles in non-baremetal builds, where `syscall` is gated out), so the
+    // coupling is asserted from this side, which is also the only configuration where a `Proc` table
+    // exists and a shortfall could mean anything.
+    assert!(
+        MAX_PROCS <= super::sched::MAX_KILL_REQS,
+        "every killable Proc row must have a kill slot to be killed through"
+    );
+};
 
 /// The parent's WITNESS (reported via SYS_REPORT): `U4_WITNESS_TOKEN` (nonzero) iff it reaped BOTH children
 /// by handle with exit status 0, else 0. `u4_launcher`'s verdict demands it be non-zero (and no kill). A
@@ -3173,7 +3249,7 @@ fn proc_reserve() -> Option<usize> {
     // EXITED and that nobody has reaped. BGRUN-1's stated position was that holding those rows is
     // "honest: a shell that never runs `jobs` eventually gets 'process table full', not silent loss" —
     // and that is right about the STATUS, but it makes a table of CORPSES indistinguishable from a table
-    // of running programs at the point where it matters most: `MAX_PROCS` is 4, so four short-lived
+    // of running programs at the point where it matters most: `MAX_PROCS` is 6, so six short-lived
     // launches with no intervening `jobs` deny the operator the very shell verb that would clear them.
     //
     // The trade is explicit, and it is the lesser loss: an unobserved EXIT STATUS is dropped (a later
@@ -3209,7 +3285,7 @@ fn proc_reserve() -> Option<usize> {
     // owner timed out or was killed WITHOUT the kill confirming, parked terminal-but-owned. Pre-arc such
     // a row was IMMORTAL unless the victim happened to die through one of the two reclaim hooks
     // (`note_killed_task_retired`, which needs an ARMED kill slot, or the orphan's own SYS_EXIT). Neither
-    // fires when the kill table was exhausted at arm time (`KILL_EXHAUSTED`), so four such rows wedge
+    // fires when the kill table was exhausted at arm time (`KILL_EXHAUSTED`), so `MAX_PROCS` such rows wedge
     // `bg` for the rest of the boot — the hard, user-visible end of the P60 report.
     //
     // SMP SAFETY — the reclaim is gated on a POSITIVE QUIESCENCE WITNESS, never on elapsed time and
@@ -3279,17 +3355,46 @@ fn proc_table_full_reason() -> &'static str {
 }
 
 /// KILLBOUND: how many `Proc` rows are in each lifecycle state — `(porphaned, exited_unreaped)`.
+/// The full breakdown lives in [`proc_table_headroom`]; this is the two fields
+/// `proc_table_full_reason` needs to name WHICH exhaustion an operator is looking at.
 fn proc_table_census() -> (usize, usize) {
-    let mut porphaned = 0usize;
+    let (_, _, exited, porphaned) = proc_table_headroom();
+    (porphaned, exited)
+}
+
+/// STORM-HEADROOM: the `Proc` table's occupancy right now, as
+/// `(free, running, exited_unreaped, porphaned)`. Reads only; safe from any task.
+///
+/// The refusal string (`proc_table_full_reason`) already tells an operator what ran out AT THE MOMENT
+/// A LAUNCH IS REFUSED — but a burst that does NOT refuse prints nothing, and "storm 6 launched 6/6"
+/// leaves the remaining headroom unstated. That is precisely the reading a headroom probe exists to
+/// take, so the `storm` verb samples this BEFORE its burst: `free` is how many launches can possibly
+/// succeed, and the other three say whether a shortfall would be live work, corpses awaiting `jobs`,
+/// or the PORPHANED rows `jobs` can never reap (the P60 lesson, made readable one step earlier).
+///
+/// [`proc_table_rows`] is the denominator, exported beside it so a caller can print `free of N`
+/// without naming `MAX_PROCS` — the cap is this module's to state, and a second literal elsewhere
+/// would be a fact that could drift.
+pub fn proc_table_headroom() -> (usize, usize, usize, usize) {
+    let mut free = 0usize;
+    let mut running = 0usize;
     let mut exited = 0usize;
+    let mut porphaned = 0usize;
     for i in 0..MAX_PROCS {
         match PROCS[i].state.load(Ordering::Acquire) {
-            PORPHANED => porphaned += 1,
+            PFREE => free += 1,
             PEXITED => exited += 1,
-            _ => {}
+            PORPHANED => porphaned += 1,
+            _ => running += 1,
         }
     }
-    (porphaned, exited)
+    (free, running, exited, porphaned)
+}
+
+/// STORM-HEADROOM: the process-table cap — the denominator for [`proc_table_headroom`]. See the
+/// `MAX_PROCS` block for why it is 6 and why raising it is not a tuning knob.
+pub const fn proc_table_rows() -> usize {
+    MAX_PROCS
 }
 
 /// Find the RUNNING Proc entry whose pid matches — the child-exit / child-kill lookup. Called with a live
@@ -3379,7 +3484,7 @@ fn proc_find_orphaned(pid: u64) -> Option<usize> {
 /// call, the app can reach SYS_EXIT: it takes the live-child arm (the row is still `PRUNNING`), stores
 /// `PEXITED`, posts `done`, and retires. A blind store would then park a row whose task is already DEAD, and
 /// nothing would ever reclaim it — `proc_find_orphaned` is consulted only from the task's own exit/kill paths,
-/// which never run again. Four such races would exhaust `MAX_PROCS` until reboot. On CAS failure the task
+/// which never run again. `MAX_PROCS` such races would exhaust the table until reboot. On CAS failure the task
 /// died in the window, so the row is simply FREED here (returning `false` so the caller can report honestly).
 ///
 /// The stray `done` permit that death posted must be consumed before the row is recycled, or the
@@ -3547,11 +3652,11 @@ static HANDLES: [[AtomicU64; NHANDLE]; super::boot::USER_SLOTS + 1] =
 /// `CAP_WRITE` gates `sys_write`; `CAP_GRANT` gates minting attenuated copies; `CAP_READ`/`CAP_EXEC`/
 /// `CAP_REVOKE` round out the model (CAP_REVOKE is reserved for cross-process revocation — U6; U5 revoke is
 /// ownership-based). The values are stable across arches (documented in the permission-model doc).
-const CAP_READ: u32 = 1 << 0; // 0x01 (== fs::unafs::RIGHT_READ, const-asserted at rights_from_native)
-const CAP_WRITE: u32 = 1 << 1; // 0x02
-const CAP_EXEC: u32 = 1 << 2; // 0x04
-const CAP_GRANT: u32 = 1 << 3; // 0x08
-const CAP_REVOKE: u32 = 1 << 4; // 0x10 (U8: revoking a handle carrying this kills its derivation SUBTREE)
+use una_abi::CAP_READ; // 0x01 (== fs::unafs::RIGHT_READ, const-asserted at rights_from_native)
+use una_abi::CAP_WRITE; // 0x02
+use una_abi::CAP_EXEC; // 0x04
+use una_abi::CAP_GRANT; // 0x08
+use una_abi::CAP_REVOKE; // 0x10 (U8: revoking a handle carrying this kills its derivation SUBTREE)
 // The rights are the distinct low 5 bits — a well-formed bitmask (each a single, non-overlapping bit, which
 // the attenuation check `req & !src` relies on). This const-assert verifies that and anchors every CAP_* as
 // used, so the model bits not yet exercised in Rust this arc (CAP_EXEC — held by no fixture, so the
@@ -3825,6 +3930,18 @@ pub fn clear_handle_row(asid: u64) {
     // ELF-5: reset this ASID's input ring (a reused ASID inherits no stale input event), and if it was the
     // registered active input target, clear the designation so the router stops enqueueing to a dead slot.
     clear_input_row(asid);
+    // VUGPAUSE-2r2: and drop the park hint with it. THIS is the site that needs it — a task killed while
+    // parked in `SYS_INPUT_WAIT` leaves through `sched::futex_wait`'s pre-park kill boundary, which
+    // `exit()`s and never runs the clear on the syscall's normal path, so without this the recycled slot
+    // would inherit a permanent "someone is parked here" and the backstop would wake an empty key for the
+    // rest of the boot. It is deliberately NOT inside `clear_input_row`, whose other caller is a focus
+    // arrival: see `clear_input_parked`.
+    clear_input_parked(asid);
+    // VUGMIN-C: and the resume-print pacing counter, for the ordinary recycle reason — the next tenant of
+    // this slot must get its own first/second `[vugpause2] resume` lines printed rather than inheriting a
+    // departed program's cadence and going quiet until the count next hits a power of two. Pacing state
+    // only; the cumulative `USER_INPUT_WAKES` the rollup reports is boot-scoped and stays.
+    clear_input_resumes(asid);
     // INROUTE: this CAS is a FOCUS REVOCATION, and it is asynchronous with respect to whoever currently
     // holds focus — it fires on the dying slot's core the instant that slot tears down. Count it. The
     // count is the evidence line for the one race this seam can lose an event to: a router pass that
@@ -3832,7 +3949,7 @@ pub fn clear_handle_row(asid: u64) {
     // it drained. That is CORRECT for a real app (a dead slot must stop receiving input), but it is
     // indistinguishable from a routing bug in any witness that counts deliveries — see
     // `input_router_selftest`, which used to borrow ASID 1 while the fixture cascade was recycling it.
-    if EL0_INPUT_ACTIVE
+    if USER_INPUT_ACTIVE
         .compare_exchange(asid, 0, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
@@ -3842,7 +3959,7 @@ pub fn clear_handle_row(asid: u64) {
     // engaged, and a REUSED ASID would inherit it — the next `run` into the same slot would start with its
     // deadline already suspended. CAS on `asid` so we only ever clear OUR OWN latch, never a live one belonging
     // to a different process. (The heartbeat needs no clear: `takeover_suspends` ignores it once the latch is 0,
-    // and `el0_input_set_active` resets it on the next focus anyway.)
+    // and `user_input_set_active` resets it on the next focus anyway.)
     let _ = EL0_TAKEOVER_ASID.compare_exchange(asid, 0, Ordering::AcqRel, Ordering::Acquire);
     // WC-B: close every WINDOW this ASID still owns — the window twin of the handle/file/input rows above,
     // and for the same reason: a window row outliving its owner would name a surface inside a backing
@@ -4378,14 +4495,40 @@ fn free_orphan_chain(first_cluster: u32) -> bool {
             return false;
         }
     };
-    if fs.free_chain(first_cluster).is_err() {
-        serial_println!(
-            "U11-defer: deferred free of chain @cluster {} — free_chain error, orphaned (leak)",
-            first_cluster
-        );
-        return false;
+    match fs.free_chain(first_cluster) {
+        Ok(_) => true,
+        // WEDGE-10 (F2): `Busy` is the ONE retryable error here, and it must not orphan the chain.
+        // It does not mean the free failed — it means the storage device was momentarily loaned to
+        // another context, so the FAT RMW refused (masked) or exhausted (unmasked) its bounded wait
+        // and mutated NOTHING. Every other `FatError` describes a real I/O or structural failure whose
+        // retry would be futile, and those keep the historical orphan path (lost clusters — benign,
+        // chkdsk-reclaimable). A transient loan is exactly the shape a periodic reaper absorbs: push
+        // the head back onto the deferred-free queue and let the next pass free it (the push `post()`s
+        // `REAPER_SEM`, so the retry is scheduled, not spun on). Before this arm a `Busy` here leaked
+        // the chain outright — the regression that surfaced when the SD card became a claimed loan.
+        Err(crate::fs::fat::FatError::Busy) => {
+            if deferred_free_push(first_cluster) {
+                serial_println!(
+                    "U11-defer: deferred free of chain @cluster {} — storage busy, requeued for the next reaper pass",
+                    first_cluster
+                );
+            } else {
+                // Queue full: nothing left to retry with, so fall back to the honest leak log.
+                serial_println!(
+                    "U11-defer: deferred free of chain @cluster {} — storage busy but queue full, orphaned (leak)",
+                    first_cluster
+                );
+            }
+            false
+        }
+        Err(_) => {
+            serial_println!(
+                "U11-defer: deferred free of chain @cluster {} — free_chain error, orphaned (leak)",
+                first_cluster
+            );
+            false
+        }
     }
-    true
 }
 
 // =============================================================================================
@@ -6044,6 +6187,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_FB_PRESENT => sys_fb_present(),
         SYS_FUTEX => sys_futex(a0, a1, a2),
         SYS_INPUT_POLL => sys_input_poll(),
+        SYS_INPUT_WAIT => sys_input_wait(),
         SYS_WIN_CREATE => sys_win_create(a0, a1),
         SYS_WIN_PRESENT => sys_win_present(a0),
         SYS_WIN_MOVE => sys_win_move(a0, a1, a2),
@@ -6472,11 +6616,15 @@ fn sys_write_file(asid: u64, file_id: u64, buf: u64, len: u64) -> i64 {
         let fs = match crate::fs::fat::mount() {
             Ok(fs) => fs,
             Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+            Err(crate::fs::fat::FatError::Busy) => return EAGAIN, // WEDGE-8: driver loan busy — retryable
             Err(_) => return EIO,
         };
         let cluster = FILE_CLUSTER[asid as usize][idx].load(Ordering::Acquire);
         let wrote = match fs.write_at(cluster, size, offset, &data) {
             Ok(n) => n,
+            // WEDGE-8 (F3): the storage driver was busy past the bounded retry — retryable, no
+            // bytes written. Distinct from EIO so a shell/app retry loop is honest, not superstition.
+            Err(crate::fs::fat::FatError::Busy) => return EAGAIN,
             Err(_) => return EIO,
         };
         if wrote == 0 {
@@ -6504,6 +6652,7 @@ fn sys_write_file(asid: u64, file_id: u64, buf: u64, len: u64) -> i64 {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(crate::fs::fat::FatError::Busy) => return EAGAIN, // WEDGE-8: driver loan busy — retryable, nothing mutated
         Err(_) => return EIO,
     };
     let cluster = FILE_CLUSTER[asid as usize][idx].load(Ordering::Acquire);
@@ -6512,6 +6661,7 @@ fn sys_write_file(asid: u64, file_id: u64, buf: u64, len: u64) -> i64 {
     let (wrote, new_size, new_first) = match fs.write_grow(cluster, size, dir_lba, dir_off, offset, &data) {
         Ok(t) => t,
         Err(crate::fs::fat::FatError::NoSpace) => return ENOSPC,
+        Err(crate::fs::fat::FatError::Busy) => return EAGAIN, // WEDGE-8: driver loan busy — retryable
         Err(_) => return EIO, // a bad chain / block error — nothing advanced (the dir bump is write_grow's last step)
     };
     if wrote == 0 {
@@ -6533,13 +6683,30 @@ fn sys_write_file(asid: u64, file_id: u64, buf: u64, len: u64) -> i64 {
     wrote as i64
 }
 
-/// The fixed struct SYS_GETINFO writes to EL0. `#[repr(C)]` so the byte layout is stable for the user
-/// program that reads it back: `pid` at offset 0, `ticks` at offset 8 (16 bytes total).
-#[repr(C)]
-struct UserInfo {
-    pid: u64,
-    ticks: u64,
-}
+/// The fixed struct SYS_GETINFO writes to EL0 — `pid` at offset 0, `ticks` at offset 8, 16 bytes.
+/// ABIFREEZE moved the declaration into `una_abi`: one type, shared with the x86 kernel and with the
+/// ring-3 programs that read the bytes back.
+///
+/// `ticks` here is the 250 Hz SCHEDULER tick, not milliseconds — the x86 kernel's same-named field is
+/// a 1 kHz millisecond count. Both are shipped behaviour and neither moves; the rate a ring-3 program
+/// needs is `una_abi::GETINFO_TICK_HZ`. See una-abi's divergence ledger, D1.
+use una_abi::UserInfo;
+
+// ABIFREEZE (divergence D1): the ABI's declared tick rate MUST be the rate this kernel's heartbeat is
+// armed at, because `sys_getinfo` below hands EL0 that tick count RAW.
+//
+// The x86 twin carries the identical assert against `apic::TICK_HZ` (1000). The two rates DIFFER —
+// that is the divergence — and these two lines are what keep each arch's ABI constant honest about its
+// own clock, so a retune of either timer becomes a COMPILE ERROR rather than a silent 4x error in
+// every ring-3 program that reads `ticks`.
+//
+// VERIFIED BY NEGATIVE TEST, not assumed: setting `timer::TICK_HZ` to 200 fails `./arroyo check` with
+// `error[E0080] ... assertion failed` on the `arm-pi` leg (the x86 twin fails on the very first leg).
+// It does NOT fire on the plain `aarch64` leg, and that is correct rather than a hole: this whole
+// module is `#[cfg(feature = "baremetal")]` (arch/aarch64/mod.rs), so a non-baremetal aarch64 build
+// compiles no syscall surface at all and has no ABI to protect. Every configuration that HAS
+// `sys_getinfo` checks it.
+const _: () = assert!(una_abi::GETINFO_TICK_HZ == super::timer::TICK_HZ);
 
 /// SYS_GETINFO(user_ptr): write a small fixed {pid, ticks} struct to the caller's buffer via
 /// `copy_to_user` — the to-user direction's exerciser. Returns 0, or `-EFAULT` if the pointer/length fails
@@ -6854,16 +7021,27 @@ fn map_image_into_slot(bytes: &[u8]) -> Result<Mapped, MapErr> {
 }
 
 /// EXEC-1: the outcome of `run_user_image` — the program exited with a status, was killed by the fault-kill
-/// net (a CONTAINED fault), or overran its deadline (still running / stuck).
+/// net (a CONTAINED fault), was closed by the operator (CLOSE-CLEAN: the window's close box), or overran
+/// its deadline (still running / stuck).
 pub enum RunOutcome {
     Exited(i32),
     Faulted,
+    /// CLOSE-CLEAN: the operator clicked the window's close box. A clean, asked-for exit — rendered as
+    /// `closed`, never as a fault.
+    Closed,
     Timeout,
 }
 
 /// run_user_image: the Proc `status` a killed run-image task is marked with (see the fault-kill path), so
 /// the wait renders it as `Faulted` rather than `Exited`. `i32::MIN` never collides with a real exit code.
 const EXEC_KILLED_STATUS: i32 = i32::MIN;
+
+/// CLOSE-CLEAN: the Proc `status` a close-box settle marks a confirmed kill with (`wc_close_click`).
+/// Deliberately DISTINCT from [`EXEC_KILLED_STATUS`]: the operator ASKED for this exit by clicking the
+/// window's close box, so `jobs` and `run` render it as a clean `closed` — not `FAULTED`. Genuine
+/// fault-kills keep the kill sentinel; the two classifications never blur. `i32::MIN + 1` never collides
+/// with a real exit code for the same reason the kill sentinel does not.
+const EXEC_CLOSED_STATUS: i32 = i32::MIN + 1;
 
 /// EXEC-1: load an already-read program IMAGE (flat or ELF64) into a fresh EL0 slot, run it to completion
 /// on THIS core, and return its exit status. The synchronous shell `run <path>` entry: the EL1/ASID-0 panel
@@ -6964,7 +7142,7 @@ pub fn run_user_image(
     // on the slot's teardown, so an exited program's focus never lingers; the explicit clear covers the
     // Timeout path (task still alive, no teardown yet). Setting a focus RESETS the ring, so a fresh program
     // starts with an empty input queue.
-    el0_input_set_active(asid);
+    user_input_set_active(asid);
     // Deadline-bounded cooperative wait: yield so the co-located task runs; its SYS_EXIT (or the fault-kill
     // path) marks PROCS[pi] EXITED and records the status via the GENERIC child-reap short-circuit.
     //
@@ -6975,7 +7153,7 @@ pub fn run_user_image(
     // wedged-app Timeout are unchanged. On metal the app enters interactive takeover when it actually DRAINS a
     // real event through `SYS_INPUT_POLL` (the same edge it announces with `:: UVUG: interactive takeover ::`).
     //
-    // UVUG-8r2 fixes the liveness hole in the first cut. There, takeover was latched by `el0_input_push` (an
+    // UVUG-8r2 fixes the liveness hole in the first cut. There, takeover was latched by `user_input_push` (an
     // event merely REACHING the ring) and cleared only by a focus change — which, on the real `run` path, only
     // happens after this loop exits. So a HUNG interactive app (stops polling, never exits) suspended the
     // deadline FOREVER: `run_user_image` spun in `yield_now()` with no bound, the shell never came back, and
@@ -7096,6 +7274,7 @@ pub fn run_user_image(
     let outcome = if PROCS[pi].state.load(Ordering::Acquire) == PEXITED {
         match PROCS[pi].status.load(Ordering::Acquire) {
             EXEC_KILLED_STATUS => RunOutcome::Faulted,
+            EXEC_CLOSED_STATUS => RunOutcome::Closed,
             s => RunOutcome::Exited(s),
         }
     } else {
@@ -7105,7 +7284,7 @@ pub fn run_user_image(
     // Belt-and-suspenders with `clear_handle_row`'s teardown clear (which fired already if the program
     // exited/was killed and its slot was torn down) — and the SOLE clear on the Timeout path, where the
     // task is still alive and no teardown has run. Idempotent: a no-op if the designation was already 0.
-    el0_input_set_active(0);
+    user_input_set_active(0);
     // Reap the Proc entry. The scheduler's exit path already repointed THIS core to the boot root (ASID 0)
     // and dispatched back to the caller (the shell task), so the shell's ASID-0 invariant holds on return.
     //
@@ -7219,6 +7398,7 @@ pub fn run_user_image(
                 proc_free(pi);
                 match status {
                     EXEC_KILLED_STATUS => RunOutcome::Faulted,
+                    EXEC_CLOSED_STATUS => RunOutcome::Closed,
                     s => RunOutcome::Exited(s),
                 }
             } else {
@@ -7234,6 +7414,7 @@ pub fn run_user_image(
             let out = match proc_orphan(pi) {
                 None => RunOutcome::Timeout,
                 Some(EXEC_KILLED_STATUS) => RunOutcome::Faulted,
+                Some(EXEC_CLOSED_STATUS) => RunOutcome::Closed,
                 Some(s) => RunOutcome::Exited(s),
             };
             serial_println!(
@@ -7250,6 +7431,7 @@ pub fn run_user_image(
             let out = match proc_orphan(pi) {
                 None => RunOutcome::Timeout,
                 Some(EXEC_KILLED_STATUS) => RunOutcome::Faulted,
+                Some(EXEC_CLOSED_STATUS) => RunOutcome::Closed,
                 Some(s) => RunOutcome::Exited(s),
             };
             serial_println!("[skill] killed pid={} asid={} confirmed=0 row=orphaned", pid, asid);
@@ -7276,7 +7458,7 @@ pub fn run_user_image(
 // as long as the operator wants, and TAB walks between them.
 //
 // Contract differences from `run_user_image`, each deliberate:
-//   * NO `el0_input_set_active` — focus stays wherever it is. A windowed bg app receives input when
+//   * NO `user_input_set_active` — focus stays wherever it is. A windowed bg app receives input when
 //     the operator TABs into it (the WC-TAB shell binding / in-ring cycle), which resets its ring
 //     exactly as the foreground path does. There is no focus to restore on exit either: the slot
 //     teardown's `clear_handle_row` clears the designation iff the dying app held it.
@@ -7301,6 +7483,9 @@ pub enum BgPoll {
     Exited(i32),
     /// Killed by the fault-kill net (contained fault); if `reap` was set the row has been freed.
     Faulted,
+    /// CLOSE-CLEAN: closed by the operator via the window's close box — a clean, asked-for exit,
+    /// never a fault; if `reap` was set the row has been freed.
+    Closed,
     /// No row holds this pid (already reaped, or never existed).
     Gone,
 }
@@ -7361,7 +7546,7 @@ pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str
     // EXEC1-M publish order — see the block comment in `run_user_image`; identical window, identical fix.
     PROCS[pi].asid.store(asid, Ordering::Release);
     let pid = super::sched::spawn_user_slot(
-        "bg-el0",
+        "bg-user",
         mapped.base,
         mapped.sp,
         mapped.ttbr0,
@@ -7393,6 +7578,8 @@ pub fn bg_poll(pid: u64, reap: bool) -> BgPoll {
                 }
                 if status == EXEC_KILLED_STATUS {
                     BgPoll::Faulted
+                } else if status == EXEC_CLOSED_STATUS {
+                    BgPoll::Closed
                 } else {
                     BgPoll::Exited(status)
                 }
@@ -7896,14 +8083,14 @@ const MAX_NAME: usize = 12;
 /// U10: `SYS_OPEN` mode bit1 — create the file if it is absent (and endow the write cap, since you create to
 /// write). Bit0 remains RW (U9). `O_CREAT` on an EXISTING file just opens it (idempotent). No `O_TRUNC` /
 /// `O_EXCL` / `O_APPEND` this arc — bits >= 3 stay reserved.
-const O_CREAT: u64 = 1 << 1;
+use una_abi::O_CREAT;
 
 /// U6: `SYS_OPEN` mode bit2 — at an `O_CREAT` of a NEW name, make the file PUBLIC (world-accessible) instead
 /// of the owned-by-default private file. UnaOS is secure-by-default: a plain `O_CREAT` records the creator as
 /// the file's OWNER (private — only the owner or a principal it `SYS_FGRANT`s may open it); `O_PUBLIC` opts a
 /// create OUT of ownership into the pre-U6 open-by-anyone behaviour. Ignored on an open of an existing file
 /// (ownership is fixed at create) and outside `O_CREAT`. See `sys_open` and the owner/grants block.
-const O_PUBLIC: u64 = 1 << 2;
+use una_abi::O_PUBLIC;
 
 /// SYS_OPEN(name_ptr, name_len, mode) -> a File-handle index, or a negative errno. The first resource syscall
 /// routed through a NON-Console object: it makes U6a's `File` scaffold real. `copy_from_user`s the (bounded) 8.3
@@ -7954,6 +8141,7 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(crate::fs::fat::FatError::Busy) => return EAGAIN, // WEDGE-8: driver loan busy — retryable, nothing mutated
         Err(_) => return EIO,
     };
     // F3-M3: the NAMESPACE hold — from the name lookup through the descriptor claim. It makes the
@@ -7984,9 +8172,11 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
                 }
                 Err(crate::fs::fat::FatError::Unsupported) => return EINVAL, // name not representable as 8.3
                 Err(crate::fs::fat::FatError::NoSpace) => return ENOSPC,     // root directory full
+                Err(crate::fs::fat::FatError::Busy) => return EAGAIN,        // WEDGE-8: retryable, nothing created
                 Err(_) => return EIO,
             }
         }
+        Err(crate::fs::fat::FatError::Busy) => return EAGAIN, // WEDGE-8: retryable, nothing claimed
         Err(_) => return EIO,
     };
     if de.is_dir {
@@ -8110,12 +8300,16 @@ fn sys_read(handle: u64, buf: u64, len: u64) -> i64 {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(crate::fs::fat::FatError::Busy) => return EAGAIN, // WEDGE-8: driver loan busy — retryable, nothing mutated
         Err(_) => return EIO,
     };
     let cluster = FILE_CLUSTER[asid as usize][idx].load(Ordering::Acquire);
     let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    if fs.read_at(cluster, size, offset, &mut bytes, want).is_err() {
-        return EIO;
+    match fs.read_at(cluster, size, offset, &mut bytes, want) {
+        Ok(_) => {}
+        // WEDGE-8 (F3): the storage driver was busy past the bounded wait — retryable, no data lost.
+        Err(crate::fs::fat::FatError::Busy) => return EAGAIN,
+        Err(_) => return EIO,
     }
     let got = bytes.len();
     if got == 0 {
@@ -8215,6 +8409,7 @@ fn sys_unlink(handle: u64) -> i64 {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(crate::fs::fat::FatError::Busy) => return EAGAIN, // WEDGE-8: driver loan busy — retryable, nothing mutated
         Err(_) => return EIO,
     };
     // K1 M2.3: snapshot the owner's persistent principal BEFORE owned_clear drops the row, so we know whether a
@@ -9297,7 +9492,7 @@ fn m6g_loader_run(_: usize) {
 // =============================================================================================
 
 /// The witness token ELFHELLO.ELF reports via SYS_REPORT (`movz x0, #0x1E`) — must match the fixture.
-const ELF1_WITNESS_TOKEN: u64 = 0x1E;
+use una_abi::ELF1_WITNESS_TOKEN;
 
 /// The token the ELF-loaded program reported (0 until it runs). Read by `elf1_launcher`'s verdict.
 static ELF1_WITNESS: AtomicU64 = AtomicU64::new(0);
@@ -9451,6 +9646,9 @@ fn exec1_witness(_demo_cpu: usize) {
         Ok((RunOutcome::Faulted, _)) => {
             serial_println!(":: EXEC1: run {} — EL0 program FAULTED -> FAIL ::", path)
         }
+        Ok((RunOutcome::Closed, _)) => {
+            serial_println!(":: EXEC1: run {} — EL0 program CLOSED mid-run (unexpected) -> FAIL ::", path)
+        }
         Ok((RunOutcome::Timeout, _)) => {
             serial_println!(":: EXEC1: run {} — EL0 program did not exit in time -> FAIL ::", path)
         }
@@ -9516,7 +9714,7 @@ fn bgrun_witness(_demo_cpu: usize) {
             let exited = loop {
                 match bg_poll(pid, false) {
                     BgPoll::Exited(0) => break true,
-                    BgPoll::Exited(_) | BgPoll::Faulted | BgPoll::Gone => break false,
+                    BgPoll::Exited(_) | BgPoll::Faulted | BgPoll::Closed | BgPoll::Gone => break false,
                     BgPoll::Running => {}
                 }
                 if super::timer::cntpct().wrapping_sub(t0) >= budget {
@@ -9541,13 +9739,25 @@ fn bgrun_witness(_demo_cpu: usize) {
     // the operator actually hit: launch short-lived bg programs WITHOUT running `jobs` between them, and
     // the exited-unreaped rows accumulate until `proc_reserve` has nothing left to hand out — a table of
     // corpses reads exactly like a table of running programs, and the spawn fails with
-    // "process table full (run `jobs` to reap exited background programs)". With MAX_PROCS = 4 that is
-    // four launches deep.
+    // "process table full (run `jobs` to reap exited background programs)". With MAX_PROCS = 6 that is
+    // six launches deep.
     //
     // The leg spawns ELFHELLO `MAX_PROCS + 2` times, waiting for each to EXIT but deliberately never
     // reaping, and REQUIREs every spawn to succeed. Without the scavenge in `proc_reserve` this fails on
     // the launch after the table fills — which is the point: the leg is written to go red on the bug.
+    //
+    // PROCS-6 — the launch count is DERIVED from the cap, not written down, so raising the cap moves the
+    // fill point and the leg keeps its teeth for free: at 6 rows it now drives 8 launches, of which the
+    // last two can only be served by the PEXITED scavenge. Had it been a literal 6 the raise would have
+    // made the leg vacuous (six launches into a six-row table never fill it), which is exactly the
+    // failure mode a capacity change is supposed to expose rather than hide. The rollup below prints the
+    // capacity once so a log tells you which table the leg was actually exercising.
     {
+        serial_println!(
+            ":: BGRUN-ST: process table capacity = {} rows (bg programs alive at once; EL0 slots {}) ::",
+            MAX_PROCS,
+            super::boot::USER_SLOTS
+        );
         let mut spawned = 0usize;
         let mut failed_at = usize::MAX;
         for n in 0..(MAX_PROCS + 2) {
@@ -9608,7 +9818,7 @@ fn bgrun_witness(_demo_cpu: usize) {
             let settled = loop {
                 match bg_poll(pid, true) {
                     BgPoll::Gone => break true,
-                    BgPoll::Exited(_) | BgPoll::Faulted => {} // reaped this pass; next poll reads Gone
+                    BgPoll::Exited(_) | BgPoll::Faulted | BgPoll::Closed => {} // reaped this pass; next poll reads Gone
                     BgPoll::Running => {}                     // PORPHANED fallback settles at a boundary
                 }
                 if super::timer::cntpct().wrapping_sub(t0) >= budget {
@@ -9658,7 +9868,7 @@ fn bgrun_witness(_demo_cpu: usize) {
             let settled = loop {
                 match bg_poll(pid, true) {
                     BgPoll::Gone => break true,
-                    BgPoll::Exited(_) | BgPoll::Faulted => {} // reaped this pass; next poll reads Gone
+                    BgPoll::Exited(_) | BgPoll::Faulted | BgPoll::Closed => {} // reaped this pass; next poll reads Gone
                     BgPoll::Running => {}                     // PORPHANED fallback settles at a boundary
                 }
                 if super::timer::cntpct().wrapping_sub(t1) >= budget {
@@ -9827,6 +10037,9 @@ fn uvug_witness(_demo_cpu: usize) {
         ),
         Ok((RunOutcome::Faulted, _)) => {
             serial_println!(":: EXEC-UVUG: run {} — EL0 program FAULTED -> FAIL ::", path)
+        }
+        Ok((RunOutcome::Closed, _)) => {
+            serial_println!(":: EXEC-UVUG: run {} — EL0 program CLOSED mid-run (unexpected) -> FAIL ::", path)
         }
         Ok((RunOutcome::Timeout, _)) => {
             serial_println!(":: EXEC-UVUG: run {} — EL0 program did not exit in time -> FAIL ::", path)
@@ -10198,9 +10411,16 @@ unsafe extern "C" {
 // muddy a witness whose entire subject is the PARENT's core. One task per launch, three launches,
 // three parent placements.
 //
-// Parking (rather than spinning) also keeps the leg honest about what it does NOT measure: a parked
-// task leaves the run queue, so the three placements are decided against a nearly-flat load and what
-// the witness reads is the PLACEMENT POLICY, not a transient queue-depth artefact.
+// The fixture SPINS BOUNDEDLY FIRST, then parks — and the spin is load-bearing (U7FIX composition
+// lesson, 2026-07-26): an instant park leaves the run queue immediately, so the three placements
+// were decided against a nearly-flat load where `pick_cpu`'s busy-fraction tiebreak picks ONE
+// strictly-least core every time — `distinct=1`, legal, and the leg false-reds. The leg's teeth
+// came from AMBIENT boot noise (the old U7 yield-spam), which U7FIX removed. The bounded spin
+// (~4M iterations, a few ms on metal, tens under QEMU) keeps each prior fixture IN its core's
+// ready queue while the next placement is decided, so the first tiebreak (queue depth) avoids
+// used cores BY CONSTRUCTION — the spread is structural, not atmospheric. The spin is bounded so
+// the fixture still reaches its kill-aware futex park (an unbounded EL0 spin is unkillable under
+// QEMU — KILLBOUND's documented residual).
 //
 // FLAT image (no ELF magic), one code page, position-independent via `adr` — rides
 // `spawn_user_image_bg` with no fixture files on the card. The flat loader does not zero the data
@@ -10217,6 +10437,9 @@ __bgspread_blob_start:
     add  x21, x20, #0x1000                // x21 = the futex word (RW data page 1)
     str  xzr, [x21]                       // word = 0 (the recycled-backing guard)
     dmb  ish                              // publish the zero before the wait reads it
+    movz x22, #0x40, lsl #16              // ~4M-iteration BOUNDED spin: stay in the run queue
+2:  subs x22, x22, #1                     //   while the sibling placements are decided (the
+    b.ne 2b                               //   structural-spread guarantee; see block comment)
     mov  x0, x21                          // SYS_FUTEX(uaddr, FUTEX_WAIT=0, expect=0) -> parks forever
     mov  x1, #0
     mov  x2, #0
@@ -10471,7 +10694,7 @@ fn spinhunt_witness() {
 ///
 /// WHAT THE EXISTING LEGS COULD NOT CATCH. Every `bg` leg in this file launches ONE program at a
 /// time, so none of them can observe a relationship BETWEEN launches — and stacking is only visible
-/// as a relationship. The `:: SCHED: task 'bg-el0' -> core N ::` placement line has always carried
+/// as a relationship. The `:: SCHED: task 'bg-user' -> core N ::` placement line has always carried
 /// the raw fact, but a spec REQUIRE matches one line at a time and cannot count distinct cores
 /// across several; this leg does the counting in the kernel and states the result in one assertable
 /// line. (The `SCHED: load` row cannot substitute: attended P62 showed it reading a flat
@@ -10492,8 +10715,13 @@ fn spinhunt_witness() {
 ///
 /// TEETH (the A/B). On the pre-arc code `spawn_user_image_bg` passed `this_cpu()`, and all `NBG`
 /// launches run from this one witness task on one core, so `distinct` is 1 BY CONSTRUCTION and the
-/// leg fails on every boot — it cannot pass for a lucky reason. With `CPU_AUTO` the rotating tie-break
-/// in `pick_cpu` fans consecutive equal-load placements across cores, so `distinct` is 2..=NBG.
+/// leg fails on every boot — it cannot pass for a lucky reason. With `CPU_AUTO`, spread is
+/// STRUCTURAL, not atmospheric (corrected 2026-07-26 after the U7FIX composition false-red): each
+/// fixture busy-spins boundedly before parking, so it still occupies its core's ready queue while
+/// the next placement is decided, and `pick_cpu`'s FIRST tiebreak (queue depth) avoids used cores
+/// by construction. The original claim leaned on the rotating tie-break, which only breaks FULL
+/// ties — the busy-fraction criterion almost never fully ties, and on a calm boot one strictly-least
+/// core legally won all three placements (`distinct=1`, correct policy, red leg).
 ///
 /// An honest skip on a boot with fewer than 2 online cores (the metal 3-of-4 variance in the spec
 /// header has a uniprocessor tail): with one candidate core there is no spread to observe, and a
@@ -10741,6 +10969,15 @@ static DETACHED_ASIDS: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 /// are ignored (the process table is far smaller; this is a bound, not an expected case), which fails in
 /// the safe direction: an unrepresentable ASID simply reads back "not detached" — the current behaviour.
 fn set_detached(asid: u64, on: bool) {
+    // VUGLIFE: the silent no-op above 63 is now load-bearing for USER-VISIBLE behaviour, not just for
+    // `jobs` bookkeeping — a vug reads this bit to decide whether its interactive frame budget is waived,
+    // so an unrepresentable ASID would give the operator a desktop vug that still dies at the cap. It is
+    // unreachable today (`boot::USER_SLOTS` = 8, ASID = slot + 1, so ASID <= 8) and the assert pins that
+    // relationship: if the slot table is ever widened past 63, this bitmask must widen with it.
+    debug_assert!(
+        asid < 64,
+        "VUG-BG detached bitmask is 64-wide; USER_SLOTS grew past it"
+    );
     if asid == 0 || asid >= 64 {
         return;
     }
@@ -10768,18 +11005,137 @@ fn is_detached(asid: u64) -> bool {
     DETACHED_ASIDS.load(Ordering::Acquire) & (1u64 << asid) != 0
 }
 
+/// VUGMIN — one bit per ASID: set while every window that address space owns is HIDDEN, i.e. sitting
+/// below `video::wm`'s `SHELL_Z` and therefore not composited onto the panel at all. Peter's word for
+/// this state is "minimized" (P69: *"if vug is minimized it should shut off"*), and the audit that
+/// opened this arc established that UnaOS has no separate minimize verb and needs none: the shell-focus
+/// arm of `wm::focus_changed` ALREADY pushes every window below the shell's z and erases their boxes.
+/// A vug in that state is invisible and still rendering at full rate — six of them still burn six cores.
+/// So the bit names the condition that actually exists (HIDDEN), not a feature that does not.
+///
+/// A deliberate mirror of `DETACHED_ASIDS` above, down to the 64-bit bound and the fail-safe direction,
+/// for the same reason: the reader is the FB info-page writer, reached with the window table lock held.
+///
+/// LIVE AS OF VUGMIN-B. The two call sites are in `video::wm`: `focus_changed` publishes the predicate
+/// for every live owner after each focus change (the shell arm hides them all, a raise unhides the owner
+/// it raised), and `wm::present` reads the same predicate off the window table to suppress a composite
+/// no one can see. Headless QEMU still reads a constant 0 — no HID means nothing ever TABs to the
+/// shell, so nothing is ever hidden there and the deterministic checksum is unchanged.
+static HIDDEN_ASIDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// VUGMIN — record whether ASID `asid`'s windows are currently hidden below the shell. Public because
+/// its callers are VUGMIN-B's, in `video::wm`: this module owns the bitmask and the info page, `wm` owns
+/// the z-order that decides the answer, and this is the seam between them.
+///
+/// Out-of-range ASIDs are ignored on the same argument `set_detached` makes, and fail the same safe way
+/// — an unrepresentable ASID reads back "not hidden", i.e. keeps rendering. A vug that idles when it
+/// should not is a vug that stops responding; a vug that renders when it could idle merely wastes the
+/// core it wastes today. The cheap failure is the one to fail into.
+pub fn set_hidden(asid: u64, on: bool) {
+    debug_assert!(
+        asid < 64,
+        "VUGMIN hidden bitmask is 64-wide; USER_SLOTS grew past it"
+    );
+    if asid == 0 || asid >= 64 {
+        return;
+    }
+    let bit = 1u64 << asid;
+    if on {
+        HIDDEN_ASIDS.fetch_or(bit, Ordering::Release);
+    } else {
+        HIDDEN_ASIDS.fetch_and(!bit, Ordering::Release);
+    }
+    // THE SETTER IS THE PUBLISHER, and it has to be. Bit 0 could leave publication to the info-page
+    // writers because "was I launched detached" is fixed before the process runs, so the write that
+    // `sys_win_create` performs anyway is always in time. Bit 1 CHANGES UNDER A RUNNING PROCESS, and the
+    // info-page writers run only on create/map — a vug that is hidden while it renders would never see
+    // the bit at all, and the whole mechanism would be an unobservable atomic. Republishing here is what
+    // makes EL0's per-frame poll able to observe anything, and it keeps VUGMIN-B to a bare call.
+    //
+    // Only the flags WORD is rewritten: the geometry fields belong to the info-page writers, which own
+    // the window table's view of them, and touching them from here would race those writers for no
+    // reason. A u32 store is single-copy-atomic on this A72, so a concurrent EL0 read sees the old value
+    // or the new one and never a tear.
+    //
+    // Writing a slot with no live window is harmless and deliberately unguarded: the page is per-slot
+    // kernel backing that exists for the slot's whole life, teardown zeroes it, and `clear_hidden` at the
+    // teardown funnel means a dead slot's word cannot outlive its owner.
+    let slot = (asid - 1) as usize;
+    if slot < super::boot::USER_SLOTS {
+        let info = super::boot::slot_fb_info_ptr(slot) as *mut u32;
+        // SAFETY: `slot < USER_SLOTS` is the bound `slot_fb_info_ptr` itself asserts, and `FB_INFO_FLAGS`
+        // is inside the info page — the same pointer and index the two info-page writers use.
+        unsafe { info.add(FB_INFO_FLAGS).write_volatile(fb_info_flags(slot)) };
+    }
+    // VUGPAUSE-2: an UNHIDE is a wake edge, and it is the one edge the ring cannot supply. A hidden vug is
+    // by construction not the focused app, so no event is ever routed to it; if it is parked in
+    // `SYS_INPUT_WAIT` the only thing that changed when it became visible again is the word written just
+    // above — which nothing wakes on. Without this the restore would wait for the backstop (~256 ms) or,
+    // if the timer IRQ is not live, forever. Ordered AFTER the info-page publish so the woken vug's first
+    // read of the flags word already shows it visible.
+    if !on {
+        // VUGPAUSE-2r2: the LAST of the three edges a click-to-restore crosses, and the decisive one — it
+        // is the only one that fires after the flags word says visible, so a vug woken here cannot find
+        // itself frozen and re-park. Like the focus edge it was dead before this fix (`user_input_set_active`
+        // ran microseconds earlier and had wiped the park hint), which is why an unhide could not restart
+        // a backgrounded vug either.
+        user_input_wake_edge(asid, "unhide");
+    }
+}
+
+/// VUGMIN — clear ASID `asid`'s hidden bit. Called from `boot::teardown_user_slot`'s FINAL-release arm
+/// beside `clear_detached`, under the identical ordering rule and for the identical reason: ASIDs are
+/// RECYCLED, so without this a slot last used by a vug that was hidden when it died would hand its stale
+/// bit to the next tenant — which would come up already idling, having never been hidden at all. That is
+/// the worse of the two failure directions (a window that draws nothing), so it is the one closed here
+/// at the funnel rather than at each launcher.
+#[cfg(feature = "baremetal")]
+pub fn clear_hidden(asid: u64) {
+    set_hidden(asid, false);
+}
+
+/// VUGMIN — are ASID `asid`'s windows currently hidden below the shell?
+fn is_hidden(asid: u64) -> bool {
+    if asid == 0 || asid >= 64 {
+        return false;
+    }
+    HIDDEN_ASIDS.load(Ordering::Acquire) & (1u64 << asid) != 0
+}
+
 /// VUG-BG — u32 index of the PROCESS-FLAGS word in the RO info page, in the reserved gap between the
-/// legacy ELF-3 header (`[0x00..0x1C]`) and the per-window entries (`0x40 + r*0x20`). Bit 0 = DETACHED.
+/// legacy ELF-3 header (`[0x00..0x1C]`) and the per-window entries (`0x40 + r*0x20`). Bit 0 = DETACHED,
+/// bit 1 = HIDDEN (VUGMIN).
 const FB_INFO_FLAGS: usize = 0x20 / 4;
 /// VUG-BG — bit 0 of `FB_INFO_FLAGS`: this process was launched by `bg`, not by `run`.
 const FB_FLAG_DETACHED: u32 = 1 << 0;
+/// VUGMIN — bit 1 of `FB_INFO_FLAGS`: every window this process owns is hidden below the shell's z, so
+/// nothing it renders can reach the panel. EL0 polls this EVERY FRAME (unlike bit 0, which a program
+/// reads once at start-up), because unlike "was I launched detached" it changes under a running process.
+const FB_FLAG_HIDDEN: u32 = 1 << 1;
+
+/// VUG-BG + VUGMIN — the PROCESS-FLAGS word for `slot`, as published into its RO info page. Factored out
+/// because BOTH info-page writers must publish the identical word: `fb_info_write_legacy` refreshes only
+/// region slot 0, so a process whose first window landed on a higher slot would otherwise read a zeroed
+/// flags word from `fb_info_write_win` — the bug VUG-BG already had to fix once for bit 0 alone. One
+/// function means bit 2 cannot reintroduce it. `slot + 1` is the ASID (every caller derives
+/// `slot = asid - 1` from `win_caller_slot`).
+fn fb_info_flags(slot: usize) -> u32 {
+    let asid = slot as u64 + 1;
+    let mut f = 0u32;
+    if is_detached(asid) {
+        f |= FB_FLAG_DETACHED;
+    }
+    if is_hidden(asid) {
+        f |= FB_FLAG_HIDDEN;
+    }
+    f
+}
 
 fn fb_info_write_legacy(slot: usize) {
     let info = super::boot::slot_fb_info_ptr(slot) as *mut u32;
     // VUG-BG: the process-flags word rides along with every legacy-header publication, so it is present
-    // by the time any window verb has returned a mapped surface to the caller. `slot + 1` is the ASID
-    // (`win_caller_slot` returns the ASID and every caller derives `slot = asid - 1`).
-    let flags = if is_detached(slot as u64 + 1) { FB_FLAG_DETACHED } else { 0 };
+    // by the time any window verb has returned a mapped surface to the caller.
+    let flags = fb_info_flags(slot);
     unsafe {
         info.add(FB_INFO_FLAGS).write_volatile(flags);
         info.add(0).write_volatile(FB_MAGIC);
@@ -10870,7 +11226,7 @@ fn present_surface_common(
     // stranded until reboot. Worse, it is sticky: one timeout arms that defeat for the rest of the boot.
     // Scoping to the focused ASID makes an unfocused orphan's presents invisible here, which is what keeps
     // the cap honest.
-    if EL0_INPUT_ACTIVE.load(Ordering::Acquire) == asid {
+    if USER_INPUT_ACTIVE.load(Ordering::Acquire) == asid {
         EL0_FOCUSED_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
     }
     // WC-INT — ONE forwarding, not two. Before integration both this body and `video::screen::present_surface`
@@ -11043,7 +11399,10 @@ fn win_resolve(asid: u64, win: u64) -> Result<(usize, WinEntry), i64> {
 /// region slot. Layout of the page (all u32, little-endian):
 ///   [0x00..0x1C] the LEGACY ELF-3 header — magic, w, h, stride, format, size, surface_offset — which
 ///                keeps describing region slot 0 so the existing VUG.ELF reads exactly what it always did;
-///   [0x20]       VUG-BG process flags — bit 0 = DETACHED (the process was launched by `bg`, not `run`);
+///   [0x20]       process flags — bit 0 = DETACHED (VUG-BG: launched by `bg`, not `run`); bit 1 =
+///                HIDDEN (VUGMIN: every window this process owns sits below the shell's z, so nothing it
+///                renders reaches the panel). Bit 0 is fixed for the process's life; bit 1 is live and
+///                republished by `set_hidden` itself, so EL0 polls it per frame;
 ///   [0x40 + r*0x20] per region slot `r`: magic, win_id, w, h, stride, size, surface_offset-from-info-base.
 /// A region slot with no live window keeps a zeroed entry (magic 0), so EL0 can tell live from stale.
 fn fb_info_write_win(slot: usize, id: usize, e: &WinEntry) {
@@ -11053,7 +11412,7 @@ fn fb_info_write_win(slot: usize, id: usize, e: &WinEntry) {
     // VUG-BG: publish the process-flags word here too. The legacy header (which also writes it) is only
     // refreshed for region slot 0, so a process whose FIRST window landed on a higher slot would
     // otherwise read a zeroed — i.e. wrongly "not detached" — flags word.
-    let flags = if is_detached(slot as u64 + 1) { FB_FLAG_DETACHED } else { 0 };
+    let flags = fb_info_flags(slot);
     unsafe {
         info.add(FB_INFO_FLAGS).write_volatile(flags);
         let p = info.add(0x40 / 4 + (e.rslot as usize) * (0x20 / 4));
@@ -11417,7 +11776,7 @@ fn sys_futex(uaddr: u64, op: u64, val: u64) -> i64 {
 // SHAPE (mirrors how the GUI routes input to kernel apps today — GUI-CLICK-2b's SCREEN_APP_ACTIVE gate +
 // gui_watchdog: only the ACTIVE app receives input). The kernel holds a small per-ASID ring of packed
 // events; the GUI router (main.rs `pump_usb_into_gui`) fills the ACTIVE process's ring when it drains
-// `pal::next_event()` — via the public `el0_input_enqueue` seam here (the ELF-3 present-hook twin). EL0
+// `pal::next_event()` — via the public `user_input_enqueue` seam here (the ELF-3 present-hook twin). EL0
 // polls its own ring nonblocking through SYS_INPUT_POLL. One producer (the single router task) + one
 // consumer (the EL0 task) per ring => a lock-free SPSC ring (free-running head/tail, occupancy = tail-head).
 //
@@ -11427,9 +11786,9 @@ fn sys_futex(uaddr: u64, op: u64, val: u64) -> i64 {
 //
 // DEFERRED ROUTER WIRING (2-3 lines, OUTSIDE this lane — main.rs `pump_usb_into_gui`, the next arc folds):
 // when an EL0 app owns the screen (an ELF-5 analogue of SCREEN_APP_ACTIVE, with the focused process's ASID
-// registered via `el0_input_set_active`), route drained pal events to the EL0 ring instead of GUI_CHANNEL:
+// registered via `user_input_set_active`), route drained pal events to the EL0 ring instead of GUI_CHANNEL:
 //     while let Some(ev) = unaos_kernel::pal::next_event() {
-//         unaos_kernel::arch::aarch64::syscall::el0_input_enqueue(ev); // -> the active EL0 app's ring
+//         unaos_kernel::arch::aarch64::syscall::user_input_enqueue(ev); // -> the active EL0 app's ring
 //     }
 // (Today only the in-kernel witness registers an active process + injects a test event — see
 // `input_launcher`. QEMU raspi4b delivers no USB HID, so the kernel-injected event is what proves the
@@ -11437,29 +11796,193 @@ fn sys_futex(uaddr: u64, op: u64, val: u64) -> i64 {
 // =============================================================================================
 
 /// ELF-5 packed-event type tags (packed value bits [55:48]).
-const INPUT_EV_KEY_DOWN: u64 = 1; // a key PRESS   (payload[7:0] = ASCII)
-const INPUT_EV_KEY_UP: u64 = 2; // a key RELEASE (payload[7:0] = ASCII)
-const INPUT_EV_MOUSE_REL: u64 = 3; // relative pointer motion (payload[31:16]=dx, [15:0]=dy as i16)
-const INPUT_EV_MOUSE_ABS: u64 = 4; // absolute pointer position (payload[31:16]=x,  [15:0]=y  as i16)
-const INPUT_EV_BUTTON: u64 = 5; // a pointer button-DOWN edge (payload[7:0] = button bitmask)
+use una_abi::INPUT_EV_KEY_DOWN; // a key PRESS   (payload[7:0] = ASCII)
+use una_abi::INPUT_EV_KEY_UP; // a key RELEASE (payload[7:0] = ASCII)
+use una_abi::INPUT_EV_MOUSE_REL; // relative pointer motion (payload[31:16]=dx, [15:0]=dy as i16)
+use una_abi::INPUT_EV_MOUSE_ABS; // absolute pointer position (payload[31:16]=x,  [15:0]=y  as i16)
+use una_abi::INPUT_EV_BUTTON; // a pointer button-DOWN edge (payload[7:0] = button bitmask)
 
 /// Per-ASID input ring capacity (power of two — occupancy math is `tail.wrapping_sub(head)`).
 const INPUT_RING_CAP: usize = 32;
 
 /// The per-process input rings, keyed by ASID (0 = the shared/boot context, never a delivery target). One
 /// producer (the router) + one consumer (the EL0 task) per ring => a lock-free SPSC ring.
-static EL0_INPUT_BUF: [[AtomicU64; INPUT_RING_CAP]; super::boot::USER_SLOTS + 1] =
+static USER_INPUT_BUF: [[AtomicU64; INPUT_RING_CAP]; super::boot::USER_SLOTS + 1] =
     [const { [const { AtomicU64::new(0) }; INPUT_RING_CAP] }; super::boot::USER_SLOTS + 1];
 /// Consumer index (free-running; advanced by SYS_INPUT_POLL). Real slot = `head & (CAP-1)`.
-static EL0_INPUT_HEAD: [AtomicU32; super::boot::USER_SLOTS + 1] =
+static USER_INPUT_HEAD: [AtomicU32; super::boot::USER_SLOTS + 1] =
     [const { AtomicU32::new(0) }; super::boot::USER_SLOTS + 1];
-/// Producer index (free-running; advanced by `el0_input_enqueue`). Occupancy = `tail - head`.
-static EL0_INPUT_TAIL: [AtomicU32; super::boot::USER_SLOTS + 1] =
+/// Producer index (free-running; advanced by `user_input_enqueue`). Occupancy = `tail - head`.
+static USER_INPUT_TAIL: [AtomicU32; super::boot::USER_SLOTS + 1] =
     [const { AtomicU32::new(0) }; super::boot::USER_SLOTS + 1];
 
+/// VUGPAUSE-2: per-slot "this ASID has a task parked in `SYS_INPUT_WAIT`" flag. Set immediately before the
+/// futex park, cleared immediately after it returns — and ALSO cleared on slot teardown by
+/// `clear_input_parked`, because the park is a kill boundary that can `exit()` without ever returning here
+/// (see `sched::futex_wait`), so the clear on the normal path is not sufficient on its own.
+///
+/// VUGPAUSE-2r2 — WHO MAY CLEAR THIS, and why the question is load-bearing. VUGPAUSE-2 described the flag
+/// as "a HINT, never a decision", on the strength of "a stale-clear flag is impossible (only the parker
+/// sets it, before parking)". Both halves were wrong, and P72 spent a bench session on the difference:
+///   * It IS a decision. `user_input_wake` returns early on a clear flag, so every wake edge — the router's
+///     own enqueue, focus arrival, unhide — is gated on it, not just the backstop.
+///   * A stale clear WAS reachable. `clear_input_row` cleared it, and `user_input_set_active` calls
+///     `clear_input_row` on a focus ARRIVAL: exactly the moment a parked, backgrounded vug is being handed
+///     the keyboard. The arrival cleared the flag, then its own wake read the flag it had just cleared,
+///     took the fast path, and woke nobody; `focus_changed`'s unhide and the press enqueue that followed
+///     did the same; and the backstop skipped the slot forever after. The vug was parked on a live futex
+///     key that nothing in the kernel would ever name again — Peter's "once a vug goes into the background
+///     it is stopped and cannot be restarted", exactly.
+/// The invariant now is: SET by the parker before parking; CLEARED by the parker on return, or by slot
+/// teardown, and by nothing else. A stale-set flag costs one wasted `futex_wake` per backstop period on a
+/// key with no waiters; a stale-clear flag costs a task that never runs again, so the two are traded
+/// against each other in that direction on purpose. The backstop no longer reads it at all
+/// (`user_input_wake_backstop`), which caps the whole failure class at one backstop period.
+static USER_INPUT_PARKED: [AtomicBool; super::boot::USER_SLOTS + 1] =
+    [const { AtomicBool::new(false) }; super::boot::USER_SLOTS + 1];
+
+/// VUGPAUSE-2: how many times a task has PARKED in `SYS_INPUT_WAIT`, and how many waiters the wake seam
+/// has released. Both are cumulative for the boot and drive the `[vugpause2]` witness.
+static USER_INPUT_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static USER_INPUT_WAKES: AtomicU64 = AtomicU64::new(0);
+
+/// CLICK-SWALLOW: how many NAMED wake edges (`focus` / `unhide` — the VUGPAUSE-2r2 restore chain) the
+/// wake seam has been ASKED to run, whether or not a waiter was there to release. Distinct from
+/// `USER_INPUT_WAKES`, which counts waiters actually woken: a headless gate parks nobody, so only this
+/// counter can witness that the restore chain was REACHED. Read by [`user_input_wake_edges`].
+static USER_INPUT_WAKE_EDGES: AtomicU64 = AtomicU64::new(0);
+
+/// VUGMIN-C: per-slot count of NAMED-EDGE resumes (`focus` / `unhide`) this ASID has actually taken.
+///
+/// Exists only to pace `user_input_wake_edge`'s print — the aggregate that the `[vugpause2]` rollup
+/// reports is `USER_INPUT_WAKES` above and is unaffected by anything here. Per-ASID rather than global
+/// because the question the line answers ("did THIS vug resume, or is it stranded?") is per-ASID: a
+/// global cadence would let a busy vug's traffic silence a newly launched one's first resume.
+static USER_INPUT_RESUMES: [AtomicU64; super::boot::USER_SLOTS + 1] =
+    [const { AtomicU64::new(0) }; super::boot::USER_SLOTS + 1];
+
+/// VUGMIN-C: drop `asid`'s resume-print pacing count. Called from slot teardown ONLY — the count paces a
+/// witness line across a whole tenancy, so nothing on the running path may reset it.
+fn clear_input_resumes(asid: u64) {
+    if asid != 0 && asid as usize <= super::boot::USER_SLOTS {
+        USER_INPUT_RESUMES[asid as usize].store(0, Ordering::Relaxed);
+    }
+}
+
+/// VUGPAUSE-2: the synthetic futex key for ASID `asid`'s input ring.
+///
+/// `sys_futex`'s user keys are PHYSICAL ADDRESSES of EL0 words, and on this SoC a PA is < 2^40; bit 63
+/// is therefore free forever, and setting it puts every input key in a space no user word can name. That
+/// matters more than it looks: the buckets are shared, so an EL0 program that could forge an input key
+/// could wake (or, worse, park on) another process's ring. It cannot reach this space at all.
+#[inline]
+fn input_futex_key(asid: u64) -> u64 {
+    (1u64 << 63) | asid
+}
+
+/// VUGPAUSE-2 WAKE SEAM: release every task parked in `SYS_INPUT_WAIT` on `asid`'s ring. Returns how many
+/// were woken (0 is the overwhelmingly common case — nobody is parked).
+///
+/// Called from THREE edges, and all three are needed for a blocked vug to be as responsive as a polling
+/// one was:
+///   * `user_input_push` — the event itself. This is the latency-critical one: the router publishes TAIL
+///     and then wakes, so the keypress that arrives while a vug is idle re-readies it in the same pass
+///     the router runs in, not a poll period later.
+///   * `user_input_set_active` — a focus ARRIVAL. Focus does not enqueue anything (it RESETS the ring), so
+///     without this a vug parked on an empty ring would sleep through being handed the keyboard.
+///   * `set_hidden(asid, false)` — an UNHIDE. The hidden bit lives in the info page, not in the ring, so
+///     nothing about becoming visible again touches TAIL. A vug parked while hidden must be re-readied to
+///     observe its own restore; this is the edge that makes VUGMIN's idle exit-able.
+fn user_input_wake(asid: u64) -> usize {
+    user_input_wake_edge(asid, "")
+}
+
+/// VUGPAUSE-2r2: `user_input_wake` with the EDGE named, for the wire.
+///
+/// A non-empty `edge` asks for a `[vugpause2] resume` line when this call actually releases someone. Only
+/// the two OPERATOR-RATE edges pass one — focus arrival and unhide, the pair that resumes a backgrounded
+/// vug and the pair that was silently dead before this fix. The router's per-event push passes `""` and
+/// stays silent: it fires at mouse-motion rate and a line per event would be a flood.
+///
+/// This is the witness that distinguishes the two P72 outcomes on wire. A stranded vug produces a
+/// `[clickroute] press hit` with no `[vugpause2] resume` after it; a resumed one produces the pair.
+///
+/// VUGMIN-C / P73 wire hygiene — **the line is thinned; the counters are not.** "Operator rate" was too
+/// generous a description: one focus change fired 6-12 of these from inside the input path, on several
+/// cores, and the P73 capture shows the UART overrun mid-line in exactly those bursts
+/// (`resu<e7>sid=1`, `[f8>fv]`, `<fu>pause2]`) — a corrupted witness that also blocks the press path for
+/// tens of milliseconds while it corrupts. So the print is now on a per-ASID POWER-OF-TWO cadence: the
+/// 1st, 2nd, 4th, 8th, … resume for a given ASID prints, the rest are silent. Every resume is still
+/// counted — `USER_INPUT_WAKES` (the `[vugpause2] blocked=/wakes=` rollup) is untouched, and the printed
+/// line now carries `n=`, that ASID's exact cumulative resume count, so a reader can subtract across two
+/// lines and know how many were elided. The first two resumes of every ASID print, which is what the
+/// "was this vug stranded or resumed?" read actually needs; a flood is what it does not.
+fn user_input_wake_edge(asid: u64, edge: &str) -> usize {
+    if asid == 0 || asid as usize > super::boot::USER_SLOTS {
+        return 0;
+    }
+    // CLICK-SWALLOW: count the NAMED edges — the focus arrival and the unhide, i.e. exactly the two
+    // that make up the VUGPAUSE-2r2 restore chain. Counted here, ABOVE the parked fast path, because
+    // the question the swallow witness has to answer is "was this edge REACHED?", not "did it find a
+    // waiter": on a headless gate nothing is ever parked, so the woken count is always 0 and would
+    // prove nothing, while a swallow that skipped `user_input_set_active` would show up here at once.
+    // Relaxed and off any hot path — the router's per-event push passes `""` and is not counted.
+    if !edge.is_empty() {
+        USER_INPUT_WAKE_EDGES.fetch_add(1, Ordering::Relaxed);
+    }
+    if !USER_INPUT_PARKED[asid as usize].load(Ordering::Acquire) {
+        return 0; // fast path: nobody has parked on this ring
+    }
+    let n = super::sched::futex_wake(input_futex_key(asid), usize::MAX);
+    if n != 0 {
+        USER_INPUT_WAKES.fetch_add(n as u64, Ordering::Relaxed);
+        if !edge.is_empty() {
+            let seen = USER_INPUT_RESUMES[asid as usize].fetch_add(1, Ordering::Relaxed) + 1;
+            if seen.is_power_of_two() {
+                serial_println!(
+                    "[vugpause2] resume asid={} edge={} woken={} n={}",
+                    asid, edge, n, seen
+                );
+            }
+        }
+    }
+    n
+}
+
+/// VUGPAUSE-2 BACKSTOP: wake every parked input waiter, unconditionally. Called on a coarse cadence from
+/// the scheduler loop (`sched::run`), and it is a LIVENESS device, not a correctness one — the three wake
+/// edges above are what make the wait responsive.
+///
+/// Why it has to exist. A parked task issues no `SYS_INPUT_POLL`, and two independent liveness bounds are
+/// fed by exactly that syscall: `gui_watchdog`'s 5 s wedge timer (which hands the keyboard back to the
+/// shell) and UVUG-8r2's 2 s takeover heartbeat (which un-suspends the `run` deadline). Both would read a
+/// legitimately idle, blocked vug as a wedged one. Rather than teach either of them a new state, the
+/// backstop keeps the old contract true: the vug still polls, just a few times a second instead of
+/// thousands. At `INPUT_WAIT_BACKSTOP_TICKS` (~256 ms) that is ~4 wake/poll/re-park cycles per second per
+/// idle vug — far inside both bounds and far below anything a load meter can see.
+/// VUGPAUSE-2r2 — THE HINT IS NO LONGER CONSULTED HERE. It used to be, and that turned P72's stale-clear
+/// from a hiccup into a permanent strand: the one mechanism whose entire job is to be the net that catches
+/// a missed wake was itself gated on the same flag every missed wake had already gone through. A backstop
+/// that can be disabled by the bug it exists to survive is not a backstop.
+///
+/// So it wakes all `USER_SLOTS` keys unconditionally. The cost is `USER_SLOTS` (8) `futex_wake` calls per
+/// ~256 ms — each a bounded scan of the bucket array that exits on the first matching key or a miss —
+/// which is ~31 calls a second on a machine that dispatches thousands of times a second, and a wake on a
+/// key with no waiters allocates nothing and readies nobody. That is a rounding error against the arc's
+/// measured idle win, and it is the price of the failure class being bounded at one period rather than
+/// unbounded. Any future stale-clear of the hint now costs an idle vug ~256 ms of latency, once.
+pub fn user_input_wake_backstop() {
+    for asid in 1..=super::boot::USER_SLOTS as u64 {
+        let n = super::sched::futex_wake(input_futex_key(asid), usize::MAX);
+        if n != 0 {
+            USER_INPUT_WAKES.fetch_add(n as u64, Ordering::Relaxed);
+        }
+    }
+}
+
 /// The ASID of the process currently designated to RECEIVE input (0 = none). The router enqueues only into
-/// this process's ring — the ELF-5 twin of `SCREEN_APP_ACTIVE`. Set via `el0_input_set_active`.
-static EL0_INPUT_ACTIVE: AtomicU64 = AtomicU64::new(0);
+/// this process's ring — the ELF-5 twin of `SCREEN_APP_ACTIVE`. Set via `user_input_set_active`.
+static USER_INPUT_ACTIVE: AtomicU64 = AtomicU64::new(0);
 
 /// INROUTE: how many times a SLOT TEARDOWN revoked the live input focus (`clear_handle_row`'s CAS actually
 /// fired — the dying ASID *was* the focused one). Zero on a boot where no focused program ever exited; it
@@ -11476,18 +11999,18 @@ pub fn el0_focus_revokes() -> u64 {
 /// (`run /fat/VUG.ELF`) flips to interactive mode the instant it drains its FIRST real input event (the
 /// UVUG-4 input-driven switch) — the same edge the app announces with `:: UVUG: interactive takeover ::`.
 ///
-/// UVUG-8r2 moves the engage edge from PRODUCER to CONSUMER. The first cut latched in `el0_input_push` — an
-/// event merely REACHING the ring. That mis-fired on metal at t≈0: `el0_input_set_active` reset the per-ASID
+/// UVUG-8r2 moves the engage edge from PRODUCER to CONSUMER. The first cut latched in `user_input_push` — an
+/// event merely REACHING the ring. That mis-fired on metal at t≈0: `user_input_set_active` reset the per-ASID
 /// ring but NOT `pal::EVENT_QUEUE`, so the Enter KeyUp left over from typing `run /fat/VUG.ELF` drained
 /// straight into the new app's ring and engaged takeover before the app had run a single frame — giving EVERY
 /// keyboard-launched run (batch apps included, which never poll at all) a suspended deadline. Now the latch is
 /// set by `sys_input_poll` only when the app ACTUALLY CONSUMES a packed event, so it reflects the app's own
-/// behaviour rather than the router's; and `el0_input_set_active` drains the stale `pal::EVENT_QUEUE` so the
+/// behaviour rather than the router's; and `user_input_set_active` drains the stale `pal::EVENT_QUEUE` so the
 /// launch keystroke cannot be mistaken for in-app interaction in the first place.
 ///
 /// This latch is the `run_user_image` deadline's signal to SUSPEND — but only in conjunction with a fresh
 /// `EL0_TAKEOVER_HB` heartbeat (see `takeover_suspends`), so a hung app cannot suspend the deadline forever.
-/// Cleared on ANY focus change (`el0_input_set_active`) and on slot teardown (`clear_handle_row`), so a fresh
+/// Cleared on ANY focus change (`user_input_set_active`) and on slot teardown (`clear_handle_row`), so a fresh
 /// `run` always starts disengaged and the deadline is fully intact for the batch (no-HID) path.
 static EL0_TAKEOVER_ASID: AtomicU64 = AtomicU64::new(0);
 
@@ -11556,14 +12079,14 @@ fn pack_input(ev: crate::pal::Event) -> Option<u64> {
         Event::Button(mask) => (INPUT_EV_BUTTON, mask as u64),
         Event::Timer | Event::None | Event::Unknown => return None,
     };
-    Some((ty << 48) | payload)
+    Some(una_abi::input_ev_pack(ty, payload))
 }
 
 /// ELF-5 ROUTER SEAM (public, in-lane): enqueue one input event into the ACTIVE process's ring. Called by the
 /// GUI router (main.rs `pump_usb_into_gui`) when it drains `pal::next_event()` and an EL0 app owns input.
 /// Returns `true` if the event was queued, `false` if there is no active EL0 target, the event is not
 /// deliverable, or the ring is full (drop-newest — an unread event is never overwritten). Single producer.
-pub fn el0_input_enqueue(ev: crate::pal::Event) -> bool {
+pub fn user_input_enqueue(ev: crate::pal::Event) -> bool {
     // WC-C: TAB is the COMPOSITOR's key, not the focused app's — the one keystroke the window system
     // reserves for itself, so an operator can always reach the other window even from an app that has
     // taken over the keyboard. Intercepted HERE, at the router seam, because this is the single choke
@@ -11575,22 +12098,31 @@ pub fn el0_input_enqueue(ev: crate::pal::Event) -> bool {
     if wc_focus_key(ev) {
         return true;
     }
-    let asid = EL0_INPUT_ACTIVE.load(Ordering::Acquire);
+    // CLICK-ROUTE: the pointer's twin of the line above, and in the same place for the same reason —
+    // this is the single choke point every event bound for an EL0 ring passes through, so it is where
+    // "who is this click FOR?" gets asked. `true` means the click was addressed to the desktop and is
+    // consumed — and, since CLICK-SHELL, that focus has moved to the shell with it, so the load below
+    // would read 0 anyway; `false` may mean the routing raised a NEW window to focus, in which case the
+    // load below picks up the new ASID and the press lands in the right ring on the way past.
+    if wc_click_route(ev) {
+        return false; // consumed, not queued — `[el0in] routed` must stay truthful
+    }
+    let asid = USER_INPUT_ACTIVE.load(Ordering::Acquire);
     if asid == 0 || asid as usize > super::boot::USER_SLOTS {
         return false;
     }
     let Some(packed) = pack_input(ev) else {
         return false;
     };
-    el0_input_push(asid, packed)
+    user_input_push(asid, packed)
 }
 
 /// WC-C — the TAB focus-cycle. Returns `true` when the event was CONSUMED by the window system and must
 /// not reach any app's ring.
 ///
 /// Cycling means: take the compositor's focus ring (`video::wm::focus_ring` — the distinct owner ASIDs of
-/// the live windows, in window-id order) PLUS one more slot for the SHELL (`EL0_INPUT_ACTIVE == 0`), find
-/// where the current focus sits, and hand focus to the next slot. `el0_input_set_active` is the ONE way
+/// the live windows, in window-id order) PLUS one more slot for the SHELL (`USER_INPUT_ACTIVE == 0`), find
+/// where the current focus sits, and hand focus to the next slot. `user_input_set_active` is the ONE way
 /// focus moves, so the tab-cycle inherits everything that already hangs off it: the incoming ring is
 /// reset, the interactive-takeover latch is cleared (the newly-focused app has consumed nothing yet, so
 /// its `run` deadline re-arms and the UVUG-8 cap keeps holding PER WINDOW), and the outgoing app simply
@@ -11602,13 +12134,13 @@ pub fn el0_input_enqueue(ev: crate::pal::Event) -> bool {
 /// the rotation, not an absence.
 ///
 /// WC-TAB closed the loop. WC-C shipped this as a one-way exit: once focus was the shell,
-/// `route_input_to_active_el0` was not called at all (`main.rs` gates on `el0_input_active() != 0`), so
+/// `route_input_to_active_el0` was not called at all (`main.rs` gates on `user_input_active() != 0`), so
 /// no TAB ever reached this function. The shell's own event drain now calls `wc_shell_focus_key`, the
 /// second entry point onto this same body, so the shell slot is a full position in the rotation —
 /// leavable and re-enterable — rather than a terminus.
 ///
 /// Two further deliberate consequences, neither hidden:
-///  * `el0_input_set_active` also drains `pal::EVENT_QUEUE`. We are called from inside a drain loop, so
+///  * `user_input_set_active` also drains `pal::EVENT_QUEUE`. We are called from inside a drain loop, so
 ///    anything typed BEHIND the Tab is discarded rather than delivered to the new focus, and it is the
 ///    same discard a launch already performs. WC-TAB note on PROVENANCE, since there are now two callers
 ///    and they do not share one: from the in-ring entry point those keystrokes were aimed at the window
@@ -11616,7 +12148,7 @@ pub fn el0_input_enqueue(ev: crate::pal::Event) -> bool {
 ///    aimed at the PROMPT — type `ls`, then TAB quickly, and the `ls` bytes are dropped before the
 ///    console ever sees them. Kept anyway, and flagged rather than quietly fixed: the alternative is to
 ///    let pre-TAB shell bytes survive into a window's ring, which is a worse leak than losing a partial
-///    command line, and `el0_input_set_active`'s "a fresh focus starts clean" contract is relied on by
+///    command line, and `user_input_set_active`'s "a fresh focus starts clean" contract is relied on by
 ///    the UVUG-8r2 takeover reasoning. Splitting the discard by direction means splitting that contract,
 ///    which is an arc-sized change to the focus primitive, not a keybinding fix.
 ///  * The KeyUp is swallowed too, on the same predicate. Delivering a lone KeyUp for a KeyDown the app
@@ -11628,9 +12160,14 @@ fn wc_focus_key(ev: crate::pal::Event) -> bool {
         crate::pal::Event::KeyUp(K_TAB) => false,
         _ => return false,
     };
+    // WEDGE-2 `<F1>` — a TAB edge has been recognised and the chain begins. Emitted BEFORE
+    // `focus_ring`, which takes the window TABLE lock: a `<F1>` with no successor means the chain
+    // died reading the ring, i.e. against `TABLE`. Both entry points (the in-ring router seam and
+    // `wc_shell_focus_key`) funnel through this one body, so one token covers both.
+    crate::wedge2::mark("<F1>");
     let mut ring = [0u64; crate::video::wm::MAX_WINDOWS];
     let n = crate::video::wm::focus_ring(&mut ring);
-    let cur = EL0_INPUT_ACTIVE.load(Ordering::Acquire);
+    let cur = USER_INPUT_ACTIVE.load(Ordering::Acquire);
     // BGRUN-1 GUARD REWRITE (supersedes WC-TAB's shared `n < 2`, deliberately). The old guard was
     // justified when windows could not outlive `run`: a lone window meant a parked shell, so consuming
     // TAB there could only rebuild the one-way trap. BGRUN-1 makes "focused window + free shell" the
@@ -11648,7 +12185,7 @@ fn wc_focus_key(ev: crate::pal::Event) -> bool {
         return true; // swallow the release edge of a Tab whose press we consumed
     }
     let at = ring[..n].iter().position(|&a| a == cur);
-    // The ring has n WINDOW slots plus ONE MORE: slot `n` is the SHELL (`EL0_INPUT_ACTIVE == 0`, no EL0
+    // The ring has n WINDOW slots plus ONE MORE: slot `n` is the SHELL (`USER_INPUT_ACTIVE == 0`, no EL0
     // target). Without it the cycle is a closed loop over the live apps and the keyboard can never be
     // handed back — an operator who tabs into a window is stuck there until the app exits, with the
     // wedge watchdog as the only other way out. That is a trap, not a window manager, so "no app has
@@ -11671,14 +12208,29 @@ fn wc_focus_key(ev: crate::pal::Event) -> bool {
     if next == cur {
         return true;
     }
-    el0_input_set_active(next);
-    // FOCUS-VIS — the other half of a focus change. `el0_input_set_active` moves where KEYSTROKES go;
+    // WEDGE-2 `<F2>` — the ring was read and a destination chosen; the focus PRIMITIVE is next.
+    // `user_input_set_active` clears the target's ring and drains up to 64 events off
+    // `pal::EVENT_QUEUE` (a bounded loop against a live producer), so a `<F2>` with no `<F3>` puts
+    // the death in the input-queue drain rather than anywhere in the compositor.
+    crate::wedge2::mark("<F2>");
+    user_input_set_active(next);
+    // WEDGE-2 `<F3>` — focus routing has moved; the VISIBLE half is next. This is the seam the three
+    // silicon wedges all crossed: `[wc-fv] focus raise` is printed from inside `focus_changed`, so
+    // every recorded wedge got at least this far.
+    crate::wedge2::mark("<F3>");
+    // FOCUS-VIS — the other half of a focus change. `user_input_set_active` moves where KEYSTROKES go;
     // this moves what the PANEL shows. P59's bench report is what happens when only the first exists:
     // `[wc-c] focus tab-cycle` fired on every press and nothing on screen moved, so the newly focused
     // window stayed buried and the shell stayed covered. `next == 0` is the shell slot, and
     // `focus_changed` treats it as a first-class member of the z-order (raise the shell, drop the
     // windows below it, ask the desktop for a full present) rather than as "no window focused".
     crate::video::wm::focus_changed(next);
+    // WEDGE-2 `<F9>` — `focus_changed` RETURNED and this core is about to fall back into the input
+    // pump. A wire that reaches `<F9>` has exonerated the whole focus path for that press. The
+    // `[wc-c]` line below is the ordinary witness, but it takes the serial lock and is buffered
+    // behind it, so the TOKEN is what proves the return, not the line. (The chain claim is released
+    // inside `focus_changed` itself, on every path out of it — see the note there.)
+    crate::wedge2::mark("<F9>");
     serial_println!(
         "[wc-c] focus tab-cycle {} -> {} (ring of {} + shell)",
         cur,
@@ -11690,18 +12242,25 @@ fn wc_focus_key(ev: crate::pal::Event) -> bool {
 
 /// Push a pre-packed event into `asid`'s ring (the SPSC producer half). Drop-newest on a full ring so a
 /// backlog can never clobber an event the EL0 consumer has not yet read. `asid` is validated by the caller.
-fn el0_input_push(asid: u64, packed: u64) -> bool {
+fn user_input_push(asid: u64, packed: u64) -> bool {
     let a = asid as usize;
-    let head = EL0_INPUT_HEAD[a].load(Ordering::Acquire);
-    let tail = EL0_INPUT_TAIL[a].load(Ordering::Relaxed); // this task is the sole producer
+    let head = USER_INPUT_HEAD[a].load(Ordering::Acquire);
+    let tail = USER_INPUT_TAIL[a].load(Ordering::Relaxed); // this task is the sole producer
     if tail.wrapping_sub(head) >= INPUT_RING_CAP as u32 {
         return false; // full — drop the newest
     }
-    EL0_INPUT_BUF[a][(tail as usize) & (INPUT_RING_CAP - 1)].store(packed, Ordering::Release);
-    EL0_INPUT_TAIL[a].store(tail.wrapping_add(1), Ordering::Release); // publish AFTER the slot store
+    USER_INPUT_BUF[a][(tail as usize) & (INPUT_RING_CAP - 1)].store(packed, Ordering::Release);
+    USER_INPUT_TAIL[a].store(tail.wrapping_add(1), Ordering::Release); // publish AFTER the slot store
     // UVUG-8r2: deliberately NO takeover latch here. Delivery into the ring proves only that the ROUTER acted;
     // it says nothing about whether the app is interactive (or even running). The latch is set on the CONSUMER
     // side, in `sys_input_poll`, when the app actually drains the event. See `EL0_TAKEOVER_ASID`.
+    //
+    // VUGPAUSE-2: the wake, AFTER the TAIL publish and never before it. `sched::futex_wait` performs its
+    // compare of this very word under the bucket lock that `futex_wake` must take, so the two possible
+    // interleavings are the only two, and both are correct: a waiter that read TAIL before our store fails
+    // its compare and never parks; one that parked before our store is on the bucket we are about to take.
+    // There is no third case and therefore no lost wakeup.
+    user_input_wake(asid);
     true
 }
 
@@ -11709,7 +12268,7 @@ fn el0_input_push(asid: u64, packed: u64) -> bool {
 /// ASID resets that ring (a freshly-focused process starts with an empty queue — no stale input from a prior
 /// focus); passing 0 clears the designation (no EL0 target — enqueues become no-ops). Called by the focus
 /// owner (today the witness; on the folded router, the shell/compositor on a focus change).
-pub fn el0_input_set_active(asid: u64) {
+pub fn user_input_set_active(asid: u64) {
     // UVUG-8r2: a fresh focus must also start with an empty UPSTREAM queue. `clear_input_row` resets only the
     // per-ASID ring; `pal::EVENT_QUEUE` sits in front of it and, on metal, still holds the tail of the
     // keystroke that LAUNCHED this program — the Enter KeyUp from typing `run /fat/VUG.ELF`. Left there, the
@@ -11742,13 +12301,13 @@ pub fn el0_input_set_active(asid: u64) {
     // which a concurrent router push could re-store the OUTGOING asid into the latch after we cleared it. With
     // the engage edge moved to the consumer side that push can no longer write the latch at all, and this order
     // narrows the remaining window to near-nothing — but it does NOT close it. `sys_input_poll` reads
-    // `EL0_INPUT_ACTIVE` and writes the latch as two separate atomics, so a poll that read the OLD focus just
+    // `USER_INPUT_ACTIVE` and writes the latch as two separate atomics, so a poll that read the OLD focus just
     // before this store can still land its write after the clear below (a TOCTOU on the focus-drop edge). The
     // residue is harmless and self-healing: the stale latch names the OUTGOING asid, `takeover_suspends` only
-    // suspends when the latch matches the asid the wait loop is watching, and the next `el0_input_set_active`
+    // suspends when the latch matches the asid the wait loop is watching, and the next `user_input_set_active`
     // clears it again. Closing it properly would need focus+latch under one atomic or a seqlock, which is not
     // worth it for a window this narrow and this benign.
-    EL0_INPUT_ACTIVE.store(asid, Ordering::Release);
+    USER_INPUT_ACTIVE.store(asid, Ordering::Release);
     EL0_TAKEOVER_ASID.store(0, Ordering::Release);
     // Heartbeat reset to 0 as an "unset" sentinel. NOTE it is a value, not a tombstone: `takeover_suspends`
     // treats it as a real timestamp, so within the first `TAKEOVER_STALE_SECS` after CNTPCT origin a 0 reads as
@@ -11757,12 +12316,24 @@ pub fn el0_input_set_active(asid: u64) {
     // on the line above and `takeover_suspends` requires a non-zero MATCHING latch before the heartbeat is even
     // consulted. Flagged rather than fixed: an Option-shaped sentinel would buy nothing real here.
     EL0_TAKEOVER_HB.store(0, Ordering::Release);
+    // VUGPAUSE-2: a focus ARRIVAL is a wake edge. It has to be, and the reason is the line above the
+    // `clear_input_row` call: focus RESETS the incoming ring rather than filling it, so a vug parked on
+    // an empty ring sees no TAIL movement when it is handed the keyboard. Last, after the focus is
+    // published, so the woken task re-polls against the new state rather than the old.
+    //
+    // VUGPAUSE-2r2: this edge was DEAD until now, and it is the first of the three the click-to-restore
+    // path crosses. `clear_input_row` above no longer clears the park hint, so the wake can see the
+    // waiter it is for. Note it fires while the vug may still be HIDDEN (`focus_changed` runs after this
+    // in `wc_click_route`): the woken vug re-reads its flags word, may find itself still hidden and
+    // re-park, and is then released again by the unhide edge below — which is why BOTH edges are needed
+    // and neither is redundant.
+    user_input_wake_edge(asid, "focus");
 }
 
 /// WC-TAB — the SHELL half of the focus ring, closing the one-way exit WC-C left open.
 ///
-/// When focus is the shell slot, `el0_input_active()` is 0 and `main.rs` never calls
-/// `route_input_to_active_el0`, so `el0_input_enqueue` (and with it the TAB interception) is never
+/// When focus is the shell slot, `user_input_active()` is 0 and `main.rs` never calls
+/// `route_input_to_active_el0`, so `user_input_enqueue` (and with it the TAB interception) is never
 /// reached: TAB got as far as the console's `handle_key`, which ignores byte 9 outright — no completion,
 /// no binding, nothing. The rotation could be left but not re-entered.
 ///
@@ -11776,7 +12347,7 @@ pub fn el0_input_set_active(asid: u64) {
 ///
 /// Same predicate, same body, same witness as the in-ring cycle — this is a second entry point onto
 /// `wc_focus_key`, not a second implementation. Two consequences follow from that, both wanted:
-///  * With `EL0_INPUT_ACTIVE == 0` the current focus is in no window's slot, so the cycle takes the
+///  * With `USER_INPUT_ACTIVE == 0` the current focus is in no window's slot, so the cycle takes the
 ///    "unknown focus" arm and lands on the ring's head — the first window in window-id order.
 ///  * The `n < 2` guard is shared, so a system with one window (or none) leaves TAB an ordinary key
 ///    here too. That is deliberate symmetry, not an oversight: a lone window does not consume TAB, so
@@ -11786,15 +12357,562 @@ pub fn el0_input_set_active(asid: u64) {
 /// Returns `true` when the window system consumed the event; the caller must not forward it.
 /// A non-TAB event, or TAB with focus already on an app, returns `false` untouched.
 pub fn wc_shell_focus_key(ev: crate::pal::Event) -> bool {
-    if EL0_INPUT_ACTIVE.load(Ordering::Acquire) != 0 {
+    if USER_INPUT_ACTIVE.load(Ordering::Acquire) != 0 {
         return false; // an app owns input — the router seam handles TAB, not us
     }
     wc_focus_key(ev)
 }
 
-/// The ASID currently designated to receive input (0 = none) — the read side of `el0_input_set_active`.
-pub fn el0_input_active() -> u64 {
-    EL0_INPUT_ACTIVE.load(Ordering::Acquire)
+// ---- CLICK-ROUTE: a pointer button goes to the window UNDER THE CURSOR ------------------------
+
+/// CLICK-ROUTE: the pointer-button bitmask as the ROUTER last saw it, so this layer can tell a PRESS
+/// edge (a bit going 0->1) from a RELEASE edge (1->0) from an unchanged held state.
+///
+/// Deliberately its OWN tracker and not a share of `main.rs`'s `CLICK1_PREV_MASK`: that one belongs to
+/// the shell's `click1_dispatch` and only ever sees the events that actually REACH the shell. Routing
+/// decisions are made upstream of that, on events the shell may never see, so the two masks track two
+/// different populations by design. They cannot disagree in a way that matters — `click1_dispatch`
+/// still sees a coherent press/release sequence for whatever subset it receives, because this layer
+/// routes whole pairs (below) and never splits one.
+static CLICK_PREV_MASK: AtomicU32 = AtomicU32::new(0);
+
+/// CLICK-ROUTE sentinel: the outstanding press was NOT delivered to any ring, so its release must not
+/// be either. `u64::MAX` is not a valid ASID (`USER_SLOTS` is single digits), so it cannot collide.
+const CLICK_TARGET_DROP: u64 = u64::MAX;
+
+/// CLICK-ROUTE: where the outstanding PRESS was delivered, so the matching RELEASE follows it.
+/// An ASID (0 = the shell path), or [`CLICK_TARGET_DROP`] when the press was deliberately consumed.
+///
+/// **A press/release pair must never be split across two apps.** A release delivered to an app that
+/// never saw the press is a fabricated click — it is exactly the dropped-edge shape UVUG-6 spent an
+/// arc removing from the typematic path, and on the button path it is worse: the receiving app sees a
+/// button go up that never went down, which for a click-to-pause vug is an invented click. So the
+/// release edge is not re-routed at all; it is compared against this and either follows the press or
+/// is dropped.
+static CLICK_PRESS_TARGET: AtomicU64 = AtomicU64::new(CLICK_TARGET_DROP);
+
+/// CLOSE-BOX — rate limit for the `[clickroute] close=` event line, `[spread4] rewake`-style: name
+/// the first few closes in full, then go quiet. A close is human-rate by construction (one line per
+/// operator click on a close box), so the cap exists for the pathological case only — a stuck
+/// button over a spawner that keeps re-opening windows must not be able to flood the wire.
+const CLOSE_LOG_MAX: u32 = 16;
+static CLOSE_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// CLOSE-FIX — the settle tag of the MOST RECENT close-box resolution, as a small code the window
+/// layer's witness legs can assert against ([`wc_close_last_settle`]). The wire line alone cannot be
+/// asserted by a leg (a leg has no view of serial), and the router's `bool` return says only
+/// "consumed" — this is the read-back that lets the real-path close leg require `settle != noproc`,
+/// which is exactly the assertion that would have caught P82's kill-finds-nobody shape.
+#[cfg(feature = "witness")]
+static CLOSE_LAST_SETTLE: AtomicU32 = AtomicU32::new(0);
+/// No close has resolved yet (the `CLOSE_LAST_SETTLE` reset/initial state).
+#[cfg(feature = "witness")]
+pub const CLOSE_SETTLE_NONE: u32 = 0;
+/// `settle=closed` — kill confirmed, Proc row settled clean.
+#[cfg(feature = "witness")]
+pub const CLOSE_SETTLE_CLOSED: u32 = 1;
+/// `settle=noproc` — a REAL slot ASID with no live process behind it.
+#[cfg(feature = "witness")]
+pub const CLOSE_SETTLE_NOPROC: u32 = 2;
+/// `settle=noproc-selftest` — witness furniture (owner outside the slot range).
+#[cfg(feature = "witness")]
+pub const CLOSE_SETTLE_NOPROC_SELFTEST: u32 = 3;
+/// Any other tag (`dead`, `armed`, `exhausted`) — resolved, but not a shape the legs assert on.
+#[cfg(feature = "witness")]
+pub const CLOSE_SETTLE_OTHER: u32 = 4;
+
+#[cfg(feature = "witness")]
+fn close_settle_code(tag: &str) -> u32 {
+    match tag {
+        "closed" => CLOSE_SETTLE_CLOSED,
+        "noproc" => CLOSE_SETTLE_NOPROC,
+        "noproc-selftest" => CLOSE_SETTLE_NOPROC_SELFTEST,
+        _ => CLOSE_SETTLE_OTHER,
+    }
+}
+
+/// CLOSE-FIX — the code of the most recent close-box settle (see [`CLOSE_SETTLE_NONE`] and
+/// siblings). Witness read for the hit-test battery's real-path close leg; racy only against a
+/// concurrent operator click, which no witness leg runs under.
+#[cfg(feature = "witness")]
+pub fn wc_close_last_settle() -> u32 {
+    CLOSE_LAST_SETTLE.load(Ordering::Acquire)
+}
+
+/// CLOSE-BOX (P79) — **the close click's whole effect: the windows go, then the process goes.**
+/// Called from [`wc_click_route`]'s close arm only, with the press already consumed.
+///
+/// ### The order
+/// 1. **Windows first** — `wm::close_owner` removes EVERY row the owner holds (the vug parent's
+///    window and any workers' windows are one owner), erases and re-tiles, so the operator's click
+///    is answered on the panel immediately rather than after a kill settles. Idempotent against the
+///    teardown's own `close_owner` (which will find zero rows).
+/// 2. **Focus next** — if the closed owner held focus (either half), it is handed to the SHELL
+///    through the one focus primitive, in the canonical order (`user_input_set_active(0)` then
+///    `wm::focus_changed(0)`) — the same state a TAB-to-shell or a desktop-miss click leaves.
+///    Without this the keyboard would keep addressing a process that is about to be dead.
+/// 3. **Kill last** — the SKILL-1 primitive, ASID-SCOPED (`sched::kill(pid, owner)`), so the vug
+///    parent and every worker thread under the slot die together; `kill` itself evicts targets
+///    parked in kernel waits (`futex_wake_killed` scans all buckets, `kill_wake_parked_semaphores`
+///    the semaphores), which is what reaches a fleet idled in `SYS_INPUT_WAIT`.
+///
+/// ### The Proc row is SETTLED, never reaped, and that is the safety argument
+/// This runs from the input-pump/shell task, racing whichever launcher owns the row (`bg`'s poll,
+/// or a FOREGROUND `run_user_image` blocked in its wait loop). Reaping here (the `bg_kill` shape)
+/// would free a row a foreground launcher still watches — the exact double-reap hazard `bg_kill`'s
+/// LENS MUST-FIX note documents. So on a CONFIRMED kill the row is settled with the SHAPE of a
+/// FAULT-kill settle (`record_el0_kill`'s live-child arm) but a CLEAN status (CLOSE-CLEAN, P80):
+/// status `EXEC_CLOSED_STATUS` — the operator asked for this exit, so it must never read as a
+/// fault — then a CAS `PRUNNING -> PEXITED`, then ONE `done` post; the CAS makes the post
+/// single-shot against a concurrent fault-kill of the same task (a fault-kill that wins the CAS
+/// keeps its own `EXEC_KILLED_STATUS`, honestly). Both launchers already converge on that state:
+/// the foreground wait wakes promptly and reaps through its normal exit path; a `bg` row reads
+/// `closed` in `jobs` and is reaped there — not `FAULTED`, which is reserved for the fault-kill
+/// net. An UNCONFIRMED kill detaches and touches the row not at
+/// all — the request stays armed, the target dies at its next boundary, and the row's owner keeps
+/// every invariant it had (no orphaning here for the same double-owner reason).
+///
+/// Owners outside the private-slot range (kernel witness fixtures) and ASIDs with no live Proc row
+/// skip the kill: there is no process to kill, and the window close is the whole of the effect.
+/// Returns the settle tag for the `[clickroute] close=` witness line: `closed` (kill confirmed,
+/// row settled clean), `noproc` (a REAL slot ASID with no live process behind it), `dead` (target
+/// already exited on its own), `armed` (unconfirmed — the request stays armed), `exhausted` (no
+/// kill slot), `noproc-selftest` (an owner OUTSIDE the slot range — witness furniture, which only
+/// the selftest battery can mint).
+///
+/// CLOSE-FIX (P82) — `noproc-selftest` is deliberately a DISTINCT tag rather than a reuse of
+/// `noproc`. The bench read `[clickroute] close=win3 asid=3085 ... settle=noproc` off the wire and
+/// could not tell whether a REAL click had resolved to the hit-test selftest's synthetic ASID
+/// (0xC0D — a routing defect) or the selftest's own no-op arm had merely logged itself (benign):
+/// the two lines were byte-for-byte the same shape. They must never be again — a spec can now
+/// FORBID plain `noproc` where only fixtures close, and an operator reading the log can tell a
+/// witness no-op from a click that killed nobody.
+fn wc_close_click(owner: u64) -> &'static str {
+    let closed = crate::video::wm::close_owner(owner);
+    if USER_INPUT_ACTIVE.load(Ordering::Acquire) == owner {
+        user_input_set_active(0);
+    }
+    if crate::video::wm::focus_asid() == owner {
+        crate::video::wm::focus_changed(0);
+    }
+    if owner == 0 || owner as usize > super::boot::USER_SLOTS {
+        // CLOSE-FIX: synthetic owner — no process CAN be behind it, the row close was the whole
+        // effect, and the tag says so distinguishably (see the doc block's discriminator note).
+        return "noproc-selftest";
+    }
+    // The live Proc row for this ASID, if any. `pid == 0` (mid-publish) is skipped — a kill needs
+    // a tid to name, and the publish window is microseconds wide; the operator's next click lands
+    // after it.
+    let mut target: Option<(usize, u64)> = None;
+    for pi in 0..MAX_PROCS {
+        if PROCS[pi].state.load(Ordering::Acquire) == PRUNNING
+            && PROCS[pi].asid.load(Ordering::Acquire) == owner
+        {
+            let pid = PROCS[pi].pid.load(Ordering::Acquire);
+            if pid != 0 {
+                target = Some((pi, pid));
+            }
+            break;
+        }
+    }
+    let Some((pi, pid)) = target else {
+        serial_println!(
+            "[skill] close-box asid={} closed={} window(s), no live process — nothing to kill",
+            owner, closed
+        );
+        return "noproc";
+    };
+    let Some(ticket) = super::sched::kill(pid, owner) else {
+        if !KILL_EXHAUSTED.swap(true, Ordering::AcqRel) {
+            serial_println!(
+                "[skill] slot table EXHAUSTED — close-box kill for asid={} not armed",
+                owner
+            );
+        }
+        return "exhausted";
+    };
+    // Bounded cooperative confirm wait — the SKILL-1 shape. Short in practice: the arm's own
+    // `kill_wake_parked` has already evicted a parked fleet, so the boundary is one dispatch away.
+    let t0 = super::timer::cntpct();
+    let budget = super::timer::cntfrq().saturating_mul(KILL_CONFIRM_SECS);
+    let mut ok = false;
+    let mut already_dead = false;
+    loop {
+        if super::sched::kill_confirmed(&ticket) {
+            ok = true;
+            break;
+        }
+        if PROCS[pi].state.load(Ordering::Acquire) == PEXITED
+            && super::sched::asid_live_threads(owner) == 0
+        {
+            already_dead = true;
+            break;
+        }
+        if super::timer::cntpct().wrapping_sub(t0) >= budget {
+            break;
+        }
+        super::sched::yield_now();
+    }
+    if ok {
+        super::sched::kill_release(ticket);
+        // Settle (never reap) the row — see the doc block. Status BEFORE the state flip, so a
+        // watcher that wakes on PEXITED always reads the CLOSE-CLEAN sentinel, exactly as
+        // `record_el0_kill` orders its stores. EXEC_CLOSED_STATUS, not EXEC_KILLED_STATUS: the
+        // operator clicked the close box, so `jobs`/`run` report `closed`, never `FAULTED`.
+        PROCS[pi].status.store(EXEC_CLOSED_STATUS, Ordering::Release);
+        if PROCS[pi]
+            .state
+            .compare_exchange(PRUNNING, PEXITED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            PROCS[pi].done.post();
+        }
+        serial_println!(
+            "[skill] close-box killed pid={} asid={} confirmed=1 ({} window(s) closed)",
+            pid, owner, closed
+        );
+        "closed"
+    } else if already_dead {
+        super::sched::kill_retract(ticket);
+        "dead"
+    } else {
+        super::sched::kill_detach(ticket);
+        serial_println!(
+            "[skill] close-box kill pid={} asid={} confirmed=0 — request stays armed, target dies at its next boundary",
+            pid, owner
+        );
+        "armed"
+    }
+}
+
+/// CLICK-ROUTE: the current pointer position in PANEL pixels — the point a click is addressed to.
+/// Reads the shared cursor state every other pointer consumer reads (`pal::cursor`, the same state
+/// `click1_dispatch` hit-tests and the compositor draws), clamped by the live panel geometry.
+///
+/// Locks: the framebuffer info lock, then the cursor position lock, and both are released before
+/// `wm::hit_test` takes the window TABLE lock. No nesting, so no new lock order (§WEDGE-1).
+fn click_pointer_pos() -> (i32, i32) {
+    let (w, h) = {
+        let info = crate::video::WRITER.lock().info();
+        (info.width as i32, info.height as i32)
+    };
+    crate::pal::cursor::pos(w, h)
+}
+
+/// CLICK-SHELL r2 — **does the FOCUSED app own the panel even though it owns no window?** The one
+/// exemption the miss arm of [`wc_click_route`] grants: a full-screen app presenting through the
+/// compat row (`SYS_FB_PRESENT`). See that function's "which app owns a pixel nothing hit-tests to"
+/// note for why this replaced the focus-ring test.
+fn click_owner_is_fullscreen(asid: u64) -> bool {
+    asid != 0 && crate::video::wm::compat_live()
+}
+
+/// CLICK-ROUTE — **route a pointer button by POSITION rather than by focus.**
+///
+/// ### The defect
+/// P69, attended: "out of focus clicks cause the focused vug to stop". The EL0IN-FOCUS audit named the
+/// mechanism exactly — the Button path has no window hit-test anywhere in it, so under EL0 focus a
+/// button report goes straight to the focused app's ring whatever the pointer is pointing at. Click
+/// the desktop, click another window, click the console: the focused vug gets the click and pauses.
+/// (The audit also reframed x86's CLICK-3 "15/16 clicks eaten" as MIS-ROUTED rather than dropped, so
+/// this seam is written to be inherited by the x86 tree rather than duplicated there.)
+///
+/// ### The rule, on a PRESS edge
+/// Hit-test the cursor ([`crate::video::wm::hit_test`] — topmost visible window containing the point):
+///  * **a DIFFERENT window than the focused one** — raise it to focus, through the one focus
+///    primitive that exists (`user_input_set_active` + `wm::focus_changed`, in that order, exactly as
+///    `wc_focus_key` calls them), and then DELIVER the press to it (CLICK-PLAIN, below). Click-to-focus,
+///    with no second focus path invented for it: this is a new CALLER of the WEDGE path, so a
+///    click-driven raise emits the same `<F1>`-`<F9>` breadcrumbs a TAB does, which is desirable — the
+///    breadcrumbs cover both callers.
+///  * **the FOCUSED window** — deliver exactly as before. This is the no-change case and it is the
+///    common one.
+///  * **no window** — the click landed on the desktop or the console. It is not the focused app's
+///    click, so it is CONSUMED here rather than delivered: that arm is what P69 is asking for. It also
+///    MOVES FOCUS TO THE SHELL (below). Two deliberate limits on it:
+///      - With focus at the SHELL (`cur == 0`) nothing is consumed — the caller's normal path IS the
+///        shell path (`gui_send` -> `click1_dispatch`), which is where a desktop click belongs, and the
+///        focus is already where the miss would put it.
+///      - If a FULL-SCREEN app is presenting ([`click_owner_is_fullscreen`]), the press is delivered
+///        as before: a compat row covers the panel but carries owner ASID 0 and so can never be hit,
+///        and dropping its clicks would break UVUG's own click-to-exit. A miss over a full-screen app
+///        is a hit on that app, not on the desktop.
+///
+/// ### CLICK-SHELL r2 — which app owns a pixel that hit-tests to nothing (P72, bench)
+/// CLICK-SHELL shipped that second limit as `click_owner_is_windowed(cur)` — "deliver unless the
+/// focused app is in the focus ring". That is not the question. The exemption exists for the app that
+/// owns the PANEL without owning a window, and the focus ring answers a different question: it lists
+/// apps that own a window at all. The two answers coincide only while every focused app is either
+/// windowed or full-screen, and the bench state that falsifies it is ordinary — a focused app holding
+/// the keyboard with NO window and NO compat row:
+///   * a `run` program between the focus grant in `run_user_image` and its first present (or one that
+///     never presents at all — every batch program, for its whole run);
+///   * a windowed app that has closed its last window and kept running.
+/// In that state every desktop press took the `else` arm and was delivered to an app that owns nothing
+/// on the panel, so the miss arm never fired and printed no line. TAB did not rescue it in one press
+/// either: `wc_focus_key`'s unknown-focus arm sends a focus that is in no ring slot to `ring[0]`, not
+/// to the shell, so the operator had to cycle the WHOLE ring before the shell slot came up. That is
+/// P72's report exactly — "the shell can't be focused until it's cycled through a tab sequence".
+///
+/// So the predicate now asks the question the exemption was written for, directly: is a full-screen
+/// app presenting ([`crate::video::wm::compat_live`])? `hit_test` has already answered "no WINDOW owns
+/// this pixel"; the compat row is the only other thing that can own it. Everything else is the
+/// desktop, whoever holds focus and whether or not they own a window.
+///
+/// ### CLICK-SHELL — a miss moves focus to the SHELL
+/// CLICK-ROUTE shipped this arm as "consume, but do not move focus", on the reasoning that raising the
+/// shell buries every window under the console. P71, attended, is the ruling against that reading:
+/// clicking a window focuses it, and clicking the DESKTOP must focus the desktop — otherwise the
+/// out-of-focus vug keeps the keyboard while the operator is demonstrably interacting with the shell,
+/// and there is no pointer gesture that reaches the console at all (only `TAB`).
+///
+/// So a miss over a windowed focus does what the hit arm does, with the shell as the target: the ONE
+/// focus primitive (`user_input_set_active(0)` then `wm::focus_changed(0)`, in that order), which is
+/// literally the shell slot of `wc_focus_key`'s ring — no second shell-focus state is invented here,
+/// and everything already hanging off that path follows unchanged (the outgoing app's ring is left
+/// alone, its takeover latch is cleared, and VUGMIN's hidden bit is published by `focus_changed`'s own
+/// scan, so the vug it just left IDLES rather than pausing or dying). The burial is the intended
+/// effect, not a side effect — it is the same z-order move `TAB`-to-shell has always made, and the
+/// same one FOCUS-VIS's "shell" leg asserts.
+///
+/// The press itself is still CONSUMED (target [`CLICK_TARGET_DROP`], so the release is dropped with
+/// it). Focus moved; the click is not re-addressed to the console after the fact, because a
+/// press/release pair must not be split and the shell's `click1_dispatch` never saw the press edge.
+/// The operator's NEXT click is an ordinary shell click on the shell's own path.
+///
+/// ### CLICK-PLAIN — a FOCUS-CHANGING press is DELIVERED, after the focus moves (P75, bench)
+/// CLICK-SWALLOW (P73) consumed the focus-changing press instead of delivering it, on the rule "an app
+/// never sees a click it did not own the focus for". That rule was written to defend a specific app
+/// behaviour — a delivered click was UVUG's pause toggle, so a restoring click arrived as "focus this
+/// AND toggle this" and the vug came back paused ("restarting a vug I have to click twice"). P75 is the
+/// ruling that the defence was aimed at the wrong layer: withholding the press made the click's effect
+/// depend on invisible state (which vug held focus, whether this was the first click or the second),
+/// which is the very thing the operator could not model — "stop works like absolute garbage there is no
+/// reason to it".
+///
+/// So the router's job shrinks back to ROUTING, and the whole of it is: **a press goes to the window
+/// under the cursor, and if that window was not focused, the focus goes there first.** Every press that
+/// lands on a window is delivered to that window's owner — the newly focused one on a raise, the
+/// already focused one otherwise — so there is exactly one rule, and it is the one the operator's hand
+/// already assumes. What the app DOES with a delivered click is the app's decision and is made in the
+/// app (see `user-vug`); the router no longer encodes a policy about it.
+///
+/// **The order is the whole of the correctness here.** Both wake edges the VUGPAUSE-2r2 restore chain
+/// needs fire BEFORE the press is queued, from the two calls in that arm: the focus arrival
+/// (`user_input_set_active`) and the unhide (`focus_changed` -> `set_hidden(asid, false)`). Only then
+/// does the press reach the ring — which by that point is the RAISED owner's ring, because
+/// `user_input_set_active` has already moved `USER_INPUT_ACTIVE`. A press on a PARKED, hidden, unfocused
+/// vug therefore produces the `[vugpause2] resume` pair, re-readies the waiter, AND hands it the click:
+/// the vug wakes, observes its restore, and reads one press.
+///
+/// **Both callers converge on this without a second decision.** The arm returns `false` ("carry on with
+/// your normal path"), and both normal paths now address the new focus: the EL0-focus path
+/// (`user_input_enqueue`) pushes to `USER_INPUT_ACTIVE`, which this arm has just repointed; the SHELL path
+/// (`main.rs`'s Button arm) forwards through `gui_send` -> `click1_dispatch` -> `user_input_enqueue`,
+/// which funnels back through here, sees no edge (the mask tracker was swapped on entry) and lands in
+/// the same push.
+///
+/// The RELEASE follows it: the arm records the raised owner in [`CLICK_PRESS_TARGET`], so the pair is
+/// delivered whole to one app — never split, and never a fabricated half-click.
+///
+/// ### The RELEASE edge follows the press, and is never re-routed
+/// See [`CLICK_PRESS_TARGET`]. The release is delivered iff the focus is still the one the press was
+/// delivered to; otherwise it is dropped. So a TAB (or an app exit) between press and release costs
+/// the release, never a fabricated one in a second app.
+///
+/// Returns `true` when the event was CONSUMED and the caller must not deliver or forward it — since
+/// CLICK-PLAIN that is the MISS arm only (a press that moved focus to the shell). `false` means "carry
+/// on with your normal path", with whatever focus this call left in place: unchanged on a press to the
+/// already-focused window, and the newly RAISED owner on a press that moved focus to a window.
+///
+/// Idempotent per edge: the mask tracker is swapped on entry, so a second call with the same mask sees
+/// no edge and answers `false`. The shell caller relies on that (it calls `user_input_enqueue`, which
+/// funnels through here again) — one report produces one decision.
+pub fn wc_click_route(ev: crate::pal::Event) -> bool {
+    let crate::pal::Event::Button(mask) = ev else {
+        return false;
+    };
+    let prev = CLICK_PREV_MASK.swap(mask as u32, Ordering::Relaxed) as u8;
+    let cur = USER_INPUT_ACTIVE.load(Ordering::Acquire);
+    if mask & !prev != 0 {
+        // PRESS edge.
+        let (x, y) = click_pointer_pos();
+        match crate::video::wm::hit_test(x, y) {
+            // CLOSE-BOX (P79) — checked FIRST, so the close box beats select. This is the ONE
+            // point in the click grammar where a click ACTS: the box is explicit window FURNITURE
+            // (kernel chrome, drawn from the same `close_box` rect this tests), so clicking it is
+            // an instruction to the WINDOW SYSTEM, not input to the app — which is exactly why it
+            // does not go through the app's ring and does not disturb CLICK-SELECT for any other
+            // target. The press is CONSUMED (target DROP, so the release is dropped with it): the
+            // owner it would have been delivered to is being torn down.
+            Some((win, owner, _z)) if crate::video::wm::close_box_hit(win, x, y) => {
+                CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+                // CLOSE-FIX (P82) — the close acts on what the operator SAW, all the way down.
+                // The bench shape: a leaked witness row (synthetic owner, hit-test-first by z) sat
+                // over a real vug's close box, so the click resolved to the fixture, the
+                // ASID-scoped kill found no process, and the REAL owner survived with the operator
+                // none the wiser. The fixture row is gone after its own `close_owner`, so when a
+                // resolution settles `noproc-selftest` — the ONE tag that proves the click acted on
+                // witness furniture rather than on any app — re-ask the hit-test at the SAME point
+                // and, if another window's close box also contains it, close that one too: the
+                // operator's click falls through the furniture to the row it visually addressed.
+                // Real settles (`closed`, `noproc`, `dead`, `armed`, `exhausted`) never retry —
+                // the click already acted on a real app's row. Bounded by the table: every hop
+                // removes at least the hit row, so MAX_WINDOWS caps it structurally; each hop emits
+                // its own witness line under the shared rate limit, so the wire names every row the
+                // one click consumed.
+                let (mut win, mut owner) = (win, owner);
+                let mut hops = 0usize;
+                loop {
+                    // CLOSE-CLEAN: the witness line is emitted AFTER the settle so it can name the
+                    // outcome — `settle=closed` is the wire proof a close-box exit landed as a
+                    // clean close (not a fault-kill). Same rate limit, same line, one new field.
+                    let settle = wc_close_click(owner);
+                    #[cfg(feature = "witness")]
+                    CLOSE_LAST_SETTLE.store(close_settle_code(settle), Ordering::Release);
+                    if CLOSE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX {
+                        serial_println!(
+                            "[clickroute] close=win{} asid={} at ({},{}) settle={}",
+                            win, owner, x, y, settle
+                        );
+                    }
+                    hops += 1;
+                    if settle != "noproc-selftest" || hops >= crate::video::wm::MAX_WINDOWS {
+                        break;
+                    }
+                    match crate::video::wm::hit_test(x, y) {
+                        Some((w2, o2, _)) if o2 != owner && crate::video::wm::close_box_hit(w2, x, y) => {
+                            win = w2;
+                            owner = o2;
+                        }
+                        _ => break,
+                    }
+                }
+                true
+            }
+            // WMCTRL — the OTHER TWO CONTROLS, wired on the same rule the close arm states: a press
+            // on kernel-drawn chrome is an instruction to the window system, consumed here, never
+            // app input. They used to fall through to the arms below, which is how a cluster of
+            // three discs behaved as one button and two decorations. `minimise_hit`/`zoom_hit` read
+            // the SAME `control_disc` accessor the painter draws with, so each disc answers for
+            // itself; the close arm above now does too, and is no longer the cluster's left anchor.
+            Some((win, owner, _z)) if crate::video::wm::minimise_hit(win, x, y) => {
+                CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+                let settle = crate::video::wm::minimise(win);
+                // The keyboard follows the window off the panel — otherwise the operator types into
+                // something they cannot see. The shell is also where `<TAB>`, the way back to the
+                // parked window, is reached from. NOT `focus_changed(0)`: that arm parks everything.
+                if cur == owner {
+                    user_input_set_active(0);
+                }
+                if CLOSE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX {
+                    serial_println!(
+                        "[wm-act] minimise win={} owner={} at ({},{}) -> settle={}",
+                        win, owner, x, y, settle
+                    );
+                }
+                true
+            }
+            Some((win, owner, _z)) if crate::video::wm::zoom_hit(win, x, y) => {
+                CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+                // Raise and focus first: a maximise the operator cannot see the result of (because
+                // the window stayed behind another one) is not a maximise.
+                if owner != cur {
+                    user_input_set_active(owner);
+                }
+                crate::video::wm::focus_changed(owner);
+                let settle = crate::video::wm::zoom(win);
+                if CLOSE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX {
+                    serial_println!(
+                        "[wm-act] zoom win={} owner={} at ({},{}) -> settle={}",
+                        win, owner, x, y, settle
+                    );
+                }
+                true
+            }
+            Some((win, owner, _z)) if owner != cur => {
+                // The ONLY line this arc adds to serial, and only on the arm that changes behaviour:
+                // a click that MOVED focus. Human-rate by construction (one line per click that lands
+                // on a window other than the focused one), so it needs no throttle of its own. The
+                // line names the DISPOSITION as well as the address — CLICK-PLAIN: `delivered`, the
+                // wire proof that the raised window was handed its own press.
+                serial_println!(
+                    "[clickroute] press hit asid={} win={} (was {}) delivered",
+                    owner, win, cur
+                );
+                // The wake chain runs FIRST and in full: focus arrival (`user_input_set_active` ->
+                // `user_input_wake_edge(asid, "focus")`) then the raise and its unhide
+                // (`focus_changed` -> `set_hidden(asid, false)` -> `user_input_wake_edge(asid,
+                // "unhide")`). Only then does the caller push, and by then `USER_INPUT_ACTIVE` is
+                // `owner`, so the press lands in the ring of the window that was clicked.
+                user_input_set_active(owner);
+                crate::video::wm::focus_changed(owner);
+                // The release must follow the press into the SAME ring: record the raised owner, not
+                // the sentinel, so the pair is delivered whole.
+                CLICK_PRESS_TARGET.store(owner, Ordering::Release);
+                false
+            }
+            Some(_) => {
+                CLICK_PRESS_TARGET.store(cur, Ordering::Release);
+                false
+            }
+            None => {
+                if cur != 0 && !click_owner_is_fullscreen(cur) {
+                    // CLICK-SHELL: the desktop was clicked while some app held focus. Same
+                    // human-rate reasoning as the hit arm's line — one line per click that moves
+                    // focus, so no throttle is owed.
+                    serial_println!(
+                        "[clickroute] press miss at ({},{}) -> shell focus (was {})",
+                        x, y, cur
+                    );
+                    user_input_set_active(0);
+                    crate::video::wm::focus_changed(0);
+                    CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+                    true
+                } else {
+                    CLICK_PRESS_TARGET.store(cur, Ordering::Release);
+                    false
+                }
+            }
+        }
+    } else if prev & !mask != 0 {
+        // RELEASE edge — follow the press, or drop. Never hit-tested: the release belongs to whoever
+        // received the press, not to whatever the pointer has since been dragged over.
+        let target = CLICK_PRESS_TARGET.load(Ordering::Acquire);
+        target == CLICK_TARGET_DROP || target != cur
+    } else {
+        // Unchanged mask (a re-report of a held button, or the idempotent second call described
+        // above): no edge, no decision.
+        false
+    }
+}
+
+/// The ASID currently designated to receive input (0 = none) — the read side of `user_input_set_active`.
+pub fn user_input_active() -> u64 {
+    USER_INPUT_ACTIVE.load(Ordering::Acquire)
+}
+
+/// CLICK-SWALLOW witness read: how many events are sitting UNREAD in `asid`'s input ring. 0 for the
+/// shell slot and for any ASID outside the private-slot range (they have no ring).
+///
+/// This is the observation the swallow leg is built on, and it is the only honest one available: "was
+/// the app handed this click?" is a question about the RING, not about a return value. The producer
+/// (`user_input_push`) and the consumer (`sys_input_poll`) are the only writers, and neither runs while
+/// the selftest drives a synthetic edge, so the difference across one press is exactly the delivery.
+pub fn user_input_depth(asid: u64) -> u32 {
+    if asid == 0 || asid as usize > super::boot::USER_SLOTS {
+        return 0;
+    }
+    let a = asid as usize;
+    let head = USER_INPUT_HEAD[a].load(Ordering::Acquire);
+    USER_INPUT_TAIL[a].load(Ordering::Acquire).wrapping_sub(head)
+}
+
+/// CLICK-SWALLOW witness read: the cumulative count of NAMED wake edges — see
+/// [`USER_INPUT_WAKE_EDGES`]. The swallow leg samples it either side of a press to assert that
+/// consuming the click did not also skip the restore chain.
+pub fn user_input_wake_edges() -> u64 {
+    USER_INPUT_WAKE_EDGES.load(Ordering::Relaxed)
 }
 
 /// UVUG-8: the ASID currently in interactive takeover (0 = none) — the read side of the takeover latch. The
@@ -11835,8 +12953,30 @@ pub fn run_deadline_timed_out(in_takeover: bool, now: u64, budget_start: u64, de
 /// producer runs for the dying ASID, and on a focus change the router only ever targets the newly-active ASID.
 fn clear_input_row(asid: u64) {
     let a = asid as usize;
-    EL0_INPUT_HEAD[a].store(0, Ordering::Release);
-    EL0_INPUT_TAIL[a].store(0, Ordering::Release);
+    USER_INPUT_HEAD[a].store(0, Ordering::Release);
+    USER_INPUT_TAIL[a].store(0, Ordering::Release);
+    // VUGPAUSE-2r2: the park hint is DELIBERATELY not touched here — see `clear_input_parked`, which the
+    // teardown caller invokes and the focus caller must not. VUGPAUSE-2 cleared it on this line, and that
+    // was the P72 "a backgrounded vug can never be restarted" bug in one store: `user_input_set_active`
+    // calls this function on a focus ARRIVAL, microseconds before its own wake edge, so the arrival wiped
+    // the very hint the wake seam consults and every subsequent edge — focus, unhide, the press itself,
+    // and the backstop — took the "nobody is parked" fast path on a task that was, in fact, parked.
+}
+
+/// VUGPAUSE-2r2: drop ASID `asid`'s "a task is parked in `SYS_INPUT_WAIT`" hint. Exactly ONE caller, and
+/// the restriction is the fix: SLOT TEARDOWN.
+///
+/// The hint's failure modes are not symmetric, which is why this is separated from the ring reset it used
+/// to ride along with. A stale-SET hint costs one wasted `futex_wake` per backstop period on a key with no
+/// waiters. A stale-CLEAR hint costs a task that is parked forever: it is the only thing standing between
+/// every wake edge and the parked waiter, and a task that never runs again never re-sets it. So the hint
+/// may be cleared only by the parker itself (on the normal return from `sys_input_wait`) or by the one
+/// event that proves the parker is gone — its slot being torn down, which is also the path where the
+/// parker `exit()`s out of `sched::futex_wait`'s pre-park kill boundary and never reaches its own clear.
+fn clear_input_parked(asid: u64) {
+    if asid != 0 && asid as usize <= super::boot::USER_SLOTS {
+        USER_INPUT_PARKED[asid as usize].store(false, Ordering::Release);
+    }
 }
 
 /// SYS_INPUT_POLL(): nonblocking dequeue of the next input event for the CALLING process. Returns the packed
@@ -11869,25 +13009,97 @@ fn sys_input_poll() -> i64 {
     // and the run regains its bound. Stamped only for the FOCUSED app so an unfocused EL0 task's polling can
     // never keep another process's takeover alive. One focus test now serves both (they were always the same
     // question — "is the caller the app that owns the screen?").
-    if EL0_INPUT_ACTIVE.load(Ordering::Acquire) == asid {
+    if USER_INPUT_ACTIVE.load(Ordering::Acquire) == asid {
         crate::gui_watchdog::note_progress();
         EL0_TAKEOVER_HB.store(super::timer::cntpct(), Ordering::Release);
     }
     let a = asid as usize;
-    let head = EL0_INPUT_HEAD[a].load(Ordering::Relaxed); // this task is the sole consumer
-    let tail = EL0_INPUT_TAIL[a].load(Ordering::Acquire);
+    let head = USER_INPUT_HEAD[a].load(Ordering::Relaxed); // this task is the sole consumer
+    let tail = USER_INPUT_TAIL[a].load(Ordering::Acquire);
     if head == tail {
         return EAGAIN; // empty
     }
-    let packed = EL0_INPUT_BUF[a][(head as usize) & (INPUT_RING_CAP - 1)].load(Ordering::Acquire);
-    EL0_INPUT_HEAD[a].store(head.wrapping_add(1), Ordering::Release); // consume AFTER the load
+    let packed = USER_INPUT_BUF[a][(head as usize) & (INPUT_RING_CAP - 1)].load(Ordering::Acquire);
+    USER_INPUT_HEAD[a].store(head.wrapping_add(1), Ordering::Release); // consume AFTER the load
     // UVUG-8r2: the app just CONSUMED a real input event — the interactive-takeover edge, observed on the
     // consumer side (see `EL0_TAKEOVER_ASID` for why the producer side was wrong). Latch it, but only for the
     // FOCUSED app: a background EL0 task draining its own stale ring is not taking over the screen. Idempotent.
-    if EL0_INPUT_ACTIVE.load(Ordering::Acquire) == asid {
+    if USER_INPUT_ACTIVE.load(Ordering::Acquire) == asid {
         EL0_TAKEOVER_ASID.store(asid, Ordering::Release);
     }
     packed as i64
+}
+
+/// SYS_INPUT_WAIT(): block until the CALLING process's input ring is (or may be) non-empty. Returns 0 —
+/// it is a WAIT, not a read: nothing is dequeued, so the caller's ordinary `SYS_INPUT_POLL` drain runs
+/// next and sees every event. `-EINVAL` off a private slot or off a schedulable task.
+///
+/// WHY THIS EXISTS (VUGPAUSE-2). VUGPAUSE and VUGMIN stopped an idle vug from RENDERING; they did not stop
+/// it from RUNNING. The idle loop they left behind is `drain_input` + `SYS_YIELD`, which is a runnable
+/// spin: it never parks, so it is always in a run queue, and six of them held the P69 fleet at 47-61% per
+/// core with nothing moving on the panel. That residue is this syscall's whole target. The vug calls this
+/// instead of `SYS_YIELD` on the idle path only; the rendering path is untouched.
+///
+/// The three deliberate properties, in the order they were argued:
+///   * SAME-TICK WAKE. The wake is issued by `user_input_push` itself, so the latency from "the router
+///     enqueued a keypress" to "the vug is ready to run" is one `make_ready` — strictly better than the
+///     yield loop, which could not act until it was next dispatched.
+///   * KILL-SURVIVABLE. This is KILLBOUND's futex, not a new primitive, so a parked vug inherits the
+///     pre-park kill check and `futex_wake_killed`'s eviction of already-parked targets. A vug blocked
+///     here is exactly as killable and reapable as one blocked in the frame barrier, which is the case
+///     the KILLBOUND arc was built for. That is also the answer to VUGGUARD/P60's "an unbounded
+///     `futex_wait` is an unkillable empty window": it was, before KILLBOUND, and it is not now.
+///   * BOUNDED ANYWAY. The `run` deadline and the GUI wedge watchdog both measure liveness in polls, so a
+///     genuinely idle vug that stopped polling would read as wedged. `user_input_wake_backstop` keeps it
+///     polling a few times a second — see there for the full argument.
+fn sys_input_wait() -> i64 {
+    let asid = current_asid();
+    if asid == 0 || asid as usize > super::boot::USER_SLOTS {
+        return EINVAL;
+    }
+    // The same two liveness stamps `sys_input_poll` makes, under the same focus predicate and for the
+    // same reason: reaching this syscall IS drain progress. Stamped BEFORE the park, so the clock the
+    // watchdog reads starts at the moment the vug went to sleep rather than the moment it last drew.
+    if USER_INPUT_ACTIVE.load(Ordering::Acquire) == asid {
+        crate::gui_watchdog::note_progress();
+        EL0_TAKEOVER_HB.store(super::timer::cntpct(), Ordering::Release);
+    }
+    let a = asid as usize;
+    let head = USER_INPUT_HEAD[a].load(Ordering::Relaxed); // this task is the sole consumer
+    let tail = USER_INPUT_TAIL[a].load(Ordering::Acquire);
+    if head != tail {
+        return 0; // already has work — never park on a non-empty ring
+    }
+    // Park on the ring's TAIL word. `futex_wait` re-reads it under the bucket lock and refuses to park if
+    // it has moved, which closes the window between the load above and the park below.
+    USER_INPUT_PARKED[a].store(true, Ordering::Release);
+    let n = USER_INPUT_BLOCKS.fetch_add(1, Ordering::Relaxed) + 1;
+    // Witness on a POWER-OF-TWO cadence (1, 2, 4, 8, …). An idle fleet parks thousands of times a minute,
+    // so a per-park line would be a flood and a one-shot line would say nothing about whether the mechanism
+    // kept working; a logarithmic cadence is bounded at ~40 lines for any conceivable boot and still shows
+    // the ratio moving. `wakes` beside `blocked` is the pair that matters — they should track each other,
+    // and a `blocked` that climbs while `wakes` stalls is a vug going to sleep and not being woken.
+    if n & (n - 1) == 0 {
+        serial_println!(
+            "[vugpause2] blocked={} wakes={} asid={}",
+            n,
+            USER_INPUT_WAKES.load(Ordering::Relaxed),
+            asid
+        );
+    }
+    let key = input_futex_key(asid);
+    let uaddr = core::ptr::addr_of!(USER_INPUT_TAIL[a]) as u64;
+    let r = super::sched::futex_wait(key, uaddr, tail);
+    USER_INPUT_PARKED[a].store(false, Ordering::Release);
+    match r {
+        // Woken by a wake edge, or the ring moved under the compare (`Mismatch`) — either way the caller's
+        // next drain is the thing that decides, so both are simply "go look".
+        super::sched::FutexWait::Woken | super::sched::FutexWait::Mismatch => 0,
+        // Every bucket is busy with another key. Returning 0 degrades this syscall to a `SYS_YIELD` for
+        // that iteration — the pre-VUGPAUSE-2 behaviour, which is the right thing to fall back to.
+        super::sched::FutexWait::TableFull => 0,
+        super::sched::FutexWait::NoTask => EINVAL,
+    }
 }
 
 // ELF-5 input-test witnesses (captured kernel-side, printed by `input_launcher`). The program SYS_REPORTs
@@ -11957,7 +13169,7 @@ unsafe extern "C" {
 /// its own uncounted `:: EL0: input test … ::` line). Copies the input blob into a fresh slot's code page,
 /// protects it EL0-RX/EL1-RO, REGISTERS the slot as the active input target, and runs `el0-input` on THIS
 /// core (so the cooperative-yield verdict drives it under QEMU). Once the program has done its initial poll
-/// (observed the empty ring), the launcher injects ONE KeyDown('A') through the REAL `el0_input_enqueue`
+/// (observed the empty ring), the launcher injects ONE KeyDown('A') through the REAL `user_input_enqueue`
 /// router seam (proving pack + active routing), then waits for the program to drain it and exit. The verdict
 /// asserts: initial poll == -EAGAIN, injection returned true, the drained event == the expected packed value,
 /// final poll == -EAGAIN. QEMU raspi4b has no USB HID, so the kernel-injected event is what proves the
@@ -11971,7 +13183,7 @@ fn input_launcher(_demo_cpu: usize) {
     // UVUG-10: DO NOT RUN THIS FIXTURE ON METAL.
     //
     // The fixture is a REAL interactive takeover: it registers itself as the active input target
-    // (`el0_input_set_active`) and spawns an EL0 program that spins on SYS_INPUT_POLL until it sees the one
+    // (`user_input_set_active`) and spawns an EL0 program that spins on SYS_INPUT_POLL until it sees the one
     // event the launcher injects. In QEMU raspi4b that is airtight — there is no USB HID, so the ONLY
     // producer is the kernel injection and the program drains it, reports, and exits 0. On metal with real
     // HID attached the premise collapses: live keyboard/pointer traffic is routed into the same ring before
@@ -12028,9 +13240,9 @@ fn input_launcher(_demo_cpu: usize) {
     let ttbr0 = super::boot::slot_ttbr0(slot);
     let asid = ttbr0 >> 48;
     install_console_cap(asid);
-    // ELF-5: register this process as the active input target BEFORE it runs, so `el0_input_enqueue` routes
+    // ELF-5: register this process as the active input target BEFORE it runs, so `user_input_enqueue` routes
     // to its ring (and resets the ring — a clean start).
-    el0_input_set_active(asid);
+    user_input_set_active(asid);
     let entry = base + (&raw const __input_prog as usize - bstart) as u64;
     let run_cpu = super::percpu::this_cpu().cpu_index as usize;
     super::sched::spawn_user_slot("el0-input", entry, sp, ttbr0, run_cpu);
@@ -12045,7 +13257,7 @@ fn input_launcher(_demo_cpu: usize) {
         super::sched::yield_now();
     }
     // Inject one KeyDown('A') through the REAL router seam — targets the active ASID (this program's ring).
-    let ok = el0_input_enqueue(crate::pal::Event::Key(b'A'));
+    let ok = user_input_enqueue(crate::pal::Event::Key(b'A'));
     INPUT_ENQUEUE_OK.store(ok, Ordering::Release);
     // Wait (bounded) for the program to drain the event and exit cleanly.
     while !INPUT_PARENT_DONE.load(Ordering::Acquire)
@@ -12054,14 +13266,14 @@ fn input_launcher(_demo_cpu: usize) {
         super::sched::yield_now();
     }
     // Clear the active designation (also cleared at slot teardown; explicit here for symmetry).
-    el0_input_set_active(0);
+    user_input_set_active(0);
 
     let obs0 = INPUT_OBS[0].load(Ordering::Acquire);
     let obs1 = INPUT_OBS[1].load(Ordering::Acquire);
     let obs2 = INPUT_OBS[2].load(Ordering::Acquire);
     let n = INPUT_OBS_N.load(Ordering::Acquire);
     let done = INPUT_PARENT_DONE.load(Ordering::Acquire);
-    let expected = (INPUT_EV_KEY_DOWN << 48) | (b'A' as u64);
+    let expected = una_abi::input_ev_pack(INPUT_EV_KEY_DOWN, b'A' as u64);
     let eagain = EAGAIN as u64; // -EAGAIN sign-extended to u64
     if done && ok && n == 3 && obs0 == eagain && obs1 == expected && obs2 == eagain {
         serial_println!(
@@ -12599,6 +13811,40 @@ fn wcb_launcher(_demo_cpu: usize) {
     // WC-I: the arc's rollup, last — it reports counters the two selftests above contribute to.
     #[cfg(feature = "witness")]
     crate::video::wm::wci_rollup();
+    // CLICK-ROUTE: the hit-test witness, AFTER the rollup — it mints two rows of its own, and the
+    // rollup reports counters those rows would otherwise perturb. Self-cleaning (closes its windows,
+    // restores SHELL_Z/FOCUS_ASID, repaints), so nothing after it sees a changed table.
+    #[cfg(feature = "witness")]
+    crate::video::wm::hittest_selftest();
+    // CTRLWIT: the control-cluster DECLINE witness, right after the hit-test battery — it is the
+    // same shape of fixture (mints synthetic rows, reaps them, restores the panel) and it must run
+    // after every per-window one-shot above has been claimed, or its three probe rows would burn
+    // latches the arc's real windows are owed. It re-pins its rows at scale 1 so its verdict is a
+    // property of the compositor and not of the panel it happens to be running on.
+    #[cfg(feature = "witness")]
+    crate::video::wm::ctrldecline_selftest();
+    // PAPER: the kit texture's determinism fixture, LAST — it neither mints a window nor reads the
+    // panel, so it perturbs nothing above it, and its only side effect is generating the one tile
+    // (which emits the unconditional `[paper]` wire line naming the checksum the verdict asserts).
+    #[cfg(feature = "witness")]
+    crate::video::paper::selftest();
+    // CERAMIC: the brushed-chrome material's determinism fixture, beside paper's and for the same
+    // reasons — it mints no window, reads no panel, and its only side effect is generating the one
+    // 512-byte row table (which emits the unconditional `[ceramic]` wire line naming the checksum
+    // the verdict asserts). Its leg 6 also times `shade`, the one operation the material adds to a
+    // composite, so the cost of chrome texturing is a number in every capture.
+    #[cfg(feature = "witness")]
+    crate::video::ceramic::selftest();
+    // KNURL: the control discs' crosshatch, LAST of the three materials and deliberately after
+    // both of the others — its leg 6 re-hashes paper's LIVE tile and ceramic's LIVE row table and
+    // asserts both still equal their own pinned constants, which is only a regression proof if
+    // both have already been generated by the two fixtures above. Mints no window, reads no panel;
+    // its only side effect is generating the one 64-byte tile (which emits the unconditional
+    // `[knurl]` wire line naming the checksum the verdict asserts). Leg 7 times `shade`, the one
+    // operation the material adds per disc pixel, so the cost of knurling is a number in every
+    // capture.
+    #[cfg(feature = "witness")]
+    crate::video::knurl::selftest();
 }
 
 // =============================================================================================
@@ -13332,7 +14578,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     // (the SYS_FB_* / SYS_FUTEX primitives it builds on are proven, and the futex pool is armed). Its own
     // uncounted `:: EXEC-UVUG: … ::` verdict; an honest skip without the fixture.
     uvug_witness(demo_cpu);
-    // ELF-5: input into EL0 — SYS_INPUT_POLL + the per-process ring + the `el0_input_enqueue` router seam.
+    // ELF-5: input into EL0 — SYS_INPUT_POLL + the per-process ring + the `user_input_enqueue` router seam.
     // A register-only EL0 program polls its ring empty (-EAGAIN), the launcher injects one KeyDown through
     // the real router seam, the program drains it (verifying the packed value) and polls empty again. In-RAM
     // (no disk), so it can never perturb the fixture battery; its own uncounted `:: EL0: input test — … ::`
@@ -13369,6 +14615,14 @@ pub fn u7_launcher(demo_cpu: usize) {
     // IMAGES, closing the "same 8.3 name = same principal" residual (the loader now mints IMAGE_SHA256). Its
     // own uncounted `:: IMG-SIG: … PASS ::` line; read-only, no disk write.
     image_sig_selftest();
+    // TERM_RING (MIDDEN_CONVERGENCE §3, M2): the terminal-output transport's own witness — the ring
+    // refuses exactly the records its drop-NEWEST bound says it must, hands the survivors back in
+    // order and byte-exact, seals an over-long record with the truncation mark, and accounts for
+    // every record under the tap conservation law. In-RAM (no disk, no card, no panel) and it holds
+    // the ring against foreign producers for its duration, so it can perturb nothing here; its own
+    // uncounted `:: TERMRING: … :: PASS ::` line.
+    #[cfg(feature = "witness")]
+    crate::termring::termring_selftest();
     // FATDIRS: exercise the new fat.rs directory create/remove seam (create_dir/remove_dir) on the live
     // volume — LAST in the chain (its disk I/O can never perturb the 23 fixtures or the witnesses), fully
     // self-cleaning. Its own uncounted `:: FATDIRS: … PASS ::` line. Unblocks JD7's Orin-panel mkdir/rmdir.
@@ -16806,7 +18060,7 @@ fn clock3_fat_launcher() {
 const K2_OWN_NAME: &str = "K2OWN.BIN"; // the owner program -> principal prog:K2OWN.BIN
 const K2_IMP_NAME: &str = "K2IMP.BIN"; // the impostor program -> principal prog:K2IMP.BIN
 const K2_PRIV_NAME: &str = "K2PRIV.BIN"; // the private file the owner creates at EL0
-const K2_EXIT_STATUS: u64 = 0x82; // both K2 programs' sentinel exit -> EL0_K2_DONE (distinct from 0x6D..0x81)
+use una_abi::EXIT_STATUS_K2 as K2_EXIT_STATUS; // both K2 programs' sentinel exit -> EL0_K2_DONE (distinct from 0x6D..0x81)
 const K2_OWN_WITNESS_ALL: u64 = 0x3; // owner: bit0 open admitted + bit1 owner write OK
 const K2_IMP_WITNESS_ALL: u64 = 0x1; // impostor: bit0 open denied (-EACCES)
 
@@ -17234,6 +18488,7 @@ fn u7_run(demo_cpu: usize) {
         proc_free(pi);
         return;
     };
+    let t_child_spawn = super::timer::cntpct(); // U7FIX: the child's park starts here
     let child_pid = super::sched::spawn_user_slot("el0-u7child", child.entry, child.sp, child.ttbr0, demo_cpu);
     // Publish the pid->ASID map (ASID first — the sys_spawn discipline — then the pid, the live key).
     PROCS[pi].asid.store(child.asid, Ordering::Release);
@@ -17250,6 +18505,7 @@ fn u7_run(demo_cpu: usize) {
     serial_println!(
         ":: U7: cross-process transfer — inbox-mediated SYS_XFER/SYS_RECV + sender revoke (single-writer preserved) ::"
     );
+    let t_parent_spawn = super::timer::cntpct(); // U7FIX: the parent's park starts here
     super::sched::spawn_user_slot("el0-u7parent", parent.entry, parent.sp, parent.ttbr0, demo_cpu);
 
     // 4. The single-writer witness: t1 pending in the child's inbox + the child's row still untouched
@@ -17261,13 +18517,39 @@ fn u7_run(demo_cpu: usize) {
         })
     });
     let snap_ok = deposit_seen && handle_row_is_clear(child.asid);
+
+    // U7FIX: how long the child actually had to sit parked before we released it. On P63 this is the
+    // interval its budget had to outlast — and did not.
+    let child_wait = super::timer::cntpct().wrapping_sub(t_child_spawn);
+    // U7FIX ASSERTION: the child must STILL BE PARKED at the moment we release it. A fixture that gave up
+    // mid-park has already run its `SYS_EXIT`, so `EL0_U7_DONE` counts it — a non-zero reading here is a
+    // parked-out fixture and nothing else (neither U7 program can legitimately exit before its GO). This is
+    // the check whose absence made P63 a puzzle: the witness bitmask reported the *consequence* (`child=0x0`)
+    // and left the *cause* to be inferred, when the launcher was holding the one fact that names it.
+    let child_parked_out = EL0_U7_DONE.load(Ordering::Acquire);
     u7_release_go(child.slot);
 
     // 5. Use-then-revoke sequencing: wait for the child's first successful write through the cap, then
     //    let the parent revoke.
     let _ = wait_while_secs(5, || U7_CHILD_USED.load(Ordering::Acquire) == 0);
     let used = U7_CHILD_USED.load(Ordering::Acquire);
+    // U7FIX: the parent's park is the LONGER of the two — it spans everything above, including the child's
+    // whole spawn/RECV/write leg. Same assertion, same reasoning: the parent must still be parked here, and
+    // `EL0_U7_DONE` may legitimately have counted the CHILD by now, so the parent's parked-out test is
+    // "more than the child has exited". Both intervals are reported so a shrinking margin is visible on the
+    // bench BEFORE it becomes a cliff.
+    let parent_wait = super::timer::cntpct().wrapping_sub(t_parent_spawn);
+    let parent_parked_out = EL0_U7_DONE.load(Ordering::Acquire) > 1;
     u7_release_go(parent.slot);
+    let frq = super::timer::cntfrq().max(1);
+    serial_println!(
+        ":: [u7fix] park margin — child parked {}ms before GO (parked_out={}), parent parked {}ms before GO \
+         (parked_out={}); park primitive=SYS_SLEEP_MS budget=0x8000 ::",
+        child_wait / (frq / 1000).max(1),
+        child_parked_out,
+        parent_wait / (frq / 1000).max(1),
+        parent_parked_out
+    );
 
     // 6a. Wait (bounded) for both sentinel exits, then snapshot the witnesses.
     let _ = wait_while_secs(8, || EL0_U7_DONE.load(Ordering::Acquire) < 2);
@@ -18323,13 +19605,14 @@ fn u11defer_build(entry_sym: *const u8) -> Option<U7Fix> {
 /// the chain (all FAT copies) exactly once.
 ///
 ///   A creates+writes DEFER.BIN, reports A_OPENED
-///     -> release B's unlink
+///     -> MEASURE the chain head `f0` from the on-disk name (B has not unlinked yet), release B's unlink
 ///   B opens+unlinks (name gone -> a re-open is -ENOENT), reports B_UNLINKED
 ///     -> CHECKPOINT-1: name GONE on disk, chain (cluster `f0`) STILL allocated in all FAT copies -> release A's read
 ///   A seeks+reads its ORIGINAL bytes (the deferred chain is alive), reports A_READ
 ///     -> CHECKPOINT-2: chain still allocated -> release A's close
 ///   A closes (last ref: the deferred free runs) + double-close -> -EBADF; both exit
-///     -> CHECKPOINT-3: chain FREED in all FAT copies + re-allocatable (first-free == `f0`)
+///     -> CHECKPOINT-3: chain FREED in all FAT copies + the free-set rank is restored (first-free is `f0` again,
+///        or the cluster that was already lower than `f0` while the chain was live)
 ///
 /// PASS iff both witnesses full AND all three cues fired AND both exited AND no kill AND both rows torn down AND
 /// the three on-disk checkpoints hold. Runtime-created file (no arroyo plant); needs a fresh image (DEFER.BIN
@@ -18342,10 +19625,12 @@ fn u11defer_run(demo_cpu: usize) {
     if crate::drivers::block::info().is_none() {
         return; // no SD -> the fixtures cannot create/open disk files; skip silently
     }
-    // Pre-flight: require DEFER.BIN ABSENT (a stale copy would confound the on-disk checks), and snapshot the
-    // first-free cluster `f0` — A's grow-from-empty write allocates it (first-fit), so `f0` is DEFER.BIN's chain
-    // head, which the three checkpoints track (allocated -> allocated -> freed + re-allocatable).
-    let f0 = match crate::fs::fat::mount() {
+    // Pre-flight: require DEFER.BIN ABSENT (a stale copy would confound the on-disk checks) and the volume to
+    // have at least one free cluster (A's grow-from-empty write needs one). U11-MEASURE: the pre-flight
+    // first-free is NOT the chain head — predicting the head from a first-fit snapshot taken before the spawn
+    // is unsound (any other allocator running in that window moves the file elsewhere). The head is MEASURED
+    // from the on-disk name after A reports A_OPENED; see the capture below.
+    match crate::fs::fat::mount() {
         Ok(fs) => {
             if fs.find_in_root(U11DEFER_NAME).is_ok() {
                 serial_println!(
@@ -18353,16 +19638,13 @@ fn u11defer_run(demo_cpu: usize) {
                 );
                 return;
             }
-            match fs.first_free_cluster() {
-                Ok(c) => c,
-                Err(_) => {
-                    serial_println!(":: U11-defer: no free cluster pre-demo — defer demo skipped ::");
-                    return;
-                }
+            if fs.first_free_cluster().is_err() {
+                serial_println!(":: U11-defer: no free cluster pre-demo — defer demo skipped ::");
+                return;
             }
         }
         Err(_) => return, // unmountable -> skip silently
-    };
+    }
 
     // Build + spawn A, then B. A creates the file B unlinks, but B parks on its GO word until A has created it,
     // so the create-before-open ordering is enforced by the launcher (below), not by spawn order.
@@ -18386,7 +19668,30 @@ fn u11defer_run(demo_cpu: usize) {
         wait_while_secs(secs, || flag.load(Ordering::Acquire) == 0);
         flag.load(Ordering::Acquire) != 0
     };
-    // Fresh-mount FAT snapshot: is DEFER.BIN's chain head `f0` still allocated in ALL FAT copies (non-zero)?
+
+    // Edge 1: A runs immediately (no GO gate on its open). Wait for A_OPENED — A has now created DEFER.BIN AND
+    // completed the 16-byte grow-write, and `write_grow` publishes the new chain head into the directory entry
+    // as its LAST step, so the on-disk name already resolves to the real head.
+    let a_opened = wait_flag(&U11DEFER_A_OPENED_F, 5);
+
+    // U11-MEASURE: capture the chain head from the NAME rather than predicting it. This is the one window in
+    // which the name is guaranteed to resolve: A has published it (A_OPENED), and B is still parked on its
+    // unlink GO — the launcher has not released it yet (next statement), so no unlink can race this mount.
+    // `ff_busy` is the lowest free cluster in that SAME snapshot, i.e. while the chain is still allocated; it is
+    // what CHECKPOINT-3's rank check is measured against (see there).
+    let (f0, ff_busy, measured) = match crate::fs::fat::mount() {
+        Ok(fs) => match fs.find_located(U11DEFER_NAME) {
+            Ok((de, _, _)) => {
+                let head = de.first_cluster();
+                let ff = fs.first_free_cluster().unwrap_or(0);
+                (head, ff, head >= 2 && ff >= 2)
+            }
+            Err(_) => (0, 0, false),
+        },
+        Err(_) => (0, 0, false),
+    };
+
+    // Fresh-mount FAT snapshot: is DEFER.BIN's measured chain head `f0` still allocated in ALL FAT copies?
     let chain_allocated = || -> bool {
         match crate::fs::fat::mount() {
             Ok(fs) => {
@@ -18407,8 +19712,6 @@ fn u11defer_run(demo_cpu: usize) {
         }
     };
 
-    // Edge 1: A runs immediately (no GO gate on its open). Wait for A_OPENED, then release B's unlink.
-    let a_opened = wait_flag(&U11DEFER_A_OPENED_F, 5);
     u11defer_release_go(b.slot, 0x3000);
     // Edge 2: wait for B_UNLINKED; CHECKPOINT-1 — the NAME is gone on disk, but the chain is STILL allocated.
     let b_unlinked = wait_flag(&U11DEFER_B_UNLINKED_F, 5);
@@ -18441,8 +19744,15 @@ fn u11defer_run(demo_cpu: usize) {
         && handle_row_is_clear(a.asid)
         && handle_row_is_clear(b.asid);
 
-    // CHECKPOINT-3: A's last close ran the deferred free — `f0` is now free in ALL FAT copies and re-allocatable
-    // (the first-free cluster is `f0` again, since nothing below it was ever freed). The name was gone since B.
+    // CHECKPOINT-3: A's last close ran the deferred free — `f0` is now free in ALL FAT copies, and the free-set
+    // RANK is restored. U11-MEASURE: with `f0` measured rather than predicted, the old `first_free == f0` is no
+    // longer the right expectation — the head can legitimately sit above a cluster that was already free while
+    // the chain was live. The rank check is kept (it is what catches an OVER-free that dropped a cluster below
+    // the chain, and a free that never reached the FAT's low end at all), just stated against the measured pair:
+    // once `f0` rejoins the free set, the lowest free cluster must be exactly `min(ff_busy, f0)` — `ff_busy`
+    // when something below the head was already free, and `f0` itself when the volume was packed below it (the
+    // original assertion, recovered exactly).
+    let want_ff = if ff_busy < f0 { ff_busy } else { f0 };
     let (freed_c3, reusable_c3) = match crate::fs::fat::mount() {
         Ok(fs) => {
             let nf = fs.num_fats();
@@ -18455,12 +19765,13 @@ fn u11defer_run(demo_cpu: usize) {
                 }
                 f += 1;
             }
-            (freed, fs.first_free_cluster() == Ok(f0))
+            (freed, fs.first_free_cluster() == Ok(want_ff))
         }
         Err(_) => (false, false),
     };
 
-    let ok = a_opened
+    let ok = measured
+        && a_opened
         && b_unlinked
         && a_read
         && a_witness == U11DEFER_A_WITNESS_ALL
@@ -18479,7 +19790,11 @@ fn u11defer_run(demo_cpu: usize) {
         );
     } else {
         serial_println!(
-            ":: U11-defer: cross-process unlink-defers-free FAIL — a_w={:#x} b_w={:#x} opened={} unlinked={} read={} done={} killed={} cleared={} c1(gone={},alive={}) c2_alive={} c3(freed={},reuse={}) (want {:#x}/{:#x}/t/t/t/2/0/t/t/t/t/t/t) ::",
+            ":: U11-defer: cross-process unlink-defers-free FAIL — head={} ff_busy={} measured={} want_ff={} a_w={:#x} b_w={:#x} opened={} unlinked={} read={} done={} killed={} cleared={} c1(gone={},alive={}) c2_alive={} c3(freed={},reuse={}) (want {:#x}/{:#x}/t/t/t/2/0/t/t/t/t/t/t) ::",
+            f0,
+            ff_busy,
+            measured,
+            want_ff,
             a_witness,
             b_witness,
             a_opened,
@@ -18663,15 +19978,15 @@ fn u11reap_build(entry_sym: *const u8) -> Option<U7Fix> {
 /// `SYS_CLOSE`. The launcher re-mounts the FAT at THREE checkpoints:
 ///
 ///   A creates+writes DEFER2.BIN, reports A_OPENED
-///     -> release B's unlink
+///     -> MEASURE the chain head `f0` from the on-disk name (B has not unlinked yet), release B's unlink
 ///   B opens+unlinks (name gone -> a re-open is -ENOENT), reports B_UNLINKED
 ///     -> CHECKPOINT-1: name GONE on disk, chain (cluster `f0`) STILL allocated -> release A's read
 ///   A seeks+reads its ORIGINAL bytes (the deferred chain is alive), reports A_READ
 ///     -> CHECKPOINT-2: chain still allocated -> release A's EXIT GO
 ///   A exits WITHOUT closing (teardown queues the orphan); B exits
 ///     -> CHECKPOINT-3: bounded YIELD-poll of the FAT until the reaper has FREED the chain (all FAT copies) +
-///        it is re-allocatable (`first_free == f0`) — the yields cede this core to the co-located reaper, so
-///        the cooperative-QEMU drain is deterministic.
+///        the free-set rank is restored (`first_free == min(ff_busy, f0)`) — the yields cede this core to the
+///        co-located reaper, so the cooperative-QEMU drain is deterministic.
 ///
 /// PASS iff both witnesses full AND all three cues fired AND both exited AND no kill AND both rows torn down AND
 /// the three checkpoints hold. Runtime-created file (no arroyo plant); needs a fresh image (DEFER2.BIN absent
@@ -18685,10 +20000,12 @@ fn u11reap_run(demo_cpu: usize) {
     if crate::drivers::block::info().is_none() {
         return; // no SD -> the fixtures cannot create/open disk files; skip silently
     }
-    // Pre-flight: require DEFER2.BIN ABSENT (a stale copy would confound the on-disk checks), and snapshot the
-    // first-free cluster `f0` — A's grow-from-empty write allocates it (first-fit), so `f0` is DEFER2.BIN's
-    // chain head, which the checkpoints track (allocated -> allocated -> freed-by-reaper + re-allocatable).
-    let f0 = match crate::fs::fat::mount() {
+    // Pre-flight: require DEFER2.BIN ABSENT (a stale copy would confound the on-disk checks) and the volume to
+    // have at least one free cluster (A's grow-from-empty write needs one). U11-MEASURE: the pre-flight
+    // first-free is NOT the chain head — predicting the head from a first-fit snapshot taken before the spawn
+    // is unsound (any other allocator running in that window moves the file elsewhere). The head is MEASURED
+    // from the on-disk name after A reports A_OPENED; see the capture below.
+    match crate::fs::fat::mount() {
         Ok(fs) => {
             if fs.find_in_root(U11REAP_NAME).is_ok() {
                 serial_println!(
@@ -18696,16 +20013,13 @@ fn u11reap_run(demo_cpu: usize) {
                 );
                 return;
             }
-            match fs.first_free_cluster() {
-                Ok(c) => c,
-                Err(_) => {
-                    serial_println!(":: U11-reap: no free cluster pre-demo — reaper demo skipped ::");
-                    return;
-                }
+            if fs.first_free_cluster().is_err() {
+                serial_println!(":: U11-reap: no free cluster pre-demo — reaper demo skipped ::");
+                return;
             }
         }
         Err(_) => return, // unmountable -> skip silently
-    };
+    }
 
     // Build + spawn A, then B (B parks on its GO until A has created the file, like u11defer).
     let Some(a) = u11reap_build(&raw const __u11reap_prog_a) else {
@@ -18727,7 +20041,30 @@ fn u11reap_run(demo_cpu: usize) {
         wait_while_secs(secs, || flag.load(Ordering::Acquire) == 0);
         flag.load(Ordering::Acquire) != 0
     };
-    // Fresh-mount FAT snapshot: is DEFER2.BIN's chain head `f0` still allocated in ALL FAT copies (non-zero)?
+
+    // Edge 1: A runs immediately (no GO gate on its open). Wait for A_OPENED — A has now created DEFER2.BIN AND
+    // completed the 16-byte grow-write, and `write_grow` publishes the new chain head into the directory entry
+    // as its LAST step, so the on-disk name already resolves to the real head.
+    let a_opened = wait_flag(&U11REAP_A_OPENED_F, 5);
+
+    // U11-MEASURE: capture the chain head from the NAME rather than predicting it. This is the one window in
+    // which the name is guaranteed to resolve: A has published it (A_OPENED), and B is still parked on its
+    // unlink GO — the launcher has not released it yet (next statement), so no unlink can race this mount.
+    // `ff_busy` is the lowest free cluster in that SAME snapshot, i.e. while the chain is still allocated; it is
+    // what CHECKPOINT-3's rank check is measured against (see there).
+    let (f0, ff_busy, measured) = match crate::fs::fat::mount() {
+        Ok(fs) => match fs.find_located(U11REAP_NAME) {
+            Ok((de, _, _)) => {
+                let head = de.first_cluster();
+                let ff = fs.first_free_cluster().unwrap_or(0);
+                (head, ff, head >= 2 && ff >= 2)
+            }
+            Err(_) => (0, 0, false),
+        },
+        Err(_) => (0, 0, false),
+    };
+
+    // Fresh-mount FAT snapshot: is DEFER2.BIN's measured chain head `f0` still allocated in ALL FAT copies?
     let chain_allocated = || -> bool {
         match crate::fs::fat::mount() {
             Ok(fs) => {
@@ -18748,8 +20085,6 @@ fn u11reap_run(demo_cpu: usize) {
         }
     };
 
-    // Edge 1: A runs immediately (no GO gate on its open). Wait for A_OPENED, then release B's unlink.
-    let a_opened = wait_flag(&U11REAP_A_OPENED_F, 5);
     u11defer_release_go(b.slot, 0x3000);
     // Edge 2: wait for B_UNLINKED; CHECKPOINT-1 — the NAME is gone on disk, but the chain is STILL allocated.
     let b_unlinked = wait_flag(&U11REAP_B_UNLINKED_F, 5);
@@ -18783,9 +20118,13 @@ fn u11reap_run(demo_cpu: usize) {
         && handle_row_is_clear(b.asid);
 
     // CHECKPOINT-3: A exited WITHOUT closing -> its teardown queued `f0` to the reaper. Bounded YIELD-poll the
-    // FAT until the reaper has freed it (all FAT copies) AND it is re-allocatable (`first_free == f0`, since
-    // nothing below it was ever freed). The yields cede this core to the co-located reaper so the cooperative-
-    // QEMU drain is deterministic. Times out (still false) if the reaper never runs -> the verdict FAILs loudly.
+    // FAT until the reaper has freed it (all FAT copies) AND the free-set RANK is restored. U11-MEASURE: with
+    // `f0` measured rather than predicted, the rank expectation is `min(ff_busy, f0)`, not `f0` — the head can
+    // legitimately sit above a cluster that was already free while the chain was live. The check still catches
+    // an OVER-free that dropped a cluster below the chain, and collapses to the original `first_free == f0`
+    // whenever the volume was packed below the head. The yields cede this core to the co-located reaper so the
+    // cooperative-QEMU drain is deterministic. Times out (still false) if the reaper never runs -> FAILs loudly.
+    let want_ff = if ff_busy < f0 { ff_busy } else { f0 };
     let (freed_c3, reusable_c3) = {
         let dstart = super::timer::cntpct();
         let ddeadline = 5 * super::timer::cntfrq();
@@ -18802,7 +20141,7 @@ fn u11reap_run(demo_cpu: usize) {
                         }
                         f += 1;
                     }
-                    (freed, fs.first_free_cluster() == Ok(f0))
+                    (freed, fs.first_free_cluster() == Ok(want_ff))
                 }
                 Err(_) => (false, false),
             };
@@ -18816,7 +20155,8 @@ fn u11reap_run(demo_cpu: usize) {
         }
     };
 
-    let ok = a_opened
+    let ok = measured
+        && a_opened
         && b_unlinked
         && a_read
         && a_witness == U11REAP_A_WITNESS_ALL
@@ -18835,7 +20175,11 @@ fn u11reap_run(demo_cpu: usize) {
         );
     } else {
         serial_println!(
-            ":: U11-reap: teardown-last-close reaper FAIL — a_w={:#x} b_w={:#x} opened={} unlinked={} read={} done={} killed={} cleared={} c1(gone={},alive={}) c2_alive={} c3(freed={},reuse={}) (want {:#x}/{:#x}/t/t/t/2/0/t/t/t/t/t/t) ::",
+            ":: U11-reap: teardown-last-close reaper FAIL — head={} ff_busy={} measured={} want_ff={} a_w={:#x} b_w={:#x} opened={} unlinked={} read={} done={} killed={} cleared={} c1(gone={},alive={}) c2_alive={} c3(freed={},reuse={}) (want {:#x}/{:#x}/t/t/t/2/0/t/t/t/t/t/t) ::",
+            f0,
+            ff_busy,
+            measured,
+            want_ff,
             a_witness,
             b_witness,
             a_opened,
@@ -19309,6 +20653,7 @@ fn bus_ls(text: &mut alloc::vec::Vec<u8>) -> i64 {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(crate::fs::fat::FatError::Busy) => return EAGAIN, // WEDGE-8: driver loan busy — retryable, nothing mutated
         Err(_) => return EIO,
     };
     let entries = match fs.read_root() {
@@ -19357,6 +20702,7 @@ fn bus_cat(asid: u64, agen: u64, ppid: PrincipalRecord, name: &str, text: &mut a
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(crate::fs::fat::FatError::Busy) => return EAGAIN, // WEDGE-8: driver loan busy — retryable, nothing mutated
         Err(_) => return EIO,
     };
     let ns = ns_lock();
@@ -19399,6 +20745,7 @@ fn bus_cp(asid: u64, agen: u64, ppid: PrincipalRecord, src: &str, dst: &str) -> 
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(crate::fs::fat::FatError::Busy) => return EAGAIN, // WEDGE-8: driver loan busy — retryable, nothing mutated
         Err(_) => return EIO,
     };
     let ns = ns_lock();
@@ -19495,6 +20842,7 @@ fn bus_write(asid: u64, agen: u64, ppid: PrincipalRecord, name: &str, content: &
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(crate::fs::fat::FatError::Busy) => return EAGAIN, // WEDGE-8: driver loan busy — retryable, nothing mutated
         Err(_) => return EIO,
     };
     // Existence check (advisory — re-verified under the ns hold below before any mutation).
@@ -19618,6 +20966,7 @@ fn bus_rm(asid: u64, agen: u64, ppid: PrincipalRecord, name: &str) -> i64 {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(crate::fs::fat::FatError::Busy) => return EAGAIN, // WEDGE-8: driver loan busy — retryable, nothing mutated
         Err(_) => return EIO,
     };
     // Locate + authorize under the ns hold (coherent), then DROP it for the durable clear (which
@@ -19684,6 +21033,7 @@ fn bus_mv(asid: u64, agen: u64, ppid: PrincipalRecord, src: &str, dst: &str) -> 
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
+        Err(crate::fs::fat::FatError::Busy) => return EAGAIN, // WEDGE-8: driver loan busy — retryable, nothing mutated
         Err(_) => return EIO,
     };
     let ns = ns_lock();
@@ -20140,7 +21490,7 @@ fn bandy_grant_check() {
 // -----------------------------------------------------------------------------------------------
 
 const MIDDEN_NAME: &str = "MIDDEN.BIN";
-const MIDDEN_EXIT_STATUS: u64 = 0xB5; // midden's sentinel exit -> EL0_MIDDEN_DONE
+use una_abi::EXIT_STATUS_MIDDEN as MIDDEN_EXIT_STATUS; // midden's sentinel exit -> EL0_MIDDEN_DONE
 const MIDTXT_NAME: &str = "MIDTXT.TXT";
 const MIDCPY_NAME: &str = "MIDCPY.TXT";
 const BUSPRIV_NAME: &str = "BUSPRIV.BIN";

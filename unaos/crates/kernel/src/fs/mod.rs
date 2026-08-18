@@ -24,6 +24,14 @@
 //! `UNAFS.ATR` sidecar is retired; a fixed two-mount dispatch {FAT, UnaFS}, no VFS).
 
 pub mod fat;
+
+/// SDHC-4c (x86, `sdhcblk` knob): the WRITE PERMIT for the internal SD card — one published,
+/// immutable LBA interval, and the single decision point every FAT-layer write to that card passes
+/// through. Kept in its own file rather than inside `fat.rs` because it is the whole safety
+/// argument of the arc and has to be readable end-to-end in one sitting.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+pub mod sdhc4c;
+
 #[cfg(target_arch = "aarch64")]
 pub mod unafs;
 

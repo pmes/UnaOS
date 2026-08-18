@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use blake3::Hasher;
 use elessar::{Context as ElessarContext, Spline};
 use ignore::WalkBuilder;

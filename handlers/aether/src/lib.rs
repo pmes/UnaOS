@@ -1,0 +1,696 @@
+
+pub mod net;
+pub mod dom;
+pub mod layout;
+pub mod render;
+pub mod js;
+pub mod images;
+pub mod forms;
+pub mod css;
+
+pub mod headless;
+pub mod ledger;
+pub mod storage;
+pub mod workers;
+pub mod event_loop;
+pub mod fonts;
+pub mod api;
+
+#[cfg(test)]
+mod engine_tests;
+pub struct AetherEngine {
+    pub document: Option<kuchiki::NodeRef>,
+    pub layout_tree: Option<layout::LayoutTree>,
+    pub js_engine: Option<js::Engine>,
+    pub needs_repaint: bool,
+    pub damage_rects: Vec<(u32, u32, u32, u32)>, // x, y, w, h
+    pub scroll_x: f64,
+    pub scroll_y: f64,
+    pub history: Vec<String>,
+    pub history_idx: usize,
+    pub width: u32,
+    pub height: u32,
+    pub title: String,
+    pub focused_node: Option<kuchiki::NodeRef>,
+    pub surface: Vec<u8>,
+    /// All stylesheet text applied to the current document (document
+    /// <style> blocks + external sheets), kept for script-driven relayout.
+    pub stylesheets: Vec<String>,
+    /// Play request staged by a media-element click: (url, title, mime).
+    pending_media: Option<(String, String, String)>,
+    /// Navigation staged by a link click or form submit. The SHELL performs
+    /// it asynchronously: the engine thread runs a current-thread runtime,
+    /// where tokio::task::block_in_place panics — the old inline block here
+    /// killed the engine thread on the first link click.
+    pending_nav: Option<forms::OpenDocument>,
+}
+
+impl AetherEngine {
+    pub fn new() -> Self {
+        Self {
+            document: None,
+            layout_tree: None,
+            js_engine: None,
+            needs_repaint: false,
+            damage_rects: Vec::new(),
+            scroll_x: 0.0,
+            scroll_y: 0.0,
+            history: Vec::new(),
+            history_idx: 0,
+            width: 800,
+            height: 600,
+            title: "Aether Browser".to_string(),
+            focused_node: None,
+            surface: vec![255; 800 * 600 * 4],
+            stylesheets: Vec::new(),
+            pending_media: None,
+            pending_nav: None,
+        }
+    }
+
+    /// Rebuilds layout from the (possibly script-mutated) DOM and re-applies
+    /// the page's stylesheets. The M3 mutation→relayout half-loop.
+    pub fn relayout(&mut self) {
+        let Some(document) = self.document.clone() else { return };
+        let mut layout_tree = layout::build_tree(&document, self.width as f32, self.height as f32);
+        css::apply_stylesheets(&mut layout_tree, &self.stylesheets);
+        self.layout_tree = Some(layout_tree);
+        self.needs_repaint = true;
+        self.damage_rects.push((0, 0, self.width, self.height));
+    }
+
+    pub fn surface(&self) -> &[u8] {
+        &self.surface
+    }
+
+    /// One turn of the event loop: fire the timers due right now, then settle
+    /// the microtasks they queued.
+    ///
+    /// Both halves are bounded by construction (see `event_loop`): the due set
+    /// is snapshotted before any callback runs, so a callback that re-arms
+    /// itself waits for the NEXT tick, and the job drain has a ceiling. A tick
+    /// therefore always returns — which is the whole point, since the shell's
+    /// `select!` loop cannot service navigation while it is inside one.
+    pub fn tick(&mut self) -> bool {
+        if let Some(js) = &mut self.js_engine {
+            event_loop::fire_due_timers(&mut js.context);
+            let _ = js.context.run_jobs();
+        }
+        if js::take_mutated() {
+            self.relayout();
+        }
+
+        let needs_repaint = self.needs_repaint;
+        self.needs_repaint = false;
+        needs_repaint
+    }
+    
+    fn hit_test(&self, x: f64, y: f64) -> Option<kuchiki::NodeRef> {
+        let layout = self.layout_tree.as_ref()?;
+        let abs_x = x + self.scroll_x;
+        let abs_y = y + self.scroll_y;
+        
+        let mut hit = None;
+        fn walk(
+            node_id: taffy::prelude::NodeId, 
+            cx: f32, 
+            cy: f32, 
+            abs_x: f64, 
+            abs_y: f64, 
+            layout: &layout::LayoutTree,
+            hit: &mut Option<kuchiki::NodeRef>
+        ) {
+            if let Ok(l) = layout.taffy.layout(node_id) {
+                let nx = cx + l.location.x;
+                let ny = cy + l.location.y;
+                let nw = l.size.width;
+                let nh = l.size.height;
+                
+                if abs_x >= nx as f64 && abs_x <= (nx + nw) as f64 &&
+                   abs_y >= ny as f64 && abs_y <= (ny + nh) as f64 {
+                    if let Some(dom_node) = layout.node_map.get(&node_id) {
+                        *hit = Some(dom_node.clone());
+                    }
+                }
+                
+                if let Ok(children) = layout.taffy.children(node_id) {
+                    for child in children {
+                        walk(child, nx, ny, abs_x, abs_y, layout, hit);
+                    }
+                }
+            }
+        }
+        
+        walk(layout.root_node, 0.0, 0.0, abs_x, abs_y, layout, &mut hit);
+        hit
+    }
+
+    pub fn handle_event(&mut self, event: api::events::Event) {
+        match event {
+            api::events::Event::Scroll(_dx, dy) => {
+                let old_sy = self.scroll_y;
+                // Clamp to the document: [0, content height - viewport].
+                let max_scroll = self
+                    .layout_tree
+                    .as_ref()
+                    .and_then(|t| t.taffy.layout(t.root_node).ok().map(|l| l.size.height))
+                    .map(|h| (h as f64 - self.height as f64).max(0.0))
+                    .unwrap_or(f64::MAX);
+                self.scroll_y = (self.scroll_y + dy).clamp(0.0, max_scroll);
+                // Integer shift must equal the difference of the TRUNCATED
+                // positions the renderer will actually paint at — deriving it
+                // from the fractional delta lets retained pixels drift against
+                // fresh paint under precise-trackpad deltas (duplicated lines
+                // a few px apart).
+                let idy = (self.scroll_y as i32) - (old_sy as i32);
+
+                if idy != 0 {
+                    let w = self.width as usize;
+                    let h = self.height as usize;
+                    
+                    if idy > 0 && idy < h as i32 {
+                        // Scrolling down, document moves up, shift pixels UP
+                        let shift = idy as usize * w * 4;
+                        self.surface.copy_within(shift.., 0);
+                        self.damage_rects.push((0, (h as i32 - idy) as u32, self.width, idy as u32));
+                    } else if idy < 0 && -idy < h as i32 {
+                        // Scrolling up, document moves down, shift pixels DOWN
+                        let shift = (-idy) as usize * w * 4;
+                        let src_len = (h - (-idy) as usize) * w * 4;
+                        self.surface.copy_within(0..src_len, shift);
+                        self.damage_rects.push((0, 0, self.width, (-idy) as u32));
+                    } else {
+                        self.damage_rects.push((0, 0, self.width, self.height));
+                    }
+                    self.needs_repaint = true;
+                }
+            }
+            api::events::Event::Resize(w, h) => {
+                self.width = w;
+                self.height = h;
+                self.surface = vec![255; (w * h * 4) as usize];
+                // Real reflow: media queries and wrap widths depend on the
+                // viewport, so relayout — not just repaint.
+                self.relayout();
+            }
+            api::events::Event::Text(text) => {
+                if let Some(node) = &self.focused_node {
+                    if let Some(el) = node.as_element() {
+                        if &*el.name.local == "input" {
+                            let mut attrs = el.attributes.borrow_mut();
+                            let mut val = attrs.get("value").unwrap_or("").to_string();
+                            val.push_str(&text);
+                            attrs.insert("value", val);
+                            self.needs_repaint = true;
+                            // Approximate field damage rect: push full for now, layout mapping is needed
+                            self.damage_rects.push((0, 0, self.width, self.height));
+                        }
+                    }
+                }
+            }
+            api::events::Event::KeyDown(key) => {
+                let focused = self.focused_node.clone();
+                if let Some(node) = focused.as_ref() {
+                    if let Some(el) = node.as_element() {
+                        if &*el.name.local == "input" {
+                            if key == "BackSpace" {
+                                let mut attrs = el.attributes.borrow_mut();
+                                let mut val = attrs.get("value").unwrap_or("").to_string();
+                                val.pop();
+                                attrs.insert("value", val);
+                                self.needs_repaint = true;
+                                self.damage_rects.push((0, 0, self.width, self.height));
+                            } else if key == "Return" {
+                                if let Some(doc_req) = self.build_form_submission(node) {
+                                    self.pending_nav = Some(doc_req);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            api::events::Event::MouseMove(_x, _y) => {}
+            api::events::Event::MouseDown(_x, _y) => {}
+            api::events::Event::MouseUp(x, y) => {
+                if let Some(node) = self.hit_test(x, y) {
+                    // Script click handlers run first (bubbling); a handled
+                    // click still follows links, matching default behavior.
+                    if let Some(js_engine) = &mut self.js_engine {
+                        if js::dispatch_event(&mut js_engine.context, &node, "click") {
+                            self.relayout();
+                        }
+                    }
+                    // A click on (or inside) a media element is a play
+                    // request: stage the resolved stream for the shell to
+                    // hand to Stria (PlayMedia passthrough, no site code).
+                    let mut cur = Some(node.clone());
+                    while let Some(n) = cur {
+                        if let Some(el) = n.as_element() {
+                            let tag = el.name.local.as_ref();
+                            if tag == "video" || tag == "audio" {
+                                if let Some((src, mime)) = self.media_source_for(&n) {
+                                    self.pending_media = Some((src, self.title.clone(), mime));
+                                }
+                                break;
+                            }
+                        }
+                        cur = n.parent();
+                    }
+                    // The hit is the DEEPEST box — usually the text run
+                    // inside the link — so walk ancestors for the <a>.
+                    let mut cur = Some(node.clone());
+                    while let Some(n) = cur {
+                        if let Some(el) = n.as_element() {
+                            match el.name.local.as_ref() {
+                                "a" => {
+                                    if let Some(href) = el.attributes.borrow().get("href") {
+                                        let base = self.history.get(self.history_idx).cloned().unwrap_or_default();
+                                        let url = images::resolve(&base, href);
+                                        self.pending_nav = Some(forms::OpenDocument {
+                                            url,
+                                            method: forms::HttpMethod::Get,
+                                            body: None,
+                                        });
+                                    }
+                                    break;
+                                }
+                                "input" | "textarea" | "select" => {
+                                    self.focused_node = Some(n.clone());
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                        cur = n.parent();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Builds a form submission from the focused control's enclosing <form>:
+    /// collects named inputs, resolves the action against the current page.
+    fn build_form_submission(&self, control: &kuchiki::NodeRef) -> Option<forms::OpenDocument> {
+        // Walk up to the enclosing form.
+        let mut cur = Some(control.clone());
+        let form_node = loop {
+            let n = cur?;
+            if let Some(el) = n.as_element() {
+                if &*el.name.local == "form" {
+                    break n;
+                }
+            }
+            cur = n.parent();
+        };
+
+        let form_el = form_node.as_element()?;
+        let attrs = form_el.attributes.borrow();
+        let action = attrs.get("action").unwrap_or("").to_string();
+        let method = if attrs.get("method").map(|m| m.eq_ignore_ascii_case("post")).unwrap_or(false) {
+            forms::HttpMethod::Post
+        } else {
+            forms::HttpMethod::Get
+        };
+        drop(attrs);
+
+        // Resolve action against the current page URL.
+        let base = self.history.get(self.history_idx).cloned().unwrap_or_default();
+        let resolved = if action.is_empty() {
+            base.clone()
+        } else {
+            url::Url::parse(&base)
+                .and_then(|b| b.join(&action))
+                .map(|u| u.to_string())
+                .unwrap_or(action)
+        };
+
+        let mut form = forms::Form::new(resolved, method);
+        if let Ok(inputs) = form_node.select("input, textarea, select") {
+            for input in inputs {
+                let attrs = input.attributes.borrow();
+                let Some(name) = attrs.get("name") else { continue };
+                let value = attrs.get("value").unwrap_or("").to_string();
+                form.add_input(name.to_string(), value);
+            }
+        }
+        Some(form.submit())
+    }
+
+    pub async fn go_back(&mut self) {
+        if let Some(url) = self.get_back_url() {
+            let _ = self.load_url_internal(&url, false).await;
+        }
+    }
+
+    pub fn get_back_url(&mut self) -> Option<String> {
+        if self.history_idx > 0 {
+            self.history_idx -= 1;
+            Some(self.history[self.history_idx].clone())
+        } else {
+            None
+        }
+    }
+
+    pub async fn go_forward(&mut self) {
+        if let Some(url) = self.get_forward_url() {
+            let _ = self.load_url_internal(&url, false).await;
+        }
+    }
+
+    pub fn get_forward_url(&mut self) -> Option<String> {
+        if self.history_idx + 1 < self.history.len() {
+            self.history_idx += 1;
+            Some(self.history[self.history_idx].clone())
+        } else {
+            None
+        }
+    }
+
+    #[deprecated(since = "0.1.0", note = "use aether::net::fetch_document and engine.load_html instead to prevent borrow panics")]
+    pub async fn load_url(&mut self, url: &str) -> anyhow::Result<()> {
+        self.load_url_internal(url, true).await
+    }
+
+    async fn load_url_internal(&mut self, url: &str, add_history: bool) -> anyhow::Result<()> {
+        let html = match net::fetch_document(url).await {
+            Ok(content) => content,
+            Err(e) => {
+                self.load_error_page(url, &e.to_string());
+                return Ok(());
+            }
+        };
+        self.load_html(url, &html, add_history);
+        Ok(())
+    }
+
+    pub fn load_error_page(&mut self, url: &str, error: &str) {
+        let html = format!(
+            "<html><head><title>Error</title></head><body style=\"background-color: #f8d7da; color: #721c24; padding: 20px; font-family: sans-serif;\"><h1>Navigation Error</h1><p>Failed to load {}: {}</p></body></html>",
+            url, error
+        );
+        self.load_html(url, &html, true);
+    }
+
+    pub fn load_html(&mut self, url: &str, html: &str, add_history: bool) {
+        self.load_html_styled(url, html, &[], add_history)
+    }
+
+    /// The staged navigation from the last link click / form submit, if
+    /// any. The shell consumes it and drives the async load.
+    pub fn take_pending_nav(&mut self) -> Option<forms::OpenDocument> {
+        self.pending_nav.take()
+    }
+
+    /// The staged play request from the last media-element click, if any.
+    /// The shell consumes this and fires SMessage::PlayMedia toward Stria.
+    pub fn take_pending_media(&mut self) -> Option<(String, String, String)> {
+        self.pending_media.take()
+    }
+
+    /// Resolves one media element's playable source: its own src, else the
+    /// first <source> child's. Returns (absolute url, mime).
+    fn media_source_for(&self, node: &kuchiki::NodeRef) -> Option<(String, String)> {
+        let base = self.history.get(self.history_idx).cloned().unwrap_or_default();
+        let pick = |el: &kuchiki::ElementData| -> Option<(String, String)> {
+            let attrs = el.attributes.borrow();
+            let src = attrs.get("src").filter(|s| !s.is_empty())?.to_string();
+            let abs = images::resolve(&base, &src);
+            let mime = attrs
+                .get("type")
+                .map(str::to_string)
+                .unwrap_or_else(|| Self::mime_for(&abs).to_string());
+            Some((abs, mime))
+        };
+        if let Some(el) = node.as_element() {
+            if let Some(found) = pick(el) {
+                return Some(found);
+            }
+        }
+        for child in node.children() {
+            if let Some(el) = child.as_element() {
+                if el.name.local.as_ref() == "source" {
+                    if let Some(found) = pick(el) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn mime_for(url: &str) -> &'static str {
+        match url.rsplit('.').next() {
+            Some("mp4") => "video/mp4",
+            Some("webm") => "video/webm",
+            Some("mp3") => "audio/mpeg",
+            Some("ogg") => "audio/ogg",
+            Some("wav") => "audio/wav",
+            _ => "application/octet-stream",
+        }
+    }
+
+    /// Media the current page references, ready to hand to Stria. We own the
+    /// browser and the OS, so a `<video>`/`<audio>` source the page already
+    /// resolved is ours to play — same passthrough as audio, no site-specific
+    /// resolver. Returns (absolute src, mime) for each playable element.
+    pub fn media_sources(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let Some(doc) = &self.document else { return out };
+        let base = self.history.get(self.history_idx).cloned().unwrap_or_default();
+        let Ok(media) = doc.select("video, audio, source") else { return out };
+        for el in media {
+            let attrs = el.attributes.borrow();
+            let Some(src) = attrs.get("src") else { continue };
+            if src.is_empty() {
+                continue;
+            }
+            let abs = images::resolve(&base, src);
+            let mime = attrs.get("type").map(str::to_string).unwrap_or_else(|| {
+                match abs.rsplit('.').next() {
+                    Some("mp4") => "video/mp4",
+                    Some("webm") => "video/webm",
+                    Some("mp3") => "audio/mpeg",
+                    Some("ogg") => "audio/ogg",
+                    Some("wav") => "audio/wav",
+                    _ => "application/octet-stream",
+                }
+                .to_string()
+            });
+            out.push((abs, mime));
+        }
+        out
+    }
+
+    /// Like `load_html`, with pre-fetched external stylesheets (see
+    /// `net::fetch_page`) applied after the document's own `<style>` blocks.
+    pub fn load_html_styled(&mut self, url: &str, html: &str, external_css: &[String], add_history: bool) {
+        self.load_impl(url, html, external_css, None, add_history);
+    }
+
+    /// Loads a fully fetched Page: installs its images and runs its scripts
+    /// (inline AND fetched external, in document order) — the charter path
+    /// for scripted sites: the page's own JS drives its state; no per-site
+    /// code anywhere.
+    pub fn load_page(&mut self, page: net::Page, add_history: bool) {
+        images::set_page(&page.base_url, page.images);
+        self.load_impl(
+            &page.base_url,
+            &page.html,
+            &page.sheets,
+            Some((&page.scripts, &page.script_nodes)),
+            add_history,
+        );
+    }
+
+    fn load_impl(
+        &mut self,
+        url: &str,
+        html: &str,
+        external_css: &[String],
+        scripts_override: Option<(&[String], &[usize])>,
+        add_history: bool,
+    ) {
+        let document = dom::parse_html(html);
+        
+        self.title = "Aether Browser".to_string();
+        if let Ok(mut titles) = document.select("title") {
+            if let Some(title_node) = titles.next() {
+                self.title = title_node.as_node().text_contents();
+            }
+        }
+        
+        if add_history {
+            // Drop any forward entries beyond the current position, then
+            // append. (Truncating AT the index wiped the current entry too —
+            // history never grew past one, so Back never had anywhere to go.)
+            if !self.history.is_empty() {
+                self.history.truncate(self.history_idx + 1);
+            }
+            self.history.push(url.to_string());
+            self.history_idx = self.history.len() - 1;
+        }
+        
+        let mut js_engine = js::Engine::new(document.clone());
+        js_engine.set_location(url);
+        // UNAOS_JSDEBUG=1: trace each script's index/head/outcome to stderr
+        // (which script kills a page's boot is otherwise invisible).
+        let js_debug = std::env::var("UNAOS_JSDEBUG").is_ok();
+        // UNAOS_JSDUMP=<dir>: write every script's full source to
+        // <dir>/script-<NNN>.js before running it. A minified bundle's text is
+        // otherwise unreachable from outside (inline scripts never hit the
+        // network, and the fetched ones are concatenated in document order),
+        // so the only way to read the expression a stack trace points at is to
+        // dump exactly what the engine was handed.
+        let js_dump = std::env::var("UNAOS_JSDUMP").ok();
+        // UNAOS_JSPRELUDE=<file>: evaluate a script of our own *before* the
+        // page's, in the same realm. `UNAOS_JSEVAL` only reaches post-boot
+        // state, which is useless when boot itself throws — a prelude can wrap
+        // a global a bundle is about to install and report what flowed through
+        // it. Diagnostic only; never set in normal operation.
+        if let Ok(path) = std::env::var("UNAOS_JSPRELUDE") {
+            match std::fs::read_to_string(&path) {
+                Ok(src) => {
+                    if let Err(e) = js_engine.execute(&src) {
+                        eprintln!("[jsprelude] ERR: {}", e);
+                    }
+                }
+                Err(e) => eprintln!("[jsprelude] cannot read {}: {}", path, e),
+            }
+        }
+        // The `<script>` elements of THIS parse, in document order. The
+        // fetched script list carries, per source text, the ordinal of the
+        // element it came from (the two lists are not aligned — non-JS
+        // types, the fetch cap and failed fetches all drop entries), so this
+        // is what gives `document.currentScript` a real element to report.
+        let script_elements: Vec<kuchiki::NodeRef> = document
+            .select("script")
+            .map(|m| m.map(|el| el.as_node().clone()).collect())
+            .unwrap_or_default();
+        match scripts_override {
+            Some((scripts, script_nodes)) => {
+                for (i, text) in scripts.iter().enumerate() {
+                    js::set_current_script(
+                        script_nodes.get(i).and_then(|o| script_elements.get(*o)).cloned(),
+                    );
+                    if let Some(dir) = &js_dump {
+                        let _ = std::fs::create_dir_all(dir);
+                        let _ = std::fs::write(format!("{}/script-{:03}.js", dir, i), text);
+                    }
+                    let head: String = text.chars().take(60).filter(|c| !c.is_control()).collect();
+                    match js_engine.execute(text) {
+                        Err(e) => {
+                            let msg = e.to_string();
+                            if js_debug {
+                                // Full message + stack: the ledger keeps a
+                                // 64-char digest, but a truncated stack names
+                                // no frames, which is the whole point here.
+                                eprintln!("[jsdebug] script {} ERR: {}\n  | head: {}", i, msg, head);
+                            }
+                            ledger::record_js(&format!("script-error:{}", &msg[..msg.len().min(64)]));
+                        }
+                        Ok(_) if js_debug => eprintln!("[jsdebug] script {} ok | head: {}", i, head),
+                        Ok(_) => {}
+                    }
+                }
+            }
+            None => {
+                for script_node in &script_elements {
+                    let text = script_node.text_contents();
+                    if !text.trim().is_empty() {
+                        js::set_current_script(Some(script_node.clone()));
+                        if let Err(e) = js_engine.execute(&text) {
+                            let msg = e.to_string();
+                            ledger::record_js(&format!("script-error:{}", &msg[..msg.len().min(64)]));
+                        }
+                    }
+                }
+            }
+        }
+        // Out of the script list: everything after this — lifecycle events,
+        // timer and rAF drains, promise jobs — must see currentScript null,
+        // which is what the spec requires of those contexts anyway.
+        js::set_current_script(None);
+
+        // Drain zero-delay boot timers, then fire queued rAF callbacks in
+        // bounded passes (framework render paths), then drain the promise
+        // work they spawned — all before first layout.
+        //
+        // `boot_drain` is the bounded form of what used to be a bare
+        // `run_jobs()`: a fixed number of passes, each advancing the timer
+        // clock one frame and firing only what is due, so a boot timer that
+        // re-arms itself costs N passes instead of the whole load.
+        event_loop::boot_drain(&mut js_engine.context);
+        // Lifecycle events pages gate init on, then the rAF passes, then
+        // the promise work all of it spawned. readyState advances with the
+        // events rather than sitting at one value, so the
+        // `readyState === 'loading' ? wait : run now` fork every bundle
+        // writes takes the branch it would take in a browser.
+        let _ = js_engine.execute("document.readyState = 'interactive';");
+        js::dispatch_event(&mut js_engine.context, &document, "readystatechange");
+        js::dispatch_event(&mut js_engine.context, &document, "DOMContentLoaded");
+        let _ = js_engine.execute("document.readyState = 'complete';");
+        js::dispatch_event(&mut js_engine.context, &document, "readystatechange");
+        js::dispatch_event(&mut js_engine.context, &document, "load");
+        event_loop::boot_drain(&mut js_engine.context);
+        js::drain_raf(&mut js_engine.context);
+        event_loop::boot_drain(&mut js_engine.context);
+
+        // UNAOS_JSEVAL=<expr>: evaluate one expression against the booted page
+        // and print its value. The post-boot DOM/JS state is otherwise opaque
+        // from outside; this is the probe for "did that global/class land?".
+        if let Ok(expr) = std::env::var("UNAOS_JSEVAL") {
+            match js_engine.execute(&expr) {
+                Ok(v) => {
+                    let s = v
+                        .to_string(&mut js_engine.context)
+                        .map(|s| s.to_std_string_escaped())
+                        .unwrap_or_else(|_| "<unprintable>".to_string());
+                    eprintln!("[jseval] {}", s);
+                }
+                Err(e) => eprintln!("[jseval] ERR: {}", e),
+            }
+        }
+
+        let mut sheets: Vec<String> = Vec::new();
+        if let Ok(styles) = document.select("style") {
+            for style_node in styles {
+                sheets.push(style_node.as_node().text_contents());
+            }
+        }
+        sheets.extend(external_css.iter().cloned());
+
+        let mut layout_tree = layout::build_tree(&document, self.width as f32, self.height as f32);
+        css::apply_stylesheets(&mut layout_tree, &sheets);
+        self.stylesheets = sheets;
+        
+        self.document = Some(document);
+        self.layout_tree = Some(layout_tree);
+        self.js_engine = Some(js_engine);
+        self.scroll_x = 0.0;
+        self.scroll_y = 0.0;
+        self.needs_repaint = true;
+        self.damage_rects.push((0, 0, self.width, self.height));
+    }
+
+    pub fn render_frame(&mut self) -> Vec<(u32, u32, u32, u32)> {
+        let damages = std::mem::take(&mut self.damage_rects);
+        
+        if let Some(layout) = &self.layout_tree {
+            render::render_frame(layout, &mut self.surface, self.width, self.height, self.scroll_x, self.scroll_y, &damages);
+        } else {
+            for chunk in self.surface.chunks_exact_mut(4) {
+                chunk[0] = 255;
+                chunk[1] = 255;
+                chunk[2] = 255;
+                chunk[3] = 255;
+            }
+        }
+        
+        if damages.is_empty() {
+            vec![(0, 0, self.width, self.height)]
+        } else {
+            damages
+        }
+    }
+}
+

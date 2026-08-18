@@ -4,14 +4,23 @@ pub mod gdt;
 pub mod interrupts;
 pub mod apic;
 pub mod acpi;
+pub mod acpi_power;
 pub mod percpu;
 pub mod smp;
 pub mod sched;
 pub mod syscall;
 pub mod pci;
 pub mod memory;
+/// WINX-2: the x86_64 ring-3 ELF64 loader (validation + `PT_LOAD` mapping with per-segment W^X).
+pub mod elf;
 
 pub fn init() {
+    // BPACE HPACE-1: `core-init d=` is the interval from the WC retype to here — on the current
+    // ordering that is the `WRITER` seed and its one line; if `set_framebuffer_wc` is ever hoisted
+    // ABOVE `fbcon::init` in `kernel_main`, the console's full-surface clear lands in this bucket
+    // instead of in `fb-wc`. Which bucket carries the big number therefore SAYS which ordering the
+    // build has, without anyone having to read the source. See bootpace.md §11.
+    crate::bootpace::record("core-init");
     gdt::init();
     interrupts::init_idt();
     // Pure local-APIC system: silence the legacy 8259 PIC, then software-enable the local
@@ -25,6 +34,35 @@ pub fn init() {
     // U1a: SYSCALL/SYSRET MSRs + NX/SMEP for the BSP. After gdt (STAR needs the selectors) and
     // percpu (GS base + KERNEL_GS_BASE); before `sti`.
     syscall::init();
+    // WXN-x86 M1: the PDPT-level NX sweep — the first NX bit this kernel puts in its own map. Sits
+    // HERE, and only here: after `syscall::init` because with EFER.NXE clear bit 63 is a RESERVED
+    // bit (setting it would fault the next translation of ANY kind, not just a fetch), and before
+    // `wx_audit_report` so the existing WXAUDIT census line IS the success signature rather than a
+    // stale "before" a reader has to reconcile with a second one. Before `wx_probe_report` too, so
+    // the WXPROBE `map:` lines are a post-sweep readback whose `e=` fields must be bit-identical to
+    // the pre-sweep capture (no leaf is written) while their folded `fx=` fields flip to 0 outside
+    // the spared GiBs (the parents did change). Needs no allocator — a PDPT-level sweep creates no
+    // tables — which is what lets it run this early, and interrupts are still masked.
+    memory::wxn_pdpt_sweep();
+    // WXAUDIT: audit the live map now that EFER.NXE and CR4.SMEP are set — before this point an NX
+    // bit in a PTE means nothing to the hardware, so an audit here would be reporting on a protection
+    // that is not yet armed. Read-only walk; publishes the negative control and the map's W^X census.
+    memory::wx_audit_report();
+    // WXPROBE: the read-only reconnaissance the WXN-x86 split is designed from — leaf level and raw
+    // bits at the six addresses the split must classify, the control registers that decide its flush
+    // and its NX semantics, and the kernel's own PT_LOAD layout via `__ehdr_start`. Sits here rather
+    // than anywhere else for the same reason the audit does (EFER.NXE/CR4.SMEP are armed, the heap
+    // is not yet created, interrupts are still masked) and directly after it so the census and the
+    // specific addresses land adjacent in one capture. Writes nothing.
+    memory::wx_probe_report();
+    // PFWIRE self-test (feature `pfwire_selftest`, `UNAOS_PFWIRE_SELFTEST=1`) — proves the CPL-0
+    // fault handlers drain their diagnostics to serial. It deliberately faults and HALTS the boot, so
+    // it fires here, still IF=0 with the IDT installed (the M3b fault window), and default-off it
+    // vanishes entirely. It diverges, so `sti` below is cfg'd out under it (never reached, no
+    // unreachable-code warning). See `serial::pfwire_selftest`.
+    #[cfg(feature = "pfwire_selftest")]
+    serial::pfwire_selftest();
+    #[cfg(not(feature = "pfwire_selftest"))]
     x86_64::instructions::interrupts::enable();
 }
 
@@ -118,9 +156,80 @@ pub fn hw_wait_budget() -> u64 {
     }
 }
 
+/// WEDGE-7 — the RAII form of [`without_interrupts`], for spans that cannot be expressed as a
+/// closure. Twin of the aarch64 `IrqMask`; same save/restore semantics, so an inner guard restores
+/// to "still masked" rather than unconditionally re-enabling. Needed because `video/wm.rs` compiles
+/// on both arches and must hold the mask exactly as long as a lock guard whose scope the caller
+/// owns (see `video::wm::table`).
+pub struct IrqMask {
+    /// Whether interrupts were enabled at `new()` — i.e. whether this guard owns the OUTERMOST
+    /// transition and must re-enable (and, under `rtwit`, time) on drop.
+    was_enabled: bool,
+    /// R0 / rtwit — TSC at the enabled→disabled transition, for the interrupt-mask span. Only present
+    /// when the ruler is armed; the struct is otherwise byte-identical to the old `IrqMask(bool)`.
+    #[cfg(feature = "rtwit")]
+    t0: u64,
+}
+
+/// WEDGE-8 (F3): true when interrupts are masked on this core (`RFLAGS.IF` clear). Twin of the
+/// aarch64 `irqs_masked`; the block layer uses it to refuse a masked wait on the xHCI loan.
+#[inline]
+pub fn irqs_masked() -> bool {
+    !x86_64::instructions::interrupts::are_enabled()
+}
+
+impl IrqMask {
+    #[inline]
+    pub fn new() -> Self {
+        let was_enabled = x86_64::instructions::interrupts::are_enabled();
+        x86_64::instructions::interrupts::disable();
+        IrqMask {
+            was_enabled,
+            // R0 / rtwit — stamp the transition only when WE are the outermost mask (interrupts were
+            // enabled); a nested mask reads `was_enabled == false` and its span is not timed.
+            #[cfg(feature = "rtwit")]
+            t0: now_cycles(),
+        }
+    }
+}
+
+impl Default for IrqMask {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for IrqMask {
+    #[inline]
+    fn drop(&mut self) {
+        if self.was_enabled {
+            // R0 / rtwit — fold the outermost mask span before re-enabling. Only the guard that
+            // masked from an enabled state times anything; nested guards restore to "still masked".
+            #[cfg(feature = "rtwit")]
+            crate::rtwit::note_mask_span(now_cycles().wrapping_sub(self.t0));
+            x86_64::instructions::interrupts::enable();
+        }
+    }
+}
+
 pub fn without_interrupts<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
 {
-    x86_64::instructions::interrupts::without_interrupts(f)
+    // R0 / rtwit — MAX interrupt-mask span. Rather than reimplement mask/run/restore (which would
+    // drop the crate's UNWIND-SAFE restore — a panic in `f` must not leave IF masked), the timed
+    // path reuses `IrqMask`: its `new()` masks and stamps the outermost transition, its `Drop`
+    // re-enables AND folds the span, and both happen via RAII so an unwinding `f` still restores and
+    // still times. Nesting-aware for free (a nested `IrqMask` finds IF already clear and times
+    // nothing). The knob-off path is the plain crate delegation, so a shipped boot is byte-identical.
+    #[cfg(feature = "rtwit")]
+    {
+        let _timed = IrqMask::new();
+        f()
+    }
+    #[cfg(not(feature = "rtwit"))]
+    {
+        x86_64::instructions::interrupts::without_interrupts(f)
+    }
 }

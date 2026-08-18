@@ -20,8 +20,11 @@
 // enters the copied image at offset 0.
 //
 // ABI (Linux-style, shared x86_64/aarch64 per the userspace docs): rax = syscall number, args in
-// rdi/rsi/rdx, return in rax. Syscalls used: SYS_WRITE = 1 (fd, buf, len), SYS_EXIT = 2 (status).
-// See arch/x86_64/syscall.rs.
+// rdi/rsi/rdx, return in rax. Syscalls used: SYS_WRITE (fd, buf, len), SYS_EXIT (status).
+//
+// ABIFREEZE: both numbers are `const` OPERANDS out of `una_abi` — the same declaration
+// `arch/x86_64/syscall.rs` dispatches from — rather than immediates typed into the asm string.
+// Byte-identical output, and the entry stays at offset 0 where the kernel enters the copied image.
 
 use core::arch::naked_asm;
 
@@ -36,12 +39,12 @@ use core::arch::naked_asm;
 #[unsafe(link_section = ".text.entry")]
 pub extern "C" fn _start() -> ! {
     naked_asm!(
-        "mov rax, 1",              // SYS_WRITE
+        "mov rax, {sys_write}",    // SYS_WRITE
         "mov rdi, 1",              // fd = 1 (stdout)
         "lea rsi, [rip + 3f]",     // buf -> the message's ring-3 VA at run time (RIP-relative)
         "mov rdx, [rip + 2f]",     // len (from the stored length word; RIP-relative)
         "syscall",
-        "mov rax, 2",              // SYS_EXIT
+        "mov rax, {sys_exit}",     // SYS_EXIT
         "mov rdi, 0",              // status = 0
         "syscall",
         "1: jmp 1b",               // sys_exit never returns; spin as a belt-and-braces guard
@@ -49,6 +52,8 @@ pub extern "C" fn _start() -> ! {
         "2: .quad 4f - 3f",        // message length (assemble-time label difference)
         "3: .ascii \"hello from disk\\n\"",
         "4:",
+        sys_write = const una_abi::SYS_WRITE,
+        sys_exit = const una_abi::SYS_EXIT,
     );
 }
 

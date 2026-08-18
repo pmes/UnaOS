@@ -8,17 +8,21 @@ members = [
     "unaos/libs/fs/unafs",
     "libs/input/ibus",
     "unaos/libs/sys/helm",
+    "unaos/libs/sys/midden_core",
     "libs/pwm/pca9685",
     "libs/bandy",
     "libs/euclase",
     "handlers/vein",
     "handlers/matrix",
+    "handlers/comscan",
     "handlers/vaire",
     "handlers/aule",
     "handlers/tabula",
     "handlers/midden",
     "handlers/amber_bytes",
     "handlers/stria",
+    "handlers/aether",
+    "handlers/principia",
     # "handlers/vug",
     "tools/vertex",
     "tools/unafs",
@@ -29,7 +33,8 @@ members = [
     "vessels/phonolite",
     "vessels/facet",
     "vessels/una",
-    "libs/lux"
+    "libs/lux",
+    "vessels/aether-shell"
 ]
 
 # 🦅 MACH'S BRIDGE:
@@ -41,8 +46,25 @@ default-members = [
     "vessels/phonolite",
     "vessels/facet",
     "vessels/una",
+    "vessels/aether-shell",
     "tools/vertex",
     "tools/unafs",
     "tools/unafs_bench",
     "tools/sentinel"
 ]
+
+# Dev builds keep our crates debuggable but compile dependencies optimized —
+# selector matching / HTML parsing / rasterization live in deps, and a debug
+# cascade on a rule-heavy page (wikipedia) costs ~40s CPU without this.
+[profile.dev.package."*"]
+opt-level = 2
+
+# The browser's own hot loops (pixel blits, glyph rasterization, cascade)
+# live in these crates — run them optimized in dev too. Debugging them
+# means flipping these to 0 locally, not shipping a pokey browser daily.
+[profile.dev.package.aether]
+opt-level = 2
+[profile.dev.package.quartzite]
+opt-level = 2
+[profile.dev.package.aether-shell]
+opt-level = 2

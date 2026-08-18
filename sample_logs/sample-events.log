@@ -1,0 +1,75 @@
+2026-07-19T18:15:39Z OPEN /dev/cu.usbmodem143402 @ 115200 raw -> /Users/pmes/unaos-bench/capture/orin-r23s1/cu.usbmodem143402.log  [DebugProbe-CDC (Orin/Pi UART — identify by what is WIRED)]
+2026-07-19T18:15:39Z DISKS baseline: {"disk0": "2001.1 GB [EFI, Apple_APFS]"}
+2026-07-19T18:15:39Z DISK-POLL armed (⚠ flash-first/TCC hazard — see header)
+2026-07-19T18:15:39Z WATCH up: 1 port(s), session /Users/pmes/unaos-bench/capture/orin-r23s1
+2026-07-19T18:15:39Z MARK session-start
+2026-07-19T18:15:52Z MARK R23s1 boot1 ORIN O1+O2 — install-fix verify + NET-4c, media fe91119 20260719T1805Z
+2026-07-19T18:16:15Z OPEN /dev/cu.usbmodem143402 @ 115200 raw -> /Users/pmes/unaos-bench/capture/orin-r23s1/cu.usbmodem143402.log  [DebugProbe-CDC (Orin/Pi UART — identify by what is WIRED)]
+2026-07-19T18:16:15Z DISKS baseline: {"disk0": "2001.1 GB [EFI, Apple_APFS]"}
+2026-07-19T18:16:15Z DISK-POLL armed (⚠ flash-first/TCC hazard — see header)
+2026-07-19T18:16:15Z WATCH up: 1 port(s), session /Users/pmes/unaos-bench/capture/orin-r23s1
+2026-07-19T18:16:15Z MARK session-start
+2026-07-19T18:16:25Z MARK R23s1 boot1 ORIN O1+O2 — install-fix verify + NET-4c, media fe91119 20260719T1805Z (re-mark after watch restart)
+2026-07-19T18:27:29Z DISK-ATTACH /dev/disk2 32.5 GB [UNAOS-ORIN]
+2026-07-19T18:54:02Z MARK R23s1 boot2 ORIN — USB-FIX-2 warm-reset + NET-4d RX classifier, hw-jetson 8d7b7bc 20260719T1853Z
+2026-07-19T18:54:04Z DISK-DETACH /dev/disk2
+2026-07-19T18:59:21Z DISK-ATTACH /dev/disk2 32.5 GB [UNAOS-ORIN]
+2026-07-19T19:14:07Z DISK-DETACH /dev/disk2
+2026-07-19T19:14:12Z MARK R23s1 boot3 ORIN — NET-4e RX barrier + USB-FIX-3 link-train wait, hw-jetson 5fc0d9e 20260719T1914Z
+2026-07-19T19:36:11Z DISK-ATTACH /dev/disk2 32.5 GB [UNAOS-ORIN]
+2026-07-19T19:37:14Z MARK R23s1 boot4 ORIN — USB-FIX-4 hub-configure + NET-4f cache maintenance, hw-jetson 068f86d
+2026-07-19T19:37:16Z DISK-DETACH /dev/disk2
+2026-07-19T19:45:18Z DISK-ATTACH /dev/disk2 32.5 GB [UNAOS-ORIN]
+2026-07-19T19:54:35Z DISK-DETACH /dev/disk2
+2026-07-19T19:54:41Z MARK R23s1 boot5 ORIN — USB-FIX-5 SET_HUB_DEPTH + VUG-RAS heap-guard, hw-jetson c5aaba1
+2026-07-19T19:59:33Z DISK-ATTACH /dev/disk2 32.5 GB [UNAOS-ORIN]
+2026-07-19T20:32:12Z DISK-DETACH /dev/disk2
+2026-07-19T20:32:18Z MARK R23s1 boot6 ORIN — RAS-2 high heap + net4g dump + SCHED-BAL + SMP-RUN + JD20 pointer, hw-jetson 9f32810
+2026-07-19T20:42:09Z DISK-ATTACH /dev/disk2 32.5 GB [UNAOS-ORIN]
+2026-07-19T20:43:02Z DISK-DETACH /dev/disk2
+2026-07-19T20:43:02Z MARK R23s1 boot7 ORIN ⚠ARMED INSTALL-2 — self-clone to seated microSD, hw-jetson 9f32810, Peter's explicit go
+2026-07-19T20:45:04Z MARK R23s1 boot8 ORIN — CLONED-CARD BOOT ATTEMPT (microSD self-install, stick removed)
+2026-07-19T20:49:51Z DISK-ATTACH /dev/disk2 32.5 GB [UNAOS-ORIN]
+2026-07-19T20:51:09Z MARK R23s1 boot9 ORIN — NET-4h inbound iATU + P7 release, hw-jetson 2c9955c (stick boot)
+2026-07-19T20:51:11Z DISK-DETACH /dev/disk2
+2026-07-19T20:55:21Z DISK-ATTACH /dev/disk2 32.5 GB [UNAOS-ORIN]
+2026-07-19T21:01:08Z MARK R23s1 boot10 ORIN ⚠ARMED re-clone (fresh go) — 9546d73a: iATU+P7+JD20-coalesce onto microSD
+2026-07-19T21:01:09Z DISK-DETACH /dev/disk2
+2026-07-19T21:36:24Z DISK-ATTACH /dev/disk2 32.5 GB [UNAOS-ORIN]
+2026-07-19T21:36:38Z MARK R23s1 boot11 ORIN — net4i SMMU + burst + multi-HID/SET_IDLE + install-filter, hw-jetson 2949a796
+2026-07-19T21:36:39Z DISK-DETACH /dev/disk2
+2026-07-19T21:48:21Z MARK session-end
+2026-07-19T21:48:21Z WATCH down
+2026-07-19T22:17:14Z OPEN /dev/cu.usbmodem143402 @ 115200 raw -> /Users/pmes/unaos-bench/capture/orin-r23s1/cu.usbmodem143402.log  [DebugProbe-CDC (Orin/Pi UART — identify by what is WIRED)]
+2026-07-19T22:17:14Z DISKS baseline: {"disk0": "2001.1 GB [EFI, Apple_APFS]", "disk2": "32.5 GB [UNAOS-ORIN]"}
+2026-07-19T22:17:14Z DISK-POLL armed (⚠ flash-first/TCC hazard — see header)
+2026-07-19T22:17:14Z WATCH up: 1 port(s), session /Users/pmes/unaos-bench/capture/orin-r23s1
+2026-07-19T22:17:14Z MARK session-start
+2026-07-19T22:29:39Z MARK MARK R23s1 boot12 ORIN — SCHED-BURST-FIX + NET-4j gate + DMA-WINDOW + JC3 AP-tick/SGI-affinity, hw-jetson b364c788
+2026-07-19T22:29:39Z DISK-DETACH /dev/disk2
+2026-07-19T23:04:26Z DISK-ATTACH /dev/disk2 32.5 GB [UNAOS-ORIN]
+2026-07-19T23:04:38Z DISK-DETACH /dev/disk2
+2026-07-19T23:04:43Z MARK MARK R23s1 boot13 ORIN — boot12 payload + HID-REGRESS-B12 WFI-park fix, hw-jetson 46760e41
+2026-07-20T01:07:44Z DISK-ATTACH /dev/disk2 32.5 GB [UNAOS-ORIN]
+2026-07-20T01:08:37Z MARK MARK R23s1 boot14 ORIN — NET-4k TX-witness + SIMMER, hw-jetson 11d23a64
+2026-07-20T01:08:37Z DISK-DETACH /dev/disk2
+2026-07-20T01:10:33Z DISK-ATTACH /dev/disk2 32.5 GB [UNAOS-ORIN]
+2026-07-20T01:10:55Z DISK-DETACH /dev/disk2
+2026-07-20T01:31:20Z DISK-ATTACH /dev/disk2 32.5 GB [UNAOS-ORIN]
+2026-07-20T01:32:26Z MARK MARK R23s1 boot15 ORIN — NET-4l RX OWN-last (lease?) + VUG-RAS-LOCALIZER armed, hw-jetson 8088b2ef
+2026-07-20T01:32:29Z DISK-DETACH /dev/disk2
+2026-07-20T01:59:08Z DISK-ATTACH /dev/disk2 32.5 GB [UNAOS-ORIN]
+2026-07-20T01:59:24Z MARK MARK R23s1 boot16 ORIN — DIAGNOSTIC: NET-4m discriminator + span-B-bounded localizer, hw-jetson 9177a719
+2026-07-20T01:59:27Z DISK-DETACH /dev/disk2
+2026-07-20T02:37:30Z DISK-ATTACH /dev/disk2 32.5 GB [UNAOS-ORIN]
+2026-07-20T02:38:12Z MARK MARK R23s1 boot17 ORIN — NET-4n PCIDAC 64-bit DMA (LEASE?), hw-jetson a6839dfc
+2026-07-20T02:38:12Z DISK-DETACH /dev/disk2
+2026-07-20T02:52:06Z DISK-ATTACH /dev/disk2 32.5 GB [UNAOS-ORIN]
+2026-07-20T02:53:02Z MARK MARK R23s1 boot18 ORIN — NET-4n2 PCIDAC final-write (LEASE?), hw-jetson cd17dc95
+2026-07-20T02:53:05Z DISK-DETACH /dev/disk2
+2026-07-20T03:16:47Z DISK-ATTACH /dev/disk2 32.5 GB [UNAOS-ORIN]
+2026-07-20T03:19:18Z MARK MARK R23s1 boot19 ORIN — NET-4o arena (LEASE?) + XCARVE-SNOC heap-move (no SNOC RAS?), hw-jetson 425090fd
+2026-07-20T03:19:19Z DISK-DETACH /dev/disk2
+2026-07-20T03:48:02Z DISK-ATTACH /dev/disk2 32.5 GB [UNAOS-ORIN]
+2026-07-20T03:48:27Z MARK MARK R23s1 boot20 ORIN — NET-4p iATU-alias (LEASE?) + XCARVE clean, hw-jetson 4d8f2a54
+2026-07-20T03:48:27Z DISK-DETACH /dev/disk2

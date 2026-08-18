@@ -159,7 +159,7 @@ pub trait GneissPal {
 // Now every screen-owning loop shares this position and draws the same metrics-scaled arrow.
 pub mod cursor {
     use super::GneissPal;
-    use core::sync::atomic::{AtomicU64, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use spin::Mutex;
 
     /// 8×8 arrow mask, MSB = leftmost pixel.
@@ -180,6 +180,72 @@ pub mod cursor {
     /// console loop and the full-screen demos all move/draw the same cursor.
     static POS: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 
+    // --- CURSOR-X86 (metal defect fix: the pointer moved at PRESENT rate) ----------------------
+    //
+    // WHO OWNS THE POINTER'S PIXELS. Everything above this line is the pointer's *state* — position,
+    // activity clock, auto-hide — and that is arch-neutral and stays where it is. What was NOT
+    // arch-neutral, and what this flag names, is where the arrow's pixels are written.
+    //
+    // The x86 path drew the arrow into the `Screen` BACK BUFFER (`draw`/`draw_over` below, through
+    // `GneissPal::draw_rect`), with a save-under stashed from the same back buffer. A back-buffer
+    // pixel is not on the panel: it reaches glass only when somebody calls `Screen::flush`. Two
+    // consequences followed, and both are on the s45 rMBP bench record:
+    //
+    //   1. **The cursor could not move faster than the desktop could PRESENT.** Inside a full-screen
+    //      app the present is the frame, and the frame on that panel is expensive — `[vugfps4]` puts
+    //      `flush` at 69–86% of the whole frame budget at 10.9 MB/frame, and the panel's measured
+    //      write bandwidth (`[wc-h] win=2 … bytes=1620080 present_us=9858`) is ~150 MB/s. So the arrow
+    //      advanced once per 25–80 ms frame while the trackpad reported every 8 ms: the pointer
+    //      travelled in visible jumps and lagged the finger by a whole frame plus its flush. That is
+    //      the "slow as molasses" verdict, and it is a structural property of painting into the back
+    //      buffer, not a cost that any amount of tuning inside the sprite could remove.
+    //   2. **The sprite was BELOW the window layer.** `Screen::present_background` subtracts the
+    //      compositor's occluder boxes from the desktop's damage (WC-I), so back-buffer pixels are
+    //      deliberately never copied where a window is. The arrow therefore vanished under every
+    //      window it crossed — correct behaviour for the desktop layer, wrong behaviour for a system
+    //      cursor, which is by definition the last painter of the panel.
+    //
+    // `video::cursor` is the fix, and it was already here: a front-buffer sprite with its own
+    // colour-guarded, painted-pixels-only save-under (~200 reads at this panel's 2x block scale), a
+    // repair hand-off to the compositor, and CURSOR-8's rate floor on that repair. The Pi's render
+    // task has driven it since CURSOR-1 (`main.rs`: `move_rel` … then `video::cursor::repaint()`,
+    // with the pass deliberately NOT marked dirty — "a pointer report costs a save + a few small
+    // fills over one cell, not a `Screen::flush` of the sprite's damage box"). On x86 it was fully
+    // lifted and completely dormant: the s45 wire reads `[cursor3] planned=0 offers=0 ensure=177`
+    // and `[wc-i] cursor_brackets=0` — the machinery was compiled, linked, and never once asked to
+    // paint.
+    //
+    // WHERE THE SWITCH IS MADE, AND WHY HERE RATHER THAN AT THE CALL SITES. Every pointer report on
+    // every x86 path — the console loop, the user input router, any full-redraw loop's own drain —
+    // funnels through `move_rel`/`set_abs`, and every paint request funnels through `draw`/
+    // `draw_over`/`restore`. Folding the delegation into those six functions moves the whole target
+    // onto the compositor sprite without a single call-site change: a caller keeps calling
+    // `cursor::draw(pal)` once a frame and simply stops putting pixels in the back buffer, while the
+    // ARROW now tracks the pointer at report rate because `move_rel` repaints it the moment the
+    // report lands.
+    //
+    // The back-buffer sprite is kept, unchanged, for every other target: aarch64's `virt`/UEFI GUI
+    // console has no compositor-sprite driver of its own, and the bare-metal Pi render task already
+    // drives `video::cursor` explicitly. Nothing on those paths changes.
+    /// Whether the SYSTEM COMPOSITOR SPRITE (`video::cursor`, front buffer, above the window layer)
+    /// owns the arrow's pixels on this target, rather than the back-buffer sprite below.
+    ///
+    /// FLICKER-4 — `pub(crate)` because [`draw`]/[`draw_over`]/[`restore`] and `move_rel`/`set_abs`
+    /// read it to pick the model. The paragraph above promises a full-redraw loop can "simply stop
+    /// putting pixels in the back buffer"; that is true of the PAINT, which `draw`/`draw_over`
+    /// delegate away.
+    ///
+    /// It was NOT true of the per-frame back-buffer ERASE the full-screen demo loops ran to clear
+    /// the sprite's own trail — under the front-buffer model that erase restored pixels nobody had
+    /// written and marked damage over a live arrow, which was the x86 flicker. Those loops (the
+    /// in-kernel `vug` crystal and `pulse` monitor) no longer exist, so the companion
+    /// `BACKBUF_SPRITE_NEEDS_ERASE` predicate they were the sole readers of is gone with them. **If
+    /// a full-redraw loop is ever reintroduced, it must erase the arrow's previous footprint only
+    /// when this constant is `false` (the back-buffer sprite model — aarch64 / the Pi in-kernel
+    /// path); under the front-buffer model (x86) `video::cursor`'s own save-under owns the trail
+    /// and a back-buffer erase does active harm.**
+    pub(crate) const SPRITE_OWNS_PAINT: bool = cfg!(target_arch = "x86_64");
+
     // CURSOR-HIDE (metal verdict, 2026-07-18): the cursor auto-hides after ~1.5 s without pointer
     // input and reappears instantly on the next report (`move_rel`/`set_abs` stamp the activity
     // clock, and every draw site runs AFTER the frame's input drain). It also starts hidden — no
@@ -189,6 +255,36 @@ pub mod cursor {
     const HIDE_AFTER_MS: u64 = 1500;
     /// ms() timestamp of the last pointer report; 0 = never (cursor starts hidden).
     static LAST_INPUT_MS: AtomicU64 = AtomicU64::new(0);
+
+    // --- DRAGREL (metal defect fix: a title-bar drag never ended) -----------------------------
+    //
+    // THE POINTER'S BUTTON **LEVEL**, published beside its position, and it is here for the same
+    // reason the position is: it is pointer STATE, every producer already writes it, and more than
+    // one consumer needs to ask "is the button down RIGHT NOW?" without waiting for an event.
+    //
+    // Why an event was not enough. The HID pointer paths deliver `Event::Button` on EDGES, and the
+    // interrupt endpoint is armed for ONE report per service pass (see the CLICK-3 ledger in
+    // `drivers/ehci/mod.rs`): a report is a LEVEL, so a release that lands between two service
+    // passes is superseded by whatever the pad reports next and its EDGE is simply gone. A gesture
+    // whose END is carried only by that edge — a title-bar drag — then never ends, and the window
+    // follows the pointer for the rest of the boot. The release EDGE is still emitted (it gives the
+    // exact release position, unthrottled); this level is the BELT under it, consulted by the
+    // routing tail on every motion report, and it cannot be missed because every report writes it.
+    /// Whether the pointer's PRIMARY button is currently held, as of the most recent HID report.
+    /// Written by every pointer parse path; false before the first report.
+    static BUTTON_DOWN: AtomicBool = AtomicBool::new(false);
+
+    /// DRAGREL — publish the primary button's CURRENT level. Called from every pointer report,
+    /// pressed or not, edge or no edge.
+    pub fn set_button_level(down: bool) {
+        BUTTON_DOWN.store(down, Ordering::Relaxed);
+    }
+
+    /// DRAGREL — the primary button's level as of the last pointer report. `false` when no pointer
+    /// has ever reported, which is the correct reading for "nothing is being held".
+    pub fn button_down() -> bool {
+        BUTTON_DOWN.load(Ordering::Relaxed)
+    }
 
     /// Stamp the pointer-activity clock (a real report just arrived).
     fn touch() {
@@ -207,11 +303,15 @@ pub mod cursor {
     /// without the auto-hide half). Distinct from `visible()` because it answers a different question:
     /// "does this machine have a working pointer?", not "should the arrow be on screen right now?".
     ///
-    /// It exists so the EL0 input router can keep the sprite alive while an app holds focus WITHOUT
-    /// arming a cursor that never existed. QEMU raspi4b delivers no HID pointer, but the boot-time
-    /// `input_router_selftest` pushes a synthetic `Event::Mouse` through the real router to prove the
-    /// routing path; gating on this keeps that synthetic event from stamping the activity clock,
-    /// drawing a sprite, and printing `[cursor] armed` on a gate that has no pointer at all.
+    /// It was introduced so the user input router could keep the sprite alive while an app holds focus
+    /// WITHOUT arming a cursor that never existed (QEMU raspi4b delivers no HID pointer, but the
+    /// boot-time `input_router_selftest` pushes a synthetic `Event::Mouse` through the real router).
+    ///
+    /// EL0IN-FOCUS retired that use: this latch can only ever be SET by the very code it was gating, so
+    /// on a boot where a user app took focus before the first real pointer report it stayed false
+    /// forever and the cursor was dead until the operator TAB'd back to the shell. The router now
+    /// scopes the guard to the selftest's own call instead (`ROUTER_SELFTEST` in `main.rs`). Kept as the
+    /// honest "does this machine have a working pointer?" predicate, distinct from `visible()`.
     pub fn has_reported() -> bool {
         LAST_INPUT_MS.load(Ordering::Relaxed) != 0
     }
@@ -260,6 +360,16 @@ pub mod cursor {
     /// flat-color `erase`). No-op when nothing is stashed. Call before moving the position and
     /// when the auto-hide expires; the restored pixels come from the stash, never from VRAM.
     pub fn restore(pal: &mut impl GneissPal) {
+        // CURSOR-X86: the compositor sprite has its own save-under, in the FRONT buffer, and this
+        // verb means exactly "take the arrow off the panel" — so it delegates rather than no-ops.
+        // Both of this function's callers want that: the console loop's per-report restore → move →
+        // draw sequence, and the auto-hide transition, which is the ONE place the sprite must come
+        // down and stay down. Nothing was ever stashed in the back buffer on this target, so there
+        // is no local state to unwind.
+        if SPRITE_OWNS_PAINT {
+            crate::video::cursor::undraw();
+            return;
+        }
         let mut s = SAVED.lock();
         if !s.valid {
             return;
@@ -282,6 +392,15 @@ pub mod cursor {
     /// `None`) the stash is skipped and this degrades to a plain draw — no such surface exists
     /// on the GUI path today (`TargetPal` is always `Screen`-backed).
     pub fn draw_over(pal: &mut impl GneissPal) {
+        // CURSOR-X86: the arrow is already on the panel — `move_rel`/`set_abs` put it there the
+        // instant the report landed, which is the whole point. `ensure_drawn` is the cheap
+        // idempotent tail (one lock acquisition and a boolean in the common case, per WC-I); it does
+        // real work only when something took the sprite down and owes it back, e.g. the `restore`
+        // above or a compositor erase.
+        if SPRITE_OWNS_PAINT {
+            crate::video::cursor::ensure_drawn();
+            return;
+        }
         if !visible() {
             return;
         }
@@ -321,6 +440,7 @@ pub mod cursor {
         touch();
         let (x, y) = pos(w, h);
         set_clamped(x + dx, y + dy, w, h);
+        repaint_on_move();
     }
 
     /// Apply an absolute report in the 0..=32767 HID coordinate space, scaled to the panel.
@@ -329,6 +449,173 @@ pub mod cursor {
         let x = ((ax as i64 * w as i64) / 32767) as i32;
         let y = ((ay as i64 * h as i64) / 32767) as i32;
         set_clamped(x, y, w, h);
+        repaint_on_move();
+    }
+
+    /// CURSOR-VUG — the SYSTEM pointer follows a report a ring-3 app consumed.
+    ///
+    /// ### The defect this closes
+    /// `arch::x86_64::syscall::user_input_route` hands every packable event to the FOCUSED app's
+    /// ring and returns `Event::Unknown`, and the shell's drain then falls through its catch-all
+    /// arm. `Event::Mouse`/`Event::MouseAbsolute` are packable, so from the instant a vug takes
+    /// focus **no pointer report reaches [`move_rel`]/[`set_abs`] at all**. Three consequences, all
+    /// of them Peter's "vug blocks mouse cursor" (Boots AL/AO) stated from a different side:
+    ///
+    /// * The sprite stops moving. The arrow is frozen wherever it was when the click landed.
+    /// * [`visible`] goes false 1.5 s later ([`HIDE_AFTER_MS`]), and `refresh_locked` undraws
+    ///   unconditionally while redrawing only while visible — so the next composite tail over the
+    ///   arrow's box TAKES IT OFF THE PANEL and nothing puts it back. Over a static desktop nothing
+    ///   composites there and the frozen arrow simply sits; over a PRESENTING vug a tail runs within
+    ///   a frame, which is exactly why the arrow vanishes over a vug and nowhere else.
+    /// * Every cursor witness goes silent, because [`rollup_tick`] hangs off the motion path. That
+    ///   is the 725 s of silence after `144821ms` in the GR21 rmbp capture — the last live
+    ///   `[cursor12]` block sits between two trackpad clicks, and the one that raised a window is
+    ///   the last pointer report the kernel sprite ever saw.
+    ///
+    /// ### Why the position update belongs here and not in the drain
+    /// The drain already calls [`move_rel`]/[`set_abs`] for events the router did NOT take. Doing it
+    /// there for taken events too would need the taken/not-taken answer at four separate drains, and
+    /// a relative report applied twice would DOUBLE the motion. Applied at the router, on the
+    /// consumed branch only, each report moves the pointer exactly once on exactly one path.
+    ///
+    /// The app still receives the report unchanged — this is not a policy change about who gets
+    /// input. It is the statement that the arrow is a property of the SCREEN rather than of the
+    /// shell: on x86 `SPRITE_OWNS_PAINT` is true, the compositor owns the only pointer on the panel,
+    /// and no app draws one of its own.
+    ///
+    /// Panel geometry is resolved from `video::WRITER` rather than passed in, because the router has
+    /// no `pal` in hand. A framebuffer that is not ready yet, or a degenerate panel, is a no-op —
+    /// there is nothing to clamp against and nothing on the glass to draw on.
+    ///
+    /// Lock discipline is the drain's, unchanged: this runs from the shell's input drain (the sole
+    /// caller of `user_input_route`), unmasked, holding none of `SPRITE`/`WRITER`/`TABLE` — the same
+    /// context the drain's own `move_rel` call at the next arm already runs in.
+    #[cfg(target_arch = "x86_64")]
+    pub fn track_routed(ev: &super::Event) {
+        let (dx, dy, abs) = match *ev {
+            super::Event::Mouse { x, y } => (x, y, false),
+            super::Event::MouseAbsolute { x, y } => (x, y, true),
+            _ => return,
+        };
+        let (w, h) = {
+            let fb = *crate::video::WRITER.lock();
+            if !fb.is_ready() {
+                return;
+            }
+            let i = fb.info();
+            (i.width as i32, i.height as i32)
+        };
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        if abs {
+            set_abs(dx, dy, w, h);
+        } else {
+            move_rel(dx, dy, w, h);
+        }
+    }
+
+    /// CURSOR-X86 — put the compositor sprite where the pointer now is, on the report that moved it.
+    ///
+    /// THE ONE CHOKE POINT. `move_rel` and `set_abs` are the only two functions in the kernel that
+    /// change the pointer's position, so a repaint here is a repaint on every pointer report of every
+    /// x86 path — the console loop's drain, the full-screen demos' own drain, and the user input
+    /// router's keep-alive — without any of them being touched. That is what decouples the arrow's
+    /// cadence from the panel present: `video::cursor::repaint` is a restore → save → draw over one
+    /// glyph cell in the FRONT buffer (~200 read-backs at this panel's 2x block scale, then the same
+    /// number of writes), so it costs single-digit microseconds and is affordable at the trackpad's
+    /// full ~125 Hz, where a `Screen::flush` of the same box was gated behind a 25–80 ms frame.
+    ///
+    /// Self-gating, twice over: `repaint` does nothing while `visible()` is false (before the first
+    /// report of the boot, and again ~1.5 s after the last one), and nothing at all on a target where
+    /// the back-buffer sprite still owns the paint. The headless QEMU gates deliver no pointer report
+    /// at all, so this never runs there and the regression suite sees no change.
+    ///
+    /// Lock discipline: `repaint` takes `SPRITE` → `WRITER`, and its `repair` tail takes `TABLE` with
+    /// `SPRITE` already released (the module's stated `SPRITE` → `TABLE` order). Every caller of
+    /// `move_rel`/`set_abs` is an input drain holding none of the three, so no new order is created.
+    #[inline]
+    fn repaint_on_move() {
+        if SPRITE_OWNS_PAINT {
+            crate::video::cursor::repaint();
+        }
+        rollup_tick();
+    }
+
+    /// CURSOR-12 — how long between two live cursor rollups, in milliseconds.
+    ///
+    /// 5 s, matching `[sched6]`'s window, so a bench capture interleaves the two at the same cadence
+    /// and an operator can read "what the pointer cost" against "what the render loop did" without
+    /// aligning timestamps by hand. Short enough that a 30-second sitting yields several samples;
+    /// long enough that the block (six lines) cannot become the load it is measuring.
+    #[cfg(feature = "witness")]
+    const ROLLUP_EVERY_MS: u64 = 5_000;
+
+    /// CURSOR-12 — wall-clock reading of the last live rollup, or 0 for "never".
+    #[cfg(feature = "witness")]
+    static ROLLUP_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+    /// CURSOR-12 — print the cursor rollup block on the pointer's own cadence, rate-limited.
+    ///
+    /// ### Why the pointer path is the right place, stated once
+    /// The block's only other caller is a boot-time fixture in `arch::aarch64::syscall`, which fires
+    /// before any pointer report has arrived and does not exist on x86 at all
+    /// (`wm::wci_rollup_live` documents both consequences). An instrument for a pointer mechanism has
+    /// to sample while the pointer is moving, and this is the one function every x86 motion path goes
+    /// through — the console loop's drain, the demos' drain, and the user router's keep-alive.
+    ///
+    /// Self-gating three times over, which is what keeps it off every gate: witness builds only, and
+    /// it is unreachable without a real HID report, so both QEMU suites (which deliver no pointer)
+    /// print nothing and their line counts are unchanged.
+    ///
+    /// **`swap`, not a read-then-write.** Two cores can drain input concurrently; a compare-and-set on
+    /// the deadline means a race produces one rollup rather than two, and the loser simply returns.
+    /// The failure mode of this limiter is a skipped sample, never a duplicated block.
+    ///
+    /// ### CURSOR-14 — the FIRST report ARMS the window; it does not print one
+    ///
+    /// It used to print. `ROLLUP_LAST_MS` starts at 0, the limiter's `last != 0` guard let a zero
+    /// through, and so the very first pointer report of the boot emitted a block — from inside
+    /// `repaint_on_move`, i.e. one call after the `repaint` that draws the sprite for the first time.
+    /// Every composite that block reported therefore ran BEFORE the sprite had ever existed, so
+    /// `cursor::sprite_plan()` was `None` on all of them **by construction, on any kernel, with or
+    /// without a fix**. `[cursor12] … nosprite=N/N -> nosprite` was the only reading that block could
+    /// ever produce.
+    ///
+    /// That is not a hypothetical. It is s48 (42/42), s49 (47/47) and s50 (69/69) — three boots, three
+    /// different boot-era composite totals, all of them first blocks, read across the seats as "the
+    /// mechanism is pinned and the fix changed nothing". The tell is in the capture itself: the
+    /// `[cursor] armed x=… y=…` line (emitted once, at the first draw) sits immediately above the
+    /// block, because both come from the same pointer report.
+    ///
+    /// So the first report now stores the deadline and returns. Every block that prints covers at
+    /// least [`ROLLUP_EVERY_MS`] of real pointer activity, with the sprite alive throughout — which is
+    /// the only condition under which any term in it means what its name says. The cost is one lost
+    /// sample per boot, and what it buys is that no sample is a lie.
+    #[inline]
+    fn rollup_tick() {
+        #[cfg(feature = "witness")]
+        {
+            use core::sync::atomic::Ordering::Relaxed;
+            let now = crate::arch::ms();
+            let last = ROLLUP_LAST_MS.load(Relaxed);
+            // `now` can legitimately be 0 for the first few ms of a boot; `swap` below would then
+            // store a 0 and re-arm on the next report, which costs one deferred sample and nothing
+            // else. Biased that way deliberately: never print an unarmed window.
+            if last == 0 {
+                let _ = ROLLUP_LAST_MS.compare_exchange(0, now, Relaxed, Relaxed);
+                return;
+            }
+            if now.wrapping_sub(last) < ROLLUP_EVERY_MS {
+                return;
+            }
+            // Claim the slot before printing, so a second core arriving inside the same window sees
+            // the new deadline and declines.
+            if ROLLUP_LAST_MS.swap(now, Relaxed) != last {
+                return;
+            }
+            crate::video::wm::wci_rollup_live();
+        }
     }
 
     fn set_clamped(x: i32, y: i32, w: i32, h: i32) {
@@ -353,6 +640,15 @@ pub mod cursor {
         // sprite — any stash is stale; invalidate it so a later `restore` (back on the console)
         // can never paint old pixels over a fresh frame.
         SAVED.lock().valid = false;
+        // CURSOR-X86: a full-redraw surface (vug/pulse clear + flush every frame) has just repainted
+        // the back buffer; the front-buffer sprite is unaffected by that and only needs putting back
+        // if the frame's own present took it down. `TargetPal::render`'s bracket does exactly that,
+        // so in practice this is the idempotent no-op and the arrow's real cadence is the report
+        // rate, not the frame rate.
+        if SPRITE_OWNS_PAINT {
+            crate::video::cursor::ensure_drawn();
+            return;
+        }
         paint(pal);
     }
 
@@ -436,6 +732,28 @@ impl EventQueue {
     fn len(&self) -> usize {
         self.head.wrapping_sub(self.tail) % QUEUE_SIZE
     }
+
+    /// DRAGGLIDE — put the just-pushed release BUTTON ahead of the MOTION immediately behind it.
+    ///
+    /// The two newest entries only, and only in the one shape this is written for: a pointer motion
+    /// followed by a `Button`. Answers whether the swap happened, because the caller publishes that
+    /// as the per-gesture witness bit.
+    fn swap_release_ahead_of_lift(&mut self) -> bool {
+        if self.len() < 2 {
+            return false;
+        }
+        let last = (self.head + QUEUE_SIZE - 1) % QUEUE_SIZE;
+        let prev = (self.head + QUEUE_SIZE - 2) % QUEUE_SIZE;
+        let shape = matches!(self.buffer[last], Event::Button(_))
+            && matches!(
+                self.buffer[prev],
+                Event::Mouse { .. } | Event::MouseAbsolute { .. }
+            );
+        if shape {
+            self.buffer.swap(last, prev);
+        }
+        shape
+    }
 }
 
 lazy_static! {
@@ -453,7 +771,7 @@ lazy_static! {
 // all-zero-report-buffer theory is refuted by that same fact.
 //
 // LEADING THEORY (unified, and the one UVUG-10's fixture gate already kills): the boot `input_launcher`
-// fixture's orphan held `el0_input_active()` for the entire boot, so the router's EL0 branch
+// fixture's orphan held `user_input_active()` for the entire boot, so the router's user branch
 // (`route_input_to_active_el0`, main.rs) swallowed the whole queue into a ring nothing would ever read —
 // while KEYS still reached the shell, because `input_service`'s UART path calls `gui_send` DIRECTLY and
 // never touches EVENT_QUEUE at all. That single mechanism explains "ptr=0 but key climbs", explains "from
@@ -475,7 +793,7 @@ lazy_static! {
 // that floor of 1, or a healthy zero-HID boot looks like a live pointer.
 //
 // P56 VERDICT TABLE — read `[uvug10] evq` against `[uvug9] shell-path`, with the fixture now gated off
-// metal (so no orphan should exist and `el0_input_active()` should be 0 all boot):
+// metal (so no orphan should exist and `user_input_active()` should be 0 all boot):
 //   * EXPECTED: `[uvug9] ptr` climbs normally with a moving mouse and `push ptr` climbs with it. The orphan
 //     theory was right and the fixture gate was the fix; nothing further is owed.
 //   * `[uvug9] ptr=0` STILL, with no orphan alive -> the orphan theory is refuted and the hunt RESUMES at
@@ -484,7 +802,7 @@ lazy_static! {
 //         drain is not keeping up (check `depth` and the `[click2]` channel depth alongside).
 //       - `push ptr > 1` with `drop ptr = 0` -> produced and stored, then consumed by SOMEONE ELSE before
 //         the shell drain. `pop` far above the router's own `[uvug9]` totals names that second consumer;
-//         the candidates are an EL0 focus ring and `el0_input_set_active`'s pre-launch discard.
+//         the candidates are a user focus ring and `user_input_set_active`'s pre-launch discard.
 //       - `push ptr = 1` (the selftest floor, unmoved) -> against the settled xHCI finding this should be
 //         unreachable; if it happens, the pointer endpoint itself stopped completing this boot and the
 //         question is back in the driver lane. Confirm against `MOUSE-1`'s report count before concluding.
@@ -496,7 +814,7 @@ static EVQ_PUSH_KEY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 static EVQ_DROP_PTR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Key-class events DROPPED because the ring was full.
 static EVQ_DROP_KEY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// Events successfully popped by ANY consumer (the router drain, an EL0 focus discard, `pump_and_poll`, …).
+/// Events successfully popped by ANY consumer (the router drain, a user focus discard, `pump_and_poll`, …).
 static EVQ_POP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// UVUG-10 — `(push_ptr, push_key, drop_ptr, drop_key, pop)`. Read by the router's `[uvug10] evq` witness.
@@ -511,7 +829,150 @@ pub fn event_queue_stats() -> (u64, u64, u64, u64, u64) {
     )
 }
 
-pub fn push_event(event: Event) {
+/// DRAGSETTLE — **release EDGES that were queued and have not yet been drained by the router.**
+///
+/// The belt in [`cursor::button_down`] is published by the HID parse path the instant a report is
+/// decoded, but the `Event::Button` that carries the same release travels through this QUEUE and is
+/// judged one drain tick later. So on every ordinary release the LEVEL reads up while the EDGE is
+/// still in flight, and any consumer that samples the level alone will act first and leave the edge
+/// arm dead — which is exactly what a GR24 capture shows (every gesture ends `release-level`, the
+/// delivered-release arm never once).
+///
+/// This counter is the ordering the level cannot carry on its own: nonzero means "a release edge is
+/// coming, wait for it"; zero means "no edge is coming, the belt is the only end there will be".
+/// It is not a substitute for the belt and it cannot wedge one on — the consumer pairs it with a
+/// deadline (see `RELEASE_EDGE_GRACE_MS` in the x86 router), so an edge that is queued and then
+/// eaten by some other pop still ends the gesture, only later.
+static RELEASE_EDGES_PENDING: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// DRAGSETTLE — the button mask of the last `Event::Button` this seam PUSHED, so the count above is
+/// made on the same EDGE its consumer decrements on.
+///
+/// Review defect this closes: the first cut counted on the raw mask property `mask & 0x01 == 0`,
+/// while the only decrementer (`wc_click_route_at`'s release arm) fires on any bit going 1 -> 0
+/// against its OWN previous mask. xHCI pushes a `Button` on any mask change, so the two disagreed on
+/// real input in two ways that both mattered: a right-click with the primary already up counted a
+/// release nothing would ever consume (a residue surviving until the next primary press), and a
+/// SECONDARY-button press on a title bar — which does start a drag, since the press arm arms on any
+/// NEW bit — armed a phantom pending release for its own PRESS, holding that drag for the whole
+/// grace and ending it `level-late`. Tracking the primary transition here, in the producer, makes
+/// the count and the consumption the same event by construction.
+static PREV_BTN_MASK: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// DRAGGLIDE — **the lift motion must not be drained BEFORE the release edge it belongs to.**
+///
+/// Every HID pointer path in this kernel decodes one report into, in this order, an `Event::Mouse` /
+/// `Event::MouseAbsolute` for the report's dx/dy (pushed only when nonzero) and then an
+/// `Event::Button` for a mask change. On the RELEASE report that means the lift's own last fraction
+/// of travel is queued AHEAD of the release edge, and any consumer that treats "a motion drained
+/// while a release edge is still queued" as pre-release hand travel — which is exactly what the drag
+/// tail must now do to kill the glide — would steer the window by it. That motion is the ~1px the
+/// DRAGSETTLE arc removed and metal confirmed gone; it must not come back.
+///
+/// So the producer puts the edge in front of its own lift, here, at the one seam every pointer path
+/// already passes. Ordering the two events *relative to each other* is a producer decision (they came
+/// out of one report; nothing downstream can reconstruct that), and it is made where the report's
+/// structure is still knowable rather than guessed at from the drain.
+///
+/// **Which lift, decided by the DECODE SITE and not by inference.** Every production pointer path
+/// pushes its report through [`push_pointer_report`], which carries both events into the ring under
+/// one lock and tells the reorder, as a fact, whether this button has its own lift behind it
+/// ([`LiftHint`]). The sequence-and-time heuristic below survives only as the [`LiftHint::Unknown`]
+/// fallback, for a bare `Button` pushed by something that is not a decoded report — a selftest, a
+/// synthesiser, a future producer. In every case the SHAPE test in
+/// [`EventQueue::swap_release_ahead_of_lift`] has the last word: it is what stops a
+/// Button-behind-Button (a secondary release sitting between a primary press and its release) from
+/// being swapped, and what keeps the `Unknown` sequence comparison honest before any motion has ever
+/// been pushed.
+///
+/// **The residue that remains, and the direction it is biased in.** On the `Unknown` path a release
+/// with no lift of its own can still hoist the edge over the PREVIOUS event's motion if that motion
+/// is the immediately preceding push and landed inside [`LIFT_ADJACENCY_MS`], ending the drag one
+/// report of hand travel early. The opposite error — declining a swap that was owed — lets the lift
+/// steer the window, which is the ~1px hop DRAGSETTLE removed and metal confirmed gone. Both are
+/// bounded by a single report's dx/dy and neither is a jump, but the second is the one Peter would
+/// recognise, so the slack is sized to make MISSES impossible rather than false swaps impossible.
+/// `swap=` on the `[dragrel]` line makes the choice visible on a capture rather than a matter of
+/// trust.
+///
+/// **This latch is a WITNESS BIT, not a control input** — nothing in the kernel branches on it; the
+/// `[dragrel]` line and `wmdirect_selftest` are its only readers. It is global rather than
+/// per-gesture, so with two pointers live (the rMBP's EHCI pad and an xHCI mouse) a release from the
+/// OTHER device between a gesture's press and its release overwrites it, and `swap=` then describes
+/// that device's report rather than the dragged gesture's. The reorder itself is unaffected — it is
+/// decided per push, under the lock, from the pushing report's own hint — so the misreport costs a
+/// capture one ambiguous field and costs the window nothing.
+static RELEASE_EDGE_REORDERED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// DRAGGLIDE — count of STORED pushes, so "the immediately preceding push" is an exact test.
+static PUSH_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DRAGGLIDE — [`PUSH_SEQ`] as of the last STORED pointer-motion push.
+static MOTION_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DRAGGLIDE — `ms()` as of the last STORED pointer-motion push.
+static MOTION_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAGGLIDE — how far apart a motion and a release button may be pushed and still be read as ONE
+/// report (see [`RELEASE_EDGE_REORDERED`]).
+///
+/// Sized from both sides. It must exceed the jitter WITHIN a service pass — the two pushes are
+/// microseconds apart, but `ms()` is a 1 kHz tick and can roll over between them, and an interrupt
+/// can land in the gap — or a swap that was owed is missed and the lift steers the window. It must
+/// stay well under one HID report interval (~8 ms at 125 Hz; the rMBP's internal pad is slower still)
+/// or a motion from the PREVIOUS report is mistaken for this report's lift. 2 ms clears a tick
+/// boundary with a whole tick to spare and is a quarter of the interval it must not reach.
+const LIFT_ADJACENCY_MS: u64 = 2;
+
+/// DRAGSETTLE — release edges queued and not yet drained (see [`RELEASE_EDGES_PENDING`]).
+pub fn release_edge_pending() -> u32 {
+    RELEASE_EDGES_PENDING.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// DRAGGLIDE — whether the LIVE gesture's release edge was reordered ahead of its own lift motion
+/// (see [`RELEASE_EDGE_REORDERED`]). Cleared by the next primary PRESS, so it reads per gesture.
+pub fn release_edge_reordered() -> bool {
+    RELEASE_EDGE_REORDERED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// DRAGSETTLE — a router drained one release edge. Saturating, because the counter is advisory: a
+/// selftest that drives the router directly (no `push_event`) must not be able to push it negative,
+/// and an edge popped by some consumer other than the router simply ages out against the deadline.
+pub fn note_release_edge_drained() {
+    let _ = RELEASE_EDGES_PENDING.fetch_update(
+        core::sync::atomic::Ordering::AcqRel,
+        core::sync::atomic::Ordering::Acquire,
+        |n| Some(n.saturating_sub(1)),
+    );
+}
+
+/// DRAGGLIDE — what the PRODUCER knows about the lift motion belonging to a `Button` it is pushing.
+///
+/// The reorder in [`push_locked`] has to answer "is the entry behind this release edge the SAME HID
+/// REPORT's lift?" — and only the decode site knows. This carries that answer instead of guessing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LiftHint {
+    /// This button is being pushed as one report together with a motion, and that motion was STORED.
+    /// The entry behind the edge is that lift, by construction — swap, no heuristic.
+    Paired,
+    /// This report carried NO motion of its own (or the ring dropped it). Whatever is behind the edge
+    /// belongs to an earlier report and must NOT be jumped — no swap, and no heuristic either, which
+    /// is the whole reason a decode site says so explicitly.
+    NoLift,
+    /// The caller is not a paired pointer report (a selftest, a synthesiser, any future producer that
+    /// pushes a bare `Button`). Fall back to the adjacency heuristic.
+    Unknown,
+}
+
+/// The body of [`push_event`], with the ring lock already held.
+///
+/// DRAGSETTLE — the ring push and the pending-release accounting happen under the SAME
+/// interrupt-free section. Review defect this closes: with the `fetch_add` outside it, a drain could
+/// pop the release and saturating-sub the count BEFORE the producer had added it, leaving a phantom
+/// `pend=1` with nothing queued — which costs the next gesture a full grace and a `level-late` end.
+///
+/// DRAGGLIDE — the REORDER joins them, and it must: it reads the two newest ring entries and the
+/// push-adjacency record, both of which a concurrent producer would move under it.
+fn push_locked(q: &mut EventQueue, event: Event, lift: LiftHint) -> bool {
     use core::sync::atomic::Ordering::Relaxed;
     let is_ptr = matches!(
         event,
@@ -523,13 +984,135 @@ pub fn push_event(event: Event) {
     } else if is_key {
         EVQ_PUSH_KEY.fetch_add(1, Relaxed);
     }
-    let stored = crate::arch::without_interrupts(|| EVENT_QUEUE.lock().push(event));
+    let stored = {
+        let stored = q.push(event);
+        // DRAGGLIDE — the adjacency record. The sequence is bumped on EVERY push, stored or not:
+        // review defect this closes — with the bump conditional on `stored`, an event the full ring
+        // dropped left the push BEFORE it looking adjacent to the push AFTER it, manufacturing
+        // exactly the false adjacency the record exists to rule out (a dropped lift would hand the
+        // PREVIOUS report's motion to the swap). `MOTION_SEQ` is still only written for motions that
+        // were actually stored — an entry that is not in the ring can neither be the lift nor sit
+        // behind the edge.
+        let seq = PUSH_SEQ.fetch_add(1, Relaxed);
+        if stored && matches!(event, Event::Mouse { .. } | Event::MouseAbsolute { .. }) {
+            MOTION_SEQ.store(seq, Relaxed);
+            // The clock is read HERE and in the release arm below, not once per `push_event`:
+            // `arch::ms()` is a 64-bit division on aarch64 (CNTVCT / (CNTFRQ/1000)), and this seam
+            // carries every keystroke and timer event on both arches. Only pointer traffic can ever
+            // consult the stamp, so only pointer traffic pays for it.
+            MOTION_MS.store(crate::arch::ms(), Relaxed);
+        }
+        if let Event::Button(mask) = event {
+            let prev = PREV_BTN_MASK.swap(mask, Relaxed);
+            if prev & 0x01 != 0 && mask & 0x01 == 0 {
+                // The PRIMARY release edge, and the only thing counted: exactly the edge
+                // `wc_click_route_at` consumes. Counted only if the ring took it — an edge dropped by
+                // a full ring will never be drained, and holding the belt off for it would cost the
+                // one occasion the belt is the only end there is.
+                if stored {
+                    RELEASE_EDGES_PENDING.fetch_add(1, core::sync::atomic::Ordering::Release);
+                    // DRAGGLIDE — and it goes AHEAD of its own lift motion (see
+                    // [`RELEASE_EDGE_REORDERED`]). The producer's own answer first; the heuristic
+                    // only when there is no producer to ask.
+                    let adjacent = match lift {
+                        LiftHint::Paired => true,
+                        LiftHint::NoLift => false,
+                        LiftHint::Unknown => {
+                            MOTION_SEQ.load(Relaxed) == seq.wrapping_sub(1)
+                                && crate::arch::ms().wrapping_sub(MOTION_MS.load(Relaxed))
+                                    <= LIFT_ADJACENCY_MS
+                        }
+                    };
+                    // The SHAPE test is the last word in every case, including `Paired`: it is what
+                    // stops a Button-behind-Button (a secondary release landing between a primary
+                    // press and its release) from being swapped, and what keeps the `Unknown`
+                    // sequence comparison honest before any motion has ever been pushed
+                    // (`MOTION_SEQ` still 0, when it can match by accident).
+                    let swapped = adjacent && q.swap_release_ahead_of_lift();
+                    RELEASE_EDGE_REORDERED
+                        .store(swapped, core::sync::atomic::Ordering::Release);
+                }
+            } else if prev & 0x01 == 0 && mask & 0x01 != 0 {
+                // A primary PRESS opens a new gesture: whatever release was still counted belongs to
+                // a gesture that is over, and carrying it forward would hold the next drag for the
+                // whole grace.
+                RELEASE_EDGES_PENDING.store(0, core::sync::atomic::Ordering::Release);
+                RELEASE_EDGE_REORDERED.store(false, core::sync::atomic::Ordering::Release);
+            }
+        }
+        stored
+    };
     if !stored {
         if is_ptr {
             EVQ_DROP_PTR.fetch_add(1, Relaxed);
         } else if is_key {
             EVQ_DROP_KEY.fetch_add(1, Relaxed);
         }
+    }
+    // R0 / rtwit — input→present proxy: stamp the arrival of this input at the enqueue funnel. Only
+    // the FIRST input since the last composite claims the pending slot, so `in2present` reports the
+    // age of the OLDEST un-presented input. A no-op inline shim when `rtwit` is off. This is the
+    // single enqueue chokepoint (`push_event` and `push_pointer_report` both land here).
+    if stored {
+        crate::rtwit::note_input_enqueued();
+    }
+    stored
+}
+
+pub fn push_event(event: Event) {
+    crate::arch::without_interrupts(|| {
+        let mut q = EVENT_QUEUE.lock();
+        // R0 / rtwit — EVENT_QUEUE max-hold. Declared AFTER the guard so it drops FIRST (just before
+        // release), timing the acquire→release critical section (the push plus the DRAGGLIDE reorder
+        // under `push_locked`). No-op inline shim when `rtwit` is off; no change to lock semantics.
+        let _evh = crate::rtwit::hold(crate::rtwit::Lock::Evq);
+        push_locked(&mut q, event, LiftHint::Unknown);
+    });
+}
+
+/// DRAGGLIDE — **push ONE HID pointer report as ONE thing.**
+///
+/// Every pointer decode site in this kernel produces at most two events from a single report: the
+/// report's dx/dy (only when nonzero) and a `Button` (only on a mask change). Pushed separately they
+/// are two independent trips through the ring lock, and the reorder that must put a release edge in
+/// front of its own lift then has to INFER that the two belong together. That inference is not sound
+/// on this machine: the rMBP runs an EHCI trackpad and an xHCI port as concurrent producers, so a
+/// foreign `Mouse` from the other controller can land in the gap microseconds apart — inside any
+/// time window worth having — and the swap fires on the WRONG entry, hoisting the real lift AHEAD of
+/// the edge where the drag tail's lead branch steers the window by it. That is the ~1px DRAGSETTLE
+/// removed, returning with `swap=1` reporting success.
+///
+/// So the pairing is made at the decode site, where it is a fact rather than a guess, and this is
+/// the seam that carries it: one lock, both events, [`LiftHint::Paired`] for the button. A report
+/// with no motion of its own passes `motion: None` and the button is judged [`LiftHint::NoLift`] —
+/// equally a fact, and the case a heuristic gets WRONG in the other direction (it would hoist the
+/// edge over the previous report's motion and end the drag a report early).
+///
+/// `wmdirect_selftest` drives this same function for the same reason, one layer up: it asserts an
+/// EXACT resting coordinate, and a consumer popping the lift out of the gap made it read the very
+/// ~1px it exists to forbid — measured at one run in 25 of the wc QEMU gate before this landed.
+pub fn push_pointer_report(motion: Option<Event>, button: Option<Event>) {
+    match (motion, button) {
+        (None, None) => {}
+        (Some(m), None) => push_event(m),
+        (None, Some(b)) => crate::arch::without_interrupts(|| {
+            let mut q = EVENT_QUEUE.lock();
+            // R0 / rtwit — EVENT_QUEUE max-hold (see `push_event`).
+            let _evh = crate::rtwit::hold(crate::rtwit::Lock::Evq);
+            push_locked(&mut q, b, LiftHint::NoLift);
+        }),
+        (Some(m), Some(b)) => crate::arch::without_interrupts(|| {
+            let mut q = EVENT_QUEUE.lock();
+            // R0 / rtwit — EVENT_QUEUE max-hold (see `push_event`).
+            let _evh = crate::rtwit::hold(crate::rtwit::Lock::Evq);
+            // A lift the ring DROPPED is not behind the edge, so the pairing claim dies with it.
+            let hint = if push_locked(&mut q, m, LiftHint::Unknown) {
+                LiftHint::Paired
+            } else {
+                LiftHint::NoLift
+            };
+            push_locked(&mut q, b, hint);
+        }),
     }
 }
 
@@ -610,7 +1193,66 @@ pub fn keyboard_detach_gen() -> u64 {
 // mid-hold unplug is layer 2's. Layer 3 only ever covered the residue where a release report never reaches the
 // decode at all — and the backpressure guard independently prevents a stuck repeat from starving real input in
 // the meantime. The evidence gate is cleared on a keyboard detach, so a swapped device re-earns its own verdict.
-#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+//
+// PAL-TYPEMATIC — CHAIN B CLOSED: THE LAPSE NOW RE-ARMS, AND THE VERDICT IS SCOPED TO ITS HOLD.
+//
+// KEYSTAT (audit arc, commit 3b5cd2e5) traced the surviving "key repeat times out" report to two predicates in
+// this file and specified the repair for whoever owned `pal.rs`. Both halves land here, verbatim to that spec.
+//
+//   1. THE LAPSE DID NOT RE-ARM. Every disarm above stores `KEY_P1 = 0`, and the ONLY writer that puts a key
+//      back is the PRESS-edge arm at the bottom of `typematic_note_report` (`newest_press != 0`). So a report
+//      that positively proves the key is STILL HELD — `held.contains(&k)`, the strongest evidence the tracker
+//      ever receives — could not restart the repeat: the operator had to lift and re-press. The liveness guard
+//      disarmed on SILENCE and then ignored the very evidence that refuted its own inference. Fixed: a lapse
+//      parks the key in `LAPSED_P1` instead of forgetting it, and the next report whose held set still contains
+//      it re-arms at `DELAY_MS` (a fresh initial delay, so a re-arm feels like the hold it is and cannot
+//      free-run). A report WITHOUT the key clears the parked slot — a real release ends the hold for good, and
+//      layers 1/2 keep their absolute authority: detach and release both clear `LAPSED_P1` outright, so this
+//      can never resurrect the P51 stuck-repeat wedge.
+//
+//   2. THE STREAMING VERDICT WAS BOOT-WIDE. `STREAMS_WHILE_HELD` latched on the first hold that produced
+//      `IDLE_RUN_TO_LATCH` idle re-reports and was STICKY until detach, so ONE streaming hold imposed the tight
+//      `LIVENESS_MS` window on EVERY later hold of that boot — including holds during which the device happens
+//      not to re-report at all, which then stopped after ~15 repeats, SILENTLY (the tight window's disarm is
+//      deliberately quiet, so it is indistinguishable at the bench from the ~10-repeat stop UVUG-9 exists to
+//      have removed). Fixed: the verdict is scoped to the hold that earned it. A report with an EMPTY held set
+//      is the end of the hold, and it clears the verdict and its evidence. The P51 protection is not weakened:
+//      a genuinely streaming keyboard re-earns the latch within `IDLE_RUN_TO_LATCH` report periods (tens of ms
+//      at any real polling interval), i.e. long before `DELAY_MS` has even elapsed and the first repeat is due.
+//
+// Witness (`[keystat]`): a re-arm names itself for the first few per hold, and every hold that produced repeats
+// closes with one rollup line — repeats, re-arms, and which window was in force. Bounded by human key holds.
+//
+// ── KEYREPEAT-X86 (Boot AL): THE TRACKER IS NOW COMPILED ON x86 TOO ────────────────────────────────
+//
+// Peter, at the bench on Boot AL: *"so far so good with keys except no key repeat."* Everything else the
+// GR21 EHCI arc landed passes on metal — caps lock, Ctrl+letter, no stuck keys, kill works — and repeat is
+// the one thing that does not, because on x86 the ONLY keyboard the operator can reach is the rMBP's
+// INTERNAL one, which is an EHCI device decoded by `drivers/ehci`, and this module was
+// `#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]`. The EHCI decoder therefore had no host
+// repeat available to it at all and said so in its own doc block ("repeat on this arch is the DEVICE's,
+// carried by the re-reported level"). Metal refutes the premise that sentence rests on: the device does
+// NOT re-report a key held still — no SET_IDLE is sent on that path, and the keyboard's default idle
+// behaviour is report-on-change — so "the device's" repeat is no repeat.
+//
+// The cfg is widened to `x86_64 + ehcihid` rather than a second implementation being written, because this
+// tracker was PURPOSE-BUILT for exactly this hardware behaviour. Its whole design premise (UVUG-6/UVUG-9)
+// is a keyboard that goes SILENT while a key is held: report-level arm/disarm so no dropped `KeyUp` can
+// strand a hold (P51), an evidence-gated liveness window so silence is never misread as a wedge (the
+// ~10-repeat stop), and a detach layer for the hold that ends by unplug. Every one of those wedge classes
+// is already cured here, on metal, on the Pi. A private x86 copy would re-open all of them.
+//
+// WHAT DOES NOT CHANGE. On aarch64 the predicate below is still satisfied by the same arm it always was,
+// the module's contents are untouched, and no aarch64 call site moves — so aarch64 codegen is unaffected.
+// The x86 wiring is entirely outside this file: `drivers/ehci` feeds `typematic_note_report` from
+// `decode_boot_keyboard` and `note_keyboard_detached` from `flush_held_releases`, and `main`'s x86 pump
+// loops call `typematic_tick` exactly where the aarch64 pump does — before the drain, so a synthesised
+// repeat rides the SAME EVENT_QUEUE routing (asid focus, compositor, shell) a real press takes, and the
+// backpressure guard still refuses to inject past a half-full ring.
+#[cfg(any(
+    all(target_arch = "aarch64", feature = "baremetal"),
+    all(target_arch = "x86_64", feature = "ehcihid")
+))]
 mod typematic {
     use core::sync::atomic::{AtomicU32, AtomicU64};
     /// ASCII of the key eligible to repeat, +1 (0 = none). Newest press wins.
@@ -656,13 +1298,38 @@ mod typematic {
     /// idle-re-reports produces them continuously for as long as the key is held. Four is comfortably above a
     /// tap (or a double-tap) and is reached within a few report periods of a genuine hold.
     pub(super) const IDLE_RUN_TO_LATCH: u32 = 4;
+
+    // --- PAL-TYPEMATIC: the re-arm slot and the hold accounting ---
+
+    /// PAL-TYPEMATIC — the key a LIVENESS/BACKSTOP lapse disarmed, +1 (0 = none parked). Not a second armed
+    /// slot: nothing repeats off it. It exists so the next report can be asked the one question the old code
+    /// never asked — "is that key STILL down?" — and re-arm if the answer is yes. Cleared by a report that
+    /// does not contain it (a real release), by a fresh press, and by a detach.
+    pub(super) static LAPSED_P1: AtomicU32 = AtomicU32::new(0);
+    /// PAL-TYPEMATIC — the key the CURRENT hold is about, +1, kept for the hold-end rollup line (the armed
+    /// slot is already 0 by the time the release report is being processed).
+    pub(super) static HOLD_KEY: AtomicU32 = AtomicU32::new(0);
+    /// PAL-TYPEMATIC — repeats emitted during the current hold (rollup, then reset at hold end).
+    pub(super) static HOLD_REPEATS: AtomicU32 = AtomicU32::new(0);
+    /// PAL-TYPEMATIC — lapse re-arms during the current hold (rollup, then reset at hold end). A non-zero
+    /// value is the bench-visible proof that chain B fired AND was recovered from, rather than ending the hold.
+    pub(super) static HOLD_REARMS: AtomicU32 = AtomicU32::new(0);
+    /// PAL-TYPEMATIC — boot totals, carried on every rollup so a single line answers "is repeat flowing at all".
+    pub(super) static BOOT_REPEATS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static BOOT_REARMS: AtomicU64 = AtomicU64::new(0);
+    /// PAL-TYPEMATIC — how many re-arms name themselves per hold before the rollup takes over. A pathological
+    /// device could re-arm on every report; the serial line must not become the new backpressure.
+    pub(super) const REARM_LOG_MAX: u32 = 3;
 }
 
 /// UVUG-9 — pack a held-ascii set into one word for exact comparison against the previous report: bit 63 =
 /// valid, bits 56..62 = length, bytes 0..5 = the set in report order. A HID boot report carries at most six
 /// keycodes, so nothing is lost. Order-sensitive by design: a reordered set compares unequal, which only ever
 /// costs a missed latch (the safe direction — the conservative `HOLD_MAX_MS` window stays in force).
-#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+#[cfg(any(
+    all(target_arch = "aarch64", feature = "baremetal"),
+    all(target_arch = "x86_64", feature = "ehcihid")
+))]
 fn pack_held(held: &[u8]) -> u64 {
     let n = held.len().min(6);
     let mut v: u64 = (1 << 63) | ((n as u64) << 56);
@@ -677,7 +1344,10 @@ fn pack_held(held: &[u8]) -> u64 {
 /// down. Observing releases here (armed key absent from `held`) rather than from the drained event stream is
 /// what closes the UVUG-5 dropped-`KeyUp` hole. A synthesised repeat never comes through here (it is not a HID
 /// report), so the initial delay is honoured exactly once per physical press.
-#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+#[cfg(any(
+    all(target_arch = "aarch64", feature = "baremetal"),
+    all(target_arch = "x86_64", feature = "ehcihid")
+))]
 pub fn typematic_note_report(newest_press: u8, held: &[u8]) {
     use core::sync::atomic::Ordering;
     let now = crate::arch::ms();
@@ -696,6 +1366,21 @@ pub fn typematic_note_report(newest_press: u8, held: &[u8]) {
         typematic::IDLE_RUN.store(0, Ordering::Relaxed);
         0
     };
+    // PAL-TYPEMATIC (2) — the HOLD ENDED. An empty held set is the unambiguous "nothing is down any more",
+    // and it is where the streaming verdict earned by THIS hold expires. Boot-wide stickiness is what let one
+    // streaming hold impose the 1 s window on every later hold of the boot; scoping it here means a keyboard
+    // that re-reports only sometimes gets the conservative backstop on the holds where it does not, instead of
+    // a silent stop after ~15 repeats. A device that really does stream re-earns the latch within
+    // `IDLE_RUN_TO_LATCH` report periods — well inside `DELAY_MS`, i.e. before the first repeat is even due —
+    // so the P51 wedge guard is armed by the time there is anything for it to guard.
+    if held.is_empty() {
+        // Rollup FIRST: its `window=` field reads `STREAMS_WHILE_HELD`, and it must report the window that was
+        // actually in force during the hold being closed, not the cleared one the next hold will start from.
+        typematic_hold_rollup();
+        typematic::STREAMS_WHILE_HELD.store(0, Ordering::Relaxed);
+        typematic::IDLE_RUN.store(0, Ordering::Relaxed);
+        typematic::LAPSED_P1.store(0, Ordering::Relaxed);
+    }
     let kp1 = typematic::KEY_P1.load(Ordering::Relaxed);
     if kp1 != 0 {
         let k = (kp1 - 1) as u8;
@@ -718,18 +1403,98 @@ pub fn typematic_note_report(newest_press: u8, held: &[u8]) {
             // unchanged-held reports — which is what `IDLE_RUN_TO_LATCH` is for.
             typematic::STREAMS_WHILE_HELD.store(1, Ordering::Relaxed);
         }
+    } else {
+        // PAL-TYPEMATIC (1) — THE RE-ARM. Nothing is armed, but a lapse may have parked a key here. This
+        // report carries the exact evidence the lapse's inference lacked: if the parked key is still in the
+        // held set, the keyboard was never wedged and the operator never let go, so the repeat resumes. If it
+        // is absent the hold is genuinely over and the slot is dropped — a release always wins, which is why
+        // this cannot reopen the P51 hole (an armed key whose release is missed is layer 1/2's problem, and
+        // both of those clear `LAPSED_P1` too).
+        let lapsed = typematic::LAPSED_P1.load(Ordering::Relaxed);
+        if lapsed != 0 {
+            let k = (lapsed - 1) as u8;
+            if held.contains(&k) {
+                typematic::KEY_P1.store(lapsed, Ordering::Relaxed);
+                // A fresh initial delay, not the repeat rate: the re-arm re-enters the hold at its start, so a
+                // device re-reporting faster than `DELAY_MS` can never turn re-arming into a free-running spew.
+                typematic::NEXT_MS.store(now.wrapping_add(typematic::DELAY_MS), Ordering::Relaxed);
+                let n = typematic::HOLD_REARMS.fetch_add(1, Ordering::Relaxed) + 1;
+                typematic::BOOT_REARMS.fetch_add(1, Ordering::Relaxed);
+                if n <= typematic::REARM_LOG_MAX {
+                    serial_println!(
+                        "[keystat] typematic re-arm — key={:#04x} still held after a liveness lapse; repeat resumed at delay={}ms (hold re-arms={} boot re-arms={})",
+                        k,
+                        typematic::DELAY_MS,
+                        n,
+                        typematic::BOOT_REARMS.load(Ordering::Relaxed)
+                    );
+                }
+            } else {
+                typematic::LAPSED_P1.store(0, Ordering::Relaxed);
+            }
+        }
     }
     // Arm the newest press (newest-wins typematic) and (re)start the initial delay.
     if newest_press != 0 {
         typematic::KEY_P1.store(newest_press as u32 + 1, Ordering::Relaxed);
         typematic::NEXT_MS.store(now.wrapping_add(typematic::DELAY_MS), Ordering::Relaxed);
+        // A press supersedes any parked lapse (newest-wins), and names the hold for the rollup.
+        typematic::LAPSED_P1.store(0, Ordering::Relaxed);
+        typematic::HOLD_KEY.store(newest_press as u32 + 1, Ordering::Relaxed);
     }
+}
+
+/// PAL-TYPEMATIC — close out a hold: if it produced anything, say so in one line, then reset the per-hold
+/// counters. Called on the report that ends the hold (empty held set) and on a detach, so a hold that ends by
+/// unplug is accounted exactly like one that ends by release. Silent for a hold that never repeated (a tap),
+/// which is the overwhelming majority of key presses.
+#[cfg(any(
+    all(target_arch = "aarch64", feature = "baremetal"),
+    all(target_arch = "x86_64", feature = "ehcihid")
+))]
+fn typematic_hold_rollup() {
+    use core::sync::atomic::Ordering;
+    let repeats = typematic::HOLD_REPEATS.swap(0, Ordering::Relaxed);
+    let rearms = typematic::HOLD_REARMS.swap(0, Ordering::Relaxed);
+    let key = typematic::HOLD_KEY.swap(0, Ordering::Relaxed);
+    if repeats == 0 && rearms == 0 {
+        return;
+    }
+    serial_println!(
+        "[keystat] typematic hold end — key={:#04x} repeats={} re-arms={} window={}ms (boot: repeats={} re-arms={})",
+        key.wrapping_sub(1) as u8,
+        repeats,
+        rearms,
+        if typematic::STREAMS_WHILE_HELD.load(Ordering::Relaxed) != 0 {
+            typematic::LIVENESS_MS
+        } else {
+            typematic::HOLD_MAX_MS
+        },
+        typematic::BOOT_REPEATS.load(Ordering::Relaxed),
+        typematic::BOOT_REARMS.load(Ordering::Relaxed)
+    );
+}
+
+/// PAL-TYPEMATIC — the ONE place a liveness/backstop lapse disarms a hold (`typematic_tick`'s layer-3 arm and
+/// the selftest's forced-lapse aid both go through it). Clears the armed slot and PARKS the key, so the next
+/// report that still contains it re-arms instead of the operator having to lift and re-press.
+#[cfg(any(
+    all(target_arch = "aarch64", feature = "baremetal"),
+    all(target_arch = "x86_64", feature = "ehcihid")
+))]
+fn typematic_lapse_disarm(k: u8) {
+    use core::sync::atomic::Ordering;
+    typematic::KEY_P1.store(0, Ordering::Relaxed);
+    typematic::LAPSED_P1.store(k as u32 + 1, Ordering::Relaxed);
 }
 
 /// UVUG-6 — if a held key's repeat is due, return its ascii and schedule the next one. Returns `None` when no
 /// key is held, the repeat is not yet due, the keyboard detached, liveness lapsed, or EVENT_QUEUE is past half
 /// full. Called once per USB pump pass, BEFORE the drain, by the host pump in `main`.
-#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+#[cfg(any(
+    all(target_arch = "aarch64", feature = "baremetal"),
+    all(target_arch = "x86_64", feature = "ehcihid")
+))]
 pub fn typematic_tick() -> Option<u8> {
     use core::sync::atomic::Ordering;
     // (2) detach guard: a keyboard unplugged mid-hold never sends its release report.
@@ -740,9 +1505,13 @@ pub fn typematic_tick() -> Option<u8> {
         // may come from different hardware, which must earn its own verdict rather than inherit this one. The
         // evidence it was derived from goes with it, or a run straddling the detach could re-latch on a mix of
         // two keyboards' reports.
+        typematic_hold_rollup(); // before the verdict is cleared — see the same ordering in `note_report`
         typematic::STREAMS_WHILE_HELD.store(0, Ordering::Relaxed);
         typematic::PREV_HELD.store(0, Ordering::Relaxed);
         typematic::IDLE_RUN.store(0, Ordering::Relaxed);
+        // PAL-TYPEMATIC: a detach is layer 2 and it is ABSOLUTE — the parked lapse goes with the armed key, or
+        // the next keyboard's first report could re-arm a hold that belonged to hardware no longer present.
+        typematic::LAPSED_P1.store(0, Ordering::Relaxed);
         return None;
     }
     let kp1 = typematic::KEY_P1.load(Ordering::Relaxed);
@@ -760,14 +1529,17 @@ pub fn typematic_tick() -> Option<u8> {
         typematic::HOLD_MAX_MS
     };
     if last != 0 && now.wrapping_sub(last) > window && now >= last {
-        typematic::KEY_P1.store(0, Ordering::Relaxed);
+        // PAL-TYPEMATIC: park the key rather than forget it. Either window may be wrong about a hold that is
+        // still physically in progress — that is the whole of chain B — and the cheapest possible refutation
+        // is the next report's held set. `typematic_note_report` performs it.
+        typematic_lapse_disarm((kp1 - 1) as u8);
         // UVUG-9: name the BACKSTOP when it is what fired. A repeat that simply stops is indistinguishable at
         // the bench from the bug this arc fixed, so the coarse 30 s bound must say so out loud — one line per
         // disarm, which is self-limiting at a minimum of `HOLD_MAX_MS` apart. The tight `LIVENESS_MS` disarm
         // stays silent: it is the ordinary, expected end of a hold on a streaming keyboard.
         if window == typematic::HOLD_MAX_MS {
             serial_println!(
-                "[uvug9] typematic hold-max — key held {}s without an idle re-report from this keyboard; repeat disarmed by the BACKSTOP, not by a release (re-press resumes)",
+                "[uvug9] typematic hold-max — key held {}s without an idle re-report from this keyboard; repeat disarmed by the BACKSTOP, not by a release (PAL-TYPEMATIC: the next report that still holds the key re-arms it)",
                 typematic::HOLD_MAX_MS / 1000
             );
         }
@@ -781,6 +1553,13 @@ pub fn typematic_tick() -> Option<u8> {
     // `ms()` is monotonic; guard the wrap window so a rolled clock cannot spew repeats.
     if now.wrapping_sub(due) < (1u64 << 62) && now >= due {
         typematic::NEXT_MS.store(now.wrapping_add(typematic::RATE_MS), Ordering::Relaxed);
+        // PAL-TYPEMATIC witness: count every emission, per hold and for the boot. `[keystat] typematic hold
+        // end` reports both, so the bench can see repeats FLOWING rather than inferring it from the screen.
+        typematic::HOLD_REPEATS.fetch_add(1, Ordering::Relaxed);
+        typematic::BOOT_REPEATS.fetch_add(1, Ordering::Relaxed);
+        if typematic::HOLD_KEY.load(Ordering::Relaxed) == 0 {
+            typematic::HOLD_KEY.store(kp1, Ordering::Relaxed);
+        }
         return Some((kp1 - 1) as u8);
     }
     None
@@ -813,6 +1592,32 @@ pub fn typematic_test_reset() {
     typematic::PREV_HELD.store(0, Ordering::Relaxed);
     typematic::IDLE_RUN.store(0, Ordering::Relaxed);
     typematic::LAST_REPORT_MS.store(0, Ordering::Relaxed);
+    // PAL-TYPEMATIC: the re-arm slot and the hold accounting are tracker state too — a leg that inherited a
+    // parked key from the previous leg would re-arm on a key it never pressed.
+    typematic::LAPSED_P1.store(0, Ordering::Relaxed);
+    typematic::HOLD_KEY.store(0, Ordering::Relaxed);
+    typematic::HOLD_REPEATS.store(0, Ordering::Relaxed);
+    typematic::HOLD_REARMS.store(0, Ordering::Relaxed);
+}
+
+/// PAL-TYPEMATIC test aid — the currently armed repeat key, if any. Lets the selftest assert the re-arm
+/// directly (state), not only through an emitted repeat (behaviour). Not used on any boot path.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+pub fn typematic_test_armed() -> Option<u8> {
+    let kp1 = typematic::KEY_P1.load(core::sync::atomic::Ordering::Relaxed);
+    (kp1 != 0).then(|| (kp1 - 1) as u8)
+}
+
+/// PAL-TYPEMATIC test aid — fire the LIVENESS LAPSE on whatever is armed, through the same
+/// `typematic_lapse_disarm` seam `typematic_tick`'s layer-3 arm uses. Driving the lapse by the CLOCK instead
+/// would mean stalling the selftest for a real `LIVENESS_MS`/`HOLD_MAX_MS`, or putting a test hook in the
+/// production window comparison — this touches neither. Not used on any boot path.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+pub fn typematic_test_force_lapse() {
+    let kp1 = typematic::KEY_P1.load(core::sync::atomic::Ordering::Relaxed);
+    if kp1 != 0 {
+        typematic_lapse_disarm((kp1 - 1) as u8);
+    }
 }
 
 /// UVUG-9 — the consecutive unchanged-held reports required to latch the streaming verdict, mirrored so the
@@ -821,9 +1626,14 @@ pub fn typematic_test_reset() {
 pub const TYPEMATIC_IDLE_RUN_TO_LATCH: u32 = typematic::IDLE_RUN_TO_LATCH;
 
 fn pop_event() -> Option<Event> {
-    let ev = crate::arch::without_interrupts(|| EVENT_QUEUE.lock().pop());
+    let ev = crate::arch::without_interrupts(|| {
+        let mut q = EVENT_QUEUE.lock();
+        // R0 / rtwit — EVENT_QUEUE max-hold on the DRAIN side (see `push_event`).
+        let _evh = crate::rtwit::hold(crate::rtwit::Lock::Evq);
+        q.pop()
+    });
     if ev.is_some() {
-        // UVUG-10: total consumption, across EVERY consumer — the router drain, the EL0 focus-change
+        // UVUG-10: total consumption, across EVERY consumer — the router drain, the user focus-change
         // discard, `pump_and_poll`. `push - drop - pop` is the live ring occupancy; a `pop` count far
         // above the router drain's own `[uvug9]` totals names a second consumer as the thief.
         EVQ_POP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -853,7 +1663,7 @@ pub fn requeue_event(event: Event) {
 /// The seam was written for a strict peek: pop uncounted, re-push uncounted, nothing enters or leaves the
 /// pipeline. The compositor's shell-side TAB breaks that symmetry — the TAB itself is consumed by the
 /// window system, and on a real focus change the events held in the peek buffer are discarded (they are
-/// out of the queue only because the peek holds them; `el0_input_set_active` drains `EVENT_QUEUE` on every
+/// out of the queue only because the peek holds them; `user_input_set_active` drains `EVENT_QUEUE` on every
 /// focus change and would have taken them itself). Those events entered through `push_event` and were
 /// COUNTED, so leaving them uncounted on the way out drifts `[uvug10] evq`'s `push - drop - pop`
 /// occupancy permanently high — by the buffer size plus one per consumed cycle. Call this with the number
@@ -887,7 +1697,9 @@ pub fn next_event() -> Option<Event> {
 /// returns one event. The bare-metal Pi routes keys through a separate scheduled input service /
 /// channel rather than this queue, so that path is unaffected here.
 pub fn pump_and_poll() -> Option<Event> {
-    if let Some(x) = crate::drivers::xhci::XHCI_CONTROLLER.lock().as_mut() {
+    // WEDGE-8 (F3): claim, don't lock — a Busy claim (a BOT transaction in flight elsewhere)
+    // skips this poll rather than spinning on a preemptible holder; the caller polls again.
+    if let Ok(mut x) = crate::drivers::xhci::claim() {
         x.poll_events();
     }
     // RMBP-FIX M3 (x86 EHCI): the internal rMBP keyboard/trackpad ride the EHCI HID path, not xHCI.
@@ -976,6 +1788,59 @@ impl<'a> GneissPal for TargetPal<'a> {
     }
 
     /// Present the frame: flush the damaged region of the back buffer to the framebuffer.
+    ///
+    /// CURSOR-X86 — and, where the compositor sprite owns the pointer's pixels, bracket that flush.
+    ///
+    /// `Screen::flush` copies back-buffer pixels over the front framebuffer's damaged rects. The
+    /// front buffer is where the sprite lives, so an unbracketed flush would both erase the arrow and
+    /// invalidate its save-under — the next restore would stamp pre-flush content back over whatever
+    /// the desktop had just presented. The Pi's render task has always taken this bracket around its
+    /// own `pal.render()` call; putting it HERE instead of at the x86 call sites is what makes it
+    /// hold for every `Screen`-backed present on the target, including the ones inside the
+    /// full-screen demos' frame loops, without editing any of them.
+    ///
+    /// `undraw` before, `ensure_drawn` after — not `repaint` after. `ensure_drawn` is WC-I's
+    /// idempotent tail: it re-establishes a sprite that is down and does nothing to one that is up,
+    /// so a present that ran while the pointer was hidden costs one lock acquisition and a boolean.
+    /// (`repaint` would run a whole restore → save → draw cycle per present, which is the churn WC-I
+    /// removed.) Both halves are no-ops before the first pointer report of the boot, which is every
+    /// headless gate.
+    ///
+    /// ### CURSOR-14 — and the bracket is GONE, because `Screen::flush` took it
+    ///
+    /// The paragraphs above are the CURSOR-1 contract, and they were correct for as long as
+    /// `Screen::flush` was one opaque present. CURSOR-13 split that function into its two halves and
+    /// gave the DESKTOP half a bracket of its own — `undraw()` … `present_background()` …
+    /// `repaint()` — so everything this one used to protect is protected one frame deeper, by the
+    /// code that actually writes the pixels.
+    ///
+    /// What was left here is not merely redundant. It was the last caller-side bracket on this arch,
+    /// and it still spanned real work:
+    ///
+    /// * **Cost.** Two wasted `SPRITE` acquisitions per present: this `undraw` handed the sprite back
+    ///   only for `flush`'s own `undraw` to find it already down, and this `ensure_drawn` found it
+    ///   already up. An earlier arc flagged that; this is the arc that can act on it, because only
+    ///   now does something else own the sprite across the whole call.
+    /// * **Correctness, which is why it goes rather than merely shrinks.** From this `undraw` to
+    ///   `flush`'s `repaint` the arrow was off the panel for the length of the entire desktop blit —
+    ///   the longest front-buffer write in the system. A composite reached during that window from
+    ///   ANOTHER core, or from an IRQ-context printer on this one (the routed console:
+    ///   `fbcon::route_present_rows` → `wm::present_rows` → `composite`), entered with
+    ///   `sprite_plan() == None` and was starved of compose-through exactly as the flush path was
+    ///   before CURSOR-13. Deleting the pair narrows that window to `present_background` alone, which
+    ///   is the smallest it can be while a raw desktop blit exists at all.
+    ///
+    /// Nothing is left unbracketed. `self.surface` is a [`crate::video::screen::Screen`] for every
+    /// construction of this type on every target, so `flush` is always the CURSOR-13 body; and that
+    /// body closes UNCONDITIONALLY with a cursor draw, before the composite, so a present that
+    /// composites nothing at all (`wm::service_damage` early-returns on an undamaged table) still
+    /// leaves the arrow on glass. The function is now arch-neutral in shape as well as in effect.
+    ///
+    /// FLICKER-3 — the closing verb is `repaint()` when the bracket was taken and `ensure_drawn()`
+    /// when it was skipped, because the bracket itself is now gated on the present's damage
+    /// actually meeting the sprite. The guarantee this paragraph asserts is unchanged — both verbs
+    /// leave the arrow on glass — and `ensure_drawn` is the cheaper of the two precisely on the
+    /// path where nothing disturbed the sprite. See `Screen::flush`.
     fn render(&mut self) {
         self.surface.flush();
     }

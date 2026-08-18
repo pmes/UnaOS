@@ -765,7 +765,7 @@ fn witness_link_speed_width(ctx: &str) {
 /// fault — it STALLS the CPU on the bus for a pathologically long time (the run appeared frozen; a
 /// power-cycled rerun eventually returned 0). Adopt is retired: there is nothing live to adopt here.
 ///
-/// PIUSB-41 — WHY THIS DUMP IS NOW KNOB-GATED. P60 is the first real cold-boot measurement of the
+/// PIUSB-43 — WHY THIS DUMP IS NOW KNOB-GATED. P60 is the first real cold-boot measurement of the
 /// bracket chain, and it indicts this function, not the bring-up: total PCIe/VL805 bringup 141.8s, of
 /// which `stage=fw-state-dump took=129688ms` and (nested inside it) `stage=dump-linkdown-rc-claim
 /// took=32410ms`, while every FUNCTIONAL stage is fast (m1-rc-bringup 340ms, m2-enumerate-vl805 564ms,
@@ -789,7 +789,7 @@ fn witness_link_speed_width(ctx: &str) {
 /// on the always-read path above the `deep` gate, so the knob cannot change what is threaded out). It
 /// returns them because the caller's PIUSB-16 entry-link discriminator needs exactly these two values
 /// and used to re-read them microseconds later. On the cold-boot link-down path each bare RC-APB read
-/// costs ~10s (PIUSB-41's measurement: the RC is held in reset and the load is absorbed by the bridge's
+/// costs ~10s (PIUSB-43's measurement: the RC is held in reset and the load is absorbed by the bridge's
 /// completion-timeout machinery), so that duplicate pair was pure waste — worth AT MOST ~10.9s, which is
 /// all P60's total leaves for it once the dump and the functional stages are subtracted (a uniform
 /// 2 × ~10s extrapolation would say ~21s, but that exceeds the residual; see 5h). Threading them out is
@@ -802,7 +802,7 @@ fn dump_firmware_state() -> (u32, u32) {
     serial_println!(
         "{} PIUSB-5: pre-reset firmware reference dump (read-only; BEFORE any RC reset) — mode={} ::",
         P,
-        if deep { "DEEP (usbdebug: full RC register dump + RC-claim witness)" } else { "SUMMARY (default-quiet: 2 gate registers only; build UNAOS_USBDEBUG=1 for the full dump — PIUSB-41: each RC-APB read costs ~10s while the fw holds the RC in reset)" }
+        if deep { "DEEP (usbdebug: full RC register dump + RC-claim witness)" } else { "SUMMARY (default-quiet: 2 gate registers only; build UNAOS_USBDEBUG=1 for the full dump — PIUSB-43: each RC-APB read costs ~10s while the fw holds the RC in reset)" }
     );
 
     // (1) The TWO registers the gate needs, always. These are the RC's OWN register block (the
@@ -869,7 +869,7 @@ fn dump_firmware_state() -> (u32, u32) {
         //    cannot separate them and neither could P59a's log, because none of them printed anything.
         //    These three brackets make the next boot name it: whichever `[piusb40]` line is MISSING is the
         //    stage that wedged. They are pure counter reads + serial — they add no bus traffic of their own.
-        //    PIUSB-41: P60 finally timed this witness — `stage=dump-linkdown-rc-claim took=32410ms`
+        //    PIUSB-43: P60 finally timed this witness — `stage=dump-linkdown-rc-claim took=32410ms`
         //    for its THREE RC-APB reads (MISC_CTRL + RC_BAR2_CONFIG_LO/HI), ~10.8s each, matching the
         //    per-read cost the enclosing dump shows. It is a pure diagnostic (read-only; M1 reprograms
         //    MISC_CTRL/RC_BAR2 itself and proves the result with its own readback line), and its family
@@ -1106,7 +1106,7 @@ fn bringup_inner(dtb: u64) {
     //    gated ON its verdict, and PCIE_STATUS is read-only status the RC updates only in response
     //    to a link event M1 has not yet triggered. So the re-read could only ever have returned the
     //    same bits — while the firmware holds the RC in reset each absorbed RC-APB read runs ~10s
-    //    (PIUSB-41), so this bought AT MOST ~10.9s of nothing: that is the whole residual P60's
+    //    (PIUSB-43), so this bought AT MOST ~10.9s of nothing: that is the whole residual P60's
     //    141.8s total leaves after the 129.688s dump and the 1.236s of m1/m2/m3, and it is SHARED
     //    with `census-power-clock`, which P60 never separated from it. Do not quote ~21s (the naive
     //    2 × ~10s) as measured — it exceeds that residual. This stage's own `took=`, which the
@@ -2170,6 +2170,254 @@ impl EnumWitness {
     }
 }
 
+// ── PIUSB-43: the enum-portsc witness. PA5c metal ran the FULL 30 s enum-pump budget with ZERO
+//    port-connect events, and the wire could not say WHICH link died: no device electrically
+//    present (CCS never set)? CCS set but no Port Status Change Event ever generated? events
+//    written but never consumed off our ring? or PP/link state regressed after the "M3: root
+//    port(s) powered" line? This witness samples every root port's RAW PORTSC word — raw printed
+//    beside every decode, the frozen-register discipline — plus the event-ring consumer state
+//    (dequeue index/cycle, total TRBs consumed, a fresh-TRB peek, IMAN) at pump START, on a ~2 s
+//    cadence through the pump, and once at pump END, then closes with ONE verdict line naming the
+//    branch the sample series actually supports. Read-only on the sample cadence: PORTSC reads
+//    latch nothing (all change bits are RW1C and we never write), IMAN is read not acknowledged,
+//    and the ring peek is `has_event` (cache invalidate + volatile read — no state change). No
+//    pump logic, budget, or write is touched.
+//
+//    Default-ON, deliberately: the instrument's whole reason to exist is the failing path, and a
+//    knob-off default would be the classic unreachable-instrument mistake. QEMU raspi4b never
+//    reaches the pump (`XHCI_READY` gate — no PCIe RC/VL805 modeled), so the witness is
+//    hardware-gated quiet there and the QEMU log stays byte-identical.
+//
+//    Line budget: 1 HCSPARAMS1 + 1 start + <=13 periodic + 1 end + 1 verdict = <=17 lines per boot; an
+//    early-exiting healthy pump emits as few as 3.
+const PIUSB43_MAX_PORTS: usize = 8; // VL805 exposes 5 root ports; clamp for the fixed arrays
+const PIUSB43_PERIODIC_CAP: u32 = 13; // 30 s / 2 s = 15 interior ticks; cap keeps the budget honest
+
+struct PortscWitness {
+    /// xHCI operational base (CAP base + CAPLENGTH); PORTSC(n) at +0x400 + 0x10*(n-1).
+    op_base: u64,
+    /// Interrupter 0 register base (IMAN at +0). 0 = not published; IMAN then prints as absent.
+    ir0_base: u64,
+    ports: usize,
+    /// Pump-start raw PORTSC words — the REGRESSED reference. M3's claim (PP set on all root
+    /// ports) is checked against these, and these against every later sample.
+    baseline: [u32; PIUSB43_MAX_PORTS],
+    have_baseline: bool,
+    saw_ccs: u32, // bitmask: port ever sampled CCS=1
+    saw_csc: u32, // bitmask: port ever sampled CSC=1 (a connect toggled between samples)
+    /// First PP 1->0 observed vs baseline: (port, baseline raw, regressed raw).
+    pp_drop: Option<(usize, u32, u32)>,
+    /// First PLS change vs baseline on a port that never showed CCS: (port, baseline raw, raw).
+    pls_change: Option<(usize, u32, u32)>,
+    end_pend: bool,  // has_event() at the most recent sample (the END sample decides)
+    end_popped: u64, // total event TRBs consumed as of the most recent sample
+    periodic: u32,
+    /// First poison PORTSC read: (port, raw). A non-decoding BAR reads 0xffffffff, which DECODES as
+    /// CCS=1 CSC=1 PED=1 PP=1 — indistinguishable from a live connect on the decode alone. Latched
+    /// here so the sample series is disqualified rather than believed (PI-V3D-1 false-PASS rule).
+    poison: Option<(usize, u32)>,
+}
+
+impl PortscWitness {
+    fn new(op_base: u64, ir0_base: u64, ports: usize) -> Self {
+        Self {
+            op_base,
+            ir0_base,
+            ports,
+            baseline: [0; PIUSB43_MAX_PORTS],
+            have_baseline: false,
+            saw_ccs: 0,
+            saw_csc: 0,
+            pp_drop: None,
+            pls_change: None,
+            end_pend: false,
+            end_popped: 0,
+            periodic: 0,
+            poison: None,
+        }
+    }
+
+    /// One sample = ONE serial line: every root port's raw PORTSC beside its decode, then the
+    /// event-ring consumer state. Read-only throughout (see the block comment above).
+    fn sample(&mut self, tag: &str) {
+        use core::fmt::Write as _;
+        let mut line = alloc::string::String::new();
+        let freq = super::timer::cntfrq().max(1);
+        let t_ms = super::timer::cntpct().saturating_mul(1000) / freq;
+        let _ = write!(line, "{} [piusb43] portsc {} t={}ms", P, tag, t_ms);
+        for i in 0..self.ports {
+            let raw = r(self.op_base + 0x400 + (i as u64) * 0x10);
+            // A poison word is NOT live data. Print it with an explicit tell and accumulate NOTHING
+            // from it: 0xffffffff would otherwise set saw_ccs/saw_csc and drive verdict() into
+            // CCS-NO-EVENT ("a device was seen electrically") off a BAR that stopped decoding.
+            if is_poison(raw) {
+                let _ = write!(line, " p{}={:#010x}(POISON — not decoded)", i + 1, raw);
+                if self.poison.is_none() {
+                    self.poison = Some((i + 1, raw));
+                }
+                continue;
+            }
+            let ccs = raw & 1;
+            let csc = (raw >> 17) & 1;
+            let ped = (raw >> 1) & 1;
+            let pp = (raw >> 9) & 1;
+            let pls = (raw >> 5) & 0xF;
+            let spd = (raw >> 10) & 0xF;
+            let _ = write!(
+                line,
+                " p{}={:#010x}(CCS={} CSC={} PED={} PP={} PLS={} spd={})",
+                i + 1, raw, ccs, csc, ped, pp, pls, spd
+            );
+            if ccs == 1 {
+                self.saw_ccs |= 1 << i;
+            }
+            if csc == 1 {
+                self.saw_csc |= 1 << i;
+            }
+            if self.have_baseline {
+                let b = self.baseline[i];
+                if self.pp_drop.is_none() && (b >> 9) & 1 == 1 && pp == 0 {
+                    self.pp_drop = Some((i + 1, b, raw));
+                }
+                if self.pls_change.is_none() && ccs == 0 && (b & 1) == 0 && ((b >> 5) & 0xF) != pls {
+                    self.pls_change = Some((i + 1, b, raw));
+                }
+            } else {
+                self.baseline[i] = raw;
+            }
+        }
+        // Event-ring consumer state. The EVENT_RING lock is taken alone here — the caller does NOT
+        // hold the XHCI_CONTROLLER guard at sample points, matching poll_events' take-then-release
+        // ordering, and the IRQ path never takes these locks (raw-MMIO-only by contract).
+        let (deq, cyc, pend, popped) = {
+            let g = xhci::EVENT_RING.lock();
+            match g.as_ref() {
+                Some(er) => (er.dequeue_index, er.cycle_bit as u32, er.has_event(), er.popped),
+                None => (0, 0, false, 0),
+            }
+        };
+        self.end_pend = pend;
+        self.end_popped = popped;
+        if self.ir0_base != 0 {
+            let iman = r(self.ir0_base);
+            let _ = write!(
+                line,
+                " | evt deq={} cyc={} popped={} pend={} IMAN={:#010x}(IP={} IE={}) ::",
+                deq, cyc, popped, pend as u32, iman, iman & 1, (iman >> 1) & 1
+            );
+        } else {
+            let _ = write!(
+                line,
+                " | evt deq={} cyc={} popped={} pend={} IMAN=unpublished ::",
+                deq, cyc, popped, pend as u32
+            );
+        }
+        serial_println!("{}", line);
+        self.have_baseline = true;
+    }
+
+    /// ONE verdict line at pump end, naming the branch the sample series supports — and ONLY that.
+    /// Branch priority: an unconsumed ring first (it invalidates any silence claim downstream of
+    /// it), then powered-state regressions, then the device-evidence branches. A state the samples
+    /// cannot distinguish prints UNRESOLVED naming the read that would decide it.
+    fn verdict(&self, advanced: Option<&str>) {
+        // The pump reached a terminal SUCCESS state. Every branch below names a way the connect
+        // path died; none of them may speak here. PA6 metal printed a confident
+        // "yet enumeration did not advance" while the hub was walked, slots addressed and the
+        // keyboard armed — the verdict was asserting a state it had never checked.
+        if let Some(how) = advanced {
+            serial_println!(
+                "{} [piusb43] verdict=ADVANCED — the pump exited on a terminal success ({}); the connect path did NOT die and no death branch is claimed. Ring at exit: popped={} pend={} ::",
+                P, how, self.end_popped, self.end_pend as u32
+            );
+            return;
+        }
+        if !self.have_baseline {
+            serial_println!(
+                "{} [piusb43] verdict=UNRESOLVED — no sample was ever taken (pump exited before the start sample); this instrument did not execute in the state it reports on, so its silence is not evidence ::",
+                P
+            );
+            return;
+        }
+        // Ring holds a fresh TRB at exit AND nothing was ever consumed: events reached the ring
+        // but the consumer never took one. (pend=1 with popped>0 is NOT this branch — the pump
+        // was draining and one more event arrived after the last poll; the end sample line shows
+        // it either way.)
+        if self.end_pend && self.end_popped == 0 {
+            // The ring finding is DRAM-derived and survives a dark BAR — but if PORTSC read poison
+            // this line must carry that tell too, or it is the same confident-verdict-from-a-dark-
+            // window defect the poison branch below exists to prevent, just pointing the other way.
+            match self.poison {
+                Some((port, raw)) => serial_println!(
+                    "{} [piusb43] verdict=EVENTS-UNCONSUMED — the event ring holds a fresh TRB at pump exit (pend=1) and popped=0 events were consumed all pump: events reached the ring, the consumer never took one. CAVEAT: port {} PORTSC read back {:#010x} (poison), so this ring finding stands but NO PORTSC-derived reading does ::",
+                    P, port, raw
+                ),
+                None => serial_println!(
+                    "{} [piusb43] verdict=EVENTS-UNCONSUMED — the event ring holds a fresh TRB at pump exit (pend=1) and popped=0 events were consumed all pump: events reached the ring, the consumer never took one ::",
+                    P
+                ),
+            }
+            return;
+        }
+        // A poison PORTSC read disqualifies every PORTSC-DERIVED branch below (REGRESSED,
+        // CCS-NO-EVENT, NO-CCS-EVER all rest on those words). It is checked AFTER the ring branch
+        // above because that one is derived from the event ring in DRAM, not from this MMIO window,
+        // and stays sound while the BAR is dark. The raw ring words ride this line so nothing the
+        // series did observe is lost.
+        if let Some((port, raw)) = self.poison {
+            serial_println!(
+                "{} [piusb43] verdict=UNRESOLVED — port {} PORTSC read back {:#010x} (poison): the xHC register window stopped decoding, so the PORTSC-derived branches cannot be judged (that word decodes as CCS=1 CSC=1 PED=1 PP=1 and would otherwise be read as a device). Ring state at exit: popped={} pend={}. Deciding read: re-probe the VL805's PCIe config vendor:device and BAR decode enable — a live 1106:3483 means the window is back and the pump should be re-run; poison there means the RC link or the BAR window dropped ::",
+                P, port, raw, self.end_popped, self.end_pend as u32
+            );
+            return;
+        }
+        // M3 said all root ports powered; a baseline PP=0 means the regression happened BETWEEN
+        // the M3 line and the pump start.
+        for i in 0..self.ports {
+            if (self.baseline[i] >> 9) & 1 == 0 {
+                serial_println!(
+                    "{} [piusb43] verdict=REGRESSED — port {} PORTSC={:#010x} already shows PP=0 at pump start, but M3 reported PORTSC.PP set on all root ports: the powered state regressed between M3 and the pump ::",
+                    P, i + 1, self.baseline[i]
+                );
+                return;
+            }
+        }
+        if let Some((port, before, after)) = self.pp_drop {
+            serial_println!(
+                "{} [piusb43] verdict=REGRESSED — port {} PP dropped during the pump: PORTSC {:#010x} (pump start) -> {:#010x}; the M3 powered state did not hold ::",
+                P, port, before, after
+            );
+            return;
+        }
+        let dev = self.saw_ccs | self.saw_csc;
+        if dev != 0 {
+            if self.end_popped == 0 {
+                serial_println!(
+                    "{} [piusb43] verdict=CCS-NO-EVENT — port mask {:#x} showed CCS/CSC set in the samples, yet popped=0 event TRBs were consumed and none is pending at exit: a device was seen electrically but no Port Status Change Event reached the ring — event path suspect ::",
+                    P, dev
+                );
+            } else {
+                serial_println!(
+                    "{} [piusb43] verdict=UNRESOLVED — port mask {:#x} showed CCS/CSC and popped={} event TRBs were consumed, yet enumeration did not advance; deciding read: a TRB-type census of the consumed events (was any a Port Status Change Event, and for which port) — this witness does not retain popped TRB types ::",
+                    P, dev, self.end_popped
+                );
+            }
+            return;
+        }
+        if let Some((port, before, after)) = self.pls_change {
+            serial_println!(
+                "{} [piusb43] verdict=REGRESSED — port {} link state moved without a connect: PORTSC {:#010x} (pump start) -> {:#010x} (PLS changed, CCS never set); the link regressed vs the M3 state ::",
+                P, port, before, after
+            );
+            return;
+        }
+        serial_println!(
+            "{} [piusb43] verdict=NO-CCS-EVER — all {} root ports sampled CCS=0 CSC=0 at every sample across the pump (PP held, PLS stable, popped={}): no device was electrically visible to the VL805 ::",
+            P, self.ports, self.end_popped
+        );
+    }
+}
+
 /// PI-USB-2 M3 — the DMA-side bring-up + device enumeration on the VL805. Called ONCE on the BSP,
 /// post-heap (kernel_main), after `bringup` reached the honesty line pre-heap. Reuses the shared xHCI
 /// driver's polled-attach machinery verbatim (the JB2b pattern, `xusb_tegra::jb2b_attach`) with ZERO
@@ -2253,7 +2501,7 @@ pub fn enumerate() {
         x.init_interrupter(event_ring_phys, erst_table_phys);
         x.init_pointers(command_ring_phys);
         x.start();
-        *xhci::XHCI_CONTROLLER.lock() = Some(x);
+        xhci::install(x);
     }
     stage_end("enum-rings-rs1", t_rings);
 
@@ -2288,14 +2536,63 @@ pub fn enumerate() {
         "{} [enum] observer armed — watching root-port connect/speed, slot assign/address, HID arm, first report (silent unless enumeration advances) ::",
         P
     );
+    // PIUSB-43: arm the enum-portsc witness — start sample now, ~2 s cadence inside the loop,
+    // end sample + verdict after it. All reads, no pump-logic change (see the witness block doc).
+    // HCSPARAMS1 is read the same way and gets the same poison discipline: a poison word yields
+    // MaxPorts=0xff, which the clamp would silently turn into 8 — three ports past the VL805's five,
+    // sampled as if they existed. Poison here means the window is dark, so fall back to the known
+    // VL805 port count and let the per-port poison tell in `sample()` name the state on the wire.
+    // The port count is a DERIVED value, so its raw word rides the wire UNCONDITIONALLY — otherwise
+    // NO-CCS-EVER quotes "all N root ports" with nothing letting a reader check where N came from.
+    // `0` is poison here too (this file's own idiom at the CAP[0] probe): a zero read would clamp to
+    // 1 and the witness would report NO-CCS-EVER across "all 1 root ports".
+    let hcs1 = r(base + 0x04);
+    let ports = if is_poison(hcs1) || hcs1 == 0 {
+        serial_println!(
+            "{} [piusb43] HCSPARAMS1={:#010x} (poison/zero) — MaxPorts unreadable; sampling the VL805's 5 root ports and expecting the per-port poison tell below ::",
+            P, hcs1
+        );
+        5
+    } else {
+        let n = (((hcs1 >> 24) & 0xff) as usize).clamp(1, PIUSB43_MAX_PORTS);
+        serial_println!(
+            "{} [piusb43] HCSPARAMS1={:#010x} MaxPorts={} — sampling {} root port(s) ::",
+            P, hcs1, (hcs1 >> 24) & 0xff, n
+        );
+        n
+    };
+    let mut pw = PortscWitness::new(
+        base + cap_length,
+        xhci::XHCI_IR0_BASE.load(Ordering::Acquire) as u64,
+        ports,
+    );
+    pw.sample("start");
+    let mut pw_last = super::timer::cntpct();
+    // PIUSB-43r3: what the pump ACHIEVED, for the verdict. PA6 metal printed
+    // "verdict=UNRESOLVED — … yet enumeration did not advance" on a boot that enumerated a hub,
+    // addressed slots and armed a keyboard: the verdict had no success branch and asserted a
+    // failure it never checked. The witness must know how the pump exited before it names a death.
+    let mut enum_advanced: Option<&'static str> = None;
     loop {
         // XHCI-COHERENCE: no external cache maintenance here anymore. The driver's `poll_events`
         // invalidates the event ring at each dequeue (`EventRing::has_event`) and cleans every command
         // TRB it pushes (`ring::write_trb`), so the enable-slot handshake is coherent by construction
         // on aarch64 without this loop touching the caches.
         let (armed_now, storage_slot, storage_ready) = {
-            let mut guard = xhci::XHCI_CONTROLLER.lock();
-            let x = guard.as_mut().unwrap();
+            // WEDGE-8 (F3): the boot pump claims the LOAN per pass — the storage bring-up inside
+            // `service_storage` reaches `pump_until_bot_done` and must never run under a held lock.
+            // At this boot stage the scheduled pump task is not yet the loan's owner, but the claim
+            // is still fallible by contract; a Busy pass just spins the loop once more.
+            let Ok(mut x) = xhci::claim() else {
+                // Still honour the pump deadline (wrap-safe, same test as the loop bottom) so a
+                // claim that never succeeds cannot turn this bounded pump into a spin forever.
+                if super::timer::cntpct().wrapping_sub(deadline) < (1u64 << 63) {
+                    break;
+                }
+                core::hint::spin_loop();
+                continue;
+            };
+            let x = &mut *x;
             x.poll_events();
             x.service_hubs();
             x.service_hid_setproto();
@@ -2313,6 +2610,16 @@ pub fn enumerate() {
                 ready,
             )
         };
+        // PIUSB-43: ~2 s sample cadence, bounded, taken with the controller guard already
+        // dropped (the block above closed) so the witness's EVENT_RING lock is taken alone.
+        if pw.periodic < PIUSB43_PERIODIC_CAP {
+            let now = super::timer::cntpct();
+            if now.wrapping_sub(pw_last) >= freq.saturating_mul(2) {
+                pw.periodic += 1;
+                pw_last = now;
+                pw.sample("pump");
+            }
+        }
         if armed.is_none() {
             if let Some((slot, port)) = armed_now {
                 serial_println!("{} enumerate: keyboard ARMED (slot {}, root port {}) -> PASS ::", P, slot, port);
@@ -2325,10 +2632,12 @@ pub fn enumerate() {
         // keyboard-first carryover that left a disk-only Pi boot spinning to the 30 s deadline).
         if storage_ready {
             serial_println!("{} enumerate: mass storage ready (slot {}) ::", P, storage_slot);
+            enum_advanced = Some("mass storage ready");
             break;
         }
         if armed.is_some() {
             if super::timer::cntpct().wrapping_sub(armed_at) >= storage_settle {
+                enum_advanced = Some("keyboard armed, no mass storage within the settle window");
                 break; // keyboard up, no disk within the settle window — stop
             }
         }
@@ -2340,6 +2649,10 @@ pub fn enumerate() {
         core::hint::spin_loop();
     }
 
+    // PIUSB-43: end sample + the one verdict line, before the stage bracket closes.
+    pw.sample("end");
+    pw.verdict(enum_advanced);
+
     stage_end("enum-pump", pump_start);
     stage_end("enum-total", t_enum_total);
 
@@ -2347,7 +2660,7 @@ pub fn enumerate() {
     //     line each, so the boot's serial names the topology it reached (honest even on a no-device or
     //     deadline exit).
     serial_println!("{} enumerate: device topology after the polled walk: ::", P);
-    if let Some(x) = xhci::XHCI_CONTROLLER.lock().as_ref() {
+    if let Ok(x) = xhci::claim() {
         for line in x.port_slot_summary() {
             serial_println!("{}   {} ::", P, line);
         }

@@ -112,7 +112,13 @@ impl SectorDevice for SdSectorDevice {
             Ok(512) => Ok(()),
             Ok(n) => Err(SectorError::Io(format!("short sector read: {n} bytes"))),
             Err(BlockError::BadLba) => Err(SectorError::OutOfBounds(lba)),
-            Err(e) => Err(SectorError::Io(format!("block layer: {e:?}"))),
+            Err(e) => {
+                // UNAFSTXN: a `Busy` is TRANSIENT contention, not a medium fault — latch it for the
+                // enclosing [`with_unafs`] hold before it collapses into the crate's opaque
+                // `SectorError::Io`. See [`note_sector_busy`].
+                note_sector_busy(&e);
+                Err(SectorError::Io(format!("block layer: {e:?}")))
+            }
         }
     }
 
@@ -130,7 +136,13 @@ impl SectorDevice for SdSectorDevice {
         match block::write_block(lba, buf) {
             Ok(()) => Ok(()),
             Err(BlockError::BadLba) => Err(SectorError::OutOfBounds(lba)),
-            Err(e) => Err(SectorError::Io(format!("block layer: {e:?}"))),
+            Err(e) => {
+                // UNAFSTXN: as on the read twin — latch a transient `Busy` for the enclosing
+                // [`with_unafs`] hold. A `Busy` here means the CMD24 ladder never STARTED (the
+                // claim was refused before any command issued), so this sector is untouched.
+                note_sector_busy(&e);
+                Err(SectorError::Io(format!("block layer: {e:?}")))
+            }
         }
     }
 
@@ -167,6 +179,16 @@ pub enum MountError {
     NoVolume,
     /// The filesystem itself refused the mount.
     Fs(FileSystemError),
+    /// UNAFSTXN: the storage device stayed loaned out to another context for the whole of
+    /// [`with_unafs`]'s bounded restart budget, so the transaction could not be run to completion.
+    ///
+    /// TRANSIENT, and it says so honestly: nothing was mutated (the restart precondition is that no
+    /// root ever flipped — see [`with_unafs_attempt`]'s durable-progress fence), the committed tree
+    /// is exactly what it was, and the caller may simply try again. This is the unafs twin of
+    /// `FatError::Busy`/`BlockError::Busy`, and the reason it is a variant rather than a `Fs(..)`
+    /// or an `Io`: the WEDGE family's standing rule is that a refusal from CONTENTION must never be
+    /// indistinguishable on the wire from a refusal by dead hardware.
+    Busy,
 }
 
 /// A mounted read-only UnaFS volume over the kernel block layer.
@@ -198,9 +220,93 @@ pub fn locate() -> Result<PartitionSpan, MountError> {
 pub fn mount() -> Result<KernelUnaFS, MountError> {
     install_warn_hook();
     let span = locate()?;
+    partition_witness(&span);
     let dev = SdSectorDevice::open()?;
     let adapter = BlockAdapter::for_partition(dev, &span);
     UnaFS::mount(adapter).map_err(MountError::Fs)
+}
+
+/// PARTITION (GR9): cross-check the located UnaFS span against the kernel block layer's own MBR
+/// decode, once per boot.
+///
+/// There are TWO independent partition-table readers in this tree: the unafs crate's
+/// `parse_partitions` (which `locate_unafs` uses to find this volume by superblock magic) and the
+/// kernel block layer's [`block::decode_mbr`] (which the FAT mount uses to bind the ESP). They were
+/// written at different times against the same spec, so "they agree on this medium" is a real,
+/// falsifiable claim about the disk in the machine — and the one that matters, because if they
+/// disagreed the ESP and the native volume could be bound to overlapping extents. This is the check
+/// that makes the layout of record (p1 ESP, p2 UnaFS) an observed fact rather than an assumption.
+///
+/// Strictly read-only and strictly advisory: every outcome is a printed line, never an error. It
+/// cannot change what gets mounted, so a wrong witness can mislead a reader but can never corrupt a
+/// volume. The magic re-read goes through a [`block::PartitionRange`], i.e. through the bounded,
+/// partition-RELATIVE addressing path — so a PASS also proves that path maps sector 0 of the
+/// partition to the same bytes the crate's adapter reached by its own arithmetic.
+///
+/// INSTRUMENT NOTE (healthy-but-idle): the latch reads false until the first UnaFS mount of the boot
+/// and true forever after; it gates printing only. On the layout of record the line reads
+/// `slot=2 ... magic=ok fits=yes`, from the very first mount, and nothing about an idle system can
+/// change any field on it — every value is a property of the medium, read at a moment when the
+/// volume has just been located and is therefore defined.
+fn partition_witness(span: &PartitionSpan) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let Some(dev) = block::info() else {
+        serial_println!(":: PART: unafs span check — no block device ::");
+        return;
+    };
+    let mut sec = [0u8; 512];
+    if block::read_block(0, &mut sec).is_err() {
+        serial_println!(":: PART: unafs span check — LBA 0 unreadable ::");
+        return;
+    }
+    // The census may already have printed for this handle (the FAT mount runs first on most boots);
+    // calling it again is harmless and guarantees the raw bytes are in the log even on a boot where
+    // no FAT volume was ever mounted.
+    let Some(table) = block::mbr_census(block::BlockHandle::Global, &sec, dev.num_blocks) else {
+        serial_println!(
+            ":: PART: unafs span check — no MBR at LBA 0; unafs span base={} blocks={} ::",
+            span.base_lba, span.block_count
+        );
+        return;
+    };
+
+    // Which accepted primary contains the located span's base sector?
+    let Some(p) = table.iter().find(|p| p.start_lba == span.base_lba) else {
+        serial_println!(
+            ":: PART: unafs span check — base LBA {} is NOT the start of any accepted MBR partition (blocks={}) ::",
+            span.base_lba, span.block_count
+        );
+        return;
+    };
+
+    // Does the mounted volume fit inside that partition? `block_count` is 4096 B blocks; the
+    // partition is counted in 512 B sectors, so eight sectors per block. Checked, not assumed.
+    let fits = span
+        .block_count
+        .checked_mul(8)
+        .map(|s| s <= p.sector_count)
+        .unwrap_or(false);
+
+    // Re-read the superblock magic through the BOUNDED, partition-relative path.
+    let range = block::PartitionRange::new(block::BlockHandle::Global, &p);
+    let mut b0 = [0u8; 512];
+    let magic_ok = range.read_block(0, &mut b0).is_ok()
+        && b0[..::unafs::superblock::MAGIC.len()] == ::unafs::superblock::MAGIC;
+
+    serial_println!(
+        ":: PART: unafs span check — slot={} type=0x{:02x} part=[{}..{}) span_base={} span_blocks={} fits={} magic={} ::",
+        p.slot,
+        p.type_byte,
+        p.start_lba,
+        p.end_lba(),
+        span.base_lba,
+        span.block_count,
+        if fits { "yes" } else { "NO" },
+        if magic_ok { "ok" } else { "MISSING" }
+    );
 }
 
 /// The single, process-wide UnaFS mount — the K4 coherence keystone.
@@ -212,6 +318,71 @@ pub fn mount() -> Result<KernelUnaFS, MountError> {
 /// clears it.
 static MOUNT: Mutex<Option<KernelUnaFS>> = Mutex::new(None);
 
+/// UNAFSTXN: a transient `BlockError::Busy` was refused to THIS `with_unafs` attempt by the block
+/// layer — the storage device is loaned out to another context (WEDGE-8's xHCI controller mid-BOT,
+/// WEDGE-10's microSD card mid-CMD17/CMD24 ladder) and the claim gave up rather than wait longer.
+///
+/// Set by [`note_sector_busy`] at the [`SdSectorDevice`] seam, and read/cleared by
+/// [`with_unafs_attempt`] strictly INSIDE the same masked `MOUNT` hold that ran the attempt — the
+/// [`MOUNT_DISCARD`] idiom exactly. Every producer (`read_sector`/`write_sector`) runs beneath a
+/// caller that holds `MOUNT`, so this flag is serialized by that lock and can never leak from one
+/// transaction into another.
+///
+/// WHY THE FLAG AND NOT THE ERROR VALUE. The `unafs` crate's seam is `SectorError`, which carries
+/// no contention variant — a `Busy` therefore arrives at [`with_unafs`] already collapsed into
+/// `SectorError::Io("block layer: Busy")` and, one layer further up, into whatever the closure
+/// chose to make of a failed op (`FileSystemError::Storage`, a bare `false`, an `is_err()` that
+/// silently reads as "absent"). Latching at the seam is what preserves the distinction the whole
+/// WEDGE family exists to preserve: a refusal from CONTENTION must never be indistinguishable
+/// from a refusal by DEAD HARDWARE.
+static TXN_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// UNAFSTXN: latch a transient contention refusal for the enclosing transaction. Anything that is
+/// not `Busy` is a real fault and passes through untouched.
+#[inline]
+fn note_sector_busy(e: &BlockError) {
+    if matches!(e, BlockError::Busy) {
+        TXN_BUSY.store(true, Ordering::Relaxed);
+    }
+}
+
+/// UNAFSTXN: how many times one [`with_unafs`] call may run its closure before giving up with
+/// [`MountError::Busy`]. The twin of `fs::fat`'s `RMW_BUSY_ATTEMPTS`, and paired the same way with a
+/// wall-clock cap (`hw_wait_budget()`); both bounds are needed because the two backends refuse on
+/// completely different time scales, and each bound is the binding one on exactly one of them:
+///
+/// * **The wall-clock cap binds the microSD backend.** Since WEDGE-10 a MASKED claimant on emmc2 —
+///   and `with_unafs` is *always* masked, it runs the whole transaction inside `without_interrupts`
+///   — does not get an instant refusal: it spins re-claiming for `MASKED_CLAIM_BUDGET_MS`, 2× the
+///   driver's worst legitimate hold (~2.6 s), before the `Busy` is surfaced at all. So every attempt
+///   that ends in `Busy` here has ALREADY absorbed a full bounded wait, and multiplying that by an
+///   attempt count is the thing to prevent — the deadline stops us after roughly one such wait
+///   rather than eight.
+/// * **The attempt cap binds every instant-refusal backend.** WEDGE-8's xHCI keeps the original
+///   policy (a masked claimant is told `Busy` immediately, `drivers/block.rs::claim_xhci_for_io`),
+///   so on a USB-backed volume the attempts cost nothing but the inter-attempt yield and the
+///   deadline would never fire. The count is what terminates the loop there.
+///
+/// EIGHT, not `fat.rs`'s sixty-four, and the difference is deliberate: a restarted FAT RMW re-runs
+/// ONE sector read-modify-write, whereas a restarted unafs transaction re-runs a whole CoW
+/// transaction — fresh data extents, a re-serialized inode map and refcount map, and a root flip —
+/// off a mount that the abort has just discarded and must therefore re-read from the medium. The
+/// retry is a NET for a handover race (the loan changing hands between the holder's release and our
+/// claim), not a mechanism for out-waiting a wedged card; the block layer's own bounded wait is the
+/// mechanism, exactly as WEDGE-10 states it. Eight is enough to survive several consecutive lost
+/// handovers and small enough that the pathological case is bounded by the deadline instead.
+const TXN_BUSY_ATTEMPTS: u32 = 8;
+
+/// One attempt of [`with_unafs`]: the original masked `MOUNT` hold, plus the verdict on whether the
+/// transaction may be restarted. See [`Attempt`].
+enum Attempt<R> {
+    /// The transaction reached an outcome that must be reported as-is.
+    Settled(Result<R, MountError>),
+    /// The transaction hit a transient `Busy` and left NOTHING durable behind; the cached mount has
+    /// already been discarded inside the hold, so a fresh attempt starts from the committed root.
+    Restart,
+}
+
 /// Run `f` against the one coherent mount, mounting on demand.
 ///
 /// IRQ-masked around the lock (the F3 `NAMESPACE` discipline): a timer preempt
@@ -222,13 +393,45 @@ static MOUNT: Mutex<Option<KernelUnaFS>> = Mutex::new(None);
 /// reasoning the FAT-side `NAMESPACE`/`FAT_MUTATION` locks rest on. Returns
 /// [`MountError`] if the volume cannot be mounted (the cache stays empty, so a
 /// later call retries).
-pub fn with_unafs<R>(f: impl FnOnce(&mut KernelUnaFS) -> R) -> Result<R, MountError> {
+///
+/// UNAFSTXN: `f` is `FnMut` rather than `FnOnce` because a transaction that dies on a transient
+/// `Busy` is RESTARTED — see [`with_unafs`]'s restart loop and [`TXN_BUSY_ATTEMPTS`].
+fn with_unafs_attempt<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R) -> Attempt<R> {
     crate::arch::without_interrupts(|| {
         let mut guard = MOUNT.lock();
+        // UNAFSTXN: open the attempt's contention window, INSIDE the hold. Clearing it before the
+        // acquire would be an SMP bug: a core waiting on `MOUNT` would wipe the latch belonging to
+        // the transaction currently running under it. Under the lock the flag is serialized with
+        // every producer that matters, because every `read_sector`/`write_sector` of a transaction
+        // runs beneath this guard. (The two lock-free probes that also read sectors —
+        // `locate().is_err()` in `vfs`/`syscall` — can still set it from outside; the cost of that
+        // race is at worst one wasted restart, never a wrong answer, because an abort is clean.)
+        TXN_BUSY.store(false, Ordering::Relaxed);
         if guard.is_none() {
-            *guard = Some(mount()?);
+            match mount() {
+                Ok(m) => *guard = Some(m),
+                Err(e) => {
+                    // UNAFSTXN: the MOUNT itself reads sectors (`locate`, the superblock, the
+                    // reclaim drain), so contention can defeat it before the closure ever runs.
+                    // That failure is the same transient and gets the same restart; the cache is
+                    // already empty, so there is nothing to discard.
+                    return if TXN_BUSY.swap(false, Ordering::Relaxed) {
+                        Attempt::Restart
+                    } else {
+                        Attempt::Settled(Err(e))
+                    };
+                }
+            }
         }
-        let r = f(guard.as_mut().expect("mount just populated"));
+        let fs = guard.as_mut().expect("mount just populated");
+        // UNAFSTXN: the durable-progress fence. `commits` counts ROOT FLIPS — the single atomic
+        // point of a CoW transaction — so comparing it across the closure answers exactly one
+        // question: did anything this closure did reach the medium irrevocably? Read from the same
+        // mount instance on both sides, inside one hold, so the comparison is meaningful.
+        let commits_before = fs.commit_stats().commits;
+        let r = f(fs);
+        let busy = TXN_BUSY.swap(false, Ordering::Relaxed);
+        let durable = fs.commit_stats().commits != commits_before;
         // K9-PARITY: mid-staging FAILURE discard (SECURITY.md §K1 K9). A staged ACL persist that
         // fails partway (`native_acl_write_on` -> `request_mount_discard`) leaves UNCOMMITTED in-flight
         // transaction state on this shared, cached mount — the root never flipped (K3 durable-first: the
@@ -244,9 +447,148 @@ pub fn with_unafs<R>(f: impl FnOnce(&mut KernelUnaFS) -> R) -> Result<R, MountEr
         if MOUNT_DISCARD.swap(false, core::sync::atomic::Ordering::Relaxed) {
             *guard = None;
         }
-        Ok(r)
+        if busy && !durable {
+            // UNAFSTXN — CLEAN ABORT. Nothing this transaction touched can be on the medium in a
+            // half-applied form, and that is a property of the FORMAT, not of this code:
+            //   * a `Busy` is produced ONLY by a refused claim (`emmc2::claim_for_io`,
+            //     `block::claim_xhci_for_io`), which returns BEFORE any command is issued — so the
+            //     sector that took the `Busy` was never written, not partially written;
+            //   * under K8a copy-on-write no committed block is ever overwritten in place, and the
+            //     transaction's single atomic point is one 512 B root-slot flip that only happens
+            //     inside `commit()` — which the fence above has just proven did not run;
+            //   * therefore the committed tree on disk is byte-for-byte what it was at entry, and
+            //     any fresh blocks the dead transaction wrote are unreachable residue — the same
+            //     power-cut-equivalent LEAK class the crate's own `txn_unwind` is built around
+            //     ("the root never flipped on any failing path, so the on-disk committed tree is
+            //     ground truth BY DEFINITION").
+            // Discarding the whole cached mount is the strictly stronger form of that unwind: the
+            // next attempt re-derives root, inode map and refcount map from the medium and trusts
+            // nothing left in RAM. Done HERE, inside the same uninterrupted hold, for the K9 reason
+            // above. `Drop` on the discarded mount only calls `flush()`, a no-op on this device —
+            // it cannot write the residue back out.
+            *guard = None;
+            return Attempt::Restart;
+        }
+        if busy {
+            // UNAFSTXN: contention DID strike, but the closure also flipped a root — some of what it
+            // did is durable. Re-running it could double-apply, so the restart is DECLINED and the
+            // closure's own result stands. Counted for the census rather than silently ignored.
+            note_txn_busy_durable();
+        }
+        Attempt::Settled(Ok(r))
     })
 }
+
+/// Run `f` against the one coherent mount, restarting the transaction on transient contention.
+///
+/// UNAFSTXN: `with_unafs` joins the WEDGE-8/WEDGE-10 `Busy`-aware callers. Before this, a `Busy`
+/// raised inside a unafs transaction reached the closure as an opaque `SectorError::Io` and was
+/// reported upward as a hard failure — a permanent verdict on a temporary condition, and on the
+/// read paths that phrase "the op failed" as `is_err()` it could read as "the object is absent".
+/// Now a `Busy` that left nothing durable behind ABORTS the transaction cleanly (the cached mount is
+/// discarded inside the hold, so the next attempt re-derives everything from the committed root) and
+/// the whole closure is RUN AGAIN — bounded by [`TXN_BUSY_ATTEMPTS`] and by `hw_wait_budget()` of
+/// wall clock, whichever comes first. Exhaustion returns [`MountError::Busy`], which is the honest
+/// answer: nothing was mutated and the caller may retry.
+///
+/// The inter-attempt yield is the same one `fs::fat`'s RMW retry uses, with the one guard that
+/// matters here: `with_unafs` may itself be called from an already-masked context, and a `hlt` with
+/// interrupts masked never wakes. So we `hlt` (schedulable — it lets the loan holder run) only when
+/// the caller left us unmasked, and spin-hint otherwise. Either way the wait is OUTSIDE the
+/// attempt's own `without_interrupts` span: the F1–F4 rule that no masked span may wait on a driver
+/// lock is not weakened by this loop, it is what the loop is built out of.
+pub fn with_unafs<R>(mut f: impl FnMut(&mut KernelUnaFS) -> R) -> Result<R, MountError> {
+    let start = crate::arch::now_cycles();
+    let budget = crate::arch::hw_wait_budget();
+    let mut restarts: u32 = 0;
+    for _ in 0..TXN_BUSY_ATTEMPTS {
+        match with_unafs_attempt(&mut f) {
+            Attempt::Settled(out) => {
+                if restarts > 0 {
+                    note_txn_restarts(restarts, true);
+                }
+                return out;
+            }
+            Attempt::Restart => {}
+        }
+        restarts += 1;
+        if crate::arch::now_cycles().wrapping_sub(start) >= budget {
+            break;
+        }
+        if crate::arch::irqs_masked() {
+            core::hint::spin_loop();
+        } else {
+            crate::hlt(); // unmasked here — the attempt's mask ended with it; let the holder run
+        }
+    }
+    note_txn_restarts(restarts, false);
+    Err(MountError::Busy)
+}
+
+// -----------------------------------------------------------------------------------------------
+// UNAFSTXN — the restart census.
+//
+// Behind `feature = "witness"` (UNAOS_WITNESS), the family's DEFAULT-QUIET gate: a boot/media build
+// compiles the whole census away and the restart loop above is byte-identical without it. QUIET AT
+// ZERO by construction — the line is emitted per `with_unafs` call that actually restarted, so a
+// healthy boot (the expected reading, and the one WEDGE-10's gate produced: "the requeue arm fired
+// zero times — the bounded wait is the mechanism, the requeue the net") prints nothing at all. When
+// it does print, it prints the whole census: this call's restarts and verdict, plus the boot-
+// cumulative totals, so one line is enough to tell a single unlucky handover from a contended run.
+// COST WHEN ON: three relaxed atomics on a path that has already spent seconds inside the block
+// layer's bounded wait. COST WHEN OFF: none.
+// -----------------------------------------------------------------------------------------------
+
+/// UNAFSTXN: `with_unafs` calls that restarted at least once this boot.
+#[cfg(feature = "witness")]
+static TXN_CALLS_RESTARTED: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+/// UNAFSTXN: total transaction restarts this boot (a call may contribute several).
+#[cfg(feature = "witness")]
+static TXN_RESTART_TOTAL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// UNAFSTXN: transactions that took a `Busy` but had ALREADY flipped a root, so the restart was
+/// declined to avoid double-applying durable work. Non-zero here is the honest admission that a
+/// closure's result was built partly on a refused sector — the number worth watching, because it is
+/// the one case this arc cannot repair from inside `with_unafs`.
+#[cfg(feature = "witness")]
+static TXN_DECLINED_DURABLE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// UNAFSTXN: census one `with_unafs` call that restarted. `recovered` distinguishes a transaction
+/// that went on to settle from one that exhausted the bound and returned [`MountError::Busy`].
+#[cfg(feature = "witness")]
+fn note_txn_restarts(restarts: u32, recovered: bool) {
+    if restarts == 0 {
+        return;
+    }
+    let calls = TXN_CALLS_RESTARTED.fetch_add(1, Ordering::Relaxed) + 1;
+    let total = TXN_RESTART_TOTAL.fetch_add(restarts, Ordering::Relaxed) + restarts;
+    serial_println!(
+        ":: UNAFSTXN: unafs txn restarted on Busy — restarts={} verdict={} boot_txns_restarted={} boot_restarts={} declined_durable={} ::",
+        restarts,
+        if recovered { "recovered" } else { "EXHAUSTED" },
+        calls,
+        total,
+        TXN_DECLINED_DURABLE.load(Ordering::Relaxed),
+    );
+}
+
+/// UNAFSTXN: default-quiet build — the census is compiled out.
+#[cfg(not(feature = "witness"))]
+#[inline(always)]
+fn note_txn_restarts(_restarts: u32, _recovered: bool) {}
+
+/// UNAFSTXN: census a `Busy` whose transaction had already committed, so the restart was declined.
+#[cfg(feature = "witness")]
+#[inline]
+fn note_txn_busy_durable() {
+    TXN_DECLINED_DURABLE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// UNAFSTXN: default-quiet build — the census is compiled out.
+#[cfg(not(feature = "witness"))]
+#[inline(always)]
+fn note_txn_busy_durable() {}
 
 /// K9-PARITY: a staged ACL persist under an already-held [`with_unafs`] mount sets this to ask the
 /// enclosing hold to DISCARD the cached mount (drop the dirty in-flight transaction, re-mount fresh from

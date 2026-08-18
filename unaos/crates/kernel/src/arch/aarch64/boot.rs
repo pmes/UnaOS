@@ -416,6 +416,20 @@ static SLOT_USED: [AtomicBool; USER_SLOTS] = [const { AtomicBool::new(false) }; 
 /// teardown.
 static SLOT_REFCOUNT: [AtomicU32; USER_SLOTS] = [const { AtomicU32::new(0) }; USER_SLOTS];
 
+/// STORM-HEADROOM — how many of the `USER_SLOTS` address-space slots are unclaimed right now. Reads
+/// only (one relaxed-ordered flag per slot), safe from any core; never consulted on an allocation
+/// path — `alloc_user_slot`'s CAS is the only thing that may decide a slot's fate, and a count taken
+/// here is stale the instant it is returned.
+///
+/// It exists because the slot pool is the resource the `MAX_PROCS` block stakes its whole argument
+/// on: 6 background rows are meant to leave 2 EL0 slots free for a foreground `run` and the launcher
+/// fixtures. That reserve is a claim about a live system, and nothing on the wire ever stated it. The
+/// `storm` verb samples it at its launch boundaries so a bench capture says whether the reserve
+/// actually survived a full fleet, rather than whether it was intended to.
+pub fn user_slots_free() -> usize {
+    (0..USER_SLOTS).filter(|&s| !SLOT_USED[s].load(Ordering::Acquire)).count()
+}
+
 /// ELF-2 — register one more live EL0 thread against the slot owning `asid` (the shared address space a
 /// `SYS_THREAD_SPAWN` adds a task to). Balanced by that thread's eventual `teardown_user_slot` call at exit.
 /// MUST be called on a live slot (refcount already >= 1 from the initial owner) BEFORE the new thread can be
@@ -864,6 +878,12 @@ pub unsafe fn teardown_user_slot(asid: u64) {
     // the dozen in-kernel `alloc_user_slot` fixture launchers — without asking each of them to remember.
     // One durable line at the funnel beats a rule every future launcher has to be told about.
     super::syscall::clear_detached(asid);
+    // VUGMIN teardown-clear: the same funnel and the same ordering, for the HIDDEN bit. It matters MORE
+    // here than for DETACHED, not less: a stale detached bit gives the next tenant an uncapped frame
+    // budget, whereas a stale hidden bit gives it a vug that comes up already idling — a window that
+    // never draws — having never been hidden at all. Both bits are per-ASID and ASIDs are recycled, so
+    // both are cleared here, before the slot is released for reuse below.
+    super::syscall::clear_hidden(asid);
     SLOT_USED[(asid - 1) as usize].store(false, Ordering::Release);
 }
 
@@ -1106,6 +1126,17 @@ static mut BOOT_INFO: BootInfo = BootInfo {
     edid_native_height: 0,
     edid_source: 0,
     mode_action: 0,
+    // EDID-CARRY: the Pi 4 bare-metal path never runs the UEFI bootloader, so there is no EDID
+    // protocol to read — the VideoCore mailbox hands over a framebuffer, not a panel descriptor.
+    // `edid_block_valid: false` is the absent sentinel: `video::init_edid` prints `present=0` and
+    // publishes nothing, rather than letting 128 zero bytes pass for a panel.
+    edid_block: [0; 128],
+    edid_block_valid: false,
+    edid_total_len: 0,
+    // INSTALL-SELF: aarch64 does not boot through the UEFI bootloader that reads its own ESP's FAT
+    // volume serial, so the boot volume is unidentified here. 0 is the absent sentinel; the
+    // installer's boot-device guard disarms on it (with a witness line) rather than guessing.
+    boot_volume_serial: 0,
 };
 
 /// Synthesize the BootInfo the kernel expects. `dtb_addr` carries the pointer the GPU ROM passed in

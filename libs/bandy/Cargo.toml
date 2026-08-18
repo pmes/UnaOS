@@ -10,6 +10,6 @@ serde_json = "1.0"
 # THE FIX: Ignite the 'std' feature so we can allocate the logger on the heap.
 log = { version = "0.4", features = ["std"] }
 chrono = "0.4"
-anyhow = "1.0.102"
-tokio = { version = "1.49", features = ["sync", "rt", "macros"] }
+anyhow = "1.0.104"
+tokio = { version = "1.53", features = ["sync", "rt", "macros"] }
 async-channel = "2.5.0"

@@ -73,35 +73,31 @@ fn svc(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
     ret
 }
 
-const SYS_WRITE: u64 = 1;
-const SYS_EXIT: u64 = 2;
-const SYS_REPORT: u64 = 3;
-const SYS_OPEN: u64 = 11;
-const SYS_CLOSE: u64 = 17;
-const SYS_MSEND: u64 = 19;
-const SYS_MRECV: u64 = 20;
-/// WC-C: the window verbs. midden is the first NON-fixture program to own a compositor window.
-const SYS_WIN_CREATE: u64 = 29;
-const SYS_WIN_PRESENT: u64 = 30;
+// ABIFREEZE: imported from `una_abi`, the one declaration of the table (shared with both kernels).
+// WC-C: the window verbs. midden is the first NON-fixture program to own a compositor window.
+use una_abi::{
+    SYS_CLOSE, SYS_EXIT, SYS_MRECV, SYS_MSEND, SYS_OPEN, SYS_REPORT, SYS_WIN_CREATE,
+    SYS_WIN_PRESENT, SYS_WRITE,
+};
 
-const MIDDEN_EXIT_STATUS: u64 = 0xB5;
+use una_abi::EXIT_STATUS_MIDDEN as MIDDEN_EXIT_STATUS;
 
 #[inline(always)]
 fn con_write(buf: &[u8]) {
     let _ = svc(SYS_WRITE, 1, buf.as_ptr() as u64, buf.len() as u64);
 }
 
-// --- the native v1 wire (mirrors arch/aarch64/bus.rs byte-for-byte) ----------------------------
-
-const HDR: usize = 52;
-const FRAME_MAX: usize = HDR + 4096;
-const VERB_LS: u8 = 1;
-const VERB_CAT: u8 = 2;
-const VERB_CP: u8 = 3;
-// BANDY-2 write-side verbs (mirror arch/aarch64/bus.rs).
-const VERB_WRITE: u8 = 4;
-const VERB_RM: u8 = 5;
-const VERB_MV: u8 = 6;
+// --- the native v1 wire ------------------------------------------------------------------------
+//
+// ABIFREEZE (divergence D3): this block used to be a hand-kept copy of `arch/aarch64/bus.rs`, whose
+// only guarantee was the comment "mirrors arch/aarch64/bus.rs byte-for-byte". The wire constants now
+// live in `una_abi` and BOTH sides import them, so the mirror is structural rather than promised.
+use una_abi::{BUS_KIND_REPLY, BUS_KIND_REQUEST, BUS_MAGIC, BUS_VERSION};
+use una_abi::{
+    BUS_FRAME_MAX as FRAME_MAX, BUS_HDR_LEN as HDR, BUS_VERB_CAT as VERB_CAT,
+    BUS_VERB_CP as VERB_CP, BUS_VERB_LS as VERB_LS, BUS_VERB_MV as VERB_MV,
+    BUS_VERB_RM as VERB_RM, BUS_VERB_WRITE as VERB_WRITE,
+};
 
 #[inline(always)]
 unsafe fn put(p: *mut u8, i: usize, b: u8) {
@@ -122,12 +118,12 @@ fn build_req(buf: &mut [u8; 96], verb: u8, corr: u32, body: &[u8]) -> usize {
             put(p, i, 0);
             i += 1;
         }
-        put(p, 0, b'U');
-        put(p, 1, b'B');
-        put(p, 2, b'S');
-        put(p, 3, b'1');
-        put(p, 4, 1); // version
-        put(p, 5, 1); // kind REQUEST
+        put(p, 0, BUS_MAGIC[0]);
+        put(p, 1, BUS_MAGIC[1]);
+        put(p, 2, BUS_MAGIC[2]);
+        put(p, 3, BUS_MAGIC[3]);
+        put(p, 4, BUS_VERSION);
+        put(p, 5, BUS_KIND_REQUEST);
         put(p, 6, verb);
         put(p, 8, corr as u8);
         put(p, 9, (corr >> 8) as u8);
@@ -153,12 +149,12 @@ fn check_reply(rep: &[u8; FRAME_MAX], n: usize, verb: u8, corr: u32) -> (i64, us
         return (i64::MIN, 0);
     }
     unsafe {
-        if get(p, 0) != b'U'
-            || get(p, 1) != b'B'
-            || get(p, 2) != b'S'
-            || get(p, 3) != b'1'
-            || get(p, 4) != 1
-            || get(p, 5) != 2 // kind REPLY
+        if get(p, 0) != BUS_MAGIC[0]
+            || get(p, 1) != BUS_MAGIC[1]
+            || get(p, 2) != BUS_MAGIC[2]
+            || get(p, 3) != BUS_MAGIC[3]
+            || get(p, 4) != BUS_VERSION
+            || get(p, 5) != BUS_KIND_REPLY
             || get(p, 6) != verb
             || get(p, 8) != corr as u8
             || get(p, 9) != (corr >> 8) as u8
@@ -323,8 +319,8 @@ fn eq(a: &[u8], b: &[u8]) -> bool {
 
 /// The fixture text the launcher stages in MIDTXT.TXT — bit1 byte-verifies the cat body.
 const MIDTXT_CONTENT: &[u8] = b"midden bus fixture\n";
-const EACCES: i64 = -13;
-const ENOENT: i64 = -2;
+// ABIFREEZE: the errno values a ring-3 program compares a raw syscall return against.
+use una_abi::{EACCES, ENOENT};
 /// BANDY-2: the content midden WRITES (no spaces — the write parser splits name/content on the
 /// first space); the cat readback byte-verifies it. Also the mv round-trip's payload.
 const WR_CONTENT: &[u8] = b"middenwrote";
@@ -555,8 +551,7 @@ extern "C" fn midden_main() -> ! {
     // direct: opening the foreign file for WRITE (delete/truncate would need such a handle) -> EACCES.
     // mode bit0 = RW (CAP_READ|CAP_WRITE); no O_CREAT (the file exists).
     let bp = b"BUSPRIV.BIN";
-    const O_RW: u64 = 1;
-    let st_direct_rw = svc(SYS_OPEN, bp.as_ptr() as u64, bp.len() as u64, O_RW);
+    let st_direct_rw = svc(SYS_OPEN, bp.as_ptr() as u64, bp.len() as u64, una_abi::O_RW);
     if st_rm_denied == EACCES
         && st_mv_denied == EACCES
         && st_wr_denied == EACCES

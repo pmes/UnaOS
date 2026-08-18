@@ -30,7 +30,7 @@ use std::time::Instant;
 
 use crate::{NativeView, NativeWindow};
 
-pub mod spline;
+// pub mod spline;
 
 pub struct Backend {
     #[cfg(feature = "gnome")]
@@ -118,11 +118,96 @@ impl Backend {
         Self { app }
     }
 
+    pub fn new_vessel<F>(
+        app_id: &str,
+        title: &str,
+        content_size: (f64, f64),
+        build_view: F,
+    ) -> Self
+    where
+        F: FnOnce(&NativeWindow) -> NativeView + 'static,
+    {
+        crate::init();
+
+        #[cfg(feature = "gnome")]
+        let app = adw::Application::builder().application_id(app_id).build();
+        #[cfg(not(feature = "gnome"))]
+        let app = Application::builder().application_id(app_id).build();
+
+        app.connect_startup(|_| {
+            if let Some(display) = gtk4::gdk::Display::default() {
+                let icon_theme = gtk4::IconTheme::for_display(&display);
+                icon_theme.add_resource_path("/org/una/vein/icons");
+            }
+        });
+
+        let bootstrap_option = Rc::new(RefCell::new(Some(build_view)));
+        let title = title.to_string();
+
+        app.connect_activate(move |app| {
+            if let Some(window) = app.active_window() {
+                window.present();
+                return;
+            }
+
+            #[cfg(feature = "gnome")]
+            let window = adw::ApplicationWindow::builder()
+                .application(app)
+                .default_width(content_size.0 as i32)
+                .default_height(content_size.1 as i32)
+                .title(&title)
+                .build();
+
+            #[cfg(not(feature = "gnome"))]
+            let window = ApplicationWindow::builder()
+                .application(app)
+                .default_width(content_size.0 as i32)
+                .default_height(content_size.1 as i32)
+                .title(&title)
+                .build();
+
+            if let Some(bootstrap) = bootstrap_option.borrow_mut().take() {
+                #[cfg(feature = "gnome")]
+                let content: NativeView =
+                    (bootstrap)(window.upcast_ref::<gtk4::ApplicationWindow>());
+                #[cfg(not(feature = "gnome"))]
+                let content: NativeView = (bootstrap)(&window);
+
+                #[cfg(feature = "gnome")]
+                window.set_content(Some(&content));
+                #[cfg(not(feature = "gnome"))]
+                window.set_child(Some(&content));
+            }
+
+            window.present();
+        });
+
+        Self { app }
+    }
+
+    pub fn new_tetra_vessel(
+        app_id: &str,
+        title: &str,
+        content_size: (f64, f64),
+        tetra_node: crate::tetra::TetraNode,
+        synapse: bandy::Synapse,
+    ) -> Self {
+        Self::new_vessel(app_id, title, content_size, move |_window| {
+            crate::platforms::gtk::tetra_eval::eval_tetra(tetra_node, synapse.clone())
+        })
+    }
+
     pub fn run(&self) {
         self.app.run();
     }
 }
 
-pub mod mega_bar;
-pub mod types;
-pub mod workspace;
+pub mod tetra_eval;
+pub mod button;
+pub mod text_field;
+pub mod image_view;
+pub mod console_view;
+// pub mod spline;
+// pub mod mega_bar;
+// pub mod types;
+// pub mod workspace;

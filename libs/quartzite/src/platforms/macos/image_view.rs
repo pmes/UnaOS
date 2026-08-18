@@ -95,7 +95,26 @@ pub struct FacetImageIvars {
     drag_anchor: Cell<Option<(f64, f64)>>,
     /// The live mouse-move tracking area (rebuilt from `updateTrackingAreas`).
     tracking: RefCell<Option<Retained<AnyObject>>>,
+    /// Browser mode: when set, pointer input forwards to the engine over
+    /// this synapse (clicks as surface-pixel BrowserClick, wheel as
+    /// BrowserScroll) instead of driving facet zoom/pan.
+    synapse: RefCell<Option<bandy::Synapse>>,
+
+    /// True between `viewWillStartLiveResize` and `viewDidEndLiveResize` —
+    /// i.e. while the user is dragging a window edge. Resize notifications to
+    /// the engine are throttled for the duration (see `maybe_fire_resize`).
+    live_resize: Cell<bool>,
+    /// When the last `BrowserResize` went out, for the live-resize throttle.
+    last_resize_fire: Cell<Option<std::time::Instant>>,
+    /// The geometry of the last `BrowserResize` we fired — the engine gets a
+    /// given size at most once (dedupes the guaranteed end-of-drag fire against
+    /// a throttled one that already carried the same size).
+    last_resize_sent: Cell<Option<(u32, u32)>>,
 }
+
+/// Coarse tracking cadence during a live-resize drag: one `BrowserResize` per
+/// this interval, plus a guaranteed final one when the drag ends.
+const LIVE_RESIZE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
 
 define_class!(
     #[unsafe(super(NSView))]
@@ -116,6 +135,10 @@ define_class!(
                 cursor: Cell::new(None),
                 drag_anchor: Cell::new(None),
                 tracking: RefCell::new(None),
+                synapse: RefCell::new(None),
+                live_resize: Cell::new(false),
+                last_resize_fire: Cell::new(None),
+                last_resize_sent: Cell::new(None),
             });
             unsafe { msg_send![super(this), initWithFrame: frame] }
         }
@@ -136,6 +159,30 @@ define_class!(
         #[unsafe(method(setFrameSize:))]
         fn set_frame_size(&self, new_size: NSSize) {
             let _: () = unsafe { msg_send![super(self), setFrameSize: new_size] };
+            // Browser surface: the viewport changed — the ENGINE reflows the
+            // page to the new size and blits fresh pixels; nothing scales.
+            // A relayout costs real time on a heavy page, so a drag gets a
+            // coarse cadence, not one reflow per AppKit resize event. Any
+            // resize that is NOT a drag (zoom button, programmatic setFrame,
+            // window restore) still fires immediately.
+            self.maybe_fire_resize(new_size);
+            self.setNeedsDisplay(true);
+        }
+
+        // -- live resize: throttle during the drag, one guaranteed final -----
+        #[unsafe(method(viewWillStartLiveResize))]
+        fn view_will_start_live_resize(&self) {
+            let _: () = unsafe { msg_send![super(self), viewWillStartLiveResize] };
+            self.ivars().live_resize.set(true);
+        }
+
+        #[unsafe(method(viewDidEndLiveResize))]
+        fn view_did_end_live_resize(&self) {
+            let _: () = unsafe { msg_send![super(self), viewDidEndLiveResize] };
+            self.ivars().live_resize.set(false);
+            // The drag settled: the engine must end up laid out for the size
+            // the user actually let go at, whatever the throttle last sent.
+            self.fire_resize(self.frame().size);
             self.setNeedsDisplay(true);
         }
 
@@ -145,12 +192,22 @@ define_class!(
             objc2::runtime::Bool::YES
         }
 
+        #[unsafe(method(resignFirstResponder))]
+        fn resign_first_responder(&self) -> objc2::runtime::Bool {
+            // Clean resignation when another responder takes focus (e.g., the URL
+            // TextField). Return YES to allow the transition.
+            objc2::runtime::Bool::YES
+        }
+
         #[unsafe(method(viewDidMoveToWindow))]
         fn view_did_move_to_window(&self) {
-            // Become first responder so reset-to-fit key events land here even
-            // before the first click.
-            if let Some(window) = self.window() {
-                let _: bool = unsafe { msg_send![&window, makeFirstResponder: self] };
+            // Become first responder only in facet mode (not browser mode).
+            // In browser mode, let the window manage focus so the URL TextField
+            // can accept input naturally; the view becomes first responder on click.
+            if self.ivars().synapse.borrow().is_none() {
+                if let Some(window) = self.window() {
+                    let _: bool = unsafe { msg_send![&window, makeFirstResponder: self] };
+                }
             }
         }
 
@@ -165,6 +222,15 @@ define_class!(
         #[unsafe(method(scrollWheel:))]
         fn scroll_wheel(&self, event: &AnyObject) {
             let dy: f64 = unsafe { msg_send![event, scrollingDeltaY] };
+            if let Some(syn) = self.ivars().synapse.borrow().as_ref() {
+                // Browser surface: wheel scrolls the page (deltaY > 0 is
+                // fingers-down/content-up in natural scrolling; the engine
+                // wants positive dy = scroll further down the document).
+                if dy != 0.0 {
+                    syn.fire(bandy::SMessage::BrowserScroll(0.0, -dy * 3.0));
+                }
+                return;
+            }
             let precise: bool = unsafe { msg_send![event, hasPreciseScrollingDeltas] };
             if dy == 0.0 {
                 return;
@@ -182,7 +248,7 @@ define_class!(
         fn magnify_with_event(&self, event: &AnyObject) {
             // `magnification` is the incremental pinch delta for this event.
             let mag: f64 = unsafe { msg_send![event, magnification] };
-            if mag == 0.0 {
+            if mag == 0.0 || self.ivars().synapse.borrow().is_some() {
                 return;
             }
             let at = self.event_point(event);
@@ -201,6 +267,9 @@ define_class!(
 
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, event: &AnyObject) {
+            if self.ivars().synapse.borrow().is_some() {
+                return; // browser surface: no picture panning
+            }
             let (nx, ny) = self.event_window_point(event);
             if let Some((ax, ay)) = self.ivars().drag_anchor.get() {
                 let (px, py) = self.ivars().pan.get();
@@ -215,8 +284,26 @@ define_class!(
         }
 
         #[unsafe(method(mouseUp:))]
-        fn mouse_up(&self, _event: &AnyObject) {
+        fn mouse_up(&self, event: &AnyObject) {
             self.ivars().drag_anchor.set(None);
+            let syn = self.ivars().synapse.borrow().clone();
+            if let Some(syn) = syn {
+                // Map the view point through the aspect-fit transform into
+                // surface pixels (unflipped view: invert Y for the top-left
+                // origin the engine uses).
+                let (vx, vy) = self.event_point(event);
+                let bounds = self.bounds();
+                if let Some((dx, dy, dw, dh)) = self.image_dest(bounds) {
+                    let (iw, ih) = *self.ivars().size.borrow();
+                    if dw > 0.0 && dh > 0.0 && iw > 0 && ih > 0 {
+                        let px = (vx - dx) / dw * iw as f64;
+                        let py = ih as f64 - ((vy - dy) / dh * ih as f64);
+                        if px >= 0.0 && px < iw as f64 && py >= 0.0 && py < ih as f64 {
+                            syn.fire(bandy::SMessage::BrowserClick(px, py));
+                        }
+                    }
+                }
+            }
         }
 
         #[unsafe(method(mouseEntered:))]
@@ -241,8 +328,27 @@ define_class!(
         fn key_down(&self, event: &AnyObject) {
             let chars: Option<Retained<NSString>> =
                 unsafe { msg_send![event, charactersIgnoringModifiers] };
-            let handled = match chars.map(|s| s.to_string()) {
-                Some(s) if s == "0" || s == "f" || s == "F" => {
+            let text = chars.map(|s| s.to_string()).unwrap_or_default();
+            // Browser surface: keys are page input (focused field editing),
+            // not viewer shortcuts.
+            if let Some(syn) = self.ivars().synapse.borrow().as_ref() {
+                let mut it = text.chars();
+                match (it.next(), it.next()) {
+                    (Some('\u{7f}'), None) | (Some('\u{8}'), None) => {
+                        syn.fire(bandy::SMessage::BrowserKey("BackSpace".into()));
+                    }
+                    (Some('\r'), None) | (Some('\n'), None) => {
+                        syn.fire(bandy::SMessage::BrowserKey("Return".into()));
+                    }
+                    (Some(c), _) if !c.is_control() => {
+                        syn.fire(bandy::SMessage::BrowserText(text));
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            let handled = match text.as_str() {
+                "0" | "f" | "F" => {
                     self.reset_to_fit();
                     true
                 }
@@ -350,6 +456,41 @@ impl FacetImageView {
         self.reset_to_fit();
     }
 
+    // -- browser resize notification ----------------------------------------
+
+    /// Notify the engine of a new viewport size, honouring the live-resize
+    /// throttle. No-op outside browser mode.
+    fn maybe_fire_resize(&self, new_size: NSSize) {
+        if self.ivars().synapse.borrow().is_none() {
+            return;
+        }
+        if self.ivars().live_resize.get() {
+            let now = std::time::Instant::now();
+            if let Some(last) = self.ivars().last_resize_fire.get() {
+                if now.duration_since(last) < LIVE_RESIZE_INTERVAL {
+                    // Skipped: the drag keeps going and `viewDidEndLiveResize`
+                    // guarantees the final size reaches the engine regardless.
+                    return;
+                }
+            }
+        }
+        self.fire_resize(new_size);
+    }
+
+    /// Fire `BrowserResize` for `size` unless the engine already has exactly
+    /// that geometry. Browser mode only.
+    fn fire_resize(&self, size: NSSize) {
+        let syn = self.ivars().synapse.borrow().clone();
+        let Some(syn) = syn else { return };
+        let (w, h) = (size.width.max(1.0) as u32, size.height.max(1.0) as u32);
+        if self.ivars().last_resize_sent.get() == Some((w, h)) {
+            return;
+        }
+        self.ivars().last_resize_sent.set(Some((w, h)));
+        self.ivars().last_resize_fire.set(Some(std::time::Instant::now()));
+        syn.fire(bandy::SMessage::BrowserResize(w, h));
+    }
+
     // -- interaction --------------------------------------------------------
 
     /// Reset the zoom to aspect-fit and clear any pan.
@@ -412,6 +553,14 @@ impl FacetImageView {
         if iw == 0 || ih == 0 {
             return None;
         }
+        // Browser surface: the engine owns layout — draw its pixels 1:1,
+        // pinned to the TOP-left (unflipped view: top = origin.y + height).
+        if self.ivars().synapse.borrow().is_some() {
+            let (dw, dh) = (iw as f64, ih as f64);
+            let dx = bounds.origin.x;
+            let dy = bounds.origin.y + bounds.size.height - dh;
+            return Some((dx, dy, dw, dh));
+        }
         let base = self.base_scale(bounds, iw, ih);
         let scale = base * self.ivars().zoom.get();
         let dw = iw as f64 * scale;
@@ -473,8 +622,17 @@ impl FacetImageView {
     fn render(&self) {
         let bounds = self.bounds();
 
-        // The field.
-        let field = NSColor::colorWithSRGBRed_green_blue_alpha(FIELD.0, FIELD.1, FIELD.2, 1.0);
+        // The field. In browser mode the bitmap is drawn 1:1 at the top-left,
+        // so during a live resize the view is routinely larger than the last
+        // blit — the uncovered band is page background (white), not the
+        // viewer's dark console field, so a widening drag reads as "the page
+        // has not caught up yet" rather than as garbage.
+        let browser = self.ivars().synapse.borrow().is_some();
+        let field = if browser {
+            NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 1.0)
+        } else {
+            NSColor::colorWithSRGBRed_green_blue_alpha(FIELD.0, FIELD.1, FIELD.2, 1.0)
+        };
         field.set();
         objc2_app_kit::NSRectFill(bounds);
 
@@ -495,8 +653,11 @@ impl FacetImageView {
             msg_send![rep_ref, drawInRect: dest]
         };
 
-        // The pixel readout overlay, if the cursor is over the image.
-        self.draw_readout(bounds, (dx, dy, dw, dh));
+        // The pixel readout overlay (facet only — a browser page is not
+        // an inspected picture).
+        if !browser {
+            self.draw_readout(bounds, (dx, dy, dw, dh));
+        }
     }
 
     /// Map the current cursor to a source pixel and draw the readout overlay.
@@ -641,6 +802,47 @@ pub fn bootstrap_image_view(
 
     let view = FacetImageView::new(mtm, frame);
     view.set_frame(rgba, linear, width, height);
+
+    Retained::into_super(view)
+}
+
+pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NSView> {
+    let mtm = MainThreadMarker::new().expect("bootstrap_image_surface must run on the main thread");
+
+    let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(800.0, 600.0));
+    let view = FacetImageView::new(mtm, frame);
+    *view.ivars().synapse.borrow_mut() = Some(synapse.clone());
+
+    let bound = std::sync::Arc::new(dispatch2::MainThreadBound::new(view.clone(), mtm));
+    let mut rx = synapse.subscribe();
+
+    let target_id = id.to_string();
+    // The AppKit main thread has no tokio reactor; give the subscription loop
+    // its own thread + current-thread runtime and hop frames back via GCD.
+    std::thread::Builder::new().name("surface-blit".into()).spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("surface subscription runtime");
+        rt.block_on(async move {
+        loop {
+            match rx.recv().await {
+                Ok(bandy::SMessage::SurfaceBlit { url, width, height, pixels }) => {
+                    if url == target_id {
+                        let bound = bound.clone();
+                        dispatch2::DispatchQueue::main().exec_async(move || {
+                            let mtm = MainThreadMarker::new().unwrap();
+                            bound.get(mtm).set_frame(&pixels, &[], width, height);
+                        });
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+        });
+    }).expect("spawn surface-blit thread");
 
     Retained::into_super(view)
 }

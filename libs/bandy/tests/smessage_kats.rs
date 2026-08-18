@@ -29,8 +29,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bandy::ontology::WeightedSkeleton;
-use bandy::signals::{MatrixEvent, PrincipiaCommand, SMessage};
-use bandy::state::DispatchRecord;
+use bandy::signals::{LogEvent, MatrixEvent, PrefValue, PrincipiaCommand, SMessage};
+use bandy::state::{
+    BrowseEntry, BrowseKind, BrowseListing, DispatchRecord, FsOutcome, FsVerb, LogLine, LogSource,
+};
 use bandy::Origin;
 
 /// One golden KAT per serializable variant:
@@ -236,6 +238,80 @@ kat!(
     r#"{"StorageLoadPagedResult":{"receipt_id":9,"records":[{"id":"d-1","origin":{"LocalUser":"peter"},"display_name":"Peter","subject":"greeting","timestamp":"2026-07-13T00:00:00Z","content":"hello","is_chat":true}]}}"#
 );
 
+// --- AETHER (The Browser) ---
+
+kat!(
+    kat_open_document,
+    SMessage::OpenDocument { url: "https://una.os/".to_string() },
+    r#"{"OpenDocument":{"url":"https://una.os/"}}"#
+);
+kat!(
+    kat_surface_blit,
+    SMessage::SurfaceBlit {
+        url: "https://una.os/".to_string(),
+        width: 2,
+        height: 1,
+        pixels: vec![1, 2, 3, 4, 5, 6, 7, 8],
+    },
+    r#"{"SurfaceBlit":{"url":"https://una.os/","width":2,"height":1,"pixels":[1,2,3,4,5,6,7,8]}}"#
+);
+kat!(
+    kat_play_media,
+    SMessage::PlayMedia {
+        url: "https://una.os/a.mp3".to_string(),
+        title: "A".to_string(),
+        mime: "audio/mpeg".to_string(),
+    },
+    r#"{"PlayMedia":{"url":"https://una.os/a.mp3","title":"A","mime":"audio/mpeg"}}"#
+);
+kat!(kat_browser_nav_back, SMessage::BrowserNavBack, r#""BrowserNavBack""#);
+kat!(kat_browser_nav_forward, SMessage::BrowserNavForward, r#""BrowserNavForward""#);
+kat!(kat_browser_nav_reload, SMessage::BrowserNavReload, r#""BrowserNavReload""#);
+kat!(
+    kat_browser_scroll,
+    SMessage::BrowserScroll(0.0, 120.5),
+    r#"{"BrowserScroll":[0.0,120.5]}"#
+);
+kat!(
+    kat_browser_click,
+    SMessage::BrowserClick(12.5, 40.0),
+    r#"{"BrowserClick":[12.5,40.0]}"#
+);
+kat!(
+    kat_browser_resize,
+    SMessage::BrowserResize(800, 600),
+    r#"{"BrowserResize":[800,600]}"#
+);
+kat!(
+    kat_browser_key,
+    SMessage::BrowserKey("Enter".to_string()),
+    r#"{"BrowserKey":"Enter"}"#
+);
+kat!(
+    kat_browser_text,
+    SMessage::BrowserText("una".to_string()),
+    r#"{"BrowserText":"una"}"#
+);
+kat!(
+    kat_browser_url_changed,
+    SMessage::BrowserUrlChanged("https://una.os/next".to_string()),
+    r#"{"BrowserUrlChanged":"https://una.os/next"}"#
+);
+kat!(
+    kat_browser_title_changed,
+    SMessage::BrowserTitleChanged("UnaOS".to_string()),
+    r#"{"BrowserTitleChanged":"UnaOS"}"#
+);
+kat!(
+    kat_browser_favicon_changed,
+    SMessage::BrowserFaviconChanged {
+        width: 1,
+        height: 1,
+        rgba: vec![255, 0, 0, 255],
+    },
+    r#"{"BrowserFaviconChanged":{"width":1,"height":1,"rgba":[255,0,0,255]}}"#
+);
+
 // --- EDITOR (The Code Pane) ---
 
 kat!(
@@ -304,6 +380,99 @@ kat!(
     r#"{"Principia":{"SystemRootChanged":"/una"}}"#
 );
 
+// --- PRINCIPIA / PREFERENCES — one KAT per verb, plus the value domain ---
+
+kat!(
+    kat_principia_pref_get,
+    SMessage::Principia(PrincipiaCommand::PrefGet {
+        ns: "aether".to_string(),
+        key: "homepage".to_string(),
+    }),
+    r#"{"Principia":{"PrefGet":{"ns":"aether","key":"homepage"}}}"#
+);
+kat!(
+    kat_principia_pref_value_is,
+    SMessage::Principia(PrincipiaCommand::PrefValueIs {
+        ns: "aether".to_string(),
+        key: "homepage".to_string(),
+        value: Some(PrefValue::Str("https://una.os/".to_string())),
+    }),
+    r#"{"Principia":{"PrefValueIs":{"ns":"aether","key":"homepage","value":{"Str":"https://una.os/"}}}}"#
+);
+kat!(
+    kat_principia_pref_value_is_unset,
+    SMessage::Principia(PrincipiaCommand::PrefValueIs {
+        ns: "aether".to_string(),
+        key: "homepage".to_string(),
+        value: None,
+    }),
+    r#"{"Principia":{"PrefValueIs":{"ns":"aether","key":"homepage","value":null}}}"#
+);
+kat!(
+    kat_principia_pref_set,
+    SMessage::Principia(PrincipiaCommand::PrefSet {
+        ns: "aether".to_string(),
+        key: "window.width".to_string(),
+        value: PrefValue::Int(1280),
+    }),
+    r#"{"Principia":{"PrefSet":{"ns":"aether","key":"window.width","value":{"Int":1280}}}}"#
+);
+kat!(
+    kat_principia_pref_list,
+    SMessage::Principia(PrincipiaCommand::PrefList {
+        ns: "system".to_string(),
+    }),
+    r#"{"Principia":{"PrefList":{"ns":"system"}}}"#
+);
+kat!(
+    kat_principia_pref_list_is,
+    SMessage::Principia(PrincipiaCommand::PrefListIs {
+        ns: "system".to_string(),
+        entries: vec![
+            ("locale".to_string(), PrefValue::Str("en-US".to_string())),
+            ("scale".to_string(), PrefValue::Float(1.5)),
+        ],
+    }),
+    r#"{"Principia":{"PrefListIs":{"ns":"system","entries":[["locale",{"Str":"en-US"}],["scale",{"Float":1.5}]]}}}"#
+);
+kat!(
+    kat_principia_pref_changed,
+    SMessage::Principia(PrincipiaCommand::PrefChanged {
+        ns: "stria".to_string(),
+        key: "muted".to_string(),
+        value: PrefValue::Bool(true),
+    }),
+    r#"{"Principia":{"PrefChanged":{"ns":"stria","key":"muted","value":{"Bool":true}}}}"#
+);
+kat!(
+    kat_principia_pref_error,
+    SMessage::Principia(PrincipiaCommand::PrefError {
+        ns: "aether".to_string(),
+        key: "window..width".to_string(),
+        message: "empty key segment".to_string(),
+    }),
+    r#"{"Principia":{"PrefError":{"ns":"aether","key":"window..width","message":"empty key segment"}}}"#
+);
+
+/// The typed value domain must not widen or coerce across the wire — a float
+/// that reads back as an int would silently retype a stored preference.
+#[test]
+fn pref_value_types_survive_the_wire_exactly() {
+    let cases = [
+        (PrefValue::Str("x".to_string()), r#"{"Str":"x"}"#),
+        (PrefValue::Int(1), r#"{"Int":1}"#),
+        (PrefValue::Float(1.0), r#"{"Float":1.0}"#),
+        (PrefValue::Bool(false), r#"{"Bool":false}"#),
+    ];
+    for (value, golden) in cases {
+        let json = serde_json::to_string(&value).expect("serialize");
+        assert_eq!(json, golden, "wire shape drift for {value:?}");
+        let back: PrefValue = serde_json::from_str(golden).expect("deserialize");
+        assert_eq!(back, value, "round-trip retyped {value:?}");
+        assert_eq!(pref_value_variant_name(&back), pref_value_variant_name(&value));
+    }
+}
+
 // --- MATRIX (The Spatial Cortex) — one KAT per carried sub-variant ---
 
 kat!(
@@ -347,6 +516,60 @@ kat!(
         ("b".to_string(), "fn".to_string(), 2),
     ])),
     r#"{"Matrix":{"TopologyMutated":[["a","crate",0],["b","fn",2]]}}"#
+);
+kat!(
+    kat_matrix_browse_to,
+    SMessage::Matrix(MatrixEvent::BrowseTo {
+        principal: Origin::LocalUser("peter".to_string()),
+        path: "handlers/matrix".to_string(),
+    }),
+    r#"{"Matrix":{"BrowseTo":{"principal":{"LocalUser":"peter"},"path":"handlers/matrix"}}}"#
+);
+kat!(
+    kat_matrix_dir_listed,
+    SMessage::Matrix(MatrixEvent::DirListed(BrowseListing {
+        path: "src".to_string(),
+        parent: Some(String::new()),
+        breadcrumbs: vec![(String::new(), String::new()), ("src".to_string(), "src".to_string())],
+        entries: vec![
+            BrowseEntry {
+                path: "src/sub".to_string(),
+                name: "sub".to_string(),
+                kind: BrowseKind::Dir,
+                size: 0,
+                is_symlink: false,
+            },
+            BrowseEntry {
+                path: "src/main.rs".to_string(),
+                name: "main.rs".to_string(),
+                kind: BrowseKind::File,
+                size: 42,
+                is_symlink: false,
+            },
+        ],
+    })),
+    r#"{"Matrix":{"DirListed":{"path":"src","parent":"","breadcrumbs":[["",""],["src","src"]],"entries":[{"path":"src/sub","name":"sub","kind":"Dir","size":0,"is_symlink":false},{"path":"src/main.rs","name":"main.rs","kind":"File","size":42,"is_symlink":false}]}}}"#
+);
+kat!(
+    kat_matrix_file_op,
+    SMessage::Matrix(MatrixEvent::FileOp {
+        principal: Origin::LocalUser("peter".to_string()),
+        verb: FsVerb::Rename,
+        path: "notes.md".to_string(),
+        arg: Some("renamed.md".to_string()),
+        confirmed: false,
+    }),
+    r#"{"Matrix":{"FileOp":{"principal":{"LocalUser":"peter"},"verb":"Rename","path":"notes.md","arg":"renamed.md","confirmed":false}}}"#
+);
+kat!(
+    kat_matrix_fs_op_result,
+    SMessage::Matrix(MatrixEvent::FsOpResult {
+        principal: Origin::LocalUser("peter".to_string()),
+        verb: FsVerb::Delete,
+        path: "notes.md".to_string(),
+        outcome: FsOutcome::Denied { reason: "read-only volume".to_string() },
+    }),
+    r#"{"Matrix":{"FsOpResult":{"principal":{"LocalUser":"peter"},"verb":"Delete","path":"notes.md","outcome":{"Denied":{"reason":"read-only volume"}}}}}"#
 );
 
 // --- UI EVENTS ---
@@ -426,6 +649,42 @@ kat!(
 );
 kat!(kat_ui_ready, SMessage::UiReady, r#""UiReady""#);
 
+// --- LOGS (the Console log-viewer sub-enum) ----------------------------------
+kat!(
+    kat_logs_filter,
+    SMessage::Logs(LogEvent::LogFilter("gpu".to_string())),
+    r#"{"Logs":{"LogFilter":"gpu"}}"#
+);
+kat!(
+    kat_logs_source_all,
+    SMessage::Logs(LogEvent::LogSource(LogSource::All)),
+    r#"{"Logs":{"LogSource":"All"}}"#
+);
+kat!(
+    kat_logs_source_subsystem,
+    SMessage::Logs(LogEvent::LogSource(LogSource::Subsystem("kernel".to_string()))),
+    r#"{"Logs":{"LogSource":{"Subsystem":"kernel"}}}"#
+);
+kat!(
+    kat_logs_pause,
+    SMessage::Logs(LogEvent::LogPause(true)),
+    r#"{"Logs":{"LogPause":true}}"#
+);
+kat!(
+    kat_logs_tail,
+    SMessage::Logs(LogEvent::LogTail {
+        lines: vec![LogLine {
+            seq: 1,
+            level: "info".to_string(),
+            source: "net".to_string(),
+            content: "link up".to_string(),
+        }],
+        dropped: 2,
+        paused: false,
+    }),
+    r#"{"Logs":{"LogTail":{"lines":[{"seq":1,"level":"info","source":"net","content":"link up"}],"dropped":2,"paused":false}}}"#
+);
+
 // --- COMPLETENESS GUARD ------------------------------------------------------
 //
 // Exhaustive matches over the message vocabulary, with NO wildcard arm.
@@ -459,6 +718,20 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::StorageSaveResult { .. } => "StorageSaveResult",
         SMessage::StorageLoadPaged { .. } => "StorageLoadPaged",
         SMessage::StorageLoadPagedResult { .. } => "StorageLoadPagedResult",
+        SMessage::OpenDocument { .. } => "OpenDocument",
+        SMessage::SurfaceBlit { .. } => "SurfaceBlit",
+        SMessage::PlayMedia { .. } => "PlayMedia",
+        SMessage::BrowserNavBack => "BrowserNavBack",
+        SMessage::BrowserNavForward => "BrowserNavForward",
+        SMessage::BrowserNavReload => "BrowserNavReload",
+        SMessage::BrowserScroll(_, _) => "BrowserScroll",
+        SMessage::BrowserClick(_, _) => "BrowserClick",
+        SMessage::BrowserResize(_, _) => "BrowserResize",
+        SMessage::BrowserKey(_) => "BrowserKey",
+        SMessage::BrowserText(_) => "BrowserText",
+        SMessage::BrowserUrlChanged(_) => "BrowserUrlChanged",
+        SMessage::BrowserTitleChanged(_) => "BrowserTitleChanged",
+        SMessage::BrowserFaviconChanged { .. } => "BrowserFaviconChanged",
         SMessage::EditorLoad { .. } => "EditorLoad",
         SMessage::EditorEdited { .. } => "EditorEdited",
         SMessage::EditorSaveRequest => "EditorSaveRequest",
@@ -471,6 +744,7 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::TriggerUpload(_) => "TriggerUpload",
         SMessage::Principia(_) => "Principia",
         SMessage::Matrix(_) => "Matrix",
+        SMessage::Logs(_) => "Logs",
         SMessage::Input { .. } => "Input",
         SMessage::TemplateAction(_) => "TemplateAction",
         SMessage::NavSelect(_) => "NavSelect",
@@ -497,6 +771,22 @@ fn principia_variant_name(c: &PrincipiaCommand) -> &'static str {
     match c {
         PrincipiaCommand::SetSystemRoot(_) => "SetSystemRoot",
         PrincipiaCommand::SystemRootChanged(_) => "SystemRootChanged",
+        PrincipiaCommand::PrefGet { .. } => "PrefGet",
+        PrincipiaCommand::PrefValueIs { .. } => "PrefValueIs",
+        PrincipiaCommand::PrefSet { .. } => "PrefSet",
+        PrincipiaCommand::PrefList { .. } => "PrefList",
+        PrincipiaCommand::PrefListIs { .. } => "PrefListIs",
+        PrincipiaCommand::PrefChanged { .. } => "PrefChanged",
+        PrincipiaCommand::PrefError { .. } => "PrefError",
+    }
+}
+
+fn pref_value_variant_name(v: &PrefValue) -> &'static str {
+    match v {
+        PrefValue::Str(_) => "Str",
+        PrefValue::Int(_) => "Int",
+        PrefValue::Float(_) => "Float",
+        PrefValue::Bool(_) => "Bool",
     }
 }
 
@@ -508,6 +798,19 @@ fn matrix_variant_name(e: &MatrixEvent) -> &'static str {
         MatrixEvent::SectorFocused { .. } => "SectorFocused",
         MatrixEvent::NodeSelected(_) => "NodeSelected",
         MatrixEvent::TopologyMutated(_) => "TopologyMutated",
+        MatrixEvent::BrowseTo { .. } => "BrowseTo",
+        MatrixEvent::DirListed(_) => "DirListed",
+        MatrixEvent::FileOp { .. } => "FileOp",
+        MatrixEvent::FsOpResult { .. } => "FsOpResult",
+    }
+}
+
+fn logevent_variant_name(e: &LogEvent) -> &'static str {
+    match e {
+        LogEvent::LogFilter(_) => "LogFilter",
+        LogEvent::LogSource(_) => "LogSource",
+        LogEvent::LogPause(_) => "LogPause",
+        LogEvent::LogTail { .. } => "LogTail",
     }
 }
 
@@ -528,6 +831,10 @@ fn completeness_guard_matches_are_exhaustive() {
     assert_eq!(
         matrix_variant_name(&MatrixEvent::FocusSector("euclase".to_string())),
         "FocusSector"
+    );
+    assert_eq!(
+        logevent_variant_name(&LogEvent::LogPause(true)),
+        "LogPause"
     );
 }
 

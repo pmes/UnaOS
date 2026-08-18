@@ -749,6 +749,19 @@ pub fn ppi_pending(intid: u32) -> bool {
 /// Acknowledge, dispatch, and end one interrupt at the CPU interface. Called from the IRQ vector
 /// stub with IRQs masked. Reading IAR acknowledges (and returns the INTID); writing EOIR the same
 /// value completes it. Spurious reads (INTID >= 1020) take no EOI.
+/// SPIN-7 (2026-07-30, the PA0 storm hypothesis): per-core IRQ accounting for the [spin1] witness.
+/// A level-sensitive SPI with no handler is EOI'd still-asserted and re-pends instantly — an
+/// interrupt storm that freezes a task one instruction after `unmask_irq` with every lock clean
+/// and the scheduler never re-entered (the exact PA0 signature). These counters name it.
+pub static IRQ_TOTAL: [core::sync::atomic::AtomicU64; 8] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 8];
+pub static IRQ_LAST_INTID: [core::sync::atomic::AtomicU32; 8] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; 8];
+pub static IRQ_UNHANDLED: [core::sync::atomic::AtomicU64; 8] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 8];
+pub static IRQ_UNHANDLED_LAST: [core::sync::atomic::AtomicU32; 8] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; 8];
+
 pub fn handle_irq() {
     // v3: acknowledge/EOI go through the ICC_*_EL1 system registers, not the memory-mapped GICC.
     // Compiled out on the pi build (which is always v2).
@@ -763,11 +776,21 @@ pub fn handle_irq() {
         return; // spurious / special — no EOI
     }
 
+    // SPIN-7: count every acked IRQ per core; a storm shows as TOTAL racing while the core's task
+    // makes no progress, and LAST_INTID names the screamer.
+    {
+        use core::sync::atomic::Ordering;
+        let c = crate::arch::percpu::this_cpu().cpu_index as usize & 7;
+        IRQ_TOTAL[c].fetch_add(1, Ordering::Relaxed);
+        IRQ_LAST_INTID[c].store(intid, Ordering::Relaxed);
+    }
+
     if intid < 16 {
         // SGI (inter-processor interrupt). INTID = the IPI channel, bits[12:10] = source core.
-        // For now the only IPI is a wake/reschedule ping, which just needs to have interrupted the
-        // idle WFE — count it (per-core) as proof of cross-core delivery. M3 hangs the scheduler
-        // reschedule off this.
+        // The wake/reschedule ping: count it (per-core) as proof of cross-core delivery; breaking
+        // an idle core's WFI needs nothing more. SPREAD-9: on a BUSY core the ping may also carry a
+        // pending service-band preemption — that runs after EOI (`sched::ipi_preempt`, below), never
+        // here (a context switch before EOI would leave the SGI active across the switch).
         crate::arch::percpu::count_ipi();
     } else if intid == crate::arch::timer::TIMER_INTID {
         // The handler re-arms the timer (clearing its level-sensitive line) before we EOI.
@@ -780,6 +803,20 @@ pub fn handle_irq() {
         #[cfg(feature = "baremetal")]
         if intid == crate::arch::serial::PL011_RX_INTID {
             crate::arch::serial::on_rx_interrupt();
+        } else {
+            // SPIN-7: an SPI nobody handles — after the EOI below its level re-pends instantly if
+            // still asserted. Count + name it; the [spin1] line beside a racing count is the storm.
+            use core::sync::atomic::Ordering;
+            let c = crate::arch::percpu::this_cpu().cpu_index as usize & 7;
+            IRQ_UNHANDLED[c].fetch_add(1, Ordering::Relaxed);
+            IRQ_UNHANDLED_LAST[c].store(intid, Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "baremetal"))]
+        {
+            use core::sync::atomic::Ordering;
+            let c = crate::arch::percpu::this_cpu().cpu_index as usize & 7;
+            IRQ_UNHANDLED[c].fetch_add(1, Ordering::Relaxed);
+            IRQ_UNHANDLED_LAST[c].store(intid, Ordering::Relaxed);
         }
     }
 
@@ -793,6 +830,15 @@ pub fn handle_irq() {
     #[cfg(feature = "baremetal")]
     if intid == crate::arch::timer::TIMER_INTID {
         crate::arch::sched::timer_preempt();
+    }
+    // SPREAD-9: the wake SGI is now a PREEMPTION boundary, not just a WFI break. Same post-EOI
+    // position and same rationale as timer_preempt above (ipi_preempt may context-switch away and
+    // must not do so with the SGI still active on this CPU interface). It consumes the per-CPU kick
+    // the waker armed (sched::KICK_BAND, via preempt_hint) and dispatches only for a service-band
+    // wake that outranks the running task — see sched::ipi_preempt for the policy and the bound.
+    #[cfg(feature = "baremetal")]
+    if intid < 16 {
+        crate::arch::sched::ipi_preempt();
     }
 }
 

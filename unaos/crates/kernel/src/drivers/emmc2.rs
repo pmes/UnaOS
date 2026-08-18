@@ -19,6 +19,8 @@
 // both. Both bases sit in the peripheral GiB already mapped Device/XN by `boot::build_l1` (L1[3] @
 // 0xC000_0000), so no MMU change is needed.
 
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
 use spin::Mutex;
 
 use crate::drivers::block::{BlockDeviceInfo, BlockError};
@@ -103,9 +105,18 @@ const DATA_TIMEOUT_MS: u64 = 200;
 /// programming under the plain command timeout would misclassify a slow-but-successful write as an error.
 const PROG_BUSY_TIMEOUT_MS: u64 = 500;
 
-/// The identified card: which base won the probe, its addressing mode, and its capacity. `read_block_512`
-/// reads this. Behind a Mutex so a read serializes the (single) controller; on the Pi loader path only the
-/// one loader task ever reads, but the lock keeps the driver correct if a second reader ever appears.
+/// WEDGE-10 (F2): how long a MASKED claimant may spin re-attempting [`claim`] before giving up with
+/// `BlockError::Busy`. Derived from this driver's own worst legitimate hold, not guessed: the longest
+/// transfer is the CMD24 write ladder, whose deadlines sum to ~1300 ms — `CMD_TIMEOUT_MS` twice for the
+/// CMD24 issue (DAT/CMD-inhibit + CMD_DONE), `DATA_TIMEOUT_MS` twice (WRITE_RDY + DATA_DONE),
+/// `PROG_BUSY_TIMEOUT_MS` for the programming-busy window, and `CMD_TIMEOUT_MS` twice more for the CMD13
+/// verdict. The budget is 2× that, so a masked claimant outlasts one entire worst-case transfer by a
+/// factor of two before it concludes the holder is not coming back. See [`claim_for_io`] for why a
+/// wall-clock-bounded masked wait is a stall rather than the F2 deadlock.
+const MASKED_CLAIM_BUDGET_MS: u64 = 2 * (2 * CMD_TIMEOUT_MS + 2 * DATA_TIMEOUT_MS + PROG_BUSY_TIMEOUT_MS + 2 * CMD_TIMEOUT_MS);
+
+/// The identified card: which base won the probe, its addressing mode, and its capacity. Loaned out by
+/// value for the duration of one sector transfer — see [`CARD`] for why it is a loan and not a held lock.
 struct SdCard {
     base: usize,
     /// ccs (from ACMD41 bit30): true = SDHC/SDXC block addressing, false = SDSC byte addressing.
@@ -115,7 +126,62 @@ struct SdCard {
     /// CMD13 SEND_STATUS argument (RCA already shifted into [31:16]), captured at CMD3.
     rca_arg: u32,
 }
+/// WEDGE-10 (F2) — the identified card lives behind a CLAIM/LOAN model, and this mutex is PRIVATE.
+///
+/// F2 is the last of the F1–F4 masked-spinner family, and its instance is F3's defect one layer down.
+/// `CARD` used to be locked at the TOP of [`read_block_512`] / [`write_block_512`] and held straight
+/// across the entire polled sector transfer. Those transfers are bounded — but by CNTPCT deadlines that
+/// sum to ~600 ms on a read (`CMD`/`DAT` inhibit 100 + `CMD_DONE` 100 + `READ_RDY` 200 + `DATA_DONE`
+/// 200) and ~1.3 s on a write (the same ladder plus `PROG_BUSY` 500 and a CMD13 round trip) — against a
+/// 12 ms scheduler quantum. The holders are ordinary PREEMPTIBLE tasks: a user read walking a cluster
+/// chain, the `/fs/` unafs sector device, the shell's raw block verbs. Tasks never migrate and pinned
+/// tasks are never stolen, so once a holder was preempted mid-hold it never ran again while a masked
+/// acquirer (user `SYS_WRITE` → `fat.rs` `without_interrupts` FAT/dir RMW → `drivers/block.rs` → here)
+/// spun on this lock on that same core: that core could take no timer IRQ, the holder was never
+/// re-dispatched, and the core died silently — no panic, and with `FAT_MUTATION` still held by the
+/// spinner, the filesystem died with it. There is no ABBA cycle here either; lock ordering fixes none
+/// of it.
+///
+/// F2 differs from F3 in RATE, not in kind, and that is why it was last rather than optional: a healthy
+/// card's hold is microseconds, so the preempt window is a small fraction of each sector op instead of
+/// F3's near-certainty — but FAT traffic runs thousands of sector ops per boot, and a slow or failing
+/// card walks the bounded ladder out into the hundreds of milliseconds, where the window is the whole
+/// hold. Lowest trigger rate in the family; identical silent core death when it triggers.
+///
+/// The fix is WEDGE-8's, not WEDGE-7's. F1's fix masked the critical section, affordable only for
+/// micro-bounded work; a ~1.3 s worst-case sector ladder can no more be masked than F3's 8.3 s BOT pump
+/// (masking a core for that long is the bug in another coat). So the discipline goes on the LOCK, not
+/// the WORK:
+///
+///   * the mutex is held only inside [`claim`] / [`SdLoan::drop`] / [`install`], each a masked O(1)
+///     take/put (the WEDGE-7 guard order: mask taken BEFORE the acquire, lock released BEFORE the
+///     unmask). No masked spinner can wait more than a few dozen cycles on it, and no holder of it can
+///     ever be preempted mid-hold.
+///   * the CARD ITSELF is loaned out by value to exactly one transfer at a time, which runs the polled
+///     CMD17/CMD24 ladder with NO lock held. A contender is told [`SdClaimError::Busy`] immediately
+///     rather than spinning, and handles it honestly: [`claim_for_io`] waits only when unmasked, the
+///     block layer surfaces `BlockError::Busy`, `fat.rs` retries the whole RMW OUTSIDE its masked span,
+///     and user mode sees `-EAGAIN`.
+///
+/// The whole claim/loan surface is module-private — tighter than F3's, which had to be `pub` because
+/// the xHCI controller is driven from many files. Every SD transfer goes through this file's two entry
+/// points, so nothing outside needs a loan. The invariant, checkable by grep: `CARD.lock()` appears
+/// ONLY in `claim`/`Drop`/`install` in this file, and the compiler enforces the static's privacy.
 static CARD: Mutex<Option<SdCard>> = Mutex::new(None);
+
+/// WEDGE-10: true while the card is loaned out via [`claim`]. Written only inside the masked mutex
+/// hold, so a `None` in the mutex disambiguates cleanly: loaned (`Busy`) vs never identified
+/// (`NotReady`).
+static CARD_LOANED: AtomicBool = AtomicBool::new(false);
+
+/// WEDGE-10: the identified card's block count, published once by [`install`] and immutable after — so
+/// it is readable with NO lock and NO loan. Load-bearing twice over. First, [`card_num_blocks`] is
+/// called from inside `fs::unafs::with_unafs`'s masked span (via `SdSectorDevice::open`), where taking
+/// `CARD` was itself an instance of this arc's defect. Second, under the loan model a lock-based read
+/// would see `None` whenever a transfer happened to be in flight and silently report "no SD card" —
+/// reverting the PI-FS-2 geometry fix to the shared `BLOCK_DEVICE` global for that call. 0 = no card
+/// identified yet (`try_init` rejects a zero-block card, so 0 is an unambiguous sentinel).
+static CARD_BLOCKS: AtomicU64 = AtomicU64::new(0);
 
 /// PI-FS-2: the identified microSD card's block count, or `None` until [`probe`] succeeds.
 ///
@@ -126,8 +192,155 @@ static CARD: Mutex<Option<SdCard>> = Mutex::new(None);
 /// the SD's own reads against a foreign device's block count. Since `read_block_512` already
 /// serves SD data whenever the SD backend is active, its size guard must come from the same card
 /// — this accessor is that source.
+///
+/// WEDGE-10 (F2): served from the immutable [`CARD_BLOCKS`] publication, so this is lock-free and
+/// loan-independent — it neither blocks on nor is perturbed by an in-flight transfer.
 pub fn card_num_blocks() -> Option<u64> {
-    CARD.lock().as_ref().map(|c| c.num_blocks)
+    match CARD_BLOCKS.load(Ordering::Acquire) {
+        0 => None,
+        n => Some(n),
+    }
+}
+
+/// WEDGE-10: why [`claim`] returned no card.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SdClaimError {
+    /// No card was ever identified (both bases failed the probe, or `probe` has not run yet).
+    NotReady,
+    /// Another context holds the loan right now — a sector transfer is in flight. The claim did NOT
+    /// wait: waiting is the caller's decision, and a masked caller must not.
+    Busy,
+}
+
+/// WEDGE-10: an exclusive loan of the identified card, returned by [`claim`]. Derefs to [`SdCard`];
+/// dropping it returns the card to the shared slot (masked O(1) put, panic-safe by RAII — the early
+/// `return Err(..)` paths all over the transfer ladders rely on exactly that).
+struct SdLoan(Option<SdCard>);
+
+impl core::ops::Deref for SdLoan {
+    type Target = SdCard;
+    #[inline]
+    fn deref(&self) -> &SdCard {
+        self.0.as_ref().expect("SdLoan invariant: Some until drop")
+    }
+}
+
+impl Drop for SdLoan {
+    fn drop(&mut self) {
+        if let Some(c) = self.0.take() {
+            // WEDGE-10: masked micro-hold; the field order of these locals IS the fix in miniature —
+            // the guard (lock) drops before `_mask` restores DAIF, so we never run unmasked holding it.
+            let _mask = crate::arch::IrqMask::new();
+            let mut guard = CARD.lock();
+            *guard = Some(c);
+            CARD_LOANED.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// WEDGE-10: claim exclusive use of the card. O(1), never waits — the internal mutex hold is a masked
+/// take (a preempted holder of it is impossible, so any spin on it is bounded by construction), and a
+/// card already loaned out returns [`SdClaimError::Busy`] instead of blocking. Callers that can afford
+/// to wait do so OUTSIDE this call, unmasked, with their own bounded policy ([`claim_for_io`]).
+fn claim() -> Result<SdLoan, SdClaimError> {
+    let _mask = crate::arch::IrqMask::new();
+    let mut guard = CARD.lock();
+    match guard.take() {
+        Some(c) => {
+            CARD_LOANED.store(true, Ordering::Release);
+            Ok(SdLoan(Some(c)))
+        }
+        None => Err(if CARD_LOANED.load(Ordering::Acquire) {
+            SdClaimError::Busy
+        } else {
+            SdClaimError::NotReady
+        }),
+    }
+}
+
+/// WEDGE-10: install the freshly identified card into the shared slot (BSP probe, once). Publishes the
+/// immutable geometry FIRST so no reader can observe a claimable card whose block count is still 0,
+/// then takes the same masked micro-hold as [`claim`].
+fn install(card: SdCard) {
+    CARD_BLOCKS.store(card.num_blocks, Ordering::Release);
+    let _mask = crate::arch::IrqMask::new();
+    let mut guard = CARD.lock();
+    *guard = Some(card);
+    CARD_LOANED.store(false, Ordering::Release);
+}
+
+/// WEDGE-10 (F2): claim the card for one sector transfer — the emmc2 twin of
+/// `drivers::block::claim_xhci_for_io`. It lives HERE rather than beside the block layer's SD arms
+/// because [`read_block_512`] / [`write_block_512`] are also called directly (the INSTALL-PI target in
+/// `install::pi` bypasses `drivers::block` entirely), so the policy has to sit UNDER every entry point
+/// rather than beside one of them.
+///
+/// Masked callers — the FAT/dir RMW spans under `fat.rs`'s `without_interrupts`, and
+/// `fs::unafs::with_unafs` — get a CNTPCT-BOUNDED re-claim spin, then `BlockError::Busy`. They may NOT
+/// `hlt` (a WFI under masked IRQs is not this policy's business) and they may NOT wait on the mutex; they
+/// re-attempt the O(1) [`claim`] with `spin_loop` hints until [`MASKED_CLAIM_BUDGET_MS`] of wall clock
+/// has passed.
+///
+/// WHY A MASKED WAIT IS SOUND HERE, AND IS NOT F3 AGAIN. The defect this arc closes was an UNBOUNDED
+/// masked spin on a *lock* whose same-core preempted holder could never run again — the wait could only
+/// end if the holder ran, and the holder could only run if the waiter stopped. This wait ends
+/// unconditionally on wall clock, whether or not the holder ever runs, so no execution can be
+/// indefinitely postponed: it is a bounded STALL, the same accepted cost class as the masked WFI stall
+/// already documented on `fat.rs::with_fat_lock`. The two contention cases separate cleanly:
+///
+///   * CROSS-CORE (the common case, and the one the QEMU gate reproduces) — the loan holder runs on its
+///     own core and every wait it performs is itself CNTPCT-bounded, so it returns the card well inside
+///     this budget and the masked claimant proceeds. No stall in practice: a healthy hold is µs.
+///   * SAME-CORE PREEMPTED HOLDER (the F2 corner) — the holder cannot run while we spin, so the budget
+///     simply expires and we return `Busy`. Bounded stall, then an honest refusal that `fat.rs` retries
+///     outside its mask. Never a dead core, which is the whole point.
+///
+/// FAIRNESS, deliberately inverted: the masked spinner polls far faster than the unmasked `hlt` waiters
+/// below, so it wins the next free loan. That is intentional — an instant-`Busy` masked policy is
+/// STARVED by construction on this backend, because emmc2's healthy hold is microseconds while every
+/// unmasked competitor waits (and therefore wins) — which cost the U11 reaper its `free_chain` and
+/// orphaned a cluster chain outright. The masked context is the one that cannot afford to lose 64 races.
+///
+/// Unmasked callers keep the old effectively-blocking semantics, honestly bounded: retry the claim with
+/// a `hlt` between attempts (each wakes on the next IRQ, letting the scheduler run the loan holder) up
+/// to `hw_wait_budget()` wall-clock — ~2.8 s on the Pi, comfortably past the ~1.3 s worst-case write
+/// ladder, so a healthy card never surfaces `Busy` to an unmasked caller. A card wedged in a failing
+/// transfer surfaces `Busy` instead of hanging its caller forever.
+fn claim_for_io() -> Result<SdLoan, BlockError> {
+    match claim() {
+        Ok(l) => return Ok(l),
+        Err(SdClaimError::NotReady) => return Err(BlockError::NotReady),
+        Err(SdClaimError::Busy) => {}
+    }
+    if crate::arch::irqs_masked() {
+        // Masked: spin on the O(1) claim under a CNTPCT deadline — never `hlt` (we are masked), never
+        // the mutex. `deadline_ms`/`expired` are this driver's own bounded-wait discipline.
+        let dl = deadline_ms(MASKED_CLAIM_BUDGET_MS);
+        loop {
+            core::hint::spin_loop();
+            match claim() {
+                Ok(l) => return Ok(l),
+                Err(SdClaimError::NotReady) => return Err(BlockError::NotReady),
+                Err(SdClaimError::Busy) => {}
+            }
+            if expired(dl) {
+                return Err(BlockError::Busy);
+            }
+        }
+    }
+    let start = crate::arch::now_cycles();
+    let budget = crate::arch::hw_wait_budget();
+    loop {
+        crate::hlt();
+        match claim() {
+            Ok(l) => return Ok(l),
+            Err(SdClaimError::NotReady) => return Err(BlockError::NotReady),
+            Err(SdClaimError::Busy) => {}
+        }
+        if crate::arch::now_cycles().wrapping_sub(start) >= budget {
+            return Err(BlockError::Busy);
+        }
+    }
 }
 
 #[inline]
@@ -422,16 +635,21 @@ fn finish(card: SdCard) {
         vendor: *b"BCM-SD  ",
         product: *b"microSD Card    ",
     };
-    *CARD.lock() = Some(card);
+    // WEDGE-10: install BEFORE flipping the block backend, so the first routed read finds a claimable
+    // card rather than a `NotReady` — the same ordering the pre-loan code had.
+    install(card);
     crate::drivers::block::register_sd(info);
 }
 
 /// Read one 512-byte block at `lba` into `buf` (>= 512 bytes) via a polled single-block CMD17. Returns
 /// the number of bytes copied (512) on success. Backs `drivers::block::read_block` on the SD backend.
 /// No cache maintenance: PIO into a normal kernel buffer, no DMA.
+///
+/// WEDGE-10 (F2): the card is CLAIMED (a loan, held by this frame) rather than locked — the polled
+/// CMD17 ladder below runs with no lock held, so preempting this frame mid-transfer strands nobody.
+/// See [`CARD`] and [`claim_for_io`].
 pub fn read_block_512(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
-    let guard = CARD.lock();
-    let card = guard.as_ref().ok_or(BlockError::NotReady)?;
+    let card = claim_for_io()?;
     if lba >= card.num_blocks {
         return Err(BlockError::BadLba);
     }
@@ -495,9 +713,12 @@ pub fn read_block_512(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
 ///
 /// ⚠ This is the FIRST metal-risk WRITE path on the Pi 4 EMMC2 driver: QEMU's generic-sdhci models the PIO
 /// write FIFO, but silicon timing (buffer-write-ready latency, DAT0 programming-busy) is only proven on metal.
+///
+/// WEDGE-10 (F2): as with the read twin, the card is CLAIMED for the duration — the CMD24 ladder, the
+/// 500 ms programming-busy wait and the CMD13 verdict all run with no lock held. This is the longest
+/// hold in the driver (~1.3 s of bounded deadlines) and so the one that made F2 reachable at all.
 pub fn write_block_512(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
-    let guard = CARD.lock();
-    let card = guard.as_ref().ok_or(BlockError::NotReady)?;
+    let card = claim_for_io()?;
     if lba >= card.num_blocks {
         return Err(BlockError::BadLba);
     }

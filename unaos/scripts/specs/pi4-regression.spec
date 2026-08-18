@@ -17,6 +17,20 @@
 #     Re-measured 2026-07-25 (MBENCH-HONEST, this host, 63 witnesses): 8 s -> 41/63 TRUNCATED;
 #     60 s -> 63/63 PASS, last required witness (`BANDY-ACL`) at line 1035 of 1682. The 8 s default
 #     this arc removed was not marginal — it stopped less than a third of the way through the chain.
+#     FLAKE-1 (2026-07-28): the exit contract GAINS a fourth code and loses none. 0 PASS / 1 FAIL /
+#     3 TRUNCATED are exactly as above; NEW `4` = HARNESS FLAKE — QEMU never produced a capture, so the
+#     run is neither a pass, a regression, nor a truncation. It exists because a `kernel8-test 150` on
+#     this bench finished GREEN with no serial-pi.log at all: mbench errored `[Errno 2] No such file or
+#     directory` and a downstream `&&` masked it. Cause is a check-then-bind race on the QMP port (the
+#     `lsof` pre-scan runs, QEMU binds seconds later after the build, and a concurrent worktree gate can
+#     win the bind and kill ours before `-serial file:` creates the log) — unclosable atomically from
+#     shell, so `test_kernel8()` now gates on LIVENESS (pid alive + log non-empty within
+#     UNAOS_K8T_LIVE_SECS, default 5) and RETRIES on the next port, twice, loudly; exhausted retries or
+#     an empty log at assert time exit 4 instead of reaching mbench with nothing to replay.
+#     Second FLAKE-1 measurement, and why TRUNCATED now mentions host load: the sufficient window is
+#     LOAD-DEPENDENT. Same host, same image, 2026-07-28 — 150 s -> TRUNCATED under concurrent
+#     build/QEMU load; 210 s -> PASS clean. This is the same MACHINE-DEPENDENT margin noted above,
+#     observed within ONE machine over time rather than between machines.
 #   Metal:      ~/pi-serial.log (pi-bench-connect.sh bridge capture)
 #
 # Metal caveat (unaos-hazards): some real-Pi boots bring up only 3 of 4 cores and
@@ -71,6 +85,19 @@ REQUIRE U5: capabilities.*-> PASS
 REQUIRE U6: general object table.*-> PASS
 REQUIRE U6b: real File handles.*-> PASS
 REQUIRE U7: cross-process transfer.*-> PASS
+# U7FIX (P63 metal-only): the U7 fixtures' GO parks must outlast the LAUNCHER, and the launcher's deadlines
+# are wall-clock while a bare-yield park is denominated in ITERATIONS — ~1 ms each under QEMU's emulation but
+# a few hundred ns on a real idle A72 core. On metal the child gave up before GO was ever released
+# (`child=0x0 used=0 snap=false`, parent stuck at the partial `0x3`). The park primitive is SYS_SLEEP_MS now
+# (a real 250 Hz tick on metal; still a cooperative yield under QEMU, where nothing was broken).
+# NOTE what this REQUIRE can and cannot do: because SYS_SLEEP_MS degrades to a yield under QEMU, QEMU cannot
+# tell the fixed park from the broken one and CANNOT gate the fix itself — that confirmation is the bench's.
+# What it DOES gate, on both, is the launcher's new parked-out assertion: neither fixture may have exited
+# before its GO was released. That is the fact that names the defect directly, and its absence is what made
+# P63 a puzzle. The reported margins are also the early warning — they shrink before they cliff.
+REQUIRE \[u7fix\] park margin — child parked [0-9]+ms before GO \(parked_out=0\), parent parked [0-9]+ms before GO \(parked_out=false\); park primitive=SYS_SLEEP_MS budget=0x8000
+FORBID \[u7fix\] .*child parked [0-9]+ms before GO \(parked_out=[1-9]
+FORBID \[u7fix\] .*parent parked [0-9]+ms before GO \(parked_out=true
 REQUIRE U8: revocation trees.*-> PASS
 REQUIRE U9: real File writes.*-> PASS
 REQUIRE U10: file growth.*-> PASS
@@ -261,9 +288,9 @@ REQUIRE UVUG: frames=300 threads=2 checksum=0xe68285b85121ac7c
 # ---     now, and the `revokes=0` line pins the PRECONDITION the arc fixed: this test must own the
 # ---     global input focus for its window, so a slot teardown revoking focus mid-measurement (which
 # ---     is what made it flake ~1 boot in 7) fails the gate instead of merely being unlucky.
-REQUIRE EL0: input router — routed=2 .*GUI_CHANNEL bypassed :: PASS
+REQUIRE USER: input router — routed=2 .*GUI_CHANNEL bypassed :: PASS
 REQUIRE \[inroute\] router window — routed=2 stale_dropped=1 revokes=0
-FORBID EL0: input router.*FAIL
+FORBID USER: input router.*FAIL
 #
 # --- 2. The el0-wcb window-verb ledger, ALL THIRTEEN bits. The literal mask matters: a partial
 # ---    mask still prints `witness=0x...` and the verdict already refuses it, but pinning 0x1fff
@@ -310,6 +337,26 @@ FORBID \[wc-d\] verify .*-> FAIL
 REQUIRE \[wc-fv\] focus-vis .*-> PASS
 FORBID \[wc-fv\] focus-vis .*-> FAIL
 
+# --- 4c. WEDGE-1r2: the drain barrier's DWELL ledger must reach the wire. WEDGE-1's `DRAIN STALLED`
+# ---    tripwire measures only past ~10^8 spins and speaks through a blocking serial lock, so its
+# ---    silence carried no information — and §WEDGE-2 banked it as "the drain barrier is exonerated"
+# ---    across three silicon lockups. `[wedge1] dwell` is the reading below that threshold. It is
+# ---    REQUIREd for the reason the arc exists: an instrument that can vanish without the gate
+# ---    noticing is an instrument whose next silence gets misread the same way.
+# ---    `-> QUIET` (drains ran, none of them spun) is the healthy gate answer — as is `-> SPUN`
+# ---    (WEDGE-1r3: a short spin was measured and stayed under `note`; PA6 metal printed exactly
+# ---    this and the old ladder banked it as QUIET). But the REQUIRE
+# ---    pins only the LINE, not the verdict: under a loaded CI host a slow QEMU blit honestly reads
+# ---    DWELL/INFLIGHT, and a gate that fails on an honest reading teaches people to ignore it
+# ---    (lens fix, s1u — the verdict pin was a flake in waiting). The gate question is "does the
+# ---    instrument still exist and publish", and that is what the pattern below asserts.
+REQUIRE \[wedge1\] dwell drains=.*spin_max=.*->
+
+# --- STORM-HEADROOM (s1u lens nit): the boot-baseline census is the proof the storm instrument
+# ---    still exists and publishes — the same existence-pin rationale as the dwell REQUIRE above.
+# ---    Without it, the load_accounting_witness call could vanish with the gate green.
+REQUIRE \[storm\] boot-baseline \| busy
+
 # --- BGRUN-1: background EL0 runs (bg/jobs/kill). Headless-observable core of the contract,
 # ---   REQUIREd per the round-1 lens: leg 1 proves spawn->exit->reap (the sole-reaper contract);
 # ---   leg 2 proves a killed bg row settles (confirmed-kill reaps in place; no leaked PRUNNING row
@@ -323,8 +370,13 @@ FORBID \[wc-fv\] focus-vis .*-> FAIL
 # ---   races its own exit. Leg 3 keeps the persistence proof regardless: STAT.ELF has no exit condition
 # ---   AT ALL, focused or not, where VUG's persistence is conditional on the detached bit.
 REQUIRE BGRUN-ST: spawn->exit->reap PASS
+# --- PROCS-6: the cap itself, pinned. The reclaim leg below drives MAX_PROCS+2 launches, so its own
+# ---   PASS text cannot tell you which capacity it exercised; this line can, and a silent regression
+# ---   of the cap back to 4 (or a raise past the EL0 slot pool) fails HERE rather than mysteriously.
+REQUIRE BGRUN-ST: process table capacity = 6 rows \(bg programs alive at once; EL0 slots 8\)
 # --- BGRUN-SCAV: exited-but-unreaped rows must not deny a launch the machine can satisfy. MAX_PROCS+2
-# ---   bg launches with NO intervening reap; every one must succeed. Goes red on the pre-fix kernel.
+# ---   bg launches with NO intervening reap; every one must succeed (8 launches at the PROCS-6 cap, the
+# ---   last two served only by the PEXITED scavenge). Goes red on the pre-fix kernel.
 REQUIRE BGRUN-ST: slot reclaim PASS
 REQUIRE BGRUN-ST: kill mid-run PASS \(pid=[0-9]+, killed — row reaped
 REQUIRE BGRUN-ST: persist\+kill PASS \(pid=[0-9]+,
@@ -477,7 +529,60 @@ FORBID \[wc-h\] .*-> UNSTAGED
 # --- CURSOR-3 — overlay-present path (printed alongside [wc-i], witness-feature only) ----------
 #     The rollup reports the sprite mechanism across composite passes: UNWITNESSED on QEMU (no
 #     pointer), COMPOSED on metal (overlay taken). See docs/dev/OS/08_VIDEO/engine.md §CURSOR-3.
-REQUIRE \[cursor3\] rollup scope=.* planned=.* offers=.* taken=.* adopt=.* repaint=.* ensure=.* ->
+REQUIRE \[cursor3\] rollup scope=.* planned=.* offers=.* taken=.* adopt=.* repaint=.* ensure=.* stale=.* ->
+
+# --- CURSOR-5 — sprite/compositor coherence residual (printed right after [cursor3]'s rollup) ---
+#     P64 (attended): "mouse still spotty [over vug] and causes a flash in the vug display here and
+#     there if you tweak the mouse just so". The flash was WC-L's deferred-erase drain calling a FULL
+#     `cursor::undraw` from INSIDE an open overlay session: the session's plan still matched, so the
+#     staged presents kept composing the arrow onto the panel while the sprite module believed itself
+#     off-panel, and the next save-under captured its own fill. CURSOR-5 moved the drain ahead of the
+#     bracket and gave `compose_into` a lock-free generation check.
+#
+#     `drain_insession` is the direct detector for the ordering and must stay 0 — a non-zero count
+#     means someone put the drain back inside the bracket. It is scoped to the core that OPENED the
+#     session, so the VUGPAR steady state (another core legitimately mid-session while this one
+#     drains) does not trip it; that case is absorbed by the generation check and shows up as
+#     `stale_compose` instead. UNWITNESSED on QEMU (no HID pointer, so the sprite is never drawn);
+#     COHERENT/RESIDUAL on metal.
+#     See docs/dev/OS/08_VIDEO/engine.md §CURSOR-5.
+REQUIRE \[cursor5\] rollup scope=.* stale_compose=.* adopt_incoh=.* selfsave=.* masked_nosession=.* drain_insession=.* ->
+FORBID \[cursor5\] .*-> REGRESSED
+FORBID \[cursor5\] .*drain_insession=[1-9]
+
+# --- CURSOR-6 — what the PANEL got, which no earlier cursor counter could reach ------------------
+#     P65v2 (attended, pi4-r23s1o): every CURSOR-5 mechanism silent (`-> COHERENT`) while the spotty
+#     cursor and the vug-window flash both survived. That is not a contradiction — every CURSOR-3/4/5
+#     counter is taken from inside the sprite module's own bookkeeping, and a painter that overwrites
+#     the arrow's pixels without consulting the module leaves that bookkeeping self-consistent.
+#
+#     `[cursor6]` measures the overwrite directly, off a lock-free mirror of the sprite's box
+#     (`cursor::live_box_relaxed`) that is readable from inside `wm`'s BlitGuard and the desktop's row
+#     loop, where the SPRITE lock may not be taken.
+#
+#     NOTHING HERE IS FORBIDDEN, and that is a decision rather than an omission.
+#
+#     `desktop_over` was a FORBID in the arc's first cut, on the reasoning that the render task
+#     brackets its own `Screen::flush` (undraw -> pal.render -> repaint) so a live sprite must never
+#     be seen by `present_background`. The reasoning is right about the bracket and wrong about the
+#     counter. The sprite mirror is deliberately OVER-COUNT-BIASED — `draw_locked` publishes BEFORE
+#     it paints, so that the probe can never MISS an overwrite — and the HID router calls
+#     `cursor::repaint` from its own core. An arrow arriving while a desktop flush is mid-loop
+#     therefore registers a real, healthy, transient overlap. Forbidding it would red a correct metal
+#     boot, and a false red costs Peter a bench sitting chasing a bug that is not there (the same
+#     trap CURSOR-5's `drain_insession` scoping was written to avoid). It is a VERDICT term
+#     (`-> UNBRACKETED`) and a watch-list item instead: a reader who sees it looks there first, and a
+#     SUSTAINED count — not a handful — is what would mean the bracket is genuinely broken.
+#
+#     `present_over` is the metal question this arc exists to ask, so forbidding it would refuse the
+#     evidence. `uncover_lost` is printed as `lost/planned` because the fix has a price (each one
+#     costs a whole-sprite refresh); it is a number to PRICE, not to fail on.
+#
+#     The REQUIRE is therefore the whole of the gate's claim: the line is wired and prints. On QEMU
+#     every field is 0 and the verdict is UNWITNESSED (no HID pointer, so the sprite is never drawn
+#     and the mirror never sets).
+#     See docs/dev/OS/08_VIDEO/engine.md §CURSOR-6.
+REQUIRE \[cursor6\] rollup scope=.* present_over=.* masked=.* desktop_over=.* mismatch=.* uncover_lost=.* ->
 
 # --- WC-J — a closed window gives its panel rows BACK ------------------------------------------
 # ---    P61 (attended): four background vugs, some killed; the operator reported one crash, two
@@ -503,6 +608,39 @@ REQUIRE \[cursor3\] rollup scope=.* planned=.* offers=.* taken=.* adopt=.* repai
 # ---    one. See docs/dev/OS/08_VIDEO/engine.md §WC-J.
 REQUIRE \[wc-j\] vacate close_painted=true close_desktop=true .* owner_painted=true owner_desktop=true .* -> PASS
 REQUIRE \[wc-j\] retile survivor=.* moved=true painted=true live=true old_desktop=true .* -> PASS
+# --- DRAGFLICK — `[wc-j] move-once` is the third half, and it is the one the two above cannot ask.
+# ---    Boot AR, attended, twice: "window drag still flickering a lot". `move_to_inner` erased the
+# ---    WHOLE vacated outer box to the GLASS (`erase` stages a row and `flush_rect`s it) and only
+# ---    then composited the window back — once per motion report. A drag step is a few pixels, so
+# ---    the old and new boxes overlap by ~99%: the operator watched the entire window blink to
+# ---    desktop colour and back at pointer rate, for the ~2.3-2.8 ms `[comp2]` measures a pass at.
+# ---    `vacate` and `retile` both PASSED throughout, and correctly: they ask whether an ABANDONED
+# ---    box came back as desktop, and every flashed pixel was repainted a millisecond later.
+# ---    The leg therefore asks the EXTENT question, in two halves that pull opposite ways so it
+# ---    cannot pass by accident. `old_desktop`/`new_window` are panel read-backs and hold the
+# ---    MOVE-VACATE floor (a fix that merely stopped erasing fails here). `flash_px` and `exact`
+# ---    are read back from the record the erase call site wrote (`move_note_erase`, from the same
+# ---    slice `erase` received) — an OBSERVATION of the erase that happened, not a re-derivation
+# ---    (the original leg re-ran `subtract_box` itself and passed with the fix reverted).
+# ---    `recorded=true` pins the record to this leg's own window. Restoring the whole-box erase
+# ---    passes the read-backs and fails `flash_px=0` with the overlap area as the count.
+# ---
+# ---    WC-K2 CHANGED WHAT THE RECORD IS AN OBSERVATION OF, and the leg is left standing rather than
+# ---    quietly re-pointed. `erase` no longer paints: it hands its boxes to the compositor, and the
+# ---    drain publishes them at the head of the `composite()` the move already ran. So `flash_px`
+# ---    and `exact` now observe THE EXTENT HANDED TO THE COMPOSITOR, taken from the same one array
+# ---    the queue received, while `old_desktop`/`new_window` remain PANEL read-backs taken after
+# ---    `move_to` -- i.e. after that composite. The two halves therefore still pull opposite ways
+# ---    (a fix that stops erasing fails the read-backs; a whole-box erase fails `flash_px=0`), and
+# ---    they are no longer simultaneous claims.
+# ---
+# ---    AND `flash_px=0` DOES NOT BOUND THE PAINTED FLASH under coalescing -- stated here because the
+# ---    first cut of this note claimed it did. `flash_px` counts erased pixels INSIDE THE NEW BOX; a
+# ---    union enlarges the painted region, which is exactly that quantity, while the recorded value
+# ---    stays 0. So the record measures the REQUEST, and `coalesced=` in the `[wc-k]` rollup is the
+# ---    signal that request and paint have parted company. Near zero -- the normal state, since every
+# ---    erase site composites in the same call -- they are the same number.
+REQUIRE \[wc-j\] move-once .* painted=true moved=true old_desktop=true .* new_window=true .* flash_px=0 exact=true -> PASS
 FORBID \[wc-j\] .*-> FAIL
 
 # --- WC-K — the DESKTOP FILL gets the back buffer too -------------------------------------------
@@ -542,13 +680,111 @@ FORBID \[wc-j\] .*-> FAIL
 # ---    the rollup claims only the fills it has seen and the completeness question is the FORBIDs'.
 # ---    Witness-feature only. See docs/dev/OS/08_VIDEO/engine.md §WC-K.
 REQUIRE \[wc-k\] erase box=.* staged=yes .* contig=yes .* torn=.* -> BUFFERED
-REQUIRE \[wc-k\] rollup scope=fills samples=.* noncontig=.* declines=.* -> TEAR-FREE
+REQUIRE \[wc-k\] rollup scope=fills samples=.* noncontig=.* declines=.* outside=0 .* -> TEAR-FREE
 FORBID \[wc-k\] .*staged=no
 FORBID \[wc-k\] .*-> DIRECT
 FORBID \[wc-k\] .*contig=no
 FORBID \[wc-k\] .*-> SPLIT
 FORBID \[wc-k\] .*-> AT-RISK
 FORBID \[wc-k\] .*-> UNSTAGED
+# --- WC-L: the direct fallback is GONE. P64 (capture pi4-r23s1o) caught WC-K's last resort firing
+# ---    twice on focus tab-cycle transitions at ~99% core load --
+# ---    `[wc-k] erase box=514x526 staged=no reason=lock -> DIRECT` -- which is the exact
+# ---    front-buffer writing shape WC-G convicted and WC-K existed to remove. A fill that cannot
+# ---    take the staging lock is now queued as DEFERRED DAMAGE and erased through the staged path
+# ---    by the next composite pass, which also re-damages the windows the paint reached (WC-J's
+# ---    `reclaim` shape, reused). One frame late is a cost; a torn front-buffer write is a defect.
+# ---
+# ---    The two FORBIDs above are therefore now unreachable BY CONSTRUCTION rather than by luck:
+# ---    no emitter in `wcg` can produce `staged=no` or `-> DIRECT` for `[wc-k]` at all. They stay,
+# ---    because they are where a reintroduced fallback would land.
+# ---
+# ---    `-> DEFERRED` is REQUIRED, not merely permitted. Under WC-L that took a one-shot FIXTURE in
+# ---    `wm::stage_fill`, because QEMU has no lock contention of its own and a path whose only
+# ---    witness is a hardware boot is a path that regresses between hardware boots -- which is how
+# ---    WC-K shipped a fallback nobody had seen fire. WC-K2 RETIRED THAT FIXTURE, and the retirement
+# ---    is a strengthening: the queue is no longer the failure route, it is the ONLY route, so every
+# ---    erase in the boot performs the round trip the fixture used to stage by hand. The REQUIRE is
+# ---    accordingly narrowed to `reason=route`, which is the reason only a real erase site can
+# ---    produce -- a boot that satisfied it with a `lock` deferral would now be reporting contention,
+# ---    not routing. The `BUFFERED` line the drain produces is covered by the REQUIRE above.
+# ---
+# ---    What the fixture never proved, and still does not: the REQUEUE arm, a drain that tries and
+# ---    fails. WC-L said so at the time (its fixture deferred with `requeued=no` and the drain then
+# ---    succeeded); `redefers=` on a metal boot remains its only witness.
+# ---
+# ---    `staged=drop`/`-> LOST` is a fill that could neither stage nor defer (permanent `geom`/`cap`
+# ---    reasons, unreachable on any panel this kernel drives). It feeds `declines=` and so the
+# ---    `-> UNSTAGED` FORBID; the explicit FORBID here names the symptom as well as the verdict.
+# ---
+# ---    `-> STARVED` is the DELIVERY verdict, and it is separate from the tearing one on purpose. A
+# ---    deferral that arrives is a latency cost; a deferral that keeps being requeued is a repaint
+# ---    that has NOT happened, which on the panel is a dead window's last frame where the desktop
+# ---    should be -- the P61 ghost by a new route. `TEAR-FREE` printed over that would be exactly
+# ---    WC-K's mistake (a verdict describing the samples it liked rather than the panel), so past
+# ---    `E_REDEFER_MAX` requeues the rollup says STARVED instead. It also gets a one-shot
+# ---    `scope=starve` line of its own, because the sampled rollup fires at fill 4 and starvation
+# ---    by its nature arrives late -- an already-printed rollup cannot retract.
+REQUIRE \[wc-k\] erase box=.* staged=defer reason=route requeued=no -> DEFERRED
+FORBID \[wc-k\] .*-> LOST
+FORBID \[wc-k\] .*-> STARVED
+# --- WC-K2: `wm::erase` STOPS WRITING TO THE GLASS, and the drag seam dies structurally.
+# ---    Boot AS, attended: "still some flickering from title bar" during a window drag. DRAGFLICK
+# ---    had held -- every gesture printed `[drag] ... flash_px=0 -> ONCE` with an erase extent
+# ---    around 1% of the box -- so what was left was not an EXTENT defect but a SEQUENCING one, and
+# ---    DRAGFLICK's own ledger named it in advance. `erase` published `DESKTOP_BG` straight to the
+# ---    front buffer (`stage_fill` + `flush_rect`), and the window's pixels did not reach its new
+# ---    origin until the following `composite()` had finished -- `[comp2]` measures that pass at
+# ---    2279..2839 us. One motion report was therefore TWO panel events ~2.3 ms apart, and a
+# ---    scan-out landing between them shows the trailing edge as bare desktop with the window not
+# ---    yet advanced. Against a 16.7 ms frame that is roughly one report in seven, at pointer rate.
+# ---
+# ---    WC-K2 removes the first event rather than shortening it. Every erase site -- the move path,
+# ---    `close`, `close_owner`, the zoom restore, the park, and WC-J's `reclaim` -- queues its
+# ---    vacated boxes as DEFERRED DAMAGE (`reason=route`), and WC-L's `drain_deferred` publishes
+# ---    them at the head of the composite pass those sites already ran in the same call. The gap
+# ---    does not become zero and this spec does not claim it does; it stops being a whole
+# ---    compositor pass wide, and `erase` stops being a panel writer at all.
+# ---
+# ---    `-> UNPUBLISHED` IS THE LEG, and it is a caller-graph assertion made checkable. After WC-K2
+# ---    `wm::stage_fill` has exactly one caller, `drain_deferred`, which says so (`from_drain`).
+# ---    The check sits at the last statement before the first byte reaches the front buffer, so it
+# ---    fires on a fill that REACHES GLASS from outside a composite publish and not merely on a call
+# ---    from an unexpected place that then declines. It prints its own one-shot line on the
+# ---    `scope=starve` pattern, because the `scope=fills` rollup fires at sample 4 and cannot
+# ---    retract, and it outranks every timing term in that rollup's precedence: a well-shaped,
+# ---    untorn present by the wrong publisher is precisely what the drag seam was made of.
+# ---
+# ---    It CANNOT PASS VACUOUSLY, and that is the pairing rather than the FORBID. `-> BUFFERED`
+# ---    above requires that staged fills happened at all; `reason=route` above requires that they
+# ---    arrived through the queue. A boot with no fills reds on the first, a boot whose fills
+# ---    bypassed the queue reds on the second, and a boot that published one outside a composite
+# ---    reds here. What it does not cover, said plainly: a future path that bypasses `stage_fill`
+# ---    entirely and pokes the framebuffer itself -- that is WC-G's original shape, and WCD-TEARDOWN's
+# ---    `PanelWriteGuard` is its detector.
+# ---    See docs/dev/OS/08_VIDEO/engine.md §WC-K2.
+FORBID \[wc-k\] .*-> UNPUBLISHED
+FORBID \[wc-k\] .*outside=[1-9]
+# --- WC-K2r: `-> RESCUED` is NEITHER required NOR forbidden, and that is a decision.
+# ---    Review condition 1: the two x86 wakeup gates consumed COMP_PENDING and then asked
+# ---    `any_damaged()` alone, so a vacate whose box intersects NO surviving window -- a last-window
+# ---    close, a close_owner on the last owner, a park or zoom-restore jumping clear -- dropped both
+# ---    the queued fill and the retry that would have collected it. Both gates now ask
+# ---    `any_damaged() || deferred_owed()`, and `rescues=` counts the passes taken only because the
+# ---    erase queue was non-empty.
+# ---
+# ---    It is not REQUIREd because the condition needs a DECLINED pass, which needs two cores
+# ---    compositing at once, which this gate's single-core QEMU boot cannot arrange -- requiring it
+# ---    would red an honest run. It is not FORBIDden because a rescue is the fix WORKING.
+# ---
+# ---    And the thing a reader actually wants -- "no queued box outlives the next completed pass" --
+# ---    is NOT ASSERTED ANYWHERE, deliberately. It cannot be, from inside a boot: the stranded state
+# ---    IS "no further pass arrives", so the detector would have to be the pass that does not happen.
+# ---    That is WC-G's completeness lesson in its original form, and the honest response is the same
+# ---    one WC-K gave -- claim the samples seen, leave completeness to the FORBIDs, and say here that
+# ---    the gap exists rather than let the next reader mistake `rescues=` for a proof.
+# ---    Neither gate exists on aarch64 at all (`COMP_GATE` is x86-only), so the x86 half of this
+# ---    condition is pinned in scripts/specs/x86-witness.spec, not here.
 # --- PULSE-2: the always-running per-core CPU pulse, as an INSTRUMENT PANEL in the standing gap at
 # ---    the bottom of the panel -- below the tiled windows, above the PI-UI-2 status line.
 # ---
@@ -597,11 +833,76 @@ REQUIRE \[pstrip\] armed .*full=1000
 # ---    change draws nothing at all. Requiring a rollup whose `skipped=` is non-zero pins that the
 # ---    always-running pulse is genuinely paced and not a 1 Hz repaint wearing a flag.
 REQUIRE \[pstrip\] rollup samples=[0-9]+ redraws=[0-9]+ skipped=[1-9]
-# ---    The busy-loop FORBID. The rate is printed in tenths precisely so this can bite: anything at
-# ---    or above 5.0 presents/s sustained over a rollup window is the strip having become a spinner
-# ---    on the render core -- the SCHED-6 regression, re-entered through the pulse. 4.x and below is
-# ---    left legal so a genuinely churning machine is not called a bug.
-FORBID \[pstrip\] rollup .*rate=([5-9]|[1-9][0-9]+)\.[0-9]/s
+# --- PULSE-3: THE SOURCE, not the pacing.
+# ---
+# ---    P64, attended, capture pi4-r23s1o. Three vugs held the cores at a sustained 99% and the
+# ---    vugband workers churned ~1M context switches a window; the strip printed
+# ---    `rollup samples=10 redraws=0 skipped=10` and Peter watched the gradient LEDs sit still.
+# ---    Verbatim: "gradient good but pulse not real-time".
+# ---
+# ---    The dirty test was right and the 1 Hz pace was right. The FEED was wrong. PULSE-STRIP took
+# ---    vug's VUG-1 M3b counters (`meter_cpu_ticks` -- CPU_BUSY/CPU_IDLE, bumped once per dispatch
+# ---    PASS) and PULSE-2 carried them forward. Those are pass counts, and the scheduler had already
+# ---    retired that metric: SCHED-5's own note is "TIME, NOT PASSES ... it counts scheduler
+# ---    activity, not CPU time". A core running CPU-bound tasks back to back dispatches at a
+# ---    near-constant rate and never reaches the empty-queue branch, so busy/(busy+idle) pins at full
+# ---    scale and stays flat while the utilization underneath it wanders. Hence a bar that never
+# ---    moved -- and hence `[spinhunt]`'s `load settled c2=53` disagreeing with SCHED's `c2=99%` in
+# ---    the same window: two sources, and the panel was reading the wrong one.
+# ---
+# ---    The strip now reads `sched::core_load().busy_pct_recent` -- the SCHED-5/SCHED-7 rolling
+# ---    ~250 ms CNTPCT busy-TIME fraction, the same number `top` and the `SCHED: load` heartbeat
+# ---    print, so instrument and console can no longer disagree about one core. `meter_cpu_ticks`
+# ---    remains the fallback for a core SCHED-8 reports untracked, which is where VUG-HONESTY's
+# ---    PARKED decision lives, so a frozen non-demo core still reads parked and never a fabricated bar.
+# ---
+# ---    `live=k/n` is the assertion that the strip is ON that feed: k counts cores returning a live
+# ---    number. `live=0/n` is the regression exactly -- every core back on the dispatch-pass
+# ---    fallback. (k==n is NOT required: a core legitimately outside `run()` is honestly untracked.)
+REQUIRE \[pstrip\] src live=[1-9][0-9]*/[0-9]+ quantum=[0-9]+ stepres=([0-9]+px|coarse) mono=(yes|no) (PASS|FAIL|SKIP-GEOM)
+FORBID \[pstrip\] src live=0/
+# ---    The other half: a real-time source is worth nothing to a meter too coarse to render its
+# ---    steps. `stepres=` is what ONE source quantum (1% -> 10 permille) moves the lit length on this
+# ---    panel's bar; zero means the display quantizes the feed away and the bars would freeze again
+# ---    for a different reason. `mono=` catches a geometry collapsed to a constant fill being read as
+# ---    a steady load.
+# ---
+# ---    A RED MUST NAME THE RIGHT SUBSYSTEM. `stepres` is bar_w/100, so on any panel whose bar is
+# ---    under 100 px it is zero for a GEOMETRY reason -- a shrunken UNAOS_FBW, a WC-F reservation
+# ---    that grew, a layout regression -- and a blanket `stepres=0px` FORBID would report every one
+# ---    of those as a SOURCE regression, i.e. exactly backwards. So the witness refuses to state a
+# ---    pixel resolution it cannot attribute: below the bound it prints `stepres=coarse` and verdicts
+# ---    SKIP-GEOM, and the geometry FORBIDs on the `armed` line above (`panel=..0x..`, `row_h=0`,
+# ---    single-digit `leds=`) are what go red instead. `stepres=0px` is therefore only ever printed
+# ---    by a panel wide enough to have resolved the step, where it does mean what this FORBID says.
+FORBID \[pstrip\] src .*stepres=0px
+FORBID \[pstrip\] src .*mono=no
+FORBID \[pstrip\] src .*FAIL
+# ---    x86 has no `core_load` and is deliberately untouched by PULSE-3, so there is no live feed to
+# ---    be on or off there; the witness reports `live=n/a ... SKIP-ARCH` on that arch rather than
+# ---    standing a permanent FAIL in every x86 log. This spec is pi4-only, so SKIP-ARCH must not
+# ---    appear here -- an aarch64 boot printing it would mean the cfg gate itself has inverted.
+FORBID \[pstrip\] src .*SKIP-ARCH
+# ---    `srcdelta=` in the rollup is the replay-visible half of "not real-time": the count of windows
+# ---    in which the SOURCE moved, printed beside the count actually drawn. A busy window that reads
+# ---    `srcdelta=0` is a stale feed; a window with a large `srcdelta` and `redraws=0` is the dirty
+# ---    test swallowing real movement. Neither was legible in the P64 capture, and both are now.
+REQUIRE \[pstrip\] rollup .* srcdelta=[0-9]+ rate=
+# ---    The busy-loop FORBID. The rate is printed in tenths precisely so this can bite: a rate
+# ---    sustained above the strip's own legal ceiling over a rollup window is the strip having become
+# ---    a spinner on the render core -- the SCHED-6 regression, re-entered through the pulse.
+# ---    PULSE-4 raised the bound 5.0 -> 6.0, because the ceiling moved and the old bound no longer
+# ---    had headroom above it. Two independent sources feed rate=: the sample-paced load redraws,
+# ---    capped by PSTRIP_PERIOD_MS (4/s at 250 ms), and the status TEXT redraw, which is outside the
+# ---    period gate and fires on the composed line's seconds field (~1/s). A busy 10 s window can
+# ---    therefore reach exactly 5.0/s legitimately -- a false red on a correctly-paced strip.
+# ---    6.0 is deliberately kept as a bound on `rate=` in its full meaning (every present the strip
+# ---    causes, whatever drove it) rather than netting the text redraws out: a spinner that repainted
+# ---    via the text path would be just as much the regression this catches, and excluding a term
+# ---    from the number is how a witness stops measuring the thing it is named after. The margin is
+# ---    now 1.0/s over the legal ceiling, so a real spinner (free-running at the event rate, tens/s)
+# ---    still trips it by a wide margin.
+FORBID \[pstrip\] rollup .*rate=([6-9]|[1-9][0-9]+)\.[0-9]/s
 # --- SPINHUNT: a worker thread whose leader exited without joining it must reach a terminus.
 # ---
 # ---    P61: with several bg vugs launched, killed and relaunched, one core read a SUSTAINED 99%
@@ -640,7 +941,7 @@ FORBID SPINHUNT: .*-> FAIL
 # ---
 # ---    P62 (attended): four bg vugs, each visibly slower than the last, while the `SCHED: load` row
 # ---    stayed flat at c0=51 c1=99 c2=52 c3=0. The meter was right and nothing in it was the bug:
-# ---    every launch printed `SCHED: task 'bg-el0' -> core 1 (policy: caller-pinned EL0, no-migrate)`,
+# ---    every launch printed `SCHED: task 'bg-user' -> core 1 (policy: caller-pinned EL0, no-migrate)`,
 # ---    so all four parents shared one core's 100% while c3 idled. Their ELF-2 worker threads already
 # ---    spread (`other_online_cpu`); only the parents piled up.
 # ---
@@ -660,3 +961,342 @@ FORBID SPINHUNT: .*-> FAIL
 # ---    tie-break in `pick_cpu` gives 2..=3. See docs/dev/OS/02_KERNEL_CORE/userspace.md BG-SPREAD.
 REQUIRE BGSPREAD: 3 bg launches over [0-9]+ online cores -> cores [0-9]+,[0-9]+,[0-9]+ distinct=[2-9] \(want >= 2\) PASS
 FORBID BGSPREAD: .*-> FAIL
+
+# SPREAD-2 — VUG-PAR band distribution. The `[spread2]` rollup only exists when the image carries the
+# `vugpar` feature (UNAOS_VUGPAR=1), which the default suite does not set, so these are FORBIDs rather
+# than a REQUIRE: zero hits on a default log, real assertions on a UNAOS_VUGPAR=1 log. Under vugpar the
+# rollup reads e.g. `cores 4 bands 60,60,38,60 rows 3755,3149,1781,1939 rpb 6258,5248,4686,3231 ratio 193`.
+#
+# `ratio` is max/min ROWS-PER-BAND in hundredths, not max/min rows: a core that goes tracked late in a
+# window draws fewer bands, and comparing its raw row total would red a perfectly healthy split.
+# Normalized, the weights are bounded — headroom runs 100 down to HEADROOM_FLOOR (25), so the fattest
+# average band can legitimately be 4x the thinnest and no more. 5x or worse means the weighting
+# inverted or ran away (or the `lo == 0` sentinel fired: a core drew bands but no rows all window).
+# There is deliberately no `cores 1` tripwire: `nh == 0` exits to the serial path before any rollup,
+# so nbands is always >= 2 and such a line cannot print.
+FORBID \[spread2\] .* ratio ([5-9][0-9]{2}|[0-9]{4,})
+
+# CLOSE-BOX — the close button (P79: "put a close button in the upper right of the windows to
+# exit"), and the ONE action click in the CLICK-SELECT grammar: a press in a window's close box is
+# consumed by the router, closes the owner's windows, and kills the owner. Leg 9 of the hit-test
+# witness drives the shipped router with a probe window's close box placed under the real cursor;
+# `close=true` is the row provably going away through a routed press. CLOSE-FIX (P82) adds leg 10:
+# `closereal=true` is the SAME arm reaping a row the battery created through the ordinary path,
+# with the settle read-back asserted `noproc-selftest` — the leg that fails if a close resolves to
+# the wrong row or the discriminator regresses. The line is the whole CLICK-ROUTE suite's verdict,
+# so pinning it here also pins legs 1-9 (`-> PASS` at the tail).
+#
+# CRISPYWIRE-REVIEW adds leg 11 to the SAME line rather than a new REQUIRE, because it is the same
+# verdict: `corner=true` is the two ROUNDED TOP CORNERS routing as desktop — the pixels the painter
+# fills `DESKTOP_BG` are owned by no window, so a press on one reaches the shell instead of raising
+# the window it visibly is not on. It failed before that pass and it is pinned here so it cannot
+# silently return to `skip`.
+# See docs/dev/OS/08_VIDEO/engine.md CLOSE-BOX.
+REQUIRE \[clickroute\] hit-test at .*corner=true close=true closereal=true -> PASS
+
+# CLOSE-FIX (P82) — the wire DISCRIMINATOR. The bench read `close=win3 asid=3085 settle=noproc`
+# and could not tell the selftest's synthetic no-op from a real click whose ASID-scoped kill found
+# nobody (the leg's own line was byte-identical to the failure it slept through). The battery's
+# close legs must now settle `noproc-selftest` — REQUIREd here — and a plain `settle=noproc` on
+# this gate is FORBIDden outright: no operator clicks on a headless gate, so the only thing that
+# can print it is a close resolving a real slot ASID with no process behind it — P82's exact
+# kill-finds-nobody shape. The teardown guard's LEAK line is the third tripwire: a synthetic row
+# that outlives the battery polluted a whole bench boot's hit-tests, so a reap at teardown is a
+# FAIL, never housekeeping.
+REQUIRE \[clickroute\] close=win[0-9]+ asid=[0-9]+ at .* settle=noproc-selftest
+FORBID \[clickroute\] close=.* settle=noproc$
+FORBID \[clickroute\] hit-test teardown LEAK
+
+# --- MBOX-1 — the VideoCore property transport: it fails CLEAN, and has ONE user at a time -------
+# ---    Two properties landed on this wire with no directive behind either. What the transport does
+# ---    when it goes WRONG is the interesting half, so most of this block is FORBIDs.
+#
+# ---    THE POSITIVE WITNESS. `:: MAILBOX: framebuffer ... ::` is one COMPLETED property transaction
+# ---    — request cleaned out to RAM, doorbell matched on the property channel, reply invalidated and
+# ---    read back — taken through MBOX-1's claim/loan. It is REQUIREd for the reason PULSE-3's
+# ---    `stepres` note gives: A RED MUST NAME THE RIGHT SUBSYSTEM. A transport that self-denied at
+# ---    boot (the per-transaction rider: `init_framebuffer` releases the loan before re-entering the
+# ---    module, and holding across that would `Busy` itself) takes the framebuffer, V3D power/clock,
+# ---    the NOTIFY_XHCI_RESET reload and EMMC2's SD base clock down with it — which without this line
+# ---    reads as thirty video reds with nothing pointing at the mailbox.
+# ---    Geometry VALUES are deliberately not pinned: the gate panel is 640x480 and the bench is
+# ---    1920x1200, and `[wc-e] fb-geometry` above already pins the numbers. That directive is also
+# ---    the transport's SECOND transaction, i.e. the standing proof the loan came back and was
+# ---    re-claimable; it needed no change for MBOX-1 and gets none.
+REQUIRE :: MAILBOX: framebuffer [0-9]+x[0-9]+ pitch=[0-9]+B stride=[0-9]+px base=0x[0-9a-f]+ size=[0-9]+ ::
+#
+# ---    THE TIMEOUT WITNESS IS NOT REQUIRED, and that is structural rather than a judgement call:
+# ---    QEMU's firmware model always replies, so `:: MAILBOX: timeout ... ::` cannot fire on this
+# ---    gate BY CONSTRUCTION. A REQUIRE would be red on every green boot. It is metal-only.
+#
+# ---    Which leaves the question worth answering — is a timeout line on this gate a FAULT? Not
+# ---    uniformly, and a blanket FORBID would be exactly the false red CURSOR-6 refused to write.
+# ---    The emitter has three exits and they do not mean the same thing:
+# ---      * `timeout waiting for write FIFO`       — the VPU never drained our post. There is no tag
+# ---                                                 and no firmware state for which that is normal.
+# ---      * `timeout (only other-channel replies)` — doorbells for channels we never post on, until
+# ---                                                 the deadline. This kernel uses CH_PROP and
+# ---                                                 nothing else; never legitimate either.
+# ---      * `timeout waiting for reply`            — no doorbell came back. THIS ONE IS LEGITIMATE
+# ---                                                 for a NOTIFY-class tag: v3d.md §46.5 (P92/P93)
+# ---                                                 established that this firmware honours such
+# ---                                                 tags WITHOUT ringing, and `notify_display_done`
+# ---                                                 times out by design. It is `#[cfg(feature =
+# ---                                                 "v3d")]`, so it is not even in this gate's
+# ---                                                 image — but this spec is replayed against metal
+# ---                                                 captures, and forbidding it would red exactly
+# ---                                                 the reply-less investigation boots the module is
+# ---                                                 written around.
+#
+# ---    So the first two are forbidden outright, and the third is caught by its DRAIN COUNT instead,
+# ---    which is the sharper assertion in any case. `drained 0` is a tag that simply never answered;
+# ---    `drained [1-9]` says a reply WAS sitting in the read FIFO when the deadline passed — the
+# ---    late-reply seed MBOX-1 exists to close, which left in place becomes the NEXT call's doorbell
+# ---    and mis-attributes every transaction after it. That is a fault on any exit, under any knob,
+# ---    on QEMU and on metal alike.
+FORBID :: MAILBOX: timeout waiting for write FIFO
+FORBID :: MAILBOX: timeout \(only other-channel replies\)
+FORBID :: MAILBOX: timeout .* drained [1-9]
+#
+# ---    THE BUSY WITNESS, forbidden outright. MBOX-1's caller audit is that no current caller runs
+# ---    masked and none runs on an AP, so nothing contends today and `:: MAILBOX: BUSY ... ::` is
+# ---    unreachable on a healthy boot. Two things can print it and neither is the protection merely
+# ---    working: a genuinely concurrent second caller — the torn-transaction hazard the claim/loan
+# ---    model was built against, arriving — or a path that held its loan across a re-entry and denied
+# ---    itself. Same standing as `[wc-k] staged=no`: the FORBID is where a reintroduced fault lands.
+FORBID :: MAILBOX: BUSY
+
+# --- WEDGE-2 `<D4>` — WHY THIS GATE PINS NOTHING, stated rather than left as an omission ---------
+# ---    `<D4>` is the F4 death token: emitted on every EL0 teardown that actually freed a row, past
+# ---    `close_owner`'s `n == 0` early return, AFTER the reclaim and after the drain barrier comes
+# ---    down. So `<D3>` with no `<D4>` puts a death in the reclaim run, and `<D4>` as the LAST token
+# ---    on the wire puts it in the cursor bracket, i.e. on `cursor::SPRITE`. Before it both produced
+# ---    the same trace and the F4 death was being attributed to F1 — a lock WEDGE-7 had closed.
+#
+# ---    It cannot be REQUIREd here. The whole `wedge2` module is knob-gated (`UNAOS_WEDGE2=1`, see
+# ---    arroyo): with the feature off `mark` compiles to an empty body and the image holds no token
+# ---    at all. Confirmed on this arc's baseline capture — 16674 lines, zero `<D1>`..`<D4>`. A
+# ---    REQUIRE would be red on every green boot, which is the same defect as a witness that vanished.
+#
+# ---    Nor is it FORBIDden, and that is the half worth writing down. The tempting reading — a token
+# ---    in a DEFAULT log would mean the cfg gate inverted and a shipped image is paying for the
+# ---    instrument — is true as far as it goes, but this spec is replayed against metal captures
+# ---    (~/pi-serial.log) and a wedge hunt IS a `UNAOS_WEDGE2=1` boot where every token is present on
+# ---    purpose. On the hunt that finds nothing — the machine survives, the battery runs to the end —
+# ---    a `<D4>` FORBID reds a healthy capture, and CURSOR-6's ruling applies verbatim: a false red
+# ---    costs Peter a bench sitting chasing a bug that is not there. The tokens' value is diagnostic
+# ---    and ORDERED ("which was last on the wire"), which this grammar cannot express regardless.
+# ---    Token table and the reading procedure: docs/dev/OS/08_VIDEO/engine.md WEDGE-2.
+
+# --- PAPER — the Crispy kit's content-surface texture, and its determinism -------------------
+# ---    `video/paper.rs` ports `kits/crispy/theme.json`'s `content_surface.Paper` block (the
+# ---    multi-octave "Laid" noise `theme.rs` and engine.md §9 deliberately left unlifted) into
+# ---    integer Q16. Two directives, and they answer different questions.
+#
+# ---    1. THE WIRE LINE names every kit parameter the generator actually used AND the FNV-1a 64
+# ---       of the pixels it produced. It is emitted once, from the first generation, and is NOT
+# ---       witness-gated (`wm::crispy_witness`'s precedent — the metal image carries no `witness`
+# ---       feature, so a gated line is absent from the only artefact that matters). Pinning the
+# ---       hash here is what makes "which texture is the glass showing" a replayable question: the
+# ---       same hash must appear in a QEMU capture and in a metal capture, because the generator is
+# ---       integer-only and both arches are little-endian. A DIFFERENT hash means a parameter
+# ---       drifted from the kit — which is exactly the drift the shared-source law exists to catch.
+# --- MIDDEN-M1: the shell console's interpreter is the shared no_std core -----------------------
+# `shell::midden_witness` (witness battery, both arches) drives `midden_core::plan` over a synthetic
+# volume, so these four hold with no keyboard, no card and no FAT. They are REQUIREd rather than
+# left as prose because the whole point of the arc is that there is exactly ONE command table: if
+# the kernel ever grows a second decision path, `midden.route` or `midden.precedence` is what
+# notices. FORBID catches the fixture reporting a real mismatch (it prints what it got).
+#   dispatch   — a core verb is answered IN the core, with real text (not routed, not swallowed)
+#   route      — a host verb comes back as Host with its args intact
+#   resolve    — the `.elf` the user did not type is elided to a name on the volume (`vug` -> VUG.ELF
+#                against the fixture's exact-match NameList)
+#   precedence — a verb still beats a program of the same stem (`stat` vs STAT.ELF)
+#
+# FOUR RULES, NOT FIVE. The fixture also echoes `:: [midden] resolve "vug" -> VUG.ELF ::` beside its
+# `midden.resolve` verdict, and an earlier draft REQUIREd that line too. It was withdrawn as a gate
+# for two reasons, both worth keeping written down. It ASSERTS NOTHING NEW: the same fixture, in the
+# same call, already scored `midden.resolve -> PASS` on exactly that comparison, so the extra rule
+# could only ever fail in lockstep with the one above it — coverage arithmetic, not coverage. And it
+# reads as a claim about the LIVE shell that is false: on x86 the live line says `-> vug.elf`,
+# because `FatVolume::is_file` matches FAT case-insensitively and the core's as-typed probe hits
+# first. `-> VUG.ELF` is the FIXTURE's spelling (an exact-match `NameList`) and nothing else's.
+# The honest delta of the midden arc against this gate is therefore FOUR REQUIREs and one FORBID.
+REQUIRE :: TSTE: midden.dispatch -> PASS ::
+REQUIRE :: TSTE: midden.route -> PASS ::
+REQUIRE :: TSTE: midden.resolve -> PASS ::
+REQUIRE :: TSTE: midden.precedence -> PASS ::
+FORBID :: TSTE: midden\.\w+ -> FAIL
+
+REQUIRE \[paper\] kit=us-crispy-modern@0787ba9f algo=laid octaves=3 scale=4 amp_q16=1311 seed=0xfbb60e9f base=0xf5f2ea tile=352x64 hash=0x0df2b838251069dc
+#
+# ---    2. THE FIXTURE VERDICT is the stronger statement, and it is why the hash above is not
+# ---       merely a number copied from a run: `paper::selftest` recomputes every pixel from
+# ---       scratch, hashes that independently of the stored tile, and asserts BOTH that the two
+# ---       agree (determinism) and that they equal the checksum pinned in the source. It also
+# ---       asserts the top-left 4x4 byte for byte and three hand-derivable primitive identities
+# ---       (`smooth(0.5) == 0.5`, the sine's four exact quadrant points, and value-noise-at-a-
+# ---       lattice-point == the lattice hash), so a coefficient typo cannot hide behind a checksum
+# ---       nobody can reproduce on paper. Witness-gated, like every other fixture in this spec.
+REQUIRE :: PAPER: kit texture .* :: PASS ::
+FORBID :: PAPER: .* :: FAIL ::
+
+# --- CERAMIC — the brushed-aluminium chrome material, and its determinism -------------------
+# ---    `video/ceramic.rs` is paper's counterpart on the other side of the glass: Peter's
+# ---    directive of 2026-08-09 asked for texture on the window borders and buttons and paper on
+# ---    the text surfaces, and named the material ("the 'ceramic' aluminum acer has on this zen").
+# ---    It is DERIVED, not lifted — the kit carries no ceramic block — and the module says so in
+# ---    as many words rather than dressing its constants up as a citation. The two directives here
+# ---    answer the same two questions paper's do.
+#
+# ---    1. THE WIRE LINE names every derived parameter the generator used AND the FNV-1a 64 of the
+# ---       row table it produced. Emitted once, from the first generation, NOT witness-gated (the
+# ---       metal image carries no `witness` feature). Integer-only on both little-endian arches, so
+# ---       a QEMU capture and a metal capture must print the SAME hash; a different one means a
+# ---       parameter drifted.
+REQUIRE \[ceramic\] derived=peter-2026-08-09 algo=brushed-1d grain_oct=2 pitch=2 grain_amp_q16=786 curve_amp_q16=524 ctrl_gain_q16=32768 seed=0x75ae10b7 rows=128 hash=0x2c525bfdb49df67d
+#
+# ---    2. THE FIXTURE VERDICT is the stronger statement. `ceramic::selftest` recomputes every row
+# ---       from scratch and asserts determinism AND the pinned checksum; asserts the AMPLITUDE
+# ---       BUDGET on every row (no row may move a channel by more than 1310/65536 = 2 %, which is
+# ---       the promise that the material cannot fight the Crispy palette); asserts that `shade` is
+# ---       a modulation and not a painter (zero gain is the identity, and black stays black at
+# ---       every row and gain); asserts eight reference shades of `CHROME_FACE` byte for byte; and
+# ---       checks two hand-derivable identities — value-noise-at-an-even-row == the lattice hash,
+# ---       and the curve's exact quarter turn at row `TILE_H/4`. Its last leg TIMES `shade`, the
+# ---       one operation the material adds per chrome ROW (the per-pixel span work is unchanged),
+# ---       so the cost of chrome texturing is data rather than an estimate. Witness-gated.
+REQUIRE :: CERAMIC: brushed material .* :: PASS ::
+FORBID :: CERAMIC: .* :: FAIL ::
+
+# --- KNURL — the crosshatch milled into the title-bar control discs ------------------------
+# ---    `video/knurl.rs` is the third material, and the one Peter asked for by name on
+# ---    2026-08-09: "same color as mac but knurled if possible to add more texture". DERIVED, not
+# ---    lifted, on ceramic's terms and with the same disclosure. Where ceramic models a brushed
+# ---    LID (noise, one direction) this models a milled KNOB (periodic, two directions), so it is
+# ---    two families of parallel grooves at exactly +/-45 degrees — the level sets of `x + y` and
+# ---    `x - y`, which makes the angles integer expressions rather than approximated rotations —
+# ---    summed through paper's shared Q16 sine. Three directives, one more than the other two
+# ---    materials carry, and the extra one is the point.
+#
+# ---    1. THE WIRE LINE names every derived parameter AND the FNV-1a 64 of the tile produced,
+# ---       AND `box=` the control diameter the material was sized against — so Peter's size ruling
+# ---       ("window buttons are very small", `theme::CONTROL_BOX` 12 -> 24) is legible in the
+# ---       capture rather than inferred from the chrome. Emitted once from the first generation and
+# ---       NOT witness-gated, so the metal image prints it too.
+REQUIRE \[knurl\] derived=peter-2026-08-09 algo=crosshatch-2x45 pitch=4 amp_a_q16=656 amp_b_q16=655 budget_q16=1311 box=24 tile=4x4 hash=0x56957202a422b4b1
+#
+# ---    2. THE FIXTURE VERDICT. `knurl::selftest` recomputes every factor from scratch and asserts
+# ---       determinism AND the pinned checksum; asserts the AMPLITUDE BUDGET on every pixel (the
+# ---       same 1311/65536 = 2 % league paper and ceramic share, and here it is a SUM because a
+# ---       pyramid apex is where both families crest); asserts `shade` modulates rather than paints
+# ---       (zero gain is the identity, black stays black); pins the three `CTRL_*` roles under the
+# ---       material byte for byte at the lattice's node, apex, groove and cancel points — which is
+# ---       also where the CLIP of the crest on `CTRL_CLOSE`'s already-saturated red is checked
+# ---       rather than merely disclosed; and checks four hand-derivable identities, one of which
+# ---       exists solely to pin the deliberate one-unit asymmetry between the two families. Its
+# ---       last leg TIMES `shade`, the one operation the material adds per DISC PIXEL. Witness-gated.
+REQUIRE :: KNURL: crosshatch material .* :: PASS ::
+FORBID :: KNURL: .* :: FAIL ::
+#
+# ---    3. THE REGRESSION PROOF, and the reason this material's spec block has three directives.
+# ---       `knurl` reuses paper's sine and paper's FNV, and ceramic reuses the same sine; a change
+# ---       to any shared primitive would move all three tiles at once. So `knurl::selftest`'s leg 6
+# ---       re-hashes paper's LIVE tile and ceramic's LIVE row table and asserts both still equal
+# ---       their own pinned constants, and it prints both hashes on its own verdict line. This rule
+# ---       reads them there. It is deliberately redundant with the two REQUIREs above — that is
+# ---       exactly what makes it a cross-check: those two are each generated by the module they
+# ---       assert, this one is generated by a THIRD module that had every opportunity to perturb
+# ---       them. A shared-primitive edit that somehow updated both pinned constants in step would
+# ---       still have to keep this line honest.
+REQUIRE :: KNURL: .* paper=0x0df2b838251069dc ceramic=0x2c525bfdb49df67d unchanged
+
+# --- TERM_RING — the terminal-output transport (MIDDEN_CONVERGENCE §3, M2) ---------------------
+# ---    Until this arc the framebuffer console WAS the output buffer: `Console::println` pushed a
+# ---    String into the view's history Vec, so nothing but the render task could emit a console
+# ---    line. `termring` is the transport that seam needed — a 64-slot, 240-byte-per-record
+# ---    `serial_ring::LineRing`: lock-free, alloc-free, drop-NEWEST with a counted refusal, safe
+# ---    from an IRQ-masked or print-locked producer. (§3 sketched `arch::sched::Channel`; that has
+# ---    no try_send, sleeps on a Mutex<VecDeque>, and asserts it runs on a scheduled task, so it is
+# ---    unusable from exactly the contexts §3 names. The divergence is recorded in §3 itself.)
+# ---
+# ---    `termring::termring_selftest` proves four properties, each able to fail alone, with the
+# ---    consumer PARKED so the producer genuinely outruns it:
+# ---      1. bound + refusal — 80 records offered, exactly 64 accepted, exactly 16 refused, and
+# ---         the ring reports 64 in flight (a ring that grew, or overwrote instead of refusing,
+# ---         fails here);
+# ---      2. drop-NEWEST, order and bytes — the survivors are sequences 0..64, drained in that
+# ---         order, each byte-identical to a freshly recomputed fixture line (drop-OLDEST would
+# ---         hand back 16..80 and fail the FIRST comparison);
+# ---      3. truncation is SEALED, not silent — an over-long record comes back <= 240 bytes ending
+# ---         in TRUNCATION_MARK, with the tear counted;
+# ---      4. a policy refusal is NOT a loss — one record offered while the hold is up charges
+# ---         `suppressed` and leaves `dropped` alone (the one law term nothing else exercises);
+# ---      5. the tap conservation law — submitted == absorbed + dropped + suppressed + in_flight,
+# ---         sampled BEFORE the hold is released so an attended keystroke cannot flake it red.
+# ---    The verdict line carries every decoded count, so this rule cannot be satisfied by a leg
+# ---    that merely printed: the fixture emits PASS only when all five hold, and it has no SKIP
+# ---    arm (it is in-RAM — no panel, no disk, no card to be absent). A FAIL is caught by the
+# ---    battery's built-in `FAIL ::` FORBID.
+# ---    `latch_cleared=17` on the verdict line is the fixture disarming its OWN announcement latch
+# ---    (16 drops + 1 tear, all deliberate). Without it `termring::service` would print a loss
+# ---    report at the operator's first Enter on a boot that lost nothing — an instrument
+# ---    manufacturing the fault it exists to detect.
+REQUIRE :: TERMRING: transport ring slots=64 len=240 .* :: PASS ::
+# --- CTRLWIT — a window that loses its control cluster says so on the wire ----------------------
+# ---    KNURL's 24-px discs moved `wm::controls`'s width floor 122 -> 158 px. A live ring-3 window
+# ---    with an outer box in [122,158) therefore stopped getting a close, a minimise and a zoom —
+# ---    silently: nothing on the panel said so, nothing on the wire said so, and the owning app had
+# ---    no way to ask. `wm.rs` now ARMS a per-window latch at that exact branch and speaks it from
+# ---    the end of the composite pass (`[wm] controls-declined win= owner= bw= floor=`), once per
+# ---    window per boot — the painter runs at frame rate, so a line per pass would be a flood.
+# ---    Ungated, on `wm::crispy_witness`'s precedent: the metal image carries no `witness` feature,
+# ---    and the metal capture is the artefact that matters.
+#
+# ---    ONE REQUIRE, and it is the FIXTURE's verdict rather than the diagnostic line, because the
+# ---    diagnostic line alone cannot distinguish "the witness works" from "some window happened to
+# ---    be narrow". `wm::ctrldecline_selftest` pins three rows at scale 1 (so the claim is a
+# ---    property of the compositor and not of the 640x480 panel `kernel8-test` happens to run on)
+# ---    and asserts five things that can each fail:
+# ---      * a row ONE pixel under the floor gets no cluster (`none=true`), and
+# ---      * it SPOKE, exactly once — `fired=1`, read off the module's EMISSION counter, so a latch
+# ---        that armed and never reached the wire scores 0 and reds this rule;
+# ---      * four further looks at the same row keep it at one (`rl=1`) — the rate limit;
+# ---      * a row exactly AT the floor keeps its cluster (`some=true`) — the control, without which
+# ---        a `controls` that had simply stopped answering `Some` would pass the first three;
+# ---      * NORMALWIN — kernel FURNITURE has the FULL cluster: close, minimise AND zoom
+# ---        (`furniture close=true minzoom=true packed=true/<offset>`, where `minzoom=true` is the
+# ---        VERDICT "matches the build's promise", i.e. both discs present). Peter's ruling
+# ---        (2026-08-11: "go back in git history when it still had the 3 normal buttons ... i said
+# ---        normal app") makes the console WINDOW an ordinary application window, so it carries an
+# ---        ordinary application window's titlebar buttons. `wm::ctrls_for` returns the full
+# ---        `[Close, Minimise, Zoom]` list for every row and `wm::controls` no longer declines the
+# ---        kernel band owner-wide. What the facade law still governs is the RAW console/boot-log
+# ---        OUTPUT — serial, TERM_RING, the pre-compositor panel path and the panic path — none of
+# ---        which goes through a window and none of which this touches.
+# ---        This SUPERSEDES facade-console-1 (which had reverted the cluster to none) and goes one
+# ---        disc further than shellwin-a/CONSOLEWIN (which gave `[minimise, zoom]` and withheld
+# ---        close). The close disc's ACTION is x86's `wc_close_furniture` — `wm::close(id)`, the
+# ---        id-scoped primitive — so `close_owner`'s kernel-band refusal (CLOSEISO, Boot AR) is
+# ---        UNCHANGED and still refuses; see `reaped=` below and `[wc-iso] refuse=`.
+# ---        The assertion is against `FURNITURE_HAS_CONTROLS` (now `true` on every arch — a cluster
+# ---        is not an arch property), so taking any disc back off flips this leg red.
+# ---        `packed=<offset>` is the left-pack claim: slot 0 of the furniture row's cluster sits at
+# ---        the same offset from its own outer box as slot 0 of the app row's, and both slot 0s are
+# ---        the CLOSE disc, so the two rows are compared on the identical control.
+# ---        `silent=true` also means more than it used to: the furniture row is pinned AT the floor
+# ---        and reaches the width arm exactly as the app row does, so its silence is "nothing to
+# ---        complain about" rather than "returned before the test was reached".
+# ---      * and that furniture row is REAPED (`reaped=true`). CLOSEISO makes `close_owner` refuse
+# ---        every kernel-band row — unchanged by this arc — so the battery's teardown sweep is
+# ---        structurally blind to it and the leak guard could never have caught it leaking. The reap
+# ---        is asserted by id (`wm::close`), against the table, which is the only place that can
+# ---        answer it, and it is the same primitive the operator's close disc now calls.
+# ---    `fired=` and `rl=` are PER-SLOT emission deltas, not a global total: this boot's earlier
+# ---    fixtures mint 32x8 rows that decline legitimately, and a global counter would have let one
+# ---    of them inflate the delta and red a kernel that was behaving perfectly.
+# ---    Every number is pinned, so the fixture's own SKIP line (window table full) cannot satisfy
+# ---    this rule and neither can its FAIL — the values are what make it a gate rather than a
+# ---    presence check.
+REQUIRE :: WMCTRL: controls-declined — floor=158 .* furniture close=true minzoom=true packed=true/Some.* silent=true reaped=true :: PASS ::
+FORBID :: WMCTRL: .* :: FAIL ::

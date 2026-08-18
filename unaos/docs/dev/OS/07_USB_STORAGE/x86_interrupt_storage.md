@@ -347,3 +347,156 @@ sequence with seat review between spine milestones.
 - The **single-writer-per-row invariant** (SECURITY.md U7x) is preserved by construction (§3.2).
 </content>
 </invoke>
+
+## 8. SINGLE FAT WRITER (2026-07-26) — the flight recorder is no longer a second mutator
+
+**Root cause (A/B-proven).** `fs/fat.rs`'s `with_fat_lock` / `with_dir_lock` are deliberately INERT on
+x86 (masking IRQs across the `hlt`-driven xHCI BOT pump would hang the core — §5), and their comments
+used to claim x86 had a "single FAT writer by construction". That was FALSE. The FLIGHT RECORDER
+(`flight_recorder.rs::service()`, called from the x86 main loop on the BSP) re-created `UNAOS.LOG` on a
+main-loop cadence — `delete_located` (free ~32 clusters) + `create_in_root` (a root-dir-sector RMW) +
+`write_grow` (re-allocate + re-chain) — CONCURRENTLY with the demo chain's writers on the AP cores.
+Symptoms: cross-linked chains (`GROW.BIN` chain length 5/6 where 2 was expected) and delete-witness
+first-free snapshots allocated out from under the verdict. Evidence: recorder stubbed out → 0/3 FAIL;
+recorder on → 3/3 FAIL on `UNAOS_HUBSTORAGE=1 ./arroyo test-fat sf 300`. BOT transport was clean
+(timeouts=0, ~730x headroom) — the fault was allocator concurrency, not the transport.
+
+**Fix — reserve once, then write in place.** The recorder is removed from the set of FAT mutators
+rather than being serialized against them:
+
+1. **RESERVE, once.** On the first main-loop pass where `block::info()` is `Some`, the recorder makes
+   `UNAOS.LOG` exist at a fixed `RESERVE_BYTES` (= `RING_CAP` + 512 = 66048). This is its ONLY lifetime
+   FAT/directory mutation, and it is exclusive **by construction**: the `flight_recorder::service()`
+   call site precedes every `U*_probe_once()` fixture/launcher spawn in the same main-loop iteration at
+   BOTH `main.rs` loop sites, and every other x86 FAT writer gates on the same `block::info()` that has
+   only just become `Some`. A file already ≥ `RESERVE_BYTES` from a previous boot is reused untouched
+   (zero mutation at all).
+2. **Write IN PLACE, forever after.** Every later flush is a single `FatFs::write_at` over the reserved
+   chain — strictly bounded to clusters already in the file, never allocating/freeing a cluster, never
+   writing a FAT entry, never touching a directory sector (`fat.rs` `write_at` contract). It therefore
+   cannot interact with any other writer at all.
+
+**Why not "route the recorder through the storage service task".** That would only close the race with
+`irqstorage` ON. The demo-chain writers are the `witness`-gated U10x op drains (`u10_drain_*`), which
+mutate the FAT directly from an AP launcher task with the knob OFF — which is exactly the configuration
+of the gate that was failing 3/3. The reserve-then-write-in-place shape is knob-agnostic and strictly
+stronger: after bootstrap there is nothing left to serialize.
+
+**Cost.** `UNAOS.LOG` is always 66048 bytes on disk: the captured log as its prefix, an explicit
+`:: FLIGHTREC: end of log (N captured byte(s); the remainder of this 66048-byte file is reserved
+padding) ::` marker, then zero padding. The reserve is one bounded 64 KiB zero-fill at boot.
+
+**Witnesses.** `:: FR: UNAOS.LOG reserved 66048 bytes @cluster N reused=B — flushes are
+write-in-place only (single FAT writer preserved) ::` (once, at bootstrap) and
+`:: FLIGHTREC: boot log -> UNAOS.LOG (N captured bytes into a 66048-byte in-place write) -> PASS ::`
+(once, first successful flush). FRWRITE (2026-07-26): `reused=` says whether the reservation reused a
+previous boot's file. Only that case leaves a stale tail, so only that case pads the first flush out
+to `RESERVE_BYTES` — the create/grow cases just zero-filled the file, and padding it again cost ~129
+READ(10) + ~129 WRITE(10) single-sector BOT transactions. See
+[`usb_xhci.md`](../../../../../docs/dev/OS/07_USB_STORAGE/usb_xhci.md) §12.
+
+**The x86 invariant, stated honestly** (now in `fat.rs`'s `with_fat_lock` / `with_dir_lock` non-aarch64
+doc comments, replacing the false claim): x86 has no in-`fat.rs` serialization. Consistency is a caller
+discipline — knob-on, the ONE storage service task runs every create/grow/delete one at a time at IF=1;
+knob-off, the mutating callers are sequenced one-shot fixtures and the interactive shell; and the
+recorder is not a mutator after boot. A NEW concurrent x86 FAT mutator must join one of those schemes.
+
+## 9. x86 FAT concurrency audit (2026-07-27) — the mutator roster and what actually serializes it
+
+§8 fixed the recorder and then *scoped out* the obvious follow-up question: the x86 consistency
+invariant is now pure caller discipline, and nobody had checked whether that discipline holds. This
+section is that check. It enumerates **every** x86 path that allocates or frees a cluster, writes a FAT
+entry, or read-modify-writes a directory sector, and names what serializes each against the others.
+
+### 9.1 The roster
+
+| # | Mutator (call sites) | Primitives | Context / core | Gate | Serialized against the rest by |
+|---|---|---|---|---|---|
+| 1 | `flight_recorder::reserve_log` (`flight_recorder.rs`) | `delete_located`, `create_in_root`, one `write_grow` | BSP main loop, IF=1, **not a scheduled task** | x86 always; **one-shot per boot** (`RESERVED` latch) | **Program order.** `flight_recorder::service()` precedes every `U*_probe_once` and `install_probe_once` at BOTH `main.rs` loop sites, and all of them gate on the same `block::info()` that has only just become `Some`. The reserve completes synchronously before any launcher is spawned. |
+| 2 | `flight_recorder::write_log` | `write_at` only | BSP main loop | always | **Not a mutator.** Bounded to clusters already in the reserved chain — no FAT entry, no directory sector. Cannot interact with any writer. |
+| 3 | `service_create_file` / `service_grow_file` / `service_delete_file` / `service_write_file` (`drivers/xhci/irqstorage.rs`) | `create_in_root`, `write_grow`, `delete_located`, `write_at` | `storage-svc` task, AP[0] (`online_aps().first()`), **PRIO_HIGH** | `irqstorage` | **One task, one request at a time** off `REQ_QUEUE`; every submitter blocks on the request's `done` semaphore until it completes. A real single writer for everything routed through it. |
+| 4 | `u10x_preflight_grow_file`, `u10_preflight_absent` (`arch/x86_64/syscall.rs`) | `delete_located`, `create_in_root`, `write_grow` | the `u6bx-launch` → `u7x-launch` → … LAUNCHER task, AP[1], PRIO_NORMAL | `witness` **and** `HELLO_STAGED` | **Program order on one task.** The launcher chain is a linear sequence of tasks each spinning on the previous stage's `*_LAUNCH_DONE`; each stage mutates only *before* it spawns its fixture. |
+| 5 | `u10_drain_grow` / `_create_grow` / `_create_grow_delete` / `_delete`, `flush_drain_one` | same set + `write_at` | same launcher task | `witness` (U10 queue is empty knob-on) | ditto — reached only after the launcher has observed its fixture's teardown (`cleared`). |
+| 6 | `openf_release`, `u11m2_phase` → `submit_grow` / `submit_delete` | via row 3 | launcher task / fixture teardown | `irqstorage` | Submitters, not mutators — they funnel into row 3. |
+| 7 | **`shell::dispatch_command`** (`shell.rs`, 23 mutating sites) | `create_in_dir`, `create_dir`, `write_grow`, `delete_located`, `remove_dir`, `rename_entry`, `move_entry`, plus a raw `write <lba> <byte>` | **BSP GUI main loop, INLINE** (`main.rs`'s `handle_key`) — not a scheduled task, and **not** routed through row 3 even when `irqstorage` is on | **none — compiled unconditionally** | **Nothing.** |
+| 8 | `install::write_sectors` (`install/mod.rs`) | raw GPT / FAT32 format sector writes | BSP main loop | `installdemo` | **Program order** on the BSP loop, plus configuration exclusion: its blank scratch disk leaves `HELLO_STAGED` false (rows 4–5 skip their FAT legs) and permanently fails row 1's reserve. |
+
+Non-mutators confirmed read-only and therefore off the roster: `fat::probe_once`, `selftest.rs`'s
+`tste` storage section (explicitly "READ-ONLY toward storage"), `install`'s read-back verify, and every
+`find_located` / `read_dir` / `read_at` / `first_free_cluster` walk.
+
+### 9.2 Verdict
+
+**Rows 1–6 and 8 hold. Row 7 — the shell — is a real second-writer window that is currently closed only
+by configuration, not by structure.**
+
+The evidence for rows 1–6/8 is the sequencing above: one BSP main loop running the recorder and the
+installer in program order ahead of every launcher spawn; one launcher task carrying the whole demo
+chain in program order; one storage service task draining one request at a time. Nothing in that set
+mutates the FAT at the same time as anything else in it.
+
+The shell is different. `shell::dispatch_command` calls `fs/fat.rs`'s mutators **directly**, from the
+BSP GUI main loop, with no feature gate and no route through the storage service task. The breaking
+interleave is concrete:
+
+1. BSP main-loop iteration N: `u6bx_probe_once()` spawns the launcher chain on AP[1].
+2. Same iteration, a few lines later: the event drain pops a queued `Event::Key(b'\n')` and calls
+   `handle_key` → `dispatch_command("rm GROW.BIN")` → `fs.delete_located(...)` → `free_chain` →
+   `set_fat_entry` on the BSP.
+3. Concurrently on AP[1] (or, knob-on, on the `storage-svc` task at AP[0]): `write_grow` →
+   `alloc_cluster` → compare-and-claim → `set_fat_entry_inner` on the same FAT sector.
+4. The two read-modify-writes of that sector interleave. One update is lost; the loser's chain is
+   cross-linked into the winner's — the exact §8 signature.
+
+**Why it has never fired.** (a) The QEMU batteries are headless (`-display none`): QEMU's `usb-kbd` is
+attached but no key event is ever produced, and the only `handle_key` feed on x86 is the HID event
+queue (`main.rs`'s `poll_input()` drain is `#[cfg(target_arch = "aarch64")]`), so `dispatch_command`
+is unreachable there. (b) Shipping GUI/media builds are DEFAULT-QUIET: `witness` is off, so rows 4–6
+do not exist and the shell is genuinely the only writer. The window opens only in an attended GUI boot
+built **with** `witness` (and/or `irqstorage`), where a keystroke lands while the launcher chain is
+mid-grow.
+
+**Secondary (degenerate) window, recorded for completeness.** Every launcher handoff is a *bounded*
+spin (`ticks() + N` on `*_LAUNCH_DONE`, on the fixture's `*_DONE`, and on `cleared`). On expiry the
+next stage proceeds anyway and may mutate while the previous stage is still alive. This is reachable
+only on a path that already prints `FAIL`, so it degrades a diagnosis rather than a passing run.
+
+### 9.3 Proposed minimal fix for row 7 — NOT applied here (out of lane)
+
+Do not make `with_fat_lock` real on x86: masking IRQs across the `hlt`-driven BOT pump would hang the
+core (§5, and the `fat.rs` doc comments). The minimal shapes, cheapest first — each needs `main.rs`
+and/or `shell.rs`, i.e. a lane widening:
+
+1. **Gate the shell's write verbs on the chain being done** (smallest diff): have the GUI loop's
+   `handle_key` refuse the mutating verbs until the last launcher has released its `*_LAUNCH_DONE`.
+   Closes the window in the only configuration where it exists; costs the attended `witness` GUI boot
+   a few seconds of read-only shell.
+2. **Route the shell through the storage service task** when `irqstorage` is on. Correct for the
+   knob-on case but does nothing knob-off — the same objection §8 raised against routing the recorder.
+3. **A `fat.rs` namespace/volume lock** spanning the composite scan→mutate sequences, taken by a
+   context that can block. This is the eventual right answer (the aarch64 side already ledgers the same
+   residual under FATDIRS invariant 5), but it is a real design arc: the BSP GUI loop is *not* a
+   scheduled task, so it cannot block on a `Mutex` — the shell would first have to become one.
+
+### 9.4 The tripwire that landed
+
+`fs/fat.rs` now carries the roster as documentation, plus a `witness`-only, zero-cost-when-off
+tripwire around the two seams that are real locks on aarch64: `with_fat_lock` (FAT-sector RMW) and
+`with_dir_lock` (directory-sector RMW). Entering either with a nonzero in-flight count means a second
+concurrent mutator, and it bumps a sticky counter and emits ONE line:
+
+```
+:: FATRACE: SECOND CONCURRENT x86 FAT-table MUTATOR DETECTED — the caller-side single-writer roster
+   (see fs/fat.rs `with_fat_lock`) has been violated; expect cross-linked chains ::
+```
+
+This is sound because those two spans provably do not nest: `with_fat_lock` is taken only by
+`set_fat_entry` and `alloc_cluster`'s compare-and-claim, and the claim body calls the lock-free
+`set_fat_entry_inner` (a factoring that exists because the aarch64 lock is non-reentrant, so a nest
+would deadlock *there* — the invariant is enforced by aarch64, not assumed); `with_dir_lock`'s six
+bodies are pure single-sector RMWs that never call one another, and `create_in_dir` dispatches to
+`create_in_root` before taking the lock. Knob-off the whole family is `#[cfg]`-compiled out and the
+lock helpers are the byte-identical `#[inline(always)]` passthroughs. aarch64 is untouched — it holds
+real locks, and this is an x86-only invariant. The tripwire never prints in a correct run, so it cannot
+perturb a battery verdict; `fat::x86_rmw_overlaps()` reports the `(FAT, directory)` tallies, and `(0, 0)`
+is the positive evidence that the discipline held for every RMW that actually ran.

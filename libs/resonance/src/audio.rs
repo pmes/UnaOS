@@ -186,7 +186,7 @@ impl AudioEngine {
 
         let stream = match sample_format {
             cpal::SampleFormat::F32 => device.build_output_stream(
-                &config,
+                config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     write_output_f32(
                         data,

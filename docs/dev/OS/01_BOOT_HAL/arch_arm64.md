@@ -7461,3 +7461,220 @@ lowest-set-bit; a garbage readback (Tegra234 no-HCRST takeover) demanded an 8 Mi
 allocation that overshot the heap into firewalled DRAM. Fix: clamp to the spec-sane 4–32 KiB
 bits (xHCI 5.4.3 mandatory 4 KiB fallback), null/heap-bounds guard, heap-PA witness. No
 behavior change on healthy controllers (Pi VL805 reads bit 0 set → 4 KiB, unchanged).
+
+## PH-3 — is the aarch64 block-write path "fully polled emmc2"? (verdict: **premise FALSE**)
+
+An answer owed to the pi4 lane, which was deciding on the `fs/fat.rs` `FAT_MUTATION` span
+justification. **This section changes no behavior** — it records the traced facts. Any change to
+aarch64 storage dispatch belongs to the pi4 lane.
+
+### The claim under test
+
+`fs/fat.rs:581-585` (the `FAT_MUTATION` doc comment) justified holding an IRQ-masked lock across
+block I/O with: *"the aarch64 storage path is fully POLLED (an emmc2 busy-poll on metal; a spin-loop
+under the QEMU raspi4b/virt models, which deliver no timer IRQ so `hlt` degrades to a spin)"*, and
+`fs/fat.rs:600-601` restated it as *"the aarch64 I/O is polled … a couple of bounded polled sector
+transfers"*. Both halves are false as written.
+
+### Citation chain (traced 2026-07-27)
+
+1. `fs/fat.rs:602-610` — `with_fat_lock` is `#[cfg(target_arch = "aarch64")]`: **no `baremetal`
+   gate**. It wraps `f()` in `arch::without_interrupts`.
+2. `arch/aarch64/mod.rs:313-331` — `without_interrupts` does `msr daifset, #2` (mask I) around the
+   closure and restores DAIF. So the lock hold is IRQ-masked on **every** aarch64 build.
+3. `fs/fat.rs:568-573` — `write_sector(BlockSource::Default, ..)` calls
+   `drivers::block::write_block`.
+4. `drivers/block.rs:210-232` — `write_block` routes to `emmc2::write_block_512` **only** under
+   `#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]` **and** only when the runtime
+   `BACKEND` atomic reads `BACKEND_SD`. Otherwise it falls through to the xHCI BOT `WRITE(10)` body.
+5. `drivers/block.rs:22-25` — `BACKEND` initializes to `BACKEND_XHCI`; `drivers/block.rs:175-178`
+   `register_sd` is the **only** writer that flips it to SD.
+6. `drivers/emmc2.rs:400-427` — `register_sd` fires only from `finish()`, i.e. only after a
+   successful `try_init` on one of the two bases. No card / failed init → the driver prints
+   *":: M6g: no SD card on either base — no block device registered ::"* and `BACKEND` stays xHCI.
+7. `drivers/mod.rs:1-2` — `pub mod pci;` and `pub mod xhci;` are declared with **no arch cfg**.
+8. `arch/aarch64/pci.rs:37,94-125` — the aarch64 `pci::init` scans for xHCI and installs
+   `XHCI_CONTROLLER`; `main.rs:764-765` calls it under `#[cfg(not(feature = "skip_xhci"))]` only —
+   no arch gate.
+9. `drivers/xhci/mod.rs:5596` → `drivers/block.rs:150-160` — a USB stick's enumeration calls
+   `publish_usb_geometry`, which claims the global `BLOCK_DEVICE` whenever `BACKEND != BACKEND_SD`.
+
+**Therefore, two live aarch64 configurations put the xHCI BOT pump inside the IRQ-masked
+`FAT_MUTATION` span:**
+
+- **aarch64 non-`baremetal`** (QEMU `virt`): `emmc2` is not even compiled (`drivers/mod.rs:16-18`),
+  `write_block` has no SD branch at all, so BOT is the **only** path — while `with_fat_lock` is
+  still a real IRQ-masked lock.
+- **aarch64 `baremetal` with no usable microSD**: `main.rs:316-317` runs `emmc2::probe()` before
+  `arch::pci::init` (`main.rs:765`), so a *successful* card init does win the race — but a failed
+  one leaves `BACKEND_XHCI`, and a later-enumerated USB stick then owns `BLOCK_DEVICE`.
+
+### The second false half — "no timer IRQ, `hlt` degrades to a spin"
+
+- `arch/aarch64/mod.rs:236-243` — `hlt()` issues a real `wfi` whenever `timer::is_live()`; it
+  poll-spins **only** when timer liveness was never confirmed.
+- `drivers/xhci/mod.rs:5348-5350` — the BOT pump's own doc says *"On x86 / Pi / aarch64-virt … `hlt()`
+  waits for an interrupt (HLT / WFI with a live timer)"*. That is the direct contradiction.
+
+### Why the *conclusion* nevertheless survives (for a different reason)
+
+The span is still safe on aarch64, but not because the I/O is polled:
+
+- `wfi` **wakes on a pending physical interrupt even with PSTATE.I set** (stated at
+  `arch/aarch64/mod.rs:237-239`), unlike x86 `hlt` under `IF=0`, which is exactly why x86 is
+  excluded. So masking does not deadlock the pump.
+- `drivers/xhci/mod.rs:5355-5400` — `pump_until_bot_done` drains the event ring by **polling**
+  (`drain_event_ring_once`), not from an IRQ handler, and is bounded by a `now_cycles`/
+  `hw_wait_budget` **wall-clock deadline**, not an iteration count. `now_cycles` (CNTVCT) advances
+  with the timer masked.
+- The pump calls `crate::hlt()`, never a scheduler yield — so the "no scheduler yield" half of the
+  original justification does hold.
+
+### Verdict
+
+**FALSE.** The stated premise ("the aarch64 storage path is fully polled emmc2") is not an
+invariant of any aarch64 build; the xHCI BOT path is reachable under the IRQ-masked lock on
+aarch64-virt always, and on Pi metal whenever the microSD does not register. The safety conclusion
+is still correct, resting instead on (a) `wfi` waking with PSTATE.I set, (b) a polled event-ring
+drain, and (c) a wall-clock-bounded pump. `fs/fat.rs`'s comment has been corrected to state that
+real invariant. **No dispatch behavior was changed** — the pi4 lane owns any decision about whether
+a `baremetal` build should refuse the BOT fallback for `BLOCK_DEVICE`.
+## SOURCE-ALONG — the pi4 boot media carries its own source (`SRC.TGZ` / `SRC.SHA`)
+
+The first rung of the self-hosting ladder: **every UnaOS pi4 boot image carries the exact source tree
+that built it**, so a running system — and the ledger — can always answer *"what code is this"* without
+reference to an external checkout.
+
+### The FAT32 root contract
+
+`unaos/scripts/make-pi-img.sh` writes two files into the boot partition's FAT32 root, alongside
+`kernel8.img` / `start4.elf` / `fixup4.dat` / `bcm2711-rpi-4-b.dtb` / `config.txt` and the EL0 fixtures
+(`HELLO.BIN`, `K2OWN.BIN`, `K2IMP.BIN`, `MIDDEN.BIN`, `SCRATCH.BIN`, `GROW.BIN`, `ELFHELLO.ELF`,
+`VUG.ELF`, `STAT.ELF`):
+
+| File | Contents |
+|---|---|
+| `SRC.TGZ` | gzip'd tar of the repository source — **excluding** `target/`, `.git/`, and everything `.gitignore`'d. Paths are repo-root-relative (`unaos/…`, `libs/…`), no leading `./` and no wrapper prefix directory. |
+| `SRC.SHA` | Exactly one line: `<sha256>  SRC.TGZ` — the `sha256sum -c` / `shasum -a 256 -c` format, checkable in place from the FAT root. |
+
+Both names are 8.3-clean, so the kernel's read-only FAT reader can name them without long-filename
+support, and neither collides with any existing fixture. They ride MBR partition 1 (type `0x0C`); the
+unafs volume on partition 2 (type `0x7f`) is unaffected.
+
+### Determinism contract
+
+**Same source tree in ⇒ same `SRC.TGZ` bytes out**, on any host, from any branch, at any clock time.
+This is what makes `SRC.SHA` a usable ledger identity rather than a build nonce. The mechanism:
+
+- **Content set comes from git**, not from an exclude list — so `target/`, `.git/` and every
+  `.gitignore`'d path are excluded by construction and cannot drift out of sync with the ignore rules.
+- **Dirty worktrees are archived as they are, without stashing and without touching the real index.**
+  `git read-tree HEAD` + `git add -A` against a throwaway `GIT_INDEX_FILE`, then `git write-tree`, names
+  a tree object built from the *working tree* (uncommitted edits and untracked-but-not-ignored files
+  included). On a clean worktree that tree is bit-identical to `HEAD^{tree}`, so clean and dirty take one
+  code path with one set of guarantees.
+- **`git archive` of a TREE, never a commit-ish.** Archiving a commit injects a `pax_global_header`
+  carrying the commit sha, which would make the same source hash differently from two branches. Entries
+  come out sorted, uid/gid 0, mode-normalized.
+- **`--mtime=@315532800`** (1980-01-01 UTC, the FAT epoch) pins entry timestamps. Note the sharp edge
+  found here: git's approxidate does **not** parse `@0` and silently falls back to *now*, which makes the
+  archive look deterministic only within a single second. Any pinned mtime must be verified, not assumed.
+- **`gzip -n`** (no name, no timestamp in the gzip header), applied to the tar **as a file**. Streaming
+  `git archive | gzip` was measured to emit different deflate block boundaries run to run.
+- **Non-git source trees** — e.g. an image rebuilt from an unpacked `SRC.TGZ`, the next rung of the
+  ladder — fall back to GNU tar's `--sort=name --mtime --owner=0 --group=0 --numeric-owner` over an
+  explicitly-built, `LC_ALL=C`-sorted member list (`--no-recursion`), which reproduces both the
+  determinism and the `./`-free entry naming of the git path. The one honest gap: with no repository
+  there is no `.gitignore` to consult, so that branch prunes `.git/` and `target/` by name only. If
+  neither git nor a GNU tar is available the build **fails loudly** rather than shipping an image whose
+  `SRC.SHA` would be a lie; `UNAOS_NOSRC=1` is the acknowledgement.
+
+### Capacity — checked, never truncated
+
+The image is **64 MiB**: 56 MiB FAT32 boot partition (54.1 MiB usable after 2 FATs + reserved at 512-byte
+clusters) plus the 8 MiB unafs tail. Measured payload is ~10.6 MiB — ~5.3 MiB of boot set and fixtures
+plus ~5.3 MiB of `SRC.TGZ` from a 19 MiB working tree — so **this arc did not need to grow the image**.
+Before formatting anything, `make-pi-img.sh` sums the staged payload plus `SRC.TGZ`/`SRC.SHA` against the
+FAT partition size less a 4 MiB metadata slack, and on overflow aborts with a message naming the
+`size_mb` argument in `arroyo`'s `make-pi-img.sh` call. A too-small volume is a build failure, never a
+silent `mcopy`/`ditto` truncation.
+
+The check is backed by a **readback**: once the volume is written, `SRC.TGZ` is read back *out* of it
+(`mcopy ::/SRC.TGZ` on Linux, off the mountpoint on Darwin) and re-hashed against `SRC.SHA`. A FAT that
+dropped or truncated the payload fails the build with a `SOURCE-ALONG readback MISMATCH` line naming both
+hashes — it can never reach a flashed card. This is also the `./arroyo kernel8` gate's assertion, made
+self-checking rather than left to a manual `mdir`.
+
+### Default ON, including for tests
+
+`kernel8` and `kernel8-test` both carry the source. A test image whose FAT contents differ from a flashed
+image is exactly the drift this arc removes, so the knob is negative: **`UNAOS_NOSRC=1`** skips the block
+(printing a "image will NOT carry its source" warning to stderr) and is the only way to get an image
+without it. Measured cost on this tree: **+1.3 s wall** and
+**5.24 MiB** (1.83 s vs 0.49 s, readback included), against a 5 s/cycle bar that would have justified making it opt-in for tests — it does not
+come close, so the default stands.
+
+### Host portability
+
+Both host branches of `make-pi-img.sh` carry the pair: Darwin `cp`s it into the private mountpoint after
+`ditto`, Linux `mcopy -o`s it into the FAT image after the staging tree. In both cases the files are held
+in a scratch dir and copied in explicitly — `make-pi-img.sh` never mutates the staging directory it is
+handed. `UNAOS_SRC_ROOT` overrides the source tree, which otherwise resolves to the repo root two levels
+above the script.
+
+## PI-NOBM — the `pi`-without-`baremetal` feature combo is unsupported (verdict: **unreachable**)
+
+An open question carried over from the x86 seat: `UNAOS_PI=1 ./arroyo check` fails the aarch64 leg with
+18 errors, all variations of "cannot find `sched` in `arch`". This section records the investigation and
+the decision **not** to change the gate.
+
+### What the gate actually says
+
+`crates/kernel/src/arch/aarch64/mod.rs` compiles the kernel-thread scheduler under:
+
+```rust
+#[cfg(any(
+    feature = "baremetal",
+    all(target_arch = "aarch64", not(feature = "pi"), not(feature = "tegra")),
+    all(target_arch = "aarch64", feature = "tegra")
+))]
+pub mod sched;
+```
+
+Three aarch64 configurations get `sched`: anything `baremetal` (the Pi 4 metal path), the QEMU `virt`
+path (neither `pi` nor `tegra`), and the Orin `tegra` path. The fourth — `pi` **without** `baremetal` —
+is the one combination the `not(feature = "pi")` arm deliberately excludes. Its unconditional consumers
+(`selftest.rs`, `shell.rs`, and the aarch64 `mod.rs` re-export) then fail to resolve, which is the whole
+of the 18-error cascade. Nothing is subtly broken: `sched` is simply not compiled, and `rustc` says so
+with an explicit "found an item that was configured out" note pointing at the gate.
+
+### Is the combo reachable?
+
+**No.** `arroyo` composes the two features from disjoint places:
+
+- The general `_feats` accumulator adds `pi` from `UNAOS_PI=1`, and **never** adds `baremetal`.
+- `baremetal` is set only inside `kernel8()`, whose `K8_FEATS` is **curated** — it starts at
+  `baremetal,skip_xhci` and takes no input from `_feats`, so it never carries `pi` either.
+
+So the two features are produced by mutually exclusive code paths, and on the `kernel8`/`kernel8-test`
+path `UNAOS_PI=1` contributes no cargo feature at all (`baremetal` already implies the Pi target). Every
+documented `UNAOS_PI=1` invocation in `docs/env-knobs.md` pairs it with `kernel8` or `kernel8-test`; a
+sweep of `docs/`, `scripts/`, `CLAUDE.md` and `HARDWARE-BRINGUP.md` found **no** documented or scripted
+invocation that puts `pi` in front of a non-`kernel8` target. The failing combo is reachable only by
+typing `UNAOS_PI=1` at `check`/`arm`/`test-arm`/`esp-arm` by hand, and no such build has a Pi boot path
+to run — `pi` alone selects the aarch64 UART policy, not a platform.
+
+### Provenance
+
+Not a merge regression. The identical 18-error failure reproduces at `e860181a` (the pre-merge `hw-pi4`
+tip) with the same error sites and the same gate text; the gate has read this way since `1ffaf6cf`
+(SMP M3a), widened only by `c82ddf9b` (JC3, `virt`) and `1e010597` (JM6, `tegra`). `UNAOS_WITNESS=1` is
+incidental: `pi` alone already fails with 16 of the 18, and the `witness` feature only adds the last two.
+
+### Decision
+
+**The gate stands and the code is unchanged.** Adding `feature = "pi"` to the `any(...)` list would
+compile a scheduler into a configuration that has no boot path to run it, trading a loud, accurate
+compile error for a silently-buildable artifact nobody flashes. `pi` without `baremetal` is an
+**unsupported combination**; the honest compile failure is the intended behaviour. Treat
+`./arroyo kernel8` / `kernel8-test` as the only supported carriers of `UNAOS_PI=1`.

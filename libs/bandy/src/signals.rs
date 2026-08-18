@@ -3,8 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use crate::ontology::WeightedSkeleton;
-use crate::state::DispatchRecord;
+use crate::ontology::{Origin, WeightedSkeleton};
+use crate::state::{BrowseListing, DispatchRecord, FsOutcome, FsVerb, LogLine, LogSource};
 
 /// SMessage (The Shard Message).
 /// The atomic unit of truth in UnaOS.
@@ -112,6 +112,31 @@ pub enum SMessage {
         records: Vec<DispatchRecord>,
     },
 
+    // --- AETHER (The Browser) ---
+    OpenDocument { url: String },
+    SurfaceBlit { url: String, width: u32, height: u32, pixels: Vec<u8> },
+    PlayMedia { url: String, title: String, mime: String },
+    BrowserNavBack,
+    BrowserNavForward,
+    BrowserNavReload,
+    BrowserScroll(f64, f64),
+    BrowserClick(f64, f64),
+    BrowserResize(u32, u32),
+    BrowserKey(String),
+    BrowserText(String),
+    /// Engine → chrome: the current document url changed (link click,
+    /// back/forward, redirect); the address bar mirrors it.
+    BrowserUrlChanged(String),
+    /// Engine → chrome: the current document's `<title>` changed. Fired from
+    /// the same post-navigation choke point as [`SMessage::BrowserUrlChanged`],
+    /// deduped against the last one sent; the window title bar mirrors it.
+    BrowserTitleChanged(String),
+    /// Engine → chrome: the current document's favicon, decoded to tightly
+    /// packed 8-bit RGBA (`width * height * 4`, row-major, top row first).
+    /// Fetched *after* the page is delivered, so it never delays a load; an
+    /// absent or undecodable icon simply fires nothing.
+    BrowserFaviconChanged { width: u32, height: u32, rgba: Vec<u8> },
+
     // --- EDITOR (The Code Pane) ---
     /// Load a document into the active editor pane. Fired when a file is
     /// selected for editing; the macOS `MacOSSpline` router pushes `content`
@@ -153,6 +178,15 @@ pub enum SMessage {
     // --- MATRIX (The Spatial Cortex) ---
     Matrix(MatrixEvent),
 
+    // --- CONSOLE (the system log viewer — macOS Console.app equivalent) ---
+    /// The Console log-viewer channel, owned by the `comscan` handler. Distinct
+    /// from the [`SMessage::Log`] PRODUCER message: `Log { .. }` is a component
+    /// emitting one line INTO the system; `Logs(..)` is the viewer's command +
+    /// render channel layered ON TOP of that feed. Mirrors the
+    /// [`SMessage::Matrix`] / [`SMessage::Principia`] sub-enum shape so a new
+    /// app surface adds one outer variant, not a spray of siblings.
+    Logs(LogEvent),
+
     // --- UI EVENTS (Migrated from gneiss_pal::types::Event) ---
     Input {
         target: String,
@@ -192,10 +226,109 @@ pub enum SMessage {
     UiReady,
 }
 
+/// A typed preference value — the whole value domain of the Principia
+/// preference store. Deliberately small: these four types are exactly what a
+/// TOML scalar can carry losslessly, so a value survives the round trip
+/// store → file → store → bus without widening or coercion. Externally tagged
+/// on the wire (the enum default) so `Float(1.0)` cannot come back as `Int(1)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum PrefValue {
+    Str(String),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+}
+
+impl PrefValue {
+    /// The value's type name (`"string" | "int" | "float" | "bool"`) — for
+    /// logs, diagnostics and a future schema surface.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            PrefValue::Str(_) => "string",
+            PrefValue::Int(_) => "int",
+            PrefValue::Float(_) => "float",
+            PrefValue::Bool(_) => "bool",
+        }
+    }
+}
+
+impl From<String> for PrefValue {
+    fn from(v: String) -> Self {
+        PrefValue::Str(v)
+    }
+}
+impl From<&str> for PrefValue {
+    fn from(v: &str) -> Self {
+        PrefValue::Str(v.to_string())
+    }
+}
+impl From<i64> for PrefValue {
+    fn from(v: i64) -> Self {
+        PrefValue::Int(v)
+    }
+}
+impl From<f64> for PrefValue {
+    fn from(v: f64) -> Self {
+        PrefValue::Float(v)
+    }
+}
+impl From<bool> for PrefValue {
+    fn from(v: bool) -> Self {
+        PrefValue::Bool(v)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PrincipiaCommand {
     SetSystemRoot(PathBuf),
     SystemRootChanged(PathBuf),
+
+    // --- PREFERENCES (the settings surface) ---
+    // Namespaces are per-app/domain strings ("aether", "stria", "system");
+    // keys are dotted paths within a namespace ("homepage", "window.width").
+    // Defaults live with the consumer, never in the store — an unset key
+    // answers `None`.
+    /// Ask for one preference. Answered by [`PrincipiaCommand::PrefValueIs`].
+    PrefGet { ns: String, key: String },
+    /// The answer to a [`PrincipiaCommand::PrefGet`]: `None` = unset (the
+    /// consumer applies its own default).
+    PrefValueIs {
+        ns: String,
+        key: String,
+        value: Option<PrefValue>,
+    },
+    /// Write one preference. On success the store persists atomically and
+    /// [`PrincipiaCommand::PrefChanged`] is broadcast; on rejection
+    /// [`PrincipiaCommand::PrefError`] comes back instead.
+    PrefSet {
+        ns: String,
+        key: String,
+        value: PrefValue,
+    },
+    /// Ask for every set key in one namespace. Answered by
+    /// [`PrincipiaCommand::PrefListIs`].
+    PrefList { ns: String },
+    /// The answer to a [`PrincipiaCommand::PrefList`]: every `(key, value)`
+    /// currently set in `ns`, sorted by key. An unknown namespace lists empty.
+    PrefListIs {
+        ns: String,
+        entries: Vec<(String, PrefValue)>,
+    },
+    /// Broadcast after every successful set: the new value of `ns`/`key`.
+    /// This is both the set's acknowledgement and the live-update signal every
+    /// running consumer subscribes to.
+    PrefChanged {
+        ns: String,
+        key: String,
+        value: PrefValue,
+    },
+    /// A rejected preference operation (malformed namespace/key, a key that
+    /// collides with an existing dotted path, or a failed persist).
+    PrefError {
+        ns: String,
+        key: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,6 +351,68 @@ pub enum MatrixEvent {
     NodeSelected(PathBuf),
     /// Broadcasts an updated, flattened structural topology back to the UI
     TopologyMutated(Vec<(String, String, usize)>),
+
+    // --- FINDER (the file-browser capability) ---
+    // Matrix is the all-asset manager; the Finder is a navigable CURSOR over
+    // the filesystem, distinct from the code-topology DAG above. Every verb is
+    // principal-stamped (`Origin`) so an in-kernel fulfilment runs with the
+    // invoker's grants, never ambient authority (ROADMAP message-security law).
+
+    /// UI → matrix: navigate the browse cursor to a directory (workspace-
+    /// relative; `""` = workspace root). Matrix answers with `DirListed`.
+    BrowseTo { principal: Origin, path: String },
+    /// Matrix → UI: the browse-view listing of the current directory — the flat
+    /// file list/grid the vessel renders (NOT the dependency DAG).
+    DirListed(BrowseListing),
+    /// UI → matrix: a Finder file verb. `arg` is the verb's second operand (new
+    /// name for `Rename`/`NewFolder`, destination dir for `Copy`/`Move`, unused
+    /// for `Open`/`Delete`). `confirmed` gates the destructive `Delete`:
+    /// `false` ⇒ matrix answers `FsOpResult { outcome: NeedsConfirm }`.
+    FileOp {
+        principal: Origin,
+        verb: FsVerb,
+        path: String,
+        arg: Option<String>,
+        confirmed: bool,
+    },
+    /// Matrix → UI: the outcome of a `FileOp`, principal-attributed. A read-only
+    /// volume surfaces here as `Denied`, loudly — never a silent no-op.
+    FsOpResult {
+        principal: Origin,
+        verb: FsVerb,
+        path: String,
+        outcome: FsOutcome,
+    },
+}
+
+/// Console log-viewer events (the macOS `Console.app` model): the app is a
+/// SUBSCRIBER to the system log feed that maintains a bounded scrollback and
+/// publishes a viewable snapshot. Three commands flow view→handler and one
+/// render message flows handler→view; the `comscan` handler owns the ring in
+/// between. Mirrors [`MatrixEvent`] — a self-contained sub-enum whose matches
+/// stay local to its owner.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum LogEvent {
+    /// view→handler: set the text filter — a case-insensitive substring tested
+    /// against a record's `content`, `source`, and `level`. The empty string
+    /// clears it (every record passes).
+    LogFilter(String),
+    /// view→handler: choose which subsystem/source to show (the facet axis).
+    /// [`LogSource::All`] shows everything.
+    LogSource(LogSource),
+    /// view→handler: scroll-lock. `true` freezes the live tail — the ring keeps
+    /// ingesting new records, but no fresh [`LogEvent::LogTail`] is emitted on
+    /// ingest; `false` resumes and immediately re-emits the current snapshot.
+    LogPause(bool),
+    /// handler→view: the current bounded, filtered scrollback snapshot, plus the
+    /// since-boot eviction count and the pause flag. The single message the
+    /// Console vessel renders. Never consumed by the handler (it does not react
+    /// to its own output), so publisher and subscriber can share one bus.
+    LogTail {
+        lines: Vec<LogLine>,
+        dropped: u64,
+        paused: bool,
+    },
 }
 
 /// The trait that defines a "Nerve Ending" in the system.

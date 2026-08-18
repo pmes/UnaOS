@@ -1,0 +1,460 @@
+diff --git a/unaos/crates/kernel/src/drivers/gpu/kepler.rs b/unaos/crates/kernel/src/drivers/gpu/kepler.rs
+index 422a0d0d..f06994fc 100644
+--- a/unaos/crates/kernel/src/drivers/gpu/kepler.rs
++++ b/unaos/crates/kernel/src/drivers/gpu/kepler.rs
+@@ -65,89 +65,60 @@ pub mod regs {
+ ///   * the poll loop is **bounded** (spec §5.1 — the standing defect raised at
+ ///     land review `bc5fe3fc`), and exit-by-bound reports a distinct phase.
+ pub mod ucode {
+-    use super::regs::falcon_io;
+-
+-    /// Falcon IO indices, derived — never hand-written (spec §3).
+-    pub const IO_MAILBOX0: u32 = falcon_io(0x040);
+-    pub const IO_MAILBOX1: u32 = falcon_io(0x044);
+-    pub const IO_CC_SCRATCH0: u32 = falcon_io(0x800);
+-    pub const IO_CC_SCRATCH1: u32 = falcon_io(0x804);
++    use super::regs::*;
+ 
+-    /// Iteration bound on the echo poll loop.
+-    ///
+-    /// Chosen as `0x0010_0000` = 1_048_576 iterations. Sizing argument: the
+-    /// loop body is 8 instructions, so the bound is ~8.4M Falcon instructions —
+-    /// milliseconds of Falcon time. The host writes the command word one
+-    /// `mmio_write` plus one `serial_println!` after `CPUCTL <= 2`, and at s37
+-    /// the ucode had already consumed it by the host's *first* poll
+-    /// (`iters=0`). The bound is therefore ~3 orders of magnitude larger than
+-    /// the window it must cover: it exists to guarantee termination (spec
+-    /// §5.1), not to be reached. If `phase` ever comes back as
+-    /// [`PHASE_A_BOUND`]/[`PHASE_B_BOUND`], the command never arrived — that is
+-    /// a real finding, not a tuning problem.
+     pub const ECHO_BOUND: u32 = 0x0010_0000;
+-
+-    // Phase stamps. Image A uses 0x01..0x04, image B 0x11..0x14, so MAILBOX1
+-    // alone names which image ran (pull 25 distinct-magic discipline).
+-    pub const PHASE_A_PRELOOP: u8 = 0x01;
+-    pub const PHASE_A_POSTREAD: u8 = 0x02;
+-    pub const PHASE_A_PREACK: u8 = 0x03;
+-    pub const PHASE_A_POSTACK: u8 = 0x04;
+     pub const PHASE_A_BOUND: u32 = 0xFFFFFFBD;
+-    
+ 
+-    /// Image A — indexed IO ports (s37-proven prologue), **down-counting**
+-    /// bound via `sub b32 $r5, 0x1`.
+-    ///
+-    /// ```text
+-    /// // 0x00 | f0 17 00    | mov   $r1, 0x00     | scratch0 port base
+-    /// // 0x03 | f0 13 02    | sethi $r1, 0x02     | ($r1 = 0x20000)
+-    /// // 0x06 | f1 27 00 01 | mov   $r2, 0x0100   | scratch1 port base
+-    /// // 0x0a | f0 23 02    | sethi $r2, 0x02     | ($r2 = 0x20100)
+-    /// // 0x0d | f0 37 01    | mov   $r3, 0x1      | expected ack value (unused)
+-    /// // 0x10 | f1 87 00 41 | mov   $r8, 0x4100   | 0x14100 port base
+-    /// // 0x14 | f0 83 01    | sethi $r8, 0x01     | ($r8 = 0x14100)
+-    /// // 0x17 | f1 67 00 10 | mov   $r6, 0x1000   | mailbox0
+-    /// // 0x1b | f1 77 00 11 | mov   $r7, 0x1100   | mailbox1
+-    /// // 0x1f | f0 57 00    | mov   $r5, 0x0      | iter counter
+-    /// // 0x22 | f1 53 10 00 | sethi $r5, 0x0010   | ($r5 = 0x100000 = 1_048_576)
+-    /// // 0x26 | f0 07 01    | mov   $r0, 0x01     |
+-    /// // 0x29 | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = 1
+-    /// // 0x2c | cf 14 00    | iord  $r4, I[$r1]   | poll: $r4 = CC_SCRATCH0
+-    /// // 0x2f | d0 64 00    | iowr  I[$r6], $r4   | MAILBOX0 = $r4
+-    /// // 0x32 | f0 07 02    | mov   $r0, 0x02     | 
+-    /// // 0x35 | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = 2
+-    /// // 0x38 | b0 44 02    | cmpu b32 $r4, 0x2   | if host-cmd == 2 {
+-    /// // 0x3b | f4 0b 2e    | bra eq, 0x69        |   -> cmd2_exit
+-    /// // 0x3e | b0 44 01    | cmpu b32 $r4, 0x1   | } if host-cmd == 1 {
+-    /// // 0x41 | f4 1b 17    | bra ne, 0x58        |   -> dec (if != 1)
+-    /// // 0x44 | f0 07 03    | mov   $r0, 0x03     |
+-    /// // 0x47 | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = 3
+-    /// // 0x4a | cf 84 00    | iord  $r4, I[$r8]   | $r4 = 0x409504
+-    /// // 0x4d | d0 24 00    | iowr  I[$r2], $r4   | CC_SCRATCH1 = 0x409504
+-    /// // 0x50 | f0 07 04    | mov   $r0, 0x04     |
+-    /// // 0x53 | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = 4
+-    /// // 0x56 | f8 02       | exit                | halt
+-    /// // 0x58 | b6 52 01    | sub  b32 $r5, 0x1   | dec: $r5 -= 1
+-    /// // 0x5b | b0 54 00    | cmpu b32 $r5, 0x0   |
+-    /// // 0x5e | f4 1b ce    | bra ne, -0x32       | -> 0x2c (poll)
+-    /// // 0x61 | f0 07 bd    | mov   $r0, 0xbd     | EXIT BY BOUND
+-    /// // 0x64 | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = 0xBD
+-    /// // 0x67 | f8 02       | exit                |
+-    /// // 0x69 | f0 07 04    | mov   $r0, 0x04     | cmd2_exit:
+-    /// // 0x6c | d0 70 00    | iowr  I[$r7], $r0   | MAILBOX1 = 4
+-    /// // 0x6f | f8 02       | exit                |
+-    /// // 0x71 | 00 00 00... | (padding)           | 128 bytes = 32 words
+-    /// ```
+-    #[rustfmt::skip]
+     pub const ECHO_A_BYTES: [u8; 128] = [
++        0xf0, 0x17, 0x00,             // mov   $r1, 0x00
++        0xf0, 0x13, 0x02,             // sethi $r1, 0x02
++        0xf1, 0x27, 0x00, 0x01,       // mov   $r2, 0x0100
++        0xf0, 0x23, 0x02,             // sethi $r2, 0x02
++        0xf0, 0x37, 0x01,             // mov   $r3, 0x1
++        0xf1, 0x67, 0x00, 0x10,       // mov   $r6, 0x1000
++        0xf1, 0x77, 0x00, 0x11,       // mov   $r7, 0x1100
++        0xf0, 0x57, 0x00,             // mov   $r5, 0x00
++        0xf1, 0x53, 0x10, 0x00,       // sethi $r5, 0x0010
++        0xf0, 0x07, 0x01,             // mov   $r0, 0x01
++        0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
++        0xcf, 0x14, 0x00,             // poll: iord $r4, I[$r1]
++        0xd0, 0x64, 0x00,             // iowr  I[$r6], $r4
++        0xf0, 0x07, 0x02,             // mov   $r0, 0x02
++        0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
++        0xb0, 0x44, 0x02,             // cmpu b32 $r4, 0x2
++        0xf4, 0x0b, 0x2b,             // bra eq, +0x2b -> cmd2_exit
++        0xb0, 0x44, 0x01,             // cmpu b32 $r4, 0x1
++        0xf4, 0x1b, 0x14,             // bra ne, +0x14 -> dec
++        0xf0, 0x07, 0x03,             // mov   $r0, 0x03
++        0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
++        0xd0, 0x23, 0x00,             // iowr  I[$r2], $r3   (ACK)
++        0xf0, 0x07, 0x04,             // mov   $r0, 0x04
++        0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
++        0xf8, 0x02,                   // exit
++        0xb6, 0x52, 0x01,             // dec: sub b32 $r5, 0x1
++        0xb0, 0x54, 0x00,             // cmpu b32 $r5, 0x0
++        0xf4, 0x1b, 0xd1,             // bra ne, -0x2f -> poll
++        0xf0, 0x07, 0xbd,             // mov   $r0, 0xbd
++        0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
++        0xf8, 0x02,                   // exit
++        0xf0, 0x07, 0x04,             // cmd2_exit: mov $r0, 0x04
++        0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
++        0xf8, 0x02,                   // exit
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00
++    ];
++
++    pub const POKE_A_BYTES: [u8; 128] = [
+         0xf0, 0x17, 0x00,             // mov   $r1, 0x00
+         0xf0, 0x13, 0x02,             // sethi $r1, 0x02
+         0xf1, 0x27, 0x00, 0x01,       // mov   $r2, 0x0100
+         0xf0, 0x23, 0x02,             // sethi $r2, 0x02
+         0xf0, 0x37, 0x01,             // mov   $r3, 0x1
+         0xf1, 0x87, 0x00, 0x41,       // mov   $r8, 0x4100
+-        0xf0, 0x83, 0x01,             // sethi $r8, 0x01
++        0xf0, 0x83, 0x01,             // sethi $r8, 0x01 (0x14100)
+         0xf1, 0x67, 0x00, 0x10,       // mov   $r6, 0x1000
+         0xf1, 0x77, 0x00, 0x11,       // mov   $r7, 0x1100
+         0xf0, 0x57, 0x00,             // mov   $r5, 0x00
+@@ -159,10 +130,10 @@ pub mod ucode {
+         0xf0, 0x07, 0x02,             // mov   $r0, 0x02
+         0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
+         0xb0, 0x44, 0x02,             // cmpu b32 $r4, 0x2
+-        0xf4, 0x0b, 0x2e,             // bra eq, cmd2_exit
++        0xf4, 0x0b, 0x2e,             // bra eq, +0x2e -> cmd2_exit
+         0xb0, 0x44, 0x01,             // cmpu b32 $r4, 0x1
+-        0xf4, 0x1b, 0x17,             // bra ne, dec
+-        0xf0, 0x07, 0x03,             // cmd1: mov $r0, 0x03
++        0xf4, 0x1b, 0x17,             // bra ne, +0x17 -> dec
++        0xf0, 0x07, 0x03,             // mov   $r0, 0x03
+         0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
+         0xcf, 0x84, 0x00,             // iord  $r4, I[$r8]
+         0xd0, 0x24, 0x00,             // iowr  I[$r2], $r4
+@@ -171,21 +142,17 @@ pub mod ucode {
+         0xf8, 0x02,                   // exit
+         0xb6, 0x52, 0x01,             // dec: sub b32 $r5, 0x1
+         0xb0, 0x54, 0x00,             // cmpu b32 $r5, 0x0
+-        0xf4, 0x1b, 0xce,             // bra ne, poll
++        0xf4, 0x1b, 0xce,             // bra ne, -0x32 -> poll
+         0xf0, 0x07, 0xbd,             // mov   $r0, 0xbd
+         0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
+         0xf8, 0x02,                   // exit
+         0xf0, 0x07, 0x04,             // cmd2_exit: mov $r0, 0x04
+         0xd0, 0x70, 0x00,             // iowr  I[$r7], $r0
+         0xf8, 0x02,                   // exit
+-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+     ];
+ 
+-    
+-
+-    /// Pack a 128-byte Falcon instruction stream into the 32 little-endian
+-    /// `u32` words IMEMD expects.
+     pub const fn pack128(b: &[u8; 128]) -> [u32; 32] {
+         let mut out = [0u32; 32];
+         let mut w = 0;
+@@ -201,12 +168,14 @@ pub mod ucode {
+     }
+ 
+     pub const UCODE_CTX_ECHO_A: [u32; 32] = pack128(&ECHO_A_BYTES);
+-    
++    pub const UCODE_CTX_POKE_A: [u32; 32] = pack128(&POKE_A_BYTES);
+ 
+-    // Full-slice const fn instruction matchers
+     const fn mov_i16(reg: u8, imm: u16) -> [u8; 4] {
+         [0xf1, (reg << 4) | 0x07, (imm & 0xFF) as u8, (imm >> 8) as u8]
+     }
++    const fn sethi_i16(reg: u8, imm: u16) -> [u8; 4] {
++        [0xf1, (reg << 4) | 0x03, (imm & 0xFF) as u8, (imm >> 8) as u8]
++    }
+     const fn mov_i8(reg: u8, imm: u8) -> [u8; 3] {
+         [0xf0, (reg << 4) | 0x07, imm]
+     }
+@@ -228,9 +197,6 @@ pub mod ucode {
+     const fn iowr(ptr: u8, src: u8) -> [u8; 3] {
+         [0xd0, (ptr << 4) | src, 0x00]
+     }
+-    const fn exit_inst() -> [u8; 2] {
+-        [0xf8, 0x02]
+-    }
+     const fn slice2(b: &[u8; 128], at: usize) -> [u8; 2] {
+         [b[at], b[at+1]]
+     }
+@@ -240,66 +206,109 @@ pub mod ucode {
+     const fn slice4(b: &[u8; 128], at: usize) -> [u8; 4] {
+         [b[at], b[at+1], b[at+2], b[at+3]]
+     }
++    const fn slice_eq_2(a: &[u8; 2], b: &[u8; 2]) -> bool {
++        a[0] == b[0] && a[1] == b[1]
++    }
++    const fn slice_eq_3(a: &[u8; 3], b: &[u8; 3]) -> bool {
++        a[0] == b[0] && a[1] == b[1] && a[2] == b[2]
++    }
++    const fn slice_eq_4(a: &[u8; 4], b: &[u8; 4]) -> bool {
++        a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3]
++    }
++    pub const fn falcon_io(host_off: u32) -> u32 {
++        host_off << 6
++    }
+ 
+-    // ⭐ Spec §3: derived ports mapped accurately in full instructions.
+-    const _: () = assert!(slice3(&ECHO_A_BYTES, 0x00)[0] == mov_i8(1, (IO_CC_SCRATCH0 & 0xFF) as u8)[0] && slice3(&ECHO_A_BYTES, 0x00)[1] == mov_i8(1, (IO_CC_SCRATCH0 & 0xFF) as u8)[1] && slice3(&ECHO_A_BYTES, 0x00)[2] == mov_i8(1, (IO_CC_SCRATCH0 & 0xFF) as u8)[2]);
+-    const _: () = assert!(slice3(&ECHO_A_BYTES, 0x03)[0] == sethi_i8(1, (IO_CC_SCRATCH0 >> 16) as u8)[0] && slice3(&ECHO_A_BYTES, 0x03)[1] == sethi_i8(1, (IO_CC_SCRATCH0 >> 16) as u8)[1] && slice3(&ECHO_A_BYTES, 0x03)[2] == sethi_i8(1, (IO_CC_SCRATCH0 >> 16) as u8)[2]);
+-    
+-    const _: () = assert!(slice4(&ECHO_A_BYTES, 0x06)[0] == mov_i16(2, (IO_CC_SCRATCH1 & 0xFFFF) as u16)[0] && slice4(&ECHO_A_BYTES, 0x06)[1] == mov_i16(2, (IO_CC_SCRATCH1 & 0xFFFF) as u16)[1] && slice4(&ECHO_A_BYTES, 0x06)[2] == mov_i16(2, (IO_CC_SCRATCH1 & 0xFFFF) as u16)[2] && slice4(&ECHO_A_BYTES, 0x06)[3] == mov_i16(2, (IO_CC_SCRATCH1 & 0xFFFF) as u16)[3]);
+-    const _: () = assert!(slice3(&ECHO_A_BYTES, 0x0a)[0] == sethi_i8(2, (IO_CC_SCRATCH1 >> 16) as u8)[0] && slice3(&ECHO_A_BYTES, 0x0a)[1] == sethi_i8(2, (IO_CC_SCRATCH1 >> 16) as u8)[1] && slice3(&ECHO_A_BYTES, 0x0a)[2] == sethi_i8(2, (IO_CC_SCRATCH1 >> 16) as u8)[2]);
+-    
+-    const _: () = assert!(slice4(&ECHO_A_BYTES, 0x10)[0] == mov_i16(8, (falcon_io(0x504) & 0xFFFF) as u16)[0] && slice4(&ECHO_A_BYTES, 0x10)[1] == mov_i16(8, (falcon_io(0x504) & 0xFFFF) as u16)[1] && slice4(&ECHO_A_BYTES, 0x10)[2] == mov_i16(8, (falcon_io(0x504) & 0xFFFF) as u16)[2] && slice4(&ECHO_A_BYTES, 0x10)[3] == mov_i16(8, (falcon_io(0x504) & 0xFFFF) as u16)[3]);
+-    const _: () = assert!(slice3(&ECHO_A_BYTES, 0x14)[0] == sethi_i8(8, (falcon_io(0x504) >> 16) as u8)[0] && slice3(&ECHO_A_BYTES, 0x14)[1] == sethi_i8(8, (falcon_io(0x504) >> 16) as u8)[1] && slice3(&ECHO_A_BYTES, 0x14)[2] == sethi_i8(8, (falcon_io(0x504) >> 16) as u8)[2]);
+-
+-    const _: () = assert!(slice4(&ECHO_A_BYTES, 0x17)[0] == mov_i16(6, IO_MAILBOX0 as u16)[0] && slice4(&ECHO_A_BYTES, 0x17)[1] == mov_i16(6, IO_MAILBOX0 as u16)[1] && slice4(&ECHO_A_BYTES, 0x17)[2] == mov_i16(6, IO_MAILBOX0 as u16)[2] && slice4(&ECHO_A_BYTES, 0x17)[3] == mov_i16(6, IO_MAILBOX0 as u16)[3]);
+-    const _: () = assert!(slice4(&ECHO_A_BYTES, 0x1b)[0] == mov_i16(7, IO_MAILBOX1 as u16)[0] && slice4(&ECHO_A_BYTES, 0x1b)[1] == mov_i16(7, IO_MAILBOX1 as u16)[1] && slice4(&ECHO_A_BYTES, 0x1b)[2] == mov_i16(7, IO_MAILBOX1 as u16)[2] && slice4(&ECHO_A_BYTES, 0x1b)[3] == mov_i16(7, IO_MAILBOX1 as u16)[3]);
+-
+-    // Bounds initialiser check
+-    const _: () = assert!(slice3(&ECHO_A_BYTES, 0x1f)[0] == mov_i8(5, 0)[0] && slice3(&ECHO_A_BYTES, 0x1f)[1] == mov_i8(5, 0)[1] && slice3(&ECHO_A_BYTES, 0x1f)[2] == mov_i8(5, 0)[2]);
+-    const fn sethi_i16(reg: u8, imm: u16) -> [u8; 4] { [0xf1, (reg << 4) | 0x03, (imm & 0xFF) as u8, (imm >> 8) as u8] }
+-    const _: () = assert!(((ECHO_A_BYTES[0x24] as u32) | ((ECHO_A_BYTES[0x25] as u32) << 8)) << 16 == ECHO_BOUND);
+-    const _: () = assert!(slice4(&ECHO_A_BYTES, 0x22)[0] == sethi_i16(5, 0x10)[0] && slice4(&ECHO_A_BYTES, 0x22)[1] == sethi_i16(5, 0x10)[1]); // target $r5, opcode sethi, check immediate
+-
+-    // Core IORD / IOWR correctness
+-    const _: () = assert!(slice3(&ECHO_A_BYTES, 0x2c)[0] == iord(4, 1)[0] && slice3(&ECHO_A_BYTES, 0x2c)[1] == iord(4, 1)[1] && slice3(&ECHO_A_BYTES, 0x2c)[2] == iord(4, 1)[2]); // iord $r4, I[$r1]
+-    const _: () = assert!(slice3(&ECHO_A_BYTES, 0x2f)[0] == iowr(6, 4)[0] && slice3(&ECHO_A_BYTES, 0x2f)[1] == iowr(6, 4)[1] && slice3(&ECHO_A_BYTES, 0x2f)[2] == iowr(6, 4)[2]); // iowr I[$r6], $r4
+-    const _: () = assert!(slice3(&ECHO_A_BYTES, 0x4a)[0] == iord(4, 8)[0] && slice3(&ECHO_A_BYTES, 0x4a)[1] == iord(4, 8)[1] && slice3(&ECHO_A_BYTES, 0x4a)[2] == iord(4, 8)[2]); // iord $r4, I[$r8]
+-    const _: () = assert!(slice3(&ECHO_A_BYTES, 0x4d)[0] == iowr(2, 4)[0] && slice3(&ECHO_A_BYTES, 0x4d)[1] == iowr(2, 4)[1] && slice3(&ECHO_A_BYTES, 0x4d)[2] == iowr(2, 4)[2]); // iowr I[$r2], $r4
+-
+-    // Phase stamps check
+-    const _: () = assert!(slice3(&ECHO_A_BYTES, 0x29)[0] == iowr(7, 0)[0] && slice3(&ECHO_A_BYTES, 0x29)[1] == iowr(7, 0)[1] && slice3(&ECHO_A_BYTES, 0x29)[2] == iowr(7, 0)[2]);
+-    const _: () = assert!(slice3(&ECHO_A_BYTES, 0x35)[0] == iowr(7, 0)[0] && slice3(&ECHO_A_BYTES, 0x35)[1] == iowr(7, 0)[1] && slice3(&ECHO_A_BYTES, 0x35)[2] == iowr(7, 0)[2]);
+-    const _: () = assert!(slice3(&ECHO_A_BYTES, 0x47)[0] == iowr(7, 0)[0] && slice3(&ECHO_A_BYTES, 0x47)[1] == iowr(7, 0)[1] && slice3(&ECHO_A_BYTES, 0x47)[2] == iowr(7, 0)[2]);
+-    const _: () = assert!(slice3(&ECHO_A_BYTES, 0x53)[0] == iowr(7, 0)[0] && slice3(&ECHO_A_BYTES, 0x53)[1] == iowr(7, 0)[1] && slice3(&ECHO_A_BYTES, 0x53)[2] == iowr(7, 0)[2]);
+-    const _: () = assert!(slice3(&ECHO_A_BYTES, 0x64)[0] == iowr(7, 0)[0] && slice3(&ECHO_A_BYTES, 0x64)[1] == iowr(7, 0)[1] && slice3(&ECHO_A_BYTES, 0x64)[2] == iowr(7, 0)[2]);
+-    const _: () = assert!(slice3(&ECHO_A_BYTES, 0x6c)[0] == iowr(7, 0)[0] && slice3(&ECHO_A_BYTES, 0x6c)[1] == iowr(7, 0)[1] && slice3(&ECHO_A_BYTES, 0x6c)[2] == iowr(7, 0)[2]);
+-
+-    // Branches and displacements
+-    const _: () = assert!(slice3(&ECHO_A_BYTES, 0x3b)[0] == bra(0x0b, 0)[0] && slice3(&ECHO_A_BYTES, 0x3b)[1] == bra(0x0b, 0)[1]); // bra eq, cmd2_exit
+-    const _: () = assert!(0x3b_isize + slice3(&ECHO_A_BYTES, 0x3b)[2] as i8 as isize == 0x69);
+-
+-    const _: () = assert!(slice3(&ECHO_A_BYTES, 0x41)[0] == bra(0x1b, 0)[0] && slice3(&ECHO_A_BYTES, 0x41)[1] == bra(0x1b, 0)[1]); // bra ne, dec
+-    const _: () = assert!(0x41_isize + slice3(&ECHO_A_BYTES, 0x41)[2] as i8 as isize == 0x58);
+-
+-    const _: () = assert!(slice3(&ECHO_A_BYTES, 0x58)[0] == sub_b32_i8(5, 1)[0] && slice3(&ECHO_A_BYTES, 0x58)[1] == sub_b32_i8(5, 1)[1] && slice3(&ECHO_A_BYTES, 0x58)[2] == sub_b32_i8(5, 1)[2]); // dec: sub b32 $r5, 0x1
+-
+-    const _: () = assert!(slice3(&ECHO_A_BYTES, 0x5e)[0] == bra(0x1b, 0)[0] && slice3(&ECHO_A_BYTES, 0x5e)[1] == bra(0x1b, 0)[1]); // bra ne, poll
+-    const _: () = assert!(0x5e_isize + slice3(&ECHO_A_BYTES, 0x5e)[2] as i8 as isize == 0x2c);
+-
+-    // Guard cmpu instructions
+-    const _: () = assert!(slice3(&ECHO_A_BYTES, 0x38)[0] == cmpu_b32_i8(4, 2)[0] && slice3(&ECHO_A_BYTES, 0x38)[1] == cmpu_b32_i8(4, 2)[1] && slice3(&ECHO_A_BYTES, 0x38)[2] == cmpu_b32_i8(4, 2)[2]);
+-    const _: () = assert!(slice3(&ECHO_A_BYTES, 0x3e)[0] == cmpu_b32_i8(4, 1)[0] && slice3(&ECHO_A_BYTES, 0x3e)[1] == cmpu_b32_i8(4, 1)[1] && slice3(&ECHO_A_BYTES, 0x3e)[2] == cmpu_b32_i8(4, 1)[2]);
+-    const _: () = assert!(slice3(&ECHO_A_BYTES, 0x5b)[0] == cmpu_b32_i8(5, 0)[0] && slice3(&ECHO_A_BYTES, 0x5b)[1] == cmpu_b32_i8(5, 0)[1] && slice3(&ECHO_A_BYTES, 0x5b)[2] == cmpu_b32_i8(5, 0)[2]);
+-
+-    // Exit instructions
+-    const _: () = assert!(slice2(&ECHO_A_BYTES, 0x56)[0] == exit_inst()[0] && slice2(&ECHO_A_BYTES, 0x56)[1] == exit_inst()[1]);
+-    const _: () = assert!(slice2(&ECHO_A_BYTES, 0x67)[0] == exit_inst()[0] && slice2(&ECHO_A_BYTES, 0x67)[1] == exit_inst()[1]);
+-    const _: () = assert!(slice2(&ECHO_A_BYTES, 0x6f)[0] == exit_inst()[0] && slice2(&ECHO_A_BYTES, 0x6f)[1] == exit_inst()[1]);
+-
+-
+-    
+-
+-    
++    const _: () = {
++        let b = &ECHO_A_BYTES;
++        assert!(slice_eq_3(&slice3(b, 0x00), &mov_i8(1, 0x00)));
++        assert!(slice_eq_3(&slice3(b, 0x03), &sethi_i8(1, 0x02)));
++        assert!(slice_eq_4(&slice4(b, 0x06), &mov_i16(2, 0x0100)));
++        assert!(slice_eq_3(&slice3(b, 0x0a), &sethi_i8(2, 0x02)));
++        assert!(slice_eq_3(&slice3(b, 0x0d), &mov_i8(3, 1))); // ACK value
++        assert!(slice_eq_4(&slice4(b, 0x10), &mov_i16(6, falcon_io(0x040) as u16))); // MAILBOX0
++        assert!(slice_eq_4(&slice4(b, 0x14), &mov_i16(7, falcon_io(0x044) as u16))); // MAILBOX1
++        assert!(slice_eq_3(&slice3(b, 0x18), &mov_i8(5, 0x00)));
++        assert!(slice_eq_4(&slice4(b, 0x1b), &sethi_i16(5, 0x0010))); // bound
++        assert!(slice_eq_3(&slice3(b, 0x1f), &mov_i8(0, 0x01))); // phase 1
++        assert!(slice_eq_3(&slice3(b, 0x22), &iowr(7, 0)));
++        assert!(slice_eq_3(&slice3(b, 0x25), &iord(4, 1)));
++        assert!(slice_eq_3(&slice3(b, 0x28), &iowr(6, 4)));
++        assert!(slice_eq_3(&slice3(b, 0x2b), &mov_i8(0, 0x02))); // phase 2
++        assert!(slice_eq_3(&slice3(b, 0x2e), &iowr(7, 0)));
++        assert!(slice_eq_3(&slice3(b, 0x31), &cmpu_b32_i8(4, 2))); // cmd 2?
++        assert!(slice_eq_3(&slice3(b, 0x34), &bra(0xb, 0x2b))); // +0x2b = 0x5f
++        assert!(slice_eq_3(&slice3(b, 0x37), &cmpu_b32_i8(4, 1))); // cmd 1?
++        assert!(slice_eq_3(&slice3(b, 0x3a), &bra(0x1b, 0x14))); // +0x14 = 0x4e
++        assert!(slice_eq_3(&slice3(b, 0x3d), &mov_i8(0, 0x03))); // phase 3
++        assert!(slice_eq_3(&slice3(b, 0x40), &iowr(7, 0)));
++        assert!(slice_eq_3(&slice3(b, 0x43), &iowr(2, 3))); // Write ACK
++        assert!(slice_eq_3(&slice3(b, 0x46), &mov_i8(0, 0x04))); // phase 4
++        assert!(slice_eq_3(&slice3(b, 0x49), &iowr(7, 0)));
++        assert!(slice_eq_2(&slice2(b, 0x4c), &[0xf8, 0x02])); // exit
++        assert!(slice_eq_3(&slice3(b, 0x4e), &sub_b32_i8(5, 1)));
++        assert!(slice_eq_3(&slice3(b, 0x51), &cmpu_b32_i8(5, 0)));
++        assert!(slice_eq_3(&slice3(b, 0x54), &bra(0x1b, 0xd1))); // 0xd1 is -0x2f
++        assert!(slice_eq_3(&slice3(b, 0x57), &mov_i8(0, PHASE_A_BOUND as u8))); // phase bound
++        assert!(slice_eq_3(&slice3(b, 0x5a), &iowr(7, 0)));
++        assert!(slice_eq_2(&slice2(b, 0x5d), &[0xf8, 0x02])); // exit
++        assert!(slice_eq_3(&slice3(b, 0x5f), &mov_i8(0, 0x04))); // phase 4
++        assert!(slice_eq_3(&slice3(b, 0x62), &iowr(7, 0)));
++        assert!(slice_eq_2(&slice2(b, 0x65), &[0xf8, 0x02])); // exit
++        
++        let mut i = 0x67;
++        while i < 128 {
++            assert!(b[i] == 0);
++            i += 1;
++        }
++    };
++
++    const _: () = {
++        let b = &POKE_A_BYTES;
++        assert!(slice_eq_3(&slice3(b, 0x00), &mov_i8(1, 0x00)));
++        assert!(slice_eq_3(&slice3(b, 0x03), &sethi_i8(1, 0x02)));
++        assert!(slice_eq_4(&slice4(b, 0x06), &mov_i16(2, 0x0100)));
++        assert!(slice_eq_3(&slice3(b, 0x0a), &sethi_i8(2, 0x02)));
++        assert!(slice_eq_3(&slice3(b, 0x0d), &mov_i8(3, 1))); // ACK value
++        assert!(slice_eq_4(&slice4(b, 0x10), &mov_i16(8, falcon_io(0x504) as u16))); // 0x14100
++        assert!(slice_eq_3(&slice3(b, 0x14), &sethi_i8(8, 0x01))); // sethi 0x01 -> 0x10000
++        assert!(slice_eq_4(&slice4(b, 0x17), &mov_i16(6, falcon_io(0x040) as u16))); // MAILBOX0
++        assert!(slice_eq_4(&slice4(b, 0x1b), &mov_i16(7, falcon_io(0x044) as u16))); // MAILBOX1
++        assert!(slice_eq_3(&slice3(b, 0x1f), &mov_i8(5, 0x00)));
++        assert!(slice_eq_4(&slice4(b, 0x22), &sethi_i16(5, 0x0010))); // bound
++        assert!(slice_eq_3(&slice3(b, 0x26), &mov_i8(0, 0x01))); // phase 1
++        assert!(slice_eq_3(&slice3(b, 0x29), &iowr(7, 0)));
++        assert!(slice_eq_3(&slice3(b, 0x2c), &iord(4, 1)));
++        assert!(slice_eq_3(&slice3(b, 0x2f), &iowr(6, 4)));
++        assert!(slice_eq_3(&slice3(b, 0x32), &mov_i8(0, 0x02))); // phase 2
++        assert!(slice_eq_3(&slice3(b, 0x35), &iowr(7, 0)));
++        assert!(slice_eq_3(&slice3(b, 0x38), &cmpu_b32_i8(4, 2))); // cmd 2?
++        assert!(slice_eq_3(&slice3(b, 0x3b), &bra(0xb, 0x2e))); // +0x2e = 0x69
++        assert!(slice_eq_3(&slice3(b, 0x3e), &cmpu_b32_i8(4, 1))); // cmd 1?
++        assert!(slice_eq_3(&slice3(b, 0x41), &bra(0x1b, 0x17))); // +0x17 = 0x58
++        assert!(slice_eq_3(&slice3(b, 0x44), &mov_i8(0, 0x03))); // phase 3
++        assert!(slice_eq_3(&slice3(b, 0x47), &iowr(7, 0)));
++        assert!(slice_eq_3(&slice3(b, 0x4a), &iord(4, 8))); // iord 0x409504
++        assert!(slice_eq_3(&slice3(b, 0x4d), &iowr(2, 4))); // Write to scratch
++        assert!(slice_eq_3(&slice3(b, 0x50), &mov_i8(0, 0x04))); // phase 4
++        assert!(slice_eq_3(&slice3(b, 0x53), &iowr(7, 0)));
++        assert!(slice_eq_2(&slice2(b, 0x56), &[0xf8, 0x02])); // exit
++        assert!(slice_eq_3(&slice3(b, 0x58), &sub_b32_i8(5, 1)));
++        assert!(slice_eq_3(&slice3(b, 0x5b), &cmpu_b32_i8(5, 0)));
++        assert!(slice_eq_3(&slice3(b, 0x5e), &bra(0x1b, 0xce))); // 0xce is -0x32
++        assert!(slice_eq_3(&slice3(b, 0x61), &mov_i8(0, PHASE_A_BOUND as u8))); // phase bound
++        assert!(slice_eq_3(&slice3(b, 0x64), &iowr(7, 0)));
++        assert!(slice_eq_2(&slice2(b, 0x67), &[0xf8, 0x02])); // exit
++        assert!(slice_eq_3(&slice3(b, 0x69), &mov_i8(0, 0x04))); // phase 4
++        assert!(slice_eq_3(&slice3(b, 0x6c), &iowr(7, 0)));
++        assert!(slice_eq_2(&slice2(b, 0x6f), &[0xf8, 0x02])); // exit
++        
++        let mut i = 0x71;
++        while i < 128 {
++            assert!(b[i] == 0);
++            i += 1;
++        }
++    };
+ }
+ 
+ /// s26/s28 FTDI-ring budget: the 0x640000 window is PARKED (triple-refuted),
+@@ -870,6 +879,7 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
+                                             }
+                                             if !verify_echo {
+                                                 serial_println!(":: kepler: ucode-echo ABORT verify-mismatch h2h3={} ::", h2h3_label);
++                                                break;
+                                             }
+                                                                                         if h2h3_label == "on" {
+                                                 fecs_write(bar0, base + 0xC00, 2);
+@@ -911,7 +921,11 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
+                                                     h2h3_label, ucode::ECHO_BOUND);
+                                             }
+                                             if ack != MB_SEED {
+-                                                serial_println!(":: kepler: ucode-echo SUCCESS h2h3={} ::", h2h3_label);
++                                                if (ack & 0xFFFF0000) == 0xBADF0000 {
++                                                    serial_println!(":: kepler: ucode-echo POISON h2h3={} mailbox0={:08X} ::", h2h3_label, ack);
++                                                } else {
++                                                    serial_println!(":: kepler: ucode-echo SUCCESS h2h3={} mailbox0={:08X} ::", h2h3_label, ack);
++                                                }
+                                                 break;
+                                             } else {
+                                                 serial_println!(":: kepler: ucode-echo FAILURE h2h3={} ::", h2h3_label);
+@@ -1201,6 +1215,66 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
+                                         kdisp_trace[0], kdisp_trace[1], kdisp_trace[2], kdisp_trace[3],
+                                         kdisp_trace[4], kdisp_trace[5], kdisp_trace[6]);
+ 
++                                    // Run the falcon POKE experiment before the host poke
++                                    {
++                                        let img_label = "POKE";
++                                        let img_words = &ucode::UCODE_CTX_POKE_A;
++                                        const MB_SEED: u32 = 0xA5A5_0000;
++                                        
++                                        mmio_write(bar0, 0x104, 0x00000000); // CPUCTL: HALT
++                                        
++                                        let mut verify_poke = true;
++                                        for (w, word) in img_words.iter().enumerate() {
++                                            mmio_write(bar0, 0x180, (w * 4) as u32 | (1 << 24)); // IMEMC auto-increment
++                                            mmio_write(bar0, 0x184, *word);
++                                            
++                                            mmio_write(bar0, 0x180, (w * 4) as u32 | (1 << 25)); // verify readback
++                                            let rb = mmio_read(bar0, 0x184);
++                                            if rb != *word {
++                                                serial_println!(":: kepler: ucode-poke verify-mismatch offset={:08X} wr={:08X} rb={:08X} ::", w * 4, *word, rb);
++                                                verify_poke = false;
++                                            }
++                                        }
++                                        
++                                        if verify_poke {
++                                            // Seed CC_SCRATCH[1] (ack) with MB_SEED
++                                            mmio_write(bar0, 0x804, MB_SEED);
++                                            
++                                            // Write CMD=1 (execute poke) to CC_SCRATCH[0]
++                                            mmio_write(bar0, 0x800, 1);
++                                            
++                                            // Record the falcon touch in the ledger BEFORE executing
++                                            FECS_504_READ_TOUCHED.store(true, core::sync::atomic::Ordering::SeqCst);
++                                            
++                                            mmio_write(bar0, 0x100, 0x00000000); // BOOTVEC: 0
++                                            mmio_write(bar0, 0x104, 0x00000002); // CPUCTL: START
++                                            
++                                            let mut ack = MB_SEED;
++                                            let mut phase = 0;
++                                            let mut iters = 0;
++                                            while iters < ucode::ECHO_BOUND {
++                                                ack = mmio_read(bar0, 0x804);
++                                                if ack != MB_SEED { break; }
++                                                iters += 1;
++                                            }
++                                            
++                                            phase = mmio_read(bar0, 0x044); // MAILBOX1 is phase
++                                            serial_println!(":: kepler: ctx-poke img={} ack={:08X} mb0={:08X} phase={:08X} ::", img_label, ack, mmio_read(bar0, 0x040), phase);
++                                            
++                                            if ack != MB_SEED {
++                                                if (ack & 0xFFFF0000) == 0xBADF0000 {
++                                                    serial_println!(":: kepler: ucode-poke POISON img={} mailbox0={:08X} ::", img_label, ack);
++                                                } else {
++                                                    serial_println!(":: kepler: ucode-poke SUCCESS img={} mailbox0={:08X} ::", img_label, ack);
++                                                }
++                                            } else {
++                                                serial_println!(":: kepler: ucode-poke FAILURE img={} iters={} ::", img_label, iters);
++                                            }
++                                        } else {
++                                            serial_println!(":: kepler: ucode-poke ABORT verify-mismatch img={} ::", img_label);
++                                        }
++                                    }
++                                    
+                                     // ================= TERMINAL POKE — MUST BE LAST =================
+                                     // ⛔ ORDERING CONTRACT. This is the LAST kepler statement of the
+                                     // boot. Nothing below it, and nothing later in `init()`, may touch

@@ -362,3 +362,145 @@ the GPT/FAT32 structures. Both the in-kernel PASS line and host-side `HOST-VERIF
   and the per-cluster clone writes).
 - **Metal SD throughput:** the multi-block CMD18/CMD25 path is compiled + verified off-metal (QEMU models no
   Tegra234 SDMMC); its first metal exercise is the attended Orin sitting.
+
+## §INSTALL-SELF — the installer never offers, selects, or erases the device it booted from
+
+**Observed at the bench** (rMBP 2012, 2026-07-29): the machine booted from an SD card in a USB
+reader, and the graphical installer listed *that same card* as a target and offered to erase it.
+
+§INSTALL-SEL had already made target selection real — the engine binds the disk the operator chose,
+not "whatever disk is present" — so the offer was truthful about *which* disk it would destroy. It was
+still an offer to destroy the running system. **Selection correctness and target eligibility are two
+different properties**; this section supplies the second one.
+
+### The identity, and why it is a FAT volume serial
+
+Nothing in this tree carries a block-device identity across the boot handoff. The UEFI bootloader
+knows a firmware handle; the kernel knows an xHCI slot; no mapping exists between them. (The builder's
+own comment said as much: `BootInfo` carried no boot-device handle, "so the kernel cannot learn what
+it booted from".)
+
+What *does* cross the handoff is a byte written on the medium itself — the FAT `BS_VolID` the
+formatter stamped into the boot sector:
+
+| Stage | Where | What happens |
+|-------|-------|--------------|
+| Read | `crates/bootloader` → `read_boot_volume_serial` | Opens `LoadedImage` on the image handle, takes its **device** handle — the same one `get_image_file_system` resolves `kernel.elf` through — opens `BlockIO` on it **non-exclusively** (`GetProtocol`), reads LBA 0, and lifts `BS_VolID` out of the extended BPB. On a partition handle LBA 0 *is* the volume's boot sector. |
+| Carry | `crates/boot-info` → `BootInfo::boot_volume_serial: u32` | New field. **0 is the absent sentinel.** aarch64's `build_boot_info` fills 0 (it does not boot through this bootloader). |
+| Publish | `crates/kernel/src/main.rs` | One call to `install::selfguard::set_boot_volume_serial`, before `memory::init` consumes `boot_info`. Gated exactly like `crate::install`, so a build without an installer is byte-identical to baseline. |
+| Match | `install::selfguard` + `fs::fat::volume_serials` | Reads every FAT volume serial off each candidate disk and compares. |
+
+The `BlockIO` open is deliberately non-exclusive: the firmware's FAT driver holds `BlockIO` on that
+handle `BY_DRIVER`, and an `Exclusive` open would call its `Stop` — tearing down the filesystem the
+bootloader is about to read `kernel.elf` from. Every failure path returns 0. This code exists to stop
+an *erase*; it must never be able to stop a *boot*.
+
+It is a **volume** serial, not a device serial, and the difference is load-bearing in both directions:
+
+- A **byte clone** of the boot media carries the same serial. Our own installer clones boot media
+  (§INSTALL-2, §INSTALL-PI-2), so the collision is real, not theoretical.
+- A **reformat** changes it, so a disk that once held our boot volume and has since been reformatted
+  is a legitimate target again.
+
+### The two layers
+
+1. **UI — shown, marked, not selectable.** `video/instgui.rs` rows carry the verdict, resolved through
+   the same `selfguard::classify` the engine consults (cached per block-registry signature, so the
+   per-frame repaint costs nothing). A matching row is **kept on screen** and tagged ` BOOT` in dimmed
+   text, with a legend (`BOOT = the disk this system booted from. Not installable.`). Excluding it
+   from the list was the alternative; showing it was chosen because an installer that silently hides
+   the operator's own disk sends them hunting for a disk that is not there. Selection *steps over*
+   marked rows (`step_selectable`), the dialog opens on the first selectable row, the shrink-clamp in
+   `service` lands on a selectable row, and `Enter` on a marked row refuses to advance with a witness.
+   When every attached disk is marked, the `Continue` affordance is withdrawn and the screen says to
+   attach another disk.
+2. **Engine — the actual guard.** `install::run_engine` calls `selfguard::refuses` on the target it
+   **bound**, before its first write and *before* the blank-check: "this is the disk you are running
+   from" outranks "this disk is not blank" as a reason to stop, because a blank boot device is still a
+   boot device. Refusal is `InstallError::BootDevice`; nothing is written. The UI filter is not the
+   guard — this is. The unattended witness path has no UI at all and is covered by the same check.
+
+### Matching reads ALL volumes, not the first
+
+`fs::fat::mount_source` is first-match-wins: it returns the first volume that parses and stops. Right
+rule for "mount the boot media", wrong rule for "is this the disk we booted from" — a device whose
+*second* partition is the ESP we booted would go unrecognized and be offered as a target. So
+`fs::fat::volume_serials` enumerates all of them, in the same superfloppy → GPT → MBR order, through
+the same `parse_bpb` gates. The partition-table walks were extracted into `gpt_volume_starts` /
+`mbr_volume_starts` and are shared with the mount path, so the guard can never see a partition the
+mount would not, or miss one it would. The direction of the difference is the safe one: a superset of
+serials can only cause *more* candidates to be refused, never fewer.
+
+### Edge cases, all handled
+
+| Case | Behavior |
+|------|----------|
+| Serial absent / 0 (pre-guard bootloader, non-FAT boot path, aarch64) | Guard **DISARMS** with `:: install: boot volume serial ABSENT (0) — INSTALL-SELF boot-device guard DISARMED ::`. Every candidate stays eligible. Bricking the installer is not a safe failure mode; announcing that the guard protects nothing is. |
+| Two attached volumes with the SAME serial (clones) | **Both refused**, plus a distinct witness naming the collision. The rule is per-candidate, so refusing both is the *absence* of a special case. If two disks both claim to be the volume we are running from, we cannot tell which we would erase, and the safe direction is to erase neither. |
+| Candidate carries no FAT at all | Cannot match; stays a valid target (witnessed as such). |
+| Candidate's `BS_VolID` is 0 | Never excluded. 0 is the absent sentinel on both sides, so an *unstamped* volume is not evidence of anything. |
+| Candidate not in the live registry | Not judged here — the engine's own `bind_id` already refuses it as `TargetGone`. |
+
+### Witness formats
+
+At disk-list build (one line per candidate, emitted once per block-registry signature):
+
+```
+:: install: boot volume serial=0xfabe1afd — INSTALL-SELF boot-device guard ARMED ::
+:: install: boot device global/slot1 (262144 sectors) serial=0xfabe1afd EXCLUDED ::
+:: install: candidate global/slot1 (262144 sectors) 1 FAT volume(s), first serial=0x554e4153 != boot 0xfabe1afd, ELIGIBLE ::
+:: install: candidate global/slot1 (262144 sectors) — no FAT volume, cannot be the boot device, ELIGIBLE ::
+:: install: boot serial=0x… matches N attached volumes (CLONES) — ALL EXCLUDED, refusing to guess which one we booted ::
+```
+
+Engine refusal (defense in depth; should be unreachable through the UI):
+
+```
+:: INSTALL: refusal — target '<vendor>' '<product>' slot=N carries the BOOT volume serial 0x…; refusing to erase the device we booted from => guard OK ::
+```
+
+The bootloader also states its own result, including *why* a disarmed guard is disarmed, so that is a
+diagnosable fact at the bench rather than a mystery:
+
+```
+[ INFO]: boot volume FAT serial 0xfabe1afd (extended BPB BS_VolID)
+[ INFO]: boot volume FAT serial unavailable: <reason> — installer boot-device guard will disarm
+```
+
+### QEMU coverage, and what it cannot cover
+
+`UNAOS_INSTALLDEMO=1 ./arroyo test` runs `selfguard::selftest` before the engine and
+`selfguard::live_media_leg` after it.
+
+- **Decision table (synthetic, substantive).** The rule is pinned over synthetic serial sets: disarmed,
+  match, multi-volume match, no match, no FAT, 0-sentinel, clone collision. Verdict:
+  `:: INSTALL-SELF: guard decision table (…) => PASS ::`
+- **Live media.** The harness boots from an `ide-hd` ESP the kernel has no driver for, and the only
+  disk it enumerates is the installer's own **blank** scratch — so at list-build time there is no FAT
+  volume to match and the live leg **SKIPs** with that reason recorded. *After* the engine formats the
+  scratch, that disk carries a real FAT32 volume, and `live_media_leg` reads its serial off the wire
+  (`0x554e4153`, the formatter's `VOL_ID`) and confirms the guard's answer against the real boot
+  serial (`0xfabe1afd`, QEMU's vvfat constant).
+- **Exclusion on live media, role-swapped.** The harness *cannot attach* a disk whose serial matches
+  the boot volume, so the exclusion path has no live fixture. The leg therefore asks the real
+  comparison with the roles swapped: take a serial actually read off live media and ask whether a boot
+  volume carrying *that* serial excludes this disk. Real bytes, real comparison, and the answer must be
+  `BootDevice` — if it is ever anything else, the guard cannot exclude a boot device no matter what the
+  bootloader reports. Verdict:
+  `:: INSTALL-SELF: live-media exclusion (role-swapped: boot serial := 0x… read off …) => EXCLUDED, PASS ::`
+
+### Known limitations
+
+- **The FAT32 formatter stamps a constant.** `install::fat32::VOL_ID` is `0x554E_4153` ("UNAS") for
+  every volume it writes. So a machine booted from UnaOS-installed media reports that serial, and every
+  *other* UnaOS-installed disk attached to it is excluded as a clone. That is the safe direction and
+  the documented clone behavior, but it is over-broad; giving the formatter a per-install serial (and a
+  matching write-back to the media it clones) is the follow-up.
+- **`parse_bpb` does not gate on `BS_BootSig`.** The kernel's BPB parser reads `BS_VolID` at
+  0x27/0x43 unconditionally, so an unstamped volume yields whatever bytes live there. The bootloader
+  side *does* gate on `BS_BootSig == 0x29` (the byte immediately before `BS_VolID`, at 0x26/0x42). The
+  asymmetry only ever over-matches on the kernel side, and over-matching in a guard costs an excluded
+  target, not an erased one.
+- **Metal is the only place the exclusion path runs end-to-end.** Everything above is QEMU- and
+  synthetic-verified; the bench case that motivated the arc (boot from a USB SD reader, confirm the
+  card is listed, marked, unselectable, and refused by the engine) is an arc-boundary hardware check.

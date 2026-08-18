@@ -52,47 +52,154 @@
 // laws (per-page perms, WXN) are untouched.
 
 // ---------------------------------------------------------------------------------------------
-// Syscall ABI (Linux-aarch64): x8 = number, args x0..x5, return in x0. The kernel SVC path preserves
-// every GPR except x0.
+// Syscall ABI — the ARCH SPLIT (WINX-4).
+//
+// The NUMBERS are shared across arches by law: a syscall number names the same verb everywhere, so the
+// six constants below are declared once and are correct on both. Only the instruction and the register
+// mapping differ, which is exactly what the two `sysabi` modules encapsulate. Everything below this
+// block — the drawing, the formatting, the whole program — is arch-neutral Rust that never mentions a
+// register.
+//
+//   aarch64: x8 = number, args x0..x5, return in x0, `svc #0`. The kernel SVC path preserves every GPR
+//            except x0.
+//   x86_64:  rax = number, args rdi/rsi/rdx, return in rax, `syscall`. The instruction itself clobbers
+//            rcx (the saved RIP) and r11 (the saved RFLAGS), so both are declared clobbered — omitting
+//            them would let the compiler keep a live value in a register the CPU is about to destroy.
 // ---------------------------------------------------------------------------------------------
-const SYS_WRITE: u64 = 1;
-const SYS_EXIT: u64 = 2;
-const SYS_SLEEP_MS: u64 = 5;
-const SYS_GETINFO: u64 = 7;
-const SYS_WIN_CREATE: u64 = 29;
-const SYS_WIN_PRESENT: u64 = 30;
+// ABIFREEZE: the numbers are IMPORTED, not re-typed. This block used to be six local `const`s that
+// nothing compared against the kernel's — see `una_abi`'s divergence ledger for what that cost.
+use una_abi::{SYS_EXIT, SYS_GETINFO, SYS_SLEEP_MS, SYS_WIN_CREATE, SYS_WIN_PRESENT, SYS_WRITE};
 
-#[inline(always)]
-unsafe fn sys1(n: u64, a0: u64) -> u64 {
-    let mut r: u64;
-    core::arch::asm!("svc #0", inout("x0") a0 => r, in("x8") n, options(nostack));
-    r
+// WITSWEEP — REGISTER-SURVIVAL INVARIANT (sys1..sys3): the `in("x1")`/`in("x2")`/`in("x8")`
+// constraints below PROMISE the compiler those registers survive the `svc`. That is sound today only
+// because the kernel's SVC return path restores the full x0-x30 + FP register file (`__vec_svc` →
+// SAVE_GPRS/RESTORE_GPRS in arch/aarch64/exceptions.rs) — the "preserves every GPR except x0" note
+// above is a kernel implementation fact, not an ABI guarantee. The x86 tree already hardens its
+// sysret with a GPR scrub; any future aarch64 SVC-return scrub arc MUST flip these constraints to
+// `inout("x1") a1 => _` (etc.) IN THE SAME COMMIT, or these stubs become undefined behavior. The
+// identical stub set in user-vug/src/main.rs carries the same invariant.
+#[cfg(target_arch = "aarch64")]
+mod sysabi {
+    #[inline(always)]
+    pub unsafe fn sys1(n: u64, a0: u64) -> u64 {
+        let mut r: u64;
+        unsafe { core::arch::asm!("svc #0", inout("x0") a0 => r, in("x8") n, options(nostack)) };
+        r
+    }
+    #[inline(always)]
+    pub unsafe fn sys2(n: u64, a0: u64, a1: u64) -> u64 {
+        let mut r: u64;
+        unsafe {
+            core::arch::asm!(
+                "svc #0",
+                inout("x0") a0 => r,
+                in("x1") a1,
+                in("x8") n,
+                options(nostack),
+            )
+        };
+        r
+    }
+    #[inline(always)]
+    pub unsafe fn sys3(n: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+        let mut r: u64;
+        unsafe {
+            core::arch::asm!(
+                "svc #0",
+                inout("x0") a0 => r,
+                in("x1") a1,
+                in("x2") a2,
+                in("x8") n,
+                options(nostack),
+            )
+        };
+        r
+    }
 }
-#[inline(always)]
-unsafe fn sys2(n: u64, a0: u64, a1: u64) -> u64 {
-    let mut r: u64;
-    core::arch::asm!(
-        "svc #0",
-        inout("x0") a0 => r,
-        in("x1") a1,
-        in("x8") n,
-        options(nostack),
-    );
-    r
+
+/// x86_64: rax = number, args rdi/rsi/rdx, return in rax, `syscall`.
+///
+/// TEARDOWN-1 — THE CLOBBER LIST MUST STATE THE ABI THE KERNEL IMPLEMENTS, not the one SysV describes.
+/// `syscall` itself destroys rcx (the return RIP) and r11 (the saved RFLAGS), and on top of that the
+/// kernel's `sysretq` tail SCRUBS SIX registers — rdi/rsi/rdx/r8/r9/r10 — to zero on the way back to
+/// ring 3 (the U1b B1 no-kernel-pointer-leak rule), on EVERY syscall, unconditionally, regardless of
+/// how many arguments that syscall took, while preserving the callee-saved set across the C
+/// dispatcher. So every stub below, whatever its own arity, declares all six.
+///
+/// These stubs used to declare the argument registers `in(...)`, which promises the asm leaves them
+/// intact — so rustc was entitled to keep a value live in rdi across a `syscall` and reuse it, and it
+/// did. That is the whole reason a second `SYS_GETINFO` read here could report `pid=0`: not a kernel
+/// bug, a stub that lied about what the instruction does. A later fix declared each stub's own
+/// argument registers `inlateout(...) => _` but only named r8/r9/r10 as `lateout` — still an arity
+/// mistake, just a narrower one: `sys1` left rsi/rdx unnamed and `sys2` left rdx unnamed, so the
+/// compiler was still entitled to treat those as surviving the call. Every argument register is
+/// `inlateout(...) => _`, and every one of the six scrubbed registers a given stub does NOT use as
+/// an argument — including rsi/rdx below their own arity, not just r8/r9/r10 — is declared `lateout`.
+#[cfg(target_arch = "x86_64")]
+mod sysabi {
+    #[inline(always)]
+    pub unsafe fn sys1(n: u64, a0: u64) -> u64 {
+        let mut r: u64;
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") n => r,
+                inlateout("rdi") a0 => _,
+                lateout("rsi") _,
+                lateout("rdx") _,
+                lateout("rcx") _,
+                lateout("r11") _,
+                lateout("r8") _,
+                lateout("r9") _,
+                lateout("r10") _,
+                options(nostack),
+            )
+        };
+        r
+    }
+    #[inline(always)]
+    pub unsafe fn sys2(n: u64, a0: u64, a1: u64) -> u64 {
+        let mut r: u64;
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") n => r,
+                inlateout("rdi") a0 => _,
+                inlateout("rsi") a1 => _,
+                lateout("rdx") _,
+                lateout("rcx") _,
+                lateout("r11") _,
+                lateout("r8") _,
+                lateout("r9") _,
+                lateout("r10") _,
+                options(nostack),
+            )
+        };
+        r
+    }
+    #[inline(always)]
+    pub unsafe fn sys3(n: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+        let mut r: u64;
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") n => r,
+                inlateout("rdi") a0 => _,
+                inlateout("rsi") a1 => _,
+                inlateout("rdx") a2 => _,
+                lateout("rcx") _,
+                lateout("r11") _,
+                lateout("r8") _,
+                lateout("r9") _,
+                lateout("r10") _,
+                options(nostack),
+            )
+        };
+        r
+    }
 }
-#[inline(always)]
-unsafe fn sys3(n: u64, a0: u64, a1: u64, a2: u64) -> u64 {
-    let mut r: u64;
-    core::arch::asm!(
-        "svc #0",
-        inout("x0") a0 => r,
-        in("x1") a1,
-        in("x2") a2,
-        in("x8") n,
-        options(nostack),
-    );
-    r
-}
+
+use sysabi::{sys1, sys2, sys3};
 
 #[inline(always)]
 fn write_bytes(p: *const u8, len: usize) {
@@ -164,11 +271,42 @@ unsafe fn put_px(surf: *mut u8, x: i32, y: i32, color: u32) {
     (surf.add(off) as *mut u32).write_volatile(color);
 }
 
+/// Fill a rectangle, CLAMPED TO THE SURFACE BEFORE THE LOOP RUNS. The twin of `user-pulse`'s
+/// `fill_rect`, clamped for the same reason.
+///
+/// The clamp is the loop bound — that is the whole point, not a tidiness pass. With `while y < y0 + h`
+/// the row bound was an unclamped runtime value, and LLVM compiled the row loop to a rotated
+/// `do {} while (y != y0 + h)` over a 64-bit induction variable with no zero-trip guard, while the
+/// `put_px` bounds check inlined beside it stayed 32-bit (`leal`/`orl`/`testl $0xffffff80`). Those two
+/// widths disagree: every row congruent to 0 mod 2^32 passes a 32-bit guard, so an unreachable bound
+/// meant ~2^64 iterations stepping the row pointer 512 B at a time, every store suppressed until the
+/// counter wrapped and exactly one landed at `surf + 2^41`.
+///
+/// Clamping first is what bounds it. `ye` can never exceed `SH`, so the bound is always reachable and
+/// the trip count is bounded by the surface. What the compiler actually emits (verified by disassembly,
+/// not assumed): the exit test is STILL `cmpq`/`jne`, but it is now preceded by a signed zero-trip
+/// guard — `cmpl %ye, %ys; jge <past the loop>` — because `ys > ye` is possible (a negative `h`, a rect
+/// entirely below the surface) and the loop is therefore not provably non-empty. With `0 <= ys < ye <=
+/// SH` established before entry, both bounds are zero-extended to 64-bit from values proven in range,
+/// so the counter cannot outrun the bound and the 32-bit guard beside it can no longer disagree with
+/// the 64-bit pointer.
+///
+/// One STAT-specific note, so the next reader is not misled: this crate's PRE-clamp codegen stepped the
+/// row offset with a 32-bit `addl $0x200`, so its runaway wrapped inside 4 GiB and could not reach
+/// `surf + 2^41`. The clamp moves it to 64-bit pointer stepping, which is only safe BECAUSE the bound is
+/// now clamped and guarded. The accidental protection is replaced by a deliberate one, not removed.
+///
+/// `put_px` keeps its own guard. It is now redundant for every call arriving through here, which is
+/// the intent: belt and braces, and it still guards the callers that plot points directly.
 unsafe fn fill_rect(surf: *mut u8, x0: i32, y0: i32, w: i32, h: i32, color: u32) {
-    let mut y = y0;
-    while y < y0 + h {
-        let mut x = x0;
-        while x < x0 + w {
+    let xs = x0.max(0);
+    let ys = y0.max(0);
+    let xe = x0.saturating_add(w).min(SW);
+    let ye = y0.saturating_add(h).min(SH);
+    let mut y = ys;
+    while y < ye {
+        let mut x = xs;
+        while x < xe {
             put_px(surf, x, y, color);
             x += 1;
         }

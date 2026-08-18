@@ -14,6 +14,20 @@ use tokio::sync::broadcast::Receiver as BroadcastReceiver;
 use bandy::state::AppState;
 use bandy::SMessage;
 
+#[derive(Debug, Clone)]
+pub enum Event {
+    UiReady,
+    LoadHistory { offset: usize },
+    DispatchPayload(String),
+    Input { target: String, content: String, origin: String },
+    ComplexInput { target: String, action: String, payload: String, origin: String },
+    NavSelect(usize),
+    CreateNode { name: String, kind: String },
+    ToggleMatrixNode(String),
+    FocusMatrixSector(String),
+    UpdateMatrixSelection(Vec<String>),
+}
+
 #[cfg(target_os = "macos")]
 use objc2::rc::Retained;
 
@@ -36,33 +50,30 @@ pub type BootstrapPayload = (
 #[cfg(not(target_os = "macos"))]
 pub type BootstrapPayload = NativeView;
 
-#[cfg(all(target_os = "linux", feature = "gtk"))]
-use crate::platforms::gtk::spline::CommsSpline;
-
-#[cfg(target_os = "macos")]
-use crate::platforms::macos::spline::MacOSSpline;
+// use crate::platforms::gtk::spline::CommsSpline;
+// use crate::platforms::macos::spline::MacOSSpline;
 
 /// The platform-neutral entry point to Quartzite's GUI. [`Spline::bootstrap`] is the stable seam
 /// between a workspace snapshot and native rendering; it dispatches to the compile-time-selected
 /// backend under `platforms/`.
 pub struct Spline {
-    #[cfg(all(target_os = "linux", feature = "gtk"))]
-    inner: CommsSpline,
+    // #[cfg(all(target_os = "linux", feature = "gtk"))]
+    // inner: CommsSpline,
 
-    #[cfg(target_os = "macos")]
-    inner: MacOSSpline,
+    // #[cfg(target_os = "macos")]
+    // inner: MacOSSpline,
 }
 
 impl Spline {
     pub fn new() -> Self {
         #[cfg(all(target_os = "linux", feature = "gtk"))]
         return Self {
-            inner: CommsSpline::new(),
+            // inner: CommsSpline::new(),
         };
 
         #[cfg(target_os = "macos")]
         return Self {
-            inner: MacOSSpline::new(),
+            // inner: MacOSSpline::new(),
         };
 
         // For the Qt platform, Spline is entirely stateless.
@@ -86,9 +97,13 @@ impl Spline {
         _workspace_tetra: &bandy::state::WorkspaceState,
     ) -> BootstrapPayload {
         #[cfg(any(all(target_os = "linux", feature = "gtk"), target_os = "macos"))]
-        return self
-            .inner
-            .bootstrap(_window, _tx_event, _app_state, _rx_synapse, _workspace_tetra);
+        {
+            #[cfg(target_os = "macos")]
+            unimplemented!("MacOSSpline is disabled for aether-shell browser path");
+            
+            #[cfg(all(target_os = "linux", feature = "gtk"))]
+            return gtk4::Box::new(gtk4::Orientation::Horizontal, 0).into(); // Fallback, GTK workspace is deprecated
+        }
 
         #[cfg(all(target_os = "linux", feature = "qt"))]
         {
