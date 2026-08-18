@@ -1433,6 +1433,12 @@ test_x86_64() {
 #     never invokes the linker, so the -T/-z flags are inert here — but RUSTFLAGS is part of cargo's
 #     fingerprint, so a check that passed DIFFERENT flags would invalidate the crate's target/ dir and
 #     force a full build-std recompile every time an operator alternated `check` and `kernel8`.
+#     (user-vug is the exception on BOTH arches: its media builds are feature-variant and each lands in
+#     its own `--target-dir` — target/{x86,x86-pinlo,…,arm,arm-pinlo,arm-pinhi} — so these two rows own
+#     the crate's default target/ dir outright. The flags stay mirrored anyway: they are what the
+#     unfeatured image is built with, and a row that drifted from its recipe would be checking a
+#     configuration the media never ships. Both rows check the DEFAULT (adaptive) feature set only; the
+#     two pins are proved by the media builds themselves, which link all three on both arches.)
 #
 # -Z build-std comes from each crate's own .cargo/config.toml [unstable] table, so only
 # -Z json-target-spec is passed here (the .json target specs need it); NIGHTLY_FLAGS is a KERNEL
@@ -2257,6 +2263,78 @@ k8_lock_acquire() {
     trap 'k8_lock_release' EXIT INT TERM
 }
 
+# VUGSTAGE (PARITY §6.6b): one aarch64 image of crates/user-vug, named by $1 (the target/ basename) and
+# built with the cargo features in $2 — the exact twin of build_one_vug_x86 (~line 1068), which has emitted
+# three images since VUGSCENE while this arch emitted one. Same crate, same app logic, same linker-script
+# SHAPE; only the per-arch syscall stubs and the target differ.
+#
+# UVUG-1's original prose, kept because it is still what the program DOES: it maps an off-screen surface
+# (SYS_FB_MAP), spawns 2 EL0 worker threads (SYS_THREAD_SPAWN) that render halves of the scene under a FUTEX
+# frame barrier, presents each frame (SYS_FB_PRESENT), then joins both (SYS_THREAD_JOIN) and prints its
+# `:: UVUG: … ::` witness before exiting 0. Kept AS AN ELF (strip-all preserves the ELF header + program
+# headers + the two PT_LOAD segments) for the kernel's aarch64 loader to validate and map with per-segment
+# permissions. Linker script user-vug.ld (PHDRS: a R+X text segment + a R+W data segment);
+# `-z max-page-size=0x1000` packs the segments on 4 KiB boundaries so the image fits the 16 KiB slot window.
+#
+# `--target-dir` keeps the three cargo builds apart, for the reason build_one_vug_x86 states: the feature set
+# is part of the fingerprint, so a shared directory would rebuild (and relink) the whole crate on every call,
+# and a stale artifact could be picked up by the objcopy of the NEXT image if a build ever failed after the
+# first. The bare-aarch64 target comes from the crate's own .cargo/config.toml (build.target =
+# aarch64-base.json), so — unlike the x86 twin, which must override it — no `--target` is passed here; the
+# artifact lands under `<target-dir>/aarch64-base/release/`.
+build_one_vug_aarch64() {
+    local out="$1" feats="$2"
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    echo -e "${COLOR_YELLOW}⚡ Building EL0 mini-vug static-ELF program (crates/user-vug${feats:+ [$feats]} → target/${out})...${COLOR_RESET}"
+    mkdir -p "${WORKSPACE_DIR}/target"
+    cd "$WORKSPACE_DIR/crates/user-vug"
+    local tdir="${WORKSPACE_DIR}/crates/user-vug/target/arm${feats:+-$feats}"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
+      cargo +nightly build --release -Z json-target-spec --target-dir "$tdir" ${feats:+--features "$feats"}
+    cd "$WORKSPACE_DIR"
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${tdir}/aarch64-base/release/user-vug" \
+      "${WORKSPACE_DIR}/target/${out}"
+    # It must exist, begin with the ELF magic (\x7fELF), and fit the slot window (USER_REGION_SIZE = 16 KiB;
+    # a larger image is BadSize at load). A wrong magic or oversize image is a build failure caught here.
+    [ -s "${WORKSPACE_DIR}/target/${out}" ] || { echo -e "${COLOR_RED}ERROR: ${out} missing/empty — UVUG build failed${COLOR_RESET}"; exit 1; }
+    local umag; umag="$(head -c 4 "${WORKSPACE_DIR}/target/${out}" | od -An -tx1 | tr -d ' \n')"
+    [ "$umag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: ${out} does not start with the ELF magic; first 4 bytes = ${umag}${COLOR_RESET}"; exit 1; }
+    # The e_machine check the x86 twin carries, in its aarch64 form: EM_AARCH64 = 183 = 0x00b7, little-endian
+    # b7 00 at offset 18. Staging an x86 image on Pi media would otherwise be a confusing bench failure
+    # (loader refusal at spawn) rather than an obvious build failure here — and with two arches' images
+    # sharing one target/ directory, a mixed-up basename is exactly the mistake that can happen.
+    local umach; umach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/${out}" | tr -d ' \n')"
+    [ "$umach" = "b700" ] || { echo -e "${COLOR_RED}ERROR: ${out} e_machine is ${umach}, want b700 (EM_AARCH64=183 LE)${COLOR_RESET}"; exit 1; }
+    local usz; usz="$(wc -c < "${WORKSPACE_DIR}/target/${out}" | tr -d ' ')"
+    [ "$usz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: ${out} ${usz} bytes > USER_REGION_SIZE (16384)${COLOR_RESET}"; exit 1; }
+    echo -e "${COLOR_GREEN}✅ static-ELF EL0 mini-vug program: ${out} (${usz} B)${COLOR_RESET}"
+}
+
+# VUGSTAGE: the aarch64 pin table, identical to build_user_vug_x86's — three images out of one source, per
+# the LOD_PIN note in crates/user-vug/Cargo.toml:
+#
+#   VUG.ELF   (no features)  the ADAPTIVE detail ladder. The default; what `vug`/Quarry launch.
+#   VUGC.ELF  (pinlo)        level 0 forever — the CLASSIC wireframe, the A/B baseline that keeps old fps
+#                            numbers comparable across the renderer change.
+#   VUGX.ELF  (pinhi)        LOD_MAX forever — the full per-pixel shard, for measuring the heaviest frame
+#                            this draws on the BCM2711 rather than inferring it from the ladder's choice.
+#
+# `bg`/`run` take a path and no argv on either arch (shell.rs: `match args.first()`), so a build feature is
+# the only channel a pin can travel down — hence three link products rather than one flag. All three names
+# are 8.3-clean and land in the FAT root beside STAT.ELF/PULSE.ELF, so each gets its own IMAGE_SHA256
+# principal and both reach paths work on them unchanged: Quarry's double-click (`.ELF` is launchable — see
+# video/quarry/live.rs) and `bg /fat/VUGX.ELF` at the shell.
+#
+# The aarch64 names carry no `-ARM` suffix (the x86 ones carry `-X86`) because the aarch64 build IS the
+# staged name: the x86 side stages target/VUG*-X86.ELF *as* VUG*.ELF via builder/make-fat-img, while kernel8
+# copies target/VUG*.ELF into the Pi staging dir verbatim.
+build_user_vug_aarch64() {
+    build_one_vug_aarch64 VUG.ELF  ""
+    build_one_vug_aarch64 VUGC.ELF "pinlo"
+    build_one_vug_aarch64 VUGX.ELF "pinhi"
+}
+
 kernel8() {
     k8_lock_acquire
     local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
@@ -2353,29 +2431,9 @@ kernel8() {
     [ "$esz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: ELFHELLO.ELF ${esz} bytes > USER_REGION_SIZE (16384)${COLOR_RESET}"; exit 1; }
     echo -e "${COLOR_GREEN}✅ static-ELF EL0 program: ELFHELLO.ELF (${esz} B)${COLOR_RESET}"
 
-    # UVUG-1: build the static ELF64 EL0 mini-vug program (crates/user-vug) the SAME way as ELFHELLO — keep
-    # it AS AN ELF (strip-all preserves the ELF header + program headers + the two PT_LOAD segments). It maps
-    # an off-screen surface (SYS_FB_MAP), spawns 2 EL0 worker threads (SYS_THREAD_SPAWN) that render halves of
-    # an animated pattern under a FUTEX frame barrier, presents each frame (SYS_FB_PRESENT), then joins both
-    # (SYS_THREAD_JOIN) and prints its `:: UVUG: … ::` witness before exiting 0. Same linker script shape as
-    # ELFHELLO (user-vug.ld's PHDRS: a R+X text segment + a R+W data segment); `-z max-page-size=0x1000`
-    # packs the segments on 4 KiB boundaries so the whole image fits the kernel's 16 KiB slot window.
-    echo -e "${COLOR_YELLOW}⚡ Building EL0 mini-vug static-ELF program (crates/user-vug → target/VUG.ELF)...${COLOR_RESET}"
-    cd "$WORKSPACE_DIR/crates/user-vug"
-    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
-      cargo +nightly build --release -Z json-target-spec
-    cd "$WORKSPACE_DIR"
-    "$TOOLBIN/llvm-objcopy" --strip-all \
-      "${WORKSPACE_DIR}/crates/user-vug/target/aarch64-base/release/user-vug" \
-      "${WORKSPACE_DIR}/target/VUG.ELF"
-    # It must exist, begin with the ELF magic (\x7fELF), and fit the slot window (USER_REGION_SIZE = 16 KiB;
-    # a larger image is BadSize at load). A wrong magic or oversize image is a build failure caught here.
-    [ -s "${WORKSPACE_DIR}/target/VUG.ELF" ] || { echo -e "${COLOR_RED}ERROR: VUG.ELF missing/empty — UVUG build failed${COLOR_RESET}"; exit 1; }
-    umag="$(head -c 4 "${WORKSPACE_DIR}/target/VUG.ELF" | od -An -tx1 | tr -d ' \n')"
-    [ "$umag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: VUG.ELF does not start with the ELF magic; first 4 bytes = ${umag}${COLOR_RESET}"; exit 1; }
-    usz="$(wc -c < "${WORKSPACE_DIR}/target/VUG.ELF" | tr -d ' ')"
-    [ "$usz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: VUG.ELF ${usz} bytes > USER_REGION_SIZE (16384)${COLOR_RESET}"; exit 1; }
-    echo -e "${COLOR_GREEN}✅ static-ELF EL0 mini-vug program: VUG.ELF (${usz} B)${COLOR_RESET}"
+    # UVUG-1 / VUGSTAGE: build the THREE static-ELF64 EL0 mini-vug images (crates/user-vug). See
+    # build_one_vug_aarch64 above for the per-image shape and build_user_vug_aarch64 for the pin table.
+    build_user_vug_aarch64
 
     # BGRUN-2: build the static ELF64 EL0 PERSISTENCE program (crates/user-stat) exactly like UVUG/ELFHELLO
     # — keep it AS AN ELF (strip-all preserves the ELF header + program headers + the two PT_LOAD segments).
@@ -2995,7 +3053,18 @@ kernel8() {
     # the EXEC-1 `run_user_image` path (2 PT_LOAD segments, per-segment W^X); the panel `run /fat/VUG.ELF`
     # runs the same bytes live. Distinct 8.3 name => its own IMAGE_SHA256 principal; never collides with the
     # flat fixtures or ELFHELLO.ELF.
+    #
+    # VUGSTAGE (PARITY §6.6b): the two PINNED siblings ride along — VUGC.ELF (pinlo, the classic wireframe
+    # baseline) and VUGX.ELF (pinhi, the full per-pixel shard). x86 media has carried all three since
+    # VUGSCENE; this closes the last of that gap on the Pi. They are launched exactly like VUG.ELF —
+    # `bg /fat/VUGX.ELF` at the shell, or a double-click in Quarry's list, both of which take any `.ELF` on
+    # the volume — so no kernel change is needed for them to be reachable, only these bytes on the FAT.
+    # Cost against the 64 MiB image is the three sizes printed by build_user_vug_aarch64 above (~10 KiB
+    # each): under 0.05% of the volume, and the UVUG witness still reads VUG.ELF, unchanged.
     cp "${WORKSPACE_DIR}/target/VUG.ELF" "$KERNEL8_DIR/VUG.ELF"
+    cp "${WORKSPACE_DIR}/target/VUGC.ELF" "$KERNEL8_DIR/VUGC.ELF"
+    cp "${WORKSPACE_DIR}/target/VUGX.ELF" "$KERNEL8_DIR/VUGX.ELF"
+    echo -e "${COLOR_GREEN}✅ vug images staged: VUG.ELF ($(wc -c < "$KERNEL8_DIR/VUG.ELF" | tr -d ' ') B, adaptive) + VUGC.ELF ($(wc -c < "$KERNEL8_DIR/VUGC.ELF" | tr -d ' ') B, pinlo) + VUGX.ELF ($(wc -c < "$KERNEL8_DIR/VUGX.ELF" | tr -d ' ') B, pinhi)${COLOR_RESET}"
 
     # BGRUN-2: carry the persistence static ELF64 onto the boot media as STAT.ELF (make-pi-img.sh ditto's
     # the whole staging dir). The BGRUN-ST persistence leg reads it back off the SD through the VFS and

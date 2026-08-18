@@ -515,9 +515,41 @@ missing the ways to REACH it, and the headroom to run it at full detail.**
 | # | Gap | Sites | Scope |
 |---|---|---|---|
 | 6.6a | **`vug` does not launch on the Pi** | `shell.rs:5007` (`bare_exec`, `#[cfg(target_arch = "x86_64")]`), `shell.rs:2509` (`Facts::exec = cfg!(x86_64)`), `shell.rs:2899` (the `Plan::Exec` arm, whose `not(x86_64)` branch prints *"Unknown command."*) | Typing `vug` on the Pi prints **"Unknown command."** — verbatim the failure Peter reported at the bench on x86, still shipping on aarch64. The operator must type `bg /fat/VUG.ELF`. **This is also the gate on the shard itself:** VUGSCENE renders only when `overlay = detached \|\| interactive`, and `detached` is bit 0 of the info-page flags set by `bg` — so the launch path *is* the drawing path. `spawn_user_image_bg` already exists on aarch64 (`arch/aarch64/syscall.rs:8145`); only the resolver/dispatch half is missing, and the `not(x86_64)` arm was left in place precisely so "the compiler points here" when a loader arrives. **Smallest change with the largest visible payoff. Start here.** |
-| 6.6b | **Pi media stages only one vug image** | `arroyo:2344-2359` (`build_user_aarch64` builds one unfeatured `VUG.ELF`), `arroyo:2876` (stages that one file); cf. `arroyo:1034-1079` `build_one_vug_x86` emitting three | x86 media carries `VUG.ELF` (adaptive), `VUGC.ELF` (`pinlo`, classic baseline) and `VUGX.ELF` (`pinhi`, full per-pixel shard). **Pi media has neither `VUGC.ELF` nor `VUGX.ELF`**, so the pinned-detail images — the ones that show the shard at full density and give the A/B baseline — cannot be run on the Pi at all. Build-plumbing only; the crate already builds for aarch64 under both feature pins. |
+| 6.6b | ~~**Pi media stages only one vug image**~~ — **CLOSED**, `exec-vugstage`, see §6.6b-closed | `arroyo`: `build_one_vug_aarch64` + `build_user_vug_aarch64` (new — the twin of `build_one_vug_x86`), called from `kernel8` where the single inline `VUG.ELF` recipe used to sit; the FAT staging block copies all three into `$KERNEL8_DIR` | x86 media carries `VUG.ELF` (adaptive), `VUGC.ELF` (`pinlo`, classic baseline) and `VUGX.ELF` (`pinhi`, full per-pixel shard). **Pi media had neither `VUGC.ELF` nor `VUGX.ELF`**, so the pinned-detail images — the ones that show the shard at full density and give the A/B baseline — could not be run on the Pi at all. Build-plumbing only, and the row's own claim held: the crate links for aarch64 under both pins with no source change. |
 | 6.6c | ~~**No scheduler placement/steal repair on the Pi**~~ **LANDED — `exec-vugspread`, see §6.7** | `sched_spread.rs` (new, shared); `arch/aarch64/sched.rs`; `arch/x86_64/sched.rs` (delegation only) | The LOD ladder self-tunes off achieved fps, so **less CPU headroom settles the shard at a LOWER detail rung — the Pi literally draws a simpler scene.** The row was written as "placement AND steal"; §6.7 shows the Pi already had a deeper PLACEMENT lattice than x86 (SPREAD-3..14), and what it lacked was the STEAL half — the only correction that can reach a thread which never parks. That half is now ported. |
 | 6.6d | ~~**No damage-present on the Pi**~~ — **CLOSED**, `exec-presentrows` | `SYS_WIN_PRESENT_ROWS` (33) dispatched at `arch/x86_64/syscall.rs:2594`; now also at `arch/aarch64/syscall.rs` (`sys_win_present_rows`, beside `sys_win_present`) | The Pi answered `-ENOSYS` and `user-vug` fell back to a whole-box present. Ported: same number, same argument shape, same errnos in the same order, band range-checked against the presenting row's own `h` under the hold that proved ownership. See §6.6d-closed below for the correction the port forced on this row's own framing. |
+
+#### 6.6b-closed — three images on the Pi FAT, and the falsifier that proves the pin travelled
+
+`exec-vugstage` mirrored the x86 three-image build onto aarch64. `arroyo` gained
+`build_one_vug_aarch64 <out> <feats>` — the same shape as `build_one_vug_x86`: one cargo build per
+feature set, each in its own `--target-dir` (`crates/user-vug/target/{arm,arm-pinlo,arm-pinhi}`, because
+the feature set is part of cargo's fingerprint and a shared dir would relink the crate on every call),
+then `llvm-objcopy --strip-all` into `target/<out>`. Four assertions per image, one of them new on this
+arch: **e_machine must read `b700` (EM_AARCH64 = 183 LE)**, the aarch64 form of the guard the x86 twin
+already carried — both arches' images share one `target/` directory, so a mixed-up basename is exactly
+the mistake that would otherwise surface as a loader refusal at the bench rather than a build failure.
+
+The staged result, from `mdir` on a freshly built `UnaOS-pi4-baremetal.img`:
+
+| FAT name | pin | bytes | sha256 (first 24) |
+|---|---|---|---|
+| `VUG.ELF` | *(none)* — adaptive ladder | 12568 | `8595824d2dca2fd454f04d3c` |
+| `VUGC.ELF` | `pinlo` — level 0, classic wireframe | 12568 | `3da5602410c46bde94850a2a` |
+| `VUGX.ELF` | `pinhi` — `LOD_MAX`, full per-pixel shard | 12568 | `fe271640abc079af52bbe73c` |
+
+**Equal sizes are not equal images**, and the three hashes are the first half of saying so. The second
+half is a falsifier that reads the pin rather than the bytes: `LOD_PIN` is `Some(_)` under either
+feature, so `LOD_PIN.is_none()` is a compile-time-foldable false and the `[vuglod] lvl=` ladder trace
+becomes dead code. `strings` finds that literal in `VUG.ELF` and in **neither** pinned image — the pin
+travelled, and the equal sizes are just the 4 KiB segment padding `-z max-page-size=0x1000` imposes.
+Cost to the media: 25 KiB of the 64 MiB image, 0.04%.
+
+**No kernel change was needed for reach**, which is what makes this row build-plumbing only. Both launch
+paths take any `.ELF` on the volume by name: `bg /fat/VUGX.ELF` at the shell, and Quarry's double-click
+(`video/quarry/live.rs` treats `.ELF`/`.BIN` as launchable and hands the image to the same
+`spawn_user_image_bg` the `bg` verb calls). Putting the bytes in the FAT root *is* the port. The UVUG
+witness still reads `VUG.ELF` and is unchanged — knob-off `kernel8-test` stayed at 117/117.
 
 #### 6.6d-closed — what the port delivers, and the claim in the row above that was wrong
 
