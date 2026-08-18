@@ -2392,6 +2392,104 @@ floor that reads `cores-used=1` on every boot, not occasionally — the leg is a
 gives: the only site that emits it on raspi4b runs before any EL0 task exists. The numbers that matter
 are metal.)
 
+### SPREADTUNE — the brake was measuring the wrong clock (aarch64, `exec-spreadtune`)
+
+`exec-spreadtune`, off `180375ec`. The tune the §6.8f ruling called for, taken on the mechanism
+rather than on a constant. **No number in `sched_spread.rs` changes, and neither does the floor.**
+
+**The evidence, and why it was read wrong.** Two metal sittings meet §6.7's revert criterion for the
+relaxed floor on their face — PA42 boot5 `steal=1600 d1=1251 remig=1585 cool=68598` and PA44
+`steal=1121 remig=1107 d1=879`, i.e. `remig/steal ≈ 0.99` with `cool` climbing beside it. That is
+also the convicted mechanism behind the vug fps swing (25–41) the bench reports as jerky: the worker
+migrates, warms, is remigrated, repeats.
+
+**First question asked, because the brief demanded it: is the cooldown actually consulted?** Yes.
+`steal_one` calls `sched_spread::steal_cooled` on every candidate and bumps `cool` on every refusal;
+the brake is wired and firing. The leak is elsewhere, and it is structural.
+
+**The convicted defect: the governed population has TWO movers, and the brake only ever saw one.**
+VUGSPREAD-PI's own change #1 made `spawn_user_thread` mark an EL0 thread `steal_ok = true`. Such a
+thread also has `user_entry != 0`, so it is simultaneously:
+
+* **steal-eligible** — `try_steal` may move it, and stamps `migrate_ms` when it does; and
+* **an EL0 task** — so it also travels `make_ready`'s SPREAD-4 rewake lane, which retargeted
+  `task.cpu` and stamped **nothing**.
+
+So the residency window the brake enforces was measured from the last **steal**, never from the last
+**move**. A worker stolen onto c1, rewake-placed back onto c2 five milliseconds later, then stolen
+again the instant its stale steal-stamp aged out, pays three migrations while the brake accounts for
+one residency. The two correctors were overruling each other inside the very window the brake exists
+to guarantee, and neither could see the other. Before VUGSPREAD-PI the populations were disjoint
+(every EL0 task was `steal_ok = false`), which is exactly why the brake was sound when written and
+stopped being sound when the steal half landed.
+
+**And `remig` cannot falsify anything on its own.** It counts steals of a task that has *ever* moved.
+Once every steal-eligible worker has migrated once — which a small, long-lived worker pool reaches in
+the first second — `remig/steal → 1` is arithmetically forced no matter how strong the brake is. The
+ratio is a saturation artefact, not a measurement. `cool` compounds this: `steal_one`'s `position`
+closure bumps it once per *cooled candidate inspected per scan*, over millions of idle passes, so
+`cool = 42 × steal` says nothing about suppression pressure either. The revert criterion was built on
+two fields that cannot distinguish a working brake from a broken one.
+
+**The tune: both movers arm one clock.** `make_ready`'s rewake branch now calls `note_migration` and
+stamps `task.migrate_ms`, gated on `task.steal_ok` — exactly the population `steal_cooled` governs (a
+pinned EL0 slot task can never be stolen, so stamping it would only pollute the new statistics). A
+task just placed anywhere, by either lane, owns its new core for its cooldown window before the other
+lane may take it back. That is the residency contract `steal_one`'s doc-comment already claimed;
+it is now true for the whole move population instead of half of it.
+
+`migrations` is deliberately **not** bumped by a rewake move. The escalation ladder counts steal-lane
+corrections of one task; a rewake move is a different corrector's decision, with its own escapement at
+`PLACE_REFRESH_MS`/`REWAKE_MIN_PARK_MS`. A rewake move therefore can never drive a task to the 256 ms
+terminal window on its own.
+
+**The SMP-placement invariant is held, by construction.** The floor is untouched, no core becomes less
+visible as a victim, and `d1` — the floor repair's own attribution, 879–1251 on metal — is unaffected.
+More to the point, the change **cannot reach the population VUGSPREAD-PI was built for**: a worker
+that spins flat out never parks, never enters `make_ready`, and behaves identically. The tasks the new
+stamp governs are precisely the ones that already had a corrector.
+
+**The price, stated.** A task whose *first* move came from the rewake lane now waits one base window —
+16 ms, a single frame — before a corrective steal may take it, where before it was immediately
+eligible. The "first corrective steal is never delayed" property is preserved for a task that has
+never moved at all (`migrate_ms == 0`), which is the case the property was written for.
+
+**x86 is not changed** (lane discipline: this seat owns `arch/aarch64`). `arch/x86_64/sched.rs` has
+the same two-mover shape and the same leak; `sched_spread.rs` is untouched by this arc precisely so
+that the rmbp seat's decision stays open.
+
+#### The wire test
+
+`[spread4]` gains four raw words after `pack=`, and they replace `remig`/`cool` as the reading:
+
+```
+… steal= d1= remig= cool= pack= rwstamp= residn= residmin=Nms residavg=Nms
+```
+
+* `rwstamp` — rewake-lane moves that armed the brake, i.e. **the size of the closed leak**. `rwstamp`
+  comparable to `steal` is the direct measurement that the brake was seeing roughly half this
+  population's moves.
+* `residn` / `residmin` / `residavg` — residencies **ended across both movers**, in milliseconds: the
+  ping-pong period itself, as a duration. `residn` is the sample count that makes the other two
+  legible; a `residn` of zero prints `residmin=0ms residavg=0ms` rather than a sentinel.
+* **Reading rule.** `residavg` well above `STEAL_COOLDOWN_MS` with `residmin` at or above it is a
+  fleet that settles. `residavg` collapsing toward single-digit milliseconds while `steal` climbs is
+  the ping-pong — now visible as a duration rather than inferred from a ratio that cannot fall. A
+  rewake-lane move may legitimately end a short residency (its own escapement bounds it, not this
+  one), so read `residmin` *with* `rwstamp`.
+
+**The metal falsifier, and QEMU's honest limit.** The verdict is the next metal boot: `[vugfps] wf`
+spread narrowing, with `residavg` risen and `[spread4]`'s shape changed. **QEMU raspi4b cannot supply
+it** — no Group-1 IRQs or IPIs, so no real SMP contention shape — and on that host the `[spread4]`
+census reads all-zero for the reason the VUGSPREAD-PI section above already records: the only site
+that emits it on raspi4b runs before any EL0 task exists. A QEMU capture therefore proves the fields
+are wired and the fleet did not regress. It does not judge the tune.
+
+**Knob-off behaviour is NOT byte-identical, and that is deliberate.** `try_steal` and `make_ready` are
+unconditional scheduler paths — the spread machinery rides no knob; only its `[smpbal]`/`[spread4]`
+per-move witness lines are `pi`-gated. A scheduler tune that only applied under a video knob would be
+the wrong shape.
+
 ### Orphan-reaper wake on enqueue (aarch64, SCHED-4b)
 
 **SCHED-4 sleep_ticks regression** (U11-reap FAIL, timer never ticks in QEMU) bisected and fixed by SCHED-4b (`d7631117`): semaphore wake on orphan enqueue — ~0% idle duty metal-confirmed (c2=0% P31b), U11-reap PASS restored.

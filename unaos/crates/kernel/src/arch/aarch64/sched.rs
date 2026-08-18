@@ -3611,6 +3611,21 @@ fn make_ready(mut task: Box<Task>) {
                 slot_res_leave(home, task.user_ttbr0);
                 slot_res_enter(target, task.user_ttbr0);
                 task.cpu = target as u32;
+                // SPREADTUNE — ARM THE STEAL BRAKE ON A REWAKE MOVE. This is the whole behavioural
+                // change of the arc, and the block above `SPREAD15_RWSTAMP` carries the argument:
+                // an EL0 THREAD is `steal_ok`, so it has two movers, and a cooldown measured only
+                // from the last STEAL leaves the other mover's placements unprotected — the task is
+                // yanked back inside the residency window the brake exists to guarantee. Gated on
+                // `steal_ok` because that is exactly the population `steal_cooled` governs: a pinned
+                // EL0 SLOT task can never be stolen, so stamping it would only pollute `residmin`.
+                // `migrations` is NOT bumped — the escalation ladder counts steal-lane corrections
+                // of one task, and a rewake move is a different corrector's decision.
+                if task.steal_ok {
+                    let now_ms = cyc_to_ms(now);
+                    note_migration(task.migrate_ms, now_ms);
+                    task.migrate_ms = now_ms;
+                    SPREAD15_RWSTAMP.fetch_add(1, Ordering::Relaxed);
+                }
                 SPREAD4_REWAKE.fetch_add(1, Ordering::Relaxed);
                 #[cfg(feature = "pi")]
                 if SPREAD4_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < SPREAD4_LOG_MAX {
@@ -4947,6 +4962,95 @@ static SPREAD15_D1: AtomicU64 = AtomicU64::new(0);
 /// which is the reading an idle QEMU battery is expected to produce.
 static SPREAD15_PACK: AtomicU64 = AtomicU64::new(0);
 
+// ── SPREADTUNE — THE COOLDOWN WAS BLIND TO HALF THE MOVES IT WAS BUILT TO DAMP ────────────────
+//
+// The metal readings this tune was opened on — PA42 boot5 `steal=1600 d1=1251 remig=1585 cool=68598`
+// and PA44 `steal=1121 remig=1107 d1=879` — read `remig/steal ≈ 0.99` with `cool` climbing beside
+// it, which is §6.7's revert criterion for the relaxed floor. The criterion is not wrong about the
+// ping-pong; it is wrong about which mechanism is failing, and the code says which.
+//
+// `steal_cooled` IS consulted — `steal_one` calls it on every candidate and each refusal bumps
+// `cool`, so the brake is wired and firing. What the brake cannot see is that ITS OWN POPULATION HAS
+// A SECOND MOVER. `spawn_user_thread` marks an EL0 thread `steal_ok: true` (VUGSPREAD-PI's whole
+// delta) AND `user_entry != 0`, so a vug worker is simultaneously:
+//
+//   * steal-eligible — `try_steal` may move it, and stamps `migrate_ms` when it does; and
+//   * an EL0 task — so it ALSO travels `make_ready`'s SPREAD-4 rewake lane, which moved `task.cpu`
+//     and did NOT stamp `migrate_ms`.
+//
+// So the residency window the brake enforces was measured from the last STEAL, never from the last
+// MOVE. A worker stolen onto c1, rewake-placed back onto c2 five milliseconds later, then stolen
+// again the instant its stale steal-stamp aged out, pays three migrations while the brake sees one
+// residency — and `remig` counts every steal of a task that has EVER moved, which after the first
+// pass is every steal of every worker. `remig` tracking `steal` is therefore the FORCED reading of a
+// saturated population under two uncoordinated correctors, not a measurement of brake strength.
+//
+// THE TUNE IS THEREFORE A STAMP, NOT A CONSTANT. No number in `sched_spread` changes. Both movers
+// now arm one clock: a task just placed anywhere, by either lane, owns its new core for its cooldown
+// window before the other lane may take it back. That is the residency contract `steal_one`'s own
+// doc-comment already claims ("so it actually RUNS on its new home"), made true for the whole move
+// population instead of half of it.
+//
+// WHAT THIS DELIBERATELY DOES NOT DO — the SMP-placement invariant. It does not narrow the floor,
+// touch `steal_floor`, or make any core less visible as a victim; `d1` (the floor's own attribution,
+// 879–1251 on metal) is untouched and the packing repair still fires. And it does not reach the
+// population VUGSPREAD-PI was built for: a worker that spins flat out never parks, so it never
+// enters `make_ready`'s rewake lane at all and its behaviour here is unchanged. The tasks the new
+// stamp governs are exactly the ones that ALREADY have a corrector — the rewake lane, with its own
+// escapement at `PLACE_REFRESH_MS`/`REWAKE_MIN_PARK_MS` — and the change is that the steal lane
+// stops overruling that corrector inside its own residency window.
+//
+// The price, stated: a task whose FIRST move came from the rewake lane now waits one base window
+// (16 ms, a single frame) before a corrective steal may take it, where before it was immediately
+// eligible. `migrations` is deliberately NOT bumped by a rewake move, so the escalation ladder still
+// counts only what it always counted — steal-lane corrections of the same task — and a rewake move
+// can never drive a task to the 256 ms terminal window on its own.
+//
+// x86 is NOT changed here (lane discipline: this seat owns `arch/aarch64`). `arch/x86_64/sched.rs`
+// has the same two-mover shape and the same leak; closing it there is the rmbp seat's call, and the
+// shared policy in `sched_spread` is untouched by this arc precisely so that decision stays open.
+
+/// SPREADTUNE — rewake-lane moves that ARMED the cooldown clock, i.e. the migrations that were
+/// invisible to the brake before this arc. Reads zero on a build with no steal-eligible EL0 thread;
+/// its climb beside `steal` is the SIZE of the leak that was closed, and `rwstamp` comparable to
+/// `steal` says the brake was seeing roughly half of this population's moves.
+static SPREAD15_RWSTAMP: AtomicU64 = AtomicU64::new(0);
+
+/// SPREADTUNE — SHORTEST residency any steal-eligible task has ended, in ms, across BOTH movers: the
+/// ping-pong period itself, in the only units that make it falsifiable. `u64::MAX` until the first
+/// measured residency; `[spread4]` prints `0` while `residn` is zero rather than the sentinel. A
+/// brake that holds cannot show a residency below `STEAL_COOLDOWN_MS` for a STEAL-lane move; a
+/// rewake-lane move may legitimately be shorter (its own escapement, not this one, bounds it), so
+/// read `residmin` WITH `rwstamp` rather than as a hard floor.
+static SPREAD15_RESID_MIN: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// SPREADTUNE — sum of ended residencies in ms, over [`SPREAD15_RESID_N`] samples. Kept as a pair so
+/// the witness can print a mean without putting a division on the move path.
+static SPREAD15_RESID_SUM: AtomicU64 = AtomicU64::new(0);
+
+/// SPREADTUNE — how many residencies have been measured (moves of a task that had moved before). The
+/// denominator for `residavg`, and the honest sample count beside `residmin`.
+static SPREAD15_RESID_N: AtomicU64 = AtomicU64::new(0);
+
+/// SPREADTUNE — close out the residency a task is ENDING, at either mover. `prev_ms` is the task's
+/// outgoing `migrate_ms` (`0` = never moved, so no residency exists and nothing is counted); the
+/// caller stamps the new value itself, because only it owns the `Box`.
+///
+/// Called from `try_steal` and from `make_ready`'s SPREAD-4 rewake for exactly one reason: the
+/// cooldown is a property of how long the task SAT somewhere, not of which lane moved it. Relaxed
+/// atomics off any lock — these are introspection counters, and a lost race costs one sample.
+fn note_migration(prev_ms: u64, now_ms: u64) {
+    if prev_ms == 0 {
+        return; // never moved before: there is no residency to attribute
+    }
+    let resid = now_ms.saturating_sub(prev_ms);
+    SPREAD15_RESID_SUM.fetch_add(resid, Ordering::Relaxed);
+    SPREAD15_RESID_N.fetch_add(1, Ordering::Relaxed);
+    let _ = SPREAD15_RESID_MIN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |m| {
+        if resid < m { Some(resid) } else { None }
+    });
+}
+
 /// SMP-BAL — an idle `cpu` (empty local queue) tries to steal ONE steal-eligible ready task from the
 /// most-loaded online core. Returns `true` if a task was moved onto `cpu`'s queue (the caller then loops
 /// and dispatches it), `false` if there was nothing worth stealing. IRQ-masked throughout (matching the
@@ -5022,6 +5126,10 @@ fn try_steal(cpu: usize) -> bool {
     if mig > 1 {
         SPREAD15_REMIG.fetch_add(1, Ordering::Relaxed);
     }
+    // SPREADTUNE — the residency this move ENDS, priced before the stamp overwrites it. Since the
+    // rewake lane now stamps too, `migrate_ms` here is the last time this task was placed by ANY
+    // lane, so the number is the real inter-move gap rather than the steal-to-steal gap.
+    note_migration(task.migrate_ms, now_ms);
     task.migrate_ms = now_ms;
     if victim_depth == 1 {
         SPREAD15_D1.fetch_add(1, Ordering::Relaxed); // the old constant floor would have refused this
@@ -7308,13 +7416,31 @@ fn el0live_tick() {
 ///     climbs — brake refusing and serving the same oscillation. An idle battery with no EL0 and no
 ///     backlog reads all five at or near zero, which is the wiring proof, exactly as the `live`
 ///     columns' zero baseline is.
+///   * SPREADTUNE — `rwstamp` / `residn` / `residmin` / `residavg`: the tune's own attribution, and
+///     the correction to the reading rule above it. `remig` tracking `steal` is NOT by itself the
+///     revert criterion any more, because a saturated worker population forces that ratio to 1
+///     whatever the brake does (every worker has moved once, so every later steal is a `remig`). The
+///     question the brake actually answers is HOW LONG A TASK GETS TO SIT, and that is `residmin` /
+///     `residavg`, measured across BOTH movers — the steal lane and SPREAD-4's rewake lane, which
+///     until this arc moved steal-eligible EL0 threads without arming the cooldown at all. Read as a
+///     set: `rwstamp` is the size of the closed leak (how many moves the brake could not see
+///     before); `residn` is the sample count that makes the other two legible; `residavg` well above
+///     `STEAL_COOLDOWN_MS` with `residmin` at or above it is a fleet that settles, and `residavg`
+///     collapsing toward single-digit milliseconds while `steal` climbs is the ping-pong, now
+///     visible as a DURATION rather than inferred from a ratio that cannot fall. The metal
+///     falsifier for the tune is this pair rising while `[vugfps] wf` stops swinging; QEMU raspi4b
+///     cannot supply it (no Group-1 IPIs, no real SMP contention shape), so a QEMU capture proves
+///     only that the fields are wired and the fleet did not regress.
 ///
 /// Reads only, lock-free, safe from any core. Not `pi`-gated, matching `pulse5_witness` beside it: it
 /// is one introspection line on a path that already prints one, and the counters it reads exist on
 /// every aarch64 build (they simply stay zero where there is no EL0).
 fn spread4_witness() {
+    // SPREADTUNE — read ONCE: `residn` is both a printed field and the divisor for `residavg`, and a
+    // second load could race a concurrent move into a division by a different sample count.
+    let resid_n = SPREAD15_RESID_N.load(Ordering::Relaxed);
     serial_println!(
-        "[spread4] live c0={}/{} c1={}/{} c2={}/{} c3={}/{} rewake={} stay={} short={} refresh={} margin={} minpark={}ms steal={} d1={} remig={} cool={} pack={}",
+        "[spread4] live c0={}/{} c1={}/{} c2={}/{} c3={}/{} rewake={} stay={} short={} refresh={} margin={} minpark={}ms steal={} d1={} remig={} cool={} pack={} rwstamp={} residn={} residmin={}ms residavg={}ms",
         el0_active(0),
         EL0_RESIDENTS[0].0.load(Ordering::Relaxed),
         el0_active(1),
@@ -7334,6 +7460,12 @@ fn spread4_witness() {
         SPREAD15_REMIG.load(Ordering::Relaxed),
         SPREAD15_COOL.load(Ordering::Relaxed),
         SPREAD15_PACK.load(Ordering::Relaxed),
+        SPREAD15_RWSTAMP.load(Ordering::Relaxed),
+        resid_n,
+        // The sentinel is never printed: no sample means no residency has been measured, and `0` is
+        // the honest reading of that beside `residn=0` (which is what makes it interpretable).
+        if resid_n == 0 { 0 } else { SPREAD15_RESID_MIN.load(Ordering::Relaxed) },
+        if resid_n == 0 { 0 } else { SPREAD15_RESID_SUM.load(Ordering::Relaxed) / resid_n },
     );
     spread7_witness();
     spread10_witness();

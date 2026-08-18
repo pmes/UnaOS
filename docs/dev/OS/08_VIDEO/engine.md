@@ -13682,6 +13682,25 @@ discriminator; this shows it is neither.
   capture, `torn=` up to 149 and `presspread=` 58…407 — ten lines that would each have been a
   forbidden hit before this change, every one of them excluded on the field.
 
+### Name collision, resolved — this section is NOT the scheduler's spread
+
+`presspread=` above is a **video** field: the ratio of a window's slowest present to its fastest, used
+to tell a slow copy from a suspended host. It has nothing to do with **VUGSPREAD**, the work-stealing
+repair in `sched_spread.rs` + `arch/*/sched.rs`, whose wire is `[spread4] steal= d1= remig= cool=
+pack=`. The two arrived a day apart and share a word; nothing else. Recorded here because a brief
+sent a session to this section looking for the scheduler's design, and the next one should not lose
+the same hour.
+
+The scheduler side's ping-pong tune (`exec-spreadtune`, off `180375ec`) is written up where its
+mechanism lives — **[scheduler.md § SPREADTUNE — the brake was measuring the wrong clock](../02_KERNEL_CORE/scheduler.md)**,
+with the standing design in § *The steal half, ported to the Pi* and the revert criterion in
+[PARITY.md §6.7 / §6.8f](PARITY.md). The one-line summary for a reader who got here by grepping
+"spread": the steal cooldown measured residency from the last *steal*, while `make_ready`'s SPREAD-4
+rewake lane moved the same steal-eligible EL0 threads without arming it at all. Both movers now stamp
+one clock, and `[spread4]` gained `rwstamp= residn= residmin= residavg=` so residency is readable as a
+duration instead of inferred from `remig`/`steal` — a ratio that saturates at 1 and cannot falsify
+anything. **The video stack is untouched by that arc.**
+
 ---
 ### WPACE-TEXT — the present-boundary shadow (GR27 round 2)
 
