@@ -1989,6 +1989,24 @@ const BT_HCI_REMOTE_OOB_NEG_REPLY: u16 = 0x0433;
 /// traffic to narrow away, and the provenance note on `BT_EVENT_MASK_LE` applies here unchanged.
 #[cfg(feature = "btc")]
 const BT_EVENT_MASK_SSP: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 0x3F, 0x20];
+/// BT-C1 — the event mask the INQUIRY needs, and why bit 46 is not optional. The mask in force
+/// when C1 runs is `BT_EVENT_MASK_LE`, whose octet 5 is 0x1F — bits 40..44. `Extended Inquiry
+/// Result` (event 0x2F) is bit **46**, and it is CLEAR there. A controller whose Inquiry_Mode is
+/// 0x02 delivers EVERY response as 0x2F, so with bit 46 clear an inquiry runs its full length,
+/// emits its `Inquiry Complete` (bit 0, set) and reports NOTHING — a clean, silent, entirely
+/// wrong "the room is empty", which is exactly the shape gr27 flew (responses=0,
+/// read_to_term=true, events_read accounting to the command statuses alone). Octet 5 becomes
+/// 0x1F | 0x40 = 0x5F; bit 61 (LE Meta, octet 7 = 0x20) is carried from L2 unchanged so nothing
+/// L2 opened is narrowed. Nothing else moves.
+#[cfg(feature = "btc")]
+const BT_EVENT_MASK_C1: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x5F, 0x00, 0x20];
+/// BT-C1 — `HCI_Read_Inquiry_Mode`: OGF 0x03 / OCF 0x0044 => opcode 0x0C44. No parameters;
+/// returns Status(1) Inquiry_Mode(1). READ-ONLY, and it is the single byte the inquiry-deafness
+/// investigation lacks: 0x00 standard (results as 0x02), 0x01 with RSSI (0x22), 0x02 RSSI+EIR
+/// (0x2F — the shape bit 46 was masking). This arc has never measured this Broadcom ROM's
+/// power-on mode; the spec's reset default (0x00) was an assumption, not a reading.
+#[cfg(feature = "btc")]
+const BT_HCI_READ_INQUIRY_MODE: u16 = 0x0C44;
 /// BT-SSP — IO_Capability 0x03 = NoInputNoOutput (Vol 4 Part E §7.1.29). The truth about this
 /// machine DURING BOOT: the compositor may exist but no consent UI does, so claiming a display
 /// or a yes/no button would promise an interaction this stage cannot deliver. NoInputNoOutput on
@@ -6951,6 +6969,45 @@ impl Controller {
             core::str::from_utf8(&bt_addr_render_msb(&BT_L3_PEER_ADDR_BYTES))
                 .unwrap_or("??:??:??:??:??:??")
         );
+        // ---- 0a. the mode this controller is actually in — READ, never assumed -----------------
+        // BT-C1-MASK: both commands run BEFORE HCI_Inquiry, so no cancel obligation exists on any
+        // failure arm; `bt_hci_command_ex` is the same helper the SSP stage's mask write uses, so
+        // the `armed`/`toggle` invariants hold by construction. The harvest needs no change — 0x2F
+        // is already decoded (defensively, its own note says, because no mask enabled it — that
+        // defensive decode is what this write turns live).
+        let mut rp = [0u8; 8];
+        match self.bt_hci_command_ex(
+            t, intf, e, toggle, BT_HCI_READ_INQUIRY_MODE, &[], &mut rp, armed,
+        ) {
+            Some(n) if n >= 2 && rp[0] == 0x00 => serial_println!(
+                ":: bt-c1: [{}] HCI_Read_Inquiry_Mode (0x0C44) status=0x00 inquiry_mode={:#04x} ({}) — this is the controller's OWN state, not the spec default this arc used to assume == witness ::",
+                self.idx, rp[1],
+                match rp[1] {
+                    0x00 => "STANDARD: responses arrive as Inquiry Result (0x02), event-mask bit 1",
+                    0x01 => "WITH RSSI: responses arrive as 0x22, event-mask bit 33",
+                    0x02 => "WITH RSSI + EIR: responses arrive as Extended Inquiry Result (0x2F), event-mask bit 46 — the bit this arc left CLEAR until now",
+                    _ => "RESERVED — out of the spec's 0x00..=0x02 range",
+                }
+            ),
+            other => serial_println!(
+                ":: bt-c1: [{}] HCI_Read_Inquiry_Mode (0x0C44) -> {} — the mode stays UNKNOWN; the mask written below carries bits 1, 33 and 46 so all three shapes are heard regardless == witness ::",
+                self.idx,
+                if other.is_some() { "MALFORMED/NONZERO-STATUS" } else { "NO CmdComplete" }
+            ),
+        }
+        // ---- 0b. widen the mask to carry Extended Inquiry Result (bit 46) ----------------------
+        match self.bt_hci_command_ex(
+            t, intf, e, toggle, BT_HCI_SET_EVENT_MASK, &BT_EVENT_MASK_C1, &mut rp, armed,
+        ) {
+            Some(n) if n >= 1 && rp[0] == 0x00 => serial_println!(
+                ":: bt-c1: [{}] stage=event-mask — HCI_Set_Event_Mask status=0x00 mask=0x2000_5FFF_FFFF_FFFF (reset default + Extended Inquiry Result bit 46 + LE Meta bit 61 carried from L2); all THREE inquiry-result shapes (0x02 bit 1, 0x22 bit 33, 0x2F bit 46) can now reach this host == witness ::",
+                self.idx
+            ),
+            _ => serial_println!(
+                ":: bt-c1: [{}] stage=event-mask — HCI_Set_Event_Mask for bit 46 NOT CONFIRMED; the inquiry below still runs, but a controller in Inquiry_Mode 0x02 would report NOTHING and the responses=0 verdict must not be read as silence on the air == witness ::",
+                self.idx
+            ),
+        }
         if !self.bt_hci_send(t, intf, BT_HCI_INQUIRY, &params) {
             serial_println!(
                 ":: bt-c1: [{}] HCI_Inquiry (0x0401) NOT SENT — the EP0 control-OUT failed (its own line is above). No inquiry is running and no cancel is owed; the page below falls back to psrm={:#04x}(R2) clock_offset={:#06x}(NOT valid) and is a WEAKER experiment for it == witness ::",
@@ -7155,7 +7212,7 @@ impl Controller {
             } else if st.inq_responses > 0 {
                 "THE TARGET DID NOT ANSWER, AND THE ROOM IS NOT SILENT. This inquiry heard other devices, so the radio, the antenna and the receive path are all working; what is unproven is that this BD_ADDR is on the air on CLASSIC at all"
             } else {
-                "THE INQUIRY HEARD NOTHING AT ALL. No device in the room answered a GIAC inquiry, which is a statement about THIS HOST's receive path at least as much as about the room — a working controller in a populated room normally hears something"
+                "THE INQUIRY HEARD NOTHING AT ALL — and the event mask above carried bits 1, 33 AND 46, so all three inquiry-result shapes were enabled and a masked-away result is EXCLUDED. Read the HCI_Read_Inquiry_Mode line above with this one: with the mode known and the mask open, silence here is the air or the BR/EDR receiver, no longer this host's event plumbing"
             }
         );
         serial_println!(
