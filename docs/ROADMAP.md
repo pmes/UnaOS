@@ -98,6 +98,27 @@ surface. The socket syscall family opened at number 19 (SOCK-2 landed 19–22, S
 | SOCK-6 ✅ 🔬 | **Landed (round 15, `net-sock1`).** Scope A — **TCP server/listen sockets**: ring 3 gets the server side of TCP with two syscalls over the persistent stack — `sys_listen(handle, port)` (#26, arm a passive listener, `CAP_WRITE`) and `sys_accept(handle)` (#27, poll for an inbound connection, `CAP_READ`) — behind `UNAOS_SMOLNET` (knob-off byte-identical, both arches). smoltcp's listener *becomes* the connection in place, so `accept` mints a **fresh `KIND_SOCKET` handle** aliasing the same gen-fenced socket-id (`CAP_READ|CAP_WRITE|CAP_GRANT` — the accepted connection is itself transferable, inetd-style); non-blocking poll model (`-EAGAIN` re-drives) like `connect`; single-accept-per-listen. Because slirp won't open a connection INTO the guest, the server witness uses the `UNAOS_NET=socket` builder mode (no builder change) + `scripts/net-inject.py sock6`: the stateful kernel witness accepts + echoes a probe (`:: SOCK-6: smoltcp tcp accept :8080 — received 11 bytes, echoed 11 back — witness OK ::`); hermetic `./arroyo test 90` prints the honest `witness PENDING`. Next free syscall: **28**. See [`08_NET/networking.md`](../unaos/docs/dev/OS/08_NET/networking.md) + [`SECURITY.md`](SECURITY.md). | x86 |
 | SOCK-7+ | persistent-listener acceptor pool; aarch64 NIC bring-up joins here (§6 row); retire the hand-rolled shell surface + `crates/net` DHCP | later |
 
+## 1c. The portable self-hosting card (direction, Peter, 2026-08-17)
+
+**The charter, in Peter's terms:** stick an SD card into any machine — the named first
+target is his x86 Zenbook, hardware UnaOS has never seen — and UnaOS boots from it,
+installs itself, and ultimately **builds itself**, off that one innocent card, fast.
+One card is the whole operating system: boot medium, system volume, installer, and
+eventually the forge.
+
+The rungs, in order — each is an arc-sized deliverable, none skips the one before it:
+
+| Rung | Content | Owner |
+| :--- | :--- | :--- |
+| **SH-1 generic boot** | The ESP image boots generic UEFI x86 hardware, not just the rMBP: GOP-only display fallback, xHCI enumerated defensively (the BOT-PARK discipline), unknown-NIC/unknown-wifi tolerated dark. Zenbook is the proving hardware. | rmbp |
+| **SH-2 UnaFS system volume** | The card carries a UnaFS system volume as the root (FAT demoted to the ESP shim only — finish/audit the x86 FAT retirement). One medium, one filesystem, every chip. | all tracks |
+| **SH-3 self-install** | Booted-from-card UnaOS installs/clones itself to fixed media (or re-images its own card) without a host PC — the Orin microSD pain is the forcing function; prior art `fox/brief-install-pi2-selfclone.md`. | orin first |
+| **SH-4 smart install/debug** | The installer consults Claude via Vein (host-side first) to auto-diagnose metal bring-up on new hardware from the serial verdicts — new machines onboard themselves. | orin (design), all |
+| **SH-5 self-build** | The far rung, named honestly: UnaOS builds UnaOS. Requires a native toolchain story (bandy-on-metal §3b is the seed) — sequenced after the desktop chain, not before. | future |
+
+The witness discipline applies: each rung lands with a boot-time witness proving it on
+the wire (the ONECARD witness is SH-2's Pi-side ancestor and the pattern to follow).
+
 ## 2. UnaFS: meeting and surpassing BeFS
 
 `unaos/libs/fs/unafs` already exceeds BeFS on one axis — typed attributes including
