@@ -1105,6 +1105,38 @@ v3d_unarmclose = ["v3d"]
 # See docs/dev/OS/08_VIDEO/v3d.md §49.21.
 v3d_basedaim = ["v3d_unarmclose"]
 
+# PI-V3D-98: the TSAIM leg — v3d.md §49.22.5's R-next-1, built as ONE MORE leg (D) on the `[v3d97]`
+# scaffolding (hence the feature IMPLIES `v3d_basedaim`, which implies `v3d_unarmclose`; it cannot be
+# armed alone). WHY: boot7/PA45 ran legs A/B/C and produced a two-write result §49.22 folds. Leg C
+# programmed CT0QMA/CT0QMS/CT0QTS to mapped decoys and (i) the decoy POOL window took a real write —
+# 20 words inside byte span [0x0,0x7f], word0 = 0x12, arena landing digest STRAY page 4 = the decoy
+# itself — so the close-time pool write IS base-relative off CT0QMA and "structural 0x70" is refuted;
+# and (ii) a SECOND PTB write still latched a refusal, at VA 0x0, which none of §49.21.4's four
+# pre-written rows predicts. Within leg C alone the second write cannot be the pool write (that one
+# landed), so the `[v3d62]` catcher's 48 zero words on that leg belong to it. 48 is also exactly the
+# word count the ARMED empty frame wrote into the 64-word tile-state array on the §49.8 R23 bracket's
+# boot6 (which wrote 20 pool words on the same kick — the same pair, both landed), so the leading
+# identification of the VA-0 write is the TILE-STATE write, aimed from a base of zero because leg C
+# left CT0QTS.ENABLE (bit 1) clear.
+#   LEG D (`tsaim`) is that cut, and it varies EXACTLY ONE bit from leg C: CT0QTS carries its decoy
+#   base OR CT0QTS_ENABLE. Everything else — the 14-byte `emptyunarm` list, CT0QMA, CT0QMS, the four
+#   poisoned windows, the catcher, the bare CT0QBA->CT0QEA submit — is leg C's, verbatim. Four
+#   outcomes are pre-written on the wire: NO FAULT with the decoy tile-state page touched (ENABLE
+#   gates the tile-state write's BASE — leg C's VA-0 refusal is identified and the unarmed close is
+#   COMPLETE, both writes landed, a campaign first); VA 0x0 unmoved (the VA-0 write is not the
+#   tile-state write — the identification is refuted and §49.22.5's R-next-1b pool-exhaustion leg is
+#   licensed); a VA that is QTS-relative but not the base (the base is honoured, the offset is not
+#   what was assumed — the arithmetic on the line names it); NO FAULT with nothing touched anywhere
+#   (ENABLE suppresses the write rather than aiming it, which is itself the finding).
+# The V2a instrument law rides unchanged (the pair read once and first, per leg). No page table is
+# edited, no mailbox tag is sent, no BPOA/BPOS write is made, and the arena geometry is untouched —
+# leg D reuses leg C's decoy windows and every one of its compile-time geometry assertions. Default
+# OFF and fully uncompiled when off. Enable via `UNAOS_V3D=1 UNAOS_V3D_UNARMCLOSE=1
+# UNAOS_V3D_BASEDAIM=1 UNAOS_V3D_TSAIM=1 UNAOS_PI=1 ./arroyo kernel8`. ⚠ an armed boot deliberately
+# produces a SHORT capture missing every banked witness; it must never be diffed line-for-line against
+# a full deep boot. See docs/dev/OS/08_VIDEO/v3d.md §49.22.
+v3d_tsaim = ["v3d_basedaim"]
+
 # PI-USB-1: the BCM2711 PCIe root complex + VL805 xHCI attach (arch/aarch64/piusb.rs) — brcmstb RC
 # bridge reset / link-up / MEM-window + inbound-BAR config, VL805 (1106:3483) enumeration + BAR sizing,
 # the NOTIFY_XHCI_RESET mailbox, and the polled shared-xHCI attach to the "controller halted-but-decoding

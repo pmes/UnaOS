@@ -15428,6 +15428,11 @@ fn v3d95_unarmed_close_rung() {
     serial_println!(
         ":: V3D: [v3d97] CORRECTION TO THE LINE ABOVE — UNAOS_V3D_BASEDAIM=1 is armed, so this boot takes THREE CT0 kicks, not one. The [v3d95] kick below is LEG A (the zero-base, 14-byte boot4 reproduction, unchanged); [v3d97] then takes LEG B (v3d.md §49.20.6 R3 `lenvary` — zero bases, 46-byte list) and LEG C (R1 `basedaim` — CT0QMA/CT0QMS/CT0QTS programmed to arena-mapped values, 14-byte list). Everything else the header says still holds: no probe_job, no [v3d48] ladder, no M4, no visible battery, no [v3d75]/[v3d80]/[v3d81] tails, and the boot RETURNS ::"
     );
+    // PI-V3D-98: and one line further, because `UNAOS_V3D_TSAIM=1` makes it FOUR.
+    #[cfg(feature = "v3d_tsaim")]
+    serial_println!(
+        ":: V3D: [v3d98] CORRECTION TO BOTH LINES ABOVE — UNAOS_V3D_TSAIM=1 is armed on top of them, so this boot takes FOUR CT0 kicks, not three and not one. Legs A/B/C are exactly as the line above describes them and are unchanged; [v3d98] then takes LEG D (v3d.md §49.22.5 R-next-1 `tsaim` — leg C's CT0QMA/CT0QMS/CT0QTS with CT0QTS.ENABLE set, and that one bit is the only difference between the two legs). Everything else both headers say still holds, including the boot RETURNING before probe_job ::"
+    );
     match probe_hub_ident0() {
         V3dPresence::Up(_) => {}
         V3dPresence::Down => {
@@ -15795,6 +15800,77 @@ fn v3d97_pad_selfcheck() -> bool {
     same
 }
 
+/// PI-V3D-98 (v3d.md §49.22.5 R-next-2) — dump the first `0x80` bytes at `CT0QMA` verbatim.
+///
+/// The `[v3d56]` scan reports a touched count, two endpoints and a byte span; on boot7 leg C that was
+/// `touched=20`, `first_touched=[0] got 0x00000012`, `last_touched=[31]`, `byte span [0x0,0x7f]` —
+/// enough to prove a header LANDED and not enough to say what it is. Twelve of the thirty-two words in
+/// that span never moved, so the header is sparsely populated and its structure is in the pattern, not
+/// in the count. This is a pure read of arena memory the scan's invalidate has already made coherent:
+/// no register is touched and no verdict is drawn on the wire — the decode is desk-side work against
+/// the VC4/V3D tile-list formats, and it costs no boot of its own because it rides every leg.
+#[cfg(feature = "v3d_tsaim")]
+fn v3d98_dump_pool_head(tag: &str, base: u32) {
+    for row in 0..4usize {
+        let mut w = [0u32; 8];
+        for i in 0..8usize {
+            w[i] = unsafe {
+                core::ptr::read_volatile((base as usize + (row * 8 + i) * 4) as *const u32)
+            };
+        }
+        serial_println!(
+            "::   [v3d98] pool-head ({}) +{:#05x}: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} ::",
+            tag, row * 32, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]
+        );
+    }
+    serial_println!(
+        "::   [v3d98] pool-head ({}) — the 0x80-byte window at CT0QMA verbatim, which is the exact span boot7 leg C reported touched. The poison is 0xA5A5A5A5^i, so any word still carrying its own index encoding was NEVER written and every other word is the PTB's. §49.22.5 R-next-2 decodes them; this line only records them ::",
+        tag
+    );
+}
+
+/// PI-V3D-98 — leg D (`tsaim`) reads its OWN pre-written outcomes, ahead of §49.21.4's generic rows,
+/// because the generic rows were written for a leg that leaves `CT0QTS.ENABLE` clear and say so in
+/// their text. Returns `None` for every leg whose `CT0QTS` carries no `ENABLE` bit, so legs B and C
+/// fall through to §49.21.4 untouched and their wire text is unchanged.
+///
+/// The cut, stated once: leg C landed the POOL write (decoy pool touched, 20 words inside byte span
+/// `[0x0,0x7f]`, `word0 = 0x12`) and still latched a refusal at `VA 0x0`, client PTB. Within leg C
+/// alone the refused write cannot be the pool write, so the `[v3d62]` catcher's 48 zero words on that
+/// leg belong to the OTHER close-time write — and 48 is the word count §49.8's boot6 measured for the
+/// ARMED empty frame's tile-state write. Leg D sets the one bit that differs between leg C and the
+/// armed path's `CT0QTS`, and re-reads the VA.
+#[cfg(feature = "v3d_tsaim")]
+fn v3d98_tsaim_verdict(
+    fault: u32,
+    client: &str,
+    va: u64,
+    qts_pre: u32,
+    dts_touched: bool,
+    dpool_touched: bool,
+    real_touched: bool,
+) -> Option<&'static str> {
+    if qts_pre & V3D_CLE_CT0QTS_ENABLE == 0 {
+        return None; // not leg D — §49.21.4's rows own this leg
+    }
+    let ts_base = (qts_pre & !V3D_CLE_CT0QTS_ENABLE) as u64;
+    Some(if fault == 0 && dts_touched {
+        "OUTCOME D1 — NO FAULT, AND THE TILE-STATE DECOY TOOK THE WRITE. CT0QTS.ENABLE gates the tile-state write's BASE, not its existence: with the bit clear (leg C) the write fired at a base of zero and the MMU refused it at VA 0x0; with the bit set the same write lands at CT0QTS. Leg C's residual VA-0 refusal is IDENTIFIED, §49.22's two-write model is confirmed on its own terms, and BOTH close-time writes of an unarmed frame-close have now been read as COMPLETED writes on one leg — the first complete unarmed close this campaign has ever taken. Read the decoy tile-state scan's word count against §49.8 boot6's 48-of-64 and the decoy pool's against its 20: if both match, the unarmed close with mapped bases and ENABLE set is doing exactly what the ARMED empty frame did"
+    } else if fault == 0 && (dpool_touched || real_touched) {
+        "OUTCOME D1b — NO FAULT, BUT THE TILE-STATE DECOY IS UNTOUCHED WHILE SOMETHING ELSE MOVED. The refusal went away when ENABLE was set, so the bit is load-bearing, but the bytes did not go where CT0QTS points. Read the four [v3d56] scan lines and the landing digest in order: a pool-only hit means ENABLE changed the pool write rather than adding a tile-state one, and a REAL-region hit under decoy bases means the aim is not derived from these registers at all"
+    } else if fault == 0 {
+        "OUTCOME D4 — NO FAULT AND NOTHING LANDED ANYWHERE THIS INSTRUMENT LOOKS. Setting ENABLE did not aim the second write, it SUPPRESSED it: leg C's refused write is conditional on ENABLE being CLEAR. That is a finding in its own right and it inverts the reading of the bit — but check the [v3d62] catcher line on this leg before concluding, because a catcher that still absorbed its words means the write happened and only the LATCH went quiet"
+    } else if client != "PTB" {
+        "A FAULT LATCHED BUT THE CLIENT IS NOT THE PTB — attribution belongs to whichever unit VIO_ID names, and neither leg C's residual nor §49.20's PTB reading is what this leg reproduced. Read the raw pair; no aim verdict from this line"
+    } else if va == 0 {
+        "OUTCOME D2 — VA 0x0, UNMOVED, WITH CT0QTS MAPPED AND ENABLED. The second close-time write does NOT derive its address from CT0QTS: the tile-state identification of §49.22's VA-0 residual is REFUTED by the one experiment that could refute it. What survives is that the write exists, is the PTB's, is refused, and is aimed at absolute zero on a leg where every base this rung can program is mapped. §49.22.5's R-next-1b is now licensed — the pool-exhaustion leg (leg C and this leg both ran CT0QMS = 0x3000, which the PTB consumes EXACTLY, leaving BPCS = 0; a pool that is not exhausted is the next single variable) — and if that leg leaves VA 0x0 standing too, the aim is structural and R2 `mapzero` is the instrument that reads its payload"
+    } else if va >= ts_base && va < ts_base + (V3D97_TS_BYTES as u64) {
+        "OUTCOME D3 — QTS-RELATIVE, BUT NOT AT THE BASE. The tile-state base IS honoured — the VA moved with CT0QTS, which is the identification — and the offset is not the one assumed. Subtract the base printed on this line to name the offset, then read it against the decoy tile-state scan's byte span: an offset past the poisoned window's end means the tile-state region this driver allocates is too SMALL for what the block writes, which is a geometry finding and a driver fix"
+    } else {
+        "OUTCOME D5 — A FAULT AT A VA THIS LEG DOES NOT PREDICT: not zero, not inside the tile-state decoy, and the pool rows below did not claim it either. Do the subtraction against all three bases printed on this same line before concluding anything; §49.20.6's last row governs — the arithmetic will name its own base"
+    })
+}
+
 /// PI-V3D-97 — one leg. `pad` selects the list (0 = the 14-byte `emptyunarm` shape, `V3D97_PAD_FLUSHES`
 /// = the 46-byte R3 list); `bases` is `None` for R3 (nothing programmed, bases stay at leg A's zero) and
 /// `Some` for R1. Everything else — the catcher, the poison, the submit, the wait — is leg A's, verbatim.
@@ -15813,6 +15889,8 @@ fn v3d97_leg(leg: &str, tag: &str, pad: usize, bases: Option<V3d96Bases>) {
         leg, tag, ba, ea, cl_len, cl_len, pad,
         match bases {
             None => "NONE (leg A's zero residue is left standing; this leg varies list length ONLY)",
+            Some(b) if b.qts & V3D_CLE_CT0QTS_ENABLE != 0 =>
+                "CT0QMA/CT0QMS/CT0QTS WITH QTS.ENABLE=1 (no BPOS=0, no pre-kick L2T invalidate, no BPOA/BPOS) — leg C's three values with EXACTLY ONE BIT changed",
             Some(_) => "CT0QMA/CT0QMS/CT0QTS ONLY (no BPOS=0, no pre-kick L2T invalidate, no QTS.ENABLE)",
         }
     );
@@ -15915,6 +15993,10 @@ fn v3d97_leg(leg: &str, tag: &str, pad: usize, bases: Option<V3d96Bases>) {
     v3d56_emit_scan(tag, "tile-alloc pool (real, negative control)", tile_alloc, &pool_scan, flush_done);
     v3d56_emit_scan(tag, "R1 decoy POOL window (CT0QMA target)", decoy_pool, &dpool_scan, flush_done);
     v3d56_emit_scan(tag, "R1 decoy TILE-STATE page (CT0QTS target)", decoy_ts, &dts_scan, flush_done);
+    // PI-V3D-98 §49.22.5 R-next-2 — the header itself, verbatim. Rides every leg so the zero-base legs
+    // supply their own negative control: a window that took no write must still read pure poison here.
+    #[cfg(feature = "v3d_tsaim")]
+    v3d98_dump_pool_head(tag, decoy_pool);
     v3d56_emit_landing(tag, &arena_pre, &v3d56_arena_digest());
     ptb_frame_witness(tag, bfc_pre, rfc_pre, bpca_pre, if bases.is_some() { qma_pre } else { tile_alloc });
 
@@ -15927,11 +16009,29 @@ fn v3d97_leg(leg: &str, tag: &str, pad: usize, bases: Option<V3d96Bases>) {
         dpool_scan.zeroed + dpool_scan.overwritten + dts_scan.zeroed + dts_scan.overwritten;
     let real_touched = ts_scan.zeroed + ts_scan.overwritten + pool_scan.zeroed + pool_scan.overwritten;
 
+    // ── PI-V3D-98: leg D's own rows, which take precedence over §49.21.4's on the leg that sets
+    // `CT0QTS.ENABLE` (and only on that leg — `None` everywhere else, so B and C are unchanged).
+    #[cfg(feature = "v3d_tsaim")]
+    let tsaim_row = v3d98_tsaim_verdict(
+        fault,
+        client,
+        va,
+        qts_pre,
+        dts_scan.zeroed + dts_scan.overwritten > 0,
+        dpool_scan.zeroed + dpool_scan.overwritten > 0,
+        real_touched > 0,
+    );
+    #[cfg(not(feature = "v3d_tsaim"))]
+    let tsaim_row: Option<&str> = None;
+
     // ── The verdict. §49.20.6's four rows, pre-written, plus the branches that void them. ────────
     let verdict: &str = if !submit_sound {
         "THE SUBMIT DID NOT AUDIT SOUND — [v3d54] says the latched [BA,EA) is not the one intended, so nothing on this leg is about the list it names. Re-take; no verdict"
     } else if !frame_closed {
         "NO FRAME CLOSED ON THIS LEG, so the question was never put. §49.20's V1 established that an unarmed submit closes a bin frame (BFC Δ1); this leg did not close one, so there is no close whose write could be aimed anywhere. NOT a verdict on the aim — read leg A's BFC above: if leg A closed and this leg did not, the ONE variable this leg changed is what stopped it, and THAT is the finding"
+    } else if let Some(row) = tsaim_row {
+        // Leg D (PI-V3D-98) — its own pre-written rows, taken only after the two void-branches above.
+        row
     } else if bases.is_none() {
         // Leg B (R3) — the instrument control. Its verdict is about the RAW word, not the VA.
         if vio_addr == cl_len as u32 {
@@ -16016,6 +16116,26 @@ fn v3d97_basedaim_legs() {
         qts: (arena_phys() + OFF_V3D97_TS) as u32, // bare base: ENABLE (bit1) stays 0 by design
     };
     v3d97_leg("C", "v3d97 R1 basedaim (nonzero mapped bases, 14-byte list)", 0, Some(bases));
+
+    // ── PI-V3D-98 — LEG D (`tsaim`). v3d.md §49.22.5's R-next-1: leg C's three values with EXACTLY
+    // one bit changed, `CT0QTS.ENABLE`. Runs AFTER leg C so leg C stays the in-boot anchor and the
+    // pair is read within one capture, on one image, off one virgin CT0.
+    #[cfg(feature = "v3d_tsaim")]
+    {
+        serial_println!(
+            ":: V3D: [v3d98] TSAIM LEG — READ THIS FOURTH. UNAOS_V3D_TSAIM=1 adds ONE more CT0 kick after leg C, so this capture carries FOUR closes: A (zero bases, 14 B), B (zero bases, 46 B), C (mapped bases, ENABLE=0, 14 B) and D (leg C's bases with CT0QTS.ENABLE=1, 14 B). WHY: leg C LANDED its pool write off CT0QMA and still latched a PTB refusal at VA 0x0 — a SECOND close-time write, which within leg C alone cannot be the pool write, and whose 48 catcher words match the word count §49.8 boot6 measured for the ARMED empty frame's tile-state write. ENABLE (bit 1) is the ONE bit by which leg C's CT0QTS differs from the armed path's, so leg D sets it and re-reads the VA. Outcomes are pre-written on leg D's own VERDICT line (D1 the tile-state write lands and the unarmed close is COMPLETE; D2 VA 0x0 unmoved and the identification is refuted; D3 QTS-relative at another offset; D4 the write is suppressed rather than aimed). §49.20.2's V2a law rides unchanged: the violation pair is read ONCE and FIRST on this leg too ::"
+        );
+        let tsaim = V3d96Bases {
+            qma: (arena_phys() + OFF_V3D97_POOL) as u32,
+            qms: V3D97_QMS,
+            // THE ONLY DIFFERENCE FROM LEG C, and it is one bit.
+            qts: (arena_phys() + OFF_V3D97_TS) as u32 | V3D_CLE_CT0QTS_ENABLE,
+        };
+        v3d97_leg("D", "v3d98 R-next-1 tsaim (mapped bases, CT0QTS.ENABLE=1, 14-byte list)", 0, Some(tsaim));
+        serial_println!(
+            ":: V3D: [v3d98] TSAIM COMPLETE — leg D taken and nothing else. Read leg C's VERDICT before it: leg D's whole question is leg C's residual, and a leg C that did not reproduce boot7's shape (pool decoy touched, fault at VA 0x0) leaves leg D with no residual to explain. CT0QMA/CT0QMS/CT0QTS are LEFT PROGRAMMED at leg D's values, ENABLE included, for the same reason leg C left its own: nothing runs after this rung ::"
+        );
+    }
 
     serial_println!(
         ":: V3D: [v3d97] BASEDAIM COMPLETE — three closes taken (A zero-base/14B, B zero-base/46B, C mapped-bases/14B) and nothing else. CT0QMA/CT0QMS/CT0QTS are LEFT PROGRAMMED at leg C's values on purpose: nothing runs after this rung, and a restore would be one more write between the verdict and the wire. Read leg B's verdict BEFORE leg C's — if R3 fired, leg C is void ::"
