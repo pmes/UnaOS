@@ -4478,7 +4478,7 @@ fn render_service(_: usize) {
                     // for this task's life — which is also why `screen.rs` needs no edit on this arc.
                     // When the lake scene replaces the flat fill the seam is one `TargetPal`
                     // passthrough, and this call site changes by one word.
-                    pal.clear_screen(unaos_kernel::video::wm::DESKTOP_BG);
+                    pal.clear_screen(unaos_kernel::video::wm::DESKTOP_BG); unaos_kernel::video::retire_desktop_chrome(pal.width() as usize, pal.height() as usize); // REALDESK — the SAME statement retires the legacy backdrop tenants (`ui_status`'s pulse band and status line). It is here and not at task start for the reason the clear is: this is the only instant that is BOTH after the cascade and after `open_shell_window` actually returned a window, so on a panel whose decline leaves the shell owning the backdrop the instrument stays exactly where it is. ⚠ FOLDED — `main.rs` is compiled into the knob-off `kernel8.img` whose byte-identity is this track's standing proof and panic `Location` records embed line numbers; the argument is in PARITY.md §6.1 and at the tail of `video/mod.rs`.
                     dirty = true;
                     // Rebind the whole tuple, the shape the x86 reopen arm established: the store
                     // must outlive the row (which holds a raw pointer into it), the `Screen` is

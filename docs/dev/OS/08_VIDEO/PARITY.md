@@ -82,7 +82,7 @@ is an attribute gate.
 | `wm.rs` ×1 (16493) | MENUFIT witness — menubar reservation line | (d) IN FLIGHT | **exec-conswin** (menubar). |
 | `fbcon.rs` ×42 | **The console window** — `CONSOLE_WIN`, the route/pace/pending machinery (`ROUTE_BUSY`, `PACE_HZ`, `pend_merge`, `route_present*`, `console_service`, `console_flush`), the window-backed console store (`win_store`, `win_fb`, `win_content_extent`), `panel_console_window_open` / `_closed` | (d) IN FLIGHT | **exec-conswin.** Not touched by this arc. |
 | `main.rs` ×1 | `open_shell_window` | (d) IN FLIGHT | **exec-shellport.** |
-| `main.rs` ×2 | `desktop_owns_backdrop` (SHELLNOTDESK) — the crispy scene as the desktop layer, shell demoted to plumbing | (b) | **OWED** — §6.1. Adjacent to exec-shellport; coordinate before starting. |
+| `main.rs` ×2 | `desktop_owns_backdrop` (SHELLNOTDESK) — the crispy scene as the desktop layer, shell demoted to plumbing | (b) | **CLOSED** — §6.1. SHELLWIN-PI (`b2e0fb4a`) put the live shell in a window; REALDESK (exec-realdesk) took the last two backdrop tenants — the pulse band and the status line — off the glass with it. |
 | `main.rs` ×2 | `instgui::service`, `instgui::consume_key` | (c) | `instgui` is the x86 installer GUI on the `wcx` panel path. |
 | `mod.rs` ×2 | `pub mod wcx;`, `pub mod instgui;` | (c) | `wcx` **is** the x86 panel path (ignited by the Kepler takeover); `instgui` rides it. |
 | `screen.rs` ×1 (1050) | Occluder-array assembly for the blit clip | (b) | Part of the occlusion family — **OWED**, §6.2. |
@@ -414,12 +414,89 @@ here before starting; strike it when it lands.**
 
 | # | Gap | Sites | Scope |
 |---|---|---|---|
-| 6.1 | **Desktop backdrop layer (SHELLNOTDESK)** — *trigger half LANDED, PIDESK-CLEAR 2026-08-17* | `main.rs` ×2 (`desktop_owns_backdrop`), `screen.rs:669` (`paint_desktop_scene`) | **Trigger: done.** `pidesk::activate` now carries the panel-wide `DESKTOP_BG` clear (`[pidesk] desktop-clear`) — x86's WC-X DESKTOP-CLEAR on this arch — and `wcf::chrome_truth`'s desktop probe flips `NOCLEAR -> HIT` at bench geometry. **Still owed: the RENDER-SERVICE seam.** The Pi's `render_service` still paints the text shell as the backdrop, so the shell repaints over the clear within a frame; x86 paints the crispy scene and demotes the shell to plumbing. `Screen`/`fill_screen`/`mark_full` are all arch-neutral. **Coordinate with exec-shellport before starting.** |
+| 6.1 | **Desktop backdrop layer (SHELLNOTDESK)** — **CLOSED**, REALDESK 2026-08-17 | `main.rs` (the mint arm), `ui_status.rs` ×3, `video/mod.rs` (the latch) | Landed in three steps. **PIDESK-CLEAR** `8f78399d` gave the Pi the panel-wide `DESKTOP_BG` clear. **SHELLWIN-PI** `b2e0fb4a` put the live text shell in a window and claimed the backdrop in the same pass, which retired the *shell* tenant. **REALDESK** retires the two that were left: `ui_status`'s pulse LED band and its host/ip/UTC status line, both of which wrote the desktop back buffer directly. See §6.1a for the full tenancy ledger and what the retirement does NOT cover. |
 | 6.2 | **Windows do not respect menubar / dock / open dropdown** | `wm.rs:12059` (`OccClip::push`), `wm.rs:12281` (`occ_clip`), `wm.rs:12605` (`erase_clip`), `screen.rs:1050`, + 11 witness legs in §3 | On aarch64 the clip is structurally `OccClip::none`, so a window blit paints **over** the menu bar and dock and a deferred erase publishes over them. `pidesk` has already put those strips on the Pi's glass, so **the exposure is live today.** This is the same defect class x86 fixed. Largest owed item; its own arc. **STILL OWED after `exec-crystalpi`** — that arc added the *repair* (§5.5c: the bar and the dropdown now notice a clobber and repaint the same pass) but not the *protection*, so the exposure is bounded to one frame rather than removed. |
 | 6.3 | **Quiet boot screen** | `fbcon.rs` ×9 (`QUIET-PANEL` `_print` suppression, `PANEL_MUTE_TAGS`, `TAG_SNIFF` + impls, `PANIC_MIRROR`) | x86 paints milestone lines only and mutes `[wc-g]/[wc-h]/[wc-d]/[wcn]` telemetry from the glass, with `PANIC_MIRROR` as the panic override; the Pi mirrors the raw serial stream across the boot panel. All arch-neutral policy over `_print`. Self-contained. |
 | 6.4 | **Dock tile count for the blit clip** | `wm.rs` `dock_tiles` | `video::dock` is already on the Pi via `pidesk`, but its tile count feeding `occ_clip` is not. Small; **do it with 6.2**, which is the consumer. |
 | 6.5 | ~~**Fast glyph painting**~~ **LANDED — `exec-fontwire`, see §6.8** | `fbcon.rs:166` (`draw_glyph`'s span path) | x86 hoisted the pixel-format decode out of the 8×8 bit loop and poked pre-encoded words; the Pi ran `put_pixel` with a per-pixel `match` on `pixel_format`. Closed by making the hoist arch-neutral **and** run-coalesced, so it overshoots the parity the row asked for on both arches. `put_raw4` (`framebuffer.rs:268`) now has no callers. Accounting in §6.8. |
 | 6.9 | **The console's FACE was an arch gate nobody had named** — *raised and closed by `exec-fontwire`, recorded here because the census missed it* | `fbcon.rs:258` (`FbCon::aa`), `fbcon.rs:1707` (`panel_console_resume`, `#[cfg(target_arch = "x86_64")]`) | Not in the 501-site census, because it is not an attribute: `aa` had exactly ONE writer and that writer was inside an x86-only function. The Pi therefore drew anti-aliased captions, bar, crystal and dock captions — all of which resolve through the arch-neutral `wm::TITLE_CELL_*` — around a console still painting a 1-bit 8×8 cell. **A parity census that greps `cfg` attributes cannot see a gap of this shape.** The general lesson is worth more than the fix: look for *single-writer state whose writer is arch-gated*, not just for arch-gated state. |
+
+### 6.1a REALDESK — the backdrop tenancy ledger, and what the retirement does not cover
+
+Peter, 2026-08-17: *"WHEN WILL THE REAL DESKTOP APPEAR?! SHELL IS STILL THERE. OLD EMBEDDED PULSE AND
+INFO BAR"*. Three tenants were named; the ledger below is what was actually on the glass, measured off
+an armed bench-geometry boot (`UNAOS_PIDESK=1 UNAOS_QUARRY=1 UNAOS_FBW=1920 UNAOS_FBH=1200`) rather
+than derived. **Row heights below are the readings at base `6de03c87`, i.e. before FONT-PI
+(`cb787847`) armed the Pi console's `noto16-aa` face.** Nothing in the mechanism depends on them —
+`chrome_h` and `dock_reserve_h` are computed from `ui::Metrics` and the dock's own constants at
+runtime, and FONT-PI moves neither `theme::BUTTON_HEIGHT` nor `theme::GAP` — but a re-read on the
+merged tree may show a different `bottom_reserved=` if the console line pitch moved.
+
+| Tenant | Rows on the 1920x1200 panel | Painter | Disposition |
+|---|---|---|---|
+| The live text shell | whole panel | `render_service`'s `console.draw(&mut pal)` | **Already retired** by SHELLWIN-PI `b2e0fb4a`. After the mint pass the shell draws only into its own window surface; the panel is claimed once by `pal.clear_screen(DESKTOP_BG)` and no code path in the service writes it again. Nothing was owed here — §6.1's "still owed" text predated that arc. |
+| The pulse LED band | `(280, 1096, 1480x92)` — `[pstrip] armed panel=(…)` | `ui_status::draw` → `draw_panel_at(pal, None)` | **RETIRED.** The instrument is `video::pulsewin`'s window, through the *same renderer* (`draw_panel_at(pal, Some(rect))`) reading the same envelope. |
+| The info bar | full width, `y = 1188..1200` | `ui_status::draw` (a `STRIP_BG` band + `hostname / ip / UTC` text) | **RETIRED.** See "what has no home" below. |
+| The dock | centred, `y = 1136..1188` | `video::dock` via `strip::compose_all` | **STAYS.** Real desktop furniture and the console window's only way back. |
+| The menu bar | flush top, `y = 0..34` | `video::menubar` | **STAYS.** Crystal + focused caption + UTC `HH:MM`. |
+| WC-F ground-truth marks | bottom-left ramp 264x256, bottom-right twins 144x64 | `wcf`, straight to the framebuffer | **Not chrome — gate instrumentation.** `witness`-gated, and the metal image is built without `witness`, so no bench boot has ever shown them. |
+
+**The two retired bands were an aarch64-only desktop.** `x86_render_service` calls
+`screen.paint_desktop_scene()` and never reaches `ui_status` at all — x86 has neither band. That makes
+them a ONE OS defect (*"arch gates in the experience layer are defects"*) independently of taste.
+
+**They also collided with the dock.** `chrome_h(1200)` = 92 + 12 = 104 rows, and the dock is seated at
+`ph - PAD - STRIP_H` = rows 1136..1188 — *inside* the instrument's own band. `present_background`
+subtracts the dock's rect from every desktop present, so what an operator saw at the bench was a 40-px
+sliver of LED rows, the dock standing in the middle of the rest of them, and a text line beneath it.
+
+**The latch, and why it is runtime.** `video::desktop_scene_owns_backdrop()` (tail of `video/mod.rs`) is
+armed by `main.rs`'s render service in the *same statement* as the backdrop hand-off, i.e. only on the
+pass where `open_shell_window` actually returned a window. Where that declines, the shell legitimately
+still owns the backdrop and the instrument stays — a desktop with no scene on it must keep its
+readout. The three seams that read it are `ui_status::draw` (both bands), `ui_status::tick` (whose
+sampler, envelope and every `[pstrip]` pacing number are untouched — only the panel present goes) and
+`ui_status::chrome_h`.
+
+**`chrome_h` shrinks; it does not go to zero.** The band's 104 rows would otherwise be handed straight
+to `wm::place`, and on this arch `occ_clip` is structurally `OccClip::none` (§6.2), so a tiled window
+would be blitted over the dock. The reservation therefore becomes `strip::PAD + dock::STRIP_H` = 64:
+40 rows return to the work area and the furniture keeps its floor. `[realdesk] bottom_reserved=104->64`
+is that number on the wire.
+
+**What has no windowed home, stated rather than orphaned.** The menu bar carries UTC `HH:MM`; the
+retired info bar also carried the **mDNS hostname**, the **settled lease IPv4** and the **date +
+seconds**. All three remain reachable from the shell window (`netinfo`, `date`, `time`) and on the
+serial wire, but there is no longer an always-on indicator for host/IP. A network status tenant — a
+menu-bar item or a small window — is **OWED** and is the natural companion to §6.2.
+
+**Spec, deliberately untouched.** `[realdesk] … == witness ::` is `pidesk`-gated, so it is absent from
+the knob-off battery the standing gate runs; a REQUIRE for it belongs in the armed battery under the
+same argument `[dragperf]` and the `[clickroute]` furniture legs already carry. `scripts/specs/` is
+`exec-chromespec`'s lane this cycle, so the line is on the wire and the spec entry is left to that arc.
+
+**A finding about the witness, not about the code.** `wcf::chrome_truth`'s desktop probe latches ~100
+lines *before* the render service's first paint, so its `pt=desktop … -> HIT` has never been able to
+see either band. It reports the state of the panel at bring-up, which is a real and useful reading, but
+it is not evidence that the desktop is still clean at desktop-ready. Anything that wants that claim
+needs a probe after the arming.
+
+**Gates (base `6de03c87`).** `./arroyo check` and `UNAOS_WC=1 ./arroyo check` green, 12 legs each, no
+new warnings. Knob-off `./arroyo kernel8-test 210` → **MBENCH PASS 111/111, 0 forbidden**, and the
+knob-off `kernel8.img` is byte-identical to a reverted control (§5.3). The two armed geometries were
+run as **back-to-back A/B pairs on the same loaded host**, patch reverted then re-applied, because
+five sibling QEMUs were live and §2's `[wc-h]`/`[wc-g]` host-speed family is unreadable otherwise:
+
+| Gate | Baseline (reverted) | This arc | REQUIRE delta |
+|---|---|---|---|
+| `UNAOS_PIDESK=1 UNAOS_QUARRY=1` (640x480) | 106/111, 19 forbidden | 106/111, 16 forbidden | **0** — the same five misses, verbatim |
+| + `UNAOS_FBW=1920 UNAOS_FBH=1200` | 108/111, 120 forbidden | 108/111, 134 forbidden | **0** — the same three misses, verbatim |
+
+Every failing fixture in both pairs prints *before* `[realdesk]` does (640x480: lines 219/934/949/1169
+against the arm at 1510), so none of them can have executed a line of this arc. The forbidden spread
+is `[wc-h] AT-RISK` alone — 284 raw AT-RISK lines on the baseline against 265 on this arc, i.e. the
+arc's side is if anything the quieter one. A quiet-host re-run is still owed before any bench-geometry
+number here is read as a verdict.
 
 ### 6.6 THE VUG UPGRADE — the real answer to "where is the upgraded vug"
 

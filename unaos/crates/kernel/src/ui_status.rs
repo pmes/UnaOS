@@ -378,7 +378,7 @@ fn compose() -> String {
 /// they owe an unconditional redraw on top whether or not anything they display changed. The pulse
 /// bars are drawn from the LAST SAMPLED loads — no resample, so a keystroke storm cannot turn into a
 /// telemetry-read storm. [`tick`] is the paced entry point.
-pub fn draw<P: GneissPal>(pal: &mut P) {
+pub fn draw<P: GneissPal>(pal: &mut P) { #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))] if crate::video::desktop_scene_owns_backdrop() { return; } // REALDESK — RETIRED. Both bands below write the DESKTOP back buffer, and x86's desktop draws neither (`x86_render_service` calls `paint_desktop_scene` and never reaches this module) — an aarch64-only desktop, which the ONE OS law makes a defect. Once the scene owns the backdrop the instrument is `video::pulsewin`'s WINDOW through the same renderer (`draw_panel_at(Some(rect))`) and the wall clock is the menu bar's; host + lease IP have no windowed home yet and are NAMED in PARITY §6.1 rather than silently orphaned. FOLDED onto this line: `ui_status.rs` is compiled into the knob-off `kernel8.img` and must stay line-neutral — PARITY §5.3.
     let m = pal.metrics();
     let w = pal.width() as usize;
     let h = pal.height() as usize;
@@ -606,7 +606,7 @@ pub fn band_h(ph: usize) -> usize {
 /// computed in exactly one place — a second copy of this arithmetic is how a reserved region and the
 /// thing reserving it drift apart.
 pub fn chrome_h(ph: usize) -> usize {
-    let m = crate::ui::Metrics::for_height(ph);
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))] if crate::video::desktop_scene_owns_backdrop() { return crate::video::dock_reserve_h(); } let m = crate::ui::Metrics::for_height(ph); // REALDESK — a retired band reserves nothing of its own; what stays is the DOCK's floor, because `wm::occ_clip` is `OccClip::none` on this arch (PARITY §6.2) so an unreserved dock would be blitted over. See `video::dock_reserve_h`. Line-neutral fold, PARITY §5.3.
     band_h(ph).saturating_add(m.line_h)
 }
 
@@ -1282,5 +1282,5 @@ pub fn tick<P: GneissPal>(pal: &mut P) -> bool {
     if changed {
         draw(pal);
     }
-    changed
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))] let changed = changed && !crate::video::desktop_scene_owns_backdrop(); changed // REALDESK — the sampler, the envelope `video::pulsewin` reads through `loads()` and every `[pstrip]` pacing number above are UNTOUCHED; only the PANEL present goes. `draw` is already a no-op once retired, so returning `true` here would buy the render core an empty flush per pulse. `redraws=` still counts real repaints: the pass that would have redrawn the band is the pass `pulsewin::service()` redraws the window on.
 }

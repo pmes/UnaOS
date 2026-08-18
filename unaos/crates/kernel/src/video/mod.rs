@@ -361,3 +361,91 @@ pub mod pulsewin;
 // below this, so nothing moves, and a knob-off `kernel8.img` is byte-identical.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 pub mod quarry;
+
+// ── REALDESK — THE DESKTOP SCENE'S TENANCY OF THE BACKDROP ──────────────────────────────────────
+//
+// Peter, 2026-08-17: *"WHEN WILL THE REAL DESKTOP APPEAR?! SHELL IS STILL THERE. OLD EMBEDDED PULSE
+// AND INFO BAR"*. SHELLNOTDESK/SHELLWIN-PI took the live text shell off the Pi's glass and put it in
+// a window; what stayed behind were the two bands `ui_status` draws STRAIGHT INTO THE DESKTOP back
+// buffer — the per-core LED instrument (`draw_panel_at(pal, None)`) and the host/ip/UTC status line.
+// Neither exists on x86: `x86_render_service` calls `screen.paint_desktop_scene()` and never touches
+// `ui_status` at all. So they were an aarch64-ONLY desktop, which is exactly what the ONE OS law
+// ("arch gates in the experience layer are defects") forbids, and they are what Peter is looking at.
+//
+// This latch is the retirement, and it is a RUNTIME one for the reason `pidesk::armed` is: the
+// tenants may only leave when something else has taken the glass. It is armed by `main.rs`'s render
+// service in the SAME statement as the backdrop hand-off (`pal.clear_screen(DESKTOP_BG)`), i.e. only
+// on the pass where `open_shell_window` actually returned a window. On a panel where that decline
+// fires the shell legitimately still owns the backdrop, and a desktop with no scene on it must keep
+// its instrument — so the tenants stay, and the boot is byte-for-byte what it is today.
+//
+// It lives HERE, at the tail of this file, and not in `ui_status` — PARITY.md §5.3. `ui_status.rs`
+// is compiled into the knob-off `kernel8.img` whose byte-identity is this track's standing proof,
+// and panic `Location` records embed line numbers, so a static and three functions added there would
+// move the hash for a feature the image does not contain. Appended below `quarry` for `quarry`'s own
+// reason: nothing is below this, so no existing line in this file moves either. The static and all
+// three accessors carry the furniture gate, and `ui_status`'s three call sites carry it too, so a
+// knob-off build compiles NONE of this and that file's diff reduces to line-neutral comment text.
+// MEASURED rather than reasoned, as §5.3 requires: knob-off `kernel8.img` is
+// `2d9f9ab347106102ce2b4a26eca71c0e54970e875f5600de38b0e7264c81557d` with this arc applied and with
+// it reverted — same tree, same host, minutes apart, and stable across three consecutive rebuilds.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+static DESKTOP_SCENE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// REALDESK — **the desktop scene has taken the backdrop; the legacy chrome tenants retire.**
+///
+/// Called once, from the render service's backdrop hand-off. Idempotent (a second call stores the
+/// same value and says so with `was=true`), and one-way by construction: there is no un-retire,
+/// because there is no path back from a windowed shell to a shell that is the wallpaper.
+///
+/// The witness reports the reservation it just changed rather than asserting the retirement, so a
+/// capture can read the tiler's new bottom budget without inferring it — `bottom_reserved=104->64`
+/// on the 1920x1200 bench panel is the instrument band (92) plus the status line (12) giving way to
+/// the dock's own rows (`strip::PAD + dock::STRIP_H`), which is what still has to be kept clear.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+pub fn retire_desktop_chrome(pw: usize, ph: usize) {
+    let before = crate::ui_status::chrome_h(ph);
+    let was = DESKTOP_SCENE.swap(true, core::sync::atomic::Ordering::Release);
+    serial_println!(
+        "[realdesk] backdrop=desktop-scene retired=pulse-band,status-line bottom_reserved={}->{} panel={}x{} menubar={:?} dock_h={} was={} == witness ::",
+        before,
+        crate::ui_status::chrome_h(ph),
+        pw,
+        ph,
+        menubar::strip_rect(pw, ph),
+        dock_reserve_h(),
+        was
+    );
+}
+
+/// REALDESK — does the desktop SCENE own the backdrop on this boot, as of now?
+///
+/// `false` until [`retire_desktop_chrome`], and a compile-time `false` on any build without the
+/// furniture family (every knob-off Pi image, every x86 build without `wc`). Read by `ui_status` at
+/// its three seams: the two band painters and the tiler's bottom reservation.
+///
+/// `Acquire` pairs with the setter's `Release` so a reader that sees `true` also sees the
+/// whole-panel `DESKTOP_BG` fill the same statement published.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+pub fn desktop_scene_owns_backdrop() -> bool {
+    DESKTOP_SCENE.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// REALDESK — **the bottom rows a retired desktop still owes the DOCK**, and why the reservation does
+/// not simply go to zero.
+///
+/// `ui_status::chrome_h` reserved the last 104 rows of the bench panel from `wm::place` for the pulse
+/// instrument. Those rows also happen to contain the dock (`frame_centred(Edge::Bottom, …)` seats it
+/// at `ph - PAD - STRIP_H`), so the instrument's reservation has been doing the dock's protection for
+/// free. Returning `0` here would hand the dock's own rows to the tiler on the one arch where
+/// `wm::occ_clip` is structurally `OccClip::none` (PARITY §6.2) — a window blit would paint straight
+/// over the dock. So the reservation SHRINKS to what the dock actually occupies instead of vanishing:
+/// 40 rows of the bench panel come back to the work area, and the furniture keeps its floor.
+///
+/// Stated as the dock's own two constants rather than as a number, and height-only because
+/// `chrome_h` is: the dock is unconditionally PRESENT (it is the console's only way back), so there
+/// is no arm in which the panel has a desktop and no dock to keep clear.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+pub fn dock_reserve_h() -> usize {
+    strip::PAD + dock::STRIP_H
+}
