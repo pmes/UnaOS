@@ -13,7 +13,7 @@ Cell values: **yes** (verified on that platform) · **no** (verified absent) · 
 | AA font rendering (Noto Sans Mono) | ? | yes | x86 landed it first (fa193e6f, unverified this seat); Pi: PA44 metal faces noto20-aa (chrome) + noto16-aa (console) |
 | Paper texture on content surfaces | ? | no | only call site is x86-gated instgui; Pi has no kernel content surface yet |
 | App windows (create/present/composite) | ? | yes | Pi: 3 live windows @~100 comps/s on metal |
-| Window drag by title bar | ? | partial | Pi: DRAG-PI wired + coalesced (16ms, box damage), QEMU-verified — but PA42 boot5 metal drags REFUSED: DRAGWEDGE latch held by the stuck-BLIT_ACTIVE defect (open, baton pi-1 #6) |
+| Window drag by title bar | ? | partial | Pi: DRAG-PI wired + coalesced; metal refusals convicted by BLITWHO (same-core drain self-starvation, PA50 2026-08-18) and FIXED in-tree by DRAGFIX (yield/skip arms + latch self-heal at drain exit) — metal drag verdict = next boot |
 | Window close (app windows) | ? | yes | Pi: close grammar exercised on metal |
 | Close refusal on kernel furniture (no freeze) | ? | yes | drain-stall fix 49b3a5fe; wedge1 tripwire verified |
 | Dock (window switcher) | ? | yes | Pi: [dock] census on metal; press verdict awaits a bench click |
