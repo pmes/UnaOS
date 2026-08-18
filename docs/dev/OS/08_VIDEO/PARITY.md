@@ -1516,6 +1516,102 @@ fully-covered subject proves it FIRES. Zero `[wc-d] … -> FAIL` remain on the a
    is one `+ 1` term — **not taken here because `dock_tiles` also feeds the x86 clip and the term would
    move x86 pixels**, which this arc's constraint forbids.
 
+*(Items 1 and 3 are answered in §6.11 — item 3 was already false when it was written. Item 2 stands.)*
+
+---
+
+### 6.11 The `exec-eraseclip` arc — §6.2's ERASE half, and a disclosure that outlived its defect
+
+**§6.2 is now closed on both paths.** occ62 closed the WINDOW BLIT; this closes the DEFERRED ERASE.
+One commit, `9937ac9e`, and — as with occ62 — the mechanism was never rebuilt: `erase_clip`'s body is
+the shape x86 has run since WCK4, and the work was `cfg` boundaries plus the witness wire.
+
+| | What moved | Gate it now carries |
+|---|---|---|
+| **M1** | `erase_clip`'s WINDOW half-space — every live, non-`compat` row above the shell | unconditional (behaviour, not a knob), matching occ62's window term |
+| **M1** | `erase_clip`'s FURNITURE arm — `strip::rects`, i.e. dock + menu bar from the registry | `any(all(x86_64, wc), all(aarch64, pidesk))` — the furniture family's own gate |
+| **M1** | `OccClip::push` | ungated (was `any(x86_64, all(aarch64, pidesk))`) |
+| **M1** | The erase-side witness: `DO_FILL_*`, `DO_CLIP_N`, `DO_DOCK_BOX`, `DO_STRIP_N`, `DO_BAR_W`, `dragfill_box`, `span_occ`, `covered_len` and their `stage_fill` legs | `feature = "witness"` (arch term dropped) |
+| **M1** | `[erase-occ]` — a NEW aarch64 report line | `witness` + `aarch64` |
+
+**Why `push` had to be ungated, which an attribute census could not have predicted.** `occ_clip`'s
+window loop writes `boxes[n]` directly under an `OCC_CLIP_MAX` bound; `erase_clip`'s admits through
+`push`, because it has no `boxes_overlap` pre-filter and must REPORT a drop rather than write past the
+end. Making the erase's window loop unconditional therefore made `push` reachable on the **knob-off**
+aarch64 build, where its old gate did not compile it — an `E0599` whose fault is in which arm *calls*
+the function, not in the function's own gate. Same family as occ62's `OccSnap` stack fault: a parity
+port that only moves `cfg` attributes cannot see this class.
+
+**`erase_clip` keeps the lock occ62's clip could not have.** It runs ONCE PER DRAIN, so its `TABLE`
+acquisition and the `dock_scan` inside `strip::rects` are affordable; occ62's "no second table lock"
+rule was a property of the per-window blit loop and is deliberately **not** imported here.
+
+#### The witness FIRES on aarch64, and why it is a new tag
+
+§6.10 item 2 left `[drag-occ]`'s `occclip_*` fields x86-only and documented the silence as an absent
+instrument. For the ERASE the instruction was the opposite — fire the legs — and they do, on
+**`[erase-occ]`**, not on `[drag-occ]`. `[drag-occ]` carries the whole gesture budget, including
+blit-side terms (`occ_px`, `clip_px`, `buried`, `direct`, `occclip_*`) fed by statics this arc does
+not own. Printing the erase half under that tag with the rest missing is the "one field, two meanings
+on two arches" defect GR13 convicted three instruments for. Every field on `[erase-occ]` means exactly
+what the identically-named field on `[drag-occ]` means.
+
+**The evidence the erase clip works**, from the armed bench-geometry run — these lines do not exist at
+the base sha at all, because the aarch64 clip was structurally empty:
+
+```
+[erase-occ] win=3 owner=0xd40 moves=10 fill_px=0 fillpub_px=1308476 fillclip_px=2164162
+            fillover_px=0 fillruns=9190 clipn=5 dock=444x52+738+1136 bars=2/2 bar=1920
+            fillclip_dock_px=0 -> CLEAN
+[wc-k] erase box=480x480 staged=yes rowbytes=1920 runs=480 spans=0   contig=yes ... -> BUFFERED
+[wc-k] erase box=298x332 staged=yes rowbytes=1192 runs=332 spans=298 contig=yes ... -> BUFFERED
+```
+
+`clipn=5` proves the clip is populated rather than structurally zero (three windows plus both
+furniture strips); `fillclip_px=2164162` is 2.16M pixels the erase WITHHELD that the base sha would
+have published over live windows and strips; `fillover_px=0` is the span-walk audit clean. The
+`[wc-k]` pair is the arch-neutral corroboration: `runs=480 spans=0` is a fully-occluded erase
+publishing nothing at all, `runs=332 spans=298` a partially-occluded one — both impossible on aarch64
+before this arc, where `spans` always equalled `runs`.
+
+#### SHELLPIN — there was nothing to take; there were three stale disclosures to fix
+
+§6.10 item 3 was **already false when it was written**. The `+ 1` term is in the tree: the integrator
+landed it as `4c6ca42d` ("SHELLPIN integrator fix — `occ_clip`'s dock width counts the pinned tile"),
+on both arches, taking the x86 pixel delta deliberately. `dock_tiles` adds the pinned tile when no
+live row carries `KERNEL_OWNER_DESKTOP`, capped at `MAX_WINDOWS` exactly as `dock::pin_shell` is — so
+the clip cannot be made one tile WIDER than the painted strip, which is the inverse defect.
+
+So the honest option was neither of the two this arc's brief offered. The term did not need adding for
+one arch (that would BE an arch gate in the experience layer) and did not need adding for both (it is
+already there). What it needed was for `occ_clip`'s ledger, `dock.rs`'s module note and this document
+to stop telling readers to expect a residual the code no longer has. All three are corrected in place
+rather than deleted, because the text was quoted forward while the defect was live and a reader
+meeting one copy needs the others to say plainly that it no longer holds.
+
+**A stale disclosure is worse than no disclosure, because it is read as current** — and this one had
+propagated to three files before anyone re-read the function it described. The mirror of occ62's
+lesson: a census greps attributes, and a disclosure is not an attribute either.
+
+#### Gates
+
+* `./arroyo check` and `UNAOS_WC=1 ./arroyo check` — green, both arches.
+* Knob-off `./arroyo kernel8-test 210` — **MBENCH PASS, 117/117 required witnesses, 0 forbidden hit(s),
+  19506 lines scanned.** At floor. Note the knob-off leg runs **no drags at all** (`[drag]` count 0),
+  so `[erase-occ]` is legitimately absent there — a vacant instrument, not a silent one, and the
+  `[wc-k]` `runs`/`spans` pair is what carries the erase reading on that leg.
+* The armed bench-geometry leg (`UNAOS_PIDESK=1 UNAOS_FBW=1920 UNAOS_FBH=1200`) is **red at the base
+  sha as well** (116/117). Its A/B and the attribution of every residue are in the arc's landing
+  report; none of the shared residue belongs to §6.2.
+
+#### What is still OWED after this arc
+
+1. `[drag-occ]`'s `occclip_*` fields (§6.10 item 2) remain x86 by choice — unchanged by this arc.
+2. The armed leg's pre-existing red (`[wc-d] verify win=3 … -> FAIL`, `[wc-c] side-by-side drawn=1`,
+   `[wc-g] … slow=yes -> RACE`, `[dragperf] … -> FAIL`) is present at the base sha and belongs to
+   whichever arc owns those instruments. It is named here so a future capture is not misread as this
+   arc's.
+
 ---
 
 ## 7. Accounting check
