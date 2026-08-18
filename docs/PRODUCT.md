@@ -36,6 +36,8 @@ Cell values: **yes** (verified on that platform) · **no** (verified absent) · 
 | Multi-core scheduling (SMP) | ? | yes | Pi: 4 cores on metal |
 | EL0 process isolation + ACL persistence | ? | yes | Pi: K2 metal-confirmed 2026-07-11 |
 | Reboot-surviving filesystem (CoW, power-cut safe) | ? | yes | Pi: K8a/K8b metal-confirmed |
+| File manager (Quarry: volume tree + detailed list) | no | partial | `UNAOS_QUARRY=1`. Module type-checks on BOTH arches, but its data source is the VFS mount table, which `fs/vfs.rs` gates to aarch64 — x86 opens on an empty volume list until the x86 VFS adoption lands (vfs.md §12.4). Pi: opens and reads `/` at bench geometry in QEMU; declines at 640x480 by the CONSOLEWIN law; metal eyeball unflown. docs/dev/OS/05_USER_EXPERIENCE/quarry.md |
+| Scrolling (any list, anywhere) | no | partial | Quarry only, and app-owned: no wheel (the xHCI HID decoder drops the byte), no content offset in `wm`, no scrollbar widget, no rect-scoped blit. quarry.md §4 |
 
 x86 column is mostly **?** because this seat has never verified that bench; the x86 seat's
 landing reports claim more. First x86 session under this law: verify and fill the column.

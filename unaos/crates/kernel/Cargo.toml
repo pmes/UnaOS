@@ -1218,6 +1218,28 @@ piinstall = ["baremetal"]
 piinstall_arm = ["piinstall"]
 piinstall_confirm = ["piinstall_arm"]
 
+# QUARRY: `UNAOS_QUARRY=1` arms UnaOS's FILE MANAGER (`video::quarry::live`) — Peter's naming and
+# shape, 2026-08-17: "Tree on left and start with detailed list view on right." A kernel-owned
+# compositor window over the ONE VFS mount table: the mounted volumes as an expandable tree on the
+# left, a name/size/modified list of the selected directory on the right, and the first scrolling
+# anything in this tree has had (nothing in `wm`/`present`/the HID path carries a content offset —
+# see `docs/dev/OS/05_USER_EXPERIENCE/quarry.md` §4).
+#
+# It rides the DESKTOP knob family rather than replacing it: `video::quarry` is declared under the
+# same gate the furniture family carries (`any(all(x86_64, wc), all(aarch64, pidesk))`), so BOTH
+# arches type-check the module, and this feature decides whether that module is the implementation or
+# a handful of `#[inline(always)] false` stubs. That split is not cosmetic — Quarry's key and click
+# hooks are FOLDED INTO existing `#[cfg(feature = "pidesk")]` one-liners in
+# `arch/aarch64/syscall.rs`, a file compiled into the knob-off `kernel8.img` where an added line
+# breaks byte-identity (panic `Location` records embed line numbers), so the hook could not carry a
+# second `cfg` of its own. See `video/quarry.rs`'s header.
+#
+# The knob class is `pidesk`'s (builder=0): kernel8's feature list is CURATED in `arroyo`'s K8_FEATS
+# block. Default OFF => `quarry/live.rs` is not compiled, the stubs inline to nothing, and
+# `kernel8.img` is byte-identical to baseline. Arming it does NOT imply `pidesk`; a Pi build wants
+# `UNAOS_QUARRY=1 UNAOS_PIDESK=1` so the desktop seam that opens the window exists.
+quarry = []
+
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }

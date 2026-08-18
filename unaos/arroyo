@@ -1562,7 +1562,7 @@ KERNEL_CFG_MATRIX=(
   # way, which is the build the metal flight actually carries.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the
@@ -1570,7 +1570,7 @@ KERNEL_CFG_MATRIX=(
   # PI-DESK (`pidesk` — the desktop furniture family on the Pi panel; this leg carries `witness`, so it
   # is also the only place the dock/menubar/crystal FIXTURES are type-checked on aarch64).
   # Cannot carry the tegra family — see the mutual-exclusion note above.
-  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,pidesk,v3d_unarmclose"
+  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,pidesk,v3d_unarmclose,quarry"
   # aarch64 board leg 2 — Jetson Orin Nano (Tegra234), plus the board-neutral aarch64 features that
   # would otherwise ride nothing: ORIN-SMP (tegrasmp/smpprobe), the four XCARVE levers, ORIN-NET-1..4
   # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET
@@ -2843,6 +2843,21 @@ kernel8() {
     if [ -n "${UNAOS_PIDESK:-}" ]; then
         K8_FEATS="${K8_FEATS},pidesk"
         echo -e "${COLOR_YELLOW}  • UNAOS_PIDESK: desktop furniture on the BCM2711 panel (dock window-switcher strip + SHARD menu; menu bar default OFF), clicks routed through the Pi mouse${COLOR_RESET}"
+    fi
+    # QUARRY: UNAOS_QUARRY=1 adds the `quarry` feature — UnaOS's FILE MANAGER (Peter's naming and
+    # shape, 2026-08-17: "Tree on left and start with detailed list view on right"). A kernel-owned
+    # compositor window over the ONE VFS mount table: the tree of mounted volumes on the left, the
+    # name/size/modified list of the selected directory on the right, and the first scrolling in this
+    # tree. Same curated-list class as UNAOS_PIDESK above (builder is deliberately NOT touched).
+    #
+    # PAIR IT WITH UNAOS_PIDESK. `quarry` compiles the module; `pidesk` is what OPENS the window
+    # (`video/pidesk.rs`'s DESKTOP-READY seam) and what routes keys and clicks to it — armed alone, the
+    # feature builds a file manager nothing on this arch can reach. OFF => `quarry/live.rs` is not
+    # compiled, the stubs inline to nothing, and kernel8.img is byte-identical to baseline. See
+    # docs/dev/OS/05_USER_EXPERIENCE/quarry.md.
+    if [ -n "${UNAOS_QUARRY:-}" ]; then
+        K8_FEATS="${K8_FEATS},quarry"
+        echo -e "${COLOR_YELLOW}  • UNAOS_QUARRY: the file manager on the BCM2711 panel (volume tree + detailed list + scrolling; arrows/Enter/Backspace/Esc, click, and the dock's pinned tile)${COLOR_RESET}"
     fi
     echo -e "${COLOR_YELLOW}⚡ Building bare-metal kernel8.img (Pi 4, microSD-slot boot)...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"

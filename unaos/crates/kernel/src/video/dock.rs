@@ -410,6 +410,12 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 /// this id has nothing to raise and is the reopen request instead.
 const SHELL_PIN_ID: wm::WinId = wm::WinId::MAX;
 
+/// QUARRY-PIN — the pinned file-manager tile's synthetic window id. One below [`SHELL_PIN_ID`] on the
+/// same argument: real ids are `1..=wm::MAX_WINDOWS` and `wm::WIN_NONE` is 0, so neither sentinel can
+/// ever name a live row or collide with [`PRESSED`]'s idle value. Declared in both feature polarities
+/// (a `const` costs nothing) so the press arm below reads the same either way.
+const QUARRY_PIN_ID: wm::WinId = wm::WinId::MAX - 1;
+
 /// SHELLPIN — the reopen request, latched by [`press_at`] on the pinned tile and consumed by the
 /// render service (`main.rs`) with [`take_shell_reopen`] at the tail of the same event burst. A
 /// `swap` on both sides, so a double press before service is one reopen, not two — the "one live
@@ -445,6 +451,55 @@ fn pin_shell(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
     n + 1
 }
 
+/// QUARRY-PIN — the FILE MANAGER's permanent tile, and the dock's first PINNED APP.
+///
+/// Peter's direction, 2026-08-17: Quarry is *"pinned to the left side of the taskbar/dock so it opens
+/// like Mac's Finder"*. So this one PREPENDS rather than appends — Finder is the leftmost tile on
+/// macOS and the ask names that position specifically — and it is applied after [`pin_shell`] so the
+/// settled strip reads `[quarry] [live windows…] [shell]`, which is the macOS order (leftmost pinned
+/// app, switcher in the middle, the permanent tail on the right).
+///
+/// ### This does not make the dock a launcher
+///
+/// The module header's ruling stands and is not being quietly reversed: there is exactly one launch
+/// path in this kernel (the shell's program source / `bg`) and this adds no second one. Quarry is not
+/// a program — it is a KERNEL-OWNED window, the same class of furniture as the console window, and
+/// this tile is its REOPEN route for exactly the reason [`pin_shell`] is the shell's: a window an
+/// operator can close and cannot call back is a window they have lost. When Quarry is LIVE its real
+/// row is dock-addressable (kernel owners are), so the model is unchanged and no pin is added — the
+/// pin exists only while it is closed, precisely as the shell's does.
+///
+/// Returns the new count. Applied by every reader of the model — [`compose`], [`press_at`],
+/// [`strip_rect`] — so painter, router and occlusion registry cannot disagree about the tile count.
+#[cfg(feature = "quarry")]
+fn pin_quarry(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
+    if n >= wm::MAX_WINDOWS
+        || rows[..n].iter().any(|r| r.owner_asid == crate::video::quarry::OWNER)
+    {
+        return n;
+    }
+    let mut e = wm::DockEntry::empty();
+    e.id = QUARRY_PIN_ID;
+    e.owner_asid = crate::video::quarry::OWNER;
+    e.title[..6].copy_from_slice(b"quarry");
+    e.title_len = 6;
+    // Closed => OFF the panel, so the pip takes the minimised ink, the same honest read a parked
+    // window gives. `pin_shell`'s rule, unchanged.
+    e.visible = false;
+    e.focused = false;
+    // Prepend: shift the scanned rows right by one and take slot 0. Bounded by `n < MAX_WINDOWS`
+    // above, so the shift can never write past the array.
+    rows.copy_within(0..n, 1);
+    rows[0] = e;
+    n + 1
+}
+
+#[cfg(not(feature = "quarry"))]
+#[inline(always)]
+fn pin_quarry(_rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
+    n
+}
+
 /// STRIPFACTOR — the tenant's registry hook: **the dock's rect on this panel, or `None`.**
 ///
 /// Registered as [`strip::TENANTS`]`[strip::DOCK_SLOT]`, so this is what `wm::erase_clip` reads. It
@@ -458,6 +513,9 @@ pub fn strip_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
     let (n, _) = wm::dock_scan(&mut tiles, (0, 0, 0, 0));
     // SHELLPIN — the registry must report the strip the painter will paint, pinned tile included.
     let n = pin_shell(&mut tiles, n);
+    // QUARRY-PIN — after the shell pin, and PREPENDING (see `pin_quarry`): the settled strip is
+    // `[quarry] [live windows…] [shell]`, the macOS order Peter's direction names.
+    let n = pin_quarry(&mut tiles, n);
     Layout::for_panel(n, pw, ph).map(|l| l.rect())
 }
 
@@ -567,6 +625,9 @@ pub fn compose() -> bool {
     // SHELLPIN — the permanent shell tile, appended before the signature so a shell close (the row
     // vanishing, the pin appearing) is a MODEL change and repaints on its own.
     let n = pin_shell(&mut rows, n);
+    // QUARRY-PIN — after the shell pin, and PREPENDING (see `pin_quarry`): the settled strip is
+    // `[quarry] [live windows…] [shell]`, the macOS order Peter's direction names.
+    let n = pin_quarry(&mut rows, n);
     // WCK5 — one relaxed add on the pass that was clobbered, and nothing at all on the quiet pass.
     if clobbered {
         CLOBBERS.fetch_add(1, Ordering::Relaxed);
@@ -824,6 +885,9 @@ pub fn press_at(x: i32, y: i32) -> bool {
     let (n, _) = wm::dock_scan(&mut rows, (0, 0, 0, 0));
     // SHELLPIN — the router routes over the same pinned model the painter drew.
     let n = pin_shell(&mut rows, n);
+    // QUARRY-PIN — after the shell pin, and PREPENDING (see `pin_quarry`): the settled strip is
+    // `[quarry] [live windows…] [shell]`, the macOS order Peter's direction names.
+    let n = pin_quarry(&mut rows, n);
     let (pw, ph) = {
         let fb = *super::WRITER.lock();
         if !fb.is_ready() {
@@ -847,6 +911,19 @@ pub fn press_at(x: i32, y: i32) -> bool {
     // reopen request for the render service (which owns the shell's Console/Screen/window id and is
     // the one place a reopen can rebind them), and consume the press. Focus hand-back
     // (`user_input_set_active(0)`) happens at the reopen itself, keyed to the NEW window.
+    // QUARRY-PIN — the file manager's tile names no row while it is closed. LATCH the open rather
+    // than performing it: this runs inside a click router, and Quarry's open READS DIRECTORIES —
+    // `crate::video::quarry::service()` drains the latch from the arch's input-drain task, which is
+    // where a volume read belongs. Consumed either way, so the press never falls through to a window.
+    #[cfg(feature = "quarry")]
+    if r.id == QUARRY_PIN_ID {
+        crate::video::quarry::request_open();
+        serial_println!(
+            "[dock] press at ({},{}) tile={}/{} quarry=pin -> open requested",
+            x, y, t, n
+        );
+        return true;
+    }
     if r.id == SHELL_PIN_ID {
         SHELL_REOPEN.store(true, Ordering::Release);
         serial_println!(
@@ -1055,6 +1132,9 @@ pub fn selftest() {
     // so the raw count is one tile short of the strip press_at lays out: every boundary shifts, the
     // probe centre lands off its tile — and can land ON the pin tile, latching a spurious reopen.
     let n = pin_shell(&mut rows, n);
+    // QUARRY-PIN — after the shell pin, and PREPENDING (see `pin_quarry`): the settled strip is
+    // `[quarry] [live windows…] [shell]`, the macOS order Peter's direction names.
+    let n = pin_quarry(&mut rows, n);
     let mine: [Option<usize>; 3] = [
         rows[..n].iter().position(|r| r.id == w[0]),
         rows[..n].iter().position(|r| r.id == w[1]),

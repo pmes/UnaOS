@@ -287,6 +287,28 @@ pub fn activate() -> bool {
         "[pidesk] pulse-window ARMED view={} (the render pass opens it on its first live instrument sample; menu: click `View` in the window's own strip — first option is the Pi LED face, second is the x86 segment face; the desktop LED band is unchanged)",
         super::pulsewin::view().label()
     );
+    // 6. QUARRY — the file manager, when `UNAOS_QUARRY=1` armed it. This is the Pi's answer to the
+    //    question `wcx`'s `DESKTOP_APP_ARMED` answers on x86: what does the desktop OPEN once it is
+    //    up? The module header above says this seam deliberately mints no second launcher, and it
+    //    still does not — `open()` is not a launch, it is the same kind of kernel-furniture window
+    //    `panel_console_window_open` mints thirty lines above, over a surface this module never
+    //    touches. It is LAST on purpose: it reads directories, and every step before it is either
+    //    pure geometry or a flag, so a declined or slow volume read cannot delay the bar's paint.
+    //
+    //    The witness runs FIRST and unconditionally under `witness`, because its legs are pure
+    //    functions over synthetic input (geometry, the scroll clamp, the tree splice, press-to-row).
+    //    It needs no panel, no volume and no window, so it must not be able to be skipped by a
+    //    DECLINE in the thing it is proving the arithmetic of.
+    #[cfg(all(feature = "quarry", feature = "witness"))]
+    super::quarry::selftest();
+    #[cfg(feature = "quarry")]
+    {
+        super::quarry::open();
+        serial_println!(
+            "[pidesk] quarry open={} — the file manager is a desktop tenant (arrows/Enter/Backspace move, Esc closes, the dock's pinned tile reopens)",
+            super::quarry::is_open()
+        );
+    }
 
     // ── THE LIVE-CONSOLE DECISION, and the measurement that settled it ──────────────────────────
     //

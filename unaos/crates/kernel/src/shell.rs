@@ -1629,7 +1629,7 @@ fn print_dir_listing(console: &mut Console, entries: &[DirEntry], long: bool) {
 /// volumes report failures in one vocabulary instead of three.
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::type_complexity)]
-fn vfs_ls_collect(path: &str) -> Result<(bool, Vec<crate::fs::vfs::DirEnt>), String> {
+pub(crate) fn vfs_ls_collect(path: &str) -> Result<(bool, Vec<crate::fs::vfs::DirEnt>), String> {
     use crate::fs::vfs::{DirEnt, NodeKind};
     let mt = vfs_mount_table();
     // VFS-4: a path naming a reserved volume that is not currently bound reports the VOLUME as
@@ -5104,7 +5104,7 @@ fn vfs_path(arg: &str) -> String {
 }
 
 #[cfg(target_arch = "aarch64")]
-fn vfs_mount_table() -> crate::fs::vfs::MountTable {
+pub(crate) fn vfs_mount_table() -> crate::fs::vfs::MountTable {
     use crate::fs::vfs::{FatBackend, MountTable, NativeBackend, KERNEL_PRINCIPAL};
     let mut mt = MountTable::new();
     mt.mount("/", alloc::boxed::Box::new(NativeBackend::new("native")));

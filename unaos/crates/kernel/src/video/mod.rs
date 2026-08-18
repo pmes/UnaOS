@@ -342,3 +342,18 @@ pub mod pidesk;
     all(target_arch = "aarch64", feature = "pidesk")
 ))]
 pub mod pulsewin;
+// ── QUARRY ──────────────────────────────────────────────────────────────────────────────────────
+// UnaOS's FILE MANAGER (Peter, 2026-08-17: "Tree on left and start with detailed list view on
+// right"). A kernel-owned compositor window over the VFS mount table — tree of the mounted volumes on
+// the left, name/size/modified list on the right, and the first scrolling anything in this tree has
+// had. Same gate as the furniture family above (x86 `wc` OR aarch64 `pidesk`) so BOTH arches
+// type-check it, with the implementation armed separately by `UNAOS_QUARRY=1`; see `quarry.rs` for
+// why the knob lives inside the module rather than on this line, and
+// `docs/dev/OS/05_USER_EXPERIENCE/quarry.md` for the design of record — including why it is a kernel
+// window today and exactly what the ring-3 port is waiting on.
+//
+// Declared BELOW `pidesk` for `pidesk`'s own reason, restated because it is the trap: a `mod` line
+// inserted higher up renumbers every panic `Location` recorded below it in this file. Nothing is
+// below this, so nothing moves, and a knob-off `kernel8.img` is byte-identical.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+pub mod quarry;
