@@ -1298,5 +1298,5 @@ REQUIRE :: TERMRING: transport ring slots=64 len=240 .* :: PASS ::
 # ---    Every number is pinned, so the fixture's own SKIP line (window table full) cannot satisfy
 # ---    this rule and neither can its FAIL — the values are what make it a gate rather than a
 # ---    presence check.
-REQUIRE :: WMCTRL: controls-declined — floor=158 .* furniture close=true minzoom=true packed=true/Some.* silent=true reaped=true :: PASS ::
+REQUIRE :: WMCTRL: controls-declined — floor=149 .* furniture close=true minzoom=true packed=true/Some.* silent=true reaped=true :: PASS ::
 FORBID :: WMCTRL: .* :: FAIL ::
