@@ -420,10 +420,29 @@ static H_MINPRES: [AtomicU64; IDS] = [const { AtomicU64::new(u64::MAX) }; IDS];
 ///
 /// **This is a CENSUS, not a verdict.** `torn=`, `-> AT-RISK` and their precedence are untouched by
 /// WCH-SPREAD: the counter is published beside them and the reading is left to whoever consumes the
-/// line. The x86 seat holds the open item of teaching the tear TEST itself a stall guard; when that
-/// lands, this pair is the measurement it can be built on rather than a second, competing opinion.
+/// line. The stall guard that doc's first edition named as the x86 seat's open item now EXISTS —
+/// [`H_STALL`]/[`STALL_SPREAD`] in [`stage_note`]'s tear test — and is built on exactly this pair.
 static H_MINRATE: [AtomicU64; IDS] = [const { AtomicU64::new(u64::MAX) }; IDS];
 static H_MAXRATE: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+/// WCH-STALL — per-id: slow presents the tear test CONVICTED OF STALLING rather than tearing: the
+/// present outran the beam (`present_us > rectscan_us`, [`H_TORN`]'s own test) but its per-4-KiB
+/// rate was more than [`STALL_SPREAD`]× this window's established floor. That is the desched shape
+/// [`H_MINRATE`]'s doc describes — slow ONCE, at random, beside fast siblings — not the uniformly
+/// slow copy a genuine tear risk is. This is the stall guard that doc names as the x86 seat's open
+/// item, built on the measurement it asked for.
+///
+/// The precedence is deliberate and conservative: a window's FIRST slow present can never be
+/// convicted (its own rate seeds the floor, ratio 1), and a window whose every present is slow
+/// keeps counting `torn=` exactly as before — the guard only diverts the outliers. `stalls=` is
+/// printed beside `torn=` so the diverted population stays on the wire; the verdict reads `torn=`
+/// alone, so a stall can never manufacture `-> AT-RISK` and metal FORBIDs keep their teeth.
+static H_STALL: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+/// WCH-STALL — how many times the window's floor rate a slow present must exceed to be convicted a
+/// stall. The measured separation is wide: real bench presents hold `presspread=1` while desched'd
+/// QEMU boots read 58–407 (the GR27 discriminator ledger), so 8 sits an order of magnitude under
+/// the smallest observed stall and a factor of 8 above the honest spread. Integer, because the
+/// rates it multiplies are.
+const STALL_SPREAD: u64 = 8;
 /// Per-id: composites that did NOT reach the back layer and ran on the direct (pre-WC-H) path — the
 /// tearing regime. Excludes the deliberate fixture decline, which is counted separately.
 static H_DECLINE: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
@@ -730,8 +749,23 @@ pub fn stage_note(
     // stop reporting as a steady state.
     let present_us = cycles_to_us(t_end.saturating_sub(t1));
     let rectscan_us = if panel_h == 0 { 0 } else { FRAME_US * span as u64 / panel_h as u64 };
+    // WCH-STALL — classify BEFORE this present folds into the floor below: the comparison must be
+    // against the floor the window had EARNED, or a slow first present would be judged against
+    // itself. `lo == u64::MAX` (no floor yet) and `bytes == 0` (no rate exists) both decline the
+    // conviction and leave the present to `torn=`, which is the conservative direction: the guard
+    // may only ever DIVERT a tear count, never invent one, and only when the window itself has
+    // proven it can present an order of magnitude faster.
     if present_us > rectscan_us {
-        H_TORN[i].fetch_add(1, Ordering::Relaxed);
+        let stalled = bytes != 0 && {
+            let rate_ns_4k = present_us.saturating_mul(4_096_000) / bytes as u64;
+            let lo = H_MINRATE[i].load(Ordering::Relaxed);
+            lo != u64::MAX && rate_ns_4k > lo.saturating_mul(STALL_SPREAD)
+        };
+        if stalled {
+            H_STALL[i].fetch_add(1, Ordering::Relaxed);
+        } else {
+            H_TORN[i].fetch_add(1, Ordering::Relaxed);
+        }
     }
     H_MAXPRES[i].fetch_max(present_us, Ordering::Relaxed);
     // WCH-SPREAD — the floor and the two rate extremes, taken here for exactly the reasons the tear
@@ -1139,9 +1173,10 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
     // keys. Nothing is renamed, nothing is reordered, and the terminal stays terminal. The two new
     // keys go INSIDE the `pop=all-presents` run, beside `maxpresent_us=` whose population they share;
     // putting them after `pop=constant` would have filed two measurements under the marker that means
-    // "compile-time constant".
+    // "compile-time constant". WCH-STALL's `stalls=` follows the same insertion rule, directly after
+    // `torn=` — the population it was diverted from.
     serial_println!(
-        "[wc-h] rollup win={} scope={} emit={} age_ms={} pop=budgeted samples={} budget={} pop=all-presents torn={} declines={} fixture={} whole={} banded={} lines={} minspan={} minspan_bytes={} maxpresent_us={} minpresent_us={} presspread={} pop=constant frame_us={} -> {}",
+        "[wc-h] rollup win={} scope={} emit={} age_ms={} pop=budgeted samples={} budget={} pop=all-presents torn={} stalls={} declines={} fixture={} whole={} banded={} lines={} minspan={} minspan_bytes={} maxpresent_us={} minpresent_us={} presspread={} pop=constant frame_us={} -> {}",
         id,
         scope,
         emit,
@@ -1149,6 +1184,7 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
         taken.min(SAMPLES),
         SAMPLES,
         torn_n,
+        H_STALL[i].load(Ordering::Relaxed),
         decl_n,
         H_FIXTURE[i].load(Ordering::Relaxed),
         H_WHOLE[i].load(Ordering::Relaxed),
@@ -2369,7 +2405,11 @@ pub(super) fn wch_recycle(i: usize) {
     W_MAXUS[i].store(0, Ordering::Relaxed);
     W_WITUS[i].store(0, Ordering::Relaxed);
     H_TORN[i].store(0, Ordering::Relaxed);
+    H_STALL[i].store(0, Ordering::Relaxed);
     H_MAXPRES[i].store(0, Ordering::Relaxed);
+    H_MINPRES[i].store(u64::MAX, Ordering::Relaxed);
+    H_MINRATE[i].store(u64::MAX, Ordering::Relaxed);
+    H_MAXRATE[i].store(0, Ordering::Relaxed);
     H_DECLINE[i].store(0, Ordering::Relaxed);
     H_FIXTURE[i].store(0, Ordering::Relaxed);
     H_PEND[i].store(0, Ordering::Relaxed);

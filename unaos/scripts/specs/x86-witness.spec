@@ -1196,6 +1196,17 @@ FORBID \[wc-k\] .*outside=[1-9]
 #     which this grammar cannot state at all. It lives in `tools/serial-analyzer.py --wxn`, which
 #     reconciles the two walkers per boot and exits FINDING when they disagree.
 
+# --- WCH-STALL: THE TEAR TEST'S STALL GUARD, ASSERTED FOR SELF-CONSISTENCY -------------------
+# --- The [wc-h] rollup's `stalls=` (inserted after `torn=`) counts slow presents the tear test
+# --- convicted of DESCHED rather than tear: present_us outran the beam but the per-4KiB rate was
+# --- > STALL_SPREAD (8) x this window's own floor (video/wcg.rs, H_STALL). The [wc-h] family
+# --- stays the pi4 gate's subject (see the bullet above); what belongs HERE is the guard's
+# --- internal consistency, because a conviction REQUIRES a spread: a present convicted as a stall
+# --- implies maxrate/minrate > 8, so `stalls=` nonzero beside `presspread=` in single digits 0-7
+# --- is arithmetic the emitter cannot honestly produce — it means the guard convicted without the
+# --- evidence, and the verdict diversion (a torn count silently suppressed) is live. Both scopes.
+FORBID \[wc-h\] rollup .*stalls=[1-9][0-9]* .*presspread=[0-7] pop=constant
+
 # --- WCK4: THE ERASE-DISCIPLINE VERDICTS, FORBIDDEN ------------------------------------------
 # --- The [drag-occ] witness measures pixels PUBLISHED into the dragged window's live box by
 # --- painters that are not the dragged window (occ_px = a window over its occluder, fill_px =
