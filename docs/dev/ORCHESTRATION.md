@@ -23,7 +23,11 @@
 >   and the disagreement goes to Peter with both positions. Silence is never
 >   consent; a 1-1 split never deadlocks unrecorded. ("Trunk" throughout is
 >   name-agnostic — one trunk branch; `main` per Peter's 2026-08-18 ruling
->   retiring the `UnaOS-gemini` staging name.)
+>   retiring the `UnaOS-gemini` staging name.) **Landing race**: immediately
+>   before the `--no-ff` merge, announce over ccd + fresh `ls-remote`; if
+>   trunk moved since the review, merge the new trunk into the arc and re-run
+>   the trunk battery first — first announced merge wins, the other rebases
+>   its landing on the result.
 > - **Track sync ("rebase the tracks")** → each track MERGES trunk into its
 >   branch at its own arc boundaries. Never rebase a pushed tip; never
 >   force-push. (The step-4 `--ff-only` flow applies only to a track with no

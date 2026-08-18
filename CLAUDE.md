@@ -63,7 +63,11 @@ several sessions can work in parallel without stepping on each other.
     failure). **Dispute path**: no ack, or an objection the seats cannot
     resolve over ccd → the merge does not happen and the disagreement goes to
     Peter with both positions. Silence is never consent; a 1-1 split never
-    deadlocks unrecorded.
+    deadlocks unrecorded. **Landing race**: immediately before the `--no-ff`
+    merge, announce over ccd and run a fresh `ls-remote`; if trunk moved since
+    your review, merge the new trunk into your arc and re-run the trunk
+    battery before landing — first announced merge wins, the other rebases its
+    landing on the result.
   - **Sync**: each track picks up trunk at its own arc boundaries by MERGING
     trunk into its branch (never rebase a pushed tip; never force-push).
   - **Doc/`arroyo` conflicts** are reconciled by the landing seat (union: keep
