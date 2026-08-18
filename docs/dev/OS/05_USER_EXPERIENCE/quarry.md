@@ -1,7 +1,9 @@
 # QUARRY — UnaOS's file manager
 
-Status: **M1 landed** — the window, the volume tree, the detailed list, and the first scrolling in
-this tree. Knob: `UNAOS_QUARRY=1` (pair it with `UNAOS_PIDESK=1`).
+Status: **M2 landed** — M1's window, volume tree, detailed list and scrolling, plus the four
+corrections the bench asked for: a cached listing path, one row per volume, a working double-click
+launch, and a landing rule that opens where the content is. Knob: `UNAOS_QUARRY=1` (pair it with
+`UNAOS_PIDESK=1`).
 
 Peter's direction, 2026-08-17, verbatim: *"Tree on left and start with detailed list view on right.
 I'm not sure we have scrolling yet."* — and, on placement: *"pinned to the left side of the
@@ -11,15 +13,34 @@ He was right about the scrolling. There was none. §4 is the audit.
 
 ---
 
+## 0. M2 — the four bench complaints, and what each one actually was
+
+M1 shipped and was driven on the bench the same night. Four things came back, verbatim, and none of
+them was a matter of taste. Each had a mechanism; §11 writes each mechanism and its fix down in full,
+and this table is the map.
+
+| Peter said | it actually was | the fix |
+| --- | --- | --- |
+| *"FAT contents VERY SLOW to come up"* | one listing = **three full volume probes**, and every navigation asked for the same directory **twice** | a path-keyed directory cache — §11.1 |
+| *"/fat is LISTED TWICE"* | every mount prefix was a tree ROOT, **and** `/`'s listing carries the same mount points as child rows | the duplicate-root rule — §11.2 |
+| *"double-click on VUG should open the app"* | M1 deliberately minted no launch path at all | double-click / `Enter` → `spawn_user_image_bg`, the shell's own `bg` seam — §11.3 |
+| *"where is vug, where is the kernel — nothing about it is normal"* | it opened on the **emptiest volume in the namespace** (`/` carries two files; the card is `/fat`) | the landing rule — §11.4 |
+
+Nothing in M2 is FAT-specific. ORIN lays out UnaFS in days, and every rule below is written against
+the namespace (mount prefixes, directory entries, the block layer's hot-plug epoch) rather than
+against a filesystem — §11.5 states that constraint and where each fix satisfies it.
+
+---
+
 ## 1. What it is
 
 A compositor window carrying two panes and a path bar.
 
 | region | contents |
 | --- | --- |
-| path bar | the absolute VFS path the list pane is showing, plus a truncation notice when the medium had more entries than the model holds |
-| left pane | the **directory tree** — one root per mounted volume (`/`, `/fat`, `/usb` when the stick is present), expandable to `MAX_DEPTH` (8) levels, with a disclosure triangle per row |
-| right pane | the **detailed list** of the selected directory — `NAME` · `SIZE` · `MODIFIED`, header pinned above the scrolled band |
+| path bar | the absolute VFS path the list pane is showing, a truncation notice when the medium had more entries than the model holds, and (M2) the **last activation's result** — `started pid 7`, `8 live jobs — kill one first`, `no opener for CONFIG.TXT`. This window has no console, so a launch's only feedback is here |
+| left pane | the **directory tree**. M2: one root per **unclaimed** mount prefix (§11.2) — on this machine that is `/` alone, with `fat/` and `usb/` under it — expandable to `MAX_DEPTH` (8) levels, with a disclosure triangle per row |
+| right pane | the **detailed list** of the selected directory — `NAME` · `SIZE` · `MODIFIED`, header pinned above the scrolled band. M2 marks rows `ls -F` style: `/` for a directory, `*` for a file a double-click will RUN |
 | both panes | a scrollbar in `theme::SCROLL_TRACK`/`SCROLL_THUMB` whenever the content is taller than the pane |
 
 Files: `unaos/crates/kernel/src/video/quarry.rs` (the knob seam) and
@@ -32,9 +53,9 @@ Files: `unaos/crates/kernel/src/video/quarry.rs` (the knob seam) and
 | `Up` / `Down` | move the selection in the focused pane; the viewport follows it |
 | `Left` | in the list, focus the tree; in the tree, collapse — or step to the parent row when already closed |
 | `Right` | in the tree, expand — or, on an already-open row, cross into the list |
-| `Enter` | tree: show this directory. list: descend into the selected directory, revealing it on the left |
+| `Enter` | tree: show this directory. list: **open the row** — descend into a directory (revealing it on the left), or RUN a `.ELF`/`.BIN`. The keyboard twin of the double-click, deliberately the same function: a gesture that exists only on the pointer is one an operator at a serial console cannot reach |
 | `Backspace` | up one level |
-| `r` | re-read — **including the mount table**, so a stick plugged after Quarry opened appears |
+| `r` | re-read — **including the mount table**, and (M2) dropping the directory cache, so a stick plugged after Quarry opened appears and a card written to from the shell re-reads |
 | `Esc` | close (the keyboard goes straight back to the console) |
 
 The keyboard contract is `instgui`'s: while Quarry's window is **on the glass** it takes first refusal
@@ -43,8 +64,12 @@ keyboard straight back. "On the glass" and not merely "open" is load-bearing —
 *minimised* as a position (`z` below `SHELL_Z`), so a parked Quarry that kept first refusal would be
 eating arrows for a window the operator cannot see. The pointer needs no equivalent guard:
 `wm::hit_test` does not report a row that is not compositing.
+
+| pointer gesture | effect |
+| --- | --- |
 | click a tree row | select and show it; clicking the **disclosure triangle** toggles instead |
 | click a list row | select it |
+| **double-click a list row** | (M2) open it — same rule as `Enter`. Two presses on the **same row of the same pane** inside `DOUBLE_CLICK_MS` (400 ms). §11.3 derives the constant; nothing in this tree had one |
 | click a scrollbar **track** | page towards the press — see §4 for why the track, and not a wheel |
 | title bar / borders | drag, minimise, zoom — the ordinary `wm` arms, deliberately not claimed |
 | dock's `quarry` tile | reopen |
@@ -309,13 +334,49 @@ Quarry moves to EL0 the day these are true. Nothing here is Quarry's own work.
 6. *(optional, for cost)* **A wheel event in the ABI** and un-ignoring `data_data[3]` in the xHCI HID
    decoder; and `SYS_WIN_PRESENT_ROWS` on both arches, so a scroll costs a row band rather than a box.
 
+M2 adds two, both of which are about what a double-click on a NON-program should do:
+
+7. **An opener registry**, and something to open a document WITH. There is none of either today: no
+   association table, no viewer, no editor. A double-click on `CONFIG.TXT` therefore does nothing and
+   says so on the wire (`[quarry] open UNHANDLED path=… — no opener exists in this tree`), which is
+   the honest posture — "broken" and "not built yet" must be tellable apart.
+8. **`SYS_EXEC` with an argv**, so an opener could be *handed* the path it is meant to open.
+   `spawn_user_image_bg` takes an image and nothing else; a program launched from Quarry today is
+   launched exactly as `bg` launches it, with no argument, which is why the launch path is limited to
+   programs that need none.
+
+A third item is a bookkeeping debt rather than a capability:
+
+9. **A launch registry the shell and Quarry share.** `bg`'s job table (`BG_JOBS`) is `shell.rs`-private,
+   and `shell.rs` is compiled into the knob-off `kernel8.img`, where an added line breaks the
+   byte-identity proof (PARITY.md §5.3). So Quarry keeps its own small table and runs the *same*
+   reaper (`bg_poll(pid, reap = true)`) on every gesture and every `service()` pass. The consequence
+   is named rather than hidden: a Quarry-launched program does not appear in the shell's `jobs`, and
+   `MAX_JOBS` (8) is the ceiling on how many it can have outstanding. The 9th launch reaps first and
+   then declines out loud in the path bar.
+
 ---
 
 ## 8. The witness
 
-`:: QUARRY: … :: PASS ::`, five legs, `witness`-gated, run from `pidesk::activate` step 6 **before**
-`open()` — its legs are pure functions over synthetic input (no panel, no volume, no window table), so
-a DECLINE in the thing it proves the arithmetic of must not be able to skip it.
+`:: QUARRY: … :: PASS ::`, **ten** legs (M1's five plus M2's five), `witness`-gated, run from
+`pidesk::activate` step 6 **before** `open()` — its legs are pure functions over synthetic input (no
+panel, no volume, no window table), so a DECLINE in the thing it proves the arithmetic of must not be
+able to skip it.
+
+M2 also arms it. `pi4-regression.spec` carries
+
+```
+FORBID :: QUARRY: .* :: FAIL ::
+```
+
+so a regression in any leg reds **both** batteries (knob-off and armed alike — the fixture is
+`witness`-gated, so it is present on both) instead of printing a FAIL nobody greps for. It is a
+FORBID and not a REQUIRE for the standing arithmetic reason recorded beside `SHARD-PRESS` and
+`SERIAL-FOCUS` in that spec: a REQUIRE would move the count this arc's DONE gate is stated against,
+and would red a knob-off build for not carrying a knob it was never given. A FORBID costs nothing at
+0 hits and still catches the regression. M1 shipped this fixture **unguarded**; that is the gap M2
+closes.
 
 | leg | claim |
 | --- | --- |
@@ -324,14 +385,35 @@ a DECLINE in the thing it proves the arithmetic of must not be able to skip it.
 | `thumb` | absent when everything fits; at the floor at scroll 0; **exactly flush with the end of the track at max scroll**; never overruns mid-range |
 | tree splice | `subtree_len` stops at the sibling, and `collapse` is an exact inverse of the splice — the property a hand-rolled index walk gets wrong when a sibling follows the expanded row. Then the SELECTION's three cases: a highlight on a later sibling stays on it (a bare `sel > i` test drags it back onto the closing row — the defect this leg was written against), and a highlight inside the subtree lands on the row that closed over it |
 | press-to-row | the router's row arithmetic **inverts the painter's**, in both panes, with the list's body correctly clearing its pinned header |
+| **duplicate roots** (M2) | `prefix_claims` honours the resolver's boundary rule (`/usb` claims `/usb/a`, never `/usbfoo`); `root_prefixes` reduces the **live** table `["/", "/fat", "/usb"]` — the exact one that produced the bench's double `/fat` — to `["/"]`; it is **idempotent** and **order-independent**; and it does NOT hide a volume on a table with no root mount, nor drop a sibling that only shares a name prefix. That last pair is the leg that rejects the lazy fix ("just keep `/`") |
+| **name dedupe** (M2) | `dedupe_by_name` keeps exactly the first of each name, in order |
+| **launchability** (M2) | `is_executable` accepts `VUG.ELF` / `vug.elf` / `Vug.Elf` / `STAT.ELF` / `HELLO.BIN` / `midden.bin`, and refuses `KERNEL8.IMG`, `CONFIG.TXT`, `SRC.TGZ`, `START4.ELF.BAK`, a bare `.ELF`, a bare `.BIN`, `ELF`, and the empty name |
+| **double-click** (M2) | `is_double` fires exactly at the window and not one ms past it; never pairs different rows or different panes; never fires on a **zero clock** (the guard that stops the first press of a boot launching on a board whose `CNTFRQ_EL0` reads 0); and rejects a backwards clock |
+| **the cache** (M2) | the directory cache never exceeds `MAX_CACHE`, and evicts **oldest-first** |
+| **the launch gesture, end to end** (M2) | two presses at a real pixel, through the **same `content_press` the click router calls**, produce `Act::Launch("/fat/VUG.ELF")`; a third rapid press does NOT re-activate (the stamp reset); presses on two different rows open nothing; and a double-click on `CONFIG.TXT` produces `Act::NoOpener` naming it. Both clock branches are asserted, so the leg is a real claim on a board whose `CNTFRQ_EL0` reads 0 rather than a claim on some boards |
+
+Leg 11 deliberately stops at the **decision**: everything downstream of the `Act` is `bg`'s own
+machinery, exercised on every boot by the BGRUN fixtures, and a fixture that actually spawned a
+program would perturb the very window table the rest of this battery asserts exact pixels of.
 
 It is arch-neutral and disk-free by construction, so it is honest on QEMU raspi4b (no stick) and on
-x86 (no mount table at all) — the two surfaces where a volume-dependent leg would be vacuous.
+x86 (no mount table at all) — the two surfaces where a volume-dependent leg would be vacuous. The
+cache leg is deliberately driven against the model's own `Vec` rather than through `collect_cached`,
+for the same reason: reaching the seam would make it a test of the machine's storage.
 
-Runtime evidence, on the wire, from the seams rather than from a fixture:
+Runtime evidence, on the wire, from the seams rather than from a fixture. M2 adds three lines at open
+and again on every `r`, and each one answers one bench complaint **in the terms it was made in** — so
+a headless capture settles all four without a photograph:
 
 ```
-[quarry] open win=<id> surf=<w>x<h> ts=<n> box=<w>x<h> at (<x>,<y>) roots=<n> rows=<n> cwd-rows=<n>
+[quarry] open win=<id> surf=<w>x<h> ts=<n> box=<w>x<h> at (<x>,<y>) volumes=<n> tree-rows=<n> list-rows=<n> cwd=<path>
+[quarry] open volumes mounts=["/", "/fat"] roots=["/"] tree-rows=<n>          <- "/fat listed twice"
+[quarry] open cost reads=<n> hits=<n> cycles=<n> cache=<n>/16 gen=<n>         <- "VERY SLOW"
+[quarry] open census cwd=/fat entries=<n> dirs=<n> files=<n> names: KERNEL8.IMG(…) VUG.ELF*(12568) …
+                                                                             <- "where is vug, where is the kernel"
+:: QUARRY-LAUNCH: /fat/VUG.ELF — 12568 bytes, entry 0x…, pid=<n> asid=<n> DETACHED ::   <- "double-click should open the app"
+[quarry] open UNHANDLED path=/fat/CONFIG.TXT — no opener exists in this tree
+[quarry] reaped pid=<n> asid=<n> name=<path> — exited status=<n>
 [quarry] press close win=<id> at (<x>,<y>)
 [quarry] closed win=<id> paints=<n>
 [dock]   press at (<x>,<y>) tile=<t>/<n> quarry=pin -> open requested
@@ -353,6 +435,8 @@ clicks. The caps are the loop bounds.
 | `MAX_DEPTH` | 8 | an expand at the ceiling marks the row open with nothing under it |
 | `PATH_MAX` | 160 chars | a longer child is skipped rather than built |
 | surface | 1152 x 720 | the repaint cost §4 states is bounded by this |
+| `MAX_CACHE` (M2) | 16 listings | FIFO — the oldest path is evicted, never the model's growth |
+| `MAX_JOBS` (M2) | 8 programs | the 9th launch reaps first, then declines in the path bar |
 
 ---
 
@@ -407,3 +491,293 @@ forbidden against the 13 the quiet-host arc recorded is the size of the host ter
 No spec REQUIRE or FORBID was touched or re-worded. Teaching `pi4-regression.spec` about a quarry row —
 the way x86's spec was taught "win=1 is the console window on this bench" — is the integrator's
 reconciliation, not this arc's.
+
+---
+
+## 11. M2 — the four fixes, in full
+
+### 11.1 SLOW — the listing path, measured
+
+**The measurement.** One `shell::vfs_ls_collect` is not one volume access. It is three, and none of
+them is a directory read:
+
+1. `vfs_ls_collect` opens with `vfs_mount_table()`, which calls
+   `fat::mount_source(BlockSource::Usb)` to decide whether to bind `/usb` at all (the honest
+   hot-plug posture, `vfs.md` §6). That is a full probe of the stick.
+2. `MountTable::stat(path)` resolves to `FatBackend::stat`, whose **first line** is
+   `fat::mount_source(self.source)`.
+3. `MountTable::read_dir(path)` resolves to `FatBackend::read_dir`, whose first line is
+   `fat::mount_source(self.source)` **again**.
+
+And `mount_source` is not cheap. It reads LBA 0, runs `mbr_census`, attempts a superfloppy `parse_bpb`,
+then `scan_gpt` (LBA 1 plus a partition-entry sector), then walks the accepted MBR entries parsing a
+BPB sector for each — every one of those a real transaction on the SD or USB path, before a single
+directory sector is touched. Both the `stat` and the `read_dir` then resolve the path from the volume
+root independently, so the directory walk happens twice as well.
+
+On top of that, M1's **model asked for the same directory twice per navigation**: `Model::expand`
+collects a row's children for the tree, and `Model::show` immediately collects the identical path for
+the list. Landing on `/fat` cost roughly **4 mount probes and 2 root-directory walks** where one of
+each would do. That is the "VERY SLOW", and it is a per-CALL cost, not a per-ENTRY one.
+
+**The fix: `Model::collect_cached`.** A path-keyed cache of the seam's own answer — `(is_dir, rows)`,
+nothing derived — bounded at `MAX_CACHE` (16) entries with FIFO eviction. It caches *successes only*:
+a `-ENODEV` volume is a state that ends when the operator plugs the stick in, and caching it would
+need a fourth invalidation event to forget it.
+
+Invalidated on exactly three events:
+
+| event | why |
+| --- | --- |
+| **window open** | a fresh `Model` has an empty cache — this is the brief's "per open" |
+| **the `r` key** | the refresh gesture that already existed and already meant "re-read the world" |
+| **a volume generation change** | `drivers::block::usb_publish_gen()`, the block layer's own hot-plug epoch, advanced by every geometry publish and every retraction (PA35's storage race). It is one `Acquire` load of an `AtomicU64`, which is what makes it safe to ask on **every** access — asking `vfs_mount_table()` instead would cost the very USB probe the cache exists to stop paying |
+
+`Model::mounts` holds the prefix list from the last `reload_roots`, so the landing rule and the tree
+read it without a second `vfs_mount_table()` — and therefore without a second USB probe.
+
+**Why not "bound and page it", the brief's other option.** Because it divides the wrong term. The cost
+here is per-CALL setup (three volume probes and two path resolutions); a 12-entry FAT root and a
+2000-entry one pay almost the same mount-scan toll. Paging would shrink a term that is already small,
+leave the dominant one untouched, and put a page cursor into a model ORIN's UnaFS is about to re-back.
+`MAX_LIST` already bounds the entry term and says `(list truncated)` on the glass when it bites.
+
+**It is measured, not asserted.** The model counts its own misses, hits and cycles, and prints them:
+
+```
+[quarry] open cost reads=<n> hits=<n> cycles=<n> cache=<n>/16 gen=<n>
+```
+
+`reads` is seam calls actually made; `hits` is calls the cache answered. The line appears at open and
+on every refresh, so "it is faster now" is a number in a capture rather than a claim.
+
+### 11.2 TWICE — the duplicate-root rule
+
+**The mechanism.** M1 made every mount prefix a depth-0 tree row (`mt.prefixes()` = `/`, `/fat`,
+`/usb`) and then expanded `/` at open. But `vfs_ls_collect`'s "mount points immediately below `path`"
+arm **synthesizes those same mount points as child rows** of `/`. So `/fat` was a depth-0 root AND a
+depth-1 child of the root — one path, two rows, both real, both correct on their own terms. That is
+what the bench saw, and it was a model fact rather than a rendering bug.
+
+**Which row is wrong.** The ROOT row. The child row is where the path actually lives in the one
+namespace, and it is what a person means by "inside my machine". So the rule removes roots, and it is
+stated about namespaces rather than about this machine's three volumes:
+
+> **A mount point claimed by another mount point is not a root; it is reached through its parent.**
+
+`root_prefixes` implements it over `prefix_claims`, which restates the resolver's own boundary rule
+(`/usb` claims `/usb` and `/usb/…` but never `/usbfoo`; the bare root claims everything) as a pure,
+witnessed function — `MountTable`'s copy is private and this has to hold on both arches.
+
+On a table carrying `/` it leaves exactly `["/"]`, which is also the honest shape of a single
+namespace: one root, volumes hanging under it. On a table with **no** root mount — an arch that has
+not adopted the VFS root, or a namespace assembled from peers — it leaves every unclaimed prefix, so
+the tree still has roots and nothing is hidden. That last property is what rejects the lazy fix
+("just keep `/`"), and the witness asserts it.
+
+A second, independent guard sits at the splice: `Model::expand` refuses to insert a child whose path
+the tree already carries. `root_prefixes` removed the way this happened; the splice guard means no
+future source of tree rows can reintroduce a duplicate path without tripping over it. `dedupe_by_name`
+does the same job on the list pane's rows.
+
+### 11.3 LAUNCH — double-click, and the constant that did not exist
+
+**The gesture.** Two presses on the **same row of the same pane** inside `DOUBLE_CLICK_MS`. The row
+test is what makes it a gesture rather than a timer: a rapid press on row 3 then row 4 is two
+selections, which is what an operator scanning a list is doing, and it must never run anything. A
+consumed double-click **resets** the stamp rather than re-arming it, so three fast presses are one
+double-click and one fresh single — never two overlapping activations. A press in the tree stamps the
+click too, so a tree press and a list press can never combine.
+
+**The constant, honestly.** *Nothing in this tree had one.* There is no double-click anywhere in the
+kernel, no `DOUBLE_CLICK`/`DBLCLK` constant in any driver or compositor file, and the xHCI HID
+boot-mouse decoder publishes button transitions with no timing attached at all. So `DOUBLE_CLICK_MS`
+is minted here, and three facts fixed it at **400 ms**:
+
+* the CLOCK is `arch::ms()`, which on aarch64 is `CNTVCT_EL0 / (CNTFRQ_EL0/1000)` — derived from the
+  free-running counter, **not** from `ticks()`. That matters: on QEMU raspi4b the periodic timer IRQ
+  is never delivered and `ticks()` stays frozen at 0 (UVUG-7's measurement), so a tick-derived clock
+  would have made every gate here vacuous on the QEMU battery;
+* the mouse arrives over USB HID at boot-protocol rates, so two deliberate clicks land tens of ms
+  apart at best — a window under ~200 ms would drop real double-clicks on a busy compositor pass;
+* 400 ms sits between the classic desktop defaults (macOS ~450 ms, Windows 500 ms) and the low end,
+  and is deliberately on the short side because Quarry's single click is **not inert** — it selects —
+  so a too-long window makes a slow re-select feel like an accidental launch.
+
+The predicate itself, `is_double`, is pure and witnessed, so the number above is the only part of the
+gesture that is a judgement call. Its zero-clock guard is not pedantry: `arch::ms()` legitimately
+answers 0 before the timebase is up, and forever on any board whose `CNTFRQ_EL0` reads 0. Without the
+guard, the **first click of a boot** on such a machine would launch whatever it landed on.
+
+**The launch, through the shell's own seam.** `launch()` reads the image through the VFS mount table
+(never `fat::mount()` — this arc's standing law) and hands it to
+`arch::syscall::spawn_user_image_bg` — the exact call the shell's `bg` verb makes, with the same
+bounds, the same console-cap endowment and the same DETACHED posture. Quarry mints no loader and no
+policy: the extension test is a **routing** hint, and every real check (ELF magic, `EI_CLASS`,
+`e_machine`, segment bounds, the 16 KiB user window) is the loader's. A `.ELF` that is not one is
+refused in the loader's own words.
+
+Two bounds, stated rather than discovered:
+
+* it does **not** call `shell::read_el0_image`, though the gates below are that function's in the same
+  order and vocabulary. That function takes a `&mut Console` and prints into it, and it lives in
+  `shell.rs` — compiled into the knob-off `kernel8.img`, where splitting out a console-free core would
+  ADD lines and break the byte-identity proof (PARITY.md §5.3). The shared thing is the seam that
+  matters — the mount table for the read, `spawn_user_image_bg` for the spawn — not the printing;
+* `Act` carries the decision **out of the `MODEL` lock** before it is acted on. `spawn_user_image_bg`
+  reserves a `Proc` row, maps an address-space slot and calls `spawn_user_slot`; doing that with a
+  repaint-path spinlock held would put Quarry's model underneath the scheduler for no reason.
+
+**A non-executable double-click does nothing, and says so.** There are no openers in this tree: no
+association registry, no viewer, no `SYS_EXEC`-with-argv to hand a program a path with. So the census
+line is the deliverable —
+
+```
+[quarry] open UNHANDLED path=/fat/CONFIG.TXT — no opener exists in this tree (launchable = .ELF/.BIN
+via spawn_user_image_bg; a document needs the opener registry named in quarry.md 7)
+```
+
+— because an operator who double-clicks `CONFIG.TXT` and sees nothing must be able to tell "broken"
+from "not built yet". The path bar says `no opener for CONFIG.TXT` on the glass at the same time.
+
+**Reaping.** §7 item 9 has the bookkeeping debt in full: `bg`'s `BG_JOBS` is `shell.rs`-private, so
+Quarry keeps its own `MAX_JOBS`-bounded table and runs the **same** reaper — `bg_poll(pid, reap = true)`
+— on every gesture and every `service()` pass. A Quarry-launched program therefore does not show up in
+the shell's `jobs`, and that is named, not hidden.
+
+### 11.4 TRUTH — the landing rule
+
+**The measurement.** `arroyo`'s own staging step builds the native UnaFS volume with exactly two files
+on it:
+
+```
+✅ [OPERATOR] Wrote '…/K3HELLO.TXT' to '//K3HELLO.TXT'
+✅ [OPERATOR] Wrote '…/K3PAT.BIN'   to '//K3PAT.BIN'
+```
+
+…while `/fat` is the boot card: `KERNEL8.IMG`, `VUG.ELF`, `CONFIG.TXT`, `SRC.TGZ` and the firmware.
+M1 opened on `/` (the first sorted prefix) and showed two files. It was **not** hiding the kernel's
+own files from the owner and it was not truncating or filtering anything — the collector returns every
+entry the medium has, and the only filter anywhere in the path is FAT's `.`/`..` on-disk artifacts,
+which are not names in this namespace. M1 had simply landed on the emptiest volume there was, which is
+exactly as useless as being wrong.
+
+**The rule (`Model::landing`).**
+
+> Open on the root; unless one of the root's **immediate mount points** carries strictly more plain
+> FILES than the root does, in which case open on the richest of them.
+
+It names no volume, no filesystem and no extension. When the native volume is the one carrying the
+system — which is where ORIN is taking this — the same rule lands on `/` and the behaviour inverts
+without a line changing. It is bounded by the mount count (three today) and one level deep by
+construction, and every probe goes through `collect_cached`, so the listing it chooses is already in
+hand for `show` and for the tree: the rule's marginal cost on this machine is **one** directory read,
+of a volume the operator is about to be looking at.
+
+"Strictly more" is doing real work: it makes the root the default and the descent the exception, so a
+machine whose namespace has content at the top is never dragged into a volume by a coin flip. A tie
+keeps the root.
+
+The listing itself is then put on the wire, by name and size, so "where is vug, where is the kernel"
+is answerable from a headless capture:
+
+```
+[quarry] open census cwd=/fat entries=<n> dirs=<n> files=<n> truncated=false names: KERNEL8.IMG(…) VUG.ELF*(12568) …
+```
+
+And on the glass, the `*` mark tells the operator which of those rows a double-click will run — a
+window that starts programs must show which rows start programs, rather than making that discoverable
+only by double-clicking.
+
+### 11.5 The namespace-agnostic constraint
+
+Peter's coordination note: ORIN lays out UnaFS in days, so M2 must build nothing FAT-specific beyond
+the VFS seam. Where each fix satisfies that:
+
+| fix | what it is written against | what would have been wrong |
+| --- | --- | --- |
+| the cache | absolute paths, and `usb_publish_gen()` — the **block layer's** hot-plug epoch, which means "the set of block devices changed" on any filesystem | a FAT mount cache, or a cache keyed on a cluster number |
+| the duplicate-root rule | mount **prefixes** and the resolver's boundary rule | special-casing `/fat`, or hardcoding "the root is `/`" |
+| the launch | `NodeKind`, `Stat::size`, `MountTable::read`, and the arch's own loader | reading the image through `fat::mount()` — the raw-backend path this arc is forbidden to take |
+| the landing rule | "plain files per immediate mount point" | "open on `/fat`", which would be wrong the day the native volume carries the system |
+
+The one `target_arch` gate is §3.1's, unchanged in substance: `fs/vfs.rs` gates both backends to
+aarch64, so on x86 `collect` and `launch` are shims that SAY so. Every pure part of M2 —
+`prefix_claims`, `root_prefixes`, `dedupe_by_name`, `is_executable`, `is_double`, the cache bound —
+compiles and is witnessed on both arches.
+
+---
+
+## 12. M2 gate results (2026-08-17)
+
+| gate | result |
+| --- | --- |
+| `./arroyo check` | **green**, both arches (`x86-all` and `arm-pi` both carry `quarry`, so M2 is type-checked on the arch that cannot run it too) |
+| `UNAOS_WC=1 ./arroyo check` | **green**, both arches; `✅ kernel cfg coverage OK (12 legs)` |
+| knob-off `kernel8.img` byte-identity | **proven, in place.** `2d9f9ab347106102ce2b4a26eca71c0e54970e875f5600de38b0e7264c81557d` with M2's `live.rs` and with the pre-arc one, built in the **same directory** from the same command. M2 touches exactly one source file and it is behind `#[cfg(feature = "quarry")]` |
+| `./arroyo kernel8-test 210` knob-off | **PASS 111/111, 0 forbidden**, 21151 lines |
+| `UNAOS_PIDESK=1 UNAOS_QUARRY=1 ./arroyo kernel8-test 300` | FAIL 106/111, 15 forbidden — **and its paired control is worse** (see below) |
+| `:: QUARRY: … :: PASS ::` | on every armed run, eleven legs, `dbl=400ms cache=16` |
+| `FORBID :: QUARRY: .* :: FAIL ::` | **0 hits on every battery**, knob-off and armed |
+
+**Attribution of the armed battery's deficit — Quarry's delta is zero.** The armed run was paired
+against a control (`UNAOS_PIDESK=1` alone, Quarry not compiled) on the same host, back to back:
+
+| run | verdict | forbidden | quarry lines in log |
+| --- | --- | --- | --- |
+| control — `UNAOS_PIDESK=1` (7 aarch64 QEMUs on host) | FAIL 105/111 | 16 | none |
+| armed — `+ UNAOS_QUARRY=1` (7 QEMUs) | FAIL 105/111 | 16 | present |
+| control — `UNAOS_PIDESK=1` (4 QEMUs) | FAIL 105/111 | 16 | none |
+| armed — `+ UNAOS_QUARRY=1` (4 QEMUs) | FAIL **106**/111 | **15** | present |
+
+Same verdict, same 16 hits, and the **identical six missing REQUIREs** in every case —
+`[wc-c] side-by-side drawn=2`, `[wc-f] twin`, three `[wc-j]` legs, `[clickroute] hit-test`. That is
+the standing `UNAOS_PIDESK` conflict §10 already records: the `arm-pi` witness battery asserts exact
+window ids and exact panel pixels, and was written against a Pi desktop with no extra tenant on it.
+The knob-off battery on the same host is **111/111 with 0 forbidden**, which is what makes the
+attribution clean rather than a guess.
+
+### The bench-geometry run, controlled
+
+`UNAOS_FBW=1920 UNAOS_FBH=1200` — the panel Peter actually has:
+
+| run | verdict | forbidden |
+| --- | --- | --- |
+| control — `UNAOS_PIDESK=1` | FAIL 107/111 | 233 |
+| armed — `+ UNAOS_QUARRY=1` | FAIL **108**/111 | **160** |
+
+The armed run is strictly better than its own control, on both terms. Bench geometry already fails
+without Quarry, exactly as §10 recorded for M1, and the size of the host term (233 vs 160 forbidden
+between two runs differing only by a knob that adds a window) is the honest measure of how
+load-dependent these numbers are.
+
+### What the wire actually said
+
+Both armed runs, 640 x 480 and 1920 x 1200, landed the same way — the four complaints, answered in
+one capture each:
+
+```
+:: QUARRY: geometry+scroll+tree+hit+dedupe+exec+dblclick+cache+launch — 640x480 surf_px=110592
+           1920x1200 surf_px=829440 dbl=400ms cache=16 :: PASS ::
+[quarry] open win=2 surf=1152x720 ts=2 box=1162x764 at (379,183) volumes=1 tree-rows=3
+         list-rows=21 cwd=/fat
+[quarry] open volumes mounts=["/", "/fat"] roots=["/"] tree-rows=3
+[quarry] open cost reads=2 hits=3 cycles=2963625 cache=2/16 gen=0
+[quarry] open census cwd=/fat entries=21 dirs=1 files=20 truncated=false names: OVERLAYS/
+         B11.BIN*(16) CONFIG.TXT(842) DEFER2.BIN*(16) ELFHELLO.ELF*(8560) FIXUP4.DAT(5499)
+         FRESH.BIN*(16) GROW.BIN*(528) HELLO.BIN*(51) K2IMP.BIN*(74) K2OWN.BIN*(128)
+         KERNEL8.IMG(2028640) ...
+```
+
+Read against §0's table, line by line:
+
+* `roots=["/"]` against `mounts=["/", "/fat"]` — **one** row per volume. The duplicate is gone, and
+  the line proves it without a photograph.
+* `reads=2 hits=3` — five collect calls, two of which touched a volume. The three the cache answered
+  are the ones M1 paid for twice. **Landing on `/fat` under M1 cost four seam calls** (two to open on
+  `/`, two more when the operator clicked into `/fat`, and every one of them three volume probes);
+  M2 lands there in two, and every navigation after that is free until something changes. The
+  `cycles` term is the honest scale of a miss: ~2.96 M CNTVCT ticks for two reads at the Pi's 54 MHz
+  counter is **~27 ms per directory read** on QEMU, and the SD path on metal is not faster.
+* `cwd=/fat` with `KERNEL8.IMG`, `CONFIG.TXT` and a screen of `*`-marked programs — the landing rule
+  chose the card over the two-file native root, without being told what a card is.

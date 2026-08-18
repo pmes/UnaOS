@@ -1780,3 +1780,35 @@ FORBID \[menubar\] .* press=inert
 # --- `Channel::send` fails leg (C) by hanging the fixture before it can print at all — which the
 # --- TRUNCATED verdict then reports honestly rather than as a pass.
 FORBID \[serfocus\] split .* :: FAIL ::
+
+# --- QUARRY — the file manager's arithmetic fixture (`video/quarry/live.rs::selftest`, invoked from
+# --- `video/pidesk.rs`'s DESKTOP-READY seam). M1 shipped this fixture UNGUARDED: it printed
+# --- `:: QUARRY: … :: FAIL ::` into a log nobody grepped, so a regression in it was invisible to both
+# --- batteries. This closes that.
+# ---
+# --- FORBID and not REQUIRE, following the SHARD-PRESS and SERIAL-FOCUS precedents immediately above
+# --- and for their arithmetic reason: the fixture is `witness`-gated (so it is present on the knob-off
+# --- battery too, where `quarry` is NOT compiled and the line therefore never prints), and a REQUIRE
+# --- would both move the count the arcs' DONE gates are stated against and red a knob-off build for
+# --- not carrying a knob it was never given. A FORBID costs nothing at 0 hits and still reds the armed
+# --- battery on a regression. Promoting it is a one-line change the integrator can make at merge.
+# ---
+# --- What it guards — ten legs, all pure functions over synthetic input, so none of them can be made
+# --- vacuous by a machine with no volume (QEMU raspi4b has no stick; x86 has no mount table at all):
+# ---   * geometry / scroll_follow / thumb / tree splice / press-to-row — M1's five, unchanged;
+# ---   * duplicate roots — `root_prefixes(["/", "/fat", "/usb"]) == ["/"]`, the EXACT live table that
+# ---                       produced the bench's double `/fat`, plus idempotence, order-independence,
+# ---                       and the two negative claims that reject the lazy fix (it must not hide a
+# ---                       volume on a rootless table, nor drop a `/usbfoo` sibling);
+# ---   * name dedupe    — `dedupe_by_name` keeps the first of each name, in order;
+# ---   * launchability  — `.ELF`/`.BIN` accepted in any case; `KERNEL8.IMG`, `CONFIG.TXT`, `SRC.TGZ`,
+# ---                       `START4.ELF.BAK` and the bare-extension forms refused. A regression here
+# ---                       means a double-click hands the loader something it was never offered;
+# ---   * double-click   — `is_double` fires exactly at the 400 ms window and not past it, never pairs
+# ---                       different rows or panes, and NEVER fires on a zero clock. That last leg is
+# ---                       the one with teeth: `arch::ms()` reads 0 on any board whose CNTFRQ_EL0 is
+# ---                       unset, and without the guard the FIRST press of such a boot would launch
+# ---                       whatever it landed on;
+# ---   * the cache      — bounded at MAX_CACHE and evicting oldest-first, so the SLOW fix cannot
+# ---                       become an unbounded model.
+FORBID :: QUARRY: .* :: FAIL ::

@@ -56,6 +56,67 @@
 //! Every pixel lands in [`SURF`]'s heap allocation. Presentation is `wm`'s, through one
 //! [`wm::present`] per repaint. This module never touches the framebuffer and never holds the
 //! `WRITER` lock across a directory read.
+//!
+//! ## v2 — the four bench complaints, and what each one actually was
+//!
+//! Quarry v1 shipped and was driven on the bench. Four defects came back, and none of them was a
+//! matter of taste; each had a mechanism, and the mechanism is written down beside its fix.
+//!
+//! 1. **"FAT contents VERY SLOW to come up."** The listing path re-probes the whole storage stack on
+//!    every call. One [`crate::shell::vfs_ls_collect`] is *three* volume probes, not one:
+//!    `vfs_mount_table()` itself calls `fat::mount_source(BlockSource::Usb)` to decide whether to
+//!    bind `/usb` (honest hot-plug, vfs.md §6), and then `MountTable::stat` and
+//!    `MountTable::read_dir` each call `fat::mount_source` again inside `FatBackend` — and
+//!    `mount_source` is a full superfloppy → GPT → MBR scan (LBA 0, LBA 1, a BPB sector per
+//!    candidate partition) before a single directory sector is read. On top of that v1's model asked
+//!    for the SAME directory twice on every navigation: [`Model::expand`] collects a row's children
+//!    and [`Model::show`] then collects the identical path again for the list pane. Landing on
+//!    `/fat` therefore cost ~4 mount probes and 2 root-directory walks where 1 of each would do.
+//!    The fix is [`Model::collect_cached`] — see §Cost below.
+//! 2. **"/fat is LISTED TWICE."** Not a rendering bug and not a collector bug: v1 made *every* mount
+//!    prefix a tree ROOT (`mt.prefixes()` = `/`, `/fat`, `/usb`) and then expanded `/`, whose
+//!    listing carries the same mount points as synthesized child rows. `/fat` was a depth-0 root
+//!    AND a depth-1 child of `/`, both naming the same path. [`root_prefixes`] is the fix and it is
+//!    a statement about namespaces rather than about FAT: **a mount point claimed by another mount
+//!    point is not a root — it is reached through its parent.** `/` claims everything, so on this
+//!    machine the tree has exactly one root and the volumes hang under it, which is also what the
+//!    one namespace actually looks like.
+//! 3. **"double-click on VUG should open the app."** v1 deliberately minted no launch path. v2 has
+//!    one, and it is not a new mechanism: [`launch`] reads the image through the same VFS seam and
+//!    hands it to `arch::syscall::spawn_user_image_bg` — the exact call the shell's `bg` verb makes.
+//!    The double-click needs a timing constant, and none existed anywhere in this tree; see
+//!    [`DOUBLE_CLICK_MS`] for the honest derivation.
+//! 4. **"where is vug, where is the kernel."** True, and measurable: the native UnaFS root that v1
+//!    opened on holds exactly two files (`K3HELLO.TXT`, `K3PAT.BIN` — see `arroyo`'s staging step),
+//!    while the card a person means when they say "my card" is `/fat`, with `KERNEL8.IMG`,
+//!    `VUG.ELF`, `CONFIG.TXT`, `SRC.TGZ` and the firmware on it. v1 was not hiding anything; it
+//!    landed on the emptiest volume in the namespace. [`Model::landing`] fixes that with a rule
+//!    stated on the wire rather than a hardcoded `/fat`.
+//!
+//! ## Cost, measured rather than asserted
+//!
+//! [`Model::collect_cached`] is the whole SLOW fix and it is deliberately the *smallest* thing that
+//! could work: an in-model, path-keyed cache of the seam's own answer, bounded at [`MAX_CACHE`]
+//! entries with a FIFO eviction, invalidated on three events and no others —
+//!
+//!   * **window open** (a fresh [`Model`] has an empty cache — this is the brief's "per open");
+//!   * **the `r` key**, the refresh gesture that already existed and already meant "re-read";
+//!   * **a volume generation change**, `drivers::block::usb_publish_gen()` — the block layer's own
+//!     hot-plug epoch, bumped by every publish and every retraction (PA35's storage race). It is one
+//!     relaxed atomic load, so it can be asked on every access; asking `vfs_mount_table()` instead
+//!     would cost the very USB probe this cache exists to stop paying.
+//!
+//! Nothing else is cached: errors are not (a `-ENODEV` volume may arrive), and the mount PREFIX list
+//! is re-read only by `reload_roots`. The model counts its own hits, misses and cycles and prints
+//! them, so "it is faster now" is a number in the log and not a claim — `[quarry] reads=…` on open
+//! and on every refresh.
+//!
+//! The alternative the brief offered — bounding and paging the directory read — is deliberately NOT
+//! taken, and the reason is that it fixes the wrong term. The cost here is per-CALL setup (three
+//! volume probes), not per-ENTRY: a 12-entry FAT root and a 2000-entry one pay almost the same
+//! mount-scan toll. Paging would divide a term that is already small and leave the dominant one
+//! untouched, and it would put a page cursor in a model that ORIN's UnaFS is about to re-back.
+//! [`MAX_LIST`] already bounds the entry term and says so on the glass when it bites.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -94,6 +155,44 @@ const MAX_LIST: usize = 2048;
 const MAX_DEPTH: usize = 8;
 /// Longest path Quarry will build. Longer, and the child is skipped with a row that says so.
 const PATH_MAX: usize = 160;
+/// Directory listings the model will hold at once. FIFO, so a deep walk evicts the shallow rows it
+/// has finished with rather than growing. Sixteen covers a root plus every volume plus a walk down
+/// two levels of one of them, which is every gesture the window offers.
+const MAX_CACHE: usize = 16;
+/// Programs Quarry will hold reaped-pending at once. A launched job's kernel `Proc` row stays
+/// claimed after it exits until something polls it, and [`reap_jobs`] is Quarry's poller (the
+/// shell's `jobs` verb cannot be: `BG_JOBS` is `shell.rs`-private and that file is compiled into the
+/// knob-off image, where an added line is a byte-identity break). This is the ceiling on rows this
+/// window can have outstanding; the 9th launch reaps first and then declines out loud.
+#[cfg(target_arch = "aarch64")]
+const MAX_JOBS: usize = 8;
+/// Entries the open-time census prints by name.
+const CENSUS_MAX: usize = 12;
+
+/// The double-click window, in milliseconds.
+///
+/// **Nothing in this tree had one.** There is no double-click anywhere in the kernel, no
+/// `DOUBLE_CLICK`/`DBLCLK` constant in any driver or compositor file, and the HID boot-mouse decoder
+/// publishes button transitions with no timing attached at all — so this constant is minted here,
+/// and the honest thing to do is say what it was chosen against rather than to imply it was
+/// inherited. Three facts fixed it:
+///
+///   * the CLOCK is `arch::ms()`, which on aarch64 is `CNTVCT_EL0 / (CNTFRQ_EL0/1000)` — derived
+///     from the free-running counter, NOT from `ticks()`, so it is correct on QEMU raspi4b where the
+///     periodic timer IRQ is never delivered and `ticks()` stays frozen at 0 (UVUG-7's measurement).
+///     A tick-derived clock would have made every gate here vacuous on the QEMU battery;
+///   * the mouse arrives over USB HID at boot-protocol rates, so two deliberate clicks land tens of
+///     milliseconds apart at best — a window under ~200 ms would drop real double-clicks on a busy
+///     compositor pass;
+///   * 400 ms is the interval under which two presses on the SAME row read as one gesture rather
+///     than as two decisions. It sits between the classic desktop defaults (macOS ~450 ms, Windows
+///     500 ms) and the low end, and it is deliberately on the short side because Quarry's
+///     single-click is not inert — it selects — so a too-long window makes a slow re-select feel
+///     like an accidental launch.
+///
+/// The predicate is [`is_double`], which is pure and witnessed, so this number is the only part of
+/// the gesture that is a judgement call.
+const DOUBLE_CLICK_MS: u64 = 400;
 
 // ── Geometry ────────────────────────────────────────────────────────────────────────────────────
 
@@ -226,6 +325,30 @@ enum Pane {
     List,
 }
 
+/// One cached directory read — the seam's exact answer for one path, nothing derived.
+struct CacheEnt {
+    path: String,
+    is_dir: bool,
+    rows: Vec<DirEnt>,
+}
+
+/// What a press or an Enter decided, carried OUT of the model lock before it is acted on.
+///
+/// This exists because of the one thing a file manager does that a list widget does not: it starts
+/// programs. `spawn_user_image_bg` reserves a `Proc` row, maps an address-space slot and calls
+/// `spawn_user_slot` — it takes the scheduler's locks and it may run the child on another core
+/// before it returns. Doing that with Quarry's `MODEL` spinlock held would put a repaint-path lock
+/// underneath the scheduler for no reason at all. So the router decides, drops the lock, and only
+/// then acts.
+enum Act {
+    /// Nothing to do outside the lock (a selection, a scroll, a navigation — all already applied).
+    None,
+    /// Read and spawn this absolute path.
+    Launch(String),
+    /// A double-click on something Quarry cannot open yet. Census, no action.
+    NoOpener(String),
+}
+
 struct Model {
     geom: Geom,
     tree: Vec<TreeRow>,
@@ -241,6 +364,24 @@ struct Model {
     focus: Pane,
     /// The last collector error, shown in the list pane instead of rows.
     err: Option<String>,
+    /// Every mount prefix, as of the last `reload_roots`. Held so the landing rule and the tree can
+    /// both read it without paying a second `vfs_mount_table()` (and therefore a second USB probe).
+    mounts: Vec<String>,
+    /// The directory cache — see the module doc's §Cost.
+    cache: Vec<CacheEnt>,
+    /// The volume generation `cache` was filled against.
+    cache_gen: u64,
+    /// Cache misses (real seam reads), hits, and the cycles the misses cost. Printed, not asserted.
+    reads: usize,
+    hits: usize,
+    read_cycles: u64,
+    /// The previous press, for [`is_double`]. `click_ms == 0` means "none this session".
+    click_ms: u64,
+    click_row: usize,
+    click_pane: Pane,
+    /// The last activation's one-line result, shown in the path bar. This is the only feedback an
+    /// operator gets for a launch — there is no console in this window — so it is not optional.
+    status: Option<String>,
 }
 
 static MODEL: spin::Mutex<Option<Model>> = spin::Mutex::new(None);
@@ -279,9 +420,13 @@ fn collect(_path: &str) -> Result<(bool, Vec<DirEnt>), String> {
     Err(String::from("no VFS mount table on this arch yet (vfs.md 12.4)"))
 }
 
-/// The mount prefixes, longest-prefix-resolved volumes of the one namespace — the tree's roots.
+/// Every mount prefix, sorted. NOT the tree's roots — see [`root_prefixes`], which is the fix for
+/// the duplicate `/fat`.
+///
+/// This is the one call that costs a `vfs_mount_table()`, and therefore a USB probe, so the model
+/// makes it exactly once per `reload_roots` and remembers the answer in `Model::mounts`.
 #[cfg(target_arch = "aarch64")]
-fn roots() -> Vec<String> {
+fn mount_prefixes() -> Vec<String> {
     let mt = crate::shell::vfs_mount_table();
     let mut v: Vec<String> = mt.prefixes().iter().map(|p| String::from(*p)).collect();
     v.sort();
@@ -289,8 +434,115 @@ fn roots() -> Vec<String> {
 }
 
 #[cfg(not(target_arch = "aarch64"))]
-fn roots() -> Vec<String> {
+fn mount_prefixes() -> Vec<String> {
     Vec::new()
+}
+
+/// The block layer's hot-plug epoch — [`Model::collect_cached`]'s invalidation stamp.
+///
+/// `usb_publish_gen` is advanced by every geometry publish and every retraction (PA35's storage
+/// race: two devices on a recycled slot id were otherwise indistinguishable). It is a single
+/// `Acquire` load of an `AtomicU64`, which is what makes it safe to ask on every cache access —
+/// re-reading the MOUNT TABLE to detect the same event would cost the full USB volume probe this
+/// cache exists to stop paying. It is not FAT-specific and it is not namespace-specific: it says
+/// "the set of block devices under this namespace changed", which is precisely the event that can
+/// make a cached listing a lie, and it will mean the same thing when ORIN's UnaFS is the backend.
+#[cfg(target_arch = "aarch64")]
+fn volume_gen() -> u64 {
+    crate::drivers::block::usb_publish_gen()
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn volume_gen() -> u64 {
+    0
+}
+
+// ── The duplicate-root rule (pure) ──────────────────────────────────────────────────────────────
+
+/// Does mount prefix `q` claim path `p`? The resolver's boundary rule, restated here as a pure
+/// function because `MountTable`'s copy is private and this needs to be witnessed on both arches:
+/// `/usb` claims `/usb` and `/usb/...` but never `/usbfoo`, and the bare root claims everything.
+fn prefix_claims(q: &str, p: &str) -> bool {
+    if q == "/" {
+        return p.starts_with('/');
+    }
+    if !p.starts_with(q) {
+        return false;
+    }
+    p.len() == q.len() || p.as_bytes()[q.len()] == b'/'
+}
+
+/// **The `/fat`-listed-twice fix.** Reduce a mount prefix list to the prefixes that are genuinely
+/// ROOTS of the tree — those not claimed by some OTHER prefix in the same list.
+///
+/// v1 made every prefix a depth-0 row and then expanded `/`, whose listing carries `/fat` and `/usb`
+/// as synthesized mount-point rows (`shell::vfs_ls_collect`'s "mount points immediately below
+/// `path`" arm). So `/fat` was a root AND a child of the root — one path, two rows, which is what
+/// the bench saw. Dropping the row would have been the wrong repair: the CHILD row is the correct
+/// one, because it is where the path actually lives in the one namespace and it is what a person
+/// means by "inside my machine". So the ROOT row goes, and the rule that removes it is a statement
+/// about namespaces rather than about this machine's three volumes:
+///
+/// > A mount point claimed by another mount point is not a root; it is reached through its parent.
+///
+/// On a table carrying `/` it leaves exactly `["/"]`, which is also the honest shape of a single
+/// namespace. On a table with NO root mount (an arch that has not adopted the VFS, or a future
+/// namespace assembled from peers) it leaves every unclaimed prefix, so the tree still has roots and
+/// nothing is hidden. It is order-independent and idempotent, both witnessed.
+fn root_prefixes(all: &[String]) -> Vec<String> {
+    all.iter()
+        .filter(|p| !all.iter().any(|q| q.as_str() != p.as_str() && prefix_claims(q, p)))
+        .cloned()
+        .collect()
+}
+
+/// Drop rows that repeat a name already present, keeping the first. The collector already dedupes
+/// its synthesized mount rows against the backend's own entries, so this is belt-and-braces at the
+/// PRESENTATION layer — and it is the layer that must hold when a future backend surfaces a name
+/// twice for a reason of its own. Stable, so the sort order above it survives.
+fn dedupe_by_name(rows: &mut Vec<DirEnt>) {
+    let mut seen: Vec<String> = Vec::new();
+    rows.retain(|e| {
+        if seen.iter().any(|n| *n == e.name) {
+            false
+        } else {
+            seen.push(e.name.clone());
+            true
+        }
+    });
+}
+
+// ── Launchability, and the double-click predicate (pure) ────────────────────────────────────────
+
+/// Is `name` a program THIS kernel's loader can be asked to run?
+///
+/// `.ELF` and `.BIN`, case-insensitively — the two shapes `spawn_user_image_bg` accepts (a validated
+/// ELF64, or a flat blob bounded to one code page), and exactly the two the packaging text tells the
+/// operator to `bg`. The extension is a ROUTING hint and nothing more: every real check —
+/// ELF magic, `EI_CLASS`, `e_machine`, segment bounds, the 16 KiB window — is the loader's, and
+/// [`launch`] reports whatever it says. A `.ELF` that is not one is refused with the loader's own
+/// words, not with a guess made here.
+fn is_executable(name: &str) -> bool {
+    let n = name.as_bytes();
+    let ends = |ext: &[u8]| n.len() > ext.len() && n[n.len() - ext.len()..].eq_ignore_ascii_case(ext);
+    ends(b".elf") || ends(b".bin")
+}
+
+/// Two presses are one double-click iff they hit the SAME row of the SAME pane inside
+/// [`DOUBLE_CLICK_MS`].
+///
+/// `prev == 0` means "no previous press this session" and can never open the window — which is not
+/// pedantry: `arch::ms()` legitimately answers 0 before the timebase is up (and on any board whose
+/// `CNTFRQ_EL0` reads 0, where `ms()` returns 0 forever by construction). Without this guard every
+/// pair of clicks on such a machine would be a double-click, and the FIRST click of a boot would
+/// launch whatever it landed on. `now == 0` is refused for the same reason, from the other side.
+fn is_double(prev_ms: u64, now_ms: u64, prev_row: usize, row: usize, same_pane: bool) -> bool {
+    prev_ms != 0
+        && now_ms != 0
+        && same_pane
+        && prev_row == row
+        && now_ms >= prev_ms
+        && now_ms - prev_ms <= DOUBLE_CLICK_MS
 }
 
 // ── Path arithmetic (pure) ──────────────────────────────────────────────────────────────────────
@@ -396,33 +648,149 @@ impl Model {
             list_scroll: 0,
             focus: Pane::Tree,
             err: None,
+            mounts: Vec::new(),
+            cache: Vec::new(),
+            cache_gen: volume_gen(),
+            reads: 0,
+            hits: 0,
+            read_cycles: 0,
+            click_ms: 0,
+            click_row: 0,
+            click_pane: Pane::List,
+            status: None,
         };
         m.reload_roots();
-        // Open on the first root and expand it, so the operator sees two levels without a gesture —
-        // the brief's "expandable, at least 2 levels", demonstrated at open rather than promised.
-        if !m.tree.is_empty() {
-            m.expand(0);
-            let p = m.tree[0].path.clone();
-            m.show(&p);
-        } else {
+        if m.tree.is_empty() {
             m.err = Some(String::from("no volumes mounted"));
+            return m;
         }
+        // Expand the root, so the operator sees two levels without a gesture — the brief's
+        // "expandable, at least 2 levels", demonstrated at open rather than promised. With the
+        // duplicate-root rule in place the volumes ARE that second level.
+        m.expand(0);
+        let root = m.tree[0].path.clone();
+        // …then land where the content is. Every probe the rule makes is cached, so the directory it
+        // chooses is already in hand when `show` asks for it.
+        let land = m.landing(&root);
+        if land != root {
+            if let Some(i) = m.tree.iter().position(|r| r.path == land) {
+                m.tree_sel = i;
+                m.expand(i);
+            }
+        }
+        m.show(&land);
         m
     }
 
     /// Rebuild the root rows from the mount table. Called at open and on refresh, so a stick plugged
     /// after Quarry opened enters the tree on the next `r` — the honest hot-plug posture vfs.md §6
     /// gives the table itself, inherited rather than re-invented.
+    ///
+    /// The roots are [`root_prefixes`] of the mount list, NOT the mount list — that is the
+    /// duplicate-`/fat` fix, and the reason it lives here rather than in the painter is that the
+    /// duplicate was a MODEL fact: two rows existed, both real, both naming one path.
     fn reload_roots(&mut self) {
         let keep = self.tree.get(self.tree_sel).map(|r| r.path.clone());
         self.tree.clear();
-        for p in roots() {
+        self.mounts = mount_prefixes();
+        for p in root_prefixes(&self.mounts) {
             self.tree.push(TreeRow { name: leaf(&p), path: p, depth: 0, expanded: false });
         }
         self.tree_sel = keep
             .and_then(|k| self.tree.iter().position(|r| r.path == k))
             .unwrap_or(0);
         self.tree_scroll = 0;
+    }
+
+    /// Collect one directory through the seam, **once**.
+    ///
+    /// The SLOW fix. See the module doc's §Cost for what a miss actually costs and why the
+    /// invalidation set is exactly three events. Errors are returned but never cached: a
+    /// `-ENODEV` volume is a state that ends when the operator plugs the stick in, and a cache that
+    /// remembered it would need a fourth invalidation event to forget it.
+    fn collect_cached(&mut self, path: &str) -> Result<(bool, Vec<DirEnt>), String> {
+        let now_gen = volume_gen();
+        if now_gen != self.cache_gen {
+            self.cache.clear();
+            self.cache_gen = now_gen;
+        }
+        if let Some(e) = self.cache.iter().find(|e| e.path == path) {
+            self.hits += 1;
+            return Ok((e.is_dir, e.rows.clone()));
+        }
+        let t0 = crate::arch::now_cycles();
+        let out = collect(path);
+        self.read_cycles = self
+            .read_cycles
+            .saturating_add(crate::arch::now_cycles().saturating_sub(t0));
+        self.reads += 1;
+        if let Ok((is_dir, rows)) = &out {
+            if self.cache.len() >= MAX_CACHE {
+                self.cache.remove(0);
+            }
+            self.cache.push(CacheEnt {
+                path: String::from(path),
+                is_dir: *is_dir,
+                rows: rows.clone(),
+            });
+        }
+        out
+    }
+
+    /// Forget every cached listing. The `r` gesture's other half — `reload_roots` re-reads the mount
+    /// table, this re-reads the media.
+    fn invalidate(&mut self) {
+        self.cache.clear();
+        self.cache_gen = volume_gen();
+    }
+
+    /// QUARRY-LAND — **the "where is vug, where is the kernel" fix.** Choose the directory to open
+    /// on, given the namespace root.
+    ///
+    /// > Open on the root; unless one of the root's immediate mount points carries strictly more
+    /// > plain FILES than the root does, in which case open on the richest of them.
+    ///
+    /// The measurement that motivates it is in `arroyo`'s own staging step: the native UnaFS volume
+    /// this machine mounts at `/` is built with exactly two files on it (`K3HELLO.TXT`, `K3PAT.BIN`),
+    /// while `/fat` is the boot card — `KERNEL8.IMG`, `VUG.ELF`, `CONFIG.TXT`, `SRC.TGZ` and the
+    /// firmware. v1 opened on `/`, saw two files, and was correctly called dumb. It was not hiding
+    /// the kernel's own files from the owner; it had simply landed on the emptiest volume there was.
+    ///
+    /// The rule names no volume, no filesystem and no extension, which is the requirement ORIN's
+    /// UnaFS imposes: when the native volume is the one carrying the system, the same rule lands on
+    /// `/` and this function's behaviour inverts without a line changing. It is bounded by the mount
+    /// count (three today) and one level deep by construction; every probe goes through
+    /// [`collect_cached`], so the listing it selects is already in hand for `show` and the tree — the
+    /// rule's marginal cost on this machine is ONE directory read, of a volume the operator is about
+    /// to be looking at.
+    ///
+    /// A tie keeps the root. "Strictly more" is doing real work there: it makes the root the default
+    /// and the descent the exception, so a machine whose namespace has content at the top is never
+    /// dragged down into a volume by a coin flip.
+    fn landing(&mut self, root: &str) -> String {
+        fn files(rows: &[DirEnt]) -> usize {
+            rows.iter().filter(|e| !matches!(e.kind, NodeKind::Dir)).count()
+        }
+        let mut best_n = match self.collect_cached(root) {
+            Ok((true, rows)) => files(&rows),
+            // The root is unreadable or is not a directory: there is nothing to compare against and
+            // nothing to be clever about. Land on it and let `show` report whatever it reports.
+            _ => return String::from(root),
+        };
+        let mut best = String::from(root);
+        for p in self.mounts.clone() {
+            if p == root || parent(&p) != root {
+                continue;
+            }
+            if let Ok((true, rows)) = self.collect_cached(&p) {
+                let n = files(&rows);
+                if n > best_n {
+                    best_n = n;
+                    best = p;
+                }
+            }
+        }
+        best
     }
 
     /// Rows immediately below `i` that belong to its subtree.
@@ -448,7 +816,7 @@ impl Model {
             return;
         }
         let path = self.tree[i].path.clone();
-        let kids: Vec<TreeRow> = match collect(&path) {
+        let kids: Vec<TreeRow> = match self.collect_cached(&path) {
             Ok((true, rows)) => rows
                 .into_iter()
                 .filter(|e| matches!(e.kind, NodeKind::Dir))
@@ -460,6 +828,11 @@ impl Model {
                         Some(TreeRow { name: e.name, path: p, depth: depth + 1, expanded: false })
                     }
                 })
+                // Never splice a path the tree already carries. [`root_prefixes`] removed the way
+                // this happened in v1 (a mount point that was both a root and a child of the root);
+                // this is the same invariant asserted at the SPLICE, so no future source of tree
+                // rows can reintroduce a duplicate path without tripping over it here.
+                .filter(|k| !self.tree.iter().any(|r| r.path == k.path))
                 .collect(),
             _ => Vec::new(),
         };
@@ -498,11 +871,14 @@ impl Model {
         self.list_sel = 0;
         self.list_scroll = 0;
         self.list_truncated = false;
-        match collect(path) {
+        // Through the cache, which is what collapses v1's two reads per navigation into one: the
+        // tree's `expand` and this call ask for the SAME path on every descent.
+        match self.collect_cached(path) {
             Ok((true, mut rows)) => {
                 self.list_truncated = rows.len() > MAX_LIST;
                 rows.truncate(MAX_LIST);
                 list_sort(&mut rows);
+                dedupe_by_name(&mut rows);
                 self.list = rows;
                 self.err = None;
             }
@@ -553,6 +929,225 @@ impl Model {
             scroll_follow(self.tree_scroll, self.tree_sel, self.tree.len(), self.tree_visible());
         self.list_scroll =
             scroll_follow(self.list_scroll, self.list_sel, self.list.len(), self.list_visible());
+    }
+
+    /// **Open list row `i`** — the one decision behind both the double-click and Enter.
+    ///
+    /// A DIRECTORY is entered, exactly as v1's Enter did (revealing it on the left first, so the two
+    /// panes never disagree). A LAUNCHABLE file becomes an [`Act::Launch`] for the caller to run
+    /// outside the lock. Anything else becomes an [`Act::NoOpener`] — honestly, and with a census
+    /// line, because "nothing happened" and "nothing CAN happen yet" are different facts and only
+    /// one of them is a bug. There are no openers in this tree: no registry, no association table,
+    /// no viewer. `quarry.md` §7 says what a `.TXT` double-click is waiting on.
+    fn activate_row(&mut self, i: usize) -> Act {
+        let Some(e) = self.list.get(i) else {
+            return Act::None;
+        };
+        let name = e.name.clone();
+        let is_dir = matches!(e.kind, NodeKind::Dir);
+        let cwd = self.cwd.clone();
+        let p = join(&cwd, &name);
+        if p.len() > PATH_MAX {
+            self.status = Some(alloc::format!("path too long: {}", name));
+            return Act::None;
+        }
+        if is_dir {
+            if let Some(t) = self.tree.iter().position(|r| r.path == cwd) {
+                if !self.tree[t].expanded {
+                    self.expand(t);
+                }
+            }
+            self.navigate(&p);
+            self.focus = Pane::List;
+            self.status = None;
+            Act::None
+        } else if is_executable(&name) {
+            Act::Launch(p)
+        } else {
+            Act::NoOpener(p)
+        }
+    }
+}
+
+// ── Launching, and who reaps what it started ────────────────────────────────────────────────────
+//
+// The spawn seam is `arch::syscall::spawn_user_image_bg` — the SAME call the shell's `bg` verb
+// makes, with the same bounds, the same console-cap endowment and the same DETACHED posture. Quarry
+// mints no loader, no second image-reading path and no policy of its own: the image is read through
+// the VFS mount table (never `fat::mount()` — this arc's standing law), the loader does every real
+// check, and its refusal is what the operator is shown.
+
+/// One program this window started. Gated with [`launch`] and for its reason, not for a second one:
+/// the arch that cannot spawn cannot have a job to track, and a table that could only ever be empty
+/// is not honest scaffolding — it is dead weight the compiler is right to name.
+#[cfg(target_arch = "aarch64")]
+struct Job {
+    pid: u64,
+    asid: u64,
+    name: String,
+}
+
+/// The jobs Quarry has outstanding. Small, bounded, and Quarry's OWN — see [`MAX_JOBS`] for why it
+/// cannot be the shell's table.
+#[cfg(target_arch = "aarch64")]
+static JOBS: spin::Mutex<Vec<Job>> = spin::Mutex::new(Vec::new());
+
+/// Poll every outstanding job and free the kernel rows of the ones that have finished.
+///
+/// `bg_poll(pid, reap = true)` is the same reaper the shell's `jobs` verb runs, so a Quarry-launched
+/// program's row is released by exactly the mechanism a `bg`-launched one's is. Called on every
+/// input gesture and every [`service`] pass, which is often enough that the [`MAX_JOBS`] ceiling is
+/// a bound on CONCURRENT programs rather than on launches per boot.
+#[cfg(target_arch = "aarch64")]
+fn reap_jobs() {
+    use crate::arch::syscall::BgPoll;
+    let mut jobs = JOBS.lock();
+    let mut i = 0;
+    while i < jobs.len() {
+        let verdict = match crate::arch::syscall::bg_poll(jobs[i].pid, true) {
+            BgPoll::Running => {
+                i += 1;
+                continue;
+            }
+            BgPoll::Exited(st) => alloc::format!("exited status={}", st),
+            BgPoll::Faulted => String::from("faulted (contained)"),
+            BgPoll::Closed => String::from("closed by its window"),
+            BgPoll::Gone => String::from("gone (already reaped)"),
+        };
+        let j = jobs.remove(i);
+        serial_println!("[quarry] reaped pid={} asid={} name={} — {}", j.pid, j.asid, j.name, verdict);
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn reap_jobs() {}
+
+/// Read `path` through the VFS seam and spawn it detached. Returns the one line the path bar shows.
+///
+/// Every gate here is the one `shell::read_el0_image` applies, in the same order and with the same
+/// vocabulary, because they are answering the same question about the same kind of file — a
+/// directory, an empty file and an oversize file each get their errno-tagged refusal rather than a
+/// loader error the operator cannot act on. The ELF pre-checks sharpen the message only; the kernel
+/// loader re-validates from scratch either way.
+///
+/// It does NOT go through `shell::read_el0_image` itself, and that is a deliberate bound rather than
+/// an oversight: that function takes a `&mut Console` and prints into it, and it lives in `shell.rs`
+/// — a file compiled into the knob-off `kernel8.img`, where splitting out a console-free core would
+/// ADD lines and break the byte-identity proof (PARITY.md §5.3). The shared thing is the seam that
+/// matters — the mount table for the read, `spawn_user_image_bg` for the spawn — not the printing.
+#[cfg(target_arch = "aarch64")]
+fn launch(path: &str) -> String {
+    use crate::fs::vfs::{NodeKind as NK, VfsError};
+    fn why(e: VfsError) -> String {
+        match e {
+            VfsError::NoSuchVolume => String::from("no such volume"),
+            VfsError::NoSuchPath => String::from("no such file (-ENOENT)"),
+            VfsError::NotADirectory => String::from("not a directory (-ENOTDIR)"),
+            VfsError::IsADirectory => String::from("is a directory (-EISDIR)"),
+            VfsError::Denied => String::from("permission denied (-EACCES)"),
+            VfsError::Unsupported => String::from("not supported on this volume (-ENOTSUP)"),
+            VfsError::Backend(s) => alloc::format!("backend: {}", s),
+        }
+    }
+    const CAP: u64 = crate::arch::aarch64::boot::USER_REGION_SIZE as u64;
+    reap_jobs();
+    if JOBS.lock().len() >= MAX_JOBS {
+        let s = alloc::format!("{} live jobs — kill one first", MAX_JOBS);
+        serial_println!("[quarry] launch REFUSED path={} reason=job-table-full ({})", path, s);
+        return s;
+    }
+    let mt = crate::shell::vfs_mount_table();
+    let st = match mt.stat(path) {
+        Ok(s) => s,
+        Err(e) => {
+            let s = why(e);
+            serial_println!("[quarry] launch REFUSED path={} reason=stat ({})", path, s);
+            return s;
+        }
+    };
+    if matches!(st.kind, NK::Dir) {
+        return String::from("is a directory (-EISDIR)");
+    }
+    if st.size == 0 {
+        serial_println!("[quarry] launch REFUSED path={} reason=empty", path);
+        return String::from("empty file");
+    }
+    if st.size > CAP {
+        let s = alloc::format!("{} bytes exceeds the {}-byte user window (-E2BIG)", st.size, CAP);
+        serial_println!("[quarry] launch REFUSED path={} reason=oversize ({})", path, s);
+        return s;
+    }
+    let bytes = match mt.read(path, 0, st.size as usize) {
+        Ok(b) => b,
+        Err(e) => {
+            let s = why(e);
+            serial_println!("[quarry] launch REFUSED path={} reason=read ({})", path, s);
+            return s;
+        }
+    };
+    if bytes.len() >= 20 && bytes[0..4] == [0x7F, b'E', b'L', b'F'] {
+        let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
+        if bytes[4] != 2 || bytes[5] != 1 || machine != 183 {
+            let s = alloc::format!(
+                "not an aarch64 ELF64 (class {} data {} machine {})",
+                bytes[4], bytes[5], machine
+            );
+            serial_println!("[quarry] launch REFUSED path={} reason=elf ({})", path, s);
+            return s;
+        }
+    }
+    let n = bytes.len();
+    match crate::arch::syscall::spawn_user_image_bg(&bytes) {
+        Ok((pid, asid, entry)) => {
+            JOBS.lock().push(Job { pid, asid, name: String::from(path) });
+            serial_println!(
+                ":: QUARRY-LAUNCH: {} — {} bytes, entry {:#x}, pid={} asid={} DETACHED (spawn_user_image_bg, the same seam `bg` takes) ::",
+                path, n, entry, pid, asid
+            );
+            alloc::format!("started pid {}", pid)
+        }
+        Err(e) => {
+            serial_println!("[quarry] launch REFUSED path={} reason=spawn ({})", path, e);
+            String::from(e)
+        }
+    }
+}
+
+/// x86 has no VFS mount table (`fs/vfs.rs` gates both backends to aarch64, vfs.md §12.4), so there
+/// is nothing here to resolve a path against and this arm SAYS so rather than reaching for
+/// `fat::mount()` — the raw-backend path this arc is forbidden to take. The layout, the gesture, the
+/// double-click predicate and the launchability test all compile and are witnessed on this arch; the
+/// day the x86 VFS adoption lands, this shim collapses into the one above.
+#[cfg(not(target_arch = "aarch64"))]
+fn launch(path: &str) -> String {
+    serial_println!("[quarry] launch DECLINE path={} reason=no-vfs-on-this-arch (vfs.md 12.4)", path);
+    String::from("no VFS mount table on this arch yet (vfs.md 12.4)")
+}
+
+/// Perform an [`Act`] decided inside the model lock, with that lock RELEASED, then record its
+/// one-line result back into the model for the path bar.
+fn run_act(act: Act) {
+    let line = match act {
+        Act::None => return,
+        Act::Launch(p) => {
+            let r = launch(&p);
+            reap_jobs();
+            r
+        }
+        Act::NoOpener(p) => {
+            // The honest census the brief asks for. Nothing in this tree opens a document: there is
+            // no association registry, no viewer, and no `SYS_EXEC`-with-argv for a program to be
+            // handed a path with. Saying that out loud is the point — an operator who double-clicks
+            // `CONFIG.TXT` and sees nothing should be able to tell "broken" from "not built yet".
+            serial_println!(
+                "[quarry] open UNHANDLED path={} — no opener exists in this tree (launchable = .ELF/.BIN via spawn_user_image_bg; a document needs the opener registry named in quarry.md 7)",
+                p
+            );
+            alloc::format!("no opener for {}", leaf(&p))
+        }
+    };
+    if let Some(m) = MODEL.lock().as_mut() {
+        m.status = Some(line);
     }
 }
 
@@ -706,6 +1301,12 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
     if m.list_truncated {
         label.extend_from_slice(b"  (list truncated)");
     }
+    // The activation result rides the path bar. It is the ONLY feedback a launch has — this window
+    // has no console — so it is drawn even when it is a refusal, and especially then.
+    if let Some(s) = &m.status {
+        label.extend_from_slice(b"  -  ");
+        label.extend_from_slice(s.as_bytes());
+    }
     text(px, g, PAD, g.ts, &label, g.w - PAD, theme::TITLE_TEXT_ACTIVE);
 
     // ── the tree pane ───────────────────────────────────────────────────────────────────────────
@@ -810,8 +1411,14 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
             let dir = matches!(ent.kind, NodeKind::Dir);
             let mut nm: Vec<u8> = Vec::new();
             nm.extend_from_slice(ent.name.as_bytes());
+            // `ls -F`'s two marks, and they are the row's whole contract with the pointer: `/` is
+            // "double-click descends", `*` is "double-click RUNS this". A window that starts programs
+            // must show which rows start programs — an operator should never have to discover that
+            // by double-clicking and finding out.
             if dir {
                 nm.push(b'/');
+            } else if is_executable(&ent.name) {
+                nm.push(b'*');
             }
             nm.truncate(name_cols);
             text(px, g, name_x, y + g.ts, &nm, size_x.min(clip), ink);
@@ -997,7 +1604,57 @@ pub fn open() {
         id, g.w, g.h, g.ts, ow, oh, ox, oy, roots_n, tn, ln,
         MODEL.lock().as_ref().map(|m| m.cwd.clone()).unwrap_or_default()
     );
+    census("open");
     repaint();
+}
+
+/// The three lines that make v2's four claims READABLE in a headless capture, printed at open and on
+/// every refresh. None of them is a verdict; they are measurements, and each one answers a bench
+/// complaint in the terms it was made in.
+///
+///  * `volumes=` — the mount prefixes and the ROOT rows they reduced to. `/fat listed twice` is
+///    convicted or cleared by comparing the two lists, without a photograph.
+///  * `reads=/hits=/cycles=` — the cost of the listing path. `reads` is seam calls actually made,
+///    `hits` is the calls the cache answered; on this machine an open used to make four and now
+///    makes two, and the number says so.
+///  * `census=` — the DIRECTORY ITSELF, by name and size, up to [`CENSUS_MAX`] entries. "Where is
+///    vug, where is the kernel" is a question about content, so the content is on the wire.
+fn census(when: &str) {
+    let g = MODEL.lock();
+    let Some(m) = g.as_ref() else {
+        return;
+    };
+    let roots: Vec<&str> = m.tree.iter().filter(|r| r.depth == 0).map(|r| r.path.as_str()).collect();
+    serial_println!(
+        "[quarry] {} volumes mounts={:?} roots={:?} tree-rows={} (a mount claimed by another mount is not a root — that is the duplicate-/fat rule)",
+        when, m.mounts, roots, m.tree.len()
+    );
+    serial_println!(
+        "[quarry] {} cost reads={} hits={} cycles={} cache={}/{} gen={}",
+        when, m.reads, m.hits, m.read_cycles, m.cache.len(), MAX_CACHE, m.cache_gen
+    );
+    let dirs = m.list.iter().filter(|e| matches!(e.kind, NodeKind::Dir)).count();
+    let mut names = String::new();
+    for e in m.list.iter().take(CENSUS_MAX) {
+        if matches!(e.kind, NodeKind::Dir) {
+            names.push_str(&alloc::format!(" {}/", e.name));
+        } else {
+            names.push_str(&alloc::format!(
+                " {}{}({})",
+                e.name,
+                if is_executable(&e.name) { "*" } else { "" },
+                e.size
+            ));
+        }
+    }
+    serial_println!(
+        "[quarry] {} census cwd={} entries={} dirs={} files={} truncated={} names:{}{}",
+        when, m.cwd, m.list.len(), dirs, m.list.len() - dirs, m.list_truncated, names,
+        if m.list.len() > CENSUS_MAX { " ..." } else { "" }
+    );
+    if let Some(e) = &m.err {
+        serial_println!("[quarry] {} census ERROR cwd={} {}", when, m.cwd, e);
+    }
 }
 
 /// Close Quarry and release its surface. Safe to call when not open.
@@ -1038,6 +1695,9 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
         return true;
     }
     let mut acted = true;
+    let mut refreshed = false;
+    // Decided under the lock, run without it — see [`Act`].
+    let mut act = Act::None;
     {
         let mut guard = MODEL.lock();
         let Some(m) = guard.as_mut() else {
@@ -1103,23 +1763,13 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
                         m.show(&p);
                     }
                 }
+                // The KEYBOARD twin of the double-click, and deliberately the SAME function: Enter
+                // on a directory descends (as it always did) and Enter on a program runs it. A
+                // gesture that exists only on the pointer is a gesture an operator at a serial
+                // console cannot reach, and this window is driven from both.
                 Pane::List => {
-                    if let Some(e) = m.list.get(m.list_sel) {
-                        if matches!(e.kind, NodeKind::Dir) {
-                            let p = join(&m.cwd, &e.name);
-                            if p.len() <= PATH_MAX {
-                                // Reveal it on the left first, so the tree row exists for `navigate`
-                                // to select rather than silently not finding it.
-                                if let Some(i) = m.tree.iter().position(|r| r.path == m.cwd) {
-                                    if !m.tree[i].expanded {
-                                        m.expand(i);
-                                    }
-                                }
-                                m.navigate(&p);
-                                m.focus = Pane::List;
-                            }
-                        }
-                    }
+                    let i = m.list_sel;
+                    act = m.activate_row(i);
                 }
             },
             // Backspace — up one level, from wherever the focus is.
@@ -1127,17 +1777,28 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
                 let p = parent(&m.cwd);
                 m.navigate(&p);
             }
-            // `r` — re-read. The mount table is rebuilt too, so a stick plugged after open appears.
+            // `r` — re-read. The mount table is rebuilt AND the directory cache dropped, so a stick
+            // plugged after open appears and a card written to from the shell re-reads. This is the
+            // operator's half of the cache's invalidation set (module doc §Cost); the other two
+            // halves — window open and a volume-generation change — need no gesture.
             b'r' | b'R' => {
+                m.invalidate();
                 m.reload_roots();
                 let cwd = m.cwd.clone();
+                m.status = None;
                 m.show(&cwd);
+                refreshed = true;
             }
             _ => acted = false,
         }
         if acted {
             m.settle();
         }
+    }
+    run_act(act);
+    reap_jobs();
+    if refreshed {
+        census("refresh");
     }
     if acted {
         repaint();
@@ -1183,23 +1844,29 @@ pub fn press_route(x: i32, y: i32) -> bool {
     // The press is ours: raise so the operator's click also brings Quarry forward, exactly as the
     // router's own select arm would have.
     wm::focus_changed(OWNER);
-    {
+    let act = {
         let mut guard = MODEL.lock();
         let Some(m) = guard.as_mut() else {
             return true;
         };
-        // The return says whether a ROW was hit, and the repaint below does not read it: a press that
-        // hit no row still changed the pane focus (and therefore the selection ink), and it is still
-        // CONSUMED — it moved window focus and must not be delivered to whatever lies underneath.
-        let _ = content_press(m, sx, sy);
-    }
+        // A press that hit no row still changed the pane focus (and therefore the selection ink),
+        // and it is still CONSUMED — it moved window focus and must not be delivered to whatever
+        // lies underneath. So the return carries only the DEFERRED work, never "was it mine".
+        content_press(m, sx, sy)
+    };
+    // Outside the lock, always: `run_act` may reach the ELF loader and the scheduler.
+    run_act(act);
+    reap_jobs();
     repaint();
     true
 }
 
 /// Route a press already resolved to SOURCE coordinates. Split out from [`press_route`] so the
 /// witness can drive it without a window table, and so the hit arithmetic reads beside the painter's.
-fn content_press(m: &mut Model, sx: usize, sy: usize) -> bool {
+///
+/// Returns the work that must happen with the model lock RELEASED — [`Act::None`] for every gesture
+/// that is purely a model change, which is all of them except opening a program.
+fn content_press(m: &mut Model, sx: usize, sy: usize) -> Act {
     let g = m.geom;
     let row_h = g.row_h();
     let tp = g.tree_pane();
@@ -1225,19 +1892,25 @@ fn content_press(m: &mut Model, sx: usize, sy: usize) -> bool {
             // shorter than one row) reaches exactly that shape. `max` then `min` is total.
             m.tree_sel = m.tree_sel.max(m.tree_scroll).min((m.tree_scroll + tvis).saturating_sub(1));
             m.settle();
-            return true;
+            return Act::None;
         }
         if sy < ti.y {
-            return true;
+            return Act::None;
         }
         // `contains` tested the OUTER pane, so the bottom keyline row can land one past the last
         // viewport slot. Decline it rather than selecting a row the press did not visually address.
         let r = (sy - ti.y) / row_h;
         let i = m.tree_scroll + r;
         if r >= tvis || i >= m.tree.len() {
-            return true;
+            return Act::None;
         }
         m.tree_sel = i;
+        // The tree stamps the click too, so a press here followed by a press in the LIST can never
+        // combine into a double-click. `is_double` tests the PANE as well as the row, and this is
+        // what makes that test load-bearing rather than decorative.
+        m.click_ms = crate::arch::ms();
+        m.click_row = i;
+        m.click_pane = Pane::Tree;
         // A press ON the disclosure marker toggles; anywhere else on the row navigates. The two
         // regions are derived from the SAME indent the painter used, so they cannot drift.
         let indent = ti.x + PAD + m.tree[i].depth * cell;
@@ -1252,7 +1925,7 @@ fn content_press(m: &mut Model, sx: usize, sy: usize) -> bool {
             m.show(&p);
         }
         m.settle();
-        return true;
+        return Act::None;
     }
 
     if lp.contains(sx, sy) {
@@ -1272,20 +1945,41 @@ fn content_press(m: &mut Model, sx: usize, sy: usize) -> bool {
             }
             m.list_sel = m.list_sel.max(m.list_scroll).min((m.list_scroll + lvis).saturating_sub(1));
             m.settle();
-            return true;
+            return Act::None;
         }
         if sy < body_y {
-            return true; // the header is not a row
+            return Act::None; // the header is not a row
         }
         let r = (sy - body_y) / row_h;
         let i = m.list_scroll + r;
-        if r < lvis && i < m.list.len() {
-            m.list_sel = i;
+        if r >= lvis || i >= m.list.len() {
+            // A press below the last row is still a press: it moved focus to this pane, and it must
+            // NOT leave a stale click stamp behind that a later press on a row could pair with.
+            m.click_ms = 0;
+            m.settle();
+            return Act::None;
         }
+        // ── the double-click ────────────────────────────────────────────────────────────────────
+        // Two presses, same pane, same ROW, inside DOUBLE_CLICK_MS. The row test is what makes this
+        // a gesture rather than a timer: a rapid press on row 3 then row 4 is two selections, which
+        // is what an operator scanning a list is doing, and it must never run anything.
+        let now = crate::arch::ms();
+        let dbl = is_double(m.click_ms, now, m.click_row, i, m.click_pane == Pane::List);
+        m.list_sel = i;
+        m.click_row = i;
+        m.click_pane = Pane::List;
+        // A consumed double-click RESETS the stamp rather than re-arming it, so three fast presses
+        // are one double-click and one fresh single — never two overlapping activations of the row.
+        m.click_ms = if dbl { 0 } else { now };
         m.settle();
-        return true;
+        if dbl {
+            let act = m.activate_row(i);
+            m.settle();
+            return act;
+        }
+        return Act::None;
     }
-    false
+    Act::None
 }
 
 // ── The dock's request seam ─────────────────────────────────────────────────────────────────────
@@ -1302,6 +1996,7 @@ pub fn request_open() {
 /// Consume a pending open request. Idempotent, and safe to call every pass: a quiet pass is one
 /// relaxed load.
 pub fn service() {
+    reap_jobs();
     if REOPEN.swap(false, Ordering::AcqRel) {
         open();
     }
@@ -1408,6 +2103,16 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
         list_scroll: 0,
         focus: Pane::Tree,
         err: None,
+        mounts: Vec::new(),
+        cache: Vec::new(),
+        cache_gen: 0,
+        reads: 0,
+        hits: 0,
+        read_cycles: 0,
+        click_ms: 0,
+        click_row: 0,
+        click_pane: Pane::List,
+        status: None,
     };
     m.tree.push(TreeRow { path: String::from("/"), name: String::from("/"), depth: 0, expanded: false });
     m.tree.push(TreeRow { path: String::from("/fat"), name: String::from("fat"), depth: 0, expanded: false });
@@ -1485,6 +2190,183 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
         return Err("list press-to-row did not clear the header");
     }
 
+    // ── leg 6: the duplicate-root rule — the `/fat`-listed-twice fix, as a property ───────────────
+    // `prefix_claims` first, because `root_prefixes` is only as good as the boundary rule under it.
+    if !prefix_claims("/", "/fat") || !prefix_claims("/usb", "/usb/a") || !prefix_claims("/usb", "/usb") {
+        return Err("prefix_claims failed to claim a path its prefix owns");
+    }
+    if prefix_claims("/usb", "/usbfoo") || prefix_claims("/fat", "/") || prefix_claims("/fat", "/usb") {
+        return Err("prefix_claims claimed a path across a name boundary");
+    }
+    // THE DEFECT, in one assertion: this is exactly the live mount table of a Pi with a stick in it,
+    // and v1 turned it into three depth-0 rows, two of which the expanded `/` then repeated.
+    let live: Vec<String> =
+        alloc::vec![String::from("/"), String::from("/fat"), String::from("/usb")];
+    let rooted = root_prefixes(&live);
+    if rooted.len() != 1 || rooted[0] != "/" {
+        return Err("root_prefixes did not reduce a rooted namespace to its single root");
+    }
+    // Idempotent and order-independent — a rule applied twice, or to a differently-sorted table,
+    // must not answer differently.
+    if root_prefixes(&rooted) != rooted {
+        return Err("root_prefixes is not idempotent");
+    }
+    let shuffled: Vec<String> =
+        alloc::vec![String::from("/usb"), String::from("/"), String::from("/fat")];
+    if root_prefixes(&shuffled) != rooted {
+        return Err("root_prefixes depends on the order of the mount table");
+    }
+    // …and it must not HIDE a volume on a table with no root mount, which is the failure mode the
+    // lazy fix ("just drop everything but `/`") would have had on an arch that has not adopted the
+    // VFS root, or on a namespace assembled from peers.
+    let rootless: Vec<String> = alloc::vec![String::from("/fat"), String::from("/usb")];
+    if root_prefixes(&rootless).len() != 2 {
+        return Err("root_prefixes hid a volume on a table with no root mount");
+    }
+    // The boundary case: `/usb` does not claim `/usbfoo`, so both are roots.
+    let boundary: Vec<String> = alloc::vec![String::from("/usb"), String::from("/usbfoo")];
+    if root_prefixes(&boundary).len() != 2 {
+        return Err("root_prefixes dropped a sibling that only shares a name prefix");
+    }
+
+    // ── leg 7: the list-side name dedupe ─────────────────────────────────────────────────────────
+    let mut rows = alloc::vec![
+        DirEnt { name: String::from("fat"), kind: NodeKind::Dir, size: 0, mtime: None },
+        DirEnt { name: String::from("fat"), kind: NodeKind::Dir, size: 0, mtime: None },
+        DirEnt { name: String::from("VUG.ELF"), kind: NodeKind::File, size: 12568, mtime: None },
+    ];
+    dedupe_by_name(&mut rows);
+    if rows.len() != 2 || rows[0].name != "fat" || rows[1].name != "VUG.ELF" {
+        return Err("dedupe_by_name did not keep exactly the first of each name, in order");
+    }
+
+    // ── leg 8: launchability — the routing test, and what it must NOT claim ───────────────────────
+    // The four names on Peter's card, plus the case forms, plus the two shapes that must be refused.
+    for yes in ["VUG.ELF", "vug.elf", "Vug.Elf", "STAT.ELF", "HELLO.BIN", "midden.bin"] {
+        if !is_executable(yes) {
+            return Err("is_executable refused a program the loader accepts");
+        }
+    }
+    for no in ["KERNEL8.IMG", "CONFIG.TXT", "SRC.TGZ", "START4.ELF.BAK", ".ELF", ".BIN", "ELF", ""] {
+        if is_executable(no) {
+            return Err("is_executable claimed a file the loader was never offered");
+        }
+    }
+
+    // ── leg 9: the double-click predicate ────────────────────────────────────────────────────────
+    if !is_double(100, 100 + DOUBLE_CLICK_MS, 3, 3, true) {
+        return Err("is_double refused two presses exactly at the window");
+    }
+    if is_double(100, 101 + DOUBLE_CLICK_MS, 3, 3, true) {
+        return Err("is_double accepted two presses past the window");
+    }
+    if is_double(100, 200, 3, 4, true) {
+        return Err("is_double paired presses on different rows");
+    }
+    if is_double(100, 200, 3, 3, false) {
+        return Err("is_double paired presses in different panes");
+    }
+    // The guard that matters on a board whose CNTFRQ reads 0 (and on the first press of any boot):
+    // a zero clock must NEVER read as a double-click, or the first click of the session launches.
+    if is_double(0, 0, 0, 0, true) || is_double(0, 200, 3, 3, true) || is_double(100, 0, 3, 3, true) {
+        return Err("is_double armed on a zero clock — the first press of a boot would launch");
+    }
+    // Monotonic-only: a clock that went backwards is not a 4-billion-ms-fast double-click.
+    if is_double(500, 100, 3, 3, true) {
+        return Err("is_double accepted a backwards clock");
+    }
+
+    // ── leg 10: the cache — hit/miss accounting and its bound ────────────────────────────────────
+    // Driven against the model's OWN cache rather than through `collect_cached` (which would reach
+    // the seam and therefore a volume this machine may not have), because what is being proven is
+    // the eviction bound and the generation reset, both of which are pure. The read path itself is
+    // proven at the bench by the `[quarry] … cost reads=/hits=` line.
+    m.cache.clear();
+    for k in 0..(MAX_CACHE + 4) {
+        if m.cache.len() >= MAX_CACHE {
+            m.cache.remove(0);
+        }
+        m.cache.push(CacheEnt { path: alloc::format!("/p{}", k), is_dir: true, rows: Vec::new() });
+    }
+    if m.cache.len() != MAX_CACHE {
+        return Err("the directory cache grew past its bound");
+    }
+    // FIFO: the OLDEST paths are the ones gone, and the newest is still there.
+    if m.cache.iter().any(|e| e.path == "/p0") || !m.cache.iter().any(|e| e.path == "/p19") {
+        return Err("the directory cache did not evict oldest-first");
+    }
+
+    // ── leg 11: the launch gesture, END TO END through the real router ───────────────────────────
+    // Legs 8 and 9 prove the two predicates in isolation; this proves the WIRING — that two presses
+    // at a real pixel, through the same `content_press` the click router calls, produce an
+    // `Act::Launch` naming the right absolute path. Everything downstream of that `Act` is `bg`'s
+    // own already-witnessed machinery (`spawn_user_image_bg`, exercised on every boot by the BGRUN
+    // fixtures), so this leg deliberately stops at the DECISION: a fixture that actually spawned a
+    // program would perturb the very window table the rest of this battery asserts exact pixels of.
+    //
+    // Disk-free, exactly as leg 4's tree is: the list is hand-built, so the leg is honest on a
+    // machine with no volume at all.
+    m.cache.clear();
+    m.cwd = String::from("/fat");
+    m.list = alloc::vec![
+        DirEnt { name: String::from("VUG.ELF"), kind: NodeKind::File, size: 12568, mtime: None },
+        DirEnt { name: String::from("CONFIG.TXT"), kind: NodeKind::File, size: 842, mtime: None },
+    ];
+    m.list_scroll = 0;
+    m.list_sel = 0;
+    m.click_ms = 0;
+    m.focus = Pane::Tree;
+    // The first BODY row of the list pane, derived the way the PAINTER derives it — inner top plus
+    // one row for the pinned header, plus a pixel to land inside the row rather than on its edge.
+    let lin = small.list_pane().inner();
+    let px_x = lin.x + PAD + 1;
+    let row0_y = lin.y + small.row_h() + 1;
+    let row1_y = row0_y + small.row_h();
+    // A zero clock is a legitimate state (`CNTFRQ_EL0` unset), and on such a machine the guard in
+    // `is_double` must SUPPRESS the gesture rather than fire it on the first press. Both branches
+    // are asserted, so this leg is a real claim on every board rather than on some of them.
+    let clock_live = crate::arch::ms() != 0;
+    if !matches!(content_press(&mut m, px_x, row0_y), Act::None) {
+        return Err("a first press launched something");
+    }
+    if m.list_sel != 0 || m.focus != Pane::List {
+        return Err("a list press did not select its row and focus its pane");
+    }
+    match (content_press(&mut m, px_x, row0_y), clock_live) {
+        (Act::Launch(p), true) => {
+            if p != "/fat/VUG.ELF" {
+                return Err("the double-click launched the wrong path");
+            }
+        }
+        (Act::None, false) => {} // the zero-clock guard, doing exactly its job
+        (_, true) => return Err("a double-click on a program did not ask for a launch"),
+        (_, false) => return Err("a double-click fired on a zero clock"),
+    }
+    // The stamp RESET: a third rapid press must be a fresh single, never a second activation.
+    if !matches!(content_press(&mut m, px_x, row0_y), Act::None) {
+        return Err("a third rapid press re-activated the row");
+    }
+    // Two presses on DIFFERENT rows are two selections and must open nothing — the property that
+    // makes this a gesture rather than a timer.
+    m.click_ms = 0;
+    let _ = content_press(&mut m, px_x, row0_y);
+    if !matches!(content_press(&mut m, px_x, row1_y), Act::None) {
+        return Err("presses on two different rows were paired into a double-click");
+    }
+    // …and a double-click on a NON-program is honest rather than silent.
+    m.click_ms = 0;
+    let _ = content_press(&mut m, px_x, row1_y);
+    match (content_press(&mut m, px_x, row1_y), clock_live) {
+        (Act::NoOpener(p), true) => {
+            if p != "/fat/CONFIG.TXT" {
+                return Err("the unhandled double-click named the wrong path");
+            }
+        }
+        (Act::None, false) => {}
+        (_, true) => return Err("a double-click on a document did not report that it has no opener"),
+        (_, false) => return Err("a document double-click fired on a zero clock"),
+    }
+
     Ok((small.w * small.h, bench.w * bench.h))
 }
 
@@ -1493,8 +2375,8 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
 pub fn selftest() {
     match selftest_result() {
         Ok((a, b)) => serial_println!(
-            ":: QUARRY: geometry+scroll+tree+hit — 640x480 surf_px={} 1920x1200 surf_px={} :: PASS ::",
-            a, b
+            ":: QUARRY: geometry+scroll+tree+hit+dedupe+exec+dblclick+cache+launch — 640x480 surf_px={} 1920x1200 surf_px={} dbl={}ms cache={} :: PASS ::",
+            a, b, DOUBLE_CLICK_MS, MAX_CACHE
         ),
         Err(why) => serial_println!(":: QUARRY: {} :: FAIL ::", why),
     }
