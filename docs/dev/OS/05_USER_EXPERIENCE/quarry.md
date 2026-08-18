@@ -781,3 +781,146 @@ Read against §0's table, line by line:
   counter is **~27 ms per directory read** on QEMU, and the SD path on metal is not faster.
 * `cwd=/fat` with `KERNEL8.IMG`, `CONFIG.TXT` and a screen of `*`-marked programs — the landing rule
   chose the card over the two-file native root, without being told what a card is.
+
+---
+
+## 13. FATFIX — the `/fat` duplicate re-checked, and the cost put on the wire (2026-08-18)
+
+Three items came into this arc from the PA42/PA44 metal sittings, by way of baton `pi-1` §8. They did
+not all turn out to be the same kind of thing, and saying so is the arc's first deliverable.
+
+| item | verdict |
+| --- | --- |
+| 8b — *"/fat is LISTED TWICE in the tree"* | **already fixed.** §11.2's duplicate-root rule landed in `54ab30b9` (Quarry v2) and holds. Re-measured this arc on the wire; no code changed. §13.1 |
+| 8a — *"FAT contents VERY SLOW"*, plus the double-click launch delay | **instrumented, not fixed.** The cost is now a measurement rather than an argument: `[fatperf]`. §13.2 |
+| 8d — *"the USB reader shows NO FILES"* | **not a wiring gap.** The path from an enumerated disk to a Quarry row is complete and each of its two gates is honest. §13.3 |
+
+### 13.1 The duplicate is gone, and this is how that was checked rather than assumed
+
+Baton item 8b was written against **late boot5**, which was Quarry **v1**. §11.2's rule shipped after
+it. So the honest first move was to re-run the complaint before repairing it, and an armed QEMU run
+(`UNAOS_QUARRY=1 UNAOS_PIDESK=1`, bench geometry) answers it in one line:
+
+```
+[quarry] open volumes mounts=["/", "/fat"] roots=["/"] tree-rows=3 (a mount claimed by another mount is not a root — that is the duplicate-/fat rule)
+```
+
+Two mount prefixes, **one** root, three tree rows — `/`, `fat`, and `OVERLAYS` under it. `/fat`
+appears once. The property behind that line is not a QEMU accident either: `selftest` leg 6 asserts
+`root_prefixes(["/", "/fat", "/usb"]) == ["/"]` — *exactly* the mount table of a Pi with a stick in
+it, the shape the bench actually had — plus idempotence, order-independence, the rootless-namespace
+case and the `/usb` vs `/usbfoo` boundary. Leg 7 asserts the list pane's `dedupe_by_name` beside it.
+
+**No code was changed for this item.** A second dedupe layered over a working one would have been a
+change that could only ever hide a future regression from the witness that is meant to catch it.
+
+### 13.2 `[fatperf]` — the listing and launch cost, in raw words
+
+Peter's two speed complaints are about different code and were being answered with the same shrug.
+The launch half is already half-convicted: this round's wire showed `spawn`→first-present is fast,
+which leaves the **read**. So this arc builds the instrument, and deliberately stops there.
+
+```
+[fatperf] op=list path=/fat sectors=21 us=9772
+[fatperf] op=read path=/fat/VUG.ELF sectors=33 us=12525
+```
+
+Four raw words, one line per operation, no derived value:
+
+* `sectors` — 512-byte sector reads the block layer actually performed, counted at the FAT driver's
+  **two read funnels** (`fat::read_sector` and `fat::read_sectors`), so a chunked multi-block
+  transfer counts the sectors it moved rather than counting as one call. It is a delta of a global
+  census across the operation, which means an unrelated FAT read landing inside the window is
+  attributed here; on this kernel's serialised boot that is rare, and it is stated rather than
+  papered over.
+* `us` — wall time across the whole VFS operation, which is what an operator waits through. It
+  therefore **includes** `FatBackend::read_dir`/`read`'s first line, a full `fat::mount_source`
+  volume probe (LBA 0, the MBR census, the superfloppy BPB attempt, the GPT scan, a BPB sector per
+  accepted partition). That probe is the per-CALL term §11.1 convicted, and it belongs inside the
+  bracket for exactly that reason.
+
+The clock is `CNTVCT_EL0` via `arch::now_cycles()` and `timer::cntfrq()`, **not** `ticks()`: on QEMU
+raspi4b the periodic timer IRQ is never delivered and `ticks()` stays frozen at 0 (UVUG-7), so a
+tick-derived elapsed time would print `us=0` for every operation on the entire QEMU battery — the
+instrument would be vacuous precisely where it is first exercised. This is the same reasoning, and
+the same pair of registers, that `DOUBLE_CLICK_MS` needed in §11.3.
+
+Files: `unaos/crates/kernel/src/fs/fatperf.rs` (the whole instrument), `fs/mod.rs` (the wrapper),
+and four call sites — two funnels in `fs/fat.rs`, two brackets in `fs/vfs.rs`.
+
+**It is an instrument, not a fix, and that boundary is deliberate.** No cache, no refusal, no
+behavioural change. The repair — cluster-chain caching, or migration onto ORIN's UnaFS — is a later
+arc because the baton forbids building on the FAT namespace twice, and a repair chosen before the
+cost is measured is a guess. §11.1's `[quarry] cost` line counts Quarry's *calls*; `[fatperf]` counts
+what one call costs. The fix arc needs both terms and now has them separately.
+
+**Byte-identity, and the part of it that had to be measured.** The knob is `UNAOS_FATPERF=1` (cargo
+feature `fatperf`); OFF, `fs/fatperf.rs` is not compiled and `kernel8.img` is byte-identical to
+baseline (`3a280f9d…` both ways, 1301840 bytes). Getting there cost two builds and taught something
+worth writing down. The first form of the sector counter was an `#[inline(always)]` shim,
+`fs::perf_note_sectors(n)`, called from the two funnels. Knob-off it inlines to nothing, and the two
+call sites were **line-neutral** edits to lines that already existed — the discipline `arroyo`'s
+PI-DESK block states, because panic `Location` records embed line numbers. The image moved anyway:
+`3a280f9d…` → `08535f64…`, same length, **11997 bytes different**. An empty `#[inline(always)]`
+function is still a *call* in MIR, and `read_sector` is small and inlined through most of the FAT
+driver, so one extra MIR statement moved the inliner's cost decision and the drift cascaded. The fix
+is that the call must not exist knob-off at all: `fat.rs` carries the `#[cfg]` on the **statement**,
+which is gone before MIR. So the discipline is longer than it was written:
+
+> A knob-off-compiled file must be line-neutral **and** MIR-neutral — a shim that inlines to nothing
+> is not the same as a call that was never there — and the identity is re-measured, never reasoned
+> about.
+
+The `vfs.rs` bracket keeps the wrapper form, because measurement showed it costs nothing there:
+`MountTable::read_dir`/`read` are not the inline candidates `read_sector` is.
+
+### 13.3 `/usb` — the path is complete; both of its gates are honest
+
+Baton item 8d asked whether an enumerated disk ever reaches the Quarry tree. Structurally it does,
+and the chain has no missing link:
+
+1. `drivers/xhci/mod.rs:10954` — a completed SCSI bring-up calls
+   `drivers::block::publish_usb_geometry(dev_info)`.
+2. `drivers/block.rs:639` — that records the stick under `USB_BLOCK_DEVICE` (deliberately *beside*
+   the global `BLOCK_DEVICE`, which the microSD owns on the Pi), advances `USB_PUBLISH_GEN`, and
+   raises the storage-ready edge. `read_block_usb` reads through that handle.
+3. `shell.rs:5113` — `vfs_mount_table()` binds `/usb` **iff**
+   `fat::mount_source(BlockSource::Usb).is_ok()`.
+4. `shell.rs:vfs_ls_collect` — listing `/` synthesizes every bound mount prefix immediately below it
+   as a child row, so `usb` is a row of `/`.
+5. `quarry/live.rs` — `Model::expand` splices that row into the tree; `root_prefixes` keeps it a
+   child of `/` rather than a second root (§11.2).
+
+So the absence on late boot5 is one of exactly two honest refusals, and the wire distinguishes them:
+
+* **step 1 never happened** — the wire showed no enumeration lines at all (no `[piusb25]`, no
+  `BOT: PARKED`), so no geometry was ever published and there was nothing to mount. This is the
+  xHCI/BOT bring-up's business, an off-limits seam for this arc, and it is reported rather than
+  touched.
+* **step 3 refused** — the baton's own note is that the card's content reads as raw zeros plus a
+  `0x55AA` signature, which is not a FAT. `mount_source` then honestly finds no volume and `/usb` is
+  not bound, which is the hot-plug posture `vfs.md` §6 asks for. `vfs_ls_collect` reports
+  `volume /usb not mounted (-ENODEV)` for a direct `ls /usb` (VFS-4), and Quarry's `r` gesture
+  re-reads the mount table so a later plug appears without a reopen.
+
+**No fix was made**, because there is no gap in `fs/vfs.rs` or the collector to fix. When the stick
+next enumerates on the bench, `[fatperf] op=list path=/usb …` will appear beside the `/fat` lines and
+say what the stick's own listing costs.
+
+### 13.4 Gate
+
+* `./arroyo check` and `UNAOS_WC=1 ./arroyo check` — green, both arches. The `arm-pi` leg carries
+  `fatperf`, so the knob's ARMED polarity is type-checked and not merely its absence.
+* Knob-off `./arroyo kernel8` — `3a280f9dcbb32145…`, 1301840 bytes, **byte-identical to the
+  pre-arc baseline**, measured before and after rather than argued.
+* Knob-off `./arroyo kernel8-test 210` — `✅ MBENCH PASS — 117/117 required witnesses, 0 forbidden
+  hit(s), 17807 lines scanned`.
+* Armed `UNAOS_QUARRY=1 UNAOS_PIDESK=1 UNAOS_FATPERF=1` at bench geometry
+  (`UNAOS_FBW=1920 UNAOS_FBH=1200`) — the `[quarry]` and `[fatperf]` lines quoted above. **This
+  configuration is red on the required count, and it was red before this arc too** (baseline, same
+  host, same geometry, no changes applied: 116/117 and 102 forbidden hits; after: 115/117 and 106).
+  Every residual line is in the compositor lane — `[wc-g] … COHER`, `[wc-c] side-by-side drawn=1`,
+  `[wc-h]`/`[wc-k] AT-RISK`, `[dragperf] … coalesced=0` — the documented-known classes the PA44
+  ledger already names, and the host was running four concurrent QEMU sessions throughout. Nothing
+  filesystem-side appears in it, and the knob-off byte-identity is the stronger statement anyway:
+  the image an operator boots without this knob is the same bytes it was.

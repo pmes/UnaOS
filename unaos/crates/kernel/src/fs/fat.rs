@@ -718,7 +718,7 @@ fn read_sector(source: BlockSource, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> Re
         BlockSource::Sdhc => crate::drivers::block::read_block_sdhc(lba, buf),
     };
     match r {
-        Ok(n) if n >= SECTOR_SIZE => Ok(()),
+        Ok(n) if n >= SECTOR_SIZE => { #[cfg(all(feature = "fatperf", target_arch = "aarch64"))] crate::fs::fatperf::note_sectors(1); Ok(()) } // FATFIX M2: read funnel #1
         // WEDGE-8 (F3): Busy is not an I/O failure — the controller is loaned out and this context
         // refused (masked) or exhausted (unmasked) its wait. Kept distinct so the RMW wrappers can
         // retry outside the masked span and user mode sees `-EAGAIN`, never a false `-EIO`.
@@ -812,7 +812,7 @@ fn read_sectors(source: BlockSource, lba: u64, buf: &mut [u8]) -> Result<(), Fat
             BlockSource::Sdhc => crate::drivers::block::read_blocks_sdhc(at, chunk),
         };
         match r {
-            Ok(n) if n == take => {}
+            Ok(n) if n == take => { #[cfg(all(feature = "fatperf", target_arch = "aarch64"))] crate::fs::fatperf::note_sectors((take / SECTOR_SIZE) as u64); } // FATFIX M2: read funnel #2
             _ => return Err(FatError::Io), // short read == error, exactly as `read_sector`
         }
         off += take;

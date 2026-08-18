@@ -331,7 +331,7 @@ impl MountTable {
 
     pub fn read_dir(&self, path: &str) -> Result<Vec<DirEnt>, VfsError> {
         let (b, rel) = self.resolve(path)?;
-        b.read_dir(rel)
+        crate::fs::perf_op("list", path, || b.read_dir(rel)) // FATFIX M2: measured, not guessed
     }
 
     pub fn stat(&self, path: &str) -> Result<Stat, VfsError> {
@@ -341,7 +341,7 @@ impl MountTable {
 
     pub fn read(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, VfsError> {
         let (b, rel) = self.resolve(path)?;
-        b.read(rel, offset, len)
+        crate::fs::perf_op("read", path, || b.read(rel, offset, len)) // FATFIX M2: the launch delay
     }
 
     /// The unified open-for-read: resolve the namespace, then run the resolved

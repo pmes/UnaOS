@@ -41,3 +41,40 @@ pub mod unafs;
 /// and doc land alone so the design can be reviewed before consumers move onto
 /// it (shell/syscall adoption is a follow-up).
 pub mod vfs;
+
+/// FATFIX M2 (`UNAOS_FATPERF=1`): the cost instrument for the listing and file-read paths — the
+/// measurement behind Peter's "FAT contents VERY SLOW" and the double-click launch delay. See the
+/// module for what it prints and why its clock is `CNTVCT_EL0`. aarch64 only, because the two
+/// backends it measures are (`vfs.md` §12.4: x86 has no mount table to route through), and because
+/// `us_now` reads `CNTFRQ_EL0` — an x86 `now_cycles()` is a TSC whose rate this kernel does not
+/// publish, so an x86 arm would print a number in units it could not name.
+#[cfg(all(feature = "fatperf", target_arch = "aarch64"))]
+pub mod fatperf;
+
+/// Bracket one VFS operation with the sector counter and the microsecond clock, emitting the single
+/// `[fatperf] op=… path=… sectors=… us=…` line. Knob-off this is the identity function over `f`.
+///
+/// Its two call sites are line-neutral edits to lines that already existed in `vfs.rs`, because
+/// `vfs.rs` IS compiled into the knob-off `kernel8.img` and panic `Location` records embed line
+/// numbers (PI-DESK's measured lesson, `arroyo`'s K8_FEATS block).
+///
+/// ⚠ AND LINE-NEUTRALITY IS NOT SUFFICIENT — this arc measured that too, and it cost two builds.
+/// The sector counter's first form was a second shim of exactly this shape, `perf_note_sectors(n)`,
+/// called from `fat.rs`'s two read funnels. Knob-off it inlines to nothing and the source stayed
+/// line-neutral, and the image STILL moved — `3a280f9d… -> 08535f64…`, same length, **11997 bytes
+/// different**. An `#[inline(always)]` empty function is still a CALL in MIR, and `read_sector` is
+/// small and inlined into most of the FAT driver, so one extra MIR statement moved the inliner's
+/// cost decision and the drift cascaded through every caller. The fix is that the call must not
+/// exist knob-off *at all*: `fat.rs` carries `#[cfg(all(feature = "fatperf", …))]` on the STATEMENT
+/// itself, so the statement is gone before MIR, and identity is restored (measured, not reasoned).
+/// This wrapper survives in that form only because measurement showed it costs nothing HERE:
+/// `MountTable::read_dir`/`read` are not inline candidates the way `read_sector` is.
+#[inline(always)]
+pub fn perf_op<T>(_op: &str, _path: &str, f: impl FnOnce() -> T) -> T {
+    #[cfg(all(feature = "fatperf", target_arch = "aarch64"))]
+    {
+        return fatperf::measure(_op, _path, f);
+    }
+    #[cfg(not(all(feature = "fatperf", target_arch = "aarch64")))]
+    f()
+}

@@ -1607,7 +1607,7 @@ KERNEL_CFG_MATRIX=(
   # PI-DESK (`pidesk` — the desktop furniture family on the Pi panel; this leg carries `witness`, so it
   # is also the only place the dock/menubar/crystal FIXTURES are type-checked on aarch64).
   # Cannot carry the tegra family — see the mutual-exclusion note above.
-  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,pidesk,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc"
+  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,pidesk,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,fatperf"
   # aarch64 board leg 2 — Jetson Orin Nano (Tegra234), plus the board-neutral aarch64 features that
   # would otherwise ride nothing: ORIN-SMP (tegrasmp/smpprobe), the four XCARVE levers, ORIN-NET-1..4
   # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET
@@ -3133,6 +3133,20 @@ kernel8() {
     if [ -n "${UNAOS_QUARRY:-}" ]; then
         K8_FEATS="${K8_FEATS},quarry"
         echo -e "${COLOR_YELLOW}  • UNAOS_QUARRY: the file manager on the BCM2711 panel (volume tree + detailed list + scrolling; arrows/Enter/Backspace/Esc, click, and the dock's pinned tile)${COLOR_RESET}"
+    fi
+    # FATFIX M2: UNAOS_FATPERF=1 adds the `fatperf` feature — the COST INSTRUMENT for the VFS listing
+    # and file-read paths. One line per operation, raw words only:
+    #   [fatperf] op=list path=/fat sectors=222 us=13456
+    # `sectors` is counted at fat.rs's two read funnels (so a chunked multi-block transfer counts the
+    # sectors it moved); `us` brackets the whole VFS operation including FatBackend's per-call
+    # `mount_source` volume probe — the term quarry.md §11.1 convicted as the per-CALL cost. It is a
+    # MEASUREMENT knob: no caching, no behavioural change; the repair is a later arc (and must
+    # coordinate with orin 0's UnaFS layout — the baton forbids building on FAT twice).
+    # OFF => fs/fatperf.rs is not compiled, both fs/mod.rs shims inline to nothing, and kernel8.img
+    # is byte-identical to baseline (the call sites are line-neutral edits to fat.rs/vfs.rs).
+    if [ -n "${UNAOS_FATPERF:-}" ]; then
+        K8_FEATS="${K8_FEATS},fatperf"
+        echo -e "${COLOR_YELLOW}  • UNAOS_FATPERF: the FAT/VFS cost instrument ([fatperf] op=list|read path= sectors= us= — measurement only, no behaviour change)${COLOR_RESET}"
     fi
     echo -e "${COLOR_YELLOW}⚡ Building bare-metal kernel8.img (Pi 4, microSD-slot boot)...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"

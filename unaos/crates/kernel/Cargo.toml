@@ -1424,6 +1424,24 @@ piinstall_confirm = ["piinstall_arm"]
 # `UNAOS_QUARRY=1 UNAOS_PIDESK=1` so the desktop seam that opens the window exists.
 quarry = []
 
+# FATFIX M2 (`UNAOS_FATPERF=1`) — the COST INSTRUMENT for the VFS listing and file-read paths, and
+# nothing else. Peter's metal complaints (baton pi-1 item 8a, restated at PA44) are that the FAT
+# listing is VERY SLOW and that a Quarry double-click takes a long time to start the program; the
+# wire already showed `spawn`→first-present is fast, which leaves the READ. This knob compiles
+# `fs/fatperf.rs` and turns the two `#[inline(always)]` shims in `fs/mod.rs` from no-ops into a
+# sector counter (at `fat.rs`'s two read funnels) and a microsecond bracket (around
+# `MountTable::read_dir` / `MountTable::read`), which together print one line per operation:
+#   [fatperf] op=list path=/fat sectors=222 us=13456
+# Raw words only — no rates, no ratios, no verdict. It changes NO behaviour: the fix (cluster-chain
+# caching, or migration onto ORIN's UnaFS) is a later arc, because the baton forbids building on the
+# FAT namespace twice and a repair chosen before the cost is measured is a guess.
+#
+# The knob class is `quarry`/`pidesk`'s (builder=0): kernel8's feature list is CURATED in `arroyo`'s
+# K8_FEATS block. Default OFF => `fs/fatperf.rs` is not compiled, both shims inline to nothing, the
+# call sites sit on lines that already existed (no panic-`Location` line shift in `fat.rs`/`vfs.rs`,
+# which ARE compiled knob-off), and `kernel8.img` is byte-identical to baseline.
+fatperf = []
+
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }
