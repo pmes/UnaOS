@@ -169,7 +169,7 @@ scrolling list needs.** Quarry is the first scrolling anything in this tree.
 
 | layer | what exists | usable? |
 | --- | --- | --- |
-| input | `drivers/xhci/mod.rs:3763` decodes the HID boot mouse as `byte0=buttons, byte1=dx, byte2=dy` and the comment says `(byte3 = wheel, ignored)`. `pal::Event` has no wheel variant; `una-abi` has no `INPUT_EV_WHEEL`. The HID keymap drops PageUp/PageDown (`0x4B`/`0x4E` → `(0,0)`). | **no** |
+| input | ~~`drivers/xhci/mod.rs` decoded the HID boot mouse as `byte0=buttons, byte1=dx, byte2=dy` and ignored byte 3; `pal::Event` had no wheel variant and `una-abi` no `INPUT_EV_WHEEL`.~~ **Closed by the WHEEL arc:** the decoder reads byte 3 as a signed `i8` whenever the Transfer Event residual says the report actually carried four bytes, `pal::Event::Wheel(i8)` carries it, `INPUT_EV_WHEEL` packs it, and the router delivers it to the focused EL0 window (`[wheel1]` census). No CONSUMER exists yet — the channel is live, nothing scrolls on it. The HID keymap still drops PageUp/PageDown (`0x4B`/`0x4E` → `(0,0)`). | **wheel: yes; PageUp/Dn: no** |
 | compositor | `wm.rs` is 18 373 lines and `WindowInfo` has no scroll, content-offset or viewport field. There is no clip-to-content-rect. | **no** |
 | blit | `FrameBuffer::scroll_up(dy, fill)` (`framebuffer.rs:552`) is a **whole-surface** memmove — no rect, no clip, kernel-private, behind no syscall. `video/vperf.rs` instruments its cost; it is a benchmark subject, not an API. | **no** |
 | widget | `theme::SCROLL_TRACK` and `theme::SCROLL_THUMB` have existed since the theme table landed and **no scrollbar has ever consumed them** (their only uses were a row highlight in `instgui` and the dim minimised pip in `dock`). `theme::SCROLLBAR_WIDTH` had no consumer at all. | **no** |
@@ -209,11 +209,14 @@ The surface cap is what makes that affordable: at 1152 x 720 a repaint is ~830 k
 repaint happens only on an actual gesture — there is no animation and no per-frame paint. A settled
 Quarry costs nothing at all.
 
-### Scroll GESTURES, given no wheel
+### Scroll GESTURES, given no wheel CONSUMER
 
 The scrollbar **track** is the coarse gesture: a press above the thumb pages back, below pages
-forward. That is not a design preference, it is the consequence of the wheel byte being discarded in
-the xHCI decoder before the ABI ever sees it (§4's table). Thumb **dragging** is not implemented —
+forward. That was originally the consequence of the wheel byte being discarded in the xHCI decoder
+before the ABI ever saw it; the WHEEL arc has since landed the byte, the event and the routing (§4's
+table), so the track gesture is now a CHOICE rather than a workaround — and it stays the coarse
+gesture regardless, since it is the only one a wheel-less mouse has. Wiring Quarry's list to
+`INPUT_EV_WHEEL` is a scoped follow-up, not a blocked one. Thumb **dragging** is not implemented —
 `wm`'s drag machinery is title-bar-scoped and a content-drag protocol is its own arc. Keyboard
 `Up`/`Down` is the fine gesture and auto-follows.
 
@@ -331,8 +334,9 @@ Quarry moves to EL0 the day these are true. Nothing here is Quarry's own work.
 5. **A userspace drawing library.** Every EL0 crate today depends on `una-abi` alone, which is
    `const`-only, and there are four separately hand-rolled bitmap fonts across four programs (none
    covering full ASCII). Quarry needs ~96 glyphs, a `fill_rect`, a clip and a blit.
-6. *(optional, for cost)* **A wheel event in the ABI** and un-ignoring `data_data[3]` in the xHCI HID
-   decoder; and `SYS_WIN_PRESENT_ROWS` on both arches, so a scroll costs a row band rather than a box.
+6. ~~*(optional, for cost)* **A wheel event in the ABI** and un-ignoring `data_data[3]` in the xHCI HID
+   decoder~~ — **landed** (WHEEL arc); what remains of this item is `SYS_WIN_PRESENT_ROWS` on both
+   arches, so a scroll costs a row band rather than a box.
 
 M2 adds two, both of which are about what a double-click on a NON-program should do:
 

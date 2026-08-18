@@ -32,6 +32,19 @@ pub enum Event {
     /// CLICK-1: a pointer button-DOWN edge (payload = the report's button bitmask, bit 0 = primary).
     /// Emitted once per press by the HID decoders (edge-detected there); release emits nothing.
     Button(u8),
+    /// WHEEL: one scroll-wheel report, carrying the HID boot-mouse wheel byte as a SIGNED delta —
+    /// POSITIVE is scroll-up / away from the user, negative is scroll-down. This is a DELTA, not an
+    /// edge and not a level: consecutive detents arrive as consecutive events and a consumer
+    /// accumulates them.
+    ///
+    /// Emitted ONLY for a nonzero delta, and ONLY from a relative boot report that actually carried
+    /// a fourth byte. A boot mouse whose interrupt-IN endpoint delivers a 3-byte report has NO wheel
+    /// byte, and the decoders emit nothing for it rather than reading past the report and inventing
+    /// a delta out of whatever the DMA buffer held from the previous transfer.
+    ///
+    /// Consumers that do not scroll ignore it through their existing wildcard arm, exactly as they
+    /// ignore `KeyUp`.
+    Wheel(i8),
     None,
     Unknown,
 }
@@ -976,7 +989,7 @@ fn push_locked(q: &mut EventQueue, event: Event, lift: LiftHint) -> bool {
     use core::sync::atomic::Ordering::Relaxed;
     let is_ptr = matches!(
         event,
-        Event::Mouse { .. } | Event::MouseAbsolute { .. } | Event::Button(_)
+        Event::Mouse { .. } | Event::MouseAbsolute { .. } | Event::Button(_) | Event::Wheel(_)
     );
     let is_key = matches!(event, Event::Key(_) | Event::KeyUp(_));
     if is_ptr {
@@ -1114,6 +1127,66 @@ pub fn push_pointer_report(motion: Option<Event>, button: Option<Event>) {
             push_locked(&mut q, b, hint);
         }),
     }
+}
+
+// =================================================================================================
+// WHEEL — the scroll-wheel census
+// =================================================================================================
+//
+// The wheel byte was decoded nowhere in this OS until this arc: every HID pointer decoder read
+// `[buttons, dx, dy]` and left byte 3 on the floor, so `pal::Event` had no wheel variant, `una-abi`
+// had no `INPUT_EV_WHEEL`, and no ring-3 program could be sent a scroll no matter how it asked.
+// Adding the decode is cheap; PROVING it end to end is not, because the three ways a wheel report
+// can die are all silent and all look identical from the outside (nothing scrolls):
+//
+//   1. the byte is never decoded — a 3-byte report, or a pointer that never took the relative path;
+//   2. the delta is decoded but nothing is focused, so the router has no ring to put it in;
+//   3. the delta is decoded and routed, and the APP ignores it.
+//
+// These three counters separate those cases at a glance. They are plain relaxed atomics on a path
+// that already does MMIO and DMA, bumped only when a wheel is actually in play (`note_decoded` is
+// called for nonzero deltas only), so an idle boot and a boot with no wheel at all pay nothing. The
+// PRINTING is knob-gated at the call site (`pidesk`); the COUNTING is unconditional, so a metal
+// capture can read the census from any build that can reach a witness.
+
+/// Nonzero wheel deltas decoded out of HID pointer reports since boot.
+static WHEEL_DECODED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Wheel events the router successfully queued into a focused EL0 app's input ring.
+static WHEEL_ROUTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Wheel events that reached a router seam with NO EL0 app focused (or a full ring) and were
+/// dropped. Case (2) above: the decode works, the delivery has nowhere to go.
+static WHEEL_NO_FOCUS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// The most recent nonzero delta, sign preserved — so the witness can show DIRECTION, not just that
+/// something moved. Stored as i32 because there is no `AtomicI8`.
+static WHEEL_LAST: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+
+/// Record one nonzero wheel delta decoded from a HID report. Called by the HID decoders, from the
+/// interrupt-service path — lock-free and safe from any context.
+pub fn wheel_note_decoded(delta: i8) {
+    use core::sync::atomic::Ordering::Relaxed;
+    WHEEL_DECODED.fetch_add(1, Relaxed);
+    WHEEL_LAST.store(delta as i32, Relaxed);
+}
+
+/// Record that a wheel event was queued into the focused app's ring.
+pub fn wheel_note_routed() {
+    WHEEL_ROUTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record that a wheel event was dropped for want of a focused EL0 target.
+pub fn wheel_note_no_focus() {
+    WHEEL_NO_FOCUS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(decoded, routed, dropped-for-no-focus, last delta)` — the `[wheel1]` census.
+pub fn wheel_census() -> (u32, u32, u32, i32) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        WHEEL_DECODED.load(Relaxed),
+        WHEEL_ROUTED.load(Relaxed),
+        WHEEL_NO_FOCUS.load(Relaxed),
+        WHEEL_LAST.load(Relaxed),
+    )
 }
 
 /// UVUG-6 — live EVENT_QUEUE occupancy, read by the host-side typematic backpressure guard so a synthesised

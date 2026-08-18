@@ -376,6 +376,12 @@ pub const INPUT_EV_MOUSE_REL: u64 = 3;
 pub const INPUT_EV_MOUSE_ABS: u64 = 4;
 /// A pointer button state. Payload `[7:0]` = button bitmask.
 pub const INPUT_EV_BUTTON: u64 = 5;
+/// WHEEL: one scroll-wheel report. Payload `[7:0]` = the HID boot-mouse wheel byte, a SIGNED `i8` in
+/// the usual HID sense — POSITIVE is scroll-up / away from the user, negative is scroll-down. Ring 3
+/// must sign-extend: `input_ev_payload(ev) as u8 as i8`. Only ever emitted for a NONZERO delta, so a
+/// consumer never sees a no-op detent; and only from a report that ACTUALLY carried a wheel byte — a
+/// 3-byte relative boot report (a mouse with no wheel) emits nothing rather than a fabricated zero.
+pub const INPUT_EV_WHEEL: u64 = 6;
 
 /// Pack an event the way both kernels do. One definition, so the encode and the decode below cannot
 /// drift apart.

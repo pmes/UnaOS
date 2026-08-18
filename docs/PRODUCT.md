@@ -39,7 +39,7 @@ Cell values: **yes** (verified on that platform) · **no** (verified absent) · 
 | EL0 process isolation + ACL persistence | ? | yes | Pi: K2 metal-confirmed 2026-07-11 |
 | Reboot-surviving filesystem (CoW, power-cut safe) | ? | yes | Pi: K8a/K8b metal-confirmed |
 | File manager (Quarry: volume tree + detailed list) | no | partial | `UNAOS_QUARRY=1`. x86 empty until VFS adoption (vfs.md §12.4). Pi: PA42 boot5 metal — opens 1152x720, 2 volumes, dock-pinned, FAT contents load; open defects: listing VERY slow (linear FAT walk), /fat listed twice, hover flashing, no launch verb (v2 headline), /usb rows absent. docs/dev/OS/05_USER_EXPERIENCE/quarry.md |
-| Scrolling (any list, anywhere) | no | partial | Quarry only, and app-owned: no wheel (the xHCI HID decoder drops the byte), no content offset in `wm`, no scrollbar widget, no rect-scoped blit. quarry.md §4 |
+| Scrolling (any list, anywhere) | no | partial | Quarry only, and app-owned. The WHEEL now exists as a sensory channel: the xHCI HID decoder reads byte 3 of the 4-byte relative boot report (length taken from the Transfer Event residual, so a 3-byte no-wheel mouse is never read past), `pal::Event::Wheel(i8)` carries it, `INPUT_EV_WHEEL` packs it, and the router delivers it to the focused EL0 window — WHEEL arc, `[wheel1]` census. What is still missing is every CONSUMER: no app scrolls on it, no content offset in `wm`, no scrollbar widget, no rect-scoped blit. Reachability is strings-proven in the image; the delivery verdict is metal's, because QEMU raspi4b attaches no USB at all. quarry.md §4 |
 
 x86 column is mostly **?** because this seat has never verified that bench; the x86 seat's
 landing reports claim more. First x86 session under this law: verify and fill the column.

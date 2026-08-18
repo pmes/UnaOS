@@ -2947,7 +2947,21 @@ fn route_input_to_active_el0() -> usize {
             }
         }
         #[cfg(feature = "pidesk")] unaos_kernel::video::wm::drag_route_tail(ev); // DRAG-PI M3 — STEER a live title-bar grab from the FOCUSED-APP drain, after the cursor keep-alive above has applied this report and before the event is routed onward. This is the path a grab actually takes: the chrome arm focuses the dragged window's own owner, so every subsequent pointer report arrives here and is PACKED into that app's ring — the shell drain never sees it. Keyed on the raw event inside `drag_route_tail`, so a non-pointer event and an idle boot both cost one match and one atomic load. Delivery is unchanged: the app still receives the report, exactly as it does today.
-        if unaos_kernel::arch::aarch64::syscall::user_input_enqueue(ev) {
+        let queued = unaos_kernel::arch::aarch64::syscall::user_input_enqueue(ev);
+        // WHEEL — account the wheel's fate at the ONE seam that knows it. `user_input_enqueue`
+        // collapses "no EL0 target", "not deliverable" and "ring full" into a single `false`, and for
+        // a `Wheel` the middle case is impossible (`pack_input` always packs it) — so a `false` here
+        // means the delta was decoded correctly and had nowhere to land. That is precisely the case
+        // the `[wheel1]` census exists to separate from "the byte was never decoded", because on a
+        // machine where nothing scrolls the two are indistinguishable from the outside.
+        if let unaos_kernel::pal::Event::Wheel(_) = ev {
+            if queued {
+                unaos_kernel::pal::wheel_note_routed();
+            } else {
+                unaos_kernel::pal::wheel_note_no_focus();
+            }
+        }
+        if queued {
             routed += 1;
         }
     }
@@ -3520,6 +3534,7 @@ fn pump_usb_into_gui() {
     if unaos_kernel::arch::aarch64::syscall::user_input_active() != 0 {
         route_input_to_active_el0();
         click2_depth_witness();
+        wheel1_witness(); // WHEEL — edge-triggered; silent unless a wheel delta actually moved.
         return;
     }
     if SCREEN_APP_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
@@ -3688,10 +3703,20 @@ fn pump_usb_into_gui() {
                 }
                 gui_send(ev);
             }
+            // WHEEL — a scroll that arrived with the SHELL holding focus. There is no EL0 ring to put
+            // it in and the console does not scroll, so the event ends here; what this arm adds is the
+            // ACCOUNTING, so the census can say "decoded, but nobody was listening" instead of leaving
+            // a working decoder and a silent machine looking identical. Deliberately NOT forwarded to
+            // `gui_send`: the render service has no wheel consumer, and inventing one would be the
+            // scroll feature this arc is explicitly not landing.
+            unaos_kernel::pal::Event::Wheel(_) => {
+                unaos_kernel::pal::wheel_note_no_focus();
+            }
             _ => {}
         }
     }
     click2_depth_witness();
+    wheel1_witness(); // WHEEL — edge-triggered; silent unless a wheel delta actually moved.
     // PIUSB-28: fire the FAT mount from the path that ACTUALLY runs on Pi baremetal+fb. PIUSB-27
     // wired `piusb27_service()` beside `probe_once` in the main/GUI loop — but that loop never runs
     // on Pi metal (kernel_main spawns services and hlt_loops; the PIUSB-22 structural finding, which
@@ -3972,6 +3997,38 @@ fn click2_depth_witness() {
         serial_println!(
             "[click2] depth gui_chan={} (sent={} recv={}) app_active={}",
             sent.wrapping_sub(recv), sent, recv, app
+        );
+    }
+}
+
+/// WHEEL — the `[wheel1]` census line: `decoded` nonzero wheel deltas, `routed` into a focused EL0
+/// app's ring, `nofocus` dropped because nothing was focused, and the sign of the last delta.
+///
+/// EDGE-TRIGGERED, not periodic, and that is the whole design. `[click2]` fires every N passes because
+/// queue depth is a level that is interesting even when it is not moving; a wheel census is not — it
+/// is all zeros on every boot that never touched a wheel, which is every automated gate and most
+/// sittings. A periodic print would therefore add a line to the knob-off serial log for a subsystem
+/// that did nothing, and this track's regression suite counts lines. So the line fires ONLY when the
+/// census has actually advanced since the last print, which means: on a boot with no wheel input it is
+/// never emitted at all, and on a boot with wheel input it is emitted for every change and no more.
+/// Reachability on a gate that cannot deliver a wheel is therefore proved by `strings` on the image,
+/// not by the log — stated plainly rather than dressed up as a behavioural pass.
+///
+/// Called from BOTH pump destinations — the focused-app router branch and the shell drain — because
+/// the two answer different halves of the question: the router branch is where a wheel can be routed,
+/// and the shell branch is where a wheel arrives when there is nobody to route it to.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn wheel1_witness() {
+    use core::sync::atomic::Ordering;
+    /// The `decoded + routed + nofocus` sum at the last print. A sum is sufficient as the change
+    /// detector: all three counters are monotonic, so the sum advances iff any one of them did.
+    static LAST_TOTAL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let (decoded, routed, nofocus, last) = unaos_kernel::pal::wheel_census();
+    let total = decoded.wrapping_add(routed).wrapping_add(nofocus);
+    if total != LAST_TOTAL.swap(total, Ordering::Relaxed) {
+        serial_println!(
+            "[wheel1] decoded={} routed={} nofocus={} last={}",
+            decoded, routed, nofocus, last
         );
     }
 }

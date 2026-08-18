@@ -12707,6 +12707,7 @@ use una_abi::INPUT_EV_KEY_UP; // a key RELEASE (payload[7:0] = ASCII)
 use una_abi::INPUT_EV_MOUSE_REL; // relative pointer motion (payload[31:16]=dx, [15:0]=dy as i16)
 use una_abi::INPUT_EV_MOUSE_ABS; // absolute pointer position (payload[31:16]=x,  [15:0]=y  as i16)
 use una_abi::INPUT_EV_BUTTON; // a pointer button-DOWN edge (payload[7:0] = button bitmask)
+use una_abi::INPUT_EV_WHEEL; // one scroll-wheel detent    (payload[7:0] = signed i8 delta, + = up)
 
 /// Per-ASID input ring capacity (power of two — occupancy math is `tail.wrapping_sub(head)`).
 const INPUT_RING_CAP: usize = 32;
@@ -12983,6 +12984,10 @@ fn pack_input(ev: crate::pal::Event) -> Option<u64> {
         Event::Mouse { x, y } => (INPUT_EV_MOUSE_REL, pack_xy(x, y)),
         Event::MouseAbsolute { x, y } => (INPUT_EV_MOUSE_ABS, pack_xy(x, y)),
         Event::Button(mask) => (INPUT_EV_BUTTON, mask as u64),
+        // WHEEL: the delta rides the low byte as a raw two's-complement i8 — ring 3 sign-extends
+        // (`payload as u8 as i8`). Cast through `u8` first: `i8 as u64` would sign-extend to
+        // 0xFFFF_FFFF_FFFF_FFxx and smear a negative detent across the type field.
+        Event::Wheel(d) => (INPUT_EV_WHEEL, d as u8 as u64),
         Event::Timer | Event::None | Event::Unknown => return None,
     };
     Some(una_abi::input_ev_pack(ty, payload))

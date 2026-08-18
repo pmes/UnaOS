@@ -4205,6 +4205,43 @@ impl XhciController {
 
                                             let rel = slot.mouse_is_relative;
                                             let buttons = data_data[0];
+                                            // WHEEL — HOW MANY BYTES THIS REPORT ACTUALLY CARRIED,
+                                            // and why the question has to be asked at all.
+                                            //
+                                            // `queue_mouse_read` arms the interrupt-IN Normal TRB
+                                            // for `mouse_mps` bytes, and the Transfer Event's TRB
+                                            // Transfer Length field (status[23:0]) is the RESIDUAL —
+                                            // the bytes the controller did NOT transfer — so the
+                                            // report length is the difference. That is the only
+                                            // honest source. MPS alone over-reports: an 8-byte
+                                            // interrupt endpoint routinely delivers a 4-byte boot
+                                            // report, and plenty of mice declare more headroom than
+                                            // they use. And `data_data` is a 512-byte window over a
+                                            // DMA buffer that is never cleared between transfers, so
+                                            // every byte past the end of THIS report still holds the
+                                            // PREVIOUS one. A boot mouse with no wheel sends 3 bytes
+                                            // ([buttons, dx, dy]); reading byte 3 there would not
+                                            // read zero, it would read the last report's dy and
+                                            // scroll the machine on every mouse movement.
+                                            //
+                                            // Clamped to the armed length, so a controller reporting
+                                            // a nonsense residual can only ever shrink the report.
+                                            let report_len = (slot.mouse_mps as u32)
+                                                .saturating_sub(status & 0x00FF_FFFF)
+                                                .min(slot.mouse_mps as u32)
+                                                as usize;
+                                            // WHEEL — byte 3 of the 4-byte RELATIVE boot report, a
+                                            // signed i8: positive is scroll-up / away from the user.
+                                            // Gated on the length above AND on `rel`, because the
+                                            // absolute/tablet report has no wheel in that position
+                                            // at all (bytes 3-4 are its Y coordinate — decoding a
+                                            // wheel from them would turn every vertical tablet
+                                            // movement into a scroll).
+                                            let wheel = if rel && report_len >= 4 {
+                                                data_data[3] as i8
+                                            } else {
+                                                0
+                                            };
                                             // DRAGGLIDE — the motion is DECIDED here and PUSHED
                                             // below, paired with this report's button edge, so the
                                             // reorder that puts a release edge ahead of its own
@@ -4216,8 +4253,9 @@ impl XhciController {
                                             // entry — the ~1px hop, back, reporting success.
                                             let (last_a, last_b, motion) = if rel {
                                                 // HID BOOT mouse: byte0 = buttons, byte1 = dx:i8, byte2 = dy:i8
-                                                // (byte3 = wheel, ignored). Signed relative deltas — sign-extend
-                                                // i8 -> i32 and emit only on actual motion.
+                                                // (byte3 = wheel — decoded above as `wheel`, pushed below).
+                                                // Signed relative deltas — sign-extend i8 -> i32 and emit only
+                                                // on actual motion.
                                                 let dx = data_data[1] as i8 as i32;
                                                 let dy = data_data[2] as i8 as i32;
                                                 let m = if dx != 0 || dy != 0 {
@@ -4270,6 +4308,26 @@ impl XhciController {
                                                 },
                                             );
                                             self.slots[slot_id as usize].mouse_prev_buttons = buttons;
+
+                                            // WHEEL — pushed SEPARATELY, and deliberately outside
+                                            // the DRAGGLIDE pairing above. That pairing exists to
+                                            // tell a release edge which lift is its own; a scroll
+                                            // detent is neither a lift nor an edge and joining it to
+                                            // the pair would give the reorder a third entry to
+                                            // reason about for no benefit. A wheel report from a
+                                            // real mouse carries dx=dy=0 and an unchanged button
+                                            // mask, so in practice this is the ONLY push the report
+                                            // makes; the extra ring trip is paid only when the wheel
+                                            // actually moved.
+                                            //
+                                            // Zero deltas are never pushed: the wheel byte is 0 in
+                                            // every ordinary motion and click report, and emitting
+                                            // those would flood the 64-slot EVENT_QUEUE with no-ops
+                                            // and starve the real HID edges (the UVUG-6 wedge shape).
+                                            if wheel != 0 {
+                                                crate::pal::wheel_note_decoded(wheel);
+                                                crate::pal::push_event(crate::pal::Event::Wheel(wheel));
+                                            }
 
                                             // UI1-MOUSE M1: bounded serial mouse-witness — first report
                                             // + every 32nd thereafter, NEVER one-per-report (that would
