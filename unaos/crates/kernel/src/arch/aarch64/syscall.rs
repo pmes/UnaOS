@@ -7371,13 +7371,23 @@ fn sys_write_file(asid: u64, file_id: u64, buf: u64, len: u64) -> i64 {
 /// ABIFREEZE moved the declaration into `una_abi`: one type, shared with the x86 kernel and with the
 /// ring-3 programs that read the bytes back.
 ///
-/// `ticks` here is the 250 Hz SCHEDULER tick, not milliseconds — the x86 kernel's same-named field is
-/// a 1 kHz millisecond count. Both are shipped behaviour and neither moves; the rate a ring-3 program
-/// needs is `una_abi::GETINFO_TICK_HZ`. See una-abi's divergence ledger, D1.
+/// `ticks` here is a 250 Hz count, not milliseconds — the x86 kernel's same-named field is a 1 kHz
+/// millisecond count. Both are shipped behaviour and neither moves; the rate a ring-3 program needs
+/// is `una_abi::GETINFO_TICK_HZ`. See una-abi's divergence ledger, D1.
+///
+/// VUGSLOMO: it is 250 Hz *as a clock* — `timer::abi_ticks()`, off CNTVCT — and deliberately not the
+/// scheduler's tick counter, which is a sum over cores and therefore not a rate at all.
 use una_abi::UserInfo;
 
 // ABIFREEZE (divergence D1): the ABI's declared tick rate MUST be the rate this kernel's heartbeat is
-// armed at, because `sys_getinfo` below hands EL0 that tick count RAW.
+// armed at, because `sys_getinfo` below hands EL0 a count in that unit.
+//
+// VUGSLOMO WIDENED WHAT "IN THAT UNIT" MEANS, and the assert is why the fix could be local. Until
+// this arc the field carried `timer::ticks()` RAW — the GLOBAL counter, which `timer::on_tick` bumps
+// from every core, so on 4-core metal it advanced at `4 * TICK_HZ` while this assert still passed
+// (both sides were, and are, 250: the constant was never wrong, the published quantity was). The
+// field now carries `timer::abi_ticks()`, which IS a TICK_HZ-rate clock by construction, so the
+// assert below finally guards what it always read as guarding.
 //
 // The x86 twin carries the identical assert against `apic::TICK_HZ` (1000). The two rates DIFFER —
 // that is the divergence — and these two lines are what keep each arch's ABI constant honest about its
@@ -7398,7 +7408,9 @@ const _: () = assert!(una_abi::GETINFO_TICK_HZ == super::timer::TICK_HZ);
 fn sys_getinfo(user_ptr: u64) -> i64 {
     let info = UserInfo {
         pid: super::sched::current_id().unwrap_or(0),
-        ticks: super::timer::ticks(),
+        // VUGSLOMO: NOT `timer::ticks()` — that is the global, per-core-summed counter and publishing
+        // it here put a 4x-fast clock under a 250 Hz label on 4-core metal. See `timer::abi_ticks`.
+        ticks: super::timer::abi_ticks(),
     };
     // SAFETY: view `info` as its raw bytes for the copy; `UserInfo` is `#[repr(C)]` plain-old-data.
     let bytes = unsafe {

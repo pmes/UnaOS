@@ -574,6 +574,191 @@ credit a scheduler port with a fix it did not make: **VUGSPREAD raises the Pi's 
 `wf=1..2` bug.** The `wf=1..2` tail wants its own arc, and the honest first question there is what on
 c3 is at 99% while `[spread4] live` shows no EL0 resident on it.
 
+### 6.8 The `exec-vugslomo` arc — the `wf=1..2` tail, answered
+
+§6.7 closed by naming the open question: *"the honest first question there is what on c3 is at 99%
+while `[spread4] live` shows no EL0 resident on it."* This arc answers it, and the answer has two
+halves that were being read as one bug.
+
+#### 6.8a THE METER WAS 4x LOW ON EVERY PI METAL BOOT — `wf` was never the vug's rate
+
+`sys_getinfo` handed EL0 `timer::ticks()` **raw**. That is the GLOBAL tick counter and
+`timer::on_tick` bumps it from **every core's** timer IRQ, so on 4-core BCM2711 metal it advances at
+`4 × TICK_HZ` ≈ 1000 Hz while `una_abi::GETINFO_TICK_HZ` told ring 3 to divide by 250. Every ring-3
+program that read the field measured time 4x fast; every rate it computed came out **4x low**.
+
+This is UVUG-7 (P52) one caller further out — the same defect, in the same counter, that made
+`arch::ms()` run 4x fast and typematic repeat 4x too quickly. `ms()` was moved to CNTVCT then;
+`sys_getinfo` was not.
+
+**The ABIFREEZE assert could not catch it and still cannot.** `assert!(GETINFO_TICK_HZ ==
+timer::TICK_HZ)` compares the rate each core *arms its timer at* — both sides were always 250. The
+constant was never wrong. What was wrong is that the quantity being published was a **sum over cores
+rather than a clock**. The fix is therefore on the publishing side: `timer::abi_ticks()`, off CNTVCT,
+which *is* a `TICK_HZ`-rate clock by construction — so the assert now guards what it always read as
+guarding.
+
+**Evidence, two metal boots, ~1 600 samples, ratio 4.0 both times** (capture
+`pi4-pi0-b1/ttyACM0.log`):
+
+| Boot | `[vugfps] wf=` | `[wcn] win=6 asid=0x1` — the SAME window | ratio |
+|---|---|---|---|
+| boot6 / PA43 `6de03c87` | `1,2,1,2,…` — **409 ones and 409 twos, perfectly alternating**, 818 consecutive samples | `rate=5.8..6.0/s`, `gap=144..231ms` | **4.0** |
+| boot5 / PA42 `0f9a1a4b` | `wf=25..41` | `rate=96..214/s` | **≈3.9** |
+
+The alternation is not noise and not a stall — it is the arithmetic signature. A ~6 fps rate sampled
+over the **0.25 s** window the wrong divisor opens gives 1.5 frames, which the integer meter renders
+`1,2,1,2,…` forever. The vug's own meter doc predicted exactly this disagreement and named it as the
+finding it was built to make; this is that finding's other end.
+
+#### 6.8b IT WAS NOT ONLY A READOUT — the LOD ladder eats the meter's number
+
+`user-vug`'s `lod_adapt` consumes `fps_refresh`'s return directly: `rate < LOD_DOWN` (24) drops a
+rung, `rate * 4 < LOD_DOWN` drops **two**, `rate > LOD_UP` (55) climbs one, and `CALM_WINDOWS` (8)
+counts the "quiet seconds" before the ceiling relaxes. Against a 4x-low meter on a 0.25 s window those
+constants meant something else entirely on the Pi:
+
+| Constant | What it says | What it MEANT on Pi metal |
+|---|---|---|
+| `LOD_DOWN = 24` | drop below 24 fps | drop below **96** real fps |
+| `LOD_UP = 55` | climb above 55 fps | climb above **220** real fps |
+| `CALM_WINDOWS = 8` | 8 seconds of calm | **2** seconds |
+
+**This is the PA42 "fps SWING", and it is a limit cycle, not a scheduler artefact.** boot5's
+`[vuglod]` trace is a clean two-state oscillator, ~130 flips over the boot:
+
+```
+lvl=2011 → 3056 → 2012 → 3058 → 2010 → 3057 → 2013 → 3057 → 2016 → …
+   (lod 2, fps 11)   (lod 3, fps 56)   …
+```
+
+At level 2 the reported rate (≈57) clears `LOD_UP`, so the ladder climbs; at level 3 the frame costs
+~L² more and the reported rate (≈13) falls under `LOD_DOWN`, so it drops. The dead band's stated
+guarantee — *"wide enough that no single level can sit on both edges"* — is **false on the Pi**: the
+2↔3 pair straddles the whole band. The ceiling pin that exists to stop precisely this releases every
+2 s instead of every 8 s, for the same clock reason, so the cycle restarts indefinitely.
+
+**The clock fix breaks the cycle without touching a ladder constant.** With an honest meter, level 3's
+real ≈52 fps lands *inside* the dead band `[24, 55]` and the ladder settles there — which is what the
+band was designed to do, and it only ever failed because the meter was 4x low. **No LOD constant is
+retuned by this arc, deliberately:** retuning them would move x86, where they were always correct.
+
+#### 6.8c THE `wf=1..2` TAIL — throttle, and the correlation verdict the brief asked for
+
+With the meter corrected, PA43's real rate is **≈6 fps against PA42's ≈100–220**. That collapse is
+real and it is **not** the meter. The correlation test:
+
+* **The pump storm is continuous, so "inside vs outside a TIMEOUT window" is not answerable on this
+  capture.** boot6 carries 97 `BOT pump TIMEOUT` lines, 61 of them inside the vug's lifetime, running
+  effectively back to back across the whole ~450 s the vug is up. There is no non-timeout window of
+  any length to compare against. Any claim of the form "it recovers between stalls" is unfalsifiable
+  here and this arc does not make one.
+* **The machine is nevertheless capable of full rate while the pump is wedged.** Fourteen samples at
+  four distinct moments read `wf=23..75` (real ≈92–300 fps) *inside* the storm, each alongside a
+  `[comp2] rate=` burst of 20–44/s. So the pump is not a hard ceiling — it is a duty-cycle tax.
+* **The discriminator is `[fluid3]`, and it is unambiguous.** PA42: `parks=0` for the entire boot —
+  the frame barrier never parks. PA43: `parks≈30/5 s, park_us mean=169 602, max=412 786` — and 170 ms
+  is *exactly* the vug's `[wcn] gap=144..231ms`. Two committed residents are parked essentially 100 %
+  of the time (58 parks × 170 ms ≈ 2 × the 5.07 s span, `depth_max=2`).
+* **The placement is the mechanism, and it is EL0-blind.** `[spread4] live c0=0/1 c1=0/0 c2=0/1
+  c3=1/1` — the three EL0 residents *are* spread one per core, so the lattice reports itself
+  balanced. But `SCHED: load` reads `c0=0% c1=0..3% c2=0% c3=99%` for the whole vug lifetime, because
+  `usb-pump` is **`caller-pinned, no-migrate` to core 3** and burning it. **The balancer counts EL0
+  residents; it cannot see a pinned kernel task.** The vug's one runnable thread therefore
+  time-shares a 99 %-consumed core while three cores sit idle, and its workers park 170 ms a frame
+  waiting for it. This answers §6.7's question verbatim: *what is on c3 at 99 % with no EL0 resident
+  there* — a pinned `usb-pump`, and `[spread4]`'s columns are structurally unable to say so.
+
+**Verdict: throttle explains the PA43 rate; the meter explains the PA43 and PA42 *readings*; neither
+explains the other.** The pinned-pump mechanism is **exec-botpark2's**, and this arc does not touch
+`xhci`/`main.rs`. **OWED (new class (b) row):** the aarch64 placement lattice should consult per-core
+load, not EL0 resident count alone — `[pulse5]` and `SCHED: load` already carry the number it needs.
+
+#### 6.8d THE LAUNCH PAUSE IS STORAGE, and the x86 launch-stall fix has no Pi analogue
+
+Peter's *"took forever to come up"* is **not** in the present path. The capture places the whole cost
+before the program exists:
+
+```
+7452  :: BOT: rescue retry rung=port-cycle result=fail err=Timeout budget_scale=1 ::
+7454  :: BOT: SURRENDER slot=5 cause=Timeout … disk marked FAILED and retracted
+7458  :: BGRUN: bg /fat/vug.elf — loaded 12568 bytes, entry 0x500000, pid=122 asid=1 DETACHED
+7486  [wc-a] create win=6 asid=0x1 surf=128x128 stride=512 scale=4x at (17,85) z=17
+7489  [wc-h] win=6 box=522x556 … compose_us=1423 present_us=1135 -> BUFFERED
+7499  [wc-h] rollup win=6 emit=1 age_ms=51 …
+```
+
+The read of `/fat/vug.elf` completes **only after the BOT retry ladder surrenders the wedged reader**;
+`[gui] app-exit t=552s dur=12s wedged=true` on the line after `BGRUN` prices the previous attempt at
+**12 s**. Once the program is loaded, **spawn → window → four presents → rollup is `age_ms=51`** —
+51 ms, of which each present is `present_us≈1 135..1 212`. **The present path is exonerated.**
+
+This is the exact opposite of x86, where `WCD_CHUNK_US` was introduced because a stage-2 verdict cost
+~1.26 s inside the launching app's own present. See 6.8e for why that cannot happen here.
+
+#### 6.8e AUDIT — the three merged trunk video arcs against the Pi path
+
+| Merged arc | Pi-path finding | Verdict |
+|---|---|---|
+| **vug-text-flicker / `PACE_SHADOW`** | `pace_admit`, `pace_service`, `pace_shadow_refresh`, `PACE_SHADOW`, `PACE_SHADOW_OK` and the whole WPACE block are under `#[cfg(all(target_arch = "x86_64", feature = "wc"))]` — 99 such sites in `wm.rs`. The only three `cfg(feature = "wc")` sites without an arch gate are dock/menu/strip **geometry** (`menu_paint_owed`, the WCK5 strip clip, STRIPFACTOR), none of which pace anything. | **CLEAN — Peter's `9d12e7e0` ruling survives the merge. The Pi's vug is unpaced, and this arc adds no pacing.** |
+| **wcg-chunk (`WCG_CHUNK_BYTES = 32 KiB`)** | Also `x86_64 + wcg-paygo`, so on the Pi `wcg::on_present` falls through to the **unchunked** full-surface FNV at `wcg.rs:1686`. That is bounded, not a leak: `budget_left` caps it at `SAMPLES = 4` per window id. Measured on boot6: the vug window's entire witness cost is `wit_us=10 076` (10 ms, once); the 1296×736 console's is `wit_us=226 153`. | **NOT a mis-tune. The constant is unreachable on the Pi and its absence costs a bounded one-off.** |
+| **blit-collapse (`WCD_CHUNK_US = 2 000`, `WCD_CHUNK_ROWS_MAX = 64`)** | Same gate, so WC-D verdicts run **unchunked** on the Pi — and that is correct here for a reason the x86 constant's own note supplies. The chunking exists because a Kepler-BAR probe costs **~1.06 µs**. The Pi's panel is cached RAM: boot6 measures `probes=953 856 readback_us=10 539` → **~11 ns/probe**, and `probes=16 384 readback_us=520` → ~32 ns/probe. The vug window's whole 262 144-probe verdict is `us=2 760`. **~100x cheaper per probe**, so the 1.26 s hold the chunking exists to break is ~10 ms here. | **NOT a mis-tune, and NOT tuned for the Pi either. Flagged: if the Pi panel ever becomes uncached MMIO, these constants are unreachable and the launch stall arrives with no brake.** |
+
+**None of the three is the `wf=1..2` cause.** The two chunk constants were tuned against a 1.06 µs/probe
+PCIe BAR and are simply not on the Pi's path; the pacer is arch-excluded exactly as ruled.
+
+#### 6.8f VUGSPREAD: tune, do not revert — and the revert criterion is reading a downstream signal
+
+§6.7's revert criterion is *"`remig` tracking `steal` while `cool` also climbs."*
+
+* **PA42 (boot5) meets it on its face:** `steal=2136 d1=1656 remig=2122 cool=89603 pack=210953` —
+  `remig/steal = 0.993`, `cool` 42x `steal`.
+* **PA43 (boot6) cannot test it:** `steal=41 d1=26 remig=28 cool=586 pack=389291` — `remig/steal =
+  0.68`, and the whole EL0 population is **three tasks with three of four cores idle** under the
+  pinned-pump throttle. Stealing barely arises. Read under throttle, boot6 **neither confirms nor
+  refutes** the criterion, and must not be quoted as either.
+* **The criterion is firing on a downstream signal.** 6.8b establishes an oscillator **upstream of the
+  scheduler**: every LOD flip changes each worker's per-frame spin by ~L², which *is* the run-queue
+  depth the stealer reads. An oscillator in the workload will make `remig` track `steal` no matter how
+  the brake is tuned — the criterion's own words, *"the brake is refusing and serving the same
+  oscillation"*, describe what is happening, but the oscillation is **not the brake's to damp**.
+
+**Verdict: TUNE, and the tune is 6.8a — no cooldown constant is changed by this arc.** The criterion
+is **re-armed, not retired**: boot7 must re-read `steal`/`d1`/`remig`/`cool` with an honest meter and
+a settled ladder, on a **vug storm**, before the relaxed floor is judged again. A revert taken on
+PA42's numbers today would have reverted a scheduler port to fix a ring-3 divisor.
+
+#### 6.8g Gates, and what only metal can prove
+
+`./arroyo check` + `UNAOS_WC=1 ./arroyo check` green both arches.
+
+| Gate | Result |
+|---|---|
+| knob-off `./arroyo kernel8-test 210` | **111/111**, 0 forbidden, 23 412 lines scanned |
+| armed `UNAOS_WC=1 UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 210` — **this tree** | **111/111**, 0 forbidden, 12 196 lines scanned; banner `witness,ehcihid,kbdwit,sdhcblk,smolnet,wc`; `FB Size: 1920x1200` |
+| armed, same command — **baseline `6de03c87`** (throwaway worktree, A/B control) | **111/111**, 0 forbidden, 14 337 lines scanned; same banner and geometry |
+
+The change is **line-neutral by construction** — it adds no `serial_println!`; the `abi_ticks` divisor
+rides as fields on the existing `[uvug7] ms clock` line. (The two armed runs' scanned-line totals
+differ because `kernel8-test 210` is wall-clock bounded and the rollup instruments free-run inside it;
+that spread is not a diff signal, which is why the claim rests on the source and on the knob-off gate.)
+
+The one QEMU-visible A/B is that line itself:
+
+```
+before  [uvug7] ms clock: CNTFRQ=62500000 Hz (=62500 kHz per ms); ms=CNTVCT/(CNTFRQ/1000), core-count-independent
+after   [uvug7] ms clock: … ; sys_getinfo ticks=CNTVCT/(CNTFRQ/250)=250000 (NOT the per-core-summed tick counter)
+```
+
+**QEMU cannot prove the 4x, and this arc does not claim it does.** The defect needs four cores
+actually delivering timer IRQs; QEMU raspi4b delivers **none**, so `timer::ticks()` there is frozen at
+0 and the old readout never refreshed at all. What QEMU does prove is that the replacement clock is
+live and correctly scaled on that host — `[uvug7] ms clock: CNTFRQ=62500000 Hz … sys_getinfo
+ticks=CNTVCT/(CNTFRQ/250)=250000`. **The falsifier is on metal, and it is sharp:** boot7 must show
+`[vugfps] wf=` and `[wcn] win=N rate=` for the same window **agreeing**, where boot5 and boot6 both
+read them 4x apart across ~1 600 samples. If they still disagree by 4, the unit is not the fault and
+this section is wrong.
+
 ### Class (b) rows owned by arcs already in flight — do not duplicate
 
 | Gap | Sites | Owner |
