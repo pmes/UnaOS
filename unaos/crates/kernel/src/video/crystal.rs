@@ -297,19 +297,6 @@ pub fn last_press_outcome() -> &'static str {
     }
 }
 
-/// MENU-DRIVE / CLOBBER-REPAIR — **does the dropdown owe a paint or an erase that only a composite can
-/// discharge?** Two relaxed loads, no lock.
-///
-///  * **OPEN and the slot is EMPTY** — the dropdown is in state but not yet on the panel: a PAINT is
-///    owed.
-///  * **CLOSED and the slot is NON-EMPTY** — it was dismissed but its pixels are still on the panel:
-///    an ERASE is owed.
-///
-/// The condition [`compose`] itself acts on, read the other way round, so [`open`]/[`dismiss`] can
-/// confirm that the composite they drove actually LANDED rather than assume it.
-pub fn paint_owed() -> bool {
-    OPEN.load(Ordering::Relaxed) != (SLOT.packed() != 0)
-}
 
 // ---------------------------------------------------------------------------
 // Geometry — the dropdown rect, and the row layout inside it
