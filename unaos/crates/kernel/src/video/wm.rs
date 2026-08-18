@@ -3337,6 +3337,26 @@ fn paygo_service_pass() {
     if !super::wcg::paygo_clock().2 {
         return;
     }
+    // WCD-GESTURE — and nothing is taken while a DRAG is live, for two reasons, the second of which
+    // is a correctness one rather than a cost one.
+    //
+    // COST: the mark below sets `dmg_y0 = dmg_y1 = 0` — a WHOLE-BOX repaint — at 4 Hz. During a drag
+    // that is a panel-scale blit interleaved with the motion reports, on the same `COMP_GATE` the
+    // drag composite needs.
+    //
+    // CORRECTNESS: [`PAYGO_SVC_TRIES`] is incremented by the mark and cleared only by chunk PROGRESS
+    // (see the re-arm in [`verify_window`]'s banking arm). With `wcd_admit` now declining for the
+    // length of a gesture, a taker that kept marking would burn all [`PAYGO_SVC_MAX`] tries against
+    // a gate that cannot open, hit the cap, print the STOP-NOTE and leave the battery owed FOREVER —
+    // turning a deferral into the permanent blinding this arc is careful not to be. The taker and
+    // the admit gate must therefore observe the SAME predicate; this is that predicate.
+    //
+    // Terminating by construction: `drag_end`/`drag_cancel` clear `DRAG_WIN` on the button lift and
+    // on every failure arm, so the gate is bounded by one gesture and the next service pass (<=250 ms
+    // later) resumes the walk with its try count untouched.
+    if drag_active() != WIN_NONE {
+        return;
+    }
     let mut marked = None;
     // The STOP-NOTE gets its OWN slot. Sharing `marked` was the defect: a capped row wrote its note
     // into the slot and a later takeable row overwrote it in the same pass, and because the note was
@@ -5237,7 +5257,18 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
     // reference time; the pair is now DIAGNOSTIC only — WCD-PRE explains why a whole-surface bracket cannot
     // be a verdict input on a routed console — but it stays printed on the LIVE line, where the question
     // "did the surface move at all" is exactly what the reader wants next.
-    let cksum = surface_checksum(r);
+    // WCD-FNV — LAZY, for the reason given at `cksum_pre`'s site in [`verify_reference`]: this is a
+    // whole-surface byte-wise FNV (20.7 MB on a panel-width Retina window) and every one of its
+    // readers is a `serial_println!` argument. A silent banked chunk — the common case under
+    // chunking, and every chunk of a drag-fed battery — reached none of them and paid it anyway.
+    // A closure, not a `lazy` cell: the call sites are all in tail position on mutually exclusive
+    // arms, so it evaluates at most once per pass by construction.
+    //
+    // The reading now lands a few atomic ops LATER than it did (after the banking block rather than
+    // immediately after the second read-back pass). Deliberately accepted and stated: `cksum` is
+    // DIAGNOSTIC, never a verdict input — see the note this replaces — and the shift is nanoseconds
+    // against a span the module already measures in milliseconds.
+    let cksum = || surface_checksum(r);
     // The worse of the two passes: a pixel whose reference moved during EITHER read-back is unadjudicated,
     // and taking the max keeps a single moving pixel from being averaged out of the line.
     let moved = moved_cache.max(moved_ram);
@@ -5318,7 +5349,7 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
             "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} rect={}x{}+{}+{} fills={}->{} fact={}/{} desk={}->{} dact={}/{} aborts={}/{} retry={} -> SKIP (teardown)",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
             checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero,
-            occluded, occ_before.count(), occ_after.count(), cksum,
+            occluded, occ_before.count(), occ_after.count(), cksum(),
             // WCD-TEARDOWN — the mismatching pixel from whichever arm actually fired. `bad` writes
             // `first`, `moved` writes `first_moved`, and printing the wrong one is how the first cut
             // would have invented a black pixel on the arm meant to diagnose black pixels.
@@ -5451,7 +5482,7 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
             "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} cksum_pre={:#018x} fills={}->{} fact={}/{} desk={}->{} dact={}/{} -> LIVE (unverifiable)",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
             checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero,
-            occluded, occ_before.count(), occ_after.count(), cksum, cksum_pre,
+            occluded, occ_before.count(), occ_after.count(), cksum(), cksum_pre,
             seq.fills, seq_end.fills, seq.fill_active, seq_end.fill_active,
             seq.desk, seq_end.desk, seq.desk_active, seq_end.desk_active
         );
@@ -5459,7 +5490,7 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
         serial_println!(
             "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} cksum={:#018x} cksum_pre={:#018x} -> LIVE (unverifiable)",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
-            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero, cksum, cksum_pre
+            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero, cksum(), cksum_pre
         );
     } else if ok {
         // WCD-TEARDOWN — the interlock's reading rides the PASS line too, on x86.
@@ -5479,7 +5510,7 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
             "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache=0 bad_ram=0 ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=none fills={}->{} fact={}/{} desk={}->{} dact={}/{} stable={} -> PASS",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
             checked, coverage, yn(ram_indep), moved, sprite_px, nonzero,
-            occluded, occ_before.count(), occ_after.count(), cksum,
+            occluded, occ_before.count(), occ_after.count(), cksum(),
             seq.fills, seq_end.fills, seq.fill_active, seq_end.fill_active,
             seq.desk, seq_end.desk, seq.desk_active, seq_end.desk_active, yn(stable)
         );
@@ -5487,7 +5518,7 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
         serial_println!(
             "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache=0 bad_ram=0 ram_indep={} moved={} sprite_px={} nonzero={} cksum={:#018x} first=none -> PASS",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
-            checked, coverage, yn(ram_indep), moved, sprite_px, nonzero, cksum
+            checked, coverage, yn(ram_indep), moved, sprite_px, nonzero, cksum()
         );
     } else {
         // WCD-TEARDOWN — the FAIL line carries the interlock reading too, and this arm is the reason
@@ -5506,7 +5537,7 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
             "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} fills={}->{} fact={}/{} desk={}->{} dact={}/{} -> FAIL",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
             checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero,
-            occluded, occ_before.count(), occ_after.count(), cksum,
+            occluded, occ_before.count(), occ_after.count(), cksum(),
             first.0, first.1, first.2, first.3,
             seq.fills, seq_end.fills, seq.fill_active, seq_end.fill_active,
             seq.desk, seq_end.desk, seq.desk_active, seq_end.desk_active
@@ -5515,7 +5546,7 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
         serial_println!(
             "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} -> FAIL",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
-            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero, cksum,
+            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero, cksum(),
             first.0, first.1, first.2, first.3
         );
     }
@@ -5841,6 +5872,28 @@ fn verify_reference(
             }
         }
     }
+    // WCD-FNV — the pre-blit FNV, taken ONLY on a pass that can print it.
+    //
+    // [`surface_checksum`] is a byte-at-a-time `read_volatile` FNV over the WHOLE surface slot. The
+    // module's own budget ledger calls the pair "~6 ms each" — measured on a 1312x736 window
+    // (3.86 MB). A panel-width Retina window is 2880x1800x4 = 20.7 MB, i.e. ~5.4x that, and the pair
+    // is then the LARGEST term in a chunk, above the 11 ms one-row probe floor it was assumed to be
+    // negligible against. Under chunking it was paid on EVERY chunk while being printed on almost
+    // none.
+    //
+    // `cksum_pre` reaches the wire on exactly ONE arm — `-> LIVE (unverifiable)` — and under
+    // chunking that arm is reachable only from the CLOSING chunk: a non-closing clean-or-merely-moved
+    // chunk banks and returns before it, a non-closing `!ok` chunk takes the FAIL arm (which prints
+    // `cksum` and not `cksum_pre`), and the teardown abort prints neither. `row1 == rows` is the
+    // closing chunk's ask, so a skipped checksum is a checksum no format string can reach. Stage 1
+    // and every unchunked build take it as before, byte-identical.
+    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    let cksum_pre = if running == WCD_ST_FULL_RUN && row1 < rows {
+        0
+    } else {
+        surface_checksum(r)
+    };
+    #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
     let cksum_pre = surface_checksum(r);
     // WCD-TEARDOWN — open the panel-write window LAST, so it spans everything whose result the
     // verdict rests on: `draw_window`'s copy and both read-back passes. An erase landing before this
@@ -6536,8 +6589,39 @@ fn wcd_admit(id: u32, i: usize) -> Option<(usize, u32)> {
                 let (since_ms, clock, payable) = super::wcg::paygo_clock();
                 // PAYGO-TERM/PAY-AT-CLOSE — a window being torn down has no later to defer into. See
                 // [`WCD_FORCE`], and `wcg::PAYGO_FORCE` for the argument in full.
-                let payable =
-                    payable || WCD_FORCE[i].load(core::sync::atomic::Ordering::Relaxed) != 0;
+                let forced = WCD_FORCE[i].load(core::sync::atomic::Ordering::Relaxed) != 0;
+                // WCD-GESTURE — a LIVE DRAG is a deferral reason of its own, and it is the deferral
+                // this arc exists for.
+                //
+                // Stage 2 is CHUNKED but its chunk is FLOORED AT ONE SOURCE ROW: the time stop is
+                // checked BETWEEN rows (`row > row0` in [`verify_window`]'s `pass`), so a row wider
+                // than the 2 000 us budget can buy overruns it and cannot be cut. On a panel-width
+                // Retina window that row is 2 880 destination probes through the WC-mapped Kepler
+                // BAR, twice (the `bad_cache` and `bad_ram` passes) — an unavoidable ~11 ms per
+                // admitted composite, on top of which the full-surface FNVs rode until the WCD-FNV
+                // change below. `drag_motion` composites once per motion report, so the floor is
+                // paid per motion report and the drag renders in slow motion. No row-granular budget
+                // can fix that: the floor is one row and one row is over budget.
+                //
+                // So DEFER, which is the mechanism this battery already has, rather than sub-row
+                // chunking, which would put a COLUMN cursor beside the row cursor and break three
+                // invariants the module rests on (a `scale x scale` upscale cell is always probed
+                // whole; the lattice phase is `row % step` over a whole row; `band=` names the walk).
+                // The verdict is NOT BLINDED — it is postponed by the length of one gesture:
+                // [`wcd_decline`] counts it, prints it on the census cadence with `clock=drag`, and
+                // sets `WCD_SAID`, which is exactly the predicate [`wcd_pending`] uses to hand the
+                // battery to `paygo_service`'s 4 Hz taker the moment the button lifts. A part-paid
+                // cursor is pending too (`WCD_CUR != 0`), so a battery deferred MID-BOX is reached by
+                // the same taker.
+                //
+                // `forced` OVERRIDES the gesture gate, and must: pay-at-close has no later to defer
+                // into, and a window closed mid-drag would otherwise seal `-> UNPAID` — the silent
+                // shape this module forbids and `x86-witness.spec` FORBIDs on the wire.
+                if !forced && drag_active() != WIN_NONE {
+                    wcd_decline(id, i, since_ms, "drag");
+                    return None;
+                }
+                let payable = payable || forced;
                 if !payable {
                     wcd_decline(id, i, since_ms, clock);
                     return None;
