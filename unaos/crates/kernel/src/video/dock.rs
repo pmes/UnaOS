@@ -265,6 +265,10 @@ const IND_D: usize = theme::GAP / 2;
 const CELL_W: usize = wm::TITLE_CELL_W;
 const CELL_H: usize = wm::TITLE_CELL_H;
 
+/// FONT-METRIC — the atlas those metrics come from, named once so the tile's width budget and its
+/// glyph call can never disagree about which face the caption is drawn in.
+const FACE: super::font::Face = super::font::Face::Chrome;
+
 /// The longest caption a tile will ever show, in glyphs. Bounded by [`wm::MAX_TITLE`]; capped at 8
 /// because a dock is a row of many small things and a tile wide enough for a whole 16-byte title
 /// would let four windows fill a 1920 panel.
@@ -850,7 +854,7 @@ fn compose_row(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], pressed: u32
         // loop above just painted (a RAM scratch row, so the blend's read is cached). Regular
         // weight: a dock label is a secondary surface beside the caption and the bar.
         let cols = l.glyphs.min(r.title_len);
-        super::font::draw_row(out, l.w, &r.title[..cols], bx + PAD, sy, ink, false);
+        super::font::draw_row(out, l.w, &r.title[..cols], bx + PAD, sy, ink, false, FACE);
     }
 }
 

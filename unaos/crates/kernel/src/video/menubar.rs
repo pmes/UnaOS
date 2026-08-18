@@ -120,6 +120,10 @@ const BAR_H: usize = theme::TITLE_HEIGHT;
 const CELL_W: usize = wm::TITLE_CELL_W;
 const CELL_H: usize = wm::TITLE_CELL_H;
 
+/// FONT-METRIC — the atlas those metrics come from. Named once so the cell constants above and the
+/// glyph calls below can never disagree about which face the bar is drawing.
+const FACE: super::font::Face = super::font::Face::Chrome;
+
 /// The clock's rendered width in glyphs: `HH:MM`.
 const CLOCK_GLYPHS: usize = 5;
 
@@ -661,14 +665,14 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     // BOLD, the weight macOS gives the menu bar's app name; the clock stays regular, the same
     // primary/secondary split the two inks already draw.
     let cols = m.title_len.min(TITLE_GLYPHS);
-    super::font::draw_row(out, w, &m.title[..cols], TITLE_X0, sy, theme::TITLE_TEXT_ACTIVE, true);
+    super::font::draw_row(out, w, &m.title[..cols], TITLE_X0, sy, theme::TITLE_TEXT_ACTIVE, true, FACE);
 
     // Clock, right, at one PAD from the far edge. Secondary ink: the title is what the operator is
     // reading, the clock is what they glance at.
     if let Some(c) = m.clock {
         let cw = CLOCK_GLYPHS * CELL_W;
         if w > cw + strip::PAD {
-            super::font::draw_row(out, w, &c, w - strip::PAD - cw, sy, theme::TITLE_TEXT_INACTIVE, false);
+            super::font::draw_row(out, w, &c, w - strip::PAD - cw, sy, theme::TITLE_TEXT_INACTIVE, false, FACE);
         }
     }
 }

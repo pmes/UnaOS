@@ -145,6 +145,23 @@ pub fn activate() -> bool {
         wm::DESKTOP_BG
     );
 
+    // 2a. FONT-PI — **the console leaves font8x8, here.** x86 arms the shared anti-aliased face at
+    //    the Kepler takeover (`fbcon::panel_console_resume`); the Pi has no takeover and, until this
+    //    line, had no arming at all — `FbCon::aa`'s only writer was `#[cfg(target_arch = "x86_64")]`,
+    //    so a Pi desktop boot put anti-aliased captions, bar, menu and dock captions around a console
+    //    still drawing a 1-bit 8x8 cell at scale 1 (~0.8 mm on the 1920x1200 bench panel).
+    //
+    //    ABOVE the dock check on purpose, and above the window open by necessity:
+    //      * by NECESSITY, because `panel_console_window_open` sizes the console's surface in whole
+    //        CELLS and must therefore see the face's cell, not the bitmap's;
+    //      * on PURPOSE above the dock check, because the face is a legibility decision and the dock
+    //        check is a routing one. On the decline path the boot log stays on the glass — that is
+    //        the path where legible glass text is worth MORE, not less.
+    let face_cell = fbcon::panel_console_face_arm();
+    if face_cell.is_none() {
+        serial_println!("[pidesk] console-face DECLINE reason=console-not-ready (the console keeps font8x8)");
+    }
+
     // 2-3. CONSOLEWIN — the dock must be able to host the worst-case strip, or the console gets no
     //    window (and therefore no minimise disc, and therefore nothing to strand). `wcx`'s law,
     //    unchanged in substance and NARROWED in scope, which is the one place the Pi's sequence
@@ -198,6 +215,38 @@ pub fn activate() -> bool {
         // function for why the detach stays, and `wcx.rs` for x86 doing the identical thing.
         serial_println!("[pidesk] activate panel={}x{} console_win={} routed={} (the window freezes at the handoff detach that follows — x86's desktop lane does the same)", pw, ph, cwin, routed);
     }
+
+    // 3b. FONT-WITNESS — **which face each text surface on this desktop actually drew with.**
+    //
+    //    Every claim in this arc is about a face, and a face is the one thing a serial log cannot
+    //    show by accident: an anti-aliased caption and a bitmap caption print the same characters.
+    //    So the seam states it. Each term is READ from the surface's own metric rather than asserted
+    //    here — the chrome names come from `font::Face::Chrome`, whose raster is a function of
+    //    `theme::TITLE_HEIGHT`, and the console term is the cell `panel_console_face_arm` actually
+    //    installed (or `font8x8`, honestly, if it declined). A boot that regressed any surface back
+    //    to the bitmap prints it, on the metal, with nobody looking at the glass.
+    //
+    //    `chrome=` is the FONT-METRIC number: Peter on the bench (PA43, 1920x1200) reported the
+    //    caption reading small for a 34 px bar, and the fix was to derive the chrome raster from the
+    //    bar rather than fix it at the body face's 16. This line is where that derivation's result
+    //    becomes visible without a rebuild.
+    let (cface, ccell) = match face_cell {
+        Some(c) => (super::font::Face::Body.name(), c),
+        None => ("font8x8", (0, 0)),
+    };
+    serial_println!(
+        "[pidesk] faces=title:{},menu:{},crystal:{},dock:{},console:{} chrome={}x{} body={}x{} bar={} ::",
+        super::font::Face::Chrome.name(),
+        super::font::Face::Chrome.name(),
+        super::font::Face::Chrome.name(),
+        super::font::Face::Chrome.name(),
+        cface,
+        super::font::Face::Chrome.cell_w(),
+        super::font::Face::Chrome.cell_h(),
+        ccell.0,
+        ccell.1,
+        wm::TITLE_H,
+    );
 
     // 4. SHELLDESK, on the Pi — the tenancy is CLAIMED. Before this line every `set_enabled(true)` in
     //    the tree was a `witness` fixture that put the flag back before it returned, on aarch64 as on

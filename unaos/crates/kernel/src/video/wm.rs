@@ -110,14 +110,21 @@ pub const BORDER: usize = super::theme::FRAME;
 ///
 /// This retires `FONT_CELL`/`TITLE_SCALE`: the kit's `metrics.text_px = 15` used to be honoured
 /// by the nearest INTEGER replication of an 8-px 1-bit cell (16 px drawn for 15 asked — the
-/// "needs a rasterizer" note that lived here). The kernel now has pre-rasterized 16 px
-/// anti-aliased glyphs, so the cell is the FACE's, width and height separately, and the square
-/// `TITLE_CELL` is split into the two metrics it was conflating.
-pub const TITLE_CELL_W: usize = super::font::CELL_W;
+/// "needs a rasterizer" note that lived here). The kernel now has pre-rasterized anti-aliased
+/// glyphs, so the cell is the FACE's, width and height separately, and the square `TITLE_CELL` is
+/// split into the two metrics it was conflating.
+///
+/// FONT-METRIC (Peter, bench PA43, 1920x1200: *"window title font size is small for the size of
+/// the title and menu bars"*) — this is the CHROME face, not the body face. The chrome raster is
+/// [`font::chrome_raster`] of [`TITLE_H`], i.e. it is a FUNCTION of the strip these glyphs sit in
+/// rather than a size anybody wrote down; raising the bar raises the caption with it. This one
+/// constant is the whole propagation: `menubar`, `crystal` and `dock` all define their own
+/// `CELL_W`/`CELL_H` as this, and their layout constants are expressions over those.
+pub const TITLE_CELL_W: usize = super::font::CHROME_CELL_W;
 
-/// FONT (GR27) — the caption glyph cell's HEIGHT, in panel pixels: [`font::CELL_H`] (16 — the
-/// same drawn height `TITLE_SCALE = 2` produced, so every vertical centring lands where it did).
-pub const TITLE_CELL_H: usize = super::font::CELL_H;
+/// FONT (GR27) — the caption glyph cell's HEIGHT, in panel pixels: [`font::CHROME_CELL_H`].
+/// FONT-METRIC: derived from [`TITLE_H`], see [`TITLE_CELL_W`].
+pub const TITLE_CELL_H: usize = super::font::CHROME_CELL_H;
 // REVIEW (GR27 fonts): back the draw_title comment's "cell shorter than the strip" claim on every
 // arch (menubar's CELL_H<=BAR_H assert is x86+wc-only). draw_title clamps anyway, but assert it.
 const _: () = assert!(TITLE_CELL_H <= TITLE_H, "title glyph cell must fit the caption strip");
@@ -158,9 +165,9 @@ const CTRL_RESERVE: usize = 3 * super::theme::CONTROL_BOX + 4 * GAP;
 ///
 /// [`controls`] declines a box narrower than `2*BORDER + GAP + CTRL_RESERVE + TITLE_CELL_W`, and a
 /// window's box is `w * scale + 2 * BORDER`, so the `2*BORDER` cancels and the condition on the
-/// source width alone is `w >= GAP + CTRL_RESERVE + TITLE_CELL_W` — **139 px** at the current
-/// metrics (`12 + 120 + 7`; it was 148 when the glyph advance was the square 16 px bitmap cell),
-/// 112 before the size ruling.
+/// source width alone is `w >= GAP + CTRL_RESERVE + TITLE_CELL_W` — **141 px** at the current
+/// metrics (`12 + 120 + 9`; 139 when the chrome face was the body face's 16 px raster, 148 when the
+/// glyph advance was the square 16 px bitmap cell), 112 before the size ruling.
 ///
 /// This exists because that threshold has now moved TWICE and both times a fixture surface was left
 /// behind it, turning a close-control gate into a silent SKIP (CRISPYWIRE sized one from 8 to 32,
@@ -11101,7 +11108,7 @@ fn controls_declined_drain() {
 ///
 /// ```text
 /// 2*BORDER + GAP + CTRL_RESERVE + TITLE_CELL_W
-///   = 2*5    + 12  + 120          + 7         = 149 px
+///   = 2*5    + 12  + 120          + 9         = 151 px
 /// ```
 ///
 /// against the 102 the arithmetic used to produce (and the 106 the painter actually needed before a
@@ -11114,6 +11121,14 @@ fn controls_declined_drain() {
 /// themselves. What did NOT move by itself is the width of the fixture surfaces that have to clear
 /// the floor — so they are now sized from [`CLUSTER_MIN_SRC_W`] under a `const` assertion instead
 /// of from a literal with a comment beside it.
+///
+/// ### And AGAIN with FONT-METRIC — which is the point, not an annoyance
+/// The GR27 fonts merge took `TITLE_CELL_W` from the 16 px bitmap cell to the anti-aliased face's
+/// 7 px advance (floor 158 -> 149); FONT-METRIC then derived the CHROME raster from `TITLE_H`
+/// instead of fixing it at the body face's 16 px (advance 7 -> 9, floor 149 -> **151**). Three
+/// moves, three different causes, one unchanged expression — the floor has never once been written
+/// down, which is why each move cost a spec pin and no code. The pin lives at
+/// `scripts/specs/pi4-regression.spec`'s `WMCTRL: controls-declined — floor=` REQUIRE.
 fn controls(r: &Window) -> Option<(usize, usize, usize)> {
     // NORMALWIN — **there is no owner-wide furniture decline any more.** Peter's ruling
     // (2026-08-11): the console window is a normal app window, so it reaches the width test on the
@@ -16152,7 +16167,7 @@ fn draw_title(
         if i >= cols {
             break;
         }
-        for (ry, row) in super::font::glyph(b, true).iter().enumerate() {
+        for (ry, row) in super::font::glyph(b, true, super::font::Face::Chrome).iter().enumerate() {
             // WC-M's clip, per row: a row landing above the band is dropped independently.
             let dy = y + ry as isize;
             if dy < 0 {

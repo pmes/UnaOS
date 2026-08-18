@@ -1670,7 +1670,13 @@ REQUIRE :: TERMRING: transport ring slots=64 len=240 .* :: PASS ::
 # ---    presence check.
 # --- MERGE 6fddbccd (2026-08-18): the trunk's wm work moved the row floor 158 -> 149; the pin
 # --- follows the merged tree. pi 1: sanity-check the 9-row delta against the gemini wm diffs.
-REQUIRE :: WMCTRL: controls-declined — floor=149 .* furniture close=true minzoom=true packed=true/Some.* silent=true reaped=true :: PASS ::
+# --- FONT-METRIC (exec-fontwire, 2026-08-18): 149 -> 151, and the +2 is fully accounted for. The
+# --- floor is `2*BORDER + GAP + CTRL_RESERVE + TITLE_CELL_W` and only the last term moved: the
+# --- CHROME face's raster is now derived from `theme::TITLE_HEIGHT` (34 -> Size20) instead of being
+# --- fixed at the body face's Size16, so the mono advance went 7 -> 9. Nothing about the control
+# --- cluster, the frame or the gap changed. See `wm::controls`' doc for the three moves this floor
+# --- has made and why none of them was ever a code change.
+REQUIRE :: WMCTRL: controls-declined — floor=151 .* furniture close=true minzoom=true packed=true/Some.* silent=true reaped=true :: PASS ::
 FORBID :: WMCTRL: .* :: FAIL ::
 
 # --- DRAG-PI M4 — the drag COST witness (`[dragperf]`, wm::dragperf_selftest).

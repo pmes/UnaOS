@@ -1271,7 +1271,12 @@ fdt = "0.1.5"
 # knob-off builds on BOTH arches never compile it (byte-identical). Lives in the shared [dependencies]
 # (not an arch-gated block) because the demo now targets x86/virt AND aarch64/virt AND aarch64/tegra.
 rast = { path = "../rast", optional = true }
-noto-sans-mono-bitmap = { version = "0.3.2", default-features = false, features = ["regular", "bold", "size_16", "unicode-basic-latin"] }
+# FONT-METRIC: the raster LADDER `video::font::chrome_raster` snaps to. `size_16` is the BODY face
+# (the console's character grid, whose size is set by capacity); `size_20`/`size_24` are the rungs
+# the CHROME derivation can land on for the `theme::TITLE_HEIGHT` range the kit has today (26..=40).
+# The two lists must move together — a rung in `chrome_raster` without its feature here is a
+# compile error at the `RasterHeight` variant, which is the failure mode we want.
+noto-sans-mono-bitmap = { version = "0.3.2", default-features = false, features = ["regular", "bold", "size_16", "size_20", "size_24", "unicode-basic-latin"] }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 # BeFS-K3: the native UnaFS filesystem, no_std core only (on-disk types, codec,

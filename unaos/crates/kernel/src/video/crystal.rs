@@ -173,8 +173,14 @@ const ROWS: [Row; 5] = [
 const CELL_W: usize = wm::TITLE_CELL_W;
 const CELL_H: usize = wm::TITLE_CELL_H;
 
-/// An item row's height, px: the glyph cell plus 8 px of clearance split top and bottom, so a 16 px
-/// glyph sits with 4 px of air above and below in a 24 px row. Pinned by the const-assert below.
+/// FONT-METRIC — the atlas those metrics come from, named once so the layout constants and the
+/// glyph call can never disagree about which face the menu is drawing.
+const FACE: super::font::Face = super::font::Face::Chrome;
+
+/// An item row's height, px: the glyph cell plus 8 px of clearance split top and bottom, so the
+/// glyph sits with 4 px of air above and below. DERIVED from the cell, so when FONT-METRIC moved
+/// the chrome face from 16 to 20 px the row moved from 24 to 28 with it and the air stayed 4 —
+/// which is the whole point of writing it as an expression. Bounded, not pinned, below.
 const ITEM_H: usize = CELL_H + 8;
 
 /// A separator row's height, px — a thin band carrying one keyline, centred.
@@ -236,7 +242,10 @@ const ITEM_COUNT: usize = item_count();
 const _: () = {
     // The row height must clear the glyph it centres, or the label is cut.
     assert!(ITEM_H >= CELL_H);
-    assert!(ITEM_H == 24);
+    // FONT-METRIC — was `ITEM_H == 24`, a pin on the 16 px face's arithmetic that a face change is
+    // SUPPOSED to move. What actually has to hold is the clearance the row was designed around: 4 px
+    // of air above and below the cell, exactly, whatever the cell is.
+    assert!(ITEM_H == CELL_H + 8 && (ITEM_H - CELL_H) % 2 == 0);
     // The separator band must hold its keyline with air either side.
     assert!(SEP_H >= 3);
     // A menu with no pickable item would be a surface with nothing to pick.
@@ -846,7 +855,7 @@ fn compose_row(out: &mut [u32], r: strip::Rect, j: usize) {
             // painted (RAM scratch — the blend's read is cached). Regular weight: menu items are
             // body text, not a caption.
             let label = ROWS[row].label.as_bytes();
-            super::font::draw_row(out, w, label, BORDER + PADX, sy, theme::TITLE_TEXT_ACTIVE, false);
+            super::font::draw_row(out, w, label, BORDER + PADX, sy, theme::TITLE_TEXT_ACTIVE, false, FACE);
         }
     }
 }

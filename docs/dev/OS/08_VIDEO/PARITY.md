@@ -418,7 +418,8 @@ here before starting; strike it when it lands.**
 | 6.2 | **Windows do not respect menubar / dock / open dropdown** | `wm.rs:12059` (`OccClip::push`), `wm.rs:12281` (`occ_clip`), `wm.rs:12605` (`erase_clip`), `screen.rs:1050`, + 11 witness legs in §3 | On aarch64 the clip is structurally `OccClip::none`, so a window blit paints **over** the menu bar and dock and a deferred erase publishes over them. `pidesk` has already put those strips on the Pi's glass, so **the exposure is live today.** This is the same defect class x86 fixed. Largest owed item; its own arc. **STILL OWED after `exec-crystalpi`** — that arc added the *repair* (§5.5c: the bar and the dropdown now notice a clobber and repaint the same pass) but not the *protection*, so the exposure is bounded to one frame rather than removed. |
 | 6.3 | **Quiet boot screen** | `fbcon.rs` ×9 (`QUIET-PANEL` `_print` suppression, `PANEL_MUTE_TAGS`, `TAG_SNIFF` + impls, `PANIC_MIRROR`) | x86 paints milestone lines only and mutes `[wc-g]/[wc-h]/[wc-d]/[wcn]` telemetry from the glass, with `PANIC_MIRROR` as the panic override; the Pi mirrors the raw serial stream across the boot panel. All arch-neutral policy over `_print`. Self-contained. |
 | 6.4 | **Dock tile count for the blit clip** | `wm.rs` `dock_tiles` | `video::dock` is already on the Pi via `pidesk`, but its tile count feeding `occ_clip` is not. Small; **do it with 6.2**, which is the consumer. |
-| 6.5 | **Fast glyph painting** | `fbcon.rs:154` (`draw_glyph` encode4 path), `framebuffer.rs:268` (`put_raw4`) | x86 hoists the pixel-format decode out of the 8×8 bit loop and pokes pre-encoded words; the Pi runs `put_pixel` with a per-pixel `match` on `pixel_format`. `encode4`/`word4` already exist on both arches (aarch64 uses them in `fill_span4`). Performance parity, felt as console/glyph repaint speed. |
+| 6.5 | ~~**Fast glyph painting**~~ **LANDED — `exec-fontwire`, see §6.8** | `fbcon.rs:166` (`draw_glyph`'s span path) | x86 hoisted the pixel-format decode out of the 8×8 bit loop and poked pre-encoded words; the Pi ran `put_pixel` with a per-pixel `match` on `pixel_format`. Closed by making the hoist arch-neutral **and** run-coalesced, so it overshoots the parity the row asked for on both arches. `put_raw4` (`framebuffer.rs:268`) now has no callers. Accounting in §6.8. |
+| 6.9 | **The console's FACE was an arch gate nobody had named** — *raised and closed by `exec-fontwire`, recorded here because the census missed it* | `fbcon.rs:258` (`FbCon::aa`), `fbcon.rs:1707` (`panel_console_resume`, `#[cfg(target_arch = "x86_64")]`) | Not in the 501-site census, because it is not an attribute: `aa` had exactly ONE writer and that writer was inside an x86-only function. The Pi therefore drew anti-aliased captions, bar, crystal and dock captions — all of which resolve through the arch-neutral `wm::TITLE_CELL_*` — around a console still painting a 1-bit 8×8 cell. **A parity census that greps `cfg` attributes cannot see a gap of this shape.** The general lesson is worth more than the fix: look for *single-writer state whose writer is arch-gated*, not just for arch-gated state. |
 
 ### 6.6 THE VUG UPGRADE — the real answer to "where is the upgraded vug"
 
@@ -767,6 +768,94 @@ this section is wrong.
 | **Click-to-focus / raise / close-button** on windows — aarch64's `click1_dispatch` hit-tests only console-vs-status-strip | `main.rs:1693` (`wc_route_event`) | **exec-dragperf** / **exec-conswin** — settle ownership before starting |
 | Console window, its route/pace machinery, furniture strips, menubar reservation | `fbcon.rs` ×42, `screen.rs:367`, `ui_status.rs:597`, `wm.rs:16493` | **exec-conswin** |
 | Shell window | `main.rs` `open_shell_window` | **exec-shellport** |
+
+---
+
+## 6.8 The `exec-fontwire` arc — the face audit, §6.5, and one metric that was never derived
+
+Opened to answer a narrow question — *the trunk's anti-aliased Noto face merged into `hw-pi4`; does
+every Pi text surface actually RENDER it?* — and to fold in §6.5 while inside `draw_glyph`. It
+returned three things: a face census, a closed §6.5, and a metric defect the bench found first.
+
+### 6.8a The face census — what the Pi actually drew, before and after
+
+Every chrome surface resolves its cell through `wm::TITLE_CELL_W`/`_H`, which is arch-neutral, so the
+captions/bar/menu/dock were **already** the anti-aliased face on the Pi at the merge. The console was
+not, and the reason was invisible to §1's method — see §6.9.
+
+| Surface | Draw site | Face BEFORE | Face AFTER |
+|---|---|---|---|
+| Window captions | `wm.rs` `draw_title` | noto16-aa | **noto20-aa** (chrome) |
+| Menu bar title + clock | `menubar.rs:669/676` | noto16-aa | **noto20-aa** (chrome) |
+| Crystal menu rows | `crystal.rs:854` | noto16-aa | **noto20-aa** (chrome) |
+| Dock tile captions | `dock.rs:858` | noto16-aa | **noto20-aa** (chrome) |
+| Console / shell window glyphs | `fbcon.rs` `draw_glyph` | **font8x8, 8×8 cell** | **noto16-aa, 7×16 cell** |
+| Quarry tree + list text | `quarry/live.rs:596` | font8x8 | font8x8 — *`exec-quarry2`'s lane* |
+| Pulse window labels | `pal.rs:135` via `pulsewin` | font8x8 | font8x8 — **still owed** |
+| `ui_status` strip, `console.rs` | `pal.rs:135` | font8x8 | font8x8 — **still owed** |
+| `instgui` dialogs | `instgui.rs:190` | font8x8 | font8x8 — x86-only, not a Pi surface |
+
+**The fallback boundary, stated honestly.** It is not architectural, which is how the merge's own
+summary ("font8x8 fallback for early-boot/aarch64/panic") had it. It is *has this surface reached its
+desktop seam*: `fbcon` is font8x8 from reset to the arch's desktop-ready point (x86 `panel_console_
+resume`, aarch64 the new `panel_console_face_arm`), and after that point both arches — panic screen
+included — are on the face. The three `pal`/`quarry`/`instgui` rows above are a **gap, not a fold**:
+each owns a cached-RAM surface and could take `font::draw_row` unchanged. Naming them keeps the
+boundary a ledger instead of an excuse.
+
+### 6.8b §6.5 closed — and the accounting, since aarch64 has no glyph-timing instrument
+
+`vperf`'s pixel counter is `cfg(all(target_arch = "x86_64", feature = "videobench"))` and `[wc-g]`
+times compositor checksums, not glyph paint, so **there is no QEMU-cycle before/after to quote**. The
+measurement below is instead a static store count over `font8x8`'s printable set (0x20..0x7E) — which
+is the better evidence anyway, being exact and load-independent, where a QEMU wall-clock on a
+contended host is neither.
+
+Per glyph, at the console's live `scale = 1`:
+
+| | calls | format `match` | store instructions |
+|---|---|---|---|
+| BEFORE (Pi: `put_pixel`) | ~22 | ~22 | ~68 byte stores |
+| AFTER (both arches: `fill_span4` over runs) | ~9 | **1** | ~22 word stores |
+
+~22 set pixels per glyph fall into only ~9 horizontal runs (2.5 pixels per run), so coalescing is
+where most of the win is and it was free — the bit scan was already per row. x86 improves too: it was
+hoisting the decode but still poking one pixel at a time.
+
+The change is deliberately **line-neutral** in `fbcon.rs` (18 lines replaced by 18), per §5.2.3's
+rule, so no panic `Location` below it renumbers. The knob-off `kernel8.img` bytes still move — this is
+a real codegen change on a path the knob-off boot runs — which is the legitimate half of that rule.
+
+### 6.8c FONT-METRIC — the chrome raster is now DERIVED from the bar
+
+Peter, bench PA43 (1920x1200): *"fonts were looking good BUT window title font size is small for the
+size of the title and menu bars."* Not a wiring fault — a metric one. `theme::TITLE_HEIGHT` is 34 px
+and carried a 16 px raster (~47% of the band) where the platform the kit quotes sets its caption at
+~60%. **x86 has no scale factor the Pi was failing to apply**; the face was genuinely fixed at 16 on
+both arches, so the scale seam was the work.
+
+`video::font` now carries two atlases. `Face::Body` stays 16 px — its size is set by a character
+grid's capacity, not by furniture. `Face::Chrome`'s raster is `chrome_raster(theme::TITLE_HEIGHT)`:
+three fifths of the bar, snapped DOWN to a raster the atlas is built at. At 34 that is **Size20**
+(advance 7 → 9). Nothing else learned a number — `menubar`, `crystal` and `dock` already defined
+their cells as `wm::TITLE_CELL_*` and their layouts as expressions over those, so `crystal::ITEM_H`
+went 24 → 28 keeping its 4 px of air, and the `wm::controls` floor went 149 → 151 by the same
+arithmetic it has always used. Two const-asserts that were *pins on today's numbers* rather than
+statements of intent (`ITEM_H == 24`) had to be rewritten as the invariants they meant.
+
+### 6.8d Witness, and one observation for the integrator
+
+`[pidesk] faces=title:…,menu:…,crystal:…,dock:…,console:… chrome=WxH body=WxH bar=H ::` — every term
+read from the surface's own metric, so a boot that regressed a surface to the bitmap says so on the
+serial with nobody looking at the glass.
+
+**Observed, not fixed:** on the armed `UNAOS_PIDESK=1 UNAOS_QUARRY=1` boot at 1920x1200, `[wc-d]
+verify` intermittently FAILs for the small fixture windows at `(17,85)` — they sit under the console
+window's box and the probe reads panel pixels the console legitimately owns. That is **§6.2** (the Pi
+has no `OccClip`), surfaced by this arc only because arming the face changed the console's cell and
+therefore its box. `bad_ram=0` on the cache-view variants confirms the pixels themselves are correct.
+The armed 1920x1200 configuration is red on the unmodified baseline too (108/111); the knob-off gate
+this track actually gates on is 111/111.
 
 ---
 

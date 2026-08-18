@@ -159,24 +159,24 @@ impl<const N: usize> OpList<N> {
 /// aarch64 console, any pre-takeover x86 print) this is the font8x8 path, byte for byte.
 fn draw_glyph(surf: &FrameBuffer, ch: u8, cx: usize, cy: usize, fg: u32, bg: u32, s: usize, aa: bool) {
     if aa {
-        crate::video::font::draw_glyph_fb(surf, ch, cx, cy, fg, bg, false);
+        crate::video::font::draw_glyph_fb(surf, ch, cx, cy, fg, bg, false, crate::video::font::Face::Body);
         return;
     }
     let bitmap = font8x8::legacy::BASIC_LEGACY[ch as usize];
-    // VPERF M4 (x86): hoist the per-pixel format decode out of the 8x8 bit loop — encode the
-    // foreground once, poke pre-encoded 4-byte pixels (bounds checks stay per pixel).
-    #[cfg(target_arch = "x86_64")]
-    if let Some(raw) = surf.encode4(fg) {
+    // VPERF M4 / PARITY §6.5 — hoist the pixel-format decode out of the 8x8 bit loop: encode the fg
+    // ONCE, write RUNS of set bits as word SPANS. On BOTH arches now: §6.5 found x86 poking pre-encoded
+    // words here while the Pi fell to `put_pixel` — a format `match` plus three byte stores, per pixel —
+    // on the one text surface that draws on every printed line of every boot. `encode4`/`fill_span4` are
+    // arch-neutral (the aarch64 compositor hoists through them already); `word4` is the `+strict-align`
+    // guard, and without it the loop below still runs. ⚠ LINE-NEUTRAL edit — see `draw_fb`'s note.
+    if let (true, Some(raw)) = (surf.word4(), surf.encode4(fg)) {
         for (ry, byte) in bitmap.iter().enumerate() {
-            for rx in 0..8 {
-                if byte & (1 << rx) != 0 {
-                    // scale == 1 collapses to the original single poke.
-                    for dy in 0..s {
-                        for dx in 0..s {
-                            surf.put_raw4(cx + rx * s + dx, cy + ry * s + dy, raw);
-                        }
-                    }
-                }
+            let mut rx = 0usize;
+            while rx < 8 {
+                if byte & (1 << rx) == 0 { rx += 1; continue; }
+                let (x0, y0) = (cx + rx * s, cy + ry * s);
+                while rx < 8 && byte & (1 << rx) != 0 { rx += 1; }
+                for dy in 0..s { surf.fill_span4(x0, y0 + dy, cx + rx * s - x0, raw); }
             }
         }
         return;
@@ -2144,4 +2144,74 @@ fn pace_clock_hz() -> u64 {
 #[cfg(all(target_arch = "aarch64", feature = "pidesk"))]
 pub fn console_is_routed() -> bool {
     CONSOLE_WIN.load(Ordering::Relaxed) != wm::WIN_NONE
+}
+
+// ⚠ APPEND-ONLY TAIL. Everything below is deliberately at the END of this file. `draw_fb`'s standing
+// note (see its one-line aarch64 branch) is that a line ADDED to this file renumbers every panic
+// `Location` below it, and this file is compiled into the knob-off `kernel8.img` whose byte-identity
+// is the Pi track's standing proof. Adding at the tail adds no line above any existing statement, so
+// no `Location` moves. New fbcon code on this track goes here unless it cannot.
+
+/// FONT-PI — **arm the shared anti-aliased face for the Pi's console.**
+///
+/// ### The gap this closes
+///
+/// The GR27 fonts merge left `FbCon::aa` with exactly one writer, [`panel_console_resume`], which is
+/// `#[cfg(target_arch = "x86_64")]` and reached only from the Kepler takeover. Its own doc said the
+/// arrangement was intentional — *"early boot and aarch64 keep the raw 8x8 path unchanged"* — and for
+/// early boot it still is. For aarch64 it was not a decision so much as the absence of one: there was
+/// no aarch64 seam to put the arming in when that arc was written. [`super::pidesk::activate`] is now
+/// that seam, and this is the Pi's half of what `panel_console_resume` does on x86.
+///
+/// So a Pi desktop boot no longer carries two faces side by side: the captions, the bar, the crystal
+/// menu and the dock were already the anti-aliased face (their metrics resolve through
+/// `wm::TITLE_CELL_*`, which is arch-neutral), while the console INSIDE those windows was an 8x8
+/// bitmap at scale 1 — ~0.8 mm on the 1920x1200 bench panel, the size metal sitting #30 recorded as
+/// simply not visible.
+///
+/// ### What it does NOT do, and why
+///
+/// It does not clear the panel and it does not replay the boot ring. `panel_console_resume` does both
+/// because on x86 it is undoing a calibration pattern the takeover drew; the Pi arrives here having
+/// already had its panel cleared by PIDESK DESKTOP-CLEAR one step earlier, and its boot log is going
+/// into a window that is about to be created empty. Re-homing the CELL is the whole job.
+///
+/// ### Ordering
+///
+/// Must run BEFORE [`panel_console_window_open`], which reads `c.cell_w`/`c.cell_h` to size the
+/// console window's surface in whole cells. Called unconditionally at the seam — before the dock's
+/// host check, not after — so the face is armed even on a panel too small to be given a console
+/// WINDOW: on that path the boot log stays on the glass, and legible boot text on the glass is worth
+/// more there, not less. Idempotent: re-arming sets the same three fields to the same values.
+///
+/// Returns the armed `(cell_w, cell_h)`, or `None` if the console was not ready to be re-homed.
+#[cfg(all(target_arch = "aarch64", feature = "pidesk"))]
+pub fn panel_console_face_arm() -> Option<(usize, usize)> {
+    let mut armed = None;
+    crate::arch::without_interrupts(|| {
+        if let Some(mut c) = FBCON.try_lock() {
+            if !c.ready {
+                return;
+            }
+            // The face's own advance and cell height replace the 1-bit cell and its integer
+            // magnification, exactly as the x86 seam does it — `scale` is retired here too, since a
+            // magnified alpha raster is not what any of this wants.
+            c.scale = 1;
+            c.aa = true;
+            c.cell_w = crate::video::font::CELL_W;
+            c.cell_h = crate::video::font::CELL_H;
+            // The grid follows the cell. If the console is subsequently routed into a window,
+            // `panel_console_window_open` recomputes both against the WINDOW's extent; until then
+            // these are the panel's, which is the surface the console is still drawing on.
+            let info = c.fb.info();
+            c.cols = (info.width / c.cell_w).max(1);
+            c.rows = (info.height / c.cell_h).max(1);
+            // Home the cursor: the cell just changed size under a grid whose current (col, row) was
+            // counted in the OLD one, so leaving it alone would place the next glyph off its cell.
+            c.col = 0;
+            c.row = 0;
+            armed = Some((c.cell_w, c.cell_h));
+        }
+    });
+    armed
 }
