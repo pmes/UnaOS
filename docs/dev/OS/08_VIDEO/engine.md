@@ -13925,3 +13925,111 @@ is legitimately not redrawn. A defer-and-retry like CHROME-TRUTH's is the obviou
 deliberately not taken — `real` only grows, so deferring past the two-window moment would latch
 `windows=3` and turn an intermittent red into a systematic one. Left for the integrator with the
 numbers, in `scripts/specs/pi4-regression.spec` under THE ARMED-GATE HOST-LOAD RESIDUE.
+
+## DRAGFIX — the same-core wait, terminated honestly (aarch64 + x86 `wm`, 2026-08-18)
+
+**§DRAGWEDGE bounded the wait and latched the give-up. It never asked why the wait did not
+terminate.** That was the right emergency stop — it turned a dead machine into a refused gesture —
+but it left the defect standing underneath: every drag through a busy compositor paid the full
+interactive bound and was then refused for the rest of the boot, and every teardown paid the full
+2^30 bound (boot 5's multi-minute vug close). BLITWHO was landed (`250f446f`) to answer the "why",
+and the PA45 metal boot answered it in one line:
+
+```
+:: [wedge1] MOVE DRAIN GAVE UP core=2 blit_active=1 pending=1 spins=33554432 == interactive-bound ::
+:: [wedge1] BLITWHO active=1 net=[0,0,1,0,0,0,0,0] last_enter=u7-launc@c2 spin_core=2 ::
+```
+
+**The holder entered on core 2. The drain spun on core 2.** Those being the same core is what makes
+the wait *structurally non-terminating* rather than merely slow: the spin occupies the core — IRQ
+masked and unpreemptible on the teardown path, and monopolising it in any case — so the one context
+that could retire the `BlitGuard` cannot be dispatched, and `BLIT_ACTIVE` can never fall. The bound
+is then paid in full, for nothing, on every single pointer report.
+
+### The cure: three arms, and the wire says which one ran
+
+| arm | condition | action | witness |
+|---|---|---|---|
+| **SPIN** | holder on another core, or none | unchanged pre-arc spin | `spun=`, `spin_max=` |
+| **YIELD** | same-core holder **and** the context can schedule | `sched::yield_now()` until drained or a wall-clock deadline | `ywait=` / `ydrain=`, `<Dy>` |
+| **SKIP** | same-core holder and the context **cannot** schedule | abandon the wait immediately | `scskip=`, `<Ds>`, `DRAIN SAME-CORE` line |
+
+The arms are consulted only past `DRAIN_SAMECORE_GRACE` (2^19, ~5 ms), which is what separates a
+holder that is *stuck* here from one that merely *entered* here and has since migrated —
+`BLIT_NET_CORE` is indexed by enter-core, so `net[me] > 0` is a witness, not a proof. Under the grace
+the loop is the pre-arc loop plus one compare against a constant.
+
+**Yield legality is a runtime test, not a per-call-site one.** `close` is reached from the operator's
+close control (task, unmasked) *and* from teardown; `close_owner` is reached from `sched::exit`,
+already masked. A static per-site answer would have to take the worst case everywhere. The test is
+`arch::irqs_masked()` — WEDGE-8/F3's own primitive, landed for precisely this hazard class ("a masked
+wait on a preemptible holder is the F3 deadlock") — **and** `sched::current_name().is_some()`, the
+arch-neutral form of `screen.rs`'s `current_id().is_some()` scheduled-task test. Note that aarch64's
+`yield_now()` ends in an unconditional `unmask_irq()`; the `irqs_masked()` half is what stops a
+teardown that masked on purpose from being silently unmasked.
+
+**No protection is weakened.** A SKIP returns through the same tail every other arm returns through,
+so `DRAIN_PENDING` is still raised and the `DrainBarrier` still holds it — a composite taking the
+table lock from here on still observes the barrier and still skips. What is abandoned is the *wait*
+and only the wait, which is exactly what §DRAGWEDGE's `<D3>` decline arm and the bound-reached arm
+already abandon, at the price their own ledgers accepted. The ⚠ WC-B revisit note on the abandon arm
+covers `SAMECORE-SKIP` identically.
+
+**The self-heal, finally implemented where its ledger says it is.** `BARRIER_UNHEALTHY` has always
+been documented as "dropped by any drain that observes `BLIT_ACTIVE == 0`", but the only code doing
+so was `barrier_stalled()`, read at drain *entry* — so an interactive drain that declined never spun,
+never observed zero, and the latch could lift only on some later drain that happened to arrive after
+recovery. The clear now also runs at the loop's successful *exit*, which is what makes drag RETURN
+after the first honest completion instead of staying refused.
+
+### Byte identity, stated honestly
+
+`BLIT_NET_CORE` and `BlitGuard::core` are promoted from witness-gated to **unconditional** — the cure
+reads the net on knob-off builds, and a fix only armed builds get is not a fix. The price is two
+relaxed RMWs per composite pass (one at guard enter, one at drop), the same shape and order as
+`BLIT_ACTIVE`'s own pair; the array spans one or two lines so the coherence traffic is real, and
+against `[comp2] pass_us=3294` it is noise. **This moves knob-off bytes** — a capability change, on
+the BARENAME precedent, and this arc makes no byte-identity claim.
+
+### Gate results (2026-08-18, QEMU raspi4b)
+
+* `./arroyo check` and `UNAOS_WC=1 ./arroyo check` — green, both arches, 12 cfg legs.
+* knob-off `./arroyo kernel8-test 210` — **117/117 required, 0 forbidden**.
+* armed `UNAOS_PIDESK=1 UNAOS_FBW=1920 UNAOS_FBH=1200` — 116/117, 7 forbidden at load ~8.
+  The missing require is `[wc-c] side-by-side windows=2 drawn=2` and the 7 are the host-load residue
+  §DRAGWEDGE's spec block already names. **Attributed by measurement, not by argument**: the
+  UNTOUCHED base (`ec0ffada`) was captured under the same battery at *lower* load and reads the same
+  116/117, the same missing `[wc-c]` require, and **28 forbidden** — the same membership, more of it.
+  `drawn=1` is therefore systematic at this base sha and bench geometry, not this arc's; the spec's
+  residue block records it as OPEN and unattributed, and that reading now has a baseline behind it.
+
+### `dragwedge_selftest` leg 6 — the deterministic conviction
+
+Legs 2-5 are unchanged and still pass. Their holder is the fixture's *own stack*, so no yield can
+ever retire it and the wait correctly still ends at the bound — what they can honestly prove is that
+the arm was *consulted* and picked the legal arm for its context (`arm_yield=true`), not that the
+wait was cured. Leg 6 is the half that convicts: a `BlitGuard` live on this core plus an IRQ-masked
+`DrainBarrier::drain()`, i.e. boot 5's teardown scene. The bound it declines to pay is 2^30 — ~27
+seconds on this gate, which is what the call cost pre-arc:
+
+```
+[dragwedge] furniture aimed=true chrome=true grab=true release=true | stall began=true gave_up=true
+ cancelled=true ms=752/2500 | refuse=true ms=0/50 | recover=true bound=33554432 |
+ arm_yield=true arm_skip=true skip_ms=8/400 tdbound=1073741824 -> PASS
+:: [wedge1] DRAIN SAME-CORE core=2 blit_active=1 pending=1 spins=524288 interactive=false == futile-skip ::
+```
+
+**8 ms against 27 seconds.** A build without the skip arm cannot pass this leg by luck — it fails on
+the clock.
+
+### x86 takes the same fix
+
+Stated rather than assumed. `wm.rs` is shared; x86's router reaches the identical
+`drag_begin`/`drag_motion`/`move_to_inner`; `irqs_masked` and `current_name` are the arch-neutral
+pair (x86's `yield_now` even preserves the caller's IF, so it is the *safer* of the two); and x86's
+`close_owner` runs from its own `sched::exit` with IF=0 exactly as the Pi's does. The hazard is
+structural — a spinning core cannot dispatch the holder pinned to it — so gating the cure on
+`target_arch` would leave the identical livelock armed on the other lane with no hardware reason for
+the asymmetry. That is the argument §DRAGWEDGE already made one arc earlier, unchanged.
+
+**The metal verdict — drag working through a busy vug — is the next boot's.**

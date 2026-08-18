@@ -146,6 +146,22 @@ COMPLETE :: BANDY-RT:
 #     reason and exactly as WCH-SPREAD's own analysis predicts.
 #   * `[dragwedge] ... recover=false` — one capture only (base-armed-1, UNTOUCHED), same family.
 #
+# DRAGFIX ADDENDUM (2026-08-18) — `[wc-c] ... drawn=1` IS NOW ATTRIBUTED, AND NOT TO AN ARC.
+# The block above left it "OPEN, and NOT attributed" on 3-of-7 armed captures. It is now measured
+# against a baseline rather than argued about. Four armed captures on 2026-08-18, same battery,
+# same 1920x1200 geometry:
+#   dragfix-armed-1  exec-dragfix                116/117, 70 forbidden   load ~16-21
+#   dragfix-armed-2  exec-dragfix                116/117, 55 forbidden   load ~10-13
+#   dragfix-armed-3  exec-dragfix, DONE gate     116/117,  7 forbidden   load ~8
+#   base-armed-3     ec0ffada, UNTOUCHED         116/117, 28 forbidden   load ~6-9
+# The UNTOUCHED base sha reads the SAME 116/117, the SAME missing `[wc-c] ... drawn=2` require and
+# the SAME forbidden membership — with MORE of it, at LOWER load, than the arc's own gate capture.
+# So `drawn=1` is systematic at `ec0ffada` on this geometry: it is a property of the BASE, and no
+# arc since has moved it either way. The residue's load-monotonicity holds exactly as recorded above
+# (70 -> 55 -> 7 as the host quiets), which is what the whole block was written to let a reader see.
+# The REQUIRE is left standing and NOT widened, on this file's rule: an arc may not green a line it
+# did not fix. The seat that owns `[wc-c]`'s one-shot inherits a baseline number to start from.
+#
 # WHAT THIS ARC DID NOT DO ABOUT IT, and why. Every one of these lines belongs to another arc's
 # emitter — `wcg.rs`'s present constants, WCH-SPREAD's discriminator, DRAG-PI's pacer — and the
 # only way to green them from HERE would be to widen the FORBIDs, which is the one thing a witness
@@ -559,7 +575,14 @@ FORBID \[wc-fv\] focus-vis .*-> FAIL
 # ---    DWELL/INFLIGHT, and a gate that fails on an honest reading teaches people to ignore it
 # ---    (lens fix, s1u — the verdict pin was a flake in waiting). The gate question is "does the
 # ---    instrument still exist and publish", and that is what the pattern below asserts.
-REQUIRE \[wedge1\] dwell drains=.*spin_max=.*mvbound=[0-9]+ mvgiveup=[0-9]+ mvskip=[0-9]+ latched=.*->
+# ---    DRAGFIX extends the same one directive again (see §DRAGWEDGE below for why this REQUIRE is
+# ---    extended rather than joined by a second): `ywait=`/`ydrain=`/`scskip=` are the arm census —
+# ---    which of the three same-core arms ran. They are PINNED FOR EXISTENCE and not for value, on
+# ---    this section's standing rule: a yielding wait on a loaded gate host is an honest reading, and
+# ---    `scskip=` is deliberately NOT folded into `abandoned=` (whose `[1-9]` forbid three hundred
+# ---    lines up is matched against the TEARDOWN counter and must stay that way — the same naming
+# ---    care `mvgiveup=`/`mvskip=` were given). The required count is unchanged.
+REQUIRE \[wedge1\] dwell drains=.*spin_max=.*mvbound=[0-9]+ mvgiveup=[0-9]+ mvskip=[0-9]+ ywait=[0-9]+ ydrain=[0-9]+ scskip=[0-9]+ grace=[0-9]+ latched=.*->
 
 # --- STORM-HEADROOM (s1u lens nit): the boot-baseline census is the proof the storm instrument
 # ---    still exists and publishes — the same existence-pin rationale as the dwell REQUIRE above.
@@ -1978,6 +2001,17 @@ FORBID \[dragperf\] .* -> FAIL
 # --- On the pre-fix image this fixture does not print FAIL — it HANGS the gate, which is the honest
 # --- signature of the defect and is why the cure had to be the bound rather than a louder witness.
 FORBID \[dragwedge\] .* -> FAIL
+
+# --- DRAGFIX — leg 6, named on its own so a red says WHICH leg. `arm_skip=` is the masked same-core
+# --- arm: a `BlitGuard` live on the drain's core with IRQs masked, where yielding is illegal and the
+# --- wait is structurally non-terminating. Pre-arc that call paid `DRAIN_ABANDON_SPINS` (2^30, ~27 s
+# --- on this gate); the leg asserts it now costs under 400 ms. FORBID rather than REQUIRE on
+# --- `[dragperf]`'s precedent immediately above: the fixture is `pidesk`-gated and its line is absent
+# --- from the knob-off battery, so a REQUIRE would red a build for not carrying a knob it was never
+# --- given. The `-> FAIL` forbid above would also catch this; this one names the cause.
+# --- `arm_yield=` is deliberately NOT forbidden either way — see the fixture's own note: whether legs
+# --- 2-4 run in a schedulable context is a property of the harness, not of the mechanism.
+FORBID \[dragwedge\] .* arm_skip=false
 
 # --- DRAGWEDGE — and the two ledger readings the cure adds to `[wedge1] dwell`. `mvgiveup=` counts
 # --- interactive drains that reached the bound; `mvskip=` counts pointer reports the latch saved from

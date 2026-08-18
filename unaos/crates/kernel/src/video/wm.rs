@@ -7746,7 +7746,10 @@ struct BlitGuard {
     /// BLITWHO — the core this guard was entered on. Kept in the guard rather than re-read at drop
     /// because a task-context holder can migrate mid-blit: the per-core net below is "live guards
     /// ENTERED on this core", which is the reading the give-up arms need.
-    #[cfg(feature = "witness")]
+    ///
+    /// DRAGFIX — UNCONDITIONAL since M1. It was witness-gated while it was only an instrument; it is
+    /// now an input to [`DrainBarrier::drain_bounded`]'s same-core arm, i.e. to behaviour, and a cure
+    /// that exists only on witness builds would leave the shipped image with the defect.
     core: usize,
 }
 
@@ -7754,7 +7757,20 @@ struct BlitGuard {
 /// holder never retired; all-zero with `BLIT_ACTIVE` nonzero is itself a verdict (a leaked guard —
 /// a holder killed off-CPU never runs its drop). Signed on purpose: an inconsistency would print as
 /// a negative rather than wrap silently.
-#[cfg(feature = "witness")]
+///
+/// ### DRAGFIX M1 — promoted to UNCONDITIONAL, and the cost stated honestly
+/// The same-core futility test ([`blit_samecore_futile`]) reads this net on every drain that has to
+/// wait, on every build. So the net has to exist on every build, and the price is **two relaxed RMWs
+/// per composite pass** — one `fetch_add` at [`BlitGuard::enter`], one `fetch_sub` at its drop —
+/// against a line that is already indexed by core. That is the same shape and the same order of cost
+/// as [`BLIT_ACTIVE`]'s own pair, which every composite has always paid; the array spans one or two
+/// cache lines, so cores DO share lines here and the arithmetic is not free of coherence traffic.
+/// Measured against what a composite pass costs on this track (`[comp2] pass_us=3294` typical), it is
+/// noise — and it is the whole price of the knob-off cure, which is the trade this arc is making
+/// deliberately rather than shipping a fix that only armed builds get.
+///
+/// **This moves knob-off bytes.** See the M1 commit message and the BARENAME precedent: a capability
+/// change is not a byte-identity claim, and this arc does not make one.
 static BLIT_NET_CORE: [core::sync::atomic::AtomicI64; 8] = [
     core::sync::atomic::AtomicI64::new(0),
     core::sync::atomic::AtomicI64::new(0),
@@ -7813,25 +7829,24 @@ fn blitwho_report(spin_core: usize) {
 impl BlitGuard {
     fn enter() -> Self {
         BLIT_ACTIVE.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        // DRAGFIX M1 — the enter-core net is unconditional now (see [`BLIT_NET_CORE`]); only the
+        // NAME/last-enterer pair, which exists purely to print, stays witness-gated.
+        let core = crate::arch::sched::meter_current_cpu().min(7);
+        BLIT_NET_CORE[core].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "witness")]
         {
-            let core = crate::arch::sched::meter_current_cpu().min(7);
-            BLIT_NET_CORE[core].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             BLIT_LAST_ENTER_NAME.store(
                 blitwho_pack_name(crate::arch::sched::current_name()),
                 core::sync::atomic::Ordering::Relaxed,
             );
             BLIT_LAST_ENTER_CORE.store(core, core::sync::atomic::Ordering::Relaxed);
-            BlitGuard { core }
         }
-        #[cfg(not(feature = "witness"))]
-        BlitGuard {}
+        BlitGuard { core }
     }
 }
 
 impl Drop for BlitGuard {
     fn drop(&mut self) {
-        #[cfg(feature = "witness")]
         BLIT_NET_CORE[self.core].fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
         BLIT_ACTIVE.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
     }
@@ -8003,6 +8018,179 @@ fn barrier_stalled() -> bool {
         return false;
     }
     true
+}
+
+// ---- DRAGFIX (PA45 metal, baton pi-1 #6) — THE SAME-CORE WAIT, TERMINATED HONESTLY ---------------
+//
+// **The defect, convicted by instrument rather than inferred.** DRAGWEDGE bounded the interactive
+// wait and latched the give-up, which stopped the freeze; it did not ask WHY the wait never
+// terminated, so every drag still paid the full bound and then refused. BLITWHO was landed to answer
+// that, and the PA45 boot answered it in one line:
+//
+//   :: [wedge1] BLITWHO active=1 net=[0,0,1,0,0,0,0,0] last_enter=u7-launc@c2 spin_core=2 ::
+//
+// The holder entered its `BlitGuard` on core 2. The drain spun on core 2. Those are the same core,
+// and that makes the wait **structurally non-terminating rather than merely slow**: this core is
+// occupied by the spin — IRQ-masked and unpreemptible on the teardown path, and monopolising the
+// core in any case — so the one context that could retire the guard cannot be dispatched, and
+// `BLIT_ACTIVE` cannot fall no matter how long the spin runs. The full bound is then paid for
+// nothing, twice over: 2^25 on the interactive path (a refused drag, plus the [`BARRIER_UNHEALTHY`]
+// latch that refuses every drag after it), and 2^30 on teardown (boot 5's multi-minute vug close).
+//
+// **The cure is to stop waiting blind.** Three arms, and which one ran is on the wire:
+//
+//  1. **YIELD** — where the waiting context can schedule, the correct answer to "the holder is on my
+//     core" is to GIVE IT THE CORE. `crate::arch::sched::yield_now()` puts this task at the back of
+//     its run queue, the holder is dispatched, its bounded panel-clipped blit completes, the guard
+//     drops and `BLIT_ACTIVE` falls in bounded REAL time rather than never. The wait becomes a wait
+//     again instead of a livelock.
+//  2. **SKIP** — where it cannot schedule (IRQ-masked, or no task on this core), yielding is illegal
+//     and the wait is provably futile, so the honest thing is to abandon it AT ONCE rather than burn
+//     the bound first. The outcome is exactly the one the existing `<D3>` decline arm already prices
+//     and exactly the one the bound-reached arm already reaches — **the barrier stays RAISED**, only
+//     the wait is given up — so this weakens no protection; it arrives at a sanctioned outcome
+//     sooner, which is the same argument DRAGWEDGE's own bound was landed on.
+//  3. **SPIN** — everything else, byte-for-byte the pre-arc behaviour. A drain that finds
+//     `BLIT_ACTIVE == 0` never enters the loop; a drain whose holder is on ANOTHER core spins as it
+//     always has, because a cross-core holder IS running and the wait CAN terminate.
+//
+// **Why the yield legality test is a RUNTIME test and not a per-call-site one.** The four teardown
+// call sites are not each in one context: `close` is reached from the operator's close control (task,
+// unmasked) *and* from fixtures; `close_owner` is reached from `sched::exit` -> `clear_handle_row`,
+// which has already masked. A static per-site answer would therefore have to take the worst case at
+// every site and lose the cure where it is legal. The test the tree already has is exact and costs
+// two loads: [`crate::arch::irqs_masked`] — the WEDGE-8/F3 primitive, landed for *precisely this
+// hazard class* ("a masked wait on a preemptible holder is the F3 deadlock", `cursor.rs` §claim
+// _bounded) — AND `sched::current_name().is_some()`, the arch-neutral form of the
+// `sched::current_id().is_some()` scheduled-task test `screen.rs`'s band spawner uses. Both must
+// hold. Note that aarch64's `yield_now()` ends in an unconditional `unmask_irq()`, so calling it
+// from a masked context would not merely be impolite — it would silently unmask a teardown that
+// masked on purpose. The `irqs_masked()` half of the test is what forbids that.
+//
+// **No lock is held across the wait, on any path.** Every call site releases `TABLE` (and the
+// `WRITER` copy) before raising the barrier — that is `drain`'s own stated contract, without which
+// the barrier could not work at all — so a yield here parks a task holding nothing but the raised
+// `DRAIN_PENDING`, which is a COUNTER and not a lock. The interactive site is already preemptible
+// today, so the yield introduces no re-entrancy that preemption did not already allow.
+//
+// **The wait's own bound, and why this one is WALL-CLOCK.** `DRAIN_ABANDON_SPINS`'s note argues for a
+// spin count because its site runs IRQ-MASKED, where "a timer read is neither free nor trustworthy".
+// The yielding arm is unmasked BY CONSTRUCTION — that is the precondition it tested for — so
+// WEDGE-10's rule applies in full and the wait takes a measurable deadline
+// ([`DRAIN_YIELD_MOVE_MS`] / [`DRAIN_YIELD_TEARDOWN_MS`]) rather than a spin count that would mean
+// nothing across a context switch.
+//
+// **Self-heal, closed.** [`BARRIER_UNHEALTHY`]'s ledger already says it is "dropped by any drain that
+// observes `BLIT_ACTIVE == 0`", but the only implementation of that was [`barrier_stalled`], read at
+// drain ENTRY — so an interactive drain that DECLINED never spun, never observed zero, and the latch
+// could only lift on some later drain that happened to arrive after recovery. With the yield arm the
+// declining drain can now succeed instead, so the clear is also performed at the loop's successful
+// EXIT. That is what makes drag RETURN after the first honest completion rather than staying refused.
+//
+// **Arch-neutral, and x86 takes the same fix.** Nothing above is aarch64-specific: `wm.rs` is shared,
+// x86's router reaches the identical `drag_begin`/`drag_motion`/`move_to_inner`, `irqs_masked` and
+// `current_name` are the arch-neutral pair, and x86's own `close_owner` runs from its `sched::exit`
+// with IF=0 exactly as the Pi's does. The hazard is structural — a spinning core cannot dispatch the
+// holder pinned to it — so gating the cure on `target_arch` would leave the identical livelock armed
+// on the other lane with no hardware reason for the asymmetry, which is the argument DRAGWEDGE
+// already made one arc earlier.
+
+/// DRAGFIX — spins a wait may take before the same-core arms are consulted at all.
+///
+/// **Not zero, and the reason is the migration caveat.** [`BLIT_NET_CORE`] is indexed by the core the
+/// guard was ENTERED on, and a task-context holder can migrate mid-blit (that is why the enter-core
+/// is stored in the guard rather than re-read at drop). So `net[me] > 0` is a witness that a guard
+/// entered here has not retired, NOT a proof that its holder is still here. A holder that migrated is
+/// running, its blit is bounded, and the wait will terminate on its own — treating that case as
+/// futile would abandon waits that were about to succeed.
+///
+/// 2^19 is what separates the two. It is ~5 ms on the Pi at the ~10 ns/spin figure
+/// [`DRAIN_STALL_SPINS`] is calibrated on — comfortably past the `pass_us=3294` typical composite
+/// this track measures, so a migrated holder finishes inside the grace and never reaches the arms —
+/// and it is 64x under [`DRAIN_MOVE_SPINS`] and 2048x under [`DRAIN_ABANDON_SPINS`], so a wait that
+/// IS futile now costs ~5 ms instead of 340 ms or several seconds. Under the grace the loop is the
+/// pre-arc loop exactly.
+const DRAIN_SAMECORE_GRACE: u64 = 1 << 19;
+
+/// DRAGFIX — the INTERACTIVE yielding wait's deadline. A drag report may spend this long parked while
+/// the holder runs; the figure is the drag path's own budget, chosen against [`DRAIN_MOVE_SPINS`]'s
+/// ~340 ms so a yielding wait can never cost the operator MORE than the blind spin it replaces, while
+/// being long enough for several scheduler rounds on a loaded fleet.
+const DRAIN_YIELD_MOVE_MS: u64 = 250;
+
+/// DRAGFIX — the TEARDOWN yielding wait's deadline. Longer than the interactive one because the thing
+/// being waited out here is a blit from a surface about to be unmapped and the WC-B hazard is real
+/// (see the abandon arm's ⚠ note), so this path should try harder before it gives up — and shorter
+/// than [`DRAIN_ABANDON_SPINS`] by three orders, which is the boot-5 multi-minute close, cured.
+const DRAIN_YIELD_TEARDOWN_MS: u64 = 2000;
+
+/// DRAGFIX — drains that entered the yielding wait. Unconditional, on [`DRAIN_ABANDONED`]'s argument:
+/// which arm ran is a fact about the shipped image and the operator is sitting in front of a build
+/// with no witnesses. Published as `ywait=`.
+static DRAIN_YIELD_WAITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAGFIX — yielding waits that DRAINED, i.e. observed `BLIT_ACTIVE == 0` inside their deadline.
+/// `ywait > 0 && ydrain == ywait` is the whole claim of this arc on the wire: the wait that used to
+/// be structurally non-terminating now terminates honestly. Published as `ydrain=`.
+static DRAIN_YIELD_DRAINED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAGFIX — waits abandoned by the SAME-CORE arm because this context could not yield. Counted
+/// separately from [`DRAIN_ABANDONED`] and [`MOVE_DRAIN_GIVEUP`] for the reason those two are counted
+/// separately from each other: it abandons the same thing at a different price, and folding it in
+/// would red a gate written about a different event. Published as `scskip=`.
+static DRAIN_SAMECORE_SKIPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAGFIX — whether the once-per-boot same-core LINE has been printed, on [`DRAIN_ABANDON_REPORTED`]'s
+/// argument. The counters above are not rate-limited.
+static DRAGFIX_REPORTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// DRAGFIX — **is this wait provably futile?** True when a live `BlitGuard` was entered on the core
+/// this drain is spinning on: the spin owns the core, so that holder cannot be dispatched here, and
+/// `BLIT_ACTIVE` cannot reach zero while it stands.
+///
+/// The migration caveat is stated at [`DRAIN_SAMECORE_GRACE`] and is why this is consulted only after
+/// the grace: `net[me] > 0` witnesses a guard ENTERED here, and a holder that has since migrated is
+/// running normally. The grace is what separates "entered here and stuck here" from "entered here and
+/// moved on".
+fn blit_samecore_futile() -> bool {
+    let me = crate::arch::sched::meter_current_cpu().min(7);
+    BLIT_NET_CORE[me].load(core::sync::atomic::Ordering::Relaxed) > 0
+}
+
+/// DRAGFIX — **may this context give up the CPU?** Both halves are required, and both are the tree's
+/// own primitives rather than new ones: IRQs unmasked (WEDGE-8's [`crate::arch::irqs_masked`], which
+/// also forbids aarch64 `yield_now`'s unconditional `unmask_irq` from firing under a teardown that
+/// masked deliberately), and a scheduled task current on this core (the arch-neutral form of the
+/// `sched::current_id().is_some()` test `screen.rs` uses to decide whether it may spawn).
+fn drain_can_yield() -> bool {
+    !crate::arch::irqs_masked() && crate::arch::sched::current_name().is_some()
+}
+
+/// DRAGFIX — the YIELDING wait. Parks this task until `BLIT_ACTIVE` falls to zero or `budget_ms`
+/// elapses; returns whether it drained.
+///
+/// The caller must have established [`drain_can_yield`]. Wall-clock rather than a spin count because
+/// this arm is unmasked by construction and a spin count means nothing across a context switch — see
+/// the DRAGFIX ledger, and [`DRAIN_ABANDON_SPINS`] for why the MASKED arms reason in spins instead.
+///
+/// The deadline is re-derived from [`crate::arch::ms`] each pass and compared with `wrapping_sub`, so
+/// a timebase wrap costs at most one extra pass rather than an unbounded wait.
+fn drain_yield_wait(budget_ms: u64) -> bool {
+    use core::sync::atomic::Ordering;
+    DRAIN_YIELD_WAITS.fetch_add(1, Ordering::Relaxed);
+    let t0 = crate::arch::ms();
+    loop {
+        if BLIT_ACTIVE.load(Ordering::Acquire) == 0 {
+            DRAIN_YIELD_DRAINED.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        if crate::arch::ms().wrapping_sub(t0) >= budget_ms {
+            return false;
+        }
+        // The whole point: hand the core to the holder that this wait has been starving.
+        crate::arch::sched::yield_now();
+    }
 }
 
 // ---- WEDGE-1r2 — the drain barrier's silence, made readable --------------------------------------
@@ -8248,11 +8436,38 @@ impl DrainBarrier {
         // up is only the wait, which is the same thing the abandon arm below gives up and at the same
         // already-priced cost.
         if interactive && stalled {
-            MOVE_DRAIN_SKIPPED.fetch_add(1, Ordering::Relaxed);
-            crate::wedge2::mark("<D3>");
-            return DrainBarrier;
+            // DRAGFIX — **THE DECLINE IS NO LONGER THE ONLY ANSWER.** The latch says a wait was
+            // recently proven not to terminate; PA45 says WHY — the holder is on this core. Where
+            // this context can schedule, the cure for that is to give the holder the core, and a
+            // yielding wait costs the operator no core time at all. If it drains, the latch is
+            // cleared below and the drag RETURNS, which is the outcome DRAGWEDGE could only decline
+            // its way around.
+            //
+            // Gated on the same-core witness: if the net says the stall is on ANOTHER core, yielding
+            // this one buys nothing, and the pre-arc decline is exactly right. `blit_samecore_futile`
+            // is consulted without the grace here because `stalled` already means a full bound has
+            // been spent proving this wait does not terminate — the grace's job (separating a
+            // migrated holder from a stuck one) is already done by that history.
+            if blit_samecore_futile() && drain_can_yield() {
+                if drain_yield_wait(DRAIN_YIELD_MOVE_MS) {
+                    // Drained. The latch clear is the loop's, and the loop below will fall straight
+                    // through its `while` test — so take it there rather than duplicating it.
+                } else {
+                    MOVE_DRAIN_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                    crate::wedge2::mark("<D3>");
+                    return DrainBarrier;
+                }
+            } else {
+                MOVE_DRAIN_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                crate::wedge2::mark("<D3>");
+                return DrainBarrier;
+            }
         }
         let mut spins: u64 = 0;
+        // DRAGFIX — has a same-core arm already run for this drain? The arms fire at most once: the
+        // grace is a threshold, not a cadence, and a yielding wait that came back without draining
+        // has had its answer.
+        let mut samecore_tried = false;
         // WEDGE-1r2 — has this drain been charged to `spun`/`in_spin` yet? Set on the FIRST iteration
         // rather than before the loop, so a barrier that found `BLIT_ACTIVE == 0` and never waited is
         // not counted as a wait. `drains` above already counts those.
@@ -8276,6 +8491,68 @@ impl DrainBarrier {
             #[cfg(feature = "witness")]
             if spins % DRAIN_DWELL_STEP == 0 {
                 F4W_SPIN_MAX.fetch_max(spins, Ordering::Relaxed);
+            }
+            // DRAGFIX — **THE SAME-CORE ARMS.** Past the grace, and only past it, ask whether this
+            // wait can terminate at all. Under the grace the loop is the pre-arc loop exactly: one
+            // extra compare against a constant per iteration, and nothing else. See the DRAGFIX
+            // ledger for the three arms and for why the legality test is taken at runtime.
+            if !samecore_tried && spins >= DRAIN_SAMECORE_GRACE && blit_samecore_futile() {
+                samecore_tried = true;
+                if drain_can_yield() {
+                    // ARM 1 — YIELD. Give the holder the core it has been starved of. If it drains,
+                    // the `while` test below ends the wait normally and the latch clear at the tail
+                    // runs; if it does not, fall back into the spin and let the bound arms have it,
+                    // exactly as before this arc.
+                    if drain_yield_wait(if interactive {
+                        DRAIN_YIELD_MOVE_MS
+                    } else {
+                        DRAIN_YIELD_TEARDOWN_MS
+                    }) {
+                        crate::wedge2::mark("<Dy>");
+                        continue;
+                    }
+                } else {
+                    // ARM 2 — SKIP. Masked, or no task on this core: yielding is illegal and the
+                    // wait is futile, so abandon it NOW rather than burn the bound proving it again.
+                    //
+                    // **The barrier stays RAISED.** This returns through the same tail every other
+                    // arm returns through, so `DRAIN_PENDING` is still up and the `DrainBarrier` this
+                    // call constructs still holds it until the caller drops it — a composite that
+                    // takes the table lock from here on still observes the barrier and still skips.
+                    // What is abandoned is the WAIT and only the wait, which is precisely what the
+                    // `<D3>` decline arm above and the bound-reached arm below already abandon, at
+                    // the price their own ledgers have already accepted. Nothing is weakened; the
+                    // sanctioned outcome is simply reached without paying for the proof twice.
+                    crate::wedge2::mark("<Ds>");
+                    DRAIN_SAMECORE_SKIPS.fetch_add(1, Ordering::Relaxed);
+                    if interactive {
+                        // The interactive path's downstream policy — `drag_motion` cancelling the
+                        // gesture, `drag_begin` refusing a new one — keys on the latch and on
+                        // `MOVE_DRAIN_GIVEUP`, and this IS an interactive give-up: same abandoned
+                        // wait, same standing barrier, arrived at sooner. Charging it identically is
+                        // what keeps that policy (and `dragwedge_selftest`'s legs 3-5) intact.
+                        MOVE_DRAIN_GIVEUP.fetch_add(1, Ordering::Relaxed);
+                        BARRIER_UNHEALTHY.store(true, Ordering::Relaxed);
+                    } else {
+                        // NOT charged to `DRAIN_ABANDONED`: the pi4 spec FORBIDs `abandoned=[1-9]`
+                        // by name and that forbid was written about the full-bound teardown
+                        // abandonment. `scskip=` is its own field for the same reason `mvgiveup=`
+                        // is — see [`MOVE_DRAIN_GIVEUP`].
+                    }
+                    if !DRAGFIX_REPORTED.swap(true, Ordering::Relaxed) {
+                        serial_println!(
+                            ":: [wedge1] DRAIN SAME-CORE core={} blit_active={} pending={} spins={} interactive={} == futile-skip ::",
+                            crate::arch::sched::meter_current_cpu(),
+                            BLIT_ACTIVE.load(Ordering::Acquire),
+                            DRAIN_PENDING.load(Ordering::Acquire),
+                            spins,
+                            interactive
+                        );
+                        #[cfg(feature = "witness")]
+                        blitwho_report(crate::arch::sched::meter_current_cpu());
+                    }
+                    break;
+                }
             }
             if spins == DRAIN_STALL_SPINS && !DRAIN_STALL_REPORTED.swap(true, Ordering::Relaxed) {
                 // WEDGE-1r2 `<D!>` — THE TRIPWIRE FIRED, said without taking a lock, and said BEFORE
@@ -8374,6 +8651,19 @@ impl DrainBarrier {
             // stands in for it while the drain is still running.
             F4W_SPIN_MAX.fetch_max(spins, Ordering::Relaxed);
             F4W_IN_SPIN.fetch_sub(1, Ordering::Relaxed);
+        }
+        // DRAGFIX — **THE SELF-HEAL, FINALLY IMPLEMENTED WHERE ITS LEDGER SAYS IT IS.**
+        // [`BARRIER_UNHEALTHY`]'s note has always said the latch is "dropped by any drain that
+        // observes `BLIT_ACTIVE == 0`", but the only code that did so was [`barrier_stalled`], read at
+        // drain ENTRY — so a drain that arrived latched declined, never spun, never observed zero, and
+        // the latch could only lift on some LATER drain that happened to arrive after recovery. With
+        // the yield arm a declining drain can now succeed instead, and this is where that success is
+        // banked: reaching here with the count at zero is proof the barrier converged, whichever arm
+        // got it there. It is what makes drag RETURN after the first honest completion rather than
+        // staying refused for the rest of the gesture. A plain store would be correct; the load first
+        // keeps the healthy path off a shared line it has never written.
+        if BLIT_ACTIVE.load(Ordering::Acquire) == 0 && BARRIER_UNHEALTHY.load(Ordering::Relaxed) {
+            BARRIER_UNHEALTHY.store(false, Ordering::Relaxed);
         }
         // WEDGE-1r2 `<D3>` — the spin returned. `<D2>` with no `<D3>` puts the death in the spin
         // itself, which is the one region WEDGE-1's tripwire CAN see — and pairs with `<D!>` to say
@@ -9831,6 +10121,15 @@ fn wedge1_dwell_emit(span: u64) {
     // `mvskip=` rather than `move_abandoned=` deliberately — see [`MOVE_DRAIN_GIVEUP`].
     let mvgiveup = MOVE_DRAIN_GIVEUP.load(Relaxed);
     let mvskip = MOVE_DRAIN_SKIPPED.load(Relaxed);
+    // DRAGFIX — **WHICH ARM RAN.** GAUGES, on the same argument the two above are: an arm that fired
+    // is a permanent fact about this boot, and draining would let the next rollup read clean over it.
+    // `ywait`/`ydrain` are the arc's claim in two numbers — waits that parked to let the holder run,
+    // and the subset that then DRAINED — and `scskip` is the unyieldable case, abandoned at once
+    // instead of after the full bound. All three are bracket-free and none collides with the spec's
+    // `abandoned=[1-9]` forbid; see [`DRAIN_SAMECORE_SKIPS`].
+    let ywait = DRAIN_YIELD_WAITS.load(Relaxed);
+    let ydrain = DRAIN_YIELD_DRAINED.load(Relaxed);
+    let scskip = DRAIN_SAMECORE_SKIPS.load(Relaxed);
     // Lens fix (s1u): the quiet-window early-out must also test the spin evidence. The swaps above
     // have already drained `spun`/`spin_max`, so a drain that straddled the previous rollup boundary
     // (counted there as `drains`, its spin published here) would have its DWELL evidence silently
@@ -9842,6 +10141,10 @@ fn wedge1_dwell_emit(span: u64) {
         && abandoned == 0
         && mvgiveup == 0
         && mvskip == 0
+        // DRAGFIX — the arm evidence joins the quiet-window early-out on the s1u lens argument: a
+        // window whose only evidence is a yielding wait may not be silently dropped.
+        && ywait == 0
+        && scskip == 0
     {
         return;
     }
@@ -9858,8 +10161,23 @@ fn wedge1_dwell_emit(span: u64) {
         // `ABANDONED`, because nothing about to be unmapped was read — the trade this arm makes is a
         // stale rectangle on a LIVE row, which the next present repairs.
         "MOVE-GAVE-UP"
+    } else if scskip > 0 {
+        // DRAGFIX — a TEARDOWN same-core skip (the interactive one already reads MOVE-GAVE-UP, which
+        // it charges). Below `ABANDONED` because it is a different event that the spec's forbid was
+        // not written about, and above every healthy reading because it IS an abandoned wait: the
+        // barrier stayed raised, but a blit from a surface the caller is about to unmap was not
+        // waited out. Under WC-B this is the reading that must be revisited alongside the abandon
+        // arm's own ⚠ note.
+        "SAMECORE-SKIP"
     } else if in_spin > 0 {
         "INFLIGHT"
+    } else if ywait > 0 && ydrain == ywait {
+        // DRAGFIX — **the cure, on the wire.** Every yielding wait in this window terminated. A
+        // futile same-core wait was met and drained in bounded real time instead of burning a bound
+        // and refusing. Above `DWELL` because a yield necessarily spun past
+        // [`DRAIN_SAMECORE_GRACE`] and would otherwise read as a plain dwell, which is true but
+        // says nothing about the arm that fixed it.
+        "YIELD-DRAINED"
     } else if spin_max >= DRAIN_DWELL_NOTE {
         "DWELL"
     } else if drains == 0 {
@@ -9882,7 +10200,7 @@ fn wedge1_dwell_emit(span: u64) {
         "QUIET"
     };
     serial_println!(
-        "[wedge1] dwell drains={} spun={} spin_max={} note={} in_spin={} tripwire={} bound={} abandoned={} mvbound={} mvgiveup={} mvskip={} latched={} span={}ms -> {}",
+        "[wedge1] dwell drains={} spun={} spin_max={} note={} in_spin={} tripwire={} bound={} abandoned={} mvbound={} mvgiveup={} mvskip={} ywait={} ydrain={} scskip={} grace={} latched={} span={}ms -> {}",
         drains,
         spun,
         spin_max,
@@ -9894,6 +10212,10 @@ fn wedge1_dwell_emit(span: u64) {
         DRAIN_MOVE_SPINS,
         mvgiveup,
         mvskip,
+        ywait,
+        ydrain,
+        scskip,
+        DRAIN_SAMECORE_GRACE,
         BARRIER_UNHEALTHY.load(Relaxed),
         span,
         verdict
@@ -17236,6 +17558,10 @@ pub fn dragwedge_selftest() {
     };
     let g0 = MOVE_DRAIN_GIVEUP.load(Relaxed);
     let s0 = MOVE_DRAIN_SKIPPED.load(Relaxed);
+    // DRAGFIX — the arm ledger's pre-image, restored at the tail with the rest.
+    let y0 = DRAIN_YIELD_WAITS.load(Relaxed);
+    let yd0 = DRAIN_YIELD_DRAINED.load(Relaxed);
+    let sc0 = DRAIN_SAMECORE_SKIPS.load(Relaxed);
     let (began, stall_ms, gave_up, cancelled, refused, refuse_ms) = {
         let _hold = BlitGuard::enter();
         // The grab is minted BEFORE the wait has ever been met, so the latch is down and this must
@@ -17256,6 +17582,46 @@ pub fn dragwedge_selftest() {
         // barrier, whose bound is the one this whole arc is about not waiting out.
     };
 
+    // DRAGFIX — **WHICH ARM LEGS 2-4 SELECTED**, read BEFORE the restoration at the tail. This
+    // fixture's holder is its OWN stack, so no yield can ever retire it and the wait correctly ends
+    // at the bound — what leg 2 can honestly prove is therefore that the same-core arm was CONSULTED
+    // and chose the legal arm for its context, not that the wait was cured. (The metal scene differs
+    // in exactly the way that matters: PA45's holder is a DIFFERENT task, `u7-launc`, preempted on
+    // the drain's core, and there a yield does retire it. That verdict is the next boot's.)
+    let arm_yield = DRAIN_YIELD_WAITS.load(Relaxed) > y0;
+
+    // ---- Leg 6: the MASKED arm, and it is the deterministic half of the cure ----------------------
+    //
+    // The scene: a `BlitGuard` live on THIS core, and a drain raised from an IRQ-MASKED context —
+    // i.e. `close_owner` reached from `sched::exit`, which is boot 5's multi-minute vug close. Here
+    // yielding is illegal (aarch64's `yield_now` would unmask a teardown that masked on purpose), the
+    // wait is provably futile, and the correct answer is to abandon it at once.
+    //
+    // **This leg is a real conviction rather than a shape check**: the bound it declines to pay is
+    // [`DRAIN_ABANDON_SPINS`], 2^30, which on this gate is ~27 SECONDS. Pre-arc that is exactly what
+    // this call cost. The budget below is two orders under it, so a build without the skip arm cannot
+    // pass this leg by luck — it fails on the clock, loudly, and the number is on the wire either way.
+    //
+    // The barrier is raised and dropped inside the masked window, on `close`'s own pattern; nothing
+    // is torn down, so a skipped wait here abandons nothing real — the fixture is measuring the ARM,
+    // not exercising a teardown.
+    const SKIP_BUDGET_MS: u64 = 400;
+    let sc_pre = DRAIN_SAMECORE_SKIPS.load(Relaxed);
+    let (skip_ms, arm_skip) = {
+        let _hold = BlitGuard::enter();
+        let _mask = crate::arch::IrqMask::new();
+        let t2 = crate::arch::ms();
+        // `ms()` is CNTVCT-derived and interrupt-flag-independent, so it is trustworthy here — which
+        // is why the YIELDING arm may take a wall-clock deadline and the MASKED arms may not: the
+        // objection `DRAIN_ABANDON_SPINS` records is about a machine that may already be mid-wedge,
+        // not about the counter.
+        drop(DrainBarrier::drain());
+        (
+            crate::arch::ms().wrapping_sub(t2),
+            DRAIN_SAMECORE_SKIPS.load(Relaxed) > sc_pre,
+        )
+    };
+
     // ---- Leg 5: the latch LIFTS ------------------------------------------------------------------
     let healthy = !barrier_stalled();
     let regrab = drag_begin(w, gx, gy);
@@ -17272,14 +17638,22 @@ pub fn dragwedge_selftest() {
         && stall_ms <= STALL_BUDGET_MS
         && refused
         && refuse_ms <= REFUSE_BUDGET_MS
-        && recovered;
+        && recovered
+        // DRAGFIX legs: the masked arm must have FIRED and must have cost two orders less than the
+        // bound it declined. `arm_yield` is reported but NOT asserted — whether legs 2-4 run in a
+        // schedulable context is a property of where the battery is driven from, and a fixture that
+        // failed on it would be asserting the harness rather than the mechanism.
+        && arm_skip
+        && skip_ms <= SKIP_BUDGET_MS;
     serial_println!(
         "[dragwedge] furniture aimed={} chrome={} grab={} release={} | stall began={} gave_up={} \
-         cancelled={} ms={}/{} | refuse={} ms={}/{} | recover={} bound={} -> {}",
+         cancelled={} ms={}/{} | refuse={} ms={}/{} | recover={} bound={} | arm_yield={} \
+         arm_skip={} skip_ms={}/{} tdbound={} -> {}",
         aimed, chrome_ok, grab_ok, rel_ok,
         began, gave_up, cancelled, stall_ms, STALL_BUDGET_MS,
         refused, refuse_ms, REFUSE_BUDGET_MS,
         recovered, DRAIN_MOVE_SPINS,
+        arm_yield, arm_skip, skip_ms, SKIP_BUDGET_MS, DRAIN_ABANDON_SPINS,
         if ok { "PASS" } else { "FAIL" }
     );
     // A SKIPPED aim is reported as such on its own line rather than being folded into the verdict
@@ -17299,6 +17673,17 @@ pub fn dragwedge_selftest() {
     MOVE_DRAIN_SKIPPED.store(s0, Relaxed);
     MOVE_DRAIN_REPORTED.store(false, Relaxed);
     BARRIER_UNHEALTHY.store(false, Relaxed);
+    // DRAGFIX — the same restoration, extended to the arm ledger, for the identical reason. This
+    // fixture's stall is DELIBERATE and its holder is its own stack, so whichever same-core arm ran
+    // ran correctly; leaving `scskip` standing would make every later `[wedge1] dwell` line on an
+    // armed boot read `SAMECORE-SKIP`, and leaving `ywait > ydrain` standing would deny a real
+    // yielding cure its `YIELD-DRAINED` verdict for the rest of the boot. The evidence is not lost:
+    // `gave_up=true` and `ms=` on the verdict line above are where this fixture's give-up is
+    // recorded, and they are the only place it belongs.
+    DRAIN_YIELD_WAITS.store(y0, Relaxed);
+    DRAIN_YIELD_DRAINED.store(yd0, Relaxed);
+    DRAIN_SAMECORE_SKIPS.store(sc0, Relaxed);
+    DRAGFIX_REPORTED.store(false, Relaxed);
     close(w);
     composite();
 }
