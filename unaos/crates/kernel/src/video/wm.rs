@@ -3045,25 +3045,35 @@ pub fn occluders(out: &mut [(usize, usize, usize, usize); MAX_WINDOWS]) -> usize
 /// the console's own read-back charged `win=1` for 256 410 pixels `STAT` owns and reported `-> FAIL`
 /// (`[wc-d]`) / `-> BLIT` (`[wc-g]`). This snapshot subtracts those pixels.
 ///
-/// **x86 only, and the arch gate is a wire boundary, not a scoping convenience.** `wm.rs`/`wcg.rs`
-/// and the tiler are SHARED with aarch64, and `scripts/specs/pi4-regression.spec` reads the
-/// `[wc-d]`/`[wc-g]` line format. The `occluded=`/`occ=` fields and the counting behind them are
-/// therefore gated to x86 so the aarch64 wire stays byte-identical — the same protection-boundary
-/// argument WCD-TEARDOWN's interlock made (`wm.rs:3580`). The false FAIL is identical on aarch64
-/// (same `wm.rs`, same tiler, same routed console); fixing it there moves another track's gate
-/// wire and is the integrator's call.
+/// **PARITY §6.2 / OCC62 M1 — the arch gate is GONE, and it had to go in the same commit that
+/// populated [`occ_clip`] on aarch64.** The gate was a WIRE boundary: `wm.rs`/`wcg.rs` and the tiler
+/// are shared, `scripts/specs/pi4-regression.spec` reads the `[wc-d]`/`[wc-g]` line format, and while
+/// aarch64's clip was structurally `OccClip::none` there was nothing for an excuse to excuse — so
+/// keeping the fields off that wire cost nothing and kept it byte-identical.
+///
+/// That premise is now false. `occ_clip`'s WINDOW half-space runs on aarch64, so the aarch64 blit
+/// WITHHOLDS pixels a higher window owns, and a read-back with no excuse would read the panel's older
+/// contents inside a verified rect and print `-> FAIL`. The ledger on [`OccSnap::absorb`] states the
+/// rule the other way round — *the excuse must never be narrower than the clip* — and honouring it
+/// means the excuse machinery travels WITH the clip, never behind it. It does here.
+///
+/// The price, paid deliberately: `occluded=`/`occ=` now print on the aarch64 `[wc-d]`/`[wc-g]` lines,
+/// so that wire is no longer byte-identical to its pre-§6.2 self. Both spec patterns are `.*`-tolerant
+/// insertions in a window that already carries `coverage=`, and the terminals are untouched. This is
+/// the same movement DRAG-PI's precedent set: an unconditional behaviour change on aarch64 legitimately
+/// moves knob-off bytes.
 ///
 /// A snapshot, never a handle — read under the table lock and copied out, exactly as [`occluders`]
 /// is, so a window that moves or closes immediately afterwards is repaired by the mover's own
 /// composite and never by us.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 #[derive(Clone, Copy)]
 pub struct OccSnap {
     boxes: [(usize, usize, usize, usize); MAX_WINDOWS],
     n: usize,
 }
 
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 impl OccSnap {
     /// The empty snapshot — no window above the one under check.
     pub const fn none() -> Self {
@@ -3129,7 +3139,7 @@ impl OccSnap {
 /// chargeable. Compat rows are excluded for the reason [`occluders`] gives — a compat row IS the
 /// full-screen present path, and while it owns the panel the render task is parked and not
 /// verifying anyway.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 fn occluders_above(z: u32, id: u32) -> OccSnap {
     let t = table();
     let mut snap = OccSnap::none();
@@ -3156,7 +3166,7 @@ fn occluders_above(z: u32, id: u32) -> OccSnap {
 /// WC-D's pre-blit and read-back snapshots) cannot drift apart — a widened excuse at one of them and
 /// a bare `occluders_above` at another is the same manufactured `FAIL`, just harder to find. See
 /// [`OccSnap::absorb`].
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 fn occ_excuse(z: u32, id: u32, clip: &OccClip) -> OccSnap {
     let mut s = occluders_above(z, id);
     s.absorb(clip);
@@ -4839,8 +4849,23 @@ fn composite_inner() -> CursorTail {
         // (multiple megabytes for the console window), and inside WC-G's bracket that read would be
         // charged to `[wc-g] us=` — manufacturing a `slow=yes` tear report out of this witness's own
         // cost. WC-G's bracket must still contain the copy and nothing else.
+        // OCC62 M1 — THE pre-blit excuse, owned HERE and nowhere else.
+        //
+        // One [`OccSnap`] per window iteration, borrowed by WC-D's reference below and by WC-G's
+        // `end` further down. It used to be FOUR by-value copies on this frame (`wcg::Probe`'s
+        // field, `VerifyRef`'s field, and an argument temporary at each of `begin`/`end`), which is
+        // 392 bytes apiece; on aarch64 that overflowed the kernel task stack and faulted the armed
+        // 1920x1200 boot at the shell-window create. See the OCC62 note on `wcg::begin`.
+        //
+        // Taken ONCE, at the earliest of the two instants that used to take it separately
+        // (`verify_reference`'s, which ran just ahead of `wcg::begin`'s). That STRENGTHENS the law
+        // [`occ_excuse`] exists for — all four excuse points speak from one snapshot instead of two
+        // that could drift — and it cannot narrow the excuse below the clip, because
+        // `occ_excuse` unions the clip in unconditionally ([`OccSnap::absorb`]).
         #[cfg(feature = "witness")]
-        let wcd_ref = verify_reference(&fb, &rw, bands[i], &clip);
+        let occ_pre = occ_excuse(rw.z, rw.id, &clip);
+        #[cfg(feature = "witness")]
+        let wcd_ref = verify_reference(&fb, &rw, bands[i]);
         // WC-G — bracket the blit. `begin` must be the last thing before `draw_window` and `end` the
         // first thing after it: the `blit`/`after` checksums mean "the surface as the copy found it"
         // and "as the copy left it", and anything inserted between them widens the interval they
@@ -4848,16 +4873,7 @@ fn composite_inner() -> CursorTail {
         // GR21/WCD-OCC — the occluder set as of the blit is handed to `wcg::begin` on x86, so the
         // glass read-back can excuse a pixel a higher window owns exactly as `[wc-d]` does. aarch64
         // keeps the four-argument call and its byte-identical wire.
-        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
-        let wcg_probe = super::wcg::begin(
-            rw.id,
-            rw.surf,
-            rw.surf_len,
-            rw.compat,
-            // WC-K3 — the excuse, widened to whatever the blit is about to withhold.
-            occ_excuse(rw.z, rw.id, &clip),
-        );
-        #[cfg(all(feature = "witness", not(target_arch = "x86_64")))]
+        #[cfg(feature = "witness")]
         let wcg_probe = super::wcg::begin(rw.id, rw.surf, rw.surf_len, rw.compat);
         // CURSOR-3 — WHICH WINDOWS MAY CARRY THE SPRITE. WC-I's invariant "no verified pixel is ever
         // read with the sprite on the panel" is preserved here rather than weakened: this pass may
@@ -4933,13 +4949,13 @@ fn composite_inner() -> CursorTail {
         if let Some(p) = wcg_probe {
             let r = &rw;
             // GR21/WCD-OCC — the read-back-time occluder set, unioned in `end` with the pre-blit set
-            // carried in the probe. x86 only; aarch64 keeps the eight-argument call.
-            #[cfg(target_arch = "x86_64")]
+            // carried in the probe. PARITY §6.2 — ONE nine-argument call on both arches.
+            // OCC62 M1 — the read-back-time excuse, owned in THIS block so it leaves the frame the
+            // moment the bracket closes, and handed over by reference beside the pre-blit one.
+            let occ_post = occ_excuse(r.z, r.id, &clip);
             super::wcg::end(
-                p, &fb, r.x, r.y, r.w, r.h, r.stride, r.scale, occ_excuse(r.z, r.id, &clip),
+                p, &fb, r.x, r.y, r.w, r.h, r.stride, r.scale, &occ_pre, &occ_post,
             );
-            #[cfg(not(target_arch = "x86_64"))]
-            super::wcg::end(p, &fb, r.x, r.y, r.w, r.h, r.stride, r.scale);
         }
         // WC-H — print the back-layer sample the blit above recorded, if any. Deliberately AFTER
         // `wcg::end`: this emits to the serial UART, and inside the bracket it would be charged to
@@ -4955,7 +4971,7 @@ fn composite_inner() -> CursorTail {
         // meantime no longer matters: the reference was frozen before the blit.
         #[cfg(feature = "witness")]
         if let Some(vr) = wcd_ref {
-            verify_window(&fb, &rw, vr, &clip);
+            verify_window(&fb, &rw, vr, &clip, &occ_pre);
         }
         // WC-N — pixels on glass for this window id. The only writer of `comp`.
         // WCN-CAUSE — `!seed[i]` is the cause: this row was not dirty at the table snapshot, so the
@@ -5246,7 +5262,13 @@ fn tail_of(disturbed: bool, session: bool, deferred: bool) -> CursorTail {
 /// is an independent statement about whether the pixels reached the memory the scan-out reads.
 #[cfg(feature = "witness")]
 #[allow(unused_variables)]
-fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccClip) {
+fn verify_window(
+    fb: &super::FrameBuffer,
+    r: &Window,
+    vr: VerifyRef,
+    clip: &OccClip,
+    occ_before: &OccSnap,
+) {
     // COMP2-WCD — charge everything this function does to [`C2_WCD_CYC`], on EVERY exit path (the
     // teardown abort, the silent banked chunk, the verdicts), so `[comp2] wcd_us=` can name this
     // witness on the wire when a pass's `blit_us` spikes. A drop guard rather than per-exit charges:
@@ -5270,7 +5292,6 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
     let info = fb.info();
     let VerifyRef { row0, row1, cols, banded, cksum_pre, want, step, running,
         #[cfg(target_arch = "x86_64")] seq,
-        #[cfg(target_arch = "x86_64")] occ_before,
         #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))] full_rows } = vr;
     let wi = r.id as usize;
     // WCD-CHUNK — the chunk's gate-held wall clock opens here, before the first probe, so
@@ -5278,14 +5299,14 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
     // witness: both read-back passes plus the attribution walks between them.
     #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
     let t_chunk0 = crate::arch::now_cycles();
-    // GR21/WCD-OCC — the occluder set as of the READ-BACK (post-blit). Taken once, here, before the
+    // GR21/WCD-OCC — the occluder set as of the READ-BACK (post-blit). PARITY §6.2: both arches.
+    // Taken once, here, before the
     // multi-second glass read the passes run, so the table lock it briefly holds never overlaps that
     // read. Unioned with `occ_before` per pixel below: a mismatching pixel covered by EITHER snapshot
     // is one a higher window owns, which conservatively excuses a window that moved between the two
     // instants (the AK case, one re-tile removed). A window that enters mid-read is the same residual
     // hole WCD-PRE already names for a source that moves mid-read — those pixels are not on the glass
-    // to be read. x86 only; see [`OccSnap`].
-    #[cfg(target_arch = "x86_64")]
+    // to be read. See [`OccSnap`].
     let occ_after = occ_excuse(r.z, r.id, clip);
 
     // ### WCD-LIVE — the source-read census, stated once so a future edit cannot re-open it
@@ -5396,8 +5417,7 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
         let mut first_moved = (0usize, 0usize, 0u32, 0u32);
         // GR21/WCD-OCC — pixels that mismatch AND lie under a higher window. Counted here, charged
         // to neither `bad` nor `moved`: a higher window legitimately owns the destination, so the
-        // console's blit is not the writer being adjudicated. x86 only.
-        #[cfg(target_arch = "x86_64")]
+        // console's blit is not the writer being adjudicated. PARITY §6.2 — both arches.
         let mut occluded = 0usize;
         for row in row0..r1 {
             // WCD-CHUNK — the time stop. Whole rows only (checked between rows, never mid-row, so a
@@ -5458,33 +5478,19 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
                                 // pre-blit OR the read-back occluder set is owned by a higher window.
                                 // WCD-SPRITE — the fourth bucket, tested last of the excusals so a
                                 // moved reference and an occluding window keep their existing
-                                // attributions. Both arches: the sprite is `video::cursor`'s and is
-                                // not arch-gated.
+                                // attributions. PARITY §6.2 — the occluder bucket ahead of it is on
+                                // both arches now too, so this walk is one shape everywhere.
                                 let on_sprite = sprite_covers(sprite_enter, dx, dy)
                                     || sprite_covers(super::cursor::live_box_relaxed(), dx, dy);
-                                #[cfg(target_arch = "x86_64")]
-                                {
-                                    if occ_before.covers(dx, dy) || occ_after.covers(dx, dy) {
-                                        occluded += 1;
-                                    } else if on_sprite {
-                                        sprite_px += 1;
-                                    } else {
-                                        if bad == 0 {
-                                            first = (dx, dy, got, want);
-                                        }
-                                        bad += 1;
+                                if occ_before.covers(dx, dy) || occ_after.covers(dx, dy) {
+                                    occluded += 1;
+                                } else if on_sprite {
+                                    sprite_px += 1;
+                                } else {
+                                    if bad == 0 {
+                                        first = (dx, dy, got, want);
                                     }
-                                }
-                                #[cfg(not(target_arch = "x86_64"))]
-                                {
-                                    if on_sprite {
-                                        sprite_px += 1;
-                                    } else {
-                                        if bad == 0 {
-                                            first = (dx, dy, got, want);
-                                        }
-                                        bad += 1;
-                                    }
+                                    bad += 1;
                                 }
                             }
                         }
@@ -5493,14 +5499,7 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
                 col += step;
             }
         }
-        #[cfg(target_arch = "x86_64")]
-        {
-            (rows_done, checked, bad, moved, nonzero, first, first_moved, occluded, sprite_px)
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            (rows_done, checked, bad, moved, nonzero, first, first_moved, sprite_px)
-        }
+        (rows_done, checked, bad, moved, nonzero, first, first_moved, occluded, sprite_px)
     };
 
     // WCD-CHUNK — `chunked` selects the stage-2 CUMULATIVE machinery only (the resume cursor, the
@@ -5539,11 +5538,7 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
     // feeds the banking arm; `true` here is what arms the time stop for stage 1 as well (dead on
     // every build without the chunking, where `pass` ignores its `bounded` argument).
     let row1_ask = row1;
-    #[cfg(target_arch = "x86_64")]
     let (rows_done, checked, bad_cache, moved_cache, nonzero, first_cache, firstmv_cache, occ_cache, spr_cache) =
-        pass(fb, row1, true);
-    #[cfg(not(target_arch = "x86_64"))]
-    let (rows_done, checked, bad_cache, moved_cache, nonzero, first_cache, firstmv_cache, spr_cache) =
         pass(fb, row1, true);
     // WCD-CHUNK — from here on, `row1` IS the rows the first pass actually walked: the invalidate,
     // the second pass, the `band=` field, the interlock rect and the cursor all describe the chunk,
@@ -5579,11 +5574,8 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
     }
     let ram_indep = cfg!(target_arch = "aarch64");
 
-    #[cfg(target_arch = "x86_64")]
     let (_, _, bad_ram, moved_ram, _, first_ram, firstmv_ram, occ_ram, spr_ram) =
         pass(fb, row1, false);
-    #[cfg(not(target_arch = "x86_64"))]
-    let (_, _, bad_ram, moved_ram, _, first_ram, firstmv_ram, spr_ram) = pass(fb, row1, false);
     // `cksum` is the `[wc-c]` FNV over the SOURCE slot, carried here so a verdict is content-aware: without
     // it a blank surface blitted faithfully onto a blank rect is a PASS indistinguishable from a verified
     // crystal. `nonzero` is the same question asked of the DESTINATION. `cksum_pre` is the same FNV taken at
@@ -5598,7 +5590,6 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
     // in EITHER read-back is unadjudicated by the console's blit, and the max keeps a single such
     // pixel visible on the line. `ok` is UNCHANGED — occluded pixels were never charged to `bad`, so
     // a verdict is CLEAN/PASS iff the non-occluded, non-moved mismatches are zero.
-    #[cfg(target_arch = "x86_64")]
     let occluded = occ_cache.max(occ_ram);
     // WCD-SPRITE — the worse of the two passes, same rule as `moved` and `occluded`, and for the same
     // reason: AR's arrow was over the rect for exactly ONE of the two read-backs, so a min (or either
@@ -5810,9 +5801,10 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
         );
         #[cfg(not(target_arch = "x86_64"))]
         serial_println!(
-            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} cksum={:#018x} cksum_pre={:#018x} -> LIVE (unverifiable)",
+            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} cksum_pre={:#018x} -> LIVE (unverifiable)",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
-            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero, cksum, cksum_pre
+            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero,
+            occluded, occ_before.count(), occ_after.count(), cksum, cksum_pre
         );
     } else if ok {
         // WCD-TEARDOWN — the interlock's reading rides the PASS line too, on x86.
@@ -5838,9 +5830,10 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
         );
         #[cfg(not(target_arch = "x86_64"))]
         serial_println!(
-            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache=0 bad_ram=0 ram_indep={} moved={} sprite_px={} nonzero={} cksum={:#018x} first=none -> PASS",
+            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache=0 bad_ram=0 ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=none -> PASS",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
-            checked, coverage, yn(ram_indep), moved, sprite_px, nonzero, cksum
+            checked, coverage, yn(ram_indep), moved, sprite_px, nonzero,
+            occluded, occ_before.count(), occ_after.count(), cksum
         );
     } else {
         // WCD-TEARDOWN — the FAIL line carries the interlock reading too, and this arm is the reason
@@ -5866,9 +5859,10 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
         );
         #[cfg(not(target_arch = "x86_64"))]
         serial_println!(
-            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} -> FAIL",
+            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} -> FAIL",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
-            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero, cksum,
+            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero,
+            occluded, occ_before.count(), occ_after.count(), cksum,
             first.0, first.1, first.2, first.3
         );
     }
@@ -5966,11 +5960,6 @@ struct VerifyRef {
     /// aarch64 has no interlock at all (the arch gate is a protection boundary; see WCD-TEARDOWN).
     #[cfg(target_arch = "x86_64")]
     seq: PanelSeq,
-    /// GR21/WCD-OCC — the boxes of every window ABOVE this one at reference time (pre-blit). Unioned
-    /// in [`verify_window`] with a read-back-time snapshot, so a mismatching pixel a higher window
-    /// legitimately owns is counted `occluded=`, not `bad=`. x86 only; see [`OccSnap`].
-    #[cfg(target_arch = "x86_64")]
-    occ_before: OccSnap,
     /// WCD-CHUNK — the box's whole visible row extent at admission, so the read-back can tell "this
     /// chunk closed the BOX" (the cursor reached this) from "this chunk closed its band". Chunking
     /// exists only where the deferral policy does.
@@ -6000,7 +5989,6 @@ fn verify_reference(
     fb: &super::FrameBuffer,
     r: &Window,
     band: Option<(usize, usize)>,
-    clip: &OccClip,
 ) -> Option<VerifyRef> {
     // FOCUS-VIS — `presented`, so the one-shot is not claimed by the create-time composite of a blank
     // surface. `compat` rows have no chrome and no owner to verify against; `id < 32` is the latch width.
@@ -6234,14 +6222,12 @@ fn verify_reference(
     // would abandon verdicts for a race that cannot reach them. See [`PANEL_FILL_EPOCH`].
     #[cfg(target_arch = "x86_64")]
     let seq = panel_seq();
-    // GR21/WCD-OCC — the occluder set as of the reference (pre-blit). Read here, alongside the `want`
-    // snapshot, so it describes the same instant the source bytes were frozen at; [`verify_window`]
-    // unions it with a read-back-time snapshot to excuse a window that moved between the two.
-    #[cfg(target_arch = "x86_64")]
-    let occ_before = occ_excuse(r.z, r.id, clip);
+    // GR21/WCD-OCC — the occluder set as of the reference (pre-blit) is no longer carried HERE.
+    // OCC62 M1: `composite_inner` owns the one instance and lends it to [`verify_window`], which is
+    // what keeps a 392-byte `OccSnap` off this struct and out of the caller's frame. The instant is
+    // unchanged — the loop takes it immediately before calling this function.
     Some(VerifyRef { row0, row1, cols, banded, cksum_pre, want, step, running,
         #[cfg(target_arch = "x86_64")] seq,
-        #[cfg(target_arch = "x86_64")] occ_before,
         #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))] full_rows: rows })
 }
 
@@ -12990,14 +12976,20 @@ fn boxes_overlap(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize
 // enlarged union genuinely exposed, and the flash has nothing left to be made of. Coalescing is left
 // alone: it is sound (a union only ever repaints more desktop) and `coalesced=` still reports it.
 //
-// **x86 only, and the arch gate is a wire boundary rather than a scoping convenience** — the same
-// boundary GR21/WCD-OCC drew for [`OccSnap`]. `wm.rs` is shared with aarch64, whose `[wc-d]`/`[wc-g]`
-// read-backs have no occluder excuse at all: clipping there would leave the pi4 regression spec
-// reading occluder pixels inside a verified rect and calling them corruption. On x86 the excuse
-// already exists and this clip is built from a SUBSET of `occluders_above`'s population, so the
-// pixels the blit declines to write are a subset of the pixels the read-back declines to charge. On
-// aarch64 [`occ_clip`] returns the empty set and every blit below is PIXEL-IDENTICAL to the pre-arc
-// blit — the same runs, at the same offsets, from the same buffer.
+// **PARITY §6.2 / OCC62 M1 — BOTH ARCHES now, and the excuse came with it in the same commit.**
+// The arch gate here was a wire boundary rather than a scoping convenience — the same boundary
+// GR21/WCD-OCC drew for [`OccSnap`] — and its whole argument was conditional: clipping on aarch64
+// while the read-back had no occluder excuse would have left the pi4 regression spec reading
+// occluder pixels inside a verified rect and calling them corruption. That is a statement about
+// what must land TOGETHER, not a statement that the clip belongs to one arch. So the WINDOW
+// half-space below is unconditional and the excuse machinery ([`OccSnap`], [`occluders_above`],
+// [`occ_excuse`], and the `occluded=`/`occ=` fields on both wires) is unconditional with it. The
+// population is still a SUBSET of `occluders_above`'s, so the pixels the blit declines to write are
+// still a subset of the pixels the read-back declines to charge — on either arch.
+//
+// The FURNITURE arm (dock strip, menu bar, the SHARD dropdown) stays `x86_64 + wc` for now; §6.2's
+// second milestone moves it to the `wc`/`pidesk` dual gate the rest of the furniture family carries.
+// Until then an aarch64 clip holds windows and nothing else.
 //
 // **"Pixel-identical", not "byte for byte", and the review was right to separate them.** The first
 // cut of this ledger claimed the latter, which is a claim about the BINARY and is false: the clip is
@@ -13132,8 +13124,10 @@ impl OccClip {
     /// DROPPED for want of capacity, which [`erase_clip`] reports rather than swallows: a dropped
     /// occluder is a region the erase will publish over.
     ///
-    /// x86 only, with its sole caller's populated arm: on aarch64 [`erase_clip`] returns
-    /// [`OccClip::none`] and there is nothing to add to it.
+    /// x86 only, with its two callers' populated arms: on aarch64 [`erase_clip`] returns
+    /// [`OccClip::none`] and §6.2 M1 leaves `occ_clip`'s FURNITURE arm — the other pusher — x86-only.
+    /// M2 widens this to the `pidesk` dual gate along with that arm; the M1 window loop writes
+    /// `boxes[n]` directly under [`OCC_CLIP_MAX`] and needs no capacity check.
     #[cfg(target_arch = "x86_64")]
     fn push(&mut self, b: (usize, usize, usize, usize)) -> bool {
         if b.2 == 0 || b.3 == 0 {
@@ -13299,7 +13293,7 @@ impl OccRows {
 /// both a cost and a fresh interleave; the snapshot is also the RIGHT source, because it is the
 /// geometry this pass is drawing against.
 ///
-/// Empty on every arch but x86 (see the ledger above [`OccClip`]), and empty whenever nothing
+/// Populated on BOTH arches since §6.2 (see the ledger above [`OccClip`]), and empty whenever nothing
 /// overlaps, so the per-row work below is skipped outright for the topmost window of any stack.
 ///
 /// ### WCK5 — AND THE DOCK STRIP IS IN IT, WITH NO `(z, id)` TERM AT ALL
@@ -13348,15 +13342,14 @@ impl OccRows {
 /// [`OccClip::push`] rather than a direct write so that a future third piece of furniture is DECLINED
 /// rather than written past the end.
 ///
-/// **x86 + `wc` only.** Off `wc` there is no dock — `wcx.rs` is the x86 panel path the knob gates —
-/// and off x86 this whole body is absent. On aarch64 the term is STRUCTURALLY absent, not merely
-/// empty: `super::dock` is never named, no `for_panel` runs, and the clip stays [`OccClip::none`], so
-/// every aarch64 blit below is pixel-identical to the pre-arc blit. `pw`/`ph` are the two arguments
-/// that arch pays and cannot use, on [`OccClip`]'s own "same pixels, not same bytes" boundary.
+/// **x86 + `wc` only — the FURNITURE arm alone, and only until §6.2 M2.** Off `wc` there is no dock
+/// (`wcx.rs` is the x86 panel path the knob gates), and off x86 that arm is absent: on aarch64 the
+/// furniture term is STRUCTURALLY absent, not merely empty — `super::dock` is never named and no
+/// `for_panel` runs — so an aarch64 clip carries WINDOWS and no strips. `pw`/`ph` are the two
+/// arguments that arch pays and cannot use until the furniture arm follows.
 #[allow(unused_variables, unused_mut)]
 fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: usize) -> OccClip {
     let mut c = OccClip::none();
-    #[cfg(target_arch = "x86_64")]
     {
         let (z, id) = (rows[i].z, rows[i].id);
         let me = outer_box(&rows[i]);
@@ -13373,7 +13366,11 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: u
         }
         // WCK5 — the strip, admitted for every subject it meets. No `(z, id)`, for the reason in the
         // ledger above: `composite_once` paints it after this whole loop has run.
-        #[cfg(feature = "wc")]
+        //
+        // OCC62 M1 — the WINDOW half-space above is now UNCONDITIONAL (see the §6.2 note in the
+        // ledger); this FURNITURE arm keeps its `x86_64 + wc` gate for one more milestone, so the
+        // gate that was implicit in the removed outer `target_arch` attribute is restated here.
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))]
         {
             let rect = super::dock::Layout::for_panel(dock_tiles(rows), pw, ph).map(|l| l.rect());
             // WCK4-D1's lesson, restated on this side: the strip's geometry goes on the wire whether
