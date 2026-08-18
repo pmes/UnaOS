@@ -10227,6 +10227,7 @@ fn elf1_report(value: u64) {
 /// validated + mapped with per-segment permissions, run it at EL0, and confirm it ran. Modelled on
 /// `m6g_loader_run`. Self-contained; runs LAST in the u7 chain (all 8 slots are free by then). Emits ONE
 /// uncounted `:: ELF1: … ::` line (PASS or an honest skip/FAIL); never perturbs the 23-fixture battery.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn elf1_launcher(_demo_cpu: usize) {
     // One-shot (defensive, the m6g idiom).
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -10319,6 +10320,7 @@ fn elf1_launcher(_demo_cpu: usize) {
 /// mounted + proven), fully self-contained (a fresh slot, reaped on exit); an honest skip without the SD/
 /// fixture. It can never perturb the 23-fixture battery (its exit rides the generic Proc reap, off every
 /// M6b/sentinel counter).
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn exec1_witness(_demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -10385,6 +10387,7 @@ fn exec1_witness(_demo_cpu: usize) {
 ///     that legs 1 and 2 structurally cannot witness: both of their programs end by themselves.
 ///
 /// An honest skip without the SD/fixtures.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn bgrun_witness(_demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -10709,6 +10712,7 @@ fn killbound_witness() {
 /// re-arms it idempotently anyway) so its reuse of the SYS_FB_* / SYS_THREAD_* / SYS_FUTEX machinery perturbs
 /// nothing. Self-contained (a fresh slot, reaped on exit); an honest skip without the SD/fixture. Its exit
 /// rides the generic Proc reap, off every M6b/sentinel counter, so it can never perturb the fixture battery.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn uvug_witness(_demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -11529,6 +11533,7 @@ fn bgspread_witness() {
 /// sibling core), each atomically bumps the shared counter, joins them, and exits; the verdict prints the
 /// authoritative witness with the kernel-observed spawned/joined counts, the reported counter, and the cores
 /// the two workers actually ran on. Never perturbs the fixture battery (its own line, no shared counter).
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn threads_launcher(_demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -14076,6 +14081,7 @@ unsafe extern "C" {
 /// final poll == -EAGAIN. QEMU raspi4b has no USB HID, so the kernel-injected event is what proves the
 /// enqueue->drain path here — an honest statement of what QEMU can and cannot show. Never perturbs the
 /// fixture battery (its own line, exit routed by name).
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn input_launcher(_demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -14357,6 +14363,7 @@ unsafe extern "C" {
 /// surface), joins, and exits. The verdict prints the authoritative witness with the mapped geometry, the
 /// present count, and the surface checksum — self-verified against `fb_expected_checksum`. Runs AFTER
 /// `threads_launcher`'s verdict, so its reuse of the shared SYS_THREAD_* accounting perturbs nothing.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn fb_launcher(_demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -14718,6 +14725,7 @@ unsafe extern "C" {
 /// fixture battery. The fixture's slot is torn down at its exit, which also exercises the
 /// `clear_handle_row` -> `win_close_asid` teardown path (its window is already closed by then, so the
 /// sweep is a no-op — the honest limit of what a single-process fixture can show).
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn wcb_launcher(_demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -15466,7 +15474,80 @@ fn u7_release_go(slot: usize) {
 ///      revoked handle was torn down, t2 likewise, no pending residue). Free the planted Proc entry. PASS
 ///      iff both witnesses == `U7_WITNESS_ALL` AND used AND the snapshot held AND everything cleared AND no
 ///      U7 kill. Prints ONE PASS line. U7 is the last demo, so it releases no further gate.
+// =============================================================================================
+// U7STK (PARITY §6.1b) — THE CONVICTED FRAME, and why the fix is `#[inline(never)]`.
+//
+// THE DEFECT. On Pi metal `u7-launch` is dropped between `wcb_launcher` and
+// `video::pidesk::arm()` by the SPIN-6 refusal in `arch/aarch64/sched.rs`:
+//
+//   [spin6] cpu=2 REFUSING corrupt switch-in: task=70:u7-launch ctx_sp=0x20c9e70
+//   outside its stack [0x20ca000,0x20ce000) — the parked frame was OVERWRITTEN
+//
+// `ctx_sp` is 144..928 bytes BELOW this task's own 16 KiB low bound, varying per boot. Nothing was
+// writing into it; its own frame chain ran off the bottom. Everything after that statement — the
+// desktop itself, BGRUN, FATDIRS, FATMOVE — has therefore never executed on hardware, while three
+// arcs gated green on the QEMU path that does not reach it.
+//
+// THE MEASUREMENT (the `u7stk` probes below, QEMU raspi4b, 16 KiB stack, before this fix):
+//
+//   at=entry              used=5952  hw=5952   headroom=10432
+//   at=after:k1_persist   used=5952  hw=13064  headroom=3320
+//   at=after:exec1        used=5952  hw=14984  headroom=1400
+//   at=after:wcb          used=5952  hw=16384  headroom=0
+//
+// Two findings, and the first is the convict. `at=entry` says `u7_launcher`'s OWN FRAME is 5952
+// bytes — 36% of the task's whole stack, spent before it has called anything. Statically it
+// disassembles to `stp x29,x30,[sp,#-0x60]! ; sub sp,sp,#0x1,lsl #12 ; sub sp,sp,#0x5e0` =
+// 5696 bytes, the SECOND-LARGEST stack frame in the entire kernel image (only `video::wm::composite`
+// at 6640 is bigger). Second, `after:wcb` reaches `hw=16384` — every byte of the stack touched,
+// `headroom=0`. QEMU survives by exactly zero bytes; metal, whose USB-storage path adds
+// `xhci::bot_transfer -> bot_rescue_escalate -> run_bot_stage -> ... -> fbcon::__print ->
+// wm::composite` frames beneath the same chain (a subtree measuring 5520 bytes on its own, and one
+// QEMU raspi4b never takes because it models no xHCI), goes past the floor. That asymmetry IS the
+// "QEMU-green, metal-dead" of this defect, stated in bytes.
+//
+// WHY `u7_launcher`'s FRAME IS 5.7 KiB. It is a straight-line chain of ~47 no-argument calls and
+// declares no locals of its own. But THIRTY-EIGHT of those callees live in this same module and
+// were INLINED into it, so every one of their local buffers is a slot in `u7_launcher`'s single
+// frame — and that frame is live for the WHOLE cascade, including while a non-inlined callee runs
+// twelve kilobytes deep beneath it. LLVM merges slots whose lifetimes provably do not overlap, but
+// across 38 inlined bodies each carrying loops, matches and `Drop` types it cannot prove enough of
+// them disjoint, so the frame tends toward the SUM of their locals rather than the MAX.
+//
+// THE FIX. `#[inline(never)]` on exactly those 38 launchers — all of them in this file, each
+// carrying a one-line note pointing here. Each launcher's locals go back into ITS OWN frame, live
+// only while that launcher runs; the peak becomes `u7_launcher`'s residual frame plus the DEEPEST
+// SINGLE launcher instead of the sum of all of them. It costs one `bl` per fixture on a path that
+// already does disk I/O.
+//
+// IT IS UNCONDITIONAL, NOT witness-gated, because the DEFECT is not: a knob-off `./arroyo kernel8`
+// media image overflows exactly as readily as a witness one. So knob-off codegen MOVES with this
+// arc, deliberately — nothing here is byte-identical, and the battery is what proves the move is
+// behaviour-neutral. The `u7stk` probes themselves ARE witness-gated and stay in the tree, so the
+// next arc that grows a launcher sees `headroom=` shrink on the gate instead of on metal.
+// =============================================================================================
+// The high-water checkpoint macro used through `u7_launcher` below.
+// Expands to one `[u7stk] at=… sp=… low=… used=… hw=… headroom=…` line via `sched::stk_probe`,
+// which scans this task's poison-painted stack for its deepest-ever point. Because the reading is a
+// HIGH-WATER, a probe placed AFTER a launcher returns still reports how deep that launcher went —
+// which is what lets one line per call convict one call out of forty-seven without instrumenting
+// any of their interiors. `witness`-gated on both arms: knob-off the macro expands to nothing and
+// the media build is byte-identical to baseline in this file.
+#[cfg(feature = "witness")]
+macro_rules! u7stk {
+    ($at:expr) => {
+        crate::arch::sched::stk_probe($at)
+    };
+}
+#[cfg(not(feature = "witness"))]
+macro_rules! u7stk {
+    ($at:expr) => {{
+        let _ = $at;
+    }};
+}
+
 pub fn u7_launcher(demo_cpu: usize) {
+    u7stk!("entry");
     // U8, then U9, then U10, ride the SAME kernel task, each strictly after the prior flow (every exit path —
     // PASS, FAIL, or skip — falls through): the ordering gate the *_LAUNCH_DONE statics provide between
     // separately spawned launchers is here the program order of one task. Each launcher's verdict waits on its
@@ -15478,34 +15559,51 @@ pub fn u7_launcher(demo_cpu: usize) {
     // ZERO rows and the battery stays byte-identical; its live effect is on metal (a real power-cycle where a prior
     // boot left a real row). The mechanism is proven by the M3 kernel-side proof + the K2 real-program launcher.
     atr_maybe_boot_rebuild();
+    u7stk!("after:atr_boot_rebuild");
     u7_run(demo_cpu);
+    u7stk!("after:u7_run");
     u8_launcher(demo_cpu);
+    u7stk!("after:u8");
     u9_launcher(demo_cpu);
+    u7stk!("after:u9");
     u10_launcher(demo_cpu);
+    u7stk!("after:u10");
     u10c_launcher(demo_cpu);
+    u7stk!("after:u10c");
     u10d_launcher(demo_cpu);
+    u7stk!("after:u10d");
     u11_launcher(demo_cpu);
+    u7stk!("after:u11");
     u11defer_run(demo_cpu);
+    u7stk!("after:u11defer");
     u11reuse_run();
+    u7stk!("after:u11reuse");
     u11reap_run(demo_cpu);
+    u7stk!("after:u11reap");
     uowner_run(demo_cpu);
+    u7stk!("after:uowner");
     // F2 M3: after all 23 fixtures have exited, witness that FAT_MUTATION serializes the FAT-table RMW ACROSS
     // CORES (this task runs on `vcpu`; the worker on `demo_cpu` = online[0], always online). Runs LAST so it can
     // never perturb the fixture battery, and it never touches the disk. Emits its own `F2-witness:` line — NOT a
     // `-> PASS` line, so the 23-fixture count stays byte-equivalent.
     f2_witness_launcher(demo_cpu);
+    u7stk!("after:f2_witness");
     // F3 M4: the NAMESPACE-lock twin — same discipline (last, in-RAM, no disk, its own `F3-witness:` line).
     f3_witness_launcher(demo_cpu);
+    u7stk!("after:f3_witness");
     // K1 M1: the on-disk owner/grants (UNAFS.ATR) format + round-trip — runs LAST (its disk I/O can never
     // perturb the 23 fixtures or the witnesses); emits its own `:: K1-atr: ::` line (not a `-> PASS`).
     k1_atr_selftest();
+    u7stk!("after:k1_atr");
     // K1 M3: the two-phase remount-survival proof — persist an owned+granted file, simulate a reboot (rebuild
     // from UNAFS.ATR), and enforce with real stamped principals. Emits its own uncounted `:: K1-persist: … PASS ::`
     // line (the 24th) and fully cleans up. After k1_atr_selftest so it inherits a valid UNAFS.ATR image.
     k1_persist_launcher();
+    u7stk!("after:k1_persist");
     // K1 M4: the fail-closed proof — a TORN on-disk row yields a PUBLIC file at mount (never a forged owner).
     // Its own uncounted `:: K1-corrupt: … PASS ::` line (the 25th); fully self-cleaning.
     k1_corrupt_launcher();
+    u7stk!("after:k1_corrupt");
     // K2 (make-enforcement-LIVE): the end-to-end proof through TWO REAL disk-loaded programs — owner
     // re-admitted by name after the UNAFS.ATR rebuild, impostor refused. Its own uncounted
     // `:: K2-liveenf: … PASS ::` line (the 26th); fully self-cleaning (leaves no owned row on the metal card).
@@ -15514,6 +15612,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     // two-boot money-shot (k2_metal_launcher) instead — same slot, ATTENDED Pi bench only.
     #[cfg(not(feature = "k2_leave"))]
     k2_liveenf_launcher(demo_cpu);
+    u7stk!("after:k2_liveenf");
     #[cfg(feature = "k2_leave")]
     k2_metal_launcher(demo_cpu);
     // ELF-1: graduate the loader from flat-binary to minimal static ELF64. Placed HERE, among the
@@ -15524,21 +15623,25 @@ pub fn u7_launcher(demo_cpu: usize) {
     // page permissions), then drops it to EL0 and confirms it ran (its SYS_REPORT token arrived, its
     // SYS_WRITE message printed). Its own uncounted `:: ELF1: … ::` line; an honest skip without the fixture.
     elf1_launcher(demo_cpu);
+    u7stk!("after:elf1");
     // EXEC-1: prove the panel `run <path>` path — read ELFHELLO.ELF through the VFS mount table and execute
     // it via the NEW `run_user_image` loader entry, asserting a clean `exit=0`. Placed right after ELF-1
     // (same freshly-mounted FAT volume); its own uncounted `:: EXEC1: … ::` line, self-cleaning.
     exec1_witness(demo_cpu);
+    u7stk!("after:exec1");
     // ELF-2: the EL0-threading test — SYS_THREAD_SPAWN/_JOIN/_EXIT with a shared-memory counter across two
     // worker threads (one co-located, one on a sibling core). In-RAM (no disk), so it can never perturb the
     // fixture battery or the FAT witnesses; its own uncounted `:: EL0: threads test — … ::` line. Placed after
     // ELF-1 (the loader is proven; this exercises the thread primitives on top of the same slot machinery).
     threads_launcher(demo_cpu);
+    u7stk!("after:threads");
     // ELF-3: give EL0 something to draw on + real sync — SYS_FB_MAP / SYS_FB_PRESENT / SYS_FUTEX. The parent
     // maps a per-process off-screen surface, 2 threads draw halves under futex sync, the parent presents (the
     // kernel checksums + composites through the registered present hook), and the witness self-verifies the
     // drawn bytes against the expected checksum. In-RAM (no disk), so it can never perturb the fixture battery;
     // its own uncounted `:: EL0: fb test — … ::` line. Placed after ELF-2 (the thread primitives it builds on).
     fb_launcher(demo_cpu);
+    u7stk!("after:fb");
     // UVUG-1: the first REAL EL0 graphics program — the mini-vug. Reads VUG.ELF through the VFS and runs it
     // via the EXEC-1 `run_user_image` path (the same path `run /fat/VUG.ELF` drives at the panel): it maps an
     // off-screen surface, spawns 2 EL0 worker threads that render halves of an animated pattern under a FUTEX
@@ -15547,6 +15650,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     // (the SYS_FB_* / SYS_FUTEX primitives it builds on are proven, and the futex pool is armed). Its own
     // uncounted `:: EXEC-UVUG: … ::` verdict; an honest skip without the fixture.
     uvug_witness(demo_cpu);
+    u7stk!("after:uvug");
     // ELF-5: input into EL0 — SYS_INPUT_POLL + the per-process ring + the `user_input_enqueue` router seam.
     // A register-only EL0 program polls its ring empty (-EAGAIN), the launcher injects one KeyDown through
     // the real router seam, the program drains it (verifying the packed value) and polls empty again. In-RAM
@@ -15554,37 +15658,45 @@ pub fn u7_launcher(demo_cpu: usize) {
     // line. Placed after the EL0 graphics/thread ladder (the primitives it complements are proven). QEMU has
     // no real HID, so the kernel-injected event is what proves the enqueue->drain path (honest by design).
     input_launcher(demo_cpu);
+    u7stk!("after:input");
     // WC-B: the window verbs — SYS_WIN_CREATE/_PRESENT/_MOVE/_CLOSE, happy paths AND refusals, with the
     // presented 128×128 surface self-verified against the kernel-computed checksum (which is what proves
     // the 16-page negotiated mapping actually landed). In-RAM (no disk), and placed AFTER the ELF-3 fb
     // verdict and the UVUG witness have printed, so its presents cannot perturb their counters; its own
     // uncounted `:: EL0: window verbs — … ::` line.
     wcb_launcher(demo_cpu);
+    u7stk!("after:wcb");
     #[cfg(feature = "pidesk")] crate::video::pidesk::arm(); // SHELLWIN-PI: the last panel-READING fixture has returned, however it returned, so the desktop may now place furniture on the glass. At the CALLER rather than inside `wcb_launcher` deliberately: that fn has three early SKIP returns (blob oversize, no free slot, already-done), and arming from its tail would let a skipped fixture leave the Pi desktop with no shell window at all and no line saying why. This is the SECOND of the Pi's two desktop questions and it is not `pidesk::activate`'s: that one runs at the GUI handoff and asks "is this a desktop yet?", while the cascade it was called from is still running on the APs. x86 gets the ordering for free because its Kepler takeover happens after the cascade. Minting the shell window ahead of this point put a half-panel row across `[wc-j]`'s vacated-box read-backs, `[wc-f]`'s probe strip and `[clickroute]`'s hit-test: measured, `MBENCH FAIL — 104/108`. ⚠ ONE LINE, paid for by one merged in `wcb_launcher`'s tail commentary.
+    u7stk!("after:pidesk_arm");
     // BGRUN-ST: the background-run contract, headless — bg spawn -> exit -> reap (ELFHELLO), then a
     // kill mid-run (UVUG) proving the confirmed-kill arm reaps the row in place. Placed AFTER the UVUG
     // witness and WC-B (their counters/checksums are already printed, so a partial bg UVUG cannot
     // perturb them); its own `:: BGRUN-ST: … ::` lines, spec-REQUIREd (the round-1 lens showed the
     // interactive excuse did not cover the headless-observable core of the contract).
     bgrun_witness(demo_cpu);
+    u7stk!("after:bgrun");
     // K3: the revoke-persist commit-ordering proof — a named-owner file's SYS_FGRANT revoke commits to disk
     // BEFORE the in-RAM removal, so it SURVIVES REBOOT and fails CLOSED on a persist failure. Its own uncounted
     // `:: K3-revoke: … PASS ::` line; fully self-cleaning (leaves no owned row on the metal card).
     k3_revoke_launcher();
+    u7stk!("after:k3_revoke");
     // K5: the revoke/re-persist SMP-window proof — a deterministic interleaving witness that the concurrent
     // full-row re-persist can no longer resurrect a revoked grant (snapshot + disk-narrow + in-RAM commit now
     // span one ns) + the create-serialization gate. Its own uncounted `:: K5-lockspan: … PASS ::` line;
     // self-cleaning (leaves no owned row on the metal card).
     k5_lockspan_launcher(); #[cfg(feature = "nsspan")] nsspan_report(); // K7 WATCH: emit :: NS-SPAN: … :: after K3/K5 drive the sites (newline-neutral inline; knob-off byte-identical)
+    u7stk!("after:k5_lockspan");
     // K9-PARITY: the mid-staging-failure discard proof — a staged ACL persist that fails PARTWAY leaves no
     // partial-durable row (K3), AND its uncommitted residue can no longer be flushed by a LATER persist's
     // commit (the K9 lens-B residual, now closed in-lane via `with_unafs`'s MOUNT_DISCARD). Its own
     // uncounted `:: K9-parity: … PASS ::` line; self-cleaning (leaves no owned row on the metal card).
     k9_parity_launcher();
+    u7stk!("after:k9_parity");
     // IMAGE_SHA256 code-signing: prove the SHA-256 primitive (FIPS KATs) + that it discriminates program
     // IMAGES, closing the "same 8.3 name = same principal" residual (the loader now mints IMAGE_SHA256). Its
     // own uncounted `:: IMG-SIG: … PASS ::` line; read-only, no disk write.
     image_sig_selftest();
+    u7stk!("after:image_sig");
     // TERM_RING (MIDDEN_CONVERGENCE §3, M2): the terminal-output transport's own witness — the ring
     // refuses exactly the records its drop-NEWEST bound says it must, hands the survivors back in
     // order and byte-exact, seals an over-long record with the truncation mark, and accounts for
@@ -15593,31 +15705,37 @@ pub fn u7_launcher(demo_cpu: usize) {
     // uncounted `:: TERMRING: … :: PASS ::` line.
     #[cfg(feature = "witness")]
     crate::termring::termring_selftest();
+    u7stk!("after:termring");
     // FATDIRS: exercise the new fat.rs directory create/remove seam (create_dir/remove_dir) on the live
     // volume — LAST in the chain (its disk I/O can never perturb the 23 fixtures or the witnesses), fully
     // self-cleaning. Its own uncounted `:: FATDIRS: … PASS ::` line. Unblocks JD7's Orin-panel mkdir/rmdir.
     fatdirs_launcher();
+    u7stk!("after:fatdirs");
     // K4-ready: prove the native-attribute projection codec (owner/grants string forms) + the
     // UNAATR1-vs-UNAFS volume-magic discriminator — the deterministic 1:1 mapping K4's migrate-then-delete
     // will use, PINNED + KAT'd ahead of the native unafs mount. Read-only, in-RAM (no disk, no card); its
     // own uncounted `:: K4-ready: … PASS ::` line. LAST in the chain.
     k4_ready_selftest();
+    u7stk!("after:k4_ready");
     // FATMOVE: exercise the new fat.rs directory-entry rename + cross-directory move seam
     // (rename_entry/move_entry) on the live volume — LAST in the chain (its disk I/O can never
     // perturb the 23 fixtures or the witnesses), fully self-cleaning. Its own uncounted
     // `:: FATMOVE: … PASS ::` line. Unblocks a future jetson `mv` arc (JD10).
     fatmove_launcher();
+    u7stk!("after:fatmove");
     // CLOCK-3: prove the FAT last-write stamp DERIVES from the unified kernel clock — after a
     // deterministic Manual civil anchor, a freshly created file's on-disk dir-entry date matches the
     // anchor (not the all-zero unset value). Runs LAST in the storage chain (its disk I/O can never
     // perturb the fixtures/witnesses), restores the civil clock to exactly as found, and is fully
     // self-cleaning. Its own uncounted `:: CLOCK3-fat: … PASS ::` line.
     clock3_fat_launcher();
+    u7stk!("after:clock3_fat");
     // BeFS-K3: locate + mount the native unafs partition off the live card and prove the superblock
     // + the read paths (ls/cat byte-verified) + the write seam's bound-check. Read-only by
     // construction — safe here. Its own uncounted `:: K3-mount: … PASS ::` line; an honest skip on
     // media without a unafs partition.
     crate::fs::unafs::k3_mount_selftest();
+    u7stk!("after:k3_mount");
     // BeFS-K4: prove the kernel can WRITE the native unafs volume through the single coherent mount,
     // and that the write SURVIVES a genuine remount (create+write -> remount -> byte-verify ->
     // delete -> remount -> negative). Self-cleaning (create then delete + journal reset), so the
@@ -15625,6 +15743,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     // create/delete never perturbs K3-mount's exact-two-entries `ls`. Its own uncounted
     // `:: K4-write: … PASS ::` line; an honest skip on media without a unafs partition.
     crate::fs::unafs::k4_write_selftest();
+    u7stk!("after:k4_write");
     // K8a: prove the copy-on-write commit discipline on the live card — root generation advances
     // per mutation, a power cut before the root flip (the autocommit-off crash seam + a genuine
     // remount) converges to the OLD tree, refcounts persist across a remount, and the commit-path
@@ -15632,6 +15751,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     // fully self-cleaning (its scratch file is created and deleted inside the witness). Its own
     // uncounted `:: K8a-cow: … PASS ::` line; honest skip on media without a unafs partition.
     crate::fs::unafs::k8a_cow_selftest();
+    u7stk!("after:k8a_cow");
     // K8b: prove retained roots (snapshots) + reclamation on the live card — snapshot the committed
     // tree, overwrite the live file, byte-verify the snapshot's OLD blocks are untouched (never-
     // overwrite + block sharing), confirm the retention-aware allocator never reuses a live
@@ -15640,6 +15760,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     // fully self-cleaning (its scratch file + snapshots are dropped inside the witness). Its own
     // uncounted `:: K8b-snap: … PASS ::` line; honest skip on media without a unafs partition.
     crate::fs::unafs::k8b_snap_selftest();
+    u7stk!("after:k8b_snap");
     // K8c: prove the snapshot READ path enforces the LIVE object's CURRENT ACL (the "high security"
     // ruling — revocation reaches the past). Owner + grantee read the OLD retained bytes; an impostor
     // is refused from the snapshot by the SAME predicate that refuses the live read; dropping a grant
@@ -15647,6 +15768,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     // even for its owner. Runs AFTER k8b_snap_selftest, fully self-cleaning. Its own uncounted
     // `:: K8c-snapread: … PASS ::` line; honest skip on media without a unafs partition.
     crate::fs::unafs::k8c_snapread_selftest();
+    u7stk!("after:k8c_snapread");
     // F2: prove the full mutation set — `rename`, `remove_attribute`, `unlink` — on the live card,
     // each ONE atomic CoW transaction through the single IRQ-masked mount and each durable across a
     // genuine remount (rename moves the NAME, not the bytes: same inode id, identical payload;
@@ -15655,48 +15777,58 @@ pub fn u7_launcher(demo_cpu: usize) {
     // fully self-cleaning (it creates no directory — the crate has no rmdir). Its own uncounted
     // `:: F2-mutations: … PASS ::` line; honest skip on media without a unafs partition.
     crate::fs::unafs::f2_mutations_selftest();
+    u7stk!("after:f2_mutations");
     // K6: prove the U6 owner/grants ACL round-trips through the native unafs attribute volume (the
     // sidecar's successor) — forward+reverse codec, write+read+clear via the coherent mount. Runs
     // LAST, fully self-cleaning (leaves only the staged K3 fixtures). Its own uncounted
     // `:: K6-migrate: … PASS ::` line; honest skip on media without a unafs partition.
     k6_migrate_selftest();
+    u7stk!("after:k6_migrate");
     // VFS-2 (fold, from commit 76762338): the mount-table WRITE witnesses — a create+write+read-back
     // round-trip through the FAT backend and the native unafs backend. Their own uncounted
     // `:: vfs2-fat: … ::` / `:: vfs2-native: … ::` lines; honest skip when the backing volume is absent.
     crate::fs::vfs::vfs2_fat_write_witness();
+    u7stk!("after:vfs2_fat_write");
     crate::fs::vfs::vfs2_native_write_witness();
+    u7stk!("after:vfs2_native_write");
     // VFS-1 (adoption): the routing battery for the seam every path verb now shares — /fat reaches
     // the FAT backend, a bare path reaches native UnaFS, the boundary negatives (/fatty.bin,
     // /usbfoo) stay native, and a read-only backend refuses every mutating verb through the table.
     // Touches no disk except to read; its own uncounted `:: VFS-1: … ::` lines.
     crate::fs::vfs::vfs1_routing_witness();
+    u7stk!("after:vfs1_routing");
     // BANDY-1 M1: the bus v1 subset codec KATs — reply bodies proven byte-compatible with the
     // HOST serializer (tools/bandy-golden captures), native request header+payloads frozen,
     // decode fail-closed at the hard ceiling. Read-only, in-RAM (no disk, no card); its own
     // uncounted `:: BANDY-CODEC: … PASS ::` line. LAST in the chain.
     super::bus::bus_codec_selftest();
+    u7stk!("after:bus_codec");
     // BANDY-2 M1: the write-side codec KATs — write/rm/mv request goldens frozen, the typed WRITE
     // [name_len][name][content] payload + empty/at-ceiling content, decode fail-closed. A SIBLING
     // of BANDY-CODEC (the BANDY-1 goldens/witness stay byte-identical). Read-only, in-RAM; its own
     // uncounted `:: BANDY-CODEC2: … PASS ::` line.
     super::bus::bus_codec2_selftest();
+    u7stk!("after:bus_codec2");
     // BANDY-1 M5 (verdict C): the stamping witness — caller-supplied principal rejected, replies
     // stamped with the reserved kernel kind (fail-closed everywhere a grantee/owner can appear),
     // bounded per-ASID mailboxes, gen fence. Drives the PRODUCTION sys_msend_for path with
     // scratch identities; one read-only ls mount, no disk write. Its own uncounted
     // `:: BANDY-STAMP: … PASS ::` line.
     bandy_stamp_check();
+    u7stk!("after:bandy_stamp");
     // BANDY-2 lens-2 fix witness: bus write-TRUNCATE preserves grants (the direct twin mutates in
     // place and never touches the grant table — the bus must reach the same state). Drives the
     // production sys_msend_for path with scratch identities; creates + self-cleans GRNT.BIN. Its
     // own uncounted `:: BANDY-GRANT: … PASS ::` line.
     bandy_grant_check();
+    u7stk!("after:bandy_grant");
     // BANDY-1 M4/M5: the round-trip + equivalence witnesses through the REAL midden program
     // (program #3, Peter's E verdict) — ls/cat/cp parsed at EL0 into typed frames, kernel-
     // fulfilled under the stamped principal; denial equivalence (bus vs direct syscall,
     // byte-same errno) proven at EL0. Self-cleaning; its own uncounted `:: BANDY-RT: … ::`
     // + `:: BANDY-EQ: … ::` lines. LAST in the chain.
     bandy_rt_launcher(demo_cpu);
+    u7stk!("after:bandy_rt");
 }
 
 /// F2 M3 witness worker — the `demo_cpu` half of the cross-core FAT_MUTATION stress. `fn(usize)` for
@@ -15725,6 +15857,7 @@ fn f2_witness_worker_unlocked(iters: usize) {
 ///     zero loss is reported HONESTLY (QEMU's round-robin TCG did not interleave the RMWs — the true lost-update
 ///     race is metal-only, the R1-arc honest-scope pattern). The on-disk `set_fat_entry` RMW rides the bench.
 /// Emits ONE `F2-witness:` serial line (deliberately not a `-> PASS` line — keeps the 23-fixture count intact).
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn f2_witness_launcher(demo_cpu: usize) {
     const N: u32 = 120_000;
     let want = 2 * N;
@@ -15813,6 +15946,7 @@ fn f3_witness_worker_unlocked(iters: usize) {
 /// F3-M4 — the cross-core witness for the M3 NAMESPACE serialization (the `f2_witness_launcher` shape: this
 /// task on `vcpu`, a joinable worker on `demo_cpu` = online[0] so the join can never hang). Emits ONE
 /// `F3-witness:` line — deliberately NOT a `-> PASS` line, so the 23-fixture count stays byte-equivalent.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn f3_witness_launcher(demo_cpu: usize) {
     const N: u32 = 120_000;
     let want = 2 * N;
@@ -17189,6 +17323,7 @@ fn native_persist_rename(dir_lba: u64, dir_off: u32, new_name: &str) -> bool {
 /// enforce" machinery is gone. On QEMU (fresh-per-build FAT) both the sidecar and the native store are
 /// empty here, so ZERO rows install and the boot path stays byte-identical; the live effect is on metal.
 /// The MECHANISM is proven independently by the K6 witness + the K1/K2/K3/K5 launchers.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn atr_maybe_boot_rebuild() {
     if !by_name_spawn_multivalued() {
         return; // cross-reboot enforcement gated off (single-program world) -> no rebuild, no I/O
@@ -17280,6 +17415,7 @@ fn k1_atr_disk_roundtrip(fs: &crate::fs::fat::FatFs, fc: u32, size: u32, bind: &
 /// count stays byte-equivalent). ENFORCEMENT-INERT: never reads OWNED_FILES, never maps a record to
 /// (asid, gen), never persists a live owner. Runs LAST (after the F2/F3 witnesses) so its disk I/O can never
 /// perturb the battery or the witnesses.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn k1_atr_selftest() {
     // One-shot (u7_launcher's task calls this once; guard defensively — the u7_run DONE idiom).
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -17554,6 +17690,7 @@ fn k1_persist_check() -> u32 {
 /// 23 fixtures or the witnesses). Emits ONE `:: K1-persist: … PASS ::` line in the K1-atr `<noun> PASS` idiom —
 /// deliberately NOT a `-> PASS` / `: PASS` line, so arroyo's fixture PASS-counter leaves the count at 23 and only
 /// this one uncounted witness line is added (the 24th line; re-baseline the byte-diff on the OTHER 23).
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn k1_persist_launcher() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -17715,6 +17852,7 @@ fn k1_tear_persisted_row(fs: &crate::fs::fat::FatFs, dir_lba: u64, dir_off: u32)
 /// K1 M4 launcher + verdict — the fail-closed corrupt-attr proof, riding the U7 kernel task after
 /// k1_persist_launcher. Emits its own uncounted `:: K1-corrupt: … PASS ::` line (the K1-atr `<noun> PASS`
 /// idiom, never `-> PASS`/`: PASS`), so the fixture count stays 23.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn k1_corrupt_launcher() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -17879,6 +18017,7 @@ fn k3_revoke_check() -> u32 {
 /// K3 launcher + verdict — rides the U7 kernel task after the K2 launcher (its disk I/O can never perturb the 23
 /// fixtures or the witnesses). Emits ONE uncounted `:: K3-revoke: … PASS ::` line (the K1-atr `<noun> PASS` idiom,
 /// never `-> PASS`/`: PASS`), so the fixture PASS-count stays 23. Fully self-cleaning.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn k3_revoke_launcher() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -18031,6 +18170,7 @@ fn k9_parity_check() -> u32 {
 /// K9-PARITY launcher + verdict — rides the U7 kernel task after K3/K5 (its disk I/O can never perturb the
 /// counted fixtures). Emits ONE uncounted `:: K9-parity: … PASS ::` line (the K1-atr `<noun> PASS` idiom), so the
 /// fixture PASS-count is unchanged. Fully self-cleaning.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn k9_parity_launcher() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -18198,6 +18338,7 @@ fn k5_lockspan_check() -> u32 {
 /// K5 launcher + verdict — rides the U7 kernel task after the K3 launcher (its disk I/O can never perturb the 23
 /// fixtures or the witnesses). Emits ONE uncounted `:: K5-lockspan: … PASS ::` line (the K1-atr `<noun> PASS`
 /// idiom, never `-> PASS`/`: PASS`), so the fixture PASS-count stays 23. Fully self-cleaning.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn k5_lockspan_launcher() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -18225,6 +18366,7 @@ fn k5_lockspan_launcher() {
 /// card carries the two K2 programs (present in the QEMU FAT and on the metal card). Emits one UNCOUNTED line
 /// (PASS/FAIL space-flanked, never `-> PASS`/`: PASS`/`-> FAIL`/`FAIL ::`), so the 23-fixture count is
 /// byte-equivalent. Read-only — no disk write, no slot, no lock; cannot perturb the battery. Runs LAST.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn image_sig_selftest() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -18314,6 +18456,7 @@ fn image_sig_selftest() {
 // `:: K4-ready: … PASS [w=0x..] ::` line (never a `-> PASS`/`: PASS` fixture line, so the 23-PASS battery is
 // unchanged). Runs LAST in `u7_launcher`, after `fatdirs_launcher`.
 // =====================================================================================================
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn k4_ready_selftest() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -18473,6 +18616,7 @@ fn k6_principal_roundtrips(p: &PrincipalRecord) -> bool {
 }
 
 /// K6 migration + native-store witness. See the section header. Self-cleaning.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn k6_migrate_selftest() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -18727,6 +18871,7 @@ fn fatdirs_check() -> u32 {
 /// FATDIRS launcher + verdict — rides the U7 kernel task AFTER the K1/K2/K3/IMG-SIG selftests (its disk
 /// I/O can never perturb the 23 fixtures or the witnesses). Emits ONE uncounted `:: FATDIRS: … PASS ::`
 /// line (the K1-atr `<noun> PASS` idiom — NOT a `-> PASS` fixture line, so the count stays at 23).
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn fatdirs_launcher() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -18931,6 +19076,7 @@ fn fatmove_check() -> u32 {
 /// FATMOVE launcher + verdict — rides the U7 kernel task AFTER every prior storage selftest (its disk
 /// I/O can never perturb the 23 fixtures or the witnesses). Emits ONE uncounted `:: FATMOVE: … PASS ::`
 /// line (the k1-atr `<noun> PASS` idiom — NOT a `-> PASS` fixture line, so the count stays at 23).
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn fatmove_launcher() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -19012,6 +19158,7 @@ fn clock3_check() -> u32 {
 
 /// CLOCK-3 launcher + verdict — rides the U7 kernel task AFTER the FAT write selftests (its disk I/O can
 /// never perturb the fixtures or witnesses). Emits ONE uncounted `:: CLOCK3-fat: … PASS ::` line.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn clock3_fat_launcher() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -19153,6 +19300,7 @@ fn atr_row_first_cluster(fs: &crate::fs::fat::FatFs, dir_lba: u64, dir_off: u32)
 /// `FAIL ::`), so the 23-fixture PASS count stays byte-equivalent. (The `k2_leave` metal build replaces this
 /// same-boot proof with the two-boot `k2_metal_launcher`; see it + the u7_launcher call site.)
 #[cfg(not(feature = "k2_leave"))]
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn k2_liveenf_launcher(demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -19444,6 +19592,7 @@ fn k2_metal_verify(demo_cpu: usize) {
     }
 }
 
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn u7_run(demo_cpu: usize) {
     // 1. Gate on the U6b launcher (its verdict printed + its slot freed).
     let _ = wait_while_secs(10, || !U6B_LAUNCH_DONE.load(Ordering::Acquire));
@@ -19728,6 +19877,7 @@ fn u8_kernel_check() -> bool {
 /// + the derivation ledger drained — the tombstone-cascade proof); run the kernel-side cross-process checks
 /// (which need the clear ledgers); PASS iff witness == `U8_WITNESS_ALL` AND torn down AND no kill AND the
 /// kernel checks held. U8 is the last demo — it releases no further gate.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn u8_launcher(demo_cpu: usize) {
     // One-shot (the U7 launcher is spawned once; guard defensively anyway).
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -19882,6 +20032,7 @@ fn u9_check_revoked_write(fc: u32, sz: u32) -> bool {
 /// from the pre-image) + the directory size UNCHANGED (in-place, never grew), and the revoked-File-write denial.
 /// PASS iff witness == `U9_WITNESS_ALL` AND torn down AND no kill AND all kernel checks held. U9 is the last
 /// demo — it releases no further gate.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn u9_launcher(demo_cpu: usize) {
     // One-shot (the U7 launcher is spawned once; guard defensively anyway).
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -20052,6 +20203,7 @@ fn u10_fats_consistent(first_cluster: u32) -> bool {
 /// offset are on disk, the original first cluster is intact, and both FAT copies agree along the 2-cluster
 /// chain. PASS iff witness == `U10_WITNESS_ALL` AND torn down AND no kill AND all kernel checks held. U10 is the
 /// last demo — it releases no further gate.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn u10_launcher(demo_cpu: usize) {
     // One-shot (the U7 launcher is spawned once; guard defensively anyway).
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -20182,6 +20334,7 @@ fn u10c_build() -> Option<U7Fix> {
 /// `U10C_WRITTEN`, its content == the written pattern, a valid first cluster, and EXACTLY ONE such entry (the
 /// second O_CREAT opened, did not duplicate). PASS iff witness == `U10C_WITNESS_ALL` AND torn down AND no kill
 /// AND all kernel checks held. U10-create is the last demo — it releases no further gate.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn u10c_launcher(demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -20310,6 +20463,7 @@ fn u10d_build() -> Option<U7Fix> {
 /// DELME.BIN GONE, `f0`'s FAT entry is `0` in ALL copies (the chain was freed everywhere), and the first-free
 /// cluster is again `f0` (the freed cluster is re-allocatable). PASS iff witness == `U10D_WITNESS_ALL` AND torn
 /// down AND no kill AND all kernel checks held. U10-delete is the last demo — it releases no further gate.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn u10d_launcher(demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -20466,6 +20620,7 @@ fn u11_check_gen_rebind() -> bool {
 /// proof; then a fresh mount confirms A11.BIN is GONE (unlinked) and B11.BIN is PRESENT (created + never
 /// deleted). PASS iff witness == `U11_WITNESS_ALL` AND torn down AND no kill AND the gen-rebind proof + on-disk
 /// checks hold. Releases no further gate.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn u11_launcher(demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -20607,6 +20762,7 @@ fn u11defer_build(entry_sym: *const u8) -> Option<U7Fix> {
 /// long that park had to last. On PA41 both fixtures had parked out before their GOs, and the verdict line
 /// reported only the consequence — an empty `b_w` and a partial `a_w` — leaving the cause to be inferred from a
 /// bitmask. The launcher was holding the fact that names it; now it prints it, every boot, with the margins.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn u11defer_run(demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -20950,6 +21106,7 @@ fn u11defer_check_double_orphan() -> bool {
 /// U11-M2 (seat coalesce-review fix): launcher + PASS line for the slot-recycle two-orphan proof. Rides the U7
 /// kernel task after `u11defer_run`. Kernel-side only (no EL0 fixture — the proof is a deterministic table + FAT
 /// manipulation, the `u11_check_gen_rebind` style). Releases no further gate.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn u11reuse_run() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -21030,6 +21187,7 @@ fn u11reap_build(entry_sym: *const u8) -> Option<U7Fix> {
 /// the three checkpoints hold. Runtime-created file (no arroyo plant); needs a fresh image (DEFER2.BIN absent
 /// pre-demo). The last demo — releases no further gate. The M2a `"teardown … leaked"` line must NOT appear for
 /// DEFER2.BIN (the reaper freed it, not leaked it) — its ABSENCE is confirmed in the gate.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn u11reap_run(demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -21297,6 +21455,7 @@ fn uowner_build(entry_sym: *const u8) -> Option<U7Fix> {
 /// PASS iff both witnesses full AND all five cues fired AND both exited AND no kill AND both rows torn down AND
 /// OWNED.BIN is on disk (A never unlinked it; its owner row reverts to public at A's teardown). Runtime-created
 /// file (no arroyo plant); needs a fresh image (OWNED.BIN absent pre-demo). The last demo — releases no gate.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn uowner_run(demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -22268,6 +22427,7 @@ fn sys_mrecv(buf_ptr: u64, buf_len: u64) -> i64 {
 // PRODUCTION code path, no EL0 detour); in-RAM except two ls fulfillments (read-only mount).
 // -----------------------------------------------------------------------------------------------
 
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn bandy_stamp_check() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -22395,6 +22555,7 @@ fn bandy_build_write(name: &str, content: &[u8], corr: u32, buf: &mut [u8]) -> u
     super::bus::build_request(super::bus::BUS_VERB_WRITE, corr, &body[..1 + name.len() + content.len()], buf)
 }
 
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn bandy_grant_check() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -22641,6 +22802,7 @@ fn bandy_create_file(fs: &crate::fs::fat::FatFs, name: &str, content: &[u8]) -> 
     Some((lba, off as u32))
 }
 
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn bandy_rt_launcher(demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {

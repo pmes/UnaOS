@@ -731,11 +731,35 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // use is -EACCES. The launcher also proves the single-writer invariant kernel-side (the child's
             // row is byte-clear while the deposit sits in its inbox) and that teardown leaves no descriptor,
             // inbox slot, or transfer record behind. Fully QEMU-verifiable (cooperative SYS_YIELD polling).
-            unaos_kernel::arch::sched::spawn(
+            // U7STK (PARITY §6.1b) — this ONE task gets a RIGHT-SIZED kernel stack, not the blanket
+            // 16 KiB `sched::TASK_STACK_SIZE`, and the number is measured rather than chosen:
+            //
+            //   * QEMU raspi4b, `[u7stk]` high-water, AFTER the `#[inline(never)]` fix that took
+            //     `u7_launcher`'s own frame from 5696 B to 16 B:  peak hw = 12296 B (75% of 16 KiB).
+            //     BEFORE that fix the same probe read hw = 16384 B, headroom = 0 — the whole stack
+            //     touched, surviving by exactly zero bytes.
+            //   * Static worst case over the whole call graph reachable from `u7_launcher`:
+            //     26880 B before the fix, 14240 B after — i.e. 16 KiB was impossible before, and is
+            //     a 2144-byte squeeze after.
+            //   * METAL TAKES A PATH QEMU CANNOT. The Pi's USB-storage route adds
+            //     `xhci::bot_transfer -> bot_rescue_escalate -> run_bot_stage -> ... ->
+            //     fbcon::__print -> wm::composite`, a subtree measuring 5520 B on its own; QEMU
+            //     raspi4b models no xHCI and never takes it. 12296 + 5520 = 17816 > 16384, so 16 KiB
+            //     is NOT safe on hardware even with the frame fix — which is exactly the trap the
+            //     original defect set (three arcs gated green on the path metal does not take).
+            //
+            // 32 KiB is therefore the smallest power-of-two that clears the measured metal worst case
+            // with margin: 1.84x the static worst case, 2.66x the QEMU peak. The cost is 16 KiB of
+            // heap for ONE task; raising `TASK_STACK_SIZE` would have charged every kernel task in
+            // the system for this one task's cascade. `[u7stk]` rides the witness image, so the next
+            // arc that grows a launcher watches `headroom=` shrink on the gate instead of on metal.
+            const U7_LAUNCH_STACK_SIZE: usize = 32 * 1024;
+            unaos_kernel::arch::sched::spawn_stack(
                 "u7-launch",
                 unaos_kernel::arch::syscall::u7_launcher,
                 cpu,
                 vcpu,
+                U7_LAUNCH_STACK_SIZE,
             );
         }
     }

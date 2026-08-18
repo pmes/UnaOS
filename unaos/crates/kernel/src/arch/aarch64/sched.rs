@@ -40,6 +40,108 @@ use super::timer;
 /// Per-thread kernel stack. 16 KiB matches the x86 scheduler.
 const TASK_STACK_SIZE: usize = 16 * 1024;
 
+// =============================================================================================
+// U7STK — the kernel-stack HIGH-WATER instrument (PARITY §6.1b).
+//
+// WHY IT EXISTS. `u7-launch` (`main.rs`, entry `syscall::u7_launcher`) is dropped on Pi METAL
+// between `wcb_launcher` and `video::pidesk::arm()` by the SPIN-6 refusal below:
+//
+//   [spin6] cpu=2 REFUSING corrupt switch-in: task=70:u7-launch ctx_sp=0x20c9e70
+//   outside its stack [0x20ca000,0x20ce000) — the parked frame was OVERWRITTEN
+//
+// `ctx_sp` sits 144..928 bytes BELOW the task's own 16 KiB low bound, varying per boot: that is
+// this task's OWN frame chain running off the bottom of its stack, not a neighbour writing into
+// it. SPIN-6 sees the damage one dispatch later and can only name it; nothing in the tree could
+// say HOW DEEP the chain actually goes, so the fix would have been a guess.
+//
+// HOW IT MEASURES. `spawn_inner` PAINTS every fresh kernel stack with [`STACK_POISON`]; a
+// checkpoint calls [`stk_probe`], which reads the live SP and scans up from the stack's low end
+// for the first byte the task has ever touched. The scan is a HIGH-WATER over the task's whole
+// life, so a probe placed after a call reports the deepest point that call reached even though
+// the call has already returned — which is exactly what convicts one launcher out of forty-seven
+// without instrumenting any of their interiors.
+//
+// SCOPE. Only `spawn_inner` (KERNEL tasks) paints. The EL0 spawn paths are deliberately left
+// alone — they are not what overflowed, and `stk_probe` on an unpainted stack would report the
+// allocator's zero fill as touched depth. Call the probe from kernel tasks only.
+//
+// COST. Painting is one `fill` of the task's stack per spawn; a probe is one byte scan of the
+// same span plus one serial line. Both are `witness`-gated, so the plain `./arroyo kernel8` media
+// build carries neither, while the `kernel8-test` battery and the metal witness image carry the
+// instrument unconditionally — the conviction target is metal, and an instrument you have to
+// re-arm is one that will not be armed on the boot that matters. (The `#[inline(never)]` FIX in
+// `syscall.rs` is a separate matter and is NOT gated: see the U7STK block there.)
+/// The paint byte. Value is arbitrary but must not be a plausible zeroed-frame word (0x00) or a
+/// plausible pointer byte, so a partially-overwritten frame cannot read as untouched.
+#[cfg(feature = "witness")]
+pub const STACK_POISON: u8 = 0xAB;
+
+/// Kernel-stack high-water probe. Prints one raw-word `[u7stk]` line for the CURRENT task:
+///   `at=` checkpoint name · `sp=` live stack pointer · `low=`/`top=` the task's own bounds ·
+///   `used=` top-sp at this instant · `hw=` the high-water (deepest point EVER reached) ·
+///   `headroom=` len-hw, i.e. what is left before SPIN-6 fires. `headroom` goes NEGATIVE once the
+///   chain has already run off the bottom (printed signed for exactly that reason).
+///
+/// Safe to call from any kernel task; a no-op outside a scheduled task (no `current`).
+#[cfg(feature = "witness")]
+pub fn stk_probe(at: &str) {
+    let sp: u64;
+    unsafe {
+        core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
+    if raw.is_null() {
+        return;
+    }
+    // Read the bounds out of the live Task. This is the task running on THIS core, so nothing can
+    // free the Box underneath us; the fields are read, never written.
+    let task = unsafe { &*raw };
+    let base = task.stack.as_ptr() as u64;
+    let len = task.stack.len() as u64;
+    let top = base + len;
+    // High-water: the first byte from the LOW end that is no longer poison.
+    //
+    // Scanned a WORD at a time, then refined to byte granularity inside the one boundary word. The
+    // stack base is 16-byte aligned (see `build_initial_frame`) and the length is a whole number of
+    // words, so the word loop is always in bounds and every read is aligned. This matters more than
+    // it looks: the UNTOUCHED span is most of the stack and is what gets scanned, so a byte loop
+    // costs ~8x more — and under TCG emulation these probes are the one thing the instrument can
+    // perturb in the timing-sensitive armed battery. Volatile so the scan is not hoisted or
+    // vectorised past the first difference.
+    const POISON_WORD: u64 = u64::from_ne_bytes([STACK_POISON; 8]);
+    let mut untouched;
+    unsafe {
+        let w = base as *const u64;
+        let words = len / 8;
+        let mut i = 0u64;
+        while i < words && core::ptr::read_volatile(w.add(i as usize)) == POISON_WORD {
+            i += 1;
+        }
+        untouched = i * 8;
+        // The boundary word is only partly poison; walk its bytes so the reading stays exact.
+        let p = base as *const u8;
+        while untouched < len && core::ptr::read_volatile(p.add(untouched as usize)) == STACK_POISON {
+            untouched += 1;
+        }
+    }
+    let hw = len - untouched;
+    let used = top as i64 - sp as i64;
+    serial_println!(
+        "[u7stk] at={} task={}:{} sp={:#x} low={:#x} top={:#x} len={} used={} hw={} headroom={}",
+        at,
+        task.id,
+        task.name,
+        sp,
+        base,
+        top,
+        len,
+        used,
+        hw,
+        len as i64 - hw as i64
+    );
+}
+
 /// Timer ticks a task runs before preemption (~4 ms/tick × 3 = 12 ms quantum).
 const QUANTUM_TICKS: u32 = 3;
 
@@ -2916,10 +3018,15 @@ fn spawn_inner(
     requested_cpu: usize,
     priority: u8,
     done_sem: Option<Arc<Semaphore>>,
+    stack_bytes: usize,
 ) -> u64 {
     let cpu = pick_cpu(requested_cpu);
     assert!(cpu < NUM_CPUS, "spawn: cpu out of range");
-    let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
+    let mut stack: Box<[u8]> = alloc::vec![0u8; stack_bytes].into_boxed_slice();
+    // U7STK: paint before the initial frame is laid down, so `stk_probe`'s low-end scan measures
+    // real touched depth rather than the allocator's zero fill. Witness-gated (see STACK_POISON).
+    #[cfg(feature = "witness")]
+    stack.fill(STACK_POISON);
     let ctx_sp = build_initial_frame(&mut stack, task_trampoline);
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
     let task = Box::new(Task {
@@ -2974,14 +3081,31 @@ fn spawn_inner(
 /// round-robin): it runs `entry(arg)` and is freed when `entry` returns, with no way to wait for it
 /// (use `spawn_joinable` for that). Returns the task id. Use `spawn_prio` to pick a level.
 pub fn spawn(name: &'static str, entry: fn(usize), arg: usize, cpu: usize) -> u64 {
-    spawn_inner(name, entry, arg, cpu, PRIO_NORMAL, None)
+    spawn_inner(name, entry, arg, cpu, PRIO_NORMAL, None, TASK_STACK_SIZE)
+}
+
+/// U7STK — like `spawn`, but with a caller-sized kernel stack instead of the blanket
+/// [`TASK_STACK_SIZE`]. For the ONE task whose measured high-water does not fit 16 KiB: the fixture
+/// cascade's `u7-launch`, whose entry (`syscall::u7_launcher`) is a straight-line chain of ~47
+/// launcher calls and therefore reaches whichever of them is deepest. Sizing a single task is the
+/// honest fix; raising `TASK_STACK_SIZE` would pay for every kernel task in the system to cover one.
+///
+/// The size MUST come with its measurement — see the spawn site in `main.rs`.
+pub fn spawn_stack(
+    name: &'static str,
+    entry: fn(usize),
+    arg: usize,
+    cpu: usize,
+    stack_bytes: usize,
+) -> u64 {
+    spawn_inner(name, entry, arg, cpu, PRIO_NORMAL, None, stack_bytes)
 }
 
 /// Like `spawn`, but at an explicit scheduling `priority` (`0..NUM_PRIORITIES`; higher = more urgent,
 /// clamped in range). The CPU always runs a ready task of the highest non-empty level; a lower task
 /// is protected from indefinite starvation by aging (see `AGE_TICKS`). Returns the task id.
 pub fn spawn_prio(name: &'static str, entry: fn(usize), arg: usize, cpu: usize, priority: u8) -> u64 {
-    spawn_inner(name, entry, arg, cpu, priority, None)
+    spawn_inner(name, entry, arg, cpu, priority, None, TASK_STACK_SIZE)
 }
 
 /// SCHED-3: like `spawn`, but LOAD-BALANCED — the scheduler places the task on the least-loaded online
@@ -2989,7 +3113,7 @@ pub fn spawn_prio(name: &'static str, entry: fn(usize), arg: usize, cpu: usize, 
 /// have no core affinity; use `spawn` (explicit `cpu`) when a task MUST run on a specific core (e.g. the
 /// single-core render loop). Equivalent to `spawn(.., CPU_AUTO)`. Returns the task id.
 pub fn spawn_auto(name: &'static str, entry: fn(usize), arg: usize) -> u64 {
-    spawn_inner(name, entry, arg, CPU_AUTO, PRIO_NORMAL, None)
+    spawn_inner(name, entry, arg, CPU_AUTO, PRIO_NORMAL, None, TASK_STACK_SIZE)
 }
 
 /// Create a ready EL0 (user-mode) task on `cpu`'s run queue (M6a): when dispatched it drops to EL0 at
@@ -3235,7 +3359,7 @@ pub fn other_online_cpu(not: usize) -> usize {
 pub fn spawn_joinable(name: &'static str, entry: fn(usize), arg: usize, cpu: usize) -> JoinHandle {
     let done = Arc::new(Semaphore::new(0));
     done.init(); // reserve the waiter list BEFORE the task can run + post (alloc-free park)
-    let id = spawn_inner(name, entry, arg, cpu, PRIO_NORMAL, Some(done.clone()));
+    let id = spawn_inner(name, entry, arg, cpu, PRIO_NORMAL, Some(done.clone()), TASK_STACK_SIZE);
     JoinHandle { done, id }
 }
 

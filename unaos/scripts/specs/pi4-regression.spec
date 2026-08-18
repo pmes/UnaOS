@@ -1408,6 +1408,38 @@ REQUIRE \[spinhunt\] load orphan-window\(leader gone\)
 REQUIRE \[spinhunt\] load settled
 REQUIRE SPINHUNT: leader exited status=0 with 2 un-joined yield-polling workers .* drained to 0 live tasks PASS
 FORBID SPINHUNT: .*-> FAIL
+
+# --- U7STK / SPIN-6 — a boot that LOSES A KERNEL TASK mid-cascade must red the gate ------------
+# ---    THE HOLE THIS CLOSES (PARITY §6.1b, DESKREAL b01feaa1). `dispatch_next` validates a task's
+# ---    parked SP against that task's own stack bounds and REFUSES a switch-in whose frame landed
+# ---    outside them, dropping the task and dispatching on. That refusal is a hard defect — a
+# ---    kernel task has ceased to exist and everything downstream of it silently never runs — but
+# ---    it was invisible to this spec: the line carries no `FAIL`, so no default FORBID caught it,
+# ---    and every witness the dropped task would have printed is ABSENCE-shaped, which this grammar
+# ---    cannot convict. Three Pi arcs gated GREEN on captures in which `u7-launch` died between
+# ---    `wcb_launcher` and `video::pidesk::arm()`, i.e. on QEMU runs of a path metal never took, and
+# ---    the missing PASS lines were read as "not armed on this build" rather than "the task is gone".
+# ---    The wire, from ~/unaos-bench/capture/pi4-pi1-b1/ttyACM0.log:
+# ---
+# ---      [spin6] cpu=2 REFUSING corrupt switch-in: task=70:u7-launch ctx_sp=0x20c9e70
+# ---      outside its stack [0x20ca000,0x20ce000) — the parked frame was OVERWRITTEN
+# ---      (neighboring stack overflow?). Task dropped; core keeps dispatching
+# ---
+# ---    WHY THE PATTERN IS BRACKET-FREE. `[spin6]` written literally is a CHARACTER CLASS matching
+# ---    one of `6insp` — a directive that would fire on almost any line. The escaped form
+# ---    (`\[spin6\]`) is used elsewhere in this file and is correct, but the distinctive half of
+# ---    this message needs no bracket at all: `REFUSING corrupt switch-in: task=` occurs on exactly
+# ---    one line in the tree (`arch/aarch64/sched.rs`, the SPIN-6 block in `dispatch_next`) and
+# ---    nowhere else, so the shortest safe pattern is also the sharpest one.
+# ---    FORBID and not REQUIRE-of-the-negation, deliberately: a healthy boot prints this line ZERO
+# ---    times, so there is nothing to REQUIRE. It costs nothing at 0 hits, and it reds ANY boot that
+# ---    drops ANY task — this is not scoped to `u7-launch`, because losing any kernel task to a
+# ---    corrupt parked frame is the same defect wearing a different name.
+# ---    GO-RED, per this repo's discipline: replaying the green kernel8-test capture with the
+# ---    verbatim metal line above spliced in reds the suite (FORBID hit, exit 1). See the landing
+# ---    report. This directive adds NO REQUIRE, so the witness floor is unchanged at 117.
+FORBID REFUSING corrupt switch-in: task=
+
 # --- BG-SPREAD: `bg` parents must be PLACED by load, not stacked on the launcher's core.
 # ---
 # ---    P62 (attended): four bg vugs, each visibly slower than the last, while the `SCHED: load` row

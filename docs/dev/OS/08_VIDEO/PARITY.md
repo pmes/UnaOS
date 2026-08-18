@@ -498,6 +498,152 @@ is `[wc-h] AT-RISK` alone — 284 raw AT-RISK lines on the baseline against 265 
 arc's side is if anything the quieter one. A quiet-host re-run is still owed before any bench-geometry
 number here is read as a verdict.
 
+### 6.1b U7STK — the overflow that kept the desktop off metal, measured and fixed
+
+**Status: the mechanism is CLOSED in the tree; the metal verdict belongs to the next boot.**
+
+*(Integrator note: the FINDING half of this section was written by `exec-deskreal` `b01feaa1`, which
+branched from the same base. If both arcs land, fold the two — this section carries the measurement
+and the fix, that one carries the bench evidence that motivated them. Nothing outside the heading
+overlaps.)*
+
+**THE FINDING (exec-deskreal `b01feaa1`, off three metal boots + the PA44 capture
+`~/unaos-bench/capture/pi4-pi1-b1/ttyACM0.log`).** `video::pidesk::arm()` — the only writer of
+`ARMED`, and hence the gate on the shell-window mint, on `pal.clear_screen(DESKTOP_BG)` and on
+`retire_desktop_chrome` — has never executed on Pi hardware. It sits one statement after
+`wcb_launcher` inside `u7_launcher`, on the `u7-launch` task, and on metal the task is killed
+between the two statements:
+
+```
+:: EL0: window verbs — … :: PASS ::
+[spin6] cpu=2 REFUSING corrupt switch-in: task=70:u7-launch ctx_sp=0x20c9e70
+outside its stack [0x20ca000,0x20ce000) — the parked frame was OVERWRITTEN
+(neighboring stack overflow?). Task dropped; core keeps dispatching
+```
+
+`ctx_sp` lands 144–928 bytes *below* the task's own 16 KiB low bound, varying per boot — the
+launcher's own frame chain, not a neighbour. Everything after that statement (the desktop, BGRUN,
+FATDIRS, FATMOVE) is dead on metal.
+
+**WHAT WAS MISSING WAS A NUMBER.** SPIN-6 can say a frame ended up outside its stack; nothing in the
+tree could say how deep the chain actually goes, so any fix would have been a guess. This arc adds
+the instrument first and reads it.
+
+**THE INSTRUMENT (`[u7stk]`).** `sched::spawn_inner` paints every fresh kernel stack with
+`STACK_POISON` (0xAB); `sched::stk_probe` reads the live SP and scans up from the stack's low end
+for the first byte the task has ever touched. The reading is a **high-water over the task's whole
+life**, which is what lets one probe placed *after* a call report how deep that call went — so
+forty-seven checkpoints through `u7_launcher` convict one launcher without instrumenting any of
+their interiors. Both halves are `witness`-gated, so they ride the `kernel8-test` battery and the
+metal witness image unconditionally (an instrument you must re-arm is one that will not be armed on
+the boot that matters), while a plain `./arroyo kernel8` media build carries neither.
+
+**THE MEASUREMENT (QEMU raspi4b, armed, 16 KiB stack, before the fix):**
+
+```
+[u7stk] at=entry            task=69:u7-launch len=16384 used=5952 hw=5952  headroom=10432
+[u7stk] at=after:k1_persist task=69:u7-launch len=16384 used=5952 hw=13064 headroom=3320
+[u7stk] at=after:exec1      task=69:u7-launch len=16384 used=5952 hw=14984 headroom=1400
+[u7stk] at=after:wcb        task=69:u7-launch len=16384 used=5952 hw=16384 headroom=0
+```
+
+Two facts, and the first is the convict.
+
+1. **`u7_launcher`'s own frame is 5952 bytes** — 36% of the task's entire stack, spent before it has
+   called anything. Statically the prologue is `stp x29,x30,[sp,#-0x60]! ; sub sp,sp,#0x1,lsl #12 ;
+   sub sp,sp,#0x5e0` = **5696 bytes**, the second-largest stack frame in the whole kernel image
+   (only `video::wm::composite` at 6640 exceeds it). The function declares no locals of its own:
+   **38 of its ~47 callees live in the same module and were inlined into it**, so all of their local
+   buffers are slots in one frame — a frame that stays live for the entire cascade, including while
+   a non-inlined callee runs twelve kilobytes deep beneath it.
+2. **`headroom` reaches 0 at `after:wcb`** — every byte of the 16 KiB touched. QEMU survives by
+   exactly zero bytes. Metal does not, and the reason is visible in the same disassembly: the metal
+   storage path adds `xhci::bot_transfer → bot_rescue_escalate → run_bot_stage → … →
+   fbcon::__print → wm::composite` under the same chain, a subtree measuring **5520 bytes on its
+   own**, and QEMU raspi4b models no xHCI so it never takes it. That is the whole "QEMU-green,
+   metal-dead" asymmetry of this defect, stated in bytes.
+
+**THE FIX, PART 1 — the convicted frame.** `#[inline(never)]` on exactly those 38 launchers (all in
+`arch/aarch64/syscall.rs`; each carries a one-line note). Their locals return to their own frames,
+live only while that launcher runs, so the peak becomes `u7_launcher`'s residual frame plus the
+deepest *single* launcher rather than the sum of all of them. The cost is one `bl` per fixture on a
+path that already does disk I/O. It is **unconditional, not witness-gated**, because the defect is
+not: a knob-off media image overflows exactly as readily as a witness one — so knob-off codegen
+moves with this arc, deliberately, and the battery is what proves the move behaviour-neutral. A
+blanket `TASK_STACK_SIZE` increase was rejected as the *primary* fix: it would charge every kernel
+task in the system for one task's frame, and it would leave the 5.7 KiB frame in place to be
+re-discovered later. Measured effect:
+
+| | before | after |
+|---|---|---|
+| `u7_launcher` own frame (static) | 5696 B | **16 B** |
+| `u7_launcher` own frame (`at=entry`, measured) | 5952 B | **272 B** |
+| peak high-water (QEMU, whole cascade) | 16384 B — `headroom=0` | **12296 B — `headroom=4088`** |
+| static worst case over the reachable call graph | 26880 B | **14240 B** |
+
+**THE FIX, PART 2 — the right-sized stack, and why it is still needed.** Part 1 leaves the static
+worst case at 14240 B inside a 16384 B stack: a 2144-byte squeeze. That is not enough, and the
+reason is the same asymmetry that hid the defect for three arcs — the metal-only
+`xhci → fbcon::__print → wm::composite` subtree is 5520 B, and 12296 + 5520 = 17816 > 16384. Sizing
+the fix to the QEMU number would be repeating the original mistake with a smaller margin. So
+`u7-launch` alone is spawned through a new `sched::spawn_stack` with
+`U7_LAUNCH_STACK_SIZE = 32 KiB` (`main.rs`, the constant carrying the four measurements above in
+its comment) — 1.84× the static worst case, 2.66× the QEMU peak, at a cost of 16 KiB of heap for
+one task. `TASK_STACK_SIZE` is untouched, so every other kernel task is unaffected.
+
+**THE GATE HOLE, CLOSED.** The SPIN-6 refusal carries no `FAIL`, so no default FORBID caught it, and
+every witness the dropped task would have printed is absence-shaped, which the mbench grammar cannot
+convict. Three Pi arcs therefore gated green on captures in which a kernel task had ceased to exist.
+`scripts/specs/pi4-regression.spec` now carries `FORBID REFUSING corrupt switch-in: task=` — written
+bracket-free because a literal `[spin6]` is a character class matching one of `6insp`, and because
+the distinctive half of the message needs no bracket at all. It is deliberately **not** scoped to
+`u7-launch`: losing any kernel task to a corrupt parked frame is the same defect wearing a different
+name. It adds no REQUIRE, so the witness floor is unchanged at 117.
+
+Proven able to fire, per this repo's go-red discipline, against the arc's own green capture:
+
+```
+control  (unmodified)                 ✅ MBENCH PASS — 117/117, 0 forbidden hit(s)   rc=0
++ the verbatim metal line spliced in  ❌ MBENCH FAIL — 117/117, 1 forbidden hit(s)   rc=1
+                                         FORBID hit @ line 693: [spin6] cpu=2 REFUSING corrupt
+                                         switch-in: task=70:u7-launch ctx_sp=0x20c9e70 …
+```
+
+One line is the entire difference between the two runs, and it is the difference between pass and
+fail — which is exactly the property the old spec did not have.
+
+**⚠ FLAGGED FOR THE INTEGRATOR — this arc trips a `[wc-h]` FORBID it does not regress.** The
+knob-off battery is clean (117/117, 0 forbidden). The **armed** battery
+(`UNAOS_PIDESK=1 UNAOS_FBW=1920 UNAOS_FBH=1200`) was already red before this arc and is still red
+after, but the shape changed, and the reason is worth writing down rather than leaving the next
+reader to rediscover it:
+
+| capture | `[wc-h] rollup` lines | raw `-> AT-RISK` | matches `presspread=[0-9] .*-> AT-RISK` |
+|---|---|---|---|
+| pre-fix (this arc's instrument, 16 KiB stack) | 292 | 282 | **7** |
+| post-fix run 1 | 292 | 280 | **109** |
+| post-fix run 2 | 292 | 199 | **117** |
+
+The FORBID's `presspread=[0-9] ` carries a trailing space, so it convicts the **single-digit** spread
+class only — deliberately, per the WCH-SPREAD block above: `presspread=0` means "no present recorded
+at all", and the single-digit class is convicted alongside it so the unmeasured case fails safe. The
+rollup count is identical (292) and the raw AT-RISK rate is flat-to-better (282 → 280 → 199). What
+moved is the *distribution*: `presspread` on AT-RISK lines went from mostly 10/29/34/45 before to
+mostly 3/6/11/12 after. A **lower** spread is a more consistent compositor — and it is precisely that
+improvement which drops those lines into the class this FORBID convicts.
+
+So the arc's effect is neutral-to-positive on every raw counter, and the 100-hit jump is a bucket
+change rather than a regression. Reproduced twice, on a host at load ~12 with 5–7 concurrent QEMU
+instances, so it is not a one-off. **Not fixed here, deliberately:** `wc-h` is `wm.rs`'s lane and
+belongs to another executor, and the only way to green it from this side would be to widen the
+FORBID — the one thing this spec says a witness must never do. Left for whoever owns WCH-SPREAD,
+with the raw counters above as the evidence that the underlying signal did not move.
+
+**WHAT THIS ARC DOES NOT CLAIM.** Whether the desktop finally arms on hardware is the next bench
+boot's verdict, not this one's. What is established here is that the arming statement is now reached
+with headroom to spare in QEMU, that the reason it was not is measured rather than inferred, and
+that a future boot which loses a kernel task mid-cascade reds the gate instead of passing quietly.
+
 ### 6.6 THE VUG UPGRADE — the real answer to "where is the upgraded vug"
 
 **This is the replacement for the pacer work, and it is where Peter's direction actually points.** The
