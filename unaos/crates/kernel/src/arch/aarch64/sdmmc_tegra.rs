@@ -106,6 +106,13 @@ pub use metal::sdmmc_census;
 #[cfg(all(feature = "tegra", feature = "install_target"))]
 pub use metal::sdmmc_install_from_usb;
 
+// TEGRA-SDBLK (orin-unafs-root.md §3 item 1): the READ surface `drivers::block` consumes once the census
+// has published the card as a block backend. Three functions, no more: the card's sector count, one
+// single-sector read, and its counted loop. Nothing here can write — the write path stays exclusively
+// behind the `sdmmc_arm` ladder further down this file, untouched by this seam.
+#[cfg(feature = "tegra")]
+pub use metal::{tegra_sd_card_blocks, tegra_sd_read_block_512, tegra_sd_read_blocks_512};
+
 #[cfg(feature = "tegra")]
 mod metal {
     use super::PS;
@@ -567,6 +574,178 @@ mod metal {
             return "FAT boot sector (jump + FAT type string; no 0x55AA)";
         }
         "unknown (no recognised signature)"
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════════════
+    // TEGRA-SDBLK — the READ surface the block layer consumes (orin-unafs-root.md §3 item 1)
+    //
+    // Until this section the recon was a closed loop: it identified the card, read sector 0, printed what
+    // it saw, and told nobody. `drivers::block` could not reach the card at all — every SD arm in it is
+    // `cfg(all(target_arch = "aarch64", feature = "baremetal"))`, i.e. the Pi's emmc2 — so on the Orin
+    // `block::read_block` has always meant the USB stick and nothing else, and `unafs`'s
+    // `SdSectorDevice::open()` could only answer `NoStorage`. This section is the seam that ends that,
+    // and it is deliberately the SMALLEST one that can: a latched identity, a sector count, and a read.
+    //
+    // ### READ ONLY, and structurally so
+    // Nothing below issues anything but CMD17. The write path (CMD24/CMD25) exists in this file only
+    // behind the `sdmmc_arm` ladder and the `install_target` gate above it, and this section neither
+    // calls into that ladder nor is callable from it. The block layer's own `write_*_tegra_sd` entry
+    // points REFUSE unconditionally, in every cfg — so publishing the card as a block backend cannot,
+    // by construction, add a writer to the Orin's card.
+    //
+    // ### Why a private CMD17 here instead of reusing `read_block_at`
+    // `read_block_at` (the generalised single-block read) lives INSIDE the `sdmmc_arm` region and is
+    // gated on it, because rung 2 deliberately kept the rung-1 read path untouched. Un-gating it would
+    // edit the armed ladder for the convenience of an unarmed consumer, which is exactly the direction
+    // that section's law forbids. `read_block_ro` below is therefore its unarmed twin: same command,
+    // same bounded waits, same W1C discipline, reached only from this section. The duplication is the
+    // price of leaving the ladder alone, and it is named rather than hidden.
+
+    /// The published card identity — everything a sector read needs, as plain Copy data so it does not
+    /// depend on `Card`'s `install_target`-gated derives. `None` until the census publishes (see
+    /// `publish_block_backend`), which it only does after M1/M2/M3 have all succeeded.
+    #[derive(Clone, Copy)]
+    struct SdBlk {
+        base: u64,
+        block_addressing: bool,
+        num_blocks: u64,
+    }
+
+    /// The one published card. The lock is held ACROSS each transfer, not merely to snapshot the
+    /// identity: the SDHCI register file is a single shared resource, so two overlapping readers would
+    /// interleave BLKSIZECNT/CMDTM/INTERRUPT writes on the same controller. Serialising here means the
+    /// block layer above needs no rule of its own. Nothing in this file locks it re-entrantly.
+    static SD_BLK: spin::Mutex<Option<SdBlk>> = spin::Mutex::new(None);
+
+    /// Read one arbitrary block `lba` via polled single-block CMD17 into `buf` (512 bytes). READ-ONLY —
+    /// the only card command it can issue is CMD17. Returns whether the block was read. The unarmed twin
+    /// of `read_block_at` (see the section header for why it is not that function).
+    fn read_block_ro(base: u64, block_addressing: bool, lba: u64, buf: &mut [u8; 512]) -> bool {
+        // SDSC (byte addressing) can only express a 32-bit byte offset, so it tops out at 4 GiB; the
+        // multiply is checked rather than wrapped, and an out-of-range LBA is a refusal, not a read of
+        // some other sector.
+        let arg = if block_addressing {
+            if lba > u32::MAX as u64 {
+                return false;
+            }
+            lba as u32
+        } else {
+            match lba.checked_mul(512) {
+                Some(b) if b <= u32::MAX as u64 => b as u32,
+                _ => return false,
+            }
+        };
+
+        write32(base, INTERRUPT, 0xffff_ffff);
+        write32(base, BLKSIZECNT, (1 << 16) | 512); // one block, 512 bytes
+        if send_command(
+            base,
+            cmd(17) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK | CMD_ISDATA | CMD_DAT_DIR_READ,
+            arg,
+        )
+        .is_err()
+        {
+            serial_println!("{}   SDBLK: CMD17 (READ LBA {}) failed at the link layer ::", PS, lba);
+            return false;
+        }
+        let r1 = read32(base, RESP0);
+        if r1 & R1_ERROR_MASK != 0 {
+            serial_println!("{}   SDBLK: CMD17 LBA {} R1 error status {:#010x} ::", PS, lba, r1);
+            return false;
+        }
+        if !wait_set(base, INTERRUPT, INT_READ_RDY, DATA_TIMEOUT_MS) {
+            serial_println!("{}   SDBLK: LBA {} read buffer never became ready (READ_RDY timeout) ::", PS, lba);
+            return false;
+        }
+        write32(base, INTERRUPT, INT_READ_RDY); // W1C
+        for i in 0..128usize {
+            let word = read32(base, DATA);
+            let off = i * 4;
+            buf[off..off + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        if !wait_set(base, INTERRUPT, INT_DATA_DONE | INT_ERR_ANY, DATA_TIMEOUT_MS) {
+            serial_println!("{}   SDBLK: LBA {} transfer-complete timeout after buffer read ::", PS, lba);
+            return false;
+        }
+        let int = read32(base, INTERRUPT);
+        write32(base, INTERRUPT, int); // W1C everything we saw
+        if int & INT_ERR_ANY != 0 {
+            serial_println!("{}   SDBLK: LBA {} data-transfer error status {:#010x} ::", PS, lba, int);
+            return false;
+        }
+        true
+    }
+
+    /// The card's sector count as published to the block layer, or 0 if no card was published this boot.
+    /// 0 is the honest "there is nothing here" answer — the block layer refuses to register a zero-sector
+    /// device, and `unafs`'s size preference reads this the same way.
+    pub fn tegra_sd_card_blocks() -> u64 {
+        SD_BLK.lock().map(|c| c.num_blocks).unwrap_or(0)
+    }
+
+    /// Read one 512-byte sector into `buf` — the primitive `drivers::block::read_block_tegra_sd` calls.
+    /// Bounds are re-checked HERE against the card's own capacity as well as at the block layer, because
+    /// this function is what actually names an LBA to the card and must not depend on a caller's care.
+    pub fn tegra_sd_read_block_512(lba: u64, buf: &mut [u8]) -> Result<usize, crate::drivers::block::BlockError> {
+        use crate::drivers::block::BlockError;
+        if buf.len() < 512 {
+            return Err(BlockError::Io);
+        }
+        let guard = SD_BLK.lock();
+        let card = guard.ok_or(BlockError::NotReady)?;
+        if lba >= card.num_blocks {
+            return Err(BlockError::BadLba);
+        }
+        let mut sec = [0u8; 512];
+        if !read_block_ro(card.base, card.block_addressing, lba, &mut sec) {
+            return Err(BlockError::Io);
+        }
+        buf[..512].copy_from_slice(&sec);
+        Ok(512)
+    }
+
+    /// Read `count` consecutive sectors. This rung has no unarmed multi-block (CMD18) primitive — the
+    /// counted read in this file is `install_target`-gated — so it LOOPS the proven CMD17, producing
+    /// byte-for-byte the card traffic a per-sector caller would, in the same order. A CMD18 path can
+    /// replace the body later with no change above the seam. A short read is an error, never a silent
+    /// prefix: the one failure mode a filesystem above has no way to notice.
+    pub fn tegra_sd_read_blocks_512(
+        lba: u64,
+        count: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, crate::drivers::block::BlockError> {
+        use crate::drivers::block::BlockError;
+        if buf.len() < count * 512 {
+            return Err(BlockError::Io);
+        }
+        for i in 0..count {
+            let off = i * 512;
+            tegra_sd_read_block_512(lba + i as u64, &mut buf[off..off + 512])?;
+        }
+        Ok(count * 512)
+    }
+
+    /// Publish the censused card to `drivers::block` as its own handle-less backend slot, and latch the
+    /// identity the read functions above use.
+    ///
+    /// Called from exactly one place — the END of `sdmmc_census`, after M1 (window mapped, live SDHCI),
+    /// M2 (card identified: CID/CSD/RCA, capacity decoded) and M3 (sector 0 actually read) have ALL
+    /// succeeded. That ordering is the whole trust argument, and it is the same one SDHC-4b makes on
+    /// x86: registration is the statement "a filesystem may trust this device", so it is only ever made
+    /// about a card whose read path this boot has already exercised and reported on. Card-detect is not
+    /// guessed at here — `identify` refuses an absent card, and M3 refuses one that cannot serve a read,
+    /// so reaching this line IS the card-present proof.
+    fn publish_block_backend(base: u64, card: &Card) {
+        *SD_BLK.lock() = Some(SdBlk {
+            base,
+            block_addressing: card.block_addressing,
+            num_blocks: card.num_blocks,
+        });
+        if !crate::drivers::block::register_tegra_sd(card.num_blocks, card.block_addressing) {
+            // The block layer refused (zero sectors). Retract the latch rather than leave a read surface
+            // pointing at a device the registry does not admit exists.
+            *SD_BLK.lock() = None;
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════════════════════════════════
@@ -1748,6 +1927,12 @@ mod metal {
             "{} ORIN-SDMMC-1 DONE — microSD censused: {} blocks ({} MiB, CSD v{}), sector-0 {} (READ-ONLY; no card write) ::",
             PS, card.num_blocks, card.num_blocks * 512 / (1024 * 1024), card.csd_version, class
         );
+
+        // ── TEGRA-SDBLK: the card is now a block backend. LAST thing after every read witness (M1/M2/M3
+        //    all passed above), and BEFORE the armed ladder / installer below — those two restore or
+        //    rewrite CONTENT, never capacity, so the geometry published here is theirs as well, and a
+        //    publish that waited for them would be a publish that never happened on an unarmed build. ──
+        publish_block_backend(base, &card);
 
         // ── ORIN-SDMMC-2: the paranoia write ladder (only with UNAOS_SDMMC_ARM=1; compiled out otherwise, so
         //    a plain UNAOS_SDMMC=1 build ends exactly here, byte-identical to the merged recon). ──
