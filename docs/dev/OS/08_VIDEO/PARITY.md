@@ -78,14 +78,14 @@ is an attribute gate.
 |---|---|---|---|
 | `wm.rs` ×13 | **WPACE-PANEL present pacer** — `PACE_FRAME_US`, `PACE_LAST_CYC`, `PACE_PENDING`, `pace_frame_cycles`, `pace_admit`, `pace_service`, and the 5 decision sites in `present_banded` | **NOT A GAP — RULED OUT** | **Do not port. See §5.1.** |
 | `wm.rs` ×1 | `wpace_emit` — the `[wpace]` ledger line | **NOT A GAP — RULED OUT** | The ledger for the pacer above; same ruling, §5.1. |
-| `wm.rs` ×1 | `dock_tiles` — the dock's tile count feeding `occ_clip` | (b) | **OWED** — §6.4. |
+| `wm.rs` ×1 | `dock_tiles` — the dock's tile count feeding `occ_clip` | (b) | **LANDED** — `exec-occ62` M2 (§6.4). |
 | `wm.rs` ×1 (16493) | MENUFIT witness — menubar reservation line | (d) IN FLIGHT | **exec-conswin** (menubar). |
 | `fbcon.rs` ×42 | **The console window** — `CONSOLE_WIN`, the route/pace/pending machinery (`ROUTE_BUSY`, `PACE_HZ`, `pend_merge`, `route_present*`, `console_service`, `console_flush`), the window-backed console store (`win_store`, `win_fb`, `win_content_extent`), `panel_console_window_open` / `_closed` | (d) IN FLIGHT | **exec-conswin.** Not touched by this arc. |
 | `main.rs` ×1 | `open_shell_window` | (d) IN FLIGHT | **exec-shellport.** |
 | `main.rs` ×2 | `desktop_owns_backdrop` (SHELLNOTDESK) — the crispy scene as the desktop layer, shell demoted to plumbing | (b) | **CLOSED** — §6.1. SHELLWIN-PI (`b2e0fb4a`) put the live shell in a window; REALDESK (exec-realdesk) took the last two backdrop tenants — the pulse band and the status line — off the glass with it. |
 | `main.rs` ×2 | `instgui::service`, `instgui::consume_key` | (c) | `instgui` is the x86 installer GUI on the `wcx` panel path. |
 | `mod.rs` ×2 | `pub mod wcx;`, `pub mod instgui;` | (c) | `wcx` **is** the x86 panel path (ignited by the Kepler takeover); `instgui` rides it. |
-| `screen.rs` ×1 (1050) | Occluder-array assembly for the blit clip | (b) | Part of the occlusion family — **OWED**, §6.2. |
+| `screen.rs` ×1 (1050) | Occluder-array assembly for the blit clip | (b) | Part of the occlusion family — **STILL OWED** after `exec-occ62`, which took the window-blit clip but not the deferred-erase side. See §6.10. |
 | `screen.rs` ×1 (367) | `DESK_STRIP_MAX` — furniture-strip array bound | (d) IN FLIGHT | **exec-conswin** (furniture strips). |
 | `ui_status.rs` ×1 | `top_chrome_h` — menubar row reservation in the shared layout | (d) IN FLIGHT | **exec-conswin** (menubar). |
 
@@ -118,7 +118,7 @@ These are x86 *hardware* or x86-only subsystems. They are not defects and should
 | Wide glass read-back | `wcg.rs` ×5 | x86 scan-out `GlassRow` reads. |
 | ACPI soft-off | `crystal.rs` ×1, `instgui.rs` ×1 | S5 poweroff; the Pi has no soft-off and its arm answers honestly (PSCI). |
 | x86 PCI wifi (bcma), flight recorder, selfhost, irqstorage, installdemo | `main.rs` ×15 | Broadcom over x86 PCI (not the Pi's SDIO part); the recorder taps the x86 serial print seam. |
-| Occlusion *witness legs* | `crystal.rs` ×1, `menubar.rs` ×1, `wm.rs` ×1, `wcg.rs` ×8 | These probe `wm::occ_clip`; they become meaningful only once §6.2 lands, and follow it rather than lead it. |
+| Occlusion *witness legs* | `crystal.rs` ×1, `menubar.rs` ×1, `wm.rs` ×1, `wcg.rs` ×8 | These probe `wm::occ_clip`. §6.2 has landed (`exec-occ62`), so the `wcg.rs` legs — `occluded=`/`occ=` on `[wc-d]`/`[wc-g]` — are now LIVE on aarch64 and carried the proof. The `[drag-occ]` legs (`occclip_dock`/`occclip_bar`, `wm.rs`) are deliberately **still x86**: that wire belongs to the drag instrument, not to §6.2. See §6.10. |
 
 ---
 
@@ -346,18 +346,25 @@ happens to change. That is the "came up INCOMPLETE, filled in slowly alongside c
 exactly, and it is why the crystal — the leftmost 16×22 of a 1920-wide strip — could be missing while
 the strip around it looked fine.
 
-On x86 this is latent because `wm::occ_clip` withholds the bar's columns from every window blit. **On
-aarch64 `occ_clip` is `#[cfg(target_arch = "x86_64")]` and returns `OccClip::none()`** — §6.2, still
-owed — so on the Pi nothing protects the strips *and* nothing repaired them. The bar and the open
+On x86 this is latent because `wm::occ_clip` withholds the bar's columns from every window blit. **When
+this was written, aarch64's `occ_clip` was `#[cfg(target_arch = "x86_64")]` and returned
+`OccClip::none()`** — §6.2, then owed — so on the Pi nothing protected the strips *and* nothing repaired
+them. The bar and the open
 dropdown now both ask `dock_scan`'s clobber question against the rect they last painted and repaint on
 a yes: `dock::compose`'s WCK5 condition, generalised to tenants #2 and #3. `clob=` is on both ledger
 lines as the falsifier.
 
-**This is a repair, not the protection.** §6.2 remains owed and remains the correct fix — a clobber
-repaint still costs one frame with a window's pixels standing in the bar. Recorded here so a later
-session does not read `clob=` as evidence that §6.2 has been closed. **`clob=0` on every QEMU surface
-run this arc**, at 640×480 and at bench geometry: the repair is structural and its firing is
-metal-owed.
+**This is a repair, not the protection.** A clobber repaint still costs one frame with a window's
+pixels standing in the bar. Recorded here so a later session does not read `clob=` as evidence that
+§6.2 has been closed. **`clob=0` on every QEMU surface run this arc**, at 640×480 and at bench
+geometry: the repair is structural and its firing is metal-owed.
+
+> **UPDATE — §6.2 LANDED (`exec-occ62`).** The protection is now in place on aarch64: the window
+> half-space (M1) and the furniture strips (M2) are both in `occ_clip` on the Pi, so a window blit
+> withholds the bar's and the dock's columns instead of publishing over them and being repaired a
+> frame later. The repair above stays as the second line of defence it was designed to be, and
+> `clob=` remains its falsifier — but a `clob=0` capture is now the expected reading rather than an
+> unproven one.
 
 ### 5.5d BRINGUP-PAINT — read the paint back, do not infer it
 
@@ -415,9 +422,9 @@ here before starting; strike it when it lands.**
 | # | Gap | Sites | Scope |
 |---|---|---|---|
 | 6.1 | **Desktop backdrop layer (SHELLNOTDESK)** — **CLOSED**, REALDESK 2026-08-17 | `main.rs` (the mint arm), `ui_status.rs` ×3, `video/mod.rs` (the latch) | Landed in three steps. **PIDESK-CLEAR** `8f78399d` gave the Pi the panel-wide `DESKTOP_BG` clear. **SHELLWIN-PI** `b2e0fb4a` put the live text shell in a window and claimed the backdrop in the same pass, which retired the *shell* tenant. **REALDESK** retires the two that were left: `ui_status`'s pulse LED band and its host/ip/UTC status line, both of which wrote the desktop back buffer directly. See §6.1a for the full tenancy ledger and what the retirement does NOT cover. |
-| 6.2 | **Windows do not respect menubar / dock / open dropdown** | `wm.rs:12059` (`OccClip::push`), `wm.rs:12281` (`occ_clip`), `wm.rs:12605` (`erase_clip`), `screen.rs:1050`, + 11 witness legs in §3 | On aarch64 the clip is structurally `OccClip::none`, so a window blit paints **over** the menu bar and dock and a deferred erase publishes over them. `pidesk` has already put those strips on the Pi's glass, so **the exposure is live today.** This is the same defect class x86 fixed. Largest owed item; its own arc. **STILL OWED after `exec-crystalpi`** — that arc added the *repair* (§5.5c: the bar and the dropdown now notice a clobber and repaint the same pass) but not the *protection*, so the exposure is bounded to one frame rather than removed. |
+| 6.2 | ~~**Windows do not respect menubar / dock / open dropdown**~~ **LANDED — `exec-occ62`, see §6.10** | `wm.rs` (`occ_clip`, `OccClip::push`, `OccSnap`/`occluders_above`/`occ_excuse`, `dock_tiles`), `wcg.rs` (`Probe`, `begin`/`end`, `readback`, `OccNote`) | The window half-space and the furniture strips are both in the clip on aarch64 now, so a blit withholds the occluder's columns instead of publishing over them. Landed in two commits: **M1** the window term plus the read-back excuse that had to travel with it, **M2** the dock/bar/dropdown arm on the furniture family's own dual gate. `erase_clip` and `screen.rs:1050` are **NOT** covered — the deferred-erase side is still x86-only; see §6.10 for what remains. |
 | 6.3 | **Quiet boot screen** | `fbcon.rs` ×9 (`QUIET-PANEL` `_print` suppression, `PANEL_MUTE_TAGS`, `TAG_SNIFF` + impls, `PANIC_MIRROR`) | x86 paints milestone lines only and mutes `[wc-g]/[wc-h]/[wc-d]/[wcn]` telemetry from the glass, with `PANIC_MIRROR` as the panic override; the Pi mirrors the raw serial stream across the boot panel. All arch-neutral policy over `_print`. Self-contained. |
-| 6.4 | **Dock tile count for the blit clip** | `wm.rs` `dock_tiles` | `video::dock` is already on the Pi via `pidesk`, but its tile count feeding `occ_clip` is not. Small; **do it with 6.2**, which is the consumer. |
+| 6.4 | ~~**Dock tile count for the blit clip**~~ **LANDED — `exec-occ62` M2** | `wm.rs` `dock_tiles` | Moved to the furniture family's dual gate alongside its consumer, exactly as this row asked ("do it with 6.2"). The SHELLPIN residual `dock.rs` discloses travels with it and is **not** closed — see §6.10. |
 | 6.5 | ~~**Fast glyph painting**~~ **LANDED — `exec-fontwire`, see §6.8** | `fbcon.rs:166` (`draw_glyph`'s span path) | x86 hoisted the pixel-format decode out of the 8×8 bit loop and poked pre-encoded words; the Pi ran `put_pixel` with a per-pixel `match` on `pixel_format`. Closed by making the hoist arch-neutral **and** run-coalesced, so it overshoots the parity the row asked for on both arches. `put_raw4` (`framebuffer.rs:268`) now has no callers. Accounting in §6.8. |
 | 6.9 | **The console's FACE was an arch gate nobody had named** — *raised and closed by `exec-fontwire`, recorded here because the census missed it* | `fbcon.rs:258` (`FbCon::aa`), `fbcon.rs:1707` (`panel_console_resume`, `#[cfg(target_arch = "x86_64")]`) | Not in the 501-site census, because it is not an attribute: `aa` had exactly ONE writer and that writer was inside an x86-only function. The Pi therefore drew anti-aliased captions, bar, crystal and dock captions — all of which resolve through the arch-neutral `wm::TITLE_CELL_*` — around a console still painting a 1-bit 8×8 cell. **A parity census that greps `cfg` attributes cannot see a gap of this shape.** The general lesson is worth more than the fix: look for *single-writer state whose writer is arch-gated*, not just for arch-gated state. |
 
@@ -1380,6 +1387,80 @@ and now the only cause left rather than one of two.
    `dock_reserve_h()` maxed against WC-F's own published `MARGIN + SIDE` (80 rows) — but that moves
    `wm::place`'s work area and with it every pinned geometry the spec reads, so it wants its own arc
    and its own gate, not a late edit in this one.
+
+### 6.10 §6.2 — what `exec-occ62` closed, what it did not, and the one fault it had to fix on the way
+
+**The mechanism was never rebuilt.** The x86 occlusion clip was already complete and correct in-tree;
+this was call-site and `cfg` work, plus one redesign the aarch64 stack forced. Two commits:
+
+| | What moved | Gate it now carries |
+|---|---|---|
+| **M1** | `occ_clip`'s WINDOW half-space — every live, non-`compat` row above the shell, stacked after the subject under `(z, id)` | unconditional (behaviour, not a knob) |
+| **M1** | The read-back EXCUSE: `OccSnap`, `occluders_above`, `occ_excuse`, the per-pixel attribution arm, `occluded=`/`occ=` on `[wc-d]`/`[wc-g]` | `feature = "witness"` |
+| **M2** | The FURNITURE arm — dock strip, menu bar, SHARD dropdown — plus `dock_tiles` (§6.4) and `OccClip::push` | `any(all(x86_64, wc), all(aarch64, pidesk))` |
+
+**Why the excuse had to land in the same commit as the clip.** A clip without one MANUFACTURES
+failures: the blit declines pixels by design, the witness reads the panel's older contents inside a
+verified rect, and prints `-> FAIL` for a defect that does not exist. The `OccSnap` ledger states the
+rule directly — *the excuse must never be narrower than the clip* — so the arch gate on the excuse was
+never independent of the arch gate on the clip. It came off with it.
+
+**Knob-off byte-identity moves on aarch64, deliberately.** The window term is unconditional behaviour
+and `[wc-d]`/`[wc-g]` now carry `occluded=`/`occ=` on that arch. Both are insertions inside spans
+`pi4-regression.spec` already matches with `.*`, no terminal verdict moved, and the knob-off gate reads
+**117/117, 0 forbidden**. DRAG-PI set this precedent; it is the honest cost of a real behaviour change.
+
+**THE FAULT, because it is the most useful thing in this section.** The first cut ported x86's shape
+verbatim, and that shape passes `OccSnap` BY VALUE: a field in `wcg::Probe`, a field in `wm::VerifyRef`,
+and an argument temporary at each of `wcg::begin`/`end` — four copies of `MAX_WINDOWS * 32 + 8` = **392
+bytes** live on the compositor frame per window. x86 absorbed it. The aarch64 task stack did not:
+
+```
+this arc, armed 1920x1200 : [wc-a] create win=3 … surf=960x583
+                            === AARCH64 EXCEPTION:            ← boot dies, 1391 lines
+base sha b9ae9112, same cmd: reaches the SAME create event and runs on, 21096 lines, 0 exceptions
+```
+
+The fix is that the snapshot is **owned once per window iteration in `composite_inner` and lent out**:
+`Probe` and `VerifyRef` lose their fields, `wcg::begin` drops the parameter, `wcg::end` /
+`verify_window` / `readback` borrow. x86 took the same shape — paying four copies it never needed is
+the same defect, merely unconvicted there. Taking ONE pre-blit snapshot where two were taken also
+strengthens the law `occ_excuse` exists for: all four excuse points now speak from one instant rather
+than two that could drift, and it cannot narrow the excuse below the clip because `occ_excuse` unions
+the clip in unconditionally.
+
+*The general lesson, worth more than the fix:* **a by-value type that is affordable on one arch's stack
+is not thereby portable.** A parity port that only moves `cfg` attributes cannot see this class — the
+census greps attributes, and `size_of` is not an attribute. A sibling arc (`u7stack`) convicted the same
+class independently in the same sitting.
+
+**The evidence the protection works**, from the armed bench-geometry run:
+
+```
+base sha : [wc-d] verify win=3 … at (17,85) … bad_cache=1745 bad_ram=7488 …
+                  first=(17,155) got=0x2d2b55 want=0xff2020 -> FAIL
+this arc : [wc-d] verify win=3 … at (17,85) … bad_cache=0 bad_ram=0 … occluded=0 occ=1/1 … -> PASS
+this arc : [wc-d] verify win=3 … at (640,339) … occluded=20736 occ=1/1 … -> PASS
+```
+
+`occ=1/1` proves the excuse set is populated rather than structurally zero; `occluded=20736` on a
+fully-covered subject proves it FIRES. Zero `[wc-d] … -> FAIL` remain on the armed run.
+
+#### What is still OWED after this arc
+
+1. **The deferred-erase side.** `erase_clip` and `screen.rs:1050` are untouched and still x86-only.
+   §6.2 as originally written named both the blit and the erase; **only the blit is closed.** A
+   deferred erase on the Pi can still publish over a strip.
+2. **The `[drag-occ]` witness legs** (`occclip_dock`/`occclip_bar`, `OD_*`/`OB_*`) stay x86 by choice —
+   that wire belongs to the drag instrument another arc owns. On aarch64 the strips ARE in the clip and
+   those fields do not report it, so **silence there is an absent instrument, not a zero.** Named in
+   `occ_clip`'s ledger so no future capture is misread.
+3. **The SHELLPIN residual**, carried from `dock.rs`'s integrator note and now also disclosed on the
+   consumer. `dock_tiles` counts dock-addressable ROWS and cannot see the tile `dock::pin_shell`
+   appends while the shell is closed, so the clip protects a strip one tile narrower than the painted
+   one; a drag across the pinned tile clobbers it for one pass and `dock::compose` repairs it. The fix
+   is one `+ 1` term — **not taken here because `dock_tiles` also feeds the x86 clip and the term would
+   move x86 pixels**, which this arc's constraint forbids.
 
 ---
 

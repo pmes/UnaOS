@@ -2151,6 +2151,12 @@ than bought by promoting the menu to a `strip::TENANTS` member — a tenancy wou
 occlusion slot on a surface that is absent for all but a few seconds of a boot. aarch64 is `0`
 either way and its `DESK_OCC_MAX` is unchanged.
 
+> **`exec-occ62` (PARITY §6.2) note.** This paragraph is about the DESKTOP present's occluder array in
+> `screen.rs`, which is still x86-only and still owed. The WINDOW-blit clip is a different array and
+> is no longer x86-only: `occ_clip` carries windows on both arches (M1) and the strips and dropdown on
+> the `wc`/`pidesk` dual gate (M2). Read `DESK_STRIP_MAX`/`DESK_OCC_MAX` as the erase/present side,
+> `OCC_MAX`/`OCC_CLIP_MAX` as the blit side; only the latter crossed to aarch64.
+
 The residual is the strips' residual, and bounded the same way: the rect is reported from the instant
 `open` flips `OPEN`, which can be one composite before `compose` has painted those pixels. The
 desktop therefore withholds rows the menu is about to own — never rows it has stopped owning, which
@@ -2456,12 +2462,16 @@ the shell is PINNED to the dock permanently.
 * **Witness.** `[shellwin] reopen win=<id> route=dock == witness ::` on success;
   `[shellwin] reopen route=dock already-live win=<id> raised` on the raise arm; the existing
   `[shellwin] DECLINE` lines on failure.
-* **⚠ Bounded residual, flagged to the integrator.** `wm::occ_clip`'s per-window-blit dock term is
-  fed by `wm::dock_tiles` (a lock-free ROW count that cannot see the pinned tile), so while the
-  shell is closed the blit clip protects a strip one tile narrower than painted; a window dragged
-  across the pinned tile clobbers it for one pass and the dock's own clobber condition repaints it.
-  The complete fix is one term in `wm::dock_tiles` (+1 when no row is `KERNEL_OWNER_DESKTOP`) —
-  `wm.rs` is owned by concurrent arcs, so it is flagged rather than taken.
+* **⚠ Bounded residual, flagged to the integrator — STILL OPEN, and now on both arches.**
+  `wm::occ_clip`'s per-window-blit dock term is fed by `wm::dock_tiles` (a lock-free ROW count that
+  cannot see the pinned tile), so while the shell is closed the blit clip protects a strip one tile
+  narrower than painted; a window dragged across the pinned tile clobbers it for one pass and the
+  dock's own clobber condition repaints it. The complete fix is one term in `wm::dock_tiles` (+1 when
+  no row is `KERNEL_OWNER_DESKTOP`). **`exec-occ62` M2 (PARITY §6.2/§6.4) moved `dock_tiles` and the
+  furniture arm to the `wc`/`pidesk` dual gate, so the residual now reaches the Pi on the same terms
+  it always had on x86 — and it deliberately did NOT take the `+ 1`:** `dock_tiles` feeds the x86
+  clip too, so the term would move x86 pixels, which that arc was constrained not to do. It remains
+  one line, and it now wants an arc that is allowed to re-gate x86.
 
 **Gate results (2026-08-12).** `./arroyo check` and `UNAOS_WITNESS=1 UNAOS_WC=1 ./arroyo check`
 green both arches; `UNAOS_WC=1 ./arroyo esp-x86` then

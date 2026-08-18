@@ -13124,11 +13124,11 @@ impl OccClip {
     /// DROPPED for want of capacity, which [`erase_clip`] reports rather than swallows: a dropped
     /// occluder is a region the erase will publish over.
     ///
-    /// x86 only, with its two callers' populated arms: on aarch64 [`erase_clip`] returns
-    /// [`OccClip::none`] and §6.2 M1 leaves `occ_clip`'s FURNITURE arm — the other pusher — x86-only.
-    /// M2 widens this to the `pidesk` dual gate along with that arm; the M1 window loop writes
-    /// `boxes[n]` directly under [`OCC_CLIP_MAX`] and needs no capacity check.
-    #[cfg(target_arch = "x86_64")]
+    /// Both of its callers' populated arms: [`erase_clip`] (x86) and `occ_clip`'s FURNITURE arm,
+    /// which OCC62 M2 put on the furniture family's dual gate — so this rides the union. The WINDOW
+    /// loop does not use it: that population is bounded by [`OCC_CLIP_MAX`] and writes `boxes[n]`
+    /// directly.
+    #[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "pidesk")))]
     fn push(&mut self, b: (usize, usize, usize, usize)) -> bool {
         if b.2 == 0 || b.3 == 0 {
             return true;
@@ -13342,11 +13342,30 @@ impl OccRows {
 /// [`OccClip::push`] rather than a direct write so that a future third piece of furniture is DECLINED
 /// rather than written past the end.
 ///
-/// **x86 + `wc` only — the FURNITURE arm alone, and only until §6.2 M2.** Off `wc` there is no dock
-/// (`wcx.rs` is the x86 panel path the knob gates), and off x86 that arm is absent: on aarch64 the
-/// furniture term is STRUCTURALLY absent, not merely empty — `super::dock` is never named and no
-/// `for_panel` runs — so an aarch64 clip carries WINDOWS and no strips. `pw`/`ph` are the two
-/// arguments that arch pays and cannot use until the furniture arm follows.
+/// ### OCC62 M2 — THE FURNITURE ARM IS ON BOTH ARCHES, ON THE FURNITURE FAMILY'S OWN GATE
+///
+/// The arm is `any(all(x86_64, wc), all(aarch64, pidesk))` — the identical gate `video/mod.rs`
+/// declares `dock`, `strip`, `menubar` and `crystal` under. That is the whole justification and it
+/// is a tight one: the strips are admitted to the clip on exactly the boots that composite them
+/// onto the glass, so there is no boot where the clip reserves columns for furniture that is not
+/// there, and none where furniture paints without the clip knowing. Off both knobs the arm is
+/// STRUCTURALLY absent — `super::dock` is never named, no `for_panel` runs — and `pw`/`ph` are two
+/// arguments the build pays and cannot use.
+///
+/// [`dock_tiles`] moved to the same gate with it (PARITY §6.4, which that row says to land here,
+/// "with 6.2, which is the consumer"), as did [`OccClip::push`], the arm's admission primitive.
+///
+/// **The SHELLPIN residual travels too, and is still not fixed here (carried from `dock.rs`'s
+/// integrator note).** `dock_tiles` counts dock-addressable ROWS and cannot see the synthetic tile
+/// `dock::pin_shell` appends while no live row carries `KERNEL_OWNER_DESKTOP`, so with the shell
+/// closed this clip protects a strip ONE TILE narrower than the one painted. A window dragged
+/// across the pinned tile's columns overwrites them for one pass and `dock::compose`'s clobber test
+/// repaints them — the bounded, self-healing pre-WCK5 behaviour, now reaching the Pi on the same
+/// terms it already had on x86. The erase clip and the desktop present are unaffected (both read
+/// `strip_rect`, which pins). The complete fix is one `+ 1` term in `dock_tiles`; it is NOT taken
+/// here because `dock_tiles` also feeds the x86 clip, so the term would move x86 pixels — and this
+/// arc's standing constraint is that it must not. It stays disclosed, and it is now disclosed on
+/// the consumer as well as on `dock.rs`.
 #[allow(unused_variables, unused_mut)]
 fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: usize) -> OccClip {
     let mut c = OccClip::none();
@@ -13367,10 +13386,11 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: u
         // WCK5 — the strip, admitted for every subject it meets. No `(z, id)`, for the reason in the
         // ledger above: `composite_once` paints it after this whole loop has run.
         //
-        // OCC62 M1 — the WINDOW half-space above is now UNCONDITIONAL (see the §6.2 note in the
-        // ledger); this FURNITURE arm keeps its `x86_64 + wc` gate for one more milestone, so the
-        // gate that was implicit in the removed outer `target_arch` attribute is restated here.
-        #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+        // OCC62 M2 — and the FURNITURE arm now rides the SAME dual gate the furniture family
+        // itself carries (`video/mod.rs`: x86+`wc` OR aarch64+`pidesk`), so the strips are in the
+        // clip on exactly the boots that put them on the glass. `dock`, `strip`, `menubar` and
+        // `crystal` were already declared on that gate; this is the consumer catching up.
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
         {
             let rect = super::dock::Layout::for_panel(dock_tiles(rows), pw, ph).map(|l| l.rect());
             // WCK4-D1's lesson, restated on this side: the strip's geometry goes on the wire whether
@@ -13378,7 +13398,12 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: u
             // Published from the same `rect` the clip is built from, and BEFORE the overlap test — a
             // subject that does not meet the strip must not be able to erase the fact that a strip
             // exists.
-            #[cfg(feature = "witness")]
+            // OCC62 M2 — the `[drag-occ]` publications stay x86. `OD_*`/`OB_*` and the line that
+            // reads them live in the drag/gesture instrument another arc owns; the CLIP is what
+            // §6.2 owes the Pi, and widening that wire is not this arc's to do. Named rather than
+            // silent: on aarch64 the strips are in the clip and `occclip_dock`/`occclip_bar` do not
+            // report it, so a Pi capture's silence there is an ABSENT instrument, not a zero.
+            #[cfg(all(feature = "witness", target_arch = "x86_64"))]
             {
                 use core::sync::atomic::Ordering::Relaxed;
                 let (dx, dy, dw, dh) = rect.unwrap_or((0, 0, 0, 0));
@@ -13392,7 +13417,7 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: u
                     // WCK5 — one window blit whose clip CARRIED the strip. The population term for
                     // `occclip_dock_px`: a gesture with `occclip_dock=0` withheld nothing because no
                     // blit met the strip, which is a different statement from "the clip did not work".
-                    #[cfg(feature = "witness")]
+                    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
                     OD_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
             }
@@ -13414,7 +13439,7 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: u
             // Default OFF: `strip_rect` returns `None` after one relaxed load on every boot that has
             // not enabled the bar, so this arm costs one atomic per window and pushes nothing.
             let bar = super::menubar::strip_rect(pw, ph);
-            #[cfg(feature = "witness")]
+            #[cfg(all(feature = "witness", target_arch = "x86_64"))]
             {
                 use core::sync::atomic::Ordering::Relaxed;
                 let (bx0, by0, bw0, bh0) = bar.unwrap_or((0, 0, 0, 0));
@@ -13425,7 +13450,7 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: u
             }
             if let Some(b) = bar {
                 if b.2 != 0 && b.3 != 0 && boxes_overlap(me, b) && c.push(b) {
-                    #[cfg(feature = "witness")]
+                    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
                     OB_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
             }
@@ -19406,7 +19431,7 @@ fn dock_addressable(r: &Window) -> bool {
 /// acquisition would be both a cost and a fresh interleave in a loop that deliberately takes none
 /// (see its ledger). The snapshot is also the RIGHT input — it is the geometry this pass is drawing
 /// against, and the count `dock::compose` will reach at the tail of the same pass.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 fn dock_tiles(rows: &[Window; MAX_WINDOWS]) -> usize {
     let n = rows.iter().filter(|r| dock_addressable(r)).count();
     // SHELLPIN (integrator, GR27) — mirror `dock::pin_shell`: with no live KERNEL_OWNER_DESKTOP
