@@ -510,14 +510,115 @@ missing the ways to REACH it, and the headroom to run it at full detail.**
 | **VUGSCENE** `a5bd93ee` | The real drawing-complexity arc. Replaces the trivial wireframe with a solid faceted **SHARD** — an 18-half-space convex-intersection ray tracer (exact HSR, no z-buffer), orbiting light, per-facet flat shading with a specular kick, palette read from the menu bar's crystal. Plus a **ray-density LOD ladder** (lvl 0 wireframe → 3 = one ray per pixel, cost 1:4:16) that self-tunes off its own fps meter. Commit body: *"Peter: make the drawing complex, not the pacing (999fps was a trivial pattern), and the scene IS the crystal."* | **Arch-neutral.** `crates/user-vug/src/main.rs` carries no `#[cfg(target_arch)]` outside the syscall stubs; it compiles and links for aarch64. | Renderer needs no port. **The reach does** — 6.6a/6.6b/6.6c below. |
 | **VUGTRUTH** `51b66a2c` | Failed presents no longer count as frames or clock the exit budget; fps on the wire as `[vugfps]`; spin budget 4096→64. The *measurement* the VUGSCENE ladder later reads. | **Arch-neutral**, gates were run green on both arches. | **AT PARITY. Not a gap.** Added no rendered content. Recorded so it is not re-opened. |
 | **VUGSPREAD** `b30d81f3` | Scheduler repair for vug's 19 fps: unstealable spawned threads, load-blind sibling pick, a steal floor that could not see 2-on-1 packing. Adds per-task `migrations`, a placement hint, per-victim `steal_floor`, `cr3_live` shadow, `[spread]` witness, and an escalating steal cooldown. Renders no pixels. | **x86-only by directory** — every line was in `arch/x86_64/sched.rs` (~50 `VUGSPREAD` tags). | **LANDED — §6.7.** The policy is now `crates/kernel/src/sched_spread.rs`, shared; the Pi has the steal half. |
-| **LAUNCHVUG** `fa439109` | Bare `vug` at the shell resolves `VUG.ELF` on the volume executables live on and launches it **detached**. Fixed Peter's bench report *"still no way to launch vug"*. | **x86-only, explicitly.** `shell.rs:5007` `#[cfg(target_arch = "x86_64")] fn bare_exec`, and `shell.rs:2509` `exec: cfg!(target_arch = "x86_64")`. | **OWED — 6.6a. Highest priority.** |
+| **LAUNCHVUG** `fa439109` | Bare `vug` at the shell resolves `VUG.ELF` on the volume executables live on and launches it **detached**. Fixed Peter's bench report *"still no way to launch vug"*. | ~~x86-only, explicitly~~ — **PORTED**, `exec-barename`. `bare_exec` is now one shared body over one per-arch re-resolve, and `Facts::exec` stands on `proc_verbs` rather than on an arch. | **CLOSED — 6.6a, see §6.6a-closed.** |
 
 | # | Gap | Sites | Scope |
 |---|---|---|---|
-| 6.6a | **`vug` does not launch on the Pi** | `shell.rs:5007` (`bare_exec`, `#[cfg(target_arch = "x86_64")]`), `shell.rs:2509` (`Facts::exec = cfg!(x86_64)`), `shell.rs:2899` (the `Plan::Exec` arm, whose `not(x86_64)` branch prints *"Unknown command."*) | Typing `vug` on the Pi prints **"Unknown command."** — verbatim the failure Peter reported at the bench on x86, still shipping on aarch64. The operator must type `bg /fat/VUG.ELF`. **This is also the gate on the shard itself:** VUGSCENE renders only when `overlay = detached \|\| interactive`, and `detached` is bit 0 of the info-page flags set by `bg` — so the launch path *is* the drawing path. `spawn_user_image_bg` already exists on aarch64 (`arch/aarch64/syscall.rs:8145`); only the resolver/dispatch half is missing, and the `not(x86_64)` arm was left in place precisely so "the compiler points here" when a loader arrives. **Smallest change with the largest visible payoff. Start here.** |
+| 6.6a | ~~**`vug` does not launch on the Pi**~~ — **CLOSED**, `exec-barename`, see §6.6a-closed | `shell.rs` (`bare_exec` + `bare_exec_reresolve` + `exec_resolve`/`exec_canon`/`EXEC_ROOT`, `Facts::exec`, `adopt_bg_job`, the `Plan::Exec` arm); `libs/sys/midden_core/src/lib.rs` (`Facts::vugdemo`, `Avail::VugDemo`, `help`) | The operator had to type `bg /fat/VUG.ELF`. **This is also the gate on the shard itself:** VUGSCENE renders only when `overlay = detached \|\| interactive`, and `detached` is bit 0 of the info-page flags set by the detached spawn — so the launch path *is* the drawing path. `spawn_user_image_bg` already existed on aarch64 (`arch/aarch64/syscall.rs:8211`); the resolver/dispatch half is now ported, and the `not(x86_64)` arm did its job — the compiler pointed at it. **This row's own symptom claim was wrong, and the correction is the second half of the fix — see §6.6a-closed.** |
 | 6.6b | ~~**Pi media stages only one vug image**~~ — **CLOSED**, `exec-vugstage`, see §6.6b-closed | `arroyo`: `build_one_vug_aarch64` + `build_user_vug_aarch64` (new — the twin of `build_one_vug_x86`), called from `kernel8` where the single inline `VUG.ELF` recipe used to sit; the FAT staging block copies all three into `$KERNEL8_DIR` | x86 media carries `VUG.ELF` (adaptive), `VUGC.ELF` (`pinlo`, classic baseline) and `VUGX.ELF` (`pinhi`, full per-pixel shard). **Pi media had neither `VUGC.ELF` nor `VUGX.ELF`**, so the pinned-detail images — the ones that show the shard at full density and give the A/B baseline — could not be run on the Pi at all. Build-plumbing only, and the row's own claim held: the crate links for aarch64 under both pins with no source change. |
 | 6.6c | ~~**No scheduler placement/steal repair on the Pi**~~ **LANDED — `exec-vugspread`, see §6.7** | `sched_spread.rs` (new, shared); `arch/aarch64/sched.rs`; `arch/x86_64/sched.rs` (delegation only) | The LOD ladder self-tunes off achieved fps, so **less CPU headroom settles the shard at a LOWER detail rung — the Pi literally draws a simpler scene.** The row was written as "placement AND steal"; §6.7 shows the Pi already had a deeper PLACEMENT lattice than x86 (SPREAD-3..14), and what it lacked was the STEAL half — the only correction that can reach a thread which never parks. That half is now ported. |
 | 6.6d | ~~**No damage-present on the Pi**~~ — **CLOSED**, `exec-presentrows` | `SYS_WIN_PRESENT_ROWS` (33) dispatched at `arch/x86_64/syscall.rs:2594`; now also at `arch/aarch64/syscall.rs` (`sys_win_present_rows`, beside `sys_win_present`) | The Pi answered `-ENOSYS` and `user-vug` fell back to a whole-box present. Ported: same number, same argument shape, same errnos in the same order, band range-checked against the presenting row's own `h` under the hold that proved ownership. See §6.6d-closed below for the correction the port forced on this row's own framing. |
+
+#### 6.6a-closed — the bare name launches on the Pi, and the phantom verb that was really in the way
+
+`exec-barename` ports BARE-NAME LAUNCH to aarch64. Peter's order (PA44, 2026-08-18): typing `vug`
+must start it, retiring `bg` as a *requirement* on the Pi. `bg` stays — it is the explicit form and
+x86 has it too; what changed is that the bare name works.
+
+**The row above said typing `vug` on the Pi printed "Unknown command." It does not, and never did.**
+The QEMU repro on the pre-arc image is unambiguous:
+
+```
+:: [midden] cmd="vug" -> Host verb=vug ::
+```
+
+`vug` was claimed as a **VERB**. `midden_core`'s table carried `("vug", Avail::Aarch64)` and
+`("pulse", Avail::Aarch64)`, but the kernel `match` arms that service them carry
+`#[cfg(all(target_arch = "aarch64", feature = "vugdemo"))]` — and `vugdemo` is **DEFAULT OFF**
+(DECRUD-1). So on the image users flash, the core advertised two verbs the build does not carry,
+routed them to a `match` with no such arm, and answered out of `other =>`. That is a defect on its
+own; but verb-ness is **absolute** over bare-name launch (`plan` consults `resolve_exec` only after
+`is_verb` says no), so the phantom verb was ALSO what stood between the operator and `VUG.ELF`.
+
+**Turning on `Facts::exec` alone would have changed nothing for the one word Peter typed.** The two
+halves of this arc are therefore inseparable, and the second is not scope creep — it is the fix:
+
+1. **`Facts::exec = proc_verbs`.** Bare-name launch exists exactly where `spawn_user_image_bg` and
+   the shell job table exist, which is what `proc_verbs` already means. One fact, no second arch
+   gate — the ONE-OS law forbids one here.
+2. **`Avail::VugDemo`** (`facts.aarch64 && facts.vugdemo`), with `vugdemo: cfg!(feature = "vugdemo")`
+   at the kernel's single facts call site. The table's standing contract is that each entry's
+   condition mirrors the `#[cfg]` on its match arm *one for one*; this restores that. Knob-off, `vug`
+   and `pulse` are not verbs, and `help` stops listing them (they are named on the bare-name lines
+   instead). Knob-on, both are verbs again and beat the program, unchanged.
+3. **`help`'s bare-name lines key off `facts.exec`, not `facts.x86`.** A help line that names a
+   capability must be gated on the capability.
+
+**Resolution — the search path, and why it is x86's order rather than a new policy.** x86 has no VFS:
+its whole path universe *is* the program-source FAT, so "resolve from the cwd" and "resolve on the
+volume executables live on" are one sentence there, and `/fat` is carried only as an alias for that
+volume's root. On the Pi the two come apart — `/` is native UnaFS and the images are on the SD FAT at
+`/fat`. `exec_resolve` is that same sentence with the halves separated, in order:
+
+1. **cwd-relative, through `vfs_path`** — the VFS-1 seam `ls`/`cat`/`run`/`bg`/`vfs` share, so a bare
+   name means exactly what those verbs say it means. Not a private path scheme.
+2. **the program-source root, `EXEC_ROOT = "/fat"`** — relative tokens only, skipped when it would
+   repeat probe 1. On x86 this step is not absent, it is *implied* by the cwd already sitting on the
+   program source. Dropping it would leave the operator at `/` unable to type `vug`, i.e. the whole
+   defect intact.
+
+Case handling matches x86 for the same underlying reason: the FAT backend behind `/fat` matches
+components case-insensitively, so arm 2 of the core's resolver (`vug` → `vug.elf`) hits the on-disk
+`VUG.ELF` and the upper-cased arm 3 stays latent on both arches. `canon` — the on-disk spelling
+`jobs` and the witness lines quote — is read from a FAT directory entry on x86; VFS `stat` returns no
+name, so `exec_canon` recovers it from the parent listing case-insensitively, falling back to the
+resolved path (a display name is never worth a refusal). No `EXEC_BIND` stamp on this arch: that
+instrument and its `fatverb_storage_witness` reader compare FAT *handles*, and this arch binds a
+mount table.
+
+**Shape of the port.** `bare_exec` is now ONE body under
+`any(all(baremetal, aarch64), x86_64)` — the gate `BgJob`/`BG_JOBS`/`bg_program`/`adopt_bg_job`
+already carry — with the single per-arch step split out as `bare_exec_reresolve`, returning
+`(load_path, canon)`. x86's `load_path` is the token the core returned, untouched, so **every x86
+panel and serial line is byte-identical**; only aarch64 needs the absolute path, because there the
+token alone is ambiguous between the native root and the program source. Everything after the
+re-resolve — the ELF64-magic refusal, `spawn_user_image_bg`, `adopt_bg_job` (the BGRUN-1 ledger `bg`
+writes), the launch line, the job-table-full kill — is shared source, so the two arches cannot drift.
+
+**Byte-identity, stated honestly.** This arc **moves the knob-off `kernel8.img` hash**, deliberately
+and on the §5.3 grounds: it is not desktop furniture, it is a capability change on the shipped image,
+and it is the change Peter ordered. No attempt at line-neutrality was made or claimed.
+
+**Proof (QEMU raspi4b, knob-off media).** `arroyo kernel8-test` uses `-serial file:` — write-only —
+so the suite types nothing and cannot witness this. The repro therefore runs the same image under a
+**bidirectional** first UART (`-chardev socket` + `-serial chardev:`) and types at the shell for
+real. Post-arc, from `/`:
+
+```
+:: [midden] cmd="vug" -> Exec vug.elf ::
+:: BAREXEC: /fat/VUG.ELF (typed 'vug') — loaded 12568 bytes, entry 0x400000, pid=30 slot=1 DETACHED, left RUNNING ::
+:: [midden] cmd="nosuchprogram" -> TerminalError len=44 ::
+:: BGRUN: jobs — 1 tracked job(s) after the sweep ::
+```
+
+and, after `cd /fat` (the cwd leg, and the two honest-failure legs):
+
+```
+:: BAREXEC: /fat/VUGX.ELF (typed 'vugx') — loaded 12568 bytes, entry 0x600000, pid=148 slot=1 DETACHED, left RUNNING ::
+:: BAREXEC: /fat/HELLO.BIN (typed 'hello.bin') — REFUSED: not an ELF64 image (no magic); 51 bytes read ::
+:: [midden] cmd="stat" -> Host verb=stat ::
+```
+
+i.e. the bare name launches from either root, `jobs` tracks it, a genuinely unknown name still gets
+the unknown-command refusal (the negative control), a non-ELF file is refused rather than fed to the
+flat loader, and a real verb still beats a program of the same name. **No spec line moved**: nothing
+in `pi4-regression.spec` anchors on "Unknown command" (the string reaches the console only, never
+serial), and knob-off `kernel8-test 210` is 117/117, 0 forbidden.
+
+**Not done here.** The Pi's regression suite still cannot type, so none of the above is *gated* — it
+is a reproducible manual witness, not a REQUIRE. `mbench.py` already has the `--inject`/`--follow`
+machinery (metal-bridge only today); wiring a bidirectional chardev into `test_kernel8` and adding a
+BARENAME script would turn this proof into a standing gate, and is the obvious follow-up.
 
 #### 6.6b-closed — three images on the Pi FAT, and the falsifier that proves the pin travelled
 
@@ -585,7 +686,8 @@ blocks argue for — but the "cannot move" claim is now false on a boot that tak
 
 **Not gaps, recorded so they are not mistaken for them:** the `overlay` gate that renders level 0 on a
 foreground `run` behaves identically on x86 — it is shared ring-3 behaviour, not a parity defect (the
-Pi feels it more only because 6.6a denies it the easy `bg` path). `user-pulse` is fully at parity: its
+Pi felt it more only because 6.6a denied it the easy bare-name path, until `exec-barename`).
+`user-pulse` is fully at parity: its
 drawing is common code and `arroyo:2885` already stages `PULSE.ELF` on Pi media.
 
 #### 6.6e — the `exec-crystalhd` arc: CRYSTAL-HD/AA land on both chips, CRYSTAL-PACE does not
@@ -1149,5 +1251,7 @@ dispatchers (6.6d), because that is where the vug experience actually lives. Tho
 had the §1 census run over them, so §6.6 is a survey of four named arcs, not an exhaustive audit of
 its own. **A follow-up arc should run §1's script over `shell.rs`, `arch/*/sched.rs` and both syscall
 dispatchers** — on the evidence of 6.6a alone (a bare `#[cfg(target_arch = "x86_64")]` hiding the
-single most-used launch verb) that sweep will find more, and the same "is this really the desired
+single most-used launch verb, *and* a `midden_core` table entry looser than the `#[cfg]` it stood
+for, which is a second sweep the census would have to run: every `Avail` against its match arm) that
+sweep will find more, and the same "is this really the desired
 experience?" test from the header must be applied to each hit before anything is ported.

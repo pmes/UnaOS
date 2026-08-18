@@ -2502,12 +2502,20 @@ fn midden_facts() -> midden_core::Facts {
         aarch64: cfg!(target_arch = "aarch64"),
         x86: cfg!(target_arch = "x86_64"),
         v3d: cfg!(all(target_arch = "aarch64", feature = "v3d")),
+        // BARENAME (§6.6a): the knob the `vug`/`pulse` match arms actually carry. It is a pure
+        // `feature` read — `Avail::VugDemo` composes it with `aarch64` — so this line says one
+        // thing and says it truthfully: DEFAULT OFF, and off means the words are not verbs.
+        vugdemo: cfg!(feature = "vugdemo"),
         proc_verbs,
         proc_rows,
-        // BARE-NAME LAUNCH is x86-only today: `bare_exec` + `spawn_user_image_bg` off the FAT
-        // volume. With this false the core never probes the volume and never returns `Plan::Exec`,
-        // so an aarch64 build does exactly what it did before this crate existed.
-        exec: cfg!(target_arch = "x86_64"),
+        // BARENAME (PARITY §6.6a): bare-name launch exists exactly where the PROCESS VERBS exist.
+        // `spawn_user_image_bg` + the shell job table are the whole dependency and they carry that
+        // very gate, so this reads the flag off `proc_verbs` instead of re-deriving a second
+        // `cfg!(target_arch = ...)` beside it — the ONE-OS law forbids an arch gate in the
+        // experience layer, and there is only one fact here: "this build can start a ring-3
+        // program". A build with no process table still leaves it false, and there the core never
+        // probes the volume and never returns `Plan::Exec`.
+        exec: proc_verbs,
     }
 }
 
@@ -2563,9 +2571,26 @@ impl midden_core::Volume for FatVolume {
             Ok(Resolved::Entry(de, _)) if !de.is_dir
         )
     }
-    // aarch64 never sets `Facts::exec`, so the core never calls this. Answering `false` rather
-    // than reaching for unafs keeps the promise: no behaviour change on a build with no loader.
-    #[cfg(not(target_arch = "x86_64"))]
+    /// BARENAME (PARITY §6.6a): the aarch64 twin — the SAME question, asked of the namespace this
+    /// arch actually has.
+    ///
+    /// aarch64 is not x86 with a different mnemonic set here: x86 has no VFS, so its whole path
+    /// universe IS the program-source FAT and "resolve from the cwd" already means "resolve on the
+    /// volume executables live on". On the Pi those are two different statements — `/` is native
+    /// UnaFS and the executables are on `/fat` — so the faithful port is not the x86 code with the
+    /// mount swapped, it is [`exec_resolve`]: the cwd first (so `ls`/`cat`/`run` and a bare name
+    /// agree about what a name means, VFS-1's whole point), then the program-source root. See
+    /// `exec_resolve` for the order and why it is the same order.
+    ///
+    /// No [`EXEC_BIND`] stamp: that instrument and its `fatverb_storage_witness` reader are x86-only
+    /// (they compare FAT *handles*, and this arch binds a mount table, not a handle).
+    #[cfg(all(feature = "baremetal", target_arch = "aarch64"))]
+    fn is_file(&mut self, name: &str) -> bool {
+        exec_resolve(name).is_some()
+    }
+    // No process table, no loader, so `Facts::exec` is false and the core never calls this.
+    // Answering `false` keeps the promise: no behaviour change on a build that cannot launch.
+    #[cfg(not(any(target_arch = "x86_64", all(feature = "baremetal", target_arch = "aarch64"))))]
     fn is_file(&mut self, _name: &str) -> bool {
         false
     }
@@ -2622,6 +2647,7 @@ pub fn midden_witness() {
         proc_rows: midden_facts().proc_rows,
         aarch64: false,
         v3d: false,
+        vugdemo: false,
     };
 
     // 1. dispatch — a core verb is answered by the core, with real text.
@@ -2898,12 +2924,13 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             return false;
         }
         midden_core::Plan::Exec { typed, name } => {
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
             bare_exec(console, &typed, &name);
-            // No build outside x86 sets `Facts::exec`, so the core never hands this arm a plan
-            // there; the branch exists so the match is total and the day a loader arrives on
-            // another arch the compiler points here.
-            #[cfg(not(target_arch = "x86_64"))]
+            // BARENAME (§6.6a): the day a loader arrived on aarch64 the compiler pointed here, as
+            // this comment used to promise. What is left is the build with no process table at all,
+            // which never sets `Facts::exec` and so is never handed this arm; the branch stays so
+            // the match is total.
+            #[cfg(not(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64")))]
             {
                 let _ = (&typed, &name);
                 console.println("Unknown command. Type 'help' for assistance.");
@@ -4947,7 +4974,7 @@ fn bg_kill_cmd(console: &mut Console, pid: u64) {
 /// the prompt to type `bg`. Registering it here is what keeps `jobs` and `kill` TRUTHFUL —
 /// `bg_kill_cmd` resolves a pid through this table and REFUSES one it cannot find, so an
 /// unregistered launch would be a running ring-3 program the operator can neither list nor stop.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
 pub(crate) fn adopt_bg_job(pid: u64, slot: u64, name: &str) -> bool {
     let mut jobs = BG_JOBS.lock();
     let Some(free) = jobs.iter_mut().find(|s| s.is_none()) else {
@@ -4960,7 +4987,130 @@ pub(crate) fn adopt_bg_job(pid: u64, slot: u64, name: &str) -> bool {
     true
 }
 
-/// BARE-EXEC (GR20, x86): run a program by TYPING ITS NAME — `vug.elf` at the prompt starts
+/// BARENAME (PARITY §6.6a): the aarch64 program-source root — the namespace spelling of x86's
+/// "the volume executables live on".
+///
+/// x86 has no VFS: its whole path universe is the program-source FAT, so there "resolve from the
+/// cwd" and "resolve on the volume executables live on" are the same sentence, and `/fat` is
+/// carried only as an alias for that one volume's root. On the Pi the two come apart — `/` is
+/// native UnaFS and `arroyo`'s `kernel8` FAT staging puts `VUG.ELF`/`VUGC.ELF`/`VUGX.ELF`/
+/// `STAT.ELF`/`PULSE.ELF` on the SD FAT, which `vfs_mount_table` binds at `/fat`. This constant is
+/// that half of the x86 sentence, named rather than inlined.
+#[cfg(all(feature = "baremetal", target_arch = "aarch64"))]
+const EXEC_ROOT: &str = "/fat";
+
+/// BARENAME (PARITY §6.6a): resolve a bare-name candidate to an absolute VFS path, or `None`.
+///
+/// **Through the VFS seam, not a private path scheme.** [`vfs_path`] is what `ls`, `cat`, `run`,
+/// `bg` and `vfs` resolve through, so a bare name means exactly what those verbs say it means —
+/// `cd /fat` then `vug` works for the same reason `cd /fat` then `cat VUG.ELF` works, and a name
+/// that `ls` cannot show is a name this cannot launch.
+///
+/// Order, and it is x86's order transposed rather than a new policy:
+///
+/// 1. **cwd-relative**, via `vfs_path` — the x86 first (and only) probe, verbatim in intent.
+/// 2. **The program-source root**, [`EXEC_ROOT`] — only for a RELATIVE token, and skipped when it
+///    would repeat probe 1. On x86 this step is not absent, it is *implied*: its cwd already sits
+///    on the program source, so its single probe covers both. Dropping it on the Pi would mean the
+///    operator at `/` still could not type `vug` — the exact defect §6.6a names, with `bg
+///    /fat/VUG.ELF` still the only way in — so it is the step that makes the port a port.
+///
+/// A directory never resolves: a bare name launches a program.
+#[cfg(all(feature = "baremetal", target_arch = "aarch64"))]
+fn exec_resolve(name: &str) -> Option<String> {
+    use crate::fs::vfs::NodeKind;
+    let mt = vfs_mount_table();
+    let probe = |p: String| -> Option<String> {
+        match mt.stat(&p) {
+            Ok(st) if !matches!(st.kind, NodeKind::Dir) => Some(p),
+            _ => None,
+        }
+    };
+    let from_cwd = vfs_path(name);
+    if let Some(hit) = probe(from_cwd.clone()) {
+        return Some(hit);
+    }
+    if name.starts_with('/') {
+        return None;
+    }
+    let from_root = normalize_path(EXEC_ROOT, name);
+    if from_root == from_cwd {
+        return None;
+    }
+    probe(from_root)
+}
+
+/// BARENAME (PARITY §6.6a): the on-disk spelling of an already-resolved path, for the messages.
+///
+/// x86 reads `canon` out of the FAT directory entry its re-resolve walked, so `jobs` shows
+/// `/VUG.ELF` after the operator typed `vug`. The VFS `stat` this arch resolves through returns no
+/// name at all, so the spelling is recovered the only honest way available: list the parent and
+/// take the entry that matches case-insensitively. A miss (or an unreadable parent) falls back to
+/// the resolved path unchanged — a display name is never worth a refusal.
+#[cfg(all(feature = "baremetal", target_arch = "aarch64"))]
+fn exec_canon(path: &str) -> String {
+    let (dir, leaf) = match path.rfind('/') {
+        Some(0) => ("/", &path[1..]),
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => return String::from(path),
+    };
+    if let Ok(rows) = vfs_mount_table().read_dir(dir) {
+        if let Some(row) = rows.iter().find(|r| r.name.eq_ignore_ascii_case(leaf)) {
+            return normalize_path(dir, &row.name);
+        }
+    }
+    String::from(path)
+}
+
+/// BARE-EXEC: re-resolve the core's answer over the live volume — the one genuinely per-arch step
+/// of a bare-name launch, split out so everything after it is ONE body on both arches.
+///
+/// Returns `(load_path, canon)`: what to hand [`read_el0_image`], and the spelling the operator and
+/// the capture are shown. On x86 `load_path` is the token the core returned, untouched, because
+/// that arch's loader resolves it identically and quoting anything else would change lines a
+/// shipping spec anchors on. On aarch64 it is the ABSOLUTE VFS path [`exec_resolve`] found, because
+/// there the token alone is ambiguous between the native root and the program source.
+///
+/// Both twins OWN their refusal: a miss here is a volume that changed under us between the core's
+/// probe and this read (a card pulled mid-command) — an honest race, reported as one rather than as
+/// a typo — so each prints its panel line and its serial mirror before returning `None`.
+///
+/// LAUNCH-AR (x86): the PROGRAM SOURCE, matching `FatVolume::is_file` above and `read_el0_image`
+/// below. All three legs of a bare-name launch — probe, re-resolve, read — bind the same handle;
+/// the Boot AR failure was exactly what happens when they do not.
+#[cfg(target_arch = "x86_64")]
+fn bare_exec_reresolve(console: &mut Console, typed: &str, name: &str) -> Option<(String, String)> {
+    let Ok(fs) = crate::fs::fat::mount_program_source() else {
+        console.println(&alloc::format!("{}: the volume went away before it could be started", typed));
+        serial_println!(":: BAREXEC: {} (typed '{}') — REFUSED: volume vanished after resolution ::", name, typed);
+        return None;
+    };
+    match resolve_path(&fs, &normalize_path(&cwd_path(), name)) {
+        Ok(Resolved::Entry(de, canon)) if !de.is_dir => Some((String::from(name), canon)),
+        _ => {
+            console.println(&alloc::format!("{}: {} went away before it could be started", typed, name));
+            serial_println!(":: BAREXEC: {} (typed '{}') — REFUSED: resolved name no longer a file ::", name, typed);
+            None
+        }
+    }
+}
+
+/// BARENAME (PARITY §6.6a): the aarch64 twin — [`exec_resolve`] again (the same walk the probe
+/// made, one command ago, closing the same race x86's re-mount closes) plus [`exec_canon`] for the
+/// display spelling. Same two message shapes, so a Pi capture and an rMBP capture read alike.
+#[cfg(all(feature = "baremetal", target_arch = "aarch64"))]
+fn bare_exec_reresolve(console: &mut Console, typed: &str, name: &str) -> Option<(String, String)> {
+    let Some(path) = exec_resolve(name) else {
+        console.println(&alloc::format!("{}: {} went away before it could be started", typed, name));
+        serial_println!(":: BAREXEC: {} (typed '{}') — REFUSED: resolved name no longer a file ::", name, typed);
+        return None;
+    };
+    let canon = exec_canon(&path);
+    Some((path, canon))
+}
+
+/// BARE-EXEC (GR20; aarch64 since PARITY §6.6a): run a program by TYPING ITS NAME — `vug.elf` at
+/// the prompt starts
 /// `VUG.ELF` off the FAT volume, in a window, with the prompt back immediately.
 ///
 /// MIDDEN-M1: called from `dispatch_command`'s `Plan::Exec` arm, which `midden_core` produces only
@@ -4991,6 +5141,14 @@ pub(crate) fn adopt_bg_job(pid: u64, slot: u64, name: &str) -> bool {
 /// *bare* `vug` work. `cd DOCS` then a bare name works for the same reason, since the cwd is
 /// applied first.
 ///
+/// **On aarch64 (PARITY §6.6a)** the same two sentences hold with one substitution: the resolution
+/// is `exec_resolve` — the VFS seam `ls`/`cat`/`run`/`bg` share, cwd first and then the
+/// program-source root `/fat` — and `canon` is recovered by [`exec_canon`] from the parent listing
+/// rather than from a FAT directory entry. Case behaves the same way for the same reason: the FAT
+/// backend behind `/fat` matches components case-insensitively, so arm 2 of the core's resolver
+/// (`vug` → `vug.elf`) already hits the on-disk `VUG.ELF` and the upper-cased arm 3 stays latent
+/// here too.
+///
 /// # Why background, and how the operator stops it
 ///
 /// Launched through `spawn_user_image_bg` — the same call `winx8_launcher` makes — so a windowed
@@ -5010,32 +5168,20 @@ pub(crate) fn adopt_bg_job(pid: u64, slot: u64, name: &str) -> bool {
 /// The loader is untouched: the bytes go to `spawn_user_image_bg` exactly as `bg` sends them, so the
 /// per-segment W^X mapping, the ring-3 window bound and the fault-kill net are the same ones CFU-2's
 /// write gate is built on. This adds a way to CALL the loader, never a way to relax it.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
 fn bare_exec(console: &mut Console, typed: &str, name: &str) -> bool {
     // --- re-resolve the core's answer over the live volume ---------------------------------------
-    // The core probed through this same mount a moment ago; re-resolving costs one walk and closes
-    // the window where the card changed underneath. A miss here is a RACE, not a typo, and says so.
-    // LAUNCH-AR: the PROGRAM SOURCE, matching `FatVolume::is_file` above and `read_el0_image`
-    // below. All three legs of a bare-name launch — probe, re-resolve, read — now bind the same
-    // handle; the Boot AR failure was exactly what happens when they do not.
-    let Ok(fs) = crate::fs::fat::mount_program_source() else {
-        console.println(&alloc::format!("{}: the volume went away before it could be started", typed));
-        serial_println!(":: BAREXEC: {} (typed '{}') — REFUSED: volume vanished after resolution ::", name, typed);
+    // The core probed a moment ago; re-resolving costs one walk and closes the window where the
+    // volume changed underneath. A miss is a RACE, not a typo, and `bare_exec_reresolve` says so —
+    // it is the ONE per-arch step, and it has already printed if it returns `None`.
+    let Some((load_path, canon)) = bare_exec_reresolve(console, typed, name) else {
         return false;
-    };
-    let canon = match resolve_path(&fs, &normalize_path(&cwd_path(), name)) {
-        Ok(Resolved::Entry(de, canon)) if !de.is_dir => canon,
-        _ => {
-            console.println(&alloc::format!("{}: {} went away before it could be started", typed, name));
-            serial_println!(":: BAREXEC: {} (typed '{}') — REFUSED: resolved name no longer a file ::", name, typed);
-            return false;
-        }
     };
     // --- loud from here: the name is a real file, so we owe an outcome --------------------------
     // Every refusal below is mirrored to serial as well as the panel. The panel line is what the
     // operator reads; the serial line is what a headless capture reads, and without it a bench log
     // could not tell "refused, and here is why" from "the keystroke never arrived".
-    let Some(bytes) = read_el0_image(console, typed, name) else {
+    let Some(bytes) = read_el0_image(console, typed, &load_path) else {
         // read_el0_image named the reason on the panel (size / arch / read error).
         serial_println!(":: BAREXEC: {} — REFUSED at the image read/pre-check (see the panel line) ::", canon);
         return true;
@@ -5054,8 +5200,9 @@ fn bare_exec(console: &mut Console, typed: &str, name: &str) -> bool {
         );
         return true;
     }
-    // The ELF64 / little-endian / EM_X86_64 pre-checks already ran inside `read_el0_image`, which
-    // named any of them; the kernel loader re-validates from scratch regardless.
+    // The ELF64 / little-endian / e_machine pre-checks already ran inside `read_el0_image` (the
+    // arch's own twin, so EM_X86_64 there and EM_AARCH64 here), which named any of them; the kernel
+    // loader re-validates from scratch regardless.
     let n = bytes.len();
     match crate::arch::syscall::spawn_user_image_bg(&bytes) {
         Ok((pid, slot, entry)) => {
