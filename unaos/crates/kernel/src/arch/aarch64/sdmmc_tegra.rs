@@ -55,14 +55,17 @@
 //     negotiation (ACMD6 / CMD6) is deferred — it is not needed to census the card and keeps this rung
 //     minimal. The reported width/speed is "1-bit, default-speed (25 MHz)".
 //
-// ## Read-only-by-construction
+// ## Read-only-by-construction (scope updated 2026-08-19 — the original absolute claim went stale)
 //
-// This module issues ONLY the identification ladder + CMD17 single-block READ: CMD0, CMD8, CMD55/ACMD41,
-// CMD2, CMD3, CMD9, CMD7, CMD16, CMD17. There is NO CMD24/WRITE_SINGLE_BLOCK, no CMD25, no ACMD6
-// bus-width write, no erase, no CMD6 switch. The controller-register writes it does make (SRST, clock,
-// power, command issue) are the SDHCI machinery every read needs; NONE of them are a WRITE to the card's
-// storage. `grep` the diff for `cmd(24)` / `write_block` / `WRITE` and find nothing that targets card
-// storage — read-only by construction (see review/unaos-orin-sdmmc1-LANDING.md).
+// The RECON/IDENTIFY path issues ONLY the identification ladder + CMD17 single-block READ: CMD0,
+// CMD8, CMD55/ACMD41, CMD2, CMD3, CMD9, CMD7, CMD16, CMD17 — no erase (CMD32–38) exists anywhere in
+// this file, and no recon-path code can reach a write. Since ORIN-SDMMC-2/INSTALL-1 the file ALSO
+// carries an explicit write path — `write_block_at` (CMD24, `sdmmc_arm`) and `write_blocks_at`
+// (CMD25, `install_target`) — DOUBLE-GATED behind features the recon build does not carry, with no
+// caller in the identify/census code. The controller-register writes recon makes (SRST, clock,
+// power, command issue) are SDHCI machinery, not card-storage writes. An earlier version of this
+// header claimed "grep for cmd(24) and find nothing" — that was true when written and is now false;
+// the reachable-from-recon invariant is the one that holds (see review/unaos-orin-sdmmc1-LANDING.md).
 
 #![cfg(feature = "sdmmc")]
 
@@ -2171,12 +2174,24 @@ mod metal {
             );
             return;
         }
+        let mut skipped = 0u32; // per-register guard: a PARTIAL poison read must not author 0xffffffff into tap/trim (delta-review hardening)
         for (i, off) in VENDOR_REGS.iter().enumerate() {
+            if is_poison(vals[i]) {
+                skipped += 1;
+                continue;
+            }
             write32(base, *off, vals[i]);
         }
+        if skipped > 0 {
+            serial_println!(
+                "{}   M2: vendor block restored across SRST_ALL — {} poison register(s) SKIPPED (left at reset defaults, none authored) ::",
+                PS, skipped
+            );
+        } else {
         serial_println!("{}   M2: vendor block restored across SRST_ALL (firmware values, none authored) ::", PS);
+        }
 
-        if vals[7] & AUTO_CAL_ENABLE == 0 {
+        if is_poison(vals[7]) || vals[7] & AUTO_CAL_ENABLE == 0 {
             serial_println!("{}   M2: pad auto-calibration was disabled by firmware — not started ::", PS);
             return;
         }

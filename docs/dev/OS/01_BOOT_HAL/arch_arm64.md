@@ -8961,3 +8961,20 @@ hoist the capstone spawn — `sched.rs`, shared kernel-core, negotiation require
 demoted to PENDING until it lands. Lossy-TCU caveat, re-proven: boot 3's capture lost the guard and
 EDID head lines entirely — single-print witnesses need the boot-2 cross-capture evidence or 24–32×
 repetition.
+
+### SDID — the identify ladder gets evidence (boot-4 owed)
+
+Boot 3's `recon done at M2 (no identified card / honest stop)` was an evidence-free failure: every
+identify rung was `.ok()?`, so the ladder died silently somewhere past card-detect. SDID
+(`ecef8086`, hardened per delta review) makes failure impossible to hide: `send_command` returns
+the INTERRUPT register at the failing rung; `cmd_step` names every command and on failure prints
+INTERRUPT/PresentState/CONTROL0/1 then resets CMD/DAT so the controller is not left inhibited;
+SD-spec settle delays (power/clock/CMD0/ACMD41 rounds); the Tegra vendor block (tap/trim, comp pad,
+auto-cal config) is snapshotted before `SRST_ALL` and the firmware's own values restored after —
+per-register poison guard: a poisoned word is left at reset defaults, never authored; pre-reset
+Host Control 2 is printed with 1.8 V-signalling decoded (surfaced, not worked around); CMD8 timeout
+is treated as an SD v1.x card (ACMD41 drops HCS), not as fatal. Read-only scope, stated precisely:
+the recon path cannot reach a write; the file's write path (CMD24/25) is pre-existing
+ORIN-SDMMC-2/INSTALL-1 work, double-gated behind `sdmmc_arm`/`install_target`, absent from the
+recon build — the old "no write command exists in this file" header claim was stale and has been
+corrected in place. Boot 4 either publishes the block backend or names the dying rung.
