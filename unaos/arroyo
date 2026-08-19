@@ -473,6 +473,14 @@ _feats=""
 [ -n "${UNAOS_KEPLER_TAKEOVER:-}" ] && _feats="${_feats}nvidia-kepler-takeover,"
 [ -n "${UNAOS_KEPLER_FIFO:-}" ] && _feats="${_feats}nvidia-kepler-fifo,"
 [ -n "${UNAOS_KDISP_HOLD:-}" ] && _feats="${_feats}nvidia-kepler-kdisp-hold,"
+# PCIH / NOASPM: UNAOS_NOASPM=1 clears the ASPM-control bits (LNKCTL[1:0]) on BOTH the Kepler root
+# port and the endpoint at kepler init (drivers/gpu/pcihealth.rs) — the BAR1-wedge ASPM experiment.
+# RMW confined to LNKCTL[1:0]; prints one '[pcih] aspm cleared rp XXXX->XXXX ep XXXX->XXXX' witness
+# line. Implies nvidia-kepler (Cargo-side). The unconditional census + wedge sampler ride EVERY
+# kepler boot regardless of this knob; the knob arms only the clear. Default OFF => the clear is not
+# linked, unarmed media byte-identical. ⚠ NOT yet mapped in builder/src/main.rs (out of this arc's
+# lane) — until that one-liner lands, esp-x86 metal media cannot arm it; flagged in the arc NOTES.
+[ -n "${UNAOS_NOASPM:-}" ] && _feats="${_feats}noaspm,"
 # CE-LADDER: UNAOS_KEPLER_CE=1 arms the read-only copy-engine reconnaissance
 # (drivers/gpu/kepler_ce.rs) — R1 PTOP sweep, R2 CE PRI probe, R3 wide runlist scan, R5
 # firmware instance-block walk. Runs from kepler::init ABOVE the fifo leg, so it is upstream
@@ -820,6 +828,12 @@ arm_features() {
     # too, which makes this paragraph true as written and demotes the strip back to what every other
     # entry here is: fingerprint hygiene, not a load-bearing dependency.
     f="${f//,gen7,/,}"
+    # PCIH / NOASPM rides the same strip, for the same reason: every noaspm-gated byte lives in
+    # the x86_64-only half of drivers/gpu/pcihealth.rs, so the feature emits not one byte of
+    # aarch64 CODE — but an enabled feature is hashed into cargo's -Cmetadata fingerprint, so
+    # leaving it in would shift every aarch64 media hash for zero observable change. Stripped =>
+    # the x86 track can run the ASPM experiment without touching Pi or Jetson media.
+    f="${f//,noaspm,/,}"
     f="${f#,}"; f="${f%,}"
     if [ -n "$f" ]; then printf -- '--features %s' "$f"; fi
     return 0
@@ -1488,7 +1502,7 @@ check_user_arch() {
 }
 
 # GATE-CFG: the DEFAULT feature set is a tiny fraction of this kernel. `[features]` in
-# crates/kernel/Cargo.toml carries 87 knobs plus `default = []`, so the two legs below compile only
+# crates/kernel/Cargo.toml carries 98 knobs plus `default = []` (RE-COUNTED with the awk one-liner below on the PCIH tree, 2026-08-19: the 87 recorded on GR21 had gone stale by ten other-lane knobs before `noaspm` — the 98th, and on `x86-all` below — landed), so the two legs below compile only
 # (this count was stale at 78 when GR20's `bcmarecon` was added — the real count was already 82,
 # four other-lane knobs having landed without it being bumped; and it was stale AGAIN at 84 for
 # `sdhcblk` — the real count at that base was 85, `wxnro` having landed on `x86-all` without the
@@ -1573,7 +1587,7 @@ KERNEL_CFG_MATRIX=(
   # way, which is the build the metal flight actually carries.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,wifival"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,wifival,noaspm"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder. Cannot carry the tegra family — see the mutual-exclusion note above.

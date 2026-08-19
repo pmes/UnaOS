@@ -7846,6 +7846,13 @@ pub fn wcser_overdue_probe() {
         COMP_PASS_PHASE.load(Relaxed),
         COMP_PASS_ROW.load(Relaxed),
     );
+    // PCIH — root-port-at-wedge sampler, on the same cadence as the tripwire line (first
+    // crossing + each 5 s standing repeat). ROOT PORT registers only: its config space
+    // completes from the root complex, so this cannot capture the last surviving core the
+    // way an endpoint read would if the GK107 host interface is the thing that hung. If
+    // kepler never initialized (or found no bridge above it), this prints nothing.
+    #[cfg(feature = "nvidia-kepler")]
+    crate::drivers::gpu::pcihealth::rp_at_wedge();
 }
 
 /// WCPAR — per-CPU count of window composes that reached the [`STAGE`] pool, since the last rollup.

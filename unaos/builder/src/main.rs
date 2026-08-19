@@ -312,6 +312,10 @@ fn main() {
     // module; DEFAULT OFF => module + call site unlinked => byte-identical media. Needs
     // UNAOS_KEPLER + UNAOS_KEPLER_TAKEOVER to reach its seam. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_WC").is_ok() { feats.push("wc"); }
+    // PCIH: UNAOS_NOASPM=1 clears ASPM (LNKCTL[1:0]) on the Kepler link at init — the boot-8
+    // endpoint-hang discriminator. DEFAULT OFF => feature unlinked => byte-identical media.
+    // Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_NOASPM").is_ok() { feats.push("noaspm"); }
     // R0 / RTWIT: UNAOS_RTWIT=1 arms the WORST-CASE RULER (`rtwit`) — the `[rtwit]` tail instruments
     // (input→present latency, per-lock max hold, max interrupt-mask span). MAXes only; pure measurement,
     // no scheduling/locking/present change. x86_64-only in effect; DEFAULT OFF => empty inline shims,

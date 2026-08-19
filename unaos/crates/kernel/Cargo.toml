@@ -25,6 +25,16 @@ rtwit = []
 rtpi = []
 # Cleanroom GPU driver features
 nvidia-kepler = []
+# PCIH / NOASPM: `UNAOS_NOASPM=1` — clear the ASPM-control bits (LNKCTL[1:0]) on BOTH the
+# Kepler root port and the endpoint at kepler init (drivers/gpu/pcihealth.rs), for the BAR1
+# wedge theory: if the metal hangs are the GK107 host interface dropping into a firmware-armed
+# ASPM low-power state, a noaspm boot should stop wedging. Read-modify-write confined to
+# LNKCTL[1:0] — endpoint first, then root port, the disable order the spec asks for — and one
+# `[pcih] aspm cleared ...` witness line. Implies `nvidia-kepler` (the clear runs at kepler
+# init and nowhere else). DEFAULT OFF => the clear is not linked and unarmed builds are
+# byte-identical. Kept in sync with arroyo (builder/src/main.rs mapping is a flagged follow-up
+# — out of this arc's lane).
+noaspm = ["nvidia-kepler"]
 nvidia-kepler-takeover = []
 nvidia-kepler-fifo = []
 nvidia-kepler-kdisp-hold = []
