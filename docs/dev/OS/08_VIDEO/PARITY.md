@@ -1890,6 +1890,49 @@ metal via the playbooks. The pi playbook carries the read guidance from dsktp bo
 
 ---
 
+### 6.15 WINX-8 — VUGSHRINK's two latent x86 faults, found by the fold, fixed at the crate
+
+*(§6.14 is reserved: the rmbp tree carries it in flight for the §6.9c boot-seam remedy candidates.)*
+
+**Provenance.** rmbp 2's WINX-8 battery leg, pre-validating the trunk fold (main `ad2fab78` onto
+their tip), failed deterministically on both x86-fat legs: worker A killed at `cr2 = base+0x2f88
+err=0x7` on its first frame write, then the parent killed at exactly `base+0x56000` — the 288x288
+surface end. Reproduced here to the byte on `hw-pi4@5d7ff0c8` (RX `memsz 0x212f`): **no CRYSTAL
+growth was needed — VUGSHRINK itself shipped both faults.** They were invisible to pi 2's gates
+because no pi-side suite runs the x86 vug (rmbp 2 flagged the same blindness in `x86-fat.spec`:
+no WINX-8 REQUIRE, no ring-3-fault FORBID).
+
+**Fault 1 — page 2 had two owners.** VUGSHRINK's budget (`0xb0 + .text <= 0x3000`) was file-math
+true and runtime false: worker A's UVUG-1 stack top of `base+0x3000` descends through vaddr page 2,
+and the moment text legally claimed that page (it stands at `memsz 0x212f`), the page went RO+X and
+A died on its first frame write. Before VUGSHRINK the collision was masked, not absent: text past
+0x2000 also blew the 16 KiB file window, so the BUILD failed before any boot could.
+
+**Fault 2 — the base derivation skewed +0xb0.** `FILEHDR PHDRS` moved `e_entry` from 0 to 0xb0, and
+main.rs derived the window base as `_start`'s own address — correct for `e_entry` 0, now +0xb0 off.
+Every landmark computed off `base` shifted with it: the info-page flags word was read at +0x4130
+instead of +0x4080, both stacks moved, and the parent's surface blit started at window+0x50b0 and
+walked off its mapping at exactly window+0x56000. That is the parent's corpse in the WINX-8 report,
+and it is independent of fault 1.
+
+**The fix (crate-local, x86-only, aarch64 byte-identical — verified by baseline-worktree rebuild
+and `cmp`).** (a) `base = _start - 0xb0` on x86, with `user-vug-x86.ld` ASSERTing
+`_start == SIZEOF_HEADERS` so the constant cannot rot. (b) Worker A's stack top moves to the window
+end (`base+0x4000` — `sys_thread_spawn` probes the 16 bytes *below* sp, so the boundary top is
+legal); page 3 is now shared three ways (.bss head / B below +0x3800 / A below +0x4000), and both
+workers run the identical `uvug_worker`, so B's long-proven envelope bounds A's need. (c) Two new
+link ASSERTs turn every page-contract violation the script can see into a link error: text must end
+by 0x3000, and .bss may not cross 0x3600 into B's floor. Post-fix disassembly shows every window
+landmark at its exact link VA (A sp 0x4000, B sp 0x3800, surface 0x5000, flags 0x4020); the
+stripped image is 12640 B against the 16384 B window.
+
+**What this section does NOT claim.** The x86 runtime proof is rmbp 2's to take: their WINX-8 leg
+is the only suite that exercises this binary under load, and the fold re-run is the verdict. The
+`x86-fat.spec` REQUIRE/FORBID gap is flagged to the seat, not taken here — spec ownership is not
+this tree's.
+
+---
+
 ## 7. Accounting check
 
 501 sites. 10 already ported (family 1) + 67 `wc` gates (family 2) + 165 plain (family 3) + 162
