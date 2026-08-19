@@ -16808,6 +16808,23 @@ fn winx3_launcher(_demo_cpu: usize) {
     let mut wx = img.clone();
     wx[64 + 4..64 + 8].copy_from_slice(&7u32.to_le_bytes()); // PF_R|PF_W|PF_X
     let rejects_wx = super::elf::validate_elf(&wx, user_window_size()).is_err();
+    // And the WINX-8 defence-in-depth refusal, BOTH polarities (validate-only — the mapper never
+    // sees these images, so the text/data vaddr overlap the stretch creates is immaterial).
+    // BROKEN shape: the text p_memsz stretched so the RX span crosses into the FINAL window page —
+    // the page the loader's own `sp = window top` makes the first stack page of every program. Must
+    // be refused at load time (`:: elf: REFUSED rx-crosses-final-window-page … ::`), not loaded to
+    // die on the program's first frame push.
+    let mut rx_cross = img.clone();
+    let cross = (user_window_size() - 0x1000 + 1) as u64; // one byte INTO the final page
+    rx_cross[64 + 40..64 + 48].copy_from_slice(&cross.to_le_bytes()); // text p_memsz
+    let rejects_rx_cross = super::elf::validate_elf(&rx_cross, user_window_size()).is_err();
+    // FIXED shape: the RX span ending exactly AT the final-page boundary owns no byte of the final
+    // page and MUST load — the refusal is `end > boundary`, not `>=`. This is the boundary the
+    // repaired VUG-X86.ELF layout sits under (its RX memsz 0x1fe5 ends well below it).
+    let mut rx_edge = img.clone();
+    let edge = (user_window_size() - 0x1000) as u64;
+    rx_edge[64 + 40..64 + 48].copy_from_slice(&edge.to_le_bytes()); // text p_memsz
+    let loads_rx_edge = super::elf::validate_elf(&rx_edge, user_window_size()).is_ok();
 
     serial_println!(
         ":: WINX-3: ELF loader — a synthesized two-segment ELF64 ({} bytes) through spawn_user_image_bg, the same path `bg` takes ::",
@@ -16854,6 +16871,8 @@ fn winx3_launcher(_demo_cpu: usize) {
     let ok = plan_ok
         && rejects_wrong_arch
         && rejects_wx
+        && rejects_rx_cross
+        && loads_rx_edge
         && status == WINX_WITNESS_ALL as i32
         && windowed
         && presents >= 2
@@ -16861,14 +16880,14 @@ fn winx3_launcher(_demo_cpu: usize) {
         && cleared;
     if ok {
         serial_println!(
-            ":: WINX-3: ELF loader — 2 PT_LOADs mapped W^X, entry {:#x}, ring-3 witness {:#x} through the ELF path, {} presents, wrong-arch + W+X images refused, reap clean -> PASS ::",
+            ":: WINX-3: ELF loader — 2 PT_LOADs mapped W^X, entry {:#x}, ring-3 witness {:#x} through the ELF path, {} presents, wrong-arch + W+X + rx-crosses-final-window-page images refused (edge loads), reap clean -> PASS ::",
             entry, status, presents
         );
     } else {
         serial_println!(
-            ":: WINX-3: ELF loader FAIL — plan={} rej_arch={} rej_wx={} status={:#x} windowed={} presents={} gone={} cleared={} (want true/true/true/{:#x}/true/>=2/true/true) ::",
-            plan_ok, rejects_wrong_arch, rejects_wx, status, windowed, presents, gone, cleared,
-            WINX_WITNESS_ALL
+            ":: WINX-3: ELF loader FAIL — plan={} rej_arch={} rej_wx={} rej_rxcross={} edge_loads={} status={:#x} windowed={} presents={} gone={} cleared={} (want true/true/true/true/true/{:#x}/true/>=2/true/true) ::",
+            plan_ok, rejects_wrong_arch, rejects_wx, rejects_rx_cross, loads_rx_edge, status,
+            windowed, presents, gone, cleared, WINX_WITNESS_ALL
         );
     }
 }
