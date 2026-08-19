@@ -2650,26 +2650,22 @@ pub fn spawn_user_thread(
 /// never joined: a silent hang at the parent's frame barrier). This arc changes WHICH eligible core
 /// is chosen, and nothing about which cores are eligible.
 ///
-/// Render and service are DEPRIORITISED, not excluded — preferred away from first, accepted if they
-/// are all that is dispatching. Excluding them outright would reintroduce the hang this function's
-/// probe exists to prevent, on a machine small enough that they are the only siblings.
+/// The SERVICE core is DEPRIORITISED, not excluded — preferred away from first, accepted if it is
+/// all that is dispatching. Excluding it outright would reintroduce the hang this function's probe
+/// exists to prevent, on a machine small enough that it is the only sibling.
 ///
-/// The ladder here is TWO tiers — `{render, service}` excluded, then nothing excluded — and review
-/// F21 is right that this is NOT `pick_cpu`'s ladder, which is THREE (`{render, service}`, then
-/// `{render}`, then nothing). The difference is deliberate, and is written down so the two are not
-/// "unified" later by someone reading a looser earlier wording. `pick_cpu`'s middle rung keeps a
-/// long-lived program off the SERVICE core one rung longer than off the render core, because that
-/// rung is where the `xhci_worker_cpu` storage-latency preference lives. Here the caller's own core
-/// is already excluded, so by the time the first rung fails the machine has at most two dispatching
-/// cores left and there is no third candidate for a middle rung to choose between. Ordering
-/// render-before-service at that point would be a distinction with no set to apply it to.
+/// NO-RESERVATION (Peter, 2026-08-19: "THERE IS NO RESERVING CORES"). The RENDER core used to share
+/// that first-rung skip. It does not any more: it is scored on the same key chain as every other
+/// dispatching sibling and taken when it wins. The bench reading that ended the carve-out is in
+/// [`try_steal`]'s note — c1 at 0–5 % across a six-vug sitting while the rest of the machine ran
+/// 64–82 %. Review F21's "the two ladders differ" observation is therefore moot in the direction it
+/// pointed: both ladders are now TWO tiers, `{service}` then nothing, and they agree by construction.
 ///
 /// LOCKING: `run_queue_len`'s WEDGE-4 `<W1>` shape. The caller is `sys_thread_spawn`, i.e. syscall
 /// context at IF possibly 1, so the whole scan is taken inside `without_interrupts` for the identical
 /// reason `pick_cpu` and `emit_load_witness` do — at most `MAX_CPUS` iterations, one run-queue lock
 /// at a time, never nested, no allocation and no UART inside.
 pub fn sibling_online_cpu(caller: usize) -> usize {
-    let render = crate::arch::smp::render_cpu();
     let service = crate::arch::smp::service_cpu();
     let rot = AUTO_ROTATE.fetch_add(1, Ordering::Relaxed);
     let mut best: Option<(usize, usize, u32)> = None; // (cpu, depth, pct)
@@ -2680,7 +2676,7 @@ pub fn sibling_online_cpu(caller: usize) -> usize {
                 if c == caller || SCHED[c].scheduler_rsp.load(Ordering::Acquire) == 0 {
                     continue;
                 }
-                if tier < 1 && (render == Some(c) || service == Some(c)) {
+                if tier < 1 && service == Some(c) {
                     continue;
                 }
                 let depth = RUN_QUEUES[c].lock().len();
@@ -2936,7 +2932,7 @@ static PLACE_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
 /// SMPBAL-X86: choose the core a `CPU_AUTO` spawn lands on. Returns `requested` unchanged for every
 /// other value — the PIN CONTRACT, and it is checked FIRST so a named core can never be second-guessed.
 ///
-/// THREE exclusions, and they are not the same kind of rule.
+/// TWO exclusions, and they are not the same kind of rule.
 ///
 ///   1. **Core 0 for a COOPERATIVE ring-3 task** (`cooperative_user`, i.e.
 ///      `Task::is_cooperative_user`). HARD — it is a correctness rule, never relaxed at any tier: a
@@ -2951,13 +2947,15 @@ static PLACE_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
 ///      contends the service core's storage latency, and `xhci_worker_cpu` still DECLINES to
 ///      co-locate. The tier-1 relaxation needs a 2-dispatching-core machine to fire — unreachable
 ///      on the 8-core bench — and is safe when it does, merely slower.
-///   3. **The RENDER core.** Performance: it owns the panel and hosts the shell, it is the core the
-///      measured imbalance piled onto, and putting a fresh program back on it restores the defect
-///      this arc exists to remove.
+/// TWO exclusions since 2026-08-19, not three. A third rung used to deprioritise **the RENDER core**
+/// on the theory that it owned the panel and needed the headroom. Peter's ruling ends it — "THERE IS
+/// NO RESERVING CORES" — on bench evidence: the carve-out left c1 at 0–5 % through an entire six-vug
+/// sitting while the rest of the machine ran 64–82 %, for a latency budget that is never spent there
+/// (composite runs on the presenting task's core). A `CPU_AUTO` spawn now scores the render core on
+/// the same key chain as any other, and wins it whenever it is genuinely the shallowest.
 ///
-/// Rules 2 and 3 RELAX in tiers (both, then render only, then neither) so a machine with too few
-/// dispatching cores still places somewhere real instead of failing; rule 1 never relaxes. The tier
-/// ladder deliberately mirrors `smp::worker_pool`'s `Exclusive` / `SvcShared` / `RenderShared`.
+/// Rule 2 RELAXES in tiers (service excluded, then nothing) so a machine with too few dispatching
+/// cores still places somewhere real instead of failing; rule 1 never relaxes.
 ///
 /// Key chain, best first: (1) shallowest ready queue, (2) lowest rolling busy percent from the
 /// SCHEDLOAD-X86 feed (an UNTRACKED core scores 0 — it has folded no span, and a core that just
@@ -2976,15 +2974,14 @@ fn pick_cpu(requested: usize, cooperative_user: bool, name: &'static str) -> usi
         return requested;
     }
     let here = percpu::this_cpu().cpu_index as usize;
-    let render = crate::arch::smp::render_cpu();
     let service = crate::arch::smp::service_cpu();
     let rot = AUTO_ROTATE.fetch_add(1, Ordering::Relaxed);
 
-    // Tier ladder: exclude {render, service}, then {render}, then nothing. Rule 1 (core 0 for a
-    // cooperative ring-3 task) is outside the ladder — it never relaxes.
+    // Tier ladder: exclude {service}, then nothing. Rule 1 (core 0 for a cooperative ring-3 task) is
+    // outside the ladder — it never relaxes. The render core has NO rung: no-reservation ruling.
     let mut best: Option<(usize, usize, u32)> = None; // (cpu, depth, pct)
     x86_64::instructions::interrupts::without_interrupts(|| {
-        for tier in 0..3u8 {
+        for tier in 0..2u8 {
             for i in 0..MAX_CPUS {
                 let c = (rot + i) % MAX_CPUS;
                 if !cpu_dispatching(c) {
@@ -2992,9 +2989,6 @@ fn pick_cpu(requested: usize, cooperative_user: bool, name: &'static str) -> usi
                 }
                 if cooperative_user && c == 0 {
                     continue; // hard rule: never a cooperative ring-3 task on the clock core
-                }
-                if tier < 2 && render == Some(c) {
-                    continue;
                 }
                 if tier < 1 && service == Some(c) {
                     continue;
@@ -5143,7 +5137,7 @@ fn steal_floor(victim: usize) -> usize {
 //
 // | counter | meaning | which mechanism it fingerprints |
 // | --- | --- | --- |
-// | `t` [`STEAL_D_THIEF`] | the thief is the render or service core | neither — an expected refusal |
+// | `t` [`STEAL_D_THIEF`] | the thief is the SERVICE core (the deadlock rule; the render core was dropped from this exclusion by the 2026-08-19 no-reservation ruling) | neither — an expected refusal |
 // | `e` [`STEAL_D_EMPTY`] | no other dispatching core held ANY ready task | the machine really was unpacked |
 // | `f` [`STEAL_D_FLOOR`] | ready tasks existed, none reached its victim's floor | the floor (fixed above) |
 // | `p` [`STEAL_D_PINNED`] | a victim qualified, every ready task on it was pinned, cooperative-excluded, or COOLING | the pin contract / VUGSPREAD-COOL |
@@ -5345,17 +5339,25 @@ static CR3_RELOADS: AtomicU64 = AtomicU64::new(0);
 /// run-queue lock contract; no extra masking is needed and none is taken. At most one run-queue lock
 /// is held at any instant.
 ///
-/// NEITHER THE RENDER CORE NOR THE SERVICE CORE STEALS — the same two exclusions `pick_cpu` applies,
-/// and they have to be repeated here because a steal is a placement decision `pick_cpu` never sees.
-/// The service one is a DEADLOCK rule (`x86_usb_pump` holds the raw `XHCI_CONTROLLER` spinlock there;
-/// a co-located preemptible task that also takes it can preempt the holder and spin forever — the
-/// rule `smp::xhci_worker_cpu` DECLINES rather than break); the render one is the panel's latency
-/// budget, which its idleness between frames represents rather than spare capacity. Both remain valid
-/// VICTIMS: anything steal-eligible sitting on them is precisely what should be drained away. The
-/// tier relaxation `pick_cpu` does has no analogue here and needs none — refusing to steal always
+/// ONE core does not steal: the SERVICE core. That is a DEADLOCK rule (`x86_usb_pump` holds the raw
+/// `XHCI_CONTROLLER` spinlock there; a co-located preemptible task that also takes it can preempt the
+/// holder and spin forever — the rule `smp::xhci_worker_cpu` DECLINES rather than break). It is still
+/// a valid VICTIM: anything steal-eligible sitting on it is precisely what should be drained away.
+/// The tier relaxation `pick_cpu` does has no analogue here and needs none — refusing to steal always
 /// leaves the task where it already runs correctly.
+///
+/// NO-RESERVATION (Peter, 2026-08-19: "THERE IS NO RESERVING CORES"). The render core USED to be
+/// excluded here too, as "the panel's latency budget". The bench refuted it: across a six-vug sitting
+/// c1 sat at 0–5 % while every other core ran 64–82 %, and the composite work the budget was meant to
+/// cover actually runs on the presenting task's core. The machine was holding 12.5 % of itself idle
+/// for a budget that was never spent, so the render core is now an ordinary member of the dispatch
+/// pool — it steals, it is placed onto, it is stolen from. The render SERVICE task is untouched: it
+/// blocks in `GUI_CHANNEL` recv and costs the core nothing while it does.
 fn try_steal(cpu: usize) -> bool {
-    if crate::arch::smp::render_cpu() == Some(cpu) || crate::arch::smp::service_cpu() == Some(cpu) {
+    // DEADLOCK RULE, NOT A RESERVATION — this exclusion survives the no-reservation ruling because it
+    // prevents the `XHCI_CONTROLLER` preempt-the-holder wedge above, not because it holds capacity in
+    // reserve for anyone. It must never be cited as precedent for reserving a core.
+    if crate::arch::smp::service_cpu() == Some(cpu) {
         STEAL_D_THIEF.fetch_add(1, Ordering::Relaxed);
         return false;
     }

@@ -1688,7 +1688,7 @@ any MTRR type, so the MSR was the only missing piece.
 
 ```
 :: SCHED-X86: RENDER on core 1 + INPUT/usb-pump on core 7 (7 AP(s) dispatching) — OS on its own scheduler ::
-:: SCHED-X86 PLACE: aps=7 render=c1 svc=c7 worker=[c2,c3,c4] xhci=[c2,c3] tier=exclusive pool=5 ::
+:: SCHED-X86 PLACE: aps=7 rsvc=c1 svc=c7 worker=[c2,c3,c4] xhci=[c2,c3] tier=exclusive pool=5 sched=all-cores ::
 :: SCHED-X86: BSP entered run loop cpu=0 ::
 :: SCHED-X86: usb-pump task dispatched on core 7 ::
 :: SCHED-X86: input task dispatched on core 7 ::
@@ -1938,18 +1938,36 @@ migration cannot falsify what it was built for). For `CPU_AUTO` it scans the
 **dispatching** cores — `ONLINE_MASK`, set at the top of `run()`, which is the "is this
 core actually popping its queue" predicate `bg_place_cpu` has wanted since WINX-3 — and
 picks by (1) shallowest ready queue, (2) lowest SCHEDLOAD-X86 busy percent, (3) a
-rotating cursor. Three exclusions, of two different kinds:
+rotating cursor. **Two** exclusions, of two different kinds:
 
 | # | excluded | kind | relaxes? |
 | --- | --- | --- | --- |
 | 1 | core 0, for a **cooperative** (IF=0) ring-3 task | correctness — it masks the timer for its lifetime and freezes the global ms-clock | **never** |
 | 2 | the **service** core | deadlock — `x86_usb_pump` holds the raw `XHCI_CONTROLLER` spinlock there, and a co-located preemptible task that also takes it (any ring-3 program touching storage) can preempt the holder then spin on a lock whose owner cannot run. This is `xhci_worker_cpu`'s rule, which DECLINES rather than co-locate | tier 2 |
-| 3 | the **render** core | performance — it owns the panel and hosts the shell, and it is the core the imbalance piled onto | tier 3 |
 
-Rules 2 and 3 relax in tiers mirroring `smp::worker_pool`'s
-`Exclusive`/`SvcShared`/`RenderShared`, so a machine with too few dispatching cores
-still places somewhere real. Rule 1 has no tier. `run_user_image` and `bg_place_cpu`
-now pass `CPU_AUTO`, which closes the open item above.
+Rule 2 relaxes in one tier so a machine with too few dispatching cores still places
+somewhere real. Rule 1 has no tier. `run_user_image` and `bg_place_cpu` now pass
+`CPU_AUTO`, which closes the open item above.
+
+**NO RESERVING CORES — the third exclusion is gone (Peter, 2026-08-19).** A rule 3 used
+to sit in that table: the **render** core, excluded on performance grounds ("it owns the
+panel and hosts the shell, and it is the core the imbalance piled onto"), relaxing at
+tier 3. The bench refuted it. Across a full six-vug sitting the metal capture read c1 at
+**0–5 %** while every other core ran **64–82 %** — the machine holding 12.5 % of itself
+idle for a latency budget that is never spent there, because the composite actually runs
+on the *presenting task's* core. Peter's ruling is verbatim: **"THERE IS NO RESERVING
+CORES."** The render core is now an ordinary member of the dispatch pool — placed onto by
+`pick_cpu` and `sibling_online_cpu` on the same key chain as any other core, a steal thief
+in `try_steal`, and a victim as it always was. The render *service task* is unchanged:
+still spawned pinned to its core, where it blocks in `GUI_CHANNEL` `recv` and costs that
+core nothing while it does.
+
+The service-core exclusion (rule 2, and its `try_steal` twin) **survives the ruling** and
+must never be cited as precedent for reviving a reservation: it prevents a deadlock, it
+does not hold capacity. The same goes for `smp::worker_pool`'s render exclusion, which is
+about WHERE a handful of named fixtures are spawned (a cooperative IF=0 fixture parked on
+the render core stalls the panel; `xhci_worker_cpu`'s takers share a raw spinlock with the
+shell) and holds no capacity idle.
 
 **Correction — `try_steal`.** Placement is one guess made at spawn; stealing is what
 makes a wrong guess cheap. An idle core — one whose own queue came up empty — takes one
@@ -1958,9 +1976,11 @@ the **victim's lock only** (re-checking depth), release, re-home `task.cpu`, pus
 locally. One lock at a time, so no ordering hazard. `STEAL_MIN_DEPTH = 2` leaves the
 last ready task at home, which is what stops two idle cores ping-ponging a lone task.
 `steal_one` scans **LOW→HIGH** priority — take a core's background work, never its most
-urgent task. Neither the render core nor the service core steals — exclusions 2 and 3
-above, repeated here because a steal is a placement decision `pick_cpu` never sees — but
-both remain valid *victims*, since draining eligible work off them is the point.
+urgent task. The **service** core does not steal — exclusion 2 above, repeated here
+because a steal is a placement decision `pick_cpu` never sees — but it remains a valid
+*victim*, since draining eligible work off it is the point. (The render core used to be
+excluded here too; the 2026-08-19 no-reservation ruling removed it, and it now steals like
+any other core.)
 Exclusion 1 is likewise repeated in `steal_one`'s predicate.
 
 **Eligibility is the pin contract, and on x86 that includes ring-3 tasks.** `Task.steal_ok`
@@ -2092,9 +2112,11 @@ passes, over ten minutes, on a visibly lopsided machine.**
 stop — it starts exactly where `sys_thread_spawn` asked and an idle core may correct it
 later, which is this arch's whole stated model. `sibling_online_cpu` now chooses among the
 eligible cores with `pick_cpu`'s key chain (shallowest queue, then lowest rolling busy
-percent, then the shared rotating cursor), deprioritising render/service in a two-step
-ladder rather than excluding them — excluding them outright would reintroduce the silent
-`bg_place_cpu` hang its probe exists to prevent. And the floor is asked of the *victim*:
+percent, then the shared rotating cursor), deprioritising the service core in a two-step
+ladder rather than excluding it — excluding it outright would reintroduce the silent
+`bg_place_cpu` hang its probe exists to prevent. (It deprioritised the render core on the
+same rung until the 2026-08-19 no-reservation ruling; that core is now scored like any
+other sibling.) And the floor is asked of the *victim*:
 depth 1 suffices when the victim is running something (that is two runnable tasks), while a
 victim at `PRIO_IDLE` keeps the floor of 2, because that core is between tasks and about to
 dispatch the very task a thief would take — which is the ping-pong the constant was
