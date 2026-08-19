@@ -5480,6 +5480,55 @@ from the router and the coalesced path is never taken; the gate proves no-regres
 `[cursor8] flush_kb=` is the bench instrument: against an unchanged motion profile it should fall by
 roughly the panel-width-to-sprite-width ratio.
 
+### USBDBG-CURSOR — the debug loop learns to draw the cursor (Boot 3, 2026-08-19)
+
+**Observed.** A card built with BOTH `UNAOS_USBDEBUG=1` and the desktop knobs (`UNAOS_WC=1` + the
+kepler knobs) booted a *working* desktop — the compositor ignites from the Kepler takeover, which runs
+inside PCI enumeration — with **no mouse cursor at all**. The operator could see windows and select
+nothing. The combination had never been flown before: usbdebug cards predate the desktop.
+
+**Mechanism — a missing call, not a broken one.** `main.rs`'s usbdebug loop (`#[cfg(feature =
+"usbdebug")]`, before the GUI takeover, `loop`s forever) drains `pal::next_event()` and *prints* each
+pointer report. It never moved `pal::cursor`. On x86 `pal::cursor::SPRITE_OWNS_PAINT` is true, so
+`move_rel`/`set_abs` are what tail into `video::cursor::repaint()` — the whole front-buffer paint hangs
+off the position update. Every other drain in the kernel does it (the console loop's `Mouse` arms, the
+render service's, the aarch64 router's FOCUS-VIS keep-alive); this one printed the report and dropped
+it. So the sprite was never armed, `[cursor] armed` never printed, and zero cursor pixels were written
+for the entire boot.
+
+**The fix (`usbdebug_cursor_service`, main.rs).** In the usbdebug drain, gated on
+`video::wcx::is_active()` — the compositor's own runtime latch, not a build `cfg`, because a `wc` card
+whose activation DECLINED has no desktop and should keep the old behaviour — move `pal::cursor` and take
+the idempotent `ensure_drawn()` tail, exactly as the console loop's arms do. The hide edge is mirrored
+too: `visible()` going false calls `video::cursor::undraw()` once (this loop owns no `GneissPal`, so it
+cannot spell that as `pal::cursor::restore`). Panel bounds come from `video::WRITER` — the same surface
+`video::cursor` paints into — read into a copy with the guard **dropped before** `move_rel`, since
+`repaint`→`refresh_locked` takes `WRITER` itself.
+
+**No new painter.** Nothing here writes the framebuffer directly; the front-buffer contract
+(undraw-then-draw under one exclusive claim, sprite off the panel while another painter reads those
+pixels) is entirely `video::cursor`'s and is unchanged.
+
+**Heap.** None of this allocates, and the combination costs no heap either: `fbcon::attach_shadow`'s
+QUIET-PANEL early-return already declines the ~28 MiB shadow on any `usbdebug`/`witness` build without
+`bootlog`, and the usbdebug loop never reaches the GUI takeover, so no `Screen` back buffer is
+constructed on this path at all. The x86 heap is 256 MiB since GR26 in any case (`allocator.rs`; the
+48 MiB figure is aarch64's, whose heap region is hand-placed at 32 MiB / 64 MiB long).
+
+**Witness.** One line, once, on the first serviced pointer report:
+
+```
+:: USBDBG-CURSOR: debug-loop cursor service ARMED wc=active panel=WxH == witness ::
+```
+
+so the next diagnosis card proves the arming on the wire rather than from a photograph. `[cursor] armed
+x= y=` from `video::cursor` follows it immediately.
+
+**QEMU cannot witness this.** The whole path needs a real HID pointer *and* a live Kepler takeover;
+QEMU has neither. The gates prove non-regression (`check` both arches, knobs on and off; the x86-fat
+gate with knobs off) and the artifact carries the witness string. The metal falsifier is exactly the
+Boot 3 card: a `usbdebug` + `wc` card now shows the cursor.
+
 ### WEDGE-1 — P66's mechanism is UNKNOWN; this arc hardens and instruments
 
 **Verdict first: this arc did not root-cause P66.** It landed two safe-direction changes and two

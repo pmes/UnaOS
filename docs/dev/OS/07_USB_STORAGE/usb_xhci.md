@@ -2517,6 +2517,42 @@ still prints unchanged beside it.
 (`check` both arches, knob-on and knob-off; `./arroyo test` — QEMU HID pointer still enumerates and
 moves). The click behaviour remains a metal-only verdict.
 
+#### 10f-bis-1. Reading the `PTR:` line cold — the three fields do not count the same thing
+
+Boot 3 (2026-08-19) printed lines of the shape `seen=104 delivered=6 recovered=0`, and read naively that
+looks like 98 lost clicks. It is not: **`seen` is counted per REPORT, `delivered` and `recovered` per
+EDGE.** Written out (all three live in `IntEp::note_buttons`, `drivers/ehci/mod.rs`, and all three are
+`usbdebug`-only statics):
+
+| Field | Counter | Incremented when | Unit |
+| --- | --- | --- | --- |
+| `seen` | `PTR_PRESS_SEEN` | every report whose primary bit is set (`buttons & 0x01 != 0`) — no edge test at all | one per **report** |
+| `delivered` | `PTR_PRESS_DELIVERED` | the report is judged a NEW press: a down edge (`down && !prev`) **or** the §10f-bis re-press recovery (`down && prev && quiet ≥ 120 ms`) | one per **press**, and one `pal::Event::Button` is owed for each |
+| `recovered` | `PTR_PRESS_RECOVERED` | the recovery arm specifically fired — i.e. this delivery only happened because of the quiet-gap rule | one per **press**, a strict **subset of `delivered`** |
+
+Three consequences that make a line readable cold:
+
+- **`seen` ≫ `delivered` is the healthy state, not a loss.** A HID report is a *level*: while a finger
+  rests on the pad the endpoint keeps re-reporting "primary down", and each of those reports bumps `seen`
+  while none of them is a new press. `seen / delivered` is therefore roughly *reports per hold* — Boot 3's
+  104/6 is ~17 reports across 6 presses, which for a ~1 kHz endpoint drained by a frame-rate service loop
+  is an ordinary set of human-length clicks. The ratio measures **poll rate × hold duration**, and nothing
+  about correctness. `seen == delivered` would be the *suspicious* reading (every press seen exactly once
+  means the loop is missing nearly every report of every hold).
+- **`recovered` is the only defect signal on the line.** `recovered = 0` means every press this boot
+  arrived as a clean down edge. `recovered > 0` means that many presses would have been **silently
+  dropped** before §10f-bis — each one is a release report that the one-report-per-service-pass endpoint
+  missed, leaving `prev_buttons` latched at `0x01`. So `recovered` counts *repairs*, and a rising
+  `recovered` is evidence about the polling rate, not about the pad.
+- **The line prints only on a delivery.** It sits inside the `edge || repress` branch, so every `PTR:`
+  line is emitted *at* a press and the numbers are running totals as of that press. `delivered` therefore
+  increases by exactly 1 between consecutive lines from the same endpoint; `seen` jumps by however many
+  down-reports the previous hold produced. `[i]` is the interrupt-endpoint index, so a boot with a
+  trackpad and an external mouse interleaves two independent ledgers.
+
+Nothing here is derivable from a single line in isolation except `recovered`: to say anything about lost
+input you compare `recovered` against zero, never `seen` against `delivered`.
+
 ### 10g. IVY MT-INVESTIGATION — where does true multitouch actually live? (`UNAOS_MTRAW`)
 
 §10e refuted the "descriptor-advertised 0x44 / 511-byte frame streams as-is" model: 736+ observed

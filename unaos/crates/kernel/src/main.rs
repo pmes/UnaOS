@@ -1039,6 +1039,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         serial_println!(":: ============== USB DEBUG MODE ============== ::");
         serial_println!(":: Enumerating USB. Plug in a stick / keyboard / mouse, then type or move the mouse. ::");
         serial_println!(":: Watch for: 'MISSION SUCCESS' (storage), 'POINTER ... ABSOLUTE/RELATIVE', 'KEY', and the USB-DEBUG lines below. ::");
+        // USBDBG-CURSOR — whether this loop last saw the sprite visible, so the auto-hide edge
+        // takes it down exactly once (the twin of the console loop's `cursor_was_visible`).
+        #[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+        let mut cursor_was_visible = false;
         loop {
             // WEDGE-8 (F3): a claimed LOAN — the synchronous BOT work below runs with no lock
             // held, so nothing that spins on the controller can ever wait out a preempted holder.
@@ -1173,6 +1177,29 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             #[cfg(all(target_arch = "x86_64", feature = "videobench"))]
             unaos_kernel::video::vperf::scenario_tick();
             while let Some(event) = unaos_kernel::pal::next_event() {
+                // USBDBG-CURSOR — SERVICE THE SPRITE ON THIS LOOP TOO. Boot 3 (2026-08-19) flew the
+                // first card carrying BOTH `usbdebug` and the desktop knobs (`wc` + kepler): the
+                // compositor ignited (its only trigger is the Kepler takeover, which runs inside PCI
+                // enumeration, long before this loop) and painted a working desktop — with NO
+                // POINTER on it. The operator could see windows and select nothing.
+                //
+                // The mechanism is a missing call, not a broken one. Every other loop in the kernel
+                // that drains pointer reports moves `pal::cursor` — the console loop's `Mouse` arms,
+                // the render service's, the aarch64 router's FOCUS-VIS keep-alive — and on x86
+                // `SPRITE_OWNS_PAINT` makes that move tail straight into `video::cursor::repaint`,
+                // which is what puts the arrow into the FRONT framebuffer above the window layer.
+                // THIS drain printed the report and dropped it. So the sprite was never armed,
+                // `[cursor] armed` never printed, and not one pixel of a cursor was written for the
+                // whole boot. The combination had simply never been flown — usbdebug cards predate
+                // the desktop.
+                //
+                // Placed before the printing `match` rather than inside its arms so the pointer
+                // state is current for anything later in the pass that reads it, and so the two
+                // concerns stay separable: the arms below are the DEBUG VIEW (they print every
+                // report unconditionally, which is this build's whole reason to exist) and this call
+                // is the SYSTEM CURSOR (it acts only where there is a desktop to point at).
+                #[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+                usbdebug_cursor_service(&event);
                 match event {
                     unaos_kernel::pal::Event::Key(c) => {
                         let ch = c as char;
@@ -1186,6 +1213,23 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     }
                     _ => {}
                 }
+            }
+            // USBDBG-CURSOR / CURSOR-HIDE — the auto-hide transition, once per edge. `video::cursor`
+            // splits "put the sprite where the pointer is now" (`repaint`, reached through
+            // `move_rel`/`set_abs` above) from "take it off and leave it off" (`undraw`), and the
+            // hide edge is the second of those: `visible()` going false removes no pixel by itself,
+            // so without this the last arrow of a burst would sit on the panel until some composite
+            // tail happened to cross its box — which over a static desktop is never. This is exactly
+            // what the console loop spells `pal::cursor::restore(&mut pal)` (on x86 that verb
+            // delegates to this same `undraw()`), written directly because this loop owns no
+            // `GneissPal` to hand it.
+            #[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+            {
+                let cursor_vis = unaos_kernel::pal::cursor::visible();
+                if cursor_was_visible && !cursor_vis {
+                    unaos_kernel::video::cursor::undraw();
+                }
+                cursor_was_visible = cursor_vis;
             }
             unaos_kernel::hlt();
         }
@@ -2734,6 +2778,87 @@ static CLICK2_LEFT_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::
 fn gui_send(ev: unaos_kernel::pal::Event) {
     GUI_SENT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     GUI_CHANNEL.send(ev);
+}
+
+/// USBDBG-CURSOR — has the usbdebug loop's cursor service done real work yet? The latch behind the
+/// one witness line, so the arming is provable on the wire from the next diagnosis card instead of
+/// being inferred from the presence of an arrow in a photograph.
+#[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+static USBDBG_CURSOR_ARMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// USBDBG-CURSOR — panel geometry for the usbdebug loop's cursor service, read straight from the
+/// scan-out framebuffer.
+///
+/// Same source and the same argument as FOCUS-VIS's `pal_width_hint` on the Pi: this loop owns no
+/// `TargetPal` — there is no `Screen` anywhere on this path, since the GUI loop that builds one is
+/// never reached — and `pal::cursor` needs bounds to clamp the hot spot against. `video::WRITER` is
+/// the very surface `video::cursor` paints into, so the two cannot disagree. Zero while the
+/// framebuffer is unset, which clamps to (0,0); unreachable in practice, because `wcx::is_active()`
+/// gates the caller and the compositor declines activation on a framebuffer that is not ready.
+///
+/// **It returns a copy and drops the lock, and that is load-bearing.** `pal::cursor::move_rel` tails
+/// into `video::cursor::repaint` -> `refresh_locked`, which takes `video::WRITER` itself. Holding the
+/// guard across the move would deadlock the box on the first pointer report of the boot.
+#[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+fn usbdebug_panel_wh() -> (i32, i32) {
+    let info = unaos_kernel::video::WRITER.lock().info();
+    (info.width as i32, info.height as i32)
+}
+
+/// USBDBG-CURSOR — move the system pointer and repaint its sprite from the usbdebug drain.
+///
+/// ### What it does, in the terms `video::cursor`'s module notes set
+/// `move_rel`/`set_abs` are the position update; on x86 `pal::cursor::SPRITE_OWNS_PAINT` is true, so
+/// each of them tails into `video::cursor::repaint()` — an `undraw`-then-draw pair taken under one
+/// exclusive claim, which is the ordering that module requires of a painter that is about to write
+/// the front buffer. `ensure_drawn()` after it is the cheap idempotent tail (`pal::cursor::draw_over`
+/// is literally this call on this target): one claim and a boolean in the common case, real work only
+/// when something else — a compositor erase, the hide edge below — took the sprite down and owes it
+/// back. Nothing here paints directly, so no new painter enters the front-buffer contract; this
+/// function only feeds the one that is already there.
+///
+/// ### Why `wcx::is_active()` and not a knob
+/// It is the compositor's own authoritative runtime latch (`ACTIVATED != ORIGIN_NONE`, set by
+/// `activate_on` and released by a late decline) — the same signal the render service reads to decide
+/// whether the crystal desktop owns the backdrop. A `cfg!(feature = "wc")` test would be a claim
+/// about the BUILD and this is a question about the BOOT: a `wc` card whose activation DECLINED
+/// (framebuffer not ready, console window refused) has no desktop, no window layer and no compositor
+/// erases, and on it the pre-existing behaviour — print the report, draw nothing — is still the right
+/// one. No new signal is invented for this.
+///
+/// A non-pointer event returns before the panel is read, so a keystroke costs one atomic load.
+#[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+fn usbdebug_cursor_service(ev: &unaos_kernel::pal::Event) {
+    if !unaos_kernel::video::wcx::is_active() {
+        return;
+    }
+    // Cheap pre-filter: don't take the WRITER lock for a key or a timer tick.
+    match ev {
+        unaos_kernel::pal::Event::Mouse { .. } | unaos_kernel::pal::Event::MouseAbsolute { .. } => {}
+        _ => return,
+    }
+    let (w, h) = usbdebug_panel_wh();
+    match *ev {
+        // A zero-delta relative report is skipped for the same reason the aarch64 keep-alive skips
+        // it: it moves nothing, and running it would still stamp the activity clock, so a stream of
+        // null reports could hold the auto-hide open forever.
+        unaos_kernel::pal::Event::Mouse { x, y } if x != 0 || y != 0 => {
+            unaos_kernel::pal::cursor::move_rel(x, y, w, h);
+        }
+        unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
+            unaos_kernel::pal::cursor::set_abs(x, y, w, h);
+        }
+        _ => return,
+    }
+    unaos_kernel::video::cursor::ensure_drawn();
+    if !USBDBG_CURSOR_ARMED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        serial_println!(
+            ":: USBDBG-CURSOR: debug-loop cursor service ARMED wc=active panel={}x{} == witness ::",
+            w,
+            h
+        );
+    }
 }
 
 /// FOCUS-VIS — panel dimensions for the router's cursor keep-alive, read straight from the scan-out
