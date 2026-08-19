@@ -8867,3 +8867,54 @@ rather than luck. The block was lifted verbatim out of `kernel8()` into `build_u
 call it) and `esp_jetson` invokes it **only when `tegra_el0` is armed** — the disarmed path does not
 compile `syscall.rs`, so an unconditional blob build would slow every ordinary jetson build and churn
 the kernel's rebuild via the blob's refreshed mtime for nothing.
+
+## DARKWIN-GUARD — the 2026-08-18 trunk-merge boot hang, and the dark-window serial latch
+
+### The failure
+
+The first hw-jetson base carrying the month of trunk desktop/userspace work (merge `ceaa32b8`,
+tip `b86f6c33`) never booted the Orin: ~10 attended boots, none past the NVIDIA logo, while the
+pre-merge base `92997297` booted the same board completely minutes apart. A pre-EBS banner build
+proved the loader reached `ExitBootServices`; the kernel's first serial line (`:: tegra: mmu regs`,
+from inside `mmu_tegra::init`) never appeared. Peter confirmed the board never reset — a hang, not
+an exception→reset. hw-pi4 booted the identical trunk content on Pi silicon, so shared aarch64 code
+was exonerated wholesale.
+
+### The root cause (found by reading the window's own diff — zero boots)
+
+The merge added `kernel_main` step 0a2 — EDID-CARRY's `video::init_edid`, **unconditional on every
+arch and every build** — which emits its witness line via `serial_println!` *before* step 0b's
+`tegra_early_stop`. On tegra that write polls UARTC's LSR at `0x0C28_0014` while the kernel still
+runs under the UEFI-handoff translation tables, which map RAM but **not** the Tegra device window
+(JM2 R4: the kernel faulted on its first UARTC read — the fact that created `tegra_early_stop`'s
+"install the MMU FIRST — SILENT" ordering in the first place). A translation fault there has no
+usable vectors, so the board hangs silently: exactly the observed reading. `mmu_tegra.rs` itself
+was untouched by the merge — the kernel died *upstream* of it, on a new caller the merge placed in
+the dark window. The Pi is immune because its bare-metal path runs `mmu_init` before `kernel_main`;
+x86 is immune because its loader maps the console before handoff.
+
+### The fix: kill the class, not the caller (`ed8f810c`)
+
+A **dark-window latch** in `arch/aarch64/serial.rs`'s `cfg(tegra)` UART mod: every byte offered
+before `mark_mmio_ready()` is dropped and counted, never written. `tegra_early_stop` arms the latch
+on the line after `mmu_tegra::init` returns, then witnesses the count
+(`:: tegra: dark-window guard — N byte(s) dropped pre-map ::`) and re-emits the EDID witness the
+window ate, so the reading still reaches the wire. Nonzero N is a *reported* fact that some caller
+printed pre-map — the class can no longer hang the board, only announce itself. Non-tegra builds
+are byte-identical (everything sits inside `cfg(feature = "tegra")`).
+
+The alternative — gating `init_edid`'s call site on `not(tegra)` — was rejected because it fixes
+one caller: any future unconditional early print (and the merge added its by design, for witness
+coverage on every arch) would re-introduce the identical silent hang. The latch converts the whole
+class from "undebuggable dark-window death" to "counted, witnessed, harmless".
+
+### Verification status
+
+Zero-boot: `UNAOS_TEGRA=1 ./arroyo check` green both arches (+12 cfg legs); `./arroyo test-arm`
+clean; media validated (`strings`: 130 `tegra:` lines, the guard's own witness string present —
+the validity rule's proof-the-instrument-exists check). Metal: **pending** — boot 2
+(`boot2-darkguard-ed8f810`, staged with boot 1's exact knob set so the guard is the only delta)
+owes the verdict: `dark-window guard — N` with N > 0, the re-emitted EDID line, then the full
+pre-merge JD/JB chain to the JD2 shell. If boot 2 still hangs, the conviction is incomplete and
+the standing fallback is the M1 stack-switch-at-entry instrument (rmbp 0's design, deliberately
+unbuilt so each boot carries one variable).
