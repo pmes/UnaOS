@@ -1008,6 +1008,11 @@ decides ownership, so a wheel over a window ABOVE Quarry is that window's, and a
 Quarry reaches nothing — a row below `SHELL_Z` neither composites nor hit-tests, which is the same
 construction that lets `press_route` skip the `on_glass` guard the keyboard needs.
 
+> **Corrected by LOCKFIX (§14.7).** "Exactly as `click_pointer_pos` reads it" was true, and that was
+> the defect: *both* read the panel with a blocking `WRITER.lock()` on the preemptible `usb-pump`
+> band — the acquire INWEDGE had just outlawed one function away. Both now go through
+> `video::panel_info_nonblocking()`, and `wheel_route` DECLINES a detent it cannot place.
+
 ### 14.4 The reach this inherits, and the gap it does not close
 
 Quarry's wheel gets **exactly** the reach Quarry's keyboard already has, because it is the same seam:
@@ -1074,3 +1079,44 @@ rather than a guess.
 report, so requiring it would red every battery; the spec is untouched, and the standing
 `FORBID :: QUARRY: .* :: FAIL ::` covers leg 12 for free on both polarities. `[qscroll]` is bench
 evidence, and the bench is where it will first print.
+
+### 14.7 LOCKFIX — the panel read on this seam (2026-08-18, `exec-lockfix`)
+
+An adversarial landing panel held §14 on one line of `wheel_route`:
+
+```rust
+let i = crate::video::WRITER.lock().info();   // live.rs:2149, before LOCKFIX
+```
+
+**Why it was the boot-8 wedge, at this seam.** §14.3's reach argument is also the hazard's reach
+argument: this function is called from `key_route` ← `user_input_enqueue` ←
+`route_input_to_active_el0` ← `main.rs::pump_usb_into_gui`, i.e. from the **preemptible `usb-pump`
+task on the input core** — the exact band, and the exact core, whose blocking `WRITER` acquire
+INWEDGE (`scheduler.md` §INWEDGE) had just been convicted of killing dsktp boot 8. A quantum tick
+inside that acquire leaves the router off-CPU holding the panel lock, and the next masked acquirer on
+that core spins on it forever. The read sat **outside** the masked keep-alive span, so INWEDGE's
+mask did not cover it.
+
+**The fix.** `video::panel_info_nonblocking()` — masked, `try_lock`, counted into the `[inwedge]`
+census — is now the input path's one door, here and in `click_pointer_pos`. A refusal makes
+`wheel_route` return `false`: **declined, not consumed.** That is the right polarity for this
+consumer specifically. The wheel is only Quarry's once the pointer has been proven to be inside
+Quarry's window, and that proof needs the panel geometry; without it the event is not ours to eat, so
+it falls through exactly as a wheel over another window does. Every other refusal branch in this
+function returns `true` because it has *already* hit-tested to Quarry.
+
+The cost is one detent lost to a lock race that today no one can observe — the alternative is a
+consumed detent that scrolled nothing, or a wedged input core.
+
+**§14.3's byte-identity claim is QSCROLL's, and still holds for QSCROLL.** LOCKFIX itself does move
+the knob-off `kernel8.img` hash: it touches `main.rs`, `video/cursor.rs` and `arch/aarch64/syscall.rs`
+(the last line-neutral), which are compiled knob-off. That is the deliberate §5.2-class exception
+PARITY.md §5.3 sanctions — a correctness fix on a path users run, not desktop furniture. `live.rs` is
+still `feature = "quarry"`-only.
+
+**Gate.** `UNAOS_PIDESK=1 UNAOS_QUARRY=1 ./arroyo kernel8-test`, three runs: `:: QUARRY: … +wheel …
+:: PASS ::` (leg 12) and `:: INWEDGE: … tries=1 :: PASS ::` on every one, **117/117 required** on
+every one, forbidden 8/4/8 and confined to §14.6's host-load classes plus `[wc-d] verify win=1 …
+-> FAIL` (PARITY.md §6.9c's console-vs-compositor residue). The pre-arc control at `c4ee2280` on the
+same host, four runs, scored 117/117 ×3 and **116/117 once**, with the same classes — including the
+`[wc-d]` one. `scheduler.md` §LOCKFIX carries the full table.

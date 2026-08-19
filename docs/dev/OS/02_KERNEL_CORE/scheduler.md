@@ -2640,10 +2640,18 @@ WEDGE-4/5/6 watches. Everything pinned to that core died with it: `rx-backstop` 
    the scheduler, which requeues it. The task is now off-CPU **still holding `WRITER`**.
 3. The core dispatches its band peer, `input`.
 4. The next timer tick lands with `input` current. `timer_preempt` calls `load_witness_tick`, whose
-   emit is a `serial_println!` — and `serial::_print`'s panel mirror (`video::fbcon::_print`, still
-   live because `pidesk` had not yet taken the glass) takes `WRITER` with a **blocking** acquire.
-   `video/fbcon.rs` documents that call as requiring interrupts ENABLED for precisely this reason;
-   inside the IRQ vector it runs masked.
+   emit is a `serial_println!` — and that print's panel mirror takes `WRITER` with a **blocking**
+   acquire, inside the IRQ vector, masked.
+
+   > **Correction (LOCKFIX).** This step originally named `video::fbcon::_print` as the blocking
+   > acquirer. That is wrong: `fbcon::_print` takes `FBCON.`**`try_lock`** (`video/fbcon.rs:1244`)
+   > and `serial::_print` takes `SERIAL_PORT.`**`try_lock`** — neither can block, so neither can be
+   > the spinner. The blocking `WRITER.lock()` on the print path is in **`wm::composite`**
+   > (`video/wm.rs:4622`), reached through `route_present_rows` → `wm::present` when the panel
+   > console owns the glass, i.e. on `pidesk`/`wc` builds. Nothing about the mechanism, the
+   > interleaving or the fix changes — only the callee's name, and a wrong name sends the next
+   > reader to a file that is already safe. `main.rs`'s copy of this narrative carries the same
+   > correction.
 5. The acquire never returns. The core is masked, so the holder it displaced can never be
    redispatched to release the lock, and `SCHED[3].current` still names the interrupted task —
    `99:input`. That is the name on the `[spin1]` line, and it is not the culprit; it is the tenant.
@@ -2687,6 +2695,72 @@ Both are now covered on the input path — the first by the masked section above
 fact that its only masked counterparty (`sys_write`, `syscall.rs:7238`) holds `SERIAL_PORT` bounded —
 but neither has been made safe at its own site. The general rule wants a `WRITER` discipline in the
 video lane and a non-blocking `poll_input` in the syscall/serial lane.
+
+### LOCKFIX — the rule, held everywhere it applies (aarch64 + x86, `exec-lockfix`)
+
+INWEDGE stated the rule and fixed one pair of call sites. A landing panel then held the trunk on the
+two things that statement left standing, and this arc is exactly that repair: **one door for the
+input path, and a mask that contains nothing forbidden.**
+
+**What was still wrong.**
+
+* **The masked span was not safe to run masked.** `cursor::repaint`, called from inside
+  `without_interrupts`, took `WRITER` with a **blocking** acquire three times over (`undraw_locked`,
+  `draw_locked`, `refresh_locked`'s flush) and printed two `[cursor]` witness lines from in there.
+  So the mask that stopped the router being *preempted* while holding turned it into the *spinner*
+  instead: on a `pidesk` build the print mirrors to the panel through `wm::present` → `composite`,
+  whose `WRITER.lock()` is blocking, taken masked. A recoverable stall became an unrecoverable
+  wedge, live on every `pidesk` boot — the same interleaving as boot 8 with the roles exchanged.
+* **Two more input-path call sites were never converted.** `quarry::live::wheel_route` (the QSCROLL
+  seam, reached from `usb-pump` → `user_input_enqueue` → `key_route`) and
+  `arch::aarch64::syscall::click_pointer_pos` both read the panel with a plain `WRITER.lock()` on
+  the same preemptible band the rule is about.
+
+**The fix, one shape.**
+
+* **One door, in the module that owns the lock.** `video::panel_info_nonblocking()` — masked,
+  `try_lock`, counted — is now the *only* way the input path reads panel geometry. Its census
+  (`video::panel_census`) is the one `[inwedge]` reports; `main.rs`'s `inwedge_panel_info` /
+  `inwedge_census` are thin wrappers over it, so the witness and the selftest read as before.
+  Callers: the router's `pal_width_hint`/`pal_height_hint` (clamp to 0), `wheel_route` (**declines**
+  the event — a wheel it cannot place is not consumed), `click_pointer_pos` (the (0,0) clamp an
+  unset framebuffer has always given it). The `syscall.rs` change is line-neutral (PARITY §5.3).
+* **`WEDGE-8`'s policy, extended from the sprite lock to the panel lock.** `video::panel_snapshot()`
+  blocks when interrupts are ENABLED and `try_lock`s when they are MASKED — exactly what
+  `cursor::claim_bounded` already does for `SPRITE`. Every `WRITER` acquisition in `video/cursor.rs`
+  now goes through it, and every refusal takes the module's existing `owe_repaint` degradation, so
+  the panel is one composite tail late and never wrong. `refresh_locked` additionally stops the pass
+  when `sp.drawn` survives the undraw attempt: that flag is the refusal signal, and drawing on top
+  of an arrow still on the glass would save the arrow as its own under-content.
+* **The mask now contains pixels and atomics only.** `cursor::repaint` is split: `repaint_deferred()`
+  is the pixel half (no blocking lock, no printing) and returns a `RepaintTail` the caller `finish()`es
+  **outside** the mask — the two `[cursor]` lines and `repair`'s window-table damage. `repaint()`
+  itself is unchanged for every other caller (`repaint_deferred().finish()`).
+* **The go-red leg stops racing the APs.** `inwedge_selftest`'s released half asserted
+  `read == read0 + 1` off a single non-blocking read, so any AP holding `WRITER` at that instant made
+  a *correct* kernel print FAIL. It now retries the released read up to 64 times against the real
+  geometry (`tries=` on the line records how many it took) and tolerates a concurrent refusal in the
+  held half's delta (`>=`, not `==`). The held half's conviction is untouched: both reads taken
+  against a lock this core holds must still come back clamped to 0.
+
+**Witness shape**, unchanged apart from the new `tries=` field:
+`:: INWEDGE: router panel-lock — held: w=0 h=0 refused+2 | released: w=640 real=640 read+1 tries=1
+:: PASS ::`.
+
+**Knob-off byte-identity moves, deliberately** (PARITY §5.3's §5.2 precedent): `main.rs` and
+`video/cursor.rs` are compiled into the shipped `kernel8.img` and this is a correctness fix on a path
+users run, not desktop furniture. `arch/aarch64/syscall.rs` is nonetheless kept line-neutral.
+
+**Gate (2026-08-18, `exec-lockfix`).**
+
+| gate | result |
+| --- | --- |
+| `./arroyo check` | green, both arches (rc=0) |
+| `UNAOS_WC=1 UNAOS_PIDESK=1 UNAOS_QUARRY=1 ./arroyo check` | green (rc=0) |
+| `./arroyo kernel8` | builds — `UnaOS-pi4-baremetal.img` 64M |
+| `UNAOS_PIDESK=1 UNAOS_QUARRY=1 ./arroyo kernel8-test` | **117/117 required on all three runs** (8, 4, 8 forbidden), `:: INWEDGE: … tries=1 :: PASS ::` and `:: QUARRY: … +wheel … :: PASS ::` on every one |
+| pre-arc control, `c4ee2280`, same host + knobs, four runs | 117/117 (3), 117/117 (4), **116/117 (10)**, 117/117 (6). The control is the one that dropped a required witness, and it produced the same classes: `[wc-g] COHER`/`RACE-BLIT`, `[dragperf] coalesced=0`, and `[wc-d] verify win=1 … -> FAIL` — the console-vs-compositor residue PARITY.md §6.9c assigns to `exec-shellport`'s pacing lane, and quarry.md §14.6's host-load lane. **No class appears armed that the control does not also produce, and the armed runs never lost a witness.** Honest note: this host is loaded (the runs are interleaved with other aarch64 QEMUs), which is why the arc is judged on paired runs rather than on an absolute count |
+| **go-red retained** | `pal_width_hint` reverted to `WRITER.lock()` in a scratch build, nothing else changed: `✂️ MBENCH TRUNCATED — 40/117, 337 lines`. Byte-for-byte the same truncation INWEDGE recorded, so the leg still convicts a blocking acquire. Call site restored and re-verified |
 
 ### Orphan-reaper wake on enqueue (aarch64, SCHED-4b)
 

@@ -2145,11 +2145,21 @@ fn wheel_route(delta: i8) -> bool {
     if id == wm::WIN_NONE || delta == 0 {
         return false;
     }
-    let (pw, ph) = {
-        let i = crate::video::WRITER.lock().info();
-        (i.width as i32, i.height as i32)
+    // LOCKFIX — the panel geometry is read through the input path's ONE door
+    // ([`crate::video::panel_info_nonblocking`]): masked, non-blocking, counted. A plain
+    // `WRITER.lock()` here is the boot-8 wedge exactly as INWEDGE described it — this runs on the
+    // preemptible `usb-pump` band (`route_input_to_active_el0` → `user_input_enqueue` →
+    // `key_route`), on the core that also carries the kernel's IRQ-context printer, so a hold
+    // preempted here leaves a lock the next masked acquirer on that core can never see released.
+    //
+    // A refusal DECLINES the event rather than consuming it. The wheel is not ours until the
+    // pointer has been proven to be over our window, and without the panel geometry that question
+    // cannot be asked; `false` is the same answer a wheel over any other window gets, so the event
+    // falls through untouched rather than being swallowed on a lock race.
+    let Some(i) = crate::video::panel_info_nonblocking() else {
+        return false;
     };
-    let (x, y) = crate::pal::cursor::pos(pw, ph);
+    let (x, y) = crate::pal::cursor::pos(i.width as i32, i.height as i32);
     match wm::hit_test(x, y) {
         Some((w, _, _)) if w == id => {}
         _ => return false,

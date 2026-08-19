@@ -2891,10 +2891,15 @@ fn serial_to_shell(byte: u8) {
 //      to the scheduler, which requeues it. The task is now off-CPU **still holding `WRITER`**.
 //   3. The core dispatches its band peer, `input`.
 //   4. The NEXT timer tick lands with `input` current. `timer_preempt` calls `load_witness_tick`,
-//      whose emit is a `serial_println!` — and `serial::_print`'s panel mirror (`video::fbcon::_print`,
-//      reached before `pidesk` has taken the glass) takes `WRITER` with a BLOCKING acquire. That call
-//      is documented in `video/fbcon.rs` as requiring interrupts ENABLED for exactly this reason; here
-//      it runs inside the IRQ vector, IRQ-masked.
+//      whose emit is a `serial_println!` — and that print's panel mirror takes `WRITER` with a
+//      BLOCKING acquire, from inside the IRQ vector, IRQ-masked.
+//      LOCKFIX — NAMING THE ACQUIRE CORRECTLY. The original text credited this to `video::fbcon::_print`.
+//      It is not: `fbcon::_print` takes `FBCON.try_lock` (`video/fbcon.rs`) and `serial::_print` takes
+//      `SERIAL_PORT.try_lock` — neither can block. The blocking `WRITER.lock()` on the print path is in
+//      `wm::composite` (`video/wm.rs`), reached via `route_present_rows` → `wm::present` when the panel
+//      console owns the glass, i.e. on `pidesk`/`wc` builds. The mechanism, the interleaving and the fix
+//      are unchanged — only the callee's name was wrong, and a wrong name sends the next reader to a
+//      file that is already safe. `docs/dev/OS/…/scheduler.md` §INWEDGE carries the same correction.
 //   5. The acquire never returns. The core is masked, so the holder it displaced can never be
 //      redispatched to release the lock, and `SCHED[3].current` still names the interrupted task —
 //      `99:input`. Every task pinned to that core dies with it: `usb-pump` emitted `[piusb26]`
@@ -2914,38 +2919,23 @@ fn serial_to_shell(byte: u8) {
 // COUNTED — see `inwedge_note_refused`: a nonzero `[inwedge]` census on the wire is the boot-8 window
 // being entered and SURVIVED, which is the recurrence witness this arc owes.
 
-/// INWEDGE — panel-geometry reads the router refused rather than block on. Nonzero means the window
-/// that killed boot 8 was entered on this boot; the machine kept running instead of wedging.
-#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
-static INWEDGE_REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-
-/// INWEDGE — panel-geometry reads the router completed. The denominator, so a refusal rate is
-/// readable rather than an unanchored count.
-#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
-static INWEDGE_READ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-
 /// INWEDGE — `(read, refused)`.
+///
+/// LOCKFIX — the counters and the acquisition itself now live in `video` (`panel_census` /
+/// `panel_info_nonblocking`), because the router is not the only input-path caller of them:
+/// `quarry::live::wheel_route` and `syscall::click_pointer_pos` read the same geometry on the same
+/// preemptible band and were still taking `WRITER` blocking. One door, one census, one rule. These
+/// two functions stay so the witness and the selftest below read as they always have.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn inwedge_census() -> (u32, u32) {
-    use core::sync::atomic::Ordering;
-    (INWEDGE_READ.load(Ordering::Relaxed), INWEDGE_REFUSED.load(Ordering::Relaxed))
+    unaos_kernel::video::panel_census()
 }
 
-/// INWEDGE — the ONE panel-lock acquisition the input router makes: masked, non-blocking, counted.
+/// INWEDGE — the ONE panel-lock acquisition the input path makes: masked, non-blocking, counted.
 /// Returns `None` when the lock is held elsewhere (or the framebuffer is unset); the callers clamp.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn inwedge_panel_info() -> Option<unaos_boot_info::FrameBufferInfo> {
-    use core::sync::atomic::Ordering;
-    unaos_kernel::arch::without_interrupts(|| match unaos_kernel::video::WRITER.try_lock() {
-        Some(fb) => {
-            INWEDGE_READ.fetch_add(1, Ordering::Relaxed);
-            Some(fb.info())
-        }
-        None => {
-            INWEDGE_REFUSED.fetch_add(1, Ordering::Relaxed);
-            None
-        }
-    })
+    unaos_kernel::video::panel_info_nonblocking()
 }
 
 /// FOCUS-VIS — panel dimensions for the router's cursor keep-alive, read straight from the scan-out
@@ -3027,7 +3017,20 @@ fn route_input_to_active_el0() -> usize {
             // exception. The masked span is bounded and small — two `info()` reads and one 16x16
             // sprite restore+draw with its cache clean — and it runs at most once per HID report on a
             // ~250 Hz pump, which is why paying it here is cheaper than any lock-ordering scheme.
-            unaos_kernel::arch::without_interrupts(|| match ev {
+            //
+            // LOCKFIX — AND THE SPAN NOW HOLDS TO THE RULE IT STATES. Masking the section made the
+            // router unpreemptible; it did NOT, on its own, make the section safe to run masked, and
+            // two things inside it were still forbidden there. (1) `repaint`'s WRITER takes were
+            // BLOCKING acquires — a masked core spinning on a lock a preempted holder owns is the
+            // boot-8 death with the roles reversed, i.e. the mask converted a recoverable stall into
+            // an unrecoverable wedge, on every `pidesk` boot. Those takes now go through
+            // `video::panel_snapshot`, which blocks only when interrupts are enabled. (2) `repaint`
+            // printed two witness lines and marked compositor damage from in here; `serial_println!`
+            // on a `pidesk` build mirrors to the panel through `wm::present` → `composite`, whose
+            // `WRITER.lock()` is blocking, and `repair` takes the window TABLE lock. Both are now
+            // handed back as a `RepaintTail` and run BELOW, with interrupts restored. What remains
+            // inside the mask is pixels and atomics — no blocking lock, no printing.
+            let tail = unaos_kernel::arch::without_interrupts(|| match ev {
                 unaos_kernel::pal::Event::Mouse { x, y } if x != 0 || y != 0 => {
                     unaos_kernel::pal::cursor::move_rel(
                         x,
@@ -3035,14 +3038,15 @@ fn route_input_to_active_el0() -> usize {
                         pal_width_hint(),
                         pal_height_hint(),
                     );
-                    unaos_kernel::video::cursor::repaint();
+                    unaos_kernel::video::cursor::repaint_deferred()
                 }
                 unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
                     unaos_kernel::pal::cursor::set_abs(x, y, pal_width_hint(), pal_height_hint());
-                    unaos_kernel::video::cursor::repaint();
+                    unaos_kernel::video::cursor::repaint_deferred()
                 }
-                _ => {}
+                _ => unaos_kernel::video::cursor::RepaintTail::default(),
             });
+            tail.finish(); // LOCKFIX — damage + witness lines, UNMASKED. A no-op for the `_` arm.
         }
         #[cfg(feature = "pidesk")] unaos_kernel::video::wm::drag_route_tail(ev); // DRAG-PI M3 — STEER a live title-bar grab from the FOCUSED-APP drain, after the cursor keep-alive above has applied this report and before the event is routed onward. This is the path a grab actually takes: the chrome arm focuses the dragged window's own owner, so every subsequent pointer report arrives here and is PACKED into that app's ring — the shell drain never sees it. Keyed on the raw event inside `drag_route_tail`, so a non-pointer event and an idle boot both cost one match and one atomic load. Delivery is unchanged: the app still receives the report, exactly as it does today.
         let queued = unaos_kernel::arch::aarch64::syscall::user_input_enqueue(ev);
@@ -4174,20 +4178,43 @@ fn inwedge_witness() {
 /// touching `WRITER` and the census it reads is its own.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn inwedge_selftest() {
+    /// LOCKFIX — released-half attempts. The old assertion was `read2 == read0 + 1` off a SINGLE
+    /// released read, which is a race against the live APs rather than a statement about this
+    /// kernel: any secondary holding `WRITER` for its own present at that instant makes our
+    /// non-blocking read refuse (`free_w == 0`, `read2 == read0`) and the leg prints FAIL on a
+    /// correct kernel. The read is idempotent and costs a try_lock, so retry it — a kernel whose
+    /// released read genuinely cannot succeed will exhaust all 64 and still convict.
+    const RELEASED_TRIES: u32 = 64;
     let (read0, refused0) = inwedge_census();
     let (refused_w, refused_h) = {
         let _held = unaos_kernel::video::WRITER.lock(); // the holder the router must not block on
         (pal_width_hint(), pal_height_hint())
     };
     let (_, refused1) = inwedge_census();
-    let free_w = pal_width_hint();
-    let (read2, _) = inwedge_census();
+    // Taken BEFORE the released half so the retry below has something to compare against, and with a
+    // blocking acquire because this core is unmasked and holds nothing — the one place in this leg
+    // where waiting is legal, and the statement of what the released read must reproduce.
     let real = unaos_kernel::video::WRITER.lock().info().width as i32;
-    let declined = refused_w == 0 && refused_h == 0 && refused1 == refused0 + 2;
-    let recovered = free_w == real && read2 == read0 + 1;
+    let mut free_w = 0;
+    let mut read2 = read0;
+    let mut tries = 0;
+    while tries < RELEASED_TRIES {
+        tries += 1;
+        free_w = pal_width_hint();
+        read2 = inwedge_census().0;
+        if free_w == real && read2 > read0 {
+            break;
+        }
+    }
+    // The HELD half keeps its exact go-red: BOTH reads taken against a lock this core holds must
+    // come back clamped to 0 AND counted as refusals. `>=` on the refusal delta only tolerates an AP
+    // refusing alongside us; it cannot excuse a read of ours that succeeded, because a successful
+    // read would have returned the real geometry into `refused_w`/`refused_h` and failed `== 0`.
+    let declined = refused_w == 0 && refused_h == 0 && refused1 >= refused0 + 2;
+    let recovered = free_w == real && read2 > read0;
     serial_println!(
-        ":: INWEDGE: router panel-lock — held: w={} h={} refused+{} | released: w={} real={} read+{} :: {} ::",
-        refused_w, refused_h, refused1 - refused0, free_w, real, read2 - read0,
+        ":: INWEDGE: router panel-lock — held: w={} h={} refused+{} | released: w={} real={} read+{} tries={} :: {} ::",
+        refused_w, refused_h, refused1 - refused0, free_w, real, read2 - read0, tries,
         if declined && recovered { "PASS" } else { "FAIL" }
     );
 }

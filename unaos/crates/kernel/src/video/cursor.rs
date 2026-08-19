@@ -1819,7 +1819,16 @@ fn undraw_locked(
     if !sp.drawn {
         return None;
     }
-    let fb = *super::WRITER.lock();
+    // LOCKFIX — the panel comes through `super::panel_snapshot`, which blocks only when interrupts
+    // are ENABLED. Two of this function's callers run masked (`wm::erase`'s teardown chain and
+    // `composite_inner`'s reserved arm), and a masked wait on `WRITER` is the same death `claim`
+    // already refuses for the SPRITE lock: unpreemptible, tick-less, on a lock a preempted
+    // preemptible holder may own. A refusal leaves `sp.drawn` SET — which is the signal
+    // `refresh_locked` reads to know the arrow is still on the glass and a draw must not follow.
+    let Some(fb) = super::panel_snapshot() else {
+        owe_repaint();
+        return None;
+    };
     if !fb.is_ready() {
         // Unreachable in practice: `drawn` is only ever set by `draw_locked`, which returns early
         // unless the framebuffer is ready, and the framebuffer is initialised once and never torn
@@ -2333,7 +2342,14 @@ fn settle_pending_locked(sp: &mut Sprite, unsupported_now: &mut bool) {
     if !any {
         return;
     }
-    let fb = *super::WRITER.lock();
+    // LOCKFIX — masked-safe (see `super::panel_snapshot`); this is a composite tail and runs masked
+    // on both present chains. A refusal KEEPS the pending bits (unlike the not-ready arm below,
+    // which drops them because there is no surface left to settle against) and owes the whole-sprite
+    // refresh, which is that settlement in its strongest form.
+    let Some(fb) = super::panel_snapshot() else {
+        owe_repaint();
+        return;
+    };
     if !fb.is_ready() {
         // Nothing can be read or written; drop the promises rather than carry them into the next
         // pass, where the geometry they index may already be gone.
@@ -2460,7 +2476,12 @@ fn undraw_within_locked(
     if !sp.drawn {
         return (None, 0);
     }
-    let fb = *super::WRITER.lock();
+    // LOCKFIX — masked-safe (see `super::panel_snapshot`); this function's one caller is the WC-L
+    // drain, which runs masked. A refusal hands nothing back and owes the whole-sprite refresh.
+    let Some(fb) = super::panel_snapshot() else {
+        owe_repaint();
+        return (None, 0);
+    };
     if !fb.is_ready() {
         // The full undraw bumps the generation itself, so the caller's conditional bump would be
         // redundant — and harmless either way, since it reports zero pixels handed back.
@@ -2656,25 +2677,62 @@ pub fn ensure_drawn() {
 /// `composite()` on the line after this call. The cursor may be one pass late; it is never silently
 /// gone.
 pub fn repaint() {
+    repaint_deferred().finish();
+}
+
+/// LOCKFIX — what a [`repaint`] still owes the world once its pixels are down: the compositor
+/// damage for the rect it restored, and the two witness lines. Both are things a MASKED caller may
+/// not do, and neither needs the sprite lock — so they are handed back to the caller instead of run
+/// under its mask.
+///
+/// * `repair` marks every window the restored rect overlaps, which takes the window TABLE lock —
+///   a lock held by preemptible compositor code, i.e. exactly the acquire a masked core must not
+///   make (INWEDGE's rule, one lock over).
+/// * `serial_println!` is the kernel's IRQ-context printer and on a `pidesk` build its panel mirror
+///   reaches `wm::present` → `composite`, which takes `WRITER` with a BLOCKING acquire. Printing
+///   from inside a mask is the boot-8 wedge with the roles reversed: it is the *spinner*.
+///
+/// Must-use because dropping one silently loses a repair the panel is owed.
+#[must_use = "the repaint's damage and witness lines are still owed — call finish()"]
+#[derive(Clone, Copy, Default)]
+pub struct RepaintTail {
+    restored: Option<(usize, usize, usize, usize)>,
+    armed_at: Option<(i32, i32)>,
+    unsupported_now: bool,
+}
+
+impl RepaintTail {
+    /// Run the tail. UNMASKED callers may ignore the split entirely and use [`repaint`]; a masked
+    /// caller keeps the value and calls this once its mask has dropped.
+    pub fn finish(self) {
+        // Serial output happens with the sprite lock RELEASED: on a build where fbcon is still
+        // attached `serial_println!` paints the framebuffer mirror, which is another writer to the
+        // panel — one that would otherwise run with the sprite on it, and under our own lock.
+        if self.unsupported_now && !UNSUPPORTED_REPORTED.swap(true, Ordering::Relaxed) {
+            serial_println!("[cursor] disabled: panel format has no read-back inverse");
+        }
+        if let Some((px, py)) = self.armed_at {
+            serial_println!("[cursor] armed x={} y={}", px, py);
+        }
+        repair(self.restored);
+    }
+}
+
+/// LOCKFIX — [`repaint`]'s pixel half, with nothing in it that a masked caller may not do: no
+/// blocking lock (every `WRITER` take below goes through `super::panel_snapshot`, and the sprite
+/// claim already refuses to wait while masked) and no serial output. The rest comes back as a
+/// [`RepaintTail`] for the caller to `finish()` outside its mask.
+pub fn repaint_deferred() -> RepaintTail {
     let mut armed_at: Option<(i32, i32)> = None;
     let mut unsupported_now = false;
     let restored = match claim_bounded(CLAIM_RETRY_MS) {
         Ok(mut sp) => refresh_locked(&mut sp, &mut armed_at, &mut unsupported_now),
         Err(_) => {
             owe_repaint();
-            return;
+            return RepaintTail::default();
         }
     };
-    // Serial output happens with the sprite lock RELEASED: on a build where fbcon is still attached
-    // `serial_println!` paints the framebuffer mirror, which is another writer to the panel — one
-    // that would otherwise run with the sprite on it, and under our own lock.
-    if unsupported_now && !UNSUPPORTED_REPORTED.swap(true, Ordering::Relaxed) {
-        serial_println!("[cursor] disabled: panel format has no read-back inverse");
-    }
-    if let Some((px, py)) = armed_at {
-        serial_println!("[cursor] armed x={} y={}", px, py);
-    }
-    repair(restored);
+    RepaintTail { restored, armed_at, unsupported_now }
 }
 
 /// The restore → save → draw sequence, with the lock held. The body [`repaint`] and
@@ -2689,6 +2747,16 @@ fn refresh_locked(
     // CURSOR-10 — both phases defer their clean into one union, flushed below.
     let mut pend = FlushUnion::default();
     let restored = undraw_locked(sp, Some(&mut pend));
+    // LOCKFIX — `drawn` still set after an undraw ATTEMPT is the one thing it can mean: the undraw
+    // refused the panel (masked and contended — see `super::panel_snapshot`). The arrow is therefore
+    // still on the glass, and `draw_locked`'s save-under is documented to run with the sprite
+    // provably down: letting it proceed would save our own arrow as the under-content, which is the
+    // CURSOR-5 self-capture and would stamp an arrow into the panel permanently. So the pass stops
+    // here and owes itself. Nothing was written, so the (empty) union has nothing to flush.
+    if sp.drawn {
+        owe_repaint();
+        return restored;
+    }
     if crate::pal::cursor::visible() && !sp.unsupported {
         match draw_locked(sp, Some(&mut pend)) {
             Ok(pos) => *armed_at = pos,
@@ -2698,8 +2766,13 @@ fn refresh_locked(
     // Unconditional, and after BOTH phases: every pixel write above is complete, and the restore owes
     // RAM its clean even on the paths where the draw declined or failed (hidden pointer, unsupported
     // panel, unreadable pixel). The lock is still held, so nothing has observed the union half-built.
-    let fb = *super::WRITER.lock();
-    pend.flush(&fb);
+    //
+    // LOCKFIX — and masked-safe like the two phases. A refused snapshot means the writes above have
+    // not reached RAM; the owed whole-sprite refresh redoes both the pixels and their clean.
+    match super::panel_snapshot() {
+        Some(fb) => pend.flush(&fb),
+        None => owe_repaint(),
+    }
     restored
 }
 
@@ -3404,7 +3477,12 @@ pub fn compose_into(layer: &FrameBuffer, ox: usize, oy: usize, plan: Plan) -> Co
 /// The panel origin the sprite WOULD be drawn at right now — [`draw_locked`]'s clip, without the
 /// draw. Used to decide whether a published plan still describes where the pointer is.
 fn current_origin() -> Option<(usize, usize)> {
-    let fb = *super::WRITER.lock();
+    // LOCKFIX — masked-safe (see `super::panel_snapshot`). A query, not a paint: a refusal answers
+    // `None` — "the published plan cannot be confirmed" — and owes nothing, exactly as
+    // [`sprite_plan`]'s Busy policy declines to owe for a pass that raced a live rebuild.
+    let Some(fb) = super::panel_snapshot() else {
+        return None;
+    };
     if !fb.is_ready() {
         return None;
     }
@@ -3646,7 +3724,13 @@ fn redraw_off_locked(sp: &mut Sprite, unsupported_now: &mut bool) {
     if !any {
         return;
     }
-    let fb = *super::WRITER.lock();
+    // LOCKFIX — masked-safe (see `super::panel_snapshot`). Reached from `adopt_overlay`, whose
+    // callers include masked present tails; a refusal leaves the off-panel pixels off (they hold the
+    // compositor's content, which is correct) and owes the whole-sprite refresh that re-delivers them.
+    let Some(fb) = super::panel_snapshot() else {
+        owe_repaint();
+        return;
+    };
     if !fb.is_ready() {
         return;
     }
@@ -3704,7 +3788,14 @@ fn draw_locked(
     sp: &mut Sprite,
     pend: Option<&mut FlushUnion>,
 ) -> Result<Option<(i32, i32)>, ()> {
-    let fb = *super::WRITER.lock();
+    // LOCKFIX — masked-safe (see `super::panel_snapshot`). A refusal declines the draw and owes it:
+    // the sprite stays DOWN (`sp.drawn` is only set at the tail of a completed draw), which is a
+    // state the module already handles everywhere, and the owed whole-sprite refresh puts the arrow
+    // back at the next composite tail. Distinct from `Err(())`, which disables the cursor for good.
+    let Some(fb) = super::panel_snapshot() else {
+        owe_repaint();
+        return Ok(None);
+    };
     if !fb.is_ready() {
         return Ok(None);
     }

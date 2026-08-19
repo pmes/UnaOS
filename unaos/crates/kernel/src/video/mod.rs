@@ -156,13 +156,91 @@ pub mod instgui;
 pub use framebuffer::FrameBuffer;
 pub use screen::Screen;
 
-use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use spin::Mutex;
 use unaos_boot_info::FrameBufferInfo;
 
 /// The primary display surface. The GUI renderer (`pal::TargetPal` → `console`) draws here.
 /// Initialised once in `kernel_main` from `BootInfo` (UEFI GOP, or the Pi mailbox framebuffer).
 pub static WRITER: Mutex<FrameBuffer> = Mutex::new(FrameBuffer::new());
+
+// ── LOCKFIX — the two ways to take [`WRITER`] without becoming the boot-8 wedge ─────────────────
+//
+// INWEDGE stated the rule and fixed one pair of call sites; this states it once, in the module that
+// owns the lock, and gives every path that must obey it a single implementation.
+//
+// THE RULE: **a raw panel lock may not be held across a dispatch, and may not be blocked on from a
+// context that cannot be preempted.** Two disjoint populations violate it, and they need different
+// answers:
+//
+//  1. **The input path** (`quarry::live::wheel_route`, `syscall::click_pointer_pos`, the router's
+//     `pal_*_hint` geometry reads). These run on the preemptible `usb-pump`/`input` band, on the one
+//     core that also carries the kernel's IRQ-context printer. A *blocking* acquire here can be
+//     preempted while holding, and the next masked acquirer on that core then spins forever — the
+//     boot-8 capture. [`panel_info_nonblocking`] is their only door: masked (so the hold cannot span
+//     a dispatch), non-blocking (so they can never be the spinner), and COUNTED, because a refusal
+//     is the wedge window entered and survived and is the `[inwedge]` witness's whole subject.
+//
+//  2. **The paint path** (`cursor`'s locked helpers). These legitimately want the panel and, when
+//     interrupts are ENABLED, may legitimately wait for it — a preemptible waiter costs nothing the
+//     holder cannot repay. What they may not do is wait while MASKED, which is exactly the policy
+//     `cursor::claim_bounded` already applies to the SPRITE lock. [`panel_snapshot`] extends that
+//     same intent to `WRITER`: block when unmasked, `try_lock` when masked, and let the caller take
+//     its documented `owe_repaint` degradation on a refusal.
+//
+// Neither helper is arch-gated: both populations exist on x86 too (the compositor's masked present
+// chains reach `cursor`'s locked helpers there), and the rule is not a property of the hardware.
+
+/// LOCKFIX/INWEDGE — panel reads the input path completed. The denominator, so a refusal rate is
+/// readable rather than an unanchored count.
+static PANEL_READ: AtomicU32 = AtomicU32::new(0);
+
+/// LOCKFIX/INWEDGE — panel reads the input path refused rather than block on. Nonzero means the
+/// window that killed boot 8 was entered on this boot; the machine kept running instead of wedging.
+static PANEL_REFUSED: AtomicU32 = AtomicU32::new(0);
+
+/// LOCKFIX/INWEDGE — `(read, refused)` for the input path's panel reads.
+pub fn panel_census() -> (u32, u32) {
+    (PANEL_READ.load(Ordering::Relaxed), PANEL_REFUSED.load(Ordering::Relaxed))
+}
+
+/// LOCKFIX/INWEDGE — the ONE panel acquisition the input path makes: masked, non-blocking, counted.
+///
+/// `None` when the lock is held elsewhere at that instant (or the framebuffer is unset). Every
+/// caller degrades rather than waits: the router's hints clamp to 0, `wheel_route` DECLINES the
+/// event (it does not consume what it could not place), `click_pointer_pos` takes the same clamp an
+/// unset framebuffer has always given it.
+pub fn panel_info_nonblocking() -> Option<FrameBufferInfo> {
+    crate::arch::without_interrupts(|| match WRITER.try_lock() {
+        Some(fb) => {
+            PANEL_READ.fetch_add(1, Ordering::Relaxed);
+            Some(fb.info())
+        }
+        None => {
+            PANEL_REFUSED.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    })
+}
+
+/// LOCKFIX — a copy of the panel handle for a painter, with the WEDGE-8 rule applied to `WRITER`.
+///
+/// Blocking when interrupts are enabled (the caller is preemptible, so the holder can run), a bare
+/// `try_lock` when they are MASKED — where a wait can neither be preempted nor take a timer tick,
+/// and is therefore the F4 death outright. `None` is only ever the masked-and-contended case; the
+/// `cursor` callers answer it with `owe_repaint`, which re-establishes the whole sprite from the
+/// finished front at the next composite tail.
+///
+/// Not counted in [`panel_census`]: that census measures the INPUT path's refusals, which is what
+/// the `[inwedge]` witness reports on. Paint-path refusals are already counted by `[wedge9]`
+/// (`owe_repaint` is their sink), and mixing the two would make both unreadable.
+pub(crate) fn panel_snapshot() -> Option<FrameBuffer> {
+    if crate::arch::irqs_masked() {
+        WRITER.try_lock().map(|fb| *fb)
+    } else {
+        Some(*WRITER.lock())
+    }
+}
 
 /// The panel background the GUI paints over — Can-Am dark grey, `#1E1E1E`.
 pub const PANEL_BG: u32 = 0x001E_1E1E;

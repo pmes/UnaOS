@@ -13500,13 +13500,13 @@ fn wc_close_click(owner: u64) -> &'static str {
 /// Reads the shared cursor state every other pointer consumer reads (`pal::cursor`, the same state
 /// `click1_dispatch` hit-tests and the compositor draws), clamped by the live panel geometry.
 ///
-/// Locks: the framebuffer info lock, then the cursor position lock, and both are released before
-/// `wm::hit_test` takes the window TABLE lock. No nesting, so no new lock order (§WEDGE-1).
+/// Locks: the framebuffer info read is LOCKFIX's masked NON-BLOCKING door (a blocking take here is
+/// INWEDGE's boot-8 wedge, on this exact band), then the cursor position lock, and both are released
+/// before `wm::hit_test` takes the window TABLE lock. No nesting, so no new lock order (§WEDGE-1).
 fn click_pointer_pos() -> (i32, i32) {
-    let (w, h) = {
-        let info = crate::video::WRITER.lock().info();
-        (info.width as i32, info.height as i32)
-    };
+    // LOCKFIX — refused ⇒ (0, 0), the clamp an unset framebuffer has always given this function.
+    let (w, h) = crate::video::panel_info_nonblocking()
+        .map_or((0, 0), |i| (i.width as i32, i.height as i32));
     crate::pal::cursor::pos(w, h)
 }
 
