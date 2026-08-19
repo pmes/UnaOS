@@ -2007,6 +2007,51 @@ const BT_EVENT_MASK_C1: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x5F, 0x00, 0x2
 /// power-on mode; the spec's reset default (0x00) was an assumption, not a reading.
 #[cfg(feature = "btc")]
 const BT_HCI_READ_INQUIRY_MODE: u16 = 0x0C44;
+/// BT-C1/AGE — `HCI_Read_Page_Timeout`: OGF 0x03 / OCF 0x0017 => opcode 0x0C17. No parameters;
+/// returns Status(1) Page_Timeout(2). READ-ONLY, and it exists to close the one hole the WRITE
+/// cannot: `HCI_Write_Page_Timeout` answering status 0x00 says the command was ACCEPTED, not that
+/// the value was LATCHED. A controller that clamps, rounds or silently ignores the value pages on
+/// something other than what this host wrote, and every "the window we waited was longer than the
+/// timeout we set" inference downstream is then built on a number that was never in force. This
+/// read is what turns that inference into a measurement — see `bt_c1_page` step 1a.
+#[cfg(feature = "btc")]
+const BT_HCI_READ_PAGE_TIMEOUT: u16 = 0x0C17;
+/// BT-C1/AGE — the `Clock_Offset` field's LSB in MICROSECONDS. The offset carries bits 16..2 of
+/// (CLKslave - CLKmaster), and the Bluetooth native clock ticks every 312.5 us (half a 625 us
+/// slot), so one unit of this field is 4 ticks = **1250 us**. Everything the ageing witness says
+/// about drift is measured against this granularity: a harvested offset has stopped being exact
+/// the moment accumulated drift exceeds one unit.
+#[cfg(feature = "btc")]
+const BT_C1_CLK_LSB_US: u64 = 1250;
+/// BT-C1/AGE — the `Clock_Offset` field's WRAP PERIOD in milliseconds: 2^15 units of
+/// `BT_C1_CLK_LSB_US` = 40960 ms. Past this age a harvested offset is not merely stale, it is
+/// AMBIGUOUS — the true offset has wrapped through the field's whole range at least once and the
+/// stored value names a phase it no longer identifies. This is the hard ceiling the ageing witness
+/// reports the age as a fraction of.
+#[cfg(feature = "btc")]
+const BT_C1_CLK_WRAP_MS: u64 = 40960;
+/// BT-C1/AGE — worst-case RELATIVE clock drift between the two parts, in parts-per-million. Vol 2
+/// Part B allows +/-250 ppm for a device in standby/scan (the state a speaker awaiting a page is
+/// in), and both clocks are free-running until the link exists, so the offset between them may
+/// drift at up to the SUM: 500 ppm. This is a bound, not a measurement — the real drift may be far
+/// smaller — and the witness says so. It is the right bound to publish because it is the one that
+/// makes the ageing candidate FALSIFIABLE: if even 500 ppm over the measured age cannot move the
+/// offset by a single unit, ageing did not break this page and the remaining candidates carry it.
+#[cfg(feature = "btc")]
+const BT_C1_CLK_DRIFT_PPM: u64 = 500;
+/// BT-C1/PHASE — the peer's page-scan INTERVAL ceiling implied by `Page_Scan_Repetition_Mode`, in
+/// milliseconds: R0 continuous, R1 <= 1.28 s, R2 <= 2.56 s (Vol 2 Part B, page scan substates).
+/// The phase witness reports each retry's gap MODULO this number, because that residue — not the
+/// gap itself — is what says whether a second train sampled a different part of the peer's scan
+/// cycle or landed back on the same one.
+#[cfg(feature = "btc")]
+fn bt_c1_scan_interval_ms(psrm: u8) -> u64 {
+    match psrm {
+        0x00 => 0, // R0 — the peer scans continuously; there is no interval to be out of phase with
+        0x01 => 1280,
+        _ => 2560,
+    }
+}
 /// BT-SSP — IO_Capability 0x03 = NoInputNoOutput (Vol 4 Part E §7.1.29). The truth about this
 /// machine DURING BOOT: the compositor may exist but no consent UI does, so claiming a display
 /// or a yes/no button would promise an interaction this stage cannot deliver. NoInputNoOutput on
@@ -2499,6 +2544,18 @@ struct BtL3State {
     /// print what the air actually said.
     #[cfg(feature = "btc")]
     inq_clock_offset: u16,
+    /// BT-C1/AGE — the `now_cycles()` reading at the INSTANT the target's clock offset came off the
+    /// air, latched in the same branch that stores the offset itself so the two can never disagree.
+    ///
+    /// A clock offset is a statement about a phase at a moment. Everything downstream of the
+    /// inquiry — the remaining inquiry length, the `Inquiry_Cancel` round trip, the page-timeout
+    /// write and its read-back, then a first page train of up to 5.12 s and a second one after it —
+    /// happens AFTER that moment, and the offset is not re-harvested for any of it. This timestamp
+    /// is the only thing that makes the elapsed distance measurable rather than assumed, and the
+    /// ageing candidate stands or falls on it. Meaningful only when `inq_found`; 0 otherwise, and
+    /// the witness gates on the flag rather than on the value.
+    #[cfg(feature = "btc")]
+    inq_clk_at: u64,
     /// BT-C1/INQUIRY — total responses decoded across every inquiry-result event of the run. This
     /// is what separates "the room is silent on classic" from "the room is busy and the target is
     /// not in it", which the pre-inquiry capture could not distinguish at all.
@@ -2621,6 +2678,10 @@ fn bt_c1_inquiry_harvest(idx: usize, pkt: &[u8], st: &mut BtL3State) {
             // valid flag this host sets itself.
             st.inq_psrm_ok = psrm <= BT_C1_PSRM_MAX;
             st.inq_clock_offset = clk;
+            // BT-C1/AGE — the offset's timestamp is taken HERE, in the same branch that stores the
+            // offset, so no path can produce one without the other. This is the reading every
+            // ageing number downstream is measured from.
+            st.inq_clk_at = crate::arch::now_cycles();
         }
         if same_oui {
             st.inq_oui_seen = true;
@@ -7307,6 +7368,45 @@ impl Controller {
             ),
         }
 
+        // ---- 1a. BT-C1/AGE — READ THE TIMEOUT BACK ----------------------------------------------
+        // CANDIDATE 3 (controller paging parameters), first half. The write above answering
+        // status=0x00 says ACCEPTED; it does not say LATCHED. Every downstream inference of the
+        // form "the window we waited exceeded the timeout we set, so the controller owed us a Page
+        // Timeout" is built on the written value, and if this part clamps or ignores it that
+        // inference is built on a number that was never in force. Read-only, and it runs before any
+        // page is outstanding, so no failure arm here can owe a cancel.
+        let mut rpt = [0u8; 8];
+        let readback = match self.bt_hci_command(
+            t, intf, e, toggle, BT_HCI_READ_PAGE_TIMEOUT, &[], &mut rpt, armed,
+        ) {
+            Some(n) if n >= 3 && rpt[0] == 0x00 => {
+                let got = (rpt[1] as u16) | ((rpt[2] as u16) << 8);
+                serial_println!(
+                    ":: bt-c1: [{}] HCI_Read_Page_Timeout (0x0C17) status=0x00 in_force={:#06x}(={}ms) written={:#06x}(={}ms) -> {} == witness ::",
+                    self.idx, got, (got as u32 * 625) / 1000,
+                    BT_C1_PAGE_TIMEOUT, (BT_C1_PAGE_TIMEOUT as u32 * 625) / 1000,
+                    if got == BT_C1_PAGE_TIMEOUT {
+                        "LATCHED — the value this host wrote is the value the controller will page on, so a train that ends early ended early for a reason other than its deadline"
+                    } else {
+                        "NOT LATCHED — the controller is paging on a DIFFERENT deadline than this host wrote. CANDIDATE 3 IS LIVE ON THIS LINE ALONE: every Page Timeout below must be read against in_force, not against written, and any earlier capture that compared an observed timeout to the written value was comparing against a number the radio never held"
+                    }
+                );
+                Some(got)
+            }
+            other => {
+                serial_println!(
+                    ":: bt-c1: [{}] HCI_Read_Page_Timeout (0x0C17) -> {} — the deadline actually in force is UNKNOWN. The page below still runs, but a Page Timeout whose measured latency differs from the written {}ms can NOT be read as an indictment of the controller here: an unread parameter is not a wrong one == witness ::",
+                    self.idx,
+                    if other.is_some() { "MALFORMED/NONZERO-STATUS" } else { "NO CmdComplete" },
+                    (BT_C1_PAGE_TIMEOUT as u32 * 625) / 1000
+                );
+                None
+            }
+        };
+        // The deadline every observed page latency below is measured against: what the controller
+        // says is in force when it answered, and only the written value when it did not answer.
+        let deadline_ms = (readback.unwrap_or(BT_C1_PAGE_TIMEOUT) as u64 * 625) / 1000;
+
         // ---- 2. HCI_Create_Connection ----------------------------------------------------------
         // Thirteen parameter bytes: BD_ADDR(6) Packet_Type(2) Page_Scan_Repetition_Mode(1)
         // Reserved(1) Clock_Offset(2) Allow_Role_Switch(1). Every value is justified at its
@@ -7333,6 +7433,15 @@ impl Controller {
         let mut pages = 0u32; // page trains actually put on the air (Command Status ACCEPTED or unknown)
         let mut page_timeouts = 0u32; // attempts that ended in an explicit status=0x04 for OUR address
         let mut attempts_run = 0u32;
+        // BT-C1/PHASE — the previous train's start, so a retry can measure the GAP it opened. None
+        // until a train has actually gone out.
+        let mut prev_train: Option<u64> = None;
+        // BT-C1/AGE + BT-C1/PHASE — carried out of the loop so the page summary can restate the
+        // three discriminators in one line without re-deriving them.
+        let mut last_age_cy = 0u64;
+        let mut last_obs_cy = 0u64;
+        let mut obs_measured = false;
+        let mut same_phase_retry = false;
         for attempt in 1..=BT_C1_PAGE_ATTEMPTS {
         attempts_run = attempt;
         serial_println!(
@@ -7358,6 +7467,111 @@ impl Controller {
             BT_C1_ALLOW_ROLE_SWITCH,
             (BT_C1_PAGE_TIMEOUT as u32 * 625) / 1000, BT_C1_CONN_MS
         );
+        // ---- 2a. BT-C1/AGE — THE EXACT BYTES, then the three discriminators --------------------
+        // The line above DECODES the parameters; this one is the parameter block itself, as the 13
+        // bytes that will be on EP0. They are printed because every decoded field above is this
+        // host's own reading of its own array, and a field in the wrong octet — a byte-order slip
+        // in the clock offset, a psrm written into the Reserved octet — would print correctly above
+        // and still page wrong. This is the only line in the stage that can falsify the one above.
+        serial_println!(
+            ":: bt-c1: [{}] page bytes — attempt={}/{} HCI_Create_Connection(0x0405) params=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x}][{:02x} {:02x}][{:02x}][{:02x}][{:02x} {:02x}][{:02x}] = BD_ADDR(6,wire/LSB-first) Packet_Type(2,LE) PSRM(1) Reserved(1) Clock_Offset(2,LE) Allow_Role_Switch(1); THE SAME 13 BYTES GO OUT ON EVERY ATTEMPT — the block is built once before the loop and a retry re-sends it unchanged, which is exactly why the ageing line below is per-attempt and not per-page == witness ::",
+            self.idx, attempt, BT_C1_PAGE_ATTEMPTS,
+            cp[0], cp[1], cp[2], cp[3], cp[4], cp[5], cp[6], cp[7],
+            cp[8], cp[9], cp[10], cp[11], cp[12]
+        );
+        // ---- CANDIDATE 1: HAS THE HARVESTED CLOCK OFFSET AGED OUT? -----------------------------
+        // The offset in `cp` above is a statement about the peer's clock phase AT THE MOMENT the
+        // inquiry response arrived. This measures how long ago that moment was, and converts the
+        // distance into the offset's OWN units, which is the only form in which "stale" means
+        // anything: an offset is exact while accumulated drift is under one unit, approximate while
+        // it is a few, and meaningless once the field has wrapped.
+        //
+        // THE NUMBER IS FALSIFIABLE IN BOTH DIRECTIONS, and that is the point of printing the bound
+        // rather than a verdict: a small age with a sub-unit drift bound EXCLUDES ageing and hands
+        // the failure to candidates 2 and 3, and it is as useful as a large one.
+        if from_inquiry {
+            let age_cy = crate::arch::now_cycles().wrapping_sub(st.inq_clk_at);
+            last_age_cy = age_cy;
+            let (age, age_u) = epace_fmt(age_cy);
+            match epace_ms(age_cy) {
+                Some(age_ms) => {
+                    // Worst-case drift over the elapsed age, in microseconds, then in units of the
+                    // offset's own LSB and in 625 us slots. Integer maths throughout: ppm * ms is
+                    // already microseconds-scaled (1 ppm over 1 ms = 1 ns, so ppm*ms = ns), hence
+                    // the /1000 into us.
+                    let drift_us = age_ms.saturating_mul(BT_C1_CLK_DRIFT_PPM) / 1000;
+                    let drift_lsb = drift_us / BT_C1_CLK_LSB_US;
+                    let drift_slots = drift_us / 625;
+                    serial_println!(
+                        ":: bt-c1: [{}] CANDIDATE-1 clock-offset AGE — attempt={}/{} harvested_offset={:#06x} age={}ms wrap_period={}ms ({}% of wrap) drift_bound={}us at {}ppm = {} offset-units({}us each) = {} slots(625us) -> {} == witness ::",
+                        self.idx, attempt, BT_C1_PAGE_ATTEMPTS, st.inq_clock_offset,
+                        age_ms, BT_C1_CLK_WRAP_MS,
+                        age_ms.saturating_mul(100) / BT_C1_CLK_WRAP_MS,
+                        drift_us, BT_C1_CLK_DRIFT_PPM, drift_lsb, BT_C1_CLK_LSB_US, drift_slots,
+                        if age_ms >= BT_C1_CLK_WRAP_MS {
+                            "AMBIGUOUS — the age EXCEEDS the field's wrap period, so the true offset has run through the field's whole range since it was read and this value no longer identifies a phase at all. CANDIDATE 1 IS SUFFICIENT ON ITS OWN: nothing else need be wrong for this page to miss"
+                        } else if drift_slots >= 1 {
+                            "STALE BEYOND A SLOT — worst-case drift alone can move the peer's clock by a full 625us slot or more since the harvest, so the controller may be starting its train on a phase the peer left. CANDIDATE 1 IS SUFFICIENT to explain this page, though it is a BOUND and not a measurement: a peer with a better crystal may still have been where this offset said"
+                        } else if drift_lsb >= 1 {
+                            "NO LONGER EXACT — drift can exceed one offset unit, so the value is approximate, but it is still inside a slot and a page train that missed by less than a slot did not miss because of this. CANDIDATE 1 IS WEAK HERE"
+                        } else {
+                            "STILL EXACT — even at the worst drift this spec allows, the harvested offset cannot have moved by one unit of its own field. CANDIDATE 1 IS EXCLUDED for this attempt, and a Page Timeout below belongs to candidate 2 (train/scan phase) or candidate 3 (the controller)"
+                        }
+                    );
+                }
+                None => serial_println!(
+                    ":: bt-c1: [{}] CANDIDATE-1 clock-offset AGE — attempt={}/{} harvested_offset={:#06x} age={}{} — THE TSC IS UNCALIBRATED, so the age is raw cycles and no drift bound is computed from it. NOTHING IS CONCLUDED ABOUT AGEING on this attempt; converting these cycles at an assumed rate is the fabrication this driver's epace rule exists to forbid == witness ::",
+                    self.idx, attempt, BT_C1_PAGE_ATTEMPTS, st.inq_clock_offset, age, age_u
+                ),
+            }
+        } else {
+            serial_println!(
+                ":: bt-c1: [{}] CANDIDATE-1 clock-offset AGE — attempt={}/{} NOT APPLICABLE: no offset was harvested for this address, so the page carries {:#06x} with bit 15 CLEAR and the controller is sweeping for the phase rather than starting on one. Ageing cannot be the fault of a value that was never read; the sweep is the cost being paid instead == witness ::",
+                self.idx, attempt, BT_C1_PAGE_ATTEMPTS, BT_C1_CLOCK_OFFSET
+            );
+        }
+        // ---- CANDIDATE 2: DID THIS TRAIN SAMPLE A DIFFERENT SCAN PHASE? ------------------------
+        // A page train and the peer's page-scan schedule are independent clocks. The retry's whole
+        // justification (see the retry witness below) is that a second train samples a DIFFERENT
+        // phase of the peer's scan cycle — but that is an assumption about the gap, and the gap is
+        // whatever the first attempt's timeout plus this host's own overhead happened to make it.
+        // If the gap is close to a whole multiple of the peer's scan interval, the second train
+        // started at nearly the same point in the peer's cycle as the first, and the retry did not
+        // test candidate 2 at all: it re-ran the same experiment. That is the finding this line
+        // exists to make visible, and it is invisible in every capture taken so far.
+        let scan_ms = bt_c1_scan_interval_ms(psrm);
+        match (prev_train, epace_ms(crate::arch::now_cycles().wrapping_sub(prev_train.unwrap_or(0)))) {
+            (Some(_), Some(gap_ms)) if scan_ms != 0 => {
+                let resid = gap_ms % scan_ms;
+                // Distance to the NEAREST multiple, i.e. how far this train's phase sits from the
+                // previous train's — going the short way round the cycle.
+                let phase_off = core::cmp::min(resid, scan_ms - resid);
+                same_phase_retry = phase_off <= 100;
+                serial_println!(
+                    ":: bt-c1: [{}] CANDIDATE-2 train PHASE — attempt={}/{} gap_since_previous_train={}ms peer_scan_interval={}ms(psrm {}) residue={}ms phase_offset_from_previous={}ms -> {} == witness ::",
+                    self.idx, attempt, BT_C1_PAGE_ATTEMPTS, gap_ms, scan_ms,
+                    match psrm { 0x00 => "R0", 0x01 => "R1", 0x02 => "R2", _ => "RESERVED" },
+                    resid, phase_off,
+                    if phase_off <= 100 {
+                        "SAME PHASE — the gap is within 100ms of a whole multiple of the peer's scan interval, so this train started at essentially the point in the peer's scan cycle the previous one did. THE RETRY DID NOT TEST CANDIDATE 2; it repeated the first experiment. Two timeouts under this line are ONE observation, not two, and the phase hypothesis remains untested rather than refuted"
+                    } else {
+                        "DIFFERENT PHASE — this train started at a materially different point in the peer's scan cycle than the previous one. If this attempt also times out, CANDIDATE 2 IS WEAKENED: two independent phases were sampled and neither was heard"
+                    }
+                );
+            }
+            (Some(_), _) if scan_ms == 0 => serial_println!(
+                ":: bt-c1: [{}] CANDIDATE-2 train PHASE — attempt={}/{} psrm=R0, which means the peer scans CONTINUOUSLY. There is no scan interval for a train to be out of phase with, so CANDIDATE 2 IS EXCLUDED by the peer's own reported mode: a train that goes out at all overlaps a scan window by construction == witness ::",
+                self.idx, attempt, BT_C1_PAGE_ATTEMPTS
+            ),
+            (Some(_), _) => serial_println!(
+                ":: bt-c1: [{}] CANDIDATE-2 train PHASE — attempt={}/{} the gap since the previous train is unmeasurable (uncalibrated TSC), so no phase relation is claimed == witness ::",
+                self.idx, attempt, BT_C1_PAGE_ATTEMPTS
+            ),
+            (None, _) => serial_println!(
+                ":: bt-c1: [{}] CANDIDATE-2 train PHASE — attempt={}/{} FIRST TRAIN, so there is no previous train to be in or out of phase with. Its phase relative to the peer's scan cycle is UNKNOWABLE from this host: nothing here can see the peer's scan schedule, only the gap between our own trains. This line exists so the retry's line below has a baseline == witness ::",
+                self.idx, attempt, BT_C1_PAGE_ATTEMPTS
+            ),
+        }
         if !self.bt_hci_send(t, intf, BT_HCI_CREATE_CONN, &cp) {
             serial_println!(
                 ":: bt-c1: [{}] HCI_Create_Connection (0x0405) attempt={}/{} NOT SENT — the EP0 control-OUT failed (its own line is above). The command never reached the radio, so no page is outstanding and no cancel is owed. NO further attempt is made: an EP0 that refused the write is a fact about this host's transport, and repeating it measures nothing about the air == witness ::",
@@ -7377,6 +7591,13 @@ impl Controller {
         // genuinely UNKNOWN (no Command Status, or an endpoint that stopped being readable) —
         // the same two states `outstanding` already treats as "the controller MAY be paging".
         outstanding = true;
+        // BT-C1/PHASE + BT-C1/CTRL — the instant the command left EP0, which is the closest this
+        // host can stand to the instant the train went on the air. It is BOTH the phase baseline
+        // the next attempt measures its gap from AND the zero the Page Timeout latency below is
+        // measured against, and it is deliberately one reading serving both so the two numbers can
+        // never disagree about when this attempt started.
+        let train_at = crate::arch::now_cycles();
+        prev_train = Some(train_at);
         // THIS attempt's answer, not the running total — the retry decision below must not be able
         // to fire on an earlier attempt's Page Timeout.
         let mut this_page_timed_out = false;
@@ -7483,6 +7704,44 @@ impl Controller {
                         if s == 0x04 && ours {
                             page_timeouts += 1;
                             this_page_timed_out = true;
+                            // ---- CANDIDATE 3: DID THE CONTROLLER PAGE FOR THE DEADLINE IN FORCE?
+                            // The controller left the paging state to send this event, so the time
+                            // from the Create_Connection leaving EP0 to this event arriving is the
+                            // duration it actually paged, plus a transport delay of well under a
+                            // millisecond. Compared against `deadline_ms` — READ BACK from the
+                            // controller in step 1a, not merely written to it — this is the one
+                            // measurement that separates "the controller paged for its full
+                            // deadline and heard nothing" from "the controller gave up early".
+                            //
+                            // A SHORT TRAIN IS NOT A PEER PROBLEM. If this reports materially less
+                            // than the deadline, no statement about the speaker follows from this
+                            // attempt at all: the train that was supposed to be listening was not
+                            // on the air for the time the parameters claimed.
+                            let obs_cy =
+                                crate::arch::now_cycles().wrapping_sub(train_at);
+                            last_obs_cy = obs_cy;
+                            obs_measured = true;
+                            match epace_ms(obs_cy) {
+                                Some(obs_ms) => serial_println!(
+                                    ":: bt-c1: [{}] CANDIDATE-3 page-timeout LATENCY — attempt={}/{} observed={}ms deadline_in_force={}ms ({}% of it) source={} -> {} == witness ::",
+                                    self.idx, attempt, BT_C1_PAGE_ATTEMPTS, obs_ms, deadline_ms,
+                                    if deadline_ms == 0 { 0 } else { obs_ms.saturating_mul(100) / deadline_ms },
+                                    if readback.is_some() { "READ BACK from the controller" } else { "the WRITTEN value; the read-back failed and its own line says so" },
+                                    if deadline_ms == 0 {
+                                        "NO DEADLINE IS KNOWN, so this latency indicts nothing"
+                                    } else if obs_ms.saturating_mul(100) / deadline_ms < 80 {
+                                        "SHORT — the controller stopped paging well before the deadline in force. CANDIDATE 3 IS LIVE, and it is the strongest of the three on this evidence: a train cut short is not a peer that failed to answer, and NOTHING about the speaker may be concluded from this attempt"
+                                    } else if obs_ms.saturating_mul(100) / deadline_ms > 130 {
+                                        "LONG — the event arrived materially AFTER the deadline in force. The controller paged past its own timeout, or this host's event read is lagging the controller; either way the latency is not a clean measure of the train and candidate 3 is live in its second form"
+                                    } else {
+                                        "FULL — the controller paged for the deadline in force and reported the timeout on schedule. CANDIDATE 3 IS EXCLUDED in its 'train cut short' form for this attempt: the radio did the paging it was asked for, and the failure is upstream of it (offset ageing) or in the air (scan phase)"
+                                    }
+                                ),
+                                None => serial_println!(
+                                    ":: bt-c1: [{}] CANDIDATE-3 page-timeout LATENCY — attempt={}/{} UNMEASURABLE (uncalibrated TSC); the observed train duration is raw cycles and is NOT compared to the {}ms deadline. Candidate 3 is neither supported nor excluded here == witness ::",
+                                    self.idx, attempt, BT_C1_PAGE_ATTEMPTS, deadline_ms
+                                ),
+                            }
                         }
                         serial_println!(
                             ":: bt-c1: [{}] Connection Complete (0x03) — attempt={}/{} status={:#04x} -> NOT CONNECTED{}. The page RESOLVED (the controller left the paging state to send this), so no cancel is owed == witness ::",
@@ -7593,6 +7852,45 @@ impl Controller {
                 "NOT REACHED, AND NOT FOR WANT OF LISTENING TIME — no attempt ended in a Page Timeout at all. The answer came from this host's own side or from a peer that responded with something else; the attempt lines above carry it, and no amount of extra page time would change it"
             }
         );
+
+        // ---- 4b''. BT-C1/VERDICT — the three candidates, ranked by THIS boot's own numbers ------
+        // The per-attempt CANDIDATE-1/2/3 lines each answer one question about one train. This is
+        // the line a capture is read FOR: it restates all three against the last attempt's
+        // measurements so the next arc knows which candidate to spend itself on, and it ranks
+        // NOTHING that this boot did not measure. Every arm below is reachable only from numbers
+        // the controller or the clock supplied.
+        if page_timeouts > 0 && from_inquiry {
+            let age_ms = epace_ms(last_age_cy);
+            let obs_ms = if obs_measured { epace_ms(last_obs_cy) } else { None };
+            let drift_slots = age_ms.map(|a| a.saturating_mul(BT_C1_CLK_DRIFT_PPM) / 1000 / 625);
+            let short_train = match (obs_ms, deadline_ms) {
+                (Some(o), d) if d != 0 => o.saturating_mul(100) / d < 80,
+                _ => false,
+            };
+            serial_println!(
+                ":: bt-c1: [{}] CANDIDATE VERDICT — offset_age_at_last_page={}ms(drift_bound={} slots) last_train_observed={}ms deadline_in_force={}ms(readback={}) retry_phase={} -> {} == witness ::",
+                self.idx,
+                match age_ms { Some(a) => a, None => 0 },
+                match drift_slots { Some(d) => d, None => 0 },
+                match obs_ms { Some(o) => o, None => 0 },
+                deadline_ms,
+                readback.is_some(),
+                if same_phase_retry { "SAME(untested)" } else { "DIFFERENT(tested)" },
+                if short_train {
+                    "CANDIDATE 3 (controller) LEADS — the last train ran materially short of the deadline the controller itself reported in force. Spend the next arc on the controller's paging, not on the offset or the phase: an offset cannot be blamed for a train that was not on the air, and a phase cannot be sampled by one that stopped early"
+                } else if age_ms.is_none() || obs_ms.is_none() {
+                    "NOTHING IS RANKED — the TSC was uncalibrated for at least one of the two measurements this verdict needs, so the numbers above are placeholders and not readings. The per-attempt lines say which. A boot that ranks these candidates must be one where tsc_calibrated=true"
+                } else if drift_slots.unwrap_or(0) >= 1 && same_phase_retry {
+                    "CANDIDATES 1 AND 2 ARE BOTH LIVE AND THIS BOOT CANNOT SEPARATE THEM — the offset had aged past a slot AND the retry re-sampled the same scan phase, so the two trains were one experiment run twice with a stale offset. THE NEXT EXPERIMENT IS NAMED BY THIS LINE: re-harvest the offset immediately before the second train, and make the retry gap a non-multiple of the peer's scan interval. Until one of those two moves independently, neither candidate is refuted"
+                } else if drift_slots.unwrap_or(0) >= 1 {
+                    "CANDIDATE 1 (offset ageing) LEADS — the controller paged for its full deadline and two different scan phases were sampled, but the offset it started from had aged past a full slot. The cheapest decisive next experiment is to shorten the inquiry-to-page distance, or re-harvest before the second train"
+                } else if same_phase_retry {
+                    "CANDIDATE 2 (scan phase) IS UNTESTED AND LEADS BY ELIMINATION — the offset was still exact and the controller paged for its full deadline, so neither 1 nor 3 explains this; and the retry re-sampled the same phase, so the one remaining candidate is also the one this boot failed to vary. Change the retry gap and this becomes decidable in a single boot"
+                } else {
+                    "ALL THREE CANDIDATES ARE WEAKENED — the offset was still exact at page time, the controller paged for its full deadline, and two different scan phases were sampled, and the peer still never answered. If this boot's inquiry summary above also says the target ANSWERED, then the failure is in none of the three places this arc has been looking, and the next hypothesis must come from outside them — the paged BD_ADDR itself is the first place to look"
+                }
+            );
+        }
 
         // ---- 4b. reconcile the latch before any cancel is considered -----------------------------
         if !live {
