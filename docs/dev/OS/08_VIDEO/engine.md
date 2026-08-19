@@ -12143,3 +12143,153 @@ prints on metal.
 *Off by default.* Definition, statics, the screen-side span publication and the call site are all
 `#[cfg(all(feature = "witness", target_arch = "x86_64"))]`. A knob-off build has neither the code nor
 a load of its state, and its serial is byte-identical.
+
+## STALL-SPREAD x86 RE-PRICE — the `[wc-h]` stall guard's threshold, and the stall-shaped assertion that had to ship with it (x86, 2026-08-19)
+
+`STALL_SPREAD` (`video/wcg.rs`) is the `[wc-h]` tear test's stall guard: when a present outran the
+beam (`present_us > rectscan_us`), a per-4-KiB rate more than `STALL_SPREAD`× this window's own
+earned floor **diverts** the event from `torn=` into `stalls=`. The diversion is the whole mechanism
+— it never invents a count, and the verdict still reads `torn=` alone, so a stall cannot manufacture
+`-> AT-RISK`.
+
+It shipped at **8**, priced from the pi's population. This arc re-prices it for x86 from *this*
+tree's metal, and — per the pi seat's caveat, adopted here as a design rule — ships the raise
+together with a replacement assertion rather than as a quiet threshold change.
+
+### The x86 population (`~/unaos-bench/capture/rmbp1-boot1/ttyUSB0.log`)
+
+Seven boots, isolated by timestamp restart; **8133 `[wc-h] rollup` lines, every single one
+`torn=0 stalls=0 -> TEAR-FREE`.** The entire population below is therefore *healthy* by the tree's
+own verdict — nothing here is an at-risk sample.
+
+`presspread=` histogram (value : rollups):
+
+| 1 | 2 | 3 | 4 | 6 | 8 | 9 | 10 | 11 | 13 | 14 | 15 | 22 | 27 | 29 | 30 | 33 |
+|---|---|---|---|---|---|---|----|----|----|----|----|----|----|----|----|----|
+|4646|591|511|434|109|143|119|44|100|13|293|394|249|1|17|9|179|
+
+| 36 | 44 | 45 | 46 | 51 | 53 | 63 | 73 | 74 | 75 | 88 | 91 | 94 | 111 | 112 | 118 |
+|----|----|----|----|----|----|----|----|----|----|----|----|----|-----|-----|-----|
+|1|2|1|78|16|1|1|1|9|23|9|16|14|4|11|94|
+
+Per-boot, by window population:
+
+| boot | rollups | `presspread` range | notable |
+|------|---------|--------------------|---------|
+| 0 | 39 | 1–8 | the banded console (`win=1 banded=7 lines=7`) at a steady **8** |
+| 1 | 1809 | 1–91 | `win=1` banded console 4–91; `win=2` to 22 |
+| 2 | 236 | 1–9 | short boot |
+| 3 | 4021 | 1–112 | `win=1` banded console to 112; `win=2` to 15; `win=6` to 14 |
+| 4 | 132 | 1–2 | console geometry churn (`banded=` climbing), spread flat |
+| 5 | 1804 | 1–118 | `win=10` to 118, `win=9` to 51, `win=3` to 46 |
+| 6 | 92 | 1 | wire boot |
+
+**Three readings, and they decide the pin.**
+
+1. **There is no bimodal gap on x86.** The pi's population is 1–7 sustained with an empty 7..32 band
+   before its `{32, 33, 84, 136}` outliers — a clean separation, which is what made 8 the lowest
+   defensible pi threshold. Here the occupied values run continuously from 1 to 118 with no interior
+   gap wider than 94..111, and **20.9 % of healthy rollups (1699 of 8133) sit above 8.**
+2. **The x86 tail is the WRONG END of the ratio.** Every rollup with `presspread > 8` has a
+   `minpresent_us` of 23–726 µs — an anomalously *fast* present pulling the floor down — while its
+   `maxpresent_us` stays inside the same 1723–7276 µs band as the rest of the population. The pi's
+   outliers are the opposite and are the real stall shape: one present of ~218876 µs beside a normal
+   2594 µs floor. A ratio cannot tell these apart; it blows out from either end.
+3. **The honest x86 population OVERLAPS the desched population the guard was priced against**
+   (healthy to 118, desched'd QEMU 58–407 per the GR27 discriminator ledger). On this machine
+   `presspread` is therefore not a discriminator at all.
+
+This tree's hard-won honest metal `presspread=8` (boot 0/boot 2, `win=1`, banded console mixing
+geometries) is not re-litigated here — it is confirmed and shown to be unexceptional: the same
+console geometry also produces 36, 63, 91 and 112.
+
+### The pin: x86 = 256, aarch64 = 8, per-tree, unioned at merge
+
+`STALL_SPREAD` was a single shared constant; it is now arch-conditional. **Arch-conditional is the
+stated exception to arch-neutrality here because the number is a hardware-population fact** — a
+threshold on a measured distribution, where the two trees measure different machines. Pinning one
+value either disarms the guard on one tree or convicts honest presents on the other. Per-tree exact
+pins, unioned at merge: the WMCTRL ruling. Both pins are cited to their own capture in the
+constant's doc comment.
+
+Since x86 shows no gap to read the pin off, it is read off **which error is affordable**. The guard
+only ever diverts `torn=` → `stalls=`, so:
+
+* a **false conviction suppresses a tear** and disarms the `-> AT-RISK` FORBID — silent, and the
+  exact failure the FORBID exists to prevent;
+* a **false acquittal** merely lets a QEMU desched print as a tear — loud, in QEMU, read by a human.
+
+At 8, any honest x86 present in that 20.9 % tail that also outran the beam would be silently
+convicted. **256** clears the entire observed honest population (ceiling 118) by 2.2×, while still
+sitting inside the 58–407 desched band, so the guard keeps teeth against the worst of the shape it
+was built for. 128 was rejected: an 8 % margin over a ceiling measured on one machine across seven
+boots is not a margin.
+
+### The stall-shaped replacement assertion — `longpres=` / `-> STALL`
+
+A raised threshold must not leave the tree with less assertion than it had. The replacement is
+deliberately **not a ratio**, because the ratio is what failed here:
+
+```
+[wc-h] win=<id> present_us=<n> bound_us=33334 minpresent_us=<n> -> STALL
+[wc-h] rollup … torn=<n> stalls=<n> longpres=<n> … pop=constant frame_us=16667 stallbound_us=33334 -> <verdict>
+```
+
+* `STALL_PRESENT_US = 2 × FRAME_US = 33334 µs` — an **absolute** bound on a single present's
+  wall-clock duration. Priced two-sided from both trees' metal: the largest `maxpresent_us` ever
+  recorded on x86 is 7276 µs (p50 2384 µs), so the bound sits **4.6× above every healthy present
+  either machine has been observed to make**, and **6.5× below the smallest stall-shaped present
+  ever captured** (the pi's ~218876 µs). That is the wide separation `presspread` has on the pi and
+  has lost on x86, recovered in a quantity that does not depend on a floor.
+* `longpres=` is a **census, not a diversion**. It has no `present_us > rectscan_us` precondition and
+  no earned-floor precondition — both are the point of the quantity — and it takes nothing away from
+  `torn=`. A present can be counted torn *and* long. It therefore cannot weaken any existing verdict.
+* **The `-> STALL` token is on its own line, not on the rollup's terminal.** `-> TEAR-FREE` /
+  `-> AT-RISK` / `-> UNSTAGED` and their precedence are matched by two tracks' regression specs; a
+  fourth terminal arm would change what a line those specs already guard is claiming. A new line is
+  an insertion in the same sense a new field is. `longpres=` (inside `pop=all-presents`) and
+  `stallbound_us=` (after `pop=constant`, beside `frame_us=`) follow the existing insertion rule.
+* One naming line per window (`H_LONGSAID`), so a wedged machine names its first offender and then
+  stops paying UART; the count keeps the rest. `minpresent_us=` is printed beside it because that is
+  what makes the reading a *shape*: one absurd present beside a normal floor is a stall, whereas a
+  window whose floor is up there with it is uniformly slow — a different fault.
+* Printed from `stage_flush`, not from the recorder, via a pending hand-off (`H_LONGUS`). A
+  `serial_println!` in `stage_note` runs inside WC-G's clock and would charge the witness to the
+  measurement it reports — the same deferral, for the same reason, that `emit_sample` exists for.
+  All three new per-id cells are reset in `wch_recycle`; the latch especially, or a new tenant would
+  inherit a spent naming line.
+
+### No spec token, deliberately — the metal playbook carries it
+
+The pi seat's note is that QEMU vCPU-compression floods `presspread`. **`maxpresent_us` is exposed to
+the same compression**, and necessarily so: `presspread`'s numerator *is* the present measurement
+`maxpresent_us` maximises, so a desched that multiplies a present by the ledgered 58–407× would take
+a healthy ~1937 µs QEMU present to 112–790 ms — far past the 33334 µs bound.
+
+Three `UNAOS_WC=1 ./arroyo test-fat sf 150` boots on an unloaded host measured `maxpresent_us` at
+65–1937 µs with `presspread` 1–2 and `longpres=0` throughout — tight, and ~17× inside the bound. But
+that shows only that *this host was not descheduled*, not that the quantity is immune, and a spec
+FORBID on `longpres=` would go flaky-red on a loaded host for a reason that is not a video defect.
+**The witness therefore ships without a spec line**; the assertion is carried by the metal playbook.
+
+`x86-witness.spec`'s existing WCH-STALL self-consistency FORBID
+(`stalls=≥2 … presspread=[0-7]`) is unaffected and remains sound — with the pin at 256 a conviction
+now implies `presspread ≥ 256`, so the forbidden arithmetic is impossible by a wider margin than
+when it was written. Its prose is updated to name the per-arch pin rather than a bare `8`.
+
+### The metal falsifier
+
+On the next attended boot: healthy console geometries produce `stalls=0` — including the banded
+console that honestly reads `presspread=8`, 36, 91 or 112, none of which can now buy a suppression —
+while the `-> STALL` line names any present exceeding 33334 µs **with its measured µs beside its
+window's floor**. A boot that prints `stalls>0` on a healthy geometry, or that stalls visibly with
+`longpres=0`, falsifies the pin or the bound respectively.
+
+The verdict flows to `PARITY §6.13`'s x86 column via the pi seat.
+
+### Gates
+
+`./arroyo check` both arches green · `UNAOS_WC=1 ./arroyo check` green · `./arroyo test-fat sf 150` +
+mbench vs `x86-fat.spec` **31/31** knob-off and **31/31** under `UNAOS_WC=1` (`wc` in the
+`⚡ kernel features:` banner) · `longpres=`, `stallbound_us=`, `bound_us=` and `-> STALL` all
+`strings`-proven present in the WC `target/x86_64_esp/kernel.elf`.
