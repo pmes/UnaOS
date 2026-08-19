@@ -63,6 +63,18 @@
 // is the improvisation the arc discipline forbids. It is NAMED here and MADE by the arc that carries
 // the upload, exactly as §S3 named it and declined to make it.
 //
+// **RESOLUTION (W5, 2026-08-19): the named unknown above is SETTLED.** The b43 open specification —
+// the reverse-engineered HARDWARE documentation the community wrote for clean-room reimplementation,
+// legal for this module where the driver source is not — pins the routing: SHM routing **0x0300 =
+// Microcode memory**, upload control word **0x03000000**, "32 bits at a time"
+// (`bcm-specs.sipsolutions.net/SHM/` + `/MicrocodeUpload/` + `/ChipInit/`, tagged `[SPEC-V3]`;
+// corroborated where stated by `bcm-v4.sipsolutions.net`, `[SPEC-V4]`; the numbered fact ledger is
+// `bcm4331.md` §S4-W5). The two paragraphs above are KEPT, not deleted — the ledger records that the
+// value WAS unknown, and what settled it. The upload rung itself lives behind
+// `feature = "wifi3"` (`UNAOS_WIFI3=1`): its prologue is the destructive reset §5 risk 4 describes,
+// so it fires only under an explicit arming knob, and the default build's gate-3 refusal survives
+// with `reason=wifi3-not-armed`. See [`upload_ucode`].
+//
 // ## Sourcing — what was ADOPTED, and from where
 //
 // **This file's constant block and its EROM cursor scaffolding are ADOPTED FROM `drivers/bcma.rs`,
@@ -183,8 +195,9 @@ const RESET_CTL_RESET: u32 = 0x0000_0001;
 
 // ── d11 core registers, relative to the core aperture (BAR0+0 with the window on the d11 base) ──
 
-/// `[EXT-CORROBORATION-WEAK]` `B43_MMIO_MACCTL`. Read on our metal (Boot AO: `macctl=0xc0020403`).
-/// The value is non-degenerate, which corroborates "something lives at +0x120" and nothing more.
+/// `[SPEC-V4 802.11/Registers]` — W5 upgrade (was EXT-CORROBORATION-WEAK): the spec's register map
+/// pins MAC Control at 0x120, and `[SPEC-V3 ChipInit]` writes "MMIO offset 0x120" by number. Also
+/// read on our metal (Boot AO: `macctl=0xc0020403`). PINNED-ROUTING/bcm4331.md §S4-W5 fact 2.
 const D11_MACCTL: u64 = 0x0120;
 /// `[LEDGER]` `B43_MMIO_REV3PLUS_TSF_LOW` / `_HIGH`. Read on our metal, and the corroboration IS
 /// discriminating for once: the pair ADVANCED between two samples and decoded to a plausible
@@ -196,21 +209,95 @@ const D11_TSF_HIGH: u64 = 0x0184;
 /// should say. A wrong offset producing that is a coincidence, not an explanation.
 const D11_PHY_VER: u64 = 0x03E0;
 
-/// `[EXT-CORROBORATION-WEAK]` `MACCTL.PSM_RUN`. §S3 reads bit 1 of `0xc0020403` as "the microcode
-/// processor is executing" and builds the destructive-prologue argument on it — but that reading is
-/// b43's decode of the word, not a measurement of the bit's meaning. Decoded and printed here; the
-/// only thing that RESTS on it is a witness digit and a paragraph of prose, never a write.
+/// `[SPEC-V4 802.11/Registers]` `MACCTL.PSM_RUN` ("PSM Run", 0x2) — W5 upgrade (was
+/// EXT-CORROBORATION-WEAK; PINNED-ROUTING/bcm4331.md §S4-W5 fact 2: value unchanged, provenance
+/// upgraded to Group-A). §S3 reads bit 1 of `0xc0020403` as "the microcode processor is executing"
+/// and builds the destructive-prologue argument on it.
 const MACCTL_PSM_RUN: u32 = 0x0000_0002;
-/// `[EXT-UNPINNED]` `MACCTL.PSM_JMP0`. Named by §S4 as the bit the prologue sets before an upload.
-/// Never written here; decoded only, so an incorrect bit position costs a wrong digit on a witness
-/// line and nothing else.
+/// `[SPEC-V4 802.11/Registers]` `MACCTL.PSM_JMP0` ("PSM Jump 0", 0x4) — W5 upgrade (was
+/// EXT-UNPINNED; fact 2). Also carried inside `[SPEC-V3 ChipInit step 1]`'s whole-word 0x404.
 const MACCTL_PSM_JMP0: u32 = 0x0000_0004;
-/// `[EXT-CORROBORATION-WEAK]` `MACCTL.SHM_ENABLED`. No capture of ours distinguishes this bit.
+/// `[SPEC-V4 802.11/Registers]` `MACCTL.SHM_ENABLED` ("SHM Enabled", 0x100) — W5 upgrade (fact 2).
 const MACCTL_SHM_ENABLED: u32 = 0x0000_0100;
-/// `[EXT-CORROBORATION-WEAK]` `MACCTL.SHM_UPPER`. Same.
+/// `[SPEC-V4 802.11/Registers]` `MACCTL.SHM_UPPER` ("SHM Upper", 0x200) — W5 upgrade (fact 2).
 const MACCTL_SHM_UPPER: u32 = 0x0000_0200;
-/// `[EXT-CORROBORATION-WEAK]` `MACCTL.BE`. Same.
+/// `[SPEC-V4 802.11/Registers]` `MACCTL.BE` ("Big Endian", 0x10000) — W5 upgrade (fact 2).
 const MACCTL_BE: u32 = 0x0001_0000;
+
+// ── S4/W5: the upload registers and values, pinned from the b43 open specification ──────────────
+//
+// (`bcm-specs.sipsolutions.net` — [SPEC-V3]; `bcm-v4.sipsolutions.net` — [SPEC-V4]. Hardware
+// documentation, Group-A legal for this module; the numbered fact ledger these citations point
+// into is bcm4331.md §S4-W5, facts 1-8. Everything in this block is consumed ONLY by the
+// `wifi3`-gated upload rung, and is gated with it so a default build carries none of it.)
+
+/// `[SPEC-V3 SHM; SPEC-V4 802.11/Registers]` (fact 2) `SHM_CONTROL` — routing (high 16) | offset
+/// (low 16). Same offset `drivers/bcma.rs` carries and S4a exercised on metal (fact 0).
+#[cfg(feature = "wifi3")]
+const D11_SHM_CONTROL: u64 = 0x0160;
+/// `[SPEC-V3 SHM; SPEC-V4 802.11/Registers]` (fact 2) `SHM_DATA` — the 32-bit data port; the window
+/// auto-advances 32 bits per access, read and write alike (fact 2's auto-increment pin).
+#[cfg(feature = "wifi3")]
+const D11_SHM_DATA: u64 = 0x0164;
+/// `[SPEC-V3 SHM]` (fact 2) the odd-half data port; the handshake reads shared byte offsets 2 and 6
+/// through it (fact 5).
+#[cfg(feature = "wifi3")]
+const D11_SHM_DATA_UNALIGNED: u64 = 0x0166;
+/// `[SPEC-V3 SHM + MicrocodeUpload]` (fact 1) routing 0x0300 = Microcode memory. "The microcode is
+/// written to the SHM, control word 0x03000000, 32 bits at a time" — `(0x0300 << 16) | 0` verbatim.
+/// THE value gate 3 refused on until W5. The spec's own name is routing "Microcode"; the tree keeps
+/// its `SHM_ROUTE_*` naming.
+#[cfg(feature = "wifi3")]
+const SHM_ROUTE_UCODE: u32 = 0x0300;
+/// `[SPEC-V3 SHM]` (fact 1's table) routing 0x0001 = Shared Memory; offsets for THIS routing are
+/// BYTE addresses (`>> 2` to the dword index — fact 2). The same value `drivers/bcma.rs` proved on
+/// metal (S4a's select/readback leg), which is what makes the table that carries 0x0300
+/// discriminating corroboration (fact 1's cross-check).
+#[cfg(feature = "wifi3")]
+const SHM_ROUTE_SHARED: u32 = 0x0001;
+/// `[SPEC-V3 ChipInit steps 3+5+6; SPEC-V4 802.11/Registers]` (fact 4) Generic IRQ Reason —
+/// READ-TO-CLEAR, the register [`r32`]'s covenant forbids casual reads of; the upload rung is its
+/// one legitimate consumer and prints every read.
+#[cfg(feature = "wifi3")]
+const D11_GEN_IRQ_REASON: u64 = 0x0128;
+/// `[SPEC-V3 Interrupts ("Ready", 0x00000001)]` ∧ `[SPEC-V4 802.11/Registers ("MAC Suspended")]`
+/// (fact 4) — the same bit, pinned by both spec generations independently.
+#[cfg(feature = "wifi3")]
+const IRQ_READY: u32 = 0x0000_0001;
+/// `[SPEC-V3 ChipInit step 1]` (fact 4.1) the pre-upload MACCTL word: "Write 0x404 to MMIO offset
+/// 0x120" — PSM_JMP0 (0x4) + 0x400 (V3 marks it "(used)"; no name needed, the spec pins the WHOLE
+/// WORD). Written ABSOLUTE, as the spec writes it (fact 4's sequence-shape note): the displaced
+/// resident bits die with the resident image the prologue already destroyed.
+#[cfg(feature = "wifi3")]
+const MACCTL_PRE_UPLOAD: u32 = 0x0000_0404;
+/// `[SPEC-V3 ChipInit step 4]` (fact 4.4) the start word: "Write 0x20402 to MMIO offset 0x120" —
+/// Infra (0x20000) + 0x400 + PSM_RUN (0x2), JMP0 dropped. ABSOLUTE, same note as above.
+#[cfg(feature = "wifi3")]
+const MACCTL_START_PSM: u32 = 0x0002_0402;
+/// `[SPEC-V3 SHM]` (fact 5) shared-memory BYTE offsets of the running image's self-published
+/// identity. NAME MISMATCH, flagged (fact 5): V3 reads 0x0000/0x0002 as one 32-bit revision
+/// (high/low); the tree's b43-lineage constants (`drivers/bcma.rs`, metal-exercised by S4a) call
+/// them rev/patch with date/time at 0x0004/0x0006, which V3 does not document. Raw words go on the
+/// wire and BOTH decodes are printed; nothing gates on the disputed reading.
+#[cfg(feature = "wifi3")]
+const SHM_SH_ID: [u16; 4] = [0x0000, 0x0002, 0x0004, 0x0006];
+/// bcm4331.md §S4 (fact 5): b43's one hard rejection floor — a published fwrev at or below
+/// 0x128 (296) is rejected. The expected revision for THIS extraction is deliberately NOT pinned
+/// (fact 8/residual 4: no legal source carries it); the witness prints what the PSM publishes.
+#[cfg(feature = "wifi3")]
+const UCODEREV_FLOOR: u16 = 0x0128;
+/// `B43_BCMA_IOCTL_PHY_RESET` — **Group-B, recorded** (PINNED-ROUTING §7/fact 7: the AI-wrapper
+/// IOCTL flag values appear in neither spec generation; same recorded taint class as the wrapper
+/// block above, adopted from `drivers/bcma.rs`' S3 decode). Used ONLY in the prologue's
+/// REFUSE-shaped guard — the preserve-the-word argument requires PHY_RESET CLEAR in the found word
+/// (METAL: four boots read ioctl=0x00002055, phy-reset=0) — never composed into a write.
+#[cfg(feature = "wifi3")]
+const IOCTL_PHY_RESET: u32 = 0x0000_0008;
+/// FNV-1a, the tree's stream-digest convention (`firmware.rs` uses the same parameters).
+#[cfg(feature = "wifi3")]
+const FNV_OFFSET: u32 = 0x811c_9dc5;
+#[cfg(feature = "wifi3")]
+const FNV_PRIME: u32 = 0x0100_0193;
 
 // ── EROM entry encodings ────────────────────────────────────────────────────────────────────────
 //
@@ -369,6 +456,8 @@ fn settle(us: u64) -> (u64, &'static str) {
 /// `translate()`. Every offset this file reads is a status or identity register: none is a FIFO and
 /// none is read-to-clear. `GEN_IRQ_REASON` (d11+0x128) and the DMA `*_REASON` words ARE read-to-clear
 /// and are deliberately never touched here — reading them would destroy state a later arc needs.
+/// (`wifi3`'s [`upload_ucode`] IS that later arc: it is the one legitimate consumer of d11+0x128,
+/// per `[SPEC-V3 ChipInit steps 3/5/6]`, and every read of it there is printed on the wire.)
 unsafe fn r32(base: u64, off: u64) -> u32 {
     core::ptr::read_volatile((base + off) as *const u32)
 }
@@ -383,9 +472,12 @@ unsafe fn r16(base: u64, off: u64) -> u16 {
 
 /// Write a u32 into the mapped BAR0 window.
 ///
-/// **Exactly one call site** — [`enable_core`], and only on the branch where the core did NOT arrive
-/// enabled. It is deliberately not a general-purpose accessor: every other rung in this file is
-/// MMIO-read-only, and a convenient `w32` in scope is how that stops being true by accident.
+/// **Exactly one call site in the default build** — [`reach_d11`]'s enable branch, and only when the
+/// core did NOT arrive enabled. It is deliberately not a general-purpose accessor: every other rung
+/// in this file is MMIO-read-only, and a convenient `w32` in scope is how that stops being true by
+/// accident. Under `feature = "wifi3"` the upload rung ([`upload_ucode`]) is the second, deliberate
+/// consumer — every write it makes carries the same witness discipline and increments a [`Writes`]
+/// field at the write site.
 ///
 /// # Safety
 /// The caller must have mapped and verified the window, must have established by a LIVE `cfg:0x80`
@@ -686,11 +778,13 @@ struct Writes {
     /// R6's unwind writes on the STILL-DOWN path.
     wrapper_unwinds: u32,
     /// Any write to a d11 CORE-window register — `MACCTL`, `SHM_CONTROL`, `SHM_DATA`,
-    /// `RADIO_CONTROL`. **No site in this file increments it**, which is the point: it is printed
-    /// from the field, so the claim is checked by the compiler's own reachability rather than by a
-    /// reader trusting a literal.
+    /// `RADIO_CONTROL`. **In the default build no site in this file increments it**, which is the
+    /// point: it is printed from the field, so the claim is checked by the compiler's own
+    /// reachability rather than by a reader trusting a literal. Under `feature = "wifi3"` the
+    /// counter gains its first real write sites — every one inside [`upload_ucode`], incremented at
+    /// the write — and the audited zero becomes an audited count by the same mechanism.
     core_regs: u32,
-    /// Microcode bytes streamed into the core. Same argument.
+    /// Microcode bytes streamed into the core. Same argument, same `wifi3` write sites.
     upload_bytes: u64,
 }
 
@@ -717,14 +811,23 @@ impl Writes {
 /// The `end` line, printed from [`Writes`]' fields on every exit path so the audited counts cannot
 /// diverge between the refusal exits and the normal one.
 fn end_line(dl: &Deadline, ok: bool, stage: &str, d11: &str, w: &Writes, restore: &str) {
+    // The parenthetical is a CLAIM about this file's write sites, so it must change with them:
+    // under `wifi3` the counters have real sites (all inside `upload_ucode`) and the line saying
+    // "no write site" would be false the day it mattered most.
+    #[cfg(not(feature = "wifi3"))]
+    const CORE_REGS_NOTE: &str =
+        "audited — MACCTL, SHM_CONTROL, SHM_DATA and RADIO_CONTROL have no write site in this file";
+    #[cfg(feature = "wifi3")]
+    const CORE_REGS_NOTE: &str =
+        "audited — counted at the wifi3 upload sites; RADIO_CONTROL alone still has no write site in this file";
     let (ev, eu) = fmt_dur(dl.elapsed());
     serial_println!(
-        ":: wifi2: end ok={} stage={} d11={} wrote-cfg80={}(selftest={} moves={} restore={}) wrote-cfg0xac={}(moves={} restore={}) wrote-wrapper={}(enable={} unwind={}) wrote-core-regs={}(audited — MACCTL, SHM_CONTROL, SHM_DATA and RADIO_CONTROL have no write site in this file) uploaded-bytes={}(audited) restore={} elapsed={}{} ::",
+        ":: wifi2: end ok={} stage={} d11={} wrote-cfg80={}(selftest={} moves={} restore={}) wrote-cfg0xac={}(moves={} restore={}) wrote-wrapper={}(enable={} unwind={}) wrote-core-regs={}({}) uploaded-bytes={}(audited) restore={} elapsed={}{} ::",
         ok as u8, stage, d11,
         w.cfg80_total(), w.cfg80_selftest, w.cfg80_moves, w.cfg80_restore,
         w.cfg_ac_total(), w.cfg_ac_moves, w.cfg_ac_restore,
         w.wrapper_total(), w.wrapper_writes, w.wrapper_unwinds,
-        w.core_regs, w.upload_bytes, restore, ev, eu
+        w.core_regs, CORE_REGS_NOTE, w.upload_bytes, restore, ev, eu
     );
 }
 
@@ -1299,14 +1402,16 @@ fn reach_d11(bus: u8, dev: u8, func: u8, bar0: u64, d: &D11, pre_win2: u32, w: &
     }
 
     // ── R7: the upload. ─────────────────────────────────────────────────────────────────────────
-    upload_gate(macctl, w);
+    upload_gate(bar0, macctl, w);
     true
 }
 
-/// R7 — the microcode upload, and the three gates it does not pass.
+/// R7 — the microcode upload's gate ladder.
 ///
-/// This function makes NO device access. It is the honest accounting of why arc 2 stops here, and it
-/// is written as code rather than as a comment so that a boot capture carries the reason.
+/// In the default build this function makes NO device access: it is the honest accounting of why
+/// arc 2 stops here, written as code rather than as a comment so that a boot capture carries the
+/// reason. Under `feature = "wifi3"` a set that passes gates 1+2 falls through gate 3 into
+/// [`upload_ucode`] — the one place in this file past which device writes stop being reversible.
 ///
 /// WIFI-SETVAL (GR27) inserted gate 2 — full-set validation — between the completeness gate and the
 /// routing refusal. It is the consumption rung the loader could not perform even WITH the files
@@ -1317,7 +1422,7 @@ fn reach_d11(bus: u8, dev: u8, func: u8, bar0: u64, d: &D11, pre_win2: u32, w: &
 /// does not describe beyond "register init table") are both unpinned for this module, so the largest
 /// verifiable rung is validating the whole set against the facts §S4 DOES pin and recording the
 /// verdict the upload arc must consume.
-fn upload_gate(macctl: u32, w: &Writes) {
+fn upload_gate(bar0: u64, macctl: u32, w: &mut Writes) {
     let staged = super::firmware::staged_count();
     let want = super::firmware::FW_SET_LEN;
 
@@ -1347,17 +1452,24 @@ fn upload_gate(macctl: u32, w: &Writes) {
         return;
     }
 
-    // Gate 3 — the set is present AND valid, and the arc still stops, at a NAMED UNKNOWN.
-    //
-    // §S4's upload is `SHM_CONTROL <- (B43_SHM_UCODE << 16) | 0` then a stream into `SHM_DATA`. The
-    // numeric value of that routing selector is in no source this module may use (see the file
-    // header). §S4a's safety argument for touching SHM_CONTROL rests entirely on never writing the
-    // data port — a wrong routing then costs a wrong number on a witness line. An upload inverts
-    // that: a wrong routing streams tens of kilobytes into whatever bank was actually selected.
-    serial_println!(
-        ":: wifi2: upload REFUSED reason=shm-ucode-routing-UNPINNED — bcm4331.md §S4 names the selector B43_SHM_UCODE but records no VALUE for it; this tree carries only SHM_ROUTE_SHARED=0x0001 (the READ routing S4a uses) and no capture of ours has measured the ucode routing. The only source that carries it is b43 driver source, which CLEAN_ROOM_POLICY §2 puts off-limits for src/wifi/. A wrong routing on a READ costs a wrong number (§S4a); a wrong routing on a 90 KB STREAM into SHM_DATA writes that stream into whatever bank was selected. NOT guessed. What settles it: the value from a source legal for this module, or a metal probe that identifies the routing read-only ::"
-    );
-    upload_not_attempted(w);
+    // Gate 3 — W5: the routing IS pinned now ([SPEC-V3 SHM + MicrocodeUpload]: routing 0x0300,
+    // control word 0x03000000 — fact 1), so the refusal below no longer stands on an unpinned
+    // fact and the line must stop claiming otherwise. What it stands on is the ARMING knob: the
+    // upload's prologue is the destructive reset §5 risk 4 describes, and it fires only under
+    // UNAOS_WIFI3=1.
+    #[cfg(not(feature = "wifi3"))]
+    {
+        let _ = bar0;
+        serial_println!(
+            ":: wifi2: upload REFUSED reason=wifi3-not-armed — the routing IS pinned (W5: SHM routing 0x0300 = microcode memory, control word 0x03000000; bcm-specs.sipsolutions.net/SHM/ + /MicrocodeUpload/, see bcm4331.md §S4-W5) but this build does not carry the upload rung. The prologue is DESTRUCTIVE (bcm4331.md §5 risk 4: the reset destroys the microcode this radio arrives running, psm-run currently {}) and arms only under UNAOS_WIFI3=1 ::",
+            ((macctl & MACCTL_PSM_RUN) != 0) as u8
+        );
+        upload_not_attempted(w);
+    }
+
+    // Gate 3, armed — `wifi3` carries the upload rung: the W5-pinned ladder, end to end.
+    #[cfg(feature = "wifi3")]
+    upload_ucode(bar0, macctl, w);
 }
 
 /// WVAL-REPLAY — the census-ABSENT leg. Runs the set-completeness gate and [`validate_set`] and
@@ -1473,8 +1585,373 @@ fn validate_set() -> bool {
 /// reachability, not a reader's trust, is what keeps it at zero. One print site, shared by both
 /// terminal refusals, so the two exits cannot drift.
 fn upload_not_attempted(w: &Writes) {
+    // Same rule as `end_line`'s parenthetical: the claim about write sites is cfg-conditional
+    // because under `wifi3` the counters HAVE sites (in `upload_ucode`) — a refusal that reaches
+    // this line means none of them ran, and the zeros on the wire are the proof.
+    #[cfg(not(feature = "wifi3"))]
+    const SITE_NOTE: &str =
+        "SHM_CONTROL, SHM_DATA, MACCTL and RADIO_CONTROL share this counter and no site in this file increments it";
+    #[cfg(feature = "wifi3")]
+    const SITE_NOTE: &str =
+        "SHM_CONTROL, SHM_DATA, MACCTL and RADIO_CONTROL share this counter; its write sites live in the wifi3 upload rung, which did not run";
     serial_println!(
-        ":: wifi2: upload NOT ATTEMPTED uploaded-bytes={}(audited) wrote-core-regs={}(audited — SHM_CONTROL, SHM_DATA, MACCTL and RADIO_CONTROL share this counter and no site in this file increments it) — the resident microcode is untouched and still running ::",
-        w.upload_bytes, w.core_regs
+        ":: wifi2: upload NOT ATTEMPTED uploaded-bytes={}(audited) wrote-core-regs={}(audited — {}) — the resident microcode is untouched and still running ::",
+        w.upload_bytes, w.core_regs, SITE_NOTE
     );
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// WIFI-3 — the upload rung. Everything below is `cfg(feature = "wifi3")`: not one byte of it exists
+// in a default build, and the audited-zero counters stay compiler-checked zeros there. Register and
+// value citations are to bcm4331.md §S4-W5's numbered facts (the PINNED-ROUTING ledger, W5,
+// 2026-08-19): [SPEC-V3] = bcm-specs.sipsolutions.net, [SPEC-V4] = bcm-v4.sipsolutions.net.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// One FNV-1a step over a decoded u32 (folded as its four LE bytes) — the digest the pre-pass,
+/// the write stream and the readback verify all share, so a MISMATCH between them is a statement
+/// about the WORDS and never about the hash convention.
+#[cfg(feature = "wifi3")]
+fn fnv1a_word(fnv: u32, word: u32) -> u32 {
+    let mut h = fnv;
+    for b in word.to_le_bytes() {
+        h = (h ^ b as u32).wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
+/// What the pre-pass learned about the staged ucode stream, BEFORE any device write.
+#[cfg(feature = "wifi3")]
+struct UcodeStream {
+    /// Whole be32 words in the payload (fact 3: 39752 declared bytes = 9938 words on the staged
+    /// `ucode29_mimo.fw`, but the value is DERIVED from the walk, never assumed).
+    words: u32,
+    /// FNV-1a over the DECODED u32 stream — the digest the readback verify must reproduce.
+    fnv: u32,
+    first: u32,
+    last: u32,
+}
+
+/// Walk-verify the staged ucode container and derive the stream facts — the hard-won W3 law
+/// ([METAL], rmbp1-boot1): one 8-byte header, `type` 0x75 ⇒ declared size is payload BYTES, whole
+/// be32 words. Never arithmetic-trust: every rule is re-checked here on the staged bytes at the
+/// LAST look before the wire, even though gate 2 already issued VALID this boot. The be32-on-disk
+/// framing is the tree's own metal pin (fact 3: the spec does not state file endianness; the
+/// revision handshake is the backstop if the decode direction were ever wrong — a byte-swapped PSM
+/// image cannot execute and cannot publish a revision).
+#[cfg(feature = "wifi3")]
+fn ucode_stream_facts() -> Option<UcodeStream> {
+    super::firmware::with_staged("ucode", |data| {
+        if data.len() < 8 || data[0] != 0x75 {
+            return None;
+        }
+        let declared = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+        let payload = &data[8..];
+        if declared as usize != payload.len() || payload.len() % 4 != 0 || payload.is_empty() {
+            return None;
+        }
+        let mut fnv: u32 = FNV_OFFSET;
+        let mut first = 0u32;
+        let mut last = 0u32;
+        let mut words = 0u32;
+        for chunk in payload.chunks_exact(4) {
+            let word = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            fnv = fnv1a_word(fnv, word);
+            if words == 0 {
+                first = word;
+            }
+            last = word;
+            words += 1;
+        }
+        Some(UcodeStream { words, fnv, first, last })
+    })?
+}
+
+/// The ONE verdict line, shared by every exit of [`upload_ucode`] so the terminal shape cannot
+/// drift between paths. `reason` is empty exactly when the verdict is UPLOADED.
+#[cfg(feature = "wifi3")]
+fn upload_verdict(words: u32, crc: u32, psm: u8, rev: u16, kind: &'static str, reason: &'static str) {
+    if reason.is_empty() {
+        serial_println!(
+            ":: wifi2: ucode upload words={} crc={:#010x} psm={} rev={} -> {} ::",
+            words, crc, psm, rev, kind
+        );
+    } else {
+        serial_println!(
+            ":: wifi2: ucode upload words={} crc={:#010x} psm={} rev={} -> {}(reason={}) ::",
+            words, crc, psm, rev, kind, reason
+        );
+    }
+}
+
+/// Arc 3 / M2+M3 — the microcode upload and the revision handshake, per the W5-pinned ladder
+/// (bcm4331.md §S4-W5 fact 8's numbered sequence, implemented step for step).
+///
+/// Entered only past every existing gate: census PASS, identity re-read LIVE, set COMPLETE
+/// (gate 1), set VALID (gate 2), d11 FOUND with all four MATCHes, selector readback on the d11
+/// base, MACCTL not all-ones, wrapper aperture verified. Two REFUSE-shaped preconditions of its
+/// own run before the point of no return; after the prologue's reset there is NO unwind (§S4
+/// risk 4: the resident image is destroyed by construction) — every later failure is
+/// VERDICT=FAILED with its leg named, and the only way out is forward or a reboot. The caller's
+/// R8 window-restore runs unconditionally either way.
+///
+/// Initvals are NOT touched here: [SPEC-V3 ChipInit] orders them at step 8, AFTER Ready (fact 6)
+/// — they stay staged and gate-2-validated for the S5-side arc.
+#[cfg(feature = "wifi3")]
+fn upload_ucode(bar0: u64, macctl: u32, w: &mut Writes) {
+    let psm_was = ((macctl & MACCTL_PSM_RUN) != 0) as u8;
+
+    // ── Precondition (a): the container walk-verify + stream facts (W3 METAL law; fact 3). ─────
+    let Some(s) = ucode_stream_facts() else {
+        serial_println!(
+            ":: wifi2: upload REFUSED reason=ucode-container-shape — the staged ucode does not re-verify as a type-0x75 word-stream (8-byte header, size=payload BYTES, whole be32 words; the W3 METAL law) at the last look before the wire, whatever gate 2 said earlier this boot. NOTHING has been written ::"
+        );
+        upload_not_attempted(w);
+        upload_verdict(0, 0, psm_was, 0, "REFUSED", "ucode-container-shape");
+        return;
+    };
+
+    // ── Precondition (b): the prologue guard (fact 7's fallback). The preserve-the-word argument
+    // holds ONLY for the S3-shape IOCTL word four metal boots measured (ioctl=0x00002055: CLK set,
+    // FGC clear, PHY_RESET clear). Composing IOCTL flag values from unpinned sources is exactly
+    // what fact 7 sidesteps, so any other shape REFUSES here rather than being "fixed". ──────────
+    let ioctl_found = unsafe { r32(bar0, BAR0_WRAP_OFF + WRAP_IOCTL) };
+    if ioctl_found & (IOCTL_CLK | IOCTL_FGC | IOCTL_PHY_RESET) != IOCTL_CLK {
+        serial_println!(
+            ":: wifi2: upload REFUSED reason=prologue-ioctl-shape ioctl={:#010x} — not the completed-bring-up word the preserve-the-word prologue is argued for (CLK set, FGC clear, PHY_RESET clear; [METAL] Boots AO+, ioctl=0x00002055). IOCTL flag values are NOT composed from unpinned sources (fact 7). NOTHING has been written ::",
+            ioctl_found
+        );
+        upload_not_attempted(w);
+        upload_verdict(s.words, s.fnv, psm_was, 0, "REFUSED", "prologue-ioctl-shape");
+        return;
+    }
+
+    // ── Precondition (c): MACCTL window/decode sanity. The SHM-window mechanics below assume
+    // SHM_ENABLED set, and the be32-file-to-u32-port framing assumes the core is NOT in
+    // big-endian mode ([SPEC-V4 802.11/Registers] bit values, fact 2). ──────────────────────────
+    if (macctl & MACCTL_SHM_ENABLED) == 0 || (macctl & MACCTL_BE) != 0 {
+        serial_println!(
+            ":: wifi2: upload REFUSED reason=macctl-shape macctl={:#010x} shm-enabled={} want=1 big-endian={} want=0 — the SHM-window and byte-order arguments this upload rests on do not hold for this word. NOTHING has been written ::",
+            macctl, ((macctl & MACCTL_SHM_ENABLED) != 0) as u8, ((macctl & MACCTL_BE) != 0) as u8
+        );
+        upload_not_attempted(w);
+        upload_verdict(s.words, s.fnv, psm_was, 0, "REFUSED", "macctl-shape");
+        return;
+    }
+
+    // ── The point of no return, announced BEFORE the first destructive write. ───────────────────
+    serial_println!(
+        ":: wifi2: upload BEGIN words={} fnv1a={:#010x} ioctl-found={:#010x} — DESTRUCTIVE from the next write: the prologue reset clears MACCTL.PSM_RUN (currently {}) and the resident image cannot be recovered (bcm4331.md §5 risk 4); the only exit is a successful upload + handshake, or a reboot ::",
+        s.words, s.fnv, ioctl_found, psm_was
+    );
+
+    // ── The prologue: preserve-the-word reset (fact 7). The wrapper register FACTS here stay
+    // Group-B, recorded, R6-class — the AI wrapper appears in neither spec generation (fact 7 /
+    // residual 1) and these are the SAME registers R6 already writes on the not-enabled branch.
+    // The flag VALUES are sidestepped: the measured word is preserved across the reset, with only
+    // the pinned CLK/FGC/RESET bits touched. Absolute sequence:
+    //   1/4 IOCTL <- found|FGC|CLK    2/4 RESET_CTL <- RESET (the destructive step; PSM_RUN dies)
+    //   3/4 RESET_CTL <- 0            4/4 IOCTL <- found (the found word returns byte-identical)
+    // No PHY_RESET pulse: the PHY arrived out of reset (precondition b) and is never put INTO it.
+    let steps: [(&str, u64, u32); 4] = [
+        ("IOCTL", WRAP_IOCTL, ioctl_found | IOCTL_FGC | IOCTL_CLK),
+        ("RESET_CTL", WRAP_RESET_CTL, RESET_CTL_RESET),
+        ("RESET_CTL", WRAP_RESET_CTL, 0),
+        ("IOCTL", WRAP_IOCTL, ioctl_found),
+    ];
+    for (i, (name, off, val)) in steps.into_iter().enumerate() {
+        let pre = unsafe { r32(bar0, BAR0_WRAP_OFF + off) };
+        unsafe { w32(bar0, BAR0_WRAP_OFF + off, val) };
+        w.wrapper_writes += 1;
+        let (sv, su) = settle(1);
+        let post = unsafe { r32(bar0, BAR0_WRAP_OFF + off) };
+        serial_println!(
+            ":: wifi2: prologue {}/4 {} pre={:#010x} wrote={:#010x} post={:#010x} took={} settle={}{} — preserve-the-word reset (fact 7; wrapper facts Group-B, recorded, R6-class) ::",
+            i + 1, name, pre, val, post, (post == val) as u8, sv, su
+        );
+    }
+
+    // Post-prologue check: the reset must have stopped the PSM.
+    let macctl_reset = unsafe { r32(bar0, D11_MACCTL) };
+    let psm_stopped = (macctl_reset & MACCTL_PSM_RUN) == 0;
+    serial_println!(
+        ":: wifi2: prologue post macctl={:#010x} psm-run={} want=0 {} ::",
+        macctl_reset, ((macctl_reset & MACCTL_PSM_RUN) != 0) as u8,
+        if psm_stopped { "MATCH" } else { "MISMATCH" }
+    );
+    if !psm_stopped {
+        serial_println!(
+            ":: wifi2: upload FAILED reason=prologue-psm-still-running — past the point of no return with a PSM the reset did not stop; no unwind exists (§S4 risk-4 asymmetry, stated at BEGIN) and the PSM start is NOT attempted on top of it ::"
+        );
+        upload_verdict(s.words, s.fnv, 1, 0, "FAILED", "prologue-psm-still-running");
+        return;
+    }
+
+    // ── [SPEC-V3 ChipInit step 1] (fact 4.1): MACCTL <- 0x404, ABSOLUTE. The spec's citable
+    // sequence is absolute words, not RMW (fact 4's sequence-shape note); the displaced pre-image
+    // is printed beside the write so the capture shows what was displaced — bits that belonged to
+    // the image the prologue just destroyed. ────────────────────────────────────────────────────
+    unsafe { w32(bar0, D11_MACCTL, MACCTL_PRE_UPLOAD) };
+    w.core_regs += 1;
+    let mc_pre = unsafe { r32(bar0, D11_MACCTL) };
+    serial_println!(
+        ":: wifi2: upload macctl-pre displaced={:#010x} wrote={:#010x} readback={:#010x} took={} — ABSOLUTE per [SPEC-V3 ChipInit step 1] (fact 4.1: PSM_JMP0 set, PSM_RUN clear, exactly the pre-upload state §S4 requires) ::",
+        macctl_reset, MACCTL_PRE_UPLOAD, mc_pre, (mc_pre == MACCTL_PRE_UPLOAD) as u8
+    );
+
+    // ── [SPEC-V3 MicrocodeUpload + SHM] (facts 1-3): select routing 0x0300 at offset 0 — the
+    // control word 0x03000000 the spec writes verbatim — and stream the be32-decoded words
+    // through the auto-incrementing window, one u32 per data-port write. ────────────────────────
+    unsafe { w32(bar0, D11_SHM_CONTROL, SHM_ROUTE_UCODE << 16) };
+    w.core_regs += 1;
+    let streamed = super::firmware::with_staged("ucode", |data| {
+        let payload = &data[8..];
+        let mut fnv: u32 = FNV_OFFSET;
+        let mut words = 0u32;
+        for chunk in payload.chunks_exact(4) {
+            let word = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            unsafe { w32(bar0, D11_SHM_DATA, word) };
+            w.core_regs += 1;
+            w.upload_bytes += 4;
+            fnv = fnv1a_word(fnv, word);
+            // Inter-word pacing: engineering MARGIN, not spec — neither generation states a
+            // delay (fact 3.4); ~10 µs/word is cheap insurance against an uncitable posted-write
+            // FIFO, ~100 ms total for the whole stream.
+            settle(10);
+            words += 1;
+        }
+        (words, fnv)
+    });
+    let Some((wrote_words, wrote_fnv)) = streamed else {
+        // Unreachable in practice — the same accessor answered the pre-pass this same boot.
+        serial_println!(
+            ":: wifi2: upload FAILED reason=staged-ucode-vanished — with_staged answered the pre-pass and not the stream; past the point of no return, no unwind exists ::"
+        );
+        upload_verdict(s.words, s.fnv, 0, 0, "FAILED", "staged-ucode-vanished");
+        return;
+    };
+    serial_println!(
+        ":: wifi2: ucode upload words={} bytes={} fnv1a={:#010x} pace=10us(margin, not spec — fact 3.4) via SHM_CONTROL<-{:#010x} (routing 0x0300 = microcode memory, [SPEC-V3 SHM + MicrocodeUpload], facts 1-3) auto-increment stream into SHM_DATA ::",
+        wrote_words, w.upload_bytes, wrote_fnv, SHM_ROUTE_UCODE << 16
+    );
+
+    // ── Readback verify BEFORE the PSM ever starts ([SPEC-V3 SHM] auto-increment, fact 3.5 —
+    // the "incrementally verifiable" leg §S4 promised): re-select the same window and read the
+    // whole stream back through the same auto-advancing port. A MISMATCH stops everything: the
+    // PSM is never started on top of a stream the window does not echo. ─────────────────────────
+    unsafe { w32(bar0, D11_SHM_CONTROL, SHM_ROUTE_UCODE << 16) };
+    w.core_regs += 1;
+    let mut rb_fnv: u32 = FNV_OFFSET;
+    let mut rb_first = 0u32;
+    let mut rb_last = 0u32;
+    for i in 0..wrote_words {
+        let word = unsafe { r32(bar0, D11_SHM_DATA) };
+        if i == 0 {
+            rb_first = word;
+        }
+        rb_last = word;
+        rb_fnv = fnv1a_word(rb_fnv, word);
+    }
+    let verify_ok = rb_fnv == wrote_fnv && rb_first == s.first && rb_last == s.last;
+    serial_println!(
+        ":: wifi2: upload verify words={} fnv-wrote={:#010x} fnv-readback={:#010x} first={:#010x}/{:#010x} last={:#010x}/{:#010x} => {} ::",
+        wrote_words, wrote_fnv, rb_fnv, s.first, rb_first, s.last, rb_last,
+        if verify_ok { "MATCH" } else { "MISMATCH" }
+    );
+    if !verify_ok {
+        serial_println!(
+            ":: wifi2: upload FAILED reason=verify-mismatch — the readback does not reproduce the written stream, so the PSM is NOT started on top of it; no unwind exists past the prologue (stated at BEGIN), the only way out is a reboot ::"
+        );
+        upload_verdict(wrote_words, wrote_fnv, 0, 0, "FAILED", "verify-mismatch");
+        return;
+    }
+
+    // ── [SPEC-V3 ChipInit step 3] (fact 4.3): 0x128 <- 0xFFFFFFFF, clear every pending reason. ──
+    unsafe { w32(bar0, D11_GEN_IRQ_REASON, 0xFFFF_FFFF) };
+    w.core_regs += 1;
+
+    // ── [SPEC-V3 ChipInit step 4] (fact 4.4): start the PSM — 0x20402 ABSOLUTE, JMP0 dropped. ───
+    unsafe { w32(bar0, D11_MACCTL, MACCTL_START_PSM) };
+    w.core_regs += 1;
+    let mc_start = unsafe { r32(bar0, D11_MACCTL) };
+
+    // ── [SPEC-V3 ChipInit step 5] (fact 4.5): spinwait the Ready bit in 0x128 — "up to 10 sec,
+    // check every 10 µSec". The cap is min(the spec's 10 s, the tree's hw_wait_budget) and the
+    // elapsed value is printed either way. Every read of 0x128 here is deliberate: the register
+    // is read-to-clear, this rung is its one legitimate consumer, and the reads are on the wire.
+    let dl = Deadline::new();
+    let hz = crate::bootpace::origin_hz();
+    let ten_s = if hz >= 1000 { hz.saturating_mul(10) } else { u64::MAX };
+    let (ready, reason, polls) = {
+        let mut polls = 0u64;
+        loop {
+            let r = unsafe { r32(bar0, D11_GEN_IRQ_REASON) };
+            polls += 1;
+            if r & IRQ_READY != 0 {
+                break (true, r, polls);
+            }
+            if dl.expired() || dl.elapsed() > ten_s {
+                break (false, r, polls);
+            }
+            settle(10);
+        }
+    };
+    // ── [SPEC-V3 ChipInit step 6] (fact 4.6): dummy read on 0x128 — consumes the Ready reason. ──
+    let dummy = unsafe { r32(bar0, D11_GEN_IRQ_REASON) };
+    let (ev, eu) = fmt_dur(dl.elapsed());
+    serial_println!(
+        ":: wifi2: upload psm start wrote={:#010x} readback={:#010x} ready-poll reason={:#010x} ready={} polls={} elapsed={}{} dummy-read={:#010x} — Ready bit 0x1: [SPEC-V3 Interrupts \"Ready\"] AND [SPEC-V4 Registers \"MAC Suspended\"] (fact 4, same bit both generations); cap=min(spec 10s, hw_wait_budget) ::",
+        MACCTL_START_PSM, mc_start, reason, ready as u8, polls, ev, eu, dummy
+    );
+
+    // ── The handshake — [SPEC-V3 SHM] shared layout (fact 5), through S4a's metal-proven
+    // shared-routing read path: routing 0x0001, BYTE offsets 0,2,4,6 (>> 2 to the dword index,
+    // odd halves through the unaligned port). Raw words first; both decodes printed (the fact-5
+    // NAME MISMATCH is interpretive only and nothing gates on the disputed reading). ────────────
+    let mut id = [0u16; 4];
+    for (i, off) in SHM_SH_ID.into_iter().enumerate() {
+        unsafe { w32(bar0, D11_SHM_CONTROL, (SHM_ROUTE_SHARED << 16) | ((off as u32) >> 2)) };
+        w.core_regs += 1;
+        id[i] = unsafe {
+            if off & 2 == 0 { r16(bar0, D11_SHM_DATA) } else { r16(bar0, D11_SHM_DATA_UNALIGNED) }
+        };
+    }
+    let macctl_post = unsafe { r32(bar0, D11_MACCTL) };
+    let rev32 = ((id[0] as u32) << 16) | id[1] as u32;
+    let psm_run = (macctl_post & MACCTL_PSM_RUN) != 0;
+    let psm_jmp0 = (macctl_post & MACCTL_PSM_JMP0) != 0;
+    serial_println!(
+        ":: wifi2: upload handshake shm[0x0,0x2,0x4,0x6]=[{:#06x},{:#06x},{:#06x},{:#06x}] (V3 decode: rev32={:#010x}; b43-lineage decode: rev={} patch={} date={:#06x} time={:#06x} — the fact-5 NAME MISMATCH is interpretive only, the raw words are the wire) macctl={:#010x} psm-run={} psm-jmp0={} ::",
+        id[0], id[1], id[2], id[3], rev32, id[0], id[1], id[2], id[3],
+        macctl_post, psm_run as u8, psm_jmp0 as u8
+    );
+
+    // ── The verdict ladder — §S4's falsifiable predicate (fact 5 + fact 8 step 12): Ready fired;
+    // the published revision is not 0/0xFFFF ("not running", §S4 failure table) and clears the one
+    // hard floor (> 0x128 = 296); MACCTL shows PSM_RUN=1, PSM_JMP0=0. First failed leg wins and is
+    // NAMED; the expected revision NUMBER is deliberately not gated (residual 4 — no legal source
+    // pins broadcom-wl-5.100.138's value, the witness prints what the PSM publishes). ────────────
+    let rev = id[0];
+    let fail: Option<&'static str> = if !ready {
+        Some("ready-timeout")
+    } else if rev == 0 || rev == 0xFFFF {
+        Some("rev-not-running")
+    } else if rev <= UCODEREV_FLOOR {
+        Some("rev-below-floor")
+    } else if !psm_run {
+        Some("psm-not-running")
+    } else if psm_jmp0 {
+        Some("psm-jmp0-still-set")
+    } else {
+        None
+    };
+    match fail {
+        None => upload_verdict(wrote_words, wrote_fnv, psm_run as u8, rev, "UPLOADED", ""),
+        Some(why) => {
+            serial_println!(
+                ":: wifi2: upload FAILED reason={} — the §S4 predicate did not hold. No unwind exists past the prologue (the resident image is gone, stated at BEGIN); the only way out is forward or a reboot, and bringup_once's R8 window-restore still runs unconditionally ::",
+                why
+            );
+            upload_verdict(wrote_words, wrote_fnv, psm_run as u8, rev, "FAILED", why);
+        }
+    }
 }

@@ -468,6 +468,23 @@ _feats=""
 # `UNAOS_WIFI2=1 UNAOS_WIFIVAL=1` build — the shape the arm_features strip below rewrites textually.
 # See docs/dev/OS/06_NETWORK_STACK/wifi_bcma.md.
 [ -n "${UNAOS_WIFIVAL:-}" ] && _feats="${_feats}wifival,"
+# WIFI-3: UNAOS_WIFI3=1 arms arc 3's UPLOAD rung — the bcm4331 microcode upload
+# (`upload_ucode` in crates/kernel/src/wifi/bringup.rs). W5 pinned the routing gate 3 refused
+# on from the b43 open specification (SHM routing 0x0300 = microcode memory, control word
+# 0x03000000; bcm-specs.sipsolutions.net/SHM/ + /MicrocodeUpload/ + /ChipInit/ — see
+# docs/dev/OS/06_NETWORK_STACK/bcm4331.md §S4-W5), so the default build's refusal now reads
+# reason=wifi3-not-armed rather than claiming the fact is unpinned. DESTRUCTIVE on metal: the
+# upload's prologue asserts the core reset that clears MACCTL.PSM_RUN and destroys the
+# microcode the radio arrives running (bcm4331.md §5 risk 4); only a successful upload +
+# revision handshake restores a working state, which is why the rung arms only under this
+# explicit knob and the first UNAOS_WIFI3=1 boot is Peter's to schedule. QEMU models no
+# BCM4331 (the census refuses at S_START), so the upload is UNREACHABLE in QEMU and the QEMU
+# gate for this feature is compile + strings only. IMPLIES `wifi2` (the Cargo implication
+# pulls wifi2+wifi in; pushed alone for the same duplicate-token reason wifi2/wifival are).
+# x86_64-only and stripped by arm_features below. Default OFF => not one byte of the upload
+# in the image. Kept in sync with builder/src/main.rs. See
+# docs/dev/OS/06_NETWORK_STACK/bcm4331.md.
+[ -n "${UNAOS_WIFI3:-}" ] && _feats="${_feats}wifi3,"
 # VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
 [ -n "${UNAOS_VIDEOCAP:-}" ] && _feats="${_feats}videocap,"
 
@@ -802,6 +819,16 @@ arm_features() {
     # other: `,wifival,` does not contain `,wifi,` or `,wifi2,` as a substring, because the trailing
     # comma is part of every pattern.
     f="${f//,wifival,/,}"
+    # WIFI-3 rides the same strip, for the same reason and as a consequence of the same fact:
+    # `wifi3` implies `wifi2`, whose only code is the x86-gated `src/wifi/`, and `upload_ucode`
+    # is a sibling function inside `bringup.rs` under that same gate — so `wifi3` emits not one
+    # byte of aarch64 CODE. An enabled feature is still hashed into cargo's `-Cmetadata`
+    # fingerprint, so leaving it in (or its implied `wifi2`/`wifi`, both stripped above) would
+    # shift every Pi/Jetson media hash between a default build and a `UNAOS_WIFI3=1` one for
+    # zero observable change. Order-independent with the strips above by their own argument:
+    # `,wifi3,` does not contain `,wifi,` or `,wifi2,` as a substring, because the trailing
+    # comma is part of every pattern.
+    f="${f//,wifi3,/,}"
     # BT-L0 (GR21) rides the same strip, for the same reason and by the same mechanism as `kbdwit`
     # above: every line `bt` gates lives in `drivers/ehci/mod.rs`, which is declared
     # `#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]`, so `bt` emits not one byte of
@@ -1601,7 +1628,7 @@ KERNEL_CFG_MATRIX=(
   # way, which is the build the metal flight actually carries.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,wifival,noaspm"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,wifival,noaspm,wifi3"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder. Cannot carry the tegra family — see the mutual-exclusion note above.

@@ -701,7 +701,9 @@ with a 30 s staging-gate hold for the late volume.
 (`STAGED … hdr= … fnv1a=…` per file, then `firmware set COMPLETE 3/3`), and arc 2's gate 2 runs the
 full-set validation — three `set-validate` lines, the cross-set line, and the
 `set-validation verdict=` line. `verdict=VALID` re-confirms W3's answer per file and parks at
-gate 3's `upload REFUSED reason=shm-ucode-routing-UNPINNED`, which is the EXPECTED park for this
+gate 3's `upload REFUSED reason=wifi3-not-armed` (W5 renamed it from `shm-ucode-routing-UNPINNED`:
+the routing is now pinned — `bcm4331.md` §S4-W5 — and the default build's refusal stands on the
+`UNAOS_WIFI3` arming knob instead), which is the EXPECTED park for this
 round: the capture is the deliverable. `verdict=INVALID` (or any `REJECTED` at staging) is a fact
 about the media — re-extract and re-stage; the loader never routes around a present-but-wrong
 file. `UNAOS_WIFI=1` alone runs the staging half only: `COMPLETE 3/3` and no arc 2.
@@ -845,7 +847,7 @@ With the set present, the `upload SKIPPED` line is replaced by gate 2's validati
 :: wifi2: set-validate bsinitvals bytes=… fnv1a=… hdr=… want=records … => VALID|INVALID — … ::
 :: wifi2: set-validate cross type(initvals)==type(bsinitvals)=… type(ucode)!=type(initvals)=… ver-uniform=… (ADVISORY — the type rules are REQUIRED per-role above; ver is reported, not gated) ::
 :: wifi2: set-validation verdict=VALID|INVALID — W3 is ANSWERED (rmbp1-boot1) … arc 3's upload is GATED on this verdict … ::
-:: wifi2: upload REFUSED reason=shm-ucode-routing-UNPINNED — … NOT guessed. What settles it: … ::                          (verdict=VALID)
+:: wifi2: upload REFUSED reason=wifi3-not-armed — the routing IS pinned (W5 …) but this build does not carry the upload rung … ::   (verdict=VALID, default build; W5 renamed this from reason=shm-ucode-routing-UNPINNED. A UNAOS_WIFI3=1 build proceeds into the upload rung instead — bcm4331.md §S4-W5 fact 8)
 :: wifi2: upload REFUSED reason=set-validation-failed — HARD PARK: no byte of an unvalidated or ambiguous set is ever streamed at the core … re-extract the set with b43-fwcutter and re-stage the stick … ::   (verdict=INVALID)
 :: wifi2: upload NOT ATTEMPTED uploaded-bytes=0(audited) wrote-core-regs=0(audited — SHM_CONTROL, SHM_DATA, MACCTL and RADIO_CONTROL share this counter and no site in this file increments it) — the resident microcode is untouched and still running ::
 ```

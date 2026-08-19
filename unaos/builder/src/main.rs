@@ -269,6 +269,20 @@ fn main() {
     // Default OFF => the ABSENT branch parks exactly as before, media byte-identical. Kept in sync
     // with arroyo's mapping.
     if std::env::var("UNAOS_WIFIVAL").is_ok() { feats.push("wifival"); }
+    // WIFI-3: UNAOS_WIFI3=1 arms arc 3's UPLOAD rung — the bcm4331 microcode upload
+    // (`upload_ucode` in src/wifi/bringup.rs). W5 pinned the SHM routing gate 3 refused on
+    // (0x0300 = microcode memory, control word 0x03000000; the b43 open specification,
+    // bcm-specs.sipsolutions.net — see bcm4331.md §S4-W5), so the default refusal now says
+    // reason=wifi3-not-armed. DESTRUCTIVE on metal: the prologue's core reset destroys the
+    // resident microcode (bcm4331.md §5 risk 4); only a successful upload + handshake
+    // restores a working state. Implies `wifi2`. THIS list is what reaches the kernel binary
+    // for MEDIA builds — the builder re-derives the x86 feature set from ITS OWN env — so a
+    // knob wired into arroyo alone would ship the upload DISABLED while the banner claims it
+    // is on (the s42/INSTGUI and WXN-M3b failure), and on THIS feature that shape is the
+    // worst one available: a boot that made the destructive prologue impossible while the
+    // operator believed the upload was armed. Default OFF => module unlinked, media
+    // byte-identical. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_WIFI3").is_ok() { feats.push("wifi3"); }
     // BT-L0 (GR21): UNAOS_BT=1 arms the first Bluetooth arc — "does the radio answer?". Lifts the
     // EHCI hub-walk depth cap 2 -> 3 to reach the HCI controller behind the FULL-SPEED Broadcom hub
     // `0a5c:4500`, and — in the SAME change, because either alone is wrong — fixes the

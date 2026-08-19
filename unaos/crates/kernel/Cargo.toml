@@ -367,6 +367,21 @@ wifi2 = ["wifi"]
 # `UNAOS_WIFIVAL=1`. Kept in sync with arroyo and builder/src/main.rs. See
 # docs/dev/OS/06_NETWORK_STACK/wifi_bcma.md.
 wifival = ["wifi2"]
+# WIFI-3: arc 3's UPLOAD rung — the bcm4331 microcode upload (`upload_ucode` in
+# `src/wifi/bringup.rs`). W5 pinned the one value gate 3 refused on (SHM routing 0x0300 =
+# microcode memory, control word 0x03000000 — the b43 open specification,
+# bcm-specs.sipsolutions.net/SHM/ + /MicrocodeUpload/ + /ChipInit/; see
+# docs/dev/OS/06_NETWORK_STACK/bcm4331.md §S4-W5), so the refusal's reason is no longer an
+# unpinned fact — it is this feature being off. DESTRUCTIVE on metal: the upload's prologue
+# asserts the core reset that clears MACCTL.PSM_RUN and destroys the resident microcode
+# (bcm4331.md §5 risk 4); only a successful upload + handshake restores a working state, which
+# is why the rung arms only under an explicit knob. Default build: gate 3's refusal survives
+# byte-for-byte in shape with reason=wifi3-not-armed. QEMU models no BCM4331, so this code is
+# unreachable there (the census refuses at S_START); metal-first by construction.
+# IMPLIES `wifi2` (and through it `wifi`). x86_64-only and stripped by arroyo's arm_features.
+# Default OFF => byte-identical media. Enable via `UNAOS_WIFI3=1`. Kept in sync with arroyo
+# and builder/src/main.rs. See docs/dev/OS/06_NETWORK_STACK/bcm4331.md.
+wifi3 = ["wifi2"]
 # VPERF video-path bench instrumentation (x86_64 only — the module is additionally target-gated,
 # so aarch64 artifacts are byte-identical with this on or off): scroll/VRAM-read/put_pixel
 # counters + serial-only cadence lines, the effective framebuffer memory-type readout (MTRR +
