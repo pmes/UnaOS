@@ -191,6 +191,36 @@ pub mod cursor {
 
     /// Hot-spot position (arrow tip), lazily centred on first use. One shared position: the
     /// console loop and the full-screen demos all move/draw the same cursor.
+    ///
+    /// ── POSFIX — every taker of this lock is MASKED, and that is the whole discipline ─────────
+    ///
+    /// INWEDGE / LOCKFIX state the rule this obeys: *a lock the input path touches may not be held
+    /// across a dispatch.* Before POSFIX this lock broke it in INWEDGE's exact shape, with the roles
+    /// of the two populations exchanged relative to the panel lock:
+    ///
+    /// * [`move_rel`] / [`set_abs`] reach [`set_clamped`] from inside the router's masked
+    ///   keep-alive span — so those takes were already MASKED, and could not be preempted.
+    /// * [`pos`] was taken UNMASKED and PREEMPTIBLE from `quarry::live::wheel_route` and
+    ///   `syscall::click_pointer_pos` (both on the `usb-pump`/`input` band), and from the
+    ///   compositor's hit-test helpers. A quantum tick inside that blocking acquire leaves the
+    ///   reader off-CPU **holding POS**, and the next masked pointer report on that core spins on it
+    ///   forever. That is boot 8, one lock over.
+    ///
+    /// **Why mask-everywhere and not try_lock-and-decline.** LOCKFIX gave the PANEL lock the
+    /// decline treatment because its critical section is a lock over a whole framebuffer handle,
+    /// held by painters that copy megabytes — a waiter there can be made to wait arbitrarily long,
+    /// so refusing is the only bounded answer. This lock is the opposite object: **both** critical
+    /// sections are constant-time and call nothing — [`pos`] is a `get_or_insert` of an `(i32, i32)`
+    /// and [`set_clamped`] is a store of one. With every taker masked, no holder can be preempted,
+    /// so the hold is bounded by a handful of instructions and a blocking acquire cannot outlive a
+    /// bounded spin. That is `sched::rq`'s precedent applied unchanged, and it is strictly better
+    /// here than a decline: a refused position read has no honest degradation (a cursor that does
+    /// not move for this event, or a click hit-tested at a stale point), and expressing one would
+    /// have to change the eight `pos()` call sites in `video/wm.rs` — a file this arc may not touch.
+    ///
+    /// **The invariant, for anyone adding a taker:** this lock is acquired only inside
+    /// `arch::without_interrupts`, and nothing but arithmetic runs inside it. Both properties are
+    /// load-bearing — masking a long critical section would move the wedge rather than close it.
     static POS: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 
     // --- CURSOR-X86 (metal defect fix: the pointer moved at PRESENT rate) ----------------------
@@ -444,8 +474,12 @@ pub mod cursor {
     }
 
     /// Current position, centring on first use.
+    ///
+    /// POSFIX — masked, because this is the reader the preemptible input path uses (see [`POS`]).
+    /// Unmasked, a tick inside the acquire parks the holder off-CPU and the next masked pointer
+    /// report on that core spins forever.
     pub fn pos(w: i32, h: i32) -> (i32, i32) {
-        *POS.lock().get_or_insert((w / 2, h / 2))
+        crate::arch::without_interrupts(|| *POS.lock().get_or_insert((w / 2, h / 2)))
     }
 
     /// Apply a relative motion report (trackpad/mouse dx,dy), clamped to the panel.
@@ -631,10 +665,13 @@ pub mod cursor {
         }
     }
 
+    /// POSFIX — masked for the same reason [`pos`] is: the writer must be the reader's equal, or
+    /// "every taker is masked" is not true and the discipline buys nothing. The clamp is computed
+    /// outside the mask; only the store is inside it.
     fn set_clamped(x: i32, y: i32, w: i32, h: i32) {
         let cx = x.clamp(0, (w - 1).max(0));
         let cy = y.clamp(0, (h - 1).max(0));
-        *POS.lock() = Some((cx, cy));
+        crate::arch::without_interrupts(|| *POS.lock() = Some((cx, cy)));
     }
 
     /// Draw the arrow sprite at the current position: a one-block-offset drop shadow first, then

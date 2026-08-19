@@ -1120,3 +1120,44 @@ every one, forbidden 8/4/8 and confined to §14.6's host-load classes plus `[wc-
 -> FAIL` (PARITY.md §6.9c's console-vs-compositor residue). The pre-arc control at `c4ee2280` on the
 same host, four runs, scored 117/117 ×3 and **116/117 once**, with the same classes — including the
 `[wc-d]` one. `scheduler.md` §LOCKFIX carries the full table.
+
+### 14.8 POSFIX — `open()`'s panel read, and why it retries where §14.7 declines (2026-08-18, `exec-posfix`)
+
+LOCKFIX fixed `wheel_route` and named, unfixed, the panel read one function further into this module:
+
+```rust
+let fb = *crate::video::WRITER.lock();   // live.rs, inside open(), before POSFIX
+```
+
+**Why `open()` is on the input band at all.** It looks like boot furniture — `pidesk` calls it once
+while the desktop is being built — but it has a second caller, and that one is a click: the dock's
+pinned tile calls `request_open()`, and `service()` drains the latch from `syscall.rs`'s strip-press
+arm (§14.3's seam, one arm over). That is the preemptible `usb-pump`/`input` band, so this was
+INWEDGE's boot-8 acquire with a file manager behind it — and being a heavyweight one-shot made it
+*worse*, not better: the acquire sits in front of an allocation, a volume read and a window mint, so
+a quantum tick landing inside it is likelier here than anywhere else on the band.
+
+**The fix, and why its polarity differs from `wheel_route`'s.** Both now use
+`video::panel_info_nonblocking()`. `wheel_route` **declines on the first refusal** because a detent is
+cheap to lose and has no second chance, and because a wheel it cannot place is not Quarry's to eat.
+`open()` **bounded-retries** (`PANEL_TRIES = 64`, the bound LOCKFIX gave `inwedge_selftest`) because
+an open is a deliberate operator gesture — losing it to an instantaneous lock race would read as a
+dead dock tile — and because panel geometry is *static*, so the answer a retry gets is the answer the
+first try wanted. Neither try blocks, and each masks and releases inside the door, so the holder can
+always run.
+
+**The refusal is visible and self-healing.** If all 64 refuse, the request goes back into `REOPEN`
+and `open()` prints one line in this module's existing DECLINE grammar:
+
+```
+[quarry] DECLINE reason=panel-busy tries=64 (re-latched — the next dock press reopens; …)
+```
+
+The next `service()` pass reopens with no further operator action. A contended-but-successful open
+prints `[quarry] open panel-contended tries=N panel=WxH`. What is *not* on the table is proceeding on
+stale or zero geometry: `geometry()`, the `dock::Layout::for_panel` strip check and the surface
+allocation are all sized off that read, so a wrong answer there is a wrong window, silently.
+
+**Leg 12 and QSCROLL are untouched** — no click-grammar or wheel-semantics change is in this arc. The
+`:: QUARRY: … +wheel … :: PASS ::` line is byte-identical, and printed on all seven armed runs.
+`scheduler.md` §POSFIX carries the full gate table, including the `pal::cursor::POS` half.

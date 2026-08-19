@@ -1530,6 +1530,11 @@ fn on_glass() -> bool {
     id != wm::WIN_NONE && wm::info(id).map(|i| i.z > wm::shell_z()).unwrap_or(false)
 }
 
+/// POSFIX — how many times [`open`] re-asks `video::panel_info_nonblocking()` before it declines.
+/// The same bound LOCKFIX gave `inwedge_selftest`'s released read, for the same reason: enough that
+/// only a genuinely stuck holder can exhaust it, small enough that exhausting it is bounded work.
+const PANEL_TRIES: u32 = 64;
+
 /// Open Quarry. Idempotent — a second call raises the existing window rather than minting a second.
 ///
 /// Every failure arm prints exactly one `[quarry] DECLINE reason=…` line and leaves no half-built
@@ -1542,11 +1547,49 @@ pub fn open() {
         serial_println!("[quarry] open SKIP reason=already-open win={}", id);
         return;
     }
-    let (pw, ph) = {
-        let fb = *crate::video::WRITER.lock();
-        let i = fb.info();
-        (i.width, i.height)
+    // POSFIX — the panel read on the dock-click path, through LOCKFIX's one door.
+    //
+    // WHY THIS ONE WAS STILL BLOCKING. `open()` looks like boot furniture — `pidesk` calls it once
+    // while the desktop is being built — but it has a SECOND caller and that one is an input event:
+    // the dock's pinned tile latches `request_open()`, and `service()` drains the latch from
+    // `syscall.rs`'s strip-press arm, i.e. from the preemptible `usb-pump`/`input` band, the exact
+    // band INWEDGE convicted. A blocking `WRITER.lock()` there is boot 8 with a file manager on the
+    // other end of it, and being a heavyweight one-shot makes it worse, not better: this function
+    // goes on to allocate, read a volume and mint a window, so a tick landing inside the acquire is
+    // likelier here than anywhere else on the band.
+    //
+    // WHY BOUNDED-RETRY RATHER THAN A BARE DECLINE. `wheel_route`'s single-shot decline is right for
+    // a detent — an event with no second chance and a cheap loss. An open is a deliberate operator
+    // gesture, and losing it to an instantaneous lock race would read as a dead dock tile. Panel
+    // geometry is also, unlike a detent, STATIC: the answer a retry gets is the answer the first try
+    // wanted. So we retry the non-blocking door — never blocking, never masked ACROSS a retry (each
+    // try masks and releases inside `panel_info_nonblocking`), so the holder can always run — with
+    // the same bound and the same `tries=` accounting LOCKFIX gave `inwedge_selftest`'s released
+    // read.
+    //
+    // AND IF EVERY TRY REFUSES: re-latch and say so. The request goes BACK into `REOPEN`, so the next
+    // `service()` pass reopens with no further operator action, and the DECLINE line names the
+    // reason. What is not on the table is guessing: an `open()` that proceeded on stale or zero
+    // geometry would size the window, the dock-strip check and the surface allocation off a lie.
+    let mut tries = 0u32;
+    let (pw, ph) = loop {
+        if let Some(i) = crate::video::panel_info_nonblocking() {
+            break (i.width, i.height);
+        }
+        tries += 1;
+        if tries >= PANEL_TRIES {
+            REOPEN.store(true, Ordering::Release);
+            serial_println!(
+                "[quarry] DECLINE reason=panel-busy tries={} (re-latched — the next dock press reopens; POSFIX declines rather than block on the panel from the input band)",
+                tries
+            );
+            return;
+        }
+        core::hint::spin_loop();
     };
+    if tries != 0 {
+        serial_println!("[quarry] open panel-contended tries={} panel={}x{}", tries, pw, ph);
+    }
     let Some(g) = geometry(pw, ph) else {
         serial_println!(
             "[quarry] DECLINE reason=panel-below-floor panel={}x{} floor={}x{}",

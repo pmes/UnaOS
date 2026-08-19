@@ -2762,6 +2762,74 @@ users run, not desktop furniture. `arch/aarch64/syscall.rs` is nonetheless kept 
 | pre-arc control, `c4ee2280`, same host + knobs, four runs | 117/117 (3), 117/117 (4), **116/117 (10)**, 117/117 (6). The control is the one that dropped a required witness, and it produced the same classes: `[wc-g] COHER`/`RACE-BLIT`, `[dragperf] coalesced=0`, and `[wc-d] verify win=1 … -> FAIL` — the console-vs-compositor residue PARITY.md §6.9c assigns to `exec-shellport`'s pacing lane, and quarry.md §14.6's host-load lane. **No class appears armed that the control does not also produce, and the armed runs never lost a witness.** Honest note: this host is loaded (the runs are interleaved with other aarch64 QEMUs), which is why the arc is judged on paired runs rather than on an absolute count |
 | **go-red retained** | `pal_width_hint` reverted to `WRITER.lock()` in a scratch build, nothing else changed: `✂️ MBENCH TRUNCATED — 40/117, 337 lines`. Byte-for-byte the same truncation INWEDGE recorded, so the leg still convicts a blocking acquire. Call site restored and re-verified |
 
+### POSFIX — the last two blocking takes on the input path (aarch64 + x86, `exec-posfix`)
+
+LOCKFIX closed the rule's `WRITER` population and, in the same breath, named two residuals of the
+**same class** that it did not fix. This arc is exactly those two, and nothing else.
+
+**Residual 1 — `pal::cursor::POS`, INWEDGE's interleaving with a different lock.** The cursor's
+position `Mutex` had takers on both sides of the mask line: `move_rel`/`set_abs` reach `set_clamped`
+from **inside** the router's masked keep-alive span, while `pos()` was a **blocking, unmasked,
+preemptible** take from `quarry::live::wheel_route`, `syscall::click_pointer_pos` and the
+compositor's hit-test helpers. That is boot 8 with the roles exchanged: a tick inside the unmasked
+acquire parks the reader off-CPU holding `POS`, and the next masked pointer report on that core
+spins on it forever.
+
+**The fix is `sched::rq`'s, not LOCKFIX's, and the choice is a property of the object.** LOCKFIX gave
+`WRITER` try-lock-and-decline because its critical section is a whole framebuffer handle held by
+painters that copy megabytes — an unbounded wait, so refusing is the only bounded answer. `POS` is
+the opposite: **both** of its critical sections are constant-time and call nothing (`pos` is a
+`get_or_insert` of an `(i32, i32)`, `set_clamped` is a store of one). So **every taker is masked** —
+no holder can be preempted, the hold is a handful of instructions, and a blocking acquire cannot
+outlive a bounded spin. Mask-everywhere is also the only option available here: a decline has no
+honest degradation for a position read (a cursor that does not move for this event, or a click
+hit-tested at a stale point), and expressing one would have to change the eight `pos()` call sites in
+`video/wm.rs` — a file this arc may not touch. The change is contained entirely in `pal.rs`; not one
+call site moves. **The standing invariant** for anyone adding a taker is recorded on the static:
+`POS` is acquired only inside `arch::without_interrupts`, and nothing but arithmetic runs inside it.
+
+**Residual 2 — `quarry::live::open`'s panel read.** `open()` reads as boot furniture, but it has a
+second caller and that one is an input event: the dock's pinned tile latches `request_open()` and
+`service()` drains the latch from `syscall.rs`'s strip-press arm — the preemptible `usb-pump`/`input`
+band. Its `WRITER.lock()` was blocking, on that band, in front of an allocation, a volume read and a
+window mint. It now goes through `video::panel_info_nonblocking()`, **bounded-retried** (`PANEL_TRIES
+= 64`, the bound LOCKFIX gave `inwedge_selftest`'s released read) rather than declined on the first
+refusal: an open is a deliberate operator gesture where a lost event reads as a dead dock tile, and
+panel geometry is static, so the answer a retry gets is the answer the first try wanted. Each try
+masks and releases inside the door, so the holder can always run. If all 64 refuse, the request is
+put **back** into `REOPEN` — the next `service()` pass reopens with no further operator action — and
+one line says so: `[quarry] DECLINE reason=panel-busy tries=64 …`. A contended-but-successful open
+prints `[quarry] open panel-contended tries=N panel=WxH`. What is deliberately not on the table is
+proceeding on stale or zero geometry, which would size the window, the dock-strip check and the
+surface allocation off a lie.
+
+**Knob-off byte-identity is not claimed**, on PARITY.md §5.3's §5.2 precedent, exactly as LOCKFIX
+did: `pal.rs` is compiled knob-off and this is a correctness fix on a path users run, not desktop
+furniture. `video/quarry/live.rs` remains `feature = "quarry"`-only. `video/wm.rs` is untouched.
+
+**Gate (2026-08-18, `exec-posfix`).**
+
+| gate | result |
+| --- | --- |
+| `./arroyo check` | green, both arches (rc=0) |
+| `UNAOS_WC=1 UNAOS_PIDESK=1 UNAOS_QUARRY=1 ./arroyo check` | green (rc=0) |
+| `./arroyo kernel8` | builds — `UnaOS-pi4-baremetal.img` 64M |
+| `UNAOS_PIDESK=1 UNAOS_QUARRY=1 ./arroyo kernel8-test 210`, 7 runs | 116, 117, 117, 117, 116, 115, **117**/117. `:: INWEDGE: … refused+2 … read+1 tries=1 :: PASS ::` and `:: QUARRY: … +wheel … :: PASS ::` on **all seven** — the arc's own subject never wavered |
+| control, `7847ceea` (LOCKFIX tip), same host + knobs, 6 runs | 117, 117, 117, **116**, 117, 117. The control loses a required witness too, and loses it from the same lane |
+| strings-proof | `reason=panel-busy` and `open panel-contended` each present once in the shipped `target/pi_baremetal/kernel8.img` — the new witnesses are reachable, not merely compiled |
+
+**Honest reading of the forbidden hits.** Every one, armed and control, is in the host-load /
+console-vs-compositor-residue lane PARITY.md §6.9c and quarry.md §14.6 already assign elsewhere:
+`[wc-g] COHER`/`RACE-BLIT`, `[wc-d] verify … -> FAIL`, `[wc-h]`/`[wc-k] AT-RISK`, `[dragperf]
+coalesced=0`, `[wc-c] side-by-side drawn=1`. The dropped required witnesses were `[wc-c] drawn=2`
+(armed once, **control once**), `[wc-fv] focus-vis … raise=…/false` (armed once, not seen in six
+control runs — a single occurrence of the same raise-composite-did-not-land shape, not reproduced in
+six further armed runs), and, on the one 115/117 run, `VUGSPREAD … cores-used=1` plus `[wc-k]
+TEAR-FREE` — pure host-CPU starvation, on a host running these QEMUs back to back. This host is
+loaded, which is why the arc is judged on **paired** runs rather than an absolute count, and the
+paired reading is that armed and control are indistinguishable outside the arc's own two witnesses,
+which are green on every run.
+
 ### Orphan-reaper wake on enqueue (aarch64, SCHED-4b)
 
 **SCHED-4 sleep_ticks regression** (U11-reap FAIL, timer never ticks in QEMU) bisected and fixed by SCHED-4b (`d7631117`): semaphore wake on orphan enqueue — ~0% idle duty metal-confirmed (c2=0% P31b), U11-reap PASS restored.
