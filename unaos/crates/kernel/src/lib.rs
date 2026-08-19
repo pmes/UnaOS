@@ -160,6 +160,9 @@ pub mod logts;
 pub mod console;
 pub mod user;
 pub mod splash;
+// VUGRAS (hw-jetson): the RAS localizer instrument riding the vug frame loop. Declared
+// unconditionally (its public surface is knob-inert); the sweep call sites are tegra-lane.
+pub mod vugras;
 pub mod gui_watchdog;
 // WEDGE-2: the last-words breadcrumb instrument for the TAB->focus-raise chain. ALWAYS declared (its
 // public surface degrades to empty `#[inline(always)]` shims when the `wedge2` feature is off), so the

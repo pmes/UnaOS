@@ -325,6 +325,13 @@ impl TransferRing {
         self.trbs as u64
     }
 
+    /// VUGRAS: the ring's `[lo, hi)` byte span (base PA .. base + num_trbs*sizeof(Trb)). Named in the
+    /// RAS localizer's decode table so a fault ADDR inside a transfer ring is attributable.
+    pub fn span(&self) -> (usize, usize) {
+        let lo = self.trbs as usize;
+        (lo, lo + self.num_trbs * core::mem::size_of::<Trb>())
+    }
+
     /// USB-WRITE-2: the (physical address, Dequeue Cycle State) the controller should resume at
     /// after a bulk STALL is cleared — the CURRENT enqueue slot (the next TRB the host will push),
     /// carrying this ring's live cycle bit. Feeds a Set TR Dequeue Pointer command so a halted

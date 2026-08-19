@@ -142,6 +142,12 @@ _feats=""
 # metal proves raw mode is stable.
 [ -n "${UNAOS_MTRAW_INJECT:-}" ] && _feats="${_feats}mtraw_inject,"
 [ -n "${UNAOS_SCHED_DEMO:-}" ] && _feats="${_feats}sched_demo,"
+# SIMMER self-test (R23s1): UNAOS_SIMMER=1 arms the boot-time simmer smoke test on the aarch64 virt
+# GICv3 path (arch/aarch64/sched.rs::simmer_selftest) — stages the per-core load animator, samples the
+# vug meter twice ~1 s apart (asserts multiple animated cores show busy deltas), then stops (asserts
+# quiescence). Run: `UNAOS_GICV3=1 UNAOS_SIMMER=1 ./arroyo test-arm`. Off => no boot-time staging; the
+# runtime `simmer` shell verb is always available regardless of this knob.
+[ -n "${UNAOS_SIMMER:-}" ] && _feats="${_feats}simmer_test,"
 # STOR-1: route x86 storage syscalls through the interrupt-driven storage service task (opt-in;
 # metal-pending). x86_64 only — a no-op on the aarch64 media below.
 [ -n "${UNAOS_IRQSTORAGE:-}" ] && _feats="${_feats}irqstorage,"
@@ -535,12 +541,26 @@ _feats=""
 [ -n "${UNAOS_GMUX_IGD:-}" ] && _feats="${_feats}gmux_igd,"
 
 [ -n "${UNAOS_TEGRA:-}" ] && _feats="${_feats}tegra,"
+# VUG-RAS-LOCALIZER: UNAOS_VUGRAS=1 arms the RAS localizer (vugras.rs) — the knob-gated DC CIVAC
+# writeback sweep (vug frame loop + JD2 console-idle pump) + the boot candidate-PA witness. Pure
+# instrumentation; OFF by default the code vanishes and the image is byte-identical to baseline. The
+# above-heap sweep span [heap_hi, DRAM_top) is tegra-gated (empty on the virt gate, so the sweep never
+# touches unmapped RAM). Gate: `UNAOS_GICV3=1 UNAOS_VUGRAS=1 ./arroyo test-arm` (sweep runs, witnesses).
+[ -n "${UNAOS_VUGRAS:-}" ] && _feats="${_feats}vugras,"
 # ORIN-SMP-2: UNAOS_SMPPROBE=<n> arms the JM5 CPU_ON firmware-wall investigation probe (tegra-only;
 # arch/aarch64/smpprobe.rs). The numeric value selects the experiment at compile time via
 # option_env!("UNAOS_SMPPROBE") (cargo passes the env to rustc), so each armed value is a distinct
 # image — the record echoes the live SEL so the operator can verify which experiment ran. Default
 # OFF; when unset the feature vanishes and the tegra image is byte-identical to baseline.
 [ -n "${UNAOS_SMPPROBE:-}" ] && _feats="${_feats}smpprobe,"
+# JETSON-EL0 (M1b): UNAOS_TEGRA_EL0=1 arms the Orin EL0/userspace chain — `arch/aarch64/mmu_tegra_el0.rs`
+# (the M6d per-task address-space slots ported to the tegra EL1 regime), the widened `syscall`/`bus`/
+# `sched::spawn_user*` gates, and the el0-hello round-trip spawned from `tegra_early_stop`. The
+# `tegra_el0` feature implies `tegra`, so the knob is self-sufficient (`UNAOS_TEGRA_EL0=1 ./arroyo
+# esp-jetson` builds an armed jetson image). Default OFF => every widened gate reads `baremetal` again,
+# the module + spawn block vanish, and the jetson media is byte-identical to baseline. QEMU models no
+# Tegra234, so the round-trip witness is metal-owed (attended bench). See arch_arm64.md §JETSON-EL0.
+[ -n "${UNAOS_TEGRA_EL0:-}" ] && _feats="${_feats}tegra_el0,tegra,"
 # ORIN-SMP-DEFAULT: the real 6-core Orin SMP kick-off (arch/aarch64/smp_virt.rs::start_secondaries_tegra
 # + the fdt_tegra `/cpus` presence enumerator) is DEFAULT-ON for tegra builds — metal-proven across
 # SMP-1..8 (entry shape, concurrency, position, image layout, idle/busy heartbeats, count-based
@@ -2120,6 +2140,19 @@ esp_jetson() {
         esac
     fi
     echo -e "${COLOR_YELLOW}⚡ kernel features (jetson): ${_feats%,}${COLOR_RESET}"
+    # JETSON-EL0 (M1b): an ARMED jetson image compiles `arch/aarch64/syscall.rs`, which
+    # `include_bytes!`es `target/user_blob.bin` (the el0-hello payload). That file is produced by
+    # `build_user_blob`, which until this arc ran ONLY from the Pi `kernel8` path — so a first
+    # `UNAOS_TEGRA_EL0=1 ./arroyo esp-jetson` in a tree that had never built a Pi image failed with
+    # `couldn't read .../target/user_blob.bin`. Build it here, and ONLY when armed: the disarmed jetson
+    # path does not compile `syscall.rs` at all, so adding an unconditional blob build would slow every
+    # ordinary jetson build and (by refreshing the blob's mtime) churn the kernel's rebuild for nothing.
+    case ",${_feats}" in
+        *",tegra_el0,"*)
+            local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+            build_user_blob
+            ;;
+    esac
     prepare_aarch64
     pack_source_along "$ESP_DIR_ARM"
     echo -e "${COLOR_GREEN}✅ Jetson ESP (tegra): ${ESP_DIR_ARM}${COLOR_RESET}"
@@ -2226,10 +2259,16 @@ k8_lock_acquire() {
     trap 'k8_lock_release' EXIT INT TERM
 }
 
-kernel8() {
-    k8_lock_acquire
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
-
+# JETSON-EL0 (M1b): the EL0 user blob build, LIFTED VERBATIM out of `kernel8()` so a second caller can
+# reach it. It had exactly one caller (the Pi `kernel8` path), and the `tegra_el0` jetson image needs the
+# same artifact for the same reason: `syscall.rs` `include_bytes!`es `target/user_blob.bin`, so the file
+# must exist BEFORE the kernel build or the armed build fails outright (`couldn't read .../user_blob.bin`)
+# — which is precisely what a first armed `esp-jetson` did in a tree that had never run `kernel8`. An
+# in-tree build that happens to have a stale blob lying around from an earlier Pi build masks this, so the
+# dependency is wired here rather than left to luck.
+#
+# Requires `TOOLBIN` to be set by the caller (both callers compute it the same way).
+build_user_blob() {
     # M6c: build the EL0 user program as a SEPARATE link product (out of the kernel's .text) and
     # objcopy it to a flat binary the kernel include_bytes!s (crates/kernel/src/arch/aarch64/
     # syscall.rs). Built for the SAME bare aarch64 target as the kernel, with its own tiny linker
@@ -2259,6 +2298,13 @@ kernel8() {
         exit 1
     fi
     echo -e "${COLOR_GREEN}✅ EL0 user blob: $(wc -c < "${WORKSPACE_DIR}/target/user_blob.bin" | tr -d ' ') bytes${COLOR_RESET}"
+}
+
+kernel8() {
+    k8_lock_acquire
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+
+    build_user_blob
 
     # K2 (make-enforcement-LIVE): the SAME `cargo build --release` above builds every [[bin]] in the
     # user-blob crate, so `owner-blob` + `imp-blob` are already linked (with user-blob.ld) alongside

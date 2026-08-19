@@ -590,6 +590,160 @@ pub fn jb1a_dump(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
     }
 }
 
+/// ORIN-VUG-RAS — enumerate the firmware's DRAM carveouts from the DTB `/reserved-memory` children
+/// as (base, size) byte ranges. On Tegra234 several carveouts (TZ, BPMP, DCE, ...) are protected by
+/// the SNOC memory firewall AND are reported as ordinary Conventional (Usable) DRAM in the UEFI map,
+/// so the kernel heap must exclude them explicitly: a cached store into one succeeds into the
+/// D-cache and then faults on writeback with an SNOC RAS Uncorrectable "Carveout" abort that powers
+/// the cores off (the vug lockup — a heap store into a carveout page, evicted a few frames later).
+/// `/reserved-memory` on Tegra uses 2 address + 2 size cells (root #address-cells/#size-cells = 2).
+/// Only children carrying a concrete `reg` are returned; dynamically-placed carveouts (declared with
+/// `size` + `alloc-ranges` and no static base) can't be excluded from here — the caller notes that
+/// the heap-guard witness line prints the final range so a bench sitting can cross-check the RAS PA.
+/// Read-only RAM walk (the dtb is Normal-WB-mapped by the time `memory::init` runs). Returns the
+/// number of ranges written into `out`.
+pub fn reserved_carveouts(dtb_addr: u64, dtb_size: usize, out: &mut [(u64, u64)]) -> usize {
+    if dtb_addr == 0 || dtb_size == 0 || dtb_size > 4 * 1024 * 1024 || out.is_empty() {
+        return 0;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
+    let Some(fdt) = Fdt::new(blob) else { return 0 };
+    let mut n = 0usize;
+    fdt.for_each_prop(|e| {
+        // /reserved-memory/<child> `reg` arrives at depth 3 (root=1, reserved-memory=2, child=3).
+        if n >= out.len() || e.name != b"reg" || e.depth != 3 {
+            return;
+        }
+        let p = e.path;
+        if !(p.len() > 16 && &p[..16] == b"/reserved-memory") {
+            return;
+        }
+        let words = PropWords::capture(blob, e.val_off, e.val_len);
+        // Each reg entry is [base_hi, base_lo, size_hi, size_lo]; a node may carry several. Skip
+        // zero-size entries.
+        let mut i = 0usize;
+        while i + 4 <= words.n && n < out.len() {
+            let base = ((words.words[i] as u64) << 32) | words.words[i + 1] as u64;
+            let size = ((words.words[i + 2] as u64) << 32) | words.words[i + 3] as u64;
+            if size != 0 {
+                out[n] = (base, size);
+                n += 1;
+            }
+            i += 4;
+        }
+    });
+    n
+}
+
+/// ORIN-DMA-WINDOW — derive the PCIe controller's INBOUND-DMA window(s) from the DTB `dma-ranges`.
+///
+/// The RAS-2 class (heap seated below the inbound-DMA window ⇒ the fabric translated the NIC's ring
+/// writebacks to ~0x0..0x200 ⇒ SNOC/IOB RAS Uncorrectable, cores off) was patched with a HEURISTIC
+/// (`select_heap_region` prefers the highest clean window). The real boundary is DERIVABLE, not
+/// folklore: a DesignWare/Tegra234 PCIe root complex declares its inbound bus→CPU windows in
+/// `dma-ranges`. Each row on THIS hardware (child #address-cells=3, parent #address-cells=2,
+/// #size-cells=2 ⇒ 3+2+2 = 7 cells = 28 bytes — the same stride the node's `ranges` uses, walked
+/// identically in `rtl8168_tegra::resolve_atu_and_window`) maps an incoming PCIe address to a PARENT
+/// (CPU/DRAM) address for `size` bytes; the parent side `[cpu_base, cpu_base+size)` is the window a
+/// bus-master write must land in to reach DRAM — below it is the RAS-2 fabric-error class. Writes each
+/// `(cpu_base, size)` into `out` and returns the count. READ-ONLY (the dtb is Normal-WB-mapped by the
+/// time `memory::init`/the NIC bring-up run).
+///
+/// Gated to the first firmware-`okay` Tegra DesignWare RC node (`tegra234/194-pcie` / `snps,dw-pcie`)
+/// — the SAME gate `resolve_ecam_base`/`resolve_atu_and_window` apply — so a QEMU-virt DTB (a generic
+/// `pcie@` that is not Tegra-compatible) yields 0 windows and the caller degrades to the highest-clean
+/// heuristic with a witness. A missing node, an absent `dma-ranges`, or a foreign DTB all return 0.
+/// (`nvidia,dma-*` props observed on Tegra234 are booleans — e.g. `dma-coherent` — not address
+/// windows; `dma-ranges` is the sole inbound-window source, so this parses exactly that.)
+pub fn pcie_dma_windows(dtb_addr: u64, dtb_size: usize, out: &mut [(u64, u64)]) -> usize {
+    if dtb_addr == 0 || dtb_size == 0 || dtb_size > 4 * 1024 * 1024 || out.is_empty() {
+        return 0;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
+    let Some(fdt) = Fdt::new(blob) else { return 0 };
+
+    // First `pcie@` node's path (mirrors resolve_atu_and_window's walk).
+    let mut path0 = [0u8; MAX_PATH];
+    let mut plen0 = 0usize;
+    let mut found = false;
+    fdt.for_each_prop(|e| {
+        if found {
+            return;
+        }
+        let leaf = match e.path.iter().rposition(|&b| b == b'/') {
+            Some(i) => &e.path[i + 1..],
+            None => e.path,
+        };
+        if leaf.starts_with(b"pcie@") {
+            let l = e.path.len().min(MAX_PATH);
+            path0[..l].copy_from_slice(&e.path[..l]);
+            plen0 = l;
+            found = true;
+        }
+    });
+    if !found {
+        return 0;
+    }
+    let path = &path0[..plen0];
+
+    // compatible / status / dma-ranges of that node.
+    let mut compatible: Option<&[u8]> = None;
+    let mut status: Option<&[u8]> = None;
+    let mut dma_ranges: Option<&[u8]> = None;
+    fdt.for_each_prop(|e| {
+        if e.path != path {
+            return;
+        }
+        let val = &blob[e.val_off..e.val_off + e.val_len];
+        match e.name {
+            b"compatible" => compatible = Some(val),
+            b"status" => status = Some(val),
+            b"dma-ranges" => dma_ranges = Some(val),
+            _ => {}
+        }
+    });
+
+    // Tegra DesignWare RC + firmware-enabled? (same gate as resolve_atu_and_window / resolve_ecam_base.)
+    let is_tegra_rc = compatible
+        .map(|c| {
+            let has = |n: &[u8]| c.windows(n.len()).any(|w| w == n);
+            has(b"tegra234-pcie") || has(b"tegra194-pcie") || has(b"snps,dw-pcie")
+        })
+        .unwrap_or(false);
+    if !is_tegra_rc {
+        return 0;
+    }
+    let okay = match status {
+        None => true,
+        Some(s) => s.split(|&b| b == 0).any(|item| item == b"okay" || item == b"ok"),
+    };
+    if !okay {
+        return 0;
+    }
+
+    let Some(dma_ranges) = dma_ranges else {
+        return 0;
+    };
+    let cell = |b: &[u8], i: usize| -> u64 {
+        u32::from_be_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]) as u64
+    };
+    let mut n = 0usize;
+    let mut off = 0usize;
+    while off + 28 <= dma_ranges.len() && n < out.len() {
+        let row = &dma_ranges[off..off + 28];
+        // child 3 cells (0=phys.hi/space, 1/2=PCI addr — inbound, identity on Tegra); parent 2 cells
+        // (3/4 = CPU/DRAM base); size 2 cells (5/6). The parent side is the inbound-DMA window.
+        let cpu_base = (cell(row, 3) << 32) | cell(row, 4);
+        let size = (cell(row, 5) << 32) | cell(row, 6);
+        if size != 0 {
+            out[n] = (cpu_base, size);
+            n += 1;
+        }
+        off += 28;
+    }
+    n
+}
+
 /// JB3 boot-6: census of EVERY smmu/iommu node the firmware DTB knows — name, compatible,
 /// first reg base. Boot-5's verdict (v2 pair open + fault-free, DMA still dead) means a second
 /// killer sits downstream; Tegra234 carries SMMUv3 instances alongside the MMU-500 pairs, and
@@ -765,6 +919,130 @@ pub fn xusb_iommu(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<X
         ":: tegra: JB3 — DTB: {} sid={:#x} -> {} reg0={:#010x} reg1={:#010x} ({} inst) compat='{}' ::",
         core::str::from_utf8(&path[..plen]).unwrap_or("usb@3610000"),
         sid,
+        core::str::from_utf8(snode).unwrap_or("?"),
+        out.bases[0],
+        out.bases[1],
+        out.n_bases,
+        core::str::from_utf8(&cbuf[..cl]).unwrap_or("?")
+    );
+    if out.n_bases == 0 {
+        return None;
+    }
+    Some(out)
+}
+
+/// NET-4i: PCIe controller-0's SMMU binding, resolved off the LIVE firmware DTB — the SMMU
+/// instance base(s) plus the stream id that controller-0's DMA emits. Parallel to [`xusb_iommu`],
+/// but a PCIe root complex declares its stream via `iommu-map` (an RID→streamid map:
+/// `<rid-base &smmu sid-base length>` 4-tuples) rather than the point-to-point `iommus` XUSB uses.
+/// A downstream single-function device (bus1:dev0:fn0, the NET-4 RTL8168) has RID 0, so the FIRST
+/// tuple's `sid-base` is the stream id it presents to the SMMU. Falls back to a plain `iommus`
+/// binding if the node uses that form. Same first-`pcie@`-node selection as `resolve_ecam_base`
+/// (controller-0 = `/bus@0/pcie@140a0000`). READ-ONLY RAM walk; `None` on any uncooperative tree.
+pub struct PcieIommu {
+    pub sid: u32,
+    pub bases: [u64; 2],
+    pub n_bases: usize,
+}
+
+pub fn pcie_iommu(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<PcieIommu> {
+    if dtb_addr == 0 || dtb_size == 0 {
+        return None;
+    }
+    let g_lo = dtb_addr >> 30;
+    let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
+    let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
+    if !mapped(g_lo) || !mapped(g_hi) {
+        return None;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
+    let fdt = Fdt::new(blob)?;
+
+    // First `pcie@` node (controller-0), the same node `resolve_ecam_base` drives.
+    let mut path = [0u8; MAX_PATH];
+    let mut plen = 0usize;
+    fdt.for_each_prop(|e| {
+        if plen != 0 {
+            return;
+        }
+        let leaf = match e.path.iter().rposition(|&b| b == b'/') {
+            Some(i) => &e.path[i + 1..],
+            None => e.path,
+        };
+        if leaf.starts_with(b"pcie@") {
+            let l = e.path.len().min(MAX_PATH);
+            path[..l].copy_from_slice(&e.path[..l]);
+            plen = l;
+        }
+    });
+    if plen == 0 {
+        serial_println!(":: tegra: [net4i] no pcie@ node in DTB — cannot resolve PCIe SMMU stream ::");
+        return None;
+    }
+
+    // `iommu-map` (RID→streamid) preferred; RID 0's tuple is [rid-base, phandle, sid-base, length].
+    // Some node revisions carry a plain `iommus = <&smmu sid>`; accept that too.
+    let map = fdt.prop_at(&path[..plen], b"iommu-map");
+    let (ph, sid, form) = if map.found && map.n >= 3 {
+        (map.words[1], map.words[2], "iommu-map")
+    } else {
+        let it = fdt.prop_at(&path[..plen], b"iommus");
+        if it.found && it.n >= 2 {
+            (it.words[0], it.words[1], "iommus")
+        } else {
+            serial_println!(
+                ":: tegra: [net4i] {} has no iommu-map/iommus prop — PCIe SMMU stream unknown ::",
+                core::str::from_utf8(&path[..plen]).unwrap_or("pcie@")
+            );
+            return None;
+        }
+    };
+
+    let mut spath = [0u8; MAX_PATH];
+    let slen = fdt.path_of_phandle(ph, &mut spath);
+    if slen == 0 {
+        serial_println!(
+            ":: tegra: [net4i] SMMU phandle {:#x} unresolved (sid={:#x}, via {}) ::",
+            ph, sid, form
+        );
+        return None;
+    }
+    let snode = &spath[..slen];
+    // Dual MMU-500: #address-cells=2/#size-cells=2, so reg is [addr-hi addr-lo size-hi size-lo]
+    // per mirrored instance (same shape xusb_iommu decodes).
+    let reg = fdt.prop_at(snode, b"reg");
+    let mut out = PcieIommu {
+        sid,
+        bases: [0; 2],
+        n_bases: 0,
+    };
+    let mut w = 0usize;
+    while w + 3 < reg.n && out.n_bases < 2 {
+        out.bases[out.n_bases] = ((reg.words[w] as u64) << 32) | reg.words[w + 1] as u64;
+        out.n_bases += 1;
+        w += 4;
+    }
+    let compat = fdt.prop_at(snode, b"compatible");
+    let mut cbuf = [b' '; 44];
+    let mut cl = 0usize;
+    'fill: for wi in 0..compat.n {
+        for b in compat.words[wi].to_be_bytes() {
+            if cl >= cbuf.len() {
+                break 'fill;
+            }
+            cbuf[cl] = match b {
+                0 => b'|',
+                b if b.is_ascii_graphic() => b,
+                _ => b'?',
+            };
+            cl += 1;
+        }
+    }
+    serial_println!(
+        ":: tegra: [net4i] DTB: {} sid={:#x} (via {}) -> {} reg0={:#010x} reg1={:#010x} ({} inst) compat='{}' ::",
+        core::str::from_utf8(&path[..plen]).unwrap_or("pcie@"),
+        sid,
+        form,
         core::str::from_utf8(snode).unwrap_or("?"),
         out.bases[0],
         out.bases[1],

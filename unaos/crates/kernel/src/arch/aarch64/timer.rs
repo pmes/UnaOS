@@ -37,10 +37,23 @@ static LIVE: AtomicBool = AtomicBool::new(false);
 /// WITHOUT moving `GETINFO_TICK_HZ` is now a compile error, which is the whole point.
 pub const TICK_HZ: u64 = 250;
 
-/// Monotonic timer ticks since the heartbeat started. Read via `arch::ticks()`.
+/// Monotonic timer ticks since the heartbeat started. Read via `arch::ticks()` — and, through `ms()`
+/// (= `ticks() * 4`), the wall-clock budget arch-neutral code times against. So EXACTLY ONE core may
+/// advance it: the boot core (the global-clock owner). Every other GICv3 secondary that arms its own
+/// periodic tick (JC3, `arm_this_core_ap`) is registered LOCAL-ONLY in `AP_LOCAL_TICK` and bumps only
+/// its per-CPU `percpu.ticks`, never this — so N ticking APs do not inflate `ticks()`/`ms()` N×.
 static TICKS: AtomicU64 = AtomicU64::new(0);
 /// Down-counter reload value (CNTFRQ / TICK_HZ), computed once in `init`.
 static INTERVAL: AtomicU64 = AtomicU64::new(0);
+
+/// JC3 — bitmask (by linear `cpu_index`) of cores whose periodic tick is LOCAL-ONLY: they advance
+/// their own `percpu.ticks` (this core's scheduler clock, drives `sleep_ticks`/idle-wake) but NEVER the
+/// shared monotonic `TICKS`. Set by `arm_this_core_ap` when a GICv3 secondary arms its own tick; the
+/// boot core (global-clock owner) is never in it. GICv3/`virt`+tegra only — the Pi is GICv2 with every
+/// core bumping the shared clock as before, and this whole path is compiled out there, so the Pi image
+/// (and its `on_tick`) is byte-identical.
+#[cfg(not(feature = "pi"))]
+static AP_LOCAL_TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// The counter frequency (CNTFRQ_EL0), in Hz. On QEMU `virt` this is 62.5 MHz; on the Pi 4 the
 /// firmware programs it (19.2 MHz crystal-derived). Reading it instead of assuming keeps the tick
@@ -98,6 +111,23 @@ pub fn arm_this_core() {
     }
 }
 
+/// JC3 — arm a GICv3 SECONDARY's own periodic tick. Identical to `arm_this_core` (enable this core's
+/// timer PPI at its redistributor + start the periodic down-counter) but FIRST registers this core as a
+/// LOCAL-ONLY ticker in `AP_LOCAL_TICK`, so its `on_tick` advances only its per-CPU `percpu.ticks` and
+/// never the shared monotonic `TICKS`. This is the JC3 containment of the deferred double-count (the
+/// reason the AP tick was held back in JC2): several APs may now run their own idle-wake/preemptible
+/// tick — making each a self-driven scheduler participant instead of reschedule-SGI-dependent — without
+/// inflating the `ticks()`/`ms()` wall-clock budget. `INTERVAL` must already be set (the BSP's `init`
+/// ran first). GICv3 only; the Pi's per-core arm stays `arm_this_core` (shared clock, unchanged).
+#[cfg(not(feature = "pi"))]
+pub fn arm_this_core_ap() {
+    let cpu = super::percpu::this_cpu().cpu_index;
+    if cpu < 32 {
+        AP_LOCAL_TICK.fetch_or(1 << cpu, Ordering::Relaxed);
+    }
+    arm_this_core();
+}
+
 /// Per-tick handler, called from the GIC IRQ dispatch when INTID 30 fires. Re-arm first (which
 /// clears the timer's level-sensitive output so it doesn't immediately re-fire after EOI), then
 /// bump the tick counter. Lock-free; safe from interrupt context.
@@ -110,15 +140,38 @@ pub fn arm_this_core() {
 pub fn on_tick() {
     write_tval(INTERVAL.load(Ordering::Relaxed));
     unsafe { core::arch::asm!("isb", options(nomem, nostack, preserves_flags)) };
-    let prev = TICKS.fetch_add(1, Ordering::Relaxed);
     // Per-CPU tick, bumped by THIS core's timer only (each core arms its own periodic tick). It is
     // the scheduler's local clock: `sched::sleep_ticks` computes a wake deadline against this core's
     // count and the scheduler drains due sleepers against it, so a sleeper wakes on the core it
     // parked on regardless of the other cores' tick pace. Advances only on metal (QEMU raspi4b never
     // delivers the timer IRQ, so `on_tick` never runs there — hence tick-driven sleep is metal-only).
-    super::percpu::this_cpu().ticks.fetch_add(1, Ordering::Relaxed);
-    if prev == 0 {
-        serial_println!("AARCH64: timer heartbeat live (first tick).");
+    let local = super::percpu::this_cpu().ticks.fetch_add(1, Ordering::Relaxed);
+    // Shared monotonic `TICKS` (feeds `ticks()`/`ms()` wall-clock budgets): advanced ONLY by cores that
+    // are NOT registered LOCAL-ONLY. On the Pi (GICv2) that is every core, unchanged. On the GICv3
+    // `virt`/tegra path (JC3) the boot core owns it and each secondary armed via `arm_this_core_ap` is
+    // local-only, so multiple ticking APs do not advance the shared clock N×.
+    #[cfg(not(feature = "pi"))]
+    let local_only = {
+        let cpu = super::percpu::this_cpu().cpu_index;
+        cpu < 32 && (AP_LOCAL_TICK.load(Ordering::Relaxed) & (1 << cpu)) != 0
+    };
+    #[cfg(feature = "pi")]
+    let local_only = false;
+    if !local_only {
+        let prev = TICKS.fetch_add(1, Ordering::Relaxed);
+        if prev == 0 {
+            serial_println!("AARCH64: timer heartbeat live (first tick).");
+        }
+    } else if local == 0 {
+        // JC3 witness — one line the first time THIS secondary's per-core timer PPI delivers, quiet
+        // after (bounded to one line per AP: this branch runs only on that core's first tick). Proof
+        // the AP is now self-driven (its own tick re-polls the run queue) rather than SGI-dependent.
+        #[cfg(not(feature = "pi"))]
+        serial_println!(
+            ":: AARCH64 SMP: c{} timer PPI live (tick {}) ::",
+            super::percpu::this_cpu().cpu_index,
+            local + 1
+        );
     }
 }
 
@@ -132,6 +185,33 @@ pub fn ticks() -> u64 {
 #[inline]
 pub fn is_live() -> bool {
     LIVE.load(Ordering::Relaxed)
+}
+
+/// HID-REGRESS-B12 — does THIS core have its OWN periodic timer PPI armed (JC3 `arm_this_core_ap`)?
+///
+/// The global `LIVE` flag reflects the BOOT CORE's timer only: the Jetson JM6 EL2->EL1 drop clears it
+/// (`set_not_live`) because the boot core's physical timer is switched off there. But a GICv3 SECONDARY
+/// that armed its own local-only tick (registered in `AP_LOCAL_TICK`) still has a live 250 Hz wake
+/// source of its OWN, independent of the boot core. Without this distinction such a secondary falls into
+/// the `LIVE == false` poll-spin branch of `arch::hlt` post-drop and BUSY-SPINS its `run()` idle loop
+/// (re-attempting a work-steal every iteration) instead of parking in WFI until its next tick — and five
+/// cores hammering the shared run-queue spinlocks/atomics saturate the interconnect, starving the boot
+/// core's cooperative xHCI HID poll (the boot-12 "keyboard+mouse armed but ZERO deliveries" regression).
+/// Reporting the local tick here lets `hlt` WFI-park such a core (bounded to one ~4 ms tick), so it stays
+/// self-scheduling yet idle-quiet, and input coexists. The boot core is never in `AP_LOCAL_TICK`, so its
+/// timerless post-drop poll-spin is unchanged. Pi (GICv2, no `AP_LOCAL_TICK`) always reads false — the
+/// Pi idle path is byte-identical.
+#[inline]
+pub fn this_core_has_local_tick() -> bool {
+    #[cfg(not(feature = "pi"))]
+    {
+        let cpu = super::percpu::this_cpu().cpu_index;
+        cpu < 32 && (AP_LOCAL_TICK.load(Ordering::Relaxed) & (1 << cpu)) != 0
+    }
+    #[cfg(feature = "pi")]
+    {
+        false
+    }
 }
 
 /// Clear the liveness flag. Used by the Jetson (tegra) EL2->EL1 drop, which disables the physical

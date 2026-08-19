@@ -718,10 +718,117 @@ pub fn log_summary_once() {
     }
 }
 
+/// VUGRAS (RAS localizer): dump every xHCI DMA structure's physical address to serial so a decoded
+/// RAS fault ADDR can be matched against the controller's rings, contexts and buffers post-mortem. The
+/// controller structures are identity-mapped, so a `*mut`/PA is the physical address the SNOC/ACI sees.
+/// Read-only. Emphasises the port under `enumerating_port` (boots 13+14 both crashed with a port
+/// mid-enumeration; port 7 in the field capture). Called once from the boot witness under the knob.
+pub fn vugras_dump() {
+    let ctrl = XHCI_CONTROLLER.lock();
+    let Some(x) = ctrl.as_ref() else {
+        serial_println!(":: VUGRAS: xHCI not initialised — no controller PAs ::");
+        return;
+    };
+    serial_println!(
+        ":: VUGRAS: xHCI DCBAA={:#x} event_ring_base={:#x} erst_base={:#x} enum_cmd_trb={:#x} enumerating_port={} stage={} ::",
+        x.dcbaap as u64,
+        x.event_ring_phys_base,
+        x.erst_table_phys,
+        x.enum_cmd_phys,
+        x.enumerating_port,
+        x.enum_stage
+    );
+    if let Some(cr) = COMMAND_RING.lock().as_ref() {
+        let (lo, hi) = cr.span();
+        serial_println!(":: VUGRAS: xHCI command-ring [{:#x},{:#x}) ::", lo, hi);
+    }
+    let optp = |o: Option<*mut u8>| -> u64 { o.map(|p| p as u64).unwrap_or(0) };
+    for (i, s) in x.slots.iter().enumerate() {
+        if !s.active {
+            continue;
+        }
+        let mark = if s.port_id == x.enumerating_port { " <== enumerating" } else { "" };
+        serial_println!(
+            ":: VUGRAS: xHCI slot {} port {}{} in_ctx={:#x} out_ctx={:#x} desc_buf={:#x} data_buf={:#x} mouse_buf={:#x} ::",
+            i,
+            s.port_id,
+            mark,
+            s.input_context as u64,
+            s.output_context as u64,
+            s.descriptor_buffer as u64,
+            optp(s.data_buffer),
+            optp(s.mouse_data_buffer)
+        );
+        serial_println!(
+            ":: VUGRAS: xHCI slot {} port {} expect ep0={:#x} mouse={:#x} kbd={:#x} hub_int={:#x} ::",
+            i,
+            s.port_id,
+            s.ep0_expect_phys,
+            s.mouse_expect_phys,
+            s.keyboard_expect_phys,
+            s.hub_int_expect_phys
+        );
+        for (tag, r) in [
+            ("ep0", &s.ep0_ring),
+            ("mouse", &s.mouse_ring),
+            ("kbd", &s.keyboard_ring),
+            ("hub_int", &s.hub_int_ring),
+            ("bulk_in", &s.bulk_in_ring),
+            ("bulk_out", &s.bulk_out_ring),
+        ] {
+            if let Some(ring) = r {
+                let (lo, hi) = ring.span();
+                serial_println!(
+                    ":: VUGRAS: xHCI slot {} port {} {}-ring [{:#x},{:#x}) ::",
+                    i, s.port_id, tag, lo, hi
+                );
+            }
+        }
+        if let Some(b) = s.hub_change_buffer {
+            serial_println!(
+                ":: VUGRAS: xHCI slot {} port {} hub_change_buf={:#x} ::",
+                i, s.port_id, b as u64
+            );
+        }
+    }
+}
+
+/// ORIN-X200-1 (boot-28): witness every bus/DMA pointer the driver hands the controller, at the
+/// moment of programming, together with the controller state (RS/HCH/CRR) that says whether the
+/// pointer is already fetchable. Boot-28's IOB/ACI FillWrite RAS at bus address
+/// 0x8000000000000200 fired right after "SLOT 1/3 ENABLED & ADDRESSED", before any net code ran —
+/// a low/default-shaped pointer (< 0x1000) handed to the controller is the prime suspect shape.
+/// The battery line is usbdebug-gated (default-quiet law); the < 0x1000 FLAG is unconditional —
+/// it only fires on a real bug and must never be silenced by a build knob. Free function (not a
+/// method) so call sites inside `&mut self.slots[..]` borrows can use it without borrow conflicts.
+#[allow(unused_variables)]
+fn x200_witness(op_base: usize, tag: &str, val: u64) {
+    if val < 0x1000 {
+        serial_println!(
+            "xHCI: X200 FLAG !! {} = {:#x} < 0x1000 — low/default-shaped DMA pointer handed to the controller",
+            tag, val
+        );
+    }
+    #[cfg(feature = "usbdebug")]
+    unsafe {
+        let cmd = core::ptr::read_volatile(op_base as *const u32);
+        let sts = core::ptr::read_volatile((op_base + 0x04) as *const u32);
+        let crcr = core::ptr::read_volatile((op_base + 0x18) as *const u32);
+        serial_println!(
+            ":: X200: {}={:#x} (RS={} HCH={} CRR={}) ::",
+            tag, val, cmd & 1, sts & 1, (crcr >> 3) & 1
+        );
+    }
+}
+
 pub static COMMAND_RING: Mutex<Option<TransferRing>> = Mutex::new(None);
 pub static EVENT_RING: Mutex<Option<EventRing>> = Mutex::new(None);
 
-pub static mut ERST_TABLE: ErstTable = ErstTable { entries: [ErstEntry { ring_address: 0, size: 0, _rsvd: 0, _rsvd2: 0 }] };
+// JETSON-XCARVE: the ERST is HEAP-allocated inside `init_interrupter` (like DCBAA / scratchpad / the
+// command ring), NOT a kernel-image `static mut`. A `.bss`-resident xHC DMA structure inherits the
+// bootloader-chosen image extent's firewall status — which HEAP-GUARD does not vet — and the CPU's
+// construction store FillWrite-RASes on writeback (see the EventRing struct doc). No xHC DMA structure
+// lives in the image any more.
 
 // Store Physical Address of the Event Ring for Runtime ERDP updates
 static mut EVENT_RING_PHYS_BASE: u64 = 0;
@@ -1939,10 +2046,13 @@ pub struct DeviceSlot {
     /// Count of REAL (non-dup) pointer reports serviced since arming — drives the bounded serial
     /// mouse-witness (first report + every Nth), never one-line-per-report.
     pub mouse_report_count: u32,
-    /// GUI-CLICK-2: previous pointer-button bitmask for this slot, so the decode emits a
-    /// `pal::Event::Button` on the button-DOWN edge only (any bit going 0→1) and ignores the
-    /// matching release. Mirrors the EHCI press-edge idiom (ehci/mod.rs) and `CLICK1_PREV_MASK`.
-    /// 0 = no button held. Shared xHCI code: x86 xHCI mice track this identically.
+    /// GUI-CLICK-2 (== hw-jetson's CLICK-1, unified at the 2026-08-18 sync): previous
+    /// pointer-button bitmask for this slot, so the decode emits a `pal::Event::Button` on the
+    /// button-DOWN edge only (any bit going 0→1) and ignores the matching release. Byte 0 of every
+    /// HID pointer report (boot mouse AND usb-tablet) carries the same button bits, so this is
+    /// shared by both decode paths. Mirrors the EHCI press-edge idiom (ehci/mod.rs) and
+    /// `CLICK1_PREV_MASK`. 0 = no button held. Shared xHCI code: x86 xHCI mice track this
+    /// identically.
     pub mouse_prev_buttons: u8,
 
     pub is_keyboard: bool,
@@ -2217,6 +2327,9 @@ pub struct XhciController {
 
     pub configuring_slot: u8,
     pub event_ring_phys_base: u64,
+    /// Heap PA of the Event Ring Segment Table (ERST) allocated in `init_interrupter`. Kept for the
+    /// VUGRAS candidate-PA dump so both event-ring and ERST bases are witnessed as heap-resident.
+    pub erst_table_phys: u64,
 
     /// Slot id of the enumerated mass-storage device (0 = none).
     pub storage_slot: u8,
@@ -2434,6 +2547,7 @@ impl XhciController {
             ports_to_enumerate: Vec::new(),
             configuring_slot: 0,
             event_ring_phys_base: 0,
+            erst_table_phys: 0,
             storage_slot: 0,
             storage_pending_bringup: false,
             ftdi_configuring_slot: 0,
@@ -3592,6 +3706,26 @@ impl XhciController {
                                                 }
                                             }
                                         }
+                                    } else if desc_data[1] == 0x01 {
+                                        // ORIN-P7: a DEVICE descriptor whose class we have no driver
+                                        // for (e.g. 0xE0 Wireless Controller — the AzureWave 13d3:3549
+                                        // BT combo on Orin port 7). The full descriptor read SUCCEEDED
+                                        // (VID/PID above prove bytes 8..11 arrived), but none of the
+                                        // handled-class arms nor the config-descriptor arm matched, so
+                                        // without this the FSM would linger in 'dev-desc' until its
+                                        // watchdog fired a spurious "watchdog-timeout code 0" and
+                                        // re-enumerated — the ×2-3 recovery storm seen every boot. The
+                                        // device enumerated cleanly; we simply have no driver, so
+                                        // release the port and advance instead of parking. (Downstream
+                                        // slots never drive the root port queue — see the HID path.)
+                                        serial_println!(
+                                            "xHCI: no driver for device class {:#x} (slot {}, {:04x}:{:04x}); releasing port.",
+                                            class_code, slot_id,
+                                            self.slots[slot_id as usize].vid,
+                                            self.slots[slot_id as usize].pid);
+                                        if !self.slots[slot_id as usize].is_downstream {
+                                            self.start_next_port();
+                                        }
                                     }
                                 }
                                 }
@@ -3733,9 +3867,11 @@ impl XhciController {
                                                 };
                                                 (x as i32, y as i32, m)
                                             };
-                                            // `slot` (the shared borrow) is no longer read past here;
-                                            // the &mut self accesses below are the count bump + re-arm.
-
+                                            // (hw-jetson's CLICK-1 down-edge push_event block was
+                                            // superseded at the 2026-08-18 sync by GUI-CLICK-2 below —
+                                            // same press edge, plus the release edge, through the
+                                            // DRAGGLIDE one-report-one-push seam. Two emitters would
+                                            // double-fire Button on every press.)
                                             // GUI-CLICK-2 / HID-KEYS: emit a Button on ANY mask
                                             // change — both the press edge (a bit going 0→1) and the
                                             // release edge (a bit going 1→0). The payload is always
@@ -4059,6 +4195,7 @@ impl XhciController {
             let dcbaap_reg = (self.op_base + 0x30) as *mut u64;
             write_reg64(dcbaap_reg, dcbaap_ptr as u64);
             serial_println!("xHCI: DCBAAP set to {:#x}", dcbaap_ptr as u64);
+            x200_witness(self.op_base, "DCBAAP", dcbaap_ptr as u64);
 
             // 1b. SCRATCHPAD BUFFERS (xHCI spec 4.20). If the controller advertises Max Scratchpad
             // Buffers > 0 in HCSPARAMS2, the OS MUST allocate that many page-sized buffers + a
@@ -4100,6 +4237,7 @@ impl XhciController {
                         arr as u64, page_bytes, heap_lo, heap_hi
                     );
                 } else {
+                    let mut filled = 0usize;
                     for i in 0..max_scratchpad {
                         let buf_layout =
                             core::alloc::Layout::from_size_align(page_bytes, page_bytes).unwrap();
@@ -4113,16 +4251,35 @@ impl XhciController {
                         // private working memory; clean the zeroed buffer to DRAM so a non-snooping
                         // controller does not fault on stale contents. No-op x86.
                         dma_coherency::clean(buf as usize, page_bytes);
+                        x200_witness(
+                            self.op_base,
+                            &alloc::format!("scratchpad[{}]", i),
+                            buf as u64,
+                        );
+                        filled += 1;
                     }
-                    *dcbaap_ptr.add(0) = arr as u64;
-                    // XHCI-COHERENCE: clean the scratchpad pointer array and the DCBAA[0] entry that
-                    // points at it — both are controller-read before/at RS=1. No-op x86.
-                    dma_coherency::clean(arr as usize, max_scratchpad * 8);
-                    dma_coherency::clean(dcbaap_ptr as usize, core::mem::size_of::<u64>());
-                    serial_println!(
-                        "xHCI: scratchpad: {} buffer(s) x {} bytes; DCBAA[0]={:#x} (heap PA in [{:#x},{:#x}))",
-                        max_scratchpad, page_bytes, arr as u64, heap_lo, heap_hi
-                    );
+                    if filled < max_scratchpad {
+                        // ORIN-X200-1: a partially-filled scratchpad array published to DCBAA[0]
+                        // leaves ZERO entries the controller treats as buffer physical addresses —
+                        // it then DMA-writes into bus page 0 (exactly the 0x…0200 FillWrite RAS
+                        // shape). Publishing nothing is the lesser failure: the controller may
+                        // raise HSE, but it cannot wild-write. Loud + unconditional by design.
+                        serial_println!(
+                            "xHCI: X200 FLAG !! scratchpad: only {}/{} buffers allocated — NOT publishing DCBAA[0] (zero entries would be fetched as buffer pointers)",
+                            filled, max_scratchpad
+                        );
+                    } else {
+                        *dcbaap_ptr.add(0) = arr as u64;
+                        // XHCI-COHERENCE: clean the scratchpad pointer array and the DCBAA[0] entry
+                        // that points at it — both are controller-read before/at RS=1. No-op x86.
+                        dma_coherency::clean(arr as usize, max_scratchpad * 8);
+                        dma_coherency::clean(dcbaap_ptr as usize, core::mem::size_of::<u64>());
+                        x200_witness(self.op_base, "DCBAA[0](scratchpad-array)", arr as u64);
+                        serial_println!(
+                            "xHCI: scratchpad: {} buffer(s) x {} bytes; DCBAA[0]={:#x} (heap PA in [{:#x},{:#x}))",
+                            max_scratchpad, page_bytes, arr as u64, heap_lo, heap_hi
+                        );
+                    }
                 }
             } else {
                 serial_println!("xHCI: scratchpad: controller requests 0 buffers (none needed).");
@@ -4135,11 +4292,15 @@ impl XhciController {
             let crcr_value = ring_phys_addr | 1;
             write_reg64(crcr_reg, crcr_value);
             serial_println!("xHCI: CRCR set to {:#x}", crcr_value);
+            x200_witness(self.op_base, "CRCR(command-ring)", ring_phys_addr);
         }
     }
 
     // Call this AFTER init_pointers but BEFORE run
-    pub fn init_interrupter(&mut self, event_ring_phys: u64, erst_table_phys: u64) {
+    /// Program interrupter 0. `event_ring_phys` is the HEAP PA of the event ring segment (the caller
+    /// holds the `EVENT_RING` lock and passes it). The ERST is allocated HERE, in the heap — see the
+    /// `EventRing` struct doc and §JETSON-XCARVE for why no xHC DMA structure may live in image `.bss`.
+    pub fn init_interrupter(&mut self, event_ring_phys: u64) {
         // PIUSB-10: xHCI 5.4.1/4.2 — the FIRST register programming after HCRST (this writes the
         // interrupter's ERST/ERSTBA/ERDP runtime regs; `init_pointers`/`start` write CRCR/DCBAAP/
         // CONFIG/USBCMD after us). Gate ALL of it on USBSTS.CNR==0 so no write is dropped by a
@@ -4153,6 +4314,10 @@ impl XhciController {
         unsafe {
             // SAVE THIS for later use in the interrupt/event loop (ERDP updates)
             EVENT_RING_PHYS_BASE = event_ring_phys;
+            // Publish the real base into the controller struct so the VUGRAS candidate-PA dump is
+            // TRUTHFUL. This field was previously never assigned (always read 0), which sent the
+            // boot-15 RAS investigation's lead #1 chasing a phantom "event_ring_base=0x0".
+            self.event_ring_phys_base = event_ring_phys;
 
             // XHCI-COHERENCE: zeroed-handoff for the event ring. `EventRing::new()` zeroed the ring
             // into (dirty) cache lines; clean+invalidate so those zeros reach DRAM before the
@@ -4173,22 +4338,25 @@ impl XhciController {
             let ir0_base = runtime_base + 0x20;
             serial_println!("xHCI: RuntimeBase={:#x}, IR0 Base={:#x}", runtime_base, ir0_base);
 
-            // 2. Setup the Segment Table (ERST)
-            // NOTE: Caller holds the EVENT_RING lock and passes us the phys addr.
-            // Do NOT lock EVENT_RING here or we deadlock.
-            ERST_TABLE.entries[0] = ErstEntry {
+            // 2. Heap-allocate + fill the Event Ring Segment Table (ERST) in the HEAP-GUARD-vetted,
+            //    firewall-clean DMA window (mirrors the DCBAA / scratchpad allocations above). Never
+            //    freed — the controller is 'static, same lifetime discipline as DCBAA. This replaces the
+            //    old `static mut ERST_TABLE` in kernel-image .bss (JETSON-XCARVE: see the EventRing doc).
+            //    64-byte alignment (xHCI 6.5) comes from ErstTable's `#[repr(align(64))]`.
+            let erst_layout = core::alloc::Layout::new::<ErstTable>();
+            let erst = alloc::alloc::alloc_zeroed(erst_layout) as *mut ErstTable;
+            (*erst).entries[0] = ErstEntry {
                 ring_address: event_ring_phys,
                 size: event::EVENT_RING_SIZE as u16, // Must match EVENT_RING_SIZE in event.rs
                 _rsvd: 0,
                 _rsvd2: 0,
             };
+            let erst_table_phys = erst as u64;
+            self.erst_table_phys = erst_table_phys;
             // XHCI-COHERENCE: producer boundary — the controller DMA-reads the ERST when the
-            // interrupter is armed / ERSTBA is written below; clean the table to DRAM. No-op x86.
-            dma_coherency::clean(
-                core::ptr::addr_of!(ERST_TABLE) as usize,
-                core::mem::size_of::<ErstTable>(),
-            );
-            EVENT_RING_PHYS_BASE = event_ring_phys;
+            // interrupter is armed / ERSTBA is written below; clean the (heap) table to DRAM.
+            // No-op x86.
+            dma_coherency::clean(erst as usize, core::mem::size_of::<ErstTable>());
 
             // 3. Write ERSTSZ (Segment Table Size) - Offset 0x08
             // Value = 1 (We have 1 segment)
@@ -4207,6 +4375,9 @@ impl XhciController {
             // complete pointer under the PIUSB-21 32-bit split — never a stale/mirrored high.
             write_erdp(erdp_ptr, event_ring_phys); // Pointer to the RING, not the table
             serial_println!("[xhciint] ERDP initialized to {:#018x} (hi-first, EHB clear)", event_ring_phys);
+            x200_witness(self.op_base, "ERSTBA", erst_table_phys);
+            x200_witness(self.op_base, "ERST[0].ring(event-ring)", event_ring_phys);
+            x200_witness(self.op_base, "ERDP", event_ring_phys);
 
             // 5b. IMOD (Interrupter Moderation, +0x04): 0 = no moderation, fire ASAP.
             // (QEMU ignores moderation timing, but set it explicitly for clarity / real HW.)
@@ -4314,7 +4485,9 @@ impl XhciController {
                     serial_println!(
                         "xHCI: [aarch64] RS=1 witness: IR0={:#x} IMAN={:#x}(IP={} IE={}) ERSTSZ={} ERSTBA={:#018x} ERDP={:#018x}(EHB={}) ERST[0].ring={:#018x}",
                         ir0, iman, iman & 1, (iman >> 1) & 1, erstsz, erstba, erdp, (erdp >> 3) & 1,
-                        core::ptr::read_unaligned(core::ptr::addr_of!(ERST_TABLE.entries[0].ring_address))
+                        // Heap ERST (JETSON-XCARVE): read ERST[0].ring through the pointer we
+                        // programmed, not a .bss static (which no longer exists).
+                        core::ptr::read_unaligned(core::ptr::addr_of!((*(self.erst_table_phys as *const ErstTable)).entries[0].ring_address))
                     );
                 }
             }
@@ -5755,6 +5928,7 @@ impl XhciController {
             // output context during ADDRESS_DEVICE; clean the 8-byte entry to DRAM. No-op x86.
             dma_coherency::clean(dcbaap_ptr.add(slot_id as usize) as usize, core::mem::size_of::<u64>());
             serial_println!("xHCI: DCBAAP[{}] linked to {:#x}", slot_id, output_ctx_phys);
+            x200_witness(self.op_base, &alloc::format!("DCBAA[{}](out-ctx,root)", slot_id), output_ctx_phys);
 
             // 2. FILL INPUT CONTEXT (MANUAL OFFSET CALCULATION)
             let base_ptr = input_ctx_virt as *mut u32;
@@ -5799,6 +5973,7 @@ impl XhciController {
             ep0_ctx_ptr.add(1).write_volatile((4 << 3) | (3 << 1) | (mps0 << 16)); // EP Type = 4, CErr = 3, MPS
             ep0_ctx_ptr.add(2).write_volatile((ep0_ring_phys as u32) | 1); // Bit 0 must match Cycle Bit (1)
             ep0_ctx_ptr.add(3).write_volatile((ep0_ring_phys >> 32) as u32);
+            x200_witness(self.op_base, &alloc::format!("slot{} ep0 TRdeq(root)", slot_id), ep0_ring_phys);
             ep0_ctx_ptr.add(4).write_volatile(8); // Average TRB Length = 8
 
             serial_println!("xHCI: Input Context Initialized (Manual Offsets). Phys={:#x}", input_ctx_phys);
@@ -5908,6 +6083,8 @@ impl XhciController {
             ep_out_ptr.add(3).write_volatile((bulk_out_phys >> 32) as u32);
             ep_out_ptr.add(4).write_volatile(out_mps as u32);
 
+            x200_witness(self.op_base, &alloc::format!("slot{} bulk-in TRdeq", slot_id), bulk_in_phys);
+            x200_witness(self.op_base, &alloc::format!("slot{} bulk-out TRdeq", slot_id), bulk_out_phys);
             serial_println!("xHCI: Input Context Configured for Bulk Transport.");
             input_ctx_virt as u64
         }
@@ -10139,13 +10316,14 @@ impl XhciController {
                 continue;
             }
             if kbd && self.set_hid_boot_protocol(slot, kbd_intf, "keyboard") {
-                // HID-KEYS: SET_IDLE(0) on the keyboard interface. Duration 0 = "report only on
-                // change" (USB HID 1.11 §7.2.4): a keyboard that powered up with a nonzero idle
-                // rate (periodic resends) stops re-sending an unchanged report, so a held key is
-                // one press + one release edge rather than a stream of duplicate reports. Bounded
-                // and tolerated — some keyboards NAK/STALL it; we witness either way and move on.
-                // Only issued after SET_PROTOCOL succeeded (a STALL there halts EP0, so a following
-                // request would just time out).
+                // HID-KEYS / USB-HID-MULTI: SET_IDLE(0) on the keyboard interface. Duration 0 =
+                // "report only on change" (USB HID 1.11 §7.2.4): a keyboard that powered up with a
+                // nonzero idle rate (periodic resends) stops re-sending an unchanged report, so a
+                // held key is one press + one release edge rather than a stream of duplicates. The
+                // Orin tablet-combo keyboard is the metal case that NEEDS this: its default idle
+                // never spontaneously reports a key edge on our poll cadence (shell saw "zero keys
+                // ever"). Bounded and tolerated — some keyboards NAK/STALL it; we witness either
+                // way and move on. Sent LAST on this EP0: a STALL here halts EP0 harmlessly.
                 self.set_hid_idle(slot, kbd_intf);
             }
         }
@@ -10213,6 +10391,33 @@ impl XhciController {
         }
     }
 
+    // (hw-jetson's 3-arg labeled set_hid_idle was superseded at the 2026-08-18 sync by the
+    // 2-arg HID-KEYS version above — same request bytes, same tolerance; the [hidkeys] witness
+    // replaced the labeled xHCI: SET_IDLE lines.)
+
+    /// USB-HID-MULTI: every HID keyboard whose interrupt-IN read is ARMED (keyboard_state == 3, set
+    /// once the device-level SET_CONFIGURATION completed and `queue_keyboard_read` pushed the first
+    /// Normal TRB), as (slot id, root port). More than one composite keyboard can be armed at once —
+    /// each slot's read is re-armed independently in `poll_events`, and every decoded key is pushed
+    /// to the shared `pal` queue, so the platform pump drains a MERGED stream. Ordered by slot id.
+    pub fn armed_keyboards(&self) -> Vec<(u8, u8)> {
+        let mut v = Vec::new();
+        for (i, s) in self.slots.iter().enumerate() {
+            if s.active && s.is_keyboard && s.keyboard_state == 3 {
+                v.push((i as u8, s.port_id));
+            }
+        }
+        v
+    }
+
+    /// USB-HID-MULTI: count of HID pointers whose interrupt-IN read is ARMED (mouse_state == 3).
+    pub fn armed_pointer_count(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|s| s.active && s.is_mouse && s.mouse_state == 3)
+            .count()
+    }
+
     fn bring_up_hub(&mut self, hub_slot: u8) {
         if hub_slot == 0 || self.slots[hub_slot as usize].ep0_ring.is_none() {
             return;
@@ -10223,9 +10428,9 @@ impl XhciController {
         // 1. SET_CONFIGURATION(1) so the hub's ports become controllable.
         //    bmRequestType 0x00 (H2D, standard, device), bRequest 9 (SET_CONFIGURATION).
         match self.sync_control(hub_slot, 0x00, 0x09, 1, 0, 0, 0, false) {
-            Ok(1) => {}
-            Ok(c) => serial_println!("xHCI: HUB set-config returned code {}", c),
-            Err(_) => { serial_println!("xHCI: HUB set-config timed out"); return; }
+            Ok(1) => serial_println!("xHCI: HUB slot {} SET_CONFIGURATION(1) -> code 1 (OK)", hub_slot),
+            Ok(c) => serial_println!("xHCI: HUB slot {} SET_CONFIGURATION(1) -> code {}", hub_slot, c),
+            Err(_) => { serial_println!("xHCI: HUB slot {} SET_CONFIGURATION(1) timed out", hub_slot); return; }
         }
 
         // 2. GET_DESCRIPTOR (HUB) -> downstream port count + characteristics.
@@ -10261,7 +10466,12 @@ impl XhciController {
         }
 
         let root_hub_port = self.slots[hub_slot as usize].port_id;
-        let ttt = ((characteristics >> 5) & 0x3) as u32; // TT Think Time (wHubCharacteristics bits 5-6)
+        // TT Think Time (USB2 Hub Descriptor wHubCharacteristics bits 5-6). A SuperSpeed hub has NO
+        // Transaction Translator, and its SS Hub Descriptor (0x2A) wHubCharacteristics does NOT define
+        // bits 5-6 as TTT (reserved / device-defined). Feeding those bits into the slot context's TTT
+        // field would submit a garbage TTT for the SS hub; force 0 for SS (spec-correct for a TT-less
+        // hub). USB2 hubs keep the real decoded value, so their path is byte-identical.
+        let ttt = if is_ss { 0 } else { ((characteristics >> 5) & 0x3) as u32 };
         // This hub's own Route String + tier depth (0 for a hub sitting on a root port). Children
         // extend it: a device on downstream port P gets `hub_route | (P << (4*hub_depth))` at depth
         // hub_depth+1 — 4 bits per tier, so nibble `hub_depth` carries P (see DeviceSlot.route_*).
@@ -10277,9 +10487,42 @@ impl XhciController {
             return;
         }
 
+        // 2b. SET_HUB_DEPTH (USB 3.x SuperSpeed hubs ONLY). ORIN-USB-FIX-5: a SuperSpeed hub must be
+        //     told its tier depth after SET_CONFIGURATION so it knows which nibble of the 20-bit Route
+        //     String selects its downstream port. Without it the hub cannot decode route strings and
+        //     refuses to forward ANY downstream transaction — the very first downstream packet
+        //     (SET_ADDRESS during the child's ADDRESS_DEVICE) dies as a Transaction Error (completion
+        //     code 4), exactly the Orin boot-4 symptom (stick on the 0bda:0489 SS hub, ADDRESS_DEVICE
+        //     code 4 ×3). USB2 hubs have no such request (it is a USB3-only class request) and route
+        //     via the parent-hub/port slot-context fields instead, so they keep their unchanged path.
+        //     bmRequestType 0x20 (H2D, class, device), bRequest 12 (SET_HUB_DEPTH), wValue = hub depth.
+        //     Hub depth = the Route-String nibble index this hub decodes = our route_depth (0 for a hub
+        //     directly on a root port; +1 per tier) — identical to Linux's `hdev->level - 1`.
+        if is_ss {
+            let depth = hub_depth as u16;
+            match self.sync_control(hub_slot, 0x20, 0x0C, depth, 0, 0, 0, false) {
+                Ok(1) => serial_println!("xHCI: HUB slot {} SET_HUB_DEPTH({}) -> code 1 (OK)", hub_slot, depth),
+                Ok(c) => serial_println!("xHCI: HUB slot {} SET_HUB_DEPTH({}) -> code {}", hub_slot, depth, c),
+                Err(_) => serial_println!("xHCI: HUB slot {} SET_HUB_DEPTH({}) timed out", hub_slot, depth),
+            }
+        }
+
         // 3. Mark the slot as a hub (Hub bit + Number of Ports + TTT) so the controller will route
-        //    transactions through it to downstream devices.
-        self.set_hub_slot_context(hub_slot, nbr_ports, ttt);
+        //    transactions through it to downstream devices. ORIN-USB-FIX-4: this MUST succeed before
+        //    any downstream port work. If the xHC rejects the hub's Configure-Endpoint (metal Orin:
+        //    the Tegra XUSB FW appears to refuse the SS hub's slot-context update), the hub is NOT
+        //    marked in the controller's view — every downstream ADDRESS_DEVICE then targets a device
+        //    the xHC cannot route to and fails with code 4 (USB Transaction Error), exactly the Orin
+        //    stick-behind-SS-hub strand. Previously this failure was printed and IGNORED, and the walk
+        //    barrelled on into the doomed enumeration. Now fail closed: log honestly (the summary +
+        //    slot-state dump live in set_hub_slot_context) and stop the bring-up here.
+        if !self.set_hub_slot_context(hub_slot, nbr_ports, ttt, is_ss) {
+            serial_println!(
+                "xHCI: HUB slot {} could not be configured as a hub; downstream bring-up ABORTED (fail-closed).",
+                hub_slot);
+            serial_println!("xHCI: === HUB slot {} bring-up complete (aborted) ===", hub_slot);
+            return;
+        }
 
         // 4. Power on every downstream port (SET_FEATURE PORT_POWER = feature 8), then settle.
         for port in 1..=nbr_ports {
@@ -10338,8 +10581,15 @@ impl XhciController {
     /// Mark a slot as a USB hub in its slot context (Hub bit, Number of Ports, TT Think Time) via
     /// a Configure-Endpoint command updating only the slot context. Required before the controller
     /// will route to the hub's downstream devices.
-    fn set_hub_slot_context(&mut self, hub_slot: u8, nbr_ports: u8, ttt: u32) {
-        unsafe {
+    ///
+    /// ORIN-USB-FIX-4: returns `true` only on a `code 1` completion. The caller (`bring_up_hub`) fails
+    /// closed on `false` — an un-marked hub cannot route downstream traffic, so continuing would strand
+    /// every device behind it on a code-4 ADDRESS_DEVICE. On success a one-line input-context summary is
+    /// printed (route / speed / ports / hub-bit / ttt) so a metal verdict reads in one line; on failure
+    /// the completion code, the input Add-Context flags, and the hub's live output Slot State are dumped
+    /// (a code-17 Context State Error means the xHC disagrees with our slot state — the dump names which).
+    fn set_hub_slot_context(&mut self, hub_slot: u8, nbr_ports: u8, ttt: u32, is_ss: bool) -> bool {
+        let (add_flags, hub_route, hub_speed) = unsafe {
             let input_ctx_virt = self.slots[hub_slot as usize].input_context;
             let output_ctx_virt = self.slots[hub_slot as usize].output_context;
             let base_ptr = input_ctx_virt as *mut u32;
@@ -10357,7 +10607,13 @@ impl XhciController {
             slot_ctx.add(0).write_volatile(slot_ctx.add(0).read_volatile() | (1 << 26));
             slot_ctx.add(1).write_volatile((slot_ctx.add(1).read_volatile() & 0x00FF_FFFF) | ((nbr_ports as u32) << 24));
             slot_ctx.add(2).write_volatile((slot_ctx.add(2).read_volatile() & !(0x3 << 16)) | (ttt << 16));
-        }
+            let dw0 = slot_ctx.add(0).read_volatile();
+            (base_ptr.add(1).read_volatile(), dw0 & 0xFFFFF, (dw0 >> 20) & 0xF)
+        };
+        // One-line input-context summary of what we are about to submit (metal verdict aid).
+        serial_println!(
+            "xHCI: HUB slot {} configure-input: route {:#x} speed {} ({}) ports {} hub-bit 1 ttt {} add-flags {:#x}",
+            hub_slot, hub_route, hub_speed, if is_ss { "SS" } else { "HS/FS" }, nbr_ports, ttt, add_flags);
         let trb = Trb {
             parameter: self.slots[hub_slot as usize].input_context as u64,
             status: 0,
@@ -10370,9 +10626,25 @@ impl XhciController {
                 self.slots[hub_slot as usize].is_hub = true;
                 self.slots[hub_slot as usize].hub_nbr_ports = nbr_ports;
                 serial_println!("xHCI: HUB slot {} marked as hub ({} ports)", hub_slot, nbr_ports);
+                true
             }
-            Ok((c, _)) => serial_println!("xHCI: HUB slot {} configure-endpoint code {}", hub_slot, c),
-            Err(_) => serial_println!("xHCI: HUB slot {} configure-endpoint timed out", hub_slot),
+            Ok((c, _)) => {
+                // Dump WHY: the input Add-Context flags we submitted and the hub's live output Slot
+                // State (output-context DW3 bits 31:27). Code 17 = Context State Error → the xHC's
+                // notion of the slot state disagrees with an A0-only Configure Endpoint from here.
+                let slot_state = unsafe {
+                    let oc = self.slots[hub_slot as usize].output_context as *const u32;
+                    if oc.is_null() { 0xFF } else { (core::ptr::read_volatile(oc.add(3)) >> 27) & 0x1F }
+                };
+                serial_println!(
+                    "xHCI: HUB slot {} configure-endpoint FAILED code {} (add-flags {:#x}, output Slot State {}); hub NOT marked.",
+                    hub_slot, c, add_flags, slot_state);
+                false
+            }
+            Err(_) => {
+                serial_println!("xHCI: HUB slot {} configure-endpoint timed out; hub NOT marked.", hub_slot);
+                false
+            }
         }
     }
 
@@ -10396,33 +10668,87 @@ impl XhciController {
         // it and enumerates cleanly, and QEMU's downstream devices are USB2 — this branch leaves the
         // HS/FS/LS path byte-identical.
         let (reset_sel, done_bit) = if is_ss { (28u16, 1u32 << 21) } else { (4u16, 1u32 << 20) };
-        let _ = self.sync_control(hub_slot, 0x23, 0x03, reset_sel, port as u16, 0, 0, false); // SET (BH_)PORT_RESET
 
+        // ORIN-USB-FIX-3: the warm (BH) reset re-trains the SS link, so the *reset* completing is not
+        // the same event as the *port* enabling. On the Realtek 0bda:0489 SS hub the warm reset latches
+        // C_BH_PORT_RESET (reset done) but leaves the link back in training — metal Orin read
+        // wPortStatus 0x1002b1: C_PORT_RESET set (change half), yet PED=0 and PLS (bits 8:5) = 5 =
+        // Rx.Detect (status half). A hot reset used to leave the port Enabled/U0 immediately (device
+        // present but unaddressable — the code-4 that FIX-2 addressed); the warm reset FIX-2 introduced
+        // instead needs a bounded, paced settle for the link to walk Rx.Detect → Polling → U0 before
+        // the port reads Enabled. FIX-2's walk gave up the instant the reset completed. So on SS: after
+        // the reset completes, poll wPortStatus for PED=1 AND PLS=U0(0) on a wall-clock deadline
+        // (~300 ms/attempt, the now_cycles/hw_wait_budget idiom the enum FSM already uses), and if the
+        // link does not land in budget, redo the warm reset once before honest failure. USB2 keeps the
+        // single hot reset with no training wait — byte-identical to FIX-2.
         let mut pstatus = 0u32;
-        for _ in 0..50 {
-            for _ in 0..20 { if !self.drain_event_ring_once() { crate::hlt(); } }
-            if self.sync_control(hub_slot, 0xA3, 0x00, 0, port as u16, 4, buf, true).is_err() {
-                return None;
+        let mut trained = false;
+        let max_attempts: u32 = if is_ss { 2 } else { 1 };
+        for attempt in 0..max_attempts {
+            let _ = self.sync_control(hub_slot, 0x23, 0x03, reset_sel, port as u16, 0, 0, false); // SET (BH_)PORT_RESET
+
+            for _ in 0..50 {
+                for _ in 0..20 { if !self.drain_event_ring_once() { crate::hlt(); } }
+                if self.sync_control(hub_slot, 0xA3, 0x00, 0, port as u16, 4, buf, true).is_err() {
+                    return None;
+                }
+                pstatus = unsafe {
+                    let p = buf as *const u8;
+                    (*p.add(0) as u32) | ((*p.add(1) as u32) << 8)
+                        | ((*p.add(2) as u32) << 16) | ((*p.add(3) as u32) << 24)
+                };
+                // Reset complete when the matching change bit latches: C_BH_PORT_RESET (bit 21) for a warm
+                // reset, C_PORT_RESET (bit 20) for a hot one. Some SS hubs assert C_PORT_RESET on a warm
+                // reset too, so accept either on the SS path rather than spin past a genuine completion.
+                if pstatus & done_bit != 0 || (is_ss && pstatus & (1 << 20) != 0) { break; }
             }
-            pstatus = unsafe {
-                let p = buf as *const u8;
-                (*p.add(0) as u32) | ((*p.add(1) as u32) << 8)
-                    | ((*p.add(2) as u32) << 16) | ((*p.add(3) as u32) << 24)
-            };
-            // Reset complete when the matching change bit latches: C_BH_PORT_RESET (bit 21) for a warm
-            // reset, C_PORT_RESET (bit 20) for a hot one. Some SS hubs assert C_PORT_RESET on a warm
-            // reset too, so accept either on the SS path rather than spin past a genuine completion.
-            if pstatus & done_bit != 0 || (is_ss && pstatus & (1 << 20) != 0) { break; }
-        }
-        // Deassert every reset-related change this reset latched so the hub's Status Change Endpoint
-        // can quiesce later: C_PORT_RESET always; on SS additionally C_BH_PORT_RESET (asserted by the
-        // warm reset) and C_PORT_LINK_STATE (the warm reset drives the link U0→Recovery→U0). Leaving
-        // C_PORT_LINK_STATE latched storms the SCE — the same class of defect the hot-plug ack path
-        // (service_one_hub_change) already guards, mirrored here for the one-shot boot walk.
-        let _ = self.sync_control(hub_slot, 0x23, 0x01, 20, port as u16, 0, 0, false); // CLEAR C_PORT_RESET
-        if is_ss {
+            // Deassert every reset-related change this reset latched so the hub's Status Change Endpoint
+            // can quiesce later: C_PORT_RESET always; on SS additionally C_BH_PORT_RESET (asserted by the
+            // warm reset) and C_PORT_LINK_STATE (the warm reset drives the link U0→Recovery→U0). Leaving
+            // C_PORT_LINK_STATE latched storms the SCE — the same class of defect the hot-plug ack path
+            // (service_one_hub_change) already guards, mirrored here for the one-shot boot walk.
+            let _ = self.sync_control(hub_slot, 0x23, 0x01, 20, port as u16, 0, 0, false); // CLEAR C_PORT_RESET
+            if !is_ss { break; } // USB2: reset complete, no SS link training — fall through unchanged.
             let _ = self.sync_control(hub_slot, 0x23, 0x01, 29, port as u16, 0, 0, false); // CLEAR C_BH_PORT_RESET
             let _ = self.sync_control(hub_slot, 0x23, 0x01, 25, port as u16, 0, 0, false); // CLEAR C_PORT_LINK_STATE
+
+            // SS link-training wait: poll wPortStatus until the link reaches U0 and the port enables,
+            // or the per-attempt wall-clock budget expires. PLS = wPortStatus bits 8:5.
+            let start = crate::arch::now_cycles();
+            let budget = crate::arch::hw_wait_budget() / 8; // ~300 ms at the fixed 2.5 s base budget.
+            let mut polls = 0u32;
+            let mut pls = (pstatus >> 5) & 0xF;
+            loop {
+                if pstatus & (1 << 1) != 0 && pls == 0 { trained = true; break; }
+                if crate::arch::now_cycles().wrapping_sub(start) >= budget { break; }
+                for _ in 0..20 { if !self.drain_event_ring_once() { crate::hlt(); } }
+                if self.sync_control(hub_slot, 0xA3, 0x00, 0, port as u16, 4, buf, true).is_err() {
+                    return None;
+                }
+                pstatus = unsafe {
+                    let p = buf as *const u8;
+                    (*p.add(0) as u32) | ((*p.add(1) as u32) << 8)
+                        | ((*p.add(2) as u32) << 16) | ((*p.add(3) as u32) << 24)
+                };
+                pls = (pstatus >> 5) & 0xF;
+                polls += 1;
+                // The link drives C_PORT_LINK_STATE (change bit 6) as it walks to U0; clear it each poll
+                // so the SCE does not storm after we hand the port on.
+                if pstatus & (1 << 6) != 0 {
+                    let _ = self.sync_control(hub_slot, 0x23, 0x01, 25, port as u16, 0, 0, false);
+                }
+            }
+            let elapsed = crate::arch::now_cycles().wrapping_sub(start);
+            if trained {
+                serial_println!(
+                    "xHCI: HUB port {} SS link trained (status {:#x} PLS={} U0, {} polls, {} cyc, attempt {})",
+                    port, pstatus, pls, polls, elapsed, attempt);
+                break;
+            }
+            serial_println!(
+                "xHCI: HUB port {} SS link not trained (status {:#x} PLS={} PED={}, {} polls, {} cyc, attempt {}); {}",
+                port, pstatus, pls, (pstatus >> 1) & 1, polls, elapsed, attempt,
+                if attempt + 1 < max_attempts { "retrying warm reset" } else { "giving up" });
         }
 
         if pstatus & (1 << 1) == 0 {
@@ -10538,6 +10864,7 @@ impl XhciController {
             ep.add(1).write_volatile((7 << 3) | (3 << 1) | ((mps as u32) << 16));
             ep.add(2).write_volatile((phys as u32) | 1);
             ep.add(3).write_volatile((phys >> 32) as u32);
+            x200_witness(self.op_base, &alloc::format!("slot{} hub-int TRdeq", hub_slot), phys);
             ep.add(4).write_volatile(mps as u32);
         }
         let trb = Trb {
@@ -10835,6 +11162,7 @@ impl XhciController {
             // XHCI-COHERENCE: producer boundary — clean the DCBAA entry the controller reads to
             // locate this slot's output context. No-op x86.
             dma_coherency::clean(self.dcbaap.add(slot_id as usize) as usize, core::mem::size_of::<u64>());
+            x200_witness(self.op_base, &alloc::format!("DCBAA[{}](out-ctx,downstream)", slot_id), output_ctx_virt as u64);
 
             let base_ptr = input_ctx_virt as *mut u32;
             core::ptr::write_bytes(base_ptr as *mut u8, 0, core::mem::size_of::<InputContext>());
@@ -10872,6 +11200,7 @@ impl XhciController {
             ep0_ctx.add(1).write_volatile((4 << 3) | (3 << 1) | (mps0 << 16));
             ep0_ctx.add(2).write_volatile((ep0_ring_phys as u32) | 1);
             ep0_ctx.add(3).write_volatile((ep0_ring_phys >> 32) as u32);
+            x200_witness(self.op_base, &alloc::format!("slot{} ep0 TRdeq(downstream)", slot_id), ep0_ring_phys);
             ep0_ctx.add(4).write_volatile(8);
         }
         // XENUM-3 M2: bounded, paced ADDRESS_DEVICE retry. The root-port path gives a stalled device
@@ -11608,6 +11937,7 @@ impl XhciController {
 
         let input_ctx_virt;
         let max_dci;
+        let op_base = self.op_base; // captured before the slot borrow (X200 witness below)
         unsafe {
             let slot = &mut self.slots[slot_id as usize];
             input_ctx_virt = slot.input_context;
@@ -11656,6 +11986,7 @@ impl XhciController {
                 ep.add(2).write_volatile((phys as u32) | 1);
                 ep.add(3).write_volatile((phys >> 32) as u32);
                 ep.add(4).write_volatile(mps);
+                x200_witness(op_base, &alloc::format!("slot{} kbd TRdeq", slot_id), phys);
                 add_flags |= 1 << dci;
                 mdci = mdci.max(dci);
                 slot.keyboard_state = 1;
@@ -11679,6 +12010,7 @@ impl XhciController {
                 ep.add(2).write_volatile((phys as u32) | 1);
                 ep.add(3).write_volatile((phys >> 32) as u32);
                 ep.add(4).write_volatile(mps);
+                x200_witness(op_base, &alloc::format!("slot{} mouse TRdeq", slot_id), phys);
                 add_flags |= 1 << dci;
                 mdci = mdci.max(dci);
                 slot.mouse_state = 1;

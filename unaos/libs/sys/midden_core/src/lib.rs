@@ -247,6 +247,10 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     ("connect", Avail::Always), ("udpsend", Avail::Always), ("get", Avail::Always),
     // apps + scheduler + power + witnesses
     ("vug", Avail::Aarch64), ("pulse", Avail::Aarch64), ("v3d", Avail::V3d),
+    // hw-jetson (2026-08-18 sync): the Orin bench verbs — SCHED-BAL burst + the per-core
+    // load animator. Registered here so MIDDEN-M1's single interpreter routes them as
+    // Plan::Host instead of refusing them before the kernel's service arms can fire.
+    ("burst", Avail::Aarch64), ("simmer", Avail::Aarch64),
     ("tste", Avail::Always), ("selftest", Avail::Always), ("sched", Avail::Always),
     ("ps", Avail::Always), ("top", Avail::Always), ("batmon", Avail::Always),
     ("bootlog", Avail::Always), ("shutdown", Avail::Always), ("off", Avail::Always),

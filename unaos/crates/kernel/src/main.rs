@@ -1847,11 +1847,11 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // 1. Install the kernel's own MMU FIRST — SILENT. Nothing has printed yet (fbcon::init is
     //    print-free when fb_addr == 0), and the serial path cannot touch UARTC until this maps the
     //    Tegra device window. The FIRST serial byte of the whole kernel is the `mmu live` line below.
-    let mmu = unaos_kernel::arch::mmu_tegra::init(boot_info);
+    let mmu = unaos_kernel::arch::mmu_tegra::init(boot_info); unaos_kernel::arch::serial::mark_mmio_ready(); // DARKWIN-GUARD arm — window mapped; see tegra_darkwin_witness (tail)
     serial_println!(
         ":: tegra: mmu live (EL{}) — RAM Normal-WB + Tegra Device-nGnRE mapped ::",
         mmu.el
-    );
+    ); tegra_darkwin_witness(boot_info); // DARKWIN-GUARD witness + eaten-EDID re-emit (tail fn)
     serial_println!(
         ":: tegra: mmu regs — SCTLR {:#x}->{:#x} TCR={:#x} MAIR={:#x} TTBR0={:#x} RAM-GiB-mask={:#x} ::",
         mmu.sctlr_old,
@@ -1861,6 +1861,51 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         mmu.ttbr0,
         mmu.ram_gib_mask,
     );
+    // XCARVE-3 (always-on correctness, one-shot witness): report the protected-carveout hole the MMU
+    // just EXCLUDED (unmapped) from the cacheable map. Boot-21 proved PA 0x26b900000 is firewalled
+    // carveout DRAM with no software writer — any cache traffic touching it raises the SNOC RAS — so the
+    // window is left with no valid translation. Source names whether the DTB declared the reservation
+    // (`DTB`) or we fell back to a bounded quirk (`QUIRK`). `hole_size == 0` ⇒ nothing excluded.
+    if mmu.hole_size != 0 {
+        // XCARVE-6: the excluded set is now the two QUIRK windows (0x26b9, 0xbe) plus every DTB
+        // `/reserved-memory` carveout inside a RAM GiB. List EVERY window (no-silent-drop, XCARVE-5 law).
+        serial_println!(
+            ":: tegra: XCARVE-6 carveout exclusion — {} protected window(s) UNMAPPED from the cacheable map (SNOC-firewalled DRAM, no software writer) ::",
+            mmu.hole_count,
+        );
+        for i in 0..mmu.hole_count {
+            let (hb, hs, hsrc) = mmu.holes[i];
+            if hs == 0 {
+                continue;
+            }
+            let src = match hsrc {
+                1 => "DTB /reserved-memory",
+                // XCARVE-8: a QUIRK extent is a bounded GUESS (no readable register/DTB truth for the
+                // undeclared windows) — say so in the banner so a refuting hit reads as "widen the guess".
+                2 => "QUIRK (DTB silent; extent = bounded GUESS)",
+                _ => "unknown",
+            };
+            serial_println!(
+                ":: tegra:   window[{}] [{:#x},{:#x}) {} KiB @ GiB {} (source: {}) ::",
+                i,
+                hb,
+                hb + hs,
+                hs >> 10,
+                hb >> 30,
+                src,
+            );
+        }
+        if mmu.hole_dropped != 0 {
+            serial_println!(
+                ":: tegra: XCARVE-6 WARNING — {} protected window(s) DROPPED (set/pool full); exclusion set INCOMPLETE — cacheable carveout may remain ::",
+                mmu.hole_dropped,
+            );
+        }
+    }
+    // XCARVE-2 temporal bracket (RAS store-site hunt, `UNAOS_VUGRAS=1`): first bracket, right after the
+    // MMU identity-maps RAM — the 0x26b900000 line is now cleanable. Heap/span-B are not carved yet, so
+    // the span-B bisect witnesses "empty" here; the tripwire still fires. No-op knob-off.
+    unaos_kernel::vugras::phase("post-mmu");
     // JB1f: install the full healed exceptions.rs vectors NOW — before fbcon starts mirroring —
     // retiring the unhealed early window the 2026-07-11 bench caught: the A78AE-1941500 phantom
     // struck fbcon's glyph loop (the boot's heaviest ifetch+store stretch) under mmu_tegra's
@@ -2082,6 +2127,9 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     let (dtb_addr, dtb_size) = (boot_info.dtb_addr, boot_info.dtb_size);
     unaos_kernel::arch::memory::init(boot_info);
     serial_println!(":: KERNEL HEAP ALLOCATED ::");
+    // XCARVE-2 temporal bracket: heap carved + span-B top published (`select_heap_region`). span-B now
+    // covers the 0x26b900000 target, so this is the first bracket whose bisect can fire on the target.
+    unaos_kernel::vugras::phase("post-heap-init");
 
     // ORIN-NET-1 (read-only PCIe/NIC census, `UNAOS_PCIEPROBE=1`): with the `pcieprobe` feature
     // armed, run the census HERE on the metal Orin — after JM4 (serial/heap live) and the mmu is up
@@ -2113,6 +2161,9 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         dtb_size,
         ram_gib_mask: mmu.ram_gib_mask,
     });
+    // XCARVE-2 temporal bracket: after the PCIe census/recon (NET-1/2/3). If the RAS fires between here
+    // and post-heap-init, the store is in the PCIe bring-up window.
+    unaos_kernel::vugras::phase("post-pcie");
 
     // ORIN-NET-4 (RTL8168/8111 GbE driver + smoltcp bind, `UNAOS_NET4=1`): with `net4` armed (implies
     // `pcie3`), run the driver bring-up HERE on the metal Orin — AFTER the NET-3 `census2` above has
@@ -2122,6 +2173,10 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // no Tegra234 RC). Compiled out knob-off => byte-identical to baseline. See arch_arm64.md §ORIN-NET-4.
     #[cfg(all(feature = "net4", feature = "tegra"))]
     unaos_kernel::arch::rtl8168_tegra::net4_bringup(dtb_addr, dtb_size, mmu.ram_gib_mask);
+    // XCARVE-2 temporal bracket: after the NET-4 driver bring-up window (rings/DMA/MAC reset). If the RAS
+    // fires between here and post-pcie, the store is in the NIC bring-up window. (Diagnostic line only —
+    // does NOT touch the RTL8168 descriptor/ring code, which the sibling NET-4q arc owns.)
+    unaos_kernel::vugras::phase("post-net");
 
     // ORIN-SDMMC-1 (`UNAOS_SDMMC=1`): the Tegra234 microSD-slot READ-ONLY recon on the metal Orin — the
     // installer line's first rung. Resolves the SDMMC controller from the live DTB, maps its window,
@@ -2250,9 +2305,17 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
             // with a `Screen`-backed `Console` and dispatches lines through the shared shell —
             // the first interactive UnaOS session on the Orin. Headless boots (no JD1 scanout)
             // delegate straight to `kbd_pump_body`, preserving the JB2b serial evidence lines.
+            // VUGRAS (RAS localizer, `UNAOS_VUGRAS=1`): dump the candidate-PA table now — heap +
+            // xHCI rings/contexts/buffers are live, and the enumerating port is flagged — so a decoded
+            // RAS fault ADDR can be matched from the capture alone. No-op with the knob off.
+            unaos_kernel::vugras::boot_witness();
             unaos_kernel::arch::sched::spawn("jd2-console", jd2_console_pump, 0, 0);
             serial_println!(":: tegra: JD2 — EL1 console pump task spawned (boot core) ::");
         }
+        // XCARVE-2 temporal bracket: after the JB2b xHCI attach + enumeration window (the event-ring/ERST
+        // move 425090fd lives here). If the RAS fires between here and post-net, the store is in the xHCI
+        // bring-up window. Placed outside the `attached` guard so the bracket lands on every tegra boot.
+        unaos_kernel::vugras::phase("post-xhci-attach");
     } else {
         serial_println!(":: tegra: JB2b — SKIPPED (XUSB not ungated/alive this boot) ::");
     }
@@ -2393,7 +2456,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     }
     unaos_kernel::arch::percpu::init(0);
     unaos_kernel::arch::exceptions::install();
-    tegra_rast_demo_maybe(); unaos_kernel::arch::sched::run_capstone_boot_core(0); // RAST-TEGRA demo (no-op unless UNAOS_RAST=1) on the same line as the terminus so the wire-in adds ZERO source lines before any panic Location — the tegra knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helper defined at file tail.
+    tegra_el0_start_maybe(); tegra_rast_demo_maybe(); unaos_kernel::arch::sched::run_capstone_boot_core(0); // RAST-TEGRA demo (no-op unless UNAOS_RAST=1) on the same line as the terminus so the wire-in adds ZERO source lines before any panic Location — the tegra knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helper defined at file tail.
 }
 
 /// Handle one keyboard byte against the console: printable ASCII extends the input line, backspace
@@ -2489,6 +2552,9 @@ fn jd2_console_pump(_arg: usize) {
     serial_println!(
         ":: tegra: JD2 — EL1 console pump live (boot log holds the panel; first key or ~8 s enters the shell) ::"
     );
+    // XCARVE-2 temporal bracket: shell entry (boot-14/boot-20's crash path — the console pump is live with
+    // no vug run). The last named bracket before the idle-sweep cadence takes over below.
+    unaos_kernel::vugras::phase("shell-entry");
 
     // Phase 1 (JD4 screen-on-boot polish): pump the controller with the JD1 boot log visible, but
     // only until the FIRST KEYSTROKE or a ~8 s wall-clock deadline — whichever comes first — so a
@@ -2510,6 +2576,19 @@ fn jd2_console_pump(_arg: usize) {
         }
         v
     };
+    // VUGRAS (RAS localizer): a ~250 ms writeback-sweep cadence for the shell-idle path (boot-14
+    // crashed here with no vug run). `sweep_ticks` = CNTFRQ/4; the counter drives the alternating
+    // A/B span sweep. No-op with the knob off. Shared by phase 1 and phase 2 below.
+    let sweep_ticks: u64 = {
+        let f: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, CNTFRQ_EL0", out(reg) f, options(nomem, nostack, preserves_flags));
+        }
+        (if f == 0 { 62_500_000 } else { f }) / 4
+    };
+    let mut last_sweep = cntpct();
+    let mut sweep_tick: u64 = 0;
+
     let phase1_start = cntpct();
     let first_key: Option<u8> = loop {
         if let Ok(mut x) = unaos_kernel::drivers::xhci::claim() {
@@ -2521,6 +2600,11 @@ fn jd2_console_pump(_arg: usize) {
                 if cntpct().wrapping_sub(phase1_start) >= deadline_ticks {
                     break None; // quiescent boot — take the panel and show the prompt
                 }
+                if cntpct().wrapping_sub(last_sweep) >= sweep_ticks {
+                    last_sweep = cntpct();
+                    unaos_kernel::vugras::idle_sweep(sweep_tick);
+                    sweep_tick += 1;
+                }
                 unaos_kernel::arch::sched::yield_now();
             }
         }
@@ -2530,6 +2614,8 @@ fn jd2_console_pump(_arg: usize) {
     // straggler line can't paint over the console frame (serial output is unaffected).
     unaos_kernel::video::fbcon::detach();
     let mut screen = unaos_kernel::video::Screen::new(front_fb);
+    // VUGRAS: the Screen back buffer PA is only known now — add it to the candidate table.
+    unaos_kernel::vugras::note_screen(&screen);
     let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen);
     let mut console = unaos_kernel::console::Console::new();
     // JD11: mirror every command-output line to serial so an attended Orin bench captures a durable,
@@ -2555,30 +2641,120 @@ fn jd2_console_pump(_arg: usize) {
         ),
     }
 
+    // JD20 (ORIN-POINTER): the composite pointer behind the HS hub already streams reports — the
+    // shared xHCI decoder pushes Mouse/MouseAbsolute/Button onto the PAL queue (built for the x86
+    // midden GUI; nothing consumed them on the Orin until now). This loop is the tegra-side pump:
+    // it drains those events alongside keys and composites the SHARED `pal::cursor` sprite onto the
+    // console's Screen back buffer via the R22 save-under machinery (stash the pixels under the
+    // sprite, restore before any repaint), so the arrow never corrupts console text and survives
+    // console redraws. The cursor self-gates on `visible()` (starts hidden, auto-hides ~1.5 s after
+    // the last report), so a keyboard-only boot is byte-identical — no knob needed.
+    use unaos_kernel::pal::cursor;
+    let mut announced = false;
     loop {
         if let Ok(mut x) = unaos_kernel::drivers::xhci::claim() {
             x.poll_events();
         }
-        let mut keyed = false;
+        let cursor_was_visible = cursor::visible();
+        let mut needs_render = false;
+        // A key repaints the console into the back buffer; when that happens the cursor was erased
+        // first (restore, below) and must be re-composited on top after the drain.
+        let mut key_repainted = false;
+        // ORIN-POINTER-FIX (regression: keyboard went dead at the panel whenever a pointer was
+        // present). An absolute tablet reports at every poll interval, so it streams MouseAbsolute
+        // into the shared 64-deep event queue continuously — not only on motion. The first cut did
+        // a full save-under `restore`+`draw_over`+`pal.render()` PER pointer event; under that flood
+        // each frame turned into dozens of back-buffer read-backs + a DC-CVAC scanout flush, so the
+        // pump drained the queue slower than the tablet filled it. `EventQueue::push` DROPS silently
+        // when full (pal.rs), so the interleaved `Event::Key` pushes were the casualty — keys never
+        // reached the drain. Pre-JD20 the pump popped-and-ignored the same flood for free and keys
+        // got through. Fix: COALESCE all pointer motion in the frame to a single cursor update
+        // (relative deltas accumulate; absolute takes the last position), so per-frame cursor work
+        // is O(1) regardless of report rate and the drain always keeps pace with the keyboard. Keys
+        // are handled inline and unconditionally, so they flow with zero pointer devices too.
+        let mut pending_rel: Option<(i32, i32)> = None;
+        let mut pending_abs: Option<(i32, i32)> = None;
         while let Some(ev) = unaos_kernel::pal::next_event() {
-            if let Event::Key(c) = ev {
-                // Serial echo: the bench evidence line (panel + serial must agree).
-                if (32..=126).contains(&c) {
-                    serial_println!(":: tegra: JD2 — KEY '{}' ::", c as char);
-                } else {
-                    serial_println!(":: tegra: JD2 — KEY {:#04x} ::", c);
+            match ev {
+                Event::Key(c) => {
+                    // Erase the cursor BEFORE the console repaints, so the save-under stash never
+                    // captures cursor pixels and a later restore can't paint stale glyphs back.
+                    cursor::restore(&mut pal);
+                    // Serial echo: the bench evidence line (panel + serial must agree).
+                    if (32..=126).contains(&c) {
+                        serial_println!(":: tegra: JD2 — KEY '{}' ::", c as char);
+                    } else {
+                        serial_println!(":: tegra: JD2 — KEY {:#04x} ::", c);
+                    }
+                    needs_render = true;
+                    key_repainted = true;
+                    if handle_key(c, &mut console, &mut pal) {
+                        // A command took the whole screen (e.g. `gneiss`): stop draining this frame
+                        // so a queued keystroke can't paint the console back over it (the shared
+                        // drain-loop rule from the x86 GUI path).
+                        break;
+                    }
                 }
-                keyed = true;
-                if handle_key(c, &mut console, &mut pal) {
-                    // A command took the whole screen (e.g. `gneiss`): stop draining this frame
-                    // so a queued keystroke can't paint the console back over it (the shared
-                    // drain-loop rule from the x86 GUI path).
-                    break;
+                Event::Mouse { x, y } => {
+                    // Coalesce: accumulate the relative delta; the cursor moves once, after drain.
+                    let (ax, ay) = pending_rel.unwrap_or((0, 0));
+                    pending_rel = Some((ax + x, ay + y));
+                    if !announced {
+                        serial_println!(
+                            ":: tegra: JD20 — pointer live (relative mouse, cursor on scanout) ::"
+                        );
+                        announced = true;
+                    }
                 }
+                Event::MouseAbsolute { x, y } => {
+                    // Coalesce: last absolute position in the frame wins (raw HID 0..=32767).
+                    pending_abs = Some((x, y));
+                    if !announced {
+                        serial_println!(
+                            ":: tegra: JD20 — pointer live (absolute tablet, cursor on scanout) ::"
+                        );
+                        announced = true;
+                    }
+                }
+                Event::Button(mask) => {
+                    // Log clicks as a JD2 line for now (no UI action wired yet).
+                    serial_println!(":: tegra: JD20 — pointer BUTTON {:#04x} (down) ::", mask);
+                }
+                _ => {}
             }
         }
-        if keyed {
+        // One cursor composite for the whole frame's pointer activity — bounded work no matter how
+        // many reports arrived. Any key handled above already erased the cursor and repainted the
+        // console; drawing over the fresh back buffer here re-composites the arrow on top.
+        if pending_rel.is_some() || pending_abs.is_some() {
+            cursor::restore(&mut pal);
+            if let Some((dx, dy)) = pending_rel {
+                cursor::move_rel(dx, dy, pal.width() as i32, pal.height() as i32);
+            }
+            if let Some((ax, ay)) = pending_abs {
+                // Absolute tablet coords are raw HID 0..=32767; `set_abs` scales to the panel.
+                cursor::set_abs(ax, ay, pal.width() as i32, pal.height() as i32);
+            }
+            cursor::draw_over(&mut pal);
+            needs_render = true;
+        } else if key_repainted && cursor::visible() {
+            // A key repaint erased the cursor and redrew the console; put the arrow back on top.
+            cursor::draw_over(&mut pal);
+        }
+        // Auto-hide swept the cursor off this frame: erase it once so no arrow is left parked.
+        if cursor_was_visible && !cursor::visible() {
+            cursor::restore(&mut pal);
+            needs_render = true;
+        }
+        if needs_render {
             pal.render();
+        }
+        // VUGRAS: the shell-idle writeback sweep on the ~250 ms cadence (boot-14's crash path — the
+        // console pump was live at shell entry with no vug run). No-op with the knob off.
+        if cntpct().wrapping_sub(last_sweep) >= sweep_ticks {
+            last_sweep = cntpct();
+            unaos_kernel::vugras::idle_sweep(sweep_tick);
+            sweep_tick += 1;
         }
         unaos_kernel::arch::sched::yield_now();
     }
@@ -4943,3 +5119,83 @@ fn tegra_rast_demo_maybe() {
 #[cfg(all(feature = "tegra", not(feature = "rast"), target_arch = "aarch64"))]
 #[inline(always)]
 fn tegra_rast_demo_maybe() {}
+
+// ── JETSON-EL0 (M1b): the Orin's first EL0 round trip ───────────────────────────────────────────────
+//
+// Bring the user address space up, load the `USER_BLOB` hello program into it, seal the code page W^X,
+// and enqueue one EL0 task plus its verdict — the `run_capstone_boot_core` terminus dispatches both
+// (a spawn only pushes to the run queue).
+//
+// WHY IT LIVES AT THE FILE TAIL, CALLED ON THE TERMINUS LINE. Exactly the RAST-TEGRA convention above,
+// for exactly the RAST-TEGRA reason (PI-V3D-1, bisect-proven): `panic!`/`assert!`/bounds-check sites
+// bake a `core::panic::Location` — file AND LINE — into rodata, so inserting even a comment line ahead
+// of them shifts every later Location and the knob-off image stops being byte-identical. A tail
+// definition plus a same-line call adds ZERO source lines before any Location, which is what keeps the
+// disarmed jetson media bit-for-bit equal to baseline. (Found the hard way: the first cut of this arc
+// put a 35-line block inline here and moved the media hash with the knob OFF.)
+//
+// WHY IT SITS AFTER `timer::set_not_live()` — a deviation from the M1b brief, recorded because it is
+// load-bearing. The brief put the spawn BEFORE that disarm. It cannot go there: the user window hangs
+// off `L1_EL1`, and `L1_EL1` is not the live root until `boot_tegra::drop_to_el1` installs it in
+// TTBR0_EL1, so a pre-drop `syscall::setup()` would copy the blob through a user VA that translates to
+// NOTHING under the EL2 `L1` and fault into the Part-C vector. `set_not_live()` is on the very next
+// line after that drop, so "after the drop" is necessarily "after the disarm". Nothing is lost: the
+// disarm retires the timer INTERRUPT (CNTP_CTL=0 at the drop), while the verdict's bound is CNTPCT,
+// which free-runs. The site is also after `exceptions::install()` on purpose — that is what puts the
+// real `VBAR_EL1` in place for the `SVC` the EL0 task takes; `mmu_tegra::arm_el1_fault_vector()` is a
+// syndrome-printing landing vector, not a syscall handler.
+#[cfg(all(feature = "tegra_el0", target_arch = "aarch64"))]
+fn tegra_el0_start_maybe() {
+    if !unaos_kernel::arch::mmu_tegra_el0::install() {
+        // `install` already printed WHY it refused; this is the machine-checkable FAIL line, so a
+        // capture never has to infer the outcome from the absence of a PASS.
+        serial_println!(":: TEGRA-EL0: el0-hello round-trip -> FAIL — user window not installed ::");
+        return;
+    }
+    let demo = unaos_kernel::arch::syscall::setup();
+    unaos_kernel::arch::syscall::protect();
+    // Pinned to the boot core (cpu 0, not CPU_AUTO): `pick_cpu_slot` short-circuits a non-AUTO request,
+    // so the EL0 task cannot be placed on a secondary. That pin is load-bearing — the boot core is the
+    // one this function has just proven is at EL1 with the real `VBAR_EL1` installed.
+    unaos_kernel::arch::sched::spawn_user("el0-hello", demo.hello, demo.sp, 0);
+    unaos_kernel::arch::sched::spawn(
+        "tegra-el0-verdict",
+        unaos_kernel::arch::syscall::tegra_el0_verdict,
+        0,
+        0,
+    );
+    serial_println!(
+        ":: TEGRA-EL0: el0-hello spawned at EL0 (boot core), verdict armed — entry {:#x} sp {:#x} ::",
+        demo.hello,
+        demo.sp
+    );
+}
+
+// Knob-off tegra build: the wire-in compiles to nothing. `#[inline(always)]` on an empty body means the
+// call on the terminus line emits zero instructions, so the tegra image stays byte-identical.
+#[cfg(all(feature = "tegra", not(feature = "tegra_el0"), target_arch = "aarch64"))]
+#[inline(always)]
+fn tegra_el0_start_maybe() {}
+
+/// DARKWIN-GUARD witness (orin 1, 2026-08-18) — tail-defined per the Location-shift convention
+/// (`main.rs` "35-line block" lesson: inserting lines ahead of panic/assert sites shifts their
+/// baked `core::panic::Location` and moves the knob-off media hash; tail definitions + same-line
+/// calls shift nothing). Called from `tegra_early_stop` right after the `mmu live` line.
+///
+/// Nonzero N means some caller printed before `mmu_tegra::init` — the exact class (EDID-CARRY's
+/// step-0a2 witness line) that stopped the merged base at the NVIDIA logo on every boot of
+/// 2026-08-18. The dropped bytes' content is gone by design (the count is the wire-side fact;
+/// fbcon/selftest mirrors still carried the text); re-emit the one witness we know the window
+/// ate, so the EDID reading still reaches the wire on tegra.
+#[cfg(all(feature = "tegra", target_arch = "aarch64"))]
+fn tegra_darkwin_witness(boot_info: &BootInfo) {
+    serial_println!(
+        ":: tegra: dark-window guard — {} byte(s) dropped pre-map ::",
+        unaos_kernel::arch::serial::dropped_pre_map()
+    );
+    unaos_kernel::video::init_edid(
+        &boot_info.edid_block,
+        boot_info.edid_block_valid,
+        boot_info.edid_total_len,
+    );
+}

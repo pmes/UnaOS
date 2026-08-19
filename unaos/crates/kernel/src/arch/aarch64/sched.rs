@@ -210,9 +210,9 @@ pub struct Task {
     /// at `user_entry` with SP_EL0 = `user_sp`. 0 / unused for ordinary kernel tasks. Read only by
     /// `user_task_trampoline` (baremetal-only); on the `virt` build every task is a kernel thread, so
     /// these stay 0 and unread (`spawn_inner` still initialises them for the shared struct layout).
-    #[cfg_attr(not(feature = "baremetal"), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "baremetal", feature = "tegra_el0")), allow(dead_code))]
     user_entry: u64,
-    #[cfg_attr(not(feature = "baremetal"), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "baremetal", feature = "tegra_el0")), allow(dead_code))]
     user_sp: u64,
     /// M6d: the TTBR0_EL1 value (`root_pa | asid << 48`) that installs this task's address space, or 0
     /// for a kernel task (no switch — kernel mappings are Global and byte-identical in every root, so a
@@ -1252,7 +1252,7 @@ extern "C" fn task_trampoline() -> ! {
 /// Placeholder `entry` for user tasks: `spawn_user` sets `Task.entry` to this, but `user_task_trampoline`
 /// never calls it (it `eret`s to EL0 instead). Panics loudly if a path ever reaches it. EL0/user machinery
 /// is baremetal-only (the `virt` JC3 path runs kernel-thread CAPSTONE, no EL0 — see the module gate).
-#[cfg(feature = "baremetal")]
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 fn user_never(_: usize) {
     unreachable!("user task's kernel `entry` was called");
 }
@@ -1270,7 +1270,7 @@ fn user_never(_: usize) {
 /// have headroom for the SVC/IRQ frame (256 GPR + 528 FP + 32 banked + the Rust handler) — it does;
 /// this trampoline uses only a shallow prologue. The msr+eret are one `noreturn` asm block so nothing
 /// runs after the drop. Baremetal-only (EL0/user machinery — the `virt` path has no EL0 this arc).
-#[cfg(feature = "baremetal")]
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 extern "C" fn user_task_trampoline() -> ! {
     let cpu = percpu::this_cpu().cpu_index as usize;
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
@@ -2821,16 +2821,16 @@ pub fn spawn_auto(name: &'static str, entry: fn(usize), arg: usize) -> u64 {
 ///
 /// EL0/user spawn machinery (this and `spawn_user_slot`/`spawn_user_inner`) is baremetal-only: it reaches
 /// into `super::boot` (the Pi-gated user MMU), and the `virt` JC3 path runs kernel-thread CAPSTONE only.
-#[cfg(feature = "baremetal")]
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 pub fn spawn_user(name: &'static str, user_entry: u64, user_sp: u64, cpu: usize) -> u64 {
-    spawn_user_inner(name, user_entry, user_sp, super::boot::boot_ttbr0(), cpu)
+    spawn_user_inner(name, user_entry, user_sp, super::uslots::boot_ttbr0(), cpu)
 }
 
 /// Like `spawn_user`, but the task runs in its OWN per-task address space (M6d): `user_ttbr0` is the
 /// slot root `slot_l1_pa | (asid << 48)` from `boot::slot_ttbr0`. `dispatch_next` installs it on
 /// dispatch; `exit` tears the slot down. This is what lets an EL0 program write its own (slot-private)
 /// stack without disturbing any other task.
-#[cfg(feature = "baremetal")]
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 pub fn spawn_user_slot(
     name: &'static str,
     user_entry: u64,
@@ -2841,7 +2841,7 @@ pub fn spawn_user_slot(
     spawn_user_inner(name, user_entry, user_sp, user_ttbr0, cpu)
 }
 
-#[cfg(feature = "baremetal")]
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 fn spawn_user_inner(
     name: &'static str,
     user_entry: u64,
@@ -2923,7 +2923,7 @@ fn spawn_user_inner(
 /// cores run under the same root/ASID; nG user leaves are ASID-tagged and TLB maintenance is Inner-Shareable
 /// broadcast; and `teardown_user_slot` now repoints EACH exiting thread's core off the slot root, so the
 /// final ASID flush races no live root on any other core. Baremetal-only (reaches the Pi-gated user MMU).
-#[cfg(feature = "baremetal")]
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 pub fn spawn_user_thread(
     name: &'static str,
     user_entry: u64,
@@ -3479,7 +3479,7 @@ static ASID_THREADS: [AtomicU32; KILL_ASID_SLOTS] =
 /// Count a freshly spawned EL0 task against its slot. Called from both user-task spawn paths BEFORE the
 /// run-queue push, so the task is countable before it can ever be dispatched. Kernel tasks (ASID 0) and
 /// out-of-range ASIDs are ignored, which makes this inert on `virt` (every task there is a kernel thread).
-#[cfg_attr(not(feature = "baremetal"), allow(dead_code))] // both user-spawn paths are baremetal-only
+#[cfg_attr(not(any(feature = "baremetal", feature = "tegra_el0")), allow(dead_code))] // both user-spawn paths are baremetal-only
 fn asid_thread_enter(user_ttbr0: u64) {
     let asid = (user_ttbr0 >> 48) as usize;
     if asid != 0 && asid < KILL_ASID_SLOTS {
@@ -3553,7 +3553,7 @@ fn kill_settle(idx: usize, tid: u64, remaining: u32) {
     if remaining > 0 {
         return; // siblings still live under this ASID — the request stays armed for them
     }
-    #[cfg(feature = "baremetal")]
+    #[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
     super::syscall::note_killed_task_retired(tid);
     #[cfg(not(feature = "baremetal"))]
     let _ = tid;
@@ -3802,11 +3802,11 @@ fn retire_killed(idx: usize, task: Box<Task>) {
     // M6d: the same slot retirement `exit()` performs, executed on the scheduler stack. Legal here for
     // the same reason it is legal there — the kernel half of every root is Global and identical, so
     // repointing TTBR0 to the boot root pulls nothing out from under the running (scheduler) context.
-    #[cfg(feature = "baremetal")]
+    #[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
     {
         let asid = task.user_ttbr0 >> 48;
         if asid != 0 {
-            unsafe { super::boot::teardown_user_slot(asid) };
+            unsafe { super::uslots::teardown_user_slot(asid) };
         }
     }
     // Release any joiner: a killed task must not leave a `JoinHandle` blocked forever. Same single-post
@@ -3837,11 +3837,11 @@ pub fn exit() -> ! {
         // root does not pull the stack out from under us. Shared-window (ASID 0) and kernel (ttbr0 = 0)
         // tasks skip it. On `virt` (JC3) every task is a kernel thread (user_ttbr0 == 0), so there is no
         // slot to retire and the whole block is compiled out (it reaches into the Pi-gated `super::boot`).
-        #[cfg(feature = "baremetal")]
+        #[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
         {
             let asid = (*raw).user_ttbr0 >> 48;
             if asid != 0 {
-                super::boot::teardown_user_slot(asid);
+                super::uslots::teardown_user_slot(asid);
             }
         }
         // Signal completion to any joiner — the SINGLE post point for `done_sem`, covering BOTH a kernel
@@ -4426,13 +4426,13 @@ fn drain_due_sleepers(cpu: usize) {
 /// tightest liveness bound it has to satisfy (UVUG-8r2's 2 s takeover heartbeat) and far below what a load
 /// meter can resolve, which is the whole point: the vug keeps its old "I am still polling" contract with
 /// the watchdogs while costing effectively nothing.
-#[cfg(feature = "baremetal")]
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 const INPUT_WAIT_BACKSTOP_TICKS: u64 = 64;
 
 /// VUGPAUSE-2: the tick at which the next backstop pass is due. Global rather than per-CPU, and claimed by
 /// CAS, so the cadence is ONE pass per period across the whole machine and not one per core — six cores
 /// each waking every parked vug would be six times the work for exactly the same effect.
-#[cfg(feature = "baremetal")]
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 static INPUT_WAIT_BACKSTOP_DUE: AtomicU64 = AtomicU64::new(0);
 
 /// VUGPAUSE-2: run the input-wait backstop if its period has elapsed. Called from the scheduler loop top,
@@ -4449,15 +4449,15 @@ static INPUT_WAIT_BACKSTOP_DUE: AtomicU64 = AtomicU64::new(0);
 /// input ring, nothing can park on one, and the backstop has nothing to do.
 #[inline]
 fn input_wait_backstop() {
-    #[cfg(not(feature = "baremetal"))]
+    #[cfg(not(any(feature = "baremetal", feature = "tegra_el0")))]
     return;
-    #[cfg(feature = "baremetal")]
+    #[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
     {
         input_wait_backstop_inner();
     }
 }
 
-#[cfg(feature = "baremetal")]
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 #[inline]
 fn input_wait_backstop_inner() {
     let now = super::timer::ticks();
@@ -4518,6 +4518,12 @@ pub fn run_until_empty(cpu: usize) {
 /// with one task is not "loaded"), which prevents two idle cores from ping-ponging a lone task.
 const STEAL_MIN_DEPTH: usize = 2;
 
+/// SCHED-BAL — per-core tally of tasks this core has STOLEN from busier cores (bumped by `try_steal`
+/// on every successful move). Pure introspection: nothing on any scheduling path reads it; it exists
+/// so `sched_bal_witness` can report "the balancer provably moved runnable work across cores" as a
+/// number rather than an assertion. Relaxed throughout — a witness line never needs ordering.
+static STEALS: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
+
 /// SMP-BAL — rate limit for the `[smpbal] steal` witness: emit the first `STEAL_LOG_MAX` steals then go
 /// quiet, so a steady rebalancing workload cannot flood the serial log. Introspection only.
 #[cfg(feature = "pi")]
@@ -4565,6 +4571,7 @@ fn try_steal(cpu: usize) -> bool {
     let name = task.name;
     task.cpu = cpu as u32;
     rq(cpu).push(task);
+    STEALS[cpu].fetch_add(1, Ordering::Relaxed); // SCHED-BAL witness tally (introspection only)
     // Rate-limited steal witness (pi-gated: fires on the target + kernel8-test, byte-identical elsewhere).
     #[cfg(feature = "pi")]
     if STEAL_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < STEAL_LOG_MAX {
@@ -4574,6 +4581,387 @@ fn try_steal(cpu: usize) -> bool {
     let _ = name;
     unmask_irq();
     true
+}
+
+// ---------------------------------------------------------------------------------------------
+// SCHED-BAL — the balancing witness, and the ORIN-BURST fixture that exercises it
+// ---------------------------------------------------------------------------------------------
+//
+// The mechanism underneath is the trunk's: `pick_cpu` places at spawn, `try_steal` corrects at
+// runtime, `ONLINE_MASK`/`mark_online` is the participation set, and a task is steal-eligible iff it
+// was spawned with `CPU_AUTO` (`Task::steal_ok`). Nothing here adds scheduling policy — it stages
+// work, waits for it, and reports what the balancer did.
+
+/// SCHED-BAL — tasks core `cpu` has stolen from busier cores while idle (the load-balancing witness).
+pub fn steal_count(cpu: usize) -> u64 {
+    if cpu >= NUM_CPUS { 0 } else { STEALS[cpu].load(Ordering::Relaxed) }
+}
+
+/// SCHED-BAL — emit the one-line balancing witness: per-core steal counts and how many cores are online
+/// scheduler participants. On metal (Pi/Orin) with migratable work staged, a non-zero steal count on the
+/// formerly-parked cores is the proof runnable work spread; in QEMU raspi4b (no preemptive multi-core)
+/// the counts read 0 and the line is a structural marker. `total` is the sum; `busy_cores` counts cores
+/// that either dispatched (busy) or stole, so a verdict is one `awk` line.
+pub fn sched_bal_witness() {
+    let mut total = 0u64;
+    let n = meter_cpu_count().min(NUM_CPUS);
+    for c in 0..n {
+        total += STEALS[c].load(Ordering::Relaxed);
+    }
+    let busy_cores = (0..n)
+        .filter(|&c| CPU_BUSY[c].load(Ordering::Relaxed) > 0 || STEALS[c].load(Ordering::Relaxed) > 0)
+        .count();
+    serial_println!(
+        ":: AARCH64 SCHED-BAL: work-stealing witness — {} steals total across {} online cores, {} core(s) ran work ::",
+        total,
+        (0..n).filter(|&c| ONLINE_MASK[c].load(Ordering::Relaxed)).count(),
+        busy_cores
+    );
+    for c in 0..n {
+        let (busy, _idle) = meter_cpu_ticks(c);
+        serial_println!(
+            ":: AARCH64 SCHED-BAL: c{} busy={} steals={} ::",
+            c,
+            busy,
+            STEALS[c].load(Ordering::Relaxed)
+        );
+    }
+}
+
+/// ORIN-BURST — how many migratable CPU-bound tasks the tegra burst stages to light every core. Eight
+/// exceeds the Orin's six cores so every core has work even before stealing kicks in.
+const BURST_TASKS: usize = 8;
+/// ORIN-BURST — countdown of burst tasks still running; `run_burst` waits (bounded) for it to reach 0
+/// before emitting the witness. `AtomicU64` (not `Usize`) to reuse this module's existing atomic imports.
+static BURST_REMAINING: AtomicU64 = AtomicU64::new(0);
+
+/// ORIN-BURST — a bounded CPU-bound MIGRATABLE task: burn several quanta of work (so it stays runnable
+/// long enough to be PLACED on / STOLEN by an idle core and to actually load that core), then retire by
+/// decrementing the shared countdown. Runs at `PRIO_LOW`, strictly below the console/render, so it can
+/// never starve the shell. Same shape as the x86 `demo_bal_hot`.
+fn burst_hot(_i: usize) {
+    let mut acc: u64 = 0;
+    for r in 0..3u64 {
+        for k in 0..25_000_000u64 {
+            acc = acc.wrapping_add(k ^ r);
+        }
+        core::hint::black_box(acc);
+    }
+    BURST_REMAINING.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// ORIN-BURST — stage a multi-hot-thread burst so the balancer lights every online Orin core, then report.
+///
+/// Spawns `BURST_TASKS` `PRIO_LOW` busy tasks with `CPU_AUTO`, which is exactly what makes them
+/// MIGRATABLE under the trunk scheduler: `spawn_inner` sets `steal_ok` iff the requested core is
+/// `CPU_AUTO`, and `pick_cpu` then places each on the least-loaded ONLINE core (and pokes it with an
+/// `IPI_RESCHED`) — so the burst fans out across all six Orin cores instead of serialising on one, and
+/// any residual backlog is stolen by an idle secondary. `PRIO_LOW` keeps them strictly below the
+/// console/render (`PRIO_NORMAL`), so the shell stays responsive while the cores light.
+///
+/// MUST be called from a TASK body — it `yield_now`s to wait, which is a no-op outside a scheduled task.
+/// The tegra shell `burst` verb runs inside the `jd2_console_pump` task; the `sched_demo` boot trigger
+/// spawns `burst_driver`. Bounded + non-fatal: it waits (cooperatively yielding, so the driver core keeps
+/// dispatching its local share and — on the cooperative boot-core path — the CAPSTONE/console tasks keep
+/// moving) for the burst to drain or a generous spin ceiling, then emits `sched_bal_witness`. A run whose
+/// work fit the available slices without a steal still prints the per-core busy counts — the witness is
+/// descriptive, never a hang.
+pub fn run_burst(driver_cpu: usize) {
+    // SCHED-BURST-FIX defect 1 (online off-by-one) — STILL TRUE under the trunk mechanism, with a new
+    // name for the flag: the tegra boot core drives this burst COOPERATIVELY (it runs
+    // `run_capstone_boot_core`, never `run_bsp`/`run`, and `start_aps` marks only the APs), so it was
+    // absent from `ONLINE_MASK` and the witness under-counted by one (reported 5 of the 6 Orin cores).
+    // `mark_online` makes the driver a placement/steal participant here: it genuinely dispatches a run
+    // queue (cooperatively, via the `yield_now` + steal-drain below), so `pick_cpu`/`try_steal` may
+    // legitimately target it and the witness now counts all six cores. Idempotent (Release store); the
+    // boot core stays a participant for the rest of the boot, which is correct — it never stops driving
+    // its queue.
+    mark_online(driver_cpu);
+    let online = (0..NUM_CPUS).filter(|&c| ONLINE_MASK[c].load(Ordering::Acquire)).count();
+    serial_println!(
+        ":: AARCH64 SCHED-BAL: ORIN-BURST — staging {} migratable PRIO_LOW tasks (driver c{}, {} online core(s)) ::",
+        BURST_TASKS, driver_cpu, online
+    );
+    BURST_REMAINING.store(BURST_TASKS as u64, Ordering::Relaxed);
+    for i in 0..BURST_TASKS {
+        // CPU_AUTO == migratable: steal-eligible AND load-placed. (The rival implementation passed the
+        // driver core as a *preference*; the trunk placement API has no preference parameter — an
+        // explicit core would PIN the task and defeat the whole fixture, so `CPU_AUTO` is the faithful
+        // translation, and it spreads the pile at spawn rather than concentrating it on the driver.)
+        spawn_prio("burst-hot", burst_hot, i, CPU_AUTO, PRIO_LOW);
+    }
+    // Cooperatively wait for the burst to drain. TWO drivers of progress make the wait metal-robust
+    // regardless of whether an idle AP's cross-core wake actually lands:
+    //   * `yield_now` dispatches this core's own placed share (cooperative run-to-completion).
+    //   * SCHED-BURST-FIX defect 2/3 (0 steals + teardown wedge): `try_steal` pulls a burst task back
+    //     off a busier core and runs it HERE. On metal the ONLY wake an idle AP receives is the
+    //     reschedule SGI — JC3 leaves the APs tickless, so they never re-poll their run queue on their
+    //     own — and if that SGI wake is slow or lost, a placed task would sit forever on a parked AP.
+    //     The old pure-`yield_now` loop then spun its local (empty) queue to the ceiling and the board
+    //     wedged at teardown. Pulling the work back guarantees the countdown reaches 0. Under the trunk
+    //     mechanism `try_steal` does the whole move itself (victim select, steal under the victim's lock
+    //     only, re-home onto `driver_cpu`'s queue) and tallies `STEALS[driver_cpu]`, so this call site is
+    //     just the trigger — every `true` it returns is a genuine cross-core steal, and the witness
+    //     reports steals > 0: the balancer provably moved runnable work across cores on real silicon.
+    //     It respects the STEAL_MIN_DEPTH floor, so it never strips a core down to nothing.
+    // The spin ceiling is a lost-progress backstop, not the normal path: with the steal-drain the burst
+    // drains in a handful of passes. Hitting it means a genuine stall — reported on serial, never a
+    // silent hang.
+    let mut spins: u64 = 0;
+    while BURST_REMAINING.load(Ordering::Relaxed) != 0 && spins < 500_000_000 {
+        yield_now();
+        try_steal(driver_cpu);
+        spins += 1;
+    }
+    let stuck = BURST_REMAINING.load(Ordering::Relaxed);
+    if stuck != 0 {
+        // Bounded teardown, defect 3: emit an explicit timeout witness instead of leaving the board
+        // dark, then fall through to the descriptive witness below. `run_burst` always returns cleanly.
+        serial_println!(
+            ":: AARCH64 SCHED-BAL: ORIN-BURST — WARNING teardown ceiling hit after {} passes, {} task(s) never drained ::",
+            spins, stuck
+        );
+    }
+    sched_bal_witness();
+}
+
+/// ORIN-BURST — task entry for the `sched_demo` boot trigger: run the burst on the core it is dispatched
+/// on. Spawned by `run_capstone_boot_core` under `feature = "sched_demo"` so a default boot stays quiet.
+#[cfg(feature = "sched_demo")]
+fn burst_driver(_: usize) {
+    run_burst(meter_current_cpu());
+}
+
+// ---------------------------------------------------------------------------------------------
+// SIMMER — a per-core load animator (R23s1)
+// ---------------------------------------------------------------------------------------------
+//
+// `simmer` stages one PINNED, PRIO_LOW animator task on every ONLINE core EXCEPT the driver
+// (boot) core, and each animator duty-cycles — busy-spin for a while, then `sleep_ticks` — on a
+// per-core-distinct rhythm seeded from the core id. Because the vug per-core meter reads the
+// scheduler's real busy/idle dispatch counts (`CPU_BUSY`/`CPU_IDLE`), the effect is the cores'
+// bars rising and falling on independent periods, "like a moderately busy computer." It is a
+// per-core ANIMATOR, not a balancer test: the tasks are spawned on an EXPLICIT core, which under
+// the trunk scheduler is the no-migrate pin contract (`steal_ok = false`) — burst already proves
+// stealing — so each core's bar is driven by its OWN animator, independently.
+//
+// Why every online core EXCEPT the driver core: the driver/boot core (`meter_current_cpu()`)
+// runs the cooperative CAPSTONE / console-pump loop, not the preemptive `run()` loop — it
+// neither drains its sleeper list nor (on Orin, after the JM6 EL2->EL1 drop that disables its
+// timer) receives a periodic tick, so a task that `sleep_ticks` THERE would park and never wake,
+// breaking both the animation and a clean stop. The secondary cores DO run `run()` (which drains
+// due sleepers and, per JC3, self-ticks off their own timer PPI), so sleeping cycles there. This
+// is also exactly the set vug displays as a scheduler busy-FRACTION: during `vug` the boot core
+// renders (its dispatch counters freeze) and its bar shows its render load, while every other
+// online core shows its honest busy fraction — precisely the cores the animators drive. On a
+// fully-online Orin that is the boot core's render load plus five animated secondaries.
+//
+// DEFAULT-QUIET: nothing here runs unless the `simmer` verb is typed at the shell (or the gated
+// `simmer_test` self-test feature is armed) — a plain boot stages no animators.
+
+/// Shared run flag: every animator polls it and EXITS cleanly when it clears. `simmer_start` sets
+/// it; `simmer_stop` clears it. Acquire/Release so a just-spawned animator observes the `true`
+/// that preceded its spawn and a stop is seen promptly across cores.
+static SIMMER_RUN: AtomicBool = AtomicBool::new(false);
+/// Count of animator tasks currently alive; each animator decrements it on exit so `simmer_stop`
+/// can wait (bounded) for genuine quiescence before emitting the stop witness.
+static SIMMER_LIVE: AtomicU64 = AtomicU64::new(0);
+
+/// xorshift32 — a tiny per-core PRNG seeded from the core id (no wall-clock entropy needed). Drives
+/// each animator's period, phase and duty so the bars wander independently, deterministically per boot.
+#[inline]
+fn simmer_xorshift(state: &mut u32) -> u32 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    x
+}
+
+/// One PINNED per-core animator. `arg` is the core id (== the pinned cpu). Duty-cycles busy/idle on a
+/// per-core rhythm until `SIMMER_RUN` clears, then retires (decrementing `SIMMER_LIVE`). Runs at
+/// `PRIO_LOW` and yields inside the busy phase so the console / input / render always preempt it (the
+/// HID-REGRESS lesson: never busy-spin the idle path — this SLEEPS between duty windows).
+fn simmer_animator(arg: usize) {
+    let cpu = arg;
+    // Seed distinctly per core (id-derived, deterministic — same bars every boot). The multiply +
+    // OR-1 keeps the seed non-zero even for core 0, and warming a core-dependent number of steps
+    // decorrelates the phase between cores so they don't breathe in lockstep.
+    let mut rng: u32 = 0x9E37_79B1 ^ ((cpu as u32).wrapping_mul(0x0100_1001) | 1);
+    for _ in 0..(cpu + 1) * 7 {
+        simmer_xorshift(&mut rng);
+    }
+    let freq = timer::cntfrq();
+    let freq = if freq == 0 { 62_500_000 } else { freq };
+    while SIMMER_RUN.load(Ordering::Acquire) {
+        // This cycle's shape: period 30..=79 ticks (~120..320 ms @ 250 Hz) and duty 15..=70 %, both
+        // redrawn each cycle so the bar height wanders rather than settling on a fixed level.
+        let period = 30 + (simmer_xorshift(&mut rng) % 50) as u64;
+        let duty = 15 + (simmer_xorshift(&mut rng) % 56) as u64; // 15..=70 percent
+        let busy_ticks = (period * duty / 100).max(1);
+        let idle_ticks = period.saturating_sub(busy_ticks).max(1);
+        // BUSY phase: burn real work so the core actually loads, yielding periodically so any higher-
+        // priority work preempts and every dispatch pass records this core BUSY on the meter. Bound it
+        // by THIS core's own tick clock (advances via its JC3 timer PPI) with a generous wall-clock
+        // backstop (`cntpct` always advances) so a core whose tick momentarily stalls can't wedge.
+        let start_ticks = percpu::this_cpu().ticks.load(Ordering::Relaxed);
+        let wall_deadline = timer::cntpct() + freq * 2; // >= any plausible busy window; safety net only
+        let mut acc: u64 = rng as u64;
+        loop {
+            for k in 0..300_000u64 {
+                acc = acc.wrapping_add(k ^ acc.rotate_left(7));
+            }
+            core::hint::black_box(acc);
+            yield_now();
+            if !SIMMER_RUN.load(Ordering::Acquire) {
+                break;
+            }
+            let elapsed = percpu::this_cpu().ticks.load(Ordering::Relaxed).wrapping_sub(start_ticks);
+            if elapsed >= busy_ticks || timer::cntpct() >= wall_deadline {
+                break;
+            }
+        }
+        if !SIMMER_RUN.load(Ordering::Acquire) {
+            break;
+        }
+        // IDLE phase: sleep so this core's run queue drains and the meter reads it IDLE — the down-
+        // stroke of the bar. Sleeping (not spinning) is what makes the bar fall AND keeps the core
+        // genuinely free between windows (so simmer coexists with the shell / burst / input).
+        sleep_ticks(idle_ticks);
+    }
+    SIMMER_LIVE.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// True while the animators are staged (the `simmer` toggle's current state).
+pub fn simmer_active() -> bool {
+    SIMMER_RUN.load(Ordering::Acquire)
+}
+
+/// Start the per-core animators (idempotent: a second start while running is a no-op). `driver_cpu`
+/// is the caller's core (the boot/console core); it is deliberately NOT animated (see the module
+/// note). One PINNED PRIO_LOW animator is staged on every OTHER online core. Emits the start witness.
+pub fn simmer_start(driver_cpu: usize) {
+    if SIMMER_RUN.swap(true, Ordering::AcqRel) {
+        return; // already running
+    }
+    // The boot core drives cooperatively; mark it a scheduling participant for consistent online
+    // accounting (mirrors `run_burst`) — it is not itself animated.
+    mark_online(driver_cpu);
+    SIMMER_LIVE.store(0, Ordering::Relaxed);
+    let mut staged = 0usize;
+    for c in 0..NUM_CPUS {
+        if c != driver_cpu && ONLINE_MASK[c].load(Ordering::Acquire) {
+            SIMMER_LIVE.fetch_add(1, Ordering::Relaxed);
+            // Explicit core `c` => the trunk's no-migrate pin (`steal_ok = false`): each core's bar is
+            // driven by its own animator and no idle sibling can steal it away mid-animation.
+            spawn_prio("simmer", simmer_animator, c, c, PRIO_LOW);
+            staged += 1;
+        }
+    }
+    let online = (0..NUM_CPUS).filter(|&c| ONLINE_MASK[c].load(Ordering::Acquire)).count();
+    serial_println!(
+        ":: SIMMER: staged {} per-core animators (driver c{} not animated, {} online core(s)) ::",
+        staged, driver_cpu, online
+    );
+}
+
+/// Stop the animators: clear the run flag and wait (bounded, cooperatively yielding so the APs make
+/// progress and drain) for every animator to observe it and exit, then emit the stop witness. Emits a
+/// witness and returns immediately if simmer was not running.
+pub fn simmer_stop() {
+    if !SIMMER_RUN.swap(false, Ordering::AcqRel) {
+        serial_println!(":: SIMMER: already stopped ::");
+        return;
+    }
+    let mut spins: u64 = 0;
+    while SIMMER_LIVE.load(Ordering::Relaxed) != 0 && spins < 500_000_000 {
+        yield_now();
+        spins += 1;
+    }
+    let live = SIMMER_LIVE.load(Ordering::Relaxed);
+    if live != 0 {
+        // Bounded teardown: an animator that never observed the flag is reported, never a silent wedge.
+        serial_println!(
+            ":: SIMMER: WARNING stop ceiling hit after {} passes, {} animator(s) still live ::",
+            spins, live
+        );
+    }
+    serial_println!(":: SIMMER: stopped ::");
+}
+
+/// SIMMER self-test (the gated QEMU case): stage the animators, sample the per-core meter twice
+/// ~1 s apart and assert MULTIPLE animated cores show BUSY deltas, then stop and assert quiescence
+/// (no further busy growth on the animated cores). Boot-core task under `feature = "simmer_test"` so
+/// a default boot stays quiet. Emits PASS/FAIL witness lines the regression capture greps.
+#[cfg(feature = "simmer_test")]
+fn simmer_selftest(_: usize) {
+    // After-stop tolerance: once every animator has exited (`simmer_stop` waits for that) an idle AP
+    // bumps only `CPU_IDLE`, so its busy count is frozen; a small slack absorbs any stray dispatch.
+    const QUIESCE_SLACK: u64 = 8;
+    let driver = meter_current_cpu();
+    serial_println!(":: SIMMER: self-test begin (driver c{}) ::", driver);
+    simmer_start(driver);
+    let s0 = simmer_sample_busy();
+    simmer_wait_wall_ms(1000);
+    let s1 = simmer_sample_busy();
+    let mut moved = 0usize;
+    for c in 0..NUM_CPUS {
+        if c != driver && s1[c] > s0[c] {
+            moved += 1;
+        }
+    }
+    if moved >= 2 {
+        serial_println!(
+            ":: SIMMER: self-test PASS — {} animated cores showed busy deltas over ~1 s ::",
+            moved
+        );
+    } else {
+        serial_println!(
+            ":: SIMMER: self-test FAIL — only {} core(s) showed busy deltas (expected >= 2) ::",
+            moved
+        );
+    }
+    simmer_stop();
+    let q0 = simmer_sample_busy();
+    simmer_wait_wall_ms(1000);
+    let q1 = simmer_sample_busy();
+    let mut still = 0usize;
+    for c in 0..NUM_CPUS {
+        if c != driver && q1[c].wrapping_sub(q0[c]) > QUIESCE_SLACK {
+            still += 1;
+        }
+    }
+    if still == 0 {
+        serial_println!(":: SIMMER: quiescence PASS — no animated core grew busy after stop ::");
+    } else {
+        serial_println!(
+            ":: SIMMER: quiescence FAIL — {} core(s) still growing busy after stop ::",
+            still
+        );
+    }
+}
+
+/// SIMMER self-test helper: snapshot every core's cumulative BUSY dispatch count.
+#[cfg(feature = "simmer_test")]
+fn simmer_sample_busy() -> [u64; NUM_CPUS] {
+    let mut out = [0u64; NUM_CPUS];
+    for c in 0..NUM_CPUS {
+        out[c] = CPU_BUSY[c].load(Ordering::Relaxed);
+    }
+    out
+}
+
+/// SIMMER self-test helper: busy-wait `ms` of wall time on the cooperative driver core, yielding so
+/// its own queue dispatches and the preemptive secondaries run. Rides `cntpct` (always advances).
+#[cfg(feature = "simmer_test")]
+fn simmer_wait_wall_ms(ms: u64) {
+    let freq = timer::cntfrq();
+    let freq = if freq == 0 { 62_500_000 } else { freq };
+    let deadline = timer::cntpct() + freq.saturating_mul(ms) / 1000;
+    while timer::cntpct() < deadline {
+        yield_now();
+    }
 }
 
 /// SMP-BAL — the BSP's entry into the scheduler, after it finishes its one-time boot duties (service
@@ -4663,6 +5051,38 @@ pub fn wait_and_run(cpu: usize) -> ! {
     while !SCHED_GO.load(Ordering::Acquire) {
         crate::arch::hlt();
     }
+    run(cpu)
+}
+
+/// ORIN-SMP-RUN — the `virt`/tegra secondary's entry into the preemptive scheduler `run()` loop,
+/// called from `smp_virt::__secondary_rust_virt` AFTER its one-shot cooperative pass
+/// (`run_secondary_work`) in place of the old `note_core_idle` + WFI park. This is the seam that
+/// makes a tegra/virt secondary a balancing participant: `mark_online` registers it in `ONLINE_MASK`
+/// before it enters the loop, so `pick_cpu` may place `CPU_AUTO` tasks here and `try_steal` may run
+/// here and target it.
+///
+/// The `mark_online` call belongs HERE rather than in `run()`: on the Pi path the BSP registers each
+/// AP as it releases it (`start_aps`), and `run_bsp` registers core 0 — but the tegra/virt secondary
+/// is brought up through `CPU_ON` by a BSP that never runs `start_aps`, so nothing else would ever
+/// mark it. It is idempotent, so a core that was already registered pays a redundant Release store.
+///
+/// Unlike `wait_and_run` (the Pi path), this does NOT gate on `SCHED_GO`: the tegra/virt BSP never
+/// publishes `SCHED_GO` on the `CPU_ON` path (its boot core runs the cooperative CAPSTONE via
+/// `run_capstone_boot_core`, not `run()`), and any BSP-staged startup queue was already drained by
+/// `run_secondary_work` before this call — so the core enters `run()` (and goes online) at once
+/// rather than waiting for a flag that never flips. `run()`'s idle path folds an idle span on every
+/// empty pass, subsuming the honest-idle heartbeat the removed `note_core_idle` park provided.
+///
+/// JC3 landed the AP periodic tick: the caller (`smp_virt::__secondary_rust_virt`) arms this core's
+/// own local-only generic-timer tick (`timer::arm_this_core_ap`) before this call, so `run()`'s idle
+/// WFI now wakes on the AP's OWN tick every ~4 ms as well as on a reschedule/BSP SGI — the core
+/// re-polls its run queue / attempts a steal self-driven, no longer SGI-dependent. The local-only tick
+/// advances only this core's `percpu.ticks`, never the shared `TICKS`/`ms()` clock (the double-count
+/// that deferred it in JC2). `spawn_inner`/`make_ready` still poke the target with a (now
+/// affinity-targeted) `IPI_RESCHED` for prompt wakeups; the tick is the belt-and-braces backstop.
+/// Never returns.
+pub fn secondary_run(cpu: usize) -> ! {
+    mark_online(cpu);
     run(cpu)
 }
 
@@ -5461,7 +5881,7 @@ pub fn fluid3_drain() -> (u64, u64, u64, [u32; FL3_BUCKETS]) {
 /// `note_killed_task_retired` already uses.
 fn kill_wake_parked() -> u32 {
     let mut n = futex_wake_killed();
-    #[cfg(feature = "baremetal")]
+    #[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
     {
         n += super::syscall::kill_wake_parked_semaphores();
     }
@@ -7515,7 +7935,25 @@ pub fn run_capstone_boot_core(cpu: usize) -> ! {
     // alongside the line above. Equally self-contained + bounded (stages, drains, leaves the queue
     // empty), so it too never perturbs the CAPSTONE. (The AARCH64-PRIO landing deferred this one.)
     prio_mix_witness(cpu);
+    // SCHED-BAL: emit the work-stealing witness marker. On this `virt` boot-core-only cooperative path
+    // there is no preemptive multi-core `run()` loop, so the steal counts read 0 (stealing is exercised
+    // on the x86 sched_demo path in QEMU and on Pi/Orin metal); the line is the structural marker that
+    // keeps the ARM regression capture aware of the balancer. No scheduling effect.
+    sched_bal_witness();
     spawn("capstone", capstone_body, 0, cpu);
+    // ORIN-BURST — under `sched_demo` ONLY (DEFAULT-QUIET: a plain boot stages nothing), stage the
+    // multi-hot-thread balancer burst as a boot-core task so SCHED-BAL lights every ONLINE core in the
+    // regression capture (and, on Orin, in vug). Runs at `PRIO_LOW`, below CAPSTONE (`PRIO_NORMAL`), and
+    // the driver yields while waiting, so CAPSTONE still runs to COMPLETE. Not spawned by default, so the
+    // plain GICv3/tegra boot is byte-identical (the whole call compiles out without the feature).
+    #[cfg(feature = "sched_demo")]
+    spawn("burst-driver", burst_driver, 0, cpu);
+    // SIMMER self-test (R23s1) — under `simmer_test` ONLY (DEFAULT-QUIET): stage the per-core load
+    // animator as a boot-core task, sample the meter twice ~1 s apart to prove multiple animated
+    // cores show busy deltas, then stop and prove quiescence. Independent of `sched_demo`; the whole
+    // call compiles out without the feature, so a plain GICv3/tegra boot is byte-identical.
+    #[cfg(feature = "simmer_test")]
+    spawn("simmer-selftest", simmer_selftest, 0, cpu);
     SCHED_GO.store(true, Ordering::Release); // harmless (no APs on this path)
     // Cooperative dispatch loop: drain the run queue, then busy-poll (never WFI). `dispatch_next` returns
     // false only once the queue drains — after CAPSTONE has fully completed — at which point the core just

@@ -1,4 +1,49 @@
-# Orchestration runbook — the Maestro integrator seat
+# Orchestration runbook — track-coordinated integration (no integrator seat)
+
+> ⚠ **SUPERSEDED IN PART 2026-08-18 (Peter's directive, orin 0 session): the
+> Maestro/integrator SEAT is eliminated. The three track sessions (rmbp, pi,
+> orin) coordinate integration among themselves over ccd session messages.**
+> Where anything below assigns a duty to "the Maestro", "the integrator", or
+> "the seat", that duty now lands as follows — the DUTIES survive, the chair
+> does not:
+>
+> - **Review before merge** → the landing track runs the independent
+>   adversarial agent panel itself (the COI guard is unchanged and MORE
+>   load-bearing now: the author seat never merges on its own judgment alone),
+>   **plus a peer ack from at least one other track seat over ccd** before the
+>   trunk merge. A confirmed must-fix is fixed in-arc and re-gated before the
+>   merge proceeds.
+> - **Merge to trunk** → the landing track ANNOUNCES the merge over ccd,
+>   cross-verifies with a fresh `git ls-remote` on both seats in the same turn
+>   as every announce/ack (stale reachability claims are never relayed), then
+>   merges its own reviewed+acked arc `--no-ff`, runs the trunk battery
+>   (step 3 below), and reports results in its landing report. The
+>   one-unmerged-arc-per-track cap stands. **Dispute path**: no ack, or an
+>   objection the seats cannot resolve over ccd → the merge does not happen
+>   and the disagreement goes to Peter with both positions. Silence is never
+>   consent; a 1-1 split never deadlocks unrecorded. ("Trunk" throughout is
+>   name-agnostic — one trunk branch; `main` per Peter's 2026-08-18 ruling
+>   retiring the `UnaOS-gemini` staging name.) **Landing race**: immediately
+>   before the `--no-ff` merge, announce over ccd + fresh `ls-remote`; if
+>   trunk moved since the review, merge the new trunk into the arc and re-run
+>   the trunk battery first — first announced merge wins, the other rebases
+>   its landing on the result.
+> - **Track sync ("rebase the tracks")** → each track MERGES trunk into its
+>   branch at its own arc boundaries. Never rebase a pushed tip; never
+>   force-push. (The step-4 `--ff-only` flow applies only to a track with no
+>   unmerged work.)
+> - **Briefs/batons** → the closing session writes its own track's next baton
+>   (already the baton-protocol rule); cross-track scoping questions go to
+>   Peter or are negotiated over ccd.
+> - **Conflict reconciliation (docs/`arroyo`)** → the landing seat, by union.
+> - **Unchanged and non-negotiable**: Peter approves new lines of work,
+>   attends metal, and PUSHES — no session ever pushes (the push interlock in
+>   "Seat hardening" binds every track session now); the metal-verification
+>   gate and bench-debug boundary below apply as written, per track.
+>
+> The historical seat procedure below is retained as the reference for WHAT the
+> duties are; read every "Maestro/integrator/seat does X" as "the landing (or
+> syncing) track session does X under the rules above."
 
 > ⚠ **REFRESHED 2026-07-17 (wolfpack handoff).** This doc had drifted a model-generation + an
 > org-model behind — it called the seat "Fable," declared a dissolved 3-parallel-executor /

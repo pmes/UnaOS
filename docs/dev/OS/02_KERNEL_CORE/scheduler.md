@@ -2465,6 +2465,112 @@ Combined-boot evidence (one kernel running SMP + USB + net + video):
 
 ---
 
+## 4a. aarch64 SMP scheduler and the Orin work-stealing balancer
+
+The aarch64 port now runs a real preemptive multi-core scheduler
+(`arch/aarch64/{sched,smp_virt}.rs`). Secondaries brought up by PSCI `CPU_ON`
+enter `run()` (via `secondary_run`), which sets `ONLINE[cpu]` and makes the core
+a **SCHED-BAL** load-balancing participant: migratable (plain kernel) tasks are
+placed on the least-loaded online core at spawn/wake (`place_cpu`) and an idle
+core pulls work off a busier one (`try_steal`). Per-core `STEALS`/`CPU_BUSY`
+counters back the one-line `sched_bal_witness`.
+
+On the Jetson Orin Nano the boot core does **not** enter `run()` — it drives the
+cooperative M4 CAPSTONE from `run_capstone_boot_core`. The `burst` shell verb
+(and the `sched_demo` boot trigger) stages `BURST_TASKS` migratable `PRIO_LOW`
+tasks across every online core and reports the balance. Two facts about this path
+are load-bearing and were the subject of the **SCHED-BURST-FIX** arc:
+
+- The cooperative boot core is an online scheduler participant too, but it marks
+  itself `ONLINE` inside `run_burst` (it never runs the `run()` seam that does so
+  for secondaries) — otherwise the witness under-counts the online cores by one.
+- **JC3 — per-core AP timer tick.** Each GICv3 secondary now arms its OWN
+  periodic generic-timer tick (`timer::arm_this_core_ap`) before entering
+  `run()`, so it re-polls its run queue / attempts a steal every ~4 ms — a
+  self-driven scheduler participant rather than reschedule-SGI-dependent. This
+  promotes the JC2-deferred "AP timer PPI stretch": the deferral existed because
+  `on_tick` bumps the shared monotonic `TICKS` that feeds `ticks()`/`ms()`, so a
+  second ticking core would inflate the wall-clock budget. JC3 contains that with
+  a **local-only** tick: `arm_this_core_ap` registers the core in `AP_LOCAL_TICK`,
+  and such a core advances only its per-CPU `percpu.ticks` (its scheduler clock,
+  which also drives `sleep_ticks`), never the shared `TICKS`. The boot core stays
+  the sole global-clock owner. Each AP prints one witness line on its first tick
+  (`:: AARCH64 SMP: cN timer PPI live (tick 1) ::`), quiet after. The tick does
+  not preempt on this EL2 `run()` path (`SCHED_ACTIVE` stays false; `handle_irq_v3`
+  calls only `on_tick`) — it just breaks the idle WFI so the loop re-polls.
+- **HID-REGRESS-B12 — a ticking AP must WFI, not busy-spin, when idle.** `arch::hlt`
+  chooses WFI-park vs. poll-spin from `timer::is_live()`, which tracks the **boot
+  core's** timer. On the Jetson the JM6 EL2->EL1 drop disables that timer
+  (`set_not_live`), so post-drop `is_live()` is false and `hlt` poll-spins — correct
+  for the timerless boot core, which owns the cooperative xHCI HID poll. But a JC3
+  secondary has its OWN live tick, so post-drop it would fall into the same poll-spin
+  branch and **busy-spin its `run()` steal loop** between ticks instead of parking.
+  Five secondaries hammering the shared run-queue spinlocks/`ONLINE` atomics saturate
+  the interconnect and starve the boot core's HID poll — armed keyboards/pointers
+  deliver ZERO events (boot-12). Fix: `hlt` also parks on
+  `timer::this_core_has_local_tick()` (this core's `AP_LOCAL_TICK` bit), so a
+  self-ticking AP WFI-parks bounded to one ~4 ms tick — still self-scheduling, but
+  idle-quiet, so input coexists. The boot core is never in `AP_LOCAL_TICK` (its
+  poll-spin is unchanged); on QEMU `virt` the APs' tick is delivery-confirmed so
+  `is_live()` is already true (the new term is redundant, no behaviour change); Pi
+  (GICv2, no `AP_LOCAL_TICK`) reads false and is byte-identical.
+- **SGI audit (JC3).** The reschedule poke (`poke_cpu`) targeted `gic::send_sgi`
+  with the LINEAR core index, but the GICv3 CPU interface routes SGIs by MPIDR
+  **affinity** (`ICC_SGI1R_EL1`). On QEMU `virt` affinity == index so it worked;
+  on multi-cluster Tegra234 (Aff0 = 0, cluster in Aff2/Aff1) the raw index is not
+  a valid target, so a poke never woke the AP — the boot-11 metal symptom. Fixed:
+  `poke_cpu` maps the index to the core's published affinity
+  (`smp_virt::sgi_target_for_index`) first. The JC3 tick is the belt-and-braces
+  second wake, so placed/stealable work is picked up within a tick even if a poke
+  is slow or lost.
+- Belt and braces, the cooperative burst driver still **steal-drains** while it
+  waits — it pulls any stranded work back to itself and runs it — so the burst
+  always drains (no teardown wedge) and the steal is recorded (witness shows
+  steals > 0). A lost-progress spin ceiling emits an explicit timeout witness
+  rather than hanging silently.
+
+## 4b. SIMMER — the per-core load animator
+
+`simmer` (`arch/aarch64/sched.rs`) is a per-core load ANIMATOR: it makes each
+online Orin core independently "breathe" like a moderately busy machine so the
+`vug` per-core meter shows the bars rising and falling on independent rhythms.
+Where `burst` is a one-shot balancer probe (migratable tasks that get *stolen*
+across cores), `simmer` is a steady-state animator: one **PINNED** `PRIO_LOW`
+task per core, each duty-cycling on its own cadence. Pinning is the point — each
+core's bar is driven by its own animator, not by placement/stealing (`burst`
+already proves stealing).
+
+- **Toggle + default-quiet.** The `simmer` shell verb (inside `jd2_console_pump`,
+  the boot core) toggles it; `simmer off` stops it. Nothing runs unless the verb
+  is typed. `simmer_start`/`simmer_stop`/`simmer_active` back the verb; start and
+  stop emit a single serial witness each (`:: SIMMER: staged N ... ::` /
+  `:: SIMMER: stopped ::`) — the visual is the product, so there is no per-cycle
+  spam.
+- **Per-core rhythm.** Each animator seeds a small `xorshift32` from its core id
+  (no wall-clock entropy) and redraws, every cycle, a period (~120–320 ms) and a
+  duty (~15–70 %). The busy phase burns real work and `yield_now`s so higher-
+  priority work preempts and every dispatch pass records the core BUSY; the idle
+  phase `sleep_ticks` so the run queue drains and the meter reads the core IDLE —
+  the down-stroke. Busy duration is bounded by the core's own `percpu.ticks`
+  (its JC3 PPI clock) with a generous `cntpct` wall backstop.
+- **Every online core EXCEPT the driver (boot) core is animated.** The boot core
+  runs the cooperative loop, not `run()` — it neither drains its sleeper list nor
+  (post-JM6, timer disabled) ticks, so a `sleep_ticks` there would park forever,
+  breaking both the animation and a clean stop. This is also exactly the set `vug`
+  displays as a scheduler busy-*fraction*: during `vug` the boot core renders (its
+  dispatch counters freeze) and its bar reflects render load, while every other
+  online core reads its honest busy fraction. On a fully-online Orin that is the
+  boot core's render load plus five animated secondaries.
+- **Clean stop.** Animators poll a shared `SIMMER_RUN` atomic and exit; a
+  `SIMMER_LIVE` countdown lets `simmer_stop` wait (bounded, cooperatively
+  yielding) for genuine quiescence before witnessing. A stop-ceiling emits an
+  explicit warning rather than wedging.
+- **Self-test (`simmer_test` / `UNAOS_SIMMER=1`).** A gated boot-core task stages
+  the animators, samples the meter twice ~1 s apart and asserts multiple animated
+  cores show BUSY deltas, then stops and asserts quiescence. Run:
+  `UNAOS_GICV3=1 UNAOS_SIMMER=1 ./arroyo test-arm` — on QEMU `virt` (4 cores)
+  three secondaries animate and the case reports PASS + quiescence PASS.
+
 ## 5. Status and limitations
 
 - ~~**x86_64 only.** aarch64 runs a single polled core; it has no GIC-driven

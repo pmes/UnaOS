@@ -595,6 +595,15 @@ impl Screen {
         }
     }
 
+    /// VUGRAS: the back buffer's `[lo, hi)` byte span in cached heap RAM — the surface a vug/console
+    /// frame dirties every present. Named in the RAS localizer's decode table so a fault ADDR landing
+    /// inside it is attributable to the double-buffer store, not a generic heap allocation.
+    #[inline]
+    pub fn back_span(&self) -> (usize, usize) {
+        let lo = self.back_store.as_ptr() as usize;
+        (lo, lo + self.back_store.len())
+    }
+
     #[inline]
     pub fn width(&self) -> usize {
         self.info.width

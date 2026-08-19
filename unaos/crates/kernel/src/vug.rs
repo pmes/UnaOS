@@ -1033,6 +1033,11 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
             total_acc = 0;
         }
 
+        // VUGRAS (RAS localizer, `UNAOS_VUGRAS=1`): force a writeback sweep at the end of each frame so
+        // a FillWrite RAS fires within a frame of the bad store instead of frames later. No-op with the
+        // knob off (default-quiet). Deliberately makes the fault fire earlier — that is its purpose.
+        crate::vugras::frame_sweep(frame);
+
         // (Rotation angles ay/ax are advanced at the top of the loop — held-key / drag stepping
         // when the user is driving, the idle auto-tumble otherwise.)
         frame += 1;

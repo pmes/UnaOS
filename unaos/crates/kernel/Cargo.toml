@@ -234,6 +234,11 @@ wedge2 = []
 # timing stalls boot for minutes on real hardware (uncalibrated APIC timer). Off => scheduler still
 # inits, boot doesn't pause.
 sched_demo = []
+# SIMMER self-test (R23s1): under the aarch64 `virt` GICv3 boot, stage the per-core load animator,
+# sample the vug per-core meter twice ~1 s apart and assert multiple animated cores show busy deltas,
+# then stop and assert quiescence. Opt-in via `UNAOS_SIMMER=1` — a QEMU-verified smoke test of the
+# `simmer` shell verb's machinery. Off => no boot-time simmer staging (the runtime verb is unaffected).
+simmer_test = []
 # USB bring-up debug view for serial-less hardware: run the full main-loop USB path (enumeration +
 # storage + hubs) but KEEP the boot log on the framebuffer (no GUI takeover, no fbcon detach) and
 # print each input event, so external USB storage/keyboard/mouse enumeration AND live keypresses /
@@ -525,6 +530,14 @@ tegra = []
 # const). Enable via `UNAOS_SMPPROBE=<n> UNAOS_TEGRA=1 ./arroyo esp-jetson`.
 smpprobe = []
 
+# VUG-RAS-LOCALIZER: the `UNAOS_VUGRAS=1` RAS localizer (vugras.rs) — a knob-gated DC CIVAC writeback
+# sweep (vug frame loop + JD2 console-idle pump) plus a boot candidate-PA witness, to make the Orin
+# SNOC+ACI FillWrite RAS fire at/near the offending store and name the address it decodes to. Pure
+# instrumentation; with this feature OFF (default) the sweeps + witnesses vanish and the image is
+# byte-identical to baseline (default-quiet law). Enable via `UNAOS_VUGRAS=1`. The above-heap sweep
+# span [heap_hi, DRAM_top) is additionally `tegra`-gated (empty on the virt QEMU gate).
+vugras = []
+
 # ORIN-SMP-DEFAULT: the real 6-core Orin SMP kick-off (arch/aarch64 smp_virt.rs
 # `start_secondaries_tegra` + the fdt_tegra `/cpus` presence enumerator), wired into
 # `tegra_early_stop` after JM4 and BEFORE the JM6 drop. Tegra-only. As of ORIN-SMP-DEFAULT this
@@ -534,6 +547,30 @@ smpprobe = []
 # byte-identical to the pre-flip baseline (build twice, compare hashes). The DTB `/cpus` node is the
 # ONLY presence oracle (RIDER 1). See arch_arm64.md §ORIN-SMP.
 tegrasmp = ["tegra"]
+
+# JETSON-EL0 (M1b): the Jetson Orin (Tegra234) EL0/userspace chain. Through M1a the tegra path reached
+# EL1 + the scheduler (`boot_tegra`'s EL2 -> EL1 drop, `sched::run_capstone_boot_core`) and stopped
+# there: every piece of EL0 machinery — `arch::aarch64::syscall`, `arch::aarch64::bus`, and `sched`'s
+# `spawn_user*`/`user_task_trampoline`/slot-teardown arms — was `#[cfg(feature = "baremetal")]`, i.e.
+# BCM2711/Pi-only, because the per-task address-space slots those arms consume live in `boot.rs`, which
+# is Pi MMU code (its own EL1 identity regime, its own `USER_REGION` BSS window).
+#
+# `tegra_el0` widens exactly those gates to the tegra path and supplies the missing half — the M6d slot
+# system re-implemented against the tegra EL1 regime in `arch/aarch64/mmu_tegra_el0.rs`: a 4 KiB L2/L3
+# table chain hung off an OTHERWISE-UNUSED L1 GiB of `mmu_tegra`'s `L1_EL1` (NOT GiB 0, which on Tegra234
+# is the Device-nGnRE peripheral window the kernel's own UART lives in — the Pi's "demote L1[0] to a
+# table" move is unavailable here), per-slot nG leaves + ASID 1..=8, the same W^X leaf recipe boot.rs
+# uses (code RO-both + EL0-executable, data EL0/EL1-RW + UXN|PXN), and HEAP-backed slot frames so the
+# backing is drawn from the HEAP-GUARD-vetted DMA window and can never land in an SNOC-firewalled
+# carveout hole (`mmu_tegra::carveout_holes`), which a raw-region allocation could.
+#
+# Implies `tegra`. DEFAULT OFF => the widened gates all read `baremetal` again, `mmu_tegra_el0` is not
+# compiled, the `tegra_early_stop` spawn block vanishes, and the jetson media is BYTE-IDENTICAL to
+# baseline (verified by building `esp-jetson` knob-off before and after this arc and comparing
+# sha256 of target/aarch64_esp/kernel.elf). Enable via `UNAOS_TEGRA_EL0=1`. QEMU cannot exercise it
+# (the `tegra` feature has no QEMU model — the virt gate is a different machine), so the round-trip
+# witness is metal-owed/attended. See arch_arm64.md §JETSON-EL0.
+tegra_el0 = ["tegra"]
 
 # JETSON-XCARVE M2: the `UNAOS_XCARVE=1` inherited-xHCI-pointer instrumentation
 # (arch/aarch64/xusb_tegra.rs::jbxc_inherited_dump), fired at the top of `jb2b_attach` BEFORE the

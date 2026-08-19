@@ -1520,6 +1520,166 @@ pub fn write_blocks_sdhc(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     Ok(())
 }
 
+// ============ TEGRA-SDBLK — the Orin's microSD as its own registry slot (read-only) ============
+//
+// `arch::aarch64::sdmmc_tegra` has, since ORIN-SDMMC-1, identified the card in the Orin devkit's
+// microSD slot and read sectors from it — and told nobody. Every SD arm in this file is
+// `#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]`, i.e. the Pi's emmc2, so on a tegra
+// build `block::read_block` has always meant the USB stick and nothing else, and `fs::unafs`'s
+// `SdSectorDevice::open()` could only ever answer `NoStorage`. A proven driver with no consumer —
+// the same shape SDHC-4b found on x86, and this section is its aarch64 twin
+// (docs/dev/OS/10_INSTALL/orin-unafs-root.md §3 item 1).
+//
+// ### Its own slot, NOT the global, and NOT the `BACKEND` selector
+// The Orin boots from a USB stick, so on this board `BLOCK_DEVICE` is the stick and `block::info()`
+// is what the installer, `fat::probe_once`, the shell and unafs all read. Publishing the card into
+// the global would silently re-point every one of them at a different disk — PI-FS-2, exactly. The
+// `BACKEND` selector is not an option either: it is `baremetal`-gated (it exists to route the Pi's
+// emmc2) and does not compile on a tegra build at all. So the card gets its own entry, reached only
+// by naming it, precisely as `Usb` (PIUSB-27) and `Sdhc` (SDHC-4b) are — and `read_block`,
+// `write_block`, `read_blocks`, `write_blocks` and `publish_usb_geometry` gain not one statement.
+//
+// ### What this step deliberately does NOT do: no `BlockHandle::TegraSd` yet
+// SDHC-4b's precedent is a new HANDLE variant, and that is the intended end state here too. It is
+// not in this commit because `BlockHandle` is total-by-construction, and MEASURED (variant added,
+// `UNAOS_TEGRA=1 ./arroyo check`, variant removed again) the arm-tegra leg reports E0004 at twelve
+// sites: nine in this file (`alternate_program_source`, `lookup`, `mbr_census`'s two, `PartitionRange`'s
+// five) and three OUTSIDE this arc's lane — `fs::fat::source_of` and `install/mod.rs`'s two handle
+// matches. (`wifi::firmware::source_of_handle` is a fourth, latent: no gate leg compiles it on
+// aarch64.) That totality is a feature, not an obstacle: it is the forcing function those files
+// document ("a fourth handle is a build error in both places, not a silent mis-route"), and it fires
+// exactly when the variant lands. So the variant is a one-commit follow-up whose lane must cover
+// `fs/fat.rs`, `install/mod.rs` and `wifi/firmware.rs`, and
+// until then the entry points below are the whole surface: a caller names `tegra_sd_info()` and
+// `read_block(s)_tegra_sd` directly. Nothing about the read path changes when the variant arrives;
+// the variant only lets a `PartitionRange` carry it.
+//
+// ### WRITES ARE REFUSED HERE, in every cfg
+// The Orin's card-write path is the `sdmmc_arm` ladder in `sdmmc_tegra.rs`, behind three explicit
+// gates (`sdmmc` + `sdmmc_arm` + `install_target` for the destructive flow), each of which the
+// operator arms deliberately. Registering the card as a block backend must not open a fourth door
+// past that ladder, so the write entry points below exist ONLY to refuse — fail-closed, with a
+// one-shot witness that names the reason. There is no cfg in which they write.
+
+/// TEGRA-SDBLK: geometry of the card in the Orin's microSD slot, published by [`register_tegra_sd`]
+/// once `sdmmc_census` has identified it AND read sector 0 from it. A THIRD slot alongside
+/// [`BLOCK_DEVICE`] and [`USB_BLOCK_DEVICE`]: nothing here ever claims the global, so the boot volume
+/// every existing caller reads through `info()` is untouched. `None` until registration.
+#[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+pub static TEGRA_SD_BLOCK_DEVICE: Mutex<Option<BlockDeviceInfo>> = Mutex::new(None);
+
+/// TEGRA-SDBLK: snapshot of the Orin microSD's geometry, if one registered this boot.
+#[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+pub fn tegra_sd_info() -> Option<BlockDeviceInfo> {
+    *TEGRA_SD_BLOCK_DEVICE.lock()
+}
+
+/// TEGRA-SDBLK: one-shot latch so the publish witness is printed exactly once per boot even if the
+/// census were ever to run twice (it is called from two boot paths today — the JC3 early site and the
+/// main aarch64 entry — and only the first one to succeed may claim the line).
+#[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+static TEGRA_SD_PUBLISHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// TEGRA-SDBLK: publish the Orin microSD's geometry under the [`TEGRA_SD_BLOCK_DEVICE`] slot.
+///
+/// Called once, from the end of `sdmmc_tegra::sdmmc_census`, after M1 (mapped window, live SDHCI),
+/// M2 (card identified) and M3 (sector 0 read) have all succeeded — so a registered card is one whose
+/// read path this boot has already exercised and reported on, not merely one that answered CMD2/CMD3.
+///
+/// Returns whether the card was registered. It refuses `num_blocks == 0` rather than publishing a
+/// device every subsequent bound check would reject one call later — an instrument that can say NO.
+///
+/// `slot_id` is 0, the sentinel `register_sd` stamps on the Pi's microSD: 0 is never a live xHCI
+/// device slot, so [`unpublish_usb_geometry`] can never retract this entry on a USB disconnect (belt
+/// and braces — that function only touches the `Global` and `Usb` slots anyway).
+#[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+pub fn register_tegra_sd(num_blocks: u64, block_addressing: bool) -> bool {
+    if num_blocks == 0 {
+        serial_println!(
+            ":: TEGRA-SD: REFUSED to publish the microSD block backend — num_blocks=0 (nothing to address) ::"
+        );
+        return false;
+    }
+    let dev = BlockDeviceInfo {
+        slot_id: 0,
+        block_size: SECTOR_BYTES as u32,
+        num_blocks,
+        vendor: *b"TEGRA-SD",
+        product: if block_addressing { *b"MICROSD SDHC/XC " } else { *b"MICROSD SDSC    " },
+    };
+    *TEGRA_SD_BLOCK_DEVICE.lock() = Some(dev);
+    if !TEGRA_SD_PUBLISHED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        serial_println!(
+            ":: TEGRA-SD: block backend published — {} sectors (read-only) ::",
+            num_blocks
+        );
+    }
+    true
+}
+
+/// TEGRA-SDBLK: read one sector (`lba`) from the Orin microSD DIRECTLY through the SDMMC driver's
+/// polled CMD17, bypassing the backend selector — the read twin of [`read_block_usb`]. Geometry comes
+/// from [`TEGRA_SD_BLOCK_DEVICE`], re-read on every call as every other entry point does, and the
+/// driver re-guards the LBA against the card's own capacity one layer down. Takes no xHCI lock at all,
+/// so it cannot interact with the boot stick's transport.
+#[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+pub fn read_block_tegra_sd(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
+    let dev = tegra_sd_info().ok_or(BlockError::NotReady)?;
+    if lba >= dev.num_blocks {
+        return Err(BlockError::BadLba);
+    }
+    crate::arch::aarch64::sdmmc_tegra::tegra_sd_read_block_512(lba, buf)
+}
+
+/// TEGRA-SDBLK: the counted twin of [`read_block_tegra_sd`] — `buf.len() / block_size` consecutive
+/// sectors in one call, bounded by the shared [`span_blocks`] rules so the bound cannot drift between
+/// handles. The driver loops CMD17 underneath (it has no unarmed CMD18 primitive); the cap applied
+/// here is [`MAX_BLOCKS_PER_OP`], the same number `fs/fat.rs` already chunks every source against —
+/// one cap for all slots is one rule to get right instead of three.
+#[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+pub fn read_blocks_tegra_sd(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
+    let dev = tegra_sd_info().ok_or(BlockError::NotReady)?;
+    let count = span_blocks(&dev, lba, buf.len())?;
+    let n = crate::arch::aarch64::sdmmc_tegra::tegra_sd_read_blocks_512(lba, count, buf)?;
+    // A short counted read is an error, never a silent prefix — the same rule the other counted forms
+    // enforce, and the one failure mode a filesystem above has no way to notice.
+    if n < buf.len() {
+        return Err(BlockError::Io);
+    }
+    Ok(buf.len())
+}
+
+/// TEGRA-SDBLK: one-shot latch so the write refusal names itself once instead of per retry.
+#[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+static TEGRA_SD_WRITE_REFUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// TEGRA-SDBLK: the block layer REFUSES to write the Orin microSD — in every cfg, including a fully
+/// armed one. This is not a stub awaiting a driver: `sdmmc_tegra` HAS a metal-proven CMD24/CMD25 write
+/// path, and it is reachable only through the `sdmmc_arm` paranoia ladder and the `install_target`
+/// flow, each of which stashes, writes, verifies and restores under its own gates. Publishing the card
+/// as a readable block device must not become a fourth way past that ladder, so this entry point exists
+/// so the seam is total and fails CLOSED, not so that anything writes through it.
+#[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+pub fn write_block_tegra_sd(_lba: u64, _buf: &[u8]) -> Result<(), BlockError> {
+    if !TEGRA_SD_WRITE_REFUSED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        serial_println!(
+            ":: TEGRA-SD: WRITE refused at the block layer — the Orin card's only writer is the armed \
+             sdmmc_arm ladder in sdmmc_tegra.rs (first, once) ::"
+        );
+    }
+    // `NotReady` is the refusal code SDHC-4b's disarmed write twin returns for the same situation —
+    // "this build has no writer for this device" — and `BlockError` gains no variant here, so no match
+    // anywhere in the tree changes shape.
+    Err(BlockError::NotReady)
+}
+
+/// TEGRA-SDBLK: the counted twin of [`write_block_tegra_sd`], refusing for the same reason. Present so
+/// that a future `BlockHandle::TegraSd` dispatch has a total set of four entry points to name.
+#[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+pub fn write_blocks_tegra_sd(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    write_block_tegra_sd(lba, buf)
+}
+
 // ===================== PARTITION — MBR decode + bounded partition ranges =====================
 //
 // PARTITION (GR9): everything above this line addresses a WHOLE device. A real card carries a

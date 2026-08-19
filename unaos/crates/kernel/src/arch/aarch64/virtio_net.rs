@@ -565,6 +565,14 @@ fn bind_and_ping() {
 /// GICv3 path before the EL2→EL1 drop (heap up, virtio-mmio in the mapped Device window).
 pub fn vnet_bringup() {
     serial_println!("{} virtio-net-mmio bring-up (QEMU virt, legacy transport) ::", PV);
+    // NET-4j: the DHCP no-lease reproducer (witness-gated, self-contained — needs no `-netdev`). Runs
+    // the exact smoltcp dhcpv4 socket the metal seam uses against a synthesized OFFER, proving the
+    // integration contract (well-formed OFFER -> REQUEST; server-id-less OFFER -> no REQUEST). This is
+    // the QEMU regression that locks the fix the Orin no-lease investigation produced.
+    #[cfg(feature = "witness")]
+    {
+        let _ = crate::net_phy::net4j_repro::run(PV);
+    }
     let Some(dev) = probe_and_init() else {
         return;
     };

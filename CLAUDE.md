@@ -39,11 +39,41 @@ several sessions can work in parallel without stepping on each other.
 
 ## Worktrees & lanes
 
-- `main` is the integration trunk. Platform tracks: `hw-rmbp`
-  (`../UnaOS-rmbp`, x86 2012 rMBP), `hw-pi4` (`../UnaOS-pi4`, Pi 4 bare-metal),
-  `hw-jetson` (`../UnaOS-jetson`, Jetson Orin Nano).
-- Track sessions commit **only to their own track branch**. Never merge or
-  push to `main` — the integrator session does that after review.
+- There is exactly ONE trunk branch; every rule below says "trunk" and means it
+  name-agnostically. The trunk is **`main`** (Peter's ruling 2026-08-18: the
+  `UnaOS-gemini` staging name is retired; until the fast-forward push of `main`
+  to gemini's tip lands on origin, verify which ref is current with
+  `git ls-remote origin main UnaOS-gemini` rather than trusting this line).
+  Platform tracks: `hw-rmbp` (`../UnaOS-rmbp`, x86 2012 rMBP), `hw-pi4`
+  (`../UnaOS-hw-pi4`, Pi 4 bare-metal), `hw-jetson` (`../UnaOS-orin`,
+  Jetson Orin Nano). The shared trunk worktree is `../UnaOS` — landing merges
+  and trunk batteries run there; don't create a duplicate.
+- **Integrator-less coordination (Peter, 2026-08-18): there is no integrator
+  seat.** The three track sessions coordinate their own integration over ccd
+  session messages. Duties that belonged to the seat are reassigned, not
+  dropped:
+  - **Landing an arc to trunk**: the landing track runs the independent
+    adversarial review itself (agent panel — the COI guard: the author seat
+    never reviews alone), **announces the merge over ccd and obtains a peer
+    ack from at least one other track seat** (the second pair of eyes the seat
+    used to be), then merges its own reviewed arc to trunk with `--no-ff` and
+    runs the trunk battery. Every merge announce, ack, and repeat of an ask
+    carries a **fresh `git ls-remote` check run that same turn, both seats** —
+    reachability claims are never relayed stale (the 2026-08-03 mirror
+    failure). **Dispute path**: no ack, or an objection the seats cannot
+    resolve over ccd → the merge does not happen and the disagreement goes to
+    Peter with both positions. Silence is never consent; a 1-1 split never
+    deadlocks unrecorded. **Landing race**: immediately before the `--no-ff`
+    merge, announce over ccd and run a fresh `ls-remote`; if trunk moved since
+    your review, merge the new trunk into your arc and re-run the trunk
+    battery before landing — first announced merge wins, the other rebases its
+    landing on the result.
+  - **Sync**: each track picks up trunk at its own arc boundaries by MERGING
+    trunk into its branch (never rebase a pushed tip; never force-push).
+  - **Doc/`arroyo` conflicts** are reconciled by the landing seat (union: keep
+    both tracks' additions) instead of deferred to a seat.
+- Track sessions still commit **only to their own track branch** mid-arc; trunk
+  is touched only in the landing step above, after review + peer ack.
 - **The seat never runs `git push`. Peter does.** No inference overrides this.
 - **Name every push Peter will need in your FIRST turn, batched** — including
   pushes for commits you have not written yet (if your arc will end on a
@@ -55,18 +85,15 @@ several sessions can work in parallel without stepping on each other.
   deliverable. And re-run `git fetch` before ever reporting a push as still
   outstanding.
 - **Tracks run independently, at their own pace.** No track waits for another.
-  When a track's arc lands and passes review, the integrator merges *that* arc
-  to `main` and rebases *that* track for its next arc; the other tracks keep
-  running on their current base and rebase at their own next landing. The only
-  standing cap: **one unmerged arc per track** — a fresh session per arc; don't
-  stack a second arc on an unreviewed one within the same track.
+  Standing cap unchanged: **one unmerged arc per track** — a fresh session per
+  arc; don't stack a second arc on an unreviewed one within the same track.
 - While parallel arcs are in flight: the rmbp session owns shared kernel-core
   files; the pi and jetson sessions touch only the files their brief names
   (pi: its `arch/aarch64` arc files; jetson: GIC/timer + `tegra`-feature
-  files). If your arc needs a file outside your lane: **stop and report** —
-  the integrator updates the briefs. (Lanes are why independent merges stay
-  conflict-free: x86 vs aarch64 rarely collide; docs/`arroyo` the integrator
-  reconciles at merge.)
+  files). If your arc needs a file outside your lane: **negotiate it over ccd
+  with the owning seat before touching it** (and record the grant in both
+  sessions); no agreement → stop and report to Peter. (Lanes are why
+  independent merges stay conflict-free: x86 vs aarch64 rarely collide.)
 
 - **Never `git stash` in this repo or any worktree of it.** The stash stack is ONE stack
   shared across all worktrees; with parallel sessions live, a stash is a race by
@@ -90,7 +117,9 @@ several sessions can work in parallel without stepping on each other.
   - a fix would require touching a file outside your lane;
   - a workaround would disable or weaken a protection (SMEP, NXE, WXN,
     page permissions, checksums);
-  - you are about to reach for a force-push, history rewrite, or merge.
+  - you are about to reach for a force-push, a history rewrite, or a merge
+    outside the two sanctioned kinds (trunk→track sync; reviewed+peer-acked
+    arc→trunk landing).
 
 ## Committing & handoff
 
