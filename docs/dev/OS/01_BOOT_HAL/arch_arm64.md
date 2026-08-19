@@ -8935,8 +8935,11 @@ unbuilt so each boot carries one variable).
 Boot 2 (`boot2-darkguard-ed8f810`) confirmed the conviction on silicon: the guard counted **55 and
 89 dropped pre-map bytes** across two power-cycles (`:: tegra: dark-window guard — N byte(s)
 dropped pre-map ::`), the EDID witness re-emitted (1920x1200), and the boot ran JB2b HID, 5/5
-secondaries via PSCI, CAPSTONE 6/6, and RAST at 30.3 fps — everything the pre-merge base could do
-and more. It then froze on a second, unrelated merge-era defect: el0-hello's first `svc #0` landed
+secondaries via PSCI, and RAST at 30.3 fps — everything the pre-merge base could do and more.
+(A CAPSTONE 6/6 block in the recovered scrollback was initially misread as this boot's; it is
+QEMU/virt content from earlier in the shared capture — `workers on cores 2 + 3` is the `start_aps`
+signature, and the tegra terminus pins `CAP_CORES = [0, 0]`. See the CAPSTONE-unreachable note
+below.) It then froze on a second, unrelated merge-era defect: el0-hello's first `svc #0` landed
 in the halting fault logger (`ESR=0x56000000 EC=0x15 ELR=0x7800000014`), because JETSON-EL0 (M1b)
 had widened `syscall.rs`/`bus.rs` to `any(baremetal, tegra_el0)` but left the 0x400 vector's
 `svc_vec!`/`svc_stub!`/`aarch64_el0_fault_handler` gated on `baremetal` alone — a live EL0 spawn
@@ -8947,8 +8950,14 @@ live ::`, `hello from EL0`, `:: TEGRA-EL0: el0-hello round-trip -> PASS ::` — 
 round-trip on Orin silicon — then the JD2 interactive shell (the arc gate), JD4 console-owns-panel,
 JD20 pointer, and a live interactive GUI session. Spec `jetson-sync1.spec` promoted the el0-hello
 line PENDING→REQUIRE (`1f0c3aff`). Still open: TEGRA-SD identify (honest stop at M2, `card
-detected / no identified card` — the block-publish witness stays PENDING) and one unwitnessed
-REQUIRE on boot 3 (`CAPSTONE COMPLETE` — printed on boot 2's first cycle, absent under boot 3's
-interactive load; under analysis). Lossy-TCU caveat, re-proven: boot 3's capture lost the guard and
+detected / no identified card` — the block-publish witness stays PENDING) and `CAPSTONE COMPLETE`,
+which analysis shows is **structurally unreachable on the tegra path as coded** (not flaky, not
+starved): `run_capstone_boot_core`'s `priority_aging_witness` calls `run_until_empty`, whose
+drained-queue precondition is false on tegra — the JD2 console pump (infinite, cooperatively
+yielding, spawned pre-drop) and the el0 tasks are already staged, so the drain never returns and
+the `spawn("capstone", …)` after the witness block is never reached. Header-without-verdict in
+both boots' captures confirms it. Fix owed (skip drain-witnesses on a non-empty entry queue +
+hoist the capstone spawn — `sched.rs`, shared kernel-core, negotiation required); the spec line is
+demoted to PENDING until it lands. Lossy-TCU caveat, re-proven: boot 3's capture lost the guard and
 EDID head lines entirely — single-print witnesses need the boot-2 cross-capture evidence or 24–32×
 repetition.
