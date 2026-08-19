@@ -1176,7 +1176,35 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // settles on the scenario tail (what the DONE-gate screendump compares).
             #[cfg(all(target_arch = "x86_64", feature = "videobench"))]
             unaos_kernel::video::vperf::scenario_tick();
-            while let Some(event) = unaos_kernel::pal::next_event() {
+            while let Some(raw) = unaos_kernel::pal::next_event() {
+                // USBDBG-ROUTE — **ROUTE THE EVENT BEFORE VIEWING IT, WHEN THERE IS A DESKTOP.**
+                // Boot 5 (2026-08-19) flew a usbdebug+wc card whose cursor MOVED (USBDBG-CURSOR
+                // landed) and whose clicks did NOTHING. The mechanism is the same shape as that one
+                // and one layer up: EHCI delivered the press edges (`PTR: ... delivered=` climbed
+                // once per physical click) and this drain popped every `Event::Button` straight into
+                // the `_ => {}` arm below and dropped it. Click ROUTING lives only in the GUI loop
+                // (`wc_route_event` ahead of its match), which a usbdebug build never reaches — so
+                // clicks have never routed on a usbdebug desktop card. The working cursor only made
+                // the hole visible.
+                //
+                // The fix is to run the SAME chain the GUI loop runs, in the same order, rather than
+                // to invent a second routing policy for this build: `wc_route_event` is that chain
+                // named once (Escape-to-dismiss-menu, then `<TAB>` to the window system, then a
+                // BUTTON addressed BY POSITION to the window under the cursor, then everything else
+                // delivered BY FOCUS). Its invariants come along unchanged, including the one that
+                // matters to a drain: a consumed event comes back `Event::Unknown` and NEVER
+                // `Event::None`, because `None` is this `while let`'s end-of-queue sentinel and
+                // returning it would truncate the drain at the first routed click.
+                //
+                // GATED ON THE COMPOSITOR'S OWN RUNTIME LATCH, exactly as the cursor service is:
+                // `wcx::is_active()`, not `cfg!(feature = "wc")`. Without a live desktop there is no
+                // window to address a click to, and this card's whole reason to exist on pre-GUI
+                // bring-up is the print-only view below — so with the compositor inactive the
+                // behaviour is bit-for-bit today's.
+                #[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+                let event = usbdebug_route(raw);
+                #[cfg(not(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc")))]
+                let event = raw;
                 // USBDBG-CURSOR — SERVICE THE SPRITE ON THIS LOOP TOO. Boot 3 (2026-08-19) flew the
                 // first card carrying BOTH `usbdebug` and the desktop knobs (`wc` + kepler): the
                 // compositor ignited (its only trigger is the Kepler takeover, which runs inside PCI
@@ -1198,6 +1226,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 // concerns stay separable: the arms below are the DEBUG VIEW (they print every
                 // report unconditionally, which is this build's whole reason to exist) and this call
                 // is the SYSTEM CURSOR (it acts only where there is a desktop to point at).
+                //
+                // USBDBG-ROUTE — and it is fed the ROUTED event, not the raw one, which is what keeps
+                // "exactly one application per pointer report" true now that a router sits in front of
+                // it. `Event::Mouse`/`MouseAbsolute` are PACKABLE: on the consumed branch
+                // `user_input_route` -> `pal::cursor::track_routed` has ALREADY applied the delta
+                // (CURSOR-VUG), and the event this line sees is `Unknown`, which it ignores. On the
+                // declined branch the event is the raw report and this line applies it, as before.
+                // Fed the raw report instead, a consumed relative report would move the arrow twice —
+                // the same double-apply the GUI loop avoids by keying its pointer arms on `ev`.
                 #[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
                 usbdebug_cursor_service(&event);
                 match event {
@@ -1213,6 +1250,30 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     }
                     _ => {}
                 }
+                // USBDBG-ROUTE — **THE DRAG TICK, OFF `raw`, AFTER THE ARMS ABOVE — and it is NOT
+                // optional here.** The question this arc had to answer is whether the debug loop needs
+                // the GUI loop's `wc_route_tail`, and the answer is forced by where a title-bar drag's
+                // three phases live:
+                //   * ARM — the chrome arm of `wc_click_route_at`, reached from the routing call above.
+                //     With that call in place, a press on a title bar now ARMS a drag on this loop.
+                //   * STEER — `wc_drag_motion`, reached from NOWHERE but this tail.
+                //   * END — the release arm of `wc_click_route_at`, reached from the routing call.
+                // So without this line the debug card would arm and end drags perfectly while moving
+                // no window a single pixel: the grab would look accepted and be inert, which is the
+                // Boot 5 incident recreated one layer over — a card whose clicks work and whose drags
+                // dead-end. Routing without the tail is a HALF delivery, so the tail ships with it.
+                //
+                // Keyed on the RAW report and not on `event`, for the reason `wc_route_tail`'s own
+                // notes give: pointer reports are packable, and a title-bar grab GUARANTEES the
+                // consumed branch (the chrome arm focuses the dragged window's owner), so keying on
+                // the routed outcome would make the drag dead for exactly the windows that can be
+                // dragged. Placed AFTER the match so the cursor position `wc_drag_motion` reads is
+                // fresh on both branches — `track_routed` applied it on the consumed branch, the
+                // cursor service above on the declined one. Exactly one tick per report either way.
+                //
+                // Same runtime gate as the routing call: no compositor, no drag, no tail.
+                #[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+                usbdebug_route_tail(raw);
             }
             // USBDBG-CURSOR / CURSOR-HIDE — the auto-hide transition, once per edge. `video::cursor`
             // splits "put the sprite where the pointer is now" (`repaint`, reached through
@@ -2786,6 +2847,60 @@ fn gui_send(ev: unaos_kernel::pal::Event) {
 #[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
 static USBDBG_CURSOR_ARMED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+
+/// USBDBG-ROUTE — has the usbdebug loop's event routing done real work yet? The latch behind the one
+/// witness line, so the next diagnosis card proves the ROUTING is live on the wire rather than from
+/// the absence of a reaction in a photograph. The twin of [`USBDBG_CURSOR_ARMED`].
+#[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+static USBDBG_ROUTE_ARMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// USBDBG-ROUTE — run the x86 event-routing chain on one event drained by the usbdebug loop.
+///
+/// ### What this is
+/// `wc_route_event` is the WHOLE chain, named once, and it is deliberately called rather than
+/// transcribed: Escape-dismisses-a-menu, then `<TAB>` to the window system, then a pointer BUTTON
+/// addressed BY POSITION to the window under the cursor, then everything else delivered BY FOCUS.
+/// Routing policy is that function's, not this one's; this is delivery of the debug loop to it. The
+/// return value carries the outcome AS AN EVENT — a consumed event comes back `Event::Unknown` and
+/// never `Event::None`, which is exactly what a `while let Some(..)` drain needs (`None` is its
+/// end-of-queue sentinel; returning it would strand everything queued behind the first routed click).
+///
+/// ### Why the runtime latch and not the build cfg
+/// `wcx::is_active()` — the compositor's own authoritative signal, the same one the cursor service
+/// reads. With no live desktop there is no window to address a click to, and a `usbdebug` card's
+/// reason to exist on pre-GUI bring-up is the raw print-only view; on that path this returns the
+/// event untouched and the loop behaves bit-for-bit as it did before this arc.
+#[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+fn usbdebug_route(raw: unaos_kernel::pal::Event) -> unaos_kernel::pal::Event {
+    if !unaos_kernel::video::wcx::is_active() {
+        return raw;
+    }
+    if !USBDBG_ROUTE_ARMED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        serial_println!(":: USBDBG-ROUTE: debug-loop click routing ARMED wc=active == witness ::");
+    }
+    unaos_kernel::arch::x86_64::syscall::wc_route_event(raw)
+}
+
+/// USBDBG-ROUTE — the drain's TAIL for the usbdebug loop: steer a live title-bar drag off the RAW
+/// report, after the loop's own arms have run.
+///
+/// It ships with [`usbdebug_route`] and not after it, because the three phases of a title-bar drag do
+/// not share a home: the press ARMS it inside `wc_click_route_at`'s chrome arm and the release ENDS it
+/// there too — both reached from the routing call — while the only thing that MOVES the window is
+/// `wc_drag_motion`, reached from this tail alone. Routing without the tail therefore buys a card whose
+/// grabs are accepted and inert.
+///
+/// Keyed on the raw report for the reason [`wc_route_tail`](unaos_kernel::arch::x86_64::syscall::wc_route_tail)
+/// documents: pointer reports are packable and a title-bar grab guarantees the consumed branch, so the
+/// routed outcome is the wrong key.
+#[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+fn usbdebug_route_tail(raw: unaos_kernel::pal::Event) {
+    if !unaos_kernel::video::wcx::is_active() {
+        return;
+    }
+    unaos_kernel::arch::x86_64::syscall::wc_route_tail(raw);
+}
 
 /// USBDBG-CURSOR — panel geometry for the usbdebug loop's cursor service, read straight from the
 /// scan-out framebuffer.

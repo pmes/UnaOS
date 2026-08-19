@@ -2553,6 +2553,21 @@ Three consequences that make a line readable cold:
 Nothing here is derivable from a single line in isolation except `recovered`: to say anything about lost
 input you compare `recovered` against zero, never `seen` against `delivered`.
 
+**And `delivered` measures the BELT, not the outcome — Boot 5 (2026-08-19) is the worked example.** That
+card's clicks did nothing on screen while `delivered=` climbed once per physical click. Both readings
+were correct, and they are about different layers: `delivered` counts what `IntEp::note_buttons` handed
+to `pal`'s event queue, and it says *nothing* about what the drain that pops the queue does with the
+event. On Boot 5 the answer was "discards it" — the `usbdebug` drain had no router call at all, so every
+`Event::Button` fell into its catch-all arm (fixed by USBDBG-ROUTE; see `08_VIDEO/engine.md`). So when
+clicks are reported dead, read the two witnesses as a **pair**, in this order:
+
+1. `PTR: ... delivered=` rising per click ⇒ the pad, the endpoint and the edge logic are fine, and the
+   defect is at or above the drain. Stop looking at USB.
+2. no `PTR:` movement ⇒ the defect is on the belt, and `recovered` says whether polling is the cause.
+
+The instrument on the far side is `[clickroute]`, emitted by the router itself: `delivered` rising with
+**no** `[clickroute]` line for the same click is the exact signature of a drain that never routes.
+
 ### 10g. IVY MT-INVESTIGATION — where does true multitouch actually live? (`UNAOS_MTRAW`)
 
 §10e refuted the "descriptor-advertised 0x44 / 511-byte frame streams as-is" model: 736+ observed

@@ -5529,6 +5529,78 @@ QEMU has neither. The gates prove non-regression (`check` both arches, knobs on 
 gate with knobs off) and the artifact carries the witness string. The metal falsifier is exactly the
 Boot 3 card: a `usbdebug` + `wc` card now shows the cursor.
 
+### USBDBG-ROUTE — the debug loop learns to ROUTE the event (Boot 5, 2026-08-19)
+
+**Observed.** Boot 5 flew the first card carrying USBDBG-CURSOR. The cursor MOVED — that fix is
+confirmed on metal — and **clicks did nothing**: no window raised, the SHARD crystal did not open, no
+`[clickroute]` line printed for any physical click (the only ones on the log came from the boot-time
+`wmdirect_selftest`). The pointer was live and the desktop was inert under it.
+
+**Mechanism — the same shape as USBDBG-CURSOR, one layer up.** The input was *arriving*: the EHCI
+`PTR:` witness incremented `delivered=` once per physical click, so press edges reached `pal`'s queue.
+The usbdebug drain popped every `Event::Button` into its `_ => {}` catch-all and dropped it — it has no
+`Button` arm and, more to the point, **no router call at all**. Click routing on x86 lives in exactly
+one place, `wc_route_event` ahead of the GUI loop's match (`main.rs`), and a `usbdebug` build never
+reaches the GUI takeover. So clicks have **never** routed on a usbdebug desktop card; USBDBG-CURSOR's
+working arrow only made the hole visible.
+
+**The fix (`usbdebug_route` + `usbdebug_route_tail`, main.rs).** The debug drain now runs the SAME chain
+the GUI loop runs, in the same order, by *calling* `wc_route_event` rather than transcribing a second
+routing policy for this build. Its invariants come along unchanged: Escape dismisses an open SHARD menu
+and `<TAB>` is judged by the window system before either router; a pointer BUTTON is addressed BY
+POSITION (the window under the cursor) before anything is delivered BY FOCUS; and a consumed event
+returns `Event::Unknown` and **never** `Event::None`, which matters here for the same reason it matters
+in the GUI loop — `None` is this `while let Some(..)` drain's end-of-queue sentinel, so returning it
+would strand everything queued behind the first routed click.
+
+Gated on `video::wcx::is_active()`, the compositor's own runtime latch, exactly as the cursor service
+is: with no live desktop there is no window to address a click to, and the card's reason to exist on
+pre-GUI bring-up is the raw print-only view, which is preserved bit-for-bit on that path.
+
+**Two orderings are load-bearing:**
+
+- **The cursor service is fed the ROUTED event, not the raw one.** `Event::Mouse`/`MouseAbsolute` are
+  packable, so on the consumed branch `user_input_route` → `pal::cursor::track_routed` has already
+  applied the delta (CURSOR-VUG) and the event handed on is `Unknown`. Fed the raw report instead, a
+  consumed relative report would move the arrow **twice**. This is the same reason the GUI loop keys its
+  pointer arms on `ev`. (On a card with no ring-3 app focused nothing is packable-consumed and the two
+  spellings coincide — which is precisely why keying it wrong would pass every gate and fail the first
+  boot that launched a window.)
+- **The drag tick is keyed on the RAW report and runs after the match.** See below.
+
+**The drag-tick decision — it is NOT optional here.** The question was whether the debug loop also needs
+the GUI loop's `wc_route_tail`. The answer is forced by where a title-bar drag's three phases live:
+
+| Phase | Reached from |
+| --- | --- |
+| ARM | the chrome arm of `wc_click_route_at` — i.e. the routing call now added |
+| STEER | `wc_drag_motion`, reached from the drain TAIL and nowhere else |
+| END | the release arm of `wc_click_route_at` — the routing call again |
+
+Routing alone therefore buys a card that *arms* and *ends* drags perfectly while moving no window a
+single pixel: the grab looks accepted and is inert. That is the Boot 5 incident recreated one sitting
+later, so the tail ships with the routing rather than after it. It is keyed on the raw report for
+`wc_route_tail`'s own documented reason — a title-bar grab *guarantees* the consumed branch, because the
+chrome arm focuses the dragged window's owner, so keying on the routed outcome would make the drag dead
+for exactly the windows that can be dragged — and placed after the match so the cursor position
+`wc_drag_motion` reads is fresh on both branches (one tick per report either way).
+
+**Not touched:** `wc_route_event`, `wc_click_route_at` and the EHCI belt. The routing redesign at
+`4b9432bc` is aboard and unproven on metal; this change is *delivery* of the debug loop to that policy,
+not a change of policy.
+
+**Witness**, once, on the first event routed with the compositor live:
+
+```
+:: USBDBG-ROUTE: debug-loop click routing ARMED wc=active == witness ::
+```
+
+**QEMU cannot witness this** (no real HID pointer, no Kepler takeover). The gates prove non-regression —
+`check` both arches, knobs on and off; the x86-fat gate with knobs off — and the packaged `kernel.elf`
+carries the witness string, so the path is reachable and not merely compiled. **Metal falsifier:** on a
+`usbdebug` + `wc` card, one physical click on the SHARD crystal opens the menu and prints a
+`[clickroute] ... band=menu` line, and a title-bar drag moves the window.
+
 ### WEDGE-1 — P66's mechanism is UNKNOWN; this arc hardens and instruments
 
 **Verdict first: this arc did not root-cause P66.** It landed two safe-direction changes and two
