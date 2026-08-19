@@ -4447,6 +4447,12 @@ fn x86_input_service(cpu: usize) {
     serial_println!(":: SCHED-X86: input task dispatched on core {} ::", cpu);
     let mut pulse_ms = unaos_kernel::arch::ms();
     loop {
+        // WCSER-H — the overdue probe runs FIRST, before the event pump: boot 8B proved the pump
+        // can block into a wedged GUI (zero input lines within ~100ms of the hold, and the probe's
+        // 5s repeats died with it — boot 8C, which survived one repeat, is the control). A probe
+        // behind the pump dies with the wedge it exists to report.
+        #[cfg(feature = "witness")]
+        unaos_kernel::video::wm::wcser_overdue_probe();
         if SCREEN_APP_ACTIVE.load(Ordering::Relaxed) {
             // A full-screen app owns the panel and the queue. Re-base the pulse clock so the first
             // pass after it exits does not fire a stale backlog of one Timer.
@@ -4461,12 +4467,6 @@ fn x86_input_service(cpu: usize) {
                 gui_send_x86(unaos_kernel::pal::Event::Timer);
             }
         }
-        // WCSER-H — the composite-gate overdue probe rides this loop because it is the vantage
-        // boot 7 proved survives a compositor wedge: input kept servicing while render core c1
-        // spun for 440 s with every present-pumped witness dead. Two relaxed loads when the gate
-        // is free.
-        #[cfg(feature = "witness")]
-        unaos_kernel::video::wm::wcser_overdue_probe();
         unaos_kernel::arch::sched::sleep_ticks(1); // ~1 ms at the calibrated 1 kHz tick
     }
 }

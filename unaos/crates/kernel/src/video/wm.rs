@@ -3822,6 +3822,12 @@ pub fn composite() {
             COMP_PENDING.store(true, Release);
             #[cfg(feature = "witness")]
             WCSER_DECLINED.fetch_add(1, Relaxed);
+            // DROPWAKE — a decline while a drop is armed is a pass the drop waited on and did not
+            // get; the count is the trace's "the gate was busy" term.
+            #[cfg(feature = "witness")]
+            if DW_ARMED.load(Relaxed) != WIN_NONE {
+                DW_DECLINED.fetch_add(1, Relaxed);
+            }
             // `wm::erase` takes the sprite down and leaves the composite that follows to put it back.
             // That contract predates WC-I and a decline may not break it, so a declined pass still
             // discharges the sprite duty — but it DEFERS it rather than performing it.
@@ -4047,6 +4053,10 @@ fn composite_once() {
     // only place this widening changed arithmetic.
     #[cfg(feature = "witness")]
     let c2_t0 = crate::arch::now_cycles();
+    // DROPWAKE — the pass hook: refresh the pass stamp, count the pass against an armed drop, and
+    // fire the quarter-second audit if the drop has waited that long. Same clock read as `c2_t0`.
+    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    dropwake_pass_tick(c2_t0);
     let mut tail = composite_inner();
     // DOCK — the strip is the pass's LAST layer under the sprite: after every window, before the
     // cursor tail. Two lines, and both of them gated to the arch and knob the dock exists on.
@@ -7653,6 +7663,20 @@ fn comp_mark(win: u32, phase: u32) {
 #[inline]
 fn comp_mark(_win: u32, _phase: u32) {}
 
+/// WCSER-H — the row gauge beside the breadcrumb: the panel row the flush loop last emitted
+/// (or the band row the compose last painted), so a wedge inside a row loop names its row.
+/// One relaxed store per row; the loops it rides are ~10^2-10^3 iterations per band.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+static COMP_PASS_ROW: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+#[inline]
+fn comp_mark_row(y: usize) {
+    COMP_PASS_ROW.store(y, core::sync::atomic::Ordering::Relaxed);
+}
+#[cfg(not(all(target_arch = "x86_64", feature = "witness")))]
+#[inline]
+fn comp_mark_row(_y: usize) {}
+
 /// WCSER — a pass was declined and its damage is still on the table. Cleared by the holder's re-run
 /// loop; see `composite` for the lost-wakeup close.
 #[cfg(target_arch = "x86_64")]
@@ -7801,12 +7825,13 @@ pub fn wcser_overdue_probe() {
     }
     COMP_OVERDUE_LAST_MS.store(now, Relaxed);
     serial_println!(
-        ":: [wcser] PASS OVERDUE holder=c{} age_ms={} pending={} win={} phase={} == tripwire ::",
+        ":: [wcser] PASS OVERDUE holder=c{} age_ms={} pending={} win={} phase={} row={} == tripwire ::",
         holder,
         age,
         COMP_PENDING.load(core::sync::atomic::Ordering::Acquire),
         COMP_PASS_WIN.load(Relaxed),
         COMP_PASS_PHASE.load(Relaxed),
+        COMP_PASS_ROW.load(Relaxed),
     );
 }
 
@@ -11694,6 +11719,230 @@ static DRAG_BOX_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 #[cfg(feature = "witness")]
 static DRAG_FLASH_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+// ---- DROPWAKE: the ghost-drop witness ------------------------------------------------------------
+//
+// Peter reports drop-ghosting — a released window leaves a stale image behind — while boot 7/8's
+// `[dragrel]` reads CLEAN. Every existing witness measures the GESTURE; none measures the DROP: the
+// interval from the release edge to the vacated slivers' desktop fill actually reaching the glass.
+// This trace times exactly that interval, per drop, and when it blows the deadline an audit line
+// names which piece of drag state survived the release. One boot with it discriminates present-lag
+// (`[dropwake] -> LAG` with `[dropres] stale=+vacfill`) from residual drag state (`[dropwake]`
+// CLEAN beside a seen ghost, with `[dropres]` naming the survivor).
+/// DROPWAKE — the window whose drop is being timed, or [`WIN_NONE`] when no drop is in flight.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DW_ARMED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(WIN_NONE);
+/// DROPWAKE — `now_cycles` at the release ([`drag_end`]/[`drag_cancel`], after `drag_report`).
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DW_REL_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DROPWAKE — `now_cycles` when the LAST motion published its erase slivers (the damage). Zero
+/// means the gesture never moved, and the drop is not worth a line. Published LAST in
+/// [`drag_note_move`]'s stamp block so a reader that sees it nonzero sees the box it covers.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DW_DMG_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DROPWAKE — `now_cycles` when a drained fill overlapping [`DW_VAC`] was flushed to the panel.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DW_GLASS_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DROPWAKE — entry stamp of the composite pass whose drain reached the glass ([`DW_PASS_T0`] at
+/// glass time), so the trace splits "waiting for a pass" from "inside the pass".
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DW_COMP_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DROPWAKE — entry stamp of the most recent composite pass, refreshed at [`composite_once`]'s
+/// `c2_t0` read.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DW_PASS_T0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DROPWAKE — `COMP_GATE` declines observed while a drop was armed: passes that WOULD have run and
+/// were bounced to `COMP_PENDING` instead.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DW_DECLINED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DROPWAKE — composite passes that RAN while the drop was armed and still did not put the vacated
+/// slivers on the glass.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DW_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DROPWAKE — union box (`x`, `y`, `w`, `h`) of the LAST motion's erase slivers. `w == 0` means no
+/// box is held. This is what the glass hook and the audit test overlap against.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DW_VAC: [core::sync::atomic::AtomicUsize; 4] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; 4];
+/// DROPWAKE — one bounded budget shared by `[dropwake]` and `[dropres]`, so a pathological boot
+/// cannot turn the drop witness into a serial storm.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DW_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+const DW_LOG_MAX: u64 = 128;
+/// DROPWAKE — the deadline that turns a drop's `rel->glass` into a LAG verdict: two 60 Hz frames.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+const DROPWAKE_LAG_US: u64 = 33_000;
+/// DROPRES — how long an armed drop may wait for its glass before the audit fires and the trace
+/// gives up on it.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+const DROPRES_MS: u64 = 250;
+
+/// DROPWAKE — emit the finished drop's erase-latency trace and retire its state.
+///
+/// `glass_known == false` is the timeout arm: the fill never reached the glass inside
+/// [`DROPRES_MS`], so the comp/glass terms print 0 and the verdict is LAG by construction.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn dropwake_emit(win: WinId, glass_known: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    // Retire the drop FIRST, so a budget-exhausted boot still disarms cleanly.
+    DW_ARMED.store(WIN_NONE, Relaxed);
+    let rel = DW_REL_CYC.load(Relaxed);
+    let dmg = DW_DMG_CYC.swap(0, Relaxed);
+    let comp = DW_COMP_CYC.load(Relaxed);
+    let glass = DW_GLASS_CYC.load(Relaxed);
+    let declined = DW_DECLINED.swap(0, Relaxed);
+    let passes = DW_PASSES.swap(0, Relaxed);
+    if DW_LOG.fetch_add(1, Relaxed) >= DW_LOG_MAX {
+        return;
+    }
+    let us = |a: u64, b: u64| super::wcg::cycles_to_us(b.saturating_sub(a));
+    let rel_glass = if glass_known { us(rel, glass) } else { 0 };
+    // LAG on either count: the glass never came, or it came slower than two frames.
+    let lag = !glass_known || rel_glass > DROPWAKE_LAG_US;
+    serial_println!(
+        "[dropwake] win={} rel->dmg={}us dmg->comp={}us comp->glass={}us rel->glass={}us declined={} passes_waited={} -> {}",
+        win,
+        us(rel, dmg),
+        if glass_known { us(dmg, comp) } else { 0 },
+        if glass_known { us(comp, glass) } else { 0 },
+        rel_glass,
+        declined,
+        passes,
+        if lag { "LAG" } else { "CLEAN" }
+    );
+}
+
+/// DROPWAKE — arm the drop timer at a gesture's end. Called from BOTH ends ([`drag_end`] and
+/// [`drag_cancel`]) immediately after `drag_report`, for `drag_report`'s own reason: the bench's
+/// real gestures mostly end in `release-level`/`focus-key`.
+///
+/// Silent for a gesture that never moved (`DW_DMG_CYC == 0`). If the drained fill already reached
+/// the glass BEFORE the release — the queue drained mid-drag and nothing is owed — the trace is
+/// emitted CLEAN right here rather than armed, because there is nothing left to wait for.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn dropwake_arm(id: WinId) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if DW_DMG_CYC.load(Relaxed) == 0 {
+        return;
+    }
+    DW_REL_CYC.store(crate::arch::now_cycles(), Relaxed);
+    if DW_GLASS_CYC.load(Relaxed) != 0 {
+        dropwake_emit(id, true);
+        return;
+    }
+    DW_ARMED.store(id, Relaxed);
+}
+
+/// DROPWAKE — the composite-pass hook, called at [`composite_once`] entry with its own `c2_t0`.
+///
+/// Refreshes [`DW_PASS_T0`] unconditionally (one relaxed store on an idle boot); while a drop is
+/// armed it counts the pass and, past [`DROPRES_MS`], fires the [`dropres_audit`] and retires the
+/// drop as LAG — a drop that old is not going to resolve into a latency number worth waiting for.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn dropwake_pass_tick(t0: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    DW_PASS_T0.store(t0, Relaxed);
+    let id = DW_ARMED.load(Relaxed);
+    if id == WIN_NONE {
+        return;
+    }
+    DW_PASSES.fetch_add(1, Relaxed);
+    let rel = DW_REL_CYC.load(Relaxed);
+    if super::wcg::cycles_to_us(t0.saturating_sub(rel)) > DROPRES_MS * 1000 {
+        dropres_audit(id);
+        dropwake_emit(id, false);
+    }
+}
+
+/// DROPWAKE — the glass hook, called from [`drain_deferred`] at its `flush_rect` site with the box
+/// just flushed. If the box meets the vacated slivers and the glass is not yet stamped, this IS the
+/// erase reaching the panel: stamp comp+glass, and if the release has already happened, emit and
+/// disarm. (Un-armed stamping is deliberate — a queue that drains mid-drag is what lets
+/// [`dropwake_arm`] emit CLEAN at the release itself.)
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn dropwake_glass_note(x: usize, y: usize, w: usize, h: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if DW_DMG_CYC.load(Relaxed) == 0 || DW_GLASS_CYC.load(Relaxed) != 0 {
+        return;
+    }
+    let vw = DW_VAC[2].load(Relaxed);
+    if vw == 0 {
+        return;
+    }
+    let vac = (
+        DW_VAC[0].load(Relaxed),
+        DW_VAC[1].load(Relaxed),
+        vw,
+        DW_VAC[3].load(Relaxed),
+    );
+    if !boxes_overlap(vac, (x, y, w, h)) {
+        return;
+    }
+    DW_COMP_CYC.store(DW_PASS_T0.load(Relaxed), Relaxed);
+    DW_GLASS_CYC.store(crate::arch::now_cycles(), Relaxed);
+    let id = DW_ARMED.load(Relaxed);
+    if id != WIN_NONE {
+        dropwake_emit(id, true);
+    }
+}
+
+/// DROPRES — name what is still stale a quarter-second after the drop. Each term is one cheap
+/// relaxed peek at a mechanism the ghost could be hiding in; only the nonempty ones print.
+///
+/// * `vacfill` — the [`DEFER`] queue still holds a box overlapping the vacated slivers: the erase
+///   is QUEUED and no pass has drained it. Present-lag. (A `try_lock` peek, bounded at
+///   [`MAX_DEFER`] entries; a contended lock skips the term rather than waiting.)
+/// * `comppend` — [`COMP_PENDING`] is set: a decliner published a wakeup nobody has consumed.
+/// * `dragocc` — [`DO_BOX`] still carries a dragged-window box after the gesture retired it: a
+///   pass re-published drag geometry post-release, i.e. residual drag state.
+/// * `ring`/`pend` — the release edge is still in the input ring / still unrouted
+///   ([`crate::pal::release_edge_in_ring`] / [`crate::pal::release_edge_pending`]).
+/// * `sprite-vac` — the cursor sprite's live box sits on the vacated slivers: the ghost could be a
+///   sprite save-under.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn dropres_audit(win: WinId) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if DW_LOG.fetch_add(1, Relaxed) >= DW_LOG_MAX {
+        return;
+    }
+    let vac = (
+        DW_VAC[0].load(Relaxed),
+        DW_VAC[1].load(Relaxed),
+        DW_VAC[2].load(Relaxed),
+        DW_VAC[3].load(Relaxed),
+    );
+    let mut vacfill = false;
+    if vac.2 != 0 {
+        if let Some(q) = DEFER.try_lock() {
+            let (boxes, n) = &*q;
+            vacfill = boxes[..*n]
+                .iter()
+                .any(|&b| b.2 != 0 && b.3 != 0 && boxes_overlap(b, vac));
+        }
+    }
+    let comppend = COMP_PENDING.load(core::sync::atomic::Ordering::Acquire);
+    let dragocc = DO_BOX[2].load(Relaxed) != 0;
+    let ring = crate::pal::release_edge_in_ring() > 0;
+    let pend = crate::pal::release_edge_pending() > 0;
+    let sprite = vac.2 != 0
+        && super::cursor::live_box_relaxed()
+            .map(|sb| boxes_overlap(sb, vac))
+            .unwrap_or(false);
+    let none = !(vacfill || comppend || dragocc || ring || pend || sprite);
+    serial_println!(
+        "[dropres] win={} t={}ms stale={}{}{}{}{}{}{}",
+        win,
+        DROPRES_MS,
+        if vacfill { "+vacfill" } else { "" },
+        if comppend { "+comppend" } else { "" },
+        if dragocc { "+dragocc" } else { "" },
+        if ring { "+ring" } else { "" },
+        if pend { "+pend" } else { "" },
+        if sprite { "+sprite-vac" } else { "" },
+        if none { "none" } else { "" }
+    );
+}
+
 // ---- WC-K3: the OCCLUDEE witness ---------------------------------------------------------------
 //
 // **The gap this closes, stated as the reason the bleed shipped.** `[drag] … flash_px=0 -> ONCE`
@@ -12187,6 +12436,31 @@ fn drag_note_move(
     DRAG_ERASE_PX.fetch_add(px, Relaxed);
     DRAG_BOX_PX.fetch_add(old.2 as u64 * old.3 as u64, Relaxed);
     DRAG_FLASH_PX.fetch_add(flash, Relaxed);
+    // DROPWAKE — this motion's erase slivers are the box the drop will be timed against. Clear the
+    // glass stamp FIRST (the previous motion's fill no longer answers for this one), then the union,
+    // then publish `DW_DMG_CYC` LAST so a reader that sees the stamp sees the box it covers.
+    #[cfg(target_arch = "x86_64")]
+    {
+        DW_GLASS_CYC.store(0, Relaxed);
+        DW_COMP_CYC.store(0, Relaxed);
+        let mut v = (usize::MAX, usize::MAX, 0usize, 0usize); // (x0, y0, x1, y1)
+        for &p in parts.iter() {
+            if p.2 == 0 || p.3 == 0 {
+                continue;
+            }
+            v.0 = v.0.min(p.0);
+            v.1 = v.1.min(p.1);
+            v.2 = v.2.max(p.0 + p.2);
+            v.3 = v.3.max(p.1 + p.3);
+        }
+        if v.2 > v.0 && v.3 > v.1 {
+            DW_VAC[0].store(v.0, Relaxed);
+            DW_VAC[1].store(v.1, Relaxed);
+            DW_VAC[2].store(v.2 - v.0, Relaxed);
+            DW_VAC[3].store(v.3 - v.1, Relaxed);
+            DW_DMG_CYC.store(crate::arch::now_cycles(), Relaxed);
+        }
+    }
 }
 
 /// DRAGFLICK — emit the finished drag's paint budget and clear the counters for the next gesture.
@@ -12407,6 +12681,14 @@ pub fn drag_begin(id: WinId, x: i32, y: i32) -> bool {
         DRAG_ERASE_PX.store(0, Ordering::Relaxed);
         DRAG_BOX_PX.store(0, Ordering::Relaxed);
         DRAG_FLASH_PX.store(0, Ordering::Relaxed);
+        // DROPWAKE — a superseding begin invalidates the previous drop's trace: whatever it was
+        // waiting for now belongs to a gesture that no longer describes the panel.
+        #[cfg(target_arch = "x86_64")]
+        {
+            DW_ARMED.store(WIN_NONE, Ordering::Relaxed);
+            DW_DMG_CYC.store(0, Ordering::Relaxed);
+            DW_VAC[2].store(0, Ordering::Relaxed);
+        }
     }
     DRAG_OWNER.store(owner, Ordering::Release);
     // Published LAST: `DRAG_WIN` is the flag every other entry point tests, so it must not become
@@ -12506,6 +12788,10 @@ pub fn drag_end() -> WinId {
         // DRAGFLICK — the gesture's paint budget, on its own line and on its own budget.
         #[cfg(feature = "witness")]
         drag_report(id, owner, "placed", n);
+        // DROPWAKE — start the drop clock, after the gesture report so the pair reads
+        // budget-then-drop in a capture.
+        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+        dropwake_arm(id);
     }
     id
 }
@@ -12530,6 +12816,10 @@ pub fn drag_cancel(why: &str) {
         // too. Emitted before the `[wm-act]` line so the pair reads cost-then-reason in a capture.
         #[cfg(feature = "witness")]
         drag_report(id, owner, why, n);
+        // DROPWAKE — a cancelled drop ghosts exactly like a placed one, and most of the bench's
+        // real releases end here, so the drop clock starts on this arm too.
+        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+        dropwake_arm(id);
         #[cfg(not(feature = "witness"))]
         let _ = n;
         wm_act(
@@ -13791,6 +14081,11 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
         if y1 > y0 {
             // COMPOSITE-2 — the fill's own columns, not full-width scanlines (see `draw_window`).
             fb.flush_rect(x, y0, w, y1 - y0);
+            // DROPWAKE — the glass stamp: this flush is the moment a drained fill becomes panel
+            // pixels, so if it covers the drop's vacated slivers the drop is resolved here.
+            // `drain_deferred` is arch-neutral, so the hook carries the full witness+x86 gate.
+            #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+            dropwake_glass_note(x, y0, w, y1 - y0);
         }
         damage_intersecting(x, y, w, h);
         // WC-K2r REVIEW CONDITION 6 — THE SPRITE'S NET, restored where it can be exact.
@@ -14337,6 +14632,11 @@ fn draw_window(
             (y0, y1)
         }
     };
+    // WCSER-H — sub-phase 30: entering the staged path. Boot 8's wedge read phase=3 (inside
+    // draw_window, window 7) and no finer; these stamps split phase 3 so the next tripwire
+    // line names the loop: 30 stage entry, 31 band compose, 32 sprite offer, 33 span flush
+    // (row= carries the panel row), 34 direct fallback, 35 cursor uncover tail.
+    comp_mark(r.id, 30);
     let staged = stage_window(
         fb,
         r,
@@ -14364,6 +14664,7 @@ fn draw_window(
         if dragocc_target(r).is_some() {
             DO_DIRECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
+        comp_mark(r.id, 34);
         paint_window(fb, r, 0, 0, bx, by, bw, bh, pw, ph, focused, false);
     }
     // CURSOR-4 — this window has just painted its clipped outer box. If it did NOT compose the
@@ -14372,6 +14673,7 @@ fn draw_window(
     // LOWER window may have claimed for those pixels is stale — its layer save describes content
     // these pixels no longer hold. Clearing here, in back-to-front draw order, makes the topmost
     // painter of each pixel the one whose verdict the tail acts on.
+    comp_mark(r.id, 35);
     if let (Some(p), false) = (cur, overlaid) {
         // CURSOR-6 — a clear that could not be applied is not a shrug. `overlay_uncover` now reports
         // it, and the session is marked untrustworthy so the tail takes the whole-sprite refresh
@@ -14980,6 +15282,11 @@ fn paint_window(
     let swap = matches!(dinfo.pixel_format, unaos_boot_info::PixelFormat::Rgb);
     let surf = r.surf as *const u8;
     for row in 0..rows {
+        // WCSER-H — row gauge on the DIRECT path only (`!dup` = painting the panel, not a RAM
+        // layer): a phase=34 wedge otherwise leaves `row=` stale from the last staged window.
+        if !dup {
+            comp_mark_row(row);
+        }
         // WC-M — where this source row's `scale` destination lines start, in the DESTINATION's own
         // coordinates. Negative means the row begins above `dst`'s row 0, which only a chunked
         // stage's second-or-later band can produce.
@@ -15358,6 +15665,8 @@ fn stage_window(
         // with no panel margin — which is what makes each row a single contiguous run. WC-M: its
         // HEIGHT is the band's, and its length the band's bytes, so every clip `put_pixel` and `blit`
         // already performed now also fences the compose to the rows this buffer holds.
+        comp_mark(r.id, 31);
+        comp_mark_row(band);
         let mut layer = super::FrameBuffer::new();
         layer.init(
             stage.as_mut_ptr() as usize,
@@ -15399,6 +15708,7 @@ fn stage_window(
             let whole = chunk_rows >= span
                 || (plan.by >= by + band && plan.by + plan.bh <= by + band + rows);
             if whole {
+                comp_mark(r.id, 32);
                 let c = super::cursor::compose_into(&layer, bx, by + band, plan);
                 *overlaid |= c.taken > 0;
                 #[cfg(feature = "witness")]
@@ -15420,9 +15730,11 @@ fn stage_window(
         // tear-free contract is unchanged — a span is as atomic as a row was. What changes is only
         // which bytes are published, and the bytes withheld are bytes the pass is about to overwrite
         // from the window that owns them.
+        comp_mark(r.id, 33);
         for y in 0..rows {
             let src = y * row_bytes;
             let py = by + band + y;
+            comp_mark_row(py);
             if clip.n == 0 {
                 fb.blit(py * fb_row + bx * bpp, &stage[src..src + row_bytes]);
                 #[cfg(all(feature = "witness", target_arch = "x86_64"))]
