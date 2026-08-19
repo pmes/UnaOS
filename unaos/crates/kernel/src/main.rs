@@ -4461,6 +4461,12 @@ fn x86_input_service(cpu: usize) {
                 gui_send_x86(unaos_kernel::pal::Event::Timer);
             }
         }
+        // WCSER-H — the composite-gate overdue probe rides this loop because it is the vantage
+        // boot 7 proved survives a compositor wedge: input kept servicing while render core c1
+        // spun for 440 s with every present-pumped witness dead. Two relaxed loads when the gate
+        // is free.
+        #[cfg(feature = "witness")]
+        unaos_kernel::video::wm::wcser_overdue_probe();
         unaos_kernel::arch::sched::sleep_ticks(1); // ~1 ms at the calibrated 1 kHz tick
     }
 }

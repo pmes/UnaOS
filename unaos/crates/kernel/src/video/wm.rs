@@ -3782,6 +3782,11 @@ pub fn composite() {
         }
         #[cfg(feature = "witness")]
         WCSER_ENTERED.fetch_add(1, Relaxed);
+        // WCSER-H — stamp the holder BEFORE the pass, t0 first so a set core never carries a stale
+        // age. Two relaxed stores on the acquire path; the probe that reads them runs on the input
+        // service's clock, not here.
+        COMP_HOLD_T0_MS.store(crate::arch::ms(), Relaxed);
+        COMP_HOLDER_CORE.store(crate::arch::sched::meter_current_cpu(), Relaxed);
         composite_once();
         // Service what was declined while we held the gate. Each round is a FULL pass — its own
         // snapshot, its own upward closure, its own back-to-front order and its own cursor tail — so
@@ -3855,6 +3860,11 @@ pub fn composite() {
             WCSER_RERUNS.fetch_add(1, Relaxed);
             composite_once();
         }
+        // WCSER-H — this held epoch ends: clear the holder and re-arm the tripwire latch before
+        // the release publishes the gate.
+        COMP_HOLDER_CORE.store(usize::MAX, Relaxed);
+        #[cfg(feature = "witness")]
+        COMP_OVERDUE_REPORTED.store(false, Relaxed);
         COMP_GATE.store(false, Release);
         // THE LOST WAKEUP, closed. A decliner that publishes `COMP_PENDING` after our last `swap`
         // and before the release above would otherwise leave its damage on the table with no core
@@ -3870,6 +3880,9 @@ pub fn composite() {
                 .compare_exchange(false, true, AcqRel, Relaxed)
                 .is_ok()
         {
+            // WCSER-H — the re-acquire winner is a holder like any other: stamp it, t0 first.
+            COMP_HOLD_T0_MS.store(crate::arch::ms(), Relaxed);
+            COMP_HOLDER_CORE.store(crate::arch::sched::meter_current_cpu(), Relaxed);
             if COMP_PENDING.swap(false, AcqRel) {
                 let dmg = any_damaged();
                 let owed = deferred_owed();
@@ -3896,6 +3909,10 @@ pub fn composite() {
                     composite_once();
                 }
             }
+            // WCSER-H — same epoch-end discipline as the main release.
+            COMP_HOLDER_CORE.store(usize::MAX, Relaxed);
+            #[cfg(feature = "witness")]
+            COMP_OVERDUE_REPORTED.store(false, Relaxed);
             COMP_GATE.store(false, Release);
         }
     }
@@ -7408,6 +7425,29 @@ static SIDEBYSIDE_WITNESSED: core::sync::atomic::AtomicBool =
 #[cfg(target_arch = "x86_64")]
 static COMP_GATE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// WCSER-H — who holds [`COMP_GATE`] and since when. `usize::MAX` = free. Written only by the
+/// acquire-CAS winner (t0 first, then core, so a set core always has a current t0) and cleared
+/// before each release store. Gauges — loaded, never drained: a wedged holder leaves them
+/// standing, which is the whole point (boot 7 held the gate for 440+ s and no drained counter
+/// could have named it).
+#[cfg(target_arch = "x86_64")]
+static COMP_HOLDER_CORE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+#[cfg(target_arch = "x86_64")]
+static COMP_HOLD_T0_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// WCSER-H — once-per-held-epoch latch for the overdue tripwire, re-armed at release so the NEXT
+/// wedge also names itself; paired pacer for the standing 5 s repeat while a pass stays held.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+static COMP_OVERDUE_REPORTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+static COMP_OVERDUE_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// WCSER-H — the overdue bound. `[comp2]` has priced a legitimate masked-reopen pass at ~302 ms,
+/// so the tripwire sits at 1 s: 3x the worst honest pass on record, two decades under boot 7's
+/// 440 s wedge.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+const COMP_PASS_OVERDUE_MS: u64 = 1_000;
+
 /// WCSER — a pass was declined and its damage is still on the table. Cleared by the holder's re-run
 /// loop; see `composite` for the lost-wakeup close.
 #[cfg(target_arch = "x86_64")]
@@ -7495,13 +7535,23 @@ fn wcser_emit(scope: &str, span: u64) {
     let total = entered.saturating_add(declined);
     // Tenths of a percent would be noise; whole percent of passes that had to be excluded.
     let pct = declined.saturating_mul(100) / total.max(1);
+    // WCSER-H — the holder columns. `holder=-1` reads "free"; a held gate names its core and the
+    // age of the pass it is running, so a WEDGED verdict carries its culprit on the same line.
+    let holder = COMP_HOLDER_CORE.load(Relaxed);
+    let held_ms = if holder == usize::MAX {
+        0
+    } else {
+        crate::arch::ms().saturating_sub(COMP_HOLD_T0_MS.load(Relaxed))
+    };
     serial_println!(
-        "[wcser] scope={} entered={} declined={} reruns={} declined_pct={} span={}ms -> {}",
+        "[wcser] scope={} entered={} declined={} reruns={} declined_pct={} holder={} held_ms={} span={}ms -> {}",
         scope,
         entered,
         declined,
         reruns,
         pct,
+        holder as isize,
+        held_ms,
         span,
         // WEDGED is tested first and outranks SERIAL: a period in which every pass was declined and
         // none was ever entered is a permanently-held gate, not successful serialisation.
@@ -7512,6 +7562,43 @@ fn wcser_emit(scope: &str, span: u64) {
         } else {
             "SOLO"
         }
+    );
+}
+
+/// WCSER-H — the overdue-pass probe, called from `x86_input_service`'s ~1 kHz loop: a core the
+/// compositor never runs on, and one boot 7 proved survives the wedge (trackpad witnesses kept
+/// printing at t=150s while c1 spun). Deliberately NOT pumped by `wcn_tick` — that pump is the
+/// presenting tasks, and a wedge with no surviving presenters silences it, which is exactly the
+/// blindness this probe exists to close. One loud `== tripwire ::` line at the crossing, then one
+/// standing line per 5 s while the pass is still held, so the wedge stays on the wire after every
+/// other witness has died. `serial_println` is safe from here: `_print` try-locks and defers to
+/// the ring, never blocks.
+///
+/// Known residual blindness, recorded rather than argued away: `arch::ms()` advances only on the
+/// BSP, so a wedge OF the BSP freezes `age` — the probe still prints if the bound was crossed
+/// before the freeze, and a BSP wedge is otherwise a follow-up brief, not this arc's.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+pub fn wcser_overdue_probe() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let holder = COMP_HOLDER_CORE.load(Relaxed);
+    if holder == usize::MAX {
+        return; // gate free — the overwhelmingly common read: two relaxed loads total
+    }
+    let now = crate::arch::ms();
+    let age = now.saturating_sub(COMP_HOLD_T0_MS.load(Relaxed));
+    if age < COMP_PASS_OVERDUE_MS {
+        return;
+    }
+    let first = !COMP_OVERDUE_REPORTED.swap(true, Relaxed);
+    if !first && now.saturating_sub(COMP_OVERDUE_LAST_MS.load(Relaxed)) < 5_000 {
+        return; // standing repeat, paced to the rollup cadence
+    }
+    COMP_OVERDUE_LAST_MS.store(now, Relaxed);
+    serial_println!(
+        ":: [wcser] PASS OVERDUE holder=c{} age_ms={} pending={} == tripwire ::",
+        holder,
+        age,
+        COMP_PENDING.load(core::sync::atomic::Ordering::Acquire),
     );
 }
 
