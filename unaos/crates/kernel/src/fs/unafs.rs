@@ -18,7 +18,7 @@
 //!
 //! Wires the kernel's 512 B block layer ([`crate::drivers::block`]) into the
 //! `unafs` crate's K2 seam: [`SdSectorDevice`] implements
-//! [`unafs::adapter::SectorDevice`] over `read_block`/`write_block`,
+//! [`unafs::adapter::SectorDevice`] over the block layer,
 //! `locate_unafs` finds the UnaFS partition by superblock magic, and [`mount`]
 //! returns a live `UnaFS<BlockAdapter<SdSectorDevice>>`. Arch-neutral like
 //! `fs::fat` — it builds on the generic block layer only — though today only
@@ -47,6 +47,17 @@
 //! the old committed tree or the new one, never a hybrid. The WAL is gone —
 //! there is no dirty-mount state. See `docs/SECURITY.md` §K4 (ledger entry
 //! RETIRED-PENDING-METAL by K8a) and the `K8a-cow` witness below.
+//!
+//! **SDSEAM — the device names its disk.** [`SdSectorDevice`] carries the
+//! [`crate::drivers::block::BlockHandle`] it was opened on, and its reads, its
+//! writes and its `sector_count` all dispatch on that one value; [`locate_on`]
+//! and [`mount_on`] are the handle-named forms of [`locate`] / [`mount`], which
+//! are now thin `BlockHandle::Global` wrappers. Before this, reads went to the
+//! ambient backend and the size came from the ambient registry slot — two
+//! independent answers to "which disk is this", and PI-FS-2 was the boot where
+//! they disagreed. Every pi path still opens `Global`, whose arms are the
+//! identical calls, so pi behaviour is unchanged; what changed is that a mount
+//! can no longer be assembled from two devices.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -64,17 +75,119 @@ use ::unafs::adapter::{
 use ::unafs::fs::FileSystemError;
 use ::unafs::UnaFS;
 
-/// The kernel block layer as a 512 B [`SectorDevice`].
+/// The kernel block layer as a 512 B [`SectorDevice`], bound to ONE named block handle.
 ///
-/// Constructed by [`SdSectorDevice::open`] only when a block device is
-/// registered and its logical block size is exactly 512 B, so `read_sector`'s
-/// LBA space is the device's native one with no scaling.
+/// Constructed by [`SdSectorDevice::open_on`] only when the named handle holds a registered device
+/// whose logical block size is exactly 512 B, so `read_sector`'s LBA space is that device's native
+/// one with no scaling.
+///
+/// ### SDSEAM: the handle is carried, not assumed
+/// Before this arc the struct held only `sectors`, its reads went to the ambient
+/// [`block::read_block`], and its SIZE came from the ambient [`block::info`] (plus the PI-FS-2
+/// emmc2 override). That is two independent guesses at "which disk is this", and the PI-FS-2 bug
+/// was exactly the moment they disagreed: the global registry slot had been clobbered by a USB
+/// mass-storage enumeration while `read_block` still routed to the microSD, so the SIZE GUARD and
+/// the DATA PATH named different devices and the SD's own partition was rejected as out of bounds.
+///
+/// PI-FS-2 fixed that by pinning the size to the card. This arc fixes the CLASS: the device carries
+/// the [`block::BlockHandle`] it was opened on, and reads, writes AND sizing all dispatch on that
+/// one value. There is no longer any way for the three to name different disks, because there is
+/// only one name.
+///
+/// The dispatch below is EXHAUSTIVE — no wildcard arm anywhere. `BlockHandle` is
+/// total-by-construction in the block layer, so a handle added there is a compile error here (E0004)
+/// rather than a silent mis-route into whatever the ambient backend happened to be. That forcing
+/// function is the whole point: it is what makes a future handle correct at this seam BY
+/// CONSTRUCTION instead of by someone remembering.
+///
+/// **Tegra note (`orin-unafs-root.md` §3 item 4).** The reason the tegra sizing arm was skipped
+/// during TEGRASD is that on a tegra build the ambient `read_block` reaches the USB stick, so sizing
+/// from `tegra_sd_info()` would have guarded STICK reads with the CARD's capacity — the inverse of
+/// PI-FS-2. With the handle carried, that premise is gone: a device opened on
+/// `BlockHandle::TegraSd` reads the card AND is sized from the card; one opened on
+/// `BlockHandle::Global` reads the stick AND is sized from the stick. Neither can be built wrong.
+/// See [`handle_info`] / [`handle_read`] / [`handle_write`] for the arm each handle contributes.
 pub struct SdSectorDevice {
+    /// Which registry handle this device reads, writes and is sized from — the single name.
+    handle: block::BlockHandle,
     sectors: u64,
 }
 
+/// SDSEAM: the live geometry row for `handle`.
+///
+/// Exhaustive on purpose (see [`SdSectorDevice`]): every handle the block layer defines contributes
+/// exactly one arm, and the arm names the same registry slot its read/write arms below route to.
+///
+/// ### MERGE NOTE — the `TegraSd` arms this seam is waiting for
+/// `BlockHandle::TegraSd` and its entry points (`tegra_sd_info`, `read_block_tegra_sd`,
+/// `write_block_tegra_sd`) land in `drivers/block.rs` with the orin track's TEGRASD commit; they do
+/// not exist on this branch, and `drivers/block.rs` is not this arc's lane, so the arms cannot be
+/// written here yet. They are not guesswork either — the totality of these matches makes the merge
+/// report each missing arm as an E0004, and each one is a single line under the TEGRASD cfg triple
+/// `#[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]`:
+///
+/// * [`handle_info`] — `BlockHandle::TegraSd => block::tegra_sd_info(),`
+/// * [`handle_read`] — `BlockHandle::TegraSd => block::read_block_tegra_sd(lba, buf),`
+/// * [`handle_write`] — `BlockHandle::TegraSd => block::write_block_tegra_sd(lba, buf),`
+///   (which refuses in every cfg — the card is read-only outside `sdmmc_arm`, so a unafs write
+///   attempt on it fails closed rather than reaching the medium)
+/// * [`SdSectorDevice::open_on`] — `BlockHandle::TegraSd => dev.num_blocks,` (a dedicated slot;
+///   no PI-FS-2 override, for the reason given there)
+///
+/// With those four lines the tegra sizing arm skipped during TEGRASD is correct BY CONSTRUCTION:
+/// `dev` came from `tegra_sd_info()` and the reads it guards go to `read_block_tegra_sd`, so the
+/// capacity and the bytes are the same card. That is precisely the property the ambient path could
+/// not offer, and the reason the arm was right to be skipped until this seam existed.
+fn handle_info(handle: block::BlockHandle) -> Option<block::BlockDeviceInfo> {
+    match handle {
+        block::BlockHandle::Global => block::info(),
+        block::BlockHandle::Usb => block::usb_info(),
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        block::BlockHandle::Sdhc => block::sdhc_info(),
+    }
+}
+
+/// SDSEAM: one absolute 512 B sector read, routed by handle.
+///
+/// `Global` keeps calling [`block::read_block`] — the ambient backend dispatcher — because that IS
+/// what the global handle means: on the bare-metal Pi it routes to emmc2 for as long as the SD
+/// backend is active, which is the behaviour every pi path depends on and which this arc preserves
+/// unchanged. The other arms bypass the backend selector exactly as their block-layer twins do.
+fn handle_read(
+    handle: block::BlockHandle,
+    lba: u64,
+    buf: &mut [u8],
+) -> Result<usize, BlockError> {
+    match handle {
+        block::BlockHandle::Global => block::read_block(lba, buf),
+        block::BlockHandle::Usb => block::read_block_usb(lba, buf),
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        block::BlockHandle::Sdhc => block::read_block_sdhc(lba, buf),
+    }
+}
+
+/// SDSEAM: one absolute 512 B sector write, routed by handle. The twin of [`handle_read`], and it
+/// must stay the twin: a read arm and a write arm that reached different devices would be the
+/// PI-FS-2 class again, one layer down.
+fn handle_write(handle: block::BlockHandle, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    match handle {
+        block::BlockHandle::Global => block::write_block(lba, buf),
+        block::BlockHandle::Usb => block::write_block_usb(lba, buf),
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        block::BlockHandle::Sdhc => block::write_block_sdhc(lba, buf),
+    }
+}
+
 impl SdSectorDevice {
-    /// Open the registered block device, if its geometry fits the seam.
+    /// Open the GLOBAL block handle — the historical behaviour of this constructor, and what every
+    /// in-tree caller means: on the Pi the global slot is the microSD once `register_sd` has run,
+    /// and on x86 it is the boot stick. Kept as a named wrapper so the pi paths read exactly as
+    /// before and the handle they mean is written down rather than inferred.
+    pub fn open() -> Result<Self, MountError> {
+        Self::open_on(block::BlockHandle::Global)
+    }
+
+    /// SDSEAM: open a specific block handle, if its geometry fits the seam.
     ///
     /// PI-FS-2: on the bare-metal Pi the native unafs store is the microSD (emmc2), and
     /// [`block::read_block`] routes SD reads to the emmc2 backend for as long as the SD backend is
@@ -85,18 +198,46 @@ impl SdSectorDevice {
     /// partition (LBA 63, extent 109439 > 29120) as `Part(OutOfBounds(63))`, even though the reads
     /// themselves would have come off the SD. Bind the sector count to the SD card itself whenever the
     /// SD supplies the bytes, so the size guard and the data path name the same device.
-    pub fn open() -> Result<Self, MountError> {
-        let dev = block::info().ok_or(MountError::NoStorage)?;
+    ///
+    /// That override belongs to the GLOBAL handle specifically — it exists because the global slot's
+    /// row can be clobbered while the global READ path still reaches the card. A handle with its own
+    /// dedicated registry slot (`Usb`, `Sdhc`, and the tegra card when it arrives) cannot be
+    /// clobbered by another device's enumeration, so its own row is already the right answer and it
+    /// takes no override.
+    pub fn open_on(handle: block::BlockHandle) -> Result<Self, MountError> {
+        let dev = handle_info(handle).ok_or(MountError::NoStorage)?;
         if dev.block_size != 512 {
             return Err(MountError::BadSectorSize(dev.block_size));
         }
-        // Prefer the SD card's own block count when the SD backend is live (emmc2 answers the reads);
-        // the global `dev.num_blocks` may have been clobbered by a USB mass-storage enumeration.
-        #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
-        let sectors = crate::drivers::emmc2::card_num_blocks().unwrap_or(dev.num_blocks);
-        #[cfg(not(all(target_arch = "aarch64", feature = "baremetal")))]
-        let sectors = dev.num_blocks;
-        Ok(Self { sectors })
+        let sectors = match handle {
+            // Prefer the SD card's own block count when the SD backend is live (emmc2 answers the
+            // reads); the global `dev.num_blocks` may have been clobbered by a USB mass-storage
+            // enumeration. Byte-for-byte the pre-SDSEAM computation, now scoped to the one handle
+            // whose read path it describes.
+            block::BlockHandle::Global => {
+                #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+                {
+                    crate::drivers::emmc2::card_num_blocks().unwrap_or(dev.num_blocks)
+                }
+                #[cfg(not(all(target_arch = "aarch64", feature = "baremetal")))]
+                {
+                    dev.num_blocks
+                }
+            }
+            // A dedicated slot is sized from itself: `handle_info` read the same row that
+            // `handle_read`/`handle_write` will address, so guard and data path agree by
+            // construction with no override to get right.
+            block::BlockHandle::Usb => dev.num_blocks,
+            #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+            block::BlockHandle::Sdhc => dev.num_blocks,
+        };
+        Ok(Self { handle, sectors })
+    }
+
+    /// The handle this device reads, writes and was sized from. Exposed so a caller that built a
+    /// device can label its witnesses with the disk it actually names, rather than re-deciding.
+    pub fn handle(&self) -> block::BlockHandle {
+        self.handle
     }
 }
 
@@ -108,7 +249,7 @@ impl SectorDevice for SdSectorDevice {
                 buf.len()
             )));
         }
-        match block::read_block(lba, buf) {
+        match handle_read(self.handle, lba, buf) {
             Ok(512) => Ok(()),
             Ok(n) => Err(SectorError::Io(format!("short sector read: {n} bytes"))),
             Err(BlockError::BadLba) => Err(SectorError::OutOfBounds(lba)),
@@ -133,7 +274,7 @@ impl SectorDevice for SdSectorDevice {
                 buf.len()
             )));
         }
-        match block::write_block(lba, buf) {
+        match handle_write(self.handle, lba, buf) {
             Ok(()) => Ok(()),
             Err(BlockError::BadLba) => Err(SectorError::OutOfBounds(lba)),
             Err(e) => {
@@ -203,9 +344,18 @@ fn install_warn_hook() {
     }
 }
 
-/// Locate the UnaFS partition on the registered block device.
+/// Locate the UnaFS partition on the GLOBAL block handle — the volume this kernel mounts.
 pub fn locate() -> Result<PartitionSpan, MountError> {
-    let mut dev = SdSectorDevice::open()?;
+    locate_on(block::BlockHandle::Global)
+}
+
+/// SDSEAM: locate a UnaFS partition on a NAMED block handle.
+///
+/// The scan runs through the device's own routed reads, so the partition table read, the superblock
+/// probe and the bound the span is checked against all come off the same disk. That is the property
+/// [`locate`] used to get only by luck of the ambient backend agreeing with the ambient registry.
+pub fn locate_on(handle: block::BlockHandle) -> Result<PartitionSpan, MountError> {
+    let mut dev = SdSectorDevice::open_on(handle)?;
     locate_unafs(&mut dev)
         .map_err(MountError::Part)?
         .ok_or(MountError::NoVolume)
@@ -218,10 +368,17 @@ pub fn locate() -> Result<PartitionSpan, MountError> {
 /// [`with_unafs`] and [`force_remount`] build on; direct callers must ensure
 /// no other mount is live.
 pub fn mount() -> Result<KernelUnaFS, MountError> {
+    mount_on(block::BlockHandle::Global)
+}
+
+/// SDSEAM: the handle-named form of [`mount`]. Locate and mount on ONE disk end to end — the
+/// partition scan, the span witness and the live adapter every subsequent read/write flows through
+/// are all built on the same handle, so a mount can no longer be assembled from two disks.
+pub fn mount_on(handle: block::BlockHandle) -> Result<KernelUnaFS, MountError> {
     install_warn_hook();
-    let span = locate()?;
-    partition_witness(&span);
-    let dev = SdSectorDevice::open()?;
+    let span = locate_on(handle)?;
+    partition_witness(handle, &span);
+    let dev = SdSectorDevice::open_on(handle)?;
     let adapter = BlockAdapter::for_partition(dev, &span);
     UnaFS::mount(adapter).map_err(MountError::Fs)
 }
@@ -248,24 +405,28 @@ pub fn mount() -> Result<KernelUnaFS, MountError> {
 /// `slot=2 ... magic=ok fits=yes`, from the very first mount, and nothing about an idle system can
 /// change any field on it — every value is a property of the medium, read at a moment when the
 /// volume has just been located and is therefore defined.
-fn partition_witness(span: &PartitionSpan) {
+fn partition_witness(handle: block::BlockHandle, span: &PartitionSpan) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
         return;
     }
-    let Some(dev) = block::info() else {
+    // SDSEAM: the witness reads the disk the mount named, not the ambient one. On the Global handle
+    // this is the identical call it made before (`block::info` / `block::read_block`), so the pi
+    // line is unchanged; on any other handle it now describes the volume that was actually mounted
+    // instead of silently describing the global slot's disk.
+    let Some(dev) = handle_info(handle) else {
         serial_println!(":: PART: unafs span check — no block device ::");
         return;
     };
     let mut sec = [0u8; 512];
-    if block::read_block(0, &mut sec).is_err() {
+    if handle_read(handle, 0, &mut sec).is_err() {
         serial_println!(":: PART: unafs span check — LBA 0 unreadable ::");
         return;
     }
     // The census may already have printed for this handle (the FAT mount runs first on most boots);
     // calling it again is harmless and guarantees the raw bytes are in the log even on a boot where
     // no FAT volume was ever mounted.
-    let Some(table) = block::mbr_census(block::BlockHandle::Global, &sec, dev.num_blocks) else {
+    let Some(table) = block::mbr_census(handle, &sec, dev.num_blocks) else {
         serial_println!(
             ":: PART: unafs span check — no MBR at LBA 0; unafs span base={} blocks={} ::",
             span.base_lba, span.block_count
@@ -291,7 +452,7 @@ fn partition_witness(span: &PartitionSpan) {
         .unwrap_or(false);
 
     // Re-read the superblock magic through the BOUNDED, partition-relative path.
-    let range = block::PartitionRange::new(block::BlockHandle::Global, &p);
+    let range = block::PartitionRange::new(handle, &p);
     let mut b0 = [0u8; 512];
     let magic_ok = range.read_block(0, &mut b0).is_ok()
         && b0[..::unafs::superblock::MAGIC.len()] == ::unafs::superblock::MAGIC;

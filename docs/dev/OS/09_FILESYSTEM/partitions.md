@@ -120,6 +120,31 @@ enumerating a superset of the mount's candidates keeps the error in the safe dir
 refusals, never fewer). The mount path's extra rules exist to decide which volume to *trust*, which
 is a different question.
 
+### SDSEAM: a bound only holds if it names the same disk the bytes come from
+
+Both bounds above are *per-device* numbers, so each is only as good as the answer to "which device
+is this". `fs/unafs.rs`'s `SdSectorDevice` used to answer that question twice, independently: its
+reads went to the ambient backend dispatcher (`block::read_block`) while its `sector_count` came
+from the ambient global registry row (`block::info`). PI-FS-2 is the boot where the two answers
+diverged — a USB mass-storage enumeration overwrote the global row with the stick's geometry while
+`read_block` still routed to the microSD, so the SD's own partition (LBA 63, extent 109439) was
+refused as out of bounds against the stick's 29120 blocks. That fix pinned the size to the card;
+this one removes the second answer.
+
+`SdSectorDevice` carries a `block::BlockHandle` and dispatches reads, writes **and** sizing on that
+one value. `locate_on` / `mount_on` are the handle-named constructors; `locate` / `mount` are
+`BlockHandle::Global` wrappers, so every Pi path opens the same handle through the same calls it
+always made and its behaviour is unchanged. `partition_witness` follows the mount's handle too, so
+the census and the bounded magic re-read describe the volume that was actually mounted rather than
+whatever occupies the global slot.
+
+The three dispatches are **exhaustive — no wildcard arm**. `BlockHandle` is total by construction in
+the block layer, so a handle added there is an `E0004` at this seam rather than a silent mis-route
+into the ambient backend. That is why the tegra card's sizing arm, deliberately skipped during
+TEGRASD (on tegra the ambient path reaches the USB stick, so `tegra_sd_info()` would have guarded
+stick reads with the card's capacity — PI-FS-2 inverted), is correct the moment it is written: the
+arm that supplies the capacity and the arm that supplies the bytes are picked by the same value.
+
 ## 4. Witnesses a metal boot prints
 
 Raw first, conclusion second — the same discipline the block layer's `io-cause` witness follows.
@@ -175,6 +200,8 @@ but can never change what gets mounted. aarch64 only, because `fs::unafs` is.
 * `unaos/crates/kernel/src/fs/fat.rs` — partition-bounded mount (`parse_bpb`'s container gate,
   `mount_source`'s slot walk, `gpt_volume_spans`), the extent gate (`in_extent` and the four
   `rd_*`/`wr_*` wrappers), `FatError::OutOfVolume`.
-* `unaos/crates/kernel/src/fs/unafs.rs` — `partition_witness`, the two-reader cross-check.
+* `unaos/crates/kernel/src/fs/unafs.rs` — `partition_witness`, the two-reader cross-check; and
+  (SDSEAM) `SdSectorDevice`'s carried `BlockHandle` with the `handle_info` / `handle_read` /
+  `handle_write` dispatches, plus `locate_on` / `mount_on`.
 * `unaos/libs/fs/unafs/src/adapter.rs` — the pre-existing (BeFS-K2) GPT/MBR parser and
   `BlockAdapter`, unchanged.
