@@ -499,6 +499,12 @@ const U11REAP_NAME: &str = "DEFER2.BIN";
 /// U11-M2b (reap) demo: the 16-byte pattern A writes into DEFER2.BIN — A reads it back AFTER B unlinks to prove
 /// the chain is still alive. Match the `.ascii` bytes in the blob.
 const U11REAP_PATTERN: [u8; 16] = *b"U11-REAP-OK-7777";
+/// REAPFIX: how far CHECKPOINT-3's head-anchored re-allocatability scan walks the allocator's FAT copy upward
+/// from the reaped chain head before giving up. The answer is the head ITSELF the moment the reap lands, so the
+/// healthy case reads ONE entry; a scan that walks at all has already witnessed a head that is still allocated
+/// (or a hole punched above it), which is the red verdict. Kept small so a red pass costs a bounded handful of
+/// FAT-sector reads inside the bounded poll rather than a volume-length walk per iteration.
+const U11REAP_REUSE_SCAN: u32 = 64;
 
 // --- The inline EL0 FIXTURES: three fault-SHAPE fixtures (M6b) + one preemption spinner (M6e). These
 // are fixtures, not programs, so they stay inline in the kernel image; only the well-behaved `hello`
@@ -5071,6 +5077,39 @@ fn openfile_mark_pending_or_none_by_dir(dir_lba: u64, dir_off: u32, first_cluste
 fn free_orphan_chain(first_cluster: u32) -> bool {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
+        // REAPFIX (2026-08-18, metal capture `pi4-pi1-b1`): `mount()` is the FIRST block read of the whole
+        // operation, so it is the MOST likely place for a transient device loan to bite — and until this arm
+        // existed it was the one place a loan was mourned as permanent. `mount_source` propagates
+        // `BlockError::Busy` as `FatError::Busy` straight out of its LBA-0 `read_sector`, which is exactly the
+        // "the storage device was momentarily loaned to another context" condition WEDGE-10 (F2) taught the
+        // `free_chain` arm below to REQUEUE rather than orphan. The mount arm never learned it, so a reap that
+        // raced the USB/BOT mass-storage bring-up dropped the head on the floor: the head was popped, the mount
+        // refused, the chain was logged as leaked and NEVER retried — the chain stayed allocated for the rest of
+        // the boot. That is the U11-reap `c3(freed=false)` flake, convicted on the bench capture:
+        //   boot 1: `U11-defer: deferred free of chain @cluster 29473 — mount failed, orphaned (leak)`
+        //           then `U11-reap: ... FAIL — head=29473 ... c3(freed=false,...)`
+        //   boot 8: same shape at cluster 29743, immediately after a `BOT: pump ... used=24841443` loan
+        //   boot 7 (PASS): no mount refusal — `U11-defer: reaper freed teardown-orphaned chain @cluster 29611`
+        // The reaper was LIVE and PROMPT in both failing boots (it answered well inside the witness's 5 s poll);
+        // nothing was starved and nothing needed a longer timeout. Requeue a `Busy` mount for the next pass, the
+        // same way the `free_chain` arm does — the push `post()`s `REAPER_SEM`, so the retry is SCHEDULED (and
+        // `orphan_reaper` yields between passes, so a still-loaned device cannot turn this into a hot spin).
+        // Every OTHER mount error (`NoDisk`, `Unsupported`, a structural `BadFs`) describes a condition a retry
+        // cannot fix, and keeps the historical orphan path.
+        Err(crate::fs::fat::FatError::Busy) => {
+            if deferred_free_push(first_cluster) {
+                serial_println!(
+                    "U11-defer: deferred free of chain @cluster {} — storage busy at mount, requeued for the next reaper pass",
+                    first_cluster
+                );
+            } else {
+                serial_println!(
+                    "U11-defer: deferred free of chain @cluster {} — storage busy at mount but queue full, orphaned (leak)",
+                    first_cluster
+                );
+            }
+            return false;
+        }
         Err(_) => {
             serial_println!(
                 "U11-defer: deferred free of chain @cluster {} — mount failed, orphaned (leak)",
@@ -5295,6 +5334,17 @@ pub fn orphan_reaper(_: usize) {
                 // still prints, byte-identically, after the silent successful free.)
                 if free_orphan_chain(fc) {
                     serial_println!("U11-defer: reaper freed teardown-orphaned chain @cluster {}", fc);
+                } else {
+                    // REAPFIX: a failed pass either requeued the head (a `Busy` mount / `Busy` free — the
+                    // device is loaned to another context RIGHT NOW) or orphaned it. In the requeue case the
+                    // push already `post()`ed `REAPER_SEM`, so the next `deferred_free_pop` would hand the SAME
+                    // head straight back and re-attempt the mount with no time for the loan to clear — a hot
+                    // retry loop hammering the block layer from a service task. Cede the core once before the
+                    // next pass: the yield is legal here (EL1, IRQs enabled, no lock held — the queue lock was
+                    // released by `deferred_free_pop`) and it costs a single dispatch on the orphan path, where
+                    // nothing is retried anyway. This is the backoff that makes the requeue arm above SAFE to
+                    // take unconditionally on `Busy`.
+                    super::sched::yield_now();
                 }
             }
             // Queue drained: block until a producer enqueues + posts. `wait()` returns `true` here (the
@@ -21184,9 +21234,26 @@ fn u11reap_build(entry_sym: *const u8) -> Option<U7Fix> {
 ///   A seeks+reads its ORIGINAL bytes (the deferred chain is alive), reports A_READ
 ///     -> CHECKPOINT-2: chain still allocated -> release A's EXIT GO
 ///   A exits WITHOUT closing (teardown queues the orphan); B exits
-///     -> CHECKPOINT-3: bounded YIELD-poll of the FAT until the reaper has FREED the chain (all FAT copies) +
-///        the free-set rank is restored (`first_free == min(ff_busy, f0)`) — the yields cede this core to the
-///        co-located reaper, so the cooperative-QEMU drain is deterministic.
+///     -> CHECKPOINT-3: bounded YIELD-poll of the FAT until the reaper has FREED the chain (all FAT copies), the
+///        head is RE-ALLOCATABLE (the allocator's first free at-or-above `f0` IS `f0` — REAPFIX), and the
+///        volume-global free-set rank is restored (`first_free == min(ff_busy, f0)`, the over-free guard) — the
+///        yields cede this core to the co-located reaper, so the cooperative-QEMU drain is deterministic.
+///
+/// REAPFIX (2026-08-18) — what the bench capture `pi4-pi1-b1` taught this fixture, on both halves:
+///
+///   * THE DEFECT IT WAS FLAKING ON WAS REAL, AND IT WAS NOT SCHEDULING. `c3(freed=false)` FAILed on 2 of 3
+///     boots that reached this fixture. The reaper was live and prompt every time — it popped the head well
+///     inside this 5 s poll — but `free_orphan_chain`'s `mount()` arm mourned a TRANSIENT device loan as a
+///     permanent orphan (`U11-defer: deferred free of chain @cluster 29473 — mount failed, orphaned (leak)`,
+///     and the same at 29743 right behind a `BOT: pump ... used=24841443` loan from the USB mass-storage
+///     bring-up), dropping the head instead of requeueing it the way the `free_chain` `Busy` arm already did.
+///     The 5 s bound was never the problem and is deliberately UNCHANGED; the fix is at
+///     `free_orphan_chain`, which now requeues a `Busy` mount (with a `yield_now` backoff in `orphan_reaper`).
+///
+///   * THE `reuse` CONJUNCT WAS VACUOUS IN THIS CONFIGURATION, so `freed` was carrying the verdict alone. See
+///     the REAPFIX block at the CHECKPOINT-3 poll for the old criterion, why `min(ff_busy, f0)` could never go
+///     red here, and the head-anchored scan that replaces it. The verdict line now reports all three bits
+///     (`c3(freed=,reuse=,rank=)`) so a future bench read can tell the three failure modes apart.
 ///
 /// PASS iff both witnesses full AND all three cues fired AND both exited AND no kill AND both rows torn down AND
 /// the three checkpoints hold. Runtime-created file (no arroyo plant); needs a fresh image (DEFER2.BIN absent
@@ -21326,7 +21393,7 @@ fn u11reap_run(demo_cpu: usize) {
     // whenever the volume was packed below the head. The yields cede this core to the co-located reaper so the
     // cooperative-QEMU drain is deterministic. Times out (still false) if the reaper never runs -> FAILs loudly.
     let want_ff = if ff_busy < f0 { ff_busy } else { f0 };
-    let (freed_c3, reusable_c3) = {
+    let (freed_c3, reusable_c3, rank_c3) = {
         let dstart = super::timer::cntpct();
         let ddeadline = 5 * super::timer::cntfrq();
         loop {
@@ -21342,12 +21409,44 @@ fn u11reap_run(demo_cpu: usize) {
                         }
                         f += 1;
                     }
-                    (freed, fs.first_free_cluster() == Ok(want_ff))
+                    // REAPFIX — the HEAD-ANCHORED re-allocatability witness, replacing a VACUOUS conjunct.
+                    // The old `reuse` bit was `first_free_cluster() == want_ff` with `want_ff = min(ff_busy,
+                    // f0)`. On this volume `ff_busy < f0` always (the measured heads sit ~6 clusters above the
+                    // lowest free one: 29467/29473 and 29737/29743 on the bench capture), so `want_ff ==
+                    // ff_busy` and the equality is satisfied by a free cluster that has NOTHING to do with the
+                    // reaped chain — it holds whether or not the reap ever happened. It was green in BOTH
+                    // failing boots (`c3(freed=false,reuse=true)`), leaving `freed` as the only load-bearing
+                    // bit in the whole verdict. It is replaced by a scan ANCHORED AT THE CHAIN'S OWN HEAD:
+                    // walk the ALLOCATOR's copy (FAT #0 — the one a first-fit search reads) upward from `f0`
+                    // and require that the FIRST free entry it meets IS `f0`. Before the reap that scan
+                    // necessarily walks PAST the still-allocated head and answers some higher cluster, so the
+                    // bit is red exactly when the reap has not landed; after the reap the head is what a
+                    // first-fit resuming there would hand out — the re-allocatability the PASS line claims.
+                    // The bound is small because the answer is `f0` itself the moment the reap lands, and a
+                    // scan that has to walk at all has already proven the point.
+                    let mut c = f0;
+                    let mut steps = 0u32;
+                    let head_reuse = loop {
+                        match fs.fat_entry_copy(c, 0) {
+                            Ok(0) => break c == f0,
+                            Ok(_) => {}
+                            Err(_) => break false,
+                        }
+                        steps += 1;
+                        if steps >= U11REAP_REUSE_SCAN {
+                            break false;
+                        }
+                        c += 1;
+                    };
+                    // The volume-global rank is KEPT as a separate, additionally-reported conjunct: it is the
+                    // OVER-free guard (a reap that dropped a cluster BELOW the head moves the volume's first
+                    // free down), which the head-anchored scan by construction cannot see.
+                    (freed, head_reuse, fs.first_free_cluster() == Ok(want_ff))
                 }
-                Err(_) => (false, false),
+                Err(_) => (false, false, false),
             };
-            if snap.0 && snap.1 {
-                break (true, true);
+            if snap.0 && snap.1 && snap.2 {
+                break (true, true, true);
             }
             if super::timer::cntpct().wrapping_sub(dstart) > ddeadline {
                 break snap;
@@ -21369,14 +21468,15 @@ fn u11reap_run(demo_cpu: usize) {
         && chain_alive_c1
         && chain_alive_c2
         && freed_c3
-        && reusable_c3;
+        && reusable_c3
+        && rank_c3;
     if ok {
         serial_println!(
             ":: U11-reap: teardown-last-close reaper — A exits holding the unlinked file open, its chain freed by the reaper (all FAT copies) + re-allocatable, no teardown leak -> PASS ::"
         );
     } else {
         serial_println!(
-            ":: U11-reap: teardown-last-close reaper FAIL — head={} ff_busy={} measured={} want_ff={} a_w={:#x} b_w={:#x} opened={} unlinked={} read={} done={} killed={} cleared={} c1(gone={},alive={}) c2_alive={} c3(freed={},reuse={}) (want {:#x}/{:#x}/t/t/t/2/0/t/t/t/t/t/t) ::",
+            ":: U11-reap: teardown-last-close reaper FAIL — head={} ff_busy={} measured={} want_ff={} a_w={:#x} b_w={:#x} opened={} unlinked={} read={} done={} killed={} cleared={} c1(gone={},alive={}) c2_alive={} c3(freed={},reuse={},rank={}) (want {:#x}/{:#x}/t/t/t/2/0/t/t/t/t/t/t/t) ::",
             f0,
             ff_busy,
             measured,
@@ -21394,6 +21494,7 @@ fn u11reap_run(demo_cpu: usize) {
             chain_alive_c2,
             freed_c3,
             reusable_c3,
+            rank_c3,
             U11REAP_A_WITNESS_ALL,
             U11REAP_B_WITNESS_ALL
         );
