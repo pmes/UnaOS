@@ -8087,13 +8087,52 @@ fn barrier_stalled() -> bool {
 // declining drain can now succeed instead, so the clear is also performed at the loop's successful
 // EXIT. That is what makes drag RETURN after the first honest completion rather than staying refused.
 //
-// **Arch-neutral, and x86 takes the same fix.** Nothing above is aarch64-specific: `wm.rs` is shared,
-// x86's router reaches the identical `drag_begin`/`drag_motion`/`move_to_inner`, `irqs_masked` and
-// `current_name` are the arch-neutral pair, and x86's own `close_owner` runs from its `sched::exit`
-// with IF=0 exactly as the Pi's does. The hazard is structural — a spinning core cannot dispatch the
-// holder pinned to it — so gating the cure on `target_arch` would leave the identical livelock armed
-// on the other lane with no hardware reason for the asymmetry, which is the argument DRAGWEDGE
-// already made one arc earlier.
+// **Arch-neutral in its PRIMITIVES; NOT arch-neutral in what a yield can do.** The landing said
+// "nothing above is aarch64-specific", and the half of that which is true is the half about the
+// primitives: `wm.rs` is shared, x86's router reaches the identical
+// `drag_begin`/`drag_motion`/`move_to_inner`, `irqs_masked` and `current_name` are the arch-neutral
+// pair, and x86's own `close_owner` runs from its `sched::exit` with IF=0 exactly as the Pi's does.
+// The hazard is structural — a spinning core cannot dispatch the holder pinned to it — so gating the
+// cure on `target_arch` would leave the identical livelock armed on the other lane with no hardware
+// reason for the asymmetry, which is the argument DRAGWEDGE already made one arc earlier. All of that
+// stands.
+//
+// DRAGFIX M2 CORRECTS THE CLAIM WHERE IT MATTERS. `yield_now()` is arch-neutral in NAME only:
+//
+//   * x86_64 (`arch/x86_64/sched.rs::yield_now`) saves IF, switches to the scheduler, and RETURNS.
+//     It has no kill boundary. A drain that yields there always comes back to its own frame.
+//   * aarch64 (`arch/aarch64/sched.rs::yield_now`) masks and then calls `kill_check_current()`,
+//     which is documented "never returns if this task has been killed" — it calls `exit()`. So on
+//     this lane a yielding drain is a DIVERGENCE POINT: a task with a kill pending enters the yield
+//     arm and never comes out of it.
+//
+// ⚠ **THE COUNT THAT DIVERGENCE STRANDS — AN OWED CURE, NOT A LANDED ONE.** `drain_bounded` raises
+// `DRAIN_PENDING` at its head and the `DrainBarrier` that lowers it is a value returned to the
+// CALLER, so between those two points the count is held by a live stack frame and by nothing else.
+// A task that diverges in between leaks it permanently, and a permanently raised `DRAIN_PENDING`
+// makes every `composite_inner` take its barrier early-return: the PA38 shape, a live kernel behind
+// a frozen panel. Reachable from EL0 through `sys_win_move`/`sys_win_close` (task-current and
+// unmasked — which is `drain_can_yield`'s condition exactly), and note that the yield arm is not the
+// only door: `timer_preempt()` carries the same on-CPU kill boundary, so ANY unmasked drain can
+// diverge and the interactive path has been unmasked since before this arc. The yield arm did not
+// create the hazard; it widened it from "killed during a quantum tick" to "killed during a 250 ms or
+// 2000 ms park with an explicit boundary on every pass", which is a large multiplier on an
+// already-live defect.
+//
+// **Moving the `DrainBarrier` construction ahead of the yield does NOT fix this, and must not be
+// landed as though it did.** The target is built `panic-strategy: abort` (`aarch64-unaos.json`) and
+// `exit()` diverges by switching away from the task's own stack, so no unwinding runs and no drop
+// glue on the abandoned frames runs either. An RAII guard constructed before the yield strands its
+// count in precisely the same way as the bare `fetch_add` does — the guard shape cures a fix that
+// RETURNS, and this one does not return. The same argument disposes of the parallel `F4W_IN_SPIN`
+// leak (raised inside the loop, lowered after it): witness-only, so it costs a wrong rollup rather
+// than a frozen panel, but it is stranded by the identical mechanism and by no other.
+//
+// What the cure actually needs is a release the DYING task performs — the raise recorded with its
+// owner, and reconciled from the retirement path (`exit()` / `retire_killed`) rather than from a
+// stack frame that will not run again. That reaches outside `wm.rs` into `arch/*/sched.rs`, which is
+// outside this arc's lane, so it is NAMED here rather than half-cured: a partial guard would leave
+// the freeze reachable while reading, in the ledger and in review, as closed.
 
 /// DRAGFIX — spins a wait may take before the same-core arms are consulted at all.
 ///
@@ -8104,13 +8143,26 @@ fn barrier_stalled() -> bool {
 /// running, its blit is bounded, and the wait will terminate on its own — treating that case as
 /// futile would abandon waits that were about to succeed.
 ///
-/// 2^19 is what separates the two. It is ~5 ms on the Pi at the ~10 ns/spin figure
-/// [`DRAIN_STALL_SPINS`] is calibrated on — comfortably past the `pass_us=3294` typical composite
-/// this track measures, so a migrated holder finishes inside the grace and never reaches the arms —
-/// and it is 64x under [`DRAIN_MOVE_SPINS`] and 2048x under [`DRAIN_ABANDON_SPINS`], so a wait that
-/// IS futile now costs ~5 ms instead of 340 ms or several seconds. Under the grace the loop is the
-/// pre-arc loop exactly.
-const DRAIN_SAMECORE_GRACE: u64 = 1 << 19;
+/// 2^21 is what separates the two, and DRAGFIX M2 re-derives it from the MEASURED tail rather than
+/// the typical pass. The landing sized this at 2^19 — ~5 ms at the ~10 ns/spin figure
+/// [`DRAIN_STALL_SPINS`] is calibrated on — and argued it against `pass_us=3294`, the TYPICAL
+/// composite. But the same arc's own `[wc-k]` rollup recorded `maxpresent_us=12219`: a present tail
+/// of 12.2 ms on this panel, measured, in the landing's own message. A grace under the tail defeats
+/// its own design — [`BLIT_NET_CORE`] counts a migrated holder against the core it ENTERED on (that
+/// indexing is deliberate; see the caveat above), so a holder that migrated and is running a
+/// genuinely slow 12 ms pass still reads as `net[me] > 0` here, and at 5 ms the drain would consult
+/// the arms and yield or skip on a futility verdict that was false. 2^21 is ~21 ms, covering the
+/// measured 12.2 ms tail with ~70% margin, and it stays 16x under [`DRAIN_MOVE_SPINS`] and 512x under
+/// [`DRAIN_ABANDON_SPINS`] — a wait that IS futile costs ~21 ms against 340 ms or several seconds,
+/// which is the ratio the arms were landed for.
+///
+/// **A precision knob, not a correctness one.** A false-futile verdict costs an early yield or an
+/// early abandon and nothing else: the barrier stays RAISED through both arms (the property the SKIP
+/// arm's own note is careful about), so the protection is identical whichever way the verdict falls
+/// and only the WAIT is traded. Sizing this is therefore about not spending the arms on waits that
+/// would have terminated on their own — worth getting right, and not load-bearing for safety. Under
+/// the grace the loop is the pre-arc loop exactly.
+const DRAIN_SAMECORE_GRACE: u64 = 1 << 21;
 
 /// DRAGFIX — the INTERACTIVE yielding wait's deadline. A drag report may spend this long parked while
 /// the holder runs; the figure is the drag path's own budget, chosen against [`DRAIN_MOVE_SPINS`]'s
@@ -8176,6 +8228,14 @@ fn drain_can_yield() -> bool {
 ///
 /// The deadline is re-derived from [`crate::arch::ms`] each pass and compared with `wrapping_sub`, so
 /// a timebase wrap costs at most one extra pass rather than an unbounded wait.
+///
+/// ⚠ **DRAGFIX M2 — this call may not return, on aarch64 only.** `yield_now()` is arch-neutral in name
+/// and not in behaviour: the aarch64 one runs `kill_check_current()`, which `exit()`s a task with a
+/// kill pending, while the x86 one has no kill boundary at all. A drain diverging here strands
+/// `DRAIN_PENDING` (and, on witness builds, `F4W_IN_SPIN`) because `panic-strategy: abort` plus a
+/// switch-away means no drop glue runs on the abandoned frames — so no RAII guard placed in this
+/// function can cure it. The full statement of the hazard, why the guard shape does not close it, and
+/// what the cure needs, are in the DRAGFIX ledger's cross-arch paragraph above.
 fn drain_yield_wait(budget_ms: u64) -> bool {
     use core::sync::atomic::Ordering;
     DRAIN_YIELD_WAITS.fetch_add(1, Ordering::Relaxed);
@@ -8592,10 +8652,28 @@ impl DrainBarrier {
             // the unsafe half rather than perform it. That work is not this arc's, and it is named
             // here rather than left for the next reader to rediscover from a crash.
             //
-            // The abandonment can never be silent. `DRAIN_ABANDONED` is unconditional and appears on
-            // every `[wedge1] dwell` line as `abandoned=`, whose verdict goes to `ABANDONED` — a
-            // reading the spec battery FORBIDS, so a boot that reaches this arm reds the gate instead
-            // of quietly shipping a stale frame.
+            // The abandonment can never be silent — but DRAGFIX M2 states WHICH abandonment, because
+            // there are now two classes and only one of them reds a gate.
+            //
+            //  1. **BOUND-REACHED teardown abandonment — this arm.** `DRAIN_ABANDONED` is charged
+            //     unconditionally here and appears on every `[wedge1] dwell` line as `abandoned=`,
+            //     whose verdict goes to `ABANDONED` — a reading the spec battery FORBIDS by name. A
+            //     boot that reaches THIS arm reds the gate instead of quietly shipping a stale frame.
+            //     That forbid was written about this event and must keep meaning exactly it.
+            //  2. **SAME-CORE FUTILE decline — the SKIP arm above.** It abandons the wait WITHOUT
+            //     charging `abandoned=`, deliberately, and its witness is its own field: `scskip=`,
+            //     nonzero meaning a wait was declined because the holder's guard was entered on the
+            //     core the drain is spinning on and the full bound would have proved only that. The
+            //     spec REQUIREs the field's presence and does not forbid a count, for the reason
+            //     `mvgiveup=`/`mvskip=` are separate fields rather than folded in: these are
+            //     legitimate outcomes on metal, and folding them under `abandoned=`'s forbid would
+            //     red a gate on a decline the design asks for.
+            //
+            // What the two classes SHARE is the protection, and that is the point: **the barrier
+            // stays RAISED on both.** Neither class returns without the `DrainBarrier` the caller
+            // drops, so a composite taking the table lock still observes `DRAIN_PENDING` and still
+            // skips in either case. The difference between them is only how much bound was spent
+            // before the wait was given up, which is what makes it right to price them apart.
             if spins >= bound {
                 // Lock-free first, exactly as `<D!>` is: the fact that the bound was reached must
                 // survive a serial path that is itself the wedge.

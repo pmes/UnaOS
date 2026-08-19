@@ -582,6 +582,16 @@ FORBID \[wc-fv\] focus-vis .*-> FAIL
 # ---    `scskip=` is deliberately NOT folded into `abandoned=` (whose `[1-9]` forbid three hundred
 # ---    lines up is matched against the TEARDOWN counter and must stay that way — the same naming
 # ---    care `mvgiveup=`/`mvskip=` were given). The required count is unchanged.
+# --- DRAGFIX M2 — and `scskip=` gets no FORBID here either, which is a decision rather than an
+# ---    omission. A forbid would only be honest if QEMU raspi4b could not reach the SKIP arm, and it
+# ---    can: the arm needs a live `BlitGuard` entered on the drain's own core plus a masked (or
+# ---    task-less) context, and QEMU boots run exactly that pairing — window teardown reaches
+# ---    `close_owner` from `sched::exit` -> `clear_handle_row` with IRQs already masked, while a
+# ---    compositor pass preempted mid-blit on the same core leaves the net standing. Nothing about
+# ---    that shape is metal-only; it is scheduling, and the QEMU lane schedules. So the count is
+# ---    pinned for EXISTENCE only, on this section's standing rule that a gate failing on an honest
+# ---    reading teaches people to ignore it. The abandonment that DOES red a gate is the bound-
+# ---    reached teardown one, and `abandoned=[1-9]` above still catches it by name.
 REQUIRE \[wedge1\] dwell drains=.*spin_max=.*mvbound=[0-9]+ mvgiveup=[0-9]+ mvskip=[0-9]+ ywait=[0-9]+ ydrain=[0-9]+ scskip=[0-9]+ grace=[0-9]+ latched=.*->
 
 # --- STORM-HEADROOM (s1u lens nit): the boot-baseline census is the proof the storm instrument
