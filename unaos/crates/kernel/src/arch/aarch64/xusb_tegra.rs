@@ -1427,11 +1427,15 @@ pub fn jbxc_crcrq_quiesce(cap0: u32, our_cmd_ring: u64) {
 pub mod xusbfw {
     use super::{cntpct, jb9_bar2_routed, JB9G_NO_HCRST, XUSB_BAR2};
 
-    // Build-time firmware injection: `pub const XUSB_FW: Option<&[u8]>`. Emitted by
-    // crates/kernel/build.rs — `Some(include_bytes!("<abs path>"))` ONLY when UNAOS_XUSB_FW_PATH is
-    // set (read directly from the bunker, never copied into the tree), else `None`. The default
-    // build never reaches this module at all (feature off), so it is blob-free by construction.
-    include!(concat!(env!("OUT_DIR"), "/xusb_fw.rs"));
+    // Build-time firmware injection: `pub const XUSB_FW: Option<&[u8]>`, from the OPTIONAL
+    // `unaos-xusb-fw` crate — `Some(include_bytes!("<abs path>"))` ONLY when UNAOS_XUSB_FW_PATH is
+    // set (read directly from the bunker, never copied into the tree), else `None`. It lives in its
+    // own crate rather than a kernel build.rs because a build script's mere PRESENCE changes cargo's
+    // -C metadata, which re-lays-out every artifact on every arch even with the knob off (measured:
+    // 12b0993c moved knob-off x86 and Pi media, and deleting build.rs restored them byte-for-byte).
+    // As an optional dep it is absent from the knob-off build graph entirely, so the default build
+    // is both blob-free AND byte-identical to its pre-XUSBFW baseline.
+    pub use unaos_xusb_fw::XUSB_FW;
 
     /// The signed NVIDIA container magic ('NVGI') — the one byte-level fact we assert on the blob.
     /// The container is nested (NVGI -> RFFS -> RFRD -> ... -> tegra_xusb_fw_header + IMEM/DMEM) and
