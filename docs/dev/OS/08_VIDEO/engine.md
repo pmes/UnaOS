@@ -12100,3 +12100,46 @@ falsifier is WC-G's own classifier: the MAJOR-1 note above established that a pu
 bytes of a declared-finished frame, so RACE-PRESENT verdicts on paced vug windows should disappear
 from the capture, and the HUD digits should hold steady on glass. Either lying on the next metal
 boot falsifies the design, not the instrument.
+
+## STAGE-PHYS — the blit sources' physical contiguity, measured (x86 `witness`, 2026-08-18)
+
+*Why this number exists.* Every GPU-offload sketch for this compositor — the Gen7 blitter, the
+Kepler copy engine — reads its source out of RAM by **physical** address, and the shape of that read
+(one descriptor, a scatter list, or a bounce buffer plus a second full copy of every frame) is
+decided entirely by whether the compositor's blit sources are physically contiguous. Both GPU ladder
+drafts carried that as an explicit UNKNOWN. `STAGE-PHYS` closes it with a measurement instead of an
+assumption, at zero GPU risk: it touches no device, maps nothing, and writes nothing.
+
+*What it measures.* Once per boot, at the end of the first `composite_once` that finds a staged
+buffer (`wm::physwit_once`; deadline `PHYSWIT_DEADLINE_PASSES = 32` passes so a never-staging boot
+still reports), it walks each blit source page by page through `arch::memory::translate` — the
+read-only live-CR3 walker `gen7` R4 already relies on — and reduces the walk to a run-length reading:
+total pages, number of maximal physically-contiguous runs, unmapped pages, min/median/max run length,
+and the page offset at which the longest run begins. The sources are the eight per-core `STAGE`
+scratch buffers (`wm.rs`, `MAX_STAGE_BYTES` = 4 MiB cap each, grown lazily per core) and the
+desktop's `Screen::back_store` (`screen.rs`, panel-sized), whose span the screen publishes at
+construction — it is allocated once at final size and never moved, so the published span is exact,
+not a snapshot. Each `STAGE` entry's `(ptr, capacity)` is captured under `try_lock` and the guard is
+dropped *before* the walk, so the witness never blocks a compositing core; `capacity`, not `len`,
+because the allocation is what a source descriptor would have to cover. A median rather than a mean:
+one long run plus a tail of singletons has a flattering mean and a damning median, and the tail is
+exactly the shape a scatter list has to survive.
+
+*Cost, and where it is stated.* Bounded by (4 MiB x 8 + back store) / 4 KiB ≈ 15 k four-level walks,
+once, and in practice far fewer because a `STAGE` entry only carries the largest box its own core
+ever staged. The reading is never a claim about its own price — every line carries `cost_cyc=` for
+its own walk. Steady state after the one-shot spends itself is a single relaxed load per pass.
+
+*First reading (QEMU, `UNAOS_FATIMG=sf UNAOS_WC=1 UNAOS_WITNESS=1 ./arroyo test 150`).* One core
+staged (`cpu=2`, 319 200 B = 78 pages) and the back store was the QEMU panel's 4 096 000 B = 1000
+pages; **both came back `runs=1`, `unmapped=0`** — fully contiguous, `run_min = run_med = run_max =
+pages`, `largest_off=0`, at 712 460 and 115 940 cycles respectively. On this evidence the offload's
+source addressing wants a **single descriptor** with a scatter list only as a fallback, not the other
+way round. The caveat is stated plainly: QEMU's allocator is not the bench's, and 78 and 1000 pages
+are not the bench's 4 MiB stage and ~28 MiB 1920x1200 back store. What the QEMU run proves is that
+the witness executes end to end; the number that decides the DMA design is the one this same witness
+prints on metal.
+
+*Off by default.* Definition, statics, the screen-side span publication and the call site are all
+`#[cfg(all(feature = "witness", target_arch = "x86_64"))]`. A knob-off build has neither the code nor
+a load of its state, and its serial is byte-identical.

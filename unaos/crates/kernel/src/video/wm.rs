@@ -4096,6 +4096,12 @@ fn composite_once() {
     // tenant), but it is a real perturbation of a real instrument, and a decline storm across a full
     // table is the worst case worth knowing about when reading a capture whose `torn=` moved.
     controls_declined_drain();
+    // STAGE-PHYS — the one-shot blit-source contiguity witness, last in the pass for the same reason
+    // `CTRLWIT` is second-to-last: the ledger is closed, every guard the pass took has dropped, and a
+    // serial line here cannot inflate `pass_us`. Spends itself on the first pass that finds a staged
+    // buffer (see `physwit_once`); every pass after that is one relaxed load.
+    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    physwit_once();
 }
 
 /// What [`composite_inner`] owes the sprite when it returns.
@@ -13715,6 +13721,240 @@ const STAGE_CPUS: usize = crate::ui_status::PSTRIP_MAX_CPUS;
 const _: () = assert!(STAGE_CPUS == 8, "wcpar_emit prints c0..c7; widen it if STAGE_CPUS changes");
 static STAGE: [Mutex<alloc::vec::Vec<u8>>; STAGE_CPUS] =
     [const { Mutex::new(alloc::vec::Vec::new()) }; STAGE_CPUS];
+
+// ---------------------------------------------------------------------------------------------
+// STAGE-PHYS — the one-shot physical-contiguity witness over the compositor's blit SOURCES.
+// ---------------------------------------------------------------------------------------------
+//
+// THE QUESTION, and why it is worth a boot's worth of page walks. Every GPU-offload sketch for this
+// compositor (gen7 blitter, Kepler copy engine) reads its source from RAM by PHYSICAL address, and
+// the shape of that read is decided by one number nobody has printed: are the blit sources — the
+// per-core [`STAGE`] scratch and the desktop's `Screen::back_store` — physically contiguous, and if
+// not, what is the run-length distribution? A single 28 MiB contiguous back store is ONE descriptor.
+// A thousand scattered 4 KiB runs is a scatter list (or a bounce buffer, and a second full copy of
+// every frame). Both ladder drafts carry this as an UNKNOWN; this witness closes it with a
+// measurement instead of an assumption.
+//
+// WHAT IT COSTS. At most `MAX_STAGE_BYTES * STAGE_CPUS + back_store` bytes' worth of 4 KiB pages —
+// (4 MiB x 8 + ~28 MiB) / 4 KiB is about 15 k `translate` calls — ONCE per boot, and in practice far
+// fewer because a `STAGE` entry only carries the largest box ITS core actually staged. Each call is
+// a read-only 4-level walk of the live CR3 tables (~4 dependent loads). The measured cost is printed
+// as `cost_cyc=` on every line, so the reading is never a claim about its own price.
+//
+// WHAT IT IS NOT. It writes nothing, maps nothing, and takes no lock the compositor could wait on:
+// spans are captured under `try_lock` and the walk runs after the guard drops. It is
+// `witness`-gated and x86-only (`arch::memory::translate` is the x86 walker gen7 R4 already relies
+// on), so a default build has neither the code nor a single load of its state.
+
+/// STAGE-PHYS — spent once the witness has printed. One-shot for the life of the boot.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static PHYSWIT_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// STAGE-PHYS — composite passes seen since boot, used only to bound the wait for an armed
+/// [`STAGE`]. See [`physwit_once`] for why the witness does not simply fire on pass one.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static PHYSWIT_PASSES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// STAGE-PHYS — how many composite passes the witness will wait for a `STAGE` allocation before it
+/// prints anyway. A boot whose compositor never stages (every present took the direct path) is a
+/// real, reportable state: the witness says `pages=0` for those entries rather than staying silent
+/// and leaving the gate unable to tell "no staging" from "witness never ran".
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+const PHYSWIT_DEADLINE_PASSES: u32 = 32;
+
+/// STAGE-PHYS — one buffer's contiguity reading.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+struct PhysRuns {
+    /// 4 KiB pages the span touches (from the page holding its first byte through the page holding
+    /// its last), so a span that straddles a page boundary is counted honestly.
+    pages: usize,
+    /// Maximal physically-contiguous runs. `runs == 1` is the single-descriptor case.
+    runs: usize,
+    /// Pages with no live translation. Expected 0 for a kernel-heap `Vec`; a nonzero value would
+    /// mean the span is not what this witness assumes and the rest of the line is not to be trusted.
+    unmapped: usize,
+    min: usize,
+    med: usize,
+    max: usize,
+    /// Page index, from the start of the span, at which the LONGEST run begins — the offset a
+    /// single-descriptor DMA would have to start from to cover `max` pages in one go.
+    largest_off: usize,
+}
+
+/// STAGE-PHYS — walk `[base, base + len)` page by page through the live page tables and reduce it to
+/// a run-length reading.
+///
+/// Contiguity is decided the only way a DMA engine would decide it: page *i*'s physical frame must be
+/// exactly one page above page *i-1*'s. An unmapped page breaks the run and is counted; it never
+/// joins one.
+///
+/// The run lengths are collected so a MEDIAN can be reported — a mean would hide the shape this
+/// measurement exists to expose (one 6000-page run plus a tail of singletons has a flattering mean
+/// and a damning median). The vector is bounded by `pages` (about 7 k entries for a 28 MiB store, so
+/// ~28 KiB) and is taken with `try_reserve`: an allocation failure returns `None` and the caller
+/// prints an honest refusal rather than panicking from composite context.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn physwit_walk(base: usize, len: usize) -> Option<PhysRuns> {
+    const PAGE: usize = 4096;
+    if len == 0 {
+        return None;
+    }
+    let first = base & !(PAGE - 1);
+    let last = base.checked_add(len - 1)? & !(PAGE - 1);
+    let pages = (last - first) / PAGE + 1;
+    let mut lens: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    if lens.try_reserve(pages).is_err() {
+        return None;
+    }
+    let mut prev: Option<u64> = None;
+    let mut run = 0usize;
+    let mut run_start = 0usize;
+    let mut best = 0usize;
+    let mut best_off = 0usize;
+    let mut unmapped = 0usize;
+    for i in 0..pages {
+        let va = (first + i * PAGE) as u64;
+        let pa = crate::arch::memory::translate(va);
+        let cont = match (pa, prev) {
+            (Some(p), Some(q)) => p == q + PAGE as u64,
+            _ => false,
+        };
+        if cont {
+            run += 1;
+        } else {
+            if run > 0 {
+                lens.push(run as u32);
+                if run > best {
+                    best = run;
+                    best_off = run_start;
+                }
+            }
+            if pa.is_some() {
+                run = 1;
+                run_start = i;
+            } else {
+                run = 0;
+                unmapped += 1;
+            }
+        }
+        prev = pa;
+    }
+    if run > 0 {
+        lens.push(run as u32);
+        if run > best {
+            best = run;
+            best_off = run_start;
+        }
+    }
+    if lens.is_empty() {
+        return Some(PhysRuns {
+            pages,
+            runs: 0,
+            unmapped,
+            min: 0,
+            med: 0,
+            max: 0,
+            largest_off: 0,
+        });
+    }
+    lens.sort_unstable();
+    let n = lens.len();
+    Some(PhysRuns {
+        pages,
+        runs: n,
+        unmapped,
+        min: lens[0] as usize,
+        med: lens[n / 2] as usize,
+        // `best` and `lens[n - 1]` are the same number by construction — reported from the tracked
+        // maximum so that `run_max` and `largest_off` can never disagree about WHICH run they name.
+        max: best,
+        largest_off: best_off,
+    })
+}
+
+/// STAGE-PHYS — print one buffer's line, or the honest refusal when the span is empty or the run
+/// vector could not be allocated.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn physwit_emit(tag: &str, cpu: i32, base: usize, len: usize) {
+    let t0 = crate::arch::now_cycles();
+    let r = physwit_walk(base, len);
+    let cost = crate::arch::now_cycles().saturating_sub(t0);
+    match r {
+        Some(r) => serial_println!(
+            ":: STAGE-PHYS: buf={} cpu={} bytes={} pages={} runs={} unmapped={} run_min={} \
+             run_med={} run_max={} largest_off={} cost_cyc={} ::",
+            tag,
+            cpu,
+            len,
+            r.pages,
+            r.runs,
+            r.unmapped,
+            r.min,
+            r.med,
+            r.max,
+            r.largest_off,
+            cost
+        ),
+        None => serial_println!(
+            ":: STAGE-PHYS: buf={} cpu={} bytes={} pages=0 runs=0 unmapped=0 run_min=0 run_med=0 \
+             run_max=0 largest_off=0 cost_cyc={} ::",
+            tag,
+            cpu,
+            len,
+            cost
+        ),
+    }
+}
+
+/// STAGE-PHYS — the one-shot itself. Called at the very end of [`composite_once`], after the pass's
+/// ledger and after every guard the pass took has dropped, which is the same placement `CTRLWIT`
+/// uses and for the same reason: a polled-UART line inside the clock would charge the pass for the
+/// instrument's own transmit time.
+///
+/// ARMING. Firing on pass one would measure nothing — a `STAGE` entry is grown LAZILY by
+/// `stage_window`, so on the first composite every entry is still a zero-capacity `Vec`. The witness
+/// therefore waits for the first pass at which some entry carries an allocation, and gives up
+/// waiting after [`PHYSWIT_DEADLINE_PASSES`] so a never-staging boot still produces a line.
+///
+/// Steady state after it has spent itself is ONE relaxed load.
+///
+/// SPANS, NOT GUARDS. Each entry's `(ptr, capacity)` is captured under `try_lock` and the guard is
+/// dropped before any walking, so the witness never holds a `STAGE` entry across ~1 k page walks
+/// where a compositing core would meet it. `capacity`, not `len`, because the allocation is what a
+/// DMA source descriptor would have to cover. An entry another core holds right now is reported as
+/// `pages=0` rather than waited for — declining is the same answer the compositor's own `try_lock`
+/// gives, and this is a diagnostic, not a barrier.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn physwit_once() {
+    use core::sync::atomic::Ordering::Relaxed;
+    if PHYSWIT_DONE.load(Relaxed) {
+        return;
+    }
+    let passes = PHYSWIT_PASSES.fetch_add(1, Relaxed).saturating_add(1);
+    let mut spans = [(0usize, 0usize); STAGE_CPUS];
+    let mut armed = passes >= PHYSWIT_DEADLINE_PASSES;
+    for (i, e) in STAGE.iter().enumerate() {
+        if let Some(g) = e.try_lock() {
+            spans[i] = (g.as_ptr() as usize, g.capacity());
+        }
+    }
+    if !armed && spans.iter().any(|&(_, c)| c > 0) {
+        armed = true;
+    }
+    if !armed {
+        return;
+    }
+    // Exactly one core prints, even if two reach the arming condition on the same pass.
+    if PHYSWIT_DONE.swap(true, Relaxed) {
+        return;
+    }
+    for (i, &(p, c)) in spans.iter().enumerate() {
+        physwit_emit("stage", i as i32, p, c);
+    }
+    let bp = super::screen::BACK_STORE_PTR.load(Relaxed);
+    let bl = super::screen::BACK_STORE_LEN.load(Relaxed);
+    physwit_emit("back", -1, bp, bl);
+}
 
 /// WCPAR — the calling core's entry in the [`STAGE`] pool. `meter_current_cpu()` is the same reading
 /// the pstrip and `[wcn]`'s census already use; a core index at or beyond the pool (more physical cores
