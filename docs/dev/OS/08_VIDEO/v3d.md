@@ -8693,3 +8693,108 @@ baselines sitting *behind* H rather than in front of it.
 a null result: `H1` ends the bin-stage campaign and opens the render list; `H2` moves the question from
 dispatch to the clipper; `H3` puts the wall downstream of a delivery that provably happens; `H4` convicts
 the VPM write path and exonerates the shader. The leg that has never run is the leg that answers.
+
+#### 49.25.6 `hfirst`, read on metal — leg H ran, and the shader is exonerated (PI-V3D-102 verdict, boot 13, 2026-08-18)
+
+Capture `line-acm0/pi.log`, **v3d boot 13**, the PA50 image (`UNAOS_V3D_HFIRST=1 UNAOS_PI=1`), cold
+power-cycle, read from the `[v3d101]`/`[v3d102]` lines themselves. This is the boot §49.25.5 called
+"the campaign's decisive boot", and it decided.
+
+**Leg E first, as the reading order requires.** `INT_STS raw=0x00000002` — `FLDONE` (bit1) SET, every
+error bit clear. `pool words=20 tile-state words=48` — the empty close, to the word. Every production
+slot flat (`FEP/QPU/VCD/VPM/PTB` all `d=0`), only the control slot moving
+(`slot2 src32 CYCLE_COUNT raw=270622010`). That is **`OUTCOME E1`**, a clean baseline, and the bank
+control row is intact: `PCTR_EN(at read)=0x000000ff OVERFLOW=0x00000000`. Leg H therefore has a
+baseline and the boot is admissible.
+
+**Leg H — the leg that had never run in this campaign — ran.** Its words, verbatim off the wire:
+
+| witness | leg H | leg E (same boot, same bank, no re-arm) |
+|---|---|---|
+| bank control | `PCTR_EN-intact=1 src32-moved=1` | `EN=0x000000ff OVF=0x00000000` |
+| `INT_STS` | **`0x00010000`** — bit16, QPU 0's program-end host interrupt; **nothing** in the frame-done or error families | `0x00000002` (`FLDONE`) |
+| `FLDONE` / frame closed | **0 / no** | 1 / yes |
+| slot0 `src1 FEP_VALID_PRIMS` | `raw=0 d=0` | `raw=0 d=0` |
+| **slot1 `src14 QPU_ACTIVE_CYCLES_VERTEX_COORD_USER`** | **`raw=28 d=28`** | `raw=0 d=0` |
+| slot2 `src32 CYCLE_COUNT` (control) | `raw=1851095553 d=1580473543` | `raw=270622010 d=270622010` |
+| **slot3 `src16 QPU_CYCLES_VALID_INSTR`** | **`raw=53 d=53`** | `raw=0 d=0` |
+| slot4 `src58 L2T_VCD_READS` | `raw=0 d=0` | `raw=0 d=0` |
+| slot5 `src26 VPM_VDW_STALL` | `raw=0 d=0` | `raw=0 d=0` |
+| slot6 `src27 VPM_VCD_STALL` | `raw=0 d=0` | `raw=0 d=0` |
+| slot7 `src35 PTB_PRIMS_BINNED` | `raw=0 d=0` | `raw=0 d=0` |
+| pool words / tile-state words | **0 / 0** (empty close = 20 / 48) | 20 / 48 |
+| `CT0CA` / `CT0PC` | `CT0CA == EA`, `CT0PC=3` | — |
+| `PCS.BMACTIVE` | 1 | — |
+| MMU violation pair (V2a, read first) | clean | clean |
+| referenced regions changed / poison collars | 0 of 11 / 0 | 0 of 11 / 0 |
+
+**`OUTCOME H4` — THE REAL SHADER ALSO FAILS TO DELIVER**, and it arrives in the **STRONG FORM**.
+
+**The strong-form cross-read, which is the whole reason boot 13 is decisive.** §49.25.5 pre-wrote H4
+with a condition attached: *"more than boot 12's 5 is the strong form; at or near 5 means this leg ran
+something the size of the null shader, a finding about the shader record and not about VPM, and it must
+be settled first."* The condition is met with room to spare, on both QPU sources:
+
+- boot 12's leg G, the **NULL** coord shader (4 words — `vpmwt ; nop;thrsw ; nop ; nop`, the tail of
+  `CS_VS_WORDS`): `QPU_CYCLES_VALID_INSTR = 5`.
+- boot 13's leg H, the **REAL** coord shader (`CS_VS_WORDS`, 27 words):
+  `QPU_CYCLES_VALID_INSTR = 53`, `QPU_ACTIVE_CYCLES_VERTEX_COORD_USER = 28`.
+
+**53 ≫ 5** — an order of magnitude, on a program that is 27 words against 4. The ratio the cycles report
+(10.6×) and the ratio the programs carry (6.75×) are the same order, so the count is consistent with the
+**whole** 27-word body issuing, not a truncated prefix that died at some early instruction. Boot 12's
+"shader record this leg fetched" escape hatch is therefore **closed**: leg H fetched and executed the
+real, big, VPM-writing program. `INT_STS` bit16 says the same thing from an instrument the counter file
+cannot influence — a thread ran **and ended**. The two instruments agree, which is the case §49.25.4
+named as the one that carries full weight.
+
+And with that program provably executed, **`VPM_VDW_STALL`, `VPM_VCD_STALL` and `PTB_PRIMS_BINNED` are
+all still exactly zero, the tile-alloc pool took zero words, the tile-state array took zero words, and
+the frame never closed.**
+
+##### What died with boot 13
+
+**The last "shader content" hypothesis class is retired.** This is the class that has absorbed
+PI-V3D-9, -17, -18, -19, -20, -22, -26 and -47 — every arc that asked *"is the coordinate shader
+writing the wrong thing, in the wrong form, to the wrong place, or ending too early?"* Boot 13 kills the
+class, not just its current member, because it holds the question **invariant under shader size**:
+
+- a 4-word shader that writes **nothing** to VPM → frame open, VPM/PTB flat;
+- a 27-word shader that writes **six components per vertex** to VPM by construction → frame open,
+  VPM/PTB flat, *identically*.
+
+The output the frame is waiting for went from zero to six-per-vertex and **not one downstream witness
+moved by one count**. No content hypothesis survives that: whatever the shader writes, or does not
+write, the observable is the same. The shader is **exonerated**, and every future arc that proposes to
+change a QPU word in `CS_VS_WORDS` to fix the wall must first explain why boot 13's invariance is
+compatible with it.
+
+Three narrower things die with the class:
+
+- **"Leg H would have closed"** — §49.24's ladder chose F → G → H on the premise that H was the leg most
+  likely to succeed. It is not. H fails in G's exact shape.
+- **`OUTCOME H1`, `H2` and `H3` are all dead for the m4-class minimum.** The frame did not close, so H1
+  and H2 cannot be taken; VPM and PTB did not move, so H3 cannot. Of §49.25.5's four pre-written
+  outcomes exactly one is live, and it is the one that convicts the VPM write path.
+- **The two guard rows did not fire.** The QPU slots were not flat (so the `D1`-shape guard — "the
+  thread never launched, H4 is not earned" — does not apply), and the frame did not close at fewer than
+  20 pool words. H4 is earned cleanly, with no guard standing in front of it.
+
+##### The wall, at its narrowest name yet
+
+> The coordinate shader launches, executes its full 27-word body, issues six `STVPMV` stores and a
+> `VPMWT`, and ends with a program-end interrupt — and **nothing on the VPM side of the machine
+> registers that any of it happened.** The wall is the **VPM write path itself**: the VPM write-back
+> stage, or the coord thread's **access** to it. It is not what the shader was asked to write.
+
+Two properties of that statement are worth keeping in front of the next rung. First, it is a **silent**
+failure: no fault latches, no MMU violation, no referenced region changes, no poison collar breaks, and
+`INT_STS`'s error families are clear. Second, it is **not a stall in any counter we armed** — both VPM
+stall counters read zero. A write path that were merely *blocked* should plausibly stall something. A
+write path that reads zero on both stall counters while delivering nothing is more consistent with
+writes being **accepted and discarded**, or **never presented to the port at all**, than with
+back-pressure. §49.25.7 is built to split exactly that.
+
+*Fold discipline note:* boot 13 flew and was read the same sitting; this fold was written by the
+successor session from the capture, per the standing no-folds-at-close order — the capture, not this
+prose, is the evidence of record.
