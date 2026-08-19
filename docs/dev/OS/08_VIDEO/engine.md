@@ -3137,8 +3137,26 @@ format, field for field (`video/wcg.rs`, `emit_sample` and `stage_rollup`):
 ```
 [wc-h] win=<id> box=<bw>x<bh> span=<rows> band=<yes|no> bytes=<n> compose_us=<n> present_us=<n> rectscan_us=<n> torn=<yes|no> -> BUFFERED
 [wc-h] win=<id> staged=no reason=<geom|cap|lock|alloc|fixture> -> DIRECT
-[wc-h] rollup win=<id> scope=<window|window-band> emit=<n> age_ms=<n> pop=budgeted samples=<n> budget=4 pop=all-presents torn=<n> declines=<n> fixture=<n> whole=<n> banded=<n> lines=<n> minspan=<n> minspan_bytes=<n> maxpresent_us=<n> minpresent_us=<n> presspread=<n> pop=constant frame_us=16667 -> <TEAR-FREE|UNSTAGED|AT-RISK>
+[wc-h] rollup win=<id> scope=<window|window-band> emit=<n> age_ms=<n> pop=budgeted samples=<n> budget=4 pop=all-presents torn=<n> declines=<n> fixture=<n> whole=<n> banded=<n> lines=<n> minspan=<n> minspan_bytes=<n> maxpresent_us=<n> minpresent_us=<n> presspread=<n> presspop=<n> pop=constant frame_us=16667 -> <TEAR-FREE|UNSTAGED|AT-RISK>
 ```
+
+**WCHFIX (2026-08-18) — `presspop=` is the spread's population, and the spread is unreadable without
+it.** `presspread=` is `max/min` over the presents a window has had. On a window that has had exactly
+ONE present, `max` and `min` are the same sample and the ratio is `1` *by construction* — an
+arithmetic identity, not a measurement of evenness. The pi4 spec's discriminator convicts the
+single-digit spread class (a uniformly-expensive copy is the metal defect's shape; a host desched
+blows the ratio out to tens or hundreds), so the identity landed inside the conviction band and a
+single-present window that also tore was convicted on evidence that did not exist. The x86 seat
+measured it at roughly one false red in five runs of an otherwise green suite, concentrated on the
+shortest and most loaded boots — the very regime the discriminator exists to excuse. `presspop=` now
+publishes how many presents the two extremes were drawn from, as an insertion directly after
+`presspread=` inside the same `pop=all-presents` run, and the spec keys its FORBID on `presspop >= 2`.
+
+The VERDICT is deliberately untouched: a window that tore still prints `-> AT-RISK` at any
+population, because the tear was measured even where the spread was not. Withholding the verdict
+would report `TEAR-FREE` over a measured tear, which is the WC-K mistake this module has already been
+corrected for. What is given up is stated plainly: a real tear on a window that presented exactly
+once now escapes that gate — in the one case where the gate has no spread to read at all.
 
 `box=` is the whole outer box; `span=` is the rows this present actually WROTE, and `band=yes` is
 exactly the test `span < bh`; `bytes=` is `row_bytes * span` — what reached the glass. `rectscan_us`

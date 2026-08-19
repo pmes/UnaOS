@@ -424,6 +424,31 @@ static H_MINPRES: [AtomicU64; IDS] = [const { AtomicU64::new(u64::MAX) }; IDS];
 /// lands, this pair is the measurement it can be built on rather than a second, competing opinion.
 static H_MINRATE: [AtomicU64; IDS] = [const { AtomicU64::new(u64::MAX) }; IDS];
 static H_MAXRATE: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+/// WCHFIX — per-id: how many presents actually entered the rate census above. Published as the
+/// rollup's `presspop=`, immediately beside `presspread=`, because a ratio without its population
+/// is not a reading.
+///
+/// **The blind spot this closes.** `presspread` is `max/min` over this population. When the
+/// population is ONE, `max` and `min` are the same sample and the ratio is `1` BY CONSTRUCTION — not
+/// a measurement of evenness, but the arithmetic identity of a single point. A single-present window
+/// that also tore therefore printed the exact shape the pi4 spec's single-digit FORBID was written to
+/// convict (`presspread=1 -> AT-RISK`), while carrying no evidence whatsoever about which of the two
+/// causes produced the tear. The x86 seat measured that as roughly one false red in five runs of an
+/// otherwise green suite, concentrated on the shortest and most loaded boots — precisely the desched
+/// regime the discriminator exists to EXCUSE.
+///
+/// **Why a counter rather than a verdict change.** The alternative was to withhold `-> AT-RISK` until
+/// two presents exist. That would be a lie about the panel: the window DID tear, the tear counter DID
+/// see it, and a witness that reports `TEAR-FREE` over a measured tear is the failure mode WC-K was
+/// corrected for. The unmeasurable thing is not the tear, it is the SPREAD — so the population is
+/// published beside the spread and the consumer that reads the spread (the spec's FORBID) is the one
+/// that declines to convict. The verdict, its precedence and every existing count are untouched.
+///
+/// **Why not `whole=` or `banded=`.** Those count staged presents, including the zero-byte case the
+/// rate recorder skips; using them as the spread's population would assert a point that was never
+/// taken. This counts the samples the ratio was actually computed from, so `presspop >= 2` is exactly
+/// the condition under which `max` and `min` can be different measurements.
+static H_RATEN: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// Per-id: composites that did NOT reach the back layer and ran on the direct (pre-WC-H) path — the
 /// tearing regime. Excludes the deliberate fixture decline, which is counted separately.
 static H_DECLINE: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
@@ -781,6 +806,10 @@ pub fn stage_note(
         let rate_ns_4k = present_us.saturating_mul(4_096_000) / bytes as u64;
         H_MINRATE[i].fetch_min(rate_ns_4k, Ordering::Relaxed);
         H_MAXRATE[i].fetch_max(rate_ns_4k, Ordering::Relaxed);
+        // WCHFIX — the population the two extremes were drawn from, incremented in the SAME branch
+        // that feeds them so the count can never claim a sample the ratio did not see. One more
+        // `fetch_add` on an atomic already in this cache line's neighbourhood. See [`H_RATEN`].
+        H_RATEN[i].fetch_add(1, Ordering::Relaxed);
     }
     // Two budgets, one per class. See [`H_BTAKEN`] for why a shared one made the feature invisible.
     let n = if banded {
@@ -1074,7 +1103,7 @@ fn emit_sample(id: u32, i: usize) {
 /// | marker | covers | means |
 /// |--------|--------|-------|
 /// | `pop=budgeted` | `samples` `budget` | THIS SCOPE's budget only — at most [`SAMPLES`] events |
-/// | `pop=all-presents` | `torn` … `presspread` | every present/decline this WINDOW has had |
+/// | `pop=all-presents` | `torn` … `presspop` | every present/decline this WINDOW has had |
 /// | `pop=constant` | `frame_us` | a compile-time constant, not a measurement |
 ///
 /// `pop=` repeats rather than each field carrying its own suffix because the alternative was to
@@ -1105,9 +1134,11 @@ fn emit_sample(id: u32, i: usize) {
 /// - `-> AT-RISK` — `torn > 0`. Now countable past the budget and now printed after the console has
 ///   run, so a window that tears only under load says so. The pi4 spec FORBIDs it — but reads
 ///   `presspread=` alongside, because `-> AT-RISK` on its own cannot say WHY the present was slow.
-/// - `presspread=` near 1 beside `-> AT-RISK` — the presents are UNIFORMLY expensive, which is what a
-///   copy that genuinely cannot keep up with the beam looks like. This is the reading the tear FORBID
-///   was written for.
+/// - `presspread=` near 1 beside `-> AT-RISK` **and `presspop=` of 2 or more** — the presents are
+///   UNIFORMLY expensive, which is what a copy that genuinely cannot keep up with the beam looks like.
+///   This is the reading the tear FORBID was written for. `presspop=1` beside the same ratio is NOT
+///   that reading and never was: with one sample the max and the min are the same present and the
+///   ratio is 1 by construction. See [`H_RATEN`].
 /// - `presspread=` in the tens or hundreds beside `-> AT-RISK` — the window has both very fast and
 ///   very slow presents of the same bytes. A copy does not vary by that factor; a machine that stops
 ///   running underneath it does. On QEMU without `-icount` that is a host desched being charged to the
@@ -1157,7 +1188,16 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
     // recorder, so a window that reaches `-> AT-RISK` has recorded a present — the one residual is a
     // present of ZERO BYTES, which the rate recorder skips and which `stage_window`'s degenerate-
     // geometry decline is there to make unreachable. Should one ever arrive, `presspread=0` is in the
-    // single-digit class the pi4 spec's FORBID convicts, so the unmeasured case fails SAFE.
+    // single-digit class the pi4 spec's FORBID convicts — and `presspop=0` now says so explicitly
+    // rather than leaving the reader to infer it from a zero ratio.
+    //
+    // WCHFIX — `presspop=` is the number of presents the two extremes were taken over, and it is what
+    // makes `presspread=` readable at all. At `presspop=1` the max and the min are the SAME sample, so
+    // the ratio is 1 by arithmetic and says nothing about evenness; the single-digit reading that the
+    // pi4 spec convicts is, on that line, an identity rather than a measurement. The spec keys its
+    // FORBID on `presspop` >= 2 for that reason. Nothing here changes the verdict: a window that tore
+    // still reads `-> AT-RISK` whatever its population, because the tear was measured and the spread
+    // was not.
     //
     // `lo.max(1)` rather than a branch: a present fast enough to round to a rate of zero is a present
     // faster than one nanosecond per 4 KiB, i.e. below the timer's resolution, and a window holding one
@@ -1184,7 +1224,8 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
     // `-> {verdict}` are matched in this order by the pi4 track's regression spec, which also relies
     // on `scope=window ` carrying a TRAILING SPACE so its pattern cannot match `scope=window-band`.
     // Everything WC-H2 added — `emit=`, `age_ms=`, the `pop=` markers, `budget=`, `lines=` — and
-    // everything WCH-SPREAD added — `minpresent_us=`, `presspread=` — is an INSERTION between existing
+    // everything WCH-SPREAD added — `minpresent_us=`, `presspread=` — and WCHFIX's `presspop=` is an
+    // INSERTION between existing
     // keys. Nothing is renamed, nothing is reordered, and the terminal stays terminal. The two new
     // keys go INSIDE the `pop=all-presents` run, beside `maxpresent_us=` whose population they share;
     // putting them after `pop=constant` would have filed two measurements under the marker that means
@@ -1192,7 +1233,7 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
     // same rule for the same reason: an INSERTION, and it goes directly after the `declines=` total it
     // decomposes, inside `pop=all-presents` because it shares that population exactly.
     serial_println!(
-        "[wc-h] rollup win={} scope={} emit={} age_ms={} pop=budgeted samples={} budget={} pop=all-presents torn={} declines={} decl_geom={} decl_cap={} decl_lock={} decl_alloc={} fixture={} whole={} banded={} lines={} minspan={} minspan_bytes={} maxpresent_us={} minpresent_us={} presspread={} pop=constant frame_us={} -> {}",
+        "[wc-h] rollup win={} scope={} emit={} age_ms={} pop=budgeted samples={} budget={} pop=all-presents torn={} declines={} decl_geom={} decl_cap={} decl_lock={} decl_alloc={} fixture={} whole={} banded={} lines={} minspan={} minspan_bytes={} maxpresent_us={} minpresent_us={} presspread={} presspop={} pop=constant frame_us={} -> {}",
         id,
         scope,
         emit,
@@ -1214,6 +1255,7 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
         H_MAXPRES[i].load(Ordering::Relaxed),
         minpresent,
         presspread,
+        H_RATEN[i].load(Ordering::Relaxed),
         FRAME_US,
         verdict
     );

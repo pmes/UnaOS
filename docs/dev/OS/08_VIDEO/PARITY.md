@@ -633,7 +633,11 @@ reader to rediscover it:
 
 The FORBID's `presspread=[0-9] ` carries a trailing space, so it convicts the **single-digit** spread
 class only — deliberately, per the WCH-SPREAD block above: `presspread=0` means "no present recorded
-at all", and the single-digit class is convicted alongside it so the unmeasured case fails safe. The
+at all", and the single-digit class is convicted alongside it so the unmeasured case fails safe.
+*(Superseded in part by WCHFIX, 2026-08-18: the pattern is now
+`presspread=[0-9] presspop=([2-9]|[0-9]{2,}) .*-> AT-RISK`, and the `presspread=0` fail-safe clause is
+retired — a spread with fewer than two points is not a spread. See engine.md §WCHFIX. The counts in
+the table above are the pre-WCHFIX pattern's and are left as recorded.)* The
 rollup count is identical (292) and the raw AT-RISK rate is flat-to-better (282 → 280 → 199). What
 moved is the *distribution*: `presspread` on AT-RISK lines went from mostly 10/29/34/45 before to
 mostly 3/6/11/12 after. A **lower** spread is a more consistent compositor — and it is precisely that

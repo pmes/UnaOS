@@ -978,7 +978,45 @@ REQUIRE \[wc-h\] rollup win=.* scope=window .*declines=.* -> TEAR-FREE
 # ---    THE FORBID IS PROVEN ABLE TO FIRE, per this repo's go-red discipline: replaying a green
 # ---    capture with one rollup rewritten to the metal defect's shape (`torn=3 … presspread=1 ->
 # ---    AT-RISK`) reds the suite. See the landing report.
-FORBID \[wc-h\] .*presspread=[0-9] .*-> AT-RISK
+# ---
+# --- WCHFIX — the conviction band needs a POPULATION (2026-08-18).
+# ---    THE COMPOSITION DEFECT, found by the x86 seat replaying this spec against their merged tree.
+# ---    `presspread=` is `max/min` over the presents a window has had. A rollup whose window has had
+# ---    exactly ONE present reads `presspread=1` BY CONSTRUCTION — max and min are the same sample and
+# ---    the ratio is an arithmetic identity, not a measurement of evenness. That lands squarely inside
+# ---    the single-digit band above, so a single-present window that also tore was convicted on
+# ---    evidence that did not exist. Measured at roughly 1 red in 5 runs of an otherwise 117/117 suite,
+# ---    concentrated on the shortest and most loaded boots — exactly the desched regime the
+# ---    discriminator was added to EXCUSE. WCH-STALL cannot divert a window's first present either:
+# ---    there is no earned floor yet to divert it against.
+# ---
+# ---    THE FIX IS IN THE EMITTER, NOT IN THIS PATTERN'S BAND. Widening the band to exempt
+# ---    `presspread=1` would also exempt the REAL single-digit conviction on a POPULATED window — and
+# ---    `presspread=1` on a populated window is the s69 metal reading almost exactly (1.0002). So
+# ---    `wcg.rs` now publishes `presspop=`, the number of presents the two extremes were drawn from,
+# ---    as an INSERTION directly after `presspread=` inside the same `pop=all-presents` run, and this
+# ---    pattern keys on it: convict only where the spread had at least two points to be a spread over.
+# ---    `presspop=` is a census, like everything around it — the VERDICT is untouched. A window that
+# ---    tore still prints `-> AT-RISK` at any population, because the tear was measured even where the
+# ---    spread was not; withholding the verdict would have been a lie about the panel, and reporting
+# ---    `TEAR-FREE` over a measured tear is the WC-K mistake this module has already been corrected for.
+# ---
+# ---    WHAT IS GIVEN UP: a real tear on a window that presented exactly once escapes this gate. That
+# ---    is the same trade the paragraph above makes, in the one place where it is not a judgement call
+# ---    at all — with one sample there is no spread to read, so the gate is silent where it cannot
+# ---    tell rather than convicting on an identity. This also RETIRES the `presspread=0` fail-SAFE
+# ---    claim above: `presspop=0` is now excluded for the same reason `presspop=1` is, and it is the
+# ---    honest reading — a window with no measured present has no spread either. The case remains
+# ---    unreachable on an `-> AT-RISK` line for the reason stated there (the tear counter and the rate
+# ---    census are written side by side on every present), and `presspop=` is what now makes that
+# ---    unreachability CHECKABLE on the wire instead of asserted.
+# ---
+# ---    BOTH DIRECTIONS PROVEN, per go-red discipline, with synthetic captures through mbench:
+# ---      * go-red ALIVE: a rollup at `torn=3 … presspread=1 presspop=430 … -> AT-RISK` still reds.
+# ---      * false-red DEAD: the same rollup at `presspread=1 presspop=1` no longer hits.
+# ---    The `([2-9]|[0-9]{2,})` alternation is "two or more" without a lookahead, which this grammar's
+# ---    Python `re` would support but which the surrounding patterns do not use.
+FORBID \[wc-h\] .*presspread=[0-9] presspop=([2-9]|[0-9]{2,}) .*-> AT-RISK
 FORBID \[wc-h\] .*-> UNSTAGED
 
 # --- CURSOR-3 — overlay-present path (printed alongside [wc-i], witness-feature only) ----------
