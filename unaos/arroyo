@@ -120,6 +120,15 @@ NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=c
 # here), so `UNAOS_V3D_DISPATCHDISC=1` alone is sufficient. The only registers it writes are the PCTR
 # counter-file config registers mainline's v3d_perfmon.c writes on every perfmon start.
 # See the kernel8 knob block below and v3d.md §49.25.4.
+#
+# PI-V3D-102: UNAOS_V3D_HFIRST=1 is a plain arming knob (no value) for the `v3d_hfirst` feature — the
+# `[v3d102]` hfirst order arm, v3d.md §49.25.5. It adds NO leg, NO kick and NO instrument: it REORDERS
+# the `[v3d100]` ladder's content legs to E -> H -> F -> G so that leg H — the m4-class minimum over the
+# REAL coordinate shader, which DOES write VPM — runs FIRST, instead of standing down behind leg G's
+# never-closing frame as it has on every boot to date. It therefore implies `v3d_dispatchdisc` (declared
+# in Cargo.toml and armed here), so `UNAOS_V3D_HFIRST=1` alone is sufficient. It writes no register the
+# implied chain does not already write, and the CT0-hygiene gate is mirrored, not weakened.
+# See the kernel8 knob block below and v3d.md §49.25.5.
 KERNEL_FEATURES=""
 _feats=""
 # DEFAULT-QUIET: UNAOS_WITNESS=1 arms the `witness` fixture-battery feature (auto-set above for the battery
@@ -1612,7 +1621,7 @@ KERNEL_CFG_MATRIX=(
   # PI-DESK (`pidesk` — the desktop furniture family on the Pi panel; this leg carries `witness`, so it
   # is also the only place the dock/menubar/crystal FIXTURES are type-checked on aarch64).
   # Cannot carry the tegra family — see the mutual-exclusion note above.
-  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,pidesk,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,fatperf"
+  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,pidesk,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,fatperf"
   # aarch64 board leg 2 — Jetson Orin Nano (Tegra234), plus the board-neutral aarch64 features that
   # would otherwise ride nothing: ORIN-SMP (tegrasmp/smpprobe), the four XCARVE levers, ORIN-NET-1..4
   # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET
@@ -2973,6 +2982,47 @@ kernel8() {
     if [ -n "${UNAOS_V3D_DISPATCHDISC:-}" ]; then
         K8_FEATS="${K8_FEATS},v3d_dispatchdisc,v3d_bincontent,v3d_armedclose,v3d_tsaim,v3d_basedaim,v3d_unarmclose,v3d"
         echo -e "${COLOR_YELLOW}  • UNAOS_V3D_DISPATCHDISC: the [v3d101] dispatch-discriminator rung — NO new leg and NO new kick, an eight-slot PCTR bank armed ONCE before leg E and read across legs E/F/G/H (FEP prims · QPU coord/instr cycles · src32 CYCLE_COUNT control · L2T VCD reads · both VPM stalls · PTB prims-binned) plus a bit-by-bit INT_STS decode, with §49.25.4's D1/D2/D3/D4 outcomes pre-written on leg G's verdict line (⚠ implies UNAOS_V3D_BINCONTENT; short capture — do not diff against a deep boot)${COLOR_RESET}"
+    fi
+    # PI-V3D-102: UNAOS_V3D_HFIRST=1 adds the `v3d_hfirst` feature — v3d.md §49.25.5's HFIRST order arm.
+    # It therefore IMPLIES UNAOS_V3D_DISPATCHDISC (and UNAOS_V3D_BINCONTENT, UNAOS_V3D_ARMEDCLOSE,
+    # UNAOS_V3D_TSAIM, UNAOS_V3D_BASEDAIM, UNAOS_V3D_UNARMCLOSE, UNAOS_V3D): the cargo feature declares
+    # `v3d_hfirst = ["v3d_dispatchdisc"]` so the implication cannot be forgotten, and this block arms the
+    # whole chain itself. UNAOS_V3D_HFIRST=1 ALONE is sufficient to stage the boot.
+    # IT ADDS NO LEG, NO KICK AND NO INSTRUMENT. The boot still takes EIGHT CT0 closes; every leg's list,
+    # prologue, eleven referenced regions, digests and poison collars are byte-for-byte what
+    # UNAOS_V3D_BINCONTENT submits, and the [v3d101] PCTR bank is still armed ONCE before leg E and read
+    # across all four production legs.
+    # THE ONE CHANGE: the content order is E -> H -> F -> G, not E -> F -> G -> H.
+    # WHY: boot 12 returned OUTCOME D2 on leg G — QPU=5 cycles and INT_STS bit16 (QPU program end) with
+    # FEP=0 VCD=0 VPM=0 PTB=0 and FLDONE=0, while legs E and F (which feed NO primitives) both close.
+    # Leg G's coord shader is the NULL shader BY DESIGN, so D2 there is CORRECT thread behaviour and not
+    # a wall verdict: the binner's flush is waiting forever on a VPM delivery the null shader never
+    # makes. The decisive experiment is LEG H — the m4-class minimum over the REAL coordinate shader,
+    # which DOES write VPM — and leg H has NEVER RUN, because leg G leaves the frame open every time and
+    # the CT0-hygiene gate stands H down behind it. This knob puts H where the gate can still admit it:
+    # directly after leg E's clean close.
+    # THE HYGIENE GATE IS NOT WEAKENED, IT IS MIRRORED. The ladder loop is unchanged, so whichever leg
+    # leaves the frame open stands the rest down — armed, that is F and G standing down behind a hung H,
+    # by exactly the rule that stood H down before.
+    # Wire outcomes are pre-written on LEG H's own [v3d102] HFIRST VERDICT line, which splits FIRST on
+    # whether the frame CLOSED (the one fact boot 12 never produced) and only then on the counters:
+    # H1 = closed with MORE than the empty close's 20 pool words, CONTENT FLOWS and the wall dissolves;
+    # H2 = closed at exactly 20, the frame CLOSES EMPTY (a clipper/state question, not a dispatch one);
+    # H3 = not closed but VPM/PTB MOVED, delivery happens and the close STILL HANGS (wall downstream of
+    # the delivery); H4 = not closed, QPU moved, VPM/PTB FLAT, the real shader also fails to deliver and
+    # THE VPM WRITE PATH ITSELF is the wall. Two INCONCLUSIVE guards sit in front of all four, one
+    # NO-ROW guard catches a flat-QPU leg H (a D1 shape, where H4 is NOT earned), and one catches a close
+    # below 20 words. The line prints leg H's QPU cycle delta explicitly against boot 12's leg G value
+    # of 5 — the real shader should burn MORE, and a delta at or near 5 is itself a finding.
+    # NO register write, NO mailbox tag and NO page-table edit is added over UNAOS_V3D_DISPATCHDISC, and
+    # CT0 is fed a BIN list on every leg — never a render list.
+    # ⚠ an armed boot deliberately produces a SHORT capture missing every banked witness: label it and
+    # NEVER diff it line-for-line against a full deep boot. QEMU raspi4b models no V3D at all, so
+    # [v3d95] prints its hub-absent SKIPPED line and returns before any leg is reached — kernel8-test
+    # green means no regression and nothing more; the verdict is attended metal.
+    if [ -n "${UNAOS_V3D_HFIRST:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_hfirst,v3d_dispatchdisc,v3d_bincontent,v3d_armedclose,v3d_tsaim,v3d_basedaim,v3d_unarmclose,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_HFIRST: the [v3d102] hfirst order arm — NO new leg, NO new kick and NO new instrument, the content ladder simply runs E -> H -> F -> G so LEG H (the m4-class minimum over the REAL coordinate shader, which DOES write VPM) runs FIRST instead of standing down behind leg G's never-closing frame, with §49.25.5's H1/H2/H3/H4 outcomes pre-written on leg H's own verdict line and the CT0-hygiene gate mirrored rather than weakened (⚠ implies UNAOS_V3D_DISPATCHDISC; short capture — do not diff against a deep boot)${COLOR_RESET}"
     fi
     # VUG-PAR: UNAOS_VUGPAR=1 adds the `vugpar` feature — band-parallel Screen::flush that splits the
     # damaged row-copy blit into disjoint scanline bands dispatched to free secondary cores (sched::

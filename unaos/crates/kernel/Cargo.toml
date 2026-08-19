@@ -1255,6 +1255,31 @@ v3d_bincontent = ["v3d_armedclose"]
 #   line-for-line against a full deep boot. QEMU raspi4b models no V3D PCTR block at all, so this never
 #   runs there. See docs/dev/OS/08_VIDEO/v3d.md §49.25.4.
 v3d_dispatchdisc = ["v3d_bincontent"]
+# PI-V3D-102: the HFIRST order arm — v3d.md §49.25.5, built as a REORDERING of the `[v3d100]` ladder's
+# own content legs (hence the feature IMPLIES `v3d_dispatchdisc`, and through it `v3d_bincontent`,
+# `v3d_armedclose`, `v3d_tsaim`, `v3d_basedaim` and `v3d_unarmclose`; it cannot be armed alone — leg H's
+# rows are stated against the PCTR bank, so the bank must be there to state them). IT ADDS NO LEG, NO
+# KICK AND NO INSTRUMENT — the boot still takes EIGHT closes, and every leg's list, prologue, eleven
+# referenced regions, digests and poison collars are byte-for-byte what `v3d_bincontent` builds.
+#   THE ONE CHANGE: the content order becomes E -> H -> F -> G instead of E -> F -> G -> H. WHY: boot 12
+#   returned `OUTCOME D2` on leg G — the NULL coord shader's thread RUNS (QPU=5 cycles, `INT_STS` bit16
+#   = program end) and delivers nothing, which is CORRECT behaviour for a shader that writes no VPM by
+#   construction, and which leaves the bin frame open every time. The CT0-hygiene gate then stands leg H
+#   down behind it every time, so LEG H — the m4-class minimum over the REAL coordinate shader, the one
+#   that DOES write VPM — has never run. This arm puts it directly after leg E's clean close.
+#   THE HYGIENE GATE IS NOT WEAKENED, IT IS MIRRORED: the ladder loop is unchanged, so whichever leg
+#   leaves the frame open stands the rest down — armed, that is F and G standing down behind a hung H.
+#   Leg H gains its own `[v3d102] HFIRST VERDICT` line carrying §49.25.5's four pre-written outcomes
+#   (H1 content flows · H2 the frame closes empty · H3 delivery happens and the close still hangs ·
+#   H4 the real shader also fails to deliver), plus a guard row for a leg H that never launched a thread
+#   at all. `[v3d101]`'s own emitters are NOT touched by this feature. NO register write, NO mailbox tag
+#   and NO page-table edit is added; CT0 is fed a BIN list on every leg, never a render list.
+#   Default OFF and fully uncompiled when off (every build that does not arm it is byte-identical to the
+#   pre-arc build). Enable via `UNAOS_V3D_HFIRST=1 UNAOS_PI=1 ./arroyo kernel8`. ⚠ an armed boot
+#   deliberately produces a SHORT capture missing every banked witness; it must never be diffed
+#   line-for-line against a full deep boot. QEMU raspi4b models no V3D at all, so this never runs there.
+#   See docs/dev/OS/08_VIDEO/v3d.md §49.25.5.
+v3d_hfirst = ["v3d_dispatchdisc"]
 
 # PI-USB-1: the BCM2711 PCIe root complex + VL805 xHCI attach (arch/aarch64/piusb.rs) — brcmstb RC
 # bridge reset / link-up / MEM-window + inbound-BAR config, VL805 (1106:3483) enumeration + BAR sizing,

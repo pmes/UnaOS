@@ -15453,6 +15453,14 @@ fn v3d95_unarmed_close_rung() {
     serial_println!(
         ":: V3D: [v3d101] CORRECTION TO ALL FIVE LINES ABOVE — UNAOS_V3D_DISPATCHDISC=1 is armed on top of them. IT ADDS NO LEG AND NO KICK: this boot still takes EIGHT CT0 kicks and legs A..H are exactly as the four lines above describe them, byte for byte. What it adds is INSTRUMENTATION on the four legs that carry leg E's production bases — a V3D performance-counter bank (v3d.md §49.25.4 `dispatchdisc`), armed ONCE immediately before leg E's kick and left running across E/F/G/H, plus a bit-by-bit INT_STS decode on each of those legs. Eight counter slots: FEP valid primitives, the two QPU cycle sources, the reserved src32 CYCLE_COUNT control, VCD attribute reads through L2T, both VPM stall sources and PTB primitives-binned. The ONLY registers it writes are the PCTR counter-file config registers mainline's v3d_perfmon.c writes on every perfmon start; no CLE, PTB, VCD, MMU or fabric state is touched, no page table is edited, no mailbox tag is sent. §49.20.2's V2a law rides UNCHANGED and is strengthened in code: every counter read on every leg happens strictly AFTER that leg's read-once violation pair. Everything else all five headers say still holds, including the boot RETURNING before probe_job ::"
     );
+    // PI-V3D-102: and one line further still. `UNAOS_V3D_HFIRST=1` adds NO leg, NO kick and NO
+    // instrument — the leg count stays EIGHT and every leg's body is byte-identical. What it changes is
+    // the ORDER in which the three content legs are taken, and the correction it owes is about that
+    // order and about WHY boot 12 demands it.
+    #[cfg(feature = "v3d_hfirst")]
+    serial_println!(
+        ":: V3D: [v3d102] CORRECTION TO ALL SIX LINES ABOVE — UNAOS_V3D_HFIRST=1 is armed on top of them, and it REORDERS THE CONTENT LADDER. It adds NO leg, NO kick and NO instrument: this boot still takes EIGHT CT0 kicks, every leg's list, prologue, referenced regions, digests and collars are byte-identical to what the lines above describe, and the [v3d101] bank is still armed ONCE before leg E and read across all four production legs (v3d_hfirst IMPLIES v3d_dispatchdisc, so the PCTR bank and the INT_STS decode read leg H too). THE ONE CHANGE: the content order is E -> H -> F -> G, not E -> F -> G -> H. WHY, verbatim from boot 12's [v3d101] LEG G verdict: 'OUTCOME D2 — THE THREAD RUNS AND DELIVERS NOTHING. QPU cycles moved, so a coord thread launched and executed; no VPM-side event and no binned primitive followed it.' Boot 12 measured QPU=5 cycles and INT_STS bit16 (QPU program-end) on leg G with FEP=0, VCD=0, VPM=0, PTB=0 and FLDONE=0, while legs E and F — which feed NO primitives — both close with FLDONE=1. Leg G's coord shader is the NULL shader BY DESIGN, so D2 there is CORRECT thread behaviour and NOT a wall verdict: THE BINNER'S FLUSH IS WAITING FOREVER ON A VPM DELIVERY THE NULL SHADER NEVER MAKES. The decisive experiment is therefore LEG H, the m4-class minimum over the REAL coordinate shader that DOES write VPM — and leg H has NEVER RUN, because leg G leaves the frame open every time and the CT0-hygiene gate stands H down behind it. This knob puts H where the hygiene gate can still admit it: directly after leg E's clean close. THE GATE IS NOT WEAKENED, IT IS MIRRORED — if leg H leaves the frame open, F and G stand down by exactly the rule that stood H down before. Leg H keeps its [v3d101] delta line and its [v3d101] BASELINE line UNCHANGED and carries its own four pre-written outcomes (H1..H4, v3d.md §49.25.5) on a SEPARATE [v3d102] HFIRST VERDICT line printed after them, which prints its QPU cycle delta against boot 12's leg G measurement of 5. Read that [v3d101] BASELINE line on leg H with its own sentence inverted: it was written for a boot where H ran BEHIND G, and on this boot H runs in FRONT of it. Everything else all six headers say still holds, including the boot RETURNING before probe_job ::"
+    );
     match probe_hub_ident0() {
         V3dPresence::Up(_) => {}
         V3dPresence::Down => {
@@ -16537,6 +16545,11 @@ fn v3d101_emit_intsts(leg: &str, tag: &str, sts: u32) {
 /// `pool_words` is the leg's measured tile-alloc-pool word count (the same number the `[v3d100]` content
 /// arithmetic prints), because `D3` is stated against it: VPM/PTB movement WITH a zero pool is a PTB
 /// intake finding, and the same movement WITH a nonzero pool is not.
+///
+/// PI-V3D-102 does NOT touch this function. Leg H's own `H1`..`H4` rows (v3d.md §49.25.5) are emitted by
+/// `v3d102_emit_h_verdict` from its own cfg-gated statement at the call site in `v3d97_leg`, where the
+/// `frame_closed` fact those rows split on is already in scope — so every build that does not arm
+/// `v3d_hfirst` reaches this function through a signature and a body byte-identical to `[v3d101]`'s.
 #[cfg(feature = "v3d_dispatchdisc")]
 fn v3d101_emit_leg(leg: &str, tag: &str, s: &V3d101Sample, pool_words: u32, ts_words: u32) {
     let fep = s.moved(0);
@@ -16590,6 +16603,69 @@ fn v3d101_emit_leg(leg: &str, tag: &str, s: &V3d101Sample, pool_words: u32, ts_w
         s.armed_ok() as u32, s.ctrl_moved() as u32,
         fep as u32, qpu as u32, vcd as u32, vpm as u32, ptb as u32,
         pool_words,
+        row
+    );
+}
+
+/// PI-V3D-102 — LEG H's own verdict line, v3d.md §49.25.5, taken only where leg H actually runs (the
+/// `v3d_hfirst` order E → H → F → G). Leg G's `D` table cannot be reused here and must not be: `D2` is
+/// written about a shader that writes NOTHING to VPM by construction, and leg H's whole point is that
+/// its coordinate shader DOES write VPM. The four rows below split first on whether the frame CLOSED —
+/// the one fact boot 12's leg G never produced — and only then on the counters.
+///
+/// The line also prints leg H's QPU CYCLE COUNT explicitly, raw and delta, on both QPU sources. Boot 12
+/// measured `5` cycles on leg G's null shader; the real coordinate shader should burn MORE, and a leg H
+/// that burns ~5 is running something the size of the null shader, which is itself a finding about the
+/// shader record and not about VPM.
+#[cfg(feature = "v3d_hfirst")]
+fn v3d102_emit_h_verdict(
+    tag: &str,
+    s: &V3d101Sample,
+    pool_words: u32,
+    ts_words: u32,
+    frame_closed: bool,
+) {
+    // The same five derived flags `v3d101_emit_leg` prints, recomputed from the SAME sample rather than
+    // threaded through it — which is what keeps `[v3d101]`'s emitter untouched by this arc.
+    let fep = s.moved(0);
+    let qpu = s.moved(1) || s.moved(3);
+    let vcd = s.moved(4);
+    let vpm = s.moved(5) || s.moved(6);
+    let ptb = s.moved(7);
+    let row: &str = if !s.armed_ok() {
+        "INCONCLUSIVE — THE BANK WAS NOT FULLY ARMED AT READ. PCTR_EN lost the mask somewhere inside the window, so every delta on the line above is INCONCLUSIVE and not zero. Find what reprogrammed the counter file between the arm before leg E and this read before citing any H row; none is taken"
+    } else if !s.ctrl_moved() {
+        "INCONCLUSIVE — SLOT 2 (src32 CYCLE_COUNT) IS FLAT ACROSS THIS LEG. The bank's own control never counted, so every other slot on the line above is INCONCLUSIVE rather than clean, and no H row may be taken off it. Note what this WOULD mean if it reproduces: a frozen core cycle counter across a wait the wall held open is [v3d72]'s own WALL-FOUND branch, and it would be the finding of this boot on its own"
+    } else if frame_closed && pool_words > V3D99_BOOT6_POOL_WORDS {
+        "OUTCOME H1 — CONTENT FLOWS. The frame CLOSED and the tile-alloc pool took MORE words than the empty close's 20: a real coordinate shader's VPM delivery reached the PTB and the PTB wrote per-tile primitive-list bytes. THE WALL WAS THE NULL SHADER'S OWED DELIVERY — boot 12's leg G froze because its coord shader never wrote VPM and the binner's flush waited forever on a delivery that was never coming, which is correct hardware behaviour and not a defect. The bin stage is then WHOLE end to end for the m4-class minimum, and the campaign's last room opens: the RENDER LIST. Read the extra pool words against the [v3d100] CONTENT ARITHMETIC line and against leg E's 20 before sizing anything"
+    } else if frame_closed && pool_words == V3D99_BOOT6_POOL_WORDS {
+        "OUTCOME H2 — THE FRAME CLOSES EMPTY. The frame CLOSED (so the null shader's owed delivery WAS the freeze, and the wall in its boot-12 form is dead) but the pool took exactly the empty close's 20 words: the vertex path DELIVERS and the binner BINS NOTHING. That is not a dispatch question any more, it is a CLIPPER/STATE question — the primitive is being delivered and then discarded before it becomes tile bytes, which points at the clip/viewport/clipper state, the coordinate shader's own output values, or the tile configuration that decides which bins the triangle touches. PI-V3D-17's finding is the first thing to re-read: at POR zeros the clipper collapses every primitive to a point. Read slot7 PTB_PRIMS_BINNED on the line above — nonzero there with an empty pool narrows this to the PTB's write, zero narrows it to everything upstream of the PTB's intake"
+    } else if frame_closed {
+        "NO §49.25.5 ROW FITS — THE FRAME CLOSED AT A POOL COUNT NEITHER H1 NOR H2 PREDICTS (fewer words than the empty close's 20). A close that wrote LESS than the empty frame is a shape no leg of this rung has ever produced, and it must be named from the raw words and the [v3d100] CONTENT ARITHMETIC line before any earlier row is reused"
+    } else if vpm || ptb {
+        "OUTCOME H3 — DELIVERY HAPPENS AND THE CLOSE STILL HANGS. FLDONE is 0 again, the frame never closed, and yet a VPM-side and/or PTB-side counter MOVED on this leg: the real coordinate shader's delivery is being made and the flush is waiting on something else. THE WAIT IS NOT (ONLY) ON VPM, which retires the single cleanest reading boot 12 left standing and puts the wall downstream of the delivery — PTB intake, the per-tile write, or a flush condition this rung has not named. Read slot5/slot6 (the two VPM stalls) against slot7 (PTB_PRIMS_BINNED) and against the pool word count: prims-binned moving with a zero pool is [v3d101]'s D3 shape arriving on the REAL shader, which would make D3 the wall verdict D2 never was"
+    } else if !qpu {
+        "NO §49.25.5 ROW — THE COORD THREAD NEVER LAUNCHED ON LEG H. FLDONE is 0, the VPM side is flat, AND the QPU cycle slots are flat too, so this leg never got a thread at all and H4 IS NOT EARNED: H4's whole claim is that a thread RAN and still delivered nothing, which exonerates the shader and convicts the VPM write path. Flat QPU says the opposite — nothing was dispatched, so nothing about VPM is measured here. This is [v3d101]'s OUTCOME D1 shape (thread dispatch itself: the shader-record fetch or the thread-start/TSDA path) arriving on the REAL shader instead of the null one, and it is a DIFFERENT finding from every row this section pre-wrote. Boot 12's leg G DID launch a thread (QPU=5, INT_STS bit16), so leg H failing to launch off the same production bases and the same prologue means the one variable — this leg's shader record at OFF_SHADREC — is what dispatch choked on. Read the INT_STS decode line above: bit16 clear agrees with the counters and settles it; bit16 SET while the QPU slots read 0 is the two instruments DISAGREEING, and that disagreement outranks everything else on this line"
+    } else {
+        "OUTCOME H4 — THE REAL SHADER ALSO FAILS TO DELIVER. FLDONE is 0, the frame never closed, the QPU cycle slots MOVED (so a thread DID launch and execute — the guard row above rules out the flat-QPU case), and the VPM-side counters are FLAT — the same delta boot 12 read on the null shader, now on a coordinate shader that DOES write VPM by construction. The shader is then exonerated and THE VPM WRITE PATH ITSELF IS THE WALL: the VPM write-back stage, or the coord thread's access to it, and not what the shader was asked to write. Cross-read the QPU cycle count on this line — a leg H that burns MORE cycles than boot 12's leg G ran a bigger program and still delivered nothing, which is the strong form of this row; a leg H that burns the SAME ~5 cycles ran something the size of the NULL shader, which is a finding about the shader record this leg fetched and not about VPM at all, and it must be settled before H4 is cited"
+    };
+    serial_println!(
+        ":: V3D: [v3d102] HFIRST VERDICT ({}) LEG H — v3d.md §49.25.5's pre-written outcomes, taken against the [v3d101] delta line and the INT_STS decode above. Leg G's D table is NOT reused here: D2 is written about a shader that writes nothing to VPM by construction, and this leg's coordinate shader does | bank control: PCTR_EN-intact={} src32-moved={} | frame-closed={} FEP={} QPU={} VCD={} VPM={} PTB={} pool_words={} (empty close={}) tile-state words={} (empty close={}) | QPU CYCLES THIS LEG: slot1 src{} {} raw={} d={} · slot3 src{} {} raw={} d={} — boot 12's leg G burned 5 on the NULL shader, so the REAL coordinate shader should burn MORE and a delta at or near 5 is itself a finding — {} ::",
+        tag,
+        s.armed_ok() as u32,
+        s.ctrl_moved() as u32,
+        frame_closed as u32,
+        fep as u32,
+        qpu as u32,
+        vcd as u32,
+        vpm as u32,
+        ptb as u32,
+        pool_words,
+        V3D99_BOOT6_POOL_WORDS,
+        ts_words,
+        V3D99_BOOT6_TS_WORDS,
+        V3D101_SRC[1], V3D101_SRC_NAME[1], s.raw[1], s.d[1],
+        V3D101_SRC[3], V3D101_SRC_NAME[3], s.raw[3], s.d[3],
         row
     );
 }
@@ -17031,6 +17107,20 @@ fn v3d97_leg(
             pool_scan.zeroed + pool_scan.overwritten,
             ts_scan.zeroed + ts_scan.overwritten,
         );
+        // PI-V3D-102 — leg H's own §49.25.5 rows, AFTER [v3d101]'s delta line (which they cite) and its
+        // BASELINE line. Its own statement, its own cfg: `v3d101_emit_leg` above is untouched by this
+        // arc, so a build without `v3d_hfirst` emits exactly what [v3d101] emitted. `frame_closed` is
+        // the same BFC-Δ/retire fact the [v3d97] verdict line prints, and the H rows split on it first.
+        #[cfg(feature = "v3d_hfirst")]
+        if leg == "H" {
+            v3d102_emit_h_verdict(
+                tag,
+                s,
+                pool_scan.zeroed + pool_scan.overwritten,
+                ts_scan.zeroed + ts_scan.overwritten,
+                frame_closed,
+            );
+        }
     }
 
     // ── The verdict. §49.20.6's four rows, pre-written, plus the branches that void them. ────────
@@ -17204,11 +17294,41 @@ fn v3d97_basedaim_legs() {
             );
             let mut clean = leg_e.ct0_clean();
             if !clean {
+                // PI-V3D-102: armed, the first content leg is H, so the stand-down line has to name it.
+                // The default line below is untouched, which is what keeps a knob-off image identical.
+                #[cfg(feature = "v3d_hfirst")]
+                serial_println!(
+                    ":: V3D: [v3d102] LADDER STOOD DOWN BEFORE LEG H — leg E did not leave CT0 clean (submit_sound, frame-closed and CTRUN-clear all have to hold), and under UNAOS_V3D_HFIRST=1 the first content leg is H. A content leg measured behind an unclosed frame is §49.3's defect reproduced on purpose, so NO content kick was issued and NO content verdict is implied — H1..H4 are NOT in play on this boot. Read leg E's VERDICT: whatever it says is the finding of this boot ::"
+                );
+                #[cfg(not(feature = "v3d_hfirst"))]
                 serial_println!(
                     ":: V3D: [v3d100] LADDER STOOD DOWN BEFORE LEG F — leg E did not leave CT0 clean (submit_sound, frame-closed and CTRUN-clear all have to hold). A content leg measured behind an unclosed frame is §49.3's defect reproduced on purpose, so NO content kick was issued and NO content verdict is implied. Read leg E's VERDICT: whatever it says is the finding of this boot ::"
                 );
             }
-            for (leg, class, shadrec, what) in [
+            // ── PI-V3D-102 (`hfirst`) — THE ORDER ARM, and the only thing this knob touches.
+            //
+            // The two arms below are the SAME THREE TUPLES in two orders. Each leg's list, prologue,
+            // eleven referenced regions, digests and poison collars are the leg's own and depend on
+            // nothing about where it sits, so the order is the whole of the change.
+            //
+            // DEFAULT (knob off): F → G → H, spelled as the identical array literal `[v3d100]` shipped,
+            // so a build without `v3d_hfirst` compiles the expression it always compiled. §49.24's
+            // superset order, and the reason it was chosen is still true — each leg is a strict superset
+            // of the one before it and each is likelier to stall, so a stall lands as late as possible.
+            //
+            // ARMED (`v3d_hfirst`): H → F → G. Boot 12 turned that virtue into a dead end. Leg G's
+            // OUTCOME D2 is CORRECT behaviour for a NULL coord shader — the thread runs, writes nothing
+            // to VPM, and the binner's flush waits forever on the delivery it is owed — so leg G leaves
+            // the frame open EVERY TIME and the hygiene gate stands leg H down behind it, every time.
+            // Leg H is the decisive experiment (the m4-class minimum over the REAL coordinate shader,
+            // which DOES write VPM) and it has never run. This arm puts it directly after leg E's clean
+            // close, which is the only place on this ladder a leg can be admitted.
+            //
+            // THE HYGIENE GATE IS NOT WEAKENED, IT IS MIRRORED. The loop below is unchanged: whichever
+            // leg leaves the frame open, everything after it stands down. Armed, that means F and G
+            // stand down if H hangs — the exact mirror of what F/G/H does to H today.
+            #[cfg(not(feature = "v3d_hfirst"))]
+            let ladder = [
                 (
                     "F",
                     BinContent::StateNoPrims,
@@ -17227,7 +17347,33 @@ fn v3d97_basedaim_legs() {
                     OFF_SHADREC,
                     "v3d100 R-next-4 bincontent leg H (PRODUCTION bases + armed prologue, the m4-class MINIMUM: one tile config + one flat triangle)",
                 ),
-            ] {
+            ];
+            #[cfg(feature = "v3d_hfirst")]
+            let ladder = [
+                (
+                    "H",
+                    BinContent::Full,
+                    OFF_SHADREC,
+                    "v3d100 R-next-4 bincontent leg H (PRODUCTION bases + armed prologue, the m4-class MINIMUM: one tile config + one flat triangle)",
+                ),
+                (
+                    "F",
+                    BinContent::StateNoPrims,
+                    OFF_SHADREC,
+                    "v3d100 R-next-4 bincontent leg F (PRODUCTION bases + armed prologue, STATE and NO PRIMS)",
+                ),
+                (
+                    "G",
+                    BinContent::PrimsNullShader,
+                    OFF_BISECT_NULL_SHADREC,
+                    "v3d100 R-next-4 bincontent leg G (PRODUCTION bases + armed prologue, PRIMS with the NULL coord shader)",
+                ),
+            ];
+            #[cfg(feature = "v3d_hfirst")]
+            serial_println!(
+                ":: V3D: [v3d102] HFIRST ORDER — the content ladder below runs E -> H -> F -> G, NOT the [v3d100] header's E -> F -> G -> H, and the [v3d100] BINCONTENT LADDER line printed above describes the legs correctly but names the DEFAULT order. Every leg's list, prologue, eleven referenced regions, digests and poison collars are byte-identical to what that line describes; only the order changed, and only because boot 12's leg G returned OUTCOME D2 on the NULL coord shader — correct thread behaviour, a frame left open every time, and leg H stood down behind it every time. LEG H IS THE DECISIVE EXPERIMENT AND IT HAS NEVER RUN. The CT0-hygiene gate is unchanged and now guards the other way: if leg H leaves the frame open, F and G stand down by the same rule. Leg H carries §49.25.5's H1..H4 on its own [v3d102] HFIRST VERDICT line; legs F and G, if they run, stay [v3d101] baselines and leg G keeps its D table ::"
+            );
+            for (leg, class, shadrec, what) in ladder {
                 if !clean {
                     serial_println!(
                         ":: V3D: [v3d100] LEG {} STOOD DOWN — the leg before it did not close its frame or did not leave CTRUN clear, so this leg would be measured on a dirty CT0 and its result would carry no information (v3d.md §49.3). NO kick was issued and NO verdict is implied ::",
@@ -17241,8 +17387,12 @@ fn v3d97_basedaim_legs() {
             serial_println!(
                 ":: V3D: [v3d100] BINCONTENT COMPLETE — the ladder is taken and nothing else runs; the boot returns before probe_job. Read leg E's VERDICT BEFORE any of F/G/H: leg E is the EMPTY control for all three, taken on the same boot, the same image, the same bases and the same prologue, and a boot whose leg E did not return OUTCOME E1 leaves the content legs with no baseline. Then read F, G and H in that order — each is a strict superset of the one before it, so the FIRST leg whose verdict changes is where content enters. CT0QMA/CT0QMS/CT0QTS are LEFT PROGRAMMED at the production values, as leg E left them ::"
             );
+            #[cfg(feature = "v3d_hfirst")]
+            serial_println!(
+                ":: V3D: [v3d102] HFIRST COMPLETE — the reordered ladder is taken and nothing else runs; the boot returns before probe_job. The [v3d100] BINCONTENT COMPLETE line directly above says 'read F, G and H in that order' and THAT SENTENCE IS SUPERSEDED ON THIS BOOT: read leg E's VERDICT first (the EMPTY control, same boot, same image, same bases, same prologue — a leg E that did not return OUTCOME E1 leaves leg H with no baseline), then LEG H's [v3d101] INT_STS DECODE, its [v3d101] DISPATCHDISC delta line and its [v3d102] HFIRST VERDICT. Legs F and G run only if H closed and left CTRUN clean; if they ran they are [v3d101] baselines behind H rather than in front of it, and a slot that moves on F or G but not on H says the opposite of what §49.25.4's baseline sentence says, because the order it describes is the one this knob inverted. CT0QMA/CT0QMS/CT0QTS are LEFT PROGRAMMED at the production values, as leg E left them ::"
+            );
             // PI-V3D-101 — the bank is stopped by whoever armed it, on every path out of the ladder
-            // (stood down or run to leg H). Nothing runs after this in any case.
+            // (stood down or run to the ladder's last leg). Nothing runs after this in any case.
             #[cfg(feature = "v3d_dispatchdisc")]
             v3d101_pctr_stop();
         }

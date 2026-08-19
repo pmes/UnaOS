@@ -8560,3 +8560,136 @@ measured on the leg that fails, not the leg that would.
 *Fold discipline note:* boot11 flew and was read the same sitting; this fold was written by the
 successor session (pi 1) from the capture per the baton's explicit no-folds-at-close order — the
 capture, not this prose, is the evidence of record.
+
+#### 49.25.5 `hfirst` (PI-V3D-102) — run leg H first, because leg G can never let it run
+
+This records the rung as **built**, on the terms §49.25.4a recorded its predecessor's: a **design note,
+not a verdict**. QEMU raspi4b models no V3D at all, so nothing below has been observed; the gates are
+compile, presence-in-artifact and knob-off byte-identity, and the reading rules are written *before* the
+boot that will decide them.
+
+**What boot 12 established, and the trap inside it.** Leg G returned `OUTCOME D2`: QPU cycles moved
+(**5**, with `INT_STS` bit16 — QPU 0's program-end host interrupt — set), and `FEP=0 VCD=0 VPM=0 PTB=0`
+with `FLDONE=0` and the frame never closing. Legs E and F, which feed **no** primitives, both closed with
+`FLDONE=1`. §49.25.4 pre-wrote D2 as *explicitly not a wall verdict*, and that pre-writing paid: leg G's
+coord shader is the **NULL shader**, a real dispatching thread that writes nothing to VPM **by
+construction**. A thread that runs and delivers nothing is therefore exactly what healthy silicon does
+here. **The wall is an owed VPM delivery** — the binner's flush waits forever for a delivery the null
+shader was never going to make.
+
+That is correct hardware behaviour, and it is also a **trap in the ladder's own structure**. §49.24 chose
+the order F → G → H because each leg is a strict superset of the one before it and each is likelier to
+stall, so a stall lands as late as possible. Boot 12 turned that virtue into a dead end:
+
+- leg G leaves the bin frame **open, every time**, for a reason that is not a defect and will not
+  go away;
+- the CT0-hygiene gate (§49.3's founding lesson — never measure a leg behind an unclosed frame)
+  therefore stands **leg H** down, every time;
+- **leg H is the decisive experiment** — the m4-class minimum over the **real** coordinate shader, the
+  one that **does** write VPM — and **it has never run**, on any boot in this campaign.
+
+The ladder is structurally incapable of reaching its own decisive leg. Boot 13 fixes that, and it is the
+only thing boot 13 changes.
+
+**The change, stated at its narrowest.** `UNAOS_V3D_HFIRST=1` reorders the content legs to
+**E → H → F → G**. It adds **no leg, no kick and no instrument**: the boot still takes eight CT0 closes,
+every leg's list, prologue, eleven referenced regions, digests and poison collars are byte-for-byte what
+`v3d_bincontent` builds, and the `[v3d101]` `PCTR` bank is still armed once before leg E and read across
+all four production legs. The feature implies `v3d_dispatchdisc` — leg H's rows are stated against the
+bank, so the bank must be present to state them. In code the whole arm is **two `#[cfg]`'d array
+literals**: the same three tuples, in two orders.
+
+**The hygiene gate is mirrored, not weakened.** The ladder loop is untouched — after each leg it
+re-checks `ct0_clean()` and stands the rest down. Armed, that means **F and G stand down if H hangs**, by
+exactly the rule that stood H down before. No protection is relaxed to buy this boot; the gate simply now
+guards in the direction that lets the decisive leg through. `[v3d101]`'s own emitters are likewise
+untouched: leg H keeps its `[v3d101] INT_STS DECODE`, its `[v3d101] DISPATCHDISC` delta line and its
+`[v3d101] BASELINE` line unchanged, and the `[v3d102]` verdict is printed **after** them, from its own
+cfg-gated statement at the call site.
+
+*One wire line reads inverted on this boot, and says so.* Leg H's `[v3d101] BASELINE` sentence was
+written for a ladder where H ran *behind* G. The `[v3d102] CORRECTION` header and the
+`[v3d102] HFIRST COMPLETE` line both name this explicitly: a slot that moves on F or G but not on H says
+the **opposite** of what §49.25.4's baseline sentence says, because the order it describes is the one
+this knob inverted.
+
+**The four outcomes, pre-written on leg H's own `[v3d102] HFIRST VERDICT` line.** They split **first on
+whether the frame CLOSED** — the one fact boot 12 never produced — and only then on the counters. Two
+INCONCLUSIVE guards are taken before any of them (the bank lost its enable mask inside the window, or
+slot 2's `src32 CYCLE_COUNT` control never moved), and neither yields an H row.
+
+| leg H reads | verdict | what it means for the campaign |
+|---|---|---|
+| frame **CLOSED**, pool words **> 20** | `OUTCOME H1` | **content flows — the wall dissolves.** A real coordinate shader's VPM delivery reached the PTB and the PTB wrote per-tile primitive-list bytes. The wall *was* the null shader's owed delivery, and it was never a defect. The bin stage is then **whole end to end** for the m4-class minimum, and the campaign's last room opens: **the render list** |
+| frame **CLOSED**, pool words **== 20** (the empty close) | `OUTCOME H2` | **binned but empty.** The freeze in its boot-12 form is dead — the vertex path *delivers* — but the binner bins nothing. No longer a dispatch question: a **clipper/state** question. PI-V3D-17 is the first thing to re-read (at POR zeros the clipper collapses every primitive to a point). Slot 7 `PTB_PRIMS_BINNED` splits it: nonzero with an empty pool narrows to the PTB's write, zero narrows to everything upstream of its intake |
+| frame **open**, VPM and/or PTB **moved** | `OUTCOME H3` | **delivery happens and the close still hangs.** The flush is waiting on something *other* than VPM, which retires the cleanest reading boot 12 left standing and puts the wall **downstream** of the delivery — PTB intake, the per-tile write, or a flush condition this rung has not named. Prims-binned moving with a zero pool is `D3`'s shape arriving on the **real** shader, which would make D3 the wall verdict D2 never was |
+| frame **open**, QPU **moved**, VPM and PTB **flat** | `OUTCOME H4` | **the VPM write path itself is broken.** The same delta boot 12 read on the null shader, now on a shader that writes VPM by construction — so the shader is **exonerated** and the wall is the VPM write-back stage, or the coord thread's access to it. Cross-read the QPU cycles: **more** than boot 12's 5 is the strong form; **at or near 5** means this leg ran something the size of the null shader, a finding about the *shader record* and not about VPM, and it must be settled first |
+
+Two further guard rows keep those four honest, and neither is an outcome:
+
+- frame **open** and the **QPU slots flat too** ⇒ **no H row.** The thread never launched, so `H4` is not
+  earned — H4's whole claim is that a thread *ran* and still delivered nothing. This is `[v3d101]`'s `D1`
+  shape arriving on the real shader. Boot 12's leg G *did* launch (QPU=5, bit16), so a leg H that fails
+  to launch off the same production bases and the same prologue indicts the one variable: this leg's
+  shader record at `OFF_SHADREC`. `INT_STS` bit16 set while the QPU slots read 0 is the two instruments
+  **disagreeing**, and that disagreement outranks everything else on the line.
+- frame **closed** at **fewer than 20** pool words ⇒ **no row fits.** A close that wrote *less* than the
+  empty frame is a shape no leg of this rung has produced; name it from the raw words before reusing any
+  earlier row.
+
+The line also prints leg H's QPU cycle count **raw and delta on both QPU sources**, against boot 12's leg
+G measurement of 5, because three of the six rows above are read differently depending on it.
+
+**Scope and family law.** No register write, no mailbox tag and no page-table edit is added over
+`UNAOS_V3D_DISPATCHDISC`; the arena geometry is unchanged; **CT0 is fed a BIN list on every leg, never a
+render list** (driver law — RCLs run on CT1). The boot returns before `probe_job`, so the knob can never
+sit beside `[v3d75]`'s `ENABLE_QPU` or `[v3d80]`/`[v3d81d]`'s `DISPLAY_DONE` sends. §49.20.2's V2a law
+rides unchanged.
+
+**Measured, this arc** (worktree `unaos-wt-exec-v3dhfirst`, baseline `0d865227`):
+
+| gate | result |
+|---|---|
+| `./arroyo check` | green, both arches; `arm-pi` green with `v3d_hfirst` appended to its feature list, `kernel cfg coverage OK (12 legs)` |
+| `UNAOS_WC=1 ./arroyo check` | green, both arches |
+| knob-off byte-identity, `UNAOS_PI=1 ./arroyo kernel8` | arc `2295fe1e501fb637…` **==** baseline `2295fe1e501fb637…` |
+| **dispatchdisc-armed** byte-identity, `UNAOS_V3D_DISPATCHDISC=1 UNAOS_PI=1 ./arroyo kernel8` | arc `e748aafb1a50b5ec…` **==** baseline `e748aafb1a50b5ec…` — the stronger claim, and the reason `v3d101_emit_leg`'s signature was left alone |
+| implication proved by image | `UNAOS_V3D_HFIRST=1` **alone** builds `3bbc070d67c1da47…` — the same digest as the full eight-knob line, so the chain is armed by the feature and not by the operator |
+| armed build banner | `UNAOS_V3D_HFIRST` echoes its knob line |
+| strings-proof, armed image `3bbc070d67c1da47…` | `v3d102] CORRECTION TO ALL SIX` 1 · `v3d102] HFIRST ORDER` 1 · `v3d102] HFIRST VERDICT` 1 · `v3d102] HFIRST COMPLETE` 1 · `v3d102] LADDER STOOD DOWN BEFORE LEG H` 1 · `OUTCOME H1` 1 · `OUTCOME H2` 1 · `OUTCOME H3` 1 · `OUTCOME H4` 1 · `THE COORD THREAD NEVER LAUNCHED ON LEG H` 1 · `THE FRAME CLOSED AT A POOL COUNT NEITHER H1 NOR H2` 1 |
+
+*Note on the strings-proof method:* the wire strings contain em-dashes (UTF-8 multibyte), which `strings` treats
+as non-printable and splits on, so each row above was probed on its ASCII-only fragment. An unsplit search for
+`"OUTCOME H1 — CONTENT FLOWS"` returns 0 and means nothing.
+
+No QEMU battery was run and none is claimed: **raspi4b models no V3D at all**, so `[v3d95]` prints its
+hub-absent SKIPPED line and returns before any leg is reached. Metal is the verdict; the gate here is
+checks plus strings-proof plus byte-identity.
+
+*Scope of the byte-identity claim.* **Every build that does not arm `v3d_hfirst` is byte-identical to the
+pre-arc build** — including a `UNAOS_V3D_DISPATCHDISC=1` build, because `[v3d101]`'s emitters and
+`v3d101_emit_leg`'s signature are untouched by this arc and the default ladder is the same array literal
+`[v3d100]` shipped. That covers every boot that is not this experiment.
+
+**What the sitting needs.** One image, image name **PA50**:
+
+```
+UNAOS_V3D_HFIRST=1 UNAOS_PI=1 ./arroyo kernel8
+```
+
+`UNAOS_V3D_HFIRST=1` **alone** is sufficient — the feature chain arms `v3d_dispatchdisc`,
+`v3d_bincontent`, `v3d_armedclose`, `v3d_tsaim`, `v3d_basedaim`, `v3d_unarmclose` and `v3d` itself.
+
+A **cold** power-cycle, as boots 4/7/8/9/11/12 were. One short capture, labelled, **never** diffed
+line-for-line against a deep boot. **Read in this order:** the `[v3d102] CORRECTION` line and the
+`[v3d102] HFIRST ORDER` line (which together supersede the six headers above them on the order question
+only), then **leg E's verdict** — the empty control, same boot, same image, same bases, same prologue; a
+leg E that did not return `OUTCOME E1` leaves leg H with no baseline and the boot decides nothing — then
+**leg H's** `[v3d101] INT_STS DECODE`, its `[v3d101] DISPATCHDISC` delta line, and finally its
+`[v3d102] HFIRST VERDICT`. Legs F and G run **only if H closed**; if they ran, they are `[v3d101]`
+baselines sitting *behind* H rather than in front of it.
+
+**This is the campaign's decisive boot.** Every one of the four outcomes is progress and none of them is
+a null result: `H1` ends the bin-stage campaign and opens the render list; `H2` moves the question from
+dispatch to the clipper; `H3` puts the wall downstream of a delivery that provably happens; `H4` convicts
+the VPM write path and exonerates the shader. The leg that has never run is the leg that answers.
