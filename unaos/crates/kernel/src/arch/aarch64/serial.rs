@@ -286,6 +286,90 @@ impl SerialPort {
     }
 }
 
+// ---- SERFIX: the input poll DECLINES a held port instead of blocking on it ----------------------
+//
+// `arch::poll_input` is the one RX read in the kernel, and it runs from the preemptible input task
+// with interrupts ENABLED. Until this arc it took `SERIAL_PORT` with a BLOCKING acquire, which is
+// the same shape INWEDGE found on the panel lock and for the same reason: a preemptible task that
+// blocks on a raw spinlock, unmasked, on the core that also hosts the kernel's IRQ-context printer.
+// Its safety was never structural — it rested on one fact about one counterparty, that `sys_write`
+// (syscall.rs) holds the port only for a bounded IRQ-masked byte loop. That is a property of today's
+// callers, not of the lock, and it silently obliges every future `SERIAL_PORT` holder to stay
+// bounded; the moment one does not, the input core wedges behind it with no diagnostic.
+//
+// So the acquisition below is NON-BLOCKING. A refused poll degrades to "no byte this pass", which
+// costs nothing real: serial input is POLLED, not edge-delivered — the byte stays in the PL011 RX
+// FIFO (16 deep, plus the RX-timeout interrupt on the metal path) and the next pump pass reads it.
+// A `while let Some(b) = poll_input()` drain loop simply ends one iteration early and re-enters on
+// the next pass. Nothing is lost; at worst one poll interval of latency is added under contention
+// that previously would have been an unbounded stall.
+//
+// The refusals are COUNTED, and the census is reported EDGE-TRIGGERED once per contention episode
+// (see `serfix_witness`), matching the `[inwedge]` discipline: silent on every boot that never
+// contended — which is every automated gate — and loud exactly once when a real storm begins.
+
+/// SERFIX — polls that found `SERIAL_PORT` held elsewhere and declined it. Nonzero means the window
+/// that would have blocked the input core was entered on this boot, and was walked away from.
+static SERFIX_REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// SERFIX — polls that acquired the port. The denominator, so a refusal rate is readable rather than
+/// an unanchored count.
+static SERFIX_READ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// SERFIX — true while inside a contention episode (a refusal has been witnessed and no poll has
+/// acquired the port since). Set by the witness, cleared by the next successful acquire; it is what
+/// makes the `[serfix]` line episode-edged instead of per-refusal.
+static SERFIX_IN_EPISODE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// SERFIX — `(read, refused)`.
+pub fn serfix_census() -> (u32, u32) {
+    use core::sync::atomic::Ordering;
+    (SERFIX_READ.load(Ordering::Relaxed), SERFIX_REFUSED.load(Ordering::Relaxed))
+}
+
+/// SERFIX — the `[serfix]` recurrence witness, emitted at the START of a contention episode: the
+/// previous poll acquired the port and this one did not. Episode-edged rather than per-refusal
+/// because `poll_input` runs in a tight pump loop — a line per refusal would turn the storm this
+/// exists to reveal into a flood that hides it. A sustained storm therefore prints once, with the
+/// running totals; a second line means the port was released and contended again.
+///
+/// Printing from the refusal path is safe by construction: `_print` itself is `try_lock` + staging
+/// ring (see `_print` above), so the witness for a held port cannot block on that same held port —
+/// the line goes into the lock-free ring and the next holder emits it intact, in order.
+fn serfix_note_refused() {
+    use core::sync::atomic::Ordering;
+    let refused = SERFIX_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+    if !SERFIX_IN_EPISODE.swap(true, Ordering::Relaxed) {
+        let read = SERFIX_READ.load(Ordering::Relaxed);
+        serial_println!(
+            "[serfix] port read={} refused={} — poll_input declined a held SERIAL_PORT instead of blocking on it (input core survived)",
+            read, refused
+        );
+    }
+}
+
+/// SERFIX — the ONE `SERIAL_PORT` acquisition the input poll makes: non-blocking and counted.
+/// `None` means either "no byte waiting" or "the port was held elsewhere"; both are the same thing
+/// to the caller — nothing to read on this pass, try again on the next one.
+///
+/// This is what `arch::poll_input` calls; it is the whole of the input side's contract with the
+/// port lock, so no future `SERIAL_PORT` holder can wedge the input core by running long.
+pub fn poll_input_nonblocking() -> Option<u8> {
+    use core::sync::atomic::Ordering;
+    match SERIAL_PORT.try_lock() {
+        Some(port) => {
+            SERFIX_READ.fetch_add(1, Ordering::Relaxed);
+            // Episode closed: the next refusal is a new one and gets its own witness line.
+            SERFIX_IN_EPISODE.store(false, Ordering::Relaxed);
+            port.read_byte()
+        }
+        None => {
+            serfix_note_refused();
+            None
+        }
+    }
+}
+
 // ---- M5c: PL011 RX interrupt → wake the scheduled input task (bare-metal Pi only) ----------------
 //
 // Instead of the input task polling the UART, the PL011 raises an interrupt when a byte arrives; the
@@ -294,7 +378,9 @@ impl SerialPort {
 // Group-1 IRQ, so `timer::is_live()` is false there and the input task keeps polling (this stays
 // unused). All the interrupt work is on the PL011's own registers + a scheduler Semaphore — none of
 // it touches the `SERIAL_PORT` spin lock (poll_input holds that IRQ-unmasked, so an ISR that took it
-// would self-deadlock same-core).
+// would self-deadlock same-core — SERFIX made poll_input's ACQUIRE non-blocking, which removes the
+// symmetric hazard of poll_input stalling behind a holder, but the section it holds is still
+// IRQ-unmasked, so the rule for the ISR is unchanged: it takes no console lock).
 
 #[cfg(feature = "baremetal")]
 const UART_IMSC: usize = 0x38; // interrupt mask set/clear
