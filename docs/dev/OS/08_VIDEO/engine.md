@@ -6897,6 +6897,10 @@ Rides `[wcn]`'s cadence and span, directly under the per-window `comp_rate=` lin
 [wcser] scope=live entered=N declined=M reruns=R declined_pct=P span=Sms -> SERIAL|SOLO
 ```
 
+> Superseded 2026-08-19 by WCSER-H: the line now carries `holder=`, `held_ms=`, and `exbusy=`
+> before `span=`, and a `WEDGED` verdict outranks `SERIAL`. See the WCSER-H section below for
+> the current signature and fields.
+
 `declined` is the reading: the number of composite passes that would previously have been
 interleaving their blits with another core's. `SOLO` (`declined=0`) is **not** a failure — it is a
 period in which one core did all the compositing — but it *is* a falsifier for any claim that this

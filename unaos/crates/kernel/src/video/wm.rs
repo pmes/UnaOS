@@ -3930,6 +3930,11 @@ pub fn composite() {
             rounds += 1;
             #[cfg(feature = "witness")]
             WCSER_RERUNS.fetch_add(1, Relaxed);
+            // WCSER-H (landing panel F3) — the overdue bound is priced per PASS (3x the 302ms
+            // worst honest pass), so the clock re-bases per pass: a legal 4-pass storm epoch must
+            // not cross the 1s wire on accumulated honest work. A wedged pass stops re-basing by
+            // definition, so the tripwire's real target is unaffected.
+            COMP_HOLD_T0_MS.store(crate::arch::ms(), Relaxed);
             composite_once();
         }
         // WCSER-H — this held epoch ends: clear the holder and re-arm the tripwire latch before
@@ -4660,6 +4665,55 @@ fn composite_inner() -> CursorTail {
     // drain); every row the loop below adds is compositor work its owner never asked for. The two
     // sets are disjoint by construction and their union is what the blit loop draws, which is what
     // makes `comp` DERIVABLE as `pre + drg` rather than counted a third time.
+    // CURSTICK — the sprite must stay ADOPTABLE under banded drags, and this is the boot-7 lesson.
+    //
+    // The overlay offer is made per staged band, and `compose_into` declines unless the sprite's box
+    // sits wholly inside the rows the band holds. Pre-arc, every window the closure dragged in was
+    // whole-boxed, so the topmost window under the pointer always contained the sprite and the
+    // pass's tail was `Adopt` — a session close, no repaint, no re-damage. The banded drag broke
+    // that by accident: a dragged-in band covering a neighbour's sliver almost never covers the
+    // sprite's rows, so no window took the overlay, `overlaid` stayed false, and the tail became
+    // `Repaint` — whose `repair()` re-damages the pointer-stack windows through
+    // `damage_intersecting` AFTER this pass's snapshot cleared them. Under six overlapping vugs
+    // with the pointer parked on the stack, that is a self-feeding composite storm: every pass
+    // re-arms the next, the holder burns its full re-run budget per call, and `[wcser]` climbs to
+    // the declined_pct=93..98 that preceded boot 7's wedge.
+    //
+    // The fix is a WIDENING, in the fail-safe direction the arc already owns: any dirty banded
+    // window whose outer box wholly contains the sprite's box — the only geometry that can take
+    // the offer at all — has the sprite's panel rows unioned into its band. Cost: the sprite is
+    // ~2 chrome-heights of rows on one or two windows per pass; the alternative was those windows'
+    // WHOLE boxes on every pass, which is the pre-arc price this arc exists to stop paying. A
+    // whole-box window (`bands[i] == None`) already contains the sprite and is skipped; a band the
+    // rows cannot express falls back to `None`, the pre-arc behaviour exactly.
+    //
+    // ABOVE THE CLOSURE, and that placement is load-bearing (landing panel F1): the closure's
+    // guarantee — every pixel a lower window's blit touches is repainted by any window above it —
+    // is computed from `bands[i]` as the sweep reads them. A post-closure widening would blit rows
+    // the closure never propagated; on x86 `occ_clip` masks that, but on aarch64 the closure IS
+    // the occlusion mechanism and a clean higher window over the sprite rows would be overwritten
+    // and never repainted. Hoisted here, the widened band participates in the sweep like any other
+    // damage and the invariant holds on every arch.
+    if let Some(p) = plan {
+        for i in 0..MAX_WINDOWS {
+            if !dirty[i] {
+                continue;
+            }
+            let Some((c, d)) = bands[i] else { continue };
+            let (bx, by, bw, bh) = outer_box(&rows[i]);
+            if p.bx >= bx
+                && p.bx.saturating_add(p.bw) <= bx.saturating_add(bw)
+                && p.by >= by
+                && p.by.saturating_add(p.bh) <= by.saturating_add(bh)
+            {
+                bands[i] = match band_for_rows(&rows[i], p.by, p.by.saturating_add(p.bh)) {
+                    Some((a, b)) => Some((a.min(c), b.max(d))),
+                    None => None,
+                };
+            }
+        }
+    }
+
     #[cfg(feature = "witness")]
     let seed = dirty;
     for oi in 0..MAX_WINDOWS {
@@ -4740,47 +4794,6 @@ fn composite_inner() -> CursorTail {
             }
             dirty[j] = true;
             bands[j] = next;
-        }
-    }
-
-    // CURSTICK — the sprite must stay ADOPTABLE under banded drags, and this is the boot-7 lesson.
-    //
-    // The overlay offer is made per staged band, and `compose_into` declines unless the sprite's box
-    // sits wholly inside the rows the band holds. Pre-arc, every window the closure dragged in was
-    // whole-boxed, so the topmost window under the pointer always contained the sprite and the
-    // pass's tail was `Adopt` — a session close, no repaint, no re-damage. The banded drag broke
-    // that by accident: a dragged-in band covering a neighbour's sliver almost never covers the
-    // sprite's rows, so no window took the overlay, `overlaid` stayed false, and the tail became
-    // `Repaint` — whose `repair()` re-damages the pointer-stack windows through
-    // `damage_intersecting` AFTER this pass's snapshot cleared them. Under six overlapping vugs
-    // with the pointer parked on the stack, that is a self-feeding composite storm: every pass
-    // re-arms the next, the holder burns its full re-run budget per call, and `[wcser]` climbs to
-    // the declined_pct=93..98 that preceded boot 7's wedge.
-    //
-    // The fix is a WIDENING, in the fail-safe direction the arc already owns: any dirty banded
-    // window whose outer box wholly contains the sprite's box — the only geometry that can take
-    // the offer at all — has the sprite's panel rows unioned into its band. Cost: the sprite is
-    // ~2 chrome-heights of rows on one or two windows per pass; the alternative was those windows'
-    // WHOLE boxes on every pass, which is the pre-arc price this arc exists to stop paying. A
-    // whole-box window (`bands[i] == None`) already contains the sprite and is skipped; a band the
-    // rows cannot express falls back to `None`, the pre-arc behaviour exactly.
-    if let Some(p) = plan {
-        for i in 0..MAX_WINDOWS {
-            if !dirty[i] {
-                continue;
-            }
-            let Some((c, d)) = bands[i] else { continue };
-            let (bx, by, bw, bh) = outer_box(&rows[i]);
-            if p.bx >= bx
-                && p.bx.saturating_add(p.bw) <= bx.saturating_add(bw)
-                && p.by >= by
-                && p.by.saturating_add(p.bh) <= by.saturating_add(bh)
-            {
-                bands[i] = match band_for_rows(&rows[i], p.by, p.by.saturating_add(p.bh)) {
-                    Some((a, b)) => Some((a.min(c), b.max(d))),
-                    None => None,
-                };
-            }
         }
     }
 
@@ -10661,6 +10674,13 @@ fn band_for_rows(r: &Window, py0: usize, py1: usize) -> Option<(usize, usize)> {
     // The content band, in the same coordinate `damaged_box` maps back out of. `py0 <= r.y` is the
     // chrome case and `sy0 = 0` is exactly how `damaged_box` now spells it.
     let sy0 = if py0 <= r.y { 0 } else { (py0 - r.y) / r.scale };
+    // Landing panel F2 — a rect ENTIRELY inside the top chrome (`py1 <= r.y`) has no content row
+    // to name: `py1 - r.y` below would underflow (wrapping to the safe whole-box answer only by
+    // accident of release-mode semantics, and to a panic under any overflow-checks profile). Say
+    // the fail-safe out loud instead: whole box.
+    if py1 <= r.y {
+        return None;
+    }
     let cy1 = r.y.saturating_add(r.h.saturating_mul(r.scale));
     let sy1 = if py1 >= cy1 {
         r.h
