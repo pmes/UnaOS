@@ -39,6 +39,35 @@
 # On such a boot the CAPSTONE directives below report as misses; the 23-PASS chain
 # and the K1/F2/F3 witnesses must still hold.
 
+# --- PORTABILITY RULE: NO LOOK-AROUND IN THIS SPEC (SPECFIX, 2026-08-18) ------------
+# Two evaluators read this file and BOTH must parse it: the bench's
+# `unaos/scripts/mbench.py` (Python `re`, full look-around available) and the orin
+# track's `tools/foreman` (the Rust `regex` crate). The regex crate refuses
+# look-around — (?=…) (?!…) (?<=…) (?<!…) — and backreferences BY DESIGN, and
+# foreman's preflight is all-or-nothing: ONE look-ahead anywhere here made it reject
+# the whole spec and evaluate nothing, so mbench and foreman were not interchangeable
+# at the pi4 gate however identical their verdict logic is. RULE: no look-around in
+# this spec, ever. A new directive that wants one wants a rewrite instead.
+# Six directives used negative look-ahead and were rewritten look-around-free with
+# IDENTICAL match semantics (verified two ways: ~5M synthetic lines old-vs-new around
+# each excluded literal, and byte-identical mbench verdict tables on a metal capture
+# and a kernel8-test capture). The two shapes they were rewritten into:
+#   * EXCLUDED-TAG look-ahead — the `COUNT 26` fixture-verdict line below. It becomes
+#     a trie complement over the tag charset: "the tag diverges from every excluded
+#     tag at some character, then runs on", plus the proper prefixes that are legal
+#     tags in their own right (`E`, `EL`, `EXEC`, `SERWIT`, …). The `: ` the caller
+#     appends is what pins the tag's end, exactly as the look-ahead's own colon did.
+#     The exclusion stays EXACT and open-ended — an unrelated new fixture tag still
+#     counts, so the maintenance rule below (new fixture -> raise the floor) holds.
+#   * TRAILING `(?!LITERAL)` — the FORBID lines below. Each becomes the
+#     prefix-factored chain `(?:$|[^c0]|c0(?:$|[^c1]|c1(?:…)))`, read as "the text
+#     ends before the expected literal does, or differs from it at some character".
+#     `\[pstrip\]` additionally intersects that chain with its following `[0-9]+`.
+# MAINTENANCE: when one of those expected literals changes, REGENERATE the chain from
+# the new literal — do not hand-patch a look-ahead back in, and do not shorten a chain
+# by assuming the field's shape (a shorter chain stops firing on malformed lines,
+# which is a silent weakening of a FORBID).
+
 # --- END-OF-RUN MARKERS (MBENCH-HONEST) --------------------------------------------
 # The header above documents the truncation trap; these two lines are what let the TOOL
 # enforce it instead of the reader remembering. A capture that reaches neither is
@@ -230,7 +259,7 @@ COMPLETE :: BANDY-RT:
 # ---    FLOOR 25 -> 26 (2026-08-17, BOT-PARK): `:: BOT-PARK: selftest … -> PASS ::` is the same
 # ---    doubly-framed fixture-verdict form, so the maintenance rule applies again — one new
 # ---    fixture, floor +1, same landing.
-COUNT 26 :: (?!ELF1:|EXEC1:|EXEC-UVUG:|SERWIT-2:)[A-Za-z0-9_-]+: .*-> PASS ::
+COUNT 26 :: (?:(?:[0-9A-DF-RT-Za-z_\-]|E[0-9A-KM-WYZa-z_\-]|EL[0-9A-EG-Za-z_\-]|ELF[02-9A-Za-z_\-]|ELF1[0-9A-Za-z_\-]|EX[0-9A-DF-Za-z_\-]|EXE[0-9ABD-Za-z_\-]|EXEC[02-9A-Za-z_]|EXEC\-[0-9A-TV-Za-z_\-]|EXEC\-U[0-9A-UW-Za-z_\-]|EXEC\-UV[0-9A-TV-Za-z_\-]|EXEC\-UVU[0-9A-FH-Za-z_\-]|EXEC\-UVUG[0-9A-Za-z_\-]|EXEC1[0-9A-Za-z_\-]|S[0-9A-DF-Za-z_\-]|SE[0-9A-QS-Za-z_\-]|SER[0-9A-VX-Za-z_\-]|SERW[0-9A-HJ-Za-z_\-]|SERWI[0-9A-SU-Za-z_\-]|SERWIT[0-9A-Za-z_]|SERWIT\-[013-9A-Za-z_\-]|SERWIT\-2[0-9A-Za-z_\-])[A-Za-z0-9_-]*|E|EL|ELF|EX|EXE|EXEC|EXEC\-|EXEC\-U|EXEC\-UV|EXEC\-UVU|S|SE|SER|SERW|SERWI|SERWIT|SERWIT\-): .*-> PASS ::
 
 # --- SERWIT-2: mirror-tap conservation (promoted 2026-08-13, see ruling block above) ----------
 REQUIRE :: SERWIT-2: mirror taps .*-> PASS ::
@@ -1766,15 +1795,15 @@ FORBID K3-revoke:.*durable-first FAIL
 FORBID K3-mount:.*byte-verified FAIL
 FORBID K3-mount: located but mount FAILED
 FORBID K4-ready:.*prefix\) FAIL
-FORBID :: UVUG: frames=[0-9]+ threads=[0-9]+ checksum=(?!0xf18f983557b87a55)
-FORBID \[inroute\] router window — (?!routed=2 stale_dropped=1 revokes=0)
-FORBID \[wc-c\] side-by-side (?!windows=2 drawn=2)
-FORBID BGRUN-ST: process table capacity = (?!6 rows)
+FORBID :: UVUG: frames=[0-9]+ threads=[0-9]+ checksum=(?:$|[^0]|0(?:$|[^x]|x(?:$|[^f]|f(?:$|[^1]|1(?:$|[^8]|8(?:$|[^f]|f(?:$|[^9]|9(?:$|[^8]|8(?:$|[^3]|3(?:$|[^5]|5(?:$|[^5]|5(?:$|[^7]|7(?:$|[^b]|b(?:$|[^8]|8(?:$|[^7]|7(?:$|[^a]|a(?:$|[^5]|5(?:$|[^5]))))))))))))))))))
+FORBID \[inroute\] router window — (?:$|[^r]|r(?:$|[^o]|o(?:$|[^u]|u(?:$|[^t]|t(?:$|[^e]|e(?:$|[^d]|d(?:$|[^=]|=(?:$|[^2]|2(?:$|[^ ]| (?:$|[^s]|s(?:$|[^t]|t(?:$|[^a]|a(?:$|[^l]|l(?:$|[^e]|e(?:$|[^_]|_(?:$|[^d]|d(?:$|[^r]|r(?:$|[^o]|o(?:$|[^p]|p(?:$|[^p]|p(?:$|[^e]|e(?:$|[^d]|d(?:$|[^=]|=(?:$|[^1]|1(?:$|[^ ]| (?:$|[^r]|r(?:$|[^e]|e(?:$|[^v]|v(?:$|[^o]|o(?:$|[^k]|k(?:$|[^e]|e(?:$|[^s]|s(?:$|[^=]|=(?:$|[^0]))))))))))))))))))))))))))))))))))
+FORBID \[wc-c\] side-by-side (?:$|[^w]|w(?:$|[^i]|i(?:$|[^n]|n(?:$|[^d]|d(?:$|[^o]|o(?:$|[^w]|w(?:$|[^s]|s(?:$|[^=]|=(?:$|[^2]|2(?:$|[^ ]| (?:$|[^d]|d(?:$|[^r]|r(?:$|[^a]|a(?:$|[^w]|w(?:$|[^n]|n(?:$|[^=]|=(?:$|[^2])))))))))))))))))
+FORBID BGRUN-ST: process table capacity = (?:$|[^6]|6(?:$|[^ ]| (?:$|[^r]|r(?:$|[^o]|o(?:$|[^w]|w(?:$|[^s]))))))
 FORBID \[wc-e\] fb-geometry .*row_ok=false
 FORBID \[wc-e\] fb-geometry .*fit_ok=false
 FORBID \[cursor3\] .*-> INCOHERENT
 FORBID \[cursor6\] .*-> OVERWRITTEN
-FORBID \[pstrip\] armed .*full=(?!1000 )[0-9]+
+FORBID \[pstrip\] armed .*full=(?:[02-9]|1(?:$|[^0]|0(?:$|[^0]|0(?:$|[^0]|0(?:$|[^ ])))))
 FORBID \[spinhunt\] SYS_EXIT .*orphan-reap NOT ARMED
 # --- PAPER — the Crispy kit's content-surface texture, and its determinism -------------------
 # ---    `video/paper.rs` ports `kits/crispy/theme.json`'s `content_surface.Paper` block (the
