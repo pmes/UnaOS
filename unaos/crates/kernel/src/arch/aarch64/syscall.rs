@@ -196,9 +196,9 @@ use una_abi::SYS_INPUT_WAIT;
 ///
 ///   SYS_WIN_CREATE(w, h) -> win id (0..WIN_MAX) / -errno
 ///     Allocate a window owned by the CALLER's ASID and map its surface into the caller's EL0 window.
-///     `w`/`h` are pixels, 1..=128 each (`boot::FB_WIN_MAX_W/H`); the surface is ARGB8888 with
+///     `w`/`h` are pixels, 1..=288 each (`boot::FB_WIN_MAX_W/H`); the surface is ARGB8888 with
 ///     `stride = w * 4`, and the mapping is negotiated PAGE-MULTIPLE (`ceil(w*4*h / 4096)` pages of the
-///     window's 64 KiB VA slot). The surface VA is published in the RO info page (see `fb_info_write`);
+///     window's 0x51000 VA slot). The surface VA is published in the RO info page (see `fb_info_write`);
 ///     `SYS_FB_MAP` remains the way to get it back as a return value for the compat window.
 ///   SYS_WIN_PRESENT(win) -> 0 / -errno
 ///     Damage-mark + composite the window. Fail-closed on a free id (`-EBADF`) or a window owned by
@@ -209,10 +209,16 @@ use una_abi::SYS_INPUT_WAIT;
 ///   SYS_WIN_CLOSE(win) -> 0 / -errno
 ///     Unmap the surface (leaves revert to the reserved EL1-only identity descriptors) and free the
 ///     window. Same ownership gate. Teardown (`clear_handle_row`) closes every window an ASID still owns.
+///   SYS_WIN_PRESENT_ROWS(win, y0, y1) -> 0 / -errno   [FBCON-DMG-PI]
+///     The DAMAGE-CARRYING present: composite the window declaring only SOURCE rows `[y0, y1)` of its
+///     OWN surface changed, so the compositor repaints only those. Gating is 30's, verbatim and in the
+///     same order, plus `-EINVAL` for an empty, inverted or over-tall band. Additive at its own number
+///     (33) — 30 is untouched and keeps its exact one-argument shape, so an old binary cannot reach it.
 use una_abi::SYS_WIN_CREATE;
 use una_abi::SYS_WIN_PRESENT;
 use una_abi::SYS_WIN_MOVE;
 use una_abi::SYS_WIN_CLOSE;
+use una_abi::SYS_WIN_PRESENT_ROWS;
 
 /// M6e demo: the sentinel `sys_exit` status the preemption spinner uses so its exit is accounted to
 /// `EL0_SPIN_DONE` and never perturbs the M6b `exited/killed` counters. Demo-only — there is no real
@@ -230,6 +236,12 @@ const M6F_EXIT_STATUS: u64 = 0x6F;
 /// discipline). A spawned CHILD is reaped through the Proc table by pid (see the SYS_EXIT arm), not by this
 /// status. Fresh value (the retired M7 demo used `0x77`); distinct from the M6D/M6E/M6F sentinels and 0.
 const U4_EXIT_STATUS: u64 = 0x74;
+/// ERET-SCRUB witnesses (R23S1Z): the sentinel `sys_exit` status both EL0 return-path fixtures
+/// (`el0-eretentry`, `el0-eretsvc`) use, so their exits land in `EL0_ERET_DONE` and never perturb the
+/// M6b/M6d/M6e/M6f counters — the same sentinel discipline every fixture family above follows. Must
+/// match the `movz x0, #0x83` in `__eret_prog_entry`/`__eret_prog_svc`; distinct from every other
+/// sentinel in this file (0x6D..0x82, 0xB5) and from 0.
+const ERET_EXIT_STATUS: u64 = 0x83;
 /// U4 demo: the nonzero WITNESS token the parent reports iff it reaped BOTH children by handle with status 0.
 /// A token (not a pid) — `sys_spawn` now returns a handle, so the verdict only needs non-zero-means-both-ok.
 /// Must match `movz x23, #0xC4` in `__u4_prog_parent`; `u4_launcher` only checks it is non-zero.
@@ -436,10 +448,18 @@ const U11DEFER_EXIT_STATUS: u64 = 0x7F;
 /// AFTER B unlinked returns A's ORIGINAL bytes (the chain is STILL alive — the unlink was deferred); bit2
 /// SYS_CLOSE OK (the LAST close, which runs the deferred free); bit3 double-close → -EBADF. Matches
 /// `add x23, x23, #{1,2,4,8}` in program A. `u11defer_run` PASSes iff A's witness == this.
+///
+/// U11FIX — bits 4/5/6 are DIAGNOSTIC and live ABOVE this mask, so setting one still FAILs the verdict; they
+/// exist only to name the step that died, which PA41's bare `a_w=0x1` could not. bit4 the read-GO park expired,
+/// bit5 the close-GO park expired, bit6 `SYS_OPEN(O_CREAT)` itself failed. A partial-then-parked-out A now
+/// reads `0x11`/`0x23` instead of a `0x1`/`0x3` that has to be traced back through the assembly.
 const U11DEFER_A_WITNESS_ALL: u64 = 0xF;
 /// U11-M2 (defer) demo: process B's witness bitmask — bit0 open DEFER.BIN (A created it) OK; bit1 SYS_UNLINK via
 /// B's handle → 0 (deferred: A still holds it open, so the chain is NOT freed); bit2 a re-open of the unlinked
 /// name → -ENOENT (the name is gone immediately). Matches `add x23, x23, #{1,2,4}` in program B.
+///
+/// U11FIX — bit4 (above the mask, so it still FAILs) says the unlink-GO park expired. PA41's `b_w=0x0` was
+/// indistinguishable from "B woke but its SYS_OPEN failed"; `0x10` vs `0x0` now separates the two on the wire.
 const U11DEFER_B_WITNESS_ALL: u64 = 0x7;
 /// U11-M2 (defer) demo: the launcher-CUE tokens the fixtures SYS_REPORT (all `> 0xF`, so `u11defer_report`
 /// distinguishes them from a final witness). A reports `A_OPENED` after create+write; B reports `B_UNLINKED`
@@ -479,6 +499,12 @@ const U11REAP_NAME: &str = "DEFER2.BIN";
 /// U11-M2b (reap) demo: the 16-byte pattern A writes into DEFER2.BIN — A reads it back AFTER B unlinks to prove
 /// the chain is still alive. Match the `.ascii` bytes in the blob.
 const U11REAP_PATTERN: [u8; 16] = *b"U11-REAP-OK-7777";
+/// REAPFIX: how far CHECKPOINT-3's head-anchored re-allocatability scan walks the allocator's FAT copy upward
+/// from the reaped chain head before giving up. The answer is the head ITSELF the moment the reap lands, so the
+/// healthy case reads ONE entry; a scan that walks at all has already witnessed a head that is still allocated
+/// (or a hole punched above it), which is the red verdict. Kept small so a red pass costs a bounded handful of
+/// FAT-sector reads inside the bounded poll rather than a volume-length walk per iteration.
+const U11REAP_REUSE_SCAN: u32 = 64;
 
 // --- The inline EL0 FIXTURES: three fault-SHAPE fixtures (M6b) + one preemption spinner (M6e). These
 // are fixtures, not programs, so they stay inline in the kernel image; only the well-behaved `hello`
@@ -551,6 +577,500 @@ __user_prog_spin:
     svc #0
 2:  b 2b                                   // sys_exit never returns; belt-and-braces guard
 
+    // ERET-SCRUB witness A (first-entry residue). Runs as the VERY FIRST EL0 instructions of a fresh
+    // task and ORs together everything the architecture makes EL0-readable at entry: x0-x30, both
+    // 64-bit lanes of v0-v31, FPSR/FPCR, TPIDR_EL0/TPIDRRO_EL0. Reports the OR — 0 means no kernel
+    // value survived into EL0's register file. x30 is the accumulator, so its OWN entry value is
+    // folded in by construction; x0 carries `Task.arg` (0 for a `spawn_user` task), so folding it in
+    // strengthens the check rather than weakening it. Register-only: writes NO memory, so it is safe
+    // on the SHARED user window (the M6e stack STOP tripwire).
+    .balign 4
+    .globl __eret_prog_entry
+__eret_prog_entry:
+    orr x30, x30, x0
+    orr x30, x30, x1
+    orr x30, x30, x2
+    orr x30, x30, x3
+    orr x30, x30, x4
+    orr x30, x30, x5
+    orr x30, x30, x6
+    orr x30, x30, x7
+    orr x30, x30, x8
+    orr x30, x30, x9
+    orr x30, x30, x10
+    orr x30, x30, x11
+    orr x30, x30, x12
+    orr x30, x30, x13
+    orr x30, x30, x14
+    orr x30, x30, x15
+    orr x30, x30, x16
+    orr x30, x30, x17
+    orr x30, x30, x18
+    orr x30, x30, x19
+    orr x30, x30, x20
+    orr x30, x30, x21
+    orr x30, x30, x22
+    orr x30, x30, x23
+    orr x30, x30, x24
+    orr x30, x30, x25
+    orr x30, x30, x26
+    orr x30, x30, x27
+    orr x30, x30, x28
+    orr x30, x30, x29
+    // FP/SIMD file: OR-reduce v1-v31 into v0 (needs no GPR), then fold both lanes into x30.
+    orr v0.16b, v0.16b, v1.16b
+    orr v0.16b, v0.16b, v2.16b
+    orr v0.16b, v0.16b, v3.16b
+    orr v0.16b, v0.16b, v4.16b
+    orr v0.16b, v0.16b, v5.16b
+    orr v0.16b, v0.16b, v6.16b
+    orr v0.16b, v0.16b, v7.16b
+    orr v0.16b, v0.16b, v8.16b
+    orr v0.16b, v0.16b, v9.16b
+    orr v0.16b, v0.16b, v10.16b
+    orr v0.16b, v0.16b, v11.16b
+    orr v0.16b, v0.16b, v12.16b
+    orr v0.16b, v0.16b, v13.16b
+    orr v0.16b, v0.16b, v14.16b
+    orr v0.16b, v0.16b, v15.16b
+    orr v0.16b, v0.16b, v16.16b
+    orr v0.16b, v0.16b, v17.16b
+    orr v0.16b, v0.16b, v18.16b
+    orr v0.16b, v0.16b, v19.16b
+    orr v0.16b, v0.16b, v20.16b
+    orr v0.16b, v0.16b, v21.16b
+    orr v0.16b, v0.16b, v22.16b
+    orr v0.16b, v0.16b, v23.16b
+    orr v0.16b, v0.16b, v24.16b
+    orr v0.16b, v0.16b, v25.16b
+    orr v0.16b, v0.16b, v26.16b
+    orr v0.16b, v0.16b, v27.16b
+    orr v0.16b, v0.16b, v28.16b
+    orr v0.16b, v0.16b, v29.16b
+    orr v0.16b, v0.16b, v30.16b
+    orr v0.16b, v0.16b, v31.16b
+    umov x0, v0.d[0]
+    orr x30, x30, x0
+    umov x0, v0.d[1]
+    orr x30, x30, x0
+    mrs x0, tpidr_el0
+    orr x30, x30, x0
+    mrs x0, tpidrro_el0
+    orr x30, x30, x0
+    mrs x0, fpsr
+    orr x30, x30, x0
+    mrs x0, fpcr
+    orr x30, x30, x0
+    mov x0, x30                            // SYS_REPORT(residue OR); 0 == clean
+    mov x8, #3
+    svc #0
+    mov x8, #2                             // SYS_EXIT(ERET_EXIT_STATUS)
+    movz x0, #0x83
+    svc #0
+1:  b 1b
+
+    // ERET-SCRUB witness B (syscall-return preservation). Plants a DISTINCT sentinel
+    // (0xE7ED_00NN_0000_0000) in every GPR the syscall ABI does not overwrite, mirrors one sentinel
+    // into all of v0-v31, records SP_EL0 in x27, then issues SYS_YIELD — the syscall that runs the
+    // MOST kernel code between the `__vec_svc` save and its `eret` (it context-switches inside the
+    // handler, so another task's Rust — and its NEON — runs in between). On return it rebuilds every
+    // expected value and sets bit N of a bitmap for each register that did not come back. Bit 0 is
+    // never set: x0 is the deliberate return value. Bit 27 = x27 clobbered OR SP_EL0 changed; bit 31
+    // = some v0-v31 lane did not survive. Reports the bitmap — 0 means the eret leaked nothing and
+    // dropped nothing. Register-only: writes NO memory (the shared-window STOP tripwire).
+    .balign 4
+    .globl __eret_prog_svc
+__eret_prog_svc:
+    movz x1, #0xE7ED, lsl #48
+    movk x1, #1, lsl #32
+    movz x2, #0xE7ED, lsl #48
+    movk x2, #2, lsl #32
+    movz x3, #0xE7ED, lsl #48
+    movk x3, #3, lsl #32
+    movz x4, #0xE7ED, lsl #48
+    movk x4, #4, lsl #32
+    movz x5, #0xE7ED, lsl #48
+    movk x5, #5, lsl #32
+    movz x6, #0xE7ED, lsl #48
+    movk x6, #6, lsl #32
+    movz x7, #0xE7ED, lsl #48
+    movk x7, #7, lsl #32
+    movz x9, #0xE7ED, lsl #48
+    movk x9, #9, lsl #32
+    movz x10, #0xE7ED, lsl #48
+    movk x10, #10, lsl #32
+    movz x11, #0xE7ED, lsl #48
+    movk x11, #11, lsl #32
+    movz x12, #0xE7ED, lsl #48
+    movk x12, #12, lsl #32
+    movz x13, #0xE7ED, lsl #48
+    movk x13, #13, lsl #32
+    movz x14, #0xE7ED, lsl #48
+    movk x14, #14, lsl #32
+    movz x15, #0xE7ED, lsl #48
+    movk x15, #15, lsl #32
+    movz x16, #0xE7ED, lsl #48
+    movk x16, #16, lsl #32
+    movz x17, #0xE7ED, lsl #48
+    movk x17, #17, lsl #32
+    movz x18, #0xE7ED, lsl #48
+    movk x18, #18, lsl #32
+    movz x19, #0xE7ED, lsl #48
+    movk x19, #19, lsl #32
+    movz x20, #0xE7ED, lsl #48
+    movk x20, #20, lsl #32
+    movz x21, #0xE7ED, lsl #48
+    movk x21, #21, lsl #32
+    movz x22, #0xE7ED, lsl #48
+    movk x22, #22, lsl #32
+    movz x23, #0xE7ED, lsl #48
+    movk x23, #23, lsl #32
+    movz x24, #0xE7ED, lsl #48
+    movk x24, #24, lsl #32
+    movz x25, #0xE7ED, lsl #48
+    movk x25, #25, lsl #32
+    movz x26, #0xE7ED, lsl #48
+    movk x26, #26, lsl #32
+    movz x28, #0xE7ED, lsl #48
+    movk x28, #28, lsl #32
+    movz x29, #0xE7ED, lsl #48
+    movk x29, #29, lsl #32
+    movz x30, #0xE7ED, lsl #48
+    movk x30, #30, lsl #32
+    mov x27, sp                            // x27's expected value IS SP_EL0 (checked as bit 27)
+    // Mirror x26's sentinel into every vector register (the FP file's expected value).
+    dup v0.2d, x26
+    dup v1.2d, x26
+    dup v2.2d, x26
+    dup v3.2d, x26
+    dup v4.2d, x26
+    dup v5.2d, x26
+    dup v6.2d, x26
+    dup v7.2d, x26
+    dup v8.2d, x26
+    dup v9.2d, x26
+    dup v10.2d, x26
+    dup v11.2d, x26
+    dup v12.2d, x26
+    dup v13.2d, x26
+    dup v14.2d, x26
+    dup v15.2d, x26
+    dup v16.2d, x26
+    dup v17.2d, x26
+    dup v18.2d, x26
+    dup v19.2d, x26
+    dup v20.2d, x26
+    dup v21.2d, x26
+    dup v22.2d, x26
+    dup v23.2d, x26
+    dup v24.2d, x26
+    dup v25.2d, x26
+    dup v26.2d, x26
+    dup v27.2d, x26
+    dup v28.2d, x26
+    dup v29.2d, x26
+    dup v30.2d, x26
+    dup v31.2d, x26
+    mov x8, #4                             // SYS_YIELD — a context switch INSIDE the handler
+    svc #0
+    // ---- x30 is checked first, then becomes the bitmap accumulator (x0 = the scratch) ----
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #30, lsl #32
+    eor  x0, x0, x30
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #30
+    mov  x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #1, lsl #32
+    eor  x0, x0, x1
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #1
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #2, lsl #32
+    eor  x0, x0, x2
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #2
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #3, lsl #32
+    eor  x0, x0, x3
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #3
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #4, lsl #32
+    eor  x0, x0, x4
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #4
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #5, lsl #32
+    eor  x0, x0, x5
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #5
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #6, lsl #32
+    eor  x0, x0, x6
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #6
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #7, lsl #32
+    eor  x0, x0, x7
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #7
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #9, lsl #32
+    eor  x0, x0, x9
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #9
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #10, lsl #32
+    eor  x0, x0, x10
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #10
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #11, lsl #32
+    eor  x0, x0, x11
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #11
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #12, lsl #32
+    eor  x0, x0, x12
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #12
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #13, lsl #32
+    eor  x0, x0, x13
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #13
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #14, lsl #32
+    eor  x0, x0, x14
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #14
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #15, lsl #32
+    eor  x0, x0, x15
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #15
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #16, lsl #32
+    eor  x0, x0, x16
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #16
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #17, lsl #32
+    eor  x0, x0, x17
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #17
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #18, lsl #32
+    eor  x0, x0, x18
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #18
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #19, lsl #32
+    eor  x0, x0, x19
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #19
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #20, lsl #32
+    eor  x0, x0, x20
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #20
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #21, lsl #32
+    eor  x0, x0, x21
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #21
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #22, lsl #32
+    eor  x0, x0, x22
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #22
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #23, lsl #32
+    eor  x0, x0, x23
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #23
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #24, lsl #32
+    eor  x0, x0, x24
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #24
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #25, lsl #32
+    eor  x0, x0, x25
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #25
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #26, lsl #32
+    eor  x0, x0, x26
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #26
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #28, lsl #32
+    eor  x0, x0, x28
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #28
+    orr  x30, x30, x0
+    movz x0, #0xE7ED, lsl #48
+    movk x0, #29, lsl #32
+    eor  x0, x0, x29
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #29
+    orr  x30, x30, x0
+    // x8 must come back holding the syscall NUMBER we passed in (bit 8).
+    mov  x0, #4
+    eor  x0, x0, x8
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #8
+    orr  x30, x30, x0
+    // bit 27: x27 clobbered, or SP_EL0 came back different (the banked-SP_EL0 restore).
+    mov  x0, sp
+    eor  x0, x0, x27
+    cmp  x0, #0
+    cset x0, ne
+    lsl  x0, x0, #27
+    orr  x30, x30, x0
+    // bit 31: the FP/SIMD file. x26 (already convicted above) holds the expected lane value and x29
+    // (likewise) is the scratch accumulator. v0 is folded in by hand, then REBUILT as the expected
+    // vector so v1-v31 can be compared without another GPR.
+    umov x0, v0.d[0]
+    eor  x0, x0, x26
+    mov  x29, x0
+    umov x0, v0.d[1]
+    eor  x0, x0, x26
+    orr  x29, x29, x0
+    dup  v0.2d, x26
+    eor  v1.16b, v1.16b, v0.16b
+    eor  v2.16b, v2.16b, v0.16b
+    eor  v3.16b, v3.16b, v0.16b
+    eor  v4.16b, v4.16b, v0.16b
+    eor  v5.16b, v5.16b, v0.16b
+    eor  v6.16b, v6.16b, v0.16b
+    eor  v7.16b, v7.16b, v0.16b
+    eor  v8.16b, v8.16b, v0.16b
+    eor  v9.16b, v9.16b, v0.16b
+    eor  v10.16b, v10.16b, v0.16b
+    eor  v11.16b, v11.16b, v0.16b
+    eor  v12.16b, v12.16b, v0.16b
+    eor  v13.16b, v13.16b, v0.16b
+    eor  v14.16b, v14.16b, v0.16b
+    eor  v15.16b, v15.16b, v0.16b
+    eor  v16.16b, v16.16b, v0.16b
+    eor  v17.16b, v17.16b, v0.16b
+    eor  v18.16b, v18.16b, v0.16b
+    eor  v19.16b, v19.16b, v0.16b
+    eor  v20.16b, v20.16b, v0.16b
+    eor  v21.16b, v21.16b, v0.16b
+    eor  v22.16b, v22.16b, v0.16b
+    eor  v23.16b, v23.16b, v0.16b
+    eor  v24.16b, v24.16b, v0.16b
+    eor  v25.16b, v25.16b, v0.16b
+    eor  v26.16b, v26.16b, v0.16b
+    eor  v27.16b, v27.16b, v0.16b
+    eor  v28.16b, v28.16b, v0.16b
+    eor  v29.16b, v29.16b, v0.16b
+    eor  v30.16b, v30.16b, v0.16b
+    eor  v31.16b, v31.16b, v0.16b
+    orr  v1.16b, v1.16b, v2.16b
+    orr  v1.16b, v1.16b, v3.16b
+    orr  v1.16b, v1.16b, v4.16b
+    orr  v1.16b, v1.16b, v5.16b
+    orr  v1.16b, v1.16b, v6.16b
+    orr  v1.16b, v1.16b, v7.16b
+    orr  v1.16b, v1.16b, v8.16b
+    orr  v1.16b, v1.16b, v9.16b
+    orr  v1.16b, v1.16b, v10.16b
+    orr  v1.16b, v1.16b, v11.16b
+    orr  v1.16b, v1.16b, v12.16b
+    orr  v1.16b, v1.16b, v13.16b
+    orr  v1.16b, v1.16b, v14.16b
+    orr  v1.16b, v1.16b, v15.16b
+    orr  v1.16b, v1.16b, v16.16b
+    orr  v1.16b, v1.16b, v17.16b
+    orr  v1.16b, v1.16b, v18.16b
+    orr  v1.16b, v1.16b, v19.16b
+    orr  v1.16b, v1.16b, v20.16b
+    orr  v1.16b, v1.16b, v21.16b
+    orr  v1.16b, v1.16b, v22.16b
+    orr  v1.16b, v1.16b, v23.16b
+    orr  v1.16b, v1.16b, v24.16b
+    orr  v1.16b, v1.16b, v25.16b
+    orr  v1.16b, v1.16b, v26.16b
+    orr  v1.16b, v1.16b, v27.16b
+    orr  v1.16b, v1.16b, v28.16b
+    orr  v1.16b, v1.16b, v29.16b
+    orr  v1.16b, v1.16b, v30.16b
+    orr  v1.16b, v1.16b, v31.16b
+    umov x0, v1.d[0]
+    orr  x29, x29, x0
+    umov x0, v1.d[1]
+    orr  x29, x29, x0
+    cmp  x29, #0
+    cset x0, ne
+    lsl  x0, x0, #31
+    orr  x30, x30, x0
+    mov  x0, x30                           // SYS_REPORT(bitmap); 0 == nothing leaked, nothing dropped
+    mov  x8, #3
+    svc  #0
+    mov  x8, #2                            // SYS_EXIT(ERET_EXIT_STATUS)
+    movz x0, #0x83
+    svc  #0
+2:  b 2b
+
     .balign 4
     .globl __fault_blob_end
 __fault_blob_end:
@@ -564,6 +1084,8 @@ unsafe extern "C" {
     static __user_prog_code_write: u8;
     static __user_prog_stack_exec: u8;
     static __user_prog_spin: u8;
+    static __eret_prog_entry: u8;
+    static __eret_prog_svc: u8;
 }
 
 // --- M6d inline EL0 fixtures (per-task address spaces). Position-independent, register/stack-only, so
@@ -2129,6 +2651,18 @@ unsafe extern "C" {
 //     0, deferred), and a re-open of the now-gone name → -ENOENT; reports B_UNLINKED.
 // Both build a witness in x23, SYS_REPORT it, and exit with the U11-defer sentinel. Register-only save the read
 // buffer at +0x2000 (the SYS_READ dest); GO words live in page 3 (+0x3000..). ABI: x8=nr, args x0-x2, ret x0.
+//
+// U11FIX — every park below steps on `SYS_SLEEP_MS(1)`, NOT a bare `SYS_YIELD`; see the U7FIX block above for
+// the full argument. This blob was written by copying the U7 two-fixture idiom BEFORE that fix landed, and it
+// inherited the bug: the budgets are HANG GUARDS whose only job is to outlast the LAUNCHER, whose deadlines are
+// all wall clock (`wait_while_secs(5/5/5/2)`), while a bare-yield budget is denominated in ITERATIONS. The two
+// do not convert at a fixed rate — ~1 ms per iteration under QEMU's emulation, a few hundred nanoseconds on a
+// Cortex-A72 — and this fixture is the worst case in the tree, because B's park must outlast A's create +
+// grow-write AND the launcher's U11-MEASURE mount, whose `first_free_cluster` first-fit scan is hundreds of SD
+// sector reads on metal and free under QEMU. That is the whole of the PA41 metal-only U11-defer failure:
+// `b_w=0x0` (B parked out before it ever opened) + `a_w=0x1` (A parked out across the launcher's 5 s wait for
+// a cue B was never going to send) + `done=2 killed=0 cleared=true` — two fixtures that shut down cleanly,
+// having simply given up. The deferred-free path itself was never reached.
 core::arch::global_asm!(
     r#"
     .globl __u11defer_blob_start
@@ -2149,7 +2683,7 @@ __u11defer_prog_a:
     mov  x2, #7                            // O_CREAT | RW | O_PUBLIC
     svc  #0
     mov  x19, x0                           // x19 = hA (>=0) or -errno
-    tbnz x19, #63, 2f                      // create/open failed -> report what we have
+    tbnz x19, #63, 10f                     // create/open failed -> mark bit6 + report what we have
     mov  x8, #1                            // SYS_WRITE 16 bytes (the pattern) -> grow
     mov  x0, x19
     mov  x1, x13
@@ -2170,10 +2704,12 @@ __u11defer_prog_a:
     movz x24, #0x8000                      // bounded poll budget
 3:  ldr  x10, [x9]
     cbnz x10, 4f
-    mov  x8, #4                            // SYS_YIELD — cooperative
+    mov  x8, #5                            // SYS_SLEEP_MS(1) — wall-clock park (U7FIX)
+    mov  x0, #1
     svc  #0
     subs x24, x24, #1
     b.ne 3b
+    add  x23, x23, #16                     // bit4: the READ-GO park EXPIRED (a_w 0x11 names the park that died)
     b    2f                                // GO never released -> report the partial witness (verdict FAILs)
 
 4:  // (1) seek to 0, then READ 16 -> must STILL return A's original bytes (the chain is alive despite B's unlink)
@@ -2205,13 +2741,15 @@ __u11defer_prog_a:
 
     // park on the close GO word (base + 0x3018; released after the launcher's checkpoint-2)
     add  x9, x9, #0x8                      // x9 = base+0x3010 -> base+0x3018 = A close-GO
-    movz x24, #0x8000
+    movz x24, #0x8000                      // U7FIX budget (~131 s metal / ~32 s QEMU), not an iteration count
 5:  ldr  x10, [x9]
     cbnz x10, 6f
-    mov  x8, #4                            // SYS_YIELD
+    mov  x8, #5                            // SYS_SLEEP_MS(1) — wall-clock park (U7FIX)
+    mov  x0, #1
     svc  #0
     subs x24, x24, #1
     b.ne 5b
+    add  x23, x23, #32                     // bit5: the CLOSE-GO park EXPIRED (a_w 0x23, not a silent 0x3)
     b    2f
 
 6:  // (2) SYS_CLOSE hA -> 0 (the LAST reference: the deferred free runs now, in syscall context)
@@ -2227,6 +2765,8 @@ __u11defer_prog_a:
     cmn  x0, #9                            // x0 == -9 (-EBADF)?
     b.ne 2f
     add  x23, x23, #8                      // bit3: double-close -> -EBADF
+    b    2f
+10: add  x23, x23, #64                     // bit6: SYS_OPEN(O_CREAT) itself failed (a_w 0x40, not a bare 0x0)
 2:
     mov  x0, x23                           // SYS_REPORT(final witness)
     mov  x8, #3
@@ -2249,10 +2789,12 @@ __u11defer_prog_b:
     movz x24, #0x8000
 13: ldr  x10, [x9]
     cbnz x10, 14f
-    mov  x8, #4                            // SYS_YIELD
+    mov  x8, #5                            // SYS_SLEEP_MS(1) — wall-clock park (U7FIX)
+    mov  x0, #1
     svc  #0
     subs x24, x24, #1
     b.ne 13b
+    add  x23, x23, #16                     // bit4: the UNLINK-GO park EXPIRED (b_w 0x10 == B never woke)
     b    12f                               // GO never released -> report the partial witness
 
 14: // (0) open DEFER.BIN RW (no O_CREAT — A created it) -> hB
@@ -2357,7 +2899,8 @@ __u11reap_prog_a:
     movz x24, #0x8000                      // bounded poll budget
 3:  ldr  x10, [x9]
     cbnz x10, 4f
-    mov  x8, #4                            // SYS_YIELD — cooperative
+    mov  x8, #5                            // SYS_SLEEP_MS(1) — wall-clock park (U7FIX)
+    mov  x0, #1
     svc  #0
     subs x24, x24, #1
     b.ne 3b
@@ -2397,7 +2940,8 @@ __u11reap_prog_a:
     movz x24, #0x8000
 5:  ldr  x10, [x9]
     cbnz x10, 2f                           // exit GO released -> report witness + EXIT (no close)
-    mov  x8, #4                            // SYS_YIELD
+    mov  x8, #5                            // SYS_SLEEP_MS(1) — wall-clock park (U7FIX)
+    mov  x0, #1
     svc  #0
     subs x24, x24, #1
     b.ne 5b
@@ -2423,7 +2967,8 @@ __u11reap_prog_b:
     movz x24, #0x8000
 13: ldr  x10, [x9]
     cbnz x10, 14f
-    mov  x8, #4                            // SYS_YIELD
+    mov  x8, #5                            // SYS_SLEEP_MS(1) — wall-clock park (U7FIX)
+    mov  x0, #1
     svc  #0
     subs x24, x24, #1
     b.ne 13b
@@ -2538,7 +3083,8 @@ __uowner_prog_a:
     movz x24, #0x8000                      // bounded poll budget
 3:  ldr  x10, [x9]
     cbnz x10, 4f
-    mov  x8, #4                            // SYS_YIELD — cooperative
+    mov  x8, #5                            // SYS_SLEEP_MS(1) — wall-clock park (U7FIX)
+    mov  x0, #1
     svc  #0
     subs x24, x24, #1
     b.ne 3b
@@ -2632,7 +3178,8 @@ __uowner_prog_b:
     movz x24, #0x8000
 22: ldr  x10, [x9]
     cbnz x10, 23f
-    mov  x8, #4                            // SYS_YIELD
+    mov  x8, #5                            // SYS_SLEEP_MS(1) — wall-clock park (U7FIX)
+    mov  x0, #1
     svc  #0
     subs x24, x24, #1
     b.ne 22b
@@ -2915,6 +3462,43 @@ static EL0_M6G_KILLED: AtomicU32 = AtomicU32::new(0);
 static M6F_VERDICT_PRINTED: AtomicBool = AtomicBool::new(false);
 
 // =============================================================================================
+// ERET-SCRUB accounting (R23S1Z) — the EL0 return-path residue witnesses.
+//
+// The aarch64 EL0 return paths were audited from the vectors outward (see docs/SECURITY.md) and every
+// one of them is clean BY CONSTRUCTION: `__vec_svc`/`__vec_irq`/`__vec_serror` restore the WHOLE
+// x0-x30 file (and v0-v31/FPSR/FPCR) from the interrupted task's OWN entry frame before their `eret`,
+// and `user_task_trampoline` zeroes x0-x30, v0-v31, FPSR/FPCR and TPIDR_EL0/TPIDRRO_EL0 before the
+// FIRST `eret` into a task. Neither property had ever been OBSERVED FROM EL0 — the ledger said so in
+// as many words ("rests on the code path, not a fixture that reads the file"). These two fixtures are
+// that observation: one reads the register file at first entry and demands zero, the other plants
+// sentinels, crosses a syscall that context-switches, and demands every one of them back.
+//
+// Both exit with `ERET_EXIT_STATUS`, so they land in `EL0_ERET_DONE` and leave every other family's
+// counters byte-identical. Both are register-only (they write NO memory), which is what lets them run
+// on the SHARED user window without tripping the M6e per-task-stack STOP tripwire.
+// =============================================================================================
+/// EL0 VA of `__eret_prog_entry` inside the shared window's code page; latched by `setup()`.
+static ERET_ENTRY_VA: AtomicU64 = AtomicU64::new(0);
+/// EL0 VA of `__eret_prog_svc` inside the shared window's code page; latched by `setup()`.
+static ERET_SVC_VA: AtomicU64 = AtomicU64::new(0);
+/// The shared window's initial SP_EL0 (same value `El0Demo.sp` carries); latched by `setup()`.
+static ERET_SP: AtomicU64 = AtomicU64::new(0);
+/// `el0-eretentry`'s reported OR of every EL0-readable register at first entry. 0 == no residue.
+static ERET_ENTRY_OR: AtomicU64 = AtomicU64::new(0);
+/// True once `el0-eretentry` actually reported — a value of 0 is only meaningful if it was WRITTEN.
+static ERET_ENTRY_REPORTED: AtomicBool = AtomicBool::new(false);
+/// `el0-eretsvc`'s reported mismatch bitmap (bit N = register xN did not survive the syscall; bit 27
+/// also covers SP_EL0; bit 31 covers the v0-v31 file). 0 == nothing leaked and nothing was dropped.
+static ERET_SVC_BITMAP: AtomicU64 = AtomicU64::new(0);
+/// True once `el0-eretsvc` actually reported (same reasoning as `ERET_ENTRY_REPORTED`).
+static ERET_SVC_REPORTED: AtomicBool = AtomicBool::new(false);
+/// ERET-SCRUB fixtures that reached their sentinel `sys_exit` (want 2).
+static EL0_ERET_DONE: AtomicU32 = AtomicU32::new(0);
+/// ERET-SCRUB fixtures KILLED by a fault (want 0). Kept OFF the M6b `killed_unexpected` counter so a
+/// return-path regression surfaces as its OWN FAIL line, not as a phantom M6b regression.
+static EL0_ERET_KILLED: AtomicU32 = AtomicU32::new(0);
+
+// =============================================================================================
 // U4 accounting — the process model + per-process handle table: sys_spawn (load+run a child from storage,
 // return a HANDLE into the caller's table) + sys_wait (reap the child a handle refers to). Evolves M7.
 // =============================================================================================
@@ -3165,6 +3749,12 @@ static U11DEFER_A_READ_F: AtomicU32 = AtomicU32::new(0);
 static EL0_U11DEFER_DONE: AtomicU32 = AtomicU32::new(0);
 /// U11-M2 (defer): a killed defer fixture — a real bug (register-only, bar its +0x2000 read buffer).
 static EL0_U11DEFER_KILLED: AtomicU32 = AtomicU32::new(0);
+/// U11FIX: set once `el0-u11defer-a` has run its sentinel exit. The `[u11fix] park margin` assertions must tell
+/// A and B apart: B may LEGITIMATELY have exited by the time A's read/close GOs are released (it exits right
+/// after the B_UNLINKED cue), so the bare `EL0_U11DEFER_DONE` count cannot distinguish "B finished" from "A
+/// parked out". A must still be parked at ALL THREE releases — a set flag there is a parked-out A and nothing
+/// else.
+static EL0_U11DEFER_A_EXITED: AtomicU32 = AtomicU32::new(0);
 
 /// U11-M2b (reap): the two reap fixtures' final witness bitmasks (SYS_REPORT), keyed by name.
 static U11REAP_A_WITNESS: AtomicU64 = AtomicU64::new(0);
@@ -3973,15 +4563,15 @@ pub fn clear_handle_row(asid: u64) {
     //     windows the compositor has already reaped.
     //   * `close_owner` then `close_compat` — a belt-and-braces sweep for anything `win_close_asid` could not
     //     reach. `close_owner(asid)` catches a compositor row whose WC-B row was already freed by a racing
-    //     `sys_win_close` that had not yet run its `destroy`. `close_compat()` is the one WC-A explicitly
-    //     cannot reap on its own: the compat row is minted through the `SYS_FB_PRESENT` hook, whose signature
-    //     carries no ASID, so it has no owner for `close_owner` to match. Without this call it is IMMORTAL —
-    //     every later composite would re-blit whatever now lives in the dead surface's backing frame, i.e. the
-    //     next tenant of this slot's private memory, straight onto the panel.
-    // Both run with `WINDOWS` released (`win_close_asid` has returned), so their drain barriers cannot spin
-    // inside a lock a presenter is waiting on.
+    //     `sys_win_close` that had not yet run its `destroy`. `close_compat()` is the one WC-A cannot reap on
+    //     its own: the compat row is minted through the `SYS_FB_PRESENT` hook, whose signature carries no ASID,
+    //     so `close_owner` has no owner to match. Without it the row is IMMORTAL and every later composite
+    //     re-blits the dead surface's frame — the slot's next tenant's private memory — to the panel.
+    // Both run with `WINDOWS` released, so their drain barriers cannot spin inside a lock a presenter holds.
     crate::video::wm::close_owner(asid);
     crate::video::wm::close_compat();
+    // VUG-PARITY: the FOCUS half — a self-exit must not strand `FOCUS_ASID`. See PARITY.md §5.2.
+    crate::video::wm::focus_release(asid, "route=self-exit shell-raise=skipped siblings=untouched");
 }
 
 /// The ASID of the address space the caller is running in, read from `TTBR0_EL1[63:48]`. A syscall executes
@@ -4487,6 +5077,39 @@ fn openfile_mark_pending_or_none_by_dir(dir_lba: u64, dir_off: u32, first_cluste
 fn free_orphan_chain(first_cluster: u32) -> bool {
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
+        // REAPFIX (2026-08-18, metal capture `pi4-pi1-b1`): `mount()` is the FIRST block read of the whole
+        // operation, so it is the MOST likely place for a transient device loan to bite — and until this arm
+        // existed it was the one place a loan was mourned as permanent. `mount_source` propagates
+        // `BlockError::Busy` as `FatError::Busy` straight out of its LBA-0 `read_sector`, which is exactly the
+        // "the storage device was momentarily loaned to another context" condition WEDGE-10 (F2) taught the
+        // `free_chain` arm below to REQUEUE rather than orphan. The mount arm never learned it, so a reap that
+        // raced the USB/BOT mass-storage bring-up dropped the head on the floor: the head was popped, the mount
+        // refused, the chain was logged as leaked and NEVER retried — the chain stayed allocated for the rest of
+        // the boot. That is the U11-reap `c3(freed=false)` flake, convicted on the bench capture:
+        //   boot 1: `U11-defer: deferred free of chain @cluster 29473 — mount failed, orphaned (leak)`
+        //           then `U11-reap: ... FAIL — head=29473 ... c3(freed=false,...)`
+        //   boot 8: same shape at cluster 29743, immediately after a `BOT: pump ... used=24841443` loan
+        //   boot 7 (PASS): no mount refusal — `U11-defer: reaper freed teardown-orphaned chain @cluster 29611`
+        // The reaper was LIVE and PROMPT in both failing boots (it answered well inside the witness's 5 s poll);
+        // nothing was starved and nothing needed a longer timeout. Requeue a `Busy` mount for the next pass, the
+        // same way the `free_chain` arm does — the push `post()`s `REAPER_SEM`, so the retry is SCHEDULED (and
+        // `orphan_reaper` yields between passes, so a still-loaned device cannot turn this into a hot spin).
+        // Every OTHER mount error (`NoDisk`, `Unsupported`, a structural `BadFs`) describes a condition a retry
+        // cannot fix, and keeps the historical orphan path.
+        Err(crate::fs::fat::FatError::Busy) => {
+            if deferred_free_push(first_cluster) {
+                serial_println!(
+                    "U11-defer: deferred free of chain @cluster {} — storage busy at mount, requeued for the next reaper pass",
+                    first_cluster
+                );
+            } else {
+                serial_println!(
+                    "U11-defer: deferred free of chain @cluster {} — storage busy at mount but queue full, orphaned (leak)",
+                    first_cluster
+                );
+            }
+            return false;
+        }
         Err(_) => {
             serial_println!(
                 "U11-defer: deferred free of chain @cluster {} — mount failed, orphaned (leak)",
@@ -4671,8 +5294,11 @@ fn deferred_free_pop() -> Option<u32> {
 }
 
 /// U11-M2b: the deferred-free REAPER — a forever kernel service task that closes M2a's teardown-last-close
-/// honest-scope gap. Spawned ONCE at boot (`main.rs`'s aarch64-baremetal service block, via `sched::spawn`) so
-/// it already exists before any orphan is queued — a lazily-spawned reaper would need a heap `Box<Task>` +
+/// honest-scope gap. Spawned ONCE at boot (`main.rs`'s aarch64-baremetal `start_aps` block, via
+/// `sched::spawn_auto`, immediately after the APs are released and BEFORE the EL0 fixture cascade that can
+/// orphan a chain) so it already exists before any orphan is queued — the U11-reap ordering fix: the earlier
+/// site, down in the panel-service block past `pi_rast_demo_maybe()`, left this invariant FALSE for the whole
+/// fixture cascade — a lazily-spawned reaper would need a heap `Box<Task>` +
 /// `RUN_QUEUES`, both illegal from the IRQ-masked teardown push. Each turn: pop one chain head (lock held only
 /// for the pop), RELEASE the lock, THEN `free_orphan_chain` (mount + all-FAT-copies free — block I/O, legal
 /// HERE: EL1, IRQs enabled, its own stack, never in teardown context). When the queue is empty it BLOCKS on
@@ -4708,6 +5334,17 @@ pub fn orphan_reaper(_: usize) {
                 // still prints, byte-identically, after the silent successful free.)
                 if free_orphan_chain(fc) {
                     serial_println!("U11-defer: reaper freed teardown-orphaned chain @cluster {}", fc);
+                } else {
+                    // REAPFIX: a failed pass either requeued the head (a `Busy` mount / `Busy` free — the
+                    // device is loaned to another context RIGHT NOW) or orphaned it. In the requeue case the
+                    // push already `post()`ed `REAPER_SEM`, so the next `deferred_free_pop` would hand the SAME
+                    // head straight back and re-attempt the mount with no time for the loan to clear — a hot
+                    // retry loop hammering the block layer from a service task. Cede the core once before the
+                    // next pass: the yield is legal here (EL1, IRQs enabled, no lock held — the queue lock was
+                    // released by `deferred_free_pop`) and it costs a single dispatch on the orphan path, where
+                    // nothing is retried anyway. This is the backoff that makes the requeue arm above SAFE to
+                    // take unconditionally on `Busy`.
+                    super::sched::yield_now();
                 }
             }
             // Queue drained: block until a producer enqueues + posts. `wait()` returns `true` here (the
@@ -5362,8 +5999,10 @@ fn u11_report(value: u64) {
 }
 
 /// U11-M2 (defer): record the two cross-process fixtures' SYS_REPORTs, keyed by task name. Each fixture reports
-/// mid-run CUE tokens (all `> 0xF`, so they never collide with a witness value) that release the launcher's next
-/// choreography edge, then its final witness bitmask (`<= 0xF`).
+/// mid-run CUE tokens (the three EXACT values `0x60`/`0x61`/`0x62`, matched below, so they never collide with a
+/// witness value) that release the launcher's next choreography edge, then its final witness bitmask. U11FIX: the
+/// witness is no longer confined to `<= 0xF` — the diagnostic bits 4/5/6 (park expired, open failed) live above
+/// the PASS mask, which is why the routing is exact-match on the cue tokens and not a `> 0xF` range test.
 fn u11defer_report(value: u64) {
     match super::sched::current_name() {
         Some("el0-u11defer-a") => match value {
@@ -5519,6 +6158,12 @@ pub fn setup() -> El0Demo {
     // The shared window is never torn down (ASID 0), so this endowment persists for the whole boot; the M6b
     // fault fixtures and the M6e spinner share ASID 0 but never write, so the single fixed cap serves them all.
     install_console_cap(0);
+    // ERET-SCRUB: latch the two return-path witness entries (and the shared SP_EL0) into statics, so the
+    // fixtures can be spawned from a kernel task INSIDE this module (`m6e_verdict`) without threading two
+    // more fields through `El0Demo` and its caller. Same code page, same `fentry` alignment assert.
+    ERET_ENTRY_VA.store(fentry(&raw const __eret_prog_entry), Ordering::Release);
+    ERET_SVC_VA.store(fentry(&raw const __eret_prog_svc), Ordering::Release);
+    ERET_SP.store((base + size as u64) & !0xF, Ordering::Release);
     El0Demo {
         sp: (base + size as u64) & !0xF, // 16-aligned top of the window = initial user stack pointer
         hello: base, // the loaded blob's `_start` is at offset 0 of the copy (base is 16 KiB-aligned)
@@ -5599,6 +6244,14 @@ pub fn record_el0_kill(name: &str, ec: u64, far: u64, far_valid: bool) {
     // must land in its own counter, never inflating the M6b `killed_unexpected` count.
     if matches!(name, "el0-getinfo" | "el0-hostile" | "el0-yield" | "el0-sleep") {
         EL0_M6F_KILLED.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
+    // ERET-SCRUB: the two return-path witnesses are register-only and fault on nothing, so a kill here is a
+    // real bug in the EL0 return path itself (the likeliest shape: SP_EL0 came back wrong and the fixture's
+    // report never left EL0). Its own counter — never the M6b `killed_unexpected` count — and the verdict
+    // below prints FAIL from the missing report regardless.
+    if matches!(name, "el0-eretentry" | "el0-eretsvc") {
+        EL0_ERET_KILLED.fetch_add(1, Ordering::AcqRel);
         return;
     }
     // M6g: the untrusted disk-loaded program. A kill here is contained (the whole point) and reported by
@@ -5843,6 +6496,77 @@ pub fn m6e_verdict(_: usize) {
         done,
         irqs
     );
+    // ERET-SCRUB (R23S1Z): launch the two EL0 return-path residue witnesses from here. This is the host
+    // because `m6e-verdict` is spawned UNCONDITIONALLY (main.rs), unlike the M6d/M6f verdicts, which only
+    // exist when their slot allocation succeeded — a witness that can silently not-run is exactly the
+    // shape the spec's convictability hardening exists to refuse. Both fixtures live in the SHARED window's
+    // code page (`setup()` latched their VAs), need no address-space slot, and write no memory, so they add
+    // no slot pressure and cannot disturb the M6d/M6f slot budget. `CPU_AUTO` places them on an ONLINE
+    // scheduled AP — never the unscheduled BSP, which `spawn_user` forbids.
+    eret_scrub_launch();
+}
+
+/// ERET-SCRUB: spawn the two EL0 return-path witnesses plus their verdict task. Separated from
+/// `m6e_verdict` only so the launch reads as one thing; called exactly once.
+fn eret_scrub_launch() {
+    let entry = ERET_ENTRY_VA.load(Ordering::Acquire);
+    let svc = ERET_SVC_VA.load(Ordering::Acquire);
+    let sp = ERET_SP.load(Ordering::Acquire);
+    if entry == 0 || svc == 0 || sp == 0 {
+        // Unreachable on any boot that ran `setup()` (which is every EL0-capable boot). Named rather than
+        // silent: a zero VA here would otherwise `eret` a task to 0 and read as a mystery EL0 fault.
+        serial_println!(":: ERET-SCRUB: witness entries not latched — return-path residue witnesses SKIPPED ::");
+        return;
+    }
+    super::sched::spawn_user("el0-eretentry", entry, sp, super::sched::CPU_AUTO);
+    super::sched::spawn_user("el0-eretsvc", svc, sp, super::sched::CPU_AUTO);
+    super::sched::spawn("eret-verdict", eret_scrub_verdict, 0, super::sched::CPU_AUTO);
+}
+
+/// ERET-SCRUB verdict task: wait (bounded, CNTPCT) for both EL0 return-path witnesses, then print the
+/// two lines that turn the code-path argument into an observation.
+///
+/// Line 1 — FIRST ENTRY. `el0-eretentry` ORed x0-x30, both lanes of v0-v31, FPSR/FPCR and
+/// TPIDR_EL0/TPIDRRO_EL0 at its first EL0 instructions. A non-zero OR is a kernel value that survived
+/// `user_task_trampoline`'s scrub into EL0's architectural state.
+///
+/// Line 2 — SYSCALL RETURN. `el0-eretsvc` planted a distinct sentinel in every GPR the syscall ABI does
+/// not overwrite, mirrored one into v0-v31, recorded SP_EL0, and crossed a `SYS_YIELD` (which
+/// context-switches INSIDE the handler, so an unrelated task's Rust and NEON ran between `__vec_svc`'s
+/// save and its `eret`). Bit N of the reported bitmap means xN did not come back; bit 27 also covers
+/// SP_EL0, bit 31 the whole v0-v31 file. Bit 0 is never set — x0 is the deliberate return value.
+///
+/// Both PASS values are 0, so both arms demand the report actually HAPPENED (`*_REPORTED`) and that
+/// neither fixture was killed. A missing report, a kill, or a timeout is a FAIL, never a silent pass.
+pub fn eret_scrub_verdict(_: usize) {
+    // ~5 s; both fixtures are a few hundred instructions and finish in well under 1 s.
+    let _ = wait_while_secs(5, || EL0_ERET_DONE.load(Ordering::Acquire) < 2);
+    let entry_or = ERET_ENTRY_OR.load(Ordering::Acquire);
+    let entry_rep = ERET_ENTRY_REPORTED.load(Ordering::Acquire);
+    let svc_map = ERET_SVC_BITMAP.load(Ordering::Acquire);
+    let svc_rep = ERET_SVC_REPORTED.load(Ordering::Acquire);
+    let killed = EL0_ERET_KILLED.load(Ordering::Acquire);
+
+    if entry_rep && entry_or == 0 && killed == 0 {
+        serial_println!(
+            ":: ERET-SCRUB: first-entry GPR/FP/TPIDR residue = 0 (x0-x30, v0-v31, FPSR/FPCR, TPIDR_EL0/RO read at EL0) -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: ERET-SCRUB: first-entry residue or={:#x} reported={} killed={} -> FAIL ::",
+            entry_or, entry_rep, killed
+        );
+    }
+    if svc_rep && svc_map == 0 && killed == 0 {
+        serial_println!(
+            ":: ERET-SCRUB: syscall-return preserved x1-x30 + x8 + SP_EL0 + v0-v31 across SYS_YIELD (bitmap=0x0) -> PASS ::"
+        );
+    } else {
+        serial_println!(
+            ":: ERET-SCRUB: syscall-return residue bitmap={:#x} reported={} killed={} -> FAIL ::",
+            svc_map, svc_rep, killed
+        );
+    }
 }
 
 /// The M6d demo's per-task entry points (all at the SAME user VAs — the point of ASID isolation) and the
@@ -6161,6 +6885,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
             fb_report(a0);
             wcb_report(a0);
             input_report(a0);
+            eret_report(a0);
             0
         }
         SYS_YIELD => sys_yield(),
@@ -6192,6 +6917,9 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_WIN_PRESENT => sys_win_present(a0),
         SYS_WIN_MOVE => sys_win_move(a0, a1, a2),
         SYS_WIN_CLOSE => sys_win_close(a0),
+        // FBCON-DMG-PI: the banded present. Sits beside 30 rather than replacing it — a client that
+        // gets `-ENOSYS` here (an older kernel) falls back to 30 and still draws a correct picture.
+        SYS_WIN_PRESENT_ROWS => sys_win_present_rows(a0, a1, a2),
         SYS_EXIT => {
             // SPINHUNT — PROCESS exit terminates the ADDRESS SPACE, not just this task. Placed at the
             // very top of the arm, before every name-routed short-circuit below (each of which ends in
@@ -6419,6 +7147,8 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
                 EL0_M6D_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == M6F_EXIT_STATUS {
                 EL0_M6F_DONE.fetch_add(1, Ordering::AcqRel);
+            } else if a0 == ERET_EXIT_STATUS {
+                EL0_ERET_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == U4_EXIT_STATUS {
                 EL0_U4_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == U5_EXIT_STATUS {
@@ -6442,6 +7172,10 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
             } else if a0 == U11DEFER_EXIT_STATUS {
                 // Both defer fixtures (A + B) ride this one sentinel; neither has a planted Proc entry (they use
                 // no sys_xfer), so both fall through the Proc short-circuit to here. Want 2 (both exited).
+                // U11FIX: split A out by name — the park-margin assertions need "A has exited", not "someone has".
+                if super::sched::current_name() == Some("el0-u11defer-a") {
+                    EL0_U11DEFER_A_EXITED.store(1, Ordering::Release);
+                }
                 EL0_U11DEFER_DONE.fetch_add(1, Ordering::AcqRel);
             } else if a0 == U11REAP_EXIT_STATUS {
                 // Both reap fixtures (A + B) ride this one sentinel; neither has a planted Proc entry. Want 2.
@@ -6687,13 +7421,23 @@ fn sys_write_file(asid: u64, file_id: u64, buf: u64, len: u64) -> i64 {
 /// ABIFREEZE moved the declaration into `una_abi`: one type, shared with the x86 kernel and with the
 /// ring-3 programs that read the bytes back.
 ///
-/// `ticks` here is the 250 Hz SCHEDULER tick, not milliseconds — the x86 kernel's same-named field is
-/// a 1 kHz millisecond count. Both are shipped behaviour and neither moves; the rate a ring-3 program
-/// needs is `una_abi::GETINFO_TICK_HZ`. See una-abi's divergence ledger, D1.
+/// `ticks` here is a 250 Hz count, not milliseconds — the x86 kernel's same-named field is a 1 kHz
+/// millisecond count. Both are shipped behaviour and neither moves; the rate a ring-3 program needs
+/// is `una_abi::GETINFO_TICK_HZ`. See una-abi's divergence ledger, D1.
+///
+/// VUGSLOMO: it is 250 Hz *as a clock* — `timer::abi_ticks()`, off CNTVCT — and deliberately not the
+/// scheduler's tick counter, which is a sum over cores and therefore not a rate at all.
 use una_abi::UserInfo;
 
 // ABIFREEZE (divergence D1): the ABI's declared tick rate MUST be the rate this kernel's heartbeat is
-// armed at, because `sys_getinfo` below hands EL0 that tick count RAW.
+// armed at, because `sys_getinfo` below hands EL0 a count in that unit.
+//
+// VUGSLOMO WIDENED WHAT "IN THAT UNIT" MEANS, and the assert is why the fix could be local. Until
+// this arc the field carried `timer::ticks()` RAW — the GLOBAL counter, which `timer::on_tick` bumps
+// from every core, so on 4-core metal it advanced at `4 * TICK_HZ` while this assert still passed
+// (both sides were, and are, 250: the constant was never wrong, the published quantity was). The
+// field now carries `timer::abi_ticks()`, which IS a TICK_HZ-rate clock by construction, so the
+// assert below finally guards what it always read as guarding.
 //
 // The x86 twin carries the identical assert against `apic::TICK_HZ` (1000). The two rates DIFFER —
 // that is the divergence — and these two lines are what keep each arch's ABI constant honest about its
@@ -6714,7 +7458,9 @@ const _: () = assert!(una_abi::GETINFO_TICK_HZ == super::timer::TICK_HZ);
 fn sys_getinfo(user_ptr: u64) -> i64 {
     let info = UserInfo {
         pid: super::sched::current_id().unwrap_or(0),
-        ticks: super::timer::ticks(),
+        // VUGSLOMO: NOT `timer::ticks()` — that is the global, per-core-summed counter and publishing
+        // it here put a 4x-fast clock under a 250 Hz label on 4-core metal. See `timer::abi_ticks`.
+        ticks: super::timer::abi_ticks(),
     };
     // SAFETY: view `info` as its raw bytes for the copy; `UserInfo` is `#[repr(C)]` plain-old-data.
     let bytes = unsafe {
@@ -6794,6 +7540,24 @@ fn note_interleave() {
 /// M6f: record a value an M6f EL0 fixture reported via SYS_REPORT, keyed by the reporting task's name.
 /// (M6d names fall through to `m6d_report`, which the SYS_REPORT arm also calls; the name spaces are
 /// disjoint, so each function ignores the other's tasks.)
+/// ERET-SCRUB: route the two return-path witnesses' `SYS_REPORT` values by task name, and record that
+/// the report HAPPENED. The reported-flag is load-bearing: for both fixtures the PASSING value is 0, so
+/// a verdict that read the counter alone could not tell "EL0 saw a clean register file" from "the
+/// fixture never ran / was killed before it could speak". Any other task's report is ignored.
+fn eret_report(value: u64) {
+    match super::sched::current_name() {
+        Some("el0-eretentry") => {
+            ERET_ENTRY_OR.store(value, Ordering::Release);
+            ERET_ENTRY_REPORTED.store(true, Ordering::Release);
+        }
+        Some("el0-eretsvc") => {
+            ERET_SVC_BITMAP.store(value, Ordering::Release);
+            ERET_SVC_REPORTED.store(true, Ordering::Release);
+        }
+        _ => {}
+    }
+}
+
 fn m6f_report(value: u64) {
     match super::sched::current_name() {
         Some("el0-getinfo") => M6F_GETINFO_WITNESS.store(value, Ordering::Release),
@@ -9513,6 +10277,7 @@ fn elf1_report(value: u64) {
 /// validated + mapped with per-segment permissions, run it at EL0, and confirm it ran. Modelled on
 /// `m6g_loader_run`. Self-contained; runs LAST in the u7 chain (all 8 slots are free by then). Emits ONE
 /// uncounted `:: ELF1: … ::` line (PASS or an honest skip/FAIL); never perturbs the 23-fixture battery.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn elf1_launcher(_demo_cpu: usize) {
     // One-shot (defensive, the m6g idiom).
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -9605,6 +10370,7 @@ fn elf1_launcher(_demo_cpu: usize) {
 /// mounted + proven), fully self-contained (a fresh slot, reaped on exit); an honest skip without the SD/
 /// fixture. It can never perturb the 23-fixture battery (its exit rides the generic Proc reap, off every
 /// M6b/sentinel counter).
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn exec1_witness(_demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -9671,6 +10437,7 @@ fn exec1_witness(_demo_cpu: usize) {
 ///     that legs 1 and 2 structurally cannot witness: both of their programs end by themselves.
 ///
 /// An honest skip without the SD/fixtures.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn bgrun_witness(_demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -9995,6 +10762,7 @@ fn killbound_witness() {
 /// re-arms it idempotently anyway) so its reuse of the SYS_FB_* / SYS_THREAD_* / SYS_FUTEX machinery perturbs
 /// nothing. Self-contained (a fresh slot, reaped on exit); an honest skip without the SD/fixture. Its exit
 /// rides the generic Proc reap, off every M6b/sentinel counter, so it can never perturb the fixture battery.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn uvug_witness(_demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -10815,6 +11583,7 @@ fn bgspread_witness() {
 /// sibling core), each atomically bumps the shared counter, joins them, and exits; the verdict prints the
 /// authoritative witness with the kernel-observed spawned/joined counts, the reported counter, and the cores
 /// the two workers actually ran on. Never perturbs the fixture battery (its own line, no shared counter).
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn threads_launcher(_demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -11169,6 +11938,9 @@ fn sys_fb_present() -> i64 {
         Err(e) => return e,
     };
     let slot = (asid - 1) as usize;
+    // M3: the compat surface's pointer and size are slot-derived constants — nothing here needs the
+    // window table — so the checksum runs before the mask is ever taken.
+    let sum = fb_checksum(super::boot::slot_fb_surface_ptr(slot), super::boot::FB_SURFACE_SIZE);
     // WC-B: the compat wrapper presents the caller's REGION SLOT 0 surface at the legacy 32×32 geometry,
     // with the legacy witness accounting, whether or not a window entry was ever bound (a window entry
     // only adds the compositor-visible damage mark). Deliberately independent of the window table so this
@@ -11196,14 +11968,30 @@ fn sys_fb_present() -> i64 {
         super::uslots::FB_SURFACE_STRIDE,
         super::uslots::FB_SURFACE_SIZE,
         crate::video::wm::WIN_NONE,
+        sum,
+        None,
     );
     drop(t);
+    drop(_irq);
+    // M3 shrink 2: cash the sprite tail composite_pass stashed — unmasked, lock-free epilogue.
+    crate::video::wm::composite_tail_owed();
     0
 }
 
-/// WC-B: the ONE present body both `SYS_FB_PRESENT` and `SYS_WIN_PRESENT` run — witness accounting, the
-/// UVUG-8r2 focus-scoped counter bump, the compositor damage mark, and the blit. Factored so the two
+/// WC-B: the ONE present body `SYS_FB_PRESENT`, `SYS_WIN_PRESENT` and `SYS_WIN_PRESENT_ROWS` run —
+/// witness accounting, the
+/// UVUG-8r2 focus-scoped counter bump, the compositor damage mark, and the blit. Factored so the
 /// verbs cannot drift; every ELF-3/UVUG-8 invariant below is unchanged from the single-surface version.
+/// M3 (span shrink): `sum` is the caller's `fb_checksum` over the SAME surface, computed OUTSIDE
+/// the IRQ mask — the checksum reads the caller's own surface while the caller is parked in the
+/// syscall, so it needs the ownership verdict, not the mask (~65 K masked volatile reads leave the
+/// span). The store-then-count ordering below is unchanged; both callers keep it by construction.
+///
+/// FBCON-DMG-PI: `band` is the SOURCE-ROW range `[y0, y1)` the caller declared damaged, or `None` for
+/// the whole box — which is what BOTH pre-existing verbs pass, so their behaviour here is unchanged
+/// by construction. The band reaches the compositor only on the `wm` arm below; the COMPAT arm
+/// (`wm_id == WIN_NONE`) ignores it and forwards the whole surface, which is the fail-safe direction
+/// (over-paint, never a stale row) and the only one the ELF-3 hook's signature can express.
 fn present_surface_common(
     asid: u64,
     surf: *mut u8,
@@ -11212,8 +12000,16 @@ fn present_surface_common(
     stride: u32,
     size: usize,
     wm_id: crate::video::wm::WinId,
+    sum: u64,
+    band: Option<(usize, usize)>,
 ) {
-    let sum = fb_checksum(surf, size);
+    let _ = size;
+    // M3 shrink 2 — ARM THE OWED-TAIL DEFERRAL. This body is the one place both present verbs go
+    // through, it composites IRQ-masked, and both of its callers cash the tail immediately after
+    // `drop(_irq)` with nothing between that can return early. Arming HERE rather than inside
+    // `composite` is what keeps every other aarch64 compositor caller on trunk timing — see
+    // `video::wm::composite_arm_owed`.
+    crate::video::wm::composite_arm_owed();
     FB_PRESENT_CHECKSUM.store(sum, Ordering::Release);
     FB_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
     // UVUG-8r2: bump the FOCUS-SCOPED present counter too — the one `run_user_image`'s suspension cap reads.
@@ -11243,7 +12039,15 @@ fn present_surface_common(
     // checksum witness above, so the UVUG-8 suspension cap and the ELF-3 fb-test `present == 1` verdict are
     // driven by the single accounting block regardless of which path renders.
     if wm_id != crate::video::wm::WIN_NONE {
-        wc_shim::present(wm_id);
+        // FBCON-DMG-PI: one arm, two extents. `None` is `wm::present` verbatim — the pre-arc call — so
+        // `SYS_FB_PRESENT`/`SYS_WIN_PRESENT` reach the compositor through the exact same line they did
+        // before. `Some` is `wm::present_rows`, which is the SAME pass with a narrower repaint extent
+        // (occlusion closure, staged-present discipline, cursor bracket, VUGMIN-B suppression and every
+        // witness are shared code on a shared path — see `video::wm::present_banded`).
+        match band {
+            None => wc_shim::present(wm_id),
+            Some((sy0, sy1)) => wc_shim::present_rows(wm_id, sy0, sy1),
+        }
     } else {
         wc_shim::present_compat(surf as *const u8, w, h, stride);
     }
@@ -11255,7 +12059,7 @@ fn present_surface_common(
 // A fixed table of WIN_MAX windows, each owned by exactly one ASID. Two indices, deliberately distinct:
 //   * the WINDOW ID (0..WIN_MAX) — GLOBAL, what EL0 passes to the WIN verbs and what the compositor
 //     names a window by;
-//   * the REGION SLOT (0..FB_WIN_SLOTS) — PER-ADDRESS-SPACE, which 64 KiB surface slot of the owner's
+//   * the REGION SLOT (0..FB_WIN_SLOTS) — PER-ADDRESS-SPACE, which surface slot of the owner's
 //     own FB region backs it. Region slots are allocated lowest-first per ASID, so a process's FIRST
 //     window always lands on region slot 0 — the VA the single ELF-3 surface occupied, which is what
 //     makes `SYS_FB_MAP`'s returned VA byte-identical for the existing VUG.ELF binary.
@@ -11270,11 +12074,20 @@ fn present_surface_common(
 // Keeping the check on this side means the seam to WC-A carries no security weight.
 // =============================================================================================
 
-/// WC-B: the fixed window count. Matches `boot::FB_WIN_SLOTS` (asserted below) and the compositor's
-/// fixed table. STOP tripwire: a deliberate cap, like `USER_SLOTS` — do not raise it for a demo.
+/// WC-B: the fixed GLOBAL window count. STOP tripwire: a deliberate cap, like `USER_SLOTS` — do not
+/// raise it for a demo.
+///
+/// CRYSTAL-HD: this used to be `WIN_MAX == boot::FB_WIN_SLOTS`, and that equality was never the
+/// requirement — it was two caps that happened to be equal. The two count different things (see the
+/// header above): `WIN_MAX` is how many windows the SYSTEM may have live, `FB_WIN_SLOTS` how many
+/// surface slots ONE address space reserves. When the surface cap rose to 288×288 the per-process
+/// count came down 8 → 4 to keep the region inside one L3; the global table did not, and must not,
+/// follow it. What is load-bearing is the SAFE direction, asserted here exactly as the x86 twin
+/// asserts it: a region slot is indexed per address space and a window id is global, so a region
+/// slot index must never be able to exceed the global table.
 const WIN_MAX: usize = 8;
-const _: () = assert!(WIN_MAX == super::uslots::FB_WIN_SLOTS);
-/// WC-B: a 128×128 ARGB8888 surface must fit a window's 64 KiB VA slot exactly.
+const _: () = assert!(super::uslots::FB_WIN_SLOTS <= WIN_MAX);
+/// WC-B: a `FB_WIN_MAX_W` × `FB_WIN_MAX_H` ARGB8888 surface must fit a window's VA slot exactly.
 const _: () = assert!(
     (super::uslots::FB_WIN_MAX_W * super::uslots::FB_WIN_MAX_H * 4) as usize
         == super::uslots::FB_WIN_SLOT_SIZE
@@ -11460,7 +12273,16 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     let _irq = IrqGuard::mask_save();
     let mut t = WINDOWS.lock();
     // Lowest-free REGION slot for this ASID (so a process's first window is region slot 0 — the compat VA).
-    let rslot = match (0..WIN_MAX)
+    //
+    // CRYSTAL-HD — THE TWO RANGES ARE NOT THE SAME RANGE, and this is where that stopped being
+    // harmless. The CANDIDATE range is `FB_WIN_SLOTS` (how many surface slots this address space's FB
+    // region actually reserves); the SCAN range is `WIN_MAX` (any global row could belong to this
+    // ASID). Both were `WIN_MAX` while the two caps were equal; with `FB_WIN_SLOTS` at 4 and
+    // `WIN_MAX` still 8, a `WIN_MAX` candidate range would hand out region slot 4..7 and
+    // `map_slot_fb_win` would map 81 pages past the end of the FB region, into the NEXT slot's
+    // backing store. The x86 twin took the same correction when its caps diverged; the fifth window
+    // now gets the honest `-EMFILE` this verb already documents.
+    let rslot = match (0..super::boot::FB_WIN_SLOTS)
         .find(|&r| !(0..WIN_MAX).any(|i| t[i].owner == asid && t[i].rslot as usize == r))
     {
         Some(r) => r,
@@ -11553,6 +12375,14 @@ fn sys_win_present(win: u64) -> i64 {
     }
     let id = win as usize;
     let slot = (asid - 1) as usize;
+    // M3 (span shrink): snapshot–checksum–revalidate. Hold #1 is the masked micro-hold that
+    // resolves ownership and snapshots the row; the 64 KiB checksum then runs UNMASKED over the
+    // caller's own surface (the caller is parked in this syscall — its surface cannot change);
+    // hold #2 re-validates that the row still IS the snapshot before any pixel work runs under
+    // it. A row closed/recycled between the holds fails re-validation and the present is refused
+    // fail-closed (EBADF) — the recycled-id protection is preserved by the same hold-validated
+    // present as before, minus ~65 K volatile reads of masked time. (M4, a separate briefed arc,
+    // is the one that may relax the hold itself; this milestone deliberately does not.)
     let _irq = IrqGuard::mask_save();
     let t = WINDOWS.lock();
     if t[id].owner == 0 {
@@ -11562,7 +12392,15 @@ fn sys_win_present(win: u64) -> i64 {
         return EACCES;
     }
     let e = t[id];
+    drop(t);
+    drop(_irq);
     let surf = super::uslots::slot_fb_win_surface_ptr(slot, e.rslot as usize);
+    let sum = fb_checksum(surf, e.pages as usize * 0x1000);
+    let _irq = IrqGuard::mask_save();
+    let t = WINDOWS.lock();
+    if t[id].owner != asid || t[id].rslot != e.rslot || t[id].wm_id != e.wm_id {
+        return EBADF;
+    }
     present_surface_common(
         asid,
         surf,
@@ -11571,8 +12409,110 @@ fn sys_win_present(win: u64) -> i64 {
         e.w as u32 * 4,
         e.pages as usize * 0x1000,
         e.wm_id,
+        sum,
+        None,
     );
     drop(t);
+    drop(_irq);
+    // M3 shrink 2: cash the sprite tail composite_pass stashed — unmasked, lock-free epilogue.
+    crate::video::wm::composite_tail_owed();
+    0
+}
+
+/// FBCON-DMG-PI: `SYS_WIN_PRESENT_ROWS(win, y0, y1)` -> 0, or a negative errno. The DAMAGE-CARRYING
+/// present: composite the caller's window declaring only SOURCE rows `[y0, y1)` of its own surface
+/// changed. Rows are the SURFACE's, not the panel's, and the half-open interval is the C convention
+/// `y1 == y0 + count`. The aarch64 twin of x86's `sys_win_present_rows`; same number, same argument
+/// shape, same errnos in the same order — `una_abi` is the contract both sides implement.
+///
+/// ADDITIVE, at its own number (33). `SYS_WIN_PRESENT` (30) is untouched on both arches and keeps its
+/// exact one-argument shape — see the number's declaration in `una_abi` for why widening 30 in place
+/// could not be made safe. A kernel without this verb answers `-ENOSYS` from the dispatcher's default
+/// arm, having done nothing else, which is why every client carries a whole-box fallback.
+///
+/// GATING IS `sys_win_present`'S, VERBATIM, AND IN THE SAME ORDER: `win_caller_slot()` first, then
+/// `-EBADF` on an out-of-range id, `-EBADF` on a free row, `-EACCES` on another ASID's live window. A
+/// damage hint is not a weaker capability than a present, so it does not get a weaker check.
+///
+/// A BAD RANGE IS `-EINVAL`, NOT A SILENT WHOLE-BOX — the x86 arm's argument, which holds here
+/// unchanged. `video::wm::present_rows` does degrade an empty, inverted or over-tall band to the whole
+/// box internally, and that degrade is right for the KERNEL callers it was written for: fail-safe,
+/// never leaving a pixel stale. At the ABI it would be fail-SILENT in the sense that matters: a ring-3
+/// program with an off-by-one in its damage arithmetic would repaint correctly, at full cost, forever,
+/// and the syscall would answer 0 every time — the bug invisible in exactly the place this verb exists
+/// to make visible. Refusing tells the caller on its first frame, and the mandatory whole-box fallback
+/// every client already carries for the `-ENOSYS` case catches this one too, so the refusal costs a
+/// correct picture nothing and buys a debuggable one. `y0` needs no separate bound: `y0 < y1 <= h`.
+///
+/// LOCK SPAN and LOCK ORDER are `sys_win_present`'s, including its M3 snapshot–checksum–revalidate:
+/// hold #1 resolves ownership, RANGE-CHECKS THE BAND AGAINST THE SAME ROW'S `h` and snapshots the row;
+/// the 64 KiB checksum then runs unmasked over the caller's own surface (the caller is parked in this
+/// syscall, so its surface cannot change); hold #2 re-validates before a pixel moves. The band is
+/// judged against the `h` read under the hold that validated the ownership — so it is provably the `h`
+/// of the window being presented — and hold #2 re-checks `w`/`h` as well as `owner`/`rslot`/`wm_id`,
+/// one check STRONGER than the whole-box verb needs: a close+create pair that recycled this row back
+/// to the same ASID with the same region slot, the same wm id and a SMALLER surface would otherwise
+/// carry a band validated against the old height into the new window. That is refused `-EBADF`,
+/// fail-closed, rather than clamped.
+///
+/// The checksum is deliberately NOT skipped for a banded present. `FB_PRESENT_CHECKSUM` is the ELF-3
+/// witness of what was last presented, and a verb that composited without refreshing it would leave
+/// the witness describing a frame that is no longer on the panel. Cheapness here is bought from the
+/// COMPOSITOR (a narrower repaint of an upscaled box), not from the accounting.
+fn sys_win_present_rows(win: u64, y0: u64, y1: u64) -> i64 {
+    let asid = match win_caller_slot() {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if win >= WIN_MAX as u64 {
+        return EBADF;
+    }
+    let id = win as usize;
+    let slot = (asid - 1) as usize;
+    let _irq = IrqGuard::mask_save();
+    let t = WINDOWS.lock();
+    if t[id].owner == 0 {
+        return EBADF;
+    }
+    if t[id].owner != asid {
+        return EACCES;
+    }
+    // The range check runs against THIS row's surface height, read under the same hold that validated
+    // the ownership. Order matters and matches x86: ownership is proved BEFORE the band is judged, so a
+    // caller cannot probe another ASID's window geometry by watching `-EINVAL` and `-EACCES` diverge.
+    if y1 <= y0 || y1 > t[id].h as u64 {
+        return EINVAL;
+    }
+    let e = t[id];
+    drop(t);
+    drop(_irq);
+    let surf = super::boot::slot_fb_win_surface_ptr(slot, e.rslot as usize);
+    let sum = fb_checksum(surf, e.pages as usize * 0x1000);
+    let _irq = IrqGuard::mask_save();
+    let t = WINDOWS.lock();
+    if t[id].owner != asid
+        || t[id].rslot != e.rslot
+        || t[id].wm_id != e.wm_id
+        || t[id].w != e.w
+        || t[id].h != e.h
+    {
+        return EBADF;
+    }
+    present_surface_common(
+        asid,
+        surf,
+        e.w as u32,
+        e.h as u32,
+        e.w as u32 * 4,
+        e.pages as usize * 0x1000,
+        e.wm_id,
+        sum,
+        Some((y0 as usize, y1 as usize)),
+    );
+    drop(t);
+    drop(_irq);
+    // M3 shrink 2: cash the sprite tail composite_pass stashed — unmasked, lock-free epilogue.
+    crate::video::wm::composite_tail_owed();
     0
 }
 
@@ -11716,6 +12656,22 @@ mod wc_shim {
         }
     }
 
+    /// FBCON-DMG-PI: `video::wm::present_rows` — the same pass as [`present`], damage-marking only
+    /// SOURCE rows `[sy0, sy1)` of the window's surface. Called with `WINDOWS` held, for [`present`]'s
+    /// reason (WC-B (F2): the id handed to `wm` is provably still the id the verb validated).
+    ///
+    /// The band is already range-checked against THIS window's `h` by `sys_win_present_rows`, under the
+    /// same hold that proved ownership, so `wm`'s own degrade-to-whole-box for a nonsense band is
+    /// unreachable from the syscall path — a ring-3 caller is told `-EINVAL` instead of being silently
+    /// widened. The `bool` return says only whether `id` named a live row; `sys_win_present` discards
+    /// the same information (`wm::present` returns it too) and this verb keeps that behaviour, so a
+    /// present into a headless/refused compositor row answers 0 on both verbs alike.
+    pub fn present_rows(id: WinId, sy0: usize, sy1: usize) {
+        if id != WIN_NONE {
+            let _ = wm::present_rows(id, sy0, sy1);
+        }
+    }
+
     /// The COMPAT present: forward to the ELF-3 hook (`video::screen::present_surface`), which computes the
     /// legacy centred geometry and hands it to `wm::compat_present` — a chrome-less compositor row that
     /// flushes exactly the rows the pre-WC blit did. The one place the hook is still called.
@@ -11801,6 +12757,7 @@ use una_abi::INPUT_EV_KEY_UP; // a key RELEASE (payload[7:0] = ASCII)
 use una_abi::INPUT_EV_MOUSE_REL; // relative pointer motion (payload[31:16]=dx, [15:0]=dy as i16)
 use una_abi::INPUT_EV_MOUSE_ABS; // absolute pointer position (payload[31:16]=x,  [15:0]=y  as i16)
 use una_abi::INPUT_EV_BUTTON; // a pointer button-DOWN edge (payload[7:0] = button bitmask)
+use una_abi::INPUT_EV_WHEEL; // one scroll-wheel detent    (payload[7:0] = signed i8 delta, + = up)
 
 /// Per-ASID input ring capacity (power of two — occupancy math is `tail.wrapping_sub(head)`).
 const INPUT_RING_CAP: usize = 32;
@@ -12077,6 +13034,10 @@ fn pack_input(ev: crate::pal::Event) -> Option<u64> {
         Event::Mouse { x, y } => (INPUT_EV_MOUSE_REL, pack_xy(x, y)),
         Event::MouseAbsolute { x, y } => (INPUT_EV_MOUSE_ABS, pack_xy(x, y)),
         Event::Button(mask) => (INPUT_EV_BUTTON, mask as u64),
+        // WHEEL: the delta rides the low byte as a raw two's-complement i8 — ring 3 sign-extends
+        // (`payload as u8 as i8`). Cast through `u8` first: `i8 as u64` would sign-extend to
+        // 0xFFFF_FFFF_FFFF_FFxx and smear a negative detent across the type field.
+        Event::Wheel(d) => (INPUT_EV_WHEEL, d as u8 as u64),
         Event::Timer | Event::None | Event::Unknown => return None,
     };
     Some(una_abi::input_ev_pack(ty, payload))
@@ -12095,7 +13056,7 @@ pub fn user_input_enqueue(ev: crate::pal::Event) -> bool {
     //
     // Reserved only while there is somewhere to go: with fewer than two windows in the focus ring the key
     // falls through and is delivered as an ordinary TAB, so a single-window app keeps a normal keyboard.
-    if wc_focus_key(ev) {
+    #[cfg(feature = "pidesk")] if crate::video::crystal::key_escape(ev) || crate::video::quarry::key_route(ev) { return true; } if wc_focus_key(ev) { // MENUBAR-PI: <Esc> dismisses an OPEN SHARD menu, asked FIRST — x86 asks the identical question in the identical position (`wc_route_event`, ahead of `wc_focus_key`), because a modal surface must get the key before the focus ring does or Escape would TAB the desktop out from under an open menu. `key_escape` consumes ESC only while the menu is open, so every other boot is byte-alike. ⚠ ONE LINE, folded onto the `if` below: a line ADDED to this file renumbers every panic `Location` under it and breaks the knob-off `kernel8.img` byte-identity proof (PI-DESK's rule, and this file is named in it).
         return true;
     }
     // CLICK-ROUTE: the pointer's twin of the line above, and in the same place for the same reason —
@@ -12488,7 +13449,7 @@ pub fn wc_close_last_settle() -> u32 {
 /// FORBID plain `noproc` where only fixtures close, and an operator reading the log can tell a
 /// witness no-op from a click that killed nobody.
 fn wc_close_click(owner: u64) -> &'static str {
-    let closed = crate::video::wm::close_owner(owner);
+    let closed = crate::video::wm::close_owner(owner); if crate::video::wm::is_kernel_owner(owner) { return "furniture-refused"; } // DRAINSTALL (PA38): close_owner REFUSED every row — a close that removed NOTHING may perform no teardown side effect. Below this line are the two that made the freeze: the focus drop and `focus_changed(0)`, i.e. a FULL SHELL RAISE that parks every user window, publishes hidden=true fleet-wide, queues N deferred erase boxes on DEFER and arms request_full_present — all predicated on a close that did not happen. That is CLOSE-TEARDOWN's ruling ("closing a window causes the other open vug stat pulse windows to minimize"), whose fix `focus_release` has zero aarch64 callers. Returning HERE is also what unwinds the CLOSE-FIX hop: the retry loop re-enters only on `noproc-selftest`, and its stated bound ("every hop removes at least the hit row") is false for a REFUSED row. One line, line-NEUTRAL, per this file's PANIC-Location rule.
     if USER_INPUT_ACTIVE.load(Ordering::Acquire) == owner {
         user_input_set_active(0);
     }
@@ -12589,13 +13550,13 @@ fn wc_close_click(owner: u64) -> &'static str {
 /// Reads the shared cursor state every other pointer consumer reads (`pal::cursor`, the same state
 /// `click1_dispatch` hit-tests and the compositor draws), clamped by the live panel geometry.
 ///
-/// Locks: the framebuffer info lock, then the cursor position lock, and both are released before
-/// `wm::hit_test` takes the window TABLE lock. No nesting, so no new lock order (§WEDGE-1).
+/// Locks: the framebuffer info read is LOCKFIX's masked NON-BLOCKING door (a blocking take here is
+/// INWEDGE's boot-8 wedge, on this exact band), then the cursor position lock, and both are released
+/// before `wm::hit_test` takes the window TABLE lock. No nesting, so no new lock order (§WEDGE-1).
 fn click_pointer_pos() -> (i32, i32) {
-    let (w, h) = {
-        let info = crate::video::WRITER.lock().info();
-        (info.width as i32, info.height as i32)
-    };
+    // LOCKFIX — refused ⇒ (0, 0), the clamp an unset framebuffer has always given this function.
+    let (w, h) = crate::video::panel_info_nonblocking()
+        .map_or((0, 0), |i| (i.width as i32, i.height as i32));
     crate::pal::cursor::pos(w, h)
 }
 
@@ -12648,8 +13609,7 @@ fn click_owner_is_fullscreen(asid: u64) -> bool {
 ///   * a `run` program between the focus grant in `run_user_image` and its first present (or one that
 ///     never presents at all — every batch program, for its whole run);
 ///   * a windowed app that has closed its last window and kept running.
-/// In that state every desktop press took the `else` arm and was delivered to an app that owns nothing
-/// on the panel, so the miss arm never fired and printed no line. TAB did not rescue it in one press
+/// In that state every desktop press took the `else` arm and was delivered to an app that owns nothing on the panel, so the miss arm never fired and printed no line. TAB did not rescue it in one press
 /// either: `wc_focus_key`'s unknown-focus arm sends a focus that is in no ring slot to `ring[0]`, not
 /// to the shell, so the operator had to cycle the WHOLE ring before the shell slot came up. That is
 /// P72's report exactly — "the shell can't be focused until it's cycled through a tab sequence".
@@ -12675,10 +13635,7 @@ fn click_owner_is_fullscreen(asid: u64) -> bool {
 /// effect, not a side effect — it is the same z-order move `TAB`-to-shell has always made, and the
 /// same one FOCUS-VIS's "shell" leg asserts.
 ///
-/// The press itself is still CONSUMED (target [`CLICK_TARGET_DROP`], so the release is dropped with
-/// it). Focus moved; the click is not re-addressed to the console after the fact, because a
-/// press/release pair must not be split and the shell's `click1_dispatch` never saw the press edge.
-/// The operator's NEXT click is an ordinary shell click on the shell's own path.
+/// The press itself is still CONSUMED (target [`CLICK_TARGET_DROP`], so the release is dropped with it). Focus moved; the click is not re-addressed to the console after the fact, because a press/release pair must not be split and the shell's `click1_dispatch` never saw the press edge. The operator's NEXT click is an ordinary shell click on the shell's own path.
 ///
 /// ### CLICK-PLAIN — a FOCUS-CHANGING press is DELIVERED, after the focus moves (P75, bench)
 /// CLICK-SWALLOW (P73) consumed the focus-changing press instead of delivering it, on the rule "an app
@@ -12720,10 +13677,9 @@ fn click_owner_is_fullscreen(asid: u64) -> bool {
 /// delivered to; otherwise it is dropped. So a TAB (or an app exit) between press and release costs
 /// the release, never a fabricated one in a second app.
 ///
-/// Returns `true` when the event was CONSUMED and the caller must not deliver or forward it — since
-/// CLICK-PLAIN that is the MISS arm only (a press that moved focus to the shell). `false` means "carry
-/// on with your normal path", with whatever focus this call left in place: unchanged on a press to the
-/// already-focused window, and the newly RAISED owner on a press that moved focus to a window.
+/// Returns `true` when the event was CONSUMED and the caller must not deliver or forward it — the MISS arm (a press that moved focus to the shell), the close/control arms, and since PI-DESK the FURNITURE arm. `false` means "carry on with your normal path", with whatever focus this call left in place: unchanged on a press to the already-focused window, and the newly RAISED owner on a press that moved focus to a window.
+///
+/// ### PI-DESK — the FURNITURE arm, judged BEFORE every window arm. The crystal menu and the dock composite on TOP of the window layer (`wm::composite_once` paints `strip::compose_all` after the window loop), and the painter that owns the pixel owns the press. The `match` below answers from the window TABLE and knows nothing of either strip, so without that arm a window lying under the dock would take a press the operator can SEE landed on a tile. It calls the same [`crate::video::strip::press_route`] the x86 router does — ONE copy of the order, which is the inverse of the paint order and lives beside it; see that function for why neither arm can starve the other, and note that the strip's cut CORNERS decline (through its painter's own `contains`), so a corner press falls through to the desktop-miss arm, per the crispywire review. The grammar is unchanged by it: a furniture press is an instruction to the WINDOW SYSTEM, consumed with the target set to DROP exactly as the close and control arms are; a dock press SELECTS and acknowledges on the wire — it stops nothing, starts nothing, kills nothing. ⚠ The ONE-LINE shape of that arm, and this paragraph's long lines, are not style: `wm.rs` proved this arc that PANIC `Location` RECORDS EMBED LINE NUMBERS, so a line ADDED to any file compiled into the knob-off `kernel8.img` breaks its byte-identity proof — and this file is one. The arm is one line, paid for by one line removed here; the diff is line-NEUTRAL, and must stay so.
 ///
 /// Idempotent per edge: the mask tracker is swapped on entry, so a second call with the same mask sees
 /// no edge and answers `false`. The shell caller relies on that (it calls `user_input_enqueue`, which
@@ -12737,6 +13693,7 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
     if mask & !prev != 0 {
         // PRESS edge.
         let (x, y) = click_pointer_pos();
+        #[cfg(feature = "pidesk")] if crate::video::strip::press_route(x, y) { crate::video::quarry::service(); CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); return true; } else if crate::video::pulsewin::press_route(x, y) || crate::video::quarry::press_route(x, y) { CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); return true; } // PI-DESK: furniture before every window arm — see this fn's header. Order: the strips first (they composite on top); on a strip-consumed press quarry::service() drains the dock tile's reopen latch HERE (a router does no disk I/O; this input-drain context is where the shell's own ls reads volumes). PULSEWIN and QUARRY then claim ONLY their own window's discs/menus, each re-asking wm::hit_test so an occluding window keeps every press; everything else falls to the arms below (keeps both draggable/parkable). ⚠ folded IN PLACE, never added lines: knob-off line numbers are load-bearing — PARITY.md §5.3.
         match crate::video::wm::hit_test(x, y) {
             // CLOSE-BOX (P79) — checked FIRST, so the close box beats select. This is the ONE
             // point in the click grammar where a click ACTS: the box is explicit window FURNITURE
@@ -12830,6 +13787,9 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
                 }
                 true
             }
+            // DRAG-PI M3 — CHROME (title strip / border) is judged AFTER the three controls and BEFORE every app arm, exactly as the x86 twin orders it: a press on kernel-drawn chrome is an instruction to the WINDOW SYSTEM and is consumed here, a press on content is the app's input and falls through. Neither starves the other — `chrome_hit` is `outer_box` MINUS `content_box`, a region the app's surface does not cover a pixel of, and it declines COMPAT rows so a full-screen app keeps its whole panel. FURNITURE follows x86's rule rather than inventing a Pi one: a kernel-band row (the console) IS draggable — its title bar is a grip like any other — but the KEYBOARD goes to the shell, because there is no ring behind a kernel owner to hand it to. `drag_begin` self-guards on `title_bar_hit`, so a press on a BORDER raises and consumes without minting a grab the geometry does not support; the gesture is steered by `wm::drag_route_tail` from the two drains and ended by the release edge below. The click grammar is untouched: this arm SELECTS and grabs, it stops nothing and starts nothing. ⚠ ONE-LINE shape and long prose are not style — this file is compiled into the knob-off `kernel8.img` and a line ADDED anywhere in it breaks that image's byte-identity proof (panic `Location` records embed line numbers), so this arm is 2 lines paid for by 2 removed below; the diff is line-NEUTRAL and must stay so.
+            #[cfg(feature = "pidesk")] Some((win, owner, _z)) if crate::video::wm::chrome_hit(win, x, y) => { if crate::video::wm::is_kernel_owner(owner) { user_input_set_active(0); } else if owner != cur { user_input_set_active(owner); } crate::video::wm::focus_changed(owner); let how = if crate::video::wm::drag_begin(win, x, y) { "drag" } else { "chrome" }; if CLOSE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX { serial_println!("[clickroute] press chrome win={} owner={} at ({},{}) -> {}", win, owner, x, y, how); } CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); true }
+            #[cfg(feature = "pidesk")] Some((win, owner, _z)) if crate::video::wm::is_kernel_owner(owner) => { serial_println!("[clickroute] press hit furniture asid={} win={} (was {}) consume -> shell focus", owner, win, cur); user_input_set_active(0); crate::video::wm::focus_changed(owner); CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); true } // SHELLWIN-PI: KERNEL FURNITURE, on its CONTENT — raise it, hand the keyboard to the SHELL (asid 0), consume the press. Exact parity with the x86 arm of the same name (`arch/x86_64/syscall.rs`, "KERNEL FURNITURE — raise it, hand the keyboard to the shell"), including its POSITION: there the chrome block answers a furniture press on the title strip/border and this `hit_test` arm answers one on the content, and DRAG-PI's chrome arm directly above is that same first half on this arch. Without this second half the shell window is a trap — a press on its TEXT (chrome_hit is `outer_box` MINUS `content_box`, so the text is not chrome) would fall to the `owner != cur` arm below and `user_input_set_active(KERNEL_OWNER_DESKTOP)`, an "ASID" with no ring: clicking your own shell would take the keyboard AWAY from it, the SHELLWIN defect re-entered through the pointer. Below the close/minimise/zoom arms rather than above them as on x86, deliberately: those arms are where PA38's refused-close ruling lives on this arch, and this arc rides that path instead of diverting it. ⚠ ONE LINE, paid for by one line merged in this fn's header — panic `Location` records embed line numbers, so the knob-off `kernel8.img` byte-identity proof requires this diff to stay line-NEUTRAL.
             Some((win, owner, _z)) if owner != cur => {
                 // The ONLY line this arc adds to serial, and only on the arm that changes behaviour:
                 // a click that MOVED focus. Human-rate by construction (one line per click that lands
@@ -12878,6 +13838,7 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
     } else if prev & !mask != 0 {
         // RELEASE edge — follow the press, or drop. Never hit-tested: the release belongs to whoever
         // received the press, not to whatever the pointer has since been dragged over.
+        #[cfg(feature = "pidesk")] if crate::video::wm::drag_active() != crate::video::wm::WIN_NONE { crate::video::wm::drag_end(); } // DRAG-PI M3 — the button coming up ENDS the grab, and this is the primary end: it carries the delivered edge, so the window rests where the operator let go and `[drag]`/`[wm-act] drag-end` name the gesture's cost and outcome on the wire exactly as they do on x86. No belt against a LOST release here (x86's `release-level` tail exists for an EHCI endpoint that can supersede a report before it is read); the Pi's xHCI drain has not shown that loss, and inventing a second ending for a failure this arch has not demonstrated would be machinery with no evidence behind it. `drag_forget` still cancels on close, so a grab cannot outlive its window.
         let target = CLICK_PRESS_TARGET.load(Ordering::Acquire);
         target == CLICK_TARGET_DROP || target != cur
     } else {
@@ -13175,6 +14136,7 @@ unsafe extern "C" {
 /// final poll == -EAGAIN. QEMU raspi4b has no USB HID, so the kernel-injected event is what proves the
 /// enqueue->drain path here — an honest statement of what QEMU can and cannot show. Never perturbs the
 /// fixture battery (its own line, exit routed by name).
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn input_launcher(_demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -13456,6 +14418,7 @@ unsafe extern "C" {
 /// surface), joins, and exits. The verdict prints the authoritative witness with the mapped geometry, the
 /// present count, and the surface checksum — self-verified against `fb_expected_checksum`. Runs AFTER
 /// `threads_launcher`'s verdict, so its reuse of the shared SYS_THREAD_* accounting perturbs nothing.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn fb_launcher(_demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -13515,14 +14478,23 @@ fn fb_launcher(_demo_cpu: usize) {
 // self-verifies. Single-threaded and register-only apart from its own surface, so it can never perturb
 // the ELF-2/ELF-3 accounting (it runs AFTER those verdicts print).
 //
-// Bit ledger (all thirteen must be set):
+// Bit ledger (all eighteen must be set):
 //   b0  create(128,128) -> id >= 0           b6  create(0,0)        -> -EINVAL
-//   b1  the per-window info entry reads back b7  create(129,10)     -> -EINVAL (over FB_WIN_MAX_W)
+//   b1  the per-window info entry reads back b7  create(289,10)     -> -EINVAL (over FB_WIN_MAX_W)
 //       magic/128/128 for region slot 0      b8  close(A)           -> 0
 //   b2  present(A) -> 0                      b9  close(A) again     -> -EBADF (row already free)
 //   b3  move(A,40,24) -> 0                   b10 create(64,64) -> a SECOND id >= 0
 //   b4  move(A,8192,0) -> -EINVAL            b11 present(B) -> 0 with A STILL LIVE
 //   b5  present(8) -> -EBADF (unknown id)    b12 close(B)           -> 0
+//
+// FBCON-DMG-PI — the BANDED present's own five bits, added when `SYS_WIN_PRESENT_ROWS` (33) landed on
+// this arch. They exist because the verb's only ring-3 client (`user-vug`) reaches it on an idle path
+// that a headless QEMU run never enters, so without them the port would ship unexercised in the gate:
+//   b13 present_rows(A, 0, 11)  -> 0         b16 present_rows(8, 0, 1)  -> -EBADF (unknown id)
+//   b14 present_rows(A, 11, 11) -> -EINVAL   b17 present_rows(A, 0, 11) -> -EBADF on the FREED row
+//   b15 present_rows(A, 0, 129) -> -EINVAL (y1 past the 128-row surface)
+// b13 is placed while A still holds its 0xC3 surface and is followed by the whole-box re-present of A,
+// so `FB_PRESENT_CHECKSUM` at verdict time is exactly what it was before this leg existed.
 // The verdict ALSO checks the kernel-side checksum of the presented surface against the expected FNV-1a
 // of 64 KiB of 0xC3 — so b2 cannot pass on a present that composited the wrong (or a stale) surface,
 // which is the property that actually proves the 16-page negotiated mapping landed.
@@ -13541,13 +14513,14 @@ fn fb_launcher(_demo_cpu: usize) {
 
 static WCB_DONE: AtomicBool = AtomicBool::new(false); // the fixture reached its clean sys_exit(0)
 static WCB_WITNESS: AtomicU64 = AtomicU64::new(0); // its reported bitmask
-/// WC-B: every bit of the ledger above (WC-C widened it from 10 to 13 with the side-by-side leg).
-const WCB_WITNESS_ALL: u64 = 0x1FFF;
+/// WC-B: every bit of the ledger above (WC-C widened it from 10 to 13 with the side-by-side leg;
+/// FBCON-DMG-PI from 13 to 18 with the banded-present leg).
+const WCB_WITNESS_ALL: u64 = 0x3_FFFF;
 /// WC-C: the byte the fixture fills its SECOND (64x64) window with — deliberately different from
 /// `WCB_FILL`, so the two `[wc-c]` per-window checksums cannot coincide and a composite that read the
 /// wrong surface for either window is visible in the witness.
 const WCB_FILL_B: u8 = 0x5A;
-/// WC-C: the second window's edge, in pixels. 64x64x4 = 16 KiB = 4 pages of its 64 KiB slot.
+/// WC-C: the second window's edge, in pixels. 64x64x4 = 16 KiB = 4 pages of its 0x51000 slot.
 const WCB_W_B: usize = 64;
 /// WC-B: the byte the fixture fills its whole 128×128 surface with.
 const WCB_FILL: u8 = 0xC3;
@@ -13559,10 +14532,18 @@ fn wcb_report(value: u64) {
     }
 }
 
+/// WC-B: the fixture's OWN window edge, in pixels — window A is 128×128 and its blob fills exactly
+/// 64 KiB. CRYSTAL-HD: this used to be spelled `FB_WIN_MAX_W`, which was only ever a coincidence —
+/// the fixture asks for the then-maximum edge, it does not ask for "the maximum". With the cap at 288
+/// the two parted company, and the fixture's asm still stores 65 536 bytes, so the expected checksum
+/// has to be a fact about the FIXTURE, not about the cap. (The over-max REFUSAL leg, b7, is the one
+/// check that must track the cap, and it does — see the blob's `#289`.)
+const WCB_W: usize = 128;
+
 /// WC-B: the kernel-computed expected checksum of the presented surface — FNV-1a over a full
 /// 128×128 ARGB8888 surface (16 pages) of `WCB_FILL`. Mirrors `fb_expected_checksum`.
 fn wcb_expected_checksum() -> u64 {
-    let n = (super::uslots::FB_WIN_MAX_W * super::uslots::FB_WIN_MAX_H * 4) as usize;
+    let n = WCB_W * WCB_W * 4;
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut i = 0usize;
     while i < n {
@@ -13642,7 +14623,8 @@ __wcb_prog:
 9:
     cmp  x21, #0                           // (b11) fill B with a DIFFERENT byte, then present it
     b.lt 9f                                // no B -> nothing to fill; leave the bit clear
-    add  x12, x9, #0x15, lsl #12           // region slot 1's surface: base + 0x5000 + 0x10000
+    add  x12, x9, #0x56, lsl #12           // region slot 1's surface: base + 0x5000 + FB_WIN_SLOT_SIZE
+                                           // (CRYSTAL-HD: 0x51000, so 0x56000 — was 0x15000 at 64 KiB)
     mov  w14, #0x5A
     orr  w14, w14, w14, lsl #8
     orr  w14, w14, w14, lsl #16
@@ -13693,13 +14675,51 @@ __wcb_prog:
     b.ne 9f
     orr  x23, x23, #(1 << 6)
 9:
-    mov  x0, #129                          // (b7) SYS_WIN_CREATE(129, 10) -> -EINVAL (over the max edge)
+    mov  x0, #289                          // (b7) SYS_WIN_CREATE(289, 10) -> -EINVAL (over the max edge:
+                                           // CRYSTAL-HD raised FB_WIN_MAX_W 128 -> 288, so 129 is now a
+                                           // LEGAL request and this leg had to move with the cap)
     mov  x1, #10
     mov  x8, #29
     svc  #0
     cmn  x0, #22
     b.ne 9f
     orr  x23, x23, #(1 << 7)
+9:
+    mov  x0, x22                           // (b13) FBCON-DMG-PI: SYS_WIN_PRESENT_ROWS(A, 0, 11) -> 0.
+    mov  x1, #0                            // The BANDED present: 11 of A's 128 source rows declared
+    mov  x2, #11                           // damaged, the extent `user-vug`'s idle HUD refresh uses.
+    mov  x8, #33
+    svc  #0
+    cmp  x0, #0
+    b.ne 9f
+    orr  x23, x23, #(1 << 13)
+9:
+    mov  x0, x22                           // (b14) an EMPTY band (y1 == y0) -> -EINVAL, never a silent
+    mov  x1, #11                           // whole-box: a caller's damage arithmetic is told it is wrong.
+    mov  x2, #11
+    mov  x8, #33
+    svc  #0
+    cmn  x0, #22
+    b.ne 9f
+    orr  x23, x23, #(1 << 14)
+9:
+    mov  x0, x22                           // (b15) y1 PAST the 128-row surface -> -EINVAL. The bound is
+    mov  x1, #0                            // this row's own `h`, read under the ownership hold.
+    mov  x2, #129
+    mov  x8, #33
+    svc  #0
+    cmn  x0, #22
+    b.ne 9f
+    orr  x23, x23, #(1 << 15)
+9:
+    mov  x0, #8                            // (b16) rows-present off the end of the table -> -EBADF, the
+    mov  x1, #0                            // SAME refusal and the same order as the whole-box verb (b5).
+    mov  x2, #1
+    mov  x8, #33
+    svc  #0
+    cmn  x0, #9
+    b.ne 9f
+    orr  x23, x23, #(1 << 16)
 9:
     mov  x0, x22                           // WC-C: re-present A so the LAST present the kernel checksums
     mov  x8, #30                           // is A's 128x128 0xC3 surface again — the verdict's expected
@@ -13724,6 +14744,15 @@ __wcb_prog:
     cmn  x0, #9
     b.ne 9f
     orr  x23, x23, #(1 << 9)
+9:
+    mov  x0, x22                           // (b17) FBCON-DMG-PI: rows-present on the now-FREED row ->
+    mov  x1, #0                            // -EBADF. The free-row gate is 30's, verbatim: a band is not
+    mov  x2, #11                           // a weaker capability than a present and gets no weaker check.
+    mov  x8, #33
+    svc  #0
+    cmn  x0, #9
+    b.ne 9f
+    orr  x23, x23, #(1 << 17)
 9:
     mov  x0, x23                           // SYS_REPORT(witness bitmask)
     mov  x8, #3
@@ -13751,6 +14780,7 @@ unsafe extern "C" {
 /// fixture battery. The fixture's slot is torn down at its exit, which also exercises the
 /// `clear_handle_row` -> `win_close_asid` teardown path (its window is already closed by then, so the
 /// sweep is a no-op — the honest limit of what a single-process fixture can show).
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn wcb_launcher(_demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -13787,7 +14817,7 @@ fn wcb_launcher(_demo_cpu: usize) {
     let expect = wcb_expected_checksum();
     if done && w == WCB_WITNESS_ALL && checksum == expect {
         serial_println!(
-            ":: EL0: window verbs — create/present/move/close witness={:#x} surface=128x128 checksum={:#x} :: PASS ::",
+            ":: EL0: window verbs — create/present/present_rows/move/close witness={:#x} surface=128x128 checksum={:#x} :: PASS ::",
             w, checksum
         );
     } else {
@@ -13816,13 +14846,16 @@ fn wcb_launcher(_demo_cpu: usize) {
     // restores SHELL_Z/FOCUS_ASID, repaints), so nothing after it sees a changed table.
     #[cfg(feature = "witness")]
     crate::video::wm::hittest_selftest();
-    // CTRLWIT: the control-cluster DECLINE witness, right after the hit-test battery — it is the
-    // same shape of fixture (mints synthetic rows, reaps them, restores the panel) and it must run
-    // after every per-window one-shot above has been claimed, or its three probe rows would burn
-    // latches the arc's real windows are owed. It re-pins its rows at scale 1 so its verdict is a
-    // property of the compositor and not of the panel it happens to be running on.
+    // CTRLWIT: the control-cluster DECLINE witness, right after the hit-test battery — it is the same shape of fixture (mints synthetic rows, reaps them, restores the panel) and it must run after every per-window one-shot above has been claimed, or its three probe rows would burn latches the arc's real windows are owed. It re-pins its rows at scale 1 so its verdict is a property of the compositor and not of the panel it happens to be running on.
     #[cfg(feature = "witness")]
     crate::video::wm::ctrldecline_selftest();
+    // DRAG-PI M4: the drag COST witness, after the control battery for the same reason it sits after
+    // the hit-test one — it mints a row, drives it edge to edge twice and reaps it, so it must not run while another fixture's one-shots are still owed. It restores nothing because it takes nothing: `move_to` on its own row, and a grab it cancels itself.
+    #[cfg(all(feature = "witness", feature = "pidesk"))]
+    crate::video::wm::dragperf_selftest();
+    // DRAGWEDGE: the PA41 freeze fixture, immediately after the drag COST witness because it is the same shape of scene one hazard over — it mints a KERNEL-BAND row, presses its title strip through this file's own router, then holds a `BlitGuard` open to reproduce the metal's `blit_active=1` and proves the drag path is BOUNDED, that the grab it could not service is RELEASED, that a fresh grab is REFUSED while the stall stands, and that the refusal LIFTS when the compositor recovers. It runs AFTER `dragperf` deliberately: that fixture measures a healthy drag path and this one deliberately stalls the compositor for a bounded interval, so the order keeps the measurement out of the stall's shadow.
+    #[cfg(all(feature = "witness", feature = "pidesk"))]
+    crate::video::wm::dragwedge_selftest();
     // PAPER: the kit texture's determinism fixture, LAST — it neither mints a window nor reads the
     // panel, so it perturbs nothing above it, and its only side effect is generating the one tile
     // (which emits the unconditional `[paper]` wire line naming the checksum the verdict asserts).
@@ -13840,8 +14873,7 @@ fn wcb_launcher(_demo_cpu: usize) {
     // asserts both still equal their own pinned constants, which is only a regression proof if
     // both have already been generated by the two fixtures above. Mints no window, reads no panel;
     // its only side effect is generating the one 64-byte tile (which emits the unconditional
-    // `[knurl]` wire line naming the checksum the verdict asserts). Leg 7 times `shade`, the one
-    // operation the material adds per disc pixel, so the cost of knurling is a number in every
+    // `[knurl]` wire line naming the checksum the verdict asserts). Leg 7 times `shade`, the one operation the material adds per disc pixel, so the cost of knurling is a number in every
     // capture.
     #[cfg(feature = "witness")]
     crate::video::knurl::selftest();
@@ -14497,7 +15529,80 @@ fn u7_release_go(slot: usize) {
 ///      revoked handle was torn down, t2 likewise, no pending residue). Free the planted Proc entry. PASS
 ///      iff both witnesses == `U7_WITNESS_ALL` AND used AND the snapshot held AND everything cleared AND no
 ///      U7 kill. Prints ONE PASS line. U7 is the last demo, so it releases no further gate.
+// =============================================================================================
+// U7STK (PARITY §6.1b) — THE CONVICTED FRAME, and why the fix is `#[inline(never)]`.
+//
+// THE DEFECT. On Pi metal `u7-launch` is dropped between `wcb_launcher` and
+// `video::pidesk::arm()` by the SPIN-6 refusal in `arch/aarch64/sched.rs`:
+//
+//   [spin6] cpu=2 REFUSING corrupt switch-in: task=70:u7-launch ctx_sp=0x20c9e70
+//   outside its stack [0x20ca000,0x20ce000) — the parked frame was OVERWRITTEN
+//
+// `ctx_sp` is 144..928 bytes BELOW this task's own 16 KiB low bound, varying per boot. Nothing was
+// writing into it; its own frame chain ran off the bottom. Everything after that statement — the
+// desktop itself, BGRUN, FATDIRS, FATMOVE — has therefore never executed on hardware, while three
+// arcs gated green on the QEMU path that does not reach it.
+//
+// THE MEASUREMENT (the `u7stk` probes below, QEMU raspi4b, 16 KiB stack, before this fix):
+//
+//   at=entry              used=5952  hw=5952   headroom=10432
+//   at=after:k1_persist   used=5952  hw=13064  headroom=3320
+//   at=after:exec1        used=5952  hw=14984  headroom=1400
+//   at=after:wcb          used=5952  hw=16384  headroom=0
+//
+// Two findings, and the first is the convict. `at=entry` says `u7_launcher`'s OWN FRAME is 5952
+// bytes — 36% of the task's whole stack, spent before it has called anything. Statically it
+// disassembles to `stp x29,x30,[sp,#-0x60]! ; sub sp,sp,#0x1,lsl #12 ; sub sp,sp,#0x5e0` =
+// 5696 bytes, the SECOND-LARGEST stack frame in the entire kernel image (only `video::wm::composite`
+// at 6640 is bigger). Second, `after:wcb` reaches `hw=16384` — every byte of the stack touched,
+// `headroom=0`. QEMU survives by exactly zero bytes; metal, whose USB-storage path adds
+// `xhci::bot_transfer -> bot_rescue_escalate -> run_bot_stage -> ... -> fbcon::__print ->
+// wm::composite` frames beneath the same chain (a subtree measuring 5520 bytes on its own, and one
+// QEMU raspi4b never takes because it models no xHCI), goes past the floor. That asymmetry IS the
+// "QEMU-green, metal-dead" of this defect, stated in bytes.
+//
+// WHY `u7_launcher`'s FRAME IS 5.7 KiB. It is a straight-line chain of ~47 no-argument calls and
+// declares no locals of its own. But THIRTY-EIGHT of those callees live in this same module and
+// were INLINED into it, so every one of their local buffers is a slot in `u7_launcher`'s single
+// frame — and that frame is live for the WHOLE cascade, including while a non-inlined callee runs
+// twelve kilobytes deep beneath it. LLVM merges slots whose lifetimes provably do not overlap, but
+// across 38 inlined bodies each carrying loops, matches and `Drop` types it cannot prove enough of
+// them disjoint, so the frame tends toward the SUM of their locals rather than the MAX.
+//
+// THE FIX. `#[inline(never)]` on exactly those 38 launchers — all of them in this file, each
+// carrying a one-line note pointing here. Each launcher's locals go back into ITS OWN frame, live
+// only while that launcher runs; the peak becomes `u7_launcher`'s residual frame plus the DEEPEST
+// SINGLE launcher instead of the sum of all of them. It costs one `bl` per fixture on a path that
+// already does disk I/O.
+//
+// IT IS UNCONDITIONAL, NOT witness-gated, because the DEFECT is not: a knob-off `./arroyo kernel8`
+// media image overflows exactly as readily as a witness one. So knob-off codegen MOVES with this
+// arc, deliberately — nothing here is byte-identical, and the battery is what proves the move is
+// behaviour-neutral. The `u7stk` probes themselves ARE witness-gated and stay in the tree, so the
+// next arc that grows a launcher sees `headroom=` shrink on the gate instead of on metal.
+// =============================================================================================
+// The high-water checkpoint macro used through `u7_launcher` below.
+// Expands to one `[u7stk] at=… sp=… low=… used=… hw=… headroom=…` line via `sched::stk_probe`,
+// which scans this task's poison-painted stack for its deepest-ever point. Because the reading is a
+// HIGH-WATER, a probe placed AFTER a launcher returns still reports how deep that launcher went —
+// which is what lets one line per call convict one call out of forty-seven without instrumenting
+// any of their interiors. `witness`-gated on both arms: knob-off the macro expands to nothing and
+// the media build is byte-identical to baseline in this file.
+#[cfg(feature = "witness")]
+macro_rules! u7stk {
+    ($at:expr) => {
+        crate::arch::sched::stk_probe($at)
+    };
+}
+#[cfg(not(feature = "witness"))]
+macro_rules! u7stk {
+    ($at:expr) => {{
+        let _ = $at;
+    }};
+}
+
 pub fn u7_launcher(demo_cpu: usize) {
+    u7stk!("entry");
     // U8, then U9, then U10, ride the SAME kernel task, each strictly after the prior flow (every exit path —
     // PASS, FAIL, or skip — falls through): the ordering gate the *_LAUNCH_DONE statics provide between
     // separately spawned launchers is here the program order of one task. Each launcher's verdict waits on its
@@ -14509,34 +15614,51 @@ pub fn u7_launcher(demo_cpu: usize) {
     // ZERO rows and the battery stays byte-identical; its live effect is on metal (a real power-cycle where a prior
     // boot left a real row). The mechanism is proven by the M3 kernel-side proof + the K2 real-program launcher.
     atr_maybe_boot_rebuild();
+    u7stk!("after:atr_boot_rebuild");
     u7_run(demo_cpu);
+    u7stk!("after:u7_run");
     u8_launcher(demo_cpu);
+    u7stk!("after:u8");
     u9_launcher(demo_cpu);
+    u7stk!("after:u9");
     u10_launcher(demo_cpu);
+    u7stk!("after:u10");
     u10c_launcher(demo_cpu);
+    u7stk!("after:u10c");
     u10d_launcher(demo_cpu);
+    u7stk!("after:u10d");
     u11_launcher(demo_cpu);
+    u7stk!("after:u11");
     u11defer_run(demo_cpu);
+    u7stk!("after:u11defer");
     u11reuse_run();
+    u7stk!("after:u11reuse");
     u11reap_run(demo_cpu);
+    u7stk!("after:u11reap");
     uowner_run(demo_cpu);
+    u7stk!("after:uowner");
     // F2 M3: after all 23 fixtures have exited, witness that FAT_MUTATION serializes the FAT-table RMW ACROSS
     // CORES (this task runs on `vcpu`; the worker on `demo_cpu` = online[0], always online). Runs LAST so it can
     // never perturb the fixture battery, and it never touches the disk. Emits its own `F2-witness:` line — NOT a
     // `-> PASS` line, so the 23-fixture count stays byte-equivalent.
     f2_witness_launcher(demo_cpu);
+    u7stk!("after:f2_witness");
     // F3 M4: the NAMESPACE-lock twin — same discipline (last, in-RAM, no disk, its own `F3-witness:` line).
     f3_witness_launcher(demo_cpu);
+    u7stk!("after:f3_witness");
     // K1 M1: the on-disk owner/grants (UNAFS.ATR) format + round-trip — runs LAST (its disk I/O can never
     // perturb the 23 fixtures or the witnesses); emits its own `:: K1-atr: ::` line (not a `-> PASS`).
     k1_atr_selftest();
+    u7stk!("after:k1_atr");
     // K1 M3: the two-phase remount-survival proof — persist an owned+granted file, simulate a reboot (rebuild
     // from UNAFS.ATR), and enforce with real stamped principals. Emits its own uncounted `:: K1-persist: … PASS ::`
     // line (the 24th) and fully cleans up. After k1_atr_selftest so it inherits a valid UNAFS.ATR image.
     k1_persist_launcher();
+    u7stk!("after:k1_persist");
     // K1 M4: the fail-closed proof — a TORN on-disk row yields a PUBLIC file at mount (never a forged owner).
     // Its own uncounted `:: K1-corrupt: … PASS ::` line (the 25th); fully self-cleaning.
     k1_corrupt_launcher();
+    u7stk!("after:k1_corrupt");
     // K2 (make-enforcement-LIVE): the end-to-end proof through TWO REAL disk-loaded programs — owner
     // re-admitted by name after the UNAFS.ATR rebuild, impostor refused. Its own uncounted
     // `:: K2-liveenf: … PASS ::` line (the 26th); fully self-cleaning (leaves no owned row on the metal card).
@@ -14545,6 +15667,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     // two-boot money-shot (k2_metal_launcher) instead — same slot, ATTENDED Pi bench only.
     #[cfg(not(feature = "k2_leave"))]
     k2_liveenf_launcher(demo_cpu);
+    u7stk!("after:k2_liveenf");
     #[cfg(feature = "k2_leave")]
     k2_metal_launcher(demo_cpu);
     // ELF-1: graduate the loader from flat-binary to minimal static ELF64. Placed HERE, among the
@@ -14555,21 +15678,25 @@ pub fn u7_launcher(demo_cpu: usize) {
     // page permissions), then drops it to EL0 and confirms it ran (its SYS_REPORT token arrived, its
     // SYS_WRITE message printed). Its own uncounted `:: ELF1: … ::` line; an honest skip without the fixture.
     elf1_launcher(demo_cpu);
+    u7stk!("after:elf1");
     // EXEC-1: prove the panel `run <path>` path — read ELFHELLO.ELF through the VFS mount table and execute
     // it via the NEW `run_user_image` loader entry, asserting a clean `exit=0`. Placed right after ELF-1
     // (same freshly-mounted FAT volume); its own uncounted `:: EXEC1: … ::` line, self-cleaning.
     exec1_witness(demo_cpu);
+    u7stk!("after:exec1");
     // ELF-2: the EL0-threading test — SYS_THREAD_SPAWN/_JOIN/_EXIT with a shared-memory counter across two
     // worker threads (one co-located, one on a sibling core). In-RAM (no disk), so it can never perturb the
     // fixture battery or the FAT witnesses; its own uncounted `:: EL0: threads test — … ::` line. Placed after
     // ELF-1 (the loader is proven; this exercises the thread primitives on top of the same slot machinery).
     threads_launcher(demo_cpu);
+    u7stk!("after:threads");
     // ELF-3: give EL0 something to draw on + real sync — SYS_FB_MAP / SYS_FB_PRESENT / SYS_FUTEX. The parent
     // maps a per-process off-screen surface, 2 threads draw halves under futex sync, the parent presents (the
     // kernel checksums + composites through the registered present hook), and the witness self-verifies the
     // drawn bytes against the expected checksum. In-RAM (no disk), so it can never perturb the fixture battery;
     // its own uncounted `:: EL0: fb test — … ::` line. Placed after ELF-2 (the thread primitives it builds on).
     fb_launcher(demo_cpu);
+    u7stk!("after:fb");
     // UVUG-1: the first REAL EL0 graphics program — the mini-vug. Reads VUG.ELF through the VFS and runs it
     // via the EXEC-1 `run_user_image` path (the same path `run /fat/VUG.ELF` drives at the panel): it maps an
     // off-screen surface, spawns 2 EL0 worker threads that render halves of an animated pattern under a FUTEX
@@ -14578,6 +15705,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     // (the SYS_FB_* / SYS_FUTEX primitives it builds on are proven, and the futex pool is armed). Its own
     // uncounted `:: EXEC-UVUG: … ::` verdict; an honest skip without the fixture.
     uvug_witness(demo_cpu);
+    u7stk!("after:uvug");
     // ELF-5: input into EL0 — SYS_INPUT_POLL + the per-process ring + the `user_input_enqueue` router seam.
     // A register-only EL0 program polls its ring empty (-EAGAIN), the launcher injects one KeyDown through
     // the real router seam, the program drains it (verifying the packed value) and polls empty again. In-RAM
@@ -14585,36 +15713,45 @@ pub fn u7_launcher(demo_cpu: usize) {
     // line. Placed after the EL0 graphics/thread ladder (the primitives it complements are proven). QEMU has
     // no real HID, so the kernel-injected event is what proves the enqueue->drain path (honest by design).
     input_launcher(demo_cpu);
+    u7stk!("after:input");
     // WC-B: the window verbs — SYS_WIN_CREATE/_PRESENT/_MOVE/_CLOSE, happy paths AND refusals, with the
     // presented 128×128 surface self-verified against the kernel-computed checksum (which is what proves
     // the 16-page negotiated mapping actually landed). In-RAM (no disk), and placed AFTER the ELF-3 fb
     // verdict and the UVUG witness have printed, so its presents cannot perturb their counters; its own
     // uncounted `:: EL0: window verbs — … ::` line.
     wcb_launcher(demo_cpu);
+    u7stk!("after:wcb");
+    #[cfg(feature = "pidesk")] crate::video::pidesk::arm(); // SHELLWIN-PI: the last panel-READING fixture has returned, however it returned, so the desktop may now place furniture on the glass. At the CALLER rather than inside `wcb_launcher` deliberately: that fn has three early SKIP returns (blob oversize, no free slot, already-done), and arming from its tail would let a skipped fixture leave the Pi desktop with no shell window at all and no line saying why. This is the SECOND of the Pi's two desktop questions and it is not `pidesk::activate`'s: that one runs at the GUI handoff and asks "is this a desktop yet?", while the cascade it was called from is still running on the APs. x86 gets the ordering for free because its Kepler takeover happens after the cascade. Minting the shell window ahead of this point put a half-panel row across `[wc-j]`'s vacated-box read-backs, `[wc-f]`'s probe strip and `[clickroute]`'s hit-test: measured, `MBENCH FAIL — 104/108`. ⚠ ONE LINE, paid for by one merged in `wcb_launcher`'s tail commentary.
+    u7stk!("after:pidesk_arm");
     // BGRUN-ST: the background-run contract, headless — bg spawn -> exit -> reap (ELFHELLO), then a
     // kill mid-run (UVUG) proving the confirmed-kill arm reaps the row in place. Placed AFTER the UVUG
     // witness and WC-B (their counters/checksums are already printed, so a partial bg UVUG cannot
     // perturb them); its own `:: BGRUN-ST: … ::` lines, spec-REQUIREd (the round-1 lens showed the
     // interactive excuse did not cover the headless-observable core of the contract).
     bgrun_witness(demo_cpu);
+    u7stk!("after:bgrun");
     // K3: the revoke-persist commit-ordering proof — a named-owner file's SYS_FGRANT revoke commits to disk
     // BEFORE the in-RAM removal, so it SURVIVES REBOOT and fails CLOSED on a persist failure. Its own uncounted
     // `:: K3-revoke: … PASS ::` line; fully self-cleaning (leaves no owned row on the metal card).
     k3_revoke_launcher();
+    u7stk!("after:k3_revoke");
     // K5: the revoke/re-persist SMP-window proof — a deterministic interleaving witness that the concurrent
     // full-row re-persist can no longer resurrect a revoked grant (snapshot + disk-narrow + in-RAM commit now
     // span one ns) + the create-serialization gate. Its own uncounted `:: K5-lockspan: … PASS ::` line;
     // self-cleaning (leaves no owned row on the metal card).
     k5_lockspan_launcher(); #[cfg(feature = "nsspan")] nsspan_report(); // K7 WATCH: emit :: NS-SPAN: … :: after K3/K5 drive the sites (newline-neutral inline; knob-off byte-identical)
+    u7stk!("after:k5_lockspan");
     // K9-PARITY: the mid-staging-failure discard proof — a staged ACL persist that fails PARTWAY leaves no
     // partial-durable row (K3), AND its uncommitted residue can no longer be flushed by a LATER persist's
     // commit (the K9 lens-B residual, now closed in-lane via `with_unafs`'s MOUNT_DISCARD). Its own
     // uncounted `:: K9-parity: … PASS ::` line; self-cleaning (leaves no owned row on the metal card).
     k9_parity_launcher();
+    u7stk!("after:k9_parity");
     // IMAGE_SHA256 code-signing: prove the SHA-256 primitive (FIPS KATs) + that it discriminates program
     // IMAGES, closing the "same 8.3 name = same principal" residual (the loader now mints IMAGE_SHA256). Its
     // own uncounted `:: IMG-SIG: … PASS ::` line; read-only, no disk write.
     image_sig_selftest();
+    u7stk!("after:image_sig");
     // TERM_RING (MIDDEN_CONVERGENCE §3, M2): the terminal-output transport's own witness — the ring
     // refuses exactly the records its drop-NEWEST bound says it must, hands the survivors back in
     // order and byte-exact, seals an over-long record with the truncation mark, and accounts for
@@ -14623,31 +15760,37 @@ pub fn u7_launcher(demo_cpu: usize) {
     // uncounted `:: TERMRING: … :: PASS ::` line.
     #[cfg(feature = "witness")]
     crate::termring::termring_selftest();
+    u7stk!("after:termring");
     // FATDIRS: exercise the new fat.rs directory create/remove seam (create_dir/remove_dir) on the live
     // volume — LAST in the chain (its disk I/O can never perturb the 23 fixtures or the witnesses), fully
     // self-cleaning. Its own uncounted `:: FATDIRS: … PASS ::` line. Unblocks JD7's Orin-panel mkdir/rmdir.
     fatdirs_launcher();
+    u7stk!("after:fatdirs");
     // K4-ready: prove the native-attribute projection codec (owner/grants string forms) + the
     // UNAATR1-vs-UNAFS volume-magic discriminator — the deterministic 1:1 mapping K4's migrate-then-delete
     // will use, PINNED + KAT'd ahead of the native unafs mount. Read-only, in-RAM (no disk, no card); its
     // own uncounted `:: K4-ready: … PASS ::` line. LAST in the chain.
     k4_ready_selftest();
+    u7stk!("after:k4_ready");
     // FATMOVE: exercise the new fat.rs directory-entry rename + cross-directory move seam
     // (rename_entry/move_entry) on the live volume — LAST in the chain (its disk I/O can never
     // perturb the 23 fixtures or the witnesses), fully self-cleaning. Its own uncounted
     // `:: FATMOVE: … PASS ::` line. Unblocks a future jetson `mv` arc (JD10).
     fatmove_launcher();
+    u7stk!("after:fatmove");
     // CLOCK-3: prove the FAT last-write stamp DERIVES from the unified kernel clock — after a
     // deterministic Manual civil anchor, a freshly created file's on-disk dir-entry date matches the
     // anchor (not the all-zero unset value). Runs LAST in the storage chain (its disk I/O can never
     // perturb the fixtures/witnesses), restores the civil clock to exactly as found, and is fully
     // self-cleaning. Its own uncounted `:: CLOCK3-fat: … PASS ::` line.
     clock3_fat_launcher();
+    u7stk!("after:clock3_fat");
     // BeFS-K3: locate + mount the native unafs partition off the live card and prove the superblock
     // + the read paths (ls/cat byte-verified) + the write seam's bound-check. Read-only by
     // construction — safe here. Its own uncounted `:: K3-mount: … PASS ::` line; an honest skip on
     // media without a unafs partition.
     crate::fs::unafs::k3_mount_selftest();
+    u7stk!("after:k3_mount");
     // BeFS-K4: prove the kernel can WRITE the native unafs volume through the single coherent mount,
     // and that the write SURVIVES a genuine remount (create+write -> remount -> byte-verify ->
     // delete -> remount -> negative). Self-cleaning (create then delete + journal reset), so the
@@ -14655,6 +15798,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     // create/delete never perturbs K3-mount's exact-two-entries `ls`. Its own uncounted
     // `:: K4-write: … PASS ::` line; an honest skip on media without a unafs partition.
     crate::fs::unafs::k4_write_selftest();
+    u7stk!("after:k4_write");
     // K8a: prove the copy-on-write commit discipline on the live card — root generation advances
     // per mutation, a power cut before the root flip (the autocommit-off crash seam + a genuine
     // remount) converges to the OLD tree, refcounts persist across a remount, and the commit-path
@@ -14662,6 +15806,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     // fully self-cleaning (its scratch file is created and deleted inside the witness). Its own
     // uncounted `:: K8a-cow: … PASS ::` line; honest skip on media without a unafs partition.
     crate::fs::unafs::k8a_cow_selftest();
+    u7stk!("after:k8a_cow");
     // K8b: prove retained roots (snapshots) + reclamation on the live card — snapshot the committed
     // tree, overwrite the live file, byte-verify the snapshot's OLD blocks are untouched (never-
     // overwrite + block sharing), confirm the retention-aware allocator never reuses a live
@@ -14670,6 +15815,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     // fully self-cleaning (its scratch file + snapshots are dropped inside the witness). Its own
     // uncounted `:: K8b-snap: … PASS ::` line; honest skip on media without a unafs partition.
     crate::fs::unafs::k8b_snap_selftest();
+    u7stk!("after:k8b_snap");
     // K8c: prove the snapshot READ path enforces the LIVE object's CURRENT ACL (the "high security"
     // ruling — revocation reaches the past). Owner + grantee read the OLD retained bytes; an impostor
     // is refused from the snapshot by the SAME predicate that refuses the live read; dropping a grant
@@ -14677,43 +15823,67 @@ pub fn u7_launcher(demo_cpu: usize) {
     // even for its owner. Runs AFTER k8b_snap_selftest, fully self-cleaning. Its own uncounted
     // `:: K8c-snapread: … PASS ::` line; honest skip on media without a unafs partition.
     crate::fs::unafs::k8c_snapread_selftest();
+    u7stk!("after:k8c_snapread");
+    // F2: prove the full mutation set — `rename`, `remove_attribute`, `unlink` — on the live card,
+    // each ONE atomic CoW transaction through the single IRQ-masked mount and each durable across a
+    // genuine remount (rename moves the NAME, not the bytes: same inode id, identical payload;
+    // remove_attribute leaves the sibling attribute intact; unlink leaves the stale id NotFound).
+    // Runs AFTER the K8 witnesses so its churn can never perturb their block accounting, and is
+    // fully self-cleaning (it creates no directory — the crate has no rmdir). Its own uncounted
+    // `:: F2-mutations: … PASS ::` line; honest skip on media without a unafs partition.
+    crate::fs::unafs::f2_mutations_selftest();
+    u7stk!("after:f2_mutations");
     // K6: prove the U6 owner/grants ACL round-trips through the native unafs attribute volume (the
     // sidecar's successor) — forward+reverse codec, write+read+clear via the coherent mount. Runs
     // LAST, fully self-cleaning (leaves only the staged K3 fixtures). Its own uncounted
     // `:: K6-migrate: … PASS ::` line; honest skip on media without a unafs partition.
     k6_migrate_selftest();
+    u7stk!("after:k6_migrate");
     // VFS-2 (fold, from commit 76762338): the mount-table WRITE witnesses — a create+write+read-back
     // round-trip through the FAT backend and the native unafs backend. Their own uncounted
     // `:: vfs2-fat: … ::` / `:: vfs2-native: … ::` lines; honest skip when the backing volume is absent.
     crate::fs::vfs::vfs2_fat_write_witness();
+    u7stk!("after:vfs2_fat_write");
     crate::fs::vfs::vfs2_native_write_witness();
+    u7stk!("after:vfs2_native_write");
+    // VFS-1 (adoption): the routing battery for the seam every path verb now shares — /fat reaches
+    // the FAT backend, a bare path reaches native UnaFS, the boundary negatives (/fatty.bin,
+    // /usbfoo) stay native, and a read-only backend refuses every mutating verb through the table.
+    // Touches no disk except to read; its own uncounted `:: VFS-1: … ::` lines.
+    crate::fs::vfs::vfs1_routing_witness();
+    u7stk!("after:vfs1_routing");
     // BANDY-1 M1: the bus v1 subset codec KATs — reply bodies proven byte-compatible with the
     // HOST serializer (tools/bandy-golden captures), native request header+payloads frozen,
     // decode fail-closed at the hard ceiling. Read-only, in-RAM (no disk, no card); its own
     // uncounted `:: BANDY-CODEC: … PASS ::` line. LAST in the chain.
     super::bus::bus_codec_selftest();
+    u7stk!("after:bus_codec");
     // BANDY-2 M1: the write-side codec KATs — write/rm/mv request goldens frozen, the typed WRITE
     // [name_len][name][content] payload + empty/at-ceiling content, decode fail-closed. A SIBLING
     // of BANDY-CODEC (the BANDY-1 goldens/witness stay byte-identical). Read-only, in-RAM; its own
     // uncounted `:: BANDY-CODEC2: … PASS ::` line.
     super::bus::bus_codec2_selftest();
+    u7stk!("after:bus_codec2");
     // BANDY-1 M5 (verdict C): the stamping witness — caller-supplied principal rejected, replies
     // stamped with the reserved kernel kind (fail-closed everywhere a grantee/owner can appear),
     // bounded per-ASID mailboxes, gen fence. Drives the PRODUCTION sys_msend_for path with
     // scratch identities; one read-only ls mount, no disk write. Its own uncounted
     // `:: BANDY-STAMP: … PASS ::` line.
     bandy_stamp_check();
+    u7stk!("after:bandy_stamp");
     // BANDY-2 lens-2 fix witness: bus write-TRUNCATE preserves grants (the direct twin mutates in
     // place and never touches the grant table — the bus must reach the same state). Drives the
     // production sys_msend_for path with scratch identities; creates + self-cleans GRNT.BIN. Its
     // own uncounted `:: BANDY-GRANT: … PASS ::` line.
     bandy_grant_check();
+    u7stk!("after:bandy_grant");
     // BANDY-1 M4/M5: the round-trip + equivalence witnesses through the REAL midden program
     // (program #3, Peter's E verdict) — ls/cat/cp parsed at EL0 into typed frames, kernel-
     // fulfilled under the stamped principal; denial equivalence (bus vs direct syscall,
     // byte-same errno) proven at EL0. Self-cleaning; its own uncounted `:: BANDY-RT: … ::`
     // + `:: BANDY-EQ: … ::` lines. LAST in the chain.
     bandy_rt_launcher(demo_cpu);
+    u7stk!("after:bandy_rt");
 }
 
 /// F2 M3 witness worker — the `demo_cpu` half of the cross-core FAT_MUTATION stress. `fn(usize)` for
@@ -14742,6 +15912,7 @@ fn f2_witness_worker_unlocked(iters: usize) {
 ///     zero loss is reported HONESTLY (QEMU's round-robin TCG did not interleave the RMWs — the true lost-update
 ///     race is metal-only, the R1-arc honest-scope pattern). The on-disk `set_fat_entry` RMW rides the bench.
 /// Emits ONE `F2-witness:` serial line (deliberately not a `-> PASS` line — keeps the 23-fixture count intact).
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn f2_witness_launcher(demo_cpu: usize) {
     const N: u32 = 120_000;
     let want = 2 * N;
@@ -14830,6 +16001,7 @@ fn f3_witness_worker_unlocked(iters: usize) {
 /// F3-M4 — the cross-core witness for the M3 NAMESPACE serialization (the `f2_witness_launcher` shape: this
 /// task on `vcpu`, a joinable worker on `demo_cpu` = online[0] so the join can never hang). Emits ONE
 /// `F3-witness:` line — deliberately NOT a `-> PASS` line, so the 23-fixture count stays byte-equivalent.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn f3_witness_launcher(demo_cpu: usize) {
     const N: u32 = 120_000;
     let want = 2 * N;
@@ -16206,6 +17378,7 @@ fn native_persist_rename(dir_lba: u64, dir_off: u32, new_name: &str) -> bool {
 /// enforce" machinery is gone. On QEMU (fresh-per-build FAT) both the sidecar and the native store are
 /// empty here, so ZERO rows install and the boot path stays byte-identical; the live effect is on metal.
 /// The MECHANISM is proven independently by the K6 witness + the K1/K2/K3/K5 launchers.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn atr_maybe_boot_rebuild() {
     if !by_name_spawn_multivalued() {
         return; // cross-reboot enforcement gated off (single-program world) -> no rebuild, no I/O
@@ -16297,6 +17470,7 @@ fn k1_atr_disk_roundtrip(fs: &crate::fs::fat::FatFs, fc: u32, size: u32, bind: &
 /// count stays byte-equivalent). ENFORCEMENT-INERT: never reads OWNED_FILES, never maps a record to
 /// (asid, gen), never persists a live owner. Runs LAST (after the F2/F3 witnesses) so its disk I/O can never
 /// perturb the battery or the witnesses.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn k1_atr_selftest() {
     // One-shot (u7_launcher's task calls this once; guard defensively — the u7_run DONE idiom).
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -16571,6 +17745,7 @@ fn k1_persist_check() -> u32 {
 /// 23 fixtures or the witnesses). Emits ONE `:: K1-persist: … PASS ::` line in the K1-atr `<noun> PASS` idiom —
 /// deliberately NOT a `-> PASS` / `: PASS` line, so arroyo's fixture PASS-counter leaves the count at 23 and only
 /// this one uncounted witness line is added (the 24th line; re-baseline the byte-diff on the OTHER 23).
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn k1_persist_launcher() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -16732,6 +17907,7 @@ fn k1_tear_persisted_row(fs: &crate::fs::fat::FatFs, dir_lba: u64, dir_off: u32)
 /// K1 M4 launcher + verdict — the fail-closed corrupt-attr proof, riding the U7 kernel task after
 /// k1_persist_launcher. Emits its own uncounted `:: K1-corrupt: … PASS ::` line (the K1-atr `<noun> PASS`
 /// idiom, never `-> PASS`/`: PASS`), so the fixture count stays 23.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn k1_corrupt_launcher() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -16896,6 +18072,7 @@ fn k3_revoke_check() -> u32 {
 /// K3 launcher + verdict — rides the U7 kernel task after the K2 launcher (its disk I/O can never perturb the 23
 /// fixtures or the witnesses). Emits ONE uncounted `:: K3-revoke: … PASS ::` line (the K1-atr `<noun> PASS` idiom,
 /// never `-> PASS`/`: PASS`), so the fixture PASS-count stays 23. Fully self-cleaning.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn k3_revoke_launcher() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -17048,6 +18225,7 @@ fn k9_parity_check() -> u32 {
 /// K9-PARITY launcher + verdict — rides the U7 kernel task after K3/K5 (its disk I/O can never perturb the
 /// counted fixtures). Emits ONE uncounted `:: K9-parity: … PASS ::` line (the K1-atr `<noun> PASS` idiom), so the
 /// fixture PASS-count is unchanged. Fully self-cleaning.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn k9_parity_launcher() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -17215,6 +18393,7 @@ fn k5_lockspan_check() -> u32 {
 /// K5 launcher + verdict — rides the U7 kernel task after the K3 launcher (its disk I/O can never perturb the 23
 /// fixtures or the witnesses). Emits ONE uncounted `:: K5-lockspan: … PASS ::` line (the K1-atr `<noun> PASS`
 /// idiom, never `-> PASS`/`: PASS`), so the fixture PASS-count stays 23. Fully self-cleaning.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn k5_lockspan_launcher() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -17242,6 +18421,7 @@ fn k5_lockspan_launcher() {
 /// card carries the two K2 programs (present in the QEMU FAT and on the metal card). Emits one UNCOUNTED line
 /// (PASS/FAIL space-flanked, never `-> PASS`/`: PASS`/`-> FAIL`/`FAIL ::`), so the 23-fixture count is
 /// byte-equivalent. Read-only — no disk write, no slot, no lock; cannot perturb the battery. Runs LAST.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn image_sig_selftest() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -17331,6 +18511,7 @@ fn image_sig_selftest() {
 // `:: K4-ready: … PASS [w=0x..] ::` line (never a `-> PASS`/`: PASS` fixture line, so the 23-PASS battery is
 // unchanged). Runs LAST in `u7_launcher`, after `fatdirs_launcher`.
 // =====================================================================================================
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn k4_ready_selftest() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -17490,6 +18671,7 @@ fn k6_principal_roundtrips(p: &PrincipalRecord) -> bool {
 }
 
 /// K6 migration + native-store witness. See the section header. Self-cleaning.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn k6_migrate_selftest() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -17744,6 +18926,7 @@ fn fatdirs_check() -> u32 {
 /// FATDIRS launcher + verdict — rides the U7 kernel task AFTER the K1/K2/K3/IMG-SIG selftests (its disk
 /// I/O can never perturb the 23 fixtures or the witnesses). Emits ONE uncounted `:: FATDIRS: … PASS ::`
 /// line (the K1-atr `<noun> PASS` idiom — NOT a `-> PASS` fixture line, so the count stays at 23).
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn fatdirs_launcher() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -17948,6 +19131,7 @@ fn fatmove_check() -> u32 {
 /// FATMOVE launcher + verdict — rides the U7 kernel task AFTER every prior storage selftest (its disk
 /// I/O can never perturb the 23 fixtures or the witnesses). Emits ONE uncounted `:: FATMOVE: … PASS ::`
 /// line (the k1-atr `<noun> PASS` idiom — NOT a `-> PASS` fixture line, so the count stays at 23).
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn fatmove_launcher() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -18029,6 +19213,7 @@ fn clock3_check() -> u32 {
 
 /// CLOCK-3 launcher + verdict — rides the U7 kernel task AFTER the FAT write selftests (its disk I/O can
 /// never perturb the fixtures or witnesses). Emits ONE uncounted `:: CLOCK3-fat: … PASS ::` line.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn clock3_fat_launcher() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -18170,6 +19355,7 @@ fn atr_row_first_cluster(fs: &crate::fs::fat::FatFs, dir_lba: u64, dir_off: u32)
 /// `FAIL ::`), so the 23-fixture PASS count stays byte-equivalent. (The `k2_leave` metal build replaces this
 /// same-boot proof with the two-boot `k2_metal_launcher`; see it + the u7_launcher call site.)
 #[cfg(not(feature = "k2_leave"))]
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn k2_liveenf_launcher(demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -18461,6 +19647,7 @@ fn k2_metal_verify(demo_cpu: usize) {
     }
 }
 
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn u7_run(demo_cpu: usize) {
     // 1. Gate on the U6b launcher (its verdict printed + its slot freed).
     let _ = wait_while_secs(10, || !U6B_LAUNCH_DONE.load(Ordering::Acquire));
@@ -18745,6 +19932,7 @@ fn u8_kernel_check() -> bool {
 /// + the derivation ledger drained — the tombstone-cascade proof); run the kernel-side cross-process checks
 /// (which need the clear ledgers); PASS iff witness == `U8_WITNESS_ALL` AND torn down AND no kill AND the
 /// kernel checks held. U8 is the last demo — it releases no further gate.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn u8_launcher(demo_cpu: usize) {
     // One-shot (the U7 launcher is spawned once; guard defensively anyway).
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -18899,6 +20087,7 @@ fn u9_check_revoked_write(fc: u32, sz: u32) -> bool {
 /// from the pre-image) + the directory size UNCHANGED (in-place, never grew), and the revoked-File-write denial.
 /// PASS iff witness == `U9_WITNESS_ALL` AND torn down AND no kill AND all kernel checks held. U9 is the last
 /// demo — it releases no further gate.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn u9_launcher(demo_cpu: usize) {
     // One-shot (the U7 launcher is spawned once; guard defensively anyway).
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -19069,6 +20258,7 @@ fn u10_fats_consistent(first_cluster: u32) -> bool {
 /// offset are on disk, the original first cluster is intact, and both FAT copies agree along the 2-cluster
 /// chain. PASS iff witness == `U10_WITNESS_ALL` AND torn down AND no kill AND all kernel checks held. U10 is the
 /// last demo — it releases no further gate.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn u10_launcher(demo_cpu: usize) {
     // One-shot (the U7 launcher is spawned once; guard defensively anyway).
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -19199,6 +20389,7 @@ fn u10c_build() -> Option<U7Fix> {
 /// `U10C_WRITTEN`, its content == the written pattern, a valid first cluster, and EXACTLY ONE such entry (the
 /// second O_CREAT opened, did not duplicate). PASS iff witness == `U10C_WITNESS_ALL` AND torn down AND no kill
 /// AND all kernel checks held. U10-create is the last demo — it releases no further gate.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn u10c_launcher(demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -19327,6 +20518,7 @@ fn u10d_build() -> Option<U7Fix> {
 /// DELME.BIN GONE, `f0`'s FAT entry is `0` in ALL copies (the chain was freed everywhere), and the first-free
 /// cluster is again `f0` (the freed cluster is re-allocatable). PASS iff witness == `U10D_WITNESS_ALL` AND torn
 /// down AND no kill AND all kernel checks held. U10-delete is the last demo — it releases no further gate.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn u10d_launcher(demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -19483,6 +20675,7 @@ fn u11_check_gen_rebind() -> bool {
 /// proof; then a fresh mount confirms A11.BIN is GONE (unlinked) and B11.BIN is PRESENT (created + never
 /// deleted). PASS iff witness == `U11_WITNESS_ALL` AND torn down AND no kill AND the gen-rebind proof + on-disk
 /// checks hold. Releases no further gate.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn u11_launcher(demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -19615,8 +20808,16 @@ fn u11defer_build(entry_sym: *const u8) -> Option<U7Fix> {
 ///        or the cluster that was already lower than `f0` while the chain was live)
 ///
 /// PASS iff both witnesses full AND all three cues fired AND both exited AND no kill AND both rows torn down AND
-/// the three on-disk checkpoints hold. Runtime-created file (no arroyo plant); needs a fresh image (DEFER.BIN
-/// absent pre-demo). U11-defer is the last demo — releases no further gate.
+/// the three on-disk checkpoints hold. Runtime-created file (no arroyo plant); needs DEFER.BIN absent pre-demo —
+/// U11FIX: the pre-flight now DELETES a stale copy and runs rather than skipping (see there). U11-defer is the
+/// last demo — releases no further gate.
+///
+/// U11FIX also adds the `:: [u11fix] park margin — … ::` witness: at each of the three GO releases the launcher
+/// asserts the fixture it is about to release is STILL PARKED (it has not run its `SYS_EXIT`) and reports how
+/// long that park had to last. On PA41 both fixtures had parked out before their GOs, and the verdict line
+/// reported only the consequence — an empty `b_w` and a partial `a_w` — leaving the cause to be inferred from a
+/// bitmask. The launcher was holding the fact that names it; now it prints it, every boot, with the margins.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn u11defer_run(demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -19632,11 +20833,27 @@ fn u11defer_run(demo_cpu: usize) {
     // from the on-disk name after A reports A_OPENED; see the capture below.
     match crate::fs::fat::mount() {
         Ok(fs) => {
-            if fs.find_in_root(U11DEFER_NAME).is_ok() {
-                serial_println!(
-                    ":: U11-defer: DEFER.BIN already present pre-demo (stale image) — defer demo skipped ::"
-                );
-                return;
+            // U11FIX (self-heal): DEFER.BIN is created by THIS demo and by nothing else, and a PASSing run
+            // leaves it unlinked — so a copy found here can only be the residue of a prior run that FAILED
+            // before B's unlink. On a fresh QEMU image that never happens; on the bench Pi the SD card is
+            // persistent, so PA41's leftover would have skipped this demo on every subsequent boot, retiring
+            // the check permanently the first time it failed. A failure must not disable its own detector.
+            // Delete the residue and run the demo from the documented precondition (an absent name); only an
+            // UNREMOVABLE copy still skips. This restores the precondition — it does not relax any check: all
+            // three on-disk checkpoints below run exactly as before, against a freshly created file.
+            if let Ok((de, lba, off)) = fs.find_located(U11DEFER_NAME) {
+                match fs.delete_located(lba, off, de.first_cluster()) {
+                    Ok(_) => serial_println!(
+                        ":: U11-defer: stale DEFER.BIN @cluster {} from a PRIOR FAILED run — deleted; demo runs ::",
+                        de.first_cluster()
+                    ),
+                    Err(_) => {
+                        serial_println!(
+                            ":: U11-defer: DEFER.BIN already present pre-demo and undeletable — defer demo skipped ::"
+                        );
+                        return;
+                    }
+                }
             }
             if fs.first_free_cluster().is_err() {
                 serial_println!(":: U11-defer: no free cluster pre-demo — defer demo skipped ::");
@@ -19659,6 +20876,11 @@ fn u11defer_run(demo_cpu: usize) {
     serial_println!(
         ":: U11-defer: cross-process unlink-defers-free — B unlinks A's open file; chain freed at A's last close ::"
     );
+    // U11FIX: both parks start at spawn. B's runs until the unlink GO below (it spans A's whole create+grow-write
+    // AND this launcher's measure mount, which first-fit-scans the FAT to the head — hundreds of SD sectors on
+    // metal); A's read park runs until CHECKPOINT-1. Both intervals are reported, so a shrinking margin is
+    // visible on the bench BEFORE it is a failure.
+    let t_spawn = super::timer::cntpct();
     super::sched::spawn_user_slot("el0-u11defer-a", a.entry, a.sp, a.ttbr0, demo_cpu);
     super::sched::spawn_user_slot("el0-u11defer-b", b.entry, b.sp, b.ttbr0, demo_cpu);
 
@@ -19712,6 +20934,13 @@ fn u11defer_run(demo_cpu: usize) {
         }
     };
 
+    // U11FIX ASSERTION (the check whose absence made PA41 a puzzle): B must STILL BE PARKED at the moment we
+    // release it. A fixture that gave up mid-park has already run its `SYS_EXIT`, so `EL0_U11DEFER_DONE` counts
+    // it — and NEITHER program can legitimately exit this early, so any non-zero reading here is a parked-out
+    // fixture and nothing else. PA41 reported the *consequence* (`b_w=0x0`, indistinguishable from a failed
+    // SYS_OPEN) and left the *cause* to be inferred; the launcher was holding the fact that names it.
+    let b_wait = super::timer::cntpct().wrapping_sub(t_spawn);
+    let b_parked_out = EL0_U11DEFER_DONE.load(Ordering::Acquire);
     u11defer_release_go(b.slot, 0x3000);
     // Edge 2: wait for B_UNLINKED; CHECKPOINT-1 — the NAME is gone on disk, but the chain is STILL allocated.
     let b_unlinked = wait_flag(&U11DEFER_B_UNLINKED_F, 5);
@@ -19720,11 +20949,31 @@ fn u11defer_run(demo_cpu: usize) {
         Err(_) => false,
     };
     let chain_alive_c1 = chain_allocated();
+    // U11FIX: A's read park spans everything above — B's whole open/unlink/re-open leg AND two fresh mounts.
+    // Same assertion, keyed on A ALONE: B has legitimately exited by now (it exits right after its cue), so the
+    // bare DONE count would false-positive here; `EL0_U11DEFER_A_EXITED` is exact.
+    let a_read_wait = super::timer::cntpct().wrapping_sub(t_spawn);
+    let a_parked_out_r = EL0_U11DEFER_A_EXITED.load(Ordering::Acquire) != 0;
     u11defer_release_go(a.slot, 0x3010);
     // Edge 3: wait for A_READ; CHECKPOINT-2 — the chain is STILL allocated (A read its bytes; nothing was freed).
     let a_read = wait_flag(&U11DEFER_A_READ_F, 5);
     let chain_alive_c2 = chain_allocated();
+    // U11FIX: A's close park — the last one it must survive, spanning CHECKPOINT-2's mount.
+    let a_close_wait = super::timer::cntpct().wrapping_sub(t_spawn);
+    let a_parked_out_c = EL0_U11DEFER_A_EXITED.load(Ordering::Acquire) != 0;
     u11defer_release_go(a.slot, 0x3018);
+    let frq = super::timer::cntfrq().max(1);
+    let ms = |t: u64| t / (frq / 1000).max(1);
+    serial_println!(
+        ":: [u11fix] park margin — B parked {}ms before unlink-GO (parked_out={}), A parked {}ms before read-GO \
+         (parked_out={}) and {}ms before close-GO (parked_out={}); park primitive=SYS_SLEEP_MS budget=0x8000 ::",
+        ms(b_wait),
+        b_parked_out,
+        ms(a_read_wait),
+        a_parked_out_r,
+        ms(a_close_wait),
+        a_parked_out_c
+    );
 
     // Verdict: wait for both sentinel exits, read witnesses + kills, wait teardown-clear, then CHECKPOINT-3.
     let _ = wait_while_secs(5, || EL0_U11DEFER_DONE.load(Ordering::Acquire) < 2);
@@ -19912,6 +21161,7 @@ fn u11defer_check_double_orphan() -> bool {
 /// U11-M2 (seat coalesce-review fix): launcher + PASS line for the slot-recycle two-orphan proof. Rides the U7
 /// kernel task after `u11defer_run`. Kernel-side only (no EL0 fixture — the proof is a deterministic table + FAT
 /// manipulation, the `u11_check_gen_rebind` style). Releases no further gate.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn u11reuse_run() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -19984,14 +21234,32 @@ fn u11reap_build(entry_sym: *const u8) -> Option<U7Fix> {
 ///   A seeks+reads its ORIGINAL bytes (the deferred chain is alive), reports A_READ
 ///     -> CHECKPOINT-2: chain still allocated -> release A's EXIT GO
 ///   A exits WITHOUT closing (teardown queues the orphan); B exits
-///     -> CHECKPOINT-3: bounded YIELD-poll of the FAT until the reaper has FREED the chain (all FAT copies) +
-///        the free-set rank is restored (`first_free == min(ff_busy, f0)`) — the yields cede this core to the
-///        co-located reaper, so the cooperative-QEMU drain is deterministic.
+///     -> CHECKPOINT-3: bounded YIELD-poll of the FAT until the reaper has FREED the chain (all FAT copies), the
+///        head is RE-ALLOCATABLE (the allocator's first free at-or-above `f0` IS `f0` — REAPFIX), and the
+///        volume-global free-set rank is restored (`first_free == min(ff_busy, f0)`, the over-free guard) — the
+///        yields cede this core to the co-located reaper, so the cooperative-QEMU drain is deterministic.
+///
+/// REAPFIX (2026-08-18) — what the bench capture `pi4-pi1-b1` taught this fixture, on both halves:
+///
+///   * THE DEFECT IT WAS FLAKING ON WAS REAL, AND IT WAS NOT SCHEDULING. `c3(freed=false)` FAILed on 2 of 3
+///     boots that reached this fixture. The reaper was live and prompt every time — it popped the head well
+///     inside this 5 s poll — but `free_orphan_chain`'s `mount()` arm mourned a TRANSIENT device loan as a
+///     permanent orphan (`U11-defer: deferred free of chain @cluster 29473 — mount failed, orphaned (leak)`,
+///     and the same at 29743 right behind a `BOT: pump ... used=24841443` loan from the USB mass-storage
+///     bring-up), dropping the head instead of requeueing it the way the `free_chain` `Busy` arm already did.
+///     The 5 s bound was never the problem and is deliberately UNCHANGED; the fix is at
+///     `free_orphan_chain`, which now requeues a `Busy` mount (with a `yield_now` backoff in `orphan_reaper`).
+///
+///   * THE `reuse` CONJUNCT WAS VACUOUS IN THIS CONFIGURATION, so `freed` was carrying the verdict alone. See
+///     the REAPFIX block at the CHECKPOINT-3 poll for the old criterion, why `min(ff_busy, f0)` could never go
+///     red here, and the head-anchored scan that replaces it. The verdict line now reports all three bits
+///     (`c3(freed=,reuse=,rank=)`) so a future bench read can tell the three failure modes apart.
 ///
 /// PASS iff both witnesses full AND all three cues fired AND both exited AND no kill AND both rows torn down AND
 /// the three checkpoints hold. Runtime-created file (no arroyo plant); needs a fresh image (DEFER2.BIN absent
 /// pre-demo). The last demo — releases no further gate. The M2a `"teardown … leaked"` line must NOT appear for
 /// DEFER2.BIN (the reaper freed it, not leaked it) — its ABSENCE is confirmed in the gate.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn u11reap_run(demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -20125,7 +21393,7 @@ fn u11reap_run(demo_cpu: usize) {
     // whenever the volume was packed below the head. The yields cede this core to the co-located reaper so the
     // cooperative-QEMU drain is deterministic. Times out (still false) if the reaper never runs -> FAILs loudly.
     let want_ff = if ff_busy < f0 { ff_busy } else { f0 };
-    let (freed_c3, reusable_c3) = {
+    let (freed_c3, reusable_c3, rank_c3) = {
         let dstart = super::timer::cntpct();
         let ddeadline = 5 * super::timer::cntfrq();
         loop {
@@ -20141,12 +21409,44 @@ fn u11reap_run(demo_cpu: usize) {
                         }
                         f += 1;
                     }
-                    (freed, fs.first_free_cluster() == Ok(want_ff))
+                    // REAPFIX — the HEAD-ANCHORED re-allocatability witness, replacing a VACUOUS conjunct.
+                    // The old `reuse` bit was `first_free_cluster() == want_ff` with `want_ff = min(ff_busy,
+                    // f0)`. On this volume `ff_busy < f0` always (the measured heads sit ~6 clusters above the
+                    // lowest free one: 29467/29473 and 29737/29743 on the bench capture), so `want_ff ==
+                    // ff_busy` and the equality is satisfied by a free cluster that has NOTHING to do with the
+                    // reaped chain — it holds whether or not the reap ever happened. It was green in BOTH
+                    // failing boots (`c3(freed=false,reuse=true)`), leaving `freed` as the only load-bearing
+                    // bit in the whole verdict. It is replaced by a scan ANCHORED AT THE CHAIN'S OWN HEAD:
+                    // walk the ALLOCATOR's copy (FAT #0 — the one a first-fit search reads) upward from `f0`
+                    // and require that the FIRST free entry it meets IS `f0`. Before the reap that scan
+                    // necessarily walks PAST the still-allocated head and answers some higher cluster, so the
+                    // bit is red exactly when the reap has not landed; after the reap the head is what a
+                    // first-fit resuming there would hand out — the re-allocatability the PASS line claims.
+                    // The bound is small because the answer is `f0` itself the moment the reap lands, and a
+                    // scan that has to walk at all has already proven the point.
+                    let mut c = f0;
+                    let mut steps = 0u32;
+                    let head_reuse = loop {
+                        match fs.fat_entry_copy(c, 0) {
+                            Ok(0) => break c == f0,
+                            Ok(_) => {}
+                            Err(_) => break false,
+                        }
+                        steps += 1;
+                        if steps >= U11REAP_REUSE_SCAN {
+                            break false;
+                        }
+                        c += 1;
+                    };
+                    // The volume-global rank is KEPT as a separate, additionally-reported conjunct: it is the
+                    // OVER-free guard (a reap that dropped a cluster BELOW the head moves the volume's first
+                    // free down), which the head-anchored scan by construction cannot see.
+                    (freed, head_reuse, fs.first_free_cluster() == Ok(want_ff))
                 }
-                Err(_) => (false, false),
+                Err(_) => (false, false, false),
             };
-            if snap.0 && snap.1 {
-                break (true, true);
+            if snap.0 && snap.1 && snap.2 {
+                break (true, true, true);
             }
             if super::timer::cntpct().wrapping_sub(dstart) > ddeadline {
                 break snap;
@@ -20168,14 +21468,15 @@ fn u11reap_run(demo_cpu: usize) {
         && chain_alive_c1
         && chain_alive_c2
         && freed_c3
-        && reusable_c3;
+        && reusable_c3
+        && rank_c3;
     if ok {
         serial_println!(
             ":: U11-reap: teardown-last-close reaper — A exits holding the unlinked file open, its chain freed by the reaper (all FAT copies) + re-allocatable, no teardown leak -> PASS ::"
         );
     } else {
         serial_println!(
-            ":: U11-reap: teardown-last-close reaper FAIL — head={} ff_busy={} measured={} want_ff={} a_w={:#x} b_w={:#x} opened={} unlinked={} read={} done={} killed={} cleared={} c1(gone={},alive={}) c2_alive={} c3(freed={},reuse={}) (want {:#x}/{:#x}/t/t/t/2/0/t/t/t/t/t/t) ::",
+            ":: U11-reap: teardown-last-close reaper FAIL — head={} ff_busy={} measured={} want_ff={} a_w={:#x} b_w={:#x} opened={} unlinked={} read={} done={} killed={} cleared={} c1(gone={},alive={}) c2_alive={} c3(freed={},reuse={},rank={}) (want {:#x}/{:#x}/t/t/t/2/0/t/t/t/t/t/t/t) ::",
             f0,
             ff_busy,
             measured,
@@ -20193,6 +21494,7 @@ fn u11reap_run(demo_cpu: usize) {
             chain_alive_c2,
             freed_c3,
             reusable_c3,
+            rank_c3,
             U11REAP_A_WITNESS_ALL,
             U11REAP_B_WITNESS_ALL
         );
@@ -20259,6 +21561,7 @@ fn uowner_build(entry_sym: *const u8) -> Option<U7Fix> {
 /// PASS iff both witnesses full AND all five cues fired AND both exited AND no kill AND both rows torn down AND
 /// OWNED.BIN is on disk (A never unlinked it; its owner row reverts to public at A's teardown). Runtime-created
 /// file (no arroyo plant); needs a fresh image (OWNED.BIN absent pre-demo). The last demo — releases no gate.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn uowner_run(demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -21230,6 +22533,7 @@ fn sys_mrecv(buf_ptr: u64, buf_len: u64) -> i64 {
 // PRODUCTION code path, no EL0 detour); in-RAM except two ls fulfillments (read-only mount).
 // -----------------------------------------------------------------------------------------------
 
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn bandy_stamp_check() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -21357,6 +22661,7 @@ fn bandy_build_write(name: &str, content: &[u8], corr: u32, buf: &mut [u8]) -> u
     super::bus::build_request(super::bus::BUS_VERB_WRITE, corr, &body[..1 + name.len() + content.len()], buf)
 }
 
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn bandy_grant_check() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -21603,6 +22908,7 @@ fn bandy_create_file(fs: &crate::fs::fat::FatFs, name: &str, content: &[u8]) -> 
     Some((lba, off as u32))
 }
 
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
 fn bandy_rt_launcher(demo_cpu: usize) {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {

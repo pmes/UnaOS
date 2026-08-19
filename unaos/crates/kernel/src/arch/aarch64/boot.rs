@@ -67,11 +67,12 @@ pub const USER_CODE_SIZE: usize = 0x1000;
 //
 // WC-B: the hole now carries N WINDOW SURFACE SLOTS, not one surface. Layout in the hole:
 //   [+0x4000]                             RO info page (1 page)
-//   [+0x5000 + w * FB_WIN_SLOT_SIZE]      window `w`'s RW surface slot (16 pages), w in 0..FB_WIN_SLOTS
+//   [+0x5000 + w * FB_WIN_SLOT_SIZE]      window `w`'s RW surface slot (81 pages), w in 0..FB_WIN_SLOTS
 // Window slot 0 begins at exactly the VA the single ELF-3 surface used to occupy, so `fb_surface_va()`
 // (what `SYS_FB_MAP` returns) is BYTE-IDENTICAL to before and the existing VUG.ELF binary is unaffected.
-// Each slot is 64 KiB = 16 pages, which covers the largest surface this arc admits (128×128 ARGB8888 =
-// 65536 B). A surface is negotiated at map time and only its PAGE-MULTIPLE size is actually mapped — the
+// Each slot is 0x51000 = 81 pages (CRYSTAL-HD; it was 64 KiB / 16 pages), which covers the largest
+// surface this arc admits (288×288 ARGB8888 = 331 776 B). A surface is negotiated at map time and only
+// its PAGE-MULTIPLE size is actually mapped — the
 // rest of the slot stays at its reserved (EL1-only identity) leaf, so nothing beyond the negotiated
 // surface is reachable from EL0. Every mapped surface page uses `user_data_page` — the SAME MMU
 // attributes (EL0+EL1 RW, UXN, Normal-cacheable, nG) as the single ELF-3 surface page had.
@@ -82,21 +83,49 @@ pub const FB_SURFACE_STRIDE: u32 = FB_SURFACE_W * 4; // ARGB8888, 4 bytes/pixel
 pub const FB_SURFACE_SIZE: usize = (FB_SURFACE_STRIDE * FB_SURFACE_H) as usize; // 4096 = 1 page
 /// WC-B: window surface slots per process address space. Matches the compositor's fixed window table
 /// size (STOP tripwire: like `USER_SLOTS` this cap is deliberate — do not raise it for a demo).
-pub const FB_WIN_SLOTS: usize = 8;
-/// WC-B: bytes of VA reserved per window surface slot — 64 KiB = 16 pages = a 128×128 ARGB8888 surface.
-pub const FB_WIN_SLOT_SIZE: usize = 0x1_0000;
-/// WC-B: the largest surface edge a window may negotiate (128×128×4 == `FB_WIN_SLOT_SIZE`).
-pub const FB_WIN_MAX_W: u32 = 128;
-pub const FB_WIN_MAX_H: u32 = 128;
+///
+/// CRYSTAL-HD took this 8 → 4, the x86 twin's move (`arch::x86_64::memory::FB_WIN_SLOTS`) made here
+/// for the same reason and paid for by the same trade: the slot SIZE grew 5x (see
+/// [`FB_WIN_SLOT_SIZE`]) so the whole per-slot region still fits the ONE L3 table `build_slot`
+/// installs, and 4 windows per address space is still 4x what any shipped program opens. The
+/// invariant this must keep is the SAFE direction and is asserted at `syscall::WIN_MAX`:
+/// `FB_WIN_SLOTS <= WIN_MAX`, since a region slot is indexed per address space and a window id is
+/// global.
+pub const FB_WIN_SLOTS: usize = 4;
+/// WC-B: bytes of VA reserved per window surface slot. CRYSTAL-HD: 0x51000 = 81 pages = a 288×288
+/// ARGB8888 surface (was 64 KiB / 16 pages / 128×128). The shared-ABI fact is the SLOT-0 OFFSET
+/// (window base + 0x5000), which is unchanged and identical on both arches; the per-slot STRIDE is
+/// published per window in the RO info page, never assumed by ring 3.
+pub const FB_WIN_SLOT_SIZE: usize = 0x5_1000;
+/// WC-B: the largest surface edge a window may negotiate (288×288×4 == `FB_WIN_SLOT_SIZE`).
+pub const FB_WIN_MAX_W: u32 = 288;
+pub const FB_WIN_MAX_H: u32 = 288;
 /// The FB info + window-surface VA hole reserved above the program window.
-pub const FB_REGION_SIZE: usize = FB_INFO_SIZE + FB_WIN_SLOTS * FB_WIN_SLOT_SIZE; // 0x81000
+pub const FB_REGION_SIZE: usize = FB_INFO_SIZE + FB_WIN_SLOTS * FB_WIN_SLOT_SIZE; // 0x145000
 
 /// Total per-slot reserved region: the 16 KiB EL0 program window + the FB info/window-surface hole.
-/// The VA ANCHOR (`USER_REGION`) is aligned to 0x100000 (>= the 0x85000 size) so the whole region is
-/// STRUCTURALLY guaranteed to fall inside one 2 MiB L3_USER block (0x100000 divides 2 MiB, and the size
-/// is <= 0x100000, so it can never straddle a 2 MiB boundary) — the single per-slot L3 covers it all.
-const USER_STATIC_SIZE: usize = USER_REGION_SIZE + FB_REGION_SIZE; // 0x85000
-#[repr(C, align(0x100000))]
+/// The VA ANCHOR (`USER_REGION`) is aligned to its own 2 MiB so the whole region is STRUCTURALLY
+/// guaranteed to fall inside one 2 MiB L3_USER block (a 2 MiB-aligned base plus a size <= 2 MiB can
+/// never straddle a 2 MiB boundary) — the single per-slot L3 covers it all.
+///
+/// CRYSTAL-HD raised this 0x85000 → 0x149000 with the surface cap, which is what moved the anchor's
+/// alignment 0x100000 → 0x200000: the old alignment guaranteed non-straddling only because the size
+/// was <= 0x100000, and 0x149000 is not. WHAT IT COSTS ON THE PI, since this is `.bss` on a machine
+/// whose kernel heap is HAND-PLACED at 32 MiB (`MEM_REGIONS`, 0x0200_0000) and whose image therefore
+/// has a hard `.bss` ceiling there: `SLOT_BACKING` is `USER_SLOTS` (8) of this, so the pool goes
+/// 8 × 0x85000 = 4.16 MiB → 8 × 0x149000 = 10.28 MiB, the anchor itself adds 0x149000 rounded up to
+/// its 2 MiB alignment, and the MEASURED `.bss` end moves 8.56 MiB → 16.69 MiB (`readelf -S` on the
+/// `kernel8` build, `.bss` at 0x200000, 0x68fb88 → 0xeafb88). Margin to the heap floor: 15.31 MiB.
+/// The kernel image on the SD does not grow by a byte — `.bss` is NOBITS and
+/// `kernel8.img` is an objcopy of the loaded sections only.
+const USER_STATIC_SIZE: usize = USER_REGION_SIZE + FB_REGION_SIZE; // 0x149000
+const _: () = assert!(USER_STATIC_SIZE == 0x149000);
+/// The whole region must fit the ONE per-slot L3 (512 × 4 KiB = 2 MiB), or the FB leaves would spill
+/// into a table `build_slot` never wired. 0x149000 = 329 of those 512 pages.
+const _: () = assert!(USER_STATIC_SIZE <= 512 * 0x1000);
+/// A `FB_WIN_MAX_W` × `FB_WIN_MAX_H` ARGB8888 surface must fit a window's VA slot exactly.
+const _: () = assert!((FB_WIN_MAX_W * FB_WIN_MAX_H * 4) as usize == FB_WIN_SLOT_SIZE);
+#[repr(C, align(0x200000))]
 struct UserRegion([u8; USER_STATIC_SIZE]);
 static mut USER_REGION: UserRegion = UserRegion([0; USER_STATIC_SIZE]);
 
@@ -229,8 +258,9 @@ fn build_l1() {
     // USER_REGION must be 4 KiB-aligned (whole L3 pages) and in the first 1 GiB (under L1[0]).
     debug_assert!(user_pa & 0xFFF == 0, "USER_REGION not 4 KiB aligned");
     debug_assert!(user_pa >> 30 == 0, "USER_REGION not in the first 1 GiB");
-    // Structurally guaranteed by `UserRegion`'s align(0x100000) >= the region size; documents that every page falls
-    // inside the ONE 2 MiB block L3_USER covers (a straddling tail would silently stay EL1-only).
+    // Structurally guaranteed by `UserRegion`'s align(0x200000) >= the region size (CRYSTAL-HD raised both);
+    // documents that every page falls inside the ONE 2 MiB block L3_USER covers (a straddling tail would
+    // silently stay EL1-only).
     debug_assert!(
         user_pa >> 21 == (user_pa + USER_STATIC_SIZE as u64 - 1) >> 21,
         "USER_REGION (incl. the FB hole) straddles a 2 MiB block"

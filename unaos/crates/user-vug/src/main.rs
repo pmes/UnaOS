@@ -9,12 +9,15 @@
 // EL0 — the identical path the operator drives with `run /fat/VUG.ELF`.
 //
 // WHAT IT DOES
-//   1. WC-C: creates its own 128x128 ARGB8888 WINDOW via SYS_WIN_CREATE — a real compositor window with
+//   1. WC-C: creates its own 288x288 ARGB8888 WINDOW via SYS_WIN_CREATE — a real compositor window with
 //      kernel-drawn chrome, tiled beside whatever else is on the panel, rather than the single 32x32
-//      full-screen-centred compat surface SYS_FB_MAP exposed. 128x128 is `boot::FB_WIN_MAX_W/H` (one
-//      64 KiB window slot); the crystal projection is screen-space-scaled to it.
+//      full-screen-centred compat surface SYS_FB_MAP exposed. 288x288 is `FB_WIN_MAX_W/H` (one
+//      324 KiB window slot, CRYSTAL-HD, both arches); the crystal projection is screen-space-scaled to it.
+//      288-as-committed STANDS (Peter, PA44 sitting 2026-08-18: sharper and smaller on glass, "which is
+//      fine") — the 256-at-2x-density alternative from the CRYSTAL-HD arc is retired, not pending.
 //   2. Spawns TWO PERSISTENT EL0 worker threads via SYS_THREAD_SPAWN — one co-located, one on a SIBLING
-//      CORE — each of which rasterises HALF of the surface (worker A: rows 0..64, worker B: rows 64..128):
+//      CORE — each of which rasterises a BAND of the surface (worker A: rows 0..108, worker B: 108..216,
+//      the parent 216..288 — CRYSTAL-HD's 3-way split):
 //      it clears its band to the background and Bresenham-draws every crystal edge clipped to its band,
 //      from the projected vertex coordinates the parent publishes each frame.
 //      VUGGUARD: both spawns are CHECKED, and the thread pool is a request, not a guarantee — the
@@ -122,7 +125,7 @@
 // then, SPACE since CLICK-ONE — the mechanism below is indifferent to which), and that is
 // where it stopped: pause froze the frame's ADVANCE (the orientation stopped changing) but the frame
 // LOOP kept running at full rate — every paused frame still drained input, released both workers,
-// rasterised 128x128 twice, futex-barriered and PRESENTED, redrawing a surface that could not differ
+// rasterised the whole surface, futex-barriered and PRESENTED, redrawing a surface that could not differ
 // from the one already on the panel. P67v2 paid for that on silicon: six click-paused vugs, six full
 // render pipelines, cores pinned with the crystals standing still.
 //
@@ -568,6 +571,11 @@ fn input_poll() -> u64 {
 /// gate fails; `never` 8141, twenty-four bytes UNDER the untouched program. Same phenomenon the SIZE
 /// note above `futex_wait` records — the cost is inlining pressure in the frame loop, not the code
 /// written here. Nothing about correctness depends on it; the image ceiling does.
+///
+/// VUGSHRINK: the 8 KiB boundary named above was an x86 LINK-SCRIPT artefact and is gone on that arch —
+/// see `emit`'s SIZE note. The measurement stands as recorded; the pressure it was bought against no
+/// longer binds on x86, and the attribute is kept because the reasoning is still sound on aarch64,
+/// where the 0x2000 line is real.
 #[inline(never)]
 fn input_wait() {
     /// One 60 Hz frame — the fallback park's period. See the note above.
@@ -577,6 +585,30 @@ fn input_wait() {
         unsafe { sys1(SYS_SLEEP_MS, FALLBACK_PARK_MS) };
     }
 }
+
+// CRYSTAL-HD — WHERE `pace_edge` WOULD HAVE GONE, and why nothing is here.
+//
+// The held CRYSTAL-PACE half put a `pace_edge(win)` here: after a present the kernel answered
+// `WIN_PRESENT_COALESCED`, this program parked one kernel tick at a time and re-presented until the
+// panel's frame edge admitted one, locking the render loop to the composite cadence. It is NOT
+// landed, and the reason is a standing ruling rather than a defect in the mechanism — Peter,
+// 2026-08-13 (`9d12e7e0`, recorded in `docs/dev/OS/08_VIDEO/PARITY.md` §5.1):
+//
+//     vug on the Pi was working BETTER unpaced — pacing makes the app feel like it is fighting
+//     itself — and the standing direction for vug is MORE DRAWING COMPLEXITY, never artificial
+//     pacing. A vug that wants to look richer should draw more, not present less.
+//
+// That ruling deleted the WPACE-PANEL port from aarch64 for the same reason it forbids this: the
+// question of how fast a ring-3 program runs is the program's, and the answer the machine owes it is
+// how long the work takes (GR25, quoted at `crates/kernel/Cargo.toml`'s `vsyncpace`). A render loop
+// that sleeps until the compositor lets it through is the `vsyncpace` sleep with the sleep moved to
+// ring 3. The HD and AA halves of that arc land because they are the ruling's OTHER side — MORE
+// drawing: 2.25x the source density and antialiased facet edges, on the same free-running loop.
+//
+// The direct consequence, kept honest here: on x86 with `wc`, WPACE-PANEL still coalesces presents
+// into the panel frame, so a render faster than the panel does composite fewer frames than it draws.
+// That is the compositor spending less, not the app being throttled, and ring 3 cannot see it — see
+// `una_abi::SYS_WIN_PRESENT`, whose success status stays `0` on both arches for exactly this reason.
 
 /// FBCON-DMG: present SOURCE rows `[y0, y1)` of `win`, with the MANDATORY whole-box fallback.
 ///
@@ -709,13 +741,13 @@ fn crystal_vertices() -> [(Fx, Fx, Fx); 14] {
 //   * EACH SAMPLE IS A RAY. [`trace`] clips the sample's ray against the 18 slabs and keeps the last plane
 //     it entered through — the standard analytic ray/convex-polyhedron intersection. The answer is EXACT
 //     hidden-surface removal, which is what convexity buys: no z-buffer (there is no memory for one — a
-//     128x128 depth buffer is 32 KiB against a 16 KiB user window) and no depth sort.
+//     288x288 depth buffer is 324 KiB against a 16 KiB user window) and no depth sort.
 //   * THE COST IS REAL AND IT IS THE POINT. 18 planes x (one dot product plus one division) per sample is
 //     genuine rendering arithmetic, not padding, and it is where the honest frame time comes from.
 //
 // THE LADDER IS RAY DENSITY. Level 1 casts one ray per 4x4 cell of pixels and fills the cell; level 2 one
 // per 2x2; level 3 one per pixel. Cost scales 1:4:16, which is the range an adaptive ladder needs, and the
-// top rung is real quality rather than invented cost: the compositor UPSCALES this 128x128 surface onto a
+// top rung is real quality rather than invented cost: the compositor UPSCALES this 288x288 surface onto a
 // 1920x1200 panel, so every facet edge is magnified and a resolved edge is the difference the eye sees.
 //
 // THE FLOOR RUNG IS THE CLASSIC WIREFRAME, byte for byte — level 0 is [`render_wire`], the program's
@@ -776,9 +808,9 @@ fn pn(i: usize) -> (Fx, Fx, Fx) {
 #[cfg(not(feature = "kvug"))]
 const LOD_MAX: u32 = 3;
 /// Pixels per traced CELL at level `lod`: `1 << (LOD_MAX - lod)`, so level 1 casts one ray per 4x4 cell
-/// and fills it, level 2 one per 2x2, level 3 one per pixel. Cost scales 1:4:16. Every value divides 64
-/// (the worker band height) and 128 (the surface width), so a cell never straddles a band boundary or the
-/// right edge.
+/// and fills it, level 2 one per 2x2, level 3 one per pixel. Cost scales 1:4:16. Every value (1, 2, 4)
+/// divides every band boundary (108, 216, 288 — CRYSTAL-HD's split) and the 288 surface width, so a cell
+/// never straddles a band boundary or the right edge.
 #[cfg(not(feature = "kvug"))]
 #[inline(always)]
 fn lod_blk(lod: u32) -> i32 {
@@ -798,8 +830,11 @@ static GEM: [(i32, i32); 3] = [(0x3D, 0x92), (0x5F, 0xAA), (0x92, 0xC9)];
 /// the pixel the surface wants, so a traced cell is one load and one store.
 #[cfg(not(feature = "kvug"))]
 static mut FC: [Fx; NP] = [0; NP];
+/// CRYSTAL-AA: one extra entry — `FCOL[NP]` holds the BACKDROP, written once per frame by
+/// [`scene_setup`], so a miss (`trace` returns `NP`) indexes a colour like any hit and the render
+/// loop carries no miss branch at all (three sites, once per ray).
 #[cfg(not(feature = "kvug"))]
-static mut FCOL: [u32; NP] = [0; NP];
+static mut FCOL: [u32; NP + 1] = [0; NP + 1];
 /// The frame's ray basis in the SHARD's own frame — the object-space images of the world x, y and z axes —
 /// and the image-plane distance. Published with the same release/acquire edge on `PHASE` that already
 /// publishes `PX`/`PY`, so a worker that has acquired the frame has acquired these too.
@@ -860,7 +895,7 @@ fn scene_setup(ay: i32, ax: i32, dist: Fx, lt: i32) {
         // exactly that path's scale, and SCENE_ZOOM is the one place the two differ.
         //
         // WHY THEY DIFFER. The wireframe's framing was inherited from a 32x32 compat surface and leaves the
-        // crystal occupying about 40x48 px of 128x128 — eight per cent of the surface, which is the right
+        // crystal occupying about 90x108 px of 288x288 — eight per cent of the surface, which is the right
         // choice for an outline (the lines are the picture, and they need room to read) and the wrong one
         // for a solid the compositor is about to blow up onto a 1920x1200 panel. The shard is drawn at
         // SCENE_ZOOM so it fills its window: more of the frame is the object, which is both the deliberate
@@ -888,6 +923,8 @@ fn scene_setup(ay: i32, ax: i32, dist: Fx, lt: i32) {
             *(&mut *core::ptr::addr_of_mut!(FCOL)).get_unchecked_mut(i) = c;
             i += 1;
         }
+        // CRYSTAL-AA: the miss colour rides the same table — see `FCOL`.
+        *(&mut *core::ptr::addr_of_mut!(FCOL)).get_unchecked_mut(NP) = BG;
     }
 }
 
@@ -941,22 +978,67 @@ unsafe fn trace(d: (Fx, Fx, Fx)) -> usize {
     hit
 }
 
-/// Render one worker's band of the SOLID shard at detail level `lod` (1..=`LOD_MAX`).
+/// CRYSTAL-AA: the previous traced row's HIT INDICES, one row per raster band (two workers + the
+/// parent — disjoint writers by construction, so each band owns its slice). Raw FACET IDS rather than
+/// pixels, so the blend below always mixes two UN-blended facet colours — blending against the
+/// written (already-blended) pixel instead would drag a gradient tail across the facet.
+/// Zero-initialised so it stays `.bss` (a non-zero init mints a `.data` PAGE this image cannot
+/// afford); the initial contents are never read — each band's FIRST row skips the vertical compare.
+// KVUG: mode-0 shard state — gated with the ladder it serves.
+#[cfg(not(feature = "kvug"))]
+static mut HROW: [[u8; SW as usize]; 3] = [[0; SW as usize]; 3];
+
+/// CRYSTAL-AA: the mean of two ARGB8888 pixels, channel-wise, no unpacking: carry-safe halving via
+/// `(a AND b) + half the XOR difference`. Both inputs carry alpha 0xFF, so the result does too.
+// KVUG: mode-0 shard helper — gated with the rest of the ladder it serves.
+#[cfg(not(feature = "kvug"))]
+#[inline(always)]
+fn avg(a: u32, b: u32) -> u32 {
+    (((a ^ b) & 0xFEFE_FEFE) >> 1).wrapping_add(a & b)
+}
+
+/// CRYSTAL-AA: facet `h`'s shaded colour — a plain table load, misses included, because `FCOL[NP]`
+/// carries the backdrop (see `FCOL`). UNCHECKED: `h <= NP` is [`trace`]'s contract.
+// KVUG: mode-0 shard helper — gated with the rest of the ladder it serves.
+#[cfg(not(feature = "kvug"))]
+#[inline(always)]
+unsafe fn hcol(fcol: &[u32; NP + 1], h: usize) -> u32 {
+    *fcol.get_unchecked(h)
+}
+
+/// Render one band of the SOLID shard at detail level `lod` (1..=`LOD_MAX`). `band` is the writer's
+/// index into [`HROW`] (0/1 = workers, 2 = the parent).
 ///
 /// One pass, no clear: every traced cell is either shard or backdrop, and a cell is filled with the one
 /// colour its ray returned.
+///
+/// CRYSTAL-AA — at the TOP rung (one ray per pixel) every facet edge and the whole silhouette are
+/// ANTIALIASED: a pixel whose hit differs from its left or upper neighbour is averaged with that
+/// neighbour's raw colour. That is exactly the set of pixels an edge crosses, so the cost is two
+/// compares per pixel plus a blend only where edges actually are — and it is the difference the eye
+/// sees once the compositor magnifies the surface onto the panel. The first row of each band skips
+/// the vertical compare (the row above belongs to a concurrent writer mid-frame); a band seam is two
+/// interior rows of a 288-row surface and reads as such.
 #[cfg(not(feature = "kvug"))]
-unsafe fn render_solid(surf: *mut u8, y_lo: i32, y_hi: i32, lod: u32) {
+unsafe fn render_solid(surf: *mut u8, y_lo: i32, y_hi: i32, lod: u32, band: usize) {
     let blk = lod_blk(lod);
     let half = blk * (ONE / 2); // the cell's centre, in Q16.16 pixels
     let rb = &*core::ptr::addr_of!(RB);
     let (ux, uy, uz) = (rb[0], rb[1], rb[2]);
     let dz = RDZ;
     let fcol = &*core::ptr::addr_of!(FCOL);
+    let hrow = (&mut *core::ptr::addr_of_mut!(HROW)).get_unchecked_mut(band);
+    let aa = blk == 1;
     let mut by = y_lo;
     while by < y_hi {
         let py = SH * ONE / 2 - (by * ONE + half);
         let mut bx = 0i32;
+        // The hit one pixel to the LEFT (AA path only). Seeded as a MISS: left of the surface is
+        // backdrop, so an x=0 silhouette pixel correctly blends toward BG with no edge guard.
+        let mut hl = NP;
+        // Vertical AA only from the band's second row — the row above the first belongs to a
+        // concurrent writer mid-frame, and HROW holds nothing yet.
+        let vaa = aa && by > y_lo;
         while bx < SW {
             let px = bx * ONE + half - SW * ONE / 2;
             // The world-space ray through this cell's centre, carried into the shard's frame by the
@@ -967,7 +1049,18 @@ unsafe fn render_solid(surf: *mut u8, y_lo: i32, y_hi: i32, lod: u32) {
                 fmul(px, ux.2) + fmul(py, uy.2) + fmul(dz, uz.2),
             );
             let h = trace(d);
-            let c = if h < NP { *fcol.get_unchecked(h) } else { BG };
+            let mut c = hcol(fcol, h);
+            if aa {
+                if h != hl {
+                    c = avg(c, hcol(fcol, hl));
+                }
+                let hu = *hrow.get_unchecked(bx as usize) as usize;
+                if vaa && h != hu {
+                    c = avg(c, hcol(fcol, hu));
+                }
+                *hrow.get_unchecked_mut(bx as usize) = h as u8;
+                hl = h;
+            }
             let mut fy = by;
             while fy < by + blk {
                 let row = surf.add((fy as usize) * STRIDE) as *mut u32;
@@ -1001,15 +1094,44 @@ static EDGES: [(u8, u8); 30] = [
 // ---------------------------------------------------------------------------------------------
 // Surface geometry + palette.
 // ---------------------------------------------------------------------------------------------
-// WC-C: the crystal renders into a 128x128 WINDOW surface (SYS_WIN_CREATE), not the 32x32 compat page.
-// 128x128 is `boot::FB_WIN_MAX_W/H` — exactly one 64 KiB window slot — and is 4x the linear resolution
-// the compat path allowed, so the wireframe is drawn rather than approximated. FOCAL scales with it (6 ->
-// 24 px/unit) so the crystal occupies the SAME fraction of its surface as before; the visible change is
-// sharpness, not framing.
-const SW: i32 = 128; // surface width  (px)
-const SH: i32 = 128; // surface height (px)
-const STRIDE: usize = 512; // ARGB8888 row stride (bytes)
-const FOCAL: i32 = 24; // pixels-per-unit at the crystal's centre depth
+// WC-C: the crystal renders into a WINDOW surface (SYS_WIN_CREATE), not the 32x32 compat page.
+//
+// CRYSTAL-HD — the surface edge rises 128 -> 288, ON BOTH ARCHES, and there is deliberately no
+// `cfg` here. The crystal is the BRAND MARK of the OS, and at 128x128 the compositor's integer
+// upscale magnified it 8x on the 2880x1800 rMBP panel and 4x on the 1920x1200 Pi bench panel — a
+// nearest-neighbour lattice on the one object the machine is named for, on both chips. 288 is the
+// largest edge the window slot affords (`FB_WIN_MAX_W/H`, raised to 288 in `arch/x86_64/memory.rs`
+// AND `arch/aarch64/boot.rs` in this arc) and the largest whose window still tiles at an integer
+// scale >= 3 on the rMBP panel: an 864 px box at 2.25x the old source density. On the Pi bench panel
+// `wm::place_scale` gives 2x — a 576 px box against the old 4x/512 px one, i.e. the same on-glass
+// size carrying 2.25x the pixels, which is the whole point.
+//
+// The held commit kept aarch64 at 128 and named two reasons; both were retired rather than
+// overruled. The FB hole is no longer "another session's lane" (this arc raises it, and the Pi's
+// heap margin is stated in the commit message), and the 300-frame gate checksum was never a
+// hardware fact — it is a fact about the render, restated at 288 in `pi4-regression.spec`. Leaving
+// the Pi at 128 would have been a bare `target_arch` gate in the experience layer with no hardware
+// reason behind it, which is exactly what the ONE-OS ruling (2026-08-13) fails at review.
+//
+// FOCAL scales with the edge (24 px/unit at 128 -> 54 at 288) so the crystal occupies the same
+// fraction of its surface as before: the visible change is resolution, not composition.
+const SW: i32 = 288; // surface width  (px)
+const SH: i32 = 288; // surface height (px)
+const STRIDE: usize = (SW as usize) * 4; // ARGB8888 row stride (bytes)
+const FOCAL: i32 = 54; // pixels-per-unit at the crystal's centre depth
+
+// CRYSTAL-HD — THREE raster bands, because the parent was an idle core. The frame loop's shape is
+// release-workers / idle-at-barrier, so on any machine with three cores the parent spent the whole
+// raster span spinning `SYS_YIELD` at the barrier. It now rasterises the BOTTOM band itself, between
+// the release and the barrier — the exact slot the VUGGUARD inline raster already occupies — so the
+// healthy frame is a 3-way split. The parent's band is the smallest (a quarter) because the parent
+// also pays for the scene setup, the HUD and the present; the workers take the rest in halves. Every
+// boundary is a multiple of 4 (the widest LOD cell), so a cell never straddles a band. The final
+// surface is byte-identical to the two-band split — same pixels, different writers — so the split
+// itself moves no checksum; the SURFACE EDGE does, and that is the one reason the Pi gate's
+// 300-frame figure is restated in this arc.
+const BAND_PAR: i32 = SH - SH / 4; // parent: BAND_PAR..SH — 216..288
+const BAND_MID: i32 = BAND_PAR / 2; // worker A: 0..BAND_MID, worker B: BAND_MID..BAND_PAR
 const BG: u32 = 0xFF1E_1E1E; // opaque Can-Am dark grey
 const EDGE: u32 = 0xFFC9_A6E8; // opaque paler lilac seam
 
@@ -1100,6 +1222,95 @@ const INTERACTIVE_CAP: u32 = 36000; // interactive frame budget (fixture mode); 
 // spin the crystal past a quarter-turn in a single frame.
 const DRAG_DIV: i32 = 8; // px → brad divisor (full-panel drag ≈ one revolution)
 const DRAG_CLAMP: i32 = 64; // max |brad| a single frame's drag may contribute per axis
+
+// ---------------------------------------------------------------------------------------------
+// WHEELZOOM M1 — the zoom axis, and the two input sources that now share it.
+// ---------------------------------------------------------------------------------------------
+//
+// Peter's ask: "scroll should zoom the crystal in and out when over the top of vug". The WHEEL arc
+// landed the sensory channel (`INPUT_EV_WHEEL`, routed to the FOCUSED EL0 window's ring); this is
+// its first consumer.
+//
+// WHAT "ZOOM" IS IN THIS PROGRAM. There is no separate scale factor to multiply: the crystal's
+// screen-space scale is `FOCAL * dist / zc` in [`project`] and `FOCAL * SCENE_ZOOM * dist` in
+// [`scene_setup`], and BOTH are functions of one number — `dist`, the eye's distance from the
+// origin. Moving `dist` is therefore the whole zoom, for the wireframe and the shard alike, with no
+// second parameter to keep in step. The keyboard's `+`/`-` (and `e`/`q`) have moved exactly this
+// number since the program was written; the wheel now moves the same one, through the same
+// function, so the two sources cannot drift apart and the KEYBOARD path is what the QEMU suite
+// exercises on a machine that can deliver no wheel report at all.
+//
+// THE STEP AND THE CLAMPS ARE THE KEYBOARD'S, UNCHANGED. `ZOOM_STEP` is the `ONE/16` the held-key
+// arms already applied per frame, and `DIST_NEAR`/`DIST_FAR` are the `2.5`/`8` those arms already
+// clamped to. Widening either bound would change an EXISTING control's behaviour for a reason this
+// arc does not have, and the near bound in particular is load-bearing: `project` guards depth with
+// `(z2 + dist).max(ONE/4)`, and a `dist` inside the crystal's own radius drives that guard rather
+// than the projection. In on-glass terms the range is 0.5x (at `dist = 8`) to 1.6x (at `dist =
+// 2.5`) of the default framing at `dist = 4`.
+//
+// PER DETENT: `WHEEL_ZOOM_STEPS` keyboard-steps, positive HID delta (away from the operator) =
+// zoom IN = `dist` DOWN, which is the platform-conventional direction. Four steps is `ONE/4` of
+// distance, i.e. ~22 detents across the whole 5.5-unit range and a 3-10 % change in on-screen scale
+// per detent depending where in the range the operator is — one detent is visible, and no plausible
+// flick crosses the range by accident.
+const ZOOM_STEP: Fx = ONE / 16; // one keyboard-frame / one quarter-detent of eye distance
+const DIST_NEAR: Fx = 2 * ONE + ONE / 2; // closest eye distance (≈1.6x) — the keyboard's own bound
+const DIST_FAR: Fx = 8 * ONE; // furthest eye distance (0.5x) — likewise
+const WHEEL_ZOOM_STEPS: i32 = 4; // [`ZOOM_STEP`]s per wheel detent
+/// WHEELZOOM M1 — apply `steps` zoom steps to the eye distance and clamp. **The single zoom
+/// implementation**: the held-key arms and the wheel arm both call it, so the suite's keyboard path
+/// and the bench's wheel path exercise identical arithmetic, and the QEMU gate — which can be
+/// delivered no wheel report at all — still covers it.
+///
+/// Positive `steps` = zoom IN. Returns the new distance; the caller compares it against the old one
+/// to learn whether the clamp bit.
+///
+/// OVERFLOW IS BOUNDED BY THE DRAIN, and no runtime guard is owed. `FrameInput::wheel` accumulates at
+/// most [`MAX_DRAIN_PER_FRAME`] (64) events of at most ±127 detents each, so `|steps|` here cannot
+/// exceed `64 * 127 * WHEEL_ZOOM_STEPS` = 32 512 and `steps * ZOOM_STEP` cannot exceed 133 M — two
+/// orders inside an `i32`. Stated rather than clamped: a guard nothing can reach is bytes this program
+/// does not have (see the SIZE note), and the bound is a property of the drain's own cap.
+#[inline(never)]
+fn zoom_apply(dist: Fx, steps: i32) -> Fx {
+    (dist - steps * ZOOM_STEP).clamp(DIST_NEAR, DIST_FAR)
+}
+
+/// WHEELZOOM M1 — the wheel's whole zoom arm, and the `[vugzoom]` census with it.
+///
+/// `#[inline(never)]` AND IT IS LOAD-BEARING, exactly as it is on `put_slow`: the frame loop is a
+/// 3.8 KiB `_start` and this block is reached on the frames a hand is turning a wheel, i.e. never on
+/// any automated run. Inlined, it costs `_start` register pressure and spills for a path that is cold
+/// by construction; outlined it is one call. Measured against the `0x2000` `.text` line on x86 (see
+/// [`emit`]'s SIZE note), which is where this program's headroom actually is.
+///
+/// VUGSHRINK, and the record should say so plainly: outlining was not enough. This commit shipped
+/// `.text` at 0x207f — 127 bytes past that line — which moved `.bss` a page and put `VUG-X86.ELF` at
+/// 16664 against a 16384 gate, breaking every x86 runtime gate until the link script was fixed. The
+/// attribute stays (it is still the right call for a cold path in a 3.8 KiB frame loop, and aarch64
+/// still lives against 0x2000); what changed is that the line it was measured against was itself the
+/// defect.
+///
+/// `next == dist` is the exact test for "this detent could not move the picture" — the operator is
+/// already at a bound — so the two counters separate the two facts a bench needs told apart: the
+/// detent ARRIVED and was decoded (`applied`), versus it arrived and the range is spent (`clamped`).
+/// ONE emit site with a chosen tag and a chosen counter, rather than two blocks, for the same SIZE
+/// reason the pause/hidden witness gives.
+///
+/// The KEYBOARD's zoom is deliberately not counted here: a held key already witnesses itself by
+/// moving the picture, and a line per frame a key is down is not a witness, it is a flood.
+#[inline(never)]
+fn wheel_zoom(dist: Fx, wheel: i32, applied: &mut u32, clamped: &mut u32) -> Fx {
+    let next = zoom_apply(dist, wheel * WHEEL_ZOOM_STEPS);
+    let (tag, n): (&[u8], u32) = if next != dist {
+        *applied = applied.wrapping_add(1);
+        (b"[vugzoom] applied=", *applied)
+    } else {
+        *clamped = clamped.wrapping_add(1);
+        (b"[vugzoom] clamped=", *clamped)
+    };
+    sayn(tag, n);
+    next
+}
 
 // ---------------------------------------------------------------------------------------------
 // Rasterisation (worker side).
@@ -1465,7 +1676,15 @@ unsafe fn render_band(surf: *mut u8, y_lo: i32, y_hi: i32) {
 unsafe fn render_band(surf: *mut u8, y_lo: i32, y_hi: i32) {
     let lod = LOD.load(Ordering::Acquire);
     if lod > 0 {
-        render_solid(surf, y_lo, y_hi, lod);
+        // CRYSTAL-AA: the band's HROW slice, named by its top row — the three bands are fixed.
+        let band = if y_lo == 0 {
+            0
+        } else if y_lo == BAND_MID {
+            1
+        } else {
+            2
+        };
+        render_solid(surf, y_lo, y_hi, lod, band);
         return;
     }
     render_wire(surf, y_lo, y_hi)
@@ -1498,12 +1717,14 @@ unsafe fn render_wire(surf: *mut u8, y_lo: i32, y_hi: i32) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Worker thread entry. arg 0 = top half (rows 0..16), arg 1 = bottom half (rows 16..32).
+// Worker thread entry. arg 0 = the top band (rows 0..BAND_MID), arg 1 = the middle band
+// (BAND_MID..BAND_PAR); the parent owns BAND_PAR..SH itself (CRYSTAL-HD).
 // ---------------------------------------------------------------------------------------------
 #[no_mangle]
 extern "C" fn uvug_worker(arg: usize) -> ! {
     let surf = SURF.load(Ordering::Acquire) as *mut u8;
-    let (y_lo, y_hi) = if arg == 0 { (0, SH / 2) } else { (SH / 2, SH) };
+    // CRYSTAL-HD: the workers own the top two bands; the parent rasterises BAND_PAR..SH itself.
+    let (y_lo, y_hi) = if arg == 0 { (0, BAND_MID) } else { (BAND_MID, BAND_PAR) };
     let mut last: u32 = 0;
     loop {
         // Wait for the parent to release the next frame.
@@ -1571,7 +1792,7 @@ extern "C" fn uvug_worker(arg: usize) -> ! {
 // ABIFREEZE: the packed-event type tags, imported from the crate the kernels pack them with.
 use una_abi::{
     INPUT_EV_BUTTON as EV_BUTTON, INPUT_EV_KEY_DOWN as EV_KEYDOWN, INPUT_EV_KEY_UP as EV_KEYUP,
-    INPUT_EV_MOUSE_REL as EV_MOUSE_REL,
+    INPUT_EV_MOUSE_REL as EV_MOUSE_REL, INPUT_EV_WHEEL as EV_WHEEL,
 };
 
 // Held-state bits.
@@ -1638,20 +1859,36 @@ use una_abi::{
 /// ASCII 0x20 (keycode 0x2C, shifted and unshifted alike), so no modifier state is involved.
 const K_SPACE: u8 = b' ';
 
+/// CRYSTAL-HD, size only: the same mapping the old `match` ladder expressed, as a 2-byte-per-entry
+/// scan table — `(key, bit index)` pairs, `1 << bit` on a hit. The ladder compiled to ~126 bytes of
+/// compare chain; the table is 28 bytes of rodata and a short loop. Behaviour identical.
+static KEYMAP: [(u8, u8); 14] = [
+    (b'a', 0), (K_LEFT, 0),   // H_YAW_L
+    (b'd', 1), (K_RIGHT, 1),  // H_YAW_R
+    (b'w', 2), (K_UP, 2),     // H_PIT_U
+    (b's', 3), (K_DOWN, 3),   // H_PIT_D
+    (b'e', 4), (b'+', 4),     // H_ZOOM_IN  ('=' is folded onto '+' in key_bit, ahead of the scan)
+    (b'q', 5), (b'-', 5),     // H_ZOOM_OUT
+    (b'_', 5), (K_SPACE, 6),  // H_ZOOM_OUT / H_PAUSE
+];
+
 fn key_bit(k: u8) -> u32 {
-    let k = k.to_ascii_lowercase();
-    match k {
-        b'a' | K_LEFT => H_YAW_L,
-        b'd' | K_RIGHT => H_YAW_R,
-        b'w' | K_UP => H_PIT_U,
-        b's' | K_DOWN => H_PIT_D,
-        b'e' | b'+' | b'=' => H_ZOOM_IN,
-        b'q' | b'-' | b'_' => H_ZOOM_OUT,
-        K_SPACE => H_PAUSE,
-        #[cfg(feature = "kvug")]
-        b'm' => H_MODE,
-        _ => 0,
+    let k = if k == b'=' { b'+' } else { k.to_ascii_lowercase() };
+    // KVUG: the mode key is the one binding the scan table cannot carry — `H_MODE` and its
+    // `b'm'` spelling exist only under the feature, and KEYMAP is a plain (not cfg-split) table.
+    #[cfg(feature = "kvug")]
+    if k == b'm' {
+        return H_MODE;
     }
+    let mut i = 0usize;
+    while i < KEYMAP.len() {
+        let (kk, b) = KEYMAP[i];
+        if kk == k {
+            return 1 << b;
+        }
+        i += 1;
+    }
+    0
 }
 
 /// UVUG-9 — the per-frame cap on how many input events one frame may consume.
@@ -1698,6 +1935,11 @@ struct FrameInput {
     mode_keys: u32,
     mdx: i32, // summed relative mouse dx while dragging
     mdy: i32, // summed relative mouse dy while dragging
+    /// WHEELZOOM M1: wheel DETENTS accumulated this frame, signed (positive = away from the operator
+    /// = zoom in). Summed rather than latched for the same reason `mdx`/`mdy` are: a fast flick puts
+    /// several detents in one drain, and taking only the last one would throw the gesture away.
+    /// Unconditioned on `drag` — a scroll is not a drag and needs no button held.
+    wheel: i32,
     /// UVUG-9: the drain hit `MAX_DRAIN_PER_FRAME` with the ring still non-empty — the freeze signature.
     saturated: bool,
 }
@@ -1819,6 +2061,13 @@ fn drain_input(held: &mut u32, drag: &mut u32) -> FrameInput {
                     fi.mdx += dx;
                     fi.mdy += dy;
                 }
+            }
+            // WHEELZOOM M1 — one scroll detent. `una-abi` publishes the payload's low byte as the HID
+            // boot-mouse wheel byte, a SIGNED `i8`, so the sign-extension is the ABI's stated decode
+            // (`input_ev_payload(ev) as u8 as i8`) and not a guess. The kernel only ever emits a
+            // NONZERO delta, so no filtering is owed here.
+            EV_WHEEL => {
+                fi.wheel += (lo & 0xFF) as u8 as i8 as i32;
             }
             _ => {}
         }
@@ -1973,16 +2222,20 @@ static GLYPHS: [[u8; 7]; 10] = [
     [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100], // 9
 ];
 
-/// Draw one digit at (x, y), 1:1 scale (5x7 px — the window is only 128 wide).
+/// Draw one digit at (x, y), 1:1 scale (5x7 px). Direct row stores rather than [`put_px`]: every HUD
+/// coordinate is in-bounds by construction (the three readouts end well inside the 288 px surface, and
+/// did so at 128 too), so the per-pixel clip was four dead compares under every glyph bit — bytes this
+/// image cannot spare (see the SIZE note).
 unsafe fn draw_digit(surf: *mut u8, d: usize, x: i32, y: i32, color: u32) {
     let g = &GLYPHS[d % 10];
     let mut row = 0i32;
     while row < 7 {
         let bits = g[row as usize];
+        let r = surf.add(((y + row) as usize) * STRIDE) as *mut u32;
         let mut col = 0i32;
         while col < 5 {
             if bits & (1 << (4 - col)) != 0 {
-                put_px(surf, x + col, y + row, color);
+                r.add((x + col) as usize).write_volatile(color);
             }
             col += 1;
         }
@@ -2040,6 +2293,16 @@ const KM_C: u32 = 0xFF9B_59B6;
 //     recovery is a real change in the machine and not the gap between two frames.
 // A machine that is far too slow drops TWO rungs in one window (levels cost ~L^2, so one rung at a time
 // would crawl), which is what keeps the calibration inside the couple of seconds the ruling asked for.
+//
+// CRYSTAL-HD — NO LADDER CONSTANT MOVES IN THIS ARC, and that is a decision rather than an omission.
+// The held CRYSTAL-PACE half replaced `LOD_UP` with a render-time utilisation license
+// (`busy * 16 < TICK_HZ * 3`) on the premise that "with presents locked to the panel a healthy window
+// reads ~60 whether the raster took 2 ms or 15". That premise is `pace_edge`'s, and `pace_edge` is not
+// landed: this program's meter counts the frames IT renders, and nothing throttles that loop, so the
+// rate it reads is still the honest work-per-second signal `LOD_UP` was written against. The Pi's own
+// reading of these constants was fixed at the source instead (`timer::abi_ticks` — the `sys_getinfo`
+// clock was a 4-core tick SUM and every ring-3 rate came out 4x low; `PARITY.md` §6.8a/§6.8b), and
+// that fix deliberately retuned nothing here, because on x86 the constants were always correct.
 #[cfg(not(feature = "kvug"))]
 const LOD_DOWN: u32 = 24;
 #[cfg(not(feature = "kvug"))]
@@ -2116,17 +2379,7 @@ const HUD_Y1: u32 = 11;
 /// code at a different offset rather than a second copy of it — the cheapest way to add a second readout
 /// against the `.text` ceiling (see the SIZE note).
 unsafe fn draw_num(surf: *mut u8, fps: u32, x0: i32, color: u32) {
-    let v = fps.min(999);
-    // VUG-PACE, size only (no behaviour change): the digit count and its leading power of ten come out of
-    // ONE ladder. The old form derived `div` from `n` with a `while k < n { div *= 10 }` loop, and this
-    // program pays for every instruction — see the SIZE note. The barrier's spin budget was bought here.
-    let (n, mut div) = if v >= 100 {
-        (3i32, 100u32)
-    } else if v >= 10 {
-        (2, 10)
-    } else {
-        (1, 1)
-    };
+    let mut v = fps.min(999);
     let mut y = 0;
     while y < 11 {
         let row = surf.add((y as usize) * STRIDE) as *mut u32;
@@ -2137,11 +2390,17 @@ unsafe fn draw_num(surf: *mut u8, fps: u32, x0: i32, color: u32) {
         }
         y += 1;
     }
-    let mut i = 0i32;
-    while i < n {
-        draw_digit(surf, ((v / div) % 10) as usize, x0 + 2 + i * 6, 2, color);
-        div /= 10;
-        i += 1;
+    // CRYSTAL-HD, size only: digits are stamped RIGHT-TO-LEFT (`v % 10`, then `v /= 10`), which
+    // deletes the digit-count/power-of-ten ladder the left-aligned form needed. The readout is now
+    // right-aligned in its fixed box; same digits, same colours, ~50 bytes given back.
+    let mut i = 2i32;
+    loop {
+        draw_digit(surf, (v % 10) as usize, x0 + 2 + i * 6, 2, color);
+        v /= 10;
+        i -= 1;
+        if v == 0 {
+            break;
+        }
     }
 }
 
@@ -2179,6 +2438,17 @@ fn say(label: &[u8], v: u32) {
 /// `readelf -lW target/VUG-X86.ELF` against that `0x2000` line, not against the file size the build script
 /// prints (the file carries section headers and page padding, so it overstates the real footprint — the
 /// LOADable memory here is ~12.4 KiB of the 16 KiB window).
+///
+/// VUGSHRINK — **THE `0x2000` LINE ABOVE IS NOW THE aarch64 NUMBER ONLY.** That parenthetical about the
+/// file overstating the footprint was in fact the whole bug: the x86 image was 4249 bytes of hole,
+/// because nothing claimed the file's first 0xb0 bytes and the text segment was pushed a page past
+/// them, skewing every later file offset. `crates/user-vug/user-vug-x86.ld` now links the ELF header
+/// and phdr table INTO the text segment (`FILEHDR PHDRS`), so file offsets equal vaddrs and the x86
+/// budget is `0xb0 + .text <= 0x3000` — `.text <= 0x2f50`, with 3793 bytes spare at this writing. The
+/// cliff is still a cliff (one byte past it still costs 4096 in one step), it is simply a long way off
+/// now, and the trims this note and the ones on `input_wait` / `wheel_zoom` record were all bought
+/// against the OLD line. aarch64 keeps the `0x2000` budget: user-vug.ld is deliberately unchanged,
+/// that arch fits with room, and its VUG.ELF is byte-identical across VUGSHRINK.
 fn emit(label: &[u8], v: u32, tail: &[u8]) {
     let mut b = Buf::new();
     b.put(label);
@@ -2232,7 +2502,7 @@ unsafe fn draw_hud(surf: *mut u8, fps: u32, clicks: u32, lod: u32) {
 /// fps as wrong. That could not be settled from a capture, and the reason was structural rather than
 /// arithmetic: **this program had never printed the number it draws.** The kernel prints `[wpace] win=N
 /// rate=` (presents the pacer counted) and `[wcn] win=N rate=`/`comp_rate=` (presents attempted /
-/// composites that reached the panel); the vug printed its digits on a 128 px window and nowhere else.
+/// composites that reached the panel); the vug printed its digits on its own window and nowhere else.
 /// "The meter disagrees with the wire" was not a finding anyone could make — there was no meter on the
 /// wire to disagree with.
 ///
@@ -2345,12 +2615,12 @@ fn surface_checksum(surf: *const u8) -> u64 {
 // Tiny formatting into a byte buffer (no core::fmt — keep the text segment small).
 // ---------------------------------------------------------------------------------------------
 struct Buf {
-    b: [u8; 96],
+    b: [u8; 64],
     n: usize,
 }
 impl Buf {
     fn new() -> Self {
-        Buf { b: [0; 96], n: 0 }
+        Buf { b: [0; 64], n: 0 }
     }
     fn put(&mut self, s: &[u8]) {
         let mut i = 0;
@@ -2470,7 +2740,8 @@ pub extern "C" fn _start() -> ! {
     let ok_b = rc_b >> 63 == 0;
     let spawned = ok_a as u32 + ok_b as u32;
 
-    // Bands the PARENT must rasterise itself this run (top = rows 0..64, bottom = rows 64..128).
+    // Bands the PARENT must rasterise itself this run when a worker spawn failed (top = 0..BAND_MID,
+    // bottom = BAND_MID..BAND_PAR). The parent's OWN band, BAND_PAR..SH, it rasterises unconditionally.
     let mut inline_top = !ok_a;
     let mut inline_bot = !ok_b;
     // How many worker arrivals the frame barrier may legitimately wait for. Never more than the number
@@ -2528,6 +2799,12 @@ pub extern "C" fn _start() -> ! {
     // this layer: unmissable proof that the router addressed the click to the window under the cursor,
     // with zero coupling to run state.
     let mut clicks: u32 = 0;
+    // WHEELZOOM M1: the `[vugzoom]` census — frames in which a WHEEL detent reached the zoom axis, and
+    // how many of those landed on a clamp. Two counters rather than one because they answer different
+    // questions at a bench: `applied` says the event arrived and was decoded, `clamped` says the
+    // operator is already at the end of the range and the picture is right to stop moving.
+    let mut zoom_applied: u32 = 0;
+    let mut zoom_clamped: u32 = 0;
     // VUGLIFE: one-shot latch for the waived-budget witness (detached/interactive only).
     let mut budget_waived = false;
     // KVUG: the kernel-vug mode the `m` key cycles. Starts at 0 — this program's own ladder — so a VUGK
@@ -2646,7 +2923,13 @@ pub extern "C" fn _start() -> ! {
         let frozen = paused || hidden;
 
         // --- fold input into rotation/zoom ---
-        let manual = interactive && (held & H_MOTION != 0 || (drag != 0 && (fi.mdx != 0 || fi.mdy != 0)));
+        // WHEELZOOM M1: a wheel detent is manual control in its own right — it needs no held key and no
+        // button down, which is exactly what distinguishes a scroll from the drag-rotate beside it. Note
+        // the disjunct is `fi.wheel`, this FRAME's detents, so the wheel arms manual mode for the frames
+        // it is actually turning and the idle tumble resumes when the hand stops (the held-key disjunct
+        // is a LEVEL and behaves differently on purpose: a key stays down).
+        let manual = interactive
+            && (held & H_MOTION != 0 || fi.wheel != 0 || (drag != 0 && (fi.mdx != 0 || fi.mdy != 0)));
         if frozen {
             // CLICK-ONE/CLICK-PLAIN: paused (by SPACE, or by a click under LAYER 2) — hold the
             // current orientation. VUGPAUSE: holding it is now
@@ -2669,11 +2952,28 @@ pub extern "C" fn _start() -> ! {
             if held & H_PIT_D != 0 {
                 pit += 4;
             }
-            if held & H_ZOOM_IN != 0 {
-                dist = (dist - ONE / 16).max(2 * ONE + ONE / 2);
+            // WHEELZOOM M1 — the ONE zoom axis, fed by BOTH sources through [`zoom_apply`]. The two
+            // held-key arms used to inline their own step and clamp; they now call the shared function
+            // with `+1`/`-1`, which is what makes the wheel arm below suite-covered on a machine that
+            // can deliver no wheel report at all (raspi4b attaches no USB): `+`/`-` exercise the
+            // identical arithmetic, and only the event source differs.
+            let ksteps = (held & H_ZOOM_IN != 0) as i32 - (held & H_ZOOM_OUT != 0) as i32;
+            if ksteps != 0 {
+                dist = zoom_apply(dist, ksteps);
             }
-            if held & H_ZOOM_OUT != 0 {
-                dist = (dist + ONE / 16).min(8 * ONE);
+            // The wheel's own arm. Applied AFTER the keys and clamped independently, which is the
+            // honest composition: a frame carrying both sources gets both, in order, and each is
+            // stopped by the same bound.
+            //
+            // WHEELZOOM M1 census — see `[vugzoom]`. `next == dist` is the exact test for "this detent
+            // could not move the picture", i.e. the operator is already at a bound, so the two counters
+            // separate the two things a bench operator needs told apart: the detent ARRIVED and was
+            // decoded (`applied`), versus the detent arrived and the range is spent (`clamped`). One
+            // line per wheel frame, so it is human-rate the way `:: UVUG: click n=` is; the keyboard
+            // path is deliberately NOT counted here, because a held key already witnesses itself by
+            // moving the picture and would put a line on the wire every frame.
+            if fi.wheel != 0 {
+                dist = wheel_zoom(dist, fi.wheel, &mut zoom_applied, &mut zoom_clamped);
             }
             if drag != 0 {
                 // Pointer motion → rotation, scaled + per-frame clamped (see DRAG_DIV/DRAG_CLAMP).
@@ -2775,8 +3075,8 @@ pub extern "C" fn _start() -> ! {
                     // FBCON-DMG: this is the one present in the program whose damage is genuinely a BAND.
                     // Nothing rendered this pass — the frame path did not run — and the only writer since
                     // the last present was `draw_hud` immediately above, whose extent is `[HUD_Y0, HUD_Y1)`
-                    // by construction. So 11 of 128 source rows is the whole truth about what changed, and
-                    // repainting the other 117 is work the compositor was being asked to do for nothing,
+                    // by construction. So 11 of 288 source rows is the whole truth about what changed, and
+                    // repainting the other 277 is work the compositor was being asked to do for nothing,
                     // once per second, for as long as a vug sits idled on an operator's desktop.
                     let rc = present_rows(win, HUD_Y0, HUD_Y1);
                     if rc >> 63 != 0 {
@@ -2871,11 +3171,14 @@ pub extern "C" fn _start() -> ! {
         // disjoint by construction and `draw_line`/`put_px` clip to the band, so no two writers ever
         // touch a pixel.
         if inline_top {
-            unsafe { render_band(surf, 0, SH / 2) };
+            unsafe { render_band(surf, 0, BAND_MID) };
         }
         if inline_bot {
-            unsafe { render_band(surf, SH / 2, SH) };
+            unsafe { render_band(surf, BAND_MID, BAND_PAR) };
         }
+        // CRYSTAL-HD: the parent's OWN band, every frame — see BAND_PAR. Placed with the inline
+        // raster so it runs concurrently with the workers, exactly where the parent otherwise idles.
+        unsafe { render_band(surf, BAND_PAR, SH) };
 
         // --- barrier: wait for the live workers to arrive (FUTEX) ---
         // UVUG-9: the wait itself is unchanged (re-check + compare-and-block is lost-wakeup-safe); a pass

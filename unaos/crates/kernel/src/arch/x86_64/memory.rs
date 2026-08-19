@@ -434,7 +434,7 @@ pub unsafe fn map_user_page(va: u64, phys: u64, writable: bool, nx: bool) {
 /// `MAX_PROCS` at 10 with the SAME 2-slot reserve intact, which is 8 vugs + the desktop app + one
 /// foreground `run`, i.e. the fleet an operator actually asks for plus a margin.
 ///
-/// WHAT ONE MORE SLOT COSTS. A slot is `USER_STATIC_SIZE` (0x85000 = 532 KiB) of `.bss` backing plus
+/// WHAT ONE MORE SLOT COSTS. A slot is `USER_STATIC_SIZE` (0x149000 ≈ 1.3 MiB) of `.bss` backing plus
 /// four 4 KiB page tables (PML4/PDPT/PD/PT) = 548 KiB. 8 -> 12 is therefore +2.14 MiB of `.bss`
 /// (4.28 MiB -> 6.42 MiB) on a machine with GiBs; the pool is `.bss` (NOBITS), so the boot image on
 /// the ESP does not grow by a byte. Nothing else scales with the count: the per-slot sidecars in
@@ -469,7 +469,7 @@ impl PageTable {
 // immediately above the 16 KiB program window:
 //
 //     [+0x4000]                          the RO info page (1 page) — geometry the app reads
-//     [+0x5000 + w * FB_WIN_SLOT_SIZE]   window `w`'s RW surface slot (16 pages), w in 0..FB_WIN_SLOTS
+//     [+0x5000 + w * FB_WIN_SLOT_SIZE]   window `w`'s RW surface slot (81 pages), w in 0..FB_WIN_SLOTS
 //
 // Ring 3 NEVER gets the real scan-out: it owns only these off-screen surface bytes, and the kernel
 // composites them through SYS_WIN_PRESENT. A surface is negotiated at create time and only its
@@ -485,8 +485,9 @@ impl PageTable {
 // NOT a legal syscall buffer (the fail-closed direction, and what aarch64's `user_range_ok` also does).
 //
 // ONE PT STILL SUFFICES. The slot's single PT covers 512 pages = 2 MiB from `USER_BASE`, and the whole
-// region is `0x85000` = 133 pages, so the FB leaves land in `SLOT_PT[s]` alongside the program window
-// — no new table level, and `build_slot`'s PML4[2]→PDPT[0]→PD[0]→PT wiring is untouched.
+// region is `0x149000` = 329 pages, so the FB leaves land in `SLOT_PT[s]` alongside the program window
+// — no new table level, and `build_slot`'s PML4[2]→PDPT[0]→PD[0]→PT wiring is untouched. (That 2 MiB
+// line is the hard ceiling the CRYSTAL-HD surface raise was sized against — see `FB_WIN_SLOT_SIZE`.)
 
 /// WINX-1: the read-only geometry page (1 page), at `USER_BASE + 0x4000`.
 pub const FB_INFO_SIZE: usize = 0x1000;
@@ -499,35 +500,56 @@ pub const FB_INFO_SIZE: usize = 0x1000;
 /// raised the global tables (WIN_MAX 8 -> 12, MAX_WINDOWS 8 -> 12) separated them rather than
 /// dragging this one along: the GLOBAL window count had to grow because `MAX_PROCS` did (10 programs
 /// must each be able to own a window, alongside the console), but PER-PROCESS nothing changed — no
-/// shipped program opens more than one window, and 8 is already 8x that. Keeping this at 8 is what
-/// stops the raise from costing 12 slots x 4 extra 64 KiB surface reservations (+3 MiB of `.bss`)
-/// for capacity nothing asks for. The remaining invariant is the SAFE direction and is asserted at
-/// `syscall::WIN_MAX`: `FB_WIN_SLOTS <= WIN_MAX`, since a region slot is indexed per address space
-/// and a global id is not.
-pub const FB_WIN_SLOTS: usize = 8;
-/// WINX-1: VA reserved per window surface slot — 64 KiB = 16 pages = a 128x128 ARGB8888 surface.
-pub const FB_WIN_SLOT_SIZE: usize = 0x1_0000;
-/// WINX-1: the largest surface edge a window may negotiate (128 * 128 * 4 == `FB_WIN_SLOT_SIZE`).
-pub const FB_WIN_MAX_W: u32 = 128;
-pub const FB_WIN_MAX_H: u32 = 128;
+/// shipped program opens more than one window. The remaining invariant is the SAFE direction and is
+/// asserted at `syscall::WIN_MAX`: `FB_WIN_SLOTS <= WIN_MAX`, since a region slot is indexed per
+/// address space and a global id is not.
+///
+/// CRYSTAL-HD took this 8 -> 4, and the trade is the same one that kept it at 8 before: the slot
+/// SIZE grew 5x (see [`FB_WIN_SLOT_SIZE`]) so the whole per-slot FB region could fit the one PT
+/// `build_slot` wires (`USER_STATIC_SIZE <= 2 MiB`, asserted below), and 4 windows per process is
+/// still 4x what any shipped program opens.
+pub const FB_WIN_SLOTS: usize = 4;
+/// WINX-1: VA reserved per window surface slot. CRYSTAL-HD: 0x51000 = 81 pages = a 288x288 ARGB8888
+/// surface — the crystal is the brand mark and 128x128 under the compositor's integer upscale was a
+/// visible lattice on the 2880x1800 rMBP panel and on the 1920x1200 Pi bench panel alike, which is
+/// why the aarch64 twin (`arch::aarch64::boot`) carries this exact cluster rather than staying at 128
+/// (ONE OS, 2026-08-13: an experience-layer `target_arch` gate needs a hardware reason, and there is
+/// none here). The shared ABI fact is the slot-0 offset (base + 0x5000), which is unchanged on both
+/// arches; a per-window surface's real geometry is published in the RO info page and never assumed.
+///
+/// ⚠ THE JUSTIFICATION FOR THE NUMBER 288 DID NOT SURVIVE MEASUREMENT, and the cap is kept anyway
+/// because it is Peter's signed number (2026-08-18) and because it is a CEILING, not a request. The
+/// held commit chose 288 as "the largest edge whose window still tiles at an integer scale >= 3" from
+/// `min(2880/2/288, 1800/2/288) = 3`. That used the raw panel height; `wm::place_scale` divides the
+/// WORK AREA (panel less `top_chrome_h` and `chrome_h`). Measured on the bench-geometry gate, a
+/// 288x288 window tiles at 1x on 1920x1200 (`work_h` = 1102) and 2x on 2880x1800 — SMALLER on glass
+/// than the 128x128 window's 4x/6x. `PARITY.md` §6.6e carries the arithmetic and the options; the one
+/// that needs no cap change is for `user-vug` to request 256 rather than the ceiling.
+pub const FB_WIN_SLOT_SIZE: usize = 0x5_1000;
+/// WINX-1: the largest surface edge a window may negotiate (288 * 288 * 4 == `FB_WIN_SLOT_SIZE`).
+pub const FB_WIN_MAX_W: u32 = 288;
+pub const FB_WIN_MAX_H: u32 = 288;
 /// WINX-1: the whole FB hole reserved above the program window.
-pub const FB_REGION_SIZE: usize = FB_INFO_SIZE + FB_WIN_SLOTS * FB_WIN_SLOT_SIZE; // 0x81000
+pub const FB_REGION_SIZE: usize = FB_INFO_SIZE + FB_WIN_SLOTS * FB_WIN_SLOT_SIZE; // 0x145000
 /// WINX-1: byte offset of the info page from the slot's window base.
 pub const FB_INFO_OFF: usize = U3_WINDOW_PAGES * 4096; // 0x4000
 /// WINX-1: byte offset of window surface slot 0 from the slot's window base.
 pub const FB_SURFACE_OFF: usize = FB_INFO_OFF + FB_INFO_SIZE; // 0x5000
 
-/// WINX-1: total per-slot backing — the 16 KiB program window plus the FB hole. Mirrors aarch64's
-/// `USER_STATIC_SIZE` (0x85000). HEADROOM: 12 slots of this is ~6.4 MiB of `.bss` (it was ~4.25 MiB
-/// at 8 slots), the price of a static pool with no user-memory allocator; a real allocator is the
-/// same later arc `USER_SLOTS` is waiting on. The per-slot figure is UNCHANGED by that raise because
-/// `FB_WIN_SLOTS` stayed at 8 — see its doc for why the global window count grew and this did not.
+/// WINX-1: total per-slot backing — the 16 KiB program window plus the FB hole. CRYSTAL-HD: 0x85000
+/// -> 0x149000, and it STILL mirrors aarch64's (`boot::USER_STATIC_SIZE`, raised in the same arc):
+/// the hole carries 4 x 288x288 surface slots (see [`FB_WIN_SLOT_SIZE`]), so 12 slots is ~15.4 MiB of
+/// `.bss` (was ~6.4 MiB). The aarch64 twin's cost is stated at its own constant — 8 slots, `.bss` end
+/// 8.56 -> 16.69 MiB against a heap floor hand-placed at 32 MiB, margin 15.31 MiB.
+/// Still the price of a static pool with no user-memory allocator; a real allocator is the same
+/// later arc `USER_SLOTS` is waiting on. The bootloader sizes the kernel's load span from
+/// `p_memsz`, so `.bss` growth costs boot-time pages, never ESP bytes.
 const USER_STATIC_SIZE: usize = U3_WINDOW_PAGES * 4096 + FB_REGION_SIZE;
-const _: () = assert!(USER_STATIC_SIZE == 0x85000);
+const _: () = assert!(USER_STATIC_SIZE == 0x149000);
 /// The whole region must fit the ONE per-slot PT (512 * 4 KiB = 2 MiB), or the FB leaves would spill
 /// into a page table `build_slot` never wired.
 const _: () = assert!(USER_STATIC_SIZE <= 512 * 4096);
-/// A 128x128 ARGB8888 surface must fit a window's VA slot exactly.
+/// A 288x288 ARGB8888 surface must fit a window's VA slot exactly.
 const _: () = assert!((FB_WIN_MAX_W * FB_WIN_MAX_H * 4) as usize == FB_WIN_SLOT_SIZE);
 
 /// A slot's user backing store: the `U3_WINDOW_PAGES` program frames (code + data + 2 stack) followed
@@ -670,7 +692,8 @@ pub fn slot_fb_win_surface_ptr(s: usize, w: usize) -> *mut u8 {
 
 /// WINX-1: the ring-3 VA of window surface slot `w`. The SAME VA in every process slot; the FRAME differs
 /// per process (its own backing), installed by `map_slot_fb_win`. This is the VA a ring-3 program
-/// computes as `its own window base + 0x5000 + w * 0x10000`.
+/// computes as `its own window base + 0x5000 + w * FB_WIN_SLOT_SIZE` (slot 0 — the only slot any
+/// shipped program uses — is `base + 0x5000` on both arches, the shared-ABI fact).
 pub fn fb_win_surface_va(w: usize) -> u64 {
     debug_assert!(w < FB_WIN_SLOTS);
     super::syscall::USER_BASE + (FB_SURFACE_OFF + w * FB_WIN_SLOT_SIZE) as u64

@@ -8978,3 +8978,108 @@ the recon path cannot reach a write; the file's write path (CMD24/25) is pre-exi
 ORIN-SDMMC-2/INSTALL-1 work, double-gated behind `sdmmc_arm`/`install_target`, absent from the
 recon build — the old "no write command exists in this file" header claim was stale and has been
 corrected in place. Boot 4 either publishes the block backend or names the dying rung.
+
+---
+
+## ONECARD-PI — the Pi is a one-card OS (audit + the two changes it produced)
+
+Peter, 2026-08-13: *"x86 no longer needs the data card so Pi should not either. UnaOS should be
+loading like a normal OS on the one card with a unafs partition and everything."*
+
+The x86 side reached that state by flipping a default (`sdhcblk` on by default, 19a56662) and then
+teaching `program_source` to prefer the boot volume's serial over handle order (591bf6e6), because on
+that machine a USB stick inserted merely to CARRY files could claim the global slot and silently
+become the program source. This arc asked whether the Pi had the same disease. **It did not** — the
+Pi's structure already forbids it — so what this arc landed is one piece of evidence and one cost
+removal, not a port of the x86 fix.
+
+### The audit: where a USB volume could have crept into the Pi's load path, and why it does not
+
+| Path | What it binds | Can USB win? |
+|---|---|---|
+| `block::program_source()` | aarch64 takes the `not(all(x86_64, sdhcblk))` arm — a **one-rung** ladder, the global `BLOCK_DEVICE` | No. `BlockHandle::Usb` is not in the ladder on any arch (`fs/fat.rs` says so verbatim: "`program_source` never returns it") |
+| The global `BLOCK_DEVICE` itself | `register_sd` (from `emmc2::finish`) publishes the card and flips `BACKEND` to `BACKEND_SD`, synchronously on the BSP, long before xHCI enumerates | No. The aarch64 `publish_usb_geometry` claims the global **only while** `BACKEND != BACKEND_SD`; a stick stays reachable under `USB_BLOCK_DEVICE` and nowhere else (PI-FS-2) |
+| `run` / `bg` | `shell::vfs_path` → `vfs_mount_table()` → `MountTable::resolve`'s longest-prefix rule | No. `/fat` binds `BlockSource::Default` (the card); `/usb` is mounted **only if a stick is present**, and a `/usb/...` path with none present fails `-ENODEV` rather than falling through |
+| ELF1 / EXEC1 / K2 | `fs::fat::mount()` = `BlockSource::Default` | No |
+| K3 / K4 | `unafs::locate()` + `block::read_block` / `write_block`, with the sector COUNT taken from `emmc2::card_num_blocks()` rather than the global — deliberately, so a small USB reader cannot bound the span | No |
+| K2-ACL volume binding | `AtrBinding { BS_VolID, count_of_clusters }` from `FatFs::volume_fingerprint()` on a `Default` mount | No |
+| `install::selfguard` boot-device guard | keyed on `BOOT_SERIAL`, which aarch64 publishes as **0** (the Pi does not boot through the UEFI loader) — the guard prints DISARMED | n/a |
+| `wifi::firmware` (the one sanctioned USB-preferring read, via `alternate_program_source`) | x86-gated at every `main.rs` call site | Not on the Pi |
+
+**The `sdw` read-only gate does not apply here.** `sdw` and `sdhcblk` are `target_arch = "x86_64"`
+throughout `drivers/block.rs`, and `arroyo` strips `sdw` from every aarch64 feature list so the media
+hash does not shift. What keeps the Pi honest is a different mechanism with the same shape: USBFALL
+F1's `guard_default_write_backend`, which fails a `Default` write **closed** (`NotReady`, one witness
+line) on a build whose canonical backend is SD but where no SD registered — rather than letting the
+write land on somebody's stick.
+
+The `storm [n] fat` writer still targets USB (`BlockSource::Usb`, raw-scratch fallback). That is
+correct: it is an operator-typed provocation for the USB-storage campaign, it is not on any boot
+path, and with no stick attached it exits immediately with
+`:: STORM: fatw done leg=none — no USB block device enumerated; nothing exercised ::`.
+
+### M1 — `ONECARD`: the boot medium names itself
+
+The audit's finding was that the Pi's one-card property was true but **unwitnessed**. A capture
+proved it only by the ABSENCE of USB lines, which is the same inference `sdhc.md` §12.4 records as
+falsified on the x86 side. `drivers::emmc2::onecard_witness()` (called from the aarch64 bare-metal
+boot sequence immediately after `emmc2::probe()`) prints one line carrying the four fields that make
+the claim falsifiable:
+
+```
+:: ONECARD: boot medium = SD backend, N blocks (M MiB) | p1 program volume FAT32 'UNAOS-PI'
+   vol_id=0x… | p2 native volume base_lba=… blocks=… | usb=absent — no second medium was
+   consulted to reach this point ::
+```
+
+Unconditional, not behind `witness`: "UnaOS boots and runs from a single card" is a property of a
+DEFAULT boot, so a default boot is the capture that must carry the evidence. Reads only — one FAT
+mount and one MBR walk, both of which the boot performs moments later anyway. Deliberately **not**
+shaped like a fixture verdict (no `-> PASS ::` tail) so it stays outside `pi4-regression.spec`'s
+`COUNT 25` fixture census: it describes the medium, it is not a twenty-sixth thing that can pass.
+
+`usb=absent` is scoped honestly — at that point in the boot xHCI has not enumerated, so the field is
+a statement about the boot SEQUENCE (nothing USB was needed to get this far), not a promise that no
+stick will ever appear.
+
+### M2 — the EMPTY-PORTS exit: a one-card boot stops paying for an empty bus
+
+`piusb::enumerate()`'s pump had three exits — storage-ready, keyboard-armed + 6 s settle, and the
+30 s backstop — and *nothing is plugged in* reached only the last of them. A Pi that needs no USB
+medium to boot is exactly the machine that arrives there with every port empty, so the one-card
+layout was, in effect, billed 30 s of boot for re-reading five PORTSC words that had read `CCS=0
+CSC=0` since power-on.
+
+The exit added by this arc is keyed on the SAME evidence `PortscWitness::verdict` already uses for
+its `NO-CCS-EVER` branch (`saw_ccs` / `saw_csc`, accumulated from raw PORTSC reads), so it can claim
+nothing the verdict would not, and it sets no `enum_advanced` — an empty bus is not an advance, and
+the verdict stays free to print `NO-CCS-EVER` after the loop. Three conditions, each a reason:
+
+* `have_baseline` — the start sample landed, so the bitmasks mean something.
+* `poison.is_none()` — a non-decoding BAR reads `0xffffffff` and `sample()` refuses to decode it, so
+  CCS would be unset for a window that is **dark** rather than **empty**. That is the one state in
+  which silence is not evidence, and it keeps the full backstop.
+* `saw_ccs == 0 && saw_csc == 0` at every sample within `PIUSB43_NO_DEVICE_EXIT_S` (8 s, several
+  points at the 2 s cadence — the decision rests on a series, not one read).
+
+Why 8 s is *safe* and not merely short: CCS is an **electrical** property of the port, asserted after
+connect debounce (~100–200 ms once PP is up), not a product of enumeration. A device slow to
+ENUMERATE — a hub, a stick behind a hub, a device needing several address attempts — still asserts
+CCS on the ROOT port it is wired to within that debounce, and this exit reads root ports only. So an
+exit here means nothing is electrically attached to any root port, which no further waiting changes.
+A boot with a keyboard or stick attached never reaches the branch (`saw_ccs` is set at the first
+sample that sees the connect) and pays exactly what it paid before.
+
+The exit prints the window it releases, and `PIUSB43_PUMP_BACKSTOP_S` was named for that reason — a
+literal `30` in two places is how such a report drifts away from the deadline it describes.
+
+### Verification status
+
+`piusb.rs` compiles only under `feature = "piusb"` (`UNAOS_PIUSB=1`), which the default `kernel8`
+image does not carry, so M2 is **byte-identical off the knob** and the `kernel8-test` battery does
+not exercise it. Nor can QEMU: `raspi4b` models no PCIe RC, so `enumerate()` returns at the READY
+gate before the pump. M2 is type-checked on the `arm-pi` cfg leg (which carries `piusb`) and its
+behavioural proof is a **bench item** — a `UNAOS_PIUSB=1` metal boot with nothing in the USB ports
+should print the `EMPTY-PORTS exit at 8s` line and reach the shell ~22 s earlier than before.
+
+M1 is on the default path and is proven in QEMU by the gate below.

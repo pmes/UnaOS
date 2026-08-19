@@ -82,13 +82,38 @@ fn now_secs() -> Option<u64> {
     crate::clock::uptime_secs()
 }
 
-/// The pure wedge decision, factored out of `poll` so it can be reasoned about (and unit-tested)
-/// without touching any global state or clock. Returns `true` iff an app is active and its last
-/// progress heartbeat is at least `timeout` seconds old. `saturating_sub` keeps a backwards clock
-/// step (should never happen on a monotonic counter) from producing a false wedge.
-pub fn wedge_decision(app_active: bool, now: u64, last_progress: u64, timeout: u64) -> bool {
+/// The pure wedge decision, factored out of `poll` so it can be reasoned about without touching any
+/// global state or clock. Returns `true` iff an app is active and its last progress heartbeat is at
+/// least `timeout` seconds old. `saturating_sub` keeps a backwards clock step (should never happen on
+/// a monotonic counter) from producing a false wedge.
+///
+/// DECRUD-2 — `const fn` so the four cases below are checked by const evaluation. See the block.
+pub const fn wedge_decision(app_active: bool, now: u64, last_progress: u64, timeout: u64) -> bool {
     app_active && now.saturating_sub(last_progress) >= timeout
 }
+
+// DECRUD-2 — the four claims that used to live in a `#[cfg(test)] mod tests` at the foot of this file.
+//
+// That module was DEAD CODE by construction, not by neglect: nothing runs `cargo test` on this
+// `no_std` kernel crate — `./arroyo check` is the gate, and `#[cfg(test)]` code is invisible to it, so
+// the four `#[test]` fns had never been compiled, let alone run, on either arch. `drivers/gpu/kepler.rs`
+// removed the identical construct for exactly this reason and recorded the rule at its own file foot;
+// this one survived that sweep.
+//
+// The coverage did not move to nowhere — it moved UP. `wedge_decision` is now a `const fn`, so these
+// are const-evaluated on every `./arroyo check` for BOTH arches and a regression is a BUILD failure
+// rather than a test nobody runs. Same four cases, same values, stated against the same constant.
+const _: () = {
+    // progress 1 s ago, timeout 5 s -> healthy
+    assert!(!wedge_decision(true, 100, 99, WATCHDOG_TIMEOUT_SECS));
+    // exactly at the timeout boundary -> wedged, and past it -> wedged
+    assert!(wedge_decision(true, 105, 100, WATCHDOG_TIMEOUT_SECS));
+    assert!(wedge_decision(true, 200, 100, WATCHDOG_TIMEOUT_SECS));
+    // an inactive screen never wedges, whatever the clock says
+    assert!(!wedge_decision(false, 1_000, 0, WATCHDOG_TIMEOUT_SECS));
+    // now < last (impossible on a monotonic counter) saturates to 0 -> healthy, not a false wedge
+    assert!(!wedge_decision(true, 90, 100, WATCHDOG_TIMEOUT_SECS));
+};
 
 /// Record that a full-screen app has taken the screen. Call this where `SCREEN_APP_ACTIVE` is set
 /// `true` (around `dispatch_command` in `handle_key`). Resets the heartbeat and the wedge latch, then
@@ -159,32 +184,5 @@ pub fn poll() -> bool {
     false
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn live_app_is_not_wedged() {
-        // progress 1s ago, timeout 5s -> healthy
-        assert!(!wedge_decision(true, 100, 99, WATCHDOG_TIMEOUT_SECS));
-    }
-
-    #[test]
-    fn stalled_app_wedges_at_timeout() {
-        // exactly at the timeout boundary -> wedged
-        assert!(wedge_decision(true, 105, 100, WATCHDOG_TIMEOUT_SECS));
-        // past it -> wedged
-        assert!(wedge_decision(true, 200, 100, WATCHDOG_TIMEOUT_SECS));
-    }
-
-    #[test]
-    fn inactive_never_wedges() {
-        assert!(!wedge_decision(false, 1_000, 0, WATCHDOG_TIMEOUT_SECS));
-    }
-
-    #[test]
-    fn backwards_clock_does_not_false_wedge() {
-        // now < last (should be impossible on a monotonic counter) -> saturates to 0, healthy
-        assert!(!wedge_decision(true, 90, 100, WATCHDOG_TIMEOUT_SECS));
-    }
-}
+// DECRUD-2 — the `#[cfg(test)] mod tests` that used to sit here is gone, deliberately, and its four
+// claims now ride the `const _: () = { … }` block beside `wedge_decision`. See the note there.

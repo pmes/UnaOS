@@ -110,14 +110,21 @@ pub const BORDER: usize = super::theme::FRAME;
 ///
 /// This retires `FONT_CELL`/`TITLE_SCALE`: the kit's `metrics.text_px = 15` used to be honoured
 /// by the nearest INTEGER replication of an 8-px 1-bit cell (16 px drawn for 15 asked — the
-/// "needs a rasterizer" note that lived here). The kernel now has pre-rasterized 16 px
-/// anti-aliased glyphs, so the cell is the FACE's, width and height separately, and the square
-/// `TITLE_CELL` is split into the two metrics it was conflating.
-pub const TITLE_CELL_W: usize = super::font::CELL_W;
+/// "needs a rasterizer" note that lived here). The kernel now has pre-rasterized anti-aliased
+/// glyphs, so the cell is the FACE's, width and height separately, and the square `TITLE_CELL` is
+/// split into the two metrics it was conflating.
+///
+/// FONT-METRIC (Peter, bench PA43, 1920x1200: *"window title font size is small for the size of
+/// the title and menu bars"*) — this is the CHROME face, not the body face. The chrome raster is
+/// [`font::chrome_raster`] of [`TITLE_H`], i.e. it is a FUNCTION of the strip these glyphs sit in
+/// rather than a size anybody wrote down; raising the bar raises the caption with it. This one
+/// constant is the whole propagation: `menubar`, `crystal` and `dock` all define their own
+/// `CELL_W`/`CELL_H` as this, and their layout constants are expressions over those.
+pub const TITLE_CELL_W: usize = super::font::CHROME_CELL_W;
 
-/// FONT (GR27) — the caption glyph cell's HEIGHT, in panel pixels: [`font::CELL_H`] (16 — the
-/// same drawn height `TITLE_SCALE = 2` produced, so every vertical centring lands where it did).
-pub const TITLE_CELL_H: usize = super::font::CELL_H;
+/// FONT (GR27) — the caption glyph cell's HEIGHT, in panel pixels: [`font::CHROME_CELL_H`].
+/// FONT-METRIC: derived from [`TITLE_H`], see [`TITLE_CELL_W`].
+pub const TITLE_CELL_H: usize = super::font::CHROME_CELL_H;
 // REVIEW (GR27 fonts): back the draw_title comment's "cell shorter than the strip" claim on every
 // arch (menubar's CELL_H<=BAR_H assert is x86+wc-only). draw_title clamps anyway, but assert it.
 const _: () = assert!(TITLE_CELL_H <= TITLE_H, "title glyph cell must fit the caption strip");
@@ -158,9 +165,9 @@ const CTRL_RESERVE: usize = 3 * super::theme::CONTROL_BOX + 4 * GAP;
 ///
 /// [`controls`] declines a box narrower than `2*BORDER + GAP + CTRL_RESERVE + TITLE_CELL_W`, and a
 /// window's box is `w * scale + 2 * BORDER`, so the `2*BORDER` cancels and the condition on the
-/// source width alone is `w >= GAP + CTRL_RESERVE + TITLE_CELL_W` — **139 px** at the current
-/// metrics (`12 + 120 + 7`; it was 148 when the glyph advance was the square 16 px bitmap cell),
-/// 112 before the size ruling.
+/// source width alone is `w >= GAP + CTRL_RESERVE + TITLE_CELL_W` — **141 px** at the current
+/// metrics (`12 + 120 + 9`; 139 when the chrome face was the body face's 16 px raster, 148 when the
+/// glyph advance was the square 16 px bitmap cell), 112 before the size ruling.
 ///
 /// This exists because that threshold has now moved TWICE and both times a fixture surface was left
 /// behind it, turning a close-control gate into a silent SKIP (CRISPYWIRE sized one from 8 to 32,
@@ -201,14 +208,14 @@ pub struct WindowInfo {
 
 /// One row of the window table. `None`-ness is carried by `used` so the table stays a plain array.
 #[derive(Clone, Copy)]
-struct Window {
-    used: bool,
-    id: WinId,
-    owner_asid: u64,
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
+pub(super) struct Window {
+    pub(super) used: bool,
+    pub(super) id: WinId,
+    pub(super) owner_asid: u64,
+    pub(super) x: usize,
+    pub(super) y: usize,
+    pub(super) w: usize,
+    pub(super) h: usize,
     stride: usize,
     /// kernel-visible address of the owner's ARGB8888 surface. Held as a `usize` so the table is `Send`.
     surf: usize,
@@ -218,7 +225,7 @@ struct Window {
     /// read ~400 MB of kernel memory and paint kernel bytes onto the panel (`put_pixel` clips WRITES,
     /// never the source READ).
     surf_len: usize,
-    scale: usize,
+    pub(super) scale: usize,
     z: u32,
     damaged: bool,
     /// FBCON-DMG — the SOURCE-ROW band `[dmg_y0, dmg_y1)` of this window's surface that is known
@@ -238,7 +245,7 @@ struct Window {
     /// Compat shim marker: window created implicitly by [`super::screen::present_surface`]. Such a
     /// window is centered with the legacy scale rule and gets NO chrome, so the pre-WC UVUG present
     /// stays byte-for-byte identical on the panel.
-    compat: bool,
+    pub(super) compat: bool,
     /// Set by [`move_to`]: the caller placed this window explicitly, so the automatic tiling in
     /// [`place`] leaves it where it is.
     pinned: bool,
@@ -1898,7 +1905,16 @@ fn move_to_inner(id: WinId, expect_owner: Option<u64>, x: usize, y: usize) -> Mo
         // paint needs. The barrier stays, with the argument restated rather than inherited — a phase
         // barrier whose justification has quietly stopped matching the code is worse than no barrier,
         // because the next reader will trust it.
-        let barrier = DrainBarrier::drain();
+        //
+        // DRAGWEDGE — and the bound this raise waits against is the INTERACTIVE one. This is the
+        // barrier the hand drives: it is raised once per admitted drag motion, on the task that also
+        // consumes the input channel, and PA41 measured what the teardown bound costs there — several
+        // seconds per report, re-entered on the next one, with the button-up that would have ended
+        // the gesture queued behind the very spin it was waiting to stop. What the barrier BUYS is
+        // unchanged and is bought in full whenever the compositor is healthy; what changed is how
+        // long it is willing to wait for a compositor that is not, and the abandon arm below already
+        // priced that trade. See the DRAGWEDGE ledger above `DRAIN_MOVE_SPINS`.
+        let barrier = DrainBarrier::drain_bounded(DRAIN_MOVE_SPINS, true);
         // DRAGFLICK — **ERASE THE VACATED BOX MINUS THE BOX THE WINDOW NOW OCCUPIES.**
         //
         // ### The defect this closes (Peter, Boot AR, attended: "window drag still flickering a lot")
@@ -1984,7 +2000,52 @@ fn move_to_inner(id: WinId, expect_owner: Option<u64>, x: usize, y: usize) -> Mo
         // after a `move_to` returns. The one case that changes is an x86 composite that DECLINES on
         // `COMP_GATE` — the box then rides the holder's re-run or the next pass, one frame later,
         // which is WC-L's documented cost arriving on a path that previously did not pay it.
-        super::screen::request_full_present();
+        //
+        // DRAG-PI M1 — **THE OLD BOX AND THE NEW ONE, NOT THE PANEL.**
+        //
+        // This line was `request_full_present()`, and it was the single largest cost on the move
+        // path. That call damages the WHOLE desktop back buffer (`screen::mark_full` sets the damage
+        // set to `{0, 0, width, height}`), so every reposition republished 1920x1200x4 = 9 216 000
+        // bytes at the bench geometry. Measured against the PA38 capture's steady rollup
+        // (`[comp2] … blit_us=2223 bytes_pp=1082253`), that is an 8.5x multiple of a pass that was
+        // already the dominant cost of a drag step — which is the arithmetic that convicted this line.
+        //
+        // The narrowing is EXTENT arithmetic and nothing else, and it is exact rather than a
+        // heuristic: **a move changes desktop pixels only inside (old box ∪ new box).** Outside that
+        // union no pixel of the panel is touched by this function — the row's origin is the only
+        // mutation, `erase` defers fills strictly inside `old - new`, and `damage_intersecting`
+        // reaches only rows overlapping the old box. So a present covering both boxes discharges
+        // exactly the duty the whole-panel one discharged, over the only pixels that could have
+        // changed. `DamageSet::add` merges the two into one rect whenever they overlap, which for a
+        // drag step (a few pixels of travel against a box hundreds of pixels wide) is essentially
+        // always — so the common case is ONE rect a little larger than the window.
+        //
+        // **This is taken for EVERY move, not only for drags, and deliberately.** The argument above
+        // is about the extent a move can change and says nothing about who asked for it, so it holds
+        // verbatim for `SYS_WIN_MOVE` — an EL0 app repositioning its own window pays the same 8.5x
+        // for the same reason and is owed the same cure. A drag-only branch would have meant two
+        // disciplines for one invariant, and the second one would be the untested one.
+        //
+        // Overflow is handled at the callee: more owed boxes than the queue holds escalates to the
+        // whole panel, i.e. to exactly the behaviour this replaces. No rect is ever dropped, so the
+        // narrowing cannot introduce a ghost — the failure mode is a slower present, not a wrong one.
+        super::screen::request_present_rect(b.0, b.1, b.2, b.3);
+        super::screen::request_present_rect(after.0, after.1, after.2, after.3);
+        // DRAG-PI M4 — charge THIS path's desktop request, scoped to this call site and no other.
+        // A census taken inside `screen` would count every full present the system makes for its own
+        // reasons (`focus_changed`, the WC-J drain, minimise, zoom) and the move path's share would be
+        // buried in it — the first cut did exactly that and read a ratio that was mostly other
+        // subsystems' traffic. What the arc changed is what a MOVE asks for, so that is what is counted.
+        #[cfg(feature = "witness")]
+        {
+            use core::sync::atomic::Ordering::Relaxed;
+            MOVE_PRESENT_N.fetch_add(1, Relaxed);
+            MOVE_PRESENT_PX.fetch_add(
+                (b.2 as u64).saturating_mul(b.3 as u64)
+                    + (after.2 as u64).saturating_mul(after.3 as u64),
+                Relaxed,
+            );
+        }
         // Re-open before recompositing — a composite under a raised barrier is a no-op.
         drop(barrier);
         // CURSOR-14's bracket-closer is GONE, and its absence is the point rather than an omission.
@@ -2984,25 +3045,35 @@ pub fn occluders(out: &mut [(usize, usize, usize, usize); MAX_WINDOWS]) -> usize
 /// the console's own read-back charged `win=1` for 256 410 pixels `STAT` owns and reported `-> FAIL`
 /// (`[wc-d]`) / `-> BLIT` (`[wc-g]`). This snapshot subtracts those pixels.
 ///
-/// **x86 only, and the arch gate is a wire boundary, not a scoping convenience.** `wm.rs`/`wcg.rs`
-/// and the tiler are SHARED with aarch64, and `scripts/specs/pi4-regression.spec` reads the
-/// `[wc-d]`/`[wc-g]` line format. The `occluded=`/`occ=` fields and the counting behind them are
-/// therefore gated to x86 so the aarch64 wire stays byte-identical — the same protection-boundary
-/// argument WCD-TEARDOWN's interlock made (`wm.rs:3580`). The false FAIL is identical on aarch64
-/// (same `wm.rs`, same tiler, same routed console); fixing it there moves another track's gate
-/// wire and is the integrator's call.
+/// **PARITY §6.2 / OCC62 M1 — the arch gate is GONE, and it had to go in the same commit that
+/// populated [`occ_clip`] on aarch64.** The gate was a WIRE boundary: `wm.rs`/`wcg.rs` and the tiler
+/// are shared, `scripts/specs/pi4-regression.spec` reads the `[wc-d]`/`[wc-g]` line format, and while
+/// aarch64's clip was structurally `OccClip::none` there was nothing for an excuse to excuse — so
+/// keeping the fields off that wire cost nothing and kept it byte-identical.
+///
+/// That premise is now false. `occ_clip`'s WINDOW half-space runs on aarch64, so the aarch64 blit
+/// WITHHOLDS pixels a higher window owns, and a read-back with no excuse would read the panel's older
+/// contents inside a verified rect and print `-> FAIL`. The ledger on [`OccSnap::absorb`] states the
+/// rule the other way round — *the excuse must never be narrower than the clip* — and honouring it
+/// means the excuse machinery travels WITH the clip, never behind it. It does here.
+///
+/// The price, paid deliberately: `occluded=`/`occ=` now print on the aarch64 `[wc-d]`/`[wc-g]` lines,
+/// so that wire is no longer byte-identical to its pre-§6.2 self. Both spec patterns are `.*`-tolerant
+/// insertions in a window that already carries `coverage=`, and the terminals are untouched. This is
+/// the same movement DRAG-PI's precedent set: an unconditional behaviour change on aarch64 legitimately
+/// moves knob-off bytes.
 ///
 /// A snapshot, never a handle — read under the table lock and copied out, exactly as [`occluders`]
 /// is, so a window that moves or closes immediately afterwards is repaired by the mover's own
 /// composite and never by us.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 #[derive(Clone, Copy)]
 pub struct OccSnap {
     boxes: [(usize, usize, usize, usize); MAX_WINDOWS],
     n: usize,
 }
 
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 impl OccSnap {
     /// The empty snapshot — no window above the one under check.
     pub const fn none() -> Self {
@@ -3068,7 +3139,7 @@ impl OccSnap {
 /// chargeable. Compat rows are excluded for the reason [`occluders`] gives — a compat row IS the
 /// full-screen present path, and while it owns the panel the render task is parked and not
 /// verifying anyway.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 fn occluders_above(z: u32, id: u32) -> OccSnap {
     let t = table();
     let mut snap = OccSnap::none();
@@ -3095,7 +3166,7 @@ fn occluders_above(z: u32, id: u32) -> OccSnap {
 /// WC-D's pre-blit and read-back snapshots) cannot drift apart — a widened excuse at one of them and
 /// a bare `occluders_above` at another is the same manufactured `FAIL`, just harder to find. See
 /// [`OccSnap::absorb`].
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 fn occ_excuse(z: u32, id: u32, clip: &OccClip) -> OccSnap {
     let mut s = occluders_above(z, id);
     s.absorb(clip);
@@ -3595,6 +3666,210 @@ pub fn count() -> usize {
 /// [`composite_once`] is the pass this function used to be. Everything about it is unchanged; what is
 /// new is that on x86 it now runs under a non-blocking gate, so two cores can never interleave their
 /// back-to-front blits on the same glass.
+/// M3 shrink 2 — THE OWED-TAIL SPLIT, RE-LANDED ON THE TRUNK COMPOSITOR (aarch64 only).
+///
+/// The pi4 track's original split (`51b3c77c`) divided the composite into a masked half that
+/// STASHES its cursor-tail verdict and an unmasked epilogue that CASHES it. The resync merge took
+/// the trunk file wholesale and left this entry point as a no-op shim; this is the re-land.
+///
+/// What is split, and where. [`composite_once`] is now two halves: [`composite_pass_half`] (the
+/// drain, the cursor bracket, the window loop, the strip, the CURSOR-7 upgrade and the
+/// `note_cursor_tail` witness) and [`cash_tail`] (the sprite tail proper, the COMPOSITE-2 ledger
+/// and the `controls_declined_drain` emission). On aarch64 the pass half stashes its verdict into
+/// [`OWED_TAIL`] and returns; this function — called from `sys_fb_present` / `sys_win_present`
+/// AFTER their `IrqGuard` has dropped — cashes it. The sprite work and the polled-UART decline
+/// drain therefore run OUTSIDE the mask, which is the whole latency win: on a present the masked
+/// span shrinks by exactly the tail.
+///
+/// **AARCH64 ONLY, and deliberately.** On x86 the pass runs under WCSER's `COMP_GATE` with a
+/// re-run loop that calls `composite_once` repeatedly; each of those rounds is a FULL pass, cursor
+/// tail included, and the loop's correctness argument depends on that. So on x86 (and on any arch
+/// that is not aarch64) `composite_once` still calls `cash_tail` inline, nothing is ever stashed,
+/// `OWED_TAIL` does not exist, and this function is compiled away to the same no-op the shim was.
+///
+/// **NOTHING IS LOST, AND NOTHING IS DEFERRED TWICE.** The pass half cashes a STALE owed tail
+/// FIRST (masked — pathological only: a present whose caller never reached the epilogue, or one of
+/// this module's own non-syscall composites). That bounds a tail's deferral at exactly one pass,
+/// which is `OVERLAY_CLOSE_OWED`'s shape. A cash is idempotent-by-swap: [`OWED_TAIL`] is taken
+/// with a `swap(0)`, so two racing cashers cannot both run the same tail.
+///
+/// Encoding: `0` = nothing owed; otherwise `tail(1..=4) | dirty << 8`. All FOUR [`CursorTail`]
+/// arms encode (`Adopt`/`Settle`/`Repaint`/`Untouched`) — there is no arm that falls back to an
+/// inline cash, so the split covers the whole verdict space rather than a subset of it.
+/// ENGAGE (this arc) — **THE SPLIT WAS INERT, AND THIS IS WHERE.** As landed, this function's FIRST
+/// statement was `OWED_ARM.store(false)`, and [`composite_once`] opened by calling it. So on every
+/// present the order was: `present_surface_common` ARMS → the pass's `composite_once` immediately
+/// DISARMS (as a side effect of its stale cash) → the stash test at the bottom of that same pass
+/// read `false` → `cash_tail` ran inline, masked. `OWED_TAIL` was never once non-zero and the
+/// epilogue below always found `code == 0`. The masked-latency win the split exists for was never
+/// taken, and no witness could see that because nothing was stranded either.
+///
+/// The defect was an ORDERING one, not a logic one: the stale cash and the arm test are two
+/// different questions about two different passes, and the disarm belonged to neither the top of
+/// `composite_once` nor to the stale cash. It belongs HERE (the epilogue spends the arm its own
+/// present made) and to the pass's one-shot capture (`OWED_ARM.swap(false)` in `composite_once`).
+/// The stale cash — now [`cash_owed_stash`], called without touching the arm — CONSUMES ONLY THE
+/// PAST: at the top of a pass `OWED_TAIL` can hold nothing but a previous pass's stash, because
+/// this pass has not reached its own stash site yet.
+#[cfg(target_arch = "aarch64")]
+pub fn composite_tail_owed() {
+    // THE EPILOGUE OWNS THE DISARM, and it is unconditional. This present is finished; whatever it
+    // armed is spent by now, so any composite that runs before the next `composite_arm_owed` cashes
+    // inline, which is trunk timing. `composite_once` will normally have taken the arm already (with
+    // a swap, for this pass); this store is what covers the present that armed and then never
+    // reached a pass at all — without it that arm would leak onto the next unrelated composite,
+    // which is the service-lane stash that measured the 9.2 s withhold.
+    OWED_ARM.store(false, core::sync::atomic::Ordering::Relaxed);
+    let cashed = cash_owed_stash();
+    #[cfg(feature = "witness")]
+    if cashed {
+        OWED_CASH_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "witness"))]
+    let _ = cashed;
+}
+
+/// ENGAGE — take the stash if there is one and cash it; answer whether there was one.
+///
+/// The whole of the decode, shared by the two casher roles so they cannot drift: the EPILOGUE
+/// ([`composite_tail_owed`], unmasked, cashing the present's own pass) and the STALE cash (the top
+/// of [`composite_once`], masked, cashing a leftover). **It deliberately does not touch
+/// [`OWED_ARM`]** — that is exactly the clobber that made the split inert. The `swap(0)` is what
+/// makes a cash idempotent: two racing casher roles cannot both run the same tail.
+#[cfg(target_arch = "aarch64")]
+fn cash_owed_stash() -> bool {
+    let code = OWED_TAIL.swap(0, core::sync::atomic::Ordering::AcqRel);
+    if code == 0 {
+        return false;
+    }
+    let dirty = code & 0x100 != 0;
+    let tail = match code & 0xff {
+        1 => CursorTail::Adopt,
+        2 => CursorTail::Settle,
+        3 => CursorTail::Repaint,
+        _ => CursorTail::Untouched,
+    };
+    cash_tail(Owed {
+        tail,
+        dirty,
+        // COMPOSITE-2 — the marks come from the stash, so `pass_us` spans the deferral gap: the
+        // stashed `t0` is the pass's own start, and the `end` read inside `cash_tail` is taken
+        // here, after the gap. See [`composite_pass_half`].
+        #[cfg(feature = "witness")]
+        c2_t0: OWED_C2_T0.load(core::sync::atomic::Ordering::Relaxed),
+        #[cfg(feature = "witness")]
+        c2_t1: OWED_C2_T1.load(core::sync::atomic::Ordering::Relaxed),
+    });
+    true
+}
+
+/// M3 shrink 2 — the non-aarch64 entry point. See the aarch64 form above for the mechanism: on
+/// this arch `composite_once` cashes its tail inline, so nothing is ever owed and this is a no-op.
+/// It exists so the shared syscall surface keeps one name.
+#[cfg(not(target_arch = "aarch64"))]
+pub fn composite_tail_owed() {}
+
+/// M3 shrink 2 — ARM THE DEFERRAL, for exactly the callers an epilogue is coming for.
+///
+/// **This is the one deliberate departure from the original split (`51b3c77c`)**, and it was
+/// measured rather than argued. The original stashed EVERY aarch64 pass and cashed only from the
+/// two present epilogues. On this tree the composite population is not just the presents — the
+/// service lane, `erase`, `move_to`, teardowns and IRQ-context damage service all composite too,
+/// and none of them has an epilogue. Their tails then sat stashed until the next pass's stale
+/// cash, which on an idle desktop is seconds away: the first re-land measured `[comp2]
+/// max_us=9255978` (9.2 s) and a mean `pass_us` of 17427 against 2518 before the split. That is
+/// not a wide reading, it is the arrow's `ensure_drawn`/`repaint` withheld for that long.
+///
+/// So the deferral is armed, by `present_surface_common`, on entry to the ONE body both
+/// `SYS_FB_PRESENT` and `SYS_WIN_PRESENT` run — the two paths that composite IRQ-masked and then
+/// call [`composite_tail_owed`] a few instructions later with IRQs restored. Every other caller
+/// finds the flag clear and cashes inline, which is trunk behaviour exactly. The arm cannot be
+/// stranded: at both call sites nothing between `present_surface_common` and the epilogue can
+/// return early, and the epilogue clears it unconditionally.
+///
+/// One relaxed store on the present path. Cross-core skew is harmless in both directions — a
+/// stashed tail is cashed by whichever epilogue arrives (the stash was always global), and a tail
+/// cashed inline is simply the trunk's timing.
+#[cfg(target_arch = "aarch64")]
+pub fn composite_arm_owed() {
+    OWED_ARM.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// M3 shrink 2 — see the aarch64 form. Nothing defers on this arch, so arming is a no-op.
+#[cfg(not(target_arch = "aarch64"))]
+pub fn composite_arm_owed() {}
+
+/// M3 shrink 2 — is a cash coming? Set by [`composite_arm_owed`] on the present path, cleared by
+/// [`composite_tail_owed`]. A hint that selects the deferral, never part of the tail's verdict.
+#[cfg(target_arch = "aarch64")]
+static OWED_ARM: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// M3 shrink 2 — the stash. `0` = nothing owed; else `tail(1..=4) | dirty << 8`. Written with
+/// `Release` by the masked pass half and taken with an `AcqRel` swap by the casher, so the tail's
+/// verdict is published behind the pass's own writes and taken exactly once.
+#[cfg(target_arch = "aarch64")]
+static OWED_TAIL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// M3 shrink 2 — the stashed COMPOSITE-2 marks. `Relaxed`: they are witness arithmetic, ordered by
+/// [`OWED_TAIL`]'s release/acquire pair, and a torn reading of a cycle counter is a wrong number in
+/// a diagnostic, never a wrong composite.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static OWED_C2_T0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static OWED_C2_T1: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// ENGAGE — THE ENGAGEMENT CENSUS, cumulative since boot, printed by [`owedtail_emit`] as
+/// `[wc-tail]`. It exists because the split's failure mode is SILENT: an inert split composites
+/// correctly, every pixel lands, every witness reads clean, and the only symptom is a latency win
+/// that is not being taken. `stash`/`cash` are the falsifier — before this arc they were provably
+/// `0`/`0` on every boot, and a boot with presents must now show both non-zero.
+///
+/// `stash` — passes that deferred their tail (armed presents). `cash` — epilogue cashes, the
+/// unmasked ones, which is the win. `stale` — leftovers consumed masked at the top of a later pass
+/// (the pathological path; a small number is fine, a number tracking `stash` means epilogues are
+/// not arriving). `inline` — passes that cashed in the mask because no epilogue was coming, i.e.
+/// the service lane, `erase`, `move_to` and the teardowns, on trunk timing exactly as intended.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static OWED_STASH_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static OWED_CASH_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static OWED_STALE_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+static OWED_INLINE_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// ENGAGE — the census line, on the `[wcn]`/`[comp2]` rollup cadence and beside them deliberately:
+/// the engagement claim and the latency claim are read together or not at all. The counters are
+/// CUMULATIVE (loaded, never drained), so the last `[wc-tail]` in a capture is the whole boot's
+/// census and a single line answers the arc's question.
+///
+/// The verdict is not a gate directive, it is a reading: `ENGAGED` = the split is doing its job;
+/// `INERT` = nothing was ever stashed (the state this arc found); `STRANDED` = tails are being
+/// stashed but no epilogue is cashing them, which would be the 9.2 s withhold returning by another
+/// route and is the shape to watch for.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+fn owedtail_emit() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let stash = OWED_STASH_N.load(Relaxed);
+    let cash = OWED_CASH_N.load(Relaxed);
+    let stale = OWED_STALE_N.load(Relaxed);
+    let inline = OWED_INLINE_N.load(Relaxed);
+    let verdict = if stash == 0 {
+        "INERT"
+    } else if cash == 0 {
+        "STRANDED"
+    } else {
+        "ENGAGED"
+    };
+    serial_println!(
+        "[wc-tail] census stash={} cash={} stale={} inline={} -> {}",
+        stash,
+        cash,
+        stale,
+        inline,
+        verdict
+    );
+}
+
 pub fn composite() {
     #[cfg(not(target_arch = "x86_64"))]
     composite_once();
@@ -3783,6 +4058,28 @@ fn deferred_owed() -> bool {
     DEFER_N.load(core::sync::atomic::Ordering::Relaxed) != 0
 }
 
+/// M3 shrink 2 — what the pass half owes the sprite, carried from [`composite_pass_half`] to
+/// [`cash_tail`] either directly (x86, inline) or through [`OWED_TAIL`] (aarch64, deferred).
+#[derive(Clone, Copy)]
+struct Owed {
+    tail: CursorTail,
+    /// CURSOR-7's `PRESENT_DIRTY`, consumed by the pass half and therefore its property to carry.
+    dirty: bool,
+    #[cfg(feature = "witness")]
+    c2_t0: u64,
+    #[cfg(feature = "witness")]
+    c2_t1: u64,
+}
+
+/// One composite pass. M3 shrink 2 split its body in two — see [`composite_tail_owed`] for the
+/// mechanism and the aarch64-only argument.
+///
+/// **THE X86 PATH IS UNCHANGED, BY CONSTRUCTION.** On any arch that is not aarch64 this function is
+/// `composite_pass_half()` immediately followed by `cash_tail(..)`, which is the trunk body with a
+/// function boundary drawn through the middle of it and nothing else: same statements, same order,
+/// same values. No stash exists to be read or written, and `composite_tail_owed` is a no-op there.
+/// That is what lets WCSER's re-run loop keep calling this in a loop: every round is still a full
+/// pass with its own inline cursor tail, exactly as the loop's correctness argument requires.
 /// MENU-DRIVE / REVIEW — is the SHARD dropdown owed a paint or an erase? The THIRD term in the "is
 /// anything OWED" tests, beside [`any_damaged`] and [`deferred_owed`]. The open menu is neither a
 /// dirty window nor a queued erase box, so without this term the gate holder's re-run loop would
@@ -3803,9 +4100,75 @@ fn menu_paint_owed() -> bool {
 }
 
 fn composite_once() {
+    // ENGAGE — TAKE THE ARM ONCE, FOR THIS PASS, AND BEFORE ANYTHING ELSE CAN SPEND IT.
+    //
+    // This is the fix. `present_surface_common` armed a few instructions ago and its epilogue is a
+    // few instructions away; that arming is a fact about THIS pass and nothing between here and the
+    // stash test below may consume it. The old code reached the stash test through
+    // `composite_tail_owed`, whose disarm cleared the arming its own caller had just made — so the
+    // test always read `false` and the split never fired. A `swap` reads the decision and spends it
+    // in one operation: a second pass reaching here before the epilogue finds `false` and cashes
+    // inline, so one arming can never authorise two stashes.
+    #[cfg(target_arch = "aarch64")]
+    let armed = OWED_ARM.swap(false, core::sync::atomic::Ordering::Relaxed);
+    // The STALE cash, masked and first — and it NO LONGER TOUCHES THE ARM. It consumes only the
+    // PAST: at this point in a pass `OWED_TAIL` can hold nothing but a PREVIOUS pass's stash, since
+    // this pass has not reached its own stash site. Pathological only — a present whose caller
+    // never reached its unmasked epilogue. Running it here bounds a tail's deferral at one pass;
+    // the swap inside makes a double cash impossible.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let cashed = cash_owed_stash();
+        #[cfg(feature = "witness")]
+        if cashed {
+            OWED_STALE_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "witness"))]
+        let _ = cashed;
+    }
+    let owed = composite_pass_half();
+    // x86 (and anything not aarch64): cash inline, in the pass, as the trunk always has.
+    #[cfg(not(target_arch = "aarch64"))]
+    cash_tail(owed);
+    // aarch64: stash and leave — but ONLY when a cash is actually coming, i.e. this pass is a
+    // present's, whose epilogue calls `composite_tail_owed` a few instructions from now with IRQs
+    // restored. Any other caller cashes inline, exactly as the trunk does. See
+    // [`composite_arm_owed`] for the measurement that made this test necessary.
+    #[cfg(target_arch = "aarch64")]
+    if !armed {
+        #[cfg(feature = "witness")]
+        OWED_INLINE_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        cash_tail(owed);
+    } else {
+        #[cfg(feature = "witness")]
+        {
+            use core::sync::atomic::Ordering::Relaxed;
+            OWED_C2_T0.store(owed.c2_t0, Relaxed);
+            OWED_C2_T1.store(owed.c2_t1, Relaxed);
+        }
+        let code: u32 = match owed.tail {
+            CursorTail::Adopt => 1,
+            CursorTail::Settle => 2,
+            CursorTail::Repaint => 3,
+            CursorTail::Untouched => 4,
+        } | if owed.dirty { 0x100 } else { 0 };
+        OWED_TAIL.store(code, core::sync::atomic::Ordering::Release);
+        #[cfg(feature = "witness")]
+        OWED_STASH_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// M3 shrink 2 — the masked half of the pass: everything up to and including the tail VERDICT, and
+/// nothing that acts on it. On aarch64 this is all that runs inside the present's IRQ mask.
+fn composite_pass_half() -> Owed {
     // COMPOSITE-2 — the whole-pass clock. Starts before the inner pass (which self-reports its
     // sprite/wait/loop terms) and stops after the tail, so `pass_us` bounds everything a present
     // pays for its composite, including the tail's sprite work.
+    //
+    // M3 shrink 2 — and it keeps that meaning across the split: on aarch64 the mark below is
+    // STASHED with the verdict, so the stashed `t0` makes `pass_us` span the deferral gap too. The
+    // reading is still "what a present paid for its composite", now including the wait for its own
+    // epilogue; what shrank is the MASKED span, which `pass_us` was never the measure of.
     //
     // FBCON-DMG — a PASS clock takes no band, and not because one was unavailable to it. A pass
     // composites every dirty window plus everything the occlusion closure dragged in, each with its
@@ -3826,30 +4189,51 @@ fn composite_once() {
     // call is one bounded table scan and an integer compare — charged to `pass_us` below, which is
     // where a cost the composite pays belongs.
     //
-    // A repaint takes the sprite down itself and answers `true`; upgrading the tail to `Repaint` is
-    // what puts it back, and is the same upgrade `take_present_dirty` performs immediately below.
-    // `Adopt` and `Settle` are NOT downgraded — each is the sole closer of a session state whose loss
-    // would strand the overlay mechanism, and each already repaints the sprite from the finished
-    // front, which is over the strip this call just painted.
+    // A repaint takes the sprite DOWN itself (`strip::paint`/`strip::erase_rect` bracket with `cursor::undraw`) and answers `true` — this
+    // pass's obligation to put it back. CURSOR-VANISH (PA38): that obligation now rides CURSOR-7's `dirty`, not a tail upgrade — see there.
     //
-    // STRIPFACTOR — one call for EVERY furniture strip, not one per tenant. `strip::compose_all`
-    // runs each registered tenant in registry order and ORs the results, so a second strip is a
-    // registry entry rather than a second line here, and neither can short-circuit the other's
-    // damage test. A disabled tenant returns on one relaxed load.
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-    if super::strip::compose_all() && tail == CursorTail::Untouched {
-        tail = CursorTail::Repaint;
-    }
+    // STRIPFACTOR — one call for EVERY furniture strip, not one per tenant; `strip::compose_all` runs each registered
+    // tenant in registry order and ORs the results, so a second strip is a registry entry rather than a second line here
+    // and neither can short-circuit the other's damage test (a disabled tenant returns on one relaxed load). PI-DESK — the
+    // aarch64 half of the gate below is the WHOLE of M2: same seam, same position, same duty, same layering.
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+    let strip_painted = super::strip::compose_all();
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))))]
+    let strip_painted = false;
     #[cfg(feature = "witness")]
     let c2_t1 = crate::arch::now_cycles();
     // CURSOR-7 — read BEFORE the tail runs, so a repaint the tail is already going to do is not
     // duplicated, and a pass that would otherwise have done nothing at all is upgraded.
-    let dirty = super::cursor::take_present_dirty();
+    // CURSOR-VANISH (PA38) — `| strip_painted` is a FIX. `dirty` is the ONE duty ALL FOUR arms honour (`Untouched` upgraded below; `Repaint`
+    // already repaints; `Adopt`/`Settle` APPEND one) and it rides the owed-tail stash's bit 8 free. The old `&& tail == Untouched` upgrade
+    // DROPPED the strip's `true` on the other two arms, and neither redraws an UNDRAWN sprite. See engine.md §CURSOR-VANISH for the proof.
+    let dirty = super::cursor::take_present_dirty() | strip_painted;
     if dirty && tail == CursorTail::Untouched {
         tail = CursorTail::Repaint;
     }
     #[cfg(feature = "witness")]
     note_cursor_tail(tail);
+    // M3 shrink 2 — the verdict, and the end of the masked half. `note_cursor_tail` stays HERE and
+    // not in the cash: it is the census of what passes decided, and a deferred tail is still this
+    // pass's decision. Counting it at cash time would move a pass's line into whichever present
+    // happened to cash it.
+    Owed {
+        tail,
+        dirty,
+        #[cfg(feature = "witness")]
+        c2_t0,
+        #[cfg(feature = "witness")]
+        c2_t1,
+    }
+}
+
+/// M3 shrink 2 — the cashing half: the sprite tail, the COMPOSITE-2 ledger and the CTRLWIT drain.
+/// Runs inline on x86 (from [`composite_once`]) and unmasked on aarch64 (from
+/// [`composite_tail_owed`], in the syscall epilogue). Nothing here takes `TABLE`, and the tail's
+/// own sprite work has always run outside the `BlitGuard` window — which is why it can be deferred
+/// out of the mask at all.
+fn cash_tail(owed: Owed) {
+    let Owed { tail, dirty, .. } = owed;
     match tail {
         CursorTail::Adopt => {
             // `adopt_overlay` is the ONLY closer of the overlay session, so `Adopt` is never
@@ -3874,10 +4258,13 @@ fn composite_once() {
         CursorTail::Untouched => super::cursor::ensure_drawn(),
     }
     // COMPOSITE-2 — close the ledger: the tail interval is sprite work, the whole interval is the
-    // pass. One `now_cycles` read serves both accounts.
+    // pass. One `now_cycles` read serves both accounts. M3 shrink 2 — the two marks come from the
+    // `Owed` the pass half handed over (directly on x86, through the stash on aarch64), so on a
+    // deferred tail both intervals span the unmasked gap as well.
     #[cfg(feature = "witness")]
     {
         use core::sync::atomic::Ordering::Relaxed;
+        let (c2_t0, c2_t1) = (owed.c2_t0, owed.c2_t1);
         let end = crate::arch::now_cycles();
         let pass = end.saturating_sub(c2_t0);
         C2_SPRITE_CYC.fetch_add(end.saturating_sub(c2_t1), Relaxed);
@@ -4045,7 +4432,7 @@ fn composite_inner() -> CursorTail {
         // paint set uses, so the arming block below can price the dock's rect without a second
         // `TABLE` lock (occ_clip's "no second table lock" rule is per-window in the blit loop; this
         // is once per pass, and here it is free).
-        #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
         let mut sprite_dock_tiles = 0usize;
         #[allow(unused_mut)]
         let mut hit = {
@@ -4056,7 +4443,7 @@ fn composite_inner() -> CursorTail {
                     npaint += 1;
                 }
             }
-            #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+            #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
             {
                 sprite_dock_tiles = dock_tiles(&t.rows);
             }
@@ -4113,7 +4500,23 @@ fn composite_inner() -> CursorTail {
         // `open_rect` is one relaxed load on every boot with the menu closed; the dock rect is
         // `for_panel` over the tile count snapshotted under the paint set's own table acquisition
         // (`sprite_dock_tiles` above) — no second table lock, same source `occ_clip` prices.
-        #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+        //
+        // TRUNK LANDING 2026-08-19 — THE CFG WIDEN. This block and the two `sprite_dock_tiles` sites
+        // above were `all(x86_64, wc)`; they are now
+        // `any(all(x86_64, wc), all(aarch64, pidesk))`, because the furniture this arms against is
+        // not x86 furniture: `crystal::open_rect` and `dock::Layout::for_panel` are ungated and
+        // `dock_tiles` was already dual-gated, so the Pi desktop carries the identical poison (a
+        // dragged window under the dock, an open dropdown over the pointer) and had no arm for it.
+        // The aarch64 WC-F arm above can now set `reserved_hit` from BOTH sources — see
+        // [`CUR12_RESERVED`], whose "structurally exclusive per arch" claim this widen retires.
+        //
+        // COST, stated because it is the widen's one live risk: this adds a `WRITER` read (a
+        // single-statement Copy load, WEDGE-1-clean — the guard is dead at the semicolon) plus a
+        // `dock::Layout` to `composite_inner`'s aarch64 frame, and occ62's ledger records aarch64
+        // STACK EXHAUSTION as the reason that function was reshaped. It is therefore gated at ARMED
+        // BENCH GEOMETRY (`UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test`), not at QEMU's
+        // 640x480, and that leg is part of this landing's battery.
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
         {
             let fb = *super::WRITER.lock();
             if fb.is_ready() {
@@ -4187,10 +4590,11 @@ fn composite_inner() -> CursorTail {
                 #[cfg(feature = "witness")]
                 {
                     CUR3_DECL_BUDGET.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    // CURSOR-12 — `reserved` counts the WC-F probe on aarch64 and MENU-UNDER's open-
-                    // dropdown decline on x86 (each is structurally 0 on the other arch), so the
-                    // field can be read against `budget`, which also carries the per-window
-                    // `may_overlay` exclusions.
+                    // CURSOR-12 — `reserved` counts the WC-F probe (aarch64) and MENU-UNDER's
+                    // furniture decline (x86 `wc`, and since the 2026-08-19 trunk landing aarch64
+                    // `pidesk` too — so the two are NO LONGER structurally exclusive per arch and
+                    // this field can mix them). It is still read against `budget`, which also
+                    // carries the per-window `may_overlay` exclusions; see [`CUR12_RESERVED`].
                     CUR12_RESERVED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     // CURSOR-11 — a pass whose arrow left the glass. Kept, not fixed: the probe paints
                     // the FRONT after this pass, outside every window box, so no staged present can
@@ -4466,7 +4870,7 @@ fn composite_inner() -> CursorTail {
         );
         t
     };
-    let mut drawn = 0usize;
+    let mut drawn = 0usize; /* WCC-FURN — and its USER half, for WC-C alone. On the same line on PI-DESK's discipline: knob-off panic `Location`s must not move. */ #[cfg(feature = "witness")] let mut drawn_user = 0usize;
     // CURSOR-3 — did any window in this pass carry the sprite through its staged present? Back-to-
     // front order means the LAST window to take the overlay is the topmost one that fully contains
     // the sprite, and its plan is the one `OVERLAY` ends up holding — which is the window the
@@ -4527,8 +4931,23 @@ fn composite_inner() -> CursorTail {
         // (multiple megabytes for the console window), and inside WC-G's bracket that read would be
         // charged to `[wc-g] us=` — manufacturing a `slow=yes` tear report out of this witness's own
         // cost. WC-G's bracket must still contain the copy and nothing else.
+        // OCC62 M1 — THE pre-blit excuse, owned HERE and nowhere else.
+        //
+        // One [`OccSnap`] per window iteration, borrowed by WC-D's reference below and by WC-G's
+        // `end` further down. It used to be FOUR by-value copies on this frame (`wcg::Probe`'s
+        // field, `VerifyRef`'s field, and an argument temporary at each of `begin`/`end`), which is
+        // 392 bytes apiece; on aarch64 that overflowed the kernel task stack and faulted the armed
+        // 1920x1200 boot at the shell-window create. See the OCC62 note on `wcg::begin`.
+        //
+        // Taken ONCE, at the earliest of the two instants that used to take it separately
+        // (`verify_reference`'s, which ran just ahead of `wcg::begin`'s). That STRENGTHENS the law
+        // [`occ_excuse`] exists for — all four excuse points speak from one snapshot instead of two
+        // that could drift — and it cannot narrow the excuse below the clip, because
+        // `occ_excuse` unions the clip in unconditionally ([`OccSnap::absorb`]).
         #[cfg(feature = "witness")]
-        let wcd_ref = verify_reference(&fb, &rw, bands[i], &clip);
+        let occ_pre = occ_excuse(rw.z, rw.id, &clip);
+        #[cfg(feature = "witness")]
+        let wcd_ref = verify_reference(&fb, &rw, bands[i]);
         // WC-G — bracket the blit. `begin` must be the last thing before `draw_window` and `end` the
         // first thing after it: the `blit`/`after` checksums mean "the surface as the copy found it"
         // and "as the copy left it", and anything inserted between them widens the interval they
@@ -4536,16 +4955,7 @@ fn composite_inner() -> CursorTail {
         // GR21/WCD-OCC — the occluder set as of the blit is handed to `wcg::begin` on x86, so the
         // glass read-back can excuse a pixel a higher window owns exactly as `[wc-d]` does. aarch64
         // keeps the four-argument call and its byte-identical wire.
-        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
-        let wcg_probe = super::wcg::begin(
-            rw.id,
-            rw.surf,
-            rw.surf_len,
-            rw.compat,
-            // WC-K3 — the excuse, widened to whatever the blit is about to withhold.
-            occ_excuse(rw.z, rw.id, &clip),
-        );
-        #[cfg(all(feature = "witness", not(target_arch = "x86_64")))]
+        #[cfg(feature = "witness")]
         let wcg_probe = super::wcg::begin(rw.id, rw.surf, rw.surf_len, rw.compat);
         // CURSOR-3 — WHICH WINDOWS MAY CARRY THE SPRITE. WC-I's invariant "no verified pixel is ever
         // read with the sprite on the panel" is preserved here rather than weakened: this pass may
@@ -4621,13 +5031,13 @@ fn composite_inner() -> CursorTail {
         if let Some(p) = wcg_probe {
             let r = &rw;
             // GR21/WCD-OCC — the read-back-time occluder set, unioned in `end` with the pre-blit set
-            // carried in the probe. x86 only; aarch64 keeps the eight-argument call.
-            #[cfg(target_arch = "x86_64")]
+            // carried in the probe. PARITY §6.2 — ONE nine-argument call on both arches.
+            // OCC62 M1 — the read-back-time excuse, owned in THIS block so it leaves the frame the
+            // moment the bracket closes, and handed over by reference beside the pre-blit one.
+            let occ_post = occ_excuse(r.z, r.id, &clip);
             super::wcg::end(
-                p, &fb, r.x, r.y, r.w, r.h, r.stride, r.scale, occ_excuse(r.z, r.id, &clip),
+                p, &fb, r.x, r.y, r.w, r.h, r.stride, r.scale, &occ_pre, &occ_post,
             );
-            #[cfg(not(target_arch = "x86_64"))]
-            super::wcg::end(p, &fb, r.x, r.y, r.w, r.h, r.stride, r.scale);
         }
         // WC-H — print the back-layer sample the blit above recorded, if any. Deliberately AFTER
         // `wcg::end`: this emits to the serial UART, and inside the bracket it would be charged to
@@ -4643,14 +5053,14 @@ fn composite_inner() -> CursorTail {
         // meantime no longer matters: the reference was frozen before the blit.
         #[cfg(feature = "witness")]
         if let Some(vr) = wcd_ref {
-            verify_window(&fb, &rw, vr, &clip);
+            verify_window(&fb, &rw, vr, &clip, &occ_pre);
         }
         // WC-N — pixels on glass for this window id. The only writer of `comp`.
         // WCN-CAUSE — `!seed[i]` is the cause: this row was not dirty at the table snapshot, so the
         // upward closure is the only thing that could have put it in this pass.
         #[cfg(feature = "witness")]
         wcn_note_drawn(rows[i].id, !seed[i]);
-        drawn += 1;
+        drawn += 1; /* WCC-FURN — a user row is one that is neither the compat row nor kernel furniture. */ #[cfg(feature = "witness")] if !rw.compat && !is_kernel_owner(rw.owner_asid) { drawn_user += 1; }
     }
     // COMPOSITE-2 — loop closed. The witness one-shots inside it (WC-G/WC-D/WC-C) are charged here
     // when they fire; they are budgeted per window id, so the steady state they perturb is a handful
@@ -4692,17 +5102,17 @@ fn composite_inner() -> CursorTail {
     // fires from inside the pass that actually drew them, and checksums each window's SOURCE bytes, so a
     // window that is present-but-blank (or that composited a stale/recycled surface) is distinguishable
     // from one that drew real content. FNV-1a over `surf_len` — the mapping-code length, the same bound
-    // `draw_window` reads under, so the checksum can never walk past the slot.
-    //
-    // One-shot: this runs from present context at user-mode frame rates, and the checksum is a 64 KiB read.
+    // `draw_window` reads under, so the checksum can never walk past the slot. One-shot: present context,
+    // user-mode frame rates, 64 KiB read. WCC-FURN — kernel furniture (`is_kernel_owner`) is out of `real`,
+    // the per-window lines and the count — a desktop-armed boot's rows BURNED it. engine.md §WCC-FURN.
     #[cfg(feature = "witness")]
-    if drawn > 0 {
-        let real = rows.iter().filter(|r| r.used && !r.compat).count();
+    if drawn_user > 0 {
+        let real = rows.iter().filter(|r| r.used && !r.compat && !is_kernel_owner(r.owner_asid)).count();
         if real >= 2 && !SIDEBYSIDE_WITNESSED.swap(true, core::sync::atomic::Ordering::Relaxed) {
-            serial_println!("[wc-c] side-by-side windows={} drawn={}", real, drawn);
+            serial_println!("[wc-c] side-by-side windows={} drawn={}", real, drawn_user);
             for &i in order.iter() {
                 let r = &rows[i];
-                if !r.used || r.compat {
+                if !r.used || r.compat || is_kernel_owner(r.owner_asid) {
                     continue;
                 }
                 serial_println!(
@@ -4726,13 +5136,28 @@ fn composite_inner() -> CursorTail {
     #[cfg(all(target_arch = "aarch64", feature = "witness", feature = "baremetal"))]
     if drawn > 0 {
         let (pw, ph) = (fb.info().width, fb.info().height);
-        let clear = match super::wcf::reserved(pw, ph) {
-            None => false,
-            Some(boxes) => !rows
-                .iter()
-                .any(|r| r.used && boxes.iter().any(|b| boxes_overlap(*b, outer_box(r)))),
+        // CHROMESPEC — the clearance is answered PER RESERVED BOX, not for their union. The twin
+        // blocks and the slope marker are two disjoint rectangles at opposite ends of the bottom
+        // strip, and on the armed Pi desktop the console window overlaps only the second: one shared
+        // bool let the marker's overlap veto the twins, so the verdict the spec REQUIREs never
+        // printed on a boot where the addressing was never in question. See `wcf::run`'s header.
+        // The test is taken against `wcf::clearance`, NOT `wcf::reserved`: the probe's cache
+        // maintenance runs in whole scanlines, and an invalidate is a discard, so its exclusion zone
+        // is each box's full-width ROW SPAN rather than the box it paints. See `wcf::clearance`.
+        let clear = match super::wcf::clearance(pw, ph) {
+            None => [false, false],
+            Some(boxes) => {
+                let mut c = [true, true];
+                for r in rows.iter().filter(|r| r.used) {
+                    let ob = outer_box(r);
+                    for (k, b) in boxes.iter().enumerate() {
+                        c[k] &= !boxes_overlap(*b, ob);
+                    }
+                }
+                c
+            }
         };
-        super::wcf::run(&fb, clear);
+        super::wcf::run(&fb, clear); super::wcf::chrome_truth(&fb, &rows, &order, focus_asid());
     }
     let _ = drawn;
     let _ = overlaid;
@@ -4919,7 +5344,13 @@ fn tail_of(disturbed: bool, session: bool, deferred: bool) -> CursorTail {
 /// is an independent statement about whether the pixels reached the memory the scan-out reads.
 #[cfg(feature = "witness")]
 #[allow(unused_variables)]
-fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccClip) {
+fn verify_window(
+    fb: &super::FrameBuffer,
+    r: &Window,
+    vr: VerifyRef,
+    clip: &OccClip,
+    occ_before: &OccSnap,
+) {
     // COMP2-WCD — charge everything this function does to [`C2_WCD_CYC`], on EVERY exit path (the
     // teardown abort, the silent banked chunk, the verdicts), so `[comp2] wcd_us=` can name this
     // witness on the wire when a pass's `blit_us` spikes. A drop guard rather than per-exit charges:
@@ -4943,7 +5374,6 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
     let info = fb.info();
     let VerifyRef { row0, row1, cols, banded, cksum_pre, want, step, running,
         #[cfg(target_arch = "x86_64")] seq,
-        #[cfg(target_arch = "x86_64")] occ_before,
         #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))] full_rows } = vr;
     let wi = r.id as usize;
     // WCD-CHUNK — the chunk's gate-held wall clock opens here, before the first probe, so
@@ -4951,16 +5381,42 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
     // witness: both read-back passes plus the attribution walks between them.
     #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
     let t_chunk0 = crate::arch::now_cycles();
-    // GR21/WCD-OCC — the occluder set as of the READ-BACK (post-blit). Taken once, here, before the
+    // GR21/WCD-OCC — the occluder set as of the READ-BACK (post-blit). PARITY §6.2: both arches.
+    // Taken once, here, before the
     // multi-second glass read the passes run, so the table lock it briefly holds never overlaps that
     // read. Unioned with `occ_before` per pixel below: a mismatching pixel covered by EITHER snapshot
     // is one a higher window owns, which conservatively excuses a window that moved between the two
     // instants (the AK case, one re-tile removed). A window that enters mid-read is the same residual
     // hole WCD-PRE already names for a source that moves mid-read — those pixels are not on the glass
-    // to be read. x86 only; see [`OccSnap`].
-    #[cfg(target_arch = "x86_64")]
+    // to be read. See [`OccSnap`].
     let occ_after = occ_excuse(r.z, r.id, clip);
 
+    // ### WCD-LIVE — the source-read census, stated once so a future edit cannot re-open it
+    //
+    // The defect WCD-LIVE closed was a verdict that read the user-mutable SOURCE three independent
+    // times — pass 1, the post-`IVAC` pass 2, and the checksum inside the print — so `bad_cache` and
+    // `bad_ram` could differ purely because they had read different bytes, with no cache story
+    // required at all. Exactly THREE source reads survive, and each is a different question:
+    //
+    // 1. **The snapshot, `vr.want`** — the verdict's reference, and the ONLY read either pass
+    //    adjudicates against. Taken once, at one instant, by [`verify_reference`] on the correct side
+    //    of the blit (WCD-PRE). Both passes index the same frozen buffer, and WCD-CHUNK keeps them
+    //    adjudicating the same rect: the first read-back runs bounded and reports `rows_done`, the
+    //    second re-walks exactly those rows. A surviving `bad_cache != bad_ram` is therefore a real
+    //    statement about the DESTINATION — which is the only thing the two-pass design ever claimed.
+    // 2. **`source_px` below — deliberately LIVE, and the liveness detector itself.** This is not a
+    //    re-read of the reference; it is the comparison snapshot-vs-live that DEFINES `moved`. Freezing
+    //    it would delete the detector. It is asked only of a pixel that already disagrees, so a clean
+    //    blit never pays for it, and its answer is charged to `moved`, never to `bad`.
+    // 3. **`surface_checksum` in the print** — DIAGNOSTIC ONLY, never a verdict input; it is the
+    //    reason it may be live. `cksum`/`cksum_pre` answer "did the surface move at all" for a reader,
+    //    and WCD-PRE explains why a whole-surface bracket could not be a verdict input on a routed
+    //    console.
+    //
+    // WCD-SPRITE's live re-read of `cursor::live_box_relaxed()` is not on this list: it is a question
+    // about the DESTINATION's other writer, not about the reference, and it stays live for the reason
+    // its own ledger gives.
+    //
     // WCD-PRE — the per-pixel liveness question, asked only of pixels that already disagree. `want` was
     // frozen before the blit; if the SOURCE no longer holds that value, this pixel's reference moved
     // between the snapshot and now (a sibling app thread, or — on the routed console — `fbcon::_print`
@@ -5043,8 +5499,7 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
         let mut first_moved = (0usize, 0usize, 0u32, 0u32);
         // GR21/WCD-OCC — pixels that mismatch AND lie under a higher window. Counted here, charged
         // to neither `bad` nor `moved`: a higher window legitimately owns the destination, so the
-        // console's blit is not the writer being adjudicated. x86 only.
-        #[cfg(target_arch = "x86_64")]
+        // console's blit is not the writer being adjudicated. PARITY §6.2 — both arches.
         let mut occluded = 0usize;
         for row in row0..r1 {
             // WCD-CHUNK — the time stop. Whole rows only (checked between rows, never mid-row, so a
@@ -5105,33 +5560,19 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
                                 // pre-blit OR the read-back occluder set is owned by a higher window.
                                 // WCD-SPRITE — the fourth bucket, tested last of the excusals so a
                                 // moved reference and an occluding window keep their existing
-                                // attributions. Both arches: the sprite is `video::cursor`'s and is
-                                // not arch-gated.
+                                // attributions. PARITY §6.2 — the occluder bucket ahead of it is on
+                                // both arches now too, so this walk is one shape everywhere.
                                 let on_sprite = sprite_covers(sprite_enter, dx, dy)
                                     || sprite_covers(super::cursor::live_box_relaxed(), dx, dy);
-                                #[cfg(target_arch = "x86_64")]
-                                {
-                                    if occ_before.covers(dx, dy) || occ_after.covers(dx, dy) {
-                                        occluded += 1;
-                                    } else if on_sprite {
-                                        sprite_px += 1;
-                                    } else {
-                                        if bad == 0 {
-                                            first = (dx, dy, got, want);
-                                        }
-                                        bad += 1;
+                                if occ_before.covers(dx, dy) || occ_after.covers(dx, dy) {
+                                    occluded += 1;
+                                } else if on_sprite {
+                                    sprite_px += 1;
+                                } else {
+                                    if bad == 0 {
+                                        first = (dx, dy, got, want);
                                     }
-                                }
-                                #[cfg(not(target_arch = "x86_64"))]
-                                {
-                                    if on_sprite {
-                                        sprite_px += 1;
-                                    } else {
-                                        if bad == 0 {
-                                            first = (dx, dy, got, want);
-                                        }
-                                        bad += 1;
-                                    }
+                                    bad += 1;
                                 }
                             }
                         }
@@ -5140,14 +5581,7 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
                 col += step;
             }
         }
-        #[cfg(target_arch = "x86_64")]
-        {
-            (rows_done, checked, bad, moved, nonzero, first, first_moved, occluded, sprite_px)
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            (rows_done, checked, bad, moved, nonzero, first, first_moved, sprite_px)
-        }
+        (rows_done, checked, bad, moved, nonzero, first, first_moved, occluded, sprite_px)
     };
 
     // WCD-CHUNK — `chunked` selects the stage-2 CUMULATIVE machinery only (the resume cursor, the
@@ -5186,11 +5620,7 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
     // feeds the banking arm; `true` here is what arms the time stop for stage 1 as well (dead on
     // every build without the chunking, where `pass` ignores its `bounded` argument).
     let row1_ask = row1;
-    #[cfg(target_arch = "x86_64")]
     let (rows_done, checked, bad_cache, moved_cache, nonzero, first_cache, firstmv_cache, occ_cache, spr_cache) =
-        pass(fb, row1, true);
-    #[cfg(not(target_arch = "x86_64"))]
-    let (rows_done, checked, bad_cache, moved_cache, nonzero, first_cache, firstmv_cache, spr_cache) =
         pass(fb, row1, true);
     // WCD-CHUNK — from here on, `row1` IS the rows the first pass actually walked: the invalidate,
     // the second pass, the `band=` field, the interlock rect and the cursor all describe the chunk,
@@ -5226,11 +5656,8 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
     }
     let ram_indep = cfg!(target_arch = "aarch64");
 
-    #[cfg(target_arch = "x86_64")]
     let (_, _, bad_ram, moved_ram, _, first_ram, firstmv_ram, occ_ram, spr_ram) =
         pass(fb, row1, false);
-    #[cfg(not(target_arch = "x86_64"))]
-    let (_, _, bad_ram, moved_ram, _, first_ram, firstmv_ram, spr_ram) = pass(fb, row1, false);
     // `cksum` is the `[wc-c]` FNV over the SOURCE slot, carried here so a verdict is content-aware: without
     // it a blank surface blitted faithfully onto a blank rect is a PASS indistinguishable from a verified
     // crystal. `nonzero` is the same question asked of the DESTINATION. `cksum_pre` is the same FNV taken at
@@ -5245,7 +5672,6 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
     // in EITHER read-back is unadjudicated by the console's blit, and the max keeps a single such
     // pixel visible on the line. `ok` is UNCHANGED — occluded pixels were never charged to `bad`, so
     // a verdict is CLEAN/PASS iff the non-occluded, non-moved mismatches are zero.
-    #[cfg(target_arch = "x86_64")]
     let occluded = occ_cache.max(occ_ram);
     // WCD-SPRITE — the worse of the two passes, same rule as `moved` and `occluded`, and for the same
     // reason: AR's arrow was over the rect for exactly ONE of the two read-backs, so a min (or either
@@ -5457,9 +5883,10 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
         );
         #[cfg(not(target_arch = "x86_64"))]
         serial_println!(
-            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} cksum={:#018x} cksum_pre={:#018x} -> LIVE (unverifiable)",
+            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} cksum_pre={:#018x} -> LIVE (unverifiable)",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
-            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero, cksum, cksum_pre
+            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero,
+            occluded, occ_before.count(), occ_after.count(), cksum, cksum_pre
         );
     } else if ok {
         // WCD-TEARDOWN — the interlock's reading rides the PASS line too, on x86.
@@ -5485,9 +5912,10 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
         );
         #[cfg(not(target_arch = "x86_64"))]
         serial_println!(
-            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache=0 bad_ram=0 ram_indep={} moved={} sprite_px={} nonzero={} cksum={:#018x} first=none -> PASS",
+            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache=0 bad_ram=0 ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=none -> PASS",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
-            checked, coverage, yn(ram_indep), moved, sprite_px, nonzero, cksum
+            checked, coverage, yn(ram_indep), moved, sprite_px, nonzero,
+            occluded, occ_before.count(), occ_after.count(), cksum
         );
     } else {
         // WCD-TEARDOWN — the FAIL line carries the interlock reading too, and this arm is the reason
@@ -5513,9 +5941,10 @@ fn verify_window(fb: &super::FrameBuffer, r: &Window, vr: VerifyRef, clip: &OccC
         );
         #[cfg(not(target_arch = "x86_64"))]
         serial_println!(
-            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} -> FAIL",
+            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} -> FAIL",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
-            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero, cksum,
+            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero,
+            occluded, occ_before.count(), occ_after.count(), cksum,
             first.0, first.1, first.2, first.3
         );
     }
@@ -5613,11 +6042,6 @@ struct VerifyRef {
     /// aarch64 has no interlock at all (the arch gate is a protection boundary; see WCD-TEARDOWN).
     #[cfg(target_arch = "x86_64")]
     seq: PanelSeq,
-    /// GR21/WCD-OCC — the boxes of every window ABOVE this one at reference time (pre-blit). Unioned
-    /// in [`verify_window`] with a read-back-time snapshot, so a mismatching pixel a higher window
-    /// legitimately owns is counted `occluded=`, not `bad=`. x86 only; see [`OccSnap`].
-    #[cfg(target_arch = "x86_64")]
-    occ_before: OccSnap,
     /// WCD-CHUNK — the box's whole visible row extent at admission, so the read-back can tell "this
     /// chunk closed the BOX" (the cursor reached this) from "this chunk closed its band". Chunking
     /// exists only where the deferral policy does.
@@ -5647,7 +6071,6 @@ fn verify_reference(
     fb: &super::FrameBuffer,
     r: &Window,
     band: Option<(usize, usize)>,
-    clip: &OccClip,
 ) -> Option<VerifyRef> {
     // FOCUS-VIS — `presented`, so the one-shot is not claimed by the create-time composite of a blank
     // surface. `compat` rows have no chrome and no owner to verify against; `id < 32` is the latch width.
@@ -5803,6 +6226,39 @@ fn verify_reference(
     // The reference is ours from here — `wcd_admit`'s CAS made this core the only holder — so every
     // return below prints, and every return below that does NOT publish a verdict must hand the
     // window back.
+    //
+    // WEDGE-12 (F6) — **the third masked allocation, enumerated here and deliberately NOT closed.**
+    // The R24 span audit listed two `ALLOCATOR` acquisitions inside `SYS_WIN_PRESENT`'s mask
+    // (`stage_window`'s and `stage_fill`'s); this is a third, and it reaches the global heap `Mutex`
+    // twice — once here and once when the `VerifyRef`'s `want` drops. WCD-PRE moved the snapshot from
+    // `verify_window` to this function, so the two acquisitions now sit on OPPOSITE sides of the blit,
+    // but both are still inside the same masked span: `verify_reference` and `verify_window` are both
+    // called from `composite_inner`, and on aarch64 the syscall path runs IRQ-masked end to end (see
+    // the header of `arch/aarch64/syscall.rs`). It is the same family shape as the two WEDGE-12
+    // removed.
+    //
+    // It is not closed the same way because its worst case is not bounded by anything `wm` owns.
+    // `stage_window`'s was: [`MAX_STAGE_BYTES`] capped it at 4 MiB whatever the panel, so a pre-size
+    // drops no work. This buffer is `(row1 - row0) * cols * 4` bytes, and the extent comes from the
+    // ROW's surface — `surf_len / stride` by `stride / 4`, clipped by WCD-BAND to the present's band.
+    // For an EL0 window that is the 64 KiB mapped-slot cap (`FB_WIN_SLOT_SIZE`, a 128x128 ARGB
+    // surface), but a KERNEL-created row carries whatever extent its creator passed:
+    // `fbcon::panel_console_window_open` (x86 + `wc`) presents a non-compat console window sized to
+    // the panel, i.e. a multi-megabyte whole-box snapshot, and nothing in `wm` bounds a future creator
+    // below that. Pre-sizing a static to 64 KiB would turn that window's `[wc-d]` verdict from
+    // PASS/FAIL into SKIP — capping the instrument rather than fixing the lock, which is the "silently
+    // drop work" outcome the milestone's own STOP rule names.
+    //
+    // ONE arm has since acquired a real bound, and only one: WCD-CHUNK's per-chunk cap clamps `row1`
+    // to `cur + WCD_CHUNK_ROWS_MAX` on an x86 `wcg-paygo` stage-2 pass (~336 KB worst case). That
+    // is x86-only, stage-2-only, and was taken for the launch-stall hold, not for this lock — stage 1,
+    // and every aarch64 verdict, still allocate the whole clipped rect.
+    //
+    // So it is reported rather than shipped. Two facts bound the exposure meanwhile: it is
+    // `witness`-gated (it never reaches flashable media), and it is at most one live buffer per
+    // admitted reference (`wcd_admit`'s CAS makes this core the only holder), not one per pass.
+    // Closing it properly means hoisting the snapshot out of the masked span, which is span
+    // restructuring — the owed-tail milestone's scope, not this one's.
     let mut want: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
     if want.try_reserve_exact((row1 - row0) * cols).is_err() {
         serial_println!(
@@ -5848,14 +6304,12 @@ fn verify_reference(
     // would abandon verdicts for a race that cannot reach them. See [`PANEL_FILL_EPOCH`].
     #[cfg(target_arch = "x86_64")]
     let seq = panel_seq();
-    // GR21/WCD-OCC — the occluder set as of the reference (pre-blit). Read here, alongside the `want`
-    // snapshot, so it describes the same instant the source bytes were frozen at; [`verify_window`]
-    // unions it with a read-back-time snapshot to excuse a window that moved between the two.
-    #[cfg(target_arch = "x86_64")]
-    let occ_before = occ_excuse(r.z, r.id, clip);
+    // GR21/WCD-OCC — the occluder set as of the reference (pre-blit) is no longer carried HERE.
+    // OCC62 M1: `composite_inner` owns the one instance and lends it to [`verify_window`], which is
+    // what keeps a 392-byte `OccSnap` off this struct and out of the caller's frame. The instant is
+    // unchanged — the loop takes it immediately before calling this function.
     Some(VerifyRef { row0, row1, cols, banded, cksum_pre, want, step, running,
         #[cfg(target_arch = "x86_64")] seq,
-        #[cfg(target_arch = "x86_64")] occ_before,
         #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))] full_rows: rows })
 }
 
@@ -7370,17 +7824,112 @@ static BLIT_ACTIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::Atomic
 /// F4 — RAII registration for an in-flight composite. Constructed under the table lock (so it is
 /// ordered against teardown's own lock acquisition) and dropped when the blit is done, on every exit
 /// path including the early `!fb.is_ready()` return.
-struct BlitGuard;
+struct BlitGuard {
+    /// BLITWHO — the core this guard was entered on. Kept in the guard rather than re-read at drop
+    /// because a task-context holder can migrate mid-blit: the per-core net below is "live guards
+    /// ENTERED on this core", which is the reading the give-up arms need.
+    ///
+    /// DRAGFIX — UNCONDITIONAL since M1. It was witness-gated while it was only an instrument; it is
+    /// now an input to [`DrainBarrier::drain_bounded`]'s same-core arm, i.e. to behaviour, and a cure
+    /// that exists only on witness builds would leave the shipped image with the defect.
+    core: usize,
+}
+
+/// BLITWHO — live-guard net per enter-core. At a give-up, the nonzero slot names the core whose
+/// holder never retired; all-zero with `BLIT_ACTIVE` nonzero is itself a verdict (a leaked guard —
+/// a holder killed off-CPU never runs its drop). Signed on purpose: an inconsistency would print as
+/// a negative rather than wrap silently.
+///
+/// ### DRAGFIX M1 — promoted to UNCONDITIONAL, and the cost stated honestly
+/// The same-core futility test ([`blit_samecore_futile`]) reads this net on every drain that has to
+/// wait, on every build. So the net has to exist on every build, and the price is **two relaxed RMWs
+/// per composite pass** — one `fetch_add` at [`BlitGuard::enter`], one `fetch_sub` at its drop —
+/// against a line that is already indexed by core. That is the same shape and the same order of cost
+/// as [`BLIT_ACTIVE`]'s own pair, which every composite has always paid; the array spans one or two
+/// cache lines, so cores DO share lines here and the arithmetic is not free of coherence traffic.
+/// Measured against what a composite pass costs on this track (`[comp2] pass_us=3294` typical), it is
+/// noise — and it is the whole price of the knob-off cure, which is the trade this arc is making
+/// deliberately rather than shipping a fix that only armed builds get.
+///
+/// **This moves knob-off bytes.** See the M1 commit message and the BARENAME precedent: a capability
+/// change is not a byte-identity claim, and this arc does not make one.
+static BLIT_NET_CORE: [core::sync::atomic::AtomicI64; 8] = [
+    core::sync::atomic::AtomicI64::new(0),
+    core::sync::atomic::AtomicI64::new(0),
+    core::sync::atomic::AtomicI64::new(0),
+    core::sync::atomic::AtomicI64::new(0),
+    core::sync::atomic::AtomicI64::new(0),
+    core::sync::atomic::AtomicI64::new(0),
+    core::sync::atomic::AtomicI64::new(0),
+    core::sync::atomic::AtomicI64::new(0),
+];
+
+/// BLITWHO — the most recent enterer's task name (first 8 bytes of `sched::current_name()`, packed
+/// LE into one word; 0 = no task context) and core. `current_name()` is the one identity accessor
+/// both arch schedulers expose, and one atomic word cannot tear the way a (ptr,len) pair could.
+/// Last-writer-wins is enough: the depth the wire has measured is 3, and the give-up arm wants A
+/// name to start from, not the full set — the per-core net above carries the set.
+#[cfg(feature = "witness")]
+static BLIT_LAST_ENTER_NAME: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static BLIT_LAST_ENTER_CORE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// BLITWHO — pack a task name's first 8 bytes into a word for the atomic above.
+#[cfg(feature = "witness")]
+fn blitwho_pack_name(n: Option<&'static str>) -> u64 {
+    let mut w = 0u64;
+    if let Some(s) = n {
+        for (i, b) in s.as_bytes().iter().take(8).enumerate() {
+            w |= (*b as u64) << (i * 8);
+        }
+    }
+    w
+}
+
+/// BLITWHO — one line, printed only from the two give-up arms (never the hot path): the raw
+/// `BLIT_ACTIVE` word beside everything derived from it, the per-core net, and the last enterer.
+#[cfg(feature = "witness")]
+fn blitwho_report(spin_core: usize) {
+    let net: [i64; 8] = core::array::from_fn(|i| {
+        BLIT_NET_CORE[i].load(core::sync::atomic::Ordering::Relaxed)
+    });
+    let raw = BLIT_LAST_ENTER_NAME.load(core::sync::atomic::Ordering::Relaxed);
+    let bytes = raw.to_le_bytes();
+    let len = bytes.iter().position(|&b| b == 0).unwrap_or(8);
+    let name = core::str::from_utf8(&bytes[..len]).unwrap_or("?");
+    serial_println!(
+        ":: [wedge1] BLITWHO active={} net=[{},{},{},{},{},{},{},{}] last_enter={}@c{} spin_core={} ::",
+        BLIT_ACTIVE.load(core::sync::atomic::Ordering::Acquire),
+        net[0], net[1], net[2], net[3], net[4], net[5], net[6], net[7],
+        if name.is_empty() { "no-task" } else { name },
+        BLIT_LAST_ENTER_CORE.load(core::sync::atomic::Ordering::Relaxed),
+        spin_core
+    );
+}
 
 impl BlitGuard {
     fn enter() -> Self {
         BLIT_ACTIVE.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-        BlitGuard
+        // DRAGFIX M1 — the enter-core net is unconditional now (see [`BLIT_NET_CORE`]); only the
+        // NAME/last-enterer pair, which exists purely to print, stays witness-gated.
+        let core = crate::arch::sched::meter_current_cpu().min(7);
+        BLIT_NET_CORE[core].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "witness")]
+        {
+            BLIT_LAST_ENTER_NAME.store(
+                blitwho_pack_name(crate::arch::sched::current_name()),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            BLIT_LAST_ENTER_CORE.store(core, core::sync::atomic::Ordering::Relaxed);
+        }
+        BlitGuard { core }
     }
 }
 
 impl Drop for BlitGuard {
     fn drop(&mut self) {
+        BLIT_NET_CORE[self.core].fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
         BLIT_ACTIVE.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
     }
 }
@@ -7401,6 +7950,408 @@ const DRAIN_STALL_SPINS: u64 = 1 << 27;
 /// the wedge may itself be holding.
 static DRAIN_STALL_REPORTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+
+/// DRAINSTALL (PA38 metal) — spin iterations past which [`DrainBarrier::drain`] ABANDONS its wait.
+///
+/// **The wait is BOUNDED from here on, and this is the bound.** Eight times [`DRAIN_STALL_SPINS`],
+/// i.e. order 10^9 spin hints — several seconds of real time on the Pi, and four orders of magnitude
+/// past the handful of panel-clipped `memcpy`s the barrier is genuinely bounded against. Nothing
+/// healthy reaches it, the tripwire fires long before it, and the tripwire stays exactly as sharp.
+///
+/// ### Why a SPIN COUNT, when WEDGE-10's rule is a wall-clock deadline
+/// `cursor.rs`'s bounded waiters (`claim_bounded`, `overlay_claim_bounded`) refuse to spin without a
+/// measurable deadline, and they are right for their sites: pointer rate, 1-2 ms budgets, a spin
+/// count could not express either. This site is the opposite case on both axes. It runs IRQ-MASKED on
+/// the teardown path (`sched::exit` -> `clear_handle_row`), where a timer read is neither free nor
+/// trustworthy against a machine that may already be mid-wedge; and its budget is not milliseconds
+/// but "past every possibility of legitimate progress". The instrument this loop already carries —
+/// [`DRAIN_STALL_SPINS`] — is denominated in spins for that same reason, and a bound in the tripwire's
+/// own units is one number the reader can compare rather than two they must reconcile. What WEDGE-10
+/// forbids is an UNBOUNDED masked spin; a finite spin count terminates unconditionally, which is the
+/// property that matters.
+const DRAIN_ABANDON_SPINS: u64 = DRAIN_STALL_SPINS * 8;
+
+/// DRAINSTALL — drains that ABANDONED their wait. Unconditional (not witness-gated), on the same
+/// argument the `REFUSED furniture` line makes: a build without witnesses is the build the operator
+/// is sitting in front of, and an abandoned barrier is the one event on this path that can leave a
+/// stale rectangle on their panel. Published by [`wedge1_dwell_emit`] as `abandoned=`.
+static DRAIN_ABANDONED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAINSTALL — whether the abandon LINE has been printed, once per boot and globally, on the
+/// argument [`DRAIN_STALL_REPORTED`] makes. The COUNTER above is not rate-limited — only the line is
+/// — so a second abandonment is never invisible, it merely does not re-take the serial lock.
+static DRAIN_ABANDON_REPORTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+// ---- DRAGWEDGE (PA41 metal, boots 1 and 2) — THE INTERACTIVE BOUND -------------------------------
+//
+// **The defect, from the wire and not from a hypothesis.** Two attended freezes on the PA41 image
+// (`hw-pi4@14e54538`), one dragging the console window and one dragging an app window, produced the
+// same token sequence and the same ledger:
+//
+//   boot 2:  `<F4><F5><F6><F7><F8>` `[wm-act] drag-begin win=4 owner=0x1 -> grabbed` `<D2><D!><D?><D3><D2>`
+//            `:: [wedge1] DRAIN STALLED core=3 blit_active=1 pending=1 spins=134217728 ::`
+//            `:: [wedge1] DRAIN ABANDONED core=3 blit_active=1 pending=1 spins=1073741824 ::`
+//            `[wcn] rollup ... passes=0 aborted=37 -> STARVED`, `[comp2] blit_us=0 present_us=0`
+//   boot 1:  `<D2><D?><D3>` REPEATING with nothing else on the wire, `[click2] depth gui_chan=65
+//            (sent=794 recv=729)` pinned for the whole capture, ZERO `[clickroute]` lines, c1 at 99%.
+//
+// Read together those say one thing. `BLIT_ACTIVE` failed to fall; [`DrainBarrier::drain`]'s bound is
+// [`DRAIN_ABANDON_SPINS`] — order 10^9 spin hints, *several seconds* — and [`move_to_inner`] raises
+// that same teardown-grade barrier ON EVERY DRAG MOTION REPORT. So the pointer path, which on this
+// arch is also the task that consumes `GUI_CHANNEL`, spent multi-second stretches inside the spin;
+// the abandon did not disarm anything, so the very next report re-entered it (`<D3><D2>`); and the
+// BUTTON-UP that would have ended the grab is delivered through that same consumer, so it could never
+// be seen. The gesture therefore could not end, and every report it produced re-armed the spin. Boot
+// 2 is that latch caught early (kernel alive, panel dead); boot 1 is the same latch after the input
+// channel has backed up to its capacity and the machine has stopped answering.
+//
+// **What is fixed here, and what is deliberately not.**
+//
+//  1. *The interactive path gets an interactive bound.* [`DRAIN_MOVE_SPINS`] is three orders under the
+//     tripwire and still four orders over the handful of panel-clipped `memcpy`s the barrier is
+//     genuinely bounded against. This WEAKENS NO PROTECTION: the abandon arm already exists on this
+//     path and already trades exactly this — its own ledger prices the cost as "a stale rectangle, one
+//     wrong frame, self-healing at the next present" — so a smaller bound reaches an outcome the code
+//     already sanctions, sooner. The TEARDOWN paths (`close`, `close_owner`, `minimise`, `zoom`) are
+//     untouched and keep the full [`DRAIN_ABANDON_SPINS`] bound, because there the thing being waited
+//     out is a blit from a surface that is about to be unmapped and the WC-B hazard is real.
+//
+//  2. *An abandoned wait LATCHES.* [`BARRIER_UNHEALTHY`] records "this barrier is not converging", and
+//     while it stands the interactive path does not spin at all. Re-entering a wait that has just been
+//     proven not to terminate, once per pointer report, is what turned a transient stall into a dead
+//     machine; a bound alone would only have made it a slower death. The latch is self-clearing —
+//     every drain that observes `BLIT_ACTIVE == 0` drops it — so the system recovers on its own the
+//     moment the compositor does.
+//
+//  3. *A grab is always releasable.* [`drag_motion`] cancels the gesture the first time its move
+//     path reports a stalled barrier, and [`drag_begin`] REFUSES to mint a new one while the latch
+//     stands. A lost release edge can no longer mean a grab that lives forever, because the grab does
+//     not outlive the system's ability to service it. This is the sibling of the furniture-refused
+//     CLOSE guard: the same shape of hole, one verb over.
+//
+// **Arch-neutral on purpose.** All three live in `wm.rs` and are reached by x86's router through the
+// same `drag_begin`/`drag_motion`/`move_to_inner`, so the hole closes on both arches at once. It IS a
+// shared hole: nothing in the mechanism above is aarch64-specific — x86's drag path raises the same
+// barrier from the same mover — and gating the cure on `target_arch` would leave the identical latch
+// armed on the other lane with no stated hardware reason for the asymmetry.
+
+/// DRAGWEDGE — spin iterations past which the INTERACTIVE (drag/move) barrier gives its wait up.
+///
+/// **2^25, and the number is MEASURED at both ends rather than picked.**
+///
+/// The FLOOR is what a legitimate composite costs, because a bound under that would cancel healthy
+/// gestures: PA41's own `[comp2]` rollups read `pass_us=3294` typical with `max_us=82683` on the
+/// 1920x1200 bench panel. The bound must clear the outlier, not the mean — a drag report that lands
+/// mid-pass waits out that pass, and a drag that aborts whenever the compositor has a slow frame is a
+/// worse desktop than the one this arc is fixing.
+///
+/// The CEILING is [`DRAIN_STALL_SPINS`], whose own note calibrates 2^27 as *"comfortably past a
+/// second of real time on the Pi"* — so ~10 ns a spin, and 2^25 is ~340 ms. That is four times the
+/// worst pass this track has ever measured, four times under the tripwire, and thirty-two times under
+/// [`DRAIN_ABANDON_SPINS`], which is the bound PA41 measured in seconds.
+///
+/// So a false give-up costs one gesture the operator repeats, and a true one costs a single ~340 ms
+/// hitch — once, because [`BARRIER_UNHEALTHY`] latches and every later report declines the wait.
+/// Under QEMU TCG the same constant measures ~830 ms, which is what `dragwedge_selftest`'s budget is
+/// sized against.
+const DRAIN_MOVE_SPINS: u64 = 1 << 25;
+
+/// DRAGWEDGE — interactive drains that gave their wait up. Unconditional, on the same argument
+/// [`DRAIN_ABANDONED`] makes. NOT folded into that counter: the two abandon DIFFERENT things (a live
+/// row's stale rectangle here, a soon-to-be-unmapped surface there) and the pi4 spec forbids the
+/// teardown one by name, so conflating them would red a gate on an event it was never written about.
+/// Named `mvgiveup=` on the `[wedge1] dwell` line for that same reason — `move_abandoned=` would be
+/// caught by the spec's `abandoned=[1-9]` forbid.
+static MOVE_DRAIN_GIVEUP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAGWEDGE — interactive drains that DECLINED to spin because the latch was standing. This is the
+/// counter that would have been the whole boot-1 capture: one per pointer report, instead of one
+/// multi-second spin per pointer report.
+static MOVE_DRAIN_SKIPPED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAGWEDGE — **the barrier is not converging.** Raised by an interactive drain that reached its
+/// bound with `BLIT_ACTIVE` still standing; dropped by any drain that observes `BLIT_ACTIVE == 0`.
+///
+/// A GAUGE of the compositor's health, read by three places: the interactive drain (which then does
+/// not spin), [`drag_begin`] (which then refuses to mint a grab) and [`drag_motion`] (which then ends
+/// the live one). Relaxed throughout — it gates policy, and orders nothing.
+static BARRIER_UNHEALTHY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// DRAGWEDGE — whether the interactive give-up LINE has been printed, once per boot and globally, on
+/// the argument [`DRAIN_ABANDON_REPORTED`] makes. The counters above are not rate-limited.
+static MOVE_DRAIN_REPORTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// DRAGWEDGE — is the compositor's blit barrier currently believed stuck?
+///
+/// The latch AND the live count, because a latch alone can go stale: nothing forces a drain to run,
+/// so a flag raised by the last drag of a boot would otherwise refuse every grab for the rest of it.
+/// `BLIT_ACTIVE == 0` is proof the stall is over whoever observes it, so this reads both and clears
+/// the flag on the spot.
+fn barrier_stalled() -> bool {
+    use core::sync::atomic::Ordering::{Acquire, Relaxed};
+    if !BARRIER_UNHEALTHY.load(Relaxed) {
+        return false;
+    }
+    if BLIT_ACTIVE.load(Acquire) == 0 {
+        BARRIER_UNHEALTHY.store(false, Relaxed);
+        return false;
+    }
+    true
+}
+
+// ---- DRAGFIX (PA45 metal, baton pi-1 #6) — THE SAME-CORE WAIT, TERMINATED HONESTLY ---------------
+//
+// **The defect, convicted by instrument rather than inferred.** DRAGWEDGE bounded the interactive
+// wait and latched the give-up, which stopped the freeze; it did not ask WHY the wait never
+// terminated, so every drag still paid the full bound and then refused. BLITWHO was landed to answer
+// that, and the PA45 boot answered it in one line:
+//
+//   :: [wedge1] BLITWHO active=1 net=[0,0,1,0,0,0,0,0] last_enter=u7-launc@c2 spin_core=2 ::
+//
+// The holder entered its `BlitGuard` on core 2. The drain spun on core 2. Those are the same core,
+// and that makes the wait **structurally non-terminating rather than merely slow**: this core is
+// occupied by the spin — IRQ-masked and unpreemptible on the teardown path, and monopolising the
+// core in any case — so the one context that could retire the guard cannot be dispatched, and
+// `BLIT_ACTIVE` cannot fall no matter how long the spin runs. The full bound is then paid for
+// nothing, twice over: 2^25 on the interactive path (a refused drag, plus the [`BARRIER_UNHEALTHY`]
+// latch that refuses every drag after it), and 2^30 on teardown (boot 5's multi-minute vug close).
+//
+// **The cure is to stop waiting blind.** Three arms, and which one ran is on the wire:
+//
+//  1. **YIELD** — where the waiting context can schedule, the correct answer to "the holder is on my
+//     core" is to GIVE IT THE CORE. `crate::arch::sched::yield_now()` puts this task at the back of
+//     its run queue, the holder is dispatched, its bounded panel-clipped blit completes, the guard
+//     drops and `BLIT_ACTIVE` falls in bounded REAL time rather than never. The wait becomes a wait
+//     again instead of a livelock.
+//  2. **SKIP** — where it cannot schedule (IRQ-masked, or no task on this core), yielding is illegal
+//     and the wait is provably futile, so the honest thing is to abandon it AT ONCE rather than burn
+//     the bound first. The outcome is exactly the one the existing `<D3>` decline arm already prices
+//     and exactly the one the bound-reached arm already reaches — **the barrier stays RAISED**, only
+//     the wait is given up — so this weakens no protection; it arrives at a sanctioned outcome
+//     sooner, which is the same argument DRAGWEDGE's own bound was landed on.
+//  3. **SPIN** — everything else, byte-for-byte the pre-arc behaviour. A drain that finds
+//     `BLIT_ACTIVE == 0` never enters the loop; a drain whose holder is on ANOTHER core spins as it
+//     always has, because a cross-core holder IS running and the wait CAN terminate.
+//
+// **Why the yield legality test is a RUNTIME test and not a per-call-site one.** The four teardown
+// call sites are not each in one context: `close` is reached from the operator's close control (task,
+// unmasked) *and* from fixtures; `close_owner` is reached from `sched::exit` -> `clear_handle_row`,
+// which has already masked. A static per-site answer would therefore have to take the worst case at
+// every site and lose the cure where it is legal. The test the tree already has is exact and costs
+// two loads: [`crate::arch::irqs_masked`] — the WEDGE-8/F3 primitive, landed for *precisely this
+// hazard class* ("a masked wait on a preemptible holder is the F3 deadlock", `cursor.rs` §claim
+// _bounded) — AND `sched::current_name().is_some()`, the arch-neutral form of the
+// `sched::current_id().is_some()` scheduled-task test `screen.rs`'s band spawner uses. Both must
+// hold. Note that aarch64's `yield_now()` ends in an unconditional `unmask_irq()`, so calling it
+// from a masked context would not merely be impolite — it would silently unmask a teardown that
+// masked on purpose. The `irqs_masked()` half of the test is what forbids that.
+//
+// **No lock is held across the wait, on any path.** Every call site releases `TABLE` (and the
+// `WRITER` copy) before raising the barrier — that is `drain`'s own stated contract, without which
+// the barrier could not work at all — so a yield here parks a task holding nothing but the raised
+// `DRAIN_PENDING`, which is a COUNTER and not a lock. The interactive site is already preemptible
+// today, so the yield introduces no re-entrancy that preemption did not already allow.
+//
+// **The wait's own bound, and why this one is WALL-CLOCK.** `DRAIN_ABANDON_SPINS`'s note argues for a
+// spin count because its site runs IRQ-MASKED, where "a timer read is neither free nor trustworthy".
+// The yielding arm is unmasked BY CONSTRUCTION — that is the precondition it tested for — so
+// WEDGE-10's rule applies in full and the wait takes a measurable deadline
+// ([`DRAIN_YIELD_MOVE_MS`] / [`DRAIN_YIELD_TEARDOWN_MS`]) rather than a spin count that would mean
+// nothing across a context switch.
+//
+// **Self-heal, closed.** [`BARRIER_UNHEALTHY`]'s ledger already says it is "dropped by any drain that
+// observes `BLIT_ACTIVE == 0`", but the only implementation of that was [`barrier_stalled`], read at
+// drain ENTRY — so an interactive drain that DECLINED never spun, never observed zero, and the latch
+// could only lift on some later drain that happened to arrive after recovery. With the yield arm the
+// declining drain can now succeed instead, so the clear is also performed at the loop's successful
+// EXIT. That is what makes drag RETURN after the first honest completion rather than staying refused.
+//
+// **Arch-neutral in its PRIMITIVES; NOT arch-neutral in what a yield can do.** The landing said
+// "nothing above is aarch64-specific", and the half of that which is true is the half about the
+// primitives: `wm.rs` is shared, x86's router reaches the identical
+// `drag_begin`/`drag_motion`/`move_to_inner`, `irqs_masked` and `current_name` are the arch-neutral
+// pair, and x86's own `close_owner` runs from its `sched::exit` with IF=0 exactly as the Pi's does.
+// The hazard is structural — a spinning core cannot dispatch the holder pinned to it — so gating the
+// cure on `target_arch` would leave the identical livelock armed on the other lane with no hardware
+// reason for the asymmetry, which is the argument DRAGWEDGE already made one arc earlier. All of that
+// stands.
+//
+// DRAGFIX M2 CORRECTS THE CLAIM WHERE IT MATTERS. `yield_now()` is arch-neutral in NAME only:
+//
+//   * x86_64 (`arch/x86_64/sched.rs::yield_now`) saves IF, switches to the scheduler, and RETURNS.
+//     It has no kill boundary. A drain that yields there always comes back to its own frame.
+//   * aarch64 (`arch/aarch64/sched.rs::yield_now`) masks and then calls `kill_check_current()`,
+//     which is documented "never returns if this task has been killed" — it calls `exit()`. So on
+//     this lane a yielding drain is a DIVERGENCE POINT: a task with a kill pending enters the yield
+//     arm and never comes out of it.
+//
+// ⚠ **THE COUNT THAT DIVERGENCE STRANDS — AN OWED CURE, NOT A LANDED ONE.** `drain_bounded` raises
+// `DRAIN_PENDING` at its head and the `DrainBarrier` that lowers it is a value returned to the
+// CALLER, so between those two points the count is held by a live stack frame and by nothing else.
+// A task that diverges in between leaks it permanently, and a permanently raised `DRAIN_PENDING`
+// makes every `composite_inner` take its barrier early-return: the PA38 shape, a live kernel behind
+// a frozen panel. Reachable from EL0 through `sys_win_move`/`sys_win_close` (task-current and
+// unmasked — which is `drain_can_yield`'s condition exactly), and note that the yield arm is not the
+// only door: `timer_preempt()` carries the same on-CPU kill boundary, so ANY unmasked drain can
+// diverge and the interactive path has been unmasked since before this arc. The yield arm did not
+// create the hazard; it widened it from "killed during a quantum tick" to "killed during a 250 ms or
+// 2000 ms park with an explicit boundary on every pass", which is a large multiplier on an
+// already-live defect.
+//
+// **Moving the `DrainBarrier` construction ahead of the yield does NOT fix this, and must not be
+// landed as though it did.** The target is built `panic-strategy: abort` (`aarch64-unaos.json`) and
+// `exit()` diverges by switching away from the task's own stack, so no unwinding runs and no drop
+// glue on the abandoned frames runs either. An RAII guard constructed before the yield strands its
+// count in precisely the same way as the bare `fetch_add` does — the guard shape cures a fix that
+// RETURNS, and this one does not return. The same argument disposes of the parallel `F4W_IN_SPIN`
+// leak (raised inside the loop, lowered after it): witness-only, so it costs a wrong rollup rather
+// than a frozen panel, but it is stranded by the identical mechanism and by no other.
+//
+// What the cure actually needs is a release the DYING task performs — the raise recorded with its
+// owner, and reconciled from the retirement path (`exit()` / `retire_killed`) rather than from a
+// stack frame that will not run again. That reaches outside `wm.rs` into `arch/*/sched.rs`, which is
+// outside this arc's lane, so it is NAMED here rather than half-cured: a partial guard would leave
+// the freeze reachable while reading, in the ledger and in review, as closed.
+//
+// ✅ **DRAINRESCUE LANDS THAT CURE, and corrects the cross-arch claim above in one place.** The owner
+// registry and [`drain_release_dead`] are below, next to `DrainBarrier`; `exit()` and the off-CPU reap
+// arm call the release on both lanes. The correction: **the hazard is NOT aarch64-only.** The
+// paragraph above is right that x86's `yield_now` has no kill boundary — a drain that yields there
+// always returns to its own frame — but x86 does not retire killed tasks at boundaries the task walks
+// into; it retires them from the SCHEDULER side. `run()`'s READY arm tests `task_kill_armed` on every
+// task that switches back preempted-or-yielded and calls `reap_killed` instead of requeueing it. The
+// interactive drain is unmasked by construction (that is `drain_can_yield`'s own precondition), so a
+// `sys_win_move` drain preempted by the local-APIC timer with a `KillSwitch` armed is retired without
+// ever returning to the frame holding its raise — the identical leak, delivered at a different point.
+// So the x86 release is load-bearing rather than symmetric dead code, and both hooks are real.
+
+/// DRAGFIX — spins a wait may take before the same-core arms are consulted at all.
+///
+/// **Not zero, and the reason is the migration caveat.** [`BLIT_NET_CORE`] is indexed by the core the
+/// guard was ENTERED on, and a task-context holder can migrate mid-blit (that is why the enter-core
+/// is stored in the guard rather than re-read at drop). So `net[me] > 0` is a witness that a guard
+/// entered here has not retired, NOT a proof that its holder is still here. A holder that migrated is
+/// running, its blit is bounded, and the wait will terminate on its own — treating that case as
+/// futile would abandon waits that were about to succeed.
+///
+/// 2^21 is what separates the two, and DRAGFIX M2 re-derives it from the MEASURED tail rather than
+/// the typical pass. The landing sized this at 2^19 — ~5 ms at the ~10 ns/spin figure
+/// [`DRAIN_STALL_SPINS`] is calibrated on — and argued it against `pass_us=3294`, the TYPICAL
+/// composite. But the same arc's own `[wc-k]` rollup recorded `maxpresent_us=12219`: a present tail
+/// of 12.2 ms on this panel, measured, in the landing's own message. A grace under the tail defeats
+/// its own design — [`BLIT_NET_CORE`] counts a migrated holder against the core it ENTERED on (that
+/// indexing is deliberate; see the caveat above), so a holder that migrated and is running a
+/// genuinely slow 12 ms pass still reads as `net[me] > 0` here, and at 5 ms the drain would consult
+/// the arms and yield or skip on a futility verdict that was false. 2^21 is ~21 ms, covering the
+/// measured 12.2 ms tail with ~70% margin, and it stays 16x under [`DRAIN_MOVE_SPINS`] and 512x under
+/// [`DRAIN_ABANDON_SPINS`] — a wait that IS futile costs ~21 ms against 340 ms or several seconds,
+/// which is the ratio the arms were landed for.
+///
+/// **A precision knob, not a correctness one.** A false-futile verdict costs an early yield or an
+/// early abandon and nothing else: the barrier stays RAISED through both arms (the property the SKIP
+/// arm's own note is careful about), so the protection is identical whichever way the verdict falls
+/// and only the WAIT is traded. Sizing this is therefore about not spending the arms on waits that
+/// would have terminated on their own — worth getting right, and not load-bearing for safety. Under
+/// the grace the loop is the pre-arc loop exactly.
+const DRAIN_SAMECORE_GRACE: u64 = 1 << 21;
+
+/// DRAGFIX — the INTERACTIVE yielding wait's deadline. A drag report may spend this long parked while
+/// the holder runs; the figure is the drag path's own budget, chosen against [`DRAIN_MOVE_SPINS`]'s
+/// ~340 ms so a yielding wait can never cost the operator MORE than the blind spin it replaces, while
+/// being long enough for several scheduler rounds on a loaded fleet.
+const DRAIN_YIELD_MOVE_MS: u64 = 250;
+
+/// DRAGFIX — the TEARDOWN yielding wait's deadline. Longer than the interactive one because the thing
+/// being waited out here is a blit from a surface about to be unmapped and the WC-B hazard is real
+/// (see the abandon arm's ⚠ note), so this path should try harder before it gives up — and shorter
+/// than [`DRAIN_ABANDON_SPINS`] by three orders, which is the boot-5 multi-minute close, cured.
+const DRAIN_YIELD_TEARDOWN_MS: u64 = 2000;
+
+/// DRAGFIX — drains that entered the yielding wait. Unconditional, on [`DRAIN_ABANDONED`]'s argument:
+/// which arm ran is a fact about the shipped image and the operator is sitting in front of a build
+/// with no witnesses. Published as `ywait=`.
+static DRAIN_YIELD_WAITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAGFIX — yielding waits that DRAINED, i.e. observed `BLIT_ACTIVE == 0` inside their deadline.
+/// `ywait > 0 && ydrain == ywait` is the whole claim of this arc on the wire: the wait that used to
+/// be structurally non-terminating now terminates honestly. Published as `ydrain=`.
+static DRAIN_YIELD_DRAINED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAGFIX — waits abandoned by the SAME-CORE arm because this context could not yield. Counted
+/// separately from [`DRAIN_ABANDONED`] and [`MOVE_DRAIN_GIVEUP`] for the reason those two are counted
+/// separately from each other: it abandons the same thing at a different price, and folding it in
+/// would red a gate written about a different event. Published as `scskip=`.
+static DRAIN_SAMECORE_SKIPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAGFIX — whether the once-per-boot same-core LINE has been printed, on [`DRAIN_ABANDON_REPORTED`]'s
+/// argument. The counters above are not rate-limited.
+static DRAGFIX_REPORTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// DRAGFIX — **is this wait provably futile?** True when a live `BlitGuard` was entered on the core
+/// this drain is spinning on: the spin owns the core, so that holder cannot be dispatched here, and
+/// `BLIT_ACTIVE` cannot reach zero while it stands.
+///
+/// The migration caveat is stated at [`DRAIN_SAMECORE_GRACE`] and is why this is consulted only after
+/// the grace: `net[me] > 0` witnesses a guard ENTERED here, and a holder that has since migrated is
+/// running normally. The grace is what separates "entered here and stuck here" from "entered here and
+/// moved on".
+fn blit_samecore_futile() -> bool {
+    let me = crate::arch::sched::meter_current_cpu().min(7);
+    BLIT_NET_CORE[me].load(core::sync::atomic::Ordering::Relaxed) > 0
+}
+
+/// DRAGFIX — **may this context give up the CPU?** Both halves are required, and both are the tree's
+/// own primitives rather than new ones: IRQs unmasked (WEDGE-8's [`crate::arch::irqs_masked`], which
+/// also forbids aarch64 `yield_now`'s unconditional `unmask_irq` from firing under a teardown that
+/// masked deliberately), and a scheduled task current on this core (the arch-neutral form of the
+/// `sched::current_id().is_some()` test `screen.rs` uses to decide whether it may spawn).
+fn drain_can_yield() -> bool {
+    !crate::arch::irqs_masked() && crate::arch::sched::current_name().is_some()
+}
+
+/// DRAGFIX — the YIELDING wait. Parks this task until `BLIT_ACTIVE` falls to zero or `budget_ms`
+/// elapses; returns whether it drained.
+///
+/// The caller must have established [`drain_can_yield`]. Wall-clock rather than a spin count because
+/// this arm is unmasked by construction and a spin count means nothing across a context switch — see
+/// the DRAGFIX ledger, and [`DRAIN_ABANDON_SPINS`] for why the MASKED arms reason in spins instead.
+///
+/// The deadline is re-derived from [`crate::arch::ms`] each pass and compared with `wrapping_sub`, so
+/// a timebase wrap costs at most one extra pass rather than an unbounded wait.
+///
+/// ⚠ **DRAGFIX M2 — this call may not return, on aarch64 only.** `yield_now()` is arch-neutral in name
+/// and not in behaviour: the aarch64 one runs `kill_check_current()`, which `exit()`s a task with a
+/// kill pending, while the x86 one has no kill boundary at all. A drain diverging here strands
+/// `DRAIN_PENDING` (and, on witness builds, `F4W_IN_SPIN`) because `panic-strategy: abort` plus a
+/// switch-away means no drop glue runs on the abandoned frames — so no RAII guard placed in this
+/// function can cure it. The full statement of the hazard, why the guard shape does not close it, and
+/// what the cure needs, are in the DRAGFIX ledger's cross-arch paragraph above.
+///
+/// ✅ DRAINRESCUE closes the `DRAIN_PENDING` half: the raise is recorded against the owning task and
+/// released from the scheduler's retirement path, so a divergence here costs a rescued count on the
+/// `[wedge1] dwell` line rather than a frozen panel. `F4W_IN_SPIN` is deliberately NOT covered — it is
+/// witness-only, so its leak costs a wrong rollup and not a freeze, and covering it would put a second
+/// registry on the drain's hot path for a number nobody steers on.
+fn drain_yield_wait(budget_ms: u64) -> bool {
+    use core::sync::atomic::Ordering;
+    DRAIN_YIELD_WAITS.fetch_add(1, Ordering::Relaxed);
+    let t0 = crate::arch::ms();
+    loop {
+        if BLIT_ACTIVE.load(Ordering::Acquire) == 0 {
+            DRAIN_YIELD_DRAINED.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        if crate::arch::ms().wrapping_sub(t0) >= budget_ms {
+            return false;
+        }
+        // The whole point: hand the core to the holder that this wait has been starving.
+        crate::arch::sched::yield_now();
+    }
+}
 
 // ---- WEDGE-1r2 — the drain barrier's silence, made readable --------------------------------------
 //
@@ -7544,9 +8495,172 @@ const DRAIN_DWELL_STEP: u64 = 1 << 12;
 #[cfg(feature = "witness")]
 const DRAIN_DWELL_NOTE: u64 = 1 << 16;
 
+// ---- DRAINRESCUE — the raise recorded with its OWNER, released by the death path ----------------
+//
+// **What this closes.** The DRAGFIX M2 ledger's ⚠ paragraph above names the standing defect and
+// declines to half-cure it: `drain_bounded` raises `DRAIN_PENDING` at its head and lowers it from a
+// `DrainBarrier` living on the caller's stack, so a task that DIVERGES between those two points
+// leaks the count permanently — and a permanently raised `DRAIN_PENDING` makes every
+// `composite_inner` take its barrier early-return, which is a live kernel behind a frozen panel (the
+// PA38 shape). The target is `panic-strategy: abort` and every death path diverges by switching off
+// the task's own stack, so NO drop glue runs on the abandoned frames and no RAII guard placed
+// anywhere in the drain can cure it. That is the whole argument for this registry: the cure has to be
+// performed by something that still runs after the frame is gone, and the only such thing is the
+// scheduler's retirement path.
+//
+// **The shape.** The raise is recorded against the id of the task that took it; `DrainBarrier` carries
+// that id (rather than re-reading `current_id` at drop, which a migration or a mis-paired drop could
+// make lie); the death paths call [`drain_release_dead`], which reconciles whatever the dead task
+// still holds.
+//
+// **How many raises can one task hold?** Verified one, and the registry does not depend on it.
+// `drain_bounded` has six call sites — `move_to_inner`, `close`, `close_owner`, `minimise`, `zoom`
+// and the `dragwedge` fixture — and none of them is reachable from inside another's barrier scope
+// (`close_owner` clears its rows directly rather than calling `close`; the erase paths take their
+// barrier around a straight-line erase/damage/present sequence). So a per-task SINGLE slot would be
+// exact today. It is written as a scan for EVERY slot the id holds anyway, because that costs one
+// extra load on a path that already scans and makes the structure indifferent to a future nesting —
+// a nested raise simply takes a second slot and is released with the first.
+//
+// **Capacity, stated honestly.** Eight slots against `MAX_KILL_REQS`-scale concurrency is generous,
+// but the registry must NEVER block a drain: bookkeeping that can refuse would turn a full table into
+// a teardown stall, which is a worse failure than the one being cured. So a raise that finds no free
+// slot proceeds UNRECORDED — exactly today's behaviour, no worse — and is counted in
+// [`DRAIN_UNOWNED`] so the gap is visible on the wire rather than inferred. `rescued=` is only ever a
+// claim about the raises that WERE recorded.
+//
+// **Idempotence.** `exit()` and an off-CPU reaper can both name one task (they cannot in fact both
+// fire for the same task, but the release must not depend on that). The slot claim is a
+// `compare_exchange` from the owner id to `0`, so exactly one caller wins each slot and a second
+// release finds nothing and decrements nothing. Under-decrement is impossible for the same reason.
+//
+// **Cost, byte-identity stated honestly.** This bookkeeping is UNCONDITIONAL — it is not behind a
+// knob, because the freeze it cures is not behind a knob either. Knob-off therefore MOVES: every
+// drain raise gains one relaxed scan-and-claim over an eight-entry array and every lower gains the
+// matching release, and every task death gains one such scan. Against a drain that spins for
+// milliseconds and a death that tears down an address space, that is not measurable; it is recorded
+// here because "no behaviour change" would be false.
+
+/// DRAINRESCUE — outstanding raises the owner registry can record at once. See the capacity note in
+/// the ledger above: overflow degrades to today's unrecorded raise, it does not block.
+const DRAIN_OWNER_SLOTS: usize = 8;
+
+/// DRAINRESCUE — the owner registry. Each entry holds the task id of one outstanding `DRAIN_PENDING`
+/// raise; `0` is free (and is also the id used for a raise taken outside any scheduled task, which is
+/// unrecordable by construction — the scheduler will never retire a task for it).
+static DRAIN_OWNERS: [core::sync::atomic::AtomicU64; DRAIN_OWNER_SLOTS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; DRAIN_OWNER_SLOTS];
+
+/// DRAINRESCUE — raises that could NOT be recorded: taken outside a scheduled task, or with the
+/// registry full. These are the raises a death would still strand, and the number is the honest
+/// scope limit on `rescued=`. Published as the `unowned=` half of the rescue line.
+static DRAIN_UNOWNED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAINRESCUE — raises RELEASED by a dying owner, i.e. leaks that would have frozen the panel and
+/// did not. Raw cumulative, unconditional, on [`DRAIN_ABANDONED`]'s argument. Published as `rescued=`
+/// on the `[wedge1] dwell` line.
+static DRAIN_RESCUED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAINRESCUE — whether the once-per-boot rescue LINE has been printed, on [`DRAGFIX_REPORTED`]'s
+/// argument. The counter above is not rate-limited.
+static DRAIN_RESCUE_REPORTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// DRAINRESCUE — the id this drain is owned by, or `0` outside a scheduled task (the boot path, an
+/// interrupt context, the scheduler itself). `0` is not recordable and is counted as unowned.
+fn drain_owner_id() -> u64 {
+    crate::arch::sched::current_id().unwrap_or(0)
+}
+
+/// DRAINRESCUE — record that `owner` holds one outstanding raise. Never fails, never blocks; an
+/// unrecordable raise bumps [`DRAIN_UNOWNED`] and proceeds.
+fn drain_note_raise(owner: u64) {
+    use core::sync::atomic::Ordering;
+    if owner == 0 {
+        DRAIN_UNOWNED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    for slot in DRAIN_OWNERS.iter() {
+        if slot
+            .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+    }
+    DRAIN_UNOWNED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// DRAINRESCUE — retire ONE recorded raise for `owner`. Called from [`DrainBarrier::drop`], i.e. on
+/// every drain that actually returns. A raise that was never recorded finds nothing and is a no-op,
+/// which is why this may not be used to decide whether to lower `DRAIN_PENDING`.
+fn drain_note_lower(owner: u64) {
+    use core::sync::atomic::Ordering;
+    if owner == 0 {
+        return;
+    }
+    for slot in DRAIN_OWNERS.iter() {
+        if slot
+            .compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+/// DRAINRESCUE — **THE CURE.** Release every drain raise `task_id` still holds and could no longer
+/// release itself, and report whether any was found.
+///
+/// Called from the scheduler's retirement paths — `exit()` (the on-CPU funnel, which every
+/// `kill_check_current`, fault-kill and `sys_exit` reaches) and the off-CPU reap arm — AFTER the
+/// address-space teardown those paths perform, because that teardown itself routes through
+/// `clear_handle_row` → [`close_owner`], which raises and lowers a barrier of its own under this very
+/// id. Releasing first would reconcile a task that is about to raise again.
+///
+/// Idempotent by construction: the slot is taken with a `compare_exchange` off the owner id, so two
+/// callers naming one task cannot both claim the same slot and the count cannot be double-lowered.
+pub fn drain_release_dead(task_id: u64) -> bool {
+    use core::sync::atomic::Ordering;
+    if task_id == 0 {
+        return false;
+    }
+    let mut freed = 0u64;
+    for slot in DRAIN_OWNERS.iter() {
+        if slot
+            .compare_exchange(task_id, 0, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            // The slot is ours and no other caller can hold it, so this lower is owed exactly once.
+            DRAIN_PENDING.fetch_sub(1, Ordering::AcqRel);
+            freed += 1;
+        }
+    }
+    if freed == 0 {
+        return false;
+    }
+    DRAIN_RESCUED.fetch_add(freed, Ordering::Relaxed);
+    // One line per boot, on `DRAIN_ABANDONED`'s pattern: the operator is sitting in front of a build
+    // whose panel did NOT freeze, and the reason belongs on the wire once. Bracket-free so it reads
+    // as an event rather than as a rollup field. The cumulative count is on every `[wedge1] dwell`.
+    if !DRAIN_RESCUE_REPORTED.swap(true, Ordering::Relaxed) {
+        serial_println!(
+            ":: wedge1 DRAIN RESCUED task={} freed={} pending={} unowned={} == owner-release ::",
+            task_id,
+            freed,
+            DRAIN_PENDING.load(Ordering::Acquire),
+            DRAIN_UNOWNED.load(Ordering::Relaxed),
+        );
+    }
+    true
+}
+
 /// F4 — a teardown's phase barrier, RAII so the barrier always re-opens. Raised by
 /// [`close`]/[`close_owner`] and dropped once the drain has completed.
-struct DrainBarrier;
+///
+/// DRAINRESCUE — carries the id of the task that RAISED it, so the lower retires the same registry
+/// slot the raise took even if the task has since migrated. See the DRAINRESCUE ledger above.
+struct DrainBarrier(u64);
 
 impl DrainBarrier {
     /// Raise the barrier and wait out the composites that snapshotted before it went up.
@@ -7563,6 +8677,21 @@ impl DrainBarrier {
     /// livelock would have been a dead core rather than a slow one. With the barrier up the wait set
     /// is fixed at entry, finite, and every member is running a bounded panel-clipped blit.
     fn drain() -> Self {
+        Self::drain_bounded(DRAIN_ABANDON_SPINS, false)
+    }
+
+    /// DRAGWEDGE — [`DrainBarrier::drain`] with the wait's BOUND named by the caller.
+    ///
+    /// `interactive` says the caller is on the hand-driven path (`move_to_inner`), and it changes two
+    /// things and nothing else: the wait is DECLINED outright while [`BARRIER_UNHEALTHY`] stands, and
+    /// reaching the bound raises that latch instead of charging [`DRAIN_ABANDONED`]. The teardown
+    /// callers pass `false` and get exactly today's behaviour, bound included — see the DRAGWEDGE
+    /// ledger for why the two paths may not share a bound.
+    ///
+    /// The barrier itself is raised on BOTH paths and on every call, including the declined one: a
+    /// composite that takes the table lock from here on must still see `DRAIN_PENDING` and skip, or
+    /// the caller's erase would race a blit it never even looked for.
+    fn drain_bounded(bound: u64, interactive: bool) -> Self {
         use core::sync::atomic::Ordering;
         // WEDGE-1r2 `<D2>` — the caller's `TABLE` critical section is behind us, the barrier is going
         // up, and this core is about to spin IRQ-masked. Raw and lock-free, for the reason the block
@@ -7574,6 +8703,13 @@ impl DrainBarrier {
         #[cfg(feature = "witness")]
         F4W_DRAINS.fetch_add(1, Ordering::Relaxed);
         DRAIN_PENDING.fetch_add(1, Ordering::AcqRel);
+        // DRAINRESCUE — record the raise against the task that took it, so a death between here and
+        // the `DrainBarrier` returned below can reconcile it. Read BEFORE the wait rather than at the
+        // drop, and carried in the guard: the wait may migrate this task, and a lower must retire the
+        // slot the raise actually took. Ordered AFTER the `fetch_add` so the count is never lowered
+        // by a release that observed a slot the raise had not yet paid for.
+        let owner = drain_owner_id();
+        drain_note_raise(owner);
         // Ordered against the composite registration by the table lock: a composite either took the
         // lock BEFORE the clearing critical section (so it registered, and is counted here) or AFTER
         // (so it sees the raised barrier and never registers).
@@ -7618,7 +8754,50 @@ impl DrainBarrier {
         // instrument that is quiet and an instrument that cannot speak. The `<D!>` token below takes
         // no lock and is emitted BEFORE the print, so from here on this tripwire's silence means the
         // threshold was not reached rather than the report was eaten.
+        // DRAGWEDGE — **the latch, read once per drain.** The call also CLEARS the flag whenever
+        // `BLIT_ACTIVE` is zero, which is what makes the unhealthy state self-healing: every drain on
+        // every path is an opportunity to observe that the compositor has recovered, and the teardown
+        // paths take that opportunity even though they never honour the latch themselves.
+        let stalled = barrier_stalled();
+        // DRAGWEDGE — the DECLINED wait. Boot 1's capture is a spin re-entered once per pointer
+        // report after it had already been proven not to terminate; the bound alone would have made
+        // that a slower freeze rather than none. The barrier stays RAISED (the `DrainBarrier` this
+        // returns), so a composite that takes the table lock from here on still skips — what is given
+        // up is only the wait, which is the same thing the abandon arm below gives up and at the same
+        // already-priced cost.
+        if interactive && stalled {
+            // DRAGFIX — **THE DECLINE IS NO LONGER THE ONLY ANSWER.** The latch says a wait was
+            // recently proven not to terminate; PA45 says WHY — the holder is on this core. Where
+            // this context can schedule, the cure for that is to give the holder the core, and a
+            // yielding wait costs the operator no core time at all. If it drains, the latch is
+            // cleared below and the drag RETURNS, which is the outcome DRAGWEDGE could only decline
+            // its way around.
+            //
+            // Gated on the same-core witness: if the net says the stall is on ANOTHER core, yielding
+            // this one buys nothing, and the pre-arc decline is exactly right. `blit_samecore_futile`
+            // is consulted without the grace here because `stalled` already means a full bound has
+            // been spent proving this wait does not terminate — the grace's job (separating a
+            // migrated holder from a stuck one) is already done by that history.
+            if blit_samecore_futile() && drain_can_yield() {
+                if drain_yield_wait(DRAIN_YIELD_MOVE_MS) {
+                    // Drained. The latch clear is the loop's, and the loop below will fall straight
+                    // through its `while` test — so take it there rather than duplicating it.
+                } else {
+                    MOVE_DRAIN_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                    crate::wedge2::mark("<D3>");
+                    return DrainBarrier(owner);
+                }
+            } else {
+                MOVE_DRAIN_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                crate::wedge2::mark("<D3>");
+                return DrainBarrier(owner);
+            }
+        }
         let mut spins: u64 = 0;
+        // DRAGFIX — has a same-core arm already run for this drain? The arms fire at most once: the
+        // grace is a threshold, not a cadence, and a yielding wait that came back without draining
+        // has had its answer.
+        let mut samecore_tried = false;
         // WEDGE-1r2 — has this drain been charged to `spun`/`in_spin` yet? Set on the FIRST iteration
         // rather than before the loop, so a barrier that found `BLIT_ACTIVE == 0` and never waited is
         // not counted as a wait. `drains` above already counts those.
@@ -7643,6 +8822,68 @@ impl DrainBarrier {
             if spins % DRAIN_DWELL_STEP == 0 {
                 F4W_SPIN_MAX.fetch_max(spins, Ordering::Relaxed);
             }
+            // DRAGFIX — **THE SAME-CORE ARMS.** Past the grace, and only past it, ask whether this
+            // wait can terminate at all. Under the grace the loop is the pre-arc loop exactly: one
+            // extra compare against a constant per iteration, and nothing else. See the DRAGFIX
+            // ledger for the three arms and for why the legality test is taken at runtime.
+            if !samecore_tried && spins >= DRAIN_SAMECORE_GRACE && blit_samecore_futile() {
+                samecore_tried = true;
+                if drain_can_yield() {
+                    // ARM 1 — YIELD. Give the holder the core it has been starved of. If it drains,
+                    // the `while` test below ends the wait normally and the latch clear at the tail
+                    // runs; if it does not, fall back into the spin and let the bound arms have it,
+                    // exactly as before this arc.
+                    if drain_yield_wait(if interactive {
+                        DRAIN_YIELD_MOVE_MS
+                    } else {
+                        DRAIN_YIELD_TEARDOWN_MS
+                    }) {
+                        crate::wedge2::mark("<Dy>");
+                        continue;
+                    }
+                } else {
+                    // ARM 2 — SKIP. Masked, or no task on this core: yielding is illegal and the
+                    // wait is futile, so abandon it NOW rather than burn the bound proving it again.
+                    //
+                    // **The barrier stays RAISED.** This returns through the same tail every other
+                    // arm returns through, so `DRAIN_PENDING` is still up and the `DrainBarrier` this
+                    // call constructs still holds it until the caller drops it — a composite that
+                    // takes the table lock from here on still observes the barrier and still skips.
+                    // What is abandoned is the WAIT and only the wait, which is precisely what the
+                    // `<D3>` decline arm above and the bound-reached arm below already abandon, at
+                    // the price their own ledgers have already accepted. Nothing is weakened; the
+                    // sanctioned outcome is simply reached without paying for the proof twice.
+                    crate::wedge2::mark("<Ds>");
+                    DRAIN_SAMECORE_SKIPS.fetch_add(1, Ordering::Relaxed);
+                    if interactive {
+                        // The interactive path's downstream policy — `drag_motion` cancelling the
+                        // gesture, `drag_begin` refusing a new one — keys on the latch and on
+                        // `MOVE_DRAIN_GIVEUP`, and this IS an interactive give-up: same abandoned
+                        // wait, same standing barrier, arrived at sooner. Charging it identically is
+                        // what keeps that policy (and `dragwedge_selftest`'s legs 3-5) intact.
+                        MOVE_DRAIN_GIVEUP.fetch_add(1, Ordering::Relaxed);
+                        BARRIER_UNHEALTHY.store(true, Ordering::Relaxed);
+                    } else {
+                        // NOT charged to `DRAIN_ABANDONED`: the pi4 spec FORBIDs `abandoned=[1-9]`
+                        // by name and that forbid was written about the full-bound teardown
+                        // abandonment. `scskip=` is its own field for the same reason `mvgiveup=`
+                        // is — see [`MOVE_DRAIN_GIVEUP`].
+                    }
+                    if !DRAGFIX_REPORTED.swap(true, Ordering::Relaxed) {
+                        serial_println!(
+                            ":: [wedge1] DRAIN SAME-CORE core={} blit_active={} pending={} spins={} interactive={} == futile-skip ::",
+                            crate::arch::sched::meter_current_cpu(),
+                            BLIT_ACTIVE.load(Ordering::Acquire),
+                            DRAIN_PENDING.load(Ordering::Acquire),
+                            spins,
+                            interactive
+                        );
+                        #[cfg(feature = "witness")]
+                        blitwho_report(crate::arch::sched::meter_current_cpu());
+                    }
+                    break;
+                }
+            }
             if spins == DRAIN_STALL_SPINS && !DRAIN_STALL_REPORTED.swap(true, Ordering::Relaxed) {
                 // WEDGE-1r2 `<D!>` — THE TRIPWIRE FIRED, said without taking a lock, and said BEFORE
                 // the line below. The tripwire's own note concedes that a wedge in the serial path
@@ -7660,6 +8901,97 @@ impl DrainBarrier {
                     spins
                 );
             }
+            // DRAINSTALL (PA38 metal) — **THE WAIT ENDS.** Past this point the loop stops being a
+            // wait and becomes a hang, and PA38 measured what that costs: a core pinned at 99% with
+            // `DRAIN_PENDING` standing, every `composite_inner` taking its barrier early-return
+            // (`[sched6] composites=0/s`), EL0 totals frozen at 147369 while the service lane climbed
+            // — a live kernel behind a dead panel, unrecoverable without a power cycle.
+            //
+            // **What the barrier buys, and what it therefore costs to abandon — stated honestly,
+            // because this is the one edit in this arc that trades a protection for a bound.** The
+            // barrier exists so that no composite which snapshotted a row before the teardown cleared
+            // it can still be blitting from that row's surface when the caller returns. `close_owner`'s
+            // own note prices the failure exactly: *"today that would be a stale read, but under WC-B's
+            // per-ASID surface mappings it becomes a kernel abort mid-blit."* WC-B is not landed. So
+            // the cost of abandoning TODAY is a stale rectangle — one wrong frame, self-healing at the
+            // next present — and the cost of not abandoning was measured on PA38 as the whole machine.
+            //
+            // ⚠ **WC-B MUST REVISIT THIS.** When per-ASID surface mappings land, a stale read becomes
+            // a fault and this trade inverts. The abandon arm then needs an answer that is not "carry
+            // on" — the shape available is the one `cursor.rs` already uses for its own refusals: OWE
+            // the unsafe half rather than perform it. That work is not this arc's, and it is named
+            // here rather than left for the next reader to rediscover from a crash.
+            //
+            // The abandonment can never be silent — but DRAGFIX M2 states WHICH abandonment, because
+            // there are now two classes and only one of them reds a gate.
+            //
+            //  1. **BOUND-REACHED teardown abandonment — this arm.** `DRAIN_ABANDONED` is charged
+            //     unconditionally here and appears on every `[wedge1] dwell` line as `abandoned=`,
+            //     whose verdict goes to `ABANDONED` — a reading the spec battery FORBIDS by name. A
+            //     boot that reaches THIS arm reds the gate instead of quietly shipping a stale frame.
+            //     That forbid was written about this event and must keep meaning exactly it.
+            //  2. **SAME-CORE FUTILE decline — the SKIP arm above.** It abandons the wait WITHOUT
+            //     charging `abandoned=`, deliberately, and its witness is its own field: `scskip=`,
+            //     nonzero meaning a wait was declined because the holder's guard was entered on the
+            //     core the drain is spinning on and the full bound would have proved only that. The
+            //     spec REQUIREs the field's presence and does not forbid a count, for the reason
+            //     `mvgiveup=`/`mvskip=` are separate fields rather than folded in: these are
+            //     legitimate outcomes on metal, and folding them under `abandoned=`'s forbid would
+            //     red a gate on a decline the design asks for.
+            //
+            // What the two classes SHARE is the protection, and that is the point: **the barrier
+            // stays RAISED on both.** Neither class returns without the `DrainBarrier` the caller
+            // drops, so a composite taking the table lock still observes `DRAIN_PENDING` and still
+            // skips in either case. The difference between them is only how much bound was spent
+            // before the wait was given up, which is what makes it right to price them apart.
+            if spins >= bound {
+                // Lock-free first, exactly as `<D!>` is: the fact that the bound was reached must
+                // survive a serial path that is itself the wedge.
+                crate::wedge2::mark("<D?>");
+                // DRAGWEDGE — the two give-ups are counted and reported SEPARATELY. They abandon
+                // different things at different prices (see the DRAGWEDGE ledger), the pi4 spec
+                // forbids the teardown one by name, and an interactive give-up must be able to
+                // happen on a busy panel without reding a gate that was written about teardown.
+                if interactive {
+                    MOVE_DRAIN_GIVEUP.fetch_add(1, Ordering::Relaxed);
+                    // THE LATCH. Raised here and nowhere else: this is the one place the system has
+                    // just PROVED that waiting does not terminate, which is exactly the fact the
+                    // drag path needs and the fact boot 1 re-discovered several thousand times.
+                    BARRIER_UNHEALTHY.store(true, Ordering::Relaxed);
+                    if !MOVE_DRAIN_REPORTED.swap(true, Ordering::Relaxed) {
+                        serial_println!(
+                            ":: [wedge1] MOVE DRAIN GAVE UP core={} blit_active={} pending={} spins={} == interactive-bound ::",
+                            crate::arch::sched::meter_current_cpu(),
+                            BLIT_ACTIVE.load(Ordering::Acquire),
+                            DRAIN_PENDING.load(Ordering::Acquire),
+                            spins
+                        );
+                        // BLITWHO — name the holder while the stall is live. PA44 metal (2026-08-18)
+                        // photographed this arm with three candidate mechanisms still standing:
+                        // pinned-holder starved by this very spin, cross-core starvation, or a guard
+                        // leaked by an off-CPU kill. The per-core net + last-enterer discriminate.
+                        #[cfg(feature = "witness")]
+                        blitwho_report(crate::arch::sched::meter_current_cpu());
+                    }
+                } else {
+                    DRAIN_ABANDONED.fetch_add(1, Ordering::Relaxed);
+                    if !DRAIN_ABANDON_REPORTED.swap(true, Ordering::Relaxed) {
+                        serial_println!(
+                            ":: [wedge1] DRAIN ABANDONED core={} blit_active={} pending={} spins={} == bounded-wait ::",
+                            crate::arch::sched::meter_current_cpu(),
+                            BLIT_ACTIVE.load(Ordering::Acquire),
+                            DRAIN_PENDING.load(Ordering::Acquire),
+                            spins
+                        );
+                        // BLITWHO — same discriminator on the teardown arm: boot5's multi-minute
+                        // vug-close freeze paid this bound serially with kill_offcpu=3 on the
+                        // ledger, which is the leak-shaped candidate this line can convict.
+                        #[cfg(feature = "witness")]
+                        blitwho_report(crate::arch::sched::meter_current_cpu());
+                    }
+                }
+                break;
+            }
         }
         #[cfg(feature = "witness")]
         if entered {
@@ -7668,16 +9000,34 @@ impl DrainBarrier {
             F4W_SPIN_MAX.fetch_max(spins, Ordering::Relaxed);
             F4W_IN_SPIN.fetch_sub(1, Ordering::Relaxed);
         }
+        // DRAGFIX — **THE SELF-HEAL, FINALLY IMPLEMENTED WHERE ITS LEDGER SAYS IT IS.**
+        // [`BARRIER_UNHEALTHY`]'s note has always said the latch is "dropped by any drain that
+        // observes `BLIT_ACTIVE == 0`", but the only code that did so was [`barrier_stalled`], read at
+        // drain ENTRY — so a drain that arrived latched declined, never spun, never observed zero, and
+        // the latch could only lift on some LATER drain that happened to arrive after recovery. With
+        // the yield arm a declining drain can now succeed instead, and this is where that success is
+        // banked: reaching here with the count at zero is proof the barrier converged, whichever arm
+        // got it there. It is what makes drag RETURN after the first honest completion rather than
+        // staying refused for the rest of the gesture. A plain store would be correct; the load first
+        // keeps the healthy path off a shared line it has never written.
+        if BLIT_ACTIVE.load(Ordering::Acquire) == 0 && BARRIER_UNHEALTHY.load(Ordering::Relaxed) {
+            BARRIER_UNHEALTHY.store(false, Ordering::Relaxed);
+        }
         // WEDGE-1r2 `<D3>` — the spin returned. `<D2>` with no `<D3>` puts the death in the spin
         // itself, which is the one region WEDGE-1's tripwire CAN see — and pairs with `<D!>` to say
         // whether it got far enough to try.
         crate::wedge2::mark("<D3>");
-        DrainBarrier
+        DrainBarrier(owner)
     }
 }
 
 impl Drop for DrainBarrier {
     fn drop(&mut self) {
+        // DRAINRESCUE — retire the registry slot BEFORE the count, so a release racing a legitimate
+        // drop can never find a slot whose count has already been lowered. (The two cannot in fact
+        // race — a task is not retired while it is executing its own drop glue — but the order costs
+        // nothing and makes the argument local.)
+        drain_note_lower(self.0);
         DRAIN_PENDING.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
     }
 }
@@ -8036,9 +9386,15 @@ static CUR12_HIDDEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 static CUR12_NOHIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// CURSOR-12 — a WC-F reserved box overlapped the sprite, so the pass took CURSOR-3's whole-sprite
-/// bracket deliberately. On aarch64 (witness+baremetal) this is the WC-F probe; on x86 (`wc`) it is
-/// MENU-UNDER's open-dropdown decline — each is structurally 0 on the other arch, so the field
-/// never mixes the two.
+/// bracket deliberately. Two sources feed it: the WC-F probe (aarch64, witness+baremetal) and
+/// MENU-UNDER's furniture decline — the open SHARD dropdown and the dock.
+///
+/// TRUNK LANDING 2026-08-19: MENU-UNDER's sites were widened from `all(x86_64, wc)` to
+/// `any(all(x86_64, wc), all(aarch64, pidesk))`, so the old claim that each source is
+/// "structurally 0 on the other arch" NO LONGER HOLDS: an aarch64 `pidesk` build compiles both,
+/// and this one field can mix them. It still answers exactly one question — how many passes
+/// declined the overlay for a reserved box — which is what it is read against `budget` for; it no
+/// longer attributes WHICH box, and a per-source split would need two counters.
 #[cfg(feature = "witness")]
 static CUR12_RESERVED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -9116,15 +10472,73 @@ fn wedge1_dwell_emit(span: u64) {
     // A GAUGE — loaded, never drained. Draining it would report a stuck core once and then forget it,
     // which is the opposite of what a standing count is for.
     let in_spin = F4W_IN_SPIN.load(Relaxed);
+    // DRAINSTALL — a GAUGE like `in_spin`, loaded and never drained: an abandonment is a permanent
+    // fact about this boot (a stale rectangle was allowed onto the panel), not a per-window rate, and
+    // draining it would let the very next rollup read clean over it.
+    let abandoned = DRAIN_ABANDONED.load(Relaxed);
+    // DRAGWEDGE — the interactive path's two terms, GAUGES for the same reason `abandoned` is: a
+    // give-up is a permanent fact about the boot, and `skipped` is the count of pointer reports the
+    // latch saved from re-entering a wait already proven not to terminate. Named `mvgiveup=`/
+    // `mvskip=` rather than `move_abandoned=` deliberately — see [`MOVE_DRAIN_GIVEUP`].
+    let mvgiveup = MOVE_DRAIN_GIVEUP.load(Relaxed);
+    let mvskip = MOVE_DRAIN_SKIPPED.load(Relaxed);
+    // DRAGFIX — **WHICH ARM RAN.** GAUGES, on the same argument the two above are: an arm that fired
+    // is a permanent fact about this boot, and draining would let the next rollup read clean over it.
+    // `ywait`/`ydrain` are the arc's claim in two numbers — waits that parked to let the holder run,
+    // and the subset that then DRAINED — and `scskip` is the unyieldable case, abandoned at once
+    // instead of after the full bound. All three are bracket-free and none collides with the spec's
+    // `abandoned=[1-9]` forbid; see [`DRAIN_SAMECORE_SKIPS`].
+    let ywait = DRAIN_YIELD_WAITS.load(Relaxed);
+    let ydrain = DRAIN_YIELD_DRAINED.load(Relaxed);
+    let scskip = DRAIN_SAMECORE_SKIPS.load(Relaxed);
     // Lens fix (s1u): the quiet-window early-out must also test the spin evidence. The swaps above
     // have already drained `spun`/`spin_max`, so a drain that straddled the previous rollup boundary
     // (counted there as `drains`, its spin published here) would have its DWELL evidence silently
     // dropped by a `drains==0` return — banking QUIET for a window that measured a stall.
-    if drains == 0 && in_spin == 0 && spun == 0 && spin_max == 0 {
+    if drains == 0
+        && in_spin == 0
+        && spun == 0
+        && spin_max == 0
+        && abandoned == 0
+        && mvgiveup == 0
+        && mvskip == 0
+        // DRAGFIX — the arm evidence joins the quiet-window early-out on the s1u lens argument: a
+        // window whose only evidence is a yielding wait may not be silently dropped.
+        && ywait == 0
+        && scskip == 0
+    {
         return;
     }
-    let verdict = if in_spin > 0 {
+    // DRAINSTALL — ABOVE `INFLIGHT`, and deliberately. An abandonment is the strongest thing this
+    // instrument can report: the bound was reached, the wait was given up, and the panel may hold a
+    // rectangle no longer backed by a live row. A window that has one may not be described by any
+    // milder verdict, however healthy the rest of its numbers look.
+    let verdict = if abandoned > 0 {
+        "ABANDONED"
+    } else if mvgiveup > 0 {
+        // DRAGWEDGE — BELOW `ABANDONED` and above every healthy reading. An interactive give-up says
+        // the compositor stopped retiring blits for at least a millisecond while a hand was on a
+        // window; that is a real finding and may not be described as INFLIGHT or QUIET. It is not
+        // `ABANDONED`, because nothing about to be unmapped was read — the trade this arm makes is a
+        // stale rectangle on a LIVE row, which the next present repairs.
+        "MOVE-GAVE-UP"
+    } else if scskip > 0 {
+        // DRAGFIX — a TEARDOWN same-core skip (the interactive one already reads MOVE-GAVE-UP, which
+        // it charges). Below `ABANDONED` because it is a different event that the spec's forbid was
+        // not written about, and above every healthy reading because it IS an abandoned wait: the
+        // barrier stayed raised, but a blit from a surface the caller is about to unmap was not
+        // waited out. Under WC-B this is the reading that must be revisited alongside the abandon
+        // arm's own ⚠ note.
+        "SAMECORE-SKIP"
+    } else if in_spin > 0 {
         "INFLIGHT"
+    } else if ywait > 0 && ydrain == ywait {
+        // DRAGFIX — **the cure, on the wire.** Every yielding wait in this window terminated. A
+        // futile same-core wait was met and drained in bounded real time instead of burning a bound
+        // and refusing. Above `DWELL` because a yield necessarily spun past
+        // [`DRAIN_SAMECORE_GRACE`] and would otherwise read as a plain dwell, which is true but
+        // says nothing about the arm that fixed it.
+        "YIELD-DRAINED"
     } else if spin_max >= DRAIN_DWELL_NOTE {
         "DWELL"
     } else if drains == 0 {
@@ -9147,13 +10561,28 @@ fn wedge1_dwell_emit(span: u64) {
         "QUIET"
     };
     serial_println!(
-        "[wedge1] dwell drains={} spun={} spin_max={} note={} in_spin={} tripwire={} span={}ms -> {}",
+        "[wedge1] dwell drains={} spun={} spin_max={} note={} in_spin={} tripwire={} bound={} abandoned={} mvbound={} mvgiveup={} mvskip={} ywait={} ydrain={} scskip={} rescued={} grace={} latched={} span={}ms -> {}",
         drains,
         spun,
         spin_max,
         DRAIN_DWELL_NOTE,
         in_spin,
         if DRAIN_STALL_REPORTED.load(Relaxed) { "fired" } else { "silent" },
+        DRAIN_ABANDON_SPINS,
+        abandoned,
+        DRAIN_MOVE_SPINS,
+        mvgiveup,
+        mvskip,
+        ywait,
+        ydrain,
+        scskip,
+        // DRAINRESCUE — raw cumulative drain raises released by a dying owner. A non-zero value is
+        // the CURE having fired, not a fault: each unit is a `DRAIN_PENDING` leak that would have
+        // frozen the panel for the rest of the boot and did not. Never forbidden by a gate, for
+        // exactly that reason; the field's presence is what is pinned.
+        DRAIN_RESCUED.load(Relaxed),
+        DRAIN_SAMECORE_GRACE,
+        BARRIER_UNHEALTHY.load(Relaxed),
         span,
         verdict
     );
@@ -9578,6 +11007,11 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
     // FLUID-3 — the wait ledger rides the same cadence and the same span.
     #[cfg(target_arch = "aarch64")]
     fluid3_emit(span);
+    // ENGAGE — the owed-tail engagement census rides the same cadence, directly under `[comp2]`
+    // whose `sprite_us`/`max_us` it qualifies: `[comp2]` says what a pass cost, `[wc-tail]` says
+    // whether the cost was paid masked or unmasked. Cumulative, so the last one is the boot.
+    #[cfg(all(target_arch = "aarch64", feature = "witness"))]
+    owedtail_emit();
     // WCSER — the serialisation ledger rides the same cadence and the same span, and sits directly
     // under the per-window `comp_rate=` lines it explains: a `comp_rate` far above `att_rate` with
     // `declined=0` is the occlusion closure doing its job, and the same reading with `declined` high
@@ -9806,7 +11240,7 @@ fn blend_q16(a: u32, b: u32, t: u32) -> u32 {
 /// the middle of the strip and absent below it — which is what "restrained gloss" describes and
 /// what the kit's own sample renders show. The alternative reading (falloff as an exponent) would
 /// need a power function, i.e. float or a table, for no gain the kit asks for.
-fn title_row_color(j: usize, h: usize, focused: bool) -> u32 {
+pub(super) fn title_row_color(j: usize, h: usize, focused: bool) -> u32 {
     use super::theme;
     let (top, bot) = if focused {
         (theme::TITLE_ACTIVE_TOP, theme::TITLE_ACTIVE_BOTTOM)
@@ -9979,7 +11413,7 @@ fn outside_top_corner(r: &Window, px: usize, py: usize) -> bool {
 /// F5 — every product and sum here saturates. The kernel builds with overflow checks off, so a
 /// wrapping `w * scale` would silently produce a SMALL box that then fails to damage the region it
 /// actually paints; saturation degrades to "absurdly large box", which the panel clip then bounds.
-fn outer_box(r: &Window) -> (usize, usize, usize, usize) {
+pub(super) fn outer_box(r: &Window) -> (usize, usize, usize, usize) {
     let cw = r.w.saturating_mul(r.scale);
     let ch = r.h.saturating_mul(r.scale);
     if r.compat {
@@ -10454,7 +11888,7 @@ fn controls_declined_drain() {
 ///
 /// ```text
 /// 2*BORDER + GAP + CTRL_RESERVE + TITLE_CELL_W
-///   = 2*5    + 12  + 120          + 7         = 149 px
+///   = 2*5    + 12  + 120          + 9         = 151 px
 /// ```
 ///
 /// against the 102 the arithmetic used to produce (and the 106 the painter actually needed before a
@@ -10467,6 +11901,14 @@ fn controls_declined_drain() {
 /// themselves. What did NOT move by itself is the width of the fixture surfaces that have to clear
 /// the floor — so they are now sized from [`CLUSTER_MIN_SRC_W`] under a `const` assertion instead
 /// of from a literal with a comment beside it.
+///
+/// ### And AGAIN with FONT-METRIC — which is the point, not an annoyance
+/// The GR27 fonts merge took `TITLE_CELL_W` from the 16 px bitmap cell to the anti-aliased face's
+/// 7 px advance (floor 158 -> 149); FONT-METRIC then derived the CHROME raster from `TITLE_H`
+/// instead of fixing it at the body face's 16 px (advance 7 -> 9, floor 149 -> **151**). Three
+/// moves, three different causes, one unchanged expression — the floor has never once been written
+/// down, which is why each move cost a spec pin and no code. The pin lives at
+/// `scripts/specs/pi4-regression.spec`'s `WMCTRL: controls-declined — floor=` REQUIRE.
 fn controls(r: &Window) -> Option<(usize, usize, usize)> {
     // NORMALWIN — **there is no owner-wide furniture decline any more.** Peter's ruling
     // (2026-08-11): the console window is a normal app window, so it reaches the width test on the
@@ -11166,7 +12608,7 @@ static DO_BURIED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 /// WC-K3 — THE SECOND VERDICT TERM: `DESKTOP_BG` pixels the drain's staged fill published inside the
 /// dragged window's box. The coalesced erase reaching under its own occluder, which is the mechanism
 /// the arc convicted and the one no existing counter could see. See the ledger in [`stage_fill`].
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
 static DO_FILL_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// WCK4 — the dragged window's box as the DRAIN sees it, published by [`erase_clip`] from the same
 /// table read that builds the erase clip.
@@ -11237,7 +12679,7 @@ static DO_FILL_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 /// microseconds later. The failure mode a stale clip cannot produce is the one the arc is about —
 /// publishing desktop over pixels the pass will NOT repaint — because a box that left the clip did so
 /// by moving, and a window that moved is a window this pass repaints.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
 static DO_FILL_BOX: [core::sync::atomic::AtomicUsize; 4] =
     [const { core::sync::atomic::AtomicUsize::new(0) }; 4];
 /// WCK4 — `DESKTOP_BG` pixels the drain's fills actually PUT ON THE PANEL during this gesture.
@@ -11245,12 +12687,12 @@ static DO_FILL_BOX: [core::sync::atomic::AtomicUsize; 4] =
 /// The population every other fill term is a fraction of, and the answer to "is `fill_px=0` a clean
 /// drag or a drain that never ran". A gesture with `fillpub_px=0` has published no desktop at all and
 /// its zeros assert nothing.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
 static DO_FILL_PUB_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// WCK4 — pixels the erase clip WITHHELD from publication during this gesture. The mechanism's own
 /// denominator, `clip_px`'s opposite number: a gesture over a panel full of windows whose
 /// `fillclip_px` is 0 has a clip that never ran, and its `fill_px=0` proves nothing.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
 static DO_FILL_CLIP_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// WCK4 — THE PANEL-WIDE VERDICT TERM: published desktop pixels that landed inside SOME box of the
 /// erase clip, whichever it was.
@@ -11274,7 +12716,7 @@ static DO_FILL_CLIP_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 /// already notes for the banded present), and moving the audit outside the bracket would mean
 /// measuring pixels the bracket did not cover. A tear reported by a witness build is a lead, not a
 /// number.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
 static DO_FILL_OVER_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// WCK4 REVIEW (D1) — **how many boxes the last drain's clip actually held.**
 ///
@@ -11287,7 +12729,7 @@ static DO_FILL_OVER_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 /// there a clip at all, and did it have about the right number of boxes", and a running total over
 /// drains would answer neither. `0` on a gesture with `fillpub_px > 0` is the loud case — desktop
 /// published with nothing on the glass to withhold it from.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
 static DO_CLIP_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 /// WCK4 REVIEW (D1) — **the dock strip as the last drain's clip held it**: `x`, `y`, `w`, `h`, with
 /// `w == 0` meaning the strip was not in the clip at all.
@@ -11301,7 +12743,7 @@ static DO_CLIP_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUs
 /// So the geometry goes on the wire, as `dock=WxH+X+Y` or `dock=absent`. A reader comparing it
 /// against `[dock]`'s own painted rect can see the two agree; a `dock=absent` beside a live strip is
 /// the defect, stated, in the one place a capture can catch it.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
 static DO_DOCK_BOX: [core::sync::atomic::AtomicUsize; 4] =
     [const { core::sync::atomic::AtomicUsize::new(0) }; 4];
 /// STRIPFACTOR — **how many furniture strips were PRESENT in the last drain's clip**, of
@@ -11312,7 +12754,7 @@ static DO_DOCK_BOX: [core::sync::atomic::AtomicUsize; 4] =
 /// checks only `dock=` would read a healthy line while the OTHER strip was being erased with
 /// `fillover_px` at zero — the same blind spot `dock=` itself was added to close, one tenant along.
 /// So the COUNT goes on the wire beside it, as `bars=present/total`.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
 static DO_STRIP_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 /// STRIPFACTOR — the MENU BAR's width in the last drain's clip; `0` for absent.
 ///
@@ -11333,7 +12775,7 @@ static DO_STRIP_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicU
 /// tenant's own accessor is the single source. If the drag battery is ever made concurrent, latch the
 /// pair behind one store (pack both into a single `AtomicU64`, as `PAINTED_RECT` packs a rect) rather
 /// than trusting the sequential ordering this note documents.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
 static DO_BAR_W: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 /// WCK4 REVIEW (D1) — pixels withheld **specifically because of the dock strip** during this gesture.
 ///
@@ -11347,7 +12789,7 @@ static DO_BAR_W: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsi
 /// Zero is legitimate and common (no fill met the strip this gesture). It is a denominator, not a
 /// FORBID: read it WITH `dock=` — `dock=absent` is the finding, `dock=<box> fillclip_dock_px=0` just
 /// means the drag stayed away from the foot of the panel.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
 static DO_FILL_CLIP_DOCK_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// WCK4 REVIEW (D2) — **`blit` calls the drain's fills actually made** during this gesture.
 ///
@@ -11356,7 +12798,7 @@ static DO_FILL_CLIP_DOCK_PX: core::sync::atomic::AtomicU64 = core::sync::atomic:
 /// this arc's lane, so the true number is carried here — see the D2 ledger at the `erase_note` call
 /// in [`stage_fill`]. A gesture whose `fillruns` exceeds its row count had fragmented fills, which is
 /// the clip working; equality means every published row was whole.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
 static DO_FILL_RUNS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// WCK5 — **the dock strip as [`occ_clip`] last built it**: `x`, `y`, `w`, `h`, with `w == 0`
 /// meaning `dock::Layout::for_panel` answered `None` and there is no strip to protect.
@@ -11459,7 +12901,7 @@ impl core::fmt::Display for OccDockBox {
 /// Called from [`erase_clip`] with the rows it just read, so the box and the clip describe the same
 /// instant. `w == 0` (no drag, or its row has gone) leaves every fill uncharged, exactly as
 /// [`dragocc_target`]'s zero does.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
 fn dragfill_box(rows: &[Window; MAX_WINDOWS]) {
     use core::sync::atomic::Ordering::{Acquire, Relaxed};
     let id = DRAG_WIN.load(Acquire);
@@ -11541,7 +12983,7 @@ fn dragocc_target(r: &Window) -> Option<(usize, usize, usize, usize)> {
 /// The verdict term's kernel, and the whole of its independence: it is asked of the bytes a `blit`
 /// just published, against the dragged window's box, with no reference to the [`OccClip`] that chose
 /// the run. Zero when no drag is live.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
 fn span_occ(d: Option<(usize, usize, usize, usize)>, y: usize, x0: usize, x1: usize) -> u64 {
     let Some((dx, dy, dw, dh)) = d else {
         return 0;
@@ -11630,8 +13072,15 @@ fn drag_report(id: WinId, owner: u64, how: &str, moves: u64) {
     // `present()`/`repaint()` does NOT enter `comps` and cannot be caught here; that shape belongs
     // to the `[comp2]`/`[wcn]` censuses.
     let ok = flash == 0 && comps <= moves;
+    // DRAG-PI M2 — the COALESCING ratio, on the same line as the paint budget it explains. `admitted`
+    // is how many pointer reports became repositions and `coalesced` how many were folded into a
+    // later one; `admitted + coalesced` is the reports the gesture saw. The pair is what makes the
+    // pacer falsifiable rather than asserted: with it disarmed `coalesced` reads 0 and `admitted`
+    // tracks the pointer rate, which is precisely the 1:1 coupling this arc convicted.
+    let admitted = DRAG_PACE_ADMITTED.swap(0, Relaxed);
+    let coalesced = DRAG_PACE_COALESCED.swap(0, Relaxed);
     serial_println!(
-        "[drag] win={} owner={:#x} end={} moves={} composites={} erase_rects={} erase_px={} erase_px_pm={} box_px_pm={} flash_px={} -> {}",
+        "[drag] win={} owner={:#x} end={} moves={} composites={} erase_rects={} erase_px={} erase_px_pm={} box_px_pm={} flash_px={} admitted={} coalesced={} -> {}",
         id,
         owner,
         how,
@@ -11642,6 +13091,8 @@ fn drag_report(id: WinId, owner: u64, how: &str, moves: u64) {
         per,
         box_per,
         flash,
+        admitted,
+        coalesced,
         if ok { "ONCE" } else { "FLASH" }
     );
     // WC-K3 — THE OCCLUDEE LINE. A separate line rather than four more fields on `[drag]`, because
@@ -11754,6 +13205,70 @@ fn drag_report(id: WinId, owner: u64, how: &str, moves: u64) {
             );
         }
     }
+    // ERASECLIP M2 — **THE aarch64 ERASE WIRE, and why it is a SEPARATE LINE rather than `[drag-occ]`
+    // with holes in it.**
+    //
+    // `[drag-occ]` above reports a gesture's WHOLE paint budget: the neighbour mask, the window
+    // blit's own bleed (`occ_px`, `clip_px`, `buried`, `direct`) and OCC62's `occclip_*` pairs, all
+    // fed by statics this arc did not port and does not own — that is the drag/blit instrument
+    // §6.10 item 2 assigns to another arc. What ERASECLIP ports is the ERASE half, and only the
+    // erase half.
+    //
+    // Printing that half under the `[drag-occ]` tag with the other fields zeroed or missing is the
+    // exact defect GR13 convicted three instruments for: a field that means one thing on x86 and
+    // another on aarch64, where a reader cannot tell "the term measured zero" from "the term is not
+    // compiled". So the Pi gets its own tag, carrying ONLY terms that are live on it, and every
+    // field on it means precisely what the identically-named field on `[drag-occ]` means.
+    //
+    // §6.10's instruction was "make the aarch64 wire honest — fire the legs, or document the
+    // silence." This fires them. `fillover_px` in particular is the FORBID the erase path owes: it
+    // audits the span walk by asking whether a published pixel landed inside a box the clip HOLDS,
+    // and until this arc it could not be nonzero on aarch64 because the clip was structurally empty.
+    // `clipn=` and `dock=` are beside it for the reason [`DO_FILL_OVER_PX`] gives — a zero
+    // `fillover_px` over an EMPTY clip is a pass by vacancy, and the reader must be able to see that.
+    //
+    // Read `load`-not-`swap` for the shape terms and `swap` for the totals, identically to the x86
+    // arm, so the two lines are comparable field by field across a bench A/B.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let fpx = DO_FILL_PX.swap(0, Relaxed);
+        let fpub = DO_FILL_PUB_PX.swap(0, Relaxed);
+        let fclip = DO_FILL_CLIP_PX.swap(0, Relaxed);
+        let fovr = DO_FILL_OVER_PX.swap(0, Relaxed);
+        let fruns = DO_FILL_RUNS.swap(0, Relaxed);
+        let fdock = DO_FILL_CLIP_DOCK_PX.swap(0, Relaxed);
+        let clipn = DO_CLIP_N.load(Relaxed);
+        let dockw = DO_DOCK_BOX[2].load(Relaxed);
+        let barsn = DO_STRIP_N.load(Relaxed);
+        let barw = DO_BAR_W.load(Relaxed);
+        // Retired with the gesture, on the x86 arm's argument exactly: between two gestures no drain
+        // need run, so a box left standing charges the next gesture's opening fills against geometry
+        // that belonged to the last one.
+        DO_FILL_BOX[2].store(0, Relaxed);
+        // The verdict carries the two FORBIDs the ERASE owns and no others. `fill_px` is the erase
+        // publishing into the dragged window's live box; `fillover_px` is the span walk emitting a
+        // column the clip covered. `occ_px`/`direct` are the window blit's and are not measured here.
+        let clean = fpx == 0 && fovr == 0;
+        if dockw == 0 {
+            serial_println!(
+                "[erase-occ] win={} owner={:#x} moves={} fill_px={} fillpub_px={} fillclip_px={} fillover_px={} fillruns={} clipn={} dock=absent bars={}/{} bar={} fillclip_dock_px={} -> {}",
+                id, owner, moves, fpx, fpub, fclip, fovr, fruns, clipn,
+                barsn, FURNITURE_MAX, barw, fdock,
+                if clean { "CLEAN" } else { "BLEED" }
+            );
+        } else {
+            serial_println!(
+                "[erase-occ] win={} owner={:#x} moves={} fill_px={} fillpub_px={} fillclip_px={} fillover_px={} fillruns={} clipn={} dock={}x{}+{}+{} bars={}/{} bar={} fillclip_dock_px={} -> {}",
+                id, owner, moves, fpx, fpub, fclip, fovr, fruns, clipn,
+                dockw,
+                DO_DOCK_BOX[3].load(Relaxed),
+                DO_DOCK_BOX[0].load(Relaxed),
+                DO_DOCK_BOX[1].load(Relaxed),
+                barsn, FURNITURE_MAX, barw, fdock,
+                if clean { "CLEAN" } else { "BLEED" }
+            );
+        }
+    }
 }
 /// WMDIRECT — `[wm-act]` lines emitted, against [`WM_ACT_LOG_MAX`]. The begin/end/close lines are
 /// human-rate by construction (a hand cannot grab faster than serial can print), but the CANCEL arm
@@ -11796,6 +13311,18 @@ pub fn drag_begin(id: WinId, x: i32, y: i32) -> bool {
     if !title_bar_hit(id, x, y) {
         return false;
     }
+    // DRAGWEDGE — **REFUSE to mint a grab the system cannot service.** A drag is the one gesture that
+    // asks the compositor for work on every pointer report, so a stalled blit barrier turns a new
+    // grab into a report-rate storm against a barrier that has already been proven not to converge —
+    // which is the whole of the PA41 freeze. Refusing is not a loss of function: the router's chrome
+    // arm has already raised and focused the window, and it reports `chrome` instead of `drag` on its
+    // `[clickroute]` line, so the press still SELECTS and the wire says exactly why it did not grab.
+    // Self-healing by construction — `barrier_stalled` clears itself the moment `BLIT_ACTIVE` is
+    // zero, so the operator's next press after the compositor recovers drags normally.
+    if barrier_stalled() {
+        wm_act("drag-refused", id, 0, "barrier-stalled", x as i64, y as i64);
+        return false;
+    }
     let (owner, ox, oy) = {
         let t = table();
         match row(&t, id) {
@@ -11808,6 +13335,13 @@ pub fn drag_begin(id: WinId, x: i32, y: i32) -> bool {
     DRAG_LAST_X.store(ox, Ordering::Relaxed);
     DRAG_LAST_Y.store(oy, Ordering::Relaxed);
     DRAG_MOVES.store(0, Ordering::Relaxed);
+    // DRAG-PI M2 — a fresh gesture starts with a fresh pacing clock, so its FIRST motion is admitted
+    // immediately rather than being measured against whenever the previous drag last steered. Without
+    // this a grab that follows a recent gesture inside one frame period would sit still for up to
+    // `DRAG_MOTION_MS` before the window began to move — the pacer's one chance to be visible as lag.
+    DRAG_PACE_LAST_MS.store(0, Ordering::Relaxed);
+    DRAG_PACE_ADMITTED.store(0, Ordering::Relaxed);
+    DRAG_PACE_COALESCED.store(0, Ordering::Relaxed);
     // Review condition (dragflick adoption): a superseding `begin` is the THIRD way a gesture
     // ends, and it was the one path that reset none of the budget counters — a press landing
     // while a drag was still live started the new gesture with the old one's pixels on its
@@ -11845,6 +13379,144 @@ pub fn drag_begin(id: WinId, x: i32, y: i32) -> bool {
 ///
 /// Locks: reads the row under [`TABLE`] and RELEASES the guard before calling [`move_to`], which
 /// takes `WRITER` then `TABLE` for itself and composites. No lock is held across the composite pass.
+/// DRAG-PI M2 — **minimum spacing between drag repositions, in ms.** ~60 Hz: fast enough that the
+/// window tracks the hand, slow enough that a pointer sweep cannot queue more composites than the
+/// panel can retire.
+///
+/// The value is x86's, and the number is not arbitrary on either arch: a bench pointer reports at
+/// 125 Hz (an 8 ms period) while one reposition costs a table lock, a deferred erase, a damage pass
+/// and a composite. Admitting every report means asking the panel for work at eight-millisecond
+/// intervals that takes longer than eight milliseconds to retire, and the queue grows for as long as
+/// the hand keeps moving — which is the shape of "I can barely drag a window across the screen".
+///
+/// **Housed here rather than in either arch file, and that is the point.** x86 has carried this
+/// pacing since WMDIRECT; the Pi's drag arm needs the identical rule, and a second copy in
+/// `arch/aarch64/syscall.rs` would be one constant edited by two lanes on two schedules with no gate
+/// able to see them drift. `video::strip::press_route` is the precedent — the routing ORDER moved
+/// into the shared module the moment a second arch came to need it, for the same reason.
+///
+/// STATED, so the next reader is not misled: x86's `wc_drag_motion` still applies its own throttle
+/// from its own `DRAG_MOTION_MS`, because on that arch the pacing is interleaved with the DRAGREL /
+/// DRAGSETTLE / DRAGGLIDE release-level belt and cannot be lifted out without moving that machinery
+/// too. That file is another lane's; folding it onto this constant is a follow-up for the seat that
+/// owns it, not a change this arc is entitled to make. The two values are identical today and this
+/// is the one with the argument attached.
+pub const DRAG_MOTION_MS: u64 = 16;
+
+/// DRAG-PI M2 — when the last paced drag reposition was admitted, in ms. Zero means "no gesture has
+/// been paced yet", which admits the first motion of every drag unconditionally — a grab must not
+/// have to wait out a frame before the window starts following the hand.
+static DRAG_PACE_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAG-PI M2 — **steer the live drag to `(x, y)`, at most once per [`DRAG_MOTION_MS`].**
+///
+/// The COALESCING seam, and the whole of the arc's input-side saving. Without it every pointer
+/// report is its own reposition: at 125 Hz that is 125 erase+damage+composite passes a second, each
+/// consuming one 8 ms delta, and the compositor is the thing that falls behind. With it the reports
+/// still all arrive and are still all consumed — the pointer position they carry is applied to
+/// `pal::cursor` by the caller's own arms — but the WINDOW is moved once per frame period, to the
+/// LATEST position rather than through every intermediate one.
+///
+/// That distinction is why this is coalescing and not throttling: a dropped report would lose hand
+/// travel and the window would land short. Nothing is dropped. `drag_motion` reads the CURRENT
+/// cursor position from its caller, so a pass that is declined here costs the gesture nothing at all
+/// — the next admitted pass moves the window to where the hand has got to, which is strictly more
+/// current than where it was when the declined report arrived.
+///
+/// Returns whether a reposition was applied, so a caller can witness the admitted rate.
+pub fn drag_motion_paced(x: i32, y: i32) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    if drag_active() == WIN_NONE {
+        return false;
+    }
+    let now = crate::arch::ms();
+    let last = DRAG_PACE_LAST_MS.load(Relaxed);
+    if last != 0 && now.wrapping_sub(last) < DRAG_MOTION_MS {
+        DRAG_PACE_COALESCED.fetch_add(1, Relaxed);
+        return false;
+    }
+    DRAG_PACE_LAST_MS.store(now.max(1), Relaxed);
+    DRAG_PACE_ADMITTED.fetch_add(1, Relaxed);
+    drag_motion(x, y)
+}
+
+/// DRAG-PI M3 — **what a pointer report owes the window system after a drain's own arms have run:**
+/// steering the live title-bar drag, paced.
+///
+/// The arch-neutral twin of x86's `wc_route_tail`, and housed HERE rather than copied into
+/// `arch/aarch64/syscall.rs` for two reasons that point the same way. The first is the ordinary one:
+/// this is window-system policy, not arch plumbing, and a second copy would drift. The second is
+/// specific to the Pi and is a hard constraint rather than a preference — `arch/aarch64/syscall.rs`
+/// is compiled into the knob-off `kernel8.img`, whose byte-identity proof is defeated by a line ADDED
+/// anywhere in the file (panic `Location` records embed line numbers). A function body there costs
+/// that proof; a single call site does not.
+///
+/// **Keyed on the RAW report, and that is the whole of its correctness.** `Event::Mouse` and
+/// `Event::MouseAbsolute` are PACKABLE, so whenever a ring-3 app holds focus with room in its ring
+/// the router consumes the report and the drain's own pointer arms never run. A title-bar grab
+/// GUARANTEES that state on this arch too, because the chrome arm focuses the dragged window's own
+/// owner. Keyed on the routed outcome the drag would be dead for every app window and alive only for
+/// kernel furniture — app-dependent and nondeterministic, which is the defect x86's ledger records
+/// having already made once.
+///
+/// **Call it where the cursor is FRESH.** It reads the shared `pal::cursor` position rather than the
+/// report's own delta, so the window and the arrow can never disagree about where the hand is — but
+/// that means it must run AFTER whoever applied this report to the cursor. On aarch64 those places
+/// are `route_input_to_active_el0` (focused-app path, which moves the cursor itself before routing)
+/// and `render_service`'s `Mouse`/`MouseAbsolute` arms (shell path, where the cursor is applied one
+/// `GUI_CHANNEL` hop downstream of the drain — so the drain is the WRONG place and the render task is
+/// the right one).
+///
+/// Locks: takes `WRITER` for the panel geometry and RELEASES it before `drag_motion_paced` reaches
+/// `TABLE`, keeping the two strictly non-overlapping. That is the same discipline `move_to_inner`
+/// states and the reason this cannot close a WRITER/TABLE cycle.
+pub fn drag_route_tail(ev: crate::pal::Event) -> bool {
+    if !matches!(
+        ev,
+        crate::pal::Event::Mouse { .. } | crate::pal::Event::MouseAbsolute { .. }
+    ) {
+        return false;
+    }
+    // One relaxed-ish load on every pointer report of a boot where nobody grabbed a title bar, which
+    // is the overwhelming majority of them — ahead of the geometry read so the idle path takes no lock.
+    if drag_active() == WIN_NONE {
+        return false;
+    }
+    let (pw, ph) = {
+        let fb = *super::WRITER.lock();
+        if !fb.is_ready() {
+            return false;
+        }
+        let info = fb.info();
+        (info.width as i32, info.height as i32)
+    };
+    let (x, y) = crate::pal::cursor::pos(pw, ph);
+    drag_motion_paced(x, y)
+}
+
+/// DRAG-PI M4 — the MOVE PATH's desktop-repaint bill: how many moves asked, and for how many pixels.
+/// Charged at the two `request_present_rect` calls in [`move_to_inner`] and nowhere else, so the
+/// quotient is exactly "desktop area one reposition puts on the panel's bill" — the single quantity
+/// M1 changed, isolated from every other full present the system makes for its own reasons.
+#[cfg(feature = "witness")]
+static MOVE_PRESENT_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static MOVE_PRESENT_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAG-PI M4 — take and clear the move-path desktop census: `(moves, pixels)`.
+#[cfg(feature = "witness")]
+fn move_present_take() -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (MOVE_PRESENT_N.swap(0, Relaxed), MOVE_PRESENT_PX.swap(0, Relaxed))
+}
+
+/// DRAG-PI M2 — pointer reports the pacer ADMITTED and COALESCED across the live gesture. Reported
+/// on the `[drag]` line at the end of it, so the ratio is on the wire rather than inferred: with the
+/// pacer working, `coalesced` is the majority at any pointer rate above ~60 Hz, and `admitted` is
+/// what the compositor was actually asked to retire.
+static DRAG_PACE_ADMITTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static DRAG_PACE_COALESCED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 pub fn drag_motion(x: i32, y: i32) -> bool {
     use core::sync::atomic::Ordering;
     let id = DRAG_WIN.load(Ordering::Acquire);
@@ -11875,10 +13547,42 @@ pub fn drag_motion(x: i32, y: i32) -> bool {
     if nx == DRAG_LAST_X.load(Ordering::Relaxed) && ny == DRAG_LAST_Y.load(Ordering::Relaxed) {
         return false; // no pixel would change; skip the lock, the damage and the composite.
     }
+    // DRAGWEDGE — the give-up ledger, sampled ACROSS the mover. `move_to_inner` raises the
+    // interactive barrier and is the only thing in this function that can, so a change in either
+    // counter over this call is this reposition's barrier failing to converge. Sampled either side
+    // rather than merely tested afterwards because the counters are GLOBAL and a give-up is a
+    // permanent fact about the boot: a bare `> 0` test would cancel every gesture for the rest of
+    // the run once any of them had met a stall. The residual imprecision is stated and accepted —
+    // another core giving up inside this window is attributed here — and it is benign in the only
+    // direction that matters, because a barrier that is not converging is not converging for
+    // whoever asks, and the cancellation's cost is one gesture the operator repeats.
+    let stall0 = {
+        use core::sync::atomic::Ordering::Relaxed;
+        MOVE_DRAIN_GIVEUP.load(Relaxed).wrapping_add(MOVE_DRAIN_SKIPPED.load(Relaxed))
+    };
     // `move_to_inner` clamps the origin to the live panel, marks the row PINNED, erases the VACATED
     // box, re-damages what the erase reached and asks the desktop for a full present — the
     // MOVE-VACATE cure, already in that function and deliberately not duplicated here.
-    match move_to_inner(id, Some(want), nx as usize, ny as usize) {
+    let moved = move_to_inner(id, Some(want), nx as usize, ny as usize);
+    // DRAGWEDGE — **THE GRAB DOES NOT OUTLIVE THE SYSTEM'S ABILITY TO SERVICE IT**, and this is the
+    // guard that makes "a lost release edge" stop meaning "a grab forever".
+    //
+    // On this arch the release edge reaches `wm` through the router, which runs on the task that
+    // consumes the GUI channel — the same task the drag's own barrier was spinning on. PA41 boot 2
+    // shows the consequence in two lines: `drag-begin ... -> grabbed` with no `drag-end` anywhere
+    // after it, ever. So the gesture is ended HERE, from the motion path, on the system's own report
+    // that it cannot keep up. `drag_cancel` names the reason on the wire, which is the whole point of
+    // it being a cancel rather than an end: a capture can tell "the operator let go" from "the
+    // compositor stopped answering and the window system let go for them".
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        let stall1 = MOVE_DRAIN_GIVEUP.load(Relaxed).wrapping_add(MOVE_DRAIN_SKIPPED.load(Relaxed));
+        if stall1 != stall0 {
+            drag_cancel("barrier-stalled");
+            return false;
+        }
+    }
+    match moved {
         Moved::NoRow => {
             // The owner test FAILED INSIDE THE LOCK: the slot was recycled in the gap above. The
             // window was not moved, and this is the arm that proves the pre-filter is not the guard.
@@ -12024,14 +13728,20 @@ fn boxes_overlap(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize
 // enlarged union genuinely exposed, and the flash has nothing left to be made of. Coalescing is left
 // alone: it is sound (a union only ever repaints more desktop) and `coalesced=` still reports it.
 //
-// **x86 only, and the arch gate is a wire boundary rather than a scoping convenience** — the same
-// boundary GR21/WCD-OCC drew for [`OccSnap`]. `wm.rs` is shared with aarch64, whose `[wc-d]`/`[wc-g]`
-// read-backs have no occluder excuse at all: clipping there would leave the pi4 regression spec
-// reading occluder pixels inside a verified rect and calling them corruption. On x86 the excuse
-// already exists and this clip is built from a SUBSET of `occluders_above`'s population, so the
-// pixels the blit declines to write are a subset of the pixels the read-back declines to charge. On
-// aarch64 [`occ_clip`] returns the empty set and every blit below is PIXEL-IDENTICAL to the pre-arc
-// blit — the same runs, at the same offsets, from the same buffer.
+// **PARITY §6.2 / OCC62 M1 — BOTH ARCHES now, and the excuse came with it in the same commit.**
+// The arch gate here was a wire boundary rather than a scoping convenience — the same boundary
+// GR21/WCD-OCC drew for [`OccSnap`] — and its whole argument was conditional: clipping on aarch64
+// while the read-back had no occluder excuse would have left the pi4 regression spec reading
+// occluder pixels inside a verified rect and calling them corruption. That is a statement about
+// what must land TOGETHER, not a statement that the clip belongs to one arch. So the WINDOW
+// half-space below is unconditional and the excuse machinery ([`OccSnap`], [`occluders_above`],
+// [`occ_excuse`], and the `occluded=`/`occ=` fields on both wires) is unconditional with it. The
+// population is still a SUBSET of `occluders_above`'s, so the pixels the blit declines to write are
+// still a subset of the pixels the read-back declines to charge — on either arch.
+//
+// The FURNITURE arm (dock strip, menu bar, the SHARD dropdown) stays `x86_64 + wc` for now; §6.2's
+// second milestone moves it to the `wc`/`pidesk` dual gate the rest of the furniture family carries.
+// Until then an aarch64 clip holds windows and nothing else.
 //
 // **"Pixel-identical", not "byte for byte", and the review was right to separate them.** The first
 // cut of this ledger claimed the latter, which is a claim about the BINARY and is false: the clip is
@@ -12058,7 +13768,7 @@ fn boxes_overlap(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize
 /// only where the registry exists.
 const FURNITURE_MAX: usize = 2;
 
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))] // PI-DESK: two arch/knob pairs now
 const _: () = assert!(FURNITURE_MAX == super::strip::STRIP_MAX);
 
 /// MENU-OCC — occluder slots for TRANSIENT modal surfaces that are NOT `strip::TENANTS` members.
@@ -12166,9 +13876,17 @@ impl OccClip {
     /// DROPPED for want of capacity, which [`erase_clip`] reports rather than swallows: a dropped
     /// occluder is a region the erase will publish over.
     ///
-    /// x86 only, with its sole caller's populated arm: on aarch64 [`erase_clip`] returns
-    /// [`OccClip::none`] and there is nothing to add to it.
-    #[cfg(target_arch = "x86_64")]
+    /// Both of its callers' populated arms: [`erase_clip`] and `occ_clip`'s FURNITURE arm, which
+    /// OCC62 M2 put on the furniture family's dual gate. `occ_clip`'s WINDOW loop does not use it:
+    /// that population is bounded by [`OCC_CLIP_MAX`] and writes `boxes[n]` directly.
+    ///
+    /// ERASECLIP M1 — **UNGATED**, and the reason is the erase's WINDOW loop. That loop is now
+    /// unconditional on both arches (see [`erase_clip`]) and, unlike `occ_clip`'s, it admits through
+    /// `push` rather than by direct write — because it has no `boxes_overlap` pre-filter to bound it
+    /// and must REPORT the drop rather than write past the end. So `push` is reachable on the
+    /// knob-off aarch64 build, where the old `any(x86_64, all(aarch64, pidesk))` gate did not compile
+    /// it. Widening the gate compiles one more small function into that build and moves no pixel on
+    /// any other.
     fn push(&mut self, b: (usize, usize, usize, usize)) -> bool {
         if b.2 == 0 || b.3 == 0 {
             return true;
@@ -12191,7 +13909,7 @@ impl OccClip {
     /// `self.boxes` directly, so it shares no arithmetic with [`OccClip::prepare`] or
     /// [`OccRows::spans`] — neither the sort, nor the column pre-clip, nor the gap cursor — which is
     /// what lets it catch a bug in any of them.
-    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    #[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
     fn covered_len(&self, y: usize, x0: usize, x1: usize) -> u64 {
         let mut n = 0u64;
         for &(ox, oy, ow, oh) in self.boxes[..self.n].iter() {
@@ -12333,7 +14051,7 @@ impl OccRows {
 /// both a cost and a fresh interleave; the snapshot is also the RIGHT source, because it is the
 /// geometry this pass is drawing against.
 ///
-/// Empty on every arch but x86 (see the ledger above [`OccClip`]), and empty whenever nothing
+/// Populated on BOTH arches since §6.2 (see the ledger above [`OccClip`]), and empty whenever nothing
 /// overlaps, so the per-row work below is skipped outright for the topmost window of any stack.
 ///
 /// ### WCK5 — AND THE DOCK STRIP IS IN IT, WITH NO `(z, id)` TERM AT ALL
@@ -12382,15 +14100,40 @@ impl OccRows {
 /// [`OccClip::push`] rather than a direct write so that a future third piece of furniture is DECLINED
 /// rather than written past the end.
 ///
-/// **x86 + `wc` only.** Off `wc` there is no dock — `wcx.rs` is the x86 panel path the knob gates —
-/// and off x86 this whole body is absent. On aarch64 the term is STRUCTURALLY absent, not merely
-/// empty: `super::dock` is never named, no `for_panel` runs, and the clip stays [`OccClip::none`], so
-/// every aarch64 blit below is pixel-identical to the pre-arc blit. `pw`/`ph` are the two arguments
-/// that arch pays and cannot use, on [`OccClip`]'s own "same pixels, not same bytes" boundary.
+/// ### OCC62 M2 — THE FURNITURE ARM IS ON BOTH ARCHES, ON THE FURNITURE FAMILY'S OWN GATE
+///
+/// The arm is `any(all(x86_64, wc), all(aarch64, pidesk))` — the identical gate `video/mod.rs`
+/// declares `dock`, `strip`, `menubar` and `crystal` under. That is the whole justification and it
+/// is a tight one: the strips are admitted to the clip on exactly the boots that composite them
+/// onto the glass, so there is no boot where the clip reserves columns for furniture that is not
+/// there, and none where furniture paints without the clip knowing. Off both knobs the arm is
+/// STRUCTURALLY absent — `super::dock` is never named, no `for_panel` runs — and `pw`/`ph` are two
+/// arguments the build pays and cannot use.
+///
+/// [`dock_tiles`] moved to the same gate with it (PARITY §6.4, which that row says to land here,
+/// "with 6.2, which is the consumer"), as did [`OccClip::push`], the arm's admission primitive.
+///
+/// **The SHELLPIN residual — CLOSED, and this paragraph is the correction of a disclosure that
+/// outlived its defect.** What stood here (and in `dock.rs`'s module ledger, and in PARITY §6.10
+/// item 3) said: `dock_tiles` counts dock-addressable ROWS and cannot see the synthetic tile
+/// `dock::pin_shell` appends while no live row carries `KERNEL_OWNER_DESKTOP`, so with the shell
+/// closed this clip protects a strip ONE TILE narrower than the one painted; the complete fix is one
+/// `+ 1` term in `dock_tiles`, NOT taken because the term would move x86 pixels.
+///
+/// **The term is in the tree.** The integrator landed it as `4c6ca42d` ("SHELLPIN integrator fix —
+/// occ_clip's dock width counts the pinned tile"), on BOTH arches, taking the x86 pixel delta
+/// deliberately — which is the route `exec-occ62` was right to decline for itself and wrong to leave
+/// described as open afterwards. See [`dock_tiles`] for the term and for its cap (`n < MAX_WINDOWS`,
+/// mirroring `pin_shell`, so a full table pins nothing and the clip is never made one tile WIDER
+/// than the painted strip — the inverse defect).
+///
+/// `exec-eraseclip` therefore had nothing to take here and one thing to fix: three disclosures that
+/// told a reader to expect a residual the code no longer has. A stale disclosure is worse than none,
+/// because it is read as current. The ERASE side was never affected either way — [`erase_clip`]
+/// reaches the strip through `strip::rects`, i.e. `dock::strip_rect`, which pins.
 #[allow(unused_variables, unused_mut)]
 fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: usize) -> OccClip {
     let mut c = OccClip::none();
-    #[cfg(target_arch = "x86_64")]
     {
         let (z, id) = (rows[i].z, rows[i].id);
         let me = outer_box(&rows[i]);
@@ -12407,7 +14150,12 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: u
         }
         // WCK5 — the strip, admitted for every subject it meets. No `(z, id)`, for the reason in the
         // ledger above: `composite_once` paints it after this whole loop has run.
-        #[cfg(feature = "wc")]
+        //
+        // OCC62 M2 — and the FURNITURE arm now rides the SAME dual gate the furniture family
+        // itself carries (`video/mod.rs`: x86+`wc` OR aarch64+`pidesk`), so the strips are in the
+        // clip on exactly the boots that put them on the glass. `dock`, `strip`, `menubar` and
+        // `crystal` were already declared on that gate; this is the consumer catching up.
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
         {
             let rect = super::dock::Layout::for_panel(dock_tiles(rows), pw, ph).map(|l| l.rect());
             // WCK4-D1's lesson, restated on this side: the strip's geometry goes on the wire whether
@@ -12415,7 +14163,12 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: u
             // Published from the same `rect` the clip is built from, and BEFORE the overlap test — a
             // subject that does not meet the strip must not be able to erase the fact that a strip
             // exists.
-            #[cfg(feature = "witness")]
+            // OCC62 M2 — the `[drag-occ]` publications stay x86. `OD_*`/`OB_*` and the line that
+            // reads them live in the drag/gesture instrument another arc owns; the CLIP is what
+            // §6.2 owes the Pi, and widening that wire is not this arc's to do. Named rather than
+            // silent: on aarch64 the strips are in the clip and `occclip_dock`/`occclip_bar` do not
+            // report it, so a Pi capture's silence there is an ABSENT instrument, not a zero.
+            #[cfg(all(feature = "witness", target_arch = "x86_64"))]
             {
                 use core::sync::atomic::Ordering::Relaxed;
                 let (dx, dy, dw, dh) = rect.unwrap_or((0, 0, 0, 0));
@@ -12429,7 +14182,7 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: u
                     // WCK5 — one window blit whose clip CARRIED the strip. The population term for
                     // `occclip_dock_px`: a gesture with `occclip_dock=0` withheld nothing because no
                     // blit met the strip, which is a different statement from "the clip did not work".
-                    #[cfg(feature = "witness")]
+                    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
                     OD_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
             }
@@ -12451,7 +14204,7 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: u
             // Default OFF: `strip_rect` returns `None` after one relaxed load on every boot that has
             // not enabled the bar, so this arm costs one atomic per window and pushes nothing.
             let bar = super::menubar::strip_rect(pw, ph);
-            #[cfg(feature = "witness")]
+            #[cfg(all(feature = "witness", target_arch = "x86_64"))]
             {
                 use core::sync::atomic::Ordering::Relaxed;
                 let (bx0, by0, bw0, bh0) = bar.unwrap_or((0, 0, 0, 0));
@@ -12462,7 +14215,7 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: u
             }
             if let Some(b) = bar {
                 if b.2 != 0 && b.3 != 0 && boxes_overlap(me, b) && c.push(b) {
-                    #[cfg(feature = "witness")]
+                    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
                     OB_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
             }
@@ -12669,9 +14422,19 @@ pub(crate) fn occ_menu_probe(
 // `occclip_dock=0` or `occclip_dock_px=0` under the same condition. Two paths, two pairs, and neither
 // zero can stand in for the other.
 //
-// **x86 only**, on [`OccClip`]'s wire-boundary argument: aarch64 gets [`OccClip::none`], `occ.n` is
-// 0, and every fill takes the whole-row branch — the pre-arc loop, publishing the SAME PIXELS at the
-// same offsets from the same buffer.
+// **ERASECLIP M1 — NOT x86 ONLY ANY MORE, and the retired claim is quoted rather than deleted
+// because it is precisely what the Pi's defect was.** It read: *"x86 only, on `OccClip`'s
+// wire-boundary argument: aarch64 gets `OccClip::none`, `occ.n` is 0, and every fill takes the
+// whole-row branch — the pre-arc loop, publishing the SAME PIXELS at the same offsets from the same
+// buffer."* "The same pixels" was the reassurance and also the fault: the pixels an unclipped erase
+// publishes are exactly the ones standing on a live window or a furniture strip. `exec-occ62` closed
+// that hole for the WINDOW BLIT (§6.2's first half, [`occ_clip`]); this closes it for the DEFERRED
+// ERASE. The WINDOW half-space is now unconditional on both arches, the FURNITURE arm carries the
+// furniture family's dual gate, and on aarch64 `occ.n` is no longer structurally 0.
+//
+// What survives of that paragraph is its COST accounting, which was always arch-neutral and is
+// restated below: `stage_fill` zero-initialises `OccRows` + span buffer on every fill on every arch.
+// What ERASECLIP changes on aarch64 is that those bytes now do work.
 //
 // **"Same pixels", NOT "same bytes", and the review (D7) was right to hold this arc to the
 // correction WC-K3's own review already made.** `stage_fill` receives the 456-byte `OccClip` by
@@ -12708,13 +14471,21 @@ pub(crate) fn occ_menu_probe(
 /// drain — not once per queued box — and only on a drain that has boxes to publish.
 #[allow(unused_variables)]
 fn erase_clip(pw: usize, ph: usize) -> (OccClip, usize) {
-    // Both `mut`s belong to the x86 arm below; on aarch64 this returns the empty clip and a zero
-    // count, which is [`OccClip`]'s arch boundary restated for the erase.
+    // ERASECLIP M1 — THE WINDOW HALF-SPACE IS UNCONDITIONAL, on [`occ_clip`]'s own precedent.
+    //
+    // These `mut`s used to belong to an x86-only arm; the arm is gone. A deferred desktop erase that
+    // publishes over a live window is the same defect on aarch64 that it is on x86, and `exec-occ62`
+    // already settled the question for the WINDOW BLIT: its half-space is behaviour, not a knob. The
+    // erase is the other half of §6.2 and takes the same shape — the `TABLE` read, the `compat`
+    // exclusion, the [`above_shell`] predicate and the [`OccClip::push`] admission are byte-identical
+    // to what x86 has run since WCK4.
+    //
+    // The `allow`s stay because the FURNITURE arm below is still gated: an off-knob build reaches
+    // neither its `push` nor its `dropped += 1`, and a build with no window rows never pushes at all.
     #[allow(unused_mut)]
     let mut c = OccClip::none();
     #[allow(unused_mut)]
     let mut dropped = 0usize;
-    #[cfg(target_arch = "x86_64")]
     {
         let shell = shell_z();
         let rows = {
@@ -12737,7 +14508,17 @@ fn erase_clip(pw: usize, ph: usize) -> (OccClip, usize) {
         // `fill_px` stops being charged for the sliver the gesture just vacated. See `DO_FILL_BOX`.
         #[cfg(feature = "witness")]
         dragfill_box(&rows);
-        #[cfg(feature = "wc")]
+        // ERASECLIP M1 — the FURNITURE arm takes the FURNITURE FAMILY'S OWN dual gate, which is the
+        // identical move `occ_clip`'s arm made under OCC62 M2 and for the identical reason: `dock`,
+        // `strip`, `menubar` and `crystal` are declared in `video/mod.rs` under
+        // `any(all(x86_64, wc), all(aarch64, pidesk))`, so admitting their rects here on exactly that
+        // gate means the erase withholds strip columns on precisely the boots that composite strips
+        // onto the glass. Off both knobs the arm is STRUCTURALLY absent — `super::strip` is never
+        // named — and `pw`/`ph` are two arguments the build pays and cannot use.
+        #[cfg(any(
+            all(target_arch = "x86_64", feature = "wc"),
+            all(target_arch = "aarch64", feature = "pidesk")
+        ))]
         {
             // STRIPFACTOR — EVERY registered furniture strip, from the registry, in one walk.
             //
@@ -13335,6 +15116,178 @@ fn stage_pool_index() -> usize {
 #[inline]
 fn stage_for_core() -> &'static Mutex<alloc::vec::Vec<u8>> {
     &STAGE[stage_pool_index()]
+}
+
+/// WEDGE-12 (merge port) — the worst-case bytes one staged present can ask of a [`STAGE`] entry:
+/// the whole panel, capped by [`MAX_STAGE_BYTES`] exactly as `stage_window`'s own fills are.
+fn stage_worst_case(info: &unaos_boot_info::FrameBufferInfo) -> usize {
+    let area = info.width.saturating_mul(info.height).saturating_mul(info.bytes_per_pixel);
+    area.min(MAX_STAGE_BYTES)
+}
+
+/// WEDGE-12 (M2) — rows of a SECONDARY core's pre-sized band on the small-heap arch. 64 is
+/// `WCD_CHUNK_ROWS_MAX`'s value, taken as precedent rather than as a reference: that constant is
+/// `x86_64` + `witness` + `wcg-paygo`-gated and does not exist on this build, but it is the same
+/// question answered for the same reason — how many rows of a panel are a bounded bite. See
+/// [`stage_secondary_target`] for why a secondary is pre-sized to a band and not to a panel.
+const STAGE_SECONDARY_ROWS: usize = 64;
+
+/// WEDGE-12 (M2) — the bytes ONE SECONDARY core's [`STAGE`] entry is pre-sized to, which is not
+/// the same question as [`stage_worst_case`], because the two arches do not have the same heap.
+///
+/// THE ARITHMETIC, written out (the reason this function exists at all):
+///
+///   * **x86_64 — full worst case.** [`allocator::HEAP_SIZE`](crate::allocator::HEAP_SIZE) is
+///     256 MiB there since GR27. The whole pool at its cap is [`STAGE_CPUS`] x
+///     [`MAX_STAGE_BYTES`] = 8 x 4 MiB = 32 MiB, i.e. 12.5% of the heap — and it is a ceiling the
+///     lazy path was already free to reach on its own (GR27's diagnosis was precisely that 8 pools
+///     growing toward the cap is the DESIGNED regime, and that 48 MiB was the artificial famine).
+///     Pre-sizing does not raise the peak; it moves it off the masked path.
+///   * **aarch64 — the banded bound.** The heap is 48 MiB and cannot be raised without moving the
+///     hand-placed region in `arch/aarch64/boot.rs` (out of lane, and a different arc). At the
+///     bench panel (1920x1200x4) `stage_worst_case` is the 4 MiB cap, so a full 4-core pre-size is
+///     4 x 4 MiB = 16 MiB — 33% of the whole heap, standing beside a ~9.2 MiB panel-sized back
+///     buffer and the wc-d verify snapshot. That is the shape of the GR27 x86 famine (48 MiB, a
+///     desktop, and every `try_reserve` declining), and taking it on the Pi to close a bounded
+///     defect would be trading a masked allocation for `DECL_ALLOC` on every path. The honest
+///     bound is therefore the BAND: [`STAGE_SECONDARY_ROWS`] x `row_bytes`, 480 KiB per secondary
+///     at 1920x1200 and 160 KiB at QEMU's 640x480 — 1.4 MiB and 480 KiB respectively for the
+///     Pi's three secondaries, under 3% of the heap either way.
+///
+/// WHAT THE BANDED ARM DOES AND DOES NOT BUY, stated plainly: a secondary present whose `need`
+/// (see [`stage_window`]) is within the band never grows under the mask; one larger still takes
+/// exactly one masked growth, then never again for that steady size. That is a reduction of the
+/// F-family exposure on secondaries, not its elimination — the elimination is entry 0's, and
+/// entry 0 is the core that runs the panel-sized composites.
+fn stage_secondary_target(info: &unaos_boot_info::FrameBufferInfo) -> usize {
+    let full = stage_worst_case(info);
+    #[cfg(target_arch = "x86_64")]
+    {
+        full
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let row_bytes = info.width.saturating_mul(info.bytes_per_pixel);
+        row_bytes.saturating_mul(STAGE_SECONDARY_ROWS).min(full)
+    }
+}
+
+/// WEDGE-12 (M2) — how many [`STAGE`] entries are worth pre-sizing: the cores that can ACTUALLY
+/// reach a staged present, capped at the pool width.
+///
+/// NOT a config constant, and deliberately not `meter_cpu_count()`: on aarch64 that is `NUM_CPUS`
+/// (a BSS-sizing bound) and on x86 it is `acpi::cpu_count()` (what the firmware TABLE names) —
+/// both would over-count a boot where a core failed to come up and pre-size an entry no core can
+/// ever index. The sources used here are what BRING-UP RECORDED:
+///
+///   * aarch64 baremetal — `smp::online_secondaries()`, the `CORE_READY` set each released
+///     Cortex-A72 publishes for itself, plus the BSP (which never joins the scheduler's
+///     `ONLINE_MASK` on the Pi: it stays the GUI/hardware-service core, and it is the core that
+///     stages presents). 4 on a healthy Pi; the metal 3-of-4 variance the pi4 regression spec
+///     documents reads honestly as 3, and the fourth entry simply keeps trunk's lazy growth.
+///   * x86_64 — `smp::online_aps()`, the APs that reached `ap_entry` and finished bring-up (the
+///     module's own comment: "actually came up (not just 1..cpu_count)"), plus the BSP.
+///   * every other aarch64 build (virt/tegra) — 1. Those secondaries park in WFI and never run a
+///     compositor pass, so an entry beyond the BSP's would be dead memory.
+///
+/// ORDERING, checked rather than assumed. Both bring-up publications precede
+/// `video::init_panel`, so this count is already FINAL at [`reserve_stage`] and no second,
+/// post-SMP reserve pass is needed: on aarch64 `smp::start_secondaries()` (main.rs, step 4a) and
+/// `sched::start_aps` (step 4c) both run several hundred lines above the `init_panel` call, and
+/// `start_secondaries` WAITS for each core's `CORE_READY` before returning; on x86
+/// `smp::start_aps()` publishes `ONLINE_APS` on the BSP, likewise above `init_panel`. A core that
+/// came up LATE (none does today) would cost only its own lazy first growth.
+fn live_core_count() -> usize {
+    #[cfg(target_arch = "x86_64")]
+    let n = 1 + crate::arch::smp::online_aps().len();
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+    let n = 1 + crate::arch::smp::online_secondaries().len();
+    #[cfg(all(target_arch = "aarch64", not(feature = "baremetal")))]
+    let n = 1usize;
+    n.clamp(1, STAGE_CPUS)
+}
+
+/// WEDGE-12 (merge port) — bytes entry 0 of the pool holds after [`reserve_stage`]; the census
+/// line's source and the contended-arm fallback answer.
+static STAGE_RESERVED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// WEDGE-12 (M2) — size the [`STAGE`] entry of every LIVE core from an UNMASKED context, so a
+/// staged present never grows its buffer under `SYS_WIN_PRESENT`'s IRQ mask (a masked acquisition
+/// of the global heap `Mutex` — the F-family shape). Called once from `video::init_panel`, IRQs
+/// live, heap up, no pass in flight.
+///
+/// M1 (the merge port) pre-sized entry 0 only, because pre-sizing all [`STAGE_CPUS`] = 8 entries
+/// would cost 8 x [`MAX_STAGE_BYTES`] = 32 MiB against the small-heap config. M2 replaces the
+/// count rather than the cap: [`live_core_count`] entries are pre-sized, from what SMP bring-up
+/// RECORDED, and each secondary's target comes from [`stage_secondary_target`] — full worst case
+/// where the heap affords it (x86), the band where it does not (aarch64). Those two functions
+/// carry the core-count source and the heap arithmetic; this one carries the loop.
+///
+/// Entry 0 keeps [`stage_worst_case`] on both arches: the BSP is the core that runs init and the
+/// panel-sized composites, and it is the entry [`STAGE_RESERVED`] reports. An entry that comes up
+/// SHORT (heap exhausted) is not a failure mode — that core simply keeps trunk's lazy growth,
+/// declining via `DECL_ALLOC` on exhaustion, never panicking. The witness names the shortfall.
+///
+/// `try_lock`, never `lock` — [`STAGE`]'s standing acquisition rule. Idempotent and grow-only.
+pub fn reserve_stage(info: &unaos_boot_info::FrameBufferInfo) -> usize {
+    let want = stage_worst_case(info);
+    if want == 0 {
+        return 0;
+    }
+    let entries = live_core_count();
+    let secondary = stage_secondary_target(info);
+    // Per-entry outcome, folded into the census: `reserved` reached its target, `short` did not
+    // (including the entry a concurrent holder made us skip — nothing else can hold one of these
+    // this early, but the `try_lock` rule is not suspended for being early).
+    let (mut reserved, mut short) = (0usize, 0usize);
+    let mut got0 = STAGE_RESERVED.load(core::sync::atomic::Ordering::Relaxed);
+    for (cpu, entry) in STAGE.iter().enumerate().take(entries) {
+        let target = if cpu == 0 { want } else { secondary };
+        let Some(mut stage) = entry.try_lock() else {
+            short += 1;
+            continue;
+        };
+        if stage.len() < target {
+            let add = target - stage.len();
+            // The one `try_reserve` on this path that runs unmasked by construction. An exhausted
+            // heap leaves the shorter buffer rather than panicking; the pass's own declines report
+            // the shortfall honestly.
+            if stage.try_reserve(add).is_ok() {
+                stage.resize(target, 0);
+            }
+        }
+        let got = stage.len();
+        if cpu == 0 {
+            got0 = got;
+            STAGE_RESERVED.store(got, core::sync::atomic::Ordering::Relaxed);
+        }
+        if got >= target {
+            reserved += 1;
+        } else {
+            short += 1;
+        }
+    }
+    // The two tallies exist FOR the census line below; a witness-off build (every flashable image)
+    // still counts them — three adds per boot — rather than carrying a second `cfg` inside the loop.
+    // This is their reader on that build, so the counting is not a warning.
+    #[cfg(not(feature = "witness"))]
+    let _ = (reserved, short);
+    #[cfg(feature = "witness")]
+    serial_println!(
+        "[wedge12] stage-reserve panel={}x{}x{} want={} got={} entries={} reserved={} short={} \
+         secondary={} -> {}",
+        info.width,
+        info.height,
+        info.bytes_per_pixel,
+        want,
+        got0,
+        entries,
+        reserved,
+        short,
+        secondary,
+        if short == 0 { "RESERVED" } else { "SHORT" }
+    );
+    got0
 }
 
 /// WC-H — whether the one-shot fallback fixture has been spent. See the fixture block in
@@ -14917,7 +16870,7 @@ fn stage_fill(
     // distinguishable on the wire: `occ_px` is a window publishing over its occluder, `fill_px` is
     // the desktop fill doing it. They have different cures and a reader must not have to guess which
     // one a nonzero verdict names.
-    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    #[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
     let fbox = {
         // No painter to compare against here — the fill belongs to no window — so the test is simply
         // "did this desktop row land inside the dragged window's box". `dragocc_target` needs a row;
@@ -14944,16 +16897,16 @@ fn stage_fill(
             ))
         }
     };
-    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    #[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
     let (mut fill_px, mut pub_px, mut clip_px, mut over_px) = (0u64, 0u64, 0u64, 0u64);
     // REVIEW (D1) — the strip's own withheld total, and (D2) the number of `blit` calls this fill
     // actually made, which is no longer `h`.
-    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    #[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
     let (mut dock_px, mut runs) = (0u64, 0u64);
     // REVIEW (D1) — the dock strip as THIS drain's clip holds it, read once. `w == 0` means the
     // strip is not in the clip, and then `dock_px` stays 0 — which is the honest answer, and the
     // reason `dock=absent` is on the wire beside it.
-    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    #[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
     let dockb = {
         use core::sync::atomic::Ordering::Relaxed;
         let dw = DO_DOCK_BOX[2].load(Relaxed);
@@ -14987,7 +16940,7 @@ fn stage_fill(
         if occ.n == 0 {
             fb.blit(off, &stage[..row_bytes]);
             blit_calls += 1;
-            #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+            #[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
             {
                 pub_px += w as u64;
                 runs += 1;
@@ -15005,9 +16958,9 @@ fn stage_fill(
         // of it is the right source for a span of any length: no `src` offset arithmetic is needed
         // here, unlike `draw_window`'s, where each column carries a different pixel.
         let ns = occ.spans(py, x, x + w, &mut spans);
-        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+        #[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
         let (mut row_pub, mut row_dock_pub) = (0u64, 0u64);
-        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+        #[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
         {
             runs += ns as u64;
         }
@@ -15015,7 +16968,7 @@ fn stage_fill(
             let len = (sx1 - sx0) * bpp;
             fb.blit(py * fb_row + sx0 * bpp, &stage[..len]);
             blit_calls += 1;
-            #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+            #[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
             {
                 row_pub += (sx1 - sx0) as u64;
                 fill_px += span_occ(fbox, py, sx0, sx1);
@@ -15030,14 +16983,14 @@ fn stage_fill(
                 over_px += clip.covered_len(py, sx0, sx1);
             }
         }
-        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+        #[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
         {
             pub_px += row_pub;
             clip_px += w as u64 - row_pub;
             dock_px += span_occ(dockb, py, x, x + w).saturating_sub(row_dock_pub);
         }
     }
-    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    #[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
     {
         use core::sync::atomic::Ordering::Relaxed;
         // Folded unconditionally rather than behind `> 0`: `fillpub_px` is the population that says
@@ -15135,7 +17088,7 @@ fn draw_title(
         if i >= cols {
             break;
         }
-        for (ry, row) in super::font::glyph(b, true).iter().enumerate() {
+        for (ry, row) in super::font::glyph(b, true, super::font::Face::Chrome).iter().enumerate() {
             // WC-M's clip, per row: a row landing above the band is dropped independently.
             let dy = y + ry as isize;
             if dy < 0 {
@@ -15469,10 +17422,10 @@ pub fn vacate_selftest() {
 
     // One leg: place a window at (ox, oy), prove it owns its box, close it by `f`, and count how many
     // of the five sample points came back as desktop.
-    let leg = |f: &dyn Fn(WinId, u64), name: &str| -> (bool, bool, usize) {
+    let leg = |f: &dyn Fn(WinId, u64), name: &str| -> (bool, bool, (usize, usize)) {
         let w = create(ASID_J, sa, len, 8, 8, 32, b"vc-a");
         if w == WIN_NONE {
-            return (false, false, 0);
+            return (false, false, (0, 0));
         }
         move_to(w, ox, oy);
         present(w);
@@ -15481,7 +17434,7 @@ pub fn vacate_selftest() {
             Some(b) => b,
             None => {
                 close(w);
-                return (false, false, 0);
+                return (false, false, (0, 0));
             }
         };
         let painted = read(ox + 1, oy + 1) == a_col;
@@ -15494,14 +17447,12 @@ pub fn vacate_selftest() {
             (b.0 + b.2 / 2, b.1 + TITLE_H / 2),
             (b.0 + b.2 / 2, b.1 + b.3 - 1),
         ];
-        let mut clean = 0usize;
-        for &(x, y) in pts.iter() {
-            if read(x, y) == DESKTOP_BG {
-                clean += 1;
-            }
-        }
+        // FURNITURE-OCC — the reclaim is judged per point against whoever owns that point NOW; see
+        // [`vacated_points`] for why "== DESKTOP_BG everywhere" is the bare-panel special case of it
+        // rather than the rule.
+        let (v, clean, covered) = vacated_points(&pts, a_col);
         let _ = name;
-        (painted, clean == pts.len(), clean)
+        (painted, v, (clean, covered))
     };
 
     let (p1, v1, n1) = leg(&|w, _| { close(w); }, "close");
@@ -15509,9 +17460,10 @@ pub fn vacate_selftest() {
 
     let ok = p1 && v1 && p2 && v2;
     serial_println!(
-        "[wc-j] vacate close_painted={} close_desktop={} ({}/5) owner_painted={} owner_desktop={} ({}/5) -> {}",
-        p1, v1, n1, p2, v2, n2,
-        if ok { "PASS" } else { "FAIL" }
+        "[wc-j] vacate close_painted={} close_desktop={} ({}/5) owner_painted={} owner_desktop={} ({}/5) -> {} close_covered={} owner_covered={}",
+        p1, v1, n1.0, p2, v2, n2.0,
+        if ok { "PASS" } else { "FAIL" },
+        n1.1, n2.1
     );
     retile_selftest();
     closeiso_selftest();
@@ -15629,12 +17581,11 @@ fn movevacate_selftest() {
         (old.0 + 1, old.1 + old.3 - 1),
         (old.0 + old.2 - 1, old.1 + 1),
     ];
-    let mut clean = 0usize;
-    for &(x, y) in pts.iter() {
-        if read(x, y) == DESKTOP_BG {
-            clean += 1;
-        }
-    }
+    // FURNITURE-OCC — the sliver is judged against whoever owns each point now; on a bare panel that
+    // is the desktop at every one of them and the rule is byte-identical to the one this replaced.
+    // `gone` is the KEYLINE rather than the content colour: these three points are on the old box's
+    // OUTER EDGE, so an unerased sliver shows `theme::FRAME_LINE`, not the surface.
+    let (sliver_ok, clean, covered) = vacated_points(&pts, super::theme::FRAME_LINE);
     // Half 1b — and the window is genuinely THERE, at the new origin, rather than the panel having
     // simply gone quiet. Content and kernel-drawn chrome both, since the move re-lays both.
     let new_window = read(ox + STEP + 1, oy + STEP + 1) == a_col
@@ -15653,13 +17604,13 @@ fn movevacate_selftest() {
     let box_px = old.2 as u64 * old.3 as u64;
     let exact = recorded && erased_px + overlap_px == box_px;
 
-    let ok = painted && moved && clean == pts.len() && new_window && recorded && flash_px == 0 && exact;
+    let ok = painted && moved && sliver_ok && new_window && recorded && flash_px == 0 && exact;
     serial_println!(
-        "[wc-j] move-once step={} painted={} moved={} old_desktop={} ({}/{}) new_window={} parts={} erased_px={} overlap_px={} box_px={} recorded={} flash_px={} exact={} -> {}",
+        "[wc-j] move-once step={} painted={} moved={} old_desktop={} ({}/{}) new_window={} parts={} erased_px={} overlap_px={} box_px={} recorded={} flash_px={} exact={} -> {} covered={}",
         STEP,
         painted,
         moved,
-        clean == pts.len(),
+        sliver_ok,
         clean,
         pts.len(),
         new_window,
@@ -15670,7 +17621,8 @@ fn movevacate_selftest() {
         recorded,
         flash_px,
         exact,
-        if ok { "PASS" } else { "FAIL" }
+        if ok { "PASS" } else { "FAIL" },
+        covered
     );
 
     close(w);
@@ -15733,6 +17685,541 @@ fn movevacate_selftest() {
 /// Self-cleaning and one-shot on the same terms as its neighbours: every row it made is closed by id
 /// (`close`, not `close_owner` — the furniture row refuses the latter, which is the point of leg 3),
 /// `SHELL_Z` and `FOCUS_ASID` are restored, and the live set is repainted.
+/// DRAG-PI M4 — **THE DRAG COST WITNESS: the same gesture measured under both regimes, on one boot.**
+///
+/// The arc's numbers, made falsifiable. Every claim M1 and M2 make is a claim about a RATIO, and a
+/// ratio quoted from two different builds on two different boots is a claim about the builds as much
+/// as about the change. So this drives one window across one panel twice, in one call, with only the
+/// regime differing — and prints both halves so the reader divides them rather than trusting a
+/// verdict this function computed for itself.
+///
+/// ### Half 1 — the desktop repaint EXTENT (M1)
+///
+/// `whole` reproduces the pre-M1 line exactly: every reposition is followed by a
+/// `request_full_present()`, which charged the WHOLE PANEL. `rects` is the shipped path, which
+/// charges (old box ∪ new box). Both halves move the same window the same distance in the same number
+/// of steps, left-to-right then right-to-left, so the window-layer work is identical and cancels;
+/// what differs is only what the desktop layer was asked to republish.
+///
+/// **The measured ratio ERRS LOW, and that is deliberate.** The `whole` pass performs a REAL move, so
+/// it also makes the two rect requests the shipped path makes — a term the pre-M1 code never paid.
+/// The reported speedup is therefore slightly smaller than the true old/new ratio, on the standing
+/// rule that an instrument arguing for its own change reports the conservative number.
+///
+/// ### Half 2 — the pointer COALESCING ratio (M2)
+///
+/// A live grab is driven with synthetic reports at a realistic ~8 ms spacing (125 Hz, the bench
+/// pointer's rate) for a fixed span, through the SHIPPED pacer. `admitted` is how many became
+/// repositions and `coalesced` how many were folded forward. This is the half that cannot be argued
+/// from geometry: it is a statement about time, so it is measured against the clock.
+///
+/// Reports SKIP honestly rather than asserting over a fixture it could not build — no framebuffer, a
+/// panel too small to drag across, no free row. `panel=`/`box=` are printed on the verdict line
+/// because the ratio is only interpretable beside them: the whole mechanism is "panel area becomes
+/// box area", so a reader who cannot see both cannot check the arithmetic.
+#[cfg(all(feature = "witness", target_arch = "aarch64", feature = "baremetal", feature = "pidesk"))]
+pub fn dragperf_selftest() {
+    let fb = *super::WRITER.lock();
+    if !fb.is_ready() {
+        serial_println!("[dragperf] -> SKIP (framebuffer not ready)");
+        return;
+    }
+    let pinfo = fb.info();
+    if pinfo.width < 320 || pinfo.height < 240 {
+        serial_println!(
+            "[dragperf] -> SKIP (panel {}x{} too small)",
+            pinfo.width,
+            pinfo.height
+        );
+        return;
+    }
+    const ASID_DP: u64 = 0xD40;
+    const STEPS: usize = 24;
+    let surf = &raw const HT_SURF as usize;
+    let len = core::mem::size_of_val(&HT_SURF);
+    let w = create(ASID_DP, surf, len, FIX_W as u32, FIX_H as u32, FIX_STRIDE as u32, b"dgp");
+    if w == WIN_NONE {
+        serial_println!("[dragperf] -> SKIP (no free row)");
+        return;
+    }
+    let oy = pinfo.height / 2;
+    let (bw, bh) = match info_box(w) {
+        Some(b) => (b.2, b.3),
+        None => {
+            close(w);
+            serial_println!("[dragperf] -> SKIP (no box for the probe row)");
+            return;
+        }
+    };
+    // Edge to edge, with the chrome kept on the panel at both ends — `move_to` clamps, and a run that
+    // spent half its steps against a clamp would be measuring the cheap-skip rather than the move.
+    let span = pinfo.width.saturating_sub(bw + BORDER * 2);
+    if span < STEPS * 2 {
+        close(w);
+        serial_println!("[dragperf] -> SKIP (panel too narrow for a {}px box)", bw);
+        return;
+    }
+    let step = span / STEPS;
+
+    // ---- Half 1: the desktop repaint EXTENT a reposition asks for -------------------------------
+    //
+    // The `rects` side is MEASURED, from the shipped `move_to_inner` call site, across a real
+    // edge-to-edge sweep. The `whole` side is ANALYTIC and is labelled so on the wire: the line M1
+    // removed was `request_full_present()`, and that call sets the desktop damage set to
+    // `{0, 0, width, height}` (`screen::mark_full`) — one whole panel per move, exactly, with no
+    // measurement needed or possible to establish it. Quoting it as a measurement would be dressing
+    // an identity up as evidence; quoting it as what the removed line charged is simply reading it.
+    let _ = move_present_take();
+    let mut moves_b = 0usize;
+    for i in 0..STEPS {
+        if move_to(w, BORDER + i * step, oy) {
+            moves_b += 1;
+        }
+    }
+    // Back the other way, so the sweep is symmetric and the count is doubled without the window
+    // walking off the panel and spending its second half against the clamp.
+    for i in 0..STEPS {
+        if move_to(w, BORDER + (STEPS - 1 - i) * step, oy) {
+            moves_b += 1;
+        }
+    }
+    let (reqs_b, px_b) = move_present_take();
+    let pm_a = (pinfo.width as u64).saturating_mul(pinfo.height as u64);
+    let pm_b = if reqs_b > 0 { px_b / reqs_b } else { 0 };
+    serial_println!(
+        "[dragperf] mode=whole analytic px_per_move={} (one panel, what request_full_present charged)",
+        pm_a
+    );
+    serial_println!(
+        "[dragperf] mode=rects measured steps={} moves={} reqs={} px={} px_per_move={}",
+        STEPS * 2, moves_b, reqs_b, px_b, pm_b
+    );
+
+    // ---- Half 1b: THE ROUTER ARM IS REACHABLE ---------------------------------------------------
+    //
+    // The half that answers the conviction directly. Everything above measures the COST of a drag;
+    // this asserts that a drag can BEGIN AT ALL from a press, which is the thing the Pi did not have
+    // — `drag_begin` had exactly one caller in the tree and it was x86's. Driving `wm::drag_begin`
+    // from the fixture (as half 2 does) would prove the window layer and leave the router untested,
+    // which is precisely the shape of witness this arc was sent to fix.
+    //
+    // So it drives the SHIPPED router, `wc_click_route`, with a real Button edge at the real cursor
+    // — the CLICK-PLAIN fixture discipline: move the WINDOW under the pointer, never the pointer.
+    // The window is translated so the centre of its title strip lands on the cursor, solved from the
+    // shipping geometry (`info_box` + `TITLE_H`) rather than from a copy of it, and the placement is
+    // VERIFIED with `title_bar_hit` rather than assumed — `move_to` clamps, so a window that cannot
+    // be positioned under the hand reports SKIP honestly instead of asserting nothing.
+    //
+    // The focus the arm moves is saved and restored: a synthetic owner outside the private-slot range
+    // owns no ring, but leaving `USER_INPUT_ACTIVE` pointing at it would hand the rest of the boot's
+    // keyboard to a window this fixture is about to reap.
+    let router = {
+        use crate::arch::aarch64::syscall as sc;
+        let (pw, ph) = (pinfo.width as i32, pinfo.height as i32);
+        let (cx, cy) = crate::pal::cursor::pos(pw, ph);
+        let aimed = match (info(w), info_box(w)) {
+            (Some(i), Some((bx, by, bw2, _))) => {
+                let nx = i.x as i64 + (cx as i64 - (bx + bw2 / 2) as i64);
+                let ny = i.y as i64 + (cy as i64 - (by + TITLE_H / 2) as i64);
+                if nx >= BORDER as i64 && ny >= (TITLE_H + BORDER) as i64 {
+                    move_to(w, nx as usize, ny as usize);
+                    title_bar_hit(w, cx, cy)
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if aimed {
+            let saved = sc::user_input_active();
+            // PRESS then RELEASE, through the shipped edge detector. The press must land on the
+            // chrome arm and grab; the release must end the gesture and leave nothing live.
+            sc::wc_click_route(crate::pal::Event::Button(1));
+            let grabbed = drag_active() == w;
+            sc::wc_click_route(crate::pal::Event::Button(0));
+            let released = drag_active() == WIN_NONE;
+            sc::user_input_set_active(saved);
+            Some((grabbed, released))
+        } else {
+            None
+        }
+    };
+    match router {
+        Some((grabbed, released)) => serial_println!(
+            "[dragperf] router press=chrome grabbed={} released={} -> {}",
+            grabbed, released,
+            if grabbed && released { "PASS" } else { "FAIL" }
+        ),
+        None => serial_println!("[dragperf] router -> SKIP (title bar not placeable under cursor)"),
+    }
+
+    // ---- Half 2: the pacer, at a bench-realistic report rate ------------------------------------
+    // 8 ms between reports is 125 Hz — the rate `[piusb24]` records on the bench. The span is fixed
+    // rather than the count, so the expected admission is arithmetic: span / DRAG_MOTION_MS.
+    //
+    // The grab point is solved from the row's CURRENT box and not from the sweep's `oy`: half 1b has
+    // just translated the window to put its title strip under the cursor, so a grab aimed at where
+    // the row used to be misses `title_bar_hit`, `drag_begin` declines, and the whole half silently
+    // measures nothing. It did exactly that on its first run.
+    let (gx, gy) = match info_box(w) {
+        Some((bx, by, bw2, _)) => ((bx + bw2 / 2) as i32, (by + TITLE_H / 2) as i32),
+        None => (0, 0),
+    };
+    let (adm, coal) = if drag_begin(w, gx, gy) {
+        let t0 = crate::arch::ms();
+        let mut px = gx;
+        while crate::arch::ms().wrapping_sub(t0) < 320 {
+            px = px.wrapping_add(2);
+            drag_motion_paced(px, gy);
+            let m = crate::arch::ms();
+            while crate::arch::ms().wrapping_sub(m) < 8 {
+                core::hint::spin_loop();
+            }
+        }
+        (
+            DRAG_PACE_ADMITTED.load(core::sync::atomic::Ordering::Relaxed),
+            DRAG_PACE_COALESCED.load(core::sync::atomic::Ordering::Relaxed),
+        )
+    } else {
+        (0, 0)
+    };
+    drag_cancel("dragperf");
+
+    // The verdict is a CONJUNCTION of the two claims, each falsifiable on its own wire:
+    //  * the narrow regime asks for strictly less desktop area per move than the whole one, and
+    //  * the pacer folded reports rather than admitting all of them at 125 Hz.
+    // A build that loses either reads FAIL here rather than quietly reporting a ratio of 1.
+    let narrowed = pm_b > 0 && pm_b < pm_a;
+    let paced = coal > 0 && adm > 0;
+    let ratio_x10 = if pm_b > 0 { pm_a.saturating_mul(10) / pm_b } else { 0 };
+    serial_println!(
+        "[dragperf] panel={}x{} box={}x{} extent_speedup={}.{}x admitted={} coalesced={} -> {}",
+        pinfo.width, pinfo.height, bw, bh,
+        ratio_x10 / 10, ratio_x10 % 10,
+        adm, coal,
+        if narrowed && paced { "PASS" } else { "FAIL" }
+    );
+    close(w);
+    composite();
+}
+
+/// DRAGWEDGE — **the PA41 freeze, convicted in QEMU.**
+///
+/// Two attended metal freezes on `hw-pi4@14e54538` had one mechanism: a drag grab on a window whose
+/// compositor had stopped retiring blits, driving [`move_to_inner`]'s teardown-grade phase barrier
+/// once per pointer report, on the task that also consumes the input channel — so the button-up that
+/// would have ended the gesture was queued behind the very spin it was waiting to stop. The wire says
+/// it in two readings the fixture reproduces exactly: `blit_active=1 pending=1` in
+/// `:: [wedge1] DRAIN ABANDONED ::`, and a `[wm-act] drag-begin ... -> grabbed` with no `drag-end`
+/// after it anywhere in the capture.
+///
+/// ### What each leg convicts
+///  1. **The furniture press still WORKS.** A kernel-band row is draggable by ruling (see the chrome
+///     arm in `arch/aarch64/syscall.rs`), so this drives the SHIPPED router with a real `Button` edge
+///     on the console row's title strip and requires grab-then-release. It is the control: everything
+///     below refuses a grab, and a fixture that only proved refusal could be satisfied by a build in
+///     which nothing drags at all.
+///  2. **A stalled barrier is BOUNDED.** With one `BlitGuard` held — `blit_active=1`, the metal's own
+///     reading, and a wait that provably cannot terminate — one drag motion must RETURN, inside a
+///     budget measured in milliseconds rather than the seconds [`DRAIN_ABANDON_SPINS`] costs.
+///  3. **...and the grab is RELEASED by it.** The motion that met the stall must leave nothing live.
+///     This is the leg the metal capture fails: on the PA41 image the grab survives the stall and
+///     every subsequent report re-enters it.
+///  4. **...and a new grab is REFUSED while it stands.** The latch, which is what stops the operator's
+///     next press re-arming the storm. Must cost no measurable time — a refusal that spun would be
+///     the defect with a smaller constant.
+///  5. **...and the refusal LIFTS when the compositor recovers.** The guard is dropped and the same
+///     press must grab again. A latch with no exit would be a desktop that stops dragging for the
+///     rest of the boot, which is a worse bug than the one being fixed.
+///
+/// ### The arch gate, stated
+/// `target_arch = "aarch64"` is here for leg 1 and only leg 1: it drives
+/// `arch::aarch64::syscall::wc_click_route`, the shipped Pi router, because a fixture that called
+/// `drag_begin` directly would prove the window layer and leave the press path untested — the exact
+/// shape of witness DRAG-PI M4 was sent to fix. `baremetal`/`pidesk` are the knobs that name the
+/// desktop it presses on. The MECHANISM under test is arch-neutral (`wm.rs`, reached identically by
+/// x86's router), so this gate scopes the fixture's press, not the cure.
+///
+/// FORBID-on-FAIL: the verdict line is `-> PASS` or `-> FAIL`, and a build without the knobs emits
+/// nothing at all, so a knob-off gate stays green by absence rather than by a claim.
+#[cfg(all(
+    feature = "witness",
+    target_arch = "aarch64",
+    feature = "baremetal",
+    feature = "pidesk"
+))]
+pub fn dragwedge_selftest() {
+    use core::sync::atomic::Ordering::Relaxed;
+
+    /// The budget leg 2 asserts against. [`DRAIN_MOVE_SPINS`] measured 26 ms per 2^20 spins under
+    /// QEMU TCG on this gate, so the shipped 2^25 costs ~830 ms here (and ~340 ms on the Pi). The
+    /// budget is ~3x that: this leg's claim is "BOUNDED, and by an interactive amount", not a
+    /// performance figure, so it is sized to survive a loaded gate host while still being two orders
+    /// under the teardown bound the defect actually spent — which PA41 measured in seconds and which
+    /// on this gate would blow the whole 210 s window rather than print a number.
+    const STALL_BUDGET_MS: u64 = 2500;
+    /// Leg 4's budget. A refusal takes two relaxed loads; anything measurable means it spun.
+    const REFUSE_BUDGET_MS: u64 = 50;
+    const ASID_DW: u64 = KERNEL_OWNER_CONSOLE;
+
+    let fb = *super::WRITER.lock();
+    if !fb.is_ready() {
+        serial_println!("[dragwedge] -> SKIP (framebuffer not ready)");
+        return;
+    }
+    let pinfo = fb.info();
+    if pinfo.width < 320 || pinfo.height < 240 {
+        serial_println!(
+            "[dragwedge] -> SKIP (panel {}x{} too small)",
+            pinfo.width, pinfo.height
+        );
+        return;
+    }
+    let surf = &raw const HT_SURF as usize;
+    let len = core::mem::size_of_val(&HT_SURF);
+    let w = create(ASID_DW, surf, len, FIX_W as u32, FIX_H as u32, FIX_STRIDE as u32, b"dwg");
+    if w == WIN_NONE {
+        serial_println!("[dragwedge] -> SKIP (no free row)");
+        return;
+    }
+
+    // ---- Leg 1: the FURNITURE press, through the shipped router --------------------------------
+    //
+    // CLICK-PLAIN discipline, borrowed wholesale from `dragperf_selftest`: move the WINDOW under the
+    // pointer, never the pointer. The placement is VERIFIED with `title_bar_hit` rather than assumed,
+    // because `move_to` clamps and a row that cannot be put under the hand must report SKIP honestly.
+    let (pw, ph) = (pinfo.width as i32, pinfo.height as i32);
+    let (cx, cy) = crate::pal::cursor::pos(pw, ph);
+    let aimed = match (info(w), info_box(w)) {
+        (Some(i), Some((bx, by, bw2, _))) => {
+            let nx = i.x as i64 + (cx as i64 - (bx + bw2 / 2) as i64);
+            let ny = i.y as i64 + (cy as i64 - (by + TITLE_H / 2) as i64);
+            if nx >= BORDER as i64 && ny >= (TITLE_H + BORDER) as i64 {
+                move_to(w, nx as usize, ny as usize);
+                title_bar_hit(w, cx, cy)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    };
+    let (chrome_ok, grab_ok, rel_ok) = if aimed {
+        use crate::arch::aarch64::syscall as sc;
+        let saved = sc::user_input_active();
+        let chrome = chrome_hit(w, cx, cy);
+        sc::wc_click_route(crate::pal::Event::Button(1));
+        let grabbed = drag_active() == w;
+        sc::wc_click_route(crate::pal::Event::Button(0));
+        let released = drag_active() == WIN_NONE;
+        sc::user_input_set_active(saved);
+        (chrome, grabbed, released)
+    } else {
+        (false, false, false)
+    };
+
+    // ---- Legs 2-4: the stall, held open by one BlitGuard ----------------------------------------
+    //
+    // `BlitGuard::enter()` raises `BLIT_ACTIVE` to exactly the count the metal capture read, and this
+    // thread holds it, so the barrier's wait set contains a member that cannot retire while the wait
+    // runs. That is not a contrivance — it is the wire's own state, reproduced by the cheapest means
+    // that reaches it, and on the PA41 image every leg below hangs the gate instead of failing it.
+    let (gx, gy) = match info_box(w) {
+        Some((bx, by, bw2, _)) => ((bx + bw2 / 2) as i32, (by + TITLE_H / 2) as i32),
+        None => (0, 0),
+    };
+    let g0 = MOVE_DRAIN_GIVEUP.load(Relaxed);
+    let s0 = MOVE_DRAIN_SKIPPED.load(Relaxed);
+    // DRAGFIX — the arm ledger's pre-image, restored at the tail with the rest.
+    let y0 = DRAIN_YIELD_WAITS.load(Relaxed);
+    let yd0 = DRAIN_YIELD_DRAINED.load(Relaxed);
+    let sc0 = DRAIN_SAMECORE_SKIPS.load(Relaxed);
+    // DRAINRESCUE — leg 7's pre-image, restored at the tail with the rest.
+    let r0 = DRAIN_RESCUED.load(Relaxed);
+    let u0 = DRAIN_UNOWNED.load(Relaxed);
+    let (began, stall_ms, gave_up, cancelled, refused, refuse_ms) = {
+        let _hold = BlitGuard::enter();
+        // The grab is minted BEFORE the wait has ever been met, so the latch is down and this must
+        // succeed — leg 4's refusal is only meaningful against a begin that would otherwise work.
+        let began = drag_begin(w, gx, gy);
+        let t0 = crate::arch::ms();
+        // A real delta: `drag_motion` cheap-skips a reposition that would not move a pixel, and a
+        // skipped move never reaches the barrier this leg exists to measure.
+        drag_motion(gx + 24, gy);
+        let stall_ms = crate::arch::ms().wrapping_sub(t0);
+        let gave_up = MOVE_DRAIN_GIVEUP.load(Relaxed) > g0;
+        let cancelled = drag_active() == WIN_NONE;
+        let t1 = crate::arch::ms();
+        let refused = !drag_begin(w, gx, gy);
+        let refuse_ms = crate::arch::ms().wrapping_sub(t1);
+        (began, stall_ms, gave_up, cancelled, refused, refuse_ms)
+        // `_hold` drops HERE, and it must drop before anything below: `close` raises the TEARDOWN
+        // barrier, whose bound is the one this whole arc is about not waiting out.
+    };
+
+    // DRAGFIX — **WHICH ARM LEGS 2-4 SELECTED**, read BEFORE the restoration at the tail. This
+    // fixture's holder is its OWN stack, so no yield can ever retire it and the wait correctly ends
+    // at the bound — what leg 2 can honestly prove is therefore that the same-core arm was CONSULTED
+    // and chose the legal arm for its context, not that the wait was cured. (The metal scene differs
+    // in exactly the way that matters: PA45's holder is a DIFFERENT task, `u7-launc`, preempted on
+    // the drain's core, and there a yield does retire it. That verdict is the next boot's.)
+    let arm_yield = DRAIN_YIELD_WAITS.load(Relaxed) > y0;
+
+    // ---- Leg 6: the MASKED arm, and it is the deterministic half of the cure ----------------------
+    //
+    // The scene: a `BlitGuard` live on THIS core, and a drain raised from an IRQ-MASKED context —
+    // i.e. `close_owner` reached from `sched::exit`, which is boot 5's multi-minute vug close. Here
+    // yielding is illegal (aarch64's `yield_now` would unmask a teardown that masked on purpose), the
+    // wait is provably futile, and the correct answer is to abandon it at once.
+    //
+    // **This leg is a real conviction rather than a shape check**: the bound it declines to pay is
+    // [`DRAIN_ABANDON_SPINS`], 2^30, which on this gate is ~27 SECONDS. Pre-arc that is exactly what
+    // this call cost. The budget below is two orders under it, so a build without the skip arm cannot
+    // pass this leg by luck — it fails on the clock, loudly, and the number is on the wire either way.
+    //
+    // The barrier is raised and dropped inside the masked window, on `close`'s own pattern; nothing
+    // is torn down, so a skipped wait here abandons nothing real — the fixture is measuring the ARM,
+    // not exercising a teardown.
+    const SKIP_BUDGET_MS: u64 = 400;
+    let sc_pre = DRAIN_SAMECORE_SKIPS.load(Relaxed);
+    let (skip_ms, arm_skip) = {
+        let _hold = BlitGuard::enter();
+        let _mask = crate::arch::IrqMask::new();
+        let t2 = crate::arch::ms();
+        // `ms()` is CNTVCT-derived and interrupt-flag-independent, so it is trustworthy here — which
+        // is why the YIELDING arm may take a wall-clock deadline and the MASKED arms may not: the
+        // objection `DRAIN_ABANDON_SPINS` records is about a machine that may already be mid-wedge,
+        // not about the counter.
+        drop(DrainBarrier::drain());
+        (
+            crate::arch::ms().wrapping_sub(t2),
+            DRAIN_SAMECORE_SKIPS.load(Relaxed) > sc_pre,
+        )
+    };
+
+    // ---- Leg 7: DRAINRESCUE — the raise its owner cannot lower is released by the death path ------
+    //
+    // The scene this reproduces is the one no fixture can stage for real: a task that raised
+    // `DRAIN_PENDING` inside `drain_bounded` and then DIVERGED — killed at `yield_now`'s or
+    // `timer_preempt`'s boundary on aarch64, reaped out of the scheduler's READY arm on x86 — so its
+    // `DrainBarrier` is stranded on a stack that will never run drop glue again (`panic-strategy:
+    // abort`). Killing a real task mid-drain from inside a fixture would require the fixture to BE
+    // that task, which is a scene it cannot survive to report on. So the leg stages the RESIDUE
+    // instead, which is exactly what the death path is handed: the count raised, the raise recorded,
+    // and nothing on any stack that will ever lower it.
+    //
+    // **What this proves, and what it does not.** It proves the mechanism the death hooks call is
+    // correct and idempotent — the count returns to its prior value, the slot is cleared, the witness
+    // is bumped, and a second release (the `exit()`-and-reaper double-fire this arc's idempotence
+    // claim is about) decrements nothing. It does NOT prove the hooks are REACHED; that is a property
+    // of `arch/*/sched.rs`'s call sites, established by reading them, and `rescued=` on the
+    // `[wedge1] dwell` line is where a real firing shows up.
+    //
+    // Go-red is one edit: make `drain_release_dead` return `false` without touching the registry, and
+    // `rescued`/`restored`/`counted` fall together.
+    const RESCUE_FAKE_TID: u64 = 0xD9A1_0000_DEAD_BEEF; // an id no scheduler will ever mint
+    let arm_rescue = {
+        use core::sync::atomic::Ordering as O;
+        let pend_pre = DRAIN_PENDING.load(O::Acquire);
+        let resc_pre = DRAIN_RESCUED.load(Relaxed);
+        let unowned_pre = DRAIN_UNOWNED.load(Relaxed);
+        // The residue a diverging drain leaves behind: raise, record, abandon.
+        DRAIN_PENDING.fetch_add(1, O::AcqRel);
+        drain_note_raise(RESCUE_FAKE_TID);
+        let leaked = DRAIN_PENDING.load(O::Acquire) == pend_pre + 1;
+        // The raise must have been RECORDED rather than silently dropped on a full table — a leg that
+        // passed against an unrecorded raise would be asserting nothing at all.
+        let owned = DRAIN_UNOWNED.load(Relaxed) == unowned_pre;
+        // THE CURE.
+        let rescued = drain_release_dead(RESCUE_FAKE_TID);
+        let restored = DRAIN_PENDING.load(O::Acquire) == pend_pre;
+        let counted = DRAIN_RESCUED.load(Relaxed) == resc_pre + 1;
+        // Idempotence: the slot is cleared, so a second release finds nothing and lowers nothing.
+        let again = drain_release_dead(RESCUE_FAKE_TID);
+        let idempotent = !again && DRAIN_PENDING.load(O::Acquire) == pend_pre;
+        leaked && owned && rescued && restored && counted && idempotent
+    };
+
+    // ---- Leg 5: the latch LIFTS ------------------------------------------------------------------
+    let healthy = !barrier_stalled();
+    let regrab = drag_begin(w, gx, gy);
+    drag_end();
+    let recovered = healthy && regrab && drag_active() == WIN_NONE;
+
+    let ok = aimed
+        && chrome_ok
+        && grab_ok
+        && rel_ok
+        && began
+        && gave_up
+        && cancelled
+        && stall_ms <= STALL_BUDGET_MS
+        && refused
+        && refuse_ms <= REFUSE_BUDGET_MS
+        && recovered
+        // DRAGFIX legs: the masked arm must have FIRED and must have cost two orders less than the
+        // bound it declined. `arm_yield` is reported but NOT asserted — whether legs 2-4 run in a
+        // schedulable context is a property of where the battery is driven from, and a fixture that
+        // failed on it would be asserting the harness rather than the mechanism.
+        && arm_skip
+        && skip_ms <= SKIP_BUDGET_MS
+        // DRAINRESCUE: asserted unconditionally. Unlike `arm_yield` this leg depends on nothing about
+        // where the battery is driven from — it stages its own residue against a synthetic id — so a
+        // failure here is the mechanism and can only be the mechanism.
+        && arm_rescue;
+    serial_println!(
+        "[dragwedge] furniture aimed={} chrome={} grab={} release={} | stall began={} gave_up={} \
+         cancelled={} ms={}/{} | refuse={} ms={}/{} | recover={} bound={} | arm_yield={} \
+         arm_skip={} skip_ms={}/{} tdbound={} | rescue={} rescued={} unowned={} -> {}",
+        aimed, chrome_ok, grab_ok, rel_ok,
+        began, gave_up, cancelled, stall_ms, STALL_BUDGET_MS,
+        refused, refuse_ms, REFUSE_BUDGET_MS,
+        recovered, DRAIN_MOVE_SPINS,
+        arm_yield, arm_skip, skip_ms, SKIP_BUDGET_MS, DRAIN_ABANDON_SPINS,
+        arm_rescue, DRAIN_RESCUED.load(Relaxed), DRAIN_UNOWNED.load(Relaxed),
+        if ok { "PASS" } else { "FAIL" }
+    );
+    // A SKIPPED aim is reported as such on its own line rather than being folded into the verdict
+    // above, so a reader who sees FAIL can tell "the fixture could not build its scene" from "the
+    // mechanism regressed" without re-deriving it from the flags.
+    if !aimed {
+        serial_println!("[dragwedge] furniture -> SKIP (title bar not placeable under cursor)");
+    }
+    // **THE FIXTURE PUTS THE LEDGER BACK**, on this module's standing rule that a fixture restores
+    // what it takes. Its give-up is DELIBERATE, so leaving it standing would make every later
+    // `[wedge1] dwell` line on an armed boot read `MOVE-GAVE-UP` and would burn the once-per-boot
+    // `MOVE DRAIN GAVE UP` print — so a REAL give-up, later in the same boot, would be
+    // indistinguishable from this one and would have no line of its own. The evidence is not lost by
+    // restoring: `gave_up=true` on the verdict line above is where this fixture's give-up is
+    // recorded, and it is the only place it belongs.
+    MOVE_DRAIN_GIVEUP.store(g0, Relaxed);
+    MOVE_DRAIN_SKIPPED.store(s0, Relaxed);
+    MOVE_DRAIN_REPORTED.store(false, Relaxed);
+    BARRIER_UNHEALTHY.store(false, Relaxed);
+    // DRAGFIX — the same restoration, extended to the arm ledger, for the identical reason. This
+    // fixture's stall is DELIBERATE and its holder is its own stack, so whichever same-core arm ran
+    // ran correctly; leaving `scskip` standing would make every later `[wedge1] dwell` line on an
+    // armed boot read `SAMECORE-SKIP`, and leaving `ywait > ydrain` standing would deny a real
+    // yielding cure its `YIELD-DRAINED` verdict for the rest of the boot. The evidence is not lost:
+    // `gave_up=true` and `ms=` on the verdict line above are where this fixture's give-up is
+    // recorded, and they are the only place it belongs.
+    DRAIN_YIELD_WAITS.store(y0, Relaxed);
+    DRAIN_YIELD_DRAINED.store(yd0, Relaxed);
+    DRAIN_SAMECORE_SKIPS.store(sc0, Relaxed);
+    DRAGFIX_REPORTED.store(false, Relaxed);
+    // DRAINRESCUE — the same restoration, and here it is load-bearing rather than tidy. Leg 7's
+    // rescue is SYNTHETIC: leaving it standing would put `rescued=1` on every later `[wedge1] dwell`
+    // line of an armed boot and would burn the once-per-boot `DRAIN RESCUED` print, so a REAL rescue
+    // later in the same boot — the event this whole arc exists to witness — would be
+    // indistinguishable from the fixture's and would have no line of its own. The evidence is not
+    // lost: `rescue=` on the verdict line above is where leg 7's firing is recorded, and it is the
+    // only place it belongs. `DRAIN_PENDING` needs no restoration — leg 7 asserted it back itself.
+    DRAIN_RESCUED.store(r0, Relaxed);
+    DRAIN_UNOWNED.store(u0, Relaxed);
+    DRAIN_RESCUE_REPORTED.store(false, Relaxed);
+    close(w);
+    composite();
+}
+
 #[cfg(feature = "witness")]
 fn closeiso_selftest() {
     use core::sync::atomic::Ordering;
@@ -15740,6 +18227,8 @@ fn closeiso_selftest() {
     // The app whose window the operator closes, and the ordinary-owner control row.
     const ASID_APP: u64 = 0xE2A;
     const ASID_FORCED: u64 = 0xE2F;
+    /// DECRUD-4's overlapper: an ordinary owner, so the teardown sweep can reap it.
+    const ASID_OVER: u64 = 0xE2C;
 
     let fb = *super::WRITER.lock();
     if !fb.is_ready() {
@@ -15761,7 +18250,6 @@ fn closeiso_selftest() {
     let sf = &raw const FV_SURF_B as usize;
     let len = core::mem::size_of_val(&FV_SURF_A);
     let (k_col, a_col, f_col) = (HT_SURF[0], FV_SURF_A[0], FV_SURF_B[0]);
-    let _ = a_col;
 
     // Tiled, not pinned: the tiler lays these out without overlap by construction, and a close
     // re-tiles the survivors — which is the real shape (no ring-3 program moves its own window) and
@@ -15803,7 +18291,15 @@ fn closeiso_selftest() {
     let got_k = sample(wk);
     let got_f = sample(wf);
     let iso_ok = got_k == k_col;
-    let forced_ok = got_f == DESKTOP_BG;
+    // FURNITURE-OCC (CHROMESPEC, 2026-08-17) — the FORCED row is hidden by the shell raise, so its
+    // content origin must stop being ITS pixels. Desktop is what that means on a bare panel and what
+    // this leg asserted; on the armed Pi desktop the console window under it is correctly repainted
+    // there instead (`forced=0xf3f3f5` — a title-strip shade, not a stale `f_col`), which the old
+    // equality convicted. Same rule the vacate legs now keep: see [`vacated_points`].
+    let forced_ok = match probe(wf) {
+        Some(pt) => vacated_points(&[pt], f_col).0,
+        None => got_f == DESKTOP_BG,
+    };
     // The table's own answer, beside the panel's: `above_shell` must still call the furniture row
     // visible. (`owner_hidden` is the predicate every present-suppression path reads.)
     let table_ok = {
@@ -15848,12 +18344,47 @@ fn closeiso_selftest() {
         && ctrl_close == FURNITURE_HAS_CONTROLS;
 
     let park = minimise(wk);
+    // FURNITURE-OCC (CHROMESPEC, 2026-08-17) — **`parked-visible` is not a failure, and `minimise`
+    // says so in its own doc comment**: *"down, but the owner still has another window above the
+    // shell, so it keeps rendering. Not an error: minimise is a WINDOW gesture and hiding is an OWNER
+    // property."* This fixture mints `wk` in the `KERNEL_OWNER_CONSOLE` band, and on the armed Pi
+    // desktop `pidesk::activate` has ALREADY minted a real window in that same band — so the owner
+    // legitimately keeps a window up, `minimise` returns `parked-visible`, `owner_hidden` answers
+    // false, and the leg reported `park=parked-visible/0x2d2b55/false` for machinery that did exactly
+    // what it promises.
+    //
+    // So the leg asserts what it is actually about — THIS ROW went down — and takes the owner-level
+    // outcome only in the state where the owner has nothing else up. The expected string is derived
+    // from the table rather than hard-coded, so a build that returned `parked-visible` with no
+    // sibling (or `parked` with one) is still a FAIL.
+    let sibling_up = {
+        let t = table();
+        let shell = shell_z();
+        t.rows
+            .iter()
+            .filter(|r| r.used && r.id != wk && r.owner_asid == KERNEL_OWNER_CONSOLE)
+            .any(|r| above_shell(r, shell))
+    };
+    let parked_row = {
+        let t = table();
+        let shell = shell_z();
+        row(&t, wk).map(|r| !above_shell(r, shell)).unwrap_or(false)
+    };
     let parked_hidden = {
         let t = table();
         owner_hidden(&t, KERNEL_OWNER_CONSOLE, shell_z())
     };
     let parked_px = sample(wk);
-    let park_ok = park == "parked" && parked_hidden && parked_px == DESKTOP_BG;
+    // The vacated box, per FURNITURE-OCC: desktop where the desktop owns it, and provably no longer
+    // `wk`'s own paint where a live window does.
+    let parked_px_ok = match probe(wk) {
+        Some(pt) => vacated_points(&[pt], k_col).0,
+        None => parked_px == DESKTOP_BG,
+    };
+    let park_ok = park == if sibling_up { "parked-visible" } else { "parked" }
+        && parked_row
+        && (sibling_up || parked_hidden)
+        && parked_px_ok;
 
     focus_changed(KERNEL_OWNER_CONSOLE);
     let back_visible = {
@@ -15862,6 +18393,85 @@ fn closeiso_selftest() {
     };
     let back_px = sample(wk);
     let back_ok = back_visible && back_px == k_col;
+
+    // ── DECRUD-4: UNCOVER-REPAINT — **does closing a window over a FURNITURE row give the furniture
+    // its pixels back, or leave a HOLE in it?** ──────────────────────────────────────────────────
+    //
+    // Peter, on metal, this boot: a fixture window opened and closed over the console window and left
+    // an UNPAINTED HOLE in the console beneath it, which clicking did not repair. Every close witness
+    // in this file asks the WC-J question — "did the closed window's own box come back as DESKTOP?" —
+    // and that question cannot see this defect at all. It is the exact complement: the box a close
+    // vacates is only desktop-coloured where nothing was UNDER it, and where something WAS, the
+    // vacated box has to come back as THAT WINDOW. `reclaim` does `erase` (paint desktop) and then
+    // `damage_intersecting`, and the repaint of the uncovered row rides entirely on that second half:
+    // if the damage flag is set and then eaten by a composite that runs before the window is redrawn,
+    // the erase has already happened and the hole is permanent. Clicking does not repair it because a
+    // click marks no damage on a row it does not move.
+    //
+    // The leg is stated against a KERNEL-BAND row deliberately — `wk` is furniture, the same class as
+    // the console window Peter saw the hole in — and it is three reads:
+    //   1. `base`     — `wk`'s content origin reads `wk`'s colour, with nothing over it.
+    //   2. `occluded` — the overlapper is really on top (a leg that could not occlude would pass 3
+    //                   trivially, which is the way this witness could otherwise convict nothing).
+    //   3. `restored` — after `close(wo)`, that same pixel is `wk`'s colour AGAIN. NOT `DESKTOP_BG`:
+    //                   desktop there IS the hole, and is the failure this leg exists to name.
+    //
+    // `wk` is pinned for the duration and unpinned after. Without that, `close(wo)` re-tiles the
+    // unpinned survivors, `wk` MOVES out from under the hole, and read 3 passes on a broken tree —
+    // the vacuity this fixture's siblings have been convicted for before.
+    let occ_ok = {
+        let kb0 = info_box(wk);
+        let wo = create(ASID_OVER, sa, len, 8, 8, 32, b"ci-o");
+        match (kb0, wo) {
+            (Some(kb), w) if w != WIN_NONE => {
+                {
+                    let mut t = table();
+                    if let Some(r) = row_mut(&mut t, wk) {
+                        r.pinned = true;
+                    }
+                }
+                // Origin-on-origin: whatever the panel's scale, the overlapper's box then contains
+                // `wk`'s content origin, so the sampled pixel is one the overlapper genuinely covers.
+                let _ = move_to(w, kb.0, kb.1);
+                present(w);
+                let occluded = sample(wk) != k_col;
+                let reaped_o = close(w);
+                let restored = sample(wk) == k_col;
+                {
+                    let mut t = table();
+                    if let Some(r) = row_mut(&mut t, wk) {
+                        r.pinned = false;
+                    }
+                }
+                if !(occluded && restored) {
+                    serial_println!(
+                        "[wc-iso] uncover-repaint occluded={} restored={} px={:#08x} want={:#08x} desktop={:#08x} reaped={} -> FAIL",
+                        occluded, restored, sample(wk), k_col, DESKTOP_BG, reaped_o
+                    );
+                }
+                occluded && restored && reaped_o
+            }
+            _ => {
+                serial_println!("[wc-iso] uncover-repaint -> SKIP (no row)");
+                close(wo);
+                true
+            }
+        }
+    };
+
+    // DECRUD-3 — **the FURNITURE row this fixture minted is REAPED, and the reap is ASSERTED.**
+    //
+    // `wk` is a `KERNEL_OWNER_CONSOLE`-band row, and the CLOSEISO contract this very fixture proves
+    // (leg 3, `refuse_ok` above) is that `close_owner` REFUSES the kernel band. So the owner-scoped
+    // sweep below is structurally blind to `wk` — exactly the vacuity `ctrldecline_selftest`'s
+    // CTRLWIT-REVIEW convicted in its own teardown — and `close` by id, which has no such refusal, is
+    // the only thing that can reap it. That call used to be an unchecked statement at this file's
+    // tail: on a desktop boot the panel would then be carrying a second kernel-band row that no
+    // gesture can remove (`close_owner` refuses it, and the operator's close disc routes through
+    // `close_owner`), for the rest of the boot, and NOTHING on the wire would have said so. It is
+    // asserted now, on the same terms as `ctrldecline` leg 6: the return AND the row's absence,
+    // because a `true` from a function that also composites is weaker evidence than the table itself.
+    let reaped_k = close(wk) && info_box(wk).is_none();
 
     let ok = base_k
         && base_f
@@ -15872,19 +18482,40 @@ fn closeiso_selftest() {
         && refuse_ok
         && ctrls_ok
         && park_ok
-        && back_ok;
+        && back_ok
+        && occ_ok
+        && reaped_k;
     serial_println!(
-        "[wc-iso] close-iso base_k={} base_f={} closed={}/{} isolate={:#08x}/{} forced={:#08x}/{} table_visible={} refuse={}/{} ctrls min={} zoom={} close={} park={}/{:#08x}/{} restore={}/{:#08x}/{} -> {}",
+        "[wc-iso] close-iso base_k={} base_f={} closed={}/{} isolate={:#08x}/{} forced={:#08x}/{} table_visible={} refuse={}/{} ctrls min={} zoom={} close={} park={}/{:#08x}/{} restore={}/{:#08x}/{} uncover={} reaped={} -> {} owner_sibling_up={}",
         base_k, base_f, closed, closed_ok, got_k, iso_ok, got_f, forced_ok, table_ok,
         refused, refuse_ok,
         ctrl_min, ctrl_zoom, ctrl_close,
         park, parked_px, park_ok,
         back_visible, back_px, back_ok,
-        if ok { "PASS" } else { "FAIL" }
+        occ_ok,
+        reaped_k,
+        if ok { "PASS" } else { "FAIL" },
+        sibling_up
     );
 
-    close(wk);
     close(wf);
+    // DECRUD-3 — the teardown guard `hittest_selftest` established and this fixture never had: no
+    // synthetic row may outlive the battery, and a leak may not be SILENT. `wa` is deliberately not
+    // closed anywhere above — it is reaped by the very `close_owner(ASID_APP)` gesture under test at
+    // leg 2 — so if that leg ever regressed to freeing zero rows, `ci-a` would survive to the desktop
+    // and only `closed_ok` (a verdict bit, not a reap) would have noticed. The sweep costs two calls
+    // and turns that into a named FAIL. `KERNEL_OWNER_CONSOLE` is NOT swept: it is the live console's
+    // own owner on a desktop boot, and CLOSEISO refuses the band anyway — `reaped_k` above owns `wk`.
+    let mut leaked = 0usize;
+    for a in [ASID_APP, ASID_FORCED, ASID_OVER] {
+        leaked += close_owner(a);
+    }
+    if leaked > 0 {
+        serial_println!(
+            "[wc-iso] close-iso teardown LEAK — {} synthetic row(s) reaped :: FAIL ::",
+            leaked
+        );
+    }
     // Same restore its neighbours make: the shell back at the bottom, focus back to the shell, and the
     // live set repainted — this leg's `focus_changed(0)` pushed every OTHER live window under the
     // shell too, and `composite_inner` has already eaten their damage flags.
@@ -15962,20 +18593,19 @@ fn retile_selftest() {
     let moved = after != before;
     // The survivor still reaches the panel at its NEW box...
     let live_ok = read(after.0 + BORDER + 1, after.1 + TITLE_H + BORDER + 1) == b_col;
-    // ...and its OLD box is desktop again. Three points inside the abandoned content area.
-    let mut clean = 0usize;
+    // ...and its OLD box is RECLAIMED. Three points inside the abandoned content area — desktop
+    // where the desktop still owns them, and provably no longer B's paint where furniture does.
+    // FURNITURE-OCC: see [`vacated_points`] for why that is the same rule stated for a panel that
+    // has something underneath.
     let pts = [(bx0 + 1, by0 + 1), (bx0 + 2, by0 + 2), (bx0 + 5, by0 + 5)];
-    for &(x, y) in pts.iter() {
-        if read(x, y) == DESKTOP_BG {
-            clean += 1;
-        }
-    }
-    let ghost_free = !moved || clean == pts.len();
+    let (reclaimed, clean, covered) = vacated_points(&pts, b_col);
+    let ghost_free = !moved || reclaimed;
     let ok = painted && live_ok && ghost_free;
     serial_println!(
-        "[wc-j] retile survivor={} moved={} painted={} live={} old_desktop={} ({}/3) -> {}",
+        "[wc-j] retile survivor={} moved={} painted={} live={} old_desktop={} ({}/3) -> {} covered={}",
         wb, moved, painted, live_ok, ghost_free, clean,
-        if ok { "PASS" } else { "FAIL" }
+        if ok { "PASS" } else { "FAIL" },
+        covered
     );
     close(wb);
 }
@@ -15985,6 +18615,77 @@ fn retile_selftest() {
 fn info_box(id: WinId) -> Option<(usize, usize, usize, usize)> {
     let t = table();
     row(&t, id).map(outer_box)
+}
+
+/// FURNITURE-OCC — **is this panel point the DESKTOP's to answer?** `true` iff no live window's
+/// outer box contains it.
+///
+/// Called after a close or a move, with the vacating row already gone from the table, so "live" is
+/// the set that owns the panel at the instant of the read.
+#[cfg(feature = "witness")]
+fn desktop_owns(x: usize, y: usize) -> bool {
+    let t = table();
+    !t.rows.iter().filter(|r| r.used).any(|r| {
+        let (bx, by, bw, bh) = outer_box(r);
+        x >= bx && x < bx + bw && y >= by && y < by + bh
+    })
+}
+
+/// FURNITURE-OCC (CHROMESPEC, 2026-08-17) — the VACATE verdict for a set of abandoned points, on a
+/// panel that may carry PERMANENT FURNITURE underneath them.
+///
+/// Returns `(ok, correct, covered)`: whether every point answered correctly, how many did, and how
+/// many of them were owned by a live window rather than by the desktop.
+///
+/// ## Why the old rule had to widen, and why this is not a weakening
+///
+/// The rule these legs shipped with was *"every abandoned point equals [`DESKTOP_BG`], byte for
+/// byte, with no tolerance"*. That is right on a bare panel and WRONG on a desktop — and this file
+/// already says so, three hundred lines up, in DECRUD-4's own words: *"the box a close vacates is
+/// only desktop-coloured where nothing was UNDER it, and where something WAS, the vacated box has to
+/// come back as THAT WINDOW."* DECRUD-4 states the complement as a separate leg; this states it as
+/// the rule the vacate legs themselves keep.
+///
+/// It became load-bearing when the Pi grew a desktop. `pidesk::activate` mints the console window at
+/// the GUI handoff — `[wc-x] console-window win=1 … box=570x396 at (35,4)` — which on the 640x480
+/// gate panel covers `x 35..605, y 4..400`, i.e. 89 % by 82 % of the glass, and the boot witness
+/// cascade then places its probe windows INSIDE it. `pidesk.rs` records the collision as a standing
+/// one ("a standing conflict left for the integrator"). Under the old rule the legs read
+/// `close_desktop=false (0/5)`, `old_desktop=false (0/3)` — five and three CORRECT repaints reported
+/// as five and three failures, because the console window under them was faithfully redrawn and the
+/// witness could only recognise the desktop.
+///
+/// The two arms are:
+///
+/// * **desktop-owned** — unchanged, and still byte-exact: the point must be [`DESKTOP_BG`]. This is
+///   the whole of the old rule and every point takes it on a panel with no furniture, so a bare-panel
+///   boot reads exactly as it always did.
+/// * **covered** — the point must NOT still be showing `gone`, the vacating window's own paint. A
+///   window whose box was never reclaimed leaves its own pixels there, which is the defect these legs
+///   exist to catch, and it is caught under occlusion exactly as it is in the open.
+///
+/// **The disclosed limit**, because a witness that hides one is worth nothing: on a COVERED point the
+/// test is a not-equal, so it cannot convict a stale pixel whose colour happens to equal the covering
+/// window's at that point. That is why `covered=` is on the wire beside the count — a leg reporting
+/// every point covered has made a weaker statement than one reporting none, and the reader can see
+/// which. The fixture surfaces are solid `0xFF2020`/`0x20FF20`, which nothing else in the tree
+/// paints, so on the content points the arm is as tight as the equality it replaces.
+#[cfg(feature = "witness")]
+fn vacated_points(pts: &[(usize, usize)], gone: u32) -> (bool, usize, usize) {
+    let (mut correct, mut covered, mut bad) = (0usize, 0usize, 0usize);
+    for &(x, y) in pts.iter() {
+        let got = super::WRITER.lock().read_pixel(x, y).unwrap_or(0);
+        let desktop = desktop_owns(x, y);
+        if !desktop {
+            covered += 1;
+        }
+        if if desktop { got == DESKTOP_BG } else { got != gone } {
+            correct += 1;
+        } else {
+            bad += 1;
+        }
+    }
+    (bad == 0, correct, covered)
 }
 
 // ---- internals -------------------------------------------------------------------------------
@@ -16884,6 +19585,30 @@ fn clickshell_windowless_leg(asid: u64) -> Option<bool> {
     if compat_live() {
         return None; // a full-screen app owns the panel: the deliver arm, not this leg's fixture
     }
+    // FURNITURE-OCC (CHROMESPEC, 2026-08-17) — **leg 6's own precondition, which leg 7 was missing.**
+    //
+    // This leg asserts the MISS arm: a press that lands on NO window must be consumed by the shell.
+    // Whether the press lands on a window is a fact about where the pointer is parked and what is on
+    // the panel, and `clickshell_leg` has always checked it in as many words ("pointer parked over a
+    // window: that is the HIT arm, not the desktop arm"). Leg 7 inherited every other part of that
+    // fixture and not this one, which was invisible for as long as panel centre was empty.
+    //
+    // The armed Pi desktop makes it visible: `pidesk::activate` mints the console window over
+    // `x 35..605, y 4..400` of a 640x480 panel and the headless gate parks the cursor at panel
+    // CENTRE, i.e. inside it. The press is then a legitimate HIT, the router correctly declines to
+    // treat it as a desktop click, and the leg reported `bare=false` — the fixture's own precondition
+    // failing, reported as the policy failing. Leg 6 read `shell=skip` on the identical boot for the
+    // identical reason, which is the tell that this is a missing guard and not a second defect.
+    //
+    // SKIP, never PASS: the leg asserts nothing when it has no fixture, on the sibling's discipline.
+    let (cw, ch) = {
+        let i = super::WRITER.lock().info();
+        (i.width as i32, i.height as i32)
+    };
+    let (cx, cy) = crate::pal::cursor::pos(cw, ch);
+    if hit_test(cx, cy).is_some() {
+        return None; // pointer parked over a window: that is the HIT arm, not the desktop arm
+    }
     focus_changed(asid); // no window to raise — this only names the windowless owner
     sc::user_input_set_active(asid);
     let consumed = sc::wc_click_route(crate::pal::Event::Button(1));
@@ -17358,7 +20083,16 @@ pub fn hittest_selftest() {
     // reports `skip` (the sibling's discipline) rather than a verdict it has no fixture for.
     let outside_ok: Option<bool> = miss_pt.map(|(x, y)| hit_test(x, y).is_none());
     focus_changed(0);
-    let hidden_ok = hit_test(ix, iy).is_none();
+    // FURNITURE-OCC (CHROMESPEC, 2026-08-17) — leg 5 asks whether the shell raise BURIED THE PROBE
+    // ROWS, and that is what it now reads. `is_none()` was the same question asked of a panel where
+    // the probes were the only things at that point; with the Pi desktop's console window under them
+    // (`[wc-x] console-window win=1 … box=570x396 at (35,4)` covers the probe origin at 640x480) the
+    // hit-test correctly resolves to the FURNITURE the shell raise has no business burying, and the
+    // leg convicted the compositor for being right. The owner is on the wire beside the verdict, so a
+    // reader can see WHAT the point resolved to rather than only that it resolved to something.
+    let hidden_hit = hit_test(ix, iy);
+    let hidden_owner = hidden_hit.map(|(_, a, _)| a).unwrap_or(0);
+    let hidden_ok = hidden_owner != ASID_A && hidden_owner != ASID_B;
 
     // Leg 6 — CLICK-SHELL. Re-raise A (leg 5 left every window under the shell) and give it focus,
     // then drive one PRESS edge through the router with the pointer wherever it actually is. The
@@ -17415,7 +20149,7 @@ pub fn hittest_selftest() {
     };
     let (mx, my) = miss_pt.unwrap_or((-1, -1));
     serial_println!(
-        "[clickroute] hit-test at ({},{}) inside={} topmost={} raise={} outside={} miss=({},{}) hidden={} shell={} bare={} hit={} deliver={} wake={} corner={} close={} closereal={} -> {}",
+        "[clickroute] hit-test at ({},{}) inside={} topmost={} raise={} outside={} miss=({},{}) hidden={} shell={} bare={} hit={} deliver={} wake={} corner={} close={} closereal={} -> {} hidden_owner={:#x}",
         ix, iy, inside_ok, topmost_ok, raise_ok,
         match outside_ok {
             Some(true) => "true",
@@ -17431,7 +20165,8 @@ pub fn hittest_selftest() {
         match corner { Some(true) => "true", Some(false) => "false", None => "skip" },
         match closebox { Some(true) => "true", Some(false) => "false", None => "skip" },
         match closereal { Some(true) => "true", Some(false) => "false", None => "skip" },
-        if ok { "PASS" } else { "FAIL" }
+        if ok { "PASS" } else { "FAIL" },
+        hidden_owner
     );
 
     close(wa);
@@ -17498,7 +20233,7 @@ pub fn focus_reset() {
 ///
 /// A SNAPSHOT, never a handle, on [`info`]'s rule: re-read it after any mutating call. The caption is
 /// copied rather than borrowed because the table lock is released before the dock draws anything.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 #[derive(Clone, Copy)]
 pub struct DockEntry {
     /// Window id (`1..=MAX_WINDOWS`).
@@ -17517,7 +20252,7 @@ pub struct DockEntry {
     pub focused: bool,
 }
 
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 impl DockEntry {
     /// A zeroed entry, for the caller's scratch array.
     pub const fn empty() -> Self {
@@ -17553,7 +20288,7 @@ impl DockEntry {
 ///
 /// Cost and locks: one `TABLE` acquisition, one bounded `MAX_WINDOWS` scan, no allocation, no nested
 /// lock, no new lock order — [`focus_ring`]'s and [`occluders`]'s shape exactly.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 pub fn dock_scan(
     out: &mut [DockEntry; MAX_WINDOWS],
     rect: (usize, usize, usize, usize),
@@ -17607,7 +20342,7 @@ pub fn dock_scan(
 /// path that cannot take `dock_scan`'s `TABLE` lock. A predicate copied into that path would have
 /// been a second definition of which windows the strip is sized by — free to drift, and drifting
 /// silently, since the two would only disagree about the strip's WIDTH.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 #[inline]
 fn dock_addressable(r: &Window) -> bool {
     r.used && !r.compat && r.owner_asid != 0
@@ -17620,7 +20355,7 @@ fn dock_addressable(r: &Window) -> bool {
 /// acquisition would be both a cost and a fresh interleave in a loop that deliberately takes none
 /// (see its ledger). The snapshot is also the RIGHT input — it is the geometry this pass is drawing
 /// against, and the count `dock::compose` will reach at the tail of the same pass.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 fn dock_tiles(rows: &[Window; MAX_WINDOWS]) -> usize {
     let n = rows.iter().filter(|r| dock_addressable(r)).count();
     // SHELLPIN (integrator, GR27) — mirror `dock::pin_shell`: with no live KERNEL_OWNER_DESKTOP

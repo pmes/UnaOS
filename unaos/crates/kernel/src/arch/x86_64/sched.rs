@@ -3153,6 +3153,16 @@ pub fn exit() -> ! {
             SCHED[cpu].cr3_live.store(crate::arch::memory::kernel_cr3(), Ordering::Relaxed);
             user_space_release(user_cr3);
         }
+        // DRAINRESCUE — release any window-manager drain barrier this task raised and can no longer
+        // lower. `exit()` is this arch's single voluntary terminus (kernel trampoline return,
+        // `SYS_EXIT`, `SYS_THREAD_EXIT`, `ring3_fault_kill`) AND the target `kill_check_current`'s
+        // yield ultimately funnels through, and it diverges by switching off the task's own stack with
+        // `panic-strategy: abort` in force — so no drop glue runs on the abandoned frames and the
+        // `DrainBarrier` RAII guard cannot lower what it raised. Placed at the very end because the
+        // address-space release above routes through `clear_handle_row` -> `wm::close_owner`, which
+        // raises and lowers a barrier of its own under this same id. Costs one eight-entry scan of
+        // relaxed loads per death and finds nothing on almost all of them.
+        crate::video::wm::drain_release_dead((*raw).id);
         (*raw).state.store(STATE_FINISHED, Ordering::Release);
         // Switch away for good. `old_rsp` is a throwaway slot on the dying stack (the scheduler
         // never reads it back, and never switches into a Finished task).
@@ -5088,7 +5098,10 @@ fn input_wait_backstop() {
 /// SMPBAL-X86: minimum victim queue depth to steal from. `2` leaves the last ready task at its home
 /// core (a core with one task is not "loaded"), which is what stops two idle cores ping-ponging a
 /// lone task between them.
-const STEAL_MIN_DEPTH: usize = 2;
+///
+/// PARITY §6.6c LIFTED THE VALUE, not the meaning: it now re-exports `sched_spread::STEAL_MIN_DEPTH`
+/// so the Pi's `try_steal` and this one cannot drift. Nothing about x86's behaviour changes here.
+const STEAL_MIN_DEPTH: usize = crate::sched_spread::STEAL_MIN_DEPTH;
 
 // ── VUGSPREAD: THE FLOOR WAS COUNTING THE WRONG POPULATION ──────────────────────────────────────
 //
@@ -5124,13 +5137,13 @@ const STEAL_MIN_DEPTH: usize = 2;
 /// that the `current_prio` load it needs for the floor is the same one review F15's `PACK_SEEN`
 /// observation reads — one load answering both questions instead of two loads that could disagree
 /// with each other within a single iteration. Keep the two in step if either changes.
+///
+/// PARITY §6.6c: the RULE now lives in `sched_spread::steal_floor` and is shared with aarch64; what
+/// stays here is the arch-bound half — reading whether THIS arch's victim is running something.
 #[inline]
 fn steal_floor(victim: usize) -> usize {
-    if SCHED[victim].current_prio.load(Ordering::Acquire) == PRIO_IDLE {
-        STEAL_MIN_DEPTH
-    } else {
-        1
-    }
+    let running = SCHED[victim].current_prio.load(Ordering::Acquire) != PRIO_IDLE;
+    crate::sched_spread::steal_floor(running)
 }
 
 // ── VUGSPREAD: WHY A STEAL DID NOT HAPPEN ───────────────────────────────────────────────────────
@@ -5279,21 +5292,26 @@ static STEAL_REMIGS: AtomicU64 = AtomicU64::new(0);
 // enough to break the ~0.5 ms re-steal cadence Boot C measured, short enough that a one-time
 // post-close rebalance is delayed imperceptibly. It is deliberately NOT a rate cap on the renderer —
 // the vug still presents unbounded; only the SCHEDULER's re-placement of its task is damped.
-const STEAL_COOLDOWN_MS: u64 = 16;
+/// PARITY §6.6c: value and escalation both LIFTED to `sched_spread`, which is where the Pi reads
+/// them from. The Boot B/C evidence for the shape stays written up here, where it was measured.
+const STEAL_COOLDOWN_MS: u64 = crate::sched_spread::STEAL_COOLDOWN_MS;
 
 /// VUGSPREAD-COOL: escalation cap for [`steal_cooldown_ms`] — `16 << 4 = 256` ms is the terminal
 /// window. Chosen so the worst case stays imperceptible (a quarter-second residency floor, paid only
 /// by a task already re-stolen four times) while being far beyond the wake/block cadence that drives
 /// the ping-pong (~0.5–16 ms), so escalation terminates the cycle rather than stretching it.
-const STEAL_COOLDOWN_ESC_CAP: u32 = 4;
+#[allow(dead_code)] // the arithmetic moved to `sched_spread`; kept as the documented name of the cap
+const STEAL_COOLDOWN_ESC_CAP: u32 = crate::sched_spread::STEAL_COOLDOWN_ESC_CAP;
 
 /// VUGSPREAD-COOL: the per-task ESCALATING cooldown window — how long a task with `migrations` past
 /// moves must sit on its current home before `steal_one` may take it again. See the doc block on
 /// [`STEAL_COOLDOWN_MS`] for the Boot B evidence that a flat window merely stretches the ping-pong,
 /// and for why `migrations` never decays (the recency gate bounds the whole mechanism at 256 ms).
+///
+/// PARITY §6.6c: delegates to `sched_spread::steal_cooldown_ms` — one definition, both arches.
 #[inline]
 fn steal_cooldown_ms(migrations: u32) -> u64 {
-    STEAL_COOLDOWN_MS << migrations.min(STEAL_COOLDOWN_ESC_CAP)
+    crate::sched_spread::steal_cooldown_ms(migrations)
 }
 
 /// VUGSPREAD-COOL: per-task steal candidates SKIPPED because they migrated within their ESCALATED
@@ -5789,6 +5807,25 @@ fn reap_killed(task: Box<Task>) {
     if let Some(k) = &task.kill {
         k.mark_reaped(); // through the Arc — the requester's clone keeps it live
     }
+    // DRAINRESCUE — release any window-manager drain barrier this task raised and can no longer
+    // lower, taken BEFORE the Box is dropped because the id is read out of it.
+    //
+    // ⚠ **THIS ARM IS NOT DEAD CODE ON x86, and the DRAGFIX M2 ledger's asymmetry claim is narrower
+    // than it reads.** That ledger observes, correctly, that x86's `yield_now` has no kill boundary
+    // where aarch64's does — so a drain that yields here always comes back to its own frame. What it
+    // does not say is that x86 retires killed tasks from the SCHEDULER side instead: `run()`'s READY
+    // arm tests `task_kill_armed` on every task that switches back preempted-or-yielded and calls
+    // this function rather than requeueing it (and `park_blocked`'s PARK_SLEEP arm does the same). The
+    // interactive drain is unmasked by construction — that is `drain_can_yield`'s own precondition —
+    // so a `sys_win_move` drain preempted by the local-APIC timer with a `KillSwitch` armed is
+    // retired HERE and never returns to the frame holding its `DRAIN_PENDING` raise. The hazard is
+    // therefore live on BOTH lanes; only the delivery point differs (a boundary the task walks into
+    // on aarch64, a verdict the scheduler reaches on x86). The leak's consequence is identical: every
+    // `composite_inner` takes its barrier early-return for the rest of the boot.
+    //
+    // Placed after the address-space release above, which routes through `clear_handle_row` ->
+    // `wm::close_owner` and raises a barrier of its own under this same id.
+    crate::video::wm::drain_release_dead(task.id);
     drop(task); // frees the kstack; the interrupt frame on it is abandoned
     // TEARDOWN-1: reach the siblings the doom above just named. A worker parked on the frame barrier its
     // now-dead parent will never release is the whole point: it is woken here, through the futex's own
@@ -6087,6 +6124,14 @@ pub fn current_task_id(cpu: usize) -> Option<u64> {
     } else {
         Some(unsafe { (*raw).id })
     }
+}
+
+/// DRAINRESCUE — the id of the task currently dispatched on THIS core, or `None` outside a scheduled
+/// task. The x86 twin of aarch64's `current_id`, added so `video::wm`'s drain-owner registry can name
+/// its owner through ONE arch-neutral spelling rather than branching on `target_arch`. A thin wrapper
+/// over [`current_task_id`] keyed to this CPU, exactly as [`current_name`] is.
+pub fn current_id() -> Option<u64> {
+    current_task_id(percpu::this_cpu().cpu_index as usize)
 }
 
 // ---------------------------------------------------------------------------------------------

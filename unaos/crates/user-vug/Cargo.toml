@@ -33,6 +33,12 @@ path = "src/main.rs"
 # builds. Nothing in the frame loop is vectorisable here anyway — every surface write is volatile and the
 # ray loop is branch-bound — so what `"z"` costs in speed is small, and what it costs is in any case
 # reported honestly by the fps meter rather than hidden by it.
+# VUGSHRINK: the 0x2000 above is now the aarch64 budget. `user-vug-x86.ld` links the ELF header and phdrs
+# INTO the text segment, which removes a page of file skew and moves the x86 line to `0xb0 + .text <=
+# 0x3000`. `"z"` remains a REQUIREMENT all the same: the cliff is unchanged in kind (one byte over still
+# costs 4096 in one step) and aarch64 still sits against 0x2000, where the 9534-byte `"s"` build does not
+# fit. Stated precisely because the x86 half of the claim no longer holds: 0xb0 + 9534 is inside 0x3000, so
+# `"s"` would link on x86 today. The requirement is the ARM one, and the two arches build from one profile.
 [profile.release]
 opt-level = "z"
 panic = "abort"

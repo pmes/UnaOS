@@ -239,6 +239,18 @@ sched_demo = []
 # then stop and assert quiescence. Opt-in via `UNAOS_SIMMER=1` — a QEMU-verified smoke test of the
 # `simmer` shell verb's machinery. Off => no boot-time simmer staging (the runtime verb is unaffected).
 simmer_test = []
+# DECRUD-1: the in-kernel `vug` / `pulse` / `vug bebox` shell demos (aarch64 only) — the fixed-point
+# 3D crystal sculptor, the BeOS-Pulse-homage full-screen monitor and the BeBox tribute screen. Opt-in
+# via `UNAOS_VUGDEMO=1`. Default OFF because the demos have SHIPPED EL0 REPLACEMENTS that the Pi
+# actually runs: `VUG.ELF` (crates/user-vug) and `PULSE.ELF` (crates/user-pulse) are staged into the
+# FAT root of every kernel8 image and are what the bench exercises (`UVUG:` streams while the
+# in-kernel `[vugfps]` counter reads 0). Nothing on any boot path calls into `vug` — the three verbs
+# are reached only by an operator typing them at the console — so OFF removes ~1.3 kloc of Ring-0
+# software renderer from the image and changes no witness on any boot. The one part of `vug` that was
+# never a demo, the VUG-HONESTY classifier entry point and its `parked_display_witness`, moved to
+# `ui_status` (ungated, both arches), so the witness survives with this feature off.
+# See docs/dev/OS/kernel-decrud.md §3.1.
+vugdemo = []
 # USB bring-up debug view for serial-less hardware: run the full main-loop USB path (enumeration +
 # storage + hubs) but KEEP the boot log on the framebuffer (no GUI takeover, no fbcon detach) and
 # print each input event, so external USB storage/keyboard/mouse enumeration AND live keypresses /
@@ -290,6 +302,18 @@ botfaultinject = []
 # METAL EXPERIMENT ONLY. Default OFF => BOT_RING_TRBS is 16 and the artifact is byte-identical.
 # Enable via `UNAOS_BOTRING64=1`.
 botring64 = []
+# BOT-PARK test hook: a synthetic TRANSPORT WEDGE. After the storage device has completed
+# `BOT_WEDGE_AFTER` transactions, every subsequent BOT attempt on that slot returns `Timeout`
+# WITHOUT putting anything on the wire — the exact shape of the [pi0-b1b2] metal wedge, where the
+# CBW went out, IRQ_COUNT stayed 0 and the event ring was provably empty. It exists because QEMU's
+# `usb-storage` cannot wedge: it always answers, so the retry ladder's global floor (escalating
+# back-off, the per-device retry budget, the park) has no other way to be walked end-to-end outside
+# an attended metal sitting. With it, a QEMU boot reaches `:: BOT: PARKED … ::` and stops, which is
+# the whole claim of the arc.
+# ATTENDED/TEST ONLY: never enable on boot media — it makes storage permanently unusable by design.
+# Default OFF => fully cfg-compiled out and the artifact is byte-identical. Enable via
+# `UNAOS_BOTWEDGE=1`.
+botwedge = []
 # (`botcbwioc` lived here. DELETED 2026-07-30: awaiting the CBW as its own stage is now
 # unconditional — see usb_xhci.md §17 and the BOT-CBW block in drivers/xhci/mod.rs. It graduated
 # from experiment to fix on a two-boot metal A/B and there is deliberately no feature left that
@@ -917,6 +941,74 @@ v3d_qpu = []
 # from the send onward — that is the known cost; serial carries the whole verdict.
 v3d_dispdone = []
 
+# PI-V3D-92: the arming switch for the mailbox power-domain CYCLE experiment. Boots 17/18/19
+# exhausted every ARM-reachable bin-wall hypothesis (ENABLE_QPU excluded, the M_CTRL=0x4040
+# transplant refused by silicon, the vc4-kms-v3d overlay changes nothing at handoff); the one
+# untested mailbox act is a genuine OFF→ON transition of firmware power domain 10 — boot-time ON
+# lands on an already-on domain (PI-V3D-2), so the VPU's real domain-init path never runs for a
+# bare-metal boot, while piOS's v3d_reset semantics is exactly a cycle. The armed rung `[v3d92]`
+# rides the tail of the deep battery (after `[v3d77]`): pre-station → OFF → the decisive ASB
+# M_CTRL read immediately after ON (printed before any recovery, so the datum banks even if the
+# block never comes back) → clock/bridge/MMU/IRQ recovery → the PI-V3D-91 bin criterion + CT1
+# health kick. Gated on `all(v3d_deep, v3d_pmcycle)`; OFF (default) prints one `[v3d92] SKIPPED —
+# pmcycle-gate off` line and sends nothing. A bare feature that implies nothing, like the other
+# arming switches. ⚠ an armed boot may lose V3D (and with it the panel blit path) from the cycle
+# onward if recovery fails — experiment-boot cost. Do NOT arm together with UNAOS_V3D_QPU
+# (SET_ENABLE_QPU wedges the VC mailbox this rung needs) or UNAOS_V3D_DISPDONE/UNAOS_V3D81_*
+# (their stations would read a power-cycled core). Enable via `UNAOS_V3D=1 UNAOS_V3D_DEEP=1
+# UNAOS_V3D_PMCYCLE=1 UNAOS_PI=1 ./arroyo kernel8`.
+v3d_pmcycle = []
+
+# PI-V3D-93: the arming switch for the PTB FRAME-UNIT BRACKET. Boot20 closed the mailbox domain
+# family (§49.14) and left the hunt two-pronged; this is the register-side prong. The wall is
+# cornered to the PTB frame unit between item-accept and pool-write — the CLE executes the bin list
+# cleanly (CT0LC/CT0PC move, items fed) while the bin frame sits DEAD-OPEN (BMACTIVE=1, BMBUSY=0,
+# zero movement across 64 samples of PCS/CT0CS/BFC/BPCA/BPCS). What has never been measured is the
+# ORDER in which the architecturally-visible words move during that window, over a station set wider
+# than frameclose's five. The armed rung `[v3d93]` rides the deep battery after `[v3d77]`'s
+# predecessor `[v3d74]` and BEFORE `[v3d75]`, so it reads the fabric as it stands: it seeds sixteen
+# stations PRE-QBA, reuses the PI-V3D-91 bin criterion UNCHANGED and unbanked, folds one full-station
+# sample per iteration of that criterion's own FLDONE poll loop (not the ~1 ms cadence tick), and
+# prints a first-change ordering table only AFTER the window closes. Gated on
+# `all(v3d_deep, v3d_ptbbracket)`; OFF (default) prints one `[v3d93] ptb-bracket SKIPPED —
+# ptbbracket-gate off` line and samples nothing. A bare feature that implies nothing, like the other
+# arming switches. READ-ONLY by construction and therefore SAFE to arm: the rung issues no V3D
+# register write of its own and sends no mailbox tag, its only writes being those inside the
+# criterion submit the ladder already runs many times per boot — no panel risk, no V3D loss, no
+# mailbox exposure. Enable via `UNAOS_V3D=1 UNAOS_V3D_DEEP=1 UNAOS_V3D_PTBBRKT=1 UNAOS_PI=1
+# ./arroyo kernel8`. See docs/dev/OS/08_VIDEO/v3d.md §49.15.
+v3d_ptbbracket = []
+
+# PI-V3D-94: the arming switch for the two channels NOBODY samples. Boot21 closed the ARM-visible
+# V3D surface (§49.15: sixteen stations, 348,908 samples, zero motion — dead at item-accept on the
+# wide set), and the piOS sweep diff (§49.16) then named what that closure does NOT cover. Two of
+# those channels are readable from this kernel today, and this one feature arms both.
+#   HALF A — the HUB-TRAFFIC DELTA. Six unmapped hub words at +0x8c/+0x90/+0x94/+0xa0/+0xa4/+0xa8
+#   are monotone across boots (+0x94 stepped 0x1400 -> 0x1800 -> 0x1c00 over boots 18->21), the
+#   shape of hub-level traffic counters, and no rung samples them. The rung snapshots all six
+#   PRE-submit and again POST-FLDONE-backstop around the PI-V3D-91 bin criterion (its OWN window,
+#   not `[v3d93]`'s, so the two arm independently) and prints the deltas. A delta > 0 across a
+#   wedged window means the HUB saw traffic every core-side station denied; delta = 0 extends
+#   dead-at-item-accept to the hub. The six words are deliberately NOT added to the `[v3d93]`
+#   in-loop array — that would change the sample rate §49.15's baseline is stated in.
+#   HALF B — the DIRECT CM CLOCK STATION. One line at bringup right after the mailbox clock grant:
+#   CM_V3DCTL / CM_V3DDIV (offsets +0x038/+0x03C are INFERRED and tagged so) plus every nonzero word
+#   in CM[0xFE101000, +0x100), printed beside the firmware's own GET_CLOCK_RATE/GET_CLOCK_STATE —
+#   so the wire carries the hardware reading next to the report already on the §46.4 instrument-lie
+#   ledger (it claimed the clock gated at 250 MHz while CYCLE_COUNT free-ran at ~499 MHz). CM space
+#   is fully decoded on BCM2711 and sits inside the Device-nGnRnE GiB boot.rs L1[3] already maps, so
+#   no new MMU mapping is opened and no page-table edit is needed.
+# Gated on `all(v3d_deep, v3d_hubcm)`; OFF (default) prints ONE `[v3d94] SKIPPED — hubcm-gate off`
+# line covering both halves and samples nothing. A bare feature that implies nothing, like the other
+# arming switches. READ-ONLY by construction and therefore SAFE to arm: half A issues no V3D
+# register write of its own (only the criterion's, which the ladder already runs many times per
+# boot), half B issues no write at all — no CM password constant exists in this file — and its only
+# mailbox traffic is the two read-only clock property tags `[v3d55]` already sends. No panel risk,
+# no V3D loss, nothing it can wedge; safe to combine with anything. Enable via `UNAOS_V3D=1
+# UNAOS_V3D_DEEP=1 UNAOS_V3D_HUBCM=1 UNAOS_PI=1 ./arroyo kernel8`.
+# See docs/dev/OS/08_VIDEO/v3d.md §49.17.
+v3d_hubcm = []
+
 # PI-V3D-69: the WRITE half of the initialisation-diff arc. The READ half (`[v3d69] fabric` stations —
 # PM_GRAFX, both V3D async-AXI-bridge control words in both candidate ASB blocks, V3D_MMUC_CONTROL)
 # rides `v3d_deep` and is read-only. THIS feature adds the one rung that WRITES: it re-runs mainline's
@@ -978,12 +1070,289 @@ v3d81_display = ["v3d81"]
 # implemented; no mailbox tag is sent. Requires `v3d`. DEFAULT OFF — with the feature off not one
 # line of the rung is compiled and an armed V3D boot runs its normal course. The knob VALUE picks the
 # list: `empty` (the `[v3d48]` Empty frame — §49.6's top pick; also selected by `1` or an empty
-# value), `rcl` (`[v3d74a]`'s render list on CT0's queue, bare QBA->QEA with no bin-class arming) or
-# `m4` (the real draw). One experiment per boot, by construction. Enable via `UNAOS_V3D=1
+# value), `rcl` (`[v3d74a]`'s render list on CT0's queue, bare QBA->QEA with no bin-class arming),
+# `m4` (the real draw), PI-V3D-86's prefix-bisection family `rclp<n>` (the rcl list truncated after
+# main-list packet n, terminator appended — the rung that walks the rcl head packet down; `[v3d86]`
+# audits the cut), or PI-V3D-87's two discriminators (§49.10): `rclhead` (the FULL rcl with one
+# bin-class-legal NUMBER_OF_LAYERS packet prepended, so `[v3d87h]` reports CT0CA's advance in PACKET
+# terms and names the TRMC opcode as the wall or clears it) and `emptyunarm` (the known-good EMPTY
+# bin list through the rcl-class submit — no CT0QMA/QMS/QTS, no BPOS=0, no pre-kick L2T invalidate —
+# so `[v3d87u]` decides whether the bin-memory arming is the wall). One experiment per boot, by
+# construction; an unrecognised value runs `empty` and prints recognised=0. Enable via `UNAOS_V3D=1
 # UNAOS_V3D_FIRSTKICK=empty UNAOS_PI=1 ./arroyo kernel8`. ⚠ an armed boot deliberately produces a
 # SHORT capture that is missing every banked witness — it must never be diffed line-for-line against
 # a full deep boot; the rung says so on the wire, first line and last.
 v3d_firstkick = ["v3d"]
+
+# PI-V3D-95: the UNARMED-CLOSE-WRITES rung — v3d.md §49.10's queued question, built. boot11
+# (`UNAOS_V3D_FIRSTKICK=emptyunarm`) closed a bin frame through the rcl-class submit and latched an
+# MMU fault across its own kick: PT_INVALID=1 WRITE_VIOLATION=1, VIO_ID client PTB, VA 0x00000070,
+# on a boot where CT0QMA/CT0QMS were deliberately never programmed — with the arena poison fully
+# intact, so nothing landed in memory we own. The doc's design note is followed literally: PROGRAM
+# NOTHING, close a frame, and read CT0QMA/CT0QMS/CT0QTS and the PTB's fault address ACROSS it, so the
+# fault VA can be read against the registers' bring-up residue (a VA derived from the residue is a
+# different mechanism from a fixed 0x70). Programming a scratch base instead would answer a different
+# question and destroy this one. The `[v3d62]` armed-policy fault catcher is REUSED across the kick —
+# hub interrupt latch cleared, unmapped scratch page seeded — so a refused write that still LANDS is
+# caught rather than inferred. The rung rides where `[v3d85]`'s does: after M3 and BEFORE `probe_job`,
+# so CT0 is virgin and the three registers hold their residue, and the boot then RETURNS. That
+# placement also makes the standing knob-exclusion hazard structural: the boot ends long before
+# `[v3d75]`'s ENABLE_QPU and `[v3d80]`/`[v3d81d]`'s DISPLAY_DONE sends are reached, so this rung can
+# never sit beside them. If `UNAOS_V3D_FIRSTKICK` is armed too, `[v3d85]` runs first and returns and
+# this rung stands down — one experiment per boot. Default OFF and fully uncompiled when off, so a
+# knob-off image is byte-identical to one built without the arc. NOTE (§49.16): piOS programs
+# pool/base registers in the core0 +0x108..+0x174 window that contains these three registers and that
+# this driver never touches; the rung NAMES that intersection on the wire and programs none of it —
+# that is the sweep-diff arc's proposal. Enable via `UNAOS_V3D=1 UNAOS_V3D_UNARMCLOSE=1 UNAOS_PI=1
+# ./arroyo kernel8`. ⚠ an armed boot deliberately produces a SHORT capture missing every banked
+# witness; it must never be diffed line-for-line against a full deep boot.
+# See docs/dev/OS/08_VIDEO/v3d.md §49.12.1.
+v3d_unarmclose = ["v3d"]
+
+# PI-V3D-97: the BASEDAIM rung — v3d.md §49.20.6's R1 with R3 riding in front, built as two extra legs
+# on the `[v3d95]` scaffolding (hence the feature IMPLIES `v3d_unarmclose`; it cannot be armed alone).
+# §49.20 settled where the unarmed close's write goes (the MMU refuses it: PT_INVALID+WRITE_VIOLATION,
+# client PTB, VA 0x70; the `[v3d62]` catcher absorbs it; nothing GPU-reachable moves) and, in V5, that
+# the PTB OBEYS CT0QMA/CT0QMS — its reservation arithmetic was exact (BPCA−QMA=0x3000,
+# BPCA+BPCS ≡ QMA+QMS) on a base of ZERO. Zero is the one residue under which "absolute 0x70" and
+# "base 0 + 0x70" are the same number, so §49.20's honest standing is "the write is located, the aim is
+# not". This rung moves the base and reads the fault VA again.
+#   LEG B (R3 `lenvary`) runs FIRST — the instrument control. Both VA-0x70 boots submitted a 14-byte
+#   list and the raw VIO_ADDR word is 0xe = 14. This leg re-runs the identical bare submit on the same
+#   zero bases with the list padded to 46 bytes (32 extra 1-byte FLUSH_VCD_CACHE packets in the
+#   prologue; a run-time self-check proves the padded encoder is byte-identical to the `emptyunarm`
+#   shape at zero pad, so exactly ONE thing varies). VIO_ADDR = 0x2e ⇒ the raw word tracks list length,
+#   the whole VA-0x70 reading is an artifact, and leg C is VOID. VIO_ADDR = 0xe ⇒ the reading survives.
+#   LEG C (R1 `basedaim`) is the cut — CT0QMA/CT0QMS/CT0QTS and NOTHING ELSE programmed (no BPOS=0, no
+#   pre-kick L2T invalidate, no QTS.ENABLE), to three mutually distinguishable ARENA-MAPPED values, then
+#   the byte-identical 14-byte submit. Four outcomes are pre-written on the wire: QMA+0x70 (pool write,
+#   base-relative), QMA+QMS+0x70 (pool-end-relative), QTS+0x70 (tile-state write — §49.18.4 item 4's
+#   placement divergence goes live), 0x70 unmoved (genuinely absolute; "structural" earned, and R2
+#   licensed), and "no fault" — the most interesting one, meaning the write LANDED on a page the MMU
+#   maps, which the two poisoned decoy windows and the `[v3d56]` landing digest then locate.
+# §49.20.2's V2a instrument law is carried IN CODE: each leg reads MMU_VIO_ADDR/MMU_VIO_ID once and
+# first after its wait (the pair is NOT sticky — on boot4 the second and third reads returned zero and
+# the third decoded zero as client `L2T`, which is not an attribution), and both raw words ride every
+# line. The `[v3d62]` catcher is re-armed per leg and the real tile-state/pool poison rides as leg A's
+# negative control. No page table is edited (that is R2 `mapzero`, deliberately not built here) and no
+# mailbox tag is sent. Default OFF and fully uncompiled when off, so a `v3d_unarmclose`-only image is
+# byte-identical to the pre-arc one. Enable via `UNAOS_V3D=1 UNAOS_V3D_UNARMCLOSE=1
+# UNAOS_V3D_BASEDAIM=1 UNAOS_PI=1 ./arroyo kernel8`. ⚠ an armed boot deliberately produces a SHORT
+# capture missing every banked witness; it must never be diffed line-for-line against a full deep boot.
+# See docs/dev/OS/08_VIDEO/v3d.md §49.21.
+v3d_basedaim = ["v3d_unarmclose"]
+
+# PI-V3D-98: the TSAIM leg — v3d.md §49.22.5's R-next-1, built as ONE MORE leg (D) on the `[v3d97]`
+# scaffolding (hence the feature IMPLIES `v3d_basedaim`, which implies `v3d_unarmclose`; it cannot be
+# armed alone). WHY: boot7/PA45 ran legs A/B/C and produced a two-write result §49.22 folds. Leg C
+# programmed CT0QMA/CT0QMS/CT0QTS to mapped decoys and (i) the decoy POOL window took a real write —
+# 20 words inside byte span [0x0,0x7f], word0 = 0x12, arena landing digest STRAY page 4 = the decoy
+# itself — so the close-time pool write IS base-relative off CT0QMA and "structural 0x70" is refuted;
+# and (ii) a SECOND PTB write still latched a refusal, at VA 0x0, which none of §49.21.4's four
+# pre-written rows predicts. Within leg C alone the second write cannot be the pool write (that one
+# landed), so the `[v3d62]` catcher's 48 zero words on that leg belong to it. 48 is also exactly the
+# word count the ARMED empty frame wrote into the 64-word tile-state array on the §49.8 R23 bracket's
+# boot6 (which wrote 20 pool words on the same kick — the same pair, both landed), so the leading
+# identification of the VA-0 write is the TILE-STATE write, aimed from a base of zero because leg C
+# left CT0QTS.ENABLE (bit 1) clear.
+#   LEG D (`tsaim`) is that cut, and it varies EXACTLY ONE bit from leg C: CT0QTS carries its decoy
+#   base OR CT0QTS_ENABLE. Everything else — the 14-byte `emptyunarm` list, CT0QMA, CT0QMS, the four
+#   poisoned windows, the catcher, the bare CT0QBA->CT0QEA submit — is leg C's, verbatim. Four
+#   outcomes are pre-written on the wire: NO FAULT with the decoy tile-state page touched (ENABLE
+#   gates the tile-state write's BASE — leg C's VA-0 refusal is identified and the unarmed close is
+#   COMPLETE, both writes landed, a campaign first); VA 0x0 unmoved (the VA-0 write is not the
+#   tile-state write — the identification is refuted and §49.22.5's R-next-1b pool-exhaustion leg is
+#   licensed); a VA that is QTS-relative but not the base (the base is honoured, the offset is not
+#   what was assumed — the arithmetic on the line names it); NO FAULT with nothing touched anywhere
+#   (ENABLE suppresses the write rather than aiming it, which is itself the finding).
+# The V2a instrument law rides unchanged (the pair read once and first, per leg). No page table is
+# edited, no mailbox tag is sent, no BPOA/BPOS write is made, and the arena geometry is untouched —
+# leg D reuses leg C's decoy windows and every one of its compile-time geometry assertions. Default
+# OFF and fully uncompiled when off. Enable via `UNAOS_V3D=1 UNAOS_V3D_UNARMCLOSE=1
+# UNAOS_V3D_BASEDAIM=1 UNAOS_V3D_TSAIM=1 UNAOS_PI=1 ./arroyo kernel8`. ⚠ an armed boot deliberately
+# produces a SHORT capture missing every banked witness; it must never be diffed line-for-line against
+# a full deep boot. See docs/dev/OS/08_VIDEO/v3d.md §49.22.
+v3d_tsaim = ["v3d_basedaim"]
+
+# PI-V3D-99: the ARMEDCLOSE leg — v3d.md §49.23's R-next-3, built as ONE MORE leg (E) on the `[v3d97]`
+# scaffolding (hence the feature IMPLIES `v3d_tsaim`, and through it `v3d_basedaim` and
+# `v3d_unarmclose`; it cannot be armed alone). WHY: boot8/PA46's leg D returned `OUTCOME D1` — with
+# `CT0QTS.ENABLE` set, an UNARMED close completed BOTH of its close-time writes (20 pool words off
+# `CT0QMA`, 48 tile-state words off `CT0QTS`, no fault, the `[v3d62]` catcher pristine at 0/1024 after
+# three legs at 48/1024), and those two counts are §49.8 boot6's ARMED empty-frame numbers exactly.
+# §49.22.3's reconciliation of the ARMED path was written as an explicit CONDITIONAL: it said in terms
+# that the armed path's close has never been read under these instruments. LEG E DISCHARGES IT.
+#   LEG E is the production submit and it is the ONE leg of the five that is not unarmed: `BPOS = 0`
+#   first, then the per-job L2T invalidate, then `CT0QMA` (the REAL tile-alloc pool) -> `CT0QMS`
+#   (0x8000) -> `CT0QTS | ENABLE` (the REAL tile-state array) -> `CT0QBA` -> `CT0QEA`, which is
+#   `v3d_bin_job_run`'s own order, around the same 14-byte `emptyunarm` list. It carries the whole
+#   instrument set: the §49.20.2 V2a read-once violation pair, the `[v3d62]` catcher re-armed and
+#   re-seeded, four poisoned windows scanned, the arena landing digest, and the `[v3d98]`/`[v3d99]`
+#   verbatim head dumps. Note the ROLE INVERSION: on leg E the two REAL regions are the targets and the
+#   two decoys are the negative controls, the opposite of legs C/D.
+#   Outcomes are pre-written on leg E's own VERDICT line: E1 = no fault, both real windows written, 20
+#   and 48 — the armed empty close is HEALTHY and boot6's shape to the word, so the historic armed wall
+#   is NOT a close-stage artifact and the remaining surface is bin CONTENT (the m4/rcl classes);
+#   E2/E2b/E2c = a refusal at VA 0, inside the pool span, or inside the tile-state array — a first-class
+#   finding on the only path that ships, and one the 2026-08-02 pre-catcher instruments could not have
+#   seen; E3 = only one of the two writes landed (a PARTIAL close); E4 = nothing landed at all; E5 =
+#   both landed at counts other than 20/48; E1b = a decoy moved, so the aim is not derived from the
+#   registers this leg programmed; E6 = a fault at a VA none of the rows predicts (§49.20.6's last row).
+# PI-V3D-99 also adds the `[v3d99] head` dump — the TILE-STATE window verbatim, on every leg — because
+# `OUTCOME D1` reported 48 tile-state words touched of which THREE were non-zero and no instrument said
+# which. No page table is edited, no mailbox tag is sent, no `BPOA` is written (only `BPOS = 0`, which
+# is the OPPOSITE of §19/§33's stale-overflow hazard), and the arena geometry is untouched. Default OFF
+# and fully uncompiled when off. Enable via `UNAOS_V3D=1 UNAOS_V3D_UNARMCLOSE=1 UNAOS_V3D_BASEDAIM=1
+# UNAOS_V3D_TSAIM=1 UNAOS_V3D_ARMEDCLOSE=1 UNAOS_PI=1 ./arroyo kernel8`. ⚠ an armed boot deliberately
+# produces a SHORT capture missing every banked witness; it must never be diffed line-for-line against
+# a full deep boot. See docs/dev/OS/08_VIDEO/v3d.md §49.23.
+v3d_armedclose = ["v3d_tsaim"]
+
+# PI-V3D-100: the BINCONTENT ladder — v3d.md §49.24's R-next-4, built as THREE MORE legs (F, G, H) on
+# the `[v3d97]` scaffolding (hence the feature IMPLIES `v3d_armedclose`, and through it `v3d_tsaim`,
+# `v3d_basedaim` and `v3d_unarmclose`; it cannot be armed alone). WHY: boot9/PA47's leg E returned
+# `OUTCOME E1` — the PRODUCTION close is healthy and it is §49.8 boot6's shape to the word (no fault,
+# the `[v3d62]` catcher pristine, 20 pool words at `CT0QMA`, 48 tile-state words at `CT0QTS`, both
+# decoys intact, landing digest `changed=2 expected=2 STRAY=0`). §49.22.3's conditional reconciliation
+# is DISCHARGED and the close stage is closed end to end, unarmed and armed. §49.8's bracket leaves
+# exactly two stations, and NEITHER is the close: the `m4` class consumed its list, OPENED a frame and
+# never closed it; the `rcl` class froze at its first fetch. This ladder goes after the FIRST of them.
+#   LEG F = leg E's production bases and leg E's armed prologue with the full fixed-function state and
+#   `GL_SHADER_STATE` but NO `VERTEX_ARRAY_PRIMS`. LEG G = F plus the primitives, with a shader record
+#   selecting the NULL coord shader (a real dispatching thread that writes NOTHING to VPM). LEG H = the
+#   `m4`-class MINIMUM — one tile config and one flat triangle over the real coordinate shader. H's
+#   shape cannot honestly be cut smaller: PI-V3D-17 established that without the clip/viewport/clipper
+#   state the clipper runs at power-on-reset zeros and collapses every primitive to a point, so a
+#   stripped list would return a null INDISTINGUISHABLE from the empty close.
+#   NEW SURFACE, AND ITS INSTRUMENTS: these are the first lists in the rung that reference DRAM —
+#   eleven regions through `GL_SHADER_STATE` -> the shader record -> the attribute record. Each is
+#   named on the wire before the kick (`[v3d100] ref`), bounds-checked fail-closed, and witnessed two
+#   ways: an FNV-1a CONTENT DIGEST over its live bytes pre-kick vs post-write-back, and POISON COLLARS
+#   over the unused remainder of the shader-record and vertex pages. Poison is deliberately NOT used on
+#   the live bytes: a region the GPU must READ cannot carry poison and still be its own input.
+#   CT0 HYGIENE: the three legs run in increasing order of stall risk and the ladder STANDS DOWN every
+#   later leg if one fails to close its frame or leaves `CTRUN` set — v3d.md §49.3's founding lesson.
+#   Wire outcomes are pre-written on each content leg's own VERDICT line: C1 = content FLOWS (frame
+#   closed and MORE than the empty close's 20 pool words, so the bin path is whole and the last named
+#   room is the render list); C2/C2b/C2c = a close that binned nothing or binned other counts (a
+#   VERTEX-PATH statement, PI-V3D-17's empty-but-legal bin); C3a/C3b/C3c = a stall mid-content, which
+#   is §49.8 boot8's `m4` station re-read under instruments boot8 did not have; C4/C4b = a fetch that
+#   never started or stopped mid-list; C5 = `PCS.BMOOM`, pool exhaustion with no `BPOA` (a driver
+#   geometry finding); C6 = a referenced region moved, which voids the leg's content reading; C7/C7b/
+#   C7c/C7d = a refusal, read against the eleven ref iovas as well as the three bases; C1b = a decoy
+#   moved. No page table is edited, no mailbox tag is sent, no `BPOA` is written, and the arena
+#   geometry is untouched. Default OFF and fully uncompiled when off. Enable via `UNAOS_V3D=1
+# `UNAOS_V3D_UNARMCLOSE=1 UNAOS_V3D_BASEDAIM=1 UNAOS_V3D_TSAIM=1 UNAOS_V3D_ARMEDCLOSE=1
+# `UNAOS_V3D_BINCONTENT=1 UNAOS_PI=1 ./arroyo kernel8`. ⚠ an armed boot deliberately produces a SHORT
+# capture missing every banked witness; it must never be diffed line-for-line against a full deep boot.
+# See docs/dev/OS/08_VIDEO/v3d.md §49.24.
+v3d_bincontent = ["v3d_armedclose"]
+
+# PI-V3D-101: the DISPATCHDISC rung — v3d.md §49.25.4, built as INSTRUMENTATION on the `[v3d100]`
+# ladder's own legs (hence the feature IMPLIES `v3d_bincontent`, and through it `v3d_armedclose`,
+# `v3d_tsaim`, `v3d_basedaim` and `v3d_unarmclose`; it cannot be armed alone). IT ADDS NO LEG AND NO
+# KICK — the boot still takes EIGHT closes and legs A..H are byte-for-byte what `v3d_bincontent`
+# submits. WHY: boot11/PA48's leg G returned the wall at its narrowest — the bin frame stops closing the
+# INSTANT a primitive dispatches. The list was consumed to `EA`, `CT0PC` counted all three primitives,
+# `PCS.BMACTIVE` held for the whole 500 ms backstop, ZERO pool and ZERO tile-state words were written,
+# no MMU fault latched and not one of the eleven referenced regions moved. That leaves exactly one span
+# of pipeline dark — VCD attribute DMA, coord-thread launch, VPM write-back, PTB intake — and the two
+# questions the baton names (does the coord thread START? does the close wait on a VPM delivery the VCD
+# never makes?) are both answerable from the V3D performance-counter block, which is ARM-readable and
+# needs no new memory surface.
+#   WHAT IT ARMS: eight `PCTR` slots, programmed ONCE immediately before leg E's kick and left RUNNING
+#   across legs E/F/G/H so each leg's delta is a difference against in-boot baselines rather than across
+#   a boot boundary — 1 `FEP_VALID_PRIMS`, 14 `QPU_ACTIVE_CYCLES_VERTEX_COORD_USER`, 32 `CYCLE_COUNT`
+#   (slot 2, the RESERVED `V3D63_CTRL_SLOT`/`[v3d55]` clkliv slot and this bank's own control), 16
+#   `QPU_CYCLES_VALID_INSTR`, 58 `L2T_VCD_READS`, 26 `VPM_VDW_STALL`, 27 `VPM_VCD_STALL` and 35
+#   `PTB_PRIMS_BINNED`. Every id is transcribed from `include/uapi/drm/v3d_drm.h` with its line cited in
+#   code, and the six ids the tree already carried land on their existing names — §38's six-for-six
+#   index cross-check, re-run against a newer copy of the same header. §38's standing caveat rides with
+#   them: `id<->mux` validity on this silicon is PARTIAL AND PER ID, so a nonzero slot is strong and a
+#   zero slot is weak, which is exactly why legs E and F are read on the same bank as baselines.
+#   Plus a bit-by-bit `INT_STS` decode on each armed leg — boot11's leg G read `0x00010000` and no line
+#   named it; per PI-V3D-45 that is bit16, "QPU 0 raised a host interrupt", an independent instrument
+#   saying a thread ran and ended.
+#   Wire outcomes are pre-written on LEG G's own `[v3d101]` VERDICT line, one per station of the dark
+#   span: D1 = QPU delta 0, the coord thread NEVER LAUNCHES (the wall is thread dispatch itself);
+#   D2 = QPU moved, VPM/PTB flat, the thread runs and delivers nothing — and on the NULL-shader leg that
+#   is CORRECT thread behaviour, so D2 is explicitly NOT a wall verdict and must be re-run against leg
+#   H's real shader; D3 = VPM/PTB moved with ZERO pool words, the PTB receives and discards; D4 = every
+#   counter flat including FEP, so `CT0PC`'s own meaning is the finding. Two INCONCLUSIVE guards sit in
+#   front of all four (the bank lost its enable mask; the src32 control never moved).
+#   The ONLY registers written are the `PCTR` counter-file config registers mainline's `v3d_perfmon.c`
+#   writes on every perfmon start, in that file's own start/stop idiom; no CLE, PTB, VCD, MMU or fabric
+#   state is touched, no page table is edited, no mailbox tag is sent, no `BPOA` is written, and the
+#   arena geometry is untouched. §49.20.2's V2a law is strengthened in code: every counter read on every
+#   leg happens strictly AFTER that leg's read-once violation pair. Default OFF and fully uncompiled
+#   when off (knob-off `kernel8.img` is byte-identical to baseline). Enable via `UNAOS_V3D=1
+#   UNAOS_V3D_UNARMCLOSE=1 UNAOS_V3D_BASEDAIM=1 UNAOS_V3D_TSAIM=1 UNAOS_V3D_ARMEDCLOSE=1
+#   UNAOS_V3D_BINCONTENT=1 UNAOS_V3D_DISPATCHDISC=1 UNAOS_PI=1 ./arroyo kernel8`. ⚠ an armed boot
+#   deliberately produces a SHORT capture missing every banked witness; it must never be diffed
+#   line-for-line against a full deep boot. QEMU raspi4b models no V3D PCTR block at all, so this never
+#   runs there. See docs/dev/OS/08_VIDEO/v3d.md §49.25.4.
+v3d_dispatchdisc = ["v3d_bincontent"]
+# PI-V3D-102: the HFIRST order arm — v3d.md §49.25.5, built as a REORDERING of the `[v3d100]` ladder's
+# own content legs (hence the feature IMPLIES `v3d_dispatchdisc`, and through it `v3d_bincontent`,
+# `v3d_armedclose`, `v3d_tsaim`, `v3d_basedaim` and `v3d_unarmclose`; it cannot be armed alone — leg H's
+# rows are stated against the PCTR bank, so the bank must be there to state them). IT ADDS NO LEG, NO
+# KICK AND NO INSTRUMENT — the boot still takes EIGHT closes, and every leg's list, prologue, eleven
+# referenced regions, digests and poison collars are byte-for-byte what `v3d_bincontent` builds.
+#   THE ONE CHANGE: the content order becomes E -> H -> F -> G instead of E -> F -> G -> H. WHY: boot 12
+#   returned `OUTCOME D2` on leg G — the NULL coord shader's thread RUNS (QPU=5 cycles, `INT_STS` bit16
+#   = program end) and delivers nothing, which is CORRECT behaviour for a shader that writes no VPM by
+#   construction, and which leaves the bin frame open every time. The CT0-hygiene gate then stands leg H
+#   down behind it every time, so LEG H — the m4-class minimum over the REAL coordinate shader, the one
+#   that DOES write VPM — has never run. This arm puts it directly after leg E's clean close.
+#   THE HYGIENE GATE IS NOT WEAKENED, IT IS MIRRORED: the ladder loop is unchanged, so whichever leg
+#   leaves the frame open stands the rest down — armed, that is F and G standing down behind a hung H.
+#   Leg H gains its own `[v3d102] HFIRST VERDICT` line carrying §49.25.5's four pre-written outcomes
+#   (H1 content flows · H2 the frame closes empty · H3 delivery happens and the close still hangs ·
+#   H4 the real shader also fails to deliver), plus a guard row for a leg H that never launched a thread
+#   at all. `[v3d101]`'s own emitters are NOT touched by this feature. NO register write, NO mailbox tag
+#   and NO page-table edit is added; CT0 is fed a BIN list on every leg, never a render list.
+#   Default OFF and fully uncompiled when off (every build that does not arm it is byte-identical to the
+#   pre-arc build). Enable via `UNAOS_V3D_HFIRST=1 UNAOS_PI=1 ./arroyo kernel8`. ⚠ an armed boot
+#   deliberately produces a SHORT capture missing every banked witness; it must never be diffed
+#   line-for-line against a full deep boot. QEMU raspi4b models no V3D at all, so this never runs there.
+#   See docs/dev/OS/08_VIDEO/v3d.md §49.25.5.
+v3d_hfirst = ["v3d_dispatchdisc"]
+
+# PI-V3D-103: the VPMPROBE discriminator rung — v3d.md §49.25.7, the successor to boot 13's `OUTCOME H4`.
+# IMPLIES `v3d_hfirst` (and through it the whole chain down to `v3d`), because its rows are stated on
+# LEG H and leg H only runs at all under the hfirst order. IT ADDS NO LEG, NO KICK, NO SHADER WORD, NO
+# REGISTER WRITE and NO PAGE-TABLE EDIT — the boot still takes EIGHT closes, CT0 is fed a BIN list on
+# every leg and never a render list, and the boot still returns before `probe_job`.
+#   WHY: §49.25.6 folded boot 13 as `OUTCOME H4` in its STRONG form — the real 27-word coord shader ran
+#   to a program-end interrupt (`QPU_CYCLES_VALID_INSTR` 53 against the null shader's 5) and NOTHING on
+#   the VPM side moved. The wall's name is now "the VPM write path itself — the write-back stage, or the
+#   coord thread's ACCESS to it", and this rung SPLITS that sentence. Sub-hypothesis (a), "our VPM
+#   write-SETUP word is VC4-shaped on a 4.2 VPM", was resolved STATICALLY and is DEAD: there is no setup
+#   word at all. PI-V3D-20 removed `vpmsetup`/`mov vpm` outright, PI-V3D-26 cross-checked the STVPMV
+#   body against a real ver-4.2 `v3d_compile()` run, and this arc re-decoded all six STVPMV words bit by
+#   bit (OP_ADD=248, mux selects, operand order and register numbers all correct). No slot is spent on it.
+#   TWO CHANGES, BOTH INSTRUMENT-ONLY. (1) THREE PCTR SLOTS ARE RE-SOURCED. Slots 0/1/2/3/7 are
+#   UNCHANGED — the five boot 13 read H4 off, and leg H must reproduce their shape before any new slot
+#   speaks (an ADMISSIBILITY guard, not a result). Slots 4/5/6 were `L2T_VCD_READS` and the two VPM
+#   STALL counters; all three read zero on boot 13, VCD fetch was exonerated at PI-V3D-28, and a stall
+#   counter reading zero cannot tell "the write sailed through" from "no write was ever presented". They
+#   become src33 `QPU_CYCLES_STALLED_VERTEX_COORD_USER`, src11 `PTB_PRIM_CLIP` and src10
+#   `PTB_PRIM_VIEWPOINT_DISCARD` — the last two being the pair that splits "the PTB never RECEIVED" from
+#   "the PTB received and DISCARDED", which `PTB_PRIMS_BINNED=0` alone cannot do.
+#   (2) FOUR READ-ONLY REGISTERS join the readback set: `V3D_ERR_STAT`, `V3D_ERR_FDBGO`, `V3D_ERR_FDBGB`
+#   and `V3D_ERR_FDBGS`, from `v3d_regs.h` and scoped to this silicon by mainline's own
+#   `v3d_debugfs.c::v3d_core_reg_defs`, which lists all four as `REGDEF(V3D_GEN_33, V3D_GEN_71, ...)` —
+#   a range that brackets the bcm2711's V3D 4.2. Mainline reads them in a debugfs dump; this file NEVER
+#   writes them. Twelve of `ERR_STAT`'s sixteen named bits are VPM/VPA/VDW/VCD/VCM errors.
+#   Leg H gains a `[v3d103] VPMPROBE VERDICT` line carrying §49.25.7's six pre-written outcomes
+#   (V1 the VPM write is REFUSED and the silicon says so · V2 a non-write VPM error · V3 the error is
+#   beside the VPM · V4 the PTB received and discarded, H4 dead · V5 the coord thread stalled ·
+#   V6 the write is swallowed in silence), behind three guards. `[v3d101]`/`[v3d102]`'s emitters are NOT
+#   touched. Default OFF and fully uncompiled when off. Enable via
+#   `UNAOS_V3D_VPMPROBE=1 UNAOS_PI=1 ./arroyo kernel8`. ⚠ an armed boot deliberately produces a SHORT
+#   capture; never diff it line-for-line against a full deep boot. QEMU raspi4b models no V3D at all, so
+#   this never runs there. See docs/dev/OS/08_VIDEO/v3d.md §49.25.7.
+v3d_vpmprobe = ["v3d_hfirst"]
 
 # PI-USB-1: the BCM2711 PCIe root complex + VL805 xHCI attach (arch/aarch64/piusb.rs) — brcmstb RC
 # bridge reset / link-up / MEM-window + inbound-BAR config, VL805 (1106:3483) enumeration + BAR sizing,
@@ -1069,6 +1438,39 @@ smcwalk = []
 # See docs/dev/OS/08_VIDEO/rasterizer.md.
 rast = ["dep:rast"]
 
+# PI-RAST: the Pi 4 / BCM2711 panel wire-in of the SAME demo (UNAOS_PIRAST=1). Deliberately a THIN
+# feature — it only IMPLIES `rast`, so the dep gate and the `rast_demo` module gate stay exactly as
+# RAST-1/RAST-TEGRA left them and no shared `#[cfg]` site had to be widened (which is also why this
+# arc shifts no source line in `lib.rs`). What `pirast` alone gates is the single Pi call site,
+# `main.rs::pi_rast_demo_maybe()`: it runs the cube through the mailbox framebuffer's `Screen` right
+# after the boot's `fbcon::detach()` and BEFORE the input/render service tasks are spawned — panel up,
+# compositor not yet painting, so the demo can never race bring-up. The kernel8 feature list is
+# CURATED (see `arroyo`'s K8_FEATS block), so the arm lives there and NOT in `builder/src/main.rs`:
+# builder produces the x86/virt ESP media and never kernel8.img (the v3d/piusb/genet knob class).
+# Default OFF => the call site and the whole `rast` graph are unlinked and kernel8.img is
+# byte-identical to baseline. See docs/dev/OS/08_VIDEO/rasterizer.md §4.
+pirast = ["rast"]
+
+# PI-DESK: the desktop FURNITURE family on the Pi 4 panel (UNAOS_PIDESK=1). Deliberately a THIN
+# feature on `pirast`'s own terms — it pulls in no dependency and declares no module of its own. What
+# it gates is the aarch64 half of four gates that were `all(target_arch = "x86_64", feature = "wc")`
+# and are now `any(all(x86_64, wc), all(aarch64, pidesk))`: `video::strip` (the furniture-strip
+# primitive — edge-anchored geometry, the staged row-run painter, the vacated-pixel erase, the damage
+# slot, the tenant registry), `video::dock` (the window switcher — Peter's white-board Q10 ruling: a
+# switcher, NOT an app launcher), `video::menubar` (the top strip, DEFAULT OFF at runtime), and
+# `video::crystal` (the SHARD system menu). The four were already arch-neutral in their arithmetic —
+# the materials they paint through (theme/paper/ceramic/knurl) are unconditional and render on the Pi
+# today — so what this feature buys is the compose seam in `wm::composite_once`, the dock's
+# table-scan API in `wm`, and the press route in `arch/aarch64/syscall.rs::wc_click_route`.
+#
+# The knob class is `pirast`'s (builder=0): the kernel8 feature list is CURATED (see `arroyo`'s
+# K8_FEATS block), so the arm lives there and NOT in `builder/src/main.rs` — builder produces the
+# x86/virt ESP media and never kernel8.img. Default OFF => not one of the four modules is compiled on
+# aarch64, no seam in `wm` or the click router exists, and kernel8.img is BYTE-IDENTICAL to baseline
+# (proven by sha256, not assumed). x86 is untouched in either direction: its half of every gate is
+# the `wc` term it always was.
+pidesk = []
+
 # INSTALL-CORE: the `UNAOS_INSTALLDEMO=1` storage-agnostic installer engine + its boot witness
 # (crates/kernel/src/install/). Arms a GPT writer + FAT32 formatter + extent content-verify against a
 # dedicated BLANK scratch disk the builder attaches over the usb-storage slot (the boot ESP is a
@@ -1097,6 +1499,78 @@ installdemo = []
 piinstall = ["baremetal"]
 piinstall_arm = ["piinstall"]
 piinstall_confirm = ["piinstall_arm"]
+
+# QUARRY: `UNAOS_QUARRY=1` arms UnaOS's FILE MANAGER (`video::quarry::live`) — Peter's naming and
+# shape, 2026-08-17: "Tree on left and start with detailed list view on right." A kernel-owned
+# compositor window over the ONE VFS mount table: the mounted volumes as an expandable tree on the
+# left, a name/size/modified list of the selected directory on the right, and the first scrolling
+# anything in this tree has had (nothing in `wm`/`present`/the HID path carries a content offset —
+# see `docs/dev/OS/05_USER_EXPERIENCE/quarry.md` §4).
+#
+# It rides the DESKTOP knob family rather than replacing it: `video::quarry` is declared under the
+# same gate the furniture family carries (`any(all(x86_64, wc), all(aarch64, pidesk))`), so BOTH
+# arches type-check the module, and this feature decides whether that module is the implementation or
+# a handful of `#[inline(always)] false` stubs. That split is not cosmetic — Quarry's key and click
+# hooks are FOLDED INTO existing `#[cfg(feature = "pidesk")]` one-liners in
+# `arch/aarch64/syscall.rs`, a file compiled into the knob-off `kernel8.img` where an added line
+# breaks byte-identity (panic `Location` records embed line numbers), so the hook could not carry a
+# second `cfg` of its own. See `video/quarry.rs`'s header.
+#
+# The knob class is `pidesk`'s (builder=0): kernel8's feature list is CURATED in `arroyo`'s K8_FEATS
+# block. Default OFF => `quarry/live.rs` is not compiled, the stubs inline to nothing, and
+# `kernel8.img` is byte-identical to baseline. Arming it does NOT imply `pidesk`; a Pi build wants
+# `UNAOS_QUARRY=1 UNAOS_PIDESK=1` so the desktop seam that opens the window exists.
+quarry = []
+
+# FATFIX M2 (`UNAOS_FATPERF=1`) — the COST INSTRUMENT for the VFS listing and file-read paths, and
+# nothing else. Peter's metal complaints (baton pi-1 item 8a, restated at PA44) are that the FAT
+# listing is VERY SLOW and that a Quarry double-click takes a long time to start the program; the
+# wire already showed `spawn`→first-present is fast, which leaves the READ. This knob compiles
+# `fs/fatperf.rs` and turns the two `#[inline(always)]` shims in `fs/mod.rs` from no-ops into a
+# sector counter (at `fat.rs`'s two read funnels) and a microsecond bracket (around
+# `MountTable::read_dir` / `MountTable::read`), which together print one line per operation:
+#   [fatperf] op=list path=/fat sectors=222 us=13456
+# Raw words only — no rates, no ratios, no verdict. It changes NO behaviour: the fix (cluster-chain
+# caching, or migration onto ORIN's UnaFS) is a later arc, because the baton forbids building on the
+# FAT namespace twice and a repair chosen before the cost is measured is a guess.
+#
+# The knob class is `quarry`/`pidesk`'s (builder=0): kernel8's feature list is CURATED in `arroyo`'s
+# K8_FEATS block. Default OFF => `fs/fatperf.rs` is not compiled, both shims inline to nothing, the
+# call sites sit on lines that already existed (no panic-`Location` line shift in `fat.rs`/`vfs.rs`,
+# which ARE compiled knob-off), and `kernel8.img` is byte-identical to baseline.
+fatperf = []
+
+# LIVECON (`UNAOS_LIVECON=1`) — **the console window's text stays LIVE, and it presents from the
+# RENDER core.** The second half of M3, and the arc `video/pidesk.rs`'s live-console ledger names:
+# "move the console's presents off print context entirely and onto the RENDER core, one paced call
+# per frame, via the hook `fbcon::console_service` already provides".
+#
+# WHAT IT IS. Three statements, no new machinery: (1) `fbcon`'s three PRINT-CONTEXT present entries
+# (`route_present`, `route_present_rows`, `route_present_pending`) record their rows in the existing
+# `PEND` ledger and return WITHOUT compositing; (2) the Pi's `render_service` calls the existing
+# `fbcon::console_service()` once per pass, which is the paced take of that ledger; (3)
+# `pidesk::activate` therefore returns `routed`, so the GUI handoff SKIPS `fbcon::detach()` and
+# `_print` keeps reaching the window's surface for the rest of the boot.
+#
+# WHY IT IS A KNOB AND NOT A DEFAULT. The live console was tried once and REVERTED with evidence: at
+# bench geometry a routed console presenting from print context turned a 108/108 run into 97/108 with
+# 37 forbidden hits and a synchronous exception, because a console that composites on whatever core
+# printed is an unsynchronised compositor client the witness battery cannot survive. Deferral fixes
+# the SHAPE (one core, frame cadence) but that battery's verdict is measured, not argued, so the
+# default stays the frozen snapshot until a bench run says otherwise.
+#
+# ARCH-NEUTRAL BY CONSTRUCTION: every gate this knob adds is `feature = "livecon"`, never
+# `target_arch`. On x86 the deferral latch exists and is simply never armed (`wcx::activate` does not
+# call `console_present_defer`), so the `wc` desktop and the `usbdebug` bench lane are unchanged; the
+# x86 wire-in is one call site away when that arc wants it.
+#
+# The knob class is `pidesk`'s (builder=0): kernel8's feature list is CURATED in `arroyo`'s K8_FEATS
+# block. Default OFF => the latch is an `#[inline(always)] false`, the three entries fold back to the
+# bare `route_present_banded` call they have always been, the `render_service` and `pidesk` hooks are
+# statement-level `#[cfg]`s that vanish, no line moves in any file compiled knob-off, and
+# `kernel8.img` is byte-identical to baseline. Arming it does NOT imply `pidesk`; a Pi build wants
+# `UNAOS_LIVECON=1 UNAOS_PIDESK=1` so the seam that routes the console into a window exists at all.
+livecon = []
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
@@ -1129,7 +1603,12 @@ fdt = "0.1.5"
 # knob-off builds on BOTH arches never compile it (byte-identical). Lives in the shared [dependencies]
 # (not an arch-gated block) because the demo now targets x86/virt AND aarch64/virt AND aarch64/tegra.
 rast = { path = "../rast", optional = true }
-noto-sans-mono-bitmap = { version = "0.3.2", default-features = false, features = ["regular", "bold", "size_16", "unicode-basic-latin"] }
+# FONT-METRIC: the raster LADDER `video::font::chrome_raster` snaps to. `size_16` is the BODY face
+# (the console's character grid, whose size is set by capacity); `size_20`/`size_24` are the rungs
+# the CHROME derivation can land on for the `theme::TITLE_HEIGHT` range the kit has today (26..=40).
+# The two lists must move together — a rung in `chrome_raster` without its feature here is a
+# compile error at the `RasterHeight` variant, which is the failure mode we want.
+noto-sans-mono-bitmap = { version = "0.3.2", default-features = false, features = ["regular", "bold", "size_16", "size_20", "size_24", "unicode-basic-latin"] }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 # BeFS-K3: the native UnaFS filesystem, no_std core only (on-disk types, codec,

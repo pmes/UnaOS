@@ -1321,10 +1321,10 @@ FORBID \[drag-occ\] .* bars=0/[0-9] bar=[1-9]
 # --- STRIPFACTOR: THE MENU BAR IS ABSENT BY DEFAULT, AND SAYS SO -------------------------------
 # --- `video/menubar.rs` is tenant #2 of the strip primitive and exists this arc to PROVE the
 # --- primitive is generic — a one-tenant registry proves nothing. Its ONE press target is the
-# --- crystal (`press=crystal` on the line — the SHARD menu's box, routed by the click router's
-# --- menu-band arm; the term read `press=inert` before `video/crystal.rs` existed, and the stale
-# --- word was mis-read in GR27 as a routing latch-off) and the bar is off unless something enables
-# --- it at runtime.
+# --- CRYSTAL (`press=crystal` on the line — the SHARD menu's box, claimed through the shared
+# --- furniture router `strip::press_route` that both arch routers call; the term read `press=inert`
+# --- from before `video/crystal.rs` existed, and that stale word was mis-read off a Pi capture in
+# --- PA41 as "press routing latched off") and the bar is off unless something enables it at runtime.
 # ---
 # --- Six fields are load-bearing and all six are pinned on the PASS line, which already ANDs them:
 # ---   * `default_off=true`  — the ARTIFACT ships with the bar off. SHELLDESK moved this from a live

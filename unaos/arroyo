@@ -79,8 +79,66 @@ NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=c
 #
 # PI-V3D-85: UNAOS_V3D_FIRSTKICK is BOTH — its presence arms the `v3d_firstkick` cargo feature (see
 # the kernel8 knob block below) and its VALUE is read with `option_env!` by arch/aarch64/v3d.rs to
-# pick which list the boot's one CT0 kick carries (`empty` | `rcl` | `m4`; `1` or an empty value
-# select `empty`). The raw value rides the `[v3d85]` header line, so a capture states its own variant.
+# pick which list the boot's one CT0 kick carries (`empty` | `rcl` | `m4` | `rclp<n>` | `rclhead` |
+# `emptyunarm`; `1` or an empty value select `empty`). PI-V3D-86's `rclp<n>` is the prefix bisection:
+# the rcl list truncated after main-list packet n. PI-V3D-87's `rclhead` and `emptyunarm` are the two
+# discriminators that cut the last two candidates apart (v3d.md §49.10). The raw value rides the
+# `[v3d85]` header line, so a capture states its own variant.
+#
+# PI-V3D-95: UNAOS_V3D_UNARMCLOSE=1 is a plain arming knob (no value) for the `v3d_unarmclose`
+# feature — the `[v3d95]` unarmed-close-writes rung, which takes one `emptyunarm`-shaped CT0 kick
+# before probe_job and reads CT0QMA/CT0QMS/CT0QTS and the PTB fault address across the close without
+# programming any of them. See the kernel8 knob block below and v3d.md §49.12.1.
+#
+# PI-V3D-97: UNAOS_V3D_BASEDAIM=1 is a plain arming knob (no value) for the `v3d_basedaim` feature —
+# the `[v3d97]` basedaim rung, v3d.md §49.20.6's R1 with R3 in front. It rides the `[v3d95]` rung as
+# two EXTRA legs and therefore implies `v3d_unarmclose` (declared in Cargo.toml and armed here), so
+# `UNAOS_V3D_BASEDAIM=1` alone is sufficient. See the kernel8 knob block below and v3d.md §49.21.
+#
+# PI-V3D-98: UNAOS_V3D_TSAIM=1 is a plain arming knob (no value) for the `v3d_tsaim` feature — the
+# `[v3d98]` tsaim leg, v3d.md §49.22.5's R-next-1. It rides the `[v3d97]` rung as ONE more leg (D) and
+# therefore implies `v3d_basedaim` (declared in Cargo.toml and armed here), so `UNAOS_V3D_TSAIM=1`
+# alone is sufficient. See the kernel8 knob block below and v3d.md §49.22.
+#
+# PI-V3D-99: UNAOS_V3D_ARMEDCLOSE=1 is a plain arming knob (no value) for the `v3d_armedclose` feature
+# — the `[v3d99]` armedclose leg, v3d.md §49.23's R-next-3. It rides the `[v3d97]` rung as ONE more leg
+# (E) and therefore implies `v3d_tsaim` (declared in Cargo.toml and armed here), so
+# `UNAOS_V3D_ARMEDCLOSE=1` alone is sufficient. Leg E is the ONE leg of the five that is NOT unarmed.
+# See the kernel8 knob block below and v3d.md §49.23.
+#
+# PI-V3D-100: UNAOS_V3D_BINCONTENT=1 is a plain arming knob (no value) for the `v3d_bincontent` feature
+# — the `[v3d100]` content ladder, v3d.md §49.24's R-next-4. It rides the `[v3d97]` rung as THREE more
+# legs (F, G, H) and therefore implies `v3d_armedclose` (declared in Cargo.toml and armed here), so
+# `UNAOS_V3D_BINCONTENT=1` alone is sufficient. F/G/H are the first legs of the rung whose lists carry
+# CONTENT and the first whose lists reference DRAM at all.
+# See the kernel8 knob block below and v3d.md §49.24.
+#
+# PI-V3D-101: UNAOS_V3D_DISPATCHDISC=1 is a plain arming knob (no value) for the `v3d_dispatchdisc`
+# feature — the `[v3d101]` dispatch-discriminator rung, v3d.md §49.25.4. It adds NO leg and NO kick: it
+# INSTRUMENTS the `[v3d100]` ladder's own legs E/F/G/H with a V3D performance-counter bank and a
+# bit-by-bit INT_STS decode, and therefore implies `v3d_bincontent` (declared in Cargo.toml and armed
+# here), so `UNAOS_V3D_DISPATCHDISC=1` alone is sufficient. The only registers it writes are the PCTR
+# counter-file config registers mainline's v3d_perfmon.c writes on every perfmon start.
+# See the kernel8 knob block below and v3d.md §49.25.4.
+#
+# PI-V3D-102: UNAOS_V3D_HFIRST=1 is a plain arming knob (no value) for the `v3d_hfirst` feature — the
+# `[v3d102]` hfirst order arm, v3d.md §49.25.5. It adds NO leg, NO kick and NO instrument: it REORDERS
+# the `[v3d100]` ladder's content legs to E -> H -> F -> G so that leg H — the m4-class minimum over the
+# REAL coordinate shader, which DOES write VPM — runs FIRST, instead of standing down behind leg G's
+# never-closing frame as it has on every boot to date. It therefore implies `v3d_dispatchdisc` (declared
+# in Cargo.toml and armed here), so `UNAOS_V3D_HFIRST=1` alone is sufficient. It writes no register the
+# implied chain does not already write, and the CT0-hygiene gate is mirrored, not weakened.
+# See the kernel8 knob block below and v3d.md §49.25.5.
+#
+# PI-V3D-103: UNAOS_V3D_VPMPROBE=1 is a plain arming knob (no value) for the `v3d_vpmprobe` feature —
+# the `[v3d103]` VPMPROBE discriminator rung, v3d.md §49.25.7, the successor to boot 13's `OUTCOME H4`.
+# It adds NO leg, NO kick, NO shader word, NO register WRITE and NO page-table edit. It RE-SOURCES three
+# PCTR slots (4/5/6 become QPU_CYCLES_STALLED_VERTEX_COORD_USER, PTB_PRIM_CLIP and
+# PTB_PRIM_VIEWPOINT_DISCARD; the five slots boot 13 read H4 off are untouched and must reproduce) and
+# adds FOUR READ-ONLY registers to the readback set (V3D_ERR_STAT/FDBGO/FDBGB/FDBGS, which mainline's
+# own v3d_debugfs.c scopes to V3D_GEN_33..V3D_GEN_71 — bracketing this part's 4.2). It implies
+# `v3d_hfirst` (declared in Cargo.toml and armed here), so `UNAOS_V3D_VPMPROBE=1` alone is sufficient.
+# See the kernel8 knob block below and v3d.md §49.25.7.
 KERNEL_FEATURES=""
 _feats=""
 # DEFAULT-QUIET: UNAOS_WITNESS=1 arms the `witness` fixture-battery feature (auto-set above for the battery
@@ -171,6 +229,15 @@ _feats=""
 # proven fix, not an experiment (usb_xhci.md §17). Setting the variable does nothing; the KNOBS line
 # reads `cbw=always-awaited` in every build.
 [ -n "${UNAOS_BOTRING64:-}" ] && _feats="${_feats}botring64,"
+# BOT-PARK: UNAOS_BOTWEDGE=1 injects a SYNTHETIC transport wedge on the storage slot once its first
+# 24 transactions have completed — every later BOT attempt fails `Timeout` with nothing put on the
+# wire. It exists because QEMU's usb-storage cannot wedge (it always answers), so the retry ladder's
+# global floor — escalating back-off, the bounded per-device retry budget, the park — is otherwise
+# walkable only on metal. Under it a QEMU boot reaches `:: BOT: PARKED … ::` and STOPS retrying,
+# which is the arc's whole claim. TEST ONLY, never on media: it makes storage permanently unusable
+# by design, so every fixture downstream of a mounted disk fails on such a run. Default OFF => fully
+# cfg-compiled out and the artifact is byte-identical.
+[ -n "${UNAOS_BOTWEDGE:-}" ] && _feats="${_feats}botwedge,"
 # VPERF: x86 video-path bench instrumentation (scroll/VRAM-read counters, fbmem memory-type
 # readout, display-BAR probe, scripted scroll scenario). x86_64-only module — aarch64 media are
 # byte-identical with this on or off.
@@ -695,7 +762,26 @@ _feats=""
 [ -n "${UNAOS_NETTEST:-}" ] && _feats="${_feats}nettest,genet,"
 if [ -n "$_feats" ]; then
     KERNEL_FEATURES="--features ${_feats%,}"
-    echo -e "${COLOR_YELLOW}⚡ kernel features: ${_feats%,}${COLOR_RESET}"
+    # TOOLFIX/BANNER: this map drives the x86/virt cargo invocations ONLY. The Pi bare-metal builds
+    # compile from `kernel8()`'s CURATED $K8_FEATS — a SEPARATE list that deliberately does not draw
+    # from `$_feats` — so printing this line on a kernel8-family command stated the wrong build twice
+    # over: it OMITTED every armed Pi feature (`UNAOS_PIDESK=1 UNAOS_QUARRY=1 ./arroyo kernel8`
+    # printed a banner with neither name on it, and a run with no other knob set printed the default
+    # x86 list `ehcihid,kbdwit,sdhcblk,smolnet` — none of which is in the image), and it ADVERTISED
+    # features the image does not contain (`UNAOS_WC=1 ./arroyo kernel8` printed `...,wc`, but `wc`
+    # is not in K8_FEATS and no `wc` byte reaches kernel8.img).
+    #
+    # That is not cosmetic. CLAUDE.md's full-knob rule reads this exact string to decide whether a gate
+    # really armed the knob it claims, and on the Pi path the banner could be satisfied FALSELY — a run
+    # could show `wc` while building an image without one `wc` byte in it — and could equally fail to
+    # show a feature that WAS armed (`pidesk`, `quarry`, the whole v3d ladder). So the banner is
+    # suppressed for the kernel8 family here and `kernel8()` emits the real one, with the identical
+    # prefix, from the list it actually hands cargo. Every other command's banner is unchanged, and
+    # $KERNEL_FEATURES itself is set exactly as before on every path, so no build changes.
+    case "${1:-}" in
+        kernel8|baremetal|kernel8-run|run-pi|kernel8-test|test-pi|kernel8-install|install-pi) ;;
+        *) echo -e "${COLOR_YELLOW}⚡ kernel features: ${_feats%,}${COLOR_RESET}" ;;
+    esac
 fi
 
 # SMOLNET-DEFAULT: `smolnet` is an x86-only feature — its optional smoltcp dep is x86-gated
@@ -862,6 +948,11 @@ fi
 # root — so QEMU's card IS the boot image). UNAOS_SDIMG=0 omits the drive (the M6g no-SD control);
 # any other value is a path override. QEMU attaches the card to the LEGACY SDHCI (the driver's fallback
 # base); real Pi 4 silicon routes the slot to EMMC2 (the driver's first-tried base).
+#
+# UNAOS_K8_SCRIPT (kernel8-test only): arms TYPED INPUT — UART0 becomes a bidirectional socket
+# chardev (still logging to the same target/serial-pi.log) and scripts/k8_type.py types the named
+# script at the shell. DEFAULT OFF; unset, the QEMU argv is byte-for-byte what it has always been.
+# UNAOS_K8_SPEC / UNAOS_K8_PORT tune the extra spec and the socket port. See test_kernel8().
 #
 # UNAOS_FATIMG swaps the usb-storage backing to a FAT image (scripts/make-fat-img.sh) so the
 # kernel's read-only FAT reader can be exercised on aarch64 QEMU too. Mirrors the x86 builder knob
@@ -1437,6 +1528,12 @@ test_x86_64() {
 #     never invokes the linker, so the -T/-z flags are inert here — but RUSTFLAGS is part of cargo's
 #     fingerprint, so a check that passed DIFFERENT flags would invalidate the crate's target/ dir and
 #     force a full build-std recompile every time an operator alternated `check` and `kernel8`.
+#     (user-vug is the exception on BOTH arches: its media builds are feature-variant and each lands in
+#     its own `--target-dir` — target/{x86,x86-pinlo,…,arm,arm-pinlo,arm-pinhi} — so these two rows own
+#     the crate's default target/ dir outright. The flags stay mirrored anyway: they are what the
+#     unfeatured image is built with, and a row that drifted from its recipe would be checking a
+#     configuration the media never ships. Both rows check the DEFAULT (adaptive) feature set only; the
+#     two pins are proved by the media builds themselves, which link all three on both arches.)
 #
 # -Z build-std comes from each crate's own .cargo/config.toml [unstable] table, so only
 # -Z json-target-spec is passed here (the .json target specs need it); NIGHTLY_FLAGS is a KERNEL
@@ -1576,11 +1673,15 @@ KERNEL_CFG_MATRIX=(
   # way, which is the build the metal flight actually carries.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
-  # three-rung INSTALL-PI ladder. Cannot carry the tegra family — see the mutual-exclusion note above.
-  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm"
+  # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the
+  # only leg that type-checks its ARMED polarity, since `rast` alone leaves it compiled out), and
+  # PI-DESK (`pidesk` — the desktop furniture family on the Pi panel; this leg carries `witness`, so it
+  # is also the only place the dock/menubar/crystal FIXTURES are type-checked on aarch64).
+  # Cannot carry the tegra family — see the mutual-exclusion note above.
+  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,pidesk,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon"
   # aarch64 board leg 2 — Jetson Orin Nano (Tegra234), plus the board-neutral aarch64 features that
   # would otherwise ride nothing: ORIN-SMP (tegrasmp/smpprobe), the four XCARVE levers, ORIN-NET-1..4
   # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET
@@ -1833,6 +1934,15 @@ check_both() {
     # are what the operator's own UNAOS_* knobs compile, and they are the fastest way to a diagnostic
     # for the edit that was just made. `_krc` carries a red leg past the userspace legs below, so a
     # green userspace can never mask a broken feature-gated kernel.
+    #
+    # TOOLFIX/BLOB: the `arm-pi` leg enables `baremetal`, which compiles
+    # `arch/aarch64/syscall.rs` — and that module `include_bytes!`s `target/user_blob.bin`. The gate
+    # therefore CONSUMES a build artifact that only the kernel8 path produces, so on a tree with an
+    # empty `unaos/target/` (fresh clone/worktree, or post-`./arroyo clean`) `arm-pi` went red on a
+    # missing file rather than on any source defect. Produce it here when it is absent so `check` is
+    # self-contained. Existence-only on purpose: a warm tree pays nothing and the artifact's mtime,
+    # which is the kernel crate's rebuild trigger, is never disturbed by a `check`.
+    [ -f "${WORKSPACE_DIR}/target/user_blob.bin" ] || build_user_blob
     local _krc=0
     check_kernel_cfg || _krc=1
 
@@ -2270,25 +2380,115 @@ k8_lock_acquire() {
     trap 'k8_lock_release' EXIT INT TERM
 }
 
-# JETSON-EL0 (M1b): the EL0 user blob build, LIFTED VERBATIM out of `kernel8()` so a second caller can
-# reach it. It had exactly one caller (the Pi `kernel8` path), and the `tegra_el0` jetson image needs the
-# same artifact for the same reason: `syscall.rs` `include_bytes!`es `target/user_blob.bin`, so the file
-# must exist BEFORE the kernel build or the armed build fails outright (`couldn't read .../user_blob.bin`)
-# — which is precisely what a first armed `esp-jetson` did in a tree that had never run `kernel8`. An
-# in-tree build that happens to have a stale blob lying around from an earlier Pi build masks this, so the
-# dependency is wired here rather than left to luck.
+# VUGSTAGE (PARITY §6.6b): one aarch64 image of crates/user-vug, named by $1 (the target/ basename) and
+# built with the cargo features in $2 — the exact twin of build_one_vug_x86 (~line 1068), which has emitted
+# three images since VUGSCENE while this arch emitted one. Same crate, same app logic, same linker-script
+# SHAPE; only the per-arch syscall stubs and the target differ.
 #
-# Requires `TOOLBIN` to be set by the caller (both callers compute it the same way).
+# UVUG-1's original prose, kept because it is still what the program DOES: it maps an off-screen surface
+# (SYS_FB_MAP), spawns 2 EL0 worker threads (SYS_THREAD_SPAWN) that render halves of the scene under a FUTEX
+# frame barrier, presents each frame (SYS_FB_PRESENT), then joins both (SYS_THREAD_JOIN) and prints its
+# `:: UVUG: … ::` witness before exiting 0. Kept AS AN ELF (strip-all preserves the ELF header + program
+# headers + the two PT_LOAD segments) for the kernel's aarch64 loader to validate and map with per-segment
+# permissions. Linker script user-vug.ld (PHDRS: a R+X text segment + a R+W data segment);
+# `-z max-page-size=0x1000` packs the segments on 4 KiB boundaries so the image fits the 16 KiB slot window.
+#
+# `--target-dir` keeps the three cargo builds apart, for the reason build_one_vug_x86 states: the feature set
+# is part of the fingerprint, so a shared directory would rebuild (and relink) the whole crate on every call,
+# and a stale artifact could be picked up by the objcopy of the NEXT image if a build ever failed after the
+# first. The bare-aarch64 target comes from the crate's own .cargo/config.toml (build.target =
+# aarch64-base.json), so — unlike the x86 twin, which must override it — no `--target` is passed here; the
+# artifact lands under `<target-dir>/aarch64-base/release/`.
+build_one_vug_aarch64() {
+    local out="$1" feats="$2"
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    echo -e "${COLOR_YELLOW}⚡ Building EL0 mini-vug static-ELF program (crates/user-vug${feats:+ [$feats]} → target/${out})...${COLOR_RESET}"
+    mkdir -p "${WORKSPACE_DIR}/target"
+    cd "$WORKSPACE_DIR/crates/user-vug"
+    local tdir="${WORKSPACE_DIR}/crates/user-vug/target/arm${feats:+-$feats}"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
+      cargo +nightly build --release -Z json-target-spec --target-dir "$tdir" ${feats:+--features "$feats"}
+    cd "$WORKSPACE_DIR"
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${tdir}/aarch64-base/release/user-vug" \
+      "${WORKSPACE_DIR}/target/${out}"
+    # It must exist, begin with the ELF magic (\x7fELF), and fit the slot window (USER_REGION_SIZE = 16 KiB;
+    # a larger image is BadSize at load). A wrong magic or oversize image is a build failure caught here.
+    [ -s "${WORKSPACE_DIR}/target/${out}" ] || { echo -e "${COLOR_RED}ERROR: ${out} missing/empty — UVUG build failed${COLOR_RESET}"; exit 1; }
+    local umag; umag="$(head -c 4 "${WORKSPACE_DIR}/target/${out}" | od -An -tx1 | tr -d ' \n')"
+    [ "$umag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: ${out} does not start with the ELF magic; first 4 bytes = ${umag}${COLOR_RESET}"; exit 1; }
+    # The e_machine check the x86 twin carries, in its aarch64 form: EM_AARCH64 = 183 = 0x00b7, little-endian
+    # b7 00 at offset 18. Staging an x86 image on Pi media would otherwise be a confusing bench failure
+    # (loader refusal at spawn) rather than an obvious build failure here — and with two arches' images
+    # sharing one target/ directory, a mixed-up basename is exactly the mistake that can happen.
+    local umach; umach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/${out}" | tr -d ' \n')"
+    [ "$umach" = "b700" ] || { echo -e "${COLOR_RED}ERROR: ${out} e_machine is ${umach}, want b700 (EM_AARCH64=183 LE)${COLOR_RESET}"; exit 1; }
+    local usz; usz="$(wc -c < "${WORKSPACE_DIR}/target/${out}" | tr -d ' ')"
+    [ "$usz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: ${out} ${usz} bytes > USER_REGION_SIZE (16384)${COLOR_RESET}"; exit 1; }
+    echo -e "${COLOR_GREEN}✅ static-ELF EL0 mini-vug program: ${out} (${usz} B)${COLOR_RESET}"
+}
+
+# VUGSTAGE: the aarch64 pin table, identical to build_user_vug_x86's — three images out of one source, per
+# the LOD_PIN note in crates/user-vug/Cargo.toml:
+#
+#   VUG.ELF   (no features)  the ADAPTIVE detail ladder. The default; what `vug`/Quarry launch.
+#   VUGC.ELF  (pinlo)        level 0 forever — the CLASSIC wireframe, the A/B baseline that keeps old fps
+#                            numbers comparable across the renderer change.
+#   VUGX.ELF  (pinhi)        LOD_MAX forever — the full per-pixel shard, for measuring the heaviest frame
+#                            this draws on the BCM2711 rather than inferring it from the ladder's choice.
+#
+# `bg`/`run` take a path and no argv on either arch (shell.rs: `match args.first()`), so a build feature is
+# the only channel a pin can travel down — hence three link products rather than one flag. All three names
+# are 8.3-clean and land in the FAT root beside STAT.ELF/PULSE.ELF, so each gets its own IMAGE_SHA256
+# principal and both reach paths work on them unchanged: Quarry's double-click (`.ELF` is launchable — see
+# video/quarry/live.rs) and `bg /fat/VUGX.ELF` at the shell.
+#
+# The aarch64 names carry no `-ARM` suffix (the x86 ones carry `-X86`) because the aarch64 build IS the
+# staged name: the x86 side stages target/VUG*-X86.ELF *as* VUG*.ELF via builder/make-fat-img, while kernel8
+# copies target/VUG*.ELF into the Pi staging dir verbatim.
+build_user_vug_aarch64() {
+    build_one_vug_aarch64 VUG.ELF  ""
+    build_one_vug_aarch64 VUGC.ELF "pinlo"
+    build_one_vug_aarch64 VUGX.ELF "pinhi"
+}
+
+# JETSON-EL0 (M1b): this function was LIFTED VERBATIM out of `kernel8()` so a second caller can reach it.
+# It had exactly one caller (the Pi `kernel8` path), and the `tegra_el0` jetson image needs the same
+# artifact for the same reason: `syscall.rs` `include_bytes!`es `target/user_blob.bin`, so the file must
+# exist BEFORE the kernel build or the armed build fails outright (`couldn't read .../user_blob.bin`) —
+# which is precisely what a first armed `esp-jetson` did in a tree that had never run `kernel8`. An
+# in-tree build that happens to have a stale blob lying around from an earlier Pi build masks this, so the
+# dependency is wired here rather than left to luck. (`TOOLBIN` used to be the caller's to set; the merged
+# form declares its own `local TOOLBIN` below, so both callers — and `check_both` — are covered.)
+#
+# M6c: build the EL0 user program as a SEPARATE link product (out of the kernel's .text) and
+# objcopy it to a flat binary the kernel include_bytes!s (crates/kernel/src/arch/aarch64/
+# syscall.rs). Built for the SAME bare aarch64 target as the kernel, with its own tiny linker
+# script (crates/user-blob/user-blob.ld); the routine is position-independent (byte-granular `adr`
+# + an inline message), so it runs wherever the kernel copies it. This MUST run BEFORE the kernel
+# build: include_bytes! needs target/user_blob.bin to exist, and its (always-fresh) mtime is what
+# drives the kernel's rebuild when the routine changes. (build-std/target come from the crate's
+# own .cargo/config.toml; it is its own workspace, so no cargo invocation in this script builds the
+# crate as a side effect — it is built only where this function is called.)
+#
+# TOOLFIX/BLOB — WHY THIS IS A FUNCTION AND NOT AN INLINE BLOCK OF kernel8(). The comment that used
+# to sit here said "`./arroyo check`/`build` never touch it — the blob is validated only here at
+# kernel8-build time, not at `check`", and crates/kernel/src/arch/aarch64/syscall.rs says the same
+# ("`./arroyo check`/`build` — which do not build the blob — never need the file to exist"). BOTH
+# ARE FALSE, and the falsifier is in this script: `arch/aarch64/syscall.rs` is
+# `#[cfg(feature = "baremetal")]`, and KERNEL_CFG_MATRIX's `arm-pi` leg enables `baremetal`. So
+# `./arroyo check` compiles the module — and therefore its `include_bytes!` — while nothing on the
+# check path produces the file. On a tree whose `unaos/target/` is empty (a fresh clone, a fresh
+# worktree, or anything after `./arroyo clean`, which runs `cargo clean` and wipes it) the gate goes
+# red on a MISSING BUILD ARTIFACT rather than on any source defect:
+#     error: couldn't read `.../crates/kernel/../../target/user_blob.bin`: No such file or directory
+#     ❌ arm-pi — unaos-kernel FAILED to compile
+# `check_both` now calls this function when the artifact is absent, so `check` produces its own
+# input and is self-contained again. It stays a no-op on a warm tree (the guard is existence-only,
+# never a rebuild), so the artifact's mtime — which IS the kernel's rebuild trigger — is untouched
+# by `check` and only ever moved by the kernel8 path that genuinely rebuilds the routine.
 build_user_blob() {
-    # M6c: build the EL0 user program as a SEPARATE link product (out of the kernel's .text) and
-    # objcopy it to a flat binary the kernel include_bytes!s (crates/kernel/src/arch/aarch64/
-    # syscall.rs). Built for the SAME bare aarch64 target as the kernel, with its own tiny linker
-    # script (crates/user-blob/user-blob.ld); the routine is position-independent (byte-granular `adr`
-    # + an inline message), so it runs wherever the kernel copies it. This MUST run BEFORE the kernel
-    # build: include_bytes! needs target/user_blob.bin to exist, and its (always-fresh) mtime is what
-    # drives the kernel's rebuild when the routine changes. (build-std/target come from the crate's
-    # own .cargo/config.toml; it is its own workspace, so `./arroyo check`/`build` never touch it —
-    # the blob is validated only here at kernel8-build time, not at `check`.)
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building EL0 user blob (crates/user-blob → target/user_blob.bin)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-blob"
@@ -2315,6 +2515,9 @@ kernel8() {
     k8_lock_acquire
     local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
 
+    # The hello blob, unconditionally (a kernel8 image must never carry a stale routine). The same
+    # `cargo build --release` this runs also links the other [[bin]]s of the crate, which the K2 and
+    # midden objcopies below consume — so it must stay ahead of them.
     build_user_blob
 
     # K2 (make-enforcement-LIVE): the SAME `cargo build --release` above builds every [[bin]] in the
@@ -2379,29 +2582,9 @@ kernel8() {
     [ "$esz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: ELFHELLO.ELF ${esz} bytes > USER_REGION_SIZE (16384)${COLOR_RESET}"; exit 1; }
     echo -e "${COLOR_GREEN}✅ static-ELF EL0 program: ELFHELLO.ELF (${esz} B)${COLOR_RESET}"
 
-    # UVUG-1: build the static ELF64 EL0 mini-vug program (crates/user-vug) the SAME way as ELFHELLO — keep
-    # it AS AN ELF (strip-all preserves the ELF header + program headers + the two PT_LOAD segments). It maps
-    # an off-screen surface (SYS_FB_MAP), spawns 2 EL0 worker threads (SYS_THREAD_SPAWN) that render halves of
-    # an animated pattern under a FUTEX frame barrier, presents each frame (SYS_FB_PRESENT), then joins both
-    # (SYS_THREAD_JOIN) and prints its `:: UVUG: … ::` witness before exiting 0. Same linker script shape as
-    # ELFHELLO (user-vug.ld's PHDRS: a R+X text segment + a R+W data segment); `-z max-page-size=0x1000`
-    # packs the segments on 4 KiB boundaries so the whole image fits the kernel's 16 KiB slot window.
-    echo -e "${COLOR_YELLOW}⚡ Building EL0 mini-vug static-ELF program (crates/user-vug → target/VUG.ELF)...${COLOR_RESET}"
-    cd "$WORKSPACE_DIR/crates/user-vug"
-    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
-      cargo +nightly build --release -Z json-target-spec
-    cd "$WORKSPACE_DIR"
-    "$TOOLBIN/llvm-objcopy" --strip-all \
-      "${WORKSPACE_DIR}/crates/user-vug/target/aarch64-base/release/user-vug" \
-      "${WORKSPACE_DIR}/target/VUG.ELF"
-    # It must exist, begin with the ELF magic (\x7fELF), and fit the slot window (USER_REGION_SIZE = 16 KiB;
-    # a larger image is BadSize at load). A wrong magic or oversize image is a build failure caught here.
-    [ -s "${WORKSPACE_DIR}/target/VUG.ELF" ] || { echo -e "${COLOR_RED}ERROR: VUG.ELF missing/empty — UVUG build failed${COLOR_RESET}"; exit 1; }
-    umag="$(head -c 4 "${WORKSPACE_DIR}/target/VUG.ELF" | od -An -tx1 | tr -d ' \n')"
-    [ "$umag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: VUG.ELF does not start with the ELF magic; first 4 bytes = ${umag}${COLOR_RESET}"; exit 1; }
-    usz="$(wc -c < "${WORKSPACE_DIR}/target/VUG.ELF" | tr -d ' ')"
-    [ "$usz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: VUG.ELF ${usz} bytes > USER_REGION_SIZE (16384)${COLOR_RESET}"; exit 1; }
-    echo -e "${COLOR_GREEN}✅ static-ELF EL0 mini-vug program: VUG.ELF (${usz} B)${COLOR_RESET}"
+    # UVUG-1 / VUGSTAGE: build the THREE static-ELF64 EL0 mini-vug images (crates/user-vug). See
+    # build_one_vug_aarch64 above for the per-image shape and build_user_vug_aarch64 for the pin table.
+    build_user_vug_aarch64
 
     # KVUG: the SAME source, linked a second time with the `kvug` cargo feature, as target/VUGK.ELF — the
     # aarch64 twin of build_one_vug_x86's VUGK-X86.ELF. Peter's ruling: the in-kernel vug
@@ -2587,6 +2770,57 @@ kernel8() {
         K8_FEATS="${K8_FEATS},v3d_dispdone"
         echo -e "${COLOR_YELLOW}  • UNAOS_V3D_DISPDONE: ARM the NOTIFY_DISPLAY_DONE sends ([v3d80] + [v3d81d]) — ⚠ stops the firmware display driver and blacks the panel for the boot; inert without UNAOS_V3D_DEEP${COLOR_RESET}"
     fi
+    # PI-V3D-92: UNAOS_V3D_PMCYCLE=1 adds the `v3d_pmcycle` feature — the arming switch for the
+    # mailbox power-domain CYCLE experiment ([v3d92], tail of the deep battery). Powers firmware
+    # domain 10 OFF then ON — the one transition a bare-metal boot never runs (boot-time ON lands on
+    # an already-on domain), and the last untested mailbox act after boots 17/18/19 excluded
+    # ENABLE_QPU, the M_CTRL transplant and the KMS overlay. The decisive ASB M_CTRL read prints
+    # BEFORE recovery, so the datum banks even if the block dies. Inert without UNAOS_V3D_DEEP.
+    # ⚠ an armed boot may lose V3D from the cycle onward if recovery fails. Do NOT combine with
+    # UNAOS_V3D_QPU (wedges the mailbox this rung needs) or UNAOS_V3D_DISPDONE/UNAOS_V3D81_* (their
+    # stations would read a power-cycled core). See docs/dev/OS/08_VIDEO/v3d.md §49.14.
+    if [ -n "${UNAOS_V3D_PMCYCLE:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_pmcycle"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_PMCYCLE: ARM the [v3d92] power-domain OFF->ON cycle — ⚠ may cost V3D for the boot if recovery fails; inert without UNAOS_V3D_DEEP; never with QPU/DISPDONE/V3D81${COLOR_RESET}"
+    fi
+    # PI-V3D-93: UNAOS_V3D_PTBBRKT=1 adds the `v3d_ptbbracket` feature — the arming switch for the
+    # PTB FRAME-UNIT BRACKET ([v3d93], deep battery, after [v3d74] and BEFORE [v3d75] so the fabric
+    # is still untouched). Boot20 closed the mailbox domain family; this is the register-side prong
+    # of what is left. The rung seeds sixteen stations PRE-QBA, reuses the PI-V3D-91 bin criterion
+    # unchanged, folds one full-station sample per iteration of that criterion's own FLDONE poll
+    # loop (not the ~1 ms cadence tick), and prints a FIRST-CHANGE ordering table after the window
+    # closes — which register moves first, at what sample, item-accept side vs pool-write side.
+    # Inert without UNAOS_V3D_DEEP. Unlike the other v3d arming switches this one is READ-ONLY and
+    # carries NO boot cost: it issues no V3D register write of its own and sends no mailbox tag, so
+    # there is no panel risk, no V3D loss and nothing it can wedge. Safe to combine with anything.
+    # See docs/dev/OS/08_VIDEO/v3d.md §49.15.
+    if [ -n "${UNAOS_V3D_PTBBRKT:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_ptbbracket"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_PTBBRKT: ARM the [v3d93] PTB frame-unit bracket — read-only first-change ordering across item-accept -> pool-write; no boot cost; inert without UNAOS_V3D_DEEP${COLOR_RESET}"
+    fi
+    # PI-V3D-94: UNAOS_V3D_HUBCM=1 adds the `v3d_hubcm` feature — the arming switch for the two
+    # channels NOBODY samples ([v3d94]). Boot21 closed the ARM-visible V3D surface (§49.15) and the
+    # piOS sweep diff (§49.16) named what that closure does not cover; this knob arms both halves
+    # that are readable from the kernel today.
+    #   HALF A (deep battery, right after [v3d93], before [v3d75] so the fabric is untouched): the
+    #   six unmapped hub work-counters at +0x8c/+0x90/+0x94/+0xa0/+0xa4/+0xa8 — monotone across
+    #   boots 18->21, sampled by no rung — snapshotted PRE-submit and POST-FLDONE-backstop around
+    #   the PI-V3D-91 bin criterion, deltas printed. Delta > 0 across a wedged window means the HUB
+    #   saw traffic every core-side station denied; delta = 0 extends dead-at-item-accept to the hub.
+    #   HALF B (bringup, immediately after the mailbox clock grant): the DIRECT clock-manager read —
+    #   CM_V3DCTL/CM_V3DDIV at 0xFE101038/0x3C (offsets INFERRED, tagged so on the wire) plus every
+    #   nonzero word in CM[0xFE101000,+0x100), printed beside the firmware's own GET_CLOCK_RATE /
+    #   GET_CLOCK_STATE. The firmware's clock report is on the §46.4 instrument-lie ledger; this is
+    #   the first direct reading that can audit it.
+    # Inert without UNAOS_V3D_DEEP. Like UNAOS_V3D_PTBBRKT this knob is READ-ONLY and carries NO
+    # boot cost: half A issues no V3D register write of its own (only the criterion's), half B
+    # issues no write at all and sends only the two read-only clock property tags [v3d55] already
+    # sends. No panel risk, no V3D loss, nothing it can wedge. Safe to combine with anything.
+    # See docs/dev/OS/08_VIDEO/v3d.md §49.17.
+    if [ -n "${UNAOS_V3D_HUBCM:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_hubcm"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_HUBCM: ARM the [v3d94] hub-traffic delta + direct CM clock station — read-only; no boot cost; inert without UNAOS_V3D_DEEP${COLOR_RESET}"
+    fi
     # PI-V3D-69: UNAOS_V3D69_REENABLE=1 adds the `v3d69_reenable` (+`v3d_deep`,+`v3d`) features — the
     # WRITE half of the initialisation-diff arc. The READ half (the `[v3d69] fabric` stations: PM_GRAFX,
     # both V3D async-AXI-bridge control words in both candidate ASB blocks, V3D_MMUC_CONTROL) rides
@@ -2630,7 +2864,14 @@ kernel8() {
         K8_FEATS="${K8_FEATS},v3d81_display,v3d81,v3d_deep,v3d"
         echo -e "${COLOR_YELLOW}  • UNAOS_V3D81_DISPLAY: send NOTIFY_DISPLAY_DONE reply-less and read the effect ([v3d80] stands down) — ⚠ the panel may go black and stay black${COLOR_RESET}"
     fi
-    # PI-V3D-85: UNAOS_V3D_FIRSTKICK=<empty|rcl|m4> adds the `v3d_firstkick` (+`v3d`) feature — the
+    # PI-V3D-85/86/87/88: UNAOS_V3D_FIRSTKICK=<empty|rcl|m4|rclp1..rclp19|rclhead|rclhead119|
+    # rclhead126|emptyunarm|rclct1> adds the `v3d_firstkick` (+`v3d`) feature — one token is one
+    # experiment (unrecognised values run `empty` with recognised=0 on the wire). rclp<n> = the
+    # §49.9 prefix bisection; rclhead<op> = the §49.10-11 head-swap discriminators; emptyunarm =
+    # the arming swap; rclct1 = the §49.11 proof-of-law (render list on CT1, the fix arc's rung).
+    # CAMPAIGN VERDICT (boot12, 2026-08-03): render-class opcodes stall CT0's decoder — CT0 is
+    # bin-only in silicon; RCLs run on CT1. Below is the ORIGINAL §49 framing this family began
+    # from — the R-LADDER from docs/dev/OS/08_VIDEO/v3d.md §49. §49.3 named the confound underneath every banked
     # R-LADDER from docs/dev/OS/08_VIDEO/v3d.md §49. §49.3 named the confound underneath every banked
     # negative in that file: `probe_job`'s bin is the FIRST CT0 kick of an ordinary boot, and every
     # other CT0 kick runs behind it on a CT0 whose CTRUN stuck 1 at the [v3d53] rung and never
@@ -2645,15 +2886,352 @@ kernel8() {
     # against §46.1's ground truth (mainline FETCHING = 0x20, our wedged thread = 0x70), cross-read
     # against CT0RA. No V3D register is written that the kick itself does not already write; BXCF and
     # MISCCFG.QRMAXCNT stay EXCLUDED MEASURED (§49.5) and are read, never written; CTRSTA (R6) is not
-    # implemented; no mailbox tag is sent. The VALUE picks the list — `empty` (§49.6's top pick; `1`
+    # implemented; no mailbox tag is sent. An UNRECOGNISED value runs `empty` and prints
+    # recognised=0, so a typo can never read as a deliberate variant choice.
+    # The VALUE picks the list — `empty` (§49.6's top pick; `1`
     # or an empty value select it too), `rcl` ([v3d74a]'s render list on CT0, bare QBA->QEA), `m4`
-    # (the real draw) — one experiment per boot, by construction. Implies UNAOS_V3D. ⚠ an armed boot
+    # (the real draw) — one experiment per boot, by construction. PI-V3D-86 adds the prefix-bisection
+    # family `rclp<n>` (n = 1..19 decimal, e.g. `rclp1`, `rclp7`): the SAME rcl submit with the render
+    # list truncated after main-list packet n and one audited END_OF_RENDERING terminator appended.
+    # R23 read the rcl list WEDGED at its first fetch (CT0CA held QBA, poison 64/64 + 8192/8192
+    # intact) while the empty and m4 BIN lists both walked to EA — so the wall is the rcl head packet,
+    # and the bisection walks the cut point down to name it. [v3d86] audits the truncation
+    # (byte-identity of the prefix + the n==19 top-rung control that must rebuild plain `rcl`).
+    # PI-V3D-87 adds the two DISCRIMINATORS (v3d.md §49.10), after boot9's `rclp1` froze exactly like
+    # the full rcl and so exhausted LENGTH as a variable inside the rcl class, leaving two candidates:
+    # `rclhead` — the FULL rcl with one bin-class-legal NUMBER_OF_LAYERS packet (op 119, 2 B, the head
+    # both executing lists open with) PREPENDED, so [v3d87h] can report CT0CA's advance in PACKET
+    # terms: stopping at QBA+2 names the TRMC opcode as the wall, stopping at QBA says the head opcode
+    # is not the discriminator. [v3d87h] audits the construction by MEASUREMENT (position-weighted sum
+    # over the shifted span vs the plain list's, the [v3d86] way). `emptyunarm` — the known-good EMPTY
+    # bin list through the RCL-CLASS SUBMIT (no CT0QMA/QMS/QTS, no BPOS=0, no pre-kick L2T invalidate,
+    # bare QBA->QEA, CPU clean_range only): if it FREEZES the arming is the wall, if it retires the
+    # arming is excluded and the opcode hypothesis stands alone. [v3d87u] writes out both branches.
+    # Implies UNAOS_V3D. ⚠ an armed boot
     # deliberately produces a SHORT capture missing every banked witness: label it and NEVER diff it
     # line-for-line against a full deep boot. QEMU raspi4b models no V3D, so kernel8-test green means
     # no regression and nothing more; the verdict is attended metal.
     if [ -n "${UNAOS_V3D_FIRSTKICK:-}" ]; then
         K8_FEATS="${K8_FEATS},v3d_firstkick,v3d"
         echo -e "${COLOR_YELLOW}  • UNAOS_V3D_FIRSTKICK=${UNAOS_V3D_FIRSTKICK}: the R-ladder — ONE CT0 kick before probe_job with R2/R3/R7 riding it, then bringup returns (⚠ short capture: no ladder, no M4, no battery — do not diff against a deep boot)${COLOR_RESET}"
+    fi
+    # PI-V3D-95: UNAOS_V3D_UNARMCLOSE=1 adds the `v3d_unarmclose` (+`v3d`) feature — the
+    # UNARMED-CLOSE-WRITES rung ([v3d95], docs/dev/OS/08_VIDEO/v3d.md §49.10's queued question,
+    # folded at §49.12.1). boot11 (`UNAOS_V3D_FIRSTKICK=emptyunarm`) CLOSED a bin frame through the
+    # rcl-class submit and latched an MMU fault across its own kick — PT_INVALID=1 WRITE_VIOLATION=1,
+    # client PTB, VA 0x00000070 — on a boot where CT0QMA/CT0QMS were deliberately never programmed,
+    # while the arena poison stayed fully intact. So the close path issued a write, the MMU refused
+    # it, and it did not land in memory we own: WHERE DO THE WRITES OF AN UNARMED FRAME-CLOSE GO?
+    # Armed, `bringup` takes EXACTLY ONE CT0 kick in the `emptyunarm` shape (the [v3d48] Empty BIN
+    # list, bare CT0QBA->CT0QEA, CPU clean_range publish only, NO CT0QMA/QMS/QTS, NO BPOS=0, NO
+    # pre-kick L2T invalidate), after M3 and BEFORE probe_job, and then RETURNS. The rung PROGRAMS
+    # NOTHING by design — the doc's design note verbatim — and instead READS CT0QMA/CT0QMS/CT0QTS
+    # pre and post plus the PTB's fault address across the close, so the VA can be read against the
+    # registers' bring-up residue: a VA derived from that residue means the close path follows those
+    # never-programmed registers, a fixed 0x70 means the aim is structural. The `[v3d62]` armed-policy
+    # fault catcher is REUSED across the kick (hub interrupt latch cleared, unmapped scratch page
+    # seeded), so a refused write that still LANDS is caught rather than inferred, and the arena
+    # poison detectors ride as negative controls.
+    # NOTE (§49.16 sweep diff): piOS programs pool/base registers in the core0 +0x108..+0x174 window
+    # — which CONTAINS CT0QTS/CT0QMA/CT0QMS (+0x15c/+0x170/+0x174) — and this driver never touches
+    # them. The rung NAMES that intersection on the wire and programs NONE of it; doing so is the
+    # sweep-diff arc's proposal, not this one's.
+    # Implies UNAOS_V3D. Never sits beside the QPU or DISPLAY_DONE sends, and structurally so: the
+    # boot returns long before [v3d75]/[v3d80]/[v3d81d] are reached. If UNAOS_V3D_FIRSTKICK is armed
+    # too, [v3d85] runs and returns first and this rung stands down — one experiment per boot.
+    # ⚠ an armed boot deliberately produces a SHORT capture missing every banked witness: label it
+    # and NEVER diff it line-for-line against a full deep boot. QEMU raspi4b models no V3D, so the
+    # rung prints its hub-absent SKIPPED line there and kernel8-test green means no regression and
+    # nothing more; the verdict is attended metal.
+    if [ -n "${UNAOS_V3D_UNARMCLOSE:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_unarmclose,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_UNARMCLOSE: the [v3d95] unarmed-close-writes rung — ONE unarmed CT0 kick before probe_job, tile-memory registers READ (never programmed) either side, [v3d62] catcher armed, then bringup returns (⚠ short capture — do not diff against a deep boot)${COLOR_RESET}"
+    fi
+    # PI-V3D-97: UNAOS_V3D_BASEDAIM=1 adds the `v3d_basedaim` feature — v3d.md §49.20.6's R1 (`basedaim`)
+    # with R3 (`lenvary`) riding in front, built as TWO EXTRA LEGS on the [v3d95] rung. It therefore
+    # IMPLIES UNAOS_V3D_UNARMCLOSE (and UNAOS_V3D): the cargo feature declares
+    # `v3d_basedaim = ["v3d_unarmclose"]` so the implication cannot be forgotten, and this block arms
+    # both features itself so the env side matches the cargo side without the operator remembering.
+    # WHY: §49.20 settled that the unarmed close DOES write, that the V3D MMU refuses it (PT_INVALID +
+    # WRITE_VIOLATION, client PTB, VA 0x70, raw VIO_ADDR=0xe VIO_ID=0x20), that the [v3d62] catcher
+    # absorbs it and that nothing GPU-reachable moves — and, in V5, that the PTB OBEYS CT0QMA/CT0QMS,
+    # its reservation arithmetic coming out exact (BPCA−QMA=0x3000, BPCA+BPCS ≡ QMA+QMS mod 2^32) on a
+    # base of ZERO. A zero base is the one residue under which "absolute 0x70" and "base 0 + 0x70" are
+    # indistinguishable, so the write is LOCATED and the aim is NOT. This knob moves the base.
+    # LEG B (R3) runs first and is the instrument control: the identical bare submit on the same zero
+    # bases with the list padded 14 -> 46 bytes (32 extra FLUSH_VCD_CACHE packets; a run-time
+    # self-check proves the padded encoder is byte-identical at zero pad, so exactly ONE thing varies).
+    # VIO_ADDR=0x2e ⇒ the raw word tracks LIST LENGTH and the entire VA-0x70 reading is an artifact,
+    # voiding leg C; VIO_ADDR=0xe ⇒ the reading survives its own control.
+    # LEG C (R1) is the cut: CT0QMA/CT0QMS/CT0QTS and NOTHING else programmed (no BPOS=0, no pre-kick
+    # L2T invalidate, no QTS.ENABLE), to three mutually distinguishable ARENA-MAPPED values, then the
+    # byte-identical 14-byte submit. Wire outcomes are pre-written: QMA+0x70 = the pool write is
+    # base-relative; QMA+QMS+0x70 = pool-end-relative; QTS+0x70 = the tile-state write (§49.18.4 item 4
+    # goes live); 0x70 unmoved = the aim is genuinely absolute and R2 is licensed; NO FAULT = the write
+    # LANDED on a page the MMU maps, which the two poisoned decoy windows plus the [v3d56] landing
+    # digest then locate.
+    # §49.20.2's V2a law is carried in code: every leg reads MMU_VIO_ADDR/MMU_VIO_ID ONCE and FIRST
+    # after its wait, and both RAW words ride every line. No page table is edited (that is R2
+    # `mapzero`, deliberately not built) and no mailbox tag is sent.
+    # ⚠ an armed boot deliberately produces a SHORT capture missing every banked witness: label it and
+    # NEVER diff it line-for-line against a full deep boot. QEMU raspi4b models no V3D, so [v3d95]
+    # prints its hub-absent SKIPPED line and returns before these legs are reached — kernel8-test green
+    # means no regression and nothing more; the verdict is attended metal.
+    if [ -n "${UNAOS_V3D_BASEDAIM:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_basedaim,v3d_unarmclose,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_BASEDAIM: the [v3d97] basedaim rung — TWO extra CT0 kicks on the [v3d95] leg (B = R3 lenvary, 46-byte list on zero bases; C = R1 basedaim, CT0QMA/QMS/QTS programmed to arena-mapped values), violation pair read ONCE and FIRST per leg (⚠ implies UNAOS_V3D_UNARMCLOSE; short capture — do not diff against a deep boot)${COLOR_RESET}"
+    fi
+    # PI-V3D-98: UNAOS_V3D_TSAIM=1 adds the `v3d_tsaim` feature — v3d.md §49.22.5's R-next-1 (`tsaim`),
+    # built as ONE MORE leg (D) on the [v3d97] rung. It therefore IMPLIES UNAOS_V3D_BASEDAIM (and
+    # UNAOS_V3D_UNARMCLOSE, and UNAOS_V3D): the cargo feature declares `v3d_tsaim = ["v3d_basedaim"]`
+    # so the implication cannot be forgotten, and this block arms the whole chain itself.
+    # WHY: boot7/PA45 flew legs A/B/C. Leg B CLEARED the instrument (VIO_ADDR = 0xe again on a 46-byte
+    # list, so the raw word does not track list length and §49.20's VA-0x70 reading survives its own
+    # control). Leg C then produced a TWO-WRITE result: the decoy POOL window took a real write off
+    # CT0QMA — 20 words inside byte span [0x0,0x7f], word0 = 0x12, landing digest STRAY page 4 = the
+    # decoy itself — which refutes "structural 0x70" and retires the phantom-BPCA reading for that
+    # region; AND a second PTB write still latched a refusal at VA 0x0, which none of §49.21.4's four
+    # pre-written rows predicts. Within leg C alone the refused write cannot be the pool write (that one
+    # landed), so the [v3d62] catcher's 48 zero words on that leg belong to the other one — and 48 is
+    # exactly the word count §49.8's boot6 measured for the ARMED empty frame's tile-state write, on a
+    # kick that wrote 20 pool words alongside it. Hence the leading identification: the VA-0 write is
+    # the TILE-STATE write, aimed from zero because leg C left CT0QTS.ENABLE (bit 1) clear — the ONE bit
+    # by which leg C's CT0QTS differs from the armed path's 0x…002.
+    # LEG D is that cut and it varies EXACTLY ONE BIT from leg C: same 14-byte `emptyunarm` list, same
+    # CT0QMA, same CT0QMS, same four poisoned windows, same catcher, same bare CT0QBA->CT0QEA submit,
+    # CT0QTS OR CT0QTS_ENABLE. Wire outcomes are pre-written on leg D's own VERDICT line: D1 = no fault
+    # and the decoy tile-state page took the write (ENABLE gates the write's BASE; leg C's residual is
+    # identified and the unarmed close is COMPLETE — both close-time writes landed, a campaign first);
+    # D2 = VA 0x0 unmoved (the identification is REFUTED and the pool-exhaustion leg R-next-1b is
+    # licensed — leg C consumed CT0QMS = 0x3000 exactly, leaving BPCS = 0); D3 = QTS-relative at another
+    # offset (the base IS honoured; the arithmetic on the line names the offset); D4 = no fault and
+    # nothing landed (ENABLE suppresses the write rather than aiming it, which is its own finding).
+    # §49.20.2's V2a law rides unchanged (violation pair read ONCE and FIRST, per leg). No page table is
+    # edited, no mailbox tag is sent, no BPOA/BPOS is written, and the arena geometry is untouched — leg
+    # D reuses leg C's decoy windows and every one of its compile-time geometry assertions.
+    # ⚠ an armed boot deliberately produces a SHORT capture missing every banked witness: label it and
+    # NEVER diff it line-for-line against a full deep boot. QEMU raspi4b models no V3D, so [v3d95]
+    # prints its hub-absent SKIPPED line and returns before any of these legs is reached — kernel8-test
+    # green means no regression and nothing more; the verdict is attended metal.
+    if [ -n "${UNAOS_V3D_TSAIM:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_tsaim,v3d_basedaim,v3d_unarmclose,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_TSAIM: the [v3d98] tsaim leg — ONE more CT0 kick after [v3d97]'s leg C, leg C's bases with CT0QTS.ENABLE set and NOTHING else changed, to identify leg C's residual VA-0 PTB refusal (⚠ implies UNAOS_V3D_BASEDAIM; short capture — do not diff against a deep boot)${COLOR_RESET}"
+    fi
+    # PI-V3D-99: UNAOS_V3D_ARMEDCLOSE=1 adds the `v3d_armedclose` feature — v3d.md §49.23's R-next-3
+    # (`armedclose`), built as ONE MORE leg (E) on the [v3d97] rung. It therefore IMPLIES
+    # UNAOS_V3D_TSAIM (and UNAOS_V3D_BASEDAIM, UNAOS_V3D_UNARMCLOSE, UNAOS_V3D): the cargo feature
+    # declares `v3d_armedclose = ["v3d_tsaim"]` so the implication cannot be forgotten, and this block
+    # arms the whole chain itself.
+    # WHY: boot8/PA46 flew legs A/B/C/D. The pad self-check held (identical=1), leg B cleared the
+    # instrument a second time (VIO_ADDR = 0xe on a 46-byte list), leg C reproduced boot7's shape
+    # exactly (decoy pool touched 20/4096, residual PTB refusal at VA 0x0), and LEG D returned
+    # OUTCOME D1: fault=0, decoy tile-state 48/1024, decoy pool 20/4096, both real controls INTACT,
+    # BFC Δ1, and the [v3d62] catcher PRISTINE at 0/1024 where legs A/B/C each absorbed 48 words. The
+    # 48 words moved from the catcher to CT0QTS: CT0QTS.ENABLE gates the tile-state write's BASE, not
+    # its existence, and both close-time writes of an UNARMED close completed on one leg — 20 and 48,
+    # §49.8 boot6's ARMED numbers exactly. §49.22.3's reconciliation of the ARMED path was written as
+    # an explicit CONDITIONAL because that path's close has never been read under these instruments.
+    # LEG E DISCHARGES IT, and it is the ONE leg of the five that is NOT unarmed: BPOS=0 first, then
+    # the per-job L2T invalidate, then CT0QMA (the REAL tile-alloc pool) -> CT0QMS (0x8000) ->
+    # CT0QTS|ENABLE (the REAL tile-state array) -> CT0QBA -> CT0QEA — v3d_bin_job_run's own order —
+    # around the same 14-byte `emptyunarm` list, with the V2a read-once pair, the [v3d62] catcher, four
+    # poisoned windows, the landing digest and the verbatim head dumps. ROLE INVERSION: on leg E the
+    # two REAL regions are the TARGETS and the two decoys are the negative controls.
+    # Wire outcomes are pre-written on leg E's own VERDICT line: E1 = healthy and boot6's shape to the
+    # word (the armed wall is NOT a close-stage artifact; the remaining surface is bin CONTENT, the
+    # m4/rcl classes); E2/E2b/E2c = a refusal at VA 0 / inside the pool span / inside the tile-state
+    # array (a first-class finding on the only path that ships); E3 = a PARTIAL close, one write of two;
+    # E4 = nothing landed; E5 = both landed at other counts; E1b = a decoy moved; E6 = §49.20.6's last
+    # row. No page table is edited, no mailbox tag is sent, no BPOA is written.
+    # ⚠ an armed boot deliberately produces a SHORT capture missing every banked witness: label it and
+    # NEVER diff it line-for-line against a full deep boot. QEMU raspi4b models no V3D, so [v3d95]
+    # prints its hub-absent SKIPPED line and returns before any of these legs is reached — kernel8-test
+    # green means no regression and nothing more; the verdict is attended metal.
+    if [ -n "${UNAOS_V3D_ARMEDCLOSE:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_armedclose,v3d_tsaim,v3d_basedaim,v3d_unarmclose,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_ARMEDCLOSE: the [v3d99] armedclose leg — ONE more CT0 kick after [v3d98]'s leg D, the PRODUCTION submit (real pool/size/tile-state|ENABLE + BPOS=0 + pre-kick L2T invalidate) under tonight's full instrument set, to read whether the ARMED close also completes (⚠ implies UNAOS_V3D_TSAIM; the only non-unarmed leg; short capture — do not diff against a deep boot)${COLOR_RESET}"
+    fi
+    # PI-V3D-100: UNAOS_V3D_BINCONTENT=1 adds the `v3d_bincontent` feature — v3d.md §49.24's R-next-4
+    # (`bincontent`), built as THREE MORE legs (F, G, H) on the [v3d97] rung. It therefore IMPLIES
+    # UNAOS_V3D_ARMEDCLOSE (and UNAOS_V3D_TSAIM, UNAOS_V3D_BASEDAIM, UNAOS_V3D_UNARMCLOSE, UNAOS_V3D):
+    # the cargo feature declares `v3d_bincontent = ["v3d_armedclose"]` so the implication cannot be
+    # forgotten, and this block arms the whole chain itself.
+    # WHY: boot9/PA47 flew legs A-E. Legs A-D reproduced boot8 exactly (pad self-check identical=1,
+    # leg B VIO_ADDR=0xe on a 46-byte list, leg C decoy pool 20/4096 with the residual PTB refusal at
+    # VA 0x0, leg D OUTCOME D1 with the catcher pristine), and LEG E returned OUTCOME E1: fault=0, the
+    # [v3d62] catcher at 0/1024, real-ts=48/64, real-pool=20/8192, both decoys 0/0, BFC delta 1, and a
+    # landing digest reading changed=2 expected=2 STRAY=0. The ARMED close is healthy and it is §49.8
+    # boot6's shape to the word, so §49.22.3's conditional reconciliation is DISCHARGED, the close
+    # stage is CLOSED end to end, and the remaining surface is bin CONTENT — §49.8's m4/rcl classes.
+    # THIS LADDER GOES AFTER THE m4 CLASS. Leg F = leg E's production bases and armed prologue with the
+    # full fixed-function state + GL_SHADER_STATE and NO primitives; leg G = F plus VERTEX_ARRAY_PRIMS
+    # with the NULL coord shader; leg H = the m4-class MINIMUM, one tile config + one flat triangle over
+    # the real coordinate shader. H cannot be cut smaller honestly: PI-V3D-17 established that without
+    # the clip/viewport/clipper state every primitive collapses to a point and the binner writes an
+    # empty-but-legal bin, which would be indistinguishable from the empty close.
+    # NEW SURFACE: F/G/H are the first legs whose lists reference DRAM — eleven regions, each named on
+    # the wire ([v3d100] ref), bounds-checked fail-closed, digested pre/post, and collared with poison
+    # on the unused remainder of the record and vertex pages.
+    # CT0 HYGIENE: the legs run in increasing order of stall risk and each later leg is STOOD DOWN if
+    # the one before it did not close its frame or left CTRUN set (v3d.md §49.3).
+    # Wire outcomes are pre-written on each content leg's own VERDICT line: C1 = content FLOWS (closed,
+    # more than 20 pool words); C2/C2b/C2c = closed but binned nothing or other counts (a vertex-path
+    # statement); C3a/C3b/C3c = stalled mid-content (§49.8 boot8's m4 station, re-read under tonight's
+    # instruments); C4/C4b = fetch never started / stopped mid-list; C5 = PCS.BMOOM pool exhaustion;
+    # C6 = a referenced region moved; C7/C7b/C7c/C7d = a refusal; C1b = a decoy moved.
+    # No page table is edited, no mailbox tag is sent, no BPOA is written.
+    # ⚠ an armed boot deliberately produces a SHORT capture missing every banked witness: label it and
+    # NEVER diff it line-for-line against a full deep boot. QEMU raspi4b models no V3D, so [v3d95]
+    # prints its hub-absent SKIPPED line and returns before any of these legs is reached — kernel8-test
+    # green means no regression and nothing more; the verdict is attended metal.
+    if [ -n "${UNAOS_V3D_BINCONTENT:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_bincontent,v3d_armedclose,v3d_tsaim,v3d_basedaim,v3d_unarmclose,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_BINCONTENT: the [v3d100] content ladder — THREE more CT0 kicks after [v3d99]'s leg E, all on leg E's PRODUCTION bases and armed prologue, varying only the LIST (F = state, no prims; G = prims with the NULL coord shader; H = the m4-class minimum, one tile config + one flat triangle), with eleven referenced DRAM regions named/bounds-checked/digested and two poison collars, and a CT0-hygiene gate that stands later legs down (⚠ implies UNAOS_V3D_ARMEDCLOSE; short capture — do not diff against a deep boot)${COLOR_RESET}"
+    fi
+    # PI-V3D-101: UNAOS_V3D_DISPATCHDISC=1 adds the `v3d_dispatchdisc` feature — v3d.md §49.25.4's
+    # `dispatchdisc` rung. It therefore IMPLIES UNAOS_V3D_BINCONTENT (and UNAOS_V3D_ARMEDCLOSE,
+    # UNAOS_V3D_TSAIM, UNAOS_V3D_BASEDAIM, UNAOS_V3D_UNARMCLOSE, UNAOS_V3D): the cargo feature declares
+    # `v3d_dispatchdisc = ["v3d_bincontent"]` so the implication cannot be forgotten, and this block
+    # arms the whole chain itself.
+    # IT ADDS NO LEG AND NO KICK. The boot still takes EIGHT CT0 closes and legs A..H are byte-for-byte
+    # what UNAOS_V3D_BINCONTENT submits; what this knob adds is INSTRUMENTATION on the four legs that
+    # carry leg E's production bases.
+    # WHY: boot11/PA48's leg G returned the wall at its narrowest ever — the bin frame stops closing the
+    # INSTANT a primitive dispatches, and BEFORE shader output can matter (leg G's coord shader is the
+    # NULL shader). The list was consumed to EA, CT0PC counted all three primitives, PCS.BMACTIVE held
+    # for the whole 500 ms backstop, ZERO pool words and ZERO tile-state words were written where legs
+    # E and F both wrote 20 and 48, no MMU fault latched, and not one of the eleven referenced regions
+    # moved. Memory refusal is excluded, the close stage is exonerated end to end, and exactly one span
+    # of pipeline is left dark: VCD attribute DMA -> coord-thread launch -> VPM write-back -> PTB intake.
+    # WHAT IT ARMS: eight PCTR slots, programmed ONCE immediately before leg E's kick and left RUNNING
+    # across E/F/G/H so every leg's delta is a difference against IN-BOOT baselines and not across a boot
+    # boundary — src1 FEP_VALID_PRIMS, src14 QPU_ACTIVE_CYCLES_VERTEX_COORD_USER, src32 CYCLE_COUNT
+    # (slot 2, the RESERVED V3D63_CTRL_SLOT / [v3d55] clkliv slot and this bank's own control), src16
+    # QPU_CYCLES_VALID_INSTR, src58 L2T_VCD_READS, src26 VPM_VDW_STALL, src27 VPM_VCD_STALL and src35
+    # PTB_PRIMS_BINNED. Every id is transcribed from include/uapi/drm/v3d_drm.h with its line cited in
+    # code, and the six ids the tree already carried land on their existing names (§38's six-for-six
+    # index cross-check, re-run on a newer copy). §38's caveat rides with them: id<->mux validity on this
+    # silicon is PARTIAL AND PER ID, so a nonzero slot is strong and a zero slot is weak — which is why
+    # legs E and F are read on the same bank as baselines. Plus a bit-by-bit INT_STS decode on each armed
+    # leg: boot11's leg G read 0x00010000 and no line named it (per PI-V3D-45 that is bit16, "QPU 0
+    # raised a host interrupt" — an independent instrument saying a thread ran and ended).
+    # Wire outcomes are pre-written on LEG G's own [v3d101] VERDICT line, one per station of the dark
+    # span: D1 = QPU delta 0, the coord thread NEVER LAUNCHES; D2 = QPU moved but VPM/PTB flat, the
+    # thread runs and delivers nothing — which on the NULL-shader leg is CORRECT thread behaviour, so D2
+    # is explicitly NOT a wall verdict and must be re-run against leg H's real shader; D3 = VPM/PTB moved
+    # with ZERO pool words, the PTB receives and discards; D4 = every counter flat including FEP, so
+    # CT0PC's own meaning is the finding. Two INCONCLUSIVE guards sit in front of all four.
+    # The ONLY registers written are the PCTR counter-file config registers mainline's v3d_perfmon.c
+    # writes on every perfmon start, in that file's own start/stop idiom. No page table is edited, no
+    # mailbox tag is sent, no BPOA is written, and §49.20.2's V2a law is strengthened in code: every
+    # counter read on every leg happens strictly AFTER that leg's read-once violation pair.
+    # ⚠ an armed boot deliberately produces a SHORT capture missing every banked witness: label it and
+    # NEVER diff it line-for-line against a full deep boot. QEMU raspi4b models no V3D and no PCTR block,
+    # so [v3d95] prints its hub-absent SKIPPED line and returns before any leg is reached — kernel8-test
+    # green means no regression and nothing more; the verdict is attended metal.
+    if [ -n "${UNAOS_V3D_DISPATCHDISC:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_dispatchdisc,v3d_bincontent,v3d_armedclose,v3d_tsaim,v3d_basedaim,v3d_unarmclose,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_DISPATCHDISC: the [v3d101] dispatch-discriminator rung — NO new leg and NO new kick, an eight-slot PCTR bank armed ONCE before leg E and read across legs E/F/G/H (FEP prims · QPU coord/instr cycles · src32 CYCLE_COUNT control · L2T VCD reads · both VPM stalls · PTB prims-binned) plus a bit-by-bit INT_STS decode, with §49.25.4's D1/D2/D3/D4 outcomes pre-written on leg G's verdict line (⚠ implies UNAOS_V3D_BINCONTENT; short capture — do not diff against a deep boot)${COLOR_RESET}"
+    fi
+    # PI-V3D-102: UNAOS_V3D_HFIRST=1 adds the `v3d_hfirst` feature — v3d.md §49.25.5's HFIRST order arm.
+    # It therefore IMPLIES UNAOS_V3D_DISPATCHDISC (and UNAOS_V3D_BINCONTENT, UNAOS_V3D_ARMEDCLOSE,
+    # UNAOS_V3D_TSAIM, UNAOS_V3D_BASEDAIM, UNAOS_V3D_UNARMCLOSE, UNAOS_V3D): the cargo feature declares
+    # `v3d_hfirst = ["v3d_dispatchdisc"]` so the implication cannot be forgotten, and this block arms the
+    # whole chain itself. UNAOS_V3D_HFIRST=1 ALONE is sufficient to stage the boot.
+    # IT ADDS NO LEG, NO KICK AND NO INSTRUMENT. The boot still takes EIGHT CT0 closes; every leg's list,
+    # prologue, eleven referenced regions, digests and poison collars are byte-for-byte what
+    # UNAOS_V3D_BINCONTENT submits, and the [v3d101] PCTR bank is still armed ONCE before leg E and read
+    # across all four production legs.
+    # THE ONE CHANGE: the content order is E -> H -> F -> G, not E -> F -> G -> H.
+    # WHY: boot 12 returned OUTCOME D2 on leg G — QPU=5 cycles and INT_STS bit16 (QPU program end) with
+    # FEP=0 VCD=0 VPM=0 PTB=0 and FLDONE=0, while legs E and F (which feed NO primitives) both close.
+    # Leg G's coord shader is the NULL shader BY DESIGN, so D2 there is CORRECT thread behaviour and not
+    # a wall verdict: the binner's flush is waiting forever on a VPM delivery the null shader never
+    # makes. The decisive experiment is LEG H — the m4-class minimum over the REAL coordinate shader,
+    # which DOES write VPM — and leg H has NEVER RUN, because leg G leaves the frame open every time and
+    # the CT0-hygiene gate stands H down behind it. This knob puts H where the gate can still admit it:
+    # directly after leg E's clean close.
+    # THE HYGIENE GATE IS NOT WEAKENED, IT IS MIRRORED. The ladder loop is unchanged, so whichever leg
+    # leaves the frame open stands the rest down — armed, that is F and G standing down behind a hung H,
+    # by exactly the rule that stood H down before.
+    # Wire outcomes are pre-written on LEG H's own [v3d102] HFIRST VERDICT line, which splits FIRST on
+    # whether the frame CLOSED (the one fact boot 12 never produced) and only then on the counters:
+    # H1 = closed with MORE than the empty close's 20 pool words, CONTENT FLOWS and the wall dissolves;
+    # H2 = closed at exactly 20, the frame CLOSES EMPTY (a clipper/state question, not a dispatch one);
+    # H3 = not closed but VPM/PTB MOVED, delivery happens and the close STILL HANGS (wall downstream of
+    # the delivery); H4 = not closed, QPU moved, VPM/PTB FLAT, the real shader also fails to deliver and
+    # THE VPM WRITE PATH ITSELF is the wall. Two INCONCLUSIVE guards sit in front of all four, one
+    # NO-ROW guard catches a flat-QPU leg H (a D1 shape, where H4 is NOT earned), and one catches a close
+    # below 20 words. The line prints leg H's QPU cycle delta explicitly against boot 12's leg G value
+    # of 5 — the real shader should burn MORE, and a delta at or near 5 is itself a finding.
+    # NO register write, NO mailbox tag and NO page-table edit is added over UNAOS_V3D_DISPATCHDISC, and
+    # CT0 is fed a BIN list on every leg — never a render list.
+    # ⚠ an armed boot deliberately produces a SHORT capture missing every banked witness: label it and
+    # NEVER diff it line-for-line against a full deep boot. QEMU raspi4b models no V3D at all, so
+    # [v3d95] prints its hub-absent SKIPPED line and returns before any leg is reached — kernel8-test
+    # green means no regression and nothing more; the verdict is attended metal.
+    if [ -n "${UNAOS_V3D_HFIRST:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_hfirst,v3d_dispatchdisc,v3d_bincontent,v3d_armedclose,v3d_tsaim,v3d_basedaim,v3d_unarmclose,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_HFIRST: the [v3d102] hfirst order arm — NO new leg, NO new kick and NO new instrument, the content ladder simply runs E -> H -> F -> G so LEG H (the m4-class minimum over the REAL coordinate shader, which DOES write VPM) runs FIRST instead of standing down behind leg G's never-closing frame, with §49.25.5's H1/H2/H3/H4 outcomes pre-written on leg H's own verdict line and the CT0-hygiene gate mirrored rather than weakened (⚠ implies UNAOS_V3D_DISPATCHDISC; short capture — do not diff against a deep boot)${COLOR_RESET}"
+    fi
+    # PI-V3D-103: UNAOS_V3D_VPMPROBE=1 adds the `v3d_vpmprobe` feature — v3d.md §49.25.7's VPMPROBE
+    # discriminator rung, the successor to boot 13's OUTCOME H4. It IMPLIES UNAOS_V3D_HFIRST (and through
+    # it DISPATCHDISC, BINCONTENT, ARMEDCLOSE, TSAIM, BASEDAIM, UNARMCLOSE, V3D): the cargo feature
+    # declares `v3d_vpmprobe = ["v3d_hfirst"]` so the implication cannot be forgotten, and this block arms
+    # the whole chain itself. UNAOS_V3D_VPMPROBE=1 ALONE is sufficient to stage the boot.
+    # IT ADDS NO LEG, NO KICK, NO SHADER WORD, NO REGISTER WRITE AND NO PAGE-TABLE EDIT. The boot still
+    # takes EIGHT CT0 closes; every leg's list, prologue, eleven referenced regions, digests and poison
+    # collars are byte-for-byte what UNAOS_V3D_BINCONTENT submits; the ladder order is UNAOS_V3D_HFIRST's
+    # E -> H -> F -> G; CT0 is fed a BIN list on every leg, never a render list; the boot returns before
+    # probe_job.
+    # WHY: boot 13 folded as OUTCOME H4 in its STRONG form (v3d.md §49.25.6) — the REAL 27-word coord
+    # shader ran to a program-end interrupt, burning QPU_CYCLES_VALID_INSTR=53 against the null shader's
+    # 5, and NOT ONE VPM- or PTB-side witness moved. The shader is exonerated and the wall is "the VPM
+    # write path itself — the write-back stage, or the coord thread's ACCESS to it". This rung SPLITS
+    # that sentence; it does not replace it.
+    # SUB-HYPOTHESIS (a) IS ALREADY DEAD, RESOLVED AT THE DESK: "our VPM write-SETUP word is VC4-shaped
+    # on a 4.2 VPM" cannot be the wall because THERE IS NO SETUP WORD. PI-V3D-20 removed vpmsetup/mov vpm
+    # outright (that IS the VC4/3.3 model, and it does not exist for per-vertex shader output on 4.x),
+    # PI-V3D-26 cross-checked the STVPMV body against a real ver-4.2 v3d_compile() run, and this arc
+    # re-decoded all six STVPMV words bit by bit. No slot is spent on it; the wire says so on the
+    # [v3d103] VPMSTATIC line so no reader spends the boot on it either.
+    # TWO CHANGES, BOTH INSTRUMENT-ONLY.
+    # (1) THREE PCTR SLOTS RE-SOURCED. Slots 0/1/2/3/7 UNCHANGED — the five boot 13 read H4 off; leg H
+    # must reproduce their shape or the line reads INCONCLUSIVE (an admissibility guard, not a result).
+    # Slots 4/5/6 were L2T_VCD_READS + the two VPM STALL counters, all three of which read ZERO on boot
+    # 13; VCD attribute fetch was already exonerated at PI-V3D-28, and a stall counter reading zero
+    # cannot separate "the write sailed through" from "no write was ever presented". They become src33
+    # QPU_CYCLES_STALLED_VERTEX_COORD_USER, src11 PTB_PRIM_CLIP and src10 PTB_PRIM_VIEWPOINT_DISCARD.
+    # THE PAIR TO WATCH IS 5 AND 6: a primitive cannot be clipped or viewport-discarded unless it
+    # ARRIVED, so either of them moving proves the VPM delivery reaches the PTB — which KILLS H4 and
+    # moves the wall into the clipper/viewport room PI-V3D-17 opened.
+    # (2) FOUR READ-ONLY REGISTERS JOIN THE READBACK SET: V3D_ERR_STAT, V3D_ERR_FDBGO, V3D_ERR_FDBGB,
+    # V3D_ERR_FDBGS. Sourced from v3d_regs.h and scoped to THIS silicon by mainline itself —
+    # v3d_debugfs.c's v3d_core_reg_defs lists all four as REGDEF(V3D_GEN_33, V3D_GEN_71, ...), a range
+    # that brackets the bcm2711's V3D 4.2. Mainline's only use of them is a debugfs dump and this file
+    # NEVER writes them. Twelve of ERR_STAT's sixteen named bits are VPM/VPA/VDW/VCD/VCM errors, which is
+    # exactly the vocabulary the wall statement needs. Read PRISTINE once before leg E's kick and once
+    # per armed leg; every row splits on NEWLY-LATCHED bits, because ERR_STAT latches and is never cleared.
+    # Wire outcomes are pre-written on LEG H's own [v3d103] VPMPROBE VERDICT line:
+    # V1 = a VPM WRITE bit latched (VPMEWNA "write non-allocated" or VPMEWR "write range") — THE VPM
+    # WRITE IS REFUSED AND THE SILICON SAYS SO; the wall is ALLOCATION, and the three numbers that
+    # allocate are cs_output_vpm_segment_size (this driver writes 1), cs_input_vpm_segment_size (0) and
+    # VCM_CACHE_SIZE (4/4). V2 = a non-write VPM bit — the VPM is reached and unhappy, but not about our
+    # stores. V3 = a VPA or VDW/VCD/VCM/L2C bit with NO VPM bit — the wall is BESIDE the VPM and the
+    # §49.25.6 statement is misnamed. V4 = PTB_PRIM_CLIP and/or PTB_PRIM_VIEWPOINT_DISCARD moved — THE
+    # PTB RECEIVED THE PRIMITIVES AND THREW THEM AWAY, and OUTCOME H4 IS DEAD. V5 = the coord thread
+    # STALLED. V6 = nothing anywhere — THE WRITE IS SWALLOWED IN SILENCE, and the next rung must make the
+    # thread's stores visible OUTSIDE the VPM (§49.25.7's TMU landmark). Three guards sit in front of all
+    # six: an unarmed/flat-control bank, a leg H that did not reproduce boot 13's continuity slots, and a
+    # frame that closed (which boot 13 says it will not).
+    # NO register write, NO mailbox tag and NO page-table edit is added over UNAOS_V3D_HFIRST.
+    # ⚠ an armed boot deliberately produces a SHORT capture missing every banked witness: label it and
+    # NEVER diff it line-for-line against a full deep boot. QEMU raspi4b models no V3D at all, so
+    # [v3d95] prints its hub-absent SKIPPED line and returns before any leg is reached — kernel8-test
+    # green means no regression and nothing more; the verdict is attended metal.
+    if [ -n "${UNAOS_V3D_VPMPROBE:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_vpmprobe,v3d_hfirst,v3d_dispatchdisc,v3d_bincontent,v3d_armedclose,v3d_tsaim,v3d_basedaim,v3d_unarmclose,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_VPMPROBE: the [v3d103] vpmprobe discriminator rung — NO new leg, NO new kick, NO new shader word and NO new register WRITE; it re-sources PCTR slots 4/5/6 to QPU_CYCLES_STALLED_VERTEX_COORD_USER / PTB_PRIM_CLIP / PTB_PRIM_VIEWPOINT_DISCARD (leaving the five slots boot 13 read OUTCOME H4 off untouched as an admissibility guard) and adds four READ-ONLY error registers (V3D_ERR_STAT/FDBGO/FDBGB/FDBGS, scoped to this silicon by mainline's own v3d_core_reg_defs), with §49.25.7's V1..V6 outcomes pre-written on leg H's own verdict line (⚠ implies UNAOS_V3D_HFIRST; short capture — do not diff against a deep boot)${COLOR_RESET}"
     fi
     # VUG-PAR: UNAOS_VUGPAR=1 adds the `vugpar` feature — band-parallel Screen::flush that splits the
     # damaged row-copy blit into disjoint scanline bands dispatched to free secondary cores (sched::
@@ -2749,6 +3327,122 @@ kernel8() {
         K8_FEATS="${K8_FEATS},piinstall_confirm"
         echo -e "${COLOR_YELLOW}  • UNAOS_PIINSTALL_CONFIRM: Gate 3 — DESTRUCTIVE install (GPT→FAT32→payload→verify)${COLOR_RESET}"
     fi
+    # PI-RAST: UNAOS_PIRAST=1 adds the `pirast` feature (which implies `rast`) — the platform-neutral
+    # software rasterizer's spinning-cube demo on the BCM2711 panel, the Pi's first 3D pixels. Draws
+    # through the INHERITED mailbox framebuffer (`video::WRITER`) with geometry read live, so it is
+    # correct at both the bench panel's 1920x1200 and QEMU raspi4b's 640x480; no mode-set, no scanout
+    # reprogramming, V3D untouched. Rides on the GUI-handoff detach line — panel up, compositor tasks
+    # not spawned yet — so it never races bring-up, and it is bounded (90 paced frames) so the boot
+    # always reaches the shell. K8_FEATS is CURATED (like UNAOS_LOGTS above), so the arm must be here
+    # or the feature never reaches the Pi image; `builder/src/main.rs` is deliberately NOT touched —
+    # builder makes the x86/virt ESP media, never kernel8.img (the same class as the V3D/PIUSB/GENET
+    # knobs, which carry no builder mapping either). OFF => the call site + the whole `rast` graph are
+    # unlinked and kernel8.img is byte-identical to baseline. See docs/dev/OS/08_VIDEO/rasterizer.md §4.
+    if [ -n "${UNAOS_PIRAST:-}" ]; then
+        K8_FEATS="${K8_FEATS},pirast"
+        echo -e "${COLOR_YELLOW}  • UNAOS_PIRAST: software-rasterizer spinning cube on the BCM2711 panel (first 3D pixels on the Pi; 90 paced frames, then the shell repaints)${COLOR_RESET}"
+    fi
+    # DECRUD-1: UNAOS_VUGDEMO=1 adds the `vugdemo` feature — the IN-KERNEL `vug` / `vug wire` /
+    # `vug bebox` / `pulse` shell demos (crates/kernel/src/vug.rs, ~1.3 kloc of fixed-point software
+    # renderer, BeOS-Pulse-homage monitor and BeBox tribute screen). DEFAULT OFF, and this is the
+    # DEFAULT-QUIET law applied to a demo rather than to a witness family: the three verbs have shipped
+    # EL0 replacements that this very image already stages into its FAT root — VUG.ELF (crates/user-vug)
+    # and PULSE.ELF (crates/user-pulse) — and the bench runs those (`UVUG:` streams while the in-kernel
+    # `[vugfps]` counter reads 0). No boot path on either arch calls into the module; the only way in is
+    # an operator typing at the console. So OFF unlinks the whole demo and every default kernel8.img
+    # stops carrying a Ring-0 3D renderer that nothing on the machine can reach. NOT a witness gate:
+    # `parked_display_witness` (VUG-HONESTY) moved to `ui_status` first, precisely so this knob cannot
+    # take a metal-earned falsifier off a boot. K8_FEATS is CURATED (like UNAOS_PIRAST above), so the arm
+    # must be here or the feature never reaches the Pi image; `builder/src/main.rs` is deliberately NOT
+    # touched — builder makes the x86/virt ESP media, and vug.rs is aarch64-only.
+    # See docs/dev/OS/kernel-decrud.md §3.1.
+    if [ -n "${UNAOS_VUGDEMO:-}" ]; then
+        K8_FEATS="${K8_FEATS},vugdemo"
+        echo -e "${COLOR_YELLOW}  • UNAOS_VUGDEMO: the in-kernel vug/pulse/bebox shell demos (default OFF — VUG.ELF/PULSE.ELF in ring 3 are the real ones)${COLOR_RESET}"
+    fi
+    # PI-DESK: UNAOS_PIDESK=1 adds the `pidesk` feature — the desktop FURNITURE family on the Pi panel.
+    # Compiles `video::strip` (the furniture-strip primitive), `video::dock` (the window switcher),
+    # `video::menubar` (the top strip, DEFAULT OFF at runtime) and `video::crystal` (the SHARD system
+    # menu) on aarch64, wires the strip compose seam at the tail of `wm::composite_once`, and routes
+    # presses through `arch/aarch64/syscall.rs::wc_click_route` ahead of every window arm. The
+    # materials the furniture paints through (theme/paper/ceramic/knurl) were already arch-neutral and
+    # already render on the Pi, so this knob buys the SEAMS, not a second renderer. Same curated-list
+    # class as UNAOS_PIRAST above: the arm must be here or the feature never reaches the Pi image, and
+    # `builder/src/main.rs` is deliberately NOT touched (builder makes the x86/virt ESP media, never
+    # kernel8.img). OFF => none of the four modules is compiled, neither seam exists, and kernel8.img
+    # is byte-identical to baseline. See docs/dev/OS/08_VIDEO/engine.md §PI-DESK.
+    #
+    # ⚠ THE BYTE-IDENTITY PROOF HAS A DISCIPLINE, MEASURED THIS ARC RATHER THAN ASSUMED. The first cut
+    # of PI-DESK's `wm.rs` seam was `cfg`-only and still moved the knob-off hash
+    # (42355ca2… -> 1143ecc5…), because panic `Location` records embed FILE LINE NUMBERS: eleven added
+    # COMMENT lines in `wm.rs` shifted every location below them. So a change to a file that is compiled
+    # on the knob-off Pi image must be LINE-NEUTRAL — fit new prose into the line count already there,
+    # never add to it — and the identity must be re-measured after, not reasoned about. Files that are
+    # NOT compiled knob-off (`video/{strip,dock,menubar,crystal}.rs`) are free of the constraint.
+    if [ -n "${UNAOS_PIDESK:-}" ]; then
+        K8_FEATS="${K8_FEATS},pidesk"
+        echo -e "${COLOR_YELLOW}  • UNAOS_PIDESK: desktop furniture on the BCM2711 panel (dock window-switcher strip + SHARD menu; menu bar default OFF), clicks routed through the Pi mouse${COLOR_RESET}"
+    fi
+    # LIVECON: UNAOS_LIVECON=1 adds the `livecon` feature — the console window's text stays LIVE, and
+    # it presents from the RENDER core. The second half of M3. Three statements, no new machinery:
+    # `fbcon`'s three PRINT-CONTEXT present entries record their rows in the existing `PEND` ledger and
+    # return without compositing; `main.rs`'s `render_service` takes that ledger once per pass through
+    # the existing `fbcon::console_service()`; and `video/pidesk.rs`'s seam therefore returns `routed`,
+    # so the GUI handoff SKIPS `fbcon::detach()` and `_print` keeps reaching the window's surface.
+    #
+    # PAIR IT WITH UNAOS_PIDESK. `livecon` compiles the deferral and the two hooks; `pidesk` is what
+    # ROUTES the console into a window in the first place (`video/pidesk.rs`'s DESKTOP-READY seam) —
+    # armed alone there is no console window to keep live and every hook is inert.
+    #
+    # WHY A KNOB. The live console was tried once and reverted with evidence: presenting from print
+    # context made the console an N-core compositor client and turned a 108/108 bench-geometry run into
+    # 97/108 with 37 forbidden hits and a synchronous exception. Deferral fixes the shape (one core,
+    # frame cadence); the battery's verdict on the fixed shape is measured, not argued, so the default
+    # stays the frozen snapshot. Same curated-list class as UNAOS_PIDESK above (builder is deliberately
+    # NOT touched). OFF => the latch is an `#[inline(always)] false`, both hooks are statement-level
+    # `#[cfg]`s FOLDED onto lines that already existed (no panic-`Location` line shift in `fbcon.rs` or
+    # `main.rs`, which ARE compiled knob-off), and `kernel8.img` is byte-identical to baseline.
+    # See docs/dev/OS/08_VIDEO/PARITY.md §6.12.
+    if [ -n "${UNAOS_LIVECON:-}" ]; then
+        K8_FEATS="${K8_FEATS},livecon"
+        echo -e "${COLOR_YELLOW}  • UNAOS_LIVECON: the console window's text stays LIVE (presents deferred off print context onto the render core; pair with UNAOS_PIDESK)${COLOR_RESET}"
+    fi
+    # QUARRY: UNAOS_QUARRY=1 adds the `quarry` feature — UnaOS's FILE MANAGER (Peter's naming and
+    # shape, 2026-08-17: "Tree on left and start with detailed list view on right"). A kernel-owned
+    # compositor window over the ONE VFS mount table: the tree of mounted volumes on the left, the
+    # name/size/modified list of the selected directory on the right, and the first scrolling in this
+    # tree. Same curated-list class as UNAOS_PIDESK above (builder is deliberately NOT touched).
+    #
+    # PAIR IT WITH UNAOS_PIDESK. `quarry` compiles the module; `pidesk` is what OPENS the window
+    # (`video/pidesk.rs`'s DESKTOP-READY seam) and what routes keys and clicks to it — armed alone, the
+    # feature builds a file manager nothing on this arch can reach. OFF => `quarry/live.rs` is not
+    # compiled, the stubs inline to nothing, and kernel8.img is byte-identical to baseline. See
+    # docs/dev/OS/05_USER_EXPERIENCE/quarry.md.
+    if [ -n "${UNAOS_QUARRY:-}" ]; then
+        K8_FEATS="${K8_FEATS},quarry"
+        echo -e "${COLOR_YELLOW}  • UNAOS_QUARRY: the file manager on the BCM2711 panel (volume tree + detailed list + scrolling; arrows/Enter/Backspace/Esc, click, and the dock's pinned tile)${COLOR_RESET}"
+    fi
+    # FATFIX M2: UNAOS_FATPERF=1 adds the `fatperf` feature — the COST INSTRUMENT for the VFS listing
+    # and file-read paths. One line per operation, raw words only:
+    #   [fatperf] op=list path=/fat sectors=222 us=13456
+    # `sectors` is counted at fat.rs's two read funnels (so a chunked multi-block transfer counts the
+    # sectors it moved); `us` brackets the whole VFS operation including FatBackend's per-call
+    # `mount_source` volume probe — the term quarry.md §11.1 convicted as the per-CALL cost. It is a
+    # MEASUREMENT knob: no caching, no behavioural change; the repair is a later arc (and must
+    # coordinate with orin 0's UnaFS layout — the baton forbids building on FAT twice).
+    # OFF => fs/fatperf.rs is not compiled, both fs/mod.rs shims inline to nothing, and kernel8.img
+    # is byte-identical to baseline (the call sites are line-neutral edits to fat.rs/vfs.rs).
+    if [ -n "${UNAOS_FATPERF:-}" ]; then
+        K8_FEATS="${K8_FEATS},fatperf"
+        echo -e "${COLOR_YELLOW}  • UNAOS_FATPERF: the FAT/VFS cost instrument ([fatperf] op=list|read path= sectors= us= — measurement only, no behaviour change)${COLOR_RESET}"
+    fi
+    # TOOLFIX/BANNER: the Pi image's OWN feature banner, printed from the list this build is about to
+    # hand cargo — not from the x86/virt `$_feats` map at the top of the script, which is suppressed
+    # for the kernel8 family precisely so this line is the only `⚡ kernel features:` a Pi run emits.
+    # Same prefix as the x86 banner on purpose: CLAUDE.md's full-knob rule reads that string, and on a
+    # Pi run it must read a list that is true of kernel8.img. (`arm_features`' smolnet/kbdwit/sdw strip
+    # does not apply — K8_FEATS is curated and carries none of them.)
+    echo -e "${COLOR_YELLOW}⚡ kernel features: ${K8_FEATS}${COLOR_RESET}"
     echo -e "${COLOR_YELLOW}⚡ Building bare-metal kernel8.img (Pi 4, microSD-slot boot)...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/kernel/pi-baremetal.ld" \
@@ -2805,7 +3499,18 @@ kernel8() {
     # the EXEC-1 `run_user_image` path (2 PT_LOAD segments, per-segment W^X); the panel `run /fat/VUG.ELF`
     # runs the same bytes live. Distinct 8.3 name => its own IMAGE_SHA256 principal; never collides with the
     # flat fixtures or ELFHELLO.ELF.
+    #
+    # VUGSTAGE (PARITY §6.6b): the two PINNED siblings ride along — VUGC.ELF (pinlo, the classic wireframe
+    # baseline) and VUGX.ELF (pinhi, the full per-pixel shard). x86 media has carried all three since
+    # VUGSCENE; this closes the last of that gap on the Pi. They are launched exactly like VUG.ELF —
+    # `bg /fat/VUGX.ELF` at the shell, or a double-click in Quarry's list, both of which take any `.ELF` on
+    # the volume — so no kernel change is needed for them to be reachable, only these bytes on the FAT.
+    # Cost against the 64 MiB image is the three sizes printed by build_user_vug_aarch64 above (~10 KiB
+    # each): under 0.05% of the volume, and the UVUG witness still reads VUG.ELF, unchanged.
     cp "${WORKSPACE_DIR}/target/VUG.ELF" "$KERNEL8_DIR/VUG.ELF"
+    cp "${WORKSPACE_DIR}/target/VUGC.ELF" "$KERNEL8_DIR/VUGC.ELF"
+    cp "${WORKSPACE_DIR}/target/VUGX.ELF" "$KERNEL8_DIR/VUGX.ELF"
+    echo -e "${COLOR_GREEN}✅ vug images staged: VUG.ELF ($(wc -c < "$KERNEL8_DIR/VUG.ELF" | tr -d ' ') B, adaptive) + VUGC.ELF ($(wc -c < "$KERNEL8_DIR/VUGC.ELF" | tr -d ' ') B, pinlo) + VUGX.ELF ($(wc -c < "$KERNEL8_DIR/VUGX.ELF" | tr -d ' ') B, pinhi)${COLOR_RESET}"
 
     # KVUG: the kernel-vug image beside it — `run /fat/VUGK.ELF` / `bg /fat/VUGK.ELF` on the panel. Its own
     # 8.3 name, so its own IMAGE_SHA256 principal; never collides with VUG.ELF or the flat fixtures.
@@ -2932,6 +3637,49 @@ test_kernel8() {
     # mechanism that actually turns a lost race into a named, bounded retry instead of a false green.
     local qmp_port="${UNAOS_QMP_PORT:-4463}"
     while lsof -iTCP:"$qmp_port" -sTCP:LISTEN >/dev/null 2>&1; do qmp_port=$((qmp_port + 1)); done
+    # ── SUITETYPE: the OPTIONAL TYPED-INPUT MODE (default OFF) ────────────────────────────────
+    # The hole this closes: the first UART above is attached `-serial file:` — WRITE-ONLY. The
+    # guest can talk; nothing can talk back. So every interactive path on the Pi (bare-name
+    # launch, the unknown-command refusal, `jobs`) has been un-gateable, and `exec-barename`
+    # could only prove its arc by hand-driving a bidirectional chardev outside the suite
+    # (PARITY.md §6.6a-closed, "the Pi's regression suite still cannot type").
+    #
+    # `UNAOS_K8_SCRIPT=<file>` arms it. The file is an inject script in `mbench.py`'s EXISTING
+    # grammar (SLEEP / WAIT <secs> <regex> / a bare line to type) so ONE script drives both QEMU
+    # here and the metal bridge via `mbench --inject`; `scripts/k8_type.py` is the typist.
+    #
+    # WHY THE CAPTURE PATH IS UNCHANGED: a socket chardev takes QEMU's own `logfile=`, so the
+    # guest's bytes still land in exactly `$logf` and mbench still replays exactly that file.
+    # Nothing downstream of the chardev knows the difference. Knob OFF, the qemu argv below is
+    # BYTE-FOR-BYTE the argv it has always been — the array is built once and expanded once.
+    #
+    # SECOND SPEC, not extra REQUIREs in the first one: the three typed witnesses cannot exist in
+    # a run that types nothing, so putting them in `pi4-regression.spec` would red the classic
+    # gate for behaving correctly. That is the same argument the `[dragperf]`/`[dragwedge]`
+    # knob-gated families make in that spec, and it reaches the same conclusion — the base spec's
+    # REQUIRED COUNT MUST NOT MOVE. Where those families had to settle for a FORBID (one spec,
+    # one battery), typed mode gets real REQUIREs by asserting a SECOND spec, additionally, only
+    # when the knob is armed. See scripts/specs/pi4-barename.spec.
+    local k8_script="${UNAOS_K8_SCRIPT:-}"
+    local k8_spec="${UNAOS_K8_SPEC:-${WORKSPACE_DIR}/scripts/specs/pi4-barename.spec}"
+    local type_port="" tpid=""
+    local -a SERIAL_ARGS
+    if [ -n "$k8_script" ]; then
+        if [ ! -f "$k8_script" ]; then
+            echo -e "${COLOR_RED}✖ kernel8-test: UNAOS_K8_SCRIPT=${k8_script} does not exist.${COLOR_RESET}"
+            return 2
+        fi
+        # Same check-then-bind caveat as the QMP port above, same narrowing measure; the liveness
+        # gate below is what actually turns a lost race into a bounded retry.
+        type_port="${UNAOS_K8_PORT:-4801}"
+        while lsof -iTCP:"$type_port" -sTCP:LISTEN >/dev/null 2>&1; do type_port=$((type_port + 1)); done
+        SERIAL_ARGS=(-chardev "socket,id=k8u0,host=127.0.0.1,port=${type_port},server=on,wait=off,logfile=${logf}" \
+                     -serial chardev:k8u0 -serial null -display none)
+        echo -e "${COLOR_CYAN}⚡ TYPED MODE armed — UART0 is a bidirectional socket on 127.0.0.1:${type_port}"
+        echo -e "  script: ${k8_script}    extra spec: ${k8_spec}${COLOR_RESET}"
+    else
+        SERIAL_ARGS=(-serial "file:${logf}" -serial null -display none)
+    fi
     # FLAKE-1 liveness gate: within UNAOS_K8T_LIVE_SECS (default 5) of launch, the QEMU pid must be
     # ALIVE and $logf must exist and be GROWING PAST 0 BYTES. A QEMU that lost the QMP bind (or died
     # on a bad arg) fails both within milliseconds. 2 retries, each on the next port up.
@@ -2943,11 +3691,20 @@ test_kernel8() {
         qemu-system-aarch64 \
             -machine raspi4b \
             -kernel "$KERNEL8_DIR/kernel8.img" \
-            -serial "file:${logf}" -serial null -display none \
+            "${SERIAL_ARGS[@]}" \
             ${SD_DRIVE} \
             -qmp tcp:127.0.0.1:${qmp_port},server,nowait \
             ${UNAOS_QEMU_EXTRA:-} &
         qpid=$!
+        # SUITETYPE: attach the typist IMMEDIATELY, before the liveness poll. A socket chardev
+        # whose peer never reads backs up, and the guest's console writes then block or drop —
+        # which would corrupt the very capture we are about to assert. k8_type retries the
+        # connect, so starting it ahead of QEMU's bind is fine and starting it late is not.
+        if [ -n "$k8_script" ]; then
+            python3 "${WORKSPACE_DIR}/scripts/k8_type.py" --port "$type_port" \
+                --script "$k8_script" --budget "$secs" &
+            tpid=$!
+        fi
         # Poll at 10 Hz so a healthy launch costs a fraction of a second, not the whole window.
         local ticks=$((live_secs * 10)) t=0
         while [ "$t" -lt "$ticks" ]; do
@@ -2959,7 +3716,15 @@ test_kernel8() {
         if [ "$launched" -eq 1 ]; then break; fi
         kill "$qpid" 2>/dev/null || true                       # reap the remnant before retrying
         wait "$qpid" 2>/dev/null || true
+        if [ -n "$tpid" ]; then kill "$tpid" 2>/dev/null || true; wait "$tpid" 2>/dev/null || true; tpid=""; fi
         if [ "$attempt" -lt "$max_tries" ]; then
+            # SUITETYPE: the typist's port moves with the retry for the same reason the QMP port does.
+            if [ -n "$k8_script" ]; then
+                type_port=$((type_port + 1))
+                while lsof -iTCP:"$type_port" -sTCP:LISTEN >/dev/null 2>&1; do type_port=$((type_port + 1)); done
+                SERIAL_ARGS=(-chardev "socket,id=k8u0,host=127.0.0.1,port=${type_port},server=on,wait=off,logfile=${logf}" \
+                             -serial chardev:k8u0 -serial null -display none)
+            fi
             echo -e "${COLOR_YELLOW}⚠ kernel8-test: QEMU launch flake (port ${qmp_port}) — retrying on $((qmp_port + 1))${COLOR_RESET}"
             qmp_port=$((qmp_port + 1))
             while lsof -iTCP:"$qmp_port" -sTCP:LISTEN >/dev/null 2>&1; do qmp_port=$((qmp_port + 1)); done
@@ -2972,11 +3737,13 @@ test_kernel8() {
         echo -e "  This run carries NO verdict: not a pass, not a regression, not a truncation. Exit 4."
         echo -e "  Usual cause is a lost QMP-port race against a concurrent worktree gate, or a bad"
         echo -e "  UNAOS_QEMU_EXTRA. Re-run when the host is quieter, or pin UNAOS_QMP_PORT to a free port.${COLOR_RESET}"
+        if [ -n "$tpid" ]; then kill "$tpid" 2>/dev/null || true; wait "$tpid" 2>/dev/null || true; fi
         return 4
     fi
     python3 "${WORKSPACE_DIR}/scripts/qmp_shoot.py" --port "$qmp_port" --wait "$((secs - 1))" --out "$png" 2>/dev/null || sleep "$secs"
     kill "$qpid" 2>/dev/null || true
     wait "$qpid" 2>/dev/null || true
+    if [ -n "$tpid" ]; then kill "$tpid" 2>/dev/null || true; wait "$tpid" 2>/dev/null || true; tpid=""; fi
     echo -e "${COLOR_GREEN}✅ Serial:${COLOR_RESET} ${logf}    ${COLOR_GREEN}Screen:${COLOR_RESET} ${png}"
 
     # MBENCH-HONEST: ASSERT the capture we just took, and make this command's EXIT STATUS say so.
@@ -3013,6 +3780,28 @@ test_kernel8() {
             echo -e "${COLOR_YELLOW}  The needed window scales with HOST LOAD: concurrent builds/QEMU gates slow the boot, so a"
             echo -e "  window that passed on a quiet host truncates on a busy one (bench precedent 2026-07-28: 150 s"
             echo -e "  TRUNCATED under load, 210 s clean). Try './arroyo kernel8-test 210', or re-run when quieter.${COLOR_RESET}"
+        fi
+        # SUITETYPE: the typed battery, asserted SECOND and ONLY when the knob is armed.
+        # Ordering is the honesty argument: the base spec owns the COMPLETE markers, so it is the
+        # one that can say TRUNCATED. A typed run whose boot never reached steady state has no
+        # business reporting "the bare name did not launch" — the typist had nothing to type at.
+        # So a non-PASS base verdict short-circuits and is returned unchanged; the typed spec is
+        # only ever consulted on a capture the base spec already called complete and clean.
+        if [ -n "$k8_script" ] && [ "$mrc" -eq 0 ]; then
+            if [ ! -f "$k8_spec" ]; then
+                echo -e "${COLOR_RED}✖ kernel8-test: typed mode armed but ${k8_spec} is missing — nothing gates the typing.${COLOR_RESET}"
+                return 2
+            fi
+            echo -e "${COLOR_CYAN}⚡ mbench: asserting the TYPED battery against ${k8_spec#${WORKSPACE_DIR}/}${COLOR_RESET}"
+            python3 "${WORKSPACE_DIR}/scripts/mbench.py" --replay "$logf" \
+                --spec "$k8_spec" --platform pi || mrc=$?
+            if [ "$mrc" -ne 0 ]; then
+                echo -e "${COLOR_RED}✖ kernel8-test: the base spec PASSED and the TYPED battery did not."
+                echo -e "  The boot is fine; what failed is an interactive path — or the typing itself never"
+                echo -e "  landed. Check the '→ k8_type: typing' lines above: no typing means the socket peer"
+                echo -e "  never attached (a harness fault), typing with no witness means a real regression"
+                echo -e "  in the path that word takes. Script: ${k8_script}${COLOR_RESET}"
+            fi
         fi
         return $mrc
     fi

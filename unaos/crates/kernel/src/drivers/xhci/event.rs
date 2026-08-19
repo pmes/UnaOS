@@ -140,6 +140,25 @@ impl EventRing {
         self.trbs as u64
     }
 
+    /// PIUSB-40 necropsy (BOTLATCH), TRUNK-LANDING SEAM. The necropsy photographs an 8-slot window
+    /// around the dequeue position, and it used to index `ring.trbs[i]` directly — legal while the
+    /// ring segment was an inline `[Trb; EVENT_RING_SIZE]` array, and impossible once the segment
+    /// became a private heap pointer (the DMA-window move). Rather than re-open the field, the read
+    /// the necropsy actually needs is exposed as its own accessor, with the SAME two operations
+    /// every other consumer here performs: invalidate the slot's line(s) so a non-coherent bus
+    /// yields DRAM rather than a stale CPU copy, then copy the whole `packed` TRB out volatile (a
+    /// reference to one of its fields would be unaligned — see `has_event`).
+    ///
+    /// Read-only and index-checked: `i` is taken modulo the ring size, so a caller's window
+    /// arithmetic can never address outside the segment. Consumes nothing and moves neither
+    /// `dequeue_index` nor `cycle_bit` — a photograph, not a pop.
+    pub fn peek_slot(&self, i: usize) -> Trb {
+        let i = i % EVENT_RING_SIZE;
+        let slot = unsafe { self.trbs.add(i) };
+        dma_coherency::clean_inval(slot as usize, core::mem::size_of::<Trb>());
+        unsafe { core::ptr::read_volatile(slot) }
+    }
+
     /// BOT-RESCUE M2: return the event ring to its post-`new()` state — every TRB zeroed AND the
     /// consumer position/colour reset to the xHCI initial expectation (index 0, expecting cycle 1).
     ///

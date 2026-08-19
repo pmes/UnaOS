@@ -137,7 +137,7 @@ impl Message {
 pub struct Facts {
     /// aarch64 build (the Pi / Orin verbs: `uls`, `top`, `pulse`, `vug`).
     pub aarch64: bool,
-    /// x86_64 build (bare-name program launch is x86-only today).
+    /// x86_64 build.
     pub x86: bool,
     /// aarch64 + the `v3d` feature (the `APPS:` line).
     pub v3d: bool,
@@ -151,6 +151,18 @@ pub struct Facts {
     /// never returns [`Plan::Exec`] and never probes the volume, so a build
     /// without a loader behaves exactly as it did before this crate existed.
     pub exec: bool,
+    /// The in-kernel demo verbs (`vug`, `pulse`) are compiled into this build.
+    ///
+    /// BARENAME (PARITY §6.6a): a KNOB, and it has to be one. Those two `match`
+    /// arms carry `feature = "vugdemo"`, **DEFAULT OFF** (DECRUD-1), while this
+    /// table advertised them on every aarch64 build. So on the image users
+    /// actually flash, `vug` was claimed as a verb, routed to a `match` with no
+    /// such arm, and answered "the verb exists; this kernel does not carry it".
+    /// Worse: verb-ness is absolute over bare-name launch, so that phantom verb
+    /// was ALSO what stood between the operator and `VUG.ELF` — turning on
+    /// [`Facts::exec`] alone would have changed nothing for the one word Peter
+    /// typed. A verb the build does not carry is not a verb.
+    pub vugdemo: bool,
 }
 
 impl Facts {
@@ -164,6 +176,7 @@ impl Facts {
             proc_verbs: false,
             proc_rows: 0,
             exec: false,
+            vugdemo: false,
         }
     }
 }
@@ -182,20 +195,29 @@ pub const CORE_VERBS: &[&str] = &["help", "echo", "ver", "version", "gneiss"];
 /// When a host verb exists.
 ///
 /// Verb-ness is **not** a global fact, and getting that wrong is the one way
-/// this refactor could have broken the shell: `vug` is a registered verb on
-/// aarch64 and is NOT one on x86, where the same word must fall through to
+/// this refactor could have broken the shell: `vug` is a registered verb only
+/// on a `vugdemo` build, and everywhere else the same word must fall through to
 /// bare-name launch and start `VUG.ELF`. A flat name list would have turned
 /// that launch into a refusal. So each host verb carries the condition under
 /// which the ring actually registers it, and those conditions mirror the
-/// `#[cfg]` on the kernel's match arms one for one.
+/// `#[cfg]` on the kernel's match arms one for one — **one for one is the whole
+/// contract**, and PARITY §6.6a is what it costs when a condition here is
+/// looser than the `#[cfg]` it stands for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Avail {
     /// Registered on every build.
     Always,
-    /// aarch64 only (the native unafs verbs, `vug`, `pulse`).
+    /// aarch64 only (the native unafs verbs).
     Aarch64,
     /// aarch64 + `v3d` (the GPU battery replay).
     V3d,
+    /// aarch64 + `vugdemo` (the in-kernel `vug` / `pulse` demos, DEFAULT OFF).
+    ///
+    /// BARENAME (PARITY §6.6a): these two were `Aarch64`, which over-claimed
+    /// them on every Pi build — see [`Facts::vugdemo`] for what that cost. The
+    /// arch half stays because the demos draw through `crate::vug`, which is
+    /// aarch64-only source; the knob half is the part that was missing.
+    VugDemo,
     /// The process verbs: aarch64-baremetal or x86.
     Proc,
 }
@@ -207,6 +229,7 @@ impl Avail {
             Avail::Always => true,
             Avail::Aarch64 => facts.aarch64,
             Avail::V3d => facts.v3d,
+            Avail::VugDemo => facts.aarch64 && facts.vugdemo,
             Avail::Proc => facts.proc_verbs,
         }
     }
@@ -246,7 +269,7 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     ("netinfo", Avail::Always), ("ping", Avail::Always), ("arp", Avail::Always),
     ("connect", Avail::Always), ("udpsend", Avail::Always), ("get", Avail::Always),
     // apps + scheduler + power + witnesses
-    ("vug", Avail::Aarch64), ("pulse", Avail::Aarch64), ("v3d", Avail::V3d),
+    ("vug", Avail::VugDemo), ("pulse", Avail::VugDemo), ("v3d", Avail::V3d),
     // hw-jetson (2026-08-18 sync): the Orin bench verbs — SCHED-BAL burst + the per-core
     // load animator. Registered here so MIDDEN-M1's single interpreter routes them as
     // Plan::Host instead of refusing them before the kernel's service arms can fire.
@@ -289,7 +312,8 @@ pub fn canon_verb(word: &str) -> String {
 /// a completion engine and a help renderer all ask this one function. A word
 /// that is a verb somewhere else but not here is honestly NOT a verb here, and
 /// is free to become a program name — which is exactly how `vug` starts
-/// `VUG.ELF` on x86 while staying the 3D sculptor verb on the Pi.
+/// `VUG.ELF` on the shipped build of either arch while staying the in-kernel 3D
+/// sculptor verb on a `vugdemo` one.
 ///
 /// Case-insensitive via [`canon_verb`]: `LS`, `Ls` and `lS` are all the verb
 /// `ls`.
@@ -516,19 +540,33 @@ pub fn help(facts: &Facts) -> String {
     }
     say!("CLOCK:    date, setdate YYYY-MM-DD HH:MM[:SS]  (seeds mtime stamps; unset = honest dashes)");
     say!("          time  (shared civil clock: ISO-8601 UTC + source; unsynced until SNTP/setdate)");
+    // BARENAME (PARITY §6.6a): `vug` and `pulse` are the in-kernel DEMOS, and they are verbs only
+    // on a `vugdemo` build. Off the knob — which is every image users flash — the same two words
+    // name the ring-3 programs `VUG.ELF` / `PULSE.ELF` and belong to the bare-name lines below, so
+    // advertising them here would be advertising a verb this build cannot dispatch: the exact rule
+    // the `Facts` doc opens with.
     if facts.aarch64 {
-        say!("SMP:      sched (per-CPU run queues), pulse (full-screen CPU monitor)");
+        if facts.vugdemo {
+            say!("SMP:      sched (per-CPU run queues), pulse (full-screen CPU monitor)");
+        } else {
+            say!("SMP:      sched (per-CPU run queues)");
+        }
         say!("          top  (per-core load: recent busy%, ctx-switches, last task)");
     } else {
         say!("SMP:      sched (per-CPU run queues)");
     }
-    if facts.v3d {
+    if facts.v3d && facts.vugdemo {
         say!("APPS:     vug (3D sculptor), v3d (replay the visible GPU graphics battery)");
+    } else if facts.v3d {
+        say!("APPS:     v3d (replay the visible GPU graphics battery)");
     }
     if facts.proc_verbs {
         say!("PROC:     run <path> (foreground), bg <path> (background), jobs (list+reap), kill <pid>");
     }
-    if facts.x86 {
+    // BARENAME (PARITY §6.6a): keyed off `exec`, the fact these two lines actually describe, not
+    // off `x86`, the arch that happened to be the only one carrying it. A help line that names a
+    // capability must be gated on the capability.
+    if facts.exec {
         say!("          <name.elf>  (just type it: vug.elf runs VUG.ELF in a window, prompt returns)");
         // BARE-NAME (M1): the elision is a resolution rule, so it is stated
         // where the launch rule is stated. `.elf` stays visible in `ls`.
@@ -633,19 +671,51 @@ mod tests {
 
     #[test]
     fn help_tracks_the_facts() {
-        let arm = Facts { aarch64: true, v3d: true, proc_verbs: true, proc_rows: 6, ..Facts::bare() };
+        // The SHIPPED Pi: v3d on, `vugdemo` off (DECRUD-1's default), bare-name launch on
+        // (PARITY §6.6a). `vug`/`pulse` must NOT be advertised as verbs — they are programs here —
+        // and the bare-name lines must be present, since aarch64 now carries the capability.
+        let arm = Facts {
+            aarch64: true, v3d: true, proc_verbs: true, proc_rows: 6, exec: true, ..Facts::bare()
+        };
         let h = help(&arm);
         assert!(h.contains("UNAFS:"));
-        assert!(h.contains("pulse (full-screen CPU monitor)"));
+        assert!(!h.contains("pulse (full-screen CPU monitor)"), "vugdemo-only verb advertised knob-off");
+        assert!(!h.contains("vug (3D sculptor)"), "vugdemo-only verb advertised knob-off");
+        assert!(h.contains("APPS:     v3d ("), "the v3d verb is real knob-off and must stay listed");
         assert!(h.contains("n>6 is refused"));
-        assert!(!h.contains("just type it"), "x86-only line leaked onto aarch64 help");
+        assert!(h.contains("the .elf is optional"), "bare-name help is gated on exec, not on x86");
+
+        // The same Pi with the demo knob ON: the two verbs exist, so they are advertised again.
+        let armdemo = Facts { vugdemo: true, ..arm };
+        let h = help(&armdemo);
+        assert!(h.contains("pulse (full-screen CPU monitor)"));
+        assert!(h.contains("APPS:     vug (3D sculptor), v3d ("));
 
         let x86 = Facts { x86: true, proc_verbs: true, proc_rows: 10, ..Facts::bare() };
         let h = help(&x86);
         assert!(!h.contains("UNAFS:"));
         assert!(h.contains("SMP:      sched (per-CPU run queues)"));
         assert!(h.contains("n>10 is refused"));
-        assert!(h.contains("the .elf is optional"));
+        assert!(!h.contains("just type it"), "bare-name help shown on a build with exec off");
+    }
+
+    /// BARENAME (PARITY §6.6a): the regression this arc exists to prevent — a verb that the build
+    /// does NOT carry standing between the operator and the program of the same name.
+    #[test]
+    fn vug_is_a_verb_only_on_a_vugdemo_build() {
+        let shipped = Facts { aarch64: true, proc_verbs: true, exec: true, ..Facts::bare() };
+        assert!(!is_verb("vug", &shipped));
+        assert!(!is_verb("pulse", &shipped));
+        assert_eq!(
+            plan("vug", &shipped, &mut vol()),
+            Plan::Exec { typed: "vug".to_string(), name: "VUG.ELF".to_string() }
+        );
+        let demo = Facts { vugdemo: true, ..shipped };
+        assert!(is_verb("vug", &demo));
+        assert!(matches!(plan("vug", &demo, &mut vol()), Plan::Host { .. }));
+        // The knob is not a licence to leak onto x86: `crate::vug` is aarch64 source.
+        let x86demo = Facts { x86: true, vugdemo: true, exec: true, ..Facts::bare() };
+        assert!(!is_verb("vug", &x86demo));
     }
 
     #[test]
@@ -713,9 +783,9 @@ mod tests {
 
     #[test]
     fn verb_ness_follows_the_build() {
-        let arm = Facts { aarch64: true, ..Facts::bare() };
+        let arm = Facts { aarch64: true, vugdemo: true, ..Facts::bare() };
         let x86 = Facts { x86: true, exec: true, ..Facts::bare() };
-        // `vug` is the 3D sculptor verb on the Pi ...
+        // `vug` is the 3D sculptor verb on a `vugdemo` Pi build ...
         assert!(is_verb("vug", &arm));
         assert!(matches!(plan("vug", &arm, &mut vol()), Plan::Host { .. }));
         // ... and on x86 it is not a verb at all, so it starts VUG.ELF. A flat
