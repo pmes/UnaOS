@@ -201,6 +201,11 @@ impl InstallTarget for BlockTarget {
                 // the match exhaustive and to make the refusal explicit rather than accidental.
                 #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
                 block::BlockHandle::Sdhc => Err(block::BlockError::NotReady),
+                // TEGRA-SDBLK: the same refusal, for the same reason — nothing constructs a
+                // `TegraSd` target (`from_parts` is only ever called with `Global`/`Usb`), and the
+                // Orin card's install flow is `sdmmc_tegra`'s own armed ladder, not this engine.
+                #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+                block::BlockHandle::TegraSd => Err(block::BlockError::NotReady),
             }
             .map_err(map_blk)?;
             if n < chunk.len() {
@@ -220,6 +225,11 @@ impl InstallTarget for BlockTarget {
                 // medium-destroying write is the last place to let an unreachable arm fall through.
                 #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
                 block::BlockHandle::Sdhc => Err(block::BlockError::NotReady),
+                // TEGRA-SDBLK: see `read_sectors`. The block layer refuses this write one layer
+                // down as well (`write_block_tegra_sd` never writes in any cfg); refusing here too
+                // keeps the unreachable arm explicit rather than accidental.
+                #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+                block::BlockHandle::TegraSd => Err(block::BlockError::NotReady),
             }
             .map_err(map_blk)?;
         }

@@ -595,6 +595,21 @@ pub enum BlockSource {
     /// SDHC-4b (x86, `sdhcblk` knob): the internal SD card, READ-ONLY. See the note above.
     #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
     Sdhc,
+    /// TEGRA-SDBLK (aarch64, `tegra` + `sdmmc`): the Orin devkit's microSD card, READ-ONLY.
+    ///
+    /// The aarch64 twin of `Sdhc`, and it exists for one reason: `BlockSource` is total over
+    /// `crate::drivers::block::BlockHandle`, and that enum gained `TegraSd`. The gate is the same
+    /// triple the block layer puts on the handle and on its four entry points, so on x86 and on the
+    /// Pi this variant does not exist and this file is byte-identical to its pre-variant self.
+    ///
+    /// Read-only is not a policy stated here, it is the block layer's: `write_block_tegra_sd` refuses
+    /// in every cfg (the card's only writer is the armed `sdmmc_arm` ladder in `sdmmc_tegra.rs`), so
+    /// the write arms below cannot reach the medium even if [`BlockSource::write_veto`] were wrong.
+    /// Nothing constructs this source today — `block::program_source` never returns the handle — so
+    /// it routes a mount that only `mount_source` could ask for; binding one is
+    /// `docs/dev/OS/10_INSTALL/orin-unafs-root.md` §3 item 4's job, behind its own knob.
+    #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+    TegraSd,
 }
 
 impl BlockSource {
@@ -607,6 +622,10 @@ impl BlockSource {
             BlockSource::Usb => "usb",
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             BlockSource::Sdhc => "sdhc",
+            // Spelled exactly as `mbr_census` spells the same handle, for the same one-vocabulary
+            // reason the `sdhc` arm above gives.
+            #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+            BlockSource::TegraSd => "tegra-sd",
         }
     }
 
@@ -665,9 +684,20 @@ impl BlockSource {
                 "the internal SD reader is mounted READ-ONLY \u{2014} only the reserved \
                  flight-recorder extent admits a write (SDHC-4c), and no file verb can name it",
             ),
+            // TEGRA-SDBLK: a flat NO, and unlike the `Sdhc` arm there is no reserved extent to carve
+            // an exception for — the block layer's `write_block_tegra_sd` refuses in EVERY cfg. This
+            // arm is a forward to that standing answer, not a second policy.
+            #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+            BlockSource::TegraSd => Some(TEGRA_SD_VETO),
         }
     }
 }
+
+/// TEGRA-SDBLK: the Orin microSD's standing write refusal, as [`BlockSource::write_veto`] reports it.
+#[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+const TEGRA_SD_VETO: &str = "the Orin microSD is mounted READ-ONLY \u{2014} the block layer refuses \
+                             every write to it, and the card's only writer is the armed sdmmc_arm \
+                             ladder in sdmmc_tegra.rs (TEGRA-SDBLK)";
 
 // FATVERB: the `Default` refusal names the guard that ACTUALLY refuses on this target, because
 // there are two of them and they refuse for different reasons. Naming the wrong one in an operator-
@@ -716,6 +746,8 @@ fn read_sector(source: BlockSource, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> Re
         BlockSource::Usb => crate::drivers::block::read_block_usb(lba, buf),
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockSource::Sdhc => crate::drivers::block::read_block_sdhc(lba, buf),
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        BlockSource::TegraSd => crate::drivers::block::read_block_tegra_sd(lba, buf),
     };
     match r {
         Ok(n) if n >= SECTOR_SIZE => Ok(()),
@@ -749,6 +781,11 @@ fn write_sector(source: BlockSource, lba: u64, buf: &[u8; SECTOR_SIZE]) -> Resul
         // guard above returned otherwise.
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockSource::Sdhc => crate::drivers::block::write_block_sdhc(lba, buf),
+        // TEGRA-SDBLK: `write_block_tegra_sd` IS the refusal (one-shot witness + `NotReady`), so this
+        // arm cannot write. It is a forward to that refusal rather than a local `Err`, so there is
+        // exactly one place in the tree that decides the Orin card's write answer.
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        BlockSource::TegraSd => crate::drivers::block::write_block_tegra_sd(lba, buf),
     };
     r.map_err(|e| match e {
         // WEDGE-8 (F3): see `read_sector` — Busy stays Busy so it can be retried, not mourned.
@@ -810,6 +847,8 @@ fn read_sectors(source: BlockSource, lba: u64, buf: &mut [u8]) -> Result<(), Fat
             BlockSource::Usb => crate::drivers::block::read_blocks_usb(at, chunk),
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             BlockSource::Sdhc => crate::drivers::block::read_blocks_sdhc(at, chunk),
+            #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+            BlockSource::TegraSd => crate::drivers::block::read_blocks_tegra_sd(at, chunk),
         };
         match r {
             Ok(n) if n == take => {}
@@ -857,6 +896,9 @@ fn write_sectors(source: BlockSource, lba: u64, buf: &[u8]) -> Result<(), FatErr
             // Reachable ONLY with the permit armed and this chunk inside the reserved extent.
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             BlockSource::Sdhc => crate::drivers::block::write_blocks_sdhc(at, chunk),
+            // TEGRA-SDBLK: refuses, as the single-sector twin does. See `write_sector`.
+            #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+            BlockSource::TegraSd => crate::drivers::block::write_blocks_tegra_sd(at, chunk),
         };
         r.map_err(|_| FatError::Io)?;
         off += take;
@@ -1499,6 +1541,11 @@ fn source_of(handle: crate::drivers::block::BlockHandle) -> BlockSource {
         crate::drivers::block::BlockHandle::Usb => BlockSource::Usb,
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         crate::drivers::block::BlockHandle::Sdhc => BlockSource::Sdhc,
+        // TEGRA-SDBLK: mapped for totality only, exactly as `Usb` is — `program_source` never
+        // returns this handle (the Orin's program volume is the global slot; see the block layer's
+        // TEGRA-SDBLK section on why the card is not a program-source rung).
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        crate::drivers::block::BlockHandle::TegraSd => BlockSource::TegraSd,
     }
 }
 
@@ -1512,6 +1559,8 @@ pub fn mount_source(source: BlockSource) -> Result<FatFs, FatError> {
         BlockSource::Usb => crate::drivers::block::usb_info(),
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockSource::Sdhc => crate::drivers::block::sdhc_info(),
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        BlockSource::TegraSd => crate::drivers::block::tegra_sd_info(),
     }
     .ok_or(FatError::NoDisk)?;
     if dev.block_size != SECTOR_SIZE as u32 {
@@ -1582,6 +1631,8 @@ fn handle_of(source: BlockSource) -> crate::drivers::block::BlockHandle {
         BlockSource::Usb => crate::drivers::block::BlockHandle::Usb,
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockSource::Sdhc => crate::drivers::block::BlockHandle::Sdhc,
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        BlockSource::TegraSd => crate::drivers::block::BlockHandle::TegraSd,
     }
 }
 
@@ -1664,6 +1715,8 @@ pub fn volume_serials(source: BlockSource) -> alloc::vec::Vec<u32> {
         BlockSource::Usb => crate::drivers::block::usb_info(),
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockSource::Sdhc => crate::drivers::block::sdhc_info(),
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        BlockSource::TegraSd => crate::drivers::block::tegra_sd_info(),
     };
     let Some(dev) = dev else { return out };
     if dev.block_size != SECTOR_SIZE as u32 {

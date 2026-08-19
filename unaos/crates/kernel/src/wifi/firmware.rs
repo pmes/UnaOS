@@ -706,5 +706,10 @@ fn source_of_handle(handle: crate::drivers::block::BlockHandle) -> fat::BlockSou
         crate::drivers::block::BlockHandle::Usb => fat::BlockSource::Usb,
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         crate::drivers::block::BlockHandle::Sdhc => fat::BlockSource::Sdhc,
+        // TEGRA-SDBLK: the fourth handle predicted above, arrived. Mapped only — neither
+        // `program_source` nor `alternate_program_source` returns it, so no firmware search ever
+        // reaches this arm; nothing else in this file changes.
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        crate::drivers::block::BlockHandle::TegraSd => fat::BlockSource::TegraSd,
     }
 }
