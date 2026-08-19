@@ -330,10 +330,30 @@ pub struct Task {
     /// non-zero — so the churn question survives past `STEAL_LOG_MAX`, on the rollup, rather than
     /// going quiet exactly when a long run would start to answer it.
     ///
-    /// Since GR27 it is also POLICY input: [`steal_cooldown_ms`] scales the re-steal cooldown by it,
-    /// and it deliberately NEVER resets — see the decay argument in the [`STEAL_COOLDOWN_MS`] doc
-    /// block for why the recency gate makes decay unnecessary and a wake-side reset actively harmful.
+    /// It is a LIFETIME TALLY and nothing else. From GR27 until SPREADSETTLE it was ALSO policy
+    /// input — [`steal_cooldown_ms`] scaled the re-steal window by it — and that dual role is the
+    /// defect SPREADSETTLE removes: a lifetime tally can only climb, so the window it drove could
+    /// only saturate, and every long-lived task ended up permanently parked at the terminal 256 ms.
+    /// Policy now reads [`Task::steal_esc`], which decays. This field keeps counting forever, for
+    /// the witness, exactly as it always did.
     migrations: u32,
+    /// SPREADSETTLE: this task's ESCALATION LEVEL for [`steal_cooldown_ms`] — `0..=STEAL_COOLDOWN_ESC_CAP`
+    /// — the policy half that [`Task::migrations`] used to carry and structurally could not.
+    ///
+    /// It goes UP by one on every migration and DOWN by one for each full cooldown window the task
+    /// has served sitting still ([`decayed_esc`]), so it measures the task's RECENT churn rather
+    /// than its lifetime history. That is the distinction the brake needs and a lifetime tally
+    /// cannot make: a task that ping-pongs is by definition re-stolen INSIDE its window, so it never
+    /// serves a window and never decays — while a task that has held one home for half a second has
+    /// by construction no ping-pong to damp, and must not be charged the terminal window for churn
+    /// it has stopped exhibiting.
+    ///
+    /// Same write discipline as `migrations`: thief-only, at step 3 of the steal, where the popped
+    /// Box is exclusively owned. CLAMPED to `STEAL_COOLDOWN_ESC_CAP` on write — that clamp is what
+    /// bounds [`decayed_esc`]'s walk to four iterations, and it costs nothing, because the ladder
+    /// saturates there anyway. The COOLDOWN TEST itself still reads this field raw and shifts once,
+    /// with no walk at all (see [`decayed_esc`] for why decay can never change the test's answer).
+    steal_esc: u32,
     /// VUGSPREAD-COOL: `arch::ms()` at this task's LAST migration (`0` = never migrated). The
     /// ping-pong brake for the RUNNING-victim floor reads it: a task stolen less than its
     /// escalating cooldown window ago ([`steal_cooldown_ms`], base [`STEAL_COOLDOWN_MS`], scaled by
@@ -483,6 +503,26 @@ struct SchedCpu {
     /// `Relaxed`. The initial 0 is not a real CR3, so a core's first dispatch always counts — one
     /// per core per boot, which is the truth.
     cr3_live: AtomicU64,
+    /// SPREADSETTLE: `arch::ms()` at the moment this core last found its run queue EMPTY, or `0`
+    /// while it is dispatching. The elapsed `ms() - idle_since_ms` is how long this core has been
+    /// CONTINUOUSLY out of work, and it is the discriminator [`try_steal`] uses to tell a thief that
+    /// is CORRECTING a real imbalance from a thief that is merely between quanta.
+    ///
+    /// The brake it gates is VUGSPREAD-COOL, whose whole premise is a TRANSIENTLY idle thief: a vug
+    /// blocks for a few hundred microseconds inside `SYS_WIN_PRESENT`, its neighbour goes briefly
+    /// empty, steals it, and the vug comes back to a home it no longer owns. A core that has been
+    /// empty for at least one BASE cooldown window is not that thief — it has out-waited the
+    /// shortest residency the brake will ever demand of anybody — and refusing it is exactly what
+    /// this file's own `[spread]` reading table calls "the ping-pong brake working as specified and
+    /// declining a move that would in fact have helped".
+    ///
+    /// Written only by the owning core in `run()` — set on the empty-queue arm, cleared on dispatch
+    /// — and read only by that same core inside [`try_steal`], so `Relaxed` is sufficient on both
+    /// sides and no cross-core ordering is implied or needed. `ms()` rather than `now_cycles()` for
+    /// the reason `Task::migrate_ms` gives: `rdtsc` is per-core, `APIC_TICKS` is globally coherent.
+    /// The stored value is forced to at least 1 so `0` stays an unambiguous "dispatching" sentinel
+    /// even for a core that goes idle before the first tick lands.
+    idle_since_ms: AtomicU64,
 }
 
 impl SchedCpu {
@@ -499,6 +539,7 @@ impl SchedCpu {
             park_deadline: AtomicU64::new(0),
             cr3_gen: AtomicU64::new(0),
             cr3_live: AtomicU64::new(0),
+            idle_since_ms: AtomicU64::new(0),
         }
     }
 }
@@ -1092,13 +1133,14 @@ struct LineBuf {
 /// | --- | --- |
 /// | `"[spread] pack=8 spare=8 rqp=["` | 29 |
 /// | 8 x `",1/<20 digits>/<20 digits>"` — comma, `1`, `/`, ready, `/`, pinned = 44 | 352 |
-/// | `"] steal=<20>/<20> m1=<20> mh=<20> remig=<20> cool=<20> packseen=<20> cr3sw=<20>"` | 206 |
+/// | `"] steal=<20>/<20> m1=<20> mh=<20> remig=<20> cool=<20> byp=<20> dcy=<20> packseen=<20> cr3sw=<20>"` | 256 |
 /// | `" decl=t:<20> e:<20> f:<20> p:<20> d:<20> i:<20>"` | 144 |
 /// | `" cores=8/NNN <CAPPED>"` | 21 |
-/// | **total** | **752** |
+/// | **total** | **802** |
 ///
-/// 768 would have left 16 bytes — thinner still (VUGSPREAD-COOL added `cool=<20>`), which is exactly
-/// why the cap sits at **1024**, leaving ~272 bytes of headroom.
+/// 768 would already have been 34 bytes SHORT of that — the bound this note said was "one field from
+/// binding" has since taken two more (SPREADSETTLE's `byp=` and `dcy=`, +50), which is exactly why
+/// the cap sits at **1024**. Headroom is now ~222 bytes, i.e. eight more `u64` fields.
 /// The cost is 256 more bytes of a 16 KiB kernel stack, on a witness path that allocates nothing and
 /// is never nested. [`LineBuf`] reports overflow on the wire regardless, so the bound is belt and
 /// braces either way — but a bound that is quietly one field from binding is not a bound.
@@ -1299,7 +1341,7 @@ pub fn emit_load_witness(tag: &str) {
 /// rides that instrument's existing rate limit and introduces no clock of its own:
 ///
 /// ```text
-/// [spread] pack=0 spare=3 rqp=[0/0/0,1/0/0,--,1/1/1,…] steal=4/812331 m1=3 mh=4 remig=0 packseen=12 cr3sw=91204 decl=t:0 e:812327 f:0 p:0 d:0 i:0
+/// [spread] pack=0 spare=3 rqp=[0/0/0,1/0/0,--,1/1/1,…] steal=4/812331 m1=3 mh=4 remig=0 cool=0 byp=0 dcy=0 packseen=12 cr3sw=91204 decl=t:0 e:812327 f:0 p:0 d:0 i:0
 /// ```
 ///
 /// `rqp` is one token per core, `running/ready/pinned`:
@@ -1321,6 +1363,14 @@ pub fn emit_load_witness(tag: &str) {
 /// high-rate companion to `pack` (see `PACK_SEEN`); `cr3sw` is what the moves COST (see
 /// `CR3_SWITCHES`); `decl` names every declined attempt (see `STEAL_D_*`).
 ///
+/// SPREADSETTLE adds `cool` / `byp` / `dcy`, and they are a THREE-TERM READING, never one at a time.
+/// `cool` counts re-steals the cooldown refused, `byp` counts the ones a sustained-idle thief
+/// overrode ([`STEAL_COOL_BYPASS`]), `dcy` counts escalation levels shed by tasks that sat still
+/// ([`STEAL_ESC_DECAYED`]). The boot-4 defect prints as `cool` climbing at thousands per second with
+/// `byp` and `dcy` structurally absent — a brake refusing the same corrective move forever, which
+/// `cool` alone cannot be distinguished from a brake earning its keep. The settle prints as all
+/// three going flat together after the launch transient.
+///
 /// **THE CONSERVATION LAW, and its tolerance (review F11).** `e + f + p + d + i + moves == passes`,
 /// with `t` outside `passes` because `STEAL_PASSES` is bumped after the thief exclusion. The terms
 /// are read at slightly different instants from a machine that keeps incrementing them, so a
@@ -1341,6 +1391,9 @@ pub fn emit_load_witness(tag: &str) {
 /// | `pack=0` but `packseen/passes` materially non-zero, rate unchanged | the packing is real and TRANSIENT — sub-census, forming and clearing inside a frame. Neither the floor nor the pin can hold a queue that is empty whenever it is looked at; this is a barrier/wake-latency story, not a placement one. |
 /// | `pack>=1`, `spare>=1`, packed core's `pinned` > 0 | **THE FIX FAILED**, and this is the row that says so — not, as an earlier draft had it, a vindication of the pin repair. Post-fix a ring-3 thread is steal-eligible, so a pinned task still sitting on a packed core is either a kernel task that legitimately named that core (check the `[schedx86] load` name) or a ring-3 path that does not go through `spawn_user_thread`. Find which before touching anything else. |
 /// | `pack>=1`, `spare>=1`, `pinned=0`, `decl i:` climbing | the idle-floor GUARD is what is holding the packing: every ready-holding core is going idle between the peek and the lock and re-raising its floor to 2. That is the ping-pong brake working as specified and declining a move that would in fact have helped. It is a tuning question, not a defect, and the change would be to let a depth-1 steal through when the thief has been idle for more than one pass. |
+/// | `pack>=1`, `spare>=1`, `pinned=0`, `decl p:` and `cool` climbing together, `byp=0` | the row above's sibling, one filter deeper and MEASURED on 2026-08-19 (boot-4): the victim cleared the floor, but every ready task on it was inside its cooldown window. SPREADSETTLE is the answer this row asked for, in the form the row prescribed — see [`STEAL_COOL_BYPASS_MS`]. Post-fix this row is UNREACHABLE with `byp=0`: a spare core that stays spare earns the bypass within 16 ms, so either `byp` climbs or the thief is not actually idle and the `spare` column is lying. |
+/// | `cool` climbing steadily with `dcy=0` and `remig/moves` at 1.00 | the escalation ladder is at EQUILIBRIUM — every task is re-stolen strictly inside its own window, so nothing ever serves a window and nothing decays. Not a decay failure; decay has nothing to act on. The term doing the work in this regime is `byp`, and if it is also flat the fleet is genuinely thrashing and the base window is the number to raise. |
+/// | `byp` climbing steadily rather than settling flat | **THE BYPASS BECAME THE PING-PONG.** 16 ms of continuous idleness is not separating a correcting thief from a `SYS_WIN_PRESENT` blip on this hardware. Raise [`STEAL_COOL_BYPASS_MS`]; do not remove the mechanism, which would restore the boot-4 refusal storm verbatim. |
 /// | `decl f:` climbing post-fix | narrower than it was: with the per-victim floor in force, `f` can only fire when EVERY ready-holding core is at `PRIO_IDLE` with depth 1. Same guard as the row above, observed one step earlier. It does NOT mean "the old floor hid it" — that diagnosis is unreachable now. |
 /// | `moves` climbing with `remig` beside it, or `cr3sw` delta outrunning the `steal=` delta | churn. See `scheduler.md` for the numeric revert criterion; "climbing" against a baseline of one move in four and a half million passes is not a threshold. |
 ///
@@ -1420,13 +1473,19 @@ fn emit_spread_witness(n: usize, seen: usize) {
     let (moves, passes) = steal_counters();
     let _ = write!(
         w,
-        "] steal={}/{} m1={} mh={} remig={} cool={} packseen={} cr3sw={}",
+        "] steal={}/{} m1={} mh={} remig={} cool={} byp={} dcy={} packseen={} cr3sw={}",
         moves,
         passes,
         STEAL_M_DEPTH1.load(Ordering::Relaxed),
         STEAL_M_HINT.load(Ordering::Relaxed),
         STEAL_REMIGS.load(Ordering::Relaxed),
         STEAL_COOL_SKIP.load(Ordering::Relaxed),
+        // SPREADSETTLE — the two new terms, and they are a PAIR with `cool` beside them. `byp`
+        // counts cooldown overrides that took a task the window refused; `dcy` counts escalation
+        // levels shed by tasks that sat still. `cool` alone could never say whether a refusal storm
+        // was the brake working or the brake stuck, because both print the same rising number.
+        STEAL_COOL_BYPASS.load(Ordering::Relaxed),
+        STEAL_ESC_DECAYED.load(Ordering::Relaxed),
         PACK_SEEN.load(Ordering::Relaxed),
         CR3_SWITCHES.load(Ordering::Relaxed),
     );
@@ -1703,12 +1762,23 @@ impl RunQueue {
     ///     the same rule for PLACEMENT; it has to be repeated here because a later migration is a
     ///     placement decision that `pick_cpu` never sees.
     ///   * VUGSPREAD-COOL — a task that migrated within its ESCALATING cooldown window
-    ///     ([`steal_cooldown_ms`]: `STEAL_COOLDOWN_MS << min(migrations, cap)`, 32…256 ms) is left
+    ///     ([`steal_cooldown_ms`]: `STEAL_COOLDOWN_MS << min(steal_esc, cap)`, 32…256 ms) is left
     ///     where it is, so it runs on its new home before another idle core yanks it back — longer
     ///     each time it is re-stolen, until the window outlasts the wake/block cadence and it settles.
     ///     This is the RUNNING-victim ping-pong brake; each skip bumps [`STEAL_COOL_SKIP`]. A task whose only
     ///     obstacle was the cooldown is passed over exactly like a pinned one, so an empty return still
     ///     reads as `p`/[`STEAL_D_PINNED`] at the pass level — see that counter's doc.
+    ///
+    /// SPREADSETTLE — and the THIRD filter, and only the third, has an override. `cool_bypass` says
+    /// the caller has established that this thief has been CONTINUOUSLY empty for at least
+    /// [`STEAL_COOL_BYPASS_MS`] against a victim that is running with ready work behind it, i.e.
+    /// that the cooldown here is declining a move that would in fact have helped rather than
+    /// refusing a ping-pong. Under it the window is not consulted and a cooling task is taken. The
+    /// first two filters are NEVER bypassed and the parameter cannot reach them: the pin contract
+    /// and the cooperative-ring-3/core-0 rule are correctness, not tuning. Each override that
+    /// actually took a task the window would have refused bumps [`STEAL_COOL_BYPASS`]; one that
+    /// happened to land on an already-eligible task bumps nothing, so `byp` counts overrides that
+    /// MATTERED and can be read straight against `cool`.
     ///
     /// `now_ms` is `arch::ms()`, read ONCE by the caller and threaded in: it is globally coherent
     /// (`APIC_TICKS`), so comparing it against each task's `migrate_ms` is a sound cross-core elapsed,
@@ -1716,7 +1786,7 @@ impl RunQueue {
     ///
     /// O(ready tasks) worst case, and off the switch hot path — only an idle core with an empty queue
     /// ever calls it.
-    fn steal_one(&mut self, thief_cpu: usize, now_ms: u64) -> Option<Box<Task>> {
+    fn steal_one(&mut self, thief_cpu: usize, now_ms: u64, cool_bypass: bool) -> Option<Box<Task>> {
         for level in self.levels.iter_mut() {
             let pos = level.iter().position(|t| {
                 if !t.steal_ok || (thief_cpu == 0 && t.is_cooperative_user()) {
@@ -1724,13 +1794,24 @@ impl RunQueue {
                 }
                 // VUGSPREAD-COOL — refuse a re-steal inside the cooldown window. `migrate_ms == 0`
                 // (never migrated) always clears it, so the first corrective steal is never delayed.
-                // The window ESCALATES with the task's own migration history (`steal_cooldown_ms`):
-                // Boot B proved a flat window only stretches the ping-pong's period; see the
-                // `STEAL_COOLDOWN_MS` doc block for the wire evidence and the escalation shape.
+                // The window ESCALATES with the task's own RECENT churn (`steal_cooldown_ms` over
+                // `Task::steal_esc`): Boot B proved a flat window only stretches the ping-pong's
+                // period and boot-4 proved an undecaying one saturates; see the `STEAL_COOLDOWN_MS`
+                // doc block for both readings and the shape that answers them.
+                //
+                // SPREADSETTLE — the test is EVALUATED even under `cool_bypass`, and then overridden.
+                // Evaluating it is what lets `byp` count the overrides that actually took a task the
+                // window would have refused, instead of every steal a long-idle thief happens to
+                // make; the branch is one shift and one compare on a path that already took a remote
+                // run-queue lock, so the honest number is free.
                 #[cfg(not(feature = "rtpi"))]
                 if t.migrate_ms != 0
-                    && now_ms.saturating_sub(t.migrate_ms) < steal_cooldown_ms(t.migrations)
+                    && now_ms.saturating_sub(t.migrate_ms) < steal_cooldown_ms(t.steal_esc)
                 {
+                    if cool_bypass {
+                        STEAL_COOL_BYPASS.fetch_add(1, Ordering::Relaxed);
+                        return true;
+                    }
                     STEAL_COOL_SKIP.fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
@@ -1744,9 +1825,13 @@ impl RunQueue {
                 // otherwise create. (Knob-off, the `not(rtpi)` branch above is vug-storm's exact code.)
                 #[cfg(feature = "rtpi")]
                 if t.migrate_ms != 0
-                    && now_ms.saturating_sub(t.migrate_ms) < steal_cooldown_ms(t.migrations)
+                    && now_ms.saturating_sub(t.migrate_ms) < steal_cooldown_ms(t.steal_esc)
                     && sched_prio(t.as_ref()) <= t.priority
                 {
+                    if cool_bypass {
+                        STEAL_COOL_BYPASS.fetch_add(1, Ordering::Relaxed);
+                        return true;
+                    }
                     STEAL_COOL_SKIP.fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
@@ -2120,6 +2205,7 @@ fn spawn_inner(
         kill: None,
         steal_ok,
         migrations: 0,
+        steal_esc: 0,
         migrate_ms: 0,
         hint_placed: false,
         #[cfg(feature = "rtpi")]
@@ -2348,6 +2434,7 @@ fn spawn_user_inner(
         kill,
         steal_ok,
         migrations: 0,
+        steal_esc: 0,
         migrate_ms: 0,
         hint_placed: false,
         #[cfg(feature = "rtpi")]
@@ -2599,6 +2686,7 @@ pub fn spawn_user_thread(
         kill: None,
         steal_ok,
         migrations: 0,
+        steal_esc: 0,
         migrate_ms: 0,
         // VUGSPREAD (review F16): this core came from ring 3's `place` argument. Attribution only.
         hint_placed: true,
@@ -2638,12 +2726,13 @@ pub fn spawn_user_thread(
 /// end: the CPU-pulse census reads c0 and c5 pegged, c3 and c4 at exactly `busy/idle=0/250`.
 ///
 /// "A sibling" was always a policy, not a constraint — the caller asked for "not my core", nothing
-/// more — so the choice among the eligible cores is free, and it now uses the SAME key chain
-/// [`pick_cpu`] uses: shallowest ready queue first (an exact instantaneous count), lowest rolling
-/// busy percent as the tie-break (a ~250 ms lagging window), then the rotating cursor so full ties
-/// fill round-robin rather than all landing on the lowest index. Sharing the cursor with `pick_cpu`
-/// is deliberate: a process and the threads it spawns are placed against one rotation, not two that
-/// can synchronise.
+/// more — so the choice among the eligible cores is free, and it uses the SAME key chain
+/// [`pick_cpu`] uses: lowest `max(ready-queue depth, in-flight placement credit)` first, lowest
+/// rolling busy percent as the tie-break (a ~250 ms lagging window), then the rotating cursor —
+/// taken modulo the ELIGIBLE set since SPREADSETTLE — so full ties fill round-robin rather than
+/// collapsing onto whichever core follows an excluded one. Sharing the cursor AND the credit with
+/// `pick_cpu` is deliberate: a process and the threads it spawns are placed against one rotation and
+/// one accounting, not two that can synchronise or each believe the other's core is free.
 ///
 /// The ELIGIBILITY probe is unchanged on purpose — still `scheduler_rsp != 0`, still the WINX-2
 /// `bg_place_cpu` lesson (a thread placed on a core that never dispatches is spawned, never run, and
@@ -2668,11 +2757,21 @@ pub fn spawn_user_thread(
 pub fn sibling_online_cpu(caller: usize) -> usize {
     let service = crate::arch::smp::service_cpu();
     let rot = AUTO_ROTATE.fetch_add(1, Ordering::Relaxed);
-    let mut best: Option<(usize, usize, u32)> = None; // (cpu, depth, pct)
+    // SPREADSETTLE: the same two repairs `pick_cpu` takes, and they belong here for a stronger
+    // reason than symmetry — this is the function a MULTI-THREADED vug spawns through, so it is the
+    // one that sees bursts by construction. The key chain is now
+    // `max(queue depth, in-flight credit)`, then the lagging percent, then a cursor rotated over the
+    // ELIGIBLE set rather than over `MAX_CPUS`. See [`PLACE_BURST`] and [`AUTO_ROTATE`] for the
+    // boot-4 reading behind each: during a 47 ms six-spawn burst the depth reads 0 on every core
+    // (the placed task is already running) and the ~250 ms percent has not moved, so both measured
+    // keys tie and the tie-break decided all six placements by itself.
+    let now_ms = crate::arch::ms();
+    let mut best: Option<(usize, usize, u32)> = None; // (cpu, load, pct)
     x86_64::instructions::interrupts::without_interrupts(|| {
         for tier in 0..2u8 {
-            for i in 0..MAX_CPUS {
-                let c = (rot + i) % MAX_CPUS;
+            let mut elig = [(0usize, 0usize, 0u32); MAX_CPUS]; // (cpu, load, pct)
+            let mut n = 0usize;
+            for c in 0..MAX_CPUS {
                 if c == caller || SCHED[c].scheduler_rsp.load(Ordering::Acquire) == 0 {
                     continue;
                 }
@@ -2683,20 +2782,36 @@ pub fn sibling_online_cpu(caller: usize) -> usize {
                 // Cross-core read: `busy_pct`'s own contract says pass 0 for `live` here, because
                 // `live_span_cyc` would subtract another core's `rdtsc` anchor from ours.
                 let pct = ACCT[c].busy_pct(0);
+                elig[n] = (c, depth.max(place_credit(c, now_ms) as usize), pct);
+                n += 1;
+            }
+            if n == 0 {
+                continue;
+            }
+            for j in 0..n {
+                let (c, load, pct) = elig[(rot + j) % n];
                 let better = match best {
                     None => true,
-                    Some((_, bd, bp)) => depth < bd || (depth == bd && pct < bp),
+                    Some((_, bl, bp)) => load < bl || (load == bl && pct < bp),
                 };
                 if better {
-                    best = Some((c, depth, pct));
+                    best = Some((c, load, pct));
                 }
             }
-            if best.is_some() {
-                return;
-            }
+            return;
         }
     });
-    best.map_or(caller, |(c, _, _)| c)
+    // The ELIGIBILITY probe is unchanged, and so is the fallback: with nothing eligible at either
+    // tier the caller's own core is returned, which is definitionally dispatching. Charge the credit
+    // only when a real sibling was chosen — charging the fallback would penalise a core for a
+    // placement that was never a placement decision.
+    match best {
+        Some((c, _, _)) => {
+            place_charge(c, now_ms);
+            c
+        }
+        None => caller,
+    }
 }
 
 /// Turn scheduling on (idempotent): release the APs from their post-online wait loop into `run()`
@@ -2904,11 +3019,79 @@ pub const CPU_AUTO: usize = usize::MAX;
 /// must pass through), so it is true strictly before that core can pop its first task.
 static ONLINE_MASK: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 
-/// SMPBAL-X86: rotating start index for `pick_cpu`'s scan, so fully-tied cores fill round-robin
-/// instead of every tie landing on the lowest index. Introspection-grade ordering (`Relaxed`) — a
-/// racing read at worst re-uses a start position, which costs nothing but a tie broken the same way
-/// twice.
+/// SMPBAL-X86: rotating cursor for `pick_cpu`'s and `sibling_online_cpu`'s tie-break, so fully-tied
+/// cores fill round-robin instead of every tie landing on the lowest index. Introspection-grade
+/// ordering (`Relaxed`) — a racing read at worst re-uses a position, which costs nothing but a tie
+/// broken the same way twice.
+///
+/// SPREADSETTLE: it is now applied MODULO THE ELIGIBLE SET, not modulo `MAX_CPUS`. It used to pick
+/// the scan's start index and let the first eligible core encountered win, which quietly collapsed
+/// the rotation onto whichever core followed an ineligible one: with the service core excluded on
+/// tier 0, two of eight cursor values land on the same winner, and with a cooperative-ring-3 spawn
+/// excluding core 0 as well, three of eight do. The cursor promised round-robin and delivered a
+/// weighted draw. Rotating over the eligible set restores what the name says.
 static AUTO_ROTATE: AtomicUsize = AtomicUsize::new(0);
+
+/// SPREADSETTLE: window over which a placement still counts toward [`place_credit`]. Pinned to
+/// [`LOAD_WINDOW_MS`] on purpose, and that identity is the whole argument: the credit exists to
+/// cover exactly the interval in which `busy_pct` is structurally blind to a task it just handed a
+/// core, so the two must be the same number and must move together if either is ever re-tuned.
+///
+/// TUNING NOTE (trunk sync): bench-priced against the 8-core rMBP; to be re-priced against the pi
+/// track's spreadtune baseline at the next merge to `main`.
+const PLACE_BURST_MS: u64 = LOAD_WINDOW_MS;
+
+/// SPREADSETTLE: how many `CPU_AUTO` placements each core has been handed inside the current burst,
+/// and when its last one landed. Together they are the term that makes a spawn BURST self-aware.
+///
+/// The boot-4 defect this repairs: `pick_cpu`'s key chain is (queue depth, rolling busy percent),
+/// and during a six-vug launch spanning 47 ms BOTH terms are blind. Depth is blind because a placed
+/// task is popped and running before the next spawn reads the queue, so the core reads 0 again; the
+/// percent is blind because it is a ~250 ms lagging window and 47 ms of new work barely moves it.
+/// With both keys reading the same on every core, one core won all six draws and four vugs landed on
+/// it (the `SCHEDPLACE-X86` lines in that capture, every one printing `load=0%`).
+///
+/// The credit is the one number that is neither instantaneous nor lagging: it is what THIS FUNCTION
+/// has already decided, which no measurement of the machine can report yet. It is combined as
+/// `depth.max(credit)` rather than `depth + credit` so a task that IS still queued is never counted
+/// twice — the core's load is at least what it holds and at least what it has been handed, and those
+/// are the same task when both are true.
+///
+/// Relaxed throughout, and deliberately not made atomic as a pair: two spawns racing at the exact
+/// same instant can both read the pre-increment credit and both place on the same core, which is a
+/// tie broken twice — the pre-existing worst case of the cursor, not a new failure. The burst
+/// self-clears (a placement more than `PLACE_BURST_MS` after the last one restarts the count at 1),
+/// so no state survives a launch and nothing needs to be reset at teardown.
+static PLACE_BURST: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+static PLACE_LAST_MS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// SPREADSETTLE: in-flight placement credit for `cpu` — placements it has been handed within
+/// [`PLACE_BURST_MS`], or 0 once the burst has aged out. See [`PLACE_BURST`].
+#[inline]
+fn place_credit(cpu: usize, now_ms: u64) -> u32 {
+    let last = PLACE_LAST_MS[cpu].load(Ordering::Relaxed);
+    if last != 0 && now_ms.saturating_sub(last) < PLACE_BURST_MS {
+        PLACE_BURST[cpu].load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
+/// SPREADSETTLE: record that a `CPU_AUTO` placement chose `cpu`, extending its burst or starting a
+/// new one. Called from `pick_cpu` and `sibling_online_cpu` AFTER the winner is known — both share
+/// the same credit, for the same reason they share the cursor: a process and the threads it spawns
+/// must be placed against one accounting, not two that can each think the other's core is free.
+#[inline]
+fn place_charge(cpu: usize, now_ms: u64) {
+    let last = PLACE_LAST_MS[cpu].load(Ordering::Relaxed);
+    let n = if last != 0 && now_ms.saturating_sub(last) < PLACE_BURST_MS {
+        PLACE_BURST[cpu].load(Ordering::Relaxed).saturating_add(1)
+    } else {
+        1
+    };
+    PLACE_BURST[cpu].store(n, Ordering::Relaxed);
+    PLACE_LAST_MS[cpu].store(now_ms.max(1), Ordering::Relaxed);
+}
 
 /// SMPBAL-X86: register `cpu` as dispatching. Called from `run()` before its first pop.
 fn mark_online(cpu: usize) {
@@ -2957,11 +3140,22 @@ static PLACE_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
 /// Rule 2 RELAXES in tiers (service excluded, then nothing) so a machine with too few dispatching
 /// cores still places somewhere real instead of failing; rule 1 never relaxes.
 ///
-/// Key chain, best first: (1) shallowest ready queue, (2) lowest rolling busy percent from the
-/// SCHEDLOAD-X86 feed (an UNTRACKED core scores 0 — it has folded no span, and a core that just
-/// entered `run()` genuinely has no load), (3) the rotating cursor. Depth leads because it is an
-/// exact instantaneous count while the percent is a ~250 ms lagging window; the percent breaks ties
-/// between equally-shallow queues, which is the common case on an idle desktop.
+/// Key chain, best first: (1) the core's LOAD — `max(ready-queue depth, in-flight placement
+/// credit)`, (2) lowest rolling busy percent from the SCHEDLOAD-X86 feed (an UNTRACKED core scores
+/// 0 — it has folded no span, and a core that just entered `run()` genuinely has no load), (3) the
+/// rotating cursor, modulo the eligible set. Load leads because depth is an exact instantaneous
+/// count while the percent is a ~250 ms lagging window; the percent breaks ties between equally-
+/// loaded cores, which is the common case on an idle desktop.
+///
+/// SPREADSETTLE widened key 1 from the raw depth to that `max`, and the reason is that on an IDLE
+/// machine keys 1 and 2 go blind AT THE SAME TIME and for opposite reasons. During the boot-4
+/// six-vug launch — six `CPU_AUTO` spawns inside 47 ms — each placed task was popped and running
+/// before the next spawn read the queue, so depth read 0 on every core; and 47 ms of new work does
+/// not move a 250 ms window, so the percent read 0 too. Every core scored identically, the whole
+/// decision fell to key 3, and key 3's rotation was itself collapsing onto one core (see
+/// [`AUTO_ROTATE`]) — four of six vugs landed together. The credit ([`PLACE_BURST`]) is the term
+/// that is neither instantaneous nor lagging: it is what this function has already decided and no
+/// measurement of the machine can report yet.
 ///
 /// LOCKING. `run_queue_len` takes a run-queue lock with no IRQ masking of its own, and this runs from
 /// the spawn paths at IF possibly 1 — the WEDGE-4 `<W1>` shape. The whole scan is therefore taken
@@ -2977,13 +3171,28 @@ fn pick_cpu(requested: usize, cooperative_user: bool, name: &'static str) -> usi
     let service = crate::arch::smp::service_cpu();
     let rot = AUTO_ROTATE.fetch_add(1, Ordering::Relaxed);
 
+    // SPREADSETTLE: read the clock ONCE, outside the masked section, and thread it through both the
+    // credit reads and the charge, so every core in this decision is judged against one instant.
+    let now_ms = crate::arch::ms();
+
     // Tier ladder: exclude {service}, then nothing. Rule 1 (core 0 for a cooperative ring-3 task) is
     // outside the ladder — it never relaxes. The render core has NO rung: no-reservation ruling.
-    let mut best: Option<(usize, usize, u32)> = None; // (cpu, depth, pct)
+    let mut best: Option<(usize, usize, u32)> = None; // (cpu, load, pct)
     x86_64::instructions::interrupts::without_interrupts(|| {
         for tier in 0..2u8 {
-            for i in 0..MAX_CPUS {
-                let c = (rot + i) % MAX_CPUS;
+            // SPREADSETTLE — GATHER, then CHOOSE. The scan used to start at `rot` and let the first
+            // eligible core encountered win a tie, which makes the cursor's rotation modulo
+            // `MAX_CPUS` while the choice is over the ELIGIBLE cores; every cursor value that lands
+            // on an excluded core hands its turn to the same successor. Collecting the eligible set
+            // first makes the rotation modulo `n`, which is what round-robin means and what the
+            // cursor was always documented to provide.
+            //
+            // The array is `MAX_CPUS` (8) triples on the stack of a function that already runs a
+            // masked scan of `MAX_CPUS` run-queue locks; no allocation, and the lock discipline is
+            // unchanged — still one at a time, taken across `len()` and released, never nested.
+            let mut elig = [(0usize, 0usize, 0u32); MAX_CPUS]; // (cpu, load, pct)
+            let mut n = 0usize;
+            for c in 0..MAX_CPUS {
                 if !cpu_dispatching(c) {
                     continue;
                 }
@@ -2999,21 +3208,31 @@ fn pick_cpu(requested: usize, cooperative_user: bool, name: &'static str) -> usi
                 // that has never folded a span scores 0, which is the truth for a core that just
                 // entered `run()`.
                 let pct = ACCT[c].busy_pct(0);
+                // SPREADSETTLE — the primary key is no longer the queue depth alone but the depth
+                // OR the in-flight placement credit, whichever is larger: what this core holds, or
+                // what this function has already handed it and no instrument can see yet. See
+                // `PLACE_BURST` for the boot-4 reading that made both measured keys blind at once.
+                elig[n] = (c, depth.max(place_credit(c, now_ms) as usize), pct);
+                n += 1;
+            }
+            if n == 0 {
+                continue; // nothing eligible at this tier — relax and try the next
+            }
+            for j in 0..n {
+                let (c, load, pct) = elig[(rot + j) % n];
                 let better = match best {
                     None => true,
-                    Some((_, bd, bp)) => depth < bd || (depth == bd && pct < bp),
+                    Some((_, bl, bp)) => load < bl || (load == bl && pct < bp),
                 };
                 if better {
-                    best = Some((c, depth, pct));
+                    best = Some((c, load, pct));
                 }
             }
-            if best.is_some() {
-                return;
-            }
+            return;
         }
     });
 
-    let Some((cpu, depth, pct)) = best else {
+    let Some((cpu, load, pct)) = best else {
         // Nothing is dispatching yet (pre-`enable()` spawn). Fall back to the caller's core, which is
         // the pre-arc behaviour and definitionally reachable — the caller is executing on it.
         // Review C1: the fallback must not silently relax rule 1 (cooperative ring-3 on the clock
@@ -3025,12 +3244,23 @@ fn pick_cpu(requested: usize, cooperative_user: bool, name: &'static str) -> usi
         );
         return here;
     };
+    // SPREADSETTLE — charge the winner BEFORE the witness prints, so the credit the NEXT spawn in a
+    // burst reads already includes this decision even if the log has gone quiet past `PLACE_LOG_MAX`.
+    place_charge(cpu, now_ms);
     if PLACE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < PLACE_LOG_MAX {
+        // The field that used to read `q=` is now `ld=`, and the rename is the honest one: the
+        // primary key is `max(queue depth, in-flight credit)`, so a line still labelled `q=` would
+        // print a queue depth the queue does not have. `cred=` is the winning core's credit AS THE
+        // DECISION SAW IT (before the charge above), on the wire because it is the only key a reader
+        // cannot reconstruct from the machine — `ld=` and `load=` are observable, the in-flight count
+        // is not. A burst that distributes reads as distinct cores with `cred=` stepping up; the
+        // boot-4 defect reads as `ld=0 cred=0 load=0%` repeated onto one core.
         serial_println!(
-            ":: SCHEDPLACE-X86: '{}' -> c{} (q={} load={}% from c{}) ::",
+            ":: SCHEDPLACE-X86: '{}' -> c{} (ld={} cred={} load={}% from c{}) ::",
             name,
             cpu,
-            depth,
+            load,
+            place_credit(cpu, now_ms).saturating_sub(1),
             pct,
             here
         );
@@ -5253,21 +5483,52 @@ static STEAL_REMIGS: AtomicU64 = AtomicU64::new(0);
 // the seventh, endlessly.
 //
 // The brake therefore ESCALATES PER TASK: the window is
-// `STEAL_COOLDOWN_MS << min(Task::migrations, STEAL_COOLDOWN_ESC_CAP)` — 32, 64, 128, 256, 256… ms
+// `STEAL_COOLDOWN_MS << min(Task::steal_esc, STEAL_COOLDOWN_ESC_CAP)` — 32, 64, 128, 256, 256… ms
 // for the 1st, 2nd, 3rd, 4th, 5th+ re-steal ([`steal_cooldown_ms`]). A task that keeps getting
 // re-stolen earns an exponentially longer residency on each new home until, at 256 ms (~256 quanta),
 // the wake/block cadence that drives the ping-pong can no longer outrun the window and the task
 // simply stays. The FIRST steal is still free (`migrate_ms == 0` clears the test before the window
 // is even computed), so genuine spreading is untouched, exactly as before.
 //
-// `Task::migrations` is deliberately NEVER reset (the decay question, decided): the gate is
-// RECENCY-based — `migrate_ms` older than the capped 256 ms window clears it no matter how large the
-// count — so a long-settled task is always immediately stealable and history alone can never strand
-// a task on a bad core; a genuine topology change (a vug CLOSE freeing a core) sees every settled
-// survivor as stealable on the first pass. Resetting the count on the wake-side push would be
-// actively harmful: the ping-pong cycle IS block → wake → push → re-steal, so every re-steal the
-// escalation exists to refuse is preceded by exactly such a push, and a reset there would zero the
-// history each time around the loop — reproducing the flat window with extra steps.
+// ── SPREADSETTLE (2026-08-19 boot-4 capture): THE ESCALATION SATURATED AND NEVER LET GO ──────────
+//
+// The paragraph that used to stand here decided the decay question the other way — "`migrations` is
+// deliberately NEVER reset, because the gate is RECENCY-based and `migrate_ms` older than the capped
+// 256 ms window clears it no matter how large the count". That argument is sound about STRANDING and
+// wrong about COST, and boot-4 measured the difference. Because `migrations` is a LIFETIME tally
+// that only climbs, every task that survives four re-steals is parked at the terminal window
+// FOREVER, so the corrector must re-pay a quarter-second refusal storm for every single move it
+// makes. Measured over 350 s: `remig/moves = 100 %`, `cool` climbing 6 600–11 500/s, `pack >= 1`
+// WITH `spare >= 1` in every sample, and ~184 k whole-TLB flushes per 5 s bought with it. The
+// window did not terminate the cycle; it set the cycle's period, and then had no gear left.
+//
+// TWO changes, and they answer two different halves of that.
+//
+//   1. THE LADDER DECAYS. Policy moves off `Task::migrations` (which keeps counting, for the
+//      witness) and onto `Task::steal_esc`, which goes up one per migration and DOWN one per full
+//      cooldown window served sitting still ([`decayed_esc`]). This is not a retreat from the
+//      never-reset argument — it is the same argument applied to the right quantity. What must not
+//      be erased is evidence of RECENT churn, and a task that ping-pongs is by construction
+//      re-stolen INSIDE its window, so it serves no window and decays not at all. What is erased is
+//      history a task has demonstrably stopped exhibiting: half a second sitting still walks a
+//      level-4 task back to level 0. The old wake-side-reset objection still holds and is still
+//      honoured — block → wake → push is not a served window and decays nothing, because decay is
+//      keyed on `migrate_ms` residency, not on queue events.
+//
+//   2. A SUSTAINED-IDLE THIEF IS NOT A PING-PONG THIEF. Decay alone cannot collapse `cool`: in a
+//      limit cycle whose period IS the window, one level decayed and one level earned cancel, and
+//      the ladder sits at its equilibrium — which is the correct behaviour for the ladder and the
+//      wrong outcome for the machine, because the refusals in between are the 11 500/s. The term
+//      that ends them is the one this file's own `[spread]` reading table already prescribed:
+//      "let a depth-1 steal through when the thief has been idle for more than one pass". A thief
+//      that has been CONTINUOUSLY empty for at least `STEAL_COOL_BYPASS_MS` bypasses the cooldown
+//      against a victim that is genuinely packed (running, with ready work behind it). The brake's
+//      premise is a thief that went idle for a few hundred microseconds while a vug sat in
+//      `SYS_WIN_PRESENT`; a core that has held nothing for a whole base window is not that thief,
+//      and the imbalance it is looking at is real. See [`SchedCpu::idle_since_ms`] and
+//      [`STEAL_COOL_BYPASS_MS`]. Rate-bounded by construction: a bypass steal makes the thief
+//      non-idle, so it must re-earn the whole window before it may bypass again — at most one
+//      cooldown-overriding move per idle core per 16 ms, against the ~540/s boot-4 measured.
 //
 // The base stays bench-tuned to a handful of scheduling quanta (the calibrated tick is 1 kHz): long
 // enough to break the ~0.5 ms re-steal cadence Boot C measured, short enough that a one-time
@@ -5281,20 +5542,94 @@ const STEAL_COOLDOWN_MS: u64 = 16;
 /// the ping-pong (~0.5–16 ms), so escalation terminates the cycle rather than stretching it.
 const STEAL_COOLDOWN_ESC_CAP: u32 = 4;
 
-/// VUGSPREAD-COOL: the per-task ESCALATING cooldown window — how long a task with `migrations` past
-/// moves must sit on its current home before `steal_one` may take it again. See the doc block on
-/// [`STEAL_COOLDOWN_MS`] for the Boot B evidence that a flat window merely stretches the ping-pong,
-/// and for why `migrations` never decays (the recency gate bounds the whole mechanism at 256 ms).
+/// SPREADSETTLE: how long a thief core must have been CONTINUOUSLY empty before it may take a task
+/// that is still inside its cooldown window. One BASE window — the shortest residency the brake ever
+/// demands of any task — so the threshold is not a new number, it is the existing one read from the
+/// thief's side. A core that has out-waited the smallest promise the brake makes is definitionally
+/// not the sub-millisecond `SYS_WIN_PRESENT` blip the brake was built to refuse.
+///
+/// TUNING NOTE (trunk sync): this and [`STEAL_COOLDOWN_MS`] are bench-priced against the 8-core rMBP.
+/// The pi track's spreadtune leg carries its own numbers; both are to be re-priced together at the
+/// next merge to `main` rather than assumed portable.
+const STEAL_COOL_BYPASS_MS: u64 = STEAL_COOLDOWN_MS;
+
+/// VUGSPREAD-COOL: the per-task ESCALATING cooldown window — how long a task at escalation level
+/// `esc` ([`Task::steal_esc`]) must sit on its current home before `steal_one` may take it again.
+/// See the doc block on [`STEAL_COOLDOWN_MS`] for the Boot B evidence that a flat window merely
+/// stretches the ping-pong, and for the SPREADSETTLE evidence that an undecaying one merely
+/// saturates.
 #[inline]
-fn steal_cooldown_ms(migrations: u32) -> u64 {
-    STEAL_COOLDOWN_MS << migrations.min(STEAL_COOLDOWN_ESC_CAP)
+fn steal_cooldown_ms(esc: u32) -> u64 {
+    STEAL_COOLDOWN_MS << esc.min(STEAL_COOLDOWN_ESC_CAP)
 }
+
+/// SPREADSETTLE: the escalation level a task at `esc` has DECAYED to after sitting still on one home
+/// for `resident_ms` — one level shed per full window served, walking the ladder down and consuming
+/// the residency as it goes (256 ms buys the step off level 4, a further 128 ms the step off 3, …).
+/// A level-4 task is back at 0 after 496 ms of stillness, and back at 4 after four fresh re-steals.
+///
+/// Read this as "how much of the escalation has this task PAID OFF", not as a timer: the ladder is
+/// the same ladder in both directions, so the level a task holds always means the same thing —
+/// roughly, the cadence at which it has recently been moved.
+///
+/// TWO properties worth stating because both are load-bearing.
+///
+/// It CANNOT change the cooldown test's answer, which is why the test does not call it. The walk's
+/// first step requires `resident_ms >= steal_cooldown_ms(esc)` — the exact negation of the test — so
+/// a task the test finds COOLING has decayed nothing by definition, and a task that has decayed at
+/// all was already stealable. Decay is therefore purely an input to the NEXT window this task earns,
+/// evaluated once, on the steal path, where the thief already owns the Box.
+///
+/// It TERMINATES in at most `STEAL_COOLDOWN_ESC_CAP` iterations, because `Task::steal_esc` is
+/// clamped to the cap on write and every iteration sheds exactly one level. That bound is why this
+/// walk is affordable at all — the same computation over the unclamped lifetime `migrations` tally
+/// would have been O(resident_ms / 16), thousands of iterations on a long-lived task.
+#[inline]
+fn decayed_esc(esc: u32, resident_ms: u64) -> u32 {
+    let mut lvl = esc.min(STEAL_COOLDOWN_ESC_CAP);
+    let mut left = resident_ms;
+    while lvl > 0 {
+        let w = steal_cooldown_ms(lvl);
+        if left < w {
+            break;
+        }
+        left -= w;
+        lvl -= 1;
+    }
+    lvl
+}
+
+/// SPREADSETTLE: escalation LEVELS shed by [`decayed_esc`] across all migrations, machine-wide
+/// (`dcy=` on `[spread]`). The falsifier for the decay half: a capture whose `dcy` stays at 0 while
+/// `remig` climbs is a fleet whose tasks are re-stolen strictly inside their windows — the ladder is
+/// at equilibrium and the decay is doing nothing, so any improvement measured came from the bypass
+/// alone. `dcy` climbing with `remig` flat is the settle this arc is for.
+static STEAL_ESC_DECAYED: AtomicU64 = AtomicU64::new(0);
+
+/// SPREADSETTLE: steals that took a task INSIDE its cooldown window because the thief had been
+/// continuously idle for at least [`STEAL_COOL_BYPASS_MS`] and the victim was genuinely packed
+/// (`byp=` on `[spread]`). Counts moves, not attempts.
+///
+/// Judge it against `cool=`, not on its own. The intended reading post-fix is `byp` small and
+/// FLAT after the settle transient with `cool` flat beside it — the bypass fired a handful of times,
+/// cleared the packing, and then had nothing to correct. `byp` climbing steadily is the bypass
+/// itself becoming the ping-pong, and the revert criterion: it means 16 ms of continuous idleness is
+/// not separating a correcting thief from a blip on this hardware, and the threshold, not the
+/// mechanism, is what to raise.
+static STEAL_COOL_BYPASS: AtomicU64 = AtomicU64::new(0);
 
 /// VUGSPREAD-COOL: per-task steal candidates SKIPPED because they migrated within their ESCALATED
 /// window (`steal_cooldown_ms`, GR27 — 16ms doubling per re-steal to a 256ms cap). Boot B proved the
 /// old health reading backwards: a flat brake reads cool= CLIMBING (3.3k/s) while remig ALSO climbs
 /// (~540/s) — refusing and serving the same ping-pong. A healthy post-escalation capture reads
 /// cool= NEAR-FLAT after the settle transient, with remig/moves collapsed toward zero.
+///
+/// SPREADSETTLE: boot-4 then showed that reading is still not sufficient ALONE — escalation-with-
+/// saturation reads cool= climbing at 6.6–11.5k/s, which is the same shape as a brake doing its job
+/// and a brake stuck refusing the same corrective move forever. This counter is therefore no longer
+/// read on its own: score it against [`STEAL_COOL_BYPASS`] (`byp`) and [`STEAL_ESC_DECAYED`]
+/// (`dcy`), which say whether the refusals were ever overridden and whether any task ever paid its
+/// escalation off. See [`emit_spread_witness`]'s reading table.
 /// A side counter like `STEAL_REMIGS`, outside the `e+f+p+d+i+moves == passes` invariant (a cooled
 /// task that leaves `steal_one` empty-handed still lands on `p`/[`STEAL_D_PINNED`], whose doc now names
 /// this case); this counts the per-task SKIPS inside the walk, which that pass-level tally cannot see.
@@ -5427,6 +5762,27 @@ fn try_steal(cpu: usize) -> bool {
     // VUGSPREAD-COOL — one coherent `ms()` reading for both the cooldown test inside `steal_one` and
     // the migration stamp at step 3, so the task this steal takes is judged and stamped at one instant.
     let now_ms = crate::arch::ms();
+    // SPREADSETTLE — may this thief override the cooldown? Two conditions, and both are required.
+    //
+    //   * THIS CORE has been continuously empty for at least `STEAL_COOL_BYPASS_MS`. That is the
+    //     term that separates a thief CORRECTING an imbalance from the transiently-idle thief the
+    //     brake exists to refuse — a vug parked in `SYS_WIN_PRESENT` empties its neighbour for a few
+    //     hundred microseconds, not for a whole base window. Read from this core's own slot, written
+    //     by this core in `run()`; no cross-core read and no ordering implied.
+    //   * THE VICTIM is genuinely packed — running something AND holding ready work. `saw_pack`
+    //     answers that machine-wide but not for `v` specifically, so it is re-asked here of the
+    //     chosen victim; `v` was selected with `depth >= 1`, so `running` is the only open half.
+    //     Without it a long-idle thief could override the cooldown against a victim that is merely
+    //     between tasks, which is the one case where leaving the task alone is right (see the
+    //     `steal_floor` note on a `PRIO_IDLE` victim about to dispatch what we would take).
+    //
+    // Rate bound, by construction rather than by a counter: a bypass steal gives this core work, so
+    // `idle_since_ms` is cleared at the next dispatch and the whole window must be re-earned before
+    // it may bypass again. At most one cooldown-overriding move per idle core per 16 ms.
+    let idle_since = SCHED[cpu].idle_since_ms.load(Ordering::Relaxed);
+    let cool_bypass = idle_since != 0
+        && now_ms.saturating_sub(idle_since) >= STEAL_COOL_BYPASS_MS
+        && SCHED[v].current_prio.load(Ordering::Acquire) != PRIO_IDLE;
     let stolen = {
         // WEDGE-4: this is a REMOTE run-queue acquisition, new on this arch, so it goes through the
         // same bounded-spin wrapper as the dispatcher's own — otherwise it would be the one
@@ -5441,7 +5797,7 @@ fn try_steal(cpu: usize) -> bool {
             short = Some(len == 0);
             None
         } else {
-            vq.steal_one(cpu, now_ms)
+            vq.steal_one(cpu, now_ms, cool_bypass)
         }
     };
     let Some(mut task) = stolen else {
@@ -5466,6 +5822,20 @@ fn try_steal(cpu: usize) -> bool {
     if mig > 1 {
         STEAL_REMIGS.fetch_add(1, Ordering::Relaxed);
     }
+    // SPREADSETTLE — the POLICY level, which is a different quantity from the tally above and moves
+    // in both directions. Shed whatever this task paid off by sitting still on the home it is being
+    // taken from (`decayed_esc`), then charge one level for this move. A task in a genuine ping-pong
+    // sheds nothing — it never served a window — and climbs to the terminal 256 ms exactly as GR27
+    // intended; a task that held one home for half a second arrives here at level 0 and starts the
+    // ladder over, instead of being charged the terminal window for churn it stopped exhibiting a
+    // third of a second ago. `migrate_ms == 0` (never migrated) yields a residency of `now_ms`,
+    // which decays a level-0 task to level 0 — the correct no-op for a first steal.
+    let resident_ms = now_ms.saturating_sub(task.migrate_ms);
+    let esc_was = task.steal_esc.min(STEAL_COOLDOWN_ESC_CAP);
+    let decayed = decayed_esc(esc_was, resident_ms);
+    // `decayed <= esc_was` by construction (the walk only sheds), so this never underflows.
+    STEAL_ESC_DECAYED.fetch_add(u64::from(esc_was - decayed), Ordering::Relaxed);
+    task.steal_esc = decayed.saturating_add(1).min(STEAL_COOLDOWN_ESC_CAP);
     // VUGSPREAD-COOL — stamp the migration so the next idle core's `steal_one` leaves this task on its
     // new home for its escalating cooldown window (`steal_cooldown_ms`, now scaled by the `migrations`
     // bump just above). Same `now_ms` the cooldown test above read, under the pop's own lock where the
@@ -5563,6 +5933,12 @@ fn run() -> ! {
                 SCHED[cpu].current_prio.store(sched_prio(&task), Ordering::Release);
                 #[cfg(not(feature = "rtpi"))]
                 SCHED[cpu].current_prio.store(task.priority, Ordering::Release);
+                // SPREADSETTLE: this core has work, so its continuous-idle clock stops. Cleared here
+                // — the single dispatch site — rather than in the empty-queue arm's success path, so
+                // a task arriving by ANY route (own pop, wake, spawn, or a steal that fell through
+                // to the loop top) resets it, and there is exactly one place that can. One relaxed
+                // store per dispatch, beside four the site already makes.
+                SCHED[cpu].idle_since_ms.store(0, Ordering::Relaxed);
 
                 let raw = Box::into_raw(task);
                 let entry_rsp = unsafe { (*raw).ctx_rsp };
@@ -5730,6 +6106,18 @@ fn run() -> ! {
                 // the loop top (which re-pops under the lock) rather than dispatching inline, so the
                 // stolen task goes through the ordinary aging + pick path with no second code path.
                 // IF is 0 here — masked at the loop top and not yet re-enabled by the `hlt` below.
+                //
+                // SPREADSETTLE: start this core's continuous-idle clock, if it is not already
+                // running. Set BEFORE `try_steal` so the very first empty pass anchors the span the
+                // cooldown bypass measures, and set ONLY when unset so a core that stays empty
+                // accumulates one span rather than restarting it every pass — restarting it is the
+                // bug that would make the bypass unreachable. `arch::ms()` is therefore read at most
+                // once per idle TRANSITION, not once per idle pass, which is why this costs a
+                // relaxed load and a predictable branch in the steady state. Forced to at least 1:
+                // `0` is the "dispatching" sentinel and a core can go idle before the first tick.
+                if SCHED[cpu].idle_since_ms.load(Ordering::Relaxed) == 0 {
+                    SCHED[cpu].idle_since_ms.store(crate::arch::ms().max(1), Ordering::Relaxed);
+                }
                 if try_steal(cpu) {
                     continue;
                 }
