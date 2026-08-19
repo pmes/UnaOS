@@ -43,23 +43,23 @@ macro_rules! irq_el {
     };
 }
 
-// M6a: the Lower-EL-AArch64 synchronous vector (0x400) routes to __vec_svc on baremetal (EL0 syscalls
-// land there since the kernel is at EL1), but stays the halting __vec_sync on the UEFI/EL2 build (no
-// EL0 there). svc_stub!() emits the __vec_svc body only on baremetal (empty otherwise), so the UEFI
-// build has no reference to the baremetal-only aarch64_svc_handler.
-#[cfg(feature = "baremetal")]
+// M6a: the Lower-EL-AArch64 synchronous vector (0x400) routes to __vec_svc wherever EL0 exists —
+// baremetal AND tegra_el0 (recovered boot-2 capture 2026-08-18: el0-hello's first `svc #0` hit the
+// fault logger, ESR=0x56000000 EC=0x15 ELR=0x7800000014 — JETSON-EL0 widened syscall.rs but not this
+// vector). Elsewhere it stays the halting __vec_sync, and svc_stub!() emits nothing.
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 macro_rules! svc_vec {
     () => {
         "__vec_svc"
     };
 }
-#[cfg(not(feature = "baremetal"))]
+#[cfg(not(any(feature = "baremetal", feature = "tegra_el0")))]
 macro_rules! svc_vec {
     () => {
         "__vec_sync"
     };
 }
-#[cfg(feature = "baremetal")]
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 macro_rules! svc_stub {
     () => {
         r#"
@@ -103,7 +103,7 @@ __vec_svc_fault:
 "#
     };
 }
-#[cfg(not(feature = "baremetal"))]
+#[cfg(not(any(feature = "baremetal", feature = "tegra_el0")))]
 macro_rules! svc_stub {
     () => {
         ""
@@ -750,7 +750,7 @@ extern "C" fn aarch64_fault_handler(kind: u64) -> u64 {
 ///
 /// FAR_EL1 is architecturally valid only for instruction/data aborts (EC 0x20/0x24) with ISS.FnV=0
 /// and for PC-alignment faults (0x22); for every other EC it holds a stale value, so print `--`.
-#[cfg(feature = "baremetal")]
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 #[unsafe(no_mangle)]
 extern "C" fn aarch64_el0_fault_handler() -> ! {
     let (esr, elr, far): (u64, u64, u64);
