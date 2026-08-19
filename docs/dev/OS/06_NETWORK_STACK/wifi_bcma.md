@@ -300,6 +300,22 @@ The builder wiring is not optional, for the reason §4 gives and this arc inheri
 bring-up that silently did not run is indistinguishable on the wire from a radio that would not
 answer — and that is precisely the conclusion the ladder's next decision would then rest on.
 
+`UNAOS_WIFIVAL=1` arms `wifival` (implies `wifi2`; same four wiring places; stripped for aarch64
+with the same argument). Default **OFF**. It exists for one reason: QEMU models no BCM4331, so the
+census parks the module and the classifier's verdict was metal-only. Under `wifival`, a
+census-ABSENT boot latches that outcome, announces replay mode, and proceeds through staging to
+`bringup::validate_replay()` — the set-completeness check and `validate_set()` only, a function
+with no PCI access, no MMIO map and no device register touch anywhere in its body, then a terminal
+replay park. The routing is on the RECORDED census outcome, not the feature, so a `wifival` image
+on metal (radio present) behaves byte-identically to a `wifi2` one. The gate is
+`scripts/specs/x86-wifival.spec` against a `UNAOS_FATIMG=sf UNAOS_WIFIVAL=1` run: the replay-armed
+line, three `STAGED` lines (`hdr=words`, `hdr=records` ×2), three `set-validate … => VALID` lines,
+`verdict=VALID`, the replay park — and FORBIDs on the device-rung witnesses, verified
+discriminating by injection. The media half: `make-fat-img.sh` copies the three-role set from
+`UNAOS_B43_DIR` (default `~/Downloads/bcout/b43`) into `B43/` on the FAT images when that
+directory exists — the user's own extraction supplied at build time, never from the repo, never in
+distributed media (`CLEAN_ROOM_POLICY.md` §4).
+
 **Where arc 2 runs, and the one boot it never reaches.** `bringup_once()` is called from
 `finish_and_park`, the shared terminal of `S_WAIT_STORAGE` and `S_WAIT_ALT`, reached only on a
 `Settled` outcome or a `Retry` budget exhausted — so `staged_count()` is final before the
