@@ -27,7 +27,7 @@ REQUIRE CAPSTONE COMPLETE
 
 # --- NEW this boot: witnesses shipped ahead of their bench (promote on capture) -----
 # M1b: the first EL0 round-trip on Orin metal (tegra_el0 knob armed on the image).
-PENDING TEGRA-EL0.*el0-hello round-trip -> PASS
+REQUIRE TEGRA-EL0.*el0-hello round-trip -> PASS
 # M2 step 1: the microSD becomes block-layer-visible (read-only backend).
 PENDING TEGRA-SD.*block backend published
 
