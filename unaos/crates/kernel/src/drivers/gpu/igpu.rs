@@ -627,6 +627,26 @@ pub fn init(gpu: &GpuInfo) {
         #[cfg(all(target_arch = "x86_64", feature = "gen7"))]
         super::gen7::execute(bar0, bar0_size, gpu.bus, gpu.slot, gpu.func, gt_wake);
 
+        // GEN7-3D rung R6 — the wake that makes RING_CTL latch (UNAOS_IVB3D). R5 flew three boot
+        // legs and came back `enable-void`: the GGTT PTEs landed, the four RCS submission
+        // registers were programmed, RING_CTL was written 0x00000001 and read back 0x00000000.
+        // R3 releases its forcewake acquire inside its own rung, so nothing was held when R5
+        // armed the ring — which R5's own `next=` named as the suspect. R6 is that experiment:
+        // it acquires a forcewake candidate (MT 0x0A188/0x130044 [BDW-ONLY] first — the only
+        // [PINNED]-adjacent pair, and the one R3's now-retired preheld guard skipped on metal —
+        // then RENFW [CHV-ONLY], then GTFORCEAWAKE), KEEPS the hold across the ring arm, the
+        // MI_STORE_DATA_IMM submit, the drain, the disable and the register restore, and only
+        // then releases it. It stops at the first candidate whose RING_CTL enable reads back
+        // set. It also closes R5's two-page-per-run leak: a GGTT TLB-invalidation rung with its
+        // own verdict, and a reclaim gated on that verdict OR on the proof that no engine access
+        // was ever issued through either GGTT address. Placed AFTER `execute` and still BEFORE
+        // `bring_up_blt_ring`. Same write envelope as R5, not one inch wider — the Dark branch
+        // writes nothing, every write is captured/restored/re-read on every exit path, the GGTT
+        // claim only enters a proven-unowned window, and no display register is touched — so R6
+        // cannot black Peter's screen either.
+        #[cfg(all(target_arch = "x86_64", feature = "gen7"))]
+        super::gen7::rearm(bar0, bar0_size, gpu.bus, gpu.slot, gpu.func, gt_wake);
+
         // BLT ring bring-up. SEAT FIXUP (review round 2): an ACCELERATOR must degrade, never kill
         // the boot — every refusal below breaks out of this block, the ring simply never comes up,
         // `blitter_*` return false, and the CPU path carries the console exactly as before this

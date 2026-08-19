@@ -297,6 +297,32 @@ pub mod g7regs {
     // confirm that the well has woken." A third candidate shape, read-only.
     pub const HYP_RENFW_REQ: usize = 0x1300B0;
     pub const HYP_RENFW_ACK: usize = 0x1300B4;
+
+    // ---- [EXT-UNPINNED] — R6's GGTT TLB-invalidation candidate ----------------------
+    //
+    // ⚠ CLASS STATED HONESTLY, BECAUSE IT CANNOT BE PINNED FROM THE DOCUMENTS THIS MODULE
+    // OPENS. R5 leaks two 4 KiB pages per run with the note
+    // `pages-leaked-no-GGTT-TLB-invalidation-rung-exists-yet`, and R6's third deliverable is
+    // to close that. The mechanism a GGTT write needs, per the general shape of the problem,
+    // is a *global GTT flush* — a register the driver pokes after editing PTEs so the GT
+    // drops any cached translation.
+    //
+    // **It is not in the IVB PRM set R0.1 searched.** That search (draft §3.1 P3) covered
+    // FORCEWAKE / GTFIFO / the 0xA18x and 0x1300xx offsets and `power well` / `power gat`;
+    // it did **not** search for a GTT-flush register, and re-searching sixteen volumes is
+    // outside this rung. The offset below is therefore **recollection, unverified** — the
+    // module's `[EXT-UNPINNED]` class exactly — and §0's rule for that class is the rule R3
+    // already flies under: it may be TESTED as a hypothesis on our own silicon, under
+    // capture/restore/re-read, never *implemented* as though it were spec.
+    //
+    // What R6 does with it is correspondingly bounded, and this is the load-bearing part:
+    // **the page reclaim is NOT gated on this register working.** It is gated on the rung's
+    // own verdict (`r6 tlb verdict=`) *or* on the independent structural leg that the GT was
+    // never given a chance to cache a translation at all (`never-fetched`: no candidate's
+    // RING_CTL enable ever read back set, the head never moved, no sentinel ever landed — so
+    // no engine access was ever issued through either GGTT address). A register whose
+    // decode we cannot prove is not allowed to be the reason a page goes back to the heap.
+    pub const HYP_GFX_FLSH_CNTL: usize = 0x101008;
 }
 
 /// Which address space a control-frame row lives in.
@@ -1306,7 +1332,7 @@ pub enum GtWake {
     /// The battery was already live before any write (`gt-live-already`, G1 false on this part):
     /// the well was never closed.
     LiveAlready,
-    /// No wake — `fw-no-ack` / `fw-acked-gt-dark` / `both-req-preheld` / any R3 refusal. The GT
+    /// No wake — `fw-no-ack` / `fw-acked-gt-dark` / any R3 refusal. The GT
     /// block is gated (or its state is unknown), and R4 must not write behind it.
     Dark,
 }
@@ -1381,9 +1407,11 @@ unsafe fn read_frame(bar0: usize, label: &str, v: &mut [u32; FRAME_N], varied: &
 /// How a candidate acquire ended. Every outcome is named here, before the rung runs.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Acq {
-    /// The request register was already non-zero at entry — another owner holds it. No write
-    /// was made, and no reading is drawn from this candidate.
-    SkippedPreheld,
+    // ⚠ `SkippedPreheld` is RETIRED (R6). It was produced by the preheld guard whose misfire
+    // cost the ladder its only [PINNED]-adjacent candidate; the guard and this variant are gone
+    // together, and the `both-req-preheld` verdict arm with them. The entry reading survives as
+    // `pre_nonzero=` / `pre_stable=` on every `cand=` line — a witness, not a skip. See the
+    // block above `fw_acquire`.
     /// Written, and the ack field made a real dark→set transition.
     AckTransition,
     /// Written, and the ack field never left its entry value within the poll budget.
@@ -1397,7 +1425,6 @@ enum Acq {
 impl Acq {
     fn name(self) -> &'static str {
         match self {
-            Acq::SkippedPreheld => "skipped-req-preheld",
             Acq::AckTransition => "ack-transition",
             Acq::NoAck => "no-ack",
             Acq::AckUnreadable => "ack-unreadable",
@@ -1424,8 +1451,26 @@ impl Motion {
 
 /// Compare a held battery column against the entry column.
 fn motion(before: &[u32; BATTERY_N], before_var: &[bool; BATTERY_N], held: &[u32; BATTERY_N], held_var: &[bool; BATTERY_N]) -> Motion {
+    motion_filtered(before, before_var, held, held_var, |_| true)
+}
+
+/// The same comparison over a SUBSET of the battery. R6 needs it because R6, unlike R3, WRITES
+/// four of the seventeen rows (the RCS submission registers), and a register we caused to change
+/// is not a witness — the identical Wall D rule R2's `touched` column encodes. R6 prints three
+/// counts side by side: all seventeen, the fourteen R2 never writes, and the thirteen R6 never
+/// writes, so a capture reader can take whichever is honest for the question being asked.
+fn motion_filtered(
+    before: &[u32; BATTERY_N],
+    before_var: &[bool; BATTERY_N],
+    held: &[u32; BATTERY_N],
+    held_var: &[bool; BATTERY_N],
+    keep: impl Fn(usize) -> bool,
+) -> Motion {
     let mut m = Motion { gone_struct: 0, varies: 0 };
     for i in 0..BATTERY_N {
+        if !keep(i) {
+            continue;
+        }
         let was_dark = matches!(Cls::of(before[i]), Cls::Zero | Cls::AllOnes) && !before_var[i];
         if was_dark && matches!(Cls::of(held[i]), Cls::Structured) {
             m.gone_struct += 1;
@@ -1435,6 +1480,332 @@ fn motion(before: &[u32; BATTERY_N], before_var: &[bool; BATTERY_N], held: &[u32
         }
     }
     m
+}
+
+// ===================================================================================
+// The shared forcewake primitives — R3 acquires-and-releases around a battery read, R6
+// acquires-and-HOLDS around a ring arm. Both go through the same two functions so the
+// discrimination, the capture/restore discipline and the wire format cannot drift apart.
+// ===================================================================================
+//
+// ## THE MT-PREHELD GUARD MISFIRE, AND WHY THE GUARD IS RETIRED RATHER THAN REPAIRED
+//
+// R3 as first written refused a candidate whose request register read non-zero at entry:
+//
+// ```text
+// if req_pre != 0 || req_pre2 != 0 { return (Acq::SkippedPreheld, ...); }   // RETIRED
+// ```
+//
+// with the reason `request-register-non-zero-at-entry-not-ours-to-clear`. On metal it
+// **skipped the only Intel-documented forcewake pair the ladder has** — MT, `0x0A188` /
+// `0x130044` — because `0x0A188` read `0x00010000` at candidate entry while the frame
+// census, milliseconds earlier in the same rung, read `0x00000000` at the same offset.
+// The [PINNED]-adjacent candidate never flew, and the boot was spent.
+//
+// The defect is not the threshold, it is the **inference**. A non-zero read at a request
+// register has (at least) three incompatible explanations and the guard collapsed them into
+// the most alarming one:
+//
+//  1. Another owner holds forcewake — the case the guard was written for. On this machine
+//     there is no other owner: UnaOS is the only software that has touched this device since
+//     firmware handed it over, and firmware left the GT in an RC6-eligible state.
+//  2. The offset is **not a forcewake register on this part**. `0x0A188` is pinned on
+//     Broadwell; on Cherryview the same offset is `SCRATCH1`, an unrelated ECO scratch
+//     register (draft §3.1 P3). A scratch register reads back whatever it last latched.
+//  3. The read is not stable, or is a decode artefact of a gated window — the same
+//     ambiguity `Cls` exists to name, pointed at the request register instead of the battery.
+//
+// And the specific value seen makes (1) the *least* likely reading of the three: `0x00010000`
+// is **the mask-form RELEASE pattern this very function writes** (`FW_RELEASE_MASK`). Under
+// the documented mask-write semantics (IVB-V1P3 ~p.66, "Reads to this field returns zero")
+// a healthy MT register cannot even read its mask field back as set — so a readback of
+// `0x00010000` is evidence *against* the register implementing the documented semantics,
+// which is precisely the question the candidate exists to answer, and the guard turned it
+// into a reason not to ask.
+//
+// **The replacement discrimination is the handshake itself.** Attempt the documented
+// set-and-verify sequence regardless of the entry value, under the full capture/restore/
+// re-read discipline, and classify by **what the silicon answers**:
+//
+//  * `fw-ack-transition`      — the ack field left a stable-zero entry column. The pair is real.
+//  * `fw-req-decodes-no-ack`  — no ack, but the request register read back a change from our
+//                               write. Something decodes at the request offset; the ack is
+//                               not where we looked. (This is the shape a scratch register
+//                               also produces, and the wire says so rather than guessing.)
+//  * `fw-no-decode`           — no ack, and the request register did not read back our write.
+//                               Nothing at this offset answers on this part.
+//  * `fw-ack-unreadable`      — the ack register's entry column was already non-zero or
+//                               unstable, so a transition is not readable on it. The write
+//                               still happened; an unreadable ack is never scored as an ack.
+//
+// **What the retired guard actually protected is preserved, and by a stronger mechanism.**
+// Its concern was "do not stomp another owner's state". Two properties now carry that, and
+// neither depends on guessing what a non-zero entry value means:
+//
+//  * The acquire is **additive, never clearing**. On the mask form the write is
+//    `0x00010001`: mask bit 16 arms **only** data bit 0, so bits [15:1] — every other
+//    thread's request — are untouchable by it. On the plain form the write is
+//    `req_pre | 1`: the captured entry dword with bit 0 set, so no bit that was set at entry
+//    is cleared. A hypothetical other owner keeps its bits under either semantics.
+//  * The release restores **the captured entry dword**, whatever it was — `0x00000000`,
+//    `0x00010000`, or anything else — and the restore is re-read and reported with its own
+//    `evidence=` field saying whether the check could have failed at all.
+//
+// So the entry reading is not thrown away, it is **demoted from a verdict to a witness**:
+// `pre_nonzero=` and `pre_stable=` go on the wire on every candidate, and a reader who wants
+// the old guard's reading can still take it — from data, not from a skipped rung.
+
+/// Bounded poll on the **cycle counter**, not on an iteration count and not on `arch::ms()`.
+///
+/// R3/R5 bounded their polls by iterations, which is not a time: `iters=200000` of uncached
+/// MMIO reads is an unknown number of milliseconds until it flies, and R5's `EXEC_POLL_MAX`
+/// of a million is potentially a second of boot spent on a wall we already suspect. `rdtsc`
+/// is invariant on this part and advances regardless of `EFLAGS.IF`, so a TSC delta is a real
+/// bound. `iters` is still counted and printed — it is the useful *rate* datum — but it no
+/// longer decides when to stop.
+///
+/// Returns `(hit, iters, cycles_elapsed)`.
+///
+/// Forcewake-ack budget, shared by R3 and R6. ~8 ms at this part's ~2.5 GHz invariant TSC.
+/// R6 runs up to three candidates, so the worst case this term contributes to boot is ~24 ms.
+const FW_ACK_BUDGET_CYC: u64 = 20_000_000;
+
+/// Ring-execution budget (head reaching tail, or the sentinel landing). ~20 ms.
+const EXEC_BUDGET_CYC: u64 = 50_000_000;
+
+/// Ring-drain budget on teardown. ~8 ms.
+const DRAIN_BUDGET_CYC: u64 = 20_000_000;
+
+#[inline]
+unsafe fn poll_cycles<F: FnMut() -> bool>(budget: u64, mut f: F) -> (bool, u32, u64) {
+    let t0 = crate::arch::now_cycles();
+    let mut iters = 0u32;
+    loop {
+        if f() {
+            return (true, iters, crate::arch::now_cycles().wrapping_sub(t0));
+        }
+        iters = iters.saturating_add(1);
+        let c = crate::arch::now_cycles().wrapping_sub(t0);
+        if c >= budget {
+            return (false, iters, c);
+        }
+    }
+}
+
+/// How a forcewake candidate's handshake answered. Every outcome named before the rung runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FwClass {
+    /// The ack field made a real transition away from a stable-zero entry column.
+    AckTransition,
+    /// No ack, but the request register read back a change from our write: something decodes
+    /// at the request offset and the ack is not where we looked.
+    ReqDecodesNoAck,
+    /// No ack, and the request register did not read back our write. Nothing answers here.
+    NoDecode,
+    /// The ack register's entry column was already non-zero or unstable — a transition is not
+    /// readable on it, so no ack may be claimed either way.
+    AckUnreadable,
+}
+
+impl FwClass {
+    fn name(self) -> &'static str {
+        match self {
+            FwClass::AckTransition => "fw-ack-transition",
+            FwClass::ReqDecodesNoAck => "fw-req-decodes-no-ack",
+            FwClass::NoDecode => "fw-no-decode",
+            FwClass::AckUnreadable => "fw-ack-unreadable",
+        }
+    }
+}
+
+/// One acquired (or attempted) forcewake hold, carrying everything the release and the
+/// witness need. Constructed only by `fw_acquire`; consumed only by `fw_release`.
+struct FwHold {
+    cand: &'static str,
+    class_pin: &'static str,
+    req_off: usize,
+    ack_off: usize,
+    ack_mask: u32,
+    src: &'static str,
+    mask_form: bool,
+    /// The dword the release must restore the request register to.
+    req_pre: u32,
+    ack_pre: u32,
+    /// What we wrote to the request register.
+    wrote: u32,
+    /// The request register's readback immediately after the acquire write.
+    acq_post: u32,
+    /// The ack register's value when the poll ended.
+    ack_post: u32,
+    class: FwClass,
+}
+
+impl FwHold {
+    /// Is the hold ack-confirmed? The only positive proof a wake is in force. R6 arms under a
+    /// candidate regardless of this — an unacked hold that nonetheless makes RING_CTL latch is
+    /// exactly the finding the rung is hunting — but the verdict never calls it a wake.
+    fn acked(&self) -> bool {
+        self.class == FwClass::AckTransition
+    }
+}
+
+/// Acquire a forcewake candidate: capture, write the additive request, poll the ack under a
+/// cycle budget, classify. **Writes exactly one register** — the candidate's request register.
+/// The caller MUST pair this with `fw_release` on every exit path.
+///
+/// `mask_form` selects the write semantics: `true` writes `0x00010001` (BDW's documented
+/// mask-write form for `0x0A188`), `false` writes `req_pre | 1` (an additive set of data bit 0
+/// on a plain register, preserving every bit that was set at entry). Both are additive by
+/// construction — see the block above: that is what makes the retired preheld guard
+/// unnecessary rather than merely inconvenient.
+#[allow(clippy::too_many_arguments)]
+unsafe fn fw_acquire(
+    bar0: usize,
+    tag: &str,
+    cand: &'static str,
+    class_pin: &'static str,
+    req_off: usize,
+    ack_off: usize,
+    ack_mask: u32,
+    src: &'static str,
+    mask_form: bool,
+    ack_budget_cyc: u64,
+) -> FwHold {
+    // Entry images. The request register is read twice: once as the restore target, once for
+    // stability, because a restore target that is itself unstable is not a restore target.
+    let req_pre = rd(bar0, req_off);
+    let req_pre2 = rd(bar0, req_off);
+    let ack_pre = rd(bar0, ack_off);
+    let ack_pre2 = rd(bar0, ack_off);
+    let pre_nonzero = req_pre != 0 || req_pre2 != 0;
+    let pre_stable = req_pre == req_pre2;
+    let ack_readable = (ack_pre & ack_mask) == 0 && ack_pre == ack_pre2;
+
+    // The write. Additive under either semantics — it can only SET data bit 0, never clear a
+    // bit another owner set. This is the property that replaces the retired preheld guard.
+    let wrote = if mask_form { 0x0001_0001u32 } else { req_pre | 1 };
+
+    serial_println!(
+        ":: gen7: {} cand={} class={} entry req_off={:06X} req_pre={:08X} req_pre2={:08X} pre_nonzero={} pre_stable={} ack_off={:06X} ack_pre={:08X} ack_pre2={:08X} ack_mask={:08X} ack_readable={} mask_form={} will_write={:08X} src={} note=preheld-guard-retired-classification-is-by-handshake-not-by-entry-value ::",
+        tag,
+        cand,
+        class_pin,
+        req_off,
+        req_pre,
+        req_pre2,
+        if pre_nonzero { 1 } else { 0 },
+        if pre_stable { 1 } else { 0 },
+        ack_off,
+        ack_pre,
+        ack_pre2,
+        ack_mask,
+        if ack_readable { 1 } else { 0 },
+        if mask_form { 1 } else { 0 },
+        wrote,
+        src
+    );
+
+    let acq_post = witnessed_write(bar0, tag, "FW_REQUEST", req_off, wrote, src);
+
+    // The pass condition is a TRANSITION away from the stable-zero entry column — never a
+    // zero-compare (the R2/Boot-D defect, where a dead window satisfied `== 0` on iteration
+    // zero). Bounded in CYCLES.
+    let mut ack = ack_pre;
+    let (ack_set, iters, cyc) = poll_cycles(ack_budget_cyc, || {
+        ack = rd(bar0, ack_off);
+        (ack & ack_mask) != 0
+    });
+
+    let req_readback = acq_post != req_pre;
+    let class = if !ack_readable {
+        FwClass::AckUnreadable
+    } else if ack_set {
+        FwClass::AckTransition
+    } else if req_readback {
+        FwClass::ReqDecodesNoAck
+    } else {
+        FwClass::NoDecode
+    };
+
+    // THE witness line the brief names, in the exact shape a capture reader keys on.
+    serial_println!(
+        ":: gen7: {} cand={} class={} wrote={:08X} req_pre={:08X} req_post={:08X} req_readback={} ack_pre={:08X} ack_post={:08X} ack_masked={:08X} ack_bit0={} held={} classification={} iters={} cyc={} budget={} src={} ::",
+        tag,
+        cand,
+        class_pin,
+        wrote,
+        req_pre,
+        acq_post,
+        if req_readback { 1 } else { 0 },
+        ack_pre,
+        ack,
+        ack & ack_mask,
+        ack & 1,
+        if ack_set { 1 } else { 0 },
+        class.name(),
+        iters,
+        cyc,
+        ack_budget_cyc,
+        src
+    );
+
+    FwHold {
+        cand,
+        class_pin,
+        req_off,
+        ack_off,
+        ack_mask,
+        src,
+        mask_form,
+        req_pre,
+        ack_pre,
+        wrote,
+        acq_post,
+        ack_post: ack,
+        class,
+    }
+}
+
+/// Release a hold and verify the release against the captured entry dword. Returns
+/// `(restored, evidence)` — `evidence=false` means the compare could not have failed on this
+/// part (every dword involved read `0x00000000`), so `restored=1` is the best available
+/// reading and NOT proof that a hold was released. Same honesty bound R3 already carried.
+unsafe fn fw_release(bar0: usize, tag: &str, h: &FwHold) -> (bool, bool) {
+    // Two forms, because the register's write semantics are themselves a hypothesis. The mask
+    // form clears data bit 0 on a mask register (documented) and is a no-op on a plain one
+    // only if bit 16 is meaningless there — so the EXACT restore runs LAST and is authoritative
+    // under either semantics.
+    if h.mask_form {
+        witnessed_write(bar0, tag, "FW_RELEASE_MASK", h.req_off, 0x0001_0000, h.src);
+    }
+    witnessed_write(bar0, tag, "FW_RELEASE_EXACT", h.req_off, h.req_pre, h.src);
+
+    let req_post = rd(bar0, h.req_off);
+    let ack_post = rd(bar0, h.ack_off);
+    let req_ok = req_post == h.req_pre;
+    let ack_ok = (ack_post & h.ack_mask) == (h.ack_pre & h.ack_mask);
+    let restored = req_ok && ack_ok;
+    let req_readback = h.acq_post != h.req_pre;
+    let ack_moved = (h.ack_post & h.ack_mask) != (h.ack_pre & h.ack_mask);
+    let evidence = req_readback || ack_moved;
+    serial_println!(
+        ":: gen7: {} cand={} class={} release undoing={:08X} req_post={:08X} req_pre={:08X} req_ok={} ack_post={:08X} ack_pre={:08X} ack_ok={} restored={} readback={} ack_moved={} evidence={} ::",
+        tag,
+        h.cand,
+        h.class_pin,
+        h.wrote,
+        req_post,
+        h.req_pre,
+        if req_ok { 1 } else { 0 },
+        ack_post,
+        h.ack_pre,
+        if ack_ok { 1 } else { 0 },
+        if restored { 1 } else { 0 },
+        if req_readback { 1 } else { 0 },
+        if ack_moved { 1 } else { 0 },
+        if evidence { 1 } else { 0 }
+    );
+    (restored, evidence)
 }
 
 /// One forcewake candidate: acquire, poll its ack, read the battery under the hold, release,
@@ -1453,100 +1824,23 @@ fn motion(before: &[u32; BATTERY_N], before_var: &[bool; BATTERY_N], held: &[u32
 #[allow(clippy::too_many_arguments)]
 unsafe fn try_candidate(
     bar0: usize,
-    cand: &str,
+    cand: &'static str,
+    class_pin: &'static str,
     req_off: usize,
     ack_off: usize,
     ack_mask: u32,
-    src: &str,
-    poll_max: u32,
+    src: &'static str,
+    mask_form: bool,
+    ack_budget_cyc: u64,
     before: &[u32; BATTERY_N],
     before_var: &[bool; BATTERY_N],
 ) -> (Acq, Motion, bool, bool) {
-    let no_motion = Motion { gone_struct: 0, varies: 0 };
-
-    // Entry images. `req_pre` is what the release must restore the request register to —
-    // read once for the restore target and once more for stability, because a restore target
-    // that is itself unstable is not a restore target.
-    let req_pre = rd(bar0, req_off);
-    let req_pre2 = rd(bar0, req_off);
-    let ack_pre = rd(bar0, ack_off);
-    let ack_pre2 = rd(bar0, ack_off);
-    let ack_readable = (ack_pre & ack_mask) == 0 && ack_pre == ack_pre2;
-    serial_println!(
-        ":: gen7: r3 cand={} entry req_off={:06X} req_pre={:08X} req_pre2={:08X} ack_off={:06X} ack_pre={:08X} ack_pre2={:08X} ack_mask={:08X} ack_readable={} src={} ::",
-        cand,
-        req_off,
-        req_pre,
-        req_pre2,
-        ack_off,
-        ack_pre,
-        ack_pre2,
-        ack_mask,
-        if ack_readable { 1 } else { 0 },
-        src
-    );
-
-    // Refusal: someone already holds this request register. Do not write over another
-    // owner's state — read, report, return.
-    if req_pre != 0 || req_pre2 != 0 {
-        serial_println!(
-            ":: gen7: r3 cand={} outcome={} wrote=0 note=request-register-non-zero-at-entry-not-ours-to-clear ::",
-            cand,
-            Acq::SkippedPreheld.name()
-        );
-        // `evidence=true`: a skipped candidate makes no claim about a RELEASE, only the claim
-        // "nothing was written", and that one is directly established by the two entry reads
-        // printed above. It is not the vacuous `0 == 0` case the release check has to guard.
-        return (Acq::SkippedPreheld, no_motion, true, true);
-    }
-
     // ---- Acquire ------------------------------------------------------------------------
-    // Mask-write form: upper 16 bits arm the corresponding data bits (IVB-V1P3 ~p.66 for the
-    // generic semantics; BDW p.493 for this register's mask field). Requesting data bit 0.
-    // The post-read is KEPT (review, GR26): whether this register reads back its own write is
-    // what decides whether the release verification below can falsify anything at all. See
-    // `readback=` on the release line.
-    let acq_post = witnessed_write(bar0, "r3", "FW_REQUEST", req_off, 0x0001_0001, src);
-
-    // ---- Poll the ack, bounded ------------------------------------------------------------
-    // The pass condition is `(ack & mask) != 0` — a transition away from the stable zero
-    // entry column. This is the direct correction of the R2/Boot-D defect, where the pass
-    // condition was `== 0` and a dead window satisfied it on iteration zero.
-    //
-    // ⚠ COST, and why it is on the wire (review, GR26). The budget is an ITERATION count, and
-    // an iteration count is not a time. The expected-negative outcome runs this loop to expiry
-    // on BOTH candidates, so R3's expected boot cost is `2 * poll_max` uncached MMIO reads —
-    // and until it flies, nobody knows what that is in milliseconds. `now_cycles()` (rdtsc,
-    // invariant on this part, and it advances regardless of EFLAGS.IF) brackets the loop, so
-    // `cyc=` converts `iters=` into a real number the first time this rung runs. The whole
-    // `igpu::init` span is already inside the boot-pace `G_IGPU` bucket (`arch/x86_64/pci.rs`),
-    // so the cost is double-booked deliberately: once as a phase, once per poll.
-    let t0 = crate::arch::now_cycles();
-    let mut iters = 0u32;
-    let mut ack;
-    loop {
-        ack = rd(bar0, ack_off);
-        if (ack & ack_mask) != 0 {
-            break;
-        }
-        iters += 1;
-        if iters >= poll_max {
-            break;
-        }
-    }
-    let cyc = crate::arch::now_cycles().wrapping_sub(t0);
-    let ack_set = (ack & ack_mask) != 0;
-    serial_println!(
-        ":: gen7: r3 cand={} poll ack_off={:06X} ack={:08X} masked={:08X} bit0={} iters={} max={} set={} cyc={} ::",
-        cand,
-        ack_off,
-        ack,
-        ack & ack_mask,
-        ack & 1,
-        iters,
-        poll_max,
-        if ack_set { 1 } else { 0 },
-        cyc
+    // The preheld guard that used to stand here is RETIRED — see the block above `fw_acquire`
+    // for why, and for what replaces it (an additive write plus an exact-dword restore, which
+    // protect a hypothetical other owner strictly better than a skip did).
+    let hold = fw_acquire(
+        bar0, "r3", cand, class_pin, req_off, ack_off, ack_mask, src, mask_form, ack_budget_cyc,
     );
 
     // ---- The held column -------------------------------------------------------------------
@@ -1571,19 +1865,7 @@ unsafe fn try_candidate(
     // no-op on a mask register (mask=0 modifies nothing) and an exact restore on a plain one.
     // Together they return the register to its entry value under EITHER semantics, which
     // matters because which semantics this part implements is precisely what is unpinned.
-    witnessed_write(bar0, "r3", "FW_RELEASE_MASK", req_off, 0x0001_0000, src);
-    witnessed_write(bar0, "r3", "FW_RELEASE_EXACT", req_off, req_pre, src);
-
-    // ---- Verify the release ----------------------------------------------------------------
-    // Restore is not assumed. `restored` is true only if the request register reads back its
-    // entry dword AND the ack field has returned to its entry value (an ack still asserted
-    // after release means the well is being held by something we cannot see, and that is a
-    // finding the rung must not swallow).
-    let req_post = rd(bar0, req_off);
-    let ack_post = rd(bar0, ack_off);
-    let req_ok = req_post == req_pre;
-    let ack_ok = (ack_post & ack_mask) == (ack_pre & ack_mask);
-    let restored = req_ok && ack_ok;
+    let (restored, evidence) = fw_release(bar0, "r3", &hold);
 
     // ⚠ WALL D, APPLIED TO THIS RUNG'S OWN SAFETY WITNESS (review, GR26). `restored=1` above
     // is `req_post == req_pre` AND `ack_post == ack_pre` — and on the readings Boot D
@@ -1609,35 +1891,23 @@ unsafe fn try_candidate(
     // semantics — the mask form clears data bit 0 on a mask register, and the exact-dword form
     // runs LAST and restores a plain register — and neither depends on the register being
     // readable. What changes is only the honesty of the claim about it.
-    let req_readback = acq_post != req_pre;
-    let ack_moved = (ack & ack_mask) != (ack_pre & ack_mask);
-    let evidence = req_readback || ack_moved;
-    serial_println!(
-        ":: gen7: r3 cand={} release req_post={:08X} req_pre={:08X} req_ok={} ack_post={:08X} ack_pre={:08X} ack_ok={} restored={} readback={} ack_moved={} evidence={} ::",
-        cand,
-        req_post,
-        req_pre,
-        if req_ok { 1 } else { 0 },
-        ack_post,
-        ack_pre,
-        if ack_ok { 1 } else { 0 },
-        if restored { 1 } else { 0 },
-        if req_readback { 1 } else { 0 },
-        if ack_moved { 1 } else { 0 },
-        if evidence { 1 } else { 0 }
-    );
-
-    let outcome = if !ack_readable {
-        Acq::AckUnreadable
-    } else if ack_set {
-        Acq::AckTransition
-    } else {
-        Acq::NoAck
+    // (The `readback=` / `ack_moved=` / `evidence=` fields the paragraph above describes are
+    // printed by `fw_release`, which now owns the release and its honesty bound for both R3
+    // and R6 — one implementation, one wire format, no drift.)
+    let outcome = match hold.class {
+        FwClass::AckUnreadable => Acq::AckUnreadable,
+        FwClass::AckTransition => Acq::AckTransition,
+        // `fw-req-decodes-no-ack` and `fw-no-decode` are both "no ack" as far as R3's verdict
+        // ladder is concerned; the finer distinction is on the `cand=` line above and is what
+        // R6 acts on.
+        FwClass::ReqDecodesNoAck | FwClass::NoDecode => Acq::NoAck,
     };
     serial_println!(
-        ":: gen7: r3 cand={} outcome={} wrote=3 released=1 restored={} evidence={} ::",
+        ":: gen7: r3 cand={} outcome={} classification={} wrote={} released=1 restored={} evidence={} ::",
         cand,
         outcome.name(),
+        hold.class.name(),
+        if hold.mask_form { 3 } else { 2 },
         if restored { 1 } else { 0 },
         if evidence { 1 } else { 0 }
     );
@@ -1691,12 +1961,11 @@ pub unsafe fn forcewake(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: 
         return GtWake::Dark;
     }
 
-    // Bounded ack budget. Deliberately smaller than R2's `POLL_MAX`: R3 may run this poll
-    // TWICE and the expected-negative outcome is exactly the one that runs it to expiry, so
-    // an over-large budget buys nothing and spends boot time on a wall we already suspect.
-    // `iters=` is on the wire, so `no-ack` is always readable as "no ack within THIS budget"
-    // rather than as a claim about eternity.
-    const ACK_POLL_MAX: u32 = 200_000;
+    // Bounded ack budget, in CYCLES (R6 change — see `poll_cycles`). An iteration count is not
+    // a time, and the expected-negative outcome is exactly the one that runs the loop to
+    // expiry on every candidate, so the budget that matters is the wall-clock one. `iters=` is
+    // still on the wire beside `cyc=`, so `no-ack` is always readable as "no ack within THIS
+    // budget" rather than as a claim about eternity.
 
     // ---- The entry columns ---------------------------------------------------------------
     let mut frame_pre = [0u32; FRAME_N];
@@ -1745,11 +2014,13 @@ pub unsafe fn forcewake(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: 
     let (out_a, m_a, rest_a, ev_a) = try_candidate(
         bar0,
         "mt",
+        "BDW-ONLY",
         g7regs::HYP_FORCEWAKE_MT,
         g7regs::HYP_FORCEWAKE_MT_ACK,
         0x0000_FFFF,
         "BDW-2c-11.15-p493/p703",
-        ACK_POLL_MAX,
+        true, // mask-write form, per BDW p.493
+        FW_ACK_BUDGET_CYC,
         &before,
         &before_var,
     );
@@ -1776,11 +2047,13 @@ pub unsafe fn forcewake(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: 
         let (o, m, r, e) = try_candidate(
             bar0,
             "renfw",
+            "CHV-ONLY",
             g7regs::HYP_RENFW_REQ,
             g7regs::HYP_RENFW_ACK,
             0x0000_FFFF,
             "CHV-2c-10.15-p1078/p1077",
-            ACK_POLL_MAX,
+            false, // per-well request, not documented as a mask-write register
+            FW_ACK_BUDGET_CYC,
             &before,
             &before_var,
         );
@@ -1871,8 +2144,7 @@ pub unsafe fn forcewake(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: 
 
     // ---- The rung verdict — every arm named in source before the rung ran ------------------
     //  refused-no-bar0 / refused-bar0-too-small  parachutes, above; no write made.
-    //  both-req-preheld   both request registers were non-zero at entry → nothing written,
-    //                     nothing claimed; somebody else owns the block.
+    //  (both-req-preheld) RETIRED with the preheld guard — no candidate is skipped any more.
     //  gt-live-already    the entry battery was already live → a transition-based wake claim
     //                     is unreadable in principle. G1 is FALSE and that is a clean result;
     //                     every later rung still holds forcewake, because not holding it is a
@@ -1903,11 +2175,10 @@ pub unsafe fn forcewake(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: 
         "none"
     };
     let any_ack = out_a == Acq::AckTransition || (b_ran && out_b == Acq::AckTransition);
-    let both_preheld = out_a == Acq::SkippedPreheld && (!b_ran || out_b == Acq::SkippedPreheld);
 
-    let verdict = if both_preheld {
-        "both-req-preheld"
-    } else if pre_live {
+    // ⚠ The `both-req-preheld` arm is RETIRED with the preheld guard that produced it (R6).
+    // No candidate is skipped any more, so no boot can end in it.
+    let verdict = if pre_live {
         "gt-live-already"
     } else if woke_by != "none" {
         "gt-woke"
@@ -1949,7 +2220,6 @@ pub unsafe fn forcewake(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: 
             "gt-woke-noack" => "R3b-same-hold-and-hunt-the-ack-register-the-battery-is-the-oracle",
             "fw-acked-gt-dark" => "STOP-well-acks-but-ring-block-still-gated-report-before-another-write",
             "gt-live-already" => "R4-ggtt-claim(read-only)-holding-forcewake-from-here-on",
-            "both-req-preheld" => "STOP-request-registers-held-by-another-owner-investigate-before-any-write",
             _ => "STOP-neither-published-forcewake-pair-decodes-on-gen7-ladder-decision-goes-to-Peter",
         }
     );
@@ -3404,4 +3674,826 @@ pub unsafe fn execute(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8
         next
     );
     serial_println!(":: gen7: r5 end ::");
+}
+
+// ===================================================================================
+// R6 — THE WAKE THAT MAKES RING_CTL LATCH. Hold a forcewake candidate ACROSS the ring
+// arm, re-submit R5's store, and reclaim the pages.
+// ===================================================================================
+//
+// ## Why R6 exists, in one paragraph
+//
+// R5 flew on three boot legs and came back `verdict=enable-void`: the two GGTT PTEs landed,
+// the four RCS submission registers were programmed, `RING_CTL` was written `0x00000001` — and
+// read back `0x00000000`. The GT fabric is alive (GTFIFOCTL structured and moving; the GGTT
+// PTE round-trip proven at R4/R4b), but **the engine register block does not accept a write**.
+// R5's own `next=` named the suspect and the experiment in one line:
+// `STOP-RING_CTL-enable-did-not-latch-likely-forcewake-released-R6-must-hold-forcewake-and-rearm`.
+// R3 acquires a forcewake candidate and releases it *inside its own rung* — by design, because
+// R3's job was to measure the acquire, not to keep it. So by the time R5 writes `RING_CTL`, no
+// hold is in force. R6 is that experiment: acquire a candidate, **keep it held across the whole
+// arm/submit/teardown**, and re-run R5's sequence under it.
+//
+// ## The candidate order, and what each one is worth
+//
+// One variable per attempt, tried in a stated order, each labelled with its citation class on
+// the wire (`class=`). The rung stops at the first candidate that makes `RING_CTL` latch.
+//
+//  1. **`mt`** — `FORCE_WAKE 0x0A188` / `GTSP1 0x130044[15:0]`, **[BDW-ONLY]**, BDW-V2C
+//     pp.493/703. The only [PINNED]-adjacent candidate the ladder has: Intel documents the
+//     request register, the mask-write form, the ack register AND the poll procedure, on
+//     silicon two generations later. **This is also the candidate the retired preheld guard
+//     skipped on metal** — the misfire this rung's first deliverable fixes — so it is first.
+//  2. **`renfw`** — `0x1300B0` / `0x1300B4`, **[CHV-ONLY]**, CHV-V2C pp.1078/1077. A different
+//     SHAPE (per-power-well rather than per-thread) at a different offset: *"Driver must poll
+//     on the corresponding bit to confirm that the well has woken."* Plain write, not a mask
+//     write — the CHV pages do not document a mask field on it — so the acquire is `req_pre|1`.
+//  3. **`gtforceawake`** — `0x130090`, **[BDW-ONLY]** for the register (BDW-V2C p.656), and the
+//     **ack pairing is [EXT-UNPINNED]**: BDW says of this register only *"This field is no
+//     longer used. The multiple force wake mechanism has replaced it. Refer to MULTIFORCEWAKE
+//     0xA188"*, and names no ack partner. R6 watches `GTSP1 0x130044` as its ack because that
+//     is the ack of the mechanism BDW says replaced it — an inference, labelled as one, and
+//     the wire carries `class=BDW-ONLY-reg+EXT-UNPINNED-ack` so nobody reads it as a pin.
+//     Worth flying LAST and worth flying at all: a *legacy* wake register is exactly the kind
+//     of thing that would still be the live mechanism on the generation before the replacement.
+//
+// `MISC_CTRL0 0x0A180` is deliberately NOT a candidate. It is GPM **control**, not forcewake,
+// even on the silicon where it is pinned (BDW-V2C p.605) — writing it would be poking a power
+// controller on a hypothesis, which is a different and worse class of act than testing a
+// documented forcewake handshake.
+//
+// ## Wall D for R6 — what may and may not be concluded
+//
+//  * **`RING_CTL` readback is the instrument, and it is generator-checked by construction.**
+//    We write `0x00000001` and read back; `0x00000000` is R5's finding and `0x00000001` is the
+//    falsifier. A zero-compare is not load-bearing here because the *write value is ours* and
+//    the pass condition is that our own specific bit came back — the same shape R2's
+//    `witnessed_write` uses, applied to the register whose refusal ended R5.
+//  * **`HEAD == TAIL` is never the success test** (draft §4.4). At arm time `HEAD` reads
+//    `0x00000000` and the tail we are about to write is `0x00000020`, so they are unequal, but
+//    the rung does not rest on that either: the execution witness is the **sentinel**, a value
+//    only the GT's store could have placed in a page pre-seeded with a *different* generated
+//    pattern, read back through that page's own CPU mapping after a `clflush`. `head_moved` is
+//    reported as corroboration and never as proof.
+//  * **The battery is read under each hold BEFORE the ring is armed**, so at the moment of the
+//    dark→live comparison R6 has written none of the seventeen rows. The three counts on the
+//    wire (`live_all17` / `live_r2untouched14` / `live_r6untouched13`) let a reader discount
+//    every row this rung ever writes and still have a witness.
+//  * **`GTFIFOCTL` is the delta control.** It is this machine's only always-on GT witness
+//    (`0x0000003F` stable, Boot D) and R6 never writes it. Read at entry, under every hold and
+//    at exit: a change across an acquire is a statement about the GT, and its steadiness is a
+//    decode control proving the BAR0 window is still answering when the ring block is not.
+//
+// ## Safety — the envelope is R5's, not one inch wider
+//
+//  * **The Dark branch writes nothing.** R6 gates every write on `wake.write_ok()`, exactly as
+//    R4's PTE round-trip and R5's ring arm do. A `Dark`/`WokeNoAck` GT gets the read-only
+//    census and `verdict=r6-gated-on-wake writes=0`.
+//  * **No display register is written.** `PCH_PP_CONTROL` stays a read, in R1 and nowhere else.
+//  * **GGTT claims only into a proven-unowned window** — all-zero, or the four-leg-confirmed
+//    firmware scratch-fill (R4b) — with both bracketing neighbours captured and smear-checked
+//    at claim and at restore, and a fresh pre-write re-read that REFUSES on any drift.
+//  * **Every write is captured, restored and re-read on every exit path**: the forcewake
+//    request (to its captured entry dword, by `fw_release`), the four RCS registers (to their
+//    captured entry images, and only once the ring is CONFIRMED disabled — writing HEAD under a
+//    live ring is undefined, §1.1.11.2 p.76), and the four GGTT slots (to `base_img`).
+//  * **The PTEs are never unmapped under a live ring.** If `RING_CTL` will not clear, R6 leaves
+//    the PTEs claimed, leaks the pages, and parks loud — the R5 rule, unchanged.
+//  * **All bounds are cycle bounds** (`poll_cycles` on `now_cycles()`), never `arch::ms()`.
+//
+// ## The third deliverable — GGTT TLB invalidation, and an honest reclaim
+//
+// R5 leaked two pages per run for a stated reason: with no invalidation, a translation the GT
+// cached during the hold could outlive a free and DMA into reused kernel heap. R6 adds the rung
+// and, crucially, does **not** let an unpinned register be the reason a page goes back to the
+// allocator. See `HYP_GFX_FLSH_CNTL` and `r6 tlb`: the flush is attempted under full
+// capture/restore/re-read and gets its own three-way verdict, and the reclaim fires on that
+// verdict **or** on the independent structural leg `never-fetched` — no candidate's `RING_CTL`
+// ever read back enabled, the head never moved and no sentinel ever landed, so no engine access
+// was ever issued through either GGTT address and there is no translation to invalidate. On the
+// machine R5 flew on, `never-fetched` is the leg that will fire, and it is the stronger of the
+// two.
+
+/// R6's candidate holds, in the order the rung tries them.
+/// `(name, citation class, req_off, ack_off, ack_mask, src, mask_form)`.
+const R6_CANDS: &[(&str, &str, usize, usize, u32, &str, bool)] = &[
+    (
+        "mt",
+        "BDW-ONLY",
+        g7regs::HYP_FORCEWAKE_MT,
+        g7regs::HYP_FORCEWAKE_MT_ACK,
+        0x0000_FFFF,
+        "BDW-2c-11.15-p493/p703",
+        true,
+    ),
+    (
+        "renfw",
+        "CHV-ONLY",
+        g7regs::HYP_RENFW_REQ,
+        g7regs::HYP_RENFW_ACK,
+        0x0000_FFFF,
+        "CHV-2c-10.15-p1078/p1077",
+        false,
+    ),
+    (
+        "gtforceawake",
+        "BDW-ONLY-reg+EXT-UNPINNED-ack",
+        g7regs::HYP_GTFORCEAWAKE,
+        g7regs::HYP_FORCEWAKE_MT_ACK,
+        0x0000_FFFF,
+        "BDW-2c-11.15-p656/ack-pairing-inferred",
+        false,
+    ),
+];
+
+/// Is battery row `i` one of the four RCS submission registers R6 itself writes?
+fn r6_writes_row(i: usize) -> bool {
+    let (blk, name, _, _) = GT_BATTERY[i];
+    blk == "rcs" && matches!(name, "RING_CTL" | "RING_HEAD" | "RING_TAIL" | "RING_START")
+}
+
+/// GEN7 rung R6 — hold a forcewake candidate across the ring arm, re-submit R5's store, and
+/// reclaim the scratch pages.
+///
+/// Called from `igpu::init` immediately after `execute` (R5) and still BEFORE
+/// `bring_up_blt_ring`, taking R3's `GtWake` verdict so it self-gates on the same `write_ok()`
+/// evidence R4's PTE round-trip and R5's ring arm use.
+///
+/// # Safety
+/// Same contract as `recon`/`wake`/`forcewake`/`claim`/`execute`: `bar0` is a live MMIO mapping
+/// of at least `bar0_size` bytes of the IGD's BAR0. R6 writes, ONLY on a `write_ok()` wake, one
+/// forcewake request register at a time (restored to its captured entry dword by `fw_release`),
+/// at most two GGTT PTEs plus their two neighbours (all restored to `base_img` and re-read), the
+/// four RCS ring registers (restored to their captured entry images, only once the ring is
+/// confirmed disabled), and one [EXT-UNPINNED] GTT-flush register (restored to its captured
+/// value and re-read). It writes no display register.
+pub unsafe fn rearm(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, wake: GtWake) {
+    serial_println!(
+        ":: gen7: r6 begin rung=R6 wake={} reachable={} write_ok={} cands={} bdf={}:{}.{} bar0_size={} ladder=GEN7-3D ::",
+        wake.name(),
+        if wake.reachable() { 1 } else { 0 },
+        if wake.write_ok() { 1 } else { 0 },
+        R6_CANDS.len(),
+        bus,
+        slot,
+        func,
+        bar0_size
+    );
+
+    // ---- Parachutes, identical discipline to R1-R5 ------------------------------------
+    if bar0 == 0 {
+        serial_println!(":: gen7: r6 verdict=r6-refused-no-bar0 writes=0 — BAR0 unpublished; no read or write attempted ::");
+        serial_println!(":: gen7: r6 next=STOP-bar0-unpublished-fix-igpu-init-mapping-first note=no-hold-no-ring-armed ::");
+        serial_println!(":: gen7: r6 end ::");
+        return;
+    }
+
+    const GTT_BASE: usize = 0x200000; // igpu::regs::GTT_BASE — [EXT-UNPINNED], as R1/R4/R5 carry it
+    const SLOTS: usize = 524_288;
+    // Highest register offset R6 touches: RENFW_ACK (0x1300B4) — above both the ring block and
+    // the GTT-flush candidate. Checked against the size we were GIVEN, before any access.
+    const MAX_REG_OFF: usize = g7regs::HYP_RENFW_ACK + 4;
+    let win_next_slot = R5_TGT_SLOT + 1;
+    let win_end_off = GTT_BASE + (win_next_slot + 1) * 4;
+    if win_next_slot >= SLOTS
+        || bar0_size < win_end_off
+        || bar0_size < MAX_REG_OFF
+        || bar0_size < g7regs::HYP_GFX_FLSH_CNTL + 4
+    {
+        serial_println!(
+            ":: gen7: r6 verdict=r6-refused-bar0-too-small have={} need_win={} need_reg={} next_slot={} slots={} writes=0 ::",
+            bar0_size,
+            win_end_off,
+            MAX_REG_OFF,
+            win_next_slot,
+            SLOTS
+        );
+        serial_println!(":: gen7: r6 next=STOP-window-or-register-block-out-of-range note=no-hold-no-ring-armed ::");
+        serial_println!(":: gen7: r6 end ::");
+        return;
+    }
+
+    // ---- The delta control: GTFIFOCTL at entry (read twice, never written) -------------
+    let gtfifo_pre = rd(bar0, g7regs::HYP_GTFIFOCTL);
+    let gtfifo_pre2 = rd(bar0, g7regs::HYP_GTFIFOCTL);
+    serial_println!(
+        ":: gen7: r6 gtfifoctl col=pre off={:06X} v0={:08X} v1={:08X} cls={} varies={} pin=CHV-ONLY-p451/METAL-BootD note=always-on-GT-witness-never-written-by-any-rung ::",
+        g7regs::HYP_GTFIFOCTL,
+        gtfifo_pre,
+        gtfifo_pre2,
+        Cls::of(gtfifo_pre).name(),
+        if gtfifo_pre != gtfifo_pre2 { 1 } else { 0 }
+    );
+
+    // ---- The DARK battery column — read before R6 writes anything ---------------------
+    let mut dark = [0u32; BATTERY_N];
+    let mut dark_var = [false; BATTERY_N];
+    read_battery(bar0, "r6", "r6dark", &mut dark, &mut dark_var);
+
+    // ---- Ring-register entry images (read-only, BOTH branches) ------------------------
+    let mut ring = Tally::default();
+    let ring_start_pre = probe(bar0, "r6rcs", "RING_START", g7regs::RCS_RING_START, "IVB-PINNED", &mut ring);
+    let ring_ctl_pre = probe(bar0, "r6rcs", "RING_CTL", g7regs::RCS_RING_CTL, "IVB-PINNED", &mut ring);
+    let ring_head_pre = probe(bar0, "r6rcs", "RING_HEAD", g7regs::RCS_RING_HEAD, "IVB-PINNED", &mut ring);
+    let ring_tail_pre = probe(bar0, "r6rcs", "RING_TAIL", g7regs::RCS_RING_TAIL, "IVB-PINNED", &mut ring);
+    serial_println!(
+        ":: gen7: r6 ring-census n={} structured={} zero={} allones={} varies={} entry_start={:08X} entry_ctl={:08X} entry_head={:08X} entry_tail={:08X} note=entry-images-teardown-restores-to-THESE-not-to-a-blind-zero ::",
+        ring.n, ring.structured, ring.zero, ring.allones, ring.varies,
+        ring_start_pre, ring_ctl_pre, ring_head_pre, ring_tail_pre
+    );
+
+    // ---- Read-only census of the two-slot window + neighbours (R4b), BOTH branches ----
+    let ring_off = GTT_BASE + R5_RING_SLOT * 4;
+    let tgt_off = GTT_BASE + R5_TGT_SLOT * 4;
+    let prev_off_g = GTT_BASE + (R5_RING_SLOT - 1) * 4;
+    let next_off_g = GTT_BASE + (R5_TGT_SLOT + 1) * 4;
+    let ring_pre_img = rd(bar0, ring_off);
+    let tgt_pre_img = rd(bar0, tgt_off);
+    let prev_nb = rd(bar0, prev_off_g);
+    let next_nb = rd(bar0, next_off_g);
+    let fill = ring_pre_img;
+    let uniform = tgt_pre_img == fill && prev_nb == fill && next_nb == fill;
+    let all_zero = fill == 0 && uniform;
+    serial_println!(
+        ":: gen7: r6 window ring_slot={} tgt_slot={} ring_pre={:08X} tgt_pre={:08X} prev={:08X} next={:08X} fill={:08X} uniform={} all_zero={} base={:06X} base_pin=unpinned ::",
+        R5_RING_SLOT, R5_TGT_SLOT, ring_pre_img, tgt_pre_img, prev_nb, next_nb, fill,
+        if uniform { 1 } else { 0 },
+        if all_zero { 1 } else { 0 },
+        GTT_BASE
+    );
+
+    // R4b's four-leg scratch-fill test, unchanged: uniform incl. neighbours; valid-PTE shape
+    // with the >4 GiB extended-bit screen; frame == the BDSM base read from the host bridge THIS
+    // boot; and six distant probe slots agreeing so a locally-uniform buffer cannot impersonate
+    // the fill.
+    let uniform_nonzero = uniform && fill != 0;
+    let bdsm = crate::arch::pci::read_config_32(0, 0, 0, 0xB0);
+    let bdsm_base = bdsm & 0xFFF0_0000;
+    let fill_wellformed = (fill & 1) != 0 && (fill & 0xFFFF_F000) != 0 && (fill & 0xF0) == 0;
+    let fill_is_bdsm = (fill >> 12) == (bdsm_base >> 12);
+    let mut far_probed = 0u32;
+    let mut far_match = 0u32;
+    if uniform_nonzero {
+        for &s in R5_FAR_PROBE.iter() {
+            let off = GTT_BASE + s * 4;
+            if off + 4 > bar0_size {
+                continue; // skipping counts AGAINST the fill: fill_global demands all six
+            }
+            far_probed += 1;
+            if rd(bar0, off) == fill {
+                far_match += 1;
+            }
+        }
+    }
+    let fill_global = far_probed as usize == R5_FAR_PROBE.len() && far_match == far_probed;
+    let scratch_fill = uniform_nonzero && fill_wellformed && fill_is_bdsm && fill_global;
+    if uniform_nonzero {
+        serial_println!(
+            ":: gen7: r6 fill-check fill={:08X} bdsm={:08X} bdsm_base={:08X} wellformed={} frame_is_bdsm={} far_match={}/{} far_probed={} scratch_fill={} src=METAL/BootAb dec=derived-this-boot ::",
+            fill, bdsm, bdsm_base,
+            if fill_wellformed { 1 } else { 0 },
+            if fill_is_bdsm { 1 } else { 0 },
+            far_match, R5_FAR_PROBE.len(), far_probed,
+            if scratch_fill { 1 } else { 0 }
+        );
+    }
+
+    // ---- Branch on R3's verdict. The Dark branch writes NOTHING (binding invariant). ----
+    if !wake.write_ok() {
+        serial_println!(
+            ":: gen7: r6 verdict=r6-gated-on-wake wake={} reachable={} ring_structured={}/{} all_zero={} scratch_fill={} writes=0 note=no-hold-attempted-no-ring-armed-no-GGTT-touched-behind-an-unconfirmed-wake ::",
+            wake.name(),
+            if wake.reachable() { 1 } else { 0 },
+            ring.structured, ring.n,
+            if all_zero { 1 } else { 0 },
+            if scratch_fill { 1 } else { 0 }
+        );
+        serial_println!(":: gen7: r6 next=STOP-R3-did-not-confirm-a-wake-R6-needs-the-same-write_ok-gate-R4-and-R5-use note=no-hold-no-ring-armed ::");
+        serial_println!(":: gen7: r6 end ::");
+        return;
+    }
+    if !all_zero && !scratch_fill {
+        let v = if uniform_nonzero { "r6-fill-hypothesis-refuted" } else { "r6-range-owned-refused" };
+        serial_println!(
+            ":: gen7: r6 verdict={} fill={:08X} ring_pre={:08X} tgt_pre={:08X} prev={:08X} next={:08X} bdsm_base={:08X} writes=0 note=window-is-not-provably-unowned-never-overwrite-a-populated-PTE ::",
+            v, fill, ring_pre_img, tgt_pre_img, prev_nb, next_nb, bdsm_base
+        );
+        serial_println!(":: gen7: r6 next=STOP-candidate-window-owned-or-fill-leg-said-NO-park-and-report note=no-hold-no-ring-armed ::");
+        serial_println!(":: gen7: r6 end ::");
+        return;
+    }
+    let base_img: u32 = if all_zero { 0 } else { fill };
+    let mode = if all_zero { "empty" } else { "scratch-fill" };
+
+    // ---- Allocate the two pages ONCE for the whole rung -------------------------------
+    // R5 allocated per run; R6 runs up to three candidates and allocates ONCE, so the rung's
+    // maximum footprint is the same two pages R5 had — and the reclaim decision at the end is a
+    // single decision about a single pair, not three.
+    let layout = Layout::from_size_align(4096, 4096).unwrap();
+    let ring_page = alloc_zeroed(layout);
+    if ring_page.is_null() {
+        serial_println!(":: gen7: r6 verdict=r6-alloc-failed which=ring writes=0 note=nothing-written ::");
+        serial_println!(":: gen7: r6 next=STOP-no-ring-page note=no-hold-no-ring-armed ::");
+        serial_println!(":: gen7: r6 end ::");
+        return;
+    }
+    let tgt_page = alloc_zeroed(layout);
+    if tgt_page.is_null() {
+        // `ring_page` is leaked, not freed: nothing has mapped it, but refuse-on-any-doubt.
+        serial_println!(":: gen7: r6 verdict=r6-alloc-failed which=target writes=0 note=ring-page-leaked-nothing-written ::");
+        serial_println!(":: gen7: r6 next=STOP-no-target-page note=no-hold-no-ring-armed ::");
+        serial_println!(":: gen7: r6 end ::");
+        return;
+    }
+    let Some(ring_phys64) = crate::arch::memory::translate(ring_page as u64) else {
+        serial_println!(":: gen7: r6 verdict=r6-virt-unmapped which=ring va={:016X} writes=0 note=pages-leaked-nothing-written ::", ring_page as usize);
+        serial_println!(":: gen7: r6 next=STOP-ring-va-unmapped note=no-hold-no-ring-armed ::");
+        serial_println!(":: gen7: r6 end ::");
+        return;
+    };
+    let Some(tgt_phys64) = crate::arch::memory::translate(tgt_page as u64) else {
+        serial_println!(":: gen7: r6 verdict=r6-virt-unmapped which=target va={:016X} writes=0 note=pages-leaked-nothing-written ::", tgt_page as usize);
+        serial_println!(":: gen7: r6 next=STOP-target-va-unmapped note=no-hold-no-ring-armed ::");
+        serial_println!(":: gen7: r6 end ::");
+        return;
+    };
+    let ring_phys = ring_phys64 as usize;
+    let tgt_phys = tgt_phys64 as usize;
+    if ring_phys >= 0x1_0000_0000 || tgt_phys >= 0x1_0000_0000 {
+        serial_println!(":: gen7: r6 verdict=r6-phys-above-4g ring_phys={:016X} tgt_phys={:016X} writes=0 note=extended-PTE-bits-not-programmed-pages-leaked-nothing-written ::", ring_phys, tgt_phys);
+        serial_println!(":: gen7: r6 next=STOP-scratch-phys-above-4g note=no-hold-no-ring-armed ::");
+        serial_println!(":: gen7: r6 end ::");
+        return;
+    }
+    let ring_pte = (ring_phys as u32) | GGTT_PTE_VALID;
+    let tgt_pte = (tgt_phys as u32) | GGTT_PTE_VALID;
+    if ring_pte == base_img || tgt_pte == base_img {
+        serial_println!(
+            ":: gen7: r6 verdict=r6-pte-indistinct mode={} ring_pte={:08X} tgt_pte={:08X} base_img={:08X} writes=0 note=transition-unwitnessable-pages-leaked-nothing-written ::",
+            mode, ring_pte, tgt_pte, base_img
+        );
+        serial_println!(":: gen7: r6 next=STOP-pte-equals-entry-image note=no-hold-no-ring-armed ::");
+        serial_println!(":: gen7: r6 end ::");
+        return;
+    }
+    let ring_gtt_addr = (R5_RING_SLOT * 4096) as u32;
+    let tgt_gtt_addr = (R5_TGT_SLOT * 4096) as u32;
+    // RING_BUFFER_START constraint (§1.1.11.3 p.77): the ring's GGTT address bits[31:29] MUST be
+    // zero. `R5_RING_SLOT` satisfies it, but the constraint is load-bearing, so it is checked
+    // rather than trusted — a future edit to the slot that broke it would park here.
+    // ⚠ HONEST NOTE ON THE STRINGS PROOF (and the same is true of R5's identical guard):
+    // `ring_gtt_addr` is a compile-time constant, so rustc proves this branch dead and strips
+    // the verdict string from the artifact. `strings` therefore does NOT find
+    // `r6-ring-addr-illegal`, and that is the guard being *stronger* than a runtime check, not
+    // absent: the invariant is discharged at compile time. If the slot is ever changed to a
+    // non-constant, the branch (and its token) come back.
+    if ring_gtt_addr & 0xE000_0000 != 0 {
+        serial_println!(
+            ":: gen7: r6 verdict=r6-ring-addr-illegal ring_gtt_addr={:08X} writes=0 note=RING_START-requires-bits-31:29-zero-IVB-V1P3-1.1.11.3-p77 ::",
+            ring_gtt_addr
+        );
+        serial_println!(":: gen7: r6 next=STOP-ring-address-violates-RING_START-31:29-zero note=no-hold-no-ring-armed ::");
+        serial_println!(":: gen7: r6 end ::");
+        return;
+    }
+
+    // ---- Pre-write gate: re-read the four touched slots against a fresh baseline ------
+    let prev_pre = rd(bar0, prev_off_g);
+    let next_pre = rd(bar0, next_off_g);
+    if rd(bar0, ring_off) != base_img || rd(bar0, tgt_off) != base_img || prev_pre != base_img || next_pre != base_img {
+        serial_println!(
+            ":: gen7: r6 verdict=r6-entry-drifted mode={} base_img={:08X} writes=0 note=window-changed-between-census-and-claim-pages-leaked-nothing-written ::",
+            mode, base_img
+        );
+        serial_println!(":: gen7: r6 next=STOP-entry-image-drifted-park-and-report note=no-hold-no-ring-armed ::");
+        serial_println!(":: gen7: r6 end ::");
+        return;
+    }
+
+    // ---- Build the ring contents through the ring page's CPU mapping ------------------
+    // Identical to R5: one MI_STORE_DATA_IMM (DW0 header, DW1 reserved MBZ, DW2 target GGTT
+    // address, DW3 sentinel) then four MI_NOOP. 8 DWords = 32 bytes = QWord-aligned tail.
+    let ring_u32 = ring_page as *mut u32;
+    for i in 0..1024usize {
+        core::ptr::write_volatile(ring_u32.add(i), MI_NOOP);
+    }
+    core::ptr::write_volatile(ring_u32.add(0), MI_STORE_DATA_IMM_DW0);
+    core::ptr::write_volatile(ring_u32.add(1), 0x0000_0000);
+    core::ptr::write_volatile(ring_u32.add(2), tgt_gtt_addr);
+    core::ptr::write_volatile(ring_u32.add(3), R5_SENTINEL);
+    core::ptr::write_volatile(ring_u32.add(4), MI_NOOP);
+    core::ptr::write_volatile(ring_u32.add(5), MI_NOOP);
+    core::ptr::write_volatile(ring_u32.add(6), MI_NOOP);
+    core::ptr::write_volatile(ring_u32.add(7), MI_NOOP);
+    const RING_TAIL_BYTES: u32 = 8 * 4;
+    let tgt_u32 = tgt_page as *mut u32;
+
+    // ---- Claim the two GGTT slots (once, for the whole candidate loop) ----------------
+    wr(bar0, ring_off, ring_pte);
+    wr(bar0, tgt_off, tgt_pte);
+    let ring_slot_held = rd(bar0, ring_off);
+    let tgt_slot_held = rd(bar0, tgt_off);
+    let prev_held = rd(bar0, prev_off_g);
+    let next_held = rd(bar0, next_off_g);
+    let ptes_landed = ring_slot_held == ring_pte && tgt_slot_held == tgt_pte;
+    let smear_held = prev_held != prev_pre || next_held != next_pre;
+    serial_println!(
+        ":: gen7: r6 claim mode={} ring_off={:06X} ring_pte={:08X} ring_held={:08X} tgt_off={:06X} tgt_pte={:08X} tgt_held={:08X} ptes_landed={} smear_held={} ring_phys={:016X} tgt_phys={:016X} ::",
+        mode, ring_off, ring_pte, ring_slot_held, tgt_off, tgt_pte, tgt_slot_held,
+        if ptes_landed { 1 } else { 0 },
+        if smear_held { 1 } else { 0 },
+        ring_phys, tgt_phys
+    );
+
+    // ---- The candidate loop ----------------------------------------------------------
+    // Rung-wide trackers. `all_disabled` is the safety one: it must stay true for the PTEs to be
+    // unmapped at all.
+    let mut attempts = 0u32;
+    let mut any_ctl_enabled = false;
+    let mut any_head_moved = false;
+    let mut any_sentinel = false;
+    let mut all_disabled = true;
+    let mut all_regs_restored = true;
+    let mut all_fw_restored = true;
+    let mut fw_evidence_any = false;
+    let mut winner = "none";
+    // Seeded with the not-landed arm. The candidate loop overwrites it on every path it can
+    // take, and `R6_CANDS` is a non-empty const slice, so there is no "no candidate ran" arm to
+    // name — the compiler proves the loop body runs whenever the claim landed.
+    let mut exec_verdict = "r6-claim-write-void";
+    let mut best_ctl_readback = 0u32;
+
+    if ptes_landed && !smear_held {
+        for &(cand, class_pin, req_off, ack_off, ack_mask, src, mask_form) in R6_CANDS.iter() {
+            attempts += 1;
+
+            // (1) ACQUIRE — and HOLD. Unlike R3, the release does not happen until after the
+            // ring is armed, submitted, drained, disabled and its registers restored.
+            let hold = fw_acquire(
+                bar0, "r6", cand, class_pin, req_off, ack_off, ack_mask, src, mask_form,
+                FW_ACK_BUDGET_CYC,
+            );
+
+            // (2) THE BATTERY, UNDER THE HOLD, BEFORE ANY RING WRITE. At this instant R6 has
+            // written none of the seventeen rows, so all three counts are honest witnesses.
+            let mut held_col = [0u32; BATTERY_N];
+            let mut held_var = [false; BATTERY_N];
+            read_battery(bar0, "r6", cand, &mut held_col, &mut held_var);
+            let m_all = motion(&dark, &dark_var, &held_col, &held_var);
+            let m_r2 = motion_filtered(&dark, &dark_var, &held_col, &held_var, |i| !GT_BATTERY[i].3);
+            let m_r6 = motion_filtered(&dark, &dark_var, &held_col, &held_var, |i| !r6_writes_row(i));
+            serial_println!(
+                ":: gen7: r6 cand={} class={} battery live_all17={} struct_all17={} varies_all17={} live_r2untouched14={} struct_r2untouched14={} live_r6untouched13={} struct_r6untouched13={} varies_r6untouched13={} ::",
+                cand, class_pin,
+                if m_all.live() { 1 } else { 0 }, m_all.gone_struct, m_all.varies,
+                if m_r2.live() { 1 } else { 0 }, m_r2.gone_struct,
+                if m_r6.live() { 1 } else { 0 }, m_r6.gone_struct, m_r6.varies
+            );
+
+            // (3) THE DELTA CONTROL under this hold — a register no rung writes.
+            let gtf_a = rd(bar0, g7regs::HYP_GTFIFOCTL);
+            let gtf_b = rd(bar0, g7regs::HYP_GTFIFOCTL);
+            serial_println!(
+                ":: gen7: r6 gtfifoctl col=held cand={} v0={:08X} v1={:08X} pre={:08X} delta={} varies={} cls={} ::",
+                cand, gtf_a, gtf_b, gtfifo_pre,
+                if gtf_a != gtfifo_pre { 1 } else { 0 },
+                if gtf_a != gtf_b { 1 } else { 0 },
+                Cls::of(gtf_a).name()
+            );
+
+            // (4) ARM THE RING — under the hold. Re-seed the target first so a hit is a
+            // transition on THIS attempt, not a leftover from the previous candidate.
+            core::ptr::write_volatile(tgt_u32, R5_TGT_SEED);
+            clflush_range(ring_page as usize, 4096);
+            clflush_range(tgt_page as usize, 4096);
+            let tgt_seed_rb = core::ptr::read_volatile(tgt_u32 as *const u32);
+
+            wr(bar0, g7regs::RCS_RING_CTL, 0);
+            wr(bar0, g7regs::RCS_RING_START, ring_gtt_addr);
+            wr(bar0, g7regs::RCS_RING_HEAD, 0);
+            wr(bar0, g7regs::RCS_RING_TAIL, 0);
+            wr(bar0, g7regs::RCS_RING_CTL, RCS_RING_CTL_1PAGE_EN);
+            let ctl_readback = rd(bar0, g7regs::RCS_RING_CTL);
+            let armed = ctl_readback & 1 == 1;
+            let head_at_arm = rd(bar0, g7regs::RCS_RING_HEAD) & RING_HEAD_OFF_MASK;
+
+            // (5) SUBMIT and poll — only if the enable latched.
+            let mut head_post = head_at_arm;
+            let mut tgt_post = tgt_seed_rb;
+            let mut iters = 0u32;
+            let mut cyc = 0u64;
+            if armed {
+                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+                wr(bar0, g7regs::RCS_RING_TAIL, RING_TAIL_BYTES);
+                let (_hit, it, cy) = poll_cycles(EXEC_BUDGET_CYC, || {
+                    head_post = rd(bar0, g7regs::RCS_RING_HEAD) & RING_HEAD_OFF_MASK;
+                    clflush_range(tgt_page as usize, 4);
+                    tgt_post = core::ptr::read_volatile(tgt_u32 as *const u32);
+                    // Generator-checked: the SENTINEL is the witness. `head_post == tail` is a
+                    // loop exit, never the proof (draft §4.4 — HEAD==TAIL is the dead-GT trap).
+                    tgt_post == R5_SENTINEL || head_post == RING_TAIL_BYTES
+                });
+                iters = it;
+                cyc = cy;
+                clflush_range(tgt_page as usize, 4);
+                tgt_post = core::ptr::read_volatile(tgt_u32 as *const u32);
+            }
+            let head_moved = armed && head_post != head_at_arm;
+            let sentinel_hit = tgt_post == R5_SENTINEL;
+
+            // THE witness line the brief names.
+            serial_println!(
+                ":: gen7: r6 cand={} class={} ctl_wrote={:08X} ctl_readback={:08X} ctl_enabled={} head_at_arm={:08X} head_post={:08X} head_moved={} tail={:08X} tgt_seed={:08X} tgt_post={:08X} sentinel={:08X} sentinel_hit={} armed={} iters={} cyc={} budget={} ::",
+                cand, class_pin,
+                RCS_RING_CTL_1PAGE_EN, ctl_readback, ctl_readback & 1,
+                head_at_arm, head_post,
+                if head_moved { 1 } else { 0 },
+                RING_TAIL_BYTES, tgt_seed_rb, tgt_post, R5_SENTINEL,
+                if sentinel_hit { 1 } else { 0 },
+                if armed { 1 } else { 0 },
+                iters, cyc, EXEC_BUDGET_CYC
+            );
+
+            // (6) TEARDOWN — STILL UNDER THE HOLD, because that is the point of the rung: the
+            // disable and the register restore are writes to the same gated block, and doing
+            // them after the release would repeat R5's mistake in reverse.
+            let mut ring_idle = true;
+            let mut drain_iters = 0u32;
+            if armed {
+                let (idle, it, _cy) = poll_cycles(DRAIN_BUDGET_CYC, || {
+                    (rd(bar0, g7regs::RCS_RING_HEAD) & RING_HEAD_OFF_MASK) == RING_TAIL_BYTES
+                });
+                ring_idle = idle;
+                drain_iters = it;
+            }
+            wr(bar0, g7regs::RCS_RING_CTL, 0);
+            let ctl_off = rd(bar0, g7regs::RCS_RING_CTL);
+            let ring_disabled = ctl_off & 1 == 0;
+            let mut regs_restored = false;
+            if ring_disabled {
+                wr(bar0, g7regs::RCS_RING_TAIL, ring_tail_pre);
+                wr(bar0, g7regs::RCS_RING_HEAD, ring_head_pre);
+                wr(bar0, g7regs::RCS_RING_START, ring_start_pre);
+                wr(bar0, g7regs::RCS_RING_CTL, ring_ctl_pre);
+                let s = rd(bar0, g7regs::RCS_RING_START);
+                let c = rd(bar0, g7regs::RCS_RING_CTL);
+                let h = rd(bar0, g7regs::RCS_RING_HEAD);
+                let t = rd(bar0, g7regs::RCS_RING_TAIL);
+                regs_restored = s == ring_start_pre
+                    && c == ring_ctl_pre
+                    && (h & RING_HEAD_OFF_MASK) == (ring_head_pre & RING_HEAD_OFF_MASK)
+                    && t == ring_tail_pre;
+                serial_println!(
+                    ":: gen7: r6 cand={} ring-restore start={:08X}/{:08X} ctl={:08X}/{:08X} head={:08X}/{:08X} tail={:08X}/{:08X} ok={} ring_idle={} drain_iters={} ::",
+                    cand, s, ring_start_pre, c, ring_ctl_pre, h, ring_head_pre, t, ring_tail_pre,
+                    if regs_restored { 1 } else { 0 },
+                    if ring_idle { 1 } else { 0 },
+                    drain_iters
+                );
+            } else {
+                serial_println!(
+                    ":: gen7: r6 cand={} ring-restore SKIPPED ctl_off={:08X} note=ring-would-not-disable-writing-HEAD-under-a-live-ring-is-UNDEFINED-1.1.11.2-p76 ::",
+                    cand, ctl_off
+                );
+            }
+
+            // (7) RELEASE the hold, and verify it against the captured entry dword.
+            let (fw_restored, fw_evidence) = fw_release(bar0, "r6", &hold);
+
+            all_disabled &= ring_disabled;
+            all_regs_restored &= regs_restored || !ring_disabled;
+            all_fw_restored &= fw_restored;
+            fw_evidence_any |= fw_evidence;
+            any_ctl_enabled |= armed;
+            any_head_moved |= head_moved;
+            any_sentinel |= sentinel_hit;
+            if armed && ctl_readback > best_ctl_readback {
+                best_ctl_readback = ctl_readback;
+            }
+
+            let this = if !armed {
+                "enable-void"
+            } else if sentinel_hit && head_post == RING_TAIL_BYTES {
+                "sentinel-hit"
+            } else if sentinel_hit {
+                "sentinel-hit-head-stuck"
+            } else if head_post == RING_TAIL_BYTES {
+                "sentinel-miss"
+            } else if head_moved {
+                "head-stuck-partial"
+            } else {
+                "head-stuck"
+            };
+            serial_println!(
+                ":: gen7: r6 cand={} class={} attempt_verdict={} acked={} classification={} ring_disabled={} fw_restored={} fw_evidence={} ::",
+                cand, class_pin, this,
+                if hold.acked() { 1 } else { 0 },
+                hold.class.name(),
+                if ring_disabled { 1 } else { 0 },
+                if fw_restored { 1 } else { 0 },
+                if fw_evidence { 1 } else { 0 }
+            );
+
+            // (8) STOP AT THE FIRST CANDIDATE THAT MAKES THE ENABLE LATCH. That is the rung's
+            // whole question; spending further candidates after it is answered would only muddy
+            // attribution (draft §5, one variable per boot).
+            if armed {
+                winner = cand;
+                exec_verdict = match this {
+                    "sentinel-hit" => "r6-sentinel-hit",
+                    "sentinel-hit-head-stuck" => "r6-sentinel-hit-head-stuck",
+                    "sentinel-miss" => "r6-sentinel-miss",
+                    "head-stuck-partial" => "r6-head-stuck-partial",
+                    _ => "r6-head-stuck",
+                };
+                break;
+            }
+            // A candidate whose teardown could not disable the ring must not be followed by
+            // another arm — park the loop and let the safety verdict carry.
+            if !ring_disabled {
+                exec_verdict = "r6-ring-would-not-disable";
+                break;
+            }
+            exec_verdict = "r6-enable-void-under-every-hold";
+        }
+    }
+
+    // ---- The GGTT restore. NEVER under a live ring. -----------------------------------
+    let mut ptes_restored = false;
+    let mut smear_post = false;
+    if all_disabled {
+        wr(bar0, prev_off_g, base_img);
+        wr(bar0, ring_off, base_img);
+        wr(bar0, tgt_off, base_img);
+        wr(bar0, next_off_g, base_img);
+        let ring_post_pte = rd(bar0, ring_off);
+        let tgt_post_pte = rd(bar0, tgt_off);
+        let prev_post = rd(bar0, prev_off_g);
+        let next_post = rd(bar0, next_off_g);
+        ptes_restored = ring_post_pte == base_img
+            && tgt_post_pte == base_img
+            && prev_post == base_img
+            && next_post == base_img;
+        smear_post = prev_post != prev_pre || next_post != next_pre;
+        serial_println!(
+            ":: gen7: r6 ggtt-restore ring_post={:08X} tgt_post={:08X} prev_post={:08X} next_post={:08X} base_img={:08X} ptes_restored={} smear_post={} ::",
+            ring_post_pte, tgt_post_pte, prev_post, next_post, base_img,
+            if ptes_restored { 1 } else { 0 },
+            if smear_post { 1 } else { 0 }
+        );
+    } else {
+        serial_println!(
+            ":: gen7: r6 ggtt-restore SKIPPED note=a-candidate-left-the-ring-enabled-PTEs-LEFT-CLAIMED-unmapping-a-page-a-live-engine-may-DMA-is-the-corruption-this-rung-avoids ::"
+        );
+    }
+
+    // ---- R6c — THE GGTT TLB-INVALIDATION RUNG, and the reclaim it gates ---------------
+    //
+    // The write is captured, made, read back, restored to the captured value and re-read —
+    // the same discipline every other write in this module carries. Three-way verdict, and the
+    // middle arm is the honest one: a self-clearing flush register and a non-decoding offset
+    // BOTH read back their entry value, and nothing readable on this part separates them. The
+    // rung says so instead of scoring a silent write as a success.
+    let flsh_pre = rd(bar0, g7regs::HYP_GFX_FLSH_CNTL);
+    let flsh_post = witnessed_write(bar0, "r6", "GFX_FLSH_CNTL", g7regs::HYP_GFX_FLSH_CNTL, 1, "EXT-UNPINNED");
+    witnessed_write(bar0, "r6", "GFX_FLSH_RESTORE", g7regs::HYP_GFX_FLSH_CNTL, flsh_pre, "EXT-UNPINNED");
+    let flsh_rest = rd(bar0, g7regs::HYP_GFX_FLSH_CNTL);
+    let flsh_restored = flsh_rest == flsh_pre;
+    let tlb_verdict = if flsh_post != flsh_pre {
+        "tlb-flush-decodes"
+    } else if flsh_pre == 0xFFFF_FFFF {
+        "tlb-flush-allones"
+    } else {
+        "tlb-flush-write-silent"
+    };
+    let flush_positive = tlb_verdict == "tlb-flush-decodes";
+
+    // The independent structural leg. If no candidate's enable ever latched, the head never
+    // moved and no sentinel ever landed, then no engine access was ever issued through either
+    // GGTT address — so there is no cached translation to outlive the free, and the reclaim
+    // rests on a proof rather than on an unpinned register.
+    let never_fetched = !any_ctl_enabled && !any_head_moved && !any_sentinel;
+    let reversal_clean = all_disabled && ptes_restored && !smear_post && all_regs_restored;
+    let reclaim = reversal_clean && (never_fetched || flush_positive);
+    let reclaim_reason = if !reversal_clean {
+        "reversal-not-clean"
+    } else if never_fetched {
+        "never-fetched"
+    } else if flush_positive {
+        "flush-verdict"
+    } else {
+        "no-invalidation-evidence"
+    };
+    serial_println!(
+        ":: gen7: r6 tlb verdict={} off={:06X} pin=EXT-UNPINNED pre={:08X} wrote={:08X} post={:08X} restored_to={:08X} restore_ok={} flush_positive={} never_fetched={} reversal_clean={} reclaim={} reclaim_reason={} pages=2 note=an-unpinned-register-is-never-the-sole-reason-a-page-goes-back-to-the-heap ::",
+        tlb_verdict,
+        g7regs::HYP_GFX_FLSH_CNTL,
+        flsh_pre,
+        1u32,
+        flsh_post,
+        flsh_rest,
+        if flsh_restored { 1 } else { 0 },
+        if flush_positive { 1 } else { 0 },
+        if never_fetched { 1 } else { 0 },
+        if reversal_clean { 1 } else { 0 },
+        if reclaim { "freed" } else { "leaked" },
+        reclaim_reason
+    );
+
+    if reclaim {
+        dealloc(ring_page, layout);
+        dealloc(tgt_page, layout);
+        serial_println!(
+            ":: gen7: r6 reclaim=freed pages=2 bytes=8192 reason={} note=R5s-leak-closed-the-two-scratch-pages-are-back-on-the-heap ::",
+            reclaim_reason
+        );
+    } else {
+        let _ = (ring_page, tgt_page, layout);
+        serial_println!(
+            ":: gen7: r6 reclaim=leaked pages=2 bytes=8192 reason={} note=refuse-on-any-doubt-a-page-a-GT-may-hold-a-translation-to-never-goes-back-to-the-allocator ::",
+            reclaim_reason
+        );
+    }
+
+    // ---- The exit columns -------------------------------------------------------------
+    let gtfifo_post = rd(bar0, g7regs::HYP_GTFIFOCTL);
+    let gtfifo_post2 = rd(bar0, g7regs::HYP_GTFIFOCTL);
+    serial_println!(
+        ":: gen7: r6 gtfifoctl col=post v0={:08X} v1={:08X} pre={:08X} delta={} varies={} ::",
+        gtfifo_post, gtfifo_post2, gtfifo_pre,
+        if gtfifo_post != gtfifo_pre { 1 } else { 0 },
+        if gtfifo_post != gtfifo_post2 { 1 } else { 0 }
+    );
+    let mut after = [0u32; BATTERY_N];
+    let mut after_var = [false; BATTERY_N];
+    read_battery(bar0, "r6", "r6post", &mut after, &mut after_var);
+    let mut battery_moved = 0u32;
+    for i in 0..BATTERY_N {
+        if after[i] != dark[i] {
+            battery_moved += 1;
+        }
+    }
+
+    // ---- The rung verdict --------------------------------------------------------------
+    //  r6-gated-on-wake              R3 did not confirm a wake; nothing written.
+    //  r6-range-owned-refused        the GGTT window is not provably unowned; nothing written.
+    //  r6-fill-hypothesis-refuted    uniform window, but a scratch-fill leg said NO.
+    //  r6-claim-write-void           a PTE did not land, or a neighbour smeared.
+    //  r6-enable-void-under-every-hold  THE DECISIVE NEGATIVE. Every candidate hold was taken,
+    //                                and RING_CTL still read back 0. The engine register domain
+    //                                is not writable on this part on any documented register,
+    //                                and the x86 engine-offload programme is dead on documented
+    //                                registers. A finding worth the boot, and stated as one.
+    //  r6-sentinel-hit               THE WIN. The enable latched under a held wake and the GT
+    //                                executed MI_STORE_DATA_IMM.
+    //  r6-sentinel-hit-head-stuck    the store landed but the head did not retire the ring.
+    //  r6-sentinel-miss              the head retired without the store taking effect.
+    //  r6-head-stuck / -partial      the enable latched but the CS did not parse the bare ring
+    //                                — the §1.1.11.4 p.79 default-context caveat coming true,
+    //                                and a strictly better place to stand than R5 ended.
+    //  r6-ring-would-not-disable     SAFETY: the PTEs are left claimed under a possibly-live
+    //                                engine. Overrides every exec reading.
+    let safety_override = !all_disabled;
+    serial_println!(
+        ":: gen7: r6 verdict={} by={} mode={} wake={} attempts={}/{} any_ctl_enabled={} best_ctl_readback={:08X} any_head_moved={} any_sentinel={} battery_moved={}/{} fw_restored={} fw_evidence={} ring_regs_restored={} ptes_restored={} smear_post={} reclaim={} tlb={} rung=R6 note=hold-was-kept-ACROSS-the-arm-and-the-teardown-no-display-register-touched ::",
+        if safety_override { "r6-ring-would-not-disable" } else { exec_verdict },
+        winner, mode, wake.name(),
+        attempts, R6_CANDS.len(),
+        if any_ctl_enabled { 1 } else { 0 },
+        best_ctl_readback,
+        if any_head_moved { 1 } else { 0 },
+        if any_sentinel { 1 } else { 0 },
+        battery_moved, BATTERY_N,
+        if all_fw_restored { 1 } else { 0 },
+        if fw_evidence_any { "real" } else { "blind" },
+        if all_regs_restored { 1 } else { 0 },
+        if ptes_restored { 1 } else { 0 },
+        if smear_post { 1 } else { 0 },
+        if reclaim { "freed" } else { "leaked" },
+        tlb_verdict
+    );
+
+    let next = if safety_override {
+        "STOP-ring-would-not-disable-PTEs-LEFT-CLAIMED-under-a-live-ring-do-NOT-reuse-these-pages"
+    } else {
+        match exec_verdict {
+            "r6-sentinel-hit" =>
+                "R7-a-real-batch-buffer-MI_BATCH_BUFFER_START-and-a-PIPE_CONTROL-flush-under-the-same-held-wake",
+            "r6-sentinel-hit-head-stuck" =>
+                "STOP-store-executed-but-head-did-not-retire-investigate-CS-arbitration-before-R7",
+            "r6-sentinel-miss" =>
+                "STOP-head-retired-but-no-store-check-privilege-and-MI_STORE_DATA_IMM-address-encoding",
+            "r6-head-stuck" | "r6-head-stuck-partial" =>
+                "R7-the-enable-LATCHES-under-a-held-wake-the-CS-needs-a-default-render-context-per-1.1.11.4-p79",
+            "r6-claim-write-void" =>
+                "STOP-GGTT-write-did-not-land-even-before-a-hold-re-run-R4-before-any-further-ring-work",
+            "r6-enable-void-under-every-hold" =>
+                "STOP-RING_CTL-REFUSED-UNDER-EVERY-DOCUMENTED-HOLD-x86-engine-offload-is-DEAD-on-documented-registers-GEN7-vs-Kepler-decision-goes-to-Peter",
+            // Unreachable: every value `exec_verdict` can hold is named above. Rust still
+            // requires the arm on a `&str` match.
+            _ => "STOP-unnamed-exec-verdict-read-the-cand-lines",
+        }
+    };
+    serial_println!(":: gen7: r6 next={} note=every-write-captured-restored-and-re-read-on-every-exit-path ::", next);
+    serial_println!(":: gen7: r6 end ::");
 }
