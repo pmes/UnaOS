@@ -1460,6 +1460,15 @@ const BT_C1_PAGE_TIMEOUT: u16 = 0x2000;
 /// power-cycled into pairing mode is also servicing inquiry scan and (for a speaker) reconnection
 /// attempts to hosts it remembers. A second train samples a different phase of that schedule.
 ///
+/// THAT WAS AN ASSUMPTION UNTIL BOOT 3 MEASURED IT, AND IT WAS FALSE. BT-C1-DISCRIM's phase
+/// witness put the retry gap at 5125 ms against R2's 2560 ms scan interval — 5 ms from two whole
+/// cycles — so the second train sampled the SAME phase, on a parameter block built before the
+/// first train and re-sent unchanged. Two timeouts were one observation. The retry therefore no
+/// longer takes whatever gap the page timeout leaves it: it REBUILDS its parameter block from the
+/// freshest inquiry state (`bt_c1_page_fields`) and is DELAYED so its start sits about half a scan
+/// interval off a whole multiple (`bt_c1_phase_step_ms`). Both intentions are printed against what
+/// the clock measured, so a retry that still tests nothing says so on its own line.
+///
 /// THE BOUND, counted properly rather than quoted as the paging time alone: 2 attempts x 5.12 s is
 /// ~10.3 s of PAGING, but the stage also spends 2 x `BT_C1_CONN_MS` (5600 ms) of host window — the
 /// controller's Page Timeout normally lands first, so these overlap the paging rather than adding
@@ -1467,7 +1476,9 @@ const BT_C1_PAGE_TIMEOUT: u16 = 0x2000;
 /// one `hw_wait_budget()` (~1.1 s) if `HCI_Write_Page_Timeout` itself goes unanswered — and, as of
 /// the inquiry arc, the inquiry in front of it: `BT_C1_INQUIRY_MS` (5600 ms) plus two
 /// `BT_L3_CMD_MS` round trips, ~6.2 s, and only on a boot where the target never answers it. **The
-/// bounded worst case for the whole classic stage is therefore ~18.6 s**, not the ~12.4 s this
+/// bounded worst case for the whole classic stage is therefore ~18.6 s** — plus the retry's phase
+/// step, at most half a scan interval and so **<= 1.28 s** on the worst mode (R2), 0 on R0 and 0
+/// on a first train — not the ~12.4 s this
 /// comment quoted before the inquiry existed and not the ~10.2 s an earlier draft quoted; with the
 /// LE stage's repeat scan in front of it the worst boot is ~21 s. THE GOOD CASE IS MUCH SHORTER
 /// AND IS THE POINT: an inquiry that hears the target exits early, and the page it then makes is
@@ -2052,6 +2063,52 @@ fn bt_c1_scan_interval_ms(psrm: u8) -> u64 {
         _ => 2560,
     }
 }
+
+/// BT-C1/PHASE-STEP — the residue a retry train DELIBERATELY aims for inside the peer's scan
+/// cycle: half the interval `psrm` implies. R0 is 0 because a continuously scanning peer has no
+/// cycle to step within, and delaying a train against it would cost time for nothing.
+///
+/// HALF, not a quarter or a third, because half is the residue FURTHEST from a whole multiple in
+/// both directions: whatever the first train's phase was, a second train landing half an interval
+/// away is maximally distant from repeating it and equally distant from the next multiple. It is a
+/// choice about the EXPERIMENT, not a claim about the peer — this host cannot see the peer's scan
+/// schedule, only the gaps between its own trains, and the most it can do is guarantee that gap is
+/// not a whole number of the peer's cycles.
+///
+/// BOOT 3 IS WHY THIS EXISTS. Its CANDIDATE-2 line measured the retry gap at 5125 ms against the
+/// 2560 ms interval R2 implies — 5 ms from exactly two whole cycles — and printed, correctly, that
+/// the retry had re-run the first experiment rather than testing anything new.
+#[cfg(feature = "btc")]
+fn bt_c1_phase_step_ms(psrm: u8) -> u64 {
+    bt_c1_scan_interval_ms(psrm) / 2
+}
+
+/// BT-C1/REHARVEST — the page's two air-derived parameters, selected from the inquiry state AS IT
+/// STANDS AT THE MOMENT OF THE CALL. Returns `(psrm, clock_offset, from_inquiry, psrm_harvested)`.
+///
+/// THIS IS A FUNCTION AND NOT A ONE-TIME BINDING, because the parameter block is rebuilt for every
+/// page attempt. `BtL3State` is shared by the inquiry and the page, and the inquiry-result branch
+/// that stores `inq_clock_offset` latches `inq_clk_at` in the same breath — so if a fresher
+/// response for this address is decoded at any point before a retry's block is built, calling this
+/// again picks it up, and the CANDIDATE-1 age line then reports the NEW harvest's age instead of
+/// carrying the original's forward.
+///
+/// The `psrm` substitution is the one `bt_c1_inquiry` witnesses on its own line: an out-of-range
+/// Page_Scan_Repetition_Mode would be answered CommandStatus 0x12 and no train would go out at
+/// all, so `BT_C1_PSRM` is paged instead and the clock offset is left untouched.
+#[cfg(feature = "btc")]
+fn bt_c1_page_fields(st: &BtL3State) -> (u8, u16, bool, bool) {
+    if st.inq_found {
+        (
+            if st.inq_psrm_ok { st.inq_psrm } else { BT_C1_PSRM },
+            st.inq_clock_offset | BT_C1_CLOCK_OFFSET_VALID,
+            true,
+            st.inq_psrm_ok,
+        )
+    } else {
+        (BT_C1_PSRM, BT_C1_CLOCK_OFFSET, false, false)
+    }
+}
 /// BT-SSP — IO_Capability 0x03 = NoInputNoOutput (Vol 4 Part E §7.1.29). The truth about this
 /// machine DURING BOOT: the compositor may exist but no consent UI does, so claiming a display
 /// or a yes/no button would promise an interaction this stage cannot deliver. NoInputNoOutput on
@@ -2550,10 +2607,15 @@ struct BtL3State {
     /// A clock offset is a statement about a phase at a moment. Everything downstream of the
     /// inquiry — the remaining inquiry length, the `Inquiry_Cancel` round trip, the page-timeout
     /// write and its read-back, then a first page train of up to 5.12 s and a second one after it —
-    /// happens AFTER that moment, and the offset is not re-harvested for any of it. This timestamp
-    /// is the only thing that makes the elapsed distance measurable rather than assumed, and the
-    /// ageing candidate stands or falls on it. Meaningful only when `inq_found`; 0 otherwise, and
-    /// the witness gates on the flag rather than on the value.
+    /// happens AFTER that moment. This timestamp is the only thing that makes the elapsed distance
+    /// measurable rather than assumed, and the ageing candidate stands or falls on it. Meaningful
+    /// only when `inq_found`; 0 otherwise, and the witness gates on the flag rather than the value.
+    ///
+    /// IT IS ALSO THE RE-HARVEST'S IDENTITY. Every page attempt rebuilds its parameter block from
+    /// this state (`bt_c1_page_fields`) and remembers the `inq_clk_at` it built from; a retry whose
+    /// reading differs is one that picked up a response that arrived after the previous train, and
+    /// the RE-HARVEST witness says so. Comparing the instants rather than the offsets is what makes
+    /// a re-harvest to a numerically IDENTICAL offset still count as fresh evidence.
     #[cfg(feature = "btc")]
     inq_clk_at: u64,
     /// BT-C1/INQUIRY — total responses decoded across every inquiry-result event of the run. This
@@ -7240,21 +7302,12 @@ impl Controller {
         // Read this BEFORE any page verdict below. It is what separates the four cases the old
         // capture collapsed into one: the target answered; the room is busy and the target is not
         // in it; the room is silent; or the inquiry never ran to term and establishes nothing.
-        let (psrm, clk, found) = if st.inq_found {
-            (
-                // REVIEW FIX — an out-of-range mode is REFUSED, not paged. `BT_C1_PSRM_MAX` says
-                // what passing it through would have cost; the line below names the substitution.
-                if st.inq_psrm_ok {
-                    st.inq_psrm
-                } else {
-                    BT_C1_PSRM
-                },
-                st.inq_clock_offset | BT_C1_CLOCK_OFFSET_VALID,
-                true,
-            )
-        } else {
-            fallback
-        };
+        // REVIEW FIX — an out-of-range mode is REFUSED, not paged. `BT_C1_PSRM_MAX` says what
+        // passing it through would have cost; the line below names the substitution. The selection
+        // itself lives in `bt_c1_page_fields` because THE PAGE RE-RUNS IT for every attempt: one
+        // definition, so a re-harvested block can never be assembled by different rules than the
+        // first one was.
+        let (psrm, clk, found, _) = bt_c1_page_fields(st);
         if st.inq_found && !st.inq_psrm_ok {
             serial_println!(
                 ":: bt-c1: [{}] inquiry psrm REJECTED — the response for this BD_ADDR reported Page_Scan_Repetition_Mode={:#04x}, which is Reserved for Future Use (legal range 0x00..={:#04x}). Paging with it would have been answered CommandStatus 0x12 (Invalid HCI Command Parameters) and NO train would have gone out, so {:#04x}(R2) is substituted. THE CLOCK OFFSET IS UNAFFECTED and is still the peer's own — this page is aligned but not mode-sized. An inquiry response is unauthenticated: any device may answer under any BD_ADDR, so a byte out of range here is either a broken peer or a spoofed one == witness ::",
@@ -7338,12 +7391,21 @@ impl Controller {
         // purpose: one `events_read` count for the whole stage, one `blind`/`stopped` verdict, and
         // an inbound `Connection Complete` arriving during the inquiry is latched by the same
         // latch that would catch it during the page.
-        let (psrm, clock_offset, from_inquiry) =
+        let (mut psrm, mut clock_offset, mut from_inquiry) =
             self.bt_c1_inquiry(t, intf, e, toggle, armed, &mut st, &mut seen, &mut asm);
         // REVIEW FIX — latched here because `st.inq_psrm_ok` is about to be shared with the page's
         // own waits, and the page-parameters line below must not call a substituted mode
         // "HARVESTED". See `BT_C1_PSRM_MAX`.
-        let psrm_harvested = st.inq_psrm_ok;
+        //
+        // BT-C1-REPAGE — all four are `mut` because every attempt RE-DERIVES them from `st`
+        // (`bt_c1_page_fields`) instead of carrying the inquiry's one reading through the whole
+        // stage. The values here are the FIRST attempt's; a retry may replace them.
+        let mut psrm_harvested = st.inq_psrm_ok;
+        // BT-C1-REPAGE — the harvest instant the parameter block currently in hand was built from.
+        // A retry that finds `st.inq_clk_at` changed has picked up a response that arrived after
+        // the previous train, and that — not a difference in the offset VALUE — is what makes the
+        // re-harvest fresh evidence.
+        let mut built_from_clk_at = st.inq_clk_at;
 
         // ---- 1. bound what a dead speaker costs the boot ---------------------------------------
         // Vol 4 Part E §7.3.16. Written BEFORE the page, because it is the page's own deadline.
@@ -7411,18 +7473,11 @@ impl Controller {
         // Thirteen parameter bytes: BD_ADDR(6) Packet_Type(2) Page_Scan_Repetition_Mode(1)
         // Reserved(1) Clock_Offset(2) Allow_Role_Switch(1). Every value is justified at its
         // constant. The Reserved octet is 0x00 by the spec's own instruction, not by choice.
-        let cp: [u8; 13] = [
-            addr[0], addr[1], addr[2], addr[3], addr[4], addr[5],
-            BT_C1_PACKET_TYPE as u8,
-            (BT_C1_PACKET_TYPE >> 8) as u8,
-            // HARVESTED, or the fallback — `bt_c1_inquiry` said which on its own line above, and
-            // the page-parameters line below says it again on every attempt.
-            psrm,
-            0x00,
-            clock_offset as u8,
-            (clock_offset >> 8) as u8,
-            BT_C1_ALLOW_ROLE_SWITCH,
-        ];
+        //
+        // THE BLOCK IS BUILT INSIDE THE LOOP, once per attempt, and BT-C1-DISCRIM's own witness is
+        // why: it recorded that the block was built once and re-sent unchanged, so a retry
+        // re-transmitted a clock offset that had aged by the whole of the first train. See the
+        // RE-HARVEST witness at the top of each attempt.
         // ---- THE PAGE ATTEMPT LOOP -------------------------------------------------------------
         // At most `BT_C1_PAGE_ATTEMPTS` trains, and a second one is spent on exactly one answer:
         // `Connection Complete` status=0x04 (PAGE TIMEOUT) for the address we paged. See the
@@ -7442,8 +7497,138 @@ impl Controller {
         let mut last_obs_cy = 0u64;
         let mut obs_measured = false;
         let mut same_phase_retry = false;
+        // BT-C1-REPAGE — did the last retry's measured phase offset actually land where the step
+        // aimed it? Carried to the closing verdict.
+        let mut phase_step_hit = false;
+        // BT-C1-REPAGE — did any retry rebuild its block from a HARVEST INSTANT later than the one
+        // the previous train's block was built from? Carried to the closing verdict.
+        let mut reharvested_fresh = false;
         for attempt in 1..=BT_C1_PAGE_ATTEMPTS {
         attempts_run = attempt;
+        // ---- 2a'. BT-C1-REPAGE/PHASE-STEP — put this train somewhere the last one was not -------
+        // BOOT 3 MEASURED THE DEFECT THIS BLOCK FIXES: the retry gap came out at 5125 ms against
+        // R2's 2560 ms interval, i.e. within 5 ms of two whole cycles, so the second train sampled
+        // the same part of the peer's scan cycle as the first and the witness printed "THE RETRY
+        // DID NOT TEST CANDIDATE 2". The gap was never chosen — it was whatever the page timeout
+        // plus this host's overhead happened to add up to, and it landed on a multiple by accident.
+        //
+        // It is chosen now. The delay is computed from the gap ALREADY elapsed since the previous
+        // train, so the total gap lands at `scan/2` past a whole multiple rather than on one; that
+        // is why it is not a fixed sleep. NOTHING IS SENT OR READ during it — a pure spin, so the
+        // `armed` invariant is untouched and no event can be consumed unwitnessed.
+        //
+        // THE ATTEMPT BUDGET AND THE PAGE TIMEOUT ARE UNCHANGED. This spends at most half a scan
+        // interval (<= 1280 ms) of wall clock and buys the one thing two identical trains cannot:
+        // a second, independent sample of the peer's cycle.
+        //
+        // BOTH STAY 0 on a first train (no previous phase to step away from), on R0 (no cycle to
+        // step within) and on an uncalibrated clock (no honest way to time a delay). The CANDIDATE-2
+        // line prints the intended value beside the measured one, which is what makes this
+        // mechanism falsifiable on the wire rather than merely asserted here.
+        let mut phase_intended = 0u64;
+        let mut phase_delay = 0u64;
+        //
+        // THE PLAN USES THE psrm IN FORCE AT PLAN TIME — the previous train's, since the
+        // re-harvest below runs after this and could in principle replace it. On the one boot in
+        // which a peer re-reports a different mode between two trains, the intended residue would
+        // have been computed against the old interval and CANDIDATE-2's would be printed against
+        // the new one; both numbers are on that line, so the discrepancy is visible rather than
+        // silent. Stepping first is deliberate: the harvest is then read as late as possible, so
+        // the offset the block carries is the freshest thing this host has when it goes out.
+        if attempt > 1 {
+            let scan_plan = bt_c1_scan_interval_ms(psrm);
+            let step = bt_c1_phase_step_ms(psrm);
+            match (prev_train, scan_plan) {
+                (Some(pt), s) if s != 0 => {
+                    match epace_ms(crate::arch::now_cycles().wrapping_sub(pt)) {
+                        Some(el_ms) => {
+                            // How far past a whole multiple the gap already stands, and what must
+                            // be added to move it to the half-interval residue. Modular, so the
+                            // answer is always inside one interval.
+                            let cur = el_ms % s;
+                            let need = (step + s - cur) % s;
+                            phase_intended = step;
+                            phase_delay = need;
+                            serial_println!(
+                                ":: bt-c1: [{}] PHASE-STEP — attempt={}/{} elapsed_since_previous_train={}ms peer_scan_interval={}ms(psrm {}) current_residue={}ms intended_residue={}ms delay_applied={}ms -> the retry is deliberately offset by HALF the peer's scan interval instead of landing where the page timeout happened to put it. Boot 3's retry gap was 5125ms against a 2560ms interval (5ms from two whole cycles) and tested nothing; the CANDIDATE-2 line below prints the intended offset beside the MEASURED one, so this mechanism is falsifiable on the wire and not merely claimed here. No Scan_Enable and no change to the attempt budget or the page timeout == witness ::",
+                                self.idx, attempt, BT_C1_PAGE_ATTEMPTS, el_ms, s,
+                                match psrm { 0x00 => "R0", 0x01 => "R1", 0x02 => "R2", _ => "RESERVED" },
+                                cur, step, need
+                            );
+                            if need > 0 {
+                                let start = crate::arch::now_cycles();
+                                let budget = Self::bt_l3_budget(need);
+                                while crate::arch::now_cycles().wrapping_sub(start) < budget {
+                                    core::hint::spin_loop();
+                                }
+                            }
+                        }
+                        None => serial_println!(
+                            ":: bt-c1: [{}] PHASE-STEP — attempt={}/{} NOT APPLIED: the TSC is uncalibrated, so the gap since the previous train is unmeasurable and a delay computed from it would be a fabricated number of milliseconds. The retry goes out on whatever phase the page timeout leaves it, exactly as before, and the CANDIDATE-2 line below claims no phase relation == witness ::",
+                            self.idx, attempt, BT_C1_PAGE_ATTEMPTS
+                        ),
+                    }
+                }
+                (Some(_), _) => serial_println!(
+                    ":: bt-c1: [{}] PHASE-STEP — attempt={}/{} NOT APPLIED: psrm=R0, so the peer scans CONTINUOUSLY and there is no cycle for a train to be stepped within. Delaying this train would cost time and change no phase == witness ::",
+                    self.idx, attempt, BT_C1_PAGE_ATTEMPTS
+                ),
+                (None, _) => serial_println!(
+                    ":: bt-c1: [{}] PHASE-STEP — attempt={}/{} NOT APPLIED: no previous train went out, so there is no phase to step away from == witness ::",
+                    self.idx, attempt, BT_C1_PAGE_ATTEMPTS
+                ),
+            }
+        }
+        // ---- 2a''. BT-C1-REPAGE/RE-HARVEST — rebuild the block from the FRESHEST inquiry data ---
+        // The other half of Boot 3's finding: the 13 bytes were assembled once, before the first
+        // train, and the retry re-sent them unchanged — so attempt 2 paged on a clock offset that
+        // had aged by the whole first train (5.12 s of page timeout) plus this host's overhead, and
+        // the CANDIDATE-1 line was measuring the ageing of a value nothing could refresh.
+        //
+        // `st` is shared with the inquiry and with every event wait this stage runs, so an inquiry
+        // result for this address decoded at ANY point before this line is visible here. Re-reading
+        // it costs nothing and can only improve the block. The comparison that decides whether a
+        // re-harvest happened is on the HARVEST INSTANT, not on the offset value: a peer that
+        // answered again with a numerically identical offset has still told us it is there NOW, and
+        // the age the CANDIDATE-1 line prints below is the new harvest's.
+        if attempt > 1 {
+            let (p2, c2, f2, h2) = bt_c1_page_fields(&st);
+            let fresh = st.inq_clk_at != built_from_clk_at;
+            let changed = (p2, c2, f2) != (psrm, clock_offset, from_inquiry);
+            serial_println!(
+                ":: bt-c1: [{}] RE-HARVEST — attempt={}/{} previous_block(psrm={:#04x} clock_offset={:#06x} from_inquiry={}) rebuilt_block(psrm={:#04x} clock_offset={:#06x} from_inquiry={}) newer_response={} bytes_changed={} -> {} == witness ::",
+                self.idx, attempt, BT_C1_PAGE_ATTEMPTS,
+                psrm, clock_offset, from_inquiry, p2, c2, f2, fresh, changed,
+                if fresh {
+                    "A NEWER INQUIRY RESPONSE FOR THIS ADDRESS ARRIVED since the previous train's block was built, and this attempt pages on it. The CANDIDATE-1 age line below is measured from the NEW harvest instant, so a fresh age under a stale-looking first attempt is this line's doing and not a clock glitch"
+                } else if from_inquiry {
+                    "NO NEWER RESPONSE ARRIVED, so the rebuilt block carries the same harvest as the previous train and the CANDIDATE-1 age below has grown by the whole of that train. THE BLOCK IS STILL REBUILT rather than re-sent: what is stale here is the AIR's last word about this peer, not this host's bookkeeping, and no inquiry is re-run because re-entering the Inquiry state would have the controller answer the page with Command Status 0x0C"
+                } else {
+                    "NOTHING TO RE-HARVEST — no inquiry response for this address was ever decoded, so this block carries the same fallback mode and invalid clock offset the first one did. Ageing is not a candidate for a value that was never read"
+                }
+            );
+            if fresh {
+                reharvested_fresh = true;
+            }
+            psrm = p2;
+            clock_offset = c2;
+            from_inquiry = f2;
+            psrm_harvested = h2;
+            built_from_clk_at = st.inq_clk_at;
+        }
+        // The 13 bytes this attempt will put on EP0, assembled from the values immediately above.
+        let cp: [u8; 13] = [
+            addr[0], addr[1], addr[2], addr[3], addr[4], addr[5],
+            BT_C1_PACKET_TYPE as u8,
+            (BT_C1_PACKET_TYPE >> 8) as u8,
+            // HARVESTED, or the fallback — `bt_c1_inquiry` said which on its own line above, and
+            // the page-parameters line below says it again on every attempt.
+            psrm,
+            0x00,
+            clock_offset as u8,
+            (clock_offset >> 8) as u8,
+            BT_C1_ALLOW_ROLE_SWITCH,
+        ];
         serial_println!(
             ":: bt-c1: [{}] page parameters — attempt={}/{} peer={} packet_type={:#06x}(DM1|DH1, basic rate, one slot) psrm={:#04x}({}, {}) clock_offset={:#06x}(bit15 {}) allow_role_switch={:#04x}(the peer may take the link) reserved=0x00 page_timeout={}ms(written above) conn_window={}ms; NO Write_Scan_Enable is issued — Vol 4 Part E §7.3.18 governs INBOUND inquiry/page scan and paging out needs none of it, while enabling it would make this machine discoverable == witness ::",
             self.idx, attempt, BT_C1_PAGE_ATTEMPTS,
@@ -7474,7 +7659,7 @@ impl Controller {
         // in the clock offset, a psrm written into the Reserved octet — would print correctly above
         // and still page wrong. This is the only line in the stage that can falsify the one above.
         serial_println!(
-            ":: bt-c1: [{}] page bytes — attempt={}/{} HCI_Create_Connection(0x0405) params=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x}][{:02x} {:02x}][{:02x}][{:02x}][{:02x} {:02x}][{:02x}] = BD_ADDR(6,wire/LSB-first) Packet_Type(2,LE) PSRM(1) Reserved(1) Clock_Offset(2,LE) Allow_Role_Switch(1); THE SAME 13 BYTES GO OUT ON EVERY ATTEMPT — the block is built once before the loop and a retry re-sends it unchanged, which is exactly why the ageing line below is per-attempt and not per-page == witness ::",
+            ":: bt-c1: [{}] page bytes — attempt={}/{} HCI_Create_Connection(0x0405) params=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x}][{:02x} {:02x}][{:02x}][{:02x}][{:02x} {:02x}][{:02x}] = BD_ADDR(6,wire/LSB-first) Packet_Type(2,LE) PSRM(1) Reserved(1) Clock_Offset(2,LE) Allow_Role_Switch(1); THE BLOCK IS REBUILT FOR EVERY ATTEMPT from the inquiry state as it stands at that moment (BT-C1-DISCRIM witnessed the old behaviour: built once, re-sent unchanged). A retry printing DIFFERENT octets here is a re-harvest and the RE-HARVEST line above says so; identical octets mean no newer response arrived, not that the block was cached == witness ::",
             self.idx, attempt, BT_C1_PAGE_ATTEMPTS,
             cp[0], cp[1], cp[2], cp[3], cp[4], cp[5], cp[6], cp[7],
             cp[8], cp[9], cp[10], cp[11], cp[12]
@@ -7547,15 +7732,30 @@ impl Controller {
                 // previous train's — going the short way round the cycle.
                 let phase_off = core::cmp::min(resid, scan_ms - resid);
                 same_phase_retry = phase_off <= 100;
+                // THE STEP EITHER LANDED OR IT DID NOT, and this is the test. `phase_intended` is
+                // what the PHASE-STEP block above aimed at BEFORE the train went out; `phase_off`
+                // is what the clock says it got. A 150 ms tolerance covers the command's own EP0
+                // round trip and the spin's granularity without covering a miss.
+                let aimed = phase_intended != 0;
+                let hit = aimed && phase_off.abs_diff(phase_intended) <= 150;
+                phase_step_hit = hit;
                 serial_println!(
-                    ":: bt-c1: [{}] CANDIDATE-2 train PHASE — attempt={}/{} gap_since_previous_train={}ms peer_scan_interval={}ms(psrm {}) residue={}ms phase_offset_from_previous={}ms -> {} == witness ::",
+                    ":: bt-c1: [{}] CANDIDATE-2 train PHASE — attempt={}/{} gap_since_previous_train={}ms peer_scan_interval={}ms(psrm {}) residue={}ms phase_offset_from_previous={}ms intended_offset={}ms(delay_applied={}ms) -> {} == witness ::",
                     self.idx, attempt, BT_C1_PAGE_ATTEMPTS, gap_ms, scan_ms,
                     match psrm { 0x00 => "R0", 0x01 => "R1", 0x02 => "R2", _ => "RESERVED" },
-                    resid, phase_off,
+                    resid, phase_off, phase_intended, phase_delay,
                     if phase_off <= 100 {
-                        "SAME PHASE — the gap is within 100ms of a whole multiple of the peer's scan interval, so this train started at essentially the point in the peer's scan cycle the previous one did. THE RETRY DID NOT TEST CANDIDATE 2; it repeated the first experiment. Two timeouts under this line are ONE observation, not two, and the phase hypothesis remains untested rather than refuted"
+                        if aimed {
+                            "SAME PHASE, AND THE STEP FAILED TO MOVE IT — the gap is still within 100ms of a whole multiple of the peer's scan interval even though a delay was applied to put it half an interval away. THE RETRY DID NOT TEST CANDIDATE 2, and the intended/measured pair on this line says the fault is in the STEP (the elapsed reading, the delay, or the clock behind both), not in the retry's design. This is the line that falsifies this arc's own mechanism"
+                        } else {
+                            "SAME PHASE, AND NO STEP WAS APPLIED — the PHASE-STEP line above says why (first train, R0, or an uncalibrated clock). The gap is within 100ms of a whole multiple, so this train started at essentially the point in the peer's scan cycle the previous one did: THE RETRY DID NOT TEST CANDIDATE 2, two timeouts under this line are ONE observation, and the phase hypothesis remains untested rather than refuted"
+                        }
+                    } else if hit {
+                        "DIFFERENT PHASE, AND BY CONSTRUCTION — the measured offset from the previous train's phase agrees with the offset the PHASE-STEP above deliberately aimed at, so this train sampled a part of the peer's scan cycle the previous one did not, on purpose rather than by luck. THE MECHANISM IS CONFIRMED ON THE WIRE by these two numbers agreeing. If this attempt also times out, CANDIDATE 2 IS GENUINELY WEAKENED: two independent phases were sampled and neither was heard"
+                    } else if aimed {
+                        "DIFFERENT PHASE, BUT NOT THE ONE INTENDED — the train did land materially away from the previous one's phase, so candidate 2 WAS varied, but it did not land where the step aimed. The step's accounting is off by the difference between the two numbers on this line (the elapsed reading and the delay are the only inputs to it); the phase result below still stands, the mechanism's precision does not"
                     } else {
-                        "DIFFERENT PHASE — this train started at a materially different point in the peer's scan cycle than the previous one. If this attempt also times out, CANDIDATE 2 IS WEAKENED: two independent phases were sampled and neither was heard"
+                        "DIFFERENT PHASE, BY ACCIDENT — no step was applied (see the PHASE-STEP line) and the gap still fell away from a whole multiple. Candidate 2 was varied, but nothing here chose to vary it, so the next boot may just as easily land back on the same phase"
                     }
                 );
             }
@@ -7816,7 +8016,7 @@ impl Controller {
             && attempt < BT_C1_PAGE_ATTEMPTS;
         if retry {
             serial_println!(
-                ":: bt-c1: [{}] PAGE TIMEOUT on attempt={}/{} -> RETRYING. Nothing is outstanding (the controller resolved the page itself) and no link is held, so one more page train goes on the air. The reason to spend a second train is OURS: a train and the peer's page-scan schedule are independent clocks, this train's phase and its page-scan-repetition-mode/clock-offset alignment need not have overlapped the peer's scan window, and the next train samples a different phase. If it too times out the readings are co-equal — an unaligned page on our side, or a peer not scanning on theirs — and this costs one more {}ms to tell them apart == witness ::",
+                ":: bt-c1: [{}] PAGE TIMEOUT on attempt={}/{} -> RETRYING, AND THE RETRY IS A DIFFERENT EXPERIMENT. Nothing is outstanding (the controller resolved the page itself) and no link is held, so one more page train goes on the air — but not the same one. Boot 3 showed the old retry re-sending a block built before the first train and landing within 5ms of two whole scan cycles, i.e. re-running the first experiment; the next attempt therefore (1) REBUILDS its 13 bytes from the freshest inquiry state, and (2) is deliberately DELAYED so its start sits about half the peer's scan interval away from a whole multiple of it. The RE-HARVEST, PHASE-STEP and CANDIDATE-2 lines of that attempt print both intentions against what the clock measured, so a retry that once again tests nothing will say so. The budget and the {}ms page timeout are unchanged == witness ::",
                 self.idx, attempt, BT_C1_PAGE_ATTEMPTS,
                 (BT_C1_PAGE_TIMEOUT as u32 * 625) / 1000
             );
@@ -7868,7 +8068,7 @@ impl Controller {
                 _ => false,
             };
             serial_println!(
-                ":: bt-c1: [{}] CANDIDATE VERDICT — offset_age_at_last_page={}ms(drift_bound={} slots) last_train_observed={}ms deadline_in_force={}ms(readback={}) retry_phase={} -> {} == witness ::",
+                ":: bt-c1: [{}] CANDIDATE VERDICT — offset_age_at_last_page={}ms(drift_bound={} slots) last_train_observed={}ms deadline_in_force={}ms(readback={}) retry_phase={} phase_step={} reharvest_newer_response={} -> {} == witness ::",
                 self.idx,
                 match age_ms { Some(a) => a, None => 0 },
                 match drift_slots { Some(d) => d, None => 0 },
@@ -7876,16 +8076,18 @@ impl Controller {
                 deadline_ms,
                 readback.is_some(),
                 if same_phase_retry { "SAME(untested)" } else { "DIFFERENT(tested)" },
+                if phase_step_hit { "LANDED(intended==measured)" } else { "not confirmed — see the CANDIDATE-2 line" },
+                reharvested_fresh,
                 if short_train {
                     "CANDIDATE 3 (controller) LEADS — the last train ran materially short of the deadline the controller itself reported in force. Spend the next arc on the controller's paging, not on the offset or the phase: an offset cannot be blamed for a train that was not on the air, and a phase cannot be sampled by one that stopped early"
                 } else if age_ms.is_none() || obs_ms.is_none() {
                     "NOTHING IS RANKED — the TSC was uncalibrated for at least one of the two measurements this verdict needs, so the numbers above are placeholders and not readings. The per-attempt lines say which. A boot that ranks these candidates must be one where tsc_calibrated=true"
                 } else if drift_slots.unwrap_or(0) >= 1 && same_phase_retry {
-                    "CANDIDATES 1 AND 2 ARE BOTH LIVE AND THIS BOOT CANNOT SEPARATE THEM — the offset had aged past a slot AND the retry re-sampled the same scan phase, so the two trains were one experiment run twice with a stale offset. THE NEXT EXPERIMENT IS NAMED BY THIS LINE: re-harvest the offset immediately before the second train, and make the retry gap a non-multiple of the peer's scan interval. Until one of those two moves independently, neither candidate is refuted"
+                    "CANDIDATES 1 AND 2 ARE BOTH LIVE AND THIS BOOT CANNOT SEPARATE THEM — the offset had aged past a slot AND the retry re-sampled the same scan phase. THIS ARC APPLIED BOTH FIXES, so a boot still printing this line is reporting that they did not take: the RE-HARVEST line says whether any newer response existed to rebuild from (if none did, the age is the AIR's silence and not this host's caching), and the PHASE-STEP/CANDIDATE-2 pair says whether the delay landed where it aimed. Read those two lines before reading this one as a repeat of Boot 3"
                 } else if drift_slots.unwrap_or(0) >= 1 {
-                    "CANDIDATE 1 (offset ageing) LEADS — the controller paged for its full deadline and two different scan phases were sampled, but the offset it started from had aged past a full slot. The cheapest decisive next experiment is to shorten the inquiry-to-page distance, or re-harvest before the second train"
+                    "CANDIDATE 1 (offset ageing) LEADS — the controller paged for its full deadline and two different scan phases were sampled, but the offset it started from had aged past a full slot. The block IS rebuilt per attempt now, so this age is the distance to the peer's last word on the air, not to a cached array: if the RE-HARVEST line reports no newer response, the remaining lever is the inquiry-to-page distance itself"
                 } else if same_phase_retry {
-                    "CANDIDATE 2 (scan phase) IS UNTESTED AND LEADS BY ELIMINATION — the offset was still exact and the controller paged for its full deadline, so neither 1 nor 3 explains this; and the retry re-sampled the same phase, so the one remaining candidate is also the one this boot failed to vary. Change the retry gap and this becomes decidable in a single boot"
+                    "CANDIDATE 2 (scan phase) IS UNTESTED AND LEADS BY ELIMINATION — the offset was still exact and the controller paged for its full deadline, so neither 1 nor 3 explains this; and the retry re-sampled the same phase DESPITE the step that was applied to prevent exactly that. The CANDIDATE-2 line's intended/measured pair is where this boot's next question is: the step is the thing that failed here, not the hypothesis"
                 } else {
                     "ALL THREE CANDIDATES ARE WEAKENED — the offset was still exact at page time, the controller paged for its full deadline, and two different scan phases were sampled, and the peer still never answered. If this boot's inquiry summary above also says the target ANSWERED, then the failure is in none of the three places this arc has been looking, and the next hypothesis must come from outside them — the paged BD_ADDR itself is the first place to look"
                 }
