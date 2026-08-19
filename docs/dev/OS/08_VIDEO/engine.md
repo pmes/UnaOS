@@ -7037,6 +7037,13 @@ Post-fix, with the pointer over a window:
 [cursor11] compose-through scope=… passes=P bracketed=B px_deferred=D>0 px_installed=I px_redrawn=R
 ```
 
+MENU-UNDER (2026-08-18) qualifies the `reserved=` reading on x86: the field now also counts the
+sprite-over-furniture overlay declines (open SHARD dropdown, and the dock when a dragged window
+sits under it). `reserved=0` is the expected idle-desktop reading; `reserved>0` while the
+operator has the menu open under the pointer, or is dragging a window through the dock with the
+pointer on the strip, is the mechanism WORKING, not a deviation. On aarch64 the field keeps its
+WC-F-probe meaning; the two are structurally exclusive per arch.
+
 `nosprite` must fall to the passes where the pointer is *genuinely* hidden — before the first report
 of the boot, and after CURSOR-HIDE's ~1.5 s idle expiry. `nosprite ≈ passes` with a pointer moving on
 the panel means the fix did not take. With the pointer over the desktop the honest answer is

@@ -740,6 +740,12 @@ pub fn compose() -> bool {
 /// integer compares rather than a scan over every label at every pixel.
 fn compose_row(out: &mut [u32], r: strip::Rect, j: usize) {
     let (_mx, _my, w, h) = r;
+    // MENU-UNDER load-bearing palette fact (review, 2026-08-18): no colour this function emits may
+    // be pure white 0x00FF_FFFF — that is the sprite's FILL, and `cursor::undraw_locked`'s colour
+    // guard is what stops a stale save-under from stamping over a menu that opened mid-pass
+    // (the open-direction residual the MENU-UNDER decline cannot see). CHROME_FACE, FRAME_LINE and
+    // the blended label text all differ from FILL today; a future theme edit that puts 0xFFFFFF in
+    // the dropdown (BEVEL_LIGHT / GLOSS_HIGHLIGHT are both pure white) re-opens a one-pixel stamp.
 
     // The whole-row base: keyline on the top and bottom border rows, menu face elsewhere.
     let base = if j < BORDER || j + 1 > h - BORDER {

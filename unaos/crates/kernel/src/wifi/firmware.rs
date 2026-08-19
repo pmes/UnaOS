@@ -149,8 +149,9 @@ pub(crate) const FW_SET_LEN: usize = FW_SET.len();
 const SEARCH_DIRS: &[Option<&str>] = &[None, Some("B43"), Some("FIRMWARE")];
 
 /// Below this a file cannot be one of these images — it is a stub, a placeholder, or truncated.
-/// §S4: the initvals are "a few KB each", so the floor must clear a plausible small table.
-const MIN_BLOB_BYTES: u32 = 256;
+/// §S4's "a few KB each" overstated the smallest member: the real `ht0bsinitvals29.fw` measured on
+/// metal (GR27, 2026-08) is 178 bytes, so the floor sits below that while still rejecting stubs.
+const MIN_BLOB_BYTES: u32 = 128;
 /// Above this we refuse rather than commit the kernel heap. §S4: the ucode is "tens of KB"; 4 MiB is
 /// ~two orders of magnitude of headroom and still bounded.
 const MAX_BLOB_BYTES: u32 = 4 * 1024 * 1024;
