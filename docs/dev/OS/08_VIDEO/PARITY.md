@@ -1931,6 +1931,15 @@ is the only suite that exercises this binary under load, and the fold re-run is 
 `x86-fat.spec` REQUIRE/FORBID gap is flagged to the seat, not taken here — spec ownership is not
 this tree's.
 
+**Runtime verdict (rmbp 2's fold-v2, relayed 2026-08-19 before their close): GREEN.** WINX-8
+PASS on both fat legs — `loaded (entry 0x100000000b0) + windowed + 3 presents with 2 ring-3
+thread(s) … teardown clean -> PASS`; worker A alive past its first frame, the parent completes
+the full blit, both old fault lines gone, image 12640 B under the cliff. No checksum pin moved.
+Cross-tree note for the integrator: the fold with this commit aboard is landable, but three
+rmbp-side items (x86-witness presspop re-arm + the two new fat-spec lines) live in their
+`fold2-1783bee6.patch` and must be taken deliberately — a mechanical re-merge drops all three
+silently. Archive: `~/unaos-bench/scratch/rmbp2-close/fold2/`; rmbp 3 executes the fold.
+
 ---
 
 ## 7. Accounting check
