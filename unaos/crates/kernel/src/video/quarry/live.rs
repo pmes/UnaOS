@@ -577,11 +577,15 @@ fn leaf(path: &str) -> String {
 // ── Scroll arithmetic (pure) — the part of "scrolling" that did not exist ──────────────────────
 //
 // Nothing in the window/present stack carries a content offset: `wm::WindowInfo` has no scroll field,
-// `FrameBuffer::scroll_up` is a whole-surface memmove with no syscall and no rect, the HID boot-mouse
-// decoder discards the wheel byte before the ABI ever sees it, and `theme::SCROLL_TRACK`/`SCROLL_THUMB`
-// are two colours no scrollbar has ever consumed. So Quarry owns its scroll completely: an integer row
-// offset, a clamp, and a full pane redraw at the new offset. That is the whole mechanism, and the cost
-// is stated rather than hidden — see `quarry.md` §5.
+// `FrameBuffer::scroll_up` is a whole-surface memmove with no syscall and no rect, and
+// `theme::SCROLL_TRACK`/`SCROLL_THUMB` are two colours no scrollbar has ever consumed. So Quarry owns
+// its scroll completely: an integer row offset, a clamp, and a full pane redraw at the new offset.
+// That is the whole mechanism, and the cost is stated rather than hidden — see `quarry.md` §5.
+//
+// QSCROLL: the fourth item of that list — "the HID boot-mouse decoder discards the wheel byte before
+// the ABI ever sees it" — was true when this was written and is not any more. The WHEEL arc landed the
+// byte, `pal::Event::Wheel(i8)` and the routing; [`wheel_next`] below and [`wheel_scroll`] are the
+// consumer, and they feed these same three functions rather than a second offset of their own.
 
 /// The largest first-visible row for a list of `len` rows in a `visible`-row viewport.
 #[inline]
@@ -605,6 +609,39 @@ fn scroll_follow(scroll: usize, sel: usize, len: usize, visible: usize) -> usize
         s = sel + 1 - visible;
     }
     s.min(scroll_max(len, visible))
+}
+
+/// QSCROLL — rows one wheel detent moves a viewport.
+///
+/// Three, and the number is a RATIO to the two gestures that already existed rather than a taste.
+/// The scrollbar track pages by a whole viewport (`tvis`/`lvis` — 26 rows on QEMU's panel, 33 on the
+/// bench's) and `Up`/`Down` moves exactly one; a wheel that did either would be a duplicate of a
+/// gesture the operator already has. Three rows is the smallest step that is unmistakably a SCROLL
+/// rather than a cursor nudge, it is a tenth of a viewport on both panels, and a full flick of a
+/// boot-protocol mouse (the drain hands us at most ±127 detents in one report) still lands on the
+/// clamp rather than overshooting into arithmetic this module does not do.
+const WHEEL_ROWS: usize = 3;
+
+/// QSCROLL — the wheel's whole arithmetic: apply `detents` to a row offset and clamp.
+///
+/// **Positive `detents` = the wheel turned AWAY from the operator = the content moves DOWN = the
+/// offset moves UP, toward row 0.** That is the platform-conventional direction and it is the same
+/// sign convention `user-vug`'s `wheel_zoom` reads (WHEELZOOM: positive = away = zoom in), decoded
+/// from the same `pal::Event::Wheel(i8)` the same HID byte produces — so the two consumers in this
+/// tree cannot disagree about which way a hand turned.
+///
+/// Total, and saturating on both ends: `scroll_max` is the floor's twin, `0` is the floor. Overflow
+/// is not reachable — `detents` is an `i8` widened to `i32` and `WHEEL_ROWS` is 3, so the step is at
+/// most 384 rows — but it is written saturating anyway, because the alternative is a guard that has
+/// to be re-argued every time the drain's shape changes.
+#[inline]
+fn wheel_next(scroll: usize, smax: usize, detents: i32) -> usize {
+    let step = (detents.unsigned_abs() as usize).saturating_mul(WHEEL_ROWS);
+    if detents > 0 {
+        scroll.min(smax).saturating_sub(step)
+    } else {
+        scroll.saturating_add(step).min(smax)
+    }
 }
 
 /// Scrollbar thumb geometry inside a `track_h`-tall gutter, or `None` when everything fits.
@@ -1685,6 +1722,16 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
     if !on_glass() {
         return false;
     }
+    // QSCROLL — the WHEEL arrives here, at the seam that already exists, because this function is
+    // handed the whole `pal::Event` rather than a keycode and `arch/aarch64/syscall.rs` is a
+    // byte-identity-critical file no arc may add a line to (PARITY.md §5.3). The name is a keyboard
+    // noun and the event is not one; that trade is stated in [`wheel_route`] and in `quarry.md` §14
+    // rather than paid for with an edit to the router. Asked BEFORE the `Event::Key` test for the
+    // ordinary reason: the arm below would otherwise decline it and the wheel would fall through to
+    // the focus ring, which has no consumer for it either.
+    if let crate::pal::Event::Wheel(d) = ev {
+        return wheel_route(d);
+    }
     let crate::pal::Event::Key(c) = ev else {
         return false;
     };
@@ -1878,8 +1925,11 @@ fn content_press(m: &mut Model, sx: usize, sy: usize) -> Act {
         let tvis = m.tree_visible();
         let sb = m.tree.len() > tvis;
         m.focus = Pane::Tree;
-        // The gutter pages. There is no wheel on this machine — the HID boot-mouse decoder drops
-        // byte 3 before the ABI sees it — so the track IS the coarse scroll gesture.
+        // The gutter PAGES — a whole viewport per press. QSCROLL made the wheel the FINE gesture
+        // beside it ([`wheel_scroll`], three rows a detent); the track stays the coarse one, because
+        // it is the only scroll a wheel-less mouse has and the only one that crosses a
+        // thousand-entry directory in a gesture a wrist can complete. The two share this pane's one
+        // offset and the same selection pull, so neither can drift from the other.
         if sb && sx >= ti.x + ti.w - SBW {
             let (ty, th) = thumb(ti.h, m.tree.len(), tvis, m.tree_scroll).unwrap_or((0, 0));
             let rel = sy.saturating_sub(ti.y);
@@ -1980,6 +2030,171 @@ fn content_press(m: &mut Model, sx: usize, sy: usize) -> Act {
         return Act::None;
     }
     Act::None
+}
+
+/// QSCROLL — what one wheel event did to the model, for the census and the repaint decision.
+struct WheelHit {
+    /// `"tree"` or `"list"` — the pane the POINTER was over, not the pane the keyboard is driving.
+    pane: &'static str,
+    /// The offset after the detents, and the largest offset that pane admits.
+    scroll: usize,
+    max: usize,
+    /// False when the detents could not move the picture — the operator is already at a bound.
+    moved: bool,
+}
+
+/// QSCROLL — apply `detents` of wheel to the pane under source-pixel `(sx, sy)`.
+///
+/// `None` means the pointer was inside Quarry's surface but over neither pane (the path bar), which
+/// is still Quarry's pixel and still consumes the event — it simply scrolls nothing.
+///
+/// **The pane is chosen by the POINTER, not by `m.focus`.** That is the whole difference between a
+/// wheel and an arrow key: `Up`/`Down` drive the pane the keyboard owns, and a wheel drives the pane
+/// the hand is over. Resolved through the same [`Rect::contains`] calls on the same [`Geom`] accessor
+/// that [`content_press`] uses one screen above, so the wheel and the press can never disagree about
+/// where the divider is.
+///
+/// **The click grammar is untouched, deliberately and by omission.** This function writes no
+/// `click_ms`, no `click_row` and no `click_pane`, produces no [`Act`], and acknowledges nothing on
+/// the glass: a scroll is not a press, so it can neither complete a double-click nor break one that
+/// is half-made. An operator who presses a row, scrolls, and presses the same row again inside
+/// [`DOUBLE_CLICK_MS`] gets the launch they asked for — the wheel did not consume their stamp.
+///
+/// **What it DOES move is the selection, and only as far as the viewport's edge** — the same pull
+/// [`content_press`]'s scrollbar-track arm applies, written the same way (`max` then `min`, never
+/// `clamp`, which PANICS when a degenerate viewport makes `min > max`). One rule for both coarse
+/// gestures rather than two, so `quarry.md` §4's standing invariant — the selection is always inside
+/// the viewport — holds after a wheel exactly as it holds after a track page, and [`Model::settle`]
+/// stays a fixed point rather than yanking the viewport back to a selection left off-screen.
+fn wheel_scroll(m: &mut Model, sx: usize, sy: usize, detents: i32) -> Option<WheelHit> {
+    let g = m.geom;
+    let tree = g.tree_pane().contains(sx, sy);
+    if !tree && !g.list_pane().contains(sx, sy) {
+        return None;
+    }
+    let (len, vis, scroll) = if tree {
+        (m.tree.len(), m.tree_visible(), m.tree_scroll)
+    } else {
+        (m.list.len(), m.list_visible(), m.list_scroll)
+    };
+    let max = scroll_max(len, vis);
+    let next = wheel_next(scroll, max, detents);
+    let lo = next;
+    let hi = (next + vis).saturating_sub(1);
+    if tree {
+        m.tree_scroll = next;
+        m.tree_sel = m.tree_sel.max(lo).min(hi);
+    } else {
+        m.list_scroll = next;
+        m.list_sel = m.list_sel.max(lo).min(hi);
+    }
+    m.settle();
+    Some(WheelHit { pane: if tree { "tree" } else { "list" }, scroll: next, max, moved: next != scroll })
+}
+
+/// QSCROLL — the `[qscroll]` census. Frames in which a detent reached a viewport, and how many of
+/// those landed on a bound.
+///
+/// Two counters and not one, for WHEELZOOM's reason — the `[vugzoom] applied=`/`clamped=` split in
+/// `user-vug`, made here in the same words: they answer different questions at a bench.
+/// `applied` says the byte was decoded, routed, hit-tested to Quarry's window and moved the picture;
+/// `clamped` says all of that happened and the range is spent, which is a working scroll at the end
+/// of a directory rather than a dead one. Without the split those two are indistinguishable from
+/// outside the machine, which is precisely the confusion the WHEEL arc's own `[wheel1]` census exists
+/// to prevent one layer down.
+static WHEEL_APPLIED: AtomicUsize = AtomicUsize::new(0);
+static WHEEL_CLAMPED: AtomicUsize = AtomicUsize::new(0);
+
+/// QSCROLL — one wheel event, routed to the viewport under the pointer. `true` when CONSUMED.
+///
+/// ### The seam, and why it is not a new one
+///
+/// This is reached from [`key_route`], which is reached from the ONE line
+/// `arch/aarch64/syscall.rs::user_input_enqueue` already carries for the desktop furniture. That is
+/// the single choke point every event bound for a focused window passes through — the same one the
+/// WHEEL arc routes `INPUT_EV_WHEEL` through on its way to an EL0 ring, and therefore the same seam
+/// `user-vug`'s WHEELZOOM consumer sits behind, one layer further out. **No routing file is touched
+/// by this arc and no line is added to one**: `syscall.rs` is compiled into the knob-off
+/// `kernel8.img`, where an added line breaks the byte-identity proof (PARITY.md §5.3), and a folded
+/// call cannot carry a `cfg` of its own. `key_route` already receives the whole `pal::Event` rather
+/// than a keycode, which is what makes the wheel arm free.
+///
+/// Its name therefore under-describes it, and that is a deliberate trade stated rather than hidden:
+/// renaming the export would edit a line in the byte-identity-critical file for a noun, and this
+/// arc will not spend that. `quarry.md` §14 records it.
+///
+/// ### Position, and the two things this deliberately does NOT do
+///
+/// A wheel event carries a delta and no coordinates, so the position is the system cursor's — read
+/// exactly as `syscall.rs::click_pointer_pos` reads it for a button, from `pal::cursor::pos` against
+/// the live panel. [`wm::hit_test`] then decides ownership, so a wheel over a window ABOVE Quarry is
+/// that window's and a wheel over a PARKED Quarry reaches nothing (a row below `SHELL_Z` does not
+/// composite and does not hit-test — the same construction that lets [`press_route`] skip the
+/// [`on_glass`] guard the keyboard needs).
+///
+/// It does **not** call `wm::focus_changed`: a scroll is not a press, and raising a window under a
+/// hand that is only turning a wheel would make the pointer's mere presence re-order the glass.
+/// Quarry's own click grammar says a click SELECTS and acknowledges and focus stops nothing; the
+/// wheel is quieter still — it selects nothing, acknowledges nothing, and starts nothing.
+///
+/// It also does **not** touch the model when nothing moved: a detent spent on a bound repaints
+/// nothing, so an operator holding a flick against the end of a short directory costs one census
+/// line and no `wm::present` at all.
+fn wheel_route(delta: i8) -> bool {
+    let id = WIN.load(Ordering::Relaxed);
+    if id == wm::WIN_NONE || delta == 0 {
+        return false;
+    }
+    let (pw, ph) = {
+        let i = crate::video::WRITER.lock().info();
+        (i.width as i32, i.height as i32)
+    };
+    let (x, y) = crate::pal::cursor::pos(pw, ph);
+    match wm::hit_test(x, y) {
+        Some((w, _, _)) if w == id => {}
+        _ => return false,
+    }
+    let Some(info) = wm::info(id) else {
+        return false;
+    };
+    let scale = info.scale.max(1);
+    // Panel -> source, exactly as `press_route` converts it. Above/left of the content is chrome.
+    if x < info.x as i32 || y < info.y as i32 {
+        return false;
+    }
+    let sx = (x as usize - info.x) / scale;
+    let sy = (y as usize - info.y) / scale;
+    if sx >= info.w || sy >= info.h {
+        return false;
+    }
+    let hit = {
+        let mut guard = MODEL.lock();
+        // The window row can be closed by another core between the hit-test above and this lock —
+        // `close()` swaps `WIN` and then takes `MODEL`. A `None` model is that race, arriving; the
+        // event is still ours (the pixel was Quarry's when it was addressed) and is consumed rather
+        // than delivered to whatever the close is about to reveal underneath.
+        let Some(m) = guard.as_mut() else {
+            return true;
+        };
+        wheel_scroll(m, sx, sy, delta as i32)
+    };
+    // Over Quarry but over neither pane — the path bar. Consumed, nothing scrolled, nothing said.
+    let Some(h) = hit else {
+        return true;
+    };
+    let (tag, n) = if h.moved {
+        (" applied=", WHEEL_APPLIED.fetch_add(1, Ordering::Relaxed) + 1)
+    } else {
+        (" clamped=", WHEEL_CLAMPED.fetch_add(1, Ordering::Relaxed) + 1)
+    };
+    serial_println!(
+        "[qscroll]{}{} pane={} detents={} rows={} scroll={}/{}",
+        tag, n, h.pane, delta, WHEEL_ROWS, h.scroll, h.max
+    );
+    if h.moved {
+        repaint();
+    }
+    true
 }
 
 // ── The dock's request seam ─────────────────────────────────────────────────────────────────────
@@ -2367,6 +2582,162 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
         (_, false) => return Err("a document double-click fired on a zero clock"),
     }
 
+    // ── leg 12: the WHEEL (QSCROLL), through the same `wheel_scroll` the router calls ─────────────
+    // Leg 2 proves the offset arithmetic and leg 5 proves the press-to-pane mapping; this proves the
+    // GESTURE — that a detent delivered at a real pixel moves the viewport under the POINTER, in the
+    // conventional direction, stops exactly at both bounds, and leaves the click grammar alone.
+    //
+    // It stops at `wheel_scroll` for leg 11's reason, restated because it is the same boundary:
+    // everything above it in [`wheel_route`] is the cursor read, `wm::hit_test` and the panel->source
+    // conversion that [`press_route`] already performs identically, and a fixture that built a window
+    // to hit-test would perturb the very window table the rest of this battery asserts exact pixels
+    // of. Below it is arithmetic, and the arithmetic is what a QEMU with no HID at all can prove.
+    let tvis = m.tree_visible();
+    let lvis = m.list_visible();
+    if tvis == 0 || lvis == 0 {
+        return Err("a 640x480 pane held no rows — the wheel leg would be vacuous");
+    }
+    // Both panes deliberately overflow their viewport, so every clamp below is a real bound.
+    m.tree = Vec::new();
+    for i in 0..(tvis * 3) {
+        m.tree.push(TreeRow {
+            path: alloc::format!("/t{}", i),
+            name: alloc::format!("t{}", i),
+            depth: 0,
+            expanded: false,
+        });
+    }
+    m.list = Vec::new();
+    for i in 0..(lvis * 3) {
+        m.list.push(DirEnt {
+            name: alloc::format!("F{}.BIN", i),
+            kind: NodeKind::File,
+            size: 16,
+            mtime: None,
+        });
+    }
+    m.tree_sel = 0;
+    m.tree_scroll = 0;
+    m.list_sel = 0;
+    m.list_scroll = 0;
+    m.settle();
+    let tin = small.tree_pane().inner();
+    let (tree_x, tree_y) = (tin.x + PAD + 1, tin.y + 1);
+    let (list_x, list_y) = (px_x, row0_y);
+    let lmax = scroll_max(m.list.len(), lvis);
+    let tmax = scroll_max(m.tree.len(), tvis);
+
+    // One detent TOWARD the operator scrolls the list DOWN by exactly `WHEEL_ROWS`, and touches the
+    // pane the pointer is NOT over not at all.
+    match wheel_scroll(&mut m, list_x, list_y, -1) {
+        Some(h) if h.pane == "list" && h.moved && h.scroll == WHEEL_ROWS && h.max == lmax => {}
+        _ => return Err("a detent over the list pane did not scroll it by WHEEL_ROWS"),
+    }
+    if m.tree_scroll != 0 {
+        return Err("a wheel over the list moved the tree's viewport");
+    }
+    // …and one detent AWAY from the operator puts it back. The direction convention is the same sign
+    // `user-vug`'s WHEELZOOM reads off the same `pal::Event::Wheel(i8)`.
+    match wheel_scroll(&mut m, list_x, list_y, 1) {
+        Some(h) if h.moved && h.scroll == 0 => {}
+        _ => return Err("the wheel did not reverse with the sign of the detent"),
+    }
+    // The TOP bound: a detent spent at row 0 moves nothing and SAYS so, rather than wrapping.
+    match wheel_scroll(&mut m, list_x, list_y, 4) {
+        Some(h) if !h.moved && h.scroll == 0 => {}
+        _ => return Err("the wheel did not clamp at the top of the list"),
+    }
+    // The BOTTOM bound, from a flick far larger than the list: exactly `scroll_max`, never past it.
+    match wheel_scroll(&mut m, list_x, list_y, -1000) {
+        Some(h) if h.moved && h.scroll == lmax => {}
+        _ => return Err("a long flick did not clamp at scroll_max"),
+    }
+    match wheel_scroll(&mut m, list_x, list_y, -1) {
+        Some(h) if !h.moved && h.scroll == lmax => {}
+        _ => return Err("the wheel did not clamp at the bottom of the list"),
+    }
+    // The SELECTION invariant `quarry.md` §4 states holds after a wheel exactly as it holds after a
+    // keyboard move: the wheel pulled it to the viewport's edge, and `settle` left it there.
+    if m.list_sel < m.list_scroll || m.list_sel >= m.list_scroll + lvis {
+        return Err("a wheel left the list selection outside its viewport");
+    }
+    // The POINTER chooses the pane, not `m.focus` — the whole difference between a wheel and an
+    // arrow key. Focus is the List here, and a detent over the TREE must still scroll the tree.
+    m.focus = Pane::List;
+    let list_before = m.list_scroll;
+    match wheel_scroll(&mut m, tree_x, tree_y, -1000) {
+        Some(h) if h.pane == "tree" && h.moved && h.scroll == tmax => {}
+        _ => return Err("a detent over the tree pane did not scroll the tree"),
+    }
+    if m.list_scroll != list_before {
+        return Err("a wheel over the tree moved the list's viewport");
+    }
+    if m.tree_sel < m.tree_scroll || m.tree_sel >= m.tree_scroll + tvis {
+        return Err("a wheel left the tree selection outside its viewport");
+    }
+    // Over Quarry, over NEITHER pane (the path bar): nothing scrolls and nothing is disturbed.
+    let (tb, lb) = (m.tree_scroll, m.list_scroll);
+    if wheel_scroll(&mut m, small.w / 2, small.bar_h() / 2, -3).is_some() {
+        return Err("the path bar claimed a wheel");
+    }
+    if m.tree_scroll != tb || m.list_scroll != lb {
+        return Err("a wheel over the path bar moved a viewport");
+    }
+    // ── the click grammar is FINAL, and a scroll is not a press ──────────────────────────────────
+    // A wheel writes no stamp, so it can neither complete a double-click nor break a half-made one.
+    // Asserted on the stamp itself AND end to end: press a row, scroll, press it again — the launch
+    // the operator asked for still arrives.
+    m.list_scroll = 0;
+    m.list_sel = 0;
+    m.settle();
+    m.click_ms = 4242;
+    m.click_row = 7;
+    m.click_pane = Pane::Tree;
+    let _ = wheel_scroll(&mut m, list_x, list_y, -2);
+    let _ = wheel_scroll(&mut m, tree_x, tree_y, 2);
+    if m.click_ms != 4242 || m.click_row != 7 || m.click_pane != Pane::Tree {
+        return Err("a wheel disturbed the click stamp");
+    }
+    m.list = alloc::vec![DirEnt {
+        name: String::from("VUG.ELF"),
+        kind: NodeKind::File,
+        size: 12568,
+        mtime: None
+    }];
+    m.list_scroll = 0;
+    m.list_sel = 0;
+    m.click_ms = 0;
+    m.settle();
+    if !matches!(content_press(&mut m, px_x, row0_y), Act::None) {
+        return Err("the first press of the scroll-between-clicks case launched something");
+    }
+    // A one-row list cannot scroll, which is exactly the point: the wheel must be inert here and
+    // must still not eat the stamp.
+    let _ = wheel_scroll(&mut m, list_x, list_y, -1);
+    match (content_press(&mut m, px_x, row0_y), clock_live) {
+        (Act::Launch(p), true) if p == "/fat/VUG.ELF" => {}
+        (Act::None, false) => {} // the zero-clock guard, as everywhere else in this battery
+        (_, true) => return Err("a scroll between two presses broke the double-click"),
+        (_, false) => return Err("a double-click fired on a zero clock"),
+    }
+    // ── `wheel_next` swept, rather than sampled ──────────────────────────────────────────────────
+    // The two properties the clamps rest on, over a space no hand-picked case covers: the result is
+    // never past either bound, and the sign of the detent is the direction of travel.
+    for smax in [0usize, 1, 7, 64, 4096] {
+        for scroll in [0usize, 1, smax / 2, smax] {
+            for d in [-127i32, -8, -1, 1, 8, 127] {
+                let n = wheel_next(scroll, smax, d);
+                if n > smax {
+                    return Err("wheel_next ran past scroll_max");
+                }
+                let from = scroll.min(smax);
+                if (d > 0 && n > from) || (d < 0 && n < from) {
+                    return Err("wheel_next travelled against the sign of the detent");
+                }
+            }
+        }
+    }
+
     Ok((small.w * small.h, bench.w * bench.h))
 }
 
@@ -2375,8 +2746,8 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
 pub fn selftest() {
     match selftest_result() {
         Ok((a, b)) => serial_println!(
-            ":: QUARRY: geometry+scroll+tree+hit+dedupe+exec+dblclick+cache+launch — 640x480 surf_px={} 1920x1200 surf_px={} dbl={}ms cache={} :: PASS ::",
-            a, b, DOUBLE_CLICK_MS, MAX_CACHE
+            ":: QUARRY: geometry+scroll+tree+hit+dedupe+exec+dblclick+cache+launch+wheel — 640x480 surf_px={} 1920x1200 surf_px={} dbl={}ms cache={} wheel={}rows :: PASS ::",
+            a, b, DOUBLE_CLICK_MS, MAX_CACHE, WHEEL_ROWS
         ),
         Err(why) => serial_println!(":: QUARRY: {} :: FAIL ::", why),
     }

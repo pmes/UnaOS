@@ -70,7 +70,8 @@ eating arrows for a window the operator cannot see. The pointer needs no equival
 | click a tree row | select and show it; clicking the **disclosure triangle** toggles instead |
 | click a list row | select it |
 | **double-click a list row** | (M2) open it — same rule as `Enter`. Two presses on the **same row of the same pane** inside `DOUBLE_CLICK_MS` (400 ms). §11.3 derives the constant; nothing in this tree had one |
-| click a scrollbar **track** | page towards the press — see §4 for why the track, and not a wheel |
+| click a scrollbar **track** | page towards the press — a whole viewport, the COARSE gesture |
+| **wheel** over a pane | (QSCROLL) scroll that pane by three rows a detent — the FINE pointer gesture. The pane is the one under the POINTER, not the one the keyboard is driving. §14 |
 | title bar / borders | drag, minimise, zoom — the ordinary `wm` arms, deliberately not claimed |
 | dock's `quarry` tile | reopen |
 
@@ -169,7 +170,7 @@ scrolling list needs.** Quarry is the first scrolling anything in this tree.
 
 | layer | what exists | usable? |
 | --- | --- | --- |
-| input | ~~`drivers/xhci/mod.rs` decoded the HID boot mouse as `byte0=buttons, byte1=dx, byte2=dy` and ignored byte 3; `pal::Event` had no wheel variant and `una-abi` no `INPUT_EV_WHEEL`.~~ **Closed by the WHEEL arc:** the decoder reads byte 3 as a signed `i8` whenever the Transfer Event residual says the report actually carried four bytes, `pal::Event::Wheel(i8)` carries it, `INPUT_EV_WHEEL` packs it, and the router delivers it to the focused EL0 window (`[wheel1]` census). No CONSUMER exists yet — the channel is live, nothing scrolls on it. The HID keymap still drops PageUp/PageDown (`0x4B`/`0x4E` → `(0,0)`). | **wheel: yes; PageUp/Dn: no** |
+| input | ~~`drivers/xhci/mod.rs` decoded the HID boot mouse as `byte0=buttons, byte1=dx, byte2=dy` and ignored byte 3; `pal::Event` had no wheel variant and `una-abi` no `INPUT_EV_WHEEL`.~~ **Closed by the WHEEL arc:** the decoder reads byte 3 as a signed `i8` whenever the Transfer Event residual says the report actually carried four bytes, `pal::Event::Wheel(i8)` carries it, `INPUT_EV_WHEEL` packs it, and the router delivers it to the focused EL0 window (`[wheel1]` census). ~~No CONSUMER exists yet.~~ **QSCROLL is Quarry's consumer** — §14. The HID keymap still drops PageUp/PageDown (`0x4B`/`0x4E` → `(0,0)`). | **wheel: yes; PageUp/Dn: no** |
 | compositor | `wm.rs` is 18 373 lines and `WindowInfo` has no scroll, content-offset or viewport field. There is no clip-to-content-rect. | **no** |
 | blit | `FrameBuffer::scroll_up(dy, fill)` (`framebuffer.rs:552`) is a **whole-surface** memmove — no rect, no clip, kernel-private, behind no syscall. `video/vperf.rs` instruments its cost; it is a benchmark subject, not an API. | **no** |
 | widget | `theme::SCROLL_TRACK` and `theme::SCROLL_THUMB` have existed since the theme table landed and **no scrollbar has ever consumed them** (their only uses were a row highlight in `instgui` and the dim minimised pip in `dock`). `theme::SCROLLBAR_WIDTH` had no consumer at all. | **no** |
@@ -209,14 +210,15 @@ The surface cap is what makes that affordable: at 1152 x 720 a repaint is ~830 k
 repaint happens only on an actual gesture — there is no animation and no per-frame paint. A settled
 Quarry costs nothing at all.
 
-### Scroll GESTURES, given no wheel CONSUMER
+### Scroll GESTURES
 
 The scrollbar **track** is the coarse gesture: a press above the thumb pages back, below pages
 forward. That was originally the consequence of the wheel byte being discarded in the xHCI decoder
 before the ABI ever saw it; the WHEEL arc has since landed the byte, the event and the routing (§4's
 table), so the track gesture is now a CHOICE rather than a workaround — and it stays the coarse
-gesture regardless, since it is the only one a wheel-less mouse has. Wiring Quarry's list to
-`INPUT_EV_WHEEL` is a scoped follow-up, not a blocked one. Thumb **dragging** is not implemented —
+gesture regardless, since it is the only one a wheel-less mouse has. The **wheel** is the fine
+pointer gesture beside it (QSCROLL, §14) — three rows a detent, on the pane under the pointer. Thumb
+**dragging** is not implemented —
 `wm`'s drag machinery is title-bar-scoped and a content-drag protocol is its own arc. Keyboard
 `Up`/`Down` is the fine gesture and auto-follows.
 
@@ -363,7 +365,7 @@ A third item is a bookkeeping debt rather than a capability:
 
 ## 8. The witness
 
-`:: QUARRY: … :: PASS ::`, **ten** legs (M1's five plus M2's five), `witness`-gated, run from
+`:: QUARRY: … :: PASS ::`, **twelve** legs (M1's five, M2's six, and QSCROLL's wheel), `witness`-gated, run from
 `pidesk::activate` step 6 **before** `open()` — its legs are pure functions over synthetic input (no
 panel, no volume, no window table), so a DECLINE in the thing it proves the arithmetic of must not be
 able to skip it.
@@ -395,6 +397,8 @@ closes.
 | **double-click** (M2) | `is_double` fires exactly at the window and not one ms past it; never pairs different rows or different panes; never fires on a **zero clock** (the guard that stops the first press of a boot launching on a board whose `CNTFRQ_EL0` reads 0); and rejects a backwards clock |
 | **the cache** (M2) | the directory cache never exceeds `MAX_CACHE`, and evicts **oldest-first** |
 | **the launch gesture, end to end** (M2) | two presses at a real pixel, through the **same `content_press` the click router calls**, produce `Act::Launch("/fat/VUG.ELF")`; a third rapid press does NOT re-activate (the stamp reset); presses on two different rows open nothing; and a double-click on `CONFIG.TXT` produces `Act::NoOpener` naming it. Both clock branches are asserted, so the leg is a real claim on a board whose `CNTFRQ_EL0` reads 0 rather than a claim on some boards |
+
+| **the wheel** (QSCROLL) | a detent at a real pixel, through the **same `wheel_scroll` the router calls**, moves the pane **under the pointer** by `WHEEL_ROWS` and the other pane not at all; the sign reverses it; it clamps dead at 0 and at `scroll_max` and SAYS `moved=false` rather than wrapping; the path bar claims nothing; the selection is still inside its viewport afterwards; the click stamp is **byte-for-byte untouched** and a scroll between two presses on the same row still launches. Then `wheel_next` **swept** over `smax × scroll × detents`: never past either bound, never against the sign |
 
 Leg 11 deliberately stops at the **decision**: everything downstream of the `Act` is `bg`'s own
 machinery, exercised on every boot by the BGRUN fixtures, and a fixture that actually spawned a
@@ -928,3 +932,145 @@ say what the stick's own listing costs.
   ledger already names, and the host was running four concurrent QEMU sessions throughout. Nothing
   filesystem-side appears in it, and the knob-off byte-identity is the stronger statement anyway:
   the image an operator boots without this knob is the same bytes it was.
+
+---
+
+## 14. QSCROLL — the wheel reaches the viewport (2026-08-18)
+
+§4's audit ended with the wheel channel LIVE and no consumer on it: the WHEEL arc had landed the HID
+byte, `pal::Event::Wheel(i8)`, `INPUT_EV_WHEEL` and the routing to the focused window, and
+`user-vug`'s WHEELZOOM (`35f49101`) was the first consumer anywhere in the tree — its M2, *"Quarry
+list scroll"*, was explicitly deferred. This is that M2, and Quarry is the second consumer.
+
+### 14.1 The gesture
+
+> A wheel detent over a Quarry pane scrolls **that pane** by `WHEEL_ROWS` (3) rows. Positive detents
+> (the wheel turned away from the operator) move the offset toward row 0.
+
+Three rows is a ratio to the two gestures that already existed rather than a taste. The scrollbar
+track pages by a whole viewport (26 rows at 640 x 480, 33 at bench geometry) and `Up`/`Down` moves
+one; a wheel that did either would duplicate a gesture the operator already has. Three is the
+smallest step that reads as a SCROLL rather than a cursor nudge, and it is about a tenth of a
+viewport on both panels.
+
+The direction is the same sign convention `user-vug`'s `wheel_zoom` reads off the same
+`pal::Event::Wheel(i8)` — positive = away from the operator — so the tree's two wheel consumers
+cannot disagree about which way a hand turned.
+
+**The pane is chosen by the POINTER, not by `Model::focus`.** That is the whole difference between a
+wheel and an arrow key: `Up`/`Down` drive the pane the keyboard owns, and a wheel drives the pane the
+hand is over. It is resolved through the same `Rect::contains` calls on the same `geometry()` accessor
+`content_press` uses, so the press and the wheel cannot disagree about where the divider is. Over
+Quarry but over neither pane — the path bar — the event is consumed and nothing scrolls.
+
+### 14.2 The click grammar is FINAL, and a scroll is not a press
+
+The grammar is unchanged and was treated as a constraint, not a thing to extend: a click SELECTs and
+acknowledges, `SPACE` stops and starts, focus stops nothing. `wheel_scroll` therefore writes **no**
+`click_ms`, **no** `click_row`, **no** `click_pane`, produces no `Act`, and acknowledges nothing on
+the glass. It cannot complete a double-click and cannot break a half-made one — an operator who
+presses a row, scrolls, and presses the same row again inside `DOUBLE_CLICK_MS` gets the launch they
+asked for. Both halves of that are asserted by leg 12, on the stamp itself and end to end through
+`content_press`.
+
+`wheel_route` also does **not** call `wm::focus_changed`. A scroll must not raise a window: the
+pointer's mere presence over a row would otherwise re-order the glass. And a detent spent on a bound
+repaints nothing — one census line, no `wm::present` at all.
+
+What the wheel *does* move is the **selection**, and only as far as the viewport's edge — the exact
+pull `content_press`'s scrollbar-track arm already applies, written the same way (`max` then `min`,
+never `clamp`, which panics when a degenerate viewport makes `min > max`). One rule for both coarse
+gestures rather than two, so §4's standing invariant — the selection is always inside the viewport —
+holds after a wheel exactly as it holds after a track page, and `Model::settle` stays a fixed point
+instead of yanking the viewport back to a selection left off-screen.
+
+### 14.3 The seam: no routing file was touched, and no line was added to one
+
+The wheel arrives through the **one line `arch/aarch64/syscall.rs::user_input_enqueue` already
+carries** for the desktop furniture (§6's keyboard row) — the single choke point every event bound
+for a focused window passes through, and the same one the WHEEL arc routes `INPUT_EV_WHEEL` through
+on its way to an EL0 ring. WHEELZOOM's consumer sits one layer further out behind that same decision;
+Quarry's sits at it, because Quarry is kernel furniture and has no ring.
+
+That seam was free because `quarry::key_route` is handed the whole `pal::Event` rather than a
+keycode. **This arc's entire diff is one file, `video/quarry/live.rs`, which is compiled only under
+`feature = "quarry"`.** Nothing in the knob-off `kernel8.img` changed, and that was measured rather
+than reasoned about (§14.5), per §13.2's law.
+
+**One honest cost, stated rather than hidden.** `key_route` is a keyboard noun and it now also
+dispatches a wheel. Renaming the export would edit a line in `syscall.rs` — a byte-identity-critical
+file (PARITY.md §5.3) — for a noun, and this arc will not spend that. The name is wrong; the wiring
+is right; the trade is recorded here and in the function's own doc comment.
+
+**Position.** A wheel event carries a delta and no coordinates, so the position is the system
+cursor's, read exactly as `syscall.rs::click_pointer_pos` reads it for a button. `wm::hit_test` then
+decides ownership, so a wheel over a window ABOVE Quarry is that window's, and a wheel over a PARKED
+Quarry reaches nothing — a row below `SHELL_Z` neither composites nor hit-tests, which is the same
+construction that lets `press_route` skip the `on_glass` guard the keyboard needs.
+
+### 14.4 The reach this inherits, and the gap it does not close
+
+Quarry's wheel gets **exactly** the reach Quarry's keyboard already has, because it is the same seam:
+`user_input_enqueue` is called from `route_input_to_active_el0`, which `main.rs::pump_usb_into_gui`
+gates on `user_input_active() != 0`. With the **shell** holding focus (`active == 0`) the drain takes
+its own branch, whose `Event::Wheel` arm ends at `pal::wheel_note_no_focus()` — so a wheel turned
+while no EL0 app owns input never reaches this consumer, exactly as an arrow key does not.
+
+That is a pre-existing property of the furniture's key seam, not something this arc introduced, and
+closing it means editing `main.rs`'s shell drain — a shared input file outside this arc's lane and
+outside the seam WHEELZOOM established. **It is reported rather than widened into.** The bench
+condition under which the gesture is live is the ordinary one Peter drives: an EL0 app (a `vug`) has
+been focused at some point in the boot.
+
+### 14.5 The census, and the witness
+
+One line per detent that reached a viewport, split the way WHEELZOOM's `[vugzoom]` is split and for
+its reason — `applied` and `clamped` answer different questions at a bench:
+
+```
+[qscroll] applied=1 pane=list detents=-1 rows=3 scroll=3/17
+[qscroll] clamped=2 pane=list detents=-1 rows=3 scroll=17/17
+```
+
+`applied` says the byte was decoded, routed, hit-tested to Quarry's window and moved the picture.
+`clamped` says all of that happened and the range is spent — a working scroll at the end of a
+directory, not a dead one. Without the split those two are indistinguishable from outside the
+machine, which is the confusion the WHEEL arc's `[wheel1]` census exists to prevent one layer down.
+
+The witness gains a **twelfth leg** (§8's table), driven through the same `wheel_scroll` the router
+calls, plus a swept `wheel_next`. It stops at `wheel_scroll` for leg 11's reason, restated: above it
+lies the cursor read, `wm::hit_test` and the panel→source conversion `press_route` already performs
+identically, and a fixture that built a window to hit-test would perturb the very window table the
+rest of this battery asserts exact pixels of. Below it is arithmetic — and arithmetic is what a QEMU
+that can deliver no HID report at all is able to prove. The PASS line now reads:
+
+```
+:: QUARRY: geometry+scroll+tree+hit+dedupe+exec+dblclick+cache+launch+wheel — 640x480 surf_px=110592
+           1920x1200 surf_px=829440 dbl=400ms cache=16 wheel=3rows :: PASS ::
+```
+
+### 14.6 Gate results (2026-08-18)
+
+| gate | result |
+| --- | --- |
+| `./arroyo check` | **green, both arches** — `✅ x86_64 OK`, `✅ aarch64 OK`, `✅ kernel cfg coverage OK (12 legs)`. The `arm-pi` and `x86-all` legs both carry `quarry`, so leg 12 is type-checked on the arch that cannot run it too |
+| knob-off `./arroyo kernel8` byte-identity | **proven by measurement, both directions.** `8c27144aca7d7586488831b1c318e0093b9d129a210e094c32eeb00bb1d4b038`, 1221078 bytes, with this arc's `live.rs` and with the patch reversed out, built in the same directory from the same command |
+| `./arroyo kernel8-test 210` knob-off | **PASS 117/117 required, 0 forbidden**, 12808 lines |
+| `UNAOS_QUARRY=1 UNAOS_PIDESK=1 ./arroyo kernel8-test 300` | **117/117 required**, 6 forbidden, 21204 lines. `:: QUARRY: … +wheel … :: PASS ::` present |
+| control — `UNAOS_PIDESK=1` alone, same host, back to back | 116/117 required, **9** forbidden |
+| armed, repeated after the comment-only edits (host at 4 concurrent aarch64 QEMUs) | 116/117 required, 7 forbidden, 44899 lines — same image class, different host term; `:: QUARRY: … +wheel … :: PASS ::` present on both |
+| `FORBID :: QUARRY: .* :: FAIL ::` | **0 hits on every battery** |
+
+**Attribution.** The armed run is strictly better than its own paired control on both terms
+(117 vs 116 required, 6 vs 9 forbidden), which is the §12 shape again: the `arm-pi` battery asserts
+exact window ids and panel pixels and was written against a Pi desktop with no extra tenant. Every
+residual forbidden line is in the documented compositor/drag lane the PA44 ledger already names —
+`[wc-g] … RACE-BLIT`/`COHER`, `[dragperf] … coalesced=0` — and the host carried three other
+concurrent aarch64 QEMUs throughout. The knob-off battery on the same host is 117/117 with 0
+forbidden, and the knob-off image is the same bytes it was, which is what makes the attribution clean
+rather than a guess.
+
+**No new witness line is a REQUIRE.** `[qscroll]` cannot appear on a QEMU that delivers no HID
+report, so requiring it would red every battery; the spec is untouched, and the standing
+`FORBID :: QUARRY: .* :: FAIL ::` covers leg 12 for free on both polarities. `[qscroll]` is bench
+evidence, and the bench is where it will first print.
