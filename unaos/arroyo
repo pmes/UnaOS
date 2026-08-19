@@ -571,6 +571,34 @@ _feats=""
 # Mirrors the PORTSW-1/SMOLNET default-ON/negative-knob policy. See arch_arm64.md §ORIN-SMP.
 [ -n "${UNAOS_TEGRASMP:-}" ] && _feats="${_feats}tegrasmp,tegra,"
 [ -n "${UNAOS_TEGRA:-}" ] && [ -z "${UNAOS_NOTEGRASMP:-}" ] && _feats="${_feats}tegrasmp,tegra,"
+# JB11-ESCAPE: UNAOS_NOJB11=1 suppresses the Falcon firmware-header census
+# (arch/aarch64/xusb_tegra.rs::jb11_fw_header_census) so a bench sitting can take an UN-INSTRUMENTED
+# CONTROL boot. Default UNSET => the census runs on every tegra boot, unchanged — the census is the
+# point; this is only its escape. Negative-knob spelling per UNAOS_NOTEGRASMP / UNAOS_NOSDHCBLK /
+# UNAOS_NOKBDWIT above.
+#
+# NOT A CARGO FEATURE, deliberately — this is the one knob in this file whose value lies in NOT
+# changing the image. It is read with `option_env!` into a `#[used]` static that the census branches
+# on with `read_volatile`, so armed and suppressed builds are the same link: same functions, same
+# strings, same codegen units, same panic `Location`s. MEASURED: the loadable images differ in
+# EXACTLY ONE BYTE (the flag; `llvm-objcopy -O binary` + `cmp -l`), every symbol address identical —
+# the two .elf FILES differ by a further 32 non-loaded bytes of .strtab (LLVM `.llvm.<hash>`
+# internal-symbol suffixes), so compare the binary image and not the .elf sha256. JB11's WATCH
+# ITEM is that arming the census re-partitioned codegen units and grew the image ~118 KB, and the
+# JETSON-XCARVE wall is IMAGE-LAYOUT-CORRELATED — so a `#[cfg]`-style gate would remove the census
+# AND relink, confounding "JB11's BAR2 traffic moved the wall" with "the relink moved the wall".
+# This knob removes only the traffic, which is the control the WATCH ITEM asks for. Cargo's
+# dep-info env tracking rebuilds the kernel when the knob flips, so no feature arm is needed.
+#
+# Suppression is NEVER SILENT: the kernel prints one line —
+#   `:: tegra: JB11 [<tag>] — census SUPPRESSED (UNAOS_NOJB11=1) — control boot: ... ::`
+# and returns before its first touch, so the wire always states which of the two boots this was.
+# tegra-only (the whole module is `#[cfg(feature = "tegra")]`); no builder mirror — the jetson media
+# is built by this script, not by the x86 `builder` crate.
+if [ -n "${UNAOS_NOJB11:-}" ]; then
+    export UNAOS_NOJB11
+    echo -e "${COLOR_YELLOW}⚡ UNAOS_NOJB11: JB11 Falcon fw-header census SUPPRESSED (control boot — same link, ONE byte apart)${COLOR_RESET}"
+fi
 # JETSON-XCARVE M2: UNAOS_XCARVE=1 arms the inherited-xHCI-pointer instrumentation
 # (arch/aarch64/xusb_tegra.rs::jbxc_inherited_dump), fired at the top of jb2b_attach BEFORE the
 # no-HCRST takeover overwrites the inherited DCBAAP/CRCR/ERST. The `xcarve` feature implies `tegra`.
@@ -1565,6 +1593,26 @@ check_user_arch() {
 # (minus `default`) against the union of the three leg feature lists below. `sdhcblk` (SDHC-4b),
 # `bcmaS1` (BCMA-S1) and `bt` (BT-L0) are all on `x86-all`, so no arc widens the gap.
 #
+# ⚠ RE-COUNTED 2026-08-19 (GR26, the tegra_el0 leg) AND STALE AGAIN, by a wide margin: the table holds
+# 100 knobs and the board legs' union 92. EIGHT are named by no board leg, and they do NOT all mean the
+# same thing — the distinction is what the count alone hides:
+#   * `nvidia-kepler-kdisp-hold`, `rtpi`, `rtwit`, `selfhost` — x86-family (their `#[cfg]` sites are in
+#     `arch/x86_64/`, or in `lib.rs`/`main.rs` under `target_arch = "x86_64"`). `x86_cfg_universe`
+#     inherits every unnamed feature as "unclaimed => assume x86", so these ride the 8 derived mix legs
+#     and are GENUINELY compiled. Not holes; just not board-named.
+#   * `simmer_test` (arch/aarch64/sched.rs), `xusbfw` (arch/aarch64/xusb_tegra.rs) and — until the leg
+#     appended below — `tegra_el0`: aarch64-only, inherited by the SAME rule onto x86 legs, where they
+#     compile GREEN and VACUOUS. Real holes wearing a green verdict.
+#   * `vugras` — split: `pub mod vugras;` is declared unconditionally so the module's own body rides the
+#     x86 legs, while its sweep CALL SITES are tegra-lane and ride nothing.
+# THE FAILURE MODE IS SILENT, which is why the count drifted this far unnoticed. The forcing function
+# the GATE-CFG-MIX note below promises ("the gate will go red naming it") fires only for a feature that
+# names an aarch64 MODULE from unqualified code; one whose sites all sit under `src/arch/aarch64/` or
+# carry a `target_arch` qualifier passes quietly. `tegra_el0` is the proven case: swept onto 8 x86 legs,
+# type-checked by none of them, and the armed Orin build broke anyway (EXECGATE — see the leg below).
+# The other three-and-a-half are the same shape and are NOT fixed here: out of this arc's lane, recorded
+# so the pi/jetson arc that owns each one can claim it.
+#
 # And the DEFAULT legs already compile the all-off state for both arches — so for every feature BOTH polarities of its `#[cfg]` are
 # type-checked, which is what makes the 61
 # `not(feature = "pi")` / 21 `not(feature = "tegra")` / 14 `not(feature = "baremetal")` sites in the
@@ -1631,6 +1679,52 @@ KERNEL_CFG_MATRIX=(
   # that must be named explicitly now: the sleeping code has no other leg that compiles it with the
   # witness on. Between them both polarities of every `#[cfg]` in the family are compiled.
   "x86-vsyncpace ../../x86_64-unaos.json nvidia-kepler,nvidia-kepler-takeover,wc,witness,vsyncpace,ehcihid,smolnet"
+  # JETSON-EL0 (M1b) — the ARMED Orin, appended GR26. Until this leg, `tegra_el0` appeared in NO leg of
+  # this matrix, which means `./arroyo check` type-checked the configuration
+  # `UNAOS_TEGRA_EL0=1 ./arroyo esp-jetson` ships NOWHERE — and `UNAOS_TEGRA_EL0=1 ./arroyo check` did
+  # not change that, because these legs deliberately ignore $KERNEL_FEATURES (see check_kernel_cfg).
+  # Not theoretical: EXECGATE (89967799, reverted the same night) widened three `#[cfg]`s in `shell.rs`
+  # to `tegra_el0`, passed all 12 legs on both arches AND the pi/x86 byte-identity checks, and could
+  # not compile the armed build at all. Re-applied against THIS leg (2026-08-19, throwaway worktree),
+  # it reds it with exactly the three errors the 12 legs never saw — every one naming `shell.rs`:
+  #   E0433 shell.rs:4363  cannot find `boot` in `aarch64`   (the widened `read_el0_image` still reads
+  #                        `arch::aarch64::boot::USER_REGION_SIZE`; `boot` is the Pi slot module, and
+  #                        the Orin's port is `mmu_tegra_el0` behind the `uslots` facade)
+  #   E0425 shell.rs:3459  cannot find function `run_program` in this scope
+  #   E0425 shell.rs:4022  cannot find function `bg_program` in this scope
+  #                        (both helpers are still `any(all(baremetal, aarch64), x86_64)` — the widened
+  #                        `run`/`bg` ARMS went live in a build where their callees do not exist)
+  # Both required gates said green about a build that nothing compiled. Same defect class the
+  # GATE-CFG-MIX note below documents (the gmux_igd E0425), one arch over — a symbol under feature X
+  # referenced from code compiled under feature Y, catchable only by a leg with Y on and X off.
+  #
+  # WHY A SECOND LEG AND NOT `,tegra_el0` APPENDED TO `arm-tegra`. `arm-tegra` is the DISARMED twin and
+  # has to stay that way: it is the only leg anywhere that compiles the SHIPPED default jetson image
+  # (`tegra` ON, `tegra_el0` OFF), and that polarity has real code behind it — `main.rs`'s
+  # `#[cfg(all(feature = "tegra", not(feature = "tegra_el0"), target_arch = "aarch64"))]`
+  # `tegra_el0_start_maybe` stub, plus the `not(any(baremetal, tegra_el0))` arms in `sched.rs` and
+  # `exceptions.rs`. Arming the one tegra leg would have traded the new hole for that one. The default
+  # aarch64 leg does not cover it either: all-off is `tegra` OFF too, so it never compiles the
+  # tegra-ON/el0-OFF combination. Exactly the `x86-vsyncpace` shape above — the armed twin is a leg of
+  # its own, named rather than derived, and between the two every `#[cfg]` in the family gets both
+  # polarities compiled.
+  #
+  # The feature list is `arm-tegra`'s verbatim + `tegra_el0` — which is precisely what the armed media
+  # build carries (`esp_jetson` forces `tegra` + `tegrasmp`; `tegra_el0` implies `tegra`).
+  #
+  # PRECONDITION: this leg compiles `arch/aarch64/syscall.rs`, which `include_bytes!`s
+  # `target/user_blob.bin`. `ensure_user_blob` (see check_both) supplies it — and had to, for `arm-pi`,
+  # before this leg existed. Read that block before touching this line.
+  #
+  # SIDE EFFECT, deliberate and correct: naming `tegra_el0` on an arm-* leg also REMOVES it from the
+  # x86 mix universe (`x86_cfg_universe` = the feature table minus what the arm legs name and `x86-all`
+  # does not). It had been riding the 8 x86 pairwise legs as an unclaimed "assume x86" feature, where
+  # it is vacuous: every one of its cfg sites is either under `src/arch/aarch64/` or explicitly
+  # `target_arch = "aarch64"`-qualified in `main.rs`, so those legs were compiling a knob that emits
+  # nothing. The universe goes 60 -> 59 features, the leg count stays 8 (C(8,4) = 70 >= 59) and the
+  # pairwise guarantee is unaffected — it is a property of the mask construction, not of which
+  # features are in the set.
+  "arm-tegra-el0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────
@@ -1841,7 +1935,53 @@ check_kernel_cfg() {
     echo -e "${COLOR_GREEN}✅ kernel cfg coverage OK (${_n} legs)${COLOR_RESET}"
 }
 
+# ── GATE-BLOB: the one artifact `check` has to build, and why it builds it at most once per tree ──
+#
+# TWO legs of the matrix compile `arch/aarch64/syscall.rs`: `arm-pi` (via `baremetal`) and
+# `arm-tegra-el0` (via `tegra_el0`). That file `include_bytes!`s `target/user_blob.bin`, which is
+# produced by `build_user_blob` — and `build_user_blob` runs only from `kernel8` and the ARMED
+# `esp-jetson`, never from `check`. So `./arroyo check` in a tree that has never built a Pi image has
+# been RED, on `arm-pi`, since the cfg matrix gained that leg:
+#     error: couldn't read .../crates/kernel/../../target/user_blob.bin (os error 2)
+#     error: could not compile `unaos-kernel` (lib) due to 1 previous error
+# Reproduced on a `git worktree add`ed tree at f4454eff before this block existed. In an established
+# tree a blob left over from some earlier `kernel8` masks it, which is why it reads as a recurring
+# fresh-worktree papercut rather than a standing bug. It is also the reason `tegra_el0` had no leg:
+# adding one on top of this would have doubled the papercut instead of closing it.
+#
+# ONLY WHEN MISSING — the load-bearing half. `build_user_blob` re-objcopies the file on every run, and
+# `include_bytes!` registers it as a rebuild dependency, so calling it unconditionally from `check`
+# would refresh the blob's mtime every single run and force both aarch64 EL0 legs to recompile from
+# scratch each time, for a file whose CONTENTS `check` never reads. Existence is the entire
+# requirement: `cargo check` neither links nor runs the blob, so a stale one type-checks identically.
+# Present and non-empty => no-op, cost 0 (the warm case, i.e. always after the first time); absent =>
+# build it once, ever. The media paths are unaffected: `kernel8` and armed `esp-jetson` call
+# `build_user_blob` unconditionally, so neither ever consumes what this leaves behind.
+#
+# WHY NOT A STUB. Writing an empty/fake `user_blob.bin` would be cheaper still and is REJECTED,
+# because the file then exists for every later command in that tree — including ones that bake it into
+# media WITHOUT rebuilding it. `UNAOS_TEGRA_EL0=1 ./arroyo esp-arm` (likewise `arm` / `test-arm`)
+# compiles `syscall.rs` and calls `build_user_blob` nowhere: today it fails loudly with the
+# `couldn't read` above; with a stub on disk it would silently link a kernel whose EL0 payload is not a
+# program, and the failure would move from the build to the bench. Masking a missing-artifact failure
+# is exactly what must not happen, so `check` builds the REAL blob — same function, same assertions
+# (`_start` = `mov x8,#1` = 28 00 80 d2) — or fails.
+ensure_user_blob() {
+    if [ -s "${WORKSPACE_DIR}/target/user_blob.bin" ]; then
+        return 0
+    fi
+    # Same TOOLBIN computation as `build_user_blob`'s other two callers — it requires the caller to
+    # set it, and bash's dynamic scoping hands this `local` down into the call.
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    echo -e "${COLOR_CYAN}  (target/user_blob.bin absent — building it once, for the aarch64 EL0 legs)${COLOR_RESET}"
+    build_user_blob
+}
+
 check_both() {
+    # GATE-BLOB (above). BEFORE the first cargo invocation, not inside check_kernel_cfg: the DEFAULT
+    # aarch64 leg below carries `tegra_el0` too whenever the operator's own knobs do
+    # (`UNAOS_TEGRA_EL0=1 ./arroyo check`), so a blob supplied later would be supplied too late.
+    ensure_user_blob
     echo -e "${COLOR_YELLOW}⚡ Syntax Check: x86_64...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
     cargo +nightly check --release \

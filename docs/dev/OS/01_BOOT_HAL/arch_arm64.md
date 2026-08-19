@@ -8868,6 +8868,65 @@ call it) and `esp_jetson` invokes it **only when `tegra_el0` is armed** — the 
 compile `syscall.rs`, so an unconditional blob build would slow every ordinary jetson build and churn
 the kernel's rebuild via the blob's refreshed mtime for nothing.
 
+#### `./arroyo check` supplies it too — `ensure_user_blob` (2026-08-19)
+
+`check` calls neither `kernel8` nor `esp-jetson`, and **two** `KERNEL_CFG_MATRIX` legs compile
+`syscall.rs`: `arm-pi` (via `baremetal`) and the `arm-tegra-el0` leg below (via `tegra_el0`). So
+`./arroyo check` in a `git worktree add`ed tree that had never built anything was already **RED on
+`arm-pi`** with the same `couldn't read .../target/user_blob.bin`, independently of this arc —
+measured at `f4454eff`: EXIT 1 after 4 m 27 s. An established tree hides it behind a blob left over
+from some earlier `kernel8`, which is why it read as a recurring fresh-worktree papercut rather than a
+standing bug.
+
+`check_both` now calls `ensure_user_blob` before its first cargo invocation: present and non-empty ⇒
+no-op, absent ⇒ one `build_user_blob` (measured 10.3 s cold, once per tree — 51-byte blob).
+With the block in place the same fresh worktree runs **EXIT 0 in 4 m 28.9 s**: the whole gate got
+*more* legs and stayed inside a second of the red baseline, because the old `arm-pi` failure aborted
+that leg before it compiled anything. **Only-when-missing is
+load-bearing**: `build_user_blob` re-objcopies the file on every run and `include_bytes!` registers it
+as a rebuild dependency, so an unconditional call would recompile both aarch64 EL0 legs from scratch on
+every `check`, for a file whose *contents* `check` never reads — `cargo check` neither links it nor
+runs it. **A stub was rejected**: `UNAOS_TEGRA_EL0=1 ./arroyo esp-arm` (likewise `arm` / `test-arm`)
+compiles `syscall.rs` and calls `build_user_blob` nowhere, so a fake blob left on disk would convert
+today's loud build failure into a kernel whose EL0 payload is not a program — moving the failure from
+the build to the bench.
+
+### `arm-tegra-el0` — the leg that type-checks the armed Orin (2026-08-19)
+
+Until this leg, **`tegra_el0` appeared in no `KERNEL_CFG_MATRIX` leg at all**, so the configuration
+`UNAOS_TEGRA_EL0=1 ./arroyo esp-jetson` ships was type-checked nowhere; `UNAOS_TEGRA_EL0=1 ./arroyo
+check` did not change that either, because the matrix legs deliberately ignore `$KERNEL_FEATURES`.
+EXECGATE (`89967799`, reverted as `f4454eff`) is the proof: it widened three `#[cfg]`s in `shell.rs` to
+`tegra_el0`, passed all 12 legs on both arches plus the pi/x86 byte-identity comparisons, and could not
+compile the armed build. Re-applied against the new leg in a throwaway worktree, it reds it — and only
+it — with the three errors nothing else sees:
+
+```
+error[E0433]: cannot find `boot` in `aarch64`        --> crates/kernel/src/shell.rs:4363:44
+error[E0425]: cannot find function `run_program` ... --> crates/kernel/src/shell.rs:3459:32
+error[E0425]: cannot find function `bg_program` ...  --> crates/kernel/src/shell.rs:4022:21
+```
+
+The widened `read_el0_image` still reads `arch::aarch64::boot::USER_REGION_SIZE` — `boot` is the Pi
+slot module; the Orin's port is `mmu_tegra_el0` behind the `uslots` facade — and `run_program` /
+`bg_program` are themselves still `any(all(baremetal, aarch64), x86_64)`, so the widened `run` and `bg`
+arms went live in a build where their callees do not exist.
+
+The leg is `arm-tegra`'s feature list verbatim **+ `tegra_el0`** — what the armed media build carries.
+It is a **second** leg rather than `tegra_el0` appended to `arm-tegra` because `arm-tegra` is the only
+leg anywhere that compiles the *shipped default* jetson image (`tegra` ON, `tegra_el0` OFF), a polarity
+with real code behind it (`main.rs`'s `tegra_el0_start_maybe` stub under
+`#[cfg(all(feature = "tegra", not(feature = "tegra_el0"), target_arch = "aarch64"))]`, the
+`not(any(baremetal, tegra_el0))` arms in `sched.rs`/`exceptions.rs`); the all-off default leg does not
+cover it, since all-off is `tegra` OFF too. Arming the one tegra leg would have traded the new hole for
+that one. Side effect, deliberate: naming `tegra_el0` on an `arm-*` leg also removes it from the x86
+mix universe (60 → 59 features, still 8 derived legs, pairwise coverage unaffected), where it had been
+riding as an unclaimed "assume x86" knob and compiling nothing.
+
+Cost: **8.3 s** the first time a tree compiles that feature set, **0.06 s** (cargo cache hit) every run
+after — a fully warm `./arroyo check` with all 13 legs is 2.2 s end to end. Leg count 12 → 13;
+`UNAOS_TEGRA=1 ./arroyo check` is green in 16.2 s.
+
 ## DARKWIN-GUARD — the 2026-08-18 trunk-merge boot hang, and the dark-window serial latch
 
 ### The failure
