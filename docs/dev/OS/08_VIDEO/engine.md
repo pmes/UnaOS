@@ -14052,3 +14052,118 @@ structural — a spinning core cannot dispatch the holder pinned to it — so ga
 the asymmetry. That is the argument §DRAGWEDGE already made one arc earlier, unchanged.
 
 **The metal verdict — drag working through a busy vug — is the next boot's.**
+
+## §DRAINRESCUE — the drain raise that outlives its owner
+
+**The defect DRAGFIX M2 named and declined to half-cure.** `DrainBarrier::drain_bounded` raises
+`DRAIN_PENDING` at its head; the `DrainBarrier` that lowers it is a value returned to the caller. A
+task that DIES between those two points leaks the count permanently, and a permanently raised
+`DRAIN_PENDING` makes every `composite_inner` take its barrier early-return — a live kernel behind a
+frozen panel, the PA38 shape. Reachable from EL0 through `sys_win_move`/`sys_win_close`.
+
+**Why no RAII guard can close it.** The target is built `panic-strategy: abort`, and every death path
+diverges by switching off the task's own kernel stack. No unwinding runs, so no drop glue runs on the
+abandoned frames. Moving the guard's construction earlier strands the count in exactly the same way as
+the bare `fetch_add` does: the guard shape cures a path that *returns*, and this one does not return.
+
+**The cure: the raise is recorded with its OWNER; the scheduler's death path releases it.**
+
+| piece | where | what it does |
+|---|---|---|
+| `DRAIN_OWNERS` | `wm.rs`, 8 × `AtomicU64`, `0` = free | one slot per outstanding raise, holding the raiser's task id |
+| `drain_note_raise(owner)` | at the `DRAIN_PENDING.fetch_add` | claims a slot, `0 -> owner` |
+| `DrainBarrier(u64)` | the guard now carries its owner | so a lower retires the slot the raise actually took, even across a migration |
+| `drain_note_lower(owner)` | `DrainBarrier::drop`, before the count | releases one slot, `owner -> 0` |
+| `drain_release_dead(id)` | **called from `arch/*/sched.rs`** | claims every slot the dead id still holds, lowers `DRAIN_PENDING` once per slot, bumps `rescued=` |
+
+**Every death path, hooked.** The set is enumerable on both lanes, and both lanes have two arms — one
+where the dying task walks into a boundary, one where the scheduler retires it without ever entering
+it. The off-CPU arm is the one that is easy to miss and is not optional: a task parked inside the
+drain's yielding wait is READY, not running, and a kill delivered while it sits on a run queue leaks
+identically.
+
+| lane | arm | site | reached by |
+|---|---|---|---|
+| aarch64 | on-CPU | `sched.rs::exit()` | `kill_check_current` (from `yield_now` and `timer_preempt`), the M6b fault-kill, `sys_exit`, `SYS_THREAD_EXIT`, a kernel entry's return |
+| aarch64 | off-CPU | `sched.rs::retire_killed()` | `dispatch_next`'s SKILL-1 boundary — popped from a run queue, never dispatched |
+| x86_64 | on-CPU | `sched.rs::exit()` | the trampoline return, `SYS_EXIT`, `SYS_THREAD_EXIT`, `ring3_fault_kill`, and `kill_check_current`'s yield |
+| x86_64 | scheduler-side | `sched.rs::reap_killed()` | `run()`'s READY arm (`task_kill_armed` on a preempted-or-yielded task) and `park_blocked`'s PARK_SLEEP arm |
+
+Each call is placed at the very END of its path, AFTER the address-space teardown — because that
+teardown routes through `clear_handle_row` → `wm::close_owner`, which raises and lowers a barrier of
+its own under the same id. A release ordered before it would reconcile a task about to raise again.
+
+**⚠ The DRAGFIX M2 cross-arch claim is corrected here.** That ledger reads as though the hazard were
+aarch64-only, and its stated fact is right: x86's `yield_now` has no kill boundary, so a drain that
+yields there always returns to its own frame. What it does not say is that **x86 does not deliver
+kills at boundaries the task walks into — it retires killed tasks from the scheduler side.** The
+interactive drain is unmasked by construction (`drain_can_yield`'s own precondition), so an x86
+`sys_win_move` drain preempted by the local-APIC timer with a `KillSwitch` armed is reaped in `run()`
+and never returns to the frame holding its raise. Same leak, same consequence, different delivery
+point. The x86 release is therefore load-bearing, not symmetric dead code.
+
+**How many raises can one task hold?** One. `drain_bounded`'s six call sites — `move_to_inner`,
+`close`, `close_owner`, `minimise`, `zoom`, the `dragwedge` fixture — are in six distinct functions
+and none is reachable from inside another's barrier scope, so a per-task single slot would be exact.
+It is written as a scan for *every* slot the id holds anyway: that costs one extra load on a path that
+already scans, and makes the structure indifferent to a future nesting.
+
+**Idempotence.** `exit()` and a reaper naming one task must not double-decrement. The slot is claimed
+with a `compare_exchange` off the owner id, so exactly one caller wins each slot; a second release
+finds nothing, returns `false`, and lowers nothing. Under-decrement is impossible for the same reason.
+
+**Capacity, stated honestly.** The registry must never *block* a drain — bookkeeping that can refuse
+would turn a full table into a teardown stall, a worse failure than the one being cured. A raise that
+finds no free slot (or that has no scheduled task to name) proceeds **unrecorded**, which is exactly
+today's behaviour and no worse, and bumps `DRAIN_UNOWNED`. So `rescued=` is only ever a claim about
+raises that *were* recorded, and `unowned=` is the honest scope limit printed beside it.
+
+### The witness
+
+* `[wedge1] dwell` gains **`rescued=`** — raw cumulative, unconditional. Pinned FOR EXISTENCE in
+  `pi4-regression.spec` the way `scskip=` was, and given **no FORBID**: a rescue is the cure *firing*,
+  and a gate that reds on the kernel saving its own panel is precisely backwards.
+* One bracket-free line per boot on first fire, on the give-up prints' idiom:
+  `:: wedge1 DRAIN RESCUED task=… freed=… pending=… unowned=… == owner-release ::`
+
+### `dragwedge_selftest` leg 7
+
+A real conviction cannot be staged: killing a task mid-drain from inside a fixture would require the
+fixture to *be* that task. So leg 7 stages the **residue** the death path is actually handed — count
+raised, raise recorded, nothing on any stack that will ever lower it — then calls
+`drain_release_dead` and asserts the count returned to its prior value, the witness counted exactly
+one, the raise was recorded rather than dropped on a full table, and a **second** release lowered
+nothing. Reported as `rescue=` on the fixture's line and forbidden as `rescue=false`.
+
+Go-red: stubbing `drain_release_dead` to return `false` without touching the registry drops
+`rescued`/`restored`/`counted` together and the leg reads `rescue=false … -> FAIL`.
+
+### Byte identity, stated honestly
+
+The bookkeeping is **unconditional** — the freeze it cures is not behind a knob, so neither is the
+cure. **Knob-off bytes move.** The price is one eight-entry scan-and-claim per drain raise, the
+matching release per lower, and one such scan per task death. Against a drain that spins for
+milliseconds and a death that tears down an address space, it is not measurable; it is recorded here
+because "no behaviour change" would be false.
+
+`F4W_IN_SPIN` is deliberately **not** covered. It is witness-only, so its leak costs a wrong rollup
+rather than a frozen panel, and covering it would put a second registry on the drain's hot path for a
+number nobody steers on.
+
+### Gate results (2026-08-18, QEMU raspi4b)
+
+* `./arroyo check` and `UNAOS_WC=1 ./arroyo check` — green, both arches, 12 cfg legs.
+* knob-off `./arroyo kernel8-test 210` — **117/117 required, 0 forbidden**, with the new
+  `rescued=[0-9]+` pin live and the new `rescue=false` forbid at 0 hits:
+
+```
+[wedge1] dwell drains=30 spun=0 spin_max=0 note=65536 in_spin=0 tripwire=silent bound=1073741824
+ abandoned=0 mvbound=33554432 mvgiveup=0 mvskip=0 ywait=0 ydrain=0 scskip=0 rescued=0
+ grace=2097152 latched=false span=4073ms -> QUIET
+```
+
+* Both witnesses are present in the shipped knob-off `kernel8.img` (`strings`): the `rescued=` dwell
+  field and `:: wedge1 DRAIN RESCUED task=`. The release is reachable, not merely compiled.
+
+**The metal verdict — a vug killed mid-drag leaving a panel that keeps painting — is the next boot's.**
+

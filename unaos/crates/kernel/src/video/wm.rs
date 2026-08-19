@@ -8133,6 +8133,18 @@ fn barrier_stalled() -> bool {
 // stack frame that will not run again. That reaches outside `wm.rs` into `arch/*/sched.rs`, which is
 // outside this arc's lane, so it is NAMED here rather than half-cured: a partial guard would leave
 // the freeze reachable while reading, in the ledger and in review, as closed.
+//
+// ✅ **DRAINRESCUE LANDS THAT CURE, and corrects the cross-arch claim above in one place.** The owner
+// registry and [`drain_release_dead`] are below, next to `DrainBarrier`; `exit()` and the off-CPU reap
+// arm call the release on both lanes. The correction: **the hazard is NOT aarch64-only.** The
+// paragraph above is right that x86's `yield_now` has no kill boundary — a drain that yields there
+// always returns to its own frame — but x86 does not retire killed tasks at boundaries the task walks
+// into; it retires them from the SCHEDULER side. `run()`'s READY arm tests `task_kill_armed` on every
+// task that switches back preempted-or-yielded and calls `reap_killed` instead of requeueing it. The
+// interactive drain is unmasked by construction (that is `drain_can_yield`'s own precondition), so a
+// `sys_win_move` drain preempted by the local-APIC timer with a `KillSwitch` armed is retired without
+// ever returning to the frame holding its raise — the identical leak, delivered at a different point.
+// So the x86 release is load-bearing rather than symmetric dead code, and both hooks are real.
 
 /// DRAGFIX — spins a wait may take before the same-core arms are consulted at all.
 ///
@@ -8236,6 +8248,12 @@ fn drain_can_yield() -> bool {
 /// switch-away means no drop glue runs on the abandoned frames — so no RAII guard placed in this
 /// function can cure it. The full statement of the hazard, why the guard shape does not close it, and
 /// what the cure needs, are in the DRAGFIX ledger's cross-arch paragraph above.
+///
+/// ✅ DRAINRESCUE closes the `DRAIN_PENDING` half: the raise is recorded against the owning task and
+/// released from the scheduler's retirement path, so a divergence here costs a rescued count on the
+/// `[wedge1] dwell` line rather than a frozen panel. `F4W_IN_SPIN` is deliberately NOT covered — it is
+/// witness-only, so its leak costs a wrong rollup and not a freeze, and covering it would put a second
+/// registry on the drain's hot path for a number nobody steers on.
 fn drain_yield_wait(budget_ms: u64) -> bool {
     use core::sync::atomic::Ordering;
     DRAIN_YIELD_WAITS.fetch_add(1, Ordering::Relaxed);
@@ -8395,9 +8413,172 @@ const DRAIN_DWELL_STEP: u64 = 1 << 12;
 #[cfg(feature = "witness")]
 const DRAIN_DWELL_NOTE: u64 = 1 << 16;
 
+// ---- DRAINRESCUE — the raise recorded with its OWNER, released by the death path ----------------
+//
+// **What this closes.** The DRAGFIX M2 ledger's ⚠ paragraph above names the standing defect and
+// declines to half-cure it: `drain_bounded` raises `DRAIN_PENDING` at its head and lowers it from a
+// `DrainBarrier` living on the caller's stack, so a task that DIVERGES between those two points
+// leaks the count permanently — and a permanently raised `DRAIN_PENDING` makes every
+// `composite_inner` take its barrier early-return, which is a live kernel behind a frozen panel (the
+// PA38 shape). The target is `panic-strategy: abort` and every death path diverges by switching off
+// the task's own stack, so NO drop glue runs on the abandoned frames and no RAII guard placed
+// anywhere in the drain can cure it. That is the whole argument for this registry: the cure has to be
+// performed by something that still runs after the frame is gone, and the only such thing is the
+// scheduler's retirement path.
+//
+// **The shape.** The raise is recorded against the id of the task that took it; `DrainBarrier` carries
+// that id (rather than re-reading `current_id` at drop, which a migration or a mis-paired drop could
+// make lie); the death paths call [`drain_release_dead`], which reconciles whatever the dead task
+// still holds.
+//
+// **How many raises can one task hold?** Verified one, and the registry does not depend on it.
+// `drain_bounded` has six call sites — `move_to_inner`, `close`, `close_owner`, `minimise`, `zoom`
+// and the `dragwedge` fixture — and none of them is reachable from inside another's barrier scope
+// (`close_owner` clears its rows directly rather than calling `close`; the erase paths take their
+// barrier around a straight-line erase/damage/present sequence). So a per-task SINGLE slot would be
+// exact today. It is written as a scan for EVERY slot the id holds anyway, because that costs one
+// extra load on a path that already scans and makes the structure indifferent to a future nesting —
+// a nested raise simply takes a second slot and is released with the first.
+//
+// **Capacity, stated honestly.** Eight slots against `MAX_KILL_REQS`-scale concurrency is generous,
+// but the registry must NEVER block a drain: bookkeeping that can refuse would turn a full table into
+// a teardown stall, which is a worse failure than the one being cured. So a raise that finds no free
+// slot proceeds UNRECORDED — exactly today's behaviour, no worse — and is counted in
+// [`DRAIN_UNOWNED`] so the gap is visible on the wire rather than inferred. `rescued=` is only ever a
+// claim about the raises that WERE recorded.
+//
+// **Idempotence.** `exit()` and an off-CPU reaper can both name one task (they cannot in fact both
+// fire for the same task, but the release must not depend on that). The slot claim is a
+// `compare_exchange` from the owner id to `0`, so exactly one caller wins each slot and a second
+// release finds nothing and decrements nothing. Under-decrement is impossible for the same reason.
+//
+// **Cost, byte-identity stated honestly.** This bookkeeping is UNCONDITIONAL — it is not behind a
+// knob, because the freeze it cures is not behind a knob either. Knob-off therefore MOVES: every
+// drain raise gains one relaxed scan-and-claim over an eight-entry array and every lower gains the
+// matching release, and every task death gains one such scan. Against a drain that spins for
+// milliseconds and a death that tears down an address space, that is not measurable; it is recorded
+// here because "no behaviour change" would be false.
+
+/// DRAINRESCUE — outstanding raises the owner registry can record at once. See the capacity note in
+/// the ledger above: overflow degrades to today's unrecorded raise, it does not block.
+const DRAIN_OWNER_SLOTS: usize = 8;
+
+/// DRAINRESCUE — the owner registry. Each entry holds the task id of one outstanding `DRAIN_PENDING`
+/// raise; `0` is free (and is also the id used for a raise taken outside any scheduled task, which is
+/// unrecordable by construction — the scheduler will never retire a task for it).
+static DRAIN_OWNERS: [core::sync::atomic::AtomicU64; DRAIN_OWNER_SLOTS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; DRAIN_OWNER_SLOTS];
+
+/// DRAINRESCUE — raises that could NOT be recorded: taken outside a scheduled task, or with the
+/// registry full. These are the raises a death would still strand, and the number is the honest
+/// scope limit on `rescued=`. Published as the `unowned=` half of the rescue line.
+static DRAIN_UNOWNED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAINRESCUE — raises RELEASED by a dying owner, i.e. leaks that would have frozen the panel and
+/// did not. Raw cumulative, unconditional, on [`DRAIN_ABANDONED`]'s argument. Published as `rescued=`
+/// on the `[wedge1] dwell` line.
+static DRAIN_RESCUED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAINRESCUE — whether the once-per-boot rescue LINE has been printed, on [`DRAGFIX_REPORTED`]'s
+/// argument. The counter above is not rate-limited.
+static DRAIN_RESCUE_REPORTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// DRAINRESCUE — the id this drain is owned by, or `0` outside a scheduled task (the boot path, an
+/// interrupt context, the scheduler itself). `0` is not recordable and is counted as unowned.
+fn drain_owner_id() -> u64 {
+    crate::arch::sched::current_id().unwrap_or(0)
+}
+
+/// DRAINRESCUE — record that `owner` holds one outstanding raise. Never fails, never blocks; an
+/// unrecordable raise bumps [`DRAIN_UNOWNED`] and proceeds.
+fn drain_note_raise(owner: u64) {
+    use core::sync::atomic::Ordering;
+    if owner == 0 {
+        DRAIN_UNOWNED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    for slot in DRAIN_OWNERS.iter() {
+        if slot
+            .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+    }
+    DRAIN_UNOWNED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// DRAINRESCUE — retire ONE recorded raise for `owner`. Called from [`DrainBarrier::drop`], i.e. on
+/// every drain that actually returns. A raise that was never recorded finds nothing and is a no-op,
+/// which is why this may not be used to decide whether to lower `DRAIN_PENDING`.
+fn drain_note_lower(owner: u64) {
+    use core::sync::atomic::Ordering;
+    if owner == 0 {
+        return;
+    }
+    for slot in DRAIN_OWNERS.iter() {
+        if slot
+            .compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+/// DRAINRESCUE — **THE CURE.** Release every drain raise `task_id` still holds and could no longer
+/// release itself, and report whether any was found.
+///
+/// Called from the scheduler's retirement paths — `exit()` (the on-CPU funnel, which every
+/// `kill_check_current`, fault-kill and `sys_exit` reaches) and the off-CPU reap arm — AFTER the
+/// address-space teardown those paths perform, because that teardown itself routes through
+/// `clear_handle_row` → [`close_owner`], which raises and lowers a barrier of its own under this very
+/// id. Releasing first would reconcile a task that is about to raise again.
+///
+/// Idempotent by construction: the slot is taken with a `compare_exchange` off the owner id, so two
+/// callers naming one task cannot both claim the same slot and the count cannot be double-lowered.
+pub fn drain_release_dead(task_id: u64) -> bool {
+    use core::sync::atomic::Ordering;
+    if task_id == 0 {
+        return false;
+    }
+    let mut freed = 0u64;
+    for slot in DRAIN_OWNERS.iter() {
+        if slot
+            .compare_exchange(task_id, 0, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            // The slot is ours and no other caller can hold it, so this lower is owed exactly once.
+            DRAIN_PENDING.fetch_sub(1, Ordering::AcqRel);
+            freed += 1;
+        }
+    }
+    if freed == 0 {
+        return false;
+    }
+    DRAIN_RESCUED.fetch_add(freed, Ordering::Relaxed);
+    // One line per boot, on `DRAIN_ABANDONED`'s pattern: the operator is sitting in front of a build
+    // whose panel did NOT freeze, and the reason belongs on the wire once. Bracket-free so it reads
+    // as an event rather than as a rollup field. The cumulative count is on every `[wedge1] dwell`.
+    if !DRAIN_RESCUE_REPORTED.swap(true, Ordering::Relaxed) {
+        serial_println!(
+            ":: wedge1 DRAIN RESCUED task={} freed={} pending={} unowned={} == owner-release ::",
+            task_id,
+            freed,
+            DRAIN_PENDING.load(Ordering::Acquire),
+            DRAIN_UNOWNED.load(Ordering::Relaxed),
+        );
+    }
+    true
+}
+
 /// F4 — a teardown's phase barrier, RAII so the barrier always re-opens. Raised by
 /// [`close`]/[`close_owner`] and dropped once the drain has completed.
-struct DrainBarrier;
+///
+/// DRAINRESCUE — carries the id of the task that RAISED it, so the lower retires the same registry
+/// slot the raise took even if the task has since migrated. See the DRAINRESCUE ledger above.
+struct DrainBarrier(u64);
 
 impl DrainBarrier {
     /// Raise the barrier and wait out the composites that snapshotted before it went up.
@@ -8440,6 +8621,13 @@ impl DrainBarrier {
         #[cfg(feature = "witness")]
         F4W_DRAINS.fetch_add(1, Ordering::Relaxed);
         DRAIN_PENDING.fetch_add(1, Ordering::AcqRel);
+        // DRAINRESCUE — record the raise against the task that took it, so a death between here and
+        // the `DrainBarrier` returned below can reconcile it. Read BEFORE the wait rather than at the
+        // drop, and carried in the guard: the wait may migrate this task, and a lower must retire the
+        // slot the raise actually took. Ordered AFTER the `fetch_add` so the count is never lowered
+        // by a release that observed a slot the raise had not yet paid for.
+        let owner = drain_owner_id();
+        drain_note_raise(owner);
         // Ordered against the composite registration by the table lock: a composite either took the
         // lock BEFORE the clearing critical section (so it registered, and is counted here) or AFTER
         // (so it sees the raised barrier and never registers).
@@ -8515,12 +8703,12 @@ impl DrainBarrier {
                 } else {
                     MOVE_DRAIN_SKIPPED.fetch_add(1, Ordering::Relaxed);
                     crate::wedge2::mark("<D3>");
-                    return DrainBarrier;
+                    return DrainBarrier(owner);
                 }
             } else {
                 MOVE_DRAIN_SKIPPED.fetch_add(1, Ordering::Relaxed);
                 crate::wedge2::mark("<D3>");
-                return DrainBarrier;
+                return DrainBarrier(owner);
             }
         }
         let mut spins: u64 = 0;
@@ -8747,12 +8935,17 @@ impl DrainBarrier {
         // itself, which is the one region WEDGE-1's tripwire CAN see — and pairs with `<D!>` to say
         // whether it got far enough to try.
         crate::wedge2::mark("<D3>");
-        DrainBarrier
+        DrainBarrier(owner)
     }
 }
 
 impl Drop for DrainBarrier {
     fn drop(&mut self) {
+        // DRAINRESCUE — retire the registry slot BEFORE the count, so a release racing a legitimate
+        // drop can never find a slot whose count has already been lowered. (The two cannot in fact
+        // race — a task is not retired while it is executing its own drop glue — but the order costs
+        // nothing and makes the argument local.)
+        drain_note_lower(self.0);
         DRAIN_PENDING.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
     }
 }
@@ -10278,7 +10471,7 @@ fn wedge1_dwell_emit(span: u64) {
         "QUIET"
     };
     serial_println!(
-        "[wedge1] dwell drains={} spun={} spin_max={} note={} in_spin={} tripwire={} bound={} abandoned={} mvbound={} mvgiveup={} mvskip={} ywait={} ydrain={} scskip={} grace={} latched={} span={}ms -> {}",
+        "[wedge1] dwell drains={} spun={} spin_max={} note={} in_spin={} tripwire={} bound={} abandoned={} mvbound={} mvgiveup={} mvskip={} ywait={} ydrain={} scskip={} rescued={} grace={} latched={} span={}ms -> {}",
         drains,
         spun,
         spin_max,
@@ -10293,6 +10486,11 @@ fn wedge1_dwell_emit(span: u64) {
         ywait,
         ydrain,
         scskip,
+        // DRAINRESCUE — raw cumulative drain raises released by a dying owner. A non-zero value is
+        // the CURE having fired, not a fault: each unit is a `DRAIN_PENDING` leak that would have
+        // frozen the panel for the rest of the boot and did not. Never forbidden by a gate, for
+        // exactly that reason; the field's presence is what is pinned.
+        DRAIN_RESCUED.load(Relaxed),
         DRAIN_SAMECORE_GRACE,
         BARRIER_UNHEALTHY.load(Relaxed),
         span,
@@ -17745,6 +17943,9 @@ pub fn dragwedge_selftest() {
     let y0 = DRAIN_YIELD_WAITS.load(Relaxed);
     let yd0 = DRAIN_YIELD_DRAINED.load(Relaxed);
     let sc0 = DRAIN_SAMECORE_SKIPS.load(Relaxed);
+    // DRAINRESCUE — leg 7's pre-image, restored at the tail with the rest.
+    let r0 = DRAIN_RESCUED.load(Relaxed);
+    let u0 = DRAIN_UNOWNED.load(Relaxed);
     let (began, stall_ms, gave_up, cancelled, refused, refuse_ms) = {
         let _hold = BlitGuard::enter();
         // The grab is minted BEFORE the wait has ever been met, so the latch is down and this must
@@ -17805,6 +18006,49 @@ pub fn dragwedge_selftest() {
         )
     };
 
+    // ---- Leg 7: DRAINRESCUE — the raise its owner cannot lower is released by the death path ------
+    //
+    // The scene this reproduces is the one no fixture can stage for real: a task that raised
+    // `DRAIN_PENDING` inside `drain_bounded` and then DIVERGED — killed at `yield_now`'s or
+    // `timer_preempt`'s boundary on aarch64, reaped out of the scheduler's READY arm on x86 — so its
+    // `DrainBarrier` is stranded on a stack that will never run drop glue again (`panic-strategy:
+    // abort`). Killing a real task mid-drain from inside a fixture would require the fixture to BE
+    // that task, which is a scene it cannot survive to report on. So the leg stages the RESIDUE
+    // instead, which is exactly what the death path is handed: the count raised, the raise recorded,
+    // and nothing on any stack that will ever lower it.
+    //
+    // **What this proves, and what it does not.** It proves the mechanism the death hooks call is
+    // correct and idempotent — the count returns to its prior value, the slot is cleared, the witness
+    // is bumped, and a second release (the `exit()`-and-reaper double-fire this arc's idempotence
+    // claim is about) decrements nothing. It does NOT prove the hooks are REACHED; that is a property
+    // of `arch/*/sched.rs`'s call sites, established by reading them, and `rescued=` on the
+    // `[wedge1] dwell` line is where a real firing shows up.
+    //
+    // Go-red is one edit: make `drain_release_dead` return `false` without touching the registry, and
+    // `rescued`/`restored`/`counted` fall together.
+    const RESCUE_FAKE_TID: u64 = 0xD9A1_0000_DEAD_BEEF; // an id no scheduler will ever mint
+    let arm_rescue = {
+        use core::sync::atomic::Ordering as O;
+        let pend_pre = DRAIN_PENDING.load(O::Acquire);
+        let resc_pre = DRAIN_RESCUED.load(Relaxed);
+        let unowned_pre = DRAIN_UNOWNED.load(Relaxed);
+        // The residue a diverging drain leaves behind: raise, record, abandon.
+        DRAIN_PENDING.fetch_add(1, O::AcqRel);
+        drain_note_raise(RESCUE_FAKE_TID);
+        let leaked = DRAIN_PENDING.load(O::Acquire) == pend_pre + 1;
+        // The raise must have been RECORDED rather than silently dropped on a full table — a leg that
+        // passed against an unrecorded raise would be asserting nothing at all.
+        let owned = DRAIN_UNOWNED.load(Relaxed) == unowned_pre;
+        // THE CURE.
+        let rescued = drain_release_dead(RESCUE_FAKE_TID);
+        let restored = DRAIN_PENDING.load(O::Acquire) == pend_pre;
+        let counted = DRAIN_RESCUED.load(Relaxed) == resc_pre + 1;
+        // Idempotence: the slot is cleared, so a second release finds nothing and lowers nothing.
+        let again = drain_release_dead(RESCUE_FAKE_TID);
+        let idempotent = !again && DRAIN_PENDING.load(O::Acquire) == pend_pre;
+        leaked && owned && rescued && restored && counted && idempotent
+    };
+
     // ---- Leg 5: the latch LIFTS ------------------------------------------------------------------
     let healthy = !barrier_stalled();
     let regrab = drag_begin(w, gx, gy);
@@ -17827,16 +18071,21 @@ pub fn dragwedge_selftest() {
         // schedulable context is a property of where the battery is driven from, and a fixture that
         // failed on it would be asserting the harness rather than the mechanism.
         && arm_skip
-        && skip_ms <= SKIP_BUDGET_MS;
+        && skip_ms <= SKIP_BUDGET_MS
+        // DRAINRESCUE: asserted unconditionally. Unlike `arm_yield` this leg depends on nothing about
+        // where the battery is driven from — it stages its own residue against a synthetic id — so a
+        // failure here is the mechanism and can only be the mechanism.
+        && arm_rescue;
     serial_println!(
         "[dragwedge] furniture aimed={} chrome={} grab={} release={} | stall began={} gave_up={} \
          cancelled={} ms={}/{} | refuse={} ms={}/{} | recover={} bound={} | arm_yield={} \
-         arm_skip={} skip_ms={}/{} tdbound={} -> {}",
+         arm_skip={} skip_ms={}/{} tdbound={} | rescue={} rescued={} unowned={} -> {}",
         aimed, chrome_ok, grab_ok, rel_ok,
         began, gave_up, cancelled, stall_ms, STALL_BUDGET_MS,
         refused, refuse_ms, REFUSE_BUDGET_MS,
         recovered, DRAIN_MOVE_SPINS,
         arm_yield, arm_skip, skip_ms, SKIP_BUDGET_MS, DRAIN_ABANDON_SPINS,
+        arm_rescue, DRAIN_RESCUED.load(Relaxed), DRAIN_UNOWNED.load(Relaxed),
         if ok { "PASS" } else { "FAIL" }
     );
     // A SKIPPED aim is reported as such on its own line rather than being folded into the verdict
@@ -17867,6 +18116,16 @@ pub fn dragwedge_selftest() {
     DRAIN_YIELD_DRAINED.store(yd0, Relaxed);
     DRAIN_SAMECORE_SKIPS.store(sc0, Relaxed);
     DRAGFIX_REPORTED.store(false, Relaxed);
+    // DRAINRESCUE — the same restoration, and here it is load-bearing rather than tidy. Leg 7's
+    // rescue is SYNTHETIC: leaving it standing would put `rescued=1` on every later `[wedge1] dwell`
+    // line of an armed boot and would burn the once-per-boot `DRAIN RESCUED` print, so a REAL rescue
+    // later in the same boot — the event this whole arc exists to witness — would be
+    // indistinguishable from the fixture's and would have no line of its own. The evidence is not
+    // lost: `rescue=` on the verdict line above is where leg 7's firing is recorded, and it is the
+    // only place it belongs. `DRAIN_PENDING` needs no restoration — leg 7 asserted it back itself.
+    DRAIN_RESCUED.store(r0, Relaxed);
+    DRAIN_UNOWNED.store(u0, Relaxed);
+    DRAIN_RESCUE_REPORTED.store(false, Relaxed);
     close(w);
     composite();
 }

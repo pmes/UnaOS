@@ -3153,6 +3153,16 @@ pub fn exit() -> ! {
             SCHED[cpu].cr3_live.store(crate::arch::memory::kernel_cr3(), Ordering::Relaxed);
             user_space_release(user_cr3);
         }
+        // DRAINRESCUE — release any window-manager drain barrier this task raised and can no longer
+        // lower. `exit()` is this arch's single voluntary terminus (kernel trampoline return,
+        // `SYS_EXIT`, `SYS_THREAD_EXIT`, `ring3_fault_kill`) AND the target `kill_check_current`'s
+        // yield ultimately funnels through, and it diverges by switching off the task's own stack with
+        // `panic-strategy: abort` in force — so no drop glue runs on the abandoned frames and the
+        // `DrainBarrier` RAII guard cannot lower what it raised. Placed at the very end because the
+        // address-space release above routes through `clear_handle_row` -> `wm::close_owner`, which
+        // raises and lowers a barrier of its own under this same id. Costs one eight-entry scan of
+        // relaxed loads per death and finds nothing on almost all of them.
+        crate::video::wm::drain_release_dead((*raw).id);
         (*raw).state.store(STATE_FINISHED, Ordering::Release);
         // Switch away for good. `old_rsp` is a throwaway slot on the dying stack (the scheduler
         // never reads it back, and never switches into a Finished task).
@@ -5797,6 +5807,25 @@ fn reap_killed(task: Box<Task>) {
     if let Some(k) = &task.kill {
         k.mark_reaped(); // through the Arc — the requester's clone keeps it live
     }
+    // DRAINRESCUE — release any window-manager drain barrier this task raised and can no longer
+    // lower, taken BEFORE the Box is dropped because the id is read out of it.
+    //
+    // ⚠ **THIS ARM IS NOT DEAD CODE ON x86, and the DRAGFIX M2 ledger's asymmetry claim is narrower
+    // than it reads.** That ledger observes, correctly, that x86's `yield_now` has no kill boundary
+    // where aarch64's does — so a drain that yields here always comes back to its own frame. What it
+    // does not say is that x86 retires killed tasks from the SCHEDULER side instead: `run()`'s READY
+    // arm tests `task_kill_armed` on every task that switches back preempted-or-yielded and calls
+    // this function rather than requeueing it (and `park_blocked`'s PARK_SLEEP arm does the same). The
+    // interactive drain is unmasked by construction — that is `drain_can_yield`'s own precondition —
+    // so a `sys_win_move` drain preempted by the local-APIC timer with a `KillSwitch` armed is
+    // retired HERE and never returns to the frame holding its `DRAIN_PENDING` raise. The hazard is
+    // therefore live on BOTH lanes; only the delivery point differs (a boundary the task walks into
+    // on aarch64, a verdict the scheduler reaches on x86). The leak's consequence is identical: every
+    // `composite_inner` takes its barrier early-return for the rest of the boot.
+    //
+    // Placed after the address-space release above, which routes through `clear_handle_row` ->
+    // `wm::close_owner` and raises a barrier of its own under this same id.
+    crate::video::wm::drain_release_dead(task.id);
     drop(task); // frees the kstack; the interrupt frame on it is abandoned
     // TEARDOWN-1: reach the siblings the doom above just named. A worker parked on the frame barrier its
     // now-dead parent will never release is the whole point: it is woken here, through the futex's own
@@ -6095,6 +6124,14 @@ pub fn current_task_id(cpu: usize) -> Option<u64> {
     } else {
         Some(unsafe { (*raw).id })
     }
+}
+
+/// DRAINRESCUE — the id of the task currently dispatched on THIS core, or `None` outside a scheduled
+/// task. The x86 twin of aarch64's `current_id`, added so `video::wm`'s drain-owner registry can name
+/// its owner through ONE arch-neutral spelling rather than branching on `target_arch`. A thin wrapper
+/// over [`current_task_id`] keyed to this CPU, exactly as [`current_name`] is.
+pub fn current_id() -> Option<u64> {
+    current_task_id(percpu::this_cpu().cpu_index as usize)
 }
 
 // ---------------------------------------------------------------------------------------------

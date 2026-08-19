@@ -592,7 +592,16 @@ FORBID \[wc-fv\] focus-vis .*-> FAIL
 # ---    pinned for EXISTENCE only, on this section's standing rule that a gate failing on an honest
 # ---    reading teaches people to ignore it. The abandonment that DOES red a gate is the bound-
 # ---    reached teardown one, and `abandoned=[1-9]` above still catches it by name.
-REQUIRE \[wedge1\] dwell drains=.*spin_max=.*mvbound=[0-9]+ mvgiveup=[0-9]+ mvskip=[0-9]+ ywait=[0-9]+ ydrain=[0-9]+ scskip=[0-9]+ grace=[0-9]+ latched=.*->
+# --- DRAINRESCUE extends the SAME directive once more, for the same reason DRAGFIX did. `rescued=` is
+# ---    the count of `DRAIN_PENDING` raises released by a dying owner — a task killed mid-drain whose
+# ---    stack frame will never run drop glue, and whose leaked raise would otherwise make every
+# ---    `composite_inner` early-return for the rest of the boot (the PA38 frozen-panel shape). It is
+# ---    PINNED FOR EXISTENCE ONLY and gets NO FORBID, and that is the strongest statement this file
+# ---    makes about it: a rescue is THE CURE FIRING. `rescued=[1-9]` would red a gate on a boot where
+# ---    the kernel saved its own panel, which is precisely backwards — the failure this arc is about
+# ---    is the one that leaves NO line at all. What the pin defends is the instrument: without it the
+# ---    registry and both `arch/*/sched.rs` release hooks could be deleted with the gate still green.
+REQUIRE \[wedge1\] dwell drains=.*spin_max=.*mvbound=[0-9]+ mvgiveup=[0-9]+ mvskip=[0-9]+ ywait=[0-9]+ ydrain=[0-9]+ scskip=[0-9]+ rescued=[0-9]+ grace=[0-9]+ latched=.*->
 
 # --- STORM-HEADROOM (s1u lens nit): the boot-baseline census is the proof the storm instrument
 # ---    still exists and publishes — the same existence-pin rationale as the dwell REQUIRE above.
@@ -2022,6 +2031,17 @@ FORBID \[dragwedge\] .* -> FAIL
 # --- `arm_yield=` is deliberately NOT forbidden either way — see the fixture's own note: whether legs
 # --- 2-4 run in a schedulable context is a property of the harness, not of the mechanism.
 FORBID \[dragwedge\] .* arm_skip=false
+
+# --- DRAINRESCUE — leg 7, named on its own on leg 6's precedent. `rescue=` is the owner registry's
+# --- conviction: the leg stages the exact residue a task killed mid-drain leaves behind (`DRAIN_PENDING`
+# --- raised, the raise recorded, no `DrainBarrier` on any stack that will ever run drop glue), calls
+# --- `drain_release_dead`, and asserts the count returned to its prior value, the witness counted it,
+# --- and a SECOND release lowered nothing (the `exit()`-and-reaper double-fire the idempotence claim is
+# --- about). Unlike `arm_yield=` it depends on nothing about where the battery is driven from — it
+# --- stages its own scene against a synthetic task id — so a `rescue=false` is the mechanism and can
+# --- only be the mechanism. FORBID rather than REQUIRE for leg 6's reason: the fixture is `pidesk`-gated
+# --- and absent from the knob-off battery. Stubbing `drain_release_dead` to a no-op reds this line.
+FORBID \[dragwedge\] .* rescue=false
 
 # --- DRAGWEDGE — and the two ledger readings the cure adds to `[wedge1] dwell`. `mvgiveup=` counts
 # --- interactive drains that reached the bound; `mvskip=` counts pointer reports the latch saved from

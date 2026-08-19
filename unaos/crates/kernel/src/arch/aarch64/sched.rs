@@ -4170,6 +4170,19 @@ fn retire_killed(idx: usize, task: Box<Task>) {
     if let Some(sem) = &task.done_sem {
         sem.post();
     }
+    // DRAINRESCUE — release any window-manager drain barrier this task raised and can no longer
+    // lower. THE OFF-CPU ARM, and it is not the redundant one: a task parked inside
+    // `DrainBarrier::drain_bounded`'s yielding wait is READY, not running, so a kill delivered while
+    // it sits on a run queue retires it HERE and its frame — and the `DRAIN_PENDING` raise living on
+    // it — is never executed again. `panic-strategy: abort` plus a teardown that never enters the
+    // task means no drop glue runs, so the RAII guard cannot do this and nothing else will. A leaked
+    // raise makes every `composite_inner` take its barrier early-return for the rest of the boot: a
+    // live kernel behind a frozen panel. Placed AFTER the slot teardown above, because that teardown
+    // routes through `clear_handle_row` -> `wm::close_owner`, which raises and lowers a barrier of its
+    // own under this same id — releasing first would reconcile a task about to raise again. No-op
+    // (one eight-entry scan of relaxed loads) for the overwhelming majority of deaths, which hold no
+    // barrier at all. Idempotent with the `exit()` arm by the registry's own compare-exchange claim.
+    crate::video::wm::drain_release_dead(tid);
     task.state.store(STATE_FINISHED, Ordering::Release);
     drop(task); // frees the kernel stack
     // Drop this task out of its slot's live count, then settle — which withholds the confirmation while
@@ -4248,6 +4261,22 @@ pub fn exit() -> ! {
             }
             kill_settle(idx, (*raw).id, remaining);
         }
+        // DRAINRESCUE — release any window-manager drain barrier this task raised and can no longer
+        // lower. THE ON-CPU ARM, and it is the one the DRAGFIX M2 ledger names: `yield_now()` and
+        // `timer_preempt()` both run `kill_check_current()`, which routes a killed current task
+        // straight into this function, so a task that entered `DrainBarrier::drain_bounded`'s yielding
+        // wait with a kill pending DIVERGES here and never returns to the frame holding its
+        // `DRAIN_PENDING` raise. The target is `panic-strategy: abort` and this path switches off the
+        // task's own stack, so no drop glue runs on the abandoned frames — no RAII guard placed
+        // anywhere in the drain can cure it, which is precisely why the release is performed from the
+        // retirement path instead. A leaked raise makes every `composite_inner` take its barrier
+        // early-return for the rest of the boot: a live kernel behind a frozen panel (the PA38 shape).
+        //
+        // Placed HERE, at the very end: the slot teardown above routes through `clear_handle_row` ->
+        // `wm::close_owner`, which raises and lowers a barrier of its own under this same id, so a
+        // release ordered before it would reconcile a task that is about to raise again. Costs one
+        // eight-entry scan of relaxed loads on every death, and finds nothing on almost all of them.
+        crate::video::wm::drain_release_dead((*raw).id);
         (*raw).state.store(STATE_FINISHED, Ordering::Release);
         // `old_sp` is a throwaway on the dying stack — the scheduler never reads it back and never
         // switches into a finished task.
