@@ -192,6 +192,92 @@ rasterizer is embarrassingly parallel and the seat has six cores with a working
 steal-half scheduler arriving at trunk sync. That is the next honest performance
 rung, and it needs no NVIDIA anything.
 
+### 3.1 RAST-MC — the multi-core rung, as far as the shared crate allows
+
+**The cores are real, and they already dispatch.** The statement above ("six
+cores … arriving at trunk sync") understated what is on this branch today. The
+tegra image arms `tegrasmp` **by default** (`unaos/arroyo:573` — `UNAOS_TEGRA=1`
+without `UNAOS_NOTEGRASMP=1` adds the feature), so
+`smp_virt::start_secondaries_tegra` (`smp_virt.rs:783`) `CPU_ON`s every DTB
+`/cpus` secondary before the JM6 drop, and each woken core runs the *shared*
+secondary tail `__secondary_rust_virt` (`smp_virt.rs:253`), which ends in
+`timer::arm_this_core_ap()` + `sched::secondary_run(core)`
+(`smp_virt.rs:329-345`). `secondary_run` (`sched.rs:5084`) calls `mark_online`
+and enters the preemptive `run()` loop. **The Orin secondaries are therefore
+full scheduler participants — `ONLINE_MASK` members, `CPU_AUTO` placement
+candidates, steal targets — not parked cores.** The line
+`start_secondaries_tegra` still prints, "AP timer PPI stretch deferred (JC3)",
+is stale with respect to that shared tail; JC3 landed, and the AP arms its own
+local-only tick. (Correcting that log string is a one-word edit in the SMP lane,
+flagged here, not made.)
+
+**What the shared `rast` crate can and cannot express.** Band/tile decomposition
+— the decomposition that would parallelize both halves of a frame and scale with
+core count — is **not expressible through `rast`'s public API**, and `rast` is
+shared-lane and golden-pinned (§4.3), so the arc stopped rather than forking it.
+Precisely what is missing:
+
+- `render_mesh` maps NDC straight onto `target.width()`/`height()`
+  (`rast/src/lib.rs:110-113`, `to_screen` at `lib.rs:84`). A band-sized `Target`
+  therefore renders the *whole scene squashed into the band*, not the band's
+  slice of the scene. There is no viewport origin and no scissor rectangle on
+  `Target` (`rast/src/raster.rs:54-81` — only `width`/`height`/`stride`).
+- The transform stage is not separable: `clip_near`, `divide_and_map` and
+  `to_screen` are all private, so a caller cannot run transform+clip itself and
+  feed band-offset `ScreenVert`s into the public `Target::triangle`
+  (`raster.rs:142`) without re-implementing the pipeline — which is a fork of the
+  oracle in all but file location, and would put `GOLDEN_CUBE_07` at risk.
+
+  **The minimal shared-lane API that would unlock bands** (for whoever proposes
+  it, on the shared lane, with the golden re-verified): either (a) a viewport
+  origin on `Target` — `Target::new_offset(color, depth, w, h, stride, origin_x,
+  origin_y)` where the *frame* dimensions used by `to_screen` stay `(w, h)` while
+  the *writable* rows are the band — or (b) a public split of the pipeline:
+  `pub fn project_mesh(model, view_proj, verts, indices, w, h, cull, &mut FnMut([ScreenVert;3], Rgba))`,
+  which emits already-projected, already-shaded, already-clipped triangles that a
+  caller may offset and hand to `Target::triangle`. (b) is the more useful of the
+  two — it is also what a future GPU-vs-reference diff wants.
+
+**What was implemented instead: frame pipelining, which needs no `rast`
+change.** `unaos/crates/kernel/src/rast_demo.rs::run_mc` (tail, gated
+`all(feature = "tegra", target_arch = "aarch64")`, linked only under `rast`)
+probes each secondary with a pinned `sched::spawn`, enlists the ones that
+actually dispatch, gives each an own full-size RGBA8 + f32-depth pair off the
+heap, and assigns frames round-robin: core at slot `k` renders every frame
+`f ≡ k (mod nslots)` with the *same* whole-frame `render_mesh` call the
+single-core path makes, while the boot core presents finished frames **in strict
+frame order** through `Screen::put_pixel`. Pixels and their sequence are
+identical to single-core by construction. Wired in on the existing terminus line
+(`main.rs:5114`) so the knob-off image adds zero source lines.
+
+Three honesties belong on the record with it:
+
+1. **Amdahl.** Only the render half is parallel; the present half (76 800
+   `put_pixel` + one `flush` per frame) stays serial on the boot core. The
+   ceiling is `total / max(present_total, render_total / nslots)` — of order 2×
+   when render and present cost about the same, regardless of how many cores are
+   online. The witness reports the **measured** ratio against a 1-core baseline
+   taken in the *same boot, unpaced* (a paced comparison would read 30.303 fps on
+   both arms by construction and mean nothing).
+2. **Heap.** 600 KiB of back+depth buffer per render core (320×240). Five
+   secondaries ⇒ 3.0 MiB more live heap, on the seat whose documented RAS trigger
+   is exactly "grew live heap use past the carveout boundary" (§1.2,
+   ORIN-VUG-RAS / XCARVE). The witness prints the footprint; the slot count is
+   capped by the cores that check in.
+3. **Unwitnessed.** RAST-MC has **not** run on Orin silicon. QEMU cannot stand in
+   for it: the tegra path is metal-only, and the `virt` GICv3 path has the same
+   shape but is not this code's gate. Its witness lines
+   (`:: RAST-MC: N core(s), M frames, X fps — speedup Yx vs 1-core ::`, the
+   per-core `:: RAST-MC: core C rendered F frame(s) ::`, and the 1-core baseline
+   line) are **PENDING** until an attended sitting captures them.
+
+The EL split is worth stating once because it is the non-obvious part that
+works: the boot core presents from **EL1** under `mmu.ttbr0_el1` while the render
+workers run at **EL2** under the EL2 table. Both map RAM Normal-WB
+**inner-shareable** (`mmu_tegra.rs:488,505-512`), so the shared buffers and the
+handshake atomics are hardware-coherent across that split; no cache maintenance
+is needed and none is done.
+
 ---
 
 ## 4. Do not do
