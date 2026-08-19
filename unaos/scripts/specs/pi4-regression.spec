@@ -167,6 +167,27 @@ COMPLETE :: BANDY-RT:
 # only way to green them from HERE would be to widen the FORBIDs, which is the one thing a witness
 # arc may not do. They are recorded, not excluded. The line this arc could honestly move it moved,
 # at the witness, and proved the move both ways.
+#
+# WCC-FURN CLOSURE (2026-08-18) — `[wc-c] ... drawn=1` IS FIXED, AT THE WITNESS, AND WAS NEVER
+# GEOMETRY. The two blocks above read the split as 1920x1200-vs-640x480 because that is how the
+# captures fell. It is not: the armed 640x480 gate reproduces `drawn=1` with the SAME two windows,
+# and those windows are not the fixture's. On a desktop-armed boot the first pass with two non-compat
+# rows is the panel console (`asid=0xffffff01`, `KERNEL_OWNER_CONSOLE`) plus the quarry pane
+# (`asid=0xffffff03`) — kernel FURNITURE, minted hundreds of lines before the WC-B fixture runs — and
+# the pass that follows the second row's creation legitimately repaints only that row, because the
+# console's pixels are already correct and undamaged. `drawn=1` was the truthful count of the WRONG
+# pass, and the one-shot was spent before the fixture existed. Metal's `drawn=2` at bench geometry
+# was therefore a FALSE GREEN over the FURNITURE's checksums: on every armed boot, red or green, the
+# per-window checksum lines this REQUIRE exists to gate belonged to the console and the quarry pane,
+# never to the fixture.
+# THE REPAIR is a narrowing at the emitter (`video/wm.rs`, WCC-FURN): `is_kernel_owner` — the band
+# predicate `close_owner` already refuses on — is applied to WC-C's `real` census, its per-window
+# lines and its pass count (`drawn_user`). NO DIRECTIVE IN THIS FILE WAS TOUCHED, WEAKENED OR
+# WIDENED. Armed captures after the fix, host load 21-29 (NOT quiet): 640x480 **117/117** and
+# 1920x1200 **117/117**, both printing the FIXTURE pair with the SAME checksums as the knob-off
+# control (`0xfabe809492cf2325` / `0x9c1bda7f8c872325`), at scale 2x/3x and 4x/4x respectively — an
+# equality that is robust to host load, which is what makes it the discriminator here. Knob-off
+# control unchanged: 117/117, 0 forbidden. Full ledger: engine.md §WCC-FURN.
 
 # --- the aggregate: 23 fixture verdicts -------------------------------------------
 # ---    RE-SCOPED (2026-08-04, R23S1Y follow-up). The bare `-> PASS` pattern stopped meaning

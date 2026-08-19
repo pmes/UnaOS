@@ -14167,3 +14167,96 @@ number nobody steers on.
 
 **The metal verdict — a vug killed mid-drag leaving a panel that keeps painting — is the next boot's.**
 
+
+## WCC-FURN — the side-by-side witness was measuring the furniture (aarch64 + x86 `wm`, 2026-08-18)
+
+**`[wc-c] side-by-side windows=2 drawn=1` was never a geometry defect, and never a compositor
+defect. The witness was latching on the wrong pair of windows.** The line has stood red on every
+armed capture at bench geometry since `ec0ffada`, through three arcs, recorded in
+`scripts/specs/pi4-regression.spec` as OPEN and finally as "systematic at this base" — with the
+working theory that 1920x1200 exercised a path 640x480 did not, since METAL at the same geometry
+read `drawn=2`. Both halves of that theory are refuted by the captures below.
+
+### What the fixture identity says
+
+`composite_inner`'s WC-C block latches on the FIRST pass with two non-compat rows and prints what
+THAT pass blitted. On a knob-off boot the first such pass is the WC-B fixture's own, and the witness
+says so:
+
+```
+[wc-c] side-by-side windows=2 drawn=2
+[wc-c] win=1 asid=0x1 surf=128x128 scale=2x at (17,51) z=3 cksum=0xfabe809492cf2325
+[wc-c] win=2 asid=0x1 surf=64x64  scale=3x at (295,51) z=4 cksum=0x9c1bda7f8c872325
+```
+
+On a **desktop-armed** boot (`UNAOS_PIDESK=1 UNAOS_QUARRY=1`) the first such pass is hundreds of
+lines earlier, and it is not the fixture at all:
+
+```
+[wc-a] create win=1 asid=0xffffff01 surf=1295x736 stride=5180 scale=1x at (312,197) z=1
+[wc-a] composite windows=1 drawn=1
+[wc-a] create win=2 asid=0xffffff03 surf=1152x720 stride=4608 scale=1x at (384,222) z=2
+[wc-c] side-by-side windows=2 drawn=1
+[wc-c] win=1 asid=0xffffff01 surf=1295x736 scale=1x at (312,197) z=1 cksum=0xae5610333844cb9d
+[wc-c] win=2 asid=0xffffff03 surf=1152x720 scale=1x at (384,222) z=2 cksum=0x9dbc58cba8f1bc52
+```
+
+`0xffffff01` is `KERNEL_OWNER_CONSOLE` and `0xffffff03` is the quarry pane — **kernel furniture**,
+both inside `is_kernel_owner`'s reserved band, the same band `close_owner` refuses to reap. The
+console row is created and composited alone (`[wc-a] composite windows=1 drawn=1`), the quarry row is
+created a moment later, and the very next pass repaints only the new row — because the console's
+pixels are already correct and undamaged, which is the compositor being RIGHT. `drawn=1` is the
+truthful count of that pass. The one-shot then latches, and by the time the fixture's two windows
+exist the witness is spent.
+
+### The two things this refutes
+
+* **Not geometry.** The armed 640x480 gate reproduces `drawn=1` with the identical furniture pair
+  (`win=1 asid=0xffffff01 surf=560x352`, `win=2 asid=0xffffff03 surf=384x288`) — same structure,
+  same order, same verdict. The 1920x1200/640x480 split in the historical captures is which pass won
+  a race, not which panel was attached.
+* **Metal's `drawn=2` was a FALSE GREEN, not a control.** When the console and the quarry pane happen
+  to land in one pass, the witness prints `drawn=2` and the gate goes green — over the FURNITURE's
+  checksums. The spec's item 3 says the REQUIRE exists so "a fixture whose second window presented
+  BLANK would still pass every other directive, because nothing else reads those checksums"; on every
+  armed boot, green or red, those checksums were the console's and the fixture's were never read.
+
+### The repair
+
+`is_kernel_owner` — already in `wm.rs`, already the band predicate `close_owner`, `focus_ring` and the
+click router share — is applied to WC-C's three uses of "a real row": the `real` census, the
+per-window checksum lines, and the pass count, which becomes `drawn_user` (incremented in the blit
+loop for rows that are neither `compat` nor furniture). Nothing else changes; the guard `drawn > 0`
+becomes `drawn_user > 0` so a pass that blitted only furniture cannot latch a `drawn=0`.
+
+This is a NARROWING, not a widening: the witness now asserts exactly the claim its own ledger states
+("two USER programs, two windows, both on the panel at once"), and on the armed gate it now reads
+checksums it has never read before. No spec directive was touched.
+
+### Byte identity and line neutrality
+
+The diff is **9 added / 9 removed** in `wm.rs`, both new statements written on the lines they share
+with the statements they extend, on PI-DESK's discipline: panic `Location` records embed file line
+numbers, so a knob-off image must not see them move. Every added statement is `#[cfg(feature =
+"witness")]`.
+
+### Gate results (2026-08-18, QEMU raspi4b, host load 21-29 — NOT quiet)
+
+| gate | before | after |
+| --- | --- | --- |
+| `./arroyo check`, `UNAOS_WC=1 ./arroyo check` | green | green |
+| knob-off `./arroyo kernel8-test` | 117/117, 0 forbidden | **117/117, 0 forbidden** |
+| armed 640x480 (`UNAOS_PIDESK=1 UNAOS_QUARRY=1`) | 116/117, `drawn=1` | **117/117**, 6 forbidden (residue) |
+| armed 1920x1200 (+`UNAOS_FBW/FBH`) | 116/117, `drawn=1` | **117/117**, 12 forbidden (residue) |
+
+Both armed captures now print the fixture pair with the **same checksums as the knob-off control**,
+`0xfabe809492cf2325` / `0x9c1bda7f8c872325` — window for window, at scale 2x/3x on the 640x480 panel
+and 4x/4x on the 1920x1200 one. That equality is the discriminator the whole investigation wanted: it
+is robust to host load, and it says the armed desktop composites the fixture's surfaces byte-identically
+to a bare boot. The residual forbidden hits are the documented console-contention family
+(`[wc-g] win=1`, `[wc-d] verify win=1`, `[dragperf]`, `[wc-h] rollup`) plus, at load 28, the
+arithmetically-forced `[dragperf] admitted=7` — nothing in the WC-C family, at either geometry.
+
+**One flake recorded rather than smoothed over:** the first knob-off capture read 116/117 on
+`VUGSPREAD: floor test — tasks=2 cores-used=1`, a scheduler-spread witness the host's 23-deep run
+queue can starve. Re-run on the same image: 117/117, 0 forbidden.

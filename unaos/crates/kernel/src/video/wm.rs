@@ -4788,7 +4788,7 @@ fn composite_inner() -> CursorTail {
         );
         t
     };
-    let mut drawn = 0usize;
+    let mut drawn = 0usize; /* WCC-FURN — and its USER half, for WC-C alone. On the same line on PI-DESK's discipline: knob-off panic `Location`s must not move. */ #[cfg(feature = "witness")] let mut drawn_user = 0usize;
     // CURSOR-3 — did any window in this pass carry the sprite through its staged present? Back-to-
     // front order means the LAST window to take the overlay is the topmost one that fully contains
     // the sprite, and its plan is the one `OVERLAY` ends up holding — which is the window the
@@ -4978,7 +4978,7 @@ fn composite_inner() -> CursorTail {
         // upward closure is the only thing that could have put it in this pass.
         #[cfg(feature = "witness")]
         wcn_note_drawn(rows[i].id, !seed[i]);
-        drawn += 1;
+        drawn += 1; /* WCC-FURN — a user row is one that is neither the compat row nor kernel furniture. */ #[cfg(feature = "witness")] if !rw.compat && !is_kernel_owner(rw.owner_asid) { drawn_user += 1; }
     }
     // COMPOSITE-2 — loop closed. The witness one-shots inside it (WC-G/WC-D/WC-C) are charged here
     // when they fire; they are budgeted per window id, so the steady state they perturb is a handful
@@ -5020,17 +5020,17 @@ fn composite_inner() -> CursorTail {
     // fires from inside the pass that actually drew them, and checksums each window's SOURCE bytes, so a
     // window that is present-but-blank (or that composited a stale/recycled surface) is distinguishable
     // from one that drew real content. FNV-1a over `surf_len` — the mapping-code length, the same bound
-    // `draw_window` reads under, so the checksum can never walk past the slot.
-    //
-    // One-shot: this runs from present context at user-mode frame rates, and the checksum is a 64 KiB read.
+    // `draw_window` reads under, so the checksum can never walk past the slot. One-shot: present context,
+    // user-mode frame rates, 64 KiB read. WCC-FURN — kernel furniture (`is_kernel_owner`) is out of `real`,
+    // the per-window lines and the count — a desktop-armed boot's rows BURNED it. engine.md §WCC-FURN.
     #[cfg(feature = "witness")]
-    if drawn > 0 {
-        let real = rows.iter().filter(|r| r.used && !r.compat).count();
+    if drawn_user > 0 {
+        let real = rows.iter().filter(|r| r.used && !r.compat && !is_kernel_owner(r.owner_asid)).count();
         if real >= 2 && !SIDEBYSIDE_WITNESSED.swap(true, core::sync::atomic::Ordering::Relaxed) {
-            serial_println!("[wc-c] side-by-side windows={} drawn={}", real, drawn);
+            serial_println!("[wc-c] side-by-side windows={} drawn={}", real, drawn_user);
             for &i in order.iter() {
                 let r = &rows[i];
-                if !r.used || r.compat {
+                if !r.used || r.compat || is_kernel_owner(r.owner_asid) {
                     continue;
                 }
                 serial_println!(
