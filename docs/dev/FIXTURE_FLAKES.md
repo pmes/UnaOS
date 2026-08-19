@@ -122,9 +122,13 @@ re-read stops racing the prober's teardown`). Fixture-only, x86
 `arch/x86_64/syscall.rs`; no spec change (tokens unchanged). A recurrence of the
 `entry=recheck` fingerprint after this sha is a **new** defect, not this one.
 
-### 1b. SOCK-4 `cleared=false` / `kernel=false` — **instrumented; variant 2 mechanism IDENTIFIED**
+### 1b. SOCK-4 `cleared=false` / `kernel=false` — **variant 2 FIXED; variant 1 on watch**
 
 The transferable-socket fixture has flaked **five times**, in two variants.
+**Variant 2 (`cleared=true kernel=false`, `step=slot_reused`) is FIXED — see the
+disposition at the end of this entry.** The live watch is variant 1
+(`cleared=false`, 2 sightings, still teardown-race-SUSPECT), for which the
+`all_clear` half of the `BREAKDOWN` line is now the armed instrument.
 
 | # | When / where | Variant | Note |
 | --- | --- | --- | --- |
@@ -165,12 +169,21 @@ investigator for:
   `stack_open_reuse`); the `ok &=` chain latches a tag at its first failure
   (`a_resolves`, `xfer_a_to_b`, `recv_b`, `b_resolves_moved`, `a_stale_eacces`,
   `xfer_a_to_c`, `recv_c`, `c_dead_steal_fence`, `b_undisturbed`,
-  `gen_advanced`, `b_stale_vs_freed`, `slot_reused`, `b_stale_vs_new_tenant`,
-  `handle_rows_clear`, `xfer_rows_clear`, `ledgers_free`). `step=not-run` means
-  `cleared` was false and the check never ran — i.e. variant 1.
+  `gen_advanced`, `b_stale_vs_freed`, `new_tenant_live`, `stale_gen_vs_tenant`,
+  `b_stale_vs_new_tenant`, `handle_rows_clear`, `xfer_rows_clear`,
+  `ledgers_free`). `step=not-run` means `cleared` was false and the check never
+  ran — i.e. variant 1.
 
-**Root cause, variant 2 (`cleared=true kernel=false`) — IDENTIFIED at sighting 5.**
-The false term is **`slot_reused`**: step 5 of `sock4_kernel_check` closes the
+  **Tag change at the variant-2 fix.** `slot_reused` is GONE — the step it named
+  (assert the reopen first-fit back onto the freed slot) no longer exists. It is
+  replaced by the two tags of the reshaped step 5: `new_tenant_live` (the fresh
+  socket's slot, packed at its CURRENT generation, resolves under its owner — the
+  positive control) and `stale_gen_vs_tenant` (the SAME slot and SAME owner at the
+  PRECEDING generation is `-EACCES` — the fence proper). A `step=slot_reused` on
+  the wire from a build at or after the fix sha would mean a stale binary.
+
+**Root cause, variant 2 (`cleared=true kernel=false`) — IDENTIFIED at sighting 5, FIXED.**
+The false term was **`slot_reused`**: step 5 of `sock4_kernel_check` closes the
 socket, reopens, and asserts `sid2 == sid` to stage the gen-rebind fence on a
 *first-fit-reused* slot. That assertion is not a kernel invariant — it is an
 assumption about the state of the **global** `smolnet` `reg` table. `stack_open`
@@ -185,6 +198,32 @@ is why the flake is load-dependent (host load moves the DNS leg's completion
 into or out of the window) and why re-runs are clean. Nothing in the capability
 path is wrong: the fence is simply not staged, and the check reports that as a
 failure indistinguishable from a real one.
+
+**Fix (variant 2).** The gen-rebind fence no longer needs the reopen to land on
+any particular slot. Step 5 now stages the fence on **whatever slot the reopen
+returned** (`sid2`), using that slot's own generation arithmetic:
+
+| | before | after |
+| --- | --- | --- |
+| staging | `sid2 == sid` — the reopen first-fit back onto the freed slot (tag `slot_reused`) | *nothing* — no assertion about which slot the reopen returns |
+| live-tenant control | implicit (the reused slot was known live) | `socket_id_of(A, (gen2, sid2)) == Ok(sid2)` — the tenant resolves under its OWNER at its CURRENT generation (tag `new_tenant_live`) |
+| the fence proper | B's stale `(sid, gen0)` handle is `-EACCES` while `sid` holds a new tenant (tag `b_stale_vs_new_tenant`) | `socket_id_of(A, (gen2 - 1, sid2)) == Err(EACCES)` — SAME slot, SAME owner, SAME rights, one generation behind the live tenant (tag `stale_gen_vs_tenant`) — **plus** the unchanged `b_stale_vs_new_tenant` check, which holds whichever slot the reopen took |
+
+The property is **not weakened — it is sharpened**. The old
+`b_stale_vs_new_tenant` was over-determined: B's handle differs from the live
+tenant in *both* generation and owner, so a rejection there did not isolate the
+generation check. The new `stale_gen_vs_tenant` handle differs from the passing
+control in exactly one field — the packed generation — so only `sock_valid`'s
+generation comparison can reject it, and `new_tenant_live` rules out the boring
+alternative that the slot was dead all along. `gen2 - 1` is a real historical
+generation: a slot can only reach this open by having been closed, and
+`stack_close` bumps the generation; in the degenerate never-closed case it wraps
+to a generation the slot has never held, which is still not the live tenant's.
+
+**No flake window remains.** Nothing in step 5 now reads, or asserts anything
+about, the state of the global `reg` table beyond the slot the kernel itself
+just handed this check. The DNS leg and the SOCK-6/7 listeners can open and
+close freely inside the window with no effect on any term.
 
 **Root cause, variant 1 (`cleared=false`) — SUSPECT, unchanged.** The launcher's
 `all_clear` predicate (both handle rows clear, both inbox rows clear, the
@@ -209,7 +248,8 @@ boot does not have. `stack_open` is the one with a genuinely shared, contended
 resource (the `NSOCK` `reg` table, which the DNS leg and the SOCK-6/7 persistent
 listeners also draw from), so *if* an early return ever fires it is the one to
 suspect — but exhaustion returns `None`, whereas the observed contention on that
-same table manifests as the far cheaper `slot_reused` mismatch. Treat
+same table manifested as the far cheaper `slot_reused` mismatch (now fixed
+away). Treat
 `smolnet_init` / `proc_reserve_*` on the wire as evidence of a **real** defect,
 not of this class.
 
@@ -219,24 +259,36 @@ not of this class.
 - `killed` must be `0` (non-zero = a fixture was fault-killed = a real SOCK-4
   bug, **not** the class) and `done` must be `2` (lower = a fixture never
   reached its witness exit = a different failure).
-- `step=slot_reused` with all five `all_clear` terms `true` = the identified
-  variant-2 mechanism above; check the surrounding lines for a neighbouring
-  socket close (the `:: SMOLNET: [dns] … ::` line is the known one).
-- Any `step` value **other** than `slot_reused` or `not-run` is new information —
-  it has never been observed, and the capability-path tags
-  (`b_resolves_moved`, `a_stale_eacces`, `c_dead_steal_fence`,
-  `b_stale_vs_*`) would each be a genuine defect, not a flake.
+- `step=not-run` = variant 1, the remaining watch: `cleared` was false and the
+  check never ran, so read the five `all_clear` terms and treat the false one as
+  the teardown-race candidate.
+- **Any `step` value other than `not-run` is now new information.** The one
+  observed non-`not-run` tag, `slot_reused`, no longer exists in the tree; every
+  surviving tag names either a capability-path property (`b_resolves_moved`,
+  `a_stale_eacces`, `c_dead_steal_fence`, `new_tenant_live`,
+  `stale_gen_vs_tenant`, `b_stale_vs_*`) or a ledger-hygiene property, and each
+  would be a genuine defect, not a flake.
 - Whether a re-run at the same sha on an idle host is clean, and the host load
   at the time of the failure.
 
-**Disposition — WATCH, instrumented.** Variant 2's mechanism is identified but
-**not fixed**: fixing it means changing `sock4_kernel_check`'s staging (making
-the gen-rebind fence robust to a non-reusing reopen, or fencing the reopen
-against concurrent `reg` traffic) — fixture logic, out of the instrumenting
-arc's lane, and a decision an owner should take deliberately. Variant 1's fix
-shape remains the one proven in-tree for 1a: a `SWEPT`-and-park handshake so the
-launcher's re-read happens inside a window where the state is provably live,
-instead of racing a 2000 ms deadline.
+**Disposition — variant 2 FIXED at `5f243e19`; watch reduced to variant 1.**
+
+- **Variant 2 (`cleared=true kernel=false`, `step=slot_reused`) — FIXED.**
+  Fixture-only, x86 `arch/x86_64/syscall.rs` (`sock4_kernel_check` step 5); no
+  smolnet/table change, no spec change (the PASS and FAIL line texts are
+  byte-identical, tokens unchanged). Evidence: **three consecutive**
+  `UNAOS_FATIMG=sf ./arroyo test 150` runs at the fix sha, each `SOCK-4 … ->
+  PASS` and each `MBENCH PASS — 30/30`, the third under a deliberate 12-way host
+  load; the `:: SMOLNET: [dns] … ::` neighbour printed inside the window in all
+  three. The flake fired ~3 runs in 5 under load before the fix. A
+  `step=slot_reused` after this sha means a stale binary, not a recurrence.
+- **Variant 1 (`cleared=false`) — WATCH, cleared=false, 2 sightings (#1, #2),
+  still teardown-race-SUSPECT.** Unreproduced under instrumentation. The
+  `BREAKDOWN` line's `all_clear` half is armed for it and will name which of
+  `grantor_row` / `grantee_row` / `xfer_grantor` / `xfer_grantee` / `recs_free`
+  read false. The fix shape, if it recurs, remains the one proven in-tree for
+  1a: a `SWEPT`-and-park handshake so the launcher's re-read happens inside a
+  window where the state is provably live, instead of racing a 2000 ms deadline.
 
 ---
 
