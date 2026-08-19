@@ -12459,3 +12459,229 @@ The verdict flows to `PARITY §6.13`'s x86 column via the pi seat.
 mbench vs `x86-fat.spec` **31/31** knob-off and **31/31** under `UNAOS_WC=1` (`wc` in the
 `⚡ kernel features:` banner) · `longpres=`, `stallbound_us=`, `bound_us=` and `-> STALL` all
 `strings`-proven present in the WC `target/x86_64_esp/kernel.elf`.
+
+## DMG-DISJOINT — the damage set stops rounding every neighbour up to a whole box (x86 `wc`, 2026-08-18; reverted after boot 7; re-landed 2026-08-19)
+
+**The diagnosis was an equality.** The boot-4 sitting capture (six 128x128 vugs upscaled to
+768x768 on the 2880x1800 panel) read `[comp2] … dmg_px_pp=5190533 box_px_pp=5190533` — not
+approximately equal, EQUAL, and the exactness is the diagnosis. There is no union accumulator to
+degenerate: `dmg_px` is what `draw_window` painted and `box_px` is what the same call would have
+painted whole, so the two can only differ when some window in the pass carries a BAND. Two lines in
+`composite_inner`'s upward occlusion closure guaranteed none ever would:
+
+```rust
+dirty[j] = true;
+bands[j] = None;
+```
+
+Every higher-z window whose outer box merely GRAZED a damaged one was promoted to a whole-box
+repaint. With no routed console in the pass the only other band producer is `present_rows`, so on a
+vug desktop `dmg == box` was a tautology of the mechanism, not a measurement of it.
+`damage_intersecting` did the same to the erase drains, the cursor repair and the menu close — the
+WC-K3 ledger (`wm.rs`) had already named the cost in its own words: a five-pixel exposure at the
+edge of a neighbour cost that neighbour a whole-box repaint.
+
+### The mechanism — bands reach the chrome, and `None` still means whole box
+
+Damage stays per-window and banded; nothing unions across the panel.
+
+* **`damaged_box` — the band's extremes now reach the chrome.** `sy0 == 0` means the top of the
+  OUTER box, `sy1 >= r.h` the bottom. The old source-row mapping addressed content rows only, so no
+  band could say "from the top of this box down to row k" — which is *why* both call sites had to
+  whole-box. Both changes are widenings, so no caller can lose a pixel.
+* **`band_for_rows`** is `damaged_box`'s inverse: rounds outward, clipped to the window's own box.
+  `None` means "whole box" to every consumer — the pre-arc behaviour, and the fail-safe for
+  everything not expressible as a band.
+* **The closure damages `j` over the rows `i`'s blit will actually cross**, unioned with the band
+  `j` already had, instead of over `j`'s whole box. `damage_intersecting` does the same per rect;
+  its old `continue` on `damaged` also tested the wrong thing — a row carrying a band was skipped
+  entirely, so rows the rect exposed *outside* that band were never repainted. It now tests what it
+  always meant (a whole-box repaint is already owed) and widens banded rows.
+
+### The closure is one sweep, and the ordering is the termination proof
+
+The upward closure became a **single sweep in ascending z**. Its drag edge requires `z[j] > z[i]`
+STRICTLY, so the relation is a DAG over z, and the existing back-to-front `order` (hoisted above
+the closure) is a topological sort of that DAG: every contribution to `bands[i]` is applied before
+`bands[i]` is read, so **one pass IS the fixed point**. The old slot-order walk paid up to
+`MAX_WINDOWS`³ overlap tests per composite for what the ordering now gives for free — and it
+*removes*, rather than answers, the question of how many rounds a widening band needs to settle.
+
+The witnesses keep their meanings exactly, which is the point: `dmg_px_pp`/`box_px_pp` were pinned
+together by construction and are now free to differ. `[wcn] dkpx=` is charged the pixels the
+closure ADDED, not `j`'s whole box — a whole-box charge would report a cost the pass no longer pays
+and would hide the saving. A drag that cannot be narrowed still bills the whole box, because
+`damaged_box(_, None)` IS the outer box.
+
+### Boot 7 — the wedge, the revert, and what survived the audit
+
+The QEMU gate cannot witness this change and says so itself: `place` tiles the fixture's windows
+disjointly, the closure never fires, and `[comp2]` correctly still reads `dmg_px_pp == box_px_pp`
+there. The first metal sitting (boot 7) is therefore where the change met overlap — and it wedged:
+`pass_us` 42 ms → 86 ms, `declined_pct` 8 → 93 → 98 across two rollups, then one pass that entered
+at ~116 s and never returned — `[wcser] entered=0` for 87 consecutive rollups, the holder spinning
+c1 at 100 %, `[comp2]` silent, five of six vugs composited and the topmost never reached, a 440+ s
+hold ended only by power. Reverted on metal the same night (`94c81767`).
+
+**The banding itself was never refuted.** The line-level audit that followed cleared the band
+arithmetic, the chrome-extreme round trip, the whole-box encoding and the ascending-z one-pass
+fixed point, and `OccClip`'s prepare/spans/buries carry termination proofs under the wedge
+geometry. What the arc *did* break was steady-state cursor adoption — and what that fed is the
+storm that preceded the wedge. That amplifier is CURSTICK, below; the re-land (`660ef270`) is the
+same mechanism with the amplifier fixed and the pass named (`comp_mark`, under WCSER-H below).
+
+Honest residual, recorded: boot 7's terminal hold is instrumented, not root-caused to a line — the
+ABBA candidates audited do not close (`present_banded` drops `TABLE` before its blocking shadow
+acquire; `pace_shadow_source` is try-lock; `table()` holders are IRQ-masked and short). If any
+residue survives the amplifier fix, the boot-8 tripwire names its exact rung — and boot 8 did
+exactly that (wedge ledger entry below).
+
+### Boot 8 — the falsifier's first pass on real geometry
+
+The metal falsifier shipped with the original land: a six-vug idle composite must print
+`dmg_px_pp` well under `box_px_pp`; equal, or equal to the panel, and the change did not take.
+Boot 8 is the first reading on real overlapping geometry, and it passes in both regimes:
+
+| regime | `dmg_px_pp` | `box_px_pp` |
+|---|---|---|
+| idle desktop | **817617** | 984425 |
+| six-vug storm | **4099648** | 6075393 |
+
+The two witnesses differ, in the right direction, at both load points — the first time they have
+ever been observed apart, because before this arc they were equal by construction.
+
+### Gates (re-land)
+
+`./arroyo check` green both arches · `UNAOS_WC=1 ./arroyo check` green · x86-fat knob-off battery
+**31/31**, 0 forbidden · x86-fat `UNAOS_WC=1` leg **31/31**, 0 forbidden. The overlap-forcing QEMU
+leg (DMGOVLP, designed) precedes any trunk landing — QEMU's disjoint tiling structurally cannot
+witness this class.
+
+## CURSTICK — the banded drag un-adopted the sprite, and the storm it fed (x86 `wc`, 2026-08-19)
+
+**The interaction.** The overlay offer is made per staged band: `compose_into` declines the offer
+unless the sprite's box sits **wholly inside the band's rows**. Pre-arc, that predicate was
+satisfied by accident of the defect DMG-DISJOINT fixed — every dragged-in window was whole-boxed,
+so the topmost window under the pointer always contained the sprite, and the pass tail was `Adopt`:
+session closed, nothing repainted, nothing re-damaged.
+
+**The amplifier.** The banded drag broke that silently: a sliver band almost never covers the
+sprite, so no window took the overlay and every pass's tail became `Repaint` — whose `repair()`
+re-damages the pointer-stack windows through `damage_intersecting` AFTER the pass snapshot cleared
+them. A self-feeding composite storm: each pass re-arms the next, and the holder burns its full
+`COMP_RERUN_MAX` budget per call. This is the storm boot 7 rode into its wedge.
+
+**The fix is a widening in the direction the arc already owns.** Any dirty banded window whose
+outer box wholly contains the sprite's box has the sprite's rows UNIONED into its band, so the
+offer lands exactly where it landed pre-arc. Cost: sprite-height rows on the window under the
+pointer — against the whole boxes the arc exists to stop paying.
+
+**Boot-8 verdict: `Adopt` 1326/1326, `settle=0`.** Every sprite-touching tail in the sitting
+adopted; none fell through to a repaint or a deferred settle. The adoption economy is back to its
+pre-arc shape on top of banded damage.
+
+## WCSER-H — the gate names its holder, and an overdue pass trips a wire the wedge cannot cut (x86 `wc`, 2026-08-19)
+
+Boot 7 held `COMP_GATE` for 440+ seconds and the serial said almost nothing. `[wcser]` could print
+`WEDGED` but knew no holder core and no pass age. The `[wedge1]` dwell family watches the DRAIN
+BARRIER — and the storm workload (presents only, zero teardown) had taken that barrier's traffic to
+zero, so its rollup self-silenced before the hold and stayed silent through the entire event: an
+instrument–subject mismatch, not a failure. The schedx86 heartbeat rides the render core, so it
+died WITH the holder. **Every witness that could have named the wedge was pumped by the thing that
+wedged.** WCSER-H is the vantage fix.
+
+### The holder identity
+
+`COMP_GATE` gains a holder identity: **core** (`usize::MAX` = free) and **pass birth-time `t0`**,
+stamped t0-first by every CAS winner — the main acquire and the lost-wakeup re-acquire — and
+cleared before every release, so a set core always carries a current age. Gauges, never drained: a
+wedged holder leaves them standing, which is the point.
+
+### The overdue tripwire — a vantage the wedge cannot reach
+
+`wcser_overdue_probe()` rides `x86_input_service`'s ~1 kHz loop: a core the compositor never runs
+on, and the one lane boot 7 PROVED survives the wedge (trackpad witnesses kept arriving while c1
+spun). It is deliberately **not** pumped by `wcn_tick` — that pump is the presenting tasks, and a
+wedge with no surviving presenters silences it, which is exactly the blindness this closes. Boot 8
+added the ordering law: the probe runs FIRST in the service loop, ahead of the event pump, because
+the pump can block into a wedged GUI — the probe must not die of the wedge it reports.
+
+The bound is **1 s = 3× the worst honest pass on record** (the 302 ms masked reopen). At the
+crossing, one loud line (a **once-per-epoch latch**); while the pass stays held, one standing
+repeat per 5 s; the latch re-arms at release, so the NEXT wedge names itself too. Known residual,
+recorded: `arch::ms()` advances only on the BSP, so a wedge OF the BSP freezes the age — a bound
+crossed before the freeze still prints.
+
+### The wire
+
+The `[wcser]` rollup gains `holder=` (as isize; `-1` = free), `held_ms=`, and `exbusy=` (next
+section), appended after the existing anchors per the `gap=` rule — no witness signature moves.
+The tripwire prints the holder, the age, and the breadcrumb pair `win= phase=` (plus `row=` where
+the phase carries one), once at the crossing and on each 5 s repeat.
+
+### `comp_mark` — the pass is named
+
+Two relaxed stores per stamp; gauges, so a wedge leaves the last stamp standing. The blit loop
+stamps which window and which phase it is on: **1** clip/shadow, **2** wcg-begin, **3** draw,
+**4** post-draw witnesses. Boot 8's two wedges both landed in the phase-3/4 window — exactly one
+`draw_window` call and its post-draw witnesses — so phase 3 is now split into sub-phases, with a
+row gauge (`comp_mark_row`) on the flush loop and the direct paint path:
+
+| stamp | where the pass is | lead candidate if frozen here |
+|---|---|---|
+| 30 | stage entry | the heap-grow lock |
+| 31 | band compose (RAM layer) | — |
+| 32 | sprite offer | the overlay micro-mutex |
+| 33 | span flush (`row=` live) | posted-write stall mid-blit into BAR1 |
+| 34 | direct fallback (`row=` live) | posted-write stall mid-blit into BAR1 |
+| 35 | uncover tail | the overlay micro-mutex |
+| 4 | post-draw witnesses | non-posted read-back stall |
+
+The decode column is the boot-8 interior audit reduced to one line of serial: what took a session
+of forensics to rank ("hung between win8 and win9", boot 7) now costs one tripwire line.
+
+### `occluders_above` — refuse, don't wait
+
+The excuse snapshot ran INSIDE the blit loop, per drawn window, and took `table()`: a blocking
+IRQ-masked spin, for a WITNESS — the only blocking primitive in the whole pass, sitting exactly in
+the window where boot 7's pass went silent. **An instrument must never be able to block the pass
+it instruments.** It now try-locks; on contention the sample is **pardoned whole** — one
+full-coverage box, so `covers()` answers yes everywhere, no pixel can be charged, and no FAIL can
+be manufactured — and the refusal is counted on the `[wcser]` rollup as `exbusy=`. Fail-safe
+direction: witness coverage lost for one window for one pass, said on the wire.
+
+### Gates
+
+`./arroyo check` green both arches · `UNAOS_WC=1 ./arroyo check` green · x86-fat knob-off battery
+**31/31**, 0 forbidden. The boot-8 refinements (sub-phases, probe-before-pump) ride the boot-9
+staging per the once-per-staged-image rule.
+
+## The boot-8 wedge ledger entry (x86 metal, 2026-08-19)
+
+Two wedges in one sitting — **2-for-2 under the six-vug storm** — and both were named by the
+boot's own tripwire, which is WCSER-H doing on its first metal outing what it was built for:
+
+* wedge 1: **phase 3** — the write path, mid-`draw_window`;
+* wedge 2 (on the re-run): **phase 4** — the post-draw read-back.
+
+Both holds sat on **bottom-row vugs on the `clip.n == 0` fast path** — windows with nothing above
+them, taking the simplest blit the pass owns. That placement matters: the fast path holds no clip
+machinery, which thins the suspect list toward the endpoint.
+
+**The precursor, and it is ~17 s of warning.** `declined_pct` climbs **69 → 98** over roughly 17
+seconds before each hold, driven by `wcd_us` ≈ **4.0 M per 5 s rollup** — four seconds of every
+five spent in the write-combine drain. The storm shape is the panel path slowing first, the gate
+absorbing the slowdown as declines, then one pass never coming back.
+
+**Lead theory: an endpoint hang, not a kernel loop.** The interior audit exonerated every loop and
+lock in the phase-3/4 window with line-level proofs. What remains is the Kepler endpoint: a
+posted-write stall into BAR1 in phase 3, a non-posted read-back stall in phase 4 — the same two
+rows of the `comp_mark` decode table, read from the device side.
+
+**Next discriminators (boot 9):**
+
+1. **the PCIe root-port sampler** — read the root port's own state while the hold stands, from the
+   probe's surviving core: link-level distress is visible there or it is not;
+2. **NOASPM** — rule link power-state transitions in or out as the trigger;
+3. **the WCD valve** — take the write-combine drain's 4-in-5 duty out of the equation and see
+   whether the precursor, and the wedge behind it, go with it.
