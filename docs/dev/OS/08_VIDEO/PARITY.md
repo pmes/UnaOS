@@ -1858,6 +1858,32 @@ Two conclusions:
    stall, not a copy losing to the beam — but it must be taken as a deliberate trade with a
    replacement assertion beside it, not as a quiet threshold tweak.
 
+#### The x86 column (rmbp 1's re-price, landed their side at 08941dd4 — recorded 2026-08-19)
+
+The same measurement on the rMBP **inverts the discriminator verdict**: presspread is NOT a
+discriminator on x86 at all. Seven boots, 8133 `[wc-h]` rollups, every one `torn=0 stalls=0
+TEAR-FREE`: values run **continuously 1→118 with no bimodal gap**; 20.9% of healthy rollups sit
+above 8; and the outliers are **fast-floor artifacts** (`minpresent_us` 23–726µs pulling the
+ratio's denominator down while `maxpresent_us` stays in the normal 1723–7276µs band) — the mirror
+image of pi's slow-max shape, and a ratio cannot tell the two apart. pi's honest gap is thereby
+real but incidental. Consequences, per-tree under the WMCTRL precedent (exact pins per tree,
+union at merge):
+
+| | pi 4 (this file's baseline) | x86 rMBP (rmbp 1, 08941dd4) |
+|---|---|---|
+| healthy presspread | 1–7 sustained (one 181 outlier) | **1–118 continuous, no gap** |
+| AT-RISK population | {32, 33, 84, 136}, slow-max shape | none observed (fast-floor artifacts only) |
+| `STALL_SPREAD` pin | **8** (lowest defensible; 8–32 supported) | **256** (2.2x healthy ceiling; loud-false-alarm pricing) |
+| pin location | arch-conditional in `wcg.rs`, each cited to its own captures | same commit |
+
+The **shared replacement assertion** both trees adopt (the deliberate trade this section
+demanded): `STALL_PRESENT_US = 33334` (2 frames) **absolute, not a ratio** — 4.6x above every
+healthy present either machine has produced, 6.5x below pi's smallest captured stall — with a
+`longpres=` census and a per-window `-> STALL` line, diverting nothing from `torn=`. **No spec
+token on either tree**: `maxpresent_us` suffers the same QEMU vCPU compression as presspread
+(a 58–407x desched takes a healthy 1937µs present past any sane bound); the bound is read on
+metal via the playbooks. The pi playbook carries the read guidance from dsktp boot 9 on.
+
 ---
 
 ## 7. Accounting check
