@@ -344,7 +344,8 @@ pub fn jb6_csb_sweep() {
 // the state JB9d-GUARD already gates on, and this census converts that into a positive
 // experimental verdict — obtained with zero risky writes — instead of an absence of evidence.
 //
-// GATING: ALWAYS-ON in the tegra build, deliberately NOT behind the `xusbfw` feature.
+// GATING: DEFAULT-ON in the tegra build, deliberately NOT behind the `xusbfw` feature, with one
+// negative escape knob (`UNAOS_NOJB11=1`, see JB11-ESCAPE below).
 //   * `xusbfw` is the wrong home. That feature exists to arm a DESTRUCTIVE path (STEP 0 is a BPMP
 //     Falcon reset) and it is mutually exclusive with the shipped JB9G_NO_HCRST inherit recipe —
 //     `reload_entry` returns `InheritActive` and bails BEFORE it ever reaches the aperture. A
@@ -353,16 +354,59 @@ pub fn jb6_csb_sweep() {
 //   * The precedent is JB5/JB6: this block is already censused unconditionally on every tegra boot
 //     (`jb5_witness` reads USBSTS + CPUCTL, `jb6_csb_sweep` sweeps the ARU/CSB) and JB9-A's
 //     header half is the same ioctl — only fossilised behind `JB9_PROBE = false`. JB11 is that
-//     half promoted to always-on and made decisive.
+//     half promoted to default-on and made decisive.
 //   * The cost is bounded and small: one CNR poll bounded at ~200 ms (expected to exit on the
 //     first read on the inherit path, where the controller is cleanly halted and never reset), plus
-//     14 header dwords = 28 MMIO accesses. No allocation, no DMA, no wait that can outlive its
-//     deadline.
+//     11 header dwords = 22 MMIO accesses (each `jb11_hdr_dword` is one ioctl write + one result
+//     read; the eleven calls are the block at the `// The header.` comment below — ten `H_*` field
+//     offsets, `H_MAGIC` read twice for the 8-byte magic). No allocation, no DMA, no wait that can
+//     outlive its deadline. NOTE the JB11 commit message (abcc1edb) claims "14 header dwords = 28
+//     MMIO accesses" and this comment carried the same number: BOTH ARE WRONG, and the message is
+//     immutable mid-stack history so it is not rewritten. Count the `jb11_hdr_dword` calls.
 //   * The value is per-boot: every Orin boot now answers "is the inherited Falcon answering?"
 //     with a machine-checkable verdict line, which is the standing question behind the whole
 //     JB9/JETSON-XCARVE wall investigation.
 // Non-tegra builds are untouched: the whole module is `#[cfg(feature = "tegra")]`.
+//
+// JB11-ESCAPE (`UNAOS_NOJB11=1`) — the control-boot knob, spelled per the tree's negative-knob
+// convention (`UNAOS_NOTEGRASMP`, `UNAOS_NOSDHCBLK`, `UNAOS_NOKBDWIT`: `UNAOS_NO` + the thing,
+// no separating underscore, presence-is-truth). Default UNSET = census runs; that is the point of
+// JB11 and nothing about the default changes.
+//
+// WHY IT IS A RUNTIME BRANCH AND NOT A `#[cfg]`. The JB11 commit carries a WATCH ITEM: arming the
+// census grew the image ~118 KB through codegen-unit RE-PARTITIONING (not its own ~1.9 KB — proven
+// against a size-matched inert control), and the JETSON-XCARVE wall is IMAGE-LAYOUT-CORRELATED
+// (§JETSON-XCARVE: same code, different link layout, 4/4 vs 0/19). So the control boot has to
+// separate two suspects — "the census's own BAR2 traffic moved the wall" from "the relink moved the
+// wall" — and a compile-time gate cannot: cfg-ing the census out removes the traffic AND relinks,
+// confounding the two again. A runtime branch holds the layout FIXED and removes only the traffic:
+//   * armed vs suppressed are the same source, same functions, same strings, same codegen units,
+//     same panic `Location`s. MEASURED on this arc (`llvm-objcopy -O binary` of both kernel.elf,
+//     `cmp -l`): the loadable image differs in EXACTLY ONE BYTE — this flag, at `JB11_SUPPRESS`
+//     (00 -> 01) — and every symbol address is identical. The two ELF FILES additionally differ by
+//     32 bytes of `.strtab`, which is not loaded: LLVM's internal-symbol `.llvm.<hash>` suffixes
+//     change length with the module hash. Compare the binary image, not the .elf sha256;
+//   * so a wall that behaves identically under `UNAOS_NOJB11=1` exonerates JB11's 22 accesses and
+//     leaves the ~118 KB relink as the live suspect, while a wall that changes implicates the
+//     accesses. Neither inference is available from a cfg'd-out build.
+// The flag is a `#[used]` static read with `read_volatile`, NOT a bare `if option_env!(..).is_some()`
+// (which is a compile-time constant LLVM would const-fold, DCE-ing the whole census body and
+// relinking the image — reintroducing the very confound). `option_env!` is the same compile-time
+// embedding `UNAOS_SMPPROBE`/`UNAOS_FBW`/`UNAOS_V3D_FIRSTKICK` use; cargo's dep-info env tracking
+// rebuilds when the knob changes, so no feature flag is needed and none is added.
+// Suppression is never silent: the function prints one `census SUPPRESSED` line and returns before
+// the first touch, so the wire always states which of the two boots this was.
 // ---------------------------------------------------------------------------------------------
+
+/// JB11-ESCAPE: `UNAOS_NOJB11=1` at build time => 1, unset => 0. See JB11-ESCAPE above for why this
+/// is a `#[used]` static read volatilely rather than a `cfg`/const branch: the census body must stay
+/// linked in BOTH builds so that the suppressed control boot differs from the armed one by this word
+/// alone and by no relink.
+#[used]
+static JB11_SUPPRESS: u32 = match option_env!("UNAOS_NOJB11") {
+    Some(_) => 1,
+    None => 0,
+};
 
 /// BAR2 offset of the firmware IOCTL request register (`XUSB_BAR2_ARU_FW_SCRATCH`).
 const JB11_ARU_FW_SCRATCH: u64 = 0x1000;
@@ -404,7 +448,10 @@ fn jb11_utc(epoch: u32) -> (u64, u64, u64, u64, u64, u64) {
 
 /// JB11: read the resident Falcon's firmware header over BAR2 and witness what it says — or
 /// witness that it says nothing, which is the CRCR-wall confirmation. See the block comment above
-/// for the mechanism, the write-safety argument, and the always-on gating decision.
+/// for the mechanism, the write-safety argument, and the default-on gating decision.
+///
+/// Build with `UNAOS_NOJB11=1` to suppress the census for a control boot (one wire line, zero
+/// accesses, same image layout) — JB11-ESCAPE above.
 ///
 /// Preconditions are physical and self-checked: the XUSB partition must be ON (the call site is
 /// inside `jb5_pg_on`'s proof — the JX1 gated-block rule) and BAR2 must be routed (`jb5_bar2_route`;
@@ -421,6 +468,18 @@ pub fn jb11_fw_header_census(tag: &str) {
     const H_VERSION_ID: u32 = 0x48;
     const H_FWIMG_LEN: u32 = 0x64;
     const H_MAGIC: u32 = 0x68;
+
+    // JB11-ESCAPE: the control boot. Volatile load so the branch survives optimization and the
+    // census below stays linked in — see the JB11-ESCAPE block above. This is the FIRST statement of
+    // the function: a suppressed boot performs zero BAR2 accesses, zero host-aperture reads and zero
+    // CNR polling, and says so in one line rather than vanishing silently.
+    if unsafe { core::ptr::read_volatile(&raw const JB11_SUPPRESS) } != 0 {
+        serial_println!(
+            ":: tegra: JB11 [{}] — census SUPPRESSED (UNAOS_NOJB11=1) — control boot: no BAR2 ioctl, no CNR poll, no header read; the census code is still linked, so this loadable image differs from the armed one by ONE byte (this flag) and by no relink ::",
+            tag
+        );
+        return;
+    }
 
     // JX1 discipline: name the access class BEFORE the first touch, so a boot that dies here has a
     // last serial line that names the killer aperture.
@@ -472,7 +531,9 @@ pub fn jb11_fw_header_census(tag: &str) {
         }
     );
 
-    // The header. 14 dwords, one ioctl round trip each.
+    // The header. ELEVEN dwords, one ioctl round trip (write + read) each = 22 MMIO accesses — ten
+    // `H_*` field offsets plus the second half of the 8-byte magic. (Not 14/28: the JB11 commit
+    // message abcc1edb says 14 and is wrong; it is immutable history and is left as it stands.)
     let codetag = jb11_hdr_dword(H_BOOT_CODETAG);
     let codesize = jb11_hdr_dword(H_BOOT_CODESIZE);
     let rodata_off = jb11_hdr_dword(H_RODATA_IMG_OFFSET);
