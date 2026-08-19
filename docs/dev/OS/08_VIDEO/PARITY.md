@@ -1888,6 +1888,69 @@ token on either tree**: `maxpresent_us` suffers the same QEMU vCPU compression a
 (a 58–407x desched takes a healthy 1937µs present past any sane bound); the bound is read on
 metal via the playbooks. The pi playbook carries the read guidance from dsktp boot 9 on.
 
+### 6.13a `exec-flakehunt` — `[wc-k] … torn=1 -> AT-RISK` is §6.13's class, and the fix is §6.13's fix
+
+*(Renumbered from 6.14 at the seat pick — §6.14 is reserved for the rmbp tree's in-flight boot-seam
+section; this one is an addendum to §6.13 in substance anyway.)*
+
+Investigation arc off `5d7ff0c8` (Pi seat). Two Pi seats reported `[wc-k] rollup … torn=1 ->
+AT-RISK` riding some `kernel8-test` runs under host load, where the pi4 spec carries **both** a
+blanket `FORBID \[wc-k\] .*-> AT-RISK` and a `REQUIRE … outside=0 .* -> TEAR-FREE`, so one torn
+erase costs the suite two lines.
+
+**Conviction — the same QEMU vCPU-desched class as `presspread`, in its slow-max shape.** `torn` in
+`erase_note` is `present_us > rectscan_us` with `rectscan_us = FRAME_US * h / panel_h`, and
+`FRAME_US / panel_h` is a **constant** (16667/480 = 34.7 µs). So the erase tear test is exactly
+"did the present exceed 34.7 µs per row", and nothing else about the box enters it. Measured over
+**25 raspi4b runs** at host load 2–13 (unconfined, and with QEMU's five threads pinned to a 2- or
+3-CPU host set), **28 rollups / 116 staged erase samples, `torn=0` on every one**. The margin
+distribution of `rectscan_us / present_us` per sample:
+
+| min | p10 | median | p90 | max |
+|---|---|---|---|---|
+| **2.0x** | 12.3x | **29.7x** | 74.9x | 118.4x |
+
+`present_us` runs 88–3388 µs against `rectscan_us` of 6666–11528. A `torn=1` therefore needs **one**
+present to cross from a ~30x median margin while its three neighbours stay flat — and the 2.0x tail
+sample is itself almost certainly an already-inflated one that simply did not cross. No copy-path
+regression is selective like that: losing the staged shape reports `contig=no` /
+`-> SPLIT`, and a genuinely slow copy is slow on every sample. A vCPU losing its host timeslice
+mid-present is selective like that, and it is the mechanism §6.13 already named — the pi **slow-max**
+shape (`maxpresent_us` blown out beside a normal floor), not x86's fast-floor artifact.
+
+**Not reproduced here, and that is reported rather than papered over.** 25 runs, zero `torn` and zero
+`cores-used=1`; the host sat at load 6–13 and fell to 2–5 as the parallel seats finished, below the
+regime the two reporting seats ran under. Pinning QEMU harder does produce reds, but **other** ones,
+and it reds the *unmodified* tree too: across 11 pinned runs on `5d7ff0c8` the classes seen were
+`MBENCH TRUNCATED` (the 60 s window no longer reaching the `BANDY-*` witnesses — the harness's own
+bound, explicitly "not a regression"), one `[wc-c] side-by-side windows=2 drawn=1`, and one
+`AARCH64 EXCEPTION: SYNCHRONOUS` with `ELR`/`FAR` equal to `0x3133313d3631715f` — ASCII `_q16=131`,
+a PC inside a `[crispy]`/`[ceramic]` format string, alongside garbage `[click2]` counters. **That
+last one is flagged, not diagnosed, and is not this class**; the pinned regime is a torture harness
+that shakes out unrelated latent races on both trees and is therefore not a valid gate regime.
+
+**Fix shape — and why this arc did NOT land it.** The right fix is the one §6.13 already specifies
+and the rMBP seat is already landing in `video/wcg.rs`: the `STALL_PRESENT_US = 33334` absolute bound
+with its `longpres=` census and `-> STALL` line, extended from the `[wc-h]` composite path to the
+`[wc-k]` erase path, plus the discriminator field the erase rollup lacks entirely (WC-H publishes
+`presspread=`/`presspop=`; WC-K publishes no rate census at all, so its `torn=1` is printed with
+nothing beside it that could tell the two causes apart). Landing a pi-side variant of that in
+`wcg.rs` now would be a **second, competing opinion in a file another seat is actively changing** —
+precisely the drift §6.13's per-tree pin discipline exists to prevent, and outside this track's lane.
+So this arc convicts the class, records the measurement above as the baseline the bound can be priced
+against, and **stops**. Owed, to whichever seat lands the wc-k stall guard:
+
+* the erase rollup needs a rate census (ns per 4 KiB over `row_bytes * h`, exactly `[wc-h]`'s
+  normalisation) before any band can be priced. Computed offline from the 28 rollups above, the
+  per-boot QEMU spread is **2–57, mode 6–7, median 7** — the same single-digit healthy centre
+  `[wc-h]` reads on pi metal (1–7), with a tail that is itself desched. A band cannot be pinned from
+  QEMU numbers, but the SHAPE transfers: a `torn` sample must cross a ~30x margin, so it lands far
+  above the healthy centre, while a genuinely slow copy lifts every sample together and leaves the
+  spread at the centre. That is the discriminator, and it needs a metal capture to price;
+* the spec's `REQUIRE … -> TEAR-FREE` has to move with the FORBID. Unlike `[wc-h]`, whose rollup
+  verdict is only FORBIDden, `[wc-k]`'s verdict is *also* REQUIREd, so excusing the desched class in
+  the FORBID alone still reds the suite on the REQUIRE. Both lines are one change.
+
 ---
 
 ### 6.15 WINX-8 — VUGSHRINK's two latent x86 faults, found by the fold, fixed at the crate

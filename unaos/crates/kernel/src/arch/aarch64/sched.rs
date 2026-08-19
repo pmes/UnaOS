@@ -8134,27 +8134,124 @@ pub fn start_aps(online: &[usize]) {
 // single-core spawn can only happen through `try_steal`. A/B is decisive rather than statistical: on
 // the pre-arc constant floor the sibling's peek reads depth 1 < 2, declines, and the leg reports
 // `cores-used=1` on every boot.
+//
+// ── FLAKEHUNT — THE LEG ASSERTED THE MOVE, BUT MEASURED THE SIBLING'S HOST TIMESLICE ──────────
+//
+// The staging above is correct and the claim is correct; what was wrong is that BOTH ends of the
+// observation window were blind guesses at wall-clock, and one of them was three milliseconds wide.
+// `busy_delay_ms(2)` assumed `home` had picked task one up by then, and the worker's `busy_delay_ms(5)`
+// left the state the corrector must SEE — `home` running task one with exactly one ready behind it —
+// alive for the ~3 ms remainder. A sibling can only convict inside that remainder, and it can only
+// look while its own vCPU is executing. `busy_delay_ms` is CNTPCT, which on QEMU advances with the
+// HOST clock whether or not the guest core is on a host CPU, so on a loaded host the 3 ms window can
+// pass with an idle sibling executing no instructions at all: no idle pass, no steal, `cores-used=1`,
+// and a FAIL that convicts the host's run queue rather than this kernel's. Two independent Pi seats
+// measured it at roughly one red in four runs of an otherwise green suite.
+//
+// The repair changes NEITHER the staging nor the claim — the pass condition is still "the pair ran on
+// >= 2 distinct cores", still reachable only through `try_steal` at victim depth 1:
+//
+//   1. THE SECOND SPAWN IS GATED ON AN OBSERVATION, NOT A DELAY. Task two is queued only once task
+//      one has been seen RUNNING (it has set its bit in the mask, and — the pin argument — a lone
+//      ready task at depth 1 on an IDLE victim is below `STEAL_MIN_DEPTH` under BOTH floors, so the
+//      only core it can have run on is `home`). This strictly SHARPENS the A/B the blind 2 ms could
+//      lose in the other direction: a `home` that had not yet dispatched left the queue at depth 2
+//      with the victim idle, which the pre-arc constant floor ALSO cleared, so a stubbed build could
+//      go green by being slow. It no longer can.
+//   2. THE WINDOW IS WIDENED FROM 3 ms TO ~25 ms, by spinning the worker that long. This is the only
+//      knob that buys the descheduled sibling more chances to be on a host CPU while the state holds.
+//   3. THE ATTEMPT IS RETRIED, up to `VUGSPREAD_FLOOR_TRIES`, and the count is PUBLISHED as `tries=`.
+//      A retry cannot manufacture a pass on a build whose floor refuses the move — the pre-arc floor
+//      declines identically on every attempt, so a stubbed build reports `cores-used=1 tries=4 ::
+//      FAIL` — but it converts "one sibling missed one 3 ms window" into "every sibling missed four
+//      independent 25 ms windows", which is the difference between a coin flip and a verdict.
+//
+// `tries=` is not decoration either: on metal it is the leg's own honesty about how hard the machine
+// had to be asked, and a `tries=` that starts climbing there is a spread regression this leg would
+// otherwise report as a clean PASS.
 
 #[cfg(all(feature = "pi", feature = "witness"))]
 const VUGSPREAD_FLOOR_N: usize = 2;
+/// FLAKEHUNT — staging attempts the leg is allowed before it reports what it got. Each attempt is a
+/// fully independent A/B: fresh tasks, `migrations == 0`, so VUGSPREAD-COOL's brake never applies and
+/// no attempt can be refused because of an earlier one.
+#[cfg(all(feature = "pi", feature = "witness"))]
+const VUGSPREAD_FLOOR_TRIES: u32 = 4;
+/// FLAKEHUNT — how long each worker stays on-core, in ms. This IS the observation window: for its
+/// duration `home` is running task one with task two ready behind it, and that is the only state an
+/// idle sibling can convict on.
+#[cfg(all(feature = "pi", feature = "witness"))]
+const VUGSPREAD_FLOOR_SPIN_MS: u64 = 25;
+/// FLAKEHUNT — bound on the wait for task one to be seen on-core (step 1's gate). Exceeding it means
+/// `home` never dispatched, which is not this leg's question; the attempt proceeds and fails, and the
+/// retry covers it.
+#[cfg(all(feature = "pi", feature = "witness"))]
+const VUGSPREAD_FLOOR_START_MS: u64 = 20;
+/// FLAKEHUNT — bound on the wait for the second core to appear, per attempt. Comfortably past the
+/// worker spin, so an attempt that is going to succeed has succeeded.
+#[cfg(all(feature = "pi", feature = "witness"))]
+const VUGSPREAD_FLOOR_WAIT_MS: u64 = 90;
+/// FLAKEHUNT — bound on draining a failed attempt's workers before the next stages onto the same
+/// core, so an attempt never inherits a predecessor still spinning on `home`.
+#[cfg(all(feature = "pi", feature = "witness"))]
+const VUGSPREAD_FLOOR_DRAIN_MS: u64 = 80;
 #[cfg(all(feature = "pi", feature = "witness"))]
 static VUGSPREAD_FLOOR_MASK: AtomicU32 = AtomicU32::new(0);
+/// FLAKEHUNT — the attempt a worker belongs to, handed to it as its `arg` and compared against this
+/// on entry. A worker from a previous attempt that is still queued when the next one resets the mask
+/// must not write into it; the generation tag is what keeps each attempt's reading its own.
+#[cfg(all(feature = "pi", feature = "witness"))]
+static VUGSPREAD_FLOOR_GEN: AtomicU32 = AtomicU32::new(0);
+/// FLAKEHUNT — workers of the CURRENT attempt that have finished spinning. The drain gate reads it.
+#[cfg(all(feature = "pi", feature = "witness"))]
+static VUGSPREAD_FLOOR_DONE: AtomicU32 = AtomicU32::new(0);
 
 #[cfg(all(feature = "pi", feature = "witness"))]
-fn vugspread_floor_worker(_: usize) {
-    let cpu = percpu::this_cpu().cpu_index as usize;
-    VUGSPREAD_FLOOR_MASK.fetch_or(1u32 << (cpu & 31), Ordering::Relaxed);
-    // Long enough that the home core is still RUNNING this one — the `CUR_PRIO != PRIO_NONE` the
-    // per-victim floor reads — while a sibling makes its idle pass and looks at the other.
-    busy_delay_ms(5);
+fn vugspread_floor_worker(epoch: usize) {
+    let mine = VUGSPREAD_FLOOR_GEN.load(Ordering::Acquire) == epoch as u32;
+    if mine {
+        let cpu = percpu::this_cpu().cpu_index as usize;
+        VUGSPREAD_FLOOR_MASK.fetch_or(1u32 << (cpu & 31), Ordering::Relaxed);
+    }
+    // The observation window itself: long enough that the home core is still RUNNING this one — the
+    // `CUR_PRIO != PRIO_NONE` the per-victim floor reads — through many idle passes of a sibling that
+    // is only intermittently on a host CPU.
+    busy_delay_ms(VUGSPREAD_FLOOR_SPIN_MS);
+    if mine {
+        VUGSPREAD_FLOOR_DONE.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// FLAKEHUNT — poll `cond` at 1 ms granularity for at most `budget_ms`, returning `true` if it became
+/// true. Every wait in the leg is bounded and observation-driven rather than a fixed sleep, so a slow
+/// host lengthens the leg instead of falsifying it.
+#[cfg(all(feature = "pi", feature = "witness"))]
+fn vugspread_floor_poll(budget_ms: u64, mut cond: impl FnMut() -> bool) -> bool {
+    let mut waited = 0u64;
+    loop {
+        if cond() {
+            return true;
+        }
+        if waited >= budget_ms {
+            return false;
+        }
+        busy_delay_ms(1);
+        waited += 1;
+    }
 }
 
 /// VUGSPREAD — the floor-repair proof. Stage `VUGSPREAD_FLOOR_N` (2) steal-eligible tasks on ONE
-/// online core with the others idle in `run`, wait a bounded window, and PASS iff they ran on >= 2
-/// distinct cores. Emits `:: VUGSPREAD: floor test — tasks=N cores-used=M depth=1 :: PASS ::`.
+/// online core with the others idle in `run` and PASS iff they ran on >= 2 distinct cores. Emits
+/// `:: VUGSPREAD: floor test — tasks=N cores-used=M depth=1 tries=K :: PASS ::`.
 ///
 /// The `depth=1` in the line is the point of the leg and not decoration: it names the victim depth
 /// the move had to clear, which is the number `[spread4] d1=` counts cumulatively on metal.
+///
+/// FLAKEHUNT — `tries=K` is how many staging attempts it took. `K > 1` is not a failure and not a
+/// weakening: every attempt is the same A/B against the same floor, so a build whose floor refuses
+/// the move reports `cores-used=1` at every K. What K measures is how often the machine underneath
+/// the leg was able to LOOK, which on QEMU is a property of the host and on metal is a reading worth
+/// having. See the FLAKEHUNT block above for why the old single blind attempt convicted the host.
 #[cfg(all(feature = "pi", feature = "witness"))]
 pub fn vugspread_floor_witness() {
     let online: alloc::vec::Vec<usize> = (0..NUM_CPUS)
@@ -8168,31 +8265,51 @@ pub fn vugspread_floor_witness() {
         return;
     }
     let home = online[0];
-    VUGSPREAD_FLOOR_MASK.store(0, Ordering::Relaxed);
-    // STAGED, NOT BURST, and that is what makes the leg an A/B instead of a coin flip. Pushing both
-    // at once leaves a window in which `home` has not dispatched either and its queue reads depth 2
-    // — which the OLD constant floor also cleared, so a pass could come from the pre-arc path. Let
-    // the first one get PICKED UP first: from the instant the second is queued, `home` is running
-    // task one (`CUR_PRIO != PRIO_NONE`) with exactly ONE ready behind it, which is the state the
-    // constant floor refuses and the per-victim floor admits. The 2 ms gap is bounded well inside
-    // the worker's 5 ms spin, so task one is still on-core when task two lands.
-    spawn_stealable_on("vugfloor", vugspread_floor_worker, 0, home);
-    busy_delay_ms(2);
-    for _ in 1..VUGSPREAD_FLOOR_N {
-        spawn_stealable_on("vugfloor", vugspread_floor_worker, 0, home);
+    let mut used = 0usize;
+    let mut tries = 0u32;
+    while tries < VUGSPREAD_FLOOR_TRIES {
+        tries += 1;
+        // Claim this attempt's generation BEFORE anything can run under it, so a straggler from the
+        // previous attempt can never write into the mask this one is about to read.
+        VUGSPREAD_FLOOR_GEN.store(tries, Ordering::Release);
+        VUGSPREAD_FLOOR_MASK.store(0, Ordering::Relaxed);
+        VUGSPREAD_FLOOR_DONE.store(0, Ordering::Release);
+        // STAGED, NOT BURST, and that is what makes the leg an A/B instead of a coin flip. Pushing
+        // both at once leaves a window in which `home` has not dispatched either and its queue reads
+        // depth 2 — which the OLD constant floor also cleared, so a pass could come from the pre-arc
+        // path. Task two is therefore queued only after task one has been SEEN running: a lone ready
+        // task at depth 1 on an idle victim is below `STEAL_MIN_DEPTH` under both floors, so a set
+        // bit can only mean `home` dispatched it, and from that instant `home` is running task one
+        // (`CUR_PRIO != PRIO_NONE`) with exactly ONE ready behind it — the state the constant floor
+        // refuses and the per-victim floor admits.
+        spawn_stealable_on("vugfloor", vugspread_floor_worker, tries as usize, home);
+        vugspread_floor_poll(VUGSPREAD_FLOOR_START_MS, || {
+            VUGSPREAD_FLOOR_MASK.load(Ordering::Relaxed) != 0
+        });
+        for _ in 1..VUGSPREAD_FLOOR_N {
+            spawn_stealable_on("vugfloor", vugspread_floor_worker, tries as usize, home);
+        }
+        vugspread_floor_poll(VUGSPREAD_FLOOR_WAIT_MS, || {
+            VUGSPREAD_FLOOR_MASK.load(Ordering::Relaxed).count_ones() >= 2
+        });
+        used = VUGSPREAD_FLOOR_MASK.load(Ordering::Relaxed).count_ones() as usize;
+        if used >= 2 {
+            break;
+        }
+        // Let this attempt's workers finish before the next stages onto the same core.
+        vugspread_floor_poll(VUGSPREAD_FLOOR_DRAIN_MS, || {
+            VUGSPREAD_FLOOR_DONE.load(Ordering::Acquire) >= VUGSPREAD_FLOOR_N as u32
+        });
     }
-    busy_delay_ms(60);
-    let mask = VUGSPREAD_FLOOR_MASK.load(Ordering::Relaxed);
-    let used = mask.count_ones() as usize;
     if used >= 2 {
         serial_println!(
-            ":: VUGSPREAD: floor test — tasks={} cores-used={} depth=1 :: PASS ::",
-            VUGSPREAD_FLOOR_N, used
+            ":: VUGSPREAD: floor test — tasks={} cores-used={} depth=1 tries={} :: PASS ::",
+            VUGSPREAD_FLOOR_N, used, tries
         );
     } else {
         serial_println!(
-            ":: VUGSPREAD: floor test — tasks={} cores-used={} depth=1 :: FAIL ::",
-            VUGSPREAD_FLOOR_N, used
+            ":: VUGSPREAD: floor test — tasks={} cores-used={} depth=1 tries={} :: FAIL ::",
+            VUGSPREAD_FLOOR_N, used, tries
         );
     }
 }

@@ -2392,6 +2392,44 @@ floor that reads `cores-used=1` on every boot, not occasionally — the leg is a
 gives: the only site that emits it on raspi4b runs before any EL0 task exists. The numbers that matter
 are metal.)
 
+**FLAKEHUNT — the leg asserted the move but measured the sibling's host timeslice (`exec-flakehunt`,
+off `5d7ff0c8`).** The claim above is right and the staging is right; the *observation* was not. Both
+ends of the window were blind wall-clock guesses, and one of them was three milliseconds wide: the
+leg slept 2 ms assuming `home` had picked the first task up, and the worker spun 5 ms, so the state
+the corrector must SEE — `home` running task one with exactly one ready behind it — existed for the
+~3 ms remainder. A sibling can only convict inside that remainder, and only while its own vCPU is on
+a host CPU. `busy_delay_ms` is CNTPCT, which under QEMU advances with the HOST clock whether or not
+the guest core is executing, so on a loaded host that 3 ms could pass with an idle sibling running no
+instructions at all — `cores-used=1`, and a FAIL that convicted the host's run queue rather than this
+kernel's. Two independent Pi seats measured it at roughly **one red in four runs** of an otherwise
+117/117 suite.
+
+The repair changes neither the staging nor the pass condition (still "the pair ran on >= 2 distinct
+cores", still reachable only through `try_steal` at victim depth 1). It changes how the leg *looks*:
+
+1. **The second spawn is gated on an observation, not a delay.** Task two is queued only once task
+   one has been seen running. A lone ready task at depth 1 on an idle victim is below
+   `STEAL_MIN_DEPTH` under *both* floors, so a set bit can only mean `home` dispatched it. This
+   strictly **sharpens** the A/B the blind 2 ms could lose in the other direction — a `home` that had
+   not yet dispatched left the queue at depth 2 with the victim idle, which the pre-arc constant
+   floor also cleared, so a stubbed build could have gone green by being slow.
+2. **The window is ~25 ms, not ~3 ms** (the worker's spin *is* the window).
+3. **The attempt is retried up to 4 times, and the count is published as `tries=`.** A retry cannot
+   manufacture a pass: the pre-arc floor declines identically on every attempt.
+
+Line shape, `tries=` inserted after `depth=1` and keyed by the spec's REQUIRE so it cannot silently
+disappear:
+
+```
+:: VUGSPREAD: floor test — tasks=2 cores-used=2 depth=1 tries=1 :: PASS ::
+```
+
+**Go-red proven by stubbing**, not asserted: with `try_steal`'s two `steal_floor(running)` calls
+replaced by the pre-arc constant `STEAL_MIN_DEPTH`, the retried leg reports
+`cores-used=1 depth=1 tries=4 :: FAIL` — all four attempts refused — and reds both the REQUIRE and
+the FORBID (116/117 required, 2 forbidden hits). On metal a `tries=` that starts climbing is itself a
+spread reading this leg would otherwise have reported as a clean PASS.
+
 ### SPREADTUNE — the brake was measuring the wrong clock (aarch64, `exec-spreadtune`)
 
 `exec-spreadtune`, off `180375ec`. The tune the §6.8f ruling called for, taken on the mechanism
