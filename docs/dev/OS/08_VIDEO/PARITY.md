@@ -1759,6 +1759,105 @@ Two residues named honestly rather than averaged away:
    particular argument is worth checking on metal. Flipping the default is a bench decision.
 3. **`[wc-h]`'s `win=1` AT-RISK population** (residue 1 above) wants a bench reading.
 
+### 6.13 The `exec-wchun` arc — the bench reading §6.12 asked for, and what it says about both FORBIDs
+
+Investigation arc against `~/unaos-bench/capture/pi4-pi1-b1/ttyACM0.log` (three boot windows: an
+earlier-session boot here called **PA44**, then **boot 7** and **boot 8** from the later session).
+It answers §6.12's residue 1 and owed item 3, and it prices the `AT-RISK` FORBID against metal.
+
+#### The `-> UNSTAGED` flood is ONE WINDOW, in ONE BOOT — not a spec artifact and not a compositor regression
+
+`[wc-h] … -> UNSTAGED` fires **663 times in PA44 and zero times in boot 7 and boot 8**, and all 663
+are the same window:
+
+| boot | `wc-h` lines | rollups | `-> UNSTAGED` | `-> AT-RISK` | windows declining |
+|---|---|---|---|---|---|
+| PA44 | 2584 | 2561 | **663** (all `win=6`) | 921 | `win=6` only |
+| boot 7 | 1639 | 1616 | **0** | 264 | none |
+| boot 8 | 52 | 30 | **0** | 0 | none |
+
+Boot 7 is a fair control, not a short one: 1616 rollups against PA44's 2561, over a comparable soak.
+So the condition is **real, sustained, and window-scoped**, not a replay artifact of a QEMU-shaped
+spec — the FORBID assumes no fixture cadence the desktop lacks, it simply reports what PA44 did.
+
+`win=6` in PA44 is a *second* 288x288 tile minted at `(17,85)` (`[wc-a] create win=6 asid=0x1
+surf=288x288 … z=23`), stacked over the `win=4` tile already at that exact spot. Boots 7 and 8 mint
+their second tile onto an existing id instead, and neither declines at all. Its decline census is
+**bursty, not steady** — long plateaus punctuated by jumps — and it never tears:
+
+```
+emit=1   age_ms=99       declines=0    whole=4
+emit=61  age_ms=124335   declines=391  whole=7380
+emit=181 age_ms=368661   declines=424  whole=19515     <- 120 emits, +10 declines
+emit=241 age_ms=491341   declines=1126 whole=24531     <- +702 in 60
+emit=661 age_ms=1348782  declines=3281 whole=62107
+```
+
+~5% of that window's composites took the direct path, with `torn=0` throughout. **The verdict is
+correct and the diagnosis was impossible**, which is the finding that mattered: `declines=` is
+unbudgeted, but a decline's *reason* was only ever written on the per-sample
+`[wc-h] win=N staged=no reason=… -> DIRECT` line, and that line spends the same 4-sample budget the
+staged presents spend. `win=6` burned its four on the three `-> BUFFERED` composites of its first
+paint, so the entire capture contains **one** `reason=` line (`win=1 … reason=fixture`) and not one
+for any of the 3281 declines. This is exactly the flaw `H_BTAKEN` already documents about banded
+presents — *an instrument whose budget is spent by the control can never see the treatment*.
+
+**Fix taken (in lane, `wcg.rs`):** an unbudgeted per-reason decline census, printed as an INSERTION
+directly after the `declines=` total it decomposes —
+`declines=N decl_geom=N decl_cap=N decl_lock=N decl_alloc=N`. No verdict, precedence or existing key
+moves. A repeat of PA44 now names which of the four exits of `stage_window` the fallback took, and
+the four are four different faults: a permanent `DECL_CAP` and a bursty `DECL_LOCK` read identically
+today. **No spec change** — the `-> UNSTAGED` FORBID is right and the capture is genuinely red.
+
+#### The `presspread` metal baseline, and the `AT-RISK` FORBID's price
+
+§6.12's residue 1 guessed that `win=1`'s AT-RISK flood was "the console window finally having a
+population to report". **The population half is confirmed; the FORBID half is refuted.** Boot 8's
+real window, per busy window:
+
+| win | box / role | presents (`whole=`) | `minpresent_us` | `maxpresent_us` | `presspread=` | verdict |
+|---|---|---|---|---|---|---|
+| 1 | 1305x780 console | 108 (+5 banded) | 78 | 3245 | 1 → 2 → 4 → **5** | TEAR-FREE |
+| 2 | 1162x764 app | 111 | 16 | 2832 | 1 → **181** | TEAR-FREE |
+| 3 | 1290x164 strip | 106 | 525 | 672 | **1** | TEAR-FREE |
+| 4 | 288x288 tile (busiest) | 471 (+1 banded) | 14 | 1529 | 5 → **6** | TEAR-FREE |
+| 5 | 64x64 tile | 32 | 40 | 174 | 1 → **2** | TEAR-FREE |
+| 6 | 8x8 sprite | 4 | 47 | 60 | **1** | TEAR-FREE |
+
+Across all three boots the two populations are cleanly separated, and **not where the FORBID sits**:
+
+* **Healthy (`TEAR-FREE`) metal spreads: 1, 2, 3, 4, 5, 6, 7** — plus one outlier at **181**
+  (boot 8 `win=2`, a cold first present at 2832 µs beside warm ones at 16 µs). Boot 7 sustains
+  `presspread=7` on 241 healthy rollups.
+* **`AT-RISK` metal spreads: 32, 33, 84, 136 — and nothing else.** Every one carries a huge
+  `maxpresent_us` beside a normal floor: `win=1 maxpresent_us=77636 minpresent_us=294 presspread=32`,
+  `win=2 maxpresent_us=218876 minpresent_us=2594 presspread=84`, boot 7's
+  `win=4 maxpresent_us=75715 minpresent_us=13 presspread=136`.
+
+Boot 7's `win=4` shows the transition inside one boot and one window: `presspread=7 … -> TEAR-FREE`
+at `whole≈500–1000`, then `presspread=136 … -> AT-RISK` from `whole=1320` on, as a single 75 ms
+outlier lands. There is **no intermediate** — a stall on this machine is either absent or enormous.
+
+Two conclusions:
+
+1. **`FORBID \[wc-h\] .*presspread=[0-9] .*-> AT-RISK` has ZERO REACH on metal, and it is not
+   mispriced — it is untested.** It convicts the single-digit (uniformly-slow) class, and no metal
+   window has ever produced a uniform-slow tear: all 921 + 264 metal AT-RISK lines are two- or
+   three-digit. It correctly stays silent on this capture (the replay's forbidden hits are 663
+   `UNSTAGED` + 9 others, and not one `presspread`). **Leave it exactly as it is** — it is an
+   absence-shaped assertion, and its silence here is a pass, not a gap. The single-digit flood
+   §6.12 saw is a **QEMU** shape: a uniformly slow vCPU compresses the spread into the convicted
+   class, which is why the *more consistent* post-fix compositor scored *more* hits.
+2. **rmbp's `STALL_SPREAD=8` is well-placed but changes what the spec asserts.** 8 falls in the empty
+   gap between metal's healthy ceiling (7) and its AT-RISK floor (32), so it separates the two
+   populations cleanly and will not misfire on a healthy window — the observed margin is one unit on
+   the healthy side (boot 7 sustains 7) and 24 on the other, so **8 is the lowest defensible value,
+   not a comfortable one; anywhere in 8–32 is supported by this baseline.** But it would suppress
+   **100% of the AT-RISK verdicts this hardware has ever produced**, leaving the pi4 spec with no
+   live tear assertion on metal at all. That is arguably correct — a 218 ms present is a scheduling
+   stall, not a copy losing to the beam — but it must be taken as a deliberate trade with a
+   replacement assertion beside it, not as a quiet threshold tweak.
+
 ---
 
 ## 7. Accounting check

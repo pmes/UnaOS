@@ -427,6 +427,36 @@ static H_MAXRATE: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 /// Per-id: composites that did NOT reach the back layer and ran on the direct (pre-WC-H) path — the
 /// tearing regime. Excludes the deliberate fixture decline, which is counted separately.
 static H_DECLINE: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+/// WCHUN — per-id, per-reason: the same declines [`H_DECLINE`] totals, split by WHICH exit of
+/// [`stage_window`](super::wm) produced them. Indexed by the reason constant itself, so slot 0
+/// ([`KIND_STAGED`]) is permanently unused and no mapping table has to be kept in step.
+///
+/// **Why the lumped counter was not enough.** `declines=` is unbudgeted and survives the whole boot,
+/// but the only place a decline's REASON was ever written down is the per-sample
+/// `[wc-h] win=N staged=no reason=… -> DIRECT` line — and that line spends [`H_TAKEN`], the same
+/// four-sample budget the staged presents spend. The budget is therefore gone before the interesting
+/// declines arrive, for precisely the reason [`H_BTAKEN`] documents about banded presents: *an
+/// instrument whose budget is spent by the control can never see the treatment*. Window creation and
+/// first paint stage successfully, burn the budget, and every decline afterwards is counted and
+/// anonymous.
+///
+/// The `pi4-pi1-b1` capture is the case that named this. Its first boot window carries 663
+/// `-> UNSTAGED` rollups, all one window, `declines=` climbing 10 → 3281 against `whole=62388`
+/// presents — a real, sustained, ~5% fallback into the tearing path — and the boot prints not one
+/// `reason=` line for any of them, because that window's four samples went to the three
+/// `-> BUFFERED` composites of its first paint. The verdict was reachable and the diagnosis was not.
+///
+/// The four reasons are four different faults and want different answers: [`DECL_GEOM`] is a
+/// degenerate box, [`DECL_CAP`] a box no band can fit (unreachable at any panel this kernel
+/// addresses), [`DECL_LOCK`] a core re-entering its own stage entry, [`DECL_ALLOC`] a heap that will
+/// not grow. Lumping them makes a permanent cap fallback and a bursty reentrancy read identically.
+///
+/// Unbudgeted, like [`H_DECLINE`] and for the same reason: the count is what outlives the trace.
+static H_DECLBY: [[AtomicU32; DECL_KINDS]; IDS] =
+    [const { [const { AtomicU32::new(0) }; DECL_KINDS] }; IDS];
+/// One past the largest reason constant [`stage_decline`] can be handed, so [`H_DECLBY`] can be
+/// indexed by the constant directly.
+const DECL_KINDS: usize = DECL_ROUTE as usize + 1;
 /// Per-id: declines the KERNEL asked for, to keep the fallback path covered ([`DECL_FIXTURE`]).
 static H_FIXTURE: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// Per-id: a recorded-but-not-yet-printed sample. See [`stage_flush`] for why the print is deferred.
@@ -494,22 +524,29 @@ pub fn stage_decline(id: u32, reason: u32) {
         return;
     }
     mark_seen(i);
+    // The CENSUS is taken first and unconditionally — before the budget is even read — because it is
+    // the half that has to survive the budget. Both branches below used to carry their own copy of
+    // this pair; hoisting it above the gate is what makes "unbudgeted" a property of the code shape
+    // rather than of two call sites agreeing.
+    if reason == DECL_FIXTURE {
+        H_FIXTURE[i].fetch_add(1, Ordering::Relaxed);
+    } else {
+        H_DECLINE[i].fetch_add(1, Ordering::Relaxed);
+    }
+    // WCHUN — and the reason census beside it, on the same terms. Guarded rather than assumed: the
+    // reason arrives from another module, and an out-of-range one must lose its breakdown, not panic
+    // on the present path. `declines=` still counts it, so the total can never disagree with the
+    // verdict; only the split would be short, and `[wc-h]`'s own `?` name for an unknown reason has
+    // the same standing.
+    if (reason as usize) < DECL_KINDS {
+        H_DECLBY[i][reason as usize].fetch_add(1, Ordering::Relaxed);
+    }
     let n = H_TAKEN[i].fetch_add(1, Ordering::Relaxed) + 1;
     if n > SAMPLES {
         H_TAKEN[i].store(SAMPLES + 1, Ordering::Relaxed);
         // Past budget the LINE stops but the count must not: an unstaged composite is the thing the
         // verdict is about, and a boot that starts declining after sample 4 has to remain visible.
-        if reason == DECL_FIXTURE {
-            H_FIXTURE[i].fetch_add(1, Ordering::Relaxed);
-        } else {
-            H_DECLINE[i].fetch_add(1, Ordering::Relaxed);
-        }
         return;
-    }
-    if reason == DECL_FIXTURE {
-        H_FIXTURE[i].fetch_add(1, Ordering::Relaxed);
-    } else {
-        H_DECLINE[i].fetch_add(1, Ordering::Relaxed);
     }
     H_KIND[i].store(reason, Ordering::Relaxed);
     H_PEND[i].store(n, Ordering::Release);
@@ -1131,6 +1168,18 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
     let lo = H_MINRATE[i].load(Ordering::Relaxed);
     let presspread =
         if lo == u64::MAX { 0 } else { H_MAXRATE[i].load(Ordering::Relaxed) / lo.max(1) };
+    // WCHUN — the decline census, split by reason. Printed unconditionally, including the all-zero
+    // case: a reader who has to tell "no declines" from "the field is missing on this build" cannot,
+    // and a boot whose `declines=` is 0 is exactly the boot whose breakdown proves the counter is
+    // wired. Four fixed keys rather than a variable list, for the same reason `minspan_bytes=` is
+    // always present beside `minspan=` — the line's shape must not depend on its values.
+    //
+    // `fixture` is deliberately NOT among them: it has carried its own top-level key since WC-H and
+    // is excluded from `declines=`, so repeating it here would file one count under two names.
+    // `route` is likewise absent — `stage_decline` cannot be handed it (only `erase_defer` carries
+    // `DECL_ROUTE`, and that reports through `[wc-k]`), so a key for it would be a permanent zero
+    // asserting nothing.
+    let declby = |r: u32| H_DECLBY[i][r as usize].load(Ordering::Relaxed);
     // KEY ORDER IS LOAD-BEARING ACROSS SEATS. `win=`, `scope=`, `declines=` and the terminal
     // `-> {verdict}` are matched in this order by the pi4 track's regression spec, which also relies
     // on `scope=window ` carrying a TRAILING SPACE so its pattern cannot match `scope=window-band`.
@@ -1139,9 +1188,11 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
     // keys. Nothing is renamed, nothing is reordered, and the terminal stays terminal. The two new
     // keys go INSIDE the `pop=all-presents` run, beside `maxpresent_us=` whose population they share;
     // putting them after `pop=constant` would have filed two measurements under the marker that means
-    // "compile-time constant".
+    // "compile-time constant". WCHUN's `decl_geom=`/`decl_cap=`/`decl_lock=`/`decl_alloc=` follow the
+    // same rule for the same reason: an INSERTION, and it goes directly after the `declines=` total it
+    // decomposes, inside `pop=all-presents` because it shares that population exactly.
     serial_println!(
-        "[wc-h] rollup win={} scope={} emit={} age_ms={} pop=budgeted samples={} budget={} pop=all-presents torn={} declines={} fixture={} whole={} banded={} lines={} minspan={} minspan_bytes={} maxpresent_us={} minpresent_us={} presspread={} pop=constant frame_us={} -> {}",
+        "[wc-h] rollup win={} scope={} emit={} age_ms={} pop=budgeted samples={} budget={} pop=all-presents torn={} declines={} decl_geom={} decl_cap={} decl_lock={} decl_alloc={} fixture={} whole={} banded={} lines={} minspan={} minspan_bytes={} maxpresent_us={} minpresent_us={} presspread={} pop=constant frame_us={} -> {}",
         id,
         scope,
         emit,
@@ -1150,6 +1201,10 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
         SAMPLES,
         torn_n,
         decl_n,
+        declby(DECL_GEOM),
+        declby(DECL_CAP),
+        declby(DECL_LOCK),
+        declby(DECL_ALLOC),
         H_FIXTURE[i].load(Ordering::Relaxed),
         H_WHOLE[i].load(Ordering::Relaxed),
         H_BANDED[i].load(Ordering::Relaxed),
