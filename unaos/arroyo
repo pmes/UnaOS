@@ -732,7 +732,26 @@ _feats=""
 [ -n "${UNAOS_NETTEST:-}" ] && _feats="${_feats}nettest,genet,"
 if [ -n "$_feats" ]; then
     KERNEL_FEATURES="--features ${_feats%,}"
-    echo -e "${COLOR_YELLOW}⚡ kernel features: ${_feats%,}${COLOR_RESET}"
+    # TOOLFIX/BANNER: this map drives the x86/virt cargo invocations ONLY. The Pi bare-metal builds
+    # compile from `kernel8()`'s CURATED $K8_FEATS — a SEPARATE list that deliberately does not draw
+    # from `$_feats` — so printing this line on a kernel8-family command stated the wrong build twice
+    # over: it OMITTED every armed Pi feature (`UNAOS_PIDESK=1 UNAOS_QUARRY=1 ./arroyo kernel8`
+    # printed a banner with neither name on it, and a run with no other knob set printed the default
+    # x86 list `ehcihid,kbdwit,sdhcblk,smolnet` — none of which is in the image), and it ADVERTISED
+    # features the image does not contain (`UNAOS_WC=1 ./arroyo kernel8` printed `...,wc`, but `wc`
+    # is not in K8_FEATS and no `wc` byte reaches kernel8.img).
+    #
+    # That is not cosmetic. CLAUDE.md's full-knob rule reads this exact string to decide whether a gate
+    # really armed the knob it claims, and on the Pi path the banner could be satisfied FALSELY — a run
+    # could show `wc` while building an image without one `wc` byte in it — and could equally fail to
+    # show a feature that WAS armed (`pidesk`, `quarry`, the whole v3d ladder). So the banner is
+    # suppressed for the kernel8 family here and `kernel8()` emits the real one, with the identical
+    # prefix, from the list it actually hands cargo. Every other command's banner is unchanged, and
+    # $KERNEL_FEATURES itself is set exactly as before on every path, so no build changes.
+    case "${1:-}" in
+        kernel8|baremetal|kernel8-run|run-pi|kernel8-test|test-pi|kernel8-install|install-pi) ;;
+        *) echo -e "${COLOR_YELLOW}⚡ kernel features: ${_feats%,}${COLOR_RESET}" ;;
+    esac
 fi
 
 # SMOLNET-DEFAULT: `smolnet` is an x86-only feature — its optional smoltcp dep is x86-gated
@@ -1874,6 +1893,15 @@ check_both() {
     # are what the operator's own UNAOS_* knobs compile, and they are the fastest way to a diagnostic
     # for the edit that was just made. `_krc` carries a red leg past the userspace legs below, so a
     # green userspace can never mask a broken feature-gated kernel.
+    #
+    # TOOLFIX/BLOB: the `arm-pi` leg enables `baremetal`, which compiles
+    # `arch/aarch64/syscall.rs` — and that module `include_bytes!`s `target/user_blob.bin`. The gate
+    # therefore CONSUMES a build artifact that only the kernel8 path produces, so on a tree with an
+    # empty `unaos/target/` (fresh clone/worktree, or post-`./arroyo clean`) `arm-pi` went red on a
+    # missing file rather than on any source defect. Produce it here when it is absent so `check` is
+    # self-contained. Existence-only on purpose: a warm tree pays nothing and the artifact's mtime,
+    # which is the kernel crate's rebuild trigger, is never disturbed by a `check`.
+    [ -f "${WORKSPACE_DIR}/target/user_blob.bin" ] || build_user_blob
     local _krc=0
     check_kernel_cfg || _krc=1
 
@@ -2370,19 +2398,34 @@ build_user_vug_aarch64() {
     build_one_vug_aarch64 VUGX.ELF "pinhi"
 }
 
-kernel8() {
-    k8_lock_acquire
+# M6c: build the EL0 user program as a SEPARATE link product (out of the kernel's .text) and
+# objcopy it to a flat binary the kernel include_bytes!s (crates/kernel/src/arch/aarch64/
+# syscall.rs). Built for the SAME bare aarch64 target as the kernel, with its own tiny linker
+# script (crates/user-blob/user-blob.ld); the routine is position-independent (byte-granular `adr`
+# + an inline message), so it runs wherever the kernel copies it. This MUST run BEFORE the kernel
+# build: include_bytes! needs target/user_blob.bin to exist, and its (always-fresh) mtime is what
+# drives the kernel's rebuild when the routine changes. (build-std/target come from the crate's
+# own .cargo/config.toml; it is its own workspace, so no cargo invocation in this script builds the
+# crate as a side effect — it is built only where this function is called.)
+#
+# TOOLFIX/BLOB — WHY THIS IS A FUNCTION AND NOT AN INLINE BLOCK OF kernel8(). The comment that used
+# to sit here said "`./arroyo check`/`build` never touch it — the blob is validated only here at
+# kernel8-build time, not at `check`", and crates/kernel/src/arch/aarch64/syscall.rs says the same
+# ("`./arroyo check`/`build` — which do not build the blob — never need the file to exist"). BOTH
+# ARE FALSE, and the falsifier is in this script: `arch/aarch64/syscall.rs` is
+# `#[cfg(feature = "baremetal")]`, and KERNEL_CFG_MATRIX's `arm-pi` leg enables `baremetal`. So
+# `./arroyo check` compiles the module — and therefore its `include_bytes!` — while nothing on the
+# check path produces the file. On a tree whose `unaos/target/` is empty (a fresh clone, a fresh
+# worktree, or anything after `./arroyo clean`, which runs `cargo clean` and wipes it) the gate goes
+# red on a MISSING BUILD ARTIFACT rather than on any source defect:
+#     error: couldn't read `.../crates/kernel/../../target/user_blob.bin`: No such file or directory
+#     ❌ arm-pi — unaos-kernel FAILED to compile
+# `check_both` now calls this function when the artifact is absent, so `check` produces its own
+# input and is self-contained again. It stays a no-op on a warm tree (the guard is existence-only,
+# never a rebuild), so the artifact's mtime — which IS the kernel's rebuild trigger — is untouched
+# by `check` and only ever moved by the kernel8 path that genuinely rebuilds the routine.
+build_user_blob() {
     local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
-
-    # M6c: build the EL0 user program as a SEPARATE link product (out of the kernel's .text) and
-    # objcopy it to a flat binary the kernel include_bytes!s (crates/kernel/src/arch/aarch64/
-    # syscall.rs). Built for the SAME bare aarch64 target as the kernel, with its own tiny linker
-    # script (crates/user-blob/user-blob.ld); the routine is position-independent (byte-granular `adr`
-    # + an inline message), so it runs wherever the kernel copies it. This MUST run BEFORE the kernel
-    # build: include_bytes! needs target/user_blob.bin to exist, and its (always-fresh) mtime is what
-    # drives the kernel's rebuild when the routine changes. (build-std/target come from the crate's
-    # own .cargo/config.toml; it is its own workspace, so `./arroyo check`/`build` never touch it —
-    # the blob is validated only here at kernel8-build time, not at `check`.)
     echo -e "${COLOR_YELLOW}⚡ Building EL0 user blob (crates/user-blob → target/user_blob.bin)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-blob"
@@ -2403,6 +2446,16 @@ kernel8() {
         exit 1
     fi
     echo -e "${COLOR_GREEN}✅ EL0 user blob: $(wc -c < "${WORKSPACE_DIR}/target/user_blob.bin" | tr -d ' ') bytes${COLOR_RESET}"
+}
+
+kernel8() {
+    k8_lock_acquire
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+
+    # The hello blob, unconditionally (a kernel8 image must never carry a stale routine). The same
+    # `cargo build --release` this runs also links the other [[bin]]s of the crate, which the K2 and
+    # midden objcopies below consume — so it must stay ahead of them.
+    build_user_blob
 
     # K2 (make-enforcement-LIVE): the SAME `cargo build --release` above builds every [[bin]] in the
     # user-blob crate, so `owner-blob` + `imp-blob` are already linked (with user-blob.ld) alongside
@@ -3203,6 +3256,13 @@ kernel8() {
         K8_FEATS="${K8_FEATS},fatperf"
         echo -e "${COLOR_YELLOW}  • UNAOS_FATPERF: the FAT/VFS cost instrument ([fatperf] op=list|read path= sectors= us= — measurement only, no behaviour change)${COLOR_RESET}"
     fi
+    # TOOLFIX/BANNER: the Pi image's OWN feature banner, printed from the list this build is about to
+    # hand cargo — not from the x86/virt `$_feats` map at the top of the script, which is suppressed
+    # for the kernel8 family precisely so this line is the only `⚡ kernel features:` a Pi run emits.
+    # Same prefix as the x86 banner on purpose: CLAUDE.md's full-knob rule reads that string, and on a
+    # Pi run it must read a list that is true of kernel8.img. (`arm_features`' smolnet/kbdwit/sdw strip
+    # does not apply — K8_FEATS is curated and carries none of them.)
+    echo -e "${COLOR_YELLOW}⚡ kernel features: ${K8_FEATS}${COLOR_RESET}"
     echo -e "${COLOR_YELLOW}⚡ Building bare-metal kernel8.img (Pi 4, microSD-slot boot)...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/kernel/pi-baremetal.ld" \
