@@ -124,10 +124,22 @@ re-read stops racing the prober's teardown`). Fixture-only, x86
 
 ### 1b. SOCK-4 `cleared=false` — **watch**
 
-The transferable-socket fixture flaked **once** with a signature of the same
-family. It has no in-tree record (no commit, no doc entry, no spec note), so the
-observation below is a run report, not a tree-verified event; what *is*
-tree-verified is that its launcher has the structural shape the class describes.
+The transferable-socket fixture has flaked **three times**. The first
+observation was a run report with no in-tree record; the second (2026-08-19,
+an executor gate run at base `bcf56b68` under sibling-QEMU load:
+`serial.log:1029`, `killed=0 done=2`, clean on re-run) corroborates it. The
+third (2026-08-19, a `UNAOS_WIFIVAL=1` gate run at `26517e30` under
+sibling-QEMU load, `serial.log:1052`) is a **distinct variant**:
+`cleared=true kernel=false` — the teardown proof PASSED and
+`sock4_kernel_check()` itself returned false. An immediate re-run under the
+identical configuration passed clean, refuting a code-deterministic cause for
+that boot's delta (the wifi replay leg). The variant matters because it
+falsifies this entry's original "kernel=false carries no independent
+information" note for that case: with `cleared=true`, the false term is inside
+the kernel check's own resource acquisitions (`smolnet::init`,
+`proc_reserve`, `stack_open` — each returns false/None on transient
+exhaustion) or its `ok &=` chain, and the line does not say which. The flake
+is observed-recurring with two distinct failing terms.
 
 **Signature on the wire:**
 
@@ -141,7 +153,8 @@ proof came back false. `kernel=false` follows mechanically (`kernel_ok` is
 `cleared && sock4_kernel_check()`), so it carries no independent information —
 do not read it as a second failure.
 
-**Trigger conditions.** Host load, same as 1a. Observed once; clean on re-run.
+**Trigger conditions.** Host load, same as 1a. Observed twice, both under
+sibling-QEMU load; clean on re-run both times.
 
 **Root cause — SUSPECT, not established.** The SOCK-4 launcher's `all_clear`
 predicate (both handle rows clear, both inbox rows clear, the transfer-record
@@ -165,6 +178,12 @@ terms was false.
   `(grantee)` / `xfer_row_is_clear` ×2 / `xfer_recs_all_free()`. That single
   datum decides between "teardown still in flight" (the class) and "a record
   genuinely leaked" (a real defect).
+- **For the `cleared=true kernel=false` variant: which term inside
+  `sock4_kernel_check` failed.** The check returns one bool over ~a dozen
+  acquisitions and assertions; the recurrence capture needs a per-term
+  breakdown (the early-return resource acquisitions first — `smolnet::init`,
+  `proc_reserve` ×2, `stack_open`) before the variant can be classified as
+  transient exhaustion vs a real capability-path defect.
 - Whether a re-run at the same sha on an idle host is clean, and the host load
   at the time of the failure.
 
