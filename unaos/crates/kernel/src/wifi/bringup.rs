@@ -1360,6 +1360,51 @@ fn upload_gate(macctl: u32, w: &Writes) {
     upload_not_attempted(w);
 }
 
+/// WVAL-REPLAY — the census-ABSENT leg. Runs the set-completeness gate and [`validate_set`] and
+/// nothing else, then prints one terminal park line.
+///
+/// This is the whole of arc 2 that does not need a radio, and it is written as its OWN function
+/// rather than as a flag threaded through [`bringup_once`] for a reason a reviewer can check
+/// mechanically: there is no PCI config read, no `map_mmio_window`, no `r32`/`w32`, no [`Writes`]
+/// and no call to [`explore`] anywhere in this body, so "no device rung ran" is a property of the
+/// call graph rather than of a branch someone has to trust. The companion spec
+/// (`scripts/specs/x86-wifival.spec`) asserts the same fact from the other side, by FORBIDding the
+/// witness lines every device rung prints.
+///
+/// The caller ([`super::finish_and_park`]) routes here only when [`super::bus::census`] came up
+/// ABSENT, which on metal never happens — so this function is unreachable on the machine the radio
+/// is in, and `bringup_once` keeps that path byte-for-byte.
+#[cfg(feature = "wifival")]
+pub fn validate_replay() {
+    let staged = super::firmware::staged_count();
+    let want = super::firmware::FW_SET_LEN;
+
+    serial_println!(
+        ":: wifi: wifival REPLAY begin — the radio is ABSENT, so arc 2's device ladder (BAR0 map, cfg:0x80 window moves, EROM walk, core/wrapper reads, the enable rule) is NOT entered. What DOES run is the part that never needed silicon: the set-completeness gate and the full set-validation dry-run over the staged bytes ::"
+    );
+
+    // Gate 1, verbatim in intent with `upload_gate`'s: an incomplete set has nothing to validate,
+    // and the disagreement is the finding. No MACCTL here — reading it would be a device access,
+    // which is exactly what this leg does not do.
+    if staged != want {
+        serial_println!(
+            ":: wifi: wifival REPLAY set-validation SKIPPED reason=firmware-set-incomplete staged={}/{} — the media under this boot does not carry the full set, so there is nothing for the dry-run to walk ::",
+            staged, want
+        );
+        serial_println!(
+            ":: wifi: wifival REPLAY park verdict=INCOMPLETE staged={}/{} — set-completeness + set-validation dry-run only; NO PCI access, NO BAR map, NO window-selector move, NO core walk, NO device write was reachable on this leg ::",
+            staged, want
+        );
+        return;
+    }
+
+    let ok = validate_set();
+    serial_println!(
+        ":: wifi: wifival REPLAY park verdict={} staged={}/{} — set-completeness + set-validation dry-run only; NO PCI access, NO BAR map, NO window-selector move, NO core walk, NO device write was reachable on this leg. This verdict is the SAME computation arc 2's gate 2 makes on metal, from the same one `classify_header`; what it does NOT do is authorise anything ::",
+        if ok { "VALID" } else { "INVALID" }, staged, want
+    );
+}
+
 /// Gate 2 — WIFI-SETVAL: validate the COMPLETE staged set, dry-run, no device access. One line per
 /// role, one cross-set line, one verdict line. Returns whether arc 3's upload may ever consume this
 /// set.

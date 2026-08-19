@@ -249,6 +249,21 @@ fn main() {
     // that would not answer. Default OFF => module unlinked, media byte-identical to the arc-1 build.
     // Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_WIFI2").is_ok() { feats.push("wifi2"); }
+    // WVAL-REPLAY: UNAOS_WIFIVAL=1 arms the census-ABSENT REPLAY leg — the QEMU-reachable half of
+    // arc 2. QEMU models no BCM4331, so the census refuses at S_START and the module parks, which
+    // left the FAT search, the bounds checks, `classify_header`'s container verdict and arc 2's
+    // set-validation dry-run with exactly one gate: a bench round. Under this knob the ABSENT branch
+    // prints a REPLAY-armed witness, proceeds to the storage wait, stages the set off the media, and
+    // runs `bringup::validate_replay()` — the completeness gate, `validate_set()`, one park line, and
+    // no PCI access, no BAR map, no window-selector move and no core walk anywhere in its call graph.
+    // Implies `wifi2`. THIS list is what reaches the kernel binary for MEDIA builds — the builder
+    // re-derives the x86 feature set from ITS OWN env — so a knob wired into arroyo alone would ship
+    // the replay leg DISABLED while the `⚡ kernel features:` banner claims it is on (the s42/INSTGUI
+    // and WXN-M3b failure), and the failure mode here is the nastiest shape of it: the spec gate
+    // would go red on a kernel that never contained the code, and read as a classifier regression.
+    // Default OFF => the ABSENT branch parks exactly as before, media byte-identical. Kept in sync
+    // with arroyo's mapping.
+    if std::env::var("UNAOS_WIFIVAL").is_ok() { feats.push("wifival"); }
     // BT-L0 (GR21): UNAOS_BT=1 arms the first Bluetooth arc — "does the radio answer?". Lifts the
     // EHCI hub-walk depth cap 2 -> 3 to reach the HCI controller behind the FULL-SPEED Broadcom hub
     // `0a5c:4500`, and — in the SAME change, because either alone is wrong — fixes the

@@ -149,6 +149,27 @@ const S_PARKED: u8 = 3;
 static STATE: AtomicU8 = AtomicU8::new(S_START);
 static DEFER_ANNOUNCED: AtomicBool = AtomicBool::new(false);
 
+// ── WVAL-REPLAY: the census-ABSENT leg, and why it exists. ────────────────────────────────────────
+//
+// Everything this subsystem does BEFORE a device is touched is byte-level work on files: the FAT
+// search, the bounds checks, `classify_header`'s container verdict, and arc 2's `validate_set()`
+// dry-run over the whole staged set. None of it needs a radio. But the state machine's first rung is
+// the census, and QEMU models no BCM4331 — so on every QEMU boot the census refuses, `S_PARKED` is
+// stored, and not one line of that byte-level work runs. The classifier that WCLS-RECORD just taught
+// the record framing to therefore had exactly one gate: a bench round on the rMBP.
+//
+// `wifival` gives it a second. On the ABSENT branch the module records the fact in `CENSUS_ABSENT`,
+// says so out loud, and proceeds to `S_WAIT_STORAGE` — the staging pass then runs against the FAT
+// volume as it always would, and the terminal `finish_and_park` routes to `bringup::validate_replay()`
+// instead of `bringup::bringup_once()`.
+//
+// The routing is on the RECORDED census outcome, not on the feature: with the radio PRESENT this
+// latch is false and `finish_and_park` calls `bringup_once()` exactly as it does today, so an image
+// built with `wifival` behaves identically on metal. A knob that quietly re-routed the metal path
+// would be a worse instrument than the absence it is fixing.
+#[cfg(feature = "wifival")]
+static CENSUS_ABSENT: AtomicBool = AtomicBool::new(false);
+
 // ── WIFI-REARM: the wait, made visible and re-armable. ─────────────────────────────────────────────
 //
 // Boot D's capture is the whole motivation and it is worth quoting the shape rather than the lines:
@@ -264,6 +285,18 @@ pub fn service() {
             if bus::census() {
                 STATE.store(S_WAIT_STORAGE, Ordering::Relaxed);
             } else {
+                #[cfg(feature = "wifival")]
+                {
+                    // WVAL-REPLAY. The census has already printed its own honest refusal line above;
+                    // this one names what happens INSTEAD of the park, so a capture can never show a
+                    // replay boot that reads like a metal boot.
+                    CENSUS_ABSENT.store(true, Ordering::Relaxed);
+                    serial_println!(
+                        ":: wifi: census=ABSENT — wifival REPLAY armed: staging + set-validation dry-run proceed, NO device rung will run ::"
+                    );
+                    STATE.store(S_WAIT_STORAGE, Ordering::Relaxed);
+                }
+                #[cfg(not(feature = "wifival"))]
                 STATE.store(S_PARKED, Ordering::Relaxed);
             }
         }
@@ -464,7 +497,18 @@ fn alt_heartbeat(now: u64) {
 /// still moving. `Pending` in particular is why the pre-WIFI-REACH code could run arc 2 on a
 /// starved count an epoch before the stick — holding it in `S_WAIT_ALT` is the fix. Arc 2 therefore
 /// runs at most once per boot, and never on a moving count.
+///
+/// WVAL-REPLAY adds ONE branch here and it is taken only when the census came up ABSENT — a state
+/// arc 2 could never be reached from before, because that census outcome used to park immediately.
+/// On that branch arc 2's device rungs are not merely skipped, they are not called at all: the
+/// replay leg is a different function with no PCI, MMIO or window-selector access anywhere in it.
 fn finish_and_park() {
+    #[cfg(feature = "wifival")]
+    if CENSUS_ABSENT.load(Ordering::Relaxed) {
+        bringup::validate_replay();
+        STATE.store(S_PARKED, Ordering::Relaxed);
+        return;
+    }
     #[cfg(feature = "wifi2")]
     bringup::bringup_once();
     STATE.store(S_PARKED, Ordering::Relaxed);

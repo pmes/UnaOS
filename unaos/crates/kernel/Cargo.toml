@@ -329,6 +329,23 @@ wifi = []
 # Enable via `UNAOS_WIFI2=1`. Kept in sync with arroyo and builder/src/main.rs. See
 # docs/dev/OS/06_NETWORK_STACK/wifi_bcma.md.
 wifi2 = ["wifi"]
+# WVAL-REPLAY: a QEMU-REACHABLE leg for the set-validation dry-run. QEMU models no BCM4331, so
+# `wifi::service()`'s census refuses at `S_START` and parks — which means the firmware staging pass
+# and arc 2's `validate_set()` dry-run (pure byte-level work on the staged images: container-header
+# classification, the per-role layout rules, the initvals record walk) have never been exercised
+# anywhere but on metal, and a regression in the classifier could only be caught by a bench round.
+# Under `wifival` a census that comes up ABSENT prints a REPLAY-armed witness and proceeds to the
+# storage wait instead of parking, and the terminal `finish_and_park` runs `bringup::validate_replay()`
+# — the set-completeness gate + `validate_set()` + one park line, and NOTHING else. That leg makes no
+# PCI config access, maps no BAR, moves no window selector and walks no core table; arc 2's device
+# rungs are not reachable from it, which is what the companion spec's FORBIDs assert.
+# IMPLIES `wifi2` (it calls into `bringup.rs` and reads the same staged-header accessors arc 2 gates
+# on). On the census-SUCCESS path — the metal path — this feature changes NOTHING: the ABSENT branch
+# is the only place it is consulted, so a radio-present boot runs `bringup_once()` exactly as before.
+# x86_64-only and stripped by arroyo's arm_features. Default OFF => byte-identical media. Enable via
+# `UNAOS_WIFIVAL=1`. Kept in sync with arroyo and builder/src/main.rs. See
+# docs/dev/OS/06_NETWORK_STACK/wifi_bcma.md.
+wifival = ["wifi2"]
 # VPERF video-path bench instrumentation (x86_64 only — the module is additionally target-gated,
 # so aarch64 artifacts are byte-identical with this on or off): scroll/VRAM-read/put_pixel
 # counters + serial-only cadence lines, the effective framebuffer memory-type readout (MTRR +

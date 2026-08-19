@@ -441,6 +441,24 @@ _feats=""
 # both would put a duplicate `wifi` in the comma list on a `UNAOS_WIFI=1 UNAOS_WIFI2=1` build, which
 # is the shape the arm_features strip below rewrites textually.
 [ -n "${UNAOS_WIFI2:-}" ] && _feats="${_feats}wifi2,"
+# WVAL-REPLAY: UNAOS_WIFIVAL=1 arms the census-ABSENT REPLAY leg — the QEMU-reachable half of arc 2.
+# QEMU models no BCM4331, so the census refuses at S_START and the module parks, and everything
+# downstream of it — the FAT search, the bounds checks, `classify_header`'s container verdict and
+# arc 2's full set-validation dry-run — has never run anywhere but on the bench rMBP. With this knob
+# the ABSENT branch prints a REPLAY-armed witness, proceeds to the storage wait, stages the set off
+# the media as usual, and then runs `bringup::validate_replay()`: the set-completeness gate,
+# `validate_set()`, and one park line. That function makes NO PCI config access, maps no BAR, moves
+# no window selector and walks no core table — arc 2's device rungs are not in its call graph at all,
+# which is what scripts/specs/x86-wifival.spec's FORBIDs assert from the capture side. Routing is on
+# the RECORDED census outcome, not on the feature: with the radio PRESENT the latch is false and
+# `finish_and_park` runs `bringup_once()` exactly as today, so a wifival image on metal behaves
+# byte-identically to a wifi2 one. IMPLIES `wifi2` (and through it `wifi`). x86_64-only and stripped
+# by arm_features below. Default OFF => byte-identical media. Kept in sync with builder/src/main.rs.
+# Pushed ALONE for the same reason `wifi2` is, one rung further along: the Cargo implication pulls
+# `wifi2` and `wifi` in, and pushing them too would put duplicates in the comma list on a
+# `UNAOS_WIFI2=1 UNAOS_WIFIVAL=1` build — the shape the arm_features strip below rewrites textually.
+# See docs/dev/OS/06_NETWORK_STACK/wifi_bcma.md.
+[ -n "${UNAOS_WIFIVAL:-}" ] && _feats="${_feats}wifival,"
 # VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
 [ -n "${UNAOS_VIDEOCAP:-}" ] && _feats="${_feats}videocap,"
 
@@ -752,6 +770,16 @@ arm_features() {
     # does not contain `,wifi,` as a substring (the trailing comma is part of the pattern), so the
     # `wifi` strip above cannot half-rewrite it and the two lines are order-independent.
     f="${f//,wifi2,/,}"
+    # WVAL-REPLAY rides the same strip, for the same reason and as a consequence of the same fact:
+    # `wifival` implies `wifi2`, whose only code is the x86-gated `src/wifi/`, and `validate_replay`
+    # is a sibling function inside `bringup.rs` under that same gate — so `wifival` emits not one
+    # byte of aarch64 CODE. An enabled feature is still hashed into cargo's `-Cmetadata` fingerprint,
+    # so leaving it in (or its implied `wifi2`/`wifi`, both stripped above) would shift every
+    # Pi/Jetson media hash between a default build and a `UNAOS_WIFIVAL=1` one for zero observable
+    # change. Order-independent with the two strips above by the same argument they make about each
+    # other: `,wifival,` does not contain `,wifi,` or `,wifi2,` as a substring, because the trailing
+    # comma is part of every pattern.
+    f="${f//,wifival,/,}"
     # BT-L0 (GR21) rides the same strip, for the same reason and by the same mechanism as `kbdwit`
     # above: every line `bt` gates lives in `drivers/ehci/mod.rs`, which is declared
     # `#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]`, so `bt` emits not one byte of
@@ -1545,7 +1573,7 @@ KERNEL_CFG_MATRIX=(
   # way, which is the build the metal flight actually carries.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,wifival"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder. Cannot carry the tegra family — see the mutual-exclusion note above.
