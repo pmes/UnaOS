@@ -154,3 +154,7 @@ FORBID :: WXN-FBWC: .*-> SKIPPED ::
 REQUIRE :: TSTE: fatverb\.readvol -> PASS ::
 REQUIRE :: TSTE: fatverb\.writegate -> PASS ::
 REQUIRE :: \[fatverb\] storage witness: exec=[a-z-]+ read=[a-z-]+ gate=[a-z-]+ waited=[0-9]+ms handles=global=(present|absent) sdhc=(present|absent|unbuilt) ::
+# SOCK-4 (added 2026-08-19): the transferable-sockets fixture flaked 6x visible only by eye —
+# the spec never gated it (FIXTURE_FLAKES.md §1b). The gen-rebind fence fix (53c630eb) closed
+# the slot_reused variant; this REQUIRE makes any recurrence a red gate, not a scrollback find.
+REQUIRE :: SOCK-4: transferable sockets — grantee received \+ round-tripped the moved socket, grantor's migrated-away handle -EACCES, gen-rebind rejected, teardown clean -> PASS ::
