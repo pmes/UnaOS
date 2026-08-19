@@ -623,6 +623,15 @@ xcarve_crcrq = ["tegra"]
 # the layout correlation. With this feature OFF (default) the pad vanishes and the tegra image is
 # byte-identical to baseline. Enable via `UNAOS_XCARVE_RELINK=1 UNAOS_TEGRA=1 ./arroyo esp-jetson`.
 xcarve_relink = ["tegra"]
+# XUSBFW (jetson bench): the Tegra234 XUSB Falcon firmware-RELOAD scaffold
+# (arch/aarch64/xusb_tegra.rs::xusbfw). Design + guarded entry point only — NOT a working reload
+# (the signed NVGI firmware container is bench-only and never in-tree, so the IMEM/DMEM byte layout
+# is unknown and the scaffold STOPs, witnessed, at the load boundary). Build-time firmware injection
+# is via build.rs + UNAOS_XUSB_FW_PATH: the blob is `include_bytes!`d from an absolute extern path
+# ONLY when this feature AND that path are set, so the default build and all media are byte-identical
+# and blob-free by construction. Implies `tegra`. Enable via UNAOS_XUSBFW=1. See
+# ~/.claude/plans/unaos/review/xusb-fw-reload-DESIGN.md and arch_arm64.md §XUSBFW.
+xusbfw = ["tegra"]
 
 # ORIN-NET-1: the `UNAOS_PCIEPROBE=1` read-only PCIe root-complex + NIC recon census
 # (arch/aarch64/pcie_probe.rs), wired into `tegra_early_stop` (the metal Orin census) AND the virt

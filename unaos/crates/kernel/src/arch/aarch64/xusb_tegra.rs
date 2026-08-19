@@ -1166,6 +1166,154 @@ pub fn jbxc_crcrq_quiesce(cap0: u32, our_cmd_ring: u64) {
     );
 }
 
+// ---------------------------------------------------------------------------------------------
+// XUSBFW: the Tegra234 XUSB Falcon firmware-RELOAD scaffold (feature `xusbfw`, UNAOS_XUSBFW=1).
+//
+// This is a DESIGN SCAFFOLD, not a working reload. The signed NVGI firmware container is bench-only
+// and never enters the tree, so the IMEM/DMEM byte layout is unknown (see the design note) and this
+// path STOPs, witnessed, at the load boundary rather than streaming bytes it cannot place. Every
+// law's guard is wired even though the destructive steps are stubbed:
+//   * BAR2 CSB ONLY — the FPCI/CFG CSB aperture (FPCI+0x41c/+0x800) is EL3-FATAL (JB7); never here.
+//   * JB9d-GUARD reconciliation — a Falcon whose CSB reads all-ones cannot be halted/loaded via the
+//     CSB (JB6: writes don't stick). Reload's STEP 0 (a host-side BPMP MRQ_RESET, out-of-CSB) must
+//     clear that FIRST; this scaffold reuses jb6_csb_sweep's page-select-STICKS test as the gate and
+//     emits a witnessed SKIP — the guard's own honest-SKIP philosophy — if the aperture won't answer.
+//   * NEVER write CRCR at RS=1 — the scaffold touches no xHCI operational register at all.
+//   * Announce every new MMIO class before the first touch (JX1 discipline).
+//   * Mutually exclusive with the JB9G_NO_HCRST inherit recipe (STEP 0 wipes inherited state — the
+//     whole point). Enforced at RUNTIME here so the scaffold compiles; ARMING the real reset requires
+//     BOTH `JB9G_NO_HCRST = false` AND upgrading this to a compile-time assert (the JB4/JB5 pattern).
+//
+// See ~/.claude/plans/unaos/review/xusb-fw-reload-DESIGN.md.
+// ---------------------------------------------------------------------------------------------
+#[cfg(feature = "xusbfw")]
+pub mod xusbfw {
+    use super::{cntpct, jb9_bar2_routed, JB9G_NO_HCRST, XUSB_BAR2};
+
+    // Build-time firmware injection: `pub const XUSB_FW: Option<&[u8]>`. Emitted by
+    // crates/kernel/build.rs — `Some(include_bytes!("<abs path>"))` ONLY when UNAOS_XUSB_FW_PATH is
+    // set (read directly from the bunker, never copied into the tree), else `None`. The default
+    // build never reaches this module at all (feature off), so it is blob-free by construction.
+    include!(concat!(env!("OUT_DIR"), "/xusb_fw.rs"));
+
+    /// The signed NVIDIA container magic ('NVGI') — the one byte-level fact we assert on the blob.
+    /// The container is nested (NVGI -> RFFS -> RFRD -> ... -> tegra_xusb_fw_header + IMEM/DMEM) and
+    /// its internal segment layout is NOT reverse-engineered (design note §4) — read-only only.
+    const NVGI_MAGIC: [u8; 4] = *b"NVGI";
+
+    /// One witnessed outcome per reload attempt. The scaffold can only ever reach `LoadUnresolved`
+    /// (the honest STOP) or one of the earlier skips — never a real start — until the container
+    /// layout is resolved and STEP 0 (the BPMP Falcon reset) is implemented.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum ReloadOutcome {
+        /// Feature on but UNAOS_XUSB_FW_PATH unset — build.rs emitted `None`. Witnessed no-op.
+        NoFirmware,
+        /// The blob is present but not an NVGI container — refuse to touch the Falcon.
+        BadContainer,
+        /// The inherit recipe (JB9G_NO_HCRST) is armed; reload would fight it. Runtime mutual-excl.
+        InheritActive,
+        /// The BAR2 CSB aperture won't answer (all-ones / page-select won't stick). Guard-aligned
+        /// SKIP — STEP 0 (out-of-CSB Falcon reset) is required first and is not yet implemented.
+        CsbSilent,
+        /// Reached the IMEM/DMEM load boundary: container layout unresolved, so we STOP here rather
+        /// than stream bytes we cannot place. This is the scaffold's terminal state by design.
+        LoadUnresolved,
+    }
+
+    /// Does the BAR2 CSB page-select register (ARU_C11_CSBRANGE @0x9c) accept + read back a write?
+    /// This is the exact STICKS test jb6_csb_sweep runs — the discriminator between "the aperture
+    /// answers" and "the block reads all-ones / writes don't land". Strictly the same non-destructive
+    /// page-select write jb3_falcon already performs (no resets, no power/clock changes).
+    fn csb_page_select_sticks() -> bool {
+        let r = |off: u64| unsafe { core::ptr::read_volatile((XUSB_BAR2 + off) as *const u32) };
+        let w = |off: u64, v: u32| unsafe {
+            core::ptr::write_volatile((XUSB_BAR2 + off) as *mut u32, v)
+        };
+        let pre = r(0x9c);
+        w(0x9c, 0x1234);
+        let rb = r(0x9c);
+        w(0x9c, pre); // restore
+        rb == 0x1234
+    }
+
+    /// The reload entry point, wired at the top of `jb2b_attach` (before the takeover decision).
+    /// SCAFFOLD: performs every guard it can without threading new args, then STOPs witnessed at the
+    /// load boundary. Returns the outcome so the caller can (in a future armed build) branch to the
+    /// clean reset-path init instead of the no-HCRST inherit takeover.
+    pub fn reload_entry(cap0: u32) -> ReloadOutcome {
+        // 1. Witnessed no-op when no firmware path was supplied at build time (build.rs -> None).
+        let Some(fw) = XUSB_FW else {
+            serial_println!("XUSBFW: no firmware path set — reload skipped");
+            return ReloadOutcome::NoFirmware;
+        };
+
+        // 2. Cheap container sanity: the signed NVGI magic. We do NOT parse the container further
+        //    (design note §4: the NVGI/RFFS/RFRD layout is deliberately NOT reverse-engineered).
+        if fw.len() < 4 || fw[0..4] != NVGI_MAGIC {
+            serial_println!(
+                "XUSBFW: firmware present ({} B) but not an NVGI container (magic={:#04x}{:02x}{:02x}{:02x}) — refusing to touch the Falcon",
+                fw.len(),
+                fw.first().copied().unwrap_or(0),
+                fw.get(1).copied().unwrap_or(0),
+                fw.get(2).copied().unwrap_or(0),
+                fw.get(3).copied().unwrap_or(0),
+            );
+            return ReloadOutcome::BadContainer;
+        }
+        serial_println!(
+            "XUSBFW: NVGI firmware container present ({} B) — reload scaffold engaged (cap0={:#010x})",
+            fw.len(),
+            cap0
+        );
+
+        // 3. Mutual exclusion with the inherit recipe. STEP 0 of a real reload RESETS the Falcon and
+        //    wipes the inherited controller state that JB9G_NO_HCRST exists to preserve — the two can
+        //    never run on one boot. Enforced at RUNTIME so this scaffold compiles; ARMING the real
+        //    reset requires setting JB9G_NO_HCRST=false AND upgrading this to a compile-time
+        //    `const _: () = assert!(!(cfg!(feature="xusbfw") && JB9G_NO_HCRST));` (the JB4/JB5 class).
+        if JB9G_NO_HCRST {
+            serial_println!(
+                "XUSBFW: JB9G_NO_HCRST is armed — a Falcon reset would wipe the inherited state the \
+                 no-HCRST recipe preserves; reload is mutually exclusive with inherit and is SKIPPED \
+                 (set JB9G_NO_HCRST=false to arm reload — design note §5)"
+            );
+            return ReloadOutcome::InheritActive;
+        }
+
+        // 4. JB9d-GUARD reconciliation. Before ANY CSB write, prove the aperture answers. On the
+        //    inherited-halted block CPUCTL reads all-ones and JB6 proved even the 0x9c page-select
+        //    won't stick — a firmware stream into that aperture is a poke into a dead block, the exact
+        //    class JB9d-GUARD forbids. STEP 0 (a host-side BPMP MRQ_RESET of the Falcon/host reset id,
+        //    NEVER padctl) must clear the all-ones state from OUTSIDE the CSB first — that reset, and
+        //    the MRQ_PG GET_STATE partition-on proof it must be preceded by (bpmp_tegra::jb5_pg_on
+        //    style), are NOT implemented in this scaffold (they need the bpmp channel threaded in).
+        if !jb9_bar2_routed() {
+            serial_println!("XUSBFW: BAR2 unrouted — cannot reach the CSB; reload SKIPPED (guard)");
+            return ReloadOutcome::CsbSilent;
+        }
+        if !csb_page_select_sticks() {
+            serial_println!(
+                "XUSBFW: CSB page-select won't stick (Falcon all-ones / not answering) — reload SKIPPED. \
+                 A host-side BPMP Falcon reset (STEP 0, out-of-CSB) is required first and is not yet \
+                 implemented (JB9d-GUARD-aligned; design note §3)"
+            );
+            return ReloadOutcome::CsbSilent;
+        }
+
+        // 5. The load boundary. With the CSB answering we COULD now halt the Falcon (CPUCTL.HALT),
+        //    stream IMEM/DMEM, set BOOTVEC and STARTCPU (design note §1). But the NVGI container's
+        //    IMEM/DMEM segment offsets/sizes and boot vector are unknown (NOT reverse-engineered),
+        //    so we STOP here rather than stream bytes we cannot place. This is the scaffold's
+        //    terminal state — the declared reason the path is not end-to-end in-tree.
+        let _ = cntpct; // (bounded-wait helper the armed start()-poll will use)
+        serial_println!(
+            "XUSBFW: CSB answers — at the IMEM/DMEM load boundary. Container layout unresolved \
+             (NVGI/RFFS/RFRD not reverse-engineered); STOP before streaming firmware (design note §4)"
+        );
+        ReloadOutcome::LoadUnresolved
+    }
+}
+
 /// `jb9_smmu` = (NISO1 SMMU instance bases, XUSB SID) — threaded in by the caller so the JB9-B
 /// forensic captures below can dump the stream binding at enable-slot-pending time.
 pub fn jb2b_attach(
@@ -1196,6 +1344,14 @@ pub fn jb2b_attach(
         ":: tegra: JB2b — attaching the shared xHCI driver @{:#x} (platform, polled, no PCIe) ::",
         XUSB_HOST
     );
+
+    // XUSBFW: the Falcon firmware-RELOAD scaffold, run BEFORE the takeover decision (a reload
+    // replaces the inherit path — design note §2). SCAFFOLD: witnesses its guards and STOPs at the
+    // load boundary; it performs nothing destructive, so it is safe to wire ahead of the inherit
+    // takeover. Knob-off (`xusbfw` feature absent) this call + the whole module vanish
+    // (byte-identical, blob-free — build.rs emits no firmware bytes without the feature+path).
+    #[cfg(feature = "xusbfw")]
+    let _ = xusbfw::reload_entry(cap0);
 
     // JETSON-XCARVE M2: snapshot every inherited xHCI pointer BEFORE the no-HCRST takeover below
     // reprograms DCBAAP/CRCR/ERST — the diagnosis probe for the carveout wall (fault ADDR

@@ -600,6 +600,18 @@ _feats=""
 # The `xcarve_relink` feature implies `tegra`. Default OFF => the pad vanishes, byte-identical to
 # baseline.
 [ -n "${UNAOS_XCARVE_RELINK:-}" ] && _feats="${_feats}xcarve_relink,tegra,"
+# XUSBFW: UNAOS_XUSBFW=1 arms the Tegra234 XUSB Falcon firmware-RELOAD scaffold
+# (arch/aarch64/xusb_tegra.rs::xusbfw), a guarded design entry point run at the top of jb2b_attach
+# (before the inherit takeover). The `xusbfw` feature implies `tegra`. Default OFF => the module +
+# call site vanish, byte-identical to baseline. The firmware blob is bench-only and NEVER in-tree:
+# it is embedded ONLY when UNAOS_XUSB_FW_PATH points at an absolute extern path (the bunker blob),
+# read directly by crates/kernel/build.rs via include_bytes! — no copy is ever staged into the tree
+# or target/, and a knob-off (or path-unset) build is blob-free by construction. With the path unset
+# the scaffold witnesses a no-op ("XUSBFW: no firmware path set — reload skipped"). See
+# ~/.claude/plans/unaos/review/xusb-fw-reload-DESIGN.md.
+[ -n "${UNAOS_XUSBFW:-}" ] && _feats="${_feats}xusbfw,tegra,"
+[ -n "${UNAOS_XUSBFW:-}" ] && [ -n "${UNAOS_XUSB_FW_PATH:-}" ] && \
+  echo -e "${COLOR_YELLOW}⚡ XUSBFW firmware embed: ${UNAOS_XUSB_FW_PATH} (bench-only, never staged to media)${COLOR_RESET}"
 # ORIN-NET-1: UNAOS_PCIEPROBE=1 arms the read-only PCIe root-complex + NIC recon census
 # (arch/aarch64/pcie_probe.rs). Standalone feature (does NOT imply tegra, mirroring smpprobe) so the
 # census runs on BOTH the metal tegra path (combine with UNAOS_TEGRA=1) and the QEMU virt GICv3 path
