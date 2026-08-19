@@ -19145,18 +19145,36 @@ fn sock4_build(entry_sym: *const u8) -> Option<U7xFix> {
 ///      the NEW generation — B's old handle (old gen) stays `-EACCES`, provably no rebind to the new tenant.
 ///   6. LEDGER HYGIENE: after dropping every planted handle/Proc entry, the handle rows, inboxes, transfer
 ///      records AND the derivation ledger are all fully clear.
+///
+/// FLAKE INSTRUMENT (class 1b, `cleared=true kernel=false`): `step` is an out-parameter naming the FIRST
+/// term that read false — every early-return acquisition individually, and for the `ok &=` chain the tag
+/// captured at its first failure. It is written on every path and read only on the launcher's FAIL path;
+/// the check's semantics are unchanged (each term is still evaluated exactly as before, in the same order).
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-fn sock4_kernel_check() -> bool {
+fn sock4_kernel_check(step: &mut &'static str) -> bool {
     const A: usize = 5; // scratch grantor row
     const B: usize = 6; // scratch grantee row
     const PIDB: u64 = 0xE4; // planted grantee pid (never collides: PROCS holds only planted entries now)
     let mut ok = true;
+    *step = "none";
+
+    // Latch the FIRST false term. `cond` is computed by the caller exactly as the old `ok &= <expr>` did, so
+    // every side effect still happens, in the same order — this records, it does not gate.
+    #[inline(always)]
+    fn note(ok: &mut bool, step: &mut &'static str, cond: bool, tag: &'static str) {
+        if !cond && *ok {
+            *step = tag;
+        }
+        *ok &= cond;
+    }
 
     if !crate::smolnet::init() {
+        *step = "smolnet_init";
         return false; // no NIC / stack — the demo already skipped, so this never runs then
     }
     // Plant B's Proc entry (the pid->slot map `sys_xfer` resolves through; `proc_reserve` marks it RUNNING).
     let Some(pb) = proc_reserve() else {
+        *step = "proc_reserve_b";
         return false;
     };
     PROCS[pb].slot.store(B + 1, Ordering::Release); // +1-biased, like sys_spawn's pid->slot map
@@ -19165,6 +19183,7 @@ fn sock4_kernel_check() -> bool {
     // 1. A mints a UDP socket owned by row A, carrying the full CAP_READ|CAP_WRITE|CAP_GRANT (the sys_socket
     //    mint), and holds a Child handle naming B for the transfer.
     let Some(sid) = crate::smolnet::stack_open(A) else {
+        *step = "stack_open";
         proc_free(pb);
         return false;
     };
@@ -19172,18 +19191,33 @@ fn sock4_kernel_check() -> bool {
     let val = ((gen0 as u64) << 32) | ((sid as u64) + 1); // the sock_id_pack value word
     install_cap(A, 2, KIND_SOCKET, val, CAP_READ | CAP_WRITE | CAP_GRANT);
     install_cap(A, 3, KIND_CHILD, PIDB, CAP_READ);
-    ok &= socket_id_of(A, 2, CAP_WRITE) == Ok(sid); // A owns + resolves its socket
+    note(
+        &mut ok,
+        step,
+        socket_id_of(A, 2, CAP_WRITE) == Ok(sid),
+        "a_resolves",
+    ); // A owns + resolves its socket
 
     // 2. Transfer to B (attenuate to CAP_READ|CAP_WRITE); B RECVs -> ownership migrates to B.
     let t = sys_xfer_from(A, 3, 2, (CAP_READ | CAP_WRITE) as u64);
-    ok &= t > 0;
+    note(&mut ok, step, t > 0, "xfer_a_to_b");
     let hb = sys_recv_for(B);
-    ok &= hb >= 0;
+    note(&mut ok, step, hb >= 0, "recv_b");
 
     // 3. THE MOVED CAP WORKS: B resolves the socket now (owner-matched under B after migration).
-    ok &= hb >= 0 && socket_id_of(B, hb as u64, CAP_WRITE) == Ok(sid);
+    note(
+        &mut ok,
+        step,
+        hb >= 0 && socket_id_of(B, hb as u64, CAP_WRITE) == Ok(sid),
+        "b_resolves_moved",
+    );
     // 4. A's original handle is DEAD: its owner is now B, so the cross-row handle is -EACCES.
-    ok &= socket_id_of(A, 2, CAP_WRITE) == Err(EACCES);
+    note(
+        &mut ok,
+        step,
+        socket_id_of(A, 2, CAP_WRITE) == Err(EACCES),
+        "a_stale_eacces",
+    );
 
     // 4b. THE STEAL FENCE (review fix): A's handle still carries CAP_GRANT (rights are handle-local), so a
     //     SECOND deposit — to C — lands; but `xfer_socket_migrate` at C's RECV demands the sender still OWN
@@ -19192,6 +19226,7 @@ fn sock4_kernel_check() -> bool {
     const C: usize = 7; // scratch second-grantee row (< USER_SLOTS; clear like A/B — see the doc comment)
     const PIDC: u64 = 0xE5; // planted second-grantee pid (same never-collides argument as PIDB)
     let Some(pc) = proc_reserve() else {
+        *step = "proc_reserve_c";
         if hb >= 0 {
             handle_clear(B, hb as usize);
         }
@@ -19205,11 +19240,21 @@ fn sock4_kernel_check() -> bool {
     PROCS[pc].pid.store(PIDC, Ordering::Release);
     install_cap(A, 4, KIND_CHILD, PIDC, CAP_READ);
     let t2 = sys_xfer_from(A, 4, 2, (CAP_READ | CAP_WRITE) as u64);
-    ok &= t2 > 0; // the deposit lands — sys_xfer's checks are handle-level by design
+    note(&mut ok, step, t2 > 0, "xfer_a_to_c"); // the deposit lands — sys_xfer's checks are handle-level
     let hc = sys_recv_for(C);
-    ok &= hc >= 0; // the cap is delivered ...
-    ok &= hc >= 0 && socket_id_of(C, hc as u64, CAP_WRITE) == Err(EACCES); // ... but DEAD: migration refused
-    ok &= hb >= 0 && socket_id_of(B, hb as u64, CAP_WRITE) == Ok(sid); // B undisturbed — still the owner
+    note(&mut ok, step, hc >= 0, "recv_c"); // the cap is delivered ...
+    note(
+        &mut ok,
+        step,
+        hc >= 0 && socket_id_of(C, hc as u64, CAP_WRITE) == Err(EACCES),
+        "c_dead_steal_fence",
+    ); // ... but DEAD: migration refused
+    note(
+        &mut ok,
+        step,
+        hb >= 0 && socket_id_of(B, hb as u64, CAP_WRITE) == Ok(sid),
+        "b_undisturbed",
+    ); // B undisturbed — still the owner
     if hc >= 0 {
         handle_clear(C, hc as usize); // frees the second transfer's record + node before the gen-fence step
     }
@@ -19220,9 +19265,20 @@ fn sock4_kernel_check() -> bool {
     //    slot at the NEW gen. B's old handle carries (sid, gen0), so it must stay -EACCES against BOTH the
     //    freed slot and the new tenant — no rebind (the U11x fd discipline, socket edition).
     crate::smolnet::stack_close(sid);
-    ok &= crate::smolnet::sock_gen(sid) != gen0; // the generation advanced on free
-    ok &= hb >= 0 && socket_id_of(B, hb as u64, CAP_WRITE) == Err(EACCES); // stale against the freed slot
+    note(
+        &mut ok,
+        step,
+        crate::smolnet::sock_gen(sid) != gen0,
+        "gen_advanced",
+    ); // the generation advanced on free
+    note(
+        &mut ok,
+        step,
+        hb >= 0 && socket_id_of(B, hb as u64, CAP_WRITE) == Err(EACCES),
+        "b_stale_vs_freed",
+    ); // stale against the freed slot
     let Some(sid2) = crate::smolnet::stack_open(A) else {
+        *step = "stack_open_reuse";
         // cleanup on the unlikely alloc failure, then fail
         if hb >= 0 {
             handle_clear(B, hb as usize);
@@ -19232,8 +19288,13 @@ fn sock4_kernel_check() -> bool {
         proc_free(pb);
         return false;
     };
-    ok &= sid2 == sid; // first-fit reused the freed slot — the rebind hazard is now live
-    ok &= hb >= 0 && socket_id_of(B, hb as u64, CAP_WRITE) == Err(EACCES); // still -EACCES vs the NEW tenant
+    note(&mut ok, step, sid2 == sid, "slot_reused"); // first-fit reused the slot — rebind hazard is live
+    note(
+        &mut ok,
+        step,
+        hb >= 0 && socket_id_of(B, hb as u64, CAP_WRITE) == Err(EACCES),
+        "b_stale_vs_new_tenant",
+    ); // still -EACCES vs the NEW tenant
     crate::smolnet::stack_close(sid2);
 
     // 6. Drop everything planted, then demand every ledger fully clear (no record/node/slot leaked).
@@ -19243,9 +19304,24 @@ fn sock4_kernel_check() -> bool {
     handle_clear(A, 2); // drops the transfer source's derivation root node
     handle_clear(A, 3);
     proc_free(pb);
-    ok &= handle_row_is_clear(A) && handle_row_is_clear(B) && handle_row_is_clear(C);
-    ok &= xfer_row_is_clear(A) && xfer_row_is_clear(B) && xfer_row_is_clear(C);
-    ok &= xfer_recs_all_free() && deriv_all_free();
+    note(
+        &mut ok,
+        step,
+        handle_row_is_clear(A) && handle_row_is_clear(B) && handle_row_is_clear(C),
+        "handle_rows_clear",
+    );
+    note(
+        &mut ok,
+        step,
+        xfer_row_is_clear(A) && xfer_row_is_clear(B) && xfer_row_is_clear(C),
+        "xfer_rows_clear",
+    );
+    note(
+        &mut ok,
+        step,
+        xfer_recs_all_free() && deriv_all_free(),
+        "ledgers_free",
+    );
     ok
 }
 
@@ -19376,11 +19452,20 @@ fn sock4_launcher(demo_cpu: usize) {
     while !all_clear(grantor.slot, grantee.slot) && crate::arch::ticks() < tdeadline {
         crate::arch::sched::yield_now();
     }
-    let cleared = all_clear(grantor.slot, grantee.slot);
+    // FLAKE INSTRUMENT (class 1b): take the five terms individually at the same instant, so a FAIL can name
+    // WHICH one read false. Every term is a pure read, so splitting the `&&` chain changes no behaviour —
+    // `cleared` is the identical conjunction the closure computes.
+    let tc_gh = handle_row_is_clear(grantor.slot);
+    let tc_eh = handle_row_is_clear(grantee.slot);
+    let tc_gx = xfer_row_is_clear(grantor.slot);
+    let tc_ex = xfer_row_is_clear(grantee.slot);
+    let tc_rf = xfer_recs_all_free();
+    let cleared = tc_gh && tc_eh && tc_gx && tc_ex && tc_rf;
     proc_free(pi); // the planted pid->slot entry (the fixtures exited by name, never through the Proc path)
 
     // 5c. The M1 kernel-side gen-rebind proof (needs the drained ledgers the wait above establishes).
-    let kernel_ok = cleared && sock4_kernel_check();
+    let mut kstep: &'static str = "not-run"; // stays "not-run" when `cleared` short-circuits the check away
+    let kernel_ok = cleared && sock4_kernel_check(&mut kstep);
 
     if gw == SOCK4_GRANTOR_WITNESS_ALL
         && ew == SOCK4_GRANTEE_WITNESS_ALL
@@ -19406,6 +19491,17 @@ fn sock4_launcher(demo_cpu: usize) {
             SOCK4_DONE.load(Ordering::Acquire),
             SOCK4_GRANTOR_WITNESS_ALL,
             SOCK4_GRANTEE_WITNESS_ALL
+        );
+        // FLAKE INSTRUMENT (FIXTURE_FLAKES.md class 1b) — failure path ONLY, adjacent to the FAIL line the
+        // specs match on: which all_clear term read false, and which sock4_kernel_check step failed.
+        serial_println!(
+            ":: SOCK-4 BREAKDOWN: all_clear grantor_row={} grantee_row={} xfer_grantor={} xfer_grantee={} recs_free={} | kernel_check step={} ::",
+            tc_gh,
+            tc_eh,
+            tc_gx,
+            tc_ex,
+            tc_rf,
+            kstep
         );
     }
 }

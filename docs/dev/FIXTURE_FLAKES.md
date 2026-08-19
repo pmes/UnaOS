@@ -122,76 +122,121 @@ re-read stops racing the prober's teardown`). Fixture-only, x86
 `arch/x86_64/syscall.rs`; no spec change (tokens unchanged). A recurrence of the
 `entry=recheck` fingerprint after this sha is a **new** defect, not this one.
 
-### 1b. SOCK-4 `cleared=false` — **watch**
+### 1b. SOCK-4 `cleared=false` / `kernel=false` — **instrumented; variant 2 mechanism IDENTIFIED**
 
-The transferable-socket fixture has flaked **three times**. The first
-observation was a run report with no in-tree record; the second (2026-08-19,
-an executor gate run at base `bcf56b68` under sibling-QEMU load:
-`serial.log:1029`, `killed=0 done=2`, clean on re-run) corroborates it. The
-third (2026-08-19, a `UNAOS_WIFIVAL=1` gate run at `26517e30` under
-sibling-QEMU load, `serial.log:1052`) is a **distinct variant**:
-`cleared=true kernel=false` — the teardown proof PASSED and
-`sock4_kernel_check()` itself returned false. An immediate re-run under the
-identical configuration passed clean, refuting a code-deterministic cause for
-that boot's delta (the wifi replay leg). The variant matters because it
-falsifies this entry's original "kernel=false carries no independent
-information" note for that case: with `cleared=true`, the false term is inside
-the kernel check's own resource acquisitions (`smolnet::init`,
-`proc_reserve`, `stack_open` — each returns false/None on transient
-exhaustion) or its `ok &=` chain, and the line does not say which. The flake
-is observed-recurring with two distinct failing terms.
+The transferable-socket fixture has flaked **five times**, in two variants.
+
+| # | When / where | Variant | Note |
+| --- | --- | --- | --- |
+| 1 | run report, no in-tree record | `cleared=false` | uncorroborated |
+| 2 | 2026-08-19, executor gate at base `bcf56b68`, sibling-QEMU load, `serial.log:1029` | `cleared=false` | `killed=0 done=2`, clean on re-run |
+| 3 | 2026-08-19, `UNAOS_WIFIVAL=1` gate at `26517e30`, sibling-QEMU load, `serial.log:1052` | `cleared=true kernel=false` | clean on an immediate re-run under the identical config |
+| 4 | 2026-08-19, tip-battery run at `f4bd5a73`'s integration, `serial.log:1053` | `cleared=true kernel=false` | clean on re-run |
+| 5 | the instrumenting arc's own first gate run, `exec/rmbp-s4` base `f4bd5a73` (host clock 2026-08-18), `serial.log:1054` | `cleared=true kernel=false` | **caught by the new breakdown line on its first flight** — see below |
+
+Variant 2 (`cleared=true kernel=false`) is the majority: 3 of the 5 sightings,
+and now all of the last three. It matters because it falsifies this entry's
+original "`kernel=false` carries no independent information" note: that note
+holds only when `cleared` is *false* (the `&&` short-circuits the check away).
+With `cleared=true` the check really ran and really returned false.
 
 **Signature on the wire:**
 
 ```
-:: SOCK-4: transferable sockets FAIL — grantor=… grantee=… used=… snap=… cleared=false kernel=false killed=0 done=2 (want …/…/1/true/true/true/0/2) ::
+:: SOCK-4: transferable sockets FAIL — grantor=… grantee=… used=… snap=… cleared=… kernel=false killed=0 done=2 (want …/…/1/true/true/true/0/2) ::
+:: SOCK-4 BREAKDOWN: all_clear grantor_row=… grantee_row=… xfer_grantor=… xfer_grantee=… recs_free=… | kernel_check step=… ::
 ```
 
-The tell is **`cleared=false` with `killed=0` and `done=2`**: both fixtures ran to
-their witness exits and nothing was fault-killed, yet the launcher's teardown
-proof came back false. `kernel=false` follows mechanically (`kernel_ok` is
-`cleared && sock4_kernel_check()`), so it carries no independent information —
-do not read it as a second failure.
+The tell for either variant is **`killed=0` with `done=2`**: both fixtures ran to
+their witness exits and nothing was fault-killed, yet a proof came back false.
 
-**Trigger conditions.** Host load, same as 1a. Observed twice, both under
-sibling-QEMU load; clean on re-run both times.
+**The recurrence ask is now ARMED IN-TREE.** The `BREAKDOWN` line above prints
+on the FAIL path only (the PASS line and the FAIL line are both byte-identical
+to before — this is an instrument, not new chatter) and answers, without a
+one-off run, the two questions this entry used to have to ask a future
+investigator for:
 
-**Root cause — SUSPECT, not established.** The SOCK-4 launcher's `all_clear`
-predicate (both handle rows clear, both inbox rows clear, the transfer-record
-ledger fully free) is exactly a ground-truth re-read of state that the two
-fixtures' synchronous exits retire. It is **partially** mitigated relative to
-pre-fix DMG-REFUSE — it is a bounded *poll* rather than a single read, so it
-tolerates ordinary teardown latency — but the bound is **2000 ms** and there is no
-park/release handshake fencing the observation. Under a lost quantum that bound
-is a margin, not a guarantee. This is a plausible mechanism, not a confirmed one:
-nobody has reproduced it under load or instrumented which of the four `all_clear`
-terms was false.
+- the five `all_clear` terms individually — `grantor_row` / `grantee_row` /
+  `xfer_grantor` / `xfer_grantee` / `recs_free`, all sampled at the same instant
+  the launcher computes `cleared`;
+- `kernel_check step=<tag>` — the FIRST term inside `sock4_kernel_check` that
+  read false. The early-return acquisitions are named individually
+  (`smolnet_init`, `proc_reserve_b`, `stack_open`, `proc_reserve_c`,
+  `stack_open_reuse`); the `ok &=` chain latches a tag at its first failure
+  (`a_resolves`, `xfer_a_to_b`, `recv_b`, `b_resolves_moved`, `a_stale_eacces`,
+  `xfer_a_to_c`, `recv_c`, `c_dead_steal_fence`, `b_undisturbed`,
+  `gen_advanced`, `b_stale_vs_freed`, `slot_reused`, `b_stale_vs_new_tenant`,
+  `handle_rows_clear`, `xfer_rows_clear`, `ledgers_free`). `step=not-run` means
+  `cleared` was false and the check never ran — i.e. variant 1.
+
+**Root cause, variant 2 (`cleared=true kernel=false`) — IDENTIFIED at sighting 5.**
+The false term is **`slot_reused`**: step 5 of `sock4_kernel_check` closes the
+socket, reopens, and asserts `sid2 == sid` to stage the gen-rebind fence on a
+*first-fit-reused* slot. That assertion is not a kernel invariant — it is an
+assumption about the state of the **global** `smolnet` `reg` table. `stack_open`
+takes `reg.iter().position(|s| s.is_none())`, so the reopen returns `sid` only
+if no slot *below* `sid` is free at that moment. Any other socket in the kernel
+closing inside that window frees a lower slot and the reopen first-fits into it
+instead. Sighting 5's log shows exactly that neighbour: the SMOLNET DNS
+resolver leg — which does `stack_open` / bind / sendto / recvfrom /
+`stack_close` on the same `reg` table — printed its completion at
+`serial.log:1053`, between SOCK-4's banner (1051) and its verdict (1054). That
+is why the flake is load-dependent (host load moves the DNS leg's completion
+into or out of the window) and why re-runs are clean. Nothing in the capability
+path is wrong: the fence is simply not staged, and the check reports that as a
+failure indistinguishable from a real one.
+
+**Root cause, variant 1 (`cleared=false`) — SUSPECT, unchanged.** The launcher's
+`all_clear` predicate (both handle rows clear, both inbox rows clear, the
+transfer-record ledger fully free) is a ground-truth re-read of state that the
+two fixtures' synchronous exits retire. It is **partially** mitigated relative to
+pre-fix DMG-REFUSE — a bounded *poll*, not a single read — but the bound is
+**2000 ms** with no park/release handshake fencing the observation. Under a lost
+quantum that bound is a margin, not a guarantee. Still not reproduced under
+instrumentation; the `BREAKDOWN` line will name the term when it recurs.
+
+**Which early-return acquisition could plausibly fail — reasoning, not measurement.**
+Read-only review of the three (`smolnet::init`, `proc_reserve` ×2,
+`stack_open`) says none is a strong candidate for a load-induced transient, and
+that this reasoning is now superseded for variant 2 by the measurement above.
+`smolnet::init` is idempotent and has already succeeded by the time SOCK-4 runs
+(SOCK-2/3/5 printed their PASS lines above it), so a false there would mean the
+NIC went away mid-boot. `proc_reserve` runs after the launcher has `proc_free`d
+its own planted entry and after every demo fixture has exited — the PULSE-W line
+immediately above the SOCK-4 banner reports the Proc census back at `10/10`
+free — so slot exhaustion would need ~ten concurrent live processes that this
+boot does not have. `stack_open` is the one with a genuinely shared, contended
+resource (the `NSOCK` `reg` table, which the DNS leg and the SOCK-6/7 persistent
+listeners also draw from), so *if* an early return ever fires it is the one to
+suspect — but exhaustion returns `None`, whereas the observed contention on that
+same table manifests as the far cheaper `slot_reused` mismatch. Treat
+`smolnet_init` / `proc_reserve_*` on the wire as evidence of a **real** defect,
+not of this class.
 
 **What to capture on recurrence.**
 
-- The full FAIL line, and specifically whether `killed` is `0` (if non-zero, a
-  fixture was fault-killed and this is a real SOCK-4 bug, **not** the class).
-- `done` — it must read `2`. A lower value means a fixture never reached its
-  witness exit; that is a different failure.
-- **Which `all_clear` term was false.** The line does not break it out, so this
-  needs a one-off instrumented run splitting `handle_row_is_clear(grantor)` /
-  `(grantee)` / `xfer_row_is_clear` ×2 / `xfer_recs_all_free()`. That single
-  datum decides between "teardown still in flight" (the class) and "a record
-  genuinely leaked" (a real defect).
-- **For the `cleared=true kernel=false` variant: which term inside
-  `sock4_kernel_check` failed.** The check returns one bool over ~a dozen
-  acquisitions and assertions; the recurrence capture needs a per-term
-  breakdown (the early-return resource acquisitions first — `smolnet::init`,
-  `proc_reserve` ×2, `stack_open`) before the variant can be classified as
-  transient exhaustion vs a real capability-path defect.
+- Both lines — the FAIL line and the `BREAKDOWN` line beneath it.
+- `killed` must be `0` (non-zero = a fixture was fault-killed = a real SOCK-4
+  bug, **not** the class) and `done` must be `2` (lower = a fixture never
+  reached its witness exit = a different failure).
+- `step=slot_reused` with all five `all_clear` terms `true` = the identified
+  variant-2 mechanism above; check the surrounding lines for a neighbouring
+  socket close (the `:: SMOLNET: [dns] … ::` line is the known one).
+- Any `step` value **other** than `slot_reused` or `not-run` is new information —
+  it has never been observed, and the capability-path tags
+  (`b_resolves_moved`, `a_stale_eacces`, `c_dead_steal_fence`,
+  `b_stale_vs_*`) would each be a genuine defect, not a flake.
 - Whether a re-run at the same sha on an idle host is clean, and the host load
   at the time of the failure.
 
-**Disposition — WATCH.** One observation, mechanism unconfirmed. If it recurs,
-the fix shape is known and already proven in-tree: give the fixtures a
-`SWEPT`-and-park handshake in the DMG-REFUSE idiom so the launcher's re-read
-happens inside a window where the state is provably live, instead of racing a
-2000 ms deadline.
+**Disposition — WATCH, instrumented.** Variant 2's mechanism is identified but
+**not fixed**: fixing it means changing `sock4_kernel_check`'s staging (making
+the gen-rebind fence robust to a non-reusing reopen, or fencing the reopen
+against concurrent `reg` traffic) — fixture logic, out of the instrumenting
+arc's lane, and a decision an owner should take deliberately. Variant 1's fix
+shape remains the one proven in-tree for 1a: a `SWEPT`-and-park handshake so the
+launcher's re-read happens inside a window where the state is provably live,
+instead of racing a 2000 ms deadline.
 
 ---
 
