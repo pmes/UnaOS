@@ -19303,11 +19303,49 @@ pub fn ctrldecline_selftest() {
 /// The two groups are vertically disjoint, so the chain's claims stay clean of the sprite's.
 ///
 /// ### Drive
-/// M=12 passes cycling (A) a banded seed at the chain FOOT (`present_rows(w0, 0..2)`), (B) a
-/// banded seed under the three-way stack (`present_rows(w3, 0..2)`), (C) a whole present of the
-/// stack's TOP (`present(w5)`). The sprite is re-touched before every pass (`set_abs` at the same
+/// M=12 passes: the first eight cycle (A) a banded seed at the chain FOOT
+/// (`present_rows(w0, 0..2)`), (B) a banded seed under the three-way stack
+/// (`present_rows(w3, 0..2)`), (C) a whole present of the stack's TOP (`present(w5)`); the last
+/// FOUR are the STRETCH — consecutive banded seeds of the top's OWN last rows
+/// (`present_rows(w5, FIX_H-2..FIX_H)`), the shape whose adoption can come ONLY through the
+/// CURSTICK widening (below). The sprite is re-touched before every pass (`set_abs` at the same
 /// point) so `pal::cursor::visible()`'s 1.5 s auto-hide cannot silently disarm the cursor leg
 /// mid-battery.
+///
+/// ### The STRETCH and `adopt_stretch=` — the CURSTICK conviction, MEASURED not assumed
+/// The first RED calibration (12aa8a33-content, no CURSTICK widening, legs A/B/C only) read
+/// PASS, and both reasons are structural:
+///
+///  * **`adopt=` cannot convict.** [`tail_of`] answers `Adopt` for ANY pass that opened an
+///    overlay session — carried or not (`session && disturbed`, with `overlaid` deliberately
+///    unread since CURSOR-4) — and with the sprite parked over the stack a session opens on
+///    every pass on every kernel. The counter that discriminates is [`CUR3_TAKEN`]: it moves
+///    only when a staged window actually CARRIED sprite pixels through its present.
+///  * **Legs B/C cannot isolate the widening.** Every window B drags in has its sliver land in
+///    the neighbour's CHROME rows; `band_for_rows` cannot express chrome, so the drag promotes
+///    to a WHOLE box — and a whole-box window carries the sprite on any kernel. C is whole-box
+///    by definition. Both legs read `taken > 0` with CURSTICK absent.
+///  * **The pointer keep-alive donates whole boxes too** (second RED calibration, via the
+///    stretch probe line): on x86 every `set_abs` runs the motion repaint, whose undraw hands
+///    its restored rect back through `damage_intersecting` — chrome-inexpressible for these
+///    rows, so the whole staircase re-damages WHOLE before every present. The keep-alive is
+///    therefore excluded from the stretch (see the loop), where the probe then reads
+///    `pre=(false,..)` and the carry question is finally CURSTICK's alone.
+///
+/// The stretch is the shape with no rescue: `w5` is the stack's TOP (its damage drags nothing
+/// else into the pass), its box contains the parked sprite, and its seed band is its LAST two
+/// source rows — panel rows strictly below the arrow. Without the widening the staged band
+/// excludes the sprite's rows, the offer cannot land, and `CUR3_TAKEN` does not move for four
+/// consecutive passes; with it, `w5`'s band gains the sprite's rows (an 8-row surface cannot
+/// express them, so the fail-safe `None` arm rounds to the whole box) and every stretch pass
+/// carries. `adopt_stretch=N/4` counts stretch passes whose present+drain moved `CUR3_TAKEN`,
+/// and PASS requires at least one — RED is structurally zero, so the floor is set for GREEN
+/// robustness (a stage-declined direct fallback legitimately carries nothing).
+///
+/// During the stretch nothing else is staged over the sprite: only `w5` is dirty, the chain and
+/// the furniture sit clear of the arrow, and a drained pass paints nothing extra — which is what
+/// makes the four-pass window a claim about the WIDENING rather than about whoever else happened
+/// to composite.
 ///
 /// ### What is measured, and what is deliberately NOT
 /// All counters are CUMULATIVE shadows read as before/after deltas — [`C2_DMG_PX_TOT`]/
@@ -19323,23 +19361,27 @@ pub fn ctrldecline_selftest() {
 ///
 /// ### Verdict grammar (spec-regex-stable, one line)
 /// `[dmgovlp] verdict passes=N/12 drained=N/12 drag_evt=N drag_px=N relay=N narrow=k/12
-/// cur=N/12 adopt=N repaint=N max_ms=N -> PASS|FAIL`, plus `[dmgovlp] WEDGE ... -> FAIL`,
-/// `[dmgovlp] DRAIN-STUCK ... -> FAIL` and `[dmgovlp] verdict -> SKIP (...)` variants.
-/// `scripts/specs/x86-wc.spec` REQUIREs the PASS shape and FORBIDs the other three.
+/// cur=N/12 adopt=N repaint=N max_ms=N adopt_stretch=N/4 -> PASS|FAIL` (`adopt_stretch=` is
+/// APPENDED at the tail, this file's standing insertion rule, and the spec's REQUIRE moved with
+/// it), plus `[dmgovlp] WEDGE ... -> FAIL`, `[dmgovlp] DRAIN-STUCK ... -> FAIL` and
+/// `[dmgovlp] verdict -> SKIP (...)` variants. `scripts/specs/x86-wc.spec` REQUIREs the PASS
+/// shape and FORBIDs the other three.
 ///
 /// PASS thresholds: every pass runs and drains; `drag_evt`/`drag_px`/`relay` all moved;
-/// `narrow >= 3` and `cur >= 4` (the sprite-leg floor: at least 4 of the 12 passes must run the
+/// `adopt_stretch >= 1` (the stretch's conviction — RED is structurally 0/4, GREEN 4/4);
+/// `narrow >= 2` and `cur >= 4` (the sprite-leg floor: at least 4 of the 12 passes must run the
 /// overlay-offer path with a live plan).
 ///
-/// **Why the narrow floor is 3 and not 8** (measured, first QEMU run of this leg): only the four
-/// CHAIN passes can narrow. The STAIRCASE passes run under the parked sprite, and the CURSTICK
-/// widening — deliberately fail-safe — unions the sprite's panel rows into every banded window
-/// whose box contains the sprite box; against an [`FIX_H`] = 8-row surface an ~18-px sprite spans
-/// the WHOLE content, so the union rounds those bands to the full box and `Δdmg == Δbox`, exactly
-/// as designed. Pass C is whole-box by construction. So the honest expectation is `narrow = 4/12`
-/// (the run read exactly that), and the floor is 3 to tolerate one stage-declined direct fallback
-/// (which legitimately repaints whole). The claim still bites: a fat-leg regression whole-boxes
-/// the CHAIN passes too and reads `narrow = 0`.
+/// **Why the narrow floor is 2 and not 8** (measured on this leg's calibration runs): only the
+/// CHAIN passes — three of them now the stretch owns the tail of the battery — can narrow. The
+/// STAIRCASE passes run under the parked sprite, and the CURSTICK widening — deliberately
+/// fail-safe — unions the sprite's panel rows into every banded window whose box contains the
+/// sprite box; against an [`FIX_H`] = 8-row surface an ~18-px sprite spans the WHOLE content, so
+/// the union rounds those bands (the stretch's included) to the full box and `Δdmg == Δbox`,
+/// exactly as designed. Pass C is whole-box by construction. So the honest GREEN expectation is
+/// `narrow = 3/12`, and the floor is 2 to tolerate one stage-declined direct fallback (which
+/// legitimately repaints whole). The claim still bites: a fat-leg regression whole-boxes the
+/// CHAIN passes too and reads `narrow = 0`.
 ///
 /// Self-cleaning: `close` by id (the kernel band refuses `close_owner` — CLOSEISO — so the sweep
 /// is per-id and the leak check is against the table), then [`focus_reset`] + its repaint.
@@ -19358,11 +19400,15 @@ pub fn dmgovlp_selftest() {
     /// Drain-check budget: extra composites allowed to absorb a foreign present before the pass
     /// must read Δdmg == 0.
     const K: usize = 3;
-    /// PASS floor for the narrowing claim — see the doc block: only the four CHAIN passes can
+    /// PASS floor for the narrowing claim — see the doc block: only the three CHAIN passes can
     /// narrow (the sprite widening whole-boxes the staircase, by design), minus one fallback.
-    const NARROW_MIN: usize = 3;
+    const NARROW_MIN: usize = 2;
     /// PASS floor for passes run with a live cursor plan — see the doc block.
     const CUR_MIN: usize = 4;
+    /// First pass of the STRETCH (the last `M - STRETCH_AT` passes are the stretch), and the
+    /// PASS floor on its carry count — see the doc block's stretch section.
+    const STRETCH_AT: usize = 8;
+    const STRETCH_MIN: usize = 1;
     /// The six owners, kernel-band and pace-exempt. Const-asserted into the band.
     const OWNERS: [u64; 6] = [
         KERNEL_OWNER_BASE + 0x40,
@@ -19512,14 +19558,29 @@ pub fn dmgovlp_selftest() {
     let mut drained_n = 0usize;
     let mut narrow_k = 0usize;
     let mut cur_n = 0usize;
+    let mut adopt_stretch = 0usize;
     let mut max_ms = 0u64;
     let mut wedged = false;
     let mut stuck = false;
     for m in 0..M {
         // Re-touch the pointer at the SAME point: refreshes the 1.5 s visibility clock without
         // moving the sprite, so the cursor leg cannot silently disarm mid-battery.
-        crate::pal::cursor::set_abs(hx, hy, pw as i32, ph as i32);
-        super::cursor::ensure_drawn();
+        //
+        // NEVER inside the stretch, and the exclusion is measured, not stylistic: on x86
+        // (`SPRITE_OWNS_PAINT`) every `set_abs` runs `repaint_on_move` -> `cursor::repaint()`,
+        // whose undraw hands its restored rect back through `repair()` ->
+        // [`damage_intersecting`] — and the sprite's rows are CHROME rows for `w5`, so the band
+        // is inexpressible and all three staircase rows are re-damaged WHOLE. The stretch probe
+        // read `pre=(true,0,0) dd=db taken=3` on a de-widened kernel: the fixture's own
+        // keep-alive was donating the whole-box carry the stretch exists to withhold. The
+        // stretch runs a few milliseconds after pass 7's touch (`max_ms` bounds every interval
+        // at 1 s against a 1.5 s hide), so the clock cannot lapse inside it — and `cur=` still
+        // asserts a live plan on every stretch pass, so a lapse would fail loudly, not skew
+        // silently.
+        if m < STRETCH_AT {
+            crate::pal::cursor::set_abs(hx, hy, pw as i32, ph as i32);
+            super::cursor::ensure_drawn();
+        }
         // The plan the NEXT pass will be offered. One acquisition, before the present, outside
         // every lock the pass takes.
         if super::cursor::sprite_plan().is_some() {
@@ -19527,14 +19588,35 @@ pub fn dmgovlp_selftest() {
         }
         let d0 = C2_DMG_PX_TOT.load(Relaxed);
         let b0 = C2_BOX_PX_TOT.load(Relaxed);
+        // The stretch's per-pass carry baseline — CUR3_TAKEN is cumulative and load-only (its
+        // rollups never drain it), the same discipline every other counter here leans on.
+        let tk0 = CUR3_TAKEN.load(Relaxed);
+        let of0 = CUR3_OFFERS.load(Relaxed);
+        // Stretch probe: `w5`'s damage state as the present finds it. A stretch pass is only the
+        // widening's witness if the row is CLEAN here — a pre-dirtied row unions to the whole box
+        // and carries the sprite on any kernel. Printed per stretch pass so a capture can convict
+        // the fixture's own preconditions instead of leaving them assumed.
+        let pre = if m >= STRETCH_AT {
+            let t = table();
+            row(&t, w[5]).map(|r| (r.damaged, r.dmg_y0, r.dmg_y1)).unwrap_or((false, 0, 0))
+        } else {
+            (false, 0, 0)
+        };
         let t0 = crate::arch::ms();
-        let ran = match m % 3 {
-            // (A) banded seed at the chain FOOT: w1 drags in by the sliver, w2 only by relay.
-            0 => present_rows(w[0], 0, 2),
-            // (B) banded seed under the three-way stack, beneath the parked sprite.
-            1 => present_rows(w[3], 0, 2),
-            // (C) whole present of the stack's top — the pass that may legitimately not narrow.
-            _ => present(w[5]),
+        let ran = if m < STRETCH_AT {
+            match m % 3 {
+                // (A) banded seed at the chain FOOT: w1 drags by the sliver, w2 only by relay.
+                0 => present_rows(w[0], 0, 2),
+                // (B) banded seed under the three-way stack, beneath the parked sprite.
+                1 => present_rows(w[3], 0, 2),
+                // (C) whole present of the stack's top — may legitimately not narrow.
+                _ => present(w[5]),
+            }
+        } else {
+            // THE STRETCH — the top's own last rows, strictly below the arrow, dragging nothing:
+            // the one shape whose carry can only come through the CURSTICK widening. See the doc
+            // block's stretch section.
+            present_rows(w[5], FIX_H - 2, FIX_H)
         };
         let dt = crate::arch::ms().wrapping_sub(t0);
         max_ms = max_ms.max(dt);
@@ -19584,6 +19666,19 @@ pub fn dmgovlp_selftest() {
         if dd < db {
             narrow_k += 1;
         }
+        // The stretch's carry claim, over the same interval: this pass's present (or its drain)
+        // put sprite pixels through a staged window. Only the widening can make that true here.
+        if m >= STRETCH_AT {
+            if CUR3_TAKEN.load(Relaxed) != tk0 {
+                adopt_stretch += 1;
+            }
+            serial_println!(
+                "[dmgovlp] stretch pass={} pre=({},{},{}) dd={} db={} offers={} taken={}",
+                m, pre.0, pre.1, pre.2, dd, db,
+                CUR3_OFFERS.load(Relaxed).wrapping_sub(of0),
+                CUR3_TAKEN.load(Relaxed).wrapping_sub(tk0)
+            );
+        }
     }
 
     let drag_evt = OVLP_DRAG_EVT.load(Relaxed).wrapping_sub(de0);
@@ -19599,10 +19694,14 @@ pub fn dmgovlp_selftest() {
         && drag_px > 0
         && relay > 0
         && narrow_k >= NARROW_MIN
-        && cur_n >= CUR_MIN;
+        && cur_n >= CUR_MIN
+        // The stretch's conviction: at least one of its four passes CARRIED the sprite through
+        // a staged band — impossible without the CURSTICK widening (RED reads 0/4).
+        && adopt_stretch >= STRETCH_MIN;
     serial_println!(
-        "[dmgovlp] verdict passes={}/12 drained={}/12 drag_evt={} drag_px={} relay={} narrow={}/12 cur={}/12 adopt={} repaint={} max_ms={} -> {}",
+        "[dmgovlp] verdict passes={}/12 drained={}/12 drag_evt={} drag_px={} relay={} narrow={}/12 cur={}/12 adopt={} repaint={} max_ms={} adopt_stretch={}/4 -> {}",
         passes_n, drained_n, drag_evt, drag_px, relay, narrow_k, cur_n, adopt, repaint_n, max_ms,
+        adopt_stretch,
         if ok { "PASS" } else { "FAIL" }
     );
 

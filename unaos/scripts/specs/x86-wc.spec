@@ -28,10 +28,15 @@
 # merely skipped".
 #
 # NO NUMERICS are pinned anywhere in this file: every count is \d+, and the verdict's thresholds
-# (narrow >= 3, cur >= 4, drag/relay > 0) live in the fixture, which folds them into PASS/FAIL.
-# The expected steady state (measured on this spec's own gate) is narrow=4/12: only the four
-# sprite-free CHAIN passes narrow — the CURSTICK widening rounds the sprite-covered staircase
-# bands to whole boxes on an 8-row surface, deliberately, and pass C is whole-box by design.
+# (adopt_stretch >= 1, narrow >= 2, cur >= 4, drag/relay > 0) live in the fixture, which folds
+# them into PASS/FAIL. The expected steady state (measured on this spec's own gate) is
+# narrow=3/12 adopt_stretch=4/4: only the three sprite-free CHAIN passes narrow — the CURSTICK
+# widening rounds the sprite-covered staircase bands to whole boxes on an 8-row surface,
+# deliberately, and pass C is whole-box by design. adopt_stretch is the term that BITES: four
+# consecutive banded seeds of the stack's top, strictly below the parked arrow, drag nothing and
+# can carry the sprite (move CUR3_TAKEN) ONLY through the CURSTICK widening — measured RED
+# (12aa8a33-content without the widening) reads adopt_stretch=0/4 -> FAIL, while adopt= alone
+# stays high on both trees (a session Adopt-closes whether or not any window carried).
 
 # --- the ladder reached the compositor witnesses and they held --------------------------------
 REQUIRE \[wm-act\] direct .* -> PASS
@@ -42,8 +47,10 @@ REQUIRE \[clickroute\] route .* -> PASS
 # drag_evt/drag_px (RAW pixels — dkpx would round the slivers to 0): the closure's promotion arm
 # fired; relay: forwarded damage reached the chain's far window; narrow: passes that painted
 # strictly fewer pixels than whole-box; cur: passes run with a live cursor plan (the sprite leg);
-# adopt/repaint: the pass tails those cursor passes took; max_ms: worst single measured interval.
-REQUIRE \[dmgovlp\] verdict passes=\d+/12 drained=\d+/12 drag_evt=\d+ drag_px=\d+ relay=\d+ narrow=\d+/12 cur=\d+/12 adopt=\d+ repaint=\d+ max_ms=\d+ -> PASS
+# adopt/repaint: the pass tails those cursor passes took; max_ms: worst single measured
+# interval; adopt_stretch: stretch passes that carried the sprite through a staged band (the
+# CURSTICK conviction — appended at the line's tail, the standing insertion rule).
+REQUIRE \[dmgovlp\] verdict passes=\d+/12 drained=\d+/12 drag_evt=\d+ drag_px=\d+ relay=\d+ narrow=\d+/12 cur=\d+/12 adopt=\d+ repaint=\d+ max_ms=\d+ adopt_stretch=\d+/4 -> PASS
 
 # --- FORBIDDEN: every other DMGOVLP outcome ----------------------------------------------------
 # The FAIL sweep also catches the teardown LEAK line (it ends `-> FAIL`), as does mbench's default
