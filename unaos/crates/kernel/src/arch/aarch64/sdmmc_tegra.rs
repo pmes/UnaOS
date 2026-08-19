@@ -34,11 +34,19 @@
 // ## The Tegra vendor-quirk assumptions this READ-ONLY recon relies on (documented; metal-pending)
 //
 //  1. The firmware/BPMP has already ENABLED the sdmmc1 module clock + pad power and left the slot's
-//     rails up (the bootloader read the card to boot). We do NOT program the CAR/BPMP clock or the
-//     Tegra vendor pad-control registers (>= 0x100) — we drive ONLY the standard SDHCI internal-clock
-//     divider (CONTROL1) off whatever base clock the controller already has running. If metal shows the
-//     internal clock never stabilises (CLK_STABLE never sets), the diagnosis is "the input clock is
-//     gated" and the fix (a BPMP clock MRQ) is a later arc — surfaced, never worked around.
+//     rails up (the bootloader read the card to boot). We do NOT program the CAR/BPMP clock, and we
+//     AUTHOR no Tegra vendor pad-control value (>= 0x100) — we drive ONLY the standard SDHCI
+//     internal-clock divider (CONTROL1) off whatever base clock the controller already has running. If
+//     metal shows the internal clock never stabilises (CLK_STABLE never sets), the diagnosis is "the
+//     input clock is gated" and the fix (a BPMP clock MRQ) is a later arc — surfaced, never worked
+//     around.
+//     M2b AMENDMENT (post boot 3): "author none" is not the same as "never write". SRST_ALL returns the
+//     vendor block to power-on defaults, which DISCARDS the tap/trim/drive-strength/auto-cal the
+//     bootloader calibrated for this board — the ladder then runs on pads the firmware never intended.
+//     So the recon now SNAPSHOTS that block before its own reset and writes the FIRMWARE'S OWN values
+//     back afterwards (`vendor_snapshot`/`vendor_restore`), re-running pad auto-calibration only if the
+//     firmware had it enabled. Every value written there came from the controller one instruction
+//     earlier; assumption 1 stands, with its scope stated precisely.
 //  2. The CAPABILITIES base-clock field: if it reads 0 (some Tegra SKUs report base clock via the DT
 //     `clock-frequency` / assigned-clock-rates instead of CAPS[15:8]), we assume a documented 200 MHz
 //     and log it. Identification runs at 400 kHz then 25 MHz default-speed, so an inexact base only
@@ -134,7 +142,39 @@ mod metal {
     const IRPT_MASK: u64 = 0x34; // status-ENABLE (bits latch into INTERRUPT only if set here)
     const IRPT_EN: u64 = 0x38; // signal-enable (kept 0 — polled)
     const CAPABILITIES: u64 = 0x40;
+    const HOST_CTRL2: u64 = 0x3c; // [15:0] Auto-CMD error, [31:16] Host Control 2 (UHS mode / 1.8V sig)
     const HOST_VERSION: u64 = 0xfc; // [31:16] = Host Controller Version register (0xFE)
+
+    // ── M2b: the Tegra vendor register block (>= 0x100), stacked above the standard SDHCI window (the
+    //    controller window is 0x20000 long, so every offset here is in range). We do NOT author values
+    //    for these — see `vendor_snapshot`/`vendor_restore`: SRST_ALL returns them to power-on defaults
+    //    and thereby DISCARDS the pad tap/trim/drive-strength the bootloader calibrated for this exact
+    //    card and board, which is the leading suspect for a ladder that dies with no card response after
+    //    a reset that "succeeded". We preserve the firmware's values across our own reset; we never
+    //    invent one. (Same register set Linux's sdhci-tegra re-applies in `tegra_sdhci_reset`.) ──
+    const V_CLOCK_CTRL: u64 = 0x100; // tap/trim + PADPIPE/SPI clock-enable overrides
+    const V_SYS_SW_CTRL: u64 = 0x104;
+    const V_CAP_OVERRIDES: u64 = 0x10c;
+    const V_MISC_CTRL: u64 = 0x120; // SDR50/DDR50/SDR104 capability enables
+    const V_IO_TRIM_CTRL: u64 = 0x1ac;
+    const V_DLLCAL_CFG: u64 = 0x1b0;
+    const V_SDMEM_COMP_PADCTRL: u64 = 0x1e0; // pad comp / drive strength
+    const V_AUTO_CAL_CONFIG: u64 = 0x1e4;
+    const V_AUTO_CAL_STATUS: u64 = 0x1ec;
+    /// The vendor registers preserved across SRST_ALL, in write order.
+    const VENDOR_REGS: [u64; 8] = [
+        V_CLOCK_CTRL,
+        V_SYS_SW_CTRL,
+        V_CAP_OVERRIDES,
+        V_MISC_CTRL,
+        V_IO_TRIM_CTRL,
+        V_DLLCAL_CFG,
+        V_SDMEM_COMP_PADCTRL,
+        V_AUTO_CAL_CONFIG,
+    ];
+    const AUTO_CAL_START: u32 = 1 << 31;
+    const AUTO_CAL_ENABLE: u32 = 1 << 29;
+    const AUTO_CAL_ACTIVE: u32 = 1 << 31; // in V_AUTO_CAL_STATUS
 
     // ── Present State (0x24) bits. ──
     const ST_CMD_INHIBIT: u32 = 1 << 0;
@@ -146,6 +186,8 @@ mod metal {
     const C1_CLK_STABLE: u32 = 1 << 1;
     const C1_CLK_EN: u32 = 1 << 2;
     const C1_SRST_HC: u32 = 1 << 24; // Software Reset For All (reg 0x2F bit 0)
+    const C1_SRST_CMD: u32 = 1 << 25; // Software Reset For CMD line
+    const C1_SRST_DAT: u32 = 1 << 26; // Software Reset For DAT line
 
     // ── INTERRUPT (0x30) bits (W1C). ──
     const INT_CMD_DONE: u32 = 1 << 0;
@@ -240,20 +282,26 @@ mod metal {
     /// Issue one command and wait for completion. Returns Ok on CMD_DONE with no error; Err on a command
     /// timeout / CRC / index error, or our own bounded timeout. Mirrors `emmc2::send_command` (incl. the
     /// unconditional DAT_INHIBIT wait, load-bearing on metal after an R1b command leaves DAT0 busy).
-    fn send_command(base: u64, cmdtm: u32, arg: u32) -> Result<(), ()> {
+    ///
+    /// M2b: the `Err` payload is the INTERRUPT register AS READ AT THE FAILURE — a command that dies
+    /// silently is a command that cannot be diagnosed from a boot capture (boot 3 stopped inside this
+    /// ladder with no evidence whatsoever). Every caller that cares routes it through `cmd_step`, which
+    /// names the command and prints the payload beside the Present State. The two `.is_err()` callers
+    /// (the read/write primitives) ignore the payload exactly as before.
+    fn send_command(base: u64, cmdtm: u32, arg: u32) -> Result<(), u32> {
         if !wait_clear(base, STATUS, ST_CMD_INHIBIT | ST_DAT_INHIBIT, CMD_TIMEOUT_MS) {
-            return Err(());
+            return Err(read32(base, INTERRUPT));
         }
         write32(base, INTERRUPT, 0xffff_ffff); // clear any stale status
         write32(base, ARG1, arg);
         write32(base, CMDTM, cmdtm); // issues the command
         if !wait_set(base, INTERRUPT, INT_CMD_DONE | INT_ERR_ANY, CMD_TIMEOUT_MS) {
-            return Err(());
+            return Err(read32(base, INTERRUPT));
         }
         let int = read32(base, INTERRUPT);
         if int & INT_ERR_ANY != 0 {
             write32(base, INTERRUPT, int); // W1C what we saw
-            return Err(());
+            return Err(int);
         }
         write32(base, INTERRUPT, INT_CMD_DONE);
         Ok(())
@@ -348,6 +396,17 @@ mod metal {
     /// Returns the identified card, or None on any absent-card / timeout / decode failure (the caller
     /// prints the honest cause). NO card write anywhere in this ladder.
     fn identify(base: u64) -> Option<Card> {
+        // 0. M2b: snapshot the bootloader's Tegra vendor pad/tap configuration BEFORE the reset that
+        //    would discard it, and report the pre-reset signalling voltage (a card the firmware left in
+        //    1.8 V UHS signalling cannot answer a 3.3 V ladder — that diagnosis needs a PMIC/vqmmc arc,
+        //    so we surface it rather than work around it).
+        let hc2 = (read32(base, HOST_CTRL2) >> 16) & 0xffff;
+        serial_println!(
+            "{}   M2: pre-reset Host Control 2 = {:#06x} (1.8V-signalling={}, UHS mode {:#x}) ::",
+            PS, hc2, (hc2 >> 3) & 1, hc2 & 0x7
+        );
+        let vendor = vendor_snapshot(base);
+
         // 1. Full-controller software reset; wait for it to self-clear.
         serial_println!("{}   M2: SRST_ALL (controller software reset) ::", PS);
         write32(base, CONTROL1, read32(base, CONTROL1) | C1_SRST_HC);
@@ -355,13 +414,26 @@ mod metal {
             serial_println!("{}   M2: SRST did not self-clear (controller not responding) — STOP ::", PS);
             return None;
         }
+        // 1b. M2b: put the firmware's vendor pad configuration BACK (SRST_ALL reset it to power-on
+        //     defaults) and re-run pad auto-calibration if the firmware had it enabled.
+        vendor_restore(base, &vendor);
         // 2. Enable status latching (must be set or STATUS bits never appear in INTERRUPT); keep signals
         //    off (polled); clear any stale status.
         write32(base, IRPT_MASK, 0xffff_ffff);
         write32(base, IRPT_EN, 0);
         write32(base, INTERRUPT, 0xffff_ffff);
-        // 3. Bus power: 3.3 V select + bus power on (CONTROL0 bits[11:8] = 0xF).
-        write32(base, CONTROL0, (read32(base, CONTROL0) & !(0xf << 8)) | (0xf << 8));
+        // 3. Bus power, in the two writes the SDHCI spec prescribes (§3.3): FIRST select the bus voltage
+        //    with power still off, THEN set SD Bus Power. A single fused write of bits[11:8] is what the
+        //    recon did through boot 3, and a controller that latches the voltage only on a power-off
+        //    write comes up unpowered from it — a silent way to reach CMD0 with a dead bus.
+        let c0 = read32(base, CONTROL0) & !(0xf << 8);
+        write32(base, CONTROL0, c0 | (0x7 << 9)); // 3.3 V select, SD Bus Power still 0
+        write32(base, CONTROL0, c0 | (0xf << 8)); // ... then power on
+        delay_ms(2); // rails settle before the first clock edge
+        serial_println!(
+            "{}   M2: bus power 3.3 V applied (CONTROL0={:#010x}) ::",
+            PS, read32(base, CONTROL0)
+        );
 
         // 4. Card-detect: with power + reset settled, is a card seated? (Present State bit 16.)
         let present = read32(base, STATUS);
@@ -384,45 +456,87 @@ mod metal {
             return None;
         }
 
+        serial_println!(
+            "{}   M2: 400 kHz identification clock running (CONTROL1={:#010x}, base {} MHz) ::",
+            PS, read32(base, CONTROL1), base_hz / 1_000_000
+        );
+        // 5b. The SD spec's power-up ramp: the card needs >= 1 ms and 74 SDCLK cycles (185 us at
+        //     400 kHz) of clock before it will accept the first command. Boot 3 issued CMD0 in the
+        //     instruction after CLK_STABLE — inside that window a card is not obliged to answer anything.
+        delay_ms(2);
+
         // 6. CMD0 GO_IDLE (no response).
-        send_command(base, cmd(0) | CMD_RESP_NONE, 0).ok()?;
-        // 7. CMD8 SEND_IF_COND (R7): 0x1AA = 2.7-3.6 V + check pattern 0xAA. The echo is the discriminator.
-        send_command(base, cmd(8) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK, 0x1aa).ok()?;
-        let sdhc_capable = read32(base, RESP0) & 0xfff == 0x1aa;
-        if !sdhc_capable {
-            serial_println!("{}   M2: CMD8 echo mismatch — legacy/SDSC card (or no v2 support) ::", PS);
-        }
+        cmd_step(base, "CMD0 GO_IDLE", cmd(0) | CMD_RESP_NONE, 0)?;
+        delay_ms(2); // the card enters idle; give it the spec's settle before interrogating it
+        // 7. CMD8 SEND_IF_COND (R7): 0x1AA = 2.7-3.6 V + check pattern 0xAA. The echo is the
+        //    discriminator — and a NO-ANSWER is itself an answer: SD v1.x cards do not implement CMD8 at
+        //    all, so the command TIMES OUT on them. Boot 3's ladder treated that timeout as fatal and
+        //    abandoned identification; per SD Physical Layer §4.2.2 it means "not a v2 card, continue
+        //    with ACMD41 and no HCS". The CMD line is reset after the timeout before we go on.
+        let sdhc_capable = match send_command(base, cmd(8) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK, 0x1aa) {
+            Ok(()) => {
+                let echo = read32(base, RESP0) & 0xfff;
+                serial_println!("{}   M2: CMD8 SEND_IF_COND ok (R7 echo {:#05x}) ::", PS, echo);
+                if echo != 0x1aa {
+                    serial_println!("{}   M2: CMD8 echo mismatch — legacy/SDSC card (or no v2 support) ::", PS);
+                }
+                echo == 0x1aa
+            }
+            Err(int) => {
+                serial_println!(
+                    "{}   M2: CMD8 no response (INTERRUPT={:#010x}) — SD v1.x card or no v2 support; continuing without HCS ::",
+                    PS, int
+                );
+                reset_cmd_dat(base);
+                false
+            }
+        };
         // 8. ACMD41 loop (bounded ~1 s): CMD55 (APP_CMD) then ACMD41 (SD_SEND_OP_COND) with HCS + the
         //    3.3 V window, until power-up-busy (RESP0[31]) clears. ccs = RESP0[30].
+        //    HCS (bit 30) is asserted ONLY when CMD8 was answered — a v1.x card must not be told the host
+        //    supports high capacity. The loop paces itself (the card is allowed to stay busy for up to a
+        //    second; hammering it back-to-back is not required and upsets some cards) and counts its
+        //    rounds so the witness says how long power-up actually took.
+        let acmd41_arg = if sdhc_capable { 0x40ff_8000 } else { 0x00ff_8000 };
         let acmd41_deadline = deadline_ms(ACMD41_TIMEOUT_MS);
         let mut ocr;
+        let mut rounds = 0u32;
         loop {
-            send_command(base, cmd(55) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK, 0).ok()?;
-            send_command(base, cmd(41) | CMD_RESP_48, 0x40ff_8000).ok()?;
+            rounds += 1;
+            let first = rounds == 1; // one witness for the first round; the rest are summarised below
+            cmd_step_at(base, "CMD55 APP_CMD (before ACMD41)", cmd(55) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK, 0, first)?;
+            cmd_step_at(base, "ACMD41 SD_SEND_OP_COND", cmd(41) | CMD_RESP_48, acmd41_arg, first)?;
             ocr = read32(base, RESP0);
             if ocr & (1 << 31) != 0 {
                 break;
             }
             if expired(acmd41_deadline) {
-                serial_println!("{}   M2: ACMD41 power-up timed out (card never left busy) — STOP ::", PS);
+                serial_println!(
+                    "{}   M2: ACMD41 power-up timed out after {} rounds (card never left busy, last OCR {:#010x}) — STOP ::",
+                    PS, rounds, ocr
+                );
                 return None;
             }
-            core::hint::spin_loop();
+            delay_ms(5);
         }
         let block_addressing = ocr & (1 << 30) != 0; // ccs
+        serial_println!(
+            "{}   M2: ACMD41 power-up complete in {} round(s) — OCR {:#010x} (CCS={}) ::",
+            PS, rounds, ocr, block_addressing as u8
+        );
 
         // 9. CMD2 ALL_SEND_CID (R2) -> identification state. Decode + print the CID.
-        send_command(base, cmd(2) | CMD_RESP_136 | CMD_CRCCHK, 0).ok()?;
+        cmd_step(base, "CMD2 ALL_SEND_CID", cmd(2) | CMD_RESP_136 | CMD_CRCCHK, 0)?;
         let cid = read_resp(base);
         print_cid(&cid);
 
         // 10. CMD3 SEND_RELATIVE_ADDR (R6) -> rca in RESP0[31:16].
-        send_command(base, cmd(3) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK, 0).ok()?;
+        cmd_step(base, "CMD3 SEND_RELATIVE_ADDR", cmd(3) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK, 0)?;
         let rca = read32(base, RESP0) >> 16;
         let rca_arg = rca << 16;
 
         // 11. CMD9 SEND_CSD (R2) — card must be in stand-by (post-CMD3, pre-CMD7). Parse capacity.
-        send_command(base, cmd(9) | CMD_RESP_136 | CMD_CRCCHK, rca_arg).ok()?;
+        cmd_step(base, "CMD9 SEND_CSD", cmd(9) | CMD_RESP_136 | CMD_CRCCHK, rca_arg)?;
         let csd = read_resp(base);
         let csd_structure = r2_bits(&csd, 127, 126);
         let (num_blocks, csd_version) = if csd_structure == 1 {
@@ -451,9 +565,9 @@ mod metal {
         );
 
         // 12. CMD7 SELECT_CARD (R1b) -> transfer state.
-        send_command(base, cmd(7) | CMD_RESP_48_BUSY | CMD_CRCCHK | CMD_IXCHK, rca_arg).ok()?;
+        cmd_step(base, "CMD7 SELECT_CARD", cmd(7) | CMD_RESP_48_BUSY | CMD_CRCCHK | CMD_IXCHK, rca_arg)?;
         // 13. CMD16 SET_BLOCKLEN 512 (R1; SDSC semantics, harmless on SDHC where 512 is fixed).
-        send_command(base, cmd(16) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK, 512).ok()?;
+        cmd_step(base, "CMD16 SET_BLOCKLEN 512", cmd(16) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK, 512)?;
         // 14. Raise to default transfer clock (<= 25 MHz). 1-bit bus (4-bit/HS deferred — quirk note).
         if !set_clock(base, base_hz, 25_000_000) {
             serial_println!("{}   M2: could not raise to 25 MHz transfer clock — STOP ::", PS);
@@ -1956,5 +2070,127 @@ mod metal {
                 PS
             );
         }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════════════
+    // M2b — what boot 3 was missing. The identification ladder above was complete as SD-spec prose, and
+    // it still ended at `recon done at M2 (no identified card / honest stop)` with NOTHING between the
+    // card-detect line and the stop. Three defects, in the order they bite:
+    //
+    //  1. NO EVIDENCE. Every rung was `send_command(..).ok()?` — a failure returned `None` through the
+    //     `?` without a single serial line, so a capture could not say which command died, nor with
+    //     which error bits. `cmd_step` below is the fix: it names the command and prints the INTERRUPT
+    //     payload beside the Present State, then resets the CMD/DAT lines so the controller is not left
+    //     inhibited for whatever runs next.
+    //  2. NO SETTLE TIME. CMD0 was issued in the instruction after CLK_STABLE, and CMD8 in the one after
+    //     CMD0. The SD power-up ramp requires >= 1 ms plus 74 SDCLK cycles of clock before the card
+    //     accepts anything (`delay_ms` + the two 2 ms waits in the ladder).
+    //  3. NO VENDOR PRESERVATION. SRST_ALL returns the Tegra vendor block (>= 0x100) to power-on
+    //     defaults, discarding the tap/trim/drive-strength/auto-cal the bootloader calibrated for this
+    //     board — after which the pads may not sustain a command the card will answer. `vendor_snapshot`
+    //     / `vendor_restore` put the FIRMWARE'S OWN values back; they author none.
+    //
+    // Plus the one outright spec bug: CMD8 timing out is how an SD v1.x card says "I am not v2", and the
+    // old ladder took it as fatal. That is handled inline at rung 7, not here.
+    //
+    // Read-only is untouched: nothing in this section issues any card command at all.
+
+    /// Bounded busy-wait of `ms` milliseconds on the monotonic counter (same discipline as `deadline_ms`;
+    /// there is no sleeping scheduler at this point in boot).
+    fn delay_ms(ms: u64) {
+        let dl = deadline_ms(ms);
+        while !expired(dl) {
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Reset just the CMD and DAT lines (NOT SRST_ALL — that would discard the vendor configuration and
+    /// the bus power we set up). This is what the SDHCI spec prescribes after a command timeout, and it
+    /// is what lets the ladder continue past a CMD8 that no v1.x card will ever answer.
+    fn reset_cmd_dat(base: u64) {
+        write32(base, CONTROL1, read32(base, CONTROL1) | C1_SRST_CMD | C1_SRST_DAT);
+        if !wait_clear(base, CONTROL1, C1_SRST_CMD | C1_SRST_DAT, RESET_TIMEOUT_MS) {
+            serial_println!("{}   M2: CMD/DAT line reset did not self-clear (controller wedged) ::", PS);
+        }
+        write32(base, INTERRUPT, 0xffff_ffff);
+    }
+
+    /// Issue one NAMED identification command, witnessing both outcomes. `None` (which `?` turns into the
+    /// ladder's honest stop) is only ever returned AFTER a line saying exactly which command failed and
+    /// what the controller had latched — the thing boot 3 could not tell us.
+    fn cmd_step(base: u64, name: &str, cmdtm: u32, arg: u32) -> Option<()> {
+        cmd_step_at(base, name, cmdtm, arg, true)
+    }
+
+    /// `cmd_step` with the success line suppressed — for the ACMD41 poll, whose rounds are summarised
+    /// once by the loop instead of one line per round.
+    fn cmd_step_at(base: u64, name: &str, cmdtm: u32, arg: u32, verbose: bool) -> Option<()> {
+        match send_command(base, cmdtm, arg) {
+            Ok(()) => {
+                if verbose {
+                    serial_println!("{}   M2: {} ok ::", PS, name);
+                }
+                Some(())
+            }
+            Err(int) => {
+                serial_println!(
+                    "{}   M2: {} FAILED — INTERRUPT={:#010x} PresentState={:#010x} CONTROL0={:#010x} CONTROL1={:#010x} — STOP ::",
+                    PS, name, int,
+                    read32(base, STATUS), read32(base, CONTROL0), read32(base, CONTROL1)
+                );
+                reset_cmd_dat(base);
+                None
+            }
+        }
+    }
+
+    /// Snapshot the Tegra vendor register block so SRST_ALL cannot lose the bootloader's calibration.
+    /// Purely a read; logged so a capture records what the firmware had configured.
+    fn vendor_snapshot(base: u64) -> [u32; VENDOR_REGS.len()] {
+        let mut vals = [0u32; VENDOR_REGS.len()];
+        for (i, off) in VENDOR_REGS.iter().enumerate() {
+            vals[i] = read32(base, *off);
+        }
+        serial_println!(
+            "{}   M2: vendor block pre-reset — CLOCK_CTRL={:#010x} SYS_SW={:#010x} CAP_OVR={:#010x} MISC={:#010x} IO_TRIM={:#010x} DLLCAL={:#010x} COMP_PAD={:#010x} AUTO_CAL={:#010x} ::",
+            PS, vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], vals[7]
+        );
+        vals
+    }
+
+    /// Put the snapshot back after SRST_ALL, then re-run pad auto-calibration IF the firmware had it
+    /// enabled (calibration results do not survive the reset either). Bounded wait on AUTO_CAL_ACTIVE;
+    /// a calibration that never finishes is reported, never waited on forever, and never fatal — the
+    /// ladder proceeds and the command witnesses will say whether the bus works.
+    fn vendor_restore(base: u64, vals: &[u32; VENDOR_REGS.len()]) {
+        let poisoned = vals.iter().all(|v| is_poison(*v));
+        if poisoned {
+            serial_println!(
+                "{}   M2: vendor block read back all-poison — NOT restoring (the window would not be a live vendor block) ::",
+                PS
+            );
+            return;
+        }
+        for (i, off) in VENDOR_REGS.iter().enumerate() {
+            write32(base, *off, vals[i]);
+        }
+        serial_println!("{}   M2: vendor block restored across SRST_ALL (firmware values, none authored) ::", PS);
+
+        if vals[7] & AUTO_CAL_ENABLE == 0 {
+            serial_println!("{}   M2: pad auto-calibration was disabled by firmware — not started ::", PS);
+            return;
+        }
+        write32(base, V_AUTO_CAL_CONFIG, vals[7] | AUTO_CAL_ENABLE | AUTO_CAL_START);
+        if !wait_clear(base, V_AUTO_CAL_STATUS, AUTO_CAL_ACTIVE, RESET_TIMEOUT_MS) {
+            serial_println!(
+                "{}   M2: pad auto-calibration still ACTIVE after {} ms (status {:#010x}) — continuing with the restored values ::",
+                PS, RESET_TIMEOUT_MS, read32(base, V_AUTO_CAL_STATUS)
+            );
+            return;
+        }
+        serial_println!(
+            "{}   M2: pad auto-calibration complete (AUTO_CAL_CONFIG={:#010x}, status={:#010x}) ::",
+            PS, read32(base, V_AUTO_CAL_CONFIG), read32(base, V_AUTO_CAL_STATUS)
+        );
     }
 }
