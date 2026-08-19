@@ -8875,10 +8875,11 @@ the kernel's rebuild via the blob's refreshed mtime for nothing.
 The first hw-jetson base carrying the month of trunk desktop/userspace work (merge `ceaa32b8`,
 tip `b86f6c33`) never booted the Orin: ~10 attended boots, none past the NVIDIA logo, while the
 pre-merge base `92997297` booted the same board completely minutes apart. A pre-EBS banner build
-proved the loader reached `ExitBootServices`; the kernel's first serial line (`:: tegra: mmu regs`,
-from inside `mmu_tegra::init`) never appeared. Peter confirmed the board never reset — a hang, not
-an exception→reset. hw-pi4 booted the identical trunk content on Pi silicon, so shared aarch64 code
-was exonerated wholesale.
+proved the loader reached `ExitBootServices`; the kernel's first serial line (`:: tegra: mmu live`,
+emitted by `tegra_early_stop` in `main.rs` immediately after `mmu_tegra::init` returns —
+`mmu_tegra::init` itself contains no print) never appeared. Peter confirmed the board never reset —
+a hang, not an exception→reset. hw-pi4 booted the identical trunk content on Pi silicon, so shared
+aarch64 code was exonerated wholesale.
 
 ### The root cause (found by reading the window's own diff — zero boots)
 
@@ -8887,11 +8888,13 @@ arch and every build** — which emits its witness line via `serial_println!` *b
 `tegra_early_stop`. On tegra that write polls UARTC's LSR at `0x0C28_0014` while the kernel still
 runs under the UEFI-handoff translation tables, which map RAM but **not** the Tegra device window
 (JM2 R4: the kernel faulted on its first UARTC read — the fact that created `tegra_early_stop`'s
-"install the MMU FIRST — SILENT" ordering in the first place). A translation fault there has no
-usable vectors, so the board hangs silently: exactly the observed reading. `mmu_tegra.rs` itself
-was untouched by the merge — the kernel died *upstream* of it, on a new caller the merge placed in
-the dark window. The Pi is immune because its bare-metal path runs `mmu_init` before `kernel_main`;
-x86 is immune because its loader maps the console before handoff.
+"install the MMU FIRST — SILENT" ordering in the first place). Per the R4 record in `mmu_tegra.rs`,
+that fault lands in UEFI's still-resident ArmCpuDxe vectors — but after `ExitBootServices` their
+reporting path is gone, so the observed outcome on the box is a silent stop at the logo either way.
+`mmu_tegra.rs` itself was untouched by the merge — the kernel died *upstream* of it, on a new
+caller the merge placed in the dark window. The Pi is immune because its bare-metal path runs
+`mmu_init` before `kernel_main`; x86 is immune because its serial is ISA port I/O (`0x3F8`), which
+no translation table gates.
 
 ### The fix: kill the class, not the caller (`ed8f810c`)
 
@@ -8900,13 +8903,21 @@ before `mark_mmio_ready()` is dropped and counted, never written. `tegra_early_s
 on the line after `mmu_tegra::init` returns, then witnesses the count
 (`:: tegra: dark-window guard — N byte(s) dropped pre-map ::`) and re-emits the EDID witness the
 window ate, so the reading still reaches the wire. Nonzero N is a *reported* fact that some caller
-printed pre-map — the class can no longer hang the board, only announce itself. Non-tegra builds
-are byte-identical (everything sits inside `cfg(feature = "tegra")`).
+printed pre-map — the UARTC class can no longer hang the board, only announce itself. The witness
+is byte-granular by design: a future pre-map caller's *content* is still lost from the wire (the
+fbcon and selftest mirrors carry it), the count is what survives. Scope caveat: the latch guards
+UARTC only. `fbcon`'s framebuffer writes in the same window (step 0's `fill_screen`, and — post-
+guard — the mirrored text of any pre-map print) touch the GOP surface, which UEFI's own tables map;
+on the bench board the firmware hands over no linear framebuffer, so fbcon is inert there. Non-
+tegra builds are byte-identical: everything sits inside `cfg(feature = "tegra")` in tail-defined
+blocks with same-line calls, and `4f2f1229` proves it (bare `kernel8` at baseline vs the fixed
+tree: bit-identical, `cmp` clean — the first cut `ed8f810c` had broken this via panic-`Location`
+line shifts).
 
 The alternative — gating `init_edid`'s call site on `not(tegra)` — was rejected because it fixes
 one caller: any future unconditional early print (and the merge added its by design, for witness
-coverage on every arch) would re-introduce the identical silent hang. The latch converts the whole
-class from "undebuggable dark-window death" to "counted, witnessed, harmless".
+coverage on every arch) would re-introduce the identical silent hang. The latch converts the
+UARTC class from "undebuggable dark-window death" to "counted, witnessed, harmless".
 
 ### Verification status
 
