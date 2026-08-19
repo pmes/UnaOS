@@ -8929,3 +8929,26 @@ owes the verdict: `dark-window guard — N` with N > 0, the re-emitted EDID line
 pre-merge JD/JB chain to the JD2 shell. If boot 2 still hangs, the conviction is incomplete and
 the standing fallback is the M1 stack-switch-at-entry instrument (rmbp 0's design, deliberately
 unbuilt so each boot carries one variable).
+
+### Metal verdict (boots 2–3, 2026-08-18/19) and the second bug: SVCVEC
+
+Boot 2 (`boot2-darkguard-ed8f810`) confirmed the conviction on silicon: the guard counted **55 and
+89 dropped pre-map bytes** across two power-cycles (`:: tegra: dark-window guard — N byte(s)
+dropped pre-map ::`), the EDID witness re-emitted (1920x1200), and the boot ran JB2b HID, 5/5
+secondaries via PSCI, CAPSTONE 6/6, and RAST at 30.3 fps — everything the pre-merge base could do
+and more. It then froze on a second, unrelated merge-era defect: el0-hello's first `svc #0` landed
+in the halting fault logger (`ESR=0x56000000 EC=0x15 ELR=0x7800000014`), because JETSON-EL0 (M1b)
+had widened `syscall.rs`/`bus.rs` to `any(baremetal, tegra_el0)` but left the 0x400 vector's
+`svc_vec!`/`svc_stub!`/`aarch64_el0_fault_handler` gated on `baremetal` alone — a live EL0 spawn
+path with no syscall dispatch. **SVCVEC** (`33f94623`) widened the four cfg lines in place.
+
+Boot 3 (`boot3-svcvec-33f9462`) closed the arc: `:: SVC: EC=0x15 nr=1 — EL0->EL1 syscall path
+live ::`, `hello from EL0`, `:: TEGRA-EL0: el0-hello round-trip -> PASS ::` — the first EL0
+round-trip on Orin silicon — then the JD2 interactive shell (the arc gate), JD4 console-owns-panel,
+JD20 pointer, and a live interactive GUI session. Spec `jetson-sync1.spec` promoted the el0-hello
+line PENDING→REQUIRE (`1f0c3aff`). Still open: TEGRA-SD identify (honest stop at M2, `card
+detected / no identified card` — the block-publish witness stays PENDING) and one unwitnessed
+REQUIRE on boot 3 (`CAPSTONE COMPLETE` — printed on boot 2's first cycle, absent under boot 3's
+interactive load; under analysis). Lossy-TCU caveat, re-proven: boot 3's capture lost the guard and
+EDID head lines entirely — single-print witnesses need the boot-2 cross-capture evidence or 24–32×
+repetition.
