@@ -76,6 +76,17 @@ pub fn init() {
     let freq = cntfrq();
     // Guard against a firmware that left CNTFRQ unset (0): fall back to the QEMU virt value so the
     // tick is merely wrong-rate rather than a divide-by-zero / never-firing timer.
+    //
+    // ...but SAY SO. The banner below prints the SUBSTITUTED value, so a board whose firmware never
+    // programmed CNTFRQ produced a line reading `CNTFRQ=62500000 Hz` — indistinguishable from a
+    // correctly-programmed QEMU virt, while every wall-clock budget derived from it (verify_live's
+    // ~100 ms, the xHCI pump's timeouts, busy_delay_ms) is silently wrong by whatever ratio the real
+    // counter runs at. A substituted default that is never witnessed is a fabricated measurement.
+    // `tegra`-gated so the pi/virt images stay byte-identical.
+    #[cfg(feature = "tegra")]
+    if freq == 0 {
+        cntfrq_substituted(62_500_000);
+    }
     let freq = if freq == 0 { 62_500_000 } else { freq };
     let interval = freq / TICK_HZ;
     INTERVAL.store(interval, Ordering::Relaxed);
@@ -295,5 +306,16 @@ pub fn diagnose() {
         istatus as u8,
         TIMER_INTID,
         super::gic::ppi_pending(TIMER_INTID),
+    );
+}
+
+// ── CNTFRQ-SUB witness (tail-defined per the Location-shift convention; `tegra`-gated so the pi and
+// QEMU-virt images stay byte-identical). See `init`: the fallback is correct, its silence was not.
+#[cfg(feature = "tegra")]
+#[inline(never)]
+fn cntfrq_substituted(used: u64) {
+    serial_println!(
+        ":: tegra: CNTFRQ-SUB — CNTFRQ_EL0 reads 0 (firmware never programmed it); SUBSTITUTING {} Hz for the tick + EVERY wall-clock budget derived from it — the banner's CNTFRQ below is this substitute, NOT silicon ::",
+        used
     );
 }

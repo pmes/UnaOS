@@ -2339,17 +2339,19 @@ mod metal {
     /// the node is a Tegra DesignWare RC and firmware-enabled before returning the base.
     fn resolve_ecam_base(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<u64> {
         if dtb_addr == 0 || dtb_size == 0 {
-            return None;
+            return ecam_stop("no DTB handed off (addr / size)", dtb_addr, dtb_size as u64);
         }
         // The DTB must be in a mapped GiB (GiB 0 device window, or a RAM GiB) before we deref it.
         let g_lo = dtb_addr >> 30;
         let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
         let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
         if !mapped(g_lo) || !mapped(g_hi) {
-            return None;
+            return ecam_stop("DTB GiB unmapped (GiB lo / RAM-GiB-mask)", g_lo, ram_gib_mask);
         }
         let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
-        let fdt = Fdt::new(blob)?;
+        let Some(fdt) = Fdt::new(blob) else {
+            return ecam_stop("bad DTB header (magic/bounds) at Fdt::new (addr / size)", dtb_addr, dtb_size as u64);
+        };
 
         // First `pcie@` node's path.
         const PATH_CAP: usize = 160;
@@ -2372,7 +2374,7 @@ mod metal {
             }
         });
         if !found {
-            return None;
+            return ecam_stop("no pcie@ node in the tree", 0, 0);
         }
         let path = &path0[..plen0];
 
@@ -2403,7 +2405,11 @@ mod metal {
             })
             .unwrap_or(false);
         if !is_tegra_rc {
-            return None;
+            return ecam_stop(
+                "first pcie@ node is not a Tegra/DesignWare RC (compatible present? / len) — foreign or QEMU-virt DTB",
+                compatible.is_some() as u64,
+                compatible.map(|c| c.len() as u64).unwrap_or(0),
+            );
         }
         // Firmware-enabled? (absent status ⇒ "okay" per the DT spec; anything but okay/ok ⇒ skip.)
         let okay = match status {
@@ -2411,11 +2417,13 @@ mod metal {
             Some(s) => s.split(|&b| b == 0).any(|item| item == b"okay" || item == b"ok"),
         };
         if !okay {
-            return None;
+            return ecam_stop("Tegra RC node status is NOT okay (firmware-disabled controller); status len", status.map(|s| s.len() as u64).unwrap_or(0), 0);
         }
 
         // Index reg-names for "ecam"; read that region's 64-bit base from reg.
-        let (reg, names) = (reg?, reg_names?);
+        let (Some(reg), Some(names)) = (reg, reg_names) else {
+            return ecam_stop("Tegra RC node lacks reg and/or reg-names (reg present? / reg-names present?)", reg.is_some() as u64, reg_names.is_some() as u64);
+        };
         let mut idx = 0usize;
         for item in names.split(|&b| b == 0) {
             if item.is_empty() {
@@ -2430,6 +2438,19 @@ mod metal {
             }
             idx += 1;
         }
+        ecam_stop("reg-names carries no \"ecam\" region (names byte length / regions scanned)", names.len() as u64, idx as u64)
+    }
+
+    /// One named ECAM-resolution abandon witness + the `None` the rung returns (tail-of-fn helper,
+    /// so each rung stays a single `return ecam_stop(..)` line and no call-site `Location` shifts).
+    /// The caller prints ONE generic line — "no enabled Tegra234 RC ecam in the DTB" — which is true
+    /// of EIGHT different failures; on a bench boot that difference is the whole diagnosis.
+    #[inline(never)]
+    fn ecam_stop(why: &str, a: u64, b: u64) -> Option<u64> {
+        serial_println!(
+            "{}   ECAM-RESOLVE STOP — {} = {:#x} / {:#x}; controller-0 config window unresolved ::",
+            P4, why, a, b
+        );
         None
     }
 
@@ -2814,16 +2835,18 @@ mod metal {
         bar_pci: u64,
     ) -> Option<(u64, MemWindow)> {
         if dtb_addr == 0 || dtb_size == 0 {
-            return None;
+            return atu_stop("no DTB handed off (addr / size)", dtb_addr, dtb_size as u64);
         }
         let g_lo = dtb_addr >> 30;
         let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
         let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
         if !mapped(g_lo) || !mapped(g_hi) {
-            return None;
+            return atu_stop("DTB GiB unmapped (GiB lo / RAM-GiB-mask)", g_lo, ram_gib_mask);
         }
         let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
-        let fdt = Fdt::new(blob)?;
+        let Some(fdt) = Fdt::new(blob) else {
+            return atu_stop("bad DTB header (magic/bounds) at Fdt::new (addr / size)", dtb_addr, dtb_size as u64);
+        };
 
         // First `pcie@` node's path.
         const PATH_CAP: usize = 160;
@@ -2846,7 +2869,7 @@ mod metal {
             }
         });
         if !found {
-            return None;
+            return atu_stop("no pcie@ node in the tree", 0, 0);
         }
         let path = &path0[..plen0];
 
@@ -2878,18 +2901,24 @@ mod metal {
             })
             .unwrap_or(false);
         if !is_tegra_rc {
-            return None;
+            return atu_stop(
+                "first pcie@ node is not a Tegra/DesignWare RC (compatible present? / len) — foreign or QEMU-virt DTB",
+                compatible.is_some() as u64,
+                compatible.map(|c| c.len() as u64).unwrap_or(0),
+            );
         }
         let okay = match status {
             None => true,
             Some(s) => s.split(|&b| b == 0).any(|item| item == b"okay" || item == b"ok"),
         };
         if !okay {
-            return None;
+            return atu_stop("Tegra RC node status is NOT okay (firmware-disabled controller); status len", status.map(|s| s.len() as u64).unwrap_or(0), 0);
         }
 
         // reg/reg-names region base by name (4 cells = addr:2 + size:2 per region, big-endian).
-        let (reg, names) = (reg?, reg_names?);
+        let (Some(reg), Some(names)) = (reg, reg_names) else {
+            return atu_stop("Tegra RC node lacks reg and/or reg-names (reg present? / reg-names present?)", reg.is_some() as u64, reg_names.is_some() as u64);
+        };
         let region_base = |want: &[u8]| -> Option<u64> {
             let mut idx = 0usize;
             for item in names.split(|&b| b == 0) {
@@ -2908,14 +2937,19 @@ mod metal {
             None
         };
         // Prefer the dedicated ATU region; fall back to the DWC-core dbi + 0x30_0000 offset.
-        let atu_base = region_base(b"atu_dma")
+        let Some(atu_base) = region_base(b"atu_dma")
             .or_else(|| region_base(b"atu"))
-            .or_else(|| region_base(b"dbi").map(|d| d + ATU_DBI_FALLBACK_OFF))?;
+            .or_else(|| region_base(b"dbi").map(|d| d + ATU_DBI_FALLBACK_OFF))
+        else {
+            return atu_stop("reg-names carries none of atu_dma / atu / dbi — no ATU base derivable (reg-names byte length)", names.len() as u64, 0);
+        };
 
         // Walk `ranges`: rows of 7 cells (child PCI addr:3, parent CPU addr:2, size:2 = 28 bytes).
         // The child cell-0 high byte's space code ((>>24)&3): 2 = 32-bit MEM, 3 = 64-bit MEM (1 = I/O,
         // skipped). Return the first MEM window whose [pci_base, pci_base+size) contains `bar_pci`.
-        let ranges = ranges?;
+        let Some(ranges) = ranges else {
+            return atu_stop("Tegra RC node carries NO ranges property — no MEM window to place the BAR in", 0, 0);
+        };
         let cell = |b: &[u8], i: usize| -> u64 {
             u32::from_be_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]) as u64
         };
@@ -2935,6 +2969,20 @@ mod metal {
             }
             off += 28;
         }
+        atu_stop("no MEM `ranges` row contains BAR2's PCIe address (BAR pci addr / ranges byte length)", bar_pci, ranges.len() as u64)
+    }
+
+    /// One named ATU/window-resolution abandon witness + the `None` the rung returns (tail-of-fn
+    /// helper; each rung stays a single `return atu_stop(..)` line, so no call-site `Location`
+    /// shifts). The caller prints ONE generic REFUSE line covering EIGHT distinct rungs — and the
+    /// refusal is the one standing between the driver and re-running the FAULT-AT-M1 raw-BAR deref,
+    /// so which rung fired is exactly what the next bench boot needs to know.
+    #[inline(never)]
+    fn atu_stop(why: &str, a: u64, b: u64) -> Option<(u64, MemWindow)> {
+        serial_println!(
+            "{}   ATU-RESOLVE STOP — {} = {:#x} / {:#x}; outbound iATU window unresolved (caller REFUSES the raw-BAR deref) ::",
+            P4, why, a, b
+        );
         None
     }
 

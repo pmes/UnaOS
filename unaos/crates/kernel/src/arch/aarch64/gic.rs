@@ -268,6 +268,15 @@ fn gicd_wait_rwp() {
     while unsafe { gicd_read(GICD_CTLR) } & (1 << 31) != 0 {
         budget -= 1;
         if budget == 0 {
+            // A bounded wait that gives up and PROCEEDS must say so: the distributor write we were
+            // waiting on (ARE, then the group enables) has not been observed to land, so everything
+            // that follows — IROUTER, PPI/SPI enables, the whole GICv3 model — may be operating on a
+            // distributor that never accepted the affinity-routed configuration. Silence here reads
+            // exactly like success on the wire. Tegra-gated so the pi/virt images stay byte-identical.
+            #[cfg(feature = "tegra")]
+            gic_wait_timeout("GICD_CTLR.RWP never cleared (distributor write still propagating); CTLR", unsafe {
+                gicd_read(GICD_CTLR)
+            } as u64);
             break;
         }
         core::hint::spin_loop();
@@ -444,6 +453,15 @@ fn init_redistributor_v3() -> usize {
         while gicr_read(rd, GICR_WAKER) & (1 << 2) != 0 {
             budget -= 1;
             if budget == 0 {
+                // ChildrenAsleep never cleared: this core's redistributor is still asleep, so NO
+                // banked interrupt (the timer PPI 30, any SGI) can be delivered to it — yet the
+                // bring-up proceeds and the next line printed is the cheerful `GICv3 init` banner.
+                // That is a silent degrade that reads as success; name it, with the live WAKER.
+                #[cfg(feature = "tegra")]
+                gic_wait_timeout(
+                    "GICR_WAKER.ChildrenAsleep never cleared (redistributor still asleep; PPI/SGI delivery will NOT work); WAKER",
+                    gicr_read(rd, GICR_WAKER) as u64,
+                );
                 break;
             }
             core::hint::spin_loop();
@@ -861,4 +879,20 @@ fn handle_irq_v3() {
     }
     // ICC_EOIR1_EL1: writing the acked value drops priority and (EOImode=0) deactivates.
     unsafe { core::arch::asm!("msr S3_0_C12_C12_1, {}", in(reg) iar, options(nomem, nostack, preserves_flags)) };
+}
+
+// ── GIC-WAIT witness (tail-defined per the Location-shift convention; `tegra`-gated so the pi and
+// QEMU-virt images are byte-identical to baseline). Both GICv3 bring-up spins above are BOUNDED —
+// correctly, so a model that never clears the bit cannot wedge boot — but both used to expire into
+// a bare `break` and let the bring-up carry on printing its success banner. A bounded wait that
+// times out and PROCEEDS without saying so is a silent degrade, and on the Orin these two decide
+// whether the distributor accepted its configuration and whether this core's redistributor is even
+// awake to receive the timer PPI. ─────────────────────────────────────────────────────────────────
+#[cfg(all(feature = "tegra", not(feature = "pi")))]
+#[inline(never)]
+fn gic_wait_timeout(what: &str, val: u64) {
+    serial_println!(
+        ":: tegra: GIC-WAIT TIMEOUT — {} = {:#x} after 1000000 spins; bring-up PROCEEDS DEGRADED (interrupt delivery is NOT proven from here) ::",
+        what, val
+    );
 }

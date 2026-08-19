@@ -1085,14 +1085,14 @@ unsafe fn repair_fb_l2(
 /// base there is a survey misread, not a framebuffer, and the caller must then skip the blit.
 pub fn map_fb_region(pa: u64, size: usize) -> bool {
     if pa == 0 || size == 0 {
-        return false;
+        return fb_map_refuse("zero base or zero length — not a mappable scanout; base / len", pa, size as u64);
     }
     let g_lo = pa >> 30;
     let g_hi = (pa + size as u64 - 1) >> 30;
     // A scanout framebuffer lives in DRAM (Orin: 0x8000_0000.., GiB 2 upward). GiB 0 is the Tegra
     // Device window and GiB 1 the SYSRAM/peripheral window — never a framebuffer.
     if g_lo < 2 || g_hi >= 64 {
-        return false;
+        return fb_map_refuse("span outside the DRAM GiB range 2..63 (GiB lo / GiB hi)", g_lo, g_hi);
     }
     let el = current_el();
     let l1 = &raw mut L1 as *mut u64;
@@ -1153,6 +1153,12 @@ pub fn map_fb_region(pa: u64, size: usize) -> bool {
             }
         }
         let after = unsafe { l1.add(gi).read_volatile() };
+        // A GiB that is STILL neither a RAM block nor an L2 split after the patch above is the one
+        // case whose failure the caller's generic line mis-names ("not DRAM GiB 2..63" when the span
+        // is squarely inside it) — name the GiB and the descriptor that refused.
+        if !(is_ram_block(after) || is_table_desc(after)) {
+            fb_map_gib_refused(g, after);
+        }
         all_ok &= is_ram_block(after) || is_table_desc(after);
     }
     if changed {
@@ -1627,6 +1633,22 @@ pub fn select_heap_region(
     }
     let mut fdt_carve = [(0u64, 0u64); 48];
     let nf = super::fdt_tegra::reserved_carveouts(dtb_addr, dtb_size, &mut fdt_carve);
+    // `reserved_carveouts` returns a bare COUNT — 0 covers "the DTB declares none", "the blob was
+    // absent/implausible", and "the header failed to parse", and those are very different worlds for
+    // a heap that must dodge SNOC-firewalled DRAM. Witness the count either way, and say loudly when
+    // it is zero: a zero here means the ONLY protection left is the UEFI-reserved set plus the
+    // XCARVE quirk, i.e. the exclusion set is materially weaker than the one the boot assumes.
+    if nf == 0 {
+        serial_println!(
+            ":: tegra: HEAP-GUARD WARNING — DTB /reserved-memory yielded ZERO carveouts (dtb @{:#x} size={:#x}); heap dodges only the UEFI-reserved set + the XCARVE quirk ::",
+            dtb_addr, dtb_size
+        );
+    } else {
+        serial_println!(
+            ":: tegra: HEAP-GUARD — DTB /reserved-memory contributed {} carveout range(s) (cap 48) to the exclusion set ::",
+            nf
+        );
+    }
     for &c in fdt_carve.iter().take(nf) {
         if nc < MAX_CARVE {
             carve[nc] = c;
@@ -1820,4 +1842,31 @@ pub fn select_heap_region(
         best_uncon.unwrap_or(0)
     );
     None
+}
+
+// ── JD1-MAP witnesses (tail-defined per the Location-shift convention: each refusal rung stays a
+// single `return fb_map_refuse(..)` line, so no call-site line numbers move). `map_fb_region` used
+// to return a bare `false` from three places, and its one caller then printed ONE generic reason —
+// "scanout base … not mappable (not DRAM GiB 2..63)" — which is simply WRONG for two of the three
+// (a zero length, and a GiB the patch could not turn into RAM). A headless bench boot could not tell
+// them apart. These name the actual rung, with the value that decided it. ────────────────────────
+
+/// One named JD1-MAP refusal witness + the `false` the rung returns.
+#[inline(never)]
+fn fb_map_refuse(why: &str, a: u64, b: u64) -> bool {
+    serial_println!(
+        ":: tegra: JD1-MAP REFUSED — {} = {:#x} / {:#x}; the inherited scanout is NOT mapped (caller skips the blit) ::",
+        why, a, b
+    );
+    false
+}
+
+/// The per-GiB failure witness: after the L1/L2 patch this GiB is still neither a RAM block nor a
+/// carveout L2 split, so the scanout span is not fully backed. Names the GiB and the live descriptor.
+#[inline(never)]
+fn fb_map_gib_refused(gib: u64, desc: u64) {
+    serial_println!(
+        ":: tegra: JD1-MAP REFUSED — GiB {} still not RAM after patch (L1 desc={:#x}); scanout span not fully mapped ::",
+        gib, desc
+    );
 }
