@@ -6023,6 +6023,101 @@ struct VerifyRef {
     full_rows: usize,
 }
 
+// ---------------------------------------------------------------------------------------------
+// WCD-VALVE — the boot-9 read-back pressure DISCRIMINATOR (UNAOS_WCDVALVE=1, feature `wcdvalve`)
+// ---------------------------------------------------------------------------------------------
+// THE METAL FACT (boot 8): under the 6-vug storm `[comp2]` reads `wcd_us` ≈ 4.0–4.1 M per 5000 ms
+// rollup — the WC-D scan-out read-back (uncached PCIe reads from the Kepler BAR1) at ~80 % duty —
+// and that read pressure PRECEDES a reproducible full compositor wedge. The endpoint-hang theory
+// says the sustained uncached read stream is what wedges the endpoint; nothing on the wire can yet
+// separate that from a compositor-side cause.
+//
+// THE VALVE IS THE EXPERIMENT, NOT A FIX. When armed, WC-D read-back ADMISSION is suppressed while
+// composite load is high: `verify_reference` returns before `wcd_admit`, so NO state transitions
+// are made, no decline is counted, no latch is burned — the battery stays exactly as owed and the
+// standing machinery (`wcd_pending` / the paygo taker / the next admitted present) pays it when the
+// valve reopens. Boot 9 then discriminates: wedge gone with the valve CLOSED under storm ⇒ the
+// read-back pressure is implicated; wedge anyway ⇒ the reads are exonerated.
+//
+// THE SIGNAL is the `[comp2]` utilisation the instrument already maintains: `C2_INSPAN_CYC` over
+// `now − C2_EPOCH_CYC` is the fraction of the CURRENT rollup span's wall clock spent inside a
+// composite pass — the same numerator/denominator pair `util_pct` prints, read mid-span. Chosen as
+// the cheapest HONEST signal available here: two relaxed loads and one `now_cycles`, no lock, no
+// table scan, and it measures the pressure itself (composite duty) rather than a proxy like a
+// window count (six parked vugs that stopped presenting are no load at all). Hysteresis
+// (close ≥ 60 %, reopen < 35 %) plus a 50 ms minimum span keep a fresh epoch's near-zero reading
+// and a boundary wobble from flapping the valve.
+//
+// Default OFF, and the unarmed build is byte-identical: every item below is `wcdvalve`-gated and
+// compiles out with the feature. Witness-gated with the WC-D machinery it throttles; x86-only with
+// the BAR1 read-back the theory indicts.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+static WCDVALVE_SHUT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// One `CLOSED` line per suppression episode; re-armed by the reopen.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+static WCDVALVE_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Admissions suppressed in the CURRENT episode — `suspended=` on both episode lines.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+static WCDVALVE_SUSPENDED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The utilisation reading that closed the valve — `util~` on the episode line.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+static WCDVALVE_UTIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Close at or above this composite utilisation (percent of span wall clock inside a pass).
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+const WCDVALVE_CLOSE_PCT: u64 = 60;
+/// Reopen strictly below this — the hysteresis gap is what keeps the valve from flapping at the
+/// threshold while suppression itself lowers the measured load.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+const WCDVALVE_OPEN_PCT: u64 = 35;
+/// Hold the standing verdict until the current `[comp2]` span is at least this old: a rollup drain
+/// zeroes `C2_INSPAN_CYC`, and judging the first instants of a fresh epoch would read ~0 % on a
+/// storm that has not paused at all.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+const WCDVALVE_MIN_SPAN_US: u64 = 50_000;
+
+/// WCD-VALVE — is the valve CLOSED for this admission? Called by [`verify_reference`] ahead of
+/// [`wcd_admit`]; a `true` suppresses the read-back with no WC-D state touched. Also the place both
+/// episode transitions are judged and printed, so the wire carries one line per episode each way:
+/// `[wc-d] valve CLOSED util~N% suspended=K` at the first suppressed admission, and
+/// `[wc-d] valve OPEN resumed suspended=K` (K = the episode's total) when the load falls away.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+fn wcdvalve_closed() -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let now = crate::arch::now_cycles();
+    let epoch = C2_EPOCH_CYC.load(Relaxed);
+    let span = now.saturating_sub(epoch);
+    if epoch != 0 && super::wcg::cycles_to_us(span) >= WCDVALVE_MIN_SPAN_US {
+        // `span > 0` is implied by the minimum-age test, so the division is safe.
+        let util = C2_INSPAN_CYC.load(Relaxed).saturating_mul(100) / span;
+        let shut = WCDVALVE_SHUT.load(Relaxed);
+        if !shut && util >= WCDVALVE_CLOSE_PCT {
+            WCDVALVE_UTIL.store(util, Relaxed);
+            WCDVALVE_SUSPENDED.store(0, Relaxed);
+            WCDVALVE_SAID.store(false, Relaxed);
+            WCDVALVE_SHUT.store(true, Relaxed);
+        } else if shut && util < WCDVALVE_OPEN_PCT {
+            WCDVALVE_SHUT.store(false, Relaxed);
+            serial_println!(
+                "[wc-d] valve OPEN resumed suspended={}",
+                WCDVALVE_SUSPENDED.load(Relaxed)
+            );
+            return false;
+        }
+    }
+    if WCDVALVE_SHUT.load(Relaxed) {
+        let k = WCDVALVE_SUSPENDED.fetch_add(1, Relaxed) + 1;
+        if !WCDVALVE_SAID.swap(true, Relaxed) {
+            serial_println!(
+                "[wc-d] valve CLOSED util~{}% suspended={}",
+                WCDVALVE_UTIL.load(Relaxed),
+                k
+            );
+        }
+        return true;
+    }
+    false
+}
+
 /// WC-D — capture the read-back's reference, from the composite loop, BEFORE `draw_window` runs.
 ///
 /// The eligibility test and the one-shot latch live here rather than at the read-back because whoever takes
@@ -6059,6 +6154,14 @@ fn verify_reference(
     // the ONE reference, or (PAYGO) the deferral gate is shut, in which case the decline has already
     // been counted and, on cadence, printed. See [`WCD_STATE`].
     let i = r.id as usize;
+    // WCD-VALVE — suppression is judged BEFORE `wcd_admit`, deliberately: a suppressed admission
+    // moves no `WCD_STATE`, burns no latch and counts no decline, so the verdict is POSTPONED, not
+    // blinded — the battery stays owed and is paid the ordinary way once the valve reopens. See the
+    // ledger above [`wcdvalve_closed`]. Compiled out entirely without the `wcdvalve` knob.
+    #[cfg(all(target_arch = "x86_64", feature = "wcdvalve"))]
+    if wcdvalve_closed() {
+        return None;
+    }
     let (step, running) = wcd_admit(r.id, i)?;
     // The reference is this core's alone from here — `wcd_admit`'s compare_exchange is the winner
     // test — so every `serial_println!` below is emitted once. The geometry `-> SKIP`s call

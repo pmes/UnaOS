@@ -119,6 +119,15 @@ _feats=""
 # same variable (`UNAOS_WCG_PAYGO` -> `wcg-paygo`) — so the knob reaches the ESP a metal boot runs and
 # not only `check`. A knob wired into arroyo alone never reaches the boot media.
 [ -n "${UNAOS_WCG_PAYGO:-}" ] && _feats="${_feats}wcg-paygo,"
+# WCD-VALVE (boot-9 discriminator): UNAOS_WCDVALVE=1 arms the `wcdvalve` feature — suppress WC-D
+# scan-out read-back ADMISSION while composite utilisation is high (close >= 60%, reopen < 35%,
+# read from the [comp2] counters), one `[wc-d] valve CLOSED/OPEN` line per episode. A suppressed
+# admission postpones the verdict (no WCD state moved), so the battery is paid normally once the
+# valve reopens. Needs UNAOS_WITNESS to reach anything (the WC-D machinery is witness-gated);
+# x86_64 only. Default OFF => compiled out, media byte-identical. Kept in sync with
+# builder/src/main.rs, which maps this same variable — a knob wired into arroyo alone never
+# reaches the boot media.
+[ -n "${UNAOS_WCDVALVE:-}" ] && _feats="${_feats}wcdvalve,"
 [ -n "${UNAOS_SKIP_XHCI:-}" ] && _feats="${_feats}skip_xhci,"
 [ -n "${UNAOS_BOOTLOG:-}" ] && _feats="${_feats}bootlog,"
 # CLOCK-2: UNAOS_LOGTS=1 arms the `logts` feature — a compact timestamp prefix on each serial LINE
@@ -734,6 +743,11 @@ arm_features() {
     # points, which is the property that lets the x86 track arm a card-write knob without touching the
     # Pi or Jetson media at all.
     f="${f//,sdw,/,}"
+    # WCD-VALVE rides the same strip, for the same reason: every valve item is x86_64-gated, so
+    # `wcdvalve` emits not one byte of aarch64 CODE — but an enabled feature is hashed into cargo's
+    # `-Cmetadata` fingerprint, and leaving it in would shift the aarch64 media hash between a
+    # default build and a `UNAOS_WCDVALVE=1` one for zero observable change.
+    f="${f//,wcdvalve,/,}"
     # SDHC-4b rides the same strip: the registration call site is inside `drivers/sdhc.rs` (reached only
     # from `arch/x86_64/pci.rs`) and every block/FAT arm the knob adds is gated
     # `all(target_arch = "x86_64", feature = "sdhcblk")`, so `sdhcblk` emits not one byte of aarch64

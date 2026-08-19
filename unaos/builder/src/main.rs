@@ -97,6 +97,11 @@ fn main() {
     // passes, x86-only paths, default OFF => byte-identical. Mapped here as well as in `arroyo`
     // for the same reason as BOTRING64 above: a knob arroyo alone sets never reaches boot media.
     if std::env::var("UNAOS_WCG_PAYGO").is_ok() { feats.push("wcg-paygo"); }
+    // WCD-VALVE (boot-9 discriminator): suppress WC-D read-back admission under high composite
+    // utilisation (video/wm.rs §WCD-VALVE). Mapped here as well as in `arroyo` for the reason the
+    // knobs above state: a knob wired into arroyo alone never reaches the ESP media the metal boot
+    // actually runs. Requires witness to reach anything; default OFF => byte-identical.
+    if std::env::var("UNAOS_WCDVALVE").is_ok() { feats.push("wcdvalve"); }
     // VPERF: x86 video-path bench instrumentation (scroll/VRAM-read counters, fbmem readout,
     // display-BAR probe, scripted scroll scenario). x86_64-only module; default OFF.
     if std::env::var("UNAOS_VIDEOBENCH").is_ok() { feats.push("videobench"); }

@@ -158,6 +158,17 @@ wxnro = []
 # every `[wc-g]` line is byte-identical to the pre-M3 wire and aarch64 is unaffected either way.
 # Enable via `UNAOS_WCG_PAYGO=1`. See video/wcg.rs §WC-G/M3.
 wcg-paygo = []
+# WCD-VALVE (boot-9 discriminator): suppress WC-D scan-out read-back ADMISSION while composite
+# utilisation is high (close >= 60% of the [comp2] span's wall clock inside a pass, reopen < 35%,
+# judged from the counters the instrument already keeps). A suppressed admission touches no WCD
+# state — the verdict is postponed, never blinded — and each episode prints one line each way
+# (`[wc-d] valve CLOSED util~N% suspended=K` / `[wc-d] valve OPEN resumed suspended=K`). Purpose:
+# metal boot 8 ties ~4.0M us of wcd read-back per 5 s rollup (uncached Kepler BAR1 reads) to a
+# reproducible compositor wedge under the 6-vug storm; boot 9 with the valve armed discriminates —
+# wedge gone while CLOSED implicates the read pressure, wedge anyway exonerates the reads.
+# Requires `witness` (the WC-D machinery it throttles is witness-gated); x86_64 only. DEFAULT OFF =>
+# every valve item is compiled out and the build is byte-identical. Enable via `UNAOS_WCDVALVE=1`.
+wcdvalve = []
 # Skip xHCI/USB bring-up entirely (`pci::init`). For real-hardware video bring-up where the
 # firmware/SMM may still own the xHCI controller (this branch has no BIOS->OS handoff) and wedge
 # its reset handshake — the controller's status bits never flip, so the bounded-but-slow timeout
