@@ -1063,10 +1063,63 @@ const BOT_PARK_DEAD_DIV: u64 = 8;
 /// AFTER it has proven itself idle twice, and the whole verdict costs ~16 s instead of the ≥45 s
 /// the wall-clock clause needs (and never reaches once the cut is on). A healthy device is charged
 /// none of these: a completion is `dead=false`, and a live ring posts events, foreign events or
-/// doorbells, any one of which disqualifies the wait. Against boot5's own trace the account crosses
+/// doorbells, any one of which disqualifies the wait. **That defence was overstated, and BOTLATCH M2
+/// below is the correction: it protects a device that is TRANSACTING, not a device that is merely
+/// healthy.** Two devices fall through it — one whose eight idle waits are scattered across an
+/// uptime full of completions (nothing refunded them), and one that is answering with NAKs, which
+/// put nothing on the ring at all. See `BOT_PARK_REPROBE_MS`. Against boot5's own trace the account
+/// crosses
 /// 8 at pump timeout #19 of 41 — the last 22 timeouts, and the ~2.5 minutes of 99%-core they cost,
 /// never happen.
 const BOT_PARK_DEAD_MAX: u32 = 8;
+/// BOTLATCH M2 (2026-08-18 adversarial panel, findings 4 and 5). The dead-ring clause above is
+/// correct about the device it was written for and wrong about two devices it was not, and both
+/// defects have the same shape: `dead_total` was a counter with an ACCUMULATION rule and no
+/// FORGIVENESS rule, so it measured "has this identity ever looked idle" rather than "is this
+/// identity idle".
+///
+/// FINDING 4 — NO RESET ON SUCCESS. `dead_total` was cleared by exactly one thing:
+/// `bot_park_forget`, i.e. an operator replug. Nothing a device could DO cleared it. With a single
+/// USB device attached — the bench Pi's normal shape, and the shape of every capture that is not
+/// boot5's FTDI-plus-reader sitting — the `dead` predicate (`evts == 0 && foreign == 0 && db == 0`)
+/// degenerates: with no second device there is no foreign traffic to make an idle wait live, so
+/// `dead` means only "this wait timed out". Eight scattered idle timeouts across an entire uptime —
+/// a medium change, a spun-down disk, a hub that briefly stopped answering — then park, permanently,
+/// on the next transfer, with every one of the intervening thousands of COMPLETED transfers counting
+/// for nothing. The fix is `bot_park_note_success`: a transfer that COMPLETED for this identity
+/// zeroes `dead_total`. Nothing weaker is allowed to, and that is the whole point of the counter —
+/// foreign traffic on the shared ring already refunds `dead_streak`, and letting it refund the
+/// VERDICT counter too is precisely the boot5 defect this clause was written to close. A completion
+/// is a fact about THIS device: its own transfer event landed on the ring. Boot5's conviction is
+/// untouched, because the wedged reader never completed anything — its 41 waits are 41 timeouts with
+/// no completion between them.
+///
+/// FINDING 5 — A NAKING DEVICE IS INDISTINGUISHABLE FROM A DEAD RING. A cold HDD spinning up, or a
+/// card just inserted, NAKs: it posts no event TRB at all, which is byte-identical on the ring to
+/// the [piusb40] necropsy signature. Two full-budget waits arm the cut, then six at ~0.3 s — the
+/// device is parked in ~16 s and, before this, recoverable only by physical replug. That directly
+/// contradicts this module's own stated constraint (see `BOT_PARK_PASS_PUMP_MS`: "a slow-but-healthy
+/// stick must keep them"), and 16 s is well inside a 7200 rpm spin-up.
+///
+/// So a dead-ring park gets ONE automatic re-probe, after this cooldown, and exactly one. Sixty
+/// seconds: longer than any spin-up or card-init this driver can be handed, short enough that a
+/// bench operator who has walked away still finds the device working; and it is charged to UPTIME,
+/// not spun — `reprobe_at` is a deadline the next gate consultation tests, so the wait itself costs
+/// nothing. The unpark zeroes `dead_total` (the device needs a real allowance again, or the gate's
+/// own `verdict()` would re-park it inside the same call) and leaves `dead_streak` alone (so the
+/// probe is charged at the CUT budget, ~0.3 s, not a fresh ~7.2 s), and it sets `reprobed`, which is
+/// sticky for the life of the account. A SECOND park on the same identity is therefore permanent,
+/// and only an operator replug clears the flag.
+///
+/// The two fixes compose into the recovery rule: park, wait, probe once — if the probe COMPLETES,
+/// finding 4's reset clears the account and the device is simply back; if it dead-rings, the park
+/// latches for good. Boot5's reader: parked at ~16 s, re-probed at ~76 s, dead-rings, permanent —
+/// total cost two lines on the wire and one extra ~0.3 s wait, verdict preserved. A cold disk:
+/// parked at 16 s, re-probed at ~76 s when it is ready, completes, account cleared — recovered with
+/// no human hands. What the re-probe is NOT: it is not a timer and not a retry loop. It fires on the
+/// next thing that asks this identity for I/O after the deadline; if nothing ever asks again the
+/// device stays parked, which is the right outcome for a device nobody wants.
+const BOT_PARK_REPROBE_MS: u64 = 60_000;
 /// Escalating back-off between LADDER ENTRIES for one identity, doubling per entry. Distinct from
 /// `BOT_RESCUE_BACKOFF_MS`, which is the in-ladder spec-scale settle between RUNGS and stays exactly
 /// as it is (it is metal-earned: a device wedged mid-internal-stall is made worse by hammering).
@@ -1132,6 +1185,15 @@ pub static BOT_PARK_BACKOFF_REFUSED: AtomicU64 = AtomicU64::new(0);
 pub static BOT_PARK_ABORTS: AtomicU64 = AtomicU64::new(0);
 /// Pump waits whose budget was cut by the dead-ring cap.
 pub static BOT_PARK_CAPPED: AtomicU64 = AtomicU64::new(0);
+/// BOTLATCH M2 (finding 5). Dead-ring parks that spent their ONE automatic re-probe. Each one is a
+/// device that was given a second chance without an operator; read against `parked=` it says how
+/// many of this boot's parks were provisional.
+pub static BOT_PARK_REPROBES: AtomicU64 = AtomicU64::new(0);
+/// BOTLATCH M2 (finding 4). Dead-ring accounts zeroed by a COMPLETED transfer. Non-zero says the
+/// verdict counter is being forgiven by the only thing allowed to forgive it — read against
+/// `parked=`: a boot with many forgivenesses and no park is a device with occasional idle waits,
+/// which before this fix was a device on its way to a permanent park.
+pub static BOT_PARK_DEAD_FORGIVEN: AtomicU64 = AtomicU64::new(0);
 /// Ladder entries deferred to a later main-loop pass by the per-pass cap (the cooperative yield).
 pub static BOT_PARK_YIELDS: AtomicU64 = AtomicU64::new(0);
 /// Transfers declined because this main-loop pass had already spent `BOT_PARK_PASS_MS` on the
@@ -1209,10 +1271,20 @@ pub struct BotDevLedger {
     /// resets it is not a fact about this device.
     pub dead_total: u32,
     /// PARKED: no transfer, no bring-up, no rung. Cleared only by a real re-enumeration event —
-    /// a disconnect this driver did not itself cause (see `bot_park_note_disconnect`).
+    /// a disconnect this driver did not itself cause (see `bot_park_note_disconnect`) — or, once
+    /// per account, by the dead-ring re-probe below.
     pub parked: bool,
     /// `now_cycles()` before which the next ladder entry for this identity is declined.
     pub backoff_until: u64,
+    /// BOTLATCH M2 (finding 5). `now_cycles()` at or after which a DEAD-RING park unparks itself
+    /// once, for one probe. Zero = no re-probe pending (never armed, already spent, or the park was
+    /// not a dead-ring park — the other three clauses are the ladder's own verdicts on evidence a
+    /// cooldown cannot change). Not a timer: nothing polls it, the gate reads it.
+    pub reprobe_at: u64,
+    /// BOTLATCH M2 (finding 5). This identity has SPENT its one re-probe. Sticky for the life of the
+    /// account, so a second park is permanent; cleared only with the whole entry, by an operator
+    /// replug. This is what keeps the re-probe from becoming an unbounded retry loop.
+    pub reprobed: bool,
 }
 
 impl BotDevLedger {
@@ -1220,6 +1292,7 @@ impl BotDevLedger {
         ident: BotDevIdent { port: 0, route: 0, vid: 0, pid: 0 },
         used: false, gens: 0, ladders: 0, surrenders: 0, cycles: 0,
         dead_streak: 0, dead_total: 0, parked: false, backoff_until: 0,
+        reprobe_at: 0, reprobed: false,
     };
 
     /// The park verdict, as a pure function of the account and the timebase. `None` = keep going;
@@ -1245,6 +1318,53 @@ impl BotDevLedger {
     fn backoff_cycles(&self, per_ms: u64) -> u64 {
         let ms = (BOT_PARK_BACKOFF_MS << self.ladders.min(5)).min(BOT_PARK_BACKOFF_MAX_MS);
         per_ms.saturating_mul(ms)
+    }
+
+    /// BOTLATCH M2 (finding 4). A transfer COMPLETED for this identity — its own transfer event
+    /// landed on the ring, which is the one observation that contradicts "this ring is dead".
+    /// Zeroes the verdict counter and cancels any pending re-probe. Returns whether anything was
+    /// actually forgiven, so the caller can count it without counting every healthy transfer.
+    ///
+    /// Deliberately narrow. It clears the DEAD-RING account and nothing else: `ladders`,
+    /// `surrenders` and `cycles` are the ladder's records of work it had to do to get this
+    /// completion, and a device that needs a rescue rung per transfer must still reach its bound.
+    /// `reprobed` is likewise untouched — one re-probe per account, whatever happens in between.
+    fn note_success(&mut self) -> bool {
+        let forgave = self.dead_total != 0;
+        self.dead_total = 0;
+        self.reprobe_at = 0;
+        forgave
+    }
+
+    /// BOTLATCH M2 (finding 5). Arm the ONE automatic re-probe on a dead-ring park. A no-op if this
+    /// account has already spent it — that is what makes the second park permanent.
+    fn arm_reprobe(&mut self, now: u64, per_ms: u64) -> bool {
+        if self.reprobed {
+            return false;
+        }
+        self.reprobe_at = now.wrapping_add(per_ms.saturating_mul(BOT_PARK_REPROBE_MS));
+        true
+    }
+
+    /// Is this parked account due its re-probe now? Pure; wrap-safe (the deadline is compared as a
+    /// signed difference, exactly as the back-off is).
+    fn reprobe_due(&self, now: u64) -> bool {
+        self.parked
+            && !self.reprobed
+            && self.reprobe_at != 0
+            && (now.wrapping_sub(self.reprobe_at) as i64) >= 0
+    }
+
+    /// Spend the re-probe: unpark, flag, and hand the device back its dead-ring allowance. NOT a
+    /// general amnesty — `dead_streak` survives on purpose, so the probe's wait is charged at the
+    /// cut budget (~0.3 s) rather than a fresh first-attempt one, and the other three clauses are
+    /// left exactly as they were, so an account that is also at its ladder or surrender bound
+    /// re-parks on the very next `verdict()` — permanently, since `reprobed` is now set.
+    fn take_reprobe(&mut self) {
+        self.parked = false;
+        self.reprobed = true;
+        self.reprobe_at = 0;
+        self.dead_total = 0;
     }
 }
 
@@ -1375,6 +1495,63 @@ pub fn bot_park_selftest() {
         d.verdict(per_ms) == Some("dead-ring")
     } && BOT_PARK_DEAD_MAX > BOT_PARK_DEAD_STREAK;
 
+    // 4c. BOTLATCH M2, FINDING 4 — THE FORGIVENESS RULE. A COMPLETED transfer must zero the
+    //     dead-ring verdict counter, and must zero NOTHING ELSE. The first half is the fix (before
+    //     it, only an operator replug cleared `dead_total`, so eight scattered idle waits across an
+    //     uptime parked a healthy device permanently); the second half is the guard that keeps the
+    //     fix from becoming a general amnesty — `ladders`/`surrenders`/`cycles` are records of work
+    //     the ladder DID, and a completion does not undo them. Asserted against an account sitting
+    //     exactly on the dead-ring bound, so the leg fails if the reset is off by one or absent.
+    let mut s = BotDevLedger { ident: b, used: true, ..BotDevLedger::EMPTY };
+    s.dead_total = BOT_PARK_DEAD_MAX;
+    s.ladders = BOT_PARK_LADDER_MAX - 1;
+    s.surrenders = BOT_PARK_SURRENDER_MAX - 1;
+    s.cycles = per_ms * BOT_PARK_CYCLE_MAX_MS - 1;
+    let success_ok = s.verdict(per_ms) == Some("dead-ring")
+        && s.note_success()                      // it forgave something, and says so
+        && s.dead_total == 0
+        && s.verdict(per_ms).is_none()           // the park verdict is gone with it
+        && s.ladders == BOT_PARK_LADDER_MAX - 1  // and nothing else moved
+        && s.surrenders == BOT_PARK_SURRENDER_MAX - 1
+        && s.cycles == per_ms * BOT_PARK_CYCLE_MAX_MS - 1
+        && !s.note_success();                    // a second completion forgives nothing new
+
+    // 4d. BOTLATCH M2, FINDING 5 — ONE RE-PROBE, THEN PERMANENT. A dead ring and a NAKing-but-
+    //     healthy device are indistinguishable on the event ring, so a dead-ring park must be
+    //     provisional exactly once. The sequence asserted here is the whole design: arm on the
+    //     dead-ring park; NOT due before the cooldown; due after it; the probe unparks, spends the
+    //     flag, restores the dead-ring allowance and KEEPS `dead_streak` (so the probe is charged
+    //     at the cut budget, not a fresh one); a second dead-ring park cannot re-arm and is never
+    //     due again. `now` starts well past zero so the wrap-safe comparison is exercised on real
+    //     differences rather than on a degenerate zero deadline.
+    let now0 = per_ms * 1_000;
+    let mut r = BotDevLedger { ident: b, used: true, ..BotDevLedger::EMPTY };
+    r.dead_total = BOT_PARK_DEAD_MAX;
+    r.dead_streak = BOT_PARK_DEAD_STREAK;
+    r.parked = true;
+    let reprobe_ok = r.arm_reprobe(now0, per_ms)
+        && !r.reprobe_due(now0)                                   // not due immediately
+        && !r.reprobe_due(now0 + per_ms * (BOT_PARK_REPROBE_MS - 1))
+        && r.reprobe_due(now0 + per_ms * BOT_PARK_REPROBE_MS)     // due exactly at the deadline
+        && {
+            r.take_reprobe();
+            !r.parked && r.reprobed && r.reprobe_at == 0
+                && r.dead_total == 0 && r.verdict(per_ms).is_none()
+                && r.dead_streak == BOT_PARK_DEAD_STREAK // the budget cut survives the probe
+        }
+        && {
+            // it dead-rings again: park number two, which must be permanent.
+            r.dead_total = BOT_PARK_DEAD_MAX;
+            r.parked = true;
+            !r.arm_reprobe(now0 + per_ms * BOT_PARK_REPROBE_MS, per_ms)
+                && r.reprobe_at == 0
+                && !r.reprobe_due(now0 + per_ms * BOT_PARK_REPROBE_MS * 100)
+                && r.verdict(per_ms) == Some("dead-ring")
+        }
+        // and the clean slate really is clean: a replug closes the account, so the identity that
+        // comes back is re-probable again (leg 6 owns `bot_park_forget`; this pins the field).
+        && !BotDevLedger::EMPTY.reprobed;
+
     // 5. BACK-OFF is escalating and capped — it must grow with the ladder count and must never
     //    exceed the cap, or "escalating back-off" is a comment rather than a behaviour.
     let (b0, b1, b9) = (
@@ -1433,14 +1610,19 @@ pub fn bot_park_selftest() {
         && bot_park_find(&plc, elsewhere).is_none();
 
     BOT_PARK_QUIET.store(false, Ordering::Relaxed);
-    let pass = ladder_ok && reenum_ok && surrender_ok && cycles_ok && dead_ok && backoff_ok
-        && unplug_ok && pressure_ok && place_ok;
+    let pass = ladder_ok && reenum_ok && surrender_ok && cycles_ok && dead_ok && success_ok
+        && reprobe_ok && backoff_ok && unplug_ok && pressure_ok && place_ok;
+    // BOTLATCH M2: `success=` and `reprobe=` APPENDED after `dead=`, and `reprobe_ms=` after
+    // `dead_max=` — every pre-existing field keeps its name, so the spec's
+    // `REQUIRE :: BOT-PARK: selftest .*-> PASS ::` (and its FAIL FORBID) match unchanged, and the
+    // line stays diffable against captures taken before this arc. The conjunction above is what the
+    // verdict reports: a new leg can fail the whole fixture on its own.
     serial_println!(
-        ":: BOT-PARK: selftest ladder={} reenum={} surrender={} cycles={} dead={} backoff={} unplug={} pressure={} place={} ladder_max={} surrender_max={} cycle_max_ms={} dead_max={} pass_pump_ms={} slots={} -> {} ::",
-        ladder_ok, reenum_ok, surrender_ok, cycles_ok, dead_ok, backoff_ok, unplug_ok, pressure_ok,
-        place_ok,
+        ":: BOT-PARK: selftest ladder={} reenum={} surrender={} cycles={} dead={} success={} reprobe={} backoff={} unplug={} pressure={} place={} ladder_max={} surrender_max={} cycle_max_ms={} dead_max={} reprobe_ms={} pass_pump_ms={} slots={} -> {} ::",
+        ladder_ok, reenum_ok, surrender_ok, cycles_ok, dead_ok, success_ok, reprobe_ok, backoff_ok,
+        unplug_ok, pressure_ok, place_ok,
         BOT_PARK_LADDER_MAX, BOT_PARK_SURRENDER_MAX, BOT_PARK_CYCLE_MAX_MS, BOT_PARK_DEAD_MAX,
-        BOT_PARK_PASS_PUMP_MS,
+        BOT_PARK_REPROBE_MS, BOT_PARK_PASS_PUMP_MS,
         BOT_PARK_SLOTS,
         if pass { "PASS" } else { "FAIL" });
 }
@@ -9849,8 +10031,36 @@ impl XhciController {
         let id = match self.bot_ident(slot_id) { Some(i) => i, None => return Ok(()) };
         let idx = match bot_park_find(&self.bot_park, id) { Some(i) => i, None => return Ok(()) };
         if self.bot_park[idx].parked {
-            BOT_PARK_REFUSED.fetch_add(1, Ordering::Relaxed);
-            return Err(BotError::NoDevice);
+            // BOTLATCH M2 (finding 5) — THE ONE RE-PROBE. A dead ring and a NAKing-but-healthy
+            // device (cold spin-up, card just inserted) are byte-identical on the event ring: both
+            // post nothing. The park is therefore right about the evidence and can be wrong about
+            // the device, and before this it was unrecoverable without an operator. So: after
+            // `BOT_PARK_REPROBE_MS` of uptime, a dead-ring park unparks itself ONCE and falls
+            // through to the verdict below with its dead-ring allowance restored. If the device has
+            // become ready, its next completion runs `bot_park_note_success` and the account is
+            // simply clear. If the ring is really dead, the probe costs one wait at the CUT budget
+            // (~0.3 s — `dead_streak` is preserved across the unpark precisely so it does) and the
+            // re-park is permanent, because `reprobed` is now set.
+            //
+            // Read on the wire as: PARKED, then this line ~60 s later, then either silence (the
+            // device is back) or a second PARKED (it was not). `parked_total` counts both, which is
+            // correct — two parks did happen, and the pair is the evidence.
+            let now = crate::arch::now_cycles();
+            if !self.bot_park[idx].reprobe_due(now) {
+                BOT_PARK_REFUSED.fetch_add(1, Ordering::Relaxed);
+                return Err(BotError::NoDevice);
+            }
+            self.bot_park[idx].take_reprobe();
+            BOT_PARK_REPROBES.fetch_add(1, Ordering::Relaxed);
+            let e = self.bot_park[idx];
+            serial_println!(
+                ":: BOT: park re-probe slot={} port={} route={:#x} vid={:04x} pid={:04x} after_ms={} dead_streak={} dead_max={} reprobes={} — this identity was PARKED on the dead-ring clause, which cannot tell a dead ring from a device that was NAKing (cold spin-up, card just inserted). One automatic probe, once per account: the dead-ring count is zeroed, the budget cut is KEPT so this costs ~1/{} of a wait, and if it dead-rings again the park is permanent (only a physical replug re-arms this) ::",
+                slot_id, id.port, id.route, id.vid, id.pid,
+                BOT_PARK_REPROBE_MS, e.dead_streak, BOT_PARK_DEAD_MAX,
+                BOT_PARK_REPROBES.load(Ordering::Relaxed), BOT_PARK_DEAD_DIV);
+            // Fall through. The verdict below re-reads the account: any OTHER clause still at its
+            // bound re-parks the identity in this same call, and permanently — which is the right
+            // answer, since the cooldown is evidence about a ring, not about a ladder budget.
         }
         // THE VERDICT, TAKEN OFF THE LADDER'S CRITICAL PATH (R24 boot6). Before this arc
         // `verdict()` was consulted in exactly one place — `bot_park_note_ladder`, i.e. only when a
@@ -10018,6 +10228,32 @@ impl XhciController {
         }
     }
 
+    /// BOTLATCH M2 (finding 4). A BOT transfer COMPLETED for this slot's identity: the device's own
+    /// transfer event landed on the ring. Zero the dead-ring verdict counter.
+    ///
+    /// WHERE THIS IS CALLED FROM, and why nowhere else. Exactly one site: `pump_until_bot_done`'s
+    /// `Some(p) if p.done` arm — the arm reached only when the awaited stage has its completion
+    /// event. Not the timeout arm, not the `None` (nothing-pending) arm, and not anything that
+    /// merely observes traffic. That distinction is the whole content of the fix: `dead_streak` is
+    /// already refunded by any live wait, INCLUDING one made live by another device's events on the
+    /// shared ring, and a verdict counter that could be refunded the same way would be `dead_streak`
+    /// under a second name — the exact defect BOTLATCH exists to close.
+    ///
+    /// A non-SUCCESS completion code still counts, and should: a STALL or a babble is the device
+    /// ANSWERING. It disproves "provably idle ring" just as loudly as a Passed CSW, and the failure
+    /// it does describe is already charged to `ladders`/`surrenders`, whose bounds are untouched
+    /// here. What cannot reach this call is the wedge: boot5's reader posted no event of any kind.
+    ///
+    /// Opens no account (`find`, not `open`) and returns immediately on the overwhelmingly common
+    /// path — a healthy device's completion costs one 4-entry scan and a compare against zero.
+    fn bot_park_note_success(&mut self, slot_id: u8) {
+        let id = match self.bot_ident(slot_id) { Some(i) => i, None => return };
+        let idx = match bot_park_find(&self.bot_park, id) { Some(i) => i, None => return };
+        if self.bot_park[idx].note_success() {
+            BOT_PARK_DEAD_FORGIVEN.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// FIXTURE ONLY (`botwedge`). Advance an identity's back-off deadline by the wait the injected
     /// wedge stands in for.
     ///
@@ -10158,8 +10394,16 @@ impl XhciController {
         }
         self.bot_park[idx].parked = true;
         BOT_PARK_COUNT.fetch_add(1, Ordering::Relaxed);
-        let e = self.bot_park[idx];
         let per_ms = Self::cycles_per_ms().max(1);
+        // BOTLATCH M2 (finding 5): a DEAD-RING park — and only a dead-ring park — arms the one
+        // automatic re-probe. The other three clauses are the ladder's own verdicts on work it
+        // actually did (entries, surrenders, wall-clock); a cooldown does not make any of that
+        // evidence less true, so nothing there is provisional. `arm_reprobe` is a no-op on an
+        // account that has already spent its probe, which is what makes a second park permanent.
+        if why == "dead-ring" {
+            self.bot_park[idx].arm_reprobe(crate::arch::now_cycles(), per_ms);
+        }
+        let e = self.bot_park[idx];
         serial_println!(
             ":: BOT: PARKED slot={} port={} route={:#x} vid={:04x} pid={:04x} why={} cause={:?} ladders={}/{} surrenders={}/{} gens={} cycles={} ms={} max_ms={} dead={}/{} dead_streak={} refused={} capped={} yields={} parked_total={} — device account CLOSED: no transfer, no bring-up and no rescue rung on this identity until it is physically replugged (a re-enumeration this driver causes does NOT unpark it) ::",
             slot_id, id.port, id.route, id.vid, id.pid, why, cause,
@@ -10192,9 +10436,9 @@ impl XhciController {
         // off the wire without a source tree. Four clauses, any one of which closes an account —
         // stated with their bounds so a capture's numbers can be compared to them directly.
         serial_println!(
-            ":: PIUSB: [botpark] key — an identity is (root port + route string); it survives re-enumeration and slot-id reuse, which is what the per-slot surrender could not. Four PARK clauses, first to reach its bound closes the account: surrenders>={} (the ladder's verdict on two whole generations) | ladders>={} (retry entries across all generations) | ms>={} (pump wall-clock charged to the identity) | dead>={} (pump timeouts on a PROVABLY IDLE ring — no event, no foreign event, no doorbell for the whole wait; CUMULATIVE, so a live wait does not refund it). dead_streak>={} additionally CUTS the pump budget to 1/{} of base — read dead= not dead_streak= when asking why a device did or did not park. named=no means hub-downstream (no VID:PID banner) and is normal ::",
+            ":: PIUSB: [botpark] key — an identity is (root port + route string); it survives re-enumeration and slot-id reuse, which is what the per-slot surrender could not. Four PARK clauses, first to reach its bound closes the account: surrenders>={} (the ladder's verdict on two whole generations) | ladders>={} (retry entries across all generations) | ms>={} (pump wall-clock charged to the identity) | dead>={} (pump timeouts on a PROVABLY IDLE ring — no event, no foreign event, no doorbell for the whole wait; CUMULATIVE, so a live wait does not refund it). dead_streak>={} additionally CUTS the pump budget to 1/{} of base — read dead= not dead_streak= when asking why a device did or did not park. named=no means hub-downstream (no VID:PID banner) and is normal. BOTLATCH M2: the dead clause is the only one with a forgiveness rule, because it is the only one that can be wrong about a HEALTHY device (a NAKing spin-up posts no event, exactly like a dead ring) — a COMPLETED transfer zeroes dead=, and a dead-ring park unparks itself once after {} ms for a single probe at the cut budget (reprobe= says none/armed/spent; a second park on the same identity is permanent) ::",
             BOT_PARK_SURRENDER_MAX, BOT_PARK_LADDER_MAX, BOT_PARK_CYCLE_MAX_MS, BOT_PARK_DEAD_MAX,
-            BOT_PARK_DEAD_STREAK, BOT_PARK_DEAD_DIV);
+            BOT_PARK_DEAD_STREAK, BOT_PARK_DEAD_DIV, BOT_PARK_REPROBE_MS);
         for e in self.bot_park.iter().filter(|e| e.used) {
             n += 1;
             serial_println!(
@@ -10209,7 +10453,7 @@ impl XhciController {
             // that it has seen the device and is not yet done with it, which is exactly the fact
             // boot5's log could not distinguish from "the ledger is switched off".
             serial_println!(
-                ":: PIUSB: [botpark] account port={} route={:#x} vid={:04x} pid={:04x} named={} parked={} why={} surrenders={}/{} ladders={}/{} ms={}/{} dead={}/{} dead_streak={}/{} budget_cut={} gens={} ::",
+                ":: PIUSB: [botpark] account port={} route={:#x} vid={:04x} pid={:04x} named={} parked={} why={} surrenders={}/{} ladders={}/{} ms={}/{} dead={}/{} dead_streak={}/{} budget_cut={} gens={} reprobe={} ::",
                 e.ident.port, e.ident.route, e.ident.vid, e.ident.pid,
                 if e.ident.anonymous() { "no" } else { "yes" },
                 if e.parked { "yes" } else { "no" },
@@ -10219,10 +10463,14 @@ impl XhciController {
                 e.dead_total, BOT_PARK_DEAD_MAX,
                 e.dead_streak, BOT_PARK_DEAD_STREAK,
                 if e.dead_streak >= BOT_PARK_DEAD_STREAK { "on" } else { "off" },
-                e.gens);
+                e.gens,
+                // BOTLATCH M2 (finding 5). `armed` = this park is provisional and a probe is due;
+                // `spent` = the one probe has been used, so any park on this identity is now
+                // permanent; `none` = no dead-ring park has been taken on this account.
+                if e.reprobed { "spent" } else if e.reprobe_at != 0 { "armed" } else { "none" });
         }
         serial_println!(
-            ":: BOT: park rollup accounts={} parked={} refused={} backoff_refused={} pass_refused={} aborts={} capped={} yields={} pump_refused={} anon={} ladder_max={} surrender_max={} cycle_max_ms={} dead_max={} pass_ms={} pass_pump_ms={} result=CENSUS ::",
+            ":: BOT: park rollup accounts={} parked={} refused={} backoff_refused={} pass_refused={} aborts={} capped={} yields={} pump_refused={} anon={} ladder_max={} surrender_max={} cycle_max_ms={} dead_max={} pass_ms={} pass_pump_ms={} reprobes={} dead_forgiven={} reprobe_ms={} result=CENSUS ::",
             n, BOT_PARK_COUNT.load(Ordering::Relaxed),
             BOT_PARK_REFUSED.load(Ordering::Relaxed),
             BOT_PARK_BACKOFF_REFUSED.load(Ordering::Relaxed),
@@ -10233,7 +10481,15 @@ impl XhciController {
             BOT_PARK_PUMP_REFUSED.load(Ordering::Relaxed),
             BOT_PARK_ANON.load(Ordering::Relaxed),
             BOT_PARK_LADDER_MAX, BOT_PARK_SURRENDER_MAX, BOT_PARK_CYCLE_MAX_MS, BOT_PARK_DEAD_MAX,
-            BOT_PARK_PASS_MS, BOT_PARK_PASS_PUMP_MS);
+            BOT_PARK_PASS_MS, BOT_PARK_PASS_PUMP_MS,
+            // BOTLATCH M2: the two forgiveness meters, appended so every pre-existing field on this
+            // line keeps its name and position. `reprobes=` is parks that were given their one
+            // automatic second chance; `dead_forgiven=` is dead-ring accounts a COMPLETED transfer
+            // zeroed. Both are zero on a healthy boot, and a non-zero `dead_forgiven=` with
+            // `parked=0` is the finding-4 case that used to end in a permanent park.
+            BOT_PARK_REPROBES.load(Ordering::Relaxed),
+            BOT_PARK_DEAD_FORGIVEN.load(Ordering::Relaxed),
+            BOT_PARK_REPROBE_MS);
     }
 
     fn bot_surrender(&mut self, slot_id: u8, cause: BotError, ladder_gen: u64) {
@@ -10581,6 +10837,11 @@ impl XhciController {
                     // history is not given one for succeeding.
                     let used = crate::arch::now_cycles().wrapping_sub(start);
                     self.bot_park_charge(slot, used, false);
+                    // BOTLATCH M2 (finding 4): and clear the DEAD-RING VERDICT counter, which the
+                    // charge above deliberately does not touch. This is the only place in the driver
+                    // that forgives `dead_total`, and it is reached only with the awaited stage's
+                    // completion event in hand. See `bot_park_note_success`.
+                    self.bot_park_note_success(slot);
                     return Ok(());
                 }
                 None => {
