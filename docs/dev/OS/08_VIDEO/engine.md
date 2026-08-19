@@ -5529,6 +5529,13 @@ QEMU has neither. The gates prove non-regression (`check` both arches, knobs on 
 gate with knobs off) and the artifact carries the witness string. The metal falsifier is exactly the
 Boot 3 card: a `usbdebug` + `wc` card now shows the cursor.
 
+> **POSTSCRIPT (USBDBG-INVERT, 2026-08-19).** `usbdebug_cursor_service` and its auto-hide edge are
+> **gone**. They were compiled only under `x86_64` + `usbdebug` + `wc` — exactly the regime the
+> inversion below moved onto the real desktop, where `x86_render_service`'s own pointer arms have
+> always moved the sprite. The DIAGNOSIS above stands unchanged and is the first of the three
+> incidents that argued for the inversion; only the fix is superseded. The heap paragraph's two
+> claims were re-verified on the inverted path and both hold — see USBDBG-INVERT.
+
 ### USBDBG-ROUTE — the debug loop learns to ROUTE the event (Boot 5, 2026-08-19)
 
 **Observed.** Boot 5 flew the first card carrying USBDBG-CURSOR. The cursor MOVED — that fix is
@@ -5600,6 +5607,73 @@ not a change of policy.
 carries the witness string, so the path is reachable and not merely compiled. **Metal falsifier:** on a
 `usbdebug` + `wc` card, one physical click on the SHARD crystal opens the menu and prints a
 `[clickroute] ... band=menu` line, and a title-bar drag moves the window.
+
+> **POSTSCRIPT (USBDBG-INVERT, 2026-08-19).** `usbdebug_route` and `usbdebug_route_tail` are **gone**
+> too, for the reason this section's own argument makes irresistible: it ends by *calling the GUI
+> loop's chain* rather than transcribing it, which is the admission that the debug loop wanted to be
+> the GUI loop. Metal boot 6 then found the next missing piece — the dock's `-> shell-reopen` routed
+> (this fix working) onto a shell window that sat greyed and dead, because the console SERVICE lives
+> in the GUI loop as well. Rather than port a fourth piece, the arc below inverts the build. The
+> routing table above is still the correct account of where a drag's three phases live; on the
+> inverted path all three are reached from `x86_render_service`, which had them all along.
+
+### USBDBG-INVERT — the diagnosis card becomes the real desktop (2026-08-19)
+
+**Peter's ruling.** *"This is serious debug time not play time."* A diagnosis card must be **the real
+desktop plus instruments**, never a parallel half-desktop. The two sections above are the evidence: a
+usbdebug card lost its cursor (patched), then its clicks (patched), then its shell — and the shell was
+never going to be the last one, because the list of things the terminal loop lacks is simply *the whole
+of `x86_render_service`*.
+
+**The inversion.** On `x86_64` + `wc` the `#[cfg(feature = "usbdebug")]` block in `main.rs` is compiled
+out entirely, and the boot runs the ORDINARY path: the SCHED-X86 handoff, the console service, the
+shell window, the compositor — with the debug capabilities riding inside it behind the knob. The gate
+is the BUILD (`all(target_arch = "x86_64", feature = "wc")`) and deliberately not `wcx::is_active()`:
+that latch has exactly one setter (the Kepler takeover), so a runtime gate would send QEMU — where no
+Kepler exists — back into the terminal loop, and the inversion's own falsifier is a headless
+`UNAOS_USBDEBUG=1 UNAOS_WC=1` run reaching the GUI selftests.
+
+**What still compiles the terminal loop:** `usbdebug` WITHOUT `wc`, and every aarch64 usbdebug build.
+That is the knob's original purpose — pre-GUI bring-up on a card with no compositor at all — and its
+body is otherwise untouched, minus the three superseded call sites, which were runtime no-ops there
+(`wcx::is_active()` is false with no takeover).
+
+**Where each debug-only service went.**
+
+| Debug-loop service | Inverted home |
+| --- | --- |
+| xHCI `poll_events` + `service_ftdi`/`storage`/`hubs`/`hid_setproto`/`slot_disposal`/`enum` | `x86_usb_pump`, same calls in the same order |
+| EHCI HID poll, `x86_typematic_pump`, SMC battery, `irqstorage` pair | `x86_usb_pump` (the BATMON-1 note there already called the usbdebug site unreachable on a GUI boot) |
+| `fat::probe_once`, `selfhost`, `sdhc_probe_once`, `fatverb_storage_witness`, `wifi::service` | `x86_usb_pump` — the third of the three storage-ready passes; every one of these already sat at all three |
+| `bootpace::service_dump`, `flight_recorder::service`, `log_summary_once`, `fbcon::console_service`, `console_pace_census_once`, the U2..U6bx ladder | `x86_usb_pump`, already present |
+| `bootlog::service_serial_dump` (**the one gap**) | its gate widened from `witness` to `any(witness, usbdebug)` at both remaining pass sites |
+| `USB-DEBUG:` event prints | `usbdebug_event_print`, called from `x86_render_service` and the inline BSP drain, on the RAW report, **before** `wc_route_event` — print AND route |
+| `PTR:` press witnesses | never this loop's: they print from inside the EHCI HID service, which every x86 path polls |
+| VPERF `scenario_tick` (`videobench`) | stays with the preserved regime — it is a scripted **fbcon console** scroll, and the inverted path detaches fbcon |
+| `e1000::service_net` (deliberately absent from the debug loop) | present on the inverted path, like every other desktop build |
+
+**Heap arithmetic for the combined regime** (both claims re-verified): the x86 heap is **256 MiB**
+(`allocator::HEAP_SIZE`, GR26; the 48 MiB figure is aarch64's), and `fbcon::attach_shadow` early-returns
+under `any(usbdebug, witness)` without `bootlog`, so a diagnosis card allocates **no** shadow at all.
+Even if one existed, the shadow and the render service's back buffer are both `stride x height x 4` =
+4096 x 1800 x 4 = 28.1 MiB on the bench panel, so the worst case is 56.3 MiB of 256 MiB (22%) — the
+"a second ~28 MiB shadow would OOM the heap" hazard the old comment named was a 48 MiB-heap fact and no
+longer binds. The inverted path takes neither the late attach (compiled out with the block) nor the
+EARLY one at the post-heap seam (QUIET-PANEL declines it), so the measured cost is zero.
+
+**Witness**, once, at the GUI takeover, from both x86 takeover seams (scheduled and inline):
+
+```
+:: USBDBG-INVERT: debug instruments riding the real desktop == witness ::
+```
+
+**QEMU DOES witness this one**, which is the point: `UNAOS_FATIMG=sf UNAOS_USBDEBUG=1 UNAOS_WC=1
+./arroyo test 150` is the first usbdebug+wc run in this tree's history to reach the GUI selftests at
+all, and it passes the full x86-fat witness set — **MBENCH PASS 31/31**, `[wm-act] direct ... -> PASS`
+with every leg true — beside the `USBDBG-INVERT` line and the relocated `USB-DEBUG:` prints. The
+packaged `kernel.elf` carries the witness string (and no longer carries the two retired ones).
+**Metal falsifier:** a usbdebug+wc card boots to the real desktop — the shell types, the cursor moves,
+clicks route, and the `PTR:` lines still print.
 
 ### WEDGE-1 — P66's mechanism is UNKNOWN; this arc hardens and instruments
 

@@ -2568,6 +2568,18 @@ clicks are reported dead, read the two witnesses as a **pair**, in this order:
 The instrument on the far side is `[clickroute]`, emitted by the router itself: `delivered` rising with
 **no** `[clickroute]` line for the same click is the exact signature of a drain that never routes.
 
+**Pairing note, updated for USBDBG-INVERT (2026-08-19).** The *reading* above is unchanged, but the
+"which drain?" half of it has simplified: on an `x86_64` + `wc` build there is no longer a second drain
+to be in. The `usbdebug` terminal loop is compiled out on that combination and the card runs the
+ordinary desktop path (`08_VIDEO/engine.md` §USBDBG-INVERT), so *every* x86 desktop build — knob on or
+off — pops its events in `x86_render_service` and routes them through `wc_route_event`. Step 1's
+conclusion is therefore now "the defect is at or above the drain, and the drain is the render service's"
+rather than "…and which drain you are in depends on the knob". The `USB-DEBUG:` print lines survive on
+that path (they moved ahead of the router, printing the RAW report), so a capture can still show
+`PTR: ... delivered=` rising, the matching `USB-DEBUG: BUTTON` line, and the `[clickroute]` disposition
+for one physical click — the three layers of the same press, in order, on one wire. A build WITHOUT
+`wc` still has the terminal loop, and there step 1's original wording applies verbatim.
+
 ### 10g. IVY MT-INVESTIGATION — where does true multitouch actually live? (`UNAOS_MTRAW`)
 
 §10e refuted the "descriptor-advertised 0x44 / 511-byte frame streams as-is" model: 736+ observed
