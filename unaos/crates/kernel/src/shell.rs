@@ -3442,7 +3442,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // foreign volume-level path from the same surface. `vfs <op> <path>`.
             vfs_cmd(console, &args);
         },
-        #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+        #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), all(feature = "tegra_el0", target_arch = "aarch64"), target_arch = "x86_64"))] // EXECGATE: tegra_el0 joins (JETSON-EL0 widened the vectors/sched/syscall, never the shell)
         "run" => {
             // EXEC-1: load an ELF64 user program off the VFS namespace and execute it in user mode, reporting its
             // exit status. Rides the SAME `MountTable` the `vfs` verb uses (`/fat` = FAT boot partition,
@@ -4010,7 +4010,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
              crate::hlt_loop();
              crate::hlt_loop();
         },
-        #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+        #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), all(feature = "tegra_el0", target_arch = "aarch64"), target_arch = "x86_64"))] // EXECGATE: tegra_el0 joins (JETSON-EL0 widened the vectors/sched/syscall, never the shell)
         "bg" => {
             // BGRUN-1: run a user program in the BACKGROUND — the shell returns to its prompt at once and
             // the program keeps running (and, if windowed, its window stays OPEN, so TAB has a ring to
@@ -4355,7 +4355,7 @@ fn parse_num(s: &str) -> Option<u64> {
 /// * **The machine check.** The aarch64 body pre-checks `e_machine == 183`; x86 wants
 ///   `EM_X86_64 = 62`. The kernel loader (`arch::x86_64::elf::validate_elf`) re-checks from scratch
 ///   either way — this pre-check only sharpens the operator's error text.
-#[cfg(all(feature = "baremetal", target_arch = "aarch64"))]
+#[cfg(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"))] // EXECGATE: the aarch64 twin serves tegra_el0 too
 fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc::vec::Vec<u8>> {
     use crate::fs::vfs::NodeKind;
     // Cap = the kernel user window; a file at or under it may still be rejected by the loader (a flat blob
