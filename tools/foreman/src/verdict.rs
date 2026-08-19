@@ -247,6 +247,19 @@ impl Directive {
     }
 }
 
+/// One spec line after grammar parsing, BEFORE its pattern is compiled. The
+/// preflight (`preflight_spec`) walks these so it can compile every pattern and
+/// collect ALL the failures instead of hard-stopping on the first one.
+#[derive(Debug, Clone)]
+struct ScanLine {
+    kind: Kind,
+    pattern: String,
+    need: usize,
+    spec_line: usize,
+    /// The spec line as written (trimmed) — what the preflight report shows.
+    text: String,
+}
+
 /// Parse a `.spec` file and append the default FORBID set (mbench's `parse_spec`).
 pub fn parse_spec(path: &Path) -> Result<Vec<Directive>, SpecError> {
     let bytes = std::fs::read(path).map_err(|e| SpecError(format!("{}: {e}", path.display())))?;
@@ -254,8 +267,21 @@ pub fn parse_spec(path: &Path) -> Result<Vec<Directive>, SpecError> {
 }
 
 pub fn parse_spec_bytes(bytes: &[u8]) -> Result<Vec<Directive>, SpecError> {
-    let text = String::from_utf8_lossy(bytes);
     let mut directives = Vec::new();
+    for s in scan_spec_bytes(bytes)? {
+        directives.push(Directive::new(s.kind, &s.pattern, s.need, false, s.spec_line)?);
+    }
+    for p in DEFAULT_FORBIDS {
+        directives.push(Directive::new(Kind::Forbid, p, 1, true, 0)?);
+    }
+    Ok(directives)
+}
+
+/// The grammar half of `parse_spec_bytes`: directive kinds, COUNT thresholds and
+/// line numbers, with no regex compiled yet.
+fn scan_spec_bytes(bytes: &[u8]) -> Result<Vec<ScanLine>, SpecError> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut scanned = Vec::new();
     for (i, raw) in text.split('\n').enumerate() {
         let lineno = i + 1;
         let line = raw.trim_end_matches('\r').trim();
@@ -277,7 +303,13 @@ pub fn parse_spec_bytes(bytes: &[u8]) -> Result<Vec<Directive>, SpecError> {
                     return Err(bad());
                 }
                 let need: usize = n.parse().map_err(|_| bad())?;
-                directives.push(Directive::new(Kind::Count, pat, need, false, lineno)?);
+                scanned.push(ScanLine {
+                    kind: Kind::Count,
+                    pattern: pat.to_string(),
+                    need,
+                    spec_line: lineno,
+                    text: line.to_string(),
+                });
             }
             "REQUIRE" | "OPTIONAL" | "FORBID" | "PENDING" | "COMPLETE" => {
                 if rest.is_empty() {
@@ -290,17 +322,115 @@ pub fn parse_spec_bytes(bytes: &[u8]) -> Result<Vec<Directive>, SpecError> {
                     "PENDING" => Kind::Pending,
                     _ => Kind::Complete,
                 };
-                directives.push(Directive::new(k, rest, 1, false, lineno)?);
+                scanned.push(ScanLine {
+                    kind: k,
+                    pattern: rest.to_string(),
+                    need: 1,
+                    spec_line: lineno,
+                    text: line.to_string(),
+                });
             }
             other => {
                 return Err(SpecError(format!("line {lineno}: unknown directive {other:?}")));
             }
         }
     }
-    for p in DEFAULT_FORBIDS {
-        directives.push(Directive::new(Kind::Forbid, p, 1, true, 0)?);
+    Ok(scanned)
+}
+
+/// One directive whose pattern the regex crate refused.
+#[derive(Debug, Clone)]
+pub struct PatternFault {
+    pub spec_line: usize,
+    /// The spec line as written.
+    pub text: String,
+    /// The compiler's complaint, flattened to a single line.
+    pub error: String,
+}
+
+/// Every pattern fault found in one spec — the preflight's whole report.
+#[derive(Debug)]
+pub struct PreflightReport {
+    pub spec_path: PathBuf,
+    pub faults: Vec<PatternFault>,
+}
+
+impl std::fmt::Display for PreflightReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let n = self.faults.len();
+        writeln!(
+            f,
+            "spec preflight FAILED — {n} directive(s) in {} did not compile; nothing was evaluated.",
+            self.spec_path.display()
+        )?;
+        for fault in &self.faults {
+            writeln!(
+                f,
+                "  {}:{}: {} — {}",
+                self.spec_path.display(),
+                fault.spec_line,
+                fault.text,
+                fault.error
+            )?;
+        }
+        write!(
+            f,
+            "  foreman evaluates specs with the Rust regex crate dialect, which refuses \
+             look-around ((?=…) (?!…) (?<=…) (?<!…)) and backreferences BY DESIGN. \
+             For a full-PCRE spec use the bench's mbench: \
+             `python3 unaos/scripts/mbench.py --replay <LOG> --spec {}`.",
+            self.spec_path.display()
+        )
     }
-    Ok(directives)
+}
+
+impl std::error::Error for PreflightReport {}
+
+/// Compile every directive's pattern BEFORE any evaluation starts, collecting
+/// all the failures rather than hard-stopping on the first (the regex crate's
+/// own error names no spec line). Silent on success: a valid spec's output is
+/// byte-identical to what it was before the preflight existed.
+///
+/// A GRAMMAR error is deliberately not reported here — `parse_spec` still owns
+/// those messages, unchanged.
+pub fn preflight_spec(path: &Path) -> Result<(), PreflightReport> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Ok(()); // `parse_spec` reports an unreadable spec, as before.
+    };
+    preflight_spec_bytes(path, &bytes)
+}
+
+pub fn preflight_spec_bytes(path: &Path, bytes: &[u8]) -> Result<(), PreflightReport> {
+    let Ok(scanned) = scan_spec_bytes(bytes) else {
+        return Ok(()); // grammar error: `parse_spec` reports it, unchanged.
+    };
+    let faults: Vec<PatternFault> = scanned
+        .iter()
+        .filter_map(|s| {
+            Regex::new(&s.pattern).err().map(|e| PatternFault {
+                spec_line: s.spec_line,
+                text: s.text.clone(),
+                error: flatten(&e.to_string()),
+            })
+        })
+        .collect();
+    if faults.is_empty() {
+        return Ok(());
+    }
+    Err(PreflightReport {
+        spec_path: path.to_path_buf(),
+        faults,
+    })
+}
+
+/// The regex crate's errors are multi-line with an ASCII caret diagram; the
+/// report wants one line per offending directive.
+fn flatten(msg: &str) -> String {
+    msg.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.chars().all(|c| c == '^'))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The structured verdict result — the artifact the rest of the loop consumes.
@@ -643,6 +773,48 @@ REQUIRE LAST-WITNESS PASS\n";
             seen += 1;
         }
         assert!(seen > 0, "no specs found under {}", dir.display());
+    }
+
+    #[test]
+    fn preflight_is_silent_on_a_valid_spec() {
+        assert!(preflight_spec_bytes(Path::new("test.spec"), SELFTEST_SPEC.as_bytes()).is_ok());
+        assert!(preflight_spec_bytes(Path::new("test.spec"), TRUNC_SPEC.as_bytes()).is_ok());
+        // A grammar error stays parse_spec's to report, unchanged.
+        assert!(preflight_spec_bytes(Path::new("test.spec"), b"MAYBE something\n").is_ok());
+    }
+
+    #[test]
+    fn preflight_names_the_look_ahead_line() {
+        const SPEC: &str = "# look-around is not the regex crate's dialect\n\
+REQUIRE CAPSTONE COMPLETE\n\
+REQUIRE ^(?=.*ready).*init done\n\
+OPTIONAL Semaphore: PASS\n";
+        let err = preflight_spec_bytes(Path::new("look.spec"), SPEC.as_bytes())
+            .expect_err("look-ahead must be refused");
+        assert_eq!(err.faults.len(), 1);
+        let f = &err.faults[0];
+        assert_eq!(f.spec_line, 3);
+        assert_eq!(f.text, "REQUIRE ^(?=.*ready).*init done");
+        assert!(!f.error.contains('\n'), "error must be one line: {:?}", f.error);
+
+        let report = err.to_string();
+        assert!(report.contains("look.spec:3: REQUIRE ^(?=.*ready).*init done — "), "{report}");
+        assert!(report.contains("nothing was evaluated"), "{report}");
+        assert!(report.contains("look-around"), "{report}");
+        assert!(report.contains("mbench.py"), "{report}");
+        // The valid lines are NOT reported.
+        assert!(!report.contains("Semaphore"), "{report}");
+    }
+
+    #[test]
+    fn preflight_collects_every_offender() {
+        const SPEC: &str = "REQUIRE (?<=boot )ready\n\
+REQUIRE fine\n\
+COUNT 2 (?!never)done\n";
+        let err = preflight_spec_bytes(Path::new("many.spec"), SPEC.as_bytes())
+            .expect_err("both look-arounds must be refused");
+        let lines: Vec<usize> = err.faults.iter().map(|f| f.spec_line).collect();
+        assert_eq!(lines, vec![1, 3]);
     }
 
     #[test]

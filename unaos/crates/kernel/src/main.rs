@@ -5111,7 +5111,7 @@ fn tegra_rast_demo_maybe() {
     unaos_kernel::video::fbcon::detach();
     serial_println!(":: RAST: tegra — first 3D pixels on the Orin panel (inherited scanout) ::");
     let mut screen = unaos_kernel::video::Screen::new(front_fb);
-    unaos_kernel::rast_demo::run(&mut screen);
+    unaos_kernel::rast_demo::run_mc(&mut screen); unaos_kernel::rast_demo::run(&mut screen); // RAST-MC: the multi-core rung runs FIRST (1-core baseline + frame-pipelined pass, both unpaced) so the paced visible spin stays the last panel content of the boot; same-line per the zero-added-lines convention above.
 }
 
 // Knob-off / non-rast tegra build: the wire-in compiles to nothing. `#[inline(always)]` on an empty

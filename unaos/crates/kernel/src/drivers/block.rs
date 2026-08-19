@@ -436,6 +436,12 @@ pub fn alternate_program_source() -> Option<(BlockDeviceInfo, BlockHandle)> {
         BlockHandle::Usb => None,
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockHandle::Sdhc => info().map(|d| (d, BlockHandle::Global)),
+        // TEGRA-SDBLK: `program_source` never returns `TegraSd` either — the Orin's program volume is
+        // the boot medium in the global slot, and the microSD is a SEPARATE disk that this arc gives a
+        // read path, not a program-loading precedence (see the census note on `source_census`). Mapped
+        // for totality, exactly as `Usb` is, and it means the same thing: this arm cannot be reached.
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        BlockHandle::TegraSd => None,
     }
 }
 
@@ -457,6 +463,14 @@ pub struct SourceCensus {
     /// The internal-SD slot: `Some(true/false)` when this image carries the handle, `None` when it
     /// does not — which is a different fact from "the handle is empty" and is printed differently.
     pub sdhc: Option<bool>,
+    /// TEGRA-SDBLK: the Orin microSD slot, read the same three ways as `sdhc` above
+    /// (`Some(true)` registered / `Some(false)` handle built but empty / `None` not in this image).
+    ///
+    /// It is censused but NOT a program-source rung: `program_source` does not consult it, so this
+    /// field never explains a `psrc=` verdict. It is here because the census's job is to name every
+    /// handle that EXISTS, and a reader debugging "why did nothing mount the card" is owed the
+    /// difference between "no tegra handle in this build" and "the handle is there and empty".
+    pub tegra_sd: Option<bool>,
 }
 
 impl core::fmt::Display for SourceCensus {
@@ -466,6 +480,19 @@ impl core::fmt::Display for SourceCensus {
             Some(true) => write!(f, " sdhc=present"),
             Some(false) => write!(f, " sdhc=absent"),
             None => write!(f, " sdhc=unbuilt"),
+        }?;
+        // TEGRA-SDBLK: appended, never interleaved — the existing two fields keep their exact
+        // spelling and order, so every capture that greps `global=` / `sdhc=` still reads the same.
+        //
+        // Printed ONLY on a build that carries the handle. `sdhc` prints its `unbuilt` case because
+        // on x86 "is `sdhcblk` in this image" is the live question a decline line has to answer; on
+        // an rMBP or a Pi "is the ORIN's card handle in this image" is not a question anyone is
+        // asking, and answering it would rewrite a witness line three docs quote verbatim. So a
+        // non-tegra image renders exactly the string it rendered before this variant existed.
+        match self.tegra_sd {
+            Some(true) => write!(f, " tegra_sd=present"),
+            Some(false) => write!(f, " tegra_sd=absent"),
+            None => Ok(()),
         }
     }
 }
@@ -477,7 +504,11 @@ pub fn source_census() -> SourceCensus {
     let sdhc = Some(sdhc_info().is_some());
     #[cfg(not(all(target_arch = "x86_64", feature = "sdhcblk")))]
     let sdhc = None;
-    SourceCensus { global: info().is_some(), sdhc }
+    #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+    let tegra_sd = Some(tegra_sd_info().is_some());
+    #[cfg(not(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc")))]
+    let tegra_sd = None;
+    SourceCensus { global: info().is_some(), sdhc, tegra_sd }
 }
 
 /// INSTALL-SEL: which of the two registry handles a device row was read from. The block layer keeps
@@ -499,6 +530,21 @@ pub enum BlockHandle {
     /// why it is a third handle and not a third value of the `BACKEND` selector.
     #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
     Sdhc,
+    /// TEGRA-SDBLK (aarch64, `tegra` + `sdmmc`): the dedicated [`TEGRA_SD_BLOCK_DEVICE`] entry — the
+    /// card in the Orin devkit's microSD slot, read through [`read_block_tegra_sd`] /
+    /// [`read_blocks_tegra_sd`], which bypass the backend selector exactly as the `Usb` and `Sdhc`
+    /// pairs do. See the TEGRA-SDBLK section below for why it is its own handle rather than a value
+    /// of the `BACKEND` selector (which is `baremetal`-gated and does not exist on a tegra build).
+    ///
+    /// Gated on the same triple as the entry points it names, i.e. on EXACTLY the builds that have a
+    /// read path to dispatch to — the `Sdhc` precedent, and the reason a non-tegra image is
+    /// byte-identical to its pre-variant self (no arm of this variant is compiled there at all).
+    ///
+    /// **Writes through this handle are refused in every cfg.** The card's only writer is the armed
+    /// `sdmmc_arm` ladder in `sdmmc_tegra.rs`; [`write_block_tegra_sd`] exists so the dispatch below
+    /// is total and fails CLOSED, not so that anything writes.
+    #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+    TegraSd,
 }
 
 /// INSTALL-SEL: a durable name for ONE block device, good across frames and across a registry change.
@@ -544,6 +590,8 @@ pub fn lookup(id: BlockDeviceId) -> Option<BlockDeviceInfo> {
         BlockHandle::Usb => usb_info(),
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockHandle::Sdhc => sdhc_info(),
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        BlockHandle::TegraSd => tegra_sd_info(),
     };
     match cur {
         Some(d) if d.slot_id == id.slot_id && d.num_blocks == id.num_blocks => Some(d),
@@ -1539,20 +1587,30 @@ pub fn write_blocks_sdhc(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
 // by naming it, precisely as `Usb` (PIUSB-27) and `Sdhc` (SDHC-4b) are — and `read_block`,
 // `write_block`, `read_blocks`, `write_blocks` and `publish_usb_geometry` gain not one statement.
 //
-// ### What this step deliberately does NOT do: no `BlockHandle::TegraSd` yet
-// SDHC-4b's precedent is a new HANDLE variant, and that is the intended end state here too. It is
-// not in this commit because `BlockHandle` is total-by-construction, and MEASURED (variant added,
+// ### The follow-up step: `BlockHandle::TegraSd` (LANDED — see the variant above)
+// SDHC-4b's precedent is a new HANDLE variant, and it is now here. It was held back one commit
+// because `BlockHandle` is total-by-construction, and MEASURED (variant added,
 // `UNAOS_TEGRA=1 ./arroyo check`, variant removed again) the arm-tegra leg reports E0004 at twelve
 // sites: nine in this file (`alternate_program_source`, `lookup`, `mbr_census`'s two, `PartitionRange`'s
-// five) and three OUTSIDE this arc's lane — `fs::fat::source_of` and `install/mod.rs`'s two handle
-// matches. (`wifi::firmware::source_of_handle` is a fourth, latent: no gate leg compiles it on
-// aarch64.) That totality is a feature, not an obstacle: it is the forcing function those files
-// document ("a fourth handle is a build error in both places, not a silent mis-route"), and it fires
-// exactly when the variant lands. So the variant is a one-commit follow-up whose lane must cover
-// `fs/fat.rs`, `install/mod.rs` and `wifi/firmware.rs`, and
-// until then the entry points below are the whole surface: a caller names `tegra_sd_info()` and
-// `read_block(s)_tegra_sd` directly. Nothing about the read path changes when the variant arrives;
-// the variant only lets a `PartitionRange` carry it.
+// five) and three OUTSIDE that arc's lane — `fs::fat::source_of` and `install/mod.rs`'s two handle
+// matches, plus `wifi::firmware::source_of_handle` as a thirteenth. That totality is a feature, not
+// an obstacle: it is the forcing function those files document ("a fourth handle is a build error in
+// both places, not a silent mis-route"), and it fired exactly when the variant landed. Every one of
+// those arms is mechanical — the reads route here, the writes refuse here, and nothing that could
+// already serve a source changed.
+//
+// Nothing about the read path below changed when the variant arrived. The variant only lets a
+// `PartitionRange` CARRY the card, so a partition on it is addressed through the bounded,
+// partition-relative gate instead of by a caller doing `start + rel` for itself. A caller may still
+// name `tegra_sd_info()` and `read_block(s)_tegra_sd` directly; those are unchanged.
+//
+// ### What the variant deliberately does NOT do: it is not a program-source rung
+// `program_source` still returns the global slot and nothing else on this board, and
+// `alternate_program_source` maps `TegraSd` to `None`. The Orin boots from a USB stick; making the
+// card a program source would re-point `mount_program_source`, the shell's file verbs and the exec
+// path at a different disk — the PI-FS-2 hazard this whole section is written to avoid. The card is
+// censused (`SourceCensus::tegra_sd`) and readable by NAME; binding a filesystem to it is
+// `orin-unafs-root.md` §3 item 4's job, behind its own knob.
 //
 // ### WRITES ARE REFUSED HERE, in every cfg
 // The Orin's card-write path is the `sdmmc_arm` ladder in `sdmmc_tegra.rs`, behind three explicit
@@ -1958,6 +2016,11 @@ pub fn mbr_census(handle: BlockHandle, sec: &[u8], dev_blocks: u64) -> Option<Mb
         // and can never be suppressed by (or suppress) the boot volume's census.
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockHandle::Sdhc => 4,
+        // TEGRA-SDBLK: its own latch bit for the same reason `Sdhc` has one — the Orin card's table
+        // is censused once on its own terms and can neither suppress nor be suppressed by the boot
+        // stick's census. Disjoint from bit 4 by construction: no build carries both handles.
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        BlockHandle::TegraSd => 8,
     };
     let prev = MBR_CENSUS_LATCH.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
     if prev & bit != 0 || sec.len() < SECTOR_BYTES {
@@ -1968,6 +2031,8 @@ pub fn mbr_census(handle: BlockHandle, sec: &[u8], dev_blocks: u64) -> Option<Mb
         BlockHandle::Usb => "usb",
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockHandle::Sdhc => "sdhc",
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        BlockHandle::TegraSd => "tegra-sd",
     };
 
     // --- RAW, before decoding anything: the signature word and the four 16-byte entries verbatim.
@@ -2083,6 +2148,12 @@ impl PartitionRange {
             BlockHandle::Usb => read_block_usb(abs, buf),
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             BlockHandle::Sdhc => read_block_sdhc(abs, buf),
+            // TEGRA-SDBLK: the point of the variant. A `PartitionRange` built on the Orin card now
+            // reaches the sdmmc driver's polled CMD17 through the same bounded, partition-relative
+            // gate every other handle goes through — no second addressing path, no absolute LBA
+            // computed by a caller.
+            #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+            BlockHandle::TegraSd => read_block_tegra_sd(abs, buf),
         }
     }
 
@@ -2097,6 +2168,11 @@ impl PartitionRange {
             // so no FAT mutation can arrive here; a deliberate caller holding an `Sdhc` range can.
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             BlockHandle::Sdhc => write_block_sdhc(abs, buf),
+            // TEGRA-SDBLK: REFUSES, in every cfg. `write_block_tegra_sd` is the refusal itself (a
+            // one-shot witness + `NotReady`), so the variant cannot become a fourth door past the
+            // armed `sdmmc_arm` ladder — a range that carries the card is readable and nothing more.
+            #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+            BlockHandle::TegraSd => write_block_tegra_sd(abs, buf),
         }
     }
 
@@ -2109,6 +2185,8 @@ impl PartitionRange {
             BlockHandle::Usb => read_blocks_usb(abs, buf),
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             BlockHandle::Sdhc => read_blocks_sdhc(abs, buf),
+            #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+            BlockHandle::TegraSd => read_blocks_tegra_sd(abs, buf),
         }
     }
 
@@ -2120,6 +2198,9 @@ impl PartitionRange {
             BlockHandle::Usb => write_blocks_usb(abs, buf),
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             BlockHandle::Sdhc => write_blocks_sdhc(abs, buf),
+            // TEGRA-SDBLK: refuses, as the single-sector twin above does and for the same reason.
+            #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+            BlockHandle::TegraSd => write_blocks_tegra_sd(abs, buf),
         }
     }
 
@@ -2133,6 +2214,8 @@ impl PartitionRange {
             BlockHandle::Usb => usb_info(),
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             BlockHandle::Sdhc => sdhc_info(),
+            #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+            BlockHandle::TegraSd => tegra_sd_info(),
         }
         .ok_or(BlockError::NotReady)?;
         let bs = dev.block_size as usize;

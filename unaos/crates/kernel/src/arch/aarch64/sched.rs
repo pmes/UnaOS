@@ -7929,12 +7929,12 @@ pub fn run_capstone_boot_core(cpu: usize) -> ! {
     let _ = crate::vug::parked_display_witness();
     // AARCH64-PRIO M3: prove fixed-priority + anti-starvation aging before the CAPSTONE. Self-contained
     // and bounded (stages its own tasks, drains them, leaves the queue empty), so it never perturbs the
-    // CAPSTONE that follows — it just adds the `priority+aging PASS` line to this cooperative boot.
-    priority_aging_witness(cpu);
+    // CAPSTONE that follows — but it DRAINS, so JB-CAPSTONE-GUARD (file tail) gates it. See there.
+    let pre_staged = capstone_queue_pre_staged(cpu); if !pre_staged { priority_aging_witness(cpu); }
     // PRIO-MIX M1: the dedicated priority-mix stress witness (strict ordering + aged rescue), reported
     // alongside the line above. Equally self-contained + bounded (stages, drains, leaves the queue
-    // empty), so it too never perturbs the CAPSTONE. (The AARCH64-PRIO landing deferred this one.)
-    prio_mix_witness(cpu);
+    // empty), so it too never perturbs the CAPSTONE. It drains, so it is under the SAME guard.
+    if !pre_staged { prio_mix_witness(cpu); }
     // SCHED-BAL: emit the work-stealing witness marker. On this `virt` boot-core-only cooperative path
     // there is no preemptive multi-core `run()` loop, so the steal counts read 0 (stealing is exercised
     // on the x86 sched_demo path in QEMU and on Pi/Orin metal); the line is the structural marker that
@@ -7962,4 +7962,41 @@ pub fn run_capstone_boot_core(cpu: usize) -> ! {
         while dispatch_next(cpu) {}
         core::hint::spin_loop();
     }
+}
+
+/// JB-CAPSTONE-GUARD — is `cpu`'s run queue ALREADY non-empty as `run_capstone_boot_core` starts?
+///
+/// WHY. Two of the pre-CAPSTONE witnesses (`priority_aging_witness`, `prio_mix_witness`) stage their own
+/// tasks and then call `run_until_empty(cpu)` — `while dispatch_next(cpu) {}`. That is a DRAIN, and a
+/// drain only returns when the queue empties. On the `virt` path the queue IS empty here, so both are
+/// bounded exactly as their doc comments claim. On the tegra path it is NOT: `main.rs` has already
+/// staged the JD2 console pump (infinite, cooperatively yielding) and the `tegra_el0` tasks, so the
+/// FIRST drain never returns and `spawn("capstone", ...)` below is unreachable — CAPSTONE has never run
+/// on tegra. This predicate is the guard: on a pre-staged queue the two draining witnesses are skipped
+/// (their ordering claims are only valid from a drained start anyway — see `prio_mix_witness`) and
+/// control falls straight through to the CAPSTONE spawn and the drive loop, which dispatches the
+/// pre-staged tasks and CAPSTONE together. `sched_bal_witness` is NOT guarded: it only reads counters
+/// and prints, it never dispatches, so it is safe on either branch and stays where it is.
+///
+/// INERT WHEN DRAINED. `len() == 0` returns `false` with NO output and no other effect, so the
+/// virt/pi/x86 path keeps today's call sequence, spawn position and log bytes exactly.
+///
+/// WHY IT LIVES AT THE FILE TAIL, CALLED ON THE WITNESS LINE ITSELF. Same convention (and same
+/// bisect-proven reason) as `tegra_el0_start_maybe` in `main.rs`: `panic!`/`assert!`/bounds-check sites
+/// bake a `core::panic::Location` — file AND LINE — into rodata, so inserting source lines ahead of them
+/// shifts every later Location and a knob-off image stops being byte-identical. A tail definition plus a
+/// same-line call adds ZERO lines to `run_capstone_boot_core`; its line count is unchanged.
+///
+/// The read uses the queue accessor `dispatch_next` itself consults (`rq(cpu).len()`, exactly as the
+/// existing `queue_empty` probe at the CAPSTONE driver does) — no new scheduler state is introduced.
+fn capstone_queue_pre_staged(cpu: usize) -> bool {
+    let depth = rq(cpu).len();
+    if depth == 0 {
+        return false;
+    }
+    serial_println!(
+        ":: CAPSTONE: drain witnesses SKIPPED (queue not drained at entry — {} task(s) pre-staged) ::",
+        depth
+    );
+    true
 }

@@ -3037,6 +3037,49 @@
     heaviest frame this program can draw). All three are 8.3-clean and staged on both the ESP and the
     x86 data volume beside `STAT.ELF`/`PULSE.ELF`.
 
+  - **KVUG — the in-kernel vug, carried into EL0 (`VUGK.ELF`, `hw-jetson` only).** Peter's ruling: the
+    in-kernel software vug (`unaos/crates/kernel/src/vug.rs`, deleted on every other branch by
+    `ee6bfd97`) survives here, and its *content* belongs in the userspace vug — "for those with super
+    extremely slow machines / for history — it's a thing for fun and work". A fourth cargo feature,
+    `kvug`, links the same source into **VUGK.ELF** / **VUGK-X86.ELF**, where the `m` key cycles the
+    kernel demo's three screens:
+
+    | mode | what it draws | kernel origin |
+    | --- | --- | --- |
+    | 0 | the classic wireframe crystal | `run_crystal` with `Mode::Wire` |
+    | 1 | the faceted amethyst crystal — 24 triangles, screen-space backface cull, painter's-algorithm depth sort, flat Lambert against a fixed key light, cap-seam highlights | `run_crystal` with `Mode::Solid` |
+    | 2 | the BeBox GeekPort tribute — two LED columns on the `(i + col) % 3` pattern | `run_bebox_mode` |
+
+    The kernel's fixed-point maths is carried **verbatim** (`isqrt`, `TRIS`, `LIGHT`, `AMETHYST`, the
+    Lambert/ambient fold), which is the point of the exercise — it is the historical artifact, and it is
+    `no_std`-friendly and float-free for the same reason it was in the kernel. Only `pal.fill_triangle`
+    had to be rewritten, because there is no PAL at EL0; the replacement is a band-clipped scanline fill,
+    so the two worker threads still own disjoint halves of the surface and no pixel has two writers.
+
+    **It is a separate image because both renderers do not fit one.** `.text` is capped at `0x2000` by a
+    page cliff (see the SIZE note in `crates/user-vug/src/main.rs`): one byte past it and `.bss` moves a
+    page, the file grows 4096 bytes in one step, the 16 KiB `USER_REGION_SIZE` check rejects it — and
+    `.bss` lands on `base + 0x3000`, which is worker A's stack. The kernel renderer measures 2143 bytes
+    against 461 (aarch64) / 169 (x86) of headroom, so `kvug` also compiles **out** the shard raytracer it
+    replaces. That is the right trade rather than a compromise: the shard costs O(pixels × 18 planes) and
+    the kernel's facet fill costs O(filled pixels), and "slow machine" is the whole brief. Measured
+    `.text`: `0x1f75` aarch64 / `0x1fc5` x86 with `kvug`, against an unchanged `0x1e33` / `0x1f57`
+    without it.
+
+    **Additive by construction.** Every hunk is `#[cfg(feature = "kvug")]`; `VUG.ELF`, `VUGC.ELF` and
+    `VUGX.ELF` are byte-identical to what they were. The mode is forced to 0 whenever `overlay` is false,
+    which is exactly the foreground/no-input path the checksum witness runs, so `VUGK.ELF` prints
+    `checksum=0xe68285b85121ac7c` on the fixture legs like every other image of this source.
+
+    **Not ported, and why.** The kernel HUD's *text* (`VUG // quartz`, the mode/faces/frame line) needs a
+    letter font; this program carries a 5×7 **digit** font only, and a letter font is the one thing the
+    `.text` ceiling genuinely cannot hold. The drawn-face count — `draw_stats`'s `faces` stat — is
+    rendered as a digit readout instead. The CPU pulse strip (`draw_pulse_bar`, `CpuPulse`,
+    `classify_load`, the PARKED/breath states) is **already** an EL0 program: `PULSE.ELF`
+    (`crates/user-pulse`), which reads the counters through `SYS_CPUPULSE(49)` — a verb the **x86 kernel
+    alone** dispatches (ABIFREEZE divergence D2), so it could not have worked in a vug on this branch's
+    arch regardless.
+
   - **The 300-frame checksum is untouched, and by construction rather than by luck.** The scene is gated
     on `overlay` (`detached || interactive`) — the same predicate that already gates the fps overlay — so
     the foreground/no-input path that the checksum witness runs on renders level 0, the unmodified

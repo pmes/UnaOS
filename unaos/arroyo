@@ -1050,6 +1050,11 @@ build_user_stat_x86() {
 #   VUGC-X86.ELF  (pinlo)        level 0 forever — the CLASSIC wireframe, for a slow machine and for
 #                                keeping old fps baselines comparable.
 #   VUGX-X86.ELF  (pinhi)        the full shard forever, for measuring the heaviest frame this draws.
+#   VUGK-X86.ELF  (kvug)         KVUG — the IN-KERNEL vug (crates/kernel/src/vug.rs) carried into EL0:
+#                                `m` cycles its three screens, the classic wireframe (Mode::Wire), the
+#                                painter's-algorithm faceted crystal (Mode::Solid) and the BeBox tribute.
+#                                For a very slow machine, and for history. It replaces the shard
+#                                raytracer rather than joining it — both do not fit one 0x2000 .text.
 #
 # `bg`/`run` take a path and no argv on either arch (shell.rs: `match args.first()`), so a build feature is
 # the only channel a pin can travel down. The three land on the media as VUG.ELF / VUGC.ELF / VUGX.ELF —
@@ -1089,6 +1094,12 @@ build_user_vug_x86() {
     build_one_vug_x86 VUG-X86.ELF  ""
     build_one_vug_x86 VUGC-X86.ELF "pinlo"
     build_one_vug_x86 VUGX-X86.ELF "pinhi"
+    # KVUG: the fourth image — the in-kernel vug carried into EL0. See the KVUG note in the aarch64 VUG
+    # build (build_user_aarch64) for the ruling, and for why it must be its own image: the `.text` page
+    # cliff at 0x2000 leaves the shipped x86 build 169 bytes of headroom and the kernel renderer costs
+    # 2143, so `kvug` compiles out the shard raytracer it replaces. Measured 0x1fc5 with `kvug`, against
+    # an unchanged 0x1f57 without it.
+    build_one_vug_x86 VUGK-X86.ELF "kvug"
 }
 
 # PULSE-1: build the x86_64 static ELF64 EL0 CPU-PULSE MONITOR (crates/user-pulse → target/PULSE-X86.ELF).
@@ -2392,6 +2403,40 @@ kernel8() {
     [ "$usz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: VUG.ELF ${usz} bytes > USER_REGION_SIZE (16384)${COLOR_RESET}"; exit 1; }
     echo -e "${COLOR_GREEN}✅ static-ELF EL0 mini-vug program: VUG.ELF (${usz} B)${COLOR_RESET}"
 
+    # KVUG: the SAME source, linked a second time with the `kvug` cargo feature, as target/VUGK.ELF — the
+    # aarch64 twin of build_one_vug_x86's VUGK-X86.ELF. Peter's ruling: the in-kernel vug
+    # (crates/kernel/src/vug.rs) lives on this branch only and its CONTENT belongs in VUG.ELF — "for those
+    # with super extremely slow machines / for history". VUGK.ELF is that content: `m` cycles the kernel's
+    # three screens — the classic wireframe (`Mode::Wire`), the painter's-algorithm faceted crystal
+    # (`Mode::Solid`), and the BeBox tribute (`run_bebox_mode`).
+    #
+    # WHY A FOURTH IMAGE RATHER THAN A FOURTH MODE OF VUG.ELF. `.text` is capped at 0x2000 by a page cliff
+    # (the SIZE note in crates/user-vug/src/main.rs): one byte past it and `.bss` moves a page, the file
+    # jumps 4096 bytes in one step, and the 16 KiB check below rejects it — AND `.bss` would land on
+    # base+0x3000, which is worker A's stack. The kernel renderer costs 2143 bytes and the shipped images
+    # have 461 (aarch64) / 169 (x86) free, so `kvug` also compiles OUT the shard raytracer it replaces.
+    # That is what makes VUGK.ELF fit, and it is the right product besides: the shard is the expensive
+    # renderer, the kernel's is the cheap one, and "slow machine" is the whole brief.
+    #
+    # The default images are untouched by construction — every hunk of this arc is `#[cfg(feature =
+    # "kvug")]` — and `.text` was measured byte-identical (0x1e33 aarch64 / 0x1f57 x86) after the port.
+    echo -e "${COLOR_YELLOW}⚡ Building EL0 KERNEL-VUG static-ELF program (crates/user-vug [kvug] → target/VUGK.ELF)...${COLOR_RESET}"
+    cd "$WORKSPACE_DIR/crates/user-vug"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
+      cargo +nightly build --release -Z json-target-spec --features kvug \
+      --target-dir "${WORKSPACE_DIR}/crates/user-vug/target/a64-kvug"
+    cd "$WORKSPACE_DIR"
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${WORKSPACE_DIR}/crates/user-vug/target/a64-kvug/aarch64-base/release/user-vug" \
+      "${WORKSPACE_DIR}/target/VUGK.ELF"
+    # The same three checks VUG.ELF takes, on the image the loader will actually read.
+    [ -s "${WORKSPACE_DIR}/target/VUGK.ELF" ] || { echo -e "${COLOR_RED}ERROR: VUGK.ELF missing/empty — KVUG build failed${COLOR_RESET}"; exit 1; }
+    kmag="$(head -c 4 "${WORKSPACE_DIR}/target/VUGK.ELF" | od -An -tx1 | tr -d ' \n')"
+    [ "$kmag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: VUGK.ELF does not start with the ELF magic; first 4 bytes = ${kmag}${COLOR_RESET}"; exit 1; }
+    ksz="$(wc -c < "${WORKSPACE_DIR}/target/VUGK.ELF" | tr -d ' ')"
+    [ "$ksz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: VUGK.ELF ${ksz} bytes > USER_REGION_SIZE (16384)${COLOR_RESET}"; exit 1; }
+    echo -e "${COLOR_GREEN}✅ static-ELF EL0 kernel-vug program: VUGK.ELF (${ksz} B)${COLOR_RESET}"
+
     # BGRUN-2: build the static ELF64 EL0 PERSISTENCE program (crates/user-stat) exactly like UVUG/ELFHELLO
     # — keep it AS AN ELF (strip-all preserves the ELF header + program headers + the two PT_LOAD segments).
     # It creates one 128x128 compositor window (SYS_WIN_CREATE), repaints its own pid + a frame counter + a
@@ -2761,6 +2806,10 @@ kernel8() {
     # runs the same bytes live. Distinct 8.3 name => its own IMAGE_SHA256 principal; never collides with the
     # flat fixtures or ELFHELLO.ELF.
     cp "${WORKSPACE_DIR}/target/VUG.ELF" "$KERNEL8_DIR/VUG.ELF"
+
+    # KVUG: the kernel-vug image beside it — `run /fat/VUGK.ELF` / `bg /fat/VUGK.ELF` on the panel. Its own
+    # 8.3 name, so its own IMAGE_SHA256 principal; never collides with VUG.ELF or the flat fixtures.
+    cp "${WORKSPACE_DIR}/target/VUGK.ELF" "$KERNEL8_DIR/VUGK.ELF"
 
     # BGRUN-2: carry the persistence static ELF64 onto the boot media as STAT.ELF (make-pi-img.sh ditto's
     # the whole staging dir). The BGRUN-ST persistence leg reads it back off the SD through the VFS and

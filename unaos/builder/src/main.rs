@@ -462,6 +462,10 @@ fn main() {
         ("VUG-X86.ELF", "VUG.ELF"),
         ("VUGC-X86.ELF", "VUGC.ELF"),
         ("VUGX-X86.ELF", "VUGX.ELF"),
+        // KVUG: the fourth image — the IN-KERNEL vug (crates/kernel/src/vug.rs) carried into EL0, whose
+        // `m` key cycles its three historical screens. Same reasoning as the pins: no argv, so the only
+        // channel a mode set can travel down is a distinct image with a distinct 8.3 name.
+        ("VUGK-X86.ELF", "VUGK.ELF"),
     ] {
         let vug_elf = target_dir.join(src);
         if vug_elf.exists() {
@@ -528,6 +532,9 @@ fn main() {
         // and a benchmark that cannot be launched from the volume the kernel actually reads is no pin.
         (target_dir.join("VUGC-X86.ELF"), "VUGC.ELF"),
         (target_dir.join("VUGX-X86.ELF"), "VUGX.ELF"),
+        // KVUG: the kernel-vug image rides the data volume for the same reason the pins do — `bg
+        // /fat/VUGK.ELF` must reach the volume the kernel actually reads.
+        (target_dir.join("VUGK-X86.ELF"), "VUGK.ELF"),
         (target_dir.join("PULSE-X86.ELF"), "PULSE.ELF"),
     ] {
         if src.exists() {
