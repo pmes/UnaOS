@@ -19141,8 +19141,11 @@ fn sock4_build(entry_sym: *const u8) -> Option<U7xFix> {
 ///       deposit itself lands (handle-level rights are all `sys_xfer` checks), but the migration at C's
 ///       RECV is REFUSED (the sender A no longer owns the socket): C's received handle is dead and B's
 ///       ownership is undisturbed — a second transfer can never yank a moved socket back.
-///   5. THE GEN-REBIND FENCE: B frees the socket (gen bumps), then a fresh socket REUSES the same slot at
-///      the NEW generation — B's old handle (old gen) stays `-EACCES`, provably no rebind to the new tenant.
+///   5. THE GEN-REBIND FENCE: B frees the socket (gen bumps), then a fresh socket is opened — and the fence
+///      is staged on WHATEVER registry slot that open returned, using THAT slot's own generation arithmetic:
+///      the live tenant resolves under its owner at the CURRENT gen, the same slot + same owner at the
+///      PRECEDING gen is `-EACCES` (only the packed generation differs, so only the gen check can reject),
+///      and B's old handle stays `-EACCES` throughout — provably no rebind to a new tenant.
 ///   6. LEDGER HYGIENE: after dropping every planted handle/Proc entry, the handle rows, inboxes, transfer
 ///      records AND the derivation ledger are all fully clear.
 ///
@@ -19261,9 +19264,17 @@ fn sock4_kernel_check(step: &mut &'static str) -> bool {
     handle_clear(A, 4);
     proc_free(pc);
 
-    // 5. THE GEN-REBIND FENCE. B frees the socket (gen bumps) — then a fresh socket first-fit-REUSES the same
-    //    slot at the NEW gen. B's old handle carries (sid, gen0), so it must stay -EACCES against BOTH the
-    //    freed slot and the new tenant — no rebind (the U11x fd discipline, socket edition).
+    // 5. THE GEN-REBIND FENCE. B frees the socket (gen bumps) — then a fresh socket is opened for A and the
+    //    fence is staged on THAT socket's slot, whatever it is.
+    //
+    //    FLAKE FIX (class 1b variant 2): this step used to assert `sid2 == sid` — that the reopen first-fit
+    //    BACK onto the freed slot — to get a live tenant under B's stale (sid, gen0) handle. That is not a
+    //    kernel invariant: `stack_open` takes the lowest free `reg` index of the GLOBAL smolnet table, so any
+    //    other user of that table (the SMOLNET DNS leg, the SOCK-6/7 listeners) freeing a lower slot inside
+    //    this window sends the reopen elsewhere and the fence reads false with nothing wrong. The property
+    //    being proven never needed that slot to be `sid`: it needs a LIVE tenant and a packed id for the same
+    //    slot at a generation the tenant does not hold. Both are available on `sid2` directly, so the staging
+    //    no longer depends on any other user of the table.
     crate::smolnet::stack_close(sid);
     note(
         &mut ok,
@@ -19288,13 +19299,49 @@ fn sock4_kernel_check(step: &mut &'static str) -> bool {
         proc_free(pb);
         return false;
     };
-    note(&mut ok, step, sid2 == sid, "slot_reused"); // first-fit reused the slot — rebind hazard is live
+    let gen2 = crate::smolnet::sock_gen(sid2);
+    // POSITIVE CONTROL: the live tenant of `sid2`, packed at its CURRENT generation, resolves under its
+    // OWNER (row A). Without it the negative below could pass for the boring reason (a dead/free slot).
+    install_cap(
+        A,
+        5,
+        KIND_SOCKET,
+        ((gen2 as u64) << 32) | ((sid2 as u64) + 1),
+        CAP_READ | CAP_WRITE,
+    );
+    note(
+        &mut ok,
+        step,
+        socket_id_of(A, 5, CAP_WRITE) == Ok(sid2),
+        "new_tenant_live",
+    );
+    // THE FENCE: same slot, same owner, same rights — the ONLY term that differs from the control is the
+    // packed generation, one behind the live tenant's, so only the generation check can reject it. A slot
+    // can only become free (and so be handed out by this open) by having been closed, and closing bumps the
+    // generation, so `gen2 - 1` is the generation of that slot's PREVIOUS tenant; in the degenerate case of
+    // a never-closed slot it wraps to a generation the slot has never held. Either way it is not the live
+    // tenant's, which is exactly the stale packed id the U11x fd discipline (socket edition) must reject.
+    install_cap(
+        A,
+        6,
+        KIND_SOCKET,
+        ((gen2.wrapping_sub(1) as u64) << 32) | ((sid2 as u64) + 1),
+        CAP_READ | CAP_WRITE,
+    );
+    note(
+        &mut ok,
+        step,
+        socket_id_of(A, 6, CAP_WRITE) == Err(EACCES),
+        "stale_gen_vs_tenant",
+    );
+    handle_clear(A, 5);
+    handle_clear(A, 6);
     note(
         &mut ok,
         step,
         hb >= 0 && socket_id_of(B, hb as u64, CAP_WRITE) == Err(EACCES),
         "b_stale_vs_new_tenant",
-    ); // still -EACCES vs the NEW tenant
+    ); // B's own stale handle stays dead with a fresh socket live (whichever slot took it)
     crate::smolnet::stack_close(sid2);
 
     // 6. Drop everything planted, then demand every ledger fully clear (no record/node/slot leaked).
