@@ -3193,9 +3193,34 @@ impl OccSnap {
 /// chargeable. Compat rows are excluded for the reason [`occluders`] gives — a compat row IS the
 /// full-screen present path, and while it owns the panel the render task is parked and not
 /// verifying anyway.
+/// CURSTICK — excuse snapshots that declined to spin, on the `[wcser]` rollup as `exbusy=`. Each
+/// count is one witness sample pardoned whole instead of blocking the blit loop on the table; a
+/// climbing count under a storm is the census of collisions the old blocking acquire used to eat
+/// silently, IRQ-masked, inside the compositor.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static OCC_EXCUSE_BUSY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 #[cfg(all(feature = "witness", target_arch = "x86_64"))]
 fn occluders_above(z: u32, id: u32) -> OccSnap {
-    let t = table();
+    // CURSTICK — REFUSE, DON'T WAIT. This runs inside the composite blit loop, per drawn window,
+    // as an argument to `wcg::begin`/`end` — and its old body took `table()`, a BLOCKING
+    // IRQ-MASKED spin, which made a WITNESS the only blocking primitive in the whole pass. An
+    // instrument must never be able to wedge the thing it instruments. On contention the sample
+    // is pardoned whole (one full-coverage box: `covers()` answers yes everywhere, so no pixel
+    // can be charged and no FAIL can be manufactured) and the refusal is counted. The pardon is
+    // the fail-safe direction — witness coverage lost for one window for one pass, said on the
+    // wire, against the alternative boot 7 paid.
+    let _irq = crate::arch::IrqMask::new();
+    let t = match TABLE.try_lock() {
+        Some(g) => g,
+        None => {
+            OCC_EXCUSE_BUSY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let mut snap = OccSnap::none();
+            snap.boxes[0] = (0, 0, usize::MAX, usize::MAX);
+            snap.n = 1;
+            return snap;
+        }
+    };
     let mut snap = OccSnap::none();
     for r in t.rows.iter() {
         if !r.used || r.compat {
@@ -3657,19 +3682,60 @@ pub fn paygo_service() {}
 ///
 /// Compat rows are included: they are a full-screen present whose rect covers the panel, so a stale
 /// patch there is exactly as visible as anywhere else.
+///
+/// ### DMG-DISJOINT — the rect's ROWS, not the window's whole box
+///
+/// The WC-K3 ledger already names what this function used to cost: *"a five-pixel exposure at the
+/// edge of a neighbour costs that neighbour a WHOLE-BOX repaint"*. Every caller here hands in a
+/// RECT — a vacated drag sliver, the cursor's save-under box, a closing dropdown — and every one of
+/// them was rounded up to the full outer box of every window it grazed, because [`Window`]'s band
+/// could not name chrome rows and so could not name "the top of this box down to row k".
+/// [`band_for_rows`] closes that, and this is its first consumer: a rect that crosses a window's
+/// middle now damages that window's middle. Six 768x768 surfaces whose mutual overlaps are slivers
+/// stop each charging their whole box on every pass, which is what collapsed `[comp2]`'s
+/// `dmg_px_pp`/`box_px_pp` onto each other at panel area.
+///
+/// Fail-safe unchanged: `None` from [`band_for_rows`] — a rect covering the whole box, a degenerate
+/// row, a compat row it spans — takes [`Window::damage_all`] exactly as before.
+///
+/// ### The skip is now narrower, and that is a fix
+///
+/// The loop used to `continue` on `t.rows[i].damaged`, which is correct only when the standing
+/// damage is a WHOLE BOX. A row already carrying a BAND (the routed console under
+/// `route_present_banded`) was skipped too, and the rows this rect exposed OUTSIDE that band were
+/// then never repainted at all — the pass servicing the band clears the flag and the exposure
+/// survives on the glass. The skip now tests what it always meant: a whole-box repaint is already
+/// owed. A banded row is WIDENED through [`Window::damage_rows`], whose own fail-safe promotes to
+/// the whole box rather than narrowing anything.
+///
+/// The return value keeps its meaning — rows this call newly damaged — so no caller reads
+/// differently; a widening of a row that was already dirty was never counted and still is not.
 pub fn damage_intersecting(x: usize, y: usize, w: usize, h: usize) -> usize {
     if w == 0 || h == 0 {
         return 0;
     }
     let rect = (x, y, w, h);
+    let py1 = y.saturating_add(h);
     let mut t = table();
     let mut n = 0usize;
     for i in 0..MAX_WINDOWS {
-        if !t.rows[i].used || t.rows[i].damaged {
+        let r = &mut t.rows[i];
+        if !r.used {
             continue;
         }
-        if boxes_overlap(rect, outer_box(&t.rows[i])) {
-            t.rows[i].damage_all();
+        // A whole-box repaint is already owed; it covers this rect whatever rows it names.
+        if r.damaged && r.dmg_y1 <= r.dmg_y0 {
+            continue;
+        }
+        if !boxes_overlap(rect, outer_box(r)) {
+            continue;
+        }
+        let fresh = !r.damaged;
+        match band_for_rows(r, y, py1) {
+            Some((sy0, sy1)) => r.damage_rows(sy0, sy1),
+            None => r.damage_all(),
+        }
+        if fresh {
             n += 1;
         }
     }
@@ -3862,6 +3928,7 @@ pub fn composite() {
         }
         // WCSER-H — this held epoch ends: clear the holder and re-arm the tripwire latch before
         // the release publishes the gate.
+        comp_mark(0, 0);
         COMP_HOLDER_CORE.store(usize::MAX, Relaxed);
         #[cfg(feature = "witness")]
         COMP_OVERDUE_REPORTED.store(false, Relaxed);
@@ -3910,6 +3977,7 @@ pub fn composite() {
                 }
             }
             // WCSER-H — same epoch-end discipline as the main release.
+            comp_mark(0, 0);
             COMP_HOLDER_CORE.store(usize::MAX, Relaxed);
             #[cfg(feature = "witness")]
             COMP_OVERDUE_REPORTED.store(false, Relaxed);
@@ -4525,14 +4593,58 @@ fn composite_inner() -> CursorTail {
         (t.rows, dirty, bands, guard)
     };
 
-    // Close the damage set upwards over occlusion, to a fixed point (at most MAX_WINDOWS passes).
+    // Back-to-front: ascending z, ties by id (creation order).
     //
-    // FBCON-DMG — the closure now reads the DAMAGED region of `i` (its band-clipped box) rather than
-    // its whole box, and the windows it drags in are promoted to a WHOLE-BOX repaint. Both halves are
-    // the conservative direction: a narrower `bi` can only reach fewer windows, and every window it
-    // does reach repaints at least the rows `i` is about to overwrite. A `j` that was itself banded is
-    // widened here too, which is why `bands[j].is_some()` re-enters the fixed point — without it a
-    // banded window could stay banded while a lower window repainted rows outside that band.
+    // DMG-DISJOINT — HOISTED ABOVE THE CLOSURE, because the closure now walks it. See below.
+    let mut order = [0usize; MAX_WINDOWS];
+    for (i, slot) in order.iter_mut().enumerate() {
+        *slot = i;
+    }
+    order.sort_unstable_by_key(|&i| (rows[i].z, rows[i].id));
+
+    // Close the damage set upwards over occlusion.
+    //
+    // FBCON-DMG — the closure reads the DAMAGED region of `i` (its band-clipped box) rather than its
+    // whole box. A narrower `bi` can only reach fewer windows, and every window it does reach
+    // repaints at least the rows `i` is about to overwrite.
+    //
+    // ### DMG-DISJOINT — THE DRAG IS BANDED, and this is the arc's main lever
+    //
+    // **The defect, from the metal (boot-4 sitting capture, six vugs idle):**
+    //
+    // ```text
+    // [comp2] ... dmg_px_pp=5190533 box_px_pp=5190533 ...
+    // ```
+    //
+    // Not "approximately equal" — EQUAL, on a 2880x1800 (5 184 000 px) panel. That exactness is the
+    // diagnosis. `dmg_px` is what `draw_window` painted and `box_px` is what the same call would
+    // have painted whole, so the two can only differ when a window in the pass carries a BAND; and
+    // the line below was `bands[j] = None`, an unconditional promotion of every window the closure
+    // touched to a WHOLE-BOX repaint. With no routed console in the pass the only other band
+    // producer is `present_rows`, so on a vug desktop NO window ever carried a band and the equality
+    // was a tautology of the mechanism rather than a measurement of it. Six 768x768 surfaces plus
+    // their chrome, each charged whole because a neighbour's sliver grazed it, is how a sitting
+    // desktop came to repaint the panel ~21 ms at a time.
+    //
+    // **The fix is to say what was actually damaged.** `j` is dragged in because `i`'s blit will
+    // overwrite the pixels where their boxes MEET — so `j` is damaged over that intersection, not
+    // over its whole box. The intersection's panel rows go back through [`band_for_rows`], which is
+    // `damaged_box`'s inverse and rounds outward, and the result is UNIONED with whatever band `j`
+    // already had. `None` from it (the rect spans `j` whole, or names nothing expressible) is the
+    // old behaviour exactly, so the fail-safe direction is unchanged: every path that cannot narrow
+    // still whole-boxes.
+    //
+    // ### Why ONE sweep is now a fixed point, where before it needed a loop
+    //
+    // The drag edge requires `rows[j].z > rows[i].z` STRICTLY, so the closure is a DAG over ascending
+    // z and `order` is a topological sort of it. Walking `order` means every contribution to
+    // `bands[i]` has already been applied when `i` is read, so `bi` is final at the moment it is
+    // used and no second round can widen it. The old slot-order walk had no such guarantee and paid
+    // for it with a `MAX_WINDOWS`-round fixed point — up to `MAX_WINDOWS^3` overlap tests per
+    // composite. Banding made that loop's termination argument harder as well (a band can widen many
+    // times, where a whole-box promotion can happen once), and the topological order removes the
+    // question rather than answering it.
+    //
     // WCN-CAUSE — the SEED set, snapshotted before the closure runs. Every row dirty here had its
     // damage flag set by something outside this pass (its owner's `present`, a cursor rect, an erase
     // drain); every row the loop below adds is compositor work its owner never asked for. The two
@@ -4540,68 +4652,127 @@ fn composite_inner() -> CursorTail {
     // makes `comp` DERIVABLE as `pre + drg` rather than counted a third time.
     #[cfg(feature = "witness")]
     let seed = dirty;
-    for _ in 0..MAX_WINDOWS {
-        let mut grew = false;
+    for oi in 0..MAX_WINDOWS {
+        let i = order[oi];
+        if !dirty[i] {
+            continue;
+        }
+        let bi = damaged_box(&rows[i], bands[i]);
+        if bi.2 == 0 || bi.3 == 0 {
+            continue;
+        }
+        for j in 0..MAX_WINDOWS {
+            if !rows[j].used || rows[j].z <= rows[i].z {
+                continue;
+            }
+            if dirty[j] && bands[j].is_none() {
+                continue;
+            }
+            let bj = outer_box(&rows[j]);
+            if !boxes_overlap(bi, bj) {
+                continue;
+            }
+            // DMG-DISJOINT — the rows of `j` that `i`'s blit will actually cross, unioned with the
+            // band `j` already carried. `damage_rows`' widening rule, expressed on the pass's local
+            // arrays because the table lock is long gone by here.
+            let py0 = bi.1.max(bj.1);
+            let py1 = bi.1.saturating_add(bi.3).min(bj.1.saturating_add(bj.3));
+            let drag = band_for_rows(&rows[j], py0, py1);
+            let next = match (drag, bands[j]) {
+                // Not expressible, or the whole box: promote, exactly as before this arc.
+                (None, _) => None,
+                // `j` was already dirty with a band (the guard above admits only that case, or a
+                // clean `j` whose `bands[j]` is `None` MEANING "not damaged" rather than "whole
+                // box" — which is why this arm tests `dirty[j]` and not `bands[j]` alone).
+                (Some((a, b)), Some((c, d))) if dirty[j] => Some((a.min(c), b.max(d))),
+                (Some(ab), _) => Some(ab),
+            };
+            // WCN-CAUSE — charge this drag to `i`, the window whose damage reached `j`.
+            //
+            // THE EDGE AND THE BILL ARE DIFFERENT EVENTS, and D4 is that they were conflated.
+            // `dout` is an EDGE: a window ADDED to the pass, so it is `!dirty[j]` only.
+            // `dkpx` is the PROMOTION BILL the assignment below commits this pass to, and a `j`
+            // that was already dirty WITH A BAND pays it too — it is widened here and was
+            // previously charged nowhere. That case is exactly the banded console under
+            // `route_present_banded`, which is the route Q3 turns on, so missing it hid the one
+            // reading the question needed. The guard above (`dirty[j] && bands[j].is_none()` ->
+            // continue) means everything reaching here satisfies `!dirty[j] || bands[j].is_some()`,
+            // so the bill is charged unconditionally and the condition is stated by the guard.
+            //
+            // DMG-DISJOINT — the bill is now the pixels ADDED rather than `j`'s whole box, which is
+            // what keeps it honest against a banded drag: `dkpx` is the quantity this closure's
+            // cost is read from, and billing a whole box for a sliver would hide the very saving
+            // the arc exists to make. Whole-box promotions still bill the whole box, because
+            // `damaged_box(_, None)` IS the outer box, so nothing about the old reading moves on a
+            // pass that could not narrow.
+            //
+            // SEED-GATED, and D3 is why: `dout` charged to a relay window made "topmost reads
+            // dout≈0" a THEOREM (the closure only ever walks upward, so the top of the stack can
+            // charge nobody) and let a window that was itself dragged in be billed for damage it
+            // merely FORWARDED. Only a window acting on its OWN damage is a dragger; a relay is
+            // counted as `drly`, which is what makes the win=5 -> win=10 chain read as a chain
+            // rather than as six independent draggers.
+            #[cfg(feature = "witness")]
+            {
+                let before = if dirty[j] {
+                    let d = damaged_box(&rows[j], bands[j]);
+                    d.2 as u64 * d.3 as u64
+                } else {
+                    0
+                };
+                let after = damaged_box(&rows[j], next);
+                let px = (after.2 as u64 * after.3 as u64).saturating_sub(before);
+                if seed[i] {
+                    wcn_note_dragout(rows[i].id, px, !dirty[j]);
+                } else if !dirty[j] {
+                    wcn_note_relay(rows[i].id);
+                }
+            }
+            dirty[j] = true;
+            bands[j] = next;
+        }
+    }
+
+    // CURSTICK — the sprite must stay ADOPTABLE under banded drags, and this is the boot-7 lesson.
+    //
+    // The overlay offer is made per staged band, and `compose_into` declines unless the sprite's box
+    // sits wholly inside the rows the band holds. Pre-arc, every window the closure dragged in was
+    // whole-boxed, so the topmost window under the pointer always contained the sprite and the
+    // pass's tail was `Adopt` — a session close, no repaint, no re-damage. The banded drag broke
+    // that by accident: a dragged-in band covering a neighbour's sliver almost never covers the
+    // sprite's rows, so no window took the overlay, `overlaid` stayed false, and the tail became
+    // `Repaint` — whose `repair()` re-damages the pointer-stack windows through
+    // `damage_intersecting` AFTER this pass's snapshot cleared them. Under six overlapping vugs
+    // with the pointer parked on the stack, that is a self-feeding composite storm: every pass
+    // re-arms the next, the holder burns its full re-run budget per call, and `[wcser]` climbs to
+    // the declined_pct=93..98 that preceded boot 7's wedge.
+    //
+    // The fix is a WIDENING, in the fail-safe direction the arc already owns: any dirty banded
+    // window whose outer box wholly contains the sprite's box — the only geometry that can take
+    // the offer at all — has the sprite's panel rows unioned into its band. Cost: the sprite is
+    // ~2 chrome-heights of rows on one or two windows per pass; the alternative was those windows'
+    // WHOLE boxes on every pass, which is the pre-arc price this arc exists to stop paying. A
+    // whole-box window (`bands[i] == None`) already contains the sprite and is skipped; a band the
+    // rows cannot express falls back to `None`, the pre-arc behaviour exactly.
+    if let Some(p) = plan {
         for i in 0..MAX_WINDOWS {
             if !dirty[i] {
                 continue;
             }
-            let bi = damaged_box(&rows[i], bands[i]);
-            for j in 0..MAX_WINDOWS {
-                if !rows[j].used || rows[j].z <= rows[i].z {
-                    continue;
-                }
-                if dirty[j] && bands[j].is_none() {
-                    continue;
-                }
-                if boxes_overlap(bi, outer_box(&rows[j])) {
-                    // WCN-CAUSE — charge this drag to `i`, the window whose damage reached `j`.
-                    //
-                    // THE EDGE AND THE BILL ARE DIFFERENT EVENTS, and D4 is that they were conflated.
-                    // `dout` is an EDGE: a window ADDED to the pass, so it is `!dirty[j]` only.
-                    // `dkpx` is the whole-box PROMOTION BILL that `bands[j] = None` below commits
-                    // this pass to, and a `j` that was already dirty WITH A BAND is promoted here
-                    // too — it pays the same widening and was previously charged nowhere. That case
-                    // is exactly the banded console under `route_present_banded`, which is the route
-                    // Q3 turns on, so missing it hid the one reading the question needed. The guard
-                    // three lines up (`dirty[j] && bands[j].is_none()` -> continue) means everything
-                    // reaching here satisfies `!dirty[j] || bands[j].is_some()`, so the bill is
-                    // charged unconditionally and the condition is stated by the guard, not repeated.
-                    //
-                    // SEED-GATED, and D3 is why: `dout` charged to a relay window made "topmost
-                    // reads dout≈0" a THEOREM (the closure only ever walks upward, so the top of the
-                    // stack can charge nobody) and let a window that was itself dragged in be billed
-                    // for damage it merely FORWARDED — the fixed point re-reads `bi` from the row it
-                    // just promoted. Only a window acting on its OWN damage is a dragger; a relay is
-                    // counted as `drly`, which is what makes the win=5 -> win=10 chain read as a
-                    // chain rather than as six independent draggers.
-                    #[cfg(feature = "witness")]
-                    {
-                        let (_, _, jw, jh) = outer_box(&rows[j]);
-                        let px = jw as u64 * jh as u64;
-                        if seed[i] {
-                            wcn_note_dragout(rows[i].id, px, !dirty[j]);
-                        } else if !dirty[j] {
-                            wcn_note_relay(rows[i].id);
-                        }
-                    }
-                    dirty[j] = true;
-                    bands[j] = None;
-                    grew = true;
-                }
+            let Some((c, d)) = bands[i] else { continue };
+            let (bx, by, bw, bh) = outer_box(&rows[i]);
+            if p.bx >= bx
+                && p.bx.saturating_add(p.bw) <= bx.saturating_add(bw)
+                && p.by >= by
+                && p.by.saturating_add(p.bh) <= by.saturating_add(bh)
+            {
+                bands[i] = match band_for_rows(&rows[i], p.by, p.by.saturating_add(p.bh)) {
+                    Some((a, b)) => Some((a.min(c), b.max(d))),
+                    None => None,
+                };
             }
         }
-        if !grew {
-            break;
-        }
     }
-
-    // Back-to-front: ascending z, ties by id (creation order).
-    let mut order = [0usize; MAX_WINDOWS];
-    for (i, slot) in order.iter_mut().enumerate() {
-        *slot = i;
-    }
-    order.sort_unstable_by_key(|&i| (rows[i].z, rows[i].id));
 
     // FOCUS-VIS — one snapshot of the shell's z for the whole pass, so every window in it is judged
     // against the same shell position (a concurrent focus change either lands wholly before this pass
@@ -4660,6 +4831,8 @@ fn composite_inner() -> CursorTail {
         // shared by the blit and by every witness that has to excuse what the blit withheld. Built
         // per window rather than once per pass because the set is relative to the painter; the scan
         // is `MAX_WINDOWS` rows against a call that is about to copy a box.
+        // WCSER-H — breadcrumb: this window's draw begins (clip + shadow pin next).
+        comp_mark(rows[i].id, 1);
         let clip = occ_clip(&rows, i, shell, fb.info().width, fb.info().height);
         // WPACE-TEXT — blit from the present-boundary shadow when this window has one: `rw` is the
         // pass's working copy of the row, with `surf` swapped onto the shadow buffer, and the guard
@@ -4704,6 +4877,9 @@ fn composite_inner() -> CursorTail {
         // GR21/WCD-OCC — the occluder set as of the blit is handed to `wcg::begin` on x86, so the
         // glass read-back can excuse a pixel a higher window owns exactly as `[wc-d]` does. aarch64
         // keeps the four-argument call and its byte-identical wire.
+        // WCSER-H — breadcrumb: entering the wcg bracket (the excuse snapshot inside it is the
+        // pass's one table re-acquisition, now a try-lock refusal shape).
+        comp_mark(rw.id, 2);
         #[cfg(all(feature = "witness", target_arch = "x86_64"))]
         let wcg_probe = super::wcg::begin(
             rw.id,
@@ -4767,6 +4943,7 @@ fn composite_inner() -> CursorTail {
         }
         // FOCUS-HL: `focus == 0` is shell focus and highlights nothing — and the explicit `!= 0` also
         // keeps a compat row (owner ASID 0) from matching it by accident.
+        comp_mark(rw.id, 3);
         overlaid |= draw_window(
             &fb,
             &rw,
@@ -4779,12 +4956,18 @@ fn composite_inner() -> CursorTail {
             // CURSOR-15 — `deferred` answers the same question yes: the `Settle` tail owes every
             // deferred pixel its verdict, so a deferring pass must not arm `PRESENT_DIRTY` either.
             disturbed || deferred,
-            // FBCON-DMG — the band this window's damage was declared over. `None` for every window
-            // dragged in by the occlusion closure and for every whole-box present, which is every
-            // caller that predates this arc.
+            // FBCON-DMG — the band this window's damage was declared over. `None` for every
+            // whole-box present.
+            //
+            // DMG-DISJOINT — and NO LONGER `None` for every window the occlusion closure dragged in:
+            // the drag is banded to the rows the dragging window's blit actually crosses, which is
+            // what makes `[comp2] dmg_px_pp` fall below `box_px_pp` on an idle multi-window desktop
+            // instead of being pinned to it by construction.
             bands[i],
             &clip,
         );
+        // WCSER-H — breadcrumb: draw returned; the post-draw witnesses (wcg end / wc-d) run next.
+        comp_mark(rw.id, 4);
         #[cfg(feature = "witness")]
         if let Some(p) = wcg_probe {
             let r = &rw;
@@ -7448,6 +7631,28 @@ static COMP_OVERDUE_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic:
 #[cfg(all(target_arch = "x86_64", feature = "witness"))]
 const COMP_PASS_OVERDUE_MS: u64 = 1_000;
 
+/// WCSER-H — the pass BREADCRUMB: which window the blit loop is on and which phase of its draw
+/// (0 idle, 1 shadow-pin, 2 wcg-begin, 3 draw, 4 post-draw witnesses). Gauges, relaxed, stamped
+/// by the holder and read by the overdue probe — so a wedged pass names not just its core but
+/// its exact rung: boot 7's "hung between win8 and win9" cost a session of forensics to place;
+/// the next one costs one serial line.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+static COMP_PASS_WIN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+static COMP_PASS_PHASE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// WCSER-H — one breadcrumb stamp: two relaxed stores.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+#[inline]
+fn comp_mark(win: u32, phase: u32) {
+    use core::sync::atomic::Ordering::Relaxed;
+    COMP_PASS_WIN.store(win, Relaxed);
+    COMP_PASS_PHASE.store(phase, Relaxed);
+}
+#[cfg(not(all(target_arch = "x86_64", feature = "witness")))]
+#[inline]
+fn comp_mark(_win: u32, _phase: u32) {}
+
 /// WCSER — a pass was declined and its damage is still on the table. Cleared by the holder's re-run
 /// loop; see `composite` for the lost-wakeup close.
 #[cfg(target_arch = "x86_64")]
@@ -7544,7 +7749,7 @@ fn wcser_emit(scope: &str, span: u64) {
         crate::arch::ms().saturating_sub(COMP_HOLD_T0_MS.load(Relaxed))
     };
     serial_println!(
-        "[wcser] scope={} entered={} declined={} reruns={} declined_pct={} holder={} held_ms={} span={}ms -> {}",
+        "[wcser] scope={} entered={} declined={} reruns={} declined_pct={} holder={} held_ms={} exbusy={} span={}ms -> {}",
         scope,
         entered,
         declined,
@@ -7552,6 +7757,7 @@ fn wcser_emit(scope: &str, span: u64) {
         pct,
         holder as isize,
         held_ms,
+        OCC_EXCUSE_BUSY.swap(0, Relaxed),
         span,
         // WEDGED is tested first and outranks SERIAL: a period in which every pass was declined and
         // none was ever entered is a permanently-held gate, not successful serialisation.
@@ -7595,10 +7801,12 @@ pub fn wcser_overdue_probe() {
     }
     COMP_OVERDUE_LAST_MS.store(now, Relaxed);
     serial_println!(
-        ":: [wcser] PASS OVERDUE holder=c{} age_ms={} pending={} == tripwire ::",
+        ":: [wcser] PASS OVERDUE holder=c{} age_ms={} pending={} win={} phase={} == tripwire ::",
         holder,
         age,
         COMP_PENDING.load(core::sync::atomic::Ordering::Acquire),
+        COMP_PASS_WIN.load(Relaxed),
+        COMP_PASS_PHASE.load(Relaxed),
     );
 }
 
@@ -8796,10 +9004,16 @@ struct WcnRow {
     /// impose on it. Seed-gated: see the charge site for why a relay must not be billed as a
     /// dragger.
     dout: core::sync::atomic::AtomicU64,
-    /// WCN-CAUSE — the whole-box PROMOTION bill those drags commit the pass to, in units of 1024 px.
-    /// Charged on every promotion this window's own damage causes, including a `j` that was already
-    /// dirty with a BAND and is widened to its whole box — that case adds no window and so raises no
-    /// `dout`, but it is real pixels and it is the console's case.
+    /// WCN-CAUSE — the PROMOTION bill those drags commit the pass to, in units of 1024 px. Charged
+    /// on every promotion this window's own damage causes, including a `j` that was already dirty
+    /// with a BAND and is merely widened — that case adds no window and so raises no `dout`, but it
+    /// is real pixels and it is the console's case.
+    ///
+    /// DMG-DISJOINT — the bill is the pixels ADDED to `j`'s damaged extent, not `j`'s whole box.
+    /// The closure no longer whole-boxes what it drags in, so a whole-box charge would report a cost
+    /// the pass does not pay and would hide the saving this counter exists to measure. A drag that
+    /// genuinely cannot be narrowed still bills the whole box, because `damaged_box(_, None)` IS the
+    /// outer box — no pre-arc reading of this field moves.
     dkpx: core::sync::atomic::AtomicU64,
     /// WCN-CAUSE — drag-in edges this row caused while it was itself a DRAGGEE, forwarding damage
     /// the closure had just given it. Separated from `dout` so a chain of overlapping windows reads
@@ -10315,15 +10529,87 @@ fn damaged_box(r: &Window, band: Option<(usize, usize)>) -> (usize, usize, usize
     }
     // F5 discipline: saturating throughout, so a nonsense band degrades to a large box the panel
     // clip bounds rather than to a small one that under-damages.
-    let y0 = r.y.saturating_add(sy0.saturating_mul(r.scale)).max(by);
-    let y1 = r
-        .y
-        .saturating_add(sy1.saturating_mul(r.scale))
-        .min(by.saturating_add(bh));
+    //
+    // DMG-DISJOINT — THE EXTREMES REACH THE CHROME, and that is what lets a band express the damage
+    // a NEIGHBOUR inflicts rather than only the damage an owner presents.
+    //
+    // The mapping `r.y + sy * r.scale` addresses CONTENT rows only, so before this arc the topmost
+    // panel row any band could name was `r.y` — the first content row — and the title bar and top
+    // border above it were unreachable. Any damage that touched a window's top edge therefore had to
+    // be spelled `damage_all()`, which is precisely why `damage_intersecting` and the occlusion
+    // closure whole-boxed: not because the whole box was dirty, but because the band had no way to
+    // say "from the top of the box down to row k".
+    //
+    // Now it can: `sy0 == 0` means the top of the OUTER box and `sy1 >= r.h` means the bottom of it.
+    // Both are WIDENINGS — the rows added are chrome rows the alternative repainted anyway — so no
+    // caller can lose a pixel by this, and the only pre-existing producer of a band
+    // (`present_rows`, the routed console) is affected exactly when it presents its first or last
+    // source row, where it now also repaints the frame those rows sit in. Conservative in the one
+    // direction that is always safe.
+    let y0 = if sy0 == 0 {
+        by
+    } else {
+        r.y.saturating_add(sy0.saturating_mul(r.scale)).max(by)
+    };
+    let y1 = if sy1 >= r.h {
+        by.saturating_add(bh)
+    } else {
+        r.y.saturating_add(sy1.saturating_mul(r.scale))
+            .min(by.saturating_add(bh))
+    };
     if y1 <= y0 {
         return (bx, by, bw, 0);
     }
     (bx, y0, bw, y1 - y0)
+}
+
+/// DMG-DISJOINT — the inverse of [`damaged_box`]: the SOURCE band of `r` that covers panel rows
+/// `[py0, py1)`, or `None` when the rows are not expressible as a band and the caller must fall back
+/// to a whole-box [`Window::damage_all`].
+///
+/// This is the primitive that stops widely-separated small surfaces from unioning into the panel.
+/// Two callers had no choice but to whole-box before it existed, and both are per-composite hot:
+///
+/// * [`damage_intersecting`] — the erase drains, the cursor repair and the menu close. The WC-K3
+///   ledger states the cost in its own words: *"a five-pixel exposure at the edge of a neighbour
+///   costs that neighbour a WHOLE-BOX repaint"*.
+/// * the upward occlusion closure in [`composite_inner`], which promoted every higher-z window it
+///   dragged in to `bands[j] = None`.
+///
+/// `None` is returned for "the whole box" as well as for "not expressible", because those are the
+/// same instruction to the caller. Rounding is OUTWARD on both ends (`floor` at the top, `ceil` at
+/// the bottom) so an upscaled window never under-damages the source row a partial panel row reads
+/// from, and the result is clipped to `r`'s own outer box so a rect that overhangs the window cannot
+/// name a row the window does not have.
+///
+/// Width is deliberately not part of the answer. A band is full-box-width by construction
+/// (`stage_window` paints `paint_window` across the whole clipped box for each chunk it stages), and
+/// the win this arc is after is vertical: six 768x768 surfaces whose mutual overlaps are slivers no
+/// longer each charge their whole box on every pass.
+fn band_for_rows(r: &Window, py0: usize, py1: usize) -> Option<(usize, usize)> {
+    if r.h == 0 || r.scale == 0 || py1 <= py0 {
+        return None;
+    }
+    let (_, by, _, bh) = outer_box(r);
+    let py0 = py0.max(by);
+    let py1 = py1.min(by.saturating_add(bh));
+    if py1 <= py0 {
+        return None;
+    }
+    // The content band, in the same coordinate `damaged_box` maps back out of. `py0 <= r.y` is the
+    // chrome case and `sy0 = 0` is exactly how `damaged_box` now spells it.
+    let sy0 = if py0 <= r.y { 0 } else { (py0 - r.y) / r.scale };
+    let cy1 = r.y.saturating_add(r.h.saturating_mul(r.scale));
+    let sy1 = if py1 >= cy1 {
+        r.h
+    } else {
+        // ceil, so a panel row that reads from a source row only partly covered still damages it.
+        (py1 - r.y).div_ceil(r.scale).min(r.h)
+    };
+    if sy1 <= sy0 || (sy0 == 0 && sy1 >= r.h) {
+        return None; // empty, inverted, or the whole box — all "damage_all" to the caller.
+    }
+    Some((sy0, sy1))
 }
 
 /// CLOSE-BOX (P79, bench: "put a close button in the upper right of the windows to exit"; WMCTRL,
