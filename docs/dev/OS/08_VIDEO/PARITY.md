@@ -1429,6 +1429,14 @@ is what still produces the odd `[wc-g] win=1 … -> COHER` and, less often, a `[
 whose panel lags an unpresented band. That is `exec-shellport`'s pacing lane, unchanged by this arc
 and now the only cause left rather than one of two.
 
+> **RE-SCOPED by §6.14 (`exec-wcgwin1`).** The residue is real and the writer named above is the right
+> one, but "pacing lane" is the wrong home for it. A 5×5 interleaved A/B showed `UNAOS_LIVECON=1` — the
+> arc that took the console's presents off print context, i.e. precisely the pacing fix — leaves the
+> `win=1` verdicts untouched (13 exceptional samples of 20 against 14 of 20). It could not have helped:
+> `wcg::SAMPLES` is 4 and all four are spent *before* `[pidesk] livecon ARMED`. The live interval is
+> the boot seam `[console-route first-paint, detach)`, where `_print` writes the window's SOURCE
+> surface without the lock `draw_window` would need to hold. **Not closed by LIVECON.** See §6.14.
+
 ### 6.9d Two OWED items this arc measured and did not take
 
 1. **The dock paints over WC-F's twin box.** `wcf::reserved` seats the twins at `ph-MARGIN-SIDE` —
@@ -1890,8 +1898,8 @@ metal via the playbooks. The pi playbook carries the read guidance from dsktp bo
 
 ### 6.13a `exec-flakehunt` — `[wc-k] … torn=1 -> AT-RISK` is §6.13's class, and the fix is §6.13's fix
 
-*(Renumbered from 6.14 at the seat pick — §6.14 is reserved for the rmbp tree's in-flight boot-seam
-section; this one is an addendum to §6.13 in substance anyway.)*
+*(Renumbered from 6.14 at the seat pick — §6.14 below is the `exec-wcgwin1` arc's section (724770fa,
+picked the same landing day); this one is an addendum to §6.13 in substance anyway.)*
 
 Investigation arc off `5d7ff0c8` (Pi seat). Two Pi seats reported `[wc-k] rollup … torn=1 ->
 AT-RISK` riding some `kernel8-test` runs under host load, where the pi4 spec carries **both** a
@@ -1951,11 +1959,111 @@ against, and **stops**. Owed, to whichever seat lands the wc-k stall guard:
   verdict is only FORBIDden, `[wc-k]`'s verdict is *also* REQUIREd, so excusing the desched class in
   the FORBID alone still reds the suite on the REQUIRE. Both lines are one change.
 
+### 6.14 The `exec-wcgwin1` arc — §6.9c's `win=1` residue is a BOOT-SEAM writer, and `livecon` cannot touch it
+
+Investigation arc, no behaviour change. §6.9c files the standing `[wc-g] win=1 … -> COHER`/`RACE-BLIT`
+red as *"console-vs-compositor residue"* and assigns it to `exec-shellport`'s **pacing** lane. LIVECON
+(§6.12) then landed exactly the mechanism §6.9c said was missing — the console's presents moved off
+print context onto the render core — and the standing battery does not arm it. The obvious question:
+**does arming `livecon` kill the `win=1` red?** It does not, and the reason is structural rather than
+statistical.
+
+#### What the four checksums actually measure
+
+All four legs of `[wc-g]` hash the window's **SOURCE surface** (`rw.surf`), never the destination:
+`blit` before the copy, `civac` after `clean_invalidate_surface`, `after` at `wcg::end`, and `app` at
+the client's own `on_present`. So on QEMU — where the cache maintenance is inert — `COHER`
+(`blit != civac`) and `RACE-BLIT` (`blit != after`) are **the same fault sampled at two different
+phases of one bracket**: *something wrote the source while the compositor was reading and copying it.*
+They are not two classes to be told apart; which one fires is only a question of where in `begin`/`end`
+the writer's store happened to land. `fbbad=` (the read-back against the glass) rides along and is the
+downstream consequence, not an independent fault.
+
+#### The A/B — five control runs and five armed, interleaved on one host
+
+`UNAOS_PIDESK=1 UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 150`, ± `UNAOS_LIVECON=1`, at
+`5d7ff0c8`. Every armed run carries `[pidesk] livecon ARMED` and a `[wc-x] livecon census` line, so the
+knob is doing its job in all five.
+
+| Run | `win=1` samples | CLEAN | COHER | RACE-BLIT | RACE-PRESENT | BLIT | exceptional |
+|---|---|---|---|---|---|---|---|
+| control 1 | 4 | 2 | 0 | 2 | 0 | 0 | **2** |
+| control 2 | 4 | 1 | 2 | 0 | 0 | 1 | **3** |
+| control 3 | 4 | 1 | 1 | 0 | 1 | 1 | **3** |
+| control 4 | 4 | 2 | 2 | 0 | 0 | 0 | **2** |
+| control 5 | 4 | 1 | 0 | 3 | 0 | 0 | **3** |
+| **control total** | **20** | **7** | **5** | **5** | **1** | **2** | **13** |
+| `livecon` 1 | 4 | 1 | 0 | 3 | 0 | 0 | **3** |
+| `livecon` 2 | 4 | 1 | 2 | 1 | 0 | 0 | **3** |
+| `livecon` 3 | 4 | 1 | 1 | 0 | 1 | 1 | **3** |
+| `livecon` 4 | 4 | 1 | 0 | 1 | 0 | 2 | **3** |
+| `livecon` 5 | 4 | 2 | 0 | 1 | 1 | 0 | **2** |
+| **`livecon` total** | **20** | **6** | **3** | **6** | **2** | **3** | **14** |
+
+13 exceptional of 20 against 14 of 20. **No effect, and no class is introduced or removed** — every
+verdict the armed leg produces appears in the control leg and vice versa. No other window produced a
+single exceptional `[wc-g]` sample in any of the ten runs.
+
+#### Why it could not have worked — the instrument is spent before the knob arms
+
+`wcg::SAMPLES` is **4**, and the console window's four presents are consumed inside a ~30-line stretch
+of the boot. In all five armed runs the LAST `win=1` sample precedes `[pidesk] livecon ARMED` by 4–11
+lines:
+
+| run | `console-route first-paint` | last `win=1` sample | `livecon ARMED` |
+|---|---|---|---|
+| `livecon` 1 | 305 | 329 | 338 |
+| `livecon` 2 | 303 | 331 | 335 |
+| `livecon` 3 | 304 | 331 | 336 |
+| `livecon` 4 | 305 | 333 | 338 |
+| `livecon` 5 | 305 | 327 | 338 |
+
+The arming is at the tail of `pidesk::activate` **by design** (§6.12: "the last instant that is still
+single-core through this seam"). `wc-g`'s budget for this window is gone by then. **The knob cannot
+move this red because the instrument has already gone dark when the knob takes effect.**
+
+#### The surviving writer, named
+
+`seq=0` is CLEAN in all ten runs, and the exceptional verdicts begin at `seq=1`/`seq=2` — i.e. at
+`[wc-x] console-route first-paint win=1 (glyphs -> window surface)`. That is the onset, and it names
+the writer: **`fbcon::_print`'s glyph rasteriser storing into `c.win_fb` / `c.win_store`.** Between the
+route install and the GUI handoff, `GUI_ACTIVE` is still `false` and `panel_mirror_held()` has already
+lifted (it lifts by construction the moment `CONSOLE_WIN` is installed, §6.9c), so *every* print lands
+in the console window's source surface. `_print` holds the `FBCON` lock; `wm::draw_window` does not
+take it. Any core printing in that window — and the same core, from an IRQ handler, mid-copy — writes
+the bytes `wcg::begin` just hashed. That is the whole fault.
+
+**`livecon` is orthogonal to it by construction.** It defers `route_present` / `route_present_rows` /
+`route_present_pending` — the **presenter**. The **writer** is untouched in either polarity. What stops
+the writer is `fbcon::detach()` (`console_flush(); GUI_ACTIVE.store(true)`), and that is exactly the
+call `livecon` *skips* — after the last sample, so `wc-g` never sees the difference.
+
+#### Two corrections to the record, and what is owed
+
+1. **§6.9c's assignment is misfiled, in one specific way.** The residue is not a post-handoff *pacing*
+   problem; in the frozen-snapshot default there is no post-handoff console writer at all. It is a
+   **boot-seam** concurrent-writer, live only in the interval `[console-route first-paint, detach)`.
+   Any fix aimed at present cadence is aimed past it. It stays OPEN — **not** closed by LIVECON.
+2. **`livecon`'s steady-state safety on `win=1` is UNMEASURED, not proven.** With a live console the
+   writer persists for the whole boot, and `SAMPLES = 4` means `wc-g` has no visibility into that
+   regime whatsoever. The A/B above says the knob does not make the *measured* window worse; it says
+   nothing about the unmeasured one. Read it that way, and note that this is a QEMU reading — the metal
+   read is dsktp boot 10+, and `livecon` remains default OFF for the reason §6.12 gives.
+
+**Recommendation: do NOT arm `UNAOS_LIVECON` in the standard battery on account of this red** — it
+cannot move it, and arming it would buy a false "closed". The derived fix is one of two, and both are
+`wm.rs`/`wcg.rs` design calls rather than knob-line work: either the console window's blit takes the
+`FBCON` lock for the span the checksums cover, or `wcg::begin` declines `win=1` while
+`console_is_routed() && !GUI_ACTIVE` — an *honest instrument decline* at a seam where the source is
+known-mutable, which is a different thing from suppressing the verdict. Not taken here: this arc
+convicted the mechanism, not the remedy.
+
 ---
 
 ### 6.15 WINX-8 — VUGSHRINK's two latent x86 faults, found by the fold, fixed at the crate
 
-*(§6.14 is reserved: the rmbp tree carries it in flight for the §6.9c boot-seam remedy candidates.)*
+*(§6.14 above is the `exec-wcgwin1` arc — the §6.9c boot-seam conviction whose two remedy candidates
+the rmbp track weighs; an earlier note here guessed it lived on the rmbp tree, corrected at the pick.)*
 
 **Provenance.** rmbp 2's WINX-8 battery leg, pre-validating the trunk fold (main `ad2fab78` onto
 their tip), failed deterministically on both x86-fat legs: worker A killed at `cr2 = base+0x2f88
