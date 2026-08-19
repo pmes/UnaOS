@@ -2581,6 +2581,84 @@ visibly front → the cursor is visible throughout. The raise, the shell raise a
 a window create are all gate-checkable; the *legibility* of the console under the full present, and the
 sprite itself (QEMU has no pointer), remain bench-only.
 
+### SPAWN-FOCUS — the window a person asked for takes the keyboard
+
+rMBP boot 2 (bench, metal): the operator typed a launch command at the shell, `pulse`'s window
+appeared, **and the keyboard stayed with the shell.** One symptom, two distinct failures at the same
+seam — `sys_win_create`'s first-window grant, which was the *only* rule deciding whether a freshly
+created window gets focus.
+
+1. **The grant was half a grant.** It published `USER_INPUT_ACTIVE` and stopped. It never called
+   `wm::focus_changed`, so `FOCUS_ASID` still named the shell, the new row was never raised, and its
+   chrome drew in the resting colours. The routing half said the new window had the keyboard; the
+   visible half said the shell did. This is exactly the failure FOCUS-VIS was written against, and
+   `clickshell_windowless_leg` already states the rule it broke — *a fix that did only the first would
+   read as focused and look unfocused*. Every other focus owner in the kernel (`dock::restore`, the
+   TAB cycle, the click router) calls `user_input_set_active` and then `focus_changed`, in that order;
+   this was the one site that did not.
+2. **The grant was too weak to fire at all** once anything else held focus. Its condition was "take
+   focus only if *nobody* has it" — deliberately the weakest rule that could never *steal*. That is
+   right for a window that opened on its own and wrong for the one the operator just named: launch a
+   second vessel from the shell while the first is focused and the new window opens behind the
+   keyboard.
+
+#### The policy
+
+> **A window created by an explicit user action takes focus on creation. A window created by anything
+> else never steals it.**
+
+The two are indistinguishable at `wm::create` — a window create looks identical either way — so the
+distinction is carried from the only place that knows it: **the launch**. `wm::SPAWN_FOCUS` is a small
+table of owners an operator explicitly launched, each awaiting its first window.
+
+| | takes focus on creation? | how |
+|---|---|---|
+| `run <path>`, `bg <path>`, bare-name launch | **yes, unconditionally** | the spawn arms a one-shot token; the first window consumes it |
+| an app's **second** and later windows | no | the token is a one-shot — already spent |
+| the compositor's desktop app (`wcx::desktop_app_service`) | no | never armed, *and* `SLOT_NO_AUTOFOCUS` at the grant |
+| the compat row, kernel furniture, selftest fixtures | no | never armed |
+| any of the above, when nothing holds focus | yes | the pre-existing weak rule, unchanged |
+
+The weak "shell was idle" rule is **kept, not replaced**. It is what makes a window reachable at all
+when nobody is using the keyboard; SPAWN-FOCUS sits in front of it and is consulted first, so an
+explicit spawn never falls through to a rule that would decline it merely because some other app
+happens to hold focus.
+
+The one-shot is the whole safety property. It makes "the operator asked for this window" a claim about
+a *single* window rather than a standing licence — a program cannot re-take the keyboard by re-creating
+a window in a loop.
+
+#### Mechanism, and why the token is armed at the spawn
+
+The token is armed **inside** the spawn, before the task can run — not by the launcher afterwards. The
+task is runnable the instant it is spawned and can reach `SYS_WIN_CREATE` before the launcher's next
+instruction, so "afterwards" is a race the operator would lose intermittently, which is the worst
+possible failure mode for a focus policy. `SLOT_DETACHED` and `SLOT_NO_AUTOFOCUS` are both set in that
+same pre-spawn window for the same reason; this is the third flag under that rule.
+
+It is dropped at slot teardown (`spawn_focus_forget`), per **tenant** rather than per slot, for the
+reason every other flag on this path is: owners are recycled slot aliases. A program launched by name
+that exited before ever opening a window would otherwise leave a live token, and the slot's next tenant
+— which nobody asked for — would consume it and take the keyboard.
+
+#### Arch-neutrality
+
+The **policy** lives in `video/wm.rs`, ungated and free of `target_arch`: the Pi runs this same
+compositor and inherits the rule the moment its syscall layer arms and consumes the token. What stays
+per-arch is only the **wiring**, and for a structural reason rather than a hardware one — the routing
+half of focus (`USER_INPUT_ACTIVE`) is an arch-local static in each `arch::*::syscall`, and `wm` may
+not call into the syscall layer at all (the layering invariant `sys_win_present` states: nothing under
+`wm` calls back into a window verb). So `wm` owns the decision, and the arch seam — the one place
+*both* halves of focus are reachable — performs it. x86 is wired; aarch64 needs no change in `wm` to
+adopt it.
+
+#### Witness
+
+`:: wc-x86: input focus -> slot N (SPAWN-FOCUS: operator-launched, first window) ::` for the strong
+arm, and the pre-existing `(first window, shell was idle)` for the weak one. Quoting them together is
+what distinguishes the two rules in a capture — the x86 fat gate run shows both, four of the former
+(including a slot recycled across tenants, each new tenant arming afresh) and three of the latter.
+
 ### FOCUS-HL — the focused window's chrome says so
 
 FOCUS-VIS made focus *positional*: the focused window raises, the shell raises above everything. That is

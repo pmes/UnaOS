@@ -486,6 +486,131 @@ pub fn shell_z() -> u32 {
     SHELL_Z.load(core::sync::atomic::Ordering::Acquire)
 }
 
+// ---- SPAWN-FOCUS: the launch a person asked for ------------------------------------------------
+
+/// SPAWN-FOCUS — the owners an OPERATOR explicitly launched, each awaiting its FIRST window.
+///
+/// ### The defect, stated before the fix (rMBP boot 2, metal)
+///
+/// The operator typed a launch command at the shell; `pulse`'s window appeared; **the keyboard stayed
+/// with the shell.** That is one symptom of two distinct failures at the same seam, and both are fixed
+/// against this table:
+///
+///  1. **The grant was half a grant.** The x86 first-window rule published `USER_INPUT_ACTIVE` and
+///     nothing else. It never called [`focus_changed`], so `FOCUS_ASID` still named the shell, the new
+///     row was never raised, and its chrome drew in the resting colours. The two halves of focus
+///     disagreed: the routing half said the new window had the keyboard and the VISIBLE half said the
+///     shell did. `clickshell_windowless_leg` already states the rule this broke — *"a fix that did
+///     only the first would read as focused and look unfocused"* — and this was the one focus-granting
+///     site in the kernel that did exactly that. Every other one (`dock::restore`, the TAB cycle, the
+///     click router) calls `user_input_set_active` and then `focus_changed`, in that order.
+///  2. **The grant was too weak to fire at all** once anything else held focus. The rule was
+///     "take focus only if NOBODY has it", which is right for a window that opened on its own and
+///     wrong for the one the operator just asked for by name: launch a second vessel from the shell
+///     while the first is focused and the new window opens behind the keyboard.
+///
+/// ### The policy this table encodes
+///
+/// **A window opened by an explicit user action takes focus on creation. A window created by anything
+/// else never steals it.** The two are not distinguishable at [`create`] — a window create looks
+/// identical either way — so the distinction is carried from the place that KNOWS it: the launch. An
+/// operator-driven launch arms this table with the owner it is about to create; the owner's first
+/// window consumes the token and is focused unconditionally. Nothing else is armed, so nothing else
+/// can take the keyboard off a window the operator is using.
+///
+/// * **Explicit spawn** — the operator named the launch at the shell: `run <path>`, `bg <path>`, and
+///   the bare-name launch. All three reach the loader through the arch's spawn entry points, and the
+///   token is armed INSIDE the spawn.
+/// * **Background-created — never focused on creation** — the compositor's own desktop app
+///   (`wcx::desktop_app_service`, already exempt via `SLOT_NO_AUTOFOCUS`), the compat row, kernel
+///   furniture, selftest fixtures, and — the case with no flag anywhere — **every window after an
+///   app's first.** The token is a ONE-SHOT: an app that opens a second window has already spent it,
+///   so a program cannot re-take the keyboard by re-creating a window in a loop.
+///
+/// ### Why the token is armed at the SPAWN and not by the launcher afterwards
+///
+/// The task is runnable the instant it is spawned and could reach its window create before the
+/// launcher's next instruction. `SLOT_DETACHED` and `SLOT_NO_AUTOFOCUS` are both set inside the spawn
+/// for precisely this reason and say so; this is the third flag under the same rule, and "afterwards"
+/// is a race the operator would lose intermittently — the worst possible failure for a focus policy.
+///
+/// ### Arch-neutrality
+///
+/// The POLICY lives here, in the shared compositor, ungated and free of `target_arch` — the Pi runs
+/// this same module and inherits the rule the moment its syscall layer arms and consumes the token.
+/// What stays per-arch is only the WIRING, because the routing half of focus (`USER_INPUT_ACTIVE`) is
+/// an arch-local static in each `arch::*::syscall`, and `wm` may not call into the syscall layer at
+/// all (the layering invariant `sys_win_present` states: nothing under `wm` calls back into a window
+/// verb). So `wm` owns the decision and the arch seam — which is the one place BOTH halves of focus
+/// are reachable — performs it. x86 is wired by this arc; aarch64 needs no change here to adopt it.
+///
+/// Owners are the compositor's own `owner_asid` namespace (`slot + 1`-biased on x86, the ASID on
+/// aarch64) — the same values [`create`] and [`focus_changed`] take, so no translation happens here.
+/// `0` is never armed: it is the SHELL, which is not a spawn.
+///
+/// Sized to [`MAX_WINDOWS`] because a token is only ever consumed by a window create, so the table can
+/// hold no more pending owners than the compositor can hold windows. Full is fail-closed: the launch
+/// still happens, it simply does not carry a focus grant.
+static SPAWN_FOCUS: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
+
+/// SPAWN-FOCUS — arm `owner`'s one-shot focus token. Called from the arch spawn path, BEFORE the task
+/// can run. Returns whether a slot was taken (`false` = table full, or `owner == 0`).
+///
+/// Idempotent: re-arming an owner that already holds a token is a no-op rather than a second entry, so
+/// a relaunch into the same owner cannot consume two slots. The scan is a linear walk over twelve
+/// atomics under no lock, which is sound because each cell is claimed by a single CAS — two cores
+/// arming different owners cannot both win the same cell, and two cores arming the SAME owner leave
+/// one token, which is the idempotence above.
+pub fn spawn_focus_arm(owner: u64) -> bool {
+    use core::sync::atomic::Ordering;
+    if owner == 0 {
+        return false;
+    }
+    // Already armed — nothing to do. Checked before claiming so the common relaunch case does not
+    // consume a second cell for an owner that is still waiting for its first window.
+    if SPAWN_FOCUS.iter().any(|c| c.load(Ordering::Acquire) == owner) {
+        return true;
+    }
+    for cell in SPAWN_FOCUS.iter() {
+        if cell
+            .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// SPAWN-FOCUS — CONSUME `owner`'s token: `true` exactly once per arming, `false` ever after.
+///
+/// The one-shot is the whole safety property. It is what makes "the operator asked for this window"
+/// a claim about a single window rather than a standing licence: the app's first create spends it,
+/// and its second, and every create by an app nobody launched by name, take the ordinary weak rule
+/// that can never steal focus.
+pub fn spawn_focus_take(owner: u64) -> bool {
+    use core::sync::atomic::Ordering;
+    if owner == 0 {
+        return false;
+    }
+    SPAWN_FOCUS.iter().any(|cell| {
+        cell.compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    })
+}
+
+/// SPAWN-FOCUS — drop `owner`'s token unconsumed, at slot teardown.
+///
+/// Per TENANT, not per slot, for the reason every other flag on this path is: owners are recycled
+/// slot aliases. A program that was launched by name and exited before ever opening a window would
+/// otherwise leave a live token on its owner value, and the NEXT tenant of that slot — which may be
+/// the desktop app, or anything the operator did not ask for — would consume it and take the
+/// keyboard. That is the exact failure this table exists to prevent, arriving through the back door.
+pub fn spawn_focus_forget(owner: u64) {
+    let _ = spawn_focus_take(owner);
+}
+
 // ---- VUGMIN-B: hidden-owner plumbing -----------------------------------------------------------
 
 /// VUGMIN-B — `wm`'s SHADOW of the hidden bitmask `arch::aarch64::syscall` owns, one bit per ASID.

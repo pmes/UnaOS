@@ -3671,13 +3671,49 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     // undone: publishing focus and then taking it back would be a real transition the whole ledger
     // would have to account for, and there is nothing here to take back. `slot_is_focus_exempt` is
     // a `const false` on a non-`wc` build, so this reads as the unqualified original there.
-    if !slot_is_focus_exempt(slot)
-        && USER_INPUT_ACTIVE
-            .compare_exchange(0, (slot as u64) + 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+    //
+    // SPAWN-FOCUS — and it is no longer the ONLY rule. The weak grant below is kept verbatim for
+    // every window that opened on its own; a window the OPERATOR asked for is decided one branch
+    // above it, against `wm`'s spawn token, and is unconditional. See `wm::SPAWN_FOCUS` for the
+    // policy and for the two metal defects it closes. The order matters: the token is consumed
+    // FIRST, so an explicit spawn never falls through to a rule that would decline it merely
+    // because some other app happens to hold the keyboard.
+    let owner = (slot as u64) + 1;
+    let granted = if slot_is_focus_exempt(slot) {
+        false
+    } else if crate::video::wm::spawn_focus_take(owner) {
+        // The operator named this launch and this is its first window: TAKE the focus, wherever it
+        // currently is. A plain store rather than a CAS — there is no losing race to lose here, the
+        // whole point being that an incumbent holder does not veto the grant.
+        USER_INPUT_ACTIVE.store(owner, Ordering::Release);
+        clear_input_row(slot);
+        serial_println!(
+            ":: wc-x86: input focus -> slot {} (SPAWN-FOCUS: operator-launched, first window) ::",
+            slot
+        );
+        true
+    } else if USER_INPUT_ACTIVE
+        .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
     {
         clear_input_row(slot); // a fresh focus starts clean, exactly as `user_input_set_active` does
         serial_println!(":: wc-x86: input focus -> slot {} (first window, shell was idle) ::", slot);
+        true
+    } else {
+        false
+    };
+    // SPAWN-FOCUS — **the VISIBLE half, which this seam never did.** Both halves or neither: a grant
+    // that moves `USER_INPUT_ACTIVE` and stops there leaves `FOCUS_ASID` naming the shell, the new
+    // row unraised and its chrome in the resting colours — focus that reads as granted and looks
+    // withheld, which is what the bench saw. `focus_changed` is the seam every other focus owner in
+    // the kernel calls immediately after `user_input_set_active` (`dock::restore`, the TAB cycle, the
+    // click router), in this order, and this is now the fourth caller rather than the one exception.
+    //
+    // Called with the window table (`WINDOWS`) already RELEASED — `drop(t)` above — so the compositor's
+    // own table is taken beneath nothing, preserving `WINDOWS`-outermost exactly as `sys_win_present`
+    // documents. `focus_changed` is idempotent and cheap when it raises nothing.
+    if granted {
+        crate::video::wm::focus_changed(owner);
     }
     serial_println!(
         ":: wc-x86: SYS_WIN_CREATE slot={} win={} rslot={} {}x{} pages={} wm_id={} ::",
@@ -13940,6 +13976,11 @@ pub fn clear_handle_row(slot: usize) {
     // clicks consumed as furniture. Both readers of the flag depend on this clear.
     #[cfg(feature = "wc")]
     SLOT_NO_AUTOFOCUS[slot].store(false, Ordering::Release);
+    // SPAWN-FOCUS: drop any UNCONSUMED token, per TENANT and for the identical reason. A program the
+    // operator launched by name that exited before it ever opened a window would otherwise leave a
+    // live token on this owner value, and the slot's NEXT tenant — which nobody asked for — would
+    // consume it and take the keyboard. See `wm::spawn_focus_forget`.
+    crate::video::wm::spawn_focus_forget((slot as u64) + 1);
     for i in 0..NHANDLE {
         // Clear the value first (Empty => `handle_resolve` bails as NoHandle before reading rights/kind),
         // then the rights and kind — so no intermediate state is ever a live handle with stale rights/kind.
@@ -15795,6 +15836,11 @@ pub fn run_user_image(
 ) -> Result<(RunOutcome, u64), &'static str> {
     let _ = name; // the task name is fixed (`RUN_TASK_NAME`) so the kill arm can match it
     let (mapped, pi) = load_program_common(bytes)?;
+    // SPAWN-FOCUS: a foreground `run` is an operator-typed launch by construction — this entry point
+    // has exactly one caller, the shell's `run` verb — so its first window takes focus. Armed here,
+    // before `spawn_user_preemptible` below, for the same reason `spawn_user_image_bg_inner` arms
+    // before its spawn: the task can reach `SYS_WIN_CREATE` the instant it is runnable.
+    crate::video::wm::spawn_focus_arm((mapped.slot as u64) + 1);
     let kill = alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new());
     // SMPBAL-X86: a foreground `run` is load-balanced, not stuck on the caller's core. The caller is
     // `x86_render_service` (the shell runs there since SCHED-X86), so `meter_current_cpu()` put every
@@ -15908,6 +15954,19 @@ fn spawn_user_image_bg_inner(
     // flag has to be true before the task exists, not before it gets around to opening a window.
     #[cfg(feature = "wc")]
     SLOT_NO_AUTOFOCUS[mapped.slot].store(no_autofocus, Ordering::Release);
+    // SPAWN-FOCUS: and the operator's focus token, in the same pre-spawn window and under the same
+    // rule — the task is runnable the instant it is spawned, so a token armed after this call is a
+    // race the operator loses whenever the program is quick to open its window.
+    //
+    // `!no_autofocus` IS the operator predicate and not a convenient proxy for one: this function's
+    // two public wrappers are exactly "the launch the operator asked for" (`spawn_user_image_bg` —
+    // `bg`, and the bare-name launch) and "the launch NOBODY asked for" (`..._no_autofocus`, whose
+    // one caller is `wcx::desktop_app_service`). The desktop app is therefore excluded HERE, at the
+    // arming, as well as at the grant — it never holds a token to consume, so its exemption does not
+    // depend on `slot_is_focus_exempt` alone.
+    if !no_autofocus {
+        crate::video::wm::spawn_focus_arm((mapped.slot as u64) + 1);
+    }
     let kill = alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new());
     // SMPBAL-X86: load-balanced placement. See `bg_place_cpu`.
     let cpu = bg_place_cpu();
