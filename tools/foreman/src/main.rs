@@ -108,6 +108,10 @@ fn run(cli: &Cli) -> anyhow::Result<i32> {
     let capture = capture_or_explain(&cli.log)?;
 
     // 2. run the witness-spec verdicts ---------------------------------------
+    // Preflight FIRST: compile every pattern and name every offender, so an
+    // unsupported dialect stops the run with an actionable report instead of the
+    // regex crate's line-less complaint mid-evaluation. Silent on a valid spec.
+    verdict::preflight_spec(&cli.spec).map_err(|r| anyhow::anyhow!("{r}"))?;
     let directives = verdict::parse_spec(&cli.spec).map_err(|e| anyhow::anyhow!("spec error: {e}"))?;
     let ev = verdict::evaluate(directives, &capture, &cli.spec);
 
