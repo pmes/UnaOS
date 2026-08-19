@@ -8951,7 +8951,7 @@ round-trip on Orin silicon — then the JD2 interactive shell (the arc gate), JD
 JD20 pointer, and a live interactive GUI session. Spec `jetson-sync1.spec` promoted the el0-hello
 line PENDING→REQUIRE (`1f0c3aff`). Still open: TEGRA-SD identify (honest stop at M2, `card
 detected / no identified card` — the block-publish witness stays PENDING) and `CAPSTONE COMPLETE`,
-which analysis shows is **structurally unreachable on the tegra path as coded** (not flaky, not
+a PENDING spec line whose analysis shows it is **structurally unreachable on the tegra path as coded** (not flaky, not
 starved): `run_capstone_boot_core`'s `priority_aging_witness` calls `run_until_empty`, whose
 drained-queue precondition is false on tegra — the JD2 console pump (infinite, cooperatively
 yielding, spawned pre-drop) and the el0 tasks are already staged, so the drain never returns and
