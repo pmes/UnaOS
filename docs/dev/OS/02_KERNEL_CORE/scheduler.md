@@ -2490,6 +2490,112 @@ unconditional scheduler paths — the spread machinery rides no knob; only its `
 per-move witness lines are `pi`-gated. A scheduler tune that only applied under a video knob would be
 the wrong shape.
 
+### STARVE1 — the permanent starvation of dsktp boot 8 was a WEDGE, and SPREADTUNE is exonerated (aarch64, `exec-starve`)
+
+`exec-starve`, off `0d865227`. The brief sent this seat after a NEW permanent-starvation class in the
+dsktp boot-8 metal capture (`~/unaos-bench/capture/pi4-pi1-b1/ttyACM0.log`, boot-8 window from raw
+line 56087). The conviction was reachable from capture + source, and it lands somewhere the brief's
+suspect list did not: **the scheduler is not the defect, and today's own change is not implicated.**
+
+**The verdict, and the two lines that carry it.** The terminal run reads
+
+```
+[el0live] verdict=STARVED el0 runnable/parked/committed=1/0/1 last_disp=234780ms ... kill_offcpu=18 corrupt=0 nopark=0
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=1/1 ... steal=19 d1=11 remig=6 cool=6 rwstamp=0 residn=6
+```
+
+(boot-8-window lines 2533 and 2519). **The brief's premise that `[spread4]` reports all four cores at
+zero is a misreading of a single transitional line.** For the whole 250 s terminal run `[spread4]`
+reports **`c3=1/1`** — one committed EL0 resident on core 3, unparked. There is no census divergence
+to explain: `[el0live]` counts `el0_active` summed over cores and `[spread4]` prints the same
+`el0_active` per core, so `runnable=1` and `c3=1/1` are the SAME word, and they agree. The task is
+exactly where the scheduler thinks it is.
+
+**What is wrong is core 3.** Every one of boot 8's twenty-one `[spin1]` prints — from `span=14874ms`
+(line 1588) to `span=274869ms` (line 2517) — is **byte-identical apart from the span field**:
+
+```
+[spin1] cpu=3 span=…ms task=99:input state=1 park=0 | … | disp busy=197 idle=2663 | irq total=3081 last=30 unhandled=0 … | sched phase=6 passes=2860 futex_stalls=0
+```
+
+`sched passes=2860` frozen, `irq total=3081` frozen, `disp busy/idle` frozen, across 260 seconds.
+Phase 6 is `SPIN8_TASK` — *switched into a task*. Core 3 entered task `99:input` and never completed
+another scheduler pass, and took no interrupt, not even its own timer. That is the SPIN-1/SPIN-7/
+SPIN-8 wedge signature exactly as those instruments were built to read it.
+
+**Why the wedge is TERMINAL for the EL0 task, which is the genuinely new part.** An EL0 *slot* task is
+created `steal_ok: false` (`arch/aarch64/sched.rs`, in `spawn_user_inner`'s `Task` initialiser — "left pinned
+deliberately — VUGSPREAD releases THREADS, not slots"). `RunQueue::steal_one` skips every task whose
+`steal_ok` is false. So the one mechanism that could rescue a runnable task from a dead core —
+an idle sibling's `try_steal` — is by construction forbidden from touching it. While other EL0 tasks
+lived, EL0 kept being dispatched on the surviving cores and the wedge was invisible. The operator's
+vug open/close churn (`kill_oncpu=4 kill_offcpu=18`, exits 67→68) reaped them one at a time until the
+**last survivor happened to be the one pinned to the dead core**, and at that instant EL0 stopped
+forever. The kill churn is the *selector*, not the cause; the wedge predates it by ~250 s.
+
+**SPREADTUNE (`cb628006`) is exonerated by the capture itself, not by argument.** Its entire new code
+path is the `task.steal_ok`-gated stamp in `make_ready`'s rewake branch, and its wire field for that
+path reads **`rwstamp=0`** on every `[spread4]` line in boot 8. The added code never executed. It also
+could not have reached this task even in principle: the starved task is `steal_ok: false`, which is
+the gate's own false arm. Suspect #1 is dismissed on evidence.
+
+**Suspects #2 and #3 are likewise not reached.** `corrupt=0 nopark=0` for the whole run says the reap
+path lost no task and left none unparked, and `DRAIN RESCUED (freed=1 pending=0)` fired earlier in the
+same boot, so the retire/drain path demonstrably works. The task was not lost from a queue — the
+census says it is still on core 3, which is precisely the problem.
+
+**Root cause of the wedge itself is OUT OF THIS LANE and remains open.** Why `99:input` stops
+returning with interrupts masked is a question for the input/serial-RX backstop path, not
+`arch/aarch64/sched.rs`. This arc does not guess at it.
+
+**The USB-storage EL0 starvation near boot (`rdcap=14562ms`, spin+hlt pump) is a DIFFERENT class** and
+is not conflated here: it was transient and recovered, whereas this one never does.
+
+#### The instrument: `[starve1]`
+
+Rather than build an unvalidatable evacuation path into the scheduler on the strength of one capture,
+this arc ships the discriminator that names the mechanism on the *next* boot, on one line, without a
+source audit. `starve1_probe` is called from the tail of `el0live_witness` with the current verdict.
+
+**It is a DELTA, not a snapshot** — the necessary design point. A frozen `passes` value proves nothing
+read once, so the probe **arms** on the first STARVED window (snapshotting `SCHED_PASSES` and
+`gic::IRQ_TOTAL` for every core) and **fires** on the second, printing the pair across the interval:
+
+```
+[starve1] episode=N cpu=3 act=1 res=1 phase=6 passes=2860->2860 irq=3081->3081 cur=99:input — WEDGE: …
+[starve1] episode=N cores_named=1 verdict=WEDGE | machine steal= d1= cool= rwstamp= pack= — …
+```
+
+**The reading rule:**
+
+* `passes=X->X` (frozen) on the core holding the runnable resident → **WEDGE**. The placement lane is
+  blameless; go where the core died. `cur=` names the task that stopped returning.
+* `passes=X->Y` (advancing) and the resident still not dispatched → **PLACEMENT**. The core is alive
+  and refusing; the spread/run-queue/affinity lane has a case to answer, and the machine-wide
+  `steal=/cool=/rwstamp=` on the second line are on the same wire to convict or clear it without
+  hunting a nearby `[spread4]`.
+* `cores_named=0` → **CENSUS-SPLIT**: `runnable>0` machine-wide while no core reports a runnable
+  resident. That would be a third finding and a bug in the census itself.
+
+**One line per episode.** The latch disarms the instant the verdict leaves STARVED, so a 250 s freeze
+costs two lines, not the ~170 that a per-window print would have produced. `[el0live]` keeps printing
+every window — it is the clock; `[starve1]` is the cause, stated once.
+
+**Cost and safety.** Two relaxed loads per core per STARVED window, three relaxed stores per episode.
+Nothing on a dispatch, wake, or steal path is touched. **No lock is taken** — a witness that can block
+on the scheduler's own lock can hang the machine it is diagnosing — and the one `current` deref
+follows `[spin1]`'s established rule (a task still current across two witness windows is not
+mid-drop). Not knob-gated: it rides `el0live_witness`, which is unconditional.
+
+**QEMU's honest limit, stated.** raspi4b **cannot reproduce this class and cannot judge the
+instrument's verdict.** It has no Group-1 IRQs or IPIs, no real SMP contention shape, and its
+`[spread4]`/`[el0live]` emit sites run before any EL0 task exists — so the census reads all-zero, the
+STARVED verdict never fires, and `starve1_probe` never leaves `STARVE1_IDLE`. QEMU proves the code
+compiles and the strings are linked into the image (`strings` on `kernel8.img`); it proves nothing
+else. **The verdict is the next metal boot that starves.** If that boot prints `verdict=WEDGE` with a
+frozen `passes` pair, this reading is confirmed and the next arc belongs in the input path; if it
+prints `verdict=PLACEMENT`, this reading is falsified and the scheduler is back under suspicion.
+
 ### Orphan-reaper wake on enqueue (aarch64, SCHED-4b)
 
 **SCHED-4 sleep_ticks regression** (U11-reap FAIL, timer never ticks in QEMU) bisected and fixed by SCHED-4b (`d7631117`): semaphore wake on orphan enqueue — ~0% idle duty metal-confirmed (c2=0% P31b), U11-reap PASS restored.

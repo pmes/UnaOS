@@ -599,6 +599,69 @@ const EL0_STALL_MS: u64 = 2_000;
 /// every window, because the reader's capture may start anywhere.
 static EL0LIVE_LAST_SIG: AtomicU64 = AtomicU64::new(u64::MAX);
 
+// ---------------------------------------------------------------------------------------------
+// STARVE-1 — WHY the STARVED verdict, in one line, once per episode
+// ---------------------------------------------------------------------------------------------
+//
+// `[el0live] verdict=STARVED runnable>0` says an EL0 task is READY and is not being dispatched. It
+// does not say WHICH mechanism is refusing it, and the two candidates demand OPPOSITE fixes:
+//
+//   * PLACEMENT — the task's home core is alive and making scheduler passes, but the task never wins
+//     a dispatch and no other core steals it. That is a run-queue/affinity/steal-brake defect, and
+//     the repair is in the spread lane (`steal_cooled`, the residency floor, the rewake placement).
+//   * WEDGE — the core hosting the task has stopped running its scheduler loop at all. Then the
+//     placement machinery is blameless: the task is queued exactly where it should be, on a core
+//     that is never going to look at its queue again. The repair is wherever the core died, which is
+//     not the scheduler.
+//
+// The dsktp boot-8 metal capture (`pi4-pi1-b1/ttyACM0.log`) is the case this instrument exists for.
+// Its terminal run reads `[el0live] verdict=STARVED runnable/parked/committed=1/0/1` with `last_disp`
+// climbing past 234 s, beside `[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=1/1` — one runnable EL0
+// resident, on core 3 — and beside `[spin1] cpu=3 task=99:input ... sched phase=6 passes=2860`
+// whose EVERY counter (`passes`, `irq total`, `disp busy/idle`) is BYTE-IDENTICAL across all 21
+// prints spanning 14.8 s to 274.9 s. Core 3 switched into a task (phase 6 = `SPIN8_TASK`) and never
+// completed another pass or took another interrupt. The starvation was a WEDGE, downstream of a core
+// that died ~250 s before the EL0 outage even began — but reading that required cross-referencing
+// three witness lines emitted by three different subsystems, and knowing what `steal_ok: false` on
+// an EL0 slot task means (the resident is PINNED, so no idle core's `try_steal` can ever rescue it).
+// This line states it outright.
+//
+// THE DISCRIMINATOR IS A DELTA, NOT A SNAPSHOT. A frozen `passes` value proves nothing on its own —
+// it could be a healthy core sampled twice at the same instant. So the probe ARMS on the first
+// STARVED window (snapshotting each core's pass and IRQ counters) and FIRES on the second, printing
+// `passes=X->Y` across the interval between two witness windows. `X->Y` equal is a core standing
+// still; `X->Y` advancing beside a frozen `steal=` is the placement defect instead, with the spread
+// lane convicted rather than exonerated. One line either way.
+//
+// ONCE PER EPISODE. The latch disarms the moment the verdict leaves STARVED, so a machine that
+// starves, recovers, and starves again gets one line per outage — not one per witness window, which
+// on a 250 s freeze would be 170 lines of identical text. The `[el0live]` line itself keeps printing
+// every window (it is the clock); this one prints the cause once.
+//
+// Cost: two relaxed loads per core per STARVED window, three relaxed stores per episode, and one
+// line per episode. Nothing on a dispatch, wake, or steal path is touched, and no lock is taken —
+// the `current` deref follows `[spin1]`'s established rule (a task that has owned a core across two
+// witness windows is definitionally not mid-drop).
+const STARVE1_IDLE: u8 = 0;
+const STARVE1_ARMED: u8 = 1;
+const STARVE1_FIRED: u8 = 2;
+
+/// STARVE-1 — latch state across witness windows. Single logical writer (the witness runs from one
+/// core's timer train), relaxed: a missed transition costs one line, never correctness.
+static STARVE1_STATE: AtomicU8 = AtomicU8::new(STARVE1_IDLE);
+
+/// STARVE-1 — episode counter, so two lines from one capture are never mistaken for one repeated.
+static STARVE1_EPISODE: AtomicU64 = AtomicU64::new(0);
+
+/// STARVE-1 — each core's `SCHED_PASSES` at the moment the probe armed. Padded for SPIN-3's reason
+/// even though this is a cold path: it sits beside the hot per-core words and inherits their layout.
+static STARVE1_PASSES0: [PaddedU64; NUM_CPUS] = [const { PaddedU64(AtomicU64::new(0)) }; NUM_CPUS];
+
+/// STARVE-1 — each core's GIC interrupt total at the moment the probe armed. A core that is merely
+/// busy still takes its timer tick; a core whose IRQ total is frozen beside a frozen pass count is
+/// spinning with interrupts masked, which is the wedge signature SPIN-7/SPIN-8 established.
+static STARVE1_IRQ0: [PaddedU64; NUM_CPUS] = [const { PaddedU64(AtomicU64::new(0)) }; NUM_CPUS];
+
 /// SCHED-7 — the CNTPCT busy span `dispatch_next` folded into the load window on the CURRENT pass
 /// (0 when the run queue was empty). `run()` reads+clears it after every pass and folds the REST of
 /// the pass's wall span in as IDLE, so no wall time is left unaccounted. Single-writer (the owning
@@ -7361,6 +7424,116 @@ pub fn el0live_witness() {
         reap_exit, reap_kill_on, reap_kill_off, reap_corrupt, reap_nopark,
         el0_disp,
     );
+    // STARVE-1: name the mechanism behind a STARVED verdict, once per episode. Runs after the line
+    // above so a capture always reads the clock first and the cause beneath it.
+    starve1_probe(verdict == "STARVED");
+}
+
+/// STARVE-1 — the two-window probe described in the block beside `STARVE1_STATE`. Called from
+/// `el0live_witness` with the current verdict's STARVED-ness; arms on the first STARVED window and
+/// fires on the second, so `passes=X->Y` is a genuine delta across a witness interval rather than a
+/// snapshot that cannot distinguish a stopped core from a fast one.
+///
+/// Reads only: per-core relaxed counters plus one `current` pointer per resident core, taken under
+/// `[spin1]`'s rule (a task still current across two witness windows is not mid-drop). No run-queue
+/// lock is taken — a witness that can block on the scheduler's own lock is a witness that can hang
+/// the machine it is diagnosing.
+fn starve1_probe(starved: bool) {
+    if !starved {
+        // Any non-STARVED verdict closes the episode: the next outage is a new one and gets a line.
+        STARVE1_STATE.store(STARVE1_IDLE, Ordering::Relaxed);
+        return;
+    }
+    match STARVE1_STATE.load(Ordering::Relaxed) {
+        STARVE1_IDLE => {
+            // ARM: snapshot the two liveness counters on every core. Cheap, and taken for all cores
+            // rather than only resident ones so the fire path can report a core the task MOVED to.
+            for cpu in 0..NUM_CPUS {
+                let (_, passes) = spin8_state(cpu);
+                STARVE1_PASSES0[cpu].0.store(passes, Ordering::Relaxed);
+                STARVE1_IRQ0[cpu].0.store(
+                    crate::arch::gic::IRQ_TOTAL[cpu & 7].load(Ordering::Relaxed) as u64,
+                    Ordering::Relaxed,
+                );
+            }
+            STARVE1_STATE.store(STARVE1_ARMED, Ordering::Relaxed);
+        }
+        STARVE1_ARMED => {
+            let episode = STARVE1_EPISODE.fetch_add(1, Ordering::Relaxed) + 1;
+            // Report every core that holds a RUNNABLE EL0 resident — those are the only cores that
+            // could be dispatching the starved task, so they are the only ones under suspicion.
+            let mut named = 0usize;
+            let mut any_advancing = false;
+            for cpu in 0..NUM_CPUS {
+                let act = el0_active(cpu);
+                if act == 0 {
+                    continue;
+                }
+                named += 1;
+                let (phase, passes) = spin8_state(cpu);
+                let passes0 = STARVE1_PASSES0[cpu].0.load(Ordering::Relaxed);
+                let irq = crate::arch::gic::IRQ_TOTAL[cpu & 7].load(Ordering::Relaxed) as u64;
+                let irq0 = STARVE1_IRQ0[cpu].0.load(Ordering::Relaxed);
+                if passes != passes0 {
+                    any_advancing = true;
+                }
+                // Who owns the core. On the wedge reading this NAMES the task that stopped
+                // returning; on the placement reading it is whatever ran most recently.
+                let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
+                let (cur_id, cur_name) = if raw.is_null() {
+                    (0u64, "-")
+                } else {
+                    unsafe { ((*raw).id, (*raw).name) }
+                };
+                serial_println!(
+                    "[starve1] episode={} cpu={} act={} res={} phase={} passes={}->{} irq={}->{} cur={}:{} — {}",
+                    episode,
+                    cpu,
+                    act,
+                    EL0_RESIDENTS[cpu].0.load(Ordering::Relaxed),
+                    phase,
+                    passes0,
+                    passes,
+                    irq0,
+                    irq,
+                    cur_id,
+                    cur_name,
+                    if passes == passes0 {
+                        "WEDGE: this core completed no scheduler pass across the probe interval, so the resident is queued on a core that will never look at its queue again — the placement lane is blameless"
+                    } else {
+                        "PLACEMENT: this core IS making scheduler passes and still does not dispatch the resident — the refusal is in the run-queue/affinity/steal lane"
+                    },
+                );
+            }
+            // The machine-wide spread counters on the same wire, so the placement reading can be
+            // convicted or exonerated from the SAME line rather than by hunting a [spread4] nearby.
+            // A frozen `steal` beside an ADVANCING pass count is the spread lane's case to answer;
+            // a frozen `steal` beside a frozen pass count is expected and means nothing (an idle
+            // core cannot steal from a core whose queue it is not the one refusing).
+            serial_println!(
+                "[starve1] episode={} cores_named={} verdict={} | machine steal={} d1={} cool={} rwstamp={} pack={} — a runnable EL0 resident that is PINNED (an EL0 slot task is steal_ok=false) can never be rescued by try_steal, so a wedged home core is terminal for it",
+                episode,
+                named,
+                if named == 0 {
+                    // runnable>0 machine-wide but no core reports a runnable resident: the census
+                    // itself disagrees with the verdict, which is a third finding and its own bug.
+                    "CENSUS-SPLIT"
+                } else if any_advancing {
+                    "PLACEMENT"
+                } else {
+                    "WEDGE"
+                },
+                SPREAD15_MOVES.load(Ordering::Relaxed),
+                SPREAD15_D1.load(Ordering::Relaxed),
+                SPREAD15_COOL.load(Ordering::Relaxed),
+                SPREAD15_RWSTAMP.load(Ordering::Relaxed),
+                SPREAD15_PACK.load(Ordering::Relaxed),
+            );
+            STARVE1_STATE.store(STARVE1_FIRED, Ordering::Relaxed);
+        }
+        // FIRED: the episode has been explained. Stay quiet until the verdict changes.
+        _ => {}
+    }
 }
 
 /// EL0-LIVE — the TIMER-TRAIN arm of [`el0live_witness`]: change-suppressed while healthy, unmuted
