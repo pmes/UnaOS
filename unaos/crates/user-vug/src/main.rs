@@ -571,6 +571,11 @@ fn input_poll() -> u64 {
 /// gate fails; `never` 8141, twenty-four bytes UNDER the untouched program. Same phenomenon the SIZE
 /// note above `futex_wait` records — the cost is inlining pressure in the frame loop, not the code
 /// written here. Nothing about correctness depends on it; the image ceiling does.
+///
+/// VUGSHRINK: the 8 KiB boundary named above was an x86 LINK-SCRIPT artefact and is gone on that arch —
+/// see `emit`'s SIZE note. The measurement stands as recorded; the pressure it was bought against no
+/// longer binds on x86, and the attribute is kept because the reasoning is still sound on aarch64,
+/// where the 0x2000 line is real.
 #[inline(never)]
 fn input_wait() {
     /// One 60 Hz frame — the fallback park's period. See the note above.
@@ -1253,6 +1258,13 @@ fn zoom_apply(dist: Fx, steps: i32) -> Fx {
 /// any automated run. Inlined, it costs `_start` register pressure and spills for a path that is cold
 /// by construction; outlined it is one call. Measured against the `0x2000` `.text` line on x86 (see
 /// [`emit`]'s SIZE note), which is where this program's headroom actually is.
+///
+/// VUGSHRINK, and the record should say so plainly: outlining was not enough. This commit shipped
+/// `.text` at 0x207f — 127 bytes past that line — which moved `.bss` a page and put `VUG-X86.ELF` at
+/// 16664 against a 16384 gate, breaking every x86 runtime gate until the link script was fixed. The
+/// attribute stays (it is still the right call for a cold path in a 3.8 KiB frame loop, and aarch64
+/// still lives against 0x2000); what changed is that the line it was measured against was itself the
+/// defect.
 ///
 /// `next == dist` is the exact test for "this detent could not move the picture" — the operator is
 /// already at a bound — so the two counters separate the two facts a bench needs told apart: the
@@ -2034,6 +2046,17 @@ fn say(label: &[u8], v: u32) {
 /// `readelf -lW target/VUG-X86.ELF` against that `0x2000` line, not against the file size the build script
 /// prints (the file carries section headers and page padding, so it overstates the real footprint — the
 /// LOADable memory here is ~12.4 KiB of the 16 KiB window).
+///
+/// VUGSHRINK — **THE `0x2000` LINE ABOVE IS NOW THE aarch64 NUMBER ONLY.** That parenthetical about the
+/// file overstating the footprint was in fact the whole bug: the x86 image was 4249 bytes of hole,
+/// because nothing claimed the file's first 0xb0 bytes and the text segment was pushed a page past
+/// them, skewing every later file offset. `crates/user-vug/user-vug-x86.ld` now links the ELF header
+/// and phdr table INTO the text segment (`FILEHDR PHDRS`), so file offsets equal vaddrs and the x86
+/// budget is `0xb0 + .text <= 0x3000` — `.text <= 0x2f50`, with 3793 bytes spare at this writing. The
+/// cliff is still a cliff (one byte past it still costs 4096 in one step), it is simply a long way off
+/// now, and the trims this note and the ones on `input_wait` / `wheel_zoom` record were all bought
+/// against the OLD line. aarch64 keeps the `0x2000` budget: user-vug.ld is deliberately unchanged,
+/// that arch fits with room, and its VUG.ELF is byte-identical across VUGSHRINK.
 fn emit(label: &[u8], v: u32, tail: &[u8]) {
     let mut b = Buf::new();
     b.put(label);
