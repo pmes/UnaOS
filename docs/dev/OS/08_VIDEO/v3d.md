@@ -8798,3 +8798,299 @@ back-pressure. §49.25.7 is built to split exactly that.
 *Fold discipline note:* boot 13 flew and was read the same sitting; this fold was written by the
 successor session from the capture, per the standing no-folds-at-close order — the capture, not this
 prose, is the evidence of record.
+
+#### 49.25.7 `vpmprobe` (PI-V3D-103) — splitting `OUTCOME H4`: is the VPM write refused, discarded, or never presented?
+
+This records the rung as **built**, on the terms §49.25.4a/§49.25.5 recorded theirs: a **design note, not
+a verdict**. QEMU raspi4b models no V3D at all, so nothing below has been observed; the gates are
+compile, presence-in-artifact and knob-off/armed byte-identity, and the reading rules are written
+*before* the boot that will decide them.
+
+##### 49.25.7a Sub-hypothesis (a) is dead, and it died at the desk
+
+The brief for this rung named three sub-hypotheses inside §49.25.6's H4 space. The first was:
+
+> *(a) the shader's VPM WRITE SETUP is ignored or mis-targeted on this silicon — the VPMVCD write-setup
+> magic-register word. The bcm2711 is V3D 4.2, NOT the VC4 VPM model; if our shader was written against
+> VC4 VPM semantics, that mismatch could BE the wall, and it is checkable STATICALLY first.*
+
+It was checked statically, and **it is dead. There is no setup word in our shader to be wrong.**
+
+The reasoning the hypothesis rests on is *correct* — a VC4-shaped VPM setup on a 4.2 VPM would indeed be
+a wall — and it is correct because **that exact failure already happened in this campaign, and was
+already root-caused and fixed two years of arcs ago.** PI-V3D-9/17/18/19 wrote the coord shader's output
+with the streamed VC4 / V3D-3.3 mechanism: a `vpmsetup` arming a VPM segment, then `mov vpm, rfN`
+auto-advancing an implicit write pointer. **PI-V3D-20 removed it entirely**, on the finding that the
+mechanism does not exist for per-vertex shader output on V3D 4.x — every one of those builds was writing
+an unconfigured magic register. `CS_VS_WORDS` has carried the 4.2 form ever since: six `STVPMV` stores
+with **explicit** per-component VPM offsets 0..5, delivered as uniforms into `rf9..rf14`, and **no
+`vpmsetup` at all**. (`vpmsetup` *does* pack on ver 42 — opcode 187, `first_ver` 33 — but on 4.x it arms
+VPM **DMA** descriptors, an unrelated channel.)
+
+Three independent checks agree that the surviving body is 4.2-shaped:
+
+1. **Mesa-compiled cross-check (PI-V3D-26).** The body was validated against a real `v3d_compile()` run
+   at ver 4.2 configured as the driver configures a binning VS (`num_used_outputs = 0` for the
+   last-geometry-stage coord shader). Mesa stores clip Xc,Yc,Zc,Wc to VPM offsets **0,1,2,3** and screen
+   Xs,Ys to **4,5**, with viewport scale 32·256 = **8192** — our contract exactly.
+2. **Mesa-packer round-trip (PI-V3D-20).** Every word is packed and round-tripped by Mesa's own
+   `v3d_qpu_instr_pack`; `scripts/pi-v3d20-qpu-gen.out.txt` ends `All words packed + round-tripped OK`.
+3. **Bit-by-bit re-decode, this arc.** All six `STVPMV` words were decoded by hand against the ver-42
+   field layout rather than trusted:
+
+   | field | bits | value | reading |
+   |---|---|---|---|
+   | `OP_ADD` | [31:24] | `0xF8` = **248** | `V3D_QPU_A_STVPMV` — correct, on all six |
+   | `OP_MUL` | [63:58] | 15 | `V3D_QPU_M_NOP` — mul side idle |
+   | `SIG` | [57:53] | 0 | no signal on the store words |
+   | `ADD_A` mux | [14:12] | 6 | `MUX_A` → the **offset** comes from `RADDR_A` |
+   | `RADDR_A` | [11:6] | 9,10,11,12,13,14 | `rf9..rf14`, the six offset uniforms, in order |
+   | `ADD_B` mux | [17:15] | 7 | `MUX_B` → the **value** comes from `RADDR_B` |
+   | `RADDR_B` | [5:0] | 0,1,2,3,7,8 | `rf0..rf3` clip, `rf7`/`rf8` screen — in order |
+
+   The operand **order** (offset in A, value in B), the mux selects, and the register numbers are all
+   correct. `vpmwt` (`OP_ADD` 187) sits ahead of the terminal `thrsw`, per GFXH-1684.
+
+**Conclusion, stated loudly because it redirects the whole rung:** our coordinate shader is
+**4.2-shaped, not VC4-shaped**. Sub-hypothesis (a) cannot be the wall, no slot on boot 14 is spent on
+it, and the boot says so itself on a `[v3d103] VPMSTATIC` line so no reader spends the sitting
+re-deriving it. What (a)'s death buys is that §49.25.6's exoneration of the shader now covers its
+*addressing form* as well as its *content* — the wall is downstream of every choice the shader makes.
+
+##### 49.25.7b What survives, and what was found while checking
+
+Two sub-hypotheses remain, and one useful negative came out of the static pass:
+
+- **(b) the coord thread lacks VPM access or allocation.** Live, and now sharply instrumented — see
+  below. One finding narrows it before the boot: **the VCM allocation is not missing.** The bin CL does
+  emit `VCM_CACHE_SIZE` (packet 71) with `binning = rendering = 4`, computed per Mesa's
+  `CLAMP(vpm_output_batches - 1, 2, 4)` at PI-V3D-23, and the shader record does carry
+  `cs_output_vpm_segment_size = 1` / `cs_input_vpm_segment_size = 0` per Mesa's `v3d_vs_set_prog_data`
+  fold at PI-V3D-25. So the three allocation numbers are **present and Mesa-shaped**. What has *never*
+  been done is checking them against the part: this rung reads the VPM's physical size off
+  `V3D_CTL_IDENT1` and prints all three side by side for the first time.
+- **(c) the write happens but the VPM→PTB handoff is dead.** Live. Partially instrumented this rung
+  (slots 5/6 below settle whether the PTB ever *received* anything); its decisive form — the TMU
+  landmark — is **designed but deliberately not built**, for a reason recorded in §49.25.7e.
+
+**A negative worth recording: V3D 4.2 exposes no ARM-side VPM allocation/reservation register.** The
+brief asked for "VPMBASE / QUEUE config" from the 4.2 spec. There is no such register in the 4.2 core
+map — VPM allocation for the vertex pipe is driven **entirely** by the shader record's segment-size
+fields and the CL's `VCM_CACHE_SIZE`, both of which are memory the driver writes, not registers it
+programs. The only VPM state the ARM can read is `V3D_CTL_IDENT1`'s `VPM_SIZE` field (the physical
+size), and the only VPM *behaviour* it can read is the error block. Both are used here; nothing was
+invented to fill the gap.
+
+##### 49.25.7c What was built — no leg, no kick, no shader word, no register write
+
+The boot still takes **eight** CT0 closes, runs `v3d_hfirst`'s **E → H → F → G** order, feeds CT0 a
+**BIN** list on every leg and never a render list, and returns before `probe_job`. Legs A–D take none of
+this and their register traffic is unchanged byte for byte. Two instrument-only changes:
+
+**1 — Three PCTR slots re-sourced.** Slots 0/1/2/3/7 are **unchanged**: they are the five boot 13 read
+`OUTCOME H4` off, and leg H must reproduce their **shape** here before any new slot is allowed to speak.
+Slots 4/5/6 all read zero on boot 13 and had nothing left to give — `L2T_VCD_READS` because PI-V3D-28
+already exonerated attribute fetch by direct readback, and the two VPM *stall* counters because **a
+stall counter reading zero cannot separate "the write sailed through" from "no write was ever
+presented"**, which is precisely the ambiguity §49.25.6 flagged.
+
+| slot | src | boot 13 | boot 14 | what the new one watches |
+|---|---|---|---|---|
+| 0 | 1 | `FEP_VALID_PRIMS` — read 0 | **unchanged** | continuity guard |
+| 1 | 14 | `QPU_ACTIVE_CYCLES_VERTEX_COORD_USER` — read **28** | **unchanged** | continuity guard |
+| 2 | 32 | `CYCLE_COUNT` | **unchanged** | RESERVED control (`V3D63_CTRL_SLOT`) |
+| 3 | 16 | `QPU_CYCLES_VALID_INSTR` — read **53** | **unchanged** | continuity guard |
+| **4** | 58 → **33** | `L2T_VCD_READS` — read 0 | **`QPU_CYCLES_STALLED_VERTEX_COORD_USER`** | did the coord thread **stall** while it ran? |
+| **5** | 26 → **11** | `VPM_VDW_STALL` — read 0 | **`PTB_PRIM_CLIP`** | did the PTB **clip** the primitives? |
+| **6** | 27 → **10** | `VPM_VCD_STALL` — read 0 | **`PTB_PRIM_VIEWPOINT_DISCARD`** | did the PTB **discard** them at the viewport? |
+| 7 | 35 | `PTB_PRIMS_BINNED` — read 0 | **unchanged** | continuity guard |
+
+**Slots 5 and 6 are the pair boot 13 most needed and did not have.** `PTB_PRIMS_BINNED = 0` alone cannot
+separate *"the PTB never received a primitive"* from *"the PTB received it and threw it away"* — and a
+primitive **cannot be clipped or viewport-discarded unless it arrived**. Either of them moving therefore
+proves the VPM delivery reaches the PTB, which **kills `OUTCOME H4`** and moves the wall into the
+clipper/viewport room PI-V3D-17 opened. Slot 4 splits the other direction: against boot 13's `ACTIVE=28`,
+a stall delta near zero says the thread ran clean and its stores were *accepted and discarded*, while a
+large one says it spent its life blocked and `INT_STS` bit16's "program end" needs re-reading as a thread
+*released* rather than one *finished*.
+
+Every id is transcribed from `include/uapi/drm/v3d_drm.h` on the build host under §38's `index == line −
+623` rule, re-verified this arc against the 7.1.8 copy; every id the file already carried re-lands on its
+own name in the same pass, so §38's cross-check is re-run and still clean. §38's standing caveat rides
+unchanged: **`id↔mux` validity is partial and per id, so a nonzero slot is strong and a zero slot is
+weak** — which is exactly why the three new slots are read against leg E on the same bank, and why every
+row below that turns on a *zero* is written as the weakest form of its claim.
+
+**2 — Four read-only registers join the readback set.** `V3D_ERR_STAT` (`0x0f20`), `V3D_ERR_FDBGO`
+(`0x0f04`), `V3D_ERR_FDBGB` (`0x0f08`), `V3D_ERR_FDBGS` (`0x0f10`).
+
+*Sourcing, against this arc's "a new register only if the 4.2 spec names it" constraint.* All four are
+transcribed verbatim from `drivers/gpu/drm/v3d/v3d_regs.h`, and their applicability to **this** silicon
+is not inferred — mainline states it. `v3d_debugfs.c`'s `v3d_core_reg_defs[]` lists all four as
+`REGDEF(V3D_GEN_33, V3D_GEN_71, …)`: valid from V3D 3.3 through 7.1 inclusive, a range that brackets the
+bcm2711's **V3D 4.2**. They are **read-only status registers** whose only use in mainline is a debugfs
+dump, they sit inside the core window this file already maps, and **this file never writes them.** That
+is the whole safety argument. `V3D_CTL_IDENT1` is decoded too, and is not a new read at all — the file
+already reads it for the revision gate.
+
+*Why this block.* §49.25.6 left the wall at "the VPM write path itself — the write-back stage, or the
+coord thread's **access** to it". **Twelve of `V3D_ERR_STAT`'s sixteen named bits are that sentence's
+vocabulary:**
+
+| bits | class | members |
+|---|---|---|
+| 9..4 | **VPM** | `VPMEAS` (allocated-size), `VPMEFNA` (free non-allocated), **`VPMEWNA` (write non-allocated)**, `VPMERNA` (read non-allocated), `VPMERR` (read range), **`VPMEWR` (write range)** |
+| 3..0 | **VPA** | `VPAERRGL`, `VPAEBRGL`, `VPAERGS`, `VPAEABB` — vertex-pipe assembly, *upstream* of the VPM |
+| 15..10 | **PIPE** | `L2CARE`, `VCMBE`, `VCMRE`, `VCDI`, `VCDE`, `VDWE` — the stations either side of the VPM |
+
+`VPMEWNA` or `VPMEWR` latching would convict the **access** half of §49.25.6's sentence *by name*.
+
+The block is read **pristine once before leg E's kick** and once per armed leg. `V3D_ERR_STAT` **latches**
+and this file never clears it, so a bit set at the arm was set by something earlier in the boot and is not
+this ladder's finding — **every row splits on newly-latched bits (`leg & ¬pre-arm`)**, not on cumulative
+ones. The three `FDBG` words are printed **raw with no decode claimed**: they are there so a nonzero one
+can be chased, not read. Sampling sits in the same window as `[v3d101]`'s: strictly **after** the
+§49.20.2 V2a violation pair, strictly **before** the leg's L2T flush.
+
+**Leg E is the control for the ERR block too, and that is new.** A bit that latches on leg E — a leg that
+*closes* — is not this campaign's wall and must be subtracted by hand before any V row is believed.
+
+##### 49.25.7d The outcomes, pre-written on leg H's own `[v3d103] VPMPROBE VERDICT` line
+
+This rung **does not replace `OUTCOME H4` — it splits it.** H4 said *the VPM write path is the wall*;
+these rows say *which way*. **Three guards are taken first, and none yields a V row:**
+
+- the bank lost its enable mask, or slot 2's `src32 CYCLE_COUNT` never moved ⇒ INCONCLUSIVE;
+- **the continuity slots did not reproduce boot 13** (FEP flat, QPU moved, `PTB_PRIMS_BINNED` flat)
+  ⇒ INCONCLUSIVE, and it **outranks every V row**: the new slots would be measuring a leg that is not
+  the leg §49.25.6 folded, and the boot decides nothing until that is explained;
+- the frame **closed**, or the QPU slots are **flat** ⇒ no V row fits (the first is a bigger finding
+  than this rung was built for; the second is `D1`'s shape and indicts the shader record at
+  `OFF_SHADREC`).
+
+| leg H reads | verdict | what it means for the campaign |
+|---|---|---|
+| a **VPM WRITE** bit newly latched (`VPMEWNA` or `VPMEWR`) | **`OUTCOME V1`** | **the VPM write is REFUSED, and the silicon says so.** §49.25.6's "or the coord thread's **access** to it" half, convicted by name: the `STVPMV` stores land outside any VPM region the thread is entitled to write. **The wall is ALLOCATION**, and the three numbers that allocate are `cs_output_vpm_segment_size` (=1), `cs_input_vpm_segment_size` (=0) and `VCM_CACHE_SIZE` (=4/4) — read them against the `VPMSIZE` line's physical KB. Strongest row in the rung; it ends the guessing |
+| a **non-write VPM** bit newly latched (`VPMEAS`/`VPMEFNA`/`VPMERNA`/`VPMERR`), both write bits clear | **`OUTCOME V2`** | **the VPM is reached and unhappy, but not about our stores.** The fault is in how the block is *sized* or *reclaimed* around the thread, not in the thread's own access. The four bits mean four different things — name the exact one off the decode before reasoning further |
+| a **VPA** or **PIPE** bit newly latched, **no** VPM bit | **`OUTCOME V3`** | **the error is BESIDE the VPM, not in it**, and §49.25.6's wall statement is *misnamed*. `VDWE` moves it to the VPM DMA writer; `VCMBE` to the binner's vertex-cache manager; a VPA bit puts it in primitive assembly **upstream** of the VPM — in front of the write rather than behind it |
+| `PTB_PRIM_CLIP` and/or `PTB_PRIM_VIEWPOINT_DISCARD` **moved**, no error bit | **`OUTCOME V4`** | **the PTB received the primitives and threw them away — and `OUTCOME H4` IS DEAD.** A primitive cannot be clipped or viewport-discarded unless it *arrived*, so the VPM delivery **happens**. §49.25.6 must be re-folded: the wall is **clipper/viewport state**, PI-V3D-17's room, where POR zeros collapse every primitive to a point. The row that most changes the campaign, and the reason these two slots were worth boot 13's stall counters |
+| `QPU_CYCLES_STALLED_VERTEX_COORD_USER` **moved**, no error bit, no PTB slot | **`OUTCOME V5`** | **the coord thread spent its life stalled.** It ran, but it was *waiting*, and nothing downstream ever took what it offered — the write path is not refusing loudly, it is not draining at all. Cross-read the stall delta against slot 1's ACTIVE delta: stall ≳ active means mostly blocked, and `INT_STS` bit16 then reads as a thread **released**, not one **finished** |
+| frame open, thread ran, **did not stall**, **no** error bit, **no** PTB slot moved | **`OUTCOME V6`** | **the write is swallowed in silence.** Every instrument this campaign owns reports nothing on a leg that provably executed six `STVPMV` stores and a `VPMWT`. Not a refusal and not a stall: a path that **accepts and discards**, or one the stores were **never presented to**. Those two are no longer separable by any counter or status bit in the core block — the next rung must make the thread's stores **visible outside the VPM**, which is §49.25.7e |
+
+##### 49.25.7e Sub-hypothesis (c): the TMU landmark, designed and deliberately NOT built
+
+(c)'s decisive form is the brief's own: a coord-shader variant that does a **TMU write to a DRAM
+landmark alongside its VPM writes** — TMU-lands + VPM-flat convicts the VPM port specifically, TMU-also-
+flat moves the wall to the thread's store path generally. It is **designed here and not built**, and the
+reason is a confound, not effort:
+
+- The only **Mesa-compiled** TMU-storing coord program in the tree is `PROBE_WORDS` (PI-V3D-26's "PROBE
+  VS"), and it carries **its own unresolved dispatch history**: it is a `threads=2`, multi-segment
+  program with a **mid-shader `thrsw`**, and PI-V3D-36 read it at `valid_instr = 0` — *never dispatched*
+  — on the same boot the M4 coord shader read 55. PI-V3D-39 ultimately repointed the probe record's CS
+  slot away from it, at `CS_VS_WORDS`. A leg built on `PROBE_WORDS` would confound **"the store path is
+  dead"** with **"`PROBE_WORDS` never dispatched again"**, which is exactly the ambiguity this rung
+  exists to remove.
+- Building the TMU landmark into `CS_VS_WORDS` instead — the known-dispatching program — would require
+  **hand-authoring QPU words**, which §5's fabricated-constant law forbids without a Mesa-packed
+  artifact. **The V3D-26 harness checkout is deleted**, so it cannot be re-run in place.
+- There is also a ladder-order problem worth recording now: a leg T placed *behind* leg H can never run,
+  because H hangs and the CT0-hygiene gate stands the rest down — the same trap §49.25.5 had to invert
+  the ladder to escape. A leg T must run **directly after leg E**, in front of H.
+
+**The blocking artifact, named so the next arc does not rediscover it:** a **Mesa-compiled, bin-mode
+(`threads=4`, single-segment, no mid-shader `thrsw`) coordinate shader that stores to an SSBO **and**
+writes the six-component VPM output**. Regenerating it — a fresh `v3d_compile()` harness at ver 4.2, as
+`scripts/pi-v3d26-mesa-compile.c` did — is the **first** task of the rung after this one, and it is
+gated on boot 14 returning `OUTCOME V6`. If boot 14 returns V1, V2, V3 or V4, the TMU landmark is **not
+needed at all** and that work is saved.
+
+##### 49.25.7f Scope and family law
+
+No register **write**, no mailbox tag and no page-table edit is added over `UNAOS_V3D_HFIRST`. The
+reply-less mailbox tag hazard is untouched. The arena geometry is unchanged. **CT0 is fed a BIN list on
+every leg, never a render list** (driver law — RCLs run on CT1). The boot returns before `probe_job`, so
+the knob can never sit beside `[v3d75]`'s `ENABLE_QPU` or `[v3d80]`/`[v3d81d]`'s `DISPLAY_DONE` sends.
+§49.20.2's V2a law rides unchanged: every new read on every leg happens strictly *after* that leg's
+read-once violation pair and before its L2T flush. The only register traffic this arc adds is **four
+read-only loads per armed leg plus one pristine set**, and the three changed `SRC` fields inside the
+counter-file arming `[v3d101]` already performs.
+
+##### 49.25.7g Measured, this arc
+
+Worktree `unaos-wt-exec-v3dvpm`, baseline `b0bb563c`.
+
+| gate | result |
+|---|---|
+| `./arroyo check` | **green, both arches**; `arm-pi` green with `v3d_vpmprobe` appended to its feature list; `kernel cfg coverage OK (12 legs)` |
+| `UNAOS_WC=1 ./arroyo check` | **green, both arches**; `kernel cfg coverage OK (12 legs)` |
+| armed build, `UNAOS_V3D_VPMPROBE=1 UNAOS_PI=1 ./arroyo kernel8` | **green** — image `7cb050201f77cdf1…` |
+| armed build banner | `⚡ kernel features: baremetal,skip_xhci,`**`v3d_vpmprobe`**`,v3d_hfirst,v3d_dispatchdisc,v3d_bincontent,v3d_armedclose,v3d_tsaim,v3d_basedaim,v3d_unarmclose,v3d` |
+| implication proved by image | `UNAOS_V3D_VPMPROBE=1` **alone** builds `7cb050201f77cdf1…` — the **same** digest as the full nine-knob line, so the chain is armed by the feature and not by the operator |
+| knob-off byte-identity | arc `e52b17e7a48ab0b3…` **==** baseline `e52b17e7a48ab0b3…` |
+| knob-off `./arroyo kernel8-test 210` | **MBENCH PASS — 117/117 required witnesses, 0 forbidden hit(s), 13726 lines scanned** (a property of an image byte-identical to the baseline's, per the row above) |
+| **`dispatchdisc`-armed** byte-identity | arc `06b2c1e9ce75fd9f…` **==** baseline `06b2c1e9ce75fd9f…` |
+| **`hfirst`-armed** byte-identity | arc `d86b8bd760d2aa4a…` **==** baseline `d86b8bd760d2aa4a…` — the strongest of the three, and the one that cost this arc a code move (below) |
+| strings-proof, armed image `7cb050201f77cdf1…` | `v3d103] CORRECTION TO ALL SEVEN` 1 · `v3d103] VPMSTATIC` 2 · `v3d103] VPMSIZE` 3 · `v3d103] ERRSTAT` 5 · `v3d103] VPMPROBE VERDICT` 3 · `v3d103] VPMPROBE COMPLETE` 1 · `OUTCOME V1` 1 · `OUTCOME V2` 1 · `OUTCOME V3` 1 · `OUTCOME V4` 1 · `OUTCOME V5` 1 · `OUTCOME V6` 1 · `THE VPM WRITE IS REFUSED` 1 · `A VPM ERROR LATCHED, BUT NOT A WRITE ONE` 1 · `THE ERROR IS BESIDE THE VPM, NOT IN IT` 1 · `THE PTB RECEIVED THE PRIMITIVES AND THREW THEM AWAY` 1 · `THE COORD THREAD SPENT ITS LIFE STALLED` 1 · `THE WRITE IS SWALLOWED IN SILENCE` 1 · `THE CONTINUITY SLOTS DID NOT REPRODUCE BOOT 13` 1 · `SUB-HYPOTHESIS (a) IS ALREADY DEAD` 1 · `QPU_CYCLES_STALLED_VERTEX_COORD_USER` 3 · `PTB_PRIM_VIEWPOINT_DISCARD` 3 · `PTB_PRIM_CLIP` 3 · `VPMEWNA` 3 · `VPMEWR` 3 · `VPMEAS` 2 · `VDWE` 2 · `VCMBE` 2 · `VPAEABB` 1 · `VPM_SIZE(bits31:28)` 1 |
+
+*Note on the strings-proof method*, inherited from §49.25.5: the wire strings contain em-dashes (UTF-8
+multibyte), which `strings` splits on, so each row was probed on an ASCII-only fragment. Counts above 1
+are the same fragment appearing in more than one format string, not duplicates.
+
+*A byte-identity finding worth keeping.* The `hfirst`-armed identity **failed on first measurement** —
+ten bytes, same image size, zero string differences. They decoded as **four `core::panic::Location`
+structs**: `{ file: &str(ptr,len), line: u32, col: u32 }`, with the file pointer and length identical
+(`0x25` = 37 = `crates/kernel/src/arch/aarch64/v3d.rs`) and only the **line numbers** shifted, by exactly
+the 82 lines this arc had inserted above them. Panic-location line numbers are the mechanism by which an
+"instrument-only, fully cfg-gated" arc can still move a binary it never intended to touch. The fix was to
+**move the whole `[v3d103]` register-constant block from line ~660 down beside the `[v3d103]` code**, so
+no insertion sits above a surviving `Location` — which restored all three identities exactly and is
+better cohesion besides. **Any future arc claiming byte-identity should diff with `cmp -l`, not just
+compare digests: a digest mismatch of this kind is metadata, and chasing it to zero is cheap.**
+
+No QEMU battery is claimed as a verdict: **raspi4b models no V3D at all**, so `[v3d95]` prints its
+hub-absent SKIPPED line and returns before any leg is reached. Metal is the verdict; the gate here is
+checks plus armed build plus strings-proof plus byte-identity.
+
+##### 49.25.7h What the sitting needs
+
+One image, image name **PA51**:
+
+```
+UNAOS_V3D_VPMPROBE=1 UNAOS_PI=1 ./arroyo kernel8
+```
+
+`UNAOS_V3D_VPMPROBE=1` **alone** is sufficient — the feature chain arms `v3d_hfirst`,
+`v3d_dispatchdisc`, `v3d_bincontent`, `v3d_armedclose`, `v3d_tsaim`, `v3d_basedaim`, `v3d_unarmclose`
+and `v3d` itself, and the image digest proves it.
+
+A **cold** power-cycle, as boots 4/7/8/9/11/12/13 were. One short capture, labelled, **never** diffed
+line-for-line against a deep boot.
+
+**Read in this order:**
+
+1. `[v3d103] VPMSTATIC` — **first of all.** It reports desk work, not a measurement, and it says why no
+   slot on this boot is spent on the shader's VPM write setup.
+2. `[v3d103] VPMSIZE` — the VPM's physical KB off `IDENT1`, against the record's segment sizes and the
+   CL's `VCM_CACHE_SIZE`.
+3. `[v3d103] ERRSTAT (PRE-ARM)` — the pristine reference every leg's newly-latched bits are computed
+   against.
+4. `[v3d103] CORRECTION TO ALL SEVEN LINES ABOVE` and `[v3d101] PCTRARM` — which slot carries which
+   source on **this** boot.
+5. **Leg E** — its `[v3d101] INT_STS DECODE`, its `[v3d101] DISPATCHDISC` delta line, and its
+   `[v3d103] ERRSTAT (E)`. A leg E that did not return `OUTCOME E1` leaves leg H with no baseline; a
+   leg E that **latches an ERR bit** poisons leg H's newly-latched set and must be subtracted by hand.
+6. **Leg H** — its `[v3d101] INT_STS DECODE`, its `[v3d101] DISPATCHDISC` delta line, its
+   `[v3d102] HFIRST VERDICT` (which should **re-take `OUTCOME H4`** on the four continuity slots), its
+   `[v3d103] ERRSTAT (H)`, and finally its **`[v3d103] VPMPROBE VERDICT`**.
+
+**The admissibility guard outranks every V row.** If leg H's continuity slots do not reproduce boot 13's
+shape, the three re-sourced slots are measuring a leg that is not the leg §49.25.6 folded, the line says
+INCONCLUSIVE, and the boot decides nothing until that is explained. Legs F and G run only if H closed,
+which boot 13 says it will not.
+
+**Every one of the six outcomes is progress.** `V1` names the wall ALLOCATION and hands the next arc
+three specific numbers to fix. `V2` and `V3` move it to a named neighbouring station. `V4` **kills H4**
+and reopens the clipper. `V5` converts a silent wall into a measurable stall. `V6` is the only row that
+buys no new station — and even it is decisive, because it retires every instrument in the core block at
+once and makes §49.25.7e's TMU landmark the campaign's unambiguous next build.

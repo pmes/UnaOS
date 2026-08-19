@@ -1281,6 +1281,42 @@ v3d_dispatchdisc = ["v3d_bincontent"]
 #   See docs/dev/OS/08_VIDEO/v3d.md §49.25.5.
 v3d_hfirst = ["v3d_dispatchdisc"]
 
+# PI-V3D-103: the VPMPROBE discriminator rung — v3d.md §49.25.7, the successor to boot 13's `OUTCOME H4`.
+# IMPLIES `v3d_hfirst` (and through it the whole chain down to `v3d`), because its rows are stated on
+# LEG H and leg H only runs at all under the hfirst order. IT ADDS NO LEG, NO KICK, NO SHADER WORD, NO
+# REGISTER WRITE and NO PAGE-TABLE EDIT — the boot still takes EIGHT closes, CT0 is fed a BIN list on
+# every leg and never a render list, and the boot still returns before `probe_job`.
+#   WHY: §49.25.6 folded boot 13 as `OUTCOME H4` in its STRONG form — the real 27-word coord shader ran
+#   to a program-end interrupt (`QPU_CYCLES_VALID_INSTR` 53 against the null shader's 5) and NOTHING on
+#   the VPM side moved. The wall's name is now "the VPM write path itself — the write-back stage, or the
+#   coord thread's ACCESS to it", and this rung SPLITS that sentence. Sub-hypothesis (a), "our VPM
+#   write-SETUP word is VC4-shaped on a 4.2 VPM", was resolved STATICALLY and is DEAD: there is no setup
+#   word at all. PI-V3D-20 removed `vpmsetup`/`mov vpm` outright, PI-V3D-26 cross-checked the STVPMV
+#   body against a real ver-4.2 `v3d_compile()` run, and this arc re-decoded all six STVPMV words bit by
+#   bit (OP_ADD=248, mux selects, operand order and register numbers all correct). No slot is spent on it.
+#   TWO CHANGES, BOTH INSTRUMENT-ONLY. (1) THREE PCTR SLOTS ARE RE-SOURCED. Slots 0/1/2/3/7 are
+#   UNCHANGED — the five boot 13 read H4 off, and leg H must reproduce their shape before any new slot
+#   speaks (an ADMISSIBILITY guard, not a result). Slots 4/5/6 were `L2T_VCD_READS` and the two VPM
+#   STALL counters; all three read zero on boot 13, VCD fetch was exonerated at PI-V3D-28, and a stall
+#   counter reading zero cannot tell "the write sailed through" from "no write was ever presented". They
+#   become src33 `QPU_CYCLES_STALLED_VERTEX_COORD_USER`, src11 `PTB_PRIM_CLIP` and src10
+#   `PTB_PRIM_VIEWPOINT_DISCARD` — the last two being the pair that splits "the PTB never RECEIVED" from
+#   "the PTB received and DISCARDED", which `PTB_PRIMS_BINNED=0` alone cannot do.
+#   (2) FOUR READ-ONLY REGISTERS join the readback set: `V3D_ERR_STAT`, `V3D_ERR_FDBGO`, `V3D_ERR_FDBGB`
+#   and `V3D_ERR_FDBGS`, from `v3d_regs.h` and scoped to this silicon by mainline's own
+#   `v3d_debugfs.c::v3d_core_reg_defs`, which lists all four as `REGDEF(V3D_GEN_33, V3D_GEN_71, ...)` —
+#   a range that brackets the bcm2711's V3D 4.2. Mainline reads them in a debugfs dump; this file NEVER
+#   writes them. Twelve of `ERR_STAT`'s sixteen named bits are VPM/VPA/VDW/VCD/VCM errors.
+#   Leg H gains a `[v3d103] VPMPROBE VERDICT` line carrying §49.25.7's six pre-written outcomes
+#   (V1 the VPM write is REFUSED and the silicon says so · V2 a non-write VPM error · V3 the error is
+#   beside the VPM · V4 the PTB received and discarded, H4 dead · V5 the coord thread stalled ·
+#   V6 the write is swallowed in silence), behind three guards. `[v3d101]`/`[v3d102]`'s emitters are NOT
+#   touched. Default OFF and fully uncompiled when off. Enable via
+#   `UNAOS_V3D_VPMPROBE=1 UNAOS_PI=1 ./arroyo kernel8`. ⚠ an armed boot deliberately produces a SHORT
+#   capture; never diff it line-for-line against a full deep boot. QEMU raspi4b models no V3D at all, so
+#   this never runs there. See docs/dev/OS/08_VIDEO/v3d.md §49.25.7.
+v3d_vpmprobe = ["v3d_hfirst"]
+
 # PI-USB-1: the BCM2711 PCIe root complex + VL805 xHCI attach (arch/aarch64/piusb.rs) — brcmstb RC
 # bridge reset / link-up / MEM-window + inbound-BAR config, VL805 (1106:3483) enumeration + BAR sizing,
 # the NOTIFY_XHCI_RESET mailbox, and the polled shared-xHCI attach to the "controller halted-but-decoding

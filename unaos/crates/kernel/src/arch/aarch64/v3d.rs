@@ -15461,6 +15461,12 @@ fn v3d95_unarmed_close_rung() {
     serial_println!(
         ":: V3D: [v3d102] CORRECTION TO ALL SIX LINES ABOVE — UNAOS_V3D_HFIRST=1 is armed on top of them, and it REORDERS THE CONTENT LADDER. It adds NO leg, NO kick and NO instrument: this boot still takes EIGHT CT0 kicks, every leg's list, prologue, referenced regions, digests and collars are byte-identical to what the lines above describe, and the [v3d101] bank is still armed ONCE before leg E and read across all four production legs (v3d_hfirst IMPLIES v3d_dispatchdisc, so the PCTR bank and the INT_STS decode read leg H too). THE ONE CHANGE: the content order is E -> H -> F -> G, not E -> F -> G -> H. WHY, verbatim from boot 12's [v3d101] LEG G verdict: 'OUTCOME D2 — THE THREAD RUNS AND DELIVERS NOTHING. QPU cycles moved, so a coord thread launched and executed; no VPM-side event and no binned primitive followed it.' Boot 12 measured QPU=5 cycles and INT_STS bit16 (QPU program-end) on leg G with FEP=0, VCD=0, VPM=0, PTB=0 and FLDONE=0, while legs E and F — which feed NO primitives — both close with FLDONE=1. Leg G's coord shader is the NULL shader BY DESIGN, so D2 there is CORRECT thread behaviour and NOT a wall verdict: THE BINNER'S FLUSH IS WAITING FOREVER ON A VPM DELIVERY THE NULL SHADER NEVER MAKES. The decisive experiment is therefore LEG H, the m4-class minimum over the REAL coordinate shader that DOES write VPM — and leg H has NEVER RUN, because leg G leaves the frame open every time and the CT0-hygiene gate stands H down behind it. This knob puts H where the hygiene gate can still admit it: directly after leg E's clean close. THE GATE IS NOT WEAKENED, IT IS MIRRORED — if leg H leaves the frame open, F and G stand down by exactly the rule that stood H down before. Leg H keeps its [v3d101] delta line and its [v3d101] BASELINE line UNCHANGED and carries its own four pre-written outcomes (H1..H4, v3d.md §49.25.5) on a SEPARATE [v3d102] HFIRST VERDICT line printed after them, which prints its QPU cycle delta against boot 12's leg G measurement of 5. Read that [v3d101] BASELINE line on leg H with its own sentence inverted: it was written for a boot where H ran BEHIND G, and on this boot H runs in FRONT of it. Everything else all six headers say still holds, including the boot RETURNING before probe_job ::"
     );
+    // PI-V3D-103 — `vpmprobe` rides on top of ALL SEVEN lines above, and it owes exactly one correction:
+    // it changes THREE PCTR SOURCES and adds FOUR READ-ONLY REGISTERS. Nothing about the ladder moves.
+    #[cfg(feature = "v3d_vpmprobe")]
+    serial_println!(
+        ":: V3D: [v3d103] CORRECTION TO ALL SEVEN LINES ABOVE — UNAOS_V3D_VPMPROBE=1 is armed on top of them (it IMPLIES v3d_hfirst, so the E -> H -> F -> G order the [v3d102] lines describe is the order this boot takes). IT ADDS NO LEG, NO KICK, NO SHADER WORD, NO REGISTER WRITE and NO PAGE-TABLE EDIT: this boot still takes EIGHT CT0 kicks, every leg's list, prologue, eleven referenced regions, digests and poison collars are byte-identical to what the lines above describe, CT0 is fed a BIN list on every leg and never a render list, and the boot still returns before probe_job. TWO CHANGES, BOTH INSTRUMENT-ONLY. (1) THE BANK IS RE-SOURCED IN THREE SLOTS. Slots 0/1/2/3/7 are UNCHANGED — they are the five boot 13 read OUTCOME H4 off, and leg H must REPRODUCE their shape here before any new slot is allowed to speak. Slots 4/5/6 were src58 L2T_VCD_READS, src26 VPM_VDW_STALL and src27 VPM_VCD_STALL; all three read ZERO on boot 13, VCD attribute fetch was already exonerated at PI-V3D-28, and a STALL counter reading zero cannot tell 'the write sailed through' from 'no write was ever presented'. They are now src33 QPU_CYCLES_STALLED_VERTEX_COORD_USER, src11 PTB_PRIM_CLIP and src10 PTB_PRIM_VIEWPOINT_DISCARD. THE PAIR TO WATCH IS 5 AND 6: boot 13's PTB_PRIMS_BINNED=0 cannot separate 'the PTB never RECEIVED a primitive' from 'the PTB received it and threw it away', and a primitive cannot be clipped or viewport-discarded unless it ARRIVED — so either of them moving KILLS OUTCOME H4 and moves the wall into the clipper/viewport room. (2) FOUR READ-ONLY REGISTERS JOIN THE READBACK SET: V3D_ERR_STAT, V3D_ERR_FDBGO, V3D_ERR_FDBGB and V3D_ERR_FDBGS, transcribed from v3d_regs.h and scoped to THIS silicon by mainline itself — v3d_debugfs.c's v3d_core_reg_defs lists all four as REGDEF(V3D_GEN_33, V3D_GEN_71, ...), which brackets the bcm2711's V3D 4.2. Mainline's only use of them is a debugfs dump; this file NEVER writes them. Twelve of ERR_STAT's sixteen named bits are VPM/VPA/VDW/VCD/VCM errors, which is precisely the vocabulary §49.25.6's wall statement needs. They are read PRISTINE once before leg E's kick and once per armed leg, and every row splits on NEWLY-LATCHED bits (leg AND NOT pre-arm) because ERR_STAT LATCHES and this file never clears it. Leg H carries §49.25.7's V1..V6 on its own [v3d103] VPMPROBE VERDICT line, printed AFTER the [v3d102] HFIRST VERDICT it cites — this rung does not replace OUTCOME H4, IT SPLITS IT ::"
+    );
     match probe_hub_ident0() {
         V3dPresence::Up(_) => {}
         V3dPresence::Down => {
@@ -16347,12 +16353,23 @@ const PCTR_SRC_PTB_PRIMS_BINNED: u32 = 35; // v3d_drm.h:658 V3D_PERFCNT_PTB_PRIM
 #[cfg(feature = "v3d_dispatchdisc")]
 const PCTR_SRC_L2T_VCD_READS: u32 = 58; // v3d_drm.h:681 V3D_PERFCNT_L2T_VCD_READS
 
+// PI-V3D-103 — the three sources that REPLACE slots 4/5/6 when `v3d_vpmprobe` is armed. Same header,
+// same `index == line-623` rule, re-verified against the build host's copy this arc
+// (/usr/src/kernels/7.1.8-200.fc44.x86_64/include/uapi/drm/v3d_drm.h); every id this file already
+// carried re-lands on its own name in the same pass, so §38's cross-check is re-run and still clean.
+#[cfg(feature = "v3d_vpmprobe")]
+const PCTR_SRC_PTB_PRIM_VIEWPOINT_DISCARD: u32 = 10; // v3d_drm.h:633 V3D_PERFCNT_PTB_PRIM_VIEWPOINT_DISCARD
+#[cfg(feature = "v3d_vpmprobe")]
+const PCTR_SRC_PTB_PRIM_CLIP: u32 = 11; // v3d_drm.h:634 V3D_PERFCNT_PTB_PRIM_CLIP
+#[cfg(feature = "v3d_vpmprobe")]
+const PCTR_SRC_QPU_CYCLES_STALLED_VERTEX_COORD_USER: u32 = 33; // v3d_drm.h:656 V3D_PERFCNT_QPU_CYCLES_STALLED_VERTEX_COORD_USER
+
 /// PI-V3D-101 — the eight-slot bank, in `SRC_0_3`/`SRC_4_7` field order. Slot 2 is `src32 CYCLE_COUNT`
 /// and it may not be anything else: `V3D63_CTRL_SLOT` is file law (`wait_fldone` samples PCTR counter 2
 /// on every bin wait and `emit_v3d55_clock_liveness` prints a hard clock verdict off it), and it is
 /// also this bank's own control — if slot 2 reads flat the bank never counted and every other slot is
 /// INCONCLUSIVE rather than clean.
-#[cfg(feature = "v3d_dispatchdisc")]
+#[cfg(all(feature = "v3d_dispatchdisc", not(feature = "v3d_vpmprobe")))]
 const V3D101_SRC: [u32; 8] = [
     PCTR_SRC_FEP_VALID_PRIMS,                     // 0 — FEP valid primitives (front-end intake)
     PCTR_SRC_QPU_ACTIVE_CYCLES_VERTEX_COORD_USER, // 1 — coord/vertex USER-shader cycles
@@ -16363,7 +16380,7 @@ const V3D101_SRC: [u32; 8] = [
     PCTR_SRC_VPM_VCD_STALL,                       // 6 — VPM VCD-side stall
     PCTR_SRC_PTB_PRIMS_BINNED,                    // 7 — PTB intake: primitives binned
 ];
-#[cfg(feature = "v3d_dispatchdisc")]
+#[cfg(all(feature = "v3d_dispatchdisc", not(feature = "v3d_vpmprobe")))]
 const V3D101_SRC_NAME: [&str; 8] = [
     "FEP_VALID_PRIMS",
     "QPU_ACTIVE_CYCLES_VERTEX_COORD_USER",
@@ -16374,6 +16391,68 @@ const V3D101_SRC_NAME: [&str; 8] = [
     "VPM_VCD_STALL",
     "PTB_PRIMS_BINNED",
 ];
+
+// PI-V3D-103 — THE RE-SOURCED BANK (v3d.md §49.25.7). Slots 0/1/2/3/7 are UNCHANGED, deliberately:
+// they are the five boot 13 read its OUTCOME H4 off (FEP=0, QPU_ACTIVE=28, control moving,
+// VALID_INSTR=53, PTB_PRIMS_BINNED=0), and boot 14's leg H must REPRODUCE those five before any new
+// slot is allowed to say anything. That reproduction is an admissibility guard, not a result.
+//
+// Slots 4/5/6 are re-sourced because boot 13 spent all three and got nothing back:
+//   4 was `L2T_VCD_READS` — read 0, and attribute fetch was already EXONERATED at PI-V3D-28 by a direct
+//     readback of what the VCD delivered, so this slot has no question left to answer;
+//   5 and 6 were `VPM_VDW_STALL` / `VPM_VCD_STALL` — both read 0, and a STALL counter reading zero is
+//     the least informative reading in the file: it cannot distinguish "not stalled because the write
+//     sailed through" from "not stalled because no write was ever presented". §49.25.6 flagged exactly
+//     this. Two stall counters is a wasted quarter of the bank on a wall that does not stall.
+// Their replacements each answer a question §49.25.6 left open, and each is STRONG when nonzero:
+//   4 → 33 QPU_CYCLES_STALLED_VERTEX_COORD_USER — did the coord thread STALL while it ran? Against
+//     boot 13's ACTIVE=28: stalled≈0 says the thread ran clean to its program-end and its VPM writes
+//     were ACCEPTED-AND-DISCARDED; stalled≫0 says it spent its life waiting on a port that never took
+//     them, and re-opens what INT_STS bit16's "program end" actually meant.
+//   5 → 11 PTB_PRIM_CLIP — did the PTB CLIP the primitives?
+//   6 → 10 PTB_PRIM_VIEWPOINT_DISCARD — did the PTB DISCARD them at the viewport test?
+//     Slots 5/6 together are the single most valuable pair boot 13 did not have. `PTB_PRIMS_BINNED=0`
+//     alone cannot separate "the PTB never RECEIVED a primitive" from "the PTB received it and threw it
+//     away". If either moves, the VPM delivery REACHED the PTB — which kills OUTCOME H4 outright and
+//     moves the wall into the clipper/viewport room PI-V3D-17 opened.
+#[cfg(feature = "v3d_vpmprobe")]
+const V3D101_SRC: [u32; 8] = [
+    PCTR_SRC_FEP_VALID_PRIMS,                     // 0 — UNCHANGED (boot 13 continuity)
+    PCTR_SRC_QPU_ACTIVE_CYCLES_VERTEX_COORD_USER, // 1 — UNCHANGED (boot 13 read 28)
+    PCTR_SRC_CYCLE_COUNT,                         // 2 — RESERVED control (V3D63_CTRL_SLOT)
+    PCTR_SRC_QPU_CYCLES_VALID_INSTR,              // 3 — UNCHANGED (boot 13 read 53)
+    PCTR_SRC_QPU_CYCLES_STALLED_VERTEX_COORD_USER, // 4 — NEW: did the coord thread stall?
+    PCTR_SRC_PTB_PRIM_CLIP,                       // 5 — NEW: did the PTB clip the prims?
+    PCTR_SRC_PTB_PRIM_VIEWPOINT_DISCARD,          // 6 — NEW: did the PTB discard them at the viewport?
+    PCTR_SRC_PTB_PRIMS_BINNED,                    // 7 — UNCHANGED (boot 13 read 0)
+];
+#[cfg(feature = "v3d_vpmprobe")]
+const V3D101_SRC_NAME: [&str; 8] = [
+    "FEP_VALID_PRIMS",
+    "QPU_ACTIVE_CYCLES_VERTEX_COORD_USER",
+    "CYCLE_COUNT (control)",
+    "QPU_CYCLES_VALID_INSTR",
+    "QPU_CYCLES_STALLED_VERTEX_COORD_USER",
+    "PTB_PRIM_CLIP",
+    "PTB_PRIM_VIEWPOINT_DISCARD",
+    "PTB_PRIMS_BINNED",
+];
+/// PI-V3D-103 — the slots boot 13 measured and boot 14 must REPRODUCE before any new slot is read.
+#[cfg(feature = "v3d_vpmprobe")]
+const V3D103_CONTINUITY_SLOTS: [usize; 4] = [0, 1, 3, 7];
+/// PI-V3D-103 — the three re-sourced slots, in bank order.
+#[cfg(feature = "v3d_vpmprobe")]
+const V3D103_STALL_SLOT: usize = 4;
+#[cfg(feature = "v3d_vpmprobe")]
+const V3D103_CLIP_SLOT: usize = 5;
+#[cfg(feature = "v3d_vpmprobe")]
+const V3D103_DISCARD_SLOT: usize = 6;
+#[cfg(feature = "v3d_vpmprobe")]
+const _: () = assert!(
+    V3D101_SRC[V3D103_STALL_SLOT] == PCTR_SRC_QPU_CYCLES_STALLED_VERTEX_COORD_USER
+        && V3D101_SRC[V3D103_CLIP_SLOT] == PCTR_SRC_PTB_PRIM_CLIP
+        && V3D101_SRC[V3D103_DISCARD_SLOT] == PCTR_SRC_PTB_PRIM_VIEWPOINT_DISCARD
+);
 #[cfg(feature = "v3d_dispatchdisc")]
 const V3D101_PCTR_MASK: u32 = 0xFF; // all eight counters
 #[cfg(feature = "v3d_dispatchdisc")]
@@ -16670,6 +16749,263 @@ fn v3d102_emit_h_verdict(
     );
 }
 
+// ── PI-V3D-103 — the per-core ERROR/DEBUG block (v3d.md §49.25.7). ──────────────────────────────
+//
+// SOURCING, under §38's rail and this arc's "a new register only if the 4.2 spec names it" constraint.
+// These four registers are transcribed VERBATIM from Linux `drivers/gpu/drm/v3d/v3d_regs.h`, and their
+// applicability to THIS silicon is not inferred — mainline states it: `v3d_debugfs.c`'s
+// `v3d_core_reg_defs[]` carries V3D_ERR_FDBGO, V3D_ERR_FDBGB, V3D_ERR_FDBGS and V3D_ERR_STAT as
+//     REGDEF(V3D_GEN_33, V3D_GEN_71, ...)
+// — valid from V3D 3.3 through 7.1 inclusive, which brackets the bcm2711's **V3D 4.2**. They are
+// READ-ONLY status registers whose only mainline use is a debugfs dump; this file writes none of them,
+// ever, and reads them only inside the core window it already maps. That is the whole safety argument.
+//
+// WHY THIS BLOCK. §49.25.6 left the wall at "the VPM write path itself — the write-back stage, or the
+// coord thread's ACCESS to it". Twelve of V3D_ERR_STAT's sixteen named bits are that sentence's
+// vocabulary: six VPM errors, four VPA (vertex-pipe-assembly) errors, and the VDW/VCD/VCM groups on
+// either side of the VPM. A latched VPMEWNA or VPMEWR convicts the ACCESS half outright; a clean word
+// on a leg whose shader provably ran convicts the SILENT half.
+#[cfg(feature = "v3d_vpmprobe")]
+const V3D_ERR_FDBGO: usize = 0x0f04; // front-end debug O (v3d_regs.h) — printed RAW, no decode claimed
+#[cfg(feature = "v3d_vpmprobe")]
+const V3D_ERR_FDBGB: usize = 0x0f08; // front-end debug B (v3d_regs.h) — printed RAW, no decode claimed
+#[cfg(feature = "v3d_vpmprobe")]
+const V3D_ERR_FDBGS: usize = 0x0f10; // front-end debug S (v3d_regs.h) — printed RAW, no decode claimed
+#[cfg(feature = "v3d_vpmprobe")]
+const V3D_ERR_STAT: usize = 0x0f20; // latched error status (v3d_regs.h) — decoded bit by bit below
+/// V3D_ERR_STAT's bit table: (mask, `v3d_regs.h` name, this file's reading of it). The NAMES are the
+/// header's and are load-bearing; the readings are ours and are printed as readings. THE RAW WORD IS
+/// THE EVIDENCE — every emitter prints it before any name, so a wrong expansion here can narrow or
+/// mislabel a conclusion but can never destroy the measurement.
+#[cfg(feature = "v3d_vpmprobe")]
+const V3D103_ERR_BITS: [(u32, &str, &str); 16] = [
+    (1 << 15, "L2CARE", "L2C AXI receive-FIFO overrun"),
+    (1 << 14, "VCMBE", "VCM error, binner"),
+    (1 << 13, "VCMRE", "VCM error, renderer"),
+    (1 << 12, "VCDI", "VCD idle error"),
+    (1 << 11, "VCDE", "VCD error"),
+    (1 << 10, "VDWE", "VDW (VPM DMA writer) error"),
+    (1 << 9, "VPMEAS", "VPM allocated-size error"),
+    (1 << 8, "VPMEFNA", "VPM free non-allocated"),
+    (1 << 7, "VPMEWNA", "VPM WRITE NON-ALLOCATED"),
+    (1 << 6, "VPMERNA", "VPM read non-allocated"),
+    (1 << 5, "VPMERR", "VPM read range"),
+    (1 << 4, "VPMEWR", "VPM WRITE RANGE"),
+    (1 << 3, "VPAERRGL", "VPA request-too-big (limit)"),
+    (1 << 2, "VPAEBRGL", "VPA binner request-too-big (limit)"),
+    (1 << 1, "VPAERGS", "VPA request-group-size error"),
+    (1 << 0, "VPAEABB", "VPA allocating a busy block"),
+];
+/// The bit CLASSES §49.25.7's rows split on. Every bit in the table above lands in exactly one.
+#[cfg(feature = "v3d_vpmprobe")]
+const V3D_ERR_CLASS_VPM: u32 = 0x03F0; // bits 9..4 — the six VPM errors
+#[cfg(feature = "v3d_vpmprobe")]
+const V3D_ERR_CLASS_VPA: u32 = 0x000F; // bits 3..0 — the four VPA errors
+#[cfg(feature = "v3d_vpmprobe")]
+const V3D_ERR_CLASS_PIPE: u32 = 0xFC00; // bits 15..10 — L2C/VCM/VCD/VDW
+/// The two VPM-WRITE bits specifically — the pair that speaks to §49.25.6's "or the coord thread's
+/// ACCESS to it" directly, where a read/free/pipe error would name a different station instead.
+#[cfg(feature = "v3d_vpmprobe")]
+const V3D_ERR_VPM_WRITE_PAIR: u32 = (1 << 7) | (1 << 4); // VPMEWNA | VPMEWR
+#[cfg(feature = "v3d_vpmprobe")]
+const _: () = assert!(
+    V3D_ERR_CLASS_VPM | V3D_ERR_CLASS_VPA | V3D_ERR_CLASS_PIPE == 0xFFFF
+        && V3D_ERR_CLASS_VPM & V3D_ERR_CLASS_VPA == 0
+        && V3D_ERR_CLASS_VPM & V3D_ERR_CLASS_PIPE == 0
+        && V3D_ERR_CLASS_VPA & V3D_ERR_CLASS_PIPE == 0
+        && V3D_ERR_VPM_WRITE_PAIR & V3D_ERR_CLASS_VPM == V3D_ERR_VPM_WRITE_PAIR
+);
+/// `V3D_CTL_IDENT1`'s field table (v3d_regs.h; VPM_SIZE's own comment there is "Multiples of 1kb").
+/// IDENT1 is a register this file ALREADY reads — `V3D_CTL_IDENT1_REV_MASK` is the revision gate — so
+/// this adds a DECODE, not a read. It gives §49.25.7 the VPM's PHYSICAL size straight off the silicon,
+/// to size the rows against the shader record's `cs_output_vpm_segment_size` and the CL's
+/// VCM_CACHE_SIZE, both of which are numbers this driver CHOSE and neither of which has ever been
+/// checked against what the part actually has.
+#[cfg(feature = "v3d_vpmprobe")]
+const V3D103_IDENT1_FIELDS: [(u32, u32, &str); 5] = [
+    (0xF << 28, 28, "VPM_SIZE (multiples of 1 KB)"),
+    (0xFF << 16, 16, "NSEM (semaphores)"),
+    (0xF << 12, 12, "NTMU (TMUs per slice)"),
+    (0xF << 8, 8, "QUPS (QPUs per slice)"),
+    (0xF << 4, 4, "NSLC (slices)"),
+];
+
+/// PI-V3D-103 — one leg's read of the per-core ERROR/DEBUG block. FOUR READS, NO WRITES. Taken in the
+/// same window as the `[v3d101]` counter sample: strictly AFTER the §49.20.2 V2a violation pair (which
+/// keeps its read-once-and-first law untouched) and BEFORE the leg's own L2T flush, so the words
+/// describe the kick and not this code's cache maintenance.
+#[cfg(feature = "v3d_vpmprobe")]
+#[derive(Clone, Copy, Default)]
+struct V3d103Err {
+    stat: u32,
+    fdbgo: u32,
+    fdbgb: u32,
+    fdbgs: u32,
+}
+
+/// PI-V3D-103 — the PRISTINE reference read, taken once at the arm (before leg E's kick) and held so
+/// every leg's line can print NEWLY-LATCHED bits rather than cumulative ones. `V3D_ERR_STAT` is a
+/// LATCHING status register and this file never clears it, so a bit set at the arm was set by something
+/// earlier in the boot and is not this ladder's finding. The rows split on `leg & !pre` for that reason.
+#[cfg(feature = "v3d_vpmprobe")]
+static V3D103_PRE: [core::sync::atomic::AtomicU32; 4] = [
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+];
+
+#[cfg(feature = "v3d_vpmprobe")]
+fn v3d103_pre_store(e: &V3d103Err) {
+    V3D103_PRE[0].store(e.stat, Ordering::Relaxed);
+    V3D103_PRE[1].store(e.fdbgo, Ordering::Relaxed);
+    V3D103_PRE[2].store(e.fdbgb, Ordering::Relaxed);
+    V3D103_PRE[3].store(e.fdbgs, Ordering::Relaxed);
+}
+
+#[cfg(feature = "v3d_vpmprobe")]
+fn v3d103_pre_load() -> V3d103Err {
+    V3d103Err {
+        stat: V3D103_PRE[0].load(Ordering::Relaxed),
+        fdbgo: V3D103_PRE[1].load(Ordering::Relaxed),
+        fdbgb: V3D103_PRE[2].load(Ordering::Relaxed),
+        fdbgs: V3D103_PRE[3].load(Ordering::Relaxed),
+    }
+}
+
+#[cfg(feature = "v3d_vpmprobe")]
+fn v3d103_err_sample() -> V3d103Err {
+    dsb();
+    let e = V3d103Err {
+        stat: mmio_read(V3D_CORE0_BASE, V3D_ERR_STAT),
+        fdbgo: mmio_read(V3D_CORE0_BASE, V3D_ERR_FDBGO),
+        fdbgb: mmio_read(V3D_CORE0_BASE, V3D_ERR_FDBGB),
+        fdbgs: mmio_read(V3D_CORE0_BASE, V3D_ERR_FDBGS),
+    };
+    dsb();
+    e
+}
+
+/// PI-V3D-103 — `V3D_ERR_STAT` bit by bit, with the raw word FIRST and the three class masks after it.
+/// `label` names the window (`PRE-ARM` for the pristine reference read, or the leg letter).
+#[cfg(feature = "v3d_vpmprobe")]
+fn v3d103_emit_err(label: &str, tag: &str, e: &V3d103Err) {
+    let vpm = e.stat & V3D_ERR_CLASS_VPM;
+    let vpa = e.stat & V3D_ERR_CLASS_VPA;
+    let pipe = e.stat & V3D_ERR_CLASS_PIPE;
+    let wr = e.stat & V3D_ERR_VPM_WRITE_PAIR;
+    let unnamed = e.stat & !0xFFFFu32;
+    serial_println!(
+        ":: V3D: [v3d103] ERRSTAT ({}) {} — V3D_ERR_STAT raw={:#010x} | V3D_ERR_FDBGO raw={:#010x} · V3D_ERR_FDBGB raw={:#010x} · V3D_ERR_FDBGS raw={:#010x} (the three FDBG words are printed RAW and NO DECODE IS CLAIMED for them on this silicon — they are here so a nonzero one can be chased, not read) | classes: VPM(bits9..4)={:#06x} VPA(bits3..0)={:#06x} PIPE(bits15..10)={:#06x} · VPM-WRITE-PAIR(VPMEWNA|VPMEWR)={:#06x} · unnamed bits[31:16] still set={:#010x} ::",
+        label, tag, e.stat, e.fdbgo, e.fdbgb, e.fdbgs, vpm, vpa, pipe, wr, unnamed
+    );
+    for (mask, name, reading) in V3D103_ERR_BITS.iter() {
+        serial_println!(
+            "::   [v3d103] ERRSTAT ({}) bit{:<2} {:<9} = {} ({}) ::",
+            label,
+            mask.trailing_zeros(),
+            name,
+            (e.stat & mask != 0) as u32,
+            reading
+        );
+    }
+}
+
+/// PI-V3D-103 — `V3D_CTL_IDENT1` decoded. IDENT1 is already read by this file's revision gate, so this
+/// is a decode of a word we hold, not a new register read. Printed ONCE, at the arm.
+#[cfg(feature = "v3d_vpmprobe")]
+fn v3d103_emit_ident1() {
+    let id1 = mmio_read(V3D_CORE0_BASE, V3D_CTL_IDENT1);
+    let vpm_kb = (id1 & V3D103_IDENT1_FIELDS[0].0) >> V3D103_IDENT1_FIELDS[0].1;
+    serial_println!(
+        ":: V3D: [v3d103] VPMSIZE — V3D_CTL_IDENT1 raw={:#010x} | VPM_SIZE(bits31:28)={} => {} KB of VPM on this part (v3d_regs.h V3D_IDENT1_VPM_SIZE_MASK, whose own comment reads 'Multiples of 1kb'). This is the FIRST time this campaign has read the VPM's PHYSICAL size off the silicon: the shader record asks for cs_output_vpm_segment_size=1 and cs_input_vpm_segment_size=0, and the CL asks for VCM_CACHE_SIZE bin=4 render=4, and BOTH of those are numbers this driver CHOSE (PI-V3D-23, PI-V3D-25) against Mesa's formulas and NEITHER has ever been checked against the part. A VPM_SIZE field reading 0 would mean the sizing question is unanswerable from IDENT1 on this silicon and every row below that cites it is void ::",
+        id1, vpm_kb, vpm_kb
+    );
+    for (mask, shift, name) in V3D103_IDENT1_FIELDS.iter() {
+        serial_println!(
+            "::   [v3d103] VPMSIZE   {:<28} = {} ::",
+            name,
+            (id1 & mask) >> shift
+        );
+    }
+}
+
+/// PI-V3D-103 — the STATIC finding, stated on the wire so the metal reader has it in the capture
+/// rather than only in the doc. This line reports work done at the DESK, not a measurement.
+#[cfg(feature = "v3d_vpmprobe")]
+fn v3d103_emit_static() {
+    serial_println!(
+        ":: V3D: [v3d103] VPMSTATIC — SUB-HYPOTHESIS (a) IS ALREADY DEAD, RESOLVED WITHOUT A BOOT, AND THIS LINE EXISTS SO NO READER SPENDS BOOT 14 ON IT. The hypothesis was 'our coord shader's VPM WRITE-SETUP magic-register word is VC4-shaped on a V3D 4.2 VPM, and that mismatch IS the wall'. THERE IS NO SETUP WORD TO BE WRONG. Our coord shader contains no vpmsetup and no `mov vpm`: PI-V3D-20 REMOVED that mechanism outright, because it is exactly the VC4 / V3D-3.3 streamed model and it does not exist for per-vertex shader output on 4.x. The failure the hypothesis describes ALREADY HAPPENED and was ALREADY FIXED — PI-V3D-9/17/18/19 were the VC4-shaped builds (vpmsetup + auto-advancing `mov vpm`), and every one of them wrote an unconfigured magic register. CS_VS_WORDS now writes its six outputs with STVPMV and EXPLICIT per-component offsets 0..5 delivered as uniforms, which is what Mesa's vir_VPM_WRITE emits for ver 42 and nothing else. THREE INDEPENDENT CHECKS AGREE: (1) PI-V3D-26 cross-checked this body against a REAL v3d_compile() run at ver 4.2 and found the same offsets 0,1,2,3 clip + 4,5 screen and the same 32*256=8192 viewport scale; (2) every word round-trips through Mesa's own v3d_qpu_instr_pack (scripts/pi-v3d20-qpu-gen.out.txt, 'All words packed + round-tripped OK'); (3) this arc re-decoded the six STVPMV words BIT BY BIT against the ver-42 field layout — OP_ADD[31:24]=0xf8=248=V3D_QPU_A_STVPMV on all six, ADD_A mux=6 (RADDR_A) carrying the offset from rf9..rf14 and ADD_B mux=7 (RADDR_B) carrying the value from rf0..rf3/rf7/rf8, mul-side op 15 = M_NOP, sig=0 — the operand ORDER, the mux selects and the register numbers are all correct. THE VERDICT: our shader is 4.2-shaped, not VC4-shaped, and (a) cannot be the wall. Boot 14 spends its slots on (b) VPM ACCESS/ALLOCATION and on splitting PTB-never-received from PTB-received-and-discarded ::"
+    );
+}
+
+/// PI-V3D-103 — leg H's §49.25.7 rows. Printed AFTER `[v3d102]`'s H verdict, which it cites: this rung
+/// does not replace H4, it SPLITS it. The admissibility guard comes first and is not an outcome.
+#[cfg(feature = "v3d_vpmprobe")]
+fn v3d103_emit_verdict(
+    tag: &str,
+    s: &V3d101Sample,
+    e_pre: &V3d103Err,
+    e_leg: &V3d103Err,
+    pool_words: u32,
+    frame_closed: bool,
+) {
+    let newly = e_leg.stat & !e_pre.stat; // bits this leg LATCHED that the pristine read did not hold
+    let vpm_wr = newly & V3D_ERR_VPM_WRITE_PAIR;
+    let vpm_any = newly & V3D_ERR_CLASS_VPM;
+    let vpa_any = newly & V3D_ERR_CLASS_VPA;
+    let pipe_any = newly & V3D_ERR_CLASS_PIPE;
+    let stalled = s.moved(V3D103_STALL_SLOT);
+    let clipped = s.moved(V3D103_CLIP_SLOT);
+    let discarded = s.moved(V3D103_DISCARD_SLOT);
+    let qpu_moved = s.moved(1) || s.moved(3);
+    // The admissibility guard: boot 14's leg H must reproduce boot 13's five continuity slots before any
+    // re-sourced slot is allowed to speak. Reproduction here means the SHAPE, not the exact cycle count.
+    let cont_shape_ok = !s.moved(V3D103_CONTINUITY_SLOTS[0]) && s.moved(V3D103_CONTINUITY_SLOTS[1]) && s.moved(V3D103_CONTINUITY_SLOTS[2]) && !s.moved(V3D103_CONTINUITY_SLOTS[3]);
+    let row: &str = if !s.armed_ok() || !s.ctrl_moved() {
+        "INCONCLUSIVE — THE BANK WAS NOT FULLY ARMED, or SLOT 2 (src32 CYCLE_COUNT) IS FLAT across this leg's window. No V row is taken; the bank measured nothing and every slot on this line is void"
+    } else if !cont_shape_ok {
+        "INCONCLUSIVE — THE CONTINUITY SLOTS DID NOT REPRODUCE BOOT 13. Boot 13's leg H read FEP=0, QPU-moved=1, PTB_PRIMS_BINNED=0, and this leg did not. The three re-sourced slots are measured on a leg that is NOT the leg §49.25.6 folded, so no V row is earned. Read the raw words and find out what ELSE changed before citing anything below"
+    } else if frame_closed {
+        "NO V ROW FITS — THE FRAME CLOSED. Boot 13's leg H did not, and this rung's whole question is asked inside an open frame. A leg H that closes here on a byte-identical list is a bigger finding than anything this rung was built for: re-read §49.25.5's H1/H2 against the pool count, and treat boot 13 or boot 14 as the anomaly before either is cited"
+    } else if !qpu_moved {
+        "NO V ROW FITS — THE QPU SLOTS ARE FLAT. The coord thread did not launch on this leg, so there is no VPM write whose fate this rung could measure. This is [v3d101]'s D1 shape arriving where boot 13 read a running thread; the one variable is this leg's shader record at OFF_SHADREC, and that outranks everything else on the line"
+    } else if vpm_wr != 0 {
+        "OUTCOME V1 — THE VPM WRITE IS REFUSED, AND THE SILICON SAYS SO. A VPM WRITE error latched on this leg that the pre-arm read did not hold: VPMEWNA (write NON-ALLOCATED) or VPMEWR (write RANGE). This is §49.25.6's 'or the coord thread's ACCESS to it' half, convicted by name. The coord thread's STVPMV stores are landing outside any VPM region the thread is entitled to write — so the wall is ALLOCATION, and the three numbers that allocate are the shader record's cs_output_vpm_segment_size (this driver writes 1), its cs_input_vpm_segment_size (0), and the CL's VCM_CACHE_SIZE (4/4). Read those against the VPMSIZE line's physical KB. This is the strongest row in the rung and it ends the guessing"
+    } else if vpm_any != 0 {
+        "OUTCOME V2 — A VPM ERROR LATCHED, BUT NOT A WRITE ONE. Something in the VPM's read/free/size family latched on this leg (VPMEAS, VPMEFNA, VPMERNA or VPMERR) while both WRITE bits stayed clear. The VPM is REACHED and is unhappy, but not about our stores — so the fault is in how the block is SIZED or RECLAIMED around the thread rather than in the thread's own access. Name the exact bit from the decode above before reasoning further: these four bits mean four different things and only the raw word says which"
+    } else if pipe_any != 0 || vpa_any != 0 {
+        "OUTCOME V3 — THE ERROR IS BESIDE THE VPM, NOT IN IT. A VPA (vertex-pipe-assembly) or VDW/VCD/VCM/L2C bit latched on this leg and NO VPM bit did. §49.25.6's wall statement is then MISNAMED: the VPM write path is not what failed, its neighbour is, and the neighbour is on the line by name. VDWE moves the wall to the VPM DMA writer; VCMBE to the binner's vertex-cache manager; a VPA bit to primitive assembly UPSTREAM of the VPM, which would put the wall in front of the write instead of behind it"
+    } else if clipped || discarded {
+        "OUTCOME V4 — THE PTB RECEIVED THE PRIMITIVES AND THREW THEM AWAY, AND OUTCOME H4 IS DEAD. PTB_PRIM_CLIP and/or PTB_PRIM_VIEWPOINT_DISCARD moved on a leg whose PTB_PRIMS_BINNED is still zero. A primitive cannot be clipped or viewport-discarded unless it ARRIVED — so the VPM delivery HAPPENS, it reaches the PTB, and the PTB rejects it at the clip/viewport test. §49.25.6's 'the VPM write path itself is the wall' is then WRONG and must be re-folded: the wall is CLIPPER/VIEWPORT STATE, PI-V3D-17's room, where POR zeros collapse every primitive to a point. This is the row that most changes the campaign, and it is why these two slots were worth boot 13's stall counters"
+    } else if stalled {
+        "OUTCOME V5 — THE COORD THREAD SPENT ITS LIFE STALLED. QPU_CYCLES_STALLED_VERTEX_COORD_USER moved on a leg where no error bit latched and no PTB slot moved. The thread ran (boot 13's shape) but it was WAITING, and nothing downstream ever took what it offered — the write path is not refusing loudly, it is not draining at all. Cross-read the stall delta against slot1's ACTIVE delta: stalled comparable to or larger than active means the thread was mostly blocked, and INT_STS bit16's 'program end' then needs re-reading as a thread that was RELEASED rather than one that FINISHED"
+    } else {
+        "OUTCOME V6 — THE WRITE IS SWALLOWED IN SILENCE. The frame is open, the coord thread ran and did NOT stall, NO error bit latched anywhere in ERR_STAT, and the PTB neither binned, clipped nor discarded a single primitive. Every instrument this campaign owns now reports nothing on a leg that provably executed six STVPMV stores and a VPMWT. That is not a refusal and not a stall — it is a write path that ACCEPTS AND DISCARDS, or one the stores were never presented to at all. The two are no longer separable by any counter or status bit in the core block, and the next rung must make the thread's stores VISIBLE OUTSIDE THE VPM to split them: the TMU landmark of v3d.md §49.25.7's (c). If this row comes back, that leg is the campaign's next build and its blocking artifact is named in the doc"
+    };
+    serial_println!(
+        ":: V3D: [v3d103] VPMPROBE VERDICT ({}) LEG H — v3d.md §49.25.7's pre-written outcomes. This rung does NOT replace OUTCOME H4, it SPLITS it: H4 said 'the VPM write path itself is the wall', and these rows say WHICH WAY. | bank control: PCTR_EN-intact={} src32-moved={} | continuity vs boot 13 (slots 0/1/3/7 must reproduce): FEP-moved={} QPU-moved={} PTB_PRIMS_BINNED-moved={} shape-ok={} | frame-closed={} pool_words={} (empty close={}) | ERR_STAT pre-arm={:#010x} this-leg={:#010x} NEWLY-LATCHED={:#010x} (VPM-write-pair={:#06x} VPM-any={:#06x} VPA={:#06x} PIPE={:#06x}) | re-sourced slots: slot4 src{} {} raw={} d={} · slot5 src{} {} raw={} d={} · slot6 src{} {} raw={} d={} — {} ::",
+        tag,
+        s.armed_ok() as u32,
+        s.ctrl_moved() as u32,
+        s.moved(0) as u32,
+        qpu_moved as u32,
+        s.moved(7) as u32,
+        cont_shape_ok as u32,
+        frame_closed as u32,
+        pool_words,
+        V3D99_BOOT6_POOL_WORDS,
+        e_pre.stat,
+        e_leg.stat,
+        newly,
+        vpm_wr, vpm_any, vpa_any, pipe_any,
+        V3D101_SRC[V3D103_STALL_SLOT], V3D101_SRC_NAME[V3D103_STALL_SLOT], s.raw[V3D103_STALL_SLOT], s.d[V3D103_STALL_SLOT],
+        V3D101_SRC[V3D103_CLIP_SLOT], V3D101_SRC_NAME[V3D103_CLIP_SLOT], s.raw[V3D103_CLIP_SLOT], s.d[V3D103_CLIP_SLOT],
+        V3D101_SRC[V3D103_DISCARD_SLOT], V3D101_SRC_NAME[V3D103_DISCARD_SLOT], s.raw[V3D103_DISCARD_SLOT], s.d[V3D103_DISCARD_SLOT],
+        row
+    );
+}
+
 /// PI-V3D-101 — stop the bank at the end of the ladder (`v3d_perfmon_stop`: EN=0), so the counter file
 /// is left exactly as every rung outside this arming window has always seen it. Nothing runs after the
 /// ladder in any case — the boot returns before `probe_job` — but the file's law is that a bank is
@@ -16885,6 +17221,13 @@ fn v3d97_leg(
     // byte for byte. The LINE is emitted later, once the pool/tile-state word counts exist for D3.
     #[cfg(feature = "v3d_dispatchdisc")]
     let dd_sample = if armed { Some(v3d101_sample()) } else { None };
+
+    // PI-V3D-103 — the ERROR/DEBUG block, sampled in the SAME window and under the same law: strictly
+    // after the V2a pair above, strictly before this leg's L2T flush. FOUR READS, NO WRITES, and only
+    // on the armed legs — legs A–D take none of it and their register traffic is unchanged byte for
+    // byte. The LINE is emitted later, beside [v3d101]'s, so the whole leg reads in one place.
+    #[cfg(feature = "v3d_vpmprobe")]
+    let err_sample = if armed { Some(v3d103_err_sample()) } else { None };
 
     // PI-V3D-100 — the CLE's own walk position and primitive counter, read AFTER the V2a pair (the law
     // reserves the FIRST read after the wait for MMU_VIO_ADDR/VIO_ID and these are CLE registers).
@@ -17121,6 +17464,25 @@ fn v3d97_leg(
                 frame_closed,
             );
         }
+        // PI-V3D-103 — the ERR block's line on EVERY armed leg (E and H both need it: leg E is the
+        // pristine-through-a-closing-frame control), and leg H's §49.25.7 verdict AFTER [v3d102]'s H
+        // row, which it cites and splits. Its own statement, its own cfg: `v3d101_emit_leg` and
+        // `v3d102_emit_h_verdict` above are untouched by this arc, so a build without `v3d_vpmprobe`
+        // emits exactly what [v3d101]/[v3d102] emitted.
+        #[cfg(feature = "v3d_vpmprobe")]
+        if let Some(e) = err_sample.as_ref() {
+            v3d103_emit_err(leg, tag, e);
+            if leg == "H" {
+                v3d103_emit_verdict(
+                    tag,
+                    s,
+                    &v3d103_pre_load(),
+                    e,
+                    pool_scan.zeroed + pool_scan.overwritten,
+                    frame_closed,
+                );
+            }
+        }
     }
 
     // ── The verdict. §49.20.6's four rows, pre-written, plus the branches that void them. ────────
@@ -17265,6 +17627,19 @@ fn v3d97_basedaim_legs() {
         // and it sits before leg E's kick where it cannot perturb the list the leg submits.
         #[cfg(feature = "v3d_dispatchdisc")]
         v3d101_pctr_arm();
+        // ── PI-V3D-103 — the vpmprobe rung's three one-shot lines, emitted HERE: the static finding
+        // (desk work, no measurement), the VPM's physical size off IDENT1, and the PRISTINE read of the
+        // ERROR/DEBUG block taken BEFORE leg E's kick so every leg's line can print NEWLY-latched bits.
+        // The pristine read is four MMIO reads and no write, and it sits after the bank's arm so it
+        // cannot perturb the arm's own read-back audit.
+        #[cfg(feature = "v3d_vpmprobe")]
+        {
+            v3d103_emit_static();
+            v3d103_emit_ident1();
+            let pre = v3d103_err_sample();
+            v3d103_pre_store(&pre);
+            v3d103_emit_err("PRE-ARM", "pristine, before LEG E's kick", &pre);
+        }
         let leg_e = v3d97_leg(
             "E",
             "v3d99 R-next-3 armedclose (PRODUCTION bases, BPOS=0 + pre-kick L2T invalidate, 14-byte list)",
@@ -17390,6 +17765,10 @@ fn v3d97_basedaim_legs() {
             #[cfg(feature = "v3d_hfirst")]
             serial_println!(
                 ":: V3D: [v3d102] HFIRST COMPLETE — the reordered ladder is taken and nothing else runs; the boot returns before probe_job. The [v3d100] BINCONTENT COMPLETE line directly above says 'read F, G and H in that order' and THAT SENTENCE IS SUPERSEDED ON THIS BOOT: read leg E's VERDICT first (the EMPTY control, same boot, same image, same bases, same prologue — a leg E that did not return OUTCOME E1 leaves leg H with no baseline), then LEG H's [v3d101] INT_STS DECODE, its [v3d101] DISPATCHDISC delta line and its [v3d102] HFIRST VERDICT. Legs F and G run only if H closed and left CTRUN clean; if they ran they are [v3d101] baselines behind H rather than in front of it, and a slot that moves on F or G but not on H says the opposite of what §49.25.4's baseline sentence says, because the order it describes is the one this knob inverted. CT0QMA/CT0QMS/CT0QTS are LEFT PROGRAMMED at the production values, as leg E left them ::"
+            );
+            #[cfg(feature = "v3d_vpmprobe")]
+            serial_println!(
+                ":: V3D: [v3d103] VPMPROBE COMPLETE — the ladder is taken and nothing else runs; the boot returns before probe_job. READ IN THIS ORDER, and read the [v3d103] VPMSTATIC line FIRST OF ALL — it reports desk work, not a measurement, and it says why NO slot on this boot is spent on the shader's VPM write setup. Then [v3d103] VPMSIZE (the VPM's physical KB off IDENT1) and [v3d103] ERRSTAT (PRE-ARM) — the pristine reference every leg's newly-latched bits are computed against. Then LEG E: its [v3d101] INT_STS DECODE, its [v3d101] DISPATCHDISC delta line and its [v3d103] ERRSTAT (E). LEG E IS THE CONTROL FOR THE ERR BLOCK TOO, and that is new: a bit that latches on E — a leg that CLOSES — is not this campaign's wall and must be subtracted from leg H's reading by hand before any V row is believed. Then LEG H: its [v3d101] INT_STS DECODE, its [v3d101] DISPATCHDISC delta line, its [v3d102] HFIRST VERDICT (which should re-take OUTCOME H4 on the four continuity slots), its [v3d103] ERRSTAT (H), and finally its [v3d103] VPMPROBE VERDICT. THE ADMISSIBILITY GUARD OUTRANKS EVERY V ROW: if leg H's continuity slots do not reproduce boot 13's shape — FEP flat, QPU moved, PTB_PRIMS_BINNED flat — the three re-sourced slots are measuring a leg that is NOT the leg §49.25.6 folded, the line says INCONCLUSIVE, and the boot decides nothing until that is explained. Legs F and G run only if H closed, which boot 13 says it will not. CT0QMA/CT0QMS/CT0QTS are LEFT PROGRAMMED at the production values, as leg E left them ::"
             );
             // PI-V3D-101 — the bank is stopped by whoever armed it, on every path out of the ladder
             // (stood down or run to the ladder's last leg). Nothing runs after this in any case.

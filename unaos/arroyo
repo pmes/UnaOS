@@ -129,6 +129,16 @@ NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=c
 # in Cargo.toml and armed here), so `UNAOS_V3D_HFIRST=1` alone is sufficient. It writes no register the
 # implied chain does not already write, and the CT0-hygiene gate is mirrored, not weakened.
 # See the kernel8 knob block below and v3d.md §49.25.5.
+#
+# PI-V3D-103: UNAOS_V3D_VPMPROBE=1 is a plain arming knob (no value) for the `v3d_vpmprobe` feature —
+# the `[v3d103]` VPMPROBE discriminator rung, v3d.md §49.25.7, the successor to boot 13's `OUTCOME H4`.
+# It adds NO leg, NO kick, NO shader word, NO register WRITE and NO page-table edit. It RE-SOURCES three
+# PCTR slots (4/5/6 become QPU_CYCLES_STALLED_VERTEX_COORD_USER, PTB_PRIM_CLIP and
+# PTB_PRIM_VIEWPOINT_DISCARD; the five slots boot 13 read H4 off are untouched and must reproduce) and
+# adds FOUR READ-ONLY registers to the readback set (V3D_ERR_STAT/FDBGO/FDBGB/FDBGS, which mainline's
+# own v3d_debugfs.c scopes to V3D_GEN_33..V3D_GEN_71 — bracketing this part's 4.2). It implies
+# `v3d_hfirst` (declared in Cargo.toml and armed here), so `UNAOS_V3D_VPMPROBE=1` alone is sufficient.
+# See the kernel8 knob block below and v3d.md §49.25.7.
 KERNEL_FEATURES=""
 _feats=""
 # DEFAULT-QUIET: UNAOS_WITNESS=1 arms the `witness` fixture-battery feature (auto-set above for the battery
@@ -1640,7 +1650,7 @@ KERNEL_CFG_MATRIX=(
   # PI-DESK (`pidesk` — the desktop furniture family on the Pi panel; this leg carries `witness`, so it
   # is also the only place the dock/menubar/crystal FIXTURES are type-checked on aarch64).
   # Cannot carry the tegra family — see the mutual-exclusion note above.
-  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,pidesk,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,fatperf,livecon"
+  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,pidesk,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon"
   # aarch64 board leg 2 — Jetson Orin Nano (Tegra234), plus the board-neutral aarch64 features that
   # would otherwise ride nothing: ORIN-SMP (tegrasmp/smpprobe), the four XCARVE levers, ORIN-NET-1..4
   # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET
@@ -3076,6 +3086,65 @@ kernel8() {
     if [ -n "${UNAOS_V3D_HFIRST:-}" ]; then
         K8_FEATS="${K8_FEATS},v3d_hfirst,v3d_dispatchdisc,v3d_bincontent,v3d_armedclose,v3d_tsaim,v3d_basedaim,v3d_unarmclose,v3d"
         echo -e "${COLOR_YELLOW}  • UNAOS_V3D_HFIRST: the [v3d102] hfirst order arm — NO new leg, NO new kick and NO new instrument, the content ladder simply runs E -> H -> F -> G so LEG H (the m4-class minimum over the REAL coordinate shader, which DOES write VPM) runs FIRST instead of standing down behind leg G's never-closing frame, with §49.25.5's H1/H2/H3/H4 outcomes pre-written on leg H's own verdict line and the CT0-hygiene gate mirrored rather than weakened (⚠ implies UNAOS_V3D_DISPATCHDISC; short capture — do not diff against a deep boot)${COLOR_RESET}"
+    fi
+    # PI-V3D-103: UNAOS_V3D_VPMPROBE=1 adds the `v3d_vpmprobe` feature — v3d.md §49.25.7's VPMPROBE
+    # discriminator rung, the successor to boot 13's OUTCOME H4. It IMPLIES UNAOS_V3D_HFIRST (and through
+    # it DISPATCHDISC, BINCONTENT, ARMEDCLOSE, TSAIM, BASEDAIM, UNARMCLOSE, V3D): the cargo feature
+    # declares `v3d_vpmprobe = ["v3d_hfirst"]` so the implication cannot be forgotten, and this block arms
+    # the whole chain itself. UNAOS_V3D_VPMPROBE=1 ALONE is sufficient to stage the boot.
+    # IT ADDS NO LEG, NO KICK, NO SHADER WORD, NO REGISTER WRITE AND NO PAGE-TABLE EDIT. The boot still
+    # takes EIGHT CT0 closes; every leg's list, prologue, eleven referenced regions, digests and poison
+    # collars are byte-for-byte what UNAOS_V3D_BINCONTENT submits; the ladder order is UNAOS_V3D_HFIRST's
+    # E -> H -> F -> G; CT0 is fed a BIN list on every leg, never a render list; the boot returns before
+    # probe_job.
+    # WHY: boot 13 folded as OUTCOME H4 in its STRONG form (v3d.md §49.25.6) — the REAL 27-word coord
+    # shader ran to a program-end interrupt, burning QPU_CYCLES_VALID_INSTR=53 against the null shader's
+    # 5, and NOT ONE VPM- or PTB-side witness moved. The shader is exonerated and the wall is "the VPM
+    # write path itself — the write-back stage, or the coord thread's ACCESS to it". This rung SPLITS
+    # that sentence; it does not replace it.
+    # SUB-HYPOTHESIS (a) IS ALREADY DEAD, RESOLVED AT THE DESK: "our VPM write-SETUP word is VC4-shaped
+    # on a 4.2 VPM" cannot be the wall because THERE IS NO SETUP WORD. PI-V3D-20 removed vpmsetup/mov vpm
+    # outright (that IS the VC4/3.3 model, and it does not exist for per-vertex shader output on 4.x),
+    # PI-V3D-26 cross-checked the STVPMV body against a real ver-4.2 v3d_compile() run, and this arc
+    # re-decoded all six STVPMV words bit by bit. No slot is spent on it; the wire says so on the
+    # [v3d103] VPMSTATIC line so no reader spends the boot on it either.
+    # TWO CHANGES, BOTH INSTRUMENT-ONLY.
+    # (1) THREE PCTR SLOTS RE-SOURCED. Slots 0/1/2/3/7 UNCHANGED — the five boot 13 read H4 off; leg H
+    # must reproduce their shape or the line reads INCONCLUSIVE (an admissibility guard, not a result).
+    # Slots 4/5/6 were L2T_VCD_READS + the two VPM STALL counters, all three of which read ZERO on boot
+    # 13; VCD attribute fetch was already exonerated at PI-V3D-28, and a stall counter reading zero
+    # cannot separate "the write sailed through" from "no write was ever presented". They become src33
+    # QPU_CYCLES_STALLED_VERTEX_COORD_USER, src11 PTB_PRIM_CLIP and src10 PTB_PRIM_VIEWPOINT_DISCARD.
+    # THE PAIR TO WATCH IS 5 AND 6: a primitive cannot be clipped or viewport-discarded unless it
+    # ARRIVED, so either of them moving proves the VPM delivery reaches the PTB — which KILLS H4 and
+    # moves the wall into the clipper/viewport room PI-V3D-17 opened.
+    # (2) FOUR READ-ONLY REGISTERS JOIN THE READBACK SET: V3D_ERR_STAT, V3D_ERR_FDBGO, V3D_ERR_FDBGB,
+    # V3D_ERR_FDBGS. Sourced from v3d_regs.h and scoped to THIS silicon by mainline itself —
+    # v3d_debugfs.c's v3d_core_reg_defs lists all four as REGDEF(V3D_GEN_33, V3D_GEN_71, ...), a range
+    # that brackets the bcm2711's V3D 4.2. Mainline's only use of them is a debugfs dump and this file
+    # NEVER writes them. Twelve of ERR_STAT's sixteen named bits are VPM/VPA/VDW/VCD/VCM errors, which is
+    # exactly the vocabulary the wall statement needs. Read PRISTINE once before leg E's kick and once
+    # per armed leg; every row splits on NEWLY-LATCHED bits, because ERR_STAT latches and is never cleared.
+    # Wire outcomes are pre-written on LEG H's own [v3d103] VPMPROBE VERDICT line:
+    # V1 = a VPM WRITE bit latched (VPMEWNA "write non-allocated" or VPMEWR "write range") — THE VPM
+    # WRITE IS REFUSED AND THE SILICON SAYS SO; the wall is ALLOCATION, and the three numbers that
+    # allocate are cs_output_vpm_segment_size (this driver writes 1), cs_input_vpm_segment_size (0) and
+    # VCM_CACHE_SIZE (4/4). V2 = a non-write VPM bit — the VPM is reached and unhappy, but not about our
+    # stores. V3 = a VPA or VDW/VCD/VCM/L2C bit with NO VPM bit — the wall is BESIDE the VPM and the
+    # §49.25.6 statement is misnamed. V4 = PTB_PRIM_CLIP and/or PTB_PRIM_VIEWPOINT_DISCARD moved — THE
+    # PTB RECEIVED THE PRIMITIVES AND THREW THEM AWAY, and OUTCOME H4 IS DEAD. V5 = the coord thread
+    # STALLED. V6 = nothing anywhere — THE WRITE IS SWALLOWED IN SILENCE, and the next rung must make the
+    # thread's stores visible OUTSIDE the VPM (§49.25.7's TMU landmark). Three guards sit in front of all
+    # six: an unarmed/flat-control bank, a leg H that did not reproduce boot 13's continuity slots, and a
+    # frame that closed (which boot 13 says it will not).
+    # NO register write, NO mailbox tag and NO page-table edit is added over UNAOS_V3D_HFIRST.
+    # ⚠ an armed boot deliberately produces a SHORT capture missing every banked witness: label it and
+    # NEVER diff it line-for-line against a full deep boot. QEMU raspi4b models no V3D at all, so
+    # [v3d95] prints its hub-absent SKIPPED line and returns before any leg is reached — kernel8-test
+    # green means no regression and nothing more; the verdict is attended metal.
+    if [ -n "${UNAOS_V3D_VPMPROBE:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_vpmprobe,v3d_hfirst,v3d_dispatchdisc,v3d_bincontent,v3d_armedclose,v3d_tsaim,v3d_basedaim,v3d_unarmclose,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_VPMPROBE: the [v3d103] vpmprobe discriminator rung — NO new leg, NO new kick, NO new shader word and NO new register WRITE; it re-sources PCTR slots 4/5/6 to QPU_CYCLES_STALLED_VERTEX_COORD_USER / PTB_PRIM_CLIP / PTB_PRIM_VIEWPOINT_DISCARD (leaving the five slots boot 13 read OUTCOME H4 off untouched as an admissibility guard) and adds four READ-ONLY error registers (V3D_ERR_STAT/FDBGO/FDBGB/FDBGS, scoped to this silicon by mainline's own v3d_core_reg_defs), with §49.25.7's V1..V6 outcomes pre-written on leg H's own verdict line (⚠ implies UNAOS_V3D_HFIRST; short capture — do not diff against a deep boot)${COLOR_RESET}"
     fi
     # VUG-PAR: UNAOS_VUGPAR=1 adds the `vugpar` feature — band-parallel Screen::flush that splits the
     # damaged row-copy blit into disjoint scanline bands dispatched to free secondary cores (sched::
