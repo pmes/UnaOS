@@ -9860,9 +9860,9 @@ the edge — it was standing in front of it, and the lift it applied is the ~1 p
    lift's cost, which is what the operator sees). A grab-and-let-go with no motion between the edges
    settles at its own grab point.
 
-**The witness.** `[dragrel] win= end= settle= release= stale= lead= swap= post= pend= wait= ->
+**The witness.** `[dragrel] win= end= settle= release= stale= lead= swap= post= pend= ring= wait= ->
 CLEAN|DIRTY`, one line per gesture end, from both end paths, immediately before the `wm` call that
-clears the gesture. (`lead=` and `swap=` were added by DRAGGLIDE below.)
+clears the gesture. (`lead=` and `swap=` were added by DRAGGLIDE below; `ring=` by GHOST-DRAG.)
 `end=` names the path (`edge` = the delivered release; `level` = the belt with no edge queued;
 `level-late` = the belt firing past the deadline). `stale=` is `release - settle`: **the motion that
 arrived after the button read up**, i.e. exactly what the old code applied to the window and this
@@ -10035,7 +10035,10 @@ nothing to get in front of. The same gap exists on hardware between two concurre
 so the fix went to the decode sites rather than to the fixture; see *Which lift, decided by the
 decode site* above.
 
-### OPEN — two routers can interleave a gesture's routing, and the lift can still be steered
+### CLOSED by GHOST-DRAG — two routers can interleave a gesture's routing, and the lift can still be steered
+
+**Kept verbatim, because GHOST-DRAG is this exact mechanism reaching the operator's hand instead of a
+fixture's.** Read this statement of the defect, then *GHOST-DRAG* below for what closed it.
 
 **Not a fixture artifact, and it is written here rather than patched in a review pass.** Both x86
 drains — `main.rs`'s BSP GUI loop (`:1672`/`:1796`) and the SCHED-X86 render service (`:4393`/`:4458`)
@@ -10078,6 +10081,95 @@ in a *hardware* capture would be a real finding.
 gesture where the drain was running behind the hand; `stale=` at or near `(0,0)`. A recurring
 `swap=0` on gestures that also show `lead=` nonzero is the one combination that means the ~1 px is
 back.
+
+## GHOST-DRAG — a dropped window must not trail the next movement (2026-08-18)
+
+**Peter's report, boot 6 on the rMBP.** Drag a window, drop it, let the hand go **still**, then move
+again — and the window briefly **TRAILS** the pointer before settling. The drop looked finished and
+was not.
+
+**The mechanism, and it is the interleave above with a hand-sized gap opened in it.** Two facts
+compose:
+
+1. **The release edge can be emitted LATE.** If the release report is polled over at the EHCI ring
+   (boot C measured 43 down-edges against 29 releases — ring loss is real on this pad), the level is
+   never republished and the drag stays armed, invisibly, for as long as the hand rests. `wc_drag_motion`
+   states that residue and calls it harmless *because an unsteered drag moves no window*. The edge is
+   finally emitted by the FIRST report of the next movement: `note_buttons` sees `!down && prev & 0x01`
+   and pairs the late edge with that report's motion, and the DRAGGLIDE reorder duly puts it in front
+   of its own lift.
+2. **`pend` does not mean what the lead branch needs it to mean.** `RELEASE_EDGES_PENDING` counts an
+   edge from its push until a ROUTER routes it. Between the POP and the route the edge is out of the
+   ring while still counted — the window the section above describes. The lead branch's licence to
+   steer with the button level reading UP is a FIFO argument and nothing else: *"an edge is still
+   queued behind me, so I was pushed before it, so I am hand travel with the button down."* A motion
+   behind a POPPED edge was pushed AFTER it.
+
+Ordinarily (2) costs a lift's worth of pixels, which is what the section above measured. With (1) the
+motions on the far side of the popped edge are separated from the true release by the whole pause, so
+they are not a lift — they are wherever the hand has since gone. And within `LEAD_TRUST_MS` they also
+moved `DRAG_DOWN_*`, so the window did not merely trail: it came to **rest** at the new pointer
+position instead of at the drop point.
+
+**The fix, which is the one this ledger asked for and priced.** The section above names the clean
+repair — make the count mean *"still in the ring"* — and rejects doing it by moving
+`RELEASE_EDGES_PENDING`'s decrement to the pop, because that costs `end=level-late` its meaning: an
+edge eaten by another consumer would become indistinguishable from an edge that never arrived. It
+asks instead for *"its own accounting for popped but not yet routed, and its own arc"*. That is what
+landed.
+
+`pal::release_edge_in_ring()` is a SECOND, independent census of release `Button` entries physically
+present in the ring, maintained on `EventQueue::push` / `EventQueue::pop` — **the ring primitives
+themselves**, so the re-circulation peek (`peek_event_uncounted` / `requeue_event`, which bypasses
+`push_locked` entirely and runs ~250×/s while a full-screen app owns the panel) balances
+automatically and cannot drift the guard to zero. The drag tail takes it **in conjunction** with
+`pend`, never in place of it:
+
+```rust
+let edge_in_ring = crate::pal::release_edge_in_ring() != 0;
+if pend != 0 && edge_in_ring && waited < RELEASE_EDGE_GRACE_MS {
+```
+
+`pend` therefore keeps its route-time semantics and remains the only thing that ENDS a gesture, so
+`end=level` / `end=level-late` keep meaning exactly what they meant. The census is deliberately
+**coarser** than `pend` — it counts any `Button` whose primary bit is clear, because a ring primitive
+has no mask history to consult — and coarser is the safe direction under a conjunction: it can only
+ever leave the existing test in charge, never overrule it.
+
+**What did NOT change, and it is the constraint that shaped the fix.** A gate on the raw button level
+alone — *"a motion arriving with the level up must not steer"* — is the obvious repair and it is
+wrong: it reverts DRAGGLIDE outright. An ordinary release queues its backlog AHEAD of its edge, and
+every one of those motions is routed with the level already up; refusing them the steer is precisely
+the glide Peter reported off Boot A. **Leg 10 asserts this in the tree** — it drives one lead motion
+and requires the row to rest at `+12`, noting that *zero lead motions IS the glide and is a real
+failure*. Under the in-ring test those motions are popped while the edge is still queued and steer
+exactly as before; only a motion that cannot prove it came first loses the licence.
+
+**The lost-release settle rule, stated.** A motion that fails the test skips the steer AND skips the
+`DRAG_DOWN_*` record, then falls through to the belt, which ends the gesture at `drag_settle_point()`
+— the last position recorded with the button DOWN, i.e. the drag's last steered position. **The
+window settles where the hand let go, and never leaps to the new motion's position**, whether the
+edge arrives late, is eaten, or never comes at all.
+
+**The witness.** `ring=` joins the `[dragrel]` line, beside `pend=`, and the PAIR is the interleave
+detector:
+
+```
+[dragrel] win=1 end=edge settle=(439,295) release=(439,295) stale=(0,0) lead=1 swap=1 post=0 pend=0 ring=0 wait=3ms -> CLEAN
+```
+
+* `pend=1 ring=0` on a `level-late` ending — the edge had already been POPPED by the other drain and
+  was about to be routed by it. This is the state the arc closed, and the one in which a level-up
+  motion is no longer allowed to steer.
+* `pend=1 ring=1` — an edge genuinely still queued; the lead branch is licensed.
+* `pend=0 ring=0` — the ordinary ending.
+* `ring=` persistently nonzero across gestures would mean release entries are leaving the ring by
+  some path that is not `EventQueue::pop`. The census is maintained on the primitive, so that should
+  be unreachable; seeing it is a real finding.
+
+**QEMU cannot exercise this.** The gate is headless and delivers no HID pointer, and the fork this
+arc closes needs a lost release plus a hand that stops and starts. **The metal falsifier is the whole
+verdict: drag, drop, stop, move — the window stays put; no trail.**
 
 ## PAPER — the kit's content-surface texture, ported to integer Q16 (2026-08-09)
 

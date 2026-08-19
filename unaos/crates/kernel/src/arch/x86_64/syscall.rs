@@ -6074,7 +6074,46 @@ pub fn wc_drag_motion() {
         }
         let waited = if held == 0 { 0 } else { now.wrapping_sub(held) };
         let pend = crate::pal::release_edge_pending();
-        if pend != 0 && waited < RELEASE_EDGE_GRACE_MS {
+        // GHOST-DRAG — **AND THE FIFO ARGUMENT MUST STILL HOLD WHEN IT IS MADE.**
+        //
+        // Metal (boot 6): drag, drop, let the hand go STILL, then move again — and the window trails
+        // the pointer for a moment before settling. The branch below is where it trails. Its licence
+        // to steer with the button level reading UP is a FIFO argument and nothing else: "a release
+        // edge is still queued BEHIND me, therefore I was pushed before it, therefore I am hand
+        // travel with the button physically down." `pend` is not that argument. `pend` counts an edge
+        // from its push until a ROUTER routes it, and between the POP and the route the edge is out
+        // of the ring while still counted — the two-drain interleave written up on `DRAG_LAST_LEAD`,
+        // where one drain pops the edge and the other routes the motion behind it first. The motion
+        // behind a popped edge was pushed AFTER it: post-release travel, and steering with it is the
+        // trail.
+        //
+        // The lost release is what makes that gap reachable by a HAND rather than by microseconds.
+        // If the release report is polled over at the EHCI ring (boot C: 43 down-edges vs 29
+        // releases), the pad goes silent with the level still down and the drag stays armed
+        // invisibly for as long as the hand rests. The edge is finally emitted LATE, by the first
+        // report of the NEXT movement — `note_buttons` sees `!down && prev & 0x01` and pairs it with
+        // that report's motion — so the motions queued around it are separated from the actual
+        // release by the whole pause. Under the old test those motions could steer, and the settle
+        // rule went with them: within `LEAD_TRUST_MS` they also moved `DRAG_DOWN_*`, so the window
+        // did not merely trail, it came to REST at the new pointer position instead of where the
+        // hand let go.
+        //
+        // `release_edge_in_ring()` is the census the argument actually needs, taken on the ring
+        // primitives. In CONJUNCTION with `pend`, never in place of it: `pend` remains the strict
+        // primary-transition accounting and the only thing that ends the gesture, and this only ever
+        // withdraws the licence to STEER from a motion that cannot prove it came first.
+        //
+        // What this does NOT change, because leg 10 asserts it: an ordinary release still queues its
+        // backlog AHEAD of the edge, those motions are popped while the edge is still in the ring,
+        // and they steer exactly as DRAGGLIDE made them. The glide stays fixed.
+        //
+        // And the LOST-RELEASE SETTLE RULE, stated: a motion that fails this test skips the steer AND
+        // skips the `DRAG_DOWN_*` record, then falls through to the belt below, which ends the
+        // gesture at `drag_settle_point()` — the last position recorded with the button DOWN, i.e.
+        // the drag's last steered position. The window settles where the hand let go. It never leaps
+        // to the new motion's position, whether the edge arrives late, is eaten, or never comes.
+        let edge_in_ring = crate::pal::release_edge_in_ring() != 0;
+        if pend != 0 && edge_in_ring && waited < RELEASE_EDGE_GRACE_MS {
             // DRAGGLIDE — a LEAD motion: produced before the release edge that is still queued behind
             // it, so it is hand travel with the button physically down. Steer with it and record it.
             //
@@ -6332,6 +6371,14 @@ fn drag_settle_apply(x: i32, y: i32) {
 ///    fix; it is a regression sentinel, and `-> DIRTY` is its alarm, not the arc's verdict.
 ///  * `pend=` / `wait=` — release edges queued but undrained at end time, and how long the belt had
 ///    been holding for one.
+///  * `ring=` (GHOST-DRAG) — release `Button` entries still PHYSICALLY IN the ring at end time (see
+///    `pal::release_edge_in_ring`). Read against `pend=`, and the pair is the interleave detector:
+///    `pend=1 ring=0` on a `level-late` ending says the edge had already been POPPED by the other
+///    x86 drain and was about to be routed by it — the gap this arc closed, and the state in which a
+///    level-up motion is no longer allowed to steer. `pend=1 ring=1` is an edge genuinely still
+///    queued. `pend=0 ring=0` is the ordinary ending. `ring=` persistently nonzero across gestures
+///    would mean release entries are being taken out of the ring by a path that is not
+///    `EventQueue::pop` — the census is maintained on the primitive, so that should be unreachable.
 ///
 /// **What refutes what — and it is `end=` and `stale=` that carry it, not `post=`.**
 ///  * `end=edge` on the ordinary gestures, with the window resting at `settle=`, is the fix working.
@@ -6374,7 +6421,7 @@ fn dragrel_witness(how: &str, sx: i32, sy: i32, pend: u32) {
     // Latched before the disarm that follows every call site, so a fixture can read it afterwards.
     DRAG_LAST_LEAD.store(lead, Ordering::Relaxed);
     serial_println!(
-        "[dragrel] win={} end={} settle=({},{}) release=({},{}) stale=({},{}) lead={} swap={} post={} pend={} wait={}ms -> {}",
+        "[dragrel] win={} end={} settle=({},{}) release=({},{}) stale=({},{}) lead={} swap={} post={} pend={} ring={} wait={}ms -> {}",
         crate::video::wm::drag_active(),
         how,
         sx,
@@ -6387,6 +6434,7 @@ fn dragrel_witness(how: &str, sx: i32, sy: i32, pend: u32) {
         u8::from(crate::pal::release_edge_reordered()),
         post,
         pend,
+        crate::pal::release_edge_in_ring(),
         waited,
         if post == 0 { "CLEAN" } else { "DIRTY" }
     );

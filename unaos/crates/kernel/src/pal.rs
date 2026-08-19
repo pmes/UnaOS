@@ -720,6 +720,15 @@ impl EventQueue {
         if next != self.tail {
             self.buffer[self.head] = event;
             self.head = next;
+            // GHOST-DRAG — the IN-RING release census, maintained on the ring PRIMITIVES (see
+            // [`RELEASE_EDGE_IN_RING`]). Here rather than in `push_locked` so it is symmetric with
+            // `pop` by construction: the re-circulation seam (`peek_event_uncounted` /
+            // `requeue_event`) bypasses `push_locked` entirely, and a census that missed its
+            // re-pushes would drift to zero under a full-screen app's ~250/s peek loop and silently
+            // disarm the guard.
+            if matches!(event, Event::Button(m) if m & 0x01 == 0) {
+                RELEASE_EDGE_IN_RING.fetch_add(1, core::sync::atomic::Ordering::Release);
+            }
             true
         } else {
             false
@@ -731,6 +740,16 @@ impl EventQueue {
         } else {
             let event = self.buffer[self.tail];
             self.tail = (self.tail + 1) % QUEUE_SIZE;
+            // GHOST-DRAG — the edge has LEFT the ring. Saturating for the same reason
+            // `note_release_edge_drained` is: the census must never be able to wrap under a
+            // consumer that took an entry by some path this ring did not hand out.
+            if matches!(event, Event::Button(m) if m & 0x01 == 0) {
+                let _ = RELEASE_EDGE_IN_RING.fetch_update(
+                    core::sync::atomic::Ordering::AcqRel,
+                    core::sync::atomic::Ordering::Acquire,
+                    |n| Some(n.saturating_sub(1)),
+                );
+            }
             Some(event)
         }
     }
@@ -866,6 +885,9 @@ static RELEASE_EDGES_PENDING: core::sync::atomic::AtomicU32 = core::sync::atomic
 /// the count and the consumption the same event by construction.
 static PREV_BTN_MASK: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
+/// GHOST-DRAG — release `Button` entries currently in the ring (see [`release_edge_in_ring`]).
+static RELEASE_EDGE_IN_RING: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// DRAGGLIDE — **the lift motion must not be drained BEFORE the release edge it belongs to.**
 ///
 /// Every HID pointer path in this kernel decodes one report into, in this order, an `Event::Mouse` /
@@ -933,6 +955,38 @@ const LIFT_ADJACENCY_MS: u64 = 2;
 /// DRAGSETTLE — release edges queued and not yet drained (see [`RELEASE_EDGES_PENDING`]).
 pub fn release_edge_pending() -> u32 {
     RELEASE_EDGES_PENDING.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// GHOST-DRAG — **release `Button` entries physically PRESENT IN THE RING right now.**
+///
+/// [`RELEASE_EDGES_PENDING`] counts an edge from its push until a ROUTER routes it
+/// (`note_release_edge_drained`, called from `wc_click_route_at`'s release arm). Between the POP and
+/// that route the edge is out of the ring but still counted — and that gap is not theoretical on this
+/// arch. Both x86 drains (the BSP GUI loop and the SCHED-X86 render service) pop from this one ring
+/// and popping is serialised while ROUTING is not, exactly as [`RELEASE_EDGE_REORDERED`]'s
+/// `DRAG_LAST_LEAD` note in `syscall.rs` describes: consumer A pops the release edge, consumer B pops
+/// the motion BEHIND it, and B routes its motion first — reading `pend != 0` and concluding, wrongly,
+/// that its motion was produced before the release.
+///
+/// That wrong conclusion is GHOST-DRAG. The drag tail's lead-motion branch steers with a motion whose
+/// button level reads UP on the strength of `pend`, and the strength of `pend` is a FIFO argument:
+/// "the edge is still queued behind me, so I was pushed before it." The argument is sound only while
+/// the edge is still IN THE RING. Once it has been popped, a motion popped after it was pushed after
+/// it — post-release hand travel — and steering with it drags the window along behind the pointer
+/// after the hand let go.
+///
+/// So this is the census the FIFO argument actually needs, and the drag tail takes it in conjunction
+/// with `pend` rather than in place of it: `pend` still says an edge is unaccounted for, and this
+/// says the edge is still ahead of nothing that has been popped. Maintained on `EventQueue::push` /
+/// `EventQueue::pop` — the ring primitives themselves — so the re-circulation peek balances
+/// automatically and no producer or consumer can be added that forgets it.
+///
+/// Deliberately COARSER than `RELEASE_EDGES_PENDING`: it counts any `Button` whose primary bit is
+/// clear, not only a primary 1 -> 0 transition, because the ring primitive has no mask history to
+/// consult. Coarser is the safe direction under a conjunction — it can only ever leave the existing
+/// `pend` test in charge, never overrule it.
+pub fn release_edge_in_ring() -> u32 {
+    RELEASE_EDGE_IN_RING.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// DRAGGLIDE — whether the LIVE gesture's release edge was reordered ahead of its own lift motion
