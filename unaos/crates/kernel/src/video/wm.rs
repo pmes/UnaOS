@@ -3351,6 +3351,19 @@ pub(super) fn occluders_aged(
 /// idle path is one atomic read ahead of a lock acquisition that was already happening.
 pub fn service_damage() {
     if DEFER_N.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+        // MENU-DRIVE / CRYSTAL-DISMISS — the SHARD menu's owed paint/erase is the THIRD thing this
+        // backstop must see, exactly as it is the third term in the gate holder's own "is anything
+        // OWED" tests. The MENU-DRIVE ledger names this function as the standing backstop for a
+        // MASKED holder (one pass, no re-run loop, no lost-wakeup pass) — but until now it tested
+        // only the erase queue and window damage, so a `COMP_PENDING` whose ONLY freight was the
+        // menu (an open-in-state dropdown, or a dismissed one still on the glass) had no taker on a
+        // desktop where nothing else was drawing. Two relaxed loads on the idle path, x86-gated
+        // with the term itself (aarch64 compiles no menu).
+        #[cfg(target_arch = "x86_64")]
+        if menu_paint_owed() {
+            composite();
+            return;
+        }
         let t = table();
         if !t.rows.iter().any(|r| r.used && r.damaged) {
             return;
@@ -13037,11 +13050,14 @@ const MENU_OCC_MAX: usize = 1;
 /// [`OCC_CLIP_MAX`]), never the panel.
 ///
 /// MENU-OCC — plus [`MENU_OCC_MAX`] transient slots for the modal surfaces that are not strip
-/// tenants (the SHARD dropdown). `erase_clip`'s worst case is still `MAX_WINDOWS + FURNITURE_MAX`
-/// (it does not carry the transient — the DESKTOP present subtracts the menu directly, see
-/// `Screen::present_background`), so the array keeps one box of headroom for it; `occ_clip`'s worst
-/// case grows by the menu to `MAX_WINDOWS - 1 + FURNITURE_MAX + MENU_OCC_MAX` and keeps its own one
-/// box of headroom too. Both terms are one below `OCC_MAX`.
+/// tenants (the SHARD dropdown). CRYSTAL-DISMISS (metal boot 8) — `erase_clip` now carries the
+/// transient too: the earlier claim that "the DESKTOP present subtracts the menu directly" named
+/// the wrong painter, because the deferred desktop FILL is neither the desktop present nor a
+/// window blit and was publishing `DESKTOP_BG` over the open dropdown (see the push in
+/// [`erase_clip`]). `erase_clip`'s worst case is therefore `MAX_WINDOWS + FURNITURE_MAX +
+/// MENU_OCC_MAX` — an EXACT fit for the array, with `push`'s bound check and the `dropped` report
+/// standing behind it; `occ_clip`'s worst case stays `MAX_WINDOWS - 1 + FURNITURE_MAX +
+/// MENU_OCC_MAX`, one below `OCC_MAX`.
 const OCC_MAX: usize = MAX_WINDOWS + FURNITURE_MAX + MENU_OCC_MAX;
 
 /// WCK5 × STRIPFACTOR — **[`occ_clip`]'s own population bound, now that it carries EVERY strip.**
@@ -13727,6 +13743,30 @@ fn erase_clip(pw: usize, ph: usize) -> (OccClip, usize) {
                 );
             }
             let _ = present;
+
+            // MENU-OCC / CRYSTAL-DISMISS (metal boot 8) — **the open SHARD dropdown, in the ERASE
+            // clip too.** `occ_clip` has carried it since MENU-OCC, but this clip did not, on the
+            // recorded premise that "the DESKTOP present subtracts the menu directly". That premise
+            // named the wrong painter: the deferred desktop FILL (`drain_deferred` -> `stage_fill`,
+            // the DESKTOP_BG stamp over a vacated window box) is neither the desktop present nor a
+            // window blit, and it was the ONE front-buffer painter left that could publish over an
+            // open dropdown. Under the 6-vug storm a queued erase box crossing the menu did exactly
+            // that: the dropdown's pixels went to desktop colour with NO dismiss recorded — and
+            // because `crystal::compose`'s damage signature (`SLOT`) still matched, every later pass
+            // SKIPPED the repaint as up-to-date. Boot 8's wire is the residue: `[crystal] …
+            // state=open opens=8 dismisses=7` over a visually closed menu, and the reopen press
+            // spent itself dismissing a dropdown that was not on the glass.
+            //
+            // Same accessor, same law as the strips: one relaxed load while closed, the rect while
+            // open. Capacity is exact rather than spare from here — every row plus both strips plus
+            // the menu is `MAX_WINDOWS + FURNITURE_MAX + MENU_OCC_MAX == OCC_MAX` — so a dropped
+            // box still reports through `dropped`, and the OCC_MAX ledger records the new worst
+            // case.
+            if let Some(b) = super::crystal::open_rect(pw, ph) {
+                if !c.push(b) {
+                    dropped += 1;
+                }
+            }
         }
         // REVIEW (D1) — and how many boxes the clip ended up with, so an EMPTY clip cannot pass for a
         // clean gesture. Stored last, after every `push`, and after the dock arm so the count

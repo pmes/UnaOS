@@ -682,12 +682,23 @@ fn repaint_vacated(r: strip::Rect) {
 pub fn compose() -> bool {
     if !OPEN.load(Ordering::Relaxed) {
         // Closed. Owe the pixels of a menu just dismissed, once — and hand them back to their OWNERS.
+        //
+        // CRYSTAL-DISMISS (metal boot 8 review) — the ERASE lands before the slot is cleared, not
+        // after. `strip::erase_rect` can DECLINE (a contended scratch under storm load, a surface
+        // that is not ready), and clearing first turned that decline into a silent loss: the slot
+        // read empty, [`paint_owed`] answered "nothing owed", and the dismissed dropdown's pixels
+        // stood on the glass with no pass ever coming back for them — the state machine right and
+        // the glass wrong, the mirror image of the boot-8 leak. Keeping the slot until the erase
+        // has PAINTED keeps the debt visible: `paint_owed` stays true, and the gate holder's re-run
+        // loop / the next composite retries the erase.
         if SLOT.packed() != 0 {
             let r = SLOT.rect();
+            if !strip::erase_rect(r) {
+                return false; // erase declined: still owed, still in the slot — the next pass retries
+            }
             SLOT.clear();
-            let painted = strip::erase_rect(r);
             repaint_vacated(r);
-            return painted;
+            return true;
         }
         return false;
     }
@@ -714,13 +725,17 @@ pub fn compose() -> bool {
     );
 
     // The menu cannot be placed on this panel (too small) — erase anything we owed and stand down.
+    // CRYSTAL-DISMISS — erase-then-clear, as on the dismissed path above and for the same reason: a
+    // declined erase must stay owed, not be silently forgotten with its pixels still on the glass.
     let Some(r) = rect else {
         if SLOT.packed() != 0 {
             let old = SLOT.rect();
+            if !strip::erase_rect(old) {
+                return false;
+            }
             SLOT.clear();
-            let painted = strip::erase_rect(old);
             repaint_vacated(old);
-            return painted;
+            return true;
         }
         return false;
     };
