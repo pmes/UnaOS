@@ -287,6 +287,43 @@ struct IntEp {
 // long quiet gap — but a *new press after a missed release* always is. So: a report that still reads
 // "primary down" after ≥ `CLICK_REPRESS_QUIET_MS` of endpoint silence is a NEW press. No protection
 // is weakened and no held-button case gains a spurious repeat.
+//
+// ARC D M1 — **THE LAST SENTENCE ABOVE WAS FALSE ON THIS PAD, AND METAL SAID SO.** Boot 3
+// (2026-08-19, `UNAOS_USBDEBUG=1`): quiet clicking held `recovered=` at 0-1 across ~7 minutes, and
+// then, the moment the hand started HOLDING AND DRAGGING, `recovered` climbed 2 -> 19 tracking
+// `delivered` one-for-one — roughly ONE MANUFACTURED PRESS PER 300 ms OF DRIFTING HOLD. The premise
+// "neither case can produce a pressed report separated from the previous report by a long quiet
+// gap" ignores the third case this pad actually produces: a change-only pad is SILENT through a
+// still hold, so the first finger DRIFT after the gap re-reports "still down" and reads exactly like
+// a new press. The arm fires at scale in ordinary drag use; the rescue it was built for is rare
+// (≤1 ambiguous firing in 7 minutes of clicking).
+//
+// THE DISCRIMINATOR IS MOTION, and it is free at every call site. On a change-only pad a DRIFT
+// report always carries dx/dy != 0 — the drift is the whole reason the report exists. A finger that
+// genuinely RE-LANDED after a missed release arrives MOTIONLESS: it is a fresh contact, and its
+// first report is the button change. So the quiet-gap arm additionally requires `!moved`. That kills
+// the phantom storm without giving up the ring-loss rescue (Boot C: 43 down-edges vs 29 releases —
+// a report lost AT THE RING is real, and the re-landed press that follows it carries no motion).
+//
+// AND WHEN IT FIRES IT OPENS A NEW GESTURE INSTEAD OF INJECTING A SECOND PRESS INTO THE LIVE ONE.
+// The arm's entire claim is that a RELEASE went missing — so it SYNTHESISES that release first:
+// `set_button_level(false)` (which is what bumps the release generation, the boundary every
+// consumer's notion of "a new gesture" is built on) plus a queued `Button(0)`, before republishing
+// the level as down and returning the press. That turns the producer's contract into an INVARIANT
+// rather than a hope:
+//
+//   **ONE PRESS EDGE PER GESTURE. A press is always preceded by the release that ended the previous
+//   one — synthesised here when the wire lost it.**
+//
+// Which is why the consumer-side duplicate guards this arc removes (`wc_click_route_at`'s
+// stale-latch arm, `video::crystal`'s CLICK-HOLD generation guard) are not merely unnecessary but
+// UNREACHABLE: nothing downstream has to tell a duplicate press from a real one any more, because
+// the producer no longer emits one. The router can go back to the only rule that needs no hidden
+// state — primary bit set is a press, clear is a release.
+//
+// METAL FALSIFIER (QEMU cannot exercise this belt — it delivers no pointer at all): drag the pad and
+// `recovered=` must not increment ONCE; and one physical click must produce exactly one press edge
+// at every consumer, most visibly the SHARD menu, which opens and stays open.
 // ======================================================================================
 
 /// CLICK-3 — endpoint silence (ms) after which a still-pressed report counts as a NEW press rather
@@ -310,16 +347,22 @@ impl IntEp {
     /// parsed report-pointer, boot mouse). Stamps the report clock, decides whether this report is a
     /// primary-button PRESS, and updates `prev_buttons`.
     ///
-    /// DRAGREL — returns `(press, release)`: `press` is the CLICK-1/CLICK-3 verdict, bit-for-bit the
-    /// predicate this function has always returned (down edge, or a still-down report after
-    /// `CLICK_REPRESS_QUIET_MS` of endpoint silence), and `release` is the newly added primary
-    /// 1 -> 0 edge. The caller owes one `pal::Event::Button(buttons)` for EITHER — the press event's
-    /// mask has the primary bit set, the release event's has it clear, which is how every consumer
-    /// tells them apart.
+    /// DRAGREL — returns `(press, release)`: `press` is the CLICK-1/CLICK-3 verdict (down edge, or
+    /// a still-down MOTIONLESS report after `CLICK_REPRESS_QUIET_MS` of endpoint silence), and
+    /// `release` is the primary 1 -> 0 edge. The caller owes one `pal::Event::Button(buttons)` for
+    /// EITHER — the press event's mask has the primary bit set, the release event's has it clear,
+    /// which is how every consumer tells them apart.
     ///
-    /// **The press semantics are unchanged and must stay unchanged.** A release edge is a new
-    /// OBSERVATION, not a new definition of a press: `prev_buttons`, the quiet-gap recovery and the
-    /// `usbdebug` press ledger below all behave exactly as before.
+    /// ARC D M1 — `moved` is THIS REPORT'S OWN MOTION (`dx/dy != 0`), and it is what separates a
+    /// drifting hold from a genuinely re-landed finger; see the section header above for the boot-3
+    /// measurement that made it necessary. It is passed rather than derived because only the decode
+    /// site knows a report's motion — this function is deliberately given no view of the report
+    /// bytes, and the trackpad's 0x02 byte decode is not touched by this arc.
+    ///
+    /// ARC D M1 — and when the quiet-gap arm DOES fire, this function first synthesises the release
+    /// the wire lost (level down, `Button(0)` queued, release generation bumped) and then republishes
+    /// the level as down, so the recovered press OPENS A NEW GESTURE. The invariant every consumer
+    /// may now rely on: **one press edge per gesture, always preceded by a release.**
     ///
     /// It also PUBLISHES the current level to `pal::cursor::set_button_level` on every report, edge
     /// or not. That is the half a missed report cannot destroy: this endpoint is armed for one
@@ -330,7 +373,7 @@ impl IntEp {
     /// `Event::Button` on the DOWN edge only and publishes no level. That path is not the rMBP
     /// trackpad's, so it is not the drag defect this arc closes; it wants the same two lines and is
     /// a follow-up.
-    fn note_buttons(&mut self, buttons: u8, idx: usize) -> (bool, bool) {
+    fn note_buttons(&mut self, buttons: u8, moved: bool, idx: usize) -> (bool, bool) {
         let now = crate::arch::ms();
         let prev = self.prev_buttons;
         // Silence since the PREVIOUS report on this endpoint (before this one is stamped). `== 0`
@@ -346,8 +389,24 @@ impl IntEp {
         // DRAGREL — the primary RELEASE edge. Orthogonal to the press arms: it cannot be true in the
         // same report as `edge` or `repress` (both require `down`).
         let release = !down && prev & 0x01 != 0;
-        // The recovery arm: still down, was down, and the endpoint was silent across the gap.
-        let repress = down && prev & 0x01 != 0 && quiet;
+        // The recovery arm: still down, was down, the endpoint was silent across the gap — and this
+        // report carries NO MOTION OF ITS OWN. ARC D M1: the last clause is the whole redesign. A
+        // drifting hold is the case that made this arm manufacture ~1 press per 300 ms on metal, and
+        // a drift report is a MOTION report by construction; a finger that re-landed after a lost
+        // release is a fresh contact and arrives motionless.
+        let repress = down && prev & 0x01 != 0 && quiet && !moved;
+        if repress {
+            // ARC D M1 — SYNTHESISE THE MISSING RELEASE, then re-open. The arm's claim is precisely
+            // that a release was lost; making that claim explicit is what keeps the recovered press
+            // from landing INSIDE the live gesture as a second press. `set_button_level(false)` is
+            // the seam that bumps the release generation (`pal::cursor`), and the queued `Button(0)`
+            // is the edge every consumer that watches edges needs. Pushed with no motion — this
+            // report has none, which is what `repress` just asserted — so the pairing hint is
+            // honest. The caller then pushes the PRESS for the same report, in that order.
+            crate::pal::cursor::set_button_level(false);
+            crate::pal::push_pointer_report(None, Some(crate::pal::Event::Button(0)));
+            crate::pal::cursor::set_button_level(true);
+        }
         #[cfg(feature = "usbdebug")]
         {
             use core::sync::atomic::Ordering::Relaxed;
@@ -365,7 +424,7 @@ impl IntEp {
                     PTR_PRESS_SEEN.load(Relaxed),
                     PTR_PRESS_DELIVERED.load(Relaxed),
                     PTR_PRESS_RECOVERED.load(Relaxed),
-                    if repress { "re-press after quiet gap" } else { "down edge" },
+                    if repress { "motionless re-press after quiet gap (release synthesised)" } else { "down edge" },
                 );
             }
         }
@@ -11887,7 +11946,13 @@ impl Controller {
                             // inferring it. THIS pad is half of why: it and an xHCI mouse are
                             // concurrent producers, and a foreign motion landing between two
                             // separate pushes would send the swap at the wrong entry.
-                            let (press, release) = e.note_buttons(buttons, idx);
+                            //
+                            // ARC D M1: `dx != 0 || dy != 0` is the motion discriminator, taken
+                            // from the ALREADY-DECODED deltas (the 0x02 byte decode is untouched)
+                            // and identical to the predicate this same call decides to emit a
+                            // `Mouse` event on. This is THE path the boot-3 phantom storm was
+                            // measured on.
+                            let (press, release) = e.note_buttons(buttons, dx != 0 || dy != 0, idx);
                             crate::pal::push_pointer_report(
                                 if dx != 0 || dy != 0 {
                                     Some(crate::pal::Event::Mouse { x: dx, y: dy })
@@ -11923,7 +11988,15 @@ impl Controller {
                         // DRAGGLIDE: motion + edge enter the ring as ONE report (see the trackpad
                         // path above).
                         let btn = (buttons & 0xFF) as u8;
-                        let (press, release) = e.note_buttons(btn, idx);
+                        // ARC D M1 — the motion discriminator, on the SAME predicate this site
+                        // already uses to decide whether the report carries motion at all (below).
+                        // For a RELATIVE layout that is exactly "dx/dy != 0". For an ABSOLUTE one it
+                        // reads "not at the panel origin", which is the in-tree convention at this
+                        // site and errs in the SAFE direction: a stationary absolute hold reports
+                        // `moved = true` and so the quiet-gap arm simply never fires for it — no
+                        // phantom presses, only the (rare) rescue foregone. The rMBP trackpad this
+                        // arc is about takes the relative 0x02 path above, not this one.
+                        let (press, release) = e.note_buttons(btn, x != 0 || y != 0, idx);
                         let motion = if x == 0 && y == 0 {
                             None
                         } else if l.relative {
@@ -11980,7 +12053,9 @@ impl Controller {
                     // DRAGREL: and the primary UP edge, same as the other two pointer paths.
                     // DRAGGLIDE: motion + edge enter the ring as ONE report (see the trackpad path
                     // above).
-                    let (press, release) = e.note_buttons(report[0], idx);
+                    // ARC D M1 — the motion discriminator; a boot mouse is relative, so this is
+                    // literally "this report moved".
+                    let (press, release) = e.note_buttons(report[0], dx != 0 || dy != 0, idx);
                     crate::pal::push_pointer_report(
                         if dx != 0 || dy != 0 {
                             Some(crate::pal::Event::Mouse { x: dx, y: dy })

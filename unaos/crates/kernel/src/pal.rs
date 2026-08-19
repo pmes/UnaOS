@@ -276,27 +276,15 @@ pub mod cursor {
 
     /// DRAGREL — publish the primary button's CURRENT level. Called from every pointer report,
     /// pressed or not, edge or no edge.
-    /// CLICK-HOLD — how many times the primary button has been observed to COME UP, as of the last
-    /// decoded pointer report. The generation a consumer needs to tell "a new press" from "the same
-    /// press, re-reported": the two re-press recoveries (`ehci::note_buttons`'s quiet-gap arm and
-    /// `wc_click_route_at`'s stale-latch arm) both manufacture a press EDGE from a report taken
-    /// while the button is still down, so an edge alone cannot answer it. The LEVEL can: it is
-    /// published on every report, edge or not, which is the half a missed edge cannot destroy.
-    static BUTTON_UP_GEN: AtomicU64 = AtomicU64::new(0);
-
+    // ARC D M1 — **THE RELEASE GENERATION IS GONE.** `BUTTON_UP_GEN` counted down -> up transitions
+    // so a consumer could tell "a new press" from "the same press, re-reported" — a question only
+    // worth asking because the input path could re-report one. It cannot any more: the quiet-gap
+    // recovery in `ehci::note_buttons` fires only on a MOTIONLESS report and synthesises the missing
+    // release before it re-opens, and the x86 router's stale-latch arm is deleted. Its one consumer
+    // (`video::crystal`'s CLICK-HOLD guard) went with it. The LEVEL below stays — the drag belt
+    // reads it, and that is a different question.
     pub fn set_button_level(down: bool) {
-        let was = BUTTON_DOWN.swap(down, Ordering::Relaxed);
-        // CLICK-HOLD — the down -> up transition is the gesture boundary; count it here, at the
-        // one seam every producer already writes, so no producer has to learn a second verb.
-        if was && !down {
-            BUTTON_UP_GEN.fetch_add(1, Ordering::Release);
-        }
-    }
-
-    /// CLICK-HOLD — the release generation (see [`BUTTON_UP_GEN`]). Two presses that read the same
-    /// generation, with the level still down, are the SAME physical press seen twice.
-    pub fn button_up_gen() -> u64 {
-        BUTTON_UP_GEN.load(Ordering::Acquire)
+        BUTTON_DOWN.store(down, Ordering::Relaxed);
     }
 
     /// DRAGREL — the primary button's level as of the last pointer report. `false` when no pointer

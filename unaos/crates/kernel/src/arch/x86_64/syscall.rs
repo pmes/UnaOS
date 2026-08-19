@@ -5614,12 +5614,23 @@ pub fn user_input_depth(active: u64) -> u32 {
 // focus when the hand moved; what a delivered click MEANS is the app's decision, made in the app.
 // =============================================================================================
 
-/// CLICK-X86: the pointer-button bitmask as the ROUTER last saw it, so this layer can tell a PRESS
-/// edge (a bit going 0->1) from a RELEASE edge (1->0) from an unchanged held state. Its own tracker,
-/// not shared with any drain: routing decisions are made upstream of every consumer, on events some
-/// consumers never see.
-static CLICK_PREV_MASK: AtomicU32 = AtomicU32::new(0);
-
+// ARC D M1 — **`CLICK_PREV_MASK` IS GONE, AND WITH IT THE ROUTER'S SECOND OPINION.**
+//
+// This layer used to keep its own copy of the button mask so it could re-derive edges (`mask & !prev`
+// for a press, `prev & !mask` for a release) and, when that copy went stale, recover a press from
+// `mask == prev`. Both halves were compensation for a PRODUCER that could emit two presses inside one
+// physical gesture. It no longer can: `ehci::note_buttons` now discriminates a drifting hold from a
+// re-landed finger by the report's own motion, and when it does recover a press it synthesises the
+// missing release first, so the events reaching this seam satisfy
+//
+//   **one press edge per gesture, always preceded by a release.**
+//
+// With that invariant at the producer, the router's rule needs no state at all — primary bit set is a
+// press, primary bit clear is a release — and a stateless rule cannot go stale. What went with the
+// static: the `mask == prev` recovery arm, the `[clickrepress]` witness and its budget, and the 22
+// `CLICK_PREV_MASK.store(0)` resets the selftests had to sprinkle around every leg to keep the
+// tracker from poisoning the next one.
+//
 /// CLICK-X86 sentinel: the outstanding press was NOT delivered to any ring, so its release must not be
 /// either. `u64::MAX` is not a valid biased slot (`USER_SLOTS` is single digits) and sits far above
 /// `wm::KERNEL_OWNER_BASE`, so it cannot collide with either population.
@@ -5637,18 +5648,6 @@ static CLICK_PRESS_TARGET: AtomicU64 = AtomicU64::new(CLICK_TARGET_DROP);
 /// CLICK-X86 accounting, for the rollup: press edges seen, and press edges DELIVERED into some ring.
 static CLICK_PRESSES: AtomicU64 = AtomicU64::new(0);
 static CLICK_DELIVERED: AtomicU64 = AtomicU64::new(0);
-
-/// CLICK-REPRESS: stationary re-presses this router RECOVERED — a `Button(1)` whose primary bit was
-/// already set in [`CLICK_PREV_MASK`] because a RELEASE was polled-over and never reached this seam.
-/// Every one of these was a click SILENTLY DROPPED before this arc (Boot C: "clicks won't keep
-/// flowing — I have to move the mouse then click again"). Read the `[clickrepress]` witness below.
-static CLICK_REPRESS_X86: AtomicU64 = AtomicU64::new(0);
-
-/// CLICK-REPRESS: witness-line budget. A recovered re-press is a hand gesture and so human-rate by
-/// construction, but the cap is stated rather than assumed — a button that re-reports "down" after
-/// every quiet gap must not be able to bury the wire, exactly as [`CLOSE_LOG_MAX_X86`] guards the
-/// close line. The recovery itself is uncapped; only the serial line is.
-const CLICK_REPRESS_LOG_MAX_X86: u64 = 128;
 
 /// CLICK-BAND (GR27 Boot B): `[clickroute]` lines emitted for presses the FURNITURE bands consumed
 /// (`band=menu` / `band=dock`), against [`CLICK_BAND_LOG_MAX_X86`]. Before this, a press the crystal
@@ -5705,8 +5704,6 @@ fn clickband_selftest() {
     };
     let saved_bar = crate::video::menubar::enabled();
     crate::video::menubar::set_enabled(true);
-    // A clean edge for the first press — the precedent every routing fixture above follows.
-    CLICK_PREV_MASK.store(0, Ordering::Relaxed);
 
     let press = |x: i32, y: i32| -> bool {
         let hit = wc_click_route_at(crate::pal::Event::Button(1), x, y);
@@ -5749,7 +5746,6 @@ fn clickband_selftest() {
     };
 
     crate::video::menubar::set_enabled(saved_bar);
-    CLICK_PREV_MASK.store(0, Ordering::Relaxed);
     CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
 
     let owed = CLICK_BAND_LOG_X86.load(Ordering::Relaxed) - n0;
@@ -6538,42 +6534,33 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
     let crate::pal::Event::Button(mask) = ev else {
         return false;
     };
-    let prev = CLICK_PREV_MASK.swap(mask as u32, Ordering::Relaxed) as u8;
     let cur = USER_INPUT_ACTIVE.load(Ordering::Acquire);
-    // CLICK-REPRESS — **a stationary re-press the level latch would otherwise swallow** (Boot C, the
-    // operator: "clicks won't keep flowing — I have to move the mouse then click again").
+    // ARC D M1 — **THE RULE, AND IT IS THE WHOLE RULE: PRIMARY BIT SET IS A PRESS, CLEAR IS A
+    // RELEASE.** No latch, no edge re-derivation, no recovery arm.
     //
-    // `prev` is this router's own level latch, and it goes STALE the same way the HID `prev_buttons`
-    // latch did before CLICK-3. The trackpad is serviced at frame rate — orders of magnitude slower
-    // than its report interval — so a RELEASE that lands in the gap between two service passes is
-    // superseded by the pad's next level report and never reaches this seam. `prev` then stays
-    // primary-down for good, every subsequent stationary press fails the `mask & !prev` edge test
-    // below, and the click is dropped HERE, silently, with no `[clickroute]` line at all. Boot C's
-    // capture is the proof: 43 HID down-edges, 29 releases (14 polled-over), 31 routed presses.
+    // What this replaced was a second opinion about edges, taken against a copy of the mask this
+    // layer kept for itself — plus a `mask == prev` arm to recover from that copy going stale. Both
+    // existed because the PRODUCER could emit two presses inside one physical gesture (EHCI's
+    // quiet-gap arm manufacturing a press out of a drifting hold: boot 3, `recovered` 2 -> 19 across
+    // one spell of dragging). The producer is now the one place that decides, and it guarantees one
+    // press edge per gesture with a release always in front of it — synthesising that release when
+    // the wire lost it. A `Button` arriving here is therefore an EDGE already; re-deriving it could
+    // only ever disagree with the truth, and a stateless rule cannot go stale in the first place.
     //
-    // A wiggle "fixes" it only as a side effect: a motion report carries the button UP, which is what
-    // finally lets the HID release arm emit the missed `Button(0)` and clear this latch. That is the
-    // whole of the "move then click" workaround, and it is the symptom, not a second mechanism.
+    // A `Button` is pushed by a producer ONLY on a transition, so this is not "route every report":
+    // an unchanged held state produces no event to route.
     //
-    // The recovery is CLICK-3's, one layer up and on the identical contract: every pointer producer
-    // emits a `Button` ONLY on a genuine edge and de-dups a hold (EHCI's 120 ms quiet gate in
-    // `note_buttons`; xHCI on the down edge alone), so an identical PRIMARY-DOWN mask RE-REPORTED to
-    // this seam is a NEW press, never a hold. It is routed through the same press body — and
-    // `CLICK_PREV_MASK` is already `mask` from the swap above, so no consumer downstream ever sees the
-    // stale latch. A first press (`prev` primary-clear) still takes the ordinary edge test, and a
-    // multi-button change always moves the mask, so `mask == prev` isolates exactly the re-press.
-    let repress = mask & 0x01 != 0 && mask == prev;
-    if repress {
-        let n = CLICK_REPRESS_X86.fetch_add(1, Ordering::Relaxed) + 1;
-        if n <= CLICK_REPRESS_LOG_MAX_X86 {
-            serial_println!(
-                "[clickrepress] recovered stationary re-press mask={:#04x} at ({},{}) total={} == witness ::",
-                mask, x, y, n
-            );
-        }
-    }
-    if mask & !prev != 0 || repress {
-        // PRESS edge (or a recovered stationary re-press — see CLICK-REPRESS above).
+    // **A NARROWING, STATED RATHER THAN DISCOVERED.** EHCI keys its `Button` on the PRIMARY bit, so
+    // for the rMBP trackpad this reads exactly as before. `drivers/xhci` emits on ANY bit changing,
+    // so a SECONDARY-only press (mask `0x02`) used to satisfy `mask & !prev != 0` and take the press
+    // body — hit-tested, raising and focusing a window. It now takes the release arm. Deliberate:
+    // this router's whole vocabulary is the primary gesture (`CLICK_PRESS_TARGET` holds ONE
+    // outstanding press, the drag belt reads ONE level), and a secondary press was never a gesture
+    // it could describe. Nothing in-tree acts on a secondary button, and the release arm still
+    // DELIVERS the event to the focused ring when that is where the press went — what is withheld
+    // is only the raise/focus, which a right-click arguably should not have had.
+    if mask & 0x01 != 0 {
+        // PRESS.
         CLICK_PRESSES.fetch_add(1, Ordering::Relaxed);
         // CRYSTAL — **judged FIRST, ahead of the dock and every window arm.** The SHARD menu, when
         // open, is a modal dropdown composited on top of everything, so its press must be tested
@@ -6820,7 +6807,9 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
                 }
             }
         }
-    } else if prev & !mask != 0 {
+    } else {
+        // RELEASE (primary bit clear — see the rule at the top of this function).
+        //
         // WMDIRECT — a live drag ENDS on the release, and its FINAL position is applied here,
         // unthrottled. `wc_drag_motion`'s ~60 Hz admission is what keeps a trackpad sweep from
         // queueing more composites than the panel can retire, and its cost is that the last few
@@ -6856,9 +6845,6 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
         // received the press, not to whatever the pointer has since been dragged over.
         let target = CLICK_PRESS_TARGET.load(Ordering::Acquire);
         target == CLICK_TARGET_DROP || target != cur
-    } else {
-        // Unchanged mask (a re-report of a held button, or an idempotent second call): no edge.
-        false
     }
 }
 
@@ -7010,7 +6996,6 @@ pub fn clickroute_selftest() {
     // Leg 2/3 — focus on A, press over B. Delivered, not swallowed; the pair lands whole in B's ring.
     user_input_set_active(OWNER_A);
     wm::focus_changed(OWNER_A);
-    CLICK_PREV_MASK.store(0, Ordering::Relaxed);
     let press_consumed = wc_click_route_at(Event::Button(1), bpx, bpy);
     let raised_ok = user_input_active() == OWNER_B;
     let deliver_ok = !press_consumed && raised_ok && user_input_enqueue(Event::Button(1));
@@ -7070,7 +7055,6 @@ pub fn clickroute_selftest() {
     wm::close(wb);
     wm::close(wk);
     user_input_set_active(saved_focus);
-    CLICK_PREV_MASK.store(0, Ordering::Relaxed);
     CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
     wm::focus_reset();
 }
@@ -7149,7 +7133,10 @@ fn drain_and_route(max: usize) {
 /// of its own, routed the lift as if it were the edge, and then reset `CLICK_PREV_MASK` on the way
 /// out — so when the live drain finally reached the real `Button(0)` it saw no 1 -> 0 transition
 /// against that zeroed mask, took no release arm, and neither drained the pending count nor ended the
-/// gesture. A stranded drag then poisons whatever leg runs next.
+/// gesture. A stranded drag then poisons whatever leg runs next. (Historical: ARC D M1 removed that
+/// latch outright — the router now reads the primary bit and keeps no mask of its own — so this
+/// particular way of stranding a drag no longer exists. The wait is still needed, for the reason
+/// above it.)
 #[cfg(all(feature = "witness", feature = "wc"))]
 fn drain_until_drag_ends() {
     let start = crate::arch::ticks();
@@ -7300,7 +7287,6 @@ pub fn wmdirect_selftest() {
     // Leg 2 — the grab. Focus parked on the OTHER window, so this press must MOVE it.
     user_input_set_active(OWNER_O);
     wm::focus_changed(OWNER_O);
-    CLICK_PREV_MASK.store(0, Ordering::Relaxed);
     // DRAGREL — the fixture must publish the pointer LEVEL a real press publishes, or leg 3's motion
     // would reach a tail that reads "button up" and end the drag through the new belt instead of
     // through the release EVENT it exists to test. Two legs, two paths, each driven honestly.
@@ -7347,7 +7333,6 @@ pub fn wmdirect_selftest() {
             let (px, py) = ((i.x + 1) as i32, (i.y + 1) as i32);
             user_input_set_active(OWNER_O);
             wm::focus_changed(OWNER_O);
-            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
             let consumed = wc_click_route_at(Event::Button(1), px, py);
             wc_click_route_at(Event::Button(0), px, py);
             !consumed && wm::drag_active() == wm::WIN_NONE
@@ -7368,7 +7353,6 @@ pub fn wmdirect_selftest() {
             let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
             user_input_set_active(OWNER_O);
             wm::focus_changed(OWNER_O);
-            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
             // The press publishes the level the same way a real pad does; the grab itself is the
             // ordinary chrome arm.
             crate::pal::cursor::set_button_level(true);
@@ -7383,9 +7367,9 @@ pub fn wmdirect_selftest() {
             wc_route_tail(raw);
             let _ = routed;
             let ended = wm::drag_active() == wm::WIN_NONE;
-            // Leave the router's press tracker as it was found — the press above is still
-            // outstanding, and a phantom press would make the NEXT leg's release drop.
-            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+            // ARC D M1 — the leg used to have to zero the router's own mask latch here, because
+            // the press above is still outstanding and a stale latch would make the NEXT leg's
+            // release drop. The router keeps no latch any more, so there is nothing to restore.
             grabbed && ended
         }
         None => false,
@@ -7398,7 +7382,6 @@ pub fn wmdirect_selftest() {
             let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
             user_input_set_active(OWNER_O);
             wm::focus_changed(OWNER_O);
-            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
             crate::pal::cursor::set_button_level(true);
             let grabbed = wc_click_route_at(Event::Button(1), px, py) && wm::drag_active() == w;
             let consumed = wc_focus_key(Event::Key(b'\t'));
@@ -7406,7 +7389,6 @@ pub fn wmdirect_selftest() {
             // Swallow the TAB's release edge, then unwind this leg's own fixture state.
             let _ = wc_focus_key(Event::KeyUp(b'\t'));
             crate::pal::cursor::set_button_level(false);
-            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
             grabbed && consumed && ended
         }
         None => false,
@@ -7440,8 +7422,10 @@ pub fn wmdirect_selftest() {
     //  * `ended` — the gesture is over once the queue has been drained out (`drain_until_drag_ends`).
     //    Not independent (the belt would have ended it too, only later and elsewhere); it is `rest`
     //    that says WHERE. It does catch one real shape, and that shape has been seen: a release edge
-    //    left in the ring with `CLICK_PREV_MASK` already zeroed strands the drag for the rest of the
-    //    boot, which is how the pre-DRAGGLIDE leg flaked at trunk.
+    //    left in the ring with the router's own mask latch already zeroed strands the drag for the
+    //    rest of the boot, which is how the pre-DRAGGLIDE leg flaked at trunk. (ARC D M1 deleted that
+    //    latch; the conjunct is kept because a stranded drag is worth asserting against however it
+    //    comes about.)
     let settle_ok = match {
         // Re-place the row at the setup origin: eight legs have moved it, and this leg asserts an
         // EXACT resting coordinate, so it must start from a placement the panel is known to accept
@@ -7453,7 +7437,6 @@ pub fn wmdirect_selftest() {
             let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
             user_input_set_active(OWNER_O);
             wm::focus_changed(OWNER_O);
-            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
             // No edge in flight to begin with: the counter is global and a previous leg's routed
             // `Button(0)` (leg 3's, leg 4's) never went through `push_event`, so it could only be
             // left standing by a real HID release earlier in the boot. Cleared explicitly rather
@@ -7510,7 +7493,6 @@ pub fn wmdirect_selftest() {
                 let _ = wc_click_route_at(Event::Button(1), px, py);
             }
             if wm::drag_active() != w {
-                CLICK_PREV_MASK.store(0, Ordering::Relaxed);
                 let _ = wc_click_route_at(Event::Button(1), px, py);
             }
             let grabbed = wm::drag_active() == w;
@@ -7542,7 +7524,6 @@ pub fn wmdirect_selftest() {
             drain_until_drag_ends();
             let ended = wm::drag_active() == wm::WIN_NONE;
             let rest = wm::info(w).map(|r| (r.x, r.y)) == Some((i.x + 24, i.y + 24));
-            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
             // This gesture has exactly one queued motion and it is the LIFT, which the reorder puts
             // BEHIND the edge — so a clean run steers no lead motions at all. A nonzero count means
             // the lift was routed while the edge was still counted as queued, i.e. two routers
@@ -7598,7 +7579,6 @@ pub fn wmdirect_selftest() {
             let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
             user_input_set_active(OWNER_O);
             wm::focus_changed(OWNER_O);
-            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
             for _ in 0..8 {
                 if crate::pal::release_edge_pending() == 0 {
                     break;
@@ -7635,7 +7615,6 @@ pub fn wmdirect_selftest() {
                 let _ = wc_click_route_at(Event::Button(1), px, py);
             }
             if wm::drag_active() != w {
-                CLICK_PREV_MASK.store(0, Ordering::Relaxed);
                 let _ = wc_click_route_at(Event::Button(1), px, py);
             }
             let grabbed = wm::drag_active() == w;
@@ -7661,7 +7640,6 @@ pub fn wmdirect_selftest() {
             let ended = wm::drag_active() == wm::WIN_NONE;
             let rest = wm::info(w).map(|r| (r.x, r.y)) == Some((i.x + 12, i.y + 12));
             crate::pal::cursor::set_button_level(false);
-            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
             // Exactly ONE lead motion is the shape this leg drives: the +12, with the +24 lift
             // behind the edge. Two means the lift was routed as a lead as well — the two-router
             // interleave described on `DRAG_LAST_LEAD` — and the run cannot judge the kernel.
@@ -7729,7 +7707,6 @@ pub fn wmdirect_selftest() {
             let (zx, zy) = disc_centre(b);
             user_input_set_active(OWNER_O);
             wm::focus_changed(OWNER_O);
-            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
             let c1 = wc_click_route_at(Event::Button(1), zx, zy);
             match (wm::info(w), wm::control_disc_rect(w, wm::Ctrl::Zoom)) {
                 (Some(g1), Some(b2)) => {
@@ -7741,7 +7718,6 @@ pub fn wmdirect_selftest() {
                     if wm::hit_test(zx2, zy2).map(|(id, _, _)| id) != Some(w) {
                         Some(false)
                     } else {
-                        CLICK_PREV_MASK.store(0, Ordering::Relaxed);
                         let c2 = wc_click_route_at(Event::Button(1), zx2, zy2);
                         let back = wm::info(w)
                             .map(|g2| (g2.x, g2.y, g2.scale) == (g0.x, g0.y, g0.scale))
@@ -7767,7 +7743,6 @@ pub fn wmdirect_selftest() {
             let (mx, my) = disc_centre(b);
             user_input_set_active(OWNER_D);
             wm::focus_changed(OWNER_D);
-            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
             let consumed = wc_click_route_at(Event::Button(1), mx, my);
             let alive = wm::info(w).is_some();
             let parked = wm::info(w).map(|g| g.z <= wm::shell_z()).unwrap_or(false);
@@ -7788,7 +7763,6 @@ pub fn wmdirect_selftest() {
     let dragdead_ok = match wm::info(w) {
         Some(i) => {
             let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
-            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
             let grabbed = wc_click_route_at(Event::Button(1), px, py) && wm::drag_active() == w;
             wm::close(w);
             grabbed && wm::drag_active() == wm::WIN_NONE
@@ -7826,7 +7800,6 @@ pub fn wmdirect_selftest() {
                     } else {
                         user_input_set_active(OWNER_O);
                         wm::focus_changed(OWNER_O);
-                        CLICK_PREV_MASK.store(0, Ordering::Relaxed);
                         let consumed = wc_click_route_at(Event::Button(1), px, py);
                         Some(
                             consumed
@@ -7888,7 +7861,6 @@ pub fn wmdirect_selftest() {
     wm::close(wc);
     wm::close(wo);
     user_input_set_active(saved_focus);
-    CLICK_PREV_MASK.store(0, Ordering::Relaxed);
     CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
     wm::focus_reset();
 }
