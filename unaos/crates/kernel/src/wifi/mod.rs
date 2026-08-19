@@ -64,11 +64,11 @@
 // one costs the credibility of every other claim in the subsystem.
 //
 // Where a fact could not be pinned from a source legal for THIS implementer it is named UNKNOWN in
-// the comments and reported by a witness rather than assumed by the code. Two such facts stand: the
-// firmware container header layout, on which `bcm4331.md` §S4's own record is internally inconsistent
-// (`firmware::classify_header` reports it instead of resolving it), and the `B43_SHM_UCODE` routing
-// value, which no source available to this module records at all and on which arc 2's upload rung
-// refuses.
+// the comments and reported by a witness rather than assumed by the code. One such fact stands: the
+// `B43_SHM_UCODE` routing value, which no source available to this module records at all and on
+// which arc 2's upload rung refuses. The container header layout (W3) WAS such a fact and is now
+// ANSWERED on metal — rmbp1-boot1; `firmware.rs`'s module note carries the answer and its
+// provenance (hypothesis-falsification against the bench set's own bytes, no driver source read).
 //
 // ## Knob and arch gate
 // `UNAOS_WIFI=1` arms the `wifi` Cargo feature. Default OFF => this module and its call sites vanish

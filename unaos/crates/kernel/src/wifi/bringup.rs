@@ -1333,12 +1333,12 @@ fn upload_gate(macctl: u32, w: &Writes) {
 
     // Gate 2 — WIFI-SETVAL: the set is on the media; validate ALL of it before anything else is
     // even discussed. A hard park here outranks the routing refusal below on purpose: the day the
-    // routing IS pinned, this gate is most of what stands between a corrupt or misclassified set and a
-    // stream into the core — with one named residual it cannot see: a layout-A set whose files are
-    // all truncated/corrupted IDENTICALLY in their trailing bytes classifies as a valid layout-B set
-    // (no Group-A-legal magic exists to catch it; that is W3/W5's honesty). The §S4 handshake — the
-    // UCODEREV echo after upload — is the backstop that catches what this dry-run cannot. It is
-    // stream into the core — never a blind push of unvalidated bytes.
+    // routing IS pinned, this gate is most of what stands between a corrupt or misclassified set and
+    // a stream into the core — with one named residual it cannot see: a corruption that preserves
+    // the type byte, the declared size AND the shape rule (whole words, or a count-matching record
+    // walk) passes; the FNV digest reports it only across boots, never against ground truth. The
+    // §S4 handshake — the UCODEREV echo after upload — is the backstop that catches what this
+    // dry-run cannot. It is stream into the core — never a blind push of unvalidated bytes.
     if !validate_set() {
         serial_println!(
             ":: wifi2: upload REFUSED reason=set-validation-failed — HARD PARK: no byte of an unvalidated or ambiguous set is ever streamed at the core, whatever the routing turns out to be, and the §S4 PROLOGUE (the reset that destroys the resident microcode) is skipped with it. The fix is on the media: re-extract the set with b43-fwcutter and re-stage the stick (see wifi_bcma.md, \"The bench round\") ::"
@@ -1364,23 +1364,19 @@ fn upload_gate(macctl: u32, w: &Writes) {
 /// role, one cross-set line, one verdict line. Returns whether arc 3's upload may ever consume this
 /// set.
 ///
-/// What is REQUIRED (a hard park on failure) is what `bcm4331.md` §S4 pins, plus one
-/// inference argued here (cross-file layout uniformity — one extraction produces one container;
-/// §S4 itself pins only the header record and the be32-word rule):
+/// W3 was ANSWERED on metal (rmbp1-boot1; `firmware.rs` module note carries the evidence and the
+/// provenance), and the REQUIRED rules are now per-role, replacing the refuted cross-file
+/// layout-uniformity rule — the microcode and the initvals legitimately carry DIFFERENT payload
+/// shapes under the one 8-byte container, and "uniform" is exactly the reading the 178-byte
+/// bsinitvals file falsified:
 ///
-///   * every file's header satisfies one of `classify_header`'s two self-consistent candidate
-///     layouts — a file satisfying NEITHER cannot carry a whole-be32-word payload under any reading
-///     of §S4's (internally inconsistent) header record;
-///   * every file's payload is a whole number of big-endian 32-bit words under its layout — §S4:
-///     "the payload is a stream of big-endian 32-bit words";
-///   * all three files satisfy the SAME layout. The payload offset arc 3 feeds from is a function
-///     of the layout, and one extraction produces one container format — a set whose files disagree
-///     about their own container is corrupt, mixed from two extractions, or misclassified, and
-///     every one of those parks.
+///   * the ucode is a word-stream (`hdr=words`): declared size == payload bytes, whole be32 words;
+///   * both initvals are record-streams (`hdr=records`): a clean record walk whose count equals the
+///     declared size — verified by walking, never by arithmetic alone;
+///   * `stream_ok` carries each rule's verdict, computed by the one `classify_header`.
 ///
-/// What is ADVISORY (reported, never gated on) is every relation whose expected value no source
-/// legal for this module records: the type bytes and version bytes. They are printed so the first
-/// boot with the real set PINS them — the same metal-probe posture as W3 itself.
+/// ADVISORY (reported, never gated on): the version bytes. Observed ver=0x01 on all three (metal),
+/// but no legal source pins what other extractions produce, so it stays a report.
 fn validate_set() -> bool {
     let hs = super::firmware::set_headers();
     let want = super::firmware::FW_SET_LEN;
@@ -1394,38 +1390,33 @@ fn validate_set() -> bool {
 
     let mut all_ok = true;
     for h in &hs {
-        let recognized = h.layout == "A" || h.layout == "B";
-        let payload_off: usize = match h.layout {
-            "A" => 8,
-            "B" => 4,
-            _ => 0,
+        let want_layout = match h.role {
+            "ucode" => "words",
+            _ => "records",
         };
-        let ok = recognized && h.words_ok;
+        let ok = h.layout == want_layout && h.stream_ok;
         all_ok &= ok;
         serial_println!(
-            ":: wifi2: set-validate {} bytes={} fnv1a={:#010x} hdr={} type={:#04x} ver={:#04x} declared={} payload-offset={} payload-bytes={} be32-words={} words-whole={} => {} — dry-run, NO device access; this is the exact stream arc 3 would push for this role ::",
-            h.role, h.len, h.digest, h.layout, h.kind, h.ver, h.declared, payload_off,
-            h.len.saturating_sub(payload_off), h.len.saturating_sub(payload_off) / 4,
-            h.words_ok as u8, if ok { "VALID" } else { "INVALID" },
+            ":: wifi2: set-validate {} bytes={} fnv1a={:#010x} hdr={} want={} type={:#04x} ver={:#04x} declared={} records={} payload-bytes={} stream-ok={} => {} — dry-run, NO device access; this is the exact stream arc 3 would push for this role ::",
+            h.role, h.len, h.digest, h.layout, want_layout, h.kind, h.ver, h.declared, h.records,
+            h.len.saturating_sub(8), h.stream_ok as u8, if ok { "VALID" } else { "INVALID" },
         );
     }
 
-    let uniform = hs.iter().all(|h| h.layout == hs[0].layout);
-    all_ok &= uniform;
     if let (Some(uc), Some(iv), Some(bs)) = (
         hs.iter().find(|h| h.role == "ucode"),
         hs.iter().find(|h| h.role == "initvals"),
         hs.iter().find(|h| h.role == "bsinitvals"),
     ) {
         serial_println!(
-            ":: wifi2: set-validate cross layout-uniform={} (REQUIRED — one extraction produces one container format, and the payload offset is a function of the layout) type(initvals)==type(bsinitvals)={} type(ucode)!=type(initvals)={} ver-uniform={} (ADVISORY — no source legal for this module pins the expected type/ver values; the observed relations are reported so the first boot with the real set pins them, and nothing is gated on them) ::",
-            uniform as u8, (iv.kind == bs.kind) as u8, (uc.kind != iv.kind) as u8,
+            ":: wifi2: set-validate cross type(initvals)==type(bsinitvals)={} type(ucode)!=type(initvals)={} ver-uniform={} (ADVISORY — the type rules are REQUIRED per-role above; ver is reported, not gated) ::",
+            (iv.kind == bs.kind) as u8, (uc.kind != iv.kind) as u8,
             (uc.ver == iv.ver && iv.ver == bs.ver) as u8,
         );
     }
 
     serial_println!(
-        ":: wifi2: set-validation verdict={} — W3 (bcm4331.md §S4's internally-inconsistent header record) now gets THREE independent hdr= verdicts above, one per file, all from the one classify_header; arc 3's upload is GATED on this verdict — a VALID here is its precondition, never its permission ::",
+        ":: wifi2: set-validation verdict={} — W3 is ANSWERED (rmbp1-boot1): one 8-byte container, size=bytes for the ucode word-stream, size=RECORD-COUNT for the initvals record-streams; arc 3's upload is GATED on this verdict — a VALID here is its precondition, never its permission ::",
         if all_ok { "VALID" } else { "INVALID" }
     );
     all_ok
