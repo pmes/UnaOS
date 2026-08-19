@@ -309,6 +309,243 @@ pub fn jb6_csb_sweep() {
     w(0x9c, 0);
 }
 
+// ---------------------------------------------------------------------------------------------
+// JB11 — the Falcon FIRMWARE-HEADER CENSUS: a blob-free identity readout that doubles as a
+// CRCR-wall witness. Always-on in the tegra build; read-only but for one documented IOCTL write.
+//
+// WHY THIS EXISTS. XUSBFW (the reload scaffold below) is permanently STOPped on the blob route:
+// the only T234 XUSB firmware NVIDIA ships is a signed nested container (NVGI -> RFFS -> RFRD)
+// we will not reverse-engineer, and NO raw-format image exists for this SoC — mainline's
+// xhci-tegra requests `nvidia/tegra{124,186,194,210}/xusb.bin` and has no tegra234 entry at all,
+// because `tegra234_soc` carries no `.firmware` member. What mainline does instead on t234 is
+// exactly what this census does: `tegra_xusb_init_ifr_firmware()` waits for USBSTS.CNR to clear
+// and then READS THE RUNNING FALCON'S OWN HEADER over BAR2. MB2/UEFI loads the Falcon from the
+// xusb-fw partition and Linux merely inherits it — as do we. So the firmware's identity is
+// reachable with zero blob, zero reverse engineering, and zero risky write.
+//
+// MECHANISM (public GPL, from drivers/usb/host/xhci-tegra.c — free to reimplement):
+//   write (FW_IOCTL_CFGTBL_READ << FW_IOCTL_TYPE_SHIFT) | byte_off -> BAR2 + XUSB_BAR2_ARU_FW_SCRATCH
+//   read                                                              BAR2 + XUSB_BAR2_ARU_SMI_ARU_FW_SCRATCH_DATA0
+// The header is 256 bytes; valid offsets 0x00..=0xFC. The field offsets below are the public
+// `struct tegra_xusb_fw_header` order.
+//
+// WHY THE ONE WRITE CANNOT DISTURB INHERITED CONTROLLER STATE (the no-HCRST / JB9d-GUARD law).
+// It targets XUSB_BAR2_ARU_FW_SCRATCH — the firmware's own IOCTL *request* register inside the ARU
+// window at XUSB_BAR2 (0x0365_0000). That is not an xHCI register: CRCR, USBCMD, USBSTS, DCBAAP,
+// ERSTBA/ERDP and the doorbell array all live in the SEPARATE host aperture at XUSB_HOST
+// (0x0361_0000), which this function only ever READS (the CNR poll). There is therefore no path by
+// which the scratch write can move the controller's run state, its command-ring pointer, or ring a
+// doorbell — "never write CRCR at RS=1" is not merely obeyed here, it is unreachable. Production
+// Linux issues this exact write on every t234 boot against a live inherited Falcon. It is also NOT
+// the CSB (page-select 0x9c -> window 0x2000, the JB6 aperture) and NOT the FPCI/CFG CSB
+// (EL3-FATAL on this block — JB7); it is the first-page ARU range JB6/JB8 proved decodes cleanly.
+//
+// ALL-ONES IS A RESULT, NOT A FAILURE. If the reads come back 0xffffffff the Falcon is in exactly
+// the state JB9d-GUARD already gates on, and this census converts that into a positive
+// experimental verdict — obtained with zero risky writes — instead of an absence of evidence.
+//
+// GATING: ALWAYS-ON in the tegra build, deliberately NOT behind the `xusbfw` feature.
+//   * `xusbfw` is the wrong home. That feature exists to arm a DESTRUCTIVE path (STEP 0 is a BPMP
+//     Falcon reset) and it is mutually exclusive with the shipped JB9G_NO_HCRST inherit recipe —
+//     `reload_entry` returns `InheritActive` and bails BEFORE it ever reaches the aperture. A
+//     census parked there would therefore never run on any boot we actually ship. It also needs a
+//     bench-only blob path to be interesting at all, while this census needs nothing.
+//   * The precedent is JB5/JB6: this block is already censused unconditionally on every tegra boot
+//     (`jb5_witness` reads USBSTS + CPUCTL, `jb6_csb_sweep` sweeps the ARU/CSB) and JB9-A's
+//     header half is the same ioctl — only fossilised behind `JB9_PROBE = false`. JB11 is that
+//     half promoted to always-on and made decisive.
+//   * The cost is bounded and small: one CNR poll bounded at ~200 ms (expected to exit on the
+//     first read on the inherit path, where the controller is cleanly halted and never reset), plus
+//     14 header dwords = 28 MMIO accesses. No allocation, no DMA, no wait that can outlive its
+//     deadline.
+//   * The value is per-boot: every Orin boot now answers "is the inherited Falcon answering?"
+//     with a machine-checkable verdict line, which is the standing question behind the whole
+//     JB9/JETSON-XCARVE wall investigation.
+// Non-tegra builds are untouched: the whole module is `#[cfg(feature = "tegra")]`.
+// ---------------------------------------------------------------------------------------------
+
+/// BAR2 offset of the firmware IOCTL request register (`XUSB_BAR2_ARU_FW_SCRATCH`).
+const JB11_ARU_FW_SCRATCH: u64 = 0x1000;
+/// BAR2 offset of the firmware IOCTL result register (`XUSB_BAR2_ARU_SMI_ARU_FW_SCRATCH_DATA0`).
+const JB11_ARU_FW_SCRATCH_DATA0: u64 = 0x01c;
+/// `FW_IOCTL_TYPE_SHIFT` / `FW_IOCTL_CFGTBL_READ` — the config-table read opcode.
+const JB11_IOCTL_TYPE_SHIFT: u32 = 24;
+const JB11_IOCTL_CFGTBL_READ: u32 = 17;
+
+/// One header dword by byte offset (`0x00..=0xFC`). Write the ioctl request, read the result.
+/// Device-nGnRE ordering on the BAR2 aperture is non-reordering, so the read cannot pass the
+/// write; this is the same two-access sequence JB8 proved answers on this silicon.
+fn jb11_hdr_dword(off: u32) -> u32 {
+    unsafe {
+        core::ptr::write_volatile(
+            (XUSB_BAR2 + JB11_ARU_FW_SCRATCH) as *mut u32,
+            (JB11_IOCTL_CFGTBL_READ << JB11_IOCTL_TYPE_SHIFT) | (off & 0xff),
+        );
+        core::ptr::read_volatile((XUSB_BAR2 + JB11_ARU_FW_SCRATCH_DATA0) as *const u32)
+    }
+}
+
+/// Decode a 32-bit UNIX epoch to (y, m, d, hh, mm, ss) UTC. Howard Hinnant's `civil_from_days`,
+/// integer-only and positive-only (a u32 epoch is always >= 1970-01-01), so it is a handful of
+/// divisions — cheap enough to run inline in a boot census.
+fn jb11_utc(epoch: u32) -> (u64, u64, u64, u64, u64, u64) {
+    let (days, rem) = (epoch as u64 / 86_400, epoch as u64 % 86_400);
+    let z = days + 719_468; // days from 0000-03-01 to 1970-01-01
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + u64::from(m <= 2);
+    (y, m, d, rem / 3600, (rem % 3600) / 60, rem % 60)
+}
+
+/// JB11: read the resident Falcon's firmware header over BAR2 and witness what it says — or
+/// witness that it says nothing, which is the CRCR-wall confirmation. See the block comment above
+/// for the mechanism, the write-safety argument, and the always-on gating decision.
+///
+/// Preconditions are physical and self-checked: the XUSB partition must be ON (the call site is
+/// inside `jb5_pg_on`'s proof — the JX1 gated-block rule) and BAR2 must be routed (`jb5_bar2_route`;
+/// re-checked here via `jb9_bar2_routed`). Everything else is a bounded read.
+pub fn jb11_fw_header_census(tag: &str) {
+    // Public `struct tegra_xusb_fw_header` byte offsets.
+    const H_BOOT_CODETAG: u32 = 0x08;
+    const H_BOOT_CODESIZE: u32 = 0x0c;
+    const H_RODATA_IMG_OFFSET: u32 = 0x18;
+    const H_FWIMG_CKSUM: u32 = 0x28;
+    const H_FWIMG_CREATED_TIME: u32 = 0x2c;
+    const H_L2_IMEM_START: u32 = 0x40;
+    const H_L2_IMEM_END: u32 = 0x44;
+    const H_VERSION_ID: u32 = 0x48;
+    const H_FWIMG_LEN: u32 = 0x64;
+    const H_MAGIC: u32 = 0x68;
+
+    // JX1 discipline: name the access class BEFORE the first touch, so a boot that dies here has a
+    // last serial line that names the killer aperture.
+    serial_println!(
+        ":: tegra: JB11 [{}] — Falcon fw-header census: BAR2+{:#05x} (IOCTL_CFGTBL_READ) -> BAR2+{:#05x}; no xHCI operational register is written ::",
+        tag, JB11_ARU_FW_SCRATCH, JB11_ARU_FW_SCRATCH_DATA0
+    );
+    if !jb9_bar2_routed() {
+        serial_println!(":: tegra: JB11 [{}] — BAR2 unrouted; census SKIPPED (guard) ::", tag);
+        return;
+    }
+    let cap0 = unsafe { core::ptr::read_volatile(XUSB_HOST as *const u32) };
+    if cap0 == 0 || cap0 == 0xFFFF_FFFF {
+        serial_println!(
+            ":: tegra: JB11 [{}] — cap0={:#010x} (host block not alive); census SKIPPED ::",
+            tag, cap0
+        );
+        return;
+    }
+
+    // Mirror mainline: wait for USBSTS.CNR (bit 11) to clear before trusting header reads. No CNR
+    // wait exists at this point in our boot order — the shared driver's `wait_for_cnr_clear` runs
+    // inside `xhci::init`/`init_interrupter`, far downstream, and on the JB9G_NO_HCRST inherit path
+    // `xhci::init` is never called at all — so this is the bounded one mainline's IFR path uses
+    // (~200 ms). Pure reads of the host aperture; expected to exit on the first poll on an inherit
+    // boot (the controller is cleanly halted by UEFI, never reset).
+    let usbsts_a = XUSB_HOST + (cap0 & 0xff) as u64 + 0x04;
+    let t0 = cntpct();
+    let deadline = t0.wrapping_add(cntfrq() / 5);
+    let mut usbsts = unsafe { core::ptr::read_volatile(usbsts_a as *const u32) };
+    let mut polls = 1u32;
+    while (usbsts >> 11) & 1 == 1 {
+        if cntpct().wrapping_sub(deadline) < (1u64 << 63) {
+            break; // deadline passed (wrap-safe)
+        }
+        core::hint::spin_loop();
+        usbsts = unsafe { core::ptr::read_volatile(usbsts_a as *const u32) };
+        polls += 1;
+    }
+    let cnr = (usbsts >> 11) & 1;
+    let waited_us = cntpct().wrapping_sub(t0).saturating_mul(1_000_000) / cntfrq();
+    serial_println!(
+        ":: tegra: JB11 [{}] — CNR gate: USBSTS={:#010x} CNR={} after {} poll(s) / ~{} us — {} ::",
+        tag, usbsts, cnr, polls, waited_us,
+        if cnr == 0 {
+            "READY (mainline waits for exactly this before reading the header)"
+        } else {
+            "STILL SET at the ~200 ms bound — the reads below are UNTRUSTED, witnessed anyway"
+        }
+    );
+
+    // The header. 14 dwords, one ioctl round trip each.
+    let codetag = jb11_hdr_dword(H_BOOT_CODETAG);
+    let codesize = jb11_hdr_dword(H_BOOT_CODESIZE);
+    let rodata_off = jb11_hdr_dword(H_RODATA_IMG_OFFSET);
+    let cksum = jb11_hdr_dword(H_FWIMG_CKSUM);
+    let created = jb11_hdr_dword(H_FWIMG_CREATED_TIME);
+    let imem_start = jb11_hdr_dword(H_L2_IMEM_START);
+    let imem_end = jb11_hdr_dword(H_L2_IMEM_END);
+    let version_id = jb11_hdr_dword(H_VERSION_ID);
+    let fwimg_len = jb11_hdr_dword(H_FWIMG_LEN);
+    let magic0 = jb11_hdr_dword(H_MAGIC);
+    let magic1 = jb11_hdr_dword(H_MAGIC + 4);
+
+    // The wall signature: EVERY anchor dword all-ones. That is the JB9d-GUARD state, and naming it
+    // from the header path is a genuine verdict, not a failed read.
+    let walled = [codetag, codesize, version_id, magic0, magic1]
+        .iter()
+        .all(|&v| v == 0xFFFF_FFFF);
+    // The JB8 liveness anchor: a served header has a sane boot_codesize.
+    let served = codesize != 0 && codesize != 0xFFFF_FFFF;
+
+    if walled {
+        serial_println!(
+            ":: tegra: JB11 [{}] — raw: codetag={:#010x} codesize={:#010x} version_id={:#010x} magic={:#010x}{:08x} ::",
+            tag, codetag, codesize, version_id, magic1, magic0
+        );
+        serial_println!(
+            ":: tegra: JB11 [{}] — verdict: Falcon not answering — inherited-state wall CONFIRMED from the header path (all-ones on every anchor dword; obtained with zero risky writes) ::",
+            tag
+        );
+        return;
+    }
+    if !served {
+        serial_println!(
+            ":: tegra: JB11 [{}] — raw: codetag={:#010x} codesize={:#010x} version_id={:#010x} created={:#010x} magic={:#010x}{:08x} ::",
+            tag, codetag, codesize, version_id, created, magic1, magic0
+        );
+        serial_println!(
+            ":: tegra: JB11 [{}] — verdict: header UNSERVED but NOT all-ones — the ARU aperture decodes and the Falcon returns no config table; INCONCLUSIVE (not the wall signature) ::",
+            tag
+        );
+        return;
+    }
+
+    // A live Falcon. Decode what it reports.
+    let mb = [
+        magic0 as u8, (magic0 >> 8) as u8, (magic0 >> 16) as u8, (magic0 >> 24) as u8,
+        magic1 as u8, (magic1 >> 8) as u8, (magic1 >> 16) as u8, (magic1 >> 24) as u8,
+    ];
+    let pr = |b: u8| if (0x20..=0x7e).contains(&b) { b as char } else { '.' };
+    let (yy, mo, dd, hh, mi, ss) = jb11_utc(created);
+    serial_println!(
+        ":: tegra: JB11 [{}] — fw ident: magic=\"{}{}{}{}{}{}{}{}\" ({:#010x}{:08x}) version_id={:#010x} (Version: {:2x}.{:02x}) ::",
+        tag, pr(mb[0]), pr(mb[1]), pr(mb[2]), pr(mb[3]), pr(mb[4]), pr(mb[5]), pr(mb[6]), pr(mb[7]),
+        magic1, magic0, version_id, (version_id >> 24) & 0xff, (version_id >> 16) & 0xff
+    );
+    serial_println!(
+        ":: tegra: JB11 [{}] — fw built: created={} (epoch) = {}-{:02}-{:02}T{:02}:{:02}:{:02}Z UTC ::",
+        tag, created, yy, mo, dd, hh, mi, ss
+    );
+    serial_println!(
+        ":: tegra: JB11 [{}] — fw image: boot_codetag={:#010x} boot_codesize={} B rodata_img_offset={:#010x} fwimg_len={} B cksum={:#010x} ::",
+        tag, codetag, codesize, rodata_off, fwimg_len, cksum
+    );
+    serial_println!(
+        ":: tegra: JB11 [{}] — fw L2 IMEM: start={:#010x} end={:#010x} (span={} B) ::",
+        tag, imem_start, imem_end, imem_end.wrapping_sub(imem_start)
+    );
+    serial_println!(
+        ":: tegra: JB11 [{}] — verdict: Falcon ANSWERING — the resident firmware served its own header over BAR2; no inherited-state wall on the header path ::",
+        tag
+    );
+}
+
 // JB7 (arc A) — RETIRED: the alternate FPCI/CFG CSB cross-read is EL3-FATAL on the inherited halted
 // block. It was meant to disambiguate dead-core vs BAR2-aperture by reading CPUCTL through
 // `UsbFalconLib.c::FalconMapReg`'s else-branch (page-select @ XUSB_FPCI+0x41c, data window @
