@@ -9179,6 +9179,17 @@ static C2_DMG_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 /// area of. Never used as a denominator; it exists so the line can be read against itself.
 #[cfg(feature = "witness")]
 static C2_BOX_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DMGOVLP — CUMULATIVE shadows of [`C2_DMG_PX`]/[`C2_BOX_PX`], charged beside them in
+/// [`draw_window`] and NEVER drained. `comp2_emit` SWAPS the pair above to zero on its own rollup
+/// cadence, so a fixture that read those for a before/after delta would be racing the rollup for
+/// its own numbers and could read a truncated interval on a healthy kernel. These two only ever
+/// grow; a delta across them is a claim about the interval and nothing else. Read exclusively by
+/// [`dmgovlp_selftest`] (x86); on aarch64 they are written and never read, the same lifecycle every
+/// per-slot WCN counter already has there, and with the `witness` knob off neither exists at all.
+#[cfg(feature = "witness")]
+static C2_DMG_PX_TOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static C2_BOX_PX_TOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// COMP2-WCD — cycles spent inside [`verify_window`] this span: the WC-D witness's glass read-back
 /// (both passes), its attribution walks, its repair redraw and its verdict UART, charged by a drop
 /// guard so every exit path pays. Printed as `wcd_us=`, a TOTAL for the span like `straddle_us`
@@ -9849,10 +9860,34 @@ fn wcn_note_drawn(id: WinId, dragged: bool) {
 /// side. The pair is what makes the census two-sided — a window can read a large `drg` (it is
 /// expensive to OTHERS' presents) or a large `dout` (others are expensive to ITS presents), and the
 /// two are different defects with different fixes. Nothing in the census forces them to agree.
+/// DMGOVLP — cumulative machine-wide shadows of the per-slot drag/relay census, charged at the top
+/// of [`wcn_note_dragout`]/[`wcn_note_relay`] BEFORE the `wcn_slot` lookup, so a fixture window
+/// that never earns a census slot still charges them. Two properties the per-slot counters cannot
+/// offer a fixture:
+///  * `OVLP_DRAG_PX` is RAW pixels, not `px / 1024` — a banded 8-px sliver drag rounds to ZERO
+///    kilopixels, so `dkpx` (and therefore `[wcn] dkpx=`) is structurally blind to exactly the
+///    slivers the DMGOVLP leg exists to force. Never assert `dkpx > 0` for a sliver.
+///  * They are never drained: the WCN rollup swaps its slots on its own cadence, and a fixture
+///    reading swap-drained counters races the rollup for its own numbers (the C2_*_TOT argument).
+#[cfg(feature = "witness")]
+static OVLP_DRAG_EVT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DMGOVLP — raw pixels the occlusion closure's promotions billed (see [`OVLP_DRAG_EVT`]).
+#[cfg(feature = "witness")]
+static OVLP_DRAG_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DMGOVLP — relay events: forwarded damage adding a higher-z window (see [`OVLP_DRAG_EVT`]).
+#[cfg(feature = "witness")]
+static OVLP_RELAY_EVT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 #[cfg(feature = "witness")]
 fn wcn_note_dragout(id: WinId, px: u64, added: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    // DMGOVLP — unconditional and first: the shadow census must see every promotion, including one
+    // charged to a row the per-slot table declined.
+    if added {
+        OVLP_DRAG_EVT.fetch_add(1, Relaxed);
+    }
+    OVLP_DRAG_PX.fetch_add(px, Relaxed);
     if let Some(s) = wcn_slot(id) {
-        use core::sync::atomic::Ordering::Relaxed;
         if added {
             s.dout.fetch_add(1, Relaxed);
         }
@@ -9864,6 +9899,8 @@ fn wcn_note_dragout(id: WinId, px: u64, added: bool) {
 /// to the pass. The chain's middle, kept out of `dout` so the chain's FOOT stays identifiable.
 #[cfg(feature = "witness")]
 fn wcn_note_relay(id: WinId) {
+    // DMGOVLP — unconditional shadow, before the slot lookup (see [`OVLP_DRAG_EVT`]).
+    OVLP_RELAY_EVT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if let Some(s) = wcn_slot(id) {
         s.drly
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -14792,6 +14829,11 @@ fn draw_window(
         C2_BYTES.fetch_add((wrote * info.bytes_per_pixel) as u64, Relaxed);
         C2_DMG_PX.fetch_add(wrote as u64, Relaxed);
         C2_BOX_PX.fetch_add((bw * bh) as u64, Relaxed);
+        // DMGOVLP — the cumulative shadows, charged from the SAME two expressions so the fixture's
+        // deltas and `[comp2]`'s spans can never disagree about what a call painted. See the
+        // statics for why the fixture cannot read the swap-drained pair above.
+        C2_DMG_PX_TOT.fetch_add(wrote as u64, Relaxed);
+        C2_BOX_PX_TOT.fetch_add((bw * bh) as u64, Relaxed);
         crate::arch::now_cycles()
     };
     if y1 > y0 {
@@ -19048,4 +19090,362 @@ pub fn ctrldecline_selftest() {
         );
     }
     repaint();
+}
+
+// =============================================================================================
+// DMGOVLP — the overlap-forcing QEMU leg, with the pointer ON the stack.
+//
+// DMG-DISJOINT landed a banded damage closure, was reverted after boot 7's composite storm, and
+// re-landed with the CURSTICK widening. Boot 8 (metal) then wedged inside `draw_window` under six
+// OVERLAPPING windows with the sprite parked on the stack — and the QEMU gate had no leg that
+// could see either failure class, because no fixture ever drives banded presents through
+// overlapping rows, let alone under a live cursor plan. This fixture is that leg. Two claims:
+//
+//  * **The closure narrows.** A banded seed under an overlapping neighbour drags a SLIVER, not a
+//    whole box: cumulatively, painted pixels stay strictly under whole-box pixels on a banded
+//    pass. Regressing to whole-box promotion (the fat leg) flips `narrow=` low.
+//  * **The damage set DRAINS.** After a present (and its composite), one extra `composite()` adds
+//    ZERO painted pixels within K=3 tries. The boot-7/boot-8 storm class — a cursor `Repaint` tail
+//    re-damaging the pointer stack after the pass's snapshot cleared it, every pass re-arming the
+//    next — cannot satisfy this: it reads DRAIN-STUCK (or trips the 1000 ms WEDGE wire) instead.
+//
+// Appended at the END of the file, after `focus_reset`, on that function's own argument: every
+// definition here is `witness`-gated, and appending keeps the knob-off artifact byte-identical on
+// both targets (`core::panic::Location` renumbering — see `focus_reset`'s doc block).
+// `ctrldecline_selftest` already extended the tail the same way.
+
+/// DMGOVLP — the fixture. See the module tail note above for what it asserts and why it exists.
+///
+/// ### Fixture shape
+/// Six kernel-band rows (`KERNEL_OWNER_BASE + 0x40..=0x45` — pace-exempt, never VUGMIN-hidden,
+/// [`above_shell`]-exempt; the x86 ladder never runs `ctrldecline_selftest`, the one other tenant
+/// of `+0x40`, and that fixture reaps its row regardless) against the shared [`HT_SURF`], pinned
+/// at scale 1 via [`move_to`] so the disjoint tiler can never re-place them:
+///
+///  * **CHAIN** `w0-w2`: three boxes in a row, each overlapping its neighbour by an 8-px sliver,
+///    with `w0 ∩ w2 = ∅` — so damage seeded at `w0` can only reach `w2` through `w1`, and the
+///    RELAY arm of the closure (`wcn_note_relay`) must fire or `w2` goes stale.
+///  * **STAIRCASE** `w3-w5`: three boxes at quarter-box offsets, sharing a common three-way
+///    overlap region. The real sprite is parked at that region's centre (`pal::cursor::set_abs`
+///    + `cursor::ensure_drawn`, the `wmdirect_selftest` pointer idiom), so every pass runs the
+///    CURSOR-3 overlay-offer path over banded overlapping rows — CURSTICK's exact territory.
+///
+/// The two groups are vertically disjoint, so the chain's claims stay clean of the sprite's.
+///
+/// ### Drive
+/// M=12 passes cycling (A) a banded seed at the chain FOOT (`present_rows(w0, 0..2)`), (B) a
+/// banded seed under the three-way stack (`present_rows(w3, 0..2)`), (C) a whole present of the
+/// stack's TOP (`present(w5)`). The sprite is re-touched before every pass (`set_abs` at the same
+/// point) so `pal::cursor::visible()`'s 1.5 s auto-hide cannot silently disarm the cursor leg
+/// mid-battery.
+///
+/// ### What is measured, and what is deliberately NOT
+/// All counters are CUMULATIVE shadows read as before/after deltas — [`C2_DMG_PX_TOT`]/
+/// [`C2_BOX_PX_TOT`] beside `draw_window`'s swap-drained pair, [`OVLP_DRAG_EVT`]/[`OVLP_DRAG_PX`]
+/// (RAW pixels)/[`OVLP_RELAY_EVT`] beside the per-slot census, and the never-drained
+/// [`CUR3_ADOPT`]/[`CUR3_REPAINT`] tail counters read directly. NEVER asserted: `[wcn] dkpx > 0`
+/// (px/1024 rounds an 8-px sliver to zero — see [`OVLP_DRAG_EVT`]) and never a delta over any
+/// swap-drained counter (the rollup would race the fixture for its own numbers).
+///
+/// Wall-clock per present AND per drain composite via [`crate::arch::ms`]; any single one over
+/// [`DMGOVLP_WEDGE_MS`] prints the WEDGE line and fails — that wire is the boot-8 class stated
+/// as a bound rather than as a symptom.
+///
+/// ### Verdict grammar (spec-regex-stable, one line)
+/// `[dmgovlp] verdict passes=N/12 drained=N/12 drag_evt=N drag_px=N relay=N narrow=k/12
+/// cur=N/12 adopt=N repaint=N max_ms=N -> PASS|FAIL`, plus `[dmgovlp] WEDGE ... -> FAIL`,
+/// `[dmgovlp] DRAIN-STUCK ... -> FAIL` and `[dmgovlp] verdict -> SKIP (...)` variants.
+/// `scripts/specs/x86-wc.spec` REQUIREs the PASS shape and FORBIDs the other three.
+///
+/// PASS thresholds: every pass runs and drains; `drag_evt`/`drag_px`/`relay` all moved;
+/// `narrow >= 3` and `cur >= 4` (the sprite-leg floor: at least 4 of the 12 passes must run the
+/// overlay-offer path with a live plan).
+///
+/// **Why the narrow floor is 3 and not 8** (measured, first QEMU run of this leg): only the four
+/// CHAIN passes can narrow. The STAIRCASE passes run under the parked sprite, and the CURSTICK
+/// widening — deliberately fail-safe — unions the sprite's panel rows into every banded window
+/// whose box contains the sprite box; against an [`FIX_H`] = 8-row surface an ~18-px sprite spans
+/// the WHOLE content, so the union rounds those bands to the full box and `Δdmg == Δbox`, exactly
+/// as designed. Pass C is whole-box by construction. So the honest expectation is `narrow = 4/12`
+/// (the run read exactly that), and the floor is 3 to tolerate one stage-declined direct fallback
+/// (which legitimately repaints whole). The claim still bites: a fat-leg regression whole-boxes
+/// the CHAIN passes too and reads `narrow = 0`.
+///
+/// Self-cleaning: `close` by id (the kernel band refuses `close_owner` — CLOSEISO — so the sweep
+/// is per-id and the leak check is against the table), then [`focus_reset`] + its repaint.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wc"))]
+pub fn dmgovlp_selftest() {
+    use core::sync::atomic::{AtomicBool, Ordering, Ordering::Relaxed};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    /// One wedge bound for every measured interval in the battery.
+    const DMGOVLP_WEDGE_MS: u64 = 1000;
+    /// Passes driven, and the denominator of three verdict fields.
+    const M: usize = 12;
+    /// Drain-check budget: extra composites allowed to absorb a foreign present before the pass
+    /// must read Δdmg == 0.
+    const K: usize = 3;
+    /// PASS floor for the narrowing claim — see the doc block: only the four CHAIN passes can
+    /// narrow (the sprite widening whole-boxes the staircase, by design), minus one fallback.
+    const NARROW_MIN: usize = 3;
+    /// PASS floor for passes run with a live cursor plan — see the doc block.
+    const CUR_MIN: usize = 4;
+    /// The six owners, kernel-band and pace-exempt. Const-asserted into the band.
+    const OWNERS: [u64; 6] = [
+        KERNEL_OWNER_BASE + 0x40,
+        KERNEL_OWNER_BASE + 0x41,
+        KERNEL_OWNER_BASE + 0x42,
+        KERNEL_OWNER_BASE + 0x43,
+        KERNEL_OWNER_BASE + 0x44,
+        KERNEL_OWNER_BASE + 0x45,
+    ];
+    const _: () = assert!(is_kernel_owner(OWNERS[0]) && is_kernel_owner(OWNERS[5]));
+    const _: () =
+        assert!(OWNERS[0] != KERNEL_OWNER_CONSOLE && OWNERS[0] != KERNEL_OWNER_DESKTOP);
+
+    let (pw, ph) = {
+        let fb = *super::WRITER.lock();
+        if !fb.is_ready() {
+            serial_println!("[dmgovlp] verdict -> SKIP (framebuffer not ready)");
+            return;
+        }
+        let i = fb.info();
+        (i.width, i.height)
+    };
+    if pw < 512 || ph < 400 {
+        serial_println!("[dmgovlp] verdict -> SKIP (panel {}x{} too small)", pw, ph);
+        return;
+    }
+
+    // ---- geometry, from the REAL panel ------------------------------------------------------
+    // Outer boxes at scale 1: the fixture pins the scale itself, so these are exact, not layout
+    // guesses. All coordinates below are OUTER-BOX coordinates; content origins (what `move_to`
+    // takes) are derived at the pin loop.
+    let bw = FIX_W + 2 * BORDER; // 170 at the shipping theme
+    let bh = FIX_H + TITLE_H + 2 * BORDER; // 52 at the shipping theme
+    let (qx, qy) = (bw / 4, bh / 4);
+    let top = work_top(pw, ph);
+    let x0 = 8usize;
+    let ya = top + 8; // chain group's box top
+    let yb = ya + bh + 16; // staircase group's box top — groups vertically DISJOINT
+    // Chain: 8-px sliver overlaps, w0 ∩ w2 empty because bw > 16.
+    // Staircase: quarter-box offsets, three-way overlap region of (bw - 2*qx) x (bh - 2*qy).
+    let boxes: [(usize, usize); 6] = [
+        (x0, ya),
+        (x0 + (bw - 8), ya),
+        (x0 + 2 * (bw - 8), ya),
+        (x0, yb),
+        (x0 + qx, yb + qy),
+        (x0 + 2 * qx, yb + 2 * qy),
+    ];
+    // Defensive fit check — the 512x400 floor above covers the shipping theme; this covers a
+    // future chrome resize without letting `move_to`'s clamp silently shear the overlap geometry.
+    let need_w = x0 + 2 * (bw - 8) + bw + BORDER;
+    let need_h = yb + 2 * qy + bh + 8;
+    if need_w > pw || need_h > ph {
+        serial_println!(
+            "[dmgovlp] verdict -> SKIP (panel {}x{} under fixture extent {}x{})",
+            pw, ph, need_w, need_h
+        );
+        return;
+    }
+
+    // ---- rows: create, then pin at scale 1, then place --------------------------------------
+    let s = &raw const HT_SURF as usize;
+    let len = core::mem::size_of_val(&HT_SURF);
+    let mut w = [WIN_NONE; 6];
+    let titles: [&[u8]; 6] = [b"ov0", b"ov1", b"ov2", b"ov3", b"ov4", b"ov5"];
+    for i in 0..6 {
+        w[i] = create(OWNERS[i], s, len, FIX_W as u32, FIX_H as u32, FIX_STRIDE as u32, titles[i]);
+    }
+    if w.iter().any(|&id| id == WIN_NONE) {
+        serial_println!(
+            "[dmgovlp] verdict -> SKIP (window table full: {} {} {} {} {} {})",
+            w[0], w[1], w[2], w[3], w[4], w[5]
+        );
+        for &id in w.iter() {
+            close(id);
+        }
+        return;
+    }
+    // Scale FIRST, under the table lock, so the `move_to` clamp below computes against the box
+    // the fixture is actually claiming (the tiler may have granted a larger upscale at create).
+    // `pinned` comes with it so no re-tile can re-place — and re-scale — a row in the gap.
+    {
+        let mut t = table();
+        for &id in w.iter() {
+            if let Some(r) = row_mut(&mut t, id) {
+                r.scale = 1;
+                r.pinned = true;
+                r.damage_all();
+            }
+        }
+    }
+    // Placement through the REAL verb — `move_to` pins, damages and composites exactly as a drag
+    // does — then READ BACK: a clamp that moved a row moved the overlap geometry, and a fixture
+    // that measured anyway would be asserting about a layout it does not have.
+    let mut placed = true;
+    for i in 0..6 {
+        let (bx, by) = boxes[i];
+        let (cx, cy) = (bx + BORDER, by + TITLE_H + BORDER);
+        move_to(w[i], cx, cy);
+        placed &= info(w[i]).map(|inf| (inf.x, inf.y)) == Some((cx, cy));
+    }
+    if !placed {
+        serial_println!("[dmgovlp] verdict -> SKIP (placement clamped off the fixture geometry)");
+        for &id in w.iter() {
+            close(id);
+        }
+        return;
+    }
+    // No row below the shell: the kernel band is `above_shell`-exempt by construction, and the
+    // raise puts the stack's top where the sprite leg expects it. Restored by `focus_reset`.
+    focus_changed(OWNERS[5]);
+
+    // ---- the sprite, parked ON the stack -----------------------------------------------------
+    // The three-way overlap region's centre, in panel pixels. The sprite box (9 * sprite-scale,
+    // ~18 px at QEMU's metrics) sits wholly inside all three staircase boxes here, which is the
+    // only geometry that can take the overlay offer at all — CURSTICK's adoptability condition.
+    let ov_x = x0 + 2 * qx + (bw - 2 * qx) / 2;
+    let ov_y = yb + 2 * qy + (bh - 2 * qy) / 2;
+    // `set_abs` takes HID space (0..=32767) — the same conversion `wmdirect_selftest` drives, so
+    // the panel position the sprite lands on is derived by the shipping code, not by this witness.
+    let hid = |v: usize, span: usize| -> i32 {
+        ((v as i64 * 32767) / (span as i64 - 1).max(1)) as i32
+    };
+    let (hx, hy) = (hid(ov_x, pw), hid(ov_y, ph));
+    crate::pal::cursor::set_abs(hx, hy, pw as i32, ph as i32);
+    super::cursor::ensure_drawn();
+
+    // ---- settle, then baseline (CTRLWIT's lesson: flush BEFORE the measured interval) --------
+    // Drain whatever the creates, moves, raise and sprite arming left pending, so the deltas
+    // below start from a closed damage set. Bounded: a set that will not settle here is already
+    // the defect the loop exists to catch, and the loop will catch it against its own baseline.
+    for _ in 0..K + 1 {
+        let before = C2_DMG_PX_TOT.load(Relaxed);
+        composite();
+        if C2_DMG_PX_TOT.load(Relaxed) == before {
+            break;
+        }
+    }
+    let de0 = OVLP_DRAG_EVT.load(Relaxed);
+    let dp0 = OVLP_DRAG_PX.load(Relaxed);
+    let rl0 = OVLP_RELAY_EVT.load(Relaxed);
+    let ad0 = CUR3_ADOPT.load(Relaxed);
+    let rp0 = CUR3_REPAINT.load(Relaxed);
+
+    // ---- the drive loop -----------------------------------------------------------------------
+    let mut passes_n = 0usize;
+    let mut drained_n = 0usize;
+    let mut narrow_k = 0usize;
+    let mut cur_n = 0usize;
+    let mut max_ms = 0u64;
+    let mut wedged = false;
+    let mut stuck = false;
+    for m in 0..M {
+        // Re-touch the pointer at the SAME point: refreshes the 1.5 s visibility clock without
+        // moving the sprite, so the cursor leg cannot silently disarm mid-battery.
+        crate::pal::cursor::set_abs(hx, hy, pw as i32, ph as i32);
+        super::cursor::ensure_drawn();
+        // The plan the NEXT pass will be offered. One acquisition, before the present, outside
+        // every lock the pass takes.
+        if super::cursor::sprite_plan().is_some() {
+            cur_n += 1;
+        }
+        let d0 = C2_DMG_PX_TOT.load(Relaxed);
+        let b0 = C2_BOX_PX_TOT.load(Relaxed);
+        let t0 = crate::arch::ms();
+        let ran = match m % 3 {
+            // (A) banded seed at the chain FOOT: w1 drags in by the sliver, w2 only by relay.
+            0 => present_rows(w[0], 0, 2),
+            // (B) banded seed under the three-way stack, beneath the parked sprite.
+            1 => present_rows(w[3], 0, 2),
+            // (C) whole present of the stack's top — the pass that may legitimately not narrow.
+            _ => present(w[5]),
+        };
+        let dt = crate::arch::ms().wrapping_sub(t0);
+        max_ms = max_ms.max(dt);
+        if ran {
+            passes_n += 1;
+        }
+        if dt > DMGOVLP_WEDGE_MS {
+            serial_println!("[dmgovlp] WEDGE pass={} ms={} -> FAIL", m, dt);
+            wedged = true;
+            break;
+        }
+        // Drain check: one extra composite must add NOTHING, within K tries (the tries absorb a
+        // foreign present — a caret blink, a furniture strip — landing between the reads; damage
+        // that keeps arriving on every try is the storm signature, not noise).
+        let mut drained = false;
+        let mut last_dpx = 0u64;
+        for _ in 0..K {
+            let before = C2_DMG_PX_TOT.load(Relaxed);
+            let c0 = crate::arch::ms();
+            composite();
+            let cdt = crate::arch::ms().wrapping_sub(c0);
+            max_ms = max_ms.max(cdt);
+            if cdt > DMGOVLP_WEDGE_MS {
+                serial_println!("[dmgovlp] WEDGE pass={} ms={} -> FAIL", m, cdt);
+                wedged = true;
+                break;
+            }
+            last_dpx = C2_DMG_PX_TOT.load(Relaxed).wrapping_sub(before);
+            if last_dpx == 0 {
+                drained = true;
+                break;
+            }
+        }
+        if wedged {
+            break;
+        }
+        if drained {
+            drained_n += 1;
+        } else {
+            serial_println!("[dmgovlp] DRAIN-STUCK pass={} k={} dpx={} -> FAIL", m, K, last_dpx);
+            stuck = true;
+        }
+        // The narrowing claim, over the whole pass INCLUDING its drain composites: pixels painted
+        // strictly under whole-box pixels means at least one row went banded.
+        let dd = C2_DMG_PX_TOT.load(Relaxed).wrapping_sub(d0);
+        let db = C2_BOX_PX_TOT.load(Relaxed).wrapping_sub(b0);
+        if dd < db {
+            narrow_k += 1;
+        }
+    }
+
+    let drag_evt = OVLP_DRAG_EVT.load(Relaxed).wrapping_sub(de0);
+    let drag_px = OVLP_DRAG_PX.load(Relaxed).wrapping_sub(dp0);
+    let relay = OVLP_RELAY_EVT.load(Relaxed).wrapping_sub(rl0);
+    let adopt = CUR3_ADOPT.load(Relaxed).wrapping_sub(ad0);
+    let repaint_n = CUR3_REPAINT.load(Relaxed).wrapping_sub(rp0);
+    let ok = !wedged
+        && !stuck
+        && passes_n == M
+        && drained_n == M
+        && drag_evt > 0
+        && drag_px > 0
+        && relay > 0
+        && narrow_k >= NARROW_MIN
+        && cur_n >= CUR_MIN;
+    serial_println!(
+        "[dmgovlp] verdict passes={}/12 drained={}/12 drag_evt={} drag_px={} relay={} narrow={}/12 cur={}/12 adopt={} repaint={} max_ms={} -> {}",
+        passes_n, drained_n, drag_evt, drag_px, relay, narrow_k, cur_n, adopt, repaint_n, max_ms,
+        if ok { "PASS" } else { "FAIL" }
+    );
+
+    // ---- teardown: by ID (kernel band — CLOSEISO refuses `close_owner`), asserted -------------
+    let mut leaked = 0usize;
+    for &id in w.iter() {
+        if !(close(id) && info(id).is_none()) {
+            leaked += 1;
+        }
+    }
+    if leaked > 0 {
+        serial_println!("[dmgovlp] teardown LEAK — {} fixture row(s) still live -> FAIL", leaked);
+    }
+    // Un-name the synthetic focus owner, drop the shell back, repaint the live set.
+    focus_reset();
 }

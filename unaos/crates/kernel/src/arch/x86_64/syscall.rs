@@ -16498,6 +16498,15 @@ fn winx_launcher(demo_cpu: usize) {
     // inherit a pinned fixture or a re-tiled panel.
     #[cfg(all(feature = "witness", feature = "wc"))]
     wmdirect_selftest();
+    // DMGOVLP — the overlap-forcing damage leg, and the ladder's new tail. Six kernel-band rows in
+    // two overlapping groups, banded seeds driven with the REAL sprite parked on the three-way
+    // stack: the boot-8 wedge class (banded drags + cursor-repaint storm under overlap) is only
+    // reachable with the pointer ON the stack, so the fixture parks it there itself, on
+    // `wmdirect_selftest`'s own `set_abs` idiom. Last for two reasons: every row it mints is
+    // pinned (no later fixture may inherit a re-tiled panel — moot here, but the rule is the
+    // rule), and it MOVES the real pointer, which no earlier fixture may inherit either.
+    #[cfg(all(feature = "witness", feature = "wc"))]
+    crate::video::wm::dmgovlp_selftest();
 }
 
 // =============================================================================================
