@@ -25,6 +25,36 @@ compile_error!("kernel features `pi` and `tegra` are mutually exclusive — pick
 // ── Jetson Orin Nano / Tegra234: NS16550-style UART ──────────────────────────────────────────
 #[cfg(feature = "tegra")]
 mod tegra {
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    // ── The DARK-WINDOW GUARD (orin 1, 2026-08-18) ───────────────────────────────────────────
+    // Between ExitBootServices and `mmu_tegra::init`, the kernel runs under the UEFI-handoff
+    // translation tables, which map RAM but NOT the Tegra device window (JM2 R4: the kernel
+    // faulted on its first UARTC read). Any serial byte pushed in that window is therefore a
+    // translation fault with no usable vectors — a silent hang, not a message. The trunk merge
+    // proved the class on metal: `kernel_main` step 0a2 (`video::init_edid`, unconditional on
+    // every arch) printed its witness line before `tegra_early_stop`, and the board died at the
+    // NVIDIA logo on every boot. This latch makes the whole class impossible instead of fixing
+    // one caller: bytes offered before `mark_mmio_ready()` (armed by `tegra_early_stop`
+    // immediately after `mmu_tegra::init` returns) are DROPPED and COUNTED, never written.
+    // The count is witnessed on the wire once the window closes, so a dropped byte is a
+    // reported fact rather than a silent one.
+    static MMIO_READY: AtomicBool = AtomicBool::new(false);
+    static DROPPED_PRE_MAP: AtomicU32 = AtomicU32::new(0);
+
+    /// Arm the UART: the Tegra device window is mapped and UARTC MMIO is safe. Called exactly
+    /// once, by `tegra_early_stop`, after `mmu_tegra::init` returns.
+    pub fn mark_mmio_ready() {
+        MMIO_READY.store(true, Ordering::Release);
+    }
+
+    /// How many bytes the guard dropped before the device window was mapped (the dark-window
+    /// witness — nonzero means some caller printed before `mmu_tegra::init`, exactly the class
+    /// that hung the merged base on metal).
+    pub fn dropped_pre_map() -> u32 {
+        DROPPED_PRE_MAP.load(Ordering::Relaxed)
+    }
+
     // Tegra UART base. *** TO VERIFY ON THE BOARD. *** Default = UARTC @ 0x0C28_0000: on the Orin
     // Nano dev kit the debug header the brief targets (the button-header USB-TTL — pin 3 RXD /
     // pin 4 TXD, 115200 8N1) is physically driven by UARTC. It is the port the SPE streams the
@@ -60,6 +90,10 @@ mod tegra {
     const LSR_DR: u32 = 1 << 0; // receive data ready
 
     pub fn write_byte(byte: u8) {
+        if !MMIO_READY.load(Ordering::Acquire) {
+            DROPPED_PRE_MAP.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         unsafe {
             let thr = BASE as *mut u32;
             let lsr = (BASE + LSR) as *const u32;
@@ -79,6 +113,9 @@ mod tegra {
     }
 
     pub fn read_byte() -> Option<u8> {
+        if !MMIO_READY.load(Ordering::Acquire) {
+            return None; // same fault, read-side: LSR is unmapped until the device window exists
+        }
         unsafe {
             let rbr = BASE as *const u32;
             let lsr = (BASE + LSR) as *const u32;
@@ -100,6 +137,11 @@ mod tegra {
         }
     }
 }
+
+// Re-export the dark-window guard at the module surface so `tegra_early_stop` (the sole armer)
+// and its witness line reach it as `arch::serial::{mark_mmio_ready, dropped_pre_map}`.
+#[cfg(feature = "tegra")]
+pub use tegra::{dropped_pre_map, mark_mmio_ready};
 
 pub struct SerialPort;
 

@@ -1848,9 +1848,26 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     //    print-free when fb_addr == 0), and the serial path cannot touch UARTC until this maps the
     //    Tegra device window. The FIRST serial byte of the whole kernel is the `mmu live` line below.
     let mmu = unaos_kernel::arch::mmu_tegra::init(boot_info);
+    // The device window is mapped: arm the UART (the dark-window guard in `arch::serial` drops
+    // and counts every byte offered before this line — see the guard's comment for the metal
+    // failure that bought it).
+    unaos_kernel::arch::serial::mark_mmio_ready();
     serial_println!(
         ":: tegra: mmu live (EL{}) — RAM Normal-WB + Tegra Device-nGnRE mapped ::",
         mmu.el
+    );
+    // Dark-window witness: nonzero means some caller printed before `mmu_tegra::init` — the
+    // exact class (EDID-CARRY's step-0a2 witness line) that hung the merged base at the NVIDIA
+    // logo on every boot of 2026-08-18. The dropped bytes are gone by design; re-emit the one
+    // witness we know the window ate, so the EDID reading still reaches the wire on tegra.
+    serial_println!(
+        ":: tegra: dark-window guard — {} byte(s) dropped pre-map ::",
+        unaos_kernel::arch::serial::dropped_pre_map()
+    );
+    unaos_kernel::video::init_edid(
+        &boot_info.edid_block,
+        boot_info.edid_block_valid,
+        boot_info.edid_total_len,
     );
     serial_println!(
         ":: tegra: mmu regs — SCTLR {:#x}->{:#x} TCR={:#x} MAIR={:#x} TTBR0={:#x} RAM-GiB-mask={:#x} ::",
