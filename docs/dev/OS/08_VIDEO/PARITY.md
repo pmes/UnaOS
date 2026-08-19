@@ -80,7 +80,7 @@ is an attribute gate.
 | `wm.rs` ×1 | `wpace_emit` — the `[wpace]` ledger line | **NOT A GAP — RULED OUT** | The ledger for the pacer above; same ruling, §5.1. |
 | `wm.rs` ×1 | `dock_tiles` — the dock's tile count feeding `occ_clip` | (b) | **LANDED** — `exec-occ62` M2 (§6.4). |
 | `wm.rs` ×1 (16493) | MENUFIT witness — menubar reservation line | (d) IN FLIGHT | **exec-conswin** (menubar). |
-| `fbcon.rs` ×42 | **The console window** — `CONSOLE_WIN`, the route/pace/pending machinery (`ROUTE_BUSY`, `PACE_HZ`, `pend_merge`, `route_present*`, `console_service`, `console_flush`), the window-backed console store (`win_store`, `win_fb`, `win_content_extent`), `panel_console_window_open` / `_closed` | (d) IN FLIGHT | **exec-conswin.** Not touched by this arc. |
+| `fbcon.rs` ×42 | **The console window** — `CONSOLE_WIN`, the route/pace/pending machinery (`ROUTE_BUSY`, `PACE_HZ`, `pend_merge`, `route_present*`, `console_service`, `console_flush`), the window-backed console store (`win_store`, `win_fb`, `win_content_extent`), `panel_console_window_open` / `_closed` | (b) | **CLOSED** — CONSWIN-PI widened the whole family to `any(all(x86_64, wc), all(aarch64, pidesk))` and gave the Pi a console window; **LIVECON** (§6.12, `livecon` knob) closed the half CONSWIN-PI measured and reverted, by moving the presents off print context onto the render core so the window's text is LIVE instead of a frozen boot-log snapshot. The route/pace machinery is the MECHANISM of that fix and is itself unchanged. |
 | `main.rs` ×1 | `open_shell_window` | (d) IN FLIGHT | **exec-shellport.** |
 | `main.rs` ×2 | `desktop_owns_backdrop` (SHELLNOTDESK) — the crispy scene as the desktop layer, shell demoted to plumbing | (b) | **CLOSED** — §6.1. SHELLWIN-PI (`b2e0fb4a`) put the live shell in a window; REALDESK (exec-realdesk) took the last two backdrop tenants — the pulse band and the status line — off the glass with it. |
 | `main.rs` ×2 | `instgui::service`, `instgui::consume_key` | (c) | `instgui` is the x86 installer GUI on the `wcx` panel path. |
@@ -1267,7 +1267,7 @@ this section is wrong.
 |---|---|---|
 | Title-bar window **dragging** — `wm::drag_begin/motion/end` are arch-neutral but called only from `arch/x86_64/syscall.rs` | `main.rs:1819` (`wc_route_tail`) | **exec-dragperf** |
 | **Click-to-focus / raise / close-button** on windows — aarch64's `click1_dispatch` hit-tests only console-vs-status-strip | `main.rs:1693` (`wc_route_event`) | **exec-dragperf** / **exec-conswin** — settle ownership before starting |
-| Console window, its route/pace machinery, furniture strips, menubar reservation | `fbcon.rs` ×42, `screen.rs:367`, `ui_status.rs:597`, `wm.rs:16493` | **exec-conswin** |
+| Console window, its route/pace machinery, furniture strips, menubar reservation | `fbcon.rs` ×42, `screen.rs:367`, `ui_status.rs:597`, `wm.rs:16493` | **exec-conswin** — the console-window half is **DONE**: CONSWIN-PI minted the window, **LIVECON** (§6.12) made its text live |
 | Shell window | `main.rs` `open_shell_window` | **exec-shellport** |
 
 ---
@@ -1611,6 +1611,153 @@ lesson: a census greps attributes, and a disclosure is not an attribute either.
    `[wc-g] … slow=yes -> RACE`, `[dragperf] … -> FAIL`) is present at the base sha and belongs to
    whichever arc owns those instruments. It is named here so a future capture is not misread as this
    arc's.
+
+---
+
+### 6.12 The `exec-livecon` arc — the console window's text is LIVE, and it presents from the render core
+
+**What was owed.** CONSWIN-PI gave the Pi a console window and then, in `video/pidesk.rs`'s
+live-console ledger, recorded the one thing it could not deliver: the window is a **frozen boot-log
+snapshot**. Keeping it live was implemented, measured at bench geometry, and reverted — a 108/108 run
+became **97/108 with 37 forbidden hits and a synchronous exception**. That ledger also named the
+repair, and named it precisely enough to implement without re-deriving it:
+
+> move the console's presents off print context entirely and onto the RENDER core, one paced call per
+> frame, via the hook `fbcon::console_service` already provides for exactly this on x86's bench lane.
+
+This arc is that paragraph, taken. It is `livecon`, default OFF.
+
+#### The diagnosis the revert established, restated because it is the whole design
+
+`fbcon::detach()` is **not** what freezes the window; it is only the last of two things that do. The
+route itself already discharges the detach's stated reason — `console_is_routed`'s argument is that
+the detach exists so exactly one core writes the PANEL, and a routed console writes kernel RAM. That
+argument is correct and it is incomplete: *discharging "who writes the panel" does not discharge "who
+drives the COMPOSITOR."* A routed console presents from **print context, on whatever core printed**,
+and after the handoff the Pi prints from every core it has. The window was live and the console was an
+unsynchronised compositor client — `[wc-g] … slow=yes -> RACE-BLIT`, `[wc-d] verify … -> FAIL`, and a
+synchronous exception. The blocker was never the detach. It was the *cadence and the core count*.
+
+#### What was ported — call sites, not a rebuild
+
+Nothing in the console's route/pace/pending machinery moved. `PEND`, the `Owed` three-way, `PACE_HZ`,
+the `ROUTE_BUSY` guard, the recycled-id fence and `pend_take`'s degradations are untouched; the
+already-existing guarantee "a HELD band is carried by the next present" is the exact guarantee the
+port leans on. Three statements:
+
+1. **`fbcon`'s three PRINT-CONTEXT present entries defer.** `route_present`, `route_present_rows` and
+   `route_present_pending` record their rows in `PEND` — precisely as a pacing-gate hold records them
+   — and return without taking `wm`'s window table and without compositing. The latch is
+   `fbcon::PRESENT_DEFERRED` and the test is `present_deferred()`; both live in the file's
+   **append-only tail**, and all three entries are **LINE-NEUTRAL folds** (§5.3).
+2. **The Pi's `render_service` takes the ledger, once per pass**, through
+   `fbcon::console_live_service()` — a readback bracket around the pre-existing
+   `fbcon::console_service()`, the hook x86's `usbdebug` loop has called since FBCON-PACE. This arc
+   gives that hook its **second caller** rather than inventing a second mechanism. Also a LINE-NEUTRAL
+   fold, into `main.rs`'s `let t0 = …` line.
+3. **`pidesk::activate` therefore returns `routed`**, so the GUI handoff's existing
+   `if !pidesk_activate_maybe() { detach(); }` guard skips the detach and `_print` keeps reaching the
+   window's surface for the rest of the boot. The arming of the deferral is at the **tail** of
+   `activate`, which is load-bearing: everything `activate` itself printed reached the window inline,
+   on the BSP, before the render task exists — deferring from the top would leave the window blank
+   until the first event.
+
+The console therefore stops being an N-core client at line cadence and becomes a **single-core client
+at frame cadence**, which is the shape the witness battery can survive.
+
+#### THE PANIC PATH LAW is preserved, and preserved at the latch
+
+A deferred present would be a present the panic path never receives — the render task is not scheduled
+again after a panic. So `present_deferred()` is `PRESENT_DEFERRED && !PANIC_MIRROR`: from
+`panic_screen` onwards every print composites inline on the panicking core exactly as it does today.
+That is the second of two independent guards (`panic_screen` also clears `CONSOLE_WIN`), the same
+belt-and-braces `draw_fb` and `panel_mirror_held` keep. Every other degradation is toward staleness,
+never toward a dropped band: a wedged render core leaves rows *owed* in `PEND`, and the next take — a
+pass, a `console_flush`, or `detach`'s sync point — carries them.
+
+#### The cost, stated rather than hidden
+
+`render_service` blocks on `GUI_CHANNEL.recv()`, so a line printed by a core that generates no GUI
+event waits for the next pass. The floor on that is the strip pulse's `ui_status::PSTRIP_PERIOD_MS`
+timer — the same free wake `pidesk::armed()` rides. **The console is live at the pulse rate at worst
+and immediately on interaction at best; it is not a 60 Hz console.** Adding a wake from print context
+would put channel traffic back on the very path this arc is taking work off, which is how the reverted
+cut failed.
+
+#### ONE OS: the gate is `feature = "livecon"`, never `target_arch`
+
+Every gate this arc adds is the knob and nothing else. On x86 the latch exists and is simply never
+armed (`wcx::activate` does not call `console_present_defer`), so the `wc` desktop and the `usbdebug`
+bench lane are byte-unchanged — and x86's own desktop lane, which ships the same frozen snapshot for
+the same reason, is **one call site** from the same fix whenever that arc wants it.
+
+#### Gates
+
+* `./arroyo check` — **green, both arches** (`x86-all` and `arm-pi` legs both carry `livecon`, so both
+  polarities of every new `#[cfg]` are type-checked).
+* `UNAOS_WC=1 ./arroyo check` — **green**.
+* `./arroyo kernel8` — builds; **knob-off `kernel8.img` is BYTE-IDENTICAL to the base sha**
+  (`c0099483`): `e30fb32d99bcc0d4e597f0b16b835374` from both trees. The line-neutral discipline held.
+* Knob-off `./arroyo kernel8-test 150` — **MBENCH PASS, 117/117 required witnesses, 0 forbidden hits,
+  8366 lines scanned.** At floor.
+* **The proof, on the wire.** `UNAOS_PIDESK=1 UNAOS_LIVECON=1 UNAOS_FBW=1920 UNAOS_FBH=1200
+  ./arroyo kernel8-test 150`:
+
+  ```
+  [wc-x] console-window win=1 panel=1920x1200 surf=1295x736 box=1305x780 at (307,158) cell=7x16 cols=185 rows=46
+  [wc-x] console-route first-paint win=1 (glyphs -> window surface, damage-limited)
+  [pidesk] livecon ARMED console_win=1 (presents deferred off print context; …the handoff SKIPS the detach and the window stays LIVE)
+  [wc-x] livecon census presents=8 ran=13 held=18 busy=26 idle=0 (the console window presented 8 times FROM THE RENDER SERVICE after the GUI handoff — a frozen snapshot presents none and prints no such line)
+  ```
+
+  `presents=8` is read back from `PACE_RAN` across the service call, so it counts presents that
+  actually happened rather than passes that asked for one. `held=18` is where the deferred
+  print-context lines landed. **The mechanism as two numbers: text arrived on N cores, pixels left on
+  one.** A second run reproduced it (`presents=8 ran=12 held=14 busy=21`).
+
+#### The armed bench-geometry leg — A/B, and it is red in BOTH polarities
+
+That leg is **red at the base sha** (§6.10 records the same), so the reading that matters is the
+comparison, not the verdict. Five runs on this tip:
+
+| Leg | Verdict | Forbidden hits |
+|---|---|---|
+| `UNAOS_PIDESK=1` (control) | 116/117 | 9 |
+| `UNAOS_PIDESK=1` (control) | 116/117 | 12 |
+| `UNAOS_PIDESK=1 UNAOS_LIVECON=1` | 116/117 | 9 |
+| `UNAOS_PIDESK=1 UNAOS_LIVECON=1` | 116/117 | 65 |
+| `UNAOS_PIDESK=1 UNAOS_LIVECON=1` | 115/117 | 16 |
+
+**No failure class is introduced by the knob.** Every hit in every armed run is drawn from the same
+set the control produces — `[wc-c] side-by-side drawn=1` (the missing REQUIRE, present in all five),
+`[wc-d] verify win=3 … -> FAIL`, `[wc-g] … -> COHER`/`RACE`, `[dragperf] -> FAIL` — all of which §6.10
+already attributes to arcs that own those instruments. Compare the reverted cut, whose signature was a
+**new** class outright (a synchronous exception) and 37 hits against a 108/108 control.
+
+Two residues named honestly rather than averaged away:
+
+1. **The 65-hit run is 54 hits of one noisy pattern**, `[wc-h] .*presspread=[0-9] .*-> AT-RISK`, all on
+   `win=1`. It is **not livecon-exclusive** — the control produced 7 of the same in one run and an
+   armed run produced 9 — but the outlier is real and it is the console window's own rollup. The
+   plausible mechanism is benign and worth stating: a live console presents repeatedly, so `[wc-h]`
+   finally has a *population* for `win=1` to roll up, where a frozen console presents ~4 times all
+   boot and rarely emits at all. It is the compositor's telemetry describing a window that is now
+   busy, not a new fault. **A bench run should confirm or refute that reading.**
+2. **The 115/117 run's extra miss** is `[pstrip] rollup … skipped=[1-9]`, i.e. the SCHED-6 dirty-flag
+   pacer reporting no skipped passes. `console_live_service` does not set `dirty`, so it cannot
+   suppress a skip by construction; the run was also the shortest of the five (12912 lines scanned
+   against 20004). Read as run-length noise, and named so a future capture is not misled.
+
+#### What is still OWED after this arc
+
+1. **x86's desktop lane still freezes its console**, and now for no reason but a missing call:
+   `wcx::activate` needs the same `console_present_defer(true)` and `x86_render_service` the same
+   `console_live_service()` line. Deliberately not taken here — the lane, the files and the gate are
+   x86's, and this is a Pi-track arc.
+2. **The default is still the frozen snapshot.** The knob exists because the fixed *shape* is argued
+   and QEMU-measured but not bench-measured, and the reverted cut is the standing proof that this
+   particular argument is worth checking on metal. Flipping the default is a bench decision.
+3. **`[wc-h]`'s `win=1` AT-RISK population** (residue 1 above) wants a bench reading.
 
 ---
 

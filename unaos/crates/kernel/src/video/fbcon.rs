@@ -930,7 +930,7 @@ fn pace_due(now: u64) -> bool {
 
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 fn route_present() {
-    route_present_banded(Owed::Whole, false)
+    if present_deferred() { PEND_FULL.store(true, Ordering::Release); return; } route_present_banded(Owed::Whole, false) // LIVECON — the whole box goes on the ledger and the RENDER core takes it; see `present_deferred` at the file tail (PANIC_MIRROR disarms the deferral, so the panic path composites inline exactly as before). LINE-NEUTRAL fold, PARITY §5.3.
 }
 
 /// FBCON-DMG — present the console window over SURFACE ROWS `[band.0, band.1)` only.
@@ -940,7 +940,7 @@ fn route_present() {
 /// the `FBCON` lock RELEASED and interrupts ENABLED.**
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 fn route_present_rows(band: (usize, usize)) {
-    route_present_banded(Owed::Band(band.0, band.1), true)
+    if present_deferred() { pend_merge(band.0, band.1); return; } route_present_banded(Owed::Band(band.0, band.1), true) // LIVECON — THE HOT PATH. The rows are recorded exactly as a HELD present records them and the take is `console_service`'s, one per render pass; nothing is dropped, only deferred. See `present_deferred`. LINE-NEUTRAL fold, PARITY §5.3.
 }
 
 /// FBCON-PACE — a print that changed NOTHING on the surface. Owes no rows; still gives the pacing
@@ -948,7 +948,7 @@ fn route_present_rows(band: (usize, usize)) {
 /// present, which repainted 750 rows on behalf of a line that moved no pixel.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 fn route_present_pending() {
-    route_present_banded(Owed::Nothing, true)
+    if present_deferred() { return; } route_present_banded(Owed::Nothing, true) // LIVECON — this caller owes NOTHING, so a deferred pass has nothing to record and nothing to present; the rows an earlier line left owed are the render pass's to retire. See `present_deferred`. LINE-NEUTRAL fold, PARITY §5.3.
 }
 
 /// FBCON-PACE — THE IDLE-LOOP SERVICE HOOK. Retire rows a held present left owed, **still paced**.
@@ -2287,5 +2287,164 @@ fn panel_mirror_held() -> bool {
 /// DESKHOLD — the absent-feature arm. See the sibling above.
 #[cfg(not(all(target_arch = "aarch64", feature = "pidesk")))]
 fn panel_mirror_held() -> bool {
+    false
+}
+
+/// LIVECON — **are the console window's presents DEFERRED to a service pass?**
+///
+/// ### The one fact that separates a live console from a reverted one
+///
+/// `detach()` is not what makes the desktop's console window a frozen snapshot; it is only the last
+/// of two things that do. The route itself already discharges the detach's reason
+/// ([`console_is_routed`] carries that argument in full), and the previous arc duly implemented the
+/// skip — and then MEASURED it, at bench geometry, and reverted it. The measurement is quoted in
+/// `super::pidesk::activate`'s live-console ledger and the verdict is one sentence: *discharging "who
+/// writes the PANEL" does not discharge "who drives the COMPOSITOR"*. A routed console presents from
+/// PRINT context, on whatever core printed, and after the handoff the Pi prints from every core it
+/// has — so the console became an unsynchronised compositor client, `[wc-g] … slow=yes -> RACE-BLIT`,
+/// `[wc-d] verify … -> FAIL`, and a synchronous exception.
+///
+/// ### What this latch changes, and what it deliberately does not
+///
+/// Armed, the three PRINT-CONTEXT entries ([`route_present`], [`route_present_rows`],
+/// [`route_present_pending`]) record their rows in [`PEND`] exactly as they always did and then
+/// RETURN, without taking `wm`'s window table and without compositing. Nothing else moves: the
+/// ledger, the `Owed` three-way, the [`PACE_HZ`] gate, the [`ROUTE_BUSY`] guard and the recycled-id
+/// fence are all untouched, and the rows a deferred call recorded are exactly the rows the next take
+/// carries — which is the SAME guarantee the pacing gate has always made about a held band, reached
+/// by the same path.
+///
+/// The take is then made by [`console_service`], from the render service's per-pass body, and that is
+/// the whole of the port: the console stops being an N-core client at line cadence and becomes a
+/// single-core one at frame cadence, which is the shape the witness battery can survive. It is the
+/// hook x86's bench lane has called for exactly this reason since FBCON-PACE; this arc gives it its
+/// second caller rather than inventing a second mechanism.
+///
+/// ### Every degradation presents
+///
+/// * **THE PANIC PATH LAW is preserved, and preserved HERE rather than downstream.** A deferred
+///   present that waited for a render pass would be a present the panic path never gets — the render
+///   task is not scheduled again after a panic. So `PANIC_MIRROR` disarms the deferral outright, and
+///   every print from `panic_screen` onwards composites inline on the panicking core exactly as it
+///   does today. (`panic_screen` also clears `CONSOLE_WIN`, so this is the second of two independent
+///   guards, the same belt-and-braces `draw_fb` and `panel_mirror_held` keep.)
+/// * A service pass that never comes (a wedged render core) leaves rows OWED, not lost: they sit in
+///   `PEND` and the next take — a pass, a [`console_flush`], or [`detach`]'s sync point — carries
+///   them. Staleness, never a dropped band.
+/// * Knob off, this is an `#[inline(always)] false` and the three entries fold back to the bare
+///   `route_present_banded` call they have always been.
+///
+/// Arch-neutral on purpose: the gate is `feature = "livecon"` and nothing else, so the x86 wire-in is
+/// a `console_present_defer(true)` at `wcx::activate` whenever that arc wants it.
+#[cfg(all(
+    feature = "livecon",
+    any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))
+))]
+static PRESENT_DEFERRED: AtomicBool = AtomicBool::new(false);
+
+/// LIVECON — arm/disarm the deferral described above. Called by `super::pidesk::activate` once the
+/// desktop is up and the route is installed, i.e. at the last instant the boot is still single-core
+/// through this seam; everything `activate` itself printed has already reached the window inline.
+#[cfg(all(
+    feature = "livecon",
+    any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))
+))]
+pub fn console_present_defer(on: bool) {
+    PRESENT_DEFERRED.store(on, Ordering::Relaxed);
+}
+
+/// LIVECON — the test the three print-context entries fold in. See [`PRESENT_DEFERRED`].
+#[cfg(all(
+    feature = "livecon",
+    any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))
+))]
+#[inline]
+fn present_deferred() -> bool {
+    PRESENT_DEFERRED.load(Ordering::Relaxed) && !PANIC_MIRROR.load(Ordering::Relaxed)
+}
+
+/// LIVECON — presents the RENDER service actually issued for the console window since the deferral
+/// was armed, i.e. since the GUI handoff. On a frozen-snapshot boot this number does not exist,
+/// because there is no caller: `detach` has stopped every print and the window never changes again.
+#[cfg(all(
+    feature = "livecon",
+    any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))
+))]
+static LIVE_PRESENTS: AtomicU64 = AtomicU64::new(0);
+
+/// LIVECON — one-shot latch for the census line below.
+#[cfg(all(
+    feature = "livecon",
+    any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))
+))]
+static LIVE_CENSUS_DONE: AtomicBool = AtomicBool::new(false);
+
+/// LIVECON — how many render-service presents the census waits for before it speaks.
+///
+/// Not 1. One present proves the hook is wired, which is the weaker claim and the one a boot could
+/// satisfy by accident on the pass that happens to straddle the handoff. Eight proves the console is
+/// being SERVICED — that print context kept feeding the ledger and the render core kept taking it,
+/// repeatedly, after the point at which the frozen boot stops forever.
+#[cfg(all(
+    feature = "livecon",
+    any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))
+))]
+const LIVE_CENSUS_AT: u64 = 8;
+
+/// LIVECON — **the render service's console pass, and the one line that proves the port.**
+///
+/// A thin bracket around [`console_service`] and nothing more: the service call is unchanged, still
+/// paced, still free on a clean ledger, still a no-op when the console is not routed. What the
+/// bracket adds is a READBACK — it watches [`PACE_RAN`] across the call, so it counts presents that
+/// actually happened rather than passes that asked for one, which is the same "read it back, do not
+/// infer it from having called it" discipline `super::pidesk::activate` applies to its own composite.
+///
+/// The census it emits is the arc's evidence, in terms the ledger already keeps:
+///
+/// * `presents=` — presents issued FROM THIS SERVICE, after the handoff. A frozen console's is 0 and
+///   this line never appears at all, which is what makes its presence the proof rather than its
+///   contents.
+/// * `held=` — the print-context calls the pacing gate deferred. Under LIVECON this is where every
+///   deferred line lands, so a nonzero `held` beside a climbing `presents` is the mechanism stated as
+///   two numbers: text arrived on N cores, pixels left on one.
+/// * `busy=` — [`ROUTE_BUSY`] declines. This is the number the reverted cut made large; a routed
+///   console driven from one core cannot contend with itself.
+///
+/// Silent until the count is reached, and silent forever after: one line per boot.
+#[cfg(all(
+    feature = "livecon",
+    any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))
+))]
+pub fn console_live_service() {
+    if !PRESENT_DEFERRED.load(Ordering::Relaxed) {
+        return;
+    }
+    let before = PACE_RAN.load(Ordering::Relaxed);
+    console_service();
+    if PACE_RAN.load(Ordering::Relaxed) == before {
+        return;
+    }
+    let n = LIVE_PRESENTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n >= LIVE_CENSUS_AT && !LIVE_CENSUS_DONE.swap(true, Ordering::Relaxed) {
+        serial_println!(
+            "[wc-x] livecon census presents={} ran={} held={} busy={} idle={} (the console window presented {} times FROM THE RENDER SERVICE after the GUI handoff — a frozen snapshot presents none and prints no such line)",
+            n,
+            PACE_RAN.load(Ordering::Relaxed),
+            PACE_HELD.load(Ordering::Relaxed),
+            PACE_BUSY.load(Ordering::Relaxed),
+            PACE_IDLE.load(Ordering::Relaxed),
+            n
+        );
+    }
+}
+
+/// LIVECON — the absent-knob arm. Compile-time `false`, so the deferral folds out entirely.
+#[cfg(not(all(
+    feature = "livecon",
+    any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))
+)))]
+#[allow(dead_code)]
+#[inline(always)]
+fn present_deferred() -> bool {
     false
 }

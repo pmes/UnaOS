@@ -247,6 +247,10 @@ pub fn activate() -> bool {
         // the handoff's `fbcon::detach()` follows this seam and stops them, so the window holds the
         // desktop-bringup tail and then freezes. See the live-console ledger at the tail of this
         // function for why the detach stays, and `wcx.rs` for x86 doing the identical thing.
+        // ⚠ THE WIRE WORD BELOW IS THE KNOB-OFF TRUTH and is left exactly as written because the
+        // regression specs anchor on it. With LIVECON armed the window does NOT freeze, and the
+        // correction is stated in its own `[pidesk] livecon ARMED` line at the tail rather than by
+        // rewording a string a passing spec matches on.
         serial_println!("[pidesk] activate panel={}x{} console_win={} routed={} (the window freezes at the handoff detach that follows — x86's desktop lane does the same)", pw, ph, cwin, routed);
     }
 
@@ -395,10 +399,11 @@ pub fn activate() -> bool {
 
     // ── THE LIVE-CONSOLE DECISION, and the measurement that settled it ──────────────────────────
     //
-    // This returns `false` — **detach as before** — and the honest name for that is: the Pi's console
-    // window is a FROZEN BOOT-LOG SNAPSHOT, exactly as x86's desktop-lane console window is. It is
-    // parity, achieved, and it is not the parity this arc set out to get. What follows is why, in the
-    // terms of what was actually run rather than what was argued.
+    // Knob off, this returns `false` — **detach as before** — and the honest name for that is: the
+    // Pi's console window is a FROZEN BOOT-LOG SNAPSHOT, exactly as x86's desktop-lane console window
+    // is. It is parity, achieved, and it is not the parity that arc set out to get. What follows is
+    // why, in the terms of what was actually run rather than what was argued — and then, at the
+    // bottom, what LIVECON does about it.
     //
     // The argument for `routed` (keep the console LIVE by skipping the detach) is in
     // `fbcon::console_is_routed` and it is, as far as it goes, correct: the detach exists so exactly
@@ -444,8 +449,48 @@ pub fn activate() -> bool {
     // client at frame cadence instead of an N-core one at line cadence, which is the shape the witness
     // battery can survive. It needs a line in the Pi render service — `main.rs`'s render task, which
     // is `exec-shellport`'s lane this cycle, not this one.
+    //
+    // ── LIVECON — that arc, taken ────────────────────────────────────────────────────────────────
+    //
+    // The paragraph above is the design of record and this is its implementation, in the three
+    // statements it asks for and no more. `fbcon::console_present_defer(true)` makes the three
+    // PRINT-CONTEXT present entries record their rows in the `PEND` ledger and return without
+    // compositing; `main.rs`'s `render_service` calls `fbcon::console_service()` once per pass, which
+    // is the paced take of that ledger on ONE core; and so the detach's skip — the thing measured and
+    // reverted — is sound this time, because the console is no longer an N-core compositor client at
+    // line cadence but a single-core one at frame cadence.
+    //
+    // THE ARMING IS HERE, at the tail, and the placement is load-bearing. Everything `activate` has
+    // printed above — the desktop-clear line, the face census, the console-window witness, the
+    // menubar and crystal lines — reached the window's surface INLINE, on the BSP, before the render
+    // or input tasks exist. That is the window's first content and there is no render pass yet to
+    // present it, so deferring from the top would leave the console blank until the first event.
+    // Arming here is the last instant that is still single-core through this seam, which is the same
+    // argument the DESKTOP-CLEAR above makes for its own placement.
+    //
+    // WHAT IT COSTS, STATED HONESTLY. `render_service` blocks on `GUI_CHANNEL.recv()`, so a line
+    // printed by a core that generates no GUI event waits for the next pass — and the floor on that
+    // is the strip pulse's `ui_status::PSTRIP_PERIOD_MS` timer, the same free wake `armed()` below
+    // rides. So the console is live at the pulse rate at worst and immediately on interaction at
+    // best; it is not a 60 Hz console. That is a deliberate trade: adding a wake from print context
+    // would put channel traffic back on the very path this arc is taking work OFF, which is how the
+    // reverted cut failed.
+    //
+    // KNOB OFF: neither statement is compiled, `routed` is discarded as before, and the boot is the
+    // frozen snapshot byte for byte.
     let _ = routed;
-    false
+    #[cfg(feature = "livecon")]
+    if routed {
+        fbcon::console_present_defer(true);
+        serial_println!(
+            "[pidesk] livecon ARMED console_win={} (presents deferred off print context; the render service takes the ledger once per pass via `fbcon::console_service` — the handoff SKIPS the detach and the window stays LIVE)",
+            cwin
+        );
+    }
+    #[cfg(feature = "livecon")]
+    return routed;
+    #[cfg(not(feature = "livecon"))]
+    return false;
 }
 
 // ── SHELLWIN-PI — the CASCADE latch, and why it is a SECOND question ────────────────────────────

@@ -1632,7 +1632,7 @@ KERNEL_CFG_MATRIX=(
   # way, which is the build the metal flight actually carries.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the
@@ -1640,7 +1640,7 @@ KERNEL_CFG_MATRIX=(
   # PI-DESK (`pidesk` — the desktop furniture family on the Pi panel; this leg carries `witness`, so it
   # is also the only place the dock/menubar/crystal FIXTURES are type-checked on aarch64).
   # Cannot carry the tegra family — see the mutual-exclusion note above.
-  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,pidesk,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,fatperf"
+  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,pidesk,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,fatperf,livecon"
   # aarch64 board leg 2 — Jetson Orin Nano (Tegra234), plus the board-neutral aarch64 features that
   # would otherwise ride nothing: ORIN-SMP (tegrasmp/smpprobe), the four XCARVE levers, ORIN-NET-1..4
   # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET
@@ -3226,6 +3226,30 @@ kernel8() {
     if [ -n "${UNAOS_PIDESK:-}" ]; then
         K8_FEATS="${K8_FEATS},pidesk"
         echo -e "${COLOR_YELLOW}  • UNAOS_PIDESK: desktop furniture on the BCM2711 panel (dock window-switcher strip + SHARD menu; menu bar default OFF), clicks routed through the Pi mouse${COLOR_RESET}"
+    fi
+    # LIVECON: UNAOS_LIVECON=1 adds the `livecon` feature — the console window's text stays LIVE, and
+    # it presents from the RENDER core. The second half of M3. Three statements, no new machinery:
+    # `fbcon`'s three PRINT-CONTEXT present entries record their rows in the existing `PEND` ledger and
+    # return without compositing; `main.rs`'s `render_service` takes that ledger once per pass through
+    # the existing `fbcon::console_service()`; and `video/pidesk.rs`'s seam therefore returns `routed`,
+    # so the GUI handoff SKIPS `fbcon::detach()` and `_print` keeps reaching the window's surface.
+    #
+    # PAIR IT WITH UNAOS_PIDESK. `livecon` compiles the deferral and the two hooks; `pidesk` is what
+    # ROUTES the console into a window in the first place (`video/pidesk.rs`'s DESKTOP-READY seam) —
+    # armed alone there is no console window to keep live and every hook is inert.
+    #
+    # WHY A KNOB. The live console was tried once and reverted with evidence: presenting from print
+    # context made the console an N-core compositor client and turned a 108/108 bench-geometry run into
+    # 97/108 with 37 forbidden hits and a synchronous exception. Deferral fixes the shape (one core,
+    # frame cadence); the battery's verdict on the fixed shape is measured, not argued, so the default
+    # stays the frozen snapshot. Same curated-list class as UNAOS_PIDESK above (builder is deliberately
+    # NOT touched). OFF => the latch is an `#[inline(always)] false`, both hooks are statement-level
+    # `#[cfg]`s FOLDED onto lines that already existed (no panic-`Location` line shift in `fbcon.rs` or
+    # `main.rs`, which ARE compiled knob-off), and `kernel8.img` is byte-identical to baseline.
+    # See docs/dev/OS/08_VIDEO/PARITY.md §6.12.
+    if [ -n "${UNAOS_LIVECON:-}" ]; then
+        K8_FEATS="${K8_FEATS},livecon"
+        echo -e "${COLOR_YELLOW}  • UNAOS_LIVECON: the console window's text stays LIVE (presents deferred off print context onto the render core; pair with UNAOS_PIDESK)${COLOR_RESET}"
     fi
     # QUARRY: UNAOS_QUARRY=1 adds the `quarry` feature — UnaOS's FILE MANAGER (Peter's naming and
     # shape, 2026-08-17: "Tree on left and start with detailed list view on right"). A kernel-owned

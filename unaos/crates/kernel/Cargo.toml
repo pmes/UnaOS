@@ -1467,6 +1467,38 @@ quarry = []
 # which ARE compiled knob-off), and `kernel8.img` is byte-identical to baseline.
 fatperf = []
 
+# LIVECON (`UNAOS_LIVECON=1`) — **the console window's text stays LIVE, and it presents from the
+# RENDER core.** The second half of M3, and the arc `video/pidesk.rs`'s live-console ledger names:
+# "move the console's presents off print context entirely and onto the RENDER core, one paced call
+# per frame, via the hook `fbcon::console_service` already provides".
+#
+# WHAT IT IS. Three statements, no new machinery: (1) `fbcon`'s three PRINT-CONTEXT present entries
+# (`route_present`, `route_present_rows`, `route_present_pending`) record their rows in the existing
+# `PEND` ledger and return WITHOUT compositing; (2) the Pi's `render_service` calls the existing
+# `fbcon::console_service()` once per pass, which is the paced take of that ledger; (3)
+# `pidesk::activate` therefore returns `routed`, so the GUI handoff SKIPS `fbcon::detach()` and
+# `_print` keeps reaching the window's surface for the rest of the boot.
+#
+# WHY IT IS A KNOB AND NOT A DEFAULT. The live console was tried once and REVERTED with evidence: at
+# bench geometry a routed console presenting from print context turned a 108/108 run into 97/108 with
+# 37 forbidden hits and a synchronous exception, because a console that composites on whatever core
+# printed is an unsynchronised compositor client the witness battery cannot survive. Deferral fixes
+# the SHAPE (one core, frame cadence) but that battery's verdict is measured, not argued, so the
+# default stays the frozen snapshot until a bench run says otherwise.
+#
+# ARCH-NEUTRAL BY CONSTRUCTION: every gate this knob adds is `feature = "livecon"`, never
+# `target_arch`. On x86 the deferral latch exists and is simply never armed (`wcx::activate` does not
+# call `console_present_defer`), so the `wc` desktop and the `usbdebug` bench lane are unchanged; the
+# x86 wire-in is one call site away when that arc wants it.
+#
+# The knob class is `pidesk`'s (builder=0): kernel8's feature list is CURATED in `arroyo`'s K8_FEATS
+# block. Default OFF => the latch is an `#[inline(always)] false`, the three entries fold back to the
+# bare `route_present_banded` call they have always been, the `render_service` and `pidesk` hooks are
+# statement-level `#[cfg]`s that vanish, no line moves in any file compiled knob-off, and
+# `kernel8.img` is byte-identical to baseline. Arming it does NOT imply `pidesk`; a Pi build wants
+# `UNAOS_LIVECON=1 UNAOS_PIDESK=1` so the seam that routes the console into a window exists at all.
+livecon = []
+
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }
