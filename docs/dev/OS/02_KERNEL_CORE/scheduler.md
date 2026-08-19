@@ -2596,6 +2596,98 @@ else. **The verdict is the next metal boot that starves.** If that boot prints `
 frozen `passes` pair, this reading is confirmed and the next arc belongs in the input path; if it
 prints `verdict=PLACEMENT`, this reading is falsified and the scheduler is back under suspicion.
 
+### INWEDGE — what the wedge under STARVE1 actually was: the input router held the panel lock across a dispatch (aarch64, `exec-inwedge`)
+
+STARVE1 above ends by naming the next question: *if the wedge is real, the next arc belongs in the
+input path.* This is that arc, and the answer is yes — with a mechanism, a fix and a go-red.
+
+**The prior was refuted first.** The suspect going in was the WHEEL/WHEELZOOM routing that landed
+the same day: a focused vug dying mid-scroll, the input task delivering a wheel detent into a ring
+whose owner was being torn down. The boot-8 wire refuses it outright, and does so three times over:
+
+* `[wheel1]` — the wheel census, edge-triggered on `decoded + routed + nofocus` — **never printed**,
+  in boot 8 or anywhere else in `pi4-pi1-b1/ttyACM0.log`. Not one wheel byte was decoded, routed, or
+  dropped for want of focus.
+* `[piusb26]` — the xHCI pump's cost line, rate-limited to one print per 5 s — printed **exactly
+  once** in boot 8, at byte 6501 of the boot, and never again. `usb-pump` is spawned on `input_cpu`,
+  the same core the wedge took: the pump made one pass and died with the core. After that instant no
+  HID report of any kind — motion, button or wheel — was pumped at all.
+* No `[piusb24]`, no `[el0in]`, no `[cursor] armed`, no `[vugzoom]`. Every `[clickroute]`, `[wm-act]`
+  and `[drag]` line in the freeze window carries `settle=noproc-selftest` or `dragperf`: synthetic
+  fixture events, not hardware.
+
+Boot 8 never delivered a single real pointer report. There was no scroll to race with, and the
+wheel arc is exonerated.
+
+**What the capture does support.** `[spin1] cpu=3 task=99:input state=1 park=0 … sched phase=6
+passes=2860` with `irq total=3081 last=30`, every counter byte-identical across 21 prints spanning
+14.8 s to 465.3 s. Phase 6 is `SPIN8_TASK` — the core was inside a task, not inside its own scheduler
+loop. INTID **30** is the generic-timer PPI: the last thing core 3 did was take a timer interrupt and
+never leave it. A frozen IRQ total is the SPIN-7/SPIN-8 masked-spin signature. All three
+already-witnessed masked spins read clean on that capture (`sem_stalls=0`, `futex_stalls=0`, no
+`[wedge4] preempt-in-section` line), so the spin was on a raw `spin::Mutex` that none of
+WEDGE-4/5/6 watches. Everything pinned to that core died with it: `rx-backstop` frozen at
+`bs_phase=1 bs_loops=2`, `status-tick` and `usb-pump` never dispatched again.
+
+**The interleaving, on one core.**
+
+1. `usb-pump` (input core, `PRIO_SERVICE`) runs the FOCUS-VIS cursor keep-alive inside
+   `route_input_to_active_el0`. It reads panel geometry out of `video::WRITER` (`pal_width_hint` /
+   `pal_height_hint`) and repaints the sprite through `video::cursor::repaint`, whose `refresh_locked`
+   takes `WRITER` again. All of it acquired **blocking, with interrupts enabled**, from a preemptible
+   kernel task.
+2. The quantum tick lands inside that section. `timer_preempt` marks the task READY and switches to
+   the scheduler, which requeues it. The task is now off-CPU **still holding `WRITER`**.
+3. The core dispatches its band peer, `input`.
+4. The next timer tick lands with `input` current. `timer_preempt` calls `load_witness_tick`, whose
+   emit is a `serial_println!` — and `serial::_print`'s panel mirror (`video::fbcon::_print`, still
+   live because `pidesk` had not yet taken the glass) takes `WRITER` with a **blocking** acquire.
+   `video/fbcon.rs` documents that call as requiring interrupts ENABLED for precisely this reason;
+   inside the IRQ vector it runs masked.
+5. The acquire never returns. The core is masked, so the holder it displaced can never be
+   redispatched to release the lock, and `SCHED[3].current` still names the interrupted task —
+   `99:input`. That is the name on the `[spin1]` line, and it is not the culprit; it is the tenant.
+
+**The rule, stated once.** *The input router may not hold a raw panel lock across a dispatch, and may
+not block on one.* Every other raw-spinlock section on this arch already obeys it — `sched::rq`
+masks, `Semaphore`/`FutexBucket` mask, `shell_inbox` masks, the global allocator masks. The input
+router was the exception, and it is the one task set that shares a core with the kernel's only
+IRQ-context printer.
+
+**The fix (two parts, both in `main.rs`'s router).**
+
+* `pal_width_hint` / `pal_height_hint` now go through `inwedge_panel_info`: **masked** (the section
+  cannot be preempted) and **`try_lock`** (the router can never itself be the spinner). A refused read
+  yields 0, which is the clamp-to-(0,0) degradation the FOCUS-VIS doc already sanctioned for an unset
+  framebuffer.
+* The whole keep-alive `match` runs inside `arch::without_interrupts`. Making only the two geometry
+  reads safe would leave `cursor::repaint`'s own `WRITER` hold — the wider one — still preemptible on
+  the input core, i.e. would leave the wedge where boot 8 found it. The masked span is bounded and
+  small (two `info()` reads and one sprite restore+draw with its cache clean) and runs at most once
+  per HID report on a ~250 Hz pump.
+
+**The witness.** `[inwedge] panel-lock read=N refused=M` — edge-triggered on `refused`, so it is
+silent on every boot that never contended (which is every automated gate). A **nonzero `refused` is
+the boot-8 window entered and survived**: before this arc that same instant was a blocking acquire
+from a preemptible task on the input core. It is the recurrence witness the arc owes, and it names
+the wedge rather than leaving a reader to cross-reference `[spin1]`, `[spread4]` and `[el0live]`.
+
+**Go-red.** `inwedge_selftest` holds `video::WRITER` and drives the router's own geometry read from
+the same core. With the fix: `:: INWEDGE: router panel-lock — held: w=0 h=0 refused+2 | released:
+w=640 real=640 read+1 :: PASS ::`, and `./arroyo kernel8-test 210` reaches 117/117 with 0 forbidden
+(23833 lines). With `pal_width_hint` reverted to its pre-arc `WRITER.lock()` and nothing else
+changed, the same 210 s window **stops the boot at 337 lines, 40/117 witnesses** — the deadlock, on a
+QEMU that can deliver no HID at all. The metal capture needed a pointer report and a timer tick to
+line up; the leg needs neither.
+
+**Out of lane, reported not touched.** `video::cursor::refresh_locked` still takes `WRITER` with a
+blocking acquire, and `arch::poll_input` still takes `SERIAL_PORT` blocking with interrupts enabled
+from the preemptible `input` task (`arch/aarch64/serial.rs` names that hazard in its own comment).
+Both are now covered on the input path — the first by the masked section above, the second by the
+fact that its only masked counterparty (`sys_write`, `syscall.rs:7238`) holds `SERIAL_PORT` bounded —
+but neither has been made safe at its own site. The general rule wants a `WRITER` discipline in the
+video lane and a non-blocking `poll_input` in the syscall/serial lane.
+
 ### Orphan-reaper wake on enqueue (aarch64, SCHED-4b)
 
 **SCHED-4 sleep_ticks regression** (U11-reap FAIL, timer never ticks in QEMU) bisected and fixed by SCHED-4b (`d7631117`): semaphore wake on orphan enqueue — ~0% idle duty metal-confirmed (c2=0% P31b), U11-reap PASS restored.

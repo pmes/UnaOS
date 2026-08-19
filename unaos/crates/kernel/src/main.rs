@@ -1311,6 +1311,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // ("EVENT_QUEUE is empty and no user slot is live") was false at this point in the boot: the
             // whole M6b..U7 fixture cascade is already spawned and running on the APs, holding ASIDs 1-8.
             typematic_selftest(); // UVUG-6: prove the dropped-KeyUp wedge is closed (report-level + guards)
+            inwedge_selftest(); // INWEDGE: prove the input router refuses a held panel lock instead of wedging the input core on it
             unaos_kernel::arch::serial::RX_READY.init(); // M5c: the RX-wake semaphore's waiter list
             if !pidesk_activate_maybe() { unaos_kernel::video::fbcon::detach(); } pi_rast_demo_maybe(); // CONSWIN-PI: the DESKTOP-READY seam rides the detach line on the same zero-source-lines discipline PI-RAST established, and it GUARDS the detach — `pidesk_activate_maybe` answers true only when the console is ROUTED into a compositor window, and a routed console does not write the panel (`fbcon::draw_fb` hands back the window surface), so the one thing the detach exists to guarantee — exactly one core writing the panel — is already true and skipping it leaves the console window LIVE instead of freezing it at the handoff. Knob-off it is `#[inline(always)] false`, so this folds to the bare `detach(); pi_rast_demo_maybe();` it has always been. // PI-RAST demo (no-op unless UNAOS_PIRAST=1) on the SAME source line as the detach it rides, so the wire-in adds ZERO source lines ahead of any panic Location — the pi knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helper defined at file tail; runs here because the panel is up, fbcon has just stopped mirroring, and the input/render service tasks below are not spawned yet (nothing else paints).
             // M5c: on metal, route + enable the PL011 RX interrupt (SPI 153) to the input core so the
@@ -2864,20 +2865,106 @@ fn serial_to_shell(byte: u8) {
     }
 }
 
+// =================================================================================================
+// INWEDGE — the input core must never leave the panel lock held across a dispatch
+// =================================================================================================
+//
+// THE WEDGE THIS CLOSES (dsktp boot 8, `pi4-pi1-b1/ttyACM0.log`). Core 3 — the INPUT core, host to
+// `input`, `usb-pump`, `rx-backstop` and `status-tick` — stopped dead with `[spin1] cpu=3
+// task=99:input ... sched phase=6 passes=2860` and EVERY counter byte-identical across 21 prints
+// spanning 14.8 s to 465.3 s: `passes` frozen, `disp busy/idle` frozen, and `irq total=3081
+// last=30` frozen. INTID 30 is the generic-timer PPI: the last thing that core did was take a timer
+// interrupt, and it never left it. A frozen IRQ total is the masked-spin signature SPIN-7/SPIN-8
+// established, and phase 6 (`SPIN8_TASK`) says the core was inside a task, not inside its own
+// scheduler loop. The three already-witnessed masked spins all read CLEAN on that capture
+// (`sem_stalls=0`, `futex_stalls=0`, no `[wedge4] preempt-in-section` line), so the spin was on a
+// raw `spin::Mutex` that none of WEDGE-4/5/6 watches.
+//
+// THE INTERLEAVING, on ONE core:
+//
+//   1. `usb-pump` (input core, PRIO_SERVICE) takes a HID pointer report into
+//      `route_input_to_active_el0` and runs the FOCUS-VIS cursor keep-alive, which reads panel
+//      geometry out of `video::WRITER` and then repaints the sprite through `video::cursor`. Both
+//      acquire `WRITER`, and — this is the defect — they acquired it BLOCKING and with interrupts
+//      ENABLED, from a preemptible kernel task.
+//   2. The quantum tick lands inside that section. `timer_preempt` marks the task READY and switches
+//      to the scheduler, which requeues it. The task is now off-CPU **still holding `WRITER`**.
+//   3. The core dispatches its band peer, `input`.
+//   4. The NEXT timer tick lands with `input` current. `timer_preempt` calls `load_witness_tick`,
+//      whose emit is a `serial_println!` — and `serial::_print`'s panel mirror (`video::fbcon::_print`,
+//      reached before `pidesk` has taken the glass) takes `WRITER` with a BLOCKING acquire. That call
+//      is documented in `video/fbcon.rs` as requiring interrupts ENABLED for exactly this reason; here
+//      it runs inside the IRQ vector, IRQ-masked.
+//   5. The acquire never returns. The core is masked, so the holder it displaced can never be
+//      redispatched to release the lock, and `SCHED[3].current` still names the interrupted task —
+//      `99:input`. Every task pinned to that core dies with it: `usb-pump` emitted `[piusb26]`
+//      exactly ONCE in the whole boot (it is rate-limited to 5 s), `rx-backstop` froze at
+//      `bs_phase=1 bs_loops=2`, and no `[wheel1]`, `[piusb24]`, `[el0in]` or `[cursor] armed` line
+//      ever appeared. That is the whole input subsystem, ~15 s into the boot.
+//
+// THE RULE, stated once: **the input router may not hold a raw panel lock across a dispatch, and may
+// not block on one.** Every other raw-spinlock section on this arch already obeys it — `sched::rq`
+// masks, `Semaphore`/`FutexBucket` mask, `shell_inbox` masks, the global allocator masks. The input
+// router was the exception, and it is the one task set that shares a core with the kernel's only
+// IRQ-context printer.
+//
+// The two hint readers below therefore acquire MASKED (so the section cannot be preempted) and
+// NON-BLOCKING (so the router can never itself be the spinner). A refused read yields 0, which is the
+// clamp-to-(0,0) degradation the FOCUS-VIS doc already sanctions for an unset framebuffer, and it is
+// COUNTED — see `inwedge_note_refused`: a nonzero `[inwedge]` census on the wire is the boot-8 window
+// being entered and SURVIVED, which is the recurrence witness this arc owes.
+
+/// INWEDGE — panel-geometry reads the router refused rather than block on. Nonzero means the window
+/// that killed boot 8 was entered on this boot; the machine kept running instead of wedging.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static INWEDGE_REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// INWEDGE — panel-geometry reads the router completed. The denominator, so a refusal rate is
+/// readable rather than an unanchored count.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+static INWEDGE_READ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// INWEDGE — `(read, refused)`.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn inwedge_census() -> (u32, u32) {
+    use core::sync::atomic::Ordering;
+    (INWEDGE_READ.load(Ordering::Relaxed), INWEDGE_REFUSED.load(Ordering::Relaxed))
+}
+
+/// INWEDGE — the ONE panel-lock acquisition the input router makes: masked, non-blocking, counted.
+/// Returns `None` when the lock is held elsewhere (or the framebuffer is unset); the callers clamp.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn inwedge_panel_info() -> Option<unaos_boot_info::FrameBufferInfo> {
+    use core::sync::atomic::Ordering;
+    unaos_kernel::arch::without_interrupts(|| match unaos_kernel::video::WRITER.try_lock() {
+        Some(fb) => {
+            INWEDGE_READ.fetch_add(1, Ordering::Relaxed);
+            Some(fb.info())
+        }
+        None => {
+            INWEDGE_REFUSED.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    })
+}
+
 /// FOCUS-VIS — panel dimensions for the router's cursor keep-alive, read straight from the scan-out
 /// framebuffer. The router has no `TargetPal` (that lives in the render task), and `pal::cursor` needs
 /// bounds to clamp the hot spot against; `video::WRITER` is the same surface the sprite is drawn into,
 /// so the two can never disagree. Zero while the framebuffer is unset, which clamps to (0,0) — harmless,
 /// and unreachable in practice since a pointer report implies a booted display.
+///
+/// INWEDGE — and zero, now, also when the lock is CONTENDED. See the block above for why blocking here
+/// is the wedge and refusing is not.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn pal_width_hint() -> i32 {
-    unaos_kernel::video::WRITER.lock().info().width as i32
+    inwedge_panel_info().map(|i| i.width as i32).unwrap_or(0)
 }
 
 /// FOCUS-VIS — see [`pal_width_hint`].
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn pal_height_hint() -> i32 {
-    unaos_kernel::video::WRITER.lock().info().height as i32
+    inwedge_panel_info().map(|i| i.height as i32).unwrap_or(0)
 }
 
 /// EL0IN-FOCUS: true only while `input_router_selftest` is inside `route_input_to_active_el0`. That test
@@ -2929,7 +3016,18 @@ fn route_input_to_active_el0() -> usize {
         // so its synthetic events still arm nothing and the QEMU gate output is unchanged — while a REAL
         // pointer report moves the system cursor from the first report of the boot, whoever holds focus.
         if !ROUTER_SELFTEST.load(core::sync::atomic::Ordering::Relaxed) {
-            match ev {
+            // INWEDGE — THE SECTION, and the whole of it. `video::cursor::repaint` takes `WRITER`
+            // itself (`refresh_locked`'s flush), so making only the two geometry reads safe would
+            // leave the wider hold — the sprite restore+draw — still preemptible on the input core,
+            // i.e. would leave the wedge exactly where boot 8 found it. Masking the section is what
+            // makes the rule true rather than nearly true: the input router now cannot be switched
+            // away from while it holds a panel lock, so no later masked acquirer on this core can
+            // ever spin on one it cannot get released. This is the same discipline `sched::rq`,
+            // `Semaphore`, `shell_inbox` and the global allocator already keep; the router was the
+            // exception. The masked span is bounded and small — two `info()` reads and one 16x16
+            // sprite restore+draw with its cache clean — and it runs at most once per HID report on a
+            // ~250 Hz pump, which is why paying it here is cheaper than any lock-ordering scheme.
+            unaos_kernel::arch::without_interrupts(|| match ev {
                 unaos_kernel::pal::Event::Mouse { x, y } if x != 0 || y != 0 => {
                     unaos_kernel::pal::cursor::move_rel(
                         x,
@@ -2944,7 +3042,7 @@ fn route_input_to_active_el0() -> usize {
                     unaos_kernel::video::cursor::repaint();
                 }
                 _ => {}
-            }
+            });
         }
         #[cfg(feature = "pidesk")] unaos_kernel::video::wm::drag_route_tail(ev); // DRAG-PI M3 — STEER a live title-bar grab from the FOCUSED-APP drain, after the cursor keep-alive above has applied this report and before the event is routed onward. This is the path a grab actually takes: the chrome arm focuses the dragged window's own owner, so every subsequent pointer report arrives here and is PACKED into that app's ring — the shell drain never sees it. Keyed on the raw event inside `drag_route_tail`, so a non-pointer event and an idle boot both cost one match and one atomic load. Delivery is unchanged: the app still receives the report, exactly as it does today.
         let queued = unaos_kernel::arch::aarch64::syscall::user_input_enqueue(ev);
@@ -3535,6 +3633,7 @@ fn pump_usb_into_gui() {
         route_input_to_active_el0();
         click2_depth_witness();
         wheel1_witness(); // WHEEL — edge-triggered; silent unless a wheel delta actually moved.
+        inwedge_witness(); // INWEDGE — edge-triggered; silent unless the panel lock was actually contended.
         return;
     }
     if SCREEN_APP_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
@@ -3717,6 +3816,7 @@ fn pump_usb_into_gui() {
     }
     click2_depth_witness();
     wheel1_witness(); // WHEEL — edge-triggered; silent unless a wheel delta actually moved.
+    inwedge_witness(); // INWEDGE — edge-triggered; silent unless the panel lock was actually contended.
     // PIUSB-28: fire the FAT mount from the path that ACTUALLY runs on Pi baremetal+fb. PIUSB-27
     // wired `piusb27_service()` beside `probe_once` in the main/GUI loop — but that loop never runs
     // on Pi metal (kernel_main spawns services and hlt_loops; the PIUSB-22 structural finding, which
@@ -4031,6 +4131,65 @@ fn wheel1_witness() {
             decoded, routed, nofocus, last
         );
     }
+}
+
+/// INWEDGE — the `[inwedge]` recurrence witness: how many of the input router's panel-geometry reads
+/// completed, and how many were REFUSED because `video::WRITER` was held elsewhere at that instant.
+///
+/// A refusal is the boot-8 window, entered and survived. Before this arc that same instant was a
+/// blocking acquire from a preemptible task on the input core, and the capture shows what it cost: the
+/// lock left held across a dispatch, then the IRQ-context printer of the very next timer tick spinning
+/// on it forever with interrupts masked, taking `input`, `usb-pump`, `rx-backstop` and `status-tick`
+/// down together. So a nonzero `refused` is not a fault line — it is the ONE thing that says the race
+/// is real on this hardware and that the machine walked away from it. Zero says the window was never
+/// even entered on this boot, which is the common case and is why the line is EDGE-TRIGGERED: it is
+/// silent on every boot that never contended, including every automated gate, so it adds no line to
+/// the knob-off serial log for a subsystem that did nothing.
+///
+/// Called from the same two pump destinations as `[wheel1]`, for the same reason.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn inwedge_witness() {
+    use core::sync::atomic::Ordering;
+    /// The refusal count at the last print. Only REFUSALS gate the line: `read` advances on every
+    /// pointer report of a live sitting, and a line per report would be a flood.
+    static LAST_REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let (read, refused) = inwedge_census();
+    if refused != LAST_REFUSED.swap(refused, Ordering::Relaxed) {
+        serial_println!(
+            "[inwedge] panel-lock read={} refused={} — the input router declined a held WRITER instead of blocking on it (boot-8 wedge window, survived)",
+            read, refused
+        );
+    }
+}
+
+/// INWEDGE — the QEMU-reachable proof. Holds `video::WRITER` and then drives the input router's OWN
+/// panel-geometry read from the SAME core, asserting it comes back REFUSED (clamped to 0) instead of
+/// blocking — and that it comes back with the real geometry once the lock is released.
+///
+/// WHY THIS IS A REAL GATE AND NOT A TAUTOLOGY. At the base sha this leg does not fail, it HANGS: the
+/// old `pal_width_hint` was `WRITER.lock()`, a blocking acquire on a lock this function is holding, on
+/// one core. That hang IS the boot-8 wedge, reproduced deterministically on a QEMU that can deliver no
+/// HID at all — the metal capture needed a pointer report and a timer tick to line up, this needs
+/// neither. Runs once on the BSP, before the input/render tasks are spawned, so nothing else can be
+/// touching `WRITER` and the census it reads is its own.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn inwedge_selftest() {
+    let (read0, refused0) = inwedge_census();
+    let (refused_w, refused_h) = {
+        let _held = unaos_kernel::video::WRITER.lock(); // the holder the router must not block on
+        (pal_width_hint(), pal_height_hint())
+    };
+    let (_, refused1) = inwedge_census();
+    let free_w = pal_width_hint();
+    let (read2, _) = inwedge_census();
+    let real = unaos_kernel::video::WRITER.lock().info().width as i32;
+    let declined = refused_w == 0 && refused_h == 0 && refused1 == refused0 + 2;
+    let recovered = free_w == real && read2 == read0 + 1;
+    serial_println!(
+        ":: INWEDGE: router panel-lock — held: w={} h={} refused+{} | released: w={} real={} read+{} :: {} ::",
+        refused_w, refused_h, refused1 - refused0, free_w, real, read2 - read0,
+        if declined && recovered { "PASS" } else { "FAIL" }
+    );
 }
 
 /// M5 (bare-metal aarch64): keyboard input as a scheduled kernel service. The OS runs its own input
