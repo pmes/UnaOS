@@ -647,6 +647,19 @@ pub fn init(gpu: &GpuInfo) {
         #[cfg(all(target_arch = "x86_64", feature = "gen7"))]
         super::gen7::rearm(bar0, bar0_size, gpu.bus, gpu.slot, gpu.func, gt_wake);
 
+        // GEN7-3D rung R7 — the BCS blitter ring (UNAOS_IVB3D). R6 asked whether ANY ring's
+        // RING_CTL latches under a held wake and whether the RCS retires a bare store; R7 keeps
+        // that whole envelope (same R6_CANDS holds, same fw_acquire-across-the-arm, same
+        // proven-unowned GGTT window, full capture/restore/re-read) and moves it to the BCS with a
+        // real XY_SRC_COPY_BLT — a 16x16x32bpp pixel copy plus an MI_STORE_DATA_IMM sentinel, so
+        // the copy and the retirement are two independent witnesses. Placed AFTER `rearm` and
+        // still BEFORE `bring_up_blt_ring`. Same write envelope as R6 plus one GGTT slot: the Dark
+        // branch writes nothing, every write is captured/restored/re-read on every exit path, the
+        // claim only enters a proven-unowned window, the PTEs are never unmapped under a live
+        // ring, and no display register is touched — so R7 cannot black Peter's screen either.
+        #[cfg(all(target_arch = "x86_64", feature = "gen7"))]
+        super::gen7::blit(bar0, bar0_size, gpu.bus, gpu.slot, gpu.func, gt_wake);
+
         // BLT ring bring-up. SEAT FIXUP (review round 2): an ACCELERATOR must degrade, never kill
         // the boot — every refusal below breaks out of this block, the ring simply never comes up,
         // `blitter_*` return false, and the CPU path carries the console exactly as before this

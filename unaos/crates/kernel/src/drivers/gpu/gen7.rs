@@ -4497,3 +4497,801 @@ pub unsafe fn rearm(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, 
     serial_println!(":: gen7: r6 next={} note=every-write-captured-restored-and-re-read-on-every-exit-path ::", next);
     serial_println!(":: gen7: r6 end ::");
 }
+
+// =====================================================================================
+// GEN7 rung R7 — the BCS blitter ring: XY_SRC_COPY_BLT under the mt forcewake hold.
+// =====================================================================================
+//
+// R6 asked whether ANY ring's RING_CTL will latch under a held wake and, if so, whether the CS
+// executes a bare MI_STORE_DATA_IMM on the RCS. R7 keeps the entire R6 envelope — the same
+// R6_CANDS holds (mt first), the same fw_acquire/fw_release-across-the-arm discipline, the same
+// proven-unowned GGTT window and full capture/restore/re-read on every write — and moves it to
+// the **BCS** (blitter) engine with a **real 2D command**: an XY_SRC_COPY_BLT that copies a
+// 16x16x32bpp rectangle from a seeded source page into a destination page, followed by an
+// MI_STORE_DATA_IMM sentinel so the copy and the retirement are two independent witnesses.
+//
+// The rung's whole added question over R6: does the BCS parse a genuine 2D command and move
+// pixels, not just retire a store? `dst_match=/256` is the pixel witness; `sentinel_hit` is the
+// retirement witness; the two crc columns cross-check (a perfect copy makes `dst_crc==src_crc`).
+//
+// Safety is R6's, not one inch wider: the Dark branch writes nothing; no display register is
+// touched; the GGTT claim only enters an all-zero or R4b-confirmed-scratch-fill window with both
+// bracketing neighbours smear-checked; every write (the forcewake request, the four BCS ring
+// registers — restored only once the ring is CONFIRMED disabled, §1.1.11.2 p.76 — the five GGTT
+// slots, and the one GTT-flush register) is captured, restored and re-read on every exit path;
+// and the PTEs are NEVER unmapped under a live ring — if BCS RING_CTL will not clear, R7 leaves
+// them claimed, leaks the three pages, and parks loud.
+
+/// R7's destination GGTT slot — one above R5's target (which R7 reuses as the copy source).
+/// GGTT 0x10002000. [EXT-UNPINNED base] as the R5/R6 window carries it.
+const R7_DST_SLOT: usize = 0x10002;
+/// R7's MI_STORE_DATA_IMM sentinel — distinct from the seed and from R5/R6's sentinel so a hit
+/// is unambiguously THIS rung's store landing.
+const R7_SENTINEL: u32 = 0x0B75_C0DE;
+/// The destination sentinel-slot seed, re-written before every candidate's arm.
+const R7_DST_SENTINEL_SEED: u32 = 0xDA7A_5EED;
+
+/// Is battery row `i` one of the four BCS submission registers R7 itself writes?
+fn r7_writes_row(i: usize) -> bool {
+    let (blk, name, _, _) = GT_BATTERY[i];
+    blk == "bcs" && matches!(name, "RING_CTL" | "RING_HEAD" | "RING_TAIL" | "RING_START")
+}
+
+/// GEN7 rung R7 — hold a forcewake candidate across a BCS ring arm, submit an XY_SRC_COPY_BLT +
+/// MI_STORE_DATA_IMM, verify the pixel copy and the retirement, then reclaim the scratch pages.
+///
+/// Called from `igpu::init` immediately after `rearm` (R6) and still BEFORE `bring_up_blt_ring`,
+/// taking R3's `GtWake` verdict so it self-gates on the same `write_ok()` evidence R4/R5/R6 use.
+///
+/// # Safety
+/// Same contract as `rearm`: `bar0` is a live MMIO mapping of at least `bar0_size` bytes of the
+/// IGD's BAR0. R7 writes, ONLY on a `write_ok()` wake, one forcewake request register at a time
+/// (restored by `fw_release`), at most three GGTT PTEs plus their two neighbours (all restored to
+/// `base_img` and re-read), the four BCS ring registers (restored to their captured entry images,
+/// only once the ring is confirmed disabled), and one [EXT-UNPINNED] GTT-flush register. It
+/// writes no display register.
+pub unsafe fn blit(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, wake: GtWake) {
+    serial_println!(
+        ":: gen7: r7 begin rung=R7 wake={} reachable={} write_ok={} cands={} bdf={}:{}.{} bar0_size={} ladder=GEN7-3D engine=BCS ::",
+        wake.name(),
+        if wake.reachable() { 1 } else { 0 },
+        if wake.write_ok() { 1 } else { 0 },
+        R6_CANDS.len(),
+        bus,
+        slot,
+        func,
+        bar0_size
+    );
+
+    // ---- Parachutes, identical discipline to R1-R6 ------------------------------------
+    if bar0 == 0 {
+        serial_println!(":: gen7: r7 verdict=r7-refused-no-bar0 writes=0 — BAR0 unpublished; no read or write attempted ::");
+        serial_println!(":: gen7: r7 next=STOP-bar0-unpublished-fix-igpu-init-mapping-first note=no-hold-no-ring-armed ::");
+        serial_println!(":: gen7: r7 end ::");
+        return;
+    }
+
+    const GTT_BASE: usize = 0x200000; // igpu::regs::GTT_BASE — [EXT-UNPINNED], as R1/R4/R5/R6 carry it
+    const SLOTS: usize = 524_288;
+    // Highest register offset R7 touches: RENFW_ACK (0x1300B4) — above both the ring block and
+    // the GTT-flush candidate. Checked against the size we were GIVEN, before any access.
+    const MAX_REG_OFF: usize = g7regs::HYP_RENFW_ACK + 4;
+    // R7's window is one slot wider than R6's: ring + src + dst + the two bracketing neighbours.
+    let win_next_slot = R7_DST_SLOT + 1;
+    let win_end_off = GTT_BASE + (win_next_slot + 1) * 4;
+    if win_next_slot >= SLOTS
+        || bar0_size < win_end_off
+        || bar0_size < MAX_REG_OFF
+        || bar0_size < g7regs::HYP_GFX_FLSH_CNTL + 4
+    {
+        serial_println!(
+            ":: gen7: r7 verdict=r7-refused-bar0-too-small have={} need_win={} need_reg={} next_slot={} slots={} writes=0 ::",
+            bar0_size,
+            win_end_off,
+            MAX_REG_OFF,
+            win_next_slot,
+            SLOTS
+        );
+        serial_println!(":: gen7: r7 next=STOP-window-or-register-block-out-of-range note=no-hold-no-ring-armed ::");
+        serial_println!(":: gen7: r7 end ::");
+        return;
+    }
+
+    // ---- The delta control: GTFIFOCTL at entry (read twice, never written) -------------
+    let gtfifo_pre = rd(bar0, g7regs::HYP_GTFIFOCTL);
+    let gtfifo_pre2 = rd(bar0, g7regs::HYP_GTFIFOCTL);
+    serial_println!(
+        ":: gen7: r7 gtfifoctl col=pre off={:06X} v0={:08X} v1={:08X} cls={} varies={} pin=CHV-ONLY-p451/METAL-BootD note=always-on-GT-witness-never-written-by-any-rung ::",
+        g7regs::HYP_GTFIFOCTL,
+        gtfifo_pre,
+        gtfifo_pre2,
+        Cls::of(gtfifo_pre).name(),
+        if gtfifo_pre != gtfifo_pre2 { 1 } else { 0 }
+    );
+
+    // ---- The DARK battery column — read before R7 writes anything ---------------------
+    let mut dark = [0u32; BATTERY_N];
+    let mut dark_var = [false; BATTERY_N];
+    read_battery(bar0, "r7", "r7dark", &mut dark, &mut dark_var);
+
+    // ---- Ring-register entry images (read-only, BOTH branches) — the BCS column -------
+    let mut ring = Tally::default();
+    let ring_start_pre = probe(bar0, "r7bcs", "RING_START", g7regs::BCS_RING_START, "IVB-PINNED", &mut ring);
+    let ring_ctl_pre = probe(bar0, "r7bcs", "RING_CTL", g7regs::BCS_RING_CTL, "IVB-PINNED", &mut ring);
+    let ring_head_pre = probe(bar0, "r7bcs", "RING_HEAD", g7regs::BCS_RING_HEAD, "IVB-PINNED", &mut ring);
+    let ring_tail_pre = probe(bar0, "r7bcs", "RING_TAIL", g7regs::BCS_RING_TAIL, "IVB-PINNED", &mut ring);
+    serial_println!(
+        ":: gen7: r7 ring-census engine=BCS n={} structured={} zero={} allones={} varies={} entry_start={:08X} entry_ctl={:08X} entry_head={:08X} entry_tail={:08X} note=entry-images-teardown-restores-to-THESE-not-to-a-blind-zero ::",
+        ring.n, ring.structured, ring.zero, ring.allones, ring.varies,
+        ring_start_pre, ring_ctl_pre, ring_head_pre, ring_tail_pre
+    );
+
+    // ---- Read-only census of the three-slot window + neighbours (R4b), BOTH branches --
+    let ring_off = GTT_BASE + R5_RING_SLOT * 4;
+    let src_off = GTT_BASE + R5_TGT_SLOT * 4; // R5's target slot is R7's copy SOURCE
+    let dst_off = GTT_BASE + R7_DST_SLOT * 4;
+    let prev_off_g = GTT_BASE + (R5_RING_SLOT - 1) * 4; // 0xFFFF
+    let next_off_g = GTT_BASE + (R7_DST_SLOT + 1) * 4; // 0x10003
+    let ring_pre_img = rd(bar0, ring_off);
+    let src_pre_img = rd(bar0, src_off);
+    let dst_pre_img = rd(bar0, dst_off);
+    let prev_nb = rd(bar0, prev_off_g);
+    let next_nb = rd(bar0, next_off_g);
+    let fill = ring_pre_img;
+    let uniform = src_pre_img == fill && dst_pre_img == fill && prev_nb == fill && next_nb == fill;
+    let all_zero = fill == 0 && uniform;
+    serial_println!(
+        ":: gen7: r7 window ring_slot={} src_slot={} dst_slot={} ring_pre={:08X} src_pre={:08X} dst_pre={:08X} prev={:08X} next={:08X} fill={:08X} uniform={} all_zero={} base={:06X} base_pin=unpinned ::",
+        R5_RING_SLOT, R5_TGT_SLOT, R7_DST_SLOT, ring_pre_img, src_pre_img, dst_pre_img, prev_nb, next_nb, fill,
+        if uniform { 1 } else { 0 },
+        if all_zero { 1 } else { 0 },
+        GTT_BASE
+    );
+
+    // R4b's four-leg scratch-fill test, unchanged from rearm(): uniform incl. neighbours; valid-PTE
+    // shape with the >4 GiB extended-bit screen; frame == the BDSM base read from the host bridge
+    // THIS boot; and six distant probe slots agreeing so a locally-uniform buffer cannot
+    // impersonate the fill.
+    let uniform_nonzero = uniform && fill != 0;
+    let bdsm = crate::arch::pci::read_config_32(0, 0, 0, 0xB0);
+    let bdsm_base = bdsm & 0xFFF0_0000;
+    let fill_wellformed = (fill & 1) != 0 && (fill & 0xFFFF_F000) != 0 && (fill & 0xF0) == 0;
+    let fill_is_bdsm = (fill >> 12) == (bdsm_base >> 12);
+    let mut far_probed = 0u32;
+    let mut far_match = 0u32;
+    if uniform_nonzero {
+        for &s in R5_FAR_PROBE.iter() {
+            let off = GTT_BASE + s * 4;
+            if off + 4 > bar0_size {
+                continue; // skipping counts AGAINST the fill: fill_global demands all six
+            }
+            far_probed += 1;
+            if rd(bar0, off) == fill {
+                far_match += 1;
+            }
+        }
+    }
+    let fill_global = far_probed as usize == R5_FAR_PROBE.len() && far_match == far_probed;
+    let scratch_fill = uniform_nonzero && fill_wellformed && fill_is_bdsm && fill_global;
+    if uniform_nonzero {
+        serial_println!(
+            ":: gen7: r7 fill-check fill={:08X} bdsm={:08X} bdsm_base={:08X} wellformed={} frame_is_bdsm={} far_match={}/{} far_probed={} scratch_fill={} src=METAL/BootAb dec=derived-this-boot ::",
+            fill, bdsm, bdsm_base,
+            if fill_wellformed { 1 } else { 0 },
+            if fill_is_bdsm { 1 } else { 0 },
+            far_match, R5_FAR_PROBE.len(), far_probed,
+            if scratch_fill { 1 } else { 0 }
+        );
+    }
+
+    // ---- Branch on R3's verdict. The Dark branch writes NOTHING (binding invariant). ----
+    if !wake.write_ok() {
+        serial_println!(
+            ":: gen7: r7 verdict=r7-gated-on-wake wake={} reachable={} ring_structured={}/{} all_zero={} scratch_fill={} writes=0 note=no-hold-attempted-no-ring-armed-no-GGTT-touched-behind-an-unconfirmed-wake ::",
+            wake.name(),
+            if wake.reachable() { 1 } else { 0 },
+            ring.structured, ring.n,
+            if all_zero { 1 } else { 0 },
+            if scratch_fill { 1 } else { 0 }
+        );
+        serial_println!(":: gen7: r7 next=STOP-R3-did-not-confirm-a-wake-R7-needs-the-same-write_ok-gate-R4-R5-R6-use note=no-hold-no-ring-armed ::");
+        serial_println!(":: gen7: r7 end ::");
+        return;
+    }
+    if !all_zero && !scratch_fill {
+        let v = if uniform_nonzero { "r7-fill-hypothesis-refuted" } else { "r7-range-owned-refused" };
+        serial_println!(
+            ":: gen7: r7 verdict={} fill={:08X} ring_pre={:08X} src_pre={:08X} dst_pre={:08X} prev={:08X} next={:08X} bdsm_base={:08X} writes=0 note=window-is-not-provably-unowned-never-overwrite-a-populated-PTE ::",
+            v, fill, ring_pre_img, src_pre_img, dst_pre_img, prev_nb, next_nb, bdsm_base
+        );
+        serial_println!(":: gen7: r7 next=STOP-candidate-window-owned-or-fill-leg-said-NO-park-and-report note=no-hold-no-ring-armed ::");
+        serial_println!(":: gen7: r7 end ::");
+        return;
+    }
+    let base_img: u32 = if all_zero { 0 } else { fill };
+    let mode = if all_zero { "empty" } else { "scratch-fill" };
+
+    // ---- Allocate the three pages ONCE for the whole rung -----------------------------
+    // ring (the BCS ring buffer), src (the copy source), dst (the copy destination + sentinel).
+    // Allocated ONCE and reclaimed as a single three-page decision at the end, exactly as R6
+    // allocated its pair.
+    let layout = Layout::from_size_align(4096, 4096).unwrap();
+    let ring_page = alloc_zeroed(layout);
+    if ring_page.is_null() {
+        serial_println!(":: gen7: r7 verdict=r7-alloc-failed which=ring writes=0 note=nothing-written ::");
+        serial_println!(":: gen7: r7 next=STOP-no-ring-page note=no-hold-no-ring-armed ::");
+        serial_println!(":: gen7: r7 end ::");
+        return;
+    }
+    let src_page = alloc_zeroed(layout);
+    if src_page.is_null() {
+        serial_println!(":: gen7: r7 verdict=r7-alloc-failed which=source writes=0 note=ring-page-leaked-nothing-written ::");
+        serial_println!(":: gen7: r7 next=STOP-no-source-page note=no-hold-no-ring-armed ::");
+        serial_println!(":: gen7: r7 end ::");
+        return;
+    }
+    let dst_page = alloc_zeroed(layout);
+    if dst_page.is_null() {
+        serial_println!(":: gen7: r7 verdict=r7-alloc-failed which=dest writes=0 note=ring+source-pages-leaked-nothing-written ::");
+        serial_println!(":: gen7: r7 next=STOP-no-dest-page note=no-hold-no-ring-armed ::");
+        serial_println!(":: gen7: r7 end ::");
+        return;
+    }
+    let Some(ring_phys64) = crate::arch::memory::translate(ring_page as u64) else {
+        serial_println!(":: gen7: r7 verdict=r7-virt-unmapped which=ring va={:016X} writes=0 note=pages-leaked-nothing-written ::", ring_page as usize);
+        serial_println!(":: gen7: r7 next=STOP-ring-va-unmapped note=no-hold-no-ring-armed ::");
+        serial_println!(":: gen7: r7 end ::");
+        return;
+    };
+    let Some(src_phys64) = crate::arch::memory::translate(src_page as u64) else {
+        serial_println!(":: gen7: r7 verdict=r7-virt-unmapped which=source va={:016X} writes=0 note=pages-leaked-nothing-written ::", src_page as usize);
+        serial_println!(":: gen7: r7 next=STOP-source-va-unmapped note=no-hold-no-ring-armed ::");
+        serial_println!(":: gen7: r7 end ::");
+        return;
+    };
+    let Some(dst_phys64) = crate::arch::memory::translate(dst_page as u64) else {
+        serial_println!(":: gen7: r7 verdict=r7-virt-unmapped which=dest va={:016X} writes=0 note=pages-leaked-nothing-written ::", dst_page as usize);
+        serial_println!(":: gen7: r7 next=STOP-dest-va-unmapped note=no-hold-no-ring-armed ::");
+        serial_println!(":: gen7: r7 end ::");
+        return;
+    };
+    let ring_phys = ring_phys64 as usize;
+    let src_phys = src_phys64 as usize;
+    let dst_phys = dst_phys64 as usize;
+    if ring_phys >= 0x1_0000_0000 || src_phys >= 0x1_0000_0000 || dst_phys >= 0x1_0000_0000 {
+        serial_println!(":: gen7: r7 verdict=r7-phys-above-4g ring_phys={:016X} src_phys={:016X} dst_phys={:016X} writes=0 note=extended-PTE-bits-not-programmed-pages-leaked-nothing-written ::", ring_phys, src_phys, dst_phys);
+        serial_println!(":: gen7: r7 next=STOP-scratch-phys-above-4g note=no-hold-no-ring-armed ::");
+        serial_println!(":: gen7: r7 end ::");
+        return;
+    }
+    let ring_pte = (ring_phys as u32) | GGTT_PTE_VALID;
+    let src_pte = (src_phys as u32) | GGTT_PTE_VALID;
+    let dst_pte = (dst_phys as u32) | GGTT_PTE_VALID;
+    if ring_pte == base_img || src_pte == base_img || dst_pte == base_img {
+        serial_println!(
+            ":: gen7: r7 verdict=r7-pte-indistinct mode={} ring_pte={:08X} src_pte={:08X} dst_pte={:08X} base_img={:08X} writes=0 note=transition-unwitnessable-pages-leaked-nothing-written ::",
+            mode, ring_pte, src_pte, dst_pte, base_img
+        );
+        serial_println!(":: gen7: r7 next=STOP-pte-equals-entry-image note=no-hold-no-ring-armed ::");
+        serial_println!(":: gen7: r7 end ::");
+        return;
+    }
+    let ring_gtt_addr = (R5_RING_SLOT * 4096) as u32; // 0x10000000
+    let src_gtt_addr = (R5_TGT_SLOT * 4096) as u32; // 0x10001000
+    let dst_gtt_addr = (R7_DST_SLOT * 4096) as u32; // 0x10002000
+    // RING_BUFFER_START constraint (§1.1.11.3 p.77): the ring's GGTT address bits[31:29] MUST be
+    // zero. See rearm()'s identical guard and its HONEST NOTE ON THE STRINGS PROOF: `ring_gtt_addr`
+    // is a compile-time constant, so rustc proves this branch dead and strips
+    // `r7-ring-addr-illegal` from the artifact — the invariant discharged at compile time, not
+    // absent. If the slot is ever changed to a non-constant, the branch and its token come back.
+    if ring_gtt_addr & 0xE000_0000 != 0 {
+        serial_println!(
+            ":: gen7: r7 verdict=r7-ring-addr-illegal ring_gtt_addr={:08X} writes=0 note=RING_START-requires-bits-31:29-zero-IVB-V1P3-1.1.11.3-p77 ::",
+            ring_gtt_addr
+        );
+        serial_println!(":: gen7: r7 next=STOP-ring-address-violates-RING_START-31:29-zero note=no-hold-no-ring-armed ::");
+        serial_println!(":: gen7: r7 end ::");
+        return;
+    }
+
+    // ---- Pre-write gate: re-read the five touched slots against a fresh baseline ------
+    let prev_pre = rd(bar0, prev_off_g);
+    let next_pre = rd(bar0, next_off_g);
+    if rd(bar0, ring_off) != base_img
+        || rd(bar0, src_off) != base_img
+        || rd(bar0, dst_off) != base_img
+        || prev_pre != base_img
+        || next_pre != base_img
+    {
+        serial_println!(
+            ":: gen7: r7 verdict=r7-entry-drifted mode={} base_img={:08X} writes=0 note=window-changed-between-census-and-claim-pages-leaked-nothing-written ::",
+            mode, base_img
+        );
+        serial_println!(":: gen7: r7 next=STOP-entry-image-drifted-park-and-report note=no-hold-no-ring-armed ::");
+        serial_println!(":: gen7: r7 end ::");
+        return;
+    }
+
+    // ---- The command-stream encodings ------------------------------------------------
+    // ⚠ [EXT-UNPINNED -> pin-before-flight vs IVB PRM Vol1 Part5 "Blitter Engine Command
+    //    Streamer"]. The docs/ tree carries no local extract of the 2D command block for Gen7
+    //    (searched docs/dev this session: only prose references to XY_SRC_COPY_BLT, no field
+    //    encodings), so these four constants are carried as HYPOTHESES this rung tests on our own
+    //    silicon, exactly as R2's forcewake offsets are — a wrong bit here fails the copy, it does
+    //    not touch a display register. Before any hardware flight they MUST be pinned against IVB
+    //    PRM Vol1 Part5 (BLT: XY_SRC_COPY_BLT / BR00 / BR13).
+    //   BR00 (XY_SRC_COPY_BLT DW0): client 2D (0x2<<29) | opcode 0x53<<22 | 32bpp-both bits
+    //     (0x3<<20, dst+src write-RGB / color-depth select per the 2D header) | DWord-length 6
+    //     (== total 8 DWords - 2). = 0x54F00006.
+    const XY_SRC_COPY_BLT_DW0: u32 = (0x2 << 29) | (0x53 << 22) | (0x3 << 20) | 6; // 0x54F00006
+    //   BR13: 32bpp color depth (0x3<<24) | ROP=SRCCOPY (0xCC<<16) | dest pitch 64 bytes.
+    const BR13: u32 = (0x3 << 24) | (0xCC << 16) | 64; // 0x03CC0040
+    const DST_PITCH: u32 = 64; // bytes; 16 px * 4 B
+    const SRC_PITCH: u32 = 64;
+    const RECT_WH: u32 = (16 << 16) | 16; // X2Y2 = (bottom<<16)|right, 16x16
+    const RECT_00: u32 = 0; // X1Y1 = top-left (0,0)
+    // MI_STORE_DATA_IMM reuses the R5/R6 header const (§1.2.17 p.186, IVB-PINNED).
+    // Sentinel destination GGTT address: dst base + 0x800, well clear of the 1 KiB copied rect.
+    let sentinel_gtt_addr = dst_gtt_addr + 0x800;
+    // Ring tail: XY_SRC_COPY_BLT (8 DW) + MI_STORE_DATA_IMM (4 DW) + 4 MI_NOOP pad = 16 DW = 64 B.
+    const RING_TAIL_BYTES: u32 = 0x40;
+
+    // The seed pattern the copy must reproduce, and the pre-blit dst pattern the copy must erase.
+    let src_seed = |i: usize| -> u32 { 0x50C0_0000u32 ^ (i as u32).wrapping_mul(0x9E37_79B9) };
+    let dst_seed = |i: usize| -> u32 { 0xDA7A_0000u32 | (i as u32) };
+
+    // ---- Build the ring contents through the ring page's CPU mapping ------------------
+    let ring_u32 = ring_page as *mut u32;
+    for i in 0..1024usize {
+        core::ptr::write_volatile(ring_u32.add(i), MI_NOOP);
+    }
+    // XY_SRC_COPY_BLT — 8 DWords.
+    core::ptr::write_volatile(ring_u32.add(0), XY_SRC_COPY_BLT_DW0);
+    core::ptr::write_volatile(ring_u32.add(1), BR13);
+    core::ptr::write_volatile(ring_u32.add(2), RECT_00); // dst X1Y1
+    core::ptr::write_volatile(ring_u32.add(3), RECT_WH); // dst X2Y2
+    core::ptr::write_volatile(ring_u32.add(4), dst_gtt_addr); // dst base
+    core::ptr::write_volatile(ring_u32.add(5), RECT_00); // src X1Y1
+    core::ptr::write_volatile(ring_u32.add(6), SRC_PITCH); // src pitch
+    core::ptr::write_volatile(ring_u32.add(7), src_gtt_addr); // src base
+    // MI_STORE_DATA_IMM — 4 DWords.
+    core::ptr::write_volatile(ring_u32.add(8), MI_STORE_DATA_IMM_DW0);
+    core::ptr::write_volatile(ring_u32.add(9), 0x0000_0000);
+    core::ptr::write_volatile(ring_u32.add(10), sentinel_gtt_addr);
+    core::ptr::write_volatile(ring_u32.add(11), R7_SENTINEL);
+    // DW12..15 stay MI_NOOP (already written above). Tail lands on a 64-byte boundary.
+    let _ = DST_PITCH; // BR13 already carries the dest pitch; kept for the reader's arithmetic.
+    let src_u32 = src_page as *mut u32;
+    let dst_u32 = dst_page as *mut u32;
+    let sentinel_slot = 0x800 / 4; // dword index of the sentinel within the dst page
+
+    // ---- Claim the three GGTT slots (once, for the whole candidate loop) ---------------
+    wr(bar0, ring_off, ring_pte);
+    wr(bar0, src_off, src_pte);
+    wr(bar0, dst_off, dst_pte);
+    let ring_slot_held = rd(bar0, ring_off);
+    let src_slot_held = rd(bar0, src_off);
+    let dst_slot_held = rd(bar0, dst_off);
+    let prev_held = rd(bar0, prev_off_g);
+    let next_held = rd(bar0, next_off_g);
+    let ptes_landed = ring_slot_held == ring_pte && src_slot_held == src_pte && dst_slot_held == dst_pte;
+    let smear_held = prev_held != prev_pre || next_held != next_pre;
+    serial_println!(
+        ":: gen7: r7 claim mode={} ring_off={:06X} ring_pte={:08X} ring_held={:08X} src_off={:06X} src_pte={:08X} src_held={:08X} dst_off={:06X} dst_pte={:08X} dst_held={:08X} ptes_landed={} smear_held={} ring_phys={:016X} src_phys={:016X} dst_phys={:016X} ::",
+        mode, ring_off, ring_pte, ring_slot_held, src_off, src_pte, src_slot_held, dst_off, dst_pte, dst_slot_held,
+        if ptes_landed { 1 } else { 0 },
+        if smear_held { 1 } else { 0 },
+        ring_phys, src_phys, dst_phys
+    );
+
+    // ---- The candidate loop ----------------------------------------------------------
+    let mut attempts = 0u32;
+    let mut any_ctl_enabled = false;
+    let mut any_head_moved = false;
+    let mut any_sentinel = false;
+    let mut any_copy = false;
+    let mut all_disabled = true;
+    let mut all_regs_restored = true;
+    let mut all_fw_restored = true;
+    let mut fw_evidence_any = false;
+    let mut winner = "none";
+    let mut exec_verdict = "r7-claim-write-void";
+    let mut best_ctl_readback = 0u32;
+    let mut best_dst_match = 0u32;
+
+    if ptes_landed && !smear_held {
+        for &(cand, class_pin, req_off, ack_off, ack_mask, src, mask_form) in R6_CANDS.iter() {
+            attempts += 1;
+
+            // (1) ACQUIRE — and HOLD across the arm, submit, drain, disable and restore.
+            let hold = fw_acquire(
+                bar0, "r7", cand, class_pin, req_off, ack_off, ack_mask, src, mask_form,
+                FW_ACK_BUDGET_CYC,
+            );
+
+            // (2) THE BATTERY, UNDER THE HOLD, BEFORE ANY RING WRITE.
+            let mut held_col = [0u32; BATTERY_N];
+            let mut held_var = [false; BATTERY_N];
+            read_battery(bar0, "r7", cand, &mut held_col, &mut held_var);
+            let m_all = motion(&dark, &dark_var, &held_col, &held_var);
+            let m_r2 = motion_filtered(&dark, &dark_var, &held_col, &held_var, |i| !GT_BATTERY[i].3);
+            let m_r7 = motion_filtered(&dark, &dark_var, &held_col, &held_var, |i| !r7_writes_row(i));
+            serial_println!(
+                ":: gen7: r7 cand={} class={} battery live_all17={} struct_all17={} varies_all17={} live_r2untouched14={} struct_r2untouched14={} live_r7untouched13={} struct_r7untouched13={} varies_r7untouched13={} ::",
+                cand, class_pin,
+                if m_all.live() { 1 } else { 0 }, m_all.gone_struct, m_all.varies,
+                if m_r2.live() { 1 } else { 0 }, m_r2.gone_struct,
+                if m_r7.live() { 1 } else { 0 }, m_r7.gone_struct, m_r7.varies
+            );
+
+            // (3) THE DELTA CONTROL under this hold.
+            let gtf_a = rd(bar0, g7regs::HYP_GTFIFOCTL);
+            let gtf_b = rd(bar0, g7regs::HYP_GTFIFOCTL);
+            serial_println!(
+                ":: gen7: r7 gtfifoctl col=held cand={} v0={:08X} v1={:08X} pre={:08X} delta={} varies={} cls={} ::",
+                cand, gtf_a, gtf_b, gtfifo_pre,
+                if gtf_a != gtfifo_pre { 1 } else { 0 },
+                if gtf_a != gtf_b { 1 } else { 0 },
+                Cls::of(gtf_a).name()
+            );
+
+            // (4) ARM THE RING — under the hold. Re-seed src, dst region and sentinel first so a
+            // hit and a match are transitions on THIS attempt, not leftovers from the previous.
+            for i in 0..256usize {
+                core::ptr::write_volatile(src_u32.add(i), src_seed(i));
+                core::ptr::write_volatile(dst_u32.add(i), dst_seed(i));
+            }
+            core::ptr::write_volatile(dst_u32.add(sentinel_slot), R7_DST_SENTINEL_SEED);
+            clflush_range(ring_page as usize, 4096);
+            clflush_range(src_page as usize, 4096);
+            clflush_range(dst_page as usize, 4096);
+            let sentinel_seed_rb = core::ptr::read_volatile(dst_u32.add(sentinel_slot) as *const u32);
+
+            wr(bar0, g7regs::BCS_RING_CTL, 0);
+            wr(bar0, g7regs::BCS_RING_START, ring_gtt_addr);
+            wr(bar0, g7regs::BCS_RING_HEAD, 0);
+            wr(bar0, g7regs::BCS_RING_TAIL, 0);
+            wr(bar0, g7regs::BCS_RING_CTL, RCS_RING_CTL_1PAGE_EN);
+            let ctl_readback = rd(bar0, g7regs::BCS_RING_CTL);
+            let armed = ctl_readback & 1 == 1;
+            let head_at_arm = rd(bar0, g7regs::BCS_RING_HEAD) & RING_HEAD_OFF_MASK;
+
+            // (5) SUBMIT and poll — only if the enable latched.
+            let mut head_post = head_at_arm;
+            let mut sentinel_post = sentinel_seed_rb;
+            let mut iters = 0u32;
+            let mut cyc = 0u64;
+            if armed {
+                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+                wr(bar0, g7regs::BCS_RING_TAIL, RING_TAIL_BYTES);
+                let (_hit, it, cy) = poll_cycles(EXEC_BUDGET_CYC, || {
+                    head_post = rd(bar0, g7regs::BCS_RING_HEAD) & RING_HEAD_OFF_MASK;
+                    clflush_range(dst_page as usize + 0x800, 4);
+                    sentinel_post = core::ptr::read_volatile(dst_u32.add(sentinel_slot) as *const u32);
+                    // The SENTINEL is the retirement witness; head==tail is a loop exit, never the
+                    // proof (draft §4.4 — HEAD==TAIL is the dead-GT trap).
+                    sentinel_post == R7_SENTINEL || head_post == RING_TAIL_BYTES
+                });
+                iters = it;
+                cyc = cy;
+                clflush_range(dst_page as usize, 4096);
+                sentinel_post = core::ptr::read_volatile(dst_u32.add(sentinel_slot) as *const u32);
+            }
+            let head_moved = armed && head_post != head_at_arm;
+            let sentinel_hit = sentinel_post == R7_SENTINEL;
+
+            // The pixel witness: how many of the 256 dst dwords equal the source seed, plus the
+            // two crc columns (a perfect copy makes dst_crc == src_crc).
+            let mut dst_match = 0u32;
+            let mut dst_crc = 0u32;
+            let mut src_crc = 0u32;
+            for i in 0..256usize {
+                let d = core::ptr::read_volatile(dst_u32.add(i) as *const u32);
+                let s = core::ptr::read_volatile(src_u32.add(i) as *const u32);
+                if d == src_seed(i) {
+                    dst_match += 1;
+                }
+                dst_crc = dst_crc.rotate_left(1) ^ d;
+                src_crc = src_crc.rotate_left(1) ^ s;
+            }
+            let copy_full = dst_match == 256;
+
+            // THE witness line the brief names.
+            serial_println!(
+                ":: gen7: r7 cand={} class={} ctl_wrote={:08X} ctl_readback={:08X} ctl_enabled={} head_at_arm={:08X} head_post={:08X} head_moved={} tail={:08X} sentinel_seed={:08X} sentinel_post={:08X} sentinel_hit={} dst_match={}/256 dst_crc={:08X} src_crc={:08X} armed={} iters={} cyc={} budget={} ::",
+                cand, class_pin,
+                RCS_RING_CTL_1PAGE_EN, ctl_readback, ctl_readback & 1,
+                head_at_arm, head_post,
+                if head_moved { 1 } else { 0 },
+                RING_TAIL_BYTES, sentinel_seed_rb, sentinel_post,
+                if sentinel_hit { 1 } else { 0 },
+                dst_match, dst_crc, src_crc,
+                if armed { 1 } else { 0 },
+                iters, cyc, EXEC_BUDGET_CYC
+            );
+
+            // (6) TEARDOWN — STILL UNDER THE HOLD.
+            let mut ring_idle = true;
+            let mut drain_iters = 0u32;
+            if armed {
+                let (idle, it, _cy) = poll_cycles(DRAIN_BUDGET_CYC, || {
+                    (rd(bar0, g7regs::BCS_RING_HEAD) & RING_HEAD_OFF_MASK) == RING_TAIL_BYTES
+                });
+                ring_idle = idle;
+                drain_iters = it;
+            }
+            wr(bar0, g7regs::BCS_RING_CTL, 0);
+            let ctl_off = rd(bar0, g7regs::BCS_RING_CTL);
+            let ring_disabled = ctl_off & 1 == 0;
+            let mut regs_restored = false;
+            if ring_disabled {
+                wr(bar0, g7regs::BCS_RING_TAIL, ring_tail_pre);
+                wr(bar0, g7regs::BCS_RING_HEAD, ring_head_pre);
+                wr(bar0, g7regs::BCS_RING_START, ring_start_pre);
+                wr(bar0, g7regs::BCS_RING_CTL, ring_ctl_pre);
+                let s = rd(bar0, g7regs::BCS_RING_START);
+                let c = rd(bar0, g7regs::BCS_RING_CTL);
+                let h = rd(bar0, g7regs::BCS_RING_HEAD);
+                let t = rd(bar0, g7regs::BCS_RING_TAIL);
+                regs_restored = s == ring_start_pre
+                    && c == ring_ctl_pre
+                    && (h & RING_HEAD_OFF_MASK) == (ring_head_pre & RING_HEAD_OFF_MASK)
+                    && t == ring_tail_pre;
+                serial_println!(
+                    ":: gen7: r7 cand={} ring-restore start={:08X}/{:08X} ctl={:08X}/{:08X} head={:08X}/{:08X} tail={:08X}/{:08X} ok={} ring_idle={} drain_iters={} ::",
+                    cand, s, ring_start_pre, c, ring_ctl_pre, h, ring_head_pre, t, ring_tail_pre,
+                    if regs_restored { 1 } else { 0 },
+                    if ring_idle { 1 } else { 0 },
+                    drain_iters
+                );
+            } else {
+                serial_println!(
+                    ":: gen7: r7 cand={} ring-restore SKIPPED ctl_off={:08X} note=ring-would-not-disable-writing-HEAD-under-a-live-ring-is-UNDEFINED-1.1.11.2-p76 ::",
+                    cand, ctl_off
+                );
+            }
+
+            // (7) RELEASE the hold, verified against the captured entry dword.
+            let (fw_restored, fw_evidence) = fw_release(bar0, "r7", &hold);
+
+            all_disabled &= ring_disabled;
+            all_regs_restored &= regs_restored || !ring_disabled;
+            all_fw_restored &= fw_restored;
+            fw_evidence_any |= fw_evidence;
+            any_ctl_enabled |= armed;
+            any_head_moved |= head_moved;
+            any_sentinel |= sentinel_hit;
+            any_copy |= dst_match > 0;
+            if armed && ctl_readback > best_ctl_readback {
+                best_ctl_readback = ctl_readback;
+            }
+            if dst_match > best_dst_match {
+                best_dst_match = dst_match;
+            }
+
+            let this = if !armed {
+                "enable-void"
+            } else if sentinel_hit && copy_full && head_post == RING_TAIL_BYTES {
+                "blit-verified"
+            } else if sentinel_hit && copy_full {
+                "blit-verified-head-stuck"
+            } else if sentinel_hit && dst_match > 0 {
+                "blit-partial"
+            } else if sentinel_hit {
+                "sentinel-hit-no-copy"
+            } else if head_post == RING_TAIL_BYTES {
+                "sentinel-miss"
+            } else if head_moved {
+                "head-stuck-partial"
+            } else {
+                "head-stuck"
+            };
+            serial_println!(
+                ":: gen7: r7 cand={} class={} attempt_verdict={} acked={} classification={} copy_full={} dst_match={}/256 ring_disabled={} fw_restored={} fw_evidence={} ::",
+                cand, class_pin, this,
+                if hold.acked() { 1 } else { 0 },
+                hold.class.name(),
+                if copy_full { 1 } else { 0 },
+                dst_match,
+                if ring_disabled { 1 } else { 0 },
+                if fw_restored { 1 } else { 0 },
+                if fw_evidence { 1 } else { 0 }
+            );
+
+            // (8) STOP AT THE FIRST CANDIDATE THAT MAKES THE ENABLE LATCH.
+            if armed {
+                winner = cand;
+                exec_verdict = match this {
+                    "blit-verified" => "r7-blit-verified",
+                    "blit-verified-head-stuck" => "r7-blit-partial",
+                    "blit-partial" | "sentinel-hit-no-copy" => "r7-blit-partial",
+                    "sentinel-miss" => "r7-sentinel-miss",
+                    "head-stuck-partial" => "r7-head-stuck-partial",
+                    _ => "r7-head-stuck",
+                };
+                break;
+            }
+            if !ring_disabled {
+                exec_verdict = "r7-ring-would-not-disable";
+                break;
+            }
+            exec_verdict = "r7-enable-void-under-every-hold";
+        }
+    }
+
+    // ---- The GGTT restore. NEVER under a live ring. -----------------------------------
+    let mut ptes_restored = false;
+    let mut smear_post = false;
+    if all_disabled {
+        wr(bar0, prev_off_g, base_img);
+        wr(bar0, ring_off, base_img);
+        wr(bar0, src_off, base_img);
+        wr(bar0, dst_off, base_img);
+        wr(bar0, next_off_g, base_img);
+        let ring_post_pte = rd(bar0, ring_off);
+        let src_post_pte = rd(bar0, src_off);
+        let dst_post_pte = rd(bar0, dst_off);
+        let prev_post = rd(bar0, prev_off_g);
+        let next_post = rd(bar0, next_off_g);
+        ptes_restored = ring_post_pte == base_img
+            && src_post_pte == base_img
+            && dst_post_pte == base_img
+            && prev_post == base_img
+            && next_post == base_img;
+        smear_post = prev_post != prev_pre || next_post != next_pre;
+        serial_println!(
+            ":: gen7: r7 ggtt-restore ring_post={:08X} src_post={:08X} dst_post={:08X} prev_post={:08X} next_post={:08X} base_img={:08X} ptes_restored={} smear_post={} ::",
+            ring_post_pte, src_post_pte, dst_post_pte, prev_post, next_post, base_img,
+            if ptes_restored { 1 } else { 0 },
+            if smear_post { 1 } else { 0 }
+        );
+    } else {
+        serial_println!(
+            ":: gen7: r7 ggtt-restore SKIPPED note=a-candidate-left-the-ring-enabled-PTEs-LEFT-CLAIMED-unmapping-a-page-a-live-engine-may-DMA-is-the-corruption-this-rung-avoids ::"
+        );
+    }
+
+    // ---- The GGTT TLB-invalidation rung, and the reclaim it gates ---------------------
+    // Copied verbatim from rearm()'s R6c, over three pages instead of two.
+    let flsh_pre = rd(bar0, g7regs::HYP_GFX_FLSH_CNTL);
+    let flsh_post = witnessed_write(bar0, "r7", "GFX_FLSH_CNTL", g7regs::HYP_GFX_FLSH_CNTL, 1, "EXT-UNPINNED");
+    witnessed_write(bar0, "r7", "GFX_FLSH_RESTORE", g7regs::HYP_GFX_FLSH_CNTL, flsh_pre, "EXT-UNPINNED");
+    let flsh_rest = rd(bar0, g7regs::HYP_GFX_FLSH_CNTL);
+    let flsh_restored = flsh_rest == flsh_pre;
+    let tlb_verdict = if flsh_post != flsh_pre {
+        "tlb-flush-decodes"
+    } else if flsh_pre == 0xFFFF_FFFF {
+        "tlb-flush-allones"
+    } else {
+        "tlb-flush-write-silent"
+    };
+    let flush_positive = tlb_verdict == "tlb-flush-decodes";
+
+    // The independent structural leg. If no candidate's enable ever latched, the head never
+    // moved, no sentinel ever landed and no pixel was ever copied, then no engine access was ever
+    // issued through any of the three GGTT addresses — so there is no cached translation to
+    // outlive the free, and the reclaim rests on a proof rather than on an unpinned register.
+    let never_fetched = !any_ctl_enabled && !any_head_moved && !any_sentinel && !any_copy;
+    let reversal_clean = all_disabled && ptes_restored && !smear_post && all_regs_restored;
+    let reclaim = reversal_clean && (never_fetched || flush_positive);
+    let reclaim_reason = if !reversal_clean {
+        "reversal-not-clean"
+    } else if never_fetched {
+        "never-fetched"
+    } else if flush_positive {
+        "flush-verdict"
+    } else {
+        "no-invalidation-evidence"
+    };
+    serial_println!(
+        ":: gen7: r7 tlb verdict={} off={:06X} pin=EXT-UNPINNED pre={:08X} wrote={:08X} post={:08X} restored_to={:08X} restore_ok={} flush_positive={} never_fetched={} reversal_clean={} reclaim={} reclaim_reason={} pages=3 note=an-unpinned-register-is-never-the-sole-reason-a-page-goes-back-to-the-heap ::",
+        tlb_verdict,
+        g7regs::HYP_GFX_FLSH_CNTL,
+        flsh_pre,
+        1u32,
+        flsh_post,
+        flsh_rest,
+        if flsh_restored { 1 } else { 0 },
+        if flush_positive { 1 } else { 0 },
+        if never_fetched { 1 } else { 0 },
+        if reversal_clean { 1 } else { 0 },
+        if reclaim { "freed" } else { "leaked" },
+        reclaim_reason
+    );
+
+    if reclaim {
+        dealloc(ring_page, layout);
+        dealloc(src_page, layout);
+        dealloc(dst_page, layout);
+        serial_println!(
+            ":: gen7: r7 reclaim=freed pages=3 bytes=12288 reason={} note=the-three-scratch-pages-are-back-on-the-heap ::",
+            reclaim_reason
+        );
+    } else {
+        let _ = (ring_page, src_page, dst_page, layout);
+        serial_println!(
+            ":: gen7: r7 reclaim=leaked pages=3 bytes=12288 reason={} note=refuse-on-any-doubt-a-page-a-GT-may-hold-a-translation-to-never-goes-back-to-the-allocator ::",
+            reclaim_reason
+        );
+    }
+
+    // ---- The exit columns -------------------------------------------------------------
+    let gtfifo_post = rd(bar0, g7regs::HYP_GTFIFOCTL);
+    let gtfifo_post2 = rd(bar0, g7regs::HYP_GTFIFOCTL);
+    serial_println!(
+        ":: gen7: r7 gtfifoctl col=post v0={:08X} v1={:08X} pre={:08X} delta={} varies={} ::",
+        gtfifo_post, gtfifo_post2, gtfifo_pre,
+        if gtfifo_post != gtfifo_pre { 1 } else { 0 },
+        if gtfifo_post != gtfifo_post2 { 1 } else { 0 }
+    );
+    let mut after = [0u32; BATTERY_N];
+    let mut after_var = [false; BATTERY_N];
+    read_battery(bar0, "r7", "r7post", &mut after, &mut after_var);
+    let mut battery_moved = 0u32;
+    for i in 0..BATTERY_N {
+        if after[i] != dark[i] {
+            battery_moved += 1;
+        }
+    }
+
+    // ---- The rung verdict --------------------------------------------------------------
+    //  r7-gated-on-wake                 R3 did not confirm a wake; nothing written.
+    //  r7-range-owned-refused           the GGTT window is not provably unowned; nothing written.
+    //  r7-fill-hypothesis-refuted       uniform window, but a scratch-fill leg said NO.
+    //  r7-claim-write-void              a PTE did not land, or a neighbour smeared.
+    //  r7-enable-void-under-every-hold  every candidate hold was taken and BCS RING_CTL still read
+    //                                   back 0 — the blitter engine domain is not writable on any
+    //                                   documented register on this part.
+    //  r7-blit-verified                 THE WIN. The enable latched, the CS parsed XY_SRC_COPY_BLT,
+    //                                   all 256 dwords copied, and the sentinel store retired.
+    //  r7-blit-partial                  the copy ran but not every dword landed (or the head did
+    //                                   not fully retire) — the CS parses 2D but something in the
+    //                                   encoding/coherency is off; pin the BR00/BR13 fields.
+    //  r7-sentinel-miss                 the head retired without the sentinel store taking effect.
+    //  r7-head-stuck / -partial         the enable latched but the CS did not parse the ring.
+    //  r7-ring-would-not-disable        SAFETY: the PTEs are left claimed under a possibly-live
+    //                                   engine. Overrides every exec reading.
+    let safety_override = !all_disabled;
+    serial_println!(
+        ":: gen7: r7 verdict={} by={} mode={} wake={} engine=BCS attempts={}/{} any_ctl_enabled={} best_ctl_readback={:08X} any_head_moved={} any_sentinel={} any_copy={} best_dst_match={}/256 battery_moved={}/{} fw_restored={} fw_evidence={} ring_regs_restored={} ptes_restored={} smear_post={} reclaim={} tlb={} rung=R7 note=hold-was-kept-ACROSS-the-arm-and-the-teardown-no-display-register-touched ::",
+        if safety_override { "r7-ring-would-not-disable" } else { exec_verdict },
+        winner, mode, wake.name(),
+        attempts, R6_CANDS.len(),
+        if any_ctl_enabled { 1 } else { 0 },
+        best_ctl_readback,
+        if any_head_moved { 1 } else { 0 },
+        if any_sentinel { 1 } else { 0 },
+        if any_copy { 1 } else { 0 },
+        best_dst_match,
+        battery_moved, BATTERY_N,
+        if all_fw_restored { 1 } else { 0 },
+        if fw_evidence_any { "real" } else { "blind" },
+        if all_regs_restored { 1 } else { 0 },
+        if ptes_restored { 1 } else { 0 },
+        if smear_post { 1 } else { 0 },
+        if reclaim { "freed" } else { "leaked" },
+        tlb_verdict
+    );
+
+    let next = if safety_override {
+        "STOP-ring-would-not-disable-PTEs-LEFT-CLAIMED-under-a-live-ring-do-NOT-reuse-these-pages"
+    } else {
+        match exec_verdict {
+            "r7-blit-verified" =>
+                "DONE-the-BCS-copies-pixels-under-a-held-wake-wire-bring_up_blt_ring-to-the-held-wake-and-fix-blitter_copy_rect-DW0-client-field",
+            "r7-blit-partial" =>
+                "STOP-2D-parses-but-copy-incomplete-pin-BR00-BR13-fields-vs-IVB-PRM-Vol1-Part5-before-any-further-blit-work",
+            "r7-sentinel-miss" =>
+                "STOP-head-retired-but-no-store-check-privilege-and-MI_STORE_DATA_IMM-address-encoding",
+            "r7-head-stuck" | "r7-head-stuck-partial" =>
+                "STOP-BCS-enable-latches-but-CS-does-not-parse-the-ring-needs-a-default-blit-context-per-1.1.11.4-p79",
+            "r7-claim-write-void" =>
+                "STOP-GGTT-write-did-not-land-even-before-a-hold-re-run-R4-before-any-further-ring-work",
+            "r7-enable-void-under-every-hold" =>
+                "STOP-BCS-RING_CTL-REFUSED-UNDER-EVERY-DOCUMENTED-HOLD-x86-engine-offload-is-DEAD-on-documented-registers-GEN7-vs-Kepler-decision-goes-to-Peter",
+            _ => "STOP-unnamed-exec-verdict-read-the-cand-lines",
+        }
+    };
+    serial_println!(":: gen7: r7 next={} note=every-write-captured-restored-and-re-read-on-every-exit-path ::", next);
+    serial_println!(":: gen7: r7 end ::");
+}
