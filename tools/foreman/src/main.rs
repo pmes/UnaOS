@@ -116,8 +116,18 @@ fn run(cli: &Cli) -> anyhow::Result<i32> {
     let ev = verdict::evaluate(directives, &capture, &cli.spec);
 
     if !cli.quiet {
-        // mbench prints the first hit of each FORBID above the table.
-        for d in ev.directives.iter().filter(|d| d.kind == verdict::Kind::Forbid && d.hits > 0) {
+        // mbench prints the first hit of each FORBID above the table, in CAPTURE-CHRONOLOGICAL
+        // order. `ev.directives` is spec-declaration order and `ev.sorted()` is (kind, spec_line) —
+        // neither matches, so this preamble sorts by `first_lineno` explicitly. Found by pi 2's
+        // end-to-end agreement run (2026-08-19): invisible with fewer than two forbidden hits,
+        // which is why the green captures never showed it and the byte-identity held anyway.
+        let mut forbid_hits: Vec<&verdict::Directive> = ev
+            .directives
+            .iter()
+            .filter(|d| d.kind == verdict::Kind::Forbid && d.hits > 0)
+            .collect();
+        forbid_hits.sort_by_key(|d| d.first_lineno.unwrap_or(0));
+        for d in forbid_hits {
             println!(
                 "  {} FORBID hit @ line {}: {}",
                 verdict::glyph::FAIL,
