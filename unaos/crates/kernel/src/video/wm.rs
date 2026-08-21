@@ -13161,7 +13161,29 @@ const MENU_OCC_MAX: usize = 1;
 /// MENU_OCC_MAX` — an EXACT fit for the array, with `push`'s bound check and the `dropped` report
 /// standing behind it; `occ_clip`'s worst case stays `MAX_WINDOWS - 1 + FURNITURE_MAX +
 /// MENU_OCC_MAX`, one below `OCC_MAX`.
+///
+/// ### MGL1 — the exact fit STAYS exact, and the report it rests on is no longer `witness`-gated
+///
+/// A review asked whether the spare box `erase_clip` used to carry should be restored, now that this
+/// caller sits flush against the array. It should NOT, and the reason is written two docstrings down
+/// in this same file: [`OCC_CLIP_MAX`]'s ⚠ paragraph convicts WCK5 for shipping a bound with "a whole
+/// box of slack", which "stopped guarding exactly when a SECOND strip made the guard relevant".
+/// Slack is not headroom, it is room to be wrong in quietly. The tightest true statement about the
+/// population is the RIGHT size for the array, and this is it.
+///
+/// What was actually wrong is that the run-time half of the guard was invisible where it counts.
+/// `FURNITURE_MAX` growing past the registry fails the BUILD, and `occ_clip`'s population is bound by
+/// [`OCC_CLIP_MAX`]'s assert — but [`MENU_OCC_MAX`] is a hand count of transient pushes with no
+/// registry to assert against, so a second transient beside `crystal::open_rect` would compile clean
+/// and drop a box on the glass. The `dropped` report is the only witness that direction has, and it
+/// was compiled out of the media builds. It is un-gated and latched at the report site now; see the
+/// MGL1 block in `drain_deferred`.
 const OCC_MAX: usize = MAX_WINDOWS + FURNITURE_MAX + MENU_OCC_MAX;
+
+/// MGL1 — has the `erase_clip` overflow been said? One line per boot, not one per drain; see the
+/// MGL1 block in `drain_deferred` for why the latch is load-bearing rather than tidy.
+static ERASE_CLIP_OVERFLOW_SAID: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// WCK5 × STRIPFACTOR — **[`occ_clip`]'s own population bound, now that it carries EVERY strip.**
 ///
@@ -14259,18 +14281,43 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
     // before returning, which is the same acquisition `damage_intersecting` makes below, in the same
     // function, on every box it publishes.
     let (clip, clip_dropped) = erase_clip(info.width, info.height);
-    // Loud, once, if a future furniture layer ever overflows the clip: a box that did not fit is a
-    // region the erase will publish over, which is the whole defect this arc closes. Not reachable on
-    // any panel this kernel drives — `MAX_WINDOWS` rows plus one dock strip is exactly `OCC_MAX`.
-    #[cfg(feature = "witness")]
-    if clip_dropped > 0 {
+    // Loud, once, if a furniture or transient layer ever overflows the clip: a box that did not fit
+    // is a region the erase will publish over, which is the whole defect the CRYSTAL-DISMISS arc
+    // closes.
+    //
+    // MGL1 — **UN-GATED FROM `witness`, and that is the point of the line.** `erase_clip`'s worst
+    // case stopped being `MAX_WINDOWS` rows plus one dock strip a long time before this comment
+    // stopped saying so: it is `MAX_WINDOWS + FURNITURE_MAX + MENU_OCC_MAX`, which is `OCC_MAX`
+    // EXACTLY, with no spare box left in the array. Two of those three terms fail the BUILD if they
+    // grow without the array (`FURNITURE_MAX` is `const`-asserted equal to `strip::STRIP_MAX`, and
+    // [`OCC_CLIP_MAX`] binds the other caller) — but the third does NOT and structurally cannot:
+    // `MENU_OCC_MAX` is a HAND COUNT of the transient surfaces `erase_clip` pushes, with no registry
+    // behind it to assert against. A second transient added beside `crystal::open_rect` therefore
+    // compiles clean and starts dropping a box at run time, and a dropped occluder is precisely the
+    // MENU-GHOST failure re-entering by a new route.
+    //
+    // This report is the ONLY backstop that direction has, so gating it on `witness` put it on every
+    // artifact EXCEPT the one that ships: the boot/media builds (`x86`/`esp-*`) leave `witness` off,
+    // so on the metal image the box was dropped with nothing said — the exact silence the
+    // `FURNITURE_MAX` ledger already convicts one screen up. Un-gated it costs one `usize` compare
+    // per drain against a value that is zero on every panel this kernel drives.
+    //
+    // LATCHED, on `strip::paint`'s `not-word4` precedent: a clip that overflows once overflows every
+    // pass, and an unlatched line would flood a 115200-baud wire from the compositor's own drain —
+    // turning a witness into a second defect. Said once; the condition is a property of the BUILD,
+    // not of the pass that happened to notice it.
+    if clip_dropped > 0
+        && !ERASE_CLIP_OVERFLOW_SAID.swap(true, core::sync::atomic::Ordering::Relaxed)
+    {
         serial_println!(
-            "[wck4] erase clip OVERFLOW dropped={} cap={} — the erase may publish over live pixels",
+            "[wck4] erase clip OVERFLOW dropped={} cap={} worst={}+{}+{} — the erase may publish over live pixels",
             clip_dropped,
-            OCC_MAX
+            OCC_MAX,
+            MAX_WINDOWS,
+            FURNITURE_MAX,
+            MENU_OCC_MAX
         );
     }
-    let _ = clip_dropped;
     let mut painted = false;
     for &(x, y, w, h) in boxes[..n].iter() {
         // Re-clip: a coalesced union is a synthesised box, and the panel geometry it was clipped

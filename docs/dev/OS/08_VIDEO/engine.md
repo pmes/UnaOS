@@ -2179,6 +2179,13 @@ clobbered it back a frame later — "menubar menu gets overwritten". Two changes
   the furniture array" the deferral asked for. `erase_clip` does not carry the menu (its worst case is
   unchanged); the DESKTOP present already subtracted it (`present_background`), so the two clip paths
   now cover the menu on both sides of the compositor.
+  <br>⚠ **That last sentence was overtaken by CRYSTAL-DISMISS (metal boot 8) and is kept only as the
+  record of what was believed.** "The DESKTOP present already subtracted it" named the wrong painter:
+  the deferred desktop FILL is neither the desktop present nor a window blit, and it was the one
+  front-buffer painter left that could publish `DESKTOP_BG` over an open dropdown. `erase_clip` pushes
+  `crystal::open_rect` too from that arc on, so its worst case is NOT unchanged — it is
+  `MAX_WINDOWS + FURNITURE_MAX + MENU_OCC_MAX`, which is `OCC_MAX` exactly. See the MGL1 section at
+  the end of this document for why that exact fit stays exact, and what had to become loud instead.
 * **Dismissal repaints by the owners.** `crystal::repaint_vacated`, called from `compose`'s two erase
   branches right after `strip::erase_rect`, gives the vacated rect the `damage_intersecting` +
   `request_full_present` pair `wm::reclaim` gives a vacated window box: every window overlapping the
@@ -12792,3 +12799,110 @@ rows of the `comp_mark` decode table, read from the device side.
 2. **NOASPM** — rule link power-state transitions in or out as the trigger;
 3. **the WCD valve** — take the write-combine drain's 4-in-5 duty out of the equation and see
    whether the precursor, and the wedge behind it, go with it.
+
+## MGL1 — the CRYSTAL-DISMISS livelock claim, refuted; and the `erase_clip` overflow report, un-gated (x86 `wc`, 2026-08-21)
+
+A review of CRYSTAL-DISMISS (`bf527fc8`) raised two findings. The first does not survive
+verification; it is recorded here with its disproof so the next reader does not re-derive it. The
+second does, and it was worse than the review framed it.
+
+### Finding 1 — "erase-then-clear can livelock the compositor" — NOT REACHABLE
+
+The claim: `crystal::compose`'s two erase arms now KEEP the slot when `strip::erase_rect` declines
+(`if !strip::erase_rect(r) { return false; }`), so a PERMANENT decline pins `crystal::paint_owed()`
+true forever; the `service_damage` term the same commit added —
+`if menu_paint_owed() { composite(); return; }` — then composites on every idle pass, permanently,
+and its early `return` starves the window-damage check below it. The nominated permanent decline was
+`erase_rect`'s `x >= info.width || y >= info.height` evaluated against a slot rect captured before a
+panel-geometry change, "and this machine changes panel geometry at the Kepler takeover".
+
+Three independent links have to hold. None of them does.
+
+**1. The slot rect carries no geometry to be stale about.** `crystal::menu_rect` anchors the dropdown
+under the crystal, and the crystal hangs off a `strip::Edge::Top` bar, so `menubar::strip_rect` is
+`(0, 0, pw, BAR_H)`, `crystal_box` adds `strip::PAD` in x, and `my = by + bh`. The stored rect is
+therefore always
+
+```
+(min(strip::PAD, pw - MENU_W), TITLE_HEIGHT, MENU_W, MENU_H)  =  (<=12, 34, 154, 105)
+```
+
+— x at most `theme::GAP` = 12 and y exactly `theme::TITLE_HEIGHT` = 34, both compile-time constants
+on every panel. Tripping `x >= info.width` needs a panel 12 px wide; `y >= info.height` needs one
+34 px tall. `menubar::geometry` refuses anything below `FLOOR_W` = 112 / `FLOOR_H` = 110 long before
+that, and the smallest panel in the tree is 640x480. A geometry change cannot strand a rect whose
+origin is not a function of the geometry.
+
+**2. The x86 panel geometry does not change.** `video::WRITER` is attached on x86 from the `BootInfo`
+framebuffer triple at `kernel_main` step 0a and re-attached at step 3 from the same triple —
+idempotent by construction, as the step-0a comment already states. `drivers/gpu/kepler_display.rs`
+contains **zero** references to `WRITER`: the takeover programs the display pipe to the geometry it
+INHERITED (`expected_width = gop_info.width`, `expected_pitch = expected_width * 4`); it does not
+publish a new one. `UNAOS_FBW`/`UNAOS_FBH`, the only panel override in the tree, lives in
+`arch/aarch64/mailbox.rs` and has no x86 effect. Nothing mutates `WRITER`'s width or height after
+boot on this machine, so the premise the finding rests on is not a property of this hardware.
+
+**3. The early `return` starves nothing.** Both arms of `service_damage` call the SAME `composite()`.
+The `return` skips the `any(used && damaged)` PREDICATE — which exists only to decide whether
+`composite()` is worth calling, and `composite()` has just been called unconditionally one line
+above. `composite_once` composites every damaged row either way. The claim would hold only if the
+menu arm ran something narrower than a full pass; it runs the identical call.
+
+**What IS true, and is deliberately left alone.** `paint_owed()` can be pinned true on the PAINT side
+rather than the erase side: `crystal::open` sets `OPEN` unconditionally and prints `menu=0x0+0+0` when
+the rect is unplaceable, so a panel that can host the BAR but not the MENU — `pw` in `[112, 154)` or
+`ph` in `[110, 139)` — leaves `OPEN` true with an empty slot and no arm able to fill it. Same
+busy-composite shape, and it PREDATES the erase-then-clear change (it is a `menu_rect() == None`
+state, not a declined erase). It is bounded by the same arithmetic: no panel this kernel drives lands
+in either band, and the next press outside the invisible menu dismisses it through `press_at`'s
+`menu_rect`-is-`None` fall-through. Recorded, not guarded — a guard on a state no panel can enter is
+a claim that the bug is there.
+
+### Finding 2 — the `erase_clip` overflow report was compiled out of the artifact that ships
+
+CRYSTAL-DISMISS pushed `crystal::open_rect` into `erase_clip`, which took that clip's worst case to
+`MAX_WINDOWS + FURNITURE_MAX + MENU_OCC_MAX` — `OCC_MAX` **exactly**, with no spare box left, where
+`occ_clip` still keeps one. The commit said so and rested the capacity argument on `push`'s bound
+check plus the `dropped` report standing behind it. The report was `#[cfg(feature = "witness")]`.
+
+The boot and media builds (`x86`, `esp-*`) leave `witness` OFF — `Cargo.toml` says so in as many
+words — so on the metal image the box was dropped with **nothing said**. That is the identical
+silence the `FURNITURE_MAX` ledger convicts one screen up in the same file ("the overflow report is
+`witness`-gated, so on the metal image — the only artifact that matters — an occluder would have been
+dropped with nothing said"), re-entered by the arc that quoted it. And a dropped occluder is not a
+cosmetic loss: it is a region the deferred erase publishes `DESKTOP_BG` over, which is MENU-GHOST
+itself.
+
+**The array stays exactly sized; the report becomes real.** Restoring a spare box was the other
+option and it is the wrong one, for the reason `OCC_CLIP_MAX`'s own ⚠ paragraph gives: WCK5 shipped a
+bound with "a whole box of slack" and it "stopped guarding exactly when a SECOND strip made the guard
+relevant". Slack is not headroom, it is room to be wrong in quietly. The tightest true statement about
+the population is the right size for the array.
+
+What actually needed fixing is that two of the three terms fail the BUILD if they outgrow the array
+and the third cannot. `FURNITURE_MAX` is `const`-asserted equal to `strip::STRIP_MAX`; `occ_clip`'s
+population is bound by `OCC_CLIP_MAX`'s assert. But `MENU_OCC_MAX` is a **hand count** of the
+transient surfaces `erase_clip` pushes, with no registry behind it to assert against — so a second
+transient added beside `crystal::open_rect` compiles clean and starts dropping a box at run time.
+The `dropped` report is the only backstop that direction has.
+
+So it is un-gated, and **latched** on `strip::paint`'s `not-word4` precedent: a clip that overflows
+once overflows every pass, and an unlatched line would flood a 115200-baud wire from the compositor's
+own drain — a witness that becomes a second defect. Said once per boot; the condition is a property
+of the BUILD, not of the pass that noticed it. The line now also carries the worst-case terms so a
+capture reads WHICH term grew:
+
+```
+[wck4] erase clip OVERFLOW dropped=N cap=15 worst=12+2+1 — the erase may publish over live pixels
+```
+
+Cost on every panel this kernel drives: one `usize` compare per drain against a value that is zero.
+
+### Gates
+
+`./arroyo check` green both arches · `UNAOS_WC=1 ./arroyo check` green both arches ·
+`UNAOS_WC=1 ./arroyo fat-img` · `UNAOS_WC=1 UNAOS_FATIMG=sf ./arroyo test 150` · mbench
+`x86-fat.spec` and `x86-wc.spec`. The targeted proof is a `strings` differential on the
+builder-path artifact built with `UNAOS_WC=1` plus the kepler knobs: the `[wck4] erase clip
+OVERFLOW` literal is ABSENT from that image before this change and PRESENT after — which is the
+whole of the finding, restated as an artifact fact.
