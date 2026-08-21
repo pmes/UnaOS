@@ -1117,7 +1117,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // in there would contend the xHCI storage loan from inside the EHCI service pass AND hold the
             // internal keyboard and trackpad hostage for its duration. The producer marks RAM dirty under the
             // lock; THIS call site does the I/O. `flush_if_dirty` re-checks that invariant rather than trusting
-            // the placement (it refuses while `EHCI_HID` is held), so a future call site that gets it wrong
+            // the placement (it DEFERS while `EHCI_HID` is busy — it does not refuse; see HCR1), so a call site that gets it wrong
             // goes loud instead of wedging. One-shot inside: the pure fixtures fire on the first pass, the load
             // latches once storage is up, and the flush costs a relaxed atomic load per iteration thereafter.
             // Like `fatverb_storage_witness`, it sits at ALL THREE storage-ready passes this file carries,
@@ -1593,7 +1593,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // in there would contend the xHCI storage loan from inside the EHCI service pass AND hold the
         // internal keyboard and trackpad hostage for its duration. The producer marks RAM dirty under the
         // lock; THIS call site does the I/O. `flush_if_dirty` re-checks that invariant rather than trusting
-        // the placement (it refuses while `EHCI_HID` is held), so a future call site that gets it wrong
+        // the placement (it DEFERS while `EHCI_HID` is busy — it does not refuse; see HCR1), so a call site that gets it wrong
         // goes loud instead of wedging. One-shot inside: the pure fixtures fire on the first pass, the load
         // latches once storage is up, and the flush costs a relaxed atomic load per iteration thereafter.
         // Like `fatverb_storage_witness`, it sits at ALL THREE storage-ready passes this file carries,
@@ -4537,7 +4537,7 @@ fn x86_usb_pump(cpu: usize) {
         // in there would contend the xHCI storage loan from inside the EHCI service pass AND hold the
         // internal keyboard and trackpad hostage for its duration. The producer marks RAM dirty under the
         // lock; THIS call site does the I/O. `flush_if_dirty` re-checks that invariant rather than trusting
-        // the placement (it refuses while `EHCI_HID` is held), so a future call site that gets it wrong
+        // the placement (it DEFERS while `EHCI_HID` is busy — it does not refuse; see HCR1), so a call site that gets it wrong
         // goes loud instead of wedging. One-shot inside: the pure fixtures fire on the first pass, the load
         // latches once storage is up, and the flush costs a relaxed atomic load per iteration thereafter.
         // Like `fatverb_storage_witness`, it sits at ALL THREE storage-ready passes this file carries,

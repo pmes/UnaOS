@@ -936,7 +936,7 @@ fn with_fat_lock<R>(f: impl FnOnce() -> R) -> R {
 /// Non-aarch64 (x86): the FAT-mutation lock is inert — see [`FAT_MUTATION`] for why masking IRQs across the
 /// x86 `hlt`-driven xHCI FAT path would hang. Byte-identical to the pre-F2 behaviour (a zero-cost passthrough).
 ///
-/// ⚠ THE X86 INVARIANT, STATED HONESTLY (2026-07-26; ROSTER AUDITED 2026-07-27 — see the block below).
+/// ⚠ THE X86 INVARIANT, STATED HONESTLY (2026-07-26; ROSTER AUDITED 2026-07-27; row 9 added 2026-08-21 — see the block below).
 /// Because this is a passthrough, x86 has NO in-`fat.rs` serialization of FAT/directory mutation. What keeps
 /// the volume consistent is a discipline held ABOVE `fat.rs`, by its callers. That discipline is now written
 /// down as a ROSTER, because it is caller-side and therefore only as good as the next caller added to it.
@@ -955,6 +955,7 @@ fn with_fat_lock<R>(f: impl FnOnce() -> R) -> R {
 /// | 6 | `openf_release` / `u11m2_phase` — `submit_grow` / `submit_delete` | launcher task / fixture teardown | `irqstorage` | routed through row 3 (they are submitters, not mutators). |
 /// | 7 | **`shell::dispatch_command`** — `create_in_dir`, `create_dir`, `write_grow`, `delete_located`, `remove_dir`, `rename_entry`, `move_entry`, and a raw `write <lba> <byte>` | **BSP GUI main loop, INLINE** (`main.rs`'s `handle_key`), NOT a scheduled task | **NONE — compiled unconditionally** | **NOTHING.** See the rule below. |
 /// | 8 | `install::write_sectors` — raw GPT/FAT32 format writes | BSP main loop | `installdemo` | PROGRAM ORDER on the BSP loop; its blank-scratch-disk configuration leaves `HELLO_STAGED` false (rows 4/5 skip) and permanently fails row 1's reserve. |
+/// | 9 | **`holocron::flush_if_dirty`** — `create_in_dir` + `write_grow` + `delete_located` + `rename_entry` (the bond store's publish/swap) | **BSP main loop**, at all three storage-ready passes (`main.rs` ~1126 / ~1602 / ~4546) | `holocron` | PROGRAM ORDER against rows 1/2/8, which share the BSP loop. **NOT serialized against rows 3/4/5**, which run on APs — so an armed `holocron` build that ALSO carries `witness`/`irqstorage` has the same second-writer window row 7 documents, for the same reason (BSP-loop mutation concurrent with AP-side mutation, nothing between them). Default-quiet media leaves `witness` OFF and `holocron` OFF, so neither exists in a shipping boot. Note the store additionally DEFERS its flush while `EHCI_HID` is busy — that is a re-entrancy guard against the HID service pass, NOT serialization against rows 3/4/5, and must not be read as one. |
 ///
 /// VERDICT: rows 1–6 and 8 are genuinely sequenced. Row 7 is NOT — the shell mutates the volume from the BSP
 /// main loop with nothing between it and rows 3/4/5, which run on APs. It is unreachable in the QEMU
