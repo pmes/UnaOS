@@ -551,6 +551,10 @@ fn bind_probe_admitted(handle: block::BlockHandle) -> bool {
         block::BlockHandle::Usb => true,
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => true,
+        // TEGRASD merge arm — prescribed by the MERGE NOTE above: the orin's unafs volume rides
+        // the card's dedicated handle while `Global` is the USB stick; admit the probe.
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        block::BlockHandle::TegraSd => true,
     }
 }
 
@@ -564,6 +568,8 @@ fn bind_probe_candidates() -> impl Iterator<Item = block::BlockHandle> {
         block::BlockHandle::Usb,
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc,
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        block::BlockHandle::TegraSd,
     ]
     .into_iter()
 }
@@ -577,6 +583,8 @@ fn handle_kind_name(handle: block::BlockHandle) -> &'static str {
         block::BlockHandle::Usb => "usb",
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => "sdhc",
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        block::BlockHandle::TegraSd => "tegra-sd",
     }
 }
 
