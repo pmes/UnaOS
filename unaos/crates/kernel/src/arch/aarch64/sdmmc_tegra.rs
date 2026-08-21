@@ -2108,11 +2108,24 @@ mod metal {
                 }
             }
             if all_on {
-                serial_println!("{}   CLKPROOF: all {} node clock(s) proven enabled — vendor block permitted ::", PS, n_clks);
+                serial_println!("{}   CLKPROOF: all {} node clock(s) proven enabled ::", PS, n_clks);
             } else {
-                serial_println!("{}   CLKPROOF: clock state NOT fully proven — vendor block will be SKIPPED ::", PS);
+                serial_println!("{}   CLKPROOF: clock state NOT fully proven ::", PS);
             }
-            all_on
+            // FWALL CONVICTION (metal, boots 4e + 5, 2026-08-21): the vendor range base+0x100..0x1e4
+            // raises an async EL3 SError on this firmware EVEN WITH both DTB clocks proven enabled
+            // (boot 5: CLK 120 = 1, CLK 219 = 1, then the identical esr_el3=0xbe000011 park at the
+            // same rung). Clock gating is REFUTED; the surviving suspect is a firmware firewall/SCR
+            // restriction on the vendor/pad-cal window. The block is therefore DISABLED outright —
+            // pre-SDID shape, which boot 3 proved SError-free end-to-end — until a firmware-side
+            // answer exists. CLKPROOF stays: read-only MRQ queries, and its lines are the standing
+            // evidence that discriminates this conviction from clock gating on every future boot.
+            serial_println!(
+                "{}   FWALL: vendor block DISABLED — metal conviction: SError with clocks proven on (boots 4e+5); ladder runs without pad snapshot/restore ::",
+                PS
+            );
+            let _ = all_on;
+            false
         };
 
         // ── M2: SDHCI identification ladder (READ-ONLY) ──
