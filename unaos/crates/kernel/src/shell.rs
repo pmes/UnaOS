@@ -2531,9 +2531,9 @@ fn midden_facts() -> midden_core::Facts {
     // `arch::syscall` itself is `baremetal`-gated on aarch64, so the cap must be read under the
     // SAME condition that decides whether the verbs exist — a build with no process table has no
     // storm cap to name, and 0 is the honest stand-in because `proc_verbs` is false beside it.
-    #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+    #[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
     let (proc_verbs, proc_rows) = (true, crate::arch::syscall::proc_table_rows());
-    #[cfg(not(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64")))]
+    #[cfg(not(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64")))]
     let (proc_verbs, proc_rows) = (false, 0usize);
     midden_core::Facts {
         aarch64: cfg!(target_arch = "aarch64"),
@@ -3442,7 +3442,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // foreign volume-level path from the same surface. `vfs <op> <path>`.
             vfs_cmd(console, &args);
         },
-        #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+        #[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
         "run" => {
             // EXEC-1: load an ELF64 user program off the VFS namespace and execute it in user mode, reporting its
             // exit status. Rides the SAME `MountTable` the `vfs` verb uses (`/fat` = FAT boot partition,
@@ -4010,7 +4010,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
              crate::hlt_loop();
              crate::hlt_loop();
         },
-        #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+        #[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
         "bg" => {
             // BGRUN-1: run a user program in the BACKGROUND — the shell returns to its prompt at once and
             // the program keeps running (and, if windowed, its window stays OPEN, so TAB has a ring to
@@ -4181,13 +4181,13 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 serial_println!(":: STORM: fatw REFUSED — aarch64/baremetal-only provocation, not ported to x86 ::");
             }
         },
-        #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+        #[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
         "jobs" => {
             // BGRUN-1: list background programs and REAP the exited ones (this verb is the reaper — a
             // PEXITED row stays claimed until it is polled here, and the table is bounded). `jobs`.
             bg_jobs(console);
         },
-        #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+        #[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
         "kill" => {
             // BGRUN-1: kill a background program by pid (SKILL-1 underneath — ASID-scoped, so ELF-2
             // sibling threads die with it; unconfirmed kills park the row PORPHANED and settle at the
@@ -4355,12 +4355,12 @@ fn parse_num(s: &str) -> Option<u64> {
 /// * **The machine check.** The aarch64 body pre-checks `e_machine == 183`; x86 wants
 ///   `EM_X86_64 = 62`. The kernel loader (`arch::x86_64::elf::validate_elf`) re-checks from scratch
 ///   either way — this pre-check only sharpens the operator's error text.
-#[cfg(all(feature = "baremetal", target_arch = "aarch64"))]
+#[cfg(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"))]
 fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc::vec::Vec<u8>> {
     use crate::fs::vfs::NodeKind;
     // Cap = the kernel user window; a file at or under it may still be rejected by the loader (a flat blob
     // is re-bounded to one code page), but this is the hard read ceiling — we never read past it.
-    const CAP: u64 = crate::arch::aarch64::boot::USER_REGION_SIZE as u64;
+    const CAP: u64 = crate::arch::aarch64::uslots::USER_REGION_SIZE as u64; // JETSON-EL0: uslots facade (boot.rs on pi / mmu_tegra_el0.rs on tegra)
     let mt = vfs_mount_table();
     let st = match mt.stat(path) {
         Ok(s) => s,
@@ -4561,7 +4561,7 @@ fn cyc_to_us(dt: u64) -> u64 {
     dt.saturating_mul(1_000_000) / hz
 }
 
-#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+#[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
 fn run_program(console: &mut Console, path: &str) {
     let Some(bytes) = read_el0_image(console, "run", path) else {
         return;
@@ -4625,7 +4625,7 @@ fn run_program(console: &mut Console, path: &str) {
 
 /// BGRUN-1: one shell-side background job. The PATH is copied (bounded) so `jobs` can name it — the
 /// kernel row carries only the fixed task name. The pid is the durable key; asid rides for `kill`.
-#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+#[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
 #[derive(Clone, Copy)]
 struct BgJob {
     pid: u64,
@@ -4664,7 +4664,7 @@ struct BgJob {
 /// progresses — the SCHED-X86 deadlock rule is about two preemptible takers on ONE core. But note
 /// that `bg_jobs` holds this lock across `console.println`, which on a `wc` build routes through the
 /// compositor: a future second cross-core caller could spin for the length of a repaint.
-#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+#[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
 static BG_JOBS: spin::Mutex<[Option<BgJob>; 12]> = spin::Mutex::new([None; 12]);
 
 /// STORM-FATW: the bounded USB-traffic writer `storm [n] fat` arms — the driver-claim half of the
@@ -4814,7 +4814,7 @@ fn storm_fat_writer(_: usize) {
 
 /// BGRUN-1: `bg <path>` — read the image, spawn it detached, record the job. The shell prompt is
 /// back the moment this returns; the program (and its window, if it creates one) keeps running.
-#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+#[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
 fn bg_program(console: &mut Console, path: &str) -> bool {
     let Some(bytes) = read_el0_image(console, "bg", path) else {
         return false;
@@ -4855,7 +4855,7 @@ fn bg_program(console: &mut Console, path: &str) -> bool {
 
 /// BGRUN-1: `jobs` — list background jobs and reap the exited ones. This is the SOLE reaper for
 /// bg rows: an exited job's kernel row stays claimed (PEXITED) until it is polled here.
-#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+#[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
 fn bg_jobs(console: &mut Console) {
     use crate::arch::syscall::BgPoll;
     let mut jobs = BG_JOBS.lock();
@@ -4932,7 +4932,7 @@ fn bg_jobs(console: &mut Console) {
 /// already free, and the operator's record of the outcome is THIS line rather than an uninformative
 /// `gone` from a later `jobs`. The witness carries the table accounting so a boot PROVES the transition
 /// instead of implying it.
-#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+#[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
 fn bg_kill_cmd(console: &mut Console, pid: u64) {
     let jobs = BG_JOBS.lock();
     let Some(job) = jobs.iter().flatten().find(|j| j.pid == pid).copied() else {
