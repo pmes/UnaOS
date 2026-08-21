@@ -1725,6 +1725,29 @@ KERNEL_CFG_MATRIX=(
   # pairwise guarantee is unaffected — it is a property of the mask construction, not of which
   # features are in the set.
   "arm-tegra-el0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0"
+  # SIMMER armed (appended 2026-08-21) — closes one of the two "real holes wearing a green verdict"
+  # the RE-COUNTED 2026-08-19 note above records. `simmer_test = []` is board-neutral aarch64: its
+  # four cfg sites all live in `arch/aarch64/sched.rs` (three self-test fns + the boot-core spawn in
+  # `run_capstone_boot_core`), so on the x86 mix legs it inherited it type-checked the empty set, and
+  # no arm leg named it — the armed polarity was compiled by NOTHING, the exact tegra_el0 shape.
+  # Hosted on `arm-tegra`'s list verbatim (the documented home for board-neutral aarch64 features;
+  # the spawn site is on the tegra boot path) as its own tail leg per the arm-tegra-el0 precedent —
+  # `arm-tegra` stays the shipped-default twin, and a red names the knob. There is no
+  # `not(feature = "simmer_test")` site in src/, so no disarmed asymmetry is created. Same universe
+  # side effect as tegra_el0's: the knob leaves `x86_cfg_universe` (with arm-tegra-xusbfw below,
+  # 59 -> 57; C(8,4) = 70 >= 57, mix-leg count and pairwise guarantee unchanged).
+  "arm-tegra-simmer ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,simmer_test"
+  # XUSBFW armed (appended 2026-08-21) — the other hole from the same note. `xusbfw` implies `tegra`
+  # and gates `xusb_tegra.rs`'s `pub mod xusbfw` (the Falcon firmware-reload scaffold) plus its one
+  # call site in the takeover path — a module under active work (FWCRATE, NOJB11) that until this leg
+  # was type-checked by no leg at all; armed builds existed only because the operator sets
+  # UNAOS_XUSBFW=1 by hand, which these legs deliberately ignore. Hosted on `arm-tegra`'s list
+  # verbatim + `xusbfw`, the literal arm-tegra-el0 precedent (feature implies tegra; sites in a
+  # tegra-gated module; arm-tegra stays the disarmed twin). SAFE ON ANY MACHINE: the optional
+  # `unaos-xusb-fw` crate this pulls emits `XUSB_FW = None` when `UNAOS_XUSB_FW_PATH` is unset and
+  # fails only on a set-but-unreadable path — the leg never needs (or smuggles) the bunker blob.
+  # No `not(feature = "xusbfw")` site exists in src/.
+  "arm-tegra-xusbfw ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,xusbfw"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────
