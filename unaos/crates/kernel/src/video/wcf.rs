@@ -85,7 +85,7 @@
 //! is safe only during single-core boot, while this runs from composite (post-SMP, syscall context).
 //! The firmware read happens where it is safe — at framebuffer bring-up — and is *recorded*.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use unaos_boot_info::PixelFormat;
 
@@ -234,11 +234,53 @@ pub fn reserved(pw: usize, ph: usize) -> Option<[(usize, usize, usize, usize); 2
     Some([(tx, ty, 2 * SIDE + GAP, SIDE), (MARGIN, ry, RAMP_W, RAMP_ROWS)])
 }
 
+/// The CLEARANCE zone of each reserved box — the region a live window may not overlap for that box's
+/// half of the probe to run. **Wider than [`reserved`] on purpose, and the width is the cache
+/// maintenance's, not the paint's.**
+///
+/// The probe cleans and then INVALIDATES the memory it wrote so the read-back comes from RAM rather
+/// than from its own dirty lines (WC-D's discipline). Those ranges are computed in whole SCANLINES —
+/// `row * k_row` byte offsets — because the direct half is addressed by raw byte arithmetic and has
+/// no column to clip to. An invalidate is a DISCARD: a line another core dirtied between our clean
+/// and our invalidate is thrown away, and on the panel that is somebody else's window losing pixels
+/// it had already composed.
+///
+/// So the exclusion zone is the full-width ROW SPAN of each box, and the caller's overlap test is
+/// taken against these rectangles rather than against the painted ones. Before CHROMESPEC the two
+/// were conflated and it did not matter, because the union test the caller ran was so much larger
+/// than either box that the row spans fell inside it by accident. Splitting the boxes removed that
+/// accident, so the rule is now stated.
+pub fn clearance(pw: usize, ph: usize) -> Option<[(usize, usize, usize, usize); 2]> {
+    reserved(pw, ph).map(|b| [(0, b[0].1, pw, b[0].3), (0, b[1].1, pw, b[1].3)])
+}
+
 /// The whole WC-F probe.
 ///
-/// `region_clear` is the caller's assurance that no live window overlaps [`reserved`]; `false` skips
-/// the paint entirely rather than scribble over a window's content.
-pub fn run(fb: &FrameBuffer, region_clear: bool) {
+/// `clear` is the caller's assurance that no live window overlaps [`clearance`], **per box**:
+/// `clear[0]` for the twin blocks and `clear[1]` for the slope marker. A `false` skips that box's
+/// paint entirely rather than scribble over a window's content.
+///
+/// ## Why the two boxes are judged SEPARATELY (CHROMESPEC, 2026-08-17)
+///
+/// They used to share one bool, and the armed Pi desktop turned that into a witness that never
+/// spoke. `reserved` puts the twins hard right in the bottom strip — at 640x480 that is
+/// `(480,400,144x64)` — and the slope marker hard left, `(16,208,264x256)`. The console window
+/// `[wc-x] console-window win=1 … box=570x396 at (35,4)` covers `x 35..605, y 4..400`: it misses the
+/// TWIN box by exactly the row the box starts on, and overlaps the RAMP box across a third of its
+/// height. Under one shared bool the ramp's overlap vetoed the twins, so `[wc-f] twin -> DEFER`
+/// printed once and the verdict the spec REQUIREs never arrived — a permanent red on a boot where
+/// the thing being witnessed was never in doubt.
+///
+/// The module header already anticipated this shape ("a witness that habitually skips is no
+/// witness") and answered it by moving the marks side by side rather than stacked. This is the same
+/// answer taken one step further: the marks do not share a rectangle, so they must not share a veto.
+/// Nothing is weakened — a window over the TWIN box still defers the twins, exactly as before, and a
+/// window over the RAMP box still keeps the probe off the pixels it would corrupt.
+///
+/// The twins are the VERDICT (`comp_bad`/`direct_bad` are the addressing comparison the spec pins);
+/// the ramp is a PHOTOGRAPH AID with no verdict at all, which is why the spec requires the first and
+/// not the second, and why the first must not be hostage to the second's rectangle.
+pub fn run(fb: &FrameBuffer, clear: [bool; 2]) {
     let info = fb.info();
     let (pw, ph) = (info.width, info.height);
     let bpp = info.bytes_per_pixel;
@@ -270,9 +312,9 @@ pub fn run(fb: &FrameBuffer, region_clear: bool) {
         }
         return;
     }
-    // Retryable: a window is over the strip right now. One token, then silence — and no latch, so a
-    // later clear pass still produces the verdict.
-    if !region_clear {
+    // Retryable: a window is over the TWIN strip right now. One token, then silence — and no latch,
+    // so a later clear pass still produces the verdict. The ramp box has its own answer below.
+    if !clear[0] {
         if !DEFERRED.swap(true, Ordering::Relaxed) {
             serial_println!(
                 "[wc-f] twin -> DEFER (a live window overlaps the probe strip; retrying every composite until it clears)"
@@ -327,8 +369,15 @@ pub fn run(fb: &FrameBuffer, region_clear: bool) {
         }
     }
 
-    // --- The slope marker, whose PHOTOGRAPHED slope is the hardware's row step.
-    let ramp_lost = ramp(base, len, info.pixel_format, k_row, rax, ray);
+    // --- The slope marker, whose PHOTOGRAPHED slope is the hardware's row step. Painted only when
+    // its OWN box is clear: a window under it would show the marker instead of its content, which is
+    // the same rule the twins keep and the only reason either box is ever skipped.
+    let ramp_clear = clear[1];
+    let ramp_lost = if ramp_clear {
+        ramp(base, len, info.pixel_format, k_row, rax, ray)
+    } else {
+        0
+    };
 
     // Push the touched regions out to the memory the HVS scans. The ranges are cleaned — and later
     // invalidated — SEPARATELY, never as one convex hull: when `geom_row > k_row` the hull spans rows
@@ -338,7 +387,15 @@ pub fn run(fb: &FrameBuffer, region_clear: bool) {
     let (ramp_lo, ramp_hi) = (ray, (ray + RAMP_ROWS).min(ph));
     let k_twin = (twin_lo * k_row, (twin_hi * k_row).min(len));
     let g_twin = (twin_lo * geom_row, ((twin_hi + 1) * geom_row).min(len));
-    let k_ramp = (ramp_lo * k_row, ((ramp_hi + 1) * k_row).min(len));
+    // A box that was not painted contributes no range: `hi > lo` is the loops' own guard, so a
+    // degenerate pair is skipped by both the clean and the invalidate below rather than discarding
+    // scanlines this pass never wrote — the separation rule stated two paragraphs up, applied to the
+    // per-box clearance the caller now hands in.
+    let k_ramp = if ramp_clear {
+        (ramp_lo * k_row, ((ramp_hi + 1) * k_row).min(len))
+    } else {
+        (0, 0)
+    };
     let ranges = [k_twin, g_twin, k_ramp];
     for &(lo, hi) in ranges.iter() {
         if hi > lo {
@@ -436,10 +493,19 @@ pub fn run(fb: &FrameBuffer, region_clear: bool) {
         first_bad.0, first_bad.1, first_bad.2, first_bad.3,
         if ok { "PASS" } else { "FAIL" }
     );
-    serial_println!(
-        "[wc-f] ramp origin=({},{}) rows={} byte_step={}B nominal=1px/row marks={} lost={} :: photograph the slope — a bend of d/4 px per row means the HVS row step is k_row+d, whatever the firmware reported",
-        rax, ray, RAMP_ROWS, k_row + 4, RAMP_ROWS * 2, ramp_lost
-    );
+    if ramp_clear {
+        serial_println!(
+            "[wc-f] ramp origin=({},{}) rows={} byte_step={}B nominal=1px/row marks={} lost={} :: photograph the slope — a bend of d/4 px per row means the HVS row step is k_row+d, whatever the firmware reported",
+            rax, ray, RAMP_ROWS, k_row + 4, RAMP_ROWS * 2, ramp_lost
+        );
+    } else {
+        // Its own line rather than the one above with a zeroed `lost=`: a marks/lost report for a
+        // marker that was never painted is a witness stating a measurement it did not take.
+        serial_println!(
+            "[wc-f] ramp -> DEFER (a live window overlaps the slope marker's box ({},{},{}x{}); the twin verdict above is unaffected — the two boxes are judged separately)",
+            rax, ray, RAMP_W, RAMP_ROWS
+        );
+    }
     // No latch here: the `compare_exchange` above already claimed it, which is what makes this half
     // single-entrant rather than merely once-reported.
 }
@@ -528,4 +594,448 @@ fn report_geometry(
         base_match, rowstep_match, pitch_match, panel_match, fits,
         if ok { "PASS" } else { "FAIL" }
     );
+}
+
+// ---------------------------------------------------------------------------
+// CHROME-TRUTH — the glass-readback chrome witness
+// ---------------------------------------------------------------------------
+
+/// CHROME-TRUTH — has the readback spoken yet? Latched only by a pass that actually found chrome.
+static CHROME_TRUTH_DONE: AtomicBool = AtomicBool::new(false);
+
+/// CHROME-TRUTH — how many passes read chrome back CONTESTED and were therefore not spent.
+///
+/// See [`CHROME_TRUTH_DEFER_BUDGET`] for what "contested" means and why deferring is the honest move
+/// rather than a way of getting to green.
+static CHROME_TRUTH_DEFERS: AtomicUsize = AtomicUsize::new(0);
+
+/// CHROME-TRUTH — whether the one-shot DEFER token has been printed. `[wc-f] twin`'s discipline,
+/// twelve hundred lines up in this same file and for the identical reason: one token, then silence,
+/// because the caller runs hundreds of times per boot and an unlatched print is a flood.
+static CHROME_TRUTH_DEFERRED: AtomicBool = AtomicBool::new(false);
+
+/// CHROME-TRUTH — how many contested passes may be skipped before the verdict is latched anyway.
+///
+/// ## Why a deferral exists at all (CHROMESPEC, 2026-08-17)
+///
+/// The witness is a ONE-SHOT: it spends its single reading on the first composite pass that finds a
+/// chrome-bearing window, and on the armed Pi desktop that pass is the console window's OWN
+/// `create_at` — `fbcon::panel_console_window_open` mints the row, `create_at` composites it, and
+/// this function reads its chrome off the glass immediately afterwards. At that instant the panel has
+/// TWO writers: the console glyph route is not installed until `panel_console_window_open` returns
+/// (`[wc-x] console-window …` and `[pidesk] activate … routed=true` both print AFTER this witness's
+/// verdict in the capture), so every other core's `serial_println!` is still being painted DIRECTLY
+/// onto the panel by `fbcon`, over the chrome that was correct when it was written.
+///
+/// That is not a theory. Two consecutive armed gate runs on the same image, same host:
+///
+/// ```text
+/// run 1: title_bot want=0xefeff1 got=0x000000   (fbcon's BG_DEFAULT)
+///        face_left want=0xededef got=0xc0c0c0   (fbcon's FG_DEFAULT — a console GLYPH)
+///        verdict wins=1 hits=3/5 … -> FAIL
+/// run 2: verdict wins=1 hits=5/5 title_grad=5 … -> PASS
+/// ```
+///
+/// Same chrome, same theme, same constants — a coin flip on who reached the pixel last. A one-shot
+/// that reports a coin flip is worse than no witness, because the FAIL is indistinguishable from a
+/// real theme regression and the PASS is indistinguishable from a real proof.
+///
+/// ## Why this does not weaken the witness
+///
+/// A deferral is not a retry-until-green: the budget is finite and its exhaustion LATCHES the FAIL.
+/// A build whose chrome is genuinely wrong misses on EVERY pass — the arithmetic is deterministic and
+/// the panel is quiet long before the budget runs out — so it burns the budget and then reports
+/// exactly the FAIL it always did, with `[chrome-truth] defers=` beside it saying how it got there.
+/// What the budget removes is only the class where a LATER pass reads the same chrome clean, which is
+/// by construction the class where the first reading was about the panel's other writer and not about
+/// the theme. Proven by injection both ways in the landing report.
+///
+/// 32 rather than a handful: the capture carries 443 window blits, so the budget is ~7 % of the
+/// boot's composite passes — long enough to outlast the console handoff by a wide margin, short
+/// enough that an always-wrong theme still convicts inside the first tenth of the boot.
+const CHROME_TRUTH_DEFER_BUDGET: usize = 32;
+
+/// CHROME-TRUTH — the five chrome probes for one window box, as `(name, x, y, expected)`.
+///
+/// Split out of [`chrome_truth`] because that function now READS in one pass and PRINTS in another:
+/// both derive their points from this one arithmetic, so the line the operator reads can never
+/// describe a pixel other than the one the verdict was computed from. Pure — no reads, no writes.
+///
+/// Three of the five expectations are the MATERIAL's, not the palette's: `title_top`, `title_bot` and
+/// `face_left` are `ceramic::shade` of the role colour at the row the painter used, so the ceramic
+/// grain is part of what is asserted rather than something the witness has to be blind to. The other
+/// two are flat by the painter's own decision — `wm::draw_window` states in as many words that the
+/// keyline and the two bevel hairlines are NOT machined ("a single-pixel edge has no room to show a
+/// grain") — so a flat expectation there is the texture spec's own answer, not an approximation of it.
+fn chrome_probes(
+    bx: usize,
+    by: usize,
+    bw: usize,
+    foc: bool,
+) -> [(&'static str, usize, usize, u32); 5] {
+    use super::wm::{title_row_color, BORDER, TITLE_H};
+    let strip_x = bx + bw - BORDER - 2;
+    let face_row = BORDER + TITLE_H + 8;
+    [
+        ("keyline_top", bx + bw / 2, by, super::theme::FRAME_LINE),
+        (
+            "bevel_light",
+            bx + bw / 2,
+            by + super::theme::BEVEL,
+            super::theme::BEVEL_LIGHT,
+        ),
+        (
+            "title_top",
+            strip_x,
+            by + BORDER,
+            super::ceramic::shade(title_row_color(0, TITLE_H, foc), BORDER),
+        ),
+        (
+            "title_bot",
+            strip_x,
+            by + BORDER + TITLE_H - 1,
+            super::ceramic::shade(
+                title_row_color(TITLE_H - 1, TITLE_H, foc),
+                BORDER + TITLE_H - 1,
+            ),
+        ),
+        (
+            "face_left",
+            bx + BORDER - 2,
+            by + face_row,
+            super::ceramic::shade(super::theme::CHROME_FACE, face_row),
+        ),
+    ]
+}
+
+/// CHROME-TRUTH — read the PANEL back at computed chrome coordinates and print want-vs-got.
+///
+/// ## The gap this closes
+///
+/// The Pi bench desktop already prints a full theme census (`[crispy] theme=us-crispy-modern …
+/// title_h=34 frame=5 face=0xececee desktop=0x2d2b55`), and WC-D already proves each window's
+/// CONTENT reached the scan-out buffer byte for byte. Neither instrument says one word about the
+/// CHROME. `[crispy]` reports the constants the painter was COMPILED with — it fires from
+/// `wm::paint_window` before a single chrome pixel is stored, and would print the identical line if
+/// every chrome write below it were deleted. WC-D verifies the window's CONTENT rectangle against
+/// its source surface, which by construction excludes the frame, the title strip and the discs:
+/// chrome has no source surface to be compared against.
+///
+/// So "the wire says crispy" and "the glass shows crispy" have been, until now, two claims with no
+/// wire between them — which is exactly the gap an operator standing at the bench saying *"I see no
+/// crispy anything"* falls into. This closes it: after the first composite that drew a real window,
+/// read the framebuffer back at coordinates DERIVED from the same geometry `paint_window` used, and
+/// compare each against a colour recomputed by calling the same `theme::` / `ceramic::` /
+/// `wm::title_row_color` the painter called. A `HIT` is the theme on glass. A `MISS` is the theme and
+/// the glass disagreeing, with the coordinate and both colours named so it is diagnosable rather
+/// than merely reported. This witness carries NO second copy of the kit's numbers, so it cannot
+/// drift from the theme and it cannot pass by agreeing with itself.
+///
+/// ## What each probe pins, and why these five
+///
+/// | probe | coordinate | what a MISS would mean |
+/// |---|---|---|
+/// | `keyline_top` | box top edge, mid-width | the outer keyline (`theme::FRAME_LINE`, UNMACHINED — an exact constant) never landed |
+/// | `bevel_light` | one `theme::BEVEL` in | the frame's hairline structure is absent |
+/// | `title_top` | strip row 0, right end | the title gradient's top stop under `ceramic::shade` |
+/// | `title_bot` | strip row `TITLE_H-1` | the gradient's bottom stop — the pair pins the whole ramp |
+/// | `face_left` | left frame, below the strip | the machined `CHROME_FACE` surface itself |
+///
+/// The title probes take the strip's RIGHT end (`bw - BORDER - 2`) rather than its middle, because
+/// the control cluster is LEFT-aligned and the caption follows it: mid-strip is where a glyph lives.
+/// The face probe takes `bx + BORDER - 2`, inside the frame and clear of both the keyline (`kw` =
+/// `theme::BEVEL` wide) and the bevel beside it.
+///
+/// A sixth reading, `content`, carries NO expectation and is reported as `APP`: those pixels belong
+/// to a ring-3 surface and the kernel has no business predicting them. It is printed anyway because
+/// "is there anything in the well at all" is the other half of what an operator is looking at.
+///
+/// ## The desktop reading is REPORTED BUT NOT JUDGED
+///
+/// On x86 the panel-wide `DESKTOP_BG` clear is `wcx`'s DESKTOP-CLEAR. **The Pi now has its twin —
+/// `pidesk::activate`'s PIDESK DESKTOP-CLEAR, written because this probe named the gap** (bench
+/// capture PA41 boot2: `want=0x2d2b55 got=0x1e1e1e -> NOCLEAR`, i.e. `video::PANEL_BG` still on the
+/// glass at desktop-ready). It is `feature = "pidesk"` and one-shot at bring-up, so the promise is
+/// conditional in two ways this witness must not paper over: knob-off there is still no clear, and
+/// a clear at bring-up is not a claim about a pixel some LATER writer repaints — the Pi's
+/// `render_service` still owns the backdrop (PARITY §6.1), so a probe that latches late reads
+/// whatever the shell left. `wm::erase` paints `DESKTOP_BG` into window BOXES and `Screen` holds it
+/// in the desktop LAYER, but neither promises a panel pixel outside every box. A witness that
+/// called any of that a `MISS` would be convicting the chrome for a contract it never made. It
+/// prints `NOCLEAR` instead — a distinct token, outside the verdict's arithmetic, naming which of
+/// the three the boot is in. The probe point is CHOSEN by testing candidates against every row's outer box,
+/// compat rows included (a compat row can own the whole panel and legitimately paint anything
+/// there); when no candidate is clear it says so rather than asserting a colour it cannot justify.
+///
+/// ## The amplitude numbers — the line that answers the operator, not the gate
+///
+/// `HIT` on all five would still leave *"I see no crispy anything"* unexplained, because the honest
+/// answer is not that the theme is missing but that this theme, on this panel, carries almost no
+/// visible signal. So the verdict states each material's amplitude AS A NUMBER OF 8-BIT LEVELS,
+/// measured rather than asserted:
+///
+/// - `title_grad` — `|title_top - title_bot|` READ FROM GLASS, widest channel. The kit's stops are
+///   `0xEEEEF1`→`0xE3E3E8` focused and `0xF4F4F5`→`0xEFEFF1` not, i.e. ~11 and ~5 levels across the
+///   whole 34-row strip.
+/// - `ceramic_pp` — peak-to-peak of `ceramic::shade(CHROME_FACE, ·)` over the material's whole
+///   128-row tile: the largest difference two chrome rows of one window can EVER show.
+///   `GRAIN_AMP_Q16 + CURVE_AMP_Q16` = 1310/65536 = 2.0 % of a channel.
+/// - `knurl_pp` — the same for the disc milling, `AMP_A + AMP_B` = 1311/65536, also 2.0 %.
+/// - `paper_pp` — the same for the kit's PAPER material, which is a real texture rather than a
+///   modulation, and is the loudest thing the kit has.
+/// - `paper_on` — **can any paper pixel exist in this image at all?** `paper::fill_rect` has exactly
+///   ONE call site in the tree, `video::instgui::repaint`, and `instgui` is `x86_64 + wc + instgui`.
+///   The `paper` module itself is arch-neutral, so its constants and selftest literals ARE in the Pi
+///   image and the census still names it — which is precisely how the wire can say "paper" while no
+///   paper pixel has ever existed on this panel. `cfg!` of the consumer's own gate is the whole
+///   truth of it, so that is what is printed.
+///
+/// Those five numbers are the deliverable. A boot that changes the kit's contrast, or wires paper
+/// onto a Pi content surface, moves them; nobody has to take a claim about the look on trust again.
+///
+/// ## Cost, safety, and why it cannot perturb what it measures
+///
+/// One-shot for the boot, reads 6 pixels per window plus one, and WRITES NOTHING — unlike the twin
+/// probe above it leaves no marks, so it cannot disturb a later photograph or a later WC-D
+/// reference. It is called from the tail of `wm::composite_inner`, inside the same `drawn > 0` block
+/// WC-F runs in and immediately after it, with the table guard already dropped and `rows` a
+/// snapshot — the rule `[wc-c]` and WC-F already print under. Reads go through
+/// `FrameBuffer::read_pixel` (volatile, and the exact inverse of `put_pixel`'s encoding, so the
+/// `Bgr` layout the Pi firmware reports is decoded by the same match that encoded it); the scanlines
+/// are invalidated first, on `wm::verify_window`'s pattern, so a read cannot be answered from a
+/// dirty line the blit left in cache.
+///
+/// It does NOT latch on a pass that found no chrome-bearing row — the desktop takes seconds to reach
+/// its steady population, and a witness that spent its one shot on the first pass to draw anything
+/// would report on a panel nobody is looking at. Such a pass returns silently; a `SKIP` per pass
+/// would be the flood the one-shot exists to avoid.
+pub fn chrome_truth(fb: &FrameBuffer, rows: &[super::wm::Window], order: &[usize], focus: u64) {
+    use super::wm::{outer_box, BORDER, DESKTOP_BG, TITLE_H};
+    if CHROME_TRUTH_DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    let info = fb.info();
+    let (pw, ph) = (info.width, info.height);
+    let row_bytes = info.stride * info.bytes_per_pixel;
+    let (mut hits, mut probes, mut wins) = (0usize, 0usize, 0usize);
+    let mut grad_max = 0u32;
+
+    // ── PASS 1: READ. Nothing is printed here, and nothing is latched. ──────────────────────────
+    //
+    // The reads are buffered so the DEFER decision below can be taken BEFORE a single line is
+    // committed to the wire. Reading twice instead — once to decide, once to print — would let the
+    // printed line and the verdict describe two different instants of a contested panel, which is the
+    // exact failure mode the deferral exists to remove.
+    //
+    // `slots` holds the eligible rows in composite order and `got_buf` their five readings each;
+    // `chrome_probes` regenerates the coordinates and expectations for the print pass, so the two
+    // halves cannot drift.
+    let mut slots = [0usize; super::wm::MAX_WINDOWS];
+    let mut got_buf = [0u32; super::wm::MAX_WINDOWS * 5];
+    for &i in order.iter() {
+        let Some(r) = rows.get(i) else { continue };
+        // Compat rows have no chrome at all (`paint_window` guards every chrome write with
+        // `!r.compat`), so probing one would report a MISS for a window that is CORRECTLY bare.
+        if !r.used || r.compat || r.w == 0 || r.h == 0 || r.scale == 0 {
+            continue;
+        }
+        let (bx, by, bw, bh) = outer_box(r);
+        // Every probe below indexes at most `BORDER + TITLE_H + 8` rows down and `bw - BORDER - 2`
+        // across; a box that cannot hold them is skipped rather than probed off its own edge.
+        if bw < 2 * BORDER + 4 || bh < BORDER + TITLE_H + 10 || bx + bw > pw || by + bh > ph {
+            continue;
+        }
+        if wins >= slots.len() {
+            break;
+        }
+        // FOCUS — the same predicate `composite_inner` hands `draw_window`, so the gradient
+        // recomputed here is the one that was painted.
+        let foc = focus != 0 && focus == r.owner_asid;
+
+        // Discard, never clean, over exactly the scanlines about to be read. Without it a read could
+        // be answered from the line the blit left dirty, which would make this witness agree with
+        // the compositor's INTENT instead of with the panel.
+        crate::arch::cache::invalidate_range(fb.base_addr() + by * row_bytes, bh * row_bytes);
+
+        for (n, (_, x, y, w)) in chrome_probes(bx, by, bw, foc).iter().enumerate() {
+            let got = fb.read_pixel(*x, *y).unwrap_or(0);
+            got_buf[wins * 5 + n] = got;
+            probes += 1;
+            if got == *w {
+                hits += 1;
+            }
+        }
+        slots[wins] = i;
+        wins += 1;
+    }
+
+    // Nothing chrome-bearing on the panel yet. DO NOT latch — see the header.
+    if wins == 0 {
+        return;
+    }
+
+    // ── The DEFERRAL. See `CHROME_TRUTH_DEFER_BUDGET` for the measurement that forced it. ───────
+    //
+    // A pass that read CONTESTED chrome is not spent, it is skipped, while the budget lasts. One
+    // token then silence, on `[wc-f] twin`'s discipline: this function runs on every composite pass
+    // that drew, so an unlatched print per deferral is a flood.
+    if hits < probes {
+        let n = CHROME_TRUTH_DEFERS.fetch_add(1, Ordering::Relaxed);
+        if n < CHROME_TRUTH_DEFER_BUDGET {
+            if !CHROME_TRUTH_DEFERRED.swap(true, Ordering::Relaxed) {
+                serial_println!(
+                    "[chrome-truth] defer wins={} hits={}/{} budget={} (chrome read back contested — the console glyph route is not installed until `[wc-x] console-window` and fbcon still paints the PANEL from every core; retrying every composite, and the budget's exhaustion LATCHES the FAIL)",
+                    wins, hits, probes, CHROME_TRUTH_DEFER_BUDGET
+                );
+            }
+            return;
+        }
+    }
+    // CLAIM THE SHOT — atomically, on `wcf::run`'s own precedent twelve hundred lines up in this file
+    // ("two could otherwise clear a `load` that had not yet been `store`d and both proceed").
+    //
+    // The early-out at the top of this function is a `load`, and it always was; what changed with the
+    // read/print split is the SIZE of the window between it and the latch — PASS 1's reads, the
+    // deferral decision and PASS 2's fourteen serial lines all sit inside it now, and composite runs
+    // on any core. `final-armed-2` caught exactly that: TWO `[chrome-truth] verdict` lines in one
+    // capture, from two cores that both cleared the load. A duplicated one-shot is a witness lying
+    // about being one, and its extra serial traffic perturbs the pass it prints from.
+    if CHROME_TRUTH_DONE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+
+    // The budget's own accounting, on its own line so the verdict below keeps every byte it had.
+    // `defers=0` is the ordinary reading and says the first chrome-bearing pass answered cleanly.
+    serial_println!(
+        "[chrome-truth] defers={} budget={} exhausted={} (contested passes skipped before this verdict)",
+        CHROME_TRUTH_DEFERS.load(Ordering::Relaxed),
+        CHROME_TRUTH_DEFER_BUDGET,
+        CHROME_TRUTH_DEFERS.load(Ordering::Relaxed) > CHROME_TRUTH_DEFER_BUDGET
+    );
+
+    // ── PASS 2: PRINT, from the readings PASS 1 took. ───────────────────────────────────────────
+    for k in 0..wins {
+        let Some(r) = rows.get(slots[k]) else { continue };
+        let (bx, by, bw, bh) = outer_box(r);
+        let foc = focus != 0 && focus == r.owner_asid;
+        let (mut got_top, mut got_bot) = (0u32, 0u32);
+        for (n, (name, x, y, w)) in chrome_probes(bx, by, bw, foc).iter().enumerate() {
+            let got = got_buf[k * 5 + n];
+            let ok = got == *w;
+            if n == 2 {
+                got_top = got;
+            }
+            if n == 3 {
+                got_bot = got;
+            }
+            serial_println!(
+                "[chrome-truth] win={} box=({},{},{}x{}) foc={} pt={} at=({},{}) want={:#08x} got={:#08x} -> {}",
+                r.id, bx, by, bw, bh,
+                if foc { "yes" } else { "no" },
+                name, x, y, w,
+                got,
+                if ok { "HIT" } else { "MISS" }
+            );
+        }
+        // The content well: an EL0 surface, so no expectation is possible and none is invented.
+        let cpt = (bx + BORDER + 4, by + BORDER + TITLE_H + 4);
+        serial_println!(
+            "[chrome-truth] win={} pt=content at=({},{}) want=app got={:#08x} -> APP",
+            r.id,
+            cpt.0,
+            cpt.1,
+            fb.read_pixel(cpt.0, cpt.1).unwrap_or(0)
+        );
+        // The gradient the operator's eye is actually offered, measured off glass rather than
+        // derived from the constants: the widest per-channel difference between the strip's first
+        // and last row.
+        for shift in [16u32, 8, 0] {
+            grad_max = grad_max.max(((got_top >> shift) & 0xFF).abs_diff((got_bot >> shift) & 0xFF));
+        }
+    }
+
+    let mut desk: Option<(usize, usize)> = None;
+    if pw > 4 && ph > 4 {
+        for cand in [
+            (pw - 2, ph - 2),
+            (pw - 2, 2),
+            (2, ph - 2),
+            (pw / 2, ph - 2),
+            (pw - 2, ph / 2),
+        ] {
+            let covered = rows.iter().filter(|r| r.used).any(|r| {
+                let (bx, by, bw, bh) = outer_box(r);
+                cand.0 >= bx && cand.0 < bx + bw && cand.1 >= by && cand.1 < by + bh
+            });
+            if !covered {
+                desk = Some(cand);
+                break;
+            }
+        }
+    }
+    match desk {
+        Some((dx, dy)) => {
+            crate::arch::cache::invalidate_range(fb.base_addr() + dy * row_bytes, row_bytes);
+            let got = fb.read_pixel(dx, dy);
+            // NOT counted in `hits`/`probes`, and NOT a `FAIL` — see the header's DESKTOP note.
+            let ok = got == Some(DESKTOP_BG);
+            serial_println!(
+                "[chrome-truth] pt=desktop at=({},{}) want={:#08x} got={:#08x} -> {}",
+                dx, dy, DESKTOP_BG, got.unwrap_or(0),
+                if ok { "HIT" } else if cfg!(feature = "pidesk") {
+                    "NOCLEAR (pidesk cleared the panel at bring-up; a later writer owns this pixel — PARITY 6.1)"
+                } else {
+                    "NOCLEAR (no panel-wide DESKTOP_BG clear in this build; it is pidesk-gated on aarch64)"
+                }
+            );
+        }
+        None => serial_println!(
+            "[chrome-truth] pt=desktop at=none want={:#08x} got=none -> SKIP (every candidate under a window box)",
+            DESKTOP_BG
+        ),
+    }
+
+    let face = super::theme::CHROME_FACE;
+    let ceramic_pp = pp(super::ceramic::TILE_H, |k| super::ceramic::shade(face, k));
+    let knurl_pp = pp(super::knurl::TILE_W * super::knurl::TILE_H, |k| {
+        super::knurl::shade(face, k % super::knurl::TILE_W, k / super::knurl::TILE_W)
+    });
+    let paper_tile = super::paper::tile();
+    let paper_pp = pp(paper_tile.len(), |k| paper_tile[k]);
+    // The ONLY consumer of `paper::fill_rect` is `video::instgui::repaint`, under exactly this gate.
+    let paper_on = cfg!(all(target_arch = "x86_64", feature = "wc", feature = "instgui"));
+    serial_println!(
+        "[chrome-truth] verdict wins={} hits={}/{} title_grad={} ceramic_pp={} knurl_pp={} paper_pp={} paper_on={} panel={}x{} -> {}",
+        wins, hits, probes, grad_max, ceramic_pp, knurl_pp, paper_pp,
+        if paper_on { "yes" } else { "no" },
+        pw, ph,
+        if hits == probes { "PASS" } else { "FAIL" }
+    );
+    // No latch here any more: the `compare_exchange` above claimed it, which is what makes this half
+    // single-ENTRANT rather than merely once-reported. The rule it encodes is unchanged — the shot is
+    // spent only by a pass that found chrome to read and then said what it read, and a pass that
+    // returned early above never reaches the claim.
+}
+
+/// CHROME-TRUTH — peak-to-peak of `f` over `n` samples, in 8-bit levels, widest channel.
+///
+/// One helper for all three materials so the number means the same thing in each column of the
+/// verdict: the largest difference the material can put between two of its own pixels. `ceramic` is
+/// indexed by row, `knurl` by a flattened tile coordinate, `paper` by tile pixel — the shapes differ,
+/// the question does not.
+fn pp(n: usize, f: impl Fn(usize) -> u32) -> u32 {
+    let mut best = 0u32;
+    for shift in [16u32, 8, 0] {
+        let (mut lo, mut hi) = (255u32, 0u32);
+        for k in 0..n {
+            let c = (f(k) >> shift) & 0xFF;
+            lo = lo.min(c);
+            hi = hi.max(c);
+        }
+        best = best.max(hi.saturating_sub(lo));
+    }
+    best
 }

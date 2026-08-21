@@ -303,7 +303,8 @@ last did, which is not a reference at all. If output genuinely must change, the
 change is deliberate, shared-lane, and the reason is recorded with the new
 constant.
 
-## 4. The demo (`UNAOS_RAST=1`)
+
+## 4. The demo (`UNAOS_RAST=1`, and `UNAOS_PIRAST=1` on the Pi)
 
 A knob-gated demo (`rast` Cargo feature → `unaos/crates/kernel/src/rast_demo.rs`)
 renders a spinning, flat-shaded, z-buffered cube through the panel `Screen`. It is
@@ -358,12 +359,52 @@ so the same code serves three panels; the wire-in differs per platform:
   (PI-V3D-1 bisect-proven): a stray gated block mid-`kernel_main` shifts embedded line
   numbers and perturbs `.rodata` even knob-off.
 
+- **aarch64/pi — the Raspberry Pi 4 / BCM2711 panel** (PI-RAST): wired at
+  `main.rs::pi_rast_demo_maybe`, called on the GUI-handoff `fbcon::detach()` line in
+  `kernel_main`'s aarch64/baremetal block. Like tegra this is an **inherited scanout**
+  — the panel is whatever the VideoCore firmware handed back through the mailbox
+  (`mailbox::init_framebuffer` → `video::WRITER`); there is no mode-set, no scanout
+  reprogramming, and nothing in the V3D tree is touched. **Geometry is read live**
+  (`screen.width()/height()`), never hardcoded: the bench Pi is 1920×1200 and QEMU
+  raspi4b is 640×480, and the fixed 320×240 render is centered on whichever it finds.
+
+  **Why that call site.** The Pi's boot core detaches fbcon, spawns the `input` +
+  `render` service tasks onto two APs, then joins the scheduler (`run_bsp`) — unlike
+  the Orin, whose terminus *is* the scheduler entry. The demo runs on the detach line,
+  which is *after* the panel/framebuffer, heap and timer are up (so it can never race
+  bring-up) and *before* `render_service` exists (so it can never fight the compositor
+  for the panel). Its full-panel `Screen` shadow (~9 MiB at 1920×1200) is scoped to the
+  call and dropped before those spawns, so it never coexists with the render task's
+  identical shadow on the 48 MiB metal heap. The 90 paced frames are bounded, so the
+  boot always reaches the shell; `render_service` repaints the console over the cube.
+  `pal::cursor::SPRITE_OWNS_PAINT` stays `false` on aarch64 — untouched.
+
+  The Pi wire-in prints its own panel-naming header and a second honest fps line
+  measured across a strictly wider span (the `Screen` build *plus* the render loop),
+  bracketing the shared `:: RAST:` pair:
+
+  ```
+  :: PI-RAST: BCM2711 mailbox panel 1920x1200 (live firmware geometry, inherited scanout) — software rasterizer cube, the Pi's first 3D pixels ::
+  :: PI-RAST: 90 frames in <n> ms — <f> fps (software rasterizer, BCM2711 mailbox-fb present) ::
+  ```
+
+  **Knob class.** `pirast` is a *thin* feature: it only implies `rast`, so the dep gate
+  and the `rast_demo` module gate are untouched and this arc shifts no line in `lib.rs`.
+  The arm lives in `arroyo`'s **curated** `K8_FEATS` block and deliberately **not** in
+  `builder/src/main.rs` — builder produces the x86/virt ESP media and never
+  `kernel8.img`, the same class as the V3D / PIUSB / GENET knobs. Same byte-identity
+  wire-in discipline as tegra: called on an existing source line, runner + empty
+  `#[inline(always)]` knob-off twin at the file tail, zero source lines added ahead of
+  any panic `Location`.
+
 With the feature off the whole module + the `rast` dependency are unlinked and the
 kernel image is byte-identical to baseline on **both arches** — RAST-1 verified the
 x86 sections; RAST-TEGRA re-verified x86 (`.text 9cd6…`→unchanged) and the aarch64
 `tegra` kernel (`.text a2ce1599…`, `.rodata 5d1f7604…`, `.data 4f1fe11e…`,
 `.data.rel.ro e17e3b13…` all byte-identical vs the pre-arc base), 0 `rast` symbols
-knob-off.
+knob-off. PI-RAST re-verified the third panel the same way: `kernel8.img` built with
+`UNAOS_PIRAST` unset is **byte-identical** (whole-image sha256) to a build of the
+pre-arc base at the same worktree.
 
 ## 5. Consumers, and the extensions parallelism would need
 

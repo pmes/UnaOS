@@ -102,8 +102,14 @@ pub fn init() {
     // tick rate the clock now uses: 1 CNTVCT tick = 1/CNTFRQ s, so ms = CNTVCT/(CNTFRQ/1000).
     #[cfg(feature = "witness")]
     serial_println!(
-        "[uvug7] ms clock: CNTFRQ={} Hz (={} kHz per ms); ms=CNTVCT/(CNTFRQ/1000), core-count-independent",
-        freq, freq / 1000
+        // VUGSLOMO adds the ABI leg as FIELDS on this line and not as a line of its own — the
+        // line-neutral rule (d18d37c7) — because it is the same clock answering the same question one
+        // consumer further out. `abi_per_tick` is the divisor [`abi_ticks`] applies, and it is the
+        // FALSIFIER for this arc on either host: a boot whose `[el0live]`/`[vugfps]` pair still reads
+        // 4x apart with this divisor printed is a fault somewhere other than the unit.
+        "[uvug7] ms clock: CNTFRQ={} Hz (={} kHz per ms); ms=CNTVCT/(CNTFRQ/1000), core-count-independent; \
+         sys_getinfo ticks=CNTVCT/(CNTFRQ/{})={} (NOT the per-core-summed tick counter)",
+        freq, freq / 1000, TICK_HZ, freq / TICK_HZ
     );
 }
 
@@ -190,6 +196,49 @@ pub fn on_tick() {
 #[inline]
 pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
+}
+
+/// VUGSLOMO — the [`TICK_HZ`]-rate tick count `sys_getinfo` hands EL0, derived from CNTVCT/CNTFRQ
+/// and NOT from [`ticks`]. Core-count-independent, and live even where the tick IRQ is not.
+///
+/// THE BUG THIS EXISTS TO CLOSE, and it is UVUG-7 (P52) again, one caller further out. [`ticks`] is
+/// the GLOBAL counter and [`on_tick`] bumps it from EVERY core's periodic timer IRQ, so on 4-core
+/// BCM2711 metal it advances at `4 * TICK_HZ` = ~1000 Hz. `sys_getinfo` handed that counter to EL0
+/// RAW while `una_abi::GETINFO_TICK_HZ` told ring 3 to divide by 250 — so every ring-3 program that
+/// reads the field measured time 4x FAST and any rate it computed came out 4x LOW.
+///
+/// The ABIFREEZE assert beside `sys_getinfo` could not catch this and still cannot: it checks
+/// `GETINFO_TICK_HZ == TICK_HZ`, which is the rate each core ARMS its timer at, and both sides of
+/// that equation were always 250. The divergence was never in the constant — it was that the
+/// quantity being published was a SUM over cores rather than a clock. So the fix is on the
+/// publishing side, and the assert keeps its meaning: this function's unit IS `TICK_HZ`.
+///
+/// MEASURED (R24 boot6, PA43 metal, hw-pi4@6de03c87): `[vugfps] wf=` alternated 1,2,1,2 for 818
+/// consecutive samples while `[wcn] win=6 asid=0x1` reported the SAME window presenting at 5.8-6.0/s
+/// with `gap=144..231ms` — the exact 4x, and the alternation is a ~6 fps rate sampled over the
+/// 0.25 s window the wrong divisor opens. PA42 (boot5) reads the same way: `wf=25..41` against
+/// `[wcn] rate=96..164/s`. The vug's own meter doc names this disagreement as the finding it was
+/// built to make; this is that finding's other end.
+///
+/// IT IS NOT ONLY A READOUT. `user-vug`'s LOD ladder consumes the meter's number: `rate < LOD_DOWN`
+/// (24) drops a rung and `rate * 4 < LOD_DOWN` drops TWO, `rate > LOD_UP` (55) climbs one. Against a
+/// 4x-low rate those thresholds sit at 96 and 220 REAL fps, so on the Pi the ladder ran with its
+/// step-up unreachable and its double-step-down permanently armed (boot6 `[vuglod] lvl=1001` then
+/// `lvl=1`: level 3 -> 1 -> 0 inside two windows), and PA42's 25..41 straddled the 24 edge — which is
+/// the fps SWING that boot's operator reported. One divisor, both complaints.
+///
+/// CNTVCT is immune to both faults CNTFRQ-derived clocks were reached for before: it counts at
+/// CNTFRQ_EL0 no matter how many cores tick, and it counts on QEMU raspi4b where the tick IRQ is
+/// never delivered at all (there [`ticks`] stays 0 forever, so the meter's `now > *ticks` gate never
+/// opened and the readout never refreshed — the same silence the old `ms()` had).
+///
+/// `cntfrq() / TICK_HZ` is exact on both paths (54 MHz / 250 = 216 000; QEMU virt 62.5 MHz / 250 =
+/// 250 000). A zero CNTFRQ — no generic timer — yields 0 rather than dividing by it; ring 3 reads a
+/// frozen clock and skips its update, which is the same shape as the pre-heartbeat case.
+#[inline]
+pub fn abi_ticks() -> u64 {
+    let per_tick = cntfrq() / TICK_HZ;
+    if per_tick == 0 { 0 } else { super::now_cycles() / per_tick }
 }
 
 /// Whether the timer IRQ was confirmed delivering (see `verify_live`). The idle path branches on it.

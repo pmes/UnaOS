@@ -280,8 +280,11 @@ pub fn hlt() {
     }
 }
 
+/// SERFIX — non-blocking by construction: the acquisition, its degradation and its census all live
+/// in `serial::poll_input_nonblocking` (see the SERFIX block in arch/aarch64/serial.rs for why this
+/// must never become a blocking `SERIAL_PORT.lock()` again).
 pub fn poll_input() -> Option<u8> {
-    serial::SERIAL_PORT.lock().read_byte()
+    serial::poll_input_nonblocking()
 }
 
 /// Make CPU writes to `[addr, addr+len)` visible to a non-coherent scan-out engine — the Pi 4's

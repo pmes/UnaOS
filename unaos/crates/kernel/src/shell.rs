@@ -18,10 +18,11 @@ use alloc::vec::Vec;
 use alloc::string::String;
 use crate::console::Console;
 use crate::fs::fat::{DirEntry, FatError, FatFs};
-// The in-kernel `vug` demo (the `vug` and `pulse` verbs) is an aarch64 module — see the `pub mod vug`
-// note in `lib.rs`. The verbs that drive it are gated to match, so on x86 they are not registered at
-// all and fall through to the normal unknown-command reply.
-#[cfg(target_arch = "aarch64")]
+// The in-kernel `vug` demo (the `vug` and `pulse` verbs) is an aarch64 module, and since DECRUD-1 a
+// knob-gated one — see the `pub mod vug` note in `lib.rs`. The verbs that drive it carry the identical
+// gate, so wherever the module is not compiled they are not registered at all and the words fall
+// through to the normal unknown-command reply: on x86 always, and on the Pi unless `UNAOS_VUGDEMO=1`.
+#[cfg(all(target_arch = "aarch64", feature = "vugdemo"))]
 use crate::vug;
 use crate::pal::TargetPal;
 
@@ -1358,6 +1359,48 @@ fn cat_render(console: &mut Console, fs: &FatFs, de: &DirEntry, canon: &str) {
     }
 }
 
+/// VFS-1 (adoption): `cat` through the mount table — the routed twin of [`cat_render`].
+///
+/// Before this arc `cat` was the loudest hole in the namespace: it bound `mount_program_source()`
+/// directly, so on the Pi `/` meant the SD FAT root while `ls` had already been saying `/` means
+/// native UnaFS, and `cat /usb/FILE` could not work at all — the name resolved as a literal FAT
+/// directory called `usb` and returned `-ENOENT`. Routing it through the seam makes `cat` agree with
+/// `ls`, `run`, `bg` and `vfs` about what a path means, which is the coherence this layer is for.
+///
+/// Same 8 KiB console bound and the same `[... n of m bytes shown]` tail as the FAT renderer, so a
+/// capture cannot tell the two apart except by which volume answered.
+#[cfg(target_arch = "aarch64")]
+fn vfs_cat(console: &mut Console, arg: &str) {
+    use crate::fs::vfs::NodeKind;
+    const CAP: u64 = 8192;
+    let path = vfs_path(arg);
+    let mt = vfs_mount_table();
+    if let Some(vol) = unmounted_reserved_volume(&mt.prefixes(), &path) {
+        console.println(&alloc::format!("cat: {}: volume {} not mounted (-ENODEV)", path, vol));
+        return;
+    }
+    let st = match mt.stat(&path) {
+        Ok(s) => s,
+        Err(e) => return console.println(&alloc::format!("cat: {}: {}", path, vfs_err(e))),
+    };
+    if matches!(st.kind, NodeKind::Dir) {
+        return console.println(&alloc::format!("cat: {}: is a directory (-EISDIR)", path));
+    }
+    let want = core::cmp::min(st.size, CAP);
+    match mt.read(&path, 0, want as usize) {
+        Ok(data) => {
+            for line in render_text(&data).split('\n') {
+                console.println(line);
+            }
+            if st.size > data.len() as u64 {
+                console.println(&alloc::format!(
+                    "[... {} of {} bytes shown]", data.len(), st.size));
+            }
+        }
+        Err(e) => console.println(&alloc::format!("cat: {}: {}", path, vfs_err(e))),
+    }
+}
+
 /// JD12 `head <path> [n]`: print the FIRST `n` lines of a file (default 10). Streams from offset 0 via
 /// the offset-aware `read_at` in bounded windows and STOPS as soon as `n` newlines are seen — so
 /// `head 10` of a huge file reads only the first window(s), never the whole file. A byte ceiling
@@ -1569,213 +1612,127 @@ fn print_dir_listing(console: &mut Console, entries: &[DirEntry], long: bool) {
 // unafs and it lists exactly what `/fs/` shows. (x86 keeps the FAT path, unchanged.)
 // ---------------------------------------------------------------------------------------------
 
-/// PI-SHELL-LS: list `path` off the native unafs volume under ONE `with_unafs` hold, returning
-/// `(is_dir, rows)` where each row is `(name, size, is_dir)` sorted by name (`.`/`..`/System entries
-/// filtered — the same subset `/fs/` shows). A directory yields its entries; a plain file yields its
-/// own single row (the DOS `ls <file>` idiom). Any resolve/mount failure surfaces as an errno-tagged
-/// message string. Mirrors `genet::fs_read_dir` so the shell and `/fs/` never disagree.
+/// VFS-1 (adoption): list `path` **through the mount table** — the ONE collector behind every
+/// `ls` on this arch, replacing the two per-volume collectors (`pi_ls_collect` against unafs and
+/// `pi_usb_ls_collect` against the USB FAT) that the verb used to choose between with a hand-rolled
+/// `/usb` prefix test. The volume is now decided by [`MountTable::resolve`] — the same longest-prefix
+/// rule `run`, `bg` and `vfs` already obey — so `ls /` lists native UnaFS, `ls /fat` the SD boot FAT
+/// and `ls /usb` the stick, with no verb-side dispatch and no volume the verb has to know about.
+///
+/// Returns `(is_dir, rows)` sorted by name. A directory yields its entries; a plain file yields its
+/// own single row (the DOS `ls <file>` idiom), synthesized from `stat` since a file has no listing.
+/// Mount points that sit immediately below `path` are appended as directory rows, so `ls /` still
+/// advertises `usb/` (and now `fat/`) the way the `/fs/` HTTP listing does — but as a fact READ OFF
+/// THE MOUNT TABLE rather than a `usb_info()` probe wired only for that one volume.
+///
+/// Any resolve/mount failure surfaces as the errno-tagged message [`vfs_err`] renders, so the three
+/// volumes report failures in one vocabulary instead of three.
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::type_complexity)]
-fn pi_ls_collect(path: &str) -> Result<(bool, Vec<(String, u64, bool)>), String> {
-    let listed = crate::fs::unafs::with_unafs(|fs| {
-        let id = fs
-            .resolve_path(path)
-            .map_err(|e| alloc::format!("{}: not found ({:?}, -ENOENT)", path, e))?;
-        let inode = fs
-            .read_inode(id)
-            .map_err(|e| alloc::format!("{}: stat failed ({:?}, -EIO)", path, e))?;
-        if inode.kind == ::unafs::FileKind::Directory {
-            let entries = fs
-                .ls(id)
-                .map_err(|e| alloc::format!("{}: read failed ({:?}, -EIO)", path, e))?;
-            let mut rows: Vec<(String, u64, bool)> = Vec::new();
-            for de in &entries {
-                if de.name == "." || de.name == ".." || de.kind == ::unafs::FileKind::System {
-                    continue;
-                }
-                let sz = fs.read_inode(de.inode_id).map(|i| i.size).unwrap_or(0);
-                rows.push((de.name.clone(), sz, de.kind == ::unafs::FileKind::Directory));
-            }
-            rows.sort_by(|a, b| a.0.cmp(&b.0));
-            Ok::<_, String>((true, rows))
-        } else {
-            let leaf = String::from(path.rsplit('/').next().unwrap_or(path));
-            Ok((false, alloc::vec![(leaf, inode.size, false)]))
-        }
-    });
-    match listed {
-        Ok(inner) => inner,
-        Err(e) => Err(alloc::format!("no unafs volume ({:?})", e)),
+pub(crate) fn vfs_ls_collect(path: &str) -> Result<(bool, Vec<crate::fs::vfs::DirEnt>), String> {
+    use crate::fs::vfs::{DirEnt, NodeKind};
+    let mt = vfs_mount_table();
+    // VFS-4: a path naming a reserved volume that is not currently bound reports the VOLUME as
+    // missing, not a bare -ENOENT off the native root. `ls` shares the guard the mutating `vfs`
+    // verb has had since VFS-4 rather than re-deriving it.
+    if let Some(vol) = unmounted_reserved_volume(&mt.prefixes(), path) {
+        return Err(alloc::format!("volume {} not mounted (-ENODEV)", vol));
     }
-}
-
-/// PI-SHELL-LS: the Pi `ls`/`dir` core. Resolves `arg` against the cwd, prints the unafs listing in the
-/// same table shape as the FAT path (size + name; a dir shows `<DIR>`), then a per-invocation
-/// `:: ls1: <path>: <names> (N file, M dir) ::` serial witness — the verb renders panel-only on the
-/// bench, so the witness gives a headless capture the same content (the PI-UI-3 `ui3_say` idiom).
-/// PI-FS-4: unafs inodes carry a size but no last-write time, so `ls -l` shows the size plus a dashed
-/// date column (`UNAFS_NO_MTIME`), and the short `ls` is unchanged. The `-l` serial mirror keeps the
-/// `:: ls1:` shape and appends the per-entry sizes so a headless capture can witness the long form.
-/// PI-FS-5: format a FAT last-write stamp as the fixed-width `YYYY-MM-DD HH:MM:SS` field the FAT `ls -l`
-/// column uses (mirrors genet's `fmt_fat_mtime` so the shell and `/fs/usb/` never disagree). An all-zero
-/// on-disk stamp renders as the dashed placeholder — the same 19-char width — rather than a bogus 1980 date.
-#[cfg(target_arch = "aarch64")]
-fn fat_mtime_field(ts: &crate::fs::fat::FatTimestamp) -> String {
-    if ts.is_zero() {
-        return String::from("       -           ");
+    let st = mt.stat(path).map_err(|e| alloc::format!("{}: {}", path, vfs_err(e)))?;
+    if !matches!(st.kind, NodeKind::Dir) {
+        let leaf = String::from(path.rsplit('/').next().unwrap_or(path));
+        return Ok((false, alloc::vec![DirEnt {
+            name: leaf,
+            kind: NodeKind::File,
+            size: st.size,
+            mtime: None,
+        }]));
     }
-    alloc::format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        ts.year, ts.month, ts.day, ts.hour, ts.min, ts.sec
-    )
-}
-
-/// PI-FS-5: collect a listing off the LIVE USB FAT mount at `sub` (relative to the USB root — `""` or `"/"`
-/// is the root; `"/DIR"` / `"/DIR/SUB"` descend). Mounts read-only through the same `fat::mount_source(Usb)`
-/// API genet's `/fs/usb` route uses, walks each path component by its display name (LFN-aware, PI-FS-3), and
-/// returns `(is_dir, rows)` where each row is `(name, size, is_dir, mtime_field)`. `.`/`..` are filtered.
-/// A file leaf yields its own single row (the DOS `ls <file>` idiom). Any mount/resolve failure is an
-/// errno-tagged message string, matching the unafs path's shape.
-#[cfg(target_arch = "aarch64")]
-#[allow(clippy::type_complexity)]
-fn pi_usb_ls_collect(sub: &str) -> Result<(bool, Vec<(String, u64, bool, String)>), String> {
-    let fs = crate::fs::fat::mount_source(crate::fs::fat::BlockSource::Usb)
-        .map_err(|e| alloc::format!("no USB FAT mount ({}, -ENODEV)", crate::fs::fat::fat_reason(e)))?;
-    let comps: Vec<&str> = sub.split('/').filter(|c| !c.is_empty()).collect();
-    let mut entries = fs
-        .read_root()
-        .map_err(|e| alloc::format!("/usb: read failed ({}, -EIO)", crate::fs::fat::fat_reason(e)))?;
-    for (i, comp) in comps.iter().enumerate() {
-        let here = alloc::format!("/usb/{}", comps[..=i].join("/"));
-        let de = entries
-            .iter()
-            .find(|d| d.name().eq_ignore_ascii_case(comp))
-            .ok_or_else(|| alloc::format!("{}: not found (-ENOENT)", here))?;
-        if de.is_dir {
-            entries = fs
-                .read_dir(de.first_cluster())
-                .map_err(|e| alloc::format!("{}: read failed ({}, -EIO)", here, crate::fs::fat::fat_reason(e)))?;
-        } else if i == comps.len() - 1 {
-            // A file leaf named as the final component — list its own single row (DOS idiom).
-            return Ok((false, alloc::vec![(String::from(de.name()), de.size as u64, false, fat_mtime_field(&de.mtime()))]));
-        } else {
-            return Err(alloc::format!("{}: not a directory (-ENOTDIR)", here));
-        }
-    }
-    let mut rows: Vec<(String, u64, bool, String)> = Vec::new();
-    for de in &entries {
-        let name = de.name();
-        if name == "." || name == ".." {
+    let mut rows = mt
+        .read_dir(path)
+        .map_err(|e| alloc::format!("{}: {}", path, vfs_err(e)))?;
+    // Mount points immediately below `path` — `/fat` and `/usb` when listing `/`. Boundary-matched
+    // the way the resolver matches, and only for prefixes that are actually bound, so an absent
+    // stick contributes no row (honest hot-plug, doc §6).
+    let base = if path == "/" { "" } else { path };
+    for pfx in mt.prefixes() {
+        if pfx == "/" {
             continue;
         }
-        rows.push((String::from(name), de.size as u64, de.is_dir, fat_mtime_field(&de.mtime())));
+        if let Some(tail) = pfx.strip_prefix(base) {
+            let name = tail.trim_start_matches('/');
+            if !name.is_empty() && !name.contains('/') && !rows.iter().any(|r| r.name == name) {
+                rows.push(DirEnt {
+                    name: String::from(name),
+                    kind: NodeKind::Dir,
+                    size: 0,
+                    mtime: None,
+                });
+            }
+        }
     }
-    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
     Ok((true, rows))
 }
 
-/// PI-FS-5: the `/usb[...]` arm of the Pi `ls`. `full` is the normalized `/usb...` path (for the table
-/// header and the `:: ls1: /usb...` witness); `sub` is the part past `/usb`. Prints the same table shape as
-/// the unafs/FAT paths — size + name, `<DIR>` for directories — and, under `-l`, the FAT last-write date the
-/// `/fs/usb/` HTTP listing shows (PI-FS-4). Emits the `:: ls1:` witness so a headless capture sees the rows.
+/// VFS-1 (adoption): render a [`DirEnt`](crate::fs::vfs::DirEnt)'s last-write stamp as the
+/// fixed-width `YYYY-MM-DD HH:MM:SS` field the `ls -l` date column uses (mirrors genet's
+/// `fmt_fat_mtime` so the shell and `/fs/usb/` never disagree). `None` — a medium with no stamp
+/// (native UnaFS) or a FAT entry whose on-disk field was all-zero — renders as a 19-char dashed
+/// placeholder rather than a fabricated 1980 date. ONE formatter for all three volumes: before this
+/// arc the FAT path had `fat_mtime_field` and the unafs path had a separate `UNAFS_NO_MTIME`
+/// constant, and the verb picked between them by knowing which volume it was on.
 #[cfg(target_arch = "aarch64")]
-fn pi_usb_ls(console: &mut Console, full: &str, sub: &str, long: bool) {
-    match pi_usb_ls_collect(sub) {
-        Ok((is_dir, rows)) => {
-            let (mut files, mut dirs) = (0u32, 0u32);
-            for (name, size, row_is_dir, date) in &rows {
-                if *row_is_dir {
-                    dirs += 1;
-                    if long {
-                        console.println(&alloc::format!("  <DIR>        {}  {}/", date, name));
-                    } else {
-                        console.println(&alloc::format!("  <DIR>         {}", name));
-                    }
-                } else {
-                    files += 1;
-                    if long {
-                        console.println(&alloc::format!("  {:>10}  {}  {}", size, date, name));
-                    } else {
-                        console.println(&alloc::format!("  {:>10}  {}", size, name));
-                    }
-                }
-            }
-            if is_dir {
-                console.println(&alloc::format!("{} file(s), {} dir(s)", files, dirs));
-            }
-            let names: Vec<&str> = rows.iter().map(|(n, _, _, _)| n.as_str()).collect();
-            if long {
-                let sizes: Vec<String> = rows.iter().map(|(_, s, _, _)| alloc::format!("{}", s)).collect();
-                serial_println!(
-                    ":: ls1: {}: {} ({} file, {} dir) sizes: {} ::",
-                    full, names.join(" "), files, dirs, sizes.join(" ")
-                );
-            } else {
-                serial_println!(":: ls1: {}: {} ({} file, {} dir) ::", full, names.join(" "), files, dirs);
-            }
-        }
-        Err(msg) => {
-            console.println(&alloc::format!("ls: {}", msg));
-            serial_println!(":: ls1: {}: ERR {} ::", full, msg);
-        }
+fn vfs_mtime_field(ts: Option<&crate::fs::vfs::VfsTime>) -> String {
+    match ts {
+        None => String::from("       -           "),
+        Some(t) => alloc::format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            t.year, t.month, t.day, t.hour, t.min, t.sec
+        ),
     }
 }
 
+/// VFS-1 (adoption): the Pi `ls`/`dir` core — now ONE function over the mount table instead of a
+/// `/usb` prefix test choosing between a unafs renderer and a USB-FAT renderer that printed the same
+/// table in two places. Resolves `arg` through the seam ([`vfs_path`], cwd-aware), collects through
+/// [`vfs_ls_collect`], and prints the table shape every volume has always used: size + name, `<DIR>`
+/// for directories, and under `-l` the date column [`vfs_mtime_field`] renders.
+///
+/// Emits the per-invocation `:: ls1: <path>: <names> (N file, M dir) ::` serial witness unchanged —
+/// the verb renders panel-only on the bench, so a headless capture gets the same content (the
+/// PI-UI-3 `ui3_say` idiom). The `-l` mirror keeps that shape and appends the per-entry sizes.
 #[cfg(target_arch = "aarch64")]
 fn pi_ls(console: &mut Console, arg: &str, long: bool) {
-    // 19-char dashed placeholder, the same width as the FAT `YYYY-MM-DD HH:MM:SS` field — unafs has no
-    // last-write time to render, so `ls -l` shows a `-` here honestly rather than a fabricated date.
-    const UNAFS_NO_MTIME: &str = "       -           ";
-    let path = normalize_path(&cwd_path(), arg);
-    // PI-FS-5: the `/usb` mount lives in the SAME path namespace the HTTP server exposes at `/fs/usb`.
-    // `ls /usb` (and `/usb/<sub>`, LFN-aware) lists the live USB FAT volume via the genet mount API rather
-    // than unafs. Everything else stays on the native unafs volume below.
-    if path == "/usb" || path.starts_with("/usb/") {
-        let sub = path.strip_prefix("/usb").unwrap_or("");
-        pi_usb_ls(console, &path, sub, long);
-        return;
-    }
-    match pi_ls_collect(&path) {
+    use crate::fs::vfs::NodeKind;
+    let path = vfs_path(arg);
+    match vfs_ls_collect(&path) {
         Ok((is_dir, rows)) => {
-            // PI-FS-5: at the unafs root, append a `usb/` pseudo-entry when the USB stick is mounted — mirroring
-            // the `/fs/` HTTP listing's `usb/` link, so `ls /` advertises the drive the same way the browser does.
-            let show_usb = path == "/" && crate::drivers::block::usb_info().is_some();
             let (mut files, mut dirs) = (0u32, 0u32);
-            for (name, size, row_is_dir) in &rows {
-                if *row_is_dir {
+            for de in &rows {
+                let date = vfs_mtime_field(de.mtime.as_ref());
+                if matches!(de.kind, NodeKind::Dir) {
                     dirs += 1;
                     if long {
-                        console.println(&alloc::format!("  <DIR>        {}  {}/", UNAFS_NO_MTIME, name));
+                        console.println(&alloc::format!("  <DIR>        {}  {}/", date, de.name));
                     } else {
-                        console.println(&alloc::format!("  <DIR>         {}", name));
+                        console.println(&alloc::format!("  <DIR>         {}", de.name));
                     }
                 } else {
                     files += 1;
                     if long {
-                        console.println(&alloc::format!("  {:>10}  {}  {}", size, UNAFS_NO_MTIME, name));
+                        console.println(&alloc::format!("  {:>10}  {}  {}", de.size, date, de.name));
                     } else {
-                        console.println(&alloc::format!("  {:>10}  {}", size, name));
+                        console.println(&alloc::format!("  {:>10}  {}", de.size, de.name));
                     }
-                }
-            }
-            // PI-FS-5: the mounted-USB pseudo-entry — a `usb/` dir row at the unafs root, counted as a dir.
-            if show_usb {
-                dirs += 1;
-                if long {
-                    console.println(&alloc::format!("  <DIR>        {}  usb/", UNAFS_NO_MTIME));
-                } else {
-                    console.println("  <DIR>         usb");
                 }
             }
             if is_dir {
                 console.println(&alloc::format!("{} file(s), {} dir(s)", files, dirs));
             }
-            let mut names: Vec<&str> = rows.iter().map(|(n, _, _)| n.as_str()).collect();
-            if show_usb {
-                names.push("usb");
-            }
+            let names: Vec<&str> = rows.iter().map(|d| d.name.as_str()).collect();
             if long {
-                let sizes: Vec<String> = rows.iter().map(|(_, s, _)| alloc::format!("{}", s)).collect();
+                let sizes: Vec<String> = rows.iter().map(|d| alloc::format!("{}", d.size)).collect();
                 serial_println!(
                     ":: ls1: {}: {} ({} file, {} dir) sizes: {} ::",
                     path, names.join(" "), files, dirs, sizes.join(" ")
@@ -1794,27 +1751,18 @@ fn pi_ls(console: &mut Console, arg: &str, long: bool) {
     }
 }
 
-/// PI-SHELL-LS boot witness (`witness` battery only): exercise the exact `pi_ls_collect` listing the
-/// shell verb uses, against the unafs root, and emit the `:: ls1: ... ::` line headlessly — so
-/// `UNAOS_PI=1 ./arroyo kernel8-test` proves `ls` works without a serial-console injection path. Quiet
-/// default boots never compile this. Baremetal-gated to match the emmc2 backend the volume rides.
+/// PI-SHELL-LS boot witness (`witness` battery only): exercise the exact `vfs_ls_collect` listing
+/// the shell verb uses, against the native root, and emit the `:: ls1: ... ::` line headlessly — so
+/// `UNAOS_PI=1 ./arroyo kernel8-test` proves `ls` works without a serial-console injection path.
+/// Quiet default boots never compile this. Baremetal-gated to match the emmc2 backend the volume
+/// rides. VFS-1 (adoption): the collector is now the mount-table one, so this witness proves the
+/// ROUTED listing rather than a unafs-direct call the verb no longer makes.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
 pub fn pi_ls_witness() {
-    match pi_ls_collect("/") {
-        Ok((_, rows)) => {
-            let names: Vec<&str> = rows.iter().map(|(n, _, _)| n.as_str()).collect();
-            let dirs = rows.iter().filter(|(_, _, d)| *d).count();
-            let files = rows.len() - dirs;
-            serial_println!(
-                ":: ls1: /: {} ({} file, {} dir) ::",
-                names.join(" "), files, dirs
-            );
-        }
-        Err(msg) => serial_println!(":: ls1: /: ERR {} ::", msg),
-    }
+    vfs_ls_say("/");
 }
 
-/// PI-FS-5 boot/hot-plug witness: exercise the EXACT `pi_usb_ls_collect` listing the shell's `ls /usb`
+/// PI-FS-5 boot/hot-plug witness: exercise the EXACT `vfs_ls_collect` listing the shell's `ls /usb`
 /// verb uses, against the live USB FAT mount, and emit the `:: ls1: /usb... ::` line headlessly — so a
 /// capture proves the shell sees the same volume `/fs/usb` serves, without a serial-console injection
 /// path. Called from `fat::piusb27_mount_witness` (which fires once per bring-up + every hot-plug), so it
@@ -1823,22 +1771,37 @@ pub fn pi_ls_witness() {
 /// Lists the `/usb` root then descends one named subdir to prove the LFN-aware subpath walk.
 #[cfg(target_arch = "aarch64")]
 pub fn pi_usb_ls_witness() {
-    for (full, sub) in [("/usb", ""), ("/usb/SUBDIR", "/SUBDIR")] {
-        match pi_usb_ls_collect(sub) {
-            Ok((_, rows)) => {
-                let names: Vec<String> = rows
-                    .iter()
-                    .map(|(n, _, d, _)| if *d { alloc::format!("{}/", n) } else { n.clone() })
-                    .collect();
-                let dirs = rows.iter().filter(|(_, _, d, _)| *d).count();
-                let files = rows.len() - dirs;
-                serial_println!(
-                    ":: ls1: {}: {} ({} file, {} dir) ::",
-                    full, names.join(" "), files, dirs
-                );
-            }
-            Err(msg) => serial_println!(":: ls1: {}: ERR {} ::", full, msg),
+    vfs_ls_say("/usb");
+    vfs_ls_say("/usb/SUBDIR");
+}
+
+/// VFS-1 (adoption): the ONE headless `:: ls1: ... ::` emitter both listing witnesses now share —
+/// collect through the mount table, render names (a directory shown with a trailing `/`) and the
+/// file/dir tally. Both witnesses previously carried their own copy of this loop against their own
+/// volume's collector, which is precisely the duplication the routing seam removes.
+#[cfg(target_arch = "aarch64")]
+fn vfs_ls_say(path: &str) {
+    use crate::fs::vfs::NodeKind;
+    match vfs_ls_collect(path) {
+        Ok((_, rows)) => {
+            let names: Vec<String> = rows
+                .iter()
+                .map(|d| {
+                    if matches!(d.kind, NodeKind::Dir) {
+                        alloc::format!("{}/", d.name)
+                    } else {
+                        d.name.clone()
+                    }
+                })
+                .collect();
+            let dirs = rows.iter().filter(|d| matches!(d.kind, NodeKind::Dir)).count();
+            let files = rows.len() - dirs;
+            serial_println!(
+                ":: ls1: {}: {} ({} file, {} dir) ::",
+                path, names.join(" "), files, dirs
+            );
         }
+        Err(msg) => serial_println!(":: ls1: {}: ERR {} ::", path, msg),
     }
 }
 
@@ -2539,12 +2502,20 @@ fn midden_facts() -> midden_core::Facts {
         aarch64: cfg!(target_arch = "aarch64"),
         x86: cfg!(target_arch = "x86_64"),
         v3d: cfg!(all(target_arch = "aarch64", feature = "v3d")),
+        // BARENAME (§6.6a): the knob the `vug`/`pulse` match arms actually carry. It is a pure
+        // `feature` read — `Avail::VugDemo` composes it with `aarch64` — so this line says one
+        // thing and says it truthfully: DEFAULT OFF, and off means the words are not verbs.
+        vugdemo: cfg!(feature = "vugdemo"),
         proc_verbs,
         proc_rows,
-        // BARE-NAME LAUNCH is x86-only today: `bare_exec` + `spawn_user_image_bg` off the FAT
-        // volume. With this false the core never probes the volume and never returns `Plan::Exec`,
-        // so an aarch64 build does exactly what it did before this crate existed.
-        exec: cfg!(target_arch = "x86_64"),
+        // BARENAME (PARITY §6.6a): bare-name launch exists exactly where the PROCESS VERBS exist.
+        // `spawn_user_image_bg` + the shell job table are the whole dependency and they carry that
+        // very gate, so this reads the flag off `proc_verbs` instead of re-deriving a second
+        // `cfg!(target_arch = ...)` beside it — the ONE-OS law forbids an arch gate in the
+        // experience layer, and there is only one fact here: "this build can start a ring-3
+        // program". A build with no process table still leaves it false, and there the core never
+        // probes the volume and never returns `Plan::Exec`.
+        exec: proc_verbs,
     }
 }
 
@@ -2600,9 +2571,26 @@ impl midden_core::Volume for FatVolume {
             Ok(Resolved::Entry(de, _)) if !de.is_dir
         )
     }
-    // aarch64 never sets `Facts::exec`, so the core never calls this. Answering `false` rather
-    // than reaching for unafs keeps the promise: no behaviour change on a build with no loader.
-    #[cfg(not(target_arch = "x86_64"))]
+    /// BARENAME (PARITY §6.6a): the aarch64 twin — the SAME question, asked of the namespace this
+    /// arch actually has.
+    ///
+    /// aarch64 is not x86 with a different mnemonic set here: x86 has no VFS, so its whole path
+    /// universe IS the program-source FAT and "resolve from the cwd" already means "resolve on the
+    /// volume executables live on". On the Pi those are two different statements — `/` is native
+    /// UnaFS and the executables are on `/fat` — so the faithful port is not the x86 code with the
+    /// mount swapped, it is [`exec_resolve`]: the cwd first (so `ls`/`cat`/`run` and a bare name
+    /// agree about what a name means, VFS-1's whole point), then the program-source root. See
+    /// `exec_resolve` for the order and why it is the same order.
+    ///
+    /// No [`EXEC_BIND`] stamp: that instrument and its `fatverb_storage_witness` reader are x86-only
+    /// (they compare FAT *handles*, and this arch binds a mount table, not a handle).
+    #[cfg(all(feature = "baremetal", target_arch = "aarch64"))]
+    fn is_file(&mut self, name: &str) -> bool {
+        exec_resolve(name).is_some()
+    }
+    // No process table, no loader, so `Facts::exec` is false and the core never calls this.
+    // Answering `false` keeps the promise: no behaviour change on a build that cannot launch.
+    #[cfg(not(any(target_arch = "x86_64", all(feature = "baremetal", target_arch = "aarch64"))))]
     fn is_file(&mut self, _name: &str) -> bool {
         false
     }
@@ -2659,6 +2647,7 @@ pub fn midden_witness() {
         proc_rows: midden_facts().proc_rows,
         aarch64: false,
         v3d: false,
+        vugdemo: false,
     };
 
     // 1. dispatch — a core verb is answered by the core, with real text.
@@ -2935,12 +2924,13 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             return false;
         }
         midden_core::Plan::Exec { typed, name } => {
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
             bare_exec(console, &typed, &name);
-            // No build outside x86 sets `Facts::exec`, so the core never hands this arm a plan
-            // there; the branch exists so the match is total and the day a loader arrives on
-            // another arch the compiler points here.
-            #[cfg(not(target_arch = "x86_64"))]
+            // BARENAME (§6.6a): the day a loader arrived on aarch64 the compiler pointed here, as
+            // this comment used to promise. What is left is the build with no process table at all,
+            // which never sets `Facts::exec` and so is never handed this arm; the branch stays so
+            // the match is total.
+            #[cfg(not(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64")))]
             {
                 let _ = (&typed, &name);
                 console.println("Unknown command. Type 'help' for assistance.");
@@ -2961,10 +2951,12 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
     // x86 neither `vug` nor `pulse` is registered (the demo module is aarch64-only), so nothing here
     // takes the screen: claiming otherwise would suppress the console repaint that carries the
     // "Unknown command" reply, and typing `vug` would present as a hang instead of a refusal.
+    // DECRUD-1 adds the `vugdemo` half of exactly that rule: knob-off the two arms below are not
+    // registered on aarch64 either, so the words must stop claiming the screen there too.
     #[cfg(all(target_arch = "aarch64", feature = "v3d"))]
-    let took_screen = command == "vug" || command == "pulse" || command == "v3d";
+    let took_screen = (cfg!(feature = "vugdemo") && (command == "vug" || command == "pulse")) || command == "v3d";
     #[cfg(all(target_arch = "aarch64", not(feature = "v3d")))]
-    let took_screen = command == "vug" || command == "pulse";
+    let took_screen = cfg!(feature = "vugdemo") && (command == "vug" || command == "pulse");
     #[cfg(not(target_arch = "aarch64"))]
     let took_screen = false;
 
@@ -3109,7 +3101,18 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // JD4: `cat` takes a path (absolute or cwd-relative), e.g. `cat DOCS/README.TXT`.
             match args.first() {
                 None => console.println("usage: cat <path>"),
+                // JD12 glob expansion is still FAT-direct on both arches — it walks the parent
+                // directory through `fs.read_dir` to expand the pattern. Routing globbing through
+                // the mount table is the next adoption step and is named as such in the VFS doc;
+                // it is deliberately NOT smuggled into this arc, which is plumbing unification.
                 Some(name) if has_glob(name) => cat_globbed(console, name),
+                // VFS-1 (adoption): on aarch64 `cat` resolves through the seam, so it agrees with
+                // `ls`/`run`/`bg`/`vfs` about the namespace (`/` = native, `/fat`, `/usb`). x86 keeps
+                // the FAT-direct path unchanged: `fs/vfs.rs` gates both backends to aarch64, so that
+                // arch has no mount table to route through and exactly one FAT volume to confuse.
+                #[cfg(target_arch = "aarch64")]
+                Some(name) => vfs_cat(console, name),
+                #[cfg(not(target_arch = "aarch64"))]
                 Some(name) => {
                     if let Some(fs) = mount_read_volume(console, "cat") {
                         match resolve_path(&fs, &normalize_path(&cwd_path(), name)) {
@@ -3307,6 +3310,25 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             match args.first().copied() {
                 None => console.println("usage: urm <path>"),
                 Some(path) => console.println(&unafs_verb_rm(path)),
+            }
+        },
+        #[cfg(target_arch = "aarch64")]
+        "umv" => {
+            // F2: rename or move a file/directory on the native unafs volume (`umv <src> <dst>`).
+            // `<dst>` names the target directly; an existing destination is refused (no implicit
+            // overwrite), as is moving a directory into its own descendant.
+            match (args.first().copied(), args.get(1).copied()) {
+                (Some(src), Some(dst)) => console.println(&unafs_verb_mv(src, dst)),
+                _ => console.println("usage: umv <src> <dst>"),
+            }
+        },
+        #[cfg(target_arch = "aarch64")]
+        "urmattr" => {
+            // F2: remove one typed attribute (`urmattr <path> <key>`). Value + every catalog index
+            // entry go in one transaction; a missing key is refused with AttributeNotFound.
+            match (args.first().copied(), args.get(1).copied()) {
+                (Some(path), Some(key)) => console.println(&unafs_verb_rmattr(path, key)),
+                _ => console.println("usage: urmattr <path> <key>"),
             }
         },
         #[cfg(target_arch = "aarch64")]
@@ -3824,8 +3846,10 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             }
         },
         // The in-kernel 3D sculptor. Aarch64 only, matching `crate::vug`: the whole arm vanishes on
-        // x86, where the verb is therefore an ordinary unrecognised word.
-        #[cfg(target_arch = "aarch64")]
+        // x86, where the verb is therefore an ordinary unrecognised word. DECRUD-1: and on the
+        // `vugdemo` knob, DEFAULT OFF — knob-off the verb is that same unrecognised word on the Pi,
+        // and `VUG.ELF` (`run vug`) is the program that does this for real, in ring 3.
+        #[cfg(all(target_arch = "aarch64", feature = "vugdemo"))]
         "vug" => {
              match args.first().copied() {
                  Some("bebox") => {
@@ -3865,9 +3889,10 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // On a real replay `took_screen` keeps the console off the freshly-blitted tiles.
         },
         // UI1-M3's full-screen monitor draws through the same `vug` module, so it is gated the same
-        // way. x86 keeps the per-core instrument it always had — the `ui_status` strip and `sched` —
-        // and this verb is an unrecognised word there.
-        #[cfg(target_arch = "aarch64")]
+        // way — arch AND (DECRUD-1) the `vugdemo` knob. x86 keeps the per-core instrument it always
+        // had — the `ui_status` strip and `sched` — and this verb is an unrecognised word there;
+        // knob-off the Pi is in the same position, with `PULSE.ELF` (`run pulse`) as the real one.
+        #[cfg(all(target_arch = "aarch64", feature = "vugdemo"))]
         "pulse" => {
             // UI1-M3: the full-screen system monitor (BeOS Pulse homage). Any key exits; the
             // console repaints over it on the way out (same contract as the vug crystal).
@@ -4361,7 +4386,17 @@ fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc
     // Cap = the kernel user window; a file at or under it may still be rejected by the loader (a flat blob
     // is re-bounded to one code page), but this is the hard read ceiling — we never read past it.
     const CAP: u64 = crate::arch::aarch64::uslots::USER_REGION_SIZE as u64; // JETSON-EL0: uslots facade (boot.rs on pi / mmu_tegra_el0.rs on tegra)
+    // VFS-1 (adoption): through the seam, so `run`/`bg` resolve a relative name against the cwd like
+    // every other verb (they used the raw argument before) and report an unbound volume as the
+    // VOLUME being absent rather than as a bare -ENOENT off the native root — the VFS-4 guard the
+    // mutating `vfs` verb has had since the P44 misdirection, now shared instead of re-derived.
+    let path = &vfs_path(path)[..];
     let mt = vfs_mount_table();
+    if let Some(vol) = unmounted_reserved_volume(&mt.prefixes(), path) {
+        console.println(&alloc::format!(
+            "{}: {}: volume {} not mounted (-ENODEV)", verb, path, vol));
+        return None;
+    }
     let st = match mt.stat(path) {
         Ok(s) => s,
         Err(e) => {
@@ -4985,7 +5020,7 @@ fn bg_kill_cmd(console: &mut Console, pid: u64) {
 /// the prompt to type `bg`. Registering it here is what keeps `jobs` and `kill` TRUTHFUL —
 /// `bg_kill_cmd` resolves a pid through this table and REFUSES one it cannot find, so an
 /// unregistered launch would be a running ring-3 program the operator can neither list nor stop.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
 pub(crate) fn adopt_bg_job(pid: u64, slot: u64, name: &str) -> bool {
     let mut jobs = BG_JOBS.lock();
     let Some(free) = jobs.iter_mut().find(|s| s.is_none()) else {
@@ -4998,7 +5033,130 @@ pub(crate) fn adopt_bg_job(pid: u64, slot: u64, name: &str) -> bool {
     true
 }
 
-/// BARE-EXEC (GR20, x86): run a program by TYPING ITS NAME — `vug.elf` at the prompt starts
+/// BARENAME (PARITY §6.6a): the aarch64 program-source root — the namespace spelling of x86's
+/// "the volume executables live on".
+///
+/// x86 has no VFS: its whole path universe is the program-source FAT, so there "resolve from the
+/// cwd" and "resolve on the volume executables live on" are the same sentence, and `/fat` is
+/// carried only as an alias for that one volume's root. On the Pi the two come apart — `/` is
+/// native UnaFS and `arroyo`'s `kernel8` FAT staging puts `VUG.ELF`/`VUGC.ELF`/`VUGX.ELF`/
+/// `STAT.ELF`/`PULSE.ELF` on the SD FAT, which `vfs_mount_table` binds at `/fat`. This constant is
+/// that half of the x86 sentence, named rather than inlined.
+#[cfg(all(feature = "baremetal", target_arch = "aarch64"))]
+const EXEC_ROOT: &str = "/fat";
+
+/// BARENAME (PARITY §6.6a): resolve a bare-name candidate to an absolute VFS path, or `None`.
+///
+/// **Through the VFS seam, not a private path scheme.** [`vfs_path`] is what `ls`, `cat`, `run`,
+/// `bg` and `vfs` resolve through, so a bare name means exactly what those verbs say it means —
+/// `cd /fat` then `vug` works for the same reason `cd /fat` then `cat VUG.ELF` works, and a name
+/// that `ls` cannot show is a name this cannot launch.
+///
+/// Order, and it is x86's order transposed rather than a new policy:
+///
+/// 1. **cwd-relative**, via `vfs_path` — the x86 first (and only) probe, verbatim in intent.
+/// 2. **The program-source root**, [`EXEC_ROOT`] — only for a RELATIVE token, and skipped when it
+///    would repeat probe 1. On x86 this step is not absent, it is *implied*: its cwd already sits
+///    on the program source, so its single probe covers both. Dropping it on the Pi would mean the
+///    operator at `/` still could not type `vug` — the exact defect §6.6a names, with `bg
+///    /fat/VUG.ELF` still the only way in — so it is the step that makes the port a port.
+///
+/// A directory never resolves: a bare name launches a program.
+#[cfg(all(feature = "baremetal", target_arch = "aarch64"))]
+fn exec_resolve(name: &str) -> Option<String> {
+    use crate::fs::vfs::NodeKind;
+    let mt = vfs_mount_table();
+    let probe = |p: String| -> Option<String> {
+        match mt.stat(&p) {
+            Ok(st) if !matches!(st.kind, NodeKind::Dir) => Some(p),
+            _ => None,
+        }
+    };
+    let from_cwd = vfs_path(name);
+    if let Some(hit) = probe(from_cwd.clone()) {
+        return Some(hit);
+    }
+    if name.starts_with('/') {
+        return None;
+    }
+    let from_root = normalize_path(EXEC_ROOT, name);
+    if from_root == from_cwd {
+        return None;
+    }
+    probe(from_root)
+}
+
+/// BARENAME (PARITY §6.6a): the on-disk spelling of an already-resolved path, for the messages.
+///
+/// x86 reads `canon` out of the FAT directory entry its re-resolve walked, so `jobs` shows
+/// `/VUG.ELF` after the operator typed `vug`. The VFS `stat` this arch resolves through returns no
+/// name at all, so the spelling is recovered the only honest way available: list the parent and
+/// take the entry that matches case-insensitively. A miss (or an unreadable parent) falls back to
+/// the resolved path unchanged — a display name is never worth a refusal.
+#[cfg(all(feature = "baremetal", target_arch = "aarch64"))]
+fn exec_canon(path: &str) -> String {
+    let (dir, leaf) = match path.rfind('/') {
+        Some(0) => ("/", &path[1..]),
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => return String::from(path),
+    };
+    if let Ok(rows) = vfs_mount_table().read_dir(dir) {
+        if let Some(row) = rows.iter().find(|r| r.name.eq_ignore_ascii_case(leaf)) {
+            return normalize_path(dir, &row.name);
+        }
+    }
+    String::from(path)
+}
+
+/// BARE-EXEC: re-resolve the core's answer over the live volume — the one genuinely per-arch step
+/// of a bare-name launch, split out so everything after it is ONE body on both arches.
+///
+/// Returns `(load_path, canon)`: what to hand [`read_el0_image`], and the spelling the operator and
+/// the capture are shown. On x86 `load_path` is the token the core returned, untouched, because
+/// that arch's loader resolves it identically and quoting anything else would change lines a
+/// shipping spec anchors on. On aarch64 it is the ABSOLUTE VFS path [`exec_resolve`] found, because
+/// there the token alone is ambiguous between the native root and the program source.
+///
+/// Both twins OWN their refusal: a miss here is a volume that changed under us between the core's
+/// probe and this read (a card pulled mid-command) — an honest race, reported as one rather than as
+/// a typo — so each prints its panel line and its serial mirror before returning `None`.
+///
+/// LAUNCH-AR (x86): the PROGRAM SOURCE, matching `FatVolume::is_file` above and `read_el0_image`
+/// below. All three legs of a bare-name launch — probe, re-resolve, read — bind the same handle;
+/// the Boot AR failure was exactly what happens when they do not.
+#[cfg(target_arch = "x86_64")]
+fn bare_exec_reresolve(console: &mut Console, typed: &str, name: &str) -> Option<(String, String)> {
+    let Ok(fs) = crate::fs::fat::mount_program_source() else {
+        console.println(&alloc::format!("{}: the volume went away before it could be started", typed));
+        serial_println!(":: BAREXEC: {} (typed '{}') — REFUSED: volume vanished after resolution ::", name, typed);
+        return None;
+    };
+    match resolve_path(&fs, &normalize_path(&cwd_path(), name)) {
+        Ok(Resolved::Entry(de, canon)) if !de.is_dir => Some((String::from(name), canon)),
+        _ => {
+            console.println(&alloc::format!("{}: {} went away before it could be started", typed, name));
+            serial_println!(":: BAREXEC: {} (typed '{}') — REFUSED: resolved name no longer a file ::", name, typed);
+            None
+        }
+    }
+}
+
+/// BARENAME (PARITY §6.6a): the aarch64 twin — [`exec_resolve`] again (the same walk the probe
+/// made, one command ago, closing the same race x86's re-mount closes) plus [`exec_canon`] for the
+/// display spelling. Same two message shapes, so a Pi capture and an rMBP capture read alike.
+#[cfg(all(feature = "baremetal", target_arch = "aarch64"))]
+fn bare_exec_reresolve(console: &mut Console, typed: &str, name: &str) -> Option<(String, String)> {
+    let Some(path) = exec_resolve(name) else {
+        console.println(&alloc::format!("{}: {} went away before it could be started", typed, name));
+        serial_println!(":: BAREXEC: {} (typed '{}') — REFUSED: resolved name no longer a file ::", name, typed);
+        return None;
+    };
+    let canon = exec_canon(&path);
+    Some((path, canon))
+}
+
+/// BARE-EXEC (GR20; aarch64 since PARITY §6.6a): run a program by TYPING ITS NAME — `vug.elf` at
+/// the prompt starts
 /// `VUG.ELF` off the FAT volume, in a window, with the prompt back immediately.
 ///
 /// MIDDEN-M1: called from `dispatch_command`'s `Plan::Exec` arm, which `midden_core` produces only
@@ -5029,6 +5187,14 @@ pub(crate) fn adopt_bg_job(pid: u64, slot: u64, name: &str) -> bool {
 /// *bare* `vug` work. `cd DOCS` then a bare name works for the same reason, since the cwd is
 /// applied first.
 ///
+/// **On aarch64 (PARITY §6.6a)** the same two sentences hold with one substitution: the resolution
+/// is `exec_resolve` — the VFS seam `ls`/`cat`/`run`/`bg` share, cwd first and then the
+/// program-source root `/fat` — and `canon` is recovered by [`exec_canon`] from the parent listing
+/// rather than from a FAT directory entry. Case behaves the same way for the same reason: the FAT
+/// backend behind `/fat` matches components case-insensitively, so arm 2 of the core's resolver
+/// (`vug` → `vug.elf`) already hits the on-disk `VUG.ELF` and the upper-cased arm 3 stays latent
+/// here too.
+///
 /// # Why background, and how the operator stops it
 ///
 /// Launched through `spawn_user_image_bg` — the same call `winx8_launcher` makes — so a windowed
@@ -5048,32 +5214,20 @@ pub(crate) fn adopt_bg_job(pid: u64, slot: u64, name: &str) -> bool {
 /// The loader is untouched: the bytes go to `spawn_user_image_bg` exactly as `bg` sends them, so the
 /// per-segment W^X mapping, the ring-3 window bound and the fault-kill net are the same ones CFU-2's
 /// write gate is built on. This adds a way to CALL the loader, never a way to relax it.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
 fn bare_exec(console: &mut Console, typed: &str, name: &str) -> bool {
     // --- re-resolve the core's answer over the live volume ---------------------------------------
-    // The core probed through this same mount a moment ago; re-resolving costs one walk and closes
-    // the window where the card changed underneath. A miss here is a RACE, not a typo, and says so.
-    // LAUNCH-AR: the PROGRAM SOURCE, matching `FatVolume::is_file` above and `read_el0_image`
-    // below. All three legs of a bare-name launch — probe, re-resolve, read — now bind the same
-    // handle; the Boot AR failure was exactly what happens when they do not.
-    let Ok(fs) = crate::fs::fat::mount_program_source() else {
-        console.println(&alloc::format!("{}: the volume went away before it could be started", typed));
-        serial_println!(":: BAREXEC: {} (typed '{}') — REFUSED: volume vanished after resolution ::", name, typed);
+    // The core probed a moment ago; re-resolving costs one walk and closes the window where the
+    // volume changed underneath. A miss is a RACE, not a typo, and `bare_exec_reresolve` says so —
+    // it is the ONE per-arch step, and it has already printed if it returns `None`.
+    let Some((load_path, canon)) = bare_exec_reresolve(console, typed, name) else {
         return false;
-    };
-    let canon = match resolve_path(&fs, &normalize_path(&cwd_path(), name)) {
-        Ok(Resolved::Entry(de, canon)) if !de.is_dir => canon,
-        _ => {
-            console.println(&alloc::format!("{}: {} went away before it could be started", typed, name));
-            serial_println!(":: BAREXEC: {} (typed '{}') — REFUSED: resolved name no longer a file ::", name, typed);
-            return false;
-        }
     };
     // --- loud from here: the name is a real file, so we owe an outcome --------------------------
     // Every refusal below is mirrored to serial as well as the panel. The panel line is what the
     // operator reads; the serial line is what a headless capture reads, and without it a bench log
     // could not tell "refused, and here is why" from "the keystroke never arrived".
-    let Some(bytes) = read_el0_image(console, typed, name) else {
+    let Some(bytes) = read_el0_image(console, typed, &load_path) else {
         // read_el0_image named the reason on the panel (size / arch / read error).
         serial_println!(":: BAREXEC: {} — REFUSED at the image read/pre-check (see the panel line) ::", canon);
         return true;
@@ -5092,8 +5246,9 @@ fn bare_exec(console: &mut Console, typed: &str, name: &str) -> bool {
         );
         return true;
     }
-    // The ELF64 / little-endian / EM_X86_64 pre-checks already ran inside `read_el0_image`, which
-    // named any of them; the kernel loader re-validates from scratch regardless.
+    // The ELF64 / little-endian / e_machine pre-checks already ran inside `read_el0_image` (the
+    // arch's own twin, so EM_X86_64 there and EM_AARCH64 here), which named any of them; the kernel
+    // loader re-validates from scratch regardless.
     let n = bytes.len();
     match crate::arch::syscall::spawn_user_image_bg(&bytes) {
         Ok((pid, slot, entry)) => {
@@ -5126,8 +5281,23 @@ fn bare_exec(console: &mut Console, typed: &str, name: &str) -> bool {
     }
 }
 
+/// VFS-1 (adoption): **the seam** — the ONE place a shell verb turns an operator-typed argument into
+/// an absolute VFS path. Every routed verb (`ls`, `cat`, `run`, `bg`, `vfs`) calls this and nothing
+/// else; which volume the path lands on is then decided solely by `MountTable::resolve`'s
+/// longest-prefix rule, never by the verb.
+///
+/// It is `normalize_path` against the cwd — purely lexical, so `.` collapses and `..` pops before any
+/// backend is consulted, and a relative `VUG.ELF` means what `pwd` says it means. That last part is a
+/// FIX, not just a move: `run`, `bg` and `vfs` used their argument VERBATIM, so after a `cd` they
+/// silently resolved against the root while every other verb honoured the cwd. One seam means one
+/// answer to "what does this path name", which is the point of the layer.
 #[cfg(target_arch = "aarch64")]
-fn vfs_mount_table() -> crate::fs::vfs::MountTable {
+fn vfs_path(arg: &str) -> String {
+    normalize_path(&cwd_path(), arg)
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn vfs_mount_table() -> crate::fs::vfs::MountTable {
     use crate::fs::vfs::{FatBackend, MountTable, NativeBackend, KERNEL_PRINCIPAL};
     let mut mt = MountTable::new();
     mt.mount("/", alloc::boxed::Box::new(NativeBackend::new("native")));
@@ -5210,13 +5380,15 @@ fn vfs_cmd(console: &mut Console, args: &[&str]) {
             return;
         }
     };
+    // VFS-1 (adoption): through the seam — the mutating verbs honour the cwd like the read verbs do.
     let path = match args.get(1) {
-        Some(&p) => p,
+        Some(&p) => vfs_path(p),
         None => {
             console.println(&alloc::format!("usage: vfs {} <path> [text ...]", op));
             return;
         }
     };
+    let path = &path[..];
     let mt = vfs_mount_table();
     // VFS-4: a mutating verb aimed at a reserved volume that is not mounted (the
     // USB stick absent, or its FAT unreadable so `mount_source(Usb)` failed and
@@ -5406,6 +5578,53 @@ fn unafs_verb_rm(path: &str) -> String {
         Ok(Ok(())) => alloc::format!("urm: removed {}", path),
         Ok(Err(msg)) => alloc::format!("urm: {}: {}", path, msg),
         Err(e) => alloc::format!("urm: no unafs volume ({:?})", e),
+    }
+}
+
+/// `umv <src> <dst>`: rename OR move a file or directory (F2). `<dst>` names
+/// the TARGET path directly — `umv /A.TXT /B.TXT` renames in place, and
+/// `umv /A.TXT /D/B.TXT` moves it under `/D` with a new leaf. Deliberate
+/// divergence from POSIX: an existing `<dst>` is REFUSED (`FileExists`), never
+/// silently overwritten, and moving a directory into its own descendant is
+/// refused (`DirectoryLoop`). Both directory rewrites land in ONE CoW
+/// transaction, so there is no "in neither directory" window to crash into.
+#[cfg(target_arch = "aarch64")]
+fn unafs_verb_mv(src: &str, dst: &str) -> String {
+    let (sparent, sleaf) = match unafs_split(src) {
+        Some(pl) => pl,
+        None => return alloc::format!("umv: {}: invalid path", src),
+    };
+    let (dparent, dleaf) = match unafs_split(dst) {
+        Some(pl) => pl,
+        None => return alloc::format!("umv: {}: invalid path", dst),
+    };
+    match crate::fs::unafs::with_unafs(|fs| {
+        let spid = fs.resolve_path(sparent).map_err(|e| alloc::format!("{:?}", e))?;
+        let dpid = fs.resolve_path(dparent).map_err(|e| alloc::format!("{:?}", e))?;
+        fs.rename(spid, sleaf, dpid, dleaf)
+            .map_err(|e| alloc::format!("{:?}", e))
+    }) {
+        Ok(Ok(())) => alloc::format!("umv: {} -> {}", src, dst),
+        Ok(Err(msg)) => alloc::format!("umv: {}: {}", src, msg),
+        Err(e) => alloc::format!("umv: no unafs volume ({:?})", e),
+    }
+}
+
+/// `urmattr <path> <key>`: remove one typed attribute from a file or directory
+/// (F2). The inline or spilled value AND every catalog index entry for the
+/// (inode, key) pair go in ONE CoW transaction, so a removed attribute can
+/// never be returned by a later query. A key that is not present is refused
+/// with `AttributeNotFound` — never a silent no-op.
+#[cfg(target_arch = "aarch64")]
+fn unafs_verb_rmattr(path: &str, key: &str) -> String {
+    match crate::fs::unafs::with_unafs(|fs| {
+        let id = fs.resolve_path(path).map_err(|e| alloc::format!("{:?}", e))?;
+        fs.remove_attribute(id, key)
+            .map_err(|e| alloc::format!("{:?}", e))
+    }) {
+        Ok(Ok(())) => alloc::format!("urmattr: removed '{}' from {}", key, path),
+        Ok(Err(msg)) => alloc::format!("urmattr: {}: {}: {}", path, key, msg),
+        Err(e) => alloc::format!("urmattr: no unafs volume ({:?})", e),
     }
 }
 

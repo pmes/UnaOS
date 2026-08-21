@@ -74,10 +74,11 @@ surfaces `Busy`/`-EAGAIN` to callers, which is precisely the case that used to d
 
 ## The family and its two idioms
 
-WEDGE-8's shape is no longer one arc's fix. Five locks in this tree now carry the F1–F5 discipline
-(`wm::TABLE`, `XHCI_CONTROLLER`, the mailbox transport, `cursor::SPRITE`, `cursor::OVERLAY`) — and
-they carry it in **two** idioms. That is not an inconsistency left behind by three
-authors; it is the choice the discipline actually asks of every lock it is applied to.
+WEDGE-8's shape is no longer one arc's fix. Eight entries in this tree now carry the F1–F6 discipline
+(`wm::TABLE`, `XHCI_CONTROLLER`, `emmc2::CARD`, the mailbox transport, `cursor::SPRITE`,
+`cursor::OVERLAY`, `wm::DEFER`, and `wm::STAGE`'s growth into the global heap) — and they carry it in
+**two** idioms. That is not an inconsistency left behind by several authors; it is the choice the
+discipline actually asks of every lock it is applied to.
 
 The invariant is the same in both cases, and it is the one the family's defect violates:
 
@@ -174,7 +175,9 @@ invariant is checkable by grep without booting.
 | `drivers::emmc2::CARD` (F2) | claim/loan — `claim` / `claim_for_io` / `SdLoan::drop`; bounded masked wait doctrine (`MASKED_CLAIM_BUDGET_MS` = 2× worst hold, CNTPCT) | WEDGE-10 `6773c326` | contended backends refuse rather than spin; the reaper treats `Busy` as transient and requeues; masked claimants spend at most `MASKED_CLAIM_BUDGET_MS` before surfacing `Busy` upward (row added at UNAFSTXN — WEDGE-10 shipped without one) |
 | `arch::aarch64::mailbox::MBOX_FREE` | claim/loan — `claim` / `MboxLoan::drop` | MBOX-1 `c227f420` | `get_clock_rate` alone retries (`claim_bounded`, unmasked, 600 ms) because its refusal makes EMMC2 *assume* a 100 MHz SD base clock and program a wrong divider; every other entry point fails loud with `:: MAILBOX: BUSY — {op} refused … ::` and returns its documented failure value |
 | `video::cursor::SPRITE` (F4) | claim/loan — `claim` / `SpriteLoan::drop`; WEDGE-7's idiom audited and refused | audit in WEDGE-2 `be4ea433` (`<D4>`, the F4 death token), landed WEDGE-9 `e860181a` | stated per entry point; the one rule none may break is losing a repaint silently, so every refusal arms `REPAINT_OWED` and a composite tail cashes it. `repaint` alone retries (`claim_bounded`, unmasked, 2 ms) |
-| `video::cursor::OVERLAY` (F5) | claim/loan — `overlay_claim` / `OverlayLoan::drop`; WEDGE-7's idiom enumerated and refused | WEDGE-11 (this arc) | every former `try_lock` site keeps the fallback it already had for a contended lock (decline the offer, leave the bits standing, `#[must_use]` `false`); `overlay_open` reads `Busy` as "another pass owns the overlay" and takes CURSOR-3's whole-sprite bracket; `adopt_overlay` — the session's ONLY closer — waits `2 × OVERLAY_WORST_HOLD_MS`, CNTPCT-bounded, **masked included**, then defers the close to the next `overlay_open` via `OVERLAY_CLOSE_OWED` |
+| `video::cursor::OVERLAY` (F5) | claim/loan — `overlay_claim` / `OverlayLoan::drop`; WEDGE-7's idiom enumerated and refused | WEDGE-11 `48332eb0` | every former `try_lock` site keeps the fallback it already had for a contended lock (decline the offer, leave the bits standing, `#[must_use]` `false`); `overlay_open` reads `Busy` as "another pass owns the overlay" and takes CURSOR-3's whole-sprite bracket; `adopt_overlay` — the session's ONLY closer — waits `2 × OVERLAY_WORST_HOLD_MS`, CNTPCT-bounded, **masked included**, then defers the close to the next `overlay_open` via `OVERLAY_CLOSE_OWED` |
+| `video::wm::DEFER` (F6) | masked micro-guard — one `DEFER.lock()`, in `fn defer_q()`; enumeration is two sections, both call-free | WEDGE-12 (this arc) | none, by construction, and for this lock that is the *reason* the idiom was chosen: `stage_fill` reaches `defer_erase` only because the staged path already declined, so a `Busy` would DROP the box — the P61 ghost, a dead window's last frame left on the panel for the boot. A waiter waits at most one 8-entry union scan |
+| `video::wm::STAGE` growth → `ALLOCATOR` (F6) | claim/loan's half-step — the growth leaves the masked path entirely (`wm::reserve_stage`, at panel init); the buffer is pre-sized to `min(MAX_STAGE_BYTES, pw*ph*bpp)` and the masked paths never allocate | WEDGE-12 (this arc) | a short buffer takes the `DECL_ALLOC` / `DEFER_ALLOC` declines `stage_window`/`stage_fill` already had — the window falls back to the direct path, the fill defers to the next drain. Unreachable on any boot that reserved; `[wedge12] short_win=/short_fill=` is where it would show |
 
 The F4 row is what makes the family a family rather than a coincidence of two arcs. WEDGE-2 added
 `<D4>` precisely because an F4 death on `SPRITE` was reaching the wire as F1's trace and being
@@ -224,3 +227,58 @@ so the enumeration has to be redone by the arc that acts on it. Second, **the qu
 moving pixel work inside a hold for reasons that had nothing to do with this family. A lock's idiom is
 a property of its current sections, so any arc that adds work under an existing hold owes this section
 a re-read.
+
+### F6 — the two remaining `SYS_WIN_PRESENT` locks, and a lock you cannot harden at all
+
+The sixth application takes the other two F-shapes the R24 span audit found inside
+`SYS_WIN_PRESENT`'s IRQ mask. They are in the same commit because they share a gate, and they are
+worth reading together because they land on **opposite** sides of the choice this section is about.
+
+**`wm::DEFER` takes the micro-guard**, and the enumeration is what says so rather than the hold
+length. It has exactly two acquisitions in the tree: `defer_erase` writes one of eight queue slots
+(or, on a full queue, runs an eight-entry least-added-area union scan and writes one), and
+`drain_deferred` takes a 264-byte `Copy` snapshot and clears the count. No print, no allocation, no
+I/O, no nested lock, in either — the `[wc-k]` deferral line is emitted *after* the block closes, and
+deliberately stays there. Worst-case added IRQ latency is one eight-entry scan, the same order as
+`TABLE`'s eight-row composite snapshot. What the enumeration had to displace was the block's own
+prior argument, that a bounded leaf "cannot deadlock": true about ABBA, silent about this family, and
+the exact conflation WEDGE-7 refuted — **boundedness is what makes the fix affordable, not what makes
+the bug absent**. Claim/loan was considered and refused on the `Busy` question: `stage_fill` reaches
+`defer_erase` only *because* the staged path already declined, so a refusal here has nowhere to fall
+back to and would drop the box outright — a dead window's last frame left on the panel for the rest
+of the boot. A lock whose contender cannot afford `Busy` is a lock that needs the idiom where nobody
+is refused.
+
+**`STAGE`'s growth into `ALLOCATOR` takes neither idiom, because neither is available.** The two
+staged-present paths grew their shared buffer with `Vec::try_reserve`, which acquires the global heap
+`Mutex` — the widest-shared lock in the kernel, held by any preemptible EL1 context that allocates —
+from inside the mask. You cannot micro-guard the global heap (its sections are the whole kernel's,
+and one unbounded section disqualifies the lock), and you cannot loan it out. So WEDGE-8's *principle*
+applies without WEDGE-8's mechanism: put the discipline on the lock by removing the reason to take it.
+`wm::reserve_stage` sizes the buffer once, unmasked, at panel-init time, to
+`min(MAX_STAGE_BYTES, pw*ph*bpp)` — a bound derived from the two askers (`stage_window`'s banding cap
+and its panel-clipped box; `stage_fill`'s single composed row), and one whose **both arms are
+attainable**, so pre-sizing to it drops no work and is not a cap in disguise. The masked paths keep
+their growth branch as a *decline*, routed into the `DECL_ALLOC` / `DEFER_ALLOC` exits they already
+had, so a short buffer costs a direct-path present or a deferred fill and never a heap acquisition.
+On the bench that is 4 MiB of a 48 MiB heap, and it is memory the buffer already reached in the WC-M
+banded steady state: the reservation moves *when* it is taken, not *how much*.
+
+The general rule the second half establishes: **when a masked span reaches a lock that can be neither
+guarded nor loaned, the remedy is to make the acquisition unnecessary, and the test of that remedy is
+whether the worst case you pre-size to is bounded by something the subsystem owns.** If it is not,
+the honest outcome is to report the number, not to ship a cap that silently drops work — which is
+what WEDGE-12 did with the *third* masked allocation the R24 audit had missed. `wm::verify_window`
+(`witness`-only, one-shot per window id) snapshots a window's source surface with
+`try_reserve_exact`, from inside the mask, and frees it there too. Its worst case is `rows * cols * 4`
+bytes off the *row's* extent: 64 KiB for an EL0 window (the mapped-slot cap) but 4 MB for the x86
+console window, which is kernel-created and sized to `MAX_STAGE_BYTES / 4` panel pixels — and nothing
+in `wm` bounds a future creator below that. Capping a static at 64 KiB would have turned that
+window's `[wc-d]` verdict into a `SKIP`: the instrument capped instead of the lock fixed. It is
+therefore enumerated in the source, left alone, and owed to the arc that hoists it out of the span.
+
+Census: `[wedge12] defer-guard+stage-presize scope=… holds=… reserved=… short_win=… short_fill=… ->
+QUIET`, behind `witness` (UNAOS_WITNESS), chained off `[wedge11]`'s rollup seam. `QUIET` at zero is
+the expected reading, and the line carries no `refused=` on purpose — the micro-guard refuses nobody
+by construction, so the column would be permanently zero and would read as a mechanism that never
+fired rather than one that cannot.

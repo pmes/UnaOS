@@ -86,30 +86,42 @@ pub mod wcx;
 // and a press that raises and un-hides the window it names. Peter's ruling, white board Q10
 // (2026-08-09): "mac has had the dock forever so we should have a doc and all macos like
 // experience". A window switcher, not an app launcher — there is no app grid here and no second
-// launch path. Same gate as `wcx` (x86 panel path, `UNAOS_WC=1`): aarch64 does not compile it and a
-// knob-off x86 build carries neither the module nor its two seams.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+// launch path.
+//
+// PI-DESK — the gate is no longer `wcx`'s alone. It is **the x86 panel path (`UNAOS_WC=1`) OR the Pi
+// panel path (`UNAOS_PIDESK=1`)**, and the two halves are independent: a knob-off aarch64 build
+// compiles nothing here and its `kernel8.img` stays BYTE-IDENTICAL, and x86 keeps exactly the `wc`
+// term it always had. Nothing in this module became arch-neutral by being compiled on a second arch
+// — it already was, bar one reach into `arch::x86_64::syscall` for focus, which is seamed at its own
+// call site the way `wm` seams `wcx`. The same gate is on `strip`, `menubar` and `crystal` below.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 pub mod dock;
 // STRIPFACTOR: the furniture-strip PRIMITIVE — edge-anchored geometry with floors, the staged
 // row-run painter, the vacated-pixel erase, the damage slot, the cost ledger, and the TENANT
 // REGISTRY `wm::erase_clip` walks for occlusion citizenship. Peter's direction 2026-08-11: UnaOS is
 // a spatial game-engine OS and the desktop is one shell on it — "we will not always have a menu
 // bar" — so the kernel's contribution is the mechanism, not any particular strip. `dock` is tenant
-// #1 and `menubar` is tenant #2. Same gate as `dock`/`wcx`.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+// #1 and `menubar` is tenant #2. Same gate as `dock` (PI-DESK: x86+`wc` OR aarch64+`pidesk`).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 pub mod strip;
 // MENUBAR: the top strip — tenant #2 of `strip`, and DEFAULT OFF. Inert chrome plus the focused
 // window's caption and a UTC clock; a press falls through, because opening menus belongs to the
 // renderer-agnostic menu PROTOCOL whose design ledger is at the foot of that file. Deleting it costs
-// one registry entry, one line of `strip::compose_all`, and this declaration.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+// one registry entry, one line of `strip::compose_all`, and this declaration. Same gate as `dock`
+// (PI-DESK: x86+`wc` OR aarch64+`pidesk`) — and DEFAULT OFF stays default off on the Pi too: Peter's
+// "we will not always have a menu bar" is a runtime statement, and compiling the tenant does not
+// enable it.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 pub mod menubar;
 // CRYSTAL: the SHARD menu — UnaOS's first LIVE menu, hung off the brand crystal in the menu bar. A
 // kernel-owned SYSTEM menu (About This Shard · Sleep · Restart · Shut Down), not the renderer-agnostic
 // app menu PROTOCOL (whose design ledger lives at the foot of `menubar.rs`). The dropdown is a
 // transient surface composited through `strip::paint` at the tail beside the dock and bar; the click
-// arm lives in `arch/x86_64/syscall.rs::wc_click_route_at`. Same gate as `dock`/`strip`/`menubar`.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+// arm lives in `arch/x86_64/syscall.rs::wc_click_route_at` — and, since PI-DESK, in
+// `arch/aarch64/syscall.rs::wc_click_route`, both through the ONE shared router
+// [`strip::press_route`] rather than two copies of the ordering rule. Same gate as
+// `dock`/`strip`/`menubar` (x86+`wc` OR aarch64+`pidesk`).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
 pub mod crystal;
 // CRISPY-PI theme const table — carried verbatim from hw-pi4 (single-author law: edits flow
 // through the pi4 seat from the taste-gate). Declared for INSTGUI's use; full chrome wiring
@@ -144,13 +156,91 @@ pub mod instgui;
 pub use framebuffer::FrameBuffer;
 pub use screen::Screen;
 
-use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use spin::Mutex;
 use unaos_boot_info::FrameBufferInfo;
 
 /// The primary display surface. The GUI renderer (`pal::TargetPal` → `console`) draws here.
 /// Initialised once in `kernel_main` from `BootInfo` (UEFI GOP, or the Pi mailbox framebuffer).
 pub static WRITER: Mutex<FrameBuffer> = Mutex::new(FrameBuffer::new());
+
+// ── LOCKFIX — the two ways to take [`WRITER`] without becoming the boot-8 wedge ─────────────────
+//
+// INWEDGE stated the rule and fixed one pair of call sites; this states it once, in the module that
+// owns the lock, and gives every path that must obey it a single implementation.
+//
+// THE RULE: **a raw panel lock may not be held across a dispatch, and may not be blocked on from a
+// context that cannot be preempted.** Two disjoint populations violate it, and they need different
+// answers:
+//
+//  1. **The input path** (`quarry::live::wheel_route`, `syscall::click_pointer_pos`, the router's
+//     `pal_*_hint` geometry reads). These run on the preemptible `usb-pump`/`input` band, on the one
+//     core that also carries the kernel's IRQ-context printer. A *blocking* acquire here can be
+//     preempted while holding, and the next masked acquirer on that core then spins forever — the
+//     boot-8 capture. [`panel_info_nonblocking`] is their only door: masked (so the hold cannot span
+//     a dispatch), non-blocking (so they can never be the spinner), and COUNTED, because a refusal
+//     is the wedge window entered and survived and is the `[inwedge]` witness's whole subject.
+//
+//  2. **The paint path** (`cursor`'s locked helpers). These legitimately want the panel and, when
+//     interrupts are ENABLED, may legitimately wait for it — a preemptible waiter costs nothing the
+//     holder cannot repay. What they may not do is wait while MASKED, which is exactly the policy
+//     `cursor::claim_bounded` already applies to the SPRITE lock. [`panel_snapshot`] extends that
+//     same intent to `WRITER`: block when unmasked, `try_lock` when masked, and let the caller take
+//     its documented `owe_repaint` degradation on a refusal.
+//
+// Neither helper is arch-gated: both populations exist on x86 too (the compositor's masked present
+// chains reach `cursor`'s locked helpers there), and the rule is not a property of the hardware.
+
+/// LOCKFIX/INWEDGE — panel reads the input path completed. The denominator, so a refusal rate is
+/// readable rather than an unanchored count.
+static PANEL_READ: AtomicU32 = AtomicU32::new(0);
+
+/// LOCKFIX/INWEDGE — panel reads the input path refused rather than block on. Nonzero means the
+/// window that killed boot 8 was entered on this boot; the machine kept running instead of wedging.
+static PANEL_REFUSED: AtomicU32 = AtomicU32::new(0);
+
+/// LOCKFIX/INWEDGE — `(read, refused)` for the input path's panel reads.
+pub fn panel_census() -> (u32, u32) {
+    (PANEL_READ.load(Ordering::Relaxed), PANEL_REFUSED.load(Ordering::Relaxed))
+}
+
+/// LOCKFIX/INWEDGE — the ONE panel acquisition the input path makes: masked, non-blocking, counted.
+///
+/// `None` when the lock is held elsewhere at that instant (or the framebuffer is unset). Every
+/// caller degrades rather than waits: the router's hints clamp to 0, `wheel_route` DECLINES the
+/// event (it does not consume what it could not place), `click_pointer_pos` takes the same clamp an
+/// unset framebuffer has always given it.
+pub fn panel_info_nonblocking() -> Option<FrameBufferInfo> {
+    crate::arch::without_interrupts(|| match WRITER.try_lock() {
+        Some(fb) => {
+            PANEL_READ.fetch_add(1, Ordering::Relaxed);
+            Some(fb.info())
+        }
+        None => {
+            PANEL_REFUSED.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    })
+}
+
+/// LOCKFIX — a copy of the panel handle for a painter, with the WEDGE-8 rule applied to `WRITER`.
+///
+/// Blocking when interrupts are enabled (the caller is preemptible, so the holder can run), a bare
+/// `try_lock` when they are MASKED — where a wait can neither be preempted nor take a timer tick,
+/// and is therefore the F4 death outright. `None` is only ever the masked-and-contended case; the
+/// `cursor` callers answer it with `owe_repaint`, which re-establishes the whole sprite from the
+/// finished front at the next composite tail.
+///
+/// Not counted in [`panel_census`]: that census measures the INPUT path's refusals, which is what
+/// the `[inwedge]` witness reports on. Paint-path refusals are already counted by `[wedge9]`
+/// (`owe_repaint` is their sink), and mixing the two would make both unreadable.
+pub(crate) fn panel_snapshot() -> Option<FrameBuffer> {
+    if crate::arch::irqs_masked() {
+        WRITER.try_lock().map(|fb| *fb)
+    } else {
+        Some(*WRITER.lock())
+    }
+}
 
 /// The panel background the GUI paints over — Can-Am dark grey, `#1E1E1E`.
 pub const PANEL_BG: u32 = 0x001E_1E1E;
@@ -174,6 +264,18 @@ pub fn init_panel(base: usize, len: usize, info: FrameBufferInfo) {
     surface.fill_screen(PANEL_BG);
 
     serial_println!(":: Framebuffer painted #1E1E1E ::");
+
+    // WEDGE-12 (F6) — size the compositor's staging buffer HERE, where the panel's geometry has just
+    // become known, IRQs are live and no composite pass exists yet. `wm`'s staged presents run inside
+    // `SYS_WIN_PRESENT`'s IRQ mask, so a buffer that grew on the pass would be a masked acquisition of
+    // the global heap `Mutex` — the F1-F5 family defect with the widest-shared lock in the kernel.
+    // Growing it once, from here, is what lets the masked paths be allocation-free. WEDGE-12 M2:
+    // this now sizes ONE ENTRY PER LIVE CORE, not just the BSP's — which is sound at this call
+    // site precisely because SMP bring-up has already published its core set several hundred lines
+    // above (see `wm::live_core_count` for the ordering argument and the count's source,
+    // `wm::stage_secondary_target` for the per-arch heap arithmetic, and `[wedge12]` for the
+    // per-entry census).
+    wm::reserve_stage(&info);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -299,4 +401,129 @@ pub fn init_edid(block: &[u8; 128], valid: bool, total_len: u16) {
         ext,
         total_len
     );
+}
+
+// ── CONSWIN-PI / MENUBAR-PI ─────────────────────────────────────────────────────────────────────
+// The Pi's DESKTOP-READY seam — the aarch64 counterpart of `wcx`'s activation, and the module that
+// finally claims `menubar`'s tenancy on this arch. Declared at the FILE TAIL, not beside its sibling
+// tenants above, for the reason this track has proved twice over: a `mod` line inserted higher up
+// renumbers every panic `Location` recorded below it in this file, and those records live in the
+// loadable image whose knob-off byte-identity is the Pi track's standing proof. Nothing is below
+// this, so nothing moves. `pidesk` off is a compile-time absence and the image never contains it.
+#[cfg(all(target_arch = "aarch64", feature = "pidesk"))]
+pub mod pidesk;
+
+// ── PULSEWIN ────────────────────────────────────────────────────────────────────────────────────
+// The core-load instrument in a compositor WINDOW, whose menu switches between the Pi's LED lamp
+// face and the x86 app's ten-segment face. Gated like the furniture family — `wc` on x86, `pidesk`
+// on the Pi — and deliberately NOT on an arch: it is experience-layer code with no hardware in it,
+// so it builds once and runs on every chip. Appended below `pidesk` for `pidesk`'s own reason, five
+// lines up: nothing is below this either, so nothing moves.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "pidesk")
+))]
+pub mod pulsewin;
+// ── QUARRY ──────────────────────────────────────────────────────────────────────────────────────
+// UnaOS's FILE MANAGER (Peter, 2026-08-17: "Tree on left and start with detailed list view on
+// right"). A kernel-owned compositor window over the VFS mount table — tree of the mounted volumes on
+// the left, name/size/modified list on the right, and the first scrolling anything in this tree has
+// had. Same gate as the furniture family above (x86 `wc` OR aarch64 `pidesk`) so BOTH arches
+// type-check it, with the implementation armed separately by `UNAOS_QUARRY=1`; see `quarry.rs` for
+// why the knob lives inside the module rather than on this line, and
+// `docs/dev/OS/05_USER_EXPERIENCE/quarry.md` for the design of record — including why it is a kernel
+// window today and exactly what the ring-3 port is waiting on.
+//
+// Declared BELOW `pidesk` for `pidesk`'s own reason, restated because it is the trap: a `mod` line
+// inserted higher up renumbers every panic `Location` recorded below it in this file. Nothing is
+// below this, so nothing moves, and a knob-off `kernel8.img` is byte-identical.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+pub mod quarry;
+
+// ── REALDESK — THE DESKTOP SCENE'S TENANCY OF THE BACKDROP ──────────────────────────────────────
+//
+// Peter, 2026-08-17: *"WHEN WILL THE REAL DESKTOP APPEAR?! SHELL IS STILL THERE. OLD EMBEDDED PULSE
+// AND INFO BAR"*. SHELLNOTDESK/SHELLWIN-PI took the live text shell off the Pi's glass and put it in
+// a window; what stayed behind were the two bands `ui_status` draws STRAIGHT INTO THE DESKTOP back
+// buffer — the per-core LED instrument (`draw_panel_at(pal, None)`) and the host/ip/UTC status line.
+// Neither exists on x86: `x86_render_service` calls `screen.paint_desktop_scene()` and never touches
+// `ui_status` at all. So they were an aarch64-ONLY desktop, which is exactly what the ONE OS law
+// ("arch gates in the experience layer are defects") forbids, and they are what Peter is looking at.
+//
+// This latch is the retirement, and it is a RUNTIME one for the reason `pidesk::armed` is: the
+// tenants may only leave when something else has taken the glass. It is armed by `main.rs`'s render
+// service in the SAME statement as the backdrop hand-off (`pal.clear_screen(DESKTOP_BG)`), i.e. only
+// on the pass where `open_shell_window` actually returned a window. On a panel where that decline
+// fires the shell legitimately still owns the backdrop, and a desktop with no scene on it must keep
+// its instrument — so the tenants stay, and the boot is byte-for-byte what it is today.
+//
+// It lives HERE, at the tail of this file, and not in `ui_status` — PARITY.md §5.3. `ui_status.rs`
+// is compiled into the knob-off `kernel8.img` whose byte-identity is this track's standing proof,
+// and panic `Location` records embed line numbers, so a static and three functions added there would
+// move the hash for a feature the image does not contain. Appended below `quarry` for `quarry`'s own
+// reason: nothing is below this, so no existing line in this file moves either. The static and all
+// three accessors carry the furniture gate, and `ui_status`'s three call sites carry it too, so a
+// knob-off build compiles NONE of this and that file's diff reduces to line-neutral comment text.
+// MEASURED rather than reasoned, as §5.3 requires: knob-off `kernel8.img` is
+// `2d9f9ab347106102ce2b4a26eca71c0e54970e875f5600de38b0e7264c81557d` with this arc applied and with
+// it reverted — same tree, same host, minutes apart, and stable across three consecutive rebuilds.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+static DESKTOP_SCENE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// REALDESK — **the desktop scene has taken the backdrop; the legacy chrome tenants retire.**
+///
+/// Called once, from the render service's backdrop hand-off. Idempotent (a second call stores the
+/// same value and says so with `was=true`), and one-way by construction: there is no un-retire,
+/// because there is no path back from a windowed shell to a shell that is the wallpaper.
+///
+/// The witness reports the reservation it just changed rather than asserting the retirement, so a
+/// capture can read the tiler's new bottom budget without inferring it — `bottom_reserved=104->64`
+/// on the 1920x1200 bench panel is the instrument band (92) plus the status line (12) giving way to
+/// the dock's own rows (`strip::PAD + dock::STRIP_H`), which is what still has to be kept clear.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+pub fn retire_desktop_chrome(pw: usize, ph: usize) {
+    let before = crate::ui_status::chrome_h(ph);
+    let was = DESKTOP_SCENE.swap(true, core::sync::atomic::Ordering::Release);
+    serial_println!(
+        "[realdesk] backdrop=desktop-scene retired=pulse-band,status-line bottom_reserved={}->{} panel={}x{} menubar={:?} dock_h={} was={} == witness ::",
+        before,
+        crate::ui_status::chrome_h(ph),
+        pw,
+        ph,
+        menubar::strip_rect(pw, ph),
+        dock_reserve_h(),
+        was
+    );
+}
+
+/// REALDESK — does the desktop SCENE own the backdrop on this boot, as of now?
+///
+/// `false` until [`retire_desktop_chrome`], and a compile-time `false` on any build without the
+/// furniture family (every knob-off Pi image, every x86 build without `wc`). Read by `ui_status` at
+/// its three seams: the two band painters and the tiler's bottom reservation.
+///
+/// `Acquire` pairs with the setter's `Release` so a reader that sees `true` also sees the
+/// whole-panel `DESKTOP_BG` fill the same statement published.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+pub fn desktop_scene_owns_backdrop() -> bool {
+    DESKTOP_SCENE.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// REALDESK — **the bottom rows a retired desktop still owes the DOCK**, and why the reservation does
+/// not simply go to zero.
+///
+/// `ui_status::chrome_h` reserved the last 104 rows of the bench panel from `wm::place` for the pulse
+/// instrument. Those rows also happen to contain the dock (`frame_centred(Edge::Bottom, …)` seats it
+/// at `ph - PAD - STRIP_H`), so the instrument's reservation has been doing the dock's protection for
+/// free. Returning `0` here would hand the dock's own rows to the tiler on the one arch where
+/// `wm::occ_clip` is structurally `OccClip::none` (PARITY §6.2) — a window blit would paint straight
+/// over the dock. So the reservation SHRINKS to what the dock actually occupies instead of vanishing:
+/// 40 rows of the bench panel come back to the work area, and the furniture keeps its floor.
+///
+/// Stated as the dock's own two constants rather than as a number, and height-only because
+/// `chrome_h` is: the dock is unconditionally PRESENT (it is the console's only way back), so there
+/// is no arm in which the panel has a desktop and no dock to keep clear.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+pub fn dock_reserve_h() -> usize {
+    strip::PAD + dock::STRIP_H
 }

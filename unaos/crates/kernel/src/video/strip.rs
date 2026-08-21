@@ -57,12 +57,24 @@
 //! added here without widening the clip fails the BUILD rather than dropping an occluder on a
 //! non-witness image — the exact silent hole the WCK4 review named.
 //!
-//! # x86 only, and gated
+//! # Two panels now, and gated on each
 //!
-//! `#[cfg(all(target_arch = "x86_64", feature = "wc"))]` at the `mod` declaration in [`super`], the
-//! same gate [`super::dock`] and [`super::wcx`] carry. aarch64 is byte-identical with this file
-//! present: it is not compiled there, `wm::erase_clip`'s furniture arm is gated with it, and the
-//! aarch64 erase path keeps the pixel-identity `pi4-regression.spec` pins on `[wc-k]`.
+//! `#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature =
+//! "pidesk")))]` at the `mod` declaration in [`super`] — the same gate [`super::dock`],
+//! [`super::menubar`] and [`super::crystal`] carry. It used to be the x86 term alone; PI-DESK added
+//! the second half, and the two are independent.
+//!
+//! **A knob-off aarch64 build is still BYTE-IDENTICAL with this file present** — measured against the
+//! pre-arc `kernel8.img` by sha256, not asserted — because it is not compiled there, `wm`'s compose
+//! seam and `erase_clip`'s furniture arm carry the same gate, and the aarch64 erase path keeps the
+//! pixel-identity `pi4-regression.spec` pins on `[wc-k]`. Knob ON, this module composes at the tail of
+//! `wm::composite_once` on the BCM2711 panel exactly as it does on the x86 one.
+//!
+//! Nothing here had to become arch-neutral to cross: the geometry, the row-run painter, the damage
+//! slot and the registry were always integer arithmetic over `wm` and the materials. The single
+//! exception is [`cycles_to_us`], whose input `arch::now_cycles()` is arch-neutral but whose RATE is
+//! not — see its own note for why the aarch64 arm reads CNTFRQ_EL0 instead of inheriting x86's
+//! uncalibrated-TSC guess.
 
 use super::{theme, wm};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -573,9 +585,20 @@ impl Ledger {
 /// rather than called, because `wcg` is `witness`-gated and this ledger deliberately is not (the
 /// metal image is built without `witness`). Two consumers of an unknown TSC rate in this kernel, one
 /// guess: 1.25 GHz, which is what `arch::HW_WAIT_BUDGET` already assumes.
+///
+/// PI-DESK — `now_cycles()` is arch-neutral but its RATE is not, and this is the one place in the
+/// family that has to know it. On x86 it is the calibrated TSC (`apic::tsc_hz`, `0` until
+/// `apic::calibrate` has run, hence the guess). On aarch64 `now_cycles()` is CNTVCT_EL0, whose rate
+/// is CNTFRQ_EL0 — 54 MHz on the BCM2711, ~62.5 MHz under QEMU — and it is EXACT and available from
+/// the first instruction, so the fallback arm is dead there rather than merely unlikely. Reading the
+/// register (via `timer::cntfrq`, the one accessor the arch already publishes) instead of assuming
+/// 1.25 GHz is the difference between a `[dock] paint=` in microseconds and one 23x too small.
 #[inline]
 pub fn cycles_to_us(dt: u64) -> u64 {
+    #[cfg(target_arch = "x86_64")]
     let hz = crate::arch::apic::tsc_hz();
+    #[cfg(target_arch = "aarch64")]
+    let hz = crate::arch::timer::cntfrq();
     let hz = if hz == 0 { 1_250_000_000 } else { hz };
     dt.saturating_mul(1_000_000) / hz
 }
@@ -670,6 +693,55 @@ pub fn compose_all() -> bool {
     // for the same reason — every furniture surface must get its damage test in every pass.
     let c = super::crystal::compose();
     a | b | c
+}
+
+/// **The press seam: every furniture surface's press arm, in COMPOSITE-INVERSE order.** The twin of
+/// [`compose_all`], and the one place the furniture layer's routing rule lives.
+///
+/// Returns `true` iff the press was CONSUMED by furniture, in which case the caller must drop the
+/// matching RELEASE (store its DROP sentinel) and return without consulting the window table. `false`
+/// means no furniture claimed the point and the window arms get their say.
+///
+/// # Why this function exists at all (PI-DESK, and the extraction it chose)
+///
+/// The Pi has a live mouse, so the aarch64 router owed the same two arms x86's
+/// `wc_click_route_at` already carried. Two options: copy the arms, or extract them. Copying would
+/// have put the ORDERING RULE — the whole content of this seam — in two files that are edited by two
+/// different lanes on two different schedules, free to drift, and drifting SILENTLY (the symptom of a
+/// stale order is a press landing on the wrong layer, which no gate asserts). So the core is
+/// extracted here, arch-neutral, beside `compose_all` — because the order below is not a routing
+/// preference, it is the INVERSE of the paint order that function fixes, and the two belong within
+/// one screen of each other or they will disagree.
+///
+/// Both arch routers now call this and neither owns a copy. What stays per-arch is exactly what is
+/// per-arch: the edge detection, the press-target latch, and the input rings.
+///
+/// # The order, and why neither arm can starve the other
+///
+///  1. **CRYSTAL first**, ahead of the dock and every window arm. An OPEN dropdown is a modal surface
+///     composited at the pass tail, on top of everything, so its press must be judged before any
+///     layer beneath it. CLOSED, the only point it claims is the crystal box in the menu bar — which
+///     the bar owns anyway — and it declines every other point, so nothing below it is starved.
+///  2. **DOCK second**, still ahead of every window arm, because the dock is composited on top of
+///     them: `wm::hit_test` knows nothing of the strip, so a window lying under the dock would
+///     otherwise take a press the operator can see landed on a tile. The dock declines every point
+///     outside its own strip (`Layout::contains`, the SAME accessor its painter draws from — corners
+///     included, which is why a corner hit-tests as desktop), and the strip is auto-sized to its tiles
+///     and drawn only when there is at least one, so a bare desktop has no dock to swallow anything.
+///
+/// There is no point at which two arms both answer "mine". That is a property of the accessors, not a
+/// tie-break policy: each arm asks the same rect its own painter drew.
+///
+/// # The click grammar is NOT relaxed here
+///
+/// A furniture press is an instruction to the WINDOW SYSTEM, never app input — the same law the close
+/// and chrome arms follow — so it is consumed and its release is dropped rather than delivered into
+/// whatever holds focus after the raise. A dock press SELECTS (raises, un-hides, hands over the
+/// keyboard) and acknowledges on the wire; it does not stop, start or kill anything. Nothing in this
+/// seam touches a running program's execution.
+#[inline]
+pub fn press_route(x: i32, y: i32) -> bool {
+    super::crystal::press_at(x, y) || super::dock::press_at(x, y)
 }
 
 // ---------------------------------------------------------------------------

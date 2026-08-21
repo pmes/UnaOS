@@ -311,6 +311,79 @@ fn rename_refusals_collision_loop_missing_noop() {
     assert_eq!(fs.resolve_path("/a/b").unwrap(), b_id);
 }
 
+/// A cross-directory rename rewrites TWO directories. Pre-K8 that was the
+/// "in neither directory" crash window; under the CoW core both rewrites are
+/// one transaction, so a power cut converges to the OLD name or the NEW name
+/// and never to a hybrid (both names, or neither).
+///
+/// Uses the crate's cut-mid-commit seam: `set_autocommit(false)` writes every
+/// fresh block but NEVER flips the root; dropping the instance and remounting
+/// from the raw bytes models the power cut exactly.
+#[test]
+fn rename_power_cut_converges_to_old_or_new_never_hybrid() {
+    let mut fs = fresh_fs(5000);
+    let root_id = fs.superblock.root_inode;
+    let inbox_id = fs.mkdir(root_id, "inbox".to_string()).unwrap();
+    let archive_id = fs.mkdir(root_id, "archive".to_string()).unwrap();
+
+    let file_id = fs.create_file(inbox_id, "memo.txt".to_string()).unwrap();
+    fs.write_data(file_id, 0, b"the committed bytes").unwrap();
+    let committed_gen = fs.root_generation();
+    let committed_free = fs.free_blocks();
+
+    // --- The cut: rename staged, root never flipped -------------------------
+    fs.set_autocommit(false);
+    fs.rename(inbox_id, "memo.txt", archive_id, "memo-2026.txt")
+        .expect("staged rename failed");
+    let device = fs.device.clone();
+    drop(fs);
+
+    let mut old = UnaFS::mount(device).expect("mount after simulated power cut");
+
+    // The OLD tree, whole: same generation, source name live, dest name absent.
+    assert_eq!(old.root_generation(), committed_gen);
+    assert_eq!(old.resolve_path("/inbox/memo.txt").unwrap(), file_id);
+    assert!(old.resolve_path("/archive/memo-2026.txt").is_err());
+
+    // NOT a hybrid: exactly one of the two names exists, on exactly one side.
+    assert_eq!(old.ls(inbox_id).unwrap().len(), 1);
+    assert!(old.ls(archive_id).unwrap().is_empty());
+
+    // The inode itself never moved — same id, same bytes.
+    let inode = old.read_inode(file_id).unwrap();
+    assert_eq!(
+        old.read_data(file_id, 0, inode.size).unwrap(),
+        b"the committed bytes"
+    );
+
+    // Nothing leaked: the aborted transaction's blocks were never committed.
+    assert_eq!(old.free_blocks(), committed_free);
+    let report = old.fsck(false).unwrap();
+    assert!(report.is_clean(), "old tree must be clean: {report:?}");
+
+    // --- The same rename, COMMITTED: the new tree wins, durably -------------
+    old.rename(inbox_id, "memo.txt", archive_id, "memo-2026.txt")
+        .expect("committed rename failed");
+    assert!(old.root_generation() > committed_gen);
+    let device = old.device.clone();
+    drop(old);
+
+    let mut new = UnaFS::mount(device).expect("remount after committed rename");
+    assert!(new.resolve_path("/inbox/memo.txt").is_err());
+    assert_eq!(new.resolve_path("/archive/memo-2026.txt").unwrap(), file_id);
+    assert!(new.ls(inbox_id).unwrap().is_empty());
+    assert_eq!(new.ls(archive_id).unwrap().len(), 1);
+
+    // No data copy: the rename moved a name, not bytes.
+    let inode = new.read_inode(file_id).unwrap();
+    assert_eq!(
+        new.read_data(file_id, 0, inode.size).unwrap(),
+        b"the committed bytes"
+    );
+    let report = new.fsck(false).unwrap();
+    assert!(report.is_clean(), "new tree must be clean: {report:?}");
+}
+
 // --- M3: remove_attribute ----------------------------------------------------
 
 #[test]

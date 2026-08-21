@@ -444,9 +444,64 @@ static H_STALL: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// the smallest observed stall and a factor of 8 above the honest spread. Integer, because the
 /// rates it multiplies are.
 const STALL_SPREAD: u64 = 8;
+/// WCHFIX — per-id: how many presents actually entered the rate census above. Published as the
+/// rollup's `presspop=`, immediately beside `presspread=`, because a ratio without its population
+/// is not a reading.
+///
+/// **The blind spot this closes.** `presspread` is `max/min` over this population. When the
+/// population is ONE, `max` and `min` are the same sample and the ratio is `1` BY CONSTRUCTION — not
+/// a measurement of evenness, but the arithmetic identity of a single point. A single-present window
+/// that also tore therefore printed the exact shape the pi4 spec's single-digit FORBID was written to
+/// convict (`presspread=1 -> AT-RISK`), while carrying no evidence whatsoever about which of the two
+/// causes produced the tear. The x86 seat measured that as roughly one false red in five runs of an
+/// otherwise green suite, concentrated on the shortest and most loaded boots — precisely the desched
+/// regime the discriminator exists to EXCUSE.
+///
+/// **Why a counter rather than a verdict change.** The alternative was to withhold `-> AT-RISK` until
+/// two presents exist. That would be a lie about the panel: the window DID tear, the tear counter DID
+/// see it, and a witness that reports `TEAR-FREE` over a measured tear is the failure mode WC-K was
+/// corrected for. The unmeasurable thing is not the tear, it is the SPREAD — so the population is
+/// published beside the spread and the consumer that reads the spread (the spec's FORBID) is the one
+/// that declines to convict. The verdict, its precedence and every existing count are untouched.
+///
+/// **Why not `whole=` or `banded=`.** Those count staged presents, including the zero-byte case the
+/// rate recorder skips; using them as the spread's population would assert a point that was never
+/// taken. This counts the samples the ratio was actually computed from, so `presspop >= 2` is exactly
+/// the condition under which `max` and `min` can be different measurements.
+static H_RATEN: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// Per-id: composites that did NOT reach the back layer and ran on the direct (pre-WC-H) path — the
 /// tearing regime. Excludes the deliberate fixture decline, which is counted separately.
 static H_DECLINE: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+/// WCHUN — per-id, per-reason: the same declines [`H_DECLINE`] totals, split by WHICH exit of
+/// [`stage_window`](super::wm) produced them. Indexed by the reason constant itself, so slot 0
+/// ([`KIND_STAGED`]) is permanently unused and no mapping table has to be kept in step.
+///
+/// **Why the lumped counter was not enough.** `declines=` is unbudgeted and survives the whole boot,
+/// but the only place a decline's REASON was ever written down is the per-sample
+/// `[wc-h] win=N staged=no reason=… -> DIRECT` line — and that line spends [`H_TAKEN`], the same
+/// four-sample budget the staged presents spend. The budget is therefore gone before the interesting
+/// declines arrive, for precisely the reason [`H_BTAKEN`] documents about banded presents: *an
+/// instrument whose budget is spent by the control can never see the treatment*. Window creation and
+/// first paint stage successfully, burn the budget, and every decline afterwards is counted and
+/// anonymous.
+///
+/// The `pi4-pi1-b1` capture is the case that named this. Its first boot window carries 663
+/// `-> UNSTAGED` rollups, all one window, `declines=` climbing 10 → 3281 against `whole=62388`
+/// presents — a real, sustained, ~5% fallback into the tearing path — and the boot prints not one
+/// `reason=` line for any of them, because that window's four samples went to the three
+/// `-> BUFFERED` composites of its first paint. The verdict was reachable and the diagnosis was not.
+///
+/// The four reasons are four different faults and want different answers: [`DECL_GEOM`] is a
+/// degenerate box, [`DECL_CAP`] a box no band can fit (unreachable at any panel this kernel
+/// addresses), [`DECL_LOCK`] a core re-entering its own stage entry, [`DECL_ALLOC`] a heap that will
+/// not grow. Lumping them makes a permanent cap fallback and a bursty reentrancy read identically.
+///
+/// Unbudgeted, like [`H_DECLINE`] and for the same reason: the count is what outlives the trace.
+static H_DECLBY: [[AtomicU32; DECL_KINDS]; IDS] =
+    [const { [const { AtomicU32::new(0) }; DECL_KINDS] }; IDS];
+/// One past the largest reason constant [`stage_decline`] can be handed, so [`H_DECLBY`] can be
+/// indexed by the constant directly.
+const DECL_KINDS: usize = DECL_ROUTE as usize + 1;
 /// Per-id: declines the KERNEL asked for, to keep the fallback path covered ([`DECL_FIXTURE`]).
 static H_FIXTURE: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// Per-id: a recorded-but-not-yet-printed sample. See [`stage_flush`] for why the print is deferred.
@@ -514,22 +569,29 @@ pub fn stage_decline(id: u32, reason: u32) {
         return;
     }
     mark_seen(i);
+    // The CENSUS is taken first and unconditionally — before the budget is even read — because it is
+    // the half that has to survive the budget. Both branches below used to carry their own copy of
+    // this pair; hoisting it above the gate is what makes "unbudgeted" a property of the code shape
+    // rather than of two call sites agreeing.
+    if reason == DECL_FIXTURE {
+        H_FIXTURE[i].fetch_add(1, Ordering::Relaxed);
+    } else {
+        H_DECLINE[i].fetch_add(1, Ordering::Relaxed);
+    }
+    // WCHUN — and the reason census beside it, on the same terms. Guarded rather than assumed: the
+    // reason arrives from another module, and an out-of-range one must lose its breakdown, not panic
+    // on the present path. `declines=` still counts it, so the total can never disagree with the
+    // verdict; only the split would be short, and `[wc-h]`'s own `?` name for an unknown reason has
+    // the same standing.
+    if (reason as usize) < DECL_KINDS {
+        H_DECLBY[i][reason as usize].fetch_add(1, Ordering::Relaxed);
+    }
     let n = H_TAKEN[i].fetch_add(1, Ordering::Relaxed) + 1;
     if n > SAMPLES {
         H_TAKEN[i].store(SAMPLES + 1, Ordering::Relaxed);
         // Past budget the LINE stops but the count must not: an unstaged composite is the thing the
         // verdict is about, and a boot that starts declining after sample 4 has to remain visible.
-        if reason == DECL_FIXTURE {
-            H_FIXTURE[i].fetch_add(1, Ordering::Relaxed);
-        } else {
-            H_DECLINE[i].fetch_add(1, Ordering::Relaxed);
-        }
         return;
-    }
-    if reason == DECL_FIXTURE {
-        H_FIXTURE[i].fetch_add(1, Ordering::Relaxed);
-    } else {
-        H_DECLINE[i].fetch_add(1, Ordering::Relaxed);
     }
     H_KIND[i].store(reason, Ordering::Relaxed);
     H_PEND[i].store(n, Ordering::Release);
@@ -783,6 +845,10 @@ pub fn stage_note(
         let rate_ns_4k = present_us.saturating_mul(4_096_000) / bytes as u64;
         H_MINRATE[i].fetch_min(rate_ns_4k, Ordering::Relaxed);
         H_MAXRATE[i].fetch_max(rate_ns_4k, Ordering::Relaxed);
+        // WCHFIX — the population the two extremes were drawn from, incremented in the SAME branch
+        // that feeds them so the count can never claim a sample the ratio did not see. One more
+        // `fetch_add` on an atomic already in this cache line's neighbourhood. See [`H_RATEN`].
+        H_RATEN[i].fetch_add(1, Ordering::Relaxed);
     }
     // Two budgets, one per class. See [`H_BTAKEN`] for why a shared one made the feature invisible.
     let n = if banded {
@@ -1076,7 +1142,7 @@ fn emit_sample(id: u32, i: usize) {
 /// | marker | covers | means |
 /// |--------|--------|-------|
 /// | `pop=budgeted` | `samples` `budget` | THIS SCOPE's budget only — at most [`SAMPLES`] events |
-/// | `pop=all-presents` | `torn` … `presspread` | every present/decline this WINDOW has had |
+/// | `pop=all-presents` | `torn` … `presspop` | every present/decline this WINDOW has had |
 /// | `pop=constant` | `frame_us` | a compile-time constant, not a measurement |
 ///
 /// `pop=` repeats rather than each field carrying its own suffix because the alternative was to
@@ -1107,9 +1173,11 @@ fn emit_sample(id: u32, i: usize) {
 /// - `-> AT-RISK` — `torn > 0`. Now countable past the budget and now printed after the console has
 ///   run, so a window that tears only under load says so. The pi4 spec FORBIDs it — but reads
 ///   `presspread=` alongside, because `-> AT-RISK` on its own cannot say WHY the present was slow.
-/// - `presspread=` near 1 beside `-> AT-RISK` — the presents are UNIFORMLY expensive, which is what a
-///   copy that genuinely cannot keep up with the beam looks like. This is the reading the tear FORBID
-///   was written for.
+/// - `presspread=` near 1 beside `-> AT-RISK` **and `presspop=` of 2 or more** — the presents are
+///   UNIFORMLY expensive, which is what a copy that genuinely cannot keep up with the beam looks like.
+///   This is the reading the tear FORBID was written for. `presspop=1` beside the same ratio is NOT
+///   that reading and never was: with one sample the max and the min are the same present and the
+///   ratio is 1 by construction. See [`H_RATEN`].
 /// - `presspread=` in the tens or hundreds beside `-> AT-RISK` — the window has both very fast and
 ///   very slow presents of the same bytes. A copy does not vary by that factor; a machine that stops
 ///   running underneath it does. On QEMU without `-icount` that is a host desched being charged to the
@@ -1159,7 +1227,16 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
     // recorder, so a window that reaches `-> AT-RISK` has recorded a present — the one residual is a
     // present of ZERO BYTES, which the rate recorder skips and which `stage_window`'s degenerate-
     // geometry decline is there to make unreachable. Should one ever arrive, `presspread=0` is in the
-    // single-digit class the pi4 spec's FORBID convicts, so the unmeasured case fails SAFE.
+    // single-digit class the pi4 spec's FORBID convicts, so the unmeasured case fails SAFE — and
+    // `presspop=0` now says so explicitly rather than leaving the reader to infer it from a zero ratio.
+    //
+    // WCHFIX — `presspop=` is the number of presents the two extremes were taken over, and it is what
+    // makes `presspread=` readable at all. At `presspop=1` the max and the min are the SAME sample, so
+    // the ratio is 1 by arithmetic and says nothing about evenness; the single-digit reading that the
+    // pi4 spec convicts is, on that line, an identity rather than a measurement. The spec keys its
+    // FORBID on `presspop` >= 2 for that reason. Nothing here changes the verdict: a window that tore
+    // still reads `-> AT-RISK` whatever its population, because the tear was measured and the spread
+    // was not.
     //
     // `lo.max(1)` rather than a branch: a present fast enough to round to a rate of zero is a present
     // faster than one nanosecond per 4 KiB, i.e. below the timer's resolution, and a window holding one
@@ -1170,18 +1247,32 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
     let lo = H_MINRATE[i].load(Ordering::Relaxed);
     let presspread =
         if lo == u64::MAX { 0 } else { H_MAXRATE[i].load(Ordering::Relaxed) / lo.max(1) };
+    // WCHUN — the decline census, split by reason. Printed unconditionally, including the all-zero
+    // case: a reader who has to tell "no declines" from "the field is missing on this build" cannot,
+    // and a boot whose `declines=` is 0 is exactly the boot whose breakdown proves the counter is
+    // wired. Four fixed keys rather than a variable list, for the same reason `minspan_bytes=` is
+    // always present beside `minspan=` — the line's shape must not depend on its values.
+    //
+    // `fixture` is deliberately NOT among them: it has carried its own top-level key since WC-H and
+    // is excluded from `declines=`, so repeating it here would file one count under two names.
+    // `route` is likewise absent — `stage_decline` cannot be handed it (only `erase_defer` carries
+    // `DECL_ROUTE`, and that reports through `[wc-k]`), so a key for it would be a permanent zero
+    // asserting nothing.
+    let declby = |r: u32| H_DECLBY[i][r as usize].load(Ordering::Relaxed);
     // KEY ORDER IS LOAD-BEARING ACROSS SEATS. `win=`, `scope=`, `declines=` and the terminal
     // `-> {verdict}` are matched in this order by the pi4 track's regression spec, which also relies
     // on `scope=window ` carrying a TRAILING SPACE so its pattern cannot match `scope=window-band`.
     // Everything WC-H2 added — `emit=`, `age_ms=`, the `pop=` markers, `budget=`, `lines=` — and
-    // everything WCH-SPREAD added — `minpresent_us=`, `presspread=` — is an INSERTION between existing
-    // keys. Nothing is renamed, nothing is reordered, and the terminal stays terminal. The two new
-    // keys go INSIDE the `pop=all-presents` run, beside `maxpresent_us=` whose population they share;
-    // putting them after `pop=constant` would have filed two measurements under the marker that means
-    // "compile-time constant". WCH-STALL's `stalls=` follows the same insertion rule, directly after
-    // `torn=` — the population it was diverted from.
+    // everything WCH-SPREAD added — `minpresent_us=`, `presspread=` — and WCHFIX's `presspop=` is an
+    // INSERTION between existing keys. Nothing is renamed, nothing is reordered, and the terminal stays
+    // terminal. The new keys go INSIDE the `pop=all-presents` run, beside `maxpresent_us=` whose
+    // population they share; putting them after `pop=constant` would have filed two measurements under
+    // the marker that means "compile-time constant". WCH-STALL's `stalls=` follows the same insertion
+    // rule, directly after `torn=` — the population it was diverted from — and WCHUN's
+    // `decl_geom=`/`decl_cap=`/`decl_lock=`/`decl_alloc=` go directly after the `declines=` total they
+    // decompose, inside `pop=all-presents` because they share that population exactly.
     serial_println!(
-        "[wc-h] rollup win={} scope={} emit={} age_ms={} pop=budgeted samples={} budget={} pop=all-presents torn={} stalls={} declines={} fixture={} whole={} banded={} lines={} minspan={} minspan_bytes={} maxpresent_us={} minpresent_us={} presspread={} pop=constant frame_us={} -> {}",
+        "[wc-h] rollup win={} scope={} emit={} age_ms={} pop=budgeted samples={} budget={} pop=all-presents torn={} stalls={} declines={} decl_geom={} decl_cap={} decl_lock={} decl_alloc={} fixture={} whole={} banded={} lines={} minspan={} minspan_bytes={} maxpresent_us={} minpresent_us={} presspread={} presspop={} pop=constant frame_us={} -> {}",
         id,
         scope,
         emit,
@@ -1191,6 +1282,10 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
         torn_n,
         H_STALL[i].load(Ordering::Relaxed),
         decl_n,
+        declby(DECL_GEOM),
+        declby(DECL_CAP),
+        declby(DECL_LOCK),
+        declby(DECL_ALLOC),
         H_FIXTURE[i].load(Ordering::Relaxed),
         H_WHOLE[i].load(Ordering::Relaxed),
         H_BANDED[i].load(Ordering::Relaxed),
@@ -1200,6 +1295,7 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
         H_MAXPRES[i].load(Ordering::Relaxed),
         minpresent,
         presspread,
+        H_RATEN[i].load(Ordering::Relaxed),
         FRAME_US,
         verdict
     );
@@ -1751,12 +1847,6 @@ pub struct Probe {
     /// reading there — see [`clean_invalidate_surface`].
     civac_us: u64,
     t0: u64,
-    /// GR21/WCD-OCC — the boxes of every window ABOVE this one as of the blit (`begin` time). Unioned
-    /// in [`end`] with a read-back-time snapshot, so a mismatching probe a higher window legitimately
-    /// owns is counted `occluded=`, not `fbbad`. x86 only — see [`super::wm::OccSnap`] for why the
-    /// field is off the aarch64 wire that `pi4-regression.spec` reads.
-    #[cfg(target_arch = "x86_64")]
-    occ_before: super::wm::OccSnap,
     /// WCG-CHUNK — this probe is one CHUNK of a full-coverage sample: the checksums walked
     /// `band_off..band_off + band_len` of the surface, the read-back resumes at the row that offset
     /// names, and [`end`] banks rather than prints unless the chunk closes the sample or convicts.
@@ -1810,20 +1900,17 @@ fn readback(
     row0: usize,
     row_cap: usize,
     bounded: bool,
-    #[cfg(target_arch = "x86_64")] occ_before: super::wm::OccSnap,
-    #[cfg(target_arch = "x86_64")] occ_after: super::wm::OccSnap,
+    occ_before: &super::wm::OccSnap,
+    occ_after: &super::wm::OccSnap,
 ) -> (usize, usize, usize, usize, usize, usize) {
     #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
     let _ = bounded;
     let mut checked = 0usize;
     let mut bad = 0usize;
     // GR21/WCD-OCC — probes that mismatch AND lie under a higher window. Charged to neither `bad`
-    // nor the verdict: a higher window legitimately owns the destination probe. Always 0 on aarch64
-    // (the return slot is fixed so the call site does not fork on arity); the field is off its wire.
-    #[cfg(target_arch = "x86_64")]
+    // nor the verdict: a higher window legitimately owns the destination probe. PARITY §6.2 — counted
+    // on both arches now that `wm::occ_clip` withholds those probes' pixels on both.
     let mut occluded = 0usize;
-    #[cfg(not(target_arch = "x86_64"))]
-    let occluded = 0usize;
     if x >= pw || y >= ph || scale == 0 || stride < 4 || step == 0 {
         return (bad, checked, step, occluded, row0, 0);
     }
@@ -2662,31 +2749,20 @@ fn coverage_note(_step: usize) -> &'static str {
 
 /// GR21/WCD-OCC — the `occluded=N occ=n0/n1` field, inserted between `coverage=` and `us=`. A Display
 /// shim rather than a `&str` because the values are dynamic, mirroring `wm::BandFmt`; a zero-cost
-/// verdict pays no allocation it could fail. On x86 it prints the probes a higher window owned and
-/// the two snapshot box-counts (pre-blit / read-back); on aarch64 it is a unit that writes NOTHING,
-/// which is what keeps the `[wc-g]` wire `pi4-regression.spec` reads byte-identical. See
-/// [`super::wm::OccSnap`] for why the arch gate is a wire boundary.
-#[cfg(target_arch = "x86_64")]
+/// verdict pays no allocation it could fail. It prints the probes a higher window owned and the two
+/// snapshot box-counts (pre-blit / read-back), on BOTH arches since PARITY §6.2: the aarch64 blit now
+/// withholds occluded pixels too, so a wire that stayed silent about the excuse would be a wire that
+/// hid why a probe was not charged. The insertion sits between `coverage=` and `us=`, inside the
+/// `.*` of `pi4-regression.spec`'s `[wc-g]` pattern. See [`super::wm::OccSnap`].
 struct OccNote {
     occluded: usize,
     n0: usize,
     n1: usize,
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-struct OccNote;
-
-#[cfg(target_arch = "x86_64")]
 impl core::fmt::Display for OccNote {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, " occluded={} occ={}/{}", self.occluded, self.n0, self.n1)
-    }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-impl core::fmt::Display for OccNote {
-    fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        Ok(())
     }
 }
 
@@ -2893,12 +2969,24 @@ fn paygo_complete(_id: u32, _i: usize) {}
 /// immediately after `draw_window` returns, and with nothing in between: the `after` checksum's
 /// meaning is "the surface as it stood when the copy finished", and any work inserted between the
 /// two widens the window it measures.
+///
+/// ### OCC62 M1 — the pre-blit excuse is NOT carried in the [`Probe`], and that is a stack budget
+///
+/// It used to be: `begin` took an [`super::wm::OccSnap`] BY VALUE and stored it, so every probe
+/// alive across `draw_window` pinned 392 bytes (`MAX_WINDOWS * 32 + 8`) of the compositor's frame.
+/// Ported to aarch64 unchanged, that copy — beside the one in `wm::VerifyRef`, the two argument
+/// temporaries, and `verify_window`'s own — exhausted the kernel task stack and faulted the armed
+/// bench-geometry boot at the shell-window create (`=== AARCH64 EXCEPTION` after
+/// `[wc-a] create win=3 … 960x583`, A/B'd against the same event on the base sha, which survives it).
+///
+/// So the snapshot stays OWNED by the caller's per-window frame — ONE instance, shared by this
+/// bracket and by WC-D's reference — and [`end`] borrows it. Nothing about the excuse's MEANING
+/// moved: it is still the set as of the blit, taken once, and `occ=n0/` still prints its count.
 pub fn begin(
     id: u32,
     surf: usize,
     surf_len: usize,
     compat: bool,
-    #[cfg(target_arch = "x86_64")] occ_before: super::wm::OccSnap,
 ) -> Option<Probe> {
     let i = id as usize;
     if compat || surf == 0 || surf_len == 0 || i >= IDS {
@@ -3002,11 +3090,7 @@ pub fn begin(
         cks_civac,
         cks_blit_us,
         civac_us,
-        // GR21/WCD-OCC — a plain move of a `Copy` value the caller already computed; no clock-relevant
-        // work, and above the `t0` assignment so the ordering law below is untouched.
-        #[cfg(target_arch = "x86_64")]
-        occ_before,
-        // WCG-CHUNK — three more plain moves, above `t0` for the same reason.
+        // WCG-CHUNK — three plain moves, above `t0` for the same reason.
         #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
         chunk,
         #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
@@ -3046,7 +3130,8 @@ pub fn end(
     h: usize,
     stride: usize,
     scale: usize,
-    #[cfg(target_arch = "x86_64")] occ_after: super::wm::OccSnap,
+    occ_before: &super::wm::OccSnap,
+    occ_after: &super::wm::OccSnap,
 ) {
     let us = cycles_to_us(now_cycles().saturating_sub(p.t0));
     // WCG-CHUNK — the `after` leg walks the SAME bytes the `blit`/`civac` legs walked in [`begin`]:
@@ -3106,17 +3191,11 @@ pub fn end(
     // `step_eff` is what the walk ACTUALLY used — `readback` collapses the lattice on a rect narrower
     // than its own step — and it is what the `coverage=` marker below is derived from, so the wire
     // reports the pass that ran rather than the pass that was requested.
-    // GR21/WCD-OCC — on x86 the read-back excuses probes a higher window owns and returns their
-    // count as a fourth element; aarch64 keeps the three-element return and its byte-identical wire.
-    #[cfg(target_arch = "x86_64")]
+    // GR21/WCD-OCC — the read-back excuses probes a higher window owns and returns their count as a
+    // fourth element. PARITY §6.2: one call, both arches.
     let (bad, checked, step_eff, occluded, rows_done, rows_total) = readback(
         fb, p.surf, p.surf_len, pw, ph, x, y, w, h, stride, scale, step, rb_row0, rb_cap,
-        rb_bounded, p.occ_before, occ_after,
-    );
-    #[cfg(not(target_arch = "x86_64"))]
-    let (bad, checked, step_eff, _, rows_done, rows_total) = readback(
-        fb, p.surf, p.surf_len, pw, ph, x, y, w, h, stride, scale, step, rb_row0, rb_cap,
-        rb_bounded,
+        rb_bounded, occ_before, occ_after,
     );
     let readback_us = cycles_to_us(now_cycles().saturating_sub(tp2));
     #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
@@ -3272,12 +3351,9 @@ pub fn end(
     W_MAXUS[w].fetch_max(us, Ordering::Relaxed);
 
     // GR21/WCD-OCC — the `occluded=`/`occ=` field, built here so the serial_println below stays a
-    // single shared call across arches. `OccNote` writes nothing on aarch64, so that wire is
-    // byte-identical; x86 carries the excused-probe count and the two snapshot box-counts.
-    #[cfg(target_arch = "x86_64")]
-    let occ_note = OccNote { occluded, n0: p.occ_before.count(), n1: occ_after.count() };
-    #[cfg(not(target_arch = "x86_64"))]
-    let occ_note = OccNote;
+    // single shared call across arches. PARITY §6.2: both arches carry the excused-probe count and the
+    // two snapshot box-counts, because both arches now withhold the pixels behind them.
+    let occ_note = OccNote { occluded, n0: occ_before.count(), n1: occ_after.count() };
 
     serial_println!(
         // WC-G/M3 — `coverage=` is an INSERTION between `fbbad=` and `us=`, which is what the pi4

@@ -3865,6 +3865,17 @@ fn present_backpressure(slot: usize, outcome: crate::video::wm::Presented) -> i6
             // input→glass tail by up to a frame plus a service tick. Everything else is
             // `Composited`'s: same return, same hidden-counter reset — the window is visible and
             // presenting.
+            //
+            // CRYSTAL-HD, on the return that STAYS 0. The held CRYSTAL-PACE half answered a third
+            // status here (`WIN_PRESENT_COALESCED` = 2) so `user-vug` could park until the frame
+            // edge admitted a present. Dropped on landing, for two independent reasons: it is a
+            // pacer on the render path, which Peter ruled out on 2026-08-13 (`9d12e7e0`, PARITY.md
+            // §5.1 — a vug renders unpaced on every chip); and it is the one arm that could make
+            // `SYS_WIN_PRESENT`'s SUCCESS contract differ between x86 and aarch64, which the Pi's
+            // present-rows port depends on staying identical. Coalescing remains a COMPOSITOR-side
+            // decision, invisible to ring 3 by design: the damage is committed and a pass inside
+            // this frame is guaranteed, so from the caller's side the present succeeded exactly as
+            // `Composited` did.
             SLOT_HIDDEN_PRESENTS[slot].store(0, Ordering::Relaxed);
             0
         }
@@ -4821,6 +4832,7 @@ use una_abi::INPUT_EV_KEY_UP; // a key RELEASE (payload[7:0] = same)
 use una_abi::INPUT_EV_MOUSE_REL; // relative pointer motion  (payload[31:16] = dx, [15:0] = dy, i16)
 use una_abi::INPUT_EV_MOUSE_ABS; // absolute pointer position(payload[31:16] = x,  [15:0] = y,  i16)
 use una_abi::INPUT_EV_BUTTON; // a pointer button state    (payload[7:0] = button bitmask)
+use una_abi::INPUT_EV_WHEEL; // one scroll-wheel detent   (payload[7:0] = signed i8 delta, + = up)
 
 /// Per-process input ring capacity. A power of two, because occupancy is `tail.wrapping_sub(head)`
 /// and the slot index is `& (CAP - 1)`.
@@ -5018,6 +5030,10 @@ fn pack_input(ev: crate::pal::Event) -> Option<u64> {
         Event::Mouse { x, y } => (INPUT_EV_MOUSE_REL, pack_xy(x, y)),
         Event::MouseAbsolute { x, y } => (INPUT_EV_MOUSE_ABS, pack_xy(x, y)),
         Event::Button(mask) => (INPUT_EV_BUTTON, mask as u64),
+        // WHEEL: the delta rides the low byte as a raw two's-complement i8 — ring 3 sign-extends
+        // (`payload as u8 as i8`). Cast through `u8` first: `i8 as u64` would sign-extend to
+        // 0xFFFF_FFFF_FFFF_FFxx and smear a negative detent across the type field.
+        Event::Wheel(d) => (INPUT_EV_WHEEL, d as u8 as u64),
         Event::Timer | Event::None | Event::Unknown => return None,
     };
     Some(una_abi::input_ev_pack(ty, payload))
@@ -6557,18 +6573,28 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
         }
         // DOCK — **judged before EVERY window arm, because the dock is composited on top of them.**
         //
-        // `wm::hit_test` knows nothing of the strip: it answers from the window table, and a window
-        // lying under the dock would take a press the operator can see landed on a dock tile. Asking
-        // the dock first is the same ordering rule the chrome arm below states for chrome — the
-        // painter that owns the pixel owns the press — applied to the layer above the window layer.
+        // Neither side can be starved. The crystal declines every point but the open dropdown and the
+        // crystal box in the bar (which the bar owns anyway); the dock declines every point outside
+        // its own strip (`Layout::contains`, the same accessor its painter draws from, corners
+        // included). So there is no point at which both this arm and a window arm answer "mine"; and
+        // the strip is auto-sized to its tiles and drawn only when there is at least one, so a bare
+        // desktop has no dock to swallow anything.
         //
-        // Neither side can be starved. The dock declines every point outside its own strip
-        // (`Layout::contains`, the same accessor its painter draws from, corners included), so there
-        // is no point at which both this arm and a window arm answer "mine"; and the strip is
-        // auto-sized to its tiles and drawn only when there is at least one, so a bare desktop has no
-        // dock to swallow anything.
+        // PI-DESK — this was TWO inline arms, one per surface, with that ordering rule and its
+        // no-starvation argument written out at length right here. Both moved WHOLE into
+        // [`crate::video::strip::press_route`] when the Pi's router came to need the identical seam,
+        // and the choice is stated rather than implied: the order is the INVERSE of
+        // `strip::compose_all`'s paint order, so it belongs beside that function — not duplicated
+        // across two arch files, edited by two lanes on two schedules, free to drift apart with no
+        // gate able to see it (the symptom of a stale order is a press landing on the wrong layer).
         //
-        // Consumed, with the target set to DROP so the matching RELEASE is dropped rather than
+        // **Nothing about this arch's behaviour changed**: same two surfaces, same order, same
+        // consume-and-drop. (GR27's CLICK-BAND witness re-split the two arms ON THIS ARCH so each
+        // consumed press names its band on the wire; the shared ordering law itself lives on in
+        // strip::press_route, which the aarch64 router calls.) What stays here is genuinely per-arch — the edge
+        // detection above, the press-target latch, and this file's input rings. (Line-NEUTRAL by
+        // construction; see the aarch64 twin for why that matters to the Pi's identity proof.)
+        // Consumed with the target set to DROP so the matching RELEASE is dropped rather than
         // delivered into whatever holds focus after the raise — the rule the close and chrome arms
         // below already follow for the same reason.
         #[cfg(feature = "wc")]

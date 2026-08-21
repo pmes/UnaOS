@@ -50,13 +50,22 @@
 //! | clock, right | [`crate::clock::try_unix_now`], UTC `HH:MM` | [`theme::TITLE_TEXT_INACTIVE`] |
 //!
 //! **The bar's one press target is the CRYSTAL.** This module still registers nothing with the click
-//! router itself; the SHARD menu ([`super::crystal`]) claims the crystal box through the router's
-//! menu-band arm, and every other point on the bar falls through to whatever is behind it. The
-//! witness line says so (`press=crystal`) — it read `press=inert` from the arc when the bar had no
-//! press seam at all, and that stale word survived into GR27, where it was read as "press routing
-//! latched off" during an investigation whose real defect was elsewhere. A witness term must track
-//! the code it describes. Opening APP menus is still the protocol arc's job; the design ledger at
-//! the foot of this file is what it will be built from.
+//! router itself; the SHARD menu ([`super::crystal`]) claims the crystal box through the ONE shared
+//! furniture router [`strip::press_route`], which both arch routers call ahead of every window arm.
+//! Every other point on the bar falls through to whatever is behind it. The witness line says so
+//! (`press=crystal`). It read `press=inert` from the arc when the bar had no press seam at all, and
+//! that stale word survived onto the Pi, where PA41's operator read it off a metal capture as "press
+//! routing latched off" — during an investigation whose real defect was that nothing COMPOSITED the
+//! menu the press had already opened. A witness term must track the code it describes. Opening APP
+//! menus is still the protocol arc's job; the design ledger at the foot of this file is what it will
+//! be built from.
+//!
+//! **CLOBBER-REPAIR (PA41).** The bar asks [`wm::dock_scan`] a second question beside the model — *did
+//! a window the compositor just painted intersect the rows I last painted?* — and repaints when the
+//! answer is yes even though its signature is unchanged. That is [`super::dock`]'s WCK5 condition,
+//! generalised to tenant #2, and on aarch64 it is not a belt: `wm::occ_clip` is `x86_64`-only, so a
+//! window blit crossing the top strip is NOT withheld there and the bar's pixels are destroyed with
+//! nothing in its own damage test able to notice. `clob=` on the ledger line is the falsifier.
 //!
 //! # The crystal — UnaOS's mark, where macOS puts its apple
 //!
@@ -84,6 +93,15 @@
 //! asserting a fact it does not have. So the clock is simply **not drawn** while unsynced, the title
 //! keeps the width, and the witness says `clock=unsynced`. It is **UTC**: the kernel carries no
 //! timezone, and rendering local time would require inventing one.
+//!
+//! # PI-DESK — compiled on the Pi, and STILL DEFAULT OFF there
+//!
+//! The `mod` gate is now `any(all(x86_64, wc), all(aarch64, pidesk))`, so this tenant exists on the
+//! BCM2711 panel too. Nothing about its POLICY moved with it. Peter's direction — *"we will not
+//! always have a menu bar"* — is a runtime statement, and `ENABLED` still starts `false` on both
+//! arches: a Pi boot with `UNAOS_PIDESK=1` gets the dock strip and the SHARD menu machinery and NO
+//! top strip until something asks for one. Compiling a tenant is not enabling it, and this is the
+//! tenant that exists to keep that distinction visible.
 
 use super::{ceramic, strip, theme, wm};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -101,6 +119,10 @@ const BAR_H: usize = theme::TITLE_HEIGHT;
 /// 1-bit bitmap gave way to the shared anti-aliased face, so the two axes are named separately.
 const CELL_W: usize = wm::TITLE_CELL_W;
 const CELL_H: usize = wm::TITLE_CELL_H;
+
+/// FONT-METRIC — the atlas those metrics come from. Named once so the cell constants above and the
+/// glyph calls below can never disagree about which face the bar is drawing.
+const FACE: super::font::Face = super::font::Face::Chrome;
 
 /// The clock's rendered width in glyphs: `HH:MM`.
 const CLOCK_GLYPHS: usize = 5;
@@ -214,6 +236,17 @@ static LEDGER: strip::Ledger = strip::Ledger::new();
 static TOGGLES: AtomicU64 = AtomicU64::new(0);
 static OFF_PASSES: AtomicU64 = AtomicU64::new(0);
 
+/// CLOBBER-REPAIR (PA41) — **passes in which a window the compositor painted had intersected the rows
+/// the bar last painted.** [`super::dock`]'s WCK5 counter, generalised to tenant #2.
+///
+/// It is a SEPARATE reading from `paints`, which conflates the two damage conditions: a MODEL change
+/// (the focused window's caption or the clock changed — a repaint the bar owes and always will) and a
+/// CLOBBER (a window blit published over the strip and destroyed it). A boot with `clob=0` never met
+/// the condition; a boot with `clob>0` is one where, before this arc, the bar was left standing with
+/// a window's pixels in it and NOTHING in its own damage test able to see them — the bar's signature
+/// is a function of the model and the rect, and a clobber changes neither.
+static CLOBBERS: AtomicU64 = AtomicU64::new(0);
+
 /// SHELLDESK — **the COMPILED default, latched at the first mutation.**
 ///
 /// [`selftest`]'s leg 1 ("absent by default") read [`ENABLED`] live, and its own comment named the
@@ -278,6 +311,21 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+/// BRINGUP-PAINT (PA41) — **has the bar actually PUT PIXELS on the panel?** One relaxed packed load.
+///
+/// [`enabled`] is a statement of intent and [`strip_rect`] a statement of geometry; neither says a
+/// composite ever ran, and the difference is the whole of the bring-up defect. From the instant the
+/// bar is enabled `screen::present_background` subtracts its rect, so those rows stop being desktop
+/// pixels and only a composite can fill them — and a composite whose [`strip::paint`] declined
+/// (contended scratch, a surface not yet `word4`) leaves the bar enabled, its rows withheld, and
+/// nothing on the glass. `super::pidesk::activate` reads this back after its enable-seam composite
+/// instead of assuming the composite painted, on the same "read the fact, do not infer it from your
+/// own control flow" rule that seam already applies to `fbcon::console_is_routed`.
+#[inline]
+pub fn owns_pixels() -> bool {
+    SLOT.packed() != 0
+}
+
 // ---------------------------------------------------------------------------
 // Geometry — THE ONE accessor, shared by the painter, the registry and `wm`
 // ---------------------------------------------------------------------------
@@ -331,10 +379,16 @@ impl Model {
     /// `focused`. The bar wants the TOPMOST of them, which is why the scan is reduced by `z` through
     /// `wm::info` rather than by taking the first hit: taking the first would name whichever row has
     /// the lowest window id, which is not the window the operator is looking at.
-    fn read() -> Model {
+    /// CLOBBER-REPAIR (PA41) — `painted` is the rect the bar last put on the panel ([`SLOT`]`.rect()`),
+    /// and the second half of the returned pair answers [`wm::dock_scan`]'s damage question about it:
+    /// *did any row the compositor is painting this pass intersect those pixels?* A zero-extent rect
+    /// asks nothing and always answers `false`, which is what the bar passed before this arc — the
+    /// model was taken and the damage answer thrown away, so the one writer that could destroy the bar
+    /// without changing its signature was the one thing the bar never looked at.
+    fn read(painted: (usize, usize, usize, usize)) -> (Model, bool) {
         let mut m = Model::empty();
         let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
-        let (n, _) = wm::dock_scan(&mut rows, (0, 0, 0, 0));
+        let (n, clobbered) = wm::dock_scan(&mut rows, painted);
         let mut best_z = 0u32;
         for r in rows[..n].iter() {
             if !r.focused || !r.visible {
@@ -348,7 +402,7 @@ impl Model {
             }
         }
         m.clock = clock_hhmm();
-        m
+        (m, clobbered)
     }
 
     /// The model reduced to one integer — the whole "has anything changed?" test.
@@ -435,16 +489,29 @@ pub fn compose() -> bool {
         (fb.width(), fb.height())
     };
     let rect = geometry(pw, ph);
-    let model = if rect.is_some() { Model::read() } else { Model::empty() };
+    // CLOBBER-REPAIR (PA41) — the model AND the damage question, from the ONE table scan `dock_scan`
+    // already ran for the caption. The rect asked about is what the bar last PAINTED, never what it is
+    // about to paint: the question is whether those pixels survived.
+    let (model, clobbered) = if rect.is_some() {
+        Model::read(SLOT.rect())
+    } else {
+        (Model::empty(), false)
+    };
+    if clobbered {
+        CLOBBERS.fetch_add(1, Ordering::Relaxed);
+    }
     let sig = match rect {
         Some(r) => model.signature(r),
         None => 0,
     };
     LEDGER.pass(crate::arch::now_cycles().saturating_sub(t0));
-    LEDGER.tick("menubar", format_args!("press=crystal crystal={}x{} toggles={} off_passes={}",
-        CRYSTAL_W, CRYSTAL_H, TOGGLES.load(Ordering::Relaxed), OFF_PASSES.load(Ordering::Relaxed)));
+    LEDGER.tick("menubar", format_args!("press=crystal crystal={}x{} clob={} toggles={} off_passes={}",
+        CRYSTAL_W, CRYSTAL_H, CLOBBERS.load(Ordering::Relaxed),
+        TOGGLES.load(Ordering::Relaxed), OFF_PASSES.load(Ordering::Relaxed)));
 
-    if sig == SLOT.sig() && SLOT.packed() == strip::pack_rect(rect) {
+    // The damage conditions, in the order the dock states them: a signature that MATCHES and a pass
+    // that did not touch the strip is the common case and returns here having read no pixel.
+    if sig == SLOT.sig() && SLOT.packed() == strip::pack_rect(rect) && !clobbered {
         return false;
     }
 
@@ -598,14 +665,14 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     // BOLD, the weight macOS gives the menu bar's app name; the clock stays regular, the same
     // primary/secondary split the two inks already draw.
     let cols = m.title_len.min(TITLE_GLYPHS);
-    super::font::draw_row(out, w, &m.title[..cols], TITLE_X0, sy, theme::TITLE_TEXT_ACTIVE, true);
+    super::font::draw_row(out, w, &m.title[..cols], TITLE_X0, sy, theme::TITLE_TEXT_ACTIVE, true, FACE);
 
     // Clock, right, at one PAD from the far edge. Secondary ink: the title is what the operator is
     // reading, the clock is what they glance at.
     if let Some(c) = m.clock {
         let cw = CLOCK_GLYPHS * CELL_W;
         if w > cw + strip::PAD {
-            super::font::draw_row(out, w, &c, w - strip::PAD - cw, sy, theme::TITLE_TEXT_INACTIVE, false);
+            super::font::draw_row(out, w, &c, w - strip::PAD - cw, sy, theme::TITLE_TEXT_INACTIVE, false, FACE);
         }
     }
 }
@@ -618,9 +685,10 @@ pub fn rollup(scope: &str) {
         "menubar",
         scope,
         format_args!(
-            "press=crystal crystal={}x{} toggles={} off_passes={}",
+            "press=crystal crystal={}x{} clob={} toggles={} off_passes={}",
             CRYSTAL_W,
             CRYSTAL_H,
+            CLOBBERS.load(Ordering::Relaxed),
             TOGGLES.load(Ordering::Relaxed),
             OFF_PASSES.load(Ordering::Relaxed)
         ),

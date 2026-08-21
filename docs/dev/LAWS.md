@@ -60,6 +60,20 @@ laws minted at the bench and at the seat. Each entry names its origin date.
   without re-asking. Destructive-media boots and genuinely new lanes still
   need a fresh explicit go.
 
+## Throughput
+
+- **Work the jobs — idleness is the failure state** (2026-08-19, Peter,
+  recurring). A baton's named arcs spawn in the seat's first turn; the
+  baton's assignment is the go. At every turn end, if running executors are
+  below the floor (3, up to 6 for Pi/Orin benches) while undone work exists
+  anywhere (baton-named arcs → verdicts to fold → lens follow-ups → owed
+  list → `wip/` → queue), the seat spawns to the floor before replying.
+  A question pending with the operator blocks only its dependent work,
+  never the rest of the floor. "Standing by", "awaiting your go", and
+  equivalents are banned phrases — each is itself the violation. An empty
+  floor is legitimate only when proven that turn (quote the exhausted
+  queue/owed list) or under the operator's explicit hold.
+
 ## Code and history
 
 - **Never trash code** (2026-07-16). Code is judged on its merits — wrong,

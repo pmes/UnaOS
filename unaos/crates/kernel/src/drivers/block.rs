@@ -691,6 +691,7 @@ pub fn publish_usb_geometry(dev: BlockDeviceInfo) {
     if BACKEND.load(Ordering::Acquire) != BACKEND_SD {
         *BLOCK_DEVICE.lock() = Some(dev);
     }
+    USB_PUBLISH_GEN.fetch_add(1, core::sync::atomic::Ordering::AcqRel); // PA35 race: every publish is a new generation
     set_usb_ready();
 }
 
@@ -706,6 +707,7 @@ pub fn publish_usb_geometry(dev: BlockDeviceInfo) {
     BOOT_MEDIUM_VERDICT.store(BM_UNKNOWN, core::sync::atomic::Ordering::Release);
     *BLOCK_DEVICE.lock() = Some(dev);
     *USB_BLOCK_DEVICE.lock() = Some(dev);
+    USB_PUBLISH_GEN.fetch_add(1, core::sync::atomic::Ordering::AcqRel); // PA35 race: every publish is a new generation
     set_usb_ready();
 }
 
@@ -745,8 +747,33 @@ pub fn publish_usb_geometry(dev: BlockDeviceInfo) {
 /// but not yet consumed by the main loop would otherwise drive a FAT mount against a disk that is no
 /// longer there. A replug re-raises it from `publish_usb_geometry` in the normal way.
 ///
+/// PA35's storage race, witnessed live: a rescue ladder that began before a replug ran its own
+/// port-cycle, the re-enumeration it caused PUBLISHED a fresh healthy disk mid-ladder, and the
+/// ladder's final surrender then RETRACTED that fresh publish — same slot id, nothing to tell the
+/// generations apart (`Disk …` then `:: BLK: removed …` one line later on the wire). Every publish
+/// now advances this generation; a retractor captures the generation it is working against and
+/// [`unpublish_usb_geometry`] refuses to remove a NEWER publish than the one the retraction was
+/// queued/earned against.
+pub static USB_PUBLISH_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The current publish generation — retractors capture this at the moment their teardown/ladder
+/// BEGINS, and pass it to [`unpublish_usb_geometry`] so a publish that lands in between survives.
+pub fn usb_publish_gen() -> u64 {
+    USB_PUBLISH_GEN.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// Returns true if a registry entry was actually retracted (i.e. this slot WAS the storage device).
-pub fn unpublish_usb_geometry(slot_id: u8) -> bool {
+/// `captured_gen` is the publish generation the caller captured when its retraction became owed
+/// (ladder start / disconnect detection); a registry holding a newer generation is a DIFFERENT
+/// device on a recycled slot number and must survive.
+pub fn unpublish_usb_geometry(slot_id: u8, captured_gen: u64) -> bool {
+    if USB_PUBLISH_GEN.load(core::sync::atomic::Ordering::Acquire) != captured_gen {
+        serial_println!(
+            ":: BLK: retraction SKIPPED slot={} — a newer publish (gen {}) superseded the one this retraction was earned against (gen {}); the live disk survives ::",
+            slot_id, USB_PUBLISH_GEN.load(core::sync::atomic::Ordering::Acquire), captured_gen
+        );
+        return false;
+    }
     // Slot 0 is the xHCI "no slot" sentinel and also the id `register_sd` stamps on the microSD.
     // Neither is ever a device whose disconnect we are being told about.
     if slot_id == 0 {

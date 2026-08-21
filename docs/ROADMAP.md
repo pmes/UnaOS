@@ -98,6 +98,38 @@ surface. The socket syscall family opened at number 19 (SOCK-2 landed 19–22, S
 | SOCK-6 ✅ 🔬 | **Landed (round 15, `net-sock1`).** Scope A — **TCP server/listen sockets**: ring 3 gets the server side of TCP with two syscalls over the persistent stack — `sys_listen(handle, port)` (#26, arm a passive listener, `CAP_WRITE`) and `sys_accept(handle)` (#27, poll for an inbound connection, `CAP_READ`) — behind `UNAOS_SMOLNET` (knob-off byte-identical, both arches). smoltcp's listener *becomes* the connection in place, so `accept` mints a **fresh `KIND_SOCKET` handle** aliasing the same gen-fenced socket-id (`CAP_READ|CAP_WRITE|CAP_GRANT` — the accepted connection is itself transferable, inetd-style); non-blocking poll model (`-EAGAIN` re-drives) like `connect`; single-accept-per-listen. Because slirp won't open a connection INTO the guest, the server witness uses the `UNAOS_NET=socket` builder mode (no builder change) + `scripts/net-inject.py sock6`: the stateful kernel witness accepts + echoes a probe (`:: SOCK-6: smoltcp tcp accept :8080 — received 11 bytes, echoed 11 back — witness OK ::`); hermetic `./arroyo test 90` prints the honest `witness PENDING`. Next free syscall: **28**. See [`08_NET/networking.md`](../unaos/docs/dev/OS/08_NET/networking.md) + [`SECURITY.md`](SECURITY.md). | x86 |
 | SOCK-7+ | persistent-listener acceptor pool; aarch64 NIC bring-up joins here (§6 row); retire the hand-rolled shell surface + `crates/net` DHCP | later |
 
+## 1c. The portable self-hosting card (direction, Peter, 2026-08-17)
+
+**The charter, in Peter's terms:** stick an SD card into any machine — the named first
+target is his x86 Zenbook, hardware UnaOS has never seen — and UnaOS boots from it,
+installs itself, and ultimately **builds itself**, off that one innocent card, fast.
+One card is the whole operating system: boot medium, system volume, installer, and
+eventually the forge.
+
+The rungs, in order — each is an arc-sized deliverable, none skips the one before it:
+
+| Rung | Content | Owner |
+| :--- | :--- | :--- |
+| **SH-1 generic boot** | The ESP image boots generic UEFI x86 hardware, not just the rMBP: GOP-only display fallback, xHCI enumerated defensively (the BOT-PARK discipline), unknown-NIC/unknown-wifi tolerated dark. Zenbook is the proving hardware. | rmbp |
+| **SH-2 UnaFS system volume** | The card carries a UnaFS system volume as the root (FAT demoted to the ESP shim only — finish/audit the x86 FAT retirement). One medium, one filesystem, every chip. | all tracks |
+| **SH-3 self-install** | Booted-from-card UnaOS installs/clones itself to fixed media (or re-images its own card) without a host PC — the Orin microSD pain is the forcing function; prior art `fox/brief-install-pi2-selfclone.md`. | orin first |
+| **SH-4 smart install/debug** | The installer consults an AI through Vein to auto-diagnose metal bring-up on new hardware from the serial verdicts — new machines onboard themselves. **Provider-agnostic by charter (Peter, 2026-08-17): a person sets up THEIR OWN API — Claude or whatever AI they connect — and gets the whole experience.** Vein owns the provider abstraction, Principia owns the settings surface, Holocron owns the credentials; no provider is hardwired. **Offline arm (Peter, 2026-08-17): when the installer itself cannot reach the internet, the smart half runs on UnaOS-ON-HOST — the host-native userspace on `libs/gneiss_pal` (already running well on macOS and Linux today; Windows someday) as the connected companion that drives the target's bring-up over the wire. The rMBP's open hardware bugs are the installer's first test corpus — hardware testing continues WITH the installer as the tester (Peter, 2026-08-17).** | orin (design), all |
+| **SH-5 self-build** | The far rung, named honestly: UnaOS builds UnaOS. Requires a native toolchain story (bandy-on-metal §3b is the seed) — sequenced after the desktop chain, not before. | future |
+
+**The deliverable has a name (Peter, 2026-08-17): the `UnaOS_Installer` VESSEL** —
+what people download. Two faces of one program: (a) install UnaOS itself onto a machine
+or card; (b) install and run individual UnaOS **vessels** on the foreign host (macOS,
+Linux, Windows someday) — so a person can adopt the native suite one vessel at a time
+without committing to a whole OS. The bet stated with it: the vessels will outgrow their
+host-app rivals because of the formal native suite behind them. It lives in `vessels/`
+(per the naming law), is built on the host-native userspace (`libs/gneiss_pal`), carries
+the Vein AI socket (user's own provider), and IS the alien-host companion of SH-4 —
+one program, downloadable, that is simultaneously the front door to the OS and the
+distribution channel for its applications.
+
+The witness discipline applies: each rung lands with a boot-time witness proving it on
+the wire (the ONECARD witness is SH-2's Pi-side ancestor and the pattern to follow).
+
 ## 2. UnaFS: meeting and surpassing BeFS
 
 `unaos/libs/fs/unafs` already exceeds BeFS on one axis — typed attributes including
@@ -107,7 +139,7 @@ beat it (details and caveats in [`unaos/libs/fs/unafs/README.md`](../unaos/libs/
 | Arc | Content |
 | :--- | :--- |
 | F1 | ~~Journal rollback/replay~~ — **SUPERSEDED by K8a**: under copy-on-write there is no torn state to roll back; commit is one atomic root flip |
-| F2 | `unlink`/`rename`/`remove_attribute` + catalog entry removal |
+| F2 | **✅ `unlink`/`rename`/`remove_attribute` + catalog entry removal (core landed with K8a; kernel surface completed 2026-08-12).** Each mutation is ONE atomic CoW transaction: the directory rewrite, the catalog scrub, and the block release all become visible at a single root flip, so the pre-K8 crash windows (unindexed-but-named, named-in-neither-directory, leaked extents) are gone by construction. `unlink` decrefs the inode's data, spilled-attribute and extent-index blocks through the refcount map — a block survives iff another retained root still reaches it, so a snapshot taken before an unlink keeps the unlinked bytes readable. `rename` rekeys the name only (same inode id, no data copy); an existing destination is REFUSED (`FileExists`, deliberate POSIX divergence) and a directory into its own descendant is `DirectoryLoop`. `remove_attribute` drops the inline or spilled value plus every catalog entry for the (inode, key) pair, so a removed `Vector` attribute also disappears from similarity queries. Kernel verbs `urm`/`umv`/`urmattr` through the single IRQ-masked `with_unafs` mount + a new uncounted `F2-mutations` witness (`w=0x7f`: rename durable/same-inode/bytes-intact → collision refused → attribute removed with sibling intact → unlink durable with the stale id `NotFound` → negatives → self-clean fsck). **Honest scope:** the crate has no `rmdir` — directory removal is not part of F2 |
 | F3 | Generic on-disk **B+tree** (one implementation for indexes and directories) |
 | F4 | **Attribute indexes** — log-time equality + true range queries; retires the O(n) catalog scan/rewrite |
 | F5 | **Live queries** — persistent queries emitting add/remove deltas over bandy; the query-driven UI (the BeOS crown jewel, plus similarity) |

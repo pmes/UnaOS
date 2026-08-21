@@ -32,6 +32,19 @@ pub enum Event {
     /// CLICK-1: a pointer button-DOWN edge (payload = the report's button bitmask, bit 0 = primary).
     /// Emitted once per press by the HID decoders (edge-detected there); release emits nothing.
     Button(u8),
+    /// WHEEL: one scroll-wheel report, carrying the HID boot-mouse wheel byte as a SIGNED delta —
+    /// POSITIVE is scroll-up / away from the user, negative is scroll-down. This is a DELTA, not an
+    /// edge and not a level: consecutive detents arrive as consecutive events and a consumer
+    /// accumulates them.
+    ///
+    /// Emitted ONLY for a nonzero delta, and ONLY from a relative boot report that actually carried
+    /// a fourth byte. A boot mouse whose interrupt-IN endpoint delivers a 3-byte report has NO wheel
+    /// byte, and the decoders emit nothing for it rather than reading past the report and inventing
+    /// a delta out of whatever the DMA buffer held from the previous transfer.
+    ///
+    /// Consumers that do not scroll ignore it through their existing wildcard arm, exactly as they
+    /// ignore `KeyUp`.
+    Wheel(i8),
     None,
     Unknown,
 }
@@ -178,6 +191,36 @@ pub mod cursor {
 
     /// Hot-spot position (arrow tip), lazily centred on first use. One shared position: the
     /// console loop and the full-screen demos all move/draw the same cursor.
+    ///
+    /// ── POSFIX — every taker of this lock is MASKED, and that is the whole discipline ─────────
+    ///
+    /// INWEDGE / LOCKFIX state the rule this obeys: *a lock the input path touches may not be held
+    /// across a dispatch.* Before POSFIX this lock broke it in INWEDGE's exact shape, with the roles
+    /// of the two populations exchanged relative to the panel lock:
+    ///
+    /// * [`move_rel`] / [`set_abs`] reach [`set_clamped`] from inside the router's masked
+    ///   keep-alive span — so those takes were already MASKED, and could not be preempted.
+    /// * [`pos`] was taken UNMASKED and PREEMPTIBLE from `quarry::live::wheel_route` and
+    ///   `syscall::click_pointer_pos` (both on the `usb-pump`/`input` band), and from the
+    ///   compositor's hit-test helpers. A quantum tick inside that blocking acquire leaves the
+    ///   reader off-CPU **holding POS**, and the next masked pointer report on that core spins on it
+    ///   forever. That is boot 8, one lock over.
+    ///
+    /// **Why mask-everywhere and not try_lock-and-decline.** LOCKFIX gave the PANEL lock the
+    /// decline treatment because its critical section is a lock over a whole framebuffer handle,
+    /// held by painters that copy megabytes — a waiter there can be made to wait arbitrarily long,
+    /// so refusing is the only bounded answer. This lock is the opposite object: **both** critical
+    /// sections are constant-time and call nothing — [`pos`] is a `get_or_insert` of an `(i32, i32)`
+    /// and [`set_clamped`] is a store of one. With every taker masked, no holder can be preempted,
+    /// so the hold is bounded by a handful of instructions and a blocking acquire cannot outlive a
+    /// bounded spin. That is `sched::rq`'s precedent applied unchanged, and it is strictly better
+    /// here than a decline: a refused position read has no honest degradation (a cursor that does
+    /// not move for this event, or a click hit-tested at a stale point), and expressing one would
+    /// have to change the eight `pos()` call sites in `video/wm.rs` — a file this arc may not touch.
+    ///
+    /// **The invariant, for anyone adding a taker:** this lock is acquired only inside
+    /// `arch::without_interrupts`, and nothing but arithmetic runs inside it. Both properties are
+    /// load-bearing — masking a long critical section would move the wedge rather than close it.
     static POS: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 
     // --- CURSOR-X86 (metal defect fix: the pointer moved at PRESENT rate) ----------------------
@@ -441,8 +484,12 @@ pub mod cursor {
     }
 
     /// Current position, centring on first use.
+    ///
+    /// POSFIX — masked, because this is the reader the preemptible input path uses (see [`POS`]).
+    /// Unmasked, a tick inside the acquire parks the holder off-CPU and the next masked pointer
+    /// report on that core spins forever.
     pub fn pos(w: i32, h: i32) -> (i32, i32) {
-        *POS.lock().get_or_insert((w / 2, h / 2))
+        crate::arch::without_interrupts(|| *POS.lock().get_or_insert((w / 2, h / 2)))
     }
 
     /// Apply a relative motion report (trackpad/mouse dx,dy), clamped to the panel.
@@ -628,10 +675,13 @@ pub mod cursor {
         }
     }
 
+    /// POSFIX — masked for the same reason [`pos`] is: the writer must be the reader's equal, or
+    /// "every taker is masked" is not true and the discipline buys nothing. The clamp is computed
+    /// outside the mask; only the store is inside it.
     fn set_clamped(x: i32, y: i32, w: i32, h: i32) {
         let cx = x.clamp(0, (w - 1).max(0));
         let cy = y.clamp(0, (h - 1).max(0));
-        *POS.lock() = Some((cx, cy));
+        crate::arch::without_interrupts(|| *POS.lock() = Some((cx, cy)));
     }
 
     /// Draw the arrow sprite at the current position: a one-block-offset drop shadow first, then
@@ -986,7 +1036,7 @@ fn push_locked(q: &mut EventQueue, event: Event, lift: LiftHint) -> bool {
     use core::sync::atomic::Ordering::Relaxed;
     let is_ptr = matches!(
         event,
-        Event::Mouse { .. } | Event::MouseAbsolute { .. } | Event::Button(_)
+        Event::Mouse { .. } | Event::MouseAbsolute { .. } | Event::Button(_) | Event::Wheel(_)
     );
     let is_key = matches!(event, Event::Key(_) | Event::KeyUp(_));
     if is_ptr {
@@ -1124,6 +1174,66 @@ pub fn push_pointer_report(motion: Option<Event>, button: Option<Event>) {
             push_locked(&mut q, b, hint);
         }),
     }
+}
+
+// =================================================================================================
+// WHEEL — the scroll-wheel census
+// =================================================================================================
+//
+// The wheel byte was decoded nowhere in this OS until this arc: every HID pointer decoder read
+// `[buttons, dx, dy]` and left byte 3 on the floor, so `pal::Event` had no wheel variant, `una-abi`
+// had no `INPUT_EV_WHEEL`, and no ring-3 program could be sent a scroll no matter how it asked.
+// Adding the decode is cheap; PROVING it end to end is not, because the three ways a wheel report
+// can die are all silent and all look identical from the outside (nothing scrolls):
+//
+//   1. the byte is never decoded — a 3-byte report, or a pointer that never took the relative path;
+//   2. the delta is decoded but nothing is focused, so the router has no ring to put it in;
+//   3. the delta is decoded and routed, and the APP ignores it.
+//
+// These three counters separate those cases at a glance. They are plain relaxed atomics on a path
+// that already does MMIO and DMA, bumped only when a wheel is actually in play (`note_decoded` is
+// called for nonzero deltas only), so an idle boot and a boot with no wheel at all pay nothing. The
+// PRINTING is knob-gated at the call site (`pidesk`); the COUNTING is unconditional, so a metal
+// capture can read the census from any build that can reach a witness.
+
+/// Nonzero wheel deltas decoded out of HID pointer reports since boot.
+static WHEEL_DECODED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Wheel events the router successfully queued into a focused EL0 app's input ring.
+static WHEEL_ROUTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Wheel events that reached a router seam with NO EL0 app focused (or a full ring) and were
+/// dropped. Case (2) above: the decode works, the delivery has nowhere to go.
+static WHEEL_NO_FOCUS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// The most recent nonzero delta, sign preserved — so the witness can show DIRECTION, not just that
+/// something moved. Stored as i32 because there is no `AtomicI8`.
+static WHEEL_LAST: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+
+/// Record one nonzero wheel delta decoded from a HID report. Called by the HID decoders, from the
+/// interrupt-service path — lock-free and safe from any context.
+pub fn wheel_note_decoded(delta: i8) {
+    use core::sync::atomic::Ordering::Relaxed;
+    WHEEL_DECODED.fetch_add(1, Relaxed);
+    WHEEL_LAST.store(delta as i32, Relaxed);
+}
+
+/// Record that a wheel event was queued into the focused app's ring.
+pub fn wheel_note_routed() {
+    WHEEL_ROUTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record that a wheel event was dropped for want of a focused EL0 target.
+pub fn wheel_note_no_focus() {
+    WHEEL_NO_FOCUS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(decoded, routed, dropped-for-no-focus, last delta)` — the `[wheel1]` census.
+pub fn wheel_census() -> (u32, u32, u32, i32) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        WHEEL_DECODED.load(Relaxed),
+        WHEEL_ROUTED.load(Relaxed),
+        WHEEL_NO_FOCUS.load(Relaxed),
+        WHEEL_LAST.load(Relaxed),
+    )
 }
 
 /// UVUG-6 — live EVENT_QUEUE occupancy, read by the host-side typematic backpressure guard so a synthesised
@@ -1720,7 +1830,39 @@ pub fn pump_and_poll() -> Option<Event> {
     // armed the service returns immediately. Same feature gate as the main-loop call sites.
     #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
     crate::drivers::ehci::service_ehci_hid();
-    #[cfg(target_arch = "aarch64")]
+    // SERIAL-FOCUS — the UART drain splits BY SOURCE here, and this is the second of the two doors a
+    // serial byte could previously walk through into the focus-routed pipeline.
+    //
+    // On the bare-metal Pi this arm was a genuine SECOND READER of the one PL011 RX FIFO: the
+    // scheduled `input_service` task drains that FIFO continuously on another core, so a full-screen
+    // kernel app calling `pump_and_poll` RACED it for every byte — the doc comment above this
+    // function claimed "the bare-metal Pi routes keys through a separate scheduled input service /
+    // channel rather than this queue, so that path is unaffected here", and the `cfg` never actually
+    // excluded it. Whichever reader won, the byte's destination was wrong: through THIS door it
+    // landed in `EVENT_QUEUE`, where it is indistinguishable from a decoded USB HID key, and the
+    // `[uvug9]` routing decision in `main::pump_usb_into_gui` then hands it to
+    // `route_input_to_active_el0()` whenever a focused EL0 window owns input. That is the ruling
+    // working exactly as designed, on a carrier it was never meant to govern.
+    //
+    // So on that platform the byte still leaves the FIFO (the hardware read is unchanged, and the
+    // FIFO must be drained either way) but it goes to the SHELL's serial inbox instead of into
+    // `EVENT_QUEUE`. Consumed before the focus decision, it can never be routed away from the shell.
+    // The cost is named rather than hidden: a full-screen KERNEL app (`vug`, `pulse`) on the Pi no
+    // longer sees serial keystrokes in its own drain. It only ever saw the ones it won off
+    // `input_service` in a coin toss; no QEMU gate can type (raspi4b's `-serial file:` is
+    // write-only, so this arm returns nothing there and the change is inert for every gate); and the
+    // exit gestures those apps document are the USB key and the click. What is gained is the thing
+    // the blocker was about: a command typed over the wire while an app owns the panel lands in the
+    // shell the moment that app returns, instead of being raced away or stranded.
+    //
+    // Every other aarch64 build (QEMU `virt` via UEFI, the Orin's tegra console) keeps `push_event`
+    // untouched: there is no `input_service` on those paths, so this really is their only reader and
+    // `EVENT_QUEUE` really is their shell path.
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+    while let Some(byte) = crate::arch::poll_input() {
+        crate::arch::serial::shell_inbox::offer(byte);
+    }
+    #[cfg(all(target_arch = "aarch64", not(feature = "baremetal")))]
     while let Some(byte) = crate::arch::poll_input() {
         push_event(Event::Key(byte));
     }

@@ -103,6 +103,12 @@ several sessions can work in parallel without stepping on each other.
 
 ## Arc discipline
 
+- **Work the jobs (2026-08-19): a brief/baton's named arcs spawn in the
+  session's FIRST turn — the assignment is the go. At every turn end, running
+  executors below the floor (3, up to 6 for Pi/Orin) while undone work exists
+  = spawn before replying. "Standing by"/"awaiting your go" are banned; an
+  empty floor must be proven that turn or be Peter's explicit hold. Full law:
+  `docs/dev/LAWS.md` §Throughput.**
 - One arc per session, defined by your brief
   (`~/.claude/plans/unaos-opus-<track>.md`). Do not exceed it, however
   tempting the adjacent improvement.
