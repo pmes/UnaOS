@@ -11940,7 +11940,7 @@ fn sys_fb_present() -> i64 {
     let slot = (asid - 1) as usize;
     // M3: the compat surface's pointer and size are slot-derived constants — nothing here needs the
     // window table — so the checksum runs before the mask is ever taken.
-    let sum = fb_checksum(super::boot::slot_fb_surface_ptr(slot), super::boot::FB_SURFACE_SIZE);
+    let sum = fb_checksum(super::uslots::slot_fb_surface_ptr(slot), super::uslots::FB_SURFACE_SIZE);
     // WC-B: the compat wrapper presents the caller's REGION SLOT 0 surface at the legacy 32×32 geometry,
     // with the legacy witness accounting, whether or not a window entry was ever bound (a window entry
     // only adds the compositor-visible damage mark). Deliberately independent of the window table so this
@@ -12282,7 +12282,7 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     // `map_slot_fb_win` would map 81 pages past the end of the FB region, into the NEXT slot's
     // backing store. The x86 twin took the same correction when its caps diverged; the fifth window
     // now gets the honest `-EMFILE` this verb already documents.
-    let rslot = match (0..super::boot::FB_WIN_SLOTS)
+    let rslot = match (0..super::uslots::FB_WIN_SLOTS)
         .find(|&r| !(0..WIN_MAX).any(|i| t[i].owner == asid && t[i].rslot as usize == r))
     {
         Some(r) => r,
@@ -12486,7 +12486,7 @@ fn sys_win_present_rows(win: u64, y0: u64, y1: u64) -> i64 {
     let e = t[id];
     drop(t);
     drop(_irq);
-    let surf = super::boot::slot_fb_win_surface_ptr(slot, e.rslot as usize);
+    let surf = super::uslots::slot_fb_win_surface_ptr(slot, e.rslot as usize);
     let sum = fb_checksum(surf, e.pages as usize * 0x1000);
     let _irq = IrqGuard::mask_save();
     let t = WINDOWS.lock();
