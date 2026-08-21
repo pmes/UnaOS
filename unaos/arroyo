@@ -395,6 +395,18 @@ _feats=""
 # media byte-identical on both arches. Kept in sync with builder/src/main.rs — a knob mapped HERE and
 # missing THERE ships the feature disabled while the banner claims it is on (s42/INSTGUI, WXN-M3b).
 [ -n "${UNAOS_HOLOCRON:-}" ] && _feats="${_feats}holocron,"
+# BT-BOND M1 / HOLOCRON SELFTESTS: UNAOS_HCRONST=1 arms the store's two BOOT-TIME-WRITE selftests —
+# `holocron::selftest_once` (writes then unlinks /HCRON/HCRNTEST.DAT) and `btbond::selftest_once`
+# (stages a fixture bond through the REAL flush, which creates /HCRON/BTBOND.DAT and leaves it behind
+# as an empty store). Its own knob and NOT part of UNAOS_HOLOCRON, by the same rule that gives `sdw` a
+# knob apart from `sdhcblk`: a boot that did not ask to WRITE the boot medium must be incapable of
+# doing so, and M2's real consumer must be able to have the store without the tests' writes. Implies
+# `holocron` in Cargo.toml, so setting this alone arms both. NOT stripped by `arm_features` below, for
+# the same reason `holocron` is not. The deferral-bound fixture is NOT behind this knob — it writes
+# nothing and rides `holocron`. Default OFF => both selftests and their call sites vanish. Kept in
+# sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature disabled
+# while the banner claims it is on (s42/INSTGUI, WXN-M3b).
+[ -n "${UNAOS_HCRONST:-}" ] && _feats="${_feats}hcronst,"
 # INSTALL-CORE: UNAOS_INSTALLDEMO=1 arms the installer engine + its x86 boot witness (GPT writer +
 # FAT32 formatter + extent content-verify). The builder attaches a dedicated BLANK scratch disk over
 # the usb-storage slot under this knob (see builder/src/main.rs), against which the engine writes a
@@ -1639,13 +1651,27 @@ KERNEL_CFG_MATRIX=(
   # `cfg!(...)` expression, not a `#[cfg]` item, so the DISARMED polarity of `wxn_ro_stage` is already
   # type-checked by every leg. What this leg adds is the ARMED polarity — the constant folds the other
   # way, which is the build the metal flight actually carries.
+  # BT-BOND M1: `holocron,hcronst` are APPENDED at the end, and they MUST be named on an x86-* leg
+  # even though the arm-pi leg below also carries them. `x86_cfg_universe` computes "aarch64-only" as
+  # "named by an arm-* leg and NOT by any x86-* leg" and SUBTRACTS that set from the pairwise-mix
+  # universe — so adding them to arm-pi alone would have silently deleted them from the x86 mix legs,
+  # trading the aarch64 coverage hole for an x86 one. Named on both legs, the universe is unchanged
+  # and both arches type-check the seam.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,wifival,noaspm,wifi3"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,wifival,noaspm,wifi3,holocron,hcronst"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder. Cannot carry the tegra family — see the mutual-exclusion note above.
-  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm"
+  # BT-BOND M1: `holocron,hcronst` are APPENDED at the end, and this is the coverage hole they close.
+  # Those two knobs are deliberately NOT stripped by `arm_features` — on the stated grounds that the
+  # seam emits real aarch64 CODE (`fs/mod.rs` declares the module with no arch gate; the framing
+  # fixture and the load/flush pair run on both arches) and that stripping would silently DISARM the
+  # knob there. But until now `holocron` appeared in no aarch64 leg at all, so the standing gate would
+  # not have caught an aarch64 regression in the very file the "do not strip" decision exists to
+  # protect. It is a type-check leg, so it shifts no Pi or Jetson MEDIA: `arm_features` (which media
+  # builds go through) is untouched, and `kernel8` builds from its own curated K8_FEATS.
+  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,holocron,hcronst"
   # aarch64 board leg 2 — Jetson Orin Nano (Tegra234), plus the board-neutral aarch64 features that
   # would otherwise ride nothing: ORIN-SMP (tegrasmp/smpprobe), the four XCARVE levers, ORIN-NET-1..4
   # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET

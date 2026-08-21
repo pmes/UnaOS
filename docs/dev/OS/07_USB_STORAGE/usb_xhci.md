@@ -7152,7 +7152,14 @@ deferred-write path that turns this session bond into a persistent one.
 
 ---
 
-## 28. BT-BOND — the Holocron seam and the bond store (`UNAOS_HOLOCRON=1`, 2026-08-21)
+## 28. BT-BOND — the Holocron seam and the bond store (`UNAOS_HOLOCRON=1` / `UNAOS_HCRONST=1`, 2026-08-21)
+
+> **HCR1 (2026-08-21)** — an adversarial review of M1 returned four SHOULD-FIX findings, all four
+> fixed in the commit this note rides. §28.1a corrects what the flush guard can assert and bounds its
+> witness; §28.2a splits the boot-time-write selftests behind `hcronst`; §28.3a replaces the live-leaf
+> overwrite with a stage-verify-swap and quarantines a refused image; §28.7 item 1 closes the aarch64
+> cfg-coverage hole. Where an M1 statement is now wrong it is corrected in place and the correction
+> says what it used to say — the old text is the evidence for why the fix exists.
 
 §27.3 names the gap this section closes: the link key SSP produces lives in
 `Controller::bt_ssp_key`, in RAM, for one session. A real bond survives power-off. The obstacle was
@@ -7186,16 +7193,102 @@ So the store is split in two, and the split is the whole design:
 | `holocron::flush_if_dirty` | the main loop, storage-gated, no driver lock held | one whole-file rewrite through the FAT write path. |
 
 `flush_if_dirty` **checks that invariant rather than asserting it in a comment**: on x86 with the HID
-path built it consults `EHCI_HID.is_locked()` and refuses, loudly, rather than issuing block I/O from
-inside a service pass. A future call site that gets the placement wrong prints
-`:: [hcron] flush REFUSED — EHCI_HID is held …` instead of wedging the machine.
+path built it consults `EHCI_HID.is_locked()` before issuing any block I/O. What that check can
+actually assert is the subject of the next subsection, because M1 overstated it.
+
+### 28.1a What the flush guard can and cannot say (HCR1, 2026-08-21 — corrected)
+
+M1 shipped the guard documented as *"is the EHCI HID mutex held **on this core** right now?"*, and the
+witness it fed asserted *"…and this call site is inside it"*. Both claims were wrong.
+`spin::Mutex::is_locked` is a **global** predicate: it reports that the lock is taken and never by
+whom. It cannot distinguish
+
+* **this call stack is inside a `service_ehci_hid()` pass** — the bug the seam exists to prevent — from
+* **another task is mid-pass** — benign, and expected. `main.rs` spawns `usb-pump` (which calls
+  `holocron::service()`) and `input` (which reaches `service_ehci_hid()` at roughly 1 kHz through
+  `pal::pump_and_poll`) as two preemptible tasks on the same `svc_cpu`. An interleaving that finds the
+  lock taken is an ordinary scheduling outcome on a **correct** build.
+
+Two consequences, both real:
+
+1. the printed line stated as fact something the evidence could not support;
+2. the refusal `return`ed **before** `flush_fails`/`gave_up`, so it never consumed the
+   `HCRON_FLUSH_ATTEMPTS` budget. The module's own stated law — *a volume that vetoes writes must not
+   be able to make the main loop print forever* — was enforced on the I/O-failure path and not on this
+   one. While the store was dirty and the lock contended it printed **once per main-loop pass,
+   unbounded**. And because the same commit gave `x86-fat.spec` a hard `FORBID [hcron] flush REFUSED`,
+   a benign scheduler interleaving on an armed run could red a spec three tracks share.
+
+**What it is now.** The predicate is renamed `ehci_hid_busy()` and read only in the direction it is
+sound in:
+
+| reading | what it proves | action |
+| --- | --- | --- |
+| not held | nobody holds it, so **this stack does not**. A proof. | write |
+| held | **UNKNOWN** — both readings say the same thing about this instant. | defer |
+
+A `true` is therefore a **deferral**, never a verdict about the caller. Retries stay unbounded:
+deferral is not a failure, it costs one atomic load per pass, and a legitimately long service pass (an
+SSP chain runs for seconds, and it is precisely that chain which makes the store dirty) must not cost
+the boot its persistence. What is bounded **by construction** is the witness — `HCRON_DEFER_NOTES = 2`
+lines per boot, counted where the print happens so the counter counts output rather than intent. The
+first line explains the reading; the second, at `HCRON_DEFER_STUCK = 4096` consecutive deferrals,
+states both interpretations and stops. Deferral touches neither `flush_fails` nor `gave_up`, which
+count I/O that was *attempted* and refused by the volume.
+
+**The bound is proven by an executed fixture, not by this paragraph.** `defer_bound_fixture_once()`
+takes `EHCI_HID` for real — `try_lock`, never `lock`, so it can never hold the keyboard and trackpad
+hostage; a pass that cannot take the lock instantly is simply not its pass — drives `flush_if_dirty`
+4160 times, and checks that every pass reached and took the deferral return, that **zero** writes were
+issued (`seq` unmoved, the dirty flag it set still set), and that the witness emitted no more than the
+cap. It restores the dirty flag and the deferral accounting afterwards, so a boot's real budget is not
+spent by a test, and it writes nothing at all — which is why it rides `holocron` rather than the
+`hcronst` write knob.
+
+```
+:: [hcron] deferral bound: EHCI_HID HELD, flush_if_dirty driven 4160 times (past the 4096-pass
+   escalation and 64 further) — every pass deferred, ZERO writes issued (seq unmoved at 0, still
+   dirty), and the witness emitted 2 line(s) against a cap of 2 -> PASS ::
+```
+
+Go-red, measured rather than argued: with the cap removed from `note_defer` (i.e. the pre-HCR1
+behaviour restored) the same boot printed **4160** deferral lines and the fixture reported
+`… 4160 deferred passes emitted 255 witness lines against a cap of 2 … -> FAIL ::`, which the
+`arroyo test` verdict caught on its own, before any spec replay.
+
+**A sharper predicate is possible and is deliberately not in this file.** Recording an owner — a
+marker set and cleared around the body of `service_ehci_hid`, compared against
+`sched::current_task_id` — would answer the question M1's doc comment claimed to answer. It belongs on
+the EHCI side of the seam, in `drivers/ehci/mod.rs`, where the pass is bracketed; the store can only
+sample a lock it does not own. Until that exists, the honest statement is the one above: the guard
+proves the safe case and defers the ambiguous one. (The three `main.rs` call-site comments still say
+"it refuses while `EHCI_HID` is held"; that file was outside this arc's lane and the wording is stale
+there.)
 
 ### 28.2 Where the code lives
 
 | File | Contents | Gate |
 | --- | --- | --- |
-| `src/fs/holocron.rs` | the seam: framing, CRC, class registry, in-RAM table, `load_once` / `flush_if_dirty`, the framing fixture, the store round-trip selftest | `holocron` |
+| `src/fs/holocron.rs` | the seam: framing, CRC, class registry, in-RAM table, `load_once` / `publish_store_file` / `flush_if_dirty`, the framing fixture, the deferral-bound fixture | `holocron` |
 | `src/drivers/ehci/btbond.rs` | the first client: bond record schema v1, codec, table rules, either-form lookup, the codec KAT | `holocron` (inside the x86-gated `drivers/ehci/`) |
+| the two store round-trip selftests, in those same two files | boot-time WRITES to the medium — see §28.2a | `hcronst` (implies `holocron`) |
+
+#### 28.2a Two knobs, because one of them writes the user's medium (HCR1)
+
+`holocron` arms the **store**. `hcronst` arms the two **selftests** — `holocron::selftest_once`, which
+writes and unlinks `/HCRON/HCRNTEST.DAT`, and `btbond::selftest_once`, which stages a fixture bond
+through the real flush and so creates `/HCRON/BTBOND.DAT` and leaves it behind as an empty store.
+
+Both check `write_veto()` first and both self-clean, so neither is reckless. The split is not about
+recklessness; it is this repo's standing convention for a destructive write, the same one that gives
+`sdw` a knob apart from `sdhcblk` so a build can carry the SD block backend without carrying the
+card-write. Arming a **mechanism** must not be the same act as arming a **test that writes**: as M1
+shipped it, M2's real consumer could not have the store without two boot-time writes to the user's
+boot medium. The store itself touches the medium only when a record is actually staged.
+
+The deferral-bound fixture is deliberately *not* behind `hcronst`: it writes nothing, so arming the
+store arms its own bound-proof. `hcronst` is mapped in **both** `arroyo` (`UNAOS_HCRONST=1`) and
+`builder/src/main.rs`, by the same s42/INSTGUI rule that applies to `holocron`.
 
 `handlers/holocron/` remains a ring-3 design-stage stub — no crate, no entry point, no code. This is
 therefore **not** an RPC to a handler that does not exist: it is the minimal kernel-side vault the
@@ -7230,9 +7323,53 @@ new code. `seq` is a monotonic write counter, bumped on every successful flush; 
 this machine, so `seq` is the only clock the store has.
 
 The directory and leaf are 8.3-clean by construction (`HCRON`, `BTBOND.DAT`); the store creates
-`/HCRON` on first use. The write is a **whole-file rewrite** (delete-then-create, the tree's own
-`shell.rs::fs_write` idiom) because the record count can shrink and an in-place overwrite would leave
-a tail of the previous image behind.
+`/HCRON` on first use. The write is a **whole-file rewrite** because the record count can shrink and
+an in-place overwrite would leave a tail of the previous image behind — but *which file* is rewritten
+is the point of the next paragraph.
+
+#### 28.3a The update is a SWAP, not an overwrite (HCR1, 2026-08-21)
+
+M1 wrote the live leaf directly: `delete_located(BTBOND.DAT)` → `create_in_dir` → `write_grow`. The
+CRC catches a torn **record**; it is no help against a torn **update**. That sequence leaves a window,
+as wide as the whole grow, in which the previous generation is already gone and the new one is not yet
+whole — and a failure or a pull anywhere inside it leaves **no store at all** rather than a
+stale-but-valid one. It composed badly with the load path, too: a refused image triggers `clear()`,
+which marks the table dirty, so the next flush overwrote the refused file. One medium bit-flip
+therefore discarded the user's bonds permanently, with nothing left to recover them from.
+
+Both are closed. `publish_store_file` is now a four-step swap:
+
+1. **Stage** — whole-file rewrite of `/HCRON/BTBOND.NEW`. The live leaf is untouched, so a failure
+   here costs nothing and the next pass retries.
+2. **Prove** — read the temp back off the medium and `parse_image` it. The old generation is not
+   allowed to die on the strength of a `write_grow` return code; it dies only once the bytes that will
+   replace it have been read back through the same path a future boot will read them through, and have
+   parsed. This is also a torn-write check on the write that just happened.
+3. **Drop** the live leaf (`mark_dir_deleted` + free chain).
+4. **Rename** the temp over it — `rename_entry` rewrites the name field of the temp's directory entry
+   in place, one directory-sector RMW, the smallest window `fs::fat` can offer.
+
+Nothing here is atomic in the hardware sense; FAT cannot be. What it is, is **recoverable at every
+point**. The window between 3 and 4 is one sector write wide and the data is intact under the temp
+name throughout it, so `load_once` covers it directly: if the live leaf is **absent** and
+`/HCRON/BTBOND.NEW` **parses**, that image is adopted and the table is marked dirty so the next flush
+finishes the swap the crash interrupted. The live leaf is always tried first, and a live leaf that
+merely fails to parse never falls back to the temp — that is a finding about the medium, not a reason
+to reach for a file whose own provenance is a crash.
+
+**And a refused image is quarantined, not overwritten.** Before `clear()` marks the table dirty,
+`load_once` renames the refused bytes to `/HCRON/BTBOND.BAD` (one generation kept; a second refusal
+replaces it). The witness says which way it went, because "kept" and "lost" must never be
+indistinguishable on the wire:
+
+```
+:: [hcron] load: bad record crc (BTBOND.DAT) -> store starts EMPTY, fail-closed (nothing partially
+   adopted); refused bytes KEPT as /HCRON/BTBOND.BAD (one generation; recoverable off the medium)
+   == witness ::
+```
+
+The store's own paths never delete a leaf outright any more — they swap over it. `unlink_store_file`
+survives only for the selftest's scratch leaf and rides `hcronst` with it.
 
 **Fail-closed, with no partial adoption.** Bad magic, an unknown version, a bad header CRC, a bad
 record CRC, a truncated body, an over-long body, more records than the table holds, or trailing bytes
@@ -7240,7 +7377,8 @@ past the last record — every one refuses the **whole** image and the store sta
 with which refusal fired. A store that adopted the records it managed to read before the damage would
 be a store whose contents depend on where the corruption happened to land. On a refused load the
 table is marked dirty, so the next flush **replaces** the bad image rather than leaving a file every
-future boot will refuse identically.
+future boot will refuse identically — and since HCR1 the refused bytes are **moved aside first**, to
+`/HCRON/BTBOND.BAD`, so "replaces" no longer means "destroys the only copy". See §28.3a.
 
 **Keys.** The framing carries no key field: the key is a span *inside* the body, declared per class
 by `class_key_span`. `put` takes the caller's key explicitly and refuses a key that does not equal
@@ -7324,9 +7462,22 @@ metal-only. What a QEMU boot *can* prove, and does:
 
 1. **Compile + reachability.** `./arroyo check` green on both arches, armed and unarmed; `strings` on
    a `UNAOS_HOLOCRON=1` builder-path kernel shows the `[hcron]` and `[btbond]` witness families, and
-   a default build shows none (the §27.4 discipline, extended). The knob is mapped in **both**
-   `arroyo` and `builder/src/main.rs` — mapped in one alone would put `holocron` in the
-   `⚡ kernel features:` banner over a kernel with both modules compiled out.
+   a default build shows none (the §27.4 discipline, extended). Both knobs are mapped in **both**
+   `arroyo` and `builder/src/main.rs` — mapped in one alone would put `holocron`/`hcronst` in the
+   `⚡ kernel features:` banner over a kernel with the modules compiled out.
+
+   **The aarch64 leg (HCR1).** `holocron` and `hcronst` are deliberately not stripped by
+   `arm_features`, on the grounds that the seam emits real aarch64 code and stripping would silently
+   *disarm* the knob there rather than preserve a byte-identity that does not apply. Until HCR1 that
+   argument was untested by the standing gate: `holocron` appeared in no aarch64 cfg leg at all, so an
+   aarch64 regression in the very file the decision exists to protect would not have been caught. Both
+   knobs are now appended to `arroyo`'s `arm-pi` leg — **and to `x86-all`**, which is not optional:
+   `x86_cfg_universe` computes "aarch64-only" as *named by an arm-\* leg and by no x86-\* leg* and
+   subtracts that set from the pairwise-mix universe, so naming them on `arm-pi` alone would have
+   traded the aarch64 hole for an x86 one. Named on both, the universe is unchanged (still 8 mix legs,
+   12 in total) and both arches type-check the seam. These are type-check legs: `arm_features`, which
+   is what media builds go through, is untouched, and `kernel8` builds from its own curated
+   `K8_FEATS` — so no Pi or Jetson media hash moves.
 2. **The framing fixture** (`:: [hcron] framing fixture … -> PASS ::`) — pure, no hardware. Eight
    legs: a clean serialize→parse round-trip, then every refusal **made to fire** (body CRC, header
    CRC, truncation, trailing bytes, magic, version), then the untouched copy still parsing, so seven
@@ -7336,14 +7487,31 @@ metal-only. What a QEMU boot *can* prove, and does:
    short and wrong-version refusals; the class registry's key span agreeing with the schema's
    `bd_addr`; the either-form lookup rule discriminating; and record → holocron framing → parse →
    decode with a one-byte corruption refused in between.
-4. **The store round-trip through real FAT** — two witnesses, both self-cleaning:
+4. **The deferral bound** (`:: [hcron] deferral bound … -> PASS ::`) — needs a block device and
+   nothing else, writes nothing, rides `holocron`. See §28.1a for what it drives and why an argument
+   would not have been enough.
+
+5. **The store round-trip through real FAT** — two witnesses, both self-cleaning, both behind
+   `hcronst` because both write the medium (§28.2a):
    `:: [hcron] store round-trip … -> PASS ::` writes an image to a scratch leaf, reads it back
    byte-identical, then flips one byte **on the medium** and proves the load refuses it; and
    `:: [btbond] store round-trip … -> PASS ::` stages a fixture bond on `aa:bb:cc:dd:ee:ff` through
    the real table, flushes it, looks it up by **both** identity forms, then evicts and re-flushes so
-   the medium is left as it was found.
+   the medium is left as it was found. Its two `flush -> … ok` lines are also what proves the publish
+   swap of §28.3a completed: `ok` means the temp was staged, read back, parsed, and renamed over the
+   live leaf — not merely that a write returned.
 
-   Gate: `UNAOS_HOLOCRON=1 ./arroyo test-fat sf 150`, asserted by `scripts/specs/x86-fat.spec`.
+   Gate: `UNAOS_HOLOCRON=1 UNAOS_HCRONST=1 ./arroyo test-fat sf 150`, asserted by
+   `scripts/specs/x86-holocron.spec` (REQUIREs) and `scripts/specs/x86-fat.spec` (OPTIONAL/FORBID, so
+   the default gate stays green). A `UNAOS_HOLOCRON=1`-only capture satisfies the holocron spec's §1–§3
+   and is short on §4/§5 — the honest outcome of the knob split, not a regression.
+
+**What the specs forbid, restated (HCR1).** `x86-fat.spec` used to carry
+`FORBID [hcron] flush REFUSED`, firing knob-on or knob-off. Per §28.1a that line could fire on a
+correct build, so a benign scheduler interleaving on an armed run could red a spec three tracks share.
+It is gone from both specs. What gates instead is the deferral-bound fixture's `-> FAIL ::` variant —
+reachable on **every** armed run rather than only on the schedule that happens to contend the lock —
+together with the standing `FORBID [hcron] flush -> … GIVING UP`.
 
 Mock *HCI event* injection into `bt_ssp_pair` is deliberately not attempted: that dispatch loop is
 welded to the EP0/interrupt-EP transport, and a mock seam there would be invasive scaffolding for
@@ -7363,10 +7531,16 @@ correct independently of it.
   outgoing-page-shaped. The hold needs no exception and none is designed around.
 * **Key bytes never on serial.** Every `[btbond]` and `[hcron]` witness carries addresses, key types,
   counts and sequence numbers. Never key material.
-* **Default OFF.** With the knob unset both modules and every call site vanish and both arches are
-  byte-identical. Unlike `bt`/`btc`, `holocron` is **not** stripped by `arm_features`: the seam emits
-  real aarch64 code, so stripping it would silently disarm the knob rather than preserve a
-  byte-identity that does not apply.
+* **Default OFF.** With the knobs unset both modules and every call site vanish and both arches are
+  byte-identical. Unlike `bt`/`btc`, `holocron` and `hcronst` are **not** stripped by `arm_features`:
+  the seam emits real aarch64 code, so stripping would silently disarm the knobs rather than preserve
+  a byte-identity that does not apply. That claim is now under type-check on both arches — see §28.7
+  item 1.
+* **No boot-time write without asking for one (HCR1).** `holocron` alone touches the medium only when
+  a record is actually staged; the two selftests that write at boot are behind `hcronst`, by the same
+  convention that gives `sdw` a knob apart from `sdhcblk` (§28.2a).
+* **Never fewer than one valid generation on the medium (HCR1).** The flush stages, verifies and swaps
+  rather than overwriting; a refused image is quarantined rather than destroyed (§28.3a).
 
 ---
 

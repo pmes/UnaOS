@@ -159,7 +159,12 @@ REQUIRE :: \[fatverb\] storage witness: exec=[a-z-]+ read=[a-z-]+ gate=[a-z-]+ w
 # the slot_reused variant; this REQUIRE makes any recurrence a red gate, not a scrollback find.
 REQUIRE :: SOCK-4: transferable sockets — grantee received \+ round-tripped the moved socket, grantor's migrated-away handle -EACCES, gen-rebind rejected, teardown clean -> PASS ::
 
-# --- BT-BOND M1 / HOLOCRON (added 2026-08-21): the classed-record store's four witnesses ---------
+# --- BT-BOND M1 / HOLOCRON (added 2026-08-21): the classed-record store's witnesses --------------
+# --- HCR1 (2026-08-21): two knobs now, not one. `holocron` arms the STORE; `hcronst` (implies
+# --- `holocron`) arms the two selftests that WRITE the boot medium at boot — the `store round-trip`
+# --- pair below. So on a `UNAOS_HOLOCRON=1`-only capture the two fixture lines and the deferral
+# --- bound appear and the two round-trips do not; every directive here is OPTIONAL/FORBID, so both
+# --- arming levels and the knob-off default all stay green.
 # --- SCOPE, and why these are OPTIONAL here rather than REQUIRE. This file's contract, stated at
 # --- the top, is that BOTH the default (knob-off) and the knob-on builds pass it. `holocron` is
 # --- DEFAULT OFF, so a REQUIRE would red the default `UNAOS_FATIMG=sf ./arroyo test 150` gate on
@@ -186,6 +191,28 @@ FORBID \[hcron\] framing fixture: .*-> FAIL ::
 FORBID \[btbond\] codec fixture: .*-> FAIL ::
 FORBID \[hcron\] store round-trip: .*-> FAIL ::
 FORBID \[btbond\] store round-trip: .*-> FAIL ::
-# --- The flush guard: a store write from inside the EHCI service pass is the bug the whole seam
-# --- exists to avoid, so its refusal witness firing at all is a gate failure, knob-on or knob-off.
-FORBID \[hcron\] flush REFUSED
+# --- THE FLUSH GUARD, restated for what it can actually assert (HCR1, 2026-08-21).
+# --- This block used to read `FORBID \[hcron\] flush REFUSED`, and that line was unsound in both
+# --- directions. The witness it forbade claimed "EHCI_HID is held … and this call site is inside
+# --- it", but `EHCI_HID.is_locked()` is a GLOBAL predicate on a spin::Mutex: it reports that the
+# --- lock is taken and never by whom. It therefore could not tell a flush issued from INSIDE
+# --- `service_ehci_hid()` — the bug the seam exists to prevent — from an ordinary interleaving in
+# --- which the `input` task held the lock while `usb-pump` sampled it. main.rs spawns both on the
+# --- same svc_cpu and they are preemptible, so that interleaving is a scheduling outcome on a
+# --- CORRECT build. A hard FORBID on it meant a benign schedule could red a spec three tracks share.
+# --- Worse, the refusal returned before `flush_fails`/`gave_up`, so it never consumed the flush
+# --- budget: while the store was dirty and the lock contended it printed once per main-loop pass,
+# --- without bound. The guard now DEFERS instead of accusing, and caps its own witness at
+# --- HCRON_DEFER_NOTES lines per boot.
+# --- WHAT IS ACTUALLY FORBIDDEN, and is asserted instead:
+# ---   * the deferral BOUND failing. The fixture takes EHCI_HID for real, drives `flush_if_dirty`
+# ---     past the escalation point (4096 + 64 passes), and proves every pass deferred, ZERO writes
+# ---     were issued, and the witness went quiet at the cap. Its FAIL variant is exactly what a
+# ---     regression to the unbounded print looks like, and it is reachable on every armed run rather
+# ---     than only on the schedule that happens to contend the lock.
+# ---   * the store giving up on its writes over a volume this gate believes is writable.
+# --- What is NOT forbidden: the deferral witness itself. It is the guard working, on a reading that
+# --- cannot name a culprit, and a line that can fire on a correct build must never gate a shared spec.
+OPTIONAL :: \[hcron\] deferral bound: .*-> PASS ::
+FORBID \[hcron\] deferral bound: .*-> FAIL ::
+FORBID \[hcron\] flush -> .* GIVING UP

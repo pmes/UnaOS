@@ -318,6 +318,16 @@ fn main() {
     // banner. M1 issues no HCI command and touches no radio. Default OFF => modules and call sites
     // unlinked, media byte-identical. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_HOLOCRON").is_ok() { feats.push("holocron"); }
+    // BT-BOND M1 / HOLOCRON SELFTESTS: UNAOS_HCRONST=1 arms the store's two BOOT-TIME-WRITE selftests
+    // (`holocron::selftest_once`, `btbond::selftest_once`). Its own knob and NOT part of
+    // UNAOS_HOLOCRON, by the same rule that gives `sdw` a knob apart from `sdhcblk`: a boot that did
+    // not ask to WRITE the boot medium must be incapable of doing so. Implies `holocron` in
+    // Cargo.toml, so pushing this alone arms both. THIS list is what reaches the kernel binary for
+    // MEDIA builds and for every QEMU run that goes through the builder, so a knob wired into arroyo
+    // alone would put `hcronst` in the `⚡ kernel features:` banner over a kernel with the selftests
+    // compiled OUT (the s42/INSTGUI and WXN-M3b failure). Default OFF => both selftests and their
+    // call sites unlinked. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_HCRONST").is_ok() { feats.push("hcronst"); }
     // K-GPU: UNAOS_KEPLER=1 arms the GK107 (GT 650M) driver — probe/EVO-decode/PFIFO are further
     // gated by UNAOS_KEPLER_TAKEOVER / UNAOS_KEPLER_FIFO (option_env!, compile-time). Kept in sync
     // with arroyo's mapping. (The builder rebuilds the kernel, so this MUST be here or the feature

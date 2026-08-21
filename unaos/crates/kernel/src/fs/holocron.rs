@@ -40,8 +40,12 @@
 //!   * [`put`] / [`remove`] are **RAM + a dirty flag**. Under the EHCI lock they are a `memcpy` and a
 //!     bool. No I/O, no allocation, no wait.
 //!   * [`flush_if_dirty`] is the write, and it runs from the main loop with no driver lock held. It
-//!     **refuses to run** while `EHCI_HID` is held (x86; see the guard inside) rather than trusting
-//!     the call site — the invariant is checked, not asserted in a comment.
+//!     **defers** rather than write while `EHCI_HID` cannot be proven free (x86; see the guard
+//!     inside), so the invariant is checked instead of trusted — but read the guard's own doc for
+//!     what that check can and cannot say. `spin::Mutex::is_locked` names no holder, so "held" is
+//!     read as UNKNOWN, never as "this call site is inside the pass", and the deferral is bounded in
+//!     what it prints ([`HCRON_DEFER_NOTES`]) so a contended lock can never make the main loop print
+//!     forever.
 //!
 //! # On-disk format (v1)
 //!
@@ -63,6 +67,22 @@
 //! last record — every one of them refuses the WHOLE image and the store starts EMPTY, witnessed.
 //! There is no partial adoption: a store that adopted the records before the corruption would be a
 //! store whose contents depend on where the damage happened to land.
+//!
+//! # The update is a SWAP, not an overwrite (never fewer than one valid generation)
+//!
+//! The CRC catches a torn *record*. It cannot catch a torn *update*: a delete-then-create-then-grow
+//! straight onto [`HCRON_FILE`] leaves a window in which the previous generation is already gone and
+//! the new one is not yet whole, and a failure anywhere in that window loses the user's bonds
+//! outright rather than falling back to a stale-but-valid store. So [`flush_if_dirty`] never writes
+//! the live leaf. It writes [`HCRON_TMP_FILE`], reads it back and PARSES it, and only once the new
+//! generation is proven readable on the medium does it drop the live leaf and `rename` the temp over
+//! it — one directory-sector RMW, which is the smallest window `fs::fat` can offer. A boot that
+//! finds no live leaf but a parseable temp adopts the temp and republishes it, so even that window is
+//! covered by recovery rather than by luck.
+//!
+//! For the same reason a REFUSED image is **quarantined, not overwritten**: the refused bytes are
+//! renamed to [`HCRON_BAD_FILE`] before the fresh empty store is published, so one medium bit-flip
+//! costs the user a boot's bonds and not the bytes that might still be recoverable from them.
 //!
 //! # At-rest posture (stated, not implied)
 //!
@@ -134,9 +154,36 @@ pub const HCRON_FILE: &str = "BTBOND.DAT";
 /// The store file, as a whole path — the text every witness prints.
 pub const HCRON_PATH: &str = "/HCRON/BTBOND.DAT";
 
+/// The staging leaf a flush writes and then renames over [`HCRON_FILE`]. 8.3-clean. Never adopted
+/// as the store unless the live leaf is missing (the crash-in-the-swap-window recovery).
+pub const HCRON_TMP_FILE: &str = "BTBOND.NEW";
+
+/// Where a REFUSED image is renamed before the store publishes a fresh one over its name. One
+/// generation is kept: a second refusal replaces it, so the quarantine cannot grow without bound.
+pub const HCRON_BAD_FILE: &str = "BTBOND.BAD";
+
 /// Consecutive failed flushes before the store gives up and stops retrying. A volume that vetoes
 /// writes (or a stick pulled mid-boot) must not be able to make the main loop print forever.
 pub const HCRON_FLUSH_ATTEMPTS: u8 = 8;
+
+/// The HARD CAP on how many lines the store may ever print about a DEFERRED flush, per boot.
+///
+/// The same law as [`HCRON_FLUSH_ATTEMPTS`], enforced on the other refusal path. Deferral is not a
+/// failure — it is "the lock could not be proven free on this pass" — so it must NOT consume the
+/// flush-failure budget and must NOT stop the retries (a legitimately long service pass would
+/// otherwise cost the boot its persistence). What it must not do is print once per main-loop pass
+/// for as long as the contention lasts, which is exactly what the first version of this guard did.
+/// The retry stays unbounded; the WITNESS is bounded, by construction, right here.
+pub const HCRON_DEFER_NOTES: u8 = 2;
+
+/// Consecutive deferred passes after which the second (and last) deferral line is printed.
+///
+/// Deliberately NOT a verdict, and deliberately not gated on by any spec. `is_locked()` names no
+/// holder, so no number of deferrals can distinguish a call site inside the service pass from a
+/// service pass that is legitimately long (an SSP chain runs for seconds on metal, and it is
+/// precisely the chain that makes the store dirty). The line says both readings out loud and then
+/// the store goes quiet.
+pub const HCRON_DEFER_STUCK: u32 = 4096;
 
 // =========================================================================================
 // ERRORS
@@ -419,6 +466,12 @@ struct Store {
     flush_fails: u8,
     /// [`HCRON_FLUSH_ATTEMPTS`] failures in a row — retries stopped, witnessed once.
     gave_up: bool,
+    /// Consecutive passes on which the flush could not prove `EHCI_HID` free and deferred. Reset by
+    /// any pass that gets past the guard, so it reads as "in a row", not "since boot".
+    defers: u32,
+    /// Lines actually EMITTED about deferral this boot. Incremented where the print happens, so the
+    /// count is of output and not of intent — [`HCRON_DEFER_NOTES`] is the cap it is checked against.
+    defer_notes: u8,
 }
 
 impl Store {
@@ -432,6 +485,8 @@ impl Store {
             load_done: false,
             flush_fails: 0,
             gave_up: false,
+            defers: 0,
+            defer_notes: 0,
         }
     }
 
@@ -633,30 +688,44 @@ fn read_store_file(leaf: &str, out: &mut alloc::vec::Vec<u8>) -> Result<(), Hcro
     Ok(())
 }
 
+/// The `/HCRON` directory's first cluster. `create` decides whether an absent directory is made or
+/// reported — a reader must never conjure a directory it is only looking in.
+fn store_dir(fs: &crate::fs::fat::FatFs, create: bool) -> Result<u32, HcronError> {
+    match fs.locate_in_dir(0, HCRON_DIR) {
+        Ok((de, _, _)) if de.is_dir => Ok(de.first_cluster()),
+        Ok(_) => Err(HcronError::Io), // a FILE named HCRON — not ours to replace
+        Err(crate::fs::fat::FatError::NotFound) => {
+            if !create {
+                return Err(HcronError::NotFound);
+            }
+            let (de, _, _) = fs
+                .create_dir(0, HCRON_DIR)
+                .map_err(|e| map_fat(e, HcronError::Io))?;
+            Ok(de.first_cluster())
+        }
+        Err(e) => Err(map_fat(e, HcronError::Io)),
+    }
+}
+
 /// Whole-file rewrite of `/HCRON/<leaf>`. Creates `/HCRON` if absent.
 ///
 /// Delete-then-create is how the tree's own arch-neutral write verb (`shell.rs::fs_write`) replaces a
 /// file, and it is what "whole-file rewrite" means here: the record count can shrink, so an in-place
-/// overwrite would leave a tail of the previous image behind. The window in which the file does not
-/// exist is covered by the format, not by luck — a reader that finds no file starts empty, and a
-/// reader that finds a half-written one refuses it on the CRC.
+/// overwrite would leave a tail of the previous image behind.
+///
+/// **This is the primitive, not the publish.** It is deliberately NOT how the live store is updated:
+/// between the delete and a completed `write_grow` there is no file at all, and a failure in that
+/// window destroys the previous generation rather than falling back to it. The live leaf is written
+/// by [`publish_store_file`], which uses this on [`HCRON_TMP_FILE`] and then swaps. The only callers
+/// that name a leaf directly are that publish and the selftest's own scratch leaf, neither of which
+/// has a previous generation worth protecting.
 fn write_store_file(leaf: &str, data: &[u8]) -> Result<(), HcronError> {
     let fs = crate::fs::fat::mount().map_err(|_| HcronError::NoStorage)?;
     if fs.write_veto().is_some() {
         return Err(HcronError::ReadOnly);
     }
     // The store directory, created on first use.
-    let dir_clus = match fs.locate_in_dir(0, HCRON_DIR) {
-        Ok((de, _, _)) if de.is_dir => de.first_cluster(),
-        Ok(_) => return Err(HcronError::Io), // a FILE named HCRON — not ours to replace
-        Err(crate::fs::fat::FatError::NotFound) => {
-            let (de, _, _) = fs
-                .create_dir(0, HCRON_DIR)
-                .map_err(|e| map_fat(e, HcronError::Io))?;
-            de.first_cluster()
-        }
-        Err(e) => return Err(map_fat(e, HcronError::Io)),
-    };
+    let dir_clus = store_dir(&fs, true)?;
     // Replace the leaf: drop any existing entry, then a fresh 0-length one to grow into.
     let (dir_lba, dir_off) = match fs.locate_in_dir(dir_clus, leaf) {
         Ok((de, dl, doff)) => {
@@ -688,17 +757,18 @@ fn write_store_file(leaf: &str, data: &[u8]) -> Result<(), HcronError> {
 }
 
 /// Delete `/HCRON/<leaf>` if it is there. Absent is success — this is the selftest's self-clean, and
-/// "already gone" is the state it wants.
+/// "already gone" is the state it wants. The selftest is its only caller, so it rides the same knob:
+/// the store's own paths never delete a leaf outright, they swap over it.
+#[cfg(feature = "hcronst")]
 fn unlink_store_file(leaf: &str) -> Result<(), HcronError> {
     let fs = crate::fs::fat::mount().map_err(|_| HcronError::NoStorage)?;
     if fs.write_veto().is_some() {
         return Err(HcronError::ReadOnly);
     }
-    let dir_clus = match fs.locate_in_dir(0, HCRON_DIR) {
-        Ok((de, _, _)) if de.is_dir => de.first_cluster(),
-        Ok(_) => return Err(HcronError::Io),
-        Err(crate::fs::fat::FatError::NotFound) => return Ok(()),
-        Err(e) => return Err(map_fat(e, HcronError::Io)),
+    let dir_clus = match store_dir(&fs, false) {
+        Ok(c) => c,
+        Err(HcronError::NotFound) => return Ok(()), // no /HCRON at all — already gone
+        Err(e) => return Err(e),
     };
     match fs.locate_in_dir(dir_clus, leaf) {
         Ok((de, dl, doff)) => {
@@ -709,6 +779,113 @@ fn unlink_store_file(leaf: &str) -> Result<(), HcronError> {
         Err(crate::fs::fat::FatError::NotFound) => Ok(()),
         Err(e) => Err(map_fat(e, HcronError::Io)),
     }
+}
+
+/// PUBLISH the live store: stage into [`HCRON_TMP_FILE`], PROVE the staged bytes are readable, then
+/// swap the temp over [`HCRON_FILE`].
+///
+/// The property this exists for, stated as the invariant it keeps: **at no point between two calls
+/// is there neither a valid live store nor a valid temp.** The old sequence
+/// (`delete_located(BTBOND.DAT)` → `create_in_dir` → `write_grow`) violated that for the whole
+/// duration of the grow — a failure or a pull anywhere in there left the volume with no store at all
+/// instead of the previous generation, and the per-record CRC is no help: it detects a torn RECORD,
+/// while this is a torn UPDATE.
+///
+/// The four steps, and what each one buys:
+///
+///   1. **Stage.** Whole-file rewrite of the TEMP leaf. The live leaf is untouched, so a failure here
+///      costs nothing: the previous generation is still the live one and the next pass retries.
+///   2. **Prove.** Read the temp back off the medium and `parse_image` it. The old generation is not
+///      allowed to die on the strength of a `write_grow` return code; it dies only once the bytes
+///      that will replace it have been read back through the same path a future boot will read them
+///      through, and have parsed. This is also a torn-write check on the write that just happened.
+///   3. **Drop the live leaf.** `mark_dir_deleted` + free chain.
+///   4. **Rename.** `rename_entry` rewrites the name field of the temp's directory entry IN PLACE —
+///      a single directory-sector RMW, the smallest window `fs::fat` can offer.
+///
+/// The window between 3 and 4 is one sector write wide, and even inside it the data is intact under
+/// the temp name — which is why [`load_once`] adopts a parseable temp when the live leaf is absent.
+/// Nothing here is atomic in the hardware sense; FAT cannot be. What it is, is recoverable at every
+/// point, which the previous sequence was not.
+fn publish_store_file(data: &[u8]) -> Result<(), HcronError> {
+    // 1. Stage.
+    write_store_file(HCRON_TMP_FILE, data)?;
+
+    // 2. Prove: the staged generation must READ BACK and PARSE before the live one may die.
+    let mut back: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let proof = read_store_file(HCRON_TMP_FILE, &mut back).and_then(|()| {
+        if back.len() != data.len() || back[..] != data[..] {
+            return Err(HcronError::Io);
+        }
+        parse_image(&back).map(|_| ())
+    });
+    // The readback buffer held record bodies. Wipe before it goes back to the allocator, on every
+    // path — a verification step is not an exception to hygiene.
+    for b in back.iter_mut() {
+        *b = 0;
+    }
+    proof?;
+
+    // 3 + 4. Swap, under one mount.
+    let fs = crate::fs::fat::mount().map_err(|_| HcronError::NoStorage)?;
+    if fs.write_veto().is_some() {
+        return Err(HcronError::ReadOnly);
+    }
+    let dir_clus = store_dir(&fs, true)?;
+    match fs.locate_in_dir(dir_clus, HCRON_FILE) {
+        Ok((de, dl, doff)) => {
+            if de.is_dir {
+                return Err(HcronError::Io);
+            }
+            fs.delete_located(dl, doff, de.first_cluster())
+                .map_err(|e| map_fat(e, HcronError::Io))?;
+        }
+        Err(crate::fs::fat::FatError::NotFound) => {}
+        Err(e) => return Err(map_fat(e, HcronError::Io)),
+    }
+    fs.rename_entry(dir_clus, HCRON_TMP_FILE, HCRON_FILE)
+        .map_err(|e| map_fat(e, HcronError::Io))?;
+    Ok(())
+}
+
+/// QUARANTINE a refused image: rename `/HCRON/<leaf>` to [`HCRON_BAD_FILE`], replacing any previous
+/// quarantine.
+///
+/// A refused load calls [`clear`], which marks the table dirty so the next flush replaces the bad
+/// image rather than leaving a file every future boot refuses identically. That is right, and it used
+/// to mean the refused bytes were DESTROYED — one bit-flip on the medium and the user's bonds were
+/// gone for good, with nothing left to recover them from. So the bytes are moved aside first. One
+/// generation is kept (a second refusal replaces it), the rename is a single directory-sector RMW,
+/// and a failure here is reported to the caller rather than swallowed: the witness says whether the
+/// evidence survived.
+fn quarantine_store_file(leaf: &str) -> Result<(), HcronError> {
+    let fs = crate::fs::fat::mount().map_err(|_| HcronError::NoStorage)?;
+    if fs.write_veto().is_some() {
+        return Err(HcronError::ReadOnly);
+    }
+    let dir_clus = store_dir(&fs, false)?;
+    // The refused leaf must exist — nothing to quarantine otherwise, and that is not an error.
+    match fs.locate_in_dir(dir_clus, leaf) {
+        Ok((de, _, _)) if !de.is_dir => {}
+        Ok(_) => return Err(HcronError::Io),
+        Err(crate::fs::fat::FatError::NotFound) => return Ok(()),
+        Err(e) => return Err(map_fat(e, HcronError::Io)),
+    }
+    // Free the name first: `rename_entry` refuses a destination that already exists.
+    match fs.locate_in_dir(dir_clus, HCRON_BAD_FILE) {
+        Ok((de, dl, doff)) => {
+            if de.is_dir {
+                return Err(HcronError::Io);
+            }
+            fs.delete_located(dl, doff, de.first_cluster())
+                .map_err(|e| map_fat(e, HcronError::Io))?;
+        }
+        Err(crate::fs::fat::FatError::NotFound) => {}
+        Err(e) => return Err(map_fat(e, HcronError::Io)),
+    }
+    fs.rename_entry(dir_clus, leaf, HCRON_BAD_FILE)
+        .map_err(|e| map_fat(e, HcronError::Io))?;
+    Ok(())
 }
 
 fn map_fat(e: crate::fs::fat::FatError, notfound: HcronError) -> HcronError {
@@ -729,7 +906,14 @@ fn map_fat(e: crate::fs::fat::FatError, notfound: HcronError) -> HcronError {
 ///
 /// **Fail-closed.** Any parse refusal leaves the table EMPTY and says which refusal it was. A store
 /// that adopted the records it managed to read before the damage would be a store whose contents
-/// depend on where the corruption landed.
+/// depend on where the corruption landed. The refused BYTES are moved aside
+/// ([`quarantine_store_file`]) before the empty store is allowed to publish over their name.
+///
+/// **Swap-window recovery.** [`publish_store_file`] leaves a one-sector window in which the live leaf
+/// is already gone and the temp has not been renamed over it yet. A boot landing in that window finds
+/// no [`HCRON_FILE`] and a complete [`HCRON_TMP_FILE`]; it adopts the temp and marks the table dirty
+/// so the next flush republishes it under the live name. Without this the window would be exactly the
+/// data loss the swap exists to prevent, moved one step later.
 pub fn load_once() {
     {
         let s = STORE.lock();
@@ -742,7 +926,27 @@ pub fn load_once() {
     }
 
     let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    let read = read_store_file(HCRON_FILE, &mut buf);
+    // The live leaf first. Only if it is ABSENT does the staging leaf get a look — a live store that
+    // merely fails to PARSE is a finding about the medium, not a reason to reach for a temp whose own
+    // provenance is a crash.
+    let mut leaf = HCRON_FILE;
+    let mut read = read_store_file(HCRON_FILE, &mut buf);
+    let mut from_temp = false;
+    if matches!(read, Err(HcronError::NotFound)) {
+        buf.clear();
+        match read_store_file(HCRON_TMP_FILE, &mut buf) {
+            Ok(()) => {
+                leaf = HCRON_TMP_FILE;
+                read = Ok(());
+                from_temp = true;
+            }
+            Err(HcronError::NotFound) => buf.clear(), // neither leaf: genuinely a first boot
+            Err(e) => {
+                leaf = HCRON_TMP_FILE;
+                read = Err(e);
+            }
+        }
+    }
 
     let mut s = STORE.lock();
     s.load_done = true;
@@ -758,12 +962,16 @@ pub fn load_once() {
         Err(e) => {
             s.loaded = true;
             drop(s);
+            // Move the refused bytes aside BEFORE `clear` marks the table dirty: the next flush
+            // publishes a fresh empty store, and it must not publish it over the only copy of
+            // whatever the user's bonds were. One generation is kept, as /HCRON/BTBOND.BAD.
+            let q = quarantine_store_file(leaf);
             clear();
-            // `clear` marks the table dirty so the next flush REPLACES the refused image rather than
-            // leaving a file on the medium that every future boot will refuse in the same way.
             serial_println!(
-                ":: [hcron] load: {} -> store starts EMPTY, fail-closed (nothing partially adopted) == witness ::",
-                hcron_reason(e)
+                ":: [hcron] load: {} ({}) -> store starts EMPTY, fail-closed (nothing partially adopted); refused bytes {} == witness ::",
+                hcron_reason(e),
+                leaf,
+                quarantine_note(q)
             );
         }
         Ok(()) => {
@@ -774,24 +982,36 @@ pub fn load_once() {
                     s.count = img.count;
                     s.recs = img.recs;
                     s.seq = img.seq;
-                    s.dirty = false;
+                    // A store recovered from the STAGING leaf is not yet published under the live
+                    // name. Dirty, so the next flush finishes the swap the crash interrupted.
+                    s.dirty = from_temp;
                     s.loaded = true;
                     let n = s.count;
                     let q = s.seq;
                     drop(s);
-                    serial_println!(
-                        ":: [hcron] loaded n={} from {} (seq={}) == witness ::",
-                        n, HCRON_PATH, q
-                    );
+                    if from_temp {
+                        serial_println!(
+                            ":: [hcron] loaded n={} from /{}/{} (seq={}) — the LIVE leaf was absent and the staging leaf parsed, so a previous boot died inside the publish swap; adopted and marked dirty so the next flush finishes it == witness ::",
+                            n, HCRON_DIR, HCRON_TMP_FILE, q
+                        );
+                    } else {
+                        serial_println!(
+                            ":: [hcron] loaded n={} from {} (seq={}) == witness ::",
+                            n, HCRON_PATH, q
+                        );
+                    }
                 }
                 Err(e) => {
                     let mut s = STORE.lock();
                     s.loaded = true;
                     drop(s);
+                    let q = quarantine_store_file(leaf);
                     clear();
                     serial_println!(
-                        ":: [hcron] load: {} -> store starts EMPTY, fail-closed (nothing partially adopted) == witness ::",
-                        hcron_reason(e)
+                        ":: [hcron] load: {} ({}) -> store starts EMPTY, fail-closed (nothing partially adopted); refused bytes {} == witness ::",
+                        hcron_reason(e),
+                        leaf,
+                        quarantine_note(q)
                     );
                 }
             }
@@ -803,27 +1023,107 @@ pub fn load_once() {
     }
 }
 
-/// Is the EHCI HID mutex held on this core right now?
+/// One phrase for what became of a refused image — the quarantine either happened or it is named why
+/// it did not. "Kept" and "lost" must never be indistinguishable on the wire.
+fn quarantine_note(q: Result<(), HcronError>) -> &'static str {
+    match q {
+        Ok(()) => "KEPT as /HCRON/BTBOND.BAD (one generation; recoverable off the medium)",
+        Err(HcronError::ReadOnly) => "NOT kept (volume vetoes writes) — nothing was destroyed either",
+        Err(_) => "NOT kept (the quarantine rename failed) — the next flush will publish over them",
+    }
+}
+
+/// Is the `EHCI_HID` mutex held by SOMEONE right now?
 ///
-/// The one invariant this module exists to keep, checked instead of asserted. On x86 with the HID
-/// path built, `flush_if_dirty` consults this and REFUSES rather than issuing block I/O from inside
-/// a `service_ehci_hid()` pass — the exact deadlock-and-hostage shape described at the top of the
-/// file. Everywhere else there is no such lock and the answer is a constant `false`.
+/// **Named for what it can actually answer.** `spin::Mutex::is_locked` is a GLOBAL predicate: it
+/// reports that the lock is taken, never by whom. It therefore CANNOT distinguish
+///
+///   * "this call stack is inside a `service_ehci_hid()` pass" — the bug this seam exists to
+///     prevent — from
+///   * "another task is mid-pass" — benign, and expected: `main.rs` spawns `usb-pump` (which calls
+///     [`service`]) and `input` (which reaches `service_ehci_hid` at roughly 1 kHz) as two separate
+///     preemptible tasks, so an interleaving that finds the lock taken is an ordinary scheduling
+///     outcome on a correct build, not a defect.
+///
+/// The earlier version of this function was documented as "held on this core right now" and the
+/// witness it fed asserted "this call site is inside it". Both claims were false whenever the lock
+/// was merely contended, and the refusal they produced returned before the flush budget, so a
+/// contended lock printed once per main-loop pass forever.
+///
+/// The predicate is still worth reading, because it is sound in exactly one direction:
+///
+///   * **not held** — nobody holds it, so THIS stack does not. A PROOF that the flush may run.
+///   * **held** — UNKNOWN. Both readings say the same thing about this instant: do not write now.
+///
+/// So the flush treats a `true` as a DEFERRAL, never as a verdict about its caller, and bounds what
+/// the deferral may print ([`note_defer`]). A sharper predicate is possible — a marker set and
+/// cleared around the body of `service_ehci_hid` in `drivers/ehci/mod.rs`, compared against the
+/// current task — but it belongs on the EHCI side of the seam, where the pass is bracketed.
+///
+/// Everywhere else there is no such lock and the answer is a constant `false`.
 #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
-fn ehci_hid_held() -> bool {
+fn ehci_hid_busy() -> bool {
     crate::drivers::ehci::EHCI_HID.is_locked()
 }
 
 #[cfg(not(all(target_arch = "x86_64", feature = "ehcihid")))]
-fn ehci_hid_held() -> bool {
+fn ehci_hid_busy() -> bool {
     false
+}
+
+/// Account for one deferred pass, and print about it AT MOST [`HCRON_DEFER_NOTES`] times per boot.
+///
+/// The module's stated law — "a volume that vetoes writes must not be able to make the main loop
+/// print forever" ([`HCRON_FLUSH_ATTEMPTS`]) — applied to the other refusal path, which used to be
+/// exempt from it. Two lines get emitted at most: the first deferral, which explains what the reading
+/// does and does not mean, and one at [`HCRON_DEFER_STUCK`] consecutive, which says that the
+/// contention has outlasted any interpretation this witness can choose between. After that the store
+/// is silent about deferral for the rest of the boot.
+///
+/// Retries are NOT bounded, and that is deliberate: deferral is not a failure, it costs one atomic
+/// load per pass, and a legitimately long service pass (an SSP chain runs for seconds) must not cost
+/// the boot its persistence. It does not touch `flush_fails` or `gave_up` either — those count I/O
+/// that was ATTEMPTED and refused by the volume, and no I/O is attempted here.
+fn note_defer() {
+    let n = {
+        let mut s = STORE.lock();
+        s.defers = s.defers.saturating_add(1);
+        s.defers
+    };
+    let first = n == 1;
+    let stuck = n == HCRON_DEFER_STUCK;
+    if !(first || stuck) {
+        return;
+    }
+    // THE BOUND, and it is checked where the print happens so the counter counts OUTPUT, not intent.
+    {
+        let mut s = STORE.lock();
+        if s.defer_notes >= HCRON_DEFER_NOTES {
+            return;
+        }
+        s.defer_notes = s.defer_notes.saturating_add(1);
+    }
+    if first {
+        serial_println!(
+            ":: [hcron] flush deferred — EHCI_HID is held at this instant, so the store write waits for a pass that can PROVE the lock free. This reading is GLOBAL (spin::Mutex::is_locked names no holder): \"held\" means UNKNOWN, NOT that this call site is inside the service pass. Retries continue every pass; the witness does not, and is capped at {} lines this boot == witness ::",
+            HCRON_DEFER_NOTES
+        );
+    } else {
+        serial_println!(
+            ":: [hcron] flush deferred x{} consecutive — EHCI_HID has not been provably free for {} passes. Two readings fit and this witness cannot choose between them: a service pass legitimately holding the lock for a long time (an SSP chain runs for seconds), or a call site issuing the flush from INSIDE the pass. Retries continue, silently; this is the last line the store prints about deferral this boot == witness ::",
+            n, n
+        );
+    }
 }
 
 /// The deferred write. Main-loop context only, and it proves that rather than assuming it.
 ///
-/// Rewrites the whole file when RAM differs from the medium, bumping `seq`. On failure the dirty
+/// Publishes the whole file when RAM differs from the medium, bumping `seq`. On failure the dirty
 /// flag STAYS SET so the next pass retries, bounded at [`HCRON_FLUSH_ATTEMPTS`] consecutive
 /// failures — a write-vetoed volume must not be able to make the main loop print forever.
+///
+/// The write itself is [`publish_store_file`]: stage into the temp leaf, prove it reads back and
+/// parses, then swap it over the live one. The live store is never the thing being written into.
 pub fn flush_if_dirty() {
     {
         let s = STORE.lock();
@@ -834,13 +1134,17 @@ pub fn flush_if_dirty() {
     if crate::drivers::block::info().is_none() {
         return; // no medium to write to yet; stay dirty and retry
     }
-    if ehci_hid_held() {
-        // Not a warning to be tuned out: a flush from inside the EHCI service pass is the bug this
-        // whole seam was designed to avoid, so it is named on the wire and refused.
-        serial_println!(
-            ":: [hcron] flush REFUSED — EHCI_HID is held; the store write is deferred past the service pass BY CONSTRUCTION and this call site is inside it == witness ::"
-        );
+    if ehci_hid_busy() {
+        // Cannot be proven safe on this pass, so nothing is written on this pass. Read the guard's
+        // doc for why this is a deferral and not an accusation; `note_defer` is what keeps a
+        // contended lock from printing once per main-loop pass forever.
+        note_defer();
         return;
+    }
+    // Past the guard: whatever contention there was is over, so the consecutive count starts again.
+    {
+        let mut s = STORE.lock();
+        s.defers = 0;
     }
 
     // Stage the image under the lock (a bounded memcpy), then write with the lock RELEASED — block
@@ -865,7 +1169,9 @@ pub fn flush_if_dirty() {
         }
     };
 
-    let res = write_store_file(HCRON_FILE, &img[..len]);
+    // Stage into the TEMP leaf, prove it reads back and parses, then swap it over the live one. The
+    // previous generation is never the thing being overwritten.
+    let res = publish_store_file(&img[..len]);
     // The staging buffer carried record bodies (link key material, for class 0x01). Zeroize it here,
     // on every path, before the frame goes away.
     for b in img.iter_mut() {
@@ -904,6 +1210,113 @@ pub fn flush_if_dirty() {
         }
     }
 }
+
+// =========================================================================================
+// FIXTURE — the DEFERRAL BOUND, proven by making the guard fire thousands of times
+// =========================================================================================
+
+/// Drive [`flush_if_dirty`] with `EHCI_HID` GENUINELY HELD, more times than the witness budget, and
+/// prove that the guard defers every pass, writes nothing, and goes quiet after
+/// [`HCRON_DEFER_NOTES`] lines.
+///
+/// **Why this exists as an executed fixture rather than an argument.** The defect it closes was not
+/// that the guard was absent; it was that the guard's refusal returned before every budget the module
+/// had, so a contended lock printed once per main-loop pass with nothing to stop it. "It is bounded
+/// now" is a claim about a code path that only runs when the lock is held, which no ordinary gate run
+/// exercises. So the fixture holds the lock itself and makes the path run
+/// `HCRON_DEFER_STUCK + PAST_CAP` times.
+///
+/// **It writes nothing and leaves nothing behind.** Every driven pass takes the deferral return, so
+/// no block I/O is issued at all — which the fixture then PROVES by checking `seq` never moved and
+/// the dirty flag it set is still set. The dirty flag and the deferral accounting are restored
+/// afterwards, so a boot's real budget is not spent by a test; the bound holds independently for the
+/// real path because it is the same code.
+///
+/// `try_lock`, never `lock`: this runs from the main loop, and blocking here to acquire `EHCI_HID`
+/// would hold the very keyboard and trackpad the seam exists to keep free. A pass that cannot take
+/// the lock uninstantly is simply not this fixture's pass — it returns unlatched and retries.
+#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
+pub fn defer_bound_fixture_once() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    /// Passes driven PAST the point where the cap is already reached, to prove the silence is
+    /// permanent and not merely a gap between the two notes.
+    const PAST_CAP: u32 = 64;
+    let driven = HCRON_DEFER_STUCK + PAST_CAP;
+
+    if crate::drivers::block::info().is_none() {
+        DONE.store(false, Ordering::Relaxed); // no medium => the flush returns before the guard
+        return;
+    }
+    let (dirty0, seq0, notes0, defers0, gave_up) = {
+        let s = STORE.lock();
+        (s.dirty, s.seq, s.defer_notes, s.defers, s.gave_up)
+    };
+    if gave_up {
+        serial_println!(
+            ":: [hcron] deferral bound: the store has already given up, so flush_if_dirty returns before the guard — SKIPPED ::"
+        );
+        return;
+    }
+    // Take EHCI_HID for real. Without it the guard reads false and the fixture would prove nothing.
+    let Some(_hid) = crate::drivers::ehci::EHCI_HID.try_lock() else {
+        DONE.store(false, Ordering::Relaxed); // someone is mid-pass — not our turn, retry next pass
+        return;
+    };
+    {
+        let mut s = STORE.lock();
+        s.dirty = true; // the flush must get past its first early-return to reach the guard
+    }
+    for _ in 0..driven {
+        flush_if_dirty();
+    }
+    let (dirty1, seq1, notes1, defers1) = {
+        let s = STORE.lock();
+        (s.dirty, s.seq, s.defer_notes, s.defers)
+    };
+    drop(_hid);
+    // Restore: the fixture's deferrals were synthetic and must not spend the boot's real budget.
+    {
+        let mut s = STORE.lock();
+        s.dirty = dirty0;
+        s.defers = defers0;
+        s.defer_notes = notes0;
+    }
+
+    let emitted = notes1.saturating_sub(notes0);
+    let counted = defers1.saturating_sub(defers0);
+    let no_write = seq1 == seq0 && dirty1;
+    if counted == driven && emitted <= HCRON_DEFER_NOTES && no_write {
+        serial_println!(
+            ":: [hcron] deferral bound: EHCI_HID HELD, flush_if_dirty driven {} times (past the {}-pass escalation and {} further) — every pass deferred, ZERO writes issued (seq unmoved at {}, still dirty), and the witness emitted {} line(s) against a cap of {} -> PASS ::",
+            driven, HCRON_DEFER_STUCK, PAST_CAP, seq0, emitted, HCRON_DEFER_NOTES
+        );
+    } else if counted != driven {
+        serial_println!(
+            ":: [hcron] deferral bound: drove {} passes with EHCI_HID held but only {} reached the guard — the flush is returning somewhere earlier and this fixture proves nothing -> FAIL ::",
+            driven, counted
+        );
+    } else if !no_write {
+        serial_println!(
+            ":: [hcron] deferral bound: a DEFERRED pass issued a write (seq {} -> {}, dirty={}) — the guard did not guard -> FAIL ::",
+            seq0, seq1, dirty1
+        );
+    } else {
+        serial_println!(
+            ":: [hcron] deferral bound: {} deferred passes emitted {} witness lines against a cap of {} — the main loop can print without bound while the lock is contended -> FAIL ::",
+            driven, emitted, HCRON_DEFER_NOTES
+        );
+    }
+}
+
+/// Builds with no `EHCI_HID` to hold: the guard is a compile-time `false` there, so there is no
+/// deferral path to bound and nothing to prove. Kept as a no-op rather than a `cfg` at the call site
+/// so [`service`] reads the same on every arch.
+#[cfg(not(all(target_arch = "x86_64", feature = "ehcihid")))]
+pub fn defer_bound_fixture_once() {}
 
 // =========================================================================================
 // FIXTURE — the CRC refusal path, proven with no hardware at all
@@ -1089,8 +1502,21 @@ fn expect_refusal(what: &str, img: &[u8], want: HcronError) -> u32 {
 }
 
 // =========================================================================================
-// THE SELFTEST — the same load/flush, against the REAL block path
+// THE SELFTEST — the same load/flush, against the REAL block path (`hcronst`)
 // =========================================================================================
+//
+// ITS OWN ARMING KNOB, and the reason is the repo's convention rather than a fresh opinion. The two
+// selftests below (this one and `btbond::selftest_once`) perform BOOT-TIME WRITES TO THE USER'S BOOT
+// MEDIUM: this one writes and unlinks `/HCRON/HCRNTEST.DAT`, and the bond one stages a fixture bond
+// through the real flush, which creates `/HCRON/BTBOND.DAT` and leaves it behind as an empty store.
+// Both check `write_veto()` first and both self-clean, so neither is reckless — but `sdw` gates
+// `sdhc::write_block_512` separately from `sdhcblk` for exactly this reason: in this tree a
+// destructive write gets a dedicated knob, so that arming a MECHANISM is never the same act as
+// arming a TEST that writes.
+//
+// So `holocron` now arms the store alone — the seam M2's real consumer needs, which touches the
+// medium only when a bond is actually staged — and `hcronst` (implies `holocron`) arms these two.
+// Every gate that asserts the round-trip witnesses carries both knobs; see `x86-holocron.spec`.
 
 /// Drive the store's real load and flush against the real FAT volume, once, and clean up after
 /// itself.
@@ -1106,6 +1532,7 @@ fn expect_refusal(what: &str, img: &[u8], want: HcronError) -> u32 {
 ///
 /// Honest-skip when no writable FAT volume is present, which is what a QEMU boot without a FAT image
 /// backing sees.
+#[cfg(feature = "hcronst")]
 pub fn selftest_once() {
     use core::sync::atomic::{AtomicBool, Ordering};
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -1266,8 +1693,11 @@ pub fn selftest_once() {
 ///
 ///   1. the pure fixtures, which need nothing and run on the first pass;
 ///   2. [`load_once`], which needs a block device;
-///   3. the class clients, which need the store loaded before they may answer a lookup;
-///   4. [`flush_if_dirty`], LAST, so a record a client staged this pass reaches the medium this pass
+///   3. [`defer_bound_fixture_once`], which needs a block device and writes NOTHING — it belongs to
+///      `holocron` rather than to `hcronst` for exactly that reason: it proves the guard, not the
+///      medium, so arming the store arms its own bound-proof and nothing that touches the volume;
+///   4. the class clients, which need the store loaded before they may answer a lookup;
+///   5. [`flush_if_dirty`], LAST, so a record a client staged this pass reaches the medium this pass
 ///      — deferred past the driver's lock, not deferred by a whole extra loop iteration.
 ///
 /// **Boot ordering, stated honestly rather than engineered around.** `service_ehci_hid()` — where
@@ -1295,6 +1725,11 @@ pub fn service() {
         return; // no medium yet; nothing below has anything to be right about
     }
 
+    // Writes nothing (every driven pass takes the deferral return), so it is not behind `hcronst`.
+    defer_bound_fixture_once();
+
+    // The two boot-time-write selftests, behind their own arming knob — see the section header above.
+    #[cfg(feature = "hcronst")]
     selftest_once();
 
     #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]

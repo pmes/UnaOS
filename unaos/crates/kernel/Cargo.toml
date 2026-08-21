@@ -574,6 +574,28 @@ btc = ["bt"]
 # DEFAULT OFF => `fs/holocron.rs`, `drivers/ehci/btbond.rs` and every call site vanish, and both
 # arches are byte-identical to a build without the knob. Kept in sync with arroyo.
 holocron = []
+# BT-BOND M1 / HOLOCRON SELFTESTS: `UNAOS_HCRONST=1` arms the store's two BOOT-TIME-WRITE selftests —
+# `fs::holocron::selftest_once` (writes then unlinks `/HCRON/HCRNTEST.DAT`) and
+# `drivers::ehci::btbond::selftest_once` (stages a fixture bond through the real flush, which creates
+# `/HCRON/BTBOND.DAT` and leaves it behind as an empty store).
+#
+# WHY IT IS ITS OWN KNOB. Both check `write_veto()` first and both self-clean, so neither is reckless
+# — but this repo's convention for a destructive write is a DEDICATED arming knob: `sdw` gates
+# `sdhc::write_block_512` separately from `sdhcblk`, so a build can carry the block backend without
+# carrying the card-write. The same shape applies here. `holocron` arms the STORE — the seam M2's real
+# consumer adopts, which touches the medium only when a bond is actually staged — and `hcronst` arms
+# the TESTS that write at boot. Without the split, M2's consumer could not have the store without the
+# selftests' writes to the user's boot medium.
+#
+# Implies `holocron` (the `btc = ["bt"]` shape), so setting this alone arms both. The deferral-bound
+# fixture is deliberately NOT here: it writes nothing (every driven pass takes the guard's deferral
+# return), so it rides `holocron` itself and arming the store arms its own bound-proof.
+#
+# NOT stripped by `arm_features`, for the same reason `holocron` is not: the selftests sit in the
+# arch-neutral seam and emit real aarch64 code, so stripping would silently DISARM the knob there.
+# DEFAULT OFF => both selftests and their call sites vanish. Kept in sync with arroyo and
+# builder/src/main.rs.
+hcronst = ["holocron"]
 # SMOLNET-DEFAULT (2026-07-17): the mature smoltcp TCP/IP stack (ROADMAP §1b) is the DEFAULT x86 net
 # path — the shell's ping/arp/netinfo, the socket syscall family (SOCK-2..7), the DNS sinkhole
 # (zeolite), and the boot witnesses. Pulls in the x86-only smoltcp optional dependency and compiles

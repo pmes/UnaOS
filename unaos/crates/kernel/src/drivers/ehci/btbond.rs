@@ -614,6 +614,14 @@ pub fn codec_fixture() -> bool {
 /// Fixture address `aa:bb:cc:dd:ee:ff` — never a real peer's, so a green run can never be a real
 /// bond's write. Self-cleaning: the record is removed and the removal flushed before the verdict, so
 /// the medium is left as it was found (an empty store file) and a re-run is identical.
+///
+/// **`hcronst`, not `holocron`.** This is a BOOT-TIME WRITE TO THE USER'S BOOT MEDIUM: it drives the
+/// real flush twice and leaves `/HCRON/BTBOND.DAT` behind as an empty store. Self-cleaning is not the
+/// same as not writing, and this repo's convention for a destructive write is a DEDICATED arming knob
+/// (`sdw` gates `sdhc::write_block_512` separately from `sdhcblk`). So arming the store — which M2's
+/// real consumer needs, and which touches the medium only when a bond is actually staged — no longer
+/// implies arming this. See the selftest section header in `fs/holocron.rs`.
+#[cfg(feature = "hcronst")]
 pub fn selftest_once() {
     use core::sync::atomic::{AtomicBool, Ordering};
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -729,9 +737,13 @@ pub fn selftest_once() {
 
 /// The class's main-loop presence, called by [`holocron::service`] once the store is loaded.
 ///
-/// M1 carries exactly one thing here: the store round-trip. M2 adds nothing to this function — the
-/// SSP wiring lives at the Link Key Notification and Link Key Request arms in `mod.rs`, under the
-/// EHCI lock, where `stage_store` and `lookup` are the only calls that may appear.
+/// M1 carries exactly one thing here: the store round-trip, and it is behind `hcronst` because it
+/// writes to the boot medium (see [`selftest_once`]). With `holocron` armed alone this function is
+/// empty, which is the correct M1 shape for the real consumer: the class has no periodic work. M2
+/// adds nothing to it either — the SSP wiring lives at the Link Key Notification and Link Key Request
+/// arms in `mod.rs`, under the EHCI lock, where `stage_store` and `lookup` are the only calls that
+/// may appear.
 pub fn service() {
+    #[cfg(feature = "hcronst")]
     selftest_once();
 }
