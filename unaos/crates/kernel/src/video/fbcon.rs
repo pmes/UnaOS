@@ -446,7 +446,7 @@ impl FbCon {
     fn write_byte(&mut self, b: u8) {
         let mut ops = OpList::<OPS_PER_BYTE>::new();
         self.plan_byte(b, &mut ops);
-        paint_ops(self.draw_fb(), ops.as_slice(), self.fg, self.bg, self.scale, self.aa);
+        paint_ops(self.draw_fb(), ops.as_slice(), self.fg, self.bg, self.scale, self.aa); #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))))] if self.win_store.is_some() && !PANIC_MIRROR.load(Ordering::Relaxed) { super::wcg::seam_glyph_note(true, CONSOLE_WIN.load(Ordering::Relaxed)); } // WCGSEAM — charge the routed glyph write (locked path). Atomics only, and ⚠ ONE LINE for the same reason as `draw_fb`'s aarch64 branch: panic `Location`s below must not renumber.
     }
 
     /// Take the accumulated dirty band and reset it, for a caller that will flush it itself
@@ -1441,7 +1441,7 @@ impl PanelSink {
             // deferring it: the glyphs are in cached RAM that only the compositor reads, `finish` runs
             // before `_print` returns, and the band accumulated here is exactly what the compositor
             // is then told.
-            self.routed = true;
+            self.routed = true; #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] super::wcg::seam_glyph_note(false, CONSOLE_WIN.load(Ordering::Relaxed)); // WCGSEAM — charge the routed glyph write (unlocked split path). ⚠ ONE LINE, line-NEUTRAL, per `draw_fb`'s standing note.
             self.note(band);
             return;
         }

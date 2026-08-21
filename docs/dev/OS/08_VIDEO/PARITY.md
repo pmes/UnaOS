@@ -1437,6 +1437,48 @@ and now the only cause left rather than one of two.
 > the boot seam `[console-route first-paint, detach)`, where `_print` writes the window's SOURCE
 > surface without the lock `draw_window` would need to hold. **Not closed by LIVECON.** See §6.14.
 
+> **DISCRIMINATOR INSTALLED (`exec-wcgwin1b` — WCGSEAM).** §6.14 names two remedy candidates —
+> (a) the console blit takes the `FBCON` lock for the checksum span, or (b) `wcg::begin` declines
+> `win=1` while routed pre-handoff — and deliberately did not choose. WCGSEAM is the instrument the
+> choice needs: a read-only **seam census** that, when `wc-g` convicts `win=1`, says WHO the
+> concurrent writer was, on the wire, in the same boot.
+>
+> **What it reads.** fbcon's two glyph-raster paint sites now charge a census whenever the glyphs
+> landed in the ROUTED console-window surface: the classic per-byte path (`FbCon::write_byte`,
+> under the `FBCON` lock, print context) charges `locked`, x86's unlocked split path charges the
+> remainder. The charge is three relaxed atomics (`SEAM_WRITES`, `SEAM_LAST_CYC`, `SEAM_LOCKED` in
+> `video/wcg.rs`) — no lock, no print, nothing on the render or input path. `wcg::begin` snapshots
+> the counter above `t0` (paid before the copy clock starts, per the `Probe` literal's ordering
+> law); `wcg::end` re-reads it immediately after the `after` leg, so the delta covers exactly the
+> span the checksum trio adjudicates (`blit → civac → after`).
+>
+> **The line, and how to read it.** On a NON-CLEAN `[wc-g]` verdict for the window fbcon charged as
+> the console's, and only then, `end` prints from compositor context:
+>
+> ```
+> [wcgseam] win=1 seq=… verdict=… routed=… glyphs=<boot total> delta=<writes inside this bracket> locked=<lock-held split> last_age_us=<µs since last glyph store> -> GLYPH-RASTER | QUIET-BRACKET
+> ```
+>
+> `delta>0` (`-> GLYPH-RASTER`) is the writer caught inside the bracket — the RACE-BLIT shape, and
+> a direct conviction of the glyph rasteriser. `delta=0` with a small `last_age_us=` is the COHER
+> shape: the store landed just before the bracket opened and only its cache residue is caught.
+> `delta=0` with a LARGE age on a convicting sample would exonerate the glyph path and reopen the
+> writer question — the falsifiable edge that makes this a discriminator rather than a
+> restatement. `locked=` prices remedy (a): an `FBCON` lock on the blit serialises only writers
+> that take the lock, so an unlocked-split share (x86) caps what (a) can buy there, while a census
+> that is 100 % locked says (a) suffices mechanically and the choice against (b) is cost, not
+> reach. On the Pi every charge is the locked classic path; the split is an x86 datum.
+>
+> **Gating and cost.** `witness`-gated and nothing else, exactly as WC-G itself: the census lives
+> in `wcg.rs` (compiled both arches under `witness`), and the two fbcon charge points are
+> `#[cfg(feature = "witness")]`-guarded, line-NEUTRAL one-line appends (§5.3 — no panic `Location`
+> in `fbcon.rs` renumbers, knob-off images stay byte-identical). The `[wcgseam]` line rides the
+> sample line's budget one-for-one and adds no unbudgeted serial. It is a NEW tag: no pi4 FORBID or
+> REQUIRE matches it, none was added, and none should be until the bench has spoken — an armed
+> bench-geometry capture (`UNAOS_FBW=1920 UNAOS_FBH=1200`) with the standing `win=1` reds now
+> carries one `[wcgseam]` line per conviction, which is the reading the remedy decision waits on.
+> NOT a remedy: no behaviour changes, and the standing red count is unchanged by construction.
+
 ### 6.9d Two OWED items this arc measured and did not take
 
 1. **The dock paints over WC-F's twin box.** `wcf::reserved` seats the twins at `ph-MARGIN-SIDE` —
