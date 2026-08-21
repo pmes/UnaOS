@@ -759,6 +759,51 @@ impl EventQueue {
         self.head.wrapping_sub(self.tail) % QUEUE_SIZE
     }
 
+    /// PTRDEAD — **fold a RELATIVE motion into the ring's newest entry when that entry is also a
+    /// relative motion.** Returns `true` when it was folded (no slot taken).
+    ///
+    /// Relative pointer deltas are ADDITIVE: `Mouse{a}` then `Mouse{b}` moves the cursor exactly as
+    /// far as one `Mouse{a+b}`, because the only consumer of either is `cursor::move_rel`, which
+    /// adds. So a BACKLOG of relative motion is compressible without losing a pixel — and it is the
+    /// backlog, not the report rate, that the operator feels.
+    ///
+    /// **Why it exists — metal, boot 10, the post-drop dead zone.** The x86 pointer pipeline is
+    /// EHCI -> this ring -> `GUI_CHANNEL_X86` -> the render service, and the render service is where
+    /// every queued motion is charged a full `wc_route_event` + witness line + `wc_route_tail`. At a
+    /// drop that core stalls for the length of the drop's own witness burst (`[dragrel]` + `[drag]` +
+    /// `[drag-occ]` + `[dropwake]`, and a five-second `[cursor*]` rollup if one lands there); the pad
+    /// keeps reporting at ~125 Hz; and when the core comes back it REPLAYS the backlog one event at a
+    /// time, each costing another line on the wire. The arrow then crawls along a path the hand left
+    /// long ago — which is what "the cursor is frozen for the first fifth of the pad" is: not lost
+    /// travel, a queue being walked. Folding the backlog into ONE entry makes the catch-up a single
+    /// `move_rel` to where the hand actually is.
+    ///
+    /// It also removes the only way relative travel can be LOST outright: a ring that fills
+    /// (`EVQ_DROP_PTR`) throws away deltas nothing can reconstruct. Motion that folds cannot fill it.
+    ///
+    /// **Only the NEWEST entry, and only `Event::Mouse`.** Anything else in front of it (a `Button`,
+    /// a key, an absolute report) blocks the fold, so no event ever crosses another and the order the
+    /// ring hands back is the order it took in. `MouseAbsolute` is deliberately NOT folded: absolute
+    /// positions are not additive, and the QEMU fixtures that assert exact resting coordinates drive
+    /// that variant.
+    ///
+    /// `saturating_add` because the fold is unbounded in principle — a long enough stall could sum
+    /// past `i32`, and a wrapped delta would throw the arrow across the panel.
+    fn coalesce_relative_motion(&mut self, dx: i32, dy: i32) -> bool {
+        if self.head == self.tail {
+            return false; // empty ring: nothing to fold into
+        }
+        let last = (self.head + QUEUE_SIZE - 1) % QUEUE_SIZE;
+        if let Event::Mouse { x, y } = self.buffer[last] {
+            self.buffer[last] = Event::Mouse {
+                x: x.saturating_add(dx),
+                y: y.saturating_add(dy),
+            };
+            return true;
+        }
+        false
+    }
+
     /// DRAGGLIDE — put the just-pushed release BUTTON ahead of the MOTION immediately behind it.
     ///
     /// The two newest entries only, and only in the one shape this is written for: a pointer motion
@@ -842,6 +887,22 @@ static EVQ_DROP_PTR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 static EVQ_DROP_KEY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Events successfully popped by ANY consumer (the router drain, a user focus discard, `pump_and_poll`, …).
 static EVQ_POP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// PTRDEAD — relative-motion reports FOLDED into the ring's newest entry rather than given a slot
+/// of their own (see [`EventQueue::coalesce_relative_motion`]).
+///
+/// Deliberately NOT counted in `EVQ_PUSH_PTR`, and the reason is the conservation law: `push - drop
+/// - pop` is read as the live ring OCCUPANCY, and a folded report never becomes an entry, so
+/// counting it as a push would drift that reading permanently high — exactly the hole
+/// `note_uncounted_discard` exists to keep out of the ledger. It gets its own term instead, which is
+/// also the one that answers the operator's question: a nonzero reading means the drain fell behind
+/// the pad and the arrow was handed the whole backlog at once instead of walking it.
+static EVQ_COALESCE_PTR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// PTRDEAD — relative-motion reports folded into a queued motion instead of taking a ring slot
+/// (see [`EVQ_COALESCE_PTR`]). Monotonic; 0 on a boot where the drain never fell behind the pad.
+pub fn pointer_motion_coalesced() -> u64 {
+    EVQ_COALESCE_PTR.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 /// UVUG-10 — `(push_ptr, push_key, drop_ptr, drop_key, pop)`. Read by the router's `[uvug10] evq` witness.
 pub fn event_queue_stats() -> (u64, u64, u64, u64, u64) {
@@ -1033,13 +1094,38 @@ enum LiftHint {
 ///
 /// DRAGGLIDE — the REORDER joins them, and it must: it reads the two newest ring entries and the
 /// push-adjacency record, both of which a concurrent producer would move under it.
-fn push_locked(q: &mut EventQueue, event: Event, lift: LiftHint) -> bool {
+///
+/// PTRDEAD — `coalesce` says this push MAY be folded into a queued relative motion (see
+/// [`EventQueue::coalesce_relative_motion`]). It is a parameter and not a property of the event
+/// because the decision belongs to the CALLER's shape, not to the event's type: only a motion-ONLY
+/// pointer report may fold. A motion pushed as half of a paired report must keep its own slot, or
+/// the DRAGGLIDE reorder would hoist the release edge over travel from EARLIER reports as well as
+/// over its own lift and end the drag short; and `push_event`'s callers (the boot selftests, the
+/// typematic injector, any synthesiser) keep the exact shape they had before this arc.
+fn push_locked(q: &mut EventQueue, event: Event, lift: LiftHint, coalesce: bool) -> bool {
     use core::sync::atomic::Ordering::Relaxed;
     let is_ptr = matches!(
         event,
         Event::Mouse { .. } | Event::MouseAbsolute { .. } | Event::Button(_)
     );
     let is_key = matches!(event, Event::Key(_) | Event::KeyUp(_));
+    // PTRDEAD — the fold, taken BEFORE the push accounting so a folded report is never counted as an
+    // entry that exists (see [`EVQ_COALESCE_PTR`] for the conservation argument). The adjacency
+    // record is still advanced: the newest ring entry is still a motion, and it is still the one an
+    // `Unknown`-hinted `Button` pushed next would have to get in front of, so the sequence and the
+    // stamp must describe THIS push or the heuristic would judge against a stale one.
+    if coalesce {
+        if let Event::Mouse { x, y } = event {
+            if q.coalesce_relative_motion(x, y) {
+                EVQ_COALESCE_PTR.fetch_add(1, Relaxed);
+                let seq = PUSH_SEQ.fetch_add(1, Relaxed);
+                MOTION_SEQ.store(seq, Relaxed);
+                MOTION_MS.store(crate::arch::ms(), Relaxed);
+                crate::rtwit::note_input_enqueued();
+                return true;
+            }
+        }
+    }
     if is_ptr {
         EVQ_PUSH_PTR.fetch_add(1, Relaxed);
     } else if is_key {
@@ -1127,7 +1213,10 @@ pub fn push_event(event: Event) {
         // release), timing the acquire→release critical section (the push plus the DRAGGLIDE reorder
         // under `push_locked`). No-op inline shim when `rtwit` is off; no change to lock semantics.
         let _evh = crate::rtwit::hold(crate::rtwit::Lock::Evq);
-        push_locked(&mut q, event, LiftHint::Unknown);
+        // PTRDEAD — `coalesce: false`. This is the generic seam (selftests, synthesisers, any
+        // producer that is not a decoded pointer report); it keeps the exact one-event-one-slot shape
+        // it had before the fold existed, so no fixture's event count moves.
+        push_locked(&mut q, event, LiftHint::Unknown, false);
     });
 }
 
@@ -1155,24 +1244,39 @@ pub fn push_event(event: Event) {
 pub fn push_pointer_report(motion: Option<Event>, button: Option<Event>) {
     match (motion, button) {
         (None, None) => {}
-        (Some(m), None) => push_event(m),
+        // PTRDEAD — a motion-ONLY report is the one shape that may FOLD into a queued relative
+        // motion. Nothing is behind it that a later edge has to be told apart from it, so summing it
+        // into the entry in front changes neither order nor total travel — and it is the shape the
+        // pad emits between the edges of a gesture, i.e. the whole backlog.
+        (Some(m), None) => crate::arch::without_interrupts(|| {
+            let mut q = EVENT_QUEUE.lock();
+            // R0 / rtwit — EVENT_QUEUE max-hold (see `push_event`).
+            let _evh = crate::rtwit::hold(crate::rtwit::Lock::Evq);
+            push_locked(&mut q, m, LiftHint::Unknown, true);
+        }),
         (None, Some(b)) => crate::arch::without_interrupts(|| {
             let mut q = EVENT_QUEUE.lock();
             // R0 / rtwit — EVENT_QUEUE max-hold (see `push_event`).
             let _evh = crate::rtwit::hold(crate::rtwit::Lock::Evq);
-            push_locked(&mut q, b, LiftHint::NoLift);
+            push_locked(&mut q, b, LiftHint::NoLift, false);
         }),
         (Some(m), Some(b)) => crate::arch::without_interrupts(|| {
             let mut q = EVENT_QUEUE.lock();
             // R0 / rtwit — EVENT_QUEUE max-hold (see `push_event`).
             let _evh = crate::rtwit::hold(crate::rtwit::Lock::Evq);
             // A lift the ring DROPPED is not behind the edge, so the pairing claim dies with it.
-            let hint = if push_locked(&mut q, m, LiftHint::Unknown) {
+            //
+            // PTRDEAD — `coalesce: false`, and it is load-bearing. This motion is the release
+            // report's own LIFT, and the reorder below is about to put the edge in FRONT of it
+            // precisely so the lift cannot steer. Folded into an earlier motion the two would be one
+            // entry, and hoisting the edge over it would carry pre-release hand travel behind the
+            // edge as well — the drag would end short, which is the glide DRAGGLIDE removed.
+            let hint = if push_locked(&mut q, m, LiftHint::Unknown, false) {
                 LiftHint::Paired
             } else {
                 LiftHint::NoLift
             };
-            push_locked(&mut q, b, hint);
+            push_locked(&mut q, b, hint, false);
         }),
     }
 }

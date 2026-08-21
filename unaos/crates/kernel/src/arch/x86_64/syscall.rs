@@ -6448,6 +6448,145 @@ fn drag_settle_disarm() {
     DRAG_LEAD_MOTIONS.store(0, Ordering::Relaxed);
 }
 
+/// PTRDEAD — **the post-drop DEAD ZONE: a relative-motion BACKLOG must reach the arrow as one move,
+/// not as a queue the drain walks.**
+///
+/// ### The defect, measured rather than argued
+/// Boot 10 (rMBP, 2026-08-19): after a drag-and-drop the cursor is dead for roughly the first fifth
+/// of the trackpad's width. The `USB-DEBUG: MOUSE` trace in that capture is the pointer's own
+/// heartbeat — one line per motion event ROUTED — and its cadence is 8 ms flat while the hand moves.
+/// Around every gesture end it opens a hole, and the hole's length is the console's byte count and
+/// nothing else: across 40+ samples spanning 50 to 4000 characters, `gap ≈ chars / 11.5 ms` with a
+/// median residual of 3.6 ms (115200 baud, one line per character-time). A drop emits the largest
+/// burst on the pointer path — `[dragrel]`, `[wm-act] drag-end`, `[drag]`, `[drag-occ]`, `[dropwake]`,
+/// ~1 kB, and up to 3.5 kB when a five-second `[cursor*]`/`[wcn]` rollup lands beside it — so the
+/// drop is where the hole is biggest: 80 ms to 350 ms.
+///
+/// The pad does not stop during that hole and it does not accumulate across it either: the deltas on
+/// the far side are the same magnitude as the near side (13 per report, not summed), so the backlog
+/// is REAL EVENTS, queued. When the drain returns it replays them one at a time — and on a build with
+/// the pointer trace on, each replayed event costs another line, so the queue drains barely faster
+/// than it fills. The arrow walks a path the hand left a fifth of a trackpad ago. That is the dead
+/// zone: not lost travel, a queue being walked.
+///
+/// ### What this leg asserts, and what is RED without the fold
+/// `pal::push_pointer_report(Some(Mouse), None)` — the motion-only shape, which is every report
+/// between the edges of a gesture — now FOLDS into a queued relative motion instead of taking a ring
+/// slot (`pal::EventQueue::coalesce_relative_motion`). Three legs, each a different failure
+/// direction:
+///
+///  * **`whole`** — `QUEUE_SIZE * 3` motion reports pushed with nothing draining arrive as ONE entry
+///    carrying the EXACT total. **Red pre-fix in two independent ways**: the ring holds 63, so the
+///    entry count reads 63 rather than 1, and the other 129 reports are DROPPED (`EVQ_DROP_PTR`),
+///    so the summed travel is short by more than two thirds. That drop is the one way relative
+///    travel can be lost outright, and it is what a long stall does today. **Load-bearing.**
+///  * **`nodrop`** — and the drop counter did not move at all. Stated separately from the sum
+///    because a producer that folded but still charged a drop would be lying in the ledger the
+///    `[uvug10] evq` conservation law is read from.
+///  * **`order`** — a `Button` between two motions BLOCKS the fold: `[M1][B][M1][M1]` comes back as
+///    exactly `[M1][B][M2]`, in that order. This is what says the fold can never carry an event
+///    across another one — the property every consumer downstream of this ring relies on, and the
+///    one a naive "sum all queued motion" would break. **Red on any fold that ignores the entry
+///    type.**
+///
+/// Headless by construction: it drives `pal` alone — no panel, no window table, no pointer — so the
+/// QEMU gate exercises it exactly as metal does.
+///
+/// Self-cleaning: it empties the ring before it starts (witnessed, because on metal that discards
+/// whatever the hand was doing at boot), drains everything it pushed, and puts the producer's button
+/// mask and the release-edge count back where it found them.
+#[cfg(feature = "witness")]
+pub fn ptrdead_selftest() {
+    use crate::pal::Event;
+    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // Empty the ring, bounded by its own capacity, and say so: this fixture asserts an EXACT entry
+    // count, so anything a boot selftest or a real HID report left standing would be counted as part
+    // of the run. On metal the discard eats real operator input, which is worth a line.
+    let mut discarded = 0u32;
+    for _ in 0..crate::pal::QUEUE_SIZE_PUB {
+        if crate::pal::next_event().is_none() {
+            break;
+        }
+        discarded += 1;
+    }
+    if discarded != 0 {
+        serial_println!("[ptrdead] leg-drain discarded={} queued event(s)", discarded);
+    }
+
+    // Leg 1/2 — the BACKLOG. Three ring-fulls of motion-only reports, nothing draining.
+    let n = crate::pal::QUEUE_SIZE_PUB * 3;
+    let (_, _, drop0, _, _) = crate::pal::event_queue_stats();
+    let fold0 = crate::pal::pointer_motion_coalesced();
+    for _ in 0..n {
+        crate::pal::push_pointer_report(Some(Event::Mouse { x: 1, y: -1 }), None);
+    }
+    let (mut sx, mut sy, mut entries) = (0i32, 0i32, 0u32);
+    for _ in 0..crate::pal::QUEUE_SIZE_PUB {
+        match crate::pal::next_event() {
+            Some(Event::Mouse { x, y }) => {
+                sx += x;
+                sy += y;
+                entries += 1;
+            }
+            Some(_) => entries += 1,
+            None => break,
+        }
+    }
+    let (_, _, drop1, _, _) = crate::pal::event_queue_stats();
+    let whole = entries == 1 && sx == n as i32 && sy == -(n as i32);
+    let nodrop = drop1 == drop0;
+
+    // Leg 3 — the fold may not cross a `Button`. Pushed through the same producer seams a decoded
+    // report uses: motion-only folds, a bare button does not, and the motion after the button starts
+    // a new entry because the newest entry is no longer a motion.
+    for _ in 0..crate::pal::QUEUE_SIZE_PUB {
+        if crate::pal::next_event().is_none() {
+            break;
+        }
+    }
+    crate::pal::push_pointer_report(Some(Event::Mouse { x: 1, y: 0 }), None);
+    crate::pal::push_pointer_report(None, Some(Event::Button(1)));
+    crate::pal::push_pointer_report(Some(Event::Mouse { x: 1, y: 0 }), None);
+    crate::pal::push_pointer_report(Some(Event::Mouse { x: 1, y: 0 }), None);
+    let order = matches!(crate::pal::next_event(), Some(Event::Mouse { x: 1, y: 0 }))
+        && matches!(crate::pal::next_event(), Some(Event::Button(1)))
+        && matches!(crate::pal::next_event(), Some(Event::Mouse { x: 2, y: 0 }))
+        && crate::pal::next_event().is_none();
+
+    // Put the producer back: a `Button(0)` closes the mask this leg opened (the producer tracks the
+    // primary transition, so leaving it SET would make the next real release a 1 -> 0 this fixture
+    // manufactured), and the edge it counts is drained here rather than left for the drag belt.
+    crate::pal::push_pointer_report(None, Some(Event::Button(0)));
+    for _ in 0..crate::pal::QUEUE_SIZE_PUB {
+        if crate::pal::next_event().is_none() {
+            break;
+        }
+    }
+    for _ in 0..8 {
+        if crate::pal::release_edge_pending() == 0 {
+            break;
+        }
+        crate::pal::note_release_edge_drained();
+    }
+
+    serial_println!(
+        "[ptrdead] backlog whole={} nodrop={} order={} pushed={} entries={} travel=({},{}) folded={} dropped={} -> {}",
+        whole,
+        nodrop,
+        order,
+        n,
+        entries,
+        sx,
+        sy,
+        crate::pal::pointer_motion_coalesced() - fold0,
+        drop1 - drop0,
+        if whole && nodrop && order { "PASS" } else { "FAIL" }
+    );
+}
+
 /// WMDIRECT — **THE X86 EVENT-ROUTING CHAIN, AS ONE FUNCTION.** Both x86 drains (the BSP GUI loop
 /// and the SCHED-X86 render service) called an identical three-line `if/else if/else` inline; this
 /// is that chain, named once.
@@ -16496,6 +16635,14 @@ fn winx_launcher(demo_cpu: usize) {
     // is a `move_to`, which pins the row against the tiler) and closes it under a live drag, so it
     // is the most disruptive of the three. Running it after the other two means neither of them can
     // inherit a pinned fixture or a re-tiled panel.
+    // PTRDEAD — the pointer BACKLOG leg, and it goes immediately ahead of `wmdirect_selftest`
+    // deliberately. It mints no row, touches no window table and needs no panel — it drives `pal`
+    // alone — so it is the least disruptive fixture in this ladder and could sit almost anywhere;
+    // what it DOES do is empty `EVENT_QUEUE`, exactly as `wmdirect_selftest`'s own legs 9 and 10 do
+    // for the same reason. Putting the two adjacent means one stretch of the boot owns that
+    // discard instead of two, and no fixture between them can lose an event to it.
+    #[cfg(feature = "witness")]
+    ptrdead_selftest();
     #[cfg(all(feature = "witness", feature = "wc"))]
     wmdirect_selftest();
     // DMGOVLP — the overlap-forcing damage leg, and the ladder's new tail. Six kernel-band rows in

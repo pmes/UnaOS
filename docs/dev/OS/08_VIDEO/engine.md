@@ -10249,6 +10249,109 @@ detector:
 arc closes needs a lost release plus a hand that stops and starts. **The metal falsifier is the whole
 verdict: drag, drop, stop, move — the window stays put; no trail.**
 
+## PTRDEAD — the post-drop dead zone is a queue being walked, not travel being lost (2026-08-21)
+
+**Peter's report, boot 10 on the rMBP.** GHOST-DRAG's trail is **gone** — and in its place, after a
+drop, the **cursor** is dead for roughly the first fifth of the trackpad's width. The glass is
+exonerated (`dropwake` 6/6 CLEAN, `rel->glass=0`), so this is input-side.
+
+### The GHOST-DRAG discriminator is REFUTED as the cause, and the capture says so
+
+The standing hypothesis was that `wc_drag_motion`'s post-release branch swallows the motion. It
+cannot, for two reasons that are both on the wire:
+
+* **The branch never ran.** Every gesture in the boot-10 slice ends
+  `[dragrel] … end=edge lead=0 pend=0 ring=0 wait=0ms`. `wait=0ms` means `DRAG_LEVEL_UP_MS` was never
+  set — the tail never once saw a motion with the button level up while a drag was live.
+* **It could not reach the cursor even if it had.** `wc_drag_motion` returns on its first line once
+  `wm::drag_active() == WIN_NONE`, and it never touches `pal::cursor` at all: the position is applied
+  by the drain's `Mouse` arm or by `cursor::track_routed` **before** `wc_route_tail` runs.
+
+### The mechanism, measured
+
+`USB-DEBUG: MOUSE` is one line per motion event ROUTED — the pointer's own heartbeat. In the boot-10
+slice its cadence is **8 ms flat** while the hand moves, and around every gesture end it opens a hole
+whose length is the console's byte count and nothing else. Across 40+ samples spanning 50 to 4000
+characters: **`gap ≈ chars / 11.5 ms`**, median residual 3.6 ms — 115200 baud, one line per
+character-time. Representative pairs: `chars=681 → 60 ms`, `chars=724 → 71 ms`, `chars=3076 →
+257 ms`, `chars=3489 → 310 ms`.
+
+The drop is where the hole is biggest because it emits the largest burst on the pointer path —
+`[dragrel]`, `[wm-act] drag-end`, `[drag]`, `[drag-occ]`, `[dropwake]`, ~1 kB, and up to 3.5 kB when a
+five-second `[cursor*]`/`[wcn]` rollup lands beside it. Measured post-release holes: 76, 79, 85, 85,
+86 ms, and 262/352 ms where a rollup coincided.
+
+The pad neither stops nor accumulates across the hole: the deltas on the far side are the same
+magnitude as the near side (13 per report, not summed). So the hole is **real events, queued** —
+`x86_usb_pump` keeps pushing at the pad's ~125 Hz while the render service is inside the burst. When
+that core returns it **replays the backlog one event at a time**, each replayed motion costing another
+`wc_route_event` + witness line + `wc_route_tail`; with the pointer trace armed each costs ~4.3 ms of
+the 8 ms interval, so the queue drains barely faster than it fills. The arrow walks a path the hand
+left a fifth of a trackpad ago. **The dead zone is latency, not loss** — and where the backlog does
+overflow a ring, it becomes loss as well.
+
+Note the shape of it: **ghost-drop's cure built the dead zone.** The witnesses added to chase the
+trail (`[dropwake]`, `[drag-occ]`) are a large part of the burst that now starves the pointer.
+
+### The fix — fold the backlog at the producer
+
+`pal::EventQueue::coalesce_relative_motion`. Relative deltas are **additive**: the only consumer of
+either is `cursor::move_rel`, which adds. So `push_pointer_report(Some(Mouse), None)` — the motion-only
+shape, i.e. every report between the edges of a gesture — now **folds into the ring's newest entry when
+that entry is also a relative motion**, instead of taking a slot. The catch-up becomes one `move_rel`
+to where the hand actually is.
+
+Three things the fold deliberately does **not** do:
+
+* **It never crosses another event.** Only the newest entry, and only `Event::Mouse`; a `Button`, a
+  key or an absolute report in front of it blocks the fold. Order out is order in.
+* **It never folds a release report's own LIFT.** `push_pointer_report(Some(m), Some(b))` passes
+  `coalesce: false`, because DRAGGLIDE is about to put the edge in front of exactly that motion —
+  folded into earlier travel, the hoist would carry pre-release hand travel behind the edge and end
+  the drag short. **This is what keeps ghost-drag dead**, and `[wm-act] direct` legs 9 (`settle`) and
+  10 (`lead`) are the assertion.
+* **It never folds `MouseAbsolute`**, and `push_event` never folds at all — so every fixture that
+  asserts an exact resting coordinate, and every synthesiser, keeps the shape it had.
+
+`EVQ_COALESCE_PTR` is its own ledger term rather than a push, so `push - drop - pop` still reads as
+live ring occupancy; `pal::pointer_motion_coalesced()` is the accessor.
+
+### The leg, and it bites
+
+`[ptrdead]` in `arch/x86_64/syscall.rs`, headless (it drives `pal` alone), in the witness battery
+immediately ahead of `wmdirect_selftest`:
+
+```text
+GREEN: [ptrdead] backlog whole=true  nodrop=true  order=true  pushed=192 entries=1  travel=(192,-192) folded=192 dropped=0   -> PASS
+RED:   [ptrdead] backlog whole=false nodrop=false order=false pushed=192 entries=63 travel=(63,-63)   folded=0   dropped=129 -> FAIL
+```
+
+The RED calibration is the fold disabled and nothing else. `whole` is load-bearing twice over — entry
+count and exact total travel; `nodrop` says the ledger was not lied to; `order` drives
+`[M1][B][M1][M1]` and requires exactly `[M1][B][M2]`, which is what forbids a fold that ignores the
+entry type.
+
+### What is NOT closed, and it is out of this lane
+
+The fold caps the damage at the ring. The burst itself, and two seams that amplify it, are untouched:
+
+* `main.rs` `x86_usb_pump` runs `xhci.service_ftdi()` **ahead of** `ehci::service_ehci_hid()` in the
+  same single-threaded pass, and `drain_ftdi` is documented as draining "until the ring is empty".
+  Every console character therefore delays the next pointer service.
+* The EHCI interrupt endpoint holds **exactly one report** and cannot be made to hold more on this
+  silicon: the pad's mps is 64 while its 0x02 reports are 8 bytes, so every report is a SHORT packet
+  and retires the qTD — the multi-packet arming the `mtraw` path uses is unavailable here. Reports
+  generated while the endpoint is dark are dropped on the wire, **uncounted** — there is no census for
+  them anywhere in the driver.
+* `usbdebug_event_print` (main.rs) costs ~49 characters — about 4.3 ms — **per pointer report** on the
+  build Peter flies. The pointer path spends more than half its budget printing itself.
+* `GUI_CHANNEL_X86` (64 slots, blocking `send`) carries the backlog on the SCHED-X86 split and has no
+  fold of its own; the ring-side fold only fires once the channel has backed the input service up.
+
+**The metal falsifier for what DID land:** drag, drop, then move immediately. The arrow should arrive
+where the hand is rather than crawling there — and `pal::pointer_motion_coalesced()` reading nonzero
+is the proof the drain fell behind and the fold caught it.
+
 ## PAPER — the kit's content-surface texture, ported to integer Q16 (2026-08-09)
 
 `video/paper.rs`. The Crispy kit's `content_surface.Paper` block — the one part of
