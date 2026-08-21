@@ -269,6 +269,19 @@ struct IntEp {
     /// KBDWIT-2 — the `SILENCE-BROKE` one-shot. At most one such line per endpoint per boot.
     #[cfg(feature = "kbdwit")]
     kbdwit_broke: bool,
+    /// KBDWIT-LATCH — the `SILENCE-CUT-BY-HALT` one-shot: a halt that arrived BEFORE this endpoint
+    /// ever reached its silence deadline. At most one such line per endpoint per boot.
+    ///
+    /// Deliberately a SEPARATE latch from [`IntEp::kbdwit_broke`] rather than a third user of it.
+    /// The two describe different instants and a single endpoint can legitimately reach both: with
+    /// KBDFLAP's bounded `ClearFeature(ENDPOINT_HALT)` recovery in the path, an endpoint may be cut
+    /// short by a stall at 2.4 s, be cleared and re-armed, go quiet, fire the deadline dump, and
+    /// only then break its silence. Sharing one latch would have made those mutually exclusive and
+    /// silently dropped whichever came second — reintroducing, one layer down, the exact failure
+    /// this arc is closing. Two latches means at most two KBDWIT lines per endpoint per boot, which
+    /// is still a constant, and the pair reads as the sequence it was.
+    #[cfg(feature = "kbdwit")]
+    kbdwit_cut: bool,
     /// MT-INVESTIGATION (IVY, `mtraw` only): bytes ONE armed transfer may accept — `mps` for every
     /// endpoint except the vendor-multitouch one, which is armed for the whole (grown) receive
     /// buffer so the controller accumulates a >MPS raw frame into it. See `arm_interrupt_ep`.
@@ -11769,6 +11782,8 @@ impl Controller {
             kbdwit_split_or: 0,
             #[cfg(feature = "kbdwit")]
             kbdwit_broke: false,
+            #[cfg(feature = "kbdwit")]
+            kbdwit_cut: false,
             #[cfg(feature = "mtraw")]
             rx_total,
             #[cfg(feature = "mtraw_inject")]
@@ -11866,6 +11881,32 @@ impl Controller {
         let mut mt_dumped = if self.mt_probe.is_some() { Some(self.mt_dumped) } else { None };
         for (ep_i, e) in self.int_eps.iter_mut().enumerate() {
             if e.dead {
+                // KBDWIT-LATCH: a retired endpoint is no longer SERVICED, but it must still be able
+                // to reach the instrument that reports on it. Before this, the bare `continue` here
+                // was the second half of the boot-10 blind spot: the internal keyboard was retired
+                // at 2444 ms, this branch swallowed it on every pass thereafter, and the dump that
+                // ran at 15219 ms listed the three endpoints that were still alive and simply did
+                // not mention the one that had died. Absence from a dump is evidence only if
+                // presence was possible; here it was not, so "retired at 2444 ms" and "never armed
+                // at all" produced byte-identical media.
+                //
+                // Retirement does NOT unlink the QH from the periodic list and does not free the
+                // qTD — `dead` only stops this loop from consuming completions — so every word the
+                // probe reads is still the controller's own live state, and reading it stays
+                // read-only exactly as on the live path.
+                //
+                // Gated on `kbdwit_fired` HERE and not only inside the probe: after the single dump
+                // this endpoint will ever emit, a retired endpoint must cost one predictable bool
+                // test per pass, not a volatile read of the overlay for the rest of the boot.
+                #[cfg(feature = "kbdwit")]
+                if !e.kbdwit_fired {
+                    let tok = if om {
+                        core::ptr::read_volatile(&(*e.qh).overlay[2])
+                    } else {
+                        core::ptr::read_volatile(&(*e.qtd).token)
+                    };
+                    kbdwit_probe(e, idx, om, kw_op, kw_fl, tok);
+                }
                 continue;
             }
             let tok = if om {
@@ -11908,8 +11949,17 @@ impl Controller {
                 // KBDWIT-2: the silence ended, but it ended in a HALT — see
                 // `kbdwit_note_silence_end` for why this exit gets its own verdict word instead of
                 // sharing `SILENCE-BROKE` with the clean one below.
+                //
+                // KBDWIT-LATCH: routed through `kbdwit_note_halt` rather than straight at
+                // `kbdwit_note_silence_end`, because that function's first act is to return when
+                // the deadline dump has not fired — and on boot 10 it had not, and could not have:
+                // the halt landed at 2444 ms and the earliest service pass that could have reached
+                // the deadline was 15219 ms. A halt that BEATS the deadline is precisely the case
+                // KBDWIT exists to catch, and it was the one case KBDWIT could not say a word
+                // about. `kbdwit_note_halt` keeps the post-deadline exit byte-identical and adds
+                // the pre-deadline one.
                 #[cfg(feature = "kbdwit")]
-                kbdwit_note_silence_end(e, idx, "SILENCE-ENDED-HALTED", tok);
+                kbdwit_note_halt(e, idx, tok);
                 // KBDFLAP: WHICH endpoint, decided from the QH's OWN `ep_chars` — the word the
                 // controller is executing — rather than from a software copy, for the same reason
                 // KBDWIT decodes its identity that way. Boot 10's version of this line carried a
@@ -12431,6 +12481,84 @@ fn halt_class(tok: u32) -> (&'static str, bool) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
+// BTPROXY (2026-08-21) — the two endpoints that have never carried a byte, and why they STAY
+// ARMED. A finding, not a change. Recorded here so the next reader does not re-derive it.
+//
+// `05ac:820a` and `05ac:820b` are armed on every rMBP boot as `keyboard`/`boot-mouse` and have
+// produced ZERO reports in the entire bench corpus. The question put to this arc was whether the
+// arm should be skipped, deferred, or left alone. The answer is LEFT ALONE, and the evidence runs
+// against the premise rather than merely failing to support a change.
+//
+// WHAT THE CORPUS SAYS (204 MB, 418 files, 40 boots that enumerate the pair):
+//
+//   * `reports=0` in every KBDWIT block that names them — four blocks in four different captures,
+//     each `class=never-completed last_ms=0`. There is no `keyboard raw report` or `boot-mouse raw
+//     report` line anywhere in the corpus; every report-payload line belongs to the internal
+//     trackpad or the internal keyboard.
+//   * 37 halt pairs are recorded across the corpus — `0x00088141` + `0x00048141`, CERR burned to
+//     0 with the TT answering ERR, i.e. the `xact-err-burn` arm above — against 4 boots that leave
+//     them sitting Active forever at `0x00088d80` / `0x00048d80`, never granted a complete-split.
+//     (37 + 4 covers the 40 enumerating boots plus one truncated capture that shows only the
+//     halt.) Both states are "no data", reached by two different routes.
+//   * No boot has ever re-armed or recovered one: no `HALT-CLEAR`, no `ClearFeature`, and no token
+//     appearing twice in a boot.
+//
+// WHAT THEY ARE. Ports 1, 2 and 3 of the Broadcom hub `0a5c:4500` hold `05ac:820a`, `05ac:820b`
+// and `05ac:8286` — and that third one is the Bluetooth controller itself (bt-l0's census reads
+// `neps=3 eps=[IN1/int/16 IN2/blk/64 OUT2/blk/64]`, the canonical USB-BT event/ACL endpoint
+// layout). Two boot-protocol HID functions sitting beside an HCI function on one card is the
+// standard Bluetooth HID PROXY arrangement: card firmware presents a bonded BT keyboard/mouse as
+// a plain USB boot device so it works before any BT stack exists. Caveat, stated because it is
+// load-bearing and unproven: the corpus never dumps an interface descriptor for either, so the
+// classification rests on the topology, `class=0x00` + boot-protocol interfaces, and mps 8/4.
+//
+// SO `reports=0` IS NOT A FAULT. A HID proxy with nothing bonded to proxy is CORRECT when it
+// reports nothing, forever. The premise "these endpoints are broken and should not be armed"
+// is not established by the silence; the silence is what a working proxy with no peer looks like.
+//
+// THE THREE COSTS, PRICED:
+//
+//   * TT bandwidth — REFUTED BY THE TOPOLOGY. The proxies sit on `tt=(hub 3 port 1)`; the internal
+//     keyboard and trackpad sit on `tt=(hub 3 port 2)`. Different ports of a multi-TT hub means
+//     different transaction translators, so these endpoints take no bandwidth from the input path
+//     that matters. This cost does not exist.
+//   * An endpoint slot — real but not scarce: `MAX_INT_EPS` is 6 and this bench arms four.
+//   * Two halt lines per boot — real, and it WAS the genuine harm, because the old anonymous
+//     `STOP-NOTE (token ...)` made a third halt naming the real keyboard read as "the usual two".
+//     KBDFLAP already paid that off: every halt now carries `addr=`, `ep=`, `kind=` and `class=`,
+//     so the proxies' `class=xact-err-burn` is distinguishable at a glance from a `class=stall` on
+//     the internal keyboard. `halt_class` also marks the burn unrecoverable, so not one of the
+//     bounded `ClearFeature(ENDPOINT_HALT)` budget is ever spent on them.
+//
+// WHY NOT SKIP OR DEFER ANYWAY. Two readings of the future are both live and this arc cannot
+// settle either from inside the EHCI driver:
+//
+//   (a) A bonded BT keyboard arrives ON THIS PATH, and an unconditional skip silently deletes it.
+//   (b) UnaOS drives the card through raw HCI — the corpus shows exactly that, `HCI_RESET` x189,
+//       L2CAP and ATT toward a speaker — in which case the stack owns the link, the card firmware
+//       never populates its proxy, and the proxy can never produce a report no matter what is
+//       bonded. The TT answering ERR on every boot is consistent with (b), but consistent is not
+//       convicted.
+//
+// The asymmetry decides it. Under (b) the cost of leaving the arm in place is two identified log
+// lines and one of six slots. Under (a) the cost of removing it is a keyboard that never works,
+// with the arm gone and therefore no witness to say why. A cheap, reversible, fully instrumented
+// wrong answer beats an expensive silent one.
+//
+// A gate on "does a bonded HID peer exist" is the shape that would actually be right, and it is
+// NOT AVAILABLE HERE: it needs a seam between the BT stack and this arm path, which is outside
+// this file's lane and squarely inside the BT bond-persistence arc's. The experiment that settles
+// (a) vs (b) belongs to that arc too — bond a real BT keyboard, then read whether the keystrokes
+// surface on `05ac:820a` or on HCI. Until that runs, nothing here changes.
+//
+// THE WITNESS. No new code was needed for it: KBDWIT-LATCH gives these two endpoints a record in
+// both of their observed states, which is precisely what was missing. On the 37 boots they burn
+// out they now emit `SILENCE-CUT-BY-HALT ... class=xact-err-burn` plus a `dead=1` roster dump; on
+// the 3 boots they sit Active they already emitted the ordinary dump. Either way `reports_prior=0`
+// is on the line, and this comment says what that zero means.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
 // KBDWIT — the one-shot, per-endpoint EHCI interrupt-silence witness.
 //
 // THE OBSERVATION (metal, 2012 rMBP, build s58, 2026-08-01). On two consecutive boots the USB
@@ -12568,6 +12696,43 @@ fn halt_class(tok: u32) -> (&'static str, bool) {
 //     `walks=` then says whether the controller had been transacting right up to the halt. This
 //     row does NOT belong to the healthy case above and must never be counted as one.
 //
+// ── KBDWIT-LATCH (2026-08-21): THE TWO ROWS THAT COULD NOT PRINT ──────────────────────────────
+//
+// Every row above assumes the instrument gets to run. Boot 10 is the boot where it did not, and
+// the table had no row for what actually happened because the code had no path to it:
+//
+//   [   1823ms] M2 armed keyboard addr=8 ep=IN3 mps=10 interval=8 (boot protocol)
+//   [   2444ms] STOP-NOTE interrupt endpoint halted (token 0x000a8d42)
+//   [  15219ms] dump: addr=5 kbd, addr=6 boot-mouse, addr=8 vendor-mt.  <- three. Not the keyboard.
+//
+// Two independent gates, both failing closed, both on the fault path:
+//
+//   1. `kbdwit_note_silence_end` opens `if !e.kbdwit_fired { return; }`, and on boot 10 the latch
+//      had not fired: the deadline is `KBDWIT_QUIET_MS` of silence but it is only OBSERVABLE on a
+//      service pass, and the early main loop was sparse enough that the surviving endpoints read
+//      `polls=8` at 15219 ms. The halt beat the dump by 12.8 s, so the halt exit printed nothing.
+//   2. `service()` skipped `dead` entries before the probe could run, so once retired the endpoint
+//      left KBDWIT's record entirely, and its absence was byte-identical to never having been
+//      armed. The dump's `dead={}` field had been on line 1 since KBDWIT-1 and could not once,
+//      on any boot, have printed a `1`.
+//
+// The instrument built for "armed and silent" was therefore structurally silent on the only boot
+// that showed the symptom, and its silence read as an acquittal. An instrument's silence is
+// evidence ONLY if the instrument can execute in the state it reports on.
+//
+//   * `SILENCE-CUT-BY-HALT` — the endpoint halted BEFORE it ever reached its silence deadline, so
+//     there is no dump to pair with and there never will be. `short_by_ms` is how much of the
+//     deadline it never got to serve (boot 10: quiet 621 ms of a 4000 ms deadline, short by 3379).
+//     `polls=`/`walks=` are raw and there is deliberately no `sched=` word — see
+//     `kbdwit_note_halt` for why a verdict off a handful of samples would be a claim, not evidence.
+//     Pairs with the `STOP-NOTE` immediately below it by `class=` and `tok=`, not just timestamp.
+//   * dump with `dead=1` — a retired endpoint, dumped at its deadline anyway from the `dead` arm
+//     of the loop, so the roster is complete. `last_ms=` is when it died; `sched=` describes its
+//     ARMED lifetime, because the sampler stops at retirement, and reads `NOT-SAMPLED` if it never
+//     survived a single ACTIVE poll. This row is not a fault by itself — the two BT-proxy
+//     endpoints reach it on the boots where they burn out — it is the roster entry whose ABSENCE
+//     was the defect.
+//
 // WHY PER-ENDPOINT, NOT PER-CONTROLLER. During the failure the trackpad is streaming on the SAME
 // controller, so any controller-level "is anything completing?" test reads HEALTHY on the exact
 // boot that motivated this instrument. The silence clock lives on `IntEp` and is stamped only by
@@ -12576,9 +12741,17 @@ fn halt_class(tok: u32) -> (&'static str, bool) {
 // BOUNDS. `kbdwit_fired` latches on the first dump: at most one dump per endpoint per boot, at
 // most `MAX_INT_EPS` (6) per controller for a whole boot. `kbdwit_broke` latches the same way, so
 // KBDWIT-2 adds at most one further line per endpoint per boot — eight lines, once, per endpoint,
-// for the entire boot. No loop, no retry, no wait, no allocation, no register write — every access
+// for the entire boot. KBDWIT-LATCH adds `kbdwit_cut`, a THIRD independent one-shot, for a ceiling
+// of nine; it is a separate latch and not a third user of `kbdwit_broke` because with KBDFLAP's
+// bounded halt recovery in the path one endpoint can legitimately be cut short, be cleared,
+// re-armed, go quiet, dump, and only then break its silence — sharing a latch would drop whichever
+// of those came second, which is the same failure mode this arc exists to close. Making the probe
+// reachable from the `dead` arm raises no ceiling at all: it is the SAME `kbdwit_fired` one-shot,
+// merely no longer unreachable for endpoints that die before their deadline.
+// No loop, no retry, no wait, no allocation, no register write — every access
 // below is a read. Cost on the service path is one bool test plus one `ms()` read before the
-// deadline, and one bool test after it fires; KBDWIT-2's sampler adds two volatile reads of
+// deadline, and one bool test after it fires; a retired endpoint costs one bool test per pass and
+// stops reading its overlay entirely once dumped. KBDWIT-2's sampler adds two volatile reads of
 // already-mapped DRAM plus a compare per endpoint per pass, on the ~1 kHz poll, and its counters
 // saturate rather than wrap. Note the
 // path this rides is `service()`, the POST-boot main-loop poll — NOT the `init()` bring-up block
@@ -12663,6 +12836,113 @@ fn kbdwit_pid(tok: u32) -> &'static str {
     }
 }
 
+/// KBDWIT-LATCH — the halt exit, both sides of the deadline. The service loop's `QTD_ERR_MASK`
+/// block calls THIS, never `kbdwit_note_silence_end` directly.
+///
+/// ### The gap this closes
+///
+/// `kbdwit_note_silence_end` opens with `if !e.kbdwit_fired { return; }`, and that guard is
+/// correct for what it guards: `SILENCE-BROKE` means *"the endpoint the deadline dump declared
+/// silent has now answered"*, so with no dump there is no silence to break, and a keyboard that
+/// simply works must not print a line on its first report. But the halt exit was routed through
+/// the same guard, and a halt is not a report. The result was an instrument that went silent in
+/// exactly the state it was built to describe:
+///
+/// ```text
+///   [   1823ms] M2 armed keyboard addr=8 ep=IN3 mps=10          <- the internal keyboard
+///   [   2444ms] STOP-NOTE interrupt endpoint halted (0x000a8d42) <- retired, 621 ms later
+///   [  15219ms] KBDWIT dump: addr=5, addr=6, addr=8/vendor-mt    <- three endpoints. Not this one.
+/// ```
+///
+/// The deadline is `KBDWIT_QUIET_MS` of silence, but it can only be OBSERVED on a service pass,
+/// and on boot 10 the early main loop was sparse enough that the three surviving endpoints show
+/// `polls=8` at 15219 ms. So the halt beat the dump by 12.8 s, `kbdwit_fired` was false, and the
+/// halt exit returned without printing. Every word about that keyboard's death came from
+/// `STOP-NOTE` — which at the time carried a bare token and named no endpoint at all.
+///
+/// ### What it prints, and why not simply reuse `SILENCE-BROKE`'s line
+///
+/// Post-deadline the call is forwarded verbatim, so `SILENCE-ENDED-HALTED` keeps its exact text,
+/// its exact field list and its exact meaning; captures already in the corpus stay comparable.
+/// Pre-deadline gets a NEW verdict word, `SILENCE-CUT-BY-HALT`, on its own line, for two reasons:
+///
+///   * The facts differ. There is no dump to pair with, and the quantity the reader wants is not
+///     "how long was it silent" alone but "how much of the deadline it never got to serve" —
+///     `deadline_ms` and `short_by_ms`, which have no place on the post-deadline line because
+///     there they are zero by construction.
+///   * `polls=`/`walks=` are printed RAW and NO `sched=` verdict word is emitted. On this path the
+///     sample is short by construction — boot 10's keyboard lived 621 ms across a loop that
+///     managed 8 polls in 13.5 s — and `WALKED`/`NOT-WALKED` off a handful of samples would be the
+///     unfalsifiable-conviction failure the probe's own section comment argues against. The counts
+///     are evidence; the word would have been a claim.
+///
+/// `class=` repeats `halt_class`'s verdict so this line and its `STOP-NOTE` can be paired by more
+/// than a timestamp, and `tok=` is raw beside the decoded bits so the class is re-derivable
+/// without trusting either line.
+///
+/// ### What `quiet_ms` and `short_by_ms` are NOT
+///
+/// `now_ms` is the service pass that OBSERVED the halt, not the microframe the controller halted
+/// in. This driver has no interrupt on the path — the halt is discovered by polling — so both
+/// derived spans are upper bounds on the endpoint's true survival time, and the slack is however
+/// long the main loop took to come back round. The corpus makes that gap visible rather than
+/// theoretical: the two BT-proxy endpoints halt at essentially the same instant on every boot, yet
+/// their `STOP-NOTE` timestamps range from 2778 ms to 23244 ms across the captures, tracking how
+/// long each build took to reach its run loop and nothing about the endpoints at all. The bound
+/// still convicts in the direction that matters here — an endpoint reported as cut short WAS cut
+/// short — but no arithmetic on these two fields may be presented as a latency measurement.
+#[cfg(feature = "kbdwit")]
+unsafe fn kbdwit_note_halt(e: &mut IntEp, idx: usize, tok: u32) {
+    if e.kbdwit_fired {
+        kbdwit_note_silence_end(e, idx, "SILENCE-ENDED-HALTED", tok);
+        return;
+    }
+    if e.kbdwit_cut {
+        return;
+    }
+    e.kbdwit_cut = true;
+    let now = crate::arch::ms();
+    let chars = core::ptr::read_volatile(&(*e.qh).ep_chars);
+    // `quiet_ms` is measured from ARMED, not from `kbdwit_last_ms`, and that is forced rather than
+    // chosen: the service loop stamps `kbdwit_last_ms = ms()` unconditionally on any retired qTD,
+    // ABOVE the `QTD_ERR_MASK` test that reaches this function, so by the time we are called it
+    // already holds THIS halt's own timestamp and a `now - last` would print 0 on every line. The
+    // previous activity instant is simply not recoverable at this call site. `armed_ms` is the
+    // only honest origin left, and it is the same origin `kbdwit_note_silence_end` prints
+    // `quiet_ms` from, so the two lines stay directly comparable. On the endpoint this was built
+    // for the two agree anyway — boot 10's keyboard had completed nothing at all, so armed IS the
+    // last activity: 2444 - 1823 = 621 ms, and `reports_prior=0` on the line says as much.
+    let quiet = now.wrapping_sub(e.kbdwit_armed_ms);
+    let (class, _) = halt_class(tok);
+    serial_println!(
+        ":: KBDWIT: [{}] ep=IN{} addr={} kind={} SILENCE-CUT-BY-HALT class={} tok={:#010x} cerr={} halted={} xact={} babble={} dbuf={} missed={} err={} rem={} armed_ms={} now_ms={} quiet_ms={} deadline_ms={} short_by_ms={} polls={} walks={} split_or={:#018x} reports_prior={} toggle={} == witness ::",
+        idx,
+        (chars >> 8) & 0xF,
+        chars & 0x7F,
+        int_ep_kind(e),
+        class,
+        tok,
+        (tok >> 10) & 0x3,
+        (tok >> 6) & 1,
+        (tok >> 3) & 1,
+        (tok >> 4) & 1,
+        (tok >> 5) & 1,
+        (tok >> 2) & 1,
+        tok & 1,
+        (tok >> 16) & 0x7FFF,
+        e.kbdwit_armed_ms,
+        now,
+        quiet,
+        KBDWIT_QUIET_MS,
+        KBDWIT_QUIET_MS.saturating_sub(quiet),
+        e.kbdwit_polls,
+        e.kbdwit_walks,
+        e.kbdwit_split_or,
+        e.reports,
+        e.toggle as u8,
+    );
+}
+
 /// KBDWIT — decode a QH's endpoint-speed field (`ep_chars` bits 13:12, EHCI 1.0 §3.6.2).
 #[cfg(feature = "kbdwit")]
 fn kbdwit_eps(chars: u32) -> &'static str {
@@ -12738,9 +13018,34 @@ unsafe fn kbdwit_note_silence_end(e: &mut IntEp, idx: usize, verdict: &str, tok:
     );
 }
 
-/// KBDWIT — the probe. Called from the service loop for an endpoint whose qTD is STILL ACTIVE
-/// (nothing completed this pass); dumps once and latches. See the section comment above for the
-/// observation this exists for, its bounds, and the honesty argument for each field.
+/// KBDWIT — the probe. Dumps once per endpoint per boot and latches. See the section comment above
+/// for the observation this exists for, its bounds, and the honesty argument for each field.
+///
+/// ### Two callers, and why the second one is the whole of KBDWIT-LATCH
+///
+/// 1. The service loop's ACTIVE arm — an endpoint whose qTD has not completed this pass. The
+///    original and only caller.
+/// 2. The service loop's `dead` arm — an endpoint that was armed and has since been RETIRED.
+///
+/// The `dead` case is not an extension, it is a repair. The dump's own line 1 has always carried a
+/// `dead={}` field, which is a written admission that the state exists and matters; but the loop
+/// skipped `dead` entries before ever reaching this function, so `dead=1` was unprintable and that
+/// field could only ever emit `0`. It was decoration of exactly the kind the `sched=` note below
+/// refuses to keep. Worse than decoration: it made the dump's ROSTER lie by omission. On boot 10
+/// the dump listed the three endpoints that were still alive at 15219 ms, and the internal
+/// keyboard — armed at 1823 ms, retired at 2444 ms — was simply not in it, indistinguishable in
+/// the media from a keyboard that was never armed at all.
+///
+/// Everything this function reads stays valid on a retired endpoint: `dead` stops the loop
+/// consuming completions, it does not unlink the QH from the periodic list, free the qTD, or touch
+/// the buffers. So the QH words, the frame-list linkage check and the FRINDEX samples all still
+/// describe the controller's real state — the state the endpoint died in.
+///
+/// What the `dead` path does NOT preserve is the sampler. `kbdwit_polls`/`kbdwit_walks` are only
+/// incremented on the ACTIVE arm, so on a retired endpoint they are frozen at the moment of
+/// retirement and describe its armed lifetime, not the instant of the dump. That is honest but it
+/// is not obvious, and it is why `sched=` gains a `NOT-SAMPLED` arm below; `polls=` on the line is
+/// what keeps a short sample from reading as a long one.
 #[cfg(feature = "kbdwit")]
 unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const u32, seen: u32) {
     // One-shot, cheapest test first: after the single dump this endpoint will ever emit, the whole
@@ -12839,19 +13144,37 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
     //   sched=NOT-WALKED thousands of polls and the controller never touched the QH's split
     //                    progress. A host-side fault, convicted without anyone pressing a key.
     //
-    // There is deliberately NO third arm for "not sampled yet". The obvious safety valve — a
-    // `polls == 0` case, so a missing measurement could never masquerade as a conviction — was
-    // written, and a `strings` pass over the built rlib showed the compiler had deleted it: the
-    // sampler runs on the SAME service pass, immediately above the call to this probe, so
-    // `polls >= 1` holds by construction at every reachable entry (and `saturating_add` means it
-    // can never return to zero). A branch that cannot print is a branch a reader will one day trust
-    // as coverage, so it is gone rather than left as decoration. `polls=` is on the line regardless,
-    // which is what actually guards against reading a small sample as a verdict.
+    // KBDWIT-LATCH RESTORES THE THIRD ARM, because this arc made it reachable. It was written
+    // once, and deleted with a reason recorded here: a `strings` pass over the built rlib showed
+    // the compiler had folded it away, since the sampler ran on the SAME service pass immediately
+    // above the only call to this probe, so `polls >= 1` held by construction at every reachable
+    // entry. That argument was sound and is now void. This probe has a SECOND caller — the `dead`
+    // branch of the service loop — and it reaches an endpoint that is no longer sampled at all,
+    // whose `kbdwit_polls` froze at whatever it had when the endpoint was retired. Boot 10 makes
+    // the hazard concrete rather than theoretical: the internal keyboard was armed at 1823 ms and
+    // halted at 2444 ms, across an early main loop that managed 8 polls in 13.5 s, so its frozen
+    // count is plausibly zero — and `sched=NOT-WALKED` off zero samples is a host-side conviction
+    // drawn from no evidence, in the one dump a reader would take most seriously.
+    //
+    //   sched=NOT-SAMPLED no ACTIVE poll was ever taken on this endpoint. Says nothing about the
+    //                     controller, which is the point: it is the refusal to convict.
+    //
+    // `WALKED`/`NOT-WALKED` keep their exact meanings and their exact trigger conditions, so a
+    // live endpoint's dump is byte-identical to what it was and old captures stay comparable —
+    // `polls == 0` simply cannot arise on that path. `polls=` remains on the line regardless,
+    // which is what guards against reading a SMALL sample (the dead path's other, unavoidable
+    // weakness) as a verdict.
     serial_println!(
         ":: KBDWIT: [{}] ep=IN{} addr={} kind={} NO-COMPLETIONS class={} sched={} polls={} walks={} split_or={:#018x} quiet={}ms armed_ms={} last_ms={} now_ms={} reports={} toggle={} dead={} == witness ::",
         idx, epn, addr, kind,
         if e.kbdwit_last_ms == 0 { "never-completed" } else { "went-quiet" },
-        if e.kbdwit_walks > 0 { "WALKED" } else { "NOT-WALKED" },
+        if e.kbdwit_polls == 0 {
+            "NOT-SAMPLED"
+        } else if e.kbdwit_walks > 0 {
+            "WALKED"
+        } else {
+            "NOT-WALKED"
+        },
         e.kbdwit_polls, e.kbdwit_walks, e.kbdwit_split_or,
         now.wrapping_sub(since),
         e.kbdwit_armed_ms, e.kbdwit_last_ms, now,
