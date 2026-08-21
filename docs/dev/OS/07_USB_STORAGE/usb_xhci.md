@@ -7316,6 +7316,46 @@ deferred-write path that turns this session bond into a persistent one.
 
 ---
 
+## 28. BOTSEQ — the mount runs before the probe matrices (2026-08-21)
+
+The behavioural follow-up BOTCLAIM (e3c466f3) deferred to its own arc.
+
+**The conviction chain (BOTCLAIM, 2026-08-21 pi capture, 3 boots, identical cycle).** On the
+bench card reader the bring-up chain (TUR / INQUIRY / READ CAPACITY / READ(10) LBA0) passes every
+cycle. The device then wedges INSIDE `service_storage`'s own diagnostic chain — the PIUSB-36/37/38
+probe matrices + write selftest that ran between the storage publish and the piusb27 mount —
+notably piusb37's read12-lba0 (tag 0x19: data lands, CSW never sent) and its READ CAPACITY (tag 5:
+nothing posted). Stop-EP/Set-TR-Dequeue recovery then fails cc=19 (epin=2/epout=3), and the mount
+read — issued after the matrices in the same pump pass by construction — lands on dead pipes:
+`:: BLK: io-cause op=read-usb lba=0 bot_err=Timeout ::` → no FAT → park → hub-cycle → repeat.
+
+**What changed (sequencing only — no probe deleted, no probe internals touched, bring-up and
+recovery untouched).** The bring-up pass no longer runs the matrices inline. It arms
+`storage_diag_pending` and returns right after the LBA0 sanity read, printing the witness
+
+```
+:: BOT: [botseq] mount-first attempted lba0=ok|err matrices=deferred ::
+```
+
+The storage-ready edge was raised inside `bring_up_storage`, so the SAME pass's tail mounts the
+volume (`piusb27_service` on the Pi pump, `probe_once` on x86). The first block-layer
+`storage_read10`/`storage_write10` issued while the latch is armed sets `storage_postpublish_io` —
+proof the mount attempt reached the wire — and the next `service_storage` pass consumes the latch
+and runs the exact PIUSB-36/37/38 matrices + write selftest, verbatim, in `storage_diag_matrices`.
+Mount verdict before matrices, by construction, on every platform and pump (the pi boot pump's
+`service_storage` calls skip the diag branch because no post-publish I/O exists yet).
+
+Why deferral and not the knob option: the diff stays inside `xhci/mod.rs` (no arroyo/Cargo/builder
+feature plumbing, no `main.rs` hunks), and the diagnostics still run every boot — QEMU's matrix
+and `[usbw]` coverage is preserved one pass (~4 ms) later, so no spec or battery grep moves.
+
+**What the next metal flight settles.** Until now the mount sat at a fixed position AFTER the
+probes, so "the wedge follows certain commands" and "the wedge follows sequence position" were
+collinear. With the mount first: a boot where `[botseq] ... lba0=ok` is followed by a mounted FAT
+and THEN the wedge inside the matrices convicts the probes' command mix (read12/read16/pre-sense/
+induced-stall), not sequence depth — and the desktop line gets its filesystem before the reader
+dies. A mount that still times out ahead of any matrix reopens the position/depth theory.
+
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
 - `unaos/crates/kernel/src/drivers/ehci/`, `drivers/ehci_scout.rs` — the EHCI-3 HID driver (§10) and the EHCI-1/2 scout + shared wake (§9/§9a).
