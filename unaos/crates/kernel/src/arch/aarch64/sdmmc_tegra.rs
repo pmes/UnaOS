@@ -398,17 +398,29 @@ mod metal {
     /// CSD-derived capacity, and RCA. Prints the CID (manufacturer/OEM/product/serial) and capacity.
     /// Returns the identified card, or None on any absent-card / timeout / decode failure (the caller
     /// prints the honest cause). NO card write anywhere in this ladder.
-    fn identify(base: u64) -> Option<Card> {
+    fn identify(base: u64, vendor_ok: bool) -> Option<Card> {
         // 0. M2b: snapshot the bootloader's Tegra vendor pad/tap configuration BEFORE the reset that
         //    would discard it, and report the pre-reset signalling voltage (a card the firmware left in
         //    1.8 V UHS signalling cannot answer a 3.3 V ladder — that diagnosis needs a PMIC/vqmmc arc,
         //    so we surface it rather than work around it).
-        let hc2 = (read32(base, HOST_CTRL2) >> 16) & 0xffff;
-        serial_println!(
-            "{}   M2: pre-reset Host Control 2 = {:#06x} (1.8V-signalling={}, UHS mode {:#x}) ::",
-            PS, hc2, (hc2 >> 3) & 1, hc2 & 0x7
-        );
-        let vendor = vendor_snapshot(base);
+        //    CLKPROOF gate (boot 4e): the HC2 read and the vendor block (base+0x100..0x1e4) run ONLY
+        //    when the census proved the core clock enabled over BPMP — the 4e SError raised in this
+        //    exact window. Unproven => the ladder runs pre-SDID-shaped (no vendor touch), which boot 3
+        //    proved SError-free on this silicon; the skip is witnessed, never silent.
+        let vendor = if vendor_ok {
+            let hc2 = (read32(base, HOST_CTRL2) >> 16) & 0xffff;
+            serial_println!(
+                "{}   M2: pre-reset Host Control 2 = {:#06x} (1.8V-signalling={}, UHS mode {:#x}) ::",
+                PS, hc2, (hc2 >> 3) & 1, hc2 & 0x7
+            );
+            Some(vendor_snapshot(base))
+        } else {
+            serial_println!(
+                "{}   M2: vendor snapshot SKIPPED — core clock not proven (CLKPROOF); ladder runs without pad snapshot/restore ::",
+                PS
+            );
+            None
+        };
 
         // 1. Full-controller software reset; wait for it to self-clear.
         serial_println!("{}   M2: SRST_ALL (controller software reset) ::", PS);
@@ -418,8 +430,11 @@ mod metal {
             return None;
         }
         // 1b. M2b: put the firmware's vendor pad configuration BACK (SRST_ALL reset it to power-on
-        //     defaults) and re-run pad auto-calibration if the firmware had it enabled.
-        vendor_restore(base, &vendor);
+        //     defaults) and re-run pad auto-calibration if the firmware had it enabled. Skipped (with
+        //     the M2 witness above) when CLKPROOF could not prove the clock.
+        if let Some(v) = &vendor {
+            vendor_restore(base, v);
+        }
         // 2. Enable status latching (must be set or STATUS bits never appear in INTERRUPT); keep signals
         //    off (polled); clear any stale status.
         write32(base, IRPT_MASK, 0xffff_ffff);
@@ -1849,7 +1864,7 @@ mod metal {
     /// M1: walk the DTB for every SDMMC-compatible node, log each candidate, and pick the enabled
     /// removable (microSD-slot) instance. Returns its (base, size), or None (with a printed reason).
     /// READ-ONLY RAM walk — no MMIO.
-    fn resolve_microsd(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<(u64, u64)> {
+    fn resolve_microsd(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<(u64, u64, [u32; 4], usize)> {
         if dtb_addr == 0 || dtb_size == 0 {
             serial_println!("{}   M1: no DTB handed off — cannot resolve the SDMMC controller ::", PS);
             return None;
@@ -1971,7 +1986,19 @@ mod metal {
             core::str::from_utf8(node).unwrap_or("?"),
             pick.base, pick.size
         );
-        Some((pick.base, pick.size))
+        // TEGRA-SD CLKPROOF: the picked node's `clocks` [phandle, id] pairs — the ids the BPMP
+        // proof rung queries before the vendor block is touched. Read here because only this fn
+        // holds the picked node path; odd-index words per the fdt pick convention.
+        let clocks = fdt.prop_at(node, b"clocks");
+        let mut clk_ids = [0u32; 4];
+        let mut n_clks = 0usize;
+        let mut ci = 1usize;
+        while ci < clocks.n && n_clks < clk_ids.len() {
+            clk_ids[n_clks] = clocks.words[ci];
+            n_clks += 1;
+            ci += 2;
+        }
+        Some((pick.base, pick.size, clk_ids, n_clks))
     }
 
     /// ORIN-SDMMC-1 entry point (metal): FDT census (M1) -> map + poison-honest CAPS probe -> SDHCI
@@ -1984,7 +2011,7 @@ mod metal {
         );
 
         // ── M1: resolve the microSD-slot controller from the live DTB ──
-        let Some((base, size)) = resolve_microsd(dtb_addr, dtb_size, ram_gib_mask) else {
+        let Some((base, size, clk_ids, n_clks)) = resolve_microsd(dtb_addr, dtb_size, ram_gib_mask) else {
             serial_println!("{}   recon SKIPPED (no resolvable microSD-slot SDMMC controller) ::", PS);
             return;
         };
@@ -2030,8 +2057,66 @@ mod metal {
             match hcver { 0 => "1.0", 1 => "2.0", 2 => "3.0", 3 => "4.0", _ => "?" }
         );
 
+        // ── TEGRA-SD CLKPROOF: prove the SDMMC core clock live over BPMP BEFORE identify() touches
+        //    the vendor register block (base+0x100..0x1e4). Boot 4e died in an EL3 SError (async CBB
+        //    abort, esr_el3=0xbe000011) inside vendor_snapshot's 8 reads — the first accesses this
+        //    driver ever made beyond the standard SDHCI window, on an unproven clock/firewall domain.
+        //    Pure MRQ query first (the JB7 precedent); CMD_CLK_ENABLE only if a clock reads off;
+        //    every outcome named. If the proof cannot be completed the vendor block is SKIPPED with a
+        //    witness (pre-SDID ladder behavior, metal-proven safe on boot 3) — never risked. ──
+        let vendor_ok = 'proof: {
+            if n_clks == 0 {
+                serial_println!("{}   CLKPROOF: node carries no clocks property — vendor block will be SKIPPED ::", PS);
+                break 'proof false;
+            }
+            let Some(geom) = crate::arch::aarch64::fdt_tegra::bpmp_geometry(dtb_addr, dtb_size, ram_gib_mask) else {
+                serial_println!("{}   CLKPROOF: no BPMP geometry from DTB — vendor block will be SKIPPED ::", PS);
+                break 'proof false;
+            };
+            let Some(chan) = crate::arch::aarch64::bpmp_tegra::jb1b_ping(&geom) else {
+                serial_println!("{}   CLKPROOF: BPMP ping failed — vendor block will be SKIPPED ::", PS);
+                break 'proof false;
+            };
+            let mut all_on = true;
+            for i in 0..n_clks {
+                let id = clk_ids[i];
+                match crate::arch::aarch64::bpmp_tegra::clk_is_enabled(&chan, id) {
+                    Some((0, state)) => {
+                        serial_println!("{}   CLKPROOF: CLK {} IS_ENABLED = {} ::", PS, id, state);
+                        if state == 0 {
+                            match crate::arch::aarch64::bpmp_tegra::clk_enable(&chan, id) {
+                                Some(0) => match crate::arch::aarch64::bpmp_tegra::clk_is_enabled(&chan, id) {
+                                    Some((0, 1)) => {
+                                        serial_println!("{}   CLKPROOF: CLK {} ENABLED + re-verified = 1 ::", PS, id)
+                                    }
+                                    other => {
+                                        serial_println!("{}   CLKPROOF: CLK {} enable ack'd but re-query = {:?} — NOT proven ::", PS, id, other);
+                                        all_on = false;
+                                    }
+                                },
+                                other => {
+                                    serial_println!("{}   CLKPROOF: CLK {} ENABLE -> {:?} — NOT proven ::", PS, id, other);
+                                    all_on = false;
+                                }
+                            }
+                        }
+                    }
+                    other => {
+                        serial_println!("{}   CLKPROOF: CLK {} IS_ENABLED -> {:?} — NOT proven ::", PS, id, other);
+                        all_on = false;
+                    }
+                }
+            }
+            if all_on {
+                serial_println!("{}   CLKPROOF: all {} node clock(s) proven enabled — vendor block permitted ::", PS, n_clks);
+            } else {
+                serial_println!("{}   CLKPROOF: clock state NOT fully proven — vendor block will be SKIPPED ::", PS);
+            }
+            all_on
+        };
+
         // ── M2: SDHCI identification ladder (READ-ONLY) ──
-        let Some(card) = identify(base) else {
+        let Some(card) = identify(base, vendor_ok) else {
             serial_println!("{} ORIN-SDMMC-1 recon done at M2 (no identified card / honest stop) ::", PS);
             return;
         };

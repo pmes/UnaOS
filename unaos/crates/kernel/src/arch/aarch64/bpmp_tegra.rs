@@ -513,6 +513,20 @@ pub fn jb5_pg_on(chan: &Chan, ids: &super::fdt_tegra::XusbIds) -> bool {
 /// an otherwise-powered partition shows as `=0`. If every clock reads `=1` while CPUCTL stays
 /// 0xffffffff, clock-gating is RULED OUT — the Falcon core is held in reset, not unclocked. Runs at
 /// raw handoff (before jb1c re-enables anything) so it reports the state UEFI actually left.
+/// TEGRA-SD CLKPROOF: the two MRQ_CLK verbs the SDMMC clock-proof rung needs, public so
+/// `sdmmc_tegra` can prove the core clock live before touching the vendor register block
+/// (the boot-4e EL3 SError window: 8 reads at base+0x100..0x1e4 with the clock state unproven).
+/// Same wire shapes as jb1c's ENABLE and jb7's IS_ENABLED — nothing new on the bus.
+pub fn clk_is_enabled(chan: &Chan, id: u32) -> Option<(i32, u32)> {
+    chan.transfer(MRQ_CLK, &[(CMD_CLK_IS_ENABLED << 24) | (id & 0x00ff_ffff)])
+        .map(|(err, out)| (err, out[0]))
+}
+
+/// TEGRA-SD CLKPROOF: MRQ_CLK CMD_CLK_ENABLE for one id; Some(err) on an answer, None on timeout.
+pub fn clk_enable(chan: &Chan, id: u32) -> Option<i32> {
+    chan.transfer(MRQ_CLK, &[(CMD_CLK_ENABLE << 24) | (id & 0x00ff_ffff)]).map(|(err, _)| err)
+}
+
 pub fn jb7_clocks_query(chan: &Chan, ids: &super::fdt_tegra::XusbIds) {
     let query = |id: u32, tag: &str| {
         match chan.transfer(MRQ_CLK, &[(CMD_CLK_IS_ENABLED << 24) | (id & 0x00ff_ffff)]) {
