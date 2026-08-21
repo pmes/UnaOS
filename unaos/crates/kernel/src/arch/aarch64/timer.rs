@@ -233,6 +233,16 @@ pub fn cntp_ctl() -> u64 {
     v
 }
 
+/// Raw CNTP_CVAL_EL0 — the comparator the down-counter (TVAL) writes resolve to. Diagnostic only
+/// (the `[wedgeprobe]` witness): `cval <= cntpct()` with ENABLE=1/IMASK=0 means the timer's output
+/// line SHOULD be asserted right now. Per-core banked, like every CNTP_* register.
+#[inline]
+pub fn cntp_cval() -> u64 {
+    let v: u64;
+    unsafe { core::arch::asm!("mrs {}, CNTP_CVAL_EL0", out(reg) v, options(nomem, nostack, preserves_flags)) };
+    v
+}
+
 /// Free-running physical counter CNTPCT_EL0. Diagnostic / busy-delay only.
 #[inline]
 pub fn cntpct() -> u64 {

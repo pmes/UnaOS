@@ -2868,6 +2868,53 @@ loaded, which is why the arc is judged on **paired** runs rather than an absolut
 paired reading is that armed and control are indistinguishable outside the arc's own two witnesses,
 which are green on every run.
 
+### WEDGEPROBE — the interrupt/timer instrument behind a WEDGE conviction (aarch64, `exec-wedgeprobe`)
+
+**The evidence that motivated it.** Three metal WEDGE convictions share one anatomy. dsktp boot 9:
+core 3, task `99:input`. dsktp boot 10, episode 1: core 2, task `111:el0-fb` at ~4.5 s; episode 2:
+core 2 again, task `117:el0-wcb`, after the core had RECOVERED (~11M scheduler passes elapsed
+between episodes) and re-wedged — the failure is transient-then-recurring, not a one-way latch. In
+all three, `[starve1]` printed `passes=N->N irq=M->M` for the wedged core: its scheduler passes
+frozen AND its per-core acked-IRQ count frozen across the probe interval, while every sampled lock
+counter was zero (`rx_ready locked=0`, `sem_stalls=0`, `futex_stalls=0`). The lock class is
+refuted — POSFIX was aboard boot 10 and did not prevent it. The surviving hypothesis class:
+**interrupt delivery dies on the wedged core** — no timer tick, so no preemption, so the pinned EL0
+resident starves — while the current EL0 task keeps running at EL0 (the machine stays alive).
+
+**What the probe is.** `wedgeprobe` (sched.rs), called from the `[starve1]` fire path only, whenever
+any core is convicted WEDGE (frozen passes). Discipline per §INWEDGE/§POSFIX: read-only,
+failure-path-only, no locks taken, no waits entered — relaxed atomics, `mrs`, and single volatile
+MMIO reads. It prints:
+
+* One `[wedgeprobe] … wedged_cpu=N …` line per convicted core: the cross-core-safe atomics that
+  core's own IRQ path maintains — `gic::IRQ_TOTAL` / `IRQ_LAST_INTID` / `IRQ_UNHANDLED[_LAST]` and
+  `percpu::cpu(N).ticks` / `.ipis`. There is **no last-irq timestamp** anywhere in the kernel
+  (`[spin1]`'s `last=` is `IRQ_LAST_INTID`, an INTID — 30 is the timer PPI), so a frozen
+  `irq_total` beside a live sibling IS the staleness evidence, and the line says so.
+* One `[wedgeprobe] … probe_cpu=P …` line from the convicting core: `GICD_CTLR` (the one GLOBAL
+  register — distributor enable), then the probe core's **banked** view — timer-PPI
+  enable/pending/active bits (GICD_ISENABLER0/ISPENDR0/ISACTIVER0 low words are banked per CPU
+  interface on GICv2), `GICC_CTLR/PMR/RPR/HPPIR` (the whole GICC frame is banked), and
+  `CNTP_CTL_EL0` + `CVAL−now` (CNTP_* are per-core system registers). On the QEMU-virt v3 build the
+  same fields come from this core's redistributor SGI frame + the ICC_* system registers
+  (`gic::wedgeprobe_snapshot` dispatches like every other GIC entry point).
+
+**The honest limitation, stated in the witness line itself.** The wedged core's banked GIC state and
+its CNTP registers are **unreadable from any other core** — that is what "banked" means — and the
+kernel has no run-on-core-N IPI sampling path (the only SGI is the resched kick; building one was
+explicitly out of the arc's scope). So the probe-core line is a **contrast baseline** from a core
+that is demonstrably still taking interrupts, not the wedged core's state. What it CAN settle: a
+clear `GICD_CTLR` would convict a global distributor loss; a stuck `timer_active`/low `rpr` on a
+future capture where the probe core is itself about to wedge would convict a lost EOI; and the
+per-wedged-core counters separate "no interrupts acked at all" (frozen `irq_total`) from "interrupts
+acked but ticks lost" (`irq_total` moving while `ticks` freezes — a dispatch, not delivery, fault).
+
+**Gates (this arc).** `./arroyo check` green both arches; `./arroyo test-arm` clean;
+`./arroyo kernel8-test` **117/117 required, 0 forbidden**; strings-proof: both `[wedgeprobe]`
+witness texts present in the shipped `target/pi_baremetal/kernel8.img` (positive control:
+`starve1` present in the same pass). The probe has not yet fired on metal — that is the next
+conviction's capture, at an operator-attended arc boundary.
+
 ### Orphan-reaper wake on enqueue (aarch64, SCHED-4b)
 
 **SCHED-4 sleep_ticks regression** (U11-reap FAIL, timer never ticks in QEMU) bisected and fixed by SCHED-4b (`d7631117`): semaphore wake on orphan enqueue — ~0% idle duty metal-confirmed (c2=0% P31b), U11-reap PASS restored.

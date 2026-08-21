@@ -7464,6 +7464,7 @@ fn starve1_probe(starved: bool) {
             // could be dispatching the starved task, so they are the only ones under suspicion.
             let mut named = 0usize;
             let mut any_advancing = false;
+            let mut wedged_mask = 0u32;
             for cpu in 0..NUM_CPUS {
                 let act = el0_active(cpu);
                 if act == 0 {
@@ -7476,6 +7477,9 @@ fn starve1_probe(starved: bool) {
                 let irq0 = STARVE1_IRQ0[cpu].0.load(Ordering::Relaxed);
                 if passes != passes0 {
                     any_advancing = true;
+                } else {
+                    // WEDGE conviction for THIS core — remember it for the [wedgeprobe] lines below.
+                    wedged_mask |= 1 << (cpu as u32);
                 }
                 // Who owns the core. On the wedge reading this NAMES the task that stopped
                 // returning; on the placement reading it is whatever ran most recently.
@@ -7529,11 +7533,85 @@ fn starve1_probe(starved: bool) {
                 SPREAD15_RWSTAMP.load(Ordering::Relaxed),
                 SPREAD15_PACK.load(Ordering::Relaxed),
             );
+            // WEDGEPROBE: any per-core WEDGE conviction gets the interrupt/timer instrument.
+            if wedged_mask != 0 {
+                wedgeprobe(episode, wedged_mask);
+            }
             STARVE1_STATE.store(STARVE1_FIRED, Ordering::Relaxed);
         }
         // FIRED: the episode has been explained. Stay quiet until the verdict changes.
         _ => {}
     }
+}
+
+/// WEDGEPROBE — the per-core interrupt/timer instrument behind a `[starve1]` WEDGE conviction.
+/// Metal evidence (three convictions: dsktp boot 9 core 3 task 99:input; dsktp boot 10 core 2
+/// episode 1 task 111:el0-fb at ~4.5 s and episode 2 task 117:el0-wcb after a ~11M-pass recovery)
+/// shares one anatomy: the wedged core's scheduler passes AND its irq count are BOTH frozen across
+/// the probe interval, with every sampled lock counter zero (rx_ready locked=0, sem_stalls=0,
+/// futex_stalls=0 — the lock class is refuted; POSFIX aboard boot 10 did not prevent it). The
+/// hypothesis under test: interrupt delivery dies on the wedged core (no timer tick -> no
+/// preemption -> the pinned EL0 resident starves) while the current EL0 task keeps running at EL0.
+///
+/// Discipline (scheduler.md §INWEDGE/§POSFIX law): read-only, failure-path-only (called from the
+/// `[starve1]` fire path alone), no locks taken, no waits entered — relaxed atomics, `mrs`, and
+/// single volatile MMIO reads only.
+///
+/// Honesty about banking: GICv2 banks the low ISENABLER/ISPENDR/ISACTIVER words (INTIDs 0-31,
+/// where the timer PPI lives) and the ENTIRE GICC frame per CPU interface, and CNTP_* are per-core
+/// system registers — so the convicting core CANNOT read the wedged core's copies, and this kernel
+/// has no run-on-core-N IPI sampling path (the only SGI is the resched kick; building one is out of
+/// scope by the brief). What the probe therefore prints is (a) per WEDGED core, the cross-core-safe
+/// atomics its own IRQ path maintains, and (b) the PROBE core's banked view as a healthy-core
+/// contrast baseline, labeled as exactly that. There is also no last-irq TIMESTAMP anywhere in the
+/// kernel — `[spin1]`'s `last=` is `IRQ_LAST_INTID`, an INTID (30 = the timer PPI), so the probe
+/// prints that INTID and lets the frozen `irq_total` speak for freshness.
+fn wedgeprobe(episode: u64, wedged_mask: u32) {
+    use crate::arch::gic;
+    use crate::arch::percpu;
+    use crate::arch::timer;
+    for cpu in 0..NUM_CPUS {
+        if wedged_mask & (1 << (cpu as u32)) == 0 {
+            continue;
+        }
+        let c = cpu & 7;
+        let pc = percpu::cpu(cpu);
+        serial_println!(
+            "[wedgeprobe] episode={} wedged_cpu={} irq_total={} last_intid={} unhandled={} unhandled_last={} ticks={} ipis={} — cross-core-safe counters for the WEDGED core itself; no last-irq timestamp is tracked (last_intid is an INTID, 30 = timer PPI), so a frozen irq_total IS the staleness evidence",
+            episode,
+            cpu,
+            gic::IRQ_TOTAL[c].load(Ordering::Relaxed),
+            gic::IRQ_LAST_INTID[c].load(Ordering::Relaxed),
+            gic::IRQ_UNHANDLED[c].load(Ordering::Relaxed),
+            gic::IRQ_UNHANDLED_LAST[c].load(Ordering::Relaxed),
+            pc.ticks.load(Ordering::Relaxed),
+            pc.ipis.load(Ordering::Relaxed),
+        );
+    }
+    let probe_cpu = percpu::this_cpu().cpu_index as usize;
+    let snap = gic::wedgeprobe_snapshot();
+    let ctl = timer::cntp_ctl();
+    let cval = timer::cntp_cval();
+    let now = timer::cntpct();
+    // Signed distance to the comparator: <= 0 means this core's timer line should be asserted NOW.
+    let to_fire = cval.wrapping_sub(now) as i64;
+    serial_println!(
+        "[wedgeprobe] episode={} probe_cpu={} GICD_CTLR={:#x} (GLOBAL) | probe-core BANKED view (GICv2 banks PPI enable/pend/active + all of GICC per core; CNTP_* are per-core — the wedged core's copies are UNREADABLE from cpu {} and no IPI sample path exists): ppi{} enab={} pend={} act={} gicc ctlr={:#x} pmr={:#x} rpr={:#x} hppir={} | cntp_ctl={:#x} cval-now={}cyc — contrast baseline from a core that is still taking interrupts, NOT the wedged core's state",
+        episode,
+        probe_cpu,
+        snap.gicd_ctlr,
+        probe_cpu,
+        timer::TIMER_INTID,
+        snap.timer_enabled as u8,
+        snap.timer_pending as u8,
+        snap.timer_active as u8,
+        snap.cpuif_ctlr,
+        snap.pmr,
+        snap.rpr,
+        snap.hppir,
+        ctl,
+        to_fire,
+    );
 }
 
 /// EL0-LIVE — the TIMER-TRAIN arm of [`el0live_witness`]: change-suppressed while healthy, unmuted
