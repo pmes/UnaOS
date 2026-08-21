@@ -7051,6 +7051,37 @@ impl XhciController {
                 BOT_PARK_PUMP_REFUSED.load(Ordering::Relaxed));
             return Err(BotError::NoDevice);
         }
+        // BOTCLAIM: the issue-context witness. If either bulk pipe is not Running when this
+        // transaction is BORN, its failure is inherited from an earlier wedge (a prior timeout's
+        // cc=19-failed recovery left the pipe Halted/Stopped and un-repointed), not caused by
+        // anything on the caller's path — in particular not by the block layer's claim/loan
+        // boundary, which moves no controller state (the loan is a Box move, and the loan holder
+        // runs the same `pump_until_bot_done` either way). The 2026-08-21 pi capture shows the
+        // mount's READ(10) (the `:: BLK: io-cause op=read-usb`) issued with epin=2/epout=3 after
+        // the in-bring-up read12 wedge; this line makes that state readable AT ISSUE instead of
+        // being reconstructed from the recovery lines. Printed only in the already-broken state,
+        // so a healthy boot never emits it. Read-only: two volatile output-context reads, same
+        // (uninvalidated, possibly stale — exactly as every existing `ep_state_of` caller reads
+        // it) source the recovery witnesses use.
+        {
+            let (bi, bo) = {
+                let s = &self.slots[slot_id as usize];
+                (s.bulk_in_ep, s.bulk_out_ep)
+            };
+            if bi != 0 && bo != 0 {
+                let si = self.ep_state_of(slot_id, ((bi & 0x0F) * 2) + 1);
+                let so = self.ep_state_of(slot_id, (bo & 0x0F) * 2);
+                if si != 1 || so != 1 {
+                    // QEMU-verified reachable healthy case: epstate=3 (Stopped) right after a
+                    // SUCCESSFUL resync restarts on this transaction's own doorbell (test-arm
+                    // shows the piusb38 recovery probe hitting 3/3 and the next TUR Passing), so
+                    // the line names the states and leaves the verdict to the reading key.
+                    serial_println!(
+                        ":: BOT: [botclaim] issue-context slot={} cdb0={:#04x} epin={} epout={} — transaction born onto non-Running pipe(s). Reading key: 2 (Halted), or 3 (Stopped) behind a FAILED set-deq, means any timeout below is inherited from the earlier wedge — not caused by the issuing path; 3 behind a clean resync restarts on this doorbell and is healthy ::",
+                        slot_id, cdb.first().copied().unwrap_or(0), si, so);
+                }
+            }
+        }
         let first = self.bot_transfer_once(slot_id, cdb, data_phys, data_len, dir);
         let cause = match first {
             // PH-2: a `Failed` CSW is a completed transaction the DEVICE rejected — CHECK
@@ -10873,6 +10904,17 @@ impl XhciController {
             crate::hlt();
             let elapsed = crate::arch::now_cycles().wrapping_sub(start);
             if elapsed >= budget {
+                // BOTCLAIM: the expiry-instant peek — taken FIRST, before a single byte of the
+                // timeout printout below, because the question it answers is precisely whether a
+                // completion was consumable at the moment the budget died or only landed DURING
+                // the multi-line serial dump (tens of ms at metal baud — the window in which the
+                // [piusb40] necropsy can photograph "an event in OUR colour at the dequeue slot"
+                // that did not exist when the pump last looked). Read-only: `has_event` invalidates
+                // and reads the dequeue TRB, consumes nothing, moves no pointer.
+                let bc_fresh_at_expiry = {
+                    let guard = EVENT_RING.lock();
+                    guard.as_ref().map(|r| r.has_event()).unwrap_or(false)
+                };
                 BOT_PUMP_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
                 unsafe {
                     let ir0 = XHCI_IR0_BASE.load(Ordering::Acquire);
@@ -10941,6 +10983,26 @@ impl XhciController {
                 // witnesses above it is unconditional on `bot_pending` — a timeout with nothing
                 // pending still has an event ring worth reading, and that combination is itself
                 // one of the patterns the verdict clauses distinguish.
+                // BOTCLAIM discriminator: the same predicate read AGAIN now that the timeout block
+                // above has been printed, paired with the expiry-instant reading. Printed BEFORE
+                // the necropsy so its verdict clauses can be read against this line. Three
+                // readings, three verdicts:
+                //   * fresh_at_expiry=yes (repeatedly) -> consumer-side defect — the pump's own
+                //     drain failed to consume a live event, and the necropsy's "posted and never
+                //     consumed" clause is a true finding about `has_event`/cycle bookkeeping;
+                //   * fresh_at_expiry=no fresh_now=yes -> print-latency artifact — the event
+                //     landed during this printout, and a necropsy that now finds a fresh event at
+                //     the dequeue slot photographed its own serial delay, not a consumer defect;
+                //   * fresh_at_expiry=no fresh_now=no  -> the transport-wedge verdict stands.
+                let bc_fresh_now = {
+                    let guard = EVENT_RING.lock();
+                    guard.as_ref().map(|r| r.has_event()).unwrap_or(false)
+                };
+                serial_println!(
+                    ":: BOT: [botclaim] expiry-peek slot={} fresh_at_expiry={} fresh_now={} — yes/* convicts the pump's consumer; no/yes convicts print-latency (a necropsy 'posted and never consumed' verdict below is an instrumentation artifact); no/no confirms the transport wedge ::",
+                    slot,
+                    if bc_fresh_at_expiry { "yes" } else { "no" },
+                    if bc_fresh_now { "yes" } else { "no" });
                 self.bot_event_necropsy();
                 // BOT-PARK: charge the exhausted budget to the DEVICE, and classify the wait. A
                 // wait is "dead" only when NOTHING moved anywhere for its whole duration — no event
