@@ -9037,3 +9037,40 @@ the recon path cannot reach a write; the file's write path (CMD24/25) is pre-exi
 ORIN-SDMMC-2/INSTALL-1 work, double-gated behind `sdmmc_arm`/`install_target`, absent from the
 recon build — the old "no write command exists in this file" header claim was stale and has been
 corrected in place. Boot 4 either publishes the block backend or names the dying rung.
+
+### Boots 4e/4f (2026-08-21) — SDID's answer arrives as an SError, and the first CAPSTONE on Orin
+
+**Boot 4e** (`cc82df76`, knobs TEGRA+TEGRA_EL0+RAST+SDMMC): the SDID ladder's first metal flight
+ended in `Unhandled Exception in EL3` — an SError (`esr_el3=0xbe000011`, EC=0x2f async external
+abort) taken from kernel EL2 code (`elr_el3=0x25b153548`, `spsr_el3` M[3:0]=EL2h). The last
+witness on the wire is `M2: pre-reset Host Control 2 = 0x3400`; the fault raised at the rung after
+it (the SRST/clock touch). SDID's named-rung design could not name it because the abort is
+asynchronous and trapped to EL3, above every witness. Boot 3's pre-SDID code never reached this
+rung (it stopped at `no identified card` before the reset). Everything before SDMMC was green
+(bootloader, MMU, XCARVE-6, panel LIVE, JB1/BPMP, HEAP-GUARD); nothing after it ran. The
+block-publish spec line stays PENDING; the next SDID step must make the reset-rung access safe
+(clock/power state proven before the touch) rather than better-witnessed. Full dump in
+`capture/line-acm0/raw.log` past byte 2274859.
+
+**Boot 4f** (same tip, SDMMC omitted — the isolation control): with the fatal rung compiled out,
+the boot ran end to end, convicting the SDMMC path (the reset rung after M2 is the leading suspect; the abort is asynchronous, so an earlier SDMMC access cannot be fully excluded). Verdicts, all content-anchored in
+this boot's window (`capture/orin2-boot4f.log`):
+
+- **`CAPSTONE COMPLETE` printed for the first time on the post-merge trunk scheduler** (pre-merge
+  kernels completed CAPSTONE on this board 2026-07-08 and 2026-07-18, same tegra signature; the
+  post-merge scheduler's pre-staged JD2 queue made the spawn unreachable until CAPSTONE-GATE) —
+  all 6 primitives PASS, tegra
+  signature confirmed (`workers on cores 0 + 0`, the `CAP_CORES=[0,0]` pin — not the virt
+  scrollback signature). The CAPSTONE-GATE witness fired exactly as designed:
+  `drain witnesses SKIPPED (queue not drained at entry — 3 task(s) pre-staged)`. Spec line
+  promoted PENDING → REQUIRE; replay vs this capture: **MBENCH PASS 11/11 REQUIRE, 0 FORBID**.
+- **RAST-MC on metal**: 5 secondary cores online and dispatching, pipeline width 5 (render cores
+  1–5, present on core 0), 1-core baseline 90 frames / 680 ms = 132.4 fps, 3000 KiB buffers off
+  the 48 MiB heap.
+- **el0-hello round-trip PASS** re-proven on this tip (SVC EC=0x15 nr=1 live).
+- **DARKWIN guard: 89 byte(s) dropped pre-map** — same magnitude as boot 2's second cycle.
+- **JB11 armed census** ran (BAR2 IOCTL_CFGTBL_READ path, no xHCI operational register written).
+  The suppressed control boot (`UNAOS_NOJB11=1` rebuild) is still owed for the XCARVE pair.
+- **IRQEL-RT EL1 live-arm: still unproven on metal.** The only `timer LIVE: IRQ delivery
+  confirmed` witness precedes the JM6 EL2→EL1 drop (capture lines 1013 vs 1437), so it is the EL2
+  arm again; no interrupt was taken at EL1 this boot. The EL1 half remains compile-proven only.
