@@ -88,11 +88,16 @@ pub mod install;
 // SELFHOST-2 needed the same primitives without dragging the installer engine in behind
 // `installdemo`; `install` re-exports it, so every `crate::install::hash::…` call site is unchanged.
 // Compiled only for the features that consume it — no consumer, no code.
+// BT-BOND M1 joined this list: `fs/holocron.rs` stamps a CRC-32/ISO-HDLC over its header and over
+// every record, and it uses THIS implementation rather than a private copy so that an image the
+// kernel wrote is checkable by the same host tools (and the same `crc32fast` variant) the GPT writer
+// and the gzip trailer check already agree with.
 #[cfg(any(
     feature = "installdemo",
     feature = "install_target",
     feature = "piinstall",
-    feature = "selfhost"
+    feature = "selfhost",
+    feature = "holocron"
 ))]
 pub mod hash;
 

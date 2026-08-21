@@ -158,3 +158,34 @@ REQUIRE :: \[fatverb\] storage witness: exec=[a-z-]+ read=[a-z-]+ gate=[a-z-]+ w
 # the spec never gated it (FIXTURE_FLAKES.md §1b). The gen-rebind fence fix (53c630eb) closed
 # the slot_reused variant; this REQUIRE makes any recurrence a red gate, not a scrollback find.
 REQUIRE :: SOCK-4: transferable sockets — grantee received \+ round-tripped the moved socket, grantor's migrated-away handle -EACCES, gen-rebind rejected, teardown clean -> PASS ::
+
+# --- BT-BOND M1 / HOLOCRON (added 2026-08-21): the classed-record store's four witnesses ---------
+# --- SCOPE, and why these are OPTIONAL here rather than REQUIRE. This file's contract, stated at
+# --- the top, is that BOTH the default (knob-off) and the knob-on builds pass it. `holocron` is
+# --- DEFAULT OFF, so a REQUIRE would red the default `UNAOS_FATIMG=sf ./arroyo test 150` gate on
+# --- every run — the exact failure the STOR-1 block above documents for its own knob-gated lines.
+# --- So this file uses the idiom that block established: OPTIONAL presence (so a knob-on run's
+# --- witnesses are recognised and a knob-off run stays silent and green) PLUS an explicit per-
+# --- witness FORBID on the FAIL variant, which is what actually gates. The hard REQUIREs for the
+# --- armed configuration live in `x86-holocron.spec`, whose whole scope is a
+# --- `UNAOS_HOLOCRON=1 ./arroyo test-fat sf 150` capture.
+# --- The BT-BOND design asks for a REQUIRE in THIS file; that is the one place the design and this
+# --- tree could not both be satisfied, and the split above is the resolution — see usb_xhci.md §28.
+# --- All four use the `-> PASS ::` idiom, so they DO add to the COUNT above on a knob-on run;
+# --- harmless, because mbench COUNT is `>= n`, never `== n`.
+# --- MINIMUM BUILD GENERATION — the BT-BOND M1 commit (2026-08-21). Older images cannot print them.
+# --- VERIFICATION PROVENANCE: all six directives were replayed against a real capture from THIS
+# --- host — `UNAOS_HOLOCRON=1 ./arroyo test-fat sf 150`, kept as
+# --- `~/unaos-bench/scratch/qemu-x86-btbond-m1.log` because `unaos/target/serial.log` is overwritten
+# --- by the next run — and against a knob-OFF capture of the same gate, where all four stay silent.
+OPTIONAL :: \[hcron\] framing fixture: [0-9]+/[0-9]+ legs .*-> PASS ::
+OPTIONAL :: \[btbond\] codec fixture: [0-9]+/[0-9]+ legs .*-> PASS ::
+OPTIONAL :: \[hcron\] store round-trip: .*-> PASS ::
+OPTIONAL :: \[btbond\] store round-trip: .*-> PASS ::
+FORBID \[hcron\] framing fixture: .*-> FAIL ::
+FORBID \[btbond\] codec fixture: .*-> FAIL ::
+FORBID \[hcron\] store round-trip: .*-> FAIL ::
+FORBID \[btbond\] store round-trip: .*-> FAIL ::
+# --- The flush guard: a store write from inside the EHCI service pass is the bug the whole seam
+# --- exists to avoid, so its refusal witness firing at all is a gate failure, knob-on or knob-off.
+FORBID \[hcron\] flush REFUSED

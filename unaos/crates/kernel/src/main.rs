@@ -1109,6 +1109,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }
             // Once storage is up, mount + log the FAT volume geometry (one-shot).
             unaos_kernel::fs::fat::probe_once();
+            // BT-BOND M1 (holocron knob): the classed-record store's whole main-loop presence — one call,
+            // here, beside `probe_once` and for the same reason that one is here rather than in a driver: the
+            // deferred write MUST run with no driver lock held. The Bluetooth chain that produces the record
+            // this store exists for runs inside `service_ehci_hid()` holding `EHCI_HID`, and the writable FAT
+            // volume rides USB mass storage serviced from that same pass — so a filesystem write issued from
+            // in there would contend the xHCI storage loan from inside the EHCI service pass AND hold the
+            // internal keyboard and trackpad hostage for its duration. The producer marks RAM dirty under the
+            // lock; THIS call site does the I/O. `flush_if_dirty` re-checks that invariant rather than trusting
+            // the placement (it refuses while `EHCI_HID` is held), so a future call site that gets it wrong
+            // goes loud instead of wedging. One-shot inside: the pure fixtures fire on the first pass, the load
+            // latches once storage is up, and the flush costs a relaxed atomic load per iteration thereafter.
+            // Like `fatverb_storage_witness`, it sits at ALL THREE storage-ready passes this file carries,
+            // because which pass a given build reaches depends on its knobs.
+            #[cfg(feature = "holocron")]
+            unaos_kernel::fs::holocron::service();
             // SELFHOST-2 (x86, selfhost knob): verify the medium's own SRC.TGZ against SRC.SHA and
             // walk the tar, one-shot. It belongs beside `probe_once` for the same reason that one
             // does: it needs storage up and the volume lock free. Read-only throughout. Like the
@@ -1570,6 +1585,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // Once storage is up, mount + log the FAT volume geometry (one-shot). Runs with the xHCI
         // lock released; read_block re-locks it briefly, so there is no nested-lock hazard.
         unaos_kernel::fs::fat::probe_once();
+        // BT-BOND M1 (holocron knob): the classed-record store's whole main-loop presence — one call,
+        // here, beside `probe_once` and for the same reason that one is here rather than in a driver: the
+        // deferred write MUST run with no driver lock held. The Bluetooth chain that produces the record
+        // this store exists for runs inside `service_ehci_hid()` holding `EHCI_HID`, and the writable FAT
+        // volume rides USB mass storage serviced from that same pass — so a filesystem write issued from
+        // in there would contend the xHCI storage loan from inside the EHCI service pass AND hold the
+        // internal keyboard and trackpad hostage for its duration. The producer marks RAM dirty under the
+        // lock; THIS call site does the I/O. `flush_if_dirty` re-checks that invariant rather than trusting
+        // the placement (it refuses while `EHCI_HID` is held), so a future call site that gets it wrong
+        // goes loud instead of wedging. One-shot inside: the pure fixtures fire on the first pass, the load
+        // latches once storage is up, and the flush costs a relaxed atomic load per iteration thereafter.
+        // Like `fatverb_storage_witness`, it sits at ALL THREE storage-ready passes this file carries,
+        // because which pass a given build reaches depends on its knobs.
+        #[cfg(feature = "holocron")]
+        unaos_kernel::fs::holocron::service();
         // SELFHOST-2 (x86, selfhost knob): the source-verify + tar walk, one-shot — see the note at
         // the first loop site. This is the pass a headless `test`/`test-fat` boot reaches.
         #[cfg(all(target_arch = "x86_64", feature = "selfhost"))]
@@ -4348,6 +4378,21 @@ fn x86_usb_pump(cpu: usize) {
         // Once storage is up, mount + log the FAT volume geometry (one-shot). Runs with the xHCI lock
         // released; `read_block` re-locks it briefly.
         unaos_kernel::fs::fat::probe_once();
+        // BT-BOND M1 (holocron knob): the classed-record store's whole main-loop presence — one call,
+        // here, beside `probe_once` and for the same reason that one is here rather than in a driver: the
+        // deferred write MUST run with no driver lock held. The Bluetooth chain that produces the record
+        // this store exists for runs inside `service_ehci_hid()` holding `EHCI_HID`, and the writable FAT
+        // volume rides USB mass storage serviced from that same pass — so a filesystem write issued from
+        // in there would contend the xHCI storage loan from inside the EHCI service pass AND hold the
+        // internal keyboard and trackpad hostage for its duration. The producer marks RAM dirty under the
+        // lock; THIS call site does the I/O. `flush_if_dirty` re-checks that invariant rather than trusting
+        // the placement (it refuses while `EHCI_HID` is held), so a future call site that gets it wrong
+        // goes loud instead of wedging. One-shot inside: the pure fixtures fire on the first pass, the load
+        // latches once storage is up, and the flush costs a relaxed atomic load per iteration thereafter.
+        // Like `fatverb_storage_witness`, it sits at ALL THREE storage-ready passes this file carries,
+        // because which pass a given build reaches depends on its knobs.
+        #[cfg(feature = "holocron")]
+        unaos_kernel::fs::holocron::service();
         // SELFHOST-2 (x86, selfhost knob): the source-verify + tar walk, one-shot — see the note at
         // the first loop site. This is the pass the GUI/desktop boot reaches, i.e. the metal boot.
         #[cfg(all(target_arch = "x86_64", feature = "selfhost"))]

@@ -382,6 +382,19 @@ _feats=""
 # sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature disabled
 # while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson).
 [ -n "${UNAOS_BTC:-}" ] && _feats="${_feats}btc,"
+# BT-BOND M1 / HOLOCRON: UNAOS_HOLOCRON=1 arms the kernel-side classed-record store — one CRC'd file
+# (`/HCRON/BTBOND.DAT`) on the writable FAT volume, a fixed in-RAM table, and the load/flush pair that
+# lets a record be PRODUCED under a driver lock (`EHCI_HID`, where the Bluetooth link key arrives) and
+# WRITTEN somewhere else entirely (the main loop, storage-gated, no lock held). `src/fs/holocron.rs`
+# is the seam; `src/drivers/ehci/btbond.rs` is its first client (class 0x01, one bond record).
+# NOT stripped by `arm_features` below, unlike bt/btc: the seam is arch-neutral and emits real
+# aarch64 code, so stripping it would DISARM the knob on aarch64 rather than preserve byte-identity.
+# The bond client sits inside the x86-gated `drivers/ehci/`, so an armed aarch64 build gets the store
+# and its framing fixture and nothing Bluetooth-shaped. M1 adds no HCI command and no radio access at
+# all; the SSP wiring is M2 and rides `btc`. Default OFF => both modules and every call site vanish,
+# media byte-identical on both arches. Kept in sync with builder/src/main.rs — a knob mapped HERE and
+# missing THERE ships the feature disabled while the banner claims it is on (s42/INSTGUI, WXN-M3b).
+[ -n "${UNAOS_HOLOCRON:-}" ] && _feats="${_feats}holocron,"
 # INSTALL-CORE: UNAOS_INSTALLDEMO=1 arms the installer engine + its x86 boot witness (GPT writer +
 # FAT32 formatter + extent content-verify). The builder attaches a dedicated BLANK scratch disk over
 # the usb-storage slot under this knob (see builder/src/main.rs), against which the engine writes a

@@ -41,8 +41,23 @@ pub mod qh;
 /// that proves them. Split out of this file so the decode can be exercised WITHOUT a radio —
 /// by `bt_name_fixture` on any boot, and by `tools/btname_harness.rs`, which `include!`s the
 /// same source rather than a copy of it. See that file's header for why Boot AR forced this.
-#[cfg(feature = "bt")]
+///
+/// BT-BOND M1 widened this gate to `any(bt, holocron)`. The bond store's witnesses render a stored
+/// BD_ADDR, and the wire-order-vs-display-order of an address is precisely the thing this tree has
+/// already been bitten by — so `btbond.rs` shares `bt_addr_render_msb` / `bt_addr_eq` from here
+/// rather than carrying a second copy of that decision. On a `holocron`-without-`bt` build the rest
+/// of this module genuinely has no consumer, hence the scoped `allow(dead_code)`: the alternative
+/// is a duplicate renderer, which is the failure mode the file exists to prevent.
+#[cfg(any(feature = "bt", feature = "holocron"))]
+#[cfg_attr(not(feature = "bt"), allow(dead_code))]
 mod bt_name;
+
+/// BT-BOND M1 — the bond record schema, its codec, the table rules (replace-not-append, LRU
+/// eviction, lookup by either identity form) and the fixture that proves all three with no radio.
+/// Pure functions over slices; the SSP wiring that will call into it is M2. `holocron` knob.
+#[cfg(feature = "holocron")]
+pub mod btbond;
+
 #[cfg(feature = "bt")]
 use bt_name::{
     bt_addr_case_passes, bt_addr_eq, bt_addr_matches, bt_addr_order_holds, bt_addr_render_msb,

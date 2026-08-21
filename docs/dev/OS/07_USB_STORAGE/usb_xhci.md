@@ -7152,9 +7152,226 @@ deferred-write path that turns this session bond into a persistent one.
 
 ---
 
+## 28. BT-BOND — the Holocron seam and the bond store (`UNAOS_HOLOCRON=1`, 2026-08-21)
+
+§27.3 names the gap this section closes: the link key SSP produces lives in
+`Controller::bt_ssp_key`, in RAM, for one session. A real bond survives power-off. The obstacle was
+never the filesystem — it was **where the key arrives**. This section is the store, the seam it sits
+on, and the deferral that makes writing it possible at all.
+
+**Milestone status.** M1 (this section as written) landed the seam, the record schema, the codec, the
+table rules and the proofs. It adds **no HCI command and no radio access whatsoever**: nothing in
+`bt_ssp_pair` calls into the store yet, so §27.3's gap paragraph is still accurate and is
+deliberately left standing. **M2** wires the Link Key Notification and Link Key Request arms to the
+store and rewrites §27.3 accordingly; **M3** proves eviction end to end and finishes the LE-identity
+population rule. Reading §27.3 and §28 together today: the mechanism exists and is proven; the
+driver has not yet been pointed at it.
+
+### 28.1 The re-entrancy wall (why this is not just a file write)
+
+The whole BT chain runs inside one `service_ehci_hid()` pass holding the `EHCI_HID` mutex
+(`drivers/ehci/mod.rs`). The writable FAT volume rides USB mass storage whose I/O goes through
+`drivers/block.rs` → `xhci::claim()` + `storage_read10`/`write10`. A filesystem write issued from
+inside the BT chain would therefore
+
+* contend the xHCI storage loan **from inside** the EHCI service pass, and
+* hold the internal keyboard and trackpad hostage for the write's duration — on top of the 8 s
+  worst case §27.1's operator note already describes.
+
+So the store is split in two, and the split is the whole design:
+
+| Phase | Where it runs | What it costs |
+| --- | --- | --- |
+| `holocron::put` / `remove` (and `btbond::stage_store` / `stage_remove` above them) | anywhere, lock held or not | a `memcpy` into a fixed table and a `bool`. No I/O, no allocation, no wait. |
+| `holocron::flush_if_dirty` | the main loop, storage-gated, no driver lock held | one whole-file rewrite through the FAT write path. |
+
+`flush_if_dirty` **checks that invariant rather than asserting it in a comment**: on x86 with the HID
+path built it consults `EHCI_HID.is_locked()` and refuses, loudly, rather than issuing block I/O from
+inside a service pass. A future call site that gets the placement wrong prints
+`:: [hcron] flush REFUSED — EHCI_HID is held …` instead of wedging the machine.
+
+### 28.2 Where the code lives
+
+| File | Contents | Gate |
+| --- | --- | --- |
+| `src/fs/holocron.rs` | the seam: framing, CRC, class registry, in-RAM table, `load_once` / `flush_if_dirty`, the framing fixture, the store round-trip selftest | `holocron` |
+| `src/drivers/ehci/btbond.rs` | the first client: bond record schema v1, codec, table rules, either-form lookup, the codec KAT | `holocron` (inside the x86-gated `drivers/ehci/`) |
+
+`handlers/holocron/` remains a ring-3 design-stage stub — no crate, no entry point, no code. This is
+therefore **not** an RPC to a handler that does not exist: it is the minimal kernel-side vault the
+future userspace Holocron adopts. The seam is arch-neutral (it drives only `fs::fat` and
+`crate::hash`), so an armed aarch64 build gets the store and its framing fixture and nothing
+Bluetooth-shaped; the bond client sits inside `drivers/ehci/`, which is
+`all(target_arch = "x86_64", feature = "ehcihid")`-gated.
+
+**Named-path divergence, recorded because it is real.** The BT-BOND design specifies the rewrite
+"through the VFS/FAT write path (`fs/vfs.rs` `create`/`write`)". In this tree
+`impl VfsBackend for FatBackend` — with `resolve_parent`, `fat_err` and `fat_create_err` — is
+`#[cfg(target_arch = "aarch64")]`. On x86_64, the platform this arc is for, `FatBackend` is a struct
+with no backend impl and cannot be mounted into a `MountTable` at all. The store therefore calls
+`fs::fat`'s dir-aware twins directly (`locate_in_dir` / `create_dir` / `create_in_dir` /
+`delete_located` / `write_grow`) — the exact primitives the aarch64 `FatBackend` adapter wraps,
+reached the way the arch-neutral `shell.rs` file verbs and `flight_recorder.rs` already reach them,
+landing on the same `block::write_block_usb` BOT WRITE(10) path. Adding an x86 arm to `fs/vfs.rs` is
+the alternative and is out of this arc's lane.
+
+### 28.3 On-disk format (v1) — `/HCRON/BTBOND.DAT`
+
+```text
+header:  magic "HCRN" | ver u8 = 1 | count u8 | seq u32 (LE) | hdr_crc32 (LE)     -- 14 bytes
+record:  class u8 | len u8 | body[len] | crc32(class, len, body) (LE)             -- 6 + len bytes
+```
+
+`hdr_crc32` covers the ten bytes before it. Each record's CRC covers its **framing bytes as well as
+its body**, so a flipped `class` or `len` is caught by the same check that catches a flipped body
+byte. CRC-32/ISO-HDLC comes from the arch-neutral `src/hash.rs` — the same variant the GPT writer and
+the gzip trailer check already use — so an image the kernel wrote is checkable by host tools without
+new code. `seq` is a monotonic write counter, bumped on every successful flush; there is no RTC on
+this machine, so `seq` is the only clock the store has.
+
+The directory and leaf are 8.3-clean by construction (`HCRON`, `BTBOND.DAT`); the store creates
+`/HCRON` on first use. The write is a **whole-file rewrite** (delete-then-create, the tree's own
+`shell.rs::fs_write` idiom) because the record count can shrink and an in-place overwrite would leave
+a tail of the previous image behind.
+
+**Fail-closed, with no partial adoption.** Bad magic, an unknown version, a bad header CRC, a bad
+record CRC, a truncated body, an over-long body, more records than the table holds, or trailing bytes
+past the last record — every one refuses the **whole** image and the store starts empty, witnessed
+with which refusal fired. A store that adopted the records it managed to read before the damage would
+be a store whose contents depend on where the corruption happened to land. On a refused load the
+table is marked dirty, so the next flush **replaces** the bad image rather than leaving a file every
+future boot will refuse identically.
+
+**Keys.** The framing carries no key field: the key is a span *inside* the body, declared per class
+by `class_key_span`. `put` takes the caller's key explicitly and refuses a key that does not equal
+that span, so a class codec and the store cannot drift apart about what a record's identity is. Class
+registry, v1: `HCRON_CLASS_BTBOND = 0x01`, key = `bd_addr`, six bytes at body offset 2.
+
+### 28.4 Bond record schema v1 (class 0x01 body)
+
+```text
+ver           u8   = 1
+flags         u8    bit0: LE identity present; bits 1..7 reserved = 0
+bd_addr       [6]   BR/EDR page address, WIRE order (LSB first)
+bd_addr_type  u8    0x00 public — mirrors the HCI address-type vocabulary
+link_key      [16]
+key_type      u8    verbatim from Link Key Notification (0x04..0x08)
+le_addr       [6]   LE identity/advertise address, wire order (zeros when flags bit0 is clear)
+le_addr_type  u8    0x00 public / 0x01 random (meaningful only when flags bit0 is set)
+seq_used      u32   the holocron write counter at last successful use — the LRU clock
+```
+
+**37 bytes.** (The BT-BOND design document tallies this same field list as "31 bytes"; that is an
+arithmetic slip in the prose, not a different layout. The field list is normative.)
+
+**Both identity forms from day one.** Today the only address this tree knows is the LE advertise
+address (`bt_name.rs`'s `BT_L3_PEER_ADDR_BYTES`, `88:c6:26:cc:2d:3c`); the BR/EDR page address is
+whatever `Connection Complete` binds a handle to, and §26's page trains to the advertised address
+still time out — the live hypothesis being that a dual-mode device pages under a different BR/EDR
+address. Carrying both forms means that when the address question resolves, a bond written by the
+pairing path already records the address it authenticated on **and** the address the peer was first
+seen under, so a lookup by either form hits the same record and no schema bump is needed.
+
+**Lookup rule.** `bd_addr` first (the primary key, one indexed hit); on a miss, a record whose
+`le_addr` equals the query address and whose presence flag is set. The witness names which form
+answered — that line is evidence about the address hypothesis, for free.
+
+**Table rules.** `BTBOND_MAX = 4`. `bd_addr` is the primary key, so a re-pair of a known address
+**replaces** its record rather than appending — §27.3's "one bond entry per boot" accumulation cannot
+happen. When the class is full and a new address arrives, the record with the smallest `seq_used` is
+evicted, witnessed. LRU by write counter, because there is no clock.
+
+### 28.5 At-rest posture (what is claimed, and what is not)
+
+The FAT volume is plaintext and this machine has no protected key storage — no TPM, no SEP path.
+v1 stores the link key **plaintext-on-media, CRC'd, and says so**. The CRC is torn-write detection,
+**not** authentication: it stops a half-written record from being adopted; it stops nobody who can
+write the file. A kernel-embedded cipher key would be theatre — recoverable from the image by anyone
+holding the medium — and is explicitly not claimed.
+
+What v1 does enforce is process hygiene: key bytes are never printed to serial (the standing
+`bt-ssp` law, extended — every `[btbond]` witness carries addresses, key *types*, counts and
+sequence numbers, never key material), staging buffers are zeroized on every exit path including the
+fixtures', and a vacated table slot is wiped rather than merely unlinked.
+
+Threat scope, stated plainly: the asset is a BR/EDR unauthenticated combination key for a
+loudspeaker. Exposure of the file to someone holding the physical medium enables impersonating this
+host *to the speaker*, or eavesdropping that link. It does not open the machine. Vault encryption
+(hardware-backed or passphrase-derived) is Holocron-proper's job and the format's `ver` byte is the
+migration hook. The ledger entry is in [`SECURITY.md`](../../../SECURITY.md).
+
+### 28.6 Boot ordering, stated rather than engineered around
+
+`service_ehci_hid()` — where the boot-time BT chain runs — is polled from the very first main-loop
+passes, while the FAT mount is a later storage-ready one-shot. So on a boot that arms the radio, the
+first BT chain **can** run before the store is loadable. That window is real and this design accepts
+it rather than reordering boot: `holocron::is_loaded()` exists precisely so a miss taken inside the
+window is witnessed as *"store not loaded yet"* rather than as *"no such bond"*. The paths that
+matter for reconnection — the `Ctrl+Alt+B` re-trigger (§25) and any future auto-reconnect — run long
+after storage is up.
+
+The store's whole main-loop presence is one call, `fs::holocron::service()`, placed beside
+`fs::fat::probe_once()` at all three storage-ready passes `main.rs` carries (which pass a given build
+reaches depends on its knobs; the one-shots inside make it speak exactly once). Order inside is the
+argument in miniature: pure fixtures → `load_once` → the class clients → `flush_if_dirty` **last**,
+so a record staged this pass reaches the medium this pass — deferred past the driver's lock, not
+deferred by a whole extra loop iteration.
+
+### 28.7 What QEMU proves, and what only metal can
+
+QEMU models no BT controller — the internal hub and radio are bench hardware — so every HCI leg is
+metal-only. What a QEMU boot *can* prove, and does:
+
+1. **Compile + reachability.** `./arroyo check` green on both arches, armed and unarmed; `strings` on
+   a `UNAOS_HOLOCRON=1` builder-path kernel shows the `[hcron]` and `[btbond]` witness families, and
+   a default build shows none (the §27.4 discipline, extended). The knob is mapped in **both**
+   `arroyo` and `builder/src/main.rs` — mapped in one alone would put `holocron` in the
+   `⚡ kernel features:` banner over a kernel with both modules compiled out.
+2. **The framing fixture** (`:: [hcron] framing fixture … -> PASS ::`) — pure, no hardware. Eight
+   legs: a clean serialize→parse round-trip, then every refusal **made to fire** (body CRC, header
+   CRC, truncation, trailing bytes, magic, version), then the untouched copy still parsing, so seven
+   refusals cannot be a parser that refuses everything.
+3. **The codec KAT** (`:: [btbond] codec fixture … -> PASS ::`) — pure. A synthetic Link Key
+   Notification (the 25-byte assembly the SSP arm parses) → record → encode → decode field-identical;
+   short and wrong-version refusals; the class registry's key span agreeing with the schema's
+   `bd_addr`; the either-form lookup rule discriminating; and record → holocron framing → parse →
+   decode with a one-byte corruption refused in between.
+4. **The store round-trip through real FAT** — two witnesses, both self-cleaning:
+   `:: [hcron] store round-trip … -> PASS ::` writes an image to a scratch leaf, reads it back
+   byte-identical, then flips one byte **on the medium** and proves the load refuses it; and
+   `:: [btbond] store round-trip … -> PASS ::` stages a fixture bond on `aa:bb:cc:dd:ee:ff` through
+   the real table, flushes it, looks it up by **both** identity forms, then evicts and re-flushes so
+   the medium is left as it was found.
+
+   Gate: `UNAOS_HOLOCRON=1 ./arroyo test-fat sf 150`, asserted by `scripts/specs/x86-fat.spec`.
+
+Mock *HCI event* injection into `bt_ssp_pair` is deliberately not attempted: that dispatch loop is
+welded to the EP0/interrupt-EP transport, and a mock seam there would be invasive scaffolding for
+little proof. The parse arm is covered by the codec KAT instead.
+
+**The metal falsifier, which is not this milestone's job:** pair → power-cycle → the Link Key Request
+answered from a persisted bond → `Authentication Complete` status 0x00 with **no SSP exchange**. It
+needs M2's wiring. Known risk, stated: §26's page trains to the speaker still time out, so the metal
+proof may need the discoverable-inquiry discriminator to land first. The QEMU-provable store is
+correct independently of it.
+
+### 28.8 Standing holds, respected by construction
+
+* **Scan_Enable hold.** This path adds **zero** HCI commands. M1 touches no HCI surface at all;
+  M2 will touch `Link_Key_Request_Reply`, which §27 already sends. No `HCI_Write_Scan_Enable`
+  (0x0C1A) call site exists anywhere in the tree and this work introduces none — reconnection stays
+  outgoing-page-shaped. The hold needs no exception and none is designed around.
+* **Key bytes never on serial.** Every `[btbond]` and `[hcron]` witness carries addresses, key types,
+  counts and sequence numbers. Never key material.
+* **Default OFF.** With the knob unset both modules and every call site vanish and both arches are
+  byte-identical. Unlike `bt`/`btc`, `holocron` is **not** stripped by `arm_features`: the seam emits
+  real aarch64 code, so stripping it would silently disarm the knob rather than preserve a
+  byte-identity that does not apply.
+
+---
+
 ## 29. KBDFLAP — a stalled interrupt endpoint was retired for the boot, anonymously (2026-08-21)
 
-*(§28 is reserved for the Bluetooth bond-persistence store, in flight in a parallel session.)*
 
 ### The observation
 

@@ -41,3 +41,13 @@ pub mod unafs;
 /// and doc land alone so the design can be reviewed before consumers move onto
 /// it (shell/syscall adoption is a follow-up).
 pub mod vfs;
+
+/// HOLOCRON (BT-BOND M1, `holocron` knob): the kernel-side classed-record store — one CRC'd file on
+/// the writable FAT volume, a fixed in-RAM table, and a load/flush pair whose whole reason for
+/// existing is that the record's producer (the Bluetooth chain, under the `EHCI_HID` mutex) may not
+/// be the thing that writes it. Arch-neutral: it drives only [`fat`] + [`crate::hash`], so the same
+/// code compiles and runs on the x86_64 and aarch64 storage paths. Design of record:
+/// `docs/dev/OS/07_USB_STORAGE/usb_xhci.md` §28. DEFAULT OFF => module and call sites vanish and
+/// every artifact is byte-identical.
+#[cfg(feature = "holocron")]
+pub mod holocron;

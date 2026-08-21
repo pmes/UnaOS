@@ -308,6 +308,16 @@ fn main() {
     // and WXN-M3b failure). Default OFF => the page code and its constants unlinked, media
     // byte-identical. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_BTC").is_ok() { feats.push("btc"); }
+    // BT-BOND M1 / HOLOCRON: UNAOS_HOLOCRON=1 arms the kernel-side classed-record store
+    // (`src/fs/holocron.rs`) and its first client, the bond record codec + table
+    // (`src/drivers/ehci/btbond.rs`). THIS list is what reaches the kernel binary for MEDIA builds
+    // and for every QEMU run that goes through the builder, so a knob wired into arroyo alone would
+    // put `holocron` in the `⚡ kernel features:` banner over a kernel with both modules compiled
+    // OUT — the s42/INSTGUI and WXN-M3b failure, and the exact reason this arc's gate proves the
+    // witness family with `strings` against the builder-path artifact rather than trusting the
+    // banner. M1 issues no HCI command and touches no radio. Default OFF => modules and call sites
+    // unlinked, media byte-identical. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_HOLOCRON").is_ok() { feats.push("holocron"); }
     // K-GPU: UNAOS_KEPLER=1 arms the GK107 (GT 650M) driver — probe/EVO-decode/PFIFO are further
     // gated by UNAOS_KEPLER_TAKEOVER / UNAOS_KEPLER_FIFO (option_env!, compile-time). Kept in sync
     // with arroyo's mapping. (The builder rebuilds the kernel, so this MUST be here or the feature

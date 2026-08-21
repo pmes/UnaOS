@@ -553,6 +553,27 @@ bt = ["ehcihid"]
 # `drivers/ehci/mod.rs`. Default OFF => the page code, its constants and the classic latch vanish.
 # x86_64 only; `arm_features` strips it so aarch64 media stay byte-identical.
 btc = ["bt"]
+# BT-BOND M1 / HOLOCRON: `UNAOS_HOLOCRON=1` arms the kernel-side classed-record store — one CRC'd
+# file (`/HCRON/BTBOND.DAT`) on the writable FAT volume, a fixed in-RAM table, and the load/flush
+# pair that lets a record be PRODUCED under a driver lock and WRITTEN somewhere else entirely.
+#
+# WHY IT IS ITS OWN KNOB rather than riding `btc`. The seam is not Bluetooth: `src/fs/holocron.rs` is
+# arch-neutral (it drives only `fs::fat` + `crate::hash`) and it is the module the future userspace
+# Holocron vault adopts. `src/drivers/ehci/btbond.rs` is its first CLIENT — class 0x01, one bond
+# record — and it is pure byte handling with no MMIO and no `Controller`, so it compiles and its
+# fixture runs on a build that never touches a radio. M2 wires that client into `bt_ssp_pair`, and
+# THAT half is `btc`-gated, where the standing "a boot that did not ask for a page must be incapable
+# of issuing one" argument belongs.
+#
+# NOT stripped by `arm_features`, unlike `bt`/`btc`: the seam emits real aarch64 CODE (the module is
+# declared in `fs/mod.rs` with no arch gate and the framing fixture runs on both arches), so
+# stripping it would silently DISARM the knob on aarch64 rather than preserve a byte-identity that
+# does not apply. The bond CLIENT lives inside the x86-gated `drivers/ehci/`, so an armed aarch64
+# build gets the store and the framing proof and nothing Bluetooth-shaped.
+#
+# DEFAULT OFF => `fs/holocron.rs`, `drivers/ehci/btbond.rs` and every call site vanish, and both
+# arches are byte-identical to a build without the knob. Kept in sync with arroyo.
+holocron = []
 # SMOLNET-DEFAULT (2026-07-17): the mature smoltcp TCP/IP stack (ROADMAP §1b) is the DEFAULT x86 net
 # path — the shell's ping/arp/netinfo, the socket syscall family (SOCK-2..7), the DNS sinkhole
 # (zeolite), and the boot witnesses. Pulls in the x86-only smoltcp optional dependency and compiles
