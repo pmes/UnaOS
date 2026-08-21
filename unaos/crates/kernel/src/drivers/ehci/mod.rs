@@ -130,6 +130,14 @@ struct IntEp {
     layout: Option<ReportLayout>,
     reports: u32,
     dead: bool,
+    /// KBDFLAP: how many `ClearFeature(ENDPOINT_HALT)` recoveries this endpoint has spent, capped
+    /// at [`HALT_CLEARS_MAX`]. Per ENDPOINT, not per controller, for the same reason KBDWIT's
+    /// silence clock is: on the boot this exists for, the trackpad on the SAME device was streaming
+    /// while the keyboard was stalled, so any shared budget would have been spendable by an
+    /// endpoint that never needed it. Counts ATTEMPTS, incremented when the clear is queued rather
+    /// than when it succeeds, so a device that refuses the request cannot buy an unbounded number
+    /// of refusals.
+    halt_clears: u8,
     /// CLICK-1: previous report's button bitmask, for button-DOWN edge detection (one
     /// `pal::Event::Button` per press, nothing on release/hold).
     prev_buttons: u8,
@@ -11704,6 +11712,8 @@ impl Controller {
             layout,
             reports: 0,
             dead: false,
+            // KBDFLAP: a freshly armed endpoint has spent no recovery budget.
+            halt_clears: 0,
             prev_buttons: 0,
             kbd_prev_keys: [0; 6],
             kbd_prev_mods: 0,
@@ -11758,6 +11768,51 @@ impl Controller {
         unsafe { &mut DMA_POOLS[self.idx] as *mut qh::DmaPool }
     }
 
+    /// KBDFLAP — re-arm an interrupt endpoint whose device-side stall has JUST been cleared.
+    ///
+    /// Called from one place only: the post-walk clear stage in [`Self::service`], and only after
+    /// `ClearFeature(ENDPOINT_HALT)` was accepted. Calling it without that clear would be the
+    /// precise error `BtL3State::stopped` warns about — writing a fresh `QTD_ACTIVE` overlay clears
+    /// the QH's *Halted* bit while the DEVICE's stall condition survives, so the host would poll a
+    /// wedged endpoint forever and every witness would read healthy.
+    ///
+    /// TOGGLE IS THE OTHER HALF OF §9.4.5, and it is why this is not just the service loop's
+    /// ordinary re-arm with a different caller. The ordinary re-arm FLIPS `e.toggle` because it is
+    /// continuing a stream; ClearFeature(ENDPOINT_HALT) resets the DEVICE's toggle to DATA0, so the
+    /// host must start from DATA0 too or the first post-recovery packet is discarded as a
+    /// retransmission and the endpoint reads silent for a second time — the same failure wearing a
+    /// different mask.
+    ///
+    /// Everything else — the transfer total, the buffer, the overlay-vs-qTD split — is the arming
+    /// path's, unchanged; the QH is still linked into the frame list and PSE is still on, so
+    /// nothing about the schedule needs touching.
+    unsafe fn rearm_after_halt_clear(&mut self, ep_i: usize) {
+        let om = self.overlay_mode;
+        let e = &mut self.int_eps[ep_i];
+        e.toggle = false;
+        // MT-INVESTIGATION (IVY): re-arm for the SAME total the endpoint was armed with — a
+        // `#[cfg]` pair for the identical reason the service-loop re-arm carries one.
+        #[cfg(not(feature = "mtraw"))]
+        let rx = e.mps as u32;
+        #[cfg(feature = "mtraw")]
+        let rx = e.rx_total;
+        if om {
+            (*e.qh).overlay[0] = PTR_TERMINATE;
+            (*e.qh).overlay[1] = PTR_TERMINATE;
+            (*e.qh).overlay[3] = e.buf_phys as u32;
+            (*e.qh).overlay[4] = 0;
+            core::ptr::write_volatile(
+                &mut (*e.qh).overlay[2],
+                QTD_ACTIVE | QTD_CERR3 | (rx << QTD_TOTAL_SHIFT) | QTD_PID_IN | QTD_IOC,
+            );
+        } else {
+            write_qtd(e.qtd, PTR_TERMINATE, QTD_PID_IN | QTD_IOC, rx, e.buf_phys);
+            (*e.qh).overlay[1] = PTR_TERMINATE;
+            core::ptr::write_volatile(&mut (*e.qh).overlay[2], 0);
+            core::ptr::write_volatile(&mut (*e.qh).overlay[0], e.qtd_phys as u32);
+        }
+    }
+
     /// Main-loop poll: ack USBSTS, then for each armed endpoint consume a completed report,
     /// decode it through the boot-report layouts (same table + logic as the xHCI HID path), and
     /// re-arm. The EHCI analogue of the xHCI `queue_keyboard_read` re-arm idiom.
@@ -11783,6 +11838,15 @@ impl Controller {
         // `Copy`, so the array is plain stack scratch and costs nothing when nothing toggles.
         let mut led_pushes: [Option<(usize, Target, u8, u8)>; MAX_INT_EPS] = [None; MAX_INT_EPS];
         let mut n_led = 0usize;
+        // KBDFLAP: stalled endpoints discovered during the walk, deferred for the same reason and
+        // in the same shape as `led_pushes` above — `ClearFeature(ENDPOINT_HALT)` is a control
+        // transfer and needs `&mut self`. Entries are `(index into int_eps, the device's EP0
+        // addressing tuple, the endpoint number)`; the endpoint number is decoded from the QH's own
+        // `ep_chars` at the halt, so the wIndex the clear addresses is the one the controller was
+        // actually executing. Sized `MAX_INT_EPS` so a pass in which every armed endpoint stalls
+        // still records each one.
+        let mut clear_halts: [Option<(usize, Target, u8)>; MAX_INT_EPS] = [None; MAX_INT_EPS];
+        let mut n_clr = 0usize;
         #[cfg(feature = "mtraw")]
         let mut mt_dumped = if self.mt_probe.is_some() { Some(self.mt_dumped) } else { None };
         for (ep_i, e) in self.int_eps.iter_mut().enumerate() {
@@ -11831,10 +11895,42 @@ impl Controller {
                 // sharing `SILENCE-BROKE` with the clean one below.
                 #[cfg(feature = "kbdwit")]
                 kbdwit_note_silence_end(e, idx, "SILENCE-ENDED-HALTED", tok);
+                // KBDFLAP: WHICH endpoint, decided from the QH's OWN `ep_chars` — the word the
+                // controller is executing — rather than from a software copy, for the same reason
+                // KBDWIT decodes its identity that way. Boot 10's version of this line carried a
+                // bare token and was therefore indistinguishable from the two BT-proxy halts that
+                // print on every boot; see the KBDFLAP section comment for the full derivation.
+                let h_chars = core::ptr::read_volatile(&(*e.qh).ep_chars);
+                let (h_addr, h_ep) = (h_chars & 0x7F, (h_chars >> 8) & 0xF);
+                let (h_class, h_recoverable) = halt_class(tok);
+                // Recover only the class §9.4.5 actually answers, only while budget remains, and
+                // only if the deferred-clear array has room. `n_clr` can reach `MAX_INT_EPS` only
+                // if every armed endpoint stalls in the SAME pass, in which case the last one is
+                // retired rather than dropped in silence — the `-> retire` word says which.
+                let h_clear = h_recoverable
+                    && e.halt_clears < HALT_CLEARS_MAX
+                    && n_clr < clear_halts.len();
                 serial_println!(
-                    ":: EHCI-HID: [{}] STOP-NOTE interrupt endpoint halted (token {:#010x}) — endpoint retired, not forced ::",
-                    idx, tok
+                    ":: EHCI-HID: [{}] STOP-NOTE interrupt endpoint halted addr={} ep=IN{} kind={} mps={} class={} tok={:#010x} cerr={} halted={} xact={} babble={} dbuf={} missed={} err={} reports={} clears={}/{} -> {} == witness ::",
+                    idx, h_addr, h_ep, int_ep_kind(e), e.mps, h_class, tok,
+                    (tok >> 10) & 0x3,
+                    (tok >> 6) & 1, (tok >> 3) & 1, (tok >> 4) & 1,
+                    (tok >> 5) & 1, (tok >> 2) & 1, tok & 1,
+                    e.reports, e.halt_clears, HALT_CLEARS_MAX,
+                    if h_clear { "clear-halt" } else { "retire" }
                 );
+                if h_clear {
+                    // Deferred, not sent here: the control transfer needs `&mut self` and this loop
+                    // holds an exclusive borrow of `int_eps`. The endpoint is deliberately NOT
+                    // marked dead and its held keys are NOT flushed — `flush_held_releases` also
+                    // bumps `pal::note_keyboard_detached()`, and this keyboard is not detached. If
+                    // the clear fails, the post-loop stage does both, so nothing is skipped, only
+                    // deferred by one pass of the ~1 kHz poll.
+                    clear_halts[n_clr] = Some((ep_i, e.kbd_target, h_ep as u8));
+                    n_clr += 1;
+                    e.halt_clears += 1;
+                    continue;
+                }
                 e.dead = true;
                 // EHCI-KEYUP F2: the endpoint is retired for the rest of the boot — this loop
                 // `continue`s past a `dead` entry forever after — so any key down at this instant
@@ -12126,6 +12222,41 @@ impl Controller {
                 }
             }
         }
+        // KBDFLAP: the endpoint borrow is released here, so EP0 is usable — clear the device-side
+        // stall on every endpoint the walk classified `stall`, then re-arm it. ORDER IS LOAD-
+        // BEARING and is the whole point of doing this here rather than in the walk: the clear
+        // must reach the DEVICE before the overlay is rewritten, because a fresh `QTD_ACTIVE`
+        // clears the QH's Halted bit and would otherwise leave the host believing the endpoint is
+        // healthy while the device is still stalling (the trap `BtL3State::stopped` documents).
+        for slot in clear_halts.iter().take(n_clr) {
+            if let Some((ep_i, t, ep)) = *slot {
+                // ClearFeature(ENDPOINT_HALT): bmRequestType 0x02 (host->device | standard |
+                // ENDPOINT recipient), bRequest 0x01, wValue 0x0000 (ENDPOINT_HALT), wIndex = the
+                // endpoint ADDRESS including its direction bit, no data stage. Byte-for-byte the
+                // request `bt_retry`'s toggle resync sends (mod.rs:5166); these are interrupt-IN
+                // endpoints, hence the `| 0x80`.
+                let ok = self
+                    .control(&t, 0x02, 0x01, 0x0000, (ep as u16) | 0x0080, 0, false)
+                    .is_ok();
+                serial_println!(
+                    ":: EHCI-HID: [{}] KBDFLAP HALT-CLEAR addr={} ep=IN{} kind={} attempt={}/{} ClearFeature(ENDPOINT_HALT) -> {} == witness ::",
+                    self.idx, t.addr, ep, int_ep_kind(&self.int_eps[ep_i]),
+                    self.int_eps[ep_i].halt_clears, HALT_CLEARS_MAX,
+                    if ok { "ok — re-armed DATA0" } else { "REFUSED — endpoint retired" }
+                );
+                if ok {
+                    self.rearm_after_halt_clear(ep_i);
+                } else {
+                    // The device would not take §9.4.5's own recovery. There is nothing further
+                    // this driver can do to the endpoint, so it lands exactly where an
+                    // unrecoverable halt has always landed — retired, with its held keys flushed.
+                    let ctl = self.idx;
+                    let e = &mut self.int_eps[ep_i];
+                    e.dead = true;
+                    flush_held_releases(e, ctl);
+                }
+            }
+        }
         // MT-INVESTIGATION (IVY): the endpoint borrow is released here, so the EP0 restore is safe
         // to run. Close the capture window as soon as it is full — the pad goes back to the mode
         // the landed pointer path decodes, and the probe never fires again this boot.
@@ -12137,6 +12268,151 @@ impl Controller {
             }
         }
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// KBDFLAP — the interrupt-endpoint HALT: name it, then recover from the one class that is
+// recoverable.
+//
+// THE OBSERVATION (metal, 2012 rMBP, boot 10 of `rmbp2-boot8`, 2026-08-19). The internal keyboard
+// delivered ZERO key events for a 4-minute boot while the trackpad — the OTHER interface of the
+// SAME device, addr 8 — streamed the whole time. It read as "armed and silent", the s58 class
+// KBDWIT was built for. It was not. One line in that capture decides it:
+//
+//   [   2444ms] :: EHCI-HID: [1] STOP-NOTE interrupt endpoint halted (token 0x000a8d42)
+//               — endpoint retired, not forced ::
+//
+// `0x000a8d42` decodes (EHCI 1.0 §3.5.3) to Total-Bytes 10, PID IN, IOC 1, **CERR 3**, status
+// `0x42` = Halted + SplitXState(DoComplete). Total-Bytes 10 is `mps=10`, and the only 10-byte
+// endpoint armed in that boot is `addr=8 ep=IN3` — the internal keyboard. Its non-status half
+// (`0x000a8d..`) is byte-identical to the live token KBDWIT printed for that same endpoint on the
+// neighbouring boot 9 (`seen=0x000a8d80`), so the identity is not an inference. The keyboard was
+// retired 621 ms after arming, which is also why it never appeared in boot 10's KBDWIT dump at
+// all: `service` skips a `dead` entry before the probe can run, so the instrument built for this
+// symptom was structurally silent on the boot that showed it.
+//
+// WHY THE LINE COULD NOT SAY THAT. It carried a raw token and nothing else — no address, no
+// endpoint number, no kind. Every boot in the corpus prints two of these (below), so the reader's
+// prior is "the usual two", and the one boot where a THIRD line named the real keyboard read
+// exactly like the other two.
+//
+// THE HALT IS ROUTINE — FOR OTHER ENDPOINTS. On the same bench, gr23/gr25/gr26/gr27, rmbp1-boot1
+// and boot 9 of this very capture all print, at the first service pass after arming:
+//
+//   STOP-NOTE interrupt endpoint halted (token 0x00088141)   <- 05ac:820a, the BT HID proxy kbd
+//   STOP-NOTE interrupt endpoint halted (token 0x00048141)   <- 05ac:820b, the BT HID proxy mouse
+//
+// `0x...8141` decodes to **CERR 0** and status `0x41` = Halted + ERR — three consecutive
+// transaction errors, the TT answering ERR. Neither endpoint has produced a report in ANY capture
+// in the corpus; retiring them is correct, and this arc leaves that outcome untouched.
+//
+// SO THE TWO HALTS ARE DIFFERENT FAULTS AND THE TOKEN ALREADY SAID SO. CERR unburned with no error
+// bit set is the signature of a STALL handshake: the controller stopped because the DEVICE said
+// stop, not because the wire failed. USB 2.0 §9.4.5 defines exactly one recovery for that —
+// `ClearFeature(ENDPOINT_HALT)`, which also resets the device-side data toggle to DATA0 — and this
+// driver did not have it on the interrupt path. `BtL3State::stopped`'s doc note (mod.rs:2622)
+// already spells out the trap that ordering closes: re-arming with a fresh `QTD_ACTIVE` overlay
+// "clears the QH's Halted bit while the DEVICE's STALL condition is untouched". The clear comes
+// first, or the re-arm is a lie told to the host side only.
+//
+// WHAT IS AND IS NOT CONVICTED. That a STALL retired the endpoint permanently, and anonymously, is
+// OURS, and it is what this changes. WHY the device stalled is NOT decided by that capture, and
+// the intake's ordering hypothesis is refuted by the corpus rather than confirmed: boot 9 and
+// `gr23-bootAR`'s second run both arm the same two keyboards 80 ms apart in the same order, and
+// neither stalls. `class=stall` on the next recurrence, followed by `HALT-CLEAR ... -> ok` and
+// traffic, is what turns a 4-minute dead keyboard into a logged hiccup — and if the clear is
+// REFUSED, that is the new datum, convicting the device side without another sitting.
+//
+// BOUNDS. At most `HALT_CLEARS_MAX` clears per endpoint per boot, one control transfer each,
+// issued only for `class=stall`, and only after the endpoint borrow is released (the same deferred
+// shape ALLKEYS P1's `led_pushes` uses — a control transfer needs `&mut self`). A refused clear
+// retires the endpoint exactly as before, held-key flush included. Exhausting the budget retires
+// it too. No loop, no wait, no allocation.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// KBDFLAP — how many `ClearFeature(ENDPOINT_HALT)` recoveries one interrupt endpoint may spend in
+/// a boot before it is retired for good.
+///
+/// Two, not one and not unbounded. One would be indistinguishable from "retry once and hope": a
+/// device that stalls, is cleared, and stalls again on the very next transfer is saying something
+/// the clear cannot fix, and the second attempt is what makes that observable instead of assumed.
+/// Unbounded is a livelock on the service path — a permanently stalling endpoint would buy a
+/// control transfer on every pass of the ~1 kHz main loop for the rest of the boot.
+const HALT_CLEARS_MAX: u8 = 2;
+
+/// KBDFLAP — the software name for what an armed interrupt endpoint is, shared by the halt
+/// STOP-NOTE and the KBDWIT dump so the two lines can be joined by eye. It is the DRIVER'S belief;
+/// both call sites print the controller's own decoded address and endpoint number beside it, so a
+/// disagreement between driver and controller shows up in the capture rather than hiding in it.
+fn int_ep_kind(e: &IntEp) -> &'static str {
+    match e.layout {
+        Some(l) if l.vendor_mt => "vendor-mt",
+        Some(l) if l.relative => "rptr-rel",
+        Some(_) => "rptr-abs",
+        None if e.is_kbd => "kbd",
+        None if e.is_rel_mouse => "boot-mouse",
+        None => "unknown",
+    }
+}
+
+/// KBDFLAP — classify a halted interrupt qTD token, and say whether
+/// `ClearFeature(ENDPOINT_HALT)` is the right answer to it.
+///
+/// Returns `(class, recoverable)`. The class word goes on the STOP-NOTE; `recoverable` gates the
+/// one recovery this driver has. The point is that the two halts this bench actually produces are
+/// DIFFERENT FAULTS which the pre-KBDFLAP code treated as one:
+///
+/// | metal token  | CERR | status | class           | recoverable |
+/// |--------------|------|--------|-----------------|-------------|
+/// | `0x000a8d42` |  3   | `0x42` | `stall`         | yes         |
+/// | `0x00088141` |  0   | `0x41` | `xact-err-burn` | no          |
+/// | `0x00048141` |  0   | `0x41` | `xact-err-burn` | no          |
+///
+/// ORDER IS THE SEMANTICS, so it is written down rather than left to be re-derived:
+///
+///   * babble, data-buffer error and missed-microframe are tested FIRST because each is a
+///     host/bus fault that can coexist with the Halted bit, and none of them is answered by
+///     clearing a device-side stall condition. A token carrying babble AND an intact CERR must
+///     never be read as a stall merely because it is also halted.
+///   * the transaction-error arm then absorbs both of its shapes: `XactErr` set, the split `ERR`
+///     handshake in bit 0, and `CERR == 0` — the error counter having burned all the way down IS
+///     the halt in that case, whether or not the last error also left its own bit set. This is the
+///     arm the two BT-proxy endpoints take on every boot, and it must keep taking it.
+///   * only what is left — Halted, error counter intact, no error bit anywhere — is a STALL
+///     handshake. That is a device saying "no", and USB 2.0 §9.4.5 is the answer to it.
+///
+/// `no-halt-bit` is unreachable from `service`'s call site (entry there requires `QTD_ERR_MASK`,
+/// i.e. one of bits 6..2, and every one of those except Halted is claimed by an arm above), but
+/// this is a total function over `u32` and that arm is a real answer for a caller handing it an
+/// arbitrary token — which is exactly what the host-side proof harness for this arc does.
+fn halt_class(tok: u32) -> (&'static str, bool) {
+    // Status bits, EHCI 1.0 §3.5.3. `QTD_HALTED` is bit 6 and already named in `qh.rs`; the rest
+    // are spelled out here because this is the driver's first reader of them individually.
+    const ST_DBUF: u32 = 1 << 5;
+    const ST_BABBLE: u32 = 1 << 4;
+    const ST_XACT: u32 = 1 << 3;
+    const ST_MISSED: u32 = 1 << 2;
+    // Bit 0 is Ping State on a high-speed OUT and **ERR** on a split transaction ("the TT returned
+    // an ERR handshake"). Every endpoint this function judges is full/low speed behind a TT — that
+    // is what a HID device on this bench is — so ERR is the reading that applies.
+    const ST_SPLIT_ERR: u32 = 1 << 0;
+    let cerr = (tok >> 10) & 0x3;
+    if tok & ST_BABBLE != 0 {
+        return ("babble", false);
+    }
+    if tok & ST_DBUF != 0 {
+        return ("data-buffer", false);
+    }
+    if tok & ST_MISSED != 0 {
+        return ("missed-uframe", false);
+    }
+    if tok & (ST_XACT | ST_SPLIT_ERR) != 0 || cerr == 0 {
+        return ("xact-err-burn", false);
+    }
+    if tok & QTD_HALTED != 0 {
+        return ("stall", true);
+    }
+    ("no-halt-bit", false)
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -12219,9 +12495,13 @@ impl Controller {
 // event but two, and they mean opposite things:
 //   * A CLEAN retirement (`tok & QTD_ERR_MASK == 0`) prints `SILENCE-BROKE`. The endpoint answered.
 //   * A HALT (transaction error, babble, data-buffer error — the classes `QTD_ERR_MASK` covers)
-//     prints `SILENCE-ENDED-HALTED`, from inside the same block that emits `STOP-NOTE` and retires
-//     the endpoint. The silence ended, but it ended in a fault, and that is NOT the healthy row of
-//     the table below.
+//     prints `SILENCE-ENDED-HALTED`, from inside the same block that emits `STOP-NOTE`. The
+//     silence ended, but it ended in a fault, and that is NOT the healthy row of the table below.
+//     KBDFLAP note: that block no longer always retires the endpoint — a `class=stall` halt inside
+//     its clear budget is recovered and the endpoint keeps running — so read the STOP-NOTE's own
+//     `-> clear-halt`/`-> retire` verdict, and the `HALT-CLEAR` line beside it, for which happened.
+//     `SILENCE-ENDED-HALTED` still latches either way: it reports how the silence ended, not what
+//     the driver did about it.
 // They share one latch and sit on opposite sides of the error test, so exactly one of them can ever
 // print for a given endpoint. The split is not cosmetic: emitted from a single site above that test
 // — as the first cut of this was — a halt would have printed `SILENCE-BROKE` and read as "the
@@ -12514,14 +12794,10 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
     let live = if om { ovl2 } else { qtok };
     let addr = chars & 0x7F;
     let epn = (chars >> 8) & 0xF;
-    let kind = match e.layout {
-        Some(l) if l.vendor_mt => "vendor-mt",
-        Some(l) if l.relative => "rptr-rel",
-        Some(_) => "rptr-abs",
-        None if e.is_kbd => "kbd",
-        None if e.is_rel_mouse => "boot-mouse",
-        None => "unknown",
-    };
+    // KBDFLAP: this match moved to `int_ep_kind` so the halt STOP-NOTE and this dump cannot drift
+    // apart in their vocabulary — a reader joining `kind=kbd` across the two lines is joining the
+    // same function's output, not two copies of it. Strings are unchanged.
+    let kind = int_ep_kind(e);
 
     // 1/7 — the header. NO VERDICT WORD: `NO-COMPLETIONS` is a fact, and `class=` distinguishes
     // "never completed anything" from "completed, then stopped" WITHOUT asserting which of those
@@ -13102,9 +13378,17 @@ unsafe fn decode_boot_keyboard(
 /// THE ONE ASYMMETRIC LOSS. [`decode_boot_keyboard`]'s poll-gap argument is sound and covers every
 /// case where reports keep flowing: a release the driver did not fetch is re-read from the next
 /// report's level. It says nothing about the endpoint being RETIRED. `service_ehci_hid` sets
-/// `e.dead = true` on `tok & QTD_ERR_MASK` (the `STOP-NOTE interrupt endpoint halted` line) and
-/// thereafter skips that entry for the rest of the boot — there is no next report, so a key held at
-/// that instant is stranded in ring 3 forever.
+/// `e.dead = true` on a halt it cannot recover from (the `STOP-NOTE interrupt endpoint halted`
+/// line, `-> retire`) and thereafter skips that entry for the rest of the boot — there is no next
+/// report, so a key held at that instant is stranded in ring 3 forever.
+///
+/// KBDFLAP narrowed which halts reach here, and deliberately did NOT widen what this function is
+/// called for. A `class=stall` halt inside its clear budget is answered by
+/// `ClearFeature(ENDPOINT_HALT)` and a re-arm, so reports keep flowing and the poll-gap argument
+/// above covers the gap on its own; calling this there would be wrong twice over, because it also
+/// bumps `pal::note_keyboard_detached()` and that keyboard is not detached. Only the two outcomes
+/// that really do end the endpoint — an unrecoverable class, and a clear the device REFUSED —
+/// call it, so its contract is unchanged: every invocation is still an endpoint death.
 ///
 /// AND RING 3 CANNOT SAVE ITSELF FROM IT. `user-vug`'s `H_SAW_KEYUP` belt is deliberately ONE-WAY:
 /// once any release has been seen the pause-retire stops firing for the life of the process. So a
