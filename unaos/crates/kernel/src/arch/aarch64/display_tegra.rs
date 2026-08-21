@@ -102,8 +102,17 @@ pub fn jd1_survey(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<S
         jd1_dc_survey(dtb_addr, dtb_size, ram_gib_mask);
     }
 
-    // 3. Resolve the simple-framebuffer handoff (the safe primary path).
-    let sfb = fdt_tegra::nvdisplay_simplefb(dtb_addr, dtb_size, ram_gib_mask)?;
+    // 3. Resolve the simple-framebuffer handoff (the safe primary path). The bare `?` this used to be
+    //    was the boot-3 class exactly: the resolver's `None` abandoned the whole JD1 inheritance and
+    //    the caller's `if let Some(fb)` has no `else`, so a headless boot printed NOTHING here — the
+    //    absence of `panel LIVE` was ambiguous between "no handoff published" and "never reached".
+    //    The resolver now names its own rung (`JD1-SFB STOP`); this line is the verdict beside it.
+    let Some(sfb) = fdt_tegra::nvdisplay_simplefb(dtb_addr, dtb_size, ram_gib_mask) else {
+        serial_println!(
+            ":: tegra: JD1 — no usable simple-framebuffer handoff resolved from the DTB (see the JD1-SFB line above for the rung); HEADLESS — fbcon stays inert, no blit ::"
+        );
+        return None;
+    };
 
     // 4. Decode format + geometry into the FrameBuffer layout.
     let Some((pixel_format, bpp)) = parse_format(&sfb.format[..sfb.format_len]) else {

@@ -638,6 +638,34 @@ _feats=""
 # Mirrors the PORTSW-1/SMOLNET default-ON/negative-knob policy. See arch_arm64.md §ORIN-SMP.
 [ -n "${UNAOS_TEGRASMP:-}" ] && _feats="${_feats}tegrasmp,tegra,"
 [ -n "${UNAOS_TEGRA:-}" ] && [ -z "${UNAOS_NOTEGRASMP:-}" ] && _feats="${_feats}tegrasmp,tegra,"
+# JB11-ESCAPE: UNAOS_NOJB11=1 suppresses the Falcon firmware-header census
+# (arch/aarch64/xusb_tegra.rs::jb11_fw_header_census) so a bench sitting can take an UN-INSTRUMENTED
+# CONTROL boot. Default UNSET => the census runs on every tegra boot, unchanged — the census is the
+# point; this is only its escape. Negative-knob spelling per UNAOS_NOTEGRASMP / UNAOS_NOSDHCBLK /
+# UNAOS_NOKBDWIT above.
+#
+# NOT A CARGO FEATURE, deliberately — this is the one knob in this file whose value lies in NOT
+# changing the image. It is read with `option_env!` into a `#[used]` static that the census branches
+# on with `read_volatile`, so armed and suppressed builds are the same link: same functions, same
+# strings, same codegen units, same panic `Location`s. MEASURED: the loadable images differ in
+# EXACTLY ONE BYTE (the flag; `llvm-objcopy -O binary` + `cmp -l`), every symbol address identical —
+# the two .elf FILES differ by a further 32 non-loaded bytes of .strtab (LLVM `.llvm.<hash>`
+# internal-symbol suffixes), so compare the binary image and not the .elf sha256. JB11's WATCH
+# ITEM is that arming the census re-partitioned codegen units and grew the image ~118 KB, and the
+# JETSON-XCARVE wall is IMAGE-LAYOUT-CORRELATED — so a `#[cfg]`-style gate would remove the census
+# AND relink, confounding "JB11's BAR2 traffic moved the wall" with "the relink moved the wall".
+# This knob removes only the traffic, which is the control the WATCH ITEM asks for. Cargo's
+# dep-info env tracking rebuilds the kernel when the knob flips, so no feature arm is needed.
+#
+# Suppression is NEVER SILENT: the kernel prints one line —
+#   `:: tegra: JB11 [<tag>] — census SUPPRESSED (UNAOS_NOJB11=1) — control boot: ... ::`
+# and returns before its first touch, so the wire always states which of the two boots this was.
+# tegra-only (the whole module is `#[cfg(feature = "tegra")]`); no builder mirror — the jetson media
+# is built by this script, not by the x86 `builder` crate.
+if [ -n "${UNAOS_NOJB11:-}" ]; then
+    export UNAOS_NOJB11
+    echo -e "${COLOR_YELLOW}⚡ UNAOS_NOJB11: JB11 Falcon fw-header census SUPPRESSED (control boot — same link, ONE byte apart)${COLOR_RESET}"
+fi
 # JETSON-XCARVE M2: UNAOS_XCARVE=1 arms the inherited-xHCI-pointer instrumentation
 # (arch/aarch64/xusb_tegra.rs::jbxc_inherited_dump), fired at the top of jb2b_attach BEFORE the
 # no-HCRST takeover overwrites the inherited DCBAAP/CRCR/ERST. The `xcarve` feature implies `tegra`.
@@ -667,6 +695,34 @@ _feats=""
 # The `xcarve_relink` feature implies `tegra`. Default OFF => the pad vanishes, byte-identical to
 # baseline.
 [ -n "${UNAOS_XCARVE_RELINK:-}" ] && _feats="${_feats}xcarve_relink,tegra,"
+# XUSBFW: UNAOS_XUSBFW=1 arms the Tegra234 XUSB Falcon firmware-RELOAD scaffold
+# (arch/aarch64/xusb_tegra.rs::xusbfw), a guarded design entry point run at the top of jb2b_attach
+# (before the inherit takeover). The `xusbfw` feature implies `tegra`. Default OFF => the module +
+# call site vanish and the injection crate is not resolved at all: no feature code and no behaviour
+# change, and — measured in ONE directory against the pre-XUSBFW parent 8665a464 — knob-off esp-x86
+# kernel.elf (a3ef1b4c…, 1,688,752 B) and knob-off kernel8.img (9438fa9d…, 1,275,144 B) are
+# byte-identical to that baseline.
+#
+# ⚠ THE INJECTION POINT IS crates/xusb-fw, NOT a crates/kernel/build.rs. 12b0993c put it in the
+# kernel crate and claimed byte-identity; the blob-free half of that claim is true and verified, the
+# byte-identical half was FALSE and is measured false. A build script's mere presence reseeds its
+# crate's `-C metadata` and therefore the v0 symbol disambiguator, so `.text`/`.rodata` are re-laid
+# out: knob-off kernel.elf a3ef1b4c… -> 1a179727… (+1608 B), knob-off kernel8.img 9438fa9d… ->
+# c54da061… (same size, 265,310 bytes differing). Rebuilding 12b0993c with ONLY build.rs deleted
+# reproduced the parent byte-for-byte, so the script alone was the whole delta. Moving it into its
+# own optional crate undoes the re-baselining — do not fold it back in. See crates/kernel/Cargo.toml's
+# `xusbfw` comment and crates/xusb-fw/Cargo.toml.
+#
+# The firmware blob is bench-only and NEVER in-tree: it is embedded ONLY when UNAOS_XUSB_FW_PATH
+# points at an absolute extern path (the bunker blob), read directly by crates/xusb-fw/build.rs via
+# include_bytes! — no copy is ever staged into the tree or target/, and a knob-off (or path-unset)
+# build is blob-free by construction. With the path unset the scaffold witnesses a no-op ("XUSBFW:
+# no firmware path set — reload skipped"); with the path set but unreadable, or not absolute, the
+# build FAILS LOUDLY (cargo exit 101, naming the path). See
+# ~/.claude/plans/unaos/review/xusb-fw-reload-DESIGN.md.
+[ -n "${UNAOS_XUSBFW:-}" ] && _feats="${_feats}xusbfw,tegra,"
+[ -n "${UNAOS_XUSBFW:-}" ] && [ -n "${UNAOS_XUSB_FW_PATH:-}" ] && \
+  echo -e "${COLOR_YELLOW}⚡ XUSBFW firmware embed: ${UNAOS_XUSB_FW_PATH} (bench-only, never staged to media)${COLOR_RESET}"
 # ORIN-NET-1: UNAOS_PCIEPROBE=1 arms the read-only PCIe root-complex + NIC recon census
 # (arch/aarch64/pcie_probe.rs). Standalone feature (does NOT imply tegra, mirroring smpprobe) so the
 # census runs on BOTH the metal tegra path (combine with UNAOS_TEGRA=1) and the QEMU virt GICv3 path
@@ -1634,6 +1690,26 @@ check_user_arch() {
 # (minus `default`) against the union of the three leg feature lists below. `sdhcblk` (SDHC-4b),
 # `bcmaS1` (BCMA-S1) and `bt` (BT-L0) are all on `x86-all`, so no arc widens the gap.
 #
+# ⚠ RE-COUNTED 2026-08-19 (GR26, the tegra_el0 leg) AND STALE AGAIN, by a wide margin: the table holds
+# 100 knobs and the board legs' union 92. EIGHT are named by no board leg, and they do NOT all mean the
+# same thing — the distinction is what the count alone hides:
+#   * `nvidia-kepler-kdisp-hold`, `rtpi`, `rtwit`, `selfhost` — x86-family (their `#[cfg]` sites are in
+#     `arch/x86_64/`, or in `lib.rs`/`main.rs` under `target_arch = "x86_64"`). `x86_cfg_universe`
+#     inherits every unnamed feature as "unclaimed => assume x86", so these ride the 8 derived mix legs
+#     and are GENUINELY compiled. Not holes; just not board-named.
+#   * `simmer_test` (arch/aarch64/sched.rs), `xusbfw` (arch/aarch64/xusb_tegra.rs) and — until the leg
+#     appended below — `tegra_el0`: aarch64-only, inherited by the SAME rule onto x86 legs, where they
+#     compile GREEN and VACUOUS. Real holes wearing a green verdict.
+#   * `vugras` — split: `pub mod vugras;` is declared unconditionally so the module's own body rides the
+#     x86 legs, while its sweep CALL SITES are tegra-lane and ride nothing.
+# THE FAILURE MODE IS SILENT, which is why the count drifted this far unnoticed. The forcing function
+# the GATE-CFG-MIX note below promises ("the gate will go red naming it") fires only for a feature that
+# names an aarch64 MODULE from unqualified code; one whose sites all sit under `src/arch/aarch64/` or
+# carry a `target_arch` qualifier passes quietly. `tegra_el0` is the proven case: swept onto 8 x86 legs,
+# type-checked by none of them, and the armed Orin build broke anyway (EXECGATE — see the leg below).
+# The other three-and-a-half are the same shape and are NOT fixed here: out of this arc's lane, recorded
+# so the pi/jetson arc that owns each one can claim it.
+#
 # And the DEFAULT legs already compile the all-off state for both arches — so for every feature BOTH polarities of its `#[cfg]` are
 # type-checked, which is what makes the 61
 # `not(feature = "pi")` / 21 `not(feature = "tegra")` / 14 `not(feature = "baremetal")` sites in the
@@ -1704,6 +1780,52 @@ KERNEL_CFG_MATRIX=(
   # that must be named explicitly now: the sleeping code has no other leg that compiles it with the
   # witness on. Between them both polarities of every `#[cfg]` in the family are compiled.
   "x86-vsyncpace ../../x86_64-unaos.json nvidia-kepler,nvidia-kepler-takeover,wc,witness,vsyncpace,ehcihid,smolnet"
+  # JETSON-EL0 (M1b) — the ARMED Orin, appended GR26. Until this leg, `tegra_el0` appeared in NO leg of
+  # this matrix, which means `./arroyo check` type-checked the configuration
+  # `UNAOS_TEGRA_EL0=1 ./arroyo esp-jetson` ships NOWHERE — and `UNAOS_TEGRA_EL0=1 ./arroyo check` did
+  # not change that, because these legs deliberately ignore $KERNEL_FEATURES (see check_kernel_cfg).
+  # Not theoretical: EXECGATE (89967799, reverted the same night) widened three `#[cfg]`s in `shell.rs`
+  # to `tegra_el0`, passed all 12 legs on both arches AND the pi/x86 byte-identity checks, and could
+  # not compile the armed build at all. Re-applied against THIS leg (2026-08-19, throwaway worktree),
+  # it reds it with exactly the three errors the 12 legs never saw — every one naming `shell.rs`:
+  #   E0433 shell.rs:4363  cannot find `boot` in `aarch64`   (the widened `read_el0_image` still reads
+  #                        `arch::aarch64::boot::USER_REGION_SIZE`; `boot` is the Pi slot module, and
+  #                        the Orin's port is `mmu_tegra_el0` behind the `uslots` facade)
+  #   E0425 shell.rs:3459  cannot find function `run_program` in this scope
+  #   E0425 shell.rs:4022  cannot find function `bg_program` in this scope
+  #                        (both helpers are still `any(all(baremetal, aarch64), x86_64)` — the widened
+  #                        `run`/`bg` ARMS went live in a build where their callees do not exist)
+  # Both required gates said green about a build that nothing compiled. Same defect class the
+  # GATE-CFG-MIX note below documents (the gmux_igd E0425), one arch over — a symbol under feature X
+  # referenced from code compiled under feature Y, catchable only by a leg with Y on and X off.
+  #
+  # WHY A SECOND LEG AND NOT `,tegra_el0` APPENDED TO `arm-tegra`. `arm-tegra` is the DISARMED twin and
+  # has to stay that way: it is the only leg anywhere that compiles the SHIPPED default jetson image
+  # (`tegra` ON, `tegra_el0` OFF), and that polarity has real code behind it — `main.rs`'s
+  # `#[cfg(all(feature = "tegra", not(feature = "tegra_el0"), target_arch = "aarch64"))]`
+  # `tegra_el0_start_maybe` stub, plus the `not(any(baremetal, tegra_el0))` arms in `sched.rs` and
+  # `exceptions.rs`. Arming the one tegra leg would have traded the new hole for that one. The default
+  # aarch64 leg does not cover it either: all-off is `tegra` OFF too, so it never compiles the
+  # tegra-ON/el0-OFF combination. Exactly the `x86-vsyncpace` shape above — the armed twin is a leg of
+  # its own, named rather than derived, and between the two every `#[cfg]` in the family gets both
+  # polarities compiled.
+  #
+  # The feature list is `arm-tegra`'s verbatim + `tegra_el0` — which is precisely what the armed media
+  # build carries (`esp_jetson` forces `tegra` + `tegrasmp`; `tegra_el0` implies `tegra`).
+  #
+  # PRECONDITION: this leg compiles `arch/aarch64/syscall.rs`, which `include_bytes!`s
+  # `target/user_blob.bin`. `ensure_user_blob` (see check_both) supplies it — and had to, for `arm-pi`,
+  # before this leg existed. Read that block before touching this line.
+  #
+  # SIDE EFFECT, deliberate and correct: naming `tegra_el0` on an arm-* leg also REMOVES it from the
+  # x86 mix universe (`x86_cfg_universe` = the feature table minus what the arm legs name and `x86-all`
+  # does not). It had been riding the 8 x86 pairwise legs as an unclaimed "assume x86" feature, where
+  # it is vacuous: every one of its cfg sites is either under `src/arch/aarch64/` or explicitly
+  # `target_arch = "aarch64"`-qualified in `main.rs`, so those legs were compiling a knob that emits
+  # nothing. The universe goes 60 -> 59 features, the leg count stays 8 (C(8,4) = 70 >= 59) and the
+  # pairwise guarantee is unaffected — it is a property of the mask construction, not of which
+  # features are in the set.
+  "arm-tegra-el0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────
@@ -1914,7 +2036,53 @@ check_kernel_cfg() {
     echo -e "${COLOR_GREEN}✅ kernel cfg coverage OK (${_n} legs)${COLOR_RESET}"
 }
 
+# ── GATE-BLOB: the one artifact `check` has to build, and why it builds it at most once per tree ──
+#
+# TWO legs of the matrix compile `arch/aarch64/syscall.rs`: `arm-pi` (via `baremetal`) and
+# `arm-tegra-el0` (via `tegra_el0`). That file `include_bytes!`s `target/user_blob.bin`, which is
+# produced by `build_user_blob` — and `build_user_blob` runs only from `kernel8` and the ARMED
+# `esp-jetson`, never from `check`. So `./arroyo check` in a tree that has never built a Pi image has
+# been RED, on `arm-pi`, since the cfg matrix gained that leg:
+#     error: couldn't read .../crates/kernel/../../target/user_blob.bin (os error 2)
+#     error: could not compile `unaos-kernel` (lib) due to 1 previous error
+# Reproduced on a `git worktree add`ed tree at f4454eff before this block existed. In an established
+# tree a blob left over from some earlier `kernel8` masks it, which is why it reads as a recurring
+# fresh-worktree papercut rather than a standing bug. It is also the reason `tegra_el0` had no leg:
+# adding one on top of this would have doubled the papercut instead of closing it.
+#
+# ONLY WHEN MISSING — the load-bearing half. `build_user_blob` re-objcopies the file on every run, and
+# `include_bytes!` registers it as a rebuild dependency, so calling it unconditionally from `check`
+# would refresh the blob's mtime every single run and force both aarch64 EL0 legs to recompile from
+# scratch each time, for a file whose CONTENTS `check` never reads. Existence is the entire
+# requirement: `cargo check` neither links nor runs the blob, so a stale one type-checks identically.
+# Present and non-empty => no-op, cost 0 (the warm case, i.e. always after the first time); absent =>
+# build it once, ever. The media paths are unaffected: `kernel8` and armed `esp-jetson` call
+# `build_user_blob` unconditionally, so neither ever consumes what this leaves behind.
+#
+# WHY NOT A STUB. Writing an empty/fake `user_blob.bin` would be cheaper still and is REJECTED,
+# because the file then exists for every later command in that tree — including ones that bake it into
+# media WITHOUT rebuilding it. `UNAOS_TEGRA_EL0=1 ./arroyo esp-arm` (likewise `arm` / `test-arm`)
+# compiles `syscall.rs` and calls `build_user_blob` nowhere: today it fails loudly with the
+# `couldn't read` above; with a stub on disk it would silently link a kernel whose EL0 payload is not a
+# program, and the failure would move from the build to the bench. Masking a missing-artifact failure
+# is exactly what must not happen, so `check` builds the REAL blob — same function, same assertions
+# (`_start` = `mov x8,#1` = 28 00 80 d2) — or fails.
+ensure_user_blob() {
+    if [ -s "${WORKSPACE_DIR}/target/user_blob.bin" ]; then
+        return 0
+    fi
+    # Same TOOLBIN computation as `build_user_blob`'s other two callers — it requires the caller to
+    # set it, and bash's dynamic scoping hands this `local` down into the call.
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    echo -e "${COLOR_CYAN}  (target/user_blob.bin absent — building it once, for the aarch64 EL0 legs)${COLOR_RESET}"
+    build_user_blob
+}
+
 check_both() {
+    # GATE-BLOB (above). BEFORE the first cargo invocation, not inside check_kernel_cfg: the DEFAULT
+    # aarch64 leg below carries `tegra_el0` too whenever the operator's own knobs do
+    # (`UNAOS_TEGRA_EL0=1 ./arroyo check`), so a blob supplied later would be supplied too late.
+    ensure_user_blob
     echo -e "${COLOR_YELLOW}⚡ Syntax Check: x86_64...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
     cargo +nightly check --release \
@@ -2242,10 +2410,84 @@ esp_arm() {
     echo -e "   Copy its contents to a FAT32 SD card together with the RPi4 EDK2 UEFI firmware."
 }
 
-# Jetson Orin Nano boot media: the aarch64 UEFI ESP (BOOTAA64.EFI + kernel.elf) built with the
-# `tegra` UART feature forced on (= UNAOS_TEGRA=1), so the kernel drives the Tegra 16550 at UARTC
-# (0x0C28_0000) rather than the QEMU-virt PL011. Boots from NVIDIA's on-board UEFI (JetPack 6 / L4T
-# r36) off a single-partition FAT32 USB stick. See docs/dev/OS/01_BOOT_HAL/arch_arm64.md (Orin).
+# JETSON-EL0IMG: carry the EL0 programs onto the Orin boot volume, beside kernel.elf. Runs AFTER
+# `prepare_aarch64` — that function `rm -rf`s and re-creates `$ESP_DIR_ARM`, so anything staged before
+# it is wiped.
+#
+# WHY THE JETSON VOLUME IS THE PROGRAM VOLUME. On x86 there are two volumes (the ESP the firmware reads
+# once, and a separate DATA volume the kernel mounts after ExitBootServices — see `esp_x86`). The Orin
+# has ONE: the same FAT32 stick the on-board UEFI launched BOOTAA64.EFI from is re-enumerated by the
+# kernel's own xHCI stack as USB mass storage (JD3: "mass storage ready (slot 2)"), and that is the
+# volume `fs::fat::mount()` binds and the panel `ls`/`cat` read. So a program staged here is a program
+# the running Orin can see.
+#
+# ALWAYS, NOT KNOB-GATED — three reasons:
+#
+#   1. It cannot move kernel.elf. The five crates are their own cargo workspaces with their own target
+#      dirs and nothing in the kernel reads their output (only `user_blob.bin` is `include_bytes!`d, and
+#      that build stays behind the `tegra_el0` gate above). The knob-off byte-identity invariant the
+#      `tegra_el0` Cargo note states is about the KERNEL IMAGE, and it still holds exactly: verified by
+#      building `esp-jetson` before and after this change and comparing sha256 of kernel.elf.
+#   2. The cost is nil. ~54 KiB of images against the ~11.8 MB this volume already carries (kernel.elf
+#      ~2.0 MB + SRC.TGZ ~9.8 MB) — under half a percent of a FAT32 stick that has gigabytes spare. Bytes
+#      that are never exec'd are inert.
+#   3. A conditional `ls` is an unreadable instrument. If the programs appeared only when a kernel-side
+#      development knob happened to be armed, an operator staring at an empty `ls` on the panel could not
+#      tell "this build did not stage them" from "the FAT mount is not reading". Staging unconditionally
+#      makes the listing mean one thing.
+#
+# HELLO.BIN is the one exception, and only because its source (`target/user_blob.bin`) is built by
+# `build_user_blob`, which IS knob-gated for the mtime-churn reason documented there. When the knob is
+# armed the file already exists at zero marginal cost, so it rides along; when it is not, it is absent
+# rather than stale — a stale flat blob from some earlier Pi build is worse than no file at all.
+#
+# NOT STAGED, deliberately: K2OWN.BIN / K2IMP.BIN / MIDDEN.BIN. Those are Pi *fixture* pairs driven by
+# the `witness` cascade (K2 ownership enforcement, BANDY bus round-trip), not standalone programs — on
+# the Orin nothing drives them and they would only add noise to `ls`. They cost nothing to add later if
+# a jetson witness ever wants them.
+stage_jetson_el0_images() {
+    local staged=0
+    echo -e "${COLOR_CYAN}⚡ Staging EL0 programs onto the Jetson boot volume...${COLOR_RESET}"
+    # The five static-ELF64 images `build_user_el0_elf_images` just produced. Each already passed its
+    # ELF-magic + 16 KiB slot-window assertions there; re-assert PRESENCE here, because the failure this
+    # guards against is a staging step that silently copied nothing.
+    for img in ELFHELLO.ELF VUG.ELF VUGK.ELF STAT.ELF PULSE.ELF; do
+        local src="${WORKSPACE_DIR}/target/${img}"
+        [ -s "$src" ] || { echo -e "${COLOR_RED}ERROR: ${img} missing/empty — cannot stage the jetson boot volume${COLOR_RESET}"; exit 1; }
+        cp "$src" "${ESP_DIR_ARM}/${img}"
+        staged=$((staged + 1))
+    done
+    # HELLO.BIN: only when `tegra_el0` armed `build_user_blob` above (see the block header).
+    if [ -s "${WORKSPACE_DIR}/target/user_blob.bin" ]; then
+        case ",${_feats}" in
+            *",tegra_el0,"*)
+                cp "${WORKSPACE_DIR}/target/user_blob.bin" "${ESP_DIR_ARM}/HELLO.BIN"
+                staged=$((staged + 1))
+                ;;
+        esac
+    fi
+    # THE VALIDITY CHECK (this track's rule): an instrument that is not in the image proves nothing. Print
+    # what actually landed, with sizes, so the build's own output is the evidence — not a claim about it.
+    echo -e "${COLOR_GREEN}✅ EL0 programs on the boot volume (${staged}):${COLOR_RESET}"
+    local f
+    for f in "${ESP_DIR_ARM}"/*.ELF "${ESP_DIR_ARM}"/*.BIN; do
+        [ -f "$f" ] || continue
+        printf '     %-14s %8s B\n' "$(basename "$f")" "$(wc -c < "$f" | tr -d ' ')"
+    done
+    # PULSE.ELF's honest note, printed where the operator will read it. ABIFREEZE divergence D2:
+    # SYS_CPUPULSE (49) is dispatched ONLY by the x86 kernel; the aarch64 dispatcher has no arm for it and
+    # answers -ENOSYS. `user-pulse` handles that refusal by design — its baseline `sample()` returns None,
+    # it prints `:: PULSE-A: SYS_CPUPULSE refused - no honest sample, exiting ::` and exits 2 rather than
+    # drawing a fabricated bar. So the image is honest to stage: its failure is a stated verdict, not a
+    # fault. Every other image here uses only syscalls the aarch64 dispatcher implements.
+    echo -e "${COLOR_YELLOW}   note: PULSE.ELF exits 2 with 'SYS_CPUPULSE refused' on aarch64 (ABIFREEZE D2) — by design.${COLOR_RESET}"
+}
+
+# Jetson Orin Nano boot media: the aarch64 UEFI ESP (BOOTAA64.EFI + kernel.elf + the EL0 programs
+# `stage_jetson_el0_images` carries) built with the `tegra` UART feature forced on (= UNAOS_TEGRA=1),
+# so the kernel drives the Tegra 16550 at UARTC (0x0C28_0000) rather than the QEMU-virt PL011. Boots
+# from NVIDIA's on-board UEFI (JetPack 6 / L4T r36) off a single-partition FAT32 USB stick.
+# See docs/dev/OS/01_BOOT_HAL/arch_arm64.md (Orin).
 esp_jetson() {
     # Force `tegra` on top of whatever features were already selected (idempotent).
     case ",${_feats}" in
@@ -2261,6 +2503,7 @@ esp_jetson() {
         esac
     fi
     echo -e "${COLOR_YELLOW}⚡ kernel features (jetson): ${_feats%,}${COLOR_RESET}"
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
     # JETSON-EL0 (M1b): an ARMED jetson image compiles `arch/aarch64/syscall.rs`, which
     # `include_bytes!`es `target/user_blob.bin` (the el0-hello payload). That file is produced by
     # `build_user_blob`, which until this arc ran ONLY from the Pi `kernel8` path — so a first
@@ -2270,11 +2513,15 @@ esp_jetson() {
     # ordinary jetson build and (by refreshing the blob's mtime) churn the kernel's rebuild for nothing.
     case ",${_feats}" in
         *",tegra_el0,"*)
-            local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
             build_user_blob
             ;;
     esac
+    # JETSON-EL0IMG: build the five static-ELF64 EL0 programs BEFORE the kernel, so a size-cliff or
+    # magic assertion fails in seconds rather than after a full kernel link. UNCONDITIONAL, unlike the
+    # blob above — see the three reasons in the staging block below.
+    build_user_el0_elf_images
     prepare_aarch64
+    stage_jetson_el0_images
     pack_source_along "$ESP_DIR_ARM"
     echo -e "${COLOR_GREEN}✅ Jetson ESP (tegra): ${ESP_DIR_ARM}${COLOR_RESET}"
     [ -f "${ESP_DIR_ARM}/SRC.TGZ" ] && echo -e "   SRC.TGZ sha256: $(sha256_of "${ESP_DIR_ARM}/SRC.TGZ")"
@@ -2284,8 +2531,11 @@ esp_jetson() {
     1. Format a USB stick as ONE FAT32 partition — ERASES it, pick the right diskN:
          diskutil list                                      # find your USB (external, physical)
          diskutil eraseDisk "MS-DOS FAT32" UNAOS MBRFormat /dev/diskN
-    2. Copy the ESP on (no macOS AppleDouble junk), then eject:
-         COPYFILE_DISABLE=1 cp -R "${ESP_DIR_ARM}"/EFI "${ESP_DIR_ARM}"/kernel.elf "${ESP_DIR_ARM}"/SRC.* /Volumes/UNAOS/
+    2. Copy the ESP on (no macOS AppleDouble junk), then eject. The trailing "/." copies the WHOLE
+       staged tree — EFI/, kernel.elf, SRC.*, and the EL0 programs (VUG.ELF / VUGK.ELF / STAT.ELF /
+       PULSE.ELF / ELFHELLO.ELF, + HELLO.BIN on a tegra_el0 build). Enumerating them by hand is how
+       a stick ends up booting fine with an empty \`ls\`:
+         COPYFILE_DISABLE=1 cp -R "${ESP_DIR_ARM}"/. /Volumes/UNAOS/
          sync && diskutil eject /dev/diskN
     3. Plug into an Orin USB-A port, attach a DisplayPort monitor at power-on, then power on.
     4. In the UEFI Shell (tap ESC during boot if it does not drop there):
@@ -2511,53 +2761,23 @@ build_user_blob() {
     echo -e "${COLOR_GREEN}✅ EL0 user blob: $(wc -c < "${WORKSPACE_DIR}/target/user_blob.bin" | tr -d ' ') bytes${COLOR_RESET}"
 }
 
-kernel8() {
-    k8_lock_acquire
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
-
-    # The hello blob, unconditionally (a kernel8 image must never carry a stale routine). The same
-    # `cargo build --release` this runs also links the other [[bin]]s of the crate, which the K2 and
-    # midden objcopies below consume — so it must stay ahead of them.
-    build_user_blob
-
-    # K2 (make-enforcement-LIVE): the SAME `cargo build --release` above builds every [[bin]] in the
-    # user-blob crate, so `owner-blob` + `imp-blob` are already linked (with user-blob.ld) alongside
-    # `user-blob`. objcopy each to a flat binary the kernel8 staging carries onto the card as K2OWN.BIN /
-    # K2IMP.BIN — two more distinct 8.3 names => two more distinct prog:<NAME> principals, the honest
-    # precondition for by_name_spawn_multivalued(). Position-independent like the hello blob (entry first).
-    for b in owner-blob imp-blob; do
-        out="${WORKSPACE_DIR}/target/$(echo "$b" | tr - _).bin"
-        "$TOOLBIN/llvm-objcopy" -O binary --only-section=.text \
-          "${WORKSPACE_DIR}/crates/user-blob/target/aarch64-base/release/${b}" "$out"
-        # A flat EL0 program must be non-empty and fit one code page (USER_CODE_SIZE = 0x1000); an empty
-        # or oversize blob is a build failure the loader would reject at spawn (BadSize) — catch it here.
-        [ -s "$out" ] || { echo -e "${COLOR_RED}ERROR: ${b}.bin missing/empty — K2 blob build failed${COLOR_RESET}"; exit 1; }
-        sz="$(wc -c < "$out" | tr -d ' ')"
-        [ "$sz" -le 4096 ] || { echo -e "${COLOR_RED}ERROR: ${b}.bin ${sz} bytes > USER_CODE_SIZE (4096)${COLOR_RESET}"; exit 1; }
-        # Entry-first assertion (the hello-blob discipline): the kernel enters the flat image at offset 0, so a
-        # toolchain reorder putting a non-entry byte first is a metal-only wrong-entry fault QEMU won't catch.
-        # Both K2 blobs' _start begins `mov x23, xzr` = 0xAA1F03F7 = little-endian bytes f7 03 1f aa. Assert it.
-        head4="$(head -c 4 "$out" | od -An -tx1 | tr -d ' \n')"
-        [ "$head4" = "f7031faa" ] || { echo -e "${COLOR_RED}ERROR: ${b}.bin does not start with _start (mov x23,xzr); first 4 bytes = ${head4}${COLOR_RESET}"; exit 1; }
-    done
-    echo -e "${COLOR_GREEN}✅ K2 EL0 programs: owner_blob.bin ($(wc -c < "${WORKSPACE_DIR}/target/owner_blob.bin" | tr -d ' ') B) + imp_blob.bin ($(wc -c < "${WORKSPACE_DIR}/target/imp_blob.bin" | tr -d ' ') B)${COLOR_RESET}"
-
-    # BANDY-1 M4 (midden — program #3): same build lane as the K2 blobs; objcopy the `midden-blob`
-    # [[bin]] to a flat binary staged as MIDDEN.BIN. Its _start is a single `b midden_main` hop
-    # (byte 3 of a small-forward `b` is 0x14) — assert entry-first like the other blobs.
-    "$TOOLBIN/llvm-objcopy" -O binary --only-section=.text \
-      "${WORKSPACE_DIR}/crates/user-blob/target/aarch64-base/release/midden-blob" \
-      "${WORKSPACE_DIR}/target/midden_blob.bin"
-    [ -s "${WORKSPACE_DIR}/target/midden_blob.bin" ] || { echo -e "${COLOR_RED}ERROR: midden_blob.bin missing/empty — midden build failed${COLOR_RESET}"; exit 1; }
-    msz="$(wc -c < "${WORKSPACE_DIR}/target/midden_blob.bin" | tr -d ' ')"
-    [ "$msz" -le 4096 ] || { echo -e "${COLOR_RED}ERROR: midden_blob.bin ${msz} bytes > USER_CODE_SIZE (4096)${COLOR_RESET}"; exit 1; }
-    mb4="$(head -c 4 "${WORKSPACE_DIR}/target/midden_blob.bin" | od -An -tx1 | tr -d ' \n')"
-    case "$mb4" in
-        ??????14) : ;;
-        *) echo -e "${COLOR_RED}ERROR: midden_blob.bin does not start with _start's 'b' hop; first 4 bytes = ${mb4}${COLOR_RESET}"; exit 1 ;;
-    esac
-    echo -e "${COLOR_GREEN}✅ midden EL0 program: midden_blob.bin (${msz} B)${COLOR_RESET}"
-
+# JETSON-EL0IMG: the FIVE static-ELF64 EL0 programs, LIFTED VERBATIM out of `kernel8()` so a second
+# caller can reach them — the same move (and the same reason) as `build_user_blob` above. They had
+# exactly one caller, the Pi `kernel8` path, and the jetson boot volume needs the identical artifacts:
+# `esp-jetson` staged only BOOTAA64.EFI + kernel.elf, so an Orin that boots to the panel shell had a
+# readable FAT volume with NO programs on it to `ls` or exec, while the Pi card carried all five.
+#
+# WHAT IS AND IS NOT LIFTED. Only the static-ELF family moves (ELFHELLO / VUG / VUGK / STAT / PULSE).
+# The FLAT blobs (`user_blob.bin` -> HELLO.BIN, plus K2OWN/K2IMP/MIDDEN) stay inline in `kernel8()`
+# because they are produced by the ONE cargo build in `crates/user-blob`, whose `user_blob.bin` output
+# the kernel `include_bytes!`es — see `build_user_blob`'s note on why refreshing that file's mtime is a
+# cost the disarmed jetson path must not pay. The five crates here are the opposite case: each is its
+# OWN cargo workspace with its own target dir, nothing in the kernel reads their output, and therefore
+# building them CANNOT change kernel.elf. That asymmetry is exactly why this function is safe to call
+# unconditionally from `esp_jetson` while `build_user_blob` stays behind the `tegra_el0` gate.
+#
+# Requires `TOOLBIN` to be set by the caller (both callers compute it the same way).
+build_user_el0_elf_images() {
     # ELF-1: build the minimal static ELF64 EL0 program (crates/user-elf) and — UNLIKE the flat blobs above
     # — KEEP it as an ELF (strip-all removes section headers/symbols but preserves the ELF header + program
     # headers + the two PT_LOAD segments). Its own workspace + linker script (user-elf.ld's PHDRS clause
@@ -2669,6 +2889,60 @@ kernel8() {
     psz="$(wc -c < "${WORKSPACE_DIR}/target/PULSE.ELF" | tr -d ' ')"
     [ "$psz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: PULSE.ELF ${psz} bytes > USER_REGION_SIZE (16384)${COLOR_RESET}"; exit 1; }
     echo -e "${COLOR_GREEN}✅ static-ELF EL0 cpu-pulse program: PULSE.ELF (${psz} B)${COLOR_RESET}"
+}
+
+kernel8() {
+    k8_lock_acquire
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+
+    # The hello blob, unconditionally (a kernel8 image must never carry a stale routine). The same
+    # `cargo build --release` this runs also links the other [[bin]]s of the crate, which the K2 and
+    # midden objcopies below consume — so it must stay ahead of them.
+    build_user_blob
+
+    # K2 (make-enforcement-LIVE): the SAME `cargo build --release` above builds every [[bin]] in the
+    # user-blob crate, so `owner-blob` + `imp-blob` are already linked (with user-blob.ld) alongside
+    # `user-blob`. objcopy each to a flat binary the kernel8 staging carries onto the card as K2OWN.BIN /
+    # K2IMP.BIN — two more distinct 8.3 names => two more distinct prog:<NAME> principals, the honest
+    # precondition for by_name_spawn_multivalued(). Position-independent like the hello blob (entry first).
+    for b in owner-blob imp-blob; do
+        out="${WORKSPACE_DIR}/target/$(echo "$b" | tr - _).bin"
+        "$TOOLBIN/llvm-objcopy" -O binary --only-section=.text \
+          "${WORKSPACE_DIR}/crates/user-blob/target/aarch64-base/release/${b}" "$out"
+        # A flat EL0 program must be non-empty and fit one code page (USER_CODE_SIZE = 0x1000); an empty
+        # or oversize blob is a build failure the loader would reject at spawn (BadSize) — catch it here.
+        [ -s "$out" ] || { echo -e "${COLOR_RED}ERROR: ${b}.bin missing/empty — K2 blob build failed${COLOR_RESET}"; exit 1; }
+        sz="$(wc -c < "$out" | tr -d ' ')"
+        [ "$sz" -le 4096 ] || { echo -e "${COLOR_RED}ERROR: ${b}.bin ${sz} bytes > USER_CODE_SIZE (4096)${COLOR_RESET}"; exit 1; }
+        # Entry-first assertion (the hello-blob discipline): the kernel enters the flat image at offset 0, so a
+        # toolchain reorder putting a non-entry byte first is a metal-only wrong-entry fault QEMU won't catch.
+        # Both K2 blobs' _start begins `mov x23, xzr` = 0xAA1F03F7 = little-endian bytes f7 03 1f aa. Assert it.
+        head4="$(head -c 4 "$out" | od -An -tx1 | tr -d ' \n')"
+        [ "$head4" = "f7031faa" ] || { echo -e "${COLOR_RED}ERROR: ${b}.bin does not start with _start (mov x23,xzr); first 4 bytes = ${head4}${COLOR_RESET}"; exit 1; }
+    done
+    echo -e "${COLOR_GREEN}✅ K2 EL0 programs: owner_blob.bin ($(wc -c < "${WORKSPACE_DIR}/target/owner_blob.bin" | tr -d ' ') B) + imp_blob.bin ($(wc -c < "${WORKSPACE_DIR}/target/imp_blob.bin" | tr -d ' ') B)${COLOR_RESET}"
+
+    # BANDY-1 M4 (midden — program #3): same build lane as the K2 blobs; objcopy the `midden-blob`
+    # [[bin]] to a flat binary staged as MIDDEN.BIN. Its _start is a single `b midden_main` hop
+    # (byte 3 of a small-forward `b` is 0x14) — assert entry-first like the other blobs.
+    "$TOOLBIN/llvm-objcopy" -O binary --only-section=.text \
+      "${WORKSPACE_DIR}/crates/user-blob/target/aarch64-base/release/midden-blob" \
+      "${WORKSPACE_DIR}/target/midden_blob.bin"
+    [ -s "${WORKSPACE_DIR}/target/midden_blob.bin" ] || { echo -e "${COLOR_RED}ERROR: midden_blob.bin missing/empty — midden build failed${COLOR_RESET}"; exit 1; }
+    msz="$(wc -c < "${WORKSPACE_DIR}/target/midden_blob.bin" | tr -d ' ')"
+    [ "$msz" -le 4096 ] || { echo -e "${COLOR_RED}ERROR: midden_blob.bin ${msz} bytes > USER_CODE_SIZE (4096)${COLOR_RESET}"; exit 1; }
+    mb4="$(head -c 4 "${WORKSPACE_DIR}/target/midden_blob.bin" | od -An -tx1 | tr -d ' \n')"
+    case "$mb4" in
+        ??????14) : ;;
+        *) echo -e "${COLOR_RED}ERROR: midden_blob.bin does not start with _start's 'b' hop; first 4 bytes = ${mb4}${COLOR_RESET}"; exit 1 ;;
+    esac
+    echo -e "${COLOR_GREEN}✅ midden EL0 program: midden_blob.bin (${msz} B)${COLOR_RESET}"
+
+    # JETSON-EL0IMG: the five static-ELF64 EL0 programs (ELFHELLO / VUG / VUGK / STAT / PULSE) used to
+    # be built inline right here; they are now `build_user_el0_elf_images` (defined above `kernel8`), so
+    # `esp_jetson` can build the identical artifacts for the Orin boot volume. Verbatim lift — same
+    # order, same linker scripts, same magic/size assertions, same target/ output names.
+    build_user_el0_elf_images
 
     # K2 metal money-shot: UNAOS_K2_LEAVE=1 adds the `k2_leave` feature — k2_liveenf becomes a two-boot
     # cross-reboot power-cycle proof (boot-1 leaves a persisted owned file; boot-2 verifies the live boot

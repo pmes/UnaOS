@@ -23,7 +23,7 @@ REQUIRE JD2.*console pump live
 REQUIRE JD4.*console OWNS the panel
 
 # --- scheduler: the post-merge trunk scheduler on Orin metal ------------------------
-PENDING CAPSTONE COMPLETE
+REQUIRE CAPSTONE COMPLETE
 
 # --- NEW this boot: witnesses shipped ahead of their bench (promote on capture) -----
 # M1b: the first EL0 round-trip on Orin metal (tegra_el0 knob armed on the image).

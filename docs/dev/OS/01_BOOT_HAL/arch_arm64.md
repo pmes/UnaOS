@@ -8868,6 +8868,65 @@ call it) and `esp_jetson` invokes it **only when `tegra_el0` is armed** — the 
 compile `syscall.rs`, so an unconditional blob build would slow every ordinary jetson build and churn
 the kernel's rebuild via the blob's refreshed mtime for nothing.
 
+#### `./arroyo check` supplies it too — `ensure_user_blob` (2026-08-19)
+
+`check` calls neither `kernel8` nor `esp-jetson`, and **two** `KERNEL_CFG_MATRIX` legs compile
+`syscall.rs`: `arm-pi` (via `baremetal`) and the `arm-tegra-el0` leg below (via `tegra_el0`). So
+`./arroyo check` in a `git worktree add`ed tree that had never built anything was already **RED on
+`arm-pi`** with the same `couldn't read .../target/user_blob.bin`, independently of this arc —
+measured at `f4454eff`: EXIT 1 after 4 m 27 s. An established tree hides it behind a blob left over
+from some earlier `kernel8`, which is why it read as a recurring fresh-worktree papercut rather than a
+standing bug.
+
+`check_both` now calls `ensure_user_blob` before its first cargo invocation: present and non-empty ⇒
+no-op, absent ⇒ one `build_user_blob` (measured 10.3 s cold, once per tree — 51-byte blob).
+With the block in place the same fresh worktree runs **EXIT 0 in 4 m 28.9 s**: the whole gate got
+*more* legs and stayed inside a second of the red baseline, because the old `arm-pi` failure aborted
+that leg before it compiled anything. **Only-when-missing is
+load-bearing**: `build_user_blob` re-objcopies the file on every run and `include_bytes!` registers it
+as a rebuild dependency, so an unconditional call would recompile both aarch64 EL0 legs from scratch on
+every `check`, for a file whose *contents* `check` never reads — `cargo check` neither links it nor
+runs it. **A stub was rejected**: `UNAOS_TEGRA_EL0=1 ./arroyo esp-arm` (likewise `arm` / `test-arm`)
+compiles `syscall.rs` and calls `build_user_blob` nowhere, so a fake blob left on disk would convert
+today's loud build failure into a kernel whose EL0 payload is not a program — moving the failure from
+the build to the bench.
+
+### `arm-tegra-el0` — the leg that type-checks the armed Orin (2026-08-19)
+
+Until this leg, **`tegra_el0` appeared in no `KERNEL_CFG_MATRIX` leg at all**, so the configuration
+`UNAOS_TEGRA_EL0=1 ./arroyo esp-jetson` ships was type-checked nowhere; `UNAOS_TEGRA_EL0=1 ./arroyo
+check` did not change that either, because the matrix legs deliberately ignore `$KERNEL_FEATURES`.
+EXECGATE (`89967799`, reverted as `f4454eff`) is the proof: it widened three `#[cfg]`s in `shell.rs` to
+`tegra_el0`, passed all 12 legs on both arches plus the pi/x86 byte-identity comparisons, and could not
+compile the armed build. Re-applied against the new leg in a throwaway worktree, it reds it — and only
+it — with the three errors nothing else sees:
+
+```
+error[E0433]: cannot find `boot` in `aarch64`        --> crates/kernel/src/shell.rs:4363:44
+error[E0425]: cannot find function `run_program` ... --> crates/kernel/src/shell.rs:3459:32
+error[E0425]: cannot find function `bg_program` ...  --> crates/kernel/src/shell.rs:4022:21
+```
+
+The widened `read_el0_image` still reads `arch::aarch64::boot::USER_REGION_SIZE` — `boot` is the Pi
+slot module; the Orin's port is `mmu_tegra_el0` behind the `uslots` facade — and `run_program` /
+`bg_program` are themselves still `any(all(baremetal, aarch64), x86_64)`, so the widened `run` and `bg`
+arms went live in a build where their callees do not exist.
+
+The leg is `arm-tegra`'s feature list verbatim **+ `tegra_el0`** — what the armed media build carries.
+It is a **second** leg rather than `tegra_el0` appended to `arm-tegra` because `arm-tegra` is the only
+leg anywhere that compiles the *shipped default* jetson image (`tegra` ON, `tegra_el0` OFF), a polarity
+with real code behind it (`main.rs`'s `tegra_el0_start_maybe` stub under
+`#[cfg(all(feature = "tegra", not(feature = "tegra_el0"), target_arch = "aarch64"))]`, the
+`not(any(baremetal, tegra_el0))` arms in `sched.rs`/`exceptions.rs`); the all-off default leg does not
+cover it, since all-off is `tegra` OFF too. Arming the one tegra leg would have traded the new hole for
+that one. Side effect, deliberate: naming `tegra_el0` on an `arm-*` leg also removes it from the x86
+mix universe (60 → 59 features, still 8 derived legs, pairwise coverage unaffected), where it had been
+riding as an unclaimed "assume x86" knob and compiling nothing.
+
+Cost: **8.3 s** the first time a tree compiles that feature set, **0.06 s** (cargo cache hit) every run
+after — a fully warm `./arroyo check` with all 13 legs is 2.2 s end to end. Leg count 12 → 13;
+`UNAOS_TEGRA=1 ./arroyo check` is green in 16.2 s.
+
 ## DARKWIN-GUARD — the 2026-08-18 trunk-merge boot hang, and the dark-window serial latch
 
 ### The failure
@@ -8978,6 +9037,43 @@ the recon path cannot reach a write; the file's write path (CMD24/25) is pre-exi
 ORIN-SDMMC-2/INSTALL-1 work, double-gated behind `sdmmc_arm`/`install_target`, absent from the
 recon build — the old "no write command exists in this file" header claim was stale and has been
 corrected in place. Boot 4 either publishes the block backend or names the dying rung.
+
+### Boots 4e/4f (2026-08-21) — SDID's answer arrives as an SError, and the first CAPSTONE on Orin
+
+**Boot 4e** (`cc82df76`, knobs TEGRA+TEGRA_EL0+RAST+SDMMC): the SDID ladder's first metal flight
+ended in `Unhandled Exception in EL3` — an SError (`esr_el3=0xbe000011`, EC=0x2f async external
+abort) taken from kernel EL2 code (`elr_el3=0x25b153548`, `spsr_el3` M[3:0]=EL2h). The last
+witness on the wire is `M2: pre-reset Host Control 2 = 0x3400`; the fault raised at the rung after
+it (the SRST/clock touch). SDID's named-rung design could not name it because the abort is
+asynchronous and trapped to EL3, above every witness. Boot 3's pre-SDID code never reached this
+rung (it stopped at `no identified card` before the reset). Everything before SDMMC was green
+(bootloader, MMU, XCARVE-6, panel LIVE, JB1/BPMP, HEAP-GUARD); nothing after it ran. The
+block-publish spec line stays PENDING; the next SDID step must make the reset-rung access safe
+(clock/power state proven before the touch) rather than better-witnessed. Full dump in
+`capture/line-acm0/raw.log` past byte 2274859.
+
+**Boot 4f** (same tip, SDMMC omitted — the isolation control): with the fatal rung compiled out,
+the boot ran end to end, convicting the SDMMC path (the reset rung after M2 is the leading suspect; the abort is asynchronous, so an earlier SDMMC access cannot be fully excluded). Verdicts, all content-anchored in
+this boot's window (`capture/orin2-boot4f.log`):
+
+- **`CAPSTONE COMPLETE` printed for the first time on the post-merge trunk scheduler** (pre-merge
+  kernels completed CAPSTONE on this board 2026-07-08 and 2026-07-18, same tegra signature; the
+  post-merge scheduler's pre-staged JD2 queue made the spawn unreachable until CAPSTONE-GATE) —
+  all 6 primitives PASS, tegra
+  signature confirmed (`workers on cores 0 + 0`, the `CAP_CORES=[0,0]` pin — not the virt
+  scrollback signature). The CAPSTONE-GATE witness fired exactly as designed:
+  `drain witnesses SKIPPED (queue not drained at entry — 3 task(s) pre-staged)`. Spec line
+  promoted PENDING → REQUIRE; replay vs this capture: **MBENCH PASS 11/11 REQUIRE, 0 FORBID**.
+- **RAST-MC on metal**: 5 secondary cores online and dispatching, pipeline width 5 (render cores
+  1–5, present on core 0), 1-core baseline 90 frames / 680 ms = 132.4 fps, 3000 KiB buffers off
+  the 48 MiB heap.
+- **el0-hello round-trip PASS** re-proven on this tip (SVC EC=0x15 nr=1 live).
+- **DARKWIN guard: 89 byte(s) dropped pre-map** — same magnitude as boot 2's second cycle.
+- **JB11 armed census** ran (BAR2 IOCTL_CFGTBL_READ path, no xHCI operational register written).
+  The suppressed control boot (`UNAOS_NOJB11=1` rebuild) is still owed for the XCARVE pair.
+- **IRQEL-RT EL1 live-arm: still unproven on metal.** The only `timer LIVE: IRQ delivery
+  confirmed` witness precedes the JM6 EL2→EL1 drop (capture lines 1013 vs 1437), so it is the EL2
+  arm again; no interrupt was taken at EL1 this boot. The EL1 half remains compile-proven only.
 
 ---
 

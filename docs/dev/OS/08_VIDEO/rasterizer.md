@@ -39,39 +39,164 @@ These rules live in the module docs of `math.rs` and are exercised by the golden
 tests below (a scene rendered twice must be byte-identical, and the golden digest
 is the cross-arch reference).
 
+Where each rule lives in code:
+
+| Rule | Citation |
+| --- | --- |
+| `no_std` for every cross-compiled build; `std` only under `cargo test` | `rast/src/lib.rs:4` (`#![cfg_attr(not(test), no_std)]`) |
+| `libm` is the only dependency, `default-features = false` | `rast/Cargo.toml:14` |
+| `sqrtf` for vector length | `rast/src/math.rs:69` |
+| `sinf` / `cosf` / `floorf` wrappers | `rast/src/math.rs:259,265,271` |
+| No-FMA `Mat4::mul` (explicit four-product sum) | `rast/src/math.rs:145` |
+| Zero allocation in the hot path (caller owns both planes) | `rast/src/raster.rs:54-61` |
+
+**One copy, verified.** The crate is byte-identical across every track branch —
+not by convention but as a checkable fact, since the whole crate is one git tree
+object:
+
+```
+cd /path/to/UnaOS && git fetch origin
+for r in HEAD origin/main origin/UnaOS-gemini origin/hw-pi4 origin/hw-rmbp; do
+  git rev-parse "$r:unaos/crates/rast"
+done | sort -u | wc -l      # must print 1
+```
+
+Verified 2026-08-18 from `hw-jetson`: all five refs report tree
+`bdb6d3f9e2f3549d5532ba1f657df33f3aa7f1bf`. Section 3 explains why this
+must stay true.
+
 ## 2. Crate API
 
-`math.rs` — fixed-shape `f32` linear algebra:
+The whole public surface is re-exported from `lib.rs:47-51`: the modules `math`
+and `raster`, plus `Mat4`, `Vec3`, `Vec4`, `Rgba`, `ScreenVert`, `Target`,
+`Z_FAR`. Everything below is public unless marked otherwise.
 
-- `Vec3` / `Vec4` (dot, cross, normalize, homogeneous point, `lerp`).
-- `Mat4` — **column-major** (`m[col*4 + row]`); `mul`, `transform`,
+### 2.1 `math.rs` — fixed-shape `f32` linear algebra
+
+- `Vec3` (`math.rs:25`) — `new`, `sub`, `add`, `scale`, `dot`, `cross`,
+  `length`, `normalize` (`math.rs:33-74`).
+- `Vec4` (`math.rs:86`) — `new`, `point` (homogeneous, `w = 1`), `lerp`
+  (`math.rs:95-108`).
+- `Mat4` (`math.rs:121`) — **column-major**, `pub m: [f32; 16]` indexed
+  `m[col*4 + row]` (`math.rs:123`); `zero`, `identity`, `mul`, `transform`,
   `translation`, `rotation_x/y/z`, `perspective` (right-handed, `[-1,1]³` clip
-  cube, OpenGL convention), `look_at`.
-- `sin` / `cos` / `floor` — the deterministic `libm` wrappers.
+  cube, OpenGL convention), `look_at` (`math.rs:128-231`).
+- `PI` (`math.rs:255`) and the deterministic `libm` wrappers `sin` / `cos` /
+  `floor` (`math.rs:259,265,271`).
 
-`raster.rs` — the 2D fill stage:
+### 2.2 `raster.rs` — the target and the 2D fill
 
-- `Rgba([u8;4])` — the one canonical color format, **`[R,G,B,A]`** row-major.
-- `Target::new(color, depth, width, height, stride)` — wraps caller-owned
-  buffers (`color: &mut [u8]` RGBA8, `depth: &mut [f32]`), returning `None` on a
-  mis-sized buffer so an out-of-bounds write is impossible. No allocation.
-- `Target::clear`, `triangle(v, color, cull)`, plus `get` / `depth_at` /
-  `color_bytes` oracle helpers.
-- The z-buffer is a parallel `f32` plane; smaller z is nearer, cleared to
-  `Z_FAR`. A fragment writes only when its interpolated depth is **strictly less**
-  than the stored value, so z-fighting resolves deterministically by draw order.
+**`Rgba(pub [u8; 4])`** (`raster.rs:26`) — the one canonical color format,
+**`[R, G, B, A]`**. Constructors `Rgba::new` and `Rgba::rgb` (opaque alpha) at
+`raster.rs:30,34`. Derives `PartialEq`/`Eq`, so tests compare colors directly.
 
-`lib.rs` — the pipeline:
+**`ScreenVert`** (`raster.rs:46`) — `pub x: f32, y: f32, z: f32`. A vertex
+*already projected to screen space*: sub-pixel pixel-space `x`/`y`, and a depth
+`z` that need only be monotonic with distance (the pipeline feeds NDC z in
+`[-1, 1]`). The raster stage is pure 2D — all clipping and projection happened
+upstream (`raster.rs:42-44`).
+
+**`Z_FAR: f32 = f32::INFINITY`** (`raster.rs:40`) — the depth-clear value.
+
+**`Target<'a>`** (`raster.rs:54-61`) borrows both planes from the caller and
+allocates nothing. Its four fields are `color: &'a mut [u8]`,
+`depth: &'a mut [f32]`, `width`, `height`, `stride`.
+
+- `Target::new(color, depth, width, height, stride) -> Option<Self>`
+  (`raster.rs:67-81`). **Stride is in pixels, not bytes**: the color plane
+  strides by `4*stride` bytes per row and the depth plane by `stride` entries
+  (`raster.rs:59-60`). The constructor validates `stride >= width`,
+  `color.len() >= 4*stride*height`, and `depth.len() >= stride*height`,
+  returning `None` otherwise — so a mis-sized buffer can never produce an
+  out-of-bounds write (`raster.rs:74-79`).
+- `clear(c)` (`raster.rs:93`) — color to `c`, depth to `Z_FAR`.
+- `width()` / `height()` (`raster.rs:84,88`).
+- `triangle(v, color, cull) -> bool` (`raster.rs:142`) — see below.
+- Oracle helpers: `get(x, y)` (`raster.rs:112`), `depth_at(x, y)`
+  (`raster.rs:124`), `color_bytes()` (`raster.rs:130`, the raw RGBA8 plane the
+  kernel blits from and the goldens digest).
+
+**Cull mode is a `bool`, not an enum.** `triangle`'s third argument is
+`cull: bool` (`raster.rs:142`); there is no front-face/none/both enumeration and
+no configurable winding order. The behaviour is fixed at `raster.rs:145-160`:
+
+1. Zero signed area ⇒ return `false` (degenerate, nothing drawn) —
+   `raster.rs:146-148`.
+2. `cull == true` and `area2 >= 0.0` ⇒ return `false` (back-facing) —
+   `raster.rs:149-151`.
+3. `cull == false` ⇒ the winding is normalized by swapping `v[1]`/`v[2]` when
+   needed, so both sides draw — `raster.rs:156-160`.
+
+The `bool` return means "was this triangle accepted", not "did it change
+pixels": a wholly off-screen but validly-wound triangle returns `true`
+(`raster.rs:168-170`).
+
+**Depth handling** (`raster.rs:199-208`). Depth is interpolated barycentrically
+from the three `ScreenVert.z` values, and a fragment writes **only when
+`z < self.depth[di]` — strictly less**. Smaller z is nearer. Equal depth means
+the first writer wins, so z-fighting resolves deterministically by draw order,
+and disjoint depths make the result order-independent (pinned by the test at
+`tests/golden.rs:82`).
+
+### 2.3 `lib.rs` — the pipeline entry points
 
 - `render_mesh(target, model, view_proj, verts, indices, base_color, light_dir,
-  ambient, cull) -> u32` — the whole thing: model→world→clip transform, flat-
-  shade from the world-space face normal, near-plane (`w`) clip, perspective
-  divide, viewport map, back-face cull, z-buffered fill. Returns the triangle
-  count rasterized.
-- `shade_lambert(normal, light_dir, base, ambient)` — flat Lambert shading with
-  an ambient floor.
+  ambient, cull) -> u32` (`lib.rs:104-114`) — the whole pipeline for an indexed
+  mesh. `indices` is a flat list of triples consumed by `chunks_exact(3)`
+  (`lib.rs:119`); out-of-range indices are skipped, not panicked on
+  (`lib.rs:122-124`). Returns the count of triangles actually rasterized,
+  post-cull and post-clip (`lib.rs:117,154-156`).
+- `shade_lambert(normal, light_dir, base, ambient) -> Rgba` (`lib.rs:60`) — flat
+  Lambert `max(0, n·l)` over a base color with an ambient floor; normalizes both
+  inputs itself.
+- `W_EPS: f32 = 1.0e-5` (`lib.rs:55`) — private. Clip-space `w` below this is
+  clipped away, so the perspective divide never sees a zero or negative `w`.
 
-### Conventions
+### 2.4 What the API deliberately does not have
+
+This subsection exists because the absences are load-bearing, and because they
+are what `orin-3d.md` §3.1 cites when it explains why band-parallel rendering
+was not built.
+
+- **No viewport origin.** `Target` carries `width`, `height` and `stride` and
+  nothing else (`raster.rs:54-61`); `Target::new` takes no origin
+  (`raster.rs:67-73`). Meanwhile `render_mesh` maps NDC straight onto
+  `target.width()`/`height()` (`lib.rs:115-116`, `to_screen` at `lib.rs:85-91`).
+  A band-sized `Target` therefore renders **the whole scene squashed into the
+  band**, not the band's slice of the scene.
+- **No scissor rectangle.** `triangle` clamps its bounding box to the target's
+  own full extent — `0..=width-1` by `0..=height-1` (`raster.rs:164-167`) — and
+  offers no way to restrict writes further.
+- **No clear rectangle.** `clear` always covers the full `width × height`
+  (`raster.rs:94-102`).
+
+Consequently a caller cannot say "render this scene, but only the rows I own".
+Section 5 covers the two proposed API extensions that would lift this, and why
+neither has been made.
+
+### 2.5 Pipeline stages, and which are private
+
+`render_mesh` is a closed pipeline. Only its two ends are public:
+
+| Stage | Where | Visibility |
+| --- | --- | --- |
+| model → world (and the shading normal) | `lib.rs:126-131` | inside `render_mesh` (public entry) |
+| world → clip (`view_proj.transform`) | `lib.rs:134-136` | inside `render_mesh` |
+| `clip_near` — Sutherland–Hodgman against `w >= W_EPS` | `lib.rs:174` | **private** |
+| `divide_and_map` — perspective divide + viewport map | `lib.rs:164` | **private** |
+| `to_screen` — NDC → pixel space | `lib.rs:85` | **private** |
+| `Target::triangle` — cull, fill rule, depth test, write | `raster.rs:142` | **public** |
+
+The intermediate vertex type `ClipVert` (`lib.rs:78`) is private too.
+
+**This privacy is the second half of the parallelism blocker.** Because
+`clip_near`, `divide_and_map` and `to_screen` are all private, a caller cannot
+run transform-and-clip itself and feed band-offset `ScreenVert`s into the public
+`Target::triangle` without re-implementing the projection pipeline — which is a
+fork of the oracle in all but file location, and would put `GOLDEN_CUBE_07` at
+risk for exactly the reason section 3 gives.
+
+### 2.6 Conventions
 
 - **Winding.** Front faces are counter-clockwise *as drawn on the y-down screen*,
   which is a negative signed area under the edge function (the y-down flip inverts
@@ -103,6 +228,81 @@ Coverage (`unaos/crates/rast/tests/golden.rs`):
   deliberately, never to "make it pass").
 
 That pinned digest is exactly the artifact future V3D output is diffed against.
+
+### 3.1 `GOLDEN_CUBE_07` — what it pins and how it is checked
+
+**What it pins.** One fixed pose of the canonical unit cube: 8 corners and 12
+outward-wound triangles (`tests/golden.rs:201-222`) rendered at **96×96** into a
+`0x101018` background, with `model = rotation_y(0.7) · rotation_x(0.35)`,
+`perspective(PI/3, 1.0, 0.5, 100.0)`, an eye at `(0, 0, 5)` looking at the
+origin, base color `0x40B0FF`, light `(0.4, 0.8, 0.6)`, ambient `0.25`, and
+back-face culling on (`render_cube_scene`, `tests/golden.rs:224-253`). The
+`_07` suffix is the `0.7` rotation angle.
+
+**Where the digest lives.** `const GOLDEN_CUBE_07: u64 = 0x1944_46bc_a3de_a139;`
+— `unaos/crates/rast/tests/golden.rs:279`. There is no separate golden file and
+no image blob checked in; the reference *is* that one literal.
+
+**How it is checked.** The digest is FNV-1a 64 over the **entire RGBA8 color
+plane** (`fnv1a`, `tests/golden.rs:18-25`), so any single-pixel drift trips the
+test. Two tests guard it:
+
+- `cube_scene_is_deterministic` (`tests/golden.rs:256`) — the same pose rendered
+  twice must produce byte-identical output. This is the arch-neutrality
+  guarantee in miniature.
+- `cube_scene_matches_golden` (`tests/golden.rs:266`) — the digest must equal
+  `GOLDEN_CUBE_07`, and reports the offending value on failure.
+
+Run it with a plain host `cargo test` — the crate is a member of the kernel
+workspace (`unaos/Cargo.toml:10`), and `std` links only under `cfg(test)`:
+
+```
+cd unaos && cargo test -p rast
+```
+
+Verified 2026-08-18 from the `hw-jetson` branch at `12b0993c`: **7 passed, 0
+failed**, including `cube_scene_matches_golden`. Note that this is a *host*
+run — an **x86_64** build of the crate, not an aarch64 one. The claim that the
+same digest falls out on aarch64 rests on the determinism contract in section 1
+and on the comment at `tests/golden.rs:277-278`; running the goldens under an
+aarch64 host or emulator is the check that would turn it from argued into
+observed, and that has not been recorded here.
+
+### 3.2 The standing law: one copy, never regenerated to pass
+
+Two rules in [`orin-3d.md`](../../../../unaos/docs/dev/OS/09_PLATFORM/orin-3d.md)
+§4 "Do not do" bind this crate directly. They are restated here because this is
+the doc a contributor reads first.
+
+> **§4.3 — Do not fork the oracle layer.** `unaos/crates/rast/` is byte-identical
+> across `hw-jetson`, `hw-pi4` and `UnaOS-gemini` today, and that is the whole
+> point. If a track needs something from `rast`, it is a shared-lane change,
+> which means **stop and report** — do not edit it from a platform track.
+>
+> **§4.4 — Do not regenerate a golden to make a test pass.** Regenerate only
+> deliberately, with the reason recorded.
+
+**Why, stated plainly.** The digest is not a regression test for the
+rasterizer's own sake. Its value is that it is *the same number everywhere*. Two
+consequences follow, and both evaporate the moment a second copy of the crate
+exists:
+
+1. **Cross-arch equality is checkable.** x86_64 and aarch64 running the same
+   source and arriving at the same 64-bit digest is what proves the determinism
+   contract in section 1 actually holds, rather than merely being intended. Two
+   forks with two goldens prove nothing about each other.
+2. **"GPU output == rasterizer reference" becomes a real test.** The V3D
+   milestone generalizes to diffing GPU-rendered pixels against this crate's
+   output. That comparison is only meaningful against a single, pinned
+   reference. An Orin-flavoured or Pi-flavoured `rast` would leave no
+   well-defined thing for the GPU to be equal *to*.
+
+Regenerating the digest to clear a red test destroys the same property from the
+other direction: it converts the reference into a record of whatever the code
+last did, which is not a reference at all. If output genuinely must change, the
+change is deliberate, shared-lane, and the reason is recorded with the new
+constant.
+
 
 ## 4. The demo (`UNAOS_RAST=1`, and `UNAOS_PIRAST=1` on the Pi)
 
@@ -206,8 +406,111 @@ knob-off. PI-RAST re-verified the third panel the same way: `kernel8.img` built 
 `UNAOS_PIRAST` unset is **byte-identical** (whole-image sha256) to a build of the
 pre-arc base at the same worktree.
 
+## 5. Consumers, and the extensions parallelism would need
+
+### 5.1 Who calls the crate today
+
+`rast` has exactly one in-tree consumer: the knob-gated kernel demo. Nothing in
+the shared video stack depends on it, which is what keeps the crate free to stay
+platform-neutral.
+
+- **`unaos/crates/kernel/src/rast_demo.rs`** — gated by the `rast` Cargo feature
+  (`kernel/Cargo.toml:1079`, dep at `1140`), armed by `UNAOS_RAST=1`
+  (`unaos/arroyo:181`). The module gate is `#[cfg(feature = "rast")]`
+  (`kernel/src/lib.rs:120-121`) and is deliberately **not** arch-gated, so
+  x86/virt, aarch64/virt and aarch64/tegra all link the same code.
+- Call sites: the shared GUI path at `kernel/src/main.rs:1452`, and the Orin
+  terminus line at `main.rs:2459` → `tegra_rast_demo_maybe` (`main.rs:5102`).
+- `rast` is a workspace member (`unaos/Cargo.toml:10`) and appears in the
+  curated feature sets for `x86-all`, `arm-pi` and `arm-tegra`
+  (`unaos/arroyo:1591,1595,1600`).
+
+### 5.2 RAST-MC — frame pipelining, which needed zero crate changes
+
+The multi-core rung on Orin (`rast_demo.rs::run_mc`, `rast_demo.rs:415`, gated
+`all(feature = "tegra", target_arch = "aarch64")`) is worth recording here for
+one reason: **it required no change to this crate at all.**
+
+It probes each secondary with a pinned `sched::spawn` (`rast_demo.rs:469`),
+enlists the cores that actually dispatch, gives each its own full-size RGBA8 +
+`f32` depth pair off the heap, and assigns frames round-robin — the core at slot
+`k` renders every frame `f ≡ k (mod nslots)`. Each worker calls
+`mc_render_frame` (`rast_demo.rs:301`), which builds an ordinary full-frame
+`Target::new(color, depth, w, h, w)` (`rast_demo.rs:314`) and makes the ordinary
+whole-frame `render_mesh` call (`rast_demo.rs:316`) — byte-for-byte the same
+call the single-core path makes at `rast_demo.rs:136`. The boot core presents
+finished frames in strict frame order through `Screen::put_pixel`
+(`mc_present`, `rast_demo.rs:333`).
+
+This is **frame-level** parallelism, and it fits the existing API precisely
+because every worker still owns a whole frame. Pixels and their sequence are
+identical to single-core by construction. The cost of staying inside the
+contract is Amdahl: only the render half is parallel, the present half stays
+serial on the boot core, so the ceiling is
+`total / max(present_total, render_total / nslots)` — of order 2× regardless of
+core count. Full accounting, including the per-core heap footprint and the
+witness lines, is in
+[`orin-3d.md`](../../../../unaos/docs/dev/OS/09_PLATFORM/orin-3d.md) §3.1.
+
+> **Status.** RAST-MC's witness lines are **PENDING** — it has not run on Orin
+> silicon as of 2026-08-18, and QEMU cannot stand in for the `tegra` path. That
+> pending status is a property of the wire-in, not of this crate.
+
+### 5.3 The Pi consumer
+
+The Pi 4 wire-in (**PI-RAST**, `UNAOS_PIRAST=1`) drives the same arch-neutral
+`rast_demo::run` through the BCM2711 mailbox panel, reading panel geometry live
+rather than hardcoding it. Its section of this document lives on the `hw-pi4`
+branch and has not yet reached this branch — see the note in section 6. It, too,
+required no change to the crate.
+
+### 5.4 Proposed API extensions — PROPOSALS, not decisions
+
+Band or tile decomposition is the decomposition that would parallelize *both*
+halves of a frame and scale with core count. Section 2.4 and 2.5 explain why it
+is not expressible through the current API. Two minimal extensions would lift
+the block. **Both are proposals recorded for discussion. Neither has been built,
+neither has been agreed, and neither may be implemented from a platform track:**
+`rast` is shared-lane and golden-pinned (§3.2), so any change here requires
+agreement across the track seats and a re-verified `GOLDEN_CUBE_07`.
+
+- **(a) A viewport origin on `Target`.** Something of the shape
+  `Target::new_offset(color, depth, w, h, stride, origin_x, origin_y)`, where the
+  *frame* dimensions used by `to_screen` stay `(w, h)` while the *writable* rows
+  are the band. Smaller change; solves only the band case.
+- **(b) A public split of the pipeline.** Something of the shape
+  `project_mesh(model, view_proj, verts, indices, w, h, cull, &mut FnMut([ScreenVert; 3], Rgba))`,
+  emitting already-projected, already-shaded, already-clipped triangles that a
+  caller may offset and hand to the existing public `Target::triangle`.
+
+(b) is the more useful of the two: besides bands and tiles, it is also what a
+future GPU-vs-reference diff wants, since it exposes the exact triangle stream
+the reference rasterized. Both options are stated in
+[`orin-3d.md`](../../../../unaos/docs/dev/OS/09_PLATFORM/orin-3d.md) §3.1 in the
+same terms.
+
+## 6. Known divergence between branches
+
+As of 2026-08-18 the crate `unaos/crates/rast/` is one identical tree object on
+every track branch (verified in section 1), but **this document is not**:
+`hw-pi4` carries a PI-RAST subsection in section 4 and an extra byte-identity
+sentence that `hw-jetson`, `origin/main`, `UnaOS-gemini` and `hw-rmbp` do not
+have. Compare with:
+
+```
+git diff origin/main:docs/dev/OS/08_VIDEO/rasterizer.md \
+         origin/hw-pi4:docs/dev/OS/08_VIDEO/rasterizer.md
+```
+
+The two sets of additions are in different sections and are meant to **union**,
+not to supersede each other. Whichever arc lands second reconciles by keeping
+both.
+
 ## See also
 - `unaos/crates/rast/` — the crate.
+- [orin-3d](../../../../unaos/docs/dev/OS/09_PLATFORM/orin-3d.md) — §3.1 the
+  RAST-MC rung and the parallelism analysis; §4.3/§4.4 the no-fork and
+  no-regenerate laws.
 - [framebuffer](framebuffer.md) — the panel surface the demo presents through.
 - [engine](engine.md) — the existing 2.5-D `vug` facet renderer (distinct: a
   painter's-order solid-facet engine, not a z-buffered 3D rasterizer).

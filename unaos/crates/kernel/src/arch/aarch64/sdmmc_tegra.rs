@@ -1952,7 +1952,17 @@ mod metal {
 
         // Prefer the enabled removable slot (the microSD). Fall back to the first enabled instance
         // (documented — e.g. a DT that doesn't mark the slot removable), else refuse.
-        let pick = best.or(first_enabled)?;
+        // The last rung of the M1 ladder, and the one that used to give up through a bare `?`: every
+        // candidate above was logged, then a `None` here produced only the caller's generic
+        // "no resolvable microSD-slot SDMMC controller" — with no line saying that candidates WERE
+        // found and every one of them was status=disabled or reg-less. Name it (the SDID lesson).
+        let Some(pick) = best.or(first_enabled) else {
+            serial_println!(
+                "{}   M1: {} SDMMC candidate(s) found but NONE is usable (need status=okay and a non-zero reg base; removable preferred) — STOP ::",
+                PS, n
+            );
+            return None;
+        };
         let _ = (pick.enabled, pick.removable); // (all fields consumed for logging clarity)
         let node = &pick.path[..pick.plen];
         serial_println!(

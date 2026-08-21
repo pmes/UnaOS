@@ -8,6 +8,12 @@ members = [
     "crates/una-abi",
     "crates/net",
     "crates/rast",
+    # XUSBFW: the bench-only Tegra234 XUSB Falcon firmware injection point — one build script and one
+    # `const`. It is a SEPARATE crate, and an OPTIONAL dependency of the kernel, on purpose: a build
+    # script's mere presence reseeds its crate's `-C metadata` (hence the v0 symbol disambiguator,
+    # hence the whole image layout), so carrying it inside the kernel re-baselined every knob-off
+    # media hash. See crates/xusb-fw/Cargo.toml for the measurement.
+    "crates/xusb-fw",
 ]
 # The Ring-0-embeddable cores under `libs/` (e.g. `libs/sys/helm`) are members of
 # the root host workspace, not the kernel workspace — the kernel pulls them as

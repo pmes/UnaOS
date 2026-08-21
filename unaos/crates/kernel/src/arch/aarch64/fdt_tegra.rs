@@ -255,20 +255,28 @@ pub struct BpmpGeom {
     pub db_master: u32,
 }
 
-/// Resolve the JB1b geometry silently (the JB1a dump is the human-readable twin). `None` = any
-/// piece missing or shaped unexpectedly — the caller prints and stops rather than guessing.
+/// Resolve the JB1b geometry (the JB1a dump is the human-readable twin). `None` = any piece missing
+/// or shaped unexpectedly — the caller prints its generic SKIP, so EVERY rung here names itself on
+/// serial first (the SDID lesson: a ladder that gives up through a bare `?` leaves a capture unable
+/// to say which rung died). The success path stays silent — `jb1b_ping` prints the geometry it got.
 pub fn bpmp_geometry(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<BpmpGeom> {
     if dtb_addr == 0 || dtb_size == 0 {
-        return None;
+        return geom_stop("no DTB handed off", dtb_addr, dtb_size as u64);
     }
     let g_lo = dtb_addr >> 30;
     let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
     let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
     if !mapped(g_lo) || !mapped(g_hi) {
-        return None;
+        return geom_stop("DTB GiB unmapped (lo..hi vs RAM-GiB-mask)", g_lo, ram_gib_mask);
     }
     let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
-    let fdt = Fdt::new(blob)?;
+    let Some(fdt) = Fdt::new(blob) else {
+        return geom_stop(
+            "bad DTB header (magic/bounds) at Fdt::new; first two words",
+            be32(blob, 0).unwrap_or(0) as u64,
+            be32(blob, 4).unwrap_or(0) as u64,
+        );
+    };
 
     let mut bpmp_path = [0u8; MAX_PATH];
     let mut bpmp_len = 0usize;
@@ -280,46 +288,73 @@ pub fn bpmp_geometry(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Optio
         }
     });
     if bpmp_len == 0 {
-        return None;
+        return geom_stop("no top-level /bpmp* node in the tree", 0, 0);
     }
     let bp = &bpmp_path[..bpmp_len];
     let mboxes = fdt.prop_at(bp, b"mboxes");
     let shmem = fdt.prop_at(bp, b"shmem");
     if mboxes.n < 3 || shmem.n < 2 {
-        return None;
+        return geom_stop(
+            "/bpmp mboxes/shmem too short (need >=3 / >=2 cells); got mboxes.n / shmem.n",
+            mboxes.n as u64,
+            shmem.n as u64,
+        );
     }
 
     // A shmem phandle target: child reg [offset, size] + parent reg [hi lo hi lo] -> absolute PA.
-    let resolve_shmem = |ph: u32| -> Option<u64> {
+    let resolve_shmem = |ph: u32, which: &str| -> Option<u64> {
         let mut buf = [0u8; MAX_PATH];
         let n = fdt.path_of_phandle(ph, &mut buf);
         if n == 0 {
+            serial_println!(
+                ":: tegra: JB1b-GEOM STOP — shmem {} phandle {:#x} resolves to no node; BPMP channel unresolvable ::",
+                which, ph
+            );
             return None;
         }
         let node = &buf[..n];
         let reg = fdt.prop_at(node, b"reg");
         let preg = fdt.prop_at(parent(node), b"reg");
         if reg.n < 1 || preg.n < 2 {
+            serial_println!(
+                ":: tegra: JB1b-GEOM STOP — shmem {} node {} reg.n={} / parent reg.n={} (need >=1 / >=2); cannot form the absolute PA ::",
+                which,
+                core::str::from_utf8(node).unwrap_or("?"),
+                reg.n,
+                preg.n,
+            );
             return None;
         }
         let parent_base = ((preg.words[0] as u64) << 32) | preg.words[1] as u64;
         Some(parent_base + reg.words[0] as u64)
     };
-    let shmem_tx = resolve_shmem(shmem.words[0])?;
-    let shmem_rx = resolve_shmem(shmem.words[1])?;
+    let shmem_tx = resolve_shmem(shmem.words[0], "TX")?;
+    let shmem_rx = resolve_shmem(shmem.words[1], "RX")?;
 
     // The HSP node behind mboxes[0]: reg [hi lo hi lo] -> base.
     let mut hbuf = [0u8; MAX_PATH];
     let hn = fdt.path_of_phandle(mboxes.words[0], &mut hbuf);
     if hn == 0 {
-        return None;
+        return geom_stop(
+            "HSP phandle (mboxes[0]) resolves to no node; doorbell base unknown — phandle",
+            mboxes.words[0] as u64,
+            0,
+        );
     }
     let hreg = fdt.prop_at(&hbuf[..hn], b"reg");
     if hreg.n < 2 {
-        return None;
+        return geom_stop("HSP node reg.n too short (need >=2 cells for the base); reg.n", hreg.n as u64, 0);
     }
     let hsp_base = ((hreg.words[0] as u64) << 32) | hreg.words[1] as u64;
     Some(BpmpGeom { shmem_tx, shmem_rx, hsp_base, db_master: mboxes.words[2] })
+}
+
+/// One named JB1b-GEOM abandon witness + the `None` the rung returns, so a rung stays a single
+/// `return geom_stop(..)` line and no call-site line numbers shift (the tail-helper convention).
+#[inline(never)]
+fn geom_stop(why: &str, a: u64, b: u64) -> Option<BpmpGeom> {
+    serial_println!(":: tegra: JB1b-GEOM STOP — {} = {:#x} / {:#x}; BPMP geometry unresolved ::", why, a, b);
+    None
 }
 
 /// JB1c: the XUSB host node's BPMP resource IDs, read off the firmware DTB (never a header
@@ -336,18 +371,28 @@ pub struct XusbIds {
 }
 
 /// Find the node whose name contains "usb@3610000" and read its BPMP resource id lists.
+///
+/// Every abandon rung names itself on serial (`JB1c-IDS STOP`): the caller's line is the generic
+/// "no usb@3610000 ids in DTB; SKIP", which cannot say whether the DTB was absent, unmapped,
+/// malformed, node-less, or merely id-less — and without ids the whole XUSB ungate is skipped.
 pub fn xusb_ids(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<XusbIds> {
     if dtb_addr == 0 || dtb_size == 0 {
-        return None;
+        return ids_stop("no DTB handed off", dtb_addr, dtb_size as u64);
     }
     let g_lo = dtb_addr >> 30;
     let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
     let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
     if !mapped(g_lo) || !mapped(g_hi) {
-        return None;
+        return ids_stop("DTB GiB unmapped (lo vs RAM-GiB-mask)", g_lo, ram_gib_mask);
     }
     let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
-    let fdt = Fdt::new(blob)?;
+    let Some(fdt) = Fdt::new(blob) else {
+        return ids_stop(
+            "bad DTB header (magic/bounds) at Fdt::new; first two words",
+            be32(blob, 0).unwrap_or(0) as u64,
+            be32(blob, 4).unwrap_or(0) as u64,
+        );
+    };
     let mut path = [0u8; MAX_PATH];
     let mut plen = 0usize;
     fdt.for_each_prop(|e| {
@@ -358,7 +403,7 @@ pub fn xusb_ids(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<Xus
         }
     });
     if plen == 0 {
-        return None;
+        return ids_stop("no node whose path contains usb@3610000", 0, 0);
     }
     let node = &path[..plen];
     // [phandle, id] pairs -> collect the odd-index words.
@@ -385,9 +430,21 @@ pub fn xusb_ids(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<Xus
     pick(&resets, &mut ids.resets, &mut ids.n_resets);
     pick(&pds, &mut ids.pds, &mut ids.n_pds);
     if ids.n_clocks == 0 && ids.n_resets == 0 {
-        return None;
+        return ids_stop(
+            "usb@3610000 found but carries NO clocks and NO resets (raw prop cell counts clocks.n / resets.n)",
+            clocks.n as u64,
+            resets.n as u64,
+        );
     }
     Some(ids)
+}
+
+/// One named JB1c-IDS abandon witness + the `None` the rung returns (tail-helper convention: the
+/// rung stays one line, so no call-site `Location` shifts).
+#[inline(never)]
+fn ids_stop(why: &str, a: u64, b: u64) -> Option<XusbIds> {
+    serial_println!(":: tegra: JB1c-IDS STOP — {} = {:#x} / {:#x}; XUSB resource ids unresolved ::", why, a, b);
+    None
 }
 
 /// JB2b: does the firmware DTB mark the XUSB host node `dma-coherent`? A DT boolean is presence
@@ -397,17 +454,22 @@ pub fn xusb_ids(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<Xus
 /// still proceeds, and a stale-ring enumeration stall becomes the diagnosis); `None` = the node or
 /// the DTB itself was unresolvable. Same node match as `xusb_ids`.
 pub fn xusb_dma_coherent(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<bool> {
+    // `None` here is NOT the same as `Some(false)` — it means the question was never asked, and the
+    // attach then runs its cache-maintenance choice on an unresolved answer. The consumer lives in
+    // `xusb_tegra`, so the naming has to happen here.
     if dtb_addr == 0 || dtb_size == 0 {
-        return None;
+        return xusb_prop_stop("dma-coherent: no DTB handed off (addr / size)", dtb_addr, dtb_size as u64);
     }
     let g_lo = dtb_addr >> 30;
     let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
     let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
     if !mapped(g_lo) || !mapped(g_hi) {
-        return None;
+        return xusb_prop_stop("dma-coherent: DTB GiB unmapped (GiB lo / RAM-GiB-mask)", g_lo, ram_gib_mask);
     }
     let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
-    let fdt = Fdt::new(blob)?;
+    let Some(fdt) = Fdt::new(blob) else {
+        return xusb_prop_stop("dma-coherent: bad DTB header at Fdt::new (addr / size)", dtb_addr, dtb_size as u64);
+    };
     let mut path = [0u8; MAX_PATH];
     let mut plen = 0usize;
     fdt.for_each_prop(|e| {
@@ -418,9 +480,18 @@ pub fn xusb_dma_coherent(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> O
         }
     });
     if plen == 0 {
-        return None;
+        return xusb_prop_stop("dma-coherent: no node whose path contains usb@3610000", 0, 0);
     }
     Some(fdt.prop_at(&path[..plen], b"dma-coherent").found)
+}
+
+/// One named witness for the two `usb@3610000`/`padctl@3520000` property lookups whose `None` is
+/// consumed inside `xusb_tegra` (a lane this arc does not touch) — so the abandon still lands on the
+/// wire. `Option<T>`-generic so both the `bool` and `u64` resolvers can use it.
+#[inline(never)]
+fn xusb_prop_stop<T>(why: &str, a: u64, b: u64) -> Option<T> {
+    serial_println!(":: tegra: JB-DTBPROP STOP — {} = {:#x} / {:#x}; property unresolved ::", why, a, b);
+    None
 }
 
 /// JB9: the XUSB padctl AO aperture base — reg region 1 of the `padctl@3520000` node. The JB8
@@ -431,16 +502,18 @@ pub fn xusb_dma_coherent(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> O
 /// (addr:2, size:2) cells, so region 1's base is words[4..6]. None = node/region absent.
 pub fn xusb_padctl_ao(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<u64> {
     if dtb_addr == 0 || dtb_size == 0 {
-        return None;
+        return xusb_prop_stop("padctl AO: no DTB handed off (addr / size)", dtb_addr, dtb_size as u64);
     }
     let g_lo = dtb_addr >> 30;
     let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
     let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
     if !mapped(g_lo) || !mapped(g_hi) {
-        return None;
+        return xusb_prop_stop("padctl AO: DTB GiB unmapped (GiB lo / RAM-GiB-mask)", g_lo, ram_gib_mask);
     }
     let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
-    let fdt = Fdt::new(blob)?;
+    let Some(fdt) = Fdt::new(blob) else {
+        return xusb_prop_stop("padctl AO: bad DTB header at Fdt::new (addr / size)", dtb_addr, dtb_size as u64);
+    };
     let mut path = [0u8; MAX_PATH];
     let mut plen = 0usize;
     fdt.for_each_prop(|e| {
@@ -451,15 +524,15 @@ pub fn xusb_padctl_ao(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Opti
         }
     });
     if plen == 0 {
-        return None;
+        return xusb_prop_stop("padctl AO: no node whose path contains padctl@3520000", 0, 0);
     }
     let reg = fdt.prop_at(&path[..plen], b"reg");
     if reg.n < 8 {
-        return None;
+        return xusb_prop_stop("padctl AO: reg.n < 8 — no region-1 (AO) aperture in the node; reg.n", reg.n as u64, 0);
     }
     let base = ((reg.words[4] as u64) << 32) | reg.words[5] as u64;
     if base == 0 {
-        return None;
+        return xusb_prop_stop("padctl AO: region-1 base decoded as 0 (reg words[4]/[5])", reg.words[4] as u64, reg.words[5] as u64);
     }
     Some(base)
 }
@@ -657,10 +730,16 @@ pub fn reserved_carveouts(dtb_addr: u64, dtb_size: usize, out: &mut [(u64, u64)]
 /// windows; `dma-ranges` is the sole inbound-window source, so this parses exactly that.)
 pub fn pcie_dma_windows(dtb_addr: u64, dtb_size: usize, out: &mut [(u64, u64)]) -> usize {
     if dtb_addr == 0 || dtb_size == 0 || dtb_size > 4 * 1024 * 1024 || out.is_empty() {
-        return 0;
+        return dmaw_stop("DTB absent or implausibly sized (addr / size)", dtb_addr, dtb_size as u64);
     }
     let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
-    let Some(fdt) = Fdt::new(blob) else { return 0 };
+    let Some(fdt) = Fdt::new(blob) else {
+        return dmaw_stop(
+            "bad DTB header (magic/bounds) at Fdt::new; first two words",
+            be32(blob, 0).unwrap_or(0) as u64,
+            be32(blob, 4).unwrap_or(0) as u64,
+        );
+    };
 
     // First `pcie@` node's path (mirrors resolve_atu_and_window's walk).
     let mut path0 = [0u8; MAX_PATH];
@@ -682,7 +761,7 @@ pub fn pcie_dma_windows(dtb_addr: u64, dtb_size: usize, out: &mut [(u64, u64)]) 
         }
     });
     if !found {
-        return 0;
+        return dmaw_stop("no pcie@ node in the tree", 0, 0);
     }
     let path = &path0[..plen0];
 
@@ -711,18 +790,22 @@ pub fn pcie_dma_windows(dtb_addr: u64, dtb_size: usize, out: &mut [(u64, u64)]) 
         })
         .unwrap_or(false);
     if !is_tegra_rc {
-        return 0;
+        return dmaw_stop(
+            "first pcie@ node is not a Tegra/DesignWare RC (compatible present?/len) — foreign or QEMU-virt DTB",
+            compatible.is_some() as u64,
+            compatible.map(|c| c.len() as u64).unwrap_or(0),
+        );
     }
     let okay = match status {
         None => true,
         Some(s) => s.split(|&b| b == 0).any(|item| item == b"okay" || item == b"ok"),
     };
     if !okay {
-        return 0;
+        return dmaw_stop("Tegra RC node status is NOT okay (firmware-disabled controller); status len", status.map(|s| s.len() as u64).unwrap_or(0), 0);
     }
 
     let Some(dma_ranges) = dma_ranges else {
-        return 0;
+        return dmaw_stop("Tegra RC node is okay but carries NO dma-ranges property", 0, 0);
     };
     let cell = |b: &[u8], i: usize| -> u64 {
         u32::from_be_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]) as u64
@@ -741,7 +824,22 @@ pub fn pcie_dma_windows(dtb_addr: u64, dtb_size: usize, out: &mut [(u64, u64)]) 
         }
         off += 28;
     }
+    if n == 0 {
+        return dmaw_stop("dma-ranges present but yielded 0 usable rows (byte length / 28-byte row stride)", dma_ranges.len() as u64, 28);
+    }
     n
+}
+
+/// One named DMA-WINDOW abandon witness + the `0` the rung returns. `select_heap_region`'s degrade
+/// line only says "NO PCIe dma-ranges in DTB"; that is true of FIVE different failures, and the
+/// difference decides whether the RAS-2 heap boundary is derivable at all on this board.
+#[inline(never)]
+fn dmaw_stop(why: &str, a: u64, b: u64) -> usize {
+    serial_println!(
+        ":: tegra: DMA-WINDOW STOP — {} = {:#x} / {:#x}; inbound-DMA window NOT derivable (heap falls back to the RAS-2 heuristic) ::",
+        why, a, b
+    );
+    0
 }
 
 /// JB3 boot-6: census of EVERY smmu/iommu node the firmware DTB knows — name, compatible,
@@ -1090,16 +1188,22 @@ const MAX_FB_NODES: usize = 4;
 /// handed, or the DTB is unmapped/malformed) — the caller then prints and skips the blit.
 pub fn nvdisplay_simplefb(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<SimpleFb> {
     if dtb_addr == 0 || dtb_size == 0 {
-        return None;
+        return sfb_stop("no DTB handed off", dtb_addr, dtb_size as u64);
     }
     let g_lo = dtb_addr >> 30;
     let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
     let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
     if !mapped(g_lo) || !mapped(g_hi) {
-        return None;
+        return sfb_stop("DTB GiB unmapped (lo vs RAM-GiB-mask)", g_lo, ram_gib_mask);
     }
     let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
-    let fdt = Fdt::new(blob)?;
+    let Some(fdt) = Fdt::new(blob) else {
+        return sfb_stop(
+            "bad DTB header (magic/bounds) at Fdt::new; first two words",
+            be32(blob, 0).unwrap_or(0) as u64,
+            be32(blob, 4).unwrap_or(0) as u64,
+        );
+    };
 
     // Pass 1: collect every node whose `compatible` names "simple-framebuffer" (the firmware writes
     // one per active head under /chosen). Bounded.
@@ -1140,6 +1244,7 @@ pub fn nvdisplay_simplefb(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> 
                 }
             }
             if sl >= 8 && &sb[..8] == b"disabled" {
+                sfb_reject(node, "status = \"disabled\" (firmware marks this head inactive)", 0, 0);
                 continue;
             }
         }
@@ -1157,10 +1262,12 @@ pub fn nvdisplay_simplefb(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> 
             let mut rbuf = [0u8; MAX_PATH];
             let rn = fdt.path_of_phandle(memregion.words[0], &mut rbuf);
             if rn == 0 {
+                sfb_reject(node, "memory-region phandle resolves to no node", memregion.words[0] as u64, 0);
                 continue;
             }
             let rr = fdt.prop_at(&rbuf[..rn], b"reg");
             if rr.n < 4 {
+                sfb_reject(node, "memory-region node reg.n < 4 (need base_hi/lo + size_hi/lo); reg.n", rr.n as u64, 0);
                 continue;
             }
             (
@@ -1175,11 +1282,13 @@ pub fn nvdisplay_simplefb(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> 
                 false,
             )
         } else {
+            sfb_reject(node, "no memory-region phandle and node reg.n < 4; no physical base; reg.n", node_reg.n as u64, 0);
             continue;
         };
         // Require a DRAM base (>= 0x8000_0000) here too — so a bad-but-resolvable first node does not
         // mask a valid later one (the full geometry/size sanity lives in display_tegra::jd1_survey).
         if base < 0x8000_0000 || width.n == 0 || height.n == 0 {
+            sfb_reject(node, "base below DRAM (<0x80000000) or width/height absent; base / (width.n<<8|height.n)", base, ((width.n as u64) << 8) | height.n as u64);
             continue;
         }
         let mut fmt = [0u8; 16];
@@ -1204,7 +1313,36 @@ pub fn nvdisplay_simplefb(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> 
             via_memregion,
         });
     }
+    sfb_stop(
+        "no simple-framebuffer node survived resolution (candidate node count / all rejected above)",
+        n as u64,
+        0,
+    )
+}
+
+/// One named JD1-SFB abandon witness + the `None` the rung returns. Without it the resolver's
+/// failure is a bare `None` and the boot goes headless with no line saying WHY — the exact
+/// ambiguity the `jd1_dump` (which lists the nodes it *found*) cannot resolve on its own.
+#[inline(never)]
+fn sfb_stop(why: &str, a: u64, b: u64) -> Option<SimpleFb> {
+    serial_println!(
+        ":: tegra: JD1-SFB STOP — {} = {:#x} / {:#x}; no scanout inherited (headless) ::",
+        why, a, b
+    );
     None
+}
+
+/// One named per-node rejection witness for the pass-2 `continue` rungs — so a DTB that publishes a
+/// simple-framebuffer node the strict resolver then discards says which test the node failed.
+#[inline(never)]
+fn sfb_reject(node: &[u8], why: &str, a: u64, b: u64) {
+    serial_println!(
+        ":: tegra: JD1-SFB reject — node {}: {} = {:#x} / {:#x} ::",
+        core::str::from_utf8(node).unwrap_or("?"),
+        why,
+        a,
+        b
+    );
 }
 
 /// JD1 (video): human-readable dump of the DTB display handoff — the twin of `nvdisplay_simplefb`.

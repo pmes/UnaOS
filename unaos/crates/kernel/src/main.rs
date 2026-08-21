@@ -2085,7 +2085,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
                             unaos_kernel::arch::xusb_tegra::jb5_witness("raw-handoff");
                             // JB6 probe: is CPUCTL=0xffffffff a stuck CSB page-select or a dead
                             // Falcon core? Read-only ARU/CSB sweep (only page-select writes).
-                            unaos_kernel::arch::xusb_tegra::jb6_csb_sweep();
+                            unaos_kernel::arch::xusb_tegra::jb6_csb_sweep(); unaos_kernel::arch::xusb_tegra::jb11_fw_header_census("raw-handoff"); // JB11: the blob-free Falcon fw-header readout (BAR2 IOCTL_CFGTBL_READ) — always-on, its own bounded CNR wait, and an explicit all-ones = inherited-state-wall verdict. On the SAME line as the JB6 sweep so the wire-in adds ZERO source lines before any panic `Location` (the byte-identity convention documented at the main.rs tail) — non-tegra images are unmoved.
                             // JB7 (arc A): census the Falcon clocks' ACTUAL enabled state — jb1c
                             // only proves each MRQ_CLK ENABLE *acked*, not that the clock runs. A
                             // pure BPMP query on the untouched inherited handoff state; clock-gated

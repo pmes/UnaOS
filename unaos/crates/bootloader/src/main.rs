@@ -1235,10 +1235,17 @@ fn jb8_falcon_witness(tag: &str) {
     let own0 = r(0x010);
     let mut serviced = false;
     let mut attempts = 0u32;
+    // JB9d-EVIDENCE: count the rounds that never got the owner semaphore at all. Without it a
+    // `SILENT` verdict conflated two different worlds — "we owned the mailbox and the FW never
+    // answered" (the FW service loop is dead) versus "the NVIDIA driver held the semaphore the whole
+    // time and we never sent anything" (nothing was ever asked). The bracket this witness exists to
+    // draw depends on telling them apart.
+    let mut no_owner = 0u32;
     while attempts < 3 && !serviced {
         attempts += 1;
         w(0x010, 2); // OWNER_SW
         if r(0x010) != 2 {
+            no_owner += 1;
             boot::stall(core::time::Duration::from_micros(5_000));
             continue;
         }
@@ -1258,10 +1265,15 @@ fn jb8_falcon_witness(tag: &str) {
         }
     }
     log::info!(
-        "JB9d[{tag}]: MBOX MSG_ENABLED {} (owner pre={own0:#x} now={:#x} data_out={:#010x}, attempts={attempts})",
+        "JB9d[{tag}]: MBOX MSG_ENABLED {} (owner pre={own0:#x} now={:#x} data_out={:#010x}, attempts={attempts}, owner-claim-failed={no_owner}{})",
         if serviced { "SERVICED" } else { "SILENT" },
         r(0x010),
-        r(0x00c)
+        r(0x00c),
+        if no_owner == attempts {
+            " — NO MESSAGE WAS EVER SENT: the owner semaphore was held on every attempt, so SILENT says nothing about the FW"
+        } else {
+            ""
+        }
     );
 }
 
