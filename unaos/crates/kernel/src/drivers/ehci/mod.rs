@@ -206,6 +206,50 @@ struct IntEp {
     /// button, or idle keep-alive). The re-press recovery below reads the SILENCE between reports,
     /// so it must be stamped by every report, not only by button ones. 0 = no report yet.
     last_report_ms: u64,
+    /// EHCIDARK — `arch::ms()` at the last service pass that EXAMINED this endpoint, whatever it
+    /// found. The denominator of the whole census: it is the only thing in the driver that knows how
+    /// long the endpoint went un-re-armed, because a re-arm can happen nowhere else but a pass.
+    /// 0 = never polled.
+    dark_poll_ms: u64,
+    /// EHCIDARK — the SMALLEST service-pass gap ever observed to end in a completion on this
+    /// endpoint, i.e. the device's own report cadence, self-calibrated on the passes that kept up.
+    /// `u32::MAX` until the first completion.
+    ///
+    /// Measured rather than read off `bInterval` deliberately, and the reason is that `bInterval` is
+    /// the wrong number twice over here. The QH is armed with S-mask `0x01` — one start-split per
+    /// frame — so the HOST offers this endpoint a transaction every 1 ms regardless of what the
+    /// descriptor asked for; and what the census needs is not how often the host asks but how often
+    /// the DEVICE has something to say, which for a change-only trackpad is a property of the hand,
+    /// not of the descriptor. The floor of the observed gaps is that rate: on boot 10 of
+    /// `rmbp2-boot8` the pad's routed cadence is 8 ms flat with a p50 gap of exactly 8.
+    dark_cad_ms: u32,
+    /// EHCIDARK — service passes that found a report waiting after a gap long enough for the device
+    /// to have generated MORE than the one report the endpoint can hold. One window = one stretch of
+    /// darkness the operator paid for.
+    dark_windows: u32,
+    /// EHCIDARK — total milliseconds inside those windows. The hard number: an upper bound on the
+    /// time this endpoint spent holding a retired qTD with nothing armed behind it.
+    dark_ms: u64,
+    /// EHCIDARK — the worst single such window.
+    dark_max_ms: u32,
+    /// EHCIDARK — **the answer to "how many reports were missed", stated as the BOUND it is.**
+    ///
+    /// Σ over dark windows of `gap / cadence - 1`. It is an upper bound and not an exact count
+    /// because the wire is invisible from here: the driver knows when it re-armed and it knows the
+    /// device's cadence, but a completion observed at time `t` after a pass gap of `g` only proves
+    /// the report landed somewhere in `(t - g, t]` — so the dark stretch is at most `g` and the
+    /// reports the device could have generated inside it at most `g / cadence`, one of which is the
+    /// one we got. Under-arming cannot make it read low and idleness cannot make it read high: a
+    /// pass that finds the qTD still ACTIVE contributes nothing, so a still hand costs zero.
+    dark_missed: u64,
+    /// EHCIDARK — `arch::ms()` of the last `EHCIDARK` line emitted for this endpoint, rate-limiting
+    /// it to one per [`EHCIDARK_ROLLUP_MS`]. Per ENDPOINT so a chatty pointer cannot mask a
+    /// keyboard's own darkness, and paired with [`IntEp::dark_missed_logged`] so a healthy endpoint
+    /// prints NOTHING at all — this instrument exists to shorten a burst, not to add to one.
+    dark_log_ms: u64,
+    /// EHCIDARK — the `dark_missed` value the last emitted line carried. A pass whose census has not
+    /// moved has nothing new to say and stays off the wire.
+    dark_missed_logged: u64,
     /// KBDWIT — `arch::ms()` when this endpoint was ARMED. The silence clock's origin for an
     /// endpoint that has never completed anything (the s58 keyboard's exact state). Deliberately
     /// separate from `last_report_ms`, which only the POINTER paths stamp (`note_buttons`) and so
@@ -11752,6 +11796,19 @@ impl Controller {
             kbd_intf: intf,
             kbd_led_ok: true,
             last_report_ms: 0,
+            // EHCIDARK — the census clock starts at the moment the endpoint becomes armed, for the
+            // same reason KBDWIT's silence clock does: the interval it measures is "armed and
+            // expected to complete", never "still being set up". The cadence starts UNKNOWN
+            // (`u32::MAX`) so the first completion cannot manufacture a window out of the arm-to-
+            // first-report gap, which is a property of the operator's hand and not of any stall.
+            dark_poll_ms: crate::arch::ms(),
+            dark_cad_ms: u32::MAX,
+            dark_windows: 0,
+            dark_ms: 0,
+            dark_max_ms: 0,
+            dark_missed: 0,
+            dark_log_ms: 0,
+            dark_missed_logged: 0,
             // KBDWIT: stamp the silence clock's origin at the moment the endpoint becomes armed —
             // i.e. after the QH is linked and PSE is on, so the interval this witness measures is
             // genuinely "armed and expected to complete", never "still being set up".
@@ -11879,6 +11936,10 @@ impl Controller {
         let mut n_clr = 0usize;
         #[cfg(feature = "mtraw")]
         let mut mt_dumped = if self.mt_probe.is_some() { Some(self.mt_dumped) } else { None };
+        // EHCIDARK — ONE clock read for the whole pass, shared by every endpoint. The census is about
+        // the pass's own period, so a per-endpoint read would only add jitter to the quantity being
+        // measured (and cost an MMIO/TSC read per armed endpoint on a ~1 kHz loop).
+        let now_ms = crate::arch::ms();
         for (ep_i, e) in self.int_eps.iter_mut().enumerate() {
             if e.dead {
                 // KBDWIT-LATCH: a retired endpoint is no longer SERVICED, but it must still be able
@@ -11909,6 +11970,12 @@ impl Controller {
                 }
                 continue;
             }
+            // EHCIDARK — the pass gap for THIS endpoint, taken before anything else can `continue`
+            // past it. Every exit below leaves `dark_poll_ms` describing this pass, so the next gap
+            // is measured against a real visit rather than against the last visit that happened to
+            // find a report.
+            let dark_gap_ms = now_ms.wrapping_sub(e.dark_poll_ms);
+            e.dark_poll_ms = now_ms;
             let tok = if om {
                 core::ptr::read_volatile(&(*e.qh).overlay[2])
             } else {
@@ -12020,6 +12087,69 @@ impl Controller {
             #[cfg(feature = "mtraw")]
             let len = e.rx_total.saturating_sub((tok >> QTD_TOTAL_SHIFT) & 0x7FFF) as usize;
             if len > 0 {
+                // ══════════════════════════════════════════════════════════════════════════════
+                // EHCIDARK — **the reports this endpoint could not accept, counted.**
+                //
+                // The endpoint holds exactly ONE report and cannot hold more on this silicon: `mps`
+                // is 64 against 8-byte Report ID 0x02 reports, so every report is a SHORT packet and
+                // retires the qTD. (That is also why the multi-packet arming the `mtraw` path uses is
+                // unavailable here — the controller stops at the first short packet whatever `total`
+                // says.) From that instant until a service pass rewrites the overlay the endpoint is
+                // DARK, and everything the pad sends is dropped ON THE WIRE. Nothing downstream can
+                // see it: `EVQ_DROP_PTR` counts a full ring, `pointer_motion_coalesced` counts a slow
+                // drain, and both of those are about reports that at least reached memory. Until this
+                // block there was no term anywhere in the driver for the ones that never did — which
+                // is the difference between "the pointer feels bad" and a number.
+                //
+                // The arithmetic is deliberately conservative in the only direction that could
+                // mislead. `dark_gap_ms` is this endpoint's whole service-pass gap, and the report we
+                // are holding landed SOMEWHERE inside it — so the dark stretch is AT MOST that gap
+                // and the reports the device could have generated within it at most `gap / cadence`,
+                // of which we got one. A pass that finds the qTD still ACTIVE contributes nothing at
+                // all, so a still hand — the ordinary case, a change-only pad reporting nothing —
+                // can never inflate this.
+                //
+                // `dark_cad_ms` is learned from the passes that KEPT UP (the running minimum gap),
+                // so the estimate calibrates itself against this device on this boot instead of
+                // trusting a `bInterval` that describes neither the host's poll rate nor the hand's.
+                // It is updated AFTER the window test so a pass cannot be judged against a cadence
+                // it is itself establishing.
+                if e.dark_cad_ms != u32::MAX && e.dark_cad_ms > 0 {
+                    let slots = (dark_gap_ms / e.dark_cad_ms as u64) as u32;
+                    if slots > 1 {
+                        e.dark_windows = e.dark_windows.saturating_add(1);
+                        e.dark_ms = e.dark_ms.saturating_add(dark_gap_ms);
+                        e.dark_max_ms = e.dark_max_ms.max(dark_gap_ms.min(u32::MAX as u64) as u32);
+                        e.dark_missed = e.dark_missed.saturating_add((slots - 1) as u64);
+                    }
+                }
+                // Saturate rather than cast: a gap past `u32::MAX` ms is unreachable in a boot, but a
+                // TRUNCATING cast is the one way it could turn into a small number and drive the
+                // cadence — and therefore every later `missed<=` — from a value that never happened.
+                let gap_u32 = dark_gap_ms.min(u32::MAX as u64) as u32;
+                if gap_u32 > 0 && gap_u32 < e.dark_cad_ms {
+                    e.dark_cad_ms = gap_u32;
+                }
+                // The rollup. Silent on a healthy endpoint by construction — it needs the census to
+                // have MOVED since the last line — and rate-limited to one line per
+                // `EHCIDARK_ROLLUP_MS` when it has, because an instrument built to shorten a witness
+                // burst must not become one. Identity is decoded from the QH's own `ep_chars`, the
+                // word the controller is executing, for the reason KBDFLAP's STOP-NOTE line decodes
+                // it that way: a census that named the wrong endpoint would be worse than none.
+                if e.dark_missed != e.dark_missed_logged
+                    && now_ms.wrapping_sub(e.dark_log_ms) >= EHCIDARK_ROLLUP_MS
+                {
+                    e.dark_log_ms = now_ms;
+                    e.dark_missed_logged = e.dark_missed;
+                    let chars = core::ptr::read_volatile(&(*e.qh).ep_chars);
+                    serial_println!(
+                        ":: EHCI-HID: [{}] EHCIDARK addr={} ep=IN{} kind={} reports={} cad={}ms windows={} dark={}ms max={}ms missed<={} == witness ::",
+                        idx, chars & 0x7F, (chars >> 8) & 0xF, int_ep_kind(e),
+                        e.reports.wrapping_add(1), e.dark_cad_ms, e.dark_windows,
+                        e.dark_ms, e.dark_max_ms, e.dark_missed
+                    );
+                }
+                // ══════════════════════════════════════════════════════════════════════════════
                 // Boot reports are ≤ 8 B; a parsed report-pointer report can be longer (the
                 // buffer is 64 B), so cap by kind.
                 // MT-INVESTIGATION: knob-on the layout cap becomes the (grown) buffer length —
@@ -12404,6 +12534,16 @@ impl Controller {
 /// Unbounded is a livelock on the service path — a permanently stalling endpoint would buy a
 /// control transfer on every pass of the ~1 kHz main loop for the rest of the boot.
 const HALT_CLEARS_MAX: u8 = 2;
+
+/// EHCIDARK — minimum spacing between two `EHCIDARK` census lines for the SAME endpoint.
+///
+/// Five seconds, the cadence every other rollup in this tree settles on (`[schedx86] depth`,
+/// `[rtwit]`, `[piusb26]`), and for the reason that matters here more than anywhere: this instrument
+/// exists because a witness burst was starving the pointer. A census that printed per dark window
+/// would print hardest exactly when the console is already the problem — it would be the defect
+/// wearing the shape of its own diagnosis. Paired with the "only when the count MOVED" gate at the
+/// call site, a healthy boot emits this line ZERO times.
+const EHCIDARK_ROLLUP_MS: u64 = 5000;
 
 /// KBDFLAP — the software name for what an armed interrupt endpoint is, shared by the halt
 /// STOP-NOTE and the KBDWIT dump so the two lines can be joined by eye. It is the DRIVER'S belief;

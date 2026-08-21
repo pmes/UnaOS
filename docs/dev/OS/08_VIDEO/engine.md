@@ -10340,6 +10340,10 @@ entry type.
 
 ### What is NOT closed, and it is out of this lane
 
+> **All four items below are CLOSED by the section that follows this one** (PTRWIT / PTBURST /
+> EHCIDARK / PTRCH, 2026-08-21). The list is kept verbatim because it is the ledger the next arc was
+> handed, and because each entry names the evidence that arc had to answer.
+
 The fold caps the damage at the ring. The burst itself, and two seams that amplify it, are untouched:
 
 * `main.rs` `x86_usb_pump` runs `xhci.service_ftdi()` **ahead of** `ehci::service_ehci_hid()` in the
@@ -10358,6 +10362,214 @@ The fold caps the damage at the ring. The burst itself, and two seams that ampli
 **The metal falsifier for what DID land:** drag, drop, then move immediately. The arrow should arrive
 where the hand is rather than crawling there — and `pal::pointer_motion_coalesced()` reading nonzero
 is the proof the drain fell behind and the fold caught it.
+
+## PTRWIT / PTBURST / EHCIDARK / PTRCH — the four amplifiers behind the dead zone (2026-08-21)
+
+PTRDEAD capped the damage at the ring. It did **not** remove the burst. This is the burst: the four
+seams its closing ledger named, taken in the order they cost the pointer.
+
+Read this section with the one above it. PTRDEAD established the mechanism — a relative-motion
+backlog walked one event at a time while a core is inside a console burst — and everything here is
+either an amplifier of that burst or an instrument for what the burst destroys.
+
+### PTRWIT — the pointer witness was the largest thing on the wire
+
+**The measurement, boot 10 of `rmbp2-boot8` (the `UNAOS_USBDEBUG=1` desktop Peter actually flies):**
+
+| | |
+|---|---|
+| `USB-DEBUG: MOUSE relative …` lines | **2456** |
+| bytes they cost | **121 164 — 20.8 % of the ENTIRE boot's serial output** |
+| rank among all producers in that capture | **1st**, ahead of `[wc-h] rollup` (98 kB) |
+| mean line length (with the `logts` prefix and the newline) | **49.33 B** |
+| line time at 115200 | **4.28 ms per pointer report** |
+| the pad's own routed cadence in the same slice | **8 ms flat** (p50 gap = 8) |
+
+So **more than half of every pointer interval was spent printing the pointer**, and the instrument
+could not keep up with the thing it existed to observe: 6.2 kB/s of pointer text against an 11.5 kB/s
+cable, before any other subsystem printed a byte. That is not an instrument observing a system, it is
+an instrument loading it — and the standing ruling that a diagnosis card runs the REAL desktop makes
+the witness's cost part of the desktop's behaviour.
+
+**What replaced it** (`usbdebug_event_print`, `main.rs`), and what it still answers:
+
+* the **first 16 relative reports of the boot print in the OLD FORMAT, byte for byte**. That is the
+  bring-up question — *did a real report arrive, and what did it say* — and it is asked once per boot,
+  not 125 times a second. Every `awk` written against `USB-DEBUG: MOUSE relative dx=` keeps matching;
+* after that, motion **folds into a rollup**, `USB-DEBUG: MOUSE rel n=… dx=… dy=… span=…ms`, emitted
+  at most every 250 ms and **flushed immediately ahead of any non-motion event**, so the wire stays
+  chronological: a drag reads `MOUSE rel n=…` then `BUTTON mask=0x00`, in that order. `n` and `span`
+  are the two facts the steady state is read for — they are the cadence, and a dead zone is a cadence
+  defect;
+* the 250 ms rollup period **is** `X86_GUI_PULSE_MS`. The input service already posts an
+  `Event::Timer` at that rate and that Timer flushes the rollup, so the tail of a gesture reaches the
+  wire while the hand is still, and a second, different period would only produce a ragged line rate;
+* **KEY, BUTTON and absolute-motion lines are untouched and stay per-event.** They are human-rate,
+  they were never the amplifier, and they are what a bring-up card is read for.
+
+**The proof, replayed through boot 10's own pointer stream** (same 2456 reports, both formats):
+
+| | bytes | per report | line time @115200 | cable time over the boot |
+|---|---|---|---|---|
+| before | 121 164 | 49.33 B | **4.28 ms** | 10.52 s |
+| after | 6 918 | 2.82 B | **0.24 ms** | 0.60 s |
+
+**17.5×**, and 114 kB removed from the boot. Against the pad's 8 ms interval the pointer path's own
+share of the wire falls from **53.5 % to 3.0 %**. (16 verbatim lines + 98 rollups replace 2456.)
+
+### PTBURST — the console drain, bounded to a slice the trackpad can live inside
+
+`drain_ftdi` (`drivers/xhci/mod.rs`) is called from `x86_usb_pump`, the single-threaded x86
+device-service pass, and `ehci::service_ehci_hid()` — the internal keyboard and trackpad — runs later
+in the **same pass**. It used to drain *"until the ring is empty"* in 512-byte **awaited** transfers.
+
+`ftdi_tx_stage` waits for its completion, and the FT232 completes a bulk-OUT only once its ~128-byte
+TX FIFO has room — which on a console running flat out means at the 115200 line rate of 11.52 B/ms. A
+512-byte transfer into a saturated FIFO therefore parks the whole service pass for **~33 ms**, and a
+~1 kB witness burst (a drag release: `[dragrel]` + `[wm-act]` + `[drag]` + `[drag-occ]` +
+`[dropwake]`) for **~87 ms** — which is the measured post-release hole, to the millisecond.
+
+Two bounds, both stated in the units of the defect:
+
+* **`FTDI_TX_CHUNK = 64`** — the FT232's full-speed bulk max packet size. One wire packet per
+  transfer, so a single transfer can never cost more than one packet's line time: **≤5.6 ms**.
+* **`FTDI_DRAIN_SLICE_MS = 4`** — the most wall clock one pass may spend in the drain. Chosen against
+  what it protects: the pad reports every 8 ms, so a pass that returns within 4 ms re-arms the
+  interrupt endpoint at least once per report period even with the console at full line rate.
+
+**The trade is nothing, and that is the point.** Throughput is unchanged because the *wire*, not the
+transfer count, is the bottleneck — the same bytes leave in the same milliseconds, in more and
+smaller pieces. When the FIFO has room a 64-byte transfer completes in microseconds, so a boot
+replaying tens of kilobytes still moves thousands of bytes per pass and stays cable-limited exactly as
+before. The slice only binds once the FIFO is full, and at that point the ring drains at 11.52 B/ms
+however long this function is allowed to sit there.
+
+`FTDI_SLICE_YIELDS` is the falsifiable half, carried as `yields=` on the existing
+`:: FTDI: tx pump … result=OK ::` line: zero over a whole boot means the bound never bound; a rising
+count means it did, and each increment is one device-service pass — one EHCI HID re-arm — that
+happened when it would otherwise have been deferred behind the rest of a burst.
+
+**The ORDER was deliberately NOT inverted.** `service_ftdi` still runs ahead of `service_ehci_hid`;
+BOOTPACE M2's console-first rule stands. Inverting them buys the report already sitting in the
+endpoint at most one drain slice of delivery latency — **4 ms once the bound is in place, half a
+report period** — and costs putting the console behind a call that can spend a whole
+`hw_wait_budget()` (~2 s) inside one control transfer on a stalled EP0 (the KBDFLAP `ClearFeature`
+and lock-LED `SET_REPORT` paths). Two seconds of console blackout at the exact moment an attended
+sitting needs the log is not worth 4 ms of pointer latency. **The darkness itself is indifferent to
+the order either way:** the endpoint is re-armed once per pass wherever in the pass that happens, so
+it is the pass PERIOD that sets the dark window — which is precisely what the slice shortens.
+
+### EHCIDARK — the reports lost on the wire, counted
+
+The EHCI interrupt endpoint holds **exactly one report and cannot hold more on this silicon**: `mps`
+is 64 against 8-byte Report ID 0x02 reports, so every report is a SHORT packet and retires the qTD.
+(That is also why the multi-packet arming the `mtraw` path uses is unavailable here — the controller
+stops at the first short packet whatever `total` says.) From that instant until a service pass
+rewrites the overlay the endpoint is **dark**, and everything the pad sends is dropped **on the
+wire**. Nothing downstream could see it: `EVQ_DROP_PTR` counts a full ring and
+`pointer_motion_coalesced` counts a slow drain, and both are about reports that at least reached
+memory. There was no term anywhere in the driver for the ones that never did.
+
+Per armed interrupt endpoint (`IntEp`, `drivers/ehci/mod.rs`):
+
+| field | what it is |
+|---|---|
+| `dark_poll_ms` | ms at the last service pass that examined this endpoint — the denominator; a re-arm can happen nowhere else but a pass |
+| `dark_cad_ms` | the smallest pass gap ever to end in a completion: the device's own cadence, **self-calibrated on the passes that kept up** |
+| `dark_windows` | passes that found a report waiting after a gap long enough for the device to have generated more than one |
+| `dark_ms` / `dark_max_ms` | total / worst milliseconds inside those windows |
+| `dark_missed` | **Σ `gap / cadence − 1` — the answer, stated as the bound it is** |
+
+The arithmetic is conservative in the only direction that could mislead. A completion observed at `t`
+after a pass gap of `g` proves only that the report landed somewhere in `(t − g, t]`, so the dark
+stretch is **at most** `g` and the reports the device could have generated inside it at most
+`g / cadence`, one of which is the one we got — hence `missed<=`. **A pass that finds the qTD still
+ACTIVE contributes nothing at all**, so a still hand — the ordinary case for a change-only pad —
+cannot inflate it.
+
+The cadence is measured rather than read off `bInterval`, and `bInterval` is the wrong number twice
+over: the QH is armed with S-mask `0x01`, one start-split per frame, so the **host** offers this
+endpoint a transaction every 1 ms whatever the descriptor asked; and what the census needs is not how
+often the host asks but how often the **device** has something to say, which for a change-only
+trackpad is a property of the hand. The floor of the observed gaps is that rate — boot 10's pad reads
+8 ms flat.
+
+```
+:: EHCI-HID: [0] EHCIDARK addr=8 ep=IN4 kind=trackpad reports=… cad=8ms windows=… dark=…ms max=…ms missed<=… == witness ::
+```
+
+Rate-limited to one line per endpoint per 5 s **and** gated on the count having moved, so a healthy
+boot emits it **zero times**. An instrument built to shorten a witness burst must not become one.
+
+### PTRCH — the channel's own fold, and why the ring's was not enough
+
+PTRDEAD folds the backlog in `pal::EVENT_QUEUE`. On the SCHED-X86 split **the backlog does not sit
+there.** `x86_input_service` runs on its own core and drains `pal::next_event()` to exhaustion every
+~1 ms, so the ring is essentially always empty and there is nothing to fold *into*; what the input
+service does with each event is `gui_send_x86` it into the 64-slot `GUI_CHANNEL_X86`, one slot per
+report. A render core stalled inside a witness burst therefore accumulates the whole gesture **there**,
+as 64 separate entries, then walks them one at a time — each costing a `wc_route_event`, a witness
+line and a `wc_route_tail`. Same defect, one pipe stage downstream, invisible to the ring's fold.
+
+The fold is PTRDEAD's, in PTRDEAD's shape, at the head of the render service's drain loop: a run of
+consecutive `Event::Mouse` taken off the channel is summed into one dispatch. Relative deltas are
+additive (`cursor::move_rel` adds; `wc_drag_motion` reads the resulting **absolute** position, so a
+folded run steers a live drag to exactly the same place), so it changes neither the cursor's
+destination nor any window's.
+
+Three properties it shares with the ring's, each load-bearing:
+
+* **it never crosses another event.** The run stops at the first non-`Mouse` the channel hands back,
+  and that event becomes `pending` — dispatched next, in order. A `Button` can never end up behind
+  motion that arrived after it, which is the ordering GHOST-DRAG's cure is built on. In particular the
+  release edge DRAGGLIDE hoisted ahead of its own lift arrives here **already** ahead of it, and this
+  fold cannot move it back: it stops AT the edge;
+* **`MouseAbsolute` is never folded** — absolute positions are not additive, and the QEMU tablet
+  fixtures that assert an exact resting coordinate drive that variant;
+* **the ledger stays exact.** `GUI_RECV_X86` is charged inside the new `gui_try_recv_x86` /
+  `gui_recv_blocking_x86` choke points, so a folded event is counted the moment it leaves the channel
+  and `sent − recv` still reads as live occupancy. The fold gets its own term, `GUI_FOLD_X86`,
+  appended to the depth line as `fold=` — which is what separates a channel that is empty because
+  nothing was queued from one that is empty because the consumer summed a whole gesture into one
+  dispatch:
+
+```
+[schedx86] depth sent=541 recv=541 inflight=0 (render core 1) fold=0
+```
+
+`usbdebug_event_print` moved with the recv, from the dispatch site into those choke points. That is
+the honest seam once the fold exists: printing after the fold would show one line for a run of reports
+the hardware genuinely sent, and the operator would read a pad that had gone quiet off a capture in
+which it was streaming. Raw is what the hardware sent; the fold is the drain's business, not the
+witness's.
+
+### Gates
+
+`./arroyo check` green both arches, default **and** `UNAOS_WC=1 UNAOS_USBDEBUG=1`
+(`⚡ kernel features: usbdebug,ehcihid,kbdwit,sdhcblk,smolnet,wc`) · `UNAOS_FATIMG=sf ./arroyo test
+150` + x86-fat.spec **31/31**, 0 forbidden · `UNAOS_WC=1 ./arroyo test 150` + x86-wc.spec **3/3**,
+0 forbidden · `UNAOS_FATIMG=sf UNAOS_WC=1 ./arroyo test 150` → **59 `-> PASS`, 0 FAIL/PANIC**.
+
+Ghost-drag guards intact on that run:
+
+```
+[ptrdead] backlog whole=true nodrop=true order=true pushed=192 entries=1 travel=(192,-192) folded=192 dropped=0 -> PASS
+[wm-act] direct partition=true grab=true route=true content=true level=true tabcancel=true settle=true lead=true close=true dragdead=true ctrlgeom=true zoom=true minimise=true from=(426,305) to=(450,329) -> PASS
+```
+
+plus five `[dragrel] … -> CLEAN` drag tails, `end=edge` and `end=level` both represented.
+
+**What QEMU cannot gate.** PTBURST's bound is on an FTDI console QEMU does not have (`ftdi::is_live()`
+is false there, so `drain_ftdi` returns on its first line), and EHCIDARK needs a real HID interrupt
+endpoint. Both are metal-only by construction; the QEMU battery proves they cost the deterministic
+paths nothing, and the bench proves they work. **The metal falsifiers, in order:**
+
+1. `USB-DEBUG: MOUSE rel n=… span=…ms` lines instead of a per-report flood, after 16 verbatim ones;
+2. `EHCIDARK … missed<=N` — **the number this whole arc exists to produce.** A boot where it never
+   prints is a boot where the endpoint was never dark;
+3. `yields=` on the FTDI pump line, rising, with the post-drop `USB-DEBUG` hole shorter than the
+   76–86 ms PTRDEAD measured;
+4. `fold=` on `[schedx86] depth`, nonzero exactly when the render core fell behind the pad.
 
 ## PAPER — the kit's content-surface texture, ported to integer Q16 (2026-08-09)
 

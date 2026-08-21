@@ -2722,6 +2722,41 @@ fn gui_send_x86(ev: unaos_kernel::pal::Event) {
     GUI_CHANNEL_X86.send(ev);
 }
 
+/// PTRCH — relative-motion events SUMMED into the event in front of them by the render service's
+/// drain rather than dispatched on their own (see the fold in `x86_render_service`).
+///
+/// Deliberately NOT subtracted from `GUI_RECV_X86`, and for the same conservation reason PTRDEAD
+/// keeps `EVQ_COALESCE_PTR` out of `EVQ_PUSH_PTR`: `sent - recv` is read as the channel's LIVE
+/// OCCUPANCY, and a folded event HAS left the channel, so it must be counted as received. This is a
+/// separate term describing what the consumer then did with it — and a nonzero reading is the
+/// operator's answer to "did the render core fall behind the pad": it is the count of reports the
+/// arrow was handed all at once instead of walking.
+#[cfg(target_arch = "x86_64")]
+static GUI_FOLD_X86: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// PTRCH — take one event OFF `GUI_CHANNEL_X86` without parking, charge the depth ledger, and show it
+/// to the `usbdebug` witness. The single non-blocking choke point, so `GUI_RECV_X86` can never
+/// disagree with the real receive count and no path can pull an event past the instrument.
+#[cfg(target_arch = "x86_64")]
+fn gui_try_recv_x86() -> Option<unaos_kernel::pal::Event> {
+    let ev = GUI_CHANNEL_X86.try_recv()?;
+    GUI_RECV_X86.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    #[cfg(all(feature = "usbdebug", feature = "wc"))]
+    usbdebug_event_print(ev);
+    Some(ev)
+}
+
+/// PTRCH — the blocking twin of [`gui_try_recv_x86`]: park until an event arrives, then charge the
+/// same ledger and show it to the same witness.
+#[cfg(target_arch = "x86_64")]
+fn gui_recv_blocking_x86() -> unaos_kernel::pal::Event {
+    let ev = GUI_CHANNEL_X86.recv();
+    GUI_RECV_X86.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    #[cfg(all(feature = "usbdebug", feature = "wc"))]
+    usbdebug_event_print(ev);
+    ev
+}
+
 /// One-shot guard: log "RX interrupt live" exactly once, from the input task (never the ISR).
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 static RX_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -2869,24 +2904,140 @@ fn usbdebug_invert_witness() {
 ///
 /// The KEY / MOUSE line formats are carried over verbatim, so every eye and every `awk` that reads a
 /// diagnosis capture keeps working across the inversion.
+///
+/// ### PTRWIT — **the pointer witness had become the biggest thing on the wire, and it was starving
+/// the pointer it was watching.**
+///
+/// Measured, boot 10 of `rmbp2-boot8` (the `UNAOS_USBDEBUG=1` desktop Peter flies): `USB-DEBUG: MOUSE
+/// relative …` appeared 2456 times for **121,164 bytes — 20.8 % of the entire boot's serial output,
+/// the single largest producer in the capture, ahead of `[wc-h] rollup` at 98 kB.** Mean line length
+/// with the `logts` prefix and the newline: **49.33 bytes**, i.e. **4.28 ms of 115200-baud line time
+/// per pointer report**. The pad's own cadence in that same slice is 8 ms flat (p50 gap = 8 ms), so
+/// **over half of every pointer interval was spent printing the pointer** — and the witness therefore
+/// could not keep up with the thing it existed to witness: 6.2 kB/s of pointer text against an 11.5
+/// kB/s wire, before a single other subsystem printed anything.
+///
+/// That is not an instrument observing a system, it is an instrument loading it. The standing ruling
+/// is that a diagnosis card runs the REAL desktop, which makes the witness's cost part of the
+/// desktop's behaviour — so the cost has to come down without the diagnosis going away.
+///
+/// ### What replaces it, and what it still answers
+///  * **The first [`USBDBG_PTR_VERBATIM`] relative reports of the boot print in the OLD FORMAT, byte
+///    for byte.** That is the bring-up question — "did a real report arrive, and what did it say" —
+///    and it is asked once per boot, not 125 times a second. Every `awk` written against
+///    `USB-DEBUG: MOUSE relative dx=` keeps matching.
+///  * **After that, motion FOLDS into a rollup** emitted at most every [`USBDBG_PTR_ROLLUP_MS`], and
+///    flushed immediately ahead of any non-motion event so the wire stays chronological: a drag reads
+///    `MOUSE rel n=… ` then `BUTTON mask=0x00` in that order, which is what makes a gesture legible.
+///    The rollup carries the two facts the steady state is actually read for — **how many reports
+///    arrived and over what span** (i.e. the cadence, which is where a dead zone shows up) — plus the
+///    summed travel, which is exactly what the queue would have folded anyway (`pal`'s PTRDEAD).
+///  * `Event::Timer` — the input service's 250 ms pulse — lands in the `_` arm and flushes, so the
+///    LAST rollup of a gesture reaches the wire promptly instead of waiting for the next motion. The
+///    pulse rate and the rollup rate are the same 250 ms by construction, not by coincidence.
+///
+/// KEY, BUTTON and absolute-motion lines are untouched and stay per-event: they are human-rate
+/// (a keystroke, a click, a QEMU tablet report), they are never the amplifier, and they are the lines
+/// a bring-up card is read for.
+///
+/// **The arithmetic.** 49.33 bytes/report -> one 64-byte rollup per 250 ms, i.e. 2.05 bytes/report at
+/// the pad's 125 Hz: **4.28 ms -> 0.18 ms of line time per report, a 24x reduction**, and the pointer
+/// path's steady-state share of the wire drops from 54 % of the report interval to 2.2 %.
 #[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
 fn usbdebug_event_print(raw: unaos_kernel::pal::Event) {
+    use core::sync::atomic::Ordering::Relaxed;
     match raw {
         unaos_kernel::pal::Event::Key(c) => {
+            usbdebug_ptr_rollup_flush();
             let ch = c as char;
             serial_println!("USB-DEBUG: KEY {:#04x} '{}'", c, if c >= 32 && c < 127 { ch } else { '.' });
         }
         unaos_kernel::pal::Event::Mouse { x, y } => {
-            serial_println!("USB-DEBUG: MOUSE relative dx={} dy={}", x, y);
+            // The bounded verbatim prologue: the old line, unchanged, for the first reports of the
+            // boot. `fetch_add` on a saturating compare rather than a swap so the two mutually
+            // exclusive drains (the render service and the inline BSP loop) share one budget.
+            if PTR_VERBATIM_SEEN.load(Relaxed) < USBDBG_PTR_VERBATIM {
+                PTR_VERBATIM_SEEN.fetch_add(1, Relaxed);
+                serial_println!("USB-DEBUG: MOUSE relative dx={} dy={}", x, y);
+                return;
+            }
+            let now = unaos_kernel::arch::ms();
+            if PTR_ROLL_N.fetch_add(1, Relaxed) == 0 {
+                PTR_ROLL_FIRST_MS.store(now, Relaxed);
+            }
+            PTR_ROLL_DX.fetch_add(x as i64, Relaxed);
+            PTR_ROLL_DY.fetch_add(y as i64, Relaxed);
+            if now.wrapping_sub(PTR_ROLL_FIRST_MS.load(Relaxed)) >= USBDBG_PTR_ROLLUP_MS {
+                usbdebug_ptr_rollup_flush();
+            }
         }
         unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
+            usbdebug_ptr_rollup_flush();
             serial_println!("USB-DEBUG: MOUSE absolute x={} y={}", x, y);
         }
         unaos_kernel::pal::Event::Button(mask) => {
+            usbdebug_ptr_rollup_flush();
             serial_println!("USB-DEBUG: BUTTON mask={:#04x}", mask);
         }
-        _ => {}
+        // `Event::None` is the inline BSP drain's END-OF-QUEUE SENTINEL, not an event — `pal.poll_event()`
+        // hands it back once per frame with nothing behind it. It must NOT flush: on that drain a
+        // flush-on-None would fire once per FRAME, turning a 250 ms rollup into a 60 Hz one and giving
+        // back most of what PTRWIT just saved. It is also the one variant here that is not a report.
+        unaos_kernel::pal::Event::None => {}
+        // Timer (the 250 ms pulse), KeyUp, Unknown — real reports with nothing of their own to print,
+        // and the seam that gets the tail of a gesture onto the wire while the hand is still.
+        _ => usbdebug_ptr_rollup_flush(),
     }
+}
+
+/// PTRWIT — relative motion reports printed VERBATIM, in the pre-rollup format, before the fold
+/// starts. One per report is affordable exactly once per boot; it is the steady state that is not.
+#[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+const USBDBG_PTR_VERBATIM: u32 = 16;
+
+/// PTRWIT — the rollup's minimum spacing. 250 ms, which is [`X86_GUI_PULSE_MS`]: the input service
+/// already posts an `Event::Timer` at that cadence and that Timer flushes this rollup, so a second,
+/// different period here would only ever produce a ragged line rate.
+#[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+const USBDBG_PTR_ROLLUP_MS: u64 = X86_GUI_PULSE_MS;
+
+/// PTRWIT — reports the verbatim prologue has spent (see [`USBDBG_PTR_VERBATIM`]).
+#[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+static PTR_VERBATIM_SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// PTRWIT — relative reports folded into the pending rollup. 0 = nothing pending, and the flush is
+/// a single relaxed load on every event that is not motion.
+#[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+static PTR_ROLL_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// PTRWIT — summed dx / dy of the pending rollup. `i64` because the sum is unbounded in principle and
+/// a wrapped total would read as travel in the wrong direction.
+#[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+static PTR_ROLL_DX: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+static PTR_ROLL_DY: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+/// PTRWIT — `ms()` of the FIRST report folded into the pending rollup, so the line's `span=` is the
+/// real interval those reports arrived over and `n/span` is the pad's measured cadence.
+#[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+static PTR_ROLL_FIRST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// PTRWIT — emit the pending relative-motion rollup, if there is one, and reset it.
+///
+/// Idempotent and free when nothing is pending (one relaxed load), which is what lets it be called
+/// unconditionally from every non-motion arm — the ordering guarantee ("the rollup is always on the
+/// wire AHEAD of the edge that ended it") is worth more than the branch it costs.
+#[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+fn usbdebug_ptr_rollup_flush() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let n = PTR_ROLL_N.swap(0, Relaxed);
+    if n == 0 {
+        return;
+    }
+    let dx = PTR_ROLL_DX.swap(0, Relaxed);
+    let dy = PTR_ROLL_DY.swap(0, Relaxed);
+    let span = unaos_kernel::arch::ms().wrapping_sub(PTR_ROLL_FIRST_MS.load(Relaxed));
+    serial_println!(
+        "USB-DEBUG: MOUSE rel n={} dx={} dy={} span={}ms",
+        n, dx, dy, span
+    );
 }
 
 
@@ -4757,10 +4908,29 @@ fn x86_render_service(cpu: usize) {
     // sprite exactly once. Driven by the input service's `Event::Timer` pulse when nothing is typed.
     let mut cursor_was_visible = false;
 
+    // PTRCH — an event this task has taken OFF the channel and has not dispatched yet: the one
+    // non-motion report the fold below had to pull in order to discover that a run of motion had
+    // ended. It is dispatched next, in its own turn and in its own order; nothing is ever dropped or
+    // reordered by carrying it here.
+    //
+    // **It lives outside BOTH loops, and that placement is the correctness of the whole fold.** The
+    // drain has early exits that are not "the channel is empty" — `handle_key` answering `true` means
+    // a command took the whole screen, and the drain stops so the rest of the burst is not painted
+    // over it before it is presented. An event held here across one of those exits is off the channel
+    // and cannot be re-read from it, so a `pending` scoped to the outer loop's BODY would be
+    // re-initialised to `None` on the next pass and the event would be gone — one keystroke or one
+    // click swallowed, nondeterministically, only on the boots where a full-screen command ran. Held
+    // out here it is instead the first thing the next pass dispatches.
+    let mut pending: Option<unaos_kernel::pal::Event> = None;
+
     loop {
-        // Block until an event arrives — an idle render core burns nothing.
-        let mut raw = GUI_CHANNEL_X86.recv();
-        GUI_RECV_X86.fetch_add(1, Ordering::Relaxed);
+        // Block until an event arrives — an idle render core burns nothing. PTRCH: unless one is
+        // already in hand, in which case parking would be a deadlock against an event we ourselves
+        // removed from the channel.
+        let mut raw = match pending.take() {
+            Some(ev) => ev,
+            None => gui_recv_blocking_x86(),
+        };
 
         // SCHED-X86 DRAIN: dispatch EVERY queued event, then present ONCE below — the dismantled
         // BSP loop's semantic, kept deliberately. Presenting per event is the regression this file
@@ -4769,6 +4939,58 @@ fn x86_render_service(cpu: usize) {
         // seconds late". A keystroke burst or one trackpad sweep queues dozens of events into the
         // 64-slot channel, and each would otherwise cost its own full present.
         loop {
+            // PTRCH — **THE CHANNEL'S OWN FOLD, and the reason PTRDEAD's is not enough on its own.**
+            //
+            // PTRDEAD folds a relative-motion backlog in `pal::EVENT_QUEUE`. That is the right place
+            // for the producer's backlog — but on the SCHED-X86 split the backlog does not sit there.
+            // `x86_input_service` runs on its own core and drains `pal::next_event()` to exhaustion
+            // every ~1 ms, so the ring is essentially always empty and there is nothing there to fold
+            // INTO; what the input service does with each event is `gui_send_x86` it into this
+            // 64-slot channel, one slot per report. So a render core stalled inside a witness burst
+            // accumulates the whole gesture HERE, as 64 separate entries, and then walks them one at
+            // a time — each costing a `wc_route_event`, a witness line and a `wc_route_tail`. Same
+            // defect, one pipe stage downstream, and the ring's fold cannot see it.
+            //
+            // The fold is PTRDEAD's, in PTRDEAD's shape, for PTRDEAD's reason: relative deltas are
+            // ADDITIVE (`cursor::move_rel` adds; `wc_drag_motion` reads the resulting ABSOLUTE
+            // position, so a folded run steers a live drag to exactly the same place), so summing a
+            // run of them changes neither the cursor's destination nor any window's.
+            //
+            // Three properties it shares with the ring's, each load-bearing:
+            //   * **it never crosses another event.** The run stops at the first non-`Event::Mouse`
+            //     the channel hands back, and that event becomes `pending` — dispatched next, in
+            //     order. So a `Button` can never end up behind motion that arrived after it, which
+            //     is the ordering GHOST-DRAG's cure is built on. In particular the release edge that
+            //     DRAGGLIDE hoisted ahead of its own lift arrives here already ahead of it, and this
+            //     fold cannot move it back: it stops AT the edge.
+            //   * **`MouseAbsolute` is never folded** — absolute positions are not additive, and the
+            //     QEMU tablet fixtures that assert an exact resting coordinate drive that variant.
+            //   * **the ledger stays exact.** `GUI_RECV_X86` is charged inside the recv helpers, so
+            //     every event pulled by the fold is counted the moment it leaves the channel and
+            //     `sent - recv` still reads as live occupancy. The fold gets its OWN term.
+            if let unaos_kernel::pal::Event::Mouse { x, y } = raw {
+                let (mut sx, mut sy) = (x, y);
+                loop {
+                    let next = match pending.take() {
+                        Some(e) => Some(e),
+                        None => gui_try_recv_x86(),
+                    };
+                    match next {
+                        Some(unaos_kernel::pal::Event::Mouse { x: nx, y: ny }) => {
+                            // `saturating_add` for the reason `pal` uses it: the fold is unbounded in
+                            // principle, and a wrapped delta would throw the arrow across the panel.
+                            sx = sx.saturating_add(nx);
+                            sy = sy.saturating_add(ny);
+                            GUI_FOLD_X86.fetch_add(1, Ordering::Relaxed);
+                        }
+                        other => {
+                            pending = other;
+                            break;
+                        }
+                    }
+                }
+                raw = unaos_kernel::pal::Event::Mouse { x: sx, y: sy };
+            }
             // WINX-7 / CLICK-X86 — the router pair, in the dismantled loop's exact order. A pointer
             // BUTTON is ADDRESSED before it is DELIVERED: `user_input_route` routes by FOCUS, which is
             // right for a keystroke and wrong for a click (that belongs to the window under the cursor),
@@ -4784,8 +5006,14 @@ fn x86_render_service(cpu: usize) {
             // ROUTE. Keyed on the RAW report (see `usbdebug_event_print`) so a report consumed into a
             // focused window's ring is still seen by the operator, and placed ahead of the router so
             // nothing about routing changes on a knob build.
-            #[cfg(all(feature = "usbdebug", feature = "wc"))]
-            usbdebug_event_print(raw);
+            //
+            // PTRCH — the call MOVED from here into [`gui_try_recv_x86`]/[`gui_recv_blocking_x86`],
+            // i.e. onto the moment an event leaves the CHANNEL rather than the moment this loop
+            // dispatches it. That is the honest seam once the fold above exists: printing here would
+            // show one line for a run of reports the hardware genuinely sent, and the operator would
+            // read a pad that had gone quiet off a capture in which it was streaming. Raw is what the
+            // hardware sent — the fold is this loop's business, not the witness's — and the print is
+            // still ahead of every router, still consumes nothing, and still keys on the raw report.
             let ev = unaos_kernel::arch::x86_64::syscall::wc_route_event(raw);
 
             match ev {
@@ -4883,11 +5111,12 @@ fn x86_render_service(cpu: usize) {
             // Take the next queued event if one is already waiting; otherwise the burst is drained
             // and we fall through to the single present. Never parks, so an empty channel costs one
             // failed semaphore try rather than a deschedule.
-            match GUI_CHANNEL_X86.try_recv() {
-                Some(next) => {
-                    GUI_RECV_X86.fetch_add(1, Ordering::Relaxed);
-                    raw = next;
-                }
+            //
+            // PTRCH — `pending` FIRST: an event the fold above pulled out of the channel to discover
+            // the end of a motion run is already off the channel and already counted, so taking it
+            // from here is what keeps the drain in arrival order.
+            match pending.take().or_else(gui_try_recv_x86) {
+                Some(next) => raw = next,
                 None => break,
             }
         }
@@ -5007,12 +5236,18 @@ fn x86_render_service(cpu: usize) {
             GUI_DEPTH_LAST_MS.store(now_ms.max(1), Ordering::Relaxed);
             let sent = GUI_SENT_X86.load(Ordering::Relaxed);
             let recv = GUI_RECV_X86.load(Ordering::Relaxed);
+            // PTRCH — `fold` is APPENDED at the tail (the standing insertion rule), and it is the term
+            // that separates the two ways `inflight=0` can be true. A channel that is empty because
+            // nothing was queued and a channel that is empty because the consumer summed a whole
+            // gesture into one dispatch read identically in `sent`/`recv`/`inflight`; `fold` is how
+            // many reports took the second path, i.e. how far behind the pad this core fell.
             serial_println!(
-                "[schedx86] depth sent={} recv={} inflight={} (render core {})",
+                "[schedx86] depth sent={} recv={} inflight={} (render core {}) fold={}",
                 sent,
                 recv,
                 sent.wrapping_sub(recv),
-                cpu
+                cpu,
+                GUI_FOLD_X86.load(Ordering::Relaxed)
             );
             // SCHEDLOAD-X86 load witness, riding the depth line's clock gate — the two are the answer
             // halves of one question and are worth reading as a pair: `depth` says whether the GUI
