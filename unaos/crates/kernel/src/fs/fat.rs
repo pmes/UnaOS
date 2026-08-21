@@ -4164,7 +4164,12 @@ impl FatFs {
 }
 
 /// PIUSB-27: map a [`FatError`] to a short human reason for the mount witness line.
-#[cfg(target_arch = "aarch64")]
+///
+/// VFSX86: was `#[cfg(target_arch = "aarch64")]`. The gate recorded its first CALLER (the Pi's
+/// USB mount witness), not a property of this function — the body is a total `match` over a
+/// plain enum with no register, MMIO, block-layer or arch dependency of any kind. `fs::vfs`'s
+/// `fat_err` needs it to name a backend failure on BOTH arches, so it is now arch-neutral.
+/// aarch64 is byte-inert: same function, same arms, same callers.
 pub fn fat_reason(e: FatError) -> &'static str {
     match e {
         FatError::NoDisk => "no USB block device",
