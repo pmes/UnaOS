@@ -7152,6 +7152,112 @@ deferred-write path that turns this session bond into a persistent one.
 
 ---
 
+## 29. KBDFLAP — a stalled interrupt endpoint was retired for the boot, anonymously (2026-08-21)
+
+*(§28 is reserved for the Bluetooth bond-persistence store, in flight in a parallel session.)*
+
+### The observation
+
+rMBP metal boot 10 (capture `rmbp2-boot8`, 2026-08-19). The internal keyboard delivered zero key
+events across a four-minute boot while the trackpad — the other interface of the **same device**,
+addr 8 — streamed the whole time. It read as the "armed and silent" class §10's KBDWIT probe exists
+to adjudicate. It was not that class. One line in the capture decides it:
+
+```
+[   2444ms] :: EHCI-HID: [1] STOP-NOTE interrupt endpoint halted (token 0x000a8d42)
+            — endpoint retired, not forced ::
+```
+
+`0x000a8d42` decodes (EHCI 1.0 §3.5.3) to Total-Bytes 10, PID IN, IOC 1, **CERR 3**, status `0x42`
+= Halted + SplitXState. Total-Bytes 10 is `mps=10`, and the only 10-byte endpoint armed in that
+boot is `addr=8 ep=IN3` — the internal keyboard. Its non-status half is byte-identical to the live
+token KBDWIT printed for the same endpoint on the neighbouring boot 9 (`seen=0x000a8d80`), so the
+identity is measured, not inferred. The keyboard was retired 621 ms after arming.
+
+That retirement is also why the endpoint was **absent** from boot 10's KBDWIT dump while three
+healthy endpoints appeared: `service()` skips a `dead` entry before the probe can run. The
+instrument built for this symptom was structurally silent on the boot that showed it.
+
+### Why the line could not say so
+
+It carried a raw token and nothing else — no address, no endpoint number, no kind. Every rMBP boot
+in the corpus prints two such halts:
+
+```
+STOP-NOTE interrupt endpoint halted (token 0x00088141)   <- 05ac:820a, the BT HID proxy keyboard
+STOP-NOTE interrupt endpoint halted (token 0x00048141)   <- 05ac:820b, the BT HID proxy mouse
+```
+
+`0x...8141` is **CERR 0**, status `0x41` = Halted + ERR: three consecutive transaction errors, the
+TT answering ERR. Neither of those endpoints has produced a report in any capture in the corpus, so
+retiring them is correct and is unchanged. Because two of them print every boot, the reader's prior
+is "the usual two", and the one boot where a third named the real keyboard read exactly like them.
+
+### The two halts are different faults, and the token already said which
+
+CERR unburned with no error bit set is the signature of a **STALL handshake**: the controller
+stopped because the device said stop, not because the wire failed. USB 2.0 §9.4.5 defines exactly
+one recovery for that — `ClearFeature(ENDPOINT_HALT)`, which also resets the device-side data
+toggle to DATA0 — and the interrupt path did not have it.
+
+| metal token  | CERR | status | class           | recoverable |
+|--------------|------|--------|-----------------|-------------|
+| `0x000a8d42` |  3   | `0x42` | `stall`         | yes         |
+| `0x00088141` |  0   | `0x41` | `xact-err-burn` | no          |
+| `0x00048141` |  0   | `0x41` | `xact-err-burn` | no          |
+
+Classification order is the semantics: babble, data-buffer error and missed-microframe are tested
+first — each is a host/bus fault that can coexist with the Halted bit and none is answered by
+clearing a device-side stall; the transaction-error arm then absorbs XactErr, the split ERR
+handshake, and `CERR == 0`; only Halted with the counter intact and no error bit anywhere is a
+stall.
+
+### What landed
+
+Three things, all inside `drivers/ehci`:
+
+1. `halt_class()` — classify the halted token and say whether §9.4.5 is the answer to it.
+2. The STOP-NOTE now names addr, endpoint, kind, mps, class, every decoded status bit, the report
+   count, the clear budget and its own verdict word. The `STOP-NOTE interrupt endpoint halted`
+   prefix is preserved so existing `awk` filters still match; the anonymous `(token …)` form is
+   gone from the media.
+3. Bounded recovery for `class=stall` only: at most `HALT_CLEARS_MAX` (2) clears per endpoint per
+   boot, `ClearFeature(ENDPOINT_HALT)` followed by re-arm at **DATA0**.
+
+**Ordering is load-bearing.** The clear is deferred past the `int_eps` borrow (a control transfer
+needs `&mut self`, the same shape ALLKEYS P1's `led_pushes` uses) and must reach the *device*
+before the overlay is rewritten: a fresh `QTD_ACTIVE` clears the QH's Halted bit while the device's
+stall condition survives, which is the trap `BtL3State::stopped` already documents. The re-arm
+starts at DATA0 because the clear reset the device's toggle; continuing the stream's toggle would
+have the first post-recovery packet discarded as a retransmission, and the endpoint would read
+silent a second time.
+
+A refused clear, or an exhausted budget, retires the endpoint exactly as before, held-key flush
+included. Two clears, not one and not unbounded: one is indistinguishable from "retry once and
+hope", and unbounded buys a control transfer on every pass of the ~1 kHz service loop for the rest
+of the boot.
+
+### What is not convicted
+
+**Why the device stalled is not decided by this capture, and no claim is made.** The intake
+hypothesis — a single keyboard slot the two armed keyboards collide over — is refuted:
+`MAX_INT_EPS` is 6, four endpoints were armed, both keyboards took distinct slots, and boot 10's
+own KBDWIT dump shows the QH chain intact. The ordering story is refuted too: boot 9 and
+`gr23-bootAR`'s second run both arm the same two keyboards 80 ms apart in the same order without
+stalling.
+
+What is convicted, and fixed, is that a transient stall became a dead keyboard for a whole boot,
+under a line that could not name which endpoint had died.
+
+### Reading the next boot
+
+`class=stall` followed by `HALT-CLEAR … -> ok — re-armed DATA0` and subsequent traffic means the
+hiccup was recovered. `-> REFUSED — endpoint retired` convicts the device side without another
+sitting. `class=xact-err-burn` on `05ac:820a` / `05ac:820b` is the routine per-boot pair and is not
+a fault to chase.
+
+---
+
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
 - `unaos/crates/kernel/src/drivers/ehci/`, `drivers/ehci_scout.rs` — the EHCI-3 HID driver (§10) and the EHCI-1/2 scout + shared wake (§9/§9a).
