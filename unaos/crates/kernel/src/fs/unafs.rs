@@ -58,6 +58,20 @@
 //! they disagreed. Every pi path still opens `Global`, whose arms are the
 //! identical calls, so pi behaviour is unchanged; what changed is that a mount
 //! can no longer be assembled from two devices.
+//!
+//! **UNAFSBIND — the mount cache names its disk too.** SDSEAM made a *device*
+//! carry its handle; the process-wide [`MOUNT`] cache still assumed one: its
+//! lazy bind called [`mount`] — a `BlockHandle::Global` wrapper — so a machine
+//! whose unafs volume arrives on any OTHER handle (the orin's TegraSd card,
+//! bound via SDSEAM's handle routing, is the motivating case) had a shell whose
+//! [`with_unafs`] could never see its own volume. The cache entry is now a
+//! [`BoundMount`] that STORES the [`block::BlockHandle`] its volume was mounted
+//! from, and the lazy bind ([`bind_mount`]) discovers that handle: `Global` is
+//! attempted first and wins whenever it holds a volume — every pi path is
+//! byte-for-byte the old behaviour — and only when the global path demonstrably
+//! has no unafs volume are the other handles probed, in enum order, gated by
+//! the exhaustive [`bind_probe_admitted`]. One `[unafsbind]` witness line at
+//! bind time names the handle the mount rode.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -470,6 +484,21 @@ fn partition_witness(handle: block::BlockHandle, span: &PartitionSpan) {
     );
 }
 
+/// UNAFSBIND: the mount cache entry — the live mount PLUS the handle it was mounted from.
+///
+/// The handle is stored, not re-derived, for the same reason [`SdSectorDevice`] carries one: a cache
+/// that answers "which disk is this mount" by assumption is the PI-FS-2 class one layer up. Every
+/// sector the mount moves already routes through the adapter's carried handle (SDSEAM); this field
+/// makes the BINDING itself inspectable — the `[unafsbind]` witness prints it, and
+/// [`mount_bound_handle`] exposes it so any caller can label its own witnesses with the disk the
+/// shared mount actually rides instead of re-deciding.
+struct BoundMount {
+    /// The [`block::BlockHandle`] every sector of `fs` reads and writes — the adapter inside `fs`
+    /// was built by [`mount_on`] on exactly this value.
+    handle: block::BlockHandle,
+    fs: KernelUnaFS,
+}
+
 /// The single, process-wide UnaFS mount — the K4 coherence keystone.
 ///
 /// Exactly ONE live mount for the volume, so there is one authoritative in-RAM
@@ -477,7 +506,146 @@ fn partition_witness(handle: block::BlockHandle, span: &PartitionSpan) {
 /// then kept (never dropped in steady state; `Drop`'s metadata write-back would
 /// otherwise fire on a mere read). [`force_remount`] is the only thing that
 /// clears it.
-static MOUNT: Mutex<Option<KernelUnaFS>> = Mutex::new(None);
+///
+/// UNAFSBIND: the entry is a [`BoundMount`], and the lazy bind is [`bind_mount`] —
+/// handle-DISCOVERING, not `Global`-assuming.
+static MOUNT: Mutex<Option<BoundMount>> = Mutex::new(None);
+
+/// UNAFSBIND: may the lazy mount bind PROBE this handle for a unafs volume when the GLOBAL path has
+/// none? `Global` answers `false` because it is not a probe — it is the bind's first, default
+/// attempt, and it wins outright whenever it holds a volume (the pi/x86 behaviour of record).
+///
+/// EXHAUSTIVE on purpose — no wildcard arm, the SDSEAM discipline applied to the BIND seam: a handle
+/// added in the block layer is an E0004 here, forcing the semantic decision "should a shell whose
+/// global path has no unafs volume discover one riding this handle?" to be made in the same commit
+/// that adds the handle, instead of the handle silently staying invisible to [`with_unafs`] —
+/// which is exactly the defect this arc removes.
+///
+/// ### MERGE NOTE — the TegraSd arm this seam is waiting for
+/// When `BlockHandle::TegraSd` lands (orin's TEGRASD, `drivers/block.rs`), the totality of this
+/// match reports it as an E0004 alongside [`handle_info`]'s trio. Its arm here is one line under the
+/// TEGRASD cfg triple, and it is the whole point of this arc:
+///
+/// * [`bind_probe_admitted`] — `BlockHandle::TegraSd => true,` (the orin's unafs volume rides the
+///   card's dedicated handle while `Global` is the USB stick; admitting the probe is what lets the
+///   shell's `with_unafs` find the card's volume with no tegra-side shell wiring at all)
+/// * [`bind_probe_candidates`] — add `block::BlockHandle::TegraSd` to the array (and grow its
+///   length), in enum order; the array mirrors the enum and [`handle_kind_name`] gains
+///   `BlockHandle::TegraSd => "tegra-sd",`.
+fn bind_probe_admitted(handle: block::BlockHandle) -> bool {
+    match handle {
+        // Not a probe: the default first attempt of every bind (see above).
+        block::BlockHandle::Global => false,
+        // A unafs volume on a dedicated-handle USB device whose machine boots with a volume-less
+        // global path is exactly the "volume arrives via a different handle" class; discover it.
+        block::BlockHandle::Usb => true,
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        block::BlockHandle::Sdhc => true,
+    }
+}
+
+/// UNAFSBIND: every handle the block layer defines, in enum order — the bind's probe walk. The array
+/// cannot itself be forced complete by the compiler; [`bind_probe_admitted`]'s exhaustive match is
+/// the E0004 tripwire that drags a reader here (its MERGE NOTE names this array), and
+/// [`handle_kind_name`] is a second, independent one.
+fn bind_probe_candidates() -> impl Iterator<Item = block::BlockHandle> {
+    [
+        block::BlockHandle::Global,
+        block::BlockHandle::Usb,
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        block::BlockHandle::Sdhc,
+    ]
+    .into_iter()
+}
+
+/// UNAFSBIND: the wire name of a handle kind, for the `[unafsbind]` witness. Exhaustive (E0004 on a
+/// new handle); values match the block layer's `mbr-raw handle=` names so one `awk` finds a handle's
+/// whole story across both layers.
+fn handle_kind_name(handle: block::BlockHandle) -> &'static str {
+    match handle {
+        block::BlockHandle::Global => "global",
+        block::BlockHandle::Usb => "usb",
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        block::BlockHandle::Sdhc => "sdhc",
+    }
+}
+
+/// UNAFSBIND: the handle the live cached mount is riding, or `None` if no mount is currently bound.
+/// A read-only peek (masked, like every `MOUNT` touch); it never triggers the lazy bind.
+pub fn mount_bound_handle() -> Option<block::BlockHandle> {
+    crate::arch::without_interrupts(|| MOUNT.lock().as_ref().map(|b| b.handle))
+}
+
+/// UNAFSBIND: the lazy bind — locate, mount and NAME the volume [`with_unafs`] will serve.
+///
+/// Order of proof, not of preference:
+///
+/// 1. **`Global` first, and it wins whenever it holds a volume.** On the pi the global handle IS the
+///    SD/USB path and the volume of record lives there; this arm is call-for-call the pre-UNAFSBIND
+///    `mount()`, so every machine whose volume rides `Global` binds exactly as before and the probes
+///    below never run.
+/// 2. **Probing happens only on proof of ABSENCE, never on ambiguity.** The probe walk runs only
+///    when the global attempt failed with a verdict that says "no unafs volume can be reached
+///    through the global path" (`NoStorage`, `BadSectorSize`, `Part`, `NoVolume`) AND no transient
+///    `Busy` was latched during the attempt. A `Busy`-tainted or `Fs(_)`-refused global attempt
+///    returns its error unprobed: the global volume may exist (mid-loan, or mount-refused), and
+///    binding some OTHER handle's volume behind it would shadow the volume of record with a
+///    plausible impostor — a mis-bind, which is worse than the honest error.
+/// 3. **Probes walk the handles in enum order**, taking only those [`bind_probe_admitted`] admits,
+///    and the first handle that mounts is the binding. A probe's own failure is discarded (a probe
+///    that latched `Busy` also stops the walk — same taint rule); if nothing binds, the GLOBAL
+///    error is returned, so a machine with no volume anywhere reports today's exact verdict.
+///
+/// The successful bind prints the `[unafsbind]` witness: `mount=native` (the native volume's VFS
+/// name of record — vfs.rs mounts `NativeBackend::new("native")`), `handle=` the disk it rode.
+fn bind_mount() -> Result<BoundMount, MountError> {
+    let global_err = match mount_on(block::BlockHandle::Global) {
+        Ok(fs) => {
+            serial_println!(
+                ":: [unafsbind] mount=native handle={} ::",
+                handle_kind_name(block::BlockHandle::Global)
+            );
+            return Ok(BoundMount { handle: block::BlockHandle::Global, fs });
+        }
+        Err(e) => e,
+    };
+    // Busy taint: the global attempt was refused CONTENTION, not absence — the enclosing
+    // `with_unafs_attempt` reads the latch and restarts; do not probe past a maybe-present volume.
+    if TXN_BUSY.load(Ordering::Relaxed) {
+        return Err(global_err);
+    }
+    // Only proven absence admits the probe walk (see the doc's rule 2). `Fs(_)` means a unafs
+    // volume WAS located on Global and refused the mount; `Busy` is handled above.
+    if !matches!(
+        global_err,
+        MountError::NoStorage
+            | MountError::BadSectorSize(_)
+            | MountError::Part(_)
+            | MountError::NoVolume
+    ) {
+        return Err(global_err);
+    }
+    for handle in bind_probe_candidates() {
+        if !bind_probe_admitted(handle) {
+            continue;
+        }
+        match mount_on(handle) {
+            Ok(fs) => {
+                serial_println!(
+                    ":: [unafsbind] mount=native handle={} ::",
+                    handle_kind_name(handle)
+                );
+                return Ok(BoundMount { handle, fs });
+            }
+            // A probe that hit contention stops the walk untainted-result-first: the latch is set,
+            // the enclosing attempt will restart, and the restart re-runs the whole discovery.
+            Err(_) if TXN_BUSY.load(Ordering::Relaxed) => return Err(global_err),
+            Err(_) => {}
+        }
+    }
+    // Nothing anywhere: the global path's verdict is the machine's verdict, exactly as before.
+    Err(global_err)
+}
 
 /// UNAFSTXN: a transient `BlockError::Busy` was refused to THIS `with_unafs` attempt by the block
 /// layer — the storage device is loaned out to another context (WEDGE-8's xHCI controller mid-BOT,
@@ -569,7 +737,9 @@ fn with_unafs_attempt<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R) -> Attempt<R
         // race is at worst one wasted restart, never a wrong answer, because an abort is clean.)
         TXN_BUSY.store(false, Ordering::Relaxed);
         if guard.is_none() {
-            match mount() {
+            // UNAFSBIND: the lazy bind DISCOVERS its handle (Global first and unchanged; probes only
+            // on proven global absence) instead of assuming `Global` — see [`bind_mount`].
+            match bind_mount() {
                 Ok(m) => *guard = Some(m),
                 Err(e) => {
                     // UNAFSTXN: the MOUNT itself reads sectors (`locate`, the superblock, the
@@ -584,7 +754,7 @@ fn with_unafs_attempt<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R) -> Attempt<R
                 }
             }
         }
-        let fs = guard.as_mut().expect("mount just populated");
+        let fs = &mut guard.as_mut().expect("mount just populated").fs;
         // UNAFSTXN: the durable-progress fence. `commits` counts ROOT FLIPS — the single atomic
         // point of a CoW transaction — so comparing it across the closure answers exactly one
         // question: did anything this closure did reach the medium irrevocably? Read from the same
