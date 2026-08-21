@@ -1192,6 +1192,18 @@ build_kernel_aarch64() {
     echo -e "${COLOR_YELLOW}⚡ Building aarch64 Kernel...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
     local _af; _af="$(arm_features)"
+    # BLOBATOMIC (2026-08-21, peer-ruled): a RUNNABLE image whose features compile syscall.rs's
+    # include_bytes! (baremetal or tegra_el0) must never bake whatever blob a prior `check` left —
+    # an image whose contents cannot be derived from its stated inputs is not a verifiable image.
+    # Build the blob FRESH here, unconditionally, for exactly those feature sets (kernel8 and the
+    # armed esp-jetson already do their own unconditional build; this closes esp-arm/arm/test-arm).
+    case ",${_af#--features }," in
+        *,baremetal,*|*,tegra_el0,*)
+            local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+            ( cd "$WORKSPACE_DIR" && build_user_blob )
+            cd "$WORKSPACE_DIR/crates/kernel"
+            ;;
+    esac
     # Surface the effective aarch64 feature set when it differs from the (x86) banner — makes the
     # SMOLNET-DEFAULT strip visible so an operator doesn't read `smolnet` off the banner for aarch64.
     [ "$_af" != "$KERNEL_FEATURES" ] && echo -e "${COLOR_YELLOW}⚡ aarch64 effective features: ${_af#--features }${COLOR_RESET}"
@@ -1991,7 +2003,13 @@ check_kernel_cfg() {
 # (`_start` = `mov x8,#1` = 28 00 80 d2) — or fails.
 ensure_user_blob() {
     if [ -s "${WORKSPACE_DIR}/target/user_blob.bin" ]; then
-        return 0
+        # BLOBATOMIC: re-run the entry-first assertion on the warm path too — a pre-atomic-era
+        # truncated file (or any corruption) is rebuilt LOUDLY instead of accepted forever.
+        local h4; h4="$(head -c 4 "${WORKSPACE_DIR}/target/user_blob.bin" | od -An -tx1 | tr -d ' \n')"
+        if [ "$h4" = "280080d2" ]; then
+            return 0
+        fi
+        echo -e "${COLOR_RED}  target/user_blob.bin exists but fails the _start assertion (head4=${h4}) — rebuilding it${COLOR_RESET}"
     fi
     # Same TOOLBIN computation as `build_user_blob`'s other two callers — it requires the caller to
     # set it, and bash's dynamic scoping hands this `local` down into the call.
@@ -2560,27 +2578,32 @@ build_user_blob() {
     # + an inline message), so it runs wherever the kernel copies it. This MUST run BEFORE the kernel
     # build: include_bytes! needs target/user_blob.bin to exist, and its (always-fresh) mtime is what
     # drives the kernel's rebuild when the routine changes. (build-std/target come from the crate's
-    # own .cargo/config.toml; it is its own workspace, so `./arroyo check`/`build` never touch it —
-    # the blob is validated only here at kernel8-build time, not at `check`.)
+    # own .cargo/config.toml; it is its own workspace. Since TEGRAEL0LEG, `./arroyo check` DOES
+    # build the blob once per fresh tree (`ensure_user_blob`) and armed aarch64 runnable images
+    # rebuild it unconditionally (BLOBATOMIC); validation runs here, on every build, pre-landing.)
     echo -e "${COLOR_YELLOW}⚡ Building EL0 user blob (crates/user-blob → target/user_blob.bin)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-blob"
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-blob/user-blob.ld" \
       cargo +nightly build --release -Z json-target-spec
     cd "$WORKSPACE_DIR"
+    # BLOBATOMIC (2026-08-21, peer-ruled): objcopy to a temp name and validate BEFORE the artifact
+    # lands, then mv (atomic on one filesystem) — an interrupted build can no longer leave a
+    # truncated-but-nonempty user_blob.bin that `ensure_user_blob`'s -s test would accept forever.
     "$TOOLBIN/llvm-objcopy" -O binary --only-section=.text \
       "${WORKSPACE_DIR}/crates/user-blob/target/aarch64-base/release/user-blob" \
-      "${WORKSPACE_DIR}/target/user_blob.bin"
+      "${WORKSPACE_DIR}/target/user_blob.bin.tmp"
     # The flat blob must exist and begin EXACTLY at _start's first instruction — the kernel enters the
     # copy at offset 0, so a stray byte ahead of _start (a future toolchain reordering objcopy output)
     # would be a metal-only wrong-entry fault QEMU wouldn't reliably catch. _start = `mov x8, #1` =
-    # 0xD2800028 = little-endian bytes 28 00 80 d2. Assert both.
-    [ -f "${WORKSPACE_DIR}/target/user_blob.bin" ] || { echo -e "${COLOR_RED}ERROR: user_blob.bin missing — blob build failed${COLOR_RESET}"; exit 1; }
-    local head4; head4="$(head -c 4 "${WORKSPACE_DIR}/target/user_blob.bin" | od -An -tx1 | tr -d ' \n')"
+    # 0xD2800028 = little-endian bytes 28 00 80 d2. Assert both — on the temp, before it can land.
+    [ -s "${WORKSPACE_DIR}/target/user_blob.bin.tmp" ] || { echo -e "${COLOR_RED}ERROR: user_blob.bin missing/empty — blob build failed${COLOR_RESET}"; exit 1; }
+    local head4; head4="$(head -c 4 "${WORKSPACE_DIR}/target/user_blob.bin.tmp" | od -An -tx1 | tr -d ' \n')"
     if [ "$head4" != "280080d2" ]; then
         echo -e "${COLOR_RED}ERROR: user_blob.bin does not start with _start (mov x8,#1); first 4 bytes = ${head4}${COLOR_RESET}"
         exit 1
     fi
+    mv -f "${WORKSPACE_DIR}/target/user_blob.bin.tmp" "${WORKSPACE_DIR}/target/user_blob.bin"
     echo -e "${COLOR_GREEN}✅ EL0 user blob: $(wc -c < "${WORKSPACE_DIR}/target/user_blob.bin" | tr -d ' ') bytes${COLOR_RESET}"
 }
 
