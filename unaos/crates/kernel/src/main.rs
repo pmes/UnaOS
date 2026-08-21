@@ -2389,6 +2389,72 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(all(feature = "install_target", feature = "tegra"))]
     unaos_kernel::arch::sdmmc_tegra::sdmmc_install_from_usb();
 
+    // ORIN-UNAFS-ROOT rung 4 (arc M4): probe-mount the microSD's NATIVE unafs volume on its OWN
+    // block handle — `unafs::mount_on(BlockHandle::TegraSd)`, the consumer the SDSEAM arms in
+    // fs/unafs.rs were written for. Position is load-bearing, three ways:
+    //   * AFTER `sdmmc_census` (~line 2188): the census's `publish_block_backend` is what fills
+    //     `TEGRA_SD_BLOCK_DEVICE`; before it, `tegra_sd_info()` is None and every read answers
+    //     `NotReady` — mounting earlier could only witness its own prematurity.
+    //   * AFTER `sdmmc_install_from_usb` (directly above): the installer REWRITES card content
+    //     (never capacity). A mount taken between census and install would read the pre-install
+    //     bytes and report a stale verdict on the very boot that changed the answer.
+    //   * BEFORE the JM6 drop / CAPSTONE (below): still at EL2 with the JM4 timer live, so the
+    //     polled CMD17 path's bounded waits behave exactly as they did for the census's own M3
+    //     read; and the JD2 console task, though already spawned, is not dispatched until
+    //     `run_capstone_boot_core`, so this witness lands on serial before any shell interaction.
+    // PROBE, not an installation: `mount_on` returns a fresh `KernelUnaFS`, witnessed and DROPPED.
+    // The shared `fs::unafs::MOUNT` cache (what the shell's `with_unafs` verbs use) stays bound to
+    // `BlockHandle::Global` — the USB boot stick — untouched: rebinding it is fs-lane work and a
+    // negotiation with the pi seat, not this rung. Two live mounts would be the K4 write-coherence
+    // hazard unafs.rs names; dropping ours before proceeding, plus the block layer's unconditional
+    // `write_block_tegra_sd` refusal (the card has NO writer outside `sdmmc_arm`), keeps this
+    // read-only and momentary by construction. `program_source` is likewise undisturbed — its
+    // `TegraSd` arm is `None` ("cannot be reached"), so the EL0 program volume stays the stick.
+    // Compiled out without `sdmmc` => byte-identical to baseline. See docs/dev/OS/orin-unafs-root.md.
+    #[cfg(feature = "sdmmc")]
+    {
+        use unaos_kernel::drivers::block;
+        use unaos_kernel::fs::unafs;
+        match block::tegra_sd_info() {
+            // Publish absent: the census stopped before M3 (or refused num_blocks=0). This is the
+            // expected line while the census SError is being fixed — the probe names the missing
+            // precondition instead of a misleading NoStorage.
+            None => serial_println!(
+                ":: TEGRA-UNAFS: probe SKIPPED — no TegraSd block backend published this boot (census did not reach its publish) ::"
+            ),
+            Some(dev) => match unafs::mount_on(block::BlockHandle::TegraSd) {
+                Ok(fs) => {
+                    serial_println!(
+                        ":: TEGRA-UNAFS: native unafs volume MOUNTED read-only on TegraSd — card {} sectors, {} committed root flip(s) on the volume ::",
+                        dev.num_blocks,
+                        fs.commit_stats().commits
+                    );
+                    // Dropped HERE: one mount at a time (K4), and the shared MOUNT stays Global.
+                    drop(fs);
+                }
+                // The expected verdict until the installer has written a unafs partition: the card
+                // is readable end to end (the partition scan ran off it), it just carries no volume.
+                Err(unafs::MountError::NoVolume) => serial_println!(
+                    ":: TEGRA-UNAFS: card readable ({} sectors) but NO partition carries a unafs superblock — installer has not written the native volume yet ::",
+                    dev.num_blocks
+                ),
+                // Partition table unparseable — a raw/blank card reads this way; also expected pre-install.
+                Err(unafs::MountError::Part(e)) => serial_println!(
+                    ":: TEGRA-UNAFS: partition scan on TegraSd FAILED — {:?} (card {} sectors; raw/blank card reads this way pre-install) ::",
+                    e,
+                    dev.num_blocks
+                ),
+                // Everything else (NoStorage race, BadSectorSize, Fs, Busy): a real defect worth a capture.
+                Err(e) => serial_println!(
+                    ":: TEGRA-UNAFS: mount on TegraSd FAILED — {:?} (card {} sectors; unexpected — capture this boot) ::",
+                    e,
+                    dev.num_blocks
+                ),
+            },
+        }
+    }
+
+
     // 3d. JX1 RESULT (probe removed — metal-answered 2026-07-06, capture serial-orin-jx1.log): the
     //     Tegra234 XUSB host block @ 0x0361_0000 is NOT accessible after ExitBootServices. The
     //     probe's first read fired an SError (ESR 0xbe000011, EC=0x2F/ISS=0x11) fatal to EL3 —
