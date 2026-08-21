@@ -2456,7 +2456,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     }
     unaos_kernel::arch::percpu::init(0);
     unaos_kernel::arch::exceptions::install();
-    tegra_el0_start_maybe(); tegra_rast_demo_maybe(); unaos_kernel::arch::sched::run_capstone_boot_core(0); // RAST-TEGRA demo (no-op unless UNAOS_RAST=1) on the same line as the terminus so the wire-in adds ZERO source lines before any panic Location — the tegra knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helper defined at file tail.
+    unaos_kernel::arch::timer::el1_oneshot_proof(); tegra_el0_start_maybe(); tegra_rast_demo_maybe(); unaos_kernel::arch::sched::run_capstone_boot_core(0); // IRQEL-RT EL1 one-shot proof (first: one interrupt taken AT EL1 through the runtime-banked __vec_irq, then self-disarms — see timer.rs tail) + RAST-TEGRA demo (no-op unless UNAOS_RAST=1), all on the same line as the terminus so the wire-ins add ZERO source lines before any panic Location — the tegra knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helpers defined at file tail / timer.rs tail.
 }
 
 /// Handle one keyboard byte against the console: printable ASCII extends the input line, backspace

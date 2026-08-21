@@ -319,3 +319,112 @@ fn cntfrq_substituted(used: u64) {
         used
     );
 }
+
+// ── IRQEL-RT EL1 one-shot proof (tail-defined per the Location-shift convention; everything below
+// is `tegra`-gated so the pi and QEMU-virt images stay byte-identical). M1 item 4: 0a60e260 made
+// the tegra `__vec_irq` bank ELR/SPSR by RUNTIME CurrentEL so one table serves EL2 and EL1 in one
+// boot — but only the EL2 arm is metal-proven (JM4's `verify_live`, every boot). The EL1 arm had
+// NEVER executed: the JM6 drop disables CNTP and the post-drop core runs cooperatively, so no
+// interrupt was ever TAKEN at EL1. This pair arms exactly ONE CNTP tick inside a bounded,
+// self-disarming IRQ-unmask window right after the drop (the `self_sgi_smoke` shape), witnesses
+// the first IRQ taken at EL1 from inside the handler — i.e. on the far side of the runtime
+// `irq_bank!`/`irq_unbank!` machinery this exists to prove — and leaves the machine in byte-exactly
+// the pre-existing post-drop state: timer off, IRQ masked, `LIVE` false. The cooperative scheduler
+// gains NO periodic tick (the intercept consumes the delivery INSTEAD of `on_tick`'s re-arm). ─────
+
+/// The one-shot proof window is open: `el1_proof_intercept` consumes the next timer PPI instead of
+/// letting `on_tick` re-arm a periodic tick. Set/cleared only by `el1_oneshot_proof` + the intercept.
+#[cfg(feature = "tegra")]
+static EL1_PROOF_ARMED: AtomicBool = AtomicBool::new(false);
+/// Latched by the intercept once the proof IRQ was taken; the arming spin watches it.
+#[cfg(feature = "tegra")]
+static EL1_PROOF_TAKEN: AtomicBool = AtomicBool::new(false);
+
+/// Called from `gic::handle_irq_v3` for `TIMER_INTID`, INSIDE the IRQ handler. Returns `true` iff
+/// the armed one-shot was consumed here: the timer is DISARMED first (CNTP_CTL=0 + isb, deasserting
+/// the level-sensitive PPI before the caller's EOI — the same ordering rule `on_tick` documents)
+/// and the witness printed. `false` (window not armed — every periodic tick on every other path)
+/// leaves the pre-existing `on_tick` flow untouched.
+#[cfg(feature = "tegra")]
+pub fn el1_proof_intercept() -> bool {
+    if !EL1_PROOF_ARMED.load(Ordering::Acquire) {
+        return false;
+    }
+    unsafe {
+        core::arch::asm!("msr CNTP_CTL_EL0, xzr", options(nomem, nostack, preserves_flags));
+        core::arch::asm!("isb", options(nomem, nostack, preserves_flags));
+    }
+    EL1_PROOF_ARMED.store(false, Ordering::Release);
+    // Verify-don't-assume: name the EL this IRQ was actually TAKEN at (CurrentEL — the same runtime
+    // test `irq_bank!` ran moments ago on the way in), not the EL we hope it was. Printing from IRQ
+    // context is safe here: the interrupted context is the lock-free arming spin below, which holds
+    // no serial (or any other) lock.
+    let el = super::exceptions::current_el();
+    if el == 1 {
+        serial_println!(":: IRQEL-RT: first IRQ taken at EL1 — banked vector path live (ELR_EL1 bank) ::");
+    } else {
+        serial_println!(":: IRQEL-RT: one-shot proof IRQ taken at EL{} — NOT the EL1 proof (investigate) ::", el);
+    }
+    EL1_PROOF_TAKEN.store(true, Ordering::Release);
+    true
+}
+
+/// M1 item 4 — called ONCE from `main.rs`, immediately after the post-drop `exceptions::install()`
+/// (EL1, DAIF fully masked, timer off per `set_not_live`): arm CNTP for a SINGLE tick (~4 ms) and
+/// open a bounded ~100 ms IRQ-unmask window (save DAIF, unmask I, spin on the flag off the
+/// free-running CNTPCT, restore DAIF — the `self_sgi_smoke` shape) so exactly one interrupt is
+/// taken AT EL1 through the runtime-banked `__vec_irq`. Self-disarming on EVERY path: delivered =>
+/// the intercept already wrote CNTP_CTL=0 (and printed the proof witness); not delivered => the
+/// window expiry disarms and prints the INCONCLUSIVE line. Never stalls boot beyond the window,
+/// and the post-window machine state is exactly today's (timer off, IRQ masked, `LIVE` false).
+#[cfg(feature = "tegra")]
+pub fn el1_oneshot_proof() {
+    let freq = cntfrq();
+    let freq = if freq == 0 { 62_500_000 } else { freq };
+    // Re-assert the (banked) timer PPI enable at this core's redistributor. The EL2-era enable
+    // persists across the JM6 drop (GICR state is EL-independent), but the re-enable is idempotent
+    // and cheap — verify-don't-assume.
+    super::gic::enable_ppi(TIMER_INTID);
+    EL1_PROOF_TAKEN.store(false, Ordering::Relaxed);
+    EL1_PROOF_ARMED.store(true, Ordering::Release);
+    // Armed witness BEFORE the unmask, so the serial lock is free again when the handler prints.
+    serial_println!(":: IRQEL-RT: EL1 one-shot proof — arming CNTP for a single tick at EL1 (~100 ms window) ::");
+    write_tval(freq / TICK_HZ);
+    unsafe {
+        core::arch::asm!("msr CNTP_CTL_EL0, {}", in(reg) 1u64, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("isb", options(nomem, nostack, preserves_flags));
+    }
+    let daif: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, DAIF", out(reg) daif, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("msr daifclr, #2", options(nomem, nostack, preserves_flags));
+        core::arch::asm!("isb", options(nomem, nostack, preserves_flags));
+    }
+    let budget = freq / 10; // ~100 ms — the verify_live/self_sgi_smoke window
+    let start = cntpct();
+    while cntpct().wrapping_sub(start) < budget {
+        if EL1_PROOF_TAKEN.load(Ordering::Acquire) {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    unsafe {
+        // Restore the entry DAIF (post-drop: fully masked) FIRST, then disarm unconditionally (a
+        // no-op when the intercept already did): the one-shot must not outlive its window whatever
+        // happened inside it, and no further IRQ can land once I is re-masked.
+        core::arch::asm!("msr daif, {}", in(reg) daif, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("msr CNTP_CTL_EL0, xzr", options(nomem, nostack, preserves_flags));
+        core::arch::asm!("isb", options(nomem, nostack, preserves_flags));
+    }
+    EL1_PROOF_ARMED.store(false, Ordering::Release);
+    if !EL1_PROOF_TAKEN.load(Ordering::Acquire) {
+        // Bounded, non-blocking miss path (the instrument-exists law): note it with the same
+        // diagnostics `diagnose` reads and PROCEED — boot must not stall on an unproven vector arm.
+        serial_println!(
+            ":: IRQEL-RT: EL1 one-shot NOT delivered in ~100 ms — proof INCONCLUSIVE (CNTP_CTL={:#x}, GICR PPI{} pending={}); timer disarmed, boot proceeds ::",
+            cntp_ctl(),
+            TIMER_INTID,
+            super::gic::ppi_pending(TIMER_INTID)
+        );
+    }
+}
