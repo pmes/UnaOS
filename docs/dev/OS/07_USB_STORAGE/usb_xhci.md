@@ -8064,6 +8064,111 @@ Gates: `./arroyo check` green both arches (12 cfg legs, `x86-all` carries `bt,bt
 with `UNAOS_BT=1 UNAOS_BTC=1`. No QEMU leg — QEMU has no Bluetooth controller and could never have
 judged this. Reachability was proven with `strings` on the armed builder-path `kernel.elf`.
 
+### The verdicts, flown (BTREGRESS, 2026-08-22) — read this before anything above it
+
+§30 above proposed two experiments and asserted one "blunter answer". **All three are now settled
+from captures already on disk. Two of §30's positions are refuted. Nothing above this subsection
+should be quoted without it.**
+
+#### 1. "The leak was the cause" — REFUTED. The leak was a bystander.
+
+BT-RELEASE2 shipped in `f66b1480` and flew on `rmbp4-boot13` (2026-08-22, four boots). The teardown
+now works exactly as §30's "peer-terminated case" predicted, and the page failed anyway:
+
+```
+[ 2958ms] bt-l3: SECOND LEVER NOT NEEDED — a Disconnection Complete status=0x00 handle=0x0040
+          reason=0x3e was walked past by this teardown's own waits ... RELEASE CONFIRMED
+[ 2958ms] bt-l3: L3 tally — ... disconnections_confirmed=1 ... left_outstanding=none
+[ 8085ms] bt-c1: inquiry summary — responses=0 target_found=false ... THE INQUIRY HEARD NOTHING
+[19613ms] bt-c1: page summary — attempts_run=2/2 pages_on_air=2 page_timeouts=2 -> NOT REACHED
+```
+
+No LE link is held when BT-C1 runs, the inquiry still hears nothing, both trains still time out.
+This is §30's own second reading, and it is the one that happened. **The teardown fix is correct
+and is not the pairing fix.** The `left_outstanding=A LIVE CONNECTION` condition is closed.
+
+#### 2. "The blunter answer" — that this BD_ADDR is a Logitech M196 mouse — REFUTED, in band, twice.
+
+§30 argued the stack "never once addressed the speaker". The refutation was already sitting in two
+captures, printed as three undecoded hex bytes:
+
+```
+gr26-bootC  2026-08-11  bt-c1: inquiry result — addr=88:c6:26:cc:2d:3c psrm=0x01(R1)
+                              clock_offset=0xac50 class_of_device=240418 event=0x02(standard)
+rmbp1-boot1 2026-08-18  bt-c1: inquiry result — addr=88:c6:26:cc:2d:3c psrm=0x01(R1)
+                              clock_offset=0x3800 class_of_device=240418 event=0x02(standard)
+```
+
+`class_of_device` is printed MSB-first hex with no prefix, so this is **0x240418**: Major Device
+Class `0x04` = **Audio/Video**, Major Service Classes with **Audio** (bit 21) and **Rendering**
+(bit 18) set. An audio sink. A mouse is Major Device Class `0x05` (Peripheral). These are *classic
+inquiry responses* — they came from the BR/EDR controller at the address the page is aimed at, so
+they also kill the sibling theory that a dual-mode device pages under an address other than the one
+it advertises. Peter's 2026-08-22 ruling says the same; this is the wire agreeing with him seven
+days before it was asked. `bt_c1_cod_decode` now decodes this field on the line itself so the next
+reader does not have to.
+
+#### 3. The RSSI premise is misattributed — it is an LE measurement, not a BR/EDR one.
+
+The `-86 dBm`/`-88 dBm` readings used to exclude "off" and "out of range" come from `bt-l2`, which
+is the **LE scan**, reporting `evt=ADV_IND` on the LE PHY. They prove the peer's LE radio is alive.
+They say nothing about BR/EDR inquiry scan or page scan. In the same boots the peer's *BR/EDR*
+inquiry response count is `0`. The two are different radio states on the same chip, hundreds of log
+lines apart, and reading one as evidence about the other is what kept "range/power" alive as a
+refuted-but-repeated claim. The page-summary prose now states this scope explicitly.
+
+#### 4. There is no regression commit. The bisect window is clean and it convicts nothing.
+
+Links were established on exactly two boots, both 2026-08-11: `gr25-bootA` (attempt 2/2) and
+`gr26-bootD` boot 2 (attempt 2/2). Diffing the HCI command traces, the entire on-air difference
+between the era that linked and the era that has not is **one command**: `HCI_Inquiry` (0x0401),
+added by the `bt-page` arc (`1cf20d47`, merge `12529544`, 2026-08-11), together with the two
+read-backs `HCI_Read_Inquiry_Mode` (0x0C44) and `HCI_Read_Page_Timeout` (0x0C17), neither of which
+transmits. `bt-ssp` (`d8216d1b`, 2026-08-12) is exonerated outright: it issues nothing before a
+link exists, and no link has existed since.
+
+**`bt-page` is exonerated too, by same-day controls.** On 2026-08-11, with no inquiry stage in the
+image, `gr25-bootB` (two boots), `gr25-bootC` and `gr26-bootD` boot 1 produced **8 page trains and
+0 links**. The successes are 2 of 12 blind trains on a single day, not a working baseline. And on
+2026-08-18 `rmbp1-boot1` boot 1 ran an inquiry that *heard the target*, paged it with the peer's own
+`psrm=R1` and a valid harvested clock offset — and both trains timed out. An inquiry that helps the
+page cannot be the thing that broke it.
+
+What did change with the era, on both transports at once: the peer stopped answering. `bt-l4`'s ATT
+Battery-Level read reports `answered=true` on 2 of 5 boots on 2026-08-11 and `answered=false` on
+**every** boot since (14+). A defect in the BR/EDR page path cannot stop an LE ATT read from being
+answered. The BR/EDR page timeout is the controller's own verdict about the air, delivered on the
+event endpoint, on a full-length train (`observed=5123ms deadline_in_force=5120ms ... FULL`).
+
+#### 5. What is actually left, and the one boot that settles it
+
+Every candidate this arc has chased is now weakened or dead: peer identity (dead), peer address
+(dead), held LE link (dead), power/range (dead — but only by the *inquiry*, not by the LE RSSI),
+clock-offset ageing, train phase, and controller train length (all three measured and excluded on
+`rmbp4-boot13`'s `CANDIDATE-3 ... FULL` lines).
+
+The survivor is the one thing no outbound page can measure: **the peer's page-scan enable.** A
+device that answers an inquiry is *inquiry*-scanning. Inquiry scan and page scan are separate
+enables, and "discoverable but not connectable" is an ordinary state for a speaker that is already
+bonded or connected elsewhere. Every attempt so far has tested the same direction.
+
+**The experiment is a direction test, and it is one boot.** Make this host page-scannable and let
+the speaker connect *inbound*: issue `HCI_Write_Scan_Enable` (0x0C1A) with `0x03` (inquiry scan +
+page scan) before BT-C1's outbound attempts, put the speaker into pairing mode, and wait one page
+window. The two outcomes are exclusive and neither needs a follow-up question:
+
+- **A `Connection Request` (0x04) event arrives** ⇒ the RF path works in both directions and the
+  peer's BR/EDR radio will initiate; the fault is our outbound page train or the peer's page-scan
+  enable, and the arc moves to `HCI_Write_Page_Scan_Activity`/train-length work.
+- **Nothing arrives, while the same boot's inquiry still hears the target** ⇒ the peer is
+  discoverable and not connectable in either direction; the fault is the peer's connectable state
+  (bonded/connected elsewhere, or past its pairing window) and no host-side page change will fix it.
+
+⚠ **This needs Peter's explicit go before it is built.** `Write_Scan_Enable` makes the machine
+discoverable and page-scannable, which is precisely what BT-C1's existing witness prose says the
+arc deliberately does *not* do ("paging out needs none of it, while enabling it would make this
+machine discoverable"). It is a new posture, not a tweak, and it belongs behind its own knob.
+
 ---
 
 <!-- SYNC-FOLD 2026-08-22: trunk added this section as §28 while the rmbp track added §§28-30

@@ -2904,6 +2904,68 @@ struct BtL3State {
     inq_printed: u32,
 }
 
+/// BT-C1/COD — the Class of Device, decoded rather than printed raw.
+///
+/// WHY THIS EXISTS. `class_of_device=240418` sat in two captures — `gr26-bootC` (2026-08-11) and
+/// `rmbp1-boot1` boot 1 (2026-08-18), seven days apart, the only two boots whose BR/EDR inquiry
+/// ever heard the target — and nobody decoded it, so for eleven days the arc's own doc
+/// (`usb_xhci.md` §30) carried a "blunter answer" saying this BD_ADDR was a Logitech M196 mouse
+/// and that "this stack never once addressed the speaker". It is 0x240418: Major Device Class
+/// 0x04 = **Audio/Video**, with the **Audio** (bit 21) and **Rendering** (bit 18) major service
+/// bits set. That is an audio sink, on the air, in band, twice — and it is a CLASSIC inquiry
+/// response, so it also settles the sibling theory that a dual-mode device pages under a
+/// different BD_ADDR than it advertises: the address that answered the inquiry IS the address
+/// the page is aimed at. Peter's 2026-08-22 ruling says the same thing; this is the wire agreeing
+/// with him, and it cost a boot to not have.
+///
+/// Bit layout, Bluetooth Assigned Numbers "Baseband / Class of Device": bits 0..1 format type
+/// (00), bits 2..7 minor device class, bits 8..12 major device class, bits 13..23 major service
+/// classes. `cod` arrives LSB-first exactly as it sits on the wire.
+#[cfg(feature = "btc")]
+fn bt_c1_cod_decode(cod: [u8; 3]) -> (&'static str, &'static str, bool) {
+    let v = (cod[0] as u32) | ((cod[1] as u32) << 8) | ((cod[2] as u32) << 16);
+    let major = ((v >> 8) & 0x1F) as u8;
+    let minor = ((v >> 2) & 0x3F) as u8;
+    let services = (v >> 13) & 0x7FF;
+    // Bit 21 "Audio" and bit 18 "Rendering" are bits 8 and 5 of the shifted service field.
+    let audio_service = (services & (1 << 8)) != 0;
+    let major_name = match major {
+        0x00 => "Miscellaneous",
+        0x01 => "Computer",
+        0x02 => "Phone",
+        0x03 => "LAN/Network Access Point",
+        0x04 => "AUDIO/VIDEO",
+        0x05 => "Peripheral (mouse/keyboard/pointing)",
+        0x06 => "Imaging",
+        0x07 => "Wearable",
+        0x08 => "Toy",
+        0x09 => "Health",
+        0x1F => "Uncategorized",
+        _ => "reserved",
+    };
+    // Only the Audio/Video minors are named: they are the ones that decide the question this
+    // witness exists for, and naming every minor of every major would be prose without a reader.
+    let minor_name = if major == 0x04 {
+        match minor {
+            0x01 => "Wearable Headset",
+            0x02 => "Hands-free",
+            0x04 => "Microphone",
+            0x05 => "Loudspeaker",
+            0x06 => "Headphones",
+            0x07 => "Portable Audio",
+            0x08 => "Car Audio",
+            0x0A => "HiFi Audio",
+            _ => "other A/V minor",
+        }
+    } else {
+        "(minor named only for Audio/Video)"
+    };
+    // An audio SINK is the major class plus the Audio service bit. Either alone is weaker: a
+    // phone sets the Audio bit too, and a major class with no service bits is a device that
+    // declined to say what it does.
+    (major_name, minor_name, major == 0x04 && audio_service)
+}
+
 /// BT-C1/INQUIRY — decode ONE event, and if it is an inquiry result, harvest every response in it.
 ///
 /// It is a free function rather than a method because it is called from inside `bt_l3_await`'s
@@ -3023,8 +3085,12 @@ fn bt_c1_inquiry_harvest(idx: usize, pkt: &[u8], st: &mut BtL3State) {
         // The line is emitted in three pieces because the RSSI is OPTIONAL and this kernel has no
         // float formatting: an `Inquiry Result` (0x02) carries no RSSI at all, and printing a
         // placeholder for it would put a number in the capture that the air never supplied.
+        // BT-C1/COD — decoded here and not left as three hex bytes for a reader to look up. This
+        // is the ONLY place a BR/EDR responder says what it is, and it fires on exactly the boots
+        // that need it: the ones where the inquiry heard something.
+        let (cod_major, cod_minor, cod_audio_sink) = bt_c1_cod_decode(cod);
         serial_print!(
-            ":: bt-c1: [{}] inquiry result — addr={} psrm={:#04x}({}) clock_offset={:#06x} class_of_device={:02x}{:02x}{:02x}",
+            ":: bt-c1: [{}] inquiry result — addr={} psrm={:#04x}({}) clock_offset={:#06x} class_of_device={:02x}{:02x}{:02x}(major={} minor={} audio_sink={})",
             idx,
             core::str::from_utf8(&text).unwrap_or("??:??:??:??:??:??"),
             psrm,
@@ -3037,7 +3103,10 @@ fn bt_c1_inquiry_harvest(idx: usize, pkt: &[u8], st: &mut BtL3State) {
             clk,
             cod[2],
             cod[1],
-            cod[0]
+            cod[0],
+            cod_major,
+            cod_minor,
+            cod_audio_sink
         );
         if let Some(d) = rssi_db {
             if d < 0 {
@@ -3050,8 +3119,10 @@ fn bt_c1_inquiry_harvest(idx: usize, pkt: &[u8], st: &mut BtL3State) {
             " event={:#04x}({}) -> {} == witness ::",
             pkt[0],
             if rssi { "with RSSI" } else { "standard" },
-            if ours {
-                "THIS IS THE TARGET. Its Page_Scan_Repetition_Mode and Clock_Offset are harvested and the page below carries them, so the page is no longer built on guesses"
+            if ours && cod_audio_sink {
+                "THIS IS THE TARGET, AND ITS OWN CLASS OF DEVICE SAYS IT IS AN AUDIO SINK. Two things are settled by this one line and neither needs another boot: (1) the identity — an Audio/Video major class with the Audio service bit is not a mouse, so the 'wrong peer address' reading is REFUTED in band, by the peer, on CLASSIC; (2) the sibling theory that a dual-mode device pages under a different BD_ADDR than it advertises — this response came from the BR/EDR controller at the address the page below is aimed at. Its Page_Scan_Repetition_Mode and Clock_Offset are harvested and the page carries them, so the page is no longer built on guesses. A Page Timeout after THIS line is not an addressing fault and must not be read as one"
+            } else if ours {
+                "THIS IS THE TARGET. Its Page_Scan_Repetition_Mode and Clock_Offset are harvested and the page below carries them, so the page is no longer built on guesses. Its Class of Device is NOT an audio sink — read the decoded major/minor above before assuming which device answered"
             } else if same_oui {
                 "SAME VENDOR OUI AS THE TARGET, DIFFERENT ADDRESS. The target address was read off an LE advertisement, and a dual-mode device need not page under the address it advertises — this is the shape that would produce. It is NOT paged (the address rule is Peter's, and this arc does not widen it); it is reported so the next arc has the evidence"
             } else {
@@ -8619,8 +8690,8 @@ impl Controller {
                                 // first thing a reader saw. Our-side causes now carry equal
                                 // weight, and the inquiry summary above is what decides between
                                 // them rather than the reader's prior.
-                                0x04 if from_inquiry => " (PAGE TIMEOUT: the peer did not answer the train inside the timeout written above. THE PEER-SIDE READINGS ARE EXCLUDED — the inquiry above heard this exact BD_ADDR, so it is powered, in range and scanning. What remains is OURS: the harvested clock offset may have aged out of the controller's tolerance between the inquiry and the page, the page train may not have overlapped a scan window, or this controller's paging is at fault)",
-                                0x04 => " (PAGE TIMEOUT: the peer did not answer the train inside the timeout written above. THE READINGS ARE OF EQUAL WEIGHT AND THIS LINE RANKS NONE OF THEM. Ours: this page carried NO harvested clock offset and a guessed page-scan repetition mode, so the controller had to sweep for the peer's clock phase rather than start on it — the same configuration reached this speaker on gr25-bootA only on its SECOND train, which is what an unaligned page looks like. Also ours: the BD_ADDR paged here was read off an LE advertisement and need not be the address this device pages under. Theirs: it is off, out of range, already connected to another host, or past its pairing window. Read the inquiry summary above before choosing — it is what tells these apart)",
+                                0x04 if from_inquiry => " (PAGE TIMEOUT: the peer did not answer the train inside the timeout written above. TWO peer-side readings are excluded and one is NOT. The inquiry above heard this exact BD_ADDR, so the peer is powered and in range — those two are dead. IT IS INQUIRY-SCANNING; THAT IS NOT THE SAME AS PAGE-SCANNING. Inquiry scan and page scan are separate enables on the peer, so 'answered the inquiry, ignored the page' is a coherent peer state and stays on the table alongside ours: the harvested clock offset may have aged out of the controller's tolerance between the inquiry and the page, the page train may not have overlapped a scan window, or this controller's paging is at fault. The candidate verdict below ranks the OUR-side three; nothing here ranks them against the peer's scan state, which no outbound page can measure)",
+                                0x04 => " (PAGE TIMEOUT: the peer did not answer the train inside the timeout written above. THE READINGS ARE OF EQUAL WEIGHT AND THIS LINE RANKS NONE OF THEM. Ours: this page carried NO harvested clock offset and a guessed page-scan repetition mode, so the controller had to sweep for the peer's clock phase rather than start on it — the same configuration reached this speaker on gr25-bootA only on its SECOND train, which is what an unaligned page looks like. Theirs: it is off, out of range, already connected to another host, not page-scanning, or past its pairing window. Read the inquiry summary above before choosing — it is what tells these apart. NOT a live reading: 'the BD_ADDR was read off an LE advertisement and need not be the one this device pages under' — a CLASSIC inquiry has answered at this address, with an Audio/Video Class of Device, and Peter settled the identity 2026-08-22)",
                                 0x05 => " (AUTHENTICATION FAILURE)",
                                 0x08 => " (CONNECTION TIMEOUT)",
                                 0x0D | 0x0E | 0x0F => " (CONNECTION REJECTED: the peer refused — limited resources, security, or an unacceptable BD_ADDR. A speaker bonded to another host commonly answers this)",
@@ -8707,7 +8778,7 @@ impl Controller {
                 // page under btc at all on the flight that connected — the connection there was an
                 // LE link. The honest contrast case is gr25-bootA, where THESE parameters reached
                 // this speaker on the second train.
-                "NOT REACHED, AND THE PEER NEVER ANSWERED ANY TRAIN — but read the inquiry summary above before reading that as the speaker's fault. Every attempt in the budget ended in an explicit Page Timeout for this BD_ADDR, each one a full-length train, so no page was cut short by this host. THE READINGS ARE OF EQUAL WEIGHT. Ours: no inquiry response for this address was harvested, so both trains ran with a GUESSED page-scan repetition mode and NO clock offset, and the controller had to sweep for the peer's clock phase — this same configuration reached this speaker on gr25-bootA only on its second train, so an unaligned page failing twice is an expected outcome and not a discovery. Ours: the address paged was read off an LE advertisement and a dual-mode device need not page under the address it advertises. Theirs: off, out of range, already connected to another host, or past its pairing window"
+                "NOT REACHED, AND THE PEER NEVER ANSWERED ANY TRAIN — but read the inquiry summary above before reading that as the speaker's fault. Every attempt in the budget ended in an explicit Page Timeout for this BD_ADDR, each one a full-length train, so no page was cut short by this host. THE READINGS ARE OF EQUAL WEIGHT. Ours: no inquiry response for this address was harvested, so both trains ran with a GUESSED page-scan repetition mode and NO clock offset, and the controller had to sweep for the peer's clock phase — this same configuration reached this speaker on gr25-bootA only on its second train, so an unaligned page failing twice is an expected outcome and not a discovery. Theirs: off, out of range, already connected to another host, NOT PAGE-SCANNING, or past its pairing window. TWO READINGS ARE DEAD AND MUST NOT BE REVIVED HERE. (1) 'the address was read off an LE advertisement and may be the wrong one' — a CLASSIC inquiry has answered at this address with an Audio/Video Class of Device (gr26-bootC 2026-08-11, rmbp1-boot1 2026-08-18), and Peter settled the identity 2026-08-22. (2) 'the bt-l2 line above shows a strong RSSI, so range and power are excluded' — that RSSI is an LE ADV_IND measurement. It proves the peer's LE radio is alive and it says NOTHING about BR/EDR inquiry scan or page scan, which are a different radio state on the same chip. The only in-band evidence about BR/EDR is the inquiry summary above"
             } else if page_timeouts > 0 {
                 "NOT REACHED — a Page Timeout was seen, and the sequence stopped before the budget was spent. The attempt line that ended it says why (a link, a refusal, or a local-side failure); read that line, not this count"
             } else {
@@ -8751,7 +8822,7 @@ impl Controller {
                 } else if same_phase_retry {
                     "CANDIDATE 2 (scan phase) IS UNTESTED AND LEADS BY ELIMINATION — the offset was still exact and the controller paged for its full deadline, so neither 1 nor 3 explains this; and the retry re-sampled the same phase DESPITE the step that was applied to prevent exactly that. The CANDIDATE-2 line's intended/measured pair is where this boot's next question is: the step is the thing that failed here, not the hypothesis"
                 } else {
-                    "ALL THREE CANDIDATES ARE WEAKENED — the offset was still exact at page time, the controller paged for its full deadline, and two different scan phases were sampled, and the peer still never answered. If this boot's inquiry summary above also says the target ANSWERED, then the failure is in none of the three places this arc has been looking, and the next hypothesis must come from outside them — the paged BD_ADDR itself is the first place to look"
+                    "ALL THREE CANDIDATES ARE WEAKENED — the offset was still exact at page time, the controller paged for its full deadline, and two different scan phases were sampled, and the peer still never answered. If this boot's inquiry summary above also says the target ANSWERED, then the failure is in none of the three places this arc has been looking, and the next hypothesis must come from outside them. IT IS NOT THE BD_ADDR: that question is CLOSED — Peter's 2026-08-22 ruling, and independently the Class of Device on the inquiry-result line above, an Audio/Video major class answering on CLASSIC at this very address. What is left is the peer's SCAN STATE: a device that answers an inquiry is inquiry-scanning, which says nothing about whether it is page-scanning, and on the peer those are separate enables. The discriminator is a DIRECTION test — let the peer page US — not another outbound train against the same address"
                 }
             );
         }
