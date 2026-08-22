@@ -7112,9 +7112,9 @@ const LOAD_WITNESS_INTERVAL: u64 = 1024;
 static LOAD_WITNESS_TICKS: AtomicU64 = AtomicU64::new(0);
 /// Packed busy-percents of the last emitted line (`c0 | c1<<8 | c2<<16 | c3<<24`), for change-only
 /// suppression — a steady-state system stops re-printing an unchanged load line.
-static LOAD_WITNESS_LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+#[cfg(feature = "witness")] static LOAD_WITNESS_LAST: AtomicU64 = AtomicU64::new(u64::MAX);
 /// `ctx_switches` sum snapshot at the last emission, to derive the per-window context-switch delta.
-static LOAD_WITNESS_CTX: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "witness")] static LOAD_WITNESS_CTX: AtomicU64 = AtomicU64::new(0);
 
 /// PULSE-5 — count of load windows closed by a FOLD (`account` reaching the budget at a dispatch
 /// boundary). It is the denominator of the arc's claim: reads are no longer waiting on these. Bumped
@@ -7137,20 +7137,20 @@ fn cyc_to_ms(cyc: u64) -> u64 {
 /// SCHED-2 periodic load heartbeat: called once per `timer_preempt` (per core, per tick, metal-only).
 /// The core whose atomic increment lands exactly on the `LOAD_WITNESS_INTERVAL` boundary is the sole
 /// emitter for that window (fetch_add hands each multiple to exactly one core), so there is no
-/// double-print and no reader lock. Change-only: it prints only when the packed per-core busy-percents
-/// differ from the last emission. Cheap on the non-boundary passes (one relaxed fetch_add + a modulo).
+/// double-print and no reader lock. Change-only, and STORM-R3 `witness`-gates the emit itself — a
+/// media build keeps only the cadence and `el0live_tick`. See `scheduler.md` §2 (STORM-R3).
 fn load_witness_tick() {
     let n = LOAD_WITNESS_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     if n % LOAD_WITNESS_INTERVAL != 0 {
         return;
     }
-    // EL0-LIVE: taken BEFORE the change-suppression below, deliberately. Every other line on this
-    // train is suppressed while the LOAD signature is unchanged — and a machine whose EL0 fleet has
-    // just died is precisely a machine whose load has gone flat and stopped changing. Gating the
-    // liveness census on load movement would mute it exactly when it is the only line worth having.
-    // It carries its own (liveness-shaped) suppression instead; see `el0live_tick`.
+    // EL0-LIVE: taken BEFORE the change-suppression below, and deliberately OUTSIDE STORM-R3's gate.
+    // Every other line on this train is suppressed while the LOAD signature is unchanged — and a
+    // machine whose EL0 fleet has just died is precisely a machine whose load has gone flat. It is the
+    // one line worth having on a MEDIA boot that freezes (PA41, dsktp boot 8), and it carries its own
+    // liveness-shaped suppression instead: silent while healthy. See `el0live_tick`, `scheduler.md` §2.
     el0live_tick();
-    let mut packed = 0u64;
+    #[cfg(feature = "witness")] { let mut packed = 0u64;
     let mut ctx_now = 0u64;
     for cpu in 0..NUM_CPUS.min(8) {
         let ld = core_load(cpu);
@@ -7179,7 +7179,7 @@ fn load_witness_tick() {
     );
     pulse5_witness();
     spread4_witness(); // SPREAD-4: the placement signal beside the load it is derived from
-    prio_witness(); // SCHED-PRIO: who WON those dispatches, beside where they were placed
+    prio_witness(); } // SCHED-PRIO: who WON those dispatches, beside where they were placed
 }
 
 /// PULSE-5 — the proof line for age-on-read. It says three things and nothing else: how long each

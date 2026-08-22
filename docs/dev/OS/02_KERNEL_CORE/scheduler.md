@@ -3151,6 +3151,65 @@ the residency reads and the ledger are wired.
 
 ---
 
+### STORM-R3 — the load train is witness-gated, and why `[el0live]` is not (aarch64, `exec-schedgate`)
+
+Boot 11's metal capture (`pi3-boot11/boot11.log`, 908 583 B) measures 22.1 %
+average serial duty cycle at 115200 8N1 synchronous busy-wait, 96.4 % peak during
+desktop bring-up. Peter, on glass: *"storm is burying the system."* The scheduler
+witness train was a measurable share of that wire and — unlike every structural
+sibling (`[wcn]`, `[comp2]`, `[u7stk]`, `[wcpar]`, `[wc-tail]`) — it carried **no
+`witness` gate**, so a plain `./arroyo kernel8` media build shipped all of it.
+
+Measured against boot 11, attributed per train block (a `[prio]` line is charged to
+the train only when it follows a `:: SCHED: load ::` line, which separates the
+timer train from `render_service`'s `[sched6]` caller):
+
+| tag | lines | bytes | share of wire |
+| --- | ---: | ---: | ---: |
+| `[spread4]` | 154 | 31 136 | 3.43 % |
+| `[spread10]` | 152 | 25 100 | 2.77 % |
+| `[prio]` (train) | 155 | 12 687 | 1.40 % |
+| `[pulse5]` | 154 | 12 495 | 1.38 % |
+| `[spread7]` | 153 | 10 497 | 1.16 % |
+| `:: SCHED: load ::` | 155 | 9 157 | 1.01 % |
+| `[spread9]` | 152 | 8 761 | 0.97 % |
+| **gated total** | | **109 833** | **12.11 %** |
+| `[el0live]` — *kept* | 87 | 17 083 | 1.88 % |
+
+**The gate is on the emitter, not on the witness functions.** `pulse5_witness`,
+`spread4_witness` (which chains `[spread7]`/`[spread9]`/`[spread10]`), `prio_witness`
+and `el0live_witness` each have three callers, and only one of them is the timer
+train. The other two — `load_accounting_witness`'s QEMU baseline and `storm_census`'s
+launch-boundary probe — are the sites the raspi4b battery and the `storm` verb reach,
+and gating the *functions* would have silenced both. So the `#[cfg(feature = "witness")]`
+wraps only `load_witness_tick`'s emit block. `timer_preempt` never runs on raspi4b
+(no Group-1 timer delivery), so `load_witness_tick` is unreachable in the gate, and
+`pi4-regression.spec` is untouched by construction: no REQUIRE, COUNT, COMPLETE or
+FORBID in any spec in `unaos/scripts/specs/` matches a train tag — the only four
+occurrences repo-wide are prose in `# ---` comment lines. Both COMPLETE markers are
+elsewhere: `:: SCHED: task 'el0-midden' -> core` is the *placement* line
+(`sched.rs:3131`/`:3278`), not the load line, and `:: BANDY-RT:` is in `syscall.rs`.
+
+**`el0live_tick()` stays outside the gate, deliberately.** It is the only line here
+whose value is highest on an *unattended media boot*, which is exactly the build the
+gate would have muted it on. Three metal freezes are on record that it exists to tell
+apart — PA41 boot 3 (`EXTINCT`, 545 s), dsktp boot 8 (`STARVED`, a wedge), boot 2 of
+the same session (EL0 alive, screen dead) — and all three were metal, none was a
+witness build. It is also not part of the storm: it carries its own liveness-shaped
+suppression (silent while healthy and unchanged, relentless while the verdict is not
+`LIVE`), which is why it costs 87 lines against the train's 155 windows, and it is
+taken *before* the load line's change-suppression precisely because a dead fleet is a
+flat load. There is precedent for the narrower reading, too: the development build
+that chained this line into `prio_witness` was **removed** because a witness must not
+perturb what it watches. Gating it would have been the same error in the other
+direction — cheapening the wire by deleting the instrument that reads the failure.
+
+Net: the media build sheds 12.11 % of boot 11's wire (109 833 B ≈ 9.5 s of transmit
+at 115200 8N1) and keeps the freeze census. The QEMU gate's own output does not move
+at all, because the gated emitter never ran there.
+
+---
+
 ### 2.x Kernel stack sizing — SPIN-6's three convictions, and what the refusal does NOT mean
 
 Kernel task stacks are **individual heap allocations**, not a pool:
