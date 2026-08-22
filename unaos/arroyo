@@ -826,6 +826,52 @@ fi
 # `genet` (Cargo feature). Runs at the top of `genet_bringup` and prints `:: NET-GATE: ... PASS [w=0x..] ::`.
 # Pair with UNAOS_PI=1 on the kernel8-test battery: `UNAOS_NETTEST=1 UNAOS_PI=1 ./arroyo kernel8-test`.
 [ -n "${UNAOS_NETTEST:-}" ] && _feats="${_feats}nettest,genet,"
+# ── BANNER-DEDUP (orin 3, 2026-08-22) — the banner must not misreport its own composition ─────────
+#
+# THE SYMPTOM. An armed jetson build printed `tegra` THREE times:
+#   ⚡ kernel features (jetson): rast,ehcihid,kbdwit,sdhcblk,smolnet,tegra,tegra_el0,tegra,tegrasmp,tegra
+#
+# THE CAUSE, and it is NOT the `case ",${_feats}" in *",tegra,"*` guards in `esp_jetson`. Those are
+# CORRECT: they prepend the comma to the SUBJECT (`",${_feats}"`) precisely so a feature sitting in
+# first position still presents a leading comma, and `_feats` is comma-TERMINATED by construction, so
+# both sides are bracketed and the test matches. Replayed against the exact banner above, both jetson
+# guards MATCH and append NOTHING. The duplication is produced entirely UPSTREAM, by the knob mapping
+# in this block: several knobs append an implied feature alongside their own, unguarded —
+#   UNAOS_TEGRA      -> `tegra,`
+#   UNAOS_TEGRA_EL0  -> `tegra_el0,tegra,`
+#   UNAOS_TEGRASMP   -> `tegrasmp,tegra,`   (and the NOTEGRASMP default-on line appends the same pair)
+#   UNAOS_NETTEST    -> `nettest,genet,`    (duplicates `genet` if UNAOS_GENET=1 is also set)
+# — so any two of them naming the same implied feature print it twice. It is a CLASS, not a tegra
+# quirk, and it is NOT contained to `esp_jetson`: `UNAOS_TEGRA=1 ./arroyo check`, which never calls
+# `esp_jetson` at all, prints `...,tegra,tegrasmp,tegra` from this very line.
+#
+# WHY IT IS WORTH FIXING even though the build was always correct. Cargo takes `--features` as a SET,
+# so a repeated name changes nothing about the image. But this track CERTIFIES THAT A FEATURE IS ARMED
+# BY READING THIS BANNER (CLAUDE.md's full-knob rule, and the TOOLFIX/BANNER note immediately below,
+# which exists for the same reason one arch over). A banner that misreports its own composition is the
+# instrument lying about the instrument.
+#
+# THE FIX. Collapse repeats at the single choke point where `_feats` is finalised, keeping
+# first-occurrence order, using this file's own idiom (`case ",$acc" in *",$f,"*`) rather than a new
+# one. Every consumer downstream reads `$_feats` or `$KERNEL_FEATURES` from here, so one pass fixes
+# every path's banner — check, x86, arm, esp-*, esp-jetson — and `esp_jetson`'s guards keep working
+# unchanged (they still correctly append `tegra`/`tegrasmp` on a bare `./arroyo esp-jetson`).
+#
+# IT CANNOT CHANGE THE IMAGE, and this was MEASURED, not argued: the armed jetson kernel built from
+# the duplicated string and from the deduplicated string is BYTE-IDENTICAL (same .elf sha256 — not
+# merely the same loadable image). Removing an exact repeat leaves the resolved feature SET, and hence
+# cargo's `-Cmetadata` fingerprint, untouched. Contrast `arm_features` below, which strips a feature
+# that IS in the set and therefore DOES have to justify itself.
+_dedup_acc=""
+for _dedup_f in ${_feats//,/ }; do
+    case ",${_dedup_acc}" in
+        *",${_dedup_f},"*) ;;
+        *) _dedup_acc="${_dedup_acc}${_dedup_f}," ;;
+    esac
+done
+_feats="$_dedup_acc"
+unset _dedup_acc _dedup_f
+
 if [ -n "$_feats" ]; then
     KERNEL_FEATURES="--features ${_feats%,}"
     # TOOLFIX/BANNER: this map drives the x86/virt cargo invocations ONLY. The Pi bare-metal builds
