@@ -620,6 +620,16 @@ _feats=""
 # image — the record echoes the live SEL so the operator can verify which experiment ran. Default
 # OFF; when unset the feature vanishes and the tegra image is byte-identical to baseline.
 [ -n "${UNAOS_SMPPROBE:-}" ] && _feats="${_feats}smpprobe,"
+# SMPMARK (ORIN-SMP-3): UNAOS_SMPMARK=1 arms the three secondary-bring-up marks in
+# arch/aarch64/smp_virt.rs — `:P:` (BSP publication done), `:R<idx>:` (the CPU_ON SMC returned) and
+# `:A:` (the AP crossed MMU-off -> MMU-on). They discriminate, in ONE flight, which side of the PSCI
+# wake the intermittent ~30% park is on; the existing verbose success line is ~8.2 ms of UART at
+# 115200 and is too wide a window to tell "the SMC never returned" from "the AP died while the BSP
+# was still printing". Standalone feature (does NOT imply tegra, mirroring smpprobe) so the shared
+# `:A:` site type-checks on the non-tegra aarch64 path too. Default OFF; when unset every mark
+# vanishes and the tegra image is byte-identical to baseline. The ARMED build is type-checked by the
+# `arm-tegra-smpmark` leg of KERNEL_CFG_MATRIX, not by this mapping.
+[ -n "${UNAOS_SMPMARK:-}" ] && _feats="${_feats}smpmark,"
 # JETSON-EL0 (M1b): UNAOS_TEGRA_EL0=1 arms the Orin EL0/userspace chain — `arch/aarch64/mmu_tegra_el0.rs`
 # (the M6d per-task address-space slots ported to the tegra EL1 regime), the widened `syscall`/`bus`/
 # `sched::spawn_user*` gates, and the el0-hello round-trip spawned from `tegra_early_stop`. The
@@ -1861,6 +1871,27 @@ KERNEL_CFG_MATRIX=(
   # fails only on a set-but-unreadable path — the leg never needs (or smuggles) the bunker blob.
   # No `not(feature = "xusbfw")` site exists in src/.
   "arm-tegra-xusbfw ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,xusbfw"
+  # SMPMARK armed (appended 2026-08-22, ORIN-SMP-3) — `smpmark` gates the three secondary-bring-up
+  # marks in `arch/aarch64/smp_virt.rs`. Two of the three (`:P:`, `:R<idx>:`) live inside
+  # `start_secondaries_tegra`, which is itself `#[cfg(feature = "tegrasmp")]`, so only a leg carrying
+  # `tegrasmp` compiles them at all; the third (`:A:`) is in the board-neutral `__secondary_rust_virt`.
+  # Without this leg the ARMED polarity would be compiled by NOTHING — the exact tegra_el0 /
+  # simmer_test / xusbfw shape, and the reason the standing law is that a cfg widen's gates must
+  # compile the configuration the widen turns ON.
+  #
+  # WHY ITS OWN TAIL LEG rather than `,smpmark` appended to `arm-tegra`. Same reason as the three legs
+  # above: `arm-tegra` is the DISARMED twin and is the only leg anywhere that compiles the SHIPPED
+  # default jetson image. Arming the knob there would trade this hole for that one, and a red on a
+  # tail leg names the knob. Hosted on `arm-tegra`'s list verbatim + `smpmark`.
+  #
+  # There is no `not(feature = "smpmark")` site in src/, so no disarmed asymmetry is created — every
+  # other leg (including `arm-tegra` itself) already carries the OFF polarity.
+  #
+  # Same universe side effect as tegra_el0's and simmer_test's: naming `smpmark` on an arm-* leg
+  # removes it from `x86_cfg_universe`, where it would have been vacuous (both of its non-shared cfg
+  # sites are under `src/arch/aarch64/`). The mix-leg count is unchanged — C(8,4) = 70 is still >= the
+  # universe size — so this is +1 board leg and +0 mix legs: 15 -> 16.
+  "arm-tegra-smpmark ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,smpmark"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────

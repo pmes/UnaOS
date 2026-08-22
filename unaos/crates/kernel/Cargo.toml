@@ -554,6 +554,18 @@ tegra = []
 # const). Enable via `UNAOS_SMPPROBE=<n> UNAOS_TEGRA=1 ./arroyo esp-jetson`.
 smpprobe = []
 
+# SMPMARK (ORIN-SMP-3): the `UNAOS_SMPMARK=1` one-flight discriminator for the intermittent
+# secondary-bring-up park (arch/aarch64/smp_virt.rs). Three short `serial_print!` tags — `:A:` (an AP
+# crossed MMU-off -> MMU-on), `:P:` (the BSP finished publishing SEC_CTX + the stack cache sweep) and
+# `:R<idx>:` (the `CPU_ON` SMC returned) — that between them say WHICH side of the PSCI wake the park
+# is on. The tags exist because the verbose per-core success line is ~8.2 ms of UART at 115200, long
+# enough for the woken AP to fault mid-line; the marks close that window to ~430 us. Standalone
+# (does NOT imply `tegra`, mirroring `smpprobe`) so the `:A:` mark can also be type-checked on the
+# non-tegra aarch64 path it shares. Pure instrumentation; with the feature OFF (default) every mark
+# vanishes and the tegra image is byte-identical to baseline. Enable via
+# `UNAOS_SMPMARK=1 UNAOS_TEGRA=1 ./arroyo esp-jetson`. See arch_arm64.md §ORIN-SMP.
+smpmark = []
+
 # VUG-RAS-LOCALIZER: the `UNAOS_VUGRAS=1` RAS localizer (vugras.rs) — a knob-gated DC CIVAC writeback
 # sweep (vug frame loop + JD2 console-idle pump) plus a boot candidate-PA witness, to make the Orin
 # SNOC+ACI FillWrite RAS fire at/near the offending store and name the address it decodes to. Pure
