@@ -2475,6 +2475,39 @@ static PAYGO_EMIT: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// gate and its mutual exclusion both, exactly as [`H_LASTROLL`] serves the rollup: two cores
 /// flushing the same window at once both observe this value, and only the one whose
 /// `compare_exchange` succeeds prints.
+///
+/// ### The per-window/aggregate asymmetry [`H_LASTROLL_ANY`] cures for the rollup is present here too
+///
+/// **And is deliberately NOT cured.** This array is per-id against [`CENSUS_PERIOD_US`], so N windows
+/// deferring at once permit N lines per period — the same code shape STORM-R1 convicted one instrument
+/// over, and [`paygo_note`]'s re-arm comment carried the same false "bounds the duty cycle this
+/// instrument imposes" wording that conviction rested on. What makes this a different FINDING is that
+/// the rate gate is not what bounds this emitter.
+///
+/// [`paygo_flush`]'s delta gate reads [`PAYGO_DEFERRED`], which climbs only while the deferral gate is
+/// DECLINING blits, and [`paygo_clock`] matures on `since_entry_ms() >= PAYGO_DEFER_MS` — UPTIME, not
+/// a per-window age. So at T+[`PAYGO_DEFER_MS`] every window becomes payable at the same instant, no
+/// window declines again, [`PAYGO_DEFERRED`] freezes, and this path is silent for the rest of the boot.
+/// The exposure is one 15 s window at the head of the boot; [`census_refresh`]'s was the whole boot,
+/// because a census that climbs on every present re-opens its delta gate forever.
+///
+/// The ceiling that follows: `PAYGO_DEFER_MS` / [`CENSUS_PERIOD_US`] = 7 lines per window, x 12 slots
+/// ([`crate::video::wm::MAX_WINDOWS`]), x 153 B measured = 12.9 KB — and that assumes all twelve exist
+/// and decline continuously through the burst. Measured on the richest x86 paygo capture
+/// (`gr26-bootD`, 1,635,323 B): SIX `state=waiting` lines, 920 B, **0.056% of the wire**. Two further
+/// paygo boots (`rmbp4-boot13` 1,147,107 B, `rmbp3-boot12` 907,106 B) carry ZERO — every paygo line in
+/// them is a `complete` or `closed` terminal, and neither terminal reaches this gate. Against
+/// `census_refresh`'s measured 25.17% of pi boot 11, these are not one defect wearing one shape.
+///
+/// Porting the [`H_ROLL_TURN`] rotation here would spend a global atomic, a cursor and a helper to
+/// remove at most 12.9 KB that no capture has come within two orders of magnitude of, on a path whose
+/// first `state=waiting` line is REQUIRED by `x86-witness.spec` — a system-wide gate shared with the
+/// rollup could swallow exactly that line.
+///
+/// **The condition that would invalidate all of the above**, and so the thing to watch: anything that
+/// lets the deferral outlive the boot burst — a per-window clock in place of [`paygo_clock`]'s uptime
+/// reading, a longer `PAYGO_DEFER_MS`, or a window able to defer past maturity. Any of those restores
+/// the unbounded shape and makes STORM-R1's cure the right one here.
 #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
 static PAYGO_LASTROLL: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 
@@ -2964,10 +2997,16 @@ fn paygo_note(id: u32, i: usize, state: &str, verdict: &str, chunks: Option<(u32
             hold_max_us
         ),
     }
-    // Re-arm the refresh from AFTER the serial write, so `CENSUS_PERIOD_US` bounds the duty cycle
-    // this instrument imposes on the composite path and not merely the gap between line starts —
+    // Re-arm the refresh from AFTER the serial write, so `CENSUS_PERIOD_US` bounds the time THIS
+    // WINDOW's refresh occupies the composite path and not merely the gap between its line starts —
     // the same accounting `stage_rollup` uses. Both stores happen on EVERY emission, including the
     // first and the terminal one, so the cadence is measured from the window's own last line.
+    //
+    // Per WINDOW — the old wording here ("bounds the duty cycle this instrument imposes") made the
+    // system-wide claim STORM-R1 convicted next door, and it was false here for the same reason: no
+    // per-id cell can see N. `stage_rollup` needed `H_LASTROLL_ANY` to make that claim true. This
+    // path does not, because its aggregate is bounded by the deferral deadline instead of by a rate.
+    // `PAYGO_LASTROLL` carries the arithmetic, the three captures, and the change that would end it.
     PAYGO_LASTCENSUS[i].store(PAYGO_DEFERRED[i].load(Ordering::Relaxed), Ordering::Relaxed);
     PAYGO_LASTROLL[i].store(now_cycles(), Ordering::Relaxed);
 }
@@ -2982,6 +3021,11 @@ fn paygo_note(id: u32, i: usize, state: &str, verdict: &str, chunks: Option<(u32
 /// The two gates below are [`census_refresh`]'s, for the same reasons: the DELTA gate keeps an idle
 /// window silent, and the RATE gate plus the `compare_exchange` keep the cost bounded and let exactly
 /// one core print when two flush the same window at once.
+///
+/// The RATE gate is per-window and has no system-wide companion — which in [`census_refresh`] was the
+/// STORM-R1 defect, and is not one here: the deferral deadline closes the DELTA gate for every window
+/// at the same instant, so the aggregate cannot grow with N the way the rollup's did. See
+/// [`PAYGO_LASTROLL`] for the measurement, the ceiling, and the condition that would reverse this.
 #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
 fn paygo_flush(id: u32, i: usize) {
     // THE TERMINAL IS THE LAST WORD, and this is the check that makes that true. Everything below —
