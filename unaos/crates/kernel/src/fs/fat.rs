@@ -996,8 +996,8 @@ fn with_fat_lock<R>(f: impl FnOnce() -> R) -> R {
 /// | 5 | demo-chain drains — `u10_drain_{grow,create_grow,create_grow_delete,delete}`, `flush_drain_one` | same launcher task | `witness` | ditto — reached only after the launcher has observed its fixture's teardown (`cleared`). |
 /// | 6 | `openf_release` / `u11m2_phase` — `submit_grow` / `submit_delete` | launcher task / fixture teardown | `irqstorage` | routed through row 3 (they are submitters, not mutators). |
 /// | 7 | **`shell::dispatch_command`** — `create_in_dir`, `create_dir`, `write_grow`, `delete_located`, `remove_dir`, `rename_entry`, `move_entry`, and a raw `write <lba> <byte>` | **BSP GUI main loop, INLINE** (`main.rs`'s `handle_key`), NOT a scheduled task | **NONE — compiled unconditionally** | **NOTHING.** See the rule below. |
-/// | 8 | `install::write_sectors` — raw GPT/FAT32 format writes | BSP main loop | `installdemo` | PROGRAM ORDER on the BSP loop; its blank-scratch-disk configuration leaves `HELLO_STAGED` false (rows 4/5 skip) and permanently fails row 1's reserve. |
-/// | 9 | **`holocron::flush_if_dirty`** — `create_in_dir` + `write_grow` + `delete_located` + `rename_entry` (the bond store's publish/swap) | **BSP main loop**, at all three storage-ready passes (`main.rs` ~1126 / ~1602 / ~4546) | `holocron` | PROGRAM ORDER against rows 1/2/8, which share the BSP loop. **NOT serialized against rows 3/4/5**, which run on APs — so an armed `holocron` build that ALSO carries `witness`/`irqstorage` has the same second-writer window row 7 documents, for the same reason (BSP-loop mutation concurrent with AP-side mutation, nothing between them). Default-quiet media leaves `witness` OFF and `holocron` OFF, so neither exists in a shipping boot. Note the store additionally DEFERS its flush while `EHCI_HID` is busy — that is a re-entrancy guard against the HID service pass, NOT serialization against rows 3/4/5, and must not be read as one. |
+/// | 8 | `install::write_sectors` — raw GPT/FAT32 format writes | **ONE of two mutually exclusive contexts** — `kernel_main`'s inline GUI loop on the BSP (`main.rs:1755`) OR the `x86_usb_pump` service task on `svc_cpu` (`main.rs:5633`). NEVER both: see SPLIT-EXCLUSIVITY below | `installdemo` | PROGRAM ORDER **within whichever context is live** — not "on the BSP loop", which is only half true. Its blank-scratch-disk configuration independently leaves `HELLO_STAGED` false (rows 4/5 skip) and permanently fails row 1's reserve, and THAT clause is what carries this row's safety in both contexts. |
+/// | 9 | **`holocron::flush_if_dirty`** — `create_in_dir` + `write_grow` + `delete_located` + `rename_entry` (the bond store's publish/swap) | **TWO contexts, on the same SPLIT-EXCLUSIVITY as row 8.** Its three storage-ready passes are NOT one context: `main.rs:1182` (BSP, *before* the split divergence and before any task is spawned), `main.rs:1651` (BSP inline GUI loop — split-declined only), and `main.rs:5559` (**`x86_usb_pump` on `svc_cpu`** — split-live only) | `holocron` | PROGRAM ORDER against rows 1/2/8 **because the live context is shared with them, whichever one it is** — pass `1651` sits in the same inline BSP loop as row 8's `1755`, and pass `5559` sits in the same `x86_usb_pump` body as row 8's `5633`. Pass `1182` precedes every spawn, so no other mutator exists yet. **NOT serialized against rows 3/4/5**, which run on APs — so an armed `holocron` build that ALSO carries `witness`/`irqstorage` has the same second-writer window row 7 documents, for the same reason (mutation concurrent with AP-side mutation, nothing between them). Default-quiet media leaves `witness` OFF and `holocron` OFF, so neither exists in a shipping boot. Note the store additionally DEFERS its flush while `EHCI_HID` is busy — that is a re-entrancy guard against the HID service pass, NOT serialization against rows 3/4/5, and must not be read as one. |
 ///
 /// VERDICT: rows 1–6 and 8 are genuinely sequenced. Row 7 is NOT — the shell mutates the volume from the BSP
 /// main loop with nothing between it and rows 3/4/5, which run on APs. It is unreachable in the QEMU
@@ -1007,6 +1007,35 @@ fn with_fat_lock<R>(f: impl FnOnce() -> R) -> R {
 /// window in exactly one configuration: an attended GUI boot built WITH `witness` (and/or `irqstorage`),
 /// where a keystroke dispatched while the launcher chain is mid-`write_grow` interleaves two unsynchronized
 /// cluster-chain mutations. Do not "fix" that here — see the rule.
+///
+/// SPLIT-EXCLUSIVITY — WHY ROWS 8 AND 9 ARE SEQUENCED WITHOUT EITHER OF THEM OWNING THE BSP LOOP.
+///
+/// Rows 8 and 9 each have TWO x86 call sites, and the roster used to describe both rows as "BSP main
+/// loop". That was wrong for one site of each, and the row's stale line numbers hid it. The two sites
+/// are mutually exclusive, and the mechanism is `run_bsp`'s divergence:
+///
+/// * `main.rs` decides the render/service split from `smp::online_aps()` — TWO DISTINCT CORES OR
+///   NOTHING. On the taken branch it spawns `x86_render_service` and `x86_usb_pump` and the BSP then
+///   calls `sched::run_bsp(0)`, whose signature is `-> !` and whose call site says so outright:
+///   "Diverges — nothing below this line runs on this path." Everything later in `kernel_main` —
+///   row 9's pass at `main.rs:1651` and row 8's site at `main.rs:1755` — is therefore UNREACHABLE
+///   whenever the split is live.
+/// * On the declined branch (`":: SCHED-X86: … the render/service split needs 2 distinct cores; GUI
+///   stays inline on the BSP ::"`) `x86_usb_pump` is NEVER SPAWNED, so row 9's pass at `main.rs:5559`
+///   and row 8's site at `main.rs:5633` — both inside that task's body — cannot run at all.
+///
+/// So exactly one context is live per boot, and in EITHER of them rows 8 and 9 are adjacent
+/// statements in one loop body: `1651`/`1755` in the inline BSP loop, or `5559`/`5633` in
+/// `x86_usb_pump`. Program order holds — but it holds because the CONFIGURATIONS ARE EXCLUSIVE, not
+/// because either row runs on the BSP. A future reader who "fixes" row 8 by moving it onto the BSP
+/// loop for consistency would break the exclusivity that is doing the work.
+///
+/// WHAT THIS DOES NOT BUY. In the split-live configuration rows 8 and 9 run on `svc_cpu`, a
+/// PREEMPTIBLE scheduled task — so their mutual serialization is program order within one task body,
+/// and nothing more. It is still no defence against rows 3/4/5 on other APs, exactly as row 9 says.
+///
+/// (Found by orin 3 in review of the row-9 addition, extended here: orin caught row 8's site, and
+/// checking the claim turned up that row 9's own third pass is in `x86_usb_pump` too.)
 ///
 /// THE RULE FOR A NEW X86 FAT WRITER: join one of the schemes above (submit through the storage service task,
 /// or run in program order on the BSP main loop ahead of the launchers), and add yourself to this roster.
@@ -4223,7 +4252,20 @@ impl FatFs {
 /// USB mount witness), not a property of this function — the body is a total `match` over a
 /// plain enum with no register, MMIO, block-layer or arch dependency of any kind. `fs::vfs`'s
 /// `fat_err` needs it to name a backend failure on BOTH arches, so it is now arch-neutral.
-/// aarch64 is byte-inert: same function, same arms, same callers.
+/// aarch64 is byte-inert, and that is MEASURED, not argued (rmbp 5, 2026-08-22, at orin 3's
+/// request in review — this repo's standing law is that byte-identity is measured, because a
+/// build script's mere presence once moved every artifact). The counterfactual holds all 70
+/// commits of the arc constant and toggles only the gates: re-add `#[cfg(target_arch =
+/// "aarch64")]` to this function and to `fs::vfs`'s six un-gated items, rebuild, compare.
+/// `./arroyo kernel8` -> `target/pi_baremetal/kernel8.img` is `sha256
+/// 5c29fae5785669b6d89f63ba7c543fe1a1f0aec850c7c11464902da452d0f31f` (1341928 bytes) BOTH WAYS;
+/// `cmp` reports no difference.
+///
+/// READ THE RIGHT ARTIFACT IF YOU REPEAT THIS. The outer `UnaOS-pi4-baremetal.img` sha DOES
+/// differ between the two runs, and it is not evidence of anything: that image embeds `SRC.TGZ`,
+/// a tarball of the working tree, so editing the source to build the counterfactual necessarily
+/// changes it. `kernel8.img` is the kernel; the 64 MiB image is the kernel plus a copy of its own
+/// source. Comparing the wrong one turns a clean negative result into a false positive.
 pub fn fat_reason(e: FatError) -> &'static str {
     match e {
         FatError::NoDisk => "no USB block device",
