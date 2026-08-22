@@ -49,7 +49,7 @@ REQUIRE TEGRA-SD.*block backend published
 # THE ANCHOR IS THE UNCONDITIONAL PLACEMENT LINE, AND THAT CHOICE IS THE POINT OF THIS
 # BLOCK. `spawn_user_inner`'s witness fires on EVERY EL0 slot spawn — it is un-gated as of
 # the same arc, so tegra emits it — and on this boot the spawn is `el0-hello`, pinned to
-# core 0 by main.rs:6099 (`spawn_user("el0-hello", .., 0)`, a deliberate pin at the core
+# core 0 by main.rs:6108 (`spawn_user("el0-hello", .., 0)`, a deliberate pin at the core
 # the JM6 drop has just proven is at EL1). An explicit pin at an EL1 core passes the filter
 # verbatim, so this line is emitted on every healthy tegra_el0 boot that reaches EL0 at all
 # — which the `REQUIRE TEGRA-EL0 .. round-trip -> PASS` above already demands.
@@ -64,8 +64,15 @@ REQUIRE TEGRA-SD.*block backend published
 # driven), so the honest strength is OPTIONAL: present in the table, never a gate.
 # NOTE FOR ANYONE TEMPTED TO KEY ON `n=`: that counter (`EL0_REFUSALS`) is ONE GLOBAL shared
 # by every refusing site, not a per-site sequence, so `n=1` says nothing about which lane
-# refused first and it cannot be anchored per-`bg`. Read `el0refuse=` on `[spread4]` for the
-# running total instead — it is not rate-limited, unlike these per-event lines.
+# refused first and it cannot be anchored per-`bg`. Read `el0refuse=` on `[el0core] rollup:` for
+# the running total instead — NOT on `[spread4]`, which is LINK-TIME DEAD on a tegra build (every
+# caller of `spread4_witness` is unreachable there, so the linker drops the string; sched.rs:3215
+# records the `LC_ALL=C grep -a` over the linked `arm-tegra-el0` kernel that measured it). Pointing
+# a reader at `[spread4]` on THIS board was the exact blindness commit 2f4cd179 existed to remove:
+# the one platform that actually refuses could not read its own refusal counter. The per-event
+# lines above stop for good at `EL0_REFUSE_LOG_MAX` (one cap-announce, then silence); the rollup is
+# rate-limited to ~1/s but never goes permanently blind, because its guard is "the count CHANGED"
+# — so the wire converges on the true total within a second of the last refusal.
 # PENDING, not REQUIRE: the line is code ahead of its bench. It was `#[cfg(feature = "pi")]`
 # for the whole tegra_el0 bring-up, so NO Orin capture can carry it — boot5c
 # (orin2-boot5c-gui.log) has zero hits for `SCHED: task`, which is exactly the blindness the
@@ -82,6 +89,33 @@ OPTIONAL SCHED: EL0 placement REFUSED \([a-z]+\) '[^']*' req=-?[0-9]+
 # no built configuration contained, since the kernel workspace has no `[profile]` section
 # and every arroyo cargo call is `--release`.
 FORBID SCHED: EL0 entry REFUSED
+#
+# THE `[el0core]` READERS — the counter's reader and the mask's stamp, on the platform that
+# refuses. All three patterns are pure ASCII in the source (verified with `LC_ALL=C grep -a -n`,
+# not assumed): unlike the cap-announce at sched.rs:3308, none of these lines carries an em-dash,
+# so none needs truncating before one. `{:#x}` renders a lowercase `0x…`, hence `0x[0-9a-f]+`.
+#
+#   sched.rs:3369 THE ROLLUP. `el0_refusal_rollup` has TWO call sites in
+#   `run_capstone_boot_core` — sched.rs:9815, an UNCONDITIONAL baseline BEFORE the drive loop is
+#   entered, and sched.rs:9820, a poll inside the inner `while dispatch_next(cpu)` body. (The
+#   obvious site, after the inner `while`, is RUNTIME DEAD on tegra: main.rs stages the infinite
+#   `jd2_console_pump`, so that queue never drains and the inner loop never returns.) The baseline
+#   is the falsifier for the whole instrument: `EL0_ROLLUP_LAST` starts at `u64::MAX`, so `0 != MAX`
+#   and a boot that refuses NOTHING still prints one `el0refuse=0`. PENDING, therefore, and not
+#   OPTIONAL: absence on the next tegra capture means the reader is not linked or not reached, which
+#   is a real regression and should advise promotion once a capture carries it.
+PENDING \[el0core\] rollup: el0refuse=[0-9]+ el1cores=0x[0-9a-f]+
+#   sched.rs:3201 THE STAMP. `mark_el1_core` is called from main.rs:2588, inside `tegra_early_stop`
+#   (`#[cfg(all(feature = "tegra", target_arch = "aarch64"))]`), with NO runtime knob and strictly
+#   before `tegra_el0_start_maybe()` — an unstamped mask would refuse the pinned `el0-hello`, so the
+#   `REQUIRE TEGRA-EL0 .. round-trip -> PASS` above cannot pass without this line having printed.
+#   Unconditional on a tegra image, therefore PENDING-promotable on the first capture that has it.
+PENDING \[el0core\] el1 core MEASURED: cpu=[0-9]+ mask=0x[0-9a-f]+
+#   sched.rs:3186 and :3194 THE TWO FAIL-CLOSED ARMS, sharing the prefix below (CurrentEL != 1, and
+#   cpu_index out of range). OPTIONAL, and the kind is the decision, exactly as for the IRQEL trio:
+#   this is a FAULT path. A boot that works correctly never prints it, so PENDING would advise
+#   promoting a failure to REQUIRE, and REQUIRE would demand one. Present in the table, never a gate.
+OPTIONAL \[el0core\] NOT stamped:
 
 # --- IRQEL-RT2: the EL1 one-shot proof adjudicates THREE ways; do not flatten it -----
 # `timer::el1_oneshot_proof` (tegra-gated, and UNCONDITIONAL on a tegra image — main.rs
@@ -128,7 +162,7 @@ OPTIONAL IRQEL-RT: EL1 one-shot NOT delivered in ~100 ms
 #   (1) CAPTURED — boot5c `orin.log:8310` carries it verbatim; the pattern is the prefix the
 #       IRQEL-RT2 rewording left untouched, so it matches the old and the new text alike.
 #   (2) UNCONDITIONAL — `el1_oneshot_proof` is `#[cfg(feature = "tegra")]` only, with no
-#       runtime knob, and main.rs:2581 calls it on the SAME statement as, and strictly
+#       runtime knob, and main.rs:2590 calls it on the SAME statement as, and strictly
 #       BEFORE, `run_capstone_boot_core(0)`. So every boot that satisfies the
 #       `REQUIRE CAPSTONE COMPLETE` above must already have printed this line — the
 #       promotion adds NO new way for a healthy boot to red.

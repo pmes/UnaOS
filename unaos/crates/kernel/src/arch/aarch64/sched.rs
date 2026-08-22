@@ -3158,7 +3158,15 @@ static EL1_CORE_MASK: AtomicU64 = AtomicU64::new(0);
 ///      of the drop (the pre-drop `init` seeded TPIDR_EL2). That re-seed is the earliest instant at
 ///      which BOTH facts this stamp records are simultaneously true, and reading `this_cpu()` any
 ///      earlier would dereference an unknown pointer, not merely report a stale answer.
-///   2. MEASUREMENT. The stamp is gated on a `CurrentEL` read taken HERE, on the core being stamped.
+///   2. MEASUREMENT, AND EXACTLY HOW MUCH OF IT. The EL-half is measured: a `CurrentEL` read taken
+///      HERE, on the core being stamped. The CPU-INDEX half is NOT — `percpu::init(0)` writes the
+///      literal `0` one statement earlier and `this_cpu()` reads it back through TPIDR_EL1; no MPIDR
+///      is consulted, so the stamp records "core 0 is at EL1" because the literal says 0, not because
+///      the executing core was identified. That is SOUND HERE and only here: there is one call site,
+///      it cannot be reached from an AP, and `run_capstone_boot_core(0)` hardcodes the same 0 — so the
+///      core that stamps bit 0 is the core that dispatches queue 0. It is true by the tegra path
+///      pinning itself to index 0 everywhere, NOT by the stamp measuring core identity. An AP-side
+///      stamp would have to read MPIDR_EL1; do not copy this call to one and assume it generalises.
 ///      If this ever runs before the drop, `CurrentEL` reads EL2, NOTHING is stamped, the mask stays
 ///      empty and EL0 placement stays REFUSED. Moving or duplicating the call cannot manufacture a
 ///      false stamp; it can only lose a true one, which is the fail-closed direction.
@@ -3242,7 +3250,7 @@ static EL0_ROLLUP_NEXT: AtomicU64 = AtomicU64::new(0);
 /// (`SPREAD4_LOG_MAX`) and `[smpbal] steal` (`STEAL_LOG_MAX`): name the first few refusals, then go
 /// quiet so a shell loop that retries `bg` cannot flood a synchronous polled UART. Capping the WIRE
 /// never softens the refusal — the spawn still fails and its caller still gets the failure; only the
-/// per-event trace stops, and `EL0_REFUSALS` keeps the count on `[spread4]`.
+/// per-event trace stops, and `EL0_REFUSALS` keeps the count, read out by `[el0core] rollup:`.
 ///
 /// Gated with `el0_refuse` itself on the EL0-machinery features, matching `SPREAD4_LOG_MAX`'s `pi`
 /// gate: the `virt`/JC3 legs build no EL0 spawn path at all, so on those the pair would be dead.
@@ -3343,6 +3351,14 @@ fn el0_refuse(site: &str, name: &str, requested: usize) {
 /// zero is worse than no line. `cfg!` rather than `#[cfg]` so both polarities keep type-checking on
 /// every leg, exactly as `el1_core`'s `pi` short-circuit does. On `pi` the guard is true but
 /// `run_capstone_boot_core` is never called (the Pi runs `run`/`run_bsp`), so the Pi emits nothing.
+/// AND THE DEFAULT JETSON MEDIA, which the enumeration above used to omit: a plain `./arroyo
+/// esp-jetson` build is `tegra` + `tegrasmp` with NO `tegra_el0` (arroyo:675 — `tegra_el0` arrives
+/// only from `UNAOS_TEGRA_EL0=1`), so it reaches `run_capstone_boot_core` and prints NOTHING. That is
+/// honest rather than a hole — the same `any(baremetal, tegra_el0)` gate covers `EL0_REFUSE_LOG_MAX`
+/// and `el0_placement_possible`, which holds the only `EL0_REFUSALS.fetch_add`, so that build
+/// compiles no EL0 spawn path, has nothing to refuse and nothing to count; the reader is not narrower
+/// than the thing it reads. But a reader diffing a DEFAULT-media capture against an ARMED one will go
+/// looking for the baseline `el0refuse=0` and not find it. Absent here means "not armed", NOT "dead".
 fn el0_refusal_rollup() {
     if !cfg!(any(feature = "baremetal", feature = "tegra_el0")) {
         return;

@@ -567,7 +567,15 @@ pub fn orin_wm1() -> crate::video::wm::WinId {
 // it is the only way to earn the first read.
 //
 // AND THE GUARD NEVER POWERS ANYTHING. `MRQ_PG SET_STATE` on the display domain is deliberately not
-// reachable from here (`bpmp_tegra` exposes only the getter to this feature). Powering that domain —
+// not NAMED from here (`bpmp_tegra` keeps `CMD_PG_SET_STATE`/`PG_STATE_ON` private and exposes only
+// the getter to this feature). CORRECTION, 2026-08-22, from the landing panel — `ab168ba2`'s message
+// called this "unreachable" and that OVERSTATES IT. `Chan::transfer` is `pub` and takes the MRQ and
+// payload as raw `u32`s, and this block holds a `&Chan`; `chan.transfer(66, &[1, id, 1])` would send
+// MRQ_PG CMD_PG_SET_STATE PG_STATE_ON from right here. Private consts stop it being NAMED, nothing
+// stops it being SENT. So this is a convention with a speed bump, NOT a type-system guarantee — and
+// the danger of the stronger wording is specific: a later rung "just needs the domain on", writes the
+// three numerals instead of adding a wrapper, and the review that follows reads the old claim,
+// believes the compiler forbids it, and does not look. Powering that domain —
 // or worse, cycling it — would tear down the live scanout the whole JD1 inheritance rests on, and is
 // unrecoverable for that boot. Domain not ON is a REFUSAL, printed and named, not a problem to fix.
 //

@@ -429,7 +429,8 @@ Verified at `3dc889e7` by `git merge-base --is-ancestor` and `git grep`:
 | `RENDER_STACK_SIZE = 32 KiB` | ❌ | SHELLUP only |
 | 32 KiB sizing for `usb-pump` / `input` | ❌ | STACKPOOL only |
 | SHELLUP `e8dcb09c` | ❌ not an ancestor of HEAD | **is** on `origin/hw-pi4`; **not** on `origin/main` |
-| STACKPOOL `71671423` | ❌ not an ancestor of HEAD | **CORRECTED 2026-08-23 — it is now FETCHABLE.** This row previously read "not on origin at all … it cannot be fetched today", which was true when written and went stale within hours. `git branch -r --contains 71671423` → `origin/hw-pi4`; the pi seat pushed, and `origin/hw-pi4` is now `54ddef41`. SHELLUP `e8dcb09c` is likewise contained. **Neither is an ancestor of `hw-jetson`**, so the stop-line below still stands for this branch — but the remedy is now a trunk sync or a cherry-pick agreed with the pi seat, rather than a wait for someone to push. Re-verify with `git branch -r --contains` in the same turn as any claim about this; the whole point of this row is that reachability has a shelf life. |
+| STACKPOOL `71671423` | ❌ not an ancestor of HEAD | **FETCHABLE on `origin/hw-pi4`** (`git merge-base --is-ancestor 71671423 origin/hw-pi4` → true, re-verified 2026-08-22). SHELLUP `e8dcb09c` and REDZONE `46c94c07` likewise. **Neither is an ancestor of `hw-jetson`**, so the stop-line below still stands for this branch; the remedy is a trunk sync or a cherry-pick. **This row deliberately names no tip sha.** It has now gone stale three times in one day, and the last version pinned itself to a literal that was three tips out of date under a date stamped a day in the future — in a row whose entire thesis is that reachability expires. Quote the tip YOU measured, in the turn you use it. ⚠️ **And run the right check:** `git log --oneline -1 <sha>` and `git cat-file -e` prove only that a commit is in the LOCAL object store. Under `git worktree` — this project's whole layout — every track shares ONE object store, so a peer's *unpushed* commit resolves here exactly like a pushed one; in a plain clone it would have failed honestly. Only `merge-base --is-ancestor` against a freshly-fetched remote-tracking ref answers "can a peer fetch this". |
+| REDZONE `46c94c07` | ❌ not an ancestor of HEAD | **is** on `origin/hw-pi4` (verified ancestor 2026-08-22 at tip `2950719b`); **not** on `origin/main`. A 1 KiB absorber under every stack plus a guard above it, **always-on, NOT `witness`-gated — so it ships in a media build.** Two caveats travel with it. (1) **NOT-RUN on metal:** `46c94c07` is not an ancestor of `54ddef41`, the boot-12 build sha, so the absorber is committed and gated but has never flown. Treat a *missing* absorber line as "never fired", never as "the absorber held". (2) **1 KiB is not a wall:** all four recorded overruns (400 / 128 / 96 / 256 B) fit with 2.5× margin, but an overrun past 1024+512 B still escapes. The guards make the failure LOUD, not impossible. |
 
 > ⚠️ **The instrument on this branch is the one STACKPOOL convicted as lying.**
 > `arch/aarch64/sched.rs:82-83` at `3dc889e7` documents `[u7stk]`'s `headroom` as
@@ -456,8 +457,53 @@ the two instruments that name the failure mode.
 
 **Precondition, explicit:** do not arm the full desktop cascade on Orin until
 SHELLUP and STACKPOOL arrive — via trunk sync, or via a cherry-pick agreed with
-the pi seat. STACKPOOL additionally has to be **pushed** before it can be either;
-raise that with the pi seat before planning around it.
+the pi seat. **UPDATED 2026-08-22 (orin 4): the push precondition is DISCHARGED.** All
+three cascade commits — STACKPOOL `71671423`, REDZONE `46c94c07`, SHELLUP `e8dcb09c` —
+are ancestors of `origin/hw-pi4` at `2950719b`, verified this turn. The pi seat was
+explicit that its arc is **not** landing soon (boot 12 returned three on-glass defects and
+a red replay), so waiting for its boundary would hold this rung for an unknown number of
+arcs; it advised a cherry-pick instead, in the order STACKPOOL → REDZONE → SHELLUP.
+Three hazards travel with that route and none of them are optional:
+**(H1) line-neutrality does not travel.** These commits are line-neutral against *pi's*
+base (`46c94c07` is 17+/17−, 8905 → 8905 lines). `arch/aarch64/*.rs` compiles knob-off and
+panic `Location` embeds line numbers, so on a different base they may not be — PARITY §5.3
+measured eleven added comment lines moving a knob-off hash. Run the byte-identity control
+after **each** pick, not once at the end.
+**(H2) STACKPOOL's sizes are pi spawn sites.** Take the constant and the helper, **not** the
+placement. Pi's `usb-pump`/`input` are pinned to its `input_cpu`, and the pi seat's own audit
+found that pinning them to the same core **cancelled the only real redundancy in its service
+set** — both call `pump_usb_into_gui`, so either could have covered the other, and boot 11
+lost both because they shared cpu 3. The redundancy existed in the code and was destroyed by
+the placement. Importing it would import a defect, not a cure.
+**(H3) the absorber is 1 KiB** — see the REDZONE row above.
+
+**A placement rule the cascade will tempt you to break, from two seats on the same
+day.** Neither is an Orin finding yet; both are mechanisms with numbers on them,
+and the desktop cascade is exactly where they would come due.
+
+- **rmbp 5, x86 input arc:** a gate *steal* handed composite work to the device
+  core. `x86_usb_pump`'s loop body composites on the calling core, so once the
+  steal made the gate acquirable, the core carrying USB polling and input started
+  running full passes — `gate=` named c7 in **383 of 492** post-steal samples, 88%
+  of those naming any core, against a measured pump median of 140 where 818 × 0.12
+  ≈ 98 was predicted. SCHED-X86 has explicit rules keeping composite work off the
+  device core and the steal silently violated them. Stated generally, and this is
+  the part that travels: **a steal that hands a resource to whoever asks next hands
+  it to the busiest core, because the busiest core asks most often.** If any Orin
+  lane adopts a steal, the acquirer must be **CHOSEN, not merely NEXT.**
+- **pi 4, boot 11:** pinning `usb-pump` and `input` to the same core **cancelled
+  the only real redundancy in the service set.** Both call `pump_usb_into_gui`, so
+  either could have covered the other; sharing cpu 3 meant one fault took both. The
+  redundancy existed in the code and was destroyed by the placement.
+
+One shape: **placement decided by convenience silently repeals a placement rule
+that was load-bearing**, and neither repeal announced itself. On this board that
+matters twice over, because nothing inherits a dead task's singleton roles —
+`steal_ok` is false for every explicitly-pinned task and there is no re-home path
+in the tree at all. Arm the cascade knowing the liveness instruments will tell you
+it is fine: pi's boot 11 printed `[el0live] verdict=LIVE` **one line after** the
+synchronous exception that killed cpu 3, and `:: SCHED: load ::` read `c3=100%`
+for the dead core.
 
 ---
 
