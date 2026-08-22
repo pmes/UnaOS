@@ -2484,11 +2484,19 @@ pub fn hit_test(x: i32, y: i32) -> Option<(WinId, u64, u32)> {
 ///   the same allocator `create` uses, so it lands above every other window *and* above the shell. All
 ///   of the owner's windows are raised, not just one: the focus ring is keyed by ASID (an app may own
 ///   several windows and they focus together), so raising a subset would leave an app half in front.
-/// * **The shell is raised the same way.** `asid == 0` gives [`SHELL_Z`] the fresh z, which puts every
-///   existing window BELOW the shell; those windows stop compositing, their boxes are erased to the
-///   desktop colour immediately, and the desktop is asked for a whole-panel present so the console's
-///   text comes back over the erase. That is the "TAB to the shell, then read your command's output"
-///   case, and it is a z-order fact rather than a special case.
+/// * **The shell is raised the same way — VUGTAB, and this is what changed.** `asid == 0` raises the
+///   shell's OWN rows (kernel furniture, `KERNEL_OWNER_CONSOLE` and friends) to fresh top z's, exactly
+///   as an app's rows are raised above, and then sets [`SHELL_Z`] to a FLOOR one below the lowest live
+///   row. The console lands in front and the desktop is asked for a whole-panel present, so "TAB to the
+///   shell, then read your command's output" still works — but the windows behind it stay composited
+///   and OVERLAPPED instead of being deleted out from under it.
+///
+///   Until VUGTAB this arm gave `SHELL_Z` a fresh z ABOVE everything, so every window stopped
+///   compositing and was published `hidden=true`. That was defended as a deliberate whole-table
+///   gesture; the TAB ring makes the shell slot `n` of an `n + 1` rotation, so it is not deliberate and
+///   cannot be avoided. See the arm itself for boot 12's arithmetic. **`focus_changed(0)` is therefore
+///   no longer a fleet-idle gesture** — `minimise` is the only route off the glass, and `hidden=0` on
+///   every `[wc-fv] focus shell` line is the standing assertion of it.
 /// * **VUGMIN-C — a raise publishes an ARRIVAL, not a census.** The arriving owner is unhidden (the wake
 ///   edge that restarts a parked vug); every other owner's hidden bit is left alone. Only the shell arm
 ///   speaks for the whole table. Before this, a raise re-published `hidden=false` for every owner above
@@ -2563,18 +2571,113 @@ pub fn focus_changed(asid: u64) {
             }
         }
         if asid == 0 {
-            // The SHELL takes the top of the stack. Every window is now below it; collect the boxes so
-            // the panel stops showing them at once rather than at the desktop's next flush.
-            let z = t.next_z;
-            t.next_z = t.next_z.wrapping_add(1).max(1);
+            // VUGTAB — **THE SHELL ARM RAISES THE SHELL. IT DOES NOT BURY THE DESKTOP.**
+            //
+            // Peter, dsktp boot 12, on glass: *"all vugs are minimized instead of being overlapped
+            // when tabbing through windows."*
+            //
+            // This arm used to mint `SHELL_Z` off `next_z` — a LID above every window — so every app
+            // row fell below it, stopped compositing (see [`above_shell`]), had its box erased to
+            // `DESKTOP_BG`, and was published `hidden=true` by [`vugmin_scan`]. The doc above called
+            // that "the arm that genuinely speaks for the whole table", justified by the claim that
+            // focusing the shell is *a whole-table statement the operator makes deliberately*.
+            //
+            // **That claim is false on this arch, and boot 12 is the arithmetic.** `wc_focus_key`
+            // (`arch/aarch64/syscall.rs`) builds the rotation as `n` window slots PLUS ONE — slot `n`
+            // is the shell — so a TAB rotation cannot return to the first window without passing
+            // through it. The capture shows `[wc-c] focus tab-cycle 6 -> 0` once per rotation and
+            // `[wc-fv] focus shell ... hidden=6` eleven times, at z = 77, 88, 99 … 187: a step of
+            // exactly 11 = 10 ring windows + 1 shell raise. Every rotation parked all six user vugs,
+            // and since a raise is additive (CLICK-PLAIN) they came back only one press at a time —
+            // so the operator's STEADY STATE while tabbing is "most vugs minimised". That is the
+            // report verbatim, and it is not a deliberate gesture: it is a seat the ring walks over.
+            //
+            // The fix is [`above_shell`]'s own INCIDENTAL/DELIBERATE distinction, applied one level
+            // up. That predicate already refuses to let a shell raise sweeping past take FURNITURE
+            // off the glass, on the stated ground that nobody aimed at it. Nobody aims at the six
+            // vugs either. A window leaves the glass when it is AIMED at — [`minimise`], the
+            // operator's own disc — and by no other route.
+            //
+            // So this arm keeps the half P59 demanded (the shell becomes VISIBLE) and drops the half
+            // that was never asked for (everything else becomes invisible):
+            //
+            //  1. **The shell's own rows take the top of the stack**, exactly as the raise arm does
+            //     for an app's rows. This is the part that was missing: the console row is
+            //     `KERNEL_OWNER_CONSOLE` at z=1 and was never raised, so TAB-to-shell "showed" the
+            //     console only by DELETING everything drawn over it. Raising it puts it IN FRONT,
+            //     which is what "overlapped" means and what every other focus target already gets.
+            //  2. **`SHELL_Z` becomes a FLOOR under the live rows, not a LID over them** — one below
+            //     the lowest live row, so nothing the operator did not park can fall beneath it.
+            //
+            // Consequence, stated rather than discovered: `focus_changed(0)` is no longer a
+            // fleet-idle gesture. `hidden=0` on every shell raise is the standing assertion of that,
+            // and a future arc that wants "minimise everything" must wire a control the operator can
+            // aim at, rather than borrowing a waypoint they cannot avoid.
+            //
+            // (1) The shell's furniture rows take fresh z's off the same allocator `create` uses.
+            let mut shell_top = 0u32;
+            for i in 0..MAX_WINDOWS {
+                if !t.rows[i].used || t.rows[i].compat {
+                    continue;
+                }
+                // A DELIBERATELY parked console stays parked — the same `PARKED_Z` qualification
+                // CONSOLEWIN put on the exemption in `above_shell`, for the same reason: focusing
+                // the shell may not overrule the operator's own minimise disc.
+                if !is_kernel_owner(t.rows[i].owner_asid) || t.rows[i].z == PARKED_Z {
+                    continue;
+                }
+                let z = t.next_z;
+                t.next_z = t.next_z.wrapping_add(1).max(1);
+                t.rows[i].z = z;
+                t.rows[i].damage_all();
+                shell_top = z;
+                // CLOSEISO's counter, re-sited. It still means "rows this shell raise treated as
+                // furniture"; what changed is the treatment — passed OVER before, RAISED now — so a
+                // regression that stops finding the console still shows up as `furniture=` moving.
+                furniture += 1;
+                if first_id == WIN_NONE {
+                    first_id = t.rows[i].id;
+                }
+            }
+            // (2) The FLOOR: one below the lowest live, non-parked row that is not furniture.
+            // Furniture is excluded because `above_shell` exempts it anyway AND because it was just
+            // raised in (1); compat rows are INCLUDED even though they are also exempt, so that the
+            // FV-EXEMPT contradiction below stays at zero by construction rather than by luck.
+            let mut floor = u32::MAX;
+            for i in 0..MAX_WINDOWS {
+                let r = &t.rows[i];
+                if !r.used || r.z == PARKED_Z || is_kernel_owner(r.owner_asid) {
+                    continue;
+                }
+                if r.z < floor {
+                    floor = r.z;
+                }
+            }
+            // Live z's are `wrapping_add(1).max(1)` and therefore `>= 1`, so `floor - 1` cannot
+            // underflow. With no live row to protect, the shell takes the top outright — the old
+            // arm's value, and there is nothing under it to bury.
+            let z = if floor == u32::MAX {
+                let z = t.next_z;
+                t.next_z = t.next_z.wrapping_add(1).max(1);
+                z
+            } else {
+                floor - 1
+            };
             // CLOSE-TEARDOWN r2 — the OLD shell z, taken in the same swap that publishes the new one:
             // the park witness below names only rows THIS raise takes off the glass, and "was on the
             // glass" is a claim against the shell position the operator was just looking at. A plain
             // store would lose it.
             let prev_shell = SHELL_Z.swap(z, Ordering::AcqRel);
-            newz = z;
+            // The wire reports where the SHELL landed, which is now its row's z rather than the
+            // plane's. With no furniture row in the table the plane is still the honest answer.
+            newz = if shell_top != 0 { shell_top } else { z };
             for r in t.rows.iter_mut() {
-                if r.used && r.z < z {
+                // VUGTAB — a row the operator ALREADY put away vacates nothing now, and re-erasing
+                // its box would pay `erase`'s deferred-fill hazard (WC-L) on every shell TAB for
+                // pixels that are already desktop colour. Skipping it is also what makes `hidden=0`
+                // exact: the field now counts rows THIS gesture took off the glass, which under the
+                // floor is the empty set unless something has gone wrong.
+                if r.used && r.z != PARKED_Z && r.z < z {
                     // CLOSEISO — KERNEL FURNITURE IS NOT COLLECTED, AND THEREFORE NOT ERASED.
                     //
                     // `above_shell` already exempts it, so the row keeps compositing; the question
@@ -2603,8 +2706,15 @@ pub fn focus_changed(asid: u64) {
                     // whole point of this arc: it IS an ordinary window now. The exemption applies
                     // to furniture that is ON the glass, which is the only furniture the Boot AR
                     // verdict was ever about.
+                    //
+                    // VUGTAB — this arm is now a BACKSTOP rather than the live path. Furniture that
+                    // is on the glass was raised above the floor a few lines up, so it cannot satisfy
+                    // `r.z < z`; furniture the operator parked is skipped by the `PARKED_Z` guard on
+                    // the loop. It is kept because the invariant it protects (furniture is never
+                    // erased by a shell raise) must hold however the floor is computed, and it no
+                    // longer increments `furniture` — the raise above is what counts those rows, and
+                    // double-counting here would make the field lie the moment this arm ran.
                     if is_kernel_owner(r.owner_asid) && above_shell(r, z) {
-                        furniture += 1;
                         r.damage_all();
                         continue;
                     }
@@ -17154,12 +17264,15 @@ static FV_SURF_B: [u32; 64] = [0x0020_FF20; 64];
 /// 1. **stack** — B created after A, so B is in front: the pixel is B's colour. (Baseline; if this fails
 ///    the other three prove nothing about focus.)
 /// 2. **raise** — `focus_changed(A)`: the pixel becomes A's colour. This is defect 1 of the arc.
-/// 3. **shell** — `focus_changed(0)`: the pixel is neither window's colour. The shell took the top of
-///    the z-order, both windows dropped below it and their boxes were erased. This is the "TAB to the
-///    shell and READ your output" case, reduced to the one thing a headless gate can check — that the
-///    window layer stopped owning those pixels.
-/// 4. **reraise** — `focus_changed(B)`: B comes back from under the shell. Proves the shell is a
-///    POSITION in the rotation and not a terminus for the window layer.
+/// 3. **shell** — `focus_changed(0)`: the pixel is STILL A's colour. VUGTAB inverted this leg. It used
+///    to require that the window layer stop owning the pixel — the shell took the top of the z-order,
+///    both windows dropped below it and their boxes were erased — and that whole-table park is the
+///    defect Peter reported from the glass ("all vugs are minimized instead of being overlapped when
+///    tabbing through windows"), because the TAB ring cannot rotate without landing on the shell. The
+///    leg now falsifies it: a shell raise may not park a window nobody aimed at, so A stays exactly
+///    where leg 2 put it. See the shell arm of [`focus_changed`] for boot 12's arithmetic.
+/// 4. **reraise** — `focus_changed(B)`: B comes back over A. Proves the shell is a POSITION in the
+///    rotation and that the raise arm still reorders the layer after a shell raise has passed through.
 ///
 /// Self-cleaning: both windows are closed at the end, which erases their boxes to the desktop colour and
 /// recomposites, so the panel is left as it was found. Placement is explicit (`move_to`, which pins the
@@ -17232,7 +17345,35 @@ pub fn focusvis_selftest() {
 
     let stack_ok = got_stack == b_col;
     let raise_ok = got_raise == a_col;
-    let shell_ok = got_shell != a_col && got_shell != b_col;
+    // VUGTAB — **LEG 3 IS INVERTED, BECAUSE THE BEHAVIOUR IT PINNED IS THE DEFECT.**
+    //
+    // It used to read `got_shell != a_col && got_shell != b_col`: after `focus_changed(0)` the
+    // window layer must have STOPPED owning this pixel. That is exactly what Peter reported from
+    // the glass on boot 12 — *"all vugs are minimized instead of being overlapped when tabbing
+    // through windows"* — and the shell arm's own note carries the arithmetic: the TAB ring makes
+    // the shell slot `n` of an `n + 1` rotation, so every rotation fired this whole-table park.
+    //
+    // The leg is not silenced, it is re-aimed at the requirement that replaced it: **a shell raise
+    // leaves the windows where they were.** A raised in leg 2 stays raised through leg 3, so the
+    // pixel is still A's — the same tolerance-free equality the other three legs use, now falsifying
+    // "the shell raise parked a window the operator did not aim at" instead of asserting it.
+    //
+    // TWO HALVES, because one panel cannot carry the claim alone.
+    //
+    //  * The PIXEL half keeps this witness's reason for existing — it asks the framebuffer, not the
+    //    table, which is what caught the panel that never moved while `[wc-c]` printed correctly
+    //    (P59). On a bare panel that is `a_col`. On an ARMED desktop it may not be: the shell raise
+    //    now legitimately brings the console furniture FORWARD, and the Pi's console box covers this
+    //    probe origin at 640x480 — so a kernel-owned hit is accepted there, the same allowance
+    //    `hittest_selftest`'s leg 5 makes for the same reason (FURNITURE-OCC). What NEITHER arm
+    //    accepts is the point going unowned, which is exactly what the whole-table park did.
+    //  * The TABLE half is panel-independent and is the crisp falsifier: A is still above the shell.
+    //    Under the old arm A's z went below `SHELL_Z` on every shell raise, so this reads false on
+    //    any panel, with no dependence on what happens to be painted at one pixel.
+    let shell_hit = hit_test(px as i32, py as i32);
+    let shell_px_ok =
+        got_shell == a_col || shell_hit.map(|(_, o, _)| is_kernel_owner(o)).unwrap_or(false);
+    let shell_ok = shell_px_ok && self::info(wa).map(|i| i.z > shell_z()).unwrap_or(false); // VUGTAB: `self::` — the enclosing fn binds `let info = fb.info()` above, which shadows the module fn.
     let reraise_ok = got_reraise == b_col;
     let ok = stack_ok && raise_ok && shell_ok && reraise_ok;
     serial_println!(
@@ -18306,15 +18447,24 @@ fn closeiso_selftest() {
     let got_k = sample(wk);
     let got_f = sample(wf);
     let iso_ok = got_k == k_col;
-    // FURNITURE-OCC (CHROMESPEC, 2026-08-17) — the FORCED row is hidden by the shell raise, so its
-    // content origin must stop being ITS pixels. Desktop is what that means on a bare panel and what
-    // this leg asserted; on the armed Pi desktop the console window under it is correctly repainted
-    // there instead (`forced=0xf3f3f5` — a title-strip shade, not a stale `f_col`), which the old
-    // equality convicted. Same rule the vacate legs now keep: see [`vacated_points`].
-    let forced_ok = match probe(wf) {
-        Some(pt) => vacated_points(&[pt], f_col).0,
-        None => got_f == DESKTOP_BG,
-    };
+    // VUGTAB — **THIS LEG IS INVERTED, AND THE CONTRAST IT DREW HAS MOVED.**
+    //
+    // It read: the FORCED (non-furniture) row is hidden by the shell raise, so its content origin
+    // must stop being ITS pixels — the counterpart to leg 1, where the furniture row survives.
+    // CLOSEISO's contrast was FURNITURE vs ORDINARY.
+    //
+    // The shell arm no longer parks anything on an incidental raise (Peter, boot 12: the TAB ring
+    // makes the shell an unavoidable waypoint, so "the operator asked for a clear glass" was never
+    // true), so an ordinary row survives it exactly as furniture does. The old equality now convicts
+    // the compositor for doing the right thing — the same way FURNITURE-OCC found it convicting a
+    // correctly repainted console.
+    //
+    // The contrast the fixture is really about did not disappear, it moved to where `above_shell`'s
+    // own doc puts it: INCIDENTAL vs DELIBERATE. Legs 1-2 are now BOTH the incidental case (nothing a
+    // shell raise sweeps past goes down, furniture or not), and legs 4-6 below are the deliberate one
+    // (`minimise` puts a row down and the exemption does not overrule it). A build that started
+    // parking siblings on a shell raise again fails here on `f_col` no longer being there.
+    let forced_ok = got_f == f_col;
     // The table's own answer, beside the panel's: `above_shell` must still call the furniture row
     // visible. (`owner_hidden` is the predicate every present-suppression path reads.)
     let table_ok = {
@@ -19533,12 +19683,16 @@ const _: () = assert!(FIX_W >= CLUSTER_MIN_SRC_W);
 /// leaves this file: it drives the ARCH router (`wc_click_route`), which exists only on the baremetal
 /// aarch64 build, through the same `#[cfg]` seam [`vugmin_publish`] already uses for `set_hidden`.
 ///
-/// The fixture, in order: raise `asid` back above the shell (leg 5 buried everything) and give it
-/// focus; read the REAL cursor; bail out (`None` — asserted nothing) if the pointer happens to be over
-/// a live window, since then the press is a HIT and this leg has no fixture; otherwise drive one PRESS
-/// edge and check the three things P71 asks for — the press is CONSUMED, focus is now the SHELL
-/// (`user_input_active() == 0`), and the previously focused window is BELOW the shell, which is what
-/// makes the shell focus the same state VUGMIN idles the fleet from.
+/// The fixture, in order: raise `asid` and give it focus; read the REAL cursor; bail out (`None` —
+/// asserted nothing) if the pointer happens to be over a live window, since then the press is a HIT and
+/// this leg has no fixture; otherwise drive one PRESS edge and check the three things it asks for — the
+/// press is CONSUMED, focus is now the SHELL (`user_input_active() == 0`), and the previously focused
+/// window is STILL ON THE GLASS.
+///
+/// VUGTAB inverted that third claim. P71 wrote it as "the window is BELOW the shell, which is what
+/// makes the shell focus the same state VUGMIN idles the fleet from" — and idling the fleet off a
+/// gesture nobody aimed at the fleet is the defect Peter reported from boot 12. A desktop click moves
+/// the KEYBOARD; it does not clear the glass. See the shell arm of [`focus_changed`].
 ///
 /// One RELEASE edge follows, so the router's press/release tracker is left exactly as it was found: a
 /// witness that left a phantom press outstanding would make the operator's next real release drop.
@@ -19553,9 +19707,17 @@ fn clickshell_leg(asid: u64, ix: i32, iy: i32, w: i32, h: i32) -> Option<bool> {
     sc::user_input_set_active(asid);
     let consumed = sc::wc_click_route(crate::pal::Event::Button(1));
     let refocused = sc::user_input_active() == 0;
-    let buried = hit_test(ix, iy).is_none();
+    // VUGTAB — **INVERTED: the window must SURVIVE the desktop click, not be buried by it.**
+    //
+    // This read `hit_test(ix, iy).is_none()` — the previously focused window must have gone under the
+    // shell. That is the third statement of the same defect (leg 5 of this fixture and leg 3 of
+    // `focusvis_selftest` are the other two), and Peter's boot-12 report is the verdict on it: a
+    // gesture aimed at the SHELL may not park the window the operator was using. A desktop click
+    // hands over the KEYBOARD — `refocused`, the leg above, is that claim and it is untouched — and
+    // nothing more. `is_some()` is the same assertion with the sign the panel actually wants.
+    let kept = hit_test(ix, iy).is_some();
     let _ = sc::wc_click_route(crate::pal::Event::Button(0));
-    Some(consumed && refocused && buried)
+    Some(consumed && refocused && kept)
 }
 
 /// CLICK-SHELL, DORMANT half: no arch router in this build, so leg 6 asserts nothing.
@@ -20098,9 +20260,20 @@ pub fn hittest_selftest() {
     // hit-test correctly resolves to the FURNITURE the shell raise has no business burying, and the
     // leg convicted the compositor for being right. The owner is on the wire beside the verdict, so a
     // reader can see WHAT the point resolved to rather than only that it resolved to something.
+    //
+    // VUGTAB — **AND THE LEG IS INVERTED, FOR THE SECOND TIME AND THE LAST.** FURNITURE-OCC already
+    // found this leg convicting the compositor for being right; the reason generalises. A shell raise
+    // is a WAYPOINT the TAB ring cannot avoid (boot 12: `[wc-c] focus tab-cycle 6 -> 0` once per
+    // rotation, `hidden=6` every time), so it parks nothing at all now, and "did the shell raise bury
+    // the probe rows?" has one correct answer: NO.
+    //
+    // What the point may legitimately resolve to is therefore A — raised a few lines up and left
+    // there — or the console FURNITURE where the Pi desktop has a console window over the origin.
+    // What it may NOT resolve to is `None`: that is the burial this leg exists to catch, and it is
+    // also what the old assertion accepted. `hidden_owner == 0` (the `unwrap_or`) fails both arms.
     let hidden_hit = hit_test(ix, iy);
     let hidden_owner = hidden_hit.map(|(_, a, _)| a).unwrap_or(0);
-    let hidden_ok = hidden_owner != ASID_A && hidden_owner != ASID_B;
+    let hidden_ok = hidden_owner == ASID_A || is_kernel_owner(hidden_owner);
 
     // Leg 6 — CLICK-SHELL. Re-raise A (leg 5 left every window under the shell) and give it focus,
     // then drive one PRESS edge through the router with the pointer wherever it actually is. The
