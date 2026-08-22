@@ -16144,3 +16144,339 @@ table contended from a second core, asserting the pardon line beside a `-> PASS`
 `occluded>0`. Reachability is proven (`strings`, both builder-path artifacts above), but a witness
 that compiles and never fires is the dead instrument this line exists to prevent. Until that control
 runs, treat the line as armed-but-unfired.
+
+
+## WCSER-ISR / WCSER-STEAL — the wedge is one store, and stealing the gate buys the desktop back at a stated price (x86 `wc`, 2026-08-22)
+
+Four attended metal boots and two days of a wrong theory produced one sentence: **the compositor
+wedge is a single MMIO store into the Kepler BAR1 that never returns.** This section records how
+that was measured, what it refuted, the two instrument fixes it forced, the mitigation that
+followed, and — the part that had not been written down anywhere — what the mitigation actually
+bought when it flew.
+
+Landed in `fb275007` (WCSER-ISR) and `8e91b952` (WCSER-STEAL). Both build on §WCSER-H above, which
+gave the gate a holder identity and the pass a breadcrumb; this is what the breadcrumb said.
+
+### The signature: one shape, five boots
+
+All five readings come from `[wcser] PASS OVERDUE`, whose fields are the gate's own gauges — holder
+core, hold age, and the `comp_mark`/`comp_mark_row` breadcrumb pair.
+
+| boot | image / kernel | hold t0 | holder | `win=` | `row=` | `phase=` | samples |
+|---|---|---|---|---|---|---|---|
+| 11 | `rmbp3boot11`, `5e4b9689` | 117.7 s | c1 | 5 | **704**, twice, 5 s apart | 33 | 2 |
+| 13 | `rmbp4boot13`, `d97446bd` | 33.8 s | c1 | 8 | 792 | 33 | 1 |
+| 14 | `rmbp3probe`, `09153a2b` | 54.3 s | c1 | 7 | 877 | 33 | 1 |
+| 15 | `rmbp4boot14`, `3b4abe22` | 38.8 s | c1 | 9 | **897, ninety-nine 1 s samples, never moved** | 33 | 99 |
+| 16 | `rmbp4boot16`, `19ce87ef` | 83.8 s | c1 | 9 | **946, four samples, never moved** | 33 | 4 |
+
+Boots 13–16 share one capture file, `~/unaos-bench/capture/rmbp4-boot13/ttyUSB0.log`; the byte
+splits are in `BOOT-OFFSETS.md` beside it. Boot 11's lines are quoted in
+[`PCIE-RP-RECOVERY.md`](PCIE-RP-RECOVERY.md) §1 and predate the phase-33 diagnosis — it is included
+here because it is the same signature, recorded before anyone was looking for it.
+
+Everything varies except the two things that matter. The window differs, the row differs, the boot
+time differs, the image differs (boot 14 was flown off a card that still carried a three-image-old
+tree, which is its own lesson). **`phase=33` and `holder=c1` do not vary.**
+
+`holder=c1` is not luck: every one of these boots printed
+`:: SCHED-X86: RENDER on core 1 + INPUT/usb-pump on core 7 ::`. c1 is the render service's core,
+and the render service is the caller that runs whole-panel present blits. The wedge is not "a core";
+it is *the core doing the most BAR1 writing*.
+
+### Why the row gauge makes this exact rather than inferred
+
+`phase=33` decodes, via WCSER-H's table, to `stage_window`'s span-flush loop. In the source
+(`video/wm.rs`) `comp_mark(r.id, 33)` sits on the line immediately above:
+
+```rust
+comp_mark(r.id, 33);
+for y in 0..rows {
+    let src = y * row_bytes;
+    let py = by + band + y;
+    comp_mark_row(py);
+    if clip.n == 0 {
+        fb.blit(py * fb_row + bx * bpp, &stage[src..src + row_bytes]);
+```
+
+That is the bulk row copy **into** the write-combined Kepler BAR1 aperture — the panel write, not
+the scan-out read-back. `comp_mark_row(py)` is stamped *before* the blit, so a frozen `row=N` names
+the row whose copy did not complete.
+
+**And that single field is the whole discriminator.** A loop running at microscopic speed and a
+loop stopped dead are indistinguishable from a hold age; they are trivially distinguishable from a
+row gauge, because **a stalled loop advances `row` and a stalled store does not**. Boot 15 sampled
+`row=` ninety-nine times, one per second, across ninety-nine seconds of hold, and read 897 every
+time. Boot 16 sampled four times and read 946 every time. The pass is not slow. It is stopped, on
+one instruction, and nothing in software can un-park it.
+
+Boot 16 adds an independent confirmation of the same fact from the other end of the system. After
+the steal (below), `[deadman]`'s per-core decline roster reads `dec=f0ffffff` — core 0 and cores
+2–7 saturating the gate with declines — and **core 1's nibble is `0` in all 494 samples over the
+remaining 510 seconds.** A core that is merely slow still arrives at the gate and is still turned
+away. c1 never arrives again, because c1 never executes again.
+
+### The read-back theory, held for two days, and what refuted it
+
+This arc spent two days indicting the **WC-D read-back** — the scan-out-side read the compositor
+performs off the same aperture — and built real machinery against it: WCDVALVE, which throttles
+admissions when read-back duty is high. That theory is dead, and it is recorded rather than quietly
+dropped because the refutation carries information the next reader needs.
+
+**The row trace refuted it structurally.** `phase=33` is on the **write** side of the bus; the
+post-draw read-back is `phase=4` in the same decode table. Boot 8, before the sub-phase split
+existed, saw one hold in each — coarse phase 3 (write) and coarse phase 4 (read-back) — which is
+why the read-back was a live suspect at all. **Every hold recorded since the row gauge existed has
+been phase 33**, five for five.
+
+**And boot 16 refuted it experimentally, which is stronger.** WCDVALVE — the suppressor built
+*against* the read-back hypothesis — engaged on this boot and its wire settles the question
+outright:
+
+```
+[  77546ms] [wc-d] valve CLOSED util~7% wcd~29% suspended=1        (no OPEN after this, ever)
+[  82889ms] [wc-d] valve READ util~98% wcd~0% span=50ms close_at=util12%/wcd8% state=CLOSED
+   ... hold t0 ~83823ms ...
+[  87914ms] [wc-d] valve READ util~79% wcd~0% span=50ms close_at=util12%/wcd8% state=CLOSED
+```
+
+The valve was **closed continuously from 77.5 s to the end of the session**, and read-back duty
+measured **`wcd~0%`** in the epoch that straddles the hold. The read-back was suppressed, was
+measurably not running, and **the machine wedged anyway.** Boot 13 could not deliver this verdict
+because its threshold was unreachable (below); boot 16 delivered it, and it is the answer the
+WCDVALVE experiment was built to get.
+
+**What the refutation rules out, and what it does not.** It rules out the read-back as the *site* of
+the hang and as its *trigger*. It does not exonerate write-combine pressure generally — a saturated
+drain remains the measured precursor to these holds (`declined_pct` climbing 69 → 98 over ~17 s,
+recorded in the boot-8 ledger above), and boot 16's `[comp2]` utilisation reads `util~98%` in the
+very epoch that wedges. WCDVALVE therefore stays: it was built against the wrong hypothesis and is
+still the cleanest instrument the compositor has for read-back duty. What must not survive is the
+*claim*.
+
+### WCSER-ISR — an instrument that cannot fire in the state it exists for is not a cheaper guard, it is an ABSENT one
+
+Boot 13 named its holder exactly once, at the crossing, and then said nothing for the next 78
+seconds of hold — while `[wcser]`'s 5-second rollup, driven from a different path, kept printing
+`WEDGED` the whole time.
+
+The cause is structural and it was already half-known. `wcser_overdue_probe()` rode the head of
+`x86_input_service`'s ~1 kHz loop, placed **ahead** of the event pump precisely because boot 8B had
+shown the pump blocking into a wedged GUI. Boot 13 proved that was not far enough forward: it is not
+the pump that is the gate's victim, it is **the whole loop**. `x86_input_service` blocks in
+`gui_send_x86` once the 64-slot GUI channel fills behind a render task parked on the gate — the
+mechanism [`PCIE-RP-RECOVERY.md`](PCIE-RP-RECOVERY.md) §1.2 had already established from boot 11 —
+so a probe anywhere inside that loop dies with the wedge it exists to report.
+
+The fix moves the probe to the **APIC timer ISR**, beside `deadman::tick`, BSP-only, and drops the
+standing repeat from 5 s to 1 s. That path is not chosen by argument but by demonstration: DEADMAN
+emitted 111 consecutive lines through the very same hold. What the move bought is the one field a
+single sample could never give — whether `row=` advances — which is the entire paragraph above.
+
+The same commit fixed a second instrument of the same class. **WCDVALVE's threshold was never
+reachable, and its silence was unreadable.** It armed and printed nothing on boot 13, whose own
+`[comp2] util_pct` read 0, 11 and 16 against a close threshold of 60. The 60 came from this module's
+header — "boot 8: `wcd_us` ~80% duty" — which is *read-back* duty, while the valve was wired to
+`C2_INSPAN_CYC`, which is *composite-pass* duty. A threshold sized against one signal and applied to
+another. It was re-priced off the measured peak (close at `util >= 12` OR `wcd >= 8`, reopen below
+8/5, with `C2_WCD_CYC` added as the second signal because it is the one the design was actually
+sized against), and it gained a `[wc-d] valve READ …` line every `[comp2]` epoch **even when the
+valve stays open** — because on boot 13 "the threshold was never crossed" and "the valve never ran"
+were indistinguishable on the wire, and *a discriminator that cannot report a null result
+discriminates nothing.*
+
+**The general law, which is what this section is really for.** *An instrument that cannot fire in
+the state it exists for is not a cheaper guard, it is an ABSENT one.* Four instances of it were
+found in a single day across two tracks: this probe; the trunk fold silently dropping the
+`[occ62] pardon` print past a conflict region where four green `check` legs saw nothing; orin's EL0
+placement witness gated `#[cfg(feature = "pi")]` at both spawn sites on a board that is not `pi`;
+and orin's EL0-refusal counter being link-dead on the only platform that refuses. The operational
+consequence is standing: **after any merge, and after any change touching a witness, `strings` the
+artifact and confirm each instrument line is a one-hit grep.** Compiling is not firing.
+
+### WCSER-STEAL — the mitigation, and where its safety argument actually lives
+
+Nothing in software un-parks a core stopped inside an MMIO store. What software *was* doing wrong
+was letting that core keep the panel. Boot 13 printed **15 consecutive** `[wcser] … entered=0
+declined_pct=100 holder=1 … -> WEDGED` rollups to the end of its capture; boot 15 printed **19**,
+the last reading `held_ms=96804`. Meanwhile `[deadman]` on boot 15 read `pmp` averaging **894 polls
+per second** through the hold, and ring-3 vessels kept presenting into a gate that refused every one
+of them. **The frozen glass is the refusal, not the stuck store.**
+
+So a holder in-pass past `COMP_GATE_STEAL_MS` is declared dead and its gate is taken. The bound is
+**4 s = 4× the overdue tripwire's bound, itself 3× the worst honest pass this compositor has ever
+measured (302 ms)** — 13× that pass in total, so no legal pass can reach it. It is a **liveness**
+bound, not a performance one, and that distinction is licensed by the row trace: the thing it fires
+on has been measured five times and is stopped.
+
+**The revenant hazard is closed at the release, not at the steal, and that identity check IS the
+safety argument.** "Not coming back" is a claim about a device, and a device may yet answer. If the
+store ever completes, the parked core's loop finishes writing pixels into a framebuffer — harmless —
+and then walks into a release for a gate a *live* core now owns. Both release sites previously stored
+`false` unconditionally, a shape this module's own DOUBLE-RELEASE note had already flagged. So:
+
+```rust
+fn comp_gate_release() {
+    let me = crate::arch::sched::meter_current_cpu();
+    if COMP_HOLDER_CORE.load(Relaxed) != me {
+        // Stolen from under us while we were in-pass. Not ours to release, and not ours to clear.
+        COMP_REVENANTS.fetch_add(1, Relaxed);
+        return;
+    }
+    …
+}
+```
+
+A revenant declines and returns to its own loop. A core that was never stolen from always matches
+and takes the byte-identical old path. Without this, a steal would be a licence to run two
+compositors on one panel — the exact defect WCSER exists to prevent — and the mitigation would have
+traded a wedge for a tear.
+
+`COMP_REVENANTS` counts those declines. A nonzero reading would be real news about the device
+rather than about us: it would mean a stuck BAR store *does* eventually retire.
+
+> **`COMP_REVENANTS` and `COMP_STEALS` have no reader.** Both are declared and incremented in
+> `video/wm.rs` and appear on no serial line anywhere in the tree — `grep` for them returns the
+> declaration and the `fetch_add`, and nothing else. So "boot 16 saw no revenant" is supported only
+> by the *absence of a second `GATE STOLEN` line* and by the counters not being contradicted, which
+> is weaker than a reading. This is a **fifth** instance of the law one subsection up, found while
+> writing this section: appending both to the `[wcser]` rollup — the standing tail-insertion rule,
+> no existing key moves — is one line each and is owed.
+
+**What this does NOT do, stated here as it is stated in the commit rather than left to be
+discovered:** the parked core is not recovered, its window is not recovered, and the non-returning
+store is not fixed. **One core and one window are traded for the session.**
+
+### Boot 16 — what the steal actually bought, and what it did not
+
+Boot 16 is `rmbp4boot16`, kernel `19ce87ef`, the same source tree as boots 13–15. Its capture begins
+at byte `1148954` of the shared file.
+
+**The gate came back.** The wedge began at 83.8 s, the tripwire named it four times, and:
+
+```
+[  87829ms] :: [wcser] GATE STOLEN from c1 by c7 after 4006ms — the holder was in phase 33 row 946
+             and had not moved; desktop resumes on this core, the dead core is not recovered ==
+             tripwire ::
+```
+
+The session then ran to **598 seconds** — 510 further seconds of live desktop. Boots 13, 14 and 15
+wedged at 33.8 s, 54.3 s and 38.8 s and never recovered. **`WEDGED` never appears once in boot 16's
+capture**, against 15 and 19 occurrences on the two boots before it. The compositor was not merely alive but fast: over those 510 seconds `[deadman] comp_ms`
+(the age of the last *completed* pass) reads p50 **5 ms**, p90 **9 ms**, max 21 ms, and `[wcser]`
+`held_ms` never exceeds 11 ms. Passes enter and finish. The `[wcser]` rollups read `-> SERIAL` with
+`entered` averaging **261 per 5 s window** (218–366) at `declined_pct` averaging **80 %** (71–84);
+the last ~130 s settle into a lighter regime, ~320 entered at ~73 %.
+
+That is the mitigation delivering exactly what it promised. The rest of this section is what it did
+not promise and did not deliver.
+
+**The input service starved.** Two readings in the same `[deadman]` line say it:
+
+* `hq=` — the `pal::EVENT_QUEUE` depth — **pins at exactly 25 from 101.6 s and never reads anything
+  else again**, for all 481 remaining samples.
+* `hid_ms=` — the age of the most recent HID report — climbs monotonically from 76 ms at 150.4 s to
+  **433 076** at the end of the capture. The last HID report of the session arrived at ~150.3 s.
+  The pad and the keyboard were dead for the final **~7.5 minutes**.
+
+`hq` pinned rather than climbing is itself informative: EVENT_QUEUE's PTRDEAD fold means a relative
+motion report merges into the ring's newest entry when that entry is also relative motion, taking no
+slot. So 79 HID completions in the second at 150.4 s moved `hq` not at all. Twenty-five events are
+stranded in the ring and nothing pops them.
+
+**Why, and it is the design, not a bug in the steal.** `GUI_CHANNEL_X86` has **exactly one
+consumer** — the render service's drain, `gui_try_recv_x86`/`gui_recv_blocking_x86`, both of which
+live inside `x86_render_service`'s loop — and that task was pinned to c1, the core that died. Nothing
+drains the channel again. `x86_input_service` fills the 64 slots, blocks forever in
+`Channel::send`'s `slots.wait()`, and therefore stops calling `pal::next_event()`. EVENT_QUEUE stops
+draining, and `hq=25` is what that looks like from the ISR.
+
+The USB poll underneath is untouched: `pmp` stays in its ordinary band (avg 152/s, min 48, max 396)
+for the whole post-steal stretch. **The hardware is being asked and is answering; the service that
+carries the answers to the desktop is gone.**
+
+> **A caveat stated rather than buried.** The blocked-in-`send` step is an inference, not a direct
+> reading, because the one instrument that would have shown the channel filling — `[schedx86] depth
+> sent=… recv=… inflight=…` — is emitted **from the consumer side, inside the render loop**, and
+> therefore died with the render task. Its last line in boot 16 is at 82.8 s, before the wedge. That
+> is a **sixth** instance of the absent-instrument law, found while writing this section. The inference
+> rests on three things that *are* on the wire — `hq` pinned with a live `pmp`, the single-consumer
+> structure of the channel, and the same mechanism independently established for boot 11 in
+> [`PCIE-RP-RECOVERY.md`](PCIE-RP-RECOVERY.md) §1.2 — and it should be closed by moving the depth
+> witness off the consumer.
+
+**The general form, which is the most valuable paragraph here.** The framing is orin 3's, carried
+across because it is better than ours and is on the shared board for exactly this reason:
+
+> **A gate steal is a liveness fix that REALLOCATES a starvation rather than removing it.**
+
+It turned *everything dead* into *everything contending*, and the input service is what lost the
+contention. The operator's report on the boot was precise: **"PARTIAL WEDGE INPUT AND ONE VUG WENT
+DEAD."** The dead vug is the designed trade, priced and stated in the commit. The dead input is not —
+it is a second-order effect of taking the gate without re-homing the roles the dead core held alone.
+**Any seat reaching for a gate steal as a remedy should read this section before writing it**, and
+should ask the question this boot answers by counterexample: *which singleton roles live on the core
+I am about to declare dead, and who takes them?*
+
+**Status of the remedy: IN FLIGHT, not landed.** A parallel arc owns un-gating input from the
+compositor and re-homing the dead core's singleton roles. The defect and the diagnosis above are
+settled and measured; the fix is not described here because it does not exist yet.
+
+### The root cause is OPEN, and the discriminator is built and held
+
+**Why does a store into the WC-mapped Kepler BAR1 never retire?** Unanswered. What is known bounds
+it usefully:
+
+* **It is one core, not the bus.** The root port reads clean at every wedge, on every boot:
+  `[pcih] rp-at-wedge lnksta=d081 devsta=0000 secsta=2000 aer=n`. `secsta=2000` is not a new fault —
+  it matches the same boot's `[pcih] rp-boot` latch, which is why that boot-time line exists
+  (§1.3 of [`PCIE-RP-RECOVERY.md`](PCIE-RP-RECOVERY.md)). No AER, no device-status error bits.
+* **The machine stays alive underneath it.** `pmp` keeps ticking, ring-3 vessels keep presenting,
+  serial keeps talking, and — after the steal — seven cores keep compositing at 5 ms a pass.
+* **PRAMIN is excluded.** Those writes go through BAR0; this one is BAR1.
+* **Link training and ASPM are already exonerated** by boots 9 and 11 (see the boot-8 ledger and
+  [`PCIE-RP-RECOVERY.md`](PCIE-RP-RECOVERY.md) §1).
+
+**The next experiment is built, staged and unflown.** `~/unaos-bench/scratch/rmbp4-b17-held/`,
+kernel.elf sha256 `6cef0148…`. It is the *same source tree* as boot 16 — both trees' `SRC.TGZ`
+hash to the identical `a0c44bf6…`, both stamp commit `f66b1480` — with `UNAOS_KEPLER_FIFO` and
+`UNAOS_KEPLER_CE` dropped and nothing else changed. Verified on the bytes, not on the build log:
+the boot-16 kernel carries the feature string `kepler+takeover+fifo+wc+cy` plus one hit each for
+`kepler_ce.rs` and `Starting PFIFO initialization`; the b17 kernel carries `kepler+takeover+wc+cy`
+and **zero** hits for either, while still carrying `GATE STOLEN`.
+
+Its two exits, so whoever flies it knows what each outcome means before booting:
+
+* **It wedges anyway** ⇒ the Kepler engines are exonerated. PFIFO/PBDMA and the copy-engine
+  reconnaissance touch nothing that matters, and the defect is **the bare write-combined store into
+  BAR1**. That is the harder answer and it points at the aperture, the WC drain, or the endpoint's
+  host interface.
+* **It does not wedge** ⇒ found it. Engine initialisation left the GK107 in a state where a BAR1
+  write can be swallowed, and the next rung is bisecting FIFO against CE.
+
+Note what the experiment does *not* settle either way: a non-wedge across one sitting is weak
+evidence against a defect whose onset ranged 33.8–117.7 s across five boots. Fly it to the duration
+of the longest previous survival, not to the first minute.
+
+### The unanswerable-store class — a SHAPE claim, and explicitly not a common-cause claim
+
+Named jointly by the x86 and Jetson tracks, 2026-08-22, and recorded on the shared cross-track
+board:
+
+> **A store into a device aperture that the fabric never completes, with no timeout, no recovery,
+> and — on Orin — no fault. x86 parks forever; Orin RAS'd and powered off. Different fabrics,
+> different endings, same unanswerable store.**
+
+The x86 half is this section. The Orin half is the boot-5c `bg` kill: a wild store that lands in the
+GiB-0 Device-nGnRE identity window, so it does not fault, reaches the fabric, the slave errors, and
+BL31 powers the core off.
+
+**The asymmetry is recorded with the class, not omitted from it.** Orin's store is downstream of a
+**convicted wrong-EL `eret`** — an AP running at EL2 consuming `ELR_EL2` — so its ORIGIN is known
+and ours is not. Same fate, different provenance.
+
+**These two must not be collapsed into one bug.** The value of the class is that it names a failure
+*mode* the tree had no vocabulary for — a store with no completion, no timeout and no fault is
+invisible to every guard we own, on both architectures — and that value evaporates the moment
+someone treats a shared shape as a shared cause and goes looking for one fix. If a common cause is
+ever found, it will be found by evidence, and this line will be the thing it overturns.

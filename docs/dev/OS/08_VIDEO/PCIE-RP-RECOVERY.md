@@ -13,6 +13,16 @@ Ivy Bridge PEG root port at `0:1.0`. Some of the reasoning is machine-specific a
 
 ## 1. What the evidence says, and what it does not
 
+> **Update, 2026-08-22 — the wedge has since been localised, and this section's boot-11 reading was
+> the first instance of it.** Boots 13–16 reproduced boot 11's `win=5 phase=33 row=704` signature
+> four more times, and boot 15's ISR-driven row trace (99 samples, one a second, `row=897`
+> throughout) proved the holder is **stopped inside one store into BAR1, not slow**. WCSER-STEAL
+> now takes the gate from a holder in-pass past 4 s, so a wedge no longer freezes the desktop —
+> though it does not recover the core. The read-back hypothesis is refuted. Full write-up:
+> [`engine.md`](engine.md) §WCSER-ISR / WCSER-STEAL. Nothing in *this* design document has been
+> implemented; the recovery it plans is still owed, and §1.1a's "no operator in the loop"
+> constraint is unchanged.
+
 Settled on metal before this arc and not re-derived here:
 
 * The wedge is **endpoint-class**, not ASPM. Boot 11 ran `UNAOS_NOASPM=1` with the clear
