@@ -3510,9 +3510,9 @@ fn paygo_service_pass() {
     // WCD-GESTURE — and nothing is taken while a DRAG is live, for two reasons, the second of which
     // is a correctness one rather than a cost one.
     //
-    // COST: the mark below sets `dmg_y0 = dmg_y1 = 0` — a WHOLE-BOX repaint — at 4 Hz. During a drag
-    // that is a panel-scale blit interleaved with the motion reports, on the same `COMP_GATE` the
-    // drag composite needs.
+    // COST: the mark below is a repaint at 4 Hz — a WHOLE-BOX one before a chunk has banked, and
+    // PAYGOBAND's chunk-sized one after. During a drag even the banded mark is a blit interleaved
+    // with the motion reports, on the same `COMP_GATE` the drag composite needs.
     //
     // CORRECTNESS: [`PAYGO_SVC_TRIES`] is incremented by the mark and cleared only by chunk PROGRESS
     // (see the re-arm in [`verify_window`]'s banking arm). With `wcd_admit` now declining for the
@@ -3527,6 +3527,12 @@ fn paygo_service_pass() {
     if drag_active() != WIN_NONE {
         return;
     }
+    // PAYGOBAND — the panel height, read BEFORE the table lock (this file's standing rule: nothing is
+    // called out from under `TABLE`). `*WRITER.lock()` is the single-statement `Copy` read every other
+    // site in this file uses, so the guard dies at the semicolon. A framebuffer that is not ready
+    // reports height 0, which makes `visible` 0 for every row and every mark below whole-box — the
+    // pre-PAYGOBAND behaviour exactly, which is the fail-safe direction this whole block preserves.
+    let panel_h = super::WRITER.lock().info().height;
     let mut marked = None;
     // The STOP-NOTE gets its OWN slot. Sharing `marked` was the defect: a capped row wrote its note
     // into the slot and a later takeable row overwrote it in the same pass, and because the note was
@@ -3558,7 +3564,11 @@ fn paygo_service_pass() {
                 continue;
             }
             let i = r.id as usize;
-            if !(super::wcg::paygo_ripe(i) || wcd_ripe(i)) {
+            // PAYGOBAND — the two wires are read SEPARATELY now, because the mark's extent depends on
+            // WHICH of them is owed. Same disjunction as before, same order, no new call.
+            let wcg_r = super::wcg::paygo_ripe(i);
+            let wcd_r = wcd_ripe(i);
+            if !(wcg_r || wcd_r) {
                 continue;
             }
             // THE BOUND, and it is not decoration. Every predicate above is a property of state the
@@ -3581,12 +3591,86 @@ fn paygo_service_pass() {
                 }
                 continue;
             }
-            r.damaged = true;
-            // Whole box, not a band: the deferred pass is the FULL-coverage one by definition, and a
-            // banded mark would hand `verify_reference` a band to narrow the very verdict this taker
-            // exists to complete.
-            r.dmg_y0 = 0;
-            r.dmg_y1 = 0;
+            // ### PAYGOBAND — mark the CHUNK, not the box, once the walk is under way
+            //
+            // **The defect, from the metal (rmbp3 boot 11, 40.8–105.0 s — the operator's session).**
+            // The screen is provably static across that stretch: four consecutive `[wcn]` rollups are
+            // byte-identical at `att=97 comp=151 passes=115`. Yet `[comp2] pass_us` reads 4911–4949
+            // against 2033 on a genuinely idle desktop, and the console window reads
+            //
+            // ```text
+            // [wcn] win=1 asid=0xffffff01 att=0 comp=18 ... pre=18 drg=0 dout=18 dkpx=13302
+            // ```
+            //
+            // `att=0` — its owner presented NOTHING — beside 18 whole-box composites per 5 s. That is
+            // 3.6 Hz, which is this taker at [`PAYGO_SVC_PERIOD_US`], and `[comp2] wcd_us=` (~194 000
+            // per span) names the read-back those 18 passes bought. It is not contention: `[wcser]`
+            // reads `declined_pct=7..11` throughout.
+            //
+            // **What the whole box actually bought.** The mark was `dmg_y0 = dmg_y1 = 0`, so the pass
+            // repainted all 688 source rows of a 1232x688 console (plus, through the occlusion
+            // closure, `dkpx=739` kilopixels of the shell above it, and the vug above that). The
+            // read-back it enabled is CHUNKED: [`verify_window`] resumes at [`WCD_CUR`] and walks at
+            // most [`WCD_CHUNK_ROWS_MAX`] rows, and on the metal the [`WCD_CHUNK_US`] time stop cuts
+            // it far shorter than that. The terminal lines say by how much — boot 10 closed `win=1`
+            // (688 rows) with `chunks=345` and `win=2` (883 rows) with `chunks=444`, i.e. **~2 source
+            // rows of verdict per whole-box repaint of the window**, ~345 times, at 4 Hz: 86 s of
+            // panel-scale blitting per window to buy one battery. Boot 10's `win=2` printed
+            // `-> PAID` at 188 371 ms and the very next `[comp2]` fell to `pass_us=2033 wcd_us=0`.
+            //
+            // **The fix is to mark what the chunk will read.** `verify_reference` clips the band to
+            // `[cur, min(row1, cur + WCD_CHUNK_ROWS_MAX))` itself, so a mark of exactly
+            // `[cur, cur + WCD_CHUNK_ROWS_MAX)` hands it the SAME rows it was going to walk. The
+            // ledger line this replaces said a banded mark would "narrow the very verdict this taker
+            // exists to complete" — true of an arbitrary band, and false of this one, which is the
+            // chunk's own extent by construction.
+            //
+            // **Wire-identical, and the guard is what makes it so.** `hi < visible` (`visible` being
+            // `verify_reference`'s `rows`, computed from the same four row fields and the panel
+            // height read above) gives, in that function: `row0 == cur` so `cur < row0` is false;
+            // `row1 == hi > cur` so `cur >= row1` is false; `r1 = row1.min(cur + CHUNK) == hi`, which
+            // is what the whole-box mark's `rows.min(cur + CHUNK)` also yields; `banded` was ALREADY
+            // true via its `cur > 0` term; and `cksum_pre`'s `row1 < rows` is unchanged. So the
+            // walk, the verdict and every printed field are the same — only the REPAINT shrinks,
+            // from the box to at most 64 source rows.
+            //
+            // **Everything outside that guard stays whole-box, deliberately:**
+            //  * `cur == 0` — a battery that has banked no chunk. Stage 1 has no cursor at all
+            //    (`WCD_CUR` is stage-2 only) and its lattice verdict IS "the band this present
+            //    offered, once", so a banded mark there would genuinely narrow it. One pass in ~345.
+            //  * `wcg_r` — the wc-g wire has no band test in `wcg::begin` and samples the whole
+            //    surface, so a wc-g take keeps the box it has always had.
+            //  * `hi >= visible` — includes `cur >= visible`, the SHRUNK box, whose close arm in
+            //    `verify_window` needs `row1 == rows` and is reachable only from a whole-box mark.
+            //
+            // **The one race, stated.** Another core can bank a chunk between this mark and the
+            // composite, leaving `cur` ahead of the marked band; `verify_reference` then unwinds and
+            // the take is wasted. `PAYGO_SVC_BUSY` excludes a second taker, so it takes an ordinary
+            // present landing in the gap — and a present that banks a chunk calls
+            // [`paygo_svc_progress`], which clears this row's try count. So the cost is one 250 ms
+            // cycle, the liveness bound is not consumed, and the next pass re-marks at the new cursor.
+            let cur = WCD_CUR[i].load(core::sync::atomic::Ordering::Relaxed) as usize;
+            let hi = cur.saturating_add(WCD_CHUNK_ROWS_MAX);
+            // `verify_reference`'s `rows`, from the same expression. Zero on a degenerate row (which
+            // that function `-> SKIP`s anyway) or an unready panel, and zero fails the guard.
+            let visible = if r.scale == 0 || r.stride < 4 || r.y >= panel_h {
+                0
+            } else {
+                (panel_h - r.y)
+                    .div_ceil(r.scale)
+                    .min(r.h)
+                    .min(r.surf_len / r.stride)
+            };
+            if !wcg_r && wcd_r && cur > 0 && hi < visible {
+                // Widening, not assignment: a band some present already owes must not be dropped by
+                // this mark. `damage_rows` unions, and its whole-box arm (an unserviced `damage_all`
+                // already standing) short-circuits — both are the conservative direction.
+                r.damage_rows(cur, hi);
+            } else {
+                r.damaged = true;
+                r.dmg_y0 = 0;
+                r.dmg_y1 = 0;
+            }
             marked = Some(r.id);
             break;
         }
