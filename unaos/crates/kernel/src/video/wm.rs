@@ -3671,6 +3671,9 @@ fn paygo_service_pass() {
                 r.dmg_y0 = 0;
                 r.dmg_y1 = 0;
             }
+            // NOATT — the attribution half of the discriminator, counted at the ONE site that makes
+            // this class of mark. See the ledger above [`NOATT_SEQ`].
+            noatt_note_taker();
             marked = Some(r.id);
             break;
         }
@@ -4836,6 +4839,12 @@ fn composite_inner() -> CursorTail {
 
     #[cfg(feature = "witness")]
     let seed = dirty;
+    // NOATT — the discriminator, taken HERE: `seed` is the damage set as the table snapshot found it,
+    // so every row in it was marked by something OUTSIDE this pass, and `bands` still holds each
+    // row's OWN declared extent (the closure below only ever widens rows ABOVE a dragger). Both facts
+    // are gone one loop later. See [`noatt_emit`] for what the reading means.
+    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    noatt_note_pass(&rows, &seed, &bands);
     for oi in 0..MAX_WINDOWS {
         let i = order[oi];
         if !dirty[i] {
@@ -10056,6 +10065,16 @@ fn wcn_slot(id: WinId) -> Option<&'static WcnRow> {
 #[cfg(feature = "witness")]
 fn wcn_note_present(id: WinId, hidden: bool) {
     use core::sync::atomic::Ordering::Relaxed;
+    // NOATT — the monotone sequence, bumped for EVERY present attempt (the suppressed path included,
+    // for `att`'s own reason: an attempt is what the owner did). Before the slot lookup's early
+    // return would be wrong — an out-of-range id has no census row and no seed row either — so it
+    // rides the same `Some` the census does.
+    #[cfg(target_arch = "x86_64")]
+    if let Some(i) = (id as usize).checked_sub(1) {
+        if i < MAX_WINDOWS {
+            NOATT_SEQ[i].fetch_add(1, Relaxed);
+        }
+    }
     let Some(s) = wcn_slot(id) else { return };
     s.att.fetch_add(1, Relaxed);
     if hidden {
@@ -10148,6 +10167,156 @@ fn wcn_note_relay(id: WinId) {
         s.drly
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
+}
+
+// ---- NOATT — the discriminator: damage nobody attached to -------------------------------------
+//
+// ### The question every earlier investigation walked past
+//
+// The `[wcn]` census can already say that a window composited more often than it presented — that is
+// `comp_rate` above `att_rate`, and the WCN-CAUSE split says whether the excess was the occlusion
+// closure (`drg`) or the window's own damage (`pre`). What it CANNOT say is the thing that matters
+// when a desktop is burning a core while the glass does not move: **was there an attach behind that
+// damage at all?** A row with `att=0 comp=18 pre=18` is exactly that shape — eighteen composites of
+// its OWN damage across a span in which its owner presented nothing — and on rmbp3 boot 11 it sat on
+// the wire for 64 seconds under a healthy `-> LIVE` verdict while four separate investigations read
+// past it.
+//
+// `pre` alone cannot answer it, for a structural reason: `pre` is counted per BLIT and `att` per
+// PRESENT, and the two are drained on the same cadence but never joined per pass. A window
+// presenting at 19/s and compositing at 22/s reads the same `pre > 0` as one presenting at 0/s and
+// compositing at 3.6/s. The join has to happen INSIDE the pass, against the attach count as of the
+// previous pass, and that is the whole of this instrument.
+//
+// ### What it counts
+//
+// Per composite pass, over the SEED set (rows the table snapshot found damaged — the closure's
+// dragged-in rows are excluded by construction, because their cause is named already):
+//
+//  * `noatt` — seed rows whose per-id attach sequence has not moved since the previous pass. Damage
+//    a present did not put there.
+//  * `noatt_kpx` — what those rows charged the pass, as `damaged_box` area in kilopixels: the same
+//    quantity `[wcn] dkpx=` uses, so the two are directly addable.
+//  * `taker` — how many of the span's marks came from [`paygo_service_pass`]. This is the
+//    ATTRIBUTION half: `noatt == taker` convicts the pay-as-you-go taker outright, `noatt > taker`
+//    says something else is also marking, and `taker == 0` with `noatt > 0` sends the reader to the
+//    other unattached-damage paths (`cursor::repair`'s `damage_intersecting`, `focus_changed`,
+//    `repaint`, the erase drain).
+//
+// ### The readings
+//
+// A healthy idle desktop reads NOTHING — the line is self-silencing on `noatt == 0`, which is what
+// rmbp2 boot 10 past 193 596 ms and boot 9 past 112 510 ms would both have printed. The boot-11
+// leak reads `passes=115 seeds=115 noatt=18 noatt_kpx=~13300 taker=18 -> TAKER`. A cursor path
+// re-damaging a still pointer would read `taker=0 -> UNATTRIBUTED` with `noatt` near the pass count.
+//
+// x86 only, like `[wcser]`/`[wcpar]`: the taker it attributes to is x86 + `wcg-paygo`, and the
+// aarch64 wire gains no line.
+
+/// NOATT — per-id monotone attach sequence. Bumped by [`wcn_note_present`] for every present the
+/// owner attempted, and NEVER drained: the reading is a DIFFERENCE against [`NOATT_SEEN`], so a
+/// counter the rollup swapped would manufacture a fresh "no attach" the instant it fired.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static NOATT_SEQ: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
+
+/// NOATT — per-id: [`NOATT_SEQ`] as the PREVIOUS composite pass saw it. Stamped for every slot on
+/// every pass, so "since the previous pass" is literal and a row that sat out a pass does not
+/// accumulate a spurious quiet interval.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static NOATT_SEEN: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
+
+/// NOATT — per-span: passes that reached the seed snapshot.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static NOATT_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// NOATT — per-span: seed rows, all causes. The denominator `noatt` is read against.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static NOATT_SEEDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// NOATT — per-span: seed rows with no attach since the previous pass.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static NOATT_ROWS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// NOATT — per-span: what those rows charged, in kilopixels (`[wcn] dkpx=`'s unit).
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static NOATT_KPX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// NOATT — per-span: marks made by [`paygo_service_pass`]. The attribution half.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static NOATT_TAKER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// NOATT — the pay-as-you-go taker's mark, counted where it is made. Called under no lock, one
+/// relaxed increment; compiled out with the taker itself.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+fn noatt_note_taker() {
+    NOATT_TAKER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// NOATT — fold one composite pass's seed set into the span. See the ledger above [`NOATT_SEQ`].
+///
+/// The stamp is taken for EVERY slot, not only the seeded ones: "since the previous pass" has to
+/// mean the previous pass, or a window that presents once every ten passes would read as unattached
+/// on nine of them. The `swap` is the stamp and the read in one operation, so two cores compositing
+/// concurrently cannot both claim the same quiet interval.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn noatt_note_pass(
+    rows: &[Window; MAX_WINDOWS],
+    seed: &[bool; MAX_WINDOWS],
+    bands: &[Option<(usize, usize)>; MAX_WINDOWS],
+) {
+    use core::sync::atomic::Ordering::Relaxed;
+    NOATT_PASSES.fetch_add(1, Relaxed);
+    let (mut seeds, mut noatt, mut kpx) = (0u64, 0u64, 0u64);
+    for i in 0..MAX_WINDOWS {
+        let seq = NOATT_SEQ[i].load(Relaxed);
+        let seen = NOATT_SEEN[i].swap(seq, Relaxed);
+        if !seed[i] {
+            continue;
+        }
+        seeds += 1;
+        if seq != seen {
+            continue;
+        }
+        noatt += 1;
+        // `damaged_box`, not `outer_box`: a banded row charges its band, which is the whole point of
+        // the PAYGOBAND change this instrument has to be able to measure.
+        let d = damaged_box(&rows[i], bands[i]);
+        kpx += (d.2 as u64 * d.3 as u64) / 1024;
+    }
+    NOATT_SEEDS.fetch_add(seeds, Relaxed);
+    NOATT_ROWS.fetch_add(noatt, Relaxed);
+    NOATT_KPX.fetch_add(kpx, Relaxed);
+}
+
+/// NOATT — drain and print, on `[wcn]`'s cadence and from its emitter, so the span is the same span.
+///
+/// SELF-SILENCING: a period in which every damaged row had an attach behind it prints nothing. That
+/// is the property that makes the line worth its bytes — it appears exactly when there is work
+/// nobody asked for, and its absence is the healthy reading rather than an absent instrument. The
+/// per-span counters are still drained on a silent period, so a leak cannot bank quiet spans and
+/// then report them all against one noisy one.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn noatt_emit(scope: &str, span: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let passes = NOATT_PASSES.swap(0, Relaxed);
+    let seeds = NOATT_SEEDS.swap(0, Relaxed);
+    let rows = NOATT_ROWS.swap(0, Relaxed);
+    let kpx = NOATT_KPX.swap(0, Relaxed);
+    let taker = NOATT_TAKER.swap(0, Relaxed);
+    if rows == 0 {
+        return;
+    }
+    // Tenths, per this file's rate convention.
+    let rate = rows.saturating_mul(10_000) / span.max(1);
+    let verdict = if taker >= rows {
+        "TAKER"
+    } else if taker > 0 {
+        "TAKER+"
+    } else {
+        "UNATTRIBUTED"
+    };
+    serial_println!(
+        "[noatt] scope={} passes={} seeds={} noatt={} noatt_kpx={} rate={}.{}/s taker={} span={}ms -> {}",
+        scope, passes, seeds, rows, kpx, rate / 10, rate % 10, taker, span, verdict
+    );
 }
 
 /// WC-N — record that `id`'s row was in a pass's dirty set and declined for sitting below the shell.
@@ -10405,6 +10574,12 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
     // is contention. x86 only, for the reason the gate itself is.
     #[cfg(target_arch = "x86_64")]
     wcser_emit(scope, span);
+    // NOATT — the discriminator rides the same cadence and span, directly under `[wcser]` because it
+    // answers the question `[wcser]` cannot: a `comp_rate` far above `att_rate` with `declined_pct`
+    // in single figures is not contention, and this line says whether it was work anybody asked for.
+    // Self-silencing, so a healthy desktop is as quiet as it was before. x86 only, like `[wcser]`.
+    #[cfg(target_arch = "x86_64")]
+    noatt_emit(scope, span);
     // WPACE-PANEL — the present pacer's ledger rides the same cadence, directly under `[wcser]`
     // whose `declined=` it is the cure for: `coalesced=` climbing while `declined=` falls is the
     // pacer converting gate contention into absorbed presents. Same identity snapshot as the
