@@ -790,6 +790,18 @@ arm_features() {
     # every aarch64 media hash between a default build and a `UNAOS_NOKBDWIT=1` one for zero
     # observable change. Stripped => aarch64 media are byte-identical either way.
     f="${f//,kbdwit,/,}"
+    # DEADMAN rides the same strip, for the same reason: the real instrument is
+    # `all(feature = "deadman", target_arch = "x86_64")`-gated and every counter, the emit and both
+    # `wm` samplers live inside it, so `deadman` emits not one byte of aarch64 CODE — the aarch64
+    # half is the empty `#[inline(always)]` shim, which compiles to nothing. But an enabled feature
+    # is hashed into cargo's `-Cmetadata` fingerprint, so leaving it in would shift every aarch64
+    # media hash between a default build and a `UNAOS_DEADMAN=1` one for zero observable change.
+    # Stripped => the x86 track can arm a timer-ISR witness without touching Pi or Jetson media.
+    # ⚠ This strip governs MEDIA only. `deadman` IS named on the `arm-pi` type-check leg above, and
+    # must stay there: the hooks in `video/wm.rs` (`note_attach`, `note_composite_done`) are
+    # ARCH-NEUTRAL call sites, so the shim half has to compile armed on aarch64 or the seam is
+    # covered on neither arch.
+    f="${f//,deadman,/,}"
     # SDHC-4a rides the same strip, for the same reason: `drivers/sdhc.rs` is reached only from
     # `arch/x86_64/pci.rs`, so `sdw` emits not one byte of aarch64 CODE — but leaving it enabled would
     # shift every aarch64 media hash between a default build and a `UNAOS_SDW=1` one for zero
@@ -1671,7 +1683,7 @@ KERNEL_CFG_MATRIX=(
   # and both arches type-check the seam.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,wifival,noaspm,wifi3,holocron,hcronst"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,wifival,noaspm,wifi3,holocron,hcronst,deadman"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder. Cannot carry the tegra family — see the mutual-exclusion note above.
@@ -1683,7 +1695,7 @@ KERNEL_CFG_MATRIX=(
   # not have caught an aarch64 regression in the very file the "do not strip" decision exists to
   # protect. It is a type-check leg, so it shifts no Pi or Jetson MEDIA: `arm_features` (which media
   # builds go through) is untouched, and `kernel8` builds from its own curated K8_FEATS.
-  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,holocron,hcronst"
+  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,holocron,hcronst,deadman"
   # aarch64 board leg 2 — Jetson Orin Nano (Tegra234), plus the board-neutral aarch64 features that
   # would otherwise ride nothing: ORIN-SMP (tegrasmp/smpprobe), the four XCARVE levers, ORIN-NET-1..4
   # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET

@@ -230,7 +230,7 @@ mod imp {
     /// One composite pass DECLINED by `COMP_GATE`. Charged to the declining core.
     #[inline]
     pub fn note_decline() {
-        let c = crate::arch::percpu::this_cpu().cpu_index.min(CORES - 1);
+        let c = (crate::arch::percpu::this_cpu().cpu_index as usize).min(CORES - 1);
         DEC[c].fetch_add(1, Relaxed);
     }
 
