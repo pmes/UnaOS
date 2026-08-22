@@ -39,7 +39,9 @@ These hold in every rung and are verified rather than asserted:
   scratch-fill (R4b) — with neighbour-smear checks at claim and at restore.
 - **Scratch pages are never handed back to the allocator while a GT translation to them might
   survive.** Before R6 they were leaked unconditionally; R6 replaces that with a gated
-  reclaim (§2.6).
+  reclaim (§2.6). From R7 the gate additionally requires the engine to be **provably idle**,
+  not merely disabled (§2.7) — a cleared enable bit is not a statement about a DMA already in
+  flight.
 - **Every poll is bounded on the cycle counter** (`now_cycles()`), never on `arch::ms()`.
 - **A zero-compare is never a verdict.** Every read is classified three ways
   (`structured` / `zero` / `allones`), every register is read twice so a read-twice
@@ -62,7 +64,7 @@ are off-limits and are not a source for anything in this ladder.
 
 ---
 
-## 2. Ladder state, R1 through R6
+## 2. Ladder state, R1 through R7
 
 | Rung | Name | Writes | Metal verdict |
 | --- | --- | --- | --- |
@@ -72,6 +74,7 @@ are off-limits and are not a source for anything in this ladder.
 | R4 / R4b | `claim` | ≤3 GGTT PTEs, all restored | GGTT PTE round-trip **proven** |
 | R5 | `execute` | 2 GGTT PTEs + 4 RCS ring regs, all restored | `enable-void` — `RING_CTL` write did not latch |
 | R6 | `rearm` | as R5, **under a held wake**, + 1 GTT-flush reg | *pending metal* |
+| R7 | `blit` | as R6 on the **BCS**, 3 GGTT PTEs + 4 BCS ring regs | *pending metal — DARK, see §2.7* |
 
 ### 2.1 R1 — `recon` (read-only)
 
@@ -282,6 +285,156 @@ domain is not writable on this part on any documented register, and the x86 engi
 programme is dead on documented registers. That is a finding worth the boot, and the rung
 states it in those words on its `next=` line.
 
+### 2.7 R7 — `blit` (the BCS moves pixels, or says why not)
+
+R6 asked whether **any** ring's `RING_CTL` latches under a held wake, and whether the CS
+retires a bare `MI_STORE_DATA_IMM` on the RCS. R7 keeps that entire envelope — the same
+`R6_CANDS` order, the same acquire/hold-across-the-arm/release discipline, the same
+proven-unowned GGTT window, full capture/restore/re-read on every write — and moves it to the
+**BCS** with a real 2D command: `XY_SRC_COPY_BLT` copying a 16x16x32bpp rectangle (1 KiB) from
+a seeded source page into a destination page.
+
+Three pages instead of two: `ring`, `src`, `dst`. Three GGTT slots (`0x10000`, `0x10001`,
+`0x10002`), the R5/R6 window extended by one.
+
+#### R7 is DARK, and dark means writes-nothing, not does-nothing
+
+The 2D encodings are **[EXT-UNPINNED]** (below), so R7 must not fly until they are pinned. It
+is held dark by the same `write_ok()` gate R4/R5/R6 use — but on any `UNAOS_IVB3D=1` boot
+`blit()` still performs its full read-only census before that gate: ~130 MMIO reads (the entry
+battery, the BCS ring-register images, the GGTT window and its neighbours, the six far probes,
+`GTFIFOCTL` twice) plus one PCI config read of the host bridge's `BDSM`. That census is the
+rung's value while it waits, and it must stay reachable.
+
+#### The two witnesses, and the rule that each speaks alone
+
+R7 is the first rung with two independent success witnesses, and the first where they can
+disagree:
+
+| Witness | Column | What it proves |
+| --- | --- | --- |
+| **copy** | `dst_match=N/256` | the CS parsed `XY_SRC_COPY_BLT` and moved pixels |
+| **retire** | `sentinel_hit` | `MI_STORE_DATA_IMM` took effect |
+| **head** | `head_post == tail` | the ring retired to its tail |
+
+`dst_crc` / `src_crc` cross-check the copy (a perfect copy makes them equal).
+
+**Each witness speaks without permission from the others.** As shipped in `f0daf518` every
+copy arm was conditioned on `sentinel_hit` first, so `copy_full && !sentinel_hit` fell through
+to `sentinel-miss` and was reported as `r7-sentinel-miss` — *a blit failure* — while
+`best_dst_match=256/256` sat on the same summary line. A full copy is a 2D positive whether or
+not the store lands. The classification chain now gives every combination its own name.
+
+#### The ordering barrier
+
+`XY_SRC_COPY_BLT` (DW0-7) is followed by `MI_FLUSH_DW` (DW8-11) and only then
+`MI_STORE_DATA_IMM` (DW12-15). Without the flush nothing stops the sentinel store retiring
+while the 1 KiB copy is still in the engine's write pipeline — which would make a short
+`dst_match` indistinguishable from a wrong `BR13` field, destroying the one discrimination the
+rung exists to make. The ring tail is unchanged at `0x40`: the flush occupies exactly the four
+`MI_NOOP` dwords the previous layout used as padding, so the tail stays QWord-aligned
+(§1.1.11.1 p.75).
+
+Because the flush's own encoding is [EXT-UNPINNED], the rung does not rest the discrimination
+on it alone. The pixel witness is sampled **twice** and both readings go on the wire:
+
+| Column | When | Reading |
+| --- | --- | --- |
+| `col=exec` | the instant the exec poll exited | earliest, may be short because we looked early |
+| `col=drain` | after the ring drained to `HEAD==TAIL` | settled; `settled=1` when the two agree |
+
+`col=exec` short with `col=drain` at 256 means *we looked too early*. Both short on a drained
+ring means the copy genuinely did not land, and `BR00`/`BR13` are the suspect. That leg depends
+on no encoding at all — only on `HEAD==TAIL` — so it survives a wrong `MI_FLUSH_DW`.
+
+#### The teardown gate — disabled is not idle
+
+R6's ring held one 4-byte `MI_STORE_DATA_IMM`, so "the enable bit read back clear" was a
+serviceable stand-in for "the engine is done". **R7's ring holds a 1 KiB engine-side DMA write
+into `dst_page`, and the stand-in stops holding.** Clearing `RING_CTL` bit 0 stops the command
+streamer *fetching*; it retires nothing already handed to the engine. Between "stop fetching"
+and "the last byte has landed" there is a window, and unmapping the destination PTE inside it
+aims that write at whatever the GGTT slot resolves to next.
+
+`f0daf518` computed the drain witness and then used it only in a log line. It is now
+load-bearing:
+
+```
+engine_quiesced = all_disabled && all_ring_idle
+```
+
+`all_disabled` = `RING_CTL & 1 == 0`, read back. `all_ring_idle` = every armed candidate's ring
+reached `HEAD==TAIL` (§1.1.11.4 p.78's clean point) inside `DRAIN_BUDGET_CYC`. **Both, or the
+pages do not move.** `engine_quiesced` gates the GGTT unmap *and*, through `reversal_clean`,
+the `dealloc` — two independent barriers, because a skipped unmap also forces `ptes_restored`
+false. On the un-armed path — the expected outcome on this part — `all_ring_idle` is vacuously
+true and nothing that used to reclaim stops reclaiming.
+
+The three predicates live between `R7-TEARDOWN-GATE-BEGIN` / `-END` markers in `gen7.rs` as
+pure `const fn`s, for one reason: they are the only thing standing between a live DMA engine
+and reused kernel heap, and pure functions can be driven with a **forced drain timeout outside
+the kernel**. See §3.1.
+
+#### Verdicts
+
+| `r7 verdict=` | Meaning |
+| --- | --- |
+| `r7-gated-on-wake` | R3 did not confirm a wake. **Nothing written.** |
+| `r7-range-owned-refused` / `r7-fill-hypothesis-refuted` | The GGTT window is not provably unowned. Nothing written. |
+| `r7-claim-write-void` | A PTE did not land, or a neighbour smeared. The ring was never armed. |
+| `r7-enable-void-under-every-hold` | Every candidate hold was taken and BCS `RING_CTL` still read back `0`. |
+| `r7-blit-verified` | **The win.** Enable latched, 2D parsed, all 256 dwords copied, store retired, head at tail. |
+| `r7-blit-verified-head-stuck` | Copy **and** store landed; only the head never reached tail. The 2D block is proven by 256 dwords — suspect retirement, not the encoding. |
+| `r7-blit-full-sentinel-miss` | All 256 dwords copied, store did **not** land. Also a 2D positive; suspect `MI_STORE_DATA_IMM` or the flush ahead of it. |
+| `r7-blit-partial` | The copy ran but not every dword landed. Compare `col=exec` against `col=drain` before pinning `BR00`/`BR13`. |
+| `r7-sentinel-miss` | The head retired, no pixel moved, no store landed. |
+| `r7-head-stuck` / `-partial` | The enable latched but the CS did not parse the ring. |
+| `r7-ring-would-not-disable` | **Safety override.** `RING_CTL` bit 0 would not clear. PTEs left claimed, pages leaked. |
+| `r7-ring-drain-timeout` | **Safety override.** The enable cleared but `HEAD` never reached `TAIL` — the engine may be mid-DMA into `dst_page`. PTEs left claimed, pages leaked. |
+
+The last two dominate every exec reading. `r7-blit-verified-head-stuck`,
+`r7-blit-full-sentinel-miss` and `r7-ring-drain-timeout` are new in this arc; the first two
+were previously collapsed into `r7-blit-partial` and `r7-sentinel-miss`, and the third was
+invisible — a drain timeout freed the pages.
+
+#### What is still unpinned
+
+Nothing below may fly on metal until it is pinned against the Intel IVB PRM. The clean-room
+line stands: `i915` and `i965` are not a source.
+
+| Constant | Value | Needs |
+| --- | --- | --- |
+| `XY_SRC_COPY_BLT_DW0` (BR00) | `0x54F00006` | IVB PRM Vol1 Part5, BLT — opcode `0x53`, the two 32bpp bits, DWord length. The `0x2<<29` client field **is** present and verified. |
+| `BR13` | `0x03CC0040` | same — colour-depth select, `ROP=SRCCOPY`, dest pitch |
+| `SRC_PITCH` / `RECT_WH` / `RECT_00` | `64` / `16x16` / `0` | same — DW ordering of the src/dst rect block |
+| `MI_FLUSH_DW_OPCODE` | `0x26` | IVB PRM Vol1 Part3, MI — the opcode itself |
+| `MI_FLUSH_DW_TOTAL_DW` | `4` | same — total DWord count, which sets the header's length field |
+| `HYP_GFX_FLSH_CNTL` | `0x101008` | inherited [EXT-UNPINNED] from R6; never the sole reason a page is freed |
+
+The MI **header format** used to build `MI_FLUSH_DW_DW0` is pinned (§1.2.17 p.186: Type[31:29],
+Opcode[28:23], DWord Length = *Total Length − 2*); only the opcode and the total length are
+hypotheses.
+
+#### The metal falsifier, and the watch lines
+
+Stated before the boot: **with a wake held, `ctl_readback==0x1`, `head_moved=1`,
+`sentinel_hit=1`, `dst_match=256/256`.**
+
+Three things silicon must confirm that no host gate can:
+
+1. **The drain gate never fires spuriously.** On a healthy boot expect
+   `all_ring_idle=1 engine_quiesced=1` and `reclaim=freed`. An `r7-ring-drain-timeout` on a run
+   that otherwise looks clean means `DRAIN_BUDGET_CYC` (≈8 ms) is too short for a 1 KiB blit on
+   this part — raise the budget, do **not** relax the gate.
+2. **The flush encoding.** If R7 returns `r7-head-stuck` or `r7-sentinel-miss` where R6 — same
+   hold, same ring, one command — returned `r6-sentinel-hit`, the delta is the
+   [EXT-UNPINNED] `MI_FLUSH_DW` mis-framing the store that follows it, **not** the 2D block.
+   Suspect `MI_FLUSH_DW_TOTAL_DW` first.
+3. **`settled=`.** `settled=0` with `col=drain` at 256 is the barrier doing its job late and is
+   informative, not a failure. `settled=0` with `col=drain` *below* `col=exec` would mean the
+   engine wrote `dst_page` after we thought it was idle — that is the G1 hazard observed live,
+   and it is a STOP.
+
 ---
 
 ## 3. Verification
@@ -292,16 +445,50 @@ witness is reachable. The honest gates are:
 
 1. `./arroyo check` for both arches, plus `UNAOS_WC=1 ./arroyo check` and
    `UNAOS_WC=1 UNAOS_IVB=1 UNAOS_IVB3D=1 ./arroyo check` with `gen7` in the feature banner.
+   A knob-gated change type-checked only knob-off is **not** gated: the armed run is required,
+   and the banner must actually read `...,intel-ivb,unaos_ivb,gen7`.
 2. The x86-fat knob-off battery, proving the disarmed image is unchanged.
 3. **`strings` on the armed `esp-x86` artifact**, proving every verdict token is present in
    the shipped ELF — not merely compiled behind a `cfg`.
-4. **Metal.** The falsifier above.
+4. **The R7 teardown-gate go-red** (§3.1) — for any change to the unmap/free gate, a
+   demonstration that a non-idle engine cannot reach the page free, not an argument that it
+   cannot.
+5. **Metal.** The falsifiers above.
 
 One deliberate `strings` exception: `r6-ring-addr-illegal` (and R5's identical
 `ring-addr-illegal`) does not appear in the artifact, because `ring_gtt_addr` is a
 compile-time constant and rustc proves the branch dead. That is the `RING_BUFFER_START`
 bits[31:29] invariant being discharged **at compile time** — stronger than a runtime check,
 not absent. If the ring slot is ever made non-constant, the branch and its token return.
+
+R7 carries the same exception for `r7-ring-addr-illegal`, for the same reason.
+
+### 3.1 The R7 teardown-gate go-red
+
+`./arroyo check` proves the gate compiles. It cannot prove the gate *refuses*, because R7 is
+dark and QEMU has no Ivy Bridge IGD — the drain timeout the gate exists to catch is
+unreachable in every environment available to a session.
+
+So the gate is proven where it can be: the three `const fn`s between the
+`R7-TEARDOWN-GATE-BEGIN` / `-END` markers in `gen7.rs` are **extracted verbatim** by a host
+harness (`awk` between the markers, `include!`d, compiled with `rustc`) and driven with
+`all_ring_idle` forced false. The harness also carries the pre-fix predicate as its red
+baseline, and models the teardown's control flow exactly — the GGTT-unmap block runs only when
+the gate passes, so `ptes_restored` cannot become true if the unmap was skipped.
+
+Three legs, all passing on this arc:
+
+| Leg | What it drives | Result |
+| --- | --- | --- |
+| 1 | forced drain timeout, everything else green | **pre-fix**: `ggtt_unmapped=true pages_freed=true` (RED). **post-fix**: both `false`. |
+| 2 | exhaustive over the other six witnesses, `all_ring_idle` pinned false (64 combinations) | pre-fix reached `dealloc` in **3**; post-fix in **0**, and the unmap in **0**. |
+| 3 | the un-armed path, plus all 64 idle-path combinations | still reclaims; **0 divergences** from the pre-fix gate whenever the engine is idle. |
+
+Leg 3 is the one that keeps the fix honest: it narrows the gate **only** where the engine is
+not provably idle, and changes nothing on the path this part actually takes.
+
+Because the extraction is by marker and the harness asserts it read a non-trivial region, the
+thing proven is the shipped source, not a paraphrase of it.
 
 ---
 
@@ -312,3 +499,8 @@ is proven on metal at R4/R4b. The **engine register block** has so far refused e
 R2's `INSTPM` did not latch, R5's `RING_CTL` did not latch. R6 is the rung that decides
 whether that refusal is the absence of a held wake or a property of the part. Either answer
 moves the GEN7-vs-Kepler decision; only one of them keeps the ladder alive.
+
+R7 is built and **held dark** behind the unpinned 2D encodings. Its teardown safety and its
+witness logic are now correct independently of that pin — the work that had to happen before
+the encodings are pinned, so that pinning them is the only thing left between R7 and a metal
+flight. Its read-only census runs on every armed boot in the meantime.

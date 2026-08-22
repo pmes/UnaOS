@@ -4513,14 +4513,30 @@ pub unsafe fn rearm(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, 
 // The rung's whole added question over R6: does the BCS parse a genuine 2D command and move
 // pixels, not just retire a store? `dst_match=/256` is the pixel witness; `sentinel_hit` is the
 // retirement witness; the two crc columns cross-check (a perfect copy makes `dst_crc==src_crc`).
+// THE TWO WITNESSES ARE INDEPENDENT AND EACH SPEAKS ALONE. A run that copies all 256 dwords is a
+// 2D positive whether or not the sentinel store lands, and vice versa; the classification chain
+// gives each combination its own name so the `next=` line can point at the right suspect. (It did
+// not, before this arc: every copy arm was conditioned on `sentinel_hit`, so `copy_full` with a
+// silent store was reported as `r7-sentinel-miss` — a blit failure — while `best_dst_match=256/256`
+// sat on the same summary line.)
 //
-// Safety is R6's, not one inch wider: the Dark branch writes nothing; no display register is
-// touched; the GGTT claim only enters an all-zero or R4b-confirmed-scratch-fill window with both
-// bracketing neighbours smear-checked; every write (the forcewake request, the four BCS ring
-// registers — restored only once the ring is CONFIRMED disabled, §1.1.11.2 p.76 — the five GGTT
-// slots, and the one GTT-flush register) is captured, restored and re-read on every exit path;
-// and the PTEs are NEVER unmapped under a live ring — if BCS RING_CTL will not clear, R7 leaves
-// them claimed, leaks the three pages, and parks loud.
+// Safety is R6's, not one inch wider — and one inch STRICTER in the one place R6's shape does not
+// carry over. The Dark branch writes nothing; no display register is touched; the GGTT claim only
+// enters an all-zero or R4b-confirmed-scratch-fill window with both bracketing neighbours
+// smear-checked; every write (the forcewake request, the four BCS ring registers — restored only
+// once the ring is CONFIRMED disabled, §1.1.11.2 p.76 — the five GGTT slots, and the one GTT-flush
+// register) is captured, restored and re-read on every exit path.
+//
+// THE STRICTER INCH — the unmap/free gate. R6's ring held a single 4-byte MI_STORE_DATA_IMM, so
+// "the enable bit read back clear" was a serviceable stand-in for "the engine is done". R7's ring
+// holds a 1 KiB engine-side DMA write into `dst_page`, and the stand-in stops holding: clearing
+// RING_CTL bit 0 stops the command streamer FETCHING, it does not retire a transfer already handed
+// to the engine. So both the GGTT unmap and the page free are gated on `r7_engine_quiesced` —
+// RING_CTL clear AND every armed candidate's ring drained to HEAD==TAIL (§1.1.11.4 p.78's clean
+// point) inside DRAIN_BUDGET_CYC. If either leg fails, R7 does the opposite of unmap: it leaves the
+// PTEs claimed, leaks the three pages, and parks loud on `r7-ring-would-not-disable` or
+// `r7-ring-drain-timeout`. On the un-armed path — the expected outcome on this part — the drain leg
+// is vacuously true and nothing that used to reclaim stops reclaiming.
 
 /// R7's destination GGTT slot — one above R5's target (which R7 reuses as the copy source).
 /// GGTT 0x10002000. [EXT-UNPINNED base] as the R5/R6 window carries it.
@@ -4531,14 +4547,52 @@ const R7_SENTINEL: u32 = 0x0B75_C0DE;
 /// The destination sentinel-slot seed, re-written before every candidate's arm.
 const R7_DST_SENTINEL_SEED: u32 = 0xDA7A_5EED;
 
+// ===== R7-TEARDOWN-GATE-BEGIN =====================================================
+// The three predicates that decide whether R7's scratch pages may be unmapped from the GGTT and
+// handed back to the allocator. Lifted out of `blit()` as `const fn`s for one reason: they are
+// the only thing standing between a live DMA engine and reused kernel heap, and pure functions
+// can be driven with a forced drain timeout OUTSIDE the kernel. `tools/` carries no harness for
+// this; the region between these two markers is extracted verbatim by the go-red check recorded
+// in `docs/dev/OS/08_VIDEO/gen7.md` §R7, so the thing proven is this source, not a paraphrase.
+
+/// The engine is quiesced: its enable bit read back clear AND every armed candidate's ring
+/// reached HEAD==TAIL (§1.1.11.4 p.78's clean point) inside the drain budget.
+///
+/// `all_disabled` alone is NOT this property. Clearing `RING_CTL` bit 0 stops the command
+/// streamer FETCHING; it says nothing about a transfer already handed to the engine — and R7's
+/// ring carries a 1 KiB engine-side DMA write into `dst_page`. Both legs, or neither.
+const fn r7_engine_quiesced(all_disabled: bool, all_ring_idle: bool) -> bool {
+    all_disabled && all_ring_idle
+}
+
+/// Every write R7 made has been put back and proven put back — under a quiesced engine.
+const fn r7_reversal_clean(
+    engine_quiesced: bool,
+    ptes_restored: bool,
+    smear_post: bool,
+    all_regs_restored: bool,
+) -> bool {
+    engine_quiesced && ptes_restored && !smear_post && all_regs_restored
+}
+
+/// The pages may go back to the heap. `reversal_clean` is necessary but not sufficient: the GT
+/// must additionally be known to hold no cached translation to them, either because no engine
+/// access was ever issued (`never_fetched`, a structural proof) or because the GTT flush register
+/// visibly decoded (`flush_positive`, [EXT-UNPINNED] and therefore never the sole reason).
+const fn r7_reclaim(reversal_clean: bool, never_fetched: bool, flush_positive: bool) -> bool {
+    reversal_clean && (never_fetched || flush_positive)
+}
+// ===== R7-TEARDOWN-GATE-END =======================================================
+
 /// Is battery row `i` one of the four BCS submission registers R7 itself writes?
 fn r7_writes_row(i: usize) -> bool {
     let (blk, name, _, _) = GT_BATTERY[i];
     blk == "bcs" && matches!(name, "RING_CTL" | "RING_HEAD" | "RING_TAIL" | "RING_START")
 }
 
-/// GEN7 rung R7 — hold a forcewake candidate across a BCS ring arm, submit an XY_SRC_COPY_BLT +
-/// MI_STORE_DATA_IMM, verify the pixel copy and the retirement, then reclaim the scratch pages.
+/// GEN7 rung R7 — hold a forcewake candidate across a BCS ring arm, submit an XY_SRC_COPY_BLT,
+/// an MI_FLUSH_DW barrier and an MI_STORE_DATA_IMM, verify the pixel copy and the retirement as
+/// two independent witnesses, then reclaim the scratch pages — but only behind a quiesced engine.
 ///
 /// Called from `igpu::init` immediately after `rearm` (R6) and still BEFORE `bring_up_blt_ring`,
 /// taking R3's `GtWake` verdict so it self-gates on the same `write_ok()` evidence R4/R5/R6 use.
@@ -4831,9 +4885,36 @@ pub unsafe fn blit(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, w
     const RECT_WH: u32 = (16 << 16) | 16; // X2Y2 = (bottom<<16)|right, 16x16
     const RECT_00: u32 = 0; // X1Y1 = top-left (0,0)
     // MI_STORE_DATA_IMM reuses the R5/R6 header const (§1.2.17 p.186, IVB-PINNED).
+    //
+    // ⚠ [EXT-UNPINNED -> pin-before-flight vs IVB PRM Vol1 Part3 "MI_FLUSH_DW"]. THE ORDERING
+    //    BARRIER (G2). R6's ring held ONE command, so retirement and effect were the same event.
+    //    R7's ring holds two, and the second is the witness for the first: without a flush between
+    //    XY_SRC_COPY_BLT and MI_STORE_DATA_IMM nothing in the architecture stops the sentinel store
+    //    retiring while the 1 KiB copy is still in the engine's write pipeline. That would make a
+    //    `dst_match` short of 256 read identically to a wrong BR00/BR13 field — destroying the ONE
+    //    discrimination this rung exists to make, and pointing the reader's `next=` line at the
+    //    wrong suspect. So the flush goes in.
+    //    What IS pinned is the MI *header format* (§1.2.17 p.186, quoted above): Command
+    //    Type[31:29]=0, MI Command Opcode[28:23], DWord Length[9:0] = "Total Length - 2". What is
+    //    NOT pinned is MI_FLUSH_DW's OPCODE and its TOTAL LENGTH — the module holds no extract of
+    //    that section, and this rung does not take them from Linux `i915` or Mesa `i965` (the §0
+    //    clean-room line). They are carried as two NAMED hypotheses on exactly the same footing as
+    //    BR00/BR13, and `gen7.md` lists them under "still unpinned". No post-sync operation is
+    //    requested: DW1..DW3 are zero, because the sentinel store is already the retirement
+    //    witness and a second one would only add a second unpinned field.
+    //    METAL WATCH: a wrong TOTAL length here mis-frames the store that follows it, so R7 would
+    //    come back `r7-head-stuck`/`r7-sentinel-miss` where R6 (same ring, same hold, one command)
+    //    came back `r6-sentinel-hit`. That delta — R6 hits, R7 does not — is the signature of the
+    //    flush encoding, NOT of the 2D block, and is the first thing to suspect on the boot.
+    const MI_FLUSH_DW_OPCODE: u32 = 0x26; // EXT-UNPINNED
+    const MI_FLUSH_DW_TOTAL_DW: u32 = 4; // EXT-UNPINNED — DW0 header, DW1 addr, DW2/3 imm QWord
+    const MI_FLUSH_DW_DW0: u32 = (0x0 << 29) | (MI_FLUSH_DW_OPCODE << 23) | (MI_FLUSH_DW_TOTAL_DW - 2);
     // Sentinel destination GGTT address: dst base + 0x800, well clear of the 1 KiB copied rect.
     let sentinel_gtt_addr = dst_gtt_addr + 0x800;
-    // Ring tail: XY_SRC_COPY_BLT (8 DW) + MI_STORE_DATA_IMM (4 DW) + 4 MI_NOOP pad = 16 DW = 64 B.
+    // Ring tail: XY_SRC_COPY_BLT (8 DW) + MI_FLUSH_DW (4 DW) + MI_STORE_DATA_IMM (4 DW) = 16 DW
+    // = 64 B. UNCHANGED from the pre-flush layout: the flush lands exactly in the four MI_NOOP
+    // dwords that used to pad DW12..15, so the tail stays QWord-aligned (§1.1.11.1 p.75) and the
+    // 64-byte figure below needs no re-derivation.
     const RING_TAIL_BYTES: u32 = 0x40;
 
     // The seed pattern the copy must reproduce, and the pre-blit dst pattern the copy must erase.
@@ -4854,12 +4935,19 @@ pub unsafe fn blit(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, w
     core::ptr::write_volatile(ring_u32.add(5), RECT_00); // src X1Y1
     core::ptr::write_volatile(ring_u32.add(6), SRC_PITCH); // src pitch
     core::ptr::write_volatile(ring_u32.add(7), src_gtt_addr); // src base
-    // MI_STORE_DATA_IMM — 4 DWords.
-    core::ptr::write_volatile(ring_u32.add(8), MI_STORE_DATA_IMM_DW0);
+    // MI_FLUSH_DW — 4 DWords. THE BARRIER (G2): the copy above must be at its destination before
+    // the store below can retire, or the sentinel stops being a witness for the copy. DW1..DW3 = 0
+    // (no post-sync operation, no address).
+    core::ptr::write_volatile(ring_u32.add(8), MI_FLUSH_DW_DW0);
     core::ptr::write_volatile(ring_u32.add(9), 0x0000_0000);
-    core::ptr::write_volatile(ring_u32.add(10), sentinel_gtt_addr);
-    core::ptr::write_volatile(ring_u32.add(11), R7_SENTINEL);
-    // DW12..15 stay MI_NOOP (already written above). Tail lands on a 64-byte boundary.
+    core::ptr::write_volatile(ring_u32.add(10), 0x0000_0000);
+    core::ptr::write_volatile(ring_u32.add(11), 0x0000_0000);
+    // MI_STORE_DATA_IMM — 4 DWords, now AFTER the barrier.
+    core::ptr::write_volatile(ring_u32.add(12), MI_STORE_DATA_IMM_DW0);
+    core::ptr::write_volatile(ring_u32.add(13), 0x0000_0000);
+    core::ptr::write_volatile(ring_u32.add(14), sentinel_gtt_addr);
+    core::ptr::write_volatile(ring_u32.add(15), R7_SENTINEL);
+    // DW16.. stay MI_NOOP (already written above). Tail lands on the same 64-byte boundary.
     let _ = DST_PITCH; // BR13 already carries the dest pitch; kept for the reader's arithmetic.
     let src_u32 = src_page as *mut u32;
     let dst_u32 = dst_page as *mut u32;
@@ -4891,6 +4979,12 @@ pub unsafe fn blit(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, w
     let mut any_sentinel = false;
     let mut any_copy = false;
     let mut all_disabled = true;
+    // G1: every armed candidate's ring drained to its clean point (HEAD==TAIL) inside
+    // DRAIN_BUDGET_CYC. Distinct from `all_disabled`, which only says the enable bit read back
+    // clear. R7's ring carries a 1 KiB engine-side DMA write into `dst_page`; clearing an enable
+    // bit is not a statement about a transfer already in flight, so this — not `all_disabled` —
+    // is what may authorise unmapping the PTE or handing the page back to the allocator.
+    let mut all_ring_idle = true;
     let mut all_regs_restored = true;
     let mut all_fw_restored = true;
     let mut fw_evidence_any = false;
@@ -4978,48 +5072,93 @@ pub unsafe fn blit(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, w
                 sentinel_post = core::ptr::read_volatile(dst_u32.add(sentinel_slot) as *const u32);
             }
             let head_moved = armed && head_post != head_at_arm;
-            let sentinel_hit = sentinel_post == R7_SENTINEL;
+            let sentinel_hit_exec = sentinel_post == R7_SENTINEL;
 
             // The pixel witness: how many of the 256 dst dwords equal the source seed, plus the
-            // two crc columns (a perfect copy makes dst_crc == src_crc).
-            let mut dst_match = 0u32;
-            let mut dst_crc = 0u32;
-            let mut src_crc = 0u32;
-            for i in 0..256usize {
-                let d = core::ptr::read_volatile(dst_u32.add(i) as *const u32);
-                let s = core::ptr::read_volatile(src_u32.add(i) as *const u32);
-                if d == src_seed(i) {
-                    dst_match += 1;
+            // two crc columns (a perfect copy makes dst_crc == src_crc). Sampled here at the exec
+            // poll's exit and AGAIN after the drain below — see `pixel_witness`.
+            let pixel_witness = || -> (u32, u32, u32) {
+                let mut m = 0u32;
+                let mut dc = 0u32;
+                let mut sc = 0u32;
+                for i in 0..256usize {
+                    let d = core::ptr::read_volatile(dst_u32.add(i) as *const u32);
+                    let s = core::ptr::read_volatile(src_u32.add(i) as *const u32);
+                    if d == src_seed(i) {
+                        m += 1;
+                    }
+                    dc = dc.rotate_left(1) ^ d;
+                    sc = sc.rotate_left(1) ^ s;
                 }
-                dst_crc = dst_crc.rotate_left(1) ^ d;
-                src_crc = src_crc.rotate_left(1) ^ s;
-            }
-            let copy_full = dst_match == 256;
+                (m, dc, sc)
+            };
+            let (dst_match_exec, dst_crc_exec, src_crc) = pixel_witness();
 
-            // THE witness line the brief names.
+            // THE witness line the brief names. `col=exec` — this is the sample taken the instant
+            // the exec poll exited, BEFORE the ring was drained. It is the earliest reading, not
+            // the settled one; the `col=drain` line below carries the settled one.
             serial_println!(
-                ":: gen7: r7 cand={} class={} ctl_wrote={:08X} ctl_readback={:08X} ctl_enabled={} head_at_arm={:08X} head_post={:08X} head_moved={} tail={:08X} sentinel_seed={:08X} sentinel_post={:08X} sentinel_hit={} dst_match={}/256 dst_crc={:08X} src_crc={:08X} armed={} iters={} cyc={} budget={} ::",
+                ":: gen7: r7 cand={} class={} col=exec ctl_wrote={:08X} ctl_readback={:08X} ctl_enabled={} head_at_arm={:08X} head_post={:08X} head_moved={} tail={:08X} sentinel_seed={:08X} sentinel_post={:08X} sentinel_hit={} dst_match={}/256 dst_crc={:08X} src_crc={:08X} armed={} iters={} cyc={} budget={} ::",
                 cand, class_pin,
                 RCS_RING_CTL_1PAGE_EN, ctl_readback, ctl_readback & 1,
                 head_at_arm, head_post,
                 if head_moved { 1 } else { 0 },
                 RING_TAIL_BYTES, sentinel_seed_rb, sentinel_post,
-                if sentinel_hit { 1 } else { 0 },
-                dst_match, dst_crc, src_crc,
+                if sentinel_hit_exec { 1 } else { 0 },
+                dst_match_exec, dst_crc_exec, src_crc,
                 if armed { 1 } else { 0 },
                 iters, cyc, EXEC_BUDGET_CYC
             );
 
             // (6) TEARDOWN — STILL UNDER THE HOLD.
+            //
+            // `ring_idle` is the drain witness: HEAD reached TAIL within DRAIN_BUDGET_CYC, the
+            // clean point of §1.1.11.4 p.78. It starts `true` and stays `true` on the un-armed
+            // path, which is correct — an engine that never had its enable latched never fetched
+            // anything and has nothing to drain. When the enable DID latch, `ring_idle=false` is
+            // the engine telling us it is still parsing, and G1 makes that answer load-bearing:
+            // it now rides out of the loop in `all_ring_idle` and gates BOTH the GGTT unmap and
+            // the page free. Before G1 it reached only the log line below.
             let mut ring_idle = true;
             let mut drain_iters = 0u32;
+            let mut drain_cyc = 0u64;
             if armed {
-                let (idle, it, _cy) = poll_cycles(DRAIN_BUDGET_CYC, || {
+                let (idle, it, cy) = poll_cycles(DRAIN_BUDGET_CYC, || {
                     (rd(bar0, g7regs::BCS_RING_HEAD) & RING_HEAD_OFF_MASK) == RING_TAIL_BYTES
                 });
                 ring_idle = idle;
                 drain_iters = it;
+                drain_cyc = cy;
             }
+
+            // THE SETTLED PIXEL WITNESS (G2's second half). The `col=exec` sample above was taken
+            // the instant the exec poll exited; this one is taken after the drain, so on a drained
+            // ring it is the reading that cannot be short merely because the engine had not
+            // finished. The pair is the discriminator: `col=exec` short and `col=drain` at 256
+            // means "we looked too early"; BOTH short on a drained ring means the copy really did
+            // not land and the BR00/BR13 encoding is the suspect. This is also the leg that keeps
+            // the discrimination alive if the [EXT-UNPINNED] MI_FLUSH_DW above turns out to carry
+            // the wrong opcode or length — it depends on no encoding at all, only on HEAD==TAIL.
+            clflush_range(dst_page as usize, 4096);
+            let sentinel_drain = core::ptr::read_volatile(dst_u32.add(sentinel_slot) as *const u32);
+            let sentinel_hit = sentinel_drain == R7_SENTINEL;
+            let (dst_match, dst_crc, _src_crc_drain) = pixel_witness();
+            let copy_full = dst_match == 256;
+            serial_println!(
+                ":: gen7: r7 cand={} col=drain ring_idle={} drain_iters={} drain_cyc={} budget={} head_drain={:08X} tail={:08X} sentinel_drain={:08X} sentinel_hit={} dst_match={}/256 dst_crc={:08X} exec_sentinel_hit={} exec_dst_match={}/256 settled={} ::",
+                cand,
+                if ring_idle { 1 } else { 0 },
+                drain_iters, drain_cyc, DRAIN_BUDGET_CYC,
+                rd(bar0, g7regs::BCS_RING_HEAD) & RING_HEAD_OFF_MASK,
+                RING_TAIL_BYTES,
+                sentinel_drain,
+                if sentinel_hit { 1 } else { 0 },
+                dst_match, dst_crc,
+                if sentinel_hit_exec { 1 } else { 0 },
+                dst_match_exec,
+                if dst_match != dst_match_exec || sentinel_hit != sentinel_hit_exec { 0 } else { 1 }
+            );
+
             wr(bar0, g7regs::BCS_RING_CTL, 0);
             let ctl_off = rd(bar0, g7regs::BCS_RING_CTL);
             let ring_disabled = ctl_off & 1 == 0;
@@ -5055,6 +5194,10 @@ pub unsafe fn blit(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, w
             let (fw_restored, fw_evidence) = fw_release(bar0, "r7", &hold);
 
             all_disabled &= ring_disabled;
+            // G1: the drain answer leaves the loop. `ring_disabled` says THE ENABLE BIT IS CLEAR;
+            // `all_ring_idle` says THE ENGINE REACHED ITS CLEAN POINT. Only the second one is a
+            // statement about DMA in flight, and only the second one may authorise a free.
+            all_ring_idle &= ring_idle;
             all_regs_restored &= regs_restored || !ring_disabled;
             all_fw_restored &= fw_restored;
             fw_evidence_any |= fw_evidence;
@@ -5069,14 +5212,38 @@ pub unsafe fn blit(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, w
                 best_dst_match = dst_match;
             }
 
+            // G3: THE PIXEL WITNESS SPEAKS FIRST, AND IT SPEAKS WITHOUT PERMISSION FROM THE
+            // RETIREMENT WITNESS. The old chain conditioned every copy arm on `sentinel_hit`, so
+            // a run that copied all 256 dwords but whose MI_STORE_DATA_IMM never took effect fell
+            // straight through to "sentinel-miss" — reported as a failure of the blit while
+            // `best_dst_match=256/256` sat on the very same summary line. Two independent
+            // witnesses, and each one now gets its own arm:
+            //   * the COPY witness  — `dst_match` out of 256, settled after the drain;
+            //   * the RETIRE witness — `sentinel_hit`, the store landing;
+            //   * the HEAD witness   — `head_post == RING_TAIL_BYTES`.
+            // The arms are ordered strongest-first and the names say which witness was silent, so
+            // the `next=` line can name the right suspect instead of the nearest one.
             let this = if !armed {
                 "enable-void"
-            } else if sentinel_hit && copy_full && head_post == RING_TAIL_BYTES {
+            } else if copy_full && sentinel_hit && head_post == RING_TAIL_BYTES {
                 "blit-verified"
-            } else if sentinel_hit && copy_full {
+            } else if copy_full && sentinel_hit {
+                // Copy and store BOTH landed; only the head never retired. R6 kept this distinct
+                // (`r6-sentinel-hit-head-stuck`) and R7 collapsed it into `r7-blit-partial` —
+                // which pointed the reader at the 2D encoding when the 2D encoding had just been
+                // proven correct 256 dwords over. Restored here as its own verdict.
                 "blit-verified-head-stuck"
-            } else if sentinel_hit && dst_match > 0 {
+            } else if copy_full {
+                // ALL 256 dwords copied and the store did NOT land. Nothing is wrong with BR00 or
+                // BR13; the suspect is MI_STORE_DATA_IMM's privilege/address, or the ordering
+                // barrier ahead of it. This arm is the one G3 was missing entirely.
+                "blit-full-sentinel-miss"
+            } else if dst_match > 0 && sentinel_hit {
                 "blit-partial"
+            } else if dst_match > 0 {
+                // Same asymmetry one rung down: pixels moved, the store did not. Still a 2D-parse
+                // positive, and not a `sentinel-miss` about which nothing else can be said.
+                "blit-partial-sentinel-miss"
             } else if sentinel_hit {
                 "sentinel-hit-no-copy"
             } else if head_post == RING_TAIL_BYTES {
@@ -5103,8 +5270,12 @@ pub unsafe fn blit(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, w
                 winner = cand;
                 exec_verdict = match this {
                     "blit-verified" => "r7-blit-verified",
-                    "blit-verified-head-stuck" => "r7-blit-partial",
-                    "blit-partial" | "sentinel-hit-no-copy" => "r7-blit-partial",
+                    // G3: no longer collapsed into `r7-blit-partial` — R6's distinction restored.
+                    "blit-verified-head-stuck" => "r7-blit-verified-head-stuck",
+                    "blit-full-sentinel-miss" => "r7-blit-full-sentinel-miss",
+                    "blit-partial" | "blit-partial-sentinel-miss" | "sentinel-hit-no-copy" => {
+                        "r7-blit-partial"
+                    }
                     "sentinel-miss" => "r7-sentinel-miss",
                     "head-stuck-partial" => "r7-head-stuck-partial",
                     _ => "r7-head-stuck",
@@ -5120,9 +5291,27 @@ pub unsafe fn blit(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, w
     }
 
     // ---- The GGTT restore. NEVER under a live ring. -----------------------------------
+    //
+    // G1 — THE GATE THIS BLOCK ALWAYS MEANT TO CARRY. Its own SKIPPED note has stated the rule
+    // since R6: "unmapping a page a live engine may DMA is the corruption this rung avoids." The
+    // predicate did not implement that rule. `all_disabled` is `RING_CTL & 1 == 0` read back —
+    // THE ENABLE BIT IS CLEAR, which is a statement about the command streamer's fetch, not about
+    // a transfer already handed to the engine. R6 could live with the elision because its ring
+    // held one 4-byte MI_STORE_DATA_IMM. R7's ring holds XY_SRC_COPY_BLT: a 1 KiB engine-side DMA
+    // write into `dst_page`. Between "stop fetching" and "the last byte has landed" there is a
+    // window, and unmapping the destination PTE inside it aims that write at whatever the GGTT
+    // slot resolves to next.
+    //
+    // `all_ring_idle` is the missing half, and it cost nothing to obtain: the bounded drain poll
+    // that produces it already ran, per candidate, under the hold — before G1 its answer reached
+    // nothing but a log line. HEAD==TAIL is §1.1.11.4 p.78's clean point, the engine's own
+    // statement that it retired everything we gave it. Requiring both is strictly stronger than
+    // either, and on the un-armed path (the expected outcome on this part) `all_ring_idle` is
+    // vacuously true, so nothing that used to reclaim stops reclaiming.
+    let engine_quiesced = r7_engine_quiesced(all_disabled, all_ring_idle);
     let mut ptes_restored = false;
     let mut smear_post = false;
-    if all_disabled {
+    if engine_quiesced {
         wr(bar0, prev_off_g, base_img);
         wr(bar0, ring_off, base_img);
         wr(bar0, src_off, base_img);
@@ -5147,7 +5336,10 @@ pub unsafe fn blit(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, w
         );
     } else {
         serial_println!(
-            ":: gen7: r7 ggtt-restore SKIPPED note=a-candidate-left-the-ring-enabled-PTEs-LEFT-CLAIMED-unmapping-a-page-a-live-engine-may-DMA-is-the-corruption-this-rung-avoids ::"
+            ":: gen7: r7 ggtt-restore SKIPPED all_disabled={} all_ring_idle={} why={} note=PTEs-LEFT-CLAIMED-unmapping-a-page-a-live-engine-may-DMA-is-the-corruption-this-rung-avoids ::",
+            if all_disabled { 1 } else { 0 },
+            if all_ring_idle { 1 } else { 0 },
+            if !all_disabled { "ring-would-not-disable" } else { "drain-timed-out-engine-may-still-be-writing-dst_page" }
         );
     }
 
@@ -5172,9 +5364,17 @@ pub unsafe fn blit(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, w
     // issued through any of the three GGTT addresses — so there is no cached translation to
     // outlive the free, and the reclaim rests on a proof rather than on an unpinned register.
     let never_fetched = !any_ctl_enabled && !any_head_moved && !any_sentinel && !any_copy;
-    let reversal_clean = all_disabled && ptes_restored && !smear_post && all_regs_restored;
-    let reclaim = reversal_clean && (never_fetched || flush_positive);
-    let reclaim_reason = if !reversal_clean {
+    // G1: `engine_quiesced`, not `all_disabled`. Two independent barriers now stand between a
+    // non-idle engine and `dealloc`: this one directly, and `ptes_restored` — which is false
+    // whenever the GGTT restore above was skipped for the same reason. A drain timeout therefore
+    // yields `reclaim=leaked reclaim_reason=reversal-not-clean` and the pages stay out of the
+    // allocator's hands for the life of the boot. Leaking 12 KiB once is the cheap failure; a
+    // 1 KiB DMA write into re-issued heap is not.
+    let reversal_clean = r7_reversal_clean(engine_quiesced, ptes_restored, smear_post, all_regs_restored);
+    let reclaim = r7_reclaim(reversal_clean, never_fetched, flush_positive);
+    let reclaim_reason = if !engine_quiesced {
+        if !all_disabled { "ring-would-not-disable" } else { "drain-timed-out" }
+    } else if !reversal_clean {
         "reversal-not-clean"
     } else if never_fetched {
         "never-fetched"
@@ -5184,7 +5384,7 @@ pub unsafe fn blit(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, w
         "no-invalidation-evidence"
     };
     serial_println!(
-        ":: gen7: r7 tlb verdict={} off={:06X} pin=EXT-UNPINNED pre={:08X} wrote={:08X} post={:08X} restored_to={:08X} restore_ok={} flush_positive={} never_fetched={} reversal_clean={} reclaim={} reclaim_reason={} pages=3 note=an-unpinned-register-is-never-the-sole-reason-a-page-goes-back-to-the-heap ::",
+        ":: gen7: r7 tlb verdict={} off={:06X} pin=EXT-UNPINNED pre={:08X} wrote={:08X} post={:08X} restored_to={:08X} restore_ok={} flush_positive={} never_fetched={} all_ring_idle={} engine_quiesced={} reversal_clean={} reclaim={} reclaim_reason={} pages=3 note=an-unpinned-register-is-never-the-sole-reason-a-page-goes-back-to-the-heap-and-a-non-idle-engine-is-never-a-reason-at-all ::",
         tlb_verdict,
         g7regs::HYP_GFX_FLSH_CNTL,
         flsh_pre,
@@ -5194,6 +5394,8 @@ pub unsafe fn blit(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, w
         if flsh_restored { 1 } else { 0 },
         if flush_positive { 1 } else { 0 },
         if never_fetched { 1 } else { 0 },
+        if all_ring_idle { 1 } else { 0 },
+        if engine_quiesced { 1 } else { 0 },
         if reversal_clean { 1 } else { 0 },
         if reclaim { "freed" } else { "leaked" },
         reclaim_reason
@@ -5244,17 +5446,40 @@ pub unsafe fn blit(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, w
     //                                   documented register on this part.
     //  r7-blit-verified                 THE WIN. The enable latched, the CS parsed XY_SRC_COPY_BLT,
     //                                   all 256 dwords copied, and the sentinel store retired.
-    //  r7-blit-partial                  the copy ran but not every dword landed (or the head did
-    //                                   not fully retire) — the CS parses 2D but something in the
-    //                                   encoding/coherency is off; pin the BR00/BR13 fields.
-    //  r7-sentinel-miss                 the head retired without the sentinel store taking effect.
+    //  r7-blit-verified-head-stuck      copy AND store both landed; only the head never reached
+    //                                   TAIL. The 2D block is PROVEN by 256 dwords — the suspect
+    //                                   is retirement, not the encoding. (G3: this used to be
+    //                                   reported as r7-blit-partial, which named the wrong one.)
+    //  r7-blit-full-sentinel-miss       all 256 dwords copied and the store did NOT land. Also a
+    //                                   2D positive; the suspect is MI_STORE_DATA_IMM or the
+    //                                   ordering barrier ahead of it. (G3: this reading had no
+    //                                   arm at all and fell through to r7-sentinel-miss.)
+    //  r7-blit-partial                  the copy ran but not every dword landed — the CS parses 2D
+    //                                   but something in the encoding/coherency is off; pin the
+    //                                   BR00/BR13 fields.
+    //  r7-sentinel-miss                 the head retired, NO pixel moved, and no store landed.
     //  r7-head-stuck / -partial         the enable latched but the CS did not parse the ring.
-    //  r7-ring-would-not-disable        SAFETY: the PTEs are left claimed under a possibly-live
-    //                                   engine. Overrides every exec reading.
-    let safety_override = !all_disabled;
+    //  r7-ring-would-not-disable        SAFETY: BCS RING_CTL bit 0 would not clear. The PTEs are
+    //                                   left claimed and the pages leaked. Overrides every reading.
+    //  r7-ring-drain-timeout            SAFETY (G1): the enable cleared but the ring never reached
+    //                                   HEAD==TAIL inside DRAIN_BUDGET_CYC, so the engine may still
+    //                                   be mid-DMA into dst_page. Same treatment: PTEs left
+    //                                   claimed, pages leaked, and it overrides every exec reading.
+    //                                   Before G1 this state was invisible and freed the pages.
+    // The safety override is now two-valued, because there are two ways the engine can fail to be
+    // provably quiesced and they call for different reading. `None` = quiesced, the exec verdict
+    // stands.
+    let safety_override: Option<&str> = if !all_disabled {
+        Some("r7-ring-would-not-disable")
+    } else if !all_ring_idle {
+        Some("r7-ring-drain-timeout")
+    } else {
+        debug_assert!(engine_quiesced);
+        None
+    };
     serial_println!(
-        ":: gen7: r7 verdict={} by={} mode={} wake={} engine=BCS attempts={}/{} any_ctl_enabled={} best_ctl_readback={:08X} any_head_moved={} any_sentinel={} any_copy={} best_dst_match={}/256 battery_moved={}/{} fw_restored={} fw_evidence={} ring_regs_restored={} ptes_restored={} smear_post={} reclaim={} tlb={} rung=R7 note=hold-was-kept-ACROSS-the-arm-and-the-teardown-no-display-register-touched ::",
-        if safety_override { "r7-ring-would-not-disable" } else { exec_verdict },
+        ":: gen7: r7 verdict={} by={} mode={} wake={} engine=BCS attempts={}/{} any_ctl_enabled={} best_ctl_readback={:08X} any_head_moved={} any_sentinel={} any_copy={} best_dst_match={}/256 battery_moved={}/{} fw_restored={} fw_evidence={} ring_regs_restored={} all_disabled={} all_ring_idle={} ptes_restored={} smear_post={} reclaim={} tlb={} rung=R7 note=hold-was-kept-ACROSS-the-arm-and-the-teardown-no-display-register-touched ::",
+        match safety_override { Some(v) => v, None => exec_verdict },
         winner, mode, wake.name(),
         attempts, R6_CANDS.len(),
         if any_ctl_enabled { 1 } else { 0 },
@@ -5267,22 +5492,32 @@ pub unsafe fn blit(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, w
         if all_fw_restored { 1 } else { 0 },
         if fw_evidence_any { "real" } else { "blind" },
         if all_regs_restored { 1 } else { 0 },
+        if all_disabled { 1 } else { 0 },
+        if all_ring_idle { 1 } else { 0 },
         if ptes_restored { 1 } else { 0 },
         if smear_post { 1 } else { 0 },
         if reclaim { "freed" } else { "leaked" },
         tlb_verdict
     );
 
-    let next = if safety_override {
-        "STOP-ring-would-not-disable-PTEs-LEFT-CLAIMED-under-a-live-ring-do-NOT-reuse-these-pages"
+    let next = if let Some(sv) = safety_override {
+        if sv == "r7-ring-would-not-disable" {
+            "STOP-ring-would-not-disable-PTEs-LEFT-CLAIMED-under-a-live-ring-do-NOT-reuse-these-pages"
+        } else {
+            "STOP-ring-disabled-but-HEAD-never-reached-TAIL-engine-may-be-mid-DMA-into-dst_page-PTEs-LEFT-CLAIMED-pages-LEAKED-do-NOT-reuse-them"
+        }
     } else {
         match exec_verdict {
             "r7-blit-verified" =>
                 "DONE-the-BCS-copies-pixels-under-a-held-wake-wire-bring_up_blt_ring-to-the-held-wake-and-fix-blitter_copy_rect-DW0-client-field",
+            "r7-blit-verified-head-stuck" =>
+                "STOP-copy-AND-store-both-landed-but-HEAD-never-reached-TAIL-suspect-retirement-or-the-HEAD-readback-NOT-the-2D-encoding-which-256-dwords-just-proved",
+            "r7-blit-full-sentinel-miss" =>
+                "STOP-all-256-dwords-copied-but-the-store-did-not-retire-suspect-MI_STORE_DATA_IMM-privilege-address-or-the-EXT-UNPINNED-MI_FLUSH_DW-ahead-of-it-NOT-BR00-BR13",
             "r7-blit-partial" =>
-                "STOP-2D-parses-but-copy-incomplete-pin-BR00-BR13-fields-vs-IVB-PRM-Vol1-Part5-before-any-further-blit-work",
+                "STOP-2D-parses-but-copy-incomplete-compare-col=exec-and-col=drain-dst_match-then-pin-BR00-BR13-fields-vs-IVB-PRM-Vol1-Part5-before-any-further-blit-work",
             "r7-sentinel-miss" =>
-                "STOP-head-retired-but-no-store-check-privilege-and-MI_STORE_DATA_IMM-address-encoding",
+                "STOP-head-retired-no-pixel-moved-no-store-landed-check-privilege-and-MI_STORE_DATA_IMM-address-encoding",
             "r7-head-stuck" | "r7-head-stuck-partial" =>
                 "STOP-BCS-enable-latches-but-CS-does-not-parse-the-ring-needs-a-default-blit-context-per-1.1.11.4-p79",
             "r7-claim-write-void" =>
