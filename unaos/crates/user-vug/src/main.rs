@@ -2449,6 +2449,12 @@ fn say(label: &[u8], v: u32) {
 /// now, and the trims this note and the ones on `input_wait` / `wheel_zoom` record were all bought
 /// against the OLD line. aarch64 keeps the `0x2000` budget: user-vug.ld is deliberately unchanged,
 /// that arch fits with room, and its VUG.ELF is byte-identical across VUGSHRINK.
+///
+/// WINX-8 is what made the `0x3000` line HONEST: text past `0x2000` turns page 2 RO+X, and worker A's
+/// UVUG-1 stack top of `base+0x3000` descended straight through it — a ring-3 kill on the first frame
+/// write that the old 16 KiB file cliff used to mask as a build failure. Worker A's x86 stack now tops
+/// at the window end instead (see the spawn-site carve note), and `user-vug-x86.ld` ASSERTs both page
+/// contracts at link time, so this budget can be spent without re-deriving the window map.
 fn emit(label: &[u8], v: u32, tail: &[u8]) {
     let mut b = Buf::new();
     b.put(label);
@@ -2673,7 +2679,18 @@ impl Buf {
 #[no_mangle]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
+    #[cfg(target_arch = "aarch64")]
     let base = _start as *const () as u64; // the window base B (entry VA == base, e_entry offset 0)
+    // WINX-8: on x86 the line above went stale the day VUGSHRINK shipped. `FILEHDR PHDRS` claims file
+    // AND vaddr [0, 0xb0) for the ELF headers, so `_start` sits at e_entry 0xb0 — its address is the
+    // window base PLUS 0xb0, not the window base. Every landmark computed off `base` was silently
+    // +0xb0-skewed: the info-page flags word was read 0xb0 into the wrong bytes, both worker stack
+    // tops shifted, and the parent's surface blit started at window+0x50b0 and crossed the mapping
+    // end at exactly window+0x56000 — the second corpse in rmbp's WINX-8 report. Subtract the header
+    // size; `user-vug-x86.ld` ASSERTs `_start == SIZEOF_HEADERS` so this constant cannot rot silently
+    // if the header count ever changes.
+    #[cfg(target_arch = "x86_64")]
+    let base = (_start as *const () as u64) - 0xb0;
 
     // WC-C: create a 128x128 WINDOW instead of mapping the 32x32 compat surface. `SYS_WIN_CREATE`
     // returns the window ID (>= 0) and maps the negotiated 16-page surface slot; the surface VA is the
@@ -2714,7 +2731,22 @@ pub extern "C" fn _start() -> ! {
     let surf = surf_va as *mut u8;
 
     // Spawn the two worker threads (one co-located, one on a sibling core). Stacks carved from the
-    // window: A top = B+0x3000, B top = B+0x3800 (identical layout to UVUG-1).
+    // window — and the carve is PER-ARCH, because the two images shape the window differently:
+    //
+    //   aarch64: A top = B+0x3000, B top = B+0x3800 (identical layout to UVUG-1). Text ends inside
+    //   page 1, so page 2 (0x2000..0x3000) is unclaimed RW space and worker A descends through it.
+    //
+    //   x86 (WINX-8): VUGSHRINK's budget (`0xb0 + .text <= 0x3000`) lets the RX segment claim page 2,
+    //   and at this writing it does (RX memsz 0x212f) — so page 2 is RO+X and a stack topped at
+    //   +0x3000 dies on its FIRST frame write (cr2 = base+0x2f88 err=0x7, ring-3 KILLED; found by the
+    //   rmbp seat pre-validating the trunk fold, masked before VUGSHRINK because text past 0x2000
+    //   also blew the 16384-byte file window and failed the build gate instead). The only RW page is
+    //   page 3, and it is shared three ways: .bss at its head (end +0x34a8 at this writing,
+    //   ASSERT-capped in user-vug-x86.ld), worker B in its long-proven region below +0x3800, and
+    //   worker A moved to the clean upper half, top = the window end (+0x4000 — legal: the kernel's
+    //   `sys_thread_spawn` checks 16-alignment and probes the 16 bytes BELOW sp). Both workers run
+    //   the identical `uvug_worker`, so B's proven sub-0x358 envelope bounds A's need; 0x800 is
+    //   headroom, not a squeeze.
     //
     // VUGGUARD: CHECK BOTH RETURNS. `SYS_THREAD_SPAWN` returns a negative errno when it cannot give
     // this process a thread — notably `-EAGAIN` when the kernel's fixed thread-handle table is full,
@@ -2734,7 +2766,11 @@ pub extern "C" fn _start() -> ! {
     // raster is the same function over the same coordinates, the final surface — and so the
     // deterministic auto-path CHECKSUM — is byte-identical to the two-worker run.
     let entry = uvug_worker as *const () as u64;
-    let rc_a = unsafe { sys4(SYS_THREAD_SPAWN, entry, base + 0x3000, 0, 0) };
+    #[cfg(target_arch = "aarch64")]
+    const STACK_TOP_A: u64 = 0x3000;
+    #[cfg(target_arch = "x86_64")]
+    const STACK_TOP_A: u64 = 0x4000; // WINX-8: page 2 belongs to text on x86 — see the carve note above
+    let rc_a = unsafe { sys4(SYS_THREAD_SPAWN, entry, base + STACK_TOP_A, 0, 0) };
     let rc_b = unsafe { sys4(SYS_THREAD_SPAWN, entry, base + 0x3800, 1, 1) };
     let ok_a = rc_a >> 63 == 0;
     let ok_b = rc_b >> 63 == 0;

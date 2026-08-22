@@ -3459,3 +3459,26 @@ Conventions shared across arches:
   is matched (task, vector/EC, address) so demos assert exact outcomes.
 - **User pages are never executable-and-writable**; code pages are read-only
   to the kernel after load.
+- **An executable segment may never reach the final window page (RXFINAL64, aarch64,
+  2026-08-21; the x86 twin is RX-FINALPAGE, `27298f70`).** Both loaders park every
+  program's initial stack pointer at the window TOP (`map_image_into_slot`:
+  `sp = (base + size) & !0xF`), so the window's LAST 4 KiB page is the first stack page
+  of EVERY program — and an executable PT_LOAD is mapped read-only, so an RX `memsz`
+  that spills into that page is loaded-to-die: the program's first stack write takes a
+  permission fault and the fault net kills it at RUNTIME with no load-time diagnosis
+  (the WINX-8 metal fault class). `validate_elf` now refuses it at LOAD time on both
+  arches, with the same witness family:
+  `:: elf: REFUSED rx-crosses-final-window-page seg=[..) carve=[..) ::` and the
+  `&'static str` "rx segment crosses the final window page (the initial stack page)".
+  Boundary: refuse iff `PF_X && memsz > 0 && (vaddr - min_vaddr) + memsz >
+  win_size - 4 KiB`, strict — a segment ending exactly AT the boundary owns no byte of
+  the final page and loads (`min_vaddr` is finalised over ALL program headers before
+  the bounds loop runs). **The scope is loader-universal ONLY**: program-private stack
+  carves lower in the window (user-vug's worker stacks) are a PROGRAM contract, not
+  loader law, and are deliberately NOT enforced here — every correct program satisfies
+  this check by construction, because `sp` always starts in that final page. Proven
+  both polarities on aarch64 QEMU via a SUITETYPE typed run against an SDIMG-override
+  card carrying two hand-built one-segment ELFs: `BADRX.ELF` (RX span `[0,0x3001)`,
+  one byte into the final page) is REFUSED with the witness; `RXEDGE.ELF` (`[0,0x3000)`,
+  exactly at the boundary) loads, runs, and exits 0 — asserted by a second mbench spec
+  after pi4-regression.spec passed 117/117 on the same capture.

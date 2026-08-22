@@ -9094,3 +9094,108 @@ three specific numbers to fix. `V2` and `V3` move it to a named neighbouring sta
 and reopens the clipper. `V5` converts a silent wall into a measurable stall. `V6` is the only row that
 buys no new station — and even it is decisive, because it retires every instrument in the core block at
 once and makes §49.25.7e's TMU landmark the campaign's unambiguous next build.
+
+#### 49.25.8 `vpmprobe`, read on metal — `OUTCOME V5`: the coord thread spends its life STALLED against a VPM that never drains (PI-V3D-103 verdict, boot 14, 2026-08-21)
+
+Capture `boot14.log`, **v3d boot 14**, the PA51 image (`v3d-boot14-5d7ff0c8.img`, fp 1490152,
+`UNAOS_V3D_VPMPROBE=1 UNAOS_PI=1`), flown on metal 2026-08-21 and read from the
+`[v3d101]`/`[v3d102]`/`[v3d103]` lines themselves. Eight CT0 closes flew in `hfirst`'s
+**E → H → F → G** content order; legs A–D reproduced their settled shapes (leg B's R3 control clean,
+leg C's VA-0 residual, leg D's `OUTCOME D1`) and are not re-litigated here.
+
+**The desk rows first, as §49.25.7h's reading order requires.** The `[v3d103] VPMSTATIC` line printed,
+confirming on the wire what §49.25.7a settled at the desk: **sub-hypothesis (a) — the VC4-shaped VPM
+setup word — is dead**, and no slot on this boot was spent on it. Then `[v3d103] VPMSIZE`, the first
+physical read of the VPM this campaign has ever taken: `V3D_CTL_IDENT1 raw=0x81001422`,
+**`VPM_SIZE = 8` — 8 KB of VPM on this part** — with `NSLC=2` slices, `QUPS=4` QPUs per slice,
+`NTMU=1` TMU per slice, `NSEM=0`. The field is nonzero, so §49.25.7b's sizing rows are live, and the
+allocation trio (`cs_output_vpm_segment_size=1`, `cs_input_vpm_segment_size=0`,
+`VCM_CACHE_SIZE=4/4`) now has a real part to be read against.
+
+**The pristine ERR reference.** `[v3d103] ERRSTAT (PRE-ARM)`, before leg E's kick:
+`V3D_ERR_STAT raw=0x00001000` — **one bit already set, `VCDI` (bit12, VCD idle error)**, latched by
+something earlier in the boot than this ladder and therefore, by §49.25.7c's newly-latched law, **not
+this ladder's finding**. Every other named bit 0; `FDBGO=0x00000000`, `FDBGB=0x00000010`,
+`FDBGS=0x00000007` recorded raw, no decode claimed.
+
+**Leg E, the control, healthy again.** `INT_STS raw=0x00000002` (`FLDONE`, every error family clear),
+`BFC` Δ1, `pool words=20 tile-state words=48` — **`OUTCOME E1`**, boot 13's baseline to the word, with
+every production slot flat and only the control slot moving (`slot2 src32 CYCLE_COUNT d=475220236`).
+And the new control did its new job: `[v3d103] ERRSTAT (E)` reads `raw=0x00001000` — **identical to
+the pre-arm word, so leg E latched nothing**, and there is nothing to subtract by hand from leg H's
+newly-latched set.
+
+**Leg H — the admissibility guard passes, and `OUTCOME H4` is re-taken in its strong form.** The
+continuity slots reproduced boot 13's shape exactly as the guard demands:
+`FEP-moved=0 QPU-moved=1 PTB_PRIMS_BINNED-moved=0 shape-ok=1`, with the bank intact
+(`PCTR_EN-intact=1 src32-moved=1`). The `[v3d102] HFIRST VERDICT` line re-delivered **`OUTCOME H4`**
+on the bigger program: `slot1 src14 QPU_ACTIVE_CYCLES_VERTEX_COORD_USER raw=28 d=28` and
+`slot3 src16 QPU_CYCLES_VALID_INSTR raw=53 d=53` against boot 12's null-shader 5 — the strong-form
+condition met again, boot 13's numbers to the digit — with the VPM-side witnesses flat, the frame
+never closing (`BFC 0x00000005->0x00000005 Δ0`, `retired=0`, `INT_STS=0x00010000` — bit16 alone,
+QPU 0's program-end host interrupt), and the poison untouched (`decoy-pool=0/4096`,
+`real-pool=0/8192`, `real-ts=0/64`). The shader is exonerated a second time, on a second flight, and
+the three re-sourced slots are entitled to speak.
+
+**And they convict. `OUTCOME V5` — THE COORD THREAD SPENT ITS LIFE STALLED.** The
+`[v3d103] VPMPROBE VERDICT` line, verbatim in its load-bearing parts:
+
+| witness | leg H, boot 14 |
+|---|---|
+| **slot4 `src33 QPU_CYCLES_STALLED_VERTEX_COORD_USER`** | **`raw=25 d=25` — MOVED** |
+| slot5 `src11 PTB_PRIM_CLIP` | `raw=0 d=0` |
+| slot6 `src10 PTB_PRIM_VIEWPOINT_DISCARD` | `raw=0 d=0` |
+| `ERR_STAT` pre-arm / this-leg / **newly-latched** | `0x00001000` / `0x00001000` / **`0x00000000`** |
+| newly-latched by class | `VPM-write-pair=0x0000 VPM-any=0x0000 VPA=0x0000 PIPE=0x0000` |
+| frame closed / pool words | 0 / 0 (empty close = 20) |
+
+The stall counter moved on a leg where **no error bit latched** — the pre-existing `VCDI` bit did not
+change on any leg, E or H, and the newly-latched word is exactly zero — and **no PTB slot moved**.
+That is `V5`'s row, taken cleanly, with every other row's trigger absent.
+
+**The cross-read the row prescribes, performed: stalled 25 vs active 28.** The stall delta is
+comparable to the active delta — the thread was **mostly blocked** for its short life — so, per the
+row, `INT_STS` bit16's "program end" must be re-read as a thread that was **RELEASED rather than one
+that FINISHED**. The wall's shape sharpens accordingly: the write path is **not refusing loudly — it
+is not draining at all**. The thread ran its 27-word body, offered its six `STVPMV` stores, waited
+out most of its cycles at the port, and nothing downstream ever took what it offered.
+
+**What died on boot 14:**
+
+- **`V1`, `V2` and `V3` are dead for this leg.** Zero newly-latched bits: the silicon does not call
+  this an access violation, a sizing fault, or a neighbouring-station error. §49.25.6's "or the coord
+  thread's **access** to it" half is *not* convicted by name — the VPM's error machinery considers the
+  thread entitled to do what it is doing.
+- **`V4` is dead, and with it the received-and-discarded reading.** `PTB_PRIM_CLIP d=0` and
+  `PTB_PRIM_VIEWPOINT_DISCARD d=0`: a primitive cannot be clipped or viewport-discarded unless it
+  arrived, and none arrived. The PTB **never received** anything — `OUTCOME H4` survives the split
+  built to kill it, and the clipper/viewport room stays shut.
+- **`V6` is not reached.** Its row requires "did not stall", and the thread stalled. Boot 13's
+  "accepted and discarded, or never presented" ambiguity resolves toward the third reading neither
+  phrase quite named: **presented and never taken**.
+
+**Legs F and G stood down**, per the §49.3 dirty-CT0 rule, exactly as boot 13 said they would and
+exactly as designed — no kick issued, no verdict implied, no information lost.
+
+##### The next rung, stated honestly
+
+A discipline note first: §49.25.7's pre-written material does **not** assign `V5` a named follow-up
+build the way it assigns `V6` one. §49.25.7e gates the TMU landmark **on `V6`** and says `V1`–`V4`
+would save that work; **`V5` sits in neither list** — a gap in the pre-written gate, recorded here
+rather than papered over. What the doc *does* give `V5` is §49.25.7h's sentence — *"`V5` converts a
+silent wall into a measurable stall"* — and the row's own cross-read, which boot 14 has now performed.
+
+The question `V5` leaves is therefore the **consumer side**: the coord thread stalls at the VPM port
+because whatever is supposed to **drain** the VPM — the path from VPM contents to PTB intake — never
+takes delivery, and it does so *without latching any error and without the PTB receiving anything*.
+The concrete surface this boot armed for exactly that question is the allocation trio against the
+part: `cs_output_vpm_segment_size=1` / `cs_input_vpm_segment_size=0` / `VCM_CACHE_SIZE=4/4`, now
+readable for the first time against a measured **8 KB, 2-slice** VPM (§49.25.7b's "present and
+Mesa-shaped, never checked against the part" — the checking is now possible and still undone).
+Whether §49.25.7e's TMU landmark is also owed under `V5` — it would separate "the port back-pressures
+the thread" from "the thread's store path generally is blocked" — is a decision the next brief must
+take explicitly, because the pre-written gate is silent on it.
+
+*Fold discipline note:* boot 14 flew and was read the same sitting; this fold was written by the
+successor session from the capture, per the standing no-folds-at-close order — the capture, not this
+prose, is the evidence of record.

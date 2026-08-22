@@ -2392,6 +2392,44 @@ floor that reads `cores-used=1` on every boot, not occasionally — the leg is a
 gives: the only site that emits it on raspi4b runs before any EL0 task exists. The numbers that matter
 are metal.)
 
+**FLAKEHUNT — the leg asserted the move but measured the sibling's host timeslice (`exec-flakehunt`,
+off `5d7ff0c8`).** The claim above is right and the staging is right; the *observation* was not. Both
+ends of the window were blind wall-clock guesses, and one of them was three milliseconds wide: the
+leg slept 2 ms assuming `home` had picked the first task up, and the worker spun 5 ms, so the state
+the corrector must SEE — `home` running task one with exactly one ready behind it — existed for the
+~3 ms remainder. A sibling can only convict inside that remainder, and only while its own vCPU is on
+a host CPU. `busy_delay_ms` is CNTPCT, which under QEMU advances with the HOST clock whether or not
+the guest core is executing, so on a loaded host that 3 ms could pass with an idle sibling running no
+instructions at all — `cores-used=1`, and a FAIL that convicted the host's run queue rather than this
+kernel's. Two independent Pi seats measured it at roughly **one red in four runs** of an otherwise
+117/117 suite.
+
+The repair changes neither the staging nor the pass condition (still "the pair ran on >= 2 distinct
+cores", still reachable only through `try_steal` at victim depth 1). It changes how the leg *looks*:
+
+1. **The second spawn is gated on an observation, not a delay.** Task two is queued only once task
+   one has been seen running. A lone ready task at depth 1 on an idle victim is below
+   `STEAL_MIN_DEPTH` under *both* floors, so a set bit can only mean `home` dispatched it. This
+   strictly **sharpens** the A/B the blind 2 ms could lose in the other direction — a `home` that had
+   not yet dispatched left the queue at depth 2 with the victim idle, which the pre-arc constant
+   floor also cleared, so a stubbed build could have gone green by being slow.
+2. **The window is ~25 ms, not ~3 ms** (the worker's spin *is* the window).
+3. **The attempt is retried up to 4 times, and the count is published as `tries=`.** A retry cannot
+   manufacture a pass: the pre-arc floor declines identically on every attempt.
+
+Line shape, `tries=` inserted after `depth=1` and keyed by the spec's REQUIRE so it cannot silently
+disappear:
+
+```
+:: VUGSPREAD: floor test — tasks=2 cores-used=2 depth=1 tries=1 :: PASS ::
+```
+
+**Go-red proven by stubbing**, not asserted: with `try_steal`'s two `steal_floor(running)` calls
+replaced by the pre-arc constant `STEAL_MIN_DEPTH`, the retried leg reports
+`cores-used=1 depth=1 tries=4 :: FAIL` — all four attempts refused — and reds both the REQUIRE and
+the FORBID (116/117 required, 2 forbidden hits). On metal a `tries=` that starts climbing is itself a
+spread reading this leg would otherwise have reported as a clean PASS.
+
 ### SPREADTUNE — the brake was measuring the wrong clock (aarch64, `exec-spreadtune`)
 
 `exec-spreadtune`, off `180375ec`. The tune the §6.8f ruling called for, taken on the mechanism
@@ -2829,6 +2867,53 @@ TEAR-FREE` — pure host-CPU starvation, on a host running these QEMUs back to b
 loaded, which is why the arc is judged on **paired** runs rather than an absolute count, and the
 paired reading is that armed and control are indistinguishable outside the arc's own two witnesses,
 which are green on every run.
+
+### WEDGEPROBE — the interrupt/timer instrument behind a WEDGE conviction (aarch64, `exec-wedgeprobe`)
+
+**The evidence that motivated it.** Three metal WEDGE convictions share one anatomy. dsktp boot 9:
+core 3, task `99:input`. dsktp boot 10, episode 1: core 2, task `111:el0-fb` at ~4.5 s; episode 2:
+core 2 again, task `117:el0-wcb`, after the core had RECOVERED (~11M scheduler passes elapsed
+between episodes) and re-wedged — the failure is transient-then-recurring, not a one-way latch. In
+all three, `[starve1]` printed `passes=N->N irq=M->M` for the wedged core: its scheduler passes
+frozen AND its per-core acked-IRQ count frozen across the probe interval, while every sampled lock
+counter was zero (`rx_ready locked=0`, `sem_stalls=0`, `futex_stalls=0`). The lock class is
+refuted — POSFIX was aboard boot 10 and did not prevent it. The surviving hypothesis class:
+**interrupt delivery dies on the wedged core** — no timer tick, so no preemption, so the pinned EL0
+resident starves — while the current EL0 task keeps running at EL0 (the machine stays alive).
+
+**What the probe is.** `wedgeprobe` (sched.rs), called from the `[starve1]` fire path only, whenever
+any core is convicted WEDGE (frozen passes). Discipline per §INWEDGE/§POSFIX: read-only,
+failure-path-only, no locks taken, no waits entered — relaxed atomics, `mrs`, and single volatile
+MMIO reads. It prints:
+
+* One `[wedgeprobe] … wedged_cpu=N …` line per convicted core: the cross-core-safe atomics that
+  core's own IRQ path maintains — `gic::IRQ_TOTAL` / `IRQ_LAST_INTID` / `IRQ_UNHANDLED[_LAST]` and
+  `percpu::cpu(N).ticks` / `.ipis`. There is **no last-irq timestamp** anywhere in the kernel
+  (`[spin1]`'s `last=` is `IRQ_LAST_INTID`, an INTID — 30 is the timer PPI), so a frozen
+  `irq_total` beside a live sibling IS the staleness evidence, and the line says so.
+* One `[wedgeprobe] … probe_cpu=P …` line from the convicting core: `GICD_CTLR` (the one GLOBAL
+  register — distributor enable), then the probe core's **banked** view — timer-PPI
+  enable/pending/active bits (GICD_ISENABLER0/ISPENDR0/ISACTIVER0 low words are banked per CPU
+  interface on GICv2), `GICC_CTLR/PMR/RPR/HPPIR` (the whole GICC frame is banked), and
+  `CNTP_CTL_EL0` + `CVAL−now` (CNTP_* are per-core system registers). On the QEMU-virt v3 build the
+  same fields come from this core's redistributor SGI frame + the ICC_* system registers
+  (`gic::wedgeprobe_snapshot` dispatches like every other GIC entry point).
+
+**The honest limitation, stated in the witness line itself.** The wedged core's banked GIC state and
+its CNTP registers are **unreadable from any other core** — that is what "banked" means — and the
+kernel has no run-on-core-N IPI sampling path (the only SGI is the resched kick; building one was
+explicitly out of the arc's scope). So the probe-core line is a **contrast baseline** from a core
+that is demonstrably still taking interrupts, not the wedged core's state. What it CAN settle: a
+clear `GICD_CTLR` would convict a global distributor loss; a stuck `timer_active`/low `rpr` on a
+future capture where the probe core is itself about to wedge would convict a lost EOI; and the
+per-wedged-core counters separate "no interrupts acked at all" (frozen `irq_total`) from "interrupts
+acked but ticks lost" (`irq_total` moving while `ticks` freezes — a dispatch, not delivery, fault).
+
+**Gates (this arc).** `./arroyo check` green both arches; `./arroyo test-arm` clean;
+`./arroyo kernel8-test` **117/117 required, 0 forbidden**; strings-proof: both `[wedgeprobe]`
+witness texts present in the shipped `target/pi_baremetal/kernel8.img` (positive control:
+`starve1` present in the same pass). The probe has not yet fired on metal — that is the next
+conviction's capture, at an operator-attended arc boundary.
 
 ### Orphan-reaper wake on enqueue (aarch64, SCHED-4b)
 

@@ -3011,6 +3011,15 @@ pub struct XhciController {
     /// Set once the storage bulk endpoints are configured; the main loop performs the
     /// (synchronous) SCSI bring-up + first read in a safe, non-event context.
     pub storage_pending_bringup: bool,
+    /// BOTSEQ: armed at the END of the bring-up pass in place of running the PIUSB-36/37/38
+    /// matrices + write selftest inline; `service_storage`'s diag branch consumes it on a later
+    /// pass. See the arming site for the BOTCLAIM conviction this sequencing answers.
+    storage_diag_pending: bool,
+    /// BOTSEQ: set by the first block-layer `storage_read10`/`storage_write10` issued while
+    /// `storage_diag_pending` is armed — the proof the mount attempt (piusb27/probe_once, which
+    /// runs in the pass tail after the bring-up armed us) has already reached the wire, so the
+    /// deferred diagnostics can no longer run ahead of the mount verdict.
+    storage_postpublish_io: bool,
 
     // --- U2.5 FTDI USB-serial console (root-port only) ---
     /// Slot whose Configure-Endpoint we issued for the FTDI bulk endpoints (0 = none). Kept
@@ -3276,6 +3285,8 @@ impl XhciController {
             erst_table_phys: 0,
             storage_slot: 0,
             storage_pending_bringup: false,
+            storage_diag_pending: false,
+            storage_postpublish_io: false,
             ftdi_configuring_slot: 0,
             ftdi_slot: 0,
             ftdi_pending_bringup: false,
@@ -7228,6 +7239,37 @@ impl XhciController {
                 BOT_PARK_PUMP_REFUSED.load(Ordering::Relaxed));
             return Err(BotError::NoDevice);
         }
+        // BOTCLAIM: the issue-context witness. If either bulk pipe is not Running when this
+        // transaction is BORN, its failure is inherited from an earlier wedge (a prior timeout's
+        // cc=19-failed recovery left the pipe Halted/Stopped and un-repointed), not caused by
+        // anything on the caller's path — in particular not by the block layer's claim/loan
+        // boundary, which moves no controller state (the loan is a Box move, and the loan holder
+        // runs the same `pump_until_bot_done` either way). The 2026-08-21 pi capture shows the
+        // mount's READ(10) (the `:: BLK: io-cause op=read-usb`) issued with epin=2/epout=3 after
+        // the in-bring-up read12 wedge; this line makes that state readable AT ISSUE instead of
+        // being reconstructed from the recovery lines. Printed only in the already-broken state,
+        // so a healthy boot never emits it. Read-only: two volatile output-context reads, same
+        // (uninvalidated, possibly stale — exactly as every existing `ep_state_of` caller reads
+        // it) source the recovery witnesses use.
+        {
+            let (bi, bo) = {
+                let s = &self.slots[slot_id as usize];
+                (s.bulk_in_ep, s.bulk_out_ep)
+            };
+            if bi != 0 && bo != 0 {
+                let si = self.ep_state_of(slot_id, ((bi & 0x0F) * 2) + 1);
+                let so = self.ep_state_of(slot_id, (bo & 0x0F) * 2);
+                if si != 1 || so != 1 {
+                    // QEMU-verified reachable healthy case: epstate=3 (Stopped) right after a
+                    // SUCCESSFUL resync restarts on this transaction's own doorbell (test-arm
+                    // shows the piusb38 recovery probe hitting 3/3 and the next TUR Passing), so
+                    // the line names the states and leaves the verdict to the reading key.
+                    serial_println!(
+                        ":: BOT: [botclaim] issue-context slot={} cdb0={:#04x} epin={} epout={} — transaction born onto non-Running pipe(s). Reading key: 2 (Halted), or 3 (Stopped) behind a FAILED set-deq, means any timeout below is inherited from the earlier wedge — not caused by the issuing path; 3 behind a clean resync restarts on this doorbell and is healthy ::",
+                        slot_id, cdb.first().copied().unwrap_or(0), si, so);
+                }
+            }
+        }
         let first = self.bot_transfer_once(slot_id, cdb, data_phys, data_len, dir);
         let cause = match first {
             // PH-2: a `Failed` CSW is a completed transaction the DEVICE rejected — CHECK
@@ -11049,6 +11091,17 @@ impl XhciController {
             crate::hlt();
             let elapsed = crate::arch::now_cycles().wrapping_sub(start);
             if elapsed >= budget {
+                // BOTCLAIM: the expiry-instant peek — taken FIRST, before a single byte of the
+                // timeout printout below, because the question it answers is precisely whether a
+                // completion was consumable at the moment the budget died or only landed DURING
+                // the multi-line serial dump (tens of ms at metal baud — the window in which the
+                // [piusb40] necropsy can photograph "an event in OUR colour at the dequeue slot"
+                // that did not exist when the pump last looked). Read-only: `has_event` invalidates
+                // and reads the dequeue TRB, consumes nothing, moves no pointer.
+                let bc_fresh_at_expiry = {
+                    let guard = EVENT_RING.lock();
+                    guard.as_ref().map(|r| r.has_event()).unwrap_or(false)
+                };
                 BOT_PUMP_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
                 unsafe {
                     let ir0 = XHCI_IR0_BASE.load(Ordering::Acquire);
@@ -11117,6 +11170,26 @@ impl XhciController {
                 // witnesses above it is unconditional on `bot_pending` — a timeout with nothing
                 // pending still has an event ring worth reading, and that combination is itself
                 // one of the patterns the verdict clauses distinguish.
+                // BOTCLAIM discriminator: the same predicate read AGAIN now that the timeout block
+                // above has been printed, paired with the expiry-instant reading. Printed BEFORE
+                // the necropsy so its verdict clauses can be read against this line. Three
+                // readings, three verdicts:
+                //   * fresh_at_expiry=yes (repeatedly) -> consumer-side defect — the pump's own
+                //     drain failed to consume a live event, and the necropsy's "posted and never
+                //     consumed" clause is a true finding about `has_event`/cycle bookkeeping;
+                //   * fresh_at_expiry=no fresh_now=yes -> print-latency artifact — the event
+                //     landed during this printout, and a necropsy that now finds a fresh event at
+                //     the dequeue slot photographed its own serial delay, not a consumer defect;
+                //   * fresh_at_expiry=no fresh_now=no  -> the transport-wedge verdict stands.
+                let bc_fresh_now = {
+                    let guard = EVENT_RING.lock();
+                    guard.as_ref().map(|r| r.has_event()).unwrap_or(false)
+                };
+                serial_println!(
+                    ":: BOT: [botclaim] expiry-peek slot={} fresh_at_expiry={} fresh_now={} — yes/* convicts the pump's consumer; no/yes convicts print-latency (a necropsy 'posted and never consumed' verdict below is an instrumentation artifact); no/no confirms the transport wedge ::",
+                    slot,
+                    if bc_fresh_at_expiry { "yes" } else { "no" },
+                    if bc_fresh_now { "yes" } else { "no" });
                 self.bot_event_necropsy();
                 // BOT-PARK: charge the exhausted budget to the DEVICE, and classify the wait. A
                 // wait is "dead" only when NOTHING moved anywhere for its whole duration — no event
@@ -11365,6 +11438,12 @@ impl XhciController {
     pub fn storage_read10(&mut self, lba: u32, blocks: u16) -> Result<BotResult, BotError> {
         let slot = self.storage_slot;
         if slot == 0 { return Err(BotError::NoDevice); }
+        // BOTSEQ: while the deferred diagnostics are armed, ANY transaction through this
+        // block-layer API is post-publish traffic — the mount attempt reaching the wire (the
+        // bring-up's own sanity reads run BEFORE arming; the matrices run AFTER the latch is
+        // consumed, so neither can trip this). Marked at issue time, before the outcome, so a
+        // mount read that fails still counts as the attempt it was.
+        if self.storage_diag_pending { self.storage_postpublish_io = true; }
         self.scsi_read10(slot, lba, blocks)
     }
 
@@ -11372,6 +11451,9 @@ impl XhciController {
     pub fn storage_write10(&mut self, lba: u32, blocks: u16) -> Result<BotResult, BotError> {
         let slot = self.storage_slot;
         if slot == 0 { return Err(BotError::NoDevice); }
+        // BOTSEQ: see storage_read10 — post-publish block-layer traffic releases the deferred
+        // diagnostics on the next service_storage pass.
+        if self.storage_diag_pending { self.storage_postpublish_io = true; }
         self.scsi_write10(slot, lba, blocks)
     }
 
@@ -11718,6 +11800,28 @@ impl XhciController {
     }
 
     pub fn service_storage(&mut self) {
+        // BOTSEQ — deferred-diagnostics pass. The PIUSB-36/37/38 probe matrices + the write
+        // selftest no longer run inline at the end of the bring-up pass: BOTCLAIM convicted that
+        // chain of wedging Peter's card reader BEFORE the piusb27 mount ever ran (the mount read
+        // was born onto pipes the probes had already killed). The bring-up pass now only ARMS
+        // `storage_diag_pending`; this branch fires the diagnostics on a LATER service_storage
+        // call, and only once `storage_postpublish_io` says a block-layer transaction — the mount
+        // attempt, which every platform's storage-ready pass tail issues (piusb27_service on Pi,
+        // probe_once on x86) in the SAME pass that armed us — has already reached the wire. So the
+        // mount verdict precedes the matrices by construction, and no probe was deleted or changed.
+        if self.storage_diag_pending && !self.storage_pending_bringup {
+            if !self.storage_postpublish_io { return; }
+            // Same pacing gate as the bring-up: never start the multi-second diagnostic chain
+            // while a port (e.g. a hub-cycle re-enumeration) is mid-flight. Latch stays set.
+            if self.enum_active || !self.ports_to_enumerate.is_empty() { return; }
+            self.storage_diag_pending = false;
+            if self.storage_slot == 0 { return; } // device left before the diagnostics pass
+            // BOT-PARK: this is a fresh synchronous hand-off from the desktop loop, exactly like
+            // the bring-up pass — the diagnostics get their own pass ladder, as they always had.
+            self.bot_pass_begin();
+            self.storage_diag_matrices();
+            return;
+        }
         if !self.storage_pending_bringup { return; }
         // BOOTPACE M2 — CONSOLE-FIRST. Defer the whole SCSI bring-up until the enumeration queue
         // has drained. The latch is left SET (this is a `return`, not a consume), so the bring-up is
@@ -11822,8 +11926,10 @@ impl XhciController {
                 });
         }
 
-        // Sanity read of LBA 0.
-        match self.storage_read10(0, 1) {
+        // Sanity read of LBA 0. BOTSEQ: the CSW verdict feeds the `[botseq]` sequencing witness
+        // below, so the deferral line can say whether the bring-up chain itself was healthy at
+        // the moment the mount was handed the first post-publish slot.
+        let lba0_ok = match self.storage_read10(0, 1) {
             Ok(res) => {
                 serial_println!("xHCI: READ(10) LBA0 CSW status={:?} residue={}", res.status, res.residue);
                 if let Some(p) = self.storage_data_ptr() {
@@ -11896,10 +12002,41 @@ impl XhciController {
                         }
                     }
                 }
+                res.status == CswStatus::Passed
             }
-            Err(e) => serial_println!("xHCI: READ(10) LBA0 failed: {:?}", e),
-        }
+            Err(e) => { serial_println!("xHCI: READ(10) LBA0 failed: {:?}", e); false }
+        };
 
+        // BOTSEQ — arm the deferred diagnostics instead of running them inline. BOTCLAIM's
+        // conviction: on the metal card reader the PIUSB-36/37/38 matrices (notably piusb37's
+        // read12-lba0, tag 0x19, and its READ CAPACITY, tag 5) wedge the device, Stop-EP/
+        // Set-TR-Dequeue recovery fails cc=19, and the piusb27 mount read — which used to run
+        // AFTER this whole chain in the same pump pass — timed out on the dead pipes every cycle.
+        // The storage-ready edge was raised inside `bring_up_storage` above, so the pass tail's
+        // `piusb27_service`/`probe_once` mounts THIS pass; the matrices + write selftest run
+        // unchanged on the next `service_storage` pass (see the diag branch at the top).
+        //
+        // [botseq] READING KEY (the BOTCLAIM implication, recorded): the bring-up chain
+        // (TUR/INQUIRY/READ CAPACITY/READ10-LBA0) passes every metal cycle, and the mount read is
+        // the SAME command shape (READ(10) LBA0) the bring-up just passed. Until now the mount sat
+        // at a fixed POSITION (after the probe matrices), so "the wedge follows certain commands"
+        // and "the wedge follows sequence position" were collinear — un-testable apart. With the
+        // mount now issued before the matrices, a next metal flight where the mount SURVIVES while
+        // matrices are deferred breaks that collinearity: the probes' command mix (read12/read16/
+        // pre-sense/induced-stall...), not sequence depth, is what kills the reader.
+        self.storage_diag_pending = true;
+        self.storage_postpublish_io = false;
+        serial_println!(
+            ":: BOT: [botseq] mount-first attempted lba0={} matrices=deferred ::",
+            if lba0_ok { "ok" } else { "err" });
+    }
+
+    /// BOTSEQ: the deferred diagnostics pass — the exact PIUSB-36/37/38 matrices + write selftest
+    /// that used to run inline at the end of the bring-up pass, moved verbatim (internals
+    /// untouched) so the piusb27/probe_once mount attempt precedes them on the wire. Invoked only
+    /// from `service_storage`'s diag branch, once `storage_postpublish_io` proves the mount's
+    /// block-layer transaction has already been issued.
+    fn storage_diag_matrices(&mut self) {
         // PIUSB-36: one-boot decisive experiment matrix for the Pi-only 512-B-read-returns-zeros
         // wedge (READ CAPACITY 8 B works, READ(10) 512 B returns Passed/residue=0/zeros). Read-only;
         // aarch64 witness only — no-op on x86 (never compiled). Runs after the baseline witnesses so

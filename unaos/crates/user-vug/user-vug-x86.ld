@@ -57,7 +57,28 @@
    on trial for nothing.
 
    The program is position-independent (RIP-relative references), so the link VA is immaterial to
-   correctness — the bias shifts both segments uniformly and preserves their relative distance. */
+   correctness — the bias shifts both segments uniformly and preserves their relative distance.
+
+   WINX-8 — THE BUDGET ABOVE WAS FILE-MATH TRUE AND RUNTIME FALSE, AND WHAT NOW HOLDS IT UP.
+
+   The `0xb0 + .text <= 0x3000` budget was derived from the file/window arithmetic alone. It omitted a
+   second consumer of vaddr page 2 (0x2000..0x3000): worker A's stack, which main.rs (UVUG-1) topped at
+   `base + 0x3000` and descended through that page. The two never collided before VUGSHRINK only
+   because text past 0x2000 ALSO blew the 16384-byte file window — the build gate failed before any
+   boot could. VUGSHRINK removed the file cliff and let text legally claim page 2 (it stands at memsz
+   0x212f as of this note), so the first x86 run killed worker A on its first frame write
+   (cr2 = base+0x2f88, err=0x7) — found by the rmbp seat's WINX-8 leg pre-validating the trunk fold.
+
+   And "nothing about the program changed" above was ALSO one clause too strong: e_entry moved from 0
+   to 0xb0, and main.rs derived the window base as `_start`'s own address — correct for e_entry 0,
+   now +0xb0-skewed. That skew is what killed the PARENT in the same WINX-8 report: its surface blit
+   started at window+0x50b0 and crossed the mapping end at exactly window+0x56000. main.rs now
+   subtracts the header size on x86, and an ASSERT below pins e_entry == SIZEOF_HEADERS.
+
+   The fix is ownership, not retreat: page 2 belongs to text (the budget stands), worker A's stack
+   moved to the top half of page 3 (main.rs carve note at the spawn site), the base derivation is
+   de-skewed, and the ASSERTs below turn every contract violation this file can see into a LINK
+   error instead of a runtime kill. */
 
 ENTRY(_start)
 
@@ -84,6 +105,17 @@ SECTIONS
         *(.rodata .rodata.*)
     } :text
 
+    /* WINX-8: page 3 (0x3000..0x4000) must stay a data/stack page — text ending past 0x3000 would
+       turn the image's ONLY RW page RO+X and take both worker stacks with it. This is the same line
+       as the VUGSHRINK budget above, now enforced rather than narrated. */
+    ASSERT(. <= 0x3000, "user-vug-x86: text segment (headers + .text + .rodata) spills past 0x3000 into the data/stack page")
+
+    /* WINX-8: main.rs derives the window base as `_start - 0xb0` on x86 (FILEHDR PHDRS puts `_start`
+       at e_entry SIZEOF_HEADERS, not 0 — deriving it as `_start` bare was the +0xb0 skew that walked
+       the parent's surface blit off the end of its mapping). Pin the constant: if the header count
+       ever changes SIZEOF_HEADERS, this trips instead of the skew coming back at a new width. */
+    ASSERT(_start == SIZEOF_HEADERS, "user-vug-x86: e_entry moved off SIZEOF_HEADERS — update the 0xb0 base correction in main.rs `_start`")
+
     /* Force the data segment onto its own page so text/data never share a leaf. */
     . = ALIGN(0x1000);
 
@@ -95,6 +127,14 @@ SECTIONS
     .bss : {
         *(.bss .bss.*)
     } :data
+
+    /* WINX-8: when .data lands at 0x3000 (text using page 2), page 3 is shared three ways —
+       .data/.bss at its head, worker B's stack descending from +0x3800, worker A's from +0x4000
+       (the main.rs carve). A .bss that grows past 0x3600 would silently eat worker B's floor;
+       0x3600 leaves B no less than the smallest region it has already proven on metal. When text is
+       small and .data lands at 0x2000 instead, this assert is trivially true and the stacks own
+       page 3 outright. */
+    ASSERT(!(. > 0x3600 && ADDR(.data) >= 0x3000), "user-vug-x86: .data/.bss spills past 0x3600 into worker B's stack region")
 
     /* Drop metadata/unwind/dynamic/PLT/GOT — a static, loader-less program needs none, and a stray
        GOT/PLT would imply an unsatisfiable relocation. */

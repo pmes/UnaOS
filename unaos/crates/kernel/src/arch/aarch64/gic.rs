@@ -764,6 +764,95 @@ pub fn ppi_pending(intid: u32) -> bool {
     unsafe { gicd_read(GICD_ISPENDR) & (1 << intid) != 0 }
 }
 
+/// WEDGEPROBE — one read-only GIC snapshot for the `[wedgeprobe]` witness (sched.rs), taken on the
+/// CONVICTING core at a `[starve1]` WEDGE verdict. Every field is a single volatile read (v2) or
+/// `mrs` (v3); nothing is written, no lock is taken, and no wait/spin is entered — this is a
+/// failure-path instrument and must not be able to hang the machine it is diagnosing.
+///
+/// Banking honesty (the reason the fields are named "this core's"): on a GICv2 the low words of
+/// GICD_ISENABLER/ISPENDR/ISACTIVER (INTIDs 0-31, which is where the generic-timer PPI 30 lives)
+/// and the ENTIRE GICC frame are banked per CPU interface — a core reading them sees its OWN copy,
+/// never another core's. The same holds for the v3 redistributor SGI frame and the ICC_* system
+/// registers. So this snapshot can prove the DISTRIBUTOR is globally enabled (GICD_CTLR is the one
+/// global register here) and show a healthy core's banked view for contrast; the wedged core's own
+/// banked state is unreadable from outside it, and the caller's witness line says so.
+pub struct WedgeGicSnap {
+    /// GICD_CTLR — GLOBAL distributor enable, the only field here that speaks for every core.
+    pub gicd_ctlr: u32,
+    /// This core's banked set-enable bit for the timer PPI (GICD_ISENABLER0 / GICR_ISENABLER0).
+    pub timer_enabled: bool,
+    /// This core's banked pending bit for the timer PPI (GICD_ISPENDR0 / GICR_ISPENDR0).
+    pub timer_pending: bool,
+    /// This core's banked active bit for the timer PPI (GICD_ISACTIVER0 / GICR_ISACTIVER0). A stuck
+    /// 1 here would mean a tick was acked and never EOI'd — which on the WEDGED core would block
+    /// every same-or-lower-priority interrupt forever (the delivery-death shape).
+    pub timer_active: bool,
+    /// This core's CPU-interface enable (GICC_CTLR; v3: ICC_IGRPEN1_EL1).
+    pub cpuif_ctlr: u32,
+    /// This core's priority mask (GICC_PMR / ICC_PMR_EL1). 0x00 would mask EVERYTHING.
+    pub pmr: u32,
+    /// This core's running priority (GICC_RPR / ICC_RPR_EL1). 0xFF = idle (no active interrupt);
+    /// anything lower means an interrupt is active at that priority and gates equal/lower ones.
+    pub rpr: u32,
+    /// This core's highest-priority pending INTID (GICC_HPPIR / ICC_HPPIR1_EL1). 1023 = none.
+    pub hppir: u32,
+}
+
+/// v2 GICC offsets read only by the wedgeprobe snapshot (ack/EOI never touch them).
+const GICC_RPR: usize = 0x14; // running priority
+const GICC_HPPIR: usize = 0x18; // highest-priority pending interrupt
+/// Banked set-pending / set-active words for INTIDs 0-31 (v2 GICD; read-only here).
+const GICD_ISPENDR0: usize = 0x200;
+const GICD_ISACTIVER0: usize = 0x300;
+#[cfg(not(feature = "pi"))]
+const GICR_ISACTIVER0: usize = 0x0300; // (SGI frame) set-active for SGIs/PPIs (diagnostic read)
+
+/// Take the snapshot on the CALLING core. Dispatches v2/v3 like every other entry point; the pi
+/// build compiles to the v2 arm alone.
+pub fn wedgeprobe_snapshot() -> WedgeGicSnap {
+    let intid = crate::arch::timer::TIMER_INTID;
+    #[cfg(not(feature = "pi"))]
+    if is_v3() {
+        let sgi = this_cpu_redistributor() + GICR_SGI_OFFSET;
+        let (enab, pend, act) = unsafe {
+            (
+                gicr_read(sgi, GICR_ISENABLER0),
+                gicr_read(sgi, GICR_ISPENDR0),
+                gicr_read(sgi, GICR_ISACTIVER0),
+            )
+        };
+        let (grpen1, pmr, rpr, hppir): (u64, u64, u64, u64);
+        unsafe {
+            core::arch::asm!("mrs {}, S3_0_C12_C12_7", out(reg) grpen1, options(nomem, nostack, preserves_flags)); // ICC_IGRPEN1_EL1
+            core::arch::asm!("mrs {}, S3_0_C4_C6_0", out(reg) pmr, options(nomem, nostack, preserves_flags)); // ICC_PMR_EL1
+            core::arch::asm!("mrs {}, S3_0_C12_C11_3", out(reg) rpr, options(nomem, nostack, preserves_flags)); // ICC_RPR_EL1
+            core::arch::asm!("mrs {}, S3_0_C12_C12_2", out(reg) hppir, options(nomem, nostack, preserves_flags)); // ICC_HPPIR1_EL1
+        }
+        return WedgeGicSnap {
+            gicd_ctlr: unsafe { gicd_read(GICD_CTLR) },
+            timer_enabled: enab & (1 << intid) != 0,
+            timer_pending: pend & (1 << intid) != 0,
+            timer_active: act & (1 << intid) != 0,
+            cpuif_ctlr: grpen1 as u32,
+            pmr: pmr as u32,
+            rpr: rpr as u32,
+            hppir: hppir as u32,
+        };
+    }
+    unsafe {
+        WedgeGicSnap {
+            gicd_ctlr: gicd_read(GICD_CTLR),
+            timer_enabled: gicd_read(GICD_ISENABLER) & (1 << intid) != 0,
+            timer_pending: gicd_read(GICD_ISPENDR0) & (1 << intid) != 0,
+            timer_active: gicd_read(GICD_ISACTIVER0) & (1 << intid) != 0,
+            cpuif_ctlr: gicc_read(GICC_CTLR),
+            pmr: gicc_read(GICC_PMR),
+            rpr: gicc_read(GICC_RPR),
+            hppir: gicc_read(GICC_HPPIR),
+        }
+    }
+}
+
 /// Acknowledge, dispatch, and end one interrupt at the CPU interface. Called from the IRQ vector
 /// stub with IRQs masked. Reading IAR acknowledges (and returns the INTID); writing EOIR the same
 /// value completes it. Spurious reads (INTID >= 1020) take no EOI.

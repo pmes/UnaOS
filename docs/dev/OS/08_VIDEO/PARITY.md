@@ -1429,6 +1429,56 @@ is what still produces the odd `[wc-g] win=1 … -> COHER` and, less often, a `[
 whose panel lags an unpresented band. That is `exec-shellport`'s pacing lane, unchanged by this arc
 and now the only cause left rather than one of two.
 
+> **RE-SCOPED by §6.14 (`exec-wcgwin1`).** The residue is real and the writer named above is the right
+> one, but "pacing lane" is the wrong home for it. A 5×5 interleaved A/B showed `UNAOS_LIVECON=1` — the
+> arc that took the console's presents off print context, i.e. precisely the pacing fix — leaves the
+> `win=1` verdicts untouched (13 exceptional samples of 20 against 14 of 20). It could not have helped:
+> `wcg::SAMPLES` is 4 and all four are spent *before* `[pidesk] livecon ARMED`. The live interval is
+> the boot seam `[console-route first-paint, detach)`, where `_print` writes the window's SOURCE
+> surface without the lock `draw_window` would need to hold. **Not closed by LIVECON.** See §6.14.
+
+> **DISCRIMINATOR INSTALLED (`exec-wcgwin1b` — WCGSEAM).** §6.14 names two remedy candidates —
+> (a) the console blit takes the `FBCON` lock for the checksum span, or (b) `wcg::begin` declines
+> `win=1` while routed pre-handoff — and deliberately did not choose. WCGSEAM is the instrument the
+> choice needs: a read-only **seam census** that, when `wc-g` convicts `win=1`, says WHO the
+> concurrent writer was, on the wire, in the same boot.
+>
+> **What it reads.** fbcon's two glyph-raster paint sites now charge a census whenever the glyphs
+> landed in the ROUTED console-window surface: the classic per-byte path (`FbCon::write_byte`,
+> under the `FBCON` lock, print context) charges `locked`, x86's unlocked split path charges the
+> remainder. The charge is three relaxed atomics (`SEAM_WRITES`, `SEAM_LAST_CYC`, `SEAM_LOCKED` in
+> `video/wcg.rs`) — no lock, no print, nothing on the render or input path. `wcg::begin` snapshots
+> the counter above `t0` (paid before the copy clock starts, per the `Probe` literal's ordering
+> law); `wcg::end` re-reads it immediately after the `after` leg, so the delta covers exactly the
+> span the checksum trio adjudicates (`blit → civac → after`).
+>
+> **The line, and how to read it.** On a NON-CLEAN `[wc-g]` verdict for the window fbcon charged as
+> the console's, and only then, `end` prints from compositor context:
+>
+> ```
+> [wcgseam] win=1 seq=… verdict=… routed=… glyphs=<boot total> delta=<writes inside this bracket> locked=<lock-held split> last_age_us=<µs since last glyph store> -> GLYPH-RASTER | QUIET-BRACKET
+> ```
+>
+> `delta>0` (`-> GLYPH-RASTER`) is the writer caught inside the bracket — the RACE-BLIT shape, and
+> a direct conviction of the glyph rasteriser. `delta=0` with a small `last_age_us=` is the COHER
+> shape: the store landed just before the bracket opened and only its cache residue is caught.
+> `delta=0` with a LARGE age on a convicting sample would exonerate the glyph path and reopen the
+> writer question — the falsifiable edge that makes this a discriminator rather than a
+> restatement. `locked=` prices remedy (a): an `FBCON` lock on the blit serialises only writers
+> that take the lock, so an unlocked-split share (x86) caps what (a) can buy there, while a census
+> that is 100 % locked says (a) suffices mechanically and the choice against (b) is cost, not
+> reach. On the Pi every charge is the locked classic path; the split is an x86 datum.
+>
+> **Gating and cost.** `witness`-gated and nothing else, exactly as WC-G itself: the census lives
+> in `wcg.rs` (compiled both arches under `witness`), and the two fbcon charge points are
+> `#[cfg(feature = "witness")]`-guarded, line-NEUTRAL one-line appends (§5.3 — no panic `Location`
+> in `fbcon.rs` renumbers, knob-off images stay byte-identical). The `[wcgseam]` line rides the
+> sample line's budget one-for-one and adds no unbudgeted serial. It is a NEW tag: no pi4 FORBID or
+> REQUIRE matches it, none was added, and none should be until the bench has spoken — an armed
+> bench-geometry capture (`UNAOS_FBW=1920 UNAOS_FBH=1200`) with the standing `win=1` reds now
+> carries one `[wcgseam]` line per conviction, which is the reading the remedy decision waits on.
+> NOT a remedy: no behaviour changes, and the standing red count is unchanged by construction.
+
 ### 6.9d Two OWED items this arc measured and did not take
 
 1. **The dock paints over WC-F's twin box.** `wcf::reserved` seats the twins at `ph-MARGIN-SIDE` —
@@ -1887,6 +1937,221 @@ healthy present either machine has produced, 6.5x below pi's smallest captured s
 token on either tree**: `maxpresent_us` suffers the same QEMU vCPU compression as presspread
 (a 58–407x desched takes a healthy 1937µs present past any sane bound); the bound is read on
 metal via the playbooks. The pi playbook carries the read guidance from dsktp boot 9 on.
+
+### 6.13a `exec-flakehunt` — `[wc-k] … torn=1 -> AT-RISK` is §6.13's class, and the fix is §6.13's fix
+
+*(Renumbered from 6.14 at the seat pick — §6.14 below is the `exec-wcgwin1` arc's section (724770fa,
+picked the same landing day); this one is an addendum to §6.13 in substance anyway.)*
+
+Investigation arc off `5d7ff0c8` (Pi seat). Two Pi seats reported `[wc-k] rollup … torn=1 ->
+AT-RISK` riding some `kernel8-test` runs under host load, where the pi4 spec carries **both** a
+blanket `FORBID \[wc-k\] .*-> AT-RISK` and a `REQUIRE … outside=0 .* -> TEAR-FREE`, so one torn
+erase costs the suite two lines.
+
+**Conviction — the same QEMU vCPU-desched class as `presspread`, in its slow-max shape.** `torn` in
+`erase_note` is `present_us > rectscan_us` with `rectscan_us = FRAME_US * h / panel_h`, and
+`FRAME_US / panel_h` is a **constant** (16667/480 = 34.7 µs). So the erase tear test is exactly
+"did the present exceed 34.7 µs per row", and nothing else about the box enters it. Measured over
+**25 raspi4b runs** at host load 2–13 (unconfined, and with QEMU's five threads pinned to a 2- or
+3-CPU host set), **28 rollups / 116 staged erase samples, `torn=0` on every one**. The margin
+distribution of `rectscan_us / present_us` per sample:
+
+| min | p10 | median | p90 | max |
+|---|---|---|---|---|
+| **2.0x** | 12.3x | **29.7x** | 74.9x | 118.4x |
+
+`present_us` runs 88–3388 µs against `rectscan_us` of 6666–11528. A `torn=1` therefore needs **one**
+present to cross from a ~30x median margin while its three neighbours stay flat — and the 2.0x tail
+sample is itself almost certainly an already-inflated one that simply did not cross. No copy-path
+regression is selective like that: losing the staged shape reports `contig=no` /
+`-> SPLIT`, and a genuinely slow copy is slow on every sample. A vCPU losing its host timeslice
+mid-present is selective like that, and it is the mechanism §6.13 already named — the pi **slow-max**
+shape (`maxpresent_us` blown out beside a normal floor), not x86's fast-floor artifact.
+
+**Not reproduced here, and that is reported rather than papered over.** 25 runs, zero `torn` and zero
+`cores-used=1`; the host sat at load 6–13 and fell to 2–5 as the parallel seats finished, below the
+regime the two reporting seats ran under. Pinning QEMU harder does produce reds, but **other** ones,
+and it reds the *unmodified* tree too: across 11 pinned runs on `5d7ff0c8` the classes seen were
+`MBENCH TRUNCATED` (the 60 s window no longer reaching the `BANDY-*` witnesses — the harness's own
+bound, explicitly "not a regression"), one `[wc-c] side-by-side windows=2 drawn=1`, and one
+`AARCH64 EXCEPTION: SYNCHRONOUS` with `ELR`/`FAR` equal to `0x3133313d3631715f` — ASCII `_q16=131`,
+a PC inside a `[crispy]`/`[ceramic]` format string, alongside garbage `[click2]` counters. **That
+last one is flagged, not diagnosed, and is not this class**; the pinned regime is a torture harness
+that shakes out unrelated latent races on both trees and is therefore not a valid gate regime.
+
+**Fix shape — and why this arc did NOT land it.** The right fix is the one §6.13 already specifies
+and the rMBP seat is already landing in `video/wcg.rs`: the `STALL_PRESENT_US = 33334` absolute bound
+with its `longpres=` census and `-> STALL` line, extended from the `[wc-h]` composite path to the
+`[wc-k]` erase path, plus the discriminator field the erase rollup lacks entirely (WC-H publishes
+`presspread=`/`presspop=`; WC-K publishes no rate census at all, so its `torn=1` is printed with
+nothing beside it that could tell the two causes apart). Landing a pi-side variant of that in
+`wcg.rs` now would be a **second, competing opinion in a file another seat is actively changing** —
+precisely the drift §6.13's per-tree pin discipline exists to prevent, and outside this track's lane.
+So this arc convicts the class, records the measurement above as the baseline the bound can be priced
+against, and **stops**. Owed, to whichever seat lands the wc-k stall guard:
+
+* the erase rollup needs a rate census (ns per 4 KiB over `row_bytes * h`, exactly `[wc-h]`'s
+  normalisation) before any band can be priced. Computed offline from the 28 rollups above, the
+  per-boot QEMU spread is **2–57, mode 6–7, median 7** — the same single-digit healthy centre
+  `[wc-h]` reads on pi metal (1–7), with a tail that is itself desched. A band cannot be pinned from
+  QEMU numbers, but the SHAPE transfers: a `torn` sample must cross a ~30x margin, so it lands far
+  above the healthy centre, while a genuinely slow copy lifts every sample together and leaves the
+  spread at the centre. That is the discriminator, and it needs a metal capture to price;
+* the spec's `REQUIRE … -> TEAR-FREE` has to move with the FORBID. Unlike `[wc-h]`, whose rollup
+  verdict is only FORBIDden, `[wc-k]`'s verdict is *also* REQUIREd, so excusing the desched class in
+  the FORBID alone still reds the suite on the REQUIRE. Both lines are one change.
+
+### 6.14 The `exec-wcgwin1` arc — §6.9c's `win=1` residue is a BOOT-SEAM writer, and `livecon` cannot touch it
+
+Investigation arc, no behaviour change. §6.9c files the standing `[wc-g] win=1 … -> COHER`/`RACE-BLIT`
+red as *"console-vs-compositor residue"* and assigns it to `exec-shellport`'s **pacing** lane. LIVECON
+(§6.12) then landed exactly the mechanism §6.9c said was missing — the console's presents moved off
+print context onto the render core — and the standing battery does not arm it. The obvious question:
+**does arming `livecon` kill the `win=1` red?** It does not, and the reason is structural rather than
+statistical.
+
+#### What the four checksums actually measure
+
+All four legs of `[wc-g]` hash the window's **SOURCE surface** (`rw.surf`), never the destination:
+`blit` before the copy, `civac` after `clean_invalidate_surface`, `after` at `wcg::end`, and `app` at
+the client's own `on_present`. So on QEMU — where the cache maintenance is inert — `COHER`
+(`blit != civac`) and `RACE-BLIT` (`blit != after`) are **the same fault sampled at two different
+phases of one bracket**: *something wrote the source while the compositor was reading and copying it.*
+They are not two classes to be told apart; which one fires is only a question of where in `begin`/`end`
+the writer's store happened to land. `fbbad=` (the read-back against the glass) rides along and is the
+downstream consequence, not an independent fault.
+
+#### The A/B — five control runs and five armed, interleaved on one host
+
+`UNAOS_PIDESK=1 UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 150`, ± `UNAOS_LIVECON=1`, at
+`5d7ff0c8`. Every armed run carries `[pidesk] livecon ARMED` and a `[wc-x] livecon census` line, so the
+knob is doing its job in all five.
+
+| Run | `win=1` samples | CLEAN | COHER | RACE-BLIT | RACE-PRESENT | BLIT | exceptional |
+|---|---|---|---|---|---|---|---|
+| control 1 | 4 | 2 | 0 | 2 | 0 | 0 | **2** |
+| control 2 | 4 | 1 | 2 | 0 | 0 | 1 | **3** |
+| control 3 | 4 | 1 | 1 | 0 | 1 | 1 | **3** |
+| control 4 | 4 | 2 | 2 | 0 | 0 | 0 | **2** |
+| control 5 | 4 | 1 | 0 | 3 | 0 | 0 | **3** |
+| **control total** | **20** | **7** | **5** | **5** | **1** | **2** | **13** |
+| `livecon` 1 | 4 | 1 | 0 | 3 | 0 | 0 | **3** |
+| `livecon` 2 | 4 | 1 | 2 | 1 | 0 | 0 | **3** |
+| `livecon` 3 | 4 | 1 | 1 | 0 | 1 | 1 | **3** |
+| `livecon` 4 | 4 | 1 | 0 | 1 | 0 | 2 | **3** |
+| `livecon` 5 | 4 | 2 | 0 | 1 | 1 | 0 | **2** |
+| **`livecon` total** | **20** | **6** | **3** | **6** | **2** | **3** | **14** |
+
+13 exceptional of 20 against 14 of 20. **No effect, and no class is introduced or removed** — every
+verdict the armed leg produces appears in the control leg and vice versa. No other window produced a
+single exceptional `[wc-g]` sample in any of the ten runs.
+
+#### Why it could not have worked — the instrument is spent before the knob arms
+
+`wcg::SAMPLES` is **4**, and the console window's four presents are consumed inside a ~30-line stretch
+of the boot. In all five armed runs the LAST `win=1` sample precedes `[pidesk] livecon ARMED` by 4–11
+lines:
+
+| run | `console-route first-paint` | last `win=1` sample | `livecon ARMED` |
+|---|---|---|---|
+| `livecon` 1 | 305 | 329 | 338 |
+| `livecon` 2 | 303 | 331 | 335 |
+| `livecon` 3 | 304 | 331 | 336 |
+| `livecon` 4 | 305 | 333 | 338 |
+| `livecon` 5 | 305 | 327 | 338 |
+
+The arming is at the tail of `pidesk::activate` **by design** (§6.12: "the last instant that is still
+single-core through this seam"). `wc-g`'s budget for this window is gone by then. **The knob cannot
+move this red because the instrument has already gone dark when the knob takes effect.**
+
+#### The surviving writer, named
+
+`seq=0` is CLEAN in all ten runs, and the exceptional verdicts begin at `seq=1`/`seq=2` — i.e. at
+`[wc-x] console-route first-paint win=1 (glyphs -> window surface)`. That is the onset, and it names
+the writer: **`fbcon::_print`'s glyph rasteriser storing into `c.win_fb` / `c.win_store`.** Between the
+route install and the GUI handoff, `GUI_ACTIVE` is still `false` and `panel_mirror_held()` has already
+lifted (it lifts by construction the moment `CONSOLE_WIN` is installed, §6.9c), so *every* print lands
+in the console window's source surface. `_print` holds the `FBCON` lock; `wm::draw_window` does not
+take it. Any core printing in that window — and the same core, from an IRQ handler, mid-copy — writes
+the bytes `wcg::begin` just hashed. That is the whole fault.
+
+**`livecon` is orthogonal to it by construction.** It defers `route_present` / `route_present_rows` /
+`route_present_pending` — the **presenter**. The **writer** is untouched in either polarity. What stops
+the writer is `fbcon::detach()` (`console_flush(); GUI_ACTIVE.store(true)`), and that is exactly the
+call `livecon` *skips* — after the last sample, so `wc-g` never sees the difference.
+
+#### Two corrections to the record, and what is owed
+
+1. **§6.9c's assignment is misfiled, in one specific way.** The residue is not a post-handoff *pacing*
+   problem; in the frozen-snapshot default there is no post-handoff console writer at all. It is a
+   **boot-seam** concurrent-writer, live only in the interval `[console-route first-paint, detach)`.
+   Any fix aimed at present cadence is aimed past it. It stays OPEN — **not** closed by LIVECON.
+2. **`livecon`'s steady-state safety on `win=1` is UNMEASURED, not proven.** With a live console the
+   writer persists for the whole boot, and `SAMPLES = 4` means `wc-g` has no visibility into that
+   regime whatsoever. The A/B above says the knob does not make the *measured* window worse; it says
+   nothing about the unmeasured one. Read it that way, and note that this is a QEMU reading — the metal
+   read is dsktp boot 10+, and `livecon` remains default OFF for the reason §6.12 gives.
+
+**Recommendation: do NOT arm `UNAOS_LIVECON` in the standard battery on account of this red** — it
+cannot move it, and arming it would buy a false "closed". The derived fix is one of two, and both are
+`wm.rs`/`wcg.rs` design calls rather than knob-line work: either the console window's blit takes the
+`FBCON` lock for the span the checksums cover, or `wcg::begin` declines `win=1` while
+`console_is_routed() && !GUI_ACTIVE` — an *honest instrument decline* at a seam where the source is
+known-mutable, which is a different thing from suppressing the verdict. Not taken here: this arc
+convicted the mechanism, not the remedy.
+
+---
+
+### 6.15 WINX-8 — VUGSHRINK's two latent x86 faults, found by the fold, fixed at the crate
+
+*(§6.14 above is the `exec-wcgwin1` arc — the §6.9c boot-seam conviction whose two remedy candidates
+the rmbp track weighs; an earlier note here guessed it lived on the rmbp tree, corrected at the pick.)*
+
+**Provenance.** rmbp 2's WINX-8 battery leg, pre-validating the trunk fold (main `ad2fab78` onto
+their tip), failed deterministically on both x86-fat legs: worker A killed at `cr2 = base+0x2f88
+err=0x7` on its first frame write, then the parent killed at exactly `base+0x56000` — the 288x288
+surface end. Reproduced here to the byte on `hw-pi4@5d7ff0c8` (RX `memsz 0x212f`): **no CRYSTAL
+growth was needed — VUGSHRINK itself shipped both faults.** They were invisible to pi 2's gates
+because no pi-side suite runs the x86 vug (rmbp 2 flagged the same blindness in `x86-fat.spec`:
+no WINX-8 REQUIRE, no ring-3-fault FORBID).
+
+**Fault 1 — page 2 had two owners.** VUGSHRINK's budget (`0xb0 + .text <= 0x3000`) was file-math
+true and runtime false: worker A's UVUG-1 stack top of `base+0x3000` descends through vaddr page 2,
+and the moment text legally claimed that page (it stands at `memsz 0x212f`), the page went RO+X and
+A died on its first frame write. Before VUGSHRINK the collision was masked, not absent: text past
+0x2000 also blew the 16 KiB file window, so the BUILD failed before any boot could.
+
+**Fault 2 — the base derivation skewed +0xb0.** `FILEHDR PHDRS` moved `e_entry` from 0 to 0xb0, and
+main.rs derived the window base as `_start`'s own address — correct for `e_entry` 0, now +0xb0 off.
+Every landmark computed off `base` shifted with it: the info-page flags word was read at +0x4130
+instead of +0x4080, both stacks moved, and the parent's surface blit started at window+0x50b0 and
+walked off its mapping at exactly window+0x56000. That is the parent's corpse in the WINX-8 report,
+and it is independent of fault 1.
+
+**The fix (crate-local, x86-only, aarch64 byte-identical — verified by baseline-worktree rebuild
+and `cmp`).** (a) `base = _start - 0xb0` on x86, with `user-vug-x86.ld` ASSERTing
+`_start == SIZEOF_HEADERS` so the constant cannot rot. (b) Worker A's stack top moves to the window
+end (`base+0x4000` — `sys_thread_spawn` probes the 16 bytes *below* sp, so the boundary top is
+legal); page 3 is now shared three ways (.bss head / B below +0x3800 / A below +0x4000), and both
+workers run the identical `uvug_worker`, so B's long-proven envelope bounds A's need. (c) Two new
+link ASSERTs turn every page-contract violation the script can see into a link error: text must end
+by 0x3000, and .bss may not cross 0x3600 into B's floor. Post-fix disassembly shows every window
+landmark at its exact link VA (A sp 0x4000, B sp 0x3800, surface 0x5000, flags 0x4020); the
+stripped image is 12640 B against the 16384 B window.
+
+**What this section does NOT claim.** The x86 runtime proof is rmbp 2's to take: their WINX-8 leg
+is the only suite that exercises this binary under load, and the fold re-run is the verdict. The
+`x86-fat.spec` REQUIRE/FORBID gap is flagged to the seat, not taken here — spec ownership is not
+this tree's.
+
+**Runtime verdict (rmbp 2's fold-v2, relayed 2026-08-19 before their close): GREEN.** WINX-8
+PASS on both fat legs — `loaded (entry 0x100000000b0) + windowed + 3 presents with 2 ring-3
+thread(s) … teardown clean -> PASS`; worker A alive past its first frame, the parent completes
+the full blit, both old fault lines gone, image 12640 B under the cliff. No checksum pin moved.
+Cross-tree note for the integrator: the fold with this commit aboard is landable, but three
+rmbp-side items (x86-witness presspop re-arm + the two new fat-spec lines) live in their
+`fold2-1783bee6.patch` and must be taken deliberately — a mechanical re-merge drops all three
+silently. Archive: `~/unaos-bench/scratch/rmbp2-close/fold2/`; rmbp 3 executes the fold.
 
 ---
 

@@ -378,6 +378,60 @@ static W_MAXUS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 /// not the reporting cost, and the reporting cost is stated separately at [`end`].
 static W_WITUS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 
+// ---- WCGSEAM — the boot-seam writer census (a DISCRIMINATOR, not a remedy) ---------------------
+//
+// The standing `[wc-g] win=1 -> COHER`/`RACE-BLIT` red on armed bench-geometry boots is attributed
+// to a BOOT-SEAM CONCURRENT WRITER: fbcon's glyph raster paints the routed console window's surface
+// from print context while the compositor's checksum bracket reads it. WCGWIN1 (PARITY §6.13)
+// proved LIVECON is NOT the fix — the writer fires before the deferral is armed — and named two
+// remedy candidates. This census is the instrument that must precede either: it captures WHO the
+// concurrent writer was at the moment a sample convicts, read-only, lock-free, and printed from the
+// same compositor context as the `[wc-g]` line itself (never from print context — a serial write
+// inside the glyph path would recurse into `_print`).
+//
+// fbcon charges the census at its two paint sites (the classic per-byte path under the FBCON lock,
+// and x86's unlocked split path) whenever the glyphs landed in the ROUTED window surface — three
+// relaxed atomic stores, no lock, no branch on the render or input path. `begin` snapshots the
+// counter above `t0` (one relaxed load, paid before the clock starts, per the ordering law on the
+// `Probe` literal); a convicting `end` reads it again and prints `[wcgseam]` with the bracket delta.
+
+/// WCGSEAM — glyph-raster paint batches fbcon has landed in the ROUTED console-window surface, for
+/// the whole boot. One count per `write_byte` on the classic path (a glyph or a newline's fills),
+/// one per painted chunk on the split path — a census of write EVENTS, not bytes.
+static SEAM_WRITES: AtomicU64 = AtomicU64::new(0);
+/// WCGSEAM — [`crate::arch::now_cycles`] at the most recent routed glyph write. What `last_age_us=`
+/// is derived from: a conviction with `delta=0` but a small age says the store landed just before
+/// the bracket opened — the COHER shape — rather than inside it.
+static SEAM_LAST_CYC: AtomicU64 = AtomicU64::new(0);
+/// WCGSEAM — the split of [`SEAM_WRITES`] painted UNDER the FBCON lock (the classic per-byte path,
+/// print context, interrupts masked). The remainder is the unlocked split path. Which side the
+/// writer is on is exactly what separates remedy (a) FBCON-lock the console blit — which can only
+/// serialise writers that take the lock — from remedy (b) decline win=1 in `begin` while routed.
+static SEAM_LOCKED: AtomicU64 = AtomicU64::new(0);
+/// WCGSEAM — the routed console's window id as fbcon last charged it, `wm::WIN_NONE` (0) until the
+/// first routed glyph write. The `[wcgseam]` line prints only for THIS window: a conviction on an
+/// app window has nothing to learn from a console census.
+static SEAM_WIN: AtomicU32 = AtomicU32::new(0);
+
+/// WCGSEAM — fbcon's charge point: one routed glyph-raster write event landed in the console
+/// window's surface. `locked` says the FBCON lock was held (classic path) or not (split path);
+/// `win` is [`super::fbcon`]'s `CONSOLE_WIN` at the moment of the write.
+///
+/// Three relaxed atomics and nothing else — called from print context, so it must never take a
+/// lock, allocate, or print. Budget-free deliberately: the census is the DENOMINATOR a conviction
+/// is read against, and a capped count would go dark exactly when the boot is chatty enough to
+/// matter.
+pub fn seam_glyph_note(locked: bool, win: u32) {
+    SEAM_WRITES.fetch_add(1, Ordering::Relaxed);
+    if locked {
+        SEAM_LOCKED.fetch_add(1, Ordering::Relaxed);
+    }
+    SEAM_LAST_CYC.store(now_cycles(), Ordering::Relaxed);
+    if win != 0 {
+        SEAM_WIN.store(win, Ordering::Relaxed);
+    }
+}
+
 // ---- WC-H — the back-layer's own witness -------------------------------------------------------
 
 /// Per-id: `[wc-h]` samples taken, capped at [`SAMPLES`].
@@ -1846,6 +1900,10 @@ pub struct Probe {
     /// x86 the op is a no-op and this reduces to the second full-surface read, which is the honest
     /// reading there — see [`clean_invalidate_surface`].
     civac_us: u64,
+    /// WCGSEAM — [`SEAM_WRITES`] as this sample's bracket opened, snapshotted above `t0`. A
+    /// convicting [`end`] subtracts it: a non-zero delta is the concurrent writer caught INSIDE the
+    /// adjudication bracket.
+    seam0: u64,
     t0: u64,
     /// WCG-CHUNK — this probe is one CHUNK of a full-coverage sample: the checksums walked
     /// `band_off..band_off + band_len` of the surface, the read-back resumes at the row that offset
@@ -3058,6 +3116,9 @@ pub fn begin(
     // next to the work being measured, and — this is the load-bearing part — none of it lands
     // between the `t0` assignment and the return, so the ordering law below is untouched and `us=`
     // still contains the copy and nothing else.
+    // WCGSEAM — the census snapshot this sample's bracket opens on. One relaxed load, above the
+    // checksums and therefore above `t0`, per the ordering law on the literal below.
+    let seam0 = SEAM_WRITES.load(Ordering::Relaxed);
     let tp0 = now_cycles();
     let cks_blit = checksum(cs_at, cs_len);
     let tp1 = now_cycles();
@@ -3090,6 +3151,8 @@ pub fn begin(
         cks_civac,
         cks_blit_us,
         civac_us,
+        // WCGSEAM — a plain move, above `t0` for the same reason.
+        seam0,
         // WCG-CHUNK — three plain moves, above `t0` for the same reason.
         #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
         chunk,
@@ -3147,6 +3210,12 @@ pub fn end(
     let cks_after = checksum(cs_at, cs_len);
     let tp1 = now_cycles();
     let cks_after_us = cycles_to_us(tp1.saturating_sub(tp0));
+    // WCGSEAM — the census is read HERE, immediately after the `after` leg and outside every
+    // bracket: the delta against `p.seam0` then covers exactly the span the checksum trio
+    // adjudicates over (blit → civac → after), which is the span a COHER or RACE-BLIT verdict
+    // convicts. Two relaxed loads; the line they may feed prints far below, after the sample line.
+    let seam_now = SEAM_WRITES.load(Ordering::Relaxed);
+    let seam_last = SEAM_LAST_CYC.load(Ordering::Relaxed);
 
     // Re-derive the destination from the source, one probe per SOURCE pixel (the top-left
     // destination pixel of each upscale cell). Bounds mirror `draw_window`'s: the panel clip, the
@@ -3385,6 +3454,39 @@ pub fn end(
         verdict,
         band_note
     );
+
+    // WCGSEAM — WHO the concurrent writer was, printed beside the conviction it explains.
+    //
+    // Rides the sample line's budget exactly (reachable only where the line above printed), fires
+    // only on a NON-CLEAN verdict, and only for the window fbcon has charged as the routed
+    // console's — a conviction on an app window has nothing to learn from a console census, and a
+    // boot that never routed the console never prints this at all. `delta=` is the number the two
+    // remedy candidates of PARITY §6.13 are decided on: writes that landed INSIDE this sample's
+    // adjudication bracket (`-> GLYPH-RASTER`, the writer caught in the act) versus none
+    // (`-> QUIET-BRACKET`, with `last_age_us=` saying how far back the last glyph store landed —
+    // the COHER shape, where the store precedes the bracket and only its cache residue is caught).
+    // `locked=` splits the census by paint path, which is what separates remedy (a) — an FBCON
+    // lock, able to serialise only lock-taking writers — from remedy (b), a routed-window decline
+    // in `begin`. A new tag deliberately: no pi4 FORBID matches `\[wcgseam\]`, and none may be
+    // taught to until the discriminator has spoken on the bench.
+    if verdict != "CLEAN" && p.id != 0 && p.id == SEAM_WIN.load(Ordering::Relaxed) {
+        #[cfg(all(target_arch = "aarch64", feature = "pidesk"))]
+        let routed = if super::fbcon::console_is_routed() { "yes" } else { "no" };
+        #[cfg(not(all(target_arch = "aarch64", feature = "pidesk")))]
+        let routed = "?";
+        serial_println!(
+            "[wcgseam] win={} seq={} verdict={} routed={} glyphs={} delta={} locked={} last_age_us={} -> {}",
+            p.id,
+            p.seq,
+            verdict,
+            routed,
+            seam_now,
+            seam_now.saturating_sub(p.seam0),
+            SEAM_LOCKED.load(Ordering::Relaxed),
+            cycles_to_us(now_cycles().saturating_sub(seam_last)),
+            if seam_now > p.seam0 { "GLYPH-RASTER" } else { "QUIET-BRACKET" }
+        );
+    }
 
     // WC-G/M1 — WHERE THE PASS ACTUALLY GOES.
     //
