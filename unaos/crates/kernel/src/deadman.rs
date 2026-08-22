@@ -50,6 +50,8 @@
 //! | `gate=` | `COMP_GATE` holder core `/` hold age in ms; `-` when the gate is free |
 //! | `dec=` | per-core composite DECLINES in the last second, one hex nibble per core, saturating at `f` |
 //! | `dmg=` | rows currently marked damaged `/` of those, rows with NO attach since the last pass |
+//! | `in=` | INPUT-UNGATE: motion reports coalesced `/` channel sends declined `/` heartbeats dropped, in the last second |
+//! | `rh=` | WCSER-REHOME: singleton roles re-homed off a steal-declared-dead core this boot (standing, never drained) |
 //!
 //! Roughly 95 bytes. That is deliberate: `USB-DEBUG: MOUSE` was measured at 49 bytes per report and
 //! was 20.8 % of ALL serial output before it was removed. One 95-byte line per second is ~0.8 % of a
@@ -164,6 +166,34 @@ mod imp {
     const DEC_INIT: AtomicU32 = AtomicU32::new(0);
     static DEC: [AtomicU32; CORES] = [DEC_INIT; CORES];
 
+    // ── INPUT-UNGATE: what the input producer had to do about a channel it could not fill ───────
+    //
+    // These three live HERE rather than beside their counters in `main.rs` for the reason the module
+    // header gives: the only emitter proven to survive the wedge is the timer ISR, and a witness for
+    // a wedge that is printed by a task the wedge can starve is not a witness. `GUI_SENT_X86` /
+    // `GUI_RECV_X86` / `GUI_FOLD_X86` already exist in `main.rs` and are reported by the
+    // `[schedx86] depth` line — which the RENDER TASK prints, i.e. exactly the thing that was dead
+    // for the 497 seconds this arc is about. Nothing in that ledger reached the log after 83.8 s.
+    /// Relative-motion reports SUMMED into the producer's accumulator because the channel refused
+    /// them. Conserved travel, not lost travel — see `x86_input_service`.
+    static GUI_COALESCED: AtomicU64 = AtomicU64::new(0);
+    /// `Channel::try_send` refusals on `GUI_CHANNEL_X86`. Counts ATTEMPTS refused, not events lost —
+    /// a producer holding one owed event re-offers it every ~1 ms pass, so a channel that stays full
+    /// for a whole second reads near the producer's pass rate (~10^3) rather than near the number of
+    /// events behind it. That is the intended scale: single digits mean the render task stuttered,
+    /// hundreds mean it is badly behind, and a reading pinned at the pass rate second after second
+    /// means it is GONE — which is the state `rh=` then says whether anything was done about.
+    static GUI_DECLINED: AtomicU64 = AtomicU64::new(0);
+    /// `Event::Timer` heartbeats dropped rather than queued. Pure filler by contract, so this is the
+    /// one class the producer is allowed to lose — counted anyway, because "allowed to lose" and
+    /// "lost silently" are the distinction this whole module exists to keep.
+    static GUI_TIMER_DROP: AtomicU64 = AtomicU64::new(0);
+
+    /// WCSER-REHOME: singleton roles re-homed off a core the steal declared dead. NEVER drained —
+    /// a standing nonzero is the session having survived something that used to end it, the same
+    /// reading discipline `wm::COMP_STEALS` uses.
+    static REHOMED: AtomicU64 = AtomicU64::new(0);
+
     // ── the gauges, never drained ──────────────────────────────────────────────────────────────
     /// `arch::ms()` of the most recent HID IN-token completion, or [`NEVER`].
     static HID_LAST_MS: AtomicU64 = AtomicU64::new(NEVER);
@@ -232,6 +262,30 @@ mod imp {
     pub fn note_decline() {
         let c = (crate::arch::percpu::this_cpu().cpu_index as usize).min(CORES - 1);
         DEC[c].fetch_add(1, Relaxed);
+    }
+
+    /// INPUT-UNGATE: one relative-motion report summed into the producer's accumulator.
+    #[inline]
+    pub fn note_gui_coalesced() {
+        GUI_COALESCED.fetch_add(1, Relaxed);
+    }
+
+    /// INPUT-UNGATE: one `try_send` refused by a full `GUI_CHANNEL_X86`.
+    #[inline]
+    pub fn note_gui_declined() {
+        GUI_DECLINED.fetch_add(1, Relaxed);
+    }
+
+    /// INPUT-UNGATE: one `Event::Timer` heartbeat dropped rather than queued.
+    #[inline]
+    pub fn note_gui_timer_drop() {
+        GUI_TIMER_DROP.fetch_add(1, Relaxed);
+    }
+
+    /// WCSER-REHOME: one singleton role re-homed off a core the steal declared dead.
+    #[inline]
+    pub fn note_rehome() {
+        REHOMED.fetch_add(1, Relaxed);
     }
 
     /// True iff row `i` (0-based) has had NO attach since the last completed composite pass.
@@ -334,6 +388,28 @@ mod imp {
                 let _ = write!(ln, " dmg=?/?");
             }
         }
+        // INPUT-UNGATE — `in=coalesced/declined/timerdrop` and `rh=`, the input path's own liveness,
+        // drained per second like `hid`/`pmp` beside them.
+        //
+        // WHAT EACH READING MEANS, since a witness nobody can read is not one:
+        //   `in=0/0/0`   the channel took everything offered. The normal desktop.
+        //   `in=N/M/T` with `hq` FALLING — the render task is behind but alive; motion is being
+        //              summed and heartbeats shed, which is exactly the designed degradation.
+        //   `in=N/M/T` with `hq` PINNED and `rh=0` — the consumer is GONE and was not re-homed.
+        //              This is boot 16's state, and it is the one this arc exists to make impossible.
+        //   `rh>0`     a core the steal declared dead had its singleton roles reassigned. Pair it
+        //              with `hq` returning to 0 to read the recovery as complete rather than merely
+        //              attempted.
+        // `rh` is NOT drained (a standing count), the other three ARE (a per-second rate) — so a
+        // one-second burst of declines cannot be mistaken for a permanent one.
+        let _ = write!(
+            ln,
+            " in={}/{}/{} rh={}",
+            GUI_COALESCED.swap(0, Relaxed),
+            GUI_DECLINED.swap(0, Relaxed),
+            GUI_TIMER_DROP.swap(0, Relaxed),
+            REHOMED.load(Relaxed),
+        );
         serial_println!("{}", ln.as_str());
     }
 
@@ -379,6 +455,14 @@ mod imp {
     pub fn note_composite_done() {}
     #[inline(always)]
     pub fn note_decline() {}
+    #[inline(always)]
+    pub fn note_gui_coalesced() {}
+    #[inline(always)]
+    pub fn note_gui_declined() {}
+    #[inline(always)]
+    pub fn note_gui_timer_drop() {}
+    #[inline(always)]
+    pub fn note_rehome() {}
     #[inline(always)]
     pub fn row_static(_i: usize) -> bool {
         false

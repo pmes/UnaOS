@@ -18,6 +18,15 @@ default = []
 # string and no timer-ISR work exists in an unarmed kernel. Enable via `UNAOS_DEADMAN=1`. Kept in sync
 # with arroyo AND builder/src/main.rs.
 deadman = []
+# WEDGEINJ: THE FAULT UNDER TEST, ON DEMAND. Arms `video/wm.rs`'s injected phase-33 park — the render
+# core clears IF and spins forever from inside the present blit, which is indistinguishable to every
+# other core from the non-returning Kepler BAR1 store that wedged metal boots 13/14/15/16. It exists
+# so WCSER-STEAL and WCSER-REHOME can be GATED BY EXECUTION rather than by compilation: the fault has
+# never occurred in QEMU, and a recovery path that has never run is a claim. TEST-ONLY, and it costs
+# one AP for the rest of the run BY DESIGN. Weakens no protection and adds no code to an unarmed
+# build (the call site degrades to an empty inline shim). x86_64-only. Enable via `UNAOS_WEDGEINJ=1`.
+# NEVER arm it on bench media. Kept in sync with arroyo AND builder/src/main.rs.
+wedgeinj = []
 # R0 / rtwit: the WORST-CASE RULER. Arms the `[rtwit]` tail instruments (input→present latency,
 # per-lock max hold, max interrupt-mask span) — MAXes only, never a mean. Pure measurement: no
 # scheduling/locking/present behaviour changes. DEFAULT OFF => every hook degrades to an empty inline

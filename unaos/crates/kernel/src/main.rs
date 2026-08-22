@@ -1530,6 +1530,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 svc_cpu,
                 unaos_kernel::arch::sched::PRIO_NORMAL,
             );
+            // WCSER-REHOME: record where the render role LIVES, as distinct from where the split
+            // published it. They are the same today and stop being the same the moment a steal
+            // declares this core dead — see `render_rehome_service`.
+            RENDER_ROLE_CPU_X86.store(render_cpu, core::sync::atomic::Ordering::Relaxed);
             unaos_kernel::arch::sched::spawn(
                 "render",
                 x86_render_service,
@@ -2956,12 +2960,247 @@ static GUI_DEPTH_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::At
 #[cfg(target_arch = "x86_64")]
 const X86_GUI_PULSE_MS: u64 = 250;
 
-/// SCHED-X86: forward one event into `GUI_CHANNEL_X86` and bump the sent counter — the single choke
+/// INPUT-UNGATE: OFFER one event to `GUI_CHANNEL_X86` and bump the sent counter — the single choke
 /// point, so `GUI_SENT_X86` can never disagree with the real send count.
+///
+/// **This replaced a blocking `gui_send_x86`, and the replacement is the arc.** The old choke point
+/// called `Channel::send`, which parks the caller while the channel is full. That is correct
+/// backpressure against a consumer that is merely SLOW and catastrophic against one that is DEAD,
+/// and boot 16 produced the dead one: the render task's core parked inside a non-returning MMIO
+/// store, so the channel's only consumer stopped existing, the 64 slots filled, and
+/// `x86_input_service` parked in `send` for the remaining 497 seconds. Because that task is also the
+/// only drain of `pal::EVENT_QUEUE`, the whole input path died behind the compositor.
+///
+/// The refusal is handed back rather than swallowed (`Err(ev)`), because WHAT TO DO ABOUT IT IS A
+/// QUESTION ABOUT THE EVENT, not about the channel, and only the caller can answer it — see the
+/// three-class policy in [`x86_input_service`]. `GUI_SENT_X86` is charged only on the accepted path,
+/// so `sent - recv` keeps reading as live occupancy exactly as before.
 #[cfg(target_arch = "x86_64")]
-fn gui_send_x86(ev: unaos_kernel::pal::Event) {
-    GUI_SENT_X86.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    GUI_CHANNEL_X86.send(ev);
+fn gui_try_send_x86(ev: unaos_kernel::pal::Event) -> Result<(), unaos_kernel::pal::Event> {
+    match GUI_CHANNEL_X86.try_send(ev) {
+        Ok(()) => {
+            GUI_SENT_X86.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+        Err(back) => {
+            unaos_kernel::deadman::note_gui_declined();
+            Err(back)
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// WCSER-REHOME — A CORE THE STEAL DECLARED DEAD LOSES ITS SINGLETON ROLES; THEY DO NOT DIE WITH IT.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+//
+// WCSER-STEAL closed half of a defect and named the other half as an accepted trade: *"the parked
+// core is not recovered, its window is not recovered."* Boot 16 showed the trade was mispriced,
+// because the list of what dies with the core was longer than the window. The render task lives on
+// that core, and the render task is the ONLY consumer of `GUI_CHANNEL_X86`. When it died the channel
+// acquired no consumer for the remaining 497 seconds, `x86_input_service` filled all 64 slots and
+// parked in `Channel::send`, and — because that task is also the sole drain of `pal::EVENT_QUEUE` —
+// the machine's entire input path went with it. `[deadman] hq=25`, pinned, unmoving, for seven
+// minutes, while the desktop repainted at 66 composite passes a second on a stolen gate.
+//
+// So the steal is only half a recovery. It re-homes the PANEL. Everything else pinned to the dead
+// core is re-homed here, on the principle stated generally because the general statement is the
+// fix: **a core declared dead by the steal has its singleton roles reassigned, and any role that is
+// NOT reassigned is named explicitly as a known-abandoned trade.** For this kernel that list is:
+//
+//   RE-HOMED — the render service (`x86_render_service`): the `GUI_CHANNEL_X86` drain, the event
+//              dispatch and the panel present. Re-homed because its death is unrecoverable from the
+//              producer side at any price — a non-parking producer facing a channel with no consumer
+//              coalesces and holds forever, which is a quieter death, not a lesser one.
+//   ABANDONED — the dead core itself, and the ring-3 window whose present was in flight when it
+//              parked. Peter has accepted both; they are one core and one window, and nothing in
+//              software un-parks a core stopped on an instruction. Named here rather than left to be
+//              rediscovered.
+//   NOT AT RISK — `x86_usb_pump` and `x86_input_service` share the SERVICE core, not the render
+//              core, so the steal has never cost them anything. If a future steal names the service
+//              core the same census must be run for them, and this comment is the place it is owed.
+//
+// ── THE CORPSE'S LOCKS — the hazard that could have made this fix worse than the defect ──────────
+//
+// `arch::x86_64::sched::Mutex` is `{ sem: Semaphore, data: UnsafeCell<T> }`: a bare semaphore permit
+// with NO OWNER RECORD, and nothing in task teardown walks a dying task's held locks (`reap_killed`
+// handles an explicit `kill`; a core parked on an instruction is never reaped at all). So **a task
+// that dies mid-chain holds every lock it held, forever.** A replacement that then takes one of them
+// parks forever too — and that is a SECOND freeze, quieter than the first, with nothing on the wire.
+// It would convert "input dead, visible" into "input dead and the recovery also dead, invisible".
+//
+// So the question is not rhetorical and it is answered before the spawn, not after. What can the
+// corpse hold at the instruction it stopped on — `stage_window`'s phase-33 row blit?
+//
+//   * `COMP_GATE` — yes, and that is the whole reason WCSER-STEAL exists. Stolen, and the release
+//     side is identity-checked so a revenant cannot double-release it.
+//   * `STAGE[stage_pool_index()]` — yes, but `stage_pool_index()` is `meter_current_cpu()`, so the
+//     entry is PER-CORE. The replacement runs on a different core and composes into a different
+//     entry. Structurally disjoint, not merely usually-free.
+//   * `TABLE` (the window table) — NO. `composite_inner` takes it in a scoped block that produces the
+//     row snapshot and the `BlitGuard` registration, and the guard is dropped at the end of that
+//     block, well before the draw loop the corpse is stuck in. Boot 16 is the independent
+//     confirmation: ~66 composite passes per second completed for the 510 s AFTER the steal, and
+//     every one of them takes `TABLE`. If the corpse held it, none would have.
+//   * `WRITER` — NO. `let fb = *super::WRITER.lock()` copies the handle and drops the guard on the
+//     same line; nothing holds it across a blit.
+//   * The heap lock — NO. The phase-33 row loop allocates nothing.
+//
+// That is why the rescue instance is safe to start, and it is also why it does NOT re-mint the shell
+// window: `open_shell_window` allocates and takes the table, which is fine, but the row it would add
+// duplicates one the corpse's surface still backs. Skipping it is the narrower action.
+//
+// KNOWN RESIDUAL, named rather than discovered later: the corpse's `BlitGuard` is never dropped, so
+// its `BLIT_ACTIVE` registration stands for the rest of the boot. Nothing here waits on that count
+// reaching zero — a raised `DRAIN_PENDING` makes a composite pass SKIP, not block — so it costs a
+// leaked count and not a hang. It predates this arc (it is a property of the steal, not of the
+// re-home) and boot 16 ran 510 s with it standing.
+
+/// WCSER-REHOME — cores the steal has declared dead this boot, one bit each. Consulted when picking
+/// a rescue core so a re-home can never land on a corpse (which would silently be a no-op forever).
+#[cfg(target_arch = "x86_64")]
+static DEAD_CORES_X86: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WCSER-REHOME — which core currently carries the render service's singleton role.
+///
+/// Deliberately NOT `smp::render_cpu()`. That is the core the boot-time split PUBLISHED, and the
+/// whole point of a re-home is that the role moves off it; reading the published split would make a
+/// second death — of the rescue core — look like the death of a core that carried nothing, and the
+/// recovery would silently not happen the second time. `usize::MAX` until the handoff spawns.
+#[cfg(target_arch = "x86_64")]
+static RENDER_ROLE_CPU_X86: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// WCSER-REHOME — THE RENDER ROLE'S OWNER EPOCH. Bumped once per re-home, before the replacement is
+/// spawned. Each render instance captures it at entry and re-checks it every pass; an instance whose
+/// epoch no longer matches has been SUPERSEDED and retires itself.
+///
+/// **This is the revenant check, generalised from a resource to a ROLE.** `comp_gate_release` already
+/// refuses to release `COMP_GATE` unless this core is still `COMP_HOLDER_CORE` — a woken corpse
+/// declines instead of handing a second compositor the panel. The same hazard exists one level up and
+/// is strictly worse there: a corpse that wakes and resumes its render loop becomes a SECOND consumer
+/// of `GUI_CHANNEL_X86` and a second owner of the panel present, which is exactly the state
+/// `fbcon::detach()` exists to prevent. Every event it then took would be an event the real incumbent
+/// never saw — silent, intermittent input loss with nothing on the wire.
+///
+/// **"The dead core never comes back" is an observation, not an invariant.** Boot 16 shows core 1's
+/// `dec=` nibble at 0 across all 494 post-steal samples, which is evidence it never ran again, not a
+/// guarantee that a stuck BAR store cannot eventually retire. `COMP_REVENANTS` exists precisely
+/// because this tree already declined to build on that assumption once. The check is two relaxed
+/// loads per pass; the assumption is a silent double-consumer.
+///
+/// An EPOCH rather than a core index, so the discipline stays correct even if a role were ever
+/// re-homed back onto a core it had previously occupied. Written only by `render_rehome_service`,
+/// which runs on one task (the pump) and is fed by a once-per-death mailbox, so the bump and the
+/// spawn it precedes cannot interleave with another re-home.
+#[cfg(target_arch = "x86_64")]
+static RENDER_ROLE_EPOCH_X86: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// WCSER-REHOME — set across the spawn of a RESCUE render instance, and consumed by that instance on
+/// entry. A rescue instance skips `open_shell_window`: the dead instance's shell row is still
+/// registered and its surface memory is still mapped (a parked core frees nothing), so minting a
+/// second row would put two shell windows on the desktop and pay ~5 MB for the privilege.
+#[cfg(target_arch = "x86_64")]
+static RENDER_RESCUE_X86: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// WCSER-REHOME — re-home the singleton roles of any core the steal has just declared dead.
+///
+/// Called from `x86_usb_pump`'s service pass, and that placement is the same one `DESKTOP-APP` uses
+/// for the same three reasons: `spawn` allocates a task and a kernel stack and takes a run-queue
+/// lock, so it must run from a scheduled task and never from inside the composite pass where the
+/// steal happens; the pump is on the SERVICE core, which the steal has never killed; and only a
+/// repeating pass can notice a death that happens at an arbitrary later second. Two relaxed loads
+/// per pass when nothing is owed.
+#[cfg(target_arch = "x86_64")]
+fn render_rehome_service() {
+    use core::sync::atomic::Ordering::{Relaxed, SeqCst};
+    // `take`, not a read: exactly one caller ever sees a given death, so exactly one replacement is
+    // ever spawned for it.
+    let Some(dead) = unaos_kernel::video::wm::comp_dead_core_take() else {
+        return;
+    };
+    if dead < 64 {
+        DEAD_CORES_X86.fetch_or(1u64 << dead, Relaxed);
+    }
+
+    // Did this core carry the one role we re-home? A `no` is still worth a line: the census is the
+    // deliverable, and a silent return would make "nothing was owed" and "we forgot" identical.
+    if RENDER_ROLE_CPU_X86.load(Relaxed) != dead {
+        serial_println!(
+            ":: [wcser] REHOME: c{} is dead but carried no singleton role this kernel re-homes \
+             (render role is on c{}); the core and any in-flight window are the accepted trade ::",
+            dead,
+            RENDER_ROLE_CPU_X86.load(Relaxed)
+        );
+        return;
+    }
+
+    // A rescue core must be neither the dead core nor the SERVICE core. `xhci_worker_cpu` already
+    // enforces exactly that exclusion, and for the reason that matters here: the render service is a
+    // preemptible taker of `XHCI_CONTROLLER` and so is `x86_usb_pump`, and two preemptible takers of
+    // a raw spinlock on one core deadlock it. Re-homing the render role onto the service core would
+    // trade a dead channel for a dead machine. So we ask the placement authority rather than
+    // re-deriving it.
+    //
+    // **`DEAD_CORES_X86` is NOT belt-and-braces here — without it this loop can hand back the corpse.**
+    // `smp::ONLINE_APS` is written exactly once, at `start_aps` time, and NOTHING EVER REMOVES A CORE
+    // FROM IT: a core stays a placement candidate forever, however dead it is. The placement helpers
+    // exclude the render and service cores by ROLE, and the render core is the very core we are
+    // replacing — so on a machine where it is also the only pool candidate, an unguarded
+    // `xhci_worker_cpu(0)` would answer with the core that just died and the "recovery" would spawn a
+    // task onto a core that never dispatches. Silent, and indistinguishable from success on the wire.
+    // So placement is EXPLICIT: ask the authority, then reject any answer we know to be a corpse.
+    let mut rescue = None;
+    for n in 0..unaos_kernel::arch::smp::online_aps().len() {
+        match unaos_kernel::arch::smp::xhci_worker_cpu(n) {
+            Some(c) if c < 64 && DEAD_CORES_X86.load(Relaxed) & (1u64 << c) == 0 => {
+                rescue = Some(c);
+                break;
+            }
+            Some(_) => continue,
+            None => break, // the pool is exhausted or co-location is forbidden; both mean decline
+        }
+    }
+    let Some(rescue) = rescue else {
+        // DECLINE, LOUDLY. Co-locating is a documented deadlock and inventing a core is not an
+        // option, so the honest answer is that this machine cannot recover — said out loud, on the
+        // one transport a wedged boot still has, rather than papered over with a placement that
+        // hangs. The input path stays ungated either way: INPUT-UNGATE means the producer is still
+        // draining `pal::EVENT_QUEUE` and the pump still has its CPU.
+        serial_println!(
+            ":: [wcser] REHOME DECLINED: c{} carried the render role and there is no live core that \
+             is neither it nor the service core — co-locating on the service core is the \
+             XHCI_CONTROLLER deadlock, so the role stays down == tripwire ::",
+            dead
+        );
+        return;
+    };
+
+    // Publish the new home BEFORE the spawn, so a second death racing us reads the right role owner.
+    //
+    // The EPOCH bump is what retires the corpse if it ever wakes: it is published here, ahead of the
+    // replacement, so the incumbent-check at the top of every render pass is already armed by the
+    // time either instance can run it. `Release` pairs with the `Acquire` the new instance uses to
+    // capture its own epoch at entry.
+    RENDER_ROLE_EPOCH_X86.fetch_add(1, core::sync::atomic::Ordering::Release);
+    RENDER_ROLE_CPU_X86.store(rescue, Relaxed);
+    RENDER_RESCUE_X86.store(true, SeqCst);
+    unaos_kernel::arch::sched::spawn(
+        "render-rehomed",
+        x86_render_service,
+        rescue,
+        rescue,
+        unaos_kernel::arch::sched::PRIO_NORMAL,
+    );
+    unaos_kernel::deadman::note_rehome();
+    serial_println!(
+        ":: [wcser] REHOMED the render role from DEAD c{} to c{} — GUI_CHANNEL_X86 has a consumer \
+         again and the input path is ungated; c{} and its in-flight window stay lost == tripwire ::",
+        dead,
+        rescue,
+        dead
+    );
 }
 
 /// PTRCH — relative-motion events SUMMED into the event in front of them by the render service's
@@ -5521,6 +5760,17 @@ fn x86_usb_pump(cpu: usize) {
         // keyboard/trackpad). Same polled-service spot as the xHCI hooks above.
         #[cfg(feature = "ehcihid")]
         unaos_kernel::drivers::ehci::service_ehci_hid();
+        // WEDGEINJ (wedgeinj knob, default OFF) — keep a LIVE core asking for the gate after the
+        // injected park, because the steal is a branch inside `composite` and not a timer. On metal
+        // this lane supplied that condition for free (`pace_service` / `console_service` above);
+        // on an idle QEMU desktop nothing asks and the steal never fires. Compiles to nothing
+        // without the knob, and does nothing even with it until the fault has been injected.
+        unaos_kernel::video::wm::wedgeinj_drive_maybe();
+        // WCSER-REHOME: re-home the singleton roles of any core the compositor's steal has just
+        // declared dead. HERE because this is the repeating service pass on the core the steal has
+        // never killed, and because `spawn` must not be called from inside the composite pass where
+        // the death is detected. Two relaxed loads per pass when nothing is owed.
+        render_rehome_service();
         // KEYREPEAT-X86: synthesise a held key's repeat into EVENT_QUEUE, which `x86_input_service`
         // drains and forwards over GUI_CHANNEL_X86 exactly as it does a real press.
         x86_typematic_pump();
@@ -5657,11 +5907,61 @@ fn x86_usb_pump(cpu: usize) {
 ///    with no input arriving. `Event::Timer` is inert everywhere else on the path: `wc_click_route`
 ///    ignores non-`Button` events, and `pack_input` returns `None` for it so `user_input_route` hands
 ///    it straight back rather than pushing it into a focused app's ring.
+///
+/// # INPUT-UNGATE — THIS TASK NEVER PARKS ON THE RENDER CHANNEL
+///
+/// It used to. `gui_send_x86` called `Channel::send`, which blocks while the 64 slots are full, and
+/// the channel's only consumer is the render task. Boot 16 (2026-08-22) is what that costs when the
+/// consumer dies rather than lags: core 1 parked inside a non-returning MMIO store at 83.8 s, taking
+/// the render task with it; by 101 s this task had filled the channel and parked in `send`; and
+/// `[deadman] hq=25` then sat unmoving for the remaining **497 seconds** of the boot. Because this
+/// task is also the sole drain of `pal::EVENT_QUEUE`, its park killed the entire input path. Input
+/// was gated behind the compositor BY CONSTRUCTION, and no amount of compositor repair fixes that.
+///
+/// So the send is an OFFER ([`gui_try_send_x86`]) and the loop always comes back round. What happens
+/// to a refused event is decided per CLASS, because the classes are not equally recoverable and
+/// treating them alike is how a keystroke goes missing:
+///
+///  * **Relative `Event::Mouse` — COALESCED, never dropped.** Deltas are additive (`cursor::move_rel`
+///    adds; `wc_drag_motion` reads the resulting ABSOLUTE position), so summing a refused run and
+///    delivering the sum later steers the arrow and any live drag to the identical place. This is
+///    `GUI_FOLD_X86`'s fold moved to the PRODUCER side, and it inherits that ledger's conservation
+///    reasoning verbatim: a coalesced report is not a lost report, so it is counted in its own term
+///    (`deadman`'s `in=` first field) and never netted out of `GUI_SENT_X86` — which counts what the
+///    channel ACCEPTED and must keep meaning that for `sent - recv` to read as live occupancy.
+///  * **`MouseAbsolute` is NOT folded**, for the reason the consumer-side fold gives: absolute
+///    positions are not additive, and the QEMU tablet fixtures assert an exact resting coordinate.
+///    It takes the must-survive path below.
+///  * **`Key` / `KeyUp` / `Button` / `Wheel` / `MouseAbsolute` — MUST SURVIVE.** A refused one is
+///    held in a single slot and, crucially, **we stop taking from `pal::EVENT_QUEUE`**. The ring IS
+///    the backpressure: it is bounded, its overflow is already counted (`EVQ_DROP_KEY`), and leaving
+///    events in it costs nothing but latency — whereas dropping them here would convert a visible
+///    hang into invisible loss, which is strictly worse because it looks healthy. We return to the
+///    top of the loop rather than parking, so the ring keeps being polled and, above all, **the USB
+///    pump sharing this core keeps its CPU**.
+///  * **`Event::Timer` — dropped freely.** It is loss-tolerant filler by contract (see the heartbeat
+///    note above: every consumer on the path ignores it), so a full channel simply sheds it. Counted
+///    anyway — "allowed to lose" and "lost silently" are different claims.
+///
+/// ORDER IS PRESERVED. Anything owed is retired before anything new is taken from the ring, folded
+/// motion ahead of the held event (the fold was taken from in FRONT of it), and a heartbeat is never
+/// injected while something is owed. So a `Button` can never overtake motion that preceded it, which
+/// is the ordering GHOST-DRAG's cure is built on.
+///
+/// This is necessary and NOT sufficient on its own. A non-parking producer facing a consumer that
+/// will never return just coalesces and holds forever; what actually restores input is the channel
+/// getting a live consumer again, which is WCSER-REHOME's job (see `render_rehome_service_once`).
 #[cfg(target_arch = "x86_64")]
 fn x86_input_service(cpu: usize) {
     use core::sync::atomic::Ordering;
+    use unaos_kernel::pal::Event;
     serial_println!(":: SCHED-X86: input task dispatched on core {} ::", cpu);
     let mut pulse_ms = unaos_kernel::arch::ms();
+    // INPUT-UNGATE producer state. `owed_motion` is summed relative travel the channel refused;
+    // `owed_event` is the ONE must-survive event it refused. Both are owed to the channel in that
+    // order and nothing new is taken from the ring until both are clear.
+    let mut owed_motion: Option<(i32, i32)> = None;
+    let mut owed_event: Option<Event> = None;
     loop {
         // WCSER-H — the overdue probe runs FIRST, before the event pump: boot 8B proved the pump
         // can block into a wedged GUI (zero input lines within ~100ms of the hold, and the probe's
@@ -5674,13 +5974,74 @@ fn x86_input_service(cpu: usize) {
             // pass after it exits does not fire a stale backlog of one Timer.
             pulse_ms = unaos_kernel::arch::ms();
         } else {
-            while let Some(ev) = unaos_kernel::pal::next_event() {
-                gui_send_x86(ev);
+            // (1) RETIRE WHAT WE OWE, oldest first. Motion ahead of the held event: the fold was
+            //     taken from in front of it, so sending the event first would reorder the stream.
+            if let Some((dx, dy)) = owed_motion {
+                if gui_try_send_x86(Event::Mouse { x: dx, y: dy }).is_ok() {
+                    owed_motion = None;
+                }
             }
+            if owed_motion.is_none() {
+                if let Some(ev) = owed_event.take() {
+                    if let Err(back) = gui_try_send_x86(ev) {
+                        owed_event = Some(back);
+                    }
+                }
+            }
+
+            // (2) DRAIN THE RING. This runs whether or not the channel is accepting — draining is
+            //     this task's other job and the one the pump's throughput depends on. It stops only
+            //     when a must-survive event has nowhere to go, and then the ring holds the rest.
+            while owed_event.is_none() {
+                let Some(ev) = unaos_kernel::pal::next_event() else { break };
+                match ev {
+                    // Relative motion: fold into anything already owed, else offer it.
+                    Event::Mouse { x, y } => match owed_motion.as_mut() {
+                        Some(acc) => {
+                            // `saturating_add` for the reason `pal`'s fold uses it: the sum is
+                            // unbounded in principle and a wrapped delta would throw the arrow
+                            // across the panel.
+                            acc.0 = acc.0.saturating_add(x);
+                            acc.1 = acc.1.saturating_add(y);
+                            unaos_kernel::deadman::note_gui_coalesced();
+                        }
+                        None => {
+                            if gui_try_send_x86(ev).is_err() {
+                                owed_motion = Some((x, y));
+                            }
+                        }
+                    },
+                    // Loss-tolerant filler. The ring does not carry `Timer` today — the heartbeat is
+                    // minted below, in this task — so this arm is unreachable in the current tree.
+                    // It is written anyway because the POLICY is what is being stated: if a producer
+                    // ever does enqueue one, it must be shed rather than allowed to occupy the slot
+                    // a keystroke needs. An unreachable arm that states the rule is cheaper than a
+                    // future reader inferring the rule from the absence of one.
+                    Event::Timer => unaos_kernel::deadman::note_gui_timer_drop(),
+                    // Everything else must survive verbatim and in order. With motion still owed it
+                    // cannot go out yet even if the channel would take it — that would put it ahead
+                    // of travel that preceded it.
+                    other => {
+                        if owed_motion.is_some() {
+                            owed_event = Some(other);
+                        } else if let Err(back) = gui_try_send_x86(other) {
+                            owed_event = Some(back);
+                        }
+                    }
+                }
+            }
+
+            // (3) THE HEARTBEAT. Shed it while anything is owed — it is inert filler and must never
+            //     jump the queue ahead of real input — and shed it again if the channel refuses.
             let now = unaos_kernel::arch::ms();
             if now.wrapping_sub(pulse_ms) >= X86_GUI_PULSE_MS {
                 pulse_ms = now;
-                gui_send_x86(unaos_kernel::pal::Event::Timer);
+                if owed_motion.is_some()
+                    || owed_event.is_some()
+                    || gui_try_send_x86(Event::Timer).is_err()
+                {
+                    unaos_kernel::deadman::note_gui_timer_drop();
+                }
             }
         }
         unaos_kernel::arch::sched::sleep_ticks(1); // ~1 ms at the calibrated 1 kHz tick
@@ -5855,6 +6216,30 @@ fn x86_render_service(cpu: usize) {
         screen.paint_desktop_scene();
     }
 
+    // WCSER-REHOME — is this instance a REPLACEMENT for a render task that died with its core?
+    //
+    // Consumed (`swap`) rather than read, so the flag cannot leak into some later ordinary spawn.
+    // A rescue instance differs from the original in exactly one way, and only one: it does NOT mint
+    // a shell window. The dead instance's row is still registered in `wm`'s table and its surface
+    // memory is still mapped — a parked core frees nothing — so that window keeps compositing its
+    // last contents, and minting a second one would put two shell windows on the desktop and pay
+    // ~5 MB for the confusion. The trade is named rather than hidden: **the rescued desktop's shell
+    // window is a corpse — it composites, and nothing types into it.** Keys still reach ring-3 apps
+    // through `user_input_route` and the window system still gets its clicks, which is the whole of
+    // what "input works again" has to mean for this recovery to be worth having.
+    let rescue = RENDER_RESCUE_X86.swap(false, Ordering::SeqCst);
+    // WCSER-REHOME — this instance's OWNER EPOCH, captured once. Re-checked every pass below; see
+    // `RENDER_ROLE_EPOCH_X86` for why a role needs the same revenant discipline `comp_gate_release`
+    // gives the gate.
+    let my_epoch = RENDER_ROLE_EPOCH_X86.load(Ordering::Acquire);
+    if rescue {
+        serial_println!(
+            ":: SCHED-X86: render task is a REHOMED instance on core {} — draining GUI_CHANNEL_X86 \
+             again; the previous instance's shell window is a corpse and is not re-minted ::",
+            cpu
+        );
+    }
+
     let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen);
     let mut console = unaos_kernel::console::Console::new();
 
@@ -5881,7 +6266,10 @@ fn x86_render_service(cpu: usize) {
                 unaos_kernel::video::wm::WIN_NONE,
             )
         };
-        if desktop {
+        // WCSER-REHOME — `!rescue`: a replacement instance does not re-mint the dead one's shell
+        // window (see the `rescue` latch above). `empty()` is the same declined-surface shape
+        // `open_shell_window` already returns on failure, so no path below needs a new case.
+        if desktop && !rescue {
             let info = front_fb.info();
             match open_shell_window(info.width, info.height) {
                 Some((store, fb, id)) => {
@@ -5950,7 +6338,17 @@ fn x86_render_service(cpu: usize) {
     // both against the pool `worker_cpu`/`xhci_worker_cpu` will hand out. Three producers, so the
     // PASS/FAIL can actually fail — unlike a check made at publish time against the publisher's own
     // arguments, which is a tautology dressed as evidence.
-    unaos_kernel::arch::smp::confirm_render_core(cpu);
+    //
+    // WCSER-REHOME — NOT on a rescue instance, and the skip is a correctness fix rather than a
+    // convenience. `confirm_render_core` asks "is this task on the core the boot-time split
+    // published?", and for a re-homed render task the honest answer is NO BY CONSTRUCTION: the
+    // published core is the corpse we were spawned to replace. Running it would print
+    // `verdict=FAIL` for a recovery that worked perfectly, which is worse than not printing — a
+    // FAIL that fires on the success path teaches every later reader to ignore the instrument.
+    // The re-home prints its own witness (`[wcser] REHOMED …`) naming both cores instead.
+    if !rescue {
+        unaos_kernel::arch::smp::confirm_render_core(cpu);
+    }
 
     // CURSOR-HIDE: whether the last pass drew the cursor, so the auto-hide transition erases the
     // sprite exactly once. Driven by the input service's `Event::Timer` pulse when nothing is typed.
@@ -5972,6 +6370,43 @@ fn x86_render_service(cpu: usize) {
     let mut pending: Option<unaos_kernel::pal::Event> = None;
 
     loop {
+        // WCSER-REHOME — AM I STILL THE INCUMBENT? Two relaxed loads, first thing, every pass.
+        //
+        // On every ordinary boot this is a compare that never fails: the epoch moves only when a
+        // steal declares a core dead. It fires in exactly one situation — this task's core was
+        // declared dead, its role was re-homed to a live core, and then this core CAME BACK. That
+        // core is a revenant, and if it simply resumed its loop the machine would have two consumers
+        // of `GUI_CHANNEL_X86` and two owners of the panel present, which is the split-brain
+        // `fbcon::detach()` exists to prevent.
+        //
+        // It RETIRES rather than returns, and that is load-bearing: `wm`'s rows hold RAW POINTERS
+        // into this function's locals (`_shell_store`'s heap buffer, the panel `Screen`), and the
+        // whole reason those are flat locals in a never-returning task is to keep them alive for the
+        // rows' lifetime. Returning would drop them and leave the compositor blitting from freed
+        // memory. So the frame stays on the stack forever and the task sleeps out of the way — off
+        // the channel, off the panel, holding nothing.
+        if RENDER_ROLE_EPOCH_X86.load(Ordering::Relaxed) != my_epoch {
+            serial_println!(
+                ":: [wcser] REVENANT render instance on core {} RETIRING — epoch {} was superseded \
+                 by {}; this core was declared dead and its role re-homed, and a second consumer of \
+                 GUI_CHANNEL_X86 is worse than none == tripwire ::",
+                cpu,
+                my_epoch,
+                RENDER_ROLE_EPOCH_X86.load(Ordering::Relaxed)
+            );
+            loop {
+                unaos_kernel::arch::sched::sleep_ticks(1000);
+            }
+        }
+        // WEDGEINJ (wedgeinj knob, default OFF) — the injected phase-33 park, and it is called HERE,
+        // at the top of the render loop, for two reasons. It must run on the RENDER task, because
+        // the defect under test is "the core carrying a singleton role died" and killing a pool core
+        // would prove nothing. And it must run BEFORE the `recv` below, so the task is already gone
+        // when the input service next offers an event — which is the ordering that makes the channel
+        // fill and the whole INPUT-UNGATE / WCSER-REHOME chain execute. The `Event::Timer` heartbeat
+        // wakes this loop every 250 ms, so the fuse is honoured within one pulse of its deadline even
+        // on a desktop with no input at all. Compiles to nothing without the knob.
+        unaos_kernel::video::wm::wedgeinj_park_maybe();
         // Block until an event arrives — an idle render core burns nothing. PTRCH: unless one is
         // already in hand, in which case parking would be a deadlock against an event we ourselves
         // removed from the channel.
@@ -5993,8 +6428,15 @@ fn x86_render_service(cpu: usize) {
             // for the producer's backlog — but on the SCHED-X86 split the backlog does not sit there.
             // `x86_input_service` runs on its own core and drains `pal::next_event()` to exhaustion
             // every ~1 ms, so the ring is essentially always empty and there is nothing there to fold
-            // INTO; what the input service does with each event is `gui_send_x86` it into this
-            // 64-slot channel, one slot per report. So a render core stalled inside a witness burst
+            // INTO; what the input service does with each event is offer it into this 64-slot
+            // channel, one slot per report. So a render core stalled inside a witness burst
+            //
+            // INPUT-UNGATE amends the first clause, and only the first: the producer now stops
+            // taking from the ring while it holds a must-survive event this channel refused, so
+            // "essentially always empty" is true while this task is KEEPING UP and false while it is
+            // not. That does not weaken the argument for this fold — it strengthens it. The backlog
+            // still lands here first (the channel fills before the ring starts holding), and the
+            // producer's own fold only ever engages after this one has already been outrun.
             // accumulates the whole gesture HERE, as 64 separate entries, and then walks them one at
             // a time — each costing a `wc_route_event`, a witness line and a `wc_route_tail`. Same
             // defect, one pipe stage downstream, and the ring's fold cannot see it.
