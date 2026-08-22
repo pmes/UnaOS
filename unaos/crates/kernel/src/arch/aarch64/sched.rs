@@ -8813,3 +8813,44 @@ pub fn run_capstone_boot_core(cpu: usize) -> ! {
         core::hint::spin_loop();
     }
 }
+
+// ── SHELLUP — `spawn_prio` WITH A CALLER-SIZED KERNEL STACK ─────────────────────────────────────
+//
+// Appended at the FILE TAIL rather than beside its `spawn_prio` / `spawn_stack` siblings, for the
+// reason PARITY §5.3 gives and the U7STK block at the head of this file already obeys: a definition
+// inserted higher up renumbers every panic `Location` recorded below it, and `arch/aarch64/sched.rs`
+// is compiled into the knob-off `kernel8.img` whose byte-identity is this track's standing proof.
+// Nothing is below this, so nothing moves.
+//
+// WHAT IT IS. The `spawn_stack` × `spawn_prio` CROSS. The Pi render service needs both halves at
+// once — the interactive SERVICE priority band AND a stack larger than the blanket 16 KiB
+// [`TASK_STACK_SIZE`] — and neither existing helper gives both: `spawn_stack` takes a size but pins
+// `PRIO_NORMAL`, `spawn_prio` takes a band but hard-codes the blanket size.
+//
+// WHY IT EXISTS. The render task is the SECOND task the SPIN-6 refusal below has convicted of running
+// its own frame chain off the bottom of the blanket 16 KiB — after `u7-launch`, whose cure was this
+// same one (32 KiB; see the U7STK block). Pi metal, dsktp boot 10, BOTH flights:
+//
+//   [spin6] cpu=1 REFUSING corrupt switch-in: task=103:render ctx_sp=0x2089f80
+//   outside its stack [0x208a000,0x208e000)      — flight 1, 128 B below its OWN low bound
+//   [spin6] cpu=1 REFUSING corrupt switch-in: task=98:render ctx_sp=0x2085fa0
+//   outside its stack [0x2086000,0x208a000)      — flight 2, 96 B below
+//
+// `ctx_sp` below the task's own low bound is the U7STK signature exactly — this task's frame chain,
+// not a neighbour writing into it. The corroborating measurement is already on the same wire: the
+// `[u7stk] at=after:pidesk_arm` probe reports `hw=16496` for `u7-launch`, i.e. the desktop-arming
+// subtree ALONE carries a high-water 112 bytes past 16 KiB, while the render task overflowed its own
+// 16 KiB by 96..128. Same cascade, same order of depth, same cure.
+//
+// As with `spawn_stack`, a size passed here MUST come with its measurement. The render task's is the
+// `[u7stk] at=render:pass` probe folded onto its `[sched6]` cadence — see the spawn site in `main.rs`.
+pub fn spawn_prio_stack(
+    name: &'static str,
+    entry: fn(usize),
+    arg: usize,
+    cpu: usize,
+    priority: u8,
+    stack_bytes: usize,
+) -> u64 {
+    spawn_inner(name, entry, arg, cpu, priority, None, stack_bytes)
+}

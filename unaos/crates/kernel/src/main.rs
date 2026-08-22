@@ -1367,12 +1367,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 input_cpu,
                 unaos_kernel::arch::sched::PRIO_SERVICE,
             );
-            unaos_kernel::arch::sched::spawn_prio(
+            unaos_kernel::arch::sched::spawn_prio_stack(
                 "render",
                 render_service,
                 0,
                 render_cpu,
-                unaos_kernel::arch::sched::PRIO_SERVICE,
+                unaos_kernel::arch::sched::PRIO_SERVICE, RENDER_STACK_SIZE, // SHELLUP — the render task gets a RIGHT-SIZED kernel stack, the U7STK cure applied to the SECOND task SPIN-6 convicted of running its own frame chain off the bottom of the blanket 16 KiB. Pi METAL only, dsktp boot 10, BOTH flights — QEMU raspi4b delivers no timer IRQ on this path, so no preemption frame ever lands on this task's stack there and no gate in this tree can reproduce it: `[spin6] cpu=1 REFUSING corrupt switch-in: task=103:render ctx_sp=0x2089f80 outside its stack [0x208a000,0x208e000)`, 128 B below its own low bound (flight 2: 96 B). THE DROP IS WHAT MADE BOOT 10'S DESKTOP — this task is the sole `GUI_CHANNEL.recv()`, the sole serial-shell-inbox drain, and the only site that mints the shell window, so its death left `[click2] depth gui_chan=65 (sent=66 recv=1)` frozen for the rest of BOTH boots, no `[shellwin-pi]` line, no `[pulsewin] open`, and no shell answer on the wire. Const + rationale at the file tail and the arg FOLDED onto this line: knob-off line-neutrality, PARITY §5.3.
             );
             // U11-M2b: the deferred-free REAPER used to be spawned HERE. It is not any more — it now goes up
             // in the `start_aps` block, before the EL0 fixture cascade that can orphan a chain (see the
@@ -4290,7 +4290,7 @@ fn input_service(_: usize) {
             }
             let now = unaos_kernel::arch::ms();
             if now.wrapping_sub(strip_pulse_ms) >= unaos_kernel::ui_status::PSTRIP_PERIOD_MS {
-                strip_pulse_ms = now;
+                strip_pulse_ms = now; #[cfg(feature = "witness")] shellup_census_maybe(); // SHELLUP — the poll-nap TWIN of the census call in `status_tick`, and the only one the QEMU gate can reach: `status-tick` is timer-gated at spawn and QEMU raspi4b delivers no Group-1 IRQ, so on the battery that task does not exist. Same ~250 ms strip cadence, same one-shot census. ⚠ FOLDED, `#[cfg]` on the statement — PARITY §5.3.
                 if !SCREEN_APP_ACTIVE.load(Ordering::Relaxed) {
                     gui_send(unaos_kernel::pal::Event::Timer);
                 }
@@ -4542,7 +4542,7 @@ fn render_service(_: usize) {
         let ev = GUI_CHANNEL.recv();
         GUI_RECV.fetch_add(1, core::sync::atomic::Ordering::Relaxed); // GUI-CLICK-2 depth accounting
         let t0 = unaos_kernel::arch::now_cycles(); #[cfg(feature = "livecon")] unaos_kernel::video::fbcon::console_live_service(); // LIVECON — THE PORT. The console window's presents come off print context (`fbcon::present_deferred`) and land HERE, on the one core that drives the compositor, at this pass's cadence — which is the arc `video/pidesk.rs`'s live-console ledger names. `console_live_service` is a readback bracket around the hook x86's `usbdebug` service loop has called since FBCON-PACE (`fbcon::console_service`) — the service call is unchanged and the bracket only counts presents that actually happened, which is what the one-line `[wc-x] livecon census` proof is read off. It is the PACED take, not a forced flush: `console_service` can only move a present earlier within the frame it was already going to happen in, it is free on a clean ledger (`pend_take` -> `Owed::Nothing`, nothing composited), and it is a no-op on every build where the console is not routed into a window. Top of the pass and not the tail, because a pass has many exits and a deferred band must not be able to miss one. ⚠ FOLDED onto an existing line — `main.rs` is compiled into the knob-off `kernel8.img` whose byte-identity is this track's standing proof and panic `Location` records embed line numbers (PARITY §5.3); knob-off the statement does not exist and no line moves.
-        s6_passes += 1;
+        s6_passes += 1; #[cfg(feature = "witness")] SHELLUP_RENDER_HB.fetch_add(1, core::sync::atomic::Ordering::Relaxed); // SHELLUP — the render task's LIVENESS beat, read by the `[shellup]` census from the input core. It has to be a shared counter and not a local, because the question the census exists to answer is asked from a DIFFERENT task about a task that may already be dead — boot 10 dropped this one 17 log lines after it started (flight 2) and the census must still be able to say so. ⚠ FOLDED and `#[cfg]`-ON-THE-STATEMENT: `main.rs` is compiled into the knob-off `kernel8.img` whose byte-identity is this track's standing proof, so the beat must add no source line (PARITY §5.3) AND leave no MIR statement behind knob-off (quarry.md's inline-shim measurement — an empty call still moved the image).
         // `dirty` — did this pass draw anything that must be presented? `strip_dirty` — must the
         // status strip be (re)composed on top this pass?
         let mut dirty = false;
@@ -4758,7 +4758,7 @@ fn render_service(_: usize) {
                     shell_console.mark_in_window();
                     shell_screen = unaos_kernel::video::Screen::direct(fb);
                     shell_pal = unaos_kernel::pal::TargetPal::new(&mut shell_screen);
-                    shell_id = id;
+                    shell_id = id; #[cfg(feature = "witness")] SHELLUP_SHELL.store(id as u64, core::sync::atomic::Ordering::Relaxed); // SHELLUP — publish the shell window's launch outcome for the `[shellup]` census. `shell_id` is a task LOCAL and the census runs on the input core, so without this store the one tenant the arc is named for is the one tenant the census could not name. ⚠ FOLDED, `#[cfg]` on the statement — PARITY §5.3.
                     // First frame: the prompt into the window's own surface, flushed and composited
                     // once through the owner-fenced present, so the operator has a live shell to
                     // click and type into from the moment the desktop appears.
@@ -4782,7 +4782,7 @@ fn render_service(_: usize) {
                     // The REASON is already on the wire from `open_shell_window`; this is the
                     // CONSEQUENCE, so a capture never has to infer "and therefore the keyboard has
                     // nowhere to land". The scene keeps the glass; nothing is torn down.
-                    shell_declined = true;
+                    shell_declined = true; #[cfg(feature = "witness")] SHELLUP_SHELL.store(SHELLUP_SHELL_DECLINED, core::sync::atomic::Ordering::Relaxed); // SHELLUP — the DECLINE is a launch outcome too, and it is a different one from "never tried": `open_shell_window` ran and said no. The census prints them as `shell=none:declined` vs `shell=none:unminted`, which is the difference between a heap that could not seat a window and a render task that never lived to ask. ⚠ FOLDED — PARITY §5.3.
                     serial_println!("[shellwin-pi] backdrop=crispy-scene shell=none (window declined) ::");
                 }
             }
@@ -4855,7 +4855,7 @@ fn render_service(_: usize) {
             // after it, so a capture reads "composites=N/s" and "who won the dispatches that produced
             // them" as one pair. This is the only site that fires while a fleet is actually live —
             // the scheduler's own two emitters are metal-only and boot-once respectively.
-            unaos_kernel::arch::sched::prio_witness();
+            unaos_kernel::arch::sched::prio_witness(); #[cfg(feature = "witness")] unaos_kernel::arch::sched::stk_probe("render:pass"); // SHELLUP — the render task's own kernel-stack HIGH-WATER, on `[sched6]`'s ~5 s cadence: the instrument half of the `RENDER_STACK_SIZE` fix at the spawn site. Boot 10 dropped this task with NOTHING on the wire saying how deep a render pass actually goes, so the size would have been a guess forever and the next arc that deepens a pass would have rediscovered SPIN-6 on metal instead of watching headroom shrink on a gate. One poison scan + one line per 5 s, `witness`-gated exactly like every other `[u7stk]` probe — so the plain `./arroyo kernel8` media build carries none of it while `kernel8-test` and the metal witness image carry it unconditionally. ⚠ FOLDED, `#[cfg]` on the statement — PARITY §5.3.
             s6_passes = 0;
             s6_composites = 0;
             s6_cyc = 0;
@@ -4877,7 +4877,7 @@ fn status_tick(_: usize) {
         // beside it. This was `sleep_ticks(250)` — a literal second — and it is the OUTER term of the
         // strip's latency budget: raising `PSTRIP_PERIOD_MS` alone would have left metal sampling at
         // 1 Hz regardless, i.e. PULSE-4 doing nothing on the only machine whose panel Peter watches.
-        unaos_kernel::arch::sched::sleep_ticks(unaos_kernel::ui_status::PSTRIP_PERIOD_TICKS);
+        unaos_kernel::arch::sched::sleep_ticks(unaos_kernel::ui_status::PSTRIP_PERIOD_TICKS); #[cfg(feature = "witness")] shellup_census_maybe(); // SHELLUP — the desktop tenant census, driven from the INPUT core and deliberately not from the render task. The whole point is to survive the render task's death: boot 10 dropped `render` before `[sched6]` ever fired once (zero `[sched6]` lines in either flight), so a census hung off the render pass would have been silent on exactly the boot it was written for. This task naps on the strip period and is on a different core, so it reports whether or not the render core still has a tenant. ⚠ FOLDED, `#[cfg]` on the statement — PARITY §5.3.
         // GUI-CLICK-2: suppress the status-strip pulse while a full-screen app owns the screen.
         // render_service is blocked inside dispatch_command and cannot drain GUI_CHANNEL, so an
         // ungated Timer would fill the 64-slot channel in ~16 s at PULSE-4's 4 Hz — a re-run of the exact
@@ -5925,4 +5925,197 @@ fn pidesk_activate_maybe() -> bool {
 #[inline(always)]
 fn pidesk_activate_maybe() -> bool {
     false
+}
+
+// ── SHELLUP — THE RENDER TASK'S STACK, AND THE DESKTOP TENANT CENSUS ────────────────────────────
+//
+// Everything this arc adds to `main.rs` lives HERE, at the file tail, and is CALLED from existing
+// source lines. That is not tidiness: `main.rs` is compiled into the knob-off `kernel8.img` whose
+// byte-identity is this track's standing proof, panic `Location` records embed source line numbers,
+// and PARITY §5.3 measured eleven added COMMENT lines moving the knob-off hash. Nothing is below
+// this block, so nothing moves; every wire-in above is folded onto a line that was already there,
+// with its `#[cfg]` on the STATEMENT so that knob-off it leaves no MIR behind either (quarry.md's
+// inline-shim measurement: an empty `#[inline(always)]` call, perfectly line-neutral, still moved
+// the image by 11997 bytes).
+//
+// ═══ THE CONVICTION ═══
+//
+// dsktp boot 10 came up with no usable shell window and with input that nothing consumed. The cause
+// is ONE event, and it reproduces in BOTH flights of that capture:
+//
+//   flight 1   `:: UI2: status strip armed ::` (render task starts)      log line 1018
+//              `[spin6] cpu=1 REFUSING corrupt switch-in: task=103:render
+//               ctx_sp=0x2089f80 outside its stack [0x208a000,0x208e000)` log line 1115
+//   flight 2   `:: UI2: ... ::` 1057 → `[spin6] ... task=98:render` 1074 — dead in 17 lines.
+//
+// `ctx_sp` 96..128 bytes BELOW the task's own 16 KiB low bound is the U7STK signature: this task's
+// frame chain ran off the bottom of the blanket `TASK_STACK_SIZE`. SPIN-6 refuses the switch-in and
+// DROPS the task, and the core keeps dispatching — so nothing panics and nothing else says a word.
+//
+// WHY THAT ONE DEATH IS THE WHOLE DESKTOP. `render_service` is not one tenant among several. It is:
+//
+//   * the SOLE `GUI_CHANNEL.recv()` in the tree — every keystroke, pointer report and strip pulse
+//     is consumed there and nowhere else;
+//   * the SOLE drain of `serial::shell_inbox` (the SERIAL-FOCUS seam), i.e. the serial shell's only
+//     consumer;
+//   * the ONLY site that mints the shell window (the SHELLWIN-PI lazy arm) and the only caller of
+//     `pulsewin::service()`, which is what actually OPENS the pulse window.
+//
+// So the capture's symptoms are not four faults, they are four projections of one:
+//
+//   `[click2] depth gui_chan=65 (sent=66 recv=1) app_active=false`  — 66 events in, ONE ever taken,
+//        and `recv` is frozen at 1 from the drop onward in both flights;
+//   no `[shellwin-pi]` line in either flight — the shell window was never minted;
+//   no `[pulsewin] open` line in either flight — the pulse window was ARMED by the cascade
+//        (`[pidesk] pulse-window ARMED`, which is the cascade ANNOUNCING it, not opening it) and
+//        then never opened, because the pass that opens it never ran again;
+//   `:: INPUT: PL011 RX interrupt live ::` fires on injected bytes and no shell answer ever comes
+//        back on the wire — the bytes reach `shell_inbox` and sit there unconsumed.
+//
+// AND WHAT THIS FIX DOES NOT REACH — stated because a fix whose limits are not written down gets
+// re-litigated on the next capture. In flight 1 `:: PI-DESK: desktop armed ::` lands at log line
+// 1496, i.e. 381 lines AFTER the render task was already dead; in flight 2 it never lands at all.
+// So flight 2 carries a SECOND, independent defect — the witness cascade never released the panel
+// (its `[el0live] verdict=STARVED` run and the core-2 wedge are the visible end of it) — and a
+// render task with a bigger stack would still have found no desktop to put furniture on there.
+// This arc fixes the render task. It does not fix the cascade, and the census below is written to
+// tell those two apart on the next boot instead of guessing: `desktop=UNARMED` with `render=live`
+// is the cascade's fault, `desktop=armed` with `render=DEAD` is this one's.
+//
+// NOT REPRODUCIBLE ON THE GATE, and that is structural rather than bad luck. The overflow needs a
+// preemption frame stacked on top of an already-deep pass, and timer delivery on this path is
+// metal-only — QEMU raspi4b takes no Group-1 IRQ, so the render task is never preempted there and
+// its chain never gains the frame that pushed it over. `kernel8-test` green does not exonerate the
+// 16 KiB, which is exactly why the size ships WITH an instrument rather than alone.
+
+/// SHELLUP — the render task's kernel stack: 32 KiB, not the scheduler's blanket 16 KiB
+/// (`TASK_STACK_SIZE`). Same size, same cascade and same cure as `u7-launch`, whose own `[u7stk]`
+/// probe reports `hw=16496` at `after:pidesk_arm` — the desktop-arming subtree alone carries a
+/// high-water 112 bytes past 16 KiB. The render task overflowed its 16 KiB by 96..128, so the next
+/// power of two is the measured bound and not a round number. Held to that claim by the
+/// `[u7stk] at=render:pass` probe on the `[sched6]` cadence: when a future arc deepens a render pass
+/// the headroom shrinks on the wire, on the gate, before it shrinks on metal.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+const RENDER_STACK_SIZE: usize = 32 * 1024;
+
+/// SHELLUP — the render task's pass counter, bumped once per `GUI_CHANNEL.recv()` pass. The census
+/// reads it from ANOTHER core to decide whether the render task is still a tenant; a local could not
+/// answer that question about a task that is already gone.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+static SHELLUP_RENDER_HB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// SHELLUP — the shell window's launch outcome, published by the SHELLWIN-PI mint arm.
+/// `0` = never attempted, [`SHELLUP_SHELL_DECLINED`] = `open_shell_window` ran and said no, anything
+/// else = the live `wm::WinId`. Three states, because "no window" has three different causes and the
+/// capture has to name which one it was.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+static SHELLUP_SHELL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// SHELLUP — the `shell=none:declined` sentinel (see [`SHELLUP_SHELL`]). `WinId` is a `u32`, so no
+/// real id can collide with it.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+const SHELLUP_SHELL_DECLINED: u64 = u64::MAX;
+
+/// SHELLUP — ms() at the census's first call, and the heartbeat as of that instant. The pair is the
+/// baseline the liveness verdict is measured against.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+static SHELLUP_ANCHOR_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+static SHELLUP_ANCHOR_HB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// SHELLUP — the census has fired. One line per boot; this is a LAUNCH census, not a monitor.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+static SHELLUP_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// SHELLUP — how long after the anchor the tenants have to launch before the census reports.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+const SHELLUP_SETTLE_MS: u64 = 3000;
+
+/// SHELLUP — and the ceiling on waiting for a desktop that never arms. Flight 2 never armed at all,
+/// so a census that only fired on `armed()` would have been silent on the worse of the two boots.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+const SHELLUP_FLOOR_MS: u64 = 12000;
+
+/// SHELLUP — **the desktop tenant census.** One `[shellup]` line per boot naming what every desktop
+/// tenant's launch actually did, plus the render task's liveness and the GUI channel's books.
+///
+/// Called from `status_tick` (metal) and from `input_service`'s poll-nap fallback (QEMU raspi4b,
+/// where `status-tick` is timer-gated and therefore never spawned) — both on the input core, both on
+/// the ~250 ms strip cadence, and neither on the render core. That placement is the point: the boot
+/// this witness exists for is the one where the render task is DEAD, and `[sched6]` never fired once
+/// in either flight of boot 10, so anything hung off the render pass would have had nothing to say.
+///
+/// Fires once, at the first pass that is both `SHELLUP_SETTLE_MS` past the anchor and either looking
+/// at an armed desktop or `SHELLUP_FLOOR_MS` past the anchor. So an armed desktop is reported after
+/// its tenants have had their chance, and a desktop that never arms is still reported — as UNARMED,
+/// which is itself the finding.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+fn shellup_census_maybe() {
+    use core::sync::atomic::Ordering;
+    if SHELLUP_DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    let now = unaos_kernel::arch::ms();
+    let anchor = SHELLUP_ANCHOR_MS.load(Ordering::Relaxed);
+    if anchor == 0 {
+        // First call: take the baseline and let the tenants launch. `max(1)` so a ms() of 0 cannot
+        // read back as "never anchored" and re-baseline on every pass.
+        SHELLUP_ANCHOR_MS.store(now.max(1), Ordering::Relaxed);
+        SHELLUP_ANCHOR_HB.store(SHELLUP_RENDER_HB.load(Ordering::Relaxed), Ordering::Relaxed);
+        return;
+    }
+    #[cfg(feature = "pidesk")]
+    let armed = unaos_kernel::video::pidesk::armed();
+    #[cfg(not(feature = "pidesk"))]
+    let armed = false;
+    let elapsed = now.wrapping_sub(anchor);
+    if elapsed < SHELLUP_SETTLE_MS || (!armed && elapsed < SHELLUP_FLOOR_MS) {
+        return;
+    }
+    SHELLUP_DONE.store(true, Ordering::Relaxed);
+
+    // Liveness by DELTA, not by absolute count: the render task may have run a few passes and then
+    // died (flight 1 managed several), so "did it beat since the baseline" is the only reading that
+    // separates a live tenant from a corpse.
+    let passes = SHELLUP_RENDER_HB
+        .load(Ordering::Relaxed)
+        .wrapping_sub(SHELLUP_ANCHOR_HB.load(Ordering::Relaxed));
+
+    let (shell_state, shell_win) = match SHELLUP_SHELL.load(Ordering::Relaxed) {
+        0 => ("none:unminted", 0u64),
+        SHELLUP_SHELL_DECLINED => ("none:declined", 0u64),
+        id => ("window", id),
+    };
+
+    #[cfg(feature = "pidesk")]
+    let pulse_win = unaos_kernel::video::pulsewin::win() as u64;
+    #[cfg(not(feature = "pidesk"))]
+    let pulse_win = 0u64;
+    #[cfg(feature = "pidesk")]
+    let quarry_open = unaos_kernel::video::quarry::is_open();
+    #[cfg(not(feature = "pidesk"))]
+    let quarry_open = false;
+
+    // The GUI channel's books are printed HERE as well as by `[click2]` on purpose: `[click2]` is
+    // rate-limited by a pass counter on the pump path, so on a boot whose pump is starved it can be
+    // the one witness that does not appear. This line is driven by the strip nap instead.
+    let sent = GUI_SENT.load(Ordering::Relaxed);
+    let recv = GUI_RECV.load(Ordering::Relaxed);
+
+    serial_println!(
+        "[shellup] census t={}ms desktop={} render={} passes=+{} shell={} win={} pulse={} quarry={} \
+         gui=sent{}/recv{} depth={} app_active={} == witness ::",
+        now,
+        if armed { "armed" } else { "UNARMED" },
+        if passes > 0 { "live" } else { "DEAD" },
+        passes,
+        shell_state,
+        shell_win,
+        pulse_win,
+        if quarry_open { "open" } else { "closed" },
+        sent,
+        recv,
+        sent.wrapping_sub(recv),
+        SCREEN_APP_ACTIVE.load(Ordering::Relaxed)
+    );
 }
