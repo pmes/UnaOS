@@ -428,6 +428,31 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
     // on every core but the BSP (the only core that advances `APIC_TICKS`, hence the only one whose
     // clock reading is the wall clock). A no-op inline shim when the knob is off.
     crate::deadman::tick();
+    // WCSER-ISR (boot 13, 2026-08-22) — DRIVE THE OVERDUE PROBE FROM HERE, BESIDE DEADMAN, BECAUSE
+    // ITS OWN LOOP IS A WEDGE VICTIM.
+    //
+    // The probe's home was the head of `x86_input_service`'s loop, deliberately AHEAD of the event
+    // pump — boot 8B had shown the pump blocking into a wedged GUI and taking the probe's 5 s
+    // repeats with it. Boot 13 shows that was not far enough forward: the probe printed
+    // `PASS OVERDUE holder=c1 ... win=8 phase=33 row=792` exactly ONCE, at the crossing, and never
+    // again through 78 further seconds of hold, while `[wcser]`'s own rollup kept printing
+    // `held_ms=` from a different path. The whole input-service loop is a gate victim, not just its
+    // pump, so a probe anywhere inside it dies with the wedge it exists to report.
+    //
+    // This path demonstrably survives: DEADMAN emitted 111 consecutive lines through the same hold.
+    // What that buys is the one field the single boot-13 sample could not give — whether `row=`
+    // ADVANCES. A frozen row is one MMIO write that never returned; a crawling row is the same loop
+    // running at microscopic speed. Those have different causes and the wire could not tell them
+    // apart.
+    //
+    // Cost on 999 of every 1000 ticks is what `wcser_overdue_probe` already charges at its head:
+    // BSP check, then one relaxed load of the holder and an early return while the gate is free.
+    // `serial_println!` is safe from an IRQ-masked context here for exactly the reasons
+    // `deadman::emit` documents above — `_print` is `try_lock`-only and cannot wait on anything.
+    #[cfg(feature = "witness")]
+    if crate::arch::percpu::this_cpu().cpu_index == 0 {
+        crate::video::wm::wcser_overdue_probe();
+    }
     // Preemption point. No-op unless a scheduled task is running on THIS cpu and its quantum
     // expired; runs with IF=0 (interrupt gate) and the preempted task's `iretq` restores its IF.
     crate::arch::sched::timer_preempt();

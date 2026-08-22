@@ -6647,13 +6647,47 @@ static WCDVALVE_SUSPENDED: core::sync::atomic::AtomicU64 = core::sync::atomic::A
 /// The utilisation reading that closed the valve — `util~` on the episode line.
 #[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
 static WCDVALVE_UTIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// Close at or above this composite utilisation (percent of span wall clock inside a pass).
+/// The read-back-duty reading that closed the valve — `wcd~` on the episode line.
 #[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
-const WCDVALVE_CLOSE_PCT: u64 = 60;
+static WCDVALVE_WCD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Close at or above this composite utilisation (percent of span wall clock inside a pass).
+///
+/// ### WCDVALVE-PRICE (boot 13, 2026-08-22) — 60 COULD NOT FIRE, AND THE REASON IS A UNIT ERROR
+/// Boot 13 armed this valve, wedged at 34 s, and printed **zero** `[wc-d] valve` lines. The wire
+/// says why in the instrument's own field: `[comp2] util_pct` read **0, 11, 16** across the whole
+/// boot. The close threshold was 60. It was never reachable and the boot tested nothing.
+///
+/// The 60 came from this module's own header — *"boot 8: `wcd_us` ≈ 4.0–4.1 M per 5000 ms rollup —
+/// the WC-D scan-out read-back at ~80 % duty"*. That is **`wcd_us` duty**, the read-back's share of
+/// the span. The valve was then wired to `C2_INSPAN_CYC`, which is **composite-pass duty** — a
+/// different numerator entirely. A threshold sized against one signal was applied to another, and
+/// nothing on the wire could show the mismatch because the valve printed only when it acted.
+///
+/// Re-priced from boot 13's measured peak (`util_pct` 16, so the storm's own ceiling): close at 12,
+/// reopen at 8. Both are now falsifiable every epoch by the `valve READ` line below — if a boot
+/// shows `util~` never reaching 12, say so and re-price again rather than reading silence as a pass.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+const WCDVALVE_CLOSE_PCT: u64 = 12;
 /// Reopen strictly below this — the hysteresis gap is what keeps the valve from flapping at the
 /// threshold while suppression itself lowers the measured load.
 #[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
-const WCDVALVE_OPEN_PCT: u64 = 35;
+const WCDVALVE_OPEN_PCT: u64 = 8;
+/// WCDVALVE-PRICE — the SECOND signal, and the one the design was actually sized against: the WC-D
+/// read-back's own share of the span, `C2_WCD_CYC` over the span. It is charged inside the read-back
+/// on every exit path (see COMP2-WCD), so unlike the composite-pass duty it accumulates DURING a
+/// pass rather than only at its end. Boot 13 measured 11 % of a 5002 ms span (`wcd_us=550603`)
+/// against the header's remembered 80 % from boot 8 — so either that workload was far heavier or
+/// PAYGOBAND has already taken most of the pressure out. Close at 8, reopen at 5.
+///
+/// EITHER signal closes the valve; BOTH must fall to reopen it. The read-back is what this valve
+/// exists to stand down, so a high read-back duty is sufficient reason on its own.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+const WCDVALVE_WCD_CLOSE_PCT: u64 = 8;
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+const WCDVALVE_WCD_OPEN_PCT: u64 = 5;
+/// WCDVALVE-READ — the `[comp2]` epoch the reading line last named, so it prints ONCE per span.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+static WCDVALVE_READ_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Hold the standing verdict until the current `[comp2]` span is at least this old: a rollup drain
 /// zeroes `C2_INSPAN_CYC`, and judging the first instants of a fresh epoch would read ~0 % on a
 /// storm that has not paused at all.
@@ -6674,13 +6708,32 @@ fn wcdvalve_closed() -> bool {
     if epoch != 0 && super::wcg::cycles_to_us(span) >= WCDVALVE_MIN_SPAN_US {
         // `span > 0` is implied by the minimum-age test, so the division is safe.
         let util = C2_INSPAN_CYC.load(Relaxed).saturating_mul(100) / span;
+        let wcd = C2_WCD_CYC.load(Relaxed).saturating_mul(100) / span;
         let shut = WCDVALVE_SHUT.load(Relaxed);
-        if !shut && util >= WCDVALVE_CLOSE_PCT {
+        // WCDVALVE-READ — SAY WHAT WAS MEASURED, once per `[comp2]` epoch, EVEN WHEN NOTHING
+        // HAPPENS. Boot 13 armed this valve and printed nothing at all, and "the threshold was
+        // never crossed" was indistinguishable on the wire from "the valve never ran" — a
+        // discriminator that cannot report a null result discriminates nothing. One line per span
+        // is the same budget `[comp2]` itself pays, and it makes the thresholds falsifiable from
+        // any boot instead of only from one that happens to trip them.
+        if WCDVALVE_READ_EPOCH.swap(epoch, Relaxed) != epoch {
+            serial_println!(
+                "[wc-d] valve READ util~{}% wcd~{}% span={}ms close_at=util{}%/wcd{}% state={}",
+                util,
+                wcd,
+                super::wcg::cycles_to_us(span) / 1000,
+                WCDVALVE_CLOSE_PCT,
+                WCDVALVE_WCD_CLOSE_PCT,
+                if shut { "CLOSED" } else { "open" }
+            );
+        }
+        if !shut && (util >= WCDVALVE_CLOSE_PCT || wcd >= WCDVALVE_WCD_CLOSE_PCT) {
             WCDVALVE_UTIL.store(util, Relaxed);
+            WCDVALVE_WCD.store(wcd, Relaxed);
             WCDVALVE_SUSPENDED.store(0, Relaxed);
             WCDVALVE_SAID.store(false, Relaxed);
             WCDVALVE_SHUT.store(true, Relaxed);
-        } else if shut && util < WCDVALVE_OPEN_PCT {
+        } else if shut && util < WCDVALVE_OPEN_PCT && wcd < WCDVALVE_WCD_OPEN_PCT {
             WCDVALVE_SHUT.store(false, Relaxed);
             serial_println!(
                 "[wc-d] valve OPEN resumed suspended={}",
@@ -6693,8 +6746,9 @@ fn wcdvalve_closed() -> bool {
         let k = WCDVALVE_SUSPENDED.fetch_add(1, Relaxed) + 1;
         if !WCDVALVE_SAID.swap(true, Relaxed) {
             serial_println!(
-                "[wc-d] valve CLOSED util~{}% suspended={}",
+                "[wc-d] valve CLOSED util~{}% wcd~{}% suspended={}",
                 WCDVALVE_UTIL.load(Relaxed),
+                WCDVALVE_WCD.load(Relaxed),
                 k
             );
         }
@@ -8564,8 +8618,15 @@ pub fn wcser_overdue_probe() {
         return;
     }
     let first = !COMP_OVERDUE_REPORTED.swap(true, Relaxed);
-    if !first && now.saturating_sub(COMP_OVERDUE_LAST_MS.load(Relaxed)) < 5_000 {
-        return; // standing repeat, paced to the rollup cadence
+    // WCSER-ISR (boot 13) — the standing repeat is 1 s, not 5 s, and it is now driven from the
+    // timer ISR rather than the input-service loop. The point of the repeat is the `row=` field: a
+    // FROZEN row is one MMIO write into the Kepler BAR that never returned, a CRAWLING row is the
+    // same present loop running at microscopic speed, and those are different bugs. Boot 13 got one
+    // sample and could not tell them apart. At 1 s a 78-second hold yields 78 points on the trace
+    // instead of 15, and the cost is one `serial_println!` per second — the budget DEADMAN already
+    // pays on the same ISR, on the same core, through the same wedge.
+    if !first && now.saturating_sub(COMP_OVERDUE_LAST_MS.load(Relaxed)) < 1_000 {
+        return; // standing repeat, paced to DEADMAN's cadence
     }
     COMP_OVERDUE_LAST_MS.store(now, Relaxed);
     serial_println!(
