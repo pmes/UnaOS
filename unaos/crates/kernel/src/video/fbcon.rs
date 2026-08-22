@@ -569,10 +569,10 @@ pub fn init(fb_addr: u64, fb_len: usize, info: FrameBufferInfo) {
 /// WHAT IS EXCLUDED, AND WHY EACH ONE. `[wc-g]` (per-present coherency probe), `[wc-h]` (per-present
 /// staging cost) and `[wc-d]` (per-window surface verify) all fire from within a present — they ARE
 /// the re-entrant family. `[wcn]` (window-census rollup) and `[schedx86]` (render-queue depth) are
-/// periodic telemetry with no on-glass reader. All five are serial-log instruments with spec
-/// REQUIREs behind them, and the wire keeps every one of them byte for byte: this policy governs the
-/// GLASS only, and the FTDI ring, `UNAOS.LOG` and the `tste` ring all tap upstream of here, in
-/// `arch::serial::_print`.
+/// periodic telemetry with no on-glass reader. (Spec REQUIREs back only THREE — `[wc-g]`, `[wc-h]`,
+/// `[wc-d]`; `[wcn]` and `[schedx86]` have no directive in `scripts/specs/`, and the claim that all
+/// five did is withdrawn. What makes a tag mutable here is having no on-glass reader, not a spec.)
+/// The wire keeps all five byte for byte: the FTDI ring, `UNAOS.LOG` and `tste` tap `_print` above.
 ///
 /// WHAT IS DELIBERATELY NOT EXCLUDED: `[wc-x]` — the console's own route / first-paint / decline
 /// announcements, which are exactly what a bench reader is looking FOR; `[fbcon]` and `[mirror]`,

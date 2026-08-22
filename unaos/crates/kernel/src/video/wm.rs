@@ -9710,6 +9710,37 @@ fn vugmin_rollup(scope: &str) {
 #[cfg(feature = "witness")]
 const WCN_ROLLUP_MS: u64 = 5000;
 
+/// STORM-R2 — per-window `[wcn]` lines to print per block. The AGGREGATE is unbudgeted and always
+/// printed; this caps only the itemisation beneath it.
+///
+/// ### Why a cap was needed at a cadence that was already correct
+///
+/// `[wcn]`'s cadence is global and was measured correct on pi boot 11: [`WCN_ROLLUP_MS`] is 5000 and
+/// the capture's blocks are 5.16 s apart. What is NOT capped by a cadence is the size of a block.
+/// [`wcn_emit`] enumerates every slot in [`WCN`], so a block costs (live windows + 1) lines, and boot
+/// 11's ten-window desktop paid 471 lines / 84,527 B for it — 9.30% of a 908 KB capture that was
+/// itself 22.1% average serial duty against a 356 s boot, with the desktop visibly buried behind the
+/// transmit. The split within that: 402 per-window lines / 74,742 B (88%) against 69 rollup lines /
+/// 9,785 B (12%). The itemisation is essentially the whole cost, and the aggregate — which carries
+/// exact, summable totals over every slot, capped or not — is nearly free.
+///
+/// ### Why three, and why the number is not the interesting part
+///
+/// Three is enough to see a fleet's shape: the busiest window, and two others to say whether it is
+/// an outlier or the top of a distribution. A reader who needs the fourth has `att=`/`comp=` on the
+/// rollup and can tell exactly how much traffic the itemisation did not name.
+///
+/// What matters more than the number is that the truncation is ANNOUNCED. `shown=` on the rollup
+/// line is not decoration: a per-window line's ABSENCE already meant something specific in this
+/// witness — the block's skip test is `att == 0 && comp == 0 && bel == 0`, so no line has always read
+/// as "this window had no traffic at all". Dropping busy windows silently would overload that
+/// absence with a second, opposite meaning and make the two indistinguishable, which is the reading
+/// that costs a boot. `shown=3/10` says a truncation happened and how deep it went; `shown=10/10`
+/// says the itemisation is complete, and it is printed on every block so the line's shape does not
+/// depend on its values.
+#[cfg(feature = "witness")]
+const WCN_LINES_MAX: usize = 3;
+
 /// WC-N — an inter-present gap longer than this is a PARK, not a slow frame. VUGPAUSE-2's backstop
 /// period is ~256 ms and a parked vug's next present waits on operator input, so anything past a
 /// quarter second is provably not the render loop pacing itself. The slowest rate this can misread
@@ -10560,9 +10591,17 @@ fn wedge1_dwell_emit(span: u64) {
 //
 // ### Wire cost
 //
-// The appended run is ~54 bytes per per-window line. At the `[wcn]` rollup cadence with a full table
-// that is ~86 KB over an 800 s boot — a fraction of a percent of a capture of this size, and paid
-// only on `witness` builds.
+// The appended run is ~54 bytes per per-window line, and STORM-R2 replaces this paragraph's estimate
+// with the measurement that overtook it. The estimate was ~86 KB over an 800 s boot, "a fraction of a
+// percent of a capture of this size". Pi boot 11 ran 356.3 s with ten windows and spent 74,742 B on
+// 402 per-window lines (mean 186 B), of which this run is ~21.7 KB — 2.4% of a 908,583 B capture, not
+// a fraction of one. The per-line figure was right; what was wrong was reading it against a
+// hypothetical capture rather than against the wire, which at 115200 8N1 busy-wait was 22.1% occupied
+// for the whole boot. `[wcn]` as a whole was 9.30% of it.
+//
+// The bound that now holds is [`WCN_LINES_MAX`]: at most three per-window lines per block, so this
+// run's cost stops scaling with the table and the paragraph above cannot go stale the same way again.
+// Still paid only on `witness` builds.
 
 /// WCN-CAUSE — the panel frame period `q=` is stated in, in microseconds.
 ///
@@ -10692,8 +10731,13 @@ fn wcn_note_pass(drew: bool) {
 /// Cadence follows `[pstrip]`/`[sched6]`: a fixed rollup period, one claim per period, and NOTHING
 /// printed for a period in which no window attempted or completed a present. Two consequences worth
 /// stating, because both are deliberate:
-///  * the line volume is bounded by construction — at most one block (live windows + one aggregate)
-///    per [`WCN_ROLLUP_MS`], however many cores are compositing;
+///  * the line volume is bounded by construction — at most one block per [`WCN_ROLLUP_MS`], however
+///    many cores are compositing. **STORM-R2 — the block's own SIZE is bounded too, and was not.**
+///    A block used to cost one line per slot with traffic plus the aggregate, so its cost scaled with
+///    the desktop: boot 11's ten windows spent 84,527 B (9.30% of the wire) on this witness, 88% of
+///    it in the itemisation. [`WCN_LINES_MAX`] caps the itemisation at the busiest few and the
+///    aggregate says how many were left out (`shown=`); a bounded cadence over an unbounded block was
+///    only ever half a bound;
 ///  * a fleet that has wholly parked goes SILENT rather than printing a wall of zeros. The witness is
 ///    driven by the traffic it measures, so "no `[wcn]` lines" reads as "nobody is presenting", which
 ///    is the same thing the absence of the lines would have meant anyway.
@@ -10833,7 +10877,54 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
     if !force && t_att == 0 && t_comp == 0 {
         return; // dirty-paced: a period with no present traffic prints nothing at all.
     }
-    for l in lines.iter().flatten() {
+    // STORM-R2 — pick the [`WCN_LINES_MAX`] busiest of the drained slots. The DRAIN above already
+    // happened for every slot and is unaffected by this: a window left out of the itemisation still
+    // has its counters folded into `t_att`/`t_comp`/`t_hid`/`t_bel`, so the aggregate below remains
+    // an exact total over the whole table and the capping cannot make the block's arithmetic lie.
+    //
+    // The weight is `att + comp + bel` and not `att + comp`, because those three are exactly the
+    // fields the skip test above admits a slot on. Ranking by a narrower sum would make a window that
+    // is eligible ONLY through `bel` — dirty every pass and declined every pass for sitting below the
+    // shell, which is a real and worth-seeing state — rank at zero and lose to any window with a
+    // single present, however quiet the block.
+    let mut eligible = 0usize;
+    let mut top: [(u64, usize); WCN_LINES_MAX] = [(0, usize::MAX); WCN_LINES_MAX];
+    let mut ntop = 0usize;
+    for (idx, l) in lines.iter().enumerate() {
+        let Some(l) = l else { continue };
+        eligible += 1;
+        let w = l.att.saturating_add(l.comp).saturating_add(l.bel);
+        // Insertion into a fixed-size descending top-K. `<` and not `<=` so ties keep the lower slot
+        // index, which makes the choice a function of the counters alone — two blocks with identical
+        // traffic itemise the same windows, and a reader comparing two blocks is never looking at a
+        // difference the selection invented.
+        let mut p = ntop;
+        while p > 0 && top[p - 1].0 < w {
+            p -= 1;
+        }
+        if p >= WCN_LINES_MAX {
+            continue;
+        }
+        let mut q = ntop.min(WCN_LINES_MAX - 1);
+        while q > p {
+            top[q] = top[q - 1];
+            q -= 1;
+        }
+        top[p] = (w, idx);
+        if ntop < WCN_LINES_MAX {
+            ntop += 1;
+        }
+    }
+    let mut shown = 0usize;
+    for (idx, l) in lines.iter().enumerate() {
+        let Some(l) = l else { continue };
+        // Printed in SLOT order, not in rank order: the ranking decides which lines survive, and the
+        // reader's `win=` ordering is left exactly as it was so an existing harvest sees a subset of
+        // the block it used to see rather than a reordering of it.
+        if !top[..ntop].iter().any(|t| t.1 == idx) {
+            continue;
+        }
+        shown += 1;
         // WCN-CAUSE — the census fields are APPENDED after `gap=`, which every existing `[wcn]`
         // harvest in the bench scripts anchors on. Nothing above this point moved, so an awk that
         // reads `att=`/`comp=`/`gap=` off this line keeps working unchanged. `comp=` keeps its exact
@@ -10893,10 +10984,24 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
     } else {
         "LIVE"
     };
+    // STORM-R2 — `shown=` is an INSERTION directly after `wins=`, the field whose population it
+    // qualifies, and everything after it keeps its name, its order and its meaning. Nothing in any
+    // spec matches `[wcn]` (verified against every file in `scripts/specs/`), and the bench harvests
+    // that do read this family anchor on the PER-WINDOW line's `att=`/`comp=`/`gap=`, none of which
+    // moved.
+    //
+    // Its denominator is NOT `wins=`, and the two are different on purpose. `wins=` counts rows live
+    // in the table at the identity snapshot; `shown=`'s denominator counts SLOTS WITH TRAFFIC this
+    // span, which includes a window that closed inside the span (it still earns a line, `live=no`)
+    // and excludes a live window that was idle through it. `shown=3/10` therefore reads "ten slots
+    // had traffic, three of them are itemised above" — and `shown=n/n` means the itemisation is
+    // complete, whatever `wins=` says beside it.
     serial_println!(
-        "[wcn] rollup scope={} wins={} att={} comp={} hid={} bel={} stale={} passes={} aborted={} att_rate={}.{}/s comp_rate={}.{}/s span={}ms -> {}",
+        "[wcn] rollup scope={} wins={} shown={}/{} att={} comp={} hid={} bel={} stale={} passes={} aborted={} att_rate={}.{}/s comp_rate={}.{}/s span={}ms -> {}",
         scope,
         wins,
+        shown,
+        eligible,
         t_att,
         t_comp,
         t_hid,

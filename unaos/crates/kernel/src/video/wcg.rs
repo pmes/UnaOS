@@ -178,7 +178,12 @@
 //! - **The rollup RE-FIRES** ([`census_refresh`]), so those whole-boot censuses are actually read
 //!   after the console has run. Neither half is sufficient alone: an unbudgeted `torn` that is only
 //!   ever printed at second four is still invisible, and a re-fired line carrying a budget-capped
-//!   `torn` still cannot say more than 8.
+//!   `torn` still cannot say more than 8. **STORM-R1 — the re-fire is rate-limited for the SYSTEM,
+//!   not per window** ([`H_LASTROLL_ANY`]), and the slot rotates, so a window's own lines arrive at
+//!   roughly [`CENSUS_PERIOD_US`] x (live windows) rather than at [`CENSUS_PERIOD_US`]. The reader's
+//!   rule is unaffected — greatest `emit=` per `win=` still wins and lines are still never summed —
+//!   but the GAP between two lines of one window is now a function of how busy the desktop is, which
+//!   is why `age_ms=` and not the line's position in the log is the thing that dates a census.
 //! - **Every field says which population it is drawn from**, via repeated `pop=` markers. See
 //!   [`stage_rollup`].
 //!
@@ -713,12 +718,67 @@ static H_MINSPAN: [AtomicU64; IDS] = [const { AtomicU64::new(u64::MAX) }; IDS];
 static H_T0: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 
 /// Per-id: `now_cycles()` as of the END of this window's most recent rollup emission — after the
-/// serial write, deliberately, so [`CENSUS_PERIOD_US`] bounds the *duty cycle* the refresh imposes on
-/// the composite path rather than merely the interval between its starts.
+/// serial write, deliberately, so [`CENSUS_PERIOD_US`] bounds the interval this WINDOW's refresh
+/// occupies the composite path for, rather than merely the gap between its line starts.
+///
+/// **It bounds one window's rate and nothing more, and the claim it used to carry — that
+/// [`CENSUS_PERIOD_US`] bounds "the duty cycle the refresh imposes" — was true per window and false
+/// per system.** N live windows each holding their own cell emit at N/[`CENSUS_PERIOD_US`], so the
+/// instrument's cost on the wire grows with the desktop while its documentation stayed at the
+/// one-window figure. STORM-R1 adds the cell that makes the system-wide claim true —
+/// [`H_LASTROLL_ANY`] — and this note is narrowed to what this array actually enforces. See that
+/// cell for the measurement that convicted the old wording.
 ///
 /// Also the refresh's mutual exclusion: it is armed by a `compare_exchange` on this cell, so of two
 /// cores flushing the same window at the same instant exactly one prints. See [`census_refresh`].
 static H_LASTROLL: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+
+/// STORM-R1 — SYSTEM-wide: `now_cycles()` as of the END of the most recent rollup emission by ANY
+/// window. Stored from [`stage_rollup`], after the serial write, for [`H_LASTROLL`]'s reason.
+///
+/// ### The measurement this exists because of
+///
+/// Pi boot 11's metal capture (`pi3-boot11`, 908,583 B over 7,436 lines) was byte-weighted per tag.
+/// `[wc-h]` was **25.17% of the entire wire** — 701 lines, 228,721 B, mean 326 B — of which 695 were
+/// refresh rollups against only 35 per-present sample lines. The [`SAMPLES`] budget caps the samples;
+/// nothing capped the refresh. Serial is 115200 8N1, synchronous, busy-wait per byte, so 908 KB is
+/// 78.9 s of transmit against a 356 s boot: 22.1% average duty, 96.4% at the peak, with the desktop
+/// visibly buried behind it.
+///
+/// The arithmetic was always available: at ~10 live windows the per-id gate permits 10/2 = 5 refresh
+/// lines a second, 5 x 326 B = 1,630 B/s = 14.2% of the wire from this one instrument. What was
+/// missing is that no per-window cell can see N. Only a global cell can, which is the whole of why
+/// this is a second static and not a smaller [`CENSUS_PERIOD_US`] — shrinking the period would have
+/// moved the per-window rate without touching the aggregate's dependence on N.
+///
+/// ### What it does NOT gate
+///
+/// The two one-shot latches in [`stage_flush`] ([`ROLL_WHOLE`], [`ROLL_BAND`]) are not rate-gated and
+/// this cell does not gate them: they call [`stage_rollup`] directly. That separation is load-bearing
+/// for the pi4 spec, whose `scope=window … -> TEAR-FREE` REQUIRE is satisfied by the `ROLL_WHOLE`
+/// latch. It is safe under any throttling of the refresh for a second, stronger reason as well: the
+/// verdict is drawn from [`H_TORN`] and [`H_DECLINE`], both monotone, so a window's verdict can only
+/// ever degrade across its emissions. If any of a window's rollups is `TEAR-FREE`, its FIRST — the
+/// latched one — is.
+///
+/// A latched emission does stamp this cell, because it spends the same serial time a refreshed one
+/// does and an honest duty cycle has to count it. The only effect is to move the next REFRESH out by
+/// a period, which is the intent.
+static H_LASTROLL_ANY: AtomicU64 = AtomicU64::new(0);
+
+/// STORM-R1 — whose turn the next system-wide refresh slot belongs to, as an index into
+/// [`H_LASTROLL`].
+///
+/// A bare global rate gate is won by whoever composites most often — on this desktop the routed
+/// console, by a wide margin — and every other window would then go unrepresented for the rest of the
+/// boot. That trades a log nobody can read for a log that omits the windows a reader came for. The
+/// cursor advances past each emitter so the slot rotates.
+///
+/// Starvation in the other direction is what the two escapes in [`refresh_turn_ok`] are for: a window
+/// with nothing new to say never holds the slot, and a window that has something to say but never
+/// composites again is stepped over after one grace period. Neither escape can wedge, because both
+/// are decided from state any core can read without the preferred window having to run.
+static H_ROLL_TURN: AtomicU32 = AtomicU32::new(0);
 
 /// Per-id: [`census_total`] as of the most recent rollup emission. The refresh's other gate: a window
 /// whose censuses have not moved has nothing new to say, and reprinting an unchanged line would spend
@@ -755,11 +815,18 @@ static H_LINES: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 
 /// Minimum wall time between two rollup emissions for one window.
 ///
-/// The refresh's whole cost is serial. A rollup line is ~250 bytes and the UART runs at 115200 baud,
-/// so one line is ~20 ms of a core's time on the composite path — the same path whose microsecond
-/// timings this module exists to report, which is why the figure cannot simply be made small. Two
-/// seconds puts one window's refresh at a ~1% duty cycle and the worst case ([`IDS`] windows all
-/// compositing hard) at ~8%.
+/// The refresh's whole cost is serial. A rollup line is ~250 bytes (measured at 326 B on the pi
+/// desktop, once every field this line has grown is counted) and the UART runs at 115200 baud, so one
+/// line is ~20-28 ms of a core's time on the composite path — the same path whose microsecond timings
+/// this module exists to report, which is why the figure cannot simply be made small. Two seconds
+/// puts the refresh at a ~1% duty cycle.
+///
+/// **STORM-R1 — that is now a SYSTEM figure, and it was previously a per-window one.** The old note
+/// here put the worst case ([`IDS`] windows all compositing hard) at ~8%; boot 11 measured 25.17% of
+/// the wire with ten windows live, because the ~8% was itself computed from the ~250 B estimate and,
+/// more importantly, because nothing in the code enforced any aggregate at all. [`H_LASTROLL_ANY`]
+/// enforces it: at most one refresh line per period from the whole system, whatever N is, so the ~1%
+/// above is the worst case rather than the best one.
 ///
 /// It is also what bounds the residual error this arc does NOT remove. The last refreshed line of a
 /// boot is taken up to `CENSUS_PERIOD_US` of presents before the final one, so its censuses are a
@@ -1073,18 +1140,82 @@ fn census_refresh(id: u32, i: usize) {
     if total == H_LASTCENSUS[i].load(Ordering::Relaxed) {
         return;
     }
-    // Rate gate. Checked before the `compare_exchange` so the common case — a window compositing at
-    // frame rate, arriving here dozens of times a second — costs one clock read and a compare.
+    // Rate gate, this WINDOW's. Checked before the `compare_exchange` so the common case — a window
+    // compositing at frame rate, arriving here dozens of times a second — costs one clock read and a
+    // compare.
     let last = H_LASTROLL[i].load(Ordering::Relaxed);
     let now = now_cycles();
     if cycles_to_us(now.saturating_sub(last)) < CENSUS_PERIOD_US {
+        return;
+    }
+    // STORM-R1 — rate gate, the SYSTEM's. Everything above this point is per-id and therefore permits
+    // N lines per period on a desktop of N windows; this is the gate that makes the period mean what
+    // its own documentation says it means. See [`H_LASTROLL_ANY`] for the boot-11 measurement.
+    let any = H_LASTROLL_ANY.load(Ordering::Relaxed);
+    let since_any = cycles_to_us(now.saturating_sub(any));
+    if since_any < CENSUS_PERIOD_US {
+        return;
+    }
+    // …and the rotation, so the one slot per period is not simply taken every time by whichever
+    // window composites hardest.
+    if !refresh_turn_ok(i, since_any) {
         return;
     }
     // Arm: exactly one core proceeds. See the note above.
     if H_LASTROLL[i].compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed).is_err() {
         return;
     }
+    // Claim the system slot. This is AFTER the per-window arm and not before it, deliberately: of the
+    // two ways to lose a race here, bumping one window's cell without printing costs that window one
+    // period, while consuming the system slot without printing costs EVERY window one period. The
+    // cheaper loss is the one that should be reachable.
+    if H_LASTROLL_ANY.compare_exchange(any, now, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        return;
+    }
+    // Hand the next slot to the following id. `IDS` is [`crate::video::wm::MAX_WINDOWS`] + 1 and slot
+    // 0 belongs to no window, so the wrap lands on a slot that has never rolled — which
+    // [`refresh_turn_ok`] treats as "nothing to say" and steps over on its first test, rather than
+    // costing the rotation a period.
+    H_ROLL_TURN.store((i as u32 + 1) % IDS as u32, Ordering::Relaxed);
     stage_rollup(id, i, "window", H_TAKEN[i].load(Ordering::Relaxed));
+}
+
+/// STORM-R1 — may window `i` take the system-wide refresh slot now?
+///
+/// `since_any_us` is the age of [`H_LASTROLL_ANY`] in microseconds, already known by the caller to be
+/// at least [`CENSUS_PERIOD_US`]; it is passed in rather than re-read so the two gates cannot end up
+/// deciding from two different clock readings.
+///
+/// The rotation is a PREFERENCE, not a reservation, and the difference is the whole design. A strict
+/// turn order would hand the slot to a window that may never composite again — the compositor's own
+/// corollary is that a window which stops presenting stops reaching this code at all — and the census
+/// would fall silent for the rest of the boot, which is a worse failure than the storm it replaced.
+/// So the preference yields on two conditions that any core can evaluate without the preferred window
+/// running, and each covers a case the other cannot:
+///
+///  * **Nothing to say.** The preferred window has not had its first rollup, or its census has not
+///    moved since its last one. Its own delta gate in [`census_refresh`] would decline to print, so
+///    holding the slot open for it buys the reader nothing.
+///  * **Something to say, and gone.** A window can leave a census delta standing and then never
+///    composite again — it recorded a present, lost one arbitration, and stopped. Nothing about that
+///    state decays, so the "nothing to say" test above would hold the slot for it forever. One grace
+///    period is what steps over it, and because the cursor advances to whoever takes the slot, a run
+///    of departed windows is walked THROUGH rather than re-tested from the start each period.
+///
+/// The bound this leaves is worth stating rather than hiding: in the grace case the system emits one
+/// line per two periods instead of one per period. That is quieter than the target, never louder, so
+/// it cannot reintroduce the defect being fixed.
+#[inline]
+fn refresh_turn_ok(i: usize, since_any_us: u64) -> bool {
+    let turn = H_ROLL_TURN.load(Ordering::Relaxed) as usize;
+    if turn == i || turn >= IDS {
+        return true;
+    }
+    if since_any_us >= 2 * CENSUS_PERIOD_US {
+        return true;
+    }
+    H_ROLLED[turn].load(Ordering::Relaxed) & ROLL_WHOLE == 0
+        || census_total(turn) == H_LASTCENSUS[turn].load(Ordering::Relaxed)
 }
 
 /// Print the one pending `[wc-h]` sample line for window `id`.
@@ -1337,13 +1468,22 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
         FRAME_US,
         verdict
     );
-    // Re-arm the refresh from AFTER the serial write, so `CENSUS_PERIOD_US` bounds the duty cycle
-    // this instrument imposes on the composite path and not merely the gap between line starts. Both
+    // Re-arm the refresh from AFTER the serial write, so `CENSUS_PERIOD_US` bounds the time this
+    // instrument occupies the composite path and not merely the gap between line starts. All three
     // stores happen on every emission — including the two latched ones — so the first refresh is
     // measured from the window's first rollup rather than from boot, and a window whose first rollup
     // is its last activity never refreshes at all.
     H_LASTCENSUS[i].store(census_total(i), Ordering::Relaxed);
-    H_LASTROLL[i].store(now_cycles(), Ordering::Relaxed);
+    // STORM-R1 — one clock reading for both cells. Two readings would let the system's cell trail the
+    // window's by the cost of the read, which is nothing on its own but makes the two gates describe
+    // fractionally different periods for no reason.
+    let done = now_cycles();
+    H_LASTROLL[i].store(done, Ordering::Relaxed);
+    // STORM-R1 — and the system's, from every emission for the reason the per-id one is: a latched
+    // rollup spends the same serial time a refreshed one does, so the duty cycle has to count it.
+    // This store cannot gate the latches themselves — they call this function unconditionally — it
+    // only moves the next REFRESH out by a period. See [`H_LASTROLL_ANY`].
+    H_LASTROLL_ANY.store(done, Ordering::Relaxed);
 }
 
 // ---- WC-K — the staged DESKTOP FILL's own witness ----------------------------------------------
