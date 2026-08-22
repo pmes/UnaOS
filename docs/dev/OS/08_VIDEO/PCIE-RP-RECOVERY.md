@@ -37,7 +37,8 @@ What the wedge looks like from the surviving side, read out of
 [ 212892ms] [vugfps] wf=5144
 ```
 
-Three readings matter and only one of them has been given its due.
+Four readings matter, and the one that has been given the most weight is the one least entitled
+to it (§1.3).
 
 ### 1.1 The machine is not dead. Only the picture is.
 
