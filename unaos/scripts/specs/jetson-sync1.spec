@@ -39,6 +39,50 @@ REQUIRE TEGRA-EL0.*el0-hello round-trip -> PASS
 # takes its target from the same census.
 REQUIRE TEGRA-SD.*block backend published
 
+# --- EL0-EL1CORE: where an EL0 task was placed, and what happens when it cannot be -----
+# The arc that motivated this block (sched.rs `EL0-EL1CORE`) established that on the
+# smp_virt path only the BSP drops to EL1 — every PSCI-woken AP replays the BSP's EL2
+# regime — so an EL0 task dispatched from an AP `eret`s at EL2, banks ELR_EL2/SPSR_EL2,
+# and takes the board down with a RAS Uncorrectable. The fix filters EL2 cores out of the
+# EL0 candidate set and REFUSES a placement it cannot satisfy.
+#
+# THE ANCHOR IS THE UNCONDITIONAL PLACEMENT LINE, AND THAT CHOICE IS THE POINT OF THIS
+# BLOCK. `spawn_user_inner`'s witness fires on EVERY EL0 slot spawn — it is un-gated as of
+# the same arc, so tegra emits it — and on this boot the spawn is `el0-hello`, pinned to
+# core 0 by main.rs:6099 (`spawn_user("el0-hello", .., 0)`, a deliberate pin at the core
+# the JM6 drop has just proven is at EL1). An explicit pin at an EL1 core passes the filter
+# verbatim, so this line is emitted on every healthy tegra_el0 boot that reaches EL0 at all
+# — which the `REQUIRE TEGRA-EL0 .. round-trip -> PASS` above already demands.
+#
+# THE REFUSAL LINE IS NOT AN ANCHOR AND MUST NOT BECOME ONE. Its presence is NOT an
+# invariant: it fires only when the EL1-filtered candidate set is empty for the request in
+# hand, which for a CPU_AUTO spawn depends on `ONLINE_MASK[0]`, and core 0's online bit is
+# not fixed — `run_burst` and `simmer_start` both call `mark_online(driver_cpu)` and both
+# are spawned from `run_capstone_boot_core` under `sched_demo`/`simmer_test`. With core 0
+# online a CPU_AUTO EL0 spawn can legally succeed and the refusal never prints. Nothing on
+# a default boot issues a CPU_AUTO EL0 spawn in the first place (the `bg` verb is operator-
+# driven), so the honest strength is OPTIONAL: present in the table, never a gate.
+# NOTE FOR ANYONE TEMPTED TO KEY ON `n=`: that counter (`EL0_REFUSALS`) is ONE GLOBAL shared
+# by every refusing site, not a per-site sequence, so `n=1` says nothing about which lane
+# refused first and it cannot be anchored per-`bg`. Read `el0refuse=` on `[spread4]` for the
+# running total instead — it is not rate-limited, unlike these per-event lines.
+# PENDING, not REQUIRE: the line is code ahead of its bench. It was `#[cfg(feature = "pi")]`
+# for the whole tegra_el0 bring-up, so NO Orin capture can carry it — boot5c
+# (orin2-boot5c-gui.log) has zero hits for `SCHED: task`, which is exactly the blindness the
+# arc removed. Promote to REQUIRE on the first capture that carries it, per the standing rule.
+PENDING SCHED: task 'el0-hello' -> core 0 \(policy: caller-pinned EL0 residents=[0-9]+, no-migrate\)
+OPTIONAL SCHED: EL0 placement REFUSED \([a-z]+\) '[^']*' req=-?[0-9]+
+# The LAST-INSTANT backstop in `user_task_trampoline`, and this one IS a fault signature —
+# the only FORBID in this file that is not a hardware fault. It prints when an EL0 task
+# reached the `eret` from a core that is not at EL1, i.e. when the placement filter has a
+# hole. Unlike the IRQEL trio above (honest verdicts, deliberately not FORBID), this is not
+# a measurement with a legitimate negative outcome: the filter is supposed to make it
+# unreachable, so a hit means an invariant broke and the flight should be red. It is also
+# the one line that proves the backstop is release-live — it replaced a `debug_assert` that
+# no built configuration contained, since the kernel workspace has no `[profile]` section
+# and every arroyo cargo call is `--release`.
+FORBID SCHED: EL0 entry REFUSED
+
 # --- IRQEL-RT2: the EL1 one-shot proof adjudicates THREE ways; do not flatten it -----
 # `timer::el1_oneshot_proof` (tegra-gated, and UNCONDITIONAL on a tegra image — main.rs
 # calls it right after the post-drop `exceptions::install`) arms ONE CNTP tick inside a

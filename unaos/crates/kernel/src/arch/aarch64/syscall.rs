@@ -7827,6 +7827,15 @@ pub fn run_user_image(
     if bytes.len() > super::uslots::USER_REGION_SIZE {
         return Err("image larger than the 16 KiB user window");
     }
+    // EL0-EL1CORE — the same pre-check `spawn_user_image_bg` makes, asked about the core THIS launcher
+    // pins to (`this_cpu()`, the sys_spawn co-location invariant) rather than about `CPU_AUTO`. On the
+    // Orin that core is the BSP, which JM6 drops to EL1, so `run` passes the filter verbatim and is
+    // unaffected — which is the whole reason the fix filters instead of clamping. The check is here so
+    // that if `run` is ever reached from a task running on an EL2 AP, the operator is told so on the
+    // console instead of being handed a pid of 0 and a program that never ran.
+    if !super::sched::el0_placement_possible(super::percpu::this_cpu().cpu_index as usize) {
+        return Err("this core is not at EL1; an EL0 program cannot be dispatched here (EL0-EL1CORE)");
+    }
     // Claim the Proc entry FIRST so a failed map frees nothing but the entry (no slot is allocated on any
     // map-failure path), and so the pid slot exists before the co-located task can be dispatched.
     let Some(pi) = proc_reserve() else {
@@ -8261,6 +8270,23 @@ pub enum BgPoll {
 pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str> {
     if bytes.len() > super::uslots::USER_REGION_SIZE {
         return Err("image larger than the 16 KiB user window");
+    }
+    // EL0-EL1CORE — REFUSE BEFORE ANYTHING IS CLAIMED. `sched::spawn_user_slot` filters the EL0
+    // candidate set down to cores that are at EL1 and REFUSES (returns task id 0) when that set is
+    // empty; on the Orin today it always is, because `ONLINE_MASK[0]` is false and cores 1-5 all
+    // replay the BSP's EL2 regime, so EVERY `bg` is refused. Asking here — before `proc_reserve`,
+    // before the image is mapped into a slot — means the refusal costs no unwinding, and (the point)
+    // it takes the `Err` arm, which `shell.rs`'s `bg_program` already prints to the CONSOLE. Without
+    // it the shell would report `bg: /fat/vug.elf started — pid 0` and read as a win: task id 0 is a
+    // sentinel nobody at a bench knows, and a refusal that reports success is worse than the board
+    // kill it replaces, which was at least unambiguous.
+    //
+    // Placed on the `CPU_AUTO` request this launcher actually makes, so it answers the same question
+    // the spawn will. It is advisory only — the spawn re-checks and refuses on its own — and it can
+    // only ever be stale in the safe direction: `mark_online` is one-way, so a core can join the
+    // candidate set between the two points but never leave it.
+    if !super::sched::el0_placement_possible(super::sched::CPU_AUTO) {
+        return Err("no core is at EL1 to host a background EL0 task on this platform (EL0-EL1CORE)");
     }
     let Some(pi) = proc_reserve() else {
         return Err(proc_table_full_reason());
@@ -10936,6 +10962,25 @@ fn sys_thread_spawn(entry: u64, sp: u64, arg: u64, place: u64) -> i64 {
     }
     let caller = super::percpu::this_cpu().cpu_index as usize;
     let cpu = if place == 1 { super::sched::other_online_cpu(caller) } else { caller };
+    // EL0-EL1CORE — REFUSE BEFORE THE RETAIN. `spawn_user_thread` filters the EL0 candidate set to
+    // cores at EL1 and refuses when it is empty, returning a `JoinHandle` with id 0; the retain below
+    // is taken BEFORE that call and its balancing release is the new thread's own `exit()`, so a
+    // refusal discovered after the retain would leak a slot reference permanently. Asking here costs
+    // nothing and keeps the failure a defined syscall return the EL0 program can read.
+    //
+    // `other_online_cpu` already applies the same filter to the `place == 1` sibling HINT and falls
+    // back to `caller` when no EL1 sibling qualifies, so on the Orin a threaded program keeps working
+    // — co-placed with its parent rather than refused. This arm therefore fires only if the CALLER's
+    // own core is not at EL1, which for a live EL0 task is impossible by construction (nothing could
+    // have placed it there). It is the fail-closed backstop for that "impossible".
+    //
+    // EAGAIN is reused rather than given a code of its own, and that is a KNOWN CONFLATION worth
+    // naming: it already means "the thread table is full, try later", which is transient, while this
+    // condition is a standing platform limitation until the secondaries drop to EL1. The serial line
+    // `spawn_user_thread` emits is what distinguishes them today.
+    if !super::sched::el0_placement_possible(cpu) {
+        return EAGAIN;
+    }
     // Claim a tracking slot, retain the shared address space for the new thread, then spawn it. The retain
     // precedes the spawn so the slot cannot be torn down between here and the thread's first dispatch; the
     // thread's own exit balances it (`teardown_user_slot`). The lock spans the spawn (a brief critical

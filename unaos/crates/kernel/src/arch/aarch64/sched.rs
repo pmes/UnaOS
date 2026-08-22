@@ -1615,12 +1615,12 @@ extern "C" fn user_task_trampoline() -> ! {
     // in x0 AFTER the full GPR/FP scrub below, so the scrub's no-leak property is unweakened (every other
     // register is still zeroed; x0 alone carries the intended argument, exactly as a syscall ABI arg would).
     let arg = unsafe { (*raw).arg as u64 };
-    // EL0-EL1CORE — STANDING TRIPWIRE FOR THE LATENT HAZARD. THIS IS NOT THE FIX. The fix for the
-    // convicted board-killer is the placement clamp (`el0_clamp_cpu`; see the EL0-EL1CORE block above
-    // `pick_cpu`), which keeps EL0 tasks off the EL2 APs in the first place. This assert is the standing
-    // backstop for ANY FUTURE path that reaches this `eret` from the wrong exception level — a new
-    // placement or migration lane, a hand-rolled dispatch, a board whose secondaries come up differently
-    // again, or the day the clamp is deleted because the APs "now drop to EL1".
+    // EL0-EL1CORE — LAST-INSTANT REFUSAL. THIS IS NOT THE FIX. The fix for the convicted board-killer
+    // is the placement filter (`el0_pick_cpu_slot`; see the EL0-EL1CORE block above `pick_cpu`), which
+    // keeps EL0 tasks off the EL2 APs in the first place. This is the backstop for a FIRST DISPATCH
+    // that somehow reaches this `eret` from the wrong exception level anyway — a new placement lane, a
+    // hand-rolled dispatch, a board whose secondaries come up differently again, or the day the filter
+    // is deleted because the APs "now drop to EL1".
     //
     // It earns its place because the failure mode is silent and terminal. An `eret` executed at EL2 with
     // `HCR_EL2.E2H == 0` consumes ELR_EL2/SPSR_EL2, so the three `msr`s below are written and then
@@ -1628,26 +1628,46 @@ extern "C" fn user_task_trampoline() -> ! {
     // RAS Uncorrectable and a powered-off core — no panic, no line on the wire, nothing to read
     // afterwards. This is the last instant at which the kernel can still say what happened.
     //
-    // `CurrentEL` bits [3:2] hold the level; EL1 is the only legal one here. Behind `debug_assertions`
-    // so a release image pays not even the `mrs` — a `debug_assert` by construction, matching the
-    // null-`current` check at the top of this function.
-    #[cfg(debug_assertions)]
-    {
-        let current_el: u64;
-        unsafe {
-            core::arch::asm!(
-                "mrs {el}, CurrentEL",
-                el = out(reg) current_el,
-                options(nomem, nostack, preserves_flags)
-            );
-        }
-        debug_assert_eq!(
-            (current_el >> 2) & 0b11,
-            1,
-            "user_task_trampoline: eret to EL0 attempted from EL{} on core {} — this core never dropped to EL1 (EL0-EL1CORE)",
-            (current_el >> 2) & 0b11,
-            cpu
+    // WHY IT IS RELEASE-LIVE AND NOT A `debug_assert`. The first cut wrote this as `#[cfg(debug_assertions)]`
+    // + `debug_assert_eq!` "so a release image pays not even the `mrs`". That reasoning inverts: the kernel
+    // workspace has NO `[profile]` section and every `arroyo` cargo invocation is `--release`, so
+    // `debug_assertions` is off in EVERY configuration this tree can build, gated or not. The check was
+    // therefore present in no shipped image, no bench image, and no gate — forty lines that nothing
+    // compiled, guarding a hazard that only exists on metal. A guard that cannot run on the only target
+    // that has the bug is not a guard. One `mrs` on the first dispatch of an EL0 task (not per switch:
+    // a preempted task resumes through `__vec_irq`, never here) is a price worth naming out loud.
+    //
+    // WHY A REFUSAL AND NOT A PANIC. `panic!` here would run the panic path on a core executing at EL2,
+    // in the regime this kernel does not own, to report that it is at EL2 — and it would take down a
+    // machine that is otherwise healthy. Marking the task FINISHED and returning to the scheduler costs
+    // the caller one task and costs the board nothing: `exit()` is the single retirement funnel (slot
+    // teardown, joiner post, SPREAD-3 residency release, kill settle), so the refused task leaves no
+    // half-state behind, exactly as a `sys_exit` would.
+    //
+    // COVERAGE, STATED HONESTLY BECAUSE THE FIRST CUT OVERSTATED IT. This covers FIRST ENTRY to EL0 and
+    // nothing else. A PREEMPTED EL0 task resumes through `__vec_irq`'s epilogue, which `eret`s from its
+    // own banked frame and never runs this trampoline — so this does NOT backstop "any future path",
+    // and in particular not the resume path a future MIGRATION lane would travel. It backstops the
+    // first-dispatch path: the one the convicted kill actually took, and the one a newly-added
+    // placement site would expose first. A migration lane needs its own guard; this is not it.
+    //
+    // `CurrentEL` bits [3:2] hold the level; EL1 is the only legal one here.
+    let current_el: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {el}, CurrentEL",
+            el = out(reg) current_el,
+            options(nomem, nostack, preserves_flags)
         );
+    }
+    if (current_el >> 2) & 0b11 != 1 {
+        serial_println!(
+            ":: SCHED: EL0 entry REFUSED '{}' on core {} — CurrentEL is EL{}, not EL1; an eret here would bank ELR_EL2 (EL0-EL1CORE) ::",
+            unsafe { (*raw).name },
+            cpu,
+            (current_el >> 2) & 0b11
+        );
+        exit(); // marks FINISHED, retires the slot, posts joiners, switches to the scheduler
     }
     // SPSR_EL1 = 0x240 (M6e): M[3:0]=0b0000 (EL0t — a dedicated SP_EL0; EL0h/0b0001 is an illegal
     // return from EL1 -> PSTATE.IL), M[4]=0 (AArch64), DAIF = D,F masked with A (SError) and I (IRQ)
@@ -2661,15 +2681,28 @@ fn rewake_place(home: usize, slot: usize) -> usize {
     // EL0-EL1CORE — THE SECOND EXPOSURE, closed here. This function is reached ONLY for a LIVE EL0
     // task (both callers — `make_ready`'s wake path and `dispatch_next`'s SPREAD-11 yield path —
     // gate on `task.user_entry != 0`), so a foreground program that merely PARKS on input could be
-    // migrated onto an EL2 AP and die exactly as a `bg` spawn does; `run` escaped only by exiting
-    // first. On a non-`pi` build there is nowhere to move an EL0 task TO — core 0 is the only core
-    // at EL1 — so REFUSE THE QUESTION rather than answering it and clamping the answer: the four
-    // SPREAD-4/10/12/13/14 lane counters below then report on scans that genuinely happened instead
-    // of on decisions that were overruled, and the scan itself is not paid for. A task that is
-    // somehow not already on the EL1 core is RESCUED onto it, with a line on the wire. Folds away
-    // completely on `pi` (`cfg!` is a constant), leaving that target's behaviour byte-for-byte.
+    // re-placed onto an EL2 AP and die exactly as a `bg` spawn does; `run` escaped only by exiting
+    // first.
+    //
+    // On a non-`pi` build the EL1-filtered candidate set is the single core `EL0_EL1_CORE`, and a
+    // live EL0 task is ALREADY on it — the spawn sites refuse every other placement, so no other
+    // core can be hosting one. Every candidate scan below would therefore run to a set of at most
+    // one member that is already `home`. REFUSE THE QUESTION rather than pay for the scan: return
+    // `home`, unmoved. The SPREAD-4/10/12/13/14 lane counters below then report on scans that
+    // genuinely happened rather than on decisions that were foregone.
+    //
+    // DELIBERATELY SILENT, and this is a correction to the first cut, which called a witness here.
+    // `make_ready` — the wake caller — runs inside an `irq_save_mask()` span, so a line emitted here
+    // is an unbounded ~10 ms synchronous-UART write ON THE EL0 WAKE PATH, repeated for every wake.
+    // (It is not a deadlock: `serial::_print` is `without_interrupts` + `try_lock` over a lock-free
+    // staging ring, and every `make_ready` caller drops its primitive's raw lock first. It is a
+    // latency and wire-pressure problem, which is reason enough.) Nothing is lost by the silence:
+    // this path cannot MOVE a task, so it has no decision to report, and the only site that can
+    // create the condition it would be reporting on — a spawn — has its own witness.
+    //
+    // Folds away completely on `pi` (`cfg!` is a constant), leaving that target byte-for-byte.
     if !cfg!(feature = "pi") {
-        return el0_clamp_cpu("rewake", home);
+        return home;
     }
     let home_act = el0_active(home);
     // SPREAD-10 — home's committed same-slot siblings, EXCLUDING the waking task itself (it is still
@@ -3030,54 +3063,133 @@ pub fn mark_online(cpu: usize) {
 // /fat/vug.elf` survived only because it keeps `this_cpu()` (the BSP, at EL1) and its program
 // exited before any re-placement lane could move it off.
 //
-// THE RULE, until the APs are dropped to EL1 too: an EL0 task runs on the EL1 core, and on that
-// core alone. It is applied at every site that can name the core an EL0 task will next be
-// dispatched from — the two EL0 spawn paths, the SPREAD-4/11 re-placement (`rewake_place`), and the
-// VUGSPREAD steal lane (where an EL0 thread is simply not made steal-eligible) — and NOWHERE else.
-// Ordinary kernel tasks never `eret` to a lower EL, so their placement, and with it the whole
-// SCHED-3/SPREAD-* balance across all six cores, is untouched. This narrows WHICH CORE EL0 runs on;
-// it relaxes no permission, clears no routing bit, and removes no check.
+// THE RULE, until the APs are dropped to EL1 too: an EL0 task may be placed only on a core that is
+// itself at EL1. It is applied as a FILTER ON THE CANDIDATE SET, never as a redirect — the EL2 cores
+// stop being candidates, and if the filter leaves nothing THE PLACEMENT IS REFUSED. It is applied at
+// every site that can name the core an EL0 task will next be dispatched from — the two EL0 spawn
+// paths (through `el0_pick_cpu_slot`), the SPREAD-4/11 re-placement (`rewake_place`), and the
+// VUGSPREAD steal lane (where an EL0 thread is simply not made steal-eligible AT THE SOURCE) — and
+// NOWHERE else. Ordinary kernel tasks never `eret` to a lower EL, so their placement, and with it
+// the whole SCHED-3/SPREAD-* balance across all six cores, is untouched. This narrows WHICH CORE EL0
+// may run on; it relaxes no permission, clears no routing bit, and removes no check.
+//
+// FILTER, NOT CLAMP — and the difference is the whole design. An earlier cut of this fix REDIRECTED
+// every EL0 placement onto `EL0_EL1_CORE`, which is a strictly larger change than the hazard calls
+// for and it manufactured a second defect: core 0's dispatch loop on the tegra path
+// (`run_capstone_boot_core`) has no `drain_due_sleepers` and never sets `SCHED_ACTIVE`, so a task
+// forced there that then SLEEPS parks in `SLEEPERS[0]` and is never woken. Filtering touches only
+// the tasks the hazard actually threatens and leaves every other placement decision exactly where
+// the policy put it.
+//
+// AN EXPLICIT PIN IS HONOURED VERBATIM WHEN ITS TARGET IS AT EL1. Core 0 is the EL1 core, so the
+// shell's `run` verb — which keeps `this_cpu()`, i.e. the BSP — is byte-for-byte unaffected. `run`
+// works on Orin metal today and a blanket clamp would have regressed it. A pin at an EL2 core is
+// REFUSED rather than quietly moved: silently answering a different question than the caller asked
+// is how a placement bug hides.
+//
+// REFUSAL IS AN HONEST OUTCOME ON THIS PLATFORM, NOT AN ERROR PATH THAT SHOULD NEVER FIRE. On Orin
+// today `ONLINE_MASK[0]` is FALSE (`run_capstone_boot_core` never calls `mark_online`) and cores 1-5
+// are at EL2, so the EL1-filtered candidate set for a `CPU_AUTO` EL0 spawn is EMPTY and every `bg`
+// is refused. That is the true statement — this platform cannot host a background EL0 task yet — and
+// it stops being true the moment the secondaries drop to EL1. It is also fail-closed, the direction
+// this tree already chose at `write_block_tegra_sd` and at the ELF loader's load-time refusal.
 //
 // `pi` is excluded through a `cfg!` CONSTANT rather than a `#[cfg]` item, so both polarities stay
 // type-checked on every leg: the Pi 4 drops EVERY core to EL1 in `_start` long before any of this
-// runs, so on the Pi the guard folds to `true`, each branch below it is dead code, and EL0
-// placement is exactly the behaviour SPREAD-3..15 was tuned on.
+// runs, so on the Pi `el1_core` folds to `true`, no core is ever filtered out, no spawn can ever be
+// refused, and EL0 placement is exactly the behaviour SPREAD-3..15 was tuned on.
 //
 // WHEN TO DELETE THIS: when the `smp_virt` secondaries drop to EL1 before entering `secondary_run`.
-// The tripwire in `user_task_trampoline` is the standing backstop and outlives this clamp.
+// At that point `el1_core` is true everywhere and every branch below is already dead.
 
 /// EL0-EL1CORE — the core known to be at EL1 on the non-`pi` aarch64 boots: the BSP, which JM6 drops.
+///
+/// UNASSERTED ASSUMPTION, NAMED. Nothing here proves core 0 is the core JM6 dropped; it is inferred
+/// from the boot chain — `main.rs` runs `boot_virt::drop_to_el1` on the boot core and then
+/// `run_capstone_boot_core(0)`, and `percpu::this_cpu().cpu_index` for that core is 0. There is
+/// deliberately NO runtime `CurrentEL` check standing behind this constant: `CurrentEL` reads the
+/// level of the core EXECUTING the read, so a check here would only ever report the level of
+/// whichever core happens to be spawning, which is a different question from the one the constant
+/// answers ("which core will the task be dispatched FROM"). A cheap honest assert does not exist for
+/// this; the assumption is written down instead. If the boot core index ever stops being 0, this
+/// constant is the single line that has to move with it.
 const EL0_EL1_CORE: usize = 0;
 
-/// EL0-EL1CORE — EL0 placements redirected away from an EL2 core. Introspection only; a NONZERO
-/// count on a capture is this clamp doing its job, not a fault. Zero on `pi` by construction.
-static EL0_REDIRECTS: AtomicU64 = AtomicU64::new(0);
+/// EL0-EL1CORE — EL0 placements REFUSED because the EL1-filtered candidate set was empty.
+///
+/// WHERE IT IS READABLE, measured on the built artifacts rather than assumed. It is echoed as `n=` on
+/// every refusal line this file emits, and appended as `el0refuse=` to the `[spread4]` witness line —
+/// but `[spread4]` IS NOT REACHED ON A TEGRA BUILD. `LC_ALL=C grep -a` over the linked `arm-tegra-el0`
+/// kernel finds no `[spread4] live` at all: the string is in the rlib and the linker drops it, because
+/// every caller of `spread4_witness` is unreachable on that configuration. So on the Orin — the one
+/// platform that actually refuses — the readable record is `n=`, and `n=` stops at the cap below.
+/// That gap is real, it is NOT closed here (a tegra-reachable emitter is new work, not this arc's),
+/// and the cap therefore announces itself on the wire so a capture can never mistake the silence for
+/// "no further refusals". Zero on `pi` by construction: no core is ever filtered out there.
+static EL0_REFUSALS: AtomicU64 = AtomicU64::new(0);
 
-/// EL0-EL1CORE — may an EL0 task be dispatched from `cpu`? See the block above. Always true on `pi`
-/// (every Pi core is at EL1 before the scheduler exists), so the callers' guarded branches fold away.
+/// EL0-EL1CORE — rate limit for the per-refusal witness, on the same terms as `[spread4] rewake`
+/// (`SPREAD4_LOG_MAX`) and `[smpbal] steal` (`STEAL_LOG_MAX`): name the first few refusals, then go
+/// quiet so a shell loop that retries `bg` cannot flood a synchronous polled UART. Capping the WIRE
+/// never softens the refusal — the spawn still fails and its caller still gets the failure; only the
+/// per-event trace stops, and `EL0_REFUSALS` keeps the count on `[spread4]`.
+///
+/// Gated with `el0_refuse` itself on the EL0-machinery features, matching `SPREAD4_LOG_MAX`'s `pi`
+/// gate: the `virt`/JC3 legs build no EL0 spawn path at all, so on those the pair would be dead.
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+const EL0_REFUSE_LOG_MAX: u32 = 16;
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+static EL0_REFUSE_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// EL0-EL1CORE — is `cpu` known to be at EL1, i.e. may an EL0 task be dispatched FROM it? See the
+/// block above. Always true on `pi` (every Pi core is at EL1 before the scheduler exists), so on that
+/// target the filter admits every core and each guarded branch below folds to the pre-arc path.
 #[inline]
-fn el0_core_ok(cpu: usize) -> bool {
+fn el1_core(cpu: usize) -> bool {
     cfg!(feature = "pi") || cpu == EL0_EL1_CORE
 }
 
-/// EL0-EL1CORE — clamp an EL0 placement decision onto a core that can actually `eret` to EL0, naming
-/// both the core the placement policy chose and the core the task will really run on. `site` names
-/// the lane, so a capture can tell a spawn redirect from a rewake rescue. Identity — and silent — on
-/// `pi`, and silent everywhere when the policy already picked the EL1 core (the steady state).
-fn el0_clamp_cpu(site: &str, picked: usize) -> usize {
-    if el0_core_ok(picked) {
-        return picked;
+/// EL0-EL1CORE — could an EL0 placement for `requested` succeed right now? The exact predicate
+/// `el0_pick_cpu_slot` applies, exposed so a LOADER can refuse before it reserves a process row and
+/// maps an image: `spawn_user_image_bg`'s error path returns `Err(&'static str)` to the shell, which
+/// is a better answer than unwinding a half-built launch. Advisory by nature — the spawn re-checks
+/// and refuses on its own — so a racing `mark_online` between the two can only turn a refusal into a
+/// success, never the reverse.
+pub fn el0_placement_possible(requested: usize) -> bool {
+    if requested != CPU_AUTO {
+        return el1_core(requested);
     }
-    let n = EL0_REDIRECTS.fetch_add(1, Ordering::Relaxed) + 1;
-    serial_println!(
-        ":: SCHED: EL0 redirect ({}) core {} -> core {} (core {} is at EL2; eret would bank ELR_EL2) n={} ::",
-        site,
-        picked,
-        EL0_EL1_CORE,
-        picked,
-        n
-    );
-    EL0_EL1_CORE
+    (0..NUM_CPUS).any(|c| ONLINE_MASK[c].load(Ordering::Acquire) && el1_core(c))
+}
+
+/// EL0-EL1CORE — record and (rate-limited) announce a refused EL0 placement. `site` names the lane
+/// and `name`/`requested` name what was refused and where it was asked to go, so a capture can tell a
+/// `bg` refusal from a `SYS_THREAD_SPAWN` one without cross-referencing anything. Never reached on
+/// `pi`: `el1_core` is `true` there, so no candidate is ever filtered out.
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+fn el0_refuse(site: &str, name: &str, requested: usize) {
+    let n = EL0_REFUSALS.fetch_add(1, Ordering::Relaxed) + 1;
+    let seen = EL0_REFUSE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if seen < EL0_REFUSE_LOG_MAX {
+        // `req` is printed as -1 for CPU_AUTO rather than as `usize::MAX`'s 20 digits, so the field is
+        // readable on a lossy wire and a pin is unmistakably distinct from a load-balanced request.
+        serial_println!(
+            ":: SCHED: EL0 placement REFUSED ({}) '{}' req={} — no core at EL1 is a candidate (an eret at EL2 would bank ELR_EL2) n={} ::",
+            site,
+            name,
+            if requested == CPU_AUTO { -1 } else { requested as isize },
+            n
+        );
+    } else if seen == EL0_REFUSE_LOG_MAX {
+        // ANNOUNCE THE CAP, exactly once (the counter is monotonic, so this arm is taken by one caller
+        // and never again). "The wire may not lose lines": a rate limit that goes silent without saying
+        // so makes a capped run indistinguishable from a run that stopped refusing, and on tegra the
+        // `[spread4] el0refuse=` fallback does not exist (see `EL0_REFUSALS`). One line closes that.
+        serial_println!(
+            ":: SCHED: EL0 refusal witness CAPPED at {} lines — further refusals are COUNTED, not printed (EL0-EL1CORE) ::",
+            EL0_REFUSE_LOG_MAX
+        );
+    }
 }
 
 /// Resolve a requested `cpu` to a concrete core. An explicit index passes through verbatim (the
@@ -3119,8 +3231,38 @@ fn pick_cpu(requested: usize) -> usize {
 /// Suspending it costs nothing anywhere else, because whenever the sibling core has even one runnable
 /// resident the plain key chain already sends the spawn to the emptier core.
 fn pick_cpu_slot(requested: usize, slot: usize) -> usize {
+    // KERNEL placement: the candidate set is unfiltered and `unwrap_or(0)` is the early-BSP-staging
+    // fallback this chain has always had. A kernel task never `eret`s to a lower EL, so EL0-EL1CORE
+    // has nothing to say about it and this stays byte-identical on every target.
+    pick_cpu_filtered(requested, slot, false).unwrap_or(0)
+}
+
+/// EL0-EL1CORE — `pick_cpu_slot` for an EL0 task: the same key chain over a candidate set RESTRICTED
+/// to cores that are at EL1 (`el1_core`). `None` is THE REFUSAL — the filter left no candidate, so
+/// there is no core this task could be dispatched from without `eret`ing at EL2. The caller must fail
+/// the spawn; it must NOT substitute a core of its own, which is the redirect this shape replaced.
+///
+/// On `pi` the filter admits every core, so this is `Some(pick_cpu_slot(..))` and can never be `None`.
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+fn el0_pick_cpu_slot(requested: usize, slot: usize) -> Option<usize> {
+    pick_cpu_filtered(requested, slot, true)
+}
+
+/// The shared body of `pick_cpu_slot` / `el0_pick_cpu_slot`. `el0` arms the EL0-EL1CORE candidate
+/// filter and with it the ability to answer `None`; with `el0` false the filter is inert and the
+/// result is always `Some`, except for the pre-existing "no core online yet" case the kernel wrapper
+/// still resolves to core 0.
+fn pick_cpu_filtered(requested: usize, slot: usize, el0: bool) -> Option<usize> {
     if requested != CPU_AUTO {
-        return requested; // the no-migrate pin contract: render/input stay exactly where they are put
+        // The no-migrate pin contract: render/input stay exactly where they are put. EL0-EL1CORE —
+        // an explicit pin is honoured VERBATIM when its target is at EL1 (this is what keeps the
+        // shell's `run`, which pins to `this_cpu()` = the BSP, working exactly as it does today), and
+        // REFUSED when it is not. Never silently moved: answering a different question than the
+        // caller asked is how the original placement bug stayed invisible for a whole bring-up.
+        if el0 && !el1_core(requested) {
+            return None;
+        }
+        return Some(requested);
     }
     // SPREAD-13 — asked only for a slotted spawn, so the kernel-thread path (`pick_cpu`) and the
     // `virt`/JC3 builds pay nothing and behave identically to before this arc.
@@ -3139,6 +3281,13 @@ fn pick_cpu_slot(requested: usize, slot: usize) -> usize {
     for i in 0..NUM_CPUS {
         let cpu = (rot + i) % NUM_CPUS; // rotating start => fully-tied cores fill round-robin
         if !ONLINE_MASK[cpu].load(Ordering::Acquire) {
+            continue;
+        }
+        // EL0-EL1CORE — THE FILTER. An EL2 core is not a worse candidate for an EL0 task, it is not a
+        // candidate at all, so it is removed here rather than overruled after the fact. The key chain
+        // below then ranks only cores the task could actually be dispatched from, and `best` is `None`
+        // exactly when there are none. Inert for kernel spawns and on `pi`.
+        if el0 && !el1_core(cpu) {
             continue;
         }
         let res = el0_active(cpu); // SPREAD-4: runnable residents, not merely committed ones
@@ -3181,7 +3330,9 @@ fn pick_cpu_slot(requested: usize, slot: usize) -> usize {
     if slot != 0 && best.is_some() && best != plain {
         SPREAD10_CO_MOVES.fetch_add(1, Ordering::Relaxed);
     }
-    best.unwrap_or(0)
+    // `None` reaches only the EL0 caller as a refusal; the kernel wrapper resolves it to core 0, which
+    // is the "no core online yet" early-BSP fallback this function has always had.
+    best
 }
 
 /// Shared spawn path: build a kernel thread on `cpu`'s run queue (optionally carrying a `done_sem`
@@ -3232,16 +3383,31 @@ fn spawn_inner(
     rq(cpu).push(task);
     // PI-SCHED-1 — placement witness. The scheduler PINS a task to the caller-chosen core and never
     // migrates it (see `Task.cpu` / `make_ready`), so the placement is decided entirely at the spawn
-    // site; this line makes that decision auditable (the probe's core deliverable). It was gated behind
-    // the `pi` feature, on the reasoning that the sightings that motivated the probe were observed on
-    // the Raspberry Pi and that the jetson/tegra + virt builds sharing this module should stay
-    // byte-identical. EL0-EL1CORE UN-GATES IT (2026-08-22): that gate is exactly why the Orin could never
-    // say where a task landed, and a board that cannot answer "which core?" cannot see a placement bug —
-    // the EL2-AP eret kill (see the EL0-EL1CORE block above `pick_cpu`) survived undiagnosed on this
-    // silence for the whole tegra_el0 bring-up. The line is log-only and its format is UNCHANGED, so
-    // every Pi consumer that matches on it keeps matching; what changes is only that the tegra and virt
-    // builds now emit it too. FLAG: this file is shared across the aarch64 sub-tracks — the change is
-    // log-only and cannot alter scheduling on any track.
+    // site; this line makes that decision auditable (the probe's core deliverable). Gated behind the
+    // `pi` feature so it fires on the Raspberry Pi target (where the two core-placement sightings that
+    // motivated this arc were observed) and in the `kernel8-test` gate, while staying BYTE-IDENTICAL for
+    // the jetson/tegra + virt builds that share this aarch64 module. FLAG: this file is shared across the
+    // aarch64 sub-tracks — the addition is log-only and behind `pi`, so it cannot alter scheduling on any
+    // track. (The Pi `kernel8` build never sets `sched_demo`, so `pi` is the gate that makes the probe
+    // visible on the actual target.)
+    //
+    // EL0-EL1CORE UN-GATED THIS LINE ON 2026-08-22 AND IT IS RE-GATED HERE, on evidence rather than on
+    // taste. The un-gate's argument — "a board that cannot answer which core cannot see a placement
+    // bug" — is sound, but it names the wrong line: this is the KERNEL spawn witness, and no kernel
+    // task ever `eret`s to a lower EL, so it cannot witness the EL0/EL2 hazard at all. The two EL0
+    // witnesses (`spawn_user_inner`'s and `spawn_user_thread`'s) are the ones that can, and both are
+    // un-gated.
+    //
+    // COST, with each figure attributed to whoever measured it. THE REVIEW that ordered this re-gate
+    // measured the un-gated line at 25 lines / 2065 bytes of an 8202-byte log on the CAPSTONE QEMU leg
+    // — about a quarter of that leg's entire serial output. That figure is the review's and is NOT
+    // re-verified here (reproducing it needs a `test-arm` run, which this arc was scoped away from).
+    // What IS re-measured here, independently: on the Pi capture where this line has always been
+    // armed, `target/serial-pi.log` carries 135 of them totalling 11252 bytes of a 130269-byte log.
+    // Both readings agree on the shape — this is a high-volume line — and the Orin's wire is a
+    // synchronous polled UART shared with the SPE's TCU, i.e. LOSSY. Evidence that buys this arc
+    // nothing must not push evidence that does off the wire.
+    #[cfg(feature = "pi")]
     serial_println!(
         ":: SCHED: task '{}' -> core {} (policy: {}, no-migrate; prio {}) ::",
         name,
@@ -3296,9 +3462,22 @@ pub fn spawn_auto(name: &'static str, entry: fn(usize), arg: usize) -> u64 {
 
 /// Create a ready EL0 (user-mode) task on `cpu`'s run queue (M6a): when dispatched it drops to EL0 at
 /// `user_entry` with SP_EL0 = `user_sp` (both from `syscall::setup`) and calls back into the kernel via
-/// `svc`. MUST be spawned on a SCHEDULED core (an AP), never the unscheduled BSP — `user_task_trampoline`
-/// reads `SCHED[cpu].current`, which is null on a core that never runs the scheduler loop. Fire-and-
-/// forget: `sys_exit` marks it FINISHED and the scheduler reclaims it. Returns the task id.
+/// `svc`. MUST be spawned on a core that RUNS A DISPATCH LOOP — `user_task_trampoline` reads
+/// `SCHED[cpu].current`, which is null on a core that never schedules. Fire-and-forget: `sys_exit`
+/// marks it FINISHED and the scheduler reclaims it. Returns the task id, or 0 if the placement was
+/// REFUSED (see below); 0 is never a live task id.
+///
+/// EL0-EL1CORE (2026-08-22) — THE OLD WORDING WAS "a SCHEDULED core (an AP), never the unscheduled
+/// BSP", and that is no longer the requirement on a non-`pi` build. There, the BSP is the ONLY core an
+/// EL0 task may run on (it is the only one JM6 drops to EL1; an `eret` on an EL2 AP banks ELR_EL2 and
+/// kills the board), and it is not unscheduled — `run_capstone_boot_core` is its dispatch loop, so
+/// `SCHED[0].current` is populated exactly as an AP's is. The two claims were never the same claim:
+/// the real constraint has always been "a core that dispatches", and "an AP" was the Pi-shaped way of
+/// saying it, from a target where the BSP genuinely did not schedule. On `pi` nothing changes — every
+/// core is at EL1, the filter admits all of them, and the AP advice still reads correctly there.
+///
+/// A `cpu` that names an EL2 core on a non-`pi` build is REFUSED rather than moved: the call returns 0
+/// having created nothing. Ask [`el0_placement_possible`] first if you have state to unwind.
 ///
 /// Since M6e EVERY EL0 task starts I-unmasked (preemptible) — `user_task_trampoline` plants SPSR 0x240
 /// — so on metal the timer may preempt any of them mid-EL0; `__vec_irq` banks SP_EL0 so that is safe.
@@ -3341,13 +3520,23 @@ fn spawn_user_inner(
 ) -> u64 {
     // SPREAD-10: bias toward the core(s) already holding this address space's tasks. For a fresh
     // slot the count is zero everywhere and this is byte-identical to the plain key chain.
-    // EL0-EL1CORE: …and then clamp the result onto a core that can actually `eret` to EL0. This is
-    // the narrowest point that covers BOTH EL0 slot-spawn entry points (`spawn_user` and
-    // `spawn_user_slot` are thin wrappers over this function) and no kernel spawn at all —
-    // `spawn_inner`'s `pick_cpu` is deliberately left alone. It catches the convicted `bg` case
-    // (`CPU_AUTO` → an EL2 AP) and an explicitly-pinned EL0 spawn to a bad core alike, because the
-    // hazard is the DISPATCHING core's exception level, not how that core was chosen.
-    let cpu = el0_clamp_cpu("spawn", pick_cpu_slot(requested_cpu, slot_of(user_ttbr0)));
+    // EL0-EL1CORE: …over the EL1-filtered candidate set. This is the narrowest point that covers BOTH
+    // EL0 slot-spawn entry points (`spawn_user` and `spawn_user_slot` are thin wrappers over this
+    // function) and no kernel spawn at all — `spawn_inner`'s `pick_cpu` is deliberately left alone. It
+    // covers the convicted `bg` case (`CPU_AUTO` → an EL2 AP) and an explicitly-pinned EL0 spawn to an
+    // EL2 core alike, because the hazard is the DISPATCHING core's exception level, not how that core
+    // was chosen.
+    //
+    // REFUSAL RETURNS TASK ID 0, and it returns BEFORE any state is committed: no `NEXT_TID` is
+    // burned, no `asid_thread_enter`, no resident/slot accounting, no run-queue push, no allocation.
+    // `NEXT_TID` starts at 1 and ids are never reused, so 0 is a value no live task can ever carry —
+    // the sentinel is unambiguous inside the existing `u64` signature. Callers that need to react
+    // should ask `el0_placement_possible` BEFORE they reserve a process row and map an image;
+    // `spawn_user_image_bg` is the one that matters, and its `Err(&'static str)` reaches the shell.
+    let Some(cpu) = el0_pick_cpu_slot(requested_cpu, slot_of(user_ttbr0)) else {
+        el0_refuse("spawn", name, requested_cpu);
+        return 0;
+    };
     assert!(cpu < NUM_CPUS, "spawn_user: cpu out of range");
     // BG-SPREAD witness aid — record the decision so the caller can read back where its task landed.
     LAST_USER_PLACEMENT.store(cpu, Ordering::Release);
@@ -3386,6 +3575,14 @@ fn spawn_user_inner(
     // already sees it. PINNED EL0 spawns are counted too — the pin is honored verbatim (placement is
     // untouched), but the residents it parks on that core are real committed load and a later
     // `CPU_AUTO` placement must see them.
+    //
+    // EL0-EL1CORE (2026-08-22) — "the pin is honored verbatim" REMAINS TRUE, and the reason is worth
+    // stating because an earlier cut of that fix made it false. That cut CLAMPED an out-of-range pin
+    // onto `EL0_EL1_CORE`, so a caller-pinned EL0 spawn silently landed somewhere it had not asked
+    // for, while this comment still promised verbatim placement — the contradiction a review caught.
+    // The shipped shape FILTERS instead: a pin at an EL1 core reaches this line exactly as it always
+    // did, and a pin at an EL2 core is refused above and never reaches it. Verbatim or not at all;
+    // there is no third outcome, so nothing this line counts was ever moved.
     let residents = el0_resident_enter(cpu);
     slot_res_enter(cpu, user_ttbr0); // SPREAD-10: same instant, same core — the sibling map stays true
     rq(cpu).push(task);
@@ -3395,10 +3592,14 @@ fn spawn_user_inner(
     // accounting against the observed spread. `residents` is INCLUSIVE of this task: it is the
     // committed count on that core after this placement.
     //
-    // EL0-EL1CORE UN-GATES IT (2026-08-22), same rationale as `spawn_inner`'s twin and with more force,
-    // because THIS is the line that names the core an EL0 program will `eret` from: the Orin has never
-    // been able to say where a user task landed, which is precisely why the EL2-AP kill went unread.
-    // Format unchanged — Pi consumers keep matching; tegra/virt simply stop being silent.
+    // EL0-EL1CORE UN-GATES IT (2026-08-22). This is one of the TWO witnesses the arc un-gates, and the
+    // choice of which is deliberate: THIS line names the core an EL0 program will `eret` from, and the
+    // Orin has never been able to say where a user task landed, which is precisely why the EL2-AP kill
+    // went unread. (`spawn_inner`'s KERNEL-spawn twin was un-gated in the first cut and has since been
+    // RE-GATED to `pi` — it buys this arc nothing and it costs a quarter of the CAPSTONE leg's serial
+    // budget; see the note there.) Format unchanged — Pi consumers keep matching; tegra/virt simply
+    // stop being silent. On a refused placement no task exists, so this line correctly does not print;
+    // the refusal has its own witness.
     serial_println!(
         ":: SCHED: task '{}' -> core {} (policy: {} EL0 residents={}, no-migrate) ::",
         name,
@@ -3437,10 +3638,27 @@ pub fn spawn_user_thread(
     // SPREAD-10: THE co-placement site — a worker spawns under its parent's slot root, so the bias
     // lands it beside the parent (or its earlier-spawned sibling) whenever the load terms tie.
     // EL0-EL1CORE: an EL0 THREAD erets through the same trampoline as an EL0 slot task, so it is
-    // clamped on the same terms. This is the site where the `SYS_THREAD_SPAWN` "sibling core" hint
-    // (`other_online_cpu`, a verbatim explicit pin) would otherwise hand a thread straight to an
-    // EL2 AP — the fastest reachable form of the same board kill.
-    let cpu = el0_clamp_cpu("thread", pick_cpu_slot(requested_cpu, slot_of(user_ttbr0)));
+    // filtered on the same terms. This is the site where the `SYS_THREAD_SPAWN` "sibling core" hint
+    // (`other_online_cpu`, which arrives here as a verbatim explicit pin) would otherwise hand a
+    // thread straight to an EL2 AP — the fastest reachable form of the same board kill.
+    //
+    // REFUSAL SHAPE, and it has to differ from the slot path's because this signature returns a
+    // handle rather than an id. The refused handle carries `id: 0` (never a live task id) and a
+    // semaphore that ALREADY HOLDS ITS PERMIT, so a `SYS_THREAD_JOIN` on it returns at once instead of
+    // blocking forever on a thread that was never created — a refusal must not become a hang. Nothing
+    // else is built: no `NEXT_TID`, no stack, no `asid_thread_enter`, no resident accounting, no push.
+    //
+    // THE CALLER MUST NOT REACH HERE ON A REFUSABLE REQUEST, and `sys_thread_spawn` does not: it takes
+    // a `slot_thread_retain` before this call (see the SLOT REFCOUNT note above) whose only balancing
+    // release is the new thread's own `exit()`, so a refusal discovered afterwards would leak that
+    // reference permanently. It therefore asks `el0_placement_possible` BEFORE retaining and returns
+    // `-EAGAIN`. This arm is the fail-closed backstop for a caller that forgets to.
+    let Some(cpu) = el0_pick_cpu_slot(requested_cpu, slot_of(user_ttbr0)) else {
+        el0_refuse("thread", name, requested_cpu);
+        let done = Arc::new(Semaphore::new(1));
+        done.init();
+        return JoinHandle { done, id: 0 };
+    };
     assert!(cpu < NUM_CPUS, "spawn_user_thread: cpu out of range");
     let done = Arc::new(Semaphore::new(0));
     done.init(); // reserve the waiter list BEFORE the thread can run + post (alloc-free park)
@@ -3478,7 +3696,9 @@ pub fn spawn_user_thread(
         // EL0-EL1CORE — THE THIRD EXPOSURE, closed here. `try_steal` is a SECOND mover, and it is a
         // PULL: the core doing the stealing is the core the task lands on, so on a non-`pi` build an
         // idle EL2 AP would help itself to this thread and eret it — the same kill, reached without
-        // any placement decision this arc could clamp. Refusing eligibility is the honest shape:
+        // any placement decision the spawn-side filter could see. Refusing eligibility AT THE SOURCE
+        // is the honest shape and it is the same refusal the spawn sites make, expressed in the only
+        // vocabulary a pull lane has:
         // `steal_one` skips the task entirely, no Box is ever taken and pushed back, and the
         // SPREAD-3/10/15 accounting is never disturbed. This is the ONLY steal-eligible EL0
         // population (an EL0 SLOT task is already `steal_ok: false`), so nothing else is needed on
@@ -3498,15 +3718,20 @@ pub fn spawn_user_thread(
     let residents = el0_resident_enter(cpu);
     slot_res_enter(cpu, user_ttbr0); // SPREAD-10: same instant, same core — the sibling map stays true
     rq(cpu).push(task);
-    #[cfg(feature = "pi")]
+    // EL0-EL1CORE UN-GATES IT (2026-08-22). This witness was `#[cfg(feature = "pi")]` and the first cut
+    // of the arc left it that way while un-gating the KERNEL spawn line instead — exactly the wrong
+    // pair. THIS is the `SYS_THREAD_SPAWN` lane: the sibling-core hint arrives here as an explicit pin
+    // at another core, which on a non-`pi` build is an EL2 AP, so it is the FASTEST REACHABLE form of
+    // the board kill this arc exists to close — and the one lane the arc claimed to be observing while
+    // being structurally blind to it. Un-gated, tegra and virt can finally say where an EL0 thread
+    // landed, or (with the line absent and a refusal line present) that it was never placed at all.
+    // Format string byte-identical, so every Pi consumer matching on it keeps matching.
     serial_println!(
         ":: SCHED: thread '{}' -> core {} (ELF-2 shared-ASID EL0 thread residents={}, hint-placed) ::",
         name,
         cpu,
         residents
     );
-    #[cfg(not(feature = "pi"))]
-    let _ = residents;
     poke_cpu(cpu);
     JoinHandle { done, id }
 }
@@ -3535,11 +3760,20 @@ pub fn online_cpu_count() -> usize {
 /// `SYS_THREAD_SPAWN` "spread" hint). Returns the least-loaded such core, or `not` itself if no other core is
 /// online (uniprocessor / early staging). Lets a thread demonstrate genuine cross-core parallelism without
 /// the EL0 program knowing the CPU topology.
+///
+/// EL0-EL1CORE — the candidate set is filtered to cores at EL1, on the same terms as
+/// `el0_pick_cpu_slot`'s, because this function has exactly ONE caller and it is an EL0 one
+/// (`sys_thread_spawn`'s `place == 1`). No kernel path reads it, so the filter is unconditional here
+/// rather than a parameter. The "no eligible sibling" outcome is NOT new and is NOT a redirect: the
+/// existing contract already answers `not` when nothing else qualifies, because `place` is a locality
+/// HINT and "there is no sibling to prefer" has always been one of its answers. On a non-`pi` build
+/// that is now the answer whenever the only other online cores are the EL2 APs — so an EL0 thread is
+/// co-placed with its parent instead of being handed to a core that would kill the board erecting it.
 pub fn other_online_cpu(not: usize) -> usize {
     let mut best: Option<usize> = None;
     let mut best_depth = usize::MAX;
     for c in 0..NUM_CPUS {
-        if c == not || !ONLINE_MASK[c].load(Ordering::Acquire) {
+        if c == not || !ONLINE_MASK[c].load(Ordering::Acquire) || !el1_core(c) {
             continue;
         }
         let depth = rq(c).len();
@@ -5205,8 +5439,14 @@ static SPREAD15_PACK: AtomicU64 = AtomicU64::new(0);
 //
 // `steal_cooled` IS consulted — `steal_one` calls it on every candidate and each refusal bumps
 // `cool`, so the brake is wired and firing. What the brake cannot see is that ITS OWN POPULATION HAS
-// A SECOND MOVER. `spawn_user_thread` marks an EL0 thread `steal_ok: true` (VUGSPREAD-PI's whole
-// delta) AND `user_entry != 0`, so a vug worker is simultaneously:
+// A SECOND MOVER. `spawn_user_thread` marks an EL0 thread `steal_ok: cfg!(feature = "pi")` — i.e.
+// TRUE ON THE PI, which is the target this whole tune was measured on (VUGSPREAD-PI's whole delta),
+// and FALSE on every non-`pi` build since EL0-EL1CORE (2026-08-22) removed EL0 threads from the steal
+// population at the source, because `try_steal` is a PULL and an EL2 AP doing the pulling is the
+// destination. Everything below therefore describes the PI regime exactly and describes a population
+// that does not exist on tegra/virt — where `steal` and `remig` over EL0 threads are structurally
+// zero, and a reading of this tune taken there measures nothing. On the Pi, a worker is `steal_ok`
+// AND `user_entry != 0`, so it is simultaneously:
 //
 //   * steal-eligible — `try_steal` may move it, and stamps `migrate_ms` when it does; and
 //   * an EL0 task — so it ALSO travels `make_ready`'s SPREAD-4 rewake lane, which moved `task.cpu`
@@ -8276,7 +8516,15 @@ fn spread4_witness() {
     // second load could race a concurrent move into a division by a different sample count.
     let resid_n = SPREAD15_RESID_N.load(Ordering::Relaxed);
     serial_println!(
-        "[spread4] live c0={}/{} c1={}/{} c2={}/{} c3={}/{} rewake={} stay={} short={} refresh={} margin={} minpark={}ms steal={} d1={} remig={} cool={} pack={} rwstamp={} residn={} residmin={}ms residavg={}ms",
+        // EL0-EL1CORE — `el0refuse` is appended at the END so every existing consumer's prefix match is
+        // untouched. Where this line is emitted at all it carries the running refusal total un-capped,
+        // which the per-event refusal lines cannot (they are rate-limited by `EL0_REFUSE_LOG_MAX`).
+        // READ THE CAVEAT AT `EL0_REFUSALS` BEFORE RELYING ON IT: this whole witness is link-time dead
+        // on a tegra build — no caller of `spread4_witness` is reachable there — so on the Orin the
+        // field does not appear and is not the readout. Structurally 0 on `pi` (no core is ever
+        // filtered out) and 0 on any build with no EL0 tasks, exactly as `[spread4]`'s zero baseline
+        // already proves its own wiring.
+        "[spread4] live c0={}/{} c1={}/{} c2={}/{} c3={}/{} rewake={} stay={} short={} refresh={} margin={} minpark={}ms steal={} d1={} remig={} cool={} pack={} rwstamp={} residn={} residmin={}ms residavg={}ms el0refuse={}",
         el0_active(0),
         EL0_RESIDENTS[0].0.load(Ordering::Relaxed),
         el0_active(1),
@@ -8302,6 +8550,7 @@ fn spread4_witness() {
         // the honest reading of that beside `residn=0` (which is what makes it interpretable).
         if resid_n == 0 { 0 } else { SPREAD15_RESID_MIN.load(Ordering::Relaxed) },
         if resid_n == 0 { 0 } else { SPREAD15_RESID_SUM.load(Ordering::Relaxed) / resid_n },
+        EL0_REFUSALS.load(Ordering::Relaxed),
     );
     spread7_witness();
     spread10_witness();
