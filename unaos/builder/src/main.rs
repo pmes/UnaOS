@@ -365,6 +365,11 @@ fn main() {
     // pass — one unconditional `[deadman]` line per second, so silence is distinguishable from
     // idleness. Kept in sync with arroyo.
     if std::env::var("UNAOS_DEADMAN").is_ok() { feats.push("deadman"); }
+    // WEDGEINJ: UNAOS_WEDGEINJ=1 arms the injected phase-33 park — at 30 s the published render core
+    // clears IF and spins forever from inside the present blit, reproducing the metal wedge so
+    // WCSER-STEAL and WCSER-REHOME can be gated by execution instead of by compilation. TEST-ONLY;
+    // costs one AP for the rest of the run. Never arm on bench media. Kept in sync with arroyo.
+    if std::env::var("UNAOS_WEDGEINJ").is_ok() { feats.push("wedgeinj"); }
     // R1 / RTPI: UNAOS_RTPI=1 arms PRIORITY INHERITANCE on the x86 sleeping `Mutex` plus its `[rtpi]`
     // witness. Unlike RTWIT, this CHANGES scheduling — the holder of a contended `Mutex` inherits a
     // blocked higher-priority task's priority (transitively) until release. x86_64-only in effect;

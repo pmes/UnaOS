@@ -4272,19 +4272,43 @@ pub fn composite() {
                 {
                     stole = true;
                     COMP_HOLD_T0_MS.store(crate::arch::ms(), Relaxed);
+                    // WCSER-REHOME — PUBLISH THE DEATH, not just the gate transfer.
+                    //
+                    // The steal above re-homes ONE resource: the panel. Boot 16 proved that is not
+                    // the whole of what dies with the core. Every SINGLETON ROLE pinned to `dead`
+                    // dies with it, and the gate is merely the one this module happened to own. The
+                    // role that mattered was `x86_render_service`'s drain of `GUI_CHANNEL_X86`: it is
+                    // that channel's ONLY consumer, so its death is unrecoverable from the producer
+                    // side at any price, and the producer (`x86_input_service`) filled the 64 slots
+                    // and parked in `send` for the remaining 497 seconds of the boot. The desktop
+                    // repainted the whole time. Input was gone the whole time.
+                    //
+                    // A steal that re-homes the gate and abandons the rest does not remove the
+                    // starvation, it RELOCATES it — one dead core became one dead core plus a
+                    // permanently silent keyboard. So the identity of the dead core is published
+                    // here and the roles are reassigned by whoever owns them, on a live core: this
+                    // module cannot spawn (it is called from inside a composite pass, on any core,
+                    // possibly under the table lock), and it has no business knowing what a render
+                    // task is. Publishing is the whole of its part.
+                    //
+                    // Latched, not overwritten: a second steal from a different core must not erase
+                    // an un-acted-on first death. `compare_exchange` from the free sentinel keeps the
+                    // FIRST death standing until `comp_dead_core_take` retires it.
+                    let _ = COMP_DEAD_CORE.compare_exchange(usize::MAX, dead, AcqRel, Relaxed);
                     #[cfg(feature = "witness")]
                     {
                         COMP_STEALS.fetch_add(1, Relaxed);
                         COMP_OVERDUE_REPORTED.store(false, Relaxed);
                         serial_println!(
                             ":: [wcser] GATE STOLEN from c{} by c{} after {}ms — the holder was in \
-                             phase {} row {} and had not moved; desktop resumes on this core, the \
-                             dead core is not recovered == tripwire ::",
+                             phase {} row {} and had not moved; desktop resumes on this core, c{} is \
+                             DEAD and its singleton roles are owed a re-home == tripwire ::",
                             dead,
                             me,
                             held,
                             COMP_PASS_PHASE.load(Relaxed),
-                            COMP_PASS_ROW.load(Relaxed)
+                            COMP_PASS_ROW.load(Relaxed),
+                            dead
                         );
                     }
                 }
@@ -8531,6 +8555,207 @@ fn comp_gate_release() {
     #[cfg(feature = "witness")]
     COMP_OVERDUE_REPORTED.store(false, Relaxed);
     COMP_GATE.store(false, Release);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// WEDGEINJ — THE FAULT, REPRODUCED. Knob-gated (`wedgeinj` / `UNAOS_WEDGEINJ=1`), default OFF.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+//
+// WHY THIS EXISTS. WCSER-STEAL and WCSER-REHOME are recovery paths for a fault that cannot be
+// produced on demand: a store into the Kepler BAR1 that never retires, parking core 1 on one
+// instruction. It has been observed four times on one machine and never once in QEMU. A recovery
+// path that has never executed is a claim, and this tree does not accept claims as gates — the
+// standing law is that a knob-gated protection is proven by RUNNING it, not by compiling it.
+//
+// So the fault gets an injector. It is deliberately NOT a simulation of a stuck MMIO store — it is
+// the OBSERVABLE CONSEQUENCE of one, produced the only way software can produce it: `cli` followed
+// by an unbounded spin. To every other core that is indistinguishable from the metal fault, and
+// indistinguishable is the property the recovery path is tested against. A core in that state holds
+// [`COMP_GATE`] and its own per-core stage buffer, takes no interrupt, is never rescheduled, and
+// never releases anything — which is exactly the state boot 15's seventeen consecutive
+// `win=9 phase=33 row=897` samples describe.
+//
+// WHAT IT DOES NOT WEAKEN. Nothing. It adds no path to a non-`wedgeinj` build (the shim below is
+// empty), disables no protection, and touches no permission, checksum or page bit. The one thing it
+// does is deliberately lose one AP for the rest of the run — which is the fault under test.
+//
+// TARGETING is by ROLE, not by index: only the core `smp::render_cpu()` names, because the defect is
+// specifically "the core carrying a singleton role died" and parking a pool core would prove nothing
+// about re-homing. Requires the SCHED-X86 split to have been published, so a build that never
+// dispatches the render service simply never fires.
+
+/// WEDGEINJ — uptime at which the injected park fires, in ms.
+///
+/// 30 s: the x86 QEMU gate dispatches the render service at ~20 s, so this lands with the desktop
+/// genuinely up and running rather than mid-bring-up — the state the metal fault occurred in (83.8 s
+/// into boot 16, ~63 s after that boot's render dispatch). Leaves the default `./arroyo test 60`
+/// window with ~26 s after the 4 s steal to observe the recovery, which is what the gate reads.
+#[cfg(all(target_arch = "x86_64", feature = "wedgeinj"))]
+const WEDGEINJ_AT_MS: u64 = 30_000;
+
+/// WEDGEINJ — set the instant before the `cli`, so the park happens exactly once even though the
+/// test is in a per-row loop on a preemptible task.
+#[cfg(all(target_arch = "x86_64", feature = "wedgeinj"))]
+static WEDGEINJ_FIRED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// WEDGEINJ — park this core forever, holding [`COMP_GATE`], if it is the render core and the fuse
+/// has burned down. Called once per render-service pass from `x86_input_service`'s peer, the render
+/// loop in `main.rs`. Never returns when it fires.
+///
+/// # Why the injector SYNTHESISES the held state instead of riding a real pass
+///
+/// The first version of this hooked the phase-33 blit itself, one call per row — maximum fidelity,
+/// and useless. **The x86 QEMU gate composites almost nothing.** Measured on the 60 s leg:
+/// `[wcser] scope=live entered=3 … span=12846ms`, all three inside the ring-3 window fixtures, and
+/// after they tear down at ~14 s the desktop is static — `comp_ms` climbs by exactly 1000 every
+/// second for the rest of the run, which is the deadman saying no pass has COMPLETED since. There is
+/// no window, no damage, and no pass at 30 s, so a park that can only fire from inside a pass never
+/// fires, and the recovery path stays exactly as unproven as it was before the injector existed.
+///
+/// So the injector takes the gate the way a pass takes it and then stops. That reproduces the two
+/// properties — and they are the only two — that the recovery is a function of:
+///
+///  1. **the core carrying the render role stops executing, permanently.** `cli` then spin: it takes
+///     no interrupt, is never rescheduled, and returns from nothing.
+///  2. **it is holding `COMP_GATE`, with `COMP_HOLDER_CORE` and `COMP_HOLD_T0_MS` set**, so the steal
+///     sees precisely what it saw on metal and fires on its own unmodified timer.
+///
+/// What is NOT reproduced, said plainly rather than left to be assumed: the stuck store itself, the
+/// half-written window, and any cache/BAR state the real fault leaves behind. Those are properties of
+/// the DEVICE. The recovery does not read any of them — it reads the gate, the holder and the clock —
+/// so a fault that reproduces the state the recovery consumes is the right instrument, and one that
+/// only fires under a load QEMU cannot generate is not an instrument at all.
+///
+/// The `phase`/`row` gauges are stamped to boot 15's own readings so the `PASS OVERDUE` tripwire and
+/// the `GATE STOLEN` line print the shape a reader already knows from the metal captures.
+#[cfg(all(target_arch = "x86_64", feature = "wedgeinj"))]
+pub fn wedgeinj_park_maybe() {
+    use core::sync::atomic::Ordering::{AcqRel, Relaxed, SeqCst};
+    // Cheapest test first, and it is false on every pass but one.
+    if WEDGEINJ_FIRED.load(Relaxed) || crate::arch::ms() < WEDGEINJ_AT_MS {
+        return;
+    }
+    let me = crate::arch::sched::meter_current_cpu();
+    // By ROLE. No split published => no singleton role to kill => nothing to prove; decline.
+    match crate::arch::smp::render_cpu() {
+        Some(render) if render == me => {}
+        _ => return,
+    }
+    if WEDGEINJ_FIRED.swap(true, SeqCst) {
+        return;
+    }
+    // Take the gate exactly as `composite` does. Spin rather than decline: an injector that gave up
+    // because some other core happened to be mid-pass would fire on some boots and not others, and a
+    // gate that is only sometimes armed is worse than none. The wait is bounded by one honest pass.
+    while COMP_GATE
+        .compare_exchange(false, true, AcqRel, Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    COMP_HOLD_T0_MS.store(crate::arch::ms(), Relaxed);
+    COMP_HOLDER_CORE.store(me, Relaxed);
+    // Boot 15's own gauge readings, so the tripwire and the steal print the familiar shape.
+    comp_mark(9, 33);
+    comp_mark_row(897);
+    serial_println!(
+        ":: [wedgeinj] PARKING c{} WITH THE GATE HELD, phase 33 row 897 — this core takes no further \
+         interrupt and releases nothing; the render role dies with it, on purpose == tripwire ::",
+        me
+    );
+    // The park. IF cleared first so no timer tick can ever reschedule this core off the spin — a
+    // park the scheduler can walk away from is not the fault.
+    x86_64::instructions::interrupts::disable();
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// WEDGEINJ — throttle stamp for [`wedgeinj_drive_maybe`].
+#[cfg(all(target_arch = "x86_64", feature = "wedgeinj"))]
+static WEDGEINJ_DRIVE_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WEDGEINJ — keep a LIVE core asking for the gate after the park, so the steal has a caller.
+///
+/// **The steal is not a timer. It is a branch inside `composite`,** taken by whichever core next
+/// tries to composite and finds the holder overdue. On metal that condition is free: the device-core
+/// pump body calls `wcx::desktop_app_service` → `wm::pace_service` and `fbcon::console_service` →
+/// `route_present_banded`, so c7 was asking hundreds of times a second and the steal fired 4006 ms
+/// after the park, exactly as priced.
+///
+/// In QEMU that condition does not exist. Measured with the park armed and this hook absent: the
+/// `PASS OVERDUE` tripwire printed **26 consecutive one-second samples**, `age_ms` 1000 → 26000,
+/// `holder=c1 win=9 phase=33 row=897` every time, and `GATE STOLEN` never appeared — not because the
+/// steal is broken, but because after the ring-3 window fixtures tear down at ~14 s nothing on the
+/// machine ever asks for the gate again. A recovery that is only reachable under a load the harness
+/// cannot generate is untestable there, which is the whole reason this hook exists.
+///
+/// So the injector supplies the missing half of the fault CONDITION, from the pump's service pass —
+/// the same lane that supplied it on metal. Throttled to ~10 Hz: enough that the 4 s steal bound is
+/// met promptly, cheap enough that it cannot itself become the load under study. Armed only AFTER
+/// the park has fired, so a build carrying the knob composites nothing extra until the fault exists.
+#[cfg(all(target_arch = "x86_64", feature = "wedgeinj"))]
+pub fn wedgeinj_drive_maybe() {
+    use core::sync::atomic::Ordering::Relaxed;
+    if !WEDGEINJ_FIRED.load(Relaxed) {
+        return;
+    }
+    let now = crate::arch::ms();
+    if now.saturating_sub(WEDGEINJ_DRIVE_LAST_MS.load(Relaxed)) < 100 {
+        return;
+    }
+    WEDGEINJ_DRIVE_LAST_MS.store(now, Relaxed);
+    // An ordinary unmasked composite from a live core — the identical call `pace_service` and the
+    // paygo taker already make from this lane. Nothing about the steal is special-cased for it.
+    composite();
+}
+
+/// WEDGEINJ — the knob-off shims, so the render loop's and pump's call sites need no `#[cfg]`.
+/// Compile to nothing, on x86 without the knob and on aarch64 always.
+#[cfg(not(all(target_arch = "x86_64", feature = "wedgeinj")))]
+#[inline(always)]
+pub fn wedgeinj_park_maybe() {}
+#[cfg(not(all(target_arch = "x86_64", feature = "wedgeinj")))]
+#[inline(always)]
+pub fn wedgeinj_drive_maybe() {}
+
+/// WCSER-REHOME — a core the steal has declared DEAD and whose singleton roles have not yet been
+/// reassigned. `usize::MAX` = nothing owed.
+///
+/// Set by the steal (latched from the free sentinel, so a second death cannot erase an un-acted-on
+/// first one) and retired by [`comp_dead_core_take`]. This is a MAILBOX, not a gauge: exactly one
+/// reader ever gets a given death, because the response to it — spawning a replacement task — must
+/// happen once and not once per service pass.
+#[cfg(target_arch = "x86_64")]
+static COMP_DEAD_CORE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// WCSER-REHOME — claim the identity of a core the steal declared dead, at most once per death.
+///
+/// Returns `Some(core)` to exactly ONE caller per steal and `None` to everyone else, including every
+/// later poll. The caller that receives it owns re-homing that core's singleton roles.
+///
+/// Polled from a normal service pass rather than pushed from the steal, and that is deliberate: the
+/// steal runs inside a composite pass, on an arbitrary core, potentially under the window table's
+/// lock and with interrupts masked — the exact context in which `spawn` (which allocates a task and
+/// a kernel stack, and takes a run-queue lock) must not be called. Two relaxed loads per pass when
+/// nothing is owed.
+///
+/// **Not `pub` to the compositor's benefit.** Nothing in `wm` calls this; it exists for the layer
+/// that knows what a task IS. `wm`'s whole contribution is naming the corpse.
+#[cfg(target_arch = "x86_64")]
+pub fn comp_dead_core_take() -> Option<usize> {
+    use core::sync::atomic::Ordering::{AcqRel, Relaxed};
+    let dead = COMP_DEAD_CORE.load(Relaxed);
+    if dead == usize::MAX {
+        return None;
+    }
+    // The CAS is what makes this a take rather than a read: two service passes racing on two cores
+    // must not both spawn a replacement.
+    COMP_DEAD_CORE
+        .compare_exchange(dead, usize::MAX, AcqRel, Relaxed)
+        .ok()
+        .map(|_| dead)
 }
 
 /// WCSER-STEAL — cores that came back from the dead and correctly declined to release. Zero is the

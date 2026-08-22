@@ -4873,6 +4873,41 @@ impl<T> Channel<T> {
         self.slots.post();
         Some(value)
     }
+
+    /// Non-blocking `send`: take a free slot if one is available RIGHT NOW, else hand the value back.
+    ///
+    /// INPUT-UNGATE: this exists because `send`'s block is not backpressure when the consumer can
+    /// DIE. `GUI_CHANNEL_X86` has exactly one consumer — the x86 render task — and boot 16 proved a
+    /// consumer can be lost outright: core 1 parked inside a non-returning MMIO store at 83.8 s, the
+    /// render task went with it, and nothing was ever going to drain the channel again. The producer,
+    /// `x86_input_service`, filled all 64 slots and then parked in `send` FOREVER. It therefore
+    /// stopped draining `pal::EVENT_QUEUE` too, and the machine's whole input path died behind a
+    /// compositor it has no business depending on — `[deadman] hq=25` pinned, unmoving, for the last
+    /// 497 seconds of the boot.
+    ///
+    /// A producer that must keep serving something else (here: the event ring, whose drain is what
+    /// keeps the USB pump's decode from backing up) cannot afford an unbounded park on a peer it does
+    /// not control the liveness of. So it asks instead of committing, and decides what to do with the
+    /// refusal itself — which is a decision only the caller can make correctly, because it is a
+    /// question about the VALUE (a coalescable delta, a keystroke that must survive, a heartbeat that
+    /// may be dropped) and not about the channel.
+    ///
+    /// `Err(value)` hands the value straight back rather than dropping it: a `try_send` that consumed
+    /// its argument on failure would make silent loss the DEFAULT and force every caller to opt out
+    /// of it. The refusal is lossless by type.
+    ///
+    /// Like `try_recv` this never parks, so it is safe where blocking would be wrong — but it still
+    /// takes the buffer mutex, so it must run on a scheduled task like the rest of the type.
+    /// `try_wait` takes a permit only when it succeeds, so the `slots`/`items` accounting is
+    /// identical to `send`'s on the `Ok` path and untouched on the `Err` path.
+    pub fn try_send(&self, value: T) -> Result<(), T> {
+        if !self.slots.try_wait() {
+            return Err(value);
+        }
+        self.buffer.lock().push_back(value); // mutex held only across the push (never across a wait)
+        self.items.post();
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

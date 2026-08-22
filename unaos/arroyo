@@ -655,6 +655,17 @@ _feats=""
 # inline shim). DEFAULT OFF => every hook is an empty inline shim, so an unarmed kernel carries no
 # counter and no `[deadman]` string. Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_DEADMAN:-}" ] && _feats="${_feats}deadman,"
+# WEDGEINJ: UNAOS_WEDGEINJ=1 arms THE FAULT UNDER TEST. At 30 s of uptime the published RENDER core
+# clears IF and spins forever from inside the phase-33 present blit — indistinguishable to every other
+# core from the non-returning Kepler BAR1 store that wedged metal boots 13/14/15/16, which is the
+# property the recovery is tested against. It exists so WCSER-STEAL (gate re-home) and WCSER-REHOME
+# (render-role re-home) are gated by EXECUTION rather than by compilation; neither has ever run in
+# QEMU, and a recovery path that has never run is a claim. Pairs with UNAOS_WC=1 UNAOS_DEADMAN=1 and a
+# run long enough to see the 4 s steal plus the recovery (`./arroyo test 60`). COSTS ONE AP for the rest
+# of the run, on purpose. DEFAULT OFF => the per-row call site is an empty inline shim and an unarmed
+# kernel carries no `[wedgeinj]` string. ⚠ NEVER arm it on bench media. Kept in sync with
+# builder/src/main.rs.
+[ -n "${UNAOS_WEDGEINJ:-}" ] && _feats="${_feats}wedgeinj,"
 # R1 / RTPI: UNAOS_RTPI=1 arms PRIORITY INHERITANCE on the x86 sleeping `Mutex` (arch::x86_64::sched)
 # plus its `[rtpi]` witness. Unlike RTWIT (a pure ruler), this CHANGES scheduling: while a strictly-
 # higher task blocks on a `Mutex`, the holder inherits the blocker's priority (transitively) until
@@ -964,6 +975,12 @@ arm_features() {
     # ARCH-NEUTRAL call sites, so the shim half has to compile armed on aarch64 or the seam is
     # covered on neither arch.
     f="${f//,deadman,/,}"
+    # WEDGEINJ rides the same strip, and more strictly than the others: its whole implementation is
+    # `all(target_arch = "x86_64", feature = "wedgeinj")`-gated (the aarch64 half is the empty
+    # `#[inline(always)]` shim), so it emits not one byte of aarch64 code — and it is a DELIBERATE
+    # FAULT INJECTOR, which has no business anywhere near a media path it cannot fire on. Stripped =>
+    # aarch64 media stay byte-identical whether or not the x86 track is reproducing its wedge.
+    f="${f//,wedgeinj,/,}"
     # SDHC-4a rides the same strip, for the same reason: `drivers/sdhc.rs` is reached only from
     # `arch/x86_64/pci.rs`, so `sdw` emits not one byte of aarch64 CODE — but leaving it enabled would
     # shift every aarch64 media hash between a default build and a `UNAOS_SDW=1` one for zero
@@ -1887,7 +1904,7 @@ KERNEL_CFG_MATRIX=(
   # and both arches type-check the seam.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wedgeinj"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the
