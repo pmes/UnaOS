@@ -4235,9 +4235,65 @@ pub fn composite() {
     #[cfg(target_arch = "x86_64")]
     {
         use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
-        if COMP_GATE
-            .compare_exchange(false, true, AcqRel, Relaxed)
-            .is_err()
+        // WCSER-STEAL — TAKE THE GATE FROM A HOLDER THAT IS NEVER COMING BACK.
+        //
+        // Boots 13/14/15 all wedged the same way: core 1 enters `stage_window`'s present blit and
+        // stops inside ONE store into the Kepler BAR1. Boot 15's ISR-driven row trace is what makes
+        // that exact rather than inferred — SEVENTEEN consecutive one-second samples reading
+        // `win=9 phase=33 row=897`, the row never once advancing. A crawling loop moves; this does
+        // not. The core is architecturally parked on a single instruction.
+        //
+        // Nothing in software can un-park it. What software CAN stop doing is letting one parked
+        // core take the whole desktop with it: every other core was refused for the rest of the
+        // boot (`entered=0 declined_pct=100`, 78 s and counting), which is why the glass freezes
+        // even though `[deadman] pmp≈990` says the machine is otherwise alive.
+        //
+        // So: a holder that has been in-pass past [`COMP_GATE_STEAL_MS`] is declared dead and its
+        // gate is taken. The bound is 4x the tripwire's own overdue bound, which is itself 3x the
+        // worst honest pass this compositor has ever measured (302 ms), so no legal pass can reach
+        // it. The cost of a false steal is two cores compositing at once for one pass; the cost of
+        // not stealing is the whole desktop, measured, three boots running.
+        //
+        // The revenant hazard is closed at the RELEASE sites, not here: if the parked core ever
+        // does return, its store completes into a framebuffer (harmless — it writes pixels) and it
+        // then tries to release a gate it no longer owns. Every release now checks
+        // [`COMP_HOLDER_CORE`] first and a revenant simply declines to release. See
+        // `comp_gate_release`.
+        let mut stole = false;
+        if COMP_GATE.load(Acquire) {
+            let held = crate::arch::ms().saturating_sub(COMP_HOLD_T0_MS.load(Relaxed));
+            let dead = COMP_HOLDER_CORE.load(Relaxed);
+            if held >= COMP_GATE_STEAL_MS && dead != usize::MAX {
+                let me = crate::arch::sched::meter_current_cpu();
+                if dead != me
+                    && COMP_HOLDER_CORE
+                        .compare_exchange(dead, me, AcqRel, Relaxed)
+                        .is_ok()
+                {
+                    stole = true;
+                    COMP_HOLD_T0_MS.store(crate::arch::ms(), Relaxed);
+                    #[cfg(feature = "witness")]
+                    {
+                        COMP_STEALS.fetch_add(1, Relaxed);
+                        COMP_OVERDUE_REPORTED.store(false, Relaxed);
+                        serial_println!(
+                            ":: [wcser] GATE STOLEN from c{} by c{} after {}ms — the holder was in \
+                             phase {} row {} and had not moved; desktop resumes on this core, the \
+                             dead core is not recovered == tripwire ::",
+                            dead,
+                            me,
+                            held,
+                            COMP_PASS_PHASE.load(Relaxed),
+                            COMP_PASS_ROW.load(Relaxed)
+                        );
+                    }
+                }
+            }
+        }
+        if !stole
+            && COMP_GATE
+                .compare_exchange(false, true, AcqRel, Relaxed)
+                .is_err()
         {
             // DECLINED. This pass composites nothing and — crucially — CLEARS NOTHING: it never
             // reached the table snapshot, so every `damaged` flag it would have consumed is still
@@ -4369,10 +4425,7 @@ pub fn composite() {
         // WCSER-H — this held epoch ends: clear the holder and re-arm the tripwire latch before
         // the release publishes the gate.
         comp_mark(0, 0);
-        COMP_HOLDER_CORE.store(usize::MAX, Relaxed);
-        #[cfg(feature = "witness")]
-        COMP_OVERDUE_REPORTED.store(false, Relaxed);
-        COMP_GATE.store(false, Release);
+        comp_gate_release();
         // THE LOST WAKEUP, closed. A decliner that publishes `COMP_PENDING` after our last `swap`
         // and before the release above would otherwise leave its damage on the table with no core
         // committed to drawing it, and on a static desktop no later present would arrive to find it.
@@ -4418,10 +4471,7 @@ pub fn composite() {
             }
             // WCSER-H — same epoch-end discipline as the main release.
             comp_mark(0, 0);
-            COMP_HOLDER_CORE.store(usize::MAX, Relaxed);
-            #[cfg(feature = "witness")]
-            COMP_OVERDUE_REPORTED.store(false, Relaxed);
-            COMP_GATE.store(false, Release);
+            comp_gate_release();
         }
     }
 }
@@ -8438,6 +8488,56 @@ static COMP_OVERDUE_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic:
 /// 440 s wedge.
 #[cfg(all(target_arch = "x86_64", feature = "witness"))]
 const COMP_PASS_OVERDUE_MS: u64 = 1_000;
+
+/// WCSER-STEAL — a holder in-pass longer than this is DEAD and its gate is taken.
+///
+/// Priced at 4x [`COMP_PASS_OVERDUE_MS`], which is itself 3x the worst honest pass this
+/// compositor has ever measured (302 ms), so no legal pass can reach it. It is a liveness bound,
+/// not a performance one: the thing it fires on has been measured three times and is not slow, it
+/// is stopped — boot 15's trace read `row=897` seventeen times in a row, one sample a second,
+/// without the row advancing once.
+#[cfg(target_arch = "x86_64")]
+const COMP_GATE_STEAL_MS: u64 = 4_000;
+
+/// WCSER-STEAL — how many times a dead holder's gate has been taken this boot. Never drained: a
+/// standing nonzero is the desktop having survived something that used to end the session.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+static COMP_STEALS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WCSER-STEAL — release [`COMP_GATE`], but ONLY if this core is still its recorded holder.
+///
+/// This is the whole safety argument for stealing. A core parked inside a non-returning MMIO store
+/// is not coming back; but "not coming back" is a claim about a device, and if the device ever does
+/// answer, the store completes, the present loop finishes writing pixels into a framebuffer
+/// (harmless), and the revenant walks into a release for a gate a live core now owns. Unconditional
+/// `COMP_GATE.store(false)` — which is what both release sites used to do, and which the module's
+/// own DOUBLE-RELEASE note already flagged as a shape to be careful with — would hand a second
+/// compositor the panel while the first was mid-pass.
+///
+/// So the release is now conditional on identity. The revenant finds [`COMP_HOLDER_CORE`] naming
+/// someone else, declines, and returns to its own loop; the live holder releases normally. A core
+/// that was never stolen from always matches and the path is byte-identical to the old one.
+#[cfg(target_arch = "x86_64")]
+fn comp_gate_release() {
+    use core::sync::atomic::Ordering::{Relaxed, Release};
+    let me = crate::arch::sched::meter_current_cpu();
+    if COMP_HOLDER_CORE.load(Relaxed) != me {
+        // Stolen from under us while we were in-pass. Not ours to release, and not ours to clear.
+        #[cfg(feature = "witness")]
+        COMP_REVENANTS.fetch_add(1, Relaxed);
+        return;
+    }
+    COMP_HOLDER_CORE.store(usize::MAX, Relaxed);
+    #[cfg(feature = "witness")]
+    COMP_OVERDUE_REPORTED.store(false, Relaxed);
+    COMP_GATE.store(false, Release);
+}
+
+/// WCSER-STEAL — cores that came back from the dead and correctly declined to release. Zero is the
+/// expected reading; a nonzero one means a stuck BAR store DID eventually complete, which is worth
+/// more than the counter costs because it converts "never returns" into "returns after N seconds".
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+static COMP_REVENANTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// WCSER-H — the pass BREADCRUMB: which window the blit loop is on and which phase of its draw
 /// (0 idle, 1 shadow-pin, 2 wcg-begin, 3 draw, 4 post-draw witnesses). Gauges, relaxed, stamped
