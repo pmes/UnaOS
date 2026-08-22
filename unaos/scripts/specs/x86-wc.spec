@@ -62,3 +62,12 @@ FORBID \[dmgovlp\] DRAIN-STUCK
 # there is no honest SKIP, so one appearing means the fixture lost its panel or its geometry —
 # a red, not a shrug.
 FORBID \[dmgovlp\].*SKIP
+
+# TILEFIT — two windows handed the same box. PULSE-2's last-resort clamp is idempotent, so once the
+# greedy flow overflows the work area every later row pins to the same y and restarts cx at GAP: the
+# first box of an overflow row is byte-identical to the first box of the last row that fit. On metal
+# boot 11 that gave six vugs FIVE distinct rectangles, and the operator counted five windows. The
+# covered window cannot even be clicked — `wc_click_route_at` answers with the top row. ALIASED names
+# the colliding pair by win id and asid, and it is read off the same `placed` array the fix consults,
+# so the verdict and the fix cannot silently disagree.
+FORBID \[wm\] tile-fit.* -> ALIASED

@@ -4890,7 +4890,7 @@ fn bg_program(console: &mut Console, path: &str) -> bool {
             jobs[idx] = Some(BgJob { pid, asid, name, nlen: nlen as u8 });
             console.println(&alloc::format!("bg: {} started — pid {} (see `jobs`)", path, pid));
             serial_println!(
-                ":: BGRUN: bg {} — loaded {} bytes, entry {:#x}, pid={} asid={} DETACHED ::",
+                ":: BGRUN: bg {} — loaded {} bytes, entry {:#x}, pid={} slot={} (window layer arms asid=slot+1) DETACHED ::",
                 path, n, entry, pid, asid
             );
             true
