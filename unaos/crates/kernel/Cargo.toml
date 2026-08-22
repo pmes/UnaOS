@@ -1317,6 +1317,41 @@ v3d_hfirst = ["v3d_dispatchdisc"]
 #   this never runs there. See docs/dev/OS/08_VIDEO/v3d.md §49.25.7.
 v3d_vpmprobe = ["v3d_hfirst"]
 
+# PI-V3D-104: the SINGLESEG rung — v3d.md §49.25.9d/§49.25.10, the one-variable successor to boot 14's
+# `OUTCOME V5`. IMPLIES `v3d_vpmprobe` (and through it the whole chain down to `v3d`), because its rows
+# are read off the SAME leg-H instrument bank boot 14 was read on, against boot 14 itself as baseline.
+# IT ADDS NO LEG, NO KICK, NO SHADER WORD, NO REGISTER READ OR WRITE and NO PAGE-TABLE EDIT. It changes
+# exactly ONE BIT OF ONE DRAM BYTE: bit 225 of the 36-byte GL Shader State Record `build_shader_record`
+# publishes — "Coordinate Shader start in final thread section" — from 0 to 1.
+#   WHY, AND WHERE THE POLARITY COMES FROM (the §49.25.9d task-0 gate, discharged at the desk before
+#   this feature existed; §5's fabricated-constant law forbids packing it any other way):
+#     · `src/broadcom/cle/v3d_packet.xml`, `<struct name="GL Shader State Record" max_ver="42">`:
+#       bit 224 "Coordinate Shader 4-way threadable", bit 225 "Coordinate Shader start in final thread
+#       section", bit 226 "Coordinate Shader Propagate NaNs". There is NO "2-way threadable" field in
+#       the v42 record at all — 4-way-threadable=0 IS the 2-way declaration.
+#     · `src/gallium/drivers/v3d/v3dx_draw.c`: `shader.coordinate_shader_start_in_final_thread_section
+#       = v3d->prog.cs->prog_data.vs->base.single_seg;` (and `v3dvx_pipeline.c` the same for Vulkan).
+#     · `src/broadcom/compiler/vir.c` `v3d_set_prog_data`: `prog_data->single_seg = !c->last_thrsw;`
+#     · `src/broadcom/compiler/nir_to_vir.c`: `vir_emit_thrsw` is reached only from a TMU flush, a
+#       fragment-shader TLB read or a barrier — none of which our coord shader has — so `c->last_thrsw`
+#       is NULL through translation; `vir_emit_last_thrsw` injects one artificially (so spilling lands
+#       ahead of it) and `v3d_nir_to_vir_finish` REMOVES it again when the program neither spilled nor
+#       dropped to one thread, setting `c->last_thrsw = NULL`. The terminal `thrsw` every V3D program
+#       carries is inserted later still, in `qpu_schedule.c` ("Emit the program-end THRSW instruction"),
+#       and is NOT `c->last_thrsw`. => for a no-TMU, no-spill, threads=4 coord shader — exactly
+#       CS_VS_WORDS, whose 27 words carry SIG_THRSW on word [24] and nowhere else — MESA PACKS 1.
+#   So the record we ship declares a thread-section shape the program does not have, and `OUTCOME V5`
+#   (the coord thread spends its life STALLED against a VPM that never drains) is the shape a
+#   mis-declared thread section would produce. ONE VARIABLE: bits 97 (FS) and 161 (VS) stay 0 — the
+#   armed ladder's bin frames dispatch only the coordinate shader — and leg G's null-shader record is
+#   untouched, so every other byte of every leg is PA51's. Default OFF; DEFAULT PACKING IS UNCHANGED.
+#   Adds one `[v3d104]` desk line (read FIRST, like `[v3d103] VPMSTATIC` before it) plus a per-publish
+#   readback of the record word that carries the bit, so the capture proves the bit reached DRAM.
+#   Enable via `UNAOS_V3D_SINGLESEG=1 UNAOS_PI=1 ./arroyo kernel8`. ⚠ armed => SHORT capture; never diff
+#   it against a deep boot. QEMU raspi4b models no V3D, so this never runs there; the verdict is
+#   attended metal. See docs/dev/OS/08_VIDEO/v3d.md §49.25.9d and §49.25.10.
+v3d_singleseg = ["v3d_vpmprobe"]
+
 # PI-USB-1: the BCM2711 PCIe root complex + VL805 xHCI attach (arch/aarch64/piusb.rs) — brcmstb RC
 # bridge reset / link-up / MEM-window + inbound-BAR config, VL805 (1106:3483) enumeration + BAR sizing,
 # the NOTIFY_XHCI_RESET mailbox, and the polled shared-xHCI attach to the "controller halted-but-decoding

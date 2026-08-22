@@ -9377,3 +9377,151 @@ successor added §49.25.9a's every-place sweep, §49.25.9b's two extra rows and 
 finding, sharpened §49.25.9c to stop short of claiming the `STVPMV` stores *completed* (§49.25.8 reads
 bit16 as RELEASED, not FINISHED — the two sections now agree), and ran the gates above. No boot flew
 for either half.
+
+#### 49.25.10 `v3dseg` task 0 — the polarity pinned from Mesa, the mislabel corrected, and SINGLESEG built (PI-V3D-104, desk arc, 2026-08-22)
+
+§49.25.9d made one thing the SINGLESEG rung's precondition: **pin the polarity of shader-record bit 225
+from authority, or do not pack it.** §49.25.9b had found the bit SUSPECT with **POLARITY UNKNOWN** and
+deliberately shipped nothing. This arc is that task 0, and it is again desk work only — no boot flew.
+The answer is that **Mesa packs 1 where we pack 0**, so `OUTCOME S0` does not fire and the rung lives;
+it is built here, default OFF, one bit wide.
+
+##### 49.25.10a The polarity, pinned
+
+There is no Mesa checkout on this host (the PI-V3D-26 harness was built on another machine, against a
+sparse checkout under a scratch path that no longer exists), so the four sources below were fetched raw
+from `gitlab.freedesktop.org/mesa/mesa` `main` on 2026-08-22. Line numbers are that snapshot's; the
+field and function names are the load-bearing part and are quoted exactly.
+
+| # | source | what it says, verbatim in its load-bearing part |
+|---|---|---|
+| 1 | `src/broadcom/cle/v3d_packet.xml` (`<vcxml gen="4.2" min_ver="42" max_ver="71">`), `<struct name="GL Shader State Record" max_ver="42">` | each shader group carries exactly **three** flags: `Fragment/Vertex/Coordinate Shader 4-way threadable` at bits **96/160/224**, `… start in final thread section` at **97/161/225**, `… Propagate NaNs` at **98/162/226** |
+| 2 | `src/gallium/drivers/v3d/v3dx_draw.c` | `shader.coordinate_shader_start_in_final_thread_section = v3d->prog.cs->prog_data.vs->base.single_seg;` (and the VS/FS pair beside it; `src/broadcom/vulkan/v3dvx_pipeline.c` writes the identical three assignments) |
+| 3 | `src/broadcom/compiler/vir.c`, `v3d_set_prog_data` | `prog_data->single_seg = !c->last_thrsw;` |
+| 4 | `src/broadcom/compiler/nir_to_vir.c` + `qpu_schedule.c` | `vir_emit_thrsw` is reached only from `ntq_flush_tmu`, the fragment-shader TLB-read path and the barrier intrinsic; `vir_emit_last_thrsw` injects one **artificially** so that spilling lands ahead of it; `v3d_nir_to_vir_finish` then runs `if (!c->spills && c->last_thrsw != c->restore_last_thrsw) vir_restore_last_thrsw(…)`, which for a program that had none of its own **removes the injected instruction and sets `c->last_thrsw = NULL`**. The terminal `thrsw` every V3D program carries is emitted later still — `qpu_schedule.c`: "*Emit the program-end THRSW instruction*" — unconditionally, and is **not** `c->last_thrsw` |
+
+**Chained: `single_seg = 1` for a shader that has no thread switch of its own**, and it means what its
+v42 name says — the hardware spawns the thread **already in the final thread section**, because no
+section transition is coming. `nir_to_vir.c` says so in its own words at the one place it treats
+non-fragment stages differently: *"For V3D 4.x, we can spawn the non-fragment shaders already in the
+post-last-THRSW state"*. The same flag reaches compute through a different door —
+`v3dx_draw.c`: `if (…->single_seg) submit.cfg[5] |= V3D_CSD_CFG5_SINGLE_SEG;` — so this is a hardware
+notion with a hardware name, not a driver bookkeeping bit.
+
+**Our coordinate shader is exactly that shape, and this is machine-checked in-tree, not asserted.**
+`CS_VS_WORDS`'s 27 words were decoded on their `sig` field (bits [57:53], `SIG_THRSW == 1`, the same
+decode `cs_tail_witness` prints): words 0–10 carry `sig=12` (`ldunifrf`), **word [24] carries `sig=1`
+(`SIG_THRSW`) and no other word carries any signal at all**. The program is **TMU-free**, and on the
+round-tripped artifact's authority rather than our own comments': `scripts/pi-v3d20-qpu-gen.out.txt`'s
+"COORDINATE/VERTEX shader body (`OFF_CS_CODE` / `OFF_VS_CODE`)" section disassembles these exact words
+through Mesa's own packer/disassembler and contains **no `tmu` mnemonic of any kind** — the TMU probe is
+a *different* program in a *different* record. It is declared
+`threads=4` (record bit 224 = 1), and Mesa's own ver-4.2 `v3d_compile()` run over the same draw
+(`scripts/pi-v3d26-mesa-compile.out.txt` line 3) prints `threads=4` with no spill instructions in its
+listing. No TMU op, no barrier, no TLB read, no spill, four threads ⇒ `c->last_thrsw == NULL` ⇒
+**`single_seg = 1` ⇒ bit 225 = 1. We have always packed 0.**
+
+**The trap this task existed to avoid, named.** The tempting shortcut — "Mesa's compiled coord shader
+ends in `thrsw` (artifact word [19]), so it *has* a last thrsw, so `single_seg = 0`, so our packing is
+already right" — is **wrong**, and it would have produced `OUTCOME S0` and killed a live rung at the
+desk. That terminal `thrsw` is `qpu_schedule.c`'s program-end instruction, inserted after
+`v3d_set_prog_data`'s input has already been decided; `vir_remove_thrsw`'s own comment says it out
+loud ("*one will still be inserted at `v3d_vir_to_qpu()` for the program end*"). The artifact's
+disassembly can distinguish the two cases anyway, and does: the **probe** variant (TMU store,
+`threads=2`) shows `thrsw` at **[18], [19] and [22]** — a real last-thrsw emitted as the pair Mesa
+flags for it, *plus* the program end — while the coord and render variants show exactly **one**,
+terminal, with two `nop`s behind it. One `thrsw` = no `last_thrsw` = `single_seg = 1`.
+
+**What the in-tree artifact could not settle, stated for the record:** it does not print `single_seg`
+(the harness dumps `threads`, `vpm_input_size`, `vpm_output_size`, `vcm_cache_size`,
+`separate_segments`, `vattr_sizes`, `uses_vid/iid`, `tmu_count`), so §49.25.9b's refusal to pack from
+it was correct. It supplies the two *inputs* the rule needs — thread count and program shape — and the
+rule itself had to come from the compiler sources above.
+
+##### 49.25.10b The `[v3d38]` label, corrected — and one line of campaign history re-read
+
+§49.25.9b's second finding is settled by the same read. The witness table named bit **97**
+`fs_single_seg` and bit **161** `vs_2way_threadable`; the v42 record's field list says **there is no
+"2-way threadable" field at all** — a 2-way shader is declared by *clearing* the 4-way bit
+(Mesa: `…_4_way_threadable = prog_data->base.threads == 4`) and by nothing else. So bit 97's label was
+right in substance (`single_seg` is Mesa's name for the value packed there) and **bit 161's was wrong**.
+Both are now named for the field: `fs/vs/cs_start_in_final_thread_section`, and the three flags the
+table never named at all — **162, 225 and 226** — are added, so a record diff can no longer be silent
+about the very bit this rung flips. The same correction lands on `[v3d30]`'s decode line (which printed
+`2way=` for bits 225 and 161) and on `build_probe_shader_record`'s flag-group comment (which stated the
+false law "bit1 = 2-way threadable = (threads == 2)"). **No packed byte moves for any of it**: every one
+of these bits is written 0 on the records concerned, and the labels decorate prints.
+
+The correction re-reads one piece of history rather than erasing it. **V3D-32** (§17) flipped what it
+called "the 2-WAY bit" on the *probe* record — bit 225 set, bit 224 cleared — for the `threads=2`,
+TMU-storing probe program, and the P34 capture read that coord shader as **never dispatching**
+(`valid_instr=0` against the M4 shader's 55 on the same boot); **V3D-36** restored 224=1/225=0 and
+dispatch returned. Under the correct field name, what V3D-32 actually told the hardware was that a
+program **with a mid-shader thread switch** starts in its final thread section — a declaration Mesa
+would never make for it (`single_seg = 0` there, because a TMU shader has a real `last_thrsw`) — and
+the pipeline stopped. That is not proof of anything about *our* coord shader, but it is this campaign's
+own evidence that **this bit is dispatch-potent on this silicon**, which is why the rung is worth a
+boot and why it is one bit wide.
+
+##### 49.25.10c What was built (`v3d_singleseg`, default OFF)
+
+Exactly §49.25.9d's design, no wider:
+
+- **Knob `UNAOS_V3D_SINGLESEG=1`** → cargo feature `v3d_singleseg = ["v3d_vpmprobe"]` (family
+  discipline: one env var arms the whole chain down to `v3d`), an `arm-pi` feature-list entry for cfg
+  coverage, and a kernel8 knob block carrying the polarity citation in the arming banner itself.
+- **One bit of one DRAM byte:** `build_shader_record` gains a `#[cfg(feature = "v3d_singleseg")]`
+  `sf(&mut rec, 225, 1, 1)`. **The default packing is unchanged.** Bits 97 (FS) and 161 (VS) stay 0 —
+  the armed ladder's bin frames dispatch only the coordinate shader — and
+  `build_bisect_null_shader_record`'s leg-G record is untouched, so leg G stays byte-identical to
+  boot 14's.
+- **Two `[v3d104]` lines.** The desk line (read **first**, as `[v3d103] VPMSTATIC` is) carries the
+  whole citation chain onto the wire so the capture argues for itself; and a **readback** emitted right
+  after each publish prints the record's word@byte28 with bits 224/225/226 decoded, so a capture in
+  which the bit did **not** reach DRAM kills every S row before it is read. A knob-gated line that
+  cannot prove its own bit landed is decoration.
+- No leg, no kick, no shader word, no register read or write, no page-table edit, no list change.
+
+##### 49.25.10d Is a boot 15 owed, and what is its one question
+
+**Yes — and it is the only V3D boot this verdict owes.** `OUTCOME S0` (the row that would have ended
+the campaign's producer surface at the desk) **did not fire**: the record diverges from Mesa on exactly
+one field, and that field describes the thread-section shape of the very thread `OUTCOME V5` caught
+stalling. §49.25.9d's remaining rows stand as written and are not re-litigated here: **S1** (frame
+closes / `PTB_PRIMS_BINNED` moves — the bit was the drain wall), **S2** (boot 14's leg-H shape to the
+digit — the bit is exonerated and the producer surface closes for good), **S3** (stall collapses, still
+no delivery — stall and drain are two stations), **S4** (any newly-latched `ERR_STAT` bit — the silicon
+answers the polarity question in the negative), all behind the INCONCLUSIVE guard that leg E must still
+return `OUTCOME E1`.
+
+**Boot 15's one question: with the coordinate shader's record declaring the thread-section shape the
+program actually has, does the VPM drain?** One cold boot, short capture,
+`UNAOS_V3D_SINGLESEG=1 UNAOS_PI=1`, read in §49.25.7h's order with `[v3d104]`'s two lines first,
+against **boot 14 itself** as the baseline.
+
+And the succession is already named, whichever way it falls. If the bit is exonerated (`S2`), the
+producer surface is **closed** — every field Mesa-parallel (§49.25.9b), part-checked (§49.25.9a) and
+now flight-tested both ways — and the next rung must instrument the **VCM → PSE → PTB** chain, which is
+the station `V5` accuses and the one part of the path this campaign has never watched: today the entire
+consumer side is read only through `PTB_PRIMS_BINNED`, `PTB_PRIM_CLIP` and `PTB_PRIM_VIEWPOINT_DISCARD`,
+all of which report on primitives that have **already arrived**, and none of which can see a hand-off
+that never happens. §49.25.9c's decision holds under that too: the TMU landmark stays gated on `V6`,
+and becomes the tool for the "did any store LAND" doubt only when the consumer-side instrumentation
+dead-ends.
+
+##### 49.25.10e Measured, this arc
+
+Worktree `exec-v3dseg`, baseline `e8dcb09c`.
+
+| gate | result |
+|---|---|
+| `./arroyo check` | **green, both arches** — `✅ x86_64 OK`, `✅ aarch64 OK`, `✅ kernel cfg coverage OK (12 legs)` (the `arm-pi` leg now carries `v3d_singleseg`), `✅ midden_core tests OK` |
+| `./arroyo test-arm` | **clean** — headless aarch64 QEMU to completion, `BOT-PARK … -> PASS` and `SERWIT-2 … -> PASS`, **0** `FAIL`/`PANIC`/`❌` verdict lines in `target/serial-arm.log` |
+| `./arroyo kernel8-test` | **MBENCH PASS — 117/117 required witnesses, 0 forbidden hit(s), 10141 lines scanned** |
+| strings-proof, **positive** | `UNAOS_V3D_SINGLESEG=1 UNAOS_PI=1 ./arroyo kernel8` → `kernel8.img` `451a461b0d0727d9…` contains **2** `[v3d104]` strings (`SINGLESEG` desk line + `SHADREC READBACK`), and the implied chain is compiled in with it (13 `[v3d103]`, 11 `[v3d102]` strings) |
+| strings-proof, **negative (matched)** | the same command **without** the knob → `kernel8.img` `4f24da565cc327da…` contains **0** `[v3d104]` strings, **0** `[v3d103]`, **0** `[v3d102]`; the `kernel8-test` image (`6794630056519b62…`) likewise **0** |
+| default packing | unchanged — the only unconditional edits to `v3d.rs` are print labels and comments; the one `sf(…, 225, 1, 1)` is behind `#[cfg(feature = "v3d_singleseg")]` |
+
+*Provenance:* the Mesa sources cited in §49.25.10a were read this arc from `mesa/main` (2026-08-22),
+not from memory and not from this repository's own code — the value on trial was ours, so ours could
+not be the witness.

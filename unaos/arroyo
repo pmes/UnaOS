@@ -139,6 +139,17 @@ NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=c
 # own v3d_debugfs.c scopes to V3D_GEN_33..V3D_GEN_71 — bracketing this part's 4.2). It implies
 # `v3d_hfirst` (declared in Cargo.toml and armed here), so `UNAOS_V3D_VPMPROBE=1` alone is sufficient.
 # See the kernel8 knob block below and v3d.md §49.25.7.
+#
+# PI-V3D-104: UNAOS_V3D_SINGLESEG=1 is a plain arming knob (no value) for the `v3d_singleseg` feature —
+# the SINGLESEG rung, v3d.md §49.25.9d/§49.25.10, the one-variable successor to boot 14's `OUTCOME V5`.
+# It adds NO leg, NO kick, NO shader word, NO register read or write and NO page-table edit. It changes
+# exactly ONE BIT OF ONE DRAM BYTE: bit 225 of the published GL Shader State Record — "Coordinate Shader
+# start in final thread section" — 0 -> 1, which is what Mesa packs for a TMU-free, no-spill, threads=4
+# coord shader (v3dx_draw.c <- prog_data->single_seg <- vir.c `!c->last_thrsw`; our CS_VS_WORDS carries
+# SIG_THRSW on word [24] only, and that terminal one is qpu_schedule.c's program-end THRSW, not
+# `c->last_thrsw`). It implies `v3d_vpmprobe` (declared in Cargo.toml and armed here), so
+# `UNAOS_V3D_SINGLESEG=1` alone is sufficient, and it is read against BOOT 14 as its baseline.
+# See the kernel8 knob block below and v3d.md §49.25.9d.
 KERNEL_FEATURES=""
 _feats=""
 # DEFAULT-QUIET: UNAOS_WITNESS=1 arms the `witness` fixture-battery feature (auto-set above for the battery
@@ -1650,7 +1661,7 @@ KERNEL_CFG_MATRIX=(
   # PI-DESK (`pidesk` — the desktop furniture family on the Pi panel; this leg carries `witness`, so it
   # is also the only place the dock/menubar/crystal FIXTURES are type-checked on aarch64).
   # Cannot carry the tegra family — see the mutual-exclusion note above.
-  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,pidesk,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon"
+  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,pidesk,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,v3d_singleseg,fatperf,livecon"
   # aarch64 board leg 2 — Jetson Orin Nano (Tegra234), plus the board-neutral aarch64 features that
   # would otherwise ride nothing: ORIN-SMP (tegrasmp/smpprobe), the four XCARVE levers, ORIN-NET-1..4
   # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET
@@ -3145,6 +3156,42 @@ kernel8() {
     if [ -n "${UNAOS_V3D_VPMPROBE:-}" ]; then
         K8_FEATS="${K8_FEATS},v3d_vpmprobe,v3d_hfirst,v3d_dispatchdisc,v3d_bincontent,v3d_armedclose,v3d_tsaim,v3d_basedaim,v3d_unarmclose,v3d"
         echo -e "${COLOR_YELLOW}  • UNAOS_V3D_VPMPROBE: the [v3d103] vpmprobe discriminator rung — NO new leg, NO new kick, NO new shader word and NO new register WRITE; it re-sources PCTR slots 4/5/6 to QPU_CYCLES_STALLED_VERTEX_COORD_USER / PTB_PRIM_CLIP / PTB_PRIM_VIEWPOINT_DISCARD (leaving the five slots boot 13 read OUTCOME H4 off untouched as an admissibility guard) and adds four READ-ONLY error registers (V3D_ERR_STAT/FDBGO/FDBGB/FDBGS, scoped to this silicon by mainline's own v3d_core_reg_defs), with §49.25.7's V1..V6 outcomes pre-written on leg H's own verdict line (⚠ implies UNAOS_V3D_HFIRST; short capture — do not diff against a deep boot)${COLOR_RESET}"
+    fi
+    # PI-V3D-104: UNAOS_V3D_SINGLESEG=1 adds the `v3d_singleseg` feature — v3d.md §49.25.9d's SINGLESEG
+    # rung, the one-variable successor to boot 14's OUTCOME V5. It IMPLIES UNAOS_V3D_VPMPROBE (and
+    # through it HFIRST, DISPATCHDISC, BINCONTENT, ARMEDCLOSE, TSAIM, BASEDAIM, UNARMCLOSE, V3D): the
+    # cargo feature declares `v3d_singleseg = ["v3d_vpmprobe"]` so the implication cannot be forgotten,
+    # and this block arms the whole chain itself. UNAOS_V3D_SINGLESEG=1 ALONE is sufficient.
+    # IT ADDS NO LEG, NO KICK, NO SHADER WORD, NO REGISTER READ OR WRITE AND NO PAGE-TABLE EDIT. The
+    # instrument bank is boot 14's to the slot, the ladder order is E -> H -> F -> G, CT0 is fed a BIN
+    # list on every leg, and the boot returns before probe_job. ONE BIT OF ONE DRAM BYTE MOVES: bit 225
+    # of the 36-byte GL Shader State Record `build_shader_record` publishes — "Coordinate Shader start
+    # in final thread section" — 0 -> 1.
+    # WHY, AND WHERE THE POLARITY CAME FROM. §49.25.9b found this bit SUSPECT with POLARITY UNKNOWN and
+    # deliberately packed NOTHING; §49.25.9d made pinning it from a fresh Mesa read the rung's task 0.
+    # That read is done (§49.25.10): v3d_packet.xml's "GL Shader State Record" (max_ver=42) gives each
+    # shader group exactly three flags — 4-way threadable / start in final thread section / Propagate
+    # NaNs — and has NO "2-way threadable" field at all; v3dx_draw.c packs bit 225 from
+    # prog_data->single_seg; vir.c sets `single_seg = !c->last_thrsw`; and nir_to_vir.c leaves
+    # c->last_thrsw NULL for a TMU-free, no-spill, threads=4 program (the artificial last-thrsw is
+    # injected for spilling and REMOVED again in v3d_nir_to_vir_finish), because the terminal thrsw such
+    # a program carries is qpu_schedule.c's program-end THRSW, which is not c->last_thrsw. CS_VS_WORDS
+    # is exactly that shape — SIG_THRSW on word [24] and nowhere else — so MESA PACKS 1 AND WE PACK 0.
+    # OUTCOME V5 (the coord thread STALLED against a VPM that never drained, no error latched, nothing
+    # reaching the PTB) is the shape a mis-declared thread section would produce, and V3D-32 already
+    # demonstrated on metal that this bit is dispatch-potent — it set bit 225 on the threads=2 TMU probe
+    # (a program Mesa would pack 0 for) and that coord shader stopped dispatching entirely.
+    # ONE VARIABLE: bits 97 (FS) and 161 (VS) stay 0 (the armed bin frames dispatch only the coordinate
+    # shader) and leg G's null-shader record is untouched. §49.25.9d's S0..S4 rows are pre-written and
+    # the leg-E guard outranks all of them. Two [v3d104] lines are added: the desk line (read FIRST) and
+    # a per-publish readback of the record word, so a capture proves the bit reached DRAM.
+    # ⚠ an armed boot deliberately produces a SHORT capture missing every banked witness: label it and
+    # NEVER diff it line-for-line against a full deep boot. QEMU raspi4b models no V3D at all, so
+    # [v3d95] prints its hub-absent SKIPPED line and returns before any leg is reached — kernel8-test
+    # green means no regression and nothing more; the verdict is attended metal.
+    if [ -n "${UNAOS_V3D_SINGLESEG:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_singleseg,v3d_vpmprobe,v3d_hfirst,v3d_dispatchdisc,v3d_bincontent,v3d_armedclose,v3d_tsaim,v3d_basedaim,v3d_unarmclose,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_SINGLESEG: the [v3d104] singleseg rung — NO new leg, NO new kick, NO new shader word, NO new register access; ONE BIT of ONE DRAM byte moves (shader-record bit 225, 'Coordinate Shader start in final thread section', 0 -> 1), which is what Mesa packs for our TMU-free threads=4 coord shader (v3d_packet.xml v42 field name + v3dx_draw.c <- single_seg <- vir.c !c->last_thrsw), against boot 14 as baseline and with §49.25.9d's S0..S4 rows pre-written (⚠ implies UNAOS_V3D_VPMPROBE; short capture — do not diff against a deep boot)${COLOR_RESET}"
     fi
     # VUG-PAR: UNAOS_VUGPAR=1 adds the `vugpar` feature — band-parallel Screen::flush that splits the
     # damaged row-copy blit into disjoint scanline bands dispatched to free secondary cores (sched::

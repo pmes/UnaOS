@@ -3968,7 +3968,20 @@ fn witness_shadrec_diff() {
     }
     // (name, bit start, width) per the v42 GL Shader State Record. Address fields are stored pre-shifted
     // (>>3 for the 29-bit code fields); the raw extracted value is printed as-is.
-    let fields: [(&str, usize, usize); 22] = [
+    //
+    // PI-V3D-104 LABEL CORRECTION (print-only; no packed byte moved, and both bits are written 0 either
+    // way). This table used to name bit 97 `fs_single_seg` and bit 161 `vs_2way_threadable` — the SAME
+    // slot of two per-shader flag groups under two different names, so one of them had to be wrong. It
+    // was the second: the authority is `src/broadcom/cle/v3d_packet.xml`, `<struct name="GL Shader State
+    // Record" max_ver="42">`, which gives each of the three groups exactly three flags — "<stage> 4-way
+    // threadable" (bit 96/160/224), "<stage> start in final thread section" (97/161/225) and "<stage>
+    // Propagate NaNs" (98/162/226). THERE IS NO "2-WAY THREADABLE" FIELD IN THE v42 RECORD AT ALL;
+    // 4-way-threadable = 0 IS the 2-way declaration (Mesa: `..._4_way_threadable = threads == 4`). The
+    // v42 name is used below, with Mesa's own name for the value it packs there (`single_seg`, i.e.
+    // `!c->last_thrsw`) recorded here rather than in the label. The three flags the table never named —
+    // 162, 225 and 226 — are added, so a record diff can no longer be silent about the very bit
+    // PI-V3D-104 flips.
+    let fields: [(&str, usize, usize); 25] = [
         ("point_size_in_shaded_vertex_data", 0, 1),
         ("enable_clipping", 1, 1),
         ("vertex_id_read_by_coord", 2, 1),
@@ -3980,15 +3993,18 @@ fn witness_shadrec_diff() {
         ("vs_input_vpm_segment_size", 56, 4),
         ("default_attr_values_addr", 64, 32),
         ("fs_4way_threadable", 96, 1),
-        ("fs_single_seg", 97, 1),
+        ("fs_start_in_final_thread_section", 97, 1),
         ("fs_propagate_nans", 98, 1),
         ("fs_code_addr>>3", 99, 29),
         ("fs_uniforms_addr", 128, 32),
         ("vs_4way_threadable", 160, 1),
-        ("vs_2way_threadable", 161, 1),
+        ("vs_start_in_final_thread_section", 161, 1),
+        ("vs_propagate_nans", 162, 1),
         ("vs_code_addr>>3", 163, 29),
         ("vs_uniforms_addr", 192, 32),
         ("cs_4way_threadable", 224, 1),
+        ("cs_start_in_final_thread_section", 225, 1),
+        ("cs_propagate_nans", 226, 1),
         ("cs_code_addr>>3", 227, 29),
         ("cs_uniforms_addr", 256, 32),
     ];
@@ -4067,6 +4083,22 @@ fn build_shader_record() -> u32 {
     sf(&mut rec, 163, 29, vs >> 3); // VS code address
     sf(&mut rec, 192, 32, vs_unif); // VS uniforms address (PI-V3D-9: VPM read-offset stream)
     sf(&mut rec, 224, 1, 1); // CS 4-way threadable
+    // PI-V3D-104 (`v3d_singleseg`, DEFAULT OFF) — bit 225, "Coordinate Shader start in final thread
+    // section" (v3d_packet.xml, struct "GL Shader State Record" max_ver=42; NOT a "2-way threadable"
+    // bit — no such field exists in the v42 record). Mesa sets it from `prog_data->single_seg`
+    // (v3dx_draw.c: `shader.coordinate_shader_start_in_final_thread_section =
+    // v3d->prog.cs->prog_data.vs->base.single_seg`), and `single_seg = !c->last_thrsw` (vir.c
+    // `v3d_set_prog_data`). For a no-TMU, no-spill, threads=4 coord shader — CS_VS_WORDS exactly, one
+    // SIG_THRSW on word [24] and nowhere else — `c->last_thrsw` is NULL by the time prog_data is
+    // filled: nir_to_vir.c reaches `vir_emit_thrsw` only for a TMU flush, an FS TLB read or a barrier,
+    // the artificial thrsw `vir_emit_last_thrsw` injects is REMOVED again by `v3d_nir_to_vir_finish`
+    // when the program neither spilled nor dropped to one thread, and the terminal thrsw our tail
+    // carries is `qpu_schedule.c`'s program-end THRSW, which is not `c->last_thrsw`. SO MESA PACKS 1
+    // HERE AND WE PACK 0 (v3d.md §49.25.10). The knob flips ONLY this bit, only on this record: bits
+    // 97 (FS) and 161 (VS) stay 0 because the armed ladder's bin frames dispatch only the coordinate
+    // shader, and `build_bisect_null_shader_record`'s leg-G record is untouched.
+    #[cfg(feature = "v3d_singleseg")]
+    sf(&mut rec, 225, 1, 1); // CS start in final thread section (Mesa single_seg = 1 for this program)
     sf(&mut rec, 226, 1, 1); // CS propagate NaNs (v42)
     sf(&mut rec, 227, 29, cs >> 3); // CS code address
     sf(&mut rec, 256, 32, cs_unif); // CS uniforms address (PI-V3D-9: VPM read-offset stream)
@@ -4611,9 +4643,14 @@ fn build_probe_shader_record() -> u32 {
     // M4's KNOWN-GOOD, provably-dispatching fragment/vertex programs + their uniform streams; only the CS
     // keeps the probe's TMU-store program. This removes the last record-content variable while keeping the
     // probe's purpose intact (the store fires at bin time from the CS). See the [v3d38] record diff.
-    // GL Shader State Record per-shader flag group (Mesa `v3dX(pack)`, v3d_packet_v42.xml / v3d_emit.c):
-    // bit0 = 4-way threadable = (prog_data.base.threads == 4), bit1 = 2-way threadable = (threads == 2),
-    // bit2 = propagate NaNs.
+    // GL Shader State Record per-shader flag group (`v3d_packet.xml`, struct "GL Shader State Record"
+    // max_ver=42): bit0 = "<stage> 4-way threadable" = (prog_data.base.threads == 4), bit1 = "<stage>
+    // start in final thread section" = `prog_data->single_seg` = `!c->last_thrsw` (vir.c), bit2 =
+    // "<stage> Propagate NaNs".
+    // PI-V3D-104 CORRECTION: bit1 was described here (and by V3D-32, in the paragraph below) as "2-way
+    // threadable = (threads == 2)". THERE IS NO SUCH FIELD in the v42 record — a 2-way shader is
+    // declared by clearing bit0, and nothing else. The V3D-32 → V3D-36 history below is unchanged in
+    // substance; only the name of the bit it flipped was wrong. See v3d.md §49.25.10.
     //
     // V3D-36 (THIS arc): the P34 capture proved the probe coord shader NEVER DISPATCHES — the
     // probe-scoped PCTR battery read valid_instr=0 / cycle_count=508 (SHADER NEVER RAN) while the SAME
@@ -6087,12 +6124,20 @@ fn probe_job() {
     let vs_code_pa = rec_w20 & 0xFFFF_FFF8;
     let cs_code_pa = rec_w28 & 0xFFFF_FFF8;
     let cs_4way = rec_w28 & 1; // bit 224 (V3D-36: expect 1 — mirror the dispatching M4 coord shader)
-    let cs_2way = (rec_w28 >> 1) & 1; // bit 225 (V3D-36: expect 0 — the 2-way flip killed dispatch)
+    // PI-V3D-104 LABEL CORRECTION (print-only). Bit 225 is "Coordinate Shader start in final thread
+    // section" (v3d_packet.xml, "GL Shader State Record" max_ver=42), NOT "2-way threadable" — the v42
+    // record has no such field, and 4-way-threadable=0 IS the 2-way declaration. What V3D-32 actually
+    // did was clear bit 224 (declaring the threads=2 probe 2-way, which was right) AND set bit 225,
+    // telling the hardware a program with a MID-SHADER thrsw starts in its final thread section — which
+    // is a lie for that program, and Mesa would pack 0 for it (`single_seg = !c->last_thrsw`, and a TMU
+    // shader has a real last_thrsw). Dispatch died. V3D-36 restored 224=1/225=0 and dispatch returned.
+    // The reading survives the rename intact; only the field's NAME was wrong.
+    let cs_final_sec = (rec_w28 >> 1) & 1; // bit 225 (V3D-36: expect 0 on THIS record)
     let cs_propnan = (rec_w28 >> 2) & 1; // bit 226
-    let vs_2way = (rec_w20 >> 1) & 1; // bit 161
+    let vs_final_sec = (rec_w20 >> 1) & 1; // bit 161 — VS start in final thread section
     serial_println!(
-        ":: V3D: [v3d30] shader-record decode — probe code PA={:#010x} | CS start={:#010x} (4way={} 2way={} propNaN={}) VS start={:#010x} (2way={}) FS start={:#010x} | CS unif={:#010x} — CS start {} probe code ::",
-        probe_code_pa, cs_code_pa, cs_4way, cs_2way, cs_propnan, vs_code_pa, vs_2way, fs_code_pa, rec_cs_unif,
+        ":: V3D: [v3d30] shader-record decode — probe code PA={:#010x} | CS start={:#010x} (4way={} start_in_final_thread_section={} propNaN={}) VS start={:#010x} (start_in_final_thread_section={}) FS start={:#010x} | CS unif={:#010x} — CS start {} probe code ::",
+        probe_code_pa, cs_code_pa, cs_4way, cs_final_sec, cs_propnan, vs_code_pa, vs_final_sec, fs_code_pa, rec_cs_unif,
         if cs_code_pa == probe_code_pa { "==" } else { "!= (MISMATCH — bin ran the WRONG program)" }
     );
     // Read the executed QPU words BACK from the arena at the recorded CS start address. If the record
@@ -16142,6 +16187,11 @@ fn v3d100_publish() -> ([V3d100Ref; V3D100_REFS], u32) {
     }
     fill_region(OFF_DEFAULT_ATTRS, 16, 0);
     let num_attrs = build_shader_record();
+    // PI-V3D-104 — read the published record's flag word straight back out of the arena, so the
+    // capture carries proof that the one bit this rung moves actually reached the bytes the CLE
+    // fetches. Emitted per content leg, immediately after the publish that wrote it.
+    #[cfg(feature = "v3d_singleseg")]
+    v3d104_emit_shadrec_readback();
 
     // Leg G's ONLY difference from leg H: the NULL coord shader (the exonerated 4-word Mesa thread-end
     // tail, `CS_VS_WORDS[23..27]` — vpmwt → nop;thrsw → nop → nop, which writes NOTHING to VPM) and a
@@ -16913,6 +16963,34 @@ fn v3d103_emit_err(label: &str, tag: &str, e: &V3d103Err) {
     }
 }
 
+/// PI-V3D-104 — the SINGLESEG rung's DESK line, emitted once at the arm and read FIRST, exactly as
+/// `[v3d103] VPMSTATIC` is: it reports work done at the desk, not a measurement. It names the single
+/// bit this boot moves, the authority that fixed the bit's polarity before any byte was packed, and
+/// everything that deliberately stays where PA51 left it.
+#[cfg(feature = "v3d_singleseg")]
+fn v3d104_emit_singleseg() {
+    serial_println!(
+        ":: V3D: [v3d104] SINGLESEG — ONE VARIABLE, RESOLVED AT THE DESK BEFORE IT WAS PACKED. This boot flips exactly ONE BIT of ONE DRAM BYTE against boot 14's image: bit 225 of the 36-byte GL Shader State Record at OFF_SHADREC — 'Coordinate Shader start in final thread section' — from 0 to 1. NO leg, NO kick, NO shader word, NO register read or write and NO page-table edit is added over UNAOS_V3D_VPMPROBE; the ladder is still E -> H -> F -> G, CT0 is fed a BIN list on every leg, and the boot still returns before probe_job. THE POLARITY IS MESA'S, NOT OURS, AND IT WAS PINNED FROM SOURCE: (1) v3d_packet.xml, struct 'GL Shader State Record' max_ver=42, gives each shader group three flags — 4-way threadable (224), start in final thread section (225), Propagate NaNs (226); there is NO '2-way threadable' field in the v42 record, and 4-way=0 IS the 2-way declaration. (2) v3dx_draw.c packs that bit as `shader.coordinate_shader_start_in_final_thread_section = v3d->prog.cs->prog_data.vs->base.single_seg` (v3dvx_pipeline.c identically, for Vulkan). (3) vir.c v3d_set_prog_data: `prog_data->single_seg = !c->last_thrsw`. (4) nir_to_vir.c reaches vir_emit_thrsw ONLY for a TMU flush, a fragment-shader TLB read or a barrier — our coord shader has none of the three — so c->last_thrsw is NULL through translation; vir_emit_last_thrsw injects one artificially so that spilling lands ahead of it, and v3d_nir_to_vir_finish REMOVES it again for a program that neither spilled nor fell to one thread, restoring c->last_thrsw = NULL. The terminal thrsw our tail carries is qpu_schedule.c's program-end THRSW, emitted after all of that and never c->last_thrsw. CS_VS_WORDS carries SIG_THRSW on word [24] AND NOWHERE ELSE, is TMU-free and is declared threads=4 — so MESA WOULD PACK 1 HERE AND WE HAVE ALWAYS PACKED 0. WHY IT IS WORTH A BOOT: OUTCOME V5 says the coord thread spent its life STALLED against a VPM that never drained, with no error latched and nothing reaching the PTB, and a thread the hardware believes is in its FIRST thread section is a thread whose final-section resources were never handed over. WHAT DOES NOT MOVE: bits 97 (FS) and 161 (VS) stay 0 — the armed bin frames dispatch only the coordinate shader — and leg G's null-shader record is untouched, so leg G is byte-identical to boot 14's. The baseline this boot is read against is BOOT 14 ITSELF; v3d.md §49.25.9d's rows S0..S4 are pre-written, and the guard that leg E must still return OUTCOME E1 OUTRANKS every one of them: a leg-E divergence convicts the ARM (a build that leaked wider than one bit), not the field ::"
+    );
+}
+
+/// PI-V3D-104 — the readback that keeps the desk line honest: the record word the CLE will fetch,
+/// read back OUT OF THE ARENA after `build_shader_record` published it. A knob-gated line that cannot
+/// prove its own bit landed is decoration; this one prints the word and decodes the three flags, so a
+/// capture in which bit 225 reads 0 kills every S row before it is read.
+#[cfg(feature = "v3d_singleseg")]
+fn v3d104_emit_shadrec_readback() {
+    let w28 = arena_u32(OFF_SHADREC + 28);
+    serial_println!(
+        ":: V3D: [v3d104] SHADREC READBACK — GL Shader State Record word@byte28 (bits 224..255) = {:#010x} | cs_4way_threadable(bit224)={} cs_start_in_final_thread_section(bit225)={} cs_propagate_nans(bit226)={} | CS code address (bits 227..255, resolved) = {:#010x} — ARMED EXPECTS bit225=1; if it reads 0 the knob never reached the published record and NO S row may be read off this boot ::",
+        w28,
+        w28 & 1,
+        (w28 >> 1) & 1,
+        (w28 >> 2) & 1,
+        w28 & 0xFFFF_FFF8
+    );
+}
+
 /// PI-V3D-103 — `V3D_CTL_IDENT1` decoded. IDENT1 is already read by this file's revision gate, so this
 /// is a decode of a word we hold, not a new register read. Printed ONCE, at the arm.
 #[cfg(feature = "v3d_vpmprobe")]
@@ -17634,6 +17712,11 @@ fn v3d97_basedaim_legs() {
         // ERROR/DEBUG block taken BEFORE leg E's kick so every leg's line can print NEWLY-latched bits.
         // The pristine read is four MMIO reads and no write, and it sits after the bank's arm so it
         // cannot perturb the arm's own read-back audit.
+        // ── PI-V3D-104 — the SINGLESEG desk line, FIRST of all when the rung is armed: like VPMSTATIC
+        // it reports desk work rather than a measurement, and it says which single record bit this
+        // boot moves and where its polarity came from before any S row is read.
+        #[cfg(feature = "v3d_singleseg")]
+        v3d104_emit_singleseg();
         #[cfg(feature = "v3d_vpmprobe")]
         {
             v3d103_emit_static();
