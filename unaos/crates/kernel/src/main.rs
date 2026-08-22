@@ -2576,7 +2576,16 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
             sctlr,
         );
     }
-    unaos_kernel::arch::percpu::init(0);
+    // EL0-EL1CORE — STAMP THE EL1 CORE, and do it here rather than one statement earlier or later.
+    // `percpu::init` on the line above is the first instant at which BOTH facts the stamp records are
+    // true: this core is at EL1 (the `drop_to_el1` two statements up returns only through its `eret`,
+    // so reaching this line IS the drop having completed) and TPIDR_EL1 now resolves to this core's
+    // block, so `cpu_index` is the index the SCHEDULER will dispatch under rather than a constant
+    // asserted about it. `mark_el1_core` re-measures `CurrentEL` itself and stamps nothing if it is not
+    // EL1, so the placement filter fails CLOSED — refusing every EL0 spawn — if this ever moves above
+    // the drop. It must stay ABOVE `tegra_el0_start_maybe()` on the next line: that spawns the pinned
+    // `el0-hello` task, and an unstamped mask would refuse it (see sched.rs `EL1_CORE_MASK`).
+    unaos_kernel::arch::percpu::init(0); unaos_kernel::arch::sched::mark_el1_core();
     unaos_kernel::arch::exceptions::install();
     unaos_kernel::arch::timer::el1_oneshot_proof(); tegra_el0_start_maybe(); tegra_rast_demo_maybe(); unaos_kernel::arch::sched::run_capstone_boot_core(0); // IRQEL-RT EL1 one-shot proof (first: one interrupt taken AT EL1 through the runtime-banked __vec_irq, then self-disarms — see timer.rs tail) + RAST-TEGRA demo (no-op unless UNAOS_RAST=1), all on the same line as the terminus so the wire-ins add ZERO source lines before any panic Location — the tegra knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helpers defined at file tail / timer.rs tail.
 }
