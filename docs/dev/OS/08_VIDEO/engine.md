@@ -13334,10 +13334,19 @@ followed by the very next `[comp2]` falling to `pass_us=2033 wcd_us=0`: the batt
 ends it.
 
 **No delta in the boot-11 image caused this.** KBDFLAP, KBDWIT-LATCH, PTRDEAD, RX-FINALPAGE and
-DMGOVLP-BITE are all innocent of it — PTRDEAD included, and it was checked first because it touched
-the pointer event path: the taker is on `bootpace::service_dump`'s lane, reads no pointer state, and
-its 4 Hz cadence is `PAYGO_SVC_PERIOD_US`, not an input rate. The mechanism predates all five and is
-on the wire, unchanged, in both comparison boots.
+DMGOVLP-BITE are all innocent of it. PTRDEAD was checked first, and honestly, because it touched the
+pointer event path and because the taker *does* read pointer state — `paygo_service_pass` returns
+early on `drag_active() != WIN_NONE`, so anything that changed drag liveness could in principle have
+changed how often the taker runs. Three facts close it:
+
+* the taker's rate is **identical in all three boots** — 16–21 marks per 5 s, i.e.
+  `PAYGO_SVC_PERIOD_US` — so nothing moved the gate;
+* `drag_active()` is a *suppressor*: a delta that made drags less live could only let the taker run
+  more, and it is already running at its floor in boots 9 and 10;
+* the commit that carried PTRDEAD's four sources (`2f78e68a`, PTRWIT/PTBURST/EHCIDARK/PTRCH) touches
+  no `video/` file at all.
+
+The mechanism predates all five deltas and is on the wire, unchanged, in both comparison boots.
 
 What boot 11 *did* change is the **price** of each take: boot 10's late layout had the shell at
 (1302,777), so the drag billed `dkpx=1558` for 19 events (~82 kpx each); boot 11's storm-era layout
