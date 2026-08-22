@@ -6123,6 +6123,178 @@ metal boot-stick default only after a clean multi-boot metal record. The staged 
 declare it the stick default. (The xHCI-takeover wall of §JETSON-XCARVE is image-layout-sensitive; a
 new default layout may sample it — that is expected wall data, not an arc failure. QEMU cannot fire it.)
 
+### ORIN-SMP-3-PARK — the intermittent bring-up park: the ESR decode + the SMPMARK discriminator (`UNAOS_SMPMARK`, instrument-only)
+
+§ORIN-SMP-DEFAULT promoted the 6-core kick-off to the tegra default with one failure still open: on a
+minority of SMP-armed boots the board dies during secondary bring-up, before the run reaches the JM6
+drop. This section records what the park's own syndrome says, and the instrument that names which side
+of the PSCI wake it happens on.
+
+**The rate, corrected.** Measured **2 parks / 3 clean** at the kick-off across the boot5b–5c window
+(2026-08-21/22), and **~30% across the whole record**: 2 parks / 2 boots on 2026-07-15 (the §ORIN-SMP-3
+STOP record), 1 park / 2 clean on the 2026-07-17 R21b sitting, 0 parks / 6 clean in the 2026-07-16
+SMP-8 sitting. A session note put this at "3 of the last 4"; that is too high and is retired here. The
+figure is load-bearing rather than cosmetic — it sets how many flights a one-shot discriminator needs
+before it is worth arming, and at ~30% a single armed boot has a ~70% chance of returning a *clean*
+trace that convicts nothing.
+
+**The unread evidence: the ESR, decoded.** Every park prints the same ATF line, and it has been carried
+verbatim in captures since 2026-07-15 without once being decoded:
+
+```
+ERROR:   Exception reason=1 syndrome=0x82000010
+```
+
+`syndrome=0x82000010` = **EC=0x20** (INSTRUCTION abort from a *lower* EL), **IL=1**, **IFSC=0x10**
+("synchronous external abort, not on a translation-table walk"). The fault is an instruction **FETCH**
+external abort — not a data abort, not a translation fault. That decode is what makes the hypothesis
+below testable at all, because it excludes every data-side theory the arc had been carrying.
+
+**H1 — the MMU-off Device-nGnRnE fetch window.** A PSCI-woken AP resets with `SCTLR_EL2.M = 0` and
+`SCTLR_EL2.I = 0`. Per ARM ARM D5.2.9, with stage-1 translation disabled data accesses are
+Device-nGnRnE, and instruction accesses are Device-nGnRnE while `SCTLR_ELx.I == 0`. So the AP's ~40
+instructions between its PSCI reset and the `msr SCTLR_EL2` inside `enable_mmu_virt` are Device-nGnRnE
+instruction fetches — one fabric transaction each, spread over two pages ~28 KiB apart — plus ~10
+Device loads and 1 Device store: **≈51 I/O-routed transactions per woken core**. That is the only
+Device-typed instruction fetch anywhere in the boot, and the only construct in the boot that matches
+EC=0x20.
+
+**What the layout axis already excluded.** boot5c flights #1 (park) and #2 (clean) shared
+`VBAR_EL2 = 0x25b115800` and `TTBR0 = 0x25b26a000` — same binary, same physical load base, minutes
+apart, opposite outcomes. An image-layout theory cannot explain that pair; a timing/attribute theory
+must. (This is the same discipline §ORIN-SMP-8 applied to the layout axis, and it closes it here.)
+
+**Why marks and not more logging.** The existing per-core `CPU_ON … -> SUCCESS` line is ~95 chars ≈
+8.2 ms of UART at 115200 8N1. Under H1 the AP powers up and faults well *inside* that window, so a
+capture that ends mid-line cannot distinguish "the SMC never returned" from "the SMC returned and the
+AP killed the box while the BSP was still printing". Three short tags, emitted with `serial_print!`
+(no newline, minimal format work, minimal lock hold), collapse that ambiguity:
+
+| mark | emitted where | what its presence proves |
+|---|---|---|
+| `:P:` | `start_secondaries_tegra`, immediately after the publication block (ctx capture + `SEC_CTX` clean + stack `DC CIVAC` sweep) | the BSP survived publication and is about to issue `CPU_ON` |
+| `:R<idx>:` | same function, immediately after `psci_cpu_on` returns for linear index `<idx>` | the `CPU_ON` SMC **returned** to the BSP |
+| `:A:` | `__secondary_rust_virt`, immediately after `enable_mmu_virt` | that AP crossed MMU-off → MMU-on, i.e. survived the Device window |
+
+**Reading a parked capture — what each possible tail proves:**
+
+| capture tail | verdict |
+|---|---|
+| `ORIN-SMP-3 enumerated core 5 …` then RAS | the BSP publication block itself died; no `CPU_ON` was ever issued. Suspect the `DC CIVAC` sweep over `SECONDARY_STACKS` or `capture_secondary_ctx`. **REFUTES H1.** |
+| `:P:` then RAS | publication survived; the very first `CPU_ON` SMC did not return. The fault is inside PSCI/ATF or the SMC path, **on the BSP** — not our AP entry code. **REFUTES H1.** |
+| `:P::R1:` then RAS, with **no** `:A:` | the SMC returned cleanly *and* the AP never reached the far side of `enable_mmu_virt`. The AP died in its MMU-off window. **CONVICTS H1**, and localises the fault to the entry stub + `enable_mmu_virt` — ~40 instructions of known text. |
+| `:P::R1::A:` then RAS | the AP got the MMU on and died *after*. **H1 REFUTED** as the cause; look downstream at `exceptions::install`, `percpu::init`, `gic::init_secondary_v3` (the first non-BSP redistributor touch), or the AP's first cacheable access. |
+
+A clean flight reads `:P::R1::A::R2::A:…`. **Caveat, load-bearing:** the interleaving order of `:R<n>:`
+against an earlier core's `:A:` is a two-cores-one-UART race by construction and carries **no meaning**.
+Only the **presence** of a tag and the **last tag before the park** are evidence — never the order.
+
+**The honest limit of `:A:`.** It runs *before* `exceptions::install()`, so the AP's `VBAR_EL2` is still
+the firmware's. An abort taken between the PSCI reset and that point — including one taken by
+`serial_print!` itself — is reported by ATF/UEFI, not by us. That is exactly the park's own signature,
+and it is why the mark is a presence/absence oracle rather than a handler. It sits at the first
+instruction where a spinlock is legal at all (`ldxr`/`stxr` with the MMU off is CONSTRAINED
+UNPREDICTABLE), i.e. the earliest point an AP can say anything.
+
+**Gating and byte-identity.** Every mark is `#[cfg(feature = "smpmark")]`, armed by `UNAOS_SMPMARK=1`;
+default OFF the marks vanish and the tegra image is byte-identical to baseline. All three are *appended
+to a pre-existing source line* rather than given lines of their own — written the natural way the
+disarmed image differed in 8 bytes, every one a panic `Location` line-number constant belonging to code
+further down `smp_virt.rs` (the same Location-shift defect the `serial.rs` DARKWIN-GUARD tail mod and
+the `sched.rs` VUGFIX one-liner are shaped to avoid). If you edit a mark, keep it on its host line. The
+armed configuration is type-checked by the `arm-tegra-smpmark` leg of `KERNEL_CFG_MATRIX` (16 legs).
+
+**Spec wiring.** `unaos/scripts/specs/jetson-sync1.spec` carries the three marks as `OPTIONAL` — a
+`REQUIRE` would red every *unarmed* boot, failing on configuration rather than on health — plus a
+`FORBID` on the `Exception reason=1 syndrome=0x82000010` signature so a parked flight is named rather
+than inferred from a pile of missing `REQUIRE`s. `:P:` is anchored `^:P:` there because a bare `:P:`
+takes a false hit on a pre-existing `KERNEL HEAP ALLOCATED :P: released cores …` line.
+
+### ORIN-RAS-ADDR — reading a Tegra RAS `ADDR` field: it is sometimes a location and sometimes a sink
+
+A rule this file has so far only half-recorded, written down because reading it wrong cost this lane a
+wrong claim to a peer seat.
+
+**The field has two meanings and the format does not tell you which.** Both readings are already
+documented here, separately:
+
+* **As a SINK.** §ORIN-NET-4 / NET-4m records `ADDR 0x8000000000000200` as the CBB/IOB fabric sink for a
+  transaction that matched **no region** — the real address is *stripped* and what remains (`0x200`) is
+  the slave-error terminal, not a place in DRAM. The same value appears in the ORIN-SMP-3 park, in the
+  SMP-4 legs, and in SMP-7.
+* **As a LOCATION.** `mmu_tegra.rs:136` (§XCARVE-10) records boot-34-retry hitting SNOC Carveout
+  Uncorrectable + ACI FillWrite at `ADDR 0x800000026c6be4a0` → PA `0x26c6be4a0` — a **real** address,
+  and the whole XCARVE-9→10→11 widening chain was driven by taking it as one.
+
+**The reading rule.** Strip bit 63 (set in both cases — it is a fabric tag, not part of the address) and
+look at what remains. A residue that lands inside a known DRAM span is a **location** and may be acted
+on; a small constant residue (`0x200`, `0x0`, `0xb5c`) is a **sink** and names only *that the transaction
+matched nothing* — it is evidence about routing, never about a place. The trap is that a low round
+residue is exactly where the two readings are indistinguishable by inspection: `0x…0200` is both a
+plausible stripped sink and a syntactically valid low address, and nothing in the record disambiguates
+it. **When the residue is small and round, the ADDR is not a lead** — resolve it from the accompanying
+`IERR`/`SERR` pair and the boot's own position instead, and say which reading you took.
+
+**Corollary, learned the hard way: never key a witness or a spec rule on an ADDR value.** Two different
+faults on this board share `0x8000000000000200`, and two different faults share the *shape*
+`0x8000000000000000`. The ORIN-SMP-3 park is `Status = 0xe4000612` / `SERR` slave-error `0x12` / `IERR`
+CBB Interface Error `0x6`, and carries an `Exception reason=1 syndrome=0x82000010` line; the `bg`-verb
+fault is `Status = 0xec000612` / `IERR` SNOC Write Error `0xd` / `ADDR 0x8000000000000000` and carries
+**no** `Exception reason=` line at all. Key on the syndrome and the `IERR`/`SERR` pair, and **write the
+boot id beside every quoted RAS line** — a quoted syndrome with no boot id is what produced the
+cross-seat disagreement this rule exists to prevent.
+
+### IRQEL-RT2 — the EL1 one-shot proof is CORE-scoped: an AP answered, the routing was never wrong
+
+**The report.** Metal boot 5c printed, honestly,
+`:: IRQEL-RT: one-shot proof IRQ taken at EL2 — NOT the EL1 proof (investigate) ::`
+(`capture/line-acm0/orin.log:8311`). Every routing mechanism was then audited and found **correct**:
+`HCR_EL2` cleared at the JM6 drop (IMO/FMO/AMO/TGE all 0), `CNTHCTL_EL2` EL1PCTEN/EL1PCEN set, `CNTP_*`
+rather than `CNTHP_*`/`CNTV_*`, GIC PPI 30 banked per core, DAIF masked across the drop,
+`SPSR_EL2`/`ELR_EL2` landing witnessed at EL1.
+
+**The defect was SCOPE, not routing.** `EL1_PROOF_ARMED` was a machine-global `AtomicBool` on a machine
+that had stopped being single-core. §ORIN-SMP-3 runs **before** the JM6 drop and brings five secondaries
+online that (a) stay at EL2 — `smp_virt::secondary_entry` calls `exceptions::install()` there, which
+sets `HCR_EL2.IMO|FMO|AMO` so their physical IRQs target EL2 — and (b) each arm their own 250 Hz PPI 30
+via `arm_this_core_ap`. That is ~1250 timer IRQs/s entering the same dispatch from cores that never
+dropped. The boot core set the flag; the first AP tick consumed it, read `CurrentEL` **on that AP**, and
+printed EL2. The boot core's one-shot is a full 4 ms out while each AP's next tick is uniform in
+[0, 4 ms), so an AP wins with probability ~1 — **deterministic, not flaky**. The instrument was right;
+its window's scope was wrong.
+
+**The fix.** `EL1_PROOF_CORE: AtomicU32` (`u32::MAX` = disarmed) holds the *arming core's* `cpu_index`;
+the intercept returns early for any other core, so every other core's tick falls through to `on_tick`
+unchanged. The `CurrentEL` test is byte-for-byte unchanged and the guard is strictly upstream of the
+verdict, so **the proof can still fail**: if the arming core's own IRQ lands at EL2 the failure verdict
+still prints. The change converts a spurious FAIL into either a real FAIL or an INCONCLUSIVE — never
+into a PASS.
+
+**Collateral fixed with it.** The old intercept's `msr CNTP_CTL_EL0, xzr` ran on whichever core answered
+— i.e. on an **AP** — permanently killing that secondary's only wake source while `AP_LOCAL_TICK` still
+told `hlt` it had one: a wake-less WFI park on one of five cores, every boot.
+
+**Why the drop stub now latches four EL2 registers.** The adjudicating `[irqel2a]` snapshot must print
+`HCR_EL2` / `CNTHCTL_EL2` / `ICC_SRE_EL1` / `ICC_SRE_EL2` — `HCR_EL2.IMO` being *the* bit that decides
+whether an IRQ taken at EL1 targets EL1 — but an `mrs` of an EL2 register from EL1 is **UNDEFINED** and
+would fault into the very vectors under test. So `boot_tegra::jm6_el2_latch` captures them into RAM at
+the last instant they are readable, inside the JM6 drop asm, and the snapshot reads them back from
+there. `[irqel2b]` (the GIC view) is printed *second* on purpose: it is the only part performing an
+`ICC_*_EL1` access at EL1, which is UNDEFINED unless `ICC_SRE_EL1.SRE == 1` — a bit `[irqel2a]` has
+already put on the wire, and when the latch says `SRE == 0` the snapshot is **skipped and says so**
+rather than taken.
+
+**Status: the EL1 arm remains unproven on metal.** No capture in the record carries `first IRQ taken at
+EL1`, and none carries `proof INCONCLUSIVE` or `[irqel2a]` either — the FAIL branch is the only one
+metal has ever printed, and IRQEL-RT2 is the reason to expect that to change. The spec models the
+outcome as a genuine three-way rather than a required PASS: the PASS line is `PENDING`, and the FAIL and
+MISS lines are `OPTIONAL` — never `FORBID`, because an honest negative result must not red a flight, and
+never `PENDING`, because a matched `PENDING` advises "consider promoting to REQUIRE", which is exactly
+wrong for a fault path. The proof's ability to fail without being suppressed is its most valuable
+property. Only the *arm* line is `REQUIRE`, and only because it is unconditional on a tegra image and
+sits on the same `main.rs` statement strictly ahead of `run_capstone_boot_core(0)`, whose
+`CAPSTONE COMPLETE` is already required.
+
 ### ORIN-SDMMC — Tegra234 microSD-slot SDMMC controller READ-ONLY recon (`UNAOS_SDMMC`, knob-gated; the installer line's first rung)
 
 **Context — the installer line.** The Orin devkit is the "mule" for a UnaOS-native installer: it has the
