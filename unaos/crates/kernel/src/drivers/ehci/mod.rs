@@ -1107,6 +1107,56 @@ const BT_HCI_DISCONNECT: u16 = 0x0406;
 /// will surface to its own user as a clean teardown rather than a supervision-timeout loss.
 #[cfg(feature = "bt")]
 const BT_HCI_REASON_REMOTE_USER_TERM: u8 = 0x13;
+/// BT-L3/RELEASE-2 — the SECOND reason, and it exists to isolate one byte.
+///
+/// `HCI_Disconnect` carries exactly two parameters: the handle and the reason. Boot 11 was
+/// answered Command Status **0x12 (Invalid HCI Command Parameters)** on
+/// `handle=0x0040 reason=0x13`, which says one of those two bytes was judged illegal and does not
+/// say which. `HCI_Read_RSSI` settles the handle (see `BT_HCI_READ_RSSI`); this settles the
+/// reason. 0x05 = Authentication Failure is on the SAME short list the Core spec allows a host to
+/// send (0x05, 0x13-0x15, 0x1A, 0x29, 0x3B), so a controller that accepts 0x05 where it refused
+/// 0x13 has told us, in one round trip, that its parameter check disagrees with the spec about the
+/// reason byte — and, more to the point, the link is down either way. It is retried ONLY after the
+/// probe has said the handle is live, so it is never a shot in the dark at a handle that no longer
+/// exists.
+#[cfg(feature = "bt")]
+const BT_HCI_REASON_AUTH_FAILURE: u8 = 0x05;
+/// BT-L3/RELEASE-2 — `HCI_Read_RSSI`: OGF 0x05 (Status) / OCF 0x0005 => opcode 0x1405. Two
+/// parameter bytes, Connection_Handle(2, LE); returns a **Command Complete** whose return
+/// parameters are Status(1) Connection_Handle(2) RSSI(1).
+///
+/// THE HANDLE PROBE, and it is chosen precisely because it TRANSMITS NOTHING. Vol 4 Part E §7.5.4
+/// makes it a read of the controller's own record of the last packet received on that handle: no
+/// LMP, no LL, no air time, no state change on either side. It is therefore admissible under this
+/// arc's standing rule that no radio operation may happen that was not asked for, and it answers
+/// the one question a refused disconnect leaves open — does the controller still HAVE this handle?
+/// A controller that does not answers `0x02` (Unknown Connection Identifier), which is the same
+/// answer for a handle that never existed and for one whose link has already gone; either way
+/// nothing is held and the arc is not leaking a link. `0x00` proves the opposite: the link is
+/// live, the handle is valid, and the refusal was about the OTHER parameter.
+///
+/// Boot 11's `HCI_Read_Local_Supported_Commands` reply carries `cmds[15]=0xfe`, and Read_RSSI is
+/// octet 15 bit 3, so this controller advertises it. The code does NOT rely on that: an
+/// `0x01` (Unknown HCI Command) status is handled as "the probe is unavailable here" and the
+/// reason retry runs anyway.
+#[cfg(feature = "bt")]
+const BT_HCI_READ_RSSI: u16 = 0x1405;
+/// BT-L3/RELEASE-2 — the two controller error codes this teardown reasons about by name.
+/// `0x02` Unknown Connection Identifier, `0x12` Invalid HCI Command Parameters.
+#[cfg(feature = "bt")]
+const BT_ERR_UNKNOWN_CONN_ID: u8 = 0x02;
+#[cfg(feature = "bt")]
+const BT_ERR_INVALID_PARAMS: u8 = 0x12;
+/// BT-L3/RELEASE-2 — how many walked-past event codes the teardown records, to print on a refusal.
+///
+/// Boot 11's tally said `events_read=5`: one Command Status for the create, one LE Connection
+/// Complete, and THREE during the teardown — of which only the last, the refusal itself, was ever
+/// named. The other two were walked past by `bt_l3_await` and left no trace, and one of them may
+/// well have been the `Disconnection Complete` that explains the whole refusal. Eight codes is
+/// more than the teardown can legitimately produce and costs eight bytes of state; the counter
+/// saturates past it so a chatty controller cannot make the line unbounded.
+#[cfg(feature = "bt")]
+const BT_L3_TRAIL_MAX: usize = 8;
 /// BT-L3 — HCI event codes: Command Status, and Disconnection Complete.
 #[cfg(feature = "bt")]
 const BT_EVT_CMD_STATUS: u8 = 0x0F;
@@ -2672,6 +2722,29 @@ enum BtL3Await {
     Stop,
 }
 
+/// BT-L3/RELEASE-2 — outcome of ONE `HCI_Disconnect` attempt.
+///
+/// It exists so that the second lever can be a DECISION taken on the first attempt's answer
+/// rather than a second copy of the send-and-wait. `bt_l3_disconnect`'s old body collapsed all
+/// five of these into one `bool`, which is why boot 11's capture could say "REFUSED" and then had
+/// nowhere to go: a refusal, a silent controller and a halted endpoint are three different facts
+/// and only one of them is worth another command.
+#[cfg(feature = "bt")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BtL3DiscOut {
+    /// A `Disconnection Complete` with status 0x00 and THIS handle was read. The link is down.
+    Confirmed,
+    /// The Command Status carried a nonzero status: the controller would not take the command.
+    Refused(u8),
+    /// The command went out and was not refused, but no matching `Disconnection Complete` was
+    /// read — an accepted-then-silent controller, a short event, or a handle mismatch.
+    Unconfirmed,
+    /// The EP0 control-OUT failed. Nothing reached the radio.
+    NotSent,
+    /// The event endpoint is no longer readable. The command may have landed; nothing can say.
+    Unreadable,
+}
+
 /// BT-L3 — the facts a wait learns that its CALLER did not ask for, carried across every wait of
 /// one L3 run. Three separate defects live here, and they are one structure because they are one
 /// problem: `bt_l3_await` walks past every event that is not the `want`, and some of those events
@@ -2702,6 +2775,35 @@ enum BtL3Await {
 ///   a fresh `QTD_ACTIVE` overlay — which clears the QH's Halted bit while the DEVICE's STALL
 ///   condition is untouched. The teardown COMMANDS still go out (they ride EP0, which `Stop` says
 ///   nothing about); only the reads are refused, and the witnesses say so.
+/// BT-L3/RELEASE-2 — what the teardown ended up being able to say about the link.
+///
+/// `bt_l3_disconnect` keeps its `bool` return, which has always meant exactly one thing and still
+/// does: a `Disconnection Complete` with status 0x00 for THIS handle was observed. That bool is
+/// what feeds `disconnections_confirmed=`, and widening it would have made the counter mean two
+/// different things. The verdict below is the extra fact the second lever learns, carried on
+/// `BtL3State` because that structure is already threaded through every wait and every caller.
+///
+/// `HandleGone` is the one that changes an outcome: the controller answered the handle probe with
+/// Unknown Connection Identifier, so there is NO LINK to leak. That is not a confirmed release —
+/// nobody watched it end — but it is a proof that the must-not-appear condition does not hold, and
+/// the tally has to be able to say so instead of reporting a live connection that does not exist.
+#[cfg(feature = "bt")]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum BtL3Release {
+    /// No second lever ran (the disconnect was accepted, or was never sent).
+    #[default]
+    NotProbed,
+    /// A `Disconnection Complete` status 0x00 for this handle was observed — by this teardown's
+    /// own wait, or by an earlier wait that walked past it and latched it.
+    Confirmed,
+    /// The controller does not know this handle: the link is already gone. Nothing is held.
+    HandleGone,
+    /// The probe says the link IS live and this arc could not release it. The real leak.
+    StillLive,
+    /// The probe could not be run or could not be read. Neither reading is supported.
+    Inconclusive,
+}
+
 #[cfg(feature = "bt")]
 #[derive(Clone, Copy, Default)]
 struct BtL3State {
@@ -2709,6 +2811,31 @@ struct BtL3State {
     resolved_nonzero: bool,
     blind: bool,
     stopped: bool,
+    /// BT-L3/RELEASE-2 — a `Disconnection Complete` (0x05) with status 0x00 that a wait WALKED
+    /// PAST, as `(handle, reason)`. The exact sibling of `live_handle`, for the other end of the
+    /// link's life, and it closes the same class of hole.
+    ///
+    /// Every wait in L3 discards what it did not ask for. A link that the PEER terminates — or one
+    /// the controller drops on its supervision timeout — announces itself with this event, and it
+    /// arrives whenever the peer decides, not when a wait happens to be asking for it. Boot 11 sat
+    /// for 600 ms inside BT-L4 with the event endpoint unread while an ACL response never came;
+    /// anything the controller emitted in that window was queued, and the next wait (the
+    /// teardown's Command Status) walked past two events to reach its answer without naming
+    /// either. If one of them was this event, then the `HCI_Disconnect` that followed was aimed at
+    /// a handle the controller had already retired — and the arc reported a live connection it did
+    /// not hold. Latched here, the same event becomes the confirmation the tally was missing.
+    ///
+    /// Only status 0x00 is latched: a nonzero Disconnection Complete means the teardown FAILED and
+    /// the link is still up, which is the opposite of what this field is read as.
+    disc_seen: Option<(u16, u8)>,
+    /// BT-L3/RELEASE-2 — the event codes this teardown walked past, oldest first, and how many
+    /// there were in total. Reset at the top of `bt_l3_disconnect` so the trail describes the
+    /// TEARDOWN and not the whole run (the inquiry window alone can walk past 128 events).
+    /// See `BT_L3_TRAIL_MAX` for why it exists at all.
+    trail: [u8; BT_L3_TRAIL_MAX],
+    trail_n: u32,
+    /// BT-L3/RELEASE-2 — the second lever's verdict. See `BtL3Release`.
+    release: BtL3Release,
     /// BT-C1 — the CLASSIC analogue of `live_handle`, and it exists for exactly the reason that one
     /// does. A `Connection Complete` (event 0x03) with status 0x00 carries the only handle by which
     /// a BR/EDR link can ever be released, and the cancel race has the same likelier-than-obvious
@@ -5330,10 +5457,19 @@ impl Controller {
             serial_println!(
                 ":: bt-retry: [{}] src={} STALE LINK handle={:#06x} — best-effort teardown before re-paging -> {}; the latch is CLEARED either way, so this is a reboot-FREE escape and the chain re-pages below == witness ::",
                 self.idx, source, h,
+                // RELEASE-2 — "likely dead" was a guess, and the handle probe now settles it for
+                // one round trip and no air time. `HandleGone` is the controller saying it has no
+                // such handle; `StillLive` is the case that used to be reported the same way and
+                // is the one that actually matters, because re-paging a peer this host is still
+                // linked to is a different and worse situation.
                 if ok {
                     "disconnect CONFIRMED (the link was still live and is now released — no double-connect)"
                 } else {
-                    "NOT confirmed (the handle is likely dead — the speaker was powered off ungracefully; re-paging is exactly right)"
+                    match st.release {
+                        BtL3Release::HandleGone => "NOT NEEDED — the handle probe (HCI_Read_RSSI, which transmits nothing) answered Unknown Connection Identifier, so the controller retired this handle already; the speaker was powered off or walked away, and re-paging is exactly right",
+                        BtL3Release::StillLive => "NOT confirmed AND THE PROBE SAYS THE LINK IS STILL LIVE — the latch is cleared and the chain re-pages anyway, which is the escape hatch working as designed, but this host may now hold a link to the peer it is about to page",
+                        _ => "NOT confirmed and NOT settled (the probe could not run or could not be read); re-paging is still the right move, but the handle's fate is unknown",
+                    }
                 }
             );
             self.bt_quiesce_events(&e);
@@ -6042,6 +6178,31 @@ impl Controller {
                     st.blind = true;
                 }
             }
+            // ---- RELEASE-2: THE TRAIL, AND THE OTHER END OF THE LINK'S LIFE -------------------
+            // Bounded record of what this wait stepped over, so a refusal can print the company
+            // its answer arrived in. `trail_n` saturates; only the first `BT_L3_TRAIL_MAX` codes
+            // are kept, and the count says how many there really were.
+            if (st.trail_n as usize) < BT_L3_TRAIL_MAX {
+                st.trail[st.trail_n as usize] = pkt[0];
+            }
+            st.trail_n = st.trail_n.saturating_add(1);
+            // `Disconnection Complete` (0x05): EventCode(1) Param_Total_Length(1)=4 Status(1)
+            // Connection_Handle(2, LE) Reason(1) => 6 bytes on the wire. Latched for the same
+            // reason `live_handle` is: a wait that did not ask for it would otherwise throw away
+            // the only evidence that the link ALREADY ENDED, and the teardown below would then
+            // report a live connection the controller has no record of. See `disc_seen`.
+            if pkt[0] == BT_EVT_DISCONN_COMPLETE {
+                if len >= 6 {
+                    if pkt[2] == 0x00 && st.disc_seen.is_none() {
+                        st.disc_seen = Some((
+                            ((pkt[3] as u16) | ((pkt[4] as u16) << 8)) & 0x0FFF,
+                            pkt[5],
+                        ));
+                    }
+                } else {
+                    st.blind = true;
+                }
+            }
             if pkt[0] == BT_EVT_LE_META && len >= 3 && pkt[2] == BT_LE_SUBEVT_CONN_COMPLETE {
                 if len >= 21 {
                     if pkt[3] == 0x00 {
@@ -6178,7 +6339,7 @@ impl Controller {
             );
             self.bt_l3_tally(
                 t0, seen, attempted, completed, disconnected, cancels, live, outstanding,
-                st3.live_handle,
+                st3.live_handle, false,
             );
             return;
         }
@@ -6513,18 +6674,27 @@ impl Controller {
         }
 
         // ---- 4b. MANDATORY TEARDOWN: release a live connection ---------------------------------
+        // RELEASE-2 — `HandleGone` is the second way `live` can legitimately become false. The
+        // teardown's `bool` still means only "a Disconnection Complete was OBSERVED", so it alone
+        // feeds `disconnections_confirmed`; a handle the controller has retired is not a release
+        // this arc performed, but it is a proof that no link is held, and the tally must be able
+        // to say that instead of reporting a live connection that does not exist.
+        let mut gone = false;
         if live {
             if self.bt_l3_disconnect(
                 t, intf, e, toggle, armed, handle, &mut seen, &mut st3, &mut asm,
             ) {
                 disconnected += 1;
                 live = false;
+            } else if st3.release == BtL3Release::HandleGone {
+                live = false;
+                gone = true;
             }
         }
 
         self.bt_l3_tally(
             t0, seen, attempted, completed, disconnected, cancels, live, outstanding,
-            st3.live_handle,
+            st3.live_handle, gone,
         );
     }
 
@@ -6549,6 +6719,33 @@ impl Controller {
     ///
     /// `HCI_Disconnect` answers with a Command Status; the link is not down until the
     /// `Disconnection Complete` event (0x05) arrives. Both are bounded.
+    ///
+    /// RELEASE-2 — WHAT BOOT 11 FORCED, and what this function now does about it. On 2026-08-21
+    /// the metal answered `HCI_Disconnect handle=0x0040 reason=0x13` with Command Status
+    /// **0x12 (Invalid HCI Command Parameters)**, and the arc's own witness line ended with "this
+    /// arc has no second lever for it" — after which a link to a peer was held for the remaining
+    /// ~180 s of the boot with nothing else able to touch it. `HCI_Disconnect` has exactly two
+    /// parameters and 0x12 does not say which one it means, so the lever is a two-step
+    /// discrimination and neither step guesses:
+    ///
+    ///   1. **The latch, consulted first and before anything is sent.** A link that the PEER ended
+    ///      announces itself with a `Disconnection Complete`, on the controller's schedule and not
+    ///      on a wait's. `st.disc_seen` catches one that any wait walked past. If the link already
+    ///      ended, the right answer is to say so — not to send a disconnect for a handle the
+    ///      controller retired, which is itself a plausible reading of 0x12.
+    ///   2. **`HCI_Read_RSSI`, which transmits nothing** (`BT_HCI_READ_RSSI`), on the same handle.
+    ///      `0x02` = the controller has no such handle => nothing is held, and the tally must stop
+    ///      reporting a live connection that does not exist. `0x00` => the link IS live, so the
+    ///      handle was legal and the refusal was about the REASON byte — and the retry below
+    ///      changes exactly that byte and nothing else.
+    ///   3. **One retry with `BT_HCI_REASON_AUTH_FAILURE`**, run only when the probe found the link
+    ///      live. It is the same mandated teardown with the one remaining suspect parameter
+    ///      varied; if it is accepted, the link is released AND the cause is named in one line.
+    ///
+    /// THE ADDED COST is paid only by a boot whose first disconnect was refused or went
+    /// unconfirmed — which is exactly the boot that currently leaks a link for the rest of its
+    /// life: at most `BT_L3_CMD_MS` for the probe, plus `BT_L3_CMD_MS` + `BT_L3_DISC_MS` for the
+    /// retry = **+1.2 s**, and 0 on every boot that lets go the first time.
     #[cfg(feature = "bt")]
     #[allow(clippy::too_many_arguments)]
     unsafe fn bt_l3_disconnect(
@@ -6563,18 +6760,332 @@ impl Controller {
         st: &mut BtL3State,
         asm: &mut [u8],
     ) -> bool {
+        // The trail describes THE TEARDOWN. Reset here rather than at the top of the run, because
+        // under `btc` the inquiry window alone walks past up to `BT_C1_INQUIRY_EVT_MAX` events and
+        // the first eight of those say nothing about a disconnect.
+        st.trail = [0u8; BT_L3_TRAIL_MAX];
+        st.trail_n = 0;
+        st.release = BtL3Release::NotProbed;
+        // ---- STEP 1: THE LATCH, BEFORE ANYTHING IS SENT ---------------------------------------
+        if let Some((h, reason)) = st.disc_seen {
+            if h == handle {
+                serial_println!(
+                    ":: bt-l3: [{}] LINK ALREADY RELEASED — a Disconnection Complete status=0x00 handle={:#06x} reason={:#04x} was WALKED PAST by an earlier wait (it was not the event that wait asked for). The peer, or the controller's supervision timeout, ended this link before the teardown ran. NO HCI_Disconnect is sent: the handle is retired, and issuing one on a retired handle is precisely how a controller comes to answer Invalid HCI Command Parameters. The release IS confirmed — this arc read the event that confirms it == witness ::",
+                    self.idx, h, reason
+                );
+                st.release = BtL3Release::Confirmed;
+                return true;
+            }
+        }
+        // ---- STEP 2: THE MANDATED TEARDOWN, ATTEMPT ONE ---------------------------------------
+        match self.bt_l3_disc_once(
+            t, intf, e, toggle, armed, handle, BT_HCI_REASON_REMOTE_USER_TERM, seen, st, asm,
+        ) {
+            BtL3DiscOut::Confirmed => {
+                st.release = BtL3Release::Confirmed;
+                true
+            }
+            BtL3DiscOut::NotSent | BtL3DiscOut::Unreadable => {
+                // Nothing was learned about the link, and the probe cannot learn anything either:
+                // a `NotSent` never reached the radio, and an `Unreadable` endpoint cannot carry
+                // the probe's Command Complete back. Saying so is the honest end.
+                st.release = BtL3Release::Inconclusive;
+                false
+            }
+            BtL3DiscOut::Refused(status) => {
+                self.bt_l3_trail_witness(st, "the refused HCI_Disconnect");
+                serial_println!(
+                    ":: bt-l3: [{}] HCI_Disconnect handle={:#06x} reason={:#04x} REFUSED with status={:#04x}{} — HCI_Disconnect carries exactly TWO parameters and this status names neither, so the SECOND LEVER runs below: a handle probe that transmits nothing, then at most one retry with the other legal reason == witness ::",
+                    self.idx, handle, BT_HCI_REASON_REMOTE_USER_TERM, status,
+                    if status == BT_ERR_INVALID_PARAMS {
+                        " (Invalid HCI Command Parameters)"
+                    } else {
+                        ""
+                    }
+                );
+                // The first reason was REFUSED, so the retry varies it: that is the whole point of
+                // the discrimination.
+                self.bt_l3_release_probe(
+                    t, intf, e, toggle, armed, handle, BT_HCI_REASON_AUTH_FAILURE, seen, st, asm,
+                )
+            }
+            BtL3DiscOut::Unconfirmed => {
+                // Accepted (or unanswered) but no matching `Disconnection Complete`. The probe
+                // answers the only question that matters — is the link still there? — for one
+                // bounded round trip and no air time, instead of leaving the run to guess.
+                //
+                // THE RETRY KEEPS THE SAME REASON HERE, and the distinction is not cosmetic:
+                // 0x13 was not refused on this path, so varying it would discriminate nothing and
+                // would make the retry's own witness line claim a verdict about the reason byte
+                // that this path has no evidence for. What is owed here is a RE-ISSUE of the
+                // teardown on a link the probe has just found still live, not an experiment.
+                self.bt_l3_trail_witness(st, "the unconfirmed HCI_Disconnect");
+                self.bt_l3_release_probe(
+                    t, intf, e, toggle, armed, handle, BT_HCI_REASON_REMOTE_USER_TERM, seen, st,
+                    asm,
+                )
+            }
+        }
+    }
+
+    /// BT-L3 — print the bounded record of events this teardown WALKED PAST. See `BT_L3_TRAIL_MAX`.
+    ///
+    /// Boot 11's tally read `events_read=5` and named three of them; the two the teardown stepped
+    /// over were the two that could have explained the refusal, and they left no trace at all. One
+    /// line, bounded, printed only on a teardown that did not go cleanly.
+    #[cfg(feature = "bt")]
+    fn bt_l3_trail_witness(&self, st: &BtL3State, at: &str) {
+        let n = (st.trail_n as usize).min(BT_L3_TRAIL_MAX);
+        serial_print!(
+            ":: bt-l3: [{}] teardown event trail — {} event(s) walked past by {}, codes=[",
+            self.idx, st.trail_n, at
+        );
+        for i in 0..n {
+            if i > 0 {
+                serial_print!(" ");
+            }
+            serial_print!("{:02x}", st.trail[i]);
+        }
+        serial_println!(
+            "]{} — 0x05 is Disconnection Complete, 0x13 is Number Of Completed Packets, 0x0F/0x0E are Command Status/Complete for commands already answered. An empty list means the answer arrived alone == witness ::",
+            if st.trail_n as usize > BT_L3_TRAIL_MAX {
+                " (truncated to the first 8)"
+            } else {
+                ""
+            }
+        );
+    }
+
+    /// BT-L3/RELEASE-2 — the second lever: find out whether the link is actually there, then use
+    /// the one remaining legal reason on it.
+    ///
+    /// Returns the same thing `bt_l3_disconnect` returns — whether a `Disconnection Complete` with
+    /// status 0x00 for this handle was OBSERVED — and records the richer verdict on `st.release`,
+    /// which is what lets the tally distinguish "a link is held" from "there is no link to hold".
+    ///
+    /// NOTHING HERE GOES ON THE AIR THAT WAS NOT ALREADY OWED. `HCI_Read_RSSI` is a read of the
+    /// controller's own record (Vol 4 Part E §7.5.4) and generates no LMP or LL traffic; the retry
+    /// is the teardown this arc already promised to perform, with one parameter byte varied.
+    #[cfg(feature = "bt")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn bt_l3_release_probe(
+        &mut self,
+        t: &Target,
+        intf: u8,
+        e: &BtEvtEp,
+        toggle: &mut bool,
+        armed: &mut bool,
+        handle: u16,
+        // The reason the retry will carry, decided by the CALLER from what the first attempt did.
+        // A refusal earns a different reason (the discrimination); an accepted-but-unconfirmed
+        // attempt earns the same one (a re-issue). See the call sites.
+        retry_reason: u8,
+        seen: &mut u32,
+        st: &mut BtL3State,
+        asm: &mut [u8],
+    ) -> bool {
+        // The teardown's own waits may have walked past the event that ends this. Cheapest check
+        // there is, and it runs before a single byte is sent.
+        if let Some((h, reason)) = st.disc_seen {
+            if h == handle {
+                serial_println!(
+                    ":: bt-l3: [{}] SECOND LEVER NOT NEEDED — a Disconnection Complete status=0x00 handle={:#06x} reason={:#04x} was walked past by this teardown's own waits. The link ended on the peer's schedule, which is why the command that tried to end it was answered the way it was. RELEASE CONFIRMED == witness ::",
+                    self.idx, h, reason
+                );
+                st.release = BtL3Release::Confirmed;
+                return true;
+            }
+        }
+        if st.stopped {
+            serial_println!(
+                ":: bt-l3: [{}] SECOND LEVER CANNOT RUN — the event endpoint is not readable, so neither the handle probe's Command Complete nor a retry's Disconnection Complete could be observed. HCI_Read_RSSI is not sent blind: it changes nothing and an unread answer proves nothing. The link state is UNKNOWN == witness ::",
+                self.idx
+            );
+            st.release = BtL3Release::Inconclusive;
+            return false;
+        }
+        // ---- THE HANDLE PROBE -----------------------------------------------------------------
+        // Connection_Handle(2, LE). Command Complete (0x0E) return parameters are
+        // Status(1) Connection_Handle(2) RSSI(1), so on the wire:
+        //   [0]=0x0E [1]=plen [2]=Num_HCI_Command_Packets [3..5]=opcode echo
+        //   [5]=Status [6..8]=Connection_Handle [8]=RSSI  => 9 bytes.
+        let pp: [u8; 2] = [handle as u8, (handle >> 8) as u8];
+        let mut live = false;
+        if !self.bt_hci_send(t, intf, BT_HCI_READ_RSSI, &pp) {
+            serial_println!(
+                ":: bt-l3: [{}] HCI_Read_RSSI (0x1405) handle={:#06x} NOT SENT — the EP0 control-OUT failed (its own line is above). The handle cannot be probed and the link state is UNKNOWN == witness ::",
+                self.idx, handle
+            );
+            st.release = BtL3Release::Inconclusive;
+            return false;
+        }
+        serial_println!(
+            ":: bt-l3: [{}] HCI_Read_RSSI (0x1405) SENT — handle={:#06x} params=[{:02x} {:02x}] = Connection_Handle(2,LE). THIS TRANSMITS NOTHING: it reads the controller's own record of the last packet received on the handle, so it cannot disturb the peer, the link, or the radio. It is here to answer ONE question — does this controller still have this handle == witness ::",
+            self.idx, handle, pp[0], pp[1]
+        );
+        match self.bt_l3_await(
+            e, toggle, armed,
+            BtL3Want::CmdComplete(BT_HCI_READ_RSSI),
+            Self::bt_l3_budget(BT_L3_CMD_MS),
+            seen, st, asm,
+        ) {
+            BtL3Await::Got(len) if len >= 6 => {
+                let status = asm[5];
+                let h = if len >= 8 {
+                    ((asm[6] as u16) | ((asm[7] as u16) << 8)) & 0x0FFF
+                } else {
+                    handle
+                };
+                let rssi = if len >= 9 { asm[8] as i8 } else { 0 };
+                if status == BT_ERR_UNKNOWN_CONN_ID {
+                    serial_println!(
+                        ":: bt-l3: [{}] HANDLE PROBE -> status={:#04x} (UNKNOWN CONNECTION IDENTIFIER) — THE CONTROLLER HAS NO SUCH HANDLE. handle={:#06x} is retired: the link ended before the teardown ran, and the refused HCI_Disconnect was a command aimed at a connection that no longer existed. THERE IS NO LIVE LINK AND NOTHING IS LEAKED. This is not a confirmed release — no Disconnection Complete was read — but it is a proof that the must-not-appear condition does not hold == witness ::",
+                        self.idx, status, handle
+                    );
+                    st.release = BtL3Release::HandleGone;
+                    return false;
+                } else if status == 0x00 {
+                    live = true;
+                    serial_println!(
+                        ":: bt-l3: [{}] HANDLE PROBE -> status=0x00 handle_echo={:#06x} rssi={}dBm — THE LINK IS LIVE. The handle is valid and the controller is still tracking it, so the refused HCI_Disconnect was NOT refused for its handle: the only other parameter is the reason byte, and the retry below varies exactly that == witness ::",
+                        self.idx, h, rssi
+                    );
+                } else {
+                    serial_println!(
+                        ":: bt-l3: [{}] HANDLE PROBE -> status={:#04x} — neither 0x00 (live) nor 0x02 (unknown handle){}. The probe did not settle the handle, so the retry below is run anyway: it is the teardown this arc already owes, and a link that is not there costs one refused command == witness ::",
+                        self.idx, status,
+                        if status == 0x01 {
+                            " — 0x01 is Unknown HCI Command, i.e. this controller does not implement HCI_Read_RSSI at all"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+            BtL3Await::Got(len) => {
+                serial_println!(
+                    ":: bt-l3: [{}] HANDLE PROBE -> Command Complete SHORT-EVENT ({} bytes, 6 required for a status) -> MALFORMED; the handle is not settled == witness ::",
+                    self.idx, len
+                );
+            }
+            BtL3Await::Timeout => serial_println!(
+                ":: bt-l3: [{}] HANDLE PROBE -> NO Command Complete within {}ms. HCI_Read_RSSI is answered entirely by the controller with no air time involved, so a controller that has not answered in that window is not busy; the handle is not settled == witness ::",
+                self.idx, BT_L3_CMD_MS
+            ),
+            BtL3Await::Stop => {
+                serial_println!(
+                    ":: bt-l3: [{}] HANDLE PROBE -> the event endpoint became UNREADABLE. Nothing further can be observed and no retry is issued == witness ::",
+                    self.idx
+                );
+                st.release = BtL3Release::Inconclusive;
+                return false;
+            }
+        }
+        // ---- THE RETRY ------------------------------------------------------------------------
+        match self.bt_l3_disc_once(
+            t, intf, e, toggle, armed, handle, retry_reason, seen, st, asm,
+        ) {
+            BtL3DiscOut::Confirmed => {
+                if retry_reason == BT_HCI_REASON_REMOTE_USER_TERM {
+                    serial_println!(
+                        ":: bt-l3: [{}] SECOND LEVER WORKED — a RE-ISSUE of the same teardown (reason={:#04x}, unchanged) drew the Disconnection Complete the first one did not, on a link the handle probe had just found live. The link is released. This says nothing about the reason byte and does not claim to: the first attempt was never refused == witness ::",
+                        self.idx, retry_reason
+                    );
+                } else {
+                    serial_println!(
+                        ":: bt-l3: [{}] SECOND LEVER WORKED — the same handle that was refused with reason={:#04x} was ACCEPTED with reason={:#04x}, and the link is released. THE INVALID PARAMETER WAS THE REASON BYTE, not the handle: the probe proved the handle live, both values are on the Core spec's permitted list for HCI_Disconnect, and this controller's parameter check disagrees with the spec about 0x13 == witness ::",
+                        self.idx, BT_HCI_REASON_REMOTE_USER_TERM, retry_reason
+                    );
+                }
+                st.release = BtL3Release::Confirmed;
+                true
+            }
+            other => {
+                if let Some((h, reason)) = st.disc_seen {
+                    if h == handle {
+                        serial_println!(
+                            ":: bt-l3: [{}] RELEASE CONFIRMED BY THE LATCH — a Disconnection Complete status=0x00 handle={:#06x} reason={:#04x} was walked past while the retry was in flight. The link is down == witness ::",
+                            self.idx, h, reason
+                        );
+                        st.release = BtL3Release::Confirmed;
+                        return true;
+                    }
+                }
+                self.bt_l3_trail_witness(st, "the second lever");
+                st.release = if live {
+                    BtL3Release::StillLive
+                } else {
+                    BtL3Release::Inconclusive
+                };
+                serial_println!(
+                    ":: bt-l3: [{}] SECOND LEVER EXHAUSTED — {} (retry_reason={:#04x} retry_status={:#04x}), on a handle the probe called {}. {} NOTHING FURTHER IS SENT FROM HERE == witness ::",
+                    self.idx,
+                    match other {
+                        BtL3DiscOut::Refused(_) => "the retry was REFUSED too",
+                        BtL3DiscOut::Unconfirmed => "the retry drew no Disconnection Complete",
+                        BtL3DiscOut::NotSent => "the retry could not be sent on EP0",
+                        BtL3DiscOut::Unreadable => "the event endpoint went unreadable",
+                        BtL3DiscOut::Confirmed => "unreachable",
+                    },
+                    retry_reason,
+                    match other {
+                        BtL3DiscOut::Refused(s2) => s2,
+                        _ => 0u8,
+                    },
+                    if live { "LIVE" } else { "unsettled" },
+                    if retry_reason != BT_HCI_REASON_REMOTE_USER_TERM
+                        && matches!(other, BtL3DiscOut::Refused(_))
+                    {
+                        "THE NEXT DISCRIMINATOR IS NAMED RATHER THAN GUESSED AT: BOTH reasons this arc can legally send were refused and the handle was probed, so the parameter VALUES are exonerated and what is left is the command PACKET — the parameter_total_length byte, or the EP0 data stage that carries it. Settling that needs a controller-side read of what it actually received, which is a different arc's command."
+                    } else {
+                        "THE NEXT DISCRIMINATOR: this path did not exhaust the reason byte (the first attempt was not refused, or the retry was not refused but unanswered), so the open question is whether the controller ACCEPTS the teardown and never completes it. The handle probe's verdict above is the fact to carry forward."
+                    }
+                );
+                false
+            }
+        }
+    }
+
+    /// BT-L3 — ONE `HCI_Disconnect` attempt: send, read its Command Status, and if that was an
+    /// acceptance, wait out the `Disconnection Complete`. Every path is bounded and every path
+    /// witnesses itself; the caller decides what to do with the outcome.
+    #[cfg(feature = "bt")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn bt_l3_disc_once(
+        &mut self,
+        t: &Target,
+        intf: u8,
+        e: &BtEvtEp,
+        toggle: &mut bool,
+        armed: &mut bool,
+        handle: u16,
+        reason: u8,
+        seen: &mut u32,
+        st: &mut BtL3State,
+        asm: &mut [u8],
+    ) -> BtL3DiscOut {
         // Connection_Handle(2, LE) Reason(1).
-        let dp: [u8; 3] = [handle as u8, (handle >> 8) as u8, BT_HCI_REASON_REMOTE_USER_TERM];
+        let dp: [u8; 3] = [handle as u8, (handle >> 8) as u8, reason];
         if !self.bt_hci_send(t, intf, BT_HCI_DISCONNECT, &dp) {
             serial_println!(
                 ":: bt-l3: [{}] HCI_Disconnect (0x0406) handle={:#06x} NOT SENT — the EP0 control-OUT failed (its own line is above). THE CONNECTION IS STILL LIVE == witness ::",
                 self.idx, handle
             );
-            return false;
+            return BtL3DiscOut::NotSent;
         }
+        // THE BYTES, PRINTED. A status that says "invalid parameters" is unreadable without them:
+        // boot 11 could not distinguish a wrong handle, a wrong byte order and a wrong reason from
+        // each other, because the capture carried the values this host INTENDED and not the block
+        // it actually staged. Three bytes cost one line and settle byte order for good.
         serial_println!(
-            ":: bt-l3: [{}] HCI_Disconnect (0x0406) SENT — handle={:#06x} reason={:#04x} (REMOTE-USER-TERMINATED) == witness ::",
-            self.idx, handle, BT_HCI_REASON_REMOTE_USER_TERM
+            ":: bt-l3: [{}] HCI_Disconnect (0x0406) SENT — handle={:#06x} reason={:#04x} ({}) params=[{:02x} {:02x} {:02x}] = Connection_Handle(2,LE) Reason(1), parameter_total_length=3 == witness ::",
+            self.idx, handle, reason,
+            match reason {
+                BT_HCI_REASON_REMOTE_USER_TERM => "REMOTE-USER-TERMINATED",
+                BT_HCI_REASON_AUTH_FAILURE => "AUTHENTICATION-FAILURE, the retry reason",
+                _ => "?",
+            },
+            dp[0], dp[1], dp[2]
         );
         let r = self.bt_l3_await(
             e, toggle, armed,
@@ -6589,10 +7100,10 @@ impl Controller {
             ),
             BtL3Await::Got(_) => {
                 serial_println!(
-                    ":: bt-l3: [{}] HCI_Disconnect -> CommandStatus status={:#04x} -> REFUSED. THE CONNECTION IS STILL LIVE and this arc has no second lever for it == witness ::",
+                    ":: bt-l3: [{}] HCI_Disconnect -> CommandStatus status={:#04x} -> REFUSED. The opcode echoed back in this very event is 0x0406, so the command's first two staged bytes reached the controller intact and the refusal is about the THREE PARAMETER BYTES above, nothing else == witness ::",
                     self.idx, asm[2]
                 );
-                return false;
+                return BtL3DiscOut::Refused(asm[2]);
             }
             BtL3Await::Timeout => serial_println!(
                 ":: bt-l3: [{}] HCI_Disconnect -> NO CommandStatus within {}ms; the EP0 write went out, so the teardown may still be in flight — the Disconnection Complete wait below is the decider == witness ::",
@@ -6603,7 +7114,7 @@ impl Controller {
                     ":: bt-l3: [{}] HCI_Disconnect SENT UNREAD — the event endpoint is not readable, so neither its CommandStatus nor its Disconnection Complete can be observed. The EP0 write, which is what tears the link down, went out; this arc CANNOT CONFIRM it == witness ::",
                     self.idx
                 );
-                return false;
+                return BtL3DiscOut::Unreadable;
             }
         }
         // Disconnection Complete: 0x05, Param_Total_Length(1)=4, Status(1), Connection_Handle(2),
@@ -6616,28 +7127,32 @@ impl Controller {
         );
         match r {
             BtL3Await::Got(len) if len >= 6 => {
-                let st = asm[2];
+                let status = asm[2];
                 let h = ((asm[3] as u16) | ((asm[4] as u16) << 8)) & 0x0FFF;
-                let ok = st == 0x00 && h == handle;
+                let ok = status == 0x00 && h == handle;
                 serial_println!(
                     ":: bt-l3: [{}] Disconnection Complete — status={:#04x} handle={:#06x} reason={:#04x} -> {} == witness ::",
-                    self.idx, st, h, asm[5],
+                    self.idx, status, h, asm[5],
                     if ok {
                         "DISCONNECTED (the link is released)"
-                    } else if st == 0x00 {
+                    } else if status == 0x00 {
                         "HANDLE MISMATCH — a different connection was released; ours is STILL LIVE"
                     } else {
                         "NONZERO-STATUS — the link is NOT released"
                     }
                 );
-                ok
+                if ok {
+                    BtL3DiscOut::Confirmed
+                } else {
+                    BtL3DiscOut::Unconfirmed
+                }
             }
             BtL3Await::Got(len) => {
                 serial_println!(
                     ":: bt-l3: [{}] Disconnection Complete SHORT-EVENT ({} bytes, 6 required) -> MALFORMED; the release is NOT confirmed == witness ::",
                     self.idx, len
                 );
-                false
+                BtL3DiscOut::Unconfirmed
             }
             BtL3Await::Timeout => {
                 // REVIEW CONDITION 6 — the supervision-timeout figure is the value BT-L3 asked for
@@ -6652,14 +7167,14 @@ impl Controller {
                     ":: bt-l3: [{}] NO Disconnection Complete within {}ms — the disconnect was accepted but the release is NOT confirmed. The link will in any case drop on its own supervision timeout; on an LE link that is the {}ms this arc negotiated, and ON A CLASSIC (BT-C1) HANDLE IT IS NOT — a BR/EDR link uses the controller's own link supervision timeout, which this arc neither writes nor reads == witness ::",
                     self.idx, BT_L3_DISC_MS, BT_L3_SUPERVISION_TIMEOUT as u32 * 10
                 );
-                false
+                BtL3DiscOut::Unconfirmed
             }
             BtL3Await::Stop => {
                 serial_println!(
                     ":: bt-l3: [{}] event endpoint became UNREADABLE before Disconnection Complete — the release is NOT confirmed == witness ::",
                     self.idx
                 );
-                false
+                BtL3DiscOut::Unreadable
             }
         }
     }
@@ -6681,6 +7196,10 @@ impl Controller {
         live: bool,
         outstanding: bool,
         stray: Option<u16>,
+        // RELEASE-2 — the handle probe said the controller has no such handle. `live` is already
+        // false when this is true; it is carried separately so the line can say WHY the link is
+        // not held, which is a different fact from a confirmed release and must not read like one.
+        gone: bool,
     ) {
         // FINDING 5: `unwrap_or(0)` printed `elapsed=0ms` on exactly the run this doc-comment said
         // could not masquerade — the UNCALIBRATED one, where `epace_ms` returns None. A fabricated
@@ -6704,10 +7223,14 @@ impl Controller {
             // is never set again after the create. Rather than leave a dead arm asserting a
             // condition the code cannot reach, `live` is matched first and swallows both: if a link
             // is held, that is the headline whatever `outstanding` says.
-            match (live, outstanding) {
-                (false, false) => "none",
-                (true, _) => "A LIVE CONNECTION — the teardown was not confirmed. THIS IS THE MUST-NOT-APPEAR CONDITION",
-                (false, true) => "AN UNRESOLVED HCI_LE_Create_Connection — the controller may still be INITIATING and will refuse later LE commands. THIS IS THE MUST-NOT-APPEAR CONDITION",
+            match (live, outstanding, gone) {
+                (false, false, false) => "none",
+                // RELEASE-2 — nothing is held, and the reason is worth a clause: the handle probe
+                // found the controller had already retired the handle, so the link ended before
+                // the teardown could end it. Not a confirmed release, but not a leak either.
+                (false, false, true) => "none — THE HANDLE WAS ALREADY RETIRED: HCI_Read_RSSI answered Unknown Connection Identifier, so no link is held. The release was not CONFIRMED (no Disconnection Complete was read), and it was not NEEDED",
+                (true, _, _) => "A LIVE CONNECTION — the teardown was not confirmed. THIS IS THE MUST-NOT-APPEAR CONDITION",
+                (false, true, _) => "AN UNRESOLVED HCI_LE_Create_Connection — the controller may still be INITIATING and will refuse later LE commands. THIS IS THE MUST-NOT-APPEAR CONDITION",
             }
         );
     }
@@ -8407,6 +8930,12 @@ impl Controller {
                 t, intf, e, toggle, armed, handle, &mut seen, &mut st, &mut asm2,
             ) {
                 disconnected += 1;
+                live = false;
+            } else if st.release == BtL3Release::HandleGone {
+                // RELEASE-2 — the handle probe says the controller retired this handle, so there
+                // is no BR/EDR link to leave behind. Clearing `live` here is what keeps
+                // `bt_left_link` from latching a dead handle and making every later re-trigger
+                // spend its escape hatch on a link that does not exist.
                 live = false;
             }
         }

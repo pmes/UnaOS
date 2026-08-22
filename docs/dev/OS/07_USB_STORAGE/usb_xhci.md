@@ -7649,6 +7649,183 @@ a fault to chase.
 
 ---
 
+## 30. BT-RELEASE2 — the refused teardown, and the lever the stack did not have (`UNAOS_BT=1`, 2026-08-21)
+
+### The observation
+
+rMBP metal boot 11 (capture `rmbp3-boot11`). BT-L3 opened an LE link and could not close it:
+
+```
+[ 2350ms] bt-l3: LE Connection Complete — status=0x00 handle=0x0040 role=MASTER(initiator)
+          peer=88:c6:26:cc:2d:3c/public interval=0x0027 supervision_timeout=1000ms -> CONNECTED
+[ 2350ms] bt-l4: ACL OUT2 SENT 15/15 bytes  (ATT_READ_BY_TYPE_REQ, Battery Level)
+[ 2950ms] bt-l4: L4 tally — acl_packets_with_data=0 ... answered=false
+[ 2950ms] bt-l3: HCI_Disconnect (0x0406) SENT — handle=0x0040 reason=0x13
+[ 2953ms] bt-l3: HCI_Disconnect -> CommandStatus status=0x12 -> REFUSED. THE CONNECTION IS STILL
+          LIVE and this arc has no second lever for it
+[ 2953ms] bt-l3: L3 tally — events_read=5 ... disconnections_confirmed=0
+          left_outstanding=A LIVE CONNECTION — THIS IS THE MUST-NOT-APPEAR CONDITION
+```
+
+`0x12` is Invalid HCI Command Parameters. The link was then held for the remaining ~180 s of the
+boot, with the whole classic stage (§26, §27) running on top of it.
+
+### What the capture refutes, byte for byte
+
+The five candidates, and what boot 11's own bytes do to them:
+
+- **DMA corruption of the staged command block — REFUTED.** `bt_acl_txn` leaves its bulk-IN qTD
+  ACTIVE on the `nodata` path with `overlay[3] = data_buf_phys`, and that is the *same* EP0 data
+  buffer `bt_hci_send` stages `HCI_Disconnect` into; the ASS handshake in `bt_acl_txn` exists for
+  exactly this race. It did not fire here, and it could not have: an ACL-IN DMA fills `data_buf`
+  **from offset 0**, so it would clobber the two opcode bytes first — and the Command Status this
+  host matched on required `pkt[4..6] == 0x0406`. The opcode echoed back intact. Whatever the
+  controller disliked, it was in the three parameter bytes, not in the packet's head.
+- **Handle byte order or width — REFUTED.** `[handle as u8, (handle >> 8) as u8]` on `0x0040` is
+  `[40 00]`, correct little-endian; the same convention produced the 25-byte `Create_Connection`
+  block the controller *accepted* three seconds earlier, and BT-C1's `page bytes` line shows the
+  arc rendering LSB-first correctly on the same boot. `0x0040` is inside the Core range
+  `0x0000..0x0EFF`.
+- **Latched from the wrong field — REFUTED.** The Connection Complete decoder and the
+  `bt_l3_await` latch both read `pkt[4..6]` of a 21-byte LE meta event, and both printed
+  `handle=0x0040`; the disconnect printed the same value back.
+- **Sent before the controller finished setting up — REFUTED.** 600 ms and a completed ACL-OUT
+  separate the Connection Complete from the disconnect.
+- **The reason byte `0x13`, or a handle the controller had already retired — NOT SETTLED, and the
+  capture cannot settle them.** Both are on the table and the boot carried no evidence either way,
+  because `events_read=5` names three events and the teardown's waits **walked past two more
+  without recording them**. One of those two may well have been the `Disconnection Complete` for
+  handle `0x0040`: BT-L4 sat for 600 ms with the event endpoint unread while an ATT response never
+  came, and anything the controller emitted in that window queued up behind it.
+
+That is the finding. The arc had no way to distinguish "the reason byte was rejected" from "the
+handle was already gone", and no lever to try either.
+
+### The mechanism, and the fix (`drivers/ehci/mod.rs`)
+
+`HCI_Disconnect` carries exactly two parameters. The teardown is now a discrimination over them,
+and no step guesses:
+
+1. **`BtL3State::disc_seen` — the latch for the other end of the link's life.** The exact sibling
+   of `live_handle` (§22): any `Disconnection Complete` (0x05) with status 0x00 that *any* wait
+   walks past is latched with its handle and reason. It is consulted **before a single byte is
+   sent**. A link the peer ended is a link that is down, and issuing a disconnect on a retired
+   handle is itself a plausible reading of `0x12`.
+2. **`HCI_Read_RSSI` (0x1405) as a handle probe.** Two parameter bytes, one Command Complete, and
+   — the reason it is admissible under the arc's standing "no unrequested radio operation" rule —
+   **it transmits nothing**: Vol 4 Part E §7.5.4 makes it a read of the controller's own record of
+   the last packet received on that handle. Status `0x02` (Unknown Connection Identifier) means the
+   controller has no such handle, so **no link is held**; status `0x00` proves the opposite, and
+   with it that the refused disconnect's handle was legal. Boot 11's
+   `HCI_Read_Local_Supported_Commands` reply carries `cmds[15]=0xfe` and Read_RSSI is octet 15
+   bit 3, so this controller advertises it — the code does not rely on that, and treats `0x01`
+   (Unknown HCI Command) as "the probe is unavailable here".
+3. **One retry with reason `0x05` (Authentication Failure)**, run only when the probe found the
+   link live. `0x05` is on the same short list the Core spec permits a host to send
+   (0x05, 0x13-0x15, 0x1A, 0x29, 0x3B), so the retry varies **exactly one byte** against a control
+   that has already been established. Accepted where `0x13` was refused ⇒ the reason byte was the
+   invalid parameter, and the link is released in the same round trip.
+4. **The teardown event trail.** A bounded record (`BT_L3_TRAIL_MAX` = 8 codes, saturating count)
+   of what the teardown's waits stepped over, printed on any teardown that did not go cleanly. It
+   is what boot 11 was missing.
+
+`bt_l3_disconnect` keeps its `bool` return, and it still means only one thing — *a
+`Disconnection Complete` with status 0x00 for this handle was observed* — so
+`disconnections_confirmed=` cannot start meaning two things. The richer verdict rides on
+`BtL3State::release` (`Confirmed` / `HandleGone` / `StillLive` / `Inconclusive`), and `HandleGone`
+is the one that changes an outcome: it clears `live` on both the LE (§22) and classic (§26) paths,
+so the tally stops reporting a live connection the controller does not have, and `bt_left_link`
+(§25) stops latching a dead handle.
+
+**Cost:** `0` on any boot that lets go the first time. At most `BT_L3_CMD_MS` (probe) +
+`BT_L3_CMD_MS` + `BT_L3_DISC_MS` (retry) = **+1.2 s**, paid only by the boot that is currently
+leaking a link for its entire life.
+
+### Does the held link explain the speaker never pairing?
+
+**On this host's side, no — and the capture is unambiguous about it.** With the LE link believed
+live the whole time, the controller *accepted and ran to completion* both classic operations:
+
+```
+[ 2956ms] bt-c1: HCI_Inquiry (0x0401) -> CommandStatus status=0x00 -> ACCEPTED
+[ 8079ms] bt-c1: Inquiry Complete (0x01) status=0x00 — the controller ran the full 5120ms
+[ 8082ms] bt-c1: HCI_Create_Connection (0x0405) -> CommandStatus status=0x00 -> ACCEPTED
+[13206ms] bt-c1: observed=5124ms deadline_in_force=5120ms (100% of it) ... status=0x04 PAGE TIMEOUT
+```
+
+A controller blocked by a live LE link answers `0x0C` (Command Disallowed) or returns early. This
+one inquired and paged for 100 % of both deadlines. **The held LE link does not block inquiry or
+page on the BCM20702.**
+
+**On the peer's side it is the leading suspect, and the capture cannot rule it out.** Two facts
+push against the working assumption that `88:c6:26:cc:2d:3c` is an LE-only mouse and therefore an
+irrelevant bystander:
+
+- its advertisement's **Flags byte is `0x1A`** — `02 01 1a` in the raw AD — and bit 2
+  (*BR/EDR Not Supported*) is **clear**, with bits 3 and 4 (*Simultaneous LE and BR/EDR*, controller
+  and host) both **set**. That is a dual-mode device advertising itself as one. An LE-only mouse
+  advertises `0x06`.
+- `03 03 61 fe` is a Complete 16-bit Service UUID list containing **0xFE61 = Logitech**, and
+  Ultimate Ears is a Logitech brand — so the UUID is consistent with the MEGABOOM as well as with
+  a Logitech mouse.
+
+So the ordering the arc runs is wrong-shaped for a dual-mode target: BT-L3 takes an LE link to the
+target at 2.35 s and **never lets go**, and BT-C1 then spends 5.1 s inquiring for it and 10.2 s
+paging it while that link is held. A dual-mode peer with an active LE link from this host is under
+no obligation to keep inquiry-scanning or page-scanning for it — and the inquiry heard **zero
+responses of any kind** in 5120 ms with all three result shapes unmasked (bits 1, 33 and 46),
+which is a silence worth explaining.
+
+The fix is also the experiment. There are exactly two readings and one boot separates them:
+
+- **The leak was the cause.** With the teardown confirmed, BT-C1's inquiry runs with no LE link
+  held; the target answers the inquiry, the page is clock-aligned, and a link forms.
+- **The leak was a bystander.** The inquiry still returns `inquiry_responses=0` and both trains
+  still time out — in which case the remaining suspect is receive sensitivity, which the LE side
+  already hints at (one device, 5 reports, `-88dBm` across a 500 ms window), and the address
+  constant should be re-derived from a classic inquiry rather than from an LE advertisement.
+
+`BTNAME=0` across the whole boot is a consequence of the above, not an independent fault: no
+classic link ever formed, so nothing was ever there to name.
+
+### Reading the next boot — the metal watch list
+
+Confirmations, in the order they can appear:
+
+- `bt-l3: HCI_Disconnect (0x0406) SENT — handle=… reason=0x13 (REMOTE-USER-TERMINATED)
+  params=[.. .. 13] = Connection_Handle(2,LE) Reason(1), parameter_total_length=3` — the staged
+  block is now in the capture. Byte order is settled from the line itself, with no inference.
+- **The clean case:** `Disconnection Complete — status=0x00 handle=… -> DISCONNECTED` followed by
+  `L3 tally — … disconnections_confirmed=1 … left_outstanding=none`. That is the fix working.
+- **The peer-terminated case:** `LINK ALREADY RELEASED — a Disconnection Complete status=0x00 …
+  was WALKED PAST by an earlier wait`, then `disconnections_confirmed=1` with **no HCI_Disconnect
+  sent at all**. This convicts the boot-11 refusal as a command aimed at a retired handle.
+- **The stale-handle case:** `HANDLE PROBE -> status=0x02 (UNKNOWN CONNECTION IDENTIFIER) — THE
+  CONTROLLER HAS NO SUCH HANDLE`, and the tally reading `left_outstanding=none — THE HANDLE WAS
+  ALREADY RETIRED`. Same conviction, reached by the probe instead of the latch;
+  `disconnections_confirmed` stays `0` **and that is correct** — nothing was released, because
+  nothing was there.
+- **The reason-byte case:** `HANDLE PROBE -> status=0x00 … THE LINK IS LIVE`, then
+  `SECOND LEVER WORKED — the same handle that was refused with reason=0x13 was ACCEPTED with
+  reason=0x05`, and `disconnections_confirmed=1`. This convicts the controller's parameter check.
+
+Refutation — what says the fix did not settle it:
+
+- `SECOND LEVER EXHAUSTED — the retry was REFUSED too (retry_status=0x12), on a handle the probe
+  called LIVE` plus `left_outstanding=A LIVE CONNECTION`. Both permitted reasons refused on a
+  handle proven live exonerates the parameter *values*, and the next discriminator is then the
+  command **packet** — the `parameter_total_length` byte or the EP0 data stage that carries it —
+  which needs a controller-side read of what it received and is a different arc.
+- `teardown event trail — N event(s) walked past …, codes=[…]` is the line to read in either
+  direction. `05` in that list means a `Disconnection Complete` went by; `13` is
+  Number Of Completed Packets from BT-L4's ACL OUT and is expected.
+
+Gates: `./arroyo check` green both arches (12 cfg legs, `x86-all` carries `bt,btc`) and green again
+with `UNAOS_BT=1 UNAOS_BTC=1`. No QEMU leg — QEMU has no Bluetooth controller and could never have
+judged this. Reachability was proven with `strings` on the armed builder-path `kernel.elf`.
+
+---
+
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
 - `unaos/crates/kernel/src/drivers/ehci/`, `drivers/ehci_scout.rs` — the EHCI-3 HID driver (§10) and the EHCI-1/2 scout + shared wake (§9/§9a).
