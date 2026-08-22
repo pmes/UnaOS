@@ -7788,6 +7788,19 @@ The fix is also the experiment. There are exactly two readings and one boot sepa
 `BTNAME=0` across the whole boot is a consequence of the above, not an independent fault: no
 classic link ever formed, so nothing was ever there to name.
 
+**And there is a blunter answer that sits in front of all of it.** The operator identifies
+`88:c6:26:cc:2d:3c` as a Logitech M196 — *not* the speaker. `BT_L3_PEER_ADDR` is that constant, it
+`DECIDES ALONE` (§22), and BT-C1 pages whatever BT-L3 selected: boot 11's `page bytes` line reads
+`params=[3c 2d cc 26 c6 88]`, twice. If that address is the mouse, then **across a 200 s boot with
+a speaker powered on and in pairing mode two metres away, this stack never once addressed the
+speaker** — and no amount of teardown correctness will pair a device that is never paged. The
+teardown leak is real, is fixed here, and is *not* the reason the speaker did not pair on boot 11;
+the target constant is. That is a peer-selection question, not a teardown question, and it belongs
+to a different arc. The Flags/UUID evidence above is recorded because it does not sit comfortably
+with the identification — an M196 should advertise `BR/EDR Not Supported` set, and this advertiser
+does not — and settling *which device that address is* is the first thing the next sitting should
+do, before any conclusion is drawn from another page timeout against it.
+
 ### Reading the next boot — the metal watch list
 
 Confirmations, in the order they can appear:
