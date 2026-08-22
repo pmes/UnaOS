@@ -429,7 +429,7 @@ Verified at `3dc889e7` by `git merge-base --is-ancestor` and `git grep`:
 | `RENDER_STACK_SIZE = 32 KiB` | ❌ | SHELLUP only |
 | 32 KiB sizing for `usb-pump` / `input` | ❌ | STACKPOOL only |
 | SHELLUP `e8dcb09c` | ❌ not an ancestor of HEAD | **is** on `origin/hw-pi4`; **not** on `origin/main` |
-| STACKPOOL `71671423` | ❌ not an ancestor of HEAD | **not on origin at all** — it exists only on the local `hw-pi4` worktree branch, two commits ahead of `origin/hw-pi4` (`38f2ecbb`). It cannot be fetched today |
+| STACKPOOL `71671423` | ❌ not an ancestor of HEAD | **CORRECTED 2026-08-23 — it is now FETCHABLE.** This row previously read "not on origin at all … it cannot be fetched today", which was true when written and went stale within hours. `git branch -r --contains 71671423` → `origin/hw-pi4`; the pi seat pushed, and `origin/hw-pi4` is now `54ddef41`. SHELLUP `e8dcb09c` is likewise contained. **Neither is an ancestor of `hw-jetson`**, so the stop-line below still stands for this branch — but the remedy is now a trunk sync or a cherry-pick agreed with the pi seat, rather than a wait for someone to push. Re-verify with `git branch -r --contains` in the same turn as any claim about this; the whole point of this row is that reachability has a shelf life. |
 
 > ⚠️ **The instrument on this branch is the one STACKPOOL convicted as lying.**
 > `arch/aarch64/sched.rs:82-83` at `3dc889e7` documents `[u7stk]`'s `headroom` as
