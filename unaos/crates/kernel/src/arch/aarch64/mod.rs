@@ -302,7 +302,7 @@ pub fn now_cycles() -> u64 {
     v
 }
 
-/// Busy-wait budget in `now_cycles()` (CNTVCT) units. ~2.5 s at a ~60 MHz generic-timer rate.
+/// Busy-wait budget in `now_cycles()` (CNTVCT) units. **2.78 s on Pi 4**, not the ~2.5 s at ~60 MHz this line claimed until 2026-08-22: the part reports `CNTFRQ=54000000 Hz` on its own boot diag, and 150e6/54e6 = 2.7778 s is exactly the `spent_ms=2779` the BOT pump printed when it blew a 2000 ms budget — the agreement to the millisecond is what makes this a measurement rather than arithmetic. ⚠ ONE LINE: this file is compiled knob-off and panic `Location` records embed line numbers.
 pub const HW_WAIT_BUDGET: u64 = 150_000_000;
 
 /// Busy-wait budget in `now_cycles()` (CNTVCT) units. Arch-neutral mirror of x86_64's
