@@ -341,9 +341,15 @@ pub fn dhcp_or_static<D: Device>(
 
     serial_println!("{} NET: DHCP discover (timeout {} ms) ::", prefix, timeout_ms);
     let start = now_ms();
+    // NET-4k poll-cadence witness: count how many times we drive `iface.poll` across the window. The
+    // Orin RTL8168 no-lease audit put the poll/dispatch cadence under suspicion; this busy loop is the
+    // exact seam the QEMU `vnet` path leases through, so surfacing the poll count on BOTH outcomes lets
+    // boot-14 compare the metal cadence against the known-good virtio lease directly.
+    let mut polls: u64 = 0;
     loop {
         let t = now_ms();
         iface.poll(Instant::from_millis(t), dev, &mut sockets);
+        polls += 1;
 
         match sockets.get_mut::<dhcpv4::Socket>(handle).poll() {
             Some(dhcpv4::Event::Configured(cfg)) => {
@@ -358,11 +364,12 @@ pub fn dhcp_or_static<D: Device>(
                 let dns = cfg.dns_servers.first().map(|a| a.octets());
                 apply_ipv4(iface, ip, prefix_len, gw);
                 serial_println!(
-                    "{} NET: DHCP lease ip={}.{}.{}.{}/{} gw={}.{}.{}.{} (server {}.{}.{}.{}) => PASS ::",
+                    "{} NET: DHCP lease ip={}.{}.{}.{}/{} gw={}.{}.{}.{} (server {}.{}.{}.{}) after {} polls => PASS ::",
                     prefix,
                     ip[0], ip[1], ip[2], ip[3], prefix_len,
                     gw[0], gw[1], gw[2], gw[3],
                     srv[0], srv[1], srv[2], srv[3],
+                    polls,
                 );
                 let cfg = NetConfig { leased: true, ip, prefix_len, gw, dns };
                 record_settled(&cfg); // PI-UI-2: publish the settled address for the GUI status strip
@@ -375,8 +382,8 @@ pub fn dhcp_or_static<D: Device>(
         if now_ms().saturating_sub(start) >= timeout_ms {
             apply_ipv4(iface, static_ip, static_prefix, static_gw);
             serial_println!(
-                "{} NET: no lease within {} ms — falling back to static {}.{}.{}.{}/{} gw {}.{}.{}.{} ::",
-                prefix, timeout_ms,
+                "{} NET: no lease within {} ms ({} polls) — falling back to static {}.{}.{}.{}/{} gw {}.{}.{}.{} ::",
+                prefix, timeout_ms, polls,
                 static_ip[0], static_ip[1], static_ip[2], static_ip[3], static_prefix,
                 static_gw[0], static_gw[1], static_gw[2], static_gw[3],
             );
@@ -390,6 +397,296 @@ pub fn dhcp_or_static<D: Device>(
             record_settled(&cfg); // PI-UI-2: publish the static-fallback address for the GUI status strip
             return cfg;
         }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+// NET-4j — the DHCP no-lease reproducer (witness-gated, self-contained, no NIC required).
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// Orin metal boot-11 (R23s1) captured a DHCP OFFER that passed every driver-visible check (xid match,
+// unicast to our station MAC, valid yiaddr) yet never produced a lease — the drop was ABOVE the driver,
+// in the smoltcp dhcpv4 socket. This reproducer replays that exchange deterministically, with NO network
+// backend: it drives a real `smoltcp::socket::dhcpv4::Socket` over a fake in-memory `phy::Device` carrying
+// the SAME `DeviceCapabilities` shape the metal seam uses (medium Ethernet, MTU 1500, default checksum
+// caps), polls once to emit the DISCOVER, then injects a synthesized OFFER echoing that DISCOVER's xid.
+//
+// It asserts the integration CONTRACT the metal seam relies on:
+//   * a well-formed OFFER (valid checksums, chaddr==MAC, option-54 server-identifier present) makes the
+//     socket transition Discovering -> Requesting and EMIT a REQUEST — PASS;
+//   * an OFFER identical but for the missing option-54 server-identifier is silently DROPPED and NO
+//     REQUEST is emitted — proving that gate is exactly what turns a driver-valid OFFER into a no-lease.
+//
+// Because the fixed `random_seed` the seams use makes the DISCOVER's xid deterministic, the reproducer's
+// xid equals the metal boot-11 xid (0x51fb1e94 under seed 0x4e455434) — it replays the real exchange, not
+// an analogue. Runs on the aarch64 `vnet` QEMU gate: `UNAOS_WITNESS=1 UNAOS_VNET=1 ./arroyo test-arm`.
+#[cfg(feature = "witness")]
+pub mod net4j_repro {
+    use super::*;
+    use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
+    use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+    use smoltcp::socket::dhcpv4;
+    use smoltcp::time::Instant;
+    use smoltcp::wire::{
+        DhcpMessageType, DhcpPacket, DhcpRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
+        EthernetRepr, HardwareAddress, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, UdpPacket,
+        UdpRepr,
+    };
+
+    const OUR_MAC: [u8; 6] = [0x4c, 0xbb, 0x47, 0x25, 0x49, 0xc8];
+    const SRV_MAC: [u8; 6] = [0x8a, 0x66, 0x5a, 0x72, 0x49, 0x64];
+    const SRV_IP: Ipv4Address = Ipv4Address::new(192, 168, 2, 1);
+    const YIADDR: Ipv4Address = Ipv4Address::new(192, 168, 2, 2);
+    const CAP: usize = 600;
+
+    /// A fake `phy::Device`: injects one queued inbound frame, captures the LAST outbound frame + its
+    /// DHCP message type. No heap; all scratch is struct-local (mirrors `SmoltcpPhy`).
+    struct FakeDev {
+        inbound: Option<([u8; CAP], usize)>,
+        rx: [u8; CAP],
+        tx: [u8; CAP],
+        /// Last captured outbound frame + length, written through a raw pointer from the TxToken (the
+        /// token borrows `tx` disjointly, so the capture cannot alias it). Single-threaded witness path.
+        cap_buf: [u8; CAP],
+        cap_len: usize,
+        cap_mtype: u8,
+    }
+    impl FakeDev {
+        fn new() -> Self {
+            FakeDev {
+                inbound: None,
+                rx: [0; CAP],
+                tx: [0; CAP],
+                cap_buf: [0; CAP],
+                cap_len: 0,
+                cap_mtype: 0,
+            }
+        }
+    }
+    struct RxTok<'a> {
+        buf: &'a [u8],
+    }
+    struct TxTok<'a> {
+        buf: &'a mut [u8],
+        cap_buf: *mut [u8; CAP],
+        cap_len: *mut usize,
+        cap_mtype: *mut u8,
+    }
+    impl RxToken for RxTok<'_> {
+        fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
+            f(self.buf)
+        }
+    }
+    impl TxToken for TxTok<'_> {
+        fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
+            let n = len.min(self.buf.len());
+            let r = f(&mut self.buf[..n]);
+            // SAFETY: the capture fields are distinct from `tx` (which `buf` borrows); single-threaded.
+            // Form the reference by an EXPLICIT deref (never an implicit autoref through the raw pointer).
+            unsafe {
+                let cap: &mut [u8; CAP] = &mut *self.cap_buf;
+                cap[..n].copy_from_slice(&self.buf[..n]);
+                *self.cap_len = n;
+                *self.cap_mtype = dhcp_mtype_of(&self.buf[..n]);
+            }
+            r
+        }
+    }
+    impl Device for FakeDev {
+        type RxToken<'a>
+            = RxTok<'a>
+        where
+            Self: 'a;
+        type TxToken<'a>
+            = TxTok<'a>
+        where
+            Self: 'a;
+        fn receive(&mut self, _t: Instant) -> Option<(RxTok<'_>, TxTok<'_>)> {
+            let (frame, flen) = self.inbound.take()?;
+            let n = flen.min(self.rx.len());
+            self.rx[..n].copy_from_slice(&frame[..n]);
+            let cap_buf: *mut [u8; CAP] = &mut self.cap_buf;
+            let cap_len: *mut usize = &mut self.cap_len;
+            let cap_mtype: *mut u8 = &mut self.cap_mtype;
+            Some((
+                RxTok { buf: &self.rx[..n] },
+                TxTok { buf: &mut self.tx[..], cap_buf, cap_len, cap_mtype },
+            ))
+        }
+        fn transmit(&mut self, _t: Instant) -> Option<TxTok<'_>> {
+            let cap_buf: *mut [u8; CAP] = &mut self.cap_buf;
+            let cap_len: *mut usize = &mut self.cap_len;
+            let cap_mtype: *mut u8 = &mut self.cap_mtype;
+            Some(TxTok { buf: &mut self.tx[..], cap_buf, cap_len, cap_mtype })
+        }
+        fn capabilities(&self) -> DeviceCapabilities {
+            // The EXACT shape the metal seams advertise (default checksum caps => verify on RX).
+            let mut caps = DeviceCapabilities::default();
+            caps.medium = Medium::Ethernet;
+            caps.max_transmission_unit = 1500;
+            caps
+        }
+    }
+
+    /// Parse a raw L2 frame's DHCP message type (option 53), or `0` if not a DHCP frame.
+    fn dhcp_mtype_of(frame: &[u8]) -> u8 {
+        let start = 42usize; // eth(14)+ip(20)+udp(8)
+        if frame.len() < start + 240 {
+            return 0;
+        }
+        let bootp = &frame[start..];
+        if !(bootp[236] == 0x63 && bootp[237] == 0x82 && bootp[238] == 0x53 && bootp[239] == 0x63) {
+            return 0;
+        }
+        let opts = &bootp[240..];
+        let mut i = 0usize;
+        while i < opts.len() {
+            let tag = opts[i];
+            if tag == 0xff {
+                break;
+            }
+            if tag == 0x00 {
+                i += 1;
+                continue;
+            }
+            if i + 1 >= opts.len() {
+                break;
+            }
+            let l = opts[i + 1] as usize;
+            if i + 2 + l > opts.len() {
+                break;
+            }
+            if tag == 53 && l >= 1 {
+                return opts[i + 2];
+            }
+            i += 2 + l;
+        }
+        0
+    }
+
+    /// BOOTP xid of an emitted DISCOVER frame (bytes 4..8 of the BOOTP header).
+    fn bootp_xid(frame: &[u8]) -> Option<u32> {
+        let b = 42usize;
+        if frame.len() < b + 8 {
+            return None;
+        }
+        Some(u32::from_be_bytes([frame[b + 4], frame[b + 5], frame[b + 6], frame[b + 7]]))
+    }
+
+    /// Build the synthesized OFFER (echoing `xid`) into `out`; returns its length. `with_server_id`
+    /// toggles the option-54 gate. Uses smoltcp's own wire emit so the checksums are always valid.
+    fn build_offer(out: &mut [u8; CAP], xid: u32, with_server_id: bool) -> usize {
+        let dhcp = DhcpRepr {
+            message_type: DhcpMessageType::Offer,
+            transaction_id: xid,
+            secs: 0,
+            client_hardware_address: EthernetAddress(OUR_MAC),
+            client_ip: Ipv4Address::UNSPECIFIED,
+            your_ip: YIADDR,
+            server_ip: SRV_IP,
+            router: Some(SRV_IP),
+            subnet_mask: Some(Ipv4Address::new(255, 255, 255, 0)),
+            relay_agent_ip: Ipv4Address::UNSPECIFIED,
+            broadcast: false,
+            requested_ip: None,
+            client_identifier: None,
+            server_identifier: if with_server_id { Some(SRV_IP) } else { None },
+            parameter_request_list: None,
+            dns_servers: None,
+            max_size: None,
+            lease_duration: Some(86400),
+            renew_duration: None,
+            rebind_duration: None,
+            additional_options: &[],
+        };
+        let dhcp_len = dhcp.buffer_len();
+        let mut dhcp_buf = [0u8; 400];
+        dhcp.emit(&mut DhcpPacket::new_unchecked(&mut dhcp_buf[..dhcp_len])).unwrap();
+
+        let udp_repr = UdpRepr { src_port: 67, dst_port: 68 };
+        let ip_repr = Ipv4Repr {
+            src_addr: SRV_IP,
+            dst_addr: YIADDR,
+            next_header: IpProtocol::Udp,
+            payload_len: udp_repr.header_len() + dhcp_len,
+            hop_limit: 64,
+        };
+        let caps = DeviceCapabilities::default().checksum;
+        let eth = EthernetRepr {
+            src_addr: EthernetAddress(SRV_MAC),
+            dst_addr: EthernetAddress(OUR_MAC),
+            ethertype: EthernetProtocol::Ipv4,
+        };
+        let eth_hdr = eth.buffer_len();
+        let ip_total = ip_repr.buffer_len() + ip_repr.payload_len;
+        let total = eth_hdr + ip_total;
+        for b in out[..total].iter_mut() {
+            *b = 0;
+        }
+        eth.emit(&mut EthernetFrame::new_unchecked(&mut out[..eth_hdr]));
+        {
+            let mut ipp = Ipv4Packet::new_unchecked(&mut out[eth_hdr..eth_hdr + ip_total]);
+            ip_repr.emit(&mut ipp, &caps);
+            let ip_hdr = ip_repr.buffer_len();
+            let udp_area = &mut ipp.payload_mut()[..udp_repr.header_len() + dhcp_len];
+            let mut up = UdpPacket::new_unchecked(udp_area);
+            udp_repr.emit(
+                &mut up,
+                &SRV_IP.into(),
+                &YIADDR.into(),
+                dhcp_len,
+                |b| b.copy_from_slice(&dhcp_buf[..dhcp_len]),
+                &caps,
+            );
+            let _ = ip_hdr;
+        }
+        total
+    }
+
+    /// Drive one OFFER variant through a fresh smoltcp dhcpv4 socket over the fake device. Returns
+    /// `(discover_xid, request_emitted)`.
+    fn run_variant(with_server_id: bool) -> (u32, bool) {
+        let mut dev = FakeDev::new();
+        let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(OUR_MAC)));
+        config.random_seed = 0x4e45_5434; // "NET4" — the seam's seed => the metal xid.
+        let mut iface = Interface::new(config, &mut dev, Instant::from_millis(0));
+
+        let mut storage: [SocketStorage; 1] = Default::default();
+        let mut sockets = SocketSet::new(&mut storage[..]);
+        let _handle = sockets.add(dhcpv4::Socket::new());
+
+        let mut t = 0i64;
+        iface.poll(Instant::from_millis(t), &mut dev, &mut sockets);
+        let xid = bootp_xid(&dev.cap_buf[..dev.cap_len]).unwrap_or(0);
+
+        let mut offer = [0u8; CAP];
+        let olen = build_offer(&mut offer, xid, with_server_id);
+        dev.inbound = Some((offer, olen));
+        dev.cap_mtype = 0;
+
+        let mut request = false;
+        for _ in 0..8 {
+            t += 100;
+            iface.poll(Instant::from_millis(t), &mut dev, &mut sockets);
+            if dev.cap_mtype == 3 {
+                request = true; // a REQUEST was emitted
+            }
+        }
+        (xid, request)
+    }
+
+    /// Run the NET-4j reproducer and emit the witness lines. Returns `true` iff both assertions hold
+    /// (well-formed OFFER -> REQUEST, server-id-less OFFER -> no REQUEST).
+    pub fn run(prefix: &str) -> bool {
+        let (xid, req_ok) = run_variant(true);
+        let (_, req_missing) = run_variant(false);
+        let pass = req_ok && !req_missing;
+        serial_println!(
+            "{} NET-4j reproducer: DISCOVER xid={:#010x} | well-formed OFFER => REQUEST={} | OFFER w/o server-id => REQUEST={} | {} ::",
+            prefix, xid, req_ok, req_missing,
+            if pass { "PASS" } else { "FAIL" }
+        );
+        pass
     }
 }
 

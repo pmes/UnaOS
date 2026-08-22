@@ -37,9 +37,22 @@ pub struct ErstTable {
 // init_interrupter().
 pub const EVENT_RING_SIZE: usize = 256;
 
-#[repr(C, align(64))]
+/// JETSON-XCARVE (boot-15 SNOC "Carveout Uncorrectable" FillWrite): the event ring's TRB segment is
+/// HEAP-allocated (`super::ring::allocate_ring`, 64-byte aligned, zeroed ⇒ every slot == `Trb::new()`),
+/// NOT an inline `[Trb; N]` array in this struct. When `EventRing` lived inline in the `static
+/// EVENT_RING`, its TRBs sat in kernel-image `.bss` — inside the *bootloader*-chosen image load extent
+/// (boot-15: `[0x25adea000, +0x18f000)`), which `HEAP-GUARD` does NOT vet for firewall carveouts the way
+/// it vets the heap. The CPU's ring-construction store into that un-vetted `.bss` then FillWrite-RASed on
+/// writeback (surfaced frames later by the VUGRAS DC-CIVAC sweep's cache churn; the fault ADDR is
+/// record-format per the bit-63 XCARVE erratum, so it read as `0x26b900000` — near DRAM top — not as the
+/// literal `.bss` PA). Every OTHER xHC DMA structure — command/transfer rings, DCBAA, scratchpad, per-slot
+/// contexts, HID buffers — is heap-backed; this makes the event ring uniform with them, inside the
+/// firewall-clean, DMA-window-resident heap.
+#[repr(C)]
 pub struct EventRing {
-    pub trbs: [Trb; EVENT_RING_SIZE],
+    /// Heap PA of the 64-byte-aligned ring segment (`EVENT_RING_SIZE` TRBs). The controller DMA-writes
+    /// events here; the CPU reads them via the volatile accessors below.
+    trbs: *mut Trb,
     pub dequeue_index: usize,
     pub cycle_bit: bool, // What we expect the hardware to write
     /// PIUSB-43: total TRBs ever consumed from this ring (monotonic, wrap-proof — `dequeue_index`
@@ -52,9 +65,13 @@ unsafe impl Send for EventRing {}
 unsafe impl Sync for EventRing {}
 
 impl EventRing {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
+        // Heap ring segment — see the struct doc for why the TRBs must NOT live in the static's .bss.
+        // `allocate_ring` zero-fills, so every TRB starts as `Trb::new()` (all-zero), matching the old
+        // inline `[Trb::new(); EVENT_RING_SIZE]` byte-for-byte.
+        let trbs = super::ring::allocate_ring(EVENT_RING_SIZE) as *mut Trb;
         Self {
-            trbs: [Trb::new(); EVENT_RING_SIZE],
+            trbs,
             dequeue_index: 0,
             cycle_bit: true, // xHCI starts writing 1s
             popped: 0,
@@ -75,15 +92,19 @@ impl EventRing {
         // ring is CPU-read-only, so clean+invalidate loses nothing; on x86_64 this is a no-op and the
         // read below is unchanged.
         dma_coherency::clean_inval(
-            &self.trbs[self.dequeue_index] as *const Trb as usize,
+            unsafe { self.trbs.add(self.dequeue_index) } as usize,
             core::mem::size_of::<Trb>(),
         );
         // Read the whole (aligned) TRB volatile — Trb is `packed`, so taking a reference
         // to an individual field is unaligned/illegal; copy it out, then read the field.
-        let trb = unsafe { core::ptr::read_volatile(&self.trbs[self.dequeue_index]) };
+        let trb = unsafe { core::ptr::read_volatile(self.trbs.add(self.dequeue_index)) };
         let cycle_state = (trb.control & 1) != 0;
         cycle_state == self.cycle_bit
     }
+
+    // (The tegra-only `has_event_after_invalidate` JB3 experiment was retired at the 2026-08-18
+    // sync: the general per-dequeue-TRB clean_inval inside `has_event` above supersedes it,
+    // covering the Pi too. No callers remained.)
 
     pub fn pop(&mut self) -> Option<Trb> {
         if !self.has_event() {
@@ -99,7 +120,7 @@ impl EventRing {
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
 
         // Volatile read of the DMA-written TRB (see has_event).
-        let trb = unsafe { core::ptr::read_volatile(&self.trbs[self.dequeue_index]) };
+        let trb = unsafe { core::ptr::read_volatile(self.trbs.add(self.dequeue_index)) };
 
         // Advance
         self.popped = self.popped.wrapping_add(1); // PIUSB-43 consumed-count witness
@@ -114,9 +135,28 @@ impl EventRing {
         Some(trb)
     }
 
-    /// Returns the physical address of the ring (assuming identity map)
+    /// Returns the physical address of the ring (identity-mapped; now a HEAP PA — see the struct doc).
     pub fn get_ptr(&self) -> u64 {
-        self.trbs.as_ptr() as u64
+        self.trbs as u64
+    }
+
+    /// PIUSB-40 necropsy (BOTLATCH), TRUNK-LANDING SEAM. The necropsy photographs an 8-slot window
+    /// around the dequeue position, and it used to index `ring.trbs[i]` directly — legal while the
+    /// ring segment was an inline `[Trb; EVENT_RING_SIZE]` array, and impossible once the segment
+    /// became a private heap pointer (the DMA-window move). Rather than re-open the field, the read
+    /// the necropsy actually needs is exposed as its own accessor, with the SAME two operations
+    /// every other consumer here performs: invalidate the slot's line(s) so a non-coherent bus
+    /// yields DRAM rather than a stale CPU copy, then copy the whole `packed` TRB out volatile (a
+    /// reference to one of its fields would be unaligned — see `has_event`).
+    ///
+    /// Read-only and index-checked: `i` is taken modulo the ring size, so a caller's window
+    /// arithmetic can never address outside the segment. Consumes nothing and moves neither
+    /// `dequeue_index` nor `cycle_bit` — a photograph, not a pop.
+    pub fn peek_slot(&self, i: usize) -> Trb {
+        let i = i % EVENT_RING_SIZE;
+        let slot = unsafe { self.trbs.add(i) };
+        dma_coherency::clean_inval(slot as usize, core::mem::size_of::<Trb>());
+        unsafe { core::ptr::read_volatile(slot) }
     }
 
     /// BOT-RESCUE M2: return the event ring to its post-`new()` state — every TRB zeroed AND the
@@ -137,16 +177,12 @@ impl EventRing {
     /// interrupter exists.
     pub fn clear(&mut self) {
         unsafe {
-            core::ptr::write_bytes(
-                self.trbs.as_mut_ptr() as *mut u8,
-                0,
-                EVENT_RING_SIZE * core::mem::size_of::<Trb>(),
-            );
+            core::ptr::write_bytes(self.trbs, 0, EVENT_RING_SIZE);
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             // XHCI-COHERENCE: the controller DMA-writes this ring; push the zeros out to DRAM so a
             // non-snooping master does not later fetch our dirty lines over its own events. No-op x86.
             dma_coherency::clean(
-                self.trbs.as_ptr() as usize,
+                self.trbs as usize,
                 EVENT_RING_SIZE * core::mem::size_of::<Trb>(),
             );
         }

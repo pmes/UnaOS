@@ -37,10 +37,23 @@ static LIVE: AtomicBool = AtomicBool::new(false);
 /// WITHOUT moving `GETINFO_TICK_HZ` is now a compile error, which is the whole point.
 pub const TICK_HZ: u64 = 250;
 
-/// Monotonic timer ticks since the heartbeat started. Read via `arch::ticks()`.
+/// Monotonic timer ticks since the heartbeat started. Read via `arch::ticks()` — and, through `ms()`
+/// (= `ticks() * 4`), the wall-clock budget arch-neutral code times against. So EXACTLY ONE core may
+/// advance it: the boot core (the global-clock owner). Every other GICv3 secondary that arms its own
+/// periodic tick (JC3, `arm_this_core_ap`) is registered LOCAL-ONLY in `AP_LOCAL_TICK` and bumps only
+/// its per-CPU `percpu.ticks`, never this — so N ticking APs do not inflate `ticks()`/`ms()` N×.
 static TICKS: AtomicU64 = AtomicU64::new(0);
 /// Down-counter reload value (CNTFRQ / TICK_HZ), computed once in `init`.
 static INTERVAL: AtomicU64 = AtomicU64::new(0);
+
+/// JC3 — bitmask (by linear `cpu_index`) of cores whose periodic tick is LOCAL-ONLY: they advance
+/// their own `percpu.ticks` (this core's scheduler clock, drives `sleep_ticks`/idle-wake) but NEVER the
+/// shared monotonic `TICKS`. Set by `arm_this_core_ap` when a GICv3 secondary arms its own tick; the
+/// boot core (global-clock owner) is never in it. GICv3/`virt`+tegra only — the Pi is GICv2 with every
+/// core bumping the shared clock as before, and this whole path is compiled out there, so the Pi image
+/// (and its `on_tick`) is byte-identical.
+#[cfg(not(feature = "pi"))]
+static AP_LOCAL_TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// The counter frequency (CNTFRQ_EL0), in Hz. On QEMU `virt` this is 62.5 MHz; on the Pi 4 the
 /// firmware programs it (19.2 MHz crystal-derived). Reading it instead of assuming keeps the tick
@@ -63,6 +76,17 @@ pub fn init() {
     let freq = cntfrq();
     // Guard against a firmware that left CNTFRQ unset (0): fall back to the QEMU virt value so the
     // tick is merely wrong-rate rather than a divide-by-zero / never-firing timer.
+    //
+    // ...but SAY SO. The banner below prints the SUBSTITUTED value, so a board whose firmware never
+    // programmed CNTFRQ produced a line reading `CNTFRQ=62500000 Hz` — indistinguishable from a
+    // correctly-programmed QEMU virt, while every wall-clock budget derived from it (verify_live's
+    // ~100 ms, the xHCI pump's timeouts, busy_delay_ms) is silently wrong by whatever ratio the real
+    // counter runs at. A substituted default that is never witnessed is a fabricated measurement.
+    // `tegra`-gated so the pi/virt images stay byte-identical.
+    #[cfg(feature = "tegra")]
+    if freq == 0 {
+        cntfrq_substituted(62_500_000);
+    }
     let freq = if freq == 0 { 62_500_000 } else { freq };
     let interval = freq / TICK_HZ;
     INTERVAL.store(interval, Ordering::Relaxed);
@@ -78,8 +102,14 @@ pub fn init() {
     // tick rate the clock now uses: 1 CNTVCT tick = 1/CNTFRQ s, so ms = CNTVCT/(CNTFRQ/1000).
     #[cfg(feature = "witness")]
     serial_println!(
-        "[uvug7] ms clock: CNTFRQ={} Hz (={} kHz per ms); ms=CNTVCT/(CNTFRQ/1000), core-count-independent",
-        freq, freq / 1000
+        // VUGSLOMO adds the ABI leg as FIELDS on this line and not as a line of its own — the
+        // line-neutral rule (d18d37c7) — because it is the same clock answering the same question one
+        // consumer further out. `abi_per_tick` is the divisor [`abi_ticks`] applies, and it is the
+        // FALSIFIER for this arc on either host: a boot whose `[el0live]`/`[vugfps]` pair still reads
+        // 4x apart with this divisor printed is a fault somewhere other than the unit.
+        "[uvug7] ms clock: CNTFRQ={} Hz (={} kHz per ms); ms=CNTVCT/(CNTFRQ/1000), core-count-independent; \
+         sys_getinfo ticks=CNTVCT/(CNTFRQ/{})={} (NOT the per-core-summed tick counter)",
+        freq, freq / 1000, TICK_HZ, freq / TICK_HZ
     );
 }
 
@@ -98,6 +128,23 @@ pub fn arm_this_core() {
     }
 }
 
+/// JC3 — arm a GICv3 SECONDARY's own periodic tick. Identical to `arm_this_core` (enable this core's
+/// timer PPI at its redistributor + start the periodic down-counter) but FIRST registers this core as a
+/// LOCAL-ONLY ticker in `AP_LOCAL_TICK`, so its `on_tick` advances only its per-CPU `percpu.ticks` and
+/// never the shared monotonic `TICKS`. This is the JC3 containment of the deferred double-count (the
+/// reason the AP tick was held back in JC2): several APs may now run their own idle-wake/preemptible
+/// tick — making each a self-driven scheduler participant instead of reschedule-SGI-dependent — without
+/// inflating the `ticks()`/`ms()` wall-clock budget. `INTERVAL` must already be set (the BSP's `init`
+/// ran first). GICv3 only; the Pi's per-core arm stays `arm_this_core` (shared clock, unchanged).
+#[cfg(not(feature = "pi"))]
+pub fn arm_this_core_ap() {
+    let cpu = super::percpu::this_cpu().cpu_index;
+    if cpu < 32 {
+        AP_LOCAL_TICK.fetch_or(1 << cpu, Ordering::Relaxed);
+    }
+    arm_this_core();
+}
+
 /// Per-tick handler, called from the GIC IRQ dispatch when INTID 30 fires. Re-arm first (which
 /// clears the timer's level-sensitive output so it doesn't immediately re-fire after EOI), then
 /// bump the tick counter. Lock-free; safe from interrupt context.
@@ -110,15 +157,38 @@ pub fn arm_this_core() {
 pub fn on_tick() {
     write_tval(INTERVAL.load(Ordering::Relaxed));
     unsafe { core::arch::asm!("isb", options(nomem, nostack, preserves_flags)) };
-    let prev = TICKS.fetch_add(1, Ordering::Relaxed);
     // Per-CPU tick, bumped by THIS core's timer only (each core arms its own periodic tick). It is
     // the scheduler's local clock: `sched::sleep_ticks` computes a wake deadline against this core's
     // count and the scheduler drains due sleepers against it, so a sleeper wakes on the core it
     // parked on regardless of the other cores' tick pace. Advances only on metal (QEMU raspi4b never
     // delivers the timer IRQ, so `on_tick` never runs there — hence tick-driven sleep is metal-only).
-    super::percpu::this_cpu().ticks.fetch_add(1, Ordering::Relaxed);
-    if prev == 0 {
-        serial_println!("AARCH64: timer heartbeat live (first tick).");
+    let local = super::percpu::this_cpu().ticks.fetch_add(1, Ordering::Relaxed);
+    // Shared monotonic `TICKS` (feeds `ticks()`/`ms()` wall-clock budgets): advanced ONLY by cores that
+    // are NOT registered LOCAL-ONLY. On the Pi (GICv2) that is every core, unchanged. On the GICv3
+    // `virt`/tegra path (JC3) the boot core owns it and each secondary armed via `arm_this_core_ap` is
+    // local-only, so multiple ticking APs do not advance the shared clock N×.
+    #[cfg(not(feature = "pi"))]
+    let local_only = {
+        let cpu = super::percpu::this_cpu().cpu_index;
+        cpu < 32 && (AP_LOCAL_TICK.load(Ordering::Relaxed) & (1 << cpu)) != 0
+    };
+    #[cfg(feature = "pi")]
+    let local_only = false;
+    if !local_only {
+        let prev = TICKS.fetch_add(1, Ordering::Relaxed);
+        if prev == 0 {
+            serial_println!("AARCH64: timer heartbeat live (first tick).");
+        }
+    } else if local == 0 {
+        // JC3 witness — one line the first time THIS secondary's per-core timer PPI delivers, quiet
+        // after (bounded to one line per AP: this branch runs only on that core's first tick). Proof
+        // the AP is now self-driven (its own tick re-polls the run queue) rather than SGI-dependent.
+        #[cfg(not(feature = "pi"))]
+        serial_println!(
+            ":: AARCH64 SMP: c{} timer PPI live (tick {}) ::",
+            super::percpu::this_cpu().cpu_index,
+            local + 1
+        );
     }
 }
 
@@ -128,10 +198,80 @@ pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
+/// VUGSLOMO — the [`TICK_HZ`]-rate tick count `sys_getinfo` hands EL0, derived from CNTVCT/CNTFRQ
+/// and NOT from [`ticks`]. Core-count-independent, and live even where the tick IRQ is not.
+///
+/// THE BUG THIS EXISTS TO CLOSE, and it is UVUG-7 (P52) again, one caller further out. [`ticks`] is
+/// the GLOBAL counter and [`on_tick`] bumps it from EVERY core's periodic timer IRQ, so on 4-core
+/// BCM2711 metal it advances at `4 * TICK_HZ` = ~1000 Hz. `sys_getinfo` handed that counter to EL0
+/// RAW while `una_abi::GETINFO_TICK_HZ` told ring 3 to divide by 250 — so every ring-3 program that
+/// reads the field measured time 4x FAST and any rate it computed came out 4x LOW.
+///
+/// The ABIFREEZE assert beside `sys_getinfo` could not catch this and still cannot: it checks
+/// `GETINFO_TICK_HZ == TICK_HZ`, which is the rate each core ARMS its timer at, and both sides of
+/// that equation were always 250. The divergence was never in the constant — it was that the
+/// quantity being published was a SUM over cores rather than a clock. So the fix is on the
+/// publishing side, and the assert keeps its meaning: this function's unit IS `TICK_HZ`.
+///
+/// MEASURED (R24 boot6, PA43 metal, hw-pi4@6de03c87): `[vugfps] wf=` alternated 1,2,1,2 for 818
+/// consecutive samples while `[wcn] win=6 asid=0x1` reported the SAME window presenting at 5.8-6.0/s
+/// with `gap=144..231ms` — the exact 4x, and the alternation is a ~6 fps rate sampled over the
+/// 0.25 s window the wrong divisor opens. PA42 (boot5) reads the same way: `wf=25..41` against
+/// `[wcn] rate=96..164/s`. The vug's own meter doc names this disagreement as the finding it was
+/// built to make; this is that finding's other end.
+///
+/// IT IS NOT ONLY A READOUT. `user-vug`'s LOD ladder consumes the meter's number: `rate < LOD_DOWN`
+/// (24) drops a rung and `rate * 4 < LOD_DOWN` drops TWO, `rate > LOD_UP` (55) climbs one. Against a
+/// 4x-low rate those thresholds sit at 96 and 220 REAL fps, so on the Pi the ladder ran with its
+/// step-up unreachable and its double-step-down permanently armed (boot6 `[vuglod] lvl=1001` then
+/// `lvl=1`: level 3 -> 1 -> 0 inside two windows), and PA42's 25..41 straddled the 24 edge — which is
+/// the fps SWING that boot's operator reported. One divisor, both complaints.
+///
+/// CNTVCT is immune to both faults CNTFRQ-derived clocks were reached for before: it counts at
+/// CNTFRQ_EL0 no matter how many cores tick, and it counts on QEMU raspi4b where the tick IRQ is
+/// never delivered at all (there [`ticks`] stays 0 forever, so the meter's `now > *ticks` gate never
+/// opened and the readout never refreshed — the same silence the old `ms()` had).
+///
+/// `cntfrq() / TICK_HZ` is exact on both paths (54 MHz / 250 = 216 000; QEMU virt 62.5 MHz / 250 =
+/// 250 000). A zero CNTFRQ — no generic timer — yields 0 rather than dividing by it; ring 3 reads a
+/// frozen clock and skips its update, which is the same shape as the pre-heartbeat case.
+#[inline]
+pub fn abi_ticks() -> u64 {
+    let per_tick = cntfrq() / TICK_HZ;
+    if per_tick == 0 { 0 } else { super::now_cycles() / per_tick }
+}
+
 /// Whether the timer IRQ was confirmed delivering (see `verify_live`). The idle path branches on it.
 #[inline]
 pub fn is_live() -> bool {
     LIVE.load(Ordering::Relaxed)
+}
+
+/// HID-REGRESS-B12 — does THIS core have its OWN periodic timer PPI armed (JC3 `arm_this_core_ap`)?
+///
+/// The global `LIVE` flag reflects the BOOT CORE's timer only: the Jetson JM6 EL2->EL1 drop clears it
+/// (`set_not_live`) because the boot core's physical timer is switched off there. But a GICv3 SECONDARY
+/// that armed its own local-only tick (registered in `AP_LOCAL_TICK`) still has a live 250 Hz wake
+/// source of its OWN, independent of the boot core. Without this distinction such a secondary falls into
+/// the `LIVE == false` poll-spin branch of `arch::hlt` post-drop and BUSY-SPINS its `run()` idle loop
+/// (re-attempting a work-steal every iteration) instead of parking in WFI until its next tick — and five
+/// cores hammering the shared run-queue spinlocks/atomics saturate the interconnect, starving the boot
+/// core's cooperative xHCI HID poll (the boot-12 "keyboard+mouse armed but ZERO deliveries" regression).
+/// Reporting the local tick here lets `hlt` WFI-park such a core (bounded to one ~4 ms tick), so it stays
+/// self-scheduling yet idle-quiet, and input coexists. The boot core is never in `AP_LOCAL_TICK`, so its
+/// timerless post-drop poll-spin is unchanged. Pi (GICv2, no `AP_LOCAL_TICK`) always reads false — the
+/// Pi idle path is byte-identical.
+#[inline]
+pub fn this_core_has_local_tick() -> bool {
+    #[cfg(not(feature = "pi"))]
+    {
+        let cpu = super::percpu::this_cpu().cpu_index;
+        cpu < 32 && (AP_LOCAL_TICK.load(Ordering::Relaxed) & (1 << cpu)) != 0
+    }
+    #[cfg(feature = "pi")]
+    {
+        false
+    }
 }
 
 /// Clear the liveness flag. Used by the Jetson (tegra) EL2->EL1 drop, which disables the physical
@@ -184,6 +324,16 @@ pub fn cntp_ctl() -> u64 {
     v
 }
 
+/// Raw CNTP_CVAL_EL0 — the comparator the down-counter (TVAL) writes resolve to. Diagnostic only
+/// (the `[wedgeprobe]` witness): `cval <= cntpct()` with ENABLE=1/IMASK=0 means the timer's output
+/// line SHOULD be asserted right now. Per-core banked, like every CNTP_* register.
+#[inline]
+pub fn cntp_cval() -> u64 {
+    let v: u64;
+    unsafe { core::arch::asm!("mrs {}, CNTP_CVAL_EL0", out(reg) v, options(nomem, nostack, preserves_flags)) };
+    v
+}
+
 /// Free-running physical counter CNTPCT_EL0. Diagnostic / busy-delay only.
 #[inline]
 pub fn cntpct() -> u64 {
@@ -215,5 +365,16 @@ pub fn diagnose() {
         istatus as u8,
         TIMER_INTID,
         super::gic::ppi_pending(TIMER_INTID),
+    );
+}
+
+// ── CNTFRQ-SUB witness (tail-defined per the Location-shift convention; `tegra`-gated so the pi and
+// QEMU-virt images stay byte-identical). See `init`: the fallback is correct, its silence was not.
+#[cfg(feature = "tegra")]
+#[inline(never)]
+fn cntfrq_substituted(used: u64) {
+    serial_println!(
+        ":: tegra: CNTFRQ-SUB — CNTFRQ_EL0 reads 0 (firmware never programmed it); SUBSTITUTING {} Hz for the tick + EVERY wall-clock budget derived from it — the banner's CNTFRQ below is this substitute, NOT silicon ::",
+        used
     );
 }

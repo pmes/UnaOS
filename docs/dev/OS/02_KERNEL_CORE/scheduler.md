@@ -2448,9 +2448,625 @@ all. The x86 legs prove the code type-checks and the witness is bounded; the pla
 behaviour itself is metal-only, and is stated so rather than dressed in a gate that cannot
 fail.
 
+### The steal half, ported to the Pi (aarch64, VUGSPREAD-PI)
+
+`exec-vugspread`, closing PARITY.md §6.6c. The full write-up — including the piece-by-piece verdict
+on each half of x86's VUGSPREAD and the corrected reading of the metal capture the arc was opened on
+— is [PARITY.md §6.7](../08_VIDEO/PARITY.md). What belongs here is the scheduler mechanics.
+
+**The gap was not "the Pi has a worse scheduler".** For PLACEMENT the Pi has a considerably more
+elaborate one: SPREAD-3…SPREAD-14 above have no x86 twin. What it lacked is the correction x86 does
+with `try_steal`, and the reason the two are not interchangeable is one sentence: **`make_ready` →
+`rewake_place` can only correct a task that SLEEPS.** SPREAD-6's escapement already saw part of this
+and put micro-park wakes on a 250 ms re-ask clock, but a thread that is genuinely CPU-bound between
+presents — a vug worker ray-tracing its share of the shard — does not park at all, never reaches
+`make_ready`, and its spawn-time core was therefore permanent.
+
+**Three changes, and the third is the one a port would drop.**
+
+1. **`spawn_user_thread` is `steal_ok = true`.** A ring-3 `place` argument is a locality HINT in the
+   only vocabulary `SYS_THREAD_SPAWN` has; marking the resulting core a PIN promoted it into a kernel
+   guarantee. The old justification — "EL0/slot tasks carry per-core TTBR0/ASID state" — had been
+   false since SPREAD-4, which MOVES parked EL0 tasks between cores and writes out why that is sound
+   (`user_ttbr0` is a value the task carries, `dispatch_next` installs it on whichever core runs the
+   task, the old core's residual root is benign because slot L1s are a static array and teardown
+   broadcasts `tlbi aside1is`). EL0 **slots** stay pinned deliberately: a windowed app parks on input
+   every frame, so the rewake lane genuinely serves it.
+
+2. **The floor is per-victim** (`sched_spread::steal_floor`), not the constant `STEAL_MIN_DEPTH = 2`.
+   A run queue holds only READY tasks — the running task is in `current` — so a flat floor of 2 needs
+   THREE runnable tasks before a core reads as loaded, and two-on-one packing sits at depth ONE.
+   Victim running ⇒ floor 1; victim between tasks ⇒ floor 2, which is the ping-pong case the constant
+   was actually reaching for. The floor is re-asked under the victim's own lock, not carried from the
+   peek: the victim may have gone idle in between, and then the stricter floor is the right one.
+
+3. **The SPREAD accounting is carried across the move.** `try_steal` retargets `task.cpu`; on x86
+   that is the whole re-home. Here it is not. SPREAD-3's `EL0_RESIDENTS` and SPREAD-10's
+   `SLOT_CORE_RES` are commitments released at exit **against `task.cpu`**, so a stolen EL0 thread
+   whose credit stayed behind would grow the old core's count without bound and saturate the new
+   core's at zero — and every subsequent `pick_cpu_slot` and `rewake_place` decision would steer
+   around load that is not there, permanently. Both credits transfer at re-home in `make_ready`'s
+   order (resident, then slot), and `place_cyc` is re-stamped because a steal IS a placement decision
+   — without that, the task's next wake finds a stale refresh clock and re-asks immediately, fighting
+   the move just made. `EL0_PARKED` needs no transfer: a task in a run queue is READY by construction.
+
+**The brake is not optional.** VUGSPREAD-COOL (per-task `migrations` + `migrate_ms`, window
+`16 ms << min(migrations, 4)`) is what makes the relaxed floor safe, and it is the half that matters
+on an IDLE machine: with the floor at 1 there is almost always something to take, so without the
+brake two empty cores trade one task forever. `migrate_ms == 0` always clears, so the FIRST corrective
+steal — the repair itself — is never delayed; only re-steals are damped.
+
+**What moved to shared code.** The policy above was `const`s and `fn`s inside `arch/x86_64/sched.rs`,
+which is precisely why the Pi never had it. It is now `crates/kernel/src/sched_spread.rs`
+(`STEAL_MIN_DEPTH`, `STEAL_COOLDOWN_MS`, `STEAL_COOLDOWN_ESC_CAP`, `steal_floor`, `steal_cooldown_ms`,
+`steal_cooled`), with no `cfg(target_arch)` in the file. Both schedulers call in; each keeps only what
+is genuinely arch-bound (how you ask "is this core running something", where milliseconds come from).
+x86 behaviour is unchanged — its constants became re-exports and its functions one-line delegations.
+
+**Witness.** `[spread4]` gains `steal= d1= remig= cool= pack=` on the same line as `rewake=`/`stay=`,
+because `rewake` and `steal` are two lanes of one question and a spinning worker can only appear in
+the second. `d1` is the floor repair's own attribution — moves taken from a victim at locked depth 1,
+i.e. the ones the constant would have refused. Health is `steal` stepping at convergence edges with
+`remig` near zero; the revert criterion is `remig` tracking `steal` while `cool` also climbs, which
+is a brake refusing and serving the same oscillation. Per-move lines read
+`:: [smpbal] steal 'name' cX->cY (m=N) ::`.
+
+**QEMU gates this one, and decisively.** `VUGSPREAD: floor test` stages exactly TWO steal-eligible
+tasks on one core with the rest idle and requires them to run on >= 2 distinct cores. On the pre-arc
+floor that reads `cores-used=1` on every boot, not occasionally — the leg is an A/B, not a sample.
+(The `[spread4]` census itself still reads all-zero in the battery, for the reason its own comment
+gives: the only site that emits it on raspi4b runs before any EL0 task exists. The numbers that matter
+are metal.)
+
+**FLAKEHUNT — the leg asserted the move but measured the sibling's host timeslice (`exec-flakehunt`,
+off `5d7ff0c8`).** The claim above is right and the staging is right; the *observation* was not. Both
+ends of the window were blind wall-clock guesses, and one of them was three milliseconds wide: the
+leg slept 2 ms assuming `home` had picked the first task up, and the worker spun 5 ms, so the state
+the corrector must SEE — `home` running task one with exactly one ready behind it — existed for the
+~3 ms remainder. A sibling can only convict inside that remainder, and only while its own vCPU is on
+a host CPU. `busy_delay_ms` is CNTPCT, which under QEMU advances with the HOST clock whether or not
+the guest core is executing, so on a loaded host that 3 ms could pass with an idle sibling running no
+instructions at all — `cores-used=1`, and a FAIL that convicted the host's run queue rather than this
+kernel's. Two independent Pi seats measured it at roughly **one red in four runs** of an otherwise
+117/117 suite.
+
+The repair changes neither the staging nor the pass condition (still "the pair ran on >= 2 distinct
+cores", still reachable only through `try_steal` at victim depth 1). It changes how the leg *looks*:
+
+1. **The second spawn is gated on an observation, not a delay.** Task two is queued only once task
+   one has been seen running. A lone ready task at depth 1 on an idle victim is below
+   `STEAL_MIN_DEPTH` under *both* floors, so a set bit can only mean `home` dispatched it. This
+   strictly **sharpens** the A/B the blind 2 ms could lose in the other direction — a `home` that had
+   not yet dispatched left the queue at depth 2 with the victim idle, which the pre-arc constant
+   floor also cleared, so a stubbed build could have gone green by being slow.
+2. **The window is ~25 ms, not ~3 ms** (the worker's spin *is* the window).
+3. **The attempt is retried up to 4 times, and the count is published as `tries=`.** A retry cannot
+   manufacture a pass: the pre-arc floor declines identically on every attempt.
+
+Line shape, `tries=` inserted after `depth=1` and keyed by the spec's REQUIRE so it cannot silently
+disappear:
+
+```
+:: VUGSPREAD: floor test — tasks=2 cores-used=2 depth=1 tries=1 :: PASS ::
+```
+
+**Go-red proven by stubbing**, not asserted: with `try_steal`'s two `steal_floor(running)` calls
+replaced by the pre-arc constant `STEAL_MIN_DEPTH`, the retried leg reports
+`cores-used=1 depth=1 tries=4 :: FAIL` — all four attempts refused — and reds both the REQUIRE and
+the FORBID (116/117 required, 2 forbidden hits). On metal a `tries=` that starts climbing is itself a
+spread reading this leg would otherwise have reported as a clean PASS.
+
+### SPREADTUNE — the brake was measuring the wrong clock (aarch64, `exec-spreadtune`)
+
+`exec-spreadtune`, off `180375ec`. The tune the §6.8f ruling called for, taken on the mechanism
+rather than on a constant. **No number in `sched_spread.rs` changes, and neither does the floor.**
+
+**The evidence, and why it was read wrong.** Two metal sittings meet §6.7's revert criterion for the
+relaxed floor on their face — PA42 boot5 `steal=1600 d1=1251 remig=1585 cool=68598` and PA44
+`steal=1121 remig=1107 d1=879`, i.e. `remig/steal ≈ 0.99` with `cool` climbing beside it. That is
+also the convicted mechanism behind the vug fps swing (25–41) the bench reports as jerky: the worker
+migrates, warms, is remigrated, repeats.
+
+**First question asked, because the brief demanded it: is the cooldown actually consulted?** Yes.
+`steal_one` calls `sched_spread::steal_cooled` on every candidate and bumps `cool` on every refusal;
+the brake is wired and firing. The leak is elsewhere, and it is structural.
+
+**The convicted defect: the governed population has TWO movers, and the brake only ever saw one.**
+VUGSPREAD-PI's own change #1 made `spawn_user_thread` mark an EL0 thread `steal_ok = true`. Such a
+thread also has `user_entry != 0`, so it is simultaneously:
+
+* **steal-eligible** — `try_steal` may move it, and stamps `migrate_ms` when it does; and
+* **an EL0 task** — so it also travels `make_ready`'s SPREAD-4 rewake lane, which retargeted
+  `task.cpu` and stamped **nothing**.
+
+So the residency window the brake enforces was measured from the last **steal**, never from the last
+**move**. A worker stolen onto c1, rewake-placed back onto c2 five milliseconds later, then stolen
+again the instant its stale steal-stamp aged out, pays three migrations while the brake accounts for
+one residency. The two correctors were overruling each other inside the very window the brake exists
+to guarantee, and neither could see the other. Before VUGSPREAD-PI the populations were disjoint
+(every EL0 task was `steal_ok = false`), which is exactly why the brake was sound when written and
+stopped being sound when the steal half landed.
+
+**And `remig` cannot falsify anything on its own.** It counts steals of a task that has *ever* moved.
+Once every steal-eligible worker has migrated once — which a small, long-lived worker pool reaches in
+the first second — `remig/steal → 1` is arithmetically forced no matter how strong the brake is. The
+ratio is a saturation artefact, not a measurement. `cool` compounds this: `steal_one`'s `position`
+closure bumps it once per *cooled candidate inspected per scan*, over millions of idle passes, so
+`cool = 42 × steal` says nothing about suppression pressure either. The revert criterion was built on
+two fields that cannot distinguish a working brake from a broken one.
+
+**The tune: both movers arm one clock.** `make_ready`'s rewake branch now calls `note_migration` and
+stamps `task.migrate_ms`, gated on `task.steal_ok` — exactly the population `steal_cooled` governs (a
+pinned EL0 slot task can never be stolen, so stamping it would only pollute the new statistics). A
+task just placed anywhere, by either lane, owns its new core for its cooldown window before the other
+lane may take it back. That is the residency contract `steal_one`'s doc-comment already claimed;
+it is now true for the whole move population instead of half of it.
+
+`migrations` is deliberately **not** bumped by a rewake move. The escalation ladder counts steal-lane
+corrections of one task; a rewake move is a different corrector's decision, with its own escapement at
+`PLACE_REFRESH_MS`/`REWAKE_MIN_PARK_MS`. A rewake move therefore can never drive a task to the 256 ms
+terminal window on its own.
+
+**The SMP-placement invariant is held, by construction.** The floor is untouched, no core becomes less
+visible as a victim, and `d1` — the floor repair's own attribution, 879–1251 on metal — is unaffected.
+More to the point, the change **cannot reach the population VUGSPREAD-PI was built for**: a worker
+that spins flat out never parks, never enters `make_ready`, and behaves identically. The tasks the new
+stamp governs are precisely the ones that already had a corrector.
+
+**The price, stated.** A task whose *first* move came from the rewake lane now waits one base window —
+16 ms, a single frame — before a corrective steal may take it, where before it was immediately
+eligible. The "first corrective steal is never delayed" property is preserved for a task that has
+never moved at all (`migrate_ms == 0`), which is the case the property was written for.
+
+**x86 is not changed** (lane discipline: this seat owns `arch/aarch64`). `arch/x86_64/sched.rs` has
+the same two-mover shape and the same leak; `sched_spread.rs` is untouched by this arc precisely so
+that the rmbp seat's decision stays open.
+
+#### The wire test
+
+`[spread4]` gains four raw words after `pack=`, and they replace `remig`/`cool` as the reading:
+
+```
+… steal= d1= remig= cool= pack= rwstamp= residn= residmin=Nms residavg=Nms
+```
+
+* `rwstamp` — rewake-lane moves that armed the brake, i.e. **the size of the closed leak**. `rwstamp`
+  comparable to `steal` is the direct measurement that the brake was seeing roughly half this
+  population's moves.
+* `residn` / `residmin` / `residavg` — residencies **ended across both movers**, in milliseconds: the
+  ping-pong period itself, as a duration. `residn` is the sample count that makes the other two
+  legible; a `residn` of zero prints `residmin=0ms residavg=0ms` rather than a sentinel.
+* **Reading rule.** `residavg` well above `STEAL_COOLDOWN_MS` with `residmin` at or above it is a
+  fleet that settles. `residavg` collapsing toward single-digit milliseconds while `steal` climbs is
+  the ping-pong — now visible as a duration rather than inferred from a ratio that cannot fall. A
+  rewake-lane move may legitimately end a short residency (its own escapement bounds it, not this
+  one), so read `residmin` *with* `rwstamp`.
+
+**The metal falsifier, and QEMU's honest limit.** The verdict is the next metal boot: `[vugfps] wf`
+spread narrowing, with `residavg` risen and `[spread4]`'s shape changed. **QEMU raspi4b cannot supply
+it** — no Group-1 IRQs or IPIs, so no real SMP contention shape — and on that host the `[spread4]`
+census reads all-zero for the reason the VUGSPREAD-PI section above already records: the only site
+that emits it on raspi4b runs before any EL0 task exists. A QEMU capture therefore proves the fields
+are wired and the fleet did not regress. It does not judge the tune.
+
+**Knob-off behaviour is NOT byte-identical, and that is deliberate.** `try_steal` and `make_ready` are
+unconditional scheduler paths — the spread machinery rides no knob; only its `[smpbal]`/`[spread4]`
+per-move witness lines are `pi`-gated. A scheduler tune that only applied under a video knob would be
+the wrong shape.
+
+### STARVE1 — the permanent starvation of dsktp boot 8 was a WEDGE, and SPREADTUNE is exonerated (aarch64, `exec-starve`)
+
+`exec-starve`, off `0d865227`. The brief sent this seat after a NEW permanent-starvation class in the
+dsktp boot-8 metal capture (`~/unaos-bench/capture/pi4-pi1-b1/ttyACM0.log`, boot-8 window from raw
+line 56087). The conviction was reachable from capture + source, and it lands somewhere the brief's
+suspect list did not: **the scheduler is not the defect, and today's own change is not implicated.**
+
+**The verdict, and the two lines that carry it.** The terminal run reads
+
+```
+[el0live] verdict=STARVED el0 runnable/parked/committed=1/0/1 last_disp=234780ms ... kill_offcpu=18 corrupt=0 nopark=0
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=1/1 ... steal=19 d1=11 remig=6 cool=6 rwstamp=0 residn=6
+```
+
+(boot-8-window lines 2533 and 2519). **The brief's premise that `[spread4]` reports all four cores at
+zero is a misreading of a single transitional line.** For the whole 250 s terminal run `[spread4]`
+reports **`c3=1/1`** — one committed EL0 resident on core 3, unparked. There is no census divergence
+to explain: `[el0live]` counts `el0_active` summed over cores and `[spread4]` prints the same
+`el0_active` per core, so `runnable=1` and `c3=1/1` are the SAME word, and they agree. The task is
+exactly where the scheduler thinks it is.
+
+**What is wrong is core 3.** Every one of boot 8's twenty-one `[spin1]` prints — from `span=14874ms`
+(line 1588) to `span=274869ms` (line 2517) — is **byte-identical apart from the span field**:
+
+```
+[spin1] cpu=3 span=…ms task=99:input state=1 park=0 | … | disp busy=197 idle=2663 | irq total=3081 last=30 unhandled=0 … | sched phase=6 passes=2860 futex_stalls=0
+```
+
+`sched passes=2860` frozen, `irq total=3081` frozen, `disp busy/idle` frozen, across 260 seconds.
+Phase 6 is `SPIN8_TASK` — *switched into a task*. Core 3 entered task `99:input` and never completed
+another scheduler pass, and took no interrupt, not even its own timer. That is the SPIN-1/SPIN-7/
+SPIN-8 wedge signature exactly as those instruments were built to read it.
+
+**Why the wedge is TERMINAL for the EL0 task, which is the genuinely new part.** An EL0 *slot* task is
+created `steal_ok: false` (`arch/aarch64/sched.rs`, in `spawn_user_inner`'s `Task` initialiser — "left pinned
+deliberately — VUGSPREAD releases THREADS, not slots"). `RunQueue::steal_one` skips every task whose
+`steal_ok` is false. So the one mechanism that could rescue a runnable task from a dead core —
+an idle sibling's `try_steal` — is by construction forbidden from touching it. While other EL0 tasks
+lived, EL0 kept being dispatched on the surviving cores and the wedge was invisible. The operator's
+vug open/close churn (`kill_oncpu=4 kill_offcpu=18`, exits 67→68) reaped them one at a time until the
+**last survivor happened to be the one pinned to the dead core**, and at that instant EL0 stopped
+forever. The kill churn is the *selector*, not the cause; the wedge predates it by ~250 s.
+
+**SPREADTUNE (`cb628006`) is exonerated by the capture itself, not by argument.** Its entire new code
+path is the `task.steal_ok`-gated stamp in `make_ready`'s rewake branch, and its wire field for that
+path reads **`rwstamp=0`** on every `[spread4]` line in boot 8. The added code never executed. It also
+could not have reached this task even in principle: the starved task is `steal_ok: false`, which is
+the gate's own false arm. Suspect #1 is dismissed on evidence.
+
+**Suspects #2 and #3 are likewise not reached.** `corrupt=0 nopark=0` for the whole run says the reap
+path lost no task and left none unparked, and `DRAIN RESCUED (freed=1 pending=0)` fired earlier in the
+same boot, so the retire/drain path demonstrably works. The task was not lost from a queue — the
+census says it is still on core 3, which is precisely the problem.
+
+**Root cause of the wedge itself is OUT OF THIS LANE and remains open.** Why `99:input` stops
+returning with interrupts masked is a question for the input/serial-RX backstop path, not
+`arch/aarch64/sched.rs`. This arc does not guess at it.
+
+**The USB-storage EL0 starvation near boot (`rdcap=14562ms`, spin+hlt pump) is a DIFFERENT class** and
+is not conflated here: it was transient and recovered, whereas this one never does.
+
+#### The instrument: `[starve1]`
+
+Rather than build an unvalidatable evacuation path into the scheduler on the strength of one capture,
+this arc ships the discriminator that names the mechanism on the *next* boot, on one line, without a
+source audit. `starve1_probe` is called from the tail of `el0live_witness` with the current verdict.
+
+**It is a DELTA, not a snapshot** — the necessary design point. A frozen `passes` value proves nothing
+read once, so the probe **arms** on the first STARVED window (snapshotting `SCHED_PASSES` and
+`gic::IRQ_TOTAL` for every core) and **fires** on the second, printing the pair across the interval:
+
+```
+[starve1] episode=N cpu=3 act=1 res=1 phase=6 passes=2860->2860 irq=3081->3081 cur=99:input — WEDGE: …
+[starve1] episode=N cores_named=1 verdict=WEDGE | machine steal= d1= cool= rwstamp= pack= — …
+```
+
+**The reading rule:**
+
+* `passes=X->X` (frozen) on the core holding the runnable resident → **WEDGE**. The placement lane is
+  blameless; go where the core died. `cur=` names the task that stopped returning.
+* `passes=X->Y` (advancing) and the resident still not dispatched → **PLACEMENT**. The core is alive
+  and refusing; the spread/run-queue/affinity lane has a case to answer, and the machine-wide
+  `steal=/cool=/rwstamp=` on the second line are on the same wire to convict or clear it without
+  hunting a nearby `[spread4]`.
+* `cores_named=0` → **CENSUS-SPLIT**: `runnable>0` machine-wide while no core reports a runnable
+  resident. That would be a third finding and a bug in the census itself.
+
+**One line per episode.** The latch disarms the instant the verdict leaves STARVED, so a 250 s freeze
+costs two lines, not the ~170 that a per-window print would have produced. `[el0live]` keeps printing
+every window — it is the clock; `[starve1]` is the cause, stated once.
+
+**Cost and safety.** Two relaxed loads per core per STARVED window, three relaxed stores per episode.
+Nothing on a dispatch, wake, or steal path is touched. **No lock is taken** — a witness that can block
+on the scheduler's own lock can hang the machine it is diagnosing — and the one `current` deref
+follows `[spin1]`'s established rule (a task still current across two witness windows is not
+mid-drop). Not knob-gated: it rides `el0live_witness`, which is unconditional.
+
+**QEMU's honest limit, stated.** raspi4b **cannot reproduce this class and cannot judge the
+instrument's verdict.** It has no Group-1 IRQs or IPIs, no real SMP contention shape, and its
+`[spread4]`/`[el0live]` emit sites run before any EL0 task exists — so the census reads all-zero, the
+STARVED verdict never fires, and `starve1_probe` never leaves `STARVE1_IDLE`. QEMU proves the code
+compiles and the strings are linked into the image (`strings` on `kernel8.img`); it proves nothing
+else. **The verdict is the next metal boot that starves.** If that boot prints `verdict=WEDGE` with a
+frozen `passes` pair, this reading is confirmed and the next arc belongs in the input path; if it
+prints `verdict=PLACEMENT`, this reading is falsified and the scheduler is back under suspicion.
+
+### INWEDGE — what the wedge under STARVE1 actually was: the input router held the panel lock across a dispatch (aarch64, `exec-inwedge`)
+
+STARVE1 above ends by naming the next question: *if the wedge is real, the next arc belongs in the
+input path.* This is that arc, and the answer is yes — with a mechanism, a fix and a go-red.
+
+**The prior was refuted first.** The suspect going in was the WHEEL/WHEELZOOM routing that landed
+the same day: a focused vug dying mid-scroll, the input task delivering a wheel detent into a ring
+whose owner was being torn down. The boot-8 wire refuses it outright, and does so three times over:
+
+* `[wheel1]` — the wheel census, edge-triggered on `decoded + routed + nofocus` — **never printed**,
+  in boot 8 or anywhere else in `pi4-pi1-b1/ttyACM0.log`. Not one wheel byte was decoded, routed, or
+  dropped for want of focus.
+* `[piusb26]` — the xHCI pump's cost line, rate-limited to one print per 5 s — printed **exactly
+  once** in boot 8, at byte 6501 of the boot, and never again. `usb-pump` is spawned on `input_cpu`,
+  the same core the wedge took: the pump made one pass and died with the core. After that instant no
+  HID report of any kind — motion, button or wheel — was pumped at all.
+* No `[piusb24]`, no `[el0in]`, no `[cursor] armed`, no `[vugzoom]`. Every `[clickroute]`, `[wm-act]`
+  and `[drag]` line in the freeze window carries `settle=noproc-selftest` or `dragperf`: synthetic
+  fixture events, not hardware.
+
+Boot 8 never delivered a single real pointer report. There was no scroll to race with, and the
+wheel arc is exonerated.
+
+**What the capture does support.** `[spin1] cpu=3 task=99:input state=1 park=0 … sched phase=6
+passes=2860` with `irq total=3081 last=30`, every counter byte-identical across 21 prints spanning
+14.8 s to 465.3 s. Phase 6 is `SPIN8_TASK` — the core was inside a task, not inside its own scheduler
+loop. INTID **30** is the generic-timer PPI: the last thing core 3 did was take a timer interrupt and
+never leave it. A frozen IRQ total is the SPIN-7/SPIN-8 masked-spin signature. All three
+already-witnessed masked spins read clean on that capture (`sem_stalls=0`, `futex_stalls=0`, no
+`[wedge4] preempt-in-section` line), so the spin was on a raw `spin::Mutex` that none of
+WEDGE-4/5/6 watches. Everything pinned to that core died with it: `rx-backstop` frozen at
+`bs_phase=1 bs_loops=2`, `status-tick` and `usb-pump` never dispatched again.
+
+**The interleaving, on one core.**
+
+1. `usb-pump` (input core, `PRIO_SERVICE`) runs the FOCUS-VIS cursor keep-alive inside
+   `route_input_to_active_el0`. It reads panel geometry out of `video::WRITER` (`pal_width_hint` /
+   `pal_height_hint`) and repaints the sprite through `video::cursor::repaint`, whose `refresh_locked`
+   takes `WRITER` again. All of it acquired **blocking, with interrupts enabled**, from a preemptible
+   kernel task.
+2. The quantum tick lands inside that section. `timer_preempt` marks the task READY and switches to
+   the scheduler, which requeues it. The task is now off-CPU **still holding `WRITER`**.
+3. The core dispatches its band peer, `input`.
+4. The next timer tick lands with `input` current. `timer_preempt` calls `load_witness_tick`, whose
+   emit is a `serial_println!` — and that print's panel mirror takes `WRITER` with a **blocking**
+   acquire, inside the IRQ vector, masked.
+
+   > **Correction (LOCKFIX).** This step originally named `video::fbcon::_print` as the blocking
+   > acquirer. That is wrong: `fbcon::_print` takes `FBCON.`**`try_lock`** (`video/fbcon.rs:1244`)
+   > and `serial::_print` takes `SERIAL_PORT.`**`try_lock`** — neither can block, so neither can be
+   > the spinner. The blocking `WRITER.lock()` on the print path is in **`wm::composite`**
+   > (`video/wm.rs:4622`), reached through `route_present_rows` → `wm::present` when the panel
+   > console owns the glass, i.e. on `pidesk`/`wc` builds. Nothing about the mechanism, the
+   > interleaving or the fix changes — only the callee's name, and a wrong name sends the next
+   > reader to a file that is already safe. `main.rs`'s copy of this narrative carries the same
+   > correction.
+5. The acquire never returns. The core is masked, so the holder it displaced can never be
+   redispatched to release the lock, and `SCHED[3].current` still names the interrupted task —
+   `99:input`. That is the name on the `[spin1]` line, and it is not the culprit; it is the tenant.
+
+**The rule, stated once.** *The input router may not hold a raw panel lock across a dispatch, and may
+not block on one.* Every other raw-spinlock section on this arch already obeys it — `sched::rq`
+masks, `Semaphore`/`FutexBucket` mask, `shell_inbox` masks, the global allocator masks. The input
+router was the exception, and it is the one task set that shares a core with the kernel's only
+IRQ-context printer.
+
+**The fix (two parts, both in `main.rs`'s router).**
+
+* `pal_width_hint` / `pal_height_hint` now go through `inwedge_panel_info`: **masked** (the section
+  cannot be preempted) and **`try_lock`** (the router can never itself be the spinner). A refused read
+  yields 0, which is the clamp-to-(0,0) degradation the FOCUS-VIS doc already sanctioned for an unset
+  framebuffer.
+* The whole keep-alive `match` runs inside `arch::without_interrupts`. Making only the two geometry
+  reads safe would leave `cursor::repaint`'s own `WRITER` hold — the wider one — still preemptible on
+  the input core, i.e. would leave the wedge where boot 8 found it. The masked span is bounded and
+  small (two `info()` reads and one sprite restore+draw with its cache clean) and runs at most once
+  per HID report on a ~250 Hz pump.
+
+**The witness.** `[inwedge] panel-lock read=N refused=M` — edge-triggered on `refused`, so it is
+silent on every boot that never contended (which is every automated gate). A **nonzero `refused` is
+the boot-8 window entered and survived**: before this arc that same instant was a blocking acquire
+from a preemptible task on the input core. It is the recurrence witness the arc owes, and it names
+the wedge rather than leaving a reader to cross-reference `[spin1]`, `[spread4]` and `[el0live]`.
+
+**Go-red.** `inwedge_selftest` holds `video::WRITER` and drives the router's own geometry read from
+the same core. With the fix: `:: INWEDGE: router panel-lock — held: w=0 h=0 refused+2 | released:
+w=640 real=640 read+1 :: PASS ::`, and `./arroyo kernel8-test 210` reaches 117/117 with 0 forbidden
+(23833 lines). With `pal_width_hint` reverted to its pre-arc `WRITER.lock()` and nothing else
+changed, the same 210 s window **stops the boot at 337 lines, 40/117 witnesses** — the deadlock, on a
+QEMU that can deliver no HID at all. The metal capture needed a pointer report and a timer tick to
+line up; the leg needs neither.
+
+**Out of lane, reported not touched.** `video::cursor::refresh_locked` still takes `WRITER` with a
+blocking acquire, and `arch::poll_input` still takes `SERIAL_PORT` blocking with interrupts enabled
+from the preemptible `input` task (`arch/aarch64/serial.rs` names that hazard in its own comment).
+Both are now covered on the input path — the first by the masked section above, the second by the
+fact that its only masked counterparty (`sys_write`, `syscall.rs:7238`) holds `SERIAL_PORT` bounded —
+but neither has been made safe at its own site. The general rule wants a `WRITER` discipline in the
+video lane and a non-blocking `poll_input` in the syscall/serial lane.
+
+### LOCKFIX — the rule, held everywhere it applies (aarch64 + x86, `exec-lockfix`)
+
+INWEDGE stated the rule and fixed one pair of call sites. A landing panel then held the trunk on the
+two things that statement left standing, and this arc is exactly that repair: **one door for the
+input path, and a mask that contains nothing forbidden.**
+
+**What was still wrong.**
+
+* **The masked span was not safe to run masked.** `cursor::repaint`, called from inside
+  `without_interrupts`, took `WRITER` with a **blocking** acquire three times over (`undraw_locked`,
+  `draw_locked`, `refresh_locked`'s flush) and printed two `[cursor]` witness lines from in there.
+  So the mask that stopped the router being *preempted* while holding turned it into the *spinner*
+  instead: on a `pidesk` build the print mirrors to the panel through `wm::present` → `composite`,
+  whose `WRITER.lock()` is blocking, taken masked. A recoverable stall became an unrecoverable
+  wedge, live on every `pidesk` boot — the same interleaving as boot 8 with the roles exchanged.
+* **Two more input-path call sites were never converted.** `quarry::live::wheel_route` (the QSCROLL
+  seam, reached from `usb-pump` → `user_input_enqueue` → `key_route`) and
+  `arch::aarch64::syscall::click_pointer_pos` both read the panel with a plain `WRITER.lock()` on
+  the same preemptible band the rule is about.
+
+**The fix, one shape.**
+
+* **One door, in the module that owns the lock.** `video::panel_info_nonblocking()` — masked,
+  `try_lock`, counted — is now the *only* way the input path reads panel geometry. Its census
+  (`video::panel_census`) is the one `[inwedge]` reports; `main.rs`'s `inwedge_panel_info` /
+  `inwedge_census` are thin wrappers over it, so the witness and the selftest read as before.
+  Callers: the router's `pal_width_hint`/`pal_height_hint` (clamp to 0), `wheel_route` (**declines**
+  the event — a wheel it cannot place is not consumed), `click_pointer_pos` (the (0,0) clamp an
+  unset framebuffer has always given it). The `syscall.rs` change is line-neutral (PARITY §5.3).
+* **`WEDGE-8`'s policy, extended from the sprite lock to the panel lock.** `video::panel_snapshot()`
+  blocks when interrupts are ENABLED and `try_lock`s when they are MASKED — exactly what
+  `cursor::claim_bounded` already does for `SPRITE`. Every `WRITER` acquisition in `video/cursor.rs`
+  now goes through it, and every refusal takes the module's existing `owe_repaint` degradation, so
+  the panel is one composite tail late and never wrong. `refresh_locked` additionally stops the pass
+  when `sp.drawn` survives the undraw attempt: that flag is the refusal signal, and drawing on top
+  of an arrow still on the glass would save the arrow as its own under-content.
+* **The mask now contains pixels and atomics only.** `cursor::repaint` is split: `repaint_deferred()`
+  is the pixel half (no blocking lock, no printing) and returns a `RepaintTail` the caller `finish()`es
+  **outside** the mask — the two `[cursor]` lines and `repair`'s window-table damage. `repaint()`
+  itself is unchanged for every other caller (`repaint_deferred().finish()`).
+* **The go-red leg stops racing the APs.** `inwedge_selftest`'s released half asserted
+  `read == read0 + 1` off a single non-blocking read, so any AP holding `WRITER` at that instant made
+  a *correct* kernel print FAIL. It now retries the released read up to 64 times against the real
+  geometry (`tries=` on the line records how many it took) and tolerates a concurrent refusal in the
+  held half's delta (`>=`, not `==`). The held half's conviction is untouched: both reads taken
+  against a lock this core holds must still come back clamped to 0.
+
+**Witness shape**, unchanged apart from the new `tries=` field:
+`:: INWEDGE: router panel-lock — held: w=0 h=0 refused+2 | released: w=640 real=640 read+1 tries=1
+:: PASS ::`.
+
+**Knob-off byte-identity moves, deliberately** (PARITY §5.3's §5.2 precedent): `main.rs` and
+`video/cursor.rs` are compiled into the shipped `kernel8.img` and this is a correctness fix on a path
+users run, not desktop furniture. `arch/aarch64/syscall.rs` is nonetheless kept line-neutral.
+
+**Gate (2026-08-18, `exec-lockfix`).**
+
+| gate | result |
+| --- | --- |
+| `./arroyo check` | green, both arches (rc=0) |
+| `UNAOS_WC=1 UNAOS_PIDESK=1 UNAOS_QUARRY=1 ./arroyo check` | green (rc=0) |
+| `./arroyo kernel8` | builds — `UnaOS-pi4-baremetal.img` 64M |
+| `UNAOS_PIDESK=1 UNAOS_QUARRY=1 ./arroyo kernel8-test` | **117/117 required on all three runs** (8, 4, 8 forbidden), `:: INWEDGE: … tries=1 :: PASS ::` and `:: QUARRY: … +wheel … :: PASS ::` on every one |
+| pre-arc control, `c4ee2280`, same host + knobs, four runs | 117/117 (3), 117/117 (4), **116/117 (10)**, 117/117 (6). The control is the one that dropped a required witness, and it produced the same classes: `[wc-g] COHER`/`RACE-BLIT`, `[dragperf] coalesced=0`, and `[wc-d] verify win=1 … -> FAIL` — the console-vs-compositor residue PARITY.md §6.9c assigns to `exec-shellport`'s pacing lane, and quarry.md §14.6's host-load lane. **No class appears armed that the control does not also produce, and the armed runs never lost a witness.** Honest note: this host is loaded (the runs are interleaved with other aarch64 QEMUs), which is why the arc is judged on paired runs rather than on an absolute count |
+| **go-red retained** | `pal_width_hint` reverted to `WRITER.lock()` in a scratch build, nothing else changed: `✂️ MBENCH TRUNCATED — 40/117, 337 lines`. Byte-for-byte the same truncation INWEDGE recorded, so the leg still convicts a blocking acquire. Call site restored and re-verified |
+
+### POSFIX — the last two blocking takes on the input path (aarch64 + x86, `exec-posfix`)
+
+LOCKFIX closed the rule's `WRITER` population and, in the same breath, named two residuals of the
+**same class** that it did not fix. This arc is exactly those two, and nothing else.
+
+**Residual 1 — `pal::cursor::POS`, INWEDGE's interleaving with a different lock.** The cursor's
+position `Mutex` had takers on both sides of the mask line: `move_rel`/`set_abs` reach `set_clamped`
+from **inside** the router's masked keep-alive span, while `pos()` was a **blocking, unmasked,
+preemptible** take from `quarry::live::wheel_route`, `syscall::click_pointer_pos` and the
+compositor's hit-test helpers. That is boot 8 with the roles exchanged: a tick inside the unmasked
+acquire parks the reader off-CPU holding `POS`, and the next masked pointer report on that core
+spins on it forever.
+
+**The fix is `sched::rq`'s, not LOCKFIX's, and the choice is a property of the object.** LOCKFIX gave
+`WRITER` try-lock-and-decline because its critical section is a whole framebuffer handle held by
+painters that copy megabytes — an unbounded wait, so refusing is the only bounded answer. `POS` is
+the opposite: **both** of its critical sections are constant-time and call nothing (`pos` is a
+`get_or_insert` of an `(i32, i32)`, `set_clamped` is a store of one). So **every taker is masked** —
+no holder can be preempted, the hold is a handful of instructions, and a blocking acquire cannot
+outlive a bounded spin. Mask-everywhere is also the only option available here: a decline has no
+honest degradation for a position read (a cursor that does not move for this event, or a click
+hit-tested at a stale point), and expressing one would have to change the eight `pos()` call sites in
+`video/wm.rs` — a file this arc may not touch. The change is contained entirely in `pal.rs`; not one
+call site moves. **The standing invariant** for anyone adding a taker is recorded on the static:
+`POS` is acquired only inside `arch::without_interrupts`, and nothing but arithmetic runs inside it.
+
+**Residual 2 — `quarry::live::open`'s panel read.** `open()` reads as boot furniture, but it has a
+second caller and that one is an input event: the dock's pinned tile latches `request_open()` and
+`service()` drains the latch from `syscall.rs`'s strip-press arm — the preemptible `usb-pump`/`input`
+band. Its `WRITER.lock()` was blocking, on that band, in front of an allocation, a volume read and a
+window mint. It now goes through `video::panel_info_nonblocking()`, **bounded-retried** (`PANEL_TRIES
+= 64`, the bound LOCKFIX gave `inwedge_selftest`'s released read) rather than declined on the first
+refusal: an open is a deliberate operator gesture where a lost event reads as a dead dock tile, and
+panel geometry is static, so the answer a retry gets is the answer the first try wanted. Each try
+masks and releases inside the door, so the holder can always run. If all 64 refuse, the request is
+put **back** into `REOPEN` — the next `service()` pass reopens with no further operator action — and
+one line says so: `[quarry] DECLINE reason=panel-busy tries=64 …`. A contended-but-successful open
+prints `[quarry] open panel-contended tries=N panel=WxH`. What is deliberately not on the table is
+proceeding on stale or zero geometry, which would size the window, the dock-strip check and the
+surface allocation off a lie.
+
+**Knob-off byte-identity is not claimed**, on PARITY.md §5.3's §5.2 precedent, exactly as LOCKFIX
+did: `pal.rs` is compiled knob-off and this is a correctness fix on a path users run, not desktop
+furniture. `video/quarry/live.rs` remains `feature = "quarry"`-only. `video/wm.rs` is untouched.
+
+**Gate (2026-08-18, `exec-posfix`).**
+
+| gate | result |
+| --- | --- |
+| `./arroyo check` | green, both arches (rc=0) |
+| `UNAOS_WC=1 UNAOS_PIDESK=1 UNAOS_QUARRY=1 ./arroyo check` | green (rc=0) |
+| `./arroyo kernel8` | builds — `UnaOS-pi4-baremetal.img` 64M |
+| `UNAOS_PIDESK=1 UNAOS_QUARRY=1 ./arroyo kernel8-test 210`, 7 runs | 116, 117, 117, 117, 116, 115, **117**/117. `:: INWEDGE: … refused+2 … read+1 tries=1 :: PASS ::` and `:: QUARRY: … +wheel … :: PASS ::` on **all seven** — the arc's own subject never wavered |
+| control, `7847ceea` (LOCKFIX tip), same host + knobs, 6 runs | 117, 117, 117, **116**, 117, 117. The control loses a required witness too, and loses it from the same lane |
+| strings-proof | `reason=panel-busy` and `open panel-contended` each present once in the shipped `target/pi_baremetal/kernel8.img` — the new witnesses are reachable, not merely compiled |
+
+**Honest reading of the forbidden hits.** Every one, armed and control, is in the host-load /
+console-vs-compositor-residue lane PARITY.md §6.9c and quarry.md §14.6 already assign elsewhere:
+`[wc-g] COHER`/`RACE-BLIT`, `[wc-d] verify … -> FAIL`, `[wc-h]`/`[wc-k] AT-RISK`, `[dragperf]
+coalesced=0`, `[wc-c] side-by-side drawn=1`. The dropped required witnesses were `[wc-c] drawn=2`
+(armed once, **control once**), `[wc-fv] focus-vis … raise=…/false` (armed once, not seen in six
+control runs — a single occurrence of the same raise-composite-did-not-land shape, not reproduced in
+six further armed runs), and, on the one 115/117 run, `VUGSPREAD … cores-used=1` plus `[wc-k]
+TEAR-FREE` — pure host-CPU starvation, on a host running these QEMUs back to back. This host is
+loaded, which is why the arc is judged on **paired** runs rather than an absolute count, and the
+paired reading is that armed and control are indistinguishable outside the arc's own two witnesses,
+which are green on every run.
+
+### WEDGEPROBE — the interrupt/timer instrument behind a WEDGE conviction (aarch64, `exec-wedgeprobe`)
+
+**The evidence that motivated it.** Three metal WEDGE convictions share one anatomy. dsktp boot 9:
+core 3, task `99:input`. dsktp boot 10, episode 1: core 2, task `111:el0-fb` at ~4.5 s; episode 2:
+core 2 again, task `117:el0-wcb`, after the core had RECOVERED (~11M scheduler passes elapsed
+between episodes) and re-wedged — the failure is transient-then-recurring, not a one-way latch. In
+all three, `[starve1]` printed `passes=N->N irq=M->M` for the wedged core: its scheduler passes
+frozen AND its per-core acked-IRQ count frozen across the probe interval, while every sampled lock
+counter was zero (`rx_ready locked=0`, `sem_stalls=0`, `futex_stalls=0`). The lock class is
+refuted — POSFIX was aboard boot 10 and did not prevent it. The surviving hypothesis class:
+**interrupt delivery dies on the wedged core** — no timer tick, so no preemption, so the pinned EL0
+resident starves — while the current EL0 task keeps running at EL0 (the machine stays alive).
+
+**What the probe is.** `wedgeprobe` (sched.rs), called from the `[starve1]` fire path only, whenever
+any core is convicted WEDGE (frozen passes). Discipline per §INWEDGE/§POSFIX: read-only,
+failure-path-only, no locks taken, no waits entered — relaxed atomics, `mrs`, and single volatile
+MMIO reads. It prints:
+
+* One `[wedgeprobe] … wedged_cpu=N …` line per convicted core: the cross-core-safe atomics that
+  core's own IRQ path maintains — `gic::IRQ_TOTAL` / `IRQ_LAST_INTID` / `IRQ_UNHANDLED[_LAST]` and
+  `percpu::cpu(N).ticks` / `.ipis`. There is **no last-irq timestamp** anywhere in the kernel
+  (`[spin1]`'s `last=` is `IRQ_LAST_INTID`, an INTID — 30 is the timer PPI), so a frozen
+  `irq_total` beside a live sibling IS the staleness evidence, and the line says so.
+* One `[wedgeprobe] … probe_cpu=P …` line from the convicting core: `GICD_CTLR` (the one GLOBAL
+  register — distributor enable), then the probe core's **banked** view — timer-PPI
+  enable/pending/active bits (GICD_ISENABLER0/ISPENDR0/ISACTIVER0 low words are banked per CPU
+  interface on GICv2), `GICC_CTLR/PMR/RPR/HPPIR` (the whole GICC frame is banked), and
+  `CNTP_CTL_EL0` + `CVAL−now` (CNTP_* are per-core system registers). On the QEMU-virt v3 build the
+  same fields come from this core's redistributor SGI frame + the ICC_* system registers
+  (`gic::wedgeprobe_snapshot` dispatches like every other GIC entry point).
+
+**The honest limitation, stated in the witness line itself.** The wedged core's banked GIC state and
+its CNTP registers are **unreadable from any other core** — that is what "banked" means — and the
+kernel has no run-on-core-N IPI sampling path (the only SGI is the resched kick; building one was
+explicitly out of the arc's scope). So the probe-core line is a **contrast baseline** from a core
+that is demonstrably still taking interrupts, not the wedged core's state. What it CAN settle: a
+clear `GICD_CTLR` would convict a global distributor loss; a stuck `timer_active`/low `rpr` on a
+future capture where the probe core is itself about to wedge would convict a lost EOI; and the
+per-wedged-core counters separate "no interrupts acked at all" (frozen `irq_total`) from "interrupts
+acked but ticks lost" (`irq_total` moving while `ticks` freezes — a dispatch, not delivery, fault).
+
+**Gates (this arc).** `./arroyo check` green both arches; `./arroyo test-arm` clean;
+`./arroyo kernel8-test` **117/117 required, 0 forbidden**; strings-proof: both `[wedgeprobe]`
+witness texts present in the shipped `target/pi_baremetal/kernel8.img` (positive control:
+`starve1` present in the same pass). The probe has not yet fired on metal — that is the next
+conviction's capture, at an operator-attended arc boundary.
+
 ### Orphan-reaper wake on enqueue (aarch64, SCHED-4b)
 
 **SCHED-4 sleep_ticks regression** (U11-reap FAIL, timer never ticks in QEMU) bisected and fixed by SCHED-4b (`d7631117`): semaphore wake on orphan enqueue — ~0% idle duty metal-confirmed (c2=0% P31b), U11-reap PASS restored.
+
+**Spawn-site ordering (U11-REAP ORDERING FIX).** A second U11-reap FAIL, deterministic under
+`UNAOS_PIDESK=1 UNAOS_PIRAST=1 ./arroyo kernel8-test 300` (107/108, byte-identical across runs), was
+*not* in the reaper or in the fs code the fixture exercises — it was **where the reaper was spawned**.
+The `spawn_auto("orphan-reaper", …)` call lived in the panel-service block, which runs **after**
+`pi_rast_demo_maybe()`, while the whole EL0 fixture cascade (U11-reap included) is already running on
+the APs. A teardown-orphaned chain queued by that fixture therefore waited on a service that did not
+exist yet, and U11-reap's bounded 5 s CHECKPOINT-3 poll passed only when the raster demo happened to
+finish inside it. The evidence is the log order: the reaper's `freed teardown-orphaned chain
+@cluster N` line lands **before** the verdict at 4.5 s of demo (PASS, by half a second) and **316
+lines after** it at 9.5 s (FAIL — then the chain is freed anyway, so nothing leaked). The
+`UNAOS_VUGPAR=1` control "fixed" the failure for the same reason in reverse: it shortened the demo
+back under the deadline.
+
+The fix moves the spawn to the `start_aps` block, immediately after the APs are released and before
+the fixture cascade — the first point in the boot at which a scheduled core exists, and the point at
+which the reaper's own doc comment already claimed it was spawned. Placement policy is unchanged
+(`spawn_auto`, load-balanced, SCHED-3b); at that point only the AP set is in `ONLINE_MASK`, so the
+reaper can never be placed on the not-yet-scheduling BSP, and it blocks on `REAPER_SEM` immediately,
+so an early spawn costs an idle task and no duty cycle. It is also no longer gated on
+`framebuffer_addr != 0` — a panel-less boot has teardown orphans too. The general rule the FAIL
+states: **the availability of a kernel service must not be a function of demo or panel composition.**
+The fixture's FORBID and its 5 s bound were left untouched; they were measuring honestly.
 
 ### The idle-desktop core wedge (aarch64, SPIN-1…8 / WEDGE-4…6)
 
@@ -2554,6 +3170,111 @@ path (which this tree does not map today) would be the alternative. If a PC
 sample is ever taken, it must be printed beside whatever names the masking
 window — a PC alone dates a symptom without naming a cause.
 
+### Three EL0 deaths that look identical on the wire (aarch64, EL0-LIVE)
+
+PA41's third Pi 4 metal boot froze with the desktop intact and every input dead.
+The 2660-line capture (`boot3-inputdeath-tail.txt`) is unambiguous that EL0 had
+stopped — `[prio]` totals `el0=2490629` **constant** across the whole tail,
+`[wcn] passes=0`, `composites=0/s`, `[cursor3] offers=568 taken=0` (the cursor is
+composited, so zero passes means a frozen arrow whatever the mouse does) — and it
+cannot say **why**, because three completely different failures render the same:
+
+| regime | what is true | the fix it demands |
+| --- | --- | --- |
+| **STARVED** | EL0 tasks are READY and never win a dispatch | priority / affinity |
+| **STRANDED** | EL0 tasks exist, all PARKED, no wake arrives | a lost wakeup |
+| **EXTINCT** | there are no EL0 tasks left | whatever killed them |
+
+The capture is `EXTINCT`, and the evidence that says so was circumstantial and
+only legible to a reader holding the source:
+
+- `[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0` — zero **committed** EL0 residents
+  on every core, beside `rewake=112 stay=2272 short=40357 refresh=389`, cumulative
+  wake counters large enough to prove EL0 had certainly lived earlier in the boot.
+- `[spread10] slots 1c=0 2c=0 3c+=0` — no live address-space slot either.
+- Residency is released at exactly five sites (`exit`, `retire_killed`, SPIN-6's
+  corrupt-switch refusal, `park_blocked`'s dead arm, and the balanced
+  leave/enter of a placement move), and every one of the first four **destroys
+  the task**. Residents `== 0` after a large wake history therefore means the
+  fleet was reaped, not descheduled.
+- Corroborating, and independent: `make_ready` is the sole EL0 wake funnel and
+  unconditionally bumps one of `short` / `stay` / `rewake` for every EL0 wake.
+  All three are byte-frozen for the whole tail — **zero EL0 wakes**. And
+  `[prio] agedin=` falls to 0 once the storm's own tasks retire: the run queues
+  hold no below-band ready task at all.
+
+Contrast boot 2 of the same session, which froze differently:
+`[spread4] live c0=0/1 c2=1/1 c3=1/1` with `[prio]` `el0` totals climbing
+17 899 008 → 20 832 924. EL0 alive, running hard, screen dead. Same symptom to
+the operator; opposite diagnosis.
+
+`[el0live]` states the verdict outright instead of leaving it to be reconstructed:
+
+```
+[el0live] verdict=EXTINCT el0 runnable/parked/committed=0/0/0 last_disp=27756ms last_wake=27801ms stall>=2000ms | reaped exit=3 kill_oncpu=1 kill_offcpu=2 corrupt=0 nopark=0 | totals el0_disp=2490629
+```
+
+What it adds over the counters that already existed:
+
+- **A clock.** `EL0_LAST_DISPATCH_CYC` / `EL0_LAST_WAKE_CYC` are per-core,
+  cache-line padded (SPIN-3), and stamped from CNTPCT reads the dispatch and wake
+  paths already take — no new `mrs` on either hot path. "EL0 has not run for N ms"
+  becomes one field on one line, readable from a **truncated** tail, which is the
+  material every metal freeze actually produces. `[prio] el0=` needs two lines and
+  a subtraction.
+- **The runnable/parked split**, so "not running" is qualified — the difference
+  between `STARVED` and `STRANDED`. Read lock-free from the SPREAD-3/SPREAD-4
+  counters; no run-queue lock on a witness path.
+- **A reap ledger** — `EXTINCT` is useless without a cause. The four reap sites
+  previously left no durable trace: `exit()` and `retire_killed` print nothing,
+  and SPIN-6 / the dead park arm print one line each *at the instant they fire*,
+  which a tail capture has by construction already scrolled past.
+- **A fifth verdict, `LEAKED`.** `el0_active` saturates `committed - parked` at
+  zero, so `[spread4]` renders `parked=3, committed=0` and `parked=0, committed=0`
+  identically as `0/0` — an accounting leak and a dead fleet, pixel for pixel.
+  `[el0live]` prints the raw parked count and ranks `LEAKED` above `EXTINCT`.
+
+**The 2 s threshold is `syscall::TAKEOVER_STALE_SECS`, deliberately.** After two
+seconds without a `SYS_INPUT_POLL`, `run_user_image` stops believing the focused
+app is live-in-takeover, re-arms its deadline, and — if the quiet continues —
+issues an **ASID-scoped `sched::kill`** against the whole address space. An EL0
+outage past 2 s is therefore not a latency complaint; it is the precondition for
+the shell to begin destroying the fleet. So `verdict=STARVED` on the wire is the
+early warning for the `verdict=EXTINCT kill_offcpu=` that can follow it, and the
+pair is what a future capture needs to convict PA41's death **event** itself —
+which this capture, being entirely post-mortem, cannot.
+
+**`EXTINCT` is not by itself a fault.** The shell runs foreground programs one at
+a time, so every gap between two EL0 programs is a genuinely empty machine. What
+convicts a freeze is `EXTINCT` that **persists** while the desktop is supposed to
+be up: `[wcn] wins=` nonzero, the compositor still passing, and `last_disp`
+climbing without bound. PA41 boot 3 held that state for 545 s.
+
+A development build chained the line into `prio_witness`, whose third caller is
+`render_service`'s `[sched6]` block, to get a real reading out of the raspi4b
+battery. It worked — the battery walked `NONE → LIVE (2/1/3) → EXTINCT → LIVE →
+EXTINCT`, ending `exit=68 kill_oncpu=4 kill_offcpu=19` with both kill arms
+exercised, which is the functional proof that the clocks, the runnable/parked
+split and the ledger all read correctly. **It was then removed**, because it put a
+UART write on the render task's path and the next two battery runs came back
+`[wc-h]`/`[wc-k] torn=1 → AT-RISK` after a 108/108 immediately before. Host load
+(59) is the better explanation and `maxpresent_us=10583` was inside the 16.667 ms
+frame budget — but a witness must not be able to perturb the thing it watches, and
+the chain bought nothing on metal, where `load_witness_tick` already covers it at
+the same cadence. The QEMU wiring proof stays with `load_accounting_witness`'s
+`verdict=NONE … last_disp=--` baseline, exactly as `[spread4]` documents for
+itself.
+
+Emitted from the three sites the rest of the train uses. On the metal timer path
+it is taken **before** `load_witness_tick`'s change-suppression, because a machine
+whose EL0 fleet has just died is precisely a machine whose load has gone flat and
+stopped changing; gating the liveness census on load movement would mute it exactly
+when it is the only line worth having. It carries its own suppression instead:
+silent while healthy and unchanged, printed every window while the verdict is not
+`LIVE`. The raspi4b battery spawns no EL0, so the gate reads
+`verdict=NONE … last_disp=--` — the honest baseline, and the proof that the clocks,
+the residency reads and the ledger are wired.
+
 ---
 
 ## 3. Blocking and synchronization primitives
@@ -2590,6 +3311,112 @@ Combined-boot evidence (one kernel running SMP + USB + net + video):
 `RWLOCK: [cpu3] done 5/5, torn=false, max_concurrent_readers=4 => PASS`.
 
 ---
+
+## 4a. aarch64 SMP scheduler and the Orin work-stealing balancer
+
+The aarch64 port now runs a real preemptive multi-core scheduler
+(`arch/aarch64/{sched,smp_virt}.rs`). Secondaries brought up by PSCI `CPU_ON`
+enter `run()` (via `secondary_run`), which sets `ONLINE[cpu]` and makes the core
+a **SCHED-BAL** load-balancing participant: migratable (plain kernel) tasks are
+placed on the least-loaded online core at spawn/wake (`place_cpu`) and an idle
+core pulls work off a busier one (`try_steal`). Per-core `STEALS`/`CPU_BUSY`
+counters back the one-line `sched_bal_witness`.
+
+On the Jetson Orin Nano the boot core does **not** enter `run()` — it drives the
+cooperative M4 CAPSTONE from `run_capstone_boot_core`. The `burst` shell verb
+(and the `sched_demo` boot trigger) stages `BURST_TASKS` migratable `PRIO_LOW`
+tasks across every online core and reports the balance. Two facts about this path
+are load-bearing and were the subject of the **SCHED-BURST-FIX** arc:
+
+- The cooperative boot core is an online scheduler participant too, but it marks
+  itself `ONLINE` inside `run_burst` (it never runs the `run()` seam that does so
+  for secondaries) — otherwise the witness under-counts the online cores by one.
+- **JC3 — per-core AP timer tick.** Each GICv3 secondary now arms its OWN
+  periodic generic-timer tick (`timer::arm_this_core_ap`) before entering
+  `run()`, so it re-polls its run queue / attempts a steal every ~4 ms — a
+  self-driven scheduler participant rather than reschedule-SGI-dependent. This
+  promotes the JC2-deferred "AP timer PPI stretch": the deferral existed because
+  `on_tick` bumps the shared monotonic `TICKS` that feeds `ticks()`/`ms()`, so a
+  second ticking core would inflate the wall-clock budget. JC3 contains that with
+  a **local-only** tick: `arm_this_core_ap` registers the core in `AP_LOCAL_TICK`,
+  and such a core advances only its per-CPU `percpu.ticks` (its scheduler clock,
+  which also drives `sleep_ticks`), never the shared `TICKS`. The boot core stays
+  the sole global-clock owner. Each AP prints one witness line on its first tick
+  (`:: AARCH64 SMP: cN timer PPI live (tick 1) ::`), quiet after. The tick does
+  not preempt on this EL2 `run()` path (`SCHED_ACTIVE` stays false; `handle_irq_v3`
+  calls only `on_tick`) — it just breaks the idle WFI so the loop re-polls.
+- **HID-REGRESS-B12 — a ticking AP must WFI, not busy-spin, when idle.** `arch::hlt`
+  chooses WFI-park vs. poll-spin from `timer::is_live()`, which tracks the **boot
+  core's** timer. On the Jetson the JM6 EL2->EL1 drop disables that timer
+  (`set_not_live`), so post-drop `is_live()` is false and `hlt` poll-spins — correct
+  for the timerless boot core, which owns the cooperative xHCI HID poll. But a JC3
+  secondary has its OWN live tick, so post-drop it would fall into the same poll-spin
+  branch and **busy-spin its `run()` steal loop** between ticks instead of parking.
+  Five secondaries hammering the shared run-queue spinlocks/`ONLINE` atomics saturate
+  the interconnect and starve the boot core's HID poll — armed keyboards/pointers
+  deliver ZERO events (boot-12). Fix: `hlt` also parks on
+  `timer::this_core_has_local_tick()` (this core's `AP_LOCAL_TICK` bit), so a
+  self-ticking AP WFI-parks bounded to one ~4 ms tick — still self-scheduling, but
+  idle-quiet, so input coexists. The boot core is never in `AP_LOCAL_TICK` (its
+  poll-spin is unchanged); on QEMU `virt` the APs' tick is delivery-confirmed so
+  `is_live()` is already true (the new term is redundant, no behaviour change); Pi
+  (GICv2, no `AP_LOCAL_TICK`) reads false and is byte-identical.
+- **SGI audit (JC3).** The reschedule poke (`poke_cpu`) targeted `gic::send_sgi`
+  with the LINEAR core index, but the GICv3 CPU interface routes SGIs by MPIDR
+  **affinity** (`ICC_SGI1R_EL1`). On QEMU `virt` affinity == index so it worked;
+  on multi-cluster Tegra234 (Aff0 = 0, cluster in Aff2/Aff1) the raw index is not
+  a valid target, so a poke never woke the AP — the boot-11 metal symptom. Fixed:
+  `poke_cpu` maps the index to the core's published affinity
+  (`smp_virt::sgi_target_for_index`) first. The JC3 tick is the belt-and-braces
+  second wake, so placed/stealable work is picked up within a tick even if a poke
+  is slow or lost.
+- Belt and braces, the cooperative burst driver still **steal-drains** while it
+  waits — it pulls any stranded work back to itself and runs it — so the burst
+  always drains (no teardown wedge) and the steal is recorded (witness shows
+  steals > 0). A lost-progress spin ceiling emits an explicit timeout witness
+  rather than hanging silently.
+
+## 4b. SIMMER — the per-core load animator
+
+`simmer` (`arch/aarch64/sched.rs`) is a per-core load ANIMATOR: it makes each
+online Orin core independently "breathe" like a moderately busy machine so the
+`vug` per-core meter shows the bars rising and falling on independent rhythms.
+Where `burst` is a one-shot balancer probe (migratable tasks that get *stolen*
+across cores), `simmer` is a steady-state animator: one **PINNED** `PRIO_LOW`
+task per core, each duty-cycling on its own cadence. Pinning is the point — each
+core's bar is driven by its own animator, not by placement/stealing (`burst`
+already proves stealing).
+
+- **Toggle + default-quiet.** The `simmer` shell verb (inside `jd2_console_pump`,
+  the boot core) toggles it; `simmer off` stops it. Nothing runs unless the verb
+  is typed. `simmer_start`/`simmer_stop`/`simmer_active` back the verb; start and
+  stop emit a single serial witness each (`:: SIMMER: staged N ... ::` /
+  `:: SIMMER: stopped ::`) — the visual is the product, so there is no per-cycle
+  spam.
+- **Per-core rhythm.** Each animator seeds a small `xorshift32` from its core id
+  (no wall-clock entropy) and redraws, every cycle, a period (~120–320 ms) and a
+  duty (~15–70 %). The busy phase burns real work and `yield_now`s so higher-
+  priority work preempts and every dispatch pass records the core BUSY; the idle
+  phase `sleep_ticks` so the run queue drains and the meter reads the core IDLE —
+  the down-stroke. Busy duration is bounded by the core's own `percpu.ticks`
+  (its JC3 PPI clock) with a generous `cntpct` wall backstop.
+- **Every online core EXCEPT the driver (boot) core is animated.** The boot core
+  runs the cooperative loop, not `run()` — it neither drains its sleeper list nor
+  (post-JM6, timer disabled) ticks, so a `sleep_ticks` there would park forever,
+  breaking both the animation and a clean stop. This is also exactly the set `vug`
+  displays as a scheduler busy-*fraction*: during `vug` the boot core renders (its
+  dispatch counters freeze) and its bar reflects render load, while every other
+  online core reads its honest busy fraction. On a fully-online Orin that is the
+  boot core's render load plus five animated secondaries.
+- **Clean stop.** Animators poll a shared `SIMMER_RUN` atomic and exit; a
+  `SIMMER_LIVE` countdown lets `simmer_stop` wait (bounded, cooperatively
+  yielding) for genuine quiescence before witnessing. A stop-ceiling emits an
+  explicit warning rather than wedging.
+- **Self-test (`simmer_test` / `UNAOS_SIMMER=1`).** A gated boot-core task stages
+  the animators, samples the meter twice ~1 s apart and asserts multiple animated
+  cores show BUSY deltas, then stops and asserts quiescence. Run:
+  `UNAOS_GICV3=1 UNAOS_SIMMER=1 ./arroyo test-arm` — on QEMU `virt` (4 cores)
+  three secondaries animate and the case reports PASS + quiescence PASS.
 
 ## 5. Status and limitations
 

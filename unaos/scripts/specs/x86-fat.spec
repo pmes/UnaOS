@@ -216,3 +216,23 @@ FORBID \[btbond\] store round-trip: .*-> FAIL ::
 OPTIONAL :: \[hcron\] deferral bound: .*-> PASS ::
 FORBID \[hcron\] deferral bound: .*-> FAIL ::
 FORBID \[hcron\] flush -> .* GIVING UP
+
+# --- SYNC-FOLD (trunk fold, 2026-08-22) — MUST-CARRY 2. NEITHER SIDE OF THE MERGE TOUCHES THESE
+# --- TWO FACTS, so the fold produces no signal about them and the battery was measurably blind:
+# --- fold-v2's pure merge replayed `MBENCH PASS — 31/31 required witnesses, 0 forbidden hit(s)`
+# --- over a boot whose serial carried `WINX-8 ... FAIL — windowed=true presents=0` and two
+# --- ring-3 kills. `442f1cfa` (pi's WINX-8 fix) is now IN trunk, so the fault it convicted is
+# --- gone — but the SPEC that could not see it is still the spec, and that is what these lines fix.
+# ---
+# --- `threads` is pinned at 2 on purpose: worker A dying while B lives prints 1, which is exactly
+# --- the half-failure the old spec could not distinguish from health. `presents` is left `[0-9]+`
+# --- because the emitter already refuses PASS below `WINX8_MIN_PRESENTS`, so a second floor here
+# --- would only be able to disagree with it.
+REQUIRE :: WINX-8: VUG\.ELF end-to-end — loaded \(entry 0x[0-9a-fA-F]+\) \+ windowed \+ [0-9]+ presents with 2 ring-3 thread\(s\), killed \+ row reaped by the kill \(free [0-9]+->[0-9]+/[0-9]+, exited [0-9]+->[0-9]+\), teardown clean -> PASS ::
+# --- And the narrow FORBID on ring-3 kills. U1b's three DELIBERATE fault-isolation tasks
+# --- (`u1b-wild-write`, `u1b-code-write`, `u1b-stack-exec`) are the only legitimate emitters in a
+# --- green run — measured 3/3, no others, on both x86 legs — so they are excluded by name prefix
+# --- and everything else convicts. RX-FINALPAGE's refused clone faults at LOAD time
+# --- (`:: elf: REFUSED rx-crosses-final-window-page ... ::`), never in ring 3, so it contributes
+# --- nothing here. Kept narrow deliberately: a blanket FORBID would red the fixture every boot.
+FORBID :: RING-3 FAULT: task '(?!u1b-)[^']*' KILLED

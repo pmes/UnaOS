@@ -1224,7 +1224,14 @@ FORBID \[wc-k\] .*outside=[1-9]
 # --- beside a fresh tenant's honest presspread=1 must not wedge this gate red for the rest of the
 # --- boot. One stray cannot reach 2 (every recycle resets the counter first), while a live guard
 # --- defect convicts repeatedly, so the >= 2 form keeps the falsifier and sheds the false red.
-FORBID \[wc-h\] rollup .*stalls=([2-9]|[1-9][0-9]+) .*presspread=[0-7] pop=constant
+# --- SYNC-FOLD RE-ARM (trunk fold, 2026-08-22). THIS FORBID FAILED OPEN AT THE MERGE, SILENTLY.
+# --- Both parents carried the line above VERBATIM, so git auto-merged the file with no signal at
+# --- all — and the merged `[wc-h]` rollup inserts WCHFIX's `presspop=` BETWEEN `presspread=` and
+# --- `pop=constant` (see `wcg.rs`, key order load-bearing). `presspread=[0-7] pop=constant` can
+# --- therefore never match again, and the tripwire scores zero hits on a tree that has the
+# --- forbidden arithmetic on the wire. The new key is named EXPLICITLY rather than covered by
+# --- `.*`, so nothing further can be inserted between the two without tripping this comment.
+FORBID \[wc-h\] rollup .*stalls=([2-9]|[1-9][0-9]+) .*presspread=[0-7] presspop=[0-9]+ pop=constant
 
 # --- WCK4: THE ERASE-DISCIPLINE VERDICTS, FORBIDDEN ------------------------------------------
 # --- The [drag-occ] witness measures pixels PUBLISHED into the dragged window's live box by
@@ -1335,10 +1342,10 @@ FORBID \[drag-occ\] .* bars=0/[0-9] bar=[1-9]
 # --- STRIPFACTOR: THE MENU BAR IS ABSENT BY DEFAULT, AND SAYS SO -------------------------------
 # --- `video/menubar.rs` is tenant #2 of the strip primitive and exists this arc to PROVE the
 # --- primitive is generic — a one-tenant registry proves nothing. Its ONE press target is the
-# --- crystal (`press=crystal` on the line — the SHARD menu's box, routed by the click router's
-# --- menu-band arm; the term read `press=inert` before `video/crystal.rs` existed, and the stale
-# --- word was mis-read in GR27 as a routing latch-off) and the bar is off unless something enables
-# --- it at runtime.
+# --- CRYSTAL (`press=crystal` on the line — the SHARD menu's box, claimed through the shared
+# --- furniture router `strip::press_route` that both arch routers call; the term read `press=inert`
+# --- from before `video/crystal.rs` existed, and that stale word was mis-read off a Pi capture in
+# --- PA41 as "press routing latched off") and the bar is off unless something enables it at runtime.
 # ---
 # --- Six fields are load-bearing and all six are pinned on the PASS line, which already ANDs them:
 # ---   * `default_off=true`  — the ARTIFACT ships with the bar off. SHELLDESK moved this from a live

@@ -34,7 +34,7 @@ use crate::pal::{Event, GneissPal, TargetPal};
 // The meter palette and the VUG-HONESTY classifier live in `ui_status` — the instrument strip is the
 // rule's permanent, both-arches consumer, while this demo is a shell verb. Reading them back keeps a
 // single definition of each and leaves this module free to be gated to the arches that launch it.
-use crate::ui_status::{classify_load_scaled, METER_BREATH, METER_DIM, METER_PARKED, PARKED};
+use crate::ui_status::{classify_load, METER_BREATH, METER_DIM, METER_PARKED, PARKED};
 
 // SPLASH-2: the boot splash lives in `crate::splash` (its own module, own tracer). A `vug::init`
 // background painter used to sit here, commented "called once at boot from main.rs — signature is
@@ -220,31 +220,11 @@ const METER_LILAC: u32 = 0x00_B36BFF;
 const METER_PURPLE: u32 = 0x00_9B59B6;
 const METER_LABEL: u32 = 0x00_8A8296;
 
-/// VUG-HONESTY — the pure per-core display decision at percent scale: [`classify_load_scaled`] at
-/// `full = 100`. The rule itself, and the [`PARKED`] sentinel it returns for a frozen non-demo core,
-/// are stated once in `ui_status`; this is the demo's ten-segment view of the same decision, and
-/// [`parked_display_witness`] below covers every branch of it through this entry point.
-fn classify_load(db: u64, di: u64, is_demo: bool, own_load: u32) -> u32 {
-    classify_load_scaled(db, di, is_demo, own_load, 100)
-}
-
-/// VUG-HONESTY witness — deterministic, arch-neutral, framebuffer-free. Exercises [`classify_load`]
-/// over the cases the honesty rule must separate and emits one PASS/FAIL serial line. Wired into the
-/// `virt` CAPSTONE boot (`arch::sched::run_capstone_boot_core`), so `test-arm` and the GICv3 suite
-/// witness a parked core reading PARKED rather than a fabricated pinned bar. Returns true on PASS.
-pub fn parked_display_witness() -> bool {
-    let busy = classify_load(8, 0, false, 99) == 100; // scheduled + fully busy
-    let idle = classify_load(0, 2, false, 99) == 0; // scheduled + idle → honest 0%, NOT own_load
-    let half = classify_load(1, 1, false, 0) == 50; // scheduled + half busy
-    let demo = classify_load(0, 0, true, 42) == 42; // frozen demo core → its own render load
-    let park = classify_load(0, 0, false, 99) == PARKED; // frozen non-demo core → PARKED, not fabricated
-    let pass = busy && idle && half && demo && park;
-    serial_println!(
-        ":: VUG-HONESTY: parked-core display witness {} — a frozen non-demo core reads PARKED (never the demo core's load); scheduled cores read their busy fraction, the demo core its render load ::",
-        if pass { "PASS" } else { "FAIL" }
-    );
-    pass
-}
+// DECRUD-1 — `classify_load` and `parked_display_witness` used to live here. The witness is
+// metal-earned and the rule it exercises is `ui_status`'s, so making them hostage to this demo
+// module's `vugdemo` gate would have taken a live falsifier off every default boot. Both moved to
+// `ui_status`, which is ungated and compiled on both arches; the meter below reads the classifier
+// back from there through the same single entry point, so the decision still has one definition.
 
 /// The per-core CPU load sampler — shared by the vug corner meter and the `pulse` full-screen
 /// monitor (UI1-M2/M3). Holds the previous `(busy, idle)` tick snapshot per core and the last
@@ -1032,6 +1012,11 @@ pub fn run_crystal(pal: &mut TargetPal, mode: Mode) {
             work_acc = 0;
             total_acc = 0;
         }
+
+        // VUGRAS (RAS localizer, `UNAOS_VUGRAS=1`): force a writeback sweep at the end of each frame so
+        // a FillWrite RAS fires within a frame of the bad store instead of frames later. No-op with the
+        // knob off (default-quiet). Deliberately makes the fault fire earlier — that is its purpose.
+        crate::vugras::frame_sweep(frame);
 
         // (Rotation angles ay/ax are advanced at the top of the loop — held-key / drag stepping
         // when the user is driving, the idle auto-tumble otherwise.)

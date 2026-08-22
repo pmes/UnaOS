@@ -141,22 +141,30 @@ pub mod pal;
 pub mod ui;
 pub mod ui_status;
 // The in-kernel 3D sculptor and the full-screen `pulse` monitor — the `vug`, `vug bebox`, `vug wire`
-// and `pulse` shell verbs, plus `parked_display_witness` (called from `arch::aarch64::sched`).
+// and `pulse` shell verbs. A DEMO, and now gated as one.
 //
-// Aarch64 only, and the gate is the whole story of the module's ownership. The x86 trunk deleted
-// vug.rs deliberately; the R23 merge took the pi4 body wholesale and restored the verbs on x86 as a
-// side effect, so this gate is what puts x86 back where it meant to be while leaving the Pi exactly
-// as it is. Nothing outside aarch64 needs the module: the pieces that ARE shared — the meter palette
+// Aarch64 only, because the x86 trunk deleted vug.rs deliberately and the R23 merge took the pi4 body
+// wholesale, restoring the verbs on x86 as a side effect; the arch gate is what puts x86 back where it
+// meant to be. Nothing outside aarch64 needs the module: the pieces that ARE shared — the meter palette
 // (`METER_DIM`/`METER_BREATH`/`METER_PARKED`), the `PARKED` sentinel and the VUG-HONESTY
-// `classify_load_scaled` rule the instrument strip reads — were moved into `ui_status`, which owns
-// them outright and compiles on both arches; `vug` imports them back. `shell.rs` gates its `vug` and
-// `pulse` arms to match, so on x86 those words reach the ordinary unknown-command reply.
+// `classify_load_scaled` rule the instrument strip reads — live in `ui_status`, which owns them
+// outright and compiles on both arches; `vug` imports them back.
 //
-// (The comment this replaces justified the restore with "`run_bsp` is why user vugs run". `run_bsp`
-// appears nowhere in vug.rs — it lives in `arch/{aarch64,x86_64}/sched.rs`, and the EL0 vug is the
-// `VUG.ELF` vessel, not this module. Only the classifier half of that claim was ever true, and it
-// now points at `ui_status`.)
-#[cfg(target_arch = "aarch64")]
+// DECRUD-1 — and now `feature = "vugdemo"` as well, DEFAULT OFF. The arch gate said WHERE the demo may
+// compile; it never asked WHETHER a default image should carry it, and the answer is no. The three
+// verbs have shipped EL0 replacements the Pi actually runs (`VUG.ELF`, `PULSE.ELF`, both staged into
+// every kernel8 image), no boot path calls into this module on either arch, and the operator reaches it
+// only by typing at the console — so a default kernel8.img was carrying ~1.3 kloc of Ring-0 software
+// renderer that nothing on the machine could ever reach without a keystroke. `shell.rs` gates its `vug`
+// and `pulse` arms on the same feature, so knob-off those words reach the ordinary unknown-command
+// reply exactly as they already do on x86. `parked_display_witness` moved to `ui_status` ahead of this
+// gate: it is a metal-earned falsifier and must not be hostage to a demo's knob.
+//
+// (An earlier comment here justified keeping the module with "`run_bsp` is why user vugs run".
+// `run_bsp` appears nowhere in vug.rs — it lives in `arch/{aarch64,x86_64}/sched.rs`, and the EL0 vug
+// is the `VUG.ELF` vessel, not this module. Only the classifier half of that claim was ever true, and
+// it points at `ui_status`.)
+#[cfg(all(target_arch = "aarch64", feature = "vugdemo"))]
 pub mod vug;
 pub mod video;
 pub mod clock;
@@ -165,6 +173,9 @@ pub mod logts;
 pub mod console;
 pub mod user;
 pub mod splash;
+// VUGRAS (hw-jetson): the RAS localizer instrument riding the vug frame loop. Declared
+// unconditionally (its public surface is knob-inert); the sweep call sites are tegra-lane.
+pub mod vugras;
 pub mod gui_watchdog;
 // WEDGE-2: the last-words breadcrumb instrument for the TAB->focus-raise chain. ALWAYS declared (its
 // public surface degrades to empty `#[inline(always)]` shims when the `wedge2` feature is off), so the
@@ -206,6 +217,13 @@ pub mod deadman;
 // x86-only; an aarch64 `rtpi` build gets the inline shim. Knob: `UNAOS_RTPI=1`.
 #[cfg(feature = "rtpi")]
 pub mod rtpi;
+
+// VUGSPREAD (PARITY.md §6.6c) — the arch-neutral POLICY of the work-stealing repair: the per-victim
+// steal floor and the escalating per-task cooldown brake. It was `const`s and `fn`s inside
+// `arch/x86_64/sched.rs`, which is exactly why the Pi never got the repair; lifted here so both
+// schedulers call ONE definition instead of drifting copies. Declared unconditionally and carrying
+// no state — it is `const fn` arithmetic over its arguments, so nothing is linked that is not used.
+pub mod sched_spread;
 
 pub fn init() {
     arch::init();

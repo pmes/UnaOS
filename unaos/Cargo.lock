@@ -436,9 +436,14 @@ dependencies = [
  "una-abi",
  "unafs",
  "unaos-boot-info",
+ "unaos-xusb-fw",
  "volatile 0.6.1",
  "x86_64",
 ]
+
+[[package]]
+name = "unaos-xusb-fw"
+version = "0.1.0"
 
 [[package]]
 name = "unicode-ident"

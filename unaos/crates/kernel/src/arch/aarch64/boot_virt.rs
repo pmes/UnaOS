@@ -199,7 +199,7 @@ unsafe fn enable_el1_regime() {
 // two `virt`-specific additions: it programs no MMU (already done) and it DISABLES the physical timer.
 //
 // Why disable the timer: the shared IRQ vector stub (`exceptions::__vec_irq`) banks ELR_EL2/SPSR_EL2 on
-// this not-baremetal build (the compile-time `irq_el!()` = "2"), which would fault if an IRQ were taken
+// this not-baremetal/not-tegra build (the fixed `irq_bank!` EL2 arm), which would fault if an IRQ were taken
 // at EL1. CAPSTONE on `virt` runs COOPERATIVELY (no preemption needed — the same way the Pi CAPSTONE runs
 // in QEMU with no Group-1 delivery), so we kill the only periodic IRQ source (CNTP) before the drop; the
 // JC2 SMP SGIs are already quiescent (their proof completed before this drop). CNTPCT (the free-running

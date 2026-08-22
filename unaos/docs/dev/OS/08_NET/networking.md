@@ -724,6 +724,183 @@ Reproduce (hermetic, forward+suffix+metrics OK, serve PENDING): `./arroyo test 9
 composition (hosts-format blocklist from FAT): `UNAOS_IRQSTORAGE=1 UNAOS_FATIMG=sf ./arroyo
 test 200`. The over-the-wire serve leg is unchanged from SINKHOLE-1 (injector-driven; PENDING hermetically).
 
+## NET-4j — the Orin DHCP no-lease, localized above the driver (smoltcp gate probe + reproducer)
+
+On the Jetson Orin (aarch64, RTL8168 GbE), the `net4` seam's `dhcp_or_static` bring-up
+(`crates/kernel/src/net_phy.rs`) repeatedly fell back to the static address despite the RTL8168
+driver observing a valid unicast DHCP OFFER on the wire. The R23s1 boot-11 capture showed the OFFER
+matching the DISCOVER's transaction id, addressed to our station MAC, carrying a valid `yiaddr` — it
+"passed ALL driver-visible checks" — yet no lease followed. The prior `[net4d]` probe only inspected
+three fields (xid, destination MAC, `yiaddr`), so that line was misleading: the smoltcp `dhcpv4`
+socket applies **four further gates** the driver never checked.
+
+**Root cause (proven, not hardware-dependent).** The smoltcp integration path is correct. A host and
+QEMU reproducer (`net_phy::net4j_repro`) drives the *same* `smoltcp::socket::dhcpv4::Socket` over a
+fake `phy::Device` carrying the seam's exact `DeviceCapabilities` (medium Ethernet, MTU 1500, default
+checksum caps), polls once to emit the DISCOVER, then injects a synthesized OFFER echoing its xid.
+Because the seams use a fixed `random_seed` (`0x4e455434`), the DISCOVER's transaction id is
+deterministically `0x51fb1e94` — **identical to the metal boot-11 xid**, so the reproducer replays
+the real exchange rather than an analogue. It asserts the integration contract:
+
+- a **well-formed** OFFER (valid IPv4/UDP checksums, BOOTP `chaddr == station MAC`, DHCP option 54
+  *server identifier* present) drives the socket Discovering → Requesting and **emits a REQUEST**;
+- an OFFER identical but for a **missing option-54 server identifier** is **silently dropped** — no
+  REQUEST — because `dhcpv4::Socket::process` returns early on `missing server_identifier`.
+
+The metal no-lease is therefore an OFFER that fails one of these smoltcp-strict gates the driver
+probe never inspected (per smoltcp 0.13.1 `iface/interface/ipv4.rs` + `socket/dhcpv4.rs::process`):
+**(1)** IPv4 header checksum verification (default RX checksum caps), **(2)** UDP checksum
+verification (a zero checksum is legal and accepted per RFC 768), **(3)** BOOTP `chaddr` equal to the
+station MAC, **(4)** option-54 server identifier present.
+
+**The fix (do-it-right diagnostic + regression).**
+- `net4d_offer_check` (`arch/aarch64/rtl8168_tegra.rs`) now computes each of the four smoltcp gates
+  over the raw OFFER frame (`smoltcp_offer_gate`, read-only, fully bounds-checked) and emits a
+  `[net4j] smoltcp REJECT at gate N/4 …` or `[net4j] smoltcp ACCEPT …` line, so a **single** metal
+  boot names the exact failing field instead of guessing (each guess previously cost a boot).
+- `net4j_repro::run` is a witness-gated, self-contained regression (no `-netdev` needed) that runs on
+  the aarch64 vnet QEMU gate: `UNAOS_WITNESS=1 UNAOS_VNET=1 ./arroyo test-arm`. It prints
+  `NET-4j reproducer: DISCOVER xid=0x51fb1e94 | well-formed OFFER => REQUEST=true | OFFER w/o
+  server-id => REQUEST=false | PASS ::`, locking the contract against smoltcp regressions.
+
+Refuted along the way (each formerly a metal-boot cost): UDP/IPv4 checksum *capabilities* mismatch
+(reproducer passes with default caps; zero-checksum and trailing-FCS variants both accepted), a
+frozen `Instant`/clock (CNTPCT advances — it drives the 5 s timeout that *did* fire), and
+broadcast-vs-unicast handling (smoltcp intercepts a unicast OFFER to `yiaddr` *before* the interface
+address check, so an address-less interface still receives it). Weakening smoltcp's RX checksum
+verification was explicitly rejected (a protection, not a bug).
+
+## NET-4k — the poll/dispatch cadence, run to ground (QEMU refutes it) + the REQUEST-TX blind spot closed
+
+R23s1 boot-13 sharpened the NET-4j picture: the OFFER passed **every** smoltcp gate (the driver's
+`[net4j] smoltcp ACCEPT` verdict — IPv4 csum OK, UDP csum OK, `chaddr == MAC`, server-id present) yet
+still no REQUEST reached the wire and no lease followed. With frame content exonerated on silicon, the
+`iface.poll` / dispatch **cadence** of the `dhcp_or_static` window loop was the last standing suspect.
+
+**Refuted, empirically.** The aarch64 `vnet` path drives the *identical* `dhcp_or_static` loop over a
+real `virtio-net` ring under QEMU against slirp's DHCP server, and it **leases**:
+`AARCH64 VNET: NET: DHCP lease ip=10.0.2.15/24 gw=10.0.2.2 (server 10.0.2.2) after 3 polls => PASS`.
+Three `iface.poll` calls take the socket Discovering → Requesting → ACK end-to-end. The busy loop is
+correct; the poll cadence is not the defect. (The NET-4j reproducer independently proves the socket
+emits a REQUEST for a well-formed OFFER.) This closes the cadence hypothesis without a metal boot.
+
+**The blind spot the audit exposed (and closed).** The boot-13 claim "no REQUEST TX line appears" was
+**not** proof the socket never emitted one: the driver's TX witnesses only ever fired for the *first*
+DISCOVER (the `d_xid` capture) and for `tx_count == 1` (`[net4c]`). A smoltcp-emitted REQUEST — the
+*second* DHCP TX — left **no serial trace at all**. So "no REQUEST line" could not distinguish
+"socket never emitted a REQUEST" (a frame-accept problem *above* the driver) from "REQUEST sent but
+un-witnessed" (the drop is the ACK, or the wire). The instrumentation now resolves it on one boot:
+
+- **`[net4k] TX DHCP <type> …`** (`arch/aarch64/rtl8168_tegra.rs::transmit`) witnesses **every**
+  socket-originated DHCP frame by message type (bounded), not just the first DISCOVER. If the dhcpv4
+  socket accepts the OFFER and dispatches a REQUEST, boot-14 shows `[net4k] TX DHCP 3(REQUEST) …` on
+  the way to the NIC — the definitive "did the socket emit it" answer.
+- **`[net4k] OFFER frame len=… ip_total=… trailing=… B`** (`net4d_offer_check`) surfaces the trailing
+  bytes handed to smoltcp. The RTL8168 C+ RX engine reports the received length **including** the
+  4-byte Ethernet FCS (Linux r8169 subtracts 4: `pkt_size = (status & 0x3fff) - 4`); `rx_frame_raw`
+  does not. smoltcp normally bounds L3/L4 by the IP/UDP length fields so this parses regardless, but a
+  length-driven divergence is exactly the RTL8168-specific effect QEMU's virtio path (which strips the
+  FCS) cannot reproduce — so it is now witnessed rather than assumed benign.
+- **`… after N polls => PASS` / `no lease within … (N polls) …`** (`net_phy.rs::dhcp_or_static`)
+  surfaces the poll count on both outcomes, so the metal cadence is directly comparable to the
+  known-good virtio lease (`after 3 polls`).
+
+**Expected boot-14 lines.** Either a lease —
+`:: PCIE4: NET: DHCP lease ip=… gw=… (server …) after <N> polls => PASS ::` (preceded by
+`:: PCIE4:   [net4k] TX DHCP 3(REQUEST) xid=0x51fb1e94 … tx#2 ::`) — **or** the named miss: if
+`[net4k] TX DHCP 3(REQUEST)` never prints, the dhcpv4 socket did not accept the (gate-passing) OFFER,
+localizing the defect to a length/parse divergence the `trailing=…` line quantifies; if it *does*
+print yet no lease follows, the REQUEST left the NIC and the drop is the inbound ACK (RX), not the
+DISCOVER→REQUEST cadence. Metal-only: none of this path compiles or runs under QEMU (no Tegra234 RC).
+
+## NET-4l — the ACK dies in the zero-frame zone: RX descriptor re-arm published without OWN-last ordering
+
+R23s1 boots 2–14 held one stubborn cross-boot invariant: **the first popped RX frame always carries
+real bytes; every later frame reads a real DESCRIPTOR length but an all-zero payload** (boot-4: the
+whole 32-slot ring popped in 5 s with only ~2 real frames on the wire). With ordering (`dsb ld`),
+cache maintenance (`dc ivac`), the inbound iATU (NET-4h, armed + readback-verified), the SMMU (NET-4i,
+bypassing), descriptor `addr` fields (all-MATCH, NIC-preserved), frame content, poll cadence, and
+checksum caps all refuted, the un-refuted core was the descriptor **re-arm** path.
+
+**The defect (`arch/aarch64/rtl8168_tegra.rs::rx_frame_raw`).** The *initial* ring is published by
+`init_rings`' trailing `dsb sy` **before** RX is enabled, so the NIC observes those descriptors
+fully-formed — which is exactly why the **first** frame is always real. But every **re-arm** wrote the
+whole 16-byte descriptor as **one unordered store with no barrier**. On weakly-ordered aarch64 the
+continuously-polling C+ RX engine could observe the re-armed `OWN=1` (opts1) *before* the `addr` / len
+/ opts2 stores became visible, and DMA the next frame against a **stale (or still-zeroed) descriptor** —
+the "later buffers possibly never written by the NIC at all" signature for slots ≥2, and why the one
+real frame is always the first pop (only the barrier-published initial descriptors are ever seen
+coherently). The DHCP ACK, arriving as one of those post-re-arm frames, is read as zeros → no lease.
+
+**The fix.** Re-arm with Linux r8169's OWN-last publish discipline: write the descriptor **body**
+(addr + len + EOR) with `OWN` **clear** first, `dsb sy` to order it ahead of the ownership handoff,
+then set `OWN` **last** in a single aligned `u32` store to opts1 (offset 0 of the 16-byte-strided,
+256-byte-aligned ring ⇒ always 4-aligned), then `dsb sy` to publish it. This is `addr/opts2 →
+dma_wmb() → OWN|opts1`. It is a DMA **publish** (write-side) barrier — **not** the refuted read-side
+`dsb ld`, and **not** cache maintenance (also refuted). TX already gated its descriptor behind a
+`dsb sy` before the `TPPoll` doorbell, so TX (DISCOVER/REQUEST) was never affected; RX has no doorbell
+(the engine polls continuously), which is why the missing publish barrier bit only the RX re-arm.
+
+**Instrumentation (`UNAOS_NET4_RINGDUMP`, read-only, default-quiet).** So a wrong fix still names the
+state machine exactly: `net4l_ring_dump` dumps OWN/EOR/len/opts2/addr of **all 32** descriptors
+`pre-window` (before the DHCP window) and `after-rx` (after each of the first `NET4L_AFTERRX_MAX` real
+pops); the knob also widens the existing `[net4g]` post-window dump to the full ring. Unset, the boot
+is unchanged.
+
+**Expected boot-15 lines.** A real lease is now expected:
+`:: PCIE4: NET: DHCP lease ip=… gw=… (server …) after <N> polls => PASS ::`, preceded by
+`:: PCIE4:   [net4k] TX DHCP 3(REQUEST) xid=… tx#2 ::` and the OFFER's `[net4j] smoltcp ACCEPT` line —
+the DISCOVER→OFFER→REQUEST→**ACK** round now completing because the re-armed RX descriptors the ACK
+lands in are published OWN-last. If a lease still does not follow, the `UNAOS_NET4_RINGDUMP` `after-rx`
+snapshots name the exact post-re-arm descriptor state (which slots the NIC re-owned, which carry a real
+length, any `addr` divergence). Metal-only: none of this path compiles or runs under QEMU (no Tegra234 RC).
+
+## NET-4m — the zeros survive the OWN-last re-arm; the per-pop invalidate is already live, so the cause is below the driver
+
+R23s1 boot-15 ran the NET-4l OWN-last re-arm and **the rx[2..] all-zero payloads persisted** (rx[1]
+the real OFFER; rx[2] a real 346-byte descriptor length with a zero payload; rx[3..8] lengths varying
+346/346/64/64 read fresh; the re-armed descriptors all `[MATCH]`). The natural next suspect was "the
+`dc ivac` invalidate-before-read fires only on the first pop."
+
+**That suspect is false — verified in the source.** `rx_frame_raw`'s
+`cache::invalidate_range(buf, len)` is **unconditional**: it runs on *every* pop, between the OWN-clear
+check and the buffer copy. Only the `[net4f]` *serial witness* is one-shot (`rx_count == 0`) — and that
+one-shot **print** ("first RX pop …") is exactly what read as "the invalidate is first-pop-only." The
+copy that feeds the NET-4d classifier is therefore **already a post-invalidate DRAM read**, so the zeros
+NET-4d reports are what the buffer DRAM holds *after* the invalidate. Extending the invalidate to every
+pop is a no-op — it is already there.
+
+**Two facts move the root cause outside this driver's invalidate lane.** (1) NET-4g proves the
+descriptor `addr` is **all-MATCH** — the NIC has the buffer addresses the driver programmed, so this is
+not descriptor corruption. (2) The descriptor **ring** is observed *coherently* (real per-slot lengths,
+OWN-clear seen, frames pop) while the **buffers** read zero — an **asymmetry a pure cache-coherency
+defect cannot produce**, since ring and buffers share one cacheable identity-mapped heap and one DMA
+master (a cache bug would zero the ring too). So the residual zero is one of:
+
+  * **writes-to-nowhere** — the NIC's payload DMA never lands in the CPU-visible buffer DRAM: an
+    **inbound-DMA reachability** gap (SMMU / inbound iATU / ORIN-DMA-WINDOW), *below* the driver's lane;
+  * **cache/speculation** (less likely, given the asymmetry) — the buffer DRAM holds the payload but the
+    cacheable read shadows it: curable only by a **non-cacheable DMA arena** (a Normal-NC MAIR slot +
+    splitting `mmu_tegra`'s 1 GiB RAM block to L2/L3 page granularity — an **MMU arc**, not a driver arc).
+
+Either fix is a **separate arc in a file this brief does not name**; NET-4m's job is to name *which*,
+not to weaken the (already-correct) per-pop invalidate or the OWN-last re-arm.
+
+**Instrumentation (`UNAOS_NET4_RINGDUMP`, read-only, default-quiet).** A decisive per-pop discriminator,
+`[net4m]`, re-reads the same buffer with an **independent, speculation-fenced** invalidate
+(`dc ivac` + `dsb sy` + `isb`) and dumps `buf[0..16]` for the first `NET4M_PROBE_N` pops with a
+`nonzero=` flag. It splits the two branches on the next metal boot:
+
+  * `nonzero=true`  → *DRAM holds the NIC payload; the copy's zero was a cache/speculation artifact* →
+    the non-cacheable-arena (MMU) arc.
+  * `nonzero=false` (with a real descriptor len) → *writes-to-nowhere* → the inbound SMMU/iATU arc.
+
+**Expected boot-16 lines (`UNAOS_NET4_RINGDUMP` armed).** For each of the first few real pops:
+`:: PCIE4:   [net4m] rx[<i>] slot=<s> len=<L> post-ivac(fenced) buf[0..16]=<hex> nonzero=<bool> — <verdict> ::`.
+The `[net4m] rx[1]` (the OFFER) line is expected `nonzero=true`; the discriminator is the `rx[2..]`
+lines — their `nonzero` flag names whether the next arc is the inbound-reachability audit or the
+non-cacheable arena. A lease is **not** promised this boot: NET-4m localizes the defect; the fix lands in
+the arc it names. Metal-only (no Tegra234 RC under QEMU).
 ## SOCK-8 — x86 DNS client on the shared `net_dns` (`pool.ntp.org` for SNTP)
 
 Until SOCK-8, smolnet had no way to turn a name into an address, so SNTP-X86 could only target the gateway.

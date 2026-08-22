@@ -61,8 +61,15 @@ extended by that seat.
   **Residual open, pi seat's:** the awaited-CBW architecture is unverified on Pi silicon — every pi
   `cbw_fault=0` in the archive reads `n=0 storage_slot=0` and is vacuous. Discriminator: a pi metal
   boot with `storage_slot != 0` and BOT traffic to `n > 0`, SUMMARY captured.
-- kernel8 cross-commit byte-identity is NOT currently a valid instrument (1410-byte diff on an
-  x86-confined source change; clean-dirs reproducibility discriminator queued).
+- kernel8 byte-identity — **INSTRUMENT RESTORED, with a usage rule** (discriminator run
+  2026-08-03, report plans/review/kernel8-reproducibility-verdict.md): two clean-tree builds of
+  one sha are byte-identical (0 differing bytes; path/timestamp do not leak). The 1410-byte
+  cross-commit diff was ENTIRELY the embedded 8-char git-sha stamp (`arroyo:47` →
+  `genet.rs:2572` `option_env!` → content-addressed rodata symbol reorder → ADRP/ADD ripple);
+  a stamp-neutralized control proved the x86-cfg'd source diff contributed ZERO bytes to the
+  aarch64 kernel8. RULE: same-sha byte-identity is valid evidence from CLEAN trees only;
+  cross-commit comparison requires neutralizing the stamp (detach source, soft-reset to the
+  reference sha). Corollary: builds must never run under RAM-backed /tmp (caused a host OOM).
 - **Trunk 47f955a3 does not compile x86 under `witness`** (x86 seat, post-landing): two more
   orphaned x86 call sites, gated on `witness` not `wc` (`wcg.rs:130` imports
   `crate::arch::aarch64` unconditionally; `wm::focus_reset` missing at x86 syscall.rs:4142).
@@ -88,6 +95,25 @@ extended by that seat.
   gating needs the kepler knob set (`UNAOS_IVB/KEPLER/KEPLER_TAKEOVER/KEPLER_FIFO/SMC`), not
   `UNAOS_WC` alone. pi activation is default-path (metal-proven).
 - No QEMU suite on an unchanged tree — `mbench.py --replay` the existing capture.
+- **Fixture-provisioning asymmetry** (the part a future seat will trip on): the two platforms
+  had DIFFERENT fixture models — pi plants at image build (arroyo:1652–1673) + the aarch64
+  U-family runtime-creates its files; x86 planted only in the QEMU FAT script, so x86 METAL
+  boots silently degraded U9x/U10 witnesses to a passing in-memory mode. Fixed 2026-08-03
+  (builder plants, contents cross-checked against witness constants). When adding a witness
+  with an on-disk fixture, verify the fixture reaches EVERY medium the witness runs from.
+- **Commit-message-overclaim** (x86 seat, self-reported; belongs beside the vacuous zero): a
+  commit titled "name all six sysret-scrubbed registers in every stub" did not do what it said
+  (read "argument registers" as per-stub, not the scrubbed six) and the gap crashed VUG.ELF on
+  metal (`rsi` zeroed under a live `&mut` — err=0x5 cr2=0x0). A commit message is a claim;
+  gate the claim, not the diff's existence. Fixed and disassembly-proven same day.
+- **Syscall-return register handling diverges BY DESIGN — never port a "fix" across arches**:
+  aarch64 needs no GPR scrub on the svc return because `RESTORE_GPRS` overwrites the full file
+  from the task's own entry frame (kernel values structurally cannot leak; exceptions.rs
+  `__vec_svc`); x86 NEEDS its six-register sysret scrub because its dispatch leaves kernel
+  values in caller-saved registers. Same invariant, opposite mechanisms. Likewise the saved
+  user stack pointer is per-TASK state on both arches — aarch64 banks SP_EL0 on the task's own
+  kernel stack (M6e, hazard named in the entry comment); x86's per-CPU slot version of this was
+  a cross-task stack-aliasing bug (s68) fixed 2026-08-03 to converge on the aarch64 shape.
 - **Vacuous-zero law**: a zero from a counter whose subject never ran is vacuous, not passing —
   every zero-anomaly verdict must be qualified on evidence the subject ran at all (e.g. a
   `cbw_fault=0` claim requires `n>0 storage_slot!=0` beside it, and the capture should carry the

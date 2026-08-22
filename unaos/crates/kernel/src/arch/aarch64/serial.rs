@@ -59,7 +59,7 @@ mod tegra {
     const LSR_THRE: u32 = 1 << 5; // transmit holding register empty (ok to write)
     const LSR_DR: u32 = 1 << 0; // receive data ready
 
-    pub fn write_byte(byte: u8) {
+    pub fn write_byte(byte: u8) { if super::tegra_guard::drop_pre_map() { return; } // DARKWIN-GUARD (tail mod)
         unsafe {
             let thr = BASE as *mut u32;
             let lsr = (BASE + LSR) as *const u32;
@@ -78,7 +78,7 @@ mod tegra {
         }
     }
 
-    pub fn read_byte() -> Option<u8> {
+    pub fn read_byte() -> Option<u8> { if !super::tegra_guard::ready() { return None; } // DARKWIN-GUARD (tail mod)
         unsafe {
             let rbr = BASE as *const u32;
             let lsr = (BASE + LSR) as *const u32;
@@ -286,6 +286,90 @@ impl SerialPort {
     }
 }
 
+// ---- SERFIX: the input poll DECLINES a held port instead of blocking on it ----------------------
+//
+// `arch::poll_input` is the one RX read in the kernel, and it runs from the preemptible input task
+// with interrupts ENABLED. Until this arc it took `SERIAL_PORT` with a BLOCKING acquire, which is
+// the same shape INWEDGE found on the panel lock and for the same reason: a preemptible task that
+// blocks on a raw spinlock, unmasked, on the core that also hosts the kernel's IRQ-context printer.
+// Its safety was never structural — it rested on one fact about one counterparty, that `sys_write`
+// (syscall.rs) holds the port only for a bounded IRQ-masked byte loop. That is a property of today's
+// callers, not of the lock, and it silently obliges every future `SERIAL_PORT` holder to stay
+// bounded; the moment one does not, the input core wedges behind it with no diagnostic.
+//
+// So the acquisition below is NON-BLOCKING. A refused poll degrades to "no byte this pass", which
+// costs nothing real: serial input is POLLED, not edge-delivered — the byte stays in the PL011 RX
+// FIFO (16 deep, plus the RX-timeout interrupt on the metal path) and the next pump pass reads it.
+// A `while let Some(b) = poll_input()` drain loop simply ends one iteration early and re-enters on
+// the next pass. Nothing is lost; at worst one poll interval of latency is added under contention
+// that previously would have been an unbounded stall.
+//
+// The refusals are COUNTED, and the census is reported EDGE-TRIGGERED once per contention episode
+// (see `serfix_witness`), matching the `[inwedge]` discipline: silent on every boot that never
+// contended — which is every automated gate — and loud exactly once when a real storm begins.
+
+/// SERFIX — polls that found `SERIAL_PORT` held elsewhere and declined it. Nonzero means the window
+/// that would have blocked the input core was entered on this boot, and was walked away from.
+static SERFIX_REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// SERFIX — polls that acquired the port. The denominator, so a refusal rate is readable rather than
+/// an unanchored count.
+static SERFIX_READ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// SERFIX — true while inside a contention episode (a refusal has been witnessed and no poll has
+/// acquired the port since). Set by the witness, cleared by the next successful acquire; it is what
+/// makes the `[serfix]` line episode-edged instead of per-refusal.
+static SERFIX_IN_EPISODE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// SERFIX — `(read, refused)`.
+pub fn serfix_census() -> (u32, u32) {
+    use core::sync::atomic::Ordering;
+    (SERFIX_READ.load(Ordering::Relaxed), SERFIX_REFUSED.load(Ordering::Relaxed))
+}
+
+/// SERFIX — the `[serfix]` recurrence witness, emitted at the START of a contention episode: the
+/// previous poll acquired the port and this one did not. Episode-edged rather than per-refusal
+/// because `poll_input` runs in a tight pump loop — a line per refusal would turn the storm this
+/// exists to reveal into a flood that hides it. A sustained storm therefore prints once, with the
+/// running totals; a second line means the port was released and contended again.
+///
+/// Printing from the refusal path is safe by construction: `_print` itself is `try_lock` + staging
+/// ring (see `_print` above), so the witness for a held port cannot block on that same held port —
+/// the line goes into the lock-free ring and the next holder emits it intact, in order.
+fn serfix_note_refused() {
+    use core::sync::atomic::Ordering;
+    let refused = SERFIX_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+    if !SERFIX_IN_EPISODE.swap(true, Ordering::Relaxed) {
+        let read = SERFIX_READ.load(Ordering::Relaxed);
+        serial_println!(
+            "[serfix] port read={} refused={} — poll_input declined a held SERIAL_PORT instead of blocking on it (input core survived)",
+            read, refused
+        );
+    }
+}
+
+/// SERFIX — the ONE `SERIAL_PORT` acquisition the input poll makes: non-blocking and counted.
+/// `None` means either "no byte waiting" or "the port was held elsewhere"; both are the same thing
+/// to the caller — nothing to read on this pass, try again on the next one.
+///
+/// This is what `arch::poll_input` calls; it is the whole of the input side's contract with the
+/// port lock, so no future `SERIAL_PORT` holder can wedge the input core by running long.
+pub fn poll_input_nonblocking() -> Option<u8> {
+    use core::sync::atomic::Ordering;
+    match SERIAL_PORT.try_lock() {
+        Some(port) => {
+            SERFIX_READ.fetch_add(1, Ordering::Relaxed);
+            // Episode closed: the next refusal is a new one and gets its own witness line.
+            SERFIX_IN_EPISODE.store(false, Ordering::Relaxed);
+            port.read_byte()
+        }
+        None => {
+            serfix_note_refused();
+            None
+        }
+    }
+}
+
 // ---- M5c: PL011 RX interrupt → wake the scheduled input task (bare-metal Pi only) ----------------
 //
 // Instead of the input task polling the UART, the PL011 raises an interrupt when a byte arrives; the
@@ -294,7 +378,9 @@ impl SerialPort {
 // Group-1 IRQ, so `timer::is_live()` is false there and the input task keeps polling (this stays
 // unused). All the interrupt work is on the PL011's own registers + a scheduler Semaphore — none of
 // it touches the `SERIAL_PORT` spin lock (poll_input holds that IRQ-unmasked, so an ISR that took it
-// would self-deadlock same-core).
+// would self-deadlock same-core — SERFIX made poll_input's ACQUIRE non-blocking, which removes the
+// symmetric hazard of poll_input stalling behind a holder, but the section it holds is still
+// IRQ-unmasked, so the rule for the ISR is unchanged: it takes no console lock).
 
 #[cfg(feature = "baremetal")]
 const UART_IMSC: usize = 0x38; // interrupt mask set/clear
@@ -364,4 +450,212 @@ pub fn on_rx_interrupt() {
     }
     RX_IRQ_SEEN.store(true, core::sync::atomic::Ordering::Relaxed);
     RX_READY.post();
+}
+
+// ── DARKWIN-GUARD (orin 1, 2026-08-18) — tail-defined per the Location-shift convention ──────
+// Between ExitBootServices and `mmu_tegra::init`, the kernel runs under the UEFI-handoff
+// translation tables, which map RAM but NOT the Tegra device window (JM2 R4: the kernel's first
+// UARTC read faulted there, caught by UEFI's still-resident ArmCpuDxe vectors — whose post-EBS
+// reporting path is gone, so the observed outcome on the box is a silent stop at the logo).
+// The trunk merge proved the class on metal: `kernel_main` step 0a2 (`video::init_edid`,
+// unconditional on every arch) printed its witness line before `tegra_early_stop`, and the
+// board died at the NVIDIA logo on every boot of 2026-08-18. This latch closes the UARTC class:
+// bytes offered before `mark_mmio_ready()` (armed by `tegra_early_stop` immediately after
+// `mmu_tegra::init` returns) are DROPPED and COUNTED, never written; the count is witnessed on
+// the wire once the window closes. Byte-granularity by design — the content of a pre-map line
+// is gone (fbcon/selftest mirrors still carry it), the COUNT is what survives to the wire.
+// Everything lives in this tail mod, with one-line calls appended to the pre-existing
+// `write_byte`/`read_byte` opening lines, so no pre-existing line shifts and the non-tegra
+// images keep their panic-Location bytes (the main.rs "35-line block" lesson).
+#[cfg(feature = "tegra")]
+mod tegra_guard {
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    static MMIO_READY: AtomicBool = AtomicBool::new(false);
+    static DROPPED_PRE_MAP: AtomicU32 = AtomicU32::new(0);
+
+    /// Arm the UART: the Tegra device window is mapped and UARTC MMIO is safe. Called exactly
+    /// once, by `tegra_early_stop`, the moment `mmu_tegra::init` returns.
+    pub fn mark_mmio_ready() {
+        MMIO_READY.store(true, Ordering::Release);
+    }
+
+    /// True once the device window is mapped (read-side gate: LSR is unmapped before that).
+    pub fn ready() -> bool {
+        MMIO_READY.load(Ordering::Acquire)
+    }
+
+    /// Write-side gate: returns true (and counts the byte) while the window is still dark.
+    pub fn drop_pre_map() -> bool {
+        if ready() {
+            return false;
+        }
+        DROPPED_PRE_MAP.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// How many bytes the guard dropped before the device window was mapped — nonzero means
+    /// some caller printed before `mmu_tegra::init`, exactly the class that hung the merged
+    /// base on metal.
+    pub fn dropped_pre_map() -> u32 {
+        DROPPED_PRE_MAP.load(Ordering::Relaxed)
+    }
+}
+// The module surface `tegra_early_stop` (the sole armer) and its witness line reach:
+// `arch::serial::{mark_mmio_ready, dropped_pre_map}`.
+#[cfg(feature = "tegra")]
+pub use tegra_guard::{dropped_pre_map, mark_mmio_ready};
+
+// ---- SERIAL-FOCUS: the shell's SERIAL INBOX (bare-metal Pi only) ---------------------------------
+//
+// THE BLOCKER THIS EXISTS TO REMOVE. Before this module the Pi's serial RX had exactly one
+// destination: `main::input_service` read a byte with `poll_input()` and posted it as an
+// `Event::Key` straight into `GUI_CHANNEL`. That is the SHELL's channel, which sounds right and is
+// not, for two reasons that compound:
+//
+//   (1) `GUI_CHANNEL`'s only consumer is `render_service`, and `render_service` PARKS inside
+//       `handle_key -> shell::dispatch_command` for the entire life of a foreground command — which
+//       includes `run <elf>`, the call that registers an EL0 window's ASID through
+//       `user_input_set_active` and thereby gives that window the keyboard. So in exactly the state
+//       the campaign cares about — a focused EL0 window — the channel's consumer is asleep. The
+//       first 64 serial bytes queue where nothing will read them; the 65th blocks the input task
+//       inside `Channel::send` (a `Semaphore::wait` with NO deadline). The serial wire is then dead
+//       for the rest of the program's run, and the input task with it. That unbounded wait on a
+//       parked consumer is the freeze family, reached from the UART instead of from the compositor.
+//
+//   (2) A byte that reaches `pal::EVENT_QUEUE` at all — `pal::pump_and_poll`'s aarch64 arm used to
+//       put it there — is INDISTINGUISHABLE from a decoded USB HID key by the time it meets the
+//       `[uvug9]` routing decision in `main::pump_usb_into_gui`. With `user_input_active() != 0`
+//       that decision hands the event to `route_input_to_active_el0()`, i.e. to the focused
+//       window's per-process ring. The ruling that a focused EL0 window owns the keyboard is
+//       CORRECT and stands untouched — but it was silently annexing the serial console with it.
+//
+// THE SPLIT IS BY SOURCE, AND IT IS MADE BY CONSTRUCTION RATHER THAN BY A PREDICATE. There is no
+// `source` tag threaded through `pal::Event`, and deliberately so: a tag is a field every future
+// router has to remember to test, and the one that forgets is a regression nobody sees until the
+// bench. Instead the serial byte NEVER ENTERS the focus-routed pipeline at all. It is consumed
+// BEFORE the focus decision, into this ring, whose only consumer is the shell's key path in
+// `render_service`. USB HID keeps `EVENT_QUEUE` and every line of its focus routing exactly as it
+// is — this module adds zero lines inside `pump_usb_into_gui`'s routing branches — so "the focused
+// EL0 window owns the USB keyboard" and "serial always reaches the shell" are now two statements
+// about two disjoint carriers, and neither can be broken by editing the other.
+//
+// BOUNDED, AND THE PRODUCER NEVER WAITS. `offer` is total: it takes the byte or refuses it and says
+// so, in O(1), under a spin lock held across a single array store. It has no blocking edge anywhere,
+// which is the property (1) above was missing. A storm of serial input therefore cannot jam
+// `GUI_CHANNEL` — the storm does not travel on `GUI_CHANNEL` at all; at most ONE coalesced wake
+// token does (see `main::serial_to_shell`).
+//
+// CAPACITY, with the arithmetic. 512 bytes. The shell's line editor consumes a byte per keystroke
+// and a command line is ~80 columns, so this holds ~6 full command lines pasted back to back, or
+// ~44 ms of continuous 115200 8N1 traffic (11520 B/s) with the consumer completely asleep. The
+// consumer is only ever asleep for the duration of one foreground command, and the paste case is
+// what a storm test actually does, so six lines is the honest working set and 512 is a round
+// number above it. This is a NEW ring and is NOT `serial_ring::SLOT_LEN` (1536): that one is the
+// SERWIT-2 output staging slot whose size is a measured worst case and is not to be grown casually.
+// The two share nothing but the word "serial" and travel in opposite directions.
+//
+// OVERFLOW POLICY: DROP THE NEWEST, and count it. The alternative (evict the oldest) keeps the ring
+// full of the most recent bytes but silently deletes the FRONT of whatever line was being typed,
+// which the line editor then submits as a mangled command. Dropping the newest leaves what has been
+// accepted as an exact, contiguous, in-order PREFIX of the arrival stream, so ordering within the
+// serial stream is preserved for everything that is delivered, and the loss is at the tail where
+// the operator can see it did not echo. `dropped` is on the census line for the same reason.
+#[cfg(feature = "baremetal")]
+pub mod shell_inbox {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use spin::Mutex;
+
+    /// Ring capacity in bytes. See the module header for the arithmetic behind 512.
+    pub const CAP: usize = 512;
+
+    struct Inbox {
+        buf: [u8; CAP],
+        head: usize, // next byte to hand the shell
+        len: usize,  // bytes held
+    }
+
+    static INBOX: Mutex<Inbox> = Mutex::new(Inbox { buf: [0; CAP], head: 0, len: 0 });
+
+    /// Bytes this ring took off the wire on the serial console's behalf.
+    static ACCEPTED: AtomicU64 = AtomicU64::new(0);
+    /// Bytes handed to the shell's key path (`render_service`'s drain). `accepted - delivered - held`
+    /// is always 0 on a healthy boot — a gap means a consumer took bytes by some other door.
+    static DELIVERED: AtomicU64 = AtomicU64::new(0);
+    /// Bytes refused because the ring was full. Non-zero means the shell was parked longer than 512
+    /// bytes of traffic; it is a capacity reading, not a fault, and it is never silent.
+    static DROPPED: AtomicU64 = AtomicU64::new(0);
+    /// High-water mark of `len`, so a boot that never dropped still reports how close it came.
+    static HIGH: AtomicU64 = AtomicU64::new(0);
+
+    /// PRODUCER. Take one serial byte for the shell. Never blocks, never allocates, returns `false`
+    /// when the ring is full (the byte is dropped and counted). Callable from any context that may
+    /// take a spin lock — it is held across a single array store and two `usize` updates.
+    pub fn offer(byte: u8) -> bool {
+        crate::arch::without_interrupts(|| {
+            let mut q = INBOX.lock();
+            if q.len == CAP {
+                drop(q);
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+            let tail = (q.head + q.len) % CAP;
+            q.buf[tail] = byte;
+            q.len += 1;
+            let len = q.len as u64;
+            drop(q);
+            ACCEPTED.fetch_add(1, Ordering::Relaxed);
+            HIGH.fetch_max(len, Ordering::Relaxed);
+            true
+        })
+    }
+
+    /// CONSUMER. The next serial byte for the shell, in arrival order, or `None`. The shell's key
+    /// path in `render_service` is the sole production consumer; the QEMU fixture is the other.
+    pub fn take() -> Option<u8> {
+        let b = crate::arch::without_interrupts(|| {
+            let mut q = INBOX.lock();
+            if q.len == 0 {
+                return None;
+            }
+            let b = q.buf[q.head];
+            q.head = (q.head + 1) % CAP;
+            q.len -= 1;
+            Some(b)
+        });
+        if b.is_some() {
+            DELIVERED.fetch_add(1, Ordering::Relaxed);
+        }
+        b
+    }
+
+    /// Bytes currently held (the shell has not drained them yet).
+    pub fn held() -> usize {
+        crate::arch::without_interrupts(|| INBOX.lock().len)
+    }
+
+    /// Census for the `[serfocus]` witness: `(accepted, delivered, dropped, high_water)`.
+    pub fn census() -> (u64, u64, u64, u64) {
+        (
+            ACCEPTED.load(Ordering::Relaxed),
+            DELIVERED.load(Ordering::Relaxed),
+            DROPPED.load(Ordering::Relaxed),
+            HIGH.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Fixture aid — empty the ring and zero the counters so the QEMU witness measures its own
+    /// window rather than inheriting whatever the boot has already carried. Not on any boot path.
+    #[cfg(feature = "witness")]
+    pub fn test_reset() {
+        crate::arch::without_interrupts(|| {
+            let mut q = INBOX.lock();
+            q.head = 0;
+            q.len = 0;
+        });
+        ACCEPTED.store(0, Ordering::Relaxed);
+        DELIVERED.store(0, Ordering::Relaxed);
+        DROPPED.store(0, Ordering::Relaxed);
+        HIGH.store(0, Ordering::Relaxed);
+    }
 }

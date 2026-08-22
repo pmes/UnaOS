@@ -83,6 +83,9 @@ unsafe impl GlobalAlloc for Locked<Heap> {
 #[global_allocator]
 static ALLOCATOR: Locked<Heap> = Locked::new(Heap::empty());
 
+// VUGRAS: record the heap's identity-mapped span at init so the RAS localizer can name
+// [heap_lo, heap_hi) as a candidate range for a decoded fault ADDR (and bound its DC CIVAC
+// sweep) without reaching into the allocator internals. Read-only diagnostic surface.
 // XCARVE-4 diagnostic surface (mirrors hw-jetson): expose the heap's [lo, hi) so shared
 // consumers (xhci scratchpad bounds guard) can sanity-check placements. (0, 0) pre-init.
 use core::sync::atomic::{AtomicUsize, Ordering};

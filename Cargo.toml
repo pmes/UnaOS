@@ -28,6 +28,7 @@ members = [
     "tools/unafs",
     "tools/unafs_bench",
     "tools/sentinel",
+    "tools/foreman",
     "vessels/lumen",
     "vessels/pulse",
     "vessels/phonolite",

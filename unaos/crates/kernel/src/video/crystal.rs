@@ -38,7 +38,14 @@
 //! | 1 | — (separator)     | —                                                               |
 //! | 2 | Sleep             | honest STUB — prints `unimplemented: Sleep` (no ACPI S3 path)    |
 //! | 3 | Restart           | honest STUB — prints `unimplemented: Restart` (no reboot path)   |
-//! | 4 | Shut Down         | REAL — [`crate::arch::acpi_power::poweroff`] (ACPI S5 soft-off)  |
+//! | 4 | Shut Down         | x86: REAL — [`crate::arch::acpi_power::poweroff`] (ACPI S5). aarch64: honest STUB |
+//!
+//! PI-DESK — **the RENDER and the HIT-TEST cross to aarch64 whole; two of the four ACTIONS do not,
+//! and the menu says so on the wire rather than pretending.** `About` is REAL on both arches. On the
+//! Pi, `Restart` and `Shut Down` join `Sleep` as honest stubs, each printing a line that names the
+//! missing mechanism by name (PSCI `SYSTEM_RESET` / `SYSTEM_OFF` need an EL3 secure monitor, and Pi 4
+//! bare-metal runs at EL2 with nothing behind the `smc`; the real Pi wiring is the BCM2711
+//! watchdog/`PM_RSTS` block, which is a driver arc). See [`fire`] for the full ledger.
 //!
 //! **A stub is not a no-op and not a fake success.** Sleep and Restart RENDER as pickable items — a
 //! menu item that could not be shown pickable would be unfalsifiable — and their pick prints one
@@ -166,8 +173,14 @@ const ROWS: [Row; 5] = [
 const CELL_W: usize = wm::TITLE_CELL_W;
 const CELL_H: usize = wm::TITLE_CELL_H;
 
-/// An item row's height, px: the glyph cell plus 8 px of clearance split top and bottom, so a 16 px
-/// glyph sits with 4 px of air above and below in a 24 px row. Pinned by the const-assert below.
+/// FONT-METRIC — the atlas those metrics come from, named once so the layout constants and the
+/// glyph call can never disagree about which face the menu is drawing.
+const FACE: super::font::Face = super::font::Face::Chrome;
+
+/// An item row's height, px: the glyph cell plus 8 px of clearance split top and bottom, so the
+/// glyph sits with 4 px of air above and below. DERIVED from the cell, so when FONT-METRIC moved
+/// the chrome face from 16 to 20 px the row moved from 24 to 28 with it and the air stayed 4 —
+/// which is the whole point of writing it as an expression. Bounded, not pinned, below.
 const ITEM_H: usize = CELL_H + 8;
 
 /// A separator row's height, px — a thin band carrying one keyline, centred.
@@ -229,7 +242,10 @@ const ITEM_COUNT: usize = item_count();
 const _: () = {
     // The row height must clear the glyph it centres, or the label is cut.
     assert!(ITEM_H >= CELL_H);
-    assert!(ITEM_H == 24);
+    // FONT-METRIC — was `ITEM_H == 24`, a pin on the 16 px face's arithmetic that a face change is
+    // SUPPOSED to move. What actually has to hold is the clearance the row was designed around: 4 px
+    // of air above and below the cell, exactly, whatever the cell is.
+    assert!(ITEM_H == CELL_H + 8 && (ITEM_H - CELL_H) % 2 == 0);
     // The separator band must hold its keyline with air either side.
     assert!(SEP_H >= 3);
     // A menu with no pickable item would be a surface with nothing to pick.
@@ -263,10 +279,11 @@ static DISMISSES: AtomicU64 = AtomicU64::new(0);
 static PICKS: AtomicU64 = AtomicU64::new(0);
 static LAST_VERB: AtomicU8 = AtomicU8::new(0xFF);
 
-/// CLICK-BAND — what the LAST consumed press did, for the router's `band=menu` witness line: the
-/// router sees only `true` from [`press_at`], and a band line that could not say WHAT the band did
-/// would name the band and nothing else. Written by every consuming arm of [`press_at`], read by
-/// [`last_press_outcome`] immediately after the call on the same task — no cross-core reader.
+/// CLICK-BAND — **what the LAST consumed press did.** [`press_at`] answers the router `true`, and a
+/// caller that could not say WHAT the menu did with the press could name the band and nothing else —
+/// which is exactly the reading gap PA41's "the crystal ignores clicks" round was built on. Written by
+/// every consuming arm of [`press_at`], read by [`last_press_outcome`] immediately after the call on
+/// the same task; no cross-core reader.
 static PRESS_OUTCOME: AtomicU8 = AtomicU8::new(0);
 const OUT_OPEN: u8 = 1;
 const OUT_PICK: u8 = 2;
@@ -284,6 +301,11 @@ const OUT_DISMISS: u8 = 4;
 // edge inside one hold cannot be produced and this guard could never fire again. A guard that cannot
 // fire is not protection, it is a claim that the bug is still there — so it comes out with the bug.
 
+/// CLOBBER-REPAIR (PA41) — passes in which a window the compositor painted had intersected the rows
+/// the OPEN dropdown last painted. The bar's and the dock's counter, on the same terms; `clob=` on the
+/// `[crystal]` ledger line is the falsifier for "the menu survives a window blit crossing it".
+static CLOBBERS: AtomicU64 = AtomicU64::new(0);
+
 /// CLICK-BAND — the last consumed press's outcome, as the witness word.
 pub fn last_press_outcome() -> &'static str {
     match PRESS_OUTCOME.load(Ordering::Relaxed) {
@@ -294,6 +316,7 @@ pub fn last_press_outcome() -> &'static str {
         _ => "none",
     }
 }
+
 
 // ---------------------------------------------------------------------------
 // Geometry — the dropdown rect, and the row layout inside it
@@ -456,24 +479,25 @@ fn open(pw: usize, ph: usize) {
         ":: SHARD-MENU: crystal_press=open menu={}x{}+{}+{} items={} ::",
         mw, mh, mx, my, ITEM_COUNT
     );
-    // MENU-DRIVE (GR27 Boot B) — **an open menu must DRIVE the pass that paints it.** [`compose`]
-    // runs only from `wm::composite_once`'s strip tail, and every OTHER state-changing gesture
-    // (close, drag, zoom, minimise, a dock raise) runs a composite itself — this one did not. On the
-    // emptied late-boot desktop nothing else composites (the render lane blocks on its channel; the
-    // backdrop's timer flush carries no damage; `service_damage` returns with no damaged row), so
-    // the operator's crystal presses opened the menu IN STATE while the glass never changed: Boot B
-    // shows `crystal_press=open` at 300194 ms with no `[crystal]`/`[menubar]`/`[dock]` rollup for
-    // the following 30 s — zero passes, an invisible menu, "the crystal ignores clicks". Task
-    // context only (the click router and the fixtures), so the composite is taken directly.
+    // MENU-DRIVE (x86 trunk 122ed63e, ported; PA41 on the Pi) — **an open menu must DRIVE the pass
+    // that paints it.** [`compose`] runs only from `strip::compose_all` at the tail of
+    // `wm::composite_once`, and every OTHER state-changing gesture (a close, a drag, a zoom, a
+    // minimise, a dock raise) runs a composite itself — this one did not. On the emptied late-boot
+    // desktop nothing else composites (the render lane blocks on its channel, the backdrop's timer
+    // flush carries no damage, `wm::service_damage` returns with no damaged row), so the operator's
+    // presses opened the menu IN STATE while the glass never changed: on x86 that read as
+    // `crystal_press=open` with no `[crystal]` rollup for the next 30 s; on the Pi, where the mouse
+    // itself drives composites, it read as a menu that appeared only if you kept moving the pointer.
+    // Task context only (the click router, `key_escape`, `set_enabled(false)` and the fixtures), so
+    // the composite is taken directly.
     super::wm::composite();
-    // BELT-AND-BRACES retry. The x86 gate may DECLINE this pass into a concurrent holder; the
-    // GUARANTEED painter is that holder, whose re-run loop and lost-wakeup gate now test
-    // [`paint_owed`] ([`super::wm::menu_paint_owed`]) alongside window damage and the erase queue —
-    // so a menu the holder held the gate through (a `[wc-d] verify` holds it over a second) is
-    // painted by the holder on release, not stranded. This immediate retry closes only the narrow
-    // window where the first pass declined but the holder has ALREADY released — cheaper than
-    // waiting for the holder's loop when no one is holding. The slot confirms the paint LANDED.
-    if SLOT.packed() == 0 {
+    // BELT-AND-BRACES retry, and it is NOT dead weight on aarch64 even though `wm::composite` has no
+    // decline path there (it IS `composite_once`): `strip::paint` can still decline the pass on a
+    // contended SCRATCH or a surface that is not yet `word4`, and then the slot is untouched and the
+    // menu is open with nothing on the glass. [`paint_owed`] is the same test `compose` acts on, so a
+    // retry runs iff the first pass did not land. On x86 this also closes the narrow window where the
+    // pass was declined into a concurrent `COMP_GATE` holder that has since released.
+    if paint_owed() {
         super::wm::composite();
     }
 }
@@ -488,17 +512,13 @@ fn dismiss(reason: &str) {
     }
     DISMISSES.fetch_add(1, Ordering::Relaxed);
     serial_println!(":: SHARD-MENU: crystal_press=dismiss reason={} ::", reason);
-    // MENU-DRIVE — the mirrored half of [`open`]'s rule: the erase ([`compose`]'s closed path, which
-    // also hands the vacated rows back through [`repaint_vacated`]) runs only from a composite, and
-    // on a static desktop no other pass is coming — an on-glass dropdown would outlive its Escape.
-    // Every caller is task context (the click router, the Escape arm, `set_enabled(false)`, the
-    // fixtures); a dismiss of a menu that never painted erases nothing (the slot is clear) and the
+    // MENU-DRIVE — the mirrored half of [`open`]'s rule. The erase ([`compose`]'s closed path, which
+    // also hands the vacated rows back to their owners through [`repaint_vacated`]) runs only from a
+    // composite, and on a static desktop no other pass is coming — an on-glass dropdown would outlive
+    // its Escape. A dismiss of a menu that never painted erases nothing (the slot is clear) and the
     // pass is one bounded walk.
     super::wm::composite();
-    // BELT-AND-BRACES retry — the mirror of [`open`]: [`paint_owed`] reports `!OPEN && SLOT!=0` as
-    // an owed ERASE, so the gate holder discharges a declined dismiss too; this closes only the
-    // already-released window. The slot is non-zero exactly while an erase is owed.
-    if SLOT.packed() != 0 {
+    if paint_owed() {
         super::wm::composite();
     }
 }
@@ -515,10 +535,28 @@ pub fn dismiss_for_bar_off() {
 /// - `About`    — prints the Shard identity + version (REAL).
 /// - `Sleep`    — honest STUB: prints `unimplemented: Sleep`, no side effect.
 /// - `Restart`  — honest STUB: prints `unimplemented: Restart`, no side effect.
-/// - `ShutDown` — REAL: [`crate::arch::acpi_power::poweroff`], which does not return.
+/// - `ShutDown` — on x86, REAL: [`crate::arch::acpi_power::poweroff`], which does not return.
 ///
 /// ⛔ The fixture must NEVER call this with [`Verb::ShutDown`], and does not: it drives picks only for
 /// the safe verbs and proves Shut Down's routing through [`item_at`].
+///
+/// # PI-DESK — what Restart and Shut Down are on the Pi, and why they are NOT wired
+///
+/// The render and the hit-test cross to aarch64 whole; the ACTIONS do not, and the honest answer is
+/// stated on the wire rather than faked. `acpi_power::poweroff` is an x86 path (ACPI S5 through the
+/// PM1 control block) and has no aarch64 twin. The aarch64 twin *of the family* is PSCI —
+/// `SYSTEM_OFF` (0x8400_0008) and `SYSTEM_RESET` (0x8400_0009) through an `smc` — and this kernel does
+/// carry PSCI, but only in `arch/aarch64/smpprobe.rs`, only `CPU_ON`/`AFFINITY_INFO`/`FEATURES`, and
+/// only on the **Tegra** path where an EL3 secure monitor answers. `SYSTEM_OFF` is queried by
+/// `PSCI_FEATURES` there and, in that file's own words, *"never invoked"*.
+///
+/// The Pi 4 is the case that settles it: bare-metal BCM2711 boots to EL2 with **no EL3 firmware
+/// behind it**, so an `smc` is not a power call — it is an unhandled exception. There is nothing to
+/// route to. So both verbs print an `unimplemented:` line naming what is missing, exactly as `Sleep`
+/// already did on x86, and the menu remains fully live: it opens, it hit-tests, it dismisses, and
+/// `About` is REAL on both arches. Wiring these means a Pi power path (the watchdog/PM block for
+/// reset, `PM_RSTS` for halt) — a driver arc, not a menu arc, and named as the follow-up rather than
+/// smuggled in here.
 fn fire(verb: Verb) {
     match verb {
         Verb::About => {
@@ -534,14 +572,32 @@ fn fire(verb: Verb) {
             serial_println!(":: SHARD: unimplemented: Sleep (no ACPI S3 suspend path) ::");
         }
         Verb::Restart => {
+            #[cfg(target_arch = "x86_64")]
             serial_println!(":: SHARD: unimplemented: Restart (no reboot path) ::");
+            // PI-DESK — the same honest line, naming the aarch64 reason rather than the x86 one. See
+            // this function's header: PSCI SYSTEM_RESET needs an EL3 monitor the Pi does not have.
+            #[cfg(target_arch = "aarch64")]
+            serial_println!(
+                ":: SHARD: unimplemented: Restart (no PSCI SYSTEM_RESET — Pi 4 bare-metal runs at EL2 with no secure monitor; a BCM2711 watchdog reset is the wiring this needs) ::"
+            );
         }
         Verb::ShutDown => {
             // Deliberate and destructive: the operator opened the menu and pressed Shut Down. Say so
             // once, then hand off to the real ACPI S5 soft-off, which either powers the machine off
             // mid-instruction or parks in `hlt` with its own witness. Never returns.
-            serial_println!(":: SHARD: shut down — entering ACPI S5 soft-off ::");
-            crate::arch::acpi_power::poweroff();
+            #[cfg(target_arch = "x86_64")]
+            {
+                serial_println!(":: SHARD: shut down — entering ACPI S5 soft-off ::");
+                crate::arch::acpi_power::poweroff();
+            }
+            // PI-DESK — NOT wired, and it returns. `smpprobe.rs` carries PSCI SYSTEM_OFF as a
+            // FEATURES query it deliberately never invokes, and on the Pi there is no EL3 behind the
+            // `smc` to answer it at all. A verb that cannot act says so and leaves the machine
+            // running; it does not park the operator's desktop in a `wfi` to look decisive.
+            #[cfg(target_arch = "aarch64")]
+            serial_println!(
+                ":: SHARD: unimplemented: Shut Down (no PSCI SYSTEM_OFF — Pi 4 bare-metal runs at EL2 with no secure monitor; PM_RSTS/watchdog halt is the wiring this needs) ::"
+            );
         }
     }
 }
@@ -717,10 +773,11 @@ pub fn compose() -> bool {
     LEDGER.tick(
         "crystal",
         format_args!(
-            "state=open opens={} dismisses={} picks={}",
+            "state=open opens={} dismisses={} picks={} clob={}",
             OPENS.load(Ordering::Relaxed),
             DISMISSES.load(Ordering::Relaxed),
-            PICKS.load(Ordering::Relaxed)
+            PICKS.load(Ordering::Relaxed),
+            CLOBBERS.load(Ordering::Relaxed)
         ),
     );
 
@@ -740,8 +797,20 @@ pub fn compose() -> bool {
         return false;
     };
 
+    // CLOBBER-REPAIR (PA41) — the dropdown's signature is a pure function of its RECT, so a window
+    // that painted over the open menu changes nothing this test can see and the menu would stay
+    // half-overwritten until it was dismissed. `wm::occ_clip` withholds the menu's columns from a
+    // window blit on x86 and is `x86_64`-only, so on the Pi that protection does not exist at all and
+    // this is the only thing standing between an open menu and a window's pixels. The dock's WCK5
+    // condition, asked the dock's way: one bounded table scan, and only while the menu is OPEN — the
+    // closed path returned above without reaching it.
+    let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+    let (_, clobbered) = wm::dock_scan(&mut rows, SLOT.rect());
+    if clobbered {
+        CLOBBERS.fetch_add(1, Ordering::Relaxed);
+    }
     let sig = strip::seal(strip::fnv1a_u64(strip::FNV_BASIS, strip::pack_rect(Some(r))));
-    if sig == SLOT.sig() && SLOT.packed() == strip::pack_rect(Some(r)) {
+    if sig == SLOT.sig() && SLOT.packed() == strip::pack_rect(Some(r)) && !clobbered {
         return false;
     }
 
@@ -821,7 +890,7 @@ fn compose_row(out: &mut [u32], r: strip::Rect, j: usize) {
             // painted (RAM scratch — the blend's read is cached). Regular weight: menu items are
             // body text, not a caption.
             let label = ROWS[row].label.as_bytes();
-            super::font::draw_row(out, w, label, BORDER + PADX, sy, theme::TITLE_TEXT_ACTIVE, false);
+            super::font::draw_row(out, w, label, BORDER + PADX, sy, theme::TITLE_TEXT_ACTIVE, false, FACE);
         }
     }
 }
@@ -832,10 +901,11 @@ pub fn rollup(scope: &str) {
         "crystal",
         scope,
         format_args!(
-            "opens={} dismisses={} picks={} last_verb={}",
+            "opens={} dismisses={} picks={} clob={} last_verb={}",
             OPENS.load(Ordering::Relaxed),
             DISMISSES.load(Ordering::Relaxed),
             PICKS.load(Ordering::Relaxed),
+            CLOBBERS.load(Ordering::Relaxed),
             LAST_VERB.load(Ordering::Relaxed)
         ),
     );
@@ -1004,6 +1074,85 @@ pub fn selftest() {
         if ok { "PASS" } else { "FAIL" }
     );
     rollup("selftest");
+}
+
+/// SHARD-PRESS fixture (PA41) — **a press on the crystal, through the LIVE furniture router, puts the
+/// dropdown ON THE GLASS; the next press takes it off again.**
+///
+/// # Why this exists, and why [`selftest`] could not answer it
+///
+/// [`selftest`] calls [`press_at`] DIRECTLY, so it proves the hit-test and the modal state machine and
+/// nothing about either seam that matters on metal: not the router arm that reaches the menu, and not
+/// the paint. On the Pi, PA41's operator pressed the crystal and saw nothing happen, and the only
+/// witness terms available said `crystal_press=open` (the state DID change) beside a `[menubar]` line
+/// whose `press=` word was a stale hardcode. Both halves of that gap are closed here:
+///
+/// 1. **the press is ROUTED** — driven through [`strip::press_route`], the ONE shared furniture router
+///    both `arch/aarch64/syscall.rs::wc_click_route` and x86's `wc_click_route_at` call ahead of every
+///    window arm. What is not covered is per-arch and named rather than implied: the button-mask edge
+///    detection, the press-target latch and the input rings all sit ABOVE this seam.
+/// 2. **and the menu is PAINTED** — `SLOT` non-empty, i.e. [`compose`] actually ran and landed pixels.
+///    This is the leg that reds without MENU-DRIVE: before [`open`] drove its own composite, the state
+///    flipped and the slot stayed empty, because on a quiet desktop no other pass was coming.
+/// 3. **a press outside DISMISSES, and the ERASE lands** — the mirrored claim, `SLOT` back to empty.
+///    Leg 3 is also what keeps the fixture side-effect-free: while the menu is open the crystal
+///    consumes EVERY point, so the press that would otherwise reach the dock or a window is spent on
+///    the dismissal. It is skipped entirely if leg 1 did not open, so a declined crystal can never
+///    turn this fixture into an unsolicited dock press.
+///
+/// The bar is restored to whatever state it arrived in and the menu is left closed.
+#[cfg(feature = "witness")]
+pub fn routed_selftest() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let (pw, ph) = {
+        let fb = *super::WRITER.lock();
+        (fb.width(), fb.height())
+    };
+    let saved_bar = menubar::enabled();
+    dismiss("routed-selftest"); // idempotent: a menu left open by anything above must not skew leg 1
+    menubar::set_enabled(true);
+
+    // Legs 1-2 — the crystal, through the router, and the paint that press owes.
+    let (routed, open_word, opened, painted) = match menubar::crystal_box_abs(pw, ph) {
+        Some((cx, cy, cw, ch)) => {
+            let hit = strip::press_route((cx + cw / 2) as i32, (cy + ch / 2) as i32);
+            (hit, last_press_outcome(), OPEN.load(Ordering::Acquire), SLOT.packed() != 0)
+        }
+        None => (false, "no-crystal", false, false),
+    };
+    let (mw, mh, mx, my) = menu_rect(pw, ph).map(|(x, y, w, h)| (w, h, x, y)).unwrap_or((0, 0, 0, 0));
+
+    // Leg 3 — a press outside the OPEN menu dismisses it, and the erase lands. Only reachable when
+    // leg 1 opened; otherwise this point belongs to the dock and the fixture declines to press it.
+    let (dismissed_hit, dismiss_word, closed, erased) = if opened {
+        let hit = strip::press_route((pw - 1) as i32, (ph - 1) as i32);
+        (hit, last_press_outcome(), !OPEN.load(Ordering::Acquire), SLOT.packed() == 0)
+    } else {
+        (false, "not-open", false, false)
+    };
+
+    dismiss("routed-selftest");
+    menubar::set_enabled(saved_bar);
+
+    let ok = routed
+        && open_word == "open"
+        && opened
+        && painted
+        && dismissed_hit
+        && dismiss_word == "dismiss"
+        && closed
+        && erased;
+    serial_println!(
+        ":: SHARD-PRESS: menu={}x{}+{}+{} panel={}x{} routed={}({}) opened={} painted={} \
+         dismissed={}({}) closed={} erased={} :: {} ::",
+        mw, mh, mx, my, pw, ph,
+        routed, open_word, opened, painted,
+        dismissed_hit, dismiss_word, closed, erased,
+        if ok { "PASS" } else { "FAIL" }
+    );
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════════

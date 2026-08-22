@@ -1213,13 +1213,39 @@ fn jb8_falcon_witness(tag: &str) {
     // Same MSG_ENABLED words the kernel's jb3_aru_probe writes (owner-claim -> DATA_IN ->
     // CMD|=INT_EN|DEST_FALC); 3 short attempts (~15 ms total) to keep the pre-EBS dwell small —
     // the NVIDIA driver still owns the block, so a held owner semaphore is itself a datum.
+    //
+    // JB9d-GUARD (2026-08-18 metal, boot 1 of the synced base): skip the poke entirely when the
+    // falcon's CSB aperture reads ALL-ONES. `CPUCTL=0xffffffff` is not "halted", it is "not
+    // answering" — a live block reads a sane CPUCTL and a halted-but-present one reads its
+    // halted/stopped bits. Writing OWNER_SW / MBOX_CMD / INT_EN into an aperture that answers
+    // nothing is a poke into a dead block, and this board's standing rule for that class is
+    // already written in blood (FPCI/CFG CSB is EL3-FATAL on the inherited halted block; BAR2 CSB
+    // is the only safe aperture). Evidence for the guard: with the probe live the boot stopped
+    // here every time; with it skipped the boot carried measurably further (45 KB -> 110 KB of
+    // captured log) and reached JB6 and ExitBootServices. An honest SKIPPED line is a better
+    // witness than a stall, and a mailbox answer from a block that cannot answer is worthless.
+    if cpuctl == 0xffff_ffff {
+        log::info!(
+            "JB9d[{tag}]: MBOX probe SKIPPED — falcon CSB reads all-ones (CPUCTL={cpuctl:#010x}); \
+             the block is not answering, so the owner-claim/MSG_ENABLED writes would be a poke \
+             into a dead aperture (JB9d-GUARD)"
+        );
+        return;
+    }
     let own0 = r(0x010);
     let mut serviced = false;
     let mut attempts = 0u32;
+    // JB9d-EVIDENCE: count the rounds that never got the owner semaphore at all. Without it a
+    // `SILENT` verdict conflated two different worlds — "we owned the mailbox and the FW never
+    // answered" (the FW service loop is dead) versus "the NVIDIA driver held the semaphore the whole
+    // time and we never sent anything" (nothing was ever asked). The bracket this witness exists to
+    // draw depends on telling them apart.
+    let mut no_owner = 0u32;
     while attempts < 3 && !serviced {
         attempts += 1;
         w(0x010, 2); // OWNER_SW
         if r(0x010) != 2 {
+            no_owner += 1;
             boot::stall(core::time::Duration::from_micros(5_000));
             continue;
         }
@@ -1239,10 +1265,15 @@ fn jb8_falcon_witness(tag: &str) {
         }
     }
     log::info!(
-        "JB9d[{tag}]: MBOX MSG_ENABLED {} (owner pre={own0:#x} now={:#x} data_out={:#010x}, attempts={attempts})",
+        "JB9d[{tag}]: MBOX MSG_ENABLED {} (owner pre={own0:#x} now={:#x} data_out={:#010x}, attempts={attempts}, owner-claim-failed={no_owner}{})",
         if serviced { "SERVICED" } else { "SILENT" },
         r(0x010),
-        r(0x00c)
+        r(0x00c),
+        if no_owner == attempts {
+            " — NO MESSAGE WAS EVER SENT: the owner semaphore was held on every attempt, so SILENT says nothing about the FW"
+        } else {
+            ""
+        }
     );
 }
 

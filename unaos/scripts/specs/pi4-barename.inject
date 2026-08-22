@@ -1,0 +1,48 @@
+# pi4-barename.inject — what the SUITETYPE gate types at the Pi 4 shell.
+#
+# Grammar is mbench.py's inject-script grammar, unchanged, so this ONE file drives both
+#   QEMU:   UNAOS_K8_SCRIPT=scripts/specs/pi4-barename.inject ./arroyo kernel8-test 300
+#   metal:  mbench.py --follow ~/pi-serial.log --inject /tmp/pi.in \
+#               --script scripts/specs/pi4-barename.inject --platform pi \
+#               --spec scripts/specs/pi4-barename.spec
+# (SLEEP <secs> | WAIT <secs> <regex> | anything else is a line to type, CR-terminated.)
+#
+# The witnesses these three lines must produce are in scripts/specs/pi4-barename.spec —
+# this file only says what to type; the spec says what that must prove.
+#
+# READINESS — and why it is NOT `[click2] depth`, which is what the §6.6a-closed
+# hand-driven repro waited on. Measured on this arc's own knob-off baseline capture
+# (26359 lines, 210 s window): `[click2] depth` first appears at LINE 210 — before the
+# fixture cascade has even started — and then accounts for 25529 of the 26359 lines. It is
+# the input pump's free-running depth line, so it proves the pump exists and nothing about
+# whether the boot is finished. Waiting on it and typing 12 s later means typing INTO the
+# cascade, and a witness interleaved with a fixture's own output is not a witness.
+#
+# `:: BANDY-ACL:` is the LAST REQUIRED WITNESS of pi4-regression.spec (its header names it
+# as such, and it landed at line 1432 of that same capture — everything after it is
+# steady-state `[sched6]`/`[prio]`/`[pstrip]` noise). Waiting on it means the whole battery
+# this gate rides on has already printed, so nothing typed here can interleave with it, and
+# nothing the typing does can be mistaken for a fixture's line. Measured on the gate run it
+# lands at t=17.0 s, so the 240 s bound here is a bound, not a budget.
+WAIT 240 :: BANDY-ACL:
+
+# Let the last fixture's own teardown drain before typing. 12 s is the SETTLE the
+# §6.6a-closed repro used and it is kept, now measured from a later and better anchor.
+SLEEP 12
+
+# 1. THE BARE NAME, from `/`. Must resolve VUG.ELF on the program-source volume (`/fat`)
+#    and launch it DETACHED — the whole point of LAUNCHVUG, and, because VUGSCENE renders
+#    only when the info-page detached bit is set, the drawing path too.
+vug
+SLEEP 12
+
+# 2. THE NEGATIVE CONTROL. A word that is neither a verb nor a program on either volume
+#    must still be refused. Without this line the gate above would pass just as well on a
+#    build that launched something for every word typed.
+nosuchprogram
+SLEEP 12
+
+# 3. THE LEDGER. `jobs` must see the detached child from step 1 — that is what makes step
+#    1's "left RUNNING" a claim about the system rather than about one print statement.
+jobs
+SLEEP 12

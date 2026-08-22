@@ -784,6 +784,486 @@ a live boot console on the Orin:
   keyboard/mouse — the Orin's built-in ports are **Tegra XUSB** (a platform controller needing
   firmware/phy bring-up, NOT the PCIe xHCI the kernel already drives); that is its own arc.
 
+### ORIN-VUG-RAS — carveout-aware kernel heap (the SNOC RAS "Carveout" lockup) — **code fix, metal-owed**
+
+Running `vug` from the JD2 Orin shell killed the box a few frames in: `RAS Uncorrectable Error in
+SNOC … SERR = Illegal address (software fault) … IERR = Carveout Uncorrectable Error … ADDR =
+0x80000000be055a80`, cores powered off. The RAS is a *FillWrite* — a dirty cache line evicted to a
+protected DRAM carveout — which is why it lands **after** `:: VUG: crystal live … exit clean ::` and
+the first meter window print: the offending store went into the D-cache frames earlier and only
+faulted on writeback.
+
+Root cause: the kernel heap was backed by a firmware carveout. NVIDIA's UEFI reports several
+firewall-protected low-DRAM carveouts (TZ / BPMP / DCE / …) as ordinary `Conventional` (Usable)
+memory, so `arch::memory::init`'s naive *"first Usable region ≥ `HEAP_SIZE`"* pick can seat the
+48 MiB heap on protected DRAM. The interactive console never wrote the offending page (it damages
+only small text rectangles); `vug`'s per-frame `String` formatting + full-frame draws grew live heap
+use past the carveout boundary, so `vug` is simply the first workload to store there. The framebuffer
+pixel path was audited and is **not** implicated — `FrameBuffer` holds its base as `usize` and does
+all offset math in 64-bit, so the "truncated 33/34-bit address" hypothesis was ruled out.
+
+Fix (tegra-gated; every other aarch64 target keeps the original selection byte-for-byte):
+- `fdt_tegra::reserved_carveouts` enumerates the DTB `/reserved-memory` carveouts (2 addr + 2 size
+  cells) as `(base, size)` ranges — the firewall carveouts UEFI hides inside Conventional.
+- `mmu_tegra::select_heap_region` slides a `HEAP_SIZE` window through the Usable regions until it
+  finds one clear of **both** the UEFI non-Usable regions **and** the DTB carveouts, emits a
+  `:: tegra: HEAP-GUARD — kernel heap [lo, hi) … clear of N carveout range(s) ::` witness line, and
+  returns `None` → `memory::init` **fails closed** (`panic!`) if no clean window exists. No
+  protection is weakened — this only *narrows* what the heap may claim.
+- Limitation: carveouts declared with `size` + `alloc-ranges` (no static `reg`) carry no base and
+  can't be excluded from here. The HEAP-GUARD witness prints the final range so an attended sitting
+  can confirm the RAS PA (`0xbe055a80`) is outside it; if a firewall carveout is neither UEFI-Reserved
+  nor a concrete `/reserved-memory` `reg`, the guarded range is the evidence a follow-up would need.
+
+**Metal-owed:** re-run `vug`/`pulse` from the JD2 shell on the Orin and confirm the HEAP-GUARD line
+places the heap clear of `0xbe000000` and the RAS no longer fires. QEMU cannot exercise this (tegra
+is metal-only; `virt`/`test-arm` prove only that the non-tegra path is unchanged).
+
+### ORIN-RAS-2 → ORIN-DMA-WINDOW — the heap-guard learns the REAL inbound-DMA window — **code fix, metal-owed**
+
+Boot-5 metal found a *second* RAS class one level up from the carveout fix: seating the heap at the
+DRAM base (`0x8000_0000`) put the NIC's DMA rings **below** the PCIe inbound-DMA window, so the fabric
+translated ring writebacks to ~`0x0..0x200` and returned *"Error response from slave"* (RAS
+Uncorrectable in the IOB, cores off). The interim fix (**ORIN-RAS-2**) made `select_heap_region` prefer
+the **highest** clean window rather than the first — data-justified (R22 sitting-2 proved the rings DMA
+correctly from a high-DRAM heap ~GiB 9), but the boundary was **folklore**, not derived.
+
+**ORIN-DMA-WINDOW** removes the folklore. The inbound window is DERIVABLE: a DesignWare/Tegra234 PCIe
+root complex declares its inbound bus→CPU windows in the DTB `dma-ranges` property.
+
+- `fdt_tegra::pcie_dma_windows` parses the first firmware-`okay` Tegra RC node's `dma-ranges` (rows of
+  3 child + 2 parent + 2 size cells = 28 bytes, the same stride the node's `ranges` uses) into the
+  parent-side `(cpu_base, size)` inbound window(s). READ-ONLY. Gated to the Tegra-compatible RC
+  (`tegra234/194-pcie` / `snps,dw-pcie`) — the same gate `resolve_ecam_base`/`resolve_atu_and_window`
+  use — so a foreign/QEMU-virt DTB yields 0 windows. (`nvidia,dma-*` props on Tegra234 are booleans
+  like `dma-coherent`, not address windows, so `dma-ranges` is the sole window source.)
+- `mmu_tegra::select_heap_region` now applies a **hard constraint**: when windows are derived, the
+  chosen heap base must fall fully **inside** one. It computes the highest carveout-clean base
+  intersected with the derived windows; a clean base that lies *outside* every window is refused
+  (**fail loud**), naming the best out-of-window base so the divergence is diagnosable rather than a
+  silent bad placement. Carveout exclusion + fail-closed-on-no-window are otherwise unchanged.
+- **Graceful degrade:** no `dma-ranges` / foreign DTB / QEMU-virt ⇒ 0 windows ⇒ the selector falls
+  back to the ORIN-RAS-2 highest-clean heuristic and witnesses the degrade
+  (`… RAS-2 heuristic — NO PCIe dma-ranges in DTB … degraded …`).
+- **Read-only probe** (`UNAOS_DMAWIN`, default-quiet): at NIC init `rtl8168_tegra::dmawin_probe`
+  dumps the derived window(s), reads BACK the just-programmed inbound iATU region-0
+  BASE/LIMIT/TARGET/CTRL2, and cross-checks the `ram_gib_mask`-derived identity window NET-4h armed
+  against the derivation — so the next metal boot confirms `select_heap_region`'s derivation matches
+  the hardware the NIC actually DMAs through.
+
+**Expected serial (metal, `UNAOS_NET4=1 UNAOS_TEGRA=1 UNAOS_DMAWIN=1`):**
+- `:: tegra: HEAP-GUARD — derived N PCIe inbound-DMA window(s) from dma-ranges; window[0] = [lo, hi) … ::`
+- `:: tegra: HEAP-GUARD — kernel heap [lo, hi) … highest clean window INSIDE the derived PCIe inbound-DMA window(s) (RAS-2 boundary now DERIVED, not folklore) … ::`
+- `:: PCIE4:   [dmawin] derived inbound window[0] = [lo, hi) … ::`
+- `:: PCIE4:   [dmawin] inbound iATU region0 @ … readback: BASE=… LIMIT=… TARGET=… CTRL2=… (enabled=1) ::`
+- `:: PCIE4:   [dmawin] programmed identity DRAM window [lo, hi) is INSIDE the N derived dma-ranges window(s); readback BASE/TARGET MATCH the programmed base ::`
+
+**QEMU (no-dma-ranges fallback, `UNAOS_GICV3=1 UNAOS_NET4=1 ./arroyo test-arm`):**
+- `:: PCIE4:   [dmawin] no Tegra PCIe dma-ranges in this DTB — inbound-DMA window NOT derivable; heap-guard degrades to the highest-clean heuristic (QEMU-virt fallback path) ::`
+followed by `:: CAPSTONE COMPLETE …`.
+
+**Metal-owed:** confirm on the Orin that the derived `dma-ranges` window contains the HEAP-GUARD heap
+placement and matches the NET-4h iATU readback (`UNAOS_DMAWIN=1`); QEMU exercises only the fallback +
+the non-tegra derivation (tegra is metal-only).
+
+### VUG-RAS-LOCALIZER — force the FillWrite RAS to name its writer (`UNAOS_VUGRAS=1`, instrument-only)
+
+The ORIN-VUG-RAS / ORIN-RAS-2 heap placement moved the box past the *carveout* and *DMA-window* RAS
+classes, but a residual **SNOC+ACI FillWrite Uncorrectable** still fires intermittently on the Orin.
+Two field captures pinned the difficulty:
+
+- **Boot-13**: fired during a 2nd `vug` run with mouse motion. Fault ADDR `0x80000000be000f80`.
+- **Boot-14** (no localizer aboard): fired **at shell entry** — no `vug` run, no mouse, no simmer.
+  Fault ADDR `0x800000027724f340`.
+- **Boot-15** (localizer aboard): fired **immediately after the first idle-path sweep** (`idle tick 0
+  swept`). Fault ADDR `0x800000026b900000` → stripped `0x26b900000` — `0x536000` (5.2 MiB) ABOVE heap
+  top `0x26b3ca000`, below the framebuffer `0x279e00000`. In no dumped candidate span.
+
+Two settled facts frame the diagnostic. First, the **XCARVE erratum** (see §JETSON-XCARVE): Tegra234
+RAS ADDRs are **record-format** — bit-63 is a record bit, not a poisoned-pointer half. Strip it:
+`0x800000027724f340 → 0x27724f340`. That decodes ABOVE the heap top (heap
+`[0x2683ca000, 0x26b3ca000)`) and below DRAM top `0x2_8000_0000`. Second, a **FillWrite** RAS fires on
+a cache-line **writeback**, so the offending store happened *frames before* the report — the churn
+(mouse, simmer) merely forces the eviction that surfaces it.
+
+`UNAOS_VUGRAS=1` (feature `vugras`, default OFF ⇒ code + witnesses vanish, image byte-identical) arms a
+**localizer** whose whole job is to make the fault fire *at* the store and to name the address:
+
+1. **Continuous writeback.** A `DC CIVAC` (clean+invalidate to PoC) sweep runs from every path the RAS
+   has been seen on — the `vug` frame loop (per frame, `vug.rs`) and the **JD2 console-idle pump**
+   (~250 ms cadence, `main.rs` — boot-14's crash path had no `vug` at all). The sweep alternates two
+   spans by an invocation counter so no single pass is unbounded: **A = `[heap_lo, heap_hi)`** and
+   **B = `[heap_hi, carveout-clipped top)`** (B is `tegra`-gated ⇒ empty on the `virt` gate, so the
+   sweep never touches unmapped RAM). Cleaning an already-clean line is harmless — the point is a
+   *dirty* line writes back **now**. **Span B is carveout-bounded (VUG-RAS-ANALYZE):** it is clipped to
+   the first firewall carveout above the heap (`mmu_tegra::VUGRAS_ABOVE_HEAP_TOP`, published from the
+   same carveout set that seats the heap). A raw `[heap_hi, DRAM_top)` sweep would eventually
+   `DC CIVAC` a SNOC-protected carveout — and cleaning a firewalled line *is* the FillWrite RAS whether
+   or not it is dirty — so an unbounded span B would **self-inflict** the very fault the localizer
+   exists to attribute. Real above-heap writes are still surfaced by span A's incidental cache churn.
+2. **A candidate-PA table** dumped once at boot (post-heap-init, before the JD2 spawn): heap span, DRAM
+   top, framebuffer/scanout base, the `Screen` back buffer, the cursor save-under stash, and the full
+   xHCI DMA surface — DCBAA, event/command rings, per-slot input/output contexts, transfer rings, HID
+   buffers and in-flight `expect_phys` TRBs — **with the enumerating port flagged** (boots 13+14 both
+   crashed with a port mid-enumeration; port 7 in the field capture). So a decoded ADDR can be matched
+   from the serial capture alone.
+
+This diagnostic **intentionally makes the fault fire earlier** — that is its purpose; the sweep is
+read-only and changes nothing with the knob off.
+
+**VUG-RAS-ANALYZE verdict — the boot-15 RAS is H2 (the sweep REVEALED it, did not CAUSE it).** The
+localizer fired at `idle tick 0`. By the sweep's parity (`vugras::sweep_one`: `tick & 1 == 0 ⇒`
+span A), **tick 0 sweeps span A = the heap only**; span B (the only span covering the fault
+`0x26b900000`) runs on odd ticks and had **never executed** when the RAS fired (the boot witness also
+sweeps span A only). The heap is carveout-clear by construction (`select_heap_region`), so a `DC CIVAC`
+over span A cannot fault at a protected address — the sweep provably never touched `0x26b900000`. The
+fault is therefore a **real earlier store/DMA** whose dirty line was surfaced by the span-A clean's
+incidental cache churn (the FillWrite fires on writeback). A code survey found `0x26b900000` is **not**
+produced by any allocator arithmetic (every xHCI ring/buffer is heap-backed, inside `[heap_lo,heap_hi)`;
+there is no `heap_top + offset` or frame allocator): it is a **kernel-image `.bss`/load-extent address**,
+image-layout-correlated — the same class the `XCARVE_RELINK_PAD` (`xusb_tegra.rs`) shifts the image to
+chase. Candidate writers are DMA/CPU targets that live in `.bss` rather than the heap (the xHCI event
+ring / ERST, or the image load tail). This is the ORIN-VUG-RAS / JETSON-XCARVE "store into
+protected DRAM near the image extent" class, **not** an allocator miscomputation and **not** (per this
+survey) the NET-4m rx path. Pinning the exact `.bss` writer and relinking/relocating it is the
+**XCARVE arc's** work (it touches shared xHCI/core files outside the jetson lane); VUG-RAS-ANALYZE's
+in-lane fix is the carveout-bounded span B above, which makes the localizer sound so the next boot
+attributes `0x26b900000` to the writer and not to the sweep.
+
+**~~RESOLVED (R23s1, §JETSON-XCARVE "XCARVE-SNOC FIX")~~ — REOPENED (XCARVE-2, boot-19 false-confirm):**
+the event-ring + ERST heap move (commit `425090fd`) *is* a KEEP — every xHC DMA structure is now
+heap-backed — but it was **NOT the writer**. The "confirmed fixed" reading came from **boot 19, which
+died earlier on the `0x200` NET RAS and never reached the idle/sweep path**; boot 20 reached it and
+`0x26b900000` **refired**. The `.bss`/event-ring lead is therefore refuted: the store target survives a
+move that relocated every heap-adjacent DMA structure, so the writer is neither the event ring, the
+ERST, nor any heap-backed buffer. Cross-link to the NET `0x200` defect is separately refuted by
+span-parity (span A = heap-only ran clean). The writer remains **UNIDENTIFIED**; the hunt below switches
+from decoding the record-format ADDR (settled — XCARVE erratum, do not re-chase) to **store-site
+bracketing**.
+
+#### XCARVE-2 — store-site bracketing (`UNAOS_VUGRAS=1`, instrument-only)
+
+Rather than ask *what PA is `0x26b900000`* (answered), XCARVE-2 asks *what code stored to it, and when*.
+Three brackets, all tegra-gated behind `UNAOS_VUGRAS` (default-quiet: zero VUGRAS lines knob-off), added
+in `vugras.rs` (+ the phase call sites in `main.rs`):
+
+1. **Spatial bisection.** `bisect()` splits a span into `SUBSPANS` (12) witnessed sub-spans, `DC CIVAC`-ing
+   each in turn with a `sub-span k/12 [lo,hi) swept` line. When the dirty line is cleaned the RAS
+   FillWrite fires *on that sub-span's clean*, so the **last `sub-span k/12` line before the fault pins
+   the dirty line to ~1/12 of the span**. `boot_witness` bisects **span B** (the above-heap span that
+   covers `0x26b900000`); `core_witness` bisects **span A** (the heap — always mapped, so the QEMU gate
+   exercises the machinery too).
+2. **Single-line tripwire.** `tripwire()` `DC CIVAC`s exactly the `0x26b900000` line (± a few neighbor
+   lines) with its own witness. Known carveout-free RAM (5.2 MiB above heap top, below the framebuffer)
+   and identity-mapped Normal-WB, so it is safe to run at *every* bracket point — if the store has landed,
+   the RAS fires *inside the tripwire call*.
+3. **Temporal bracketing.** `phase(name)` runs the tripwire + span-B bisect at named boot-phase
+   boundaries — **post-mmu, post-heap-init, post-pcie, post-net, post-xhci-attach, shell-entry**. The
+   interval between the last phase that swept clean and the phase whose tripwire/bisect fires the RAS
+   names the code region that made the store.
+
+**Identity witness.** `pa_identity_witness()` (one-shot, in `boot_witness`) reports, for each known
+region (heap, span-B, framebuffer, cursor stash), whether `0x26b900000` falls inside it — and if **nothing
+maps it**, says so explicitly: the store is then through a **wild/stale pointer** and the temporal bracket
+is the decisive evidence, not an owning allocation.
+
+**RO-map hard tripwire (brief step 4): DISARMED.** Read-only-mapping the containing page so the store
+faults with ELR = the store site would need a page-table edit in `mmu_tegra` and **cannot be validated on
+the QEMU gate** (`virt` has no such above-heap RAM and never runs the tegra identity map), so arming it
+blind risks perturbing a legitimate mapping on the only platform where it runs. The DC-CIVAC tripwire +
+bisection + phase brackets localize the store without touching page permissions; a future arc can arm the
+RO-map once the identity witness has established (on metal) whether the page is ever legitimately written.
+Witnessed either way (`:: VUGRAS: XCARVE RO-map hard tripwire — DISARMED … ::`).
+
+**Expected serial (metal, boot 21+, `UNAOS_VUGRAS=1 UNAOS_TEGRA=1`):** the boot-witness table (below) now
+also carries `:: VUGRAS: XCARVE identity — target line 0x26b900000 (record ADDR 0x800000026b900000) ::`
+followed by the region checks (or the NOT-inside/wild-pointer line), the RO-map DISARMED line, and
+`:: VUGRAS: sub-span k/12 [lo,hi) swept (span-B …) ::`. Each phase prints
+`:: VUGRAS: === phase <name> === ::`, `:: VUGRAS: tripwire @ <name> — line 0x26b900000 (+/-192 B) swept ::`,
+and its span-B sub-span lines. **Reading the capture:** find the RAS; the **last `phase`** and the **last
+`sub-span k/12`** printed before it name *when* (which code region) and *where* (which ~1/12 PA window) the
+store landed. A tripwire line immediately preceding the RAS with no intervening code means the store
+happened in the phase whose name that tripwire carries.
+
+**Expected serial (metal, `UNAOS_VUGRAS=1 UNAOS_TEGRA=1`):**
+- `:: VUGRAS: boot witness — RAS candidate PA table (bit-63-stripped decode) ::`
+- `:: VUGRAS: heap span [lo,hi) 48 MiB; tegra DRAM top 0x280000000 ::`
+- `:: VUGRAS: above-heap sweep span B [heap_hi,top) N KiB — carveout-clipped (never DC-cleans firewall fabric) ::`
+- `:: VUGRAS: framebuffer/scanout base 0x… len 0x… ::`
+- `:: VUGRAS: cursor save-under stash [lo,hi) ::`
+- `:: VUGRAS: xHCI DCBAA=0x… event_ring_base=0x… enum_cmd_trb=0x… enumerating_port=N stage=… ::`
+- `:: VUGRAS: xHCI slot S port 7 <== enumerating in_ctx=0x… out_ctx=0x… desc_buf=0x… … ::` (+ per-ring/expect lines)
+- `:: VUGRAS: Screen back buffer [lo,hi) ::` (when the console/vug builds the `Screen`)
+- `:: VUGRAS: idle tick N swept ::` / `:: VUGRAS: frame N swept ::` bracketing the fatal frame/period
+- `:: VUGRAS: {frame,idle} sweep cost — span {heap,above-heap} [lo,hi) M MiB in C cycles (~T ms) ::` (once per span)
+
+**QEMU (`UNAOS_GICV3=1 UNAOS_VUGRAS=1 ./arroyo test-arm`):** the `virt` boot drives neither `vug` nor
+JD2, so the headless witness runs from the CAPSTONE boot core (`arch::sched::run_capstone_boot_core`,
+alongside the VUG-HONESTY witness): it dumps the heap/cursor candidate lines and sweeps span A once —
+`:: VUGRAS: witness sweep cost — span heap [0x40000000,0x43000000) 48 MiB in ~1.3M cycles (~0 ms) ::` —
+then `:: CAPSTONE COMPLETE …`. QEMU models no caches, so `DC CIVAC` is a loop no-op; the metal cost is
+memory-bandwidth-bound (measure and witness once per span from the capture).
+
+**Post-mortem decode procedure** (from a serial capture with a RAS at fault ADDR `A`):
+1. **Strip bit-63:** `A' = A & 0x7FFF_FFFF_FFFF_FFFF` (the XCARVE record bit — never treat it as an
+   address bit). E.g. `0x800000027724f340 → 0x27724f340`.
+2. **Bracket the fault:** the last `:: VUGRAS: {frame,idle} N swept ::` before the RAS is the
+   frame/period whose writeback surfaced it — the offending store is within that window.
+3. **Match `A'` against the candidate table** (the `:: VUGRAS: …` PA lines nearest boot): which named
+   span `[lo,hi)` contains `A'`? Heap-but-not-a-named-buffer ⇒ a transient heap allocation; inside a
+   named xHCI ring/context/buffer ⇒ that DMA structure; inside the Screen back buffer / cursor stash ⇒
+   the double-buffer or cursor store. If `A'` is **above** `heap_hi` and in no named span (the boot-15
+   `0x26b900000` case), it is **not** a heap allocation: it is a kernel-image `.bss`/load-extent address
+   (image-layout-correlated — cross-check against the map file and the `XCARVE` shift). Note the
+   carveout-clipped span-B witness bounds where the sweep *could* have touched: if `A'` lies at/above
+   that clip, the sweep never cleaned it and the RAS is a real writer's natural-eviction writeback.
+4. **Correlate with enumeration:** if the flagged `enumerating_port` (port 7 in boots 13+14) owns a
+   context/ring/buffer near `A'`, test the "mid-enumeration reset-settle writeback" correlation.
+
+#### XCARVE-3 — the boot-21 verdict: `0x26b900000` is protected carveout DRAM, not a software store (**code fix, always-on; metal-owed**)
+
+The XCARVE-2 store-site bracketing answered the question it was built to answer — but not the way the
+hunt assumed. **Boot-21 (`UNAOS_VUGRAS=1 UNAOS_TEGRA=1`) fired the RAS from the very first bracket, the
+`post-mmu` tripwire's own `DC CIVAC`, with none of our own code yet run** (no heap, no PCIe/net/xHCI, no
+`vug`):
+
+```
+:: VUGRAS: === phase post-mmu ===
+… SNOC RAS Uncorrectable, Status=0xec00030d,
+   SERR = Illegal address (software fault), IERR = Carveout Uncorrectable Error: 0x3,
+   MISC1=0x9d0842000000000, ADDR=0x800000026b900000
+… EL3 sdei_dispatch_event returned -1 … core powered off
+```
+
+**There is no software writer.** `IERR = Carveout Uncorrectable` + `SERR = Illegal address` from the SNOC
+is the fabric rejecting *any* cache-line traffic to a firmware-protected carveout — the tripwire's clean
+was simply the first cache operation to touch it. Our tegra RAM map covers `0x26b900000` as an ordinary
+Normal-WB **cacheable** 1 GiB block (GiB 9), so a fill, a speculative allocation + later writeback, or a
+`DC` sweep all reach it and all are rejected. This exonerates every earlier lead: the `.bss`/event-ring
+writer theory (`425090fd` is a KEEP, unrelated), the record-format ADDR decode (settled), the NET `0x200`
+class (separate). Every prior `0x26b900000`-family RAS (boots 13/14/15/20) was just *whatever first made
+the cache touch the hole*.
+
+**The fix (always-on correctness, not a diagnostic — runs knob-off):** punch the carveout out of the
+cacheable map.
+
+- **Extent** (`mmu_tegra::resolve_carveout_hole`): mine the DTB `/reserved-memory` carveouts (the set
+  `select_heap_region` already trusts) for one that COVERS the RAS PA — used verbatim, `source = DTB`. If
+  the DTB declares no reservation over the PA, fall back to a **conservatively-bounded QUIRK**: the aligned
+  2 MiB block (the L2 granule) containing the PA, `source = QUIRK`. The block cannot reach the heap top
+  (~`0x26b3ca000`, below it) or the framebuffer carveout (`0x279e00000`, well above). Witnessed
+  DTB-vs-QUIRK: `:: tegra: XCARVE-3 carveout hole EXCLUDED — [lo,hi) N MiB unmapped from GiB 9 (source: …)
+  … ::`.
+- **Exclusion** (`mmu_tegra::install_hole_l2`): the window is sub-GiB, so the containing GiB is
+  sub-divided into an **L2 table (512 × 2 MiB)** — every block Normal-WB RAM **except** the block(s) the
+  hole intersects, left **invalid (unmapped)**. Unmapped, not Device: an unmapped VA has no valid
+  translation, so the MMU can never fill, speculate into, or write back the line — the fabric is never
+  touched (Device is non-cacheable and also safe, but leaves a live translation a stray access could
+  reach; nothing legitimate lives in the window). Applied to BOTH the live EL2 `L1` and the EL1-precise
+  twin `L1_EL1`, cleaned to PoC like the other tables. On the Orin the framebuffer shares GiB 9 with the
+  hole, so `map_fb_region`/`map_mmio_window` now treat a **table descriptor** (`is_table_desc`) as
+  already-covering RAM and never overwrite it with a 1 GiB block (which would re-map the hole).
+- **Heap/span coherence:** the resolved hole is latched (`mmu_tegra::carveout_hole`) and fed into
+  `select_heap_region`'s carveout set, so the heap never seats over it and `VUGRAS_ABOVE_HEAP_TOP` clips
+  span B **below** it — the localizer sweeps can never `DC CIVAC` the protected window.
+- **Diagnostics retargeted (VUGRAS, knob-gated):** the single-line `tripwire` no longer issues a CMO into
+  the target — a `DC CIVAC` to the now-unmapped VA would translation-fault — it witnesses the exclusion
+  instead (`… line 0x26b900000 is inside the XCARVE-3 excluded carveout … UNMAPPED, NO CMO issued …`). The
+  phase brackets + identity witness stay; `pa_identity_witness` reports the target **IS** the excluded
+  carveout (not a wild pointer), and the RO-map hard tripwire is now **MOOT** (no page to protect). The
+  always-on `XCARVE-3 … EXCLUDED` banner line is the correctness witness; the VUGRAS lines remain default-
+  quiet.
+
+**QEMU:** `virt` has no such carveout, so `resolve_carveout_hole` finds no DTB match and the hole logic is
+`tegra`-gated — the map is byte-identical and no `XCARVE-3` line prints (verified: `UNAOS_GICV3=1
+UNAOS_VUGRAS=1 ./arroyo test-arm` shows only the span-A bisect, no tegra lines). **Expected boot-22
+(metal, `UNAOS_TEGRA=1`):** the `mmu regs` banner, then `:: tegra: XCARVE-3 carveout hole EXCLUDED …
+(source: DTB|QUIRK) …`, a **clean `post-mmu` phase (no SNOC RAS)**, and — the boot now surviving past the
+MMU — the NET-4q lease oracle reaching its first real run. Metal-owed: confirm boot-22 clears the RAS and
+records the hole source (DTB vs QUIRK) so a future arc can tighten the QUIRK to the firmware's true extent
+if the DTB stays silent.
+
+#### XCARVE-6 — one window is not enough: retire the whole class (**structural, always-on; metal-owed**)
+
+Boot-24 proved the XCARVE-3 exclusion end-to-end for `0x26b9`, but boot-25 died on the **boot-13 `0xbe`
+family** (`ADDR=0x80000000be0d6c60` / `…6c70`), and a boot-25 rerun under `vug`/`simmer` load added a
+third point `0x80000000bf77a500`. Same class: SNOC `Carveout Uncorrectable` + `Illegal address`, no
+software writer, cache traffic touching a firewalled window our Normal-WB map covers.
+
+**Decode verdict (step 1, honest).** The record-format ADDR strips **bit-63** only (§JETSON-XCARVE): none
+of the three ADDRs sets any other high bit, so bit-63-strip yields the real PA directly — `0xbe0d6c60`,
+`0xbe0d6c70`, `0xbf77a500` — **face-value**, all inside the **first DRAM GiB (GiB 2, `0x8000_0000..
+0xC000_0000`)**, *not* a near-DRAM-top reinterpretation. The three points span `0xbe000000..0xbfffffff`
+(~30 MiB), consistent with a single **VPR-shaped 32 MiB carveout `[0xbe000000, 0xc0000000)`** at the top of
+GiB 2 (ending exactly at the GiB boundary — no straddle). Face-value is the correct decode for this family
+(a record-format near-top decode would land above DRAM, which none of the ADDRs do). It fires under heavy
+cache/eviction load, exactly the no-software-writer speculative-fill/writeback mechanism XCARVE-3 settled.
+
+**The structural fix (prefer over one more quirk).** XCARVE-6 generalizes the XCARVE-3 single-hole
+machinery to a **SET** of excluded windows so any firmware-declared protected window can never be cacheable:
+
+- **Set** (`mmu_tegra::resolve_carveout_holes`): (1) the PRIMARY `0x26b9` QUIRK (slot 0, unchanged — keeps
+  `carveout_hole()`/heap-guard/VUGRAS keyed exactly as before); (2) the XCARVE-6 `0xbe` window — a
+  DTB-covering node if declared (`source = DTB`), else the full **32 MiB QUIRK `[0xbe000000, 0xc0000000)`**
+  (`source = QUIRK`) bounding all three observed ADDRs; (3) the STRUCTURAL generalization — **every DTB
+  `/reserved-memory` carveout that falls inside a RAM GiB**, deduped against the quirks. The **framebuffer**
+  carveout is never punched (it is CPU-written scanout, not a no-touch firewall window — any DTB node
+  intersecting `[fb, fb+size)` is skipped).
+- **Exclusion** (`mmu_tegra::install_carveout_holes`): each RAM GiB that contains ≥1 window is sub-divided
+  into its own **L2 table (512 × 2 MiB)** — a block is left **invalid (unmapped)** iff it intersects ANY
+  window, else Normal-WB RAM. Windows sharing a GiB share that GiB's table; **one L2 pool slot per split
+  GiB** (Orin DRAM = GiB 2..=9, the two quirks land in GiB 2 and GiB 9). Applied to BOTH the live EL2 `L1`
+  and the EL1-precise twin, each used slot cleaned to PoC. `map_fb_region`/`map_mmio_window` already skip a
+  **table descriptor** (`is_table_desc`), so a split GiB is never re-flattened to a cacheable 1 GiB block.
+- **Cost (bounded).** L2 pool = `MAX_SPLIT_GIB = 8` tables × 4 KiB × 2 (live + EL1 twin) = **64 KiB** static
+  BSS; the hole set is `MAX_HOLES = 32`. Both bounds exceed the observed handful; overflow of either is
+  **witnessed, never silently dropped** (`hole_dropped` → `:: tegra: XCARVE-6 WARNING — N … DROPPED …`).
+- **Witness (no-silent-drop, XCARVE-5 law).** The always-on banner lists **every** excluded window:
+  `:: tegra: XCARVE-6 carveout exclusion — N protected window(s) UNMAPPED …` then one
+  `:: tegra:   window[i] [lo,hi) K KiB @ GiB g (source: DTB|QUIRK) ::` per window. `carveout_holes()`
+  publishes the full set; the VUGRAS identity witness mirrors it (`:: VUGRAS: XCARVE-6 excluded set — N …`).
+
+**QEMU:** `virt` has no such carveouts, the set is empty, the map is byte-identical, no `XCARVE-6` line
+prints (verified: default `test-arm`, `UNAOS_GICV3=1 UNAOS_VUGRAS=1 test-arm`, and `UNAOS_GICV3=1
+UNAOS_WITNESS=1 UNAOS_VNET=1 test-arm` all green, CAPSTONE PASS). **Expected boot-26 (metal,
+`UNAOS_TEGRA=1`):** the `mmu regs` banner, then `:: tegra: XCARVE-6 carveout exclusion — N protected
+window(s) UNMAPPED …` with a `window[…]` line for the `0x26b9` GiB-9 window AND the `0xbe000000` GiB-2
+32 MiB window (plus any declared DTB carveouts), a **clean `post-mmu` phase and clean shell+idle (no SNOC/
+ACI RAS)** through the `vug`/`simmer` load that fired boot-25. Metal-owed: confirm boot-26 clears both the
+`0x26b9` and `0xbe` families and record whether the DTB declares the `0xbe` window (QUIRK → DTB tightening).
+
+#### XCARVE-7 — boot-26: XCARVE-6 punched the framebuffer; make `map_fb_region` L2-aware (**code fix, always-on; metal-owed**)
+
+Boot-26 cleared the `0x26b9` and `0xbe` RAS families — but died a new way. The XCARVE-6 exclusion set
+listed five windows, one of them `window[4] [0x279e00000, 0x27a760000) 9600 KiB @ GiB 9 (source:
+DTB /reserved-memory)` — **that window is the framebuffer**. Two facts collided: (a) the fb-skip guard in
+`resolve_carveout_holes` keys on `boot_info.framebuffer_addr`, but THIS boot took the loader's "booting
+without a display" path and published `framebuffer_addr = 0`, so `hits_fb` never matched and the fb's DTB
+`/reserved-memory` node was punched like any other carveout; (b) the kernel's fb does not come only from
+BOOT_INFO — `jd1_survey` inherits the firmware scanout from the DTB `simple-framebuffer` node — so the
+kernel later called `map_fb_region` on that very carveout. The GiB was an L2 split, `map_fb_region` skipped
+it wholesale on `is_table_desc` (XCARVE-6's "no framebuffer ever lives in a punched block" assumption), the
+fb's 2 MiB block stayed invalid, and the first scanout write faulted:
+`ESR=0x96000046 (EC=0x25, WRITE, translation L2) FAR=0x279e00000`, right after the banner.
+
+**Root shape.** Exclusion-time fb-guarding can never be complete — the fb can arrive by the DTB/JM7 path
+with `BOOT_INFO.framebuffer_addr == 0`. The authoritative fix must be at MAP time, where the real fb PA is
+known.
+
+**The fix (`mmu_tegra::map_fb_region`, `mmu_tegra::repair_fb_l2`).** When a GiB the fb span covers holds a
+TABLE descriptor (an XCARVE-3/6 L2 split), `map_fb_region` no longer skips it — it walks that GiB's L2 and
+re-maps **every INVALID 2 MiB block intersecting `[pa, pa+size)`** back to Normal-WB RAM (attr for the
+active EL), on BOTH the live table and the EL1-precise twin (each has its own L2 in the pool), with
+`clean_desc` per written entry; the caller's trailing `dsb sy` + regime TLBI publish them. Blocks OUTSIDE
+the fb span are untouched, so every protected window stays excluded — the L1 entry remains a valid TABLE
+descriptor, never re-flattened to a 1 GiB block. `map_mmio_window`'s Device path keeps the old whole-GiB
+skip (MMIO never lives in a RAM-split GiB).
+
+- **Belt (QUIRK disjointness).** Before re-mapping a block, `quirk_hits_block` checks it against the latched
+  QUIRK (`source = QUIRK`) windows (`0x26b9`, `0xbe`). A framebuffer overlapping a firewall carveout is a
+  **genuine conflict**, not something to paper over: the block is **refused** (left unmapped) and witnessed
+  loudly — `:: tegra: XCARVE-7 CONFLICT — fb span […] overlaps QUIRK window in block […]; repair REFUSED …`.
+  DTB (`source = DTB`) windows are NOT a bar — the fb carveout is itself a `/reserved-memory` node, and
+  re-mapping its block IS the fix.
+- **Belt at punch time (disposition).** A node-name skip
+  (`"framebuffer"`/`"simple-framebuffer"`) at exclusion time would need `fdt_tegra::reserved_carveouts` to
+  thread each node's name string through (a signature + classifier change) — **not cheap**, and not needed:
+  the L2 repair re-maps any punched fb block whatever the DTB called the node. So the punch-time guard keeps
+  only the BOOT_INFO check; correctness rides on the repair. Documented in `resolve_carveout_holes`.
+- **Witness.** `:: tegra: fb L2 repair — N block(s) re-mapped in GiB g [lo,hi) ::` when N > 0.
+
+**QEMU:** `virt` has no carveouts → empty set → no L2 split → `map_fb_region` never sees a TABLE descriptor,
+so the repair path is inert and the map is byte-identical (verified: default `test-arm`, `UNAOS_GICV3=1
+UNAOS_VUGRAS=1 test-arm`, `UNAOS_GICV3=1 UNAOS_WITNESS=1 UNAOS_VNET=1 test-arm` all green, CAPSTONE PASS).
+**Expected boot-27 (metal, `UNAOS_TEGRA=1`):** the XCARVE-6 exclusion banner still lists (or skips) the fb
+window; then `:: tegra: fb L2 repair — N block(s) re-mapped in GiB 9 [0x279e00000,…) ::`; the JD1
+`test_pattern` + fbcon scanout writes now **survive** (no `translation L2` abort at `FAR=0x279e00000`); then
+the NET-4s lease + SIMMER/vug survival oracles get their run.
+
+#### XCARVE-8 — boot-27: the 0xbe carveout extends past 0xc0000000; widen the QUIRK to 96 MiB + the straddle fix (**code fix, always-on; metal-owed**)
+
+Boot-27 was the longest run yet — XCARVE-7's fb repair held (scanout clean, JD2 shell on glass, 3008+
+SIMMER/vug frames with a live mouse) — and then the `0xbe` family came back **above** the window:
+SNOC RAS Uncorrectable (`Status 0xec00030d`, SERR = Illegal address, IERR = Carveout), ACI FillWrite,
+`ADDR 0x80000000c0883000` → PA `0xc0883000` — ~8.5 MiB past the XCARVE-6 window top `0xc0000000`. The
+observed family now spans `0xbe000f80` (boot-13), `0xbe0d6c60/70` (boot-25), `0xbf77a500` (boot-25-rerun),
+`0xc0883000` (boot-27) ≈ 40.5 MiB — the "classic VPR-shaped 32 MiB" guess is **refuted**.
+
+**Why the extent stays a guess (mechanism choice).** (a) A register probe was rejected: the MC GSC
+carveout config registers are the honest source, but reading firewalled MC/IMPDEF state from NS-EL2 is
+the proven JB1d/JX1 class on this firmware (EL3-gated access → BL31 crash/SError, box reboots), and no
+probe is verifiable in QEMU — a boot-risking read to size a window we can simply exclude is a bad trade.
+(b) The DTB/UEFI sets were exhausted by XCARVE-3/6: neither declares the `0xbe` window — that is *why*
+it is a QUIRK. So (c) the QUIRK is widened to a defensible envelope: **96 MiB `[0xbe000000, 0xc4000000)`**
+(64 MiB-aligned top, ~55 MiB headroom over the highest observed hit), and the banner now says the extent
+is a guess for every QUIRK window: `source: QUIRK (DTB silent; extent = bounded GUESS)`. A future hit at
+or above `0xc4000000` refutes this guess in turn — widen again or finally justify a probe arc.
+
+**The straddle fix (`install_carveout_holes`).** The widened window crosses the GiB 2/3 boundary, and the
+XCARVE-6 split-GiB collection keyed on each window's **base** GiB only — the `[0xc0000000, 0xc4000000)`
+remainder would have stayed a whole cacheable 1 GiB block, exactly the boot-27 defect reproduced by
+construction. The collector now splits **every GiB the span `[hb, hb+hs)` touches**; the per-block punch
+loop already intersects per-GiB, so the clip is implicit. GiB 3 now takes a third `L2_POOL` slot
+(GiB 2 + 3 + 9 of `MAX_SPLIT_GIB = 8`). XCARVE-5 slot-0 seeding, `MAX_CARVE 192`, and the XCARVE-7 fb
+repair are untouched; `quirk_hits_block` is extent-generic, so the repair-refusal belt covers the widened
+window automatically.
+
+**QEMU:** `virt` has no carveouts → empty set → byte-identical map, no banner line.
+**Expected boot-28 (metal, `UNAOS_TEGRA=1`):** the exclusion banner lists
+`window[1] [0xbe000000, 0xc4000000) 98304 KiB @ GiB 2 (source: QUIRK (DTB silent; extent = bounded GUESS))`;
+no SNOC RAS from the `0xbe000000..0xc4000000` family under SIMMER/vug load; fb repair line unchanged.
+
+#### XCARVE-9 — the PRIMARY `0x26b9` window's honest extent: the declared-neighbor cap (**code fix, always-on; metal-owed**)
+
+The `0xbe` family had its extent widened by XCARVE-8; the PRIMARY `0x26b9` window still carried the
+XCARVE-3 guess — the single 2 MiB L2 granule `[0x26b800000, 0x26ba00000)` around the boot-21 hit.
+**Boot-28 run 2 refuted it**: SNOC Carveout Uncorrectable + ACI FillWrite, `ADDR 0x800000026bc5ee90`
+→ PA `0x26bc5ee90` — ~2.4 MiB **above** the 2 MiB top, mid-simmer; EL3 powered off two cores and the
+machine survived. This is the same too-small-extent class XCARVE-8 fixed for `0xbe`, and the same
+mechanism-choice bind applies: no honest extent is readable (DTB/UEFI silent over this PA — that is
+*why* it is a QUIRK; MC-register probing is the rejected EL3-crash class).
+
+**But here the geometry gives a bound `0xbe` never had.** The DTB *does* declare the adjacent
+carveouts — `[0x26b5f0000, 0x26b7f0000)` below and `[0x26c180000, 0x26c400000)` above — and the
+observed family (`0x26b900000`, `0x26bc5ee90`) sits in the *undeclared gap* between them, suggesting
+one contiguous protected span ~`[0x26b5f0000, 0x26c400000)`. So XCARVE-9 widens the QUIRK to fill
+exactly that gap: **9.5 MiB `[0x26b800000, 0x26c180000)`** (`XCARVE_GIB9_SIZE = 0x00980000`) — top
+flush against the declared upper neighbor's base, never overlapping it (the declared windows stay
+their own set entries; adjacency is fine). This is a bounded GUESS, said so in the banner; a hit in
+the residual `[0x26b7f0000, 0x26b800000)` sliver or above `0x26c400000` refutes it in turn. Heap is
+unaffected — it tops at `0x26b3ca000`, below every window here (`select_heap_region` re-proves this
+against the same set).
+
+#### XCARVE-10 — boot-34-retry: the span continues past the declared neighbor; the bounded 4 MiB gap window (**code fix, always-on; metal-owed**)
+
+XCARVE-9 assumed the declared upper neighbor `[0x26c180000, 0x26c400000)` capped the family.
+**Boot-34-retry (2026-07-21) refuted that assumption**: SNOC Carveout Uncorrectable + ACI FillWrite,
+`ADDR 0x800000026c6be4a0` → PA `0x26c6be4a0` — **above** `0x26c400000`, past the declared carveout's
+top. Same method as XCARVE-9: no honest extent is readable (DTB/UEFI silent, MC probing the rejected
+EL3-crash class), so exclude a bounded GUESS window starting flush at the declared neighbor's top.
+XCARVE-10 tried **4 MiB `[0x26c400000, 0x26c800000)`** (`XCARVE_GIB9B_BASE = 0x26c400000`) — an
+explicit bounded guess, said so in the banner, refutable at or above `0x26c800000`. Heap
+(top `0x26b3ca000`) unaffected. It was refuted within the hour — see XCARVE-11.
+
+#### XCARVE-11 — the four climbing hits: stop chasing, exclude the ENTIRE undeclared gap (**structural, always-on; metal-owed**)
+
+The 4 MiB XCARVE-10 guess was refuted **within the hour**: boot-36-retry hit a RAS at PA
+`0x26d03f600` — above `0x26c800000`. Four hits now **climb monotonically**:
+`0x26b900000` → `0x26bc5ee90` → `0x26c6be4a0` → `0x26d03f600`. Incremental widening is a refuted
+method; each bounded step just moves the wall. The verdict: stop chasing the family granule by
+granule — the protected span is (or behaves as) the **entire undeclared gap**. So XCARVE-11 excludes
+everything from the declared `[0x26c180000, 0x26c400000)` carveout's top up to the next declared
+object above it — the framebuffer/scanout carveout at `0x279e00000` (CPU-written; never excluded):
+**`[0x26c400000, 0x279e00000)` = 218 MiB** (`XCARVE_GIB9B_SIZE = 0x0da00000`). The declared windows
+(`[0x26b5f0000, 0x26b7f0000)` and `[0x26c180000, 0x26c400000)`) stay their own set entries; the span
+actually protected against the RAS family is the whole gap between and above them, now excluded in one
+sweep. Heap (top `0x26b3ca000`) and every mapped consumer sit below it; the gap holds nothing we map.
+A RAS at or above `0x279e00000` (inside fb) would refute the *static-window model itself*, not the
+extent — the escalation is a different arc, not another widening.
+
+**Cross-reference.** The forum-reply revision of 2026-07-22 (`review/unaos-orin-repro-REPLY.md` v3)
+draws on the XCARVE-9/10/11 entries above for the undeclared-gap exclusion narrative.
+
 ### JX1 result — XUSB first light (⛔ **the block is EL3-fatal to touch post-EBS; BPMP ungate required first**)
 
 The one-boot probe (a guarded read of the xHCI capability block @ `0x0361_0000`, the Linux DT
@@ -3379,6 +3859,46 @@ QEMU proof of the identical arch-neutral render is the aarch64/**virt** path (GI
 `UNAOS_RAST=1 ./arroyo test-arm` prints `:: RAST: … spinning cube … ::` + the fps line, and the boot
 still reaches `MISSION SUCCESS`.
 
+### JD20 — a visible mouse cursor on the panel (ORIN-POINTER, ⏳ METAL-PENDING)
+
+The composite HID device behind the HS hub enumerates a pointer interrupt-IN endpoint
+(`>>> POINTER INTERRUPT IN EP FOUND: 0x82 … ABSOLUTE tablet (proto 0) <<<`), and the shared xHCI
+driver has always polled its reports into the dedicated `mouse_data_buffer` and pushed
+`pal::Event::Mouse` / `MouseAbsolute` onto the PAL queue (built for the x86 midden GUI). On the Orin
+nothing consumed them — the JD2 console owns the panel and only drained `Event::Key`. JD20 wires the
+tegra-side pump: the `jd2_console_pump` shell loop (`main.rs`) now drains the pointer events alongside
+keys and composites the **shared** `pal::cursor` arrow onto the console's `Screen` back buffer via the
+R22 save-under machinery — **`pal::cursor` and `Screen`/`framebuffer.rs` are call-never-edit here**.
+
+**Compositing (save-under, trail-free).** An absolute-tablet report scales raw HID `0..=32767` to the
+1920×1200 panel in `cursor::set_abs`; a relative report accumulates via `cursor::move_rel`. Each pointer
+event runs the shared triad `restore → move/set_abs → draw_over`: `draw_over` stashes the back-buffer
+pixels under the sprite's full bbox (through `TargetPal::read_pixel` → `Screen::read_back_pixel`, cached
+RAM — the WC scanout stays write-only) and paints the arrow; `restore` repaints the stash before any
+move. **A keystroke erases the cursor first** (`restore`) so the console repaint never captures cursor
+pixels into the stash, then the arrow is re-composited on top after the drain — so the cursor survives
+console scroll/redraw and never corrupts text. The cursor self-gates on `cursor::visible()` (starts
+hidden, auto-hides ~1.5 s after the last report and is swept off that frame), so a keyboard-only boot is
+behaviourally unchanged — **no knob**.
+
+**Clicks.** Byte 0 of every pointer report is the button bitmask; the xHCI decoder now edge-detects it
+against the previous report (`DeviceSlot::mouse_last_buttons`) and pushes `pal::Event::Button(mask)` on a
+0→1 down-edge (release/hold stay silent), bringing the xHCI pointer to parity with the EHCI/rMBP path
+which already emitted `Button`. The pump logs each press as a `:: tegra: JD20 — pointer BUTTON … ::`
+line; no UI action is wired to clicks yet.
+
+**Shared-file flag (rmbp-lane review).** Two shared files changed and were re-gated on x86:
+`drivers/xhci/mod.rs` (additive: one `DeviceSlot` field + button edge-detect + `Button` push — this now
+fires for an external USB mouse on x86 too, which `vug`/`pulse` already consume to exit) and `main.rs`
+(the tegra-only `jd2_console_pump` loop). `pal::cursor`, `Screen`, and `framebuffer.rs` are untouched.
+
+**Witness / gate (QEMU).** `./arroyo check` + `UNAOS_TEGRA=1 ./arroyo check` green both arches;
+`UNAOS_GICV3=1 ./arroyo test-arm 30` → CAPSTONE clean, no `FAIL`/`SERROR`/`PANIC`; `./arroyo test 30`
+→ x86 `MISSION SUCCESS` (shared xHCI/GUI guard). QEMU-virt has no pointer, so the cursor rides the
+attended Orin bench: on silicon, moving the tablet should paint a white drop-shadowed arrow that tracks
+the pointer over the shell without smearing text, and a click should print the JD20 BUTTON line — the
+first `:: tegra: JD20 — pointer live … ::` line marks the first consumed report. **METAL-PENDING.**
+
 ## 4. Jetson Orin Nano headless bring-up (Arc JM2)
 
 The Orin is brought up **headless over serial**. The only console that has ever
@@ -4763,6 +5283,68 @@ layout joins the faulter ledger (~1-in-3 observed, small sample).
   detail in the serial log). The NET-2 scoping data now exists on the record; fold into
   §ORIN-NET-1's metal columns at the next docs pass on the merged tree.
 
+#### XCARVE-SNOC FIX — the xHCI event ring + ERST leave image `.bss` for the heap (R23s1; shared-core, Peter-approved)
+
+The diagnosis arc above and §VUG-RAS-LOCALIZER's VUG-RAS-ANALYZE verdict converged on one class: the
+residual SNOC "Carveout Uncorrectable" FillWrite is a store into the **un-vetted kernel-image load
+extent**, not an allocator miscomputation and not the NET rx path. This arc **pins and relocates the
+writer**.
+
+**Root cause (store-site evidence, not naive PA-match).** The xHCI **event ring** (`EventRing`, whose
+`trbs: [Trb; 256]` array lived *inline* in the `static EVENT_RING`) and the **ERST** (`static mut
+ERST_TABLE`) were the **only** xHC-DMA structures NOT heap-backed. Every other member of the DMA
+surface — the command/transfer rings (`ring::allocate_ring`), DCBAA + scratchpad array/buffers
+(`alloc_zeroed`), per-slot input/output contexts, HID buffers — is heap-allocated, so it lands in the
+`HEAP-GUARD`-vetted, DMA-window-resident heap (boot-15's VUGRAS candidate table confirmed them all at
+`0x2683c…`). The event ring + ERST sat instead in the **bootloader-chosen** image extent (boot-15:
+`Allocated kernel at 0x25adea000`, 399 pages ⇒ `[0x25adea000, 0x25f79000)`), which `HEAP-GUARD` does
+**not** vet for firewall carveouts. The CPU's construction store — `EventRing::new()` zero-fills 4 KiB
+of TRBs at the static; `init_interrupter` writes the ERST entry — dirties cache lines whose PA the SNOC
+firewall rejects, and the **FillWrite fires on writeback**, surfaced frames later by the VUGRAS
+`DC CIVAC` churn (the H2 verdict: span A = the heap, which is carveout-clear, so the sweep *revealed*
+the fault, did not cause it). The reported ADDR is **record-format** (bit-63 erratum, §JETSON-XCARVE
+supersession) and reads near DRAM top (`0x800000026b900000 → 0x26b900000`), **NOT** the literal `.bss`
+PA `~0x25e…`; do not root-cause by matching it. Two independent brackets localize the writer instead:
+(1) the localizer's **timing bracket** — boot-15 faulted at `:: VUGRAS: idle tick 0 swept ::`,
+immediately after the port-7 event was delivered/consumed; (2) the **structural inventory** — the
+event ring + ERST are the sole `.bss`-resident xHC-DMA surface. (Boots 13 `0xbe000f80` and 14
+`0x27724f340` are the same class on other boot paths.)
+
+**Fix (no protection weakened — nothing mapped writable, RAS never masked).** Make the xHC DMA surface
+**uniform**: every structure the controller reads/writes now lives in the vetted heap.
+- `EventRing` holds a heap `*mut Trb` (via `ring::allocate_ring`, 64-byte aligned, zero-filled ⇒
+  byte-identical initial state to the old inline `[Trb::new(); 256]`) — mirrors `TransferRing`.
+- `init_interrupter` **heap-allocates the ERST** (`alloc_zeroed(Layout::new::<ErstTable>())`, 64-byte
+  aligned per xHCI 6.5) and no longer takes an `erst_table_phys` argument; the `static mut ERST_TABLE`
+  is deleted. The allocation is never freed (the controller is `'static`, same discipline as DCBAA).
+- The formerly-**dead** `XhciController::event_ring_phys_base` field is now populated (it was only ever
+  assigned `0` at construction — the phantom `event_ring_base=0x0` that sent the boot-15 investigation's
+  lead #1 chasing an unset ring base), and the VUGRAS candidate dump gains an `erst_base=` field, so a
+  capture witnesses **both** bases as heap-resident.
+
+**Shared-core files touched (flagged — a shared xHCI change bites x86; verified below):**
+`drivers/xhci/event.rs`, `drivers/xhci/mod.rs` (shared core); `arch/x86_64/pci.rs`,
+`arch/aarch64/pci.rs`, `arch/aarch64/piusb.rs`, `arch/aarch64/xusb_tegra.rs` (the four `init_interrupter`
+call sites drop the ERST argument).
+
+**Gates (all green):** `./arroyo check` both arches + aarch64 `tegra,vugras,tegrasmp,xcarve_relink`;
+`./arroyo test` **x86 MISSION SUCCESS** (`BOT + CSW`, the shared-xhci-bites-x86 precedent gate) with the
+event ring + ERST now heap-backed; default `test-arm`, `UNAOS_GICV3=1 test-arm`, and
+`UNAOS_GICV3=1 UNAOS_VUGRAS=1 test-arm` all **CAPSTONE COMPLETE** (localizer sweep runs, no regression);
+`./arroyo kernel8` pi4 image builds (the `piusb.rs` path).
+
+**Expected metal serial (`UNAOS_TEGRA=1`, the wall-repro boot):**
+- `:: VUGRAS: xHCI DCBAA=0x2683… event_ring_base=0x2683… erst_base=0x2683… … ::` — event-ring and ERST
+  bases now inside the heap `[heap_lo,heap_hi)`, **not** image `.bss` `~0x25e…`.
+- a `vug` ×2 + shell-idle + VUGRAS burst run completes with **no `RAS Uncorrectable Error in SNOC …
+  Carveout Uncorrectable`** and no ACI FillWrite through the xHC event path.
+
+**Metal-owed:** QEMU cannot exercise the firewall (tegra is metal-only; the gates prove only no
+regression + that the heap-backed rings enumerate). Re-run the boot-13/14/15 repro on the Orin
+(default path, `UNAOS_VUGRAS=1`) and confirm the SNOC Carveout FillWrite no longer fires through a
+`vug` ×2 + shell-idle + burst, with the VUGRAS candidate table showing the event ring + ERST
+heap-resident.
+
 ### ORIN-SMP-8 — the tegrasmp RELINK (the layout-axis close-out; BUILD-ONLY, `UNAOS_TEGRASMP` + `UNAOS_XCARVE_RELINK`)
 
 ORIN-SMP-7's attended sitting exonerated the wake POSITION axis end-to-end (legs 24/25 both put 5/5
@@ -5394,6 +5976,60 @@ tick path in `timer.rs` (the shared-`TICKS` double-count containment named above
 + idle-heartbeat PASS + **busy-heartbeat PASS** + CAPSTONE 6/6; `./arroyo test-arm 22` MISSION;
 `./arroyo kernel8-test` 44 PASS / 0 FAIL (shared-`sched.rs` unregressed on the Pi — its APs run the
 full `run()` loop via `start_aps`, an untouched path).
+
+### ORIN-SMP-RUN — routing the tegra/virt secondaries into the preemptive `run()` loop (SCHED-BAL participation)
+
+The busy-heartbeat arc named its own deferral: *"preemptive multi-core scheduling on the secondaries
+… remains the metal-only step."* This arc lands it. After the SCHED-BAL balancer (work-stealing +
+wake/spawn placement) merged, the balancer places and steals **only** onto cores that entered
+`sched::run()` and set `ONLINE[cpu]`. The `virt`/tegra secondaries did their per-core bring-up + the
+one-shot cooperative pass (`run_secondary_work`) and then **parked in WFI without ever entering
+`run()`** — so on Orin one core (the boot core, running the cooperative CAPSTONE) stayed hot and the
+five secondaries stayed parked and invisible to the balancer.
+
+**The change (`__secondary_rust_virt` + one new `sched.rs` entry).** The shared secondary-entry tail
+now, after `run_secondary_work(core)`, calls **`sched::secondary_run(core)`** (a thin `-> !` wrapper
+around the private `run()`) instead of the old `note_core_idle` + WFI-park loop. `run()` sets
+`ONLINE[cpu]` first thing, so a previously-parked secondary becomes a full SCHED-BAL participant: the
+balancer may place woken/spawned migratable work on it and it steals from busier cores when idle.
+The entry shape, per-core stack discipline, and every bring-up witness line (`AP N online`, the
+BSP→AP/AP→BSP SGI proofs, CAPSTONE) are unchanged — only the terminal park is replaced.
+
+**Why not `wait_and_run` (the Pi model).** The Pi AP path enters via `wait_and_run`, which gates on
+`SCHED_GO`. The tegra/virt BSP never publishes `SCHED_GO` on the `CPU_ON` path (its boot core runs
+the cooperative CAPSTONE via `run_capstone_boot_core`, not `run()`), so gating there would leave the
+secondaries parked and never-`ONLINE` — defeating the arc. `secondary_run` enters `run()` immediately;
+this is safe because the cooperative pass already drained any BSP-staged startup queue before the call.
+
+**Housekeeping audit — what `run_secondary_work` still owes.** On the tegra/probe paths it is a no-op
+(not armed → immediate return); on `virt` it drains the staged cooperative-probe queue (`CPU_BUSY`)
+and sets `SECWORK_DONE`. Both still happen (the call is kept, before `run()`), so the BSP's
+busy-heartbeat witness is unchanged. The removed `note_core_idle` park loop fed `CPU_IDLE` for the
+CPU-pulse meter; that duty is **subsumed by `run()`'s idle path**, which bumps `CPU_IDLE` on every
+empty dispatch. In the GICv3 capture each AP now reads `pulse (busy=8, idle=2) ran+idle` — `idle=2`
+(vs the `idle=1` a bare cooperative pass leaves) is the direct witness that `run()` is now iterating.
+`note_core_idle` is retained as a general introspection helper (no live caller).
+
+**Timer deferral held (JC3).** AP periodic ticks stay deferred — a second core arming the shared tick
+clock double-counts the wall-clock budgets — so `run()`'s idle WFI wakes on the reschedule SGI, not a
+local tick. That is sufficient: `make_ready`/`spawn_balanced` poke the target with `IPI_RESCHED`, so
+newly-placed or stealable work always breaks the WFI. The JM6 EL2→EL1 boot-core drop and
+`run_capstone_boot_core` are untouched (the secondaries run the scheduler at EL2, EL-neutral).
+
+**QEMU witness.** `UNAOS_GICV3=1 ./arroyo test-arm 30`: the SCHED-BAL witness now reads
+`3 online cores, 4 core(s) ran work` (was `0 online cores` — no core entered `run()`); per-core
+`c1/c2/c3 busy=8 steals=0` (steals 0 on `virt` — no migratable balancer work is staged there, so the
+line is the structural marker). On real Orin, migratable work staged across the six cores is the
+accruing metal witness: a previously-parked core showing `busy>0` / `steals>0` in the SCHED-BAL line.
+
+**Gates green:** `./arroyo check` both arches; `UNAOS_TEGRA=1 ./arroyo check` both arches;
+`UNAOS_GICV3=1 ./arroyo test-arm 30` — no FAIL/SERROR/PANIC, all `AP N online` + `pulse … ran+idle` +
+idle/busy heartbeat PASS + CAPSTONE 6/6 present; `./arroyo kernel8-test 35` + `mbench --replay …
+--spec pi4-regression.spec` = **46/46, 0 forbidden** (shared `sched.rs`/`smp_virt.rs` unregressed on
+the Pi — its `smp.rs` `wait_and_run` path is untouched).
+
+**Metal-owed.** The Orin bench: stage migratable work across the six cores and read the SCHED-BAL
+line for `busy>0` / `steals>0` on the formerly-parked cores (`awk '/SCHED-BAL/' <log>`).
 
 ### VUG-HONESTY — the parked-core *display* completion (the heartbeats' third leg)
 
@@ -7455,6 +8091,377 @@ arches green. `./arroyo test-arm 30` 0 FAIL; `UNAOS_GICV3=1 ./arroyo test-arm 30
 brief's `UNAOS_TEGRA=1 … test-arm` combination wedges at the UEFI→kernel handoff on QEMU virt at every
 commit tested back to pre-SDMMC-3 (pre-existing; tegra builds are metal-only and historically gate
 `check`, never `test-arm`).
+
+### NET-4d → 4g — the RX no-lease investigation (rtl8168_tegra.rs)
+
+The instrumented boots turned the DHCP no-lease into a precise, still-open RX riddle. Each step is
+bounded, read-only, and keeps every prior witness:
+
+- **NET-4d** — RX-window frame classification (`net4d_classify` / `net4d_window_close`): a full L2/L3/L4
+  line for the first frames and always for any BOOTP/DHCP, per-category tally at window close, plus a
+  driver-visible OFFER accept-check (xid vs. the captured DISCOVER, dst-MAC). Metal: the DHCP **OFFER
+  arrives** (len 346, perfect bytes) — the wire/server side is exonerated.
+- **NET-4e** — a `dsb ld` DMA read barrier between the OWN-clear check and the buffer copy (the
+  observation-ordering theory). Refuted on metal: barrier live, later frames still all-zero payload.
+- **NET-4f** — non-coherent-DMA cache maintenance: `dc ivac` invalidate-before-read on RX (at alloc, at
+  recycle, and `[buf,buf+len)` after OWN-clear) + `dc cvac` clean on TX. Refuted on metal: with the
+  invalidate live on every read the signature is **identical** — `rx[0]` real, `rx[1..]` carry a real
+  DESCRIPTOR length (346/531/551/64…) but an ALL-ZERO payload; popped counts reach the full 32-slot ring.
+- **NET-4g** — the riddle-breaker dump (`net4g_desc_dump`, at window close). Code-reading refutes an
+  in-driver defect: `alloc_rx` programs each slot with a distinct `rx_buffers + i*RX_BUF_SIZE`,
+  `rx_frame_raw` reads the matching buffer, the arena is one contiguous DRAM region (Orin DRAM base
+  `0x8000_0000`, so every buffer is equally NIC-reachable — no partial inbound window), and the ring is
+  provably coherent (the CPU observes the NIC's per-slot length write-backs, so the buffers are coherent
+  too). That leaves exactly one metal-only unknown: does `desc[i].addr` hold what the driver programmed?
+  The C+ RX engine PRESERVES `addr` across completion, so the dump prints raw `opts1/opts2/addr` next to
+  the programmed address for the first `NET4G_DUMP_N` (8) slots with a MATCH / ADDR-MISMATCH verdict.
+
+**Metal-owed (decisive):** one instrumented `[net4g]` boot. An **ADDR-MISMATCH** localizes the defect to
+the descriptor semantics (format/stride — an in-file fix). **All-MATCH** proves the descriptors are
+correct and the payload-to-nowhere is a DMA-write reachability question (SMMU / inbound iATU) **below the
+NET-4 driver's lane** — a STOP-and-report boundary for a follow-up arc.
+
+### NET-4h → 4n — the inbound-DMA path, and the RX defect root-caused to 64-bit DMA left OFF (rtl8168_tegra.rs)
+
+The `[net4g]` boot returned **all-MATCH**, so the RX riddle became a DMA-write reachability question. The
+inbound path was built and armed, layer by layer, and finally root-caused **back inside the driver**:
+
+- **NET-4h** — the missing INBOUND iATU (`program_inbound_atu`). The M1-fix programmed only the OUTBOUND
+  region (CPU → NIC registers); an incoming bus-master write TLP needs an INBOUND region to reach DRAM.
+  Armed one identity region 0 covering all of RAM (`dram_window(ram_gib_mask)` → `[0x8000_0000,
+  0x2_8000_0000)`), BASE = TARGET = DRAM base. Metal: armed, readback confirmed — **the zeros survived.**
+- **NET-4i** — the SMMU stream below the iATU (`smmu_tegra::net4i_*`). Recon of PCIe-C0's stream (sid 0x9)
+  found **CLIENTPD=1 / USFCFG=0** on both MMU-500 instances — the SMMU is globally bypassing, the stream is
+  already untranslated. Nothing to arm; **the zeros survived** this too.
+- **ORIN-DMA-WINDOW** — the heap-guard now DERIVES the inbound window from the RC's `dma-ranges` and
+  constrains the heap into it (see §ORIN-RAS-2 → ORIN-DMA-WINDOW). This also moved the heap **high**
+  (~9.6 GiB) for good, exposing the defect the low-heap boots had masked.
+- **NET-4m** — the speculation-fenced buffer-DRAM probe (`[net4m]`, `UNAOS_NET4_RINGDUMP`). Boot-16 verdict:
+  `rx[1..4]` read the raw buffer DRAM **ZERO** with a real descriptor length → **writes-to-nowhere**, not a
+  cache artifact. The RC corroborated it: an **IOB `FillWrite` RAS, ADDR `0x8000000000000200`** (stripped
+  `0x200` = the fabric slave-error sink for an inbound write matching no inbound region).
+
+> **[SUPERSEDED by NET-4q]** — the NET-4n → NET-4n2 → NET-4o → NET-4p arc below rests on the premise that
+> `CplusCmd.PCIDAC` is the "64-bit buffer-DMA enable" and that its failing to latch proves a 32-bit-only
+> payload path. Per the L4T facts that premise is wrong: PCIDAC is a dead parallel-PCI relic, and the PCIe
+> 8168 forms 64-bit (DAC) TLPs natively from the descriptor's `__le64 addr`. NET-4q emits the full 64-bit
+> address (High-before-Low ring bases) and removes the sub-4 GiB arena and the inbound-iATU alias. The
+> narrative below is retained as the investigation record; see **NET-4q** at the end of this section.
+
+- **NET-4n — the fix.** With the inbound iATU armed identity over the true buffer PAs and the SMMU
+  bypassing, the addresses *reaching* them were wrong. Root cause **in this driver**: the C+ engine was
+  left in **32-bit payload-DMA mode** — `CPlusCmd.PCIDAC` (bit 4) clear (boot-16 read back `0x2021`). The
+  engine reaches the descriptor **ring** through the dedicated 64-bit `RDSAR`/`TNPDS` registers (so a
+  >4 GiB ring fetches + writes back fine — the ring stays coherent, the NET-4m asymmetry), but for the
+  per-buffer **payload** write it uses only `Desc.addr[31:0]`. With the heap seated high (buffers at
+  `0x2683cbXXX`, net4g `[MATCH]`) the payload address truncates to ~1.6 GiB, **below** the inbound iATU's
+  `0x8000_0000` base → no region matches → the `0x200` FillWrite RAS + a buffer that keeps its
+  `alloc_zeroed` zeros. Only the FIRST buffer filled after `RxEnb` lands cleanly (address latched from the
+  ring context); `rx[5]`'s "nonzero" is a torn hi/lo write, the same defect. **Fix:** set `CPlusCmd.PCIDAC`
+  in `init_rings` so every payload TLP carries the full 64-bit `Desc.addr` (the r8169 `NETIF_F_HIGHDMA`
+  path). This is the **preferred "silicon-is-64-bit-capable" fork** — the >4 GiB `RDSAR` fetch proves the
+  capability; the sub-4 GiB DMA-arena fork stays as the fallback if a metal boot shows truncation survive.
+
+**Expected boot-17 (metal-owed):** `rings up: … CPlusCmd 0x2031 PCIDAC=1 (64-bit DMA ENABLED)`, **no**
+`0x200` IOB `FillWrite` RAS, `[net4m]` all-**nonzero** across the ring, and the DHCP **ACK** lands → a
+`[dhcp]` lease instead of the `[static]` fallback. QEMU cannot exercise the tegra path; the gates prove
+non-regression only.
+
+- **NET-4n2 — PCIDAC is written but does not LATCH; re-apply it as the FINAL `CPlusCmd` write.** Boot-17
+  showed the RMW **issue then revert**: `>>> REG WRITE (NET-4n): CPlusCmd[0xe0] 0x2021 -> 0x2031` at the
+  top of `init_rings`, but the rings-up readback came back `CPlusCmd 0x2021 PCIDAC=0 (64-bit DMA NOT
+  latched)` — bit 4 dropped during the ring/`RxEnb`/`RCR` programming, and the DHCP still no-leased with the
+  same `0x200` FillWrite RAS. **Which cause:** the two candidates were (1) a later `CPlusCmd` write clobbers
+  it, or (2) the write needs a config-unlock/ordering window. A **static trace rules out (1)**: the pre-ring
+  RMW is the **only** write to `CPlusCmd` (`0xE0`) in the driver, it already sits inside the `CFG9346`
+  unlock window, and **no** register programmed after it aliases `0xE0/0xE1` (`RDSAR`@`0xE4`, `RMS`@`0xDA`,
+  `MTPS`@`0xEC`, `TCR`@`0x40`, `RCR`@`0x44`, `CR`@`0x37` all miss it). So the revert is **silicon**: this
+  RTL8168 does not hold the DAC bit when it is set **before** the descriptor engine is armed (the r8169
+  order writes `C+CR` late). **Fix:** re-apply `PCIDAC` as the **final `CPlusCmd` write** — after `RCR`,
+  still inside the `9346` unlock window, as an RMW with a bounded 3-attempt confirm loop and an **immediate
+  readback** printed after the store; the `9346` lock moves to after it so the store lands unlocked. The
+  pre-ring set is kept (its delta vs. the final re-read is the revert oracle), and the rings-up `PCIDAC=N`
+  line remains the second, independent confirmation.
+
+  **Expected boot-18 (metal-owed):** `>>> REG WRITE (NET-4n2): CPlusCmd[0xe0] 0x2021 -> 0x2031 (re-apply
+  PCIDAC — final C+CR write, post-RCR; attempt 0)` immediately followed by `CPlusCmd readback after final
+  write = 0x2031 PCIDAC=1 (LATCHED)`, then `rings up: … CPlusCmd 0x2031 PCIDAC=1 (64-bit DMA ENABLED)`,
+  **no** `0x200` IOB `FillWrite` RAS, `[net4m]` all-**nonzero**, and the DHCP **ACK** → a `[dhcp]` lease.
+  The decisive negative branch: if the readback stays `0x2031`→`0x2021` after the final write under unlock,
+  the loud `!! NET-4n2: PCIDAC WILL NOT LATCH …` line proves the C+ 64-bit-DAC path unusable on this
+  silicon and hands off to a placement/reachability fork — first attempted as the **sub-4 GiB DMA-arena**
+  (NET-4o, below), which boot-19 proved impossible on this board, then resolved by the **inbound-iATU alias**
+  (NET-4p, below). QEMU cannot exercise the tegra path; the gates prove non-regression only.
+
+- **NET-4o — PCIDAC won't latch (boot-18 settled it): give the NIC a sub-4 GiB DMA arena. `[REVERTED —
+  boot-19]`** Boot-18 fired
+  the decisive negative: `!! NET-4n2: PCIDAC WILL NOT LATCH … C+ 64-bit-DAC path unusable on this silicon`,
+  `[net4m] rx[1..5] nonzero=false`, `NET: no lease`. The C+ engine's `PCIDAC` bit does not hold on this
+  RTL8168 variant even as the final `CPlusCmd` write under `9346` unlock, so the **per-buffer payload DMA is
+  32-bit only** (`Desc.addr[31:0]`) — while `ORIN-DMA-WINDOW` seats the heap **high** (~9.6 GiB), so a heap
+  buffer PA truncates below the inbound iATU base `0x8000_0000` → the `0x200` `FillWrite` slave-error + zero
+  payloads. Placement below 4 GiB is the last lever, and it is what NET-4o pulls.
+
+  **The arena.** The valid window is **`[0x8000_0000, 0x1_0000_0000)`** — simultaneously `< 4 GiB` (a 32-bit
+  payload address reaches it) and `>= 0x8000_0000` (inside the NET-4h inbound iATU identity window). A tiny
+  (256 KiB) carveout-clean span there holds the **entire** NIC DMA surface: RX descriptor ring, 32×2 KiB RX
+  buffers, TX descriptor ring, 8×2 KiB TX buffers (≈88 KiB used). The kernel heap stays HIGH (ORIN-DMA-
+  WINDOW); this is a **separate small arena**, not a heap move.
+
+  **Where it's seated (the lane call — self-contained tegra/net lane, NO shared-allocator change).**
+  `mmu_tegra::select_heap_region` (a `tegra`-gated jetson-lane file) already scans the UEFI-reserved + DTB
+  `/reserved-memory` carveouts and derives the PCIe inbound-DMA window(s) from `dma-ranges`. NET-4o extends
+  that **same** scan: in the derived-window success path it also seats the **LOWEST** carveout-clean 256 KiB
+  span inside `[0x8000_0000, 0x1_0000_0000)` ∩ a derived window, **excluding the (high) heap span** so the
+  two never collide by construction, and publishes `(base, size)` via `net4_dma_arena()`. The RTL8168 driver
+  reads that and bump-allocates rings + buffers from it through its **own** `DmaArena` (a base+cursor bump
+  pointer in `rtl8168_tegra.rs`) — the shared global allocator is **untouched**. Identity-mapped Normal-WB
+  RAM ⇒ `base` doubles as the PA, and the existing NET-4f cache maintenance (per-pop `dc ivac`) still
+  applies unchanged. If no clean low span exists, `mmu_tegra` witnesses `NET-4o — WARN … UNSEATED` and the
+  driver **fails closed** (`!! NET-4o: no sub-4GiB DMA arena seated … REFUSING ring alloc`) rather than
+  re-arm the truncation. The `PCIDAC`/`[net4m]`/RINGDUMP instrumentation is kept; `PCIDAC=0` at rings-up is
+  now the **expected, correct** reading (32-bit payload DMA into the sub-4 GiB arena is sufficient).
+
+  **Expected boot-19 (metal-owed):** at heap-guard, `:: tegra: NET-4o — NIC DMA arena [0x8…, …) (256 KiB)
+  seated sub-4GiB …`; at ring bring-up, `:: PCIE4: NET-4o — NIC DMA arena [0x8…,0x8…) (256 KiB) sub-4GiB,
+  inside iATU window ::` with the ring/buffer PAs now in `[0x8000_0000, 0x1_0000_0000)`; **no** `0x200` IOB
+  `FillWrite` RAS; `[net4m]` **all nonzero** (the ACK lands in a reachable buffer); and the DHCP **lease**
+  (`NET: DHCP lease …` / `[dhcp]`). QEMU cannot exercise the tegra path; the gates prove non-regression only
+  (default `check` + `UNAOS_NET4=1 UNAOS_TEGRA=1` `check`, default `test-arm`, and the `UNAOS_VNET` seam
+  regression — vnet lease + the NET-4j reproducer stay PASS).
+
+- **NET-4p — no clean low DRAM exists: keep the buffers HIGH and ALIAS the truncation (the correct IOMMU
+  use).** Boot-19 refuted NET-4o's premise: `!! NET-4o: no sub-4GiB DMA arena seated (mmu_tegra HEAP-GUARD
+  found no clean low span) — REFUSING`. The window `[0x8000_0000, 0x1_0000_0000)` = `[2 GiB, 4 GiB)` is
+  packed with Tegra firmware carveouts (OPTEE `CO:43 @0xbe000000`, BPMP/TSEC/…) + UEFI reservations — there
+  is **no** carveout-clean 256 KiB span, so the arena can never seat and the NIC never comes up. The sub-4 GiB
+  arena fork is **dead** on this board. NET-4o is **REVERTED** — both `mmu_tegra::select_heap_region`'s arena
+  selection (`net4_dma_arena`, `NET4O_ARENA_*`, `lowest_clean_in`) and the driver's `DmaArena`; rings +
+  buffers return to the **high kernel heap** (pre-NET-4o `alloc::alloc::alloc_zeroed`), so there is no
+  fail-closed low-arena path and the NIC boots.
+
+  **The alias.** The inbound iATU translates PCIe bus addresses → CPU/fabric addresses. The C+ engine's
+  per-buffer payload write is permanently 32-bit (`Desc.addr[31:0]`; PCIDAC won't latch), so a high-heap
+  buffer PA `0x2683cbXXX` truncates to `0x683cbXXX` — **below** the `0x8000_0000` identity base → no inbound
+  region matches → the `0x200` `FillWrite` slave-error + a zeroed buffer. NET-4p adds, per DMA buffer span,
+  a dedicated **inbound-iATU ALIAS region** that maps the **low-32-bit alias** of the span back to the real
+  high PA: `BASE = buf_pa & 0xFFFF_FFFF`, `LIMIT = BASE + span − 1`, `TARGET = buf_pa`. The NIC's truncated
+  write to `BASE + off` now MATCHES and translates to `buf_pa + off` = the real high buffer — **no
+  truncation loss, buffers stay in the high heap, no clean low DRAM needed.** Only the **RX and TX buffer
+  spans** are aliased: the descriptor **ring** is fetched/written back through the dedicated 64-bit
+  `RDSAR`/`TNPDS` path (metal-proven un-truncated — the ring stayed coherent while the payloads vanished), so
+  it needs no alias. RX and TX buffers are separate heap allocations, so each gets its own region on a spare
+  inbound index (**1** = RX, **2** = TX; index **0** = the NET-4h identity region).
+
+  **Where it's done (self-contained tegra/net lane).** `program_inbound_alias` (`rtl8168_tegra.rs`) programs
+  the regions from `init_rings`, right after the buffers are allocated and **before** `RxEnb`/`TxEnb`, so the
+  first payload write is already covered. `mmu_tegra` is only *reverted* here — no new mmu logic; the shared
+  allocator is untouched.
+
+  **Collision check (critical, fail-closed — `arm_one_alias`).** Before arming, each alias window is checked
+  and the whole ring bring-up **refuses** on any collision: (a) a span already sub-4 GiB inside the identity
+  region needs no alias (truncation is a no-op) — skipped; (b) a truncated span crossing the 4 GiB boundary
+  can't be one contiguous region — refused; (c) overlap with the NET-4h **identity inbound region** — refused
+  (so a successfully-armed alias is always **< the DRAM base**); (d) overlap with controller-0's **PCIe
+  MEM/BAR window** (`ranges`, resolved from the DTB) — refused (peer-to-peer mis-route hazard); plus a check
+  that the RX and TX alias windows don't overlap each other. The **MSI doorbell** needs no separate test: a
+  firmware-allocated MSI target page lives in DRAM (`≥` the DRAM base), and any armed alias is `<` the DRAM
+  base by (c), so an alias can never collide with it — the one sub-DRAM-base inbound hazard is the PCIe
+  MEM/BAR window, which **is** checked. On the observed placement (buffer alias `~0x683cbXXX ≈ 1.63 GiB`,
+  DRAM base `0x8000_0000 = 2 GiB`, PCIe MEM window at `0x4000_0000`) the alias is clear of both.
+
+  **Expected boot-20 (metal-owed):** at ring bring-up, `[net4p] inbound iATU ALIAS region 1 (rx-buffers) …
+  truncated PCIe DMA [0x683c…..] -> real DRAM 0x2683c… (up-translate)` and `region 2 (tx-buffers) …`, each
+  followed by `[net4p] alias region N … readback: BASE=… LIMIT=… TARGET=0x2… CTRL2=0x8… (enabled=1)` (the
+  **alias witness**); the NET-4n2 `!! PCIDAC WILL NOT LATCH … EXPECTED — NET-4p's inbound-iATU alias makes
+  32-bit payload DMA sufficient`; **no** `0x200` IOB `FillWrite` RAS; `[net4m]` **all nonzero** (the ACK
+  lands in a reachable buffer); and the DHCP **lease** (`NET: DHCP lease …` / `[dhcp]`). QEMU cannot exercise
+  the tegra path; the gates prove non-regression only (default `check` + `UNAOS_NET4=1 UNAOS_TEGRA=1` `check`,
+  default `test-arm`, and the `UNAOS_GICV3=1 UNAOS_WITNESS=1 UNAOS_VNET=1 test-arm` seam regression — vnet
+  lease + the NET-4j reproducer stay PASS).
+
+- **NET-4q — the 8168 IS 64-bit-DMA capable: emit the full descriptor address, drop the alias.**
+  **The 32-bit-payload premise (NET-4n) and everything built on it (the NET-4o sub-4 GiB arena, the NET-4p
+  inbound-iATU alias) are SUPERSEDED.** The L4T reference (`r8169_main.c`) settles the capability question:
+  the driver requests a **64-bit** DMA mask for every 8168c-and-later (gate: `mac_version >= VER_18`; our
+  PCIe 8168 qualifies) and performs 64-bit RX/TX **purely via the descriptor's `__le64 addr` field** — a
+  full 64-bit dword inside every descriptor. `CplusCmd.PCIDAC` (bit 4) is a **parallel-PCI "Dual Address
+  Cycle" relic** that `r8169` **never sets** for a PCIe 8168/8125 and in fact **masks out** of the value it
+  writes (`CPCMD_MASK`); on PCIe a 64-bit (DAC) TLP is formed **natively** from the descriptor high dword,
+  not gated by any C+ bit. So the boots-16..18 observation *"PCIDAC won't latch"* is **expected and
+  harmless** — a no-op on this silicon — **not** evidence of a 32-bit-only payload path. The
+  `PCIDAC-won't-latch ⇒ 32-bit ⇒ arena ⇒ alias` chain was a misdiagnosis of a dead legacy bit.
+
+  **The actual init divergence (the tension boot-16/20 posed).** Our RINGDUMP already showed the RX
+  descriptor carrying the full `addr=0x2683cb000` `[MATCH]` (high dword `0x2` present) — the descriptor path
+  was **never** truncating in software. The one place our sequence differed from the documented r8169 order
+  is the descriptor-**ring** base registers: `RDSAR` (low `0xe4` / high `0xe8`) and `TNPDS` (low `0x20` /
+  high `0x24`) were written **Low-then-High**; r8169 writes the **High dword before the Low** as a documented
+  erratum ordering (some 8168 variants only latch the base when the low dword lands with the high already in
+  place). NET-4q reverses both to **High-before-Low**.
+
+  **The fix (primary, do-it-right).** (a) Program `RDSAR`/`TNPDS` as full 64-bit hi/lo pairs, **High first**;
+  (b) **remove the PCIDAC writes** (NET-4n/4n2) entirely — the rings-up readback keeps `PCIDAC` only as a
+  witness, **expected clear**; (c) **remove the NET-4p inbound-iATU alias** (`program_inbound_alias`,
+  `arm_dma_aliases`/`arm_one_alias`, and the driver's `atu_base`/`ident_*`/`mem_*` fields). The NIC then
+  emits `0x2683cb000` in a DAC TLP natively; the **NET-4h region-0 identity** `[0x8000_0000, 0x2_8000_0000)`
+  already covers the high buffer PAs (~9.6 GiB), so the payload lands identity-translated — no alias, no
+  arena, no PCIDAC. `[net4m]`/RINGDUMP and the readback witnesses are retained.
+
+  **Expected boot-21 (metal-owed):** at ring bring-up, `>>> REG WRITE (M2): RDSAR[0xe4] = 0x2683ca000 (RX
+  ring …; hi-before-lo)` + `TNPDS[0x20] = 0x… (…; hi-before-lo)`; the RINGDUMP RX descriptor `addr=0x2683cb…
+  [MATCH]` (full 64-bit); `rings up: … CPlusCmd 0x2021 PCIDAC=0 (expected clear; 64-bit DMA rides the
+  descriptor addr)`; **no** `0x200` IOB `FillWrite` RAS; `[net4m]` **all nonzero** (the ACK lands in the
+  natively-reached high buffer); and the DHCP **lease** (`NET: DHCP lease …` / `[dhcp]`).
+
+  **Fallback (only if a provably-correct full-64 descriptor STILL yields zero on metal).** That would be the
+  first real evidence the specific NIC/RC integration cannot emit >4 GiB TLPs. Only then, re-arm the inbound
+  alias per the facts: write **`UPPER_BASE` + `UPPER_TARGET`**, keep `base ≡ target (mod 64 KiB)`, use a free
+  inbound index, set `CTRL2 = ENABLE` and **read it back**. Do not lead with it — the alias is the wrong
+  layer if the primary works.
+
+  QEMU cannot exercise the tegra path; the gates prove non-regression only (default `check` + `UNAOS_NET4=1
+  UNAOS_TEGRA=1` `check`, default `test-arm`, and the `UNAOS_GICV3=1 UNAOS_WITNESS=1 UNAOS_VNET=1 test-arm`
+  seam regression — vnet lease + the NET-4j reproducer stay PASS).
+
+- **NET-4r — boot-24 fires NET-4q's fallback: native-64 falsified on silicon; re-arm the alias CORRECTLY.**
+  Boot-24 ran NET-4q for real. RINGDUMP proved the descriptors carry the **full** 64-bit buffer addresses
+  (`addr=0x2683cb… [MATCH]`, high dword `0x2` present, EOR + hi-before-lo ring bases in) — and the result was
+  **still no lease** (5000 ms, 83M polls) + the return of the `0x200` sink RAS (IOB `IERR=CBB Interface
+  Error ADDR=0x8000000000000200` + ACI `FillWrite Error ADDR=0x…200`). A **provably-correct** full-64
+  descriptor yielding the sink is the first real evidence this **RTL8168/Tegra-RC integration cannot
+  emit/carry a >4 GiB TLP**: the payload truncates to `addr[31:0]` on the wire, landing below the
+  `0x8000_0000` DRAM/identity base → the fabric sink. This is exactly the falsification clause NET-4q named.
+
+  **The fix (the sanctioned fallback, done to the letter of `L4T-FACTS-NET.md` §A0-A5).** Keep NET-4q's
+  full-64 descriptor + ring path **unchanged** (correct per the reference driver; the delivery vehicle if the
+  NIC ever emits full-64 natively — that TLP hits the NET-4h identity region). Re-arm the DWC **inbound-iATU
+  ALIAS** as the delivery mechanism, correctly this time:
+  1. **Free index, witnessed.** `enumerate_inbound_windows` reads each inbound region's `CTRL2` enable bit
+     (unroll blocks at `atu_base + (index<<9)|BIT8`, §A5) and logs the enabled-index mask; index 0 = the
+     NET-4h identity, aliases take clear indices — no index collision (NET-4p's "TX region shadowed").
+  2. **Full readback + refuse-to-proceed.** `program_inbound_alias` writes `LOWER/UPPER_BASE` ← truncated
+     32-bit bus base, `LIMIT` ← 64 KiB-rounded end, `LOWER/UPPER_TARGET` ← the real high PA, then **reads
+     every register back** and REFUSES (fails the whole bring-up closed) on any mismatch — the `UPPER_TARGET`
+     `0x2` dword **boot-20 lost** is the whole point.
+  3. **Congruence.** `alias_base = target & 0xFFFF_FFFF` ⇒ `alias_base ≡ target (mod 64 KiB)` by
+     construction; `alloc_rx`/`alloc_tx` are nudged to **64 KiB alignment** so both are 64 KiB-aligned
+     outright and the controller's 64 KiB granularity (§A2) rounds nothing (§A3). Congruence is witnessed.
+  4. **`CTRL2 = ENABLE` only** (no increase-region-size — the match window is sub-4 GiB, §A0/§A2), with the
+     `ENABLE` bit **polled** on readback (§A5 the driver loops on it).
+  5. **Both ring AND buffer blocks covered.** `arm_dma_aliases` aliases the RX ring, RX buffers, TX ring, and
+     TX buffers (boot-24 could not prove the ring rides un-truncated on this silicon; a genuinely-full-64 ring
+     TLP simply hits the identity region and the truncation-keyed alias never matches — harmless). Collision
+     checks (4 GiB-crossing, PCIe MEM/BAR overlap, alias-vs-alias) fail closed. New verbosity is knob-gated
+     under `UNAOS_NET4`.
+
+  **Expected boot-25 (metal-owed):** `[net4r] inbound iATU enumeration: enabled-index mask = 0x0001` (only
+  the identity region 0); per alias `[net4r] … congruence: alias 0x683c… = target 0x2683c… (mod 64KiB) OK`;
+  `[net4r] alias region N (…) readback: BASE=0x683c… LIMIT=0x683c… TARGET=0x2683c… UPPER_TARGET=0x00000002
+  CTRL2=0x80000000 enabled=1` for every armed region (all MATCH); `[net4r] N inbound alias region(s) armed +
+  readback-proven; RX/TX ring AND buffer blocks all covered`; then **no** `0x200` IOB/ACI RAS; `[net4m]` all
+  nonzero; and the DHCP **lease**. A readback MISMATCH (`!! [net4r] … READBACK MISMATCH …`) refuses the
+  bring-up cleanly instead of DMAing into a sink — the honest negative.
+
+  QEMU cannot exercise the tegra path; the gates prove non-regression only (default `check` + `UNAOS_TEGRA=1
+  UNAOS_NET4=1 UNAOS_VUGRAS=1` `check`, default `test-arm` MISSION SUCCESS, and `UNAOS_GICV3=1
+  UNAOS_WITNESS=1 UNAOS_VNET=1 test-arm` — vnet lease + the NET-4j reproducer stay PASS).
+
+- **NET-4s — index 2 does not exist: probe the true window count, consolidate to ONE covering region.**
+  Boot-25 ran NET-4r's one-alias-per-block plan for real. `alias region 1 (rx-ring) readback: BASE=0x683d0000
+  … UPPER_TARGET=0x00000002 CTRL2=0x80000000 enabled=1 (after 0 polls)` — **index 1 armed and
+  readback-PROVED on silicon**. Then `alias region 2 (rx-buffers) readback: BASE=0 … enabled=0 (after 1000
+  polls)` → MISMATCH → the NET-4r readback ritual correctly **fail-closed** the bring-up (no DHCP attempted,
+  the honest negative doing its job). Verdict: the **Tegra234 DWC RC implements FEWER inbound windows than the
+  8 unroll CSR blocks a CTRL2-read enumeration sees** — likely just 2 (index 0 = the NET-4h identity, index 1
+  = ours). NET-4p's "TX region shadowed" is thereby explained: those higher indices never existed. Demanding
+  one index **per** block (four aliases) could never succeed on this silicon.
+
+  **The fix** keeps NET-4r's full readback ritual + fail-closed **unchanged** and:
+  1. **Discovered window count, not assumed.** `probe_inbound_windows` replaces the CTRL2-read enumeration
+     with a **writability probe** (`L4T-FACTS-NET.md` §A5 / the `dw_pcie_iatu_detect` idiom): for each index,
+     write a probe value (`0x1111_0000` — low-16 = 0, since `LOWER_TARGET[15:0]` is hardwired 0, §A2) to
+     `LOWER_TARGET`, read it back, and **restore** the original; an unimplemented window does not retain the
+     write. Windows are contiguous from 0, so the first non-sticking write bounds `num_ib_windows`. The live
+     ENABLED index 0 (the identity, in use) is counted present without a destructive write. The count and the
+     enabled-index mask are witnessed (`[net4s] inbound iATU probe: N implemented window(s) …`).
+  2. **One covering region, not four.** `arm_dma_aliases` consolidates every block that needs aliasing (RX
+     ring, RX buffers, TX ring, TX buffers — all high-heap, all carrying the same high dword `0x2` in the
+     boot-25 `0x2683c…-0x2683f…` neighborhood) into a **single** DWC inbound region at the proven-armable
+     index 1. Offset-preservation (§A1: `translated = target + (incoming − base)`) makes one 64 KiB-aligned
+     window whose fixed up-translate offset is `high_dword << 32` offset-EXACT for every block: covering base
+     = min truncated-low-32 floored to 64 KiB, limit = max block-end rounded up, `target = (high << 32) |
+     base`. The blocks all sharing one high dword is **required** (a single region applies one offset) and
+     enforced fail-closed; the congruence, 4 GiB-crossing, and PCIe MEM/BAR-overlap guards remain. If the heap
+     ever scatters the blocks across a 4 GiB boundary, the covering region refuses rather than mistranslate —
+     the remedy is a re-seated arena, not more regions.
+  3. **NET-4r's `program_inbound_alias` readback ritual + fail-closed are untouched** — it just runs once, for
+     the covering region.
+
+  **Expected boot-26 (metal-owed):** `[net4s] inbound iATU probe: 2 implemented window(s) … enabled-index
+  mask = 0x0001`; per-block `[net4s] rx-buffers [0x2683d…] needs alias: truncated bus [0x683d…], high dword
+  0x2`; `[net4s] covering window: base 0x683c… limit 0x683f… target 0x2683c… (up-translate +0x200000000) …
+  congruent(mod 64KiB)=1 64KiB-aligned=1`; `[net4s] consolidating all N aliased block(s) into ONE covering
+  region at inbound index 1 (of 2 implemented)`; the single `program_inbound_alias` readback all-MATCH
+  (`UPPER_TARGET=0x00000002 CTRL2=0x80000000 enabled=1`); `[net4s] 1 covering inbound alias region armed +
+  readback-proven at index 1; all N DMA block(s) … covered by one window`; then **no** `0x200` IOB/ACI RAS;
+  `[net4m]` all nonzero; and the DHCP **lease**. QEMU cannot exercise the tegra path; the gates prove
+  non-regression only (default `check` + `UNAOS_TEGRA=1 UNAOS_NET4=1 UNAOS_VUGRAS=1` `check`, default
+  `test-arm` MISSION SUCCESS, and `UNAOS_GICV3=1 UNAOS_WITNESS=1 UNAOS_VNET=1 test-arm` — vnet lease + the
+  NET-4j reproducer stay PASS).
+
+- **NET-4v→4A — the RX payload sinks to a STUCK buffer; mechanism localized below the driver lane.**
+  With the inbound alias armed and readback-proven (net4v `covers=ALL`), both SMMU instances globally
+  bypassed (net4x), and the descriptor rings clean-published to the PoC (net4x), the residual RX defect
+  was scaled and localized: only slot-0 recycles ever carried payload while later slots read DRAM-zero at
+  real writeback lengths. NET-4y disabled early-RX (RX_EARLY_OFF) and wrote CPlusCmd masked per r8169;
+  NET-4z's scan-all destination witness then produced the decisive fact (boot-36-retry): **rx[0]→buffer 0,
+  rx[1]→buffer 1, rx[2..7]→buffer 1 STUCK** (the LAST descriptor of a 2-deep prefetch burst), with
+  per-slot OWN/len writebacks correct throughout and ring DRAM carrying the correct distinct addresses
+  (net4x [MATCH]). **NET-4A verdict (code analysis):** mechanism (a) — **NIC-internal descriptor-address
+  REUSE** — survives; the NIC latches the last-fetched descriptor's buffer address and does not re-fetch,
+  while its OWN/len writeback rides the correctly-advancing internal ring index. Mechanism (b) —
+  per-pop cache-line interplay on the 16 B-strided ring — is **refuted**: (1) no clean/invalidate on the
+  ring can substitute one descriptor's `addr` into another slot (every maintenance point re-derives the
+  correct addr; a stale whole-line clean at worst resurrects a same-line neighbor's OWN with its OWN
+  correct addr); (2) the (b) partially-stale sub-case predicts a zero-addr → bus-0 `0x200` sink, but the
+  landing is a VALID buffer with no RAS. The sanctioned (b) fixes don't apply: 64 B descriptor padding is
+  illegal (fixed 16 B C+ stride, no programmable descriptor-size register), and a non-cacheable ring is an
+  mmu_tegra arc — `map_mmio_window` is 1-GiB-block granular and would turn the heap's RAM GiB into Device
+  memory (breaking `ldxr/stxr`). So there is **no in-file functional fix**; the reuse is a NIC/RC
+  descriptor-fetch (or inbound descriptor-READ coherency) behavior below the driver's programming lane.
+  NET-4A lands the honest refutation (NET-4v precedent) plus a cross-pop `[net4A]` witness: it correlates
+  net4z's per-pop landing indices and emits ONE verdict line when ≥4 consecutive pops land in the same
+  buffer while the completed slot advances 1:1 — machine-checkable proof of the reuse on the next boot,
+  and its refutation if a future change makes landing-index == completed-slot.
+
+### XCARVE-4 — the endgame (2026-07-20, boots 21/22)
+The XCARVE writer is named and fixed. XCARVE-3's unmap converted the SNOC RAS into a precise
+synchronous WRITE fault (boot-22: ESR=0x96000146, FAR=0x26b800000 = align_up(heap_hi, 8 MiB),
+ELR → xusb_tegra::jb2b_attach+0xfd0 = the INLINED shared `xhci::init_pointers` scratchpad
+block). Root cause: scratchpad `page_bytes` was derived from the raw PAGESIZE lowest-set-bit;
+under the Tegra234 no-HCRST inherited-controller takeover PAGESIZE reads back with the
+mandatory 4 KiB bit clear and garbage high bits → 8 MiB size/alignment → the allocation's
+placement overshot the heap into the firewalled carveout. Fix (shared xhci/mod.rs,
+platform-neutral, Peter-authorized class): clamp PAGESIZE to the spec-sane 4–32 KiB bits with
+the spec-mandatory 4 KiB fallback, null/heap-bounds-guard the array, witness the heap PA.
+Healthy controllers (bit 0 set) are byte-identical in behavior. Boots 13–22's RAS family =
+this one store's cache line (plus diagnostics touching the same window); 425090fd fixed the
+sibling instance (event ring/ERST). XCARVE-3's hole + witnesses stay armed as the standing trap.
+
+### XCARVE-5 — the boot-23 correction (2026-07-20): the hole was silently dropped from the set
+Boot-23 (XCARVE-4 aboard) faulted at the SAME FAR 0x26b800000 — symbolized to
+`vugras::bisect+0x104`, ESR ISS CM=1 (a DC CIVAC). Root cause: the UEFI+FDT carveout set
+alone fills MAX_CARVE=96, so the XCARVE-3 hole append at the tail was SILENTLY DROPPED;
+`VUGRAS_ABOVE_HEAP_TOP` published without the hole and span B swept the unmapped window.
+Fix: hole seeded at slot 0 (can never drop), MAX_CARVE 96→192, dropped-carveout overflow
+witnessed loudly. RECORD CORRECTION: boot-22's ELR was mis-symbolized to jb2b_attach
+(inlining-shifted nearest-symbol); its fault fired immediately after the post-heap-init
+tripwire — before any XUSB attach runs — so boot-22's faulter was ALSO this sweep. The
+XCARVE-4 scratchpad PAGESIZE clamp remains as hardening (real garbage-readback hazard) but
+is no longer claimed as "the writer." With the hole enforced, the no-software-writer verdict
+(boot-21) stands: FillWrite/fault activity at this window is any cache traffic into
+firewalled DRAM our map must simply never cover.
 ### XCARVE-4 (shared xhci, landed via hw-jetson f81124c3) — scratchpad PAGESIZE clamp
 The shared `xhci::init_pointers` scratchpad block derived `page_bytes` from the raw PAGESIZE
 lowest-set-bit; a garbage readback (Tegra234 no-HCRST takeover) demanded an 8 MiB-aligned
@@ -7678,3 +8685,497 @@ compile a scheduler into a configuration that has no boot path to run it, tradin
 compile error for a silently-buildable artifact nobody flashes. `pi` without `baremetal` is an
 **unsupported combination**; the honest compile failure is the intended behaviour. Treat
 `./arroyo kernel8` / `kernel8-test` as the only supported carriers of `UNAOS_PI=1`.
+
+## JETSON-EL0 — the EL0/userspace chain on the Jetson Orin Nano (Arc M1b, `UNAOS_TEGRA_EL0`)
+
+### Where M1a left the tegra path
+
+Through M1a the Orin reached EL1 and the scheduler: `mmu_tegra::init` installs the kernel's own
+translation regime, `boot_tegra::drop_to_el1` drops EL2 → EL1 onto the EL1-precise table `L1_EL1`, and
+`tegra_early_stop` ends in `sched::run_capstone_boot_core`. It never reached EL0. The reason was not a
+missing feature flag but a missing half of the machinery: every EL0 consumer —
+`arch::aarch64::syscall`, `arch::aarch64::bus`, and `sched`'s `spawn_user*` / `user_task_trampoline` /
+slot-teardown arms — was gated `#[cfg(feature = "baremetal")]`, because the per-task address-space
+slots they consume live in `arch/aarch64/boot.rs`, which is BCM2711 MMU code end to end (it owns the
+Pi's `L1`, builds the whole identity map, performs its own EL2 → EL1 drop and turns the MMU on).
+
+`tegra_el0` supplies the missing half and widens exactly those gates. It implies `tegra`. Default OFF:
+every widened gate reads `baremetal` again, the new module is not compiled, the spawn block vanishes,
+and the jetson media is byte-identical to baseline.
+
+### The port: `arch/aarch64/mmu_tegra_el0.rs`
+
+The M6d slot system re-implemented against the tegra EL1 regime, exposing the same public shape
+`boot.rs` exposes. Per-slot private L1/L2/L3 branches, ASIDs 1..=8, all user leaves `nG`, and the same
+W^X leaf recipe (code = read-only at both ELs + EL0-executable + PXN; data = EL0/EL1-RW + UXN|PXN).
+`SCTLR_EL1.WXN` is left exactly as `boot_tegra` set it — the recipe is WXN-compatible by construction,
+since no leaf is ever both writable and executable.
+
+It diverges from `boot.rs` in three places, each forced by the platform:
+
+1. **The user window cannot live in GiB 0.** The Pi demotes `L1[0]` to a table and identity-maps a BSS
+   `USER_REGION` inside it. On Tegra234 the low 1 GiB is the **Device** window — UARTC, the GIC-600 and
+   the rest of the peripheral MMIO. Since `build_slot` copies the root table per slot and patches the
+   user entry, patching `L1[0]` would swap the kernel's own UART out from under it the moment a slot
+   root went live in `TTBR0_EL1`. The window therefore occupies an otherwise-unused 1 GiB entry —
+   `USER_GIB = 480`, VA `0x78_0000_0000` — chosen to sit above every address the kernel can map
+   (`map_mmio_window`/`map_fb_region` map identity under a 64 GiB output ceiling, or ~200 GiB of PCIe
+   ECAM with `pcie3`) and below the 512 GiB / 39-bit VA ceiling `TCR_EL1.T0SZ = 25` gives. `install`
+   **verifies** the entry is invalid before claiming it rather than asserting it in a comment.
+   Consequence: user VA ≠ backing PA, so every kernel-side write goes through `slot_backing_ptr` (the
+   identity-mapped PA), never the user VA.
+
+   The root table is obtained by reading the **live `TTBR0_EL1`** (ASID field stripped) and latching it
+   in `BOOT_ROOT`, not by exporting `mmu_tegra`'s private `L1_EL1`. That is better on the merits — it is
+   the root the hardware is actually walking, so it cannot drift from what `boot_tegra` installed — and
+   it means **`mmu_tegra.rs` is not modified by this arc at all**. It is latched once rather than re-read
+   on demand because `boot_ttbr0()` is called from `teardown_user_slot`, where the calling core's live
+   `TTBR0_EL1` may be a *slot* root; a fresh read there would hand teardown the very address space it is
+   trying to leave.
+
+2. **The backing comes off the heap, not BSS.** Putting it in BSS would be a live bug: `mmu_tegra`
+   **unmaps** the SNOC-firewalled carveout windows (the XCARVE-3/6/8/9 set), and BSS is placed wherever
+   the linker put the image with nothing keeping it clear of them — a backing frame inside a hole has
+   no translation, so the first EL0 touch would fault. The heap is already vetted (`select_heap_region`
+   seats it clear of every hole), so backings are `alloc_zeroed`ed from it, as the xHCI structures are.
+   `carveout_overlaps` re-checks each backing against the live hole set anyway and refuses the
+   allocation on a hit, so the dependency on another module's invariant is checked rather than assumed.
+
+3. **The ASID grant issues a conservative TLBI.** `boot.rs` argues no TLBI is needed on a fresh ASID.
+   That argument is sound on the A72 and probably sound on the A78AE — but "probably" is doing real
+   work in it, the Orin has its own errata surface (`mmu_tegra::a78ae_errata_probe`), and this chain is
+   metal-owed and un-QEMU-able, so a latent stale-TLB bug would surface as an unreproducible bench
+   fault. One broadcast `tlbi aside1is` per slot grant costs nothing on a per-launch path and makes the
+   grant's correctness independent of the teardown argument. Deliberate; do not remove without metal
+   evidence.
+
+One hazard is **sharper** here than on the Pi. Per-slot roots freeze the kernel map at copy time, and
+`mmu_tegra` has three routines that edit `L1_EL1` after boot — `map_mmio_window`, `map_fb_region`,
+`install_net4b_nc`. Today the EL0 chain comes up at the very end of `tegra_early_stop`, after all three
+have run, so no live slot can miss a window; **a future arc that maps an MMIO window later than the
+first slot build must mirror it into every live slot L1.** (The carveout L2 splits are safe by
+construction — those L1 entries are copied as pointers into `L2_POOL_EL1`, so slots share the tables
+rather than snapshotting them.)
+
+### PAN — a load-bearing precondition that holds by configuration, not by absence
+
+`syscall::setup()` copies `USER_BLOB` in through the shared window's user VA, `sys_write` **reads** the
+caller's message buffer, and `probe_slot_isolation` does real EL1 loads of a user VA. All three need
+EL1 to be able to touch EL0-accessible pages. `boot.rs` justifies that with "the PAN-less A72" —
+literally true there, since Armv8.0 has no PAN.
+
+**That justification does not transfer.** The Orin's Cortex-A78AE is Armv8.2 and has PAN. The accesses
+are still legal, but for a more fragile reason: two configuration facts currently set in `boot_tegra`.
+
+* `SPSR_EL2 = 0x3c5` at the EL2 → EL1 `eret`. Bit 22 (PAN) is clear, so the kernel lands at EL1 with
+  `PSTATE.PAN == 0`.
+* `SCTLR_EL1.SPAN` (bit 23) is set in `SCTLR_EL1_VAL`, meaning `PSTATE.PAN` is left **unchanged** on
+  exception entry to EL1 — so the `SVC` from an EL0 task arrives with PAN still 0.
+
+**STOP tripwire.** Clearing SPAN, or setting SPSR_EL2 bit 22, turns every one of those accesses into a
+permission fault — presenting as an EL0 program that "mysteriously" faults inside the kernel, with
+nothing in the symptom pointing at PAN. If a future arc wants PAN enforcement (a genuine hardening
+win), the right move is to gate those specific accesses behind `AT S1E1RP`-style checks or explicit
+`msr PAN, #0` windows, not to leave the dependency implicit. Recorded because it was previously written
+down nowhere.
+
+### The facade: `arch::aarch64::uslots`
+
+Two modules implement one user-address-space API: `boot.rs` for the Pi, `mmu_tegra_el0.rs` for the
+Orin. `mod.rs` re-exports whichever the active feature selects. This is what let the EL0 chain reach
+the Orin without editing a line of logic in either consumer — `syscall.rs`'s 308 call sites and
+`sched.rs`'s 5 changed **module path only** (`super::boot::` → `super::uslots::`).
+
+### Call-site placement, and why it is not where the arc brief put it
+
+The brief specified the spawn before `timer::set_not_live()`. It cannot go there. The user window hangs
+off `L1_EL1`, which is not the live root until `boot_tegra::drop_to_el1` installs it; a pre-drop
+`syscall::setup()` would copy `USER_BLOB` through a user VA that translates to nothing under the EL2
+`L1` and fault into the Part-C vector. `set_not_live()` is on the very next line after that drop, so
+"after the drop" is necessarily "after the disarm". Nothing is lost: the disarm retires the timer
+**interrupt** (CNTP_CTL=0 at the drop), while the verdict's bound is CNTPCT, which free-runs. The block
+sits after `exceptions::install()` — that is what puts the real `VBAR_EL1` in place for the `SVC` the
+EL0 task takes; `mmu_tegra::arm_el1_fault_vector()` is a syndrome-printing landing vector, not a
+syscall handler.
+
+### What this arc claims, and what it does not
+
+The **first rung only**: one EL0 task (`el0-hello`, the `USER_BLOB` payload), one `SYS_WRITE`, exit 0.
+`syscall::tegra_el0_verdict` asserts `exited_ok == 1` with `exited_err`, `killed_expected` and
+`killed_unexpected` all zero — the three zero terms are load-bearing, so a hello that faulted and was
+killed reads FAIL rather than passing on "something terminated". The Pi's `verdict` is deliberately not
+reused: it demands the full M6b split (`exited=1 killed=3`), and this boot spawns no fault fixtures, so
+it would report FAIL on a correct machine. EL0 **fault isolation** on the Orin is a later rung.
+
+Witness lines:
+
+```
+:: TEGRA-EL0: user window installed — VA 0x7800000000 (L1_EL1[480]), backing PA <pa>, 8 slots ::
+:: TEGRA-EL0: el0-hello spawned at EL0 (boot core), verdict armed — entry <va> sp <va> ::
+:: TEGRA-EL0: el0-hello round-trip -> PASS ::
+```
+
+### Verification status
+
+`./arroyo check` is green for both arches knob-off (`UNAOS_TEGRA=1`) and knob-on (`UNAOS_TEGRA_EL0=1`).
+
+**Byte-identity: the substantive property holds; the literal sha256 test does not.** Measured against a
+from-scratch `UNAOS_TEGRA=1 ./arroyo esp-jetson` build of the pre-arc tree (baseline `9616bc7f…`,
+reproduced twice — once fresh, once by reverting a dirtied tree back to HEAD, so the harness itself is
+known-good):
+
+| segment | contents | result |
+|---|---|---|
+| `R-X` | **all executable code** | **bit-identical** |
+| `RW-` (both) | initialised data + BSS image | **bit-identical** |
+| `R--` | ELF headers, `.dynsym`/`.dynstr`/`.symtab`/`.strtab` | differs |
+| whole file | `sha256(kernel.elf)` | `2f6985a6…` ≠ baseline |
+
+The differing segment carries no code. The symbol **name sets are identical** in both `.dynsym` and
+`.symtab` (a set-diff of both tables returns zero differences); what changed is the linker's
+string-table *packing* — `.strtab` came out 44 bytes shorter, i.e. LLD tail-merged the same strings
+differently. So the shipped instructions and data are provably unchanged, and only link metadata moved.
+
+Two things fell out of chasing this that are worth keeping:
+
+* **A 35-line inline block in `main.rs` really did move the media hash**, exactly as the RAST-TEGRA
+  comment warns, by shifting `panic::Location` line numbers into rodata. The fix is the established
+  convention — tail-defined helper, same-line call, zero added lines before any Location — and with it
+  `main.rs` alone rebuilds to the baseline hash *exactly*. That part of the byte-identity law is real
+  and was verified, not assumed.
+* **A pure append to `mmu_tegra.rs` of 30 fully `#[cfg(feature = "tegra_el0")]`-gated lines also moved
+  the whole-file hash** (reproduced twice), with `.text` bit-identical — the same metadata-only effect.
+  That edit has since been removed entirely (see the `BOOT_ROOT` note above), so it is moot for this
+  arc, but it is recorded because it means **`sha256(kernel.elf)` is a stricter test than "the shipped
+  code is unchanged"**, and a future arc that trips it should compare PT_LOAD segments before
+  concluding it has a real regression.
+
+**QEMU cannot exercise any of this**: the `tegra` feature has no QEMU model (the virt gate is a
+different machine with a different MMU regime and no Tegra234 carveouts), so the round-trip witness is
+**metal-owed on an attended bench**. Note also that the `nG` isolation probe (`probe_slot_isolation`) is
+structurally meaningless under emulation — QEMU models no TLB and re-walks every access, so it always
+returns `true`; its verdict counts only on silicon.
+
+### Build dependency: `target/user_blob.bin`
+
+An armed jetson image compiles `syscall.rs`, which `include_bytes!`es `target/user_blob.bin` (the
+el0-hello payload). That artifact is produced by `build_user_blob`, which before this arc ran **only**
+from the Pi `kernel8` path — so the first `UNAOS_TEGRA_EL0=1 ./arroyo esp-jetson` in a tree that had
+never built a Pi image failed outright with `couldn't read .../target/user_blob.bin`. An in-tree build
+with a stale blob left over from an earlier Pi build masks this, which is exactly why it needed wiring
+rather than luck. The block was lifted verbatim out of `kernel8()` into `build_user_blob()` (both now
+call it) and `esp_jetson` invokes it **only when `tegra_el0` is armed** — the disarmed path does not
+compile `syscall.rs`, so an unconditional blob build would slow every ordinary jetson build and churn
+the kernel's rebuild via the blob's refreshed mtime for nothing.
+
+#### `./arroyo check` supplies it too — `ensure_user_blob` (2026-08-19)
+
+`check` calls neither `kernel8` nor `esp-jetson`, and **two** `KERNEL_CFG_MATRIX` legs compile
+`syscall.rs`: `arm-pi` (via `baremetal`) and the `arm-tegra-el0` leg below (via `tegra_el0`). So
+`./arroyo check` in a `git worktree add`ed tree that had never built anything was already **RED on
+`arm-pi`** with the same `couldn't read .../target/user_blob.bin`, independently of this arc —
+measured at `f4454eff`: EXIT 1 after 4 m 27 s. An established tree hides it behind a blob left over
+from some earlier `kernel8`, which is why it read as a recurring fresh-worktree papercut rather than a
+standing bug.
+
+`check_both` now calls `ensure_user_blob` before its first cargo invocation: present and non-empty ⇒
+no-op, absent ⇒ one `build_user_blob` (measured 10.3 s cold, once per tree — 51-byte blob).
+With the block in place the same fresh worktree runs **EXIT 0 in 4 m 28.9 s**: the whole gate got
+*more* legs and stayed inside a second of the red baseline, because the old `arm-pi` failure aborted
+that leg before it compiled anything. **Only-when-missing is
+load-bearing**: `build_user_blob` re-objcopies the file on every run and `include_bytes!` registers it
+as a rebuild dependency, so an unconditional call would recompile both aarch64 EL0 legs from scratch on
+every `check`, for a file whose *contents* `check` never reads — `cargo check` neither links it nor
+runs it. **A stub was rejected**: `UNAOS_TEGRA_EL0=1 ./arroyo esp-arm` (likewise `arm` / `test-arm`)
+compiles `syscall.rs` and calls `build_user_blob` nowhere, so a fake blob left on disk would convert
+today's loud build failure into a kernel whose EL0 payload is not a program — moving the failure from
+the build to the bench.
+
+### `arm-tegra-el0` — the leg that type-checks the armed Orin (2026-08-19)
+
+Until this leg, **`tegra_el0` appeared in no `KERNEL_CFG_MATRIX` leg at all**, so the configuration
+`UNAOS_TEGRA_EL0=1 ./arroyo esp-jetson` ships was type-checked nowhere; `UNAOS_TEGRA_EL0=1 ./arroyo
+check` did not change that either, because the matrix legs deliberately ignore `$KERNEL_FEATURES`.
+EXECGATE (`89967799`, reverted as `f4454eff`) is the proof: it widened three `#[cfg]`s in `shell.rs` to
+`tegra_el0`, passed all 12 legs on both arches plus the pi/x86 byte-identity comparisons, and could not
+compile the armed build. Re-applied against the new leg in a throwaway worktree, it reds it — and only
+it — with the three errors nothing else sees:
+
+```
+error[E0433]: cannot find `boot` in `aarch64`        --> crates/kernel/src/shell.rs:4363:44
+error[E0425]: cannot find function `run_program` ... --> crates/kernel/src/shell.rs:3459:32
+error[E0425]: cannot find function `bg_program` ...  --> crates/kernel/src/shell.rs:4022:21
+```
+
+The widened `read_el0_image` still reads `arch::aarch64::boot::USER_REGION_SIZE` — `boot` is the Pi
+slot module; the Orin's port is `mmu_tegra_el0` behind the `uslots` facade — and `run_program` /
+`bg_program` are themselves still `any(all(baremetal, aarch64), x86_64)`, so the widened `run` and `bg`
+arms went live in a build where their callees do not exist.
+
+The leg is `arm-tegra`'s feature list verbatim **+ `tegra_el0`** — what the armed media build carries.
+It is a **second** leg rather than `tegra_el0` appended to `arm-tegra` because `arm-tegra` is the only
+leg anywhere that compiles the *shipped default* jetson image (`tegra` ON, `tegra_el0` OFF), a polarity
+with real code behind it (`main.rs`'s `tegra_el0_start_maybe` stub under
+`#[cfg(all(feature = "tegra", not(feature = "tegra_el0"), target_arch = "aarch64"))]`, the
+`not(any(baremetal, tegra_el0))` arms in `sched.rs`/`exceptions.rs`); the all-off default leg does not
+cover it, since all-off is `tegra` OFF too. Arming the one tegra leg would have traded the new hole for
+that one. Side effect, deliberate: naming `tegra_el0` on an `arm-*` leg also removes it from the x86
+mix universe (60 → 59 features, still 8 derived legs, pairwise coverage unaffected), where it had been
+riding as an unclaimed "assume x86" knob and compiling nothing.
+
+Cost: **8.3 s** the first time a tree compiles that feature set, **0.06 s** (cargo cache hit) every run
+after — a fully warm `./arroyo check` with all 13 legs is 2.2 s end to end. Leg count 12 → 13;
+`UNAOS_TEGRA=1 ./arroyo check` is green in 16.2 s.
+
+## DARKWIN-GUARD — the 2026-08-18 trunk-merge boot hang, and the dark-window serial latch
+
+### The failure
+
+The first hw-jetson base carrying the month of trunk desktop/userspace work (merge `ceaa32b8`,
+tip `b86f6c33`) never booted the Orin: ~10 attended boots, none past the NVIDIA logo, while the
+pre-merge base `92997297` booted the same board completely minutes apart. A pre-EBS banner build
+proved the loader reached `ExitBootServices`; the kernel's first serial line (`:: tegra: mmu live`,
+emitted by `tegra_early_stop` in `main.rs` immediately after `mmu_tegra::init` returns —
+`mmu_tegra::init` itself contains no print) never appeared. Peter confirmed the board never reset —
+a hang, not an exception→reset. hw-pi4 booted the identical trunk content on Pi silicon, so shared
+aarch64 code was exonerated wholesale.
+
+### The root cause (found by reading the window's own diff — zero boots)
+
+The merge added `kernel_main` step 0a2 — EDID-CARRY's `video::init_edid`, **unconditional on every
+arch and every build** — which emits its witness line via `serial_println!` *before* step 0b's
+`tegra_early_stop`. On tegra that write polls UARTC's LSR at `0x0C28_0014` while the kernel still
+runs under the UEFI-handoff translation tables, which map RAM but **not** the Tegra device window
+(JM2 R4: the kernel faulted on its first UARTC read — the fact that created `tegra_early_stop`'s
+"install the MMU FIRST — SILENT" ordering in the first place). Per the R4 record in `mmu_tegra.rs`,
+that fault lands in UEFI's still-resident ArmCpuDxe vectors — but after `ExitBootServices` their
+reporting path is gone, so the observed outcome on the box is a silent stop at the logo either way.
+`mmu_tegra.rs` itself was untouched by the merge — the kernel died *upstream* of it, on a new
+caller the merge placed in the dark window. The Pi is immune because its bare-metal path runs
+`mmu_init` before `kernel_main`; x86 is immune because its serial is ISA port I/O (`0x3F8`), which
+no translation table gates.
+
+### The fix: kill the class, not the caller (`ed8f810c`)
+
+A **dark-window latch** in `arch/aarch64/serial.rs`'s `cfg(tegra)` UART mod: every byte offered
+before `mark_mmio_ready()` is dropped and counted, never written. `tegra_early_stop` arms the latch
+on the line after `mmu_tegra::init` returns, then witnesses the count
+(`:: tegra: dark-window guard — N byte(s) dropped pre-map ::`) and re-emits the EDID witness the
+window ate, so the reading still reaches the wire. Nonzero N is a *reported* fact that some caller
+printed pre-map — the UARTC class can no longer hang the board, only announce itself. The witness
+is byte-granular by design: a future pre-map caller's *content* is still lost from the wire (the
+fbcon and selftest mirrors carry it), the count is what survives. Scope caveat: the latch guards
+UARTC only. `fbcon`'s framebuffer writes in the same window (step 0's `fill_screen`, and — post-
+guard — the mirrored text of any pre-map print) touch the GOP surface, which UEFI's own tables map;
+on the bench board the firmware hands over no linear framebuffer, so fbcon is inert there. Non-
+tegra builds are byte-identical: everything sits inside `cfg(feature = "tegra")` in tail-defined
+blocks with same-line calls, and `4f2f1229` proves it (bare `kernel8` at baseline vs the fixed
+tree: bit-identical, `cmp` clean — the first cut `ed8f810c` had broken this via panic-`Location`
+line shifts).
+
+The alternative — gating `init_edid`'s call site on `not(tegra)` — was rejected because it fixes
+one caller: any future unconditional early print (and the merge added its by design, for witness
+coverage on every arch) would re-introduce the identical silent hang. The latch converts the
+UARTC class from "undebuggable dark-window death" to "counted, witnessed, harmless".
+
+### Verification status
+
+Zero-boot: `UNAOS_TEGRA=1 ./arroyo check` green both arches (+12 cfg legs); `./arroyo test-arm`
+clean; media validated (`strings`: 130 `tegra:` lines, the guard's own witness string present —
+the validity rule's proof-the-instrument-exists check). Metal: **pending** — boot 2
+(`boot2-darkguard-ed8f810`, staged with boot 1's exact knob set so the guard is the only delta)
+owes the verdict: `dark-window guard — N` with N > 0, the re-emitted EDID line, then the full
+pre-merge JD/JB chain to the JD2 shell. If boot 2 still hangs, the conviction is incomplete and
+the standing fallback is the M1 stack-switch-at-entry instrument (rmbp 0's design, deliberately
+unbuilt so each boot carries one variable).
+
+### Metal verdict (boots 2–3, 2026-08-18/19) and the second bug: SVCVEC
+
+Boot 2 (`boot2-darkguard-ed8f810`) confirmed the conviction on silicon: the guard counted **55 and
+89 dropped pre-map bytes** across two power-cycles (`:: tegra: dark-window guard — N byte(s)
+dropped pre-map ::`), the EDID witness re-emitted (1920x1200), and the boot ran JB2b HID, 5/5
+secondaries via PSCI, and RAST at 30.3 fps — everything the pre-merge base could do and more.
+(A CAPSTONE 6/6 block in the recovered scrollback was initially misread as this boot's; it is
+QEMU/virt content from earlier in the shared capture — `workers on cores 2 + 3` is the `start_aps`
+signature, and the tegra terminus pins `CAP_CORES = [0, 0]`. See the CAPSTONE-unreachable note
+below.) It then froze on a second, unrelated merge-era defect: el0-hello's first `svc #0` landed
+in the halting fault logger (`ESR=0x56000000 EC=0x15 ELR=0x7800000014`), because JETSON-EL0 (M1b)
+had widened `syscall.rs`/`bus.rs` to `any(baremetal, tegra_el0)` but left the 0x400 vector's
+`svc_vec!`/`svc_stub!`/`aarch64_el0_fault_handler` gated on `baremetal` alone — a live EL0 spawn
+path with no syscall dispatch. **SVCVEC** (`33f94623`) widened the four cfg lines in place.
+
+Boot 3 (`boot3-svcvec-33f9462`) closed the arc: `:: SVC: EC=0x15 nr=1 — EL0->EL1 syscall path
+live ::`, `hello from EL0`, `:: TEGRA-EL0: el0-hello round-trip -> PASS ::` — the first EL0
+round-trip on Orin silicon — then the JD2 interactive shell (the arc gate), JD4 console-owns-panel,
+JD20 pointer, and a live interactive GUI session. Spec `jetson-sync1.spec` promoted the el0-hello
+line PENDING→REQUIRE (`1f0c3aff`). Still open: TEGRA-SD identify (honest stop at M2, `card
+detected / no identified card` — the block-publish witness stays PENDING) and `CAPSTONE COMPLETE`,
+a PENDING spec line whose analysis shows it is **structurally unreachable on the tegra path as coded** (not flaky, not
+starved): `run_capstone_boot_core`'s `priority_aging_witness` calls `run_until_empty`, whose
+drained-queue precondition is false on tegra — the JD2 console pump (infinite, cooperatively
+yielding, spawned pre-drop) and the el0 tasks are already staged, so the drain never returns and
+the `spawn("capstone", …)` after the witness block is never reached. Header-without-verdict in
+both boots' captures confirms it. Fix owed (skip drain-witnesses on a non-empty entry queue +
+hoist the capstone spawn — `sched.rs`, shared kernel-core, negotiation required); the spec line is
+demoted to PENDING until it lands. Lossy-TCU caveat, re-proven: boot 3's capture lost the guard and
+EDID head lines entirely — single-print witnesses need the boot-2 cross-capture evidence or 24–32×
+repetition.
+
+### SDID — the identify ladder gets evidence (boot-4 owed)
+
+Boot 3's `recon done at M2 (no identified card / honest stop)` was an evidence-free failure: every
+identify rung was `.ok()?`, so the ladder died silently somewhere past card-detect. SDID
+(`ecef8086`, hardened per delta review) makes failure impossible to hide: `send_command` returns
+the INTERRUPT register at the failing rung; `cmd_step` names every command and on failure prints
+INTERRUPT/PresentState/CONTROL0/1 then resets CMD/DAT so the controller is not left inhibited;
+SD-spec settle delays (power/clock/CMD0/ACMD41 rounds); the Tegra vendor block (tap/trim, comp pad,
+auto-cal config) is snapshotted before `SRST_ALL` and the firmware's own values restored after —
+per-register poison guard: a poisoned word is left at reset defaults, never authored; pre-reset
+Host Control 2 is printed with 1.8 V-signalling decoded (surfaced, not worked around); CMD8 timeout
+is treated as an SD v1.x card (ACMD41 drops HCS), not as fatal. Read-only scope, stated precisely:
+the recon path cannot reach a write; the file's write path (CMD24/25) is pre-existing
+ORIN-SDMMC-2/INSTALL-1 work, double-gated behind `sdmmc_arm`/`install_target`, absent from the
+recon build — the old "no write command exists in this file" header claim was stale and has been
+corrected in place. Boot 4 either publishes the block backend or names the dying rung.
+
+### Boots 4e/4f (2026-08-21) — SDID's answer arrives as an SError, and the first CAPSTONE on Orin
+
+**Boot 4e** (`cc82df76`, knobs TEGRA+TEGRA_EL0+RAST+SDMMC): the SDID ladder's first metal flight
+ended in `Unhandled Exception in EL3` — an SError (`esr_el3=0xbe000011`, EC=0x2f async external
+abort) taken from kernel EL2 code (`elr_el3=0x25b153548`, `spsr_el3` M[3:0]=EL2h). The last
+witness on the wire is `M2: pre-reset Host Control 2 = 0x3400`; the fault raised at the rung after
+it (the SRST/clock touch). SDID's named-rung design could not name it because the abort is
+asynchronous and trapped to EL3, above every witness. Boot 3's pre-SDID code never reached this
+rung (it stopped at `no identified card` before the reset). Everything before SDMMC was green
+(bootloader, MMU, XCARVE-6, panel LIVE, JB1/BPMP, HEAP-GUARD); nothing after it ran. The
+block-publish spec line stays PENDING; the next SDID step must make the reset-rung access safe
+(clock/power state proven before the touch) rather than better-witnessed. Full dump in
+`capture/line-acm0/raw.log` past byte 2274859.
+
+**Boot 4f** (same tip, SDMMC omitted — the isolation control): with the fatal rung compiled out,
+the boot ran end to end, convicting the SDMMC path (the reset rung after M2 is the leading suspect; the abort is asynchronous, so an earlier SDMMC access cannot be fully excluded). Verdicts, all content-anchored in
+this boot's window (`capture/orin2-boot4f.log`):
+
+- **`CAPSTONE COMPLETE` printed for the first time on the post-merge trunk scheduler** (pre-merge
+  kernels completed CAPSTONE on this board 2026-07-08 and 2026-07-18, same tegra signature; the
+  post-merge scheduler's pre-staged JD2 queue made the spawn unreachable until CAPSTONE-GATE) —
+  all 6 primitives PASS, tegra
+  signature confirmed (`workers on cores 0 + 0`, the `CAP_CORES=[0,0]` pin — not the virt
+  scrollback signature). The CAPSTONE-GATE witness fired exactly as designed:
+  `drain witnesses SKIPPED (queue not drained at entry — 3 task(s) pre-staged)`. Spec line
+  promoted PENDING → REQUIRE; replay vs this capture: **MBENCH PASS 11/11 REQUIRE, 0 FORBID**.
+- **RAST-MC on metal**: 5 secondary cores online and dispatching, pipeline width 5 (render cores
+  1–5, present on core 0), 1-core baseline 90 frames / 680 ms = 132.4 fps, 3000 KiB buffers off
+  the 48 MiB heap.
+- **el0-hello round-trip PASS** re-proven on this tip (SVC EC=0x15 nr=1 live).
+- **DARKWIN guard: 89 byte(s) dropped pre-map** — same magnitude as boot 2's second cycle.
+- **JB11 armed census** ran (BAR2 IOCTL_CFGTBL_READ path, no xHCI operational register written).
+  The suppressed control boot (`UNAOS_NOJB11=1` rebuild) is still owed for the XCARVE pair.
+- **IRQEL-RT EL1 live-arm: still unproven on metal.** The only `timer LIVE: IRQ delivery
+  confirmed` witness precedes the JM6 EL2→EL1 drop (capture lines 1013 vs 1437), so it is the EL2
+  arm again; no interrupt was taken at EL1 this boot. The EL1 half remains compile-proven only.
+
+---
+
+## ONECARD-PI — the Pi is a one-card OS (audit + the two changes it produced)
+
+Peter, 2026-08-13: *"x86 no longer needs the data card so Pi should not either. UnaOS should be
+loading like a normal OS on the one card with a unafs partition and everything."*
+
+The x86 side reached that state by flipping a default (`sdhcblk` on by default, 19a56662) and then
+teaching `program_source` to prefer the boot volume's serial over handle order (591bf6e6), because on
+that machine a USB stick inserted merely to CARRY files could claim the global slot and silently
+become the program source. This arc asked whether the Pi had the same disease. **It did not** — the
+Pi's structure already forbids it — so what this arc landed is one piece of evidence and one cost
+removal, not a port of the x86 fix.
+
+### The audit: where a USB volume could have crept into the Pi's load path, and why it does not
+
+| Path | What it binds | Can USB win? |
+|---|---|---|
+| `block::program_source()` | aarch64 takes the `not(all(x86_64, sdhcblk))` arm — a **one-rung** ladder, the global `BLOCK_DEVICE` | No. `BlockHandle::Usb` is not in the ladder on any arch (`fs/fat.rs` says so verbatim: "`program_source` never returns it") |
+| The global `BLOCK_DEVICE` itself | `register_sd` (from `emmc2::finish`) publishes the card and flips `BACKEND` to `BACKEND_SD`, synchronously on the BSP, long before xHCI enumerates | No. The aarch64 `publish_usb_geometry` claims the global **only while** `BACKEND != BACKEND_SD`; a stick stays reachable under `USB_BLOCK_DEVICE` and nowhere else (PI-FS-2) |
+| `run` / `bg` | `shell::vfs_path` → `vfs_mount_table()` → `MountTable::resolve`'s longest-prefix rule | No. `/fat` binds `BlockSource::Default` (the card); `/usb` is mounted **only if a stick is present**, and a `/usb/...` path with none present fails `-ENODEV` rather than falling through |
+| ELF1 / EXEC1 / K2 | `fs::fat::mount()` = `BlockSource::Default` | No |
+| K3 / K4 | `unafs::locate()` + `block::read_block` / `write_block`, with the sector COUNT taken from `emmc2::card_num_blocks()` rather than the global — deliberately, so a small USB reader cannot bound the span | No |
+| K2-ACL volume binding | `AtrBinding { BS_VolID, count_of_clusters }` from `FatFs::volume_fingerprint()` on a `Default` mount | No |
+| `install::selfguard` boot-device guard | keyed on `BOOT_SERIAL`, which aarch64 publishes as **0** (the Pi does not boot through the UEFI loader) — the guard prints DISARMED | n/a |
+| `wifi::firmware` (the one sanctioned USB-preferring read, via `alternate_program_source`) | x86-gated at every `main.rs` call site | Not on the Pi |
+
+**The `sdw` read-only gate does not apply here.** `sdw` and `sdhcblk` are `target_arch = "x86_64"`
+throughout `drivers/block.rs`, and `arroyo` strips `sdw` from every aarch64 feature list so the media
+hash does not shift. What keeps the Pi honest is a different mechanism with the same shape: USBFALL
+F1's `guard_default_write_backend`, which fails a `Default` write **closed** (`NotReady`, one witness
+line) on a build whose canonical backend is SD but where no SD registered — rather than letting the
+write land on somebody's stick.
+
+The `storm [n] fat` writer still targets USB (`BlockSource::Usb`, raw-scratch fallback). That is
+correct: it is an operator-typed provocation for the USB-storage campaign, it is not on any boot
+path, and with no stick attached it exits immediately with
+`:: STORM: fatw done leg=none — no USB block device enumerated; nothing exercised ::`.
+
+### M1 — `ONECARD`: the boot medium names itself
+
+The audit's finding was that the Pi's one-card property was true but **unwitnessed**. A capture
+proved it only by the ABSENCE of USB lines, which is the same inference `sdhc.md` §12.4 records as
+falsified on the x86 side. `drivers::emmc2::onecard_witness()` (called from the aarch64 bare-metal
+boot sequence immediately after `emmc2::probe()`) prints one line carrying the four fields that make
+the claim falsifiable:
+
+```
+:: ONECARD: boot medium = SD backend, N blocks (M MiB) | p1 program volume FAT32 'UNAOS-PI'
+   vol_id=0x… | p2 native volume base_lba=… blocks=… | usb=absent — no second medium was
+   consulted to reach this point ::
+```
+
+Unconditional, not behind `witness`: "UnaOS boots and runs from a single card" is a property of a
+DEFAULT boot, so a default boot is the capture that must carry the evidence. Reads only — one FAT
+mount and one MBR walk, both of which the boot performs moments later anyway. Deliberately **not**
+shaped like a fixture verdict (no `-> PASS ::` tail) so it stays outside `pi4-regression.spec`'s
+`COUNT 25` fixture census: it describes the medium, it is not a twenty-sixth thing that can pass.
+
+`usb=absent` is scoped honestly — at that point in the boot xHCI has not enumerated, so the field is
+a statement about the boot SEQUENCE (nothing USB was needed to get this far), not a promise that no
+stick will ever appear.
+
+### M2 — the EMPTY-PORTS exit: a one-card boot stops paying for an empty bus
+
+`piusb::enumerate()`'s pump had three exits — storage-ready, keyboard-armed + 6 s settle, and the
+30 s backstop — and *nothing is plugged in* reached only the last of them. A Pi that needs no USB
+medium to boot is exactly the machine that arrives there with every port empty, so the one-card
+layout was, in effect, billed 30 s of boot for re-reading five PORTSC words that had read `CCS=0
+CSC=0` since power-on.
+
+The exit added by this arc is keyed on the SAME evidence `PortscWitness::verdict` already uses for
+its `NO-CCS-EVER` branch (`saw_ccs` / `saw_csc`, accumulated from raw PORTSC reads), so it can claim
+nothing the verdict would not, and it sets no `enum_advanced` — an empty bus is not an advance, and
+the verdict stays free to print `NO-CCS-EVER` after the loop. Three conditions, each a reason:
+
+* `have_baseline` — the start sample landed, so the bitmasks mean something.
+* `poison.is_none()` — a non-decoding BAR reads `0xffffffff` and `sample()` refuses to decode it, so
+  CCS would be unset for a window that is **dark** rather than **empty**. That is the one state in
+  which silence is not evidence, and it keeps the full backstop.
+* `saw_ccs == 0 && saw_csc == 0` at every sample within `PIUSB43_NO_DEVICE_EXIT_S` (8 s, several
+  points at the 2 s cadence — the decision rests on a series, not one read).
+
+Why 8 s is *safe* and not merely short: CCS is an **electrical** property of the port, asserted after
+connect debounce (~100–200 ms once PP is up), not a product of enumeration. A device slow to
+ENUMERATE — a hub, a stick behind a hub, a device needing several address attempts — still asserts
+CCS on the ROOT port it is wired to within that debounce, and this exit reads root ports only. So an
+exit here means nothing is electrically attached to any root port, which no further waiting changes.
+A boot with a keyboard or stick attached never reaches the branch (`saw_ccs` is set at the first
+sample that sees the connect) and pays exactly what it paid before.
+
+The exit prints the window it releases, and `PIUSB43_PUMP_BACKSTOP_S` was named for that reason — a
+literal `30` in two places is how such a report drifts away from the deadline it describes.
+
+### Verification status
+
+`piusb.rs` compiles only under `feature = "piusb"` (`UNAOS_PIUSB=1`), which the default `kernel8`
+image does not carry, so M2 is **byte-identical off the knob** and the `kernel8-test` battery does
+not exercise it. Nor can QEMU: `raspi4b` models no PCIe RC, so `enumerate()` returns at the READY
+gate before the pump. M2 is type-checked on the `arm-pi` cfg leg (which carries `piusb`) and its
+behavioural proof is a **bench item** — a `UNAOS_PIUSB=1` metal boot with nothing in the USB ports
+should print the `EMPTY-PORTS exit at 8s` line and reach the shell ~22 s earlier than before.
+
+M1 is on the default path and is proven in QEMU by the gate below.

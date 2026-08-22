@@ -120,6 +120,69 @@ enumerating a superset of the mount's candidates keeps the error in the safe dir
 refusals, never fewer). The mount path's extra rules exist to decide which volume to *trust*, which
 is a different question.
 
+### SDSEAM: a bound only holds if it names the same disk the bytes come from
+
+Both bounds above are *per-device* numbers, so each is only as good as the answer to "which device
+is this". `fs/unafs.rs`'s `SdSectorDevice` used to answer that question twice, independently: its
+reads went to the ambient backend dispatcher (`block::read_block`) while its `sector_count` came
+from the ambient global registry row (`block::info`). PI-FS-2 is the boot where the two answers
+diverged — a USB mass-storage enumeration overwrote the global row with the stick's geometry while
+`read_block` still routed to the microSD, so the SD's own partition (LBA 63, extent 109439) was
+refused as out of bounds against the stick's 29120 blocks. That fix pinned the size to the card;
+this one removes the second answer.
+
+`SdSectorDevice` carries a `block::BlockHandle` and dispatches reads, writes **and** sizing on that
+one value. `locate_on` / `mount_on` are the handle-named constructors; `locate` / `mount` are
+`BlockHandle::Global` wrappers, so every Pi path opens the same handle through the same calls it
+always made and its behaviour is unchanged. `partition_witness` follows the mount's handle too, so
+the census and the bounded magic re-read describe the volume that was actually mounted rather than
+whatever occupies the global slot.
+
+The three dispatches are **exhaustive — no wildcard arm**. `BlockHandle` is total by construction in
+the block layer, so a handle added there is an `E0004` at this seam rather than a silent mis-route
+into the ambient backend. That is why the tegra card's sizing arm, deliberately skipped during
+TEGRASD (on tegra the ambient path reaches the USB stick, so `tegra_sd_info()` would have guarded
+stick reads with the card's capacity — PI-FS-2 inverted), is correct the moment it is written: the
+arm that supplies the capacity and the arm that supplies the bytes are picked by the same value.
+
+### UNAFSBIND: the mount cache names its disk too — the handle-aware binding contract
+
+SDSEAM made the *device* carry its handle; the process-wide `with_unafs` mount cache still assumed
+one. Its lazy bind called `mount()` — a `BlockHandle::Global` wrapper — so on a machine whose unafs
+volume arrives via any **other** handle (the orin's TegraSd card is the motivating case: the global
+handle there is the USB boot stick), the shell's `with_unafs` could never see its own volume: the
+cache was hardwired to the global block device. UNAFSBIND extends the SDSEAM philosophy one level
+up. The contract:
+
+* **The cache entry stores its handle.** The entry is a `BoundMount { handle, fs }` — the
+  `BlockHandle` the volume was mounted from is recorded beside the live mount, not re-derived, and
+  `mount_bound_handle()` exposes it so callers can label their witnesses with the disk the shared
+  mount actually rides. Every sector the mount moves already routes through that same handle, because
+  the adapter inside `fs` was built by `mount_on(handle)` (SDSEAM's carried-handle device).
+* **`Global` first, and it wins whenever it holds a volume.** The lazy bind (`bind_mount`) attempts
+  `Global` before anything else, call-for-call the pre-UNAFSBIND `mount()`. On the pi — where
+  `Global` is the SD/USB path and holds the volume of record — the probe walk never runs and
+  behaviour is byte-for-byte unchanged.
+* **Probing happens only on proof of absence, never on ambiguity.** Other handles are probed only
+  when the global attempt failed with a no-volume-reachable verdict (`NoStorage`,
+  `BadSectorSize`, `Part`, `NoVolume`) **and** no transient `Busy` was latched during the attempt. A
+  `Busy`-tainted or `Fs(_)`-refused global attempt returns its error unprobed — the global volume may
+  merely be mid-loan or mount-refused, and binding another handle's volume behind it would shadow the
+  volume of record with a plausible impostor. If nothing binds anywhere, the **global** error is
+  returned, so a volume-less machine reports today's exact verdict.
+* **The probe walk is E0004-guarded.** `bind_probe_admitted` is an exhaustive match — a handle added
+  in the block layer is a compile error at the bind seam, forcing the decision "should this handle be
+  discoverable?" in the same commit that adds the handle (for `TegraSd` the answer is `true`, one
+  line, and the shell needs no tegra-side wiring at all). `handle_kind_name` and
+  `bind_probe_candidates` sit beside it under the same MERGE NOTE.
+* **The binding is witnessed.** A successful bind prints one line, so any machine's wire shows which
+  handle its mount rode (`native` is the volume's VFS name of record; re-binds after
+  `force_remount`/discard print again — each line describes one live binding):
+
+```
+:: [unafsbind] mount=native handle=global ::
+```
+
 ## 4. Witnesses a metal boot prints
 
 Raw first, conclusion second — the same discipline the block layer's `io-cause` witness follows.
@@ -175,6 +238,9 @@ but can never change what gets mounted. aarch64 only, because `fs::unafs` is.
 * `unaos/crates/kernel/src/fs/fat.rs` — partition-bounded mount (`parse_bpb`'s container gate,
   `mount_source`'s slot walk, `gpt_volume_spans`), the extent gate (`in_extent` and the four
   `rd_*`/`wr_*` wrappers), `FatError::OutOfVolume`.
-* `unaos/crates/kernel/src/fs/unafs.rs` — `partition_witness`, the two-reader cross-check.
+* `unaos/crates/kernel/src/fs/unafs.rs` — `partition_witness`, the two-reader cross-check; and
+  (SDSEAM) `SdSectorDevice`'s carried `BlockHandle` with the `handle_info` / `handle_read` /
+  `handle_write` dispatches, plus `locate_on` / `mount_on`; and (UNAFSBIND) the handle-aware mount
+  cache — `BoundMount`, `bind_mount`, `bind_probe_admitted`, `mount_bound_handle`.
 * `unaos/libs/fs/unafs/src/adapter.rs` — the pre-existing (BeFS-K2) GPT/MBR parser and
   `BlockAdapter`, unchanged.

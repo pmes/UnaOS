@@ -215,6 +215,55 @@ The kernel verbs `usnapcat <gen> <path>` (read a file under current-ACL) and
 `usnapls <gen> [path]` (list a snapshot directory), and the host
 `unafs snapcat <gen> <path> --as <principal>`, drive this surface.
 
+### The mutation set: `unlink` / `rename` / `remove_attribute` (F2)
+
+Each mutation is **one transaction** — every rewrite it makes becomes visible at
+a single root flip, or none does. The pre-K8 crash windows (a name indexed but
+not present, an entry in neither directory, extents leaked by a half-finished
+delete) are gone by construction, not by recovery.
+
+- **`unlink(parent_id, name)`** removes the directory entry, **every** catalog
+  index entry for the inode, the inode's data and spilled-attribute extents,
+  its extent-index (indirection) blocks, the inode block, and its inode-map
+  slot. Returns the freed logical id. Only `File` and `Symlink` are accepted;
+  a directory is refused with `IsADirectory` (there is **no `rmdir`** — the
+  crate does not remove directories, and that is outside F2's scope).
+- **`rename(parent, old, new_parent, new)`** rekeys a **name**, never bytes:
+  the inode, its data, and the catalog (which keys on the stable logical id)
+  are untouched, so a cross-directory move copies nothing. Both directory
+  rewrites land in the same transaction. An existing destination is
+  **refused** (`FileExists` — a deliberate divergence from POSIX's silent
+  overwrite); a directory moved into itself or a descendant is `DirectoryLoop`;
+  renaming an entry to its own name is a no-op `Ok`.
+- **`remove_attribute(inode_id, key)`** drops the inline **or** spilled value
+  and every catalog entry for that (inode, key) pair, so a removed attribute
+  can never be returned by a later query — including a removed `Vector`, which
+  simply drops out of the similarity candidate set rather than scoring against
+  a stale index row. A key that is absent is `AttributeNotFound`, never a
+  silent no-op.
+
+**Why an unlink cannot destroy a snapshot's bytes.** `unlink` never *frees*
+blocks; it **decrefs** them. The allocator invariant is *free ⇔ reachable from
+no retained root*, and `snapshot_create` increfs every block its retained root
+reaches — so a block that a snapshot and the live tree share carries a count
+per referencing root. Unlinking the live name drops exactly the live tree's
+reference; while a snapshot still holds one the count stays above zero, the
+block is never reallocated, and the snapshot keeps reading the unlinked bytes.
+Only when the last root that reaches a block lets go does the count hit zero
+and the block become allocatable. This is the same one-count-per-root
+accounting `fsck` recomputes across the live root *and* every retained root, so
+a mutated volume's refcounts converge and verify clean.
+
+A power cut mid-`rename` is covered by the same structural atomicity as every
+other commit: the crate's cut-mid-commit seam (`set_autocommit(false)`, drop,
+remount) is exercised against a cross-directory rename in
+`tests/mutation_logic.rs` and converges to the old name or the new one — never
+both, never neither.
+
+The kernel verbs `urm` / `umv` / `urmattr` drive this surface through the
+single IRQ-masked mount, and the uncounted `F2-mutations` witness proves each
+mutation durable across a genuine remount on the live card.
+
 ### The bulk create+write path (UNAFS-BATCH)
 
 **`create_files_batch(parent_id, Vec<BatchFile>) -> Result<Vec<u64>>`** is the
@@ -404,7 +453,7 @@ Planned arcs (sequencing in [`docs/ROADMAP.md`](../../docs/ROADMAP.md) §2):
 | Arc | Content |
 | :--- | :--- |
 | F1 | ~~Journal rollback/replay~~ — **superseded by K8a** (commit is one atomic root flip; there is no torn state to roll back) |
-| F2 | `unlink` / `rename` / `remove_attribute` + catalog removal — **✅ landed** (now each a single atomic CoW transaction) |
+| F2 | `unlink` / `rename` / `remove_attribute` + catalog removal — **✅ landed** (each a single atomic CoW transaction; kernel verbs `urm`/`umv`/`urmattr` + the `F2-mutations` witness complete the surface) |
 | F3 | Generic on-disk B+tree (shared by indexes and directories, as BeFS did) |
 | F4 | Per-attribute B+tree indexes: log-time equality, true range queries |
 | F5 | **Live queries** — delta-emitting persistent queries published over bandy (the query-driven spatial UI, now including similarity) |

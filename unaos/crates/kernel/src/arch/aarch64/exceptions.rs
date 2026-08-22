@@ -27,39 +27,39 @@ use core::sync::atomic::{AtomicU8, Ordering};
 // EL-uniform, but VBAR install and fault decoding need the right banked-register names.
 static BOOT_EL: AtomicU8 = AtomicU8::new(0);
 
-// The IRQ stub banks ELR/SPSR for the EL we run at. Baremetal drops to EL1 (see `boot::drop_to_el1`);
-// the UEFI/QEMU-virt build stays at EL2. A single `global_asm!` can't `#[cfg]` individual lines, so
-// select the "1"/"2" EL suffix here and splice it into __vec_irq below via `concat!`.
-#[cfg(feature = "baremetal")]
-macro_rules! irq_el {
-    () => {
-        "1"
-    };
-}
-#[cfg(not(feature = "baremetal"))]
-macro_rules! irq_el {
-    () => {
-        "2"
-    };
-}
+// The IRQ stub banks ELR/SPSR for the EL the exception was taken AT. A single `global_asm!` can't
+// `#[cfg]` individual lines, so the whole bank/unbank SEQUENCE is selected here and spliced into
+// __vec_irq via `concat!` — the newlines live INSIDE the strings, so this costs no source lines.
+// Off tegra the EL is fixed at compile time (baremetal drops to EL1 -> _EL1; UEFI/QEMU-virt stays
+// at EL2 -> _EL2) and those arms emit byte-identical asm to before. On TEGRA one table serves BOTH:
+// JM4 arms the GIC-600 + CNTP and `timer::verify_live` PROVES interrupt-driven ticks AT EL2, then
+// JM6 `boot_tegra::drop_to_el1` re-installs the same table as VBAR_EL1 — and neither digit is right
+// for both ("2" UNDEFs at EL1, into the halting __vec_sync; "1" banks the wrong register at EL2), so
+// tegra reads CurrentEL at RUNTIME (the __vec_sync/JB1f pattern; x3 scratch, labels 7/8 per-site).
+#[cfg(all(not(feature = "tegra"), feature = "baremetal"))] macro_rules! irq_bank { () => { "mrs x0, ELR_EL1\n    mrs x1, SPSR_EL1" }; }
+#[cfg(all(not(feature = "tegra"), not(feature = "baremetal")))] macro_rules! irq_bank { () => { "mrs x0, ELR_EL2\n    mrs x1, SPSR_EL2" }; }
+#[cfg(feature = "tegra")] macro_rules! irq_bank { () => { "mrs x3, CurrentEL\n    cmp x3, #0x8\n    b.eq 7f\n    mrs x0, ELR_EL1\n    mrs x1, SPSR_EL1\n    b 8f\n7:  mrs x0, ELR_EL2\n    mrs x1, SPSR_EL2\n8:" }; }
+#[cfg(all(not(feature = "tegra"), feature = "baremetal"))] macro_rules! irq_unbank { () => { "msr ELR_EL1, x0\n    msr SPSR_EL1, x1" }; }
+#[cfg(all(not(feature = "tegra"), not(feature = "baremetal")))] macro_rules! irq_unbank { () => { "msr ELR_EL2, x0\n    msr SPSR_EL2, x1" }; }
+#[cfg(feature = "tegra")] macro_rules! irq_unbank { () => { "mrs x3, CurrentEL\n    cmp x3, #0x8\n    b.eq 7f\n    msr ELR_EL1, x0\n    msr SPSR_EL1, x1\n    b 8f\n7:  msr ELR_EL2, x0\n    msr SPSR_EL2, x1\n8:" }; }
 
-// M6a: the Lower-EL-AArch64 synchronous vector (0x400) routes to __vec_svc on baremetal (EL0 syscalls
-// land there since the kernel is at EL1), but stays the halting __vec_sync on the UEFI/EL2 build (no
-// EL0 there). svc_stub!() emits the __vec_svc body only on baremetal (empty otherwise), so the UEFI
-// build has no reference to the baremetal-only aarch64_svc_handler.
-#[cfg(feature = "baremetal")]
+// M6a: the Lower-EL-AArch64 synchronous vector (0x400) routes to __vec_svc wherever EL0 exists —
+// baremetal AND tegra_el0 (recovered boot-2 capture 2026-08-18: el0-hello's first `svc #0` hit the
+// fault logger, ESR=0x56000000 EC=0x15 ELR=0x7800000014 — JETSON-EL0 widened syscall.rs but not this
+// vector). Elsewhere it stays the halting __vec_sync, and svc_stub!() emits nothing.
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 macro_rules! svc_vec {
     () => {
         "__vec_svc"
     };
 }
-#[cfg(not(feature = "baremetal"))]
+#[cfg(not(any(feature = "baremetal", feature = "tegra_el0")))]
 macro_rules! svc_vec {
     () => {
         "__vec_sync"
     };
 }
-#[cfg(feature = "baremetal")]
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 macro_rules! svc_stub {
     () => {
         r#"
@@ -103,7 +103,7 @@ __vec_svc_fault:
 "#
     };
 }
-#[cfg(not(feature = "baremetal"))]
+#[cfg(not(any(feature = "baremetal", feature = "tegra_el0")))]
 macro_rules! svc_stub {
     () => {
         ""
@@ -257,7 +257,7 @@ __exception_vectors:
 
     // ---- IRQ: save, dispatch in Rust, restore, return ----
     // Beyond the GPRs + FP, bank ELR/SPSR (the return PC + PSTATE the CPU banked on entry; the EL
-    // suffix is _EL1 on the baremetal build, _EL2 on UEFI — see the irq_el! selector above) and
+    // suffix is _EL1 baremetal, _EL2 on UEFI, runtime on tegra — see irq_bank!/irq_unbank! above) and
     // (M6e) SP_EL0, into a 32-byte 16-aligned frame. These are SYSTEM registers, not stacked like
     // x86's interrupt frame, so they are per-*core*, not per-*context*. The scheduler's timer
     // preemption (timer::on_tick -> sched::timer_preempt) does a context switch INSIDE this handler;
@@ -270,13 +270,13 @@ __exception_vectors:
     // same-value round-trip (SP_EL0 is not the active stack there); only a Lower-EL (EL0) preempt
     // carries a live user SP. Do NOT read "the SP_EL0 msr ran" as "the interrupted context was EL0" —
     // test SPSR.M[3:0] for that (see aarch64_irq_handler's M6e counter). The EL is compile-time:
-    // baremetal drops to EL1 (irq_el!() = "1"), UEFI stays at EL2 ("2").
+    // baremetal drops to EL1 ("1"), UEFI stays at EL2 ("2"); on tegra it is a runtime CurrentEL test.
     .globl __vec_irq
 __vec_irq:
     SAVE_GPRS
     SAVE_FP
-    mrs x0, ELR_EL"#, irq_el!(), r#"
-    mrs x1, SPSR_EL"#, irq_el!(), r#"
+    "#, irq_bank!(), r#"
+    // ^ ELR/SPSR banked above: a fixed EL suffix off tegra, a CurrentEL runtime branch on tegra.
     mrs x2, SP_EL0
     stp x0, x1, [sp, #-32]!
     str x2, [sp, #16]
@@ -291,8 +291,8 @@ __vec_irq:
     ldp x0, x1, [sp]
     ldr x2, [sp, #16]
     add sp, sp, #32
-    msr ELR_EL"#, irq_el!(), r#", x0
-    msr SPSR_EL"#, irq_el!(), r#", x1
+    "#, irq_unbank!(), r#"
+    // ^ ELR/SPSR restored above under the same EL selection the prologue's irq_bank! used.
     msr SP_EL0, x2
     RESTORE_FP
     RESTORE_GPRS
@@ -310,8 +310,8 @@ __vec_sync:
     // discipline. Since JB1e this stub can RETURN (heal -> eret), and the handler runs substantial
     // Rust (D-side probe, atomics, serial writes) — a sync fault NESTING inside it re-banks the
     // per-core ELR/SPSR, and without this frame copy the outer eret would resume at the NESTED
-    // fault's PC/PSTATE (silent register/PC corruption). Unlike __vec_irq's compile-time irq_el!
-    // suffix, the EL is a RUNTIME check: on tegra this vector serves EL2 (pre-drop, where the
+    // fault's PC/PSTATE (silent register/PC corruption). Like __vec_irq's tegra irq_bank! arm,
+    // the EL here is a RUNTIME check: on tegra this vector serves EL2 (pre-drop, where the
     // fbcon boot-mirror window lives) AND EL1 (post-drop CAPSTONE, where a heal has fired on
     // metal) — and an ELR_EL2 access at EL1 itself UNDEFs. CurrentEL cannot fault; x0-x3 are
     // scratch here (SAVE_GPRS spilled them).
@@ -750,7 +750,7 @@ extern "C" fn aarch64_fault_handler(kind: u64) -> u64 {
 ///
 /// FAR_EL1 is architecturally valid only for instruction/data aborts (EC 0x20/0x24) with ISS.FnV=0
 /// and for PC-alignment faults (0x22); for every other EC it holds a stale value, so print `--`.
-#[cfg(feature = "baremetal")]
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 #[unsafe(no_mangle)]
 extern "C" fn aarch64_el0_fault_handler() -> ! {
     let (esr, elr, far): (u64, u64, u64);

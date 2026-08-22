@@ -35,6 +35,14 @@ SECTIONS
         *(.rodata .rodata.*)
     } :text
 
+    /* LDPIN (WINX-8 class, commit 442f1cfa; provenance: the sibling linker-script audit,
+       ~/.claude/plans/unaos/review/pi4-sibling-ld-audit.md): main.rs:803 derives the window base as
+       `_start`'s own address, and every fixed landmark (info page +0x4000, surface +0x5000) hangs
+       off that base — correct only while e_entry stays 0. WINX-8 proved that a layout change which
+       moves e_entry (user-vug-x86's FILEHDR PHDRS moved it to 0xb0) skews every landmark silently.
+       This ASSERT allocates nothing and turns that silent skew into a link failure. */
+    ASSERT(_start == 0, "user-pulse: e_entry moved off 0 -- the main.rs base derivation assumes _start IS the window base (WINX-8 class)")
+
     /* Force the data segment onto its own page so text/data never share a leaf. */
     . = ALIGN(0x1000);
 

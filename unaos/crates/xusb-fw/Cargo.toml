@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 The Architect & Una
+#
+# `unaos-xusb-fw` — the XUSBFW build-time firmware INJECTION POINT, and nothing else.
+#
+# WHY IT IS ITS OWN CRATE (measured, not stylistic). This build script used to live at
+# `crates/kernel/build.rs`. A build script's mere PRESENCE changes cargo's `-C metadata` for the
+# crate that carries it, which seeds the v0 symbol disambiguator; every v0 symbol name and the LLVM
+# module hash change with it, codegen units link in a different order, and `.text`/`.rodata` are
+# re-laid out. Measured at 12b0993c: the knob-OFF x86 `kernel.elf` grew 1608 B (a3ef1b4c… ->
+# 1a179727…) and the knob-off Pi `kernel8.img` kept its size but had 265,310 bytes differ
+# (9438fa9d… -> c54da061…) — with build.rs deleted as the only change, both artifacts reproduced
+# the parent byte-for-byte, so the script alone was the cause. The effect is deterministic and
+# semantically inert, but it re-baselines every stored pre-XUSBFW media hash on all three hardware
+# tracks, which is a real cost for a bench-only knob.
+#
+# Moving the script here confines that cost to the crate nobody links by default. The kernel takes
+# this crate as an OPTIONAL dependency behind its `xusbfw` feature, so with the knob OFF the
+# dependency is not resolved and the kernel carries no build script at all. Verified in ONE
+# directory, knob-off, 9de45011-with-this-change against the pre-XUSBFW parent 8665a464:
+# `esp-x86` kernel.elf a3ef1b4c…(1,688,752 B) and `kernel8` kernel8.img 9438fa9d…(1,275,144 B) —
+# byte-identical to baseline on both.
+#
+# The firmware blob itself is bench-only and NEVER in-tree: `build.rs` emits
+# `Some(include_bytes!("<abs path>"))` reading the blob IN PLACE from an absolute extern path
+# (the bunker), never copying it into the repo or `target/`, and `None` when `UNAOS_XUSB_FW_PATH`
+# is unset. Users fetch NVIDIA firmware themselves; UnaOS ships only its own process docs.
+[package]
+name = "unaos-xusb-fw"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+# No dependencies, ever. This crate is linked into a bare-metal kernel image and contributes exactly
+# one `const` — either a `None` or a `&'static [u8]` in `.rodata`.
+[dependencies]

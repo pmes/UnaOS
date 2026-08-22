@@ -702,6 +702,11 @@ pub fn log_summary_once() {
             BOT_WAIT_BUCKETS[6].load(Ordering::Relaxed), BOT_WAIT_BUCKETS[7].load(Ordering::Relaxed),
             BOT_WAIT_BUCKETS[8].load(Ordering::Relaxed), BOT_WAIT_BUCKETS[9].load(Ordering::Relaxed),
             BOT_WAIT_BUCKETS[10].load(Ordering::Relaxed), BOT_WAIT_BUCKETS[11].load(Ordering::Relaxed));
+        // BOT-PARK: the per-device ledger census, on its own lines for the same reason — the
+        // SUMMARY above must stay byte-comparable with every capture taken before this arc. On a
+        // clean boot this is one `accounts=0 parked=0 …` rollup; on a wedge it is the self-diagnosis
+        // the 2026-08-17 sitting had to assemble by hand from slot ids that kept changing.
+        x.bot_park_census();
         // MULTIBLK: the transfer-size census, on its own line so the SUMMARY above stays
         // byte-comparable with pre-arc captures. `single=` counts data stages still issued at one
         // sector (partial-sector RMW head/tails, INQUIRY, READ CAPACITY, REQUEST SENSE); `multi=`
@@ -718,10 +723,117 @@ pub fn log_summary_once() {
     }
 }
 
+/// VUGRAS (RAS localizer): dump every xHCI DMA structure's physical address to serial so a decoded
+/// RAS fault ADDR can be matched against the controller's rings, contexts and buffers post-mortem. The
+/// controller structures are identity-mapped, so a `*mut`/PA is the physical address the SNOC/ACI sees.
+/// Read-only. Emphasises the port under `enumerating_port` (boots 13+14 both crashed with a port
+/// mid-enumeration; port 7 in the field capture). Called once from the boot witness under the knob.
+pub fn vugras_dump() {
+    let ctrl = XHCI_CONTROLLER.lock();
+    let Some(x) = ctrl.as_ref() else {
+        serial_println!(":: VUGRAS: xHCI not initialised — no controller PAs ::");
+        return;
+    };
+    serial_println!(
+        ":: VUGRAS: xHCI DCBAA={:#x} event_ring_base={:#x} erst_base={:#x} enum_cmd_trb={:#x} enumerating_port={} stage={} ::",
+        x.dcbaap as u64,
+        x.event_ring_phys_base,
+        x.erst_table_phys,
+        x.enum_cmd_phys,
+        x.enumerating_port,
+        x.enum_stage
+    );
+    if let Some(cr) = COMMAND_RING.lock().as_ref() {
+        let (lo, hi) = cr.span();
+        serial_println!(":: VUGRAS: xHCI command-ring [{:#x},{:#x}) ::", lo, hi);
+    }
+    let optp = |o: Option<*mut u8>| -> u64 { o.map(|p| p as u64).unwrap_or(0) };
+    for (i, s) in x.slots.iter().enumerate() {
+        if !s.active {
+            continue;
+        }
+        let mark = if s.port_id == x.enumerating_port { " <== enumerating" } else { "" };
+        serial_println!(
+            ":: VUGRAS: xHCI slot {} port {}{} in_ctx={:#x} out_ctx={:#x} desc_buf={:#x} data_buf={:#x} mouse_buf={:#x} ::",
+            i,
+            s.port_id,
+            mark,
+            s.input_context as u64,
+            s.output_context as u64,
+            s.descriptor_buffer as u64,
+            optp(s.data_buffer),
+            optp(s.mouse_data_buffer)
+        );
+        serial_println!(
+            ":: VUGRAS: xHCI slot {} port {} expect ep0={:#x} mouse={:#x} kbd={:#x} hub_int={:#x} ::",
+            i,
+            s.port_id,
+            s.ep0_expect_phys,
+            s.mouse_expect_phys,
+            s.keyboard_expect_phys,
+            s.hub_int_expect_phys
+        );
+        for (tag, r) in [
+            ("ep0", &s.ep0_ring),
+            ("mouse", &s.mouse_ring),
+            ("kbd", &s.keyboard_ring),
+            ("hub_int", &s.hub_int_ring),
+            ("bulk_in", &s.bulk_in_ring),
+            ("bulk_out", &s.bulk_out_ring),
+        ] {
+            if let Some(ring) = r {
+                let (lo, hi) = ring.span();
+                serial_println!(
+                    ":: VUGRAS: xHCI slot {} port {} {}-ring [{:#x},{:#x}) ::",
+                    i, s.port_id, tag, lo, hi
+                );
+            }
+        }
+        if let Some(b) = s.hub_change_buffer {
+            serial_println!(
+                ":: VUGRAS: xHCI slot {} port {} hub_change_buf={:#x} ::",
+                i, s.port_id, b as u64
+            );
+        }
+    }
+}
+
+/// ORIN-X200-1 (boot-28): witness every bus/DMA pointer the driver hands the controller, at the
+/// moment of programming, together with the controller state (RS/HCH/CRR) that says whether the
+/// pointer is already fetchable. Boot-28's IOB/ACI FillWrite RAS at bus address
+/// 0x8000000000000200 fired right after "SLOT 1/3 ENABLED & ADDRESSED", before any net code ran —
+/// a low/default-shaped pointer (< 0x1000) handed to the controller is the prime suspect shape.
+/// The battery line is usbdebug-gated (default-quiet law); the < 0x1000 FLAG is unconditional —
+/// it only fires on a real bug and must never be silenced by a build knob. Free function (not a
+/// method) so call sites inside `&mut self.slots[..]` borrows can use it without borrow conflicts.
+#[allow(unused_variables)]
+fn x200_witness(op_base: usize, tag: &str, val: u64) {
+    if val < 0x1000 {
+        serial_println!(
+            "xHCI: X200 FLAG !! {} = {:#x} < 0x1000 — low/default-shaped DMA pointer handed to the controller",
+            tag, val
+        );
+    }
+    #[cfg(feature = "usbdebug")]
+    unsafe {
+        let cmd = core::ptr::read_volatile(op_base as *const u32);
+        let sts = core::ptr::read_volatile((op_base + 0x04) as *const u32);
+        let crcr = core::ptr::read_volatile((op_base + 0x18) as *const u32);
+        serial_println!(
+            ":: X200: {}={:#x} (RS={} HCH={} CRR={}) ::",
+            tag, val, cmd & 1, sts & 1, (crcr >> 3) & 1
+        );
+    }
+}
+
 pub static COMMAND_RING: Mutex<Option<TransferRing>> = Mutex::new(None);
 pub static EVENT_RING: Mutex<Option<EventRing>> = Mutex::new(None);
 
-pub static mut ERST_TABLE: ErstTable = ErstTable { entries: [ErstEntry { ring_address: 0, size: 0, _rsvd: 0, _rsvd2: 0 }] };
+// JETSON-XCARVE: the ERST is HEAP-allocated inside `init_interrupter` (like DCBAA / scratchpad / the
+// command ring), NOT a kernel-image `static mut`. A `.bss`-resident xHC DMA structure inherits the
+// bootloader-chosen image extent's firewall status — which HEAP-GUARD does not vet — and the CPU's
+// construction store FillWrite-RASes on writeback (see the EventRing struct doc). No xHC DMA structure
+// lives in the image any more.
 
 // Store Physical Address of the Event Ring for Runtime ERDP updates
 static mut EVENT_RING_PHYS_BASE: u64 = 0;
@@ -972,11 +1084,665 @@ const BOT_BUDGET_SCALE_ESCALATION: u64 = 1;
 /// a HID) says the opposite and would move the investigation somewhere else entirely. The 2026-07-29
 /// capture had to argue this by eye, from the FTDI slot's unrelated log lines.
 pub static BOT_FOREIGN_EVENTS: AtomicU64 = AtomicU64::new(0);
+/// [piusb41] PA34: consecutive zero-data CSW folds this boot. The PA34 boot proved the replayed
+/// CSW is not queued data (the drain found the IN pipe QUIET) — the device RE-MANUFACTURES its
+/// stale status as the answer to every new command: a stuck BOT state machine, with media seated.
+/// No host-side ring or reset act reaches that state; the rescue ladder's port power-cycle does.
+/// Two consecutive folds are the trigger (one fold is a legal device answer; two in a row on
+/// fresh tags is the stuck signature). Cleared by `bot_rescue_clear` (fresh enumeration).
+pub static BOT_FOLD_STREAK: AtomicU64 = AtomicU64::new(0);
 /// Escalation rungs attempted (a = Reset Device, b = port power-cycle) and surrenders. Zero on a
 /// clean boot, so any non-zero reading is itself the finding.
 pub static BOT_RESCUE_RESET_DEVICE: AtomicU64 = AtomicU64::new(0);
 pub static BOT_RESCUE_PORT_CYCLE: AtomicU64 = AtomicU64::new(0);
+/// [piusb41] Rung (b') attempts: the HUB-port power-cycle, the downstream twin of (b). Counted
+/// separately from the root rung because the two touch different hardware through different pipes —
+/// a root PORTSC write versus a hub-class request on another device's control endpoint — and a
+/// capture must be able to say which one a boot actually reached.
+pub static BOT_RESCUE_HUB_PORT_CYCLE: AtomicU64 = AtomicU64::new(0);
 pub static BOT_RESCUE_SURRENDER: AtomicU64 = AtomicU64::new(0);
+
+// --- BOT-PARK (2026-08-17): the GLOBAL floor — bounded work per DEVICE, not per slot id ---
+//
+// [pi0-b1b2] `boot3-inputdeath-tail.txt` convicted the one structural hole left in the ladder, on
+// Pi 4 metal. Read the capture as a CYCLE rather than as a list of failures:
+//
+//   BOT: SURRENDER slot=2 …  retracted=yes      <- the per-slot floor DID fire, exactly as designed
+//   HUB slot 1 port 1 disconnect: slot 2 …      <- the ladder's OWN hub-port power-cycle rung (b')
+//   [piusb25] storage enumerated: slot 5 …      <- the same wedged reader, re-enumerated, NEW slot id
+//   BOT: SURRENDER slot=5 …                     <- a whole fresh ladder allowance, spent, surrendered
+//   [piusb25] storage enumerated: slot 2 …      <- and back again. Forever.
+//
+// Nothing in the ladder is wrong there; every rung did what it was built to do. What is missing is a
+// verdict that OUTLIVES A SLOT ID. `bot_surrendered_slot` is one `u8`: it binds the floor to a
+// number the controller recycles, so a device whose prescribed cure is a port cycle escapes its own
+// surrender by being re-enumerated by that very cure — and, because the field holds exactly one
+// slot, parking the new id UNPARKS the old one (slot 5's surrender is literally what let slot 2 back
+// onto the wire). The measured cost was a core at 99% and a desktop frozen for the whole sitting, at
+// ~8.3 s of pump budget per attempt, `timeouts=` still climbing when Peter pulled the device.
+//
+// The ledger below is the missing GLOBAL discipline. It is keyed by a physical identity a
+// re-enumeration cannot change — root port, route string, VID:PID — deliberately excluding the slot
+// id, which is the field the wedge escaped through. The per-slot surrender is untouched: this is a
+// floor UNDER it, not a replacement for it, and no rung's semantics change.
+//
+/// Ladder entries (`bot_rescue_escalate` calls) one device identity may spend across ALL of its
+/// enumerations before it is PARKED. Six = three generations' worth of the two-strike per-generation
+/// allowance (`BOT_RESCUE_N_CONSEC`): enough that a device the port cycle genuinely cures still gets
+/// cured (PA35's replug proved one cold cycle is the cure when there is one), few enough that the
+/// metal cycle above ends in seconds instead of never.
+const BOT_PARK_LADDER_MAX: u32 = 6;
+/// Surrenders one identity may earn before parking. TWO: the first is the ladder's verdict on this
+/// generation; a second one — necessarily after the ladder's own port cycle re-enumerated the device
+/// — is the verdict on the cure itself. There is no evidence anywhere in this campaign of a device
+/// that failed two full ladders across a cold cycle and then worked.
+const BOT_PARK_SURRENDER_MAX: u32 = 2;
+/// Total pump wall-clock, in milliseconds, one identity may burn before parking regardless of how
+/// that time divides into ladders. The bound the metal sitting actually needed: 45 s is ~5 first-
+/// attempt budgets (`hw_wait_budget() * BOT_BUDGET_SCALE_FIRST` ≈ 8.3 s on Pi 4), i.e. a device gets
+/// several honest chances to be merely slow, and the desktop gets its core back inside a minute
+/// instead of losing it for the boot.
+const BOT_PARK_CYCLE_MAX_MS: u64 = 45_000;
+/// Consecutive pump timeouts on one identity with a PROVABLY IDLE ring — zero events drained, zero
+/// foreign events, zero doorbell rings observed during the whole wait — before this identity's pump
+/// budget is cut by `BOT_PARK_DEAD_DIV`. This is the [piusb40] necropsy signature, and it is the one
+/// condition under which waiting longer is known to buy nothing: the event ring was empty, the
+/// interrupter delivered nothing for anyone, and IRQ_COUNT never moved. TWO, not one, so a single
+/// unlucky quiet wait on a slow-but-healthy stick cannot shorten its own budget.
+const BOT_PARK_DEAD_STREAK: u32 = 2;
+/// Divisor applied to `hw_wait_budget()` for an identity past `BOT_PARK_DEAD_STREAK`. The cut is on
+/// the *base* budget, so the resulting cap is independent of `bot_budget_scale` and cannot lengthen
+/// any wait. Eight: ~350 ms on Pi 4, still two orders of magnitude above the microseconds a revived
+/// device answers in, and 24x below the ~8.3 s a dead one used to cost per attempt.
+const BOT_PARK_DEAD_DIV: u64 = 8;
+/// BOTLATCH (R24 boot5). Dead-ring pump timeouts — CUMULATIVE, not consecutive — one identity may be
+/// charged before it is PARKED. This is the clause the [pi0-b1b2] boot5 window is missing, and the
+/// defect it closes is a loop the ledger made with itself:
+///
+///   * `BOT_PARK_DEAD_STREAK` says a twice-dead ring has PROVEN that waiting longer buys nothing —
+///     the strongest verdict this driver can reach without a replug. Its only consequence was to
+///     CUT THE BUDGET by `BOT_PARK_DEAD_DIV`.
+///   * `verdict()` could park on wall-clock (`BOT_PARK_CYCLE_MAX_MS`), and wall-clock is exactly
+///     what the cut removes. Past the streak an identity accrues its park budget 8x — 24x against
+///     `BOT_BUDGET_SCALE_FIRST` — more slowly. **The device the driver is most certain about is the
+///     device it parks last.** That is the budget cut engaging and the identity-park never latching.
+///
+/// So the criterion now counts the same failures the budget cut counts. CUMULATIVE is the load-
+/// bearing word: `dead_streak` is reset by any single live wait, and boot5's capture shows why that
+/// is fatal to a verdict — its 41 timeouts on the reader arrive in dead runs of 6, 6 and 13 broken
+/// up by waits where `foreign=` is non-zero (the FTDI console's own traffic, on a shared event
+/// ring — nothing to do with the reader). A consecutive counter is right for arming a cheap,
+/// reversible budget cut; it cannot carry a permanent verdict, because the thing that resets it is
+/// unrelated to the device being judged.
+///
+/// EIGHT. Two arm the cut at the full budget (~7.2 s each on Pi 4 at `BOT_BUDGET_SCALE_FIRST`),
+/// then six more at the cut (~0.3 s each) — i.e. the device is given six further chances to answer
+/// AFTER it has proven itself idle twice, and the whole verdict costs ~16 s instead of the ≥45 s
+/// the wall-clock clause needs (and never reaches once the cut is on). A healthy device is charged
+/// none of these: a completion is `dead=false`, and a live ring posts events, foreign events or
+/// doorbells, any one of which disqualifies the wait. **That defence was overstated, and BOTLATCH M2
+/// below is the correction: it protects a device that is TRANSACTING, not a device that is merely
+/// healthy.** Two devices fall through it — one whose eight idle waits are scattered across an
+/// uptime full of completions (nothing refunded them), and one that is answering with NAKs, which
+/// put nothing on the ring at all. See `BOT_PARK_REPROBE_MS`. Against boot5's own trace the account
+/// crosses
+/// 8 at pump timeout #19 of 41 — the last 22 timeouts, and the ~2.5 minutes of 99%-core they cost,
+/// never happen.
+const BOT_PARK_DEAD_MAX: u32 = 8;
+/// BOTLATCH M2 (2026-08-18 adversarial panel, findings 4 and 5). The dead-ring clause above is
+/// correct about the device it was written for and wrong about two devices it was not, and both
+/// defects have the same shape: `dead_total` was a counter with an ACCUMULATION rule and no
+/// FORGIVENESS rule, so it measured "has this identity ever looked idle" rather than "is this
+/// identity idle".
+///
+/// FINDING 4 — NO RESET ON SUCCESS. `dead_total` was cleared by exactly one thing:
+/// `bot_park_forget`, i.e. an operator replug. Nothing a device could DO cleared it. With a single
+/// USB device attached — the bench Pi's normal shape, and the shape of every capture that is not
+/// boot5's FTDI-plus-reader sitting — the `dead` predicate (`evts == 0 && foreign == 0 && db == 0`)
+/// degenerates: with no second device there is no foreign traffic to make an idle wait live, so
+/// `dead` means only "this wait timed out". Eight scattered idle timeouts across an entire uptime —
+/// a medium change, a spun-down disk, a hub that briefly stopped answering — then park, permanently,
+/// on the next transfer, with every one of the intervening thousands of COMPLETED transfers counting
+/// for nothing. The fix is `bot_park_note_success`: a transfer that COMPLETED for this identity
+/// zeroes `dead_total`. Nothing weaker is allowed to, and that is the whole point of the counter —
+/// foreign traffic on the shared ring already refunds `dead_streak`, and letting it refund the
+/// VERDICT counter too is precisely the boot5 defect this clause was written to close. A completion
+/// is a fact about THIS device: its own transfer event landed on the ring. Boot5's conviction is
+/// untouched, because the wedged reader never completed anything — its 41 waits are 41 timeouts with
+/// no completion between them.
+///
+/// FINDING 5 — A NAKING DEVICE IS INDISTINGUISHABLE FROM A DEAD RING. A cold HDD spinning up, or a
+/// card just inserted, NAKs: it posts no event TRB at all, which is byte-identical on the ring to
+/// the [piusb40] necropsy signature. Two full-budget waits arm the cut, then six at ~0.3 s — the
+/// device is parked in ~16 s and, before this, recoverable only by physical replug. That directly
+/// contradicts this module's own stated constraint (see `BOT_PARK_PASS_PUMP_MS`: "a slow-but-healthy
+/// stick must keep them"), and 16 s is well inside a 7200 rpm spin-up.
+///
+/// So a dead-ring park gets ONE automatic re-probe, after this cooldown, and exactly one. Sixty
+/// seconds: longer than any spin-up or card-init this driver can be handed, short enough that a
+/// bench operator who has walked away still finds the device working; and it is charged to UPTIME,
+/// not spun — `reprobe_at` is a deadline the next gate consultation tests, so the wait itself costs
+/// nothing. The unpark zeroes `dead_total` (the device needs a real allowance again, or the gate's
+/// own `verdict()` would re-park it inside the same call) and leaves `dead_streak` alone (so the
+/// probe is charged at the CUT budget, ~0.3 s, not a fresh ~7.2 s), and it sets `reprobed`, which is
+/// sticky for the life of the account. A SECOND park on the same identity is therefore permanent,
+/// and only an operator replug clears the flag.
+///
+/// The two fixes compose into the recovery rule: park, wait, probe once — if the probe COMPLETES,
+/// finding 4's reset clears the account and the device is simply back; if it dead-rings, the park
+/// latches for good. Boot5's reader: parked at ~16 s, re-probed at ~76 s, dead-rings, permanent —
+/// total cost two lines on the wire and one extra ~0.3 s wait, verdict preserved. A cold disk:
+/// parked at 16 s, re-probed at ~76 s when it is ready, completes, account cleared — recovered with
+/// no human hands. What the re-probe is NOT: it is not a timer and not a retry loop. It fires on the
+/// next thing that asks this identity for I/O after the deadline; if nothing ever asks again the
+/// device stays parked, which is the right outcome for a device nobody wants.
+const BOT_PARK_REPROBE_MS: u64 = 60_000;
+/// Escalating back-off between LADDER ENTRIES for one identity, doubling per entry. Distinct from
+/// `BOT_RESCUE_BACKOFF_MS`, which is the in-ladder spec-scale settle between RUNGS and stays exactly
+/// as it is (it is metal-earned: a device wedged mid-internal-stall is made worse by hammering).
+/// This one is not spun: it is a DEADLINE the next `service_storage`/block-I/O pass tests and
+/// declines, so the wait is paid in main-loop passes that render frames instead of in `settle_ms`.
+const BOT_PARK_BACKOFF_MS: u64 = 100;
+const BOT_PARK_BACKOFF_MAX_MS: u64 = 4_000;
+/// Ladder entries one main-loop pass may run for a given identity before the driver yields. ONE:
+/// the pump is scheduled cooperatively from the desktop loop (`main.rs` -> `service_storage` /
+/// the block layer's synchronous reads), so "yield" here means "return to the caller and let the
+/// frame paint". A pass therefore costs at most one ladder, not an unbounded chain of them.
+const BOT_PARK_PASS_LADDERS: u32 = 1;
+/// Ledger capacity. Four: this driver brings up ONE storage device at a time, and the entries that
+/// matter are the sick ones. Small enough to scan linearly on the hot path for free.
+const BOT_PARK_SLOTS: usize = 4;
+/// Hard ceiling, in milliseconds, on the BOT time ONE main-loop pass may spend on an identity that
+/// already has an account. The ladder-count cap above is not sufficient on its own and the boot3
+/// measurement is why: the [piusb26] per-pass cost at the four c3=99% windows read 1,498,784,103 /
+/// 1,972,189,353 / 1,060,628,143 / 1,348,032,519 cycles against a normal 119-134, i.e. 20-37 s in a
+/// SINGLE pass — because one ladder legitimately chains several waits (first attempt, the recovery
+/// retry, then a retry per rung), each with its own metal-earned budget.
+///
+/// So this bound is deliberately NOT a shorter wait. It never truncates a wait in flight and never
+/// touches `hw_wait_budget()` or `BOT_BUDGET_SCALE_FIRST` — a real device can legitimately stall
+/// 1-4 s on a write and shortening that would turn a slow-but-healthy stick into a false failure.
+/// It refuses to START another one in the same pass. Ten seconds is chosen against the measurement
+/// it has to make impossible: it is just over one first-attempt budget (~8.3 s on Pi 4), so a pass
+/// can always finish the one expensive thing it began, and it is 2-4x under every window above. And
+/// it applies ONLY to an identity with an account — a device nothing has gone wrong with is never
+/// subject to it, which matters because a healthy boot's ENTIRE BOT time is ~5 s (`sum=304556240`
+/// in the same capture), half this bound.
+const BOT_PARK_PASS_MS: u64 = 10_000;
+/// THE DESKTOP THROTTLE (R24 boot6). Hard ceiling, in milliseconds, on the pump wall-clock ONE
+/// main-loop pass may spend inside BOT waits — summed across every slot, and unlike
+/// `BOT_PARK_PASS_MS` it applies to a device with NO account, which is the whole reason it exists.
+///
+/// boot6 measured what the account-gated bound above cannot reach: 84 pump TIMEOUTs at the FULL
+/// `budget=450000000`, each one paid on the desktop's own thread (`main.rs` -> `service_storage`),
+/// with the vug running at wf=1-2 against PA42's 25-41 on the same build. The first wedged attempt
+/// on a device the ledger has never heard of costs a full first-attempt budget, and boot6's log
+/// shows a pass paying several of them back to back.
+///
+/// Two seconds, enforced in two places that together make the bound total:
+///   * `bot_transfer_body`'s entry declines a transfer once the pass is over budget — no CBW, no
+///     wait, return to the desktop loop, paint the frame, resume next pass.
+///   * `pump_until_bot_done` `min`s the pass REMAINDER into its budget for an identity that already
+///     has an account, so the second wedged wait of a pass is short rather than merely refused
+///     afterwards.
+///
+/// It never shortens the first wait of a pass for a device with no history: `hw_wait_budget()` and
+/// `BOT_BUDGET_SCALE_FIRST` are metal-earned and a slow-but-healthy stick must keep them. The worst
+/// case is therefore ONE first-attempt budget per pass, decaying to `BOT_PARK_DEAD_DIV` of it as
+/// soon as the dead-ring streak opens the account — and then to nothing, at PARKED.
+const BOT_PARK_PASS_PUMP_MS: u64 = 2_000;
+
+/// Devices parked this boot. Zero on a clean boot, so any non-zero reading is itself the finding.
+pub static BOT_PARK_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Transfers refused up front by the park gate — the work the ladder did NOT do.
+pub static BOT_PARK_REFUSED: AtomicU64 = AtomicU64::new(0);
+/// Transfers declined because the identity was inside its escalating back-off window.
+pub static BOT_PARK_BACKOFF_REFUSED: AtomicU64 = AtomicU64::new(0);
+/// Ladders torn down because the slot they were running on was disposed mid-flight (disconnect).
+pub static BOT_PARK_ABORTS: AtomicU64 = AtomicU64::new(0);
+/// Pump waits whose budget was cut by the dead-ring cap.
+pub static BOT_PARK_CAPPED: AtomicU64 = AtomicU64::new(0);
+/// BOTLATCH M2 (finding 5). Dead-ring parks that spent their ONE automatic re-probe. Each one is a
+/// device that was given a second chance without an operator; read against `parked=` it says how
+/// many of this boot's parks were provisional.
+pub static BOT_PARK_REPROBES: AtomicU64 = AtomicU64::new(0);
+/// BOTLATCH M2 (finding 4). Dead-ring accounts zeroed by a COMPLETED transfer. Non-zero says the
+/// verdict counter is being forgiven by the only thing allowed to forgive it — read against
+/// `parked=`: a boot with many forgivenesses and no park is a device with occasional idle waits,
+/// which before this fix was a device on its way to a permanent park.
+pub static BOT_PARK_DEAD_FORGIVEN: AtomicU64 = AtomicU64::new(0);
+/// Ladder entries deferred to a later main-loop pass by the per-pass cap (the cooperative yield).
+pub static BOT_PARK_YIELDS: AtomicU64 = AtomicU64::new(0);
+/// Transfers declined because this main-loop pass had already spent `BOT_PARK_PASS_MS` on the
+/// identity. Directly the boot3 core-eater's counter: every hit is a 0.3-8 s wait that did NOT
+/// happen inside a pass that had already run long.
+pub static BOT_PARK_PASS_REFUSED: AtomicU64 = AtomicU64::new(0);
+/// Transfers declined because this main-loop pass had already spent `BOT_PARK_PASS_PUMP_MS` inside
+/// BOT pump waits, regardless of whether the device has an account. The desktop throttle's counter.
+pub static BOT_PARK_PUMP_REFUSED: AtomicU64 = AtomicU64::new(0);
+/// Ledger accounts opened by an identity whose VID:PID this driver never learned — a hub-downstream
+/// device, which is exactly the reader R24 boot5/boot6 could not park. Non-zero is not a fault; it
+/// is the instrument saying the keying fix is load-bearing on this hardware.
+pub static BOT_PARK_ANON: AtomicU64 = AtomicU64::new(0);
+/// Set for the duration of `bot_park_selftest`, which exercises the ledger's pure functions over
+/// local tables that are not devices. See `bot_park_opened`.
+static BOT_PARK_QUIET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The physical identity of a USB device, as far as this driver can name one WITHOUT a slot id.
+///
+/// **The key is the ATTACHMENT POINT: root port + route string, and nothing else.** The xHCI route
+/// string does not encode the root port, so both are needed to separate two hubs on different root
+/// ports; together they are the physical place the device is plugged into, and a re-enumeration —
+/// including one the rescue ladder's own port cycle causes — reproduces both exactly.
+///
+/// VID:PID is carried, printed and refreshed, but it is deliberately NOT part of the key, and R24
+/// boot6 is why. This driver records `slots[].vid/pid` from ONE place: the intercepted
+/// device-descriptor event on the root enumeration path. A HUB-DOWNSTREAM device never reaches it —
+/// boot6's whole capture contains exactly one `>>> VENDOR ID` banner, for the 2109:3431 hub itself,
+/// and none for the wedged 'Generic USB SD Reader' hanging off it. With VID:PID in the key,
+/// `bot_ident`'s "an unnamed device is charged nothing" guard turned the ENTIRE ledger off for that
+/// reader: no account, no cycles, no dead-ring streak, no ladder count, no verdict — 84 pump
+/// TIMEOUTs, every one at the full uncut budget, and `BOT: PARKED` never printed. The account must
+/// be keyed on what the driver can always observe, not on what it happens to have parsed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct BotDevIdent {
+    pub port: u8,
+    pub route: u32,
+    pub vid: u16,
+    pub pid: u16,
+}
+
+impl BotDevIdent {
+    /// Same physical attachment point — the ledger's equality. See the type doc: VID:PID is
+    /// descriptive, not identifying, because on this hardware it is frequently unknowable.
+    fn same_place(&self, o: &BotDevIdent) -> bool {
+        self.port == o.port && self.route == o.route
+    }
+
+    /// This driver never learned what the device is, only where it is.
+    fn anonymous(&self) -> bool {
+        self.vid == 0 && self.pid == 0
+    }
+}
+
+/// One device identity's standing account with the retry ladder.
+#[derive(Clone, Copy)]
+pub struct BotDevLedger {
+    pub ident: BotDevIdent,
+    /// Entry in use. A cleared entry is a device this driver has no verdict on.
+    pub used: bool,
+    /// Enumerations of this identity seen since the account was opened.
+    pub gens: u32,
+    /// Ladder entries charged across all of them.
+    pub ladders: u32,
+    /// Surrenders earned across all of them.
+    pub surrenders: u32,
+    /// Pump cycles charged to this identity.
+    pub cycles: u64,
+    /// Consecutive dead-ring timeouts (see `BOT_PARK_DEAD_STREAK`). Arms the BUDGET CUT, and is
+    /// reset by any live wait — including one made live by another device's traffic on the shared
+    /// event ring.
+    pub dead_streak: u32,
+    /// BOTLATCH: dead-ring timeouts charged to this identity across its whole life, never reset.
+    /// Carries the PARK verdict (see `BOT_PARK_DEAD_MAX`); `dead_streak` cannot, because what
+    /// resets it is not a fact about this device.
+    pub dead_total: u32,
+    /// PARKED: no transfer, no bring-up, no rung. Cleared only by a real re-enumeration event —
+    /// a disconnect this driver did not itself cause (see `bot_park_note_disconnect`) — or, once
+    /// per account, by the dead-ring re-probe below.
+    pub parked: bool,
+    /// `now_cycles()` before which the next ladder entry for this identity is declined.
+    pub backoff_until: u64,
+    /// BOTLATCH M2 (finding 5). `now_cycles()` at or after which a DEAD-RING park unparks itself
+    /// once, for one probe. Zero = no re-probe pending (never armed, already spent, or the park was
+    /// not a dead-ring park — the other three clauses are the ladder's own verdicts on evidence a
+    /// cooldown cannot change). Not a timer: nothing polls it, the gate reads it.
+    pub reprobe_at: u64,
+    /// BOTLATCH M2 (finding 5). This identity has SPENT its one re-probe. Sticky for the life of the
+    /// account, so a second park is permanent; cleared only with the whole entry, by an operator
+    /// replug. This is what keeps the re-probe from becoming an unbounded retry loop.
+    pub reprobed: bool,
+}
+
+impl BotDevLedger {
+    const EMPTY: BotDevLedger = BotDevLedger {
+        ident: BotDevIdent { port: 0, route: 0, vid: 0, pid: 0 },
+        used: false, gens: 0, ladders: 0, surrenders: 0, cycles: 0,
+        dead_streak: 0, dead_total: 0, parked: false, backoff_until: 0,
+        reprobe_at: 0, reprobed: false,
+    };
+
+    /// The park verdict, as a pure function of the account and the timebase. `None` = keep going;
+    /// `Some(why)` = park, and `why` is the clause that fired (it goes on the census line verbatim,
+    /// so a capture says WHICH bound a device hit rather than only that it hit one).
+    ///
+    /// Pure and total: no `self`-mutation, no hardware, no allocation. That is what lets
+    /// `bot_park_selftest` exercise the whole discipline on a QEMU boot where no wedge exists.
+    fn verdict(&self, per_ms: u64) -> Option<&'static str> {
+        if self.surrenders >= BOT_PARK_SURRENDER_MAX { return Some("surrenders"); }
+        if self.ladders >= BOT_PARK_LADDER_MAX { return Some("ladders"); }
+        if self.cycles >= per_ms.saturating_mul(BOT_PARK_CYCLE_MAX_MS) { return Some("cycles"); }
+        // BOTLATCH: the clause that counts what the BUDGET CUT counts. Placed last because the
+        // three above are the ladder's own verdicts and should be named first when several are
+        // true at once; reachable in practice precisely when they are not, because the cut this
+        // signature arms is what makes the wall-clock clause above recede.
+        if self.dead_total >= BOT_PARK_DEAD_MAX { return Some("dead-ring"); }
+        None
+    }
+
+    /// The escalating back-off deadline for this identity's NEXT ladder entry, in cycles from `now`.
+    /// Doubles per entry, capped. Not spun — see `BOT_PARK_BACKOFF_MS`.
+    fn backoff_cycles(&self, per_ms: u64) -> u64 {
+        let ms = (BOT_PARK_BACKOFF_MS << self.ladders.min(5)).min(BOT_PARK_BACKOFF_MAX_MS);
+        per_ms.saturating_mul(ms)
+    }
+
+    /// BOTLATCH M2 (finding 4). A transfer COMPLETED for this identity — its own transfer event
+    /// landed on the ring, which is the one observation that contradicts "this ring is dead".
+    /// Zeroes the verdict counter and cancels any pending re-probe. Returns whether anything was
+    /// actually forgiven, so the caller can count it without counting every healthy transfer.
+    ///
+    /// Deliberately narrow. It clears the DEAD-RING account and nothing else: `ladders`,
+    /// `surrenders` and `cycles` are the ladder's records of work it had to do to get this
+    /// completion, and a device that needs a rescue rung per transfer must still reach its bound.
+    /// `reprobed` is likewise untouched — one re-probe per account, whatever happens in between.
+    fn note_success(&mut self) -> bool {
+        let forgave = self.dead_total != 0;
+        self.dead_total = 0;
+        self.reprobe_at = 0;
+        forgave
+    }
+
+    /// BOTLATCH M2 (finding 5). Arm the ONE automatic re-probe on a dead-ring park. A no-op if this
+    /// account has already spent it — that is what makes the second park permanent.
+    fn arm_reprobe(&mut self, now: u64, per_ms: u64) -> bool {
+        if self.reprobed {
+            return false;
+        }
+        self.reprobe_at = now.wrapping_add(per_ms.saturating_mul(BOT_PARK_REPROBE_MS));
+        true
+    }
+
+    /// Is this parked account due its re-probe now? Pure; wrap-safe (the deadline is compared as a
+    /// signed difference, exactly as the back-off is).
+    fn reprobe_due(&self, now: u64) -> bool {
+        self.parked
+            && !self.reprobed
+            && self.reprobe_at != 0
+            && (now.wrapping_sub(self.reprobe_at) as i64) >= 0
+    }
+
+    /// Spend the re-probe: unpark, flag, and hand the device back its dead-ring allowance. NOT a
+    /// general amnesty — `dead_streak` survives on purpose, so the probe's wait is charged at the
+    /// cut budget (~0.3 s) rather than a fresh first-attempt one, and the other three clauses are
+    /// left exactly as they were, so an account that is also at its ladder or surrender bound
+    /// re-parks on the very next `verdict()` — permanently, since `reprobed` is now set.
+    fn take_reprobe(&mut self) {
+        self.parked = false;
+        self.reprobed = true;
+        self.reprobe_at = 0;
+        self.dead_total = 0;
+    }
+}
+
+/// Find an identity's account. Slot id is not a key and never has been — that is the bug this whole
+/// section exists to close.
+fn bot_park_find(tab: &[BotDevLedger; BOT_PARK_SLOTS], id: BotDevIdent) -> Option<usize> {
+    tab.iter().position(|e| e.used && e.ident.same_place(&id))
+}
+
+/// Find-or-open an account. When the table is full, reuse an entry that is NOT parked, preferring
+/// the one with the least history; a PARKED entry is never evicted to make room for a newcomer,
+/// because evicting one is exactly the "and now it may retry forever again" bug in another costume.
+/// Returns `None` only when every entry is parked — in which case the caller keeps its old
+/// behaviour rather than silently losing a verdict.
+fn bot_park_open(tab: &mut [BotDevLedger; BOT_PARK_SLOTS], id: BotDevIdent) -> Option<usize> {
+    if let Some(i) = bot_park_find(tab, id) {
+        // LATE NAMING. The key is the place, so an account opened before the descriptors were
+        // parsed is the SAME account afterwards — this only upgrades what the census can print.
+        // Refusing to re-key here is the point: an identity that re-keys mid-life is an identity
+        // that hands the device a fresh allowance, which is the class of bug this section exists
+        // to close.
+        if tab[i].ident.anonymous() && !id.anonymous() {
+            tab[i].ident.vid = id.vid;
+            tab[i].ident.pid = id.pid;
+        }
+        return Some(i);
+    }
+    if let Some(i) = tab.iter().position(|e| !e.used) {
+        bot_park_opened(id);
+        tab[i] = BotDevLedger { ident: id, used: true, ..BotDevLedger::EMPTY };
+        return Some(i);
+    }
+    bot_park_opened(id);
+    let victim = tab.iter().enumerate()
+        .filter(|(_, e)| !e.parked)
+        .min_by_key(|(_, e)| (e.ladders, e.gens))
+        .map(|(i, _)| i)?;
+    tab[victim] = BotDevLedger { ident: id, used: true, ..BotDevLedger::EMPTY };
+    Some(victim)
+}
+
+/// One line the first time an identity opens an account. It is the ledger saying "I can see this
+/// device" — the fact R24 boot5/boot6 could only be established by its absence, since a ledger that
+/// never opens an account and a ledger that is switched off produce byte-identical logs. `named=no`
+/// is the hub-downstream case the keying fix exists for, and is normal, not a fault.
+fn bot_park_opened(id: BotDevIdent) {
+    // `bot_park_selftest` drives these same pure functions over its own local tables. Its accounts
+    // are arithmetic, not devices: they must not print a device line and must not be counted.
+    if BOT_PARK_QUIET.load(Ordering::Relaxed) {
+        return;
+    }
+    if id.anonymous() { BOT_PARK_ANON.fetch_add(1, Ordering::Relaxed); }
+    serial_println!(
+        ":: BOT: park account-open port={} route={:#x} vid={:04x} pid={:04x} named={} anon_total={} — this device now has a standing account with the retry ladder; every ladder entry, surrender and pump wait is charged to it ::",
+        id.port, id.route, id.vid, id.pid,
+        if id.anonymous() { "no" } else { "yes" },
+        BOT_PARK_ANON.load(Ordering::Relaxed));
+}
+
+/// Close an identity's account — the clean slate. Called ONLY for a disconnect this driver did not
+/// itself cause, i.e. an operator replug. See `bot_park_note_disconnect` for why that distinction is
+/// the whole of the unpark rule.
+fn bot_park_forget(tab: &mut [BotDevLedger; BOT_PARK_SLOTS], id: BotDevIdent) -> bool {
+    match bot_park_find(tab, id) {
+        Some(i) => { tab[i] = BotDevLedger::EMPTY; true }
+        None => false,
+    }
+}
+
+/// BOT-PARK's own fixture, and the reason the ledger's decision logic is written as pure functions
+/// of an account rather than as branches sprinkled through the ladder.
+///
+/// **Why a fixture at all, and why this shape.** The condition this arc fixes cannot be produced in
+/// QEMU: `usb-storage` never wedges, never re-manufactures a CSW, never stops answering — the metal
+/// capture is the only place the cycle exists. A fixture that needed the wedge would therefore be
+/// permanently vacuous, which is worse than no fixture. What CAN be exercised on every boot is the
+/// discipline itself: the account arithmetic, and — the part that actually failed on metal — the
+/// keying. Every assertion below is a property the [pi0-b1b2] capture violated.
+///
+/// Runs on every boot of both arches, needs no controller (it is called before/independently of
+/// xHCI bring-up, and passes under `skip_xhci`), allocates nothing, and touches no hardware.
+pub fn bot_park_selftest() {
+    BOT_PARK_QUIET.store(true, Ordering::Relaxed);
+    let per_ms: u64 = 1_000; // a nominal timebase; the assertions are about arithmetic, not clocks
+    let a = BotDevIdent { port: 1, route: 0x1, vid: 0x058f, pid: 0x6362 };
+    let b = BotDevIdent { port: 1, route: 0x2, vid: 0x058f, pid: 0x6362 };
+    let mut tab = [BotDevLedger::EMPTY; BOT_PARK_SLOTS];
+
+    // 1. LADDER BUDGET. A fresh identity is open; `BOT_PARK_LADDER_MAX` entries close it.
+    let i = bot_park_open(&mut tab, a).unwrap();
+    let mut ladder_ok = tab[i].verdict(per_ms).is_none();
+    for _ in 0..BOT_PARK_LADDER_MAX {
+        tab[i].ladders += 1;
+    }
+    ladder_ok &= tab[i].verdict(per_ms) == Some("ladders");
+
+    // 2. THE KEYING — the assertion the metal cycle is made of. The same physical device coming
+    //    back as a DIFFERENT slot id must find the SAME account. Slot ids are not in the key, so
+    //    this is really the claim that a re-enumeration reproduces port/route/VID:PID exactly, and
+    //    that `bot_park_open` therefore returns the existing entry rather than a fresh one.
+    tab[i].parked = true;
+    let reenum_ok = bot_park_open(&mut tab, a) == Some(i) && tab[i].parked && tab[i].ladders != 0;
+
+    // 3. SURRENDER BUDGET, on a second identity so 1's state cannot carry.
+    let j = bot_park_open(&mut tab, b).unwrap();
+    tab[j].surrenders = BOT_PARK_SURRENDER_MAX;
+    let surrender_ok = tab[j].verdict(per_ms) == Some("surrenders");
+
+    // 4. CYCLE BUDGET, independent of both counts.
+    let mut e = BotDevLedger { ident: b, used: true, ..BotDevLedger::EMPTY };
+    let cycles_ok = e.verdict(per_ms).is_none() && {
+        e.cycles = per_ms * BOT_PARK_CYCLE_MAX_MS;
+        e.verdict(per_ms) == Some("cycles")
+    };
+
+    // 4b. THE BOTLATCH CLAUSE. Dead-ring timeouts must park an identity on their own, and must do
+    //     so CUMULATIVELY — the property boot5's trace needs, where the reader's dead runs are
+    //     broken up by waits another device's traffic made live. So: charge `BOT_PARK_DEAD_MAX`
+    //     dead waits with the consecutive streak reset in the middle, and require the verdict
+    //     anyway. Also assert the clause is not vacuous (one short of the bound is not a park) and
+    //     that the budget cut — the thing that used to be the streak's ONLY consequence — is armed
+    //     by the streak and not by the total, so neither counter has quietly become the other.
+    let mut d = BotDevLedger { ident: b, used: true, ..BotDevLedger::EMPTY };
+    d.dead_total = BOT_PARK_DEAD_MAX - 1;
+    let dead_ok = d.verdict(per_ms).is_none() && {
+        d.dead_total += 1;
+        d.dead_streak = 0; // a live wait just refunded the streak; the verdict must not be refunded
+        d.verdict(per_ms) == Some("dead-ring")
+    } && BOT_PARK_DEAD_MAX > BOT_PARK_DEAD_STREAK;
+
+    // 4c. BOTLATCH M2, FINDING 4 — THE FORGIVENESS RULE. A COMPLETED transfer must zero the
+    //     dead-ring verdict counter, and must zero NOTHING ELSE. The first half is the fix (before
+    //     it, only an operator replug cleared `dead_total`, so eight scattered idle waits across an
+    //     uptime parked a healthy device permanently); the second half is the guard that keeps the
+    //     fix from becoming a general amnesty — `ladders`/`surrenders`/`cycles` are records of work
+    //     the ladder DID, and a completion does not undo them. Asserted against an account sitting
+    //     exactly on the dead-ring bound, so the leg fails if the reset is off by one or absent.
+    let mut s = BotDevLedger { ident: b, used: true, ..BotDevLedger::EMPTY };
+    s.dead_total = BOT_PARK_DEAD_MAX;
+    s.ladders = BOT_PARK_LADDER_MAX - 1;
+    s.surrenders = BOT_PARK_SURRENDER_MAX - 1;
+    s.cycles = per_ms * BOT_PARK_CYCLE_MAX_MS - 1;
+    let success_ok = s.verdict(per_ms) == Some("dead-ring")
+        && s.note_success()                      // it forgave something, and says so
+        && s.dead_total == 0
+        && s.verdict(per_ms).is_none()           // the park verdict is gone with it
+        && s.ladders == BOT_PARK_LADDER_MAX - 1  // and nothing else moved
+        && s.surrenders == BOT_PARK_SURRENDER_MAX - 1
+        && s.cycles == per_ms * BOT_PARK_CYCLE_MAX_MS - 1
+        && !s.note_success();                    // a second completion forgives nothing new
+
+    // 4d. BOTLATCH M2, FINDING 5 — ONE RE-PROBE, THEN PERMANENT. A dead ring and a NAKing-but-
+    //     healthy device are indistinguishable on the event ring, so a dead-ring park must be
+    //     provisional exactly once. The sequence asserted here is the whole design: arm on the
+    //     dead-ring park; NOT due before the cooldown; due after it; the probe unparks, spends the
+    //     flag, restores the dead-ring allowance and KEEPS `dead_streak` (so the probe is charged
+    //     at the cut budget, not a fresh one); a second dead-ring park cannot re-arm and is never
+    //     due again. `now` starts well past zero so the wrap-safe comparison is exercised on real
+    //     differences rather than on a degenerate zero deadline.
+    let now0 = per_ms * 1_000;
+    let mut r = BotDevLedger { ident: b, used: true, ..BotDevLedger::EMPTY };
+    r.dead_total = BOT_PARK_DEAD_MAX;
+    r.dead_streak = BOT_PARK_DEAD_STREAK;
+    r.parked = true;
+    let reprobe_ok = r.arm_reprobe(now0, per_ms)
+        && !r.reprobe_due(now0)                                   // not due immediately
+        && !r.reprobe_due(now0 + per_ms * (BOT_PARK_REPROBE_MS - 1))
+        && r.reprobe_due(now0 + per_ms * BOT_PARK_REPROBE_MS)     // due exactly at the deadline
+        && {
+            r.take_reprobe();
+            !r.parked && r.reprobed && r.reprobe_at == 0
+                && r.dead_total == 0 && r.verdict(per_ms).is_none()
+                && r.dead_streak == BOT_PARK_DEAD_STREAK // the budget cut survives the probe
+        }
+        && {
+            // it dead-rings again: park number two, which must be permanent.
+            r.dead_total = BOT_PARK_DEAD_MAX;
+            r.parked = true;
+            !r.arm_reprobe(now0 + per_ms * BOT_PARK_REPROBE_MS, per_ms)
+                && r.reprobe_at == 0
+                && !r.reprobe_due(now0 + per_ms * BOT_PARK_REPROBE_MS * 100)
+                && r.verdict(per_ms) == Some("dead-ring")
+        }
+        // and the clean slate really is clean: a replug closes the account, so the identity that
+        // comes back is re-probable again (leg 6 owns `bot_park_forget`; this pins the field).
+        && !BotDevLedger::EMPTY.reprobed;
+
+    // 5. BACK-OFF is escalating and capped — it must grow with the ladder count and must never
+    //    exceed the cap, or "escalating back-off" is a comment rather than a behaviour.
+    let (b0, b1, b9) = (
+        BotDevLedger { ladders: 0, ..BotDevLedger::EMPTY }.backoff_cycles(per_ms),
+        BotDevLedger { ladders: 1, ..BotDevLedger::EMPTY }.backoff_cycles(per_ms),
+        BotDevLedger { ladders: 9, ..BotDevLedger::EMPTY }.backoff_cycles(per_ms));
+    let backoff_ok = b1 > b0 && b9 <= per_ms * BOT_PARK_BACKOFF_MAX_MS && b9 >= b1;
+
+    // 6. THE UNPARK RULE's arithmetic half: closing an account is what restores the allowance, and
+    //    nothing else does. (Which disconnects are allowed to close one is decided by
+    //    `bot_park_note_disconnect`, against the self-cycle window.)
+    let unplug_ok = bot_park_forget(&mut tab, a)
+        && bot_park_find(&tab, a).is_none()
+        && bot_park_open(&mut tab, a).map(|k| !tab[k].parked && tab[k].ladders == 0) == Some(true);
+
+    // 7. TABLE PRESSURE. Fill every entry, park one, then demand a newcomer: the parked verdict
+    //    must survive. An eviction policy that can drop a parked device to make room is the
+    //    original bug wearing a different hat.
+    let mut full = [BotDevLedger::EMPTY; BOT_PARK_SLOTS];
+    for k in 0..BOT_PARK_SLOTS {
+        let id = BotDevIdent { port: 2, route: k as u32, vid: 0x1234, pid: 0x5678 };
+        let idx = bot_park_open(&mut full, id).unwrap();
+        full[idx].ladders = 1 + k as u32;
+    }
+    let victim_id = BotDevIdent { port: 2, route: 3, vid: 0x1234, pid: 0x5678 };
+    let victim = bot_park_find(&full, victim_id).unwrap();
+    full[victim].parked = true;
+    let newcomer = BotDevIdent { port: 9, route: 0, vid: 0xdead, pid: 0xbeef };
+    let _ = bot_park_open(&mut full, newcomer);
+    let pressure_ok = bot_park_find(&full, victim_id).map(|k| full[k].parked) == Some(true);
+
+    // 8. THE R24 CLAUSE — PLACE KEYING. The account belongs to the ATTACHMENT POINT. An identity
+    //    whose VID:PID this driver never learned (0000:0000 — every hub-downstream device, which is
+    //    what boot5/boot6's wedged reader was) must find, and be held to, the SAME account as the
+    //    named one at that port and route; and learning the name later must UPGRADE the entry in
+    //    place, never open a second one. This is the property whose absence made the entire ledger
+    //    a no-op on metal: `bot_ident` returned `None`, so 60 ladder entries were charged nowhere.
+    let mut plc = [BotDevLedger::EMPTY; BOT_PARK_SLOTS];
+    let anon = BotDevIdent { port: 3, route: 0x21, vid: 0, pid: 0 };
+    let named = BotDevIdent { port: 3, route: 0x21, vid: 0x058f, pid: 0x6362 };
+    let elsewhere = BotDevIdent { port: 3, route: 0x22, vid: 0, pid: 0 };
+    let pi = bot_park_open(&mut plc, anon).unwrap();
+    plc[pi].ladders = BOT_PARK_LADDER_MAX;
+    let place_ok =
+        // the unnamed device is nameable at all — the guard that used to reject it is gone
+        bot_park_find(&plc, anon) == Some(pi)
+        // and its account is the named device's account, in both directions
+        && bot_park_find(&plc, named) == Some(pi)
+        && bot_park_open(&mut plc, named) == Some(pi)
+        // learning the VID:PID upgrades the entry rather than re-keying it (a re-key would hand
+        // the device a fresh allowance — the escape hatch this whole section closes)
+        && plc[pi].ident.vid == 0x058f && plc[pi].ident.pid == 0x6362
+        && plc[pi].ladders == BOT_PARK_LADDER_MAX
+        && plc[pi].verdict(per_ms) == Some("ladders")
+        // a DIFFERENT place is still a different device, name or no name
+        && bot_park_find(&plc, elsewhere).is_none();
+
+    BOT_PARK_QUIET.store(false, Ordering::Relaxed);
+    let pass = ladder_ok && reenum_ok && surrender_ok && cycles_ok && dead_ok && success_ok
+        && reprobe_ok && backoff_ok && unplug_ok && pressure_ok && place_ok;
+    // BOTLATCH M2: `success=` and `reprobe=` APPENDED after `dead=`, and `reprobe_ms=` after
+    // `dead_max=` — every pre-existing field keeps its name, so the spec's
+    // `REQUIRE :: BOT-PARK: selftest .*-> PASS ::` (and its FAIL FORBID) match unchanged, and the
+    // line stays diffable against captures taken before this arc. The conjunction above is what the
+    // verdict reports: a new leg can fail the whole fixture on its own.
+    serial_println!(
+        ":: BOT-PARK: selftest ladder={} reenum={} surrender={} cycles={} dead={} success={} reprobe={} backoff={} unplug={} pressure={} place={} ladder_max={} surrender_max={} cycle_max_ms={} dead_max={} reprobe_ms={} pass_pump_ms={} slots={} -> {} ::",
+        ladder_ok, reenum_ok, surrender_ok, cycles_ok, dead_ok, success_ok, reprobe_ok, backoff_ok,
+        unplug_ok, pressure_ok, place_ok,
+        BOT_PARK_LADDER_MAX, BOT_PARK_SURRENDER_MAX, BOT_PARK_CYCLE_MAX_MS, BOT_PARK_DEAD_MAX,
+        BOT_PARK_REPROBE_MS, BOT_PARK_PASS_PUMP_MS,
+        BOT_PARK_SLOTS,
+        if pass { "PASS" } else { "FAIL" });
+}
 
 // --- BOT-PHASE (2026-07-29): the phase-desync witnesses ---
 //
@@ -1949,10 +2715,13 @@ pub struct DeviceSlot {
     /// Count of REAL (non-dup) pointer reports serviced since arming — drives the bounded serial
     /// mouse-witness (first report + every Nth), never one-line-per-report.
     pub mouse_report_count: u32,
-    /// GUI-CLICK-2: previous pointer-button bitmask for this slot, so the decode emits a
-    /// `pal::Event::Button` on the button-DOWN edge only (any bit going 0→1) and ignores the
-    /// matching release. Mirrors the EHCI press-edge idiom (ehci/mod.rs) and `CLICK1_PREV_MASK`.
-    /// 0 = no button held. Shared xHCI code: x86 xHCI mice track this identically.
+    /// GUI-CLICK-2 (== hw-jetson's CLICK-1, unified at the 2026-08-18 sync): previous
+    /// pointer-button bitmask for this slot, so the decode emits a `pal::Event::Button` on the
+    /// button-DOWN edge only (any bit going 0→1) and ignores the matching release. Byte 0 of every
+    /// HID pointer report (boot mouse AND usb-tablet) carries the same button bits, so this is
+    /// shared by both decode paths. Mirrors the EHCI press-edge idiom (ehci/mod.rs) and
+    /// `CLICK1_PREV_MASK`. 0 = no button held. Shared xHCI code: x86 xHCI mice track this
+    /// identically.
     pub mouse_prev_buttons: u8,
 
     pub is_keyboard: bool,
@@ -2020,6 +2789,18 @@ pub struct DeviceSlot {
     /// `reset_soft_state` so a recycled slot id cannot inherit a dead device's topology.
     pub route_string: u32,
     pub route_depth: u8,
+
+    /// [piusb41] The IMMEDIATE parent hub of a downstream device: its slot id, and the hub's
+    /// downstream PORT NUMBER (1-based, as a hub-class `wIndex`) this device hangs off. Zero for a
+    /// root device, and zero is unambiguous — slot 0 is never a device and hub ports are 1-based.
+    ///
+    /// `route_string` alone cannot answer "which hub, which port": it is a path of 4-bit nibbles
+    /// with no slot ids in it, and the tail nibble is clamped at 15 for a hub with more than 15
+    /// ports. The BOT rescue ladder's hub-port power-cycle rung needs the pair EXACTLY (it drives a
+    /// class request at one named port), so it is recorded at enumeration rather than reconstructed.
+    /// Cleared in `reset_soft_state` so a recycled slot id cannot inherit a dead device's parent.
+    pub parent_hub_slot: u8,
+    pub parent_hub_port: u8,
 
     // Dedicated DMA buffers for Bulk-Only Transport (mass storage). Kept separate from
     // descriptor_buffer / data_buffer so a CBW can't clobber descriptors or HID reports.
@@ -2107,6 +2888,8 @@ impl DeviceSlot {
             is_downstream: false,
             route_string: 0,
             route_depth: 0,
+            parent_hub_slot: 0,
+            parent_hub_port: 0,
             cbw_buffer: None,
             csw_buffer: None,
             scsi_data_buffer: None,
@@ -2190,6 +2973,8 @@ impl DeviceSlot {
         self.is_downstream = false;
         self.route_string = 0;
         self.route_depth = 0;
+        self.parent_hub_slot = 0;
+        self.parent_hub_port = 0;
         self.bulk_in_ep = 0;
         self.bulk_out_ep = 0;
         self.storage_intf = 0;
@@ -2227,12 +3012,24 @@ pub struct XhciController {
 
     pub configuring_slot: u8,
     pub event_ring_phys_base: u64,
+    /// Heap PA of the Event Ring Segment Table (ERST) allocated in `init_interrupter`. Kept for the
+    /// VUGRAS candidate-PA dump so both event-ring and ERST bases are witnessed as heap-resident.
+    pub erst_table_phys: u64,
 
     /// Slot id of the enumerated mass-storage device (0 = none).
     pub storage_slot: u8,
     /// Set once the storage bulk endpoints are configured; the main loop performs the
     /// (synchronous) SCSI bring-up + first read in a safe, non-event context.
     pub storage_pending_bringup: bool,
+    /// BOTSEQ: armed at the END of the bring-up pass in place of running the PIUSB-36/37/38
+    /// matrices + write selftest inline; `service_storage`'s diag branch consumes it on a later
+    /// pass. See the arming site for the BOTCLAIM conviction this sequencing answers.
+    storage_diag_pending: bool,
+    /// BOTSEQ: set by the first block-layer `storage_read10`/`storage_write10` issued while
+    /// `storage_diag_pending` is armed — the proof the mount attempt (piusb27/probe_once, which
+    /// runs in the pass tail after the bring-up armed us) has already reached the wire, so the
+    /// deferred diagnostics can no longer run ahead of the mount verdict.
+    storage_postpublish_io: bool,
 
     // --- U2.5 FTDI USB-serial console (root-port only) ---
     /// Slot whose Configure-Endpoint we issued for the FTDI bulk endpoints (0 = none). Kept
@@ -2289,6 +3086,57 @@ pub struct XhciController {
     /// at all times except inside an escalation retry, where it is briefly
     /// `BOT_BUDGET_SCALE_ESCALATION` and restored immediately after.
     bot_budget_scale: u64,
+    /// [piusb41] PA36: set by `scsi_read_capacity10` when the geometry clamp REJECTS a reply
+    /// (phase-shifted/corrupt — a CSW tail where capacity bytes belong), consumed by
+    /// `bring_up_storage`'s error arm. `TransferError(u8)` carries completion codes and cannot
+    /// name this distinctly, and the port-cycle decision must wait for the post-wedge INQUIRY
+    /// control (the photograph must precede any pipe reset), so the clamp site records the fact
+    /// here instead of acting on it.
+    bot_geom_reject: bool,
+    /// [piusb41] S1Z: the most recent `bot_transfer_once` attempt ended in a zero-data CSW FOLD.
+    /// Read by `bot_rescue_clear` so a fold's own `Ok` return does not end the fold streak it
+    /// just joined (unconditional clearing made the PA34 two-fold trigger unfireable). Reset at
+    /// the top of every attempt and at bring-up start.
+    bot_txn_folded: bool,
+    /// [piusb41] S1Z: at least one fold has happened on the CURRENT bring-up. The widened
+    /// port-cycle trigger (fold + geometry-clamp reject = stuck reader) reads this latch instead
+    /// of the live streak, because the garbage-carrying READ CAPACITY completes as a transaction
+    /// — legitimately ending the streak — before its content ever reaches the clamp. Set at any
+    /// fold; cleared at bring-up start and when the trigger consumes it.
+    bot_fold_seen: bool,
+
+    /// BOT-PARK: the per-DEVICE-identity ledger. See the `BOT-PARK` block for the metal capture
+    /// that convicted a slot-id-keyed floor.
+    bot_park: [BotDevLedger; BOT_PARK_SLOTS],
+    /// BOT-PARK: the slot a rescue ladder is currently walking, 0 when none. Read by the disposal
+    /// paths so a disconnect can tear the ladder down instead of letting it finish its rungs
+    /// against a device that has physically left.
+    bot_ladder_slot: u8,
+    /// BOT-PARK: set by a disposal path when it disposes `bot_ladder_slot`. The ladder checks it
+    /// between rungs and before every retry and abandons immediately. Cleared at ladder entry.
+    bot_ladder_abort: bool,
+    /// BOT-PARK: ladder entries charged on the CURRENT main-loop pass. Reset by `service_storage`
+    /// and by the block layer's entry points; compared against `BOT_PARK_PASS_LADDERS`.
+    bot_pass_ladders: u32,
+    /// BOT-PARK: `now_cycles()` at the start of the current main-loop pass. The other half of
+    /// "bounded work per pass" — see `BOT_PARK_PASS_MS` and the boot3 per-pass measurement that
+    /// showed a ladder-count cap alone leaves 20-37 s passes reachable.
+    bot_pass_start: u64,
+    /// BOT-PARK / THE DESKTOP THROTTLE: pump cycles this main-loop pass has spent inside BOT waits,
+    /// summed across every slot and charged for every device, accounted or not. This is the counter
+    /// `BOT_PARK_PASS_PUMP_MS` bounds, and the reason it is separate from `bot_pass_start` is that
+    /// wall-clock-since-pass-start includes the desktop's own render time — the throttle must bound
+    /// what the DRIVER took from the frame, not how long the frame was.
+    bot_pass_pump: u64,
+    /// BOT-PARK: `now_cycles()` before which a disconnect on `bot_self_cycle_route` is attributed
+    /// to THIS DRIVER'S OWN port power-cycle rung rather than to an operator replug. The unpark
+    /// rule turns on exactly this distinction: the ladder's cure (rung b/b') produces a disconnect
+    /// and a re-enumeration that are otherwise indistinguishable from a physical replug, and
+    /// treating the ladder's own act as "the operator fixed it" is what made the metal cycle
+    /// infinite. Armed by `rescue_port_cycle` / `rescue_hub_port_cycle`.
+    bot_self_cycle_until: u64,
+    bot_self_cycle_port: u8,
+    bot_self_cycle_route: u32,
 
     /// In-flight synchronous EP0 control transfer (hub bring-up). See `Ep0Pending`.
     ep0_pending: Option<Ep0Pending>,
@@ -2444,8 +3292,11 @@ impl XhciController {
             ports_to_enumerate: Vec::new(),
             configuring_slot: 0,
             event_ring_phys_base: 0,
+            erst_table_phys: 0,
             storage_slot: 0,
             storage_pending_bringup: false,
+            storage_diag_pending: false,
+            storage_postpublish_io: false,
             ftdi_configuring_slot: 0,
             ftdi_slot: 0,
             ftdi_pending_bringup: false,
@@ -2462,6 +3313,18 @@ impl XhciController {
             bot_rescue_stage: 0,
             bot_surrendered_slot: 0,
             bot_budget_scale: BOT_BUDGET_SCALE_FIRST,
+            bot_geom_reject: false,
+            bot_txn_folded: false,
+            bot_fold_seen: false,
+            bot_park: [BotDevLedger::EMPTY; BOT_PARK_SLOTS],
+            bot_ladder_slot: 0,
+            bot_ladder_abort: false,
+            bot_pass_ladders: 0,
+            bot_pass_start: 0,
+            bot_pass_pump: 0,
+            bot_self_cycle_until: 0,
+            bot_self_cycle_port: 0,
+            bot_self_cycle_route: 0,
             ep0_pending: None,
             last_control_len: 0,
             cmd_pending: None,
@@ -2721,6 +3584,11 @@ impl XhciController {
     }
 
     pub fn poll_events(&mut self) -> bool {
+        // BOT-PARK: a new main-loop pass begins here. `poll_events` is the first thing the desktop
+        // loop calls on every iteration, so this is the honest boundary for "one pass" — and it
+        // covers the block layer's synchronous reads as well as the storage bring-up, both of which
+        // reach the ladder. See `BOT_PARK_PASS_LADDERS` and `BOT_PARK_PASS_MS`.
+        self.bot_pass_begin();
         let mut any = false;
         while self.drain_event_ring_once() {
             any = true;
@@ -3602,6 +4470,26 @@ impl XhciController {
                                                 }
                                             }
                                         }
+                                    } else if desc_data[1] == 0x01 {
+                                        // ORIN-P7: a DEVICE descriptor whose class we have no driver
+                                        // for (e.g. 0xE0 Wireless Controller — the AzureWave 13d3:3549
+                                        // BT combo on Orin port 7). The full descriptor read SUCCEEDED
+                                        // (VID/PID above prove bytes 8..11 arrived), but none of the
+                                        // handled-class arms nor the config-descriptor arm matched, so
+                                        // without this the FSM would linger in 'dev-desc' until its
+                                        // watchdog fired a spurious "watchdog-timeout code 0" and
+                                        // re-enumerated — the ×2-3 recovery storm seen every boot. The
+                                        // device enumerated cleanly; we simply have no driver, so
+                                        // release the port and advance instead of parking. (Downstream
+                                        // slots never drive the root port queue — see the HID path.)
+                                        serial_println!(
+                                            "xHCI: no driver for device class {:#x} (slot {}, {:04x}:{:04x}); releasing port.",
+                                            class_code, slot_id,
+                                            self.slots[slot_id as usize].vid,
+                                            self.slots[slot_id as usize].pid);
+                                        if !self.slots[slot_id as usize].is_downstream {
+                                            self.start_next_port();
+                                        }
                                     }
                                 }
                                 }
@@ -3711,6 +4599,43 @@ impl XhciController {
 
                                             let rel = slot.mouse_is_relative;
                                             let buttons = data_data[0];
+                                            // WHEEL — HOW MANY BYTES THIS REPORT ACTUALLY CARRIED,
+                                            // and why the question has to be asked at all.
+                                            //
+                                            // `queue_mouse_read` arms the interrupt-IN Normal TRB
+                                            // for `mouse_mps` bytes, and the Transfer Event's TRB
+                                            // Transfer Length field (status[23:0]) is the RESIDUAL —
+                                            // the bytes the controller did NOT transfer — so the
+                                            // report length is the difference. That is the only
+                                            // honest source. MPS alone over-reports: an 8-byte
+                                            // interrupt endpoint routinely delivers a 4-byte boot
+                                            // report, and plenty of mice declare more headroom than
+                                            // they use. And `data_data` is a 512-byte window over a
+                                            // DMA buffer that is never cleared between transfers, so
+                                            // every byte past the end of THIS report still holds the
+                                            // PREVIOUS one. A boot mouse with no wheel sends 3 bytes
+                                            // ([buttons, dx, dy]); reading byte 3 there would not
+                                            // read zero, it would read the last report's dy and
+                                            // scroll the machine on every mouse movement.
+                                            //
+                                            // Clamped to the armed length, so a controller reporting
+                                            // a nonsense residual can only ever shrink the report.
+                                            let report_len = (slot.mouse_mps as u32)
+                                                .saturating_sub(status & 0x00FF_FFFF)
+                                                .min(slot.mouse_mps as u32)
+                                                as usize;
+                                            // WHEEL — byte 3 of the 4-byte RELATIVE boot report, a
+                                            // signed i8: positive is scroll-up / away from the user.
+                                            // Gated on the length above AND on `rel`, because the
+                                            // absolute/tablet report has no wheel in that position
+                                            // at all (bytes 3-4 are its Y coordinate — decoding a
+                                            // wheel from them would turn every vertical tablet
+                                            // movement into a scroll).
+                                            let wheel = if rel && report_len >= 4 {
+                                                data_data[3] as i8
+                                            } else {
+                                                0
+                                            };
                                             // DRAGGLIDE — the motion is DECIDED here and PUSHED
                                             // below, paired with this report's button edge, so the
                                             // reorder that puts a release edge ahead of its own
@@ -3722,8 +4647,9 @@ impl XhciController {
                                             // entry — the ~1px hop, back, reporting success.
                                             let (last_a, last_b, motion) = if rel {
                                                 // HID BOOT mouse: byte0 = buttons, byte1 = dx:i8, byte2 = dy:i8
-                                                // (byte3 = wheel, ignored). Signed relative deltas — sign-extend
-                                                // i8 -> i32 and emit only on actual motion.
+                                                // (byte3 = wheel — decoded above as `wheel`, pushed below).
+                                                // Signed relative deltas — sign-extend i8 -> i32 and emit only
+                                                // on actual motion.
                                                 let dx = data_data[1] as i8 as i32;
                                                 let dy = data_data[2] as i8 as i32;
                                                 let m = if dx != 0 || dy != 0 {
@@ -3743,9 +4669,11 @@ impl XhciController {
                                                 };
                                                 (x as i32, y as i32, m)
                                             };
-                                            // `slot` (the shared borrow) is no longer read past here;
-                                            // the &mut self accesses below are the count bump + re-arm.
-
+                                            // (hw-jetson's CLICK-1 down-edge push_event block was
+                                            // superseded at the 2026-08-18 sync by GUI-CLICK-2 below —
+                                            // same press edge, plus the release edge, through the
+                                            // DRAGGLIDE one-report-one-push seam. Two emitters would
+                                            // double-fire Button on every press.)
                                             // GUI-CLICK-2 / HID-KEYS: emit a Button on ANY mask
                                             // change — both the press edge (a bit going 0→1) and the
                                             // release edge (a bit going 1→0). The payload is always
@@ -3776,6 +4704,26 @@ impl XhciController {
                                                 },
                                             );
                                             self.slots[slot_id as usize].mouse_prev_buttons = buttons;
+
+                                            // WHEEL — pushed SEPARATELY, and deliberately outside
+                                            // the DRAGGLIDE pairing above. That pairing exists to
+                                            // tell a release edge which lift is its own; a scroll
+                                            // detent is neither a lift nor an edge and joining it to
+                                            // the pair would give the reorder a third entry to
+                                            // reason about for no benefit. A wheel report from a
+                                            // real mouse carries dx=dy=0 and an unchanged button
+                                            // mask, so in practice this is the ONLY push the report
+                                            // makes; the extra ring trip is paid only when the wheel
+                                            // actually moved.
+                                            //
+                                            // Zero deltas are never pushed: the wheel byte is 0 in
+                                            // every ordinary motion and click report, and emitting
+                                            // those would flood the 64-slot EVENT_QUEUE with no-ops
+                                            // and starve the real HID edges (the UVUG-6 wedge shape).
+                                            if wheel != 0 {
+                                                crate::pal::wheel_note_decoded(wheel);
+                                                crate::pal::push_event(crate::pal::Event::Wheel(wheel));
+                                            }
 
                                             // UI1-MOUSE M1: bounded serial mouse-witness — first report
                                             // + every 32nd thereafter, NEVER one-per-report (that would
@@ -4069,6 +5017,7 @@ impl XhciController {
             let dcbaap_reg = (self.op_base + 0x30) as *mut u64;
             write_reg64(dcbaap_reg, dcbaap_ptr as u64);
             serial_println!("xHCI: DCBAAP set to {:#x}", dcbaap_ptr as u64);
+            x200_witness(self.op_base, "DCBAAP", dcbaap_ptr as u64);
 
             // 1b. SCRATCHPAD BUFFERS (xHCI spec 4.20). If the controller advertises Max Scratchpad
             // Buffers > 0 in HCSPARAMS2, the OS MUST allocate that many page-sized buffers + a
@@ -4110,6 +5059,7 @@ impl XhciController {
                         arr as u64, page_bytes, heap_lo, heap_hi
                     );
                 } else {
+                    let mut filled = 0usize;
                     for i in 0..max_scratchpad {
                         let buf_layout =
                             core::alloc::Layout::from_size_align(page_bytes, page_bytes).unwrap();
@@ -4123,16 +5073,35 @@ impl XhciController {
                         // private working memory; clean the zeroed buffer to DRAM so a non-snooping
                         // controller does not fault on stale contents. No-op x86.
                         dma_coherency::clean(buf as usize, page_bytes);
+                        x200_witness(
+                            self.op_base,
+                            &alloc::format!("scratchpad[{}]", i),
+                            buf as u64,
+                        );
+                        filled += 1;
                     }
-                    *dcbaap_ptr.add(0) = arr as u64;
-                    // XHCI-COHERENCE: clean the scratchpad pointer array and the DCBAA[0] entry that
-                    // points at it — both are controller-read before/at RS=1. No-op x86.
-                    dma_coherency::clean(arr as usize, max_scratchpad * 8);
-                    dma_coherency::clean(dcbaap_ptr as usize, core::mem::size_of::<u64>());
-                    serial_println!(
-                        "xHCI: scratchpad: {} buffer(s) x {} bytes; DCBAA[0]={:#x} (heap PA in [{:#x},{:#x}))",
-                        max_scratchpad, page_bytes, arr as u64, heap_lo, heap_hi
-                    );
+                    if filled < max_scratchpad {
+                        // ORIN-X200-1: a partially-filled scratchpad array published to DCBAA[0]
+                        // leaves ZERO entries the controller treats as buffer physical addresses —
+                        // it then DMA-writes into bus page 0 (exactly the 0x…0200 FillWrite RAS
+                        // shape). Publishing nothing is the lesser failure: the controller may
+                        // raise HSE, but it cannot wild-write. Loud + unconditional by design.
+                        serial_println!(
+                            "xHCI: X200 FLAG !! scratchpad: only {}/{} buffers allocated — NOT publishing DCBAA[0] (zero entries would be fetched as buffer pointers)",
+                            filled, max_scratchpad
+                        );
+                    } else {
+                        *dcbaap_ptr.add(0) = arr as u64;
+                        // XHCI-COHERENCE: clean the scratchpad pointer array and the DCBAA[0] entry
+                        // that points at it — both are controller-read before/at RS=1. No-op x86.
+                        dma_coherency::clean(arr as usize, max_scratchpad * 8);
+                        dma_coherency::clean(dcbaap_ptr as usize, core::mem::size_of::<u64>());
+                        x200_witness(self.op_base, "DCBAA[0](scratchpad-array)", arr as u64);
+                        serial_println!(
+                            "xHCI: scratchpad: {} buffer(s) x {} bytes; DCBAA[0]={:#x} (heap PA in [{:#x},{:#x}))",
+                            max_scratchpad, page_bytes, arr as u64, heap_lo, heap_hi
+                        );
+                    }
                 }
             } else {
                 serial_println!("xHCI: scratchpad: controller requests 0 buffers (none needed).");
@@ -4145,11 +5114,15 @@ impl XhciController {
             let crcr_value = ring_phys_addr | 1;
             write_reg64(crcr_reg, crcr_value);
             serial_println!("xHCI: CRCR set to {:#x}", crcr_value);
+            x200_witness(self.op_base, "CRCR(command-ring)", ring_phys_addr);
         }
     }
 
     // Call this AFTER init_pointers but BEFORE run
-    pub fn init_interrupter(&mut self, event_ring_phys: u64, erst_table_phys: u64) {
+    /// Program interrupter 0. `event_ring_phys` is the HEAP PA of the event ring segment (the caller
+    /// holds the `EVENT_RING` lock and passes it). The ERST is allocated HERE, in the heap — see the
+    /// `EventRing` struct doc and §JETSON-XCARVE for why no xHC DMA structure may live in image `.bss`.
+    pub fn init_interrupter(&mut self, event_ring_phys: u64) {
         // PIUSB-10: xHCI 5.4.1/4.2 — the FIRST register programming after HCRST (this writes the
         // interrupter's ERST/ERSTBA/ERDP runtime regs; `init_pointers`/`start` write CRCR/DCBAAP/
         // CONFIG/USBCMD after us). Gate ALL of it on USBSTS.CNR==0 so no write is dropped by a
@@ -4163,6 +5136,10 @@ impl XhciController {
         unsafe {
             // SAVE THIS for later use in the interrupt/event loop (ERDP updates)
             EVENT_RING_PHYS_BASE = event_ring_phys;
+            // Publish the real base into the controller struct so the VUGRAS candidate-PA dump is
+            // TRUTHFUL. This field was previously never assigned (always read 0), which sent the
+            // boot-15 RAS investigation's lead #1 chasing a phantom "event_ring_base=0x0".
+            self.event_ring_phys_base = event_ring_phys;
 
             // XHCI-COHERENCE: zeroed-handoff for the event ring. `EventRing::new()` zeroed the ring
             // into (dirty) cache lines; clean+invalidate so those zeros reach DRAM before the
@@ -4183,22 +5160,25 @@ impl XhciController {
             let ir0_base = runtime_base + 0x20;
             serial_println!("xHCI: RuntimeBase={:#x}, IR0 Base={:#x}", runtime_base, ir0_base);
 
-            // 2. Setup the Segment Table (ERST)
-            // NOTE: Caller holds the EVENT_RING lock and passes us the phys addr.
-            // Do NOT lock EVENT_RING here or we deadlock.
-            ERST_TABLE.entries[0] = ErstEntry {
+            // 2. Heap-allocate + fill the Event Ring Segment Table (ERST) in the HEAP-GUARD-vetted,
+            //    firewall-clean DMA window (mirrors the DCBAA / scratchpad allocations above). Never
+            //    freed — the controller is 'static, same lifetime discipline as DCBAA. This replaces the
+            //    old `static mut ERST_TABLE` in kernel-image .bss (JETSON-XCARVE: see the EventRing doc).
+            //    64-byte alignment (xHCI 6.5) comes from ErstTable's `#[repr(align(64))]`.
+            let erst_layout = core::alloc::Layout::new::<ErstTable>();
+            let erst = alloc::alloc::alloc_zeroed(erst_layout) as *mut ErstTable;
+            (*erst).entries[0] = ErstEntry {
                 ring_address: event_ring_phys,
                 size: event::EVENT_RING_SIZE as u16, // Must match EVENT_RING_SIZE in event.rs
                 _rsvd: 0,
                 _rsvd2: 0,
             };
+            let erst_table_phys = erst as u64;
+            self.erst_table_phys = erst_table_phys;
             // XHCI-COHERENCE: producer boundary — the controller DMA-reads the ERST when the
-            // interrupter is armed / ERSTBA is written below; clean the table to DRAM. No-op x86.
-            dma_coherency::clean(
-                core::ptr::addr_of!(ERST_TABLE) as usize,
-                core::mem::size_of::<ErstTable>(),
-            );
-            EVENT_RING_PHYS_BASE = event_ring_phys;
+            // interrupter is armed / ERSTBA is written below; clean the (heap) table to DRAM.
+            // No-op x86.
+            dma_coherency::clean(erst as usize, core::mem::size_of::<ErstTable>());
 
             // 3. Write ERSTSZ (Segment Table Size) - Offset 0x08
             // Value = 1 (We have 1 segment)
@@ -4217,6 +5197,9 @@ impl XhciController {
             // complete pointer under the PIUSB-21 32-bit split — never a stale/mirrored high.
             write_erdp(erdp_ptr, event_ring_phys); // Pointer to the RING, not the table
             serial_println!("[xhciint] ERDP initialized to {:#018x} (hi-first, EHB clear)", event_ring_phys);
+            x200_witness(self.op_base, "ERSTBA", erst_table_phys);
+            x200_witness(self.op_base, "ERST[0].ring(event-ring)", event_ring_phys);
+            x200_witness(self.op_base, "ERDP", event_ring_phys);
 
             // 5b. IMOD (Interrupter Moderation, +0x04): 0 = no moderation, fire ASAP.
             // (QEMU ignores moderation timing, but set it explicitly for clarity / real HW.)
@@ -4324,7 +5307,9 @@ impl XhciController {
                     serial_println!(
                         "xHCI: [aarch64] RS=1 witness: IR0={:#x} IMAN={:#x}(IP={} IE={}) ERSTSZ={} ERSTBA={:#018x} ERDP={:#018x}(EHB={}) ERST[0].ring={:#018x}",
                         ir0, iman, iman & 1, (iman >> 1) & 1, erstsz, erstba, erdp, (erdp >> 3) & 1,
-                        core::ptr::read_unaligned(core::ptr::addr_of!(ERST_TABLE.entries[0].ring_address))
+                        // Heap ERST (JETSON-XCARVE): read ERST[0].ring through the pointer we
+                        // programmed, not a .bss static (which no longer exists).
+                        core::ptr::read_unaligned(core::ptr::addr_of!((*(self.erst_table_phys as *const ErstTable)).entries[0].ring_address))
                     );
                 }
             }
@@ -4979,11 +5964,18 @@ impl XhciController {
             // doesn't match), which keeps the retraction correct even if some earlier path already
             // zeroed `storage_slot`. A replug enumerates as a NEW slot and republishes through the
             // normal attach path, so the entry is fresh rather than duplicated.
-            crate::drivers::block::unpublish_usb_geometry(i as u8);
+            crate::drivers::block::unpublish_usb_geometry(i as u8, crate::drivers::block::usb_publish_gen());
             // BOT-RESCUE: a slot that leaves takes its escalation state with it. Without this a
             // surrendered slot id, once recycled by the controller for the NEXT device, would
             // refuse that innocent device's transfers up front — the surrender must bind to the
             // disk that earned it, not to a number.
+            //
+            // BOT-PARK: and this is where that reasoning stops being enough. `bot_rescue_clear`
+            // resets `bot_fail_streak` and `bot_rescue_stage`, both of which are driver-GLOBAL, so
+            // a disconnect raised while a ladder is mid-flight handed that ladder its allowance
+            // back instead of ending it. Called BEFORE the clear so the ladder is torn down (and
+            // the unpark rule applied) against state the clear has not yet flattened.
+            self.bot_park_note_disconnect(i as u8);
             self.bot_rescue_clear(i as u8);
             if self.ftdi_configuring_slot == i as u8 {
                 self.ftdi_configuring_slot = 0;
@@ -5765,6 +6757,7 @@ impl XhciController {
             // output context during ADDRESS_DEVICE; clean the 8-byte entry to DRAM. No-op x86.
             dma_coherency::clean(dcbaap_ptr.add(slot_id as usize) as usize, core::mem::size_of::<u64>());
             serial_println!("xHCI: DCBAAP[{}] linked to {:#x}", slot_id, output_ctx_phys);
+            x200_witness(self.op_base, &alloc::format!("DCBAA[{}](out-ctx,root)", slot_id), output_ctx_phys);
 
             // 2. FILL INPUT CONTEXT (MANUAL OFFSET CALCULATION)
             let base_ptr = input_ctx_virt as *mut u32;
@@ -5809,6 +6802,7 @@ impl XhciController {
             ep0_ctx_ptr.add(1).write_volatile((4 << 3) | (3 << 1) | (mps0 << 16)); // EP Type = 4, CErr = 3, MPS
             ep0_ctx_ptr.add(2).write_volatile((ep0_ring_phys as u32) | 1); // Bit 0 must match Cycle Bit (1)
             ep0_ctx_ptr.add(3).write_volatile((ep0_ring_phys >> 32) as u32);
+            x200_witness(self.op_base, &alloc::format!("slot{} ep0 TRdeq(root)", slot_id), ep0_ring_phys);
             ep0_ctx_ptr.add(4).write_volatile(8); // Average TRB Length = 8
 
             serial_println!("xHCI: Input Context Initialized (Manual Offsets). Phys={:#x}", input_ctx_phys);
@@ -5918,6 +6912,8 @@ impl XhciController {
             ep_out_ptr.add(3).write_volatile((bulk_out_phys >> 32) as u32);
             ep_out_ptr.add(4).write_volatile(out_mps as u32);
 
+            x200_witness(self.op_base, &alloc::format!("slot{} bulk-in TRdeq", slot_id), bulk_in_phys);
+            x200_witness(self.op_base, &alloc::format!("slot{} bulk-out TRdeq", slot_id), bulk_out_phys);
             serial_println!("xHCI: Input Context Configured for Bulk Transport.");
             input_ctx_virt as u64
         }
@@ -5982,10 +6978,17 @@ impl XhciController {
             *cbw_buf.add(9) = (data_len >> 8) as u8;
             *cbw_buf.add(10) = (data_len >> 16) as u8;
             *cbw_buf.add(11) = (data_len >> 24) as u8;
-            // bmCBWFlags: 0x80 = device->host (IN), else 0x00
+            // bmCBWFlags: 0x80 = device->host (IN), else 0x00. BOT 1.0 §5.1: bit 7 is Direction and
+            // bits 6..0 are Reserved and must be zero. Audited for the zero-length case
+            // (`Direction::None`, `dCBWDataTransferLength == 0`), where §5.1 has the device IGNORE
+            // bit 7: this emits a well-defined 0x00 — direction bit clear, reserved bits clear —
+            // and the `write_bytes` zero-fill above means the byte is never uninitialized. Both
+            // arms are conformant as written; no behavior change is owed.
             *cbw_buf.add(12) = if dir == Direction::In { 0x80 } else { 0x00 };
             *cbw_buf.add(13) = 0; // bCBWLUN
             *cbw_buf.add(14) = cdb.len() as u8; // bCBWCBLength
+            // `take(16)` is now a belt on top of `bot_transfer`'s §5.1 CBWCB gate, which refuses a
+            // CDB outside 1..=16 before this function is ever reached — truncation is unreachable.
             for (i, b) in cdb.iter().enumerate().take(16) {
                 *cbw_buf.add(15 + i) = *b;
             }
@@ -6021,12 +7024,21 @@ impl XhciController {
     pub fn bot_transfer(&mut self, slot_id: u8, cdb: &[u8], data_phys: u64, data_len: u32, dir: Direction)
         -> Result<BotResult, BotError>
     {
+        // CBWCB bound. USB Mass Storage Class Bulk-Only Transport 1.0 §5.1 defines `bCBWCBLength`
+        // as the valid length of the command block, 1..=16; the CBWCB field is 16 bytes and a
+        // longer CDB has nowhere on the wire to go. Refused HERE — the one entry every storage I/O
+        // path comes through — so the refusal happens before a CBW is built or a TRB is queued,
+        // exactly as `scsi_read10`'s `blocks == 0` bound refuses rather than truncates. A CDB the
+        // transport cannot carry is a caller error, never a silently shortened command.
+        if cdb.is_empty() || cdb.len() > 16 {
+            return Err(BotError::BadRequest);
+        }
         let out = self.bot_transfer_body(slot_id, cdb, data_phys, data_len, dir);
         if let Err(cause) = out {
             // `NoDevice` is raised before anything is built or queued (no rings, no endpoints, or a
-            // surrendered slot), and `BadRequest` never reaches this function at all — in neither
-            // case is there a ring to clean. Every OTHER error, from every path in the body, lands
-            // here exactly once.
+            // surrendered slot), and `BadRequest` reaches here only from the CBWCB gate above,
+            // which returns before the body is ever called — in neither case is there a ring to
+            // clean. Every OTHER error, from every path in the body, lands here exactly once.
             if !matches!(cause, BotError::NoDevice | BotError::BadRequest) {
                 self.bot_clean_rings(slot_id, cause);
             }
@@ -6207,6 +7219,67 @@ impl XhciController {
         if slot_id != 0 && self.bot_surrendered_slot == slot_id {
             return Err(BotError::NoDevice);
         }
+        // THE DESKTOP THROTTLE (R24 boot6). Every BOT transaction in the driver funnels through
+        // here, so this is where a pass's unproductive pump time is bounded. Two calls, in order:
+        // roll the pass if the caller loop never gave us a boundary, then decline outright if this
+        // pass has already burned `BOT_PARK_PASS_PUMP_MS` in timed-out waits. Declining is free and
+        // returns to the desktop loop — the retry happens on a later pass, in a later frame.
+        self.bot_pass_roll();
+        // BOT-PARK: the floor UNDER the surrender gate. That one binds to a slot id, which the
+        // controller recycles and a re-enumeration changes; this one binds to the device. See the
+        // `BOT-PARK` block for the [pi0-b1b2] capture of a reader escaping its own surrender by
+        // being re-enumerated (as a new slot id) by the ladder's own port-cycle rung.
+        //
+        // BOTLATCH (R24 boot5) — WHY THE GATE IS AHEAD OF THE THROTTLE. It used to sit after it.
+        // The throttle's refusal returns from this function, so on a pass that had already spent
+        // `BOT_PARK_PASS_PUMP_MS` in timed-out waits — i.e. on exactly the wedged device the ledger
+        // is for — `verdict()` was never read, and the identity-park could not latch on the passes
+        // where it mattered most. That is the same inversion the dead-ring clause fixes one level
+        // down: a BUDGET CUT was being allowed to run ahead of the VERDICT it exists to serve.
+        // Order is now: park (permanent, free, constant-time) THEN throttle (per-pass, deferring).
+        // A parked device is refused here and never reaches the throttle at all, which is strictly
+        // cheaper — the throttle's whole purpose is to defer work the park has already cancelled.
+        self.bot_park_gate(slot_id)?;
+        if self.bot_pump_throttled() {
+            BOT_PARK_PUMP_REFUSED.fetch_add(1, Ordering::Relaxed);
+            serial_println!(
+                ":: BOT: park pump-refused slot={} pump_ms={} spent_ms={} refused={} — this main-loop pass has already spent its BOT pump budget on timed-out waits; no transfer is started, the frame paints, the retry moves to a later pass ::",
+                slot_id, BOT_PARK_PASS_PUMP_MS,
+                self.bot_pass_pump / Self::cycles_per_ms().max(1),
+                BOT_PARK_PUMP_REFUSED.load(Ordering::Relaxed));
+            return Err(BotError::NoDevice);
+        }
+        // BOTCLAIM: the issue-context witness. If either bulk pipe is not Running when this
+        // transaction is BORN, its failure is inherited from an earlier wedge (a prior timeout's
+        // cc=19-failed recovery left the pipe Halted/Stopped and un-repointed), not caused by
+        // anything on the caller's path — in particular not by the block layer's claim/loan
+        // boundary, which moves no controller state (the loan is a Box move, and the loan holder
+        // runs the same `pump_until_bot_done` either way). The 2026-08-21 pi capture shows the
+        // mount's READ(10) (the `:: BLK: io-cause op=read-usb`) issued with epin=2/epout=3 after
+        // the in-bring-up read12 wedge; this line makes that state readable AT ISSUE instead of
+        // being reconstructed from the recovery lines. Printed only in the already-broken state,
+        // so a healthy boot never emits it. Read-only: two volatile output-context reads, same
+        // (uninvalidated, possibly stale — exactly as every existing `ep_state_of` caller reads
+        // it) source the recovery witnesses use.
+        {
+            let (bi, bo) = {
+                let s = &self.slots[slot_id as usize];
+                (s.bulk_in_ep, s.bulk_out_ep)
+            };
+            if bi != 0 && bo != 0 {
+                let si = self.ep_state_of(slot_id, ((bi & 0x0F) * 2) + 1);
+                let so = self.ep_state_of(slot_id, (bo & 0x0F) * 2);
+                if si != 1 || so != 1 {
+                    // QEMU-verified reachable healthy case: epstate=3 (Stopped) right after a
+                    // SUCCESSFUL resync restarts on this transaction's own doorbell (test-arm
+                    // shows the piusb38 recovery probe hitting 3/3 and the next TUR Passing), so
+                    // the line names the states and leaves the verdict to the reading key.
+                    serial_println!(
+                        ":: BOT: [botclaim] issue-context slot={} cdb0={:#04x} epin={} epout={} — transaction born onto non-Running pipe(s). Reading key: 2 (Halted), or 3 (Stopped) behind a FAILED set-deq, means any timeout below is inherited from the earlier wedge — not caused by the issuing path; 3 behind a clean resync restarts on this doorbell and is healthy ::",
+                        slot_id, cdb.first().copied().unwrap_or(0), si, so);
+                }
+            }
+        }
         let first = self.bot_transfer_once(slot_id, cdb, data_phys, data_len, dir);
         let cause = match first {
             // PH-2: a `Failed` CSW is a completed transaction the DEVICE rejected — CHECK
@@ -6242,6 +7315,16 @@ impl XhciController {
             // one failed cycle and enters the escalation ladder (which, below `BOT_RESCUE_N_CONSEC`,
             // returns exactly the same `Err(cause)` after a back-off).
             return self.bot_rescue_escalate(slot_id, cdb, data_phys, data_len, dir, cause);
+        }
+        // BOT-PARK: the recovery earned this retry, but a pass that has already run long does not
+        // get to pay another full budget for it. The retry is not cancelled — it is deferred to a
+        // later pass, with the escalating back-off deciding when.
+        if self.bot_pass_exhausted(slot_id) {
+            BOT_PARK_PASS_REFUSED.fetch_add(1, Ordering::Relaxed);
+            serial_println!(
+                ":: BOT: park pass-refused slot={} what=post-recovery-retry pass_ms={} — this main-loop pass has already spent its BOT budget; the retry moves to a later pass ::",
+                slot_id, BOT_PARK_PASS_MS);
+            return Err(cause);
         }
         let again = self.bot_transfer_once(slot_id, cdb, data_phys, data_len, dir);
         match &again {
@@ -6701,16 +7784,24 @@ impl XhciController {
                     dci, dir, if ok { "yes" } else { "no" }, cc, why, ep_state, after);
                 if !ok {
                     if cc == 19 {
-                        // BOTEV (evidence only): Stop Endpoint is legal only from Running
-                        // (xHCI 1.2 §4.6.9); a Context State Error says the endpoint was not
-                        // Running when the command executed, so the state-aware arm chose on a
-                        // stale read.
+                        // boot23 (PA32) upgraded this from evidence to behaviour: Stop Endpoint is
+                        // legal only from Running (xHCI 1.2 §4.6.9), so a Context State Error here
+                        // means the endpoint is ALREADY out of Running and our output-context read
+                        // of `1` was stale (the context is only written back on state transitions
+                        // the controller chooses to record — the (stale: EP running) annotation
+                        // family). "Not Running" is this arm's entire goal, so the refusal IS the
+                        // goal state and the resync proceeds to Set TR Dequeue. Boot23's failure
+                        // shape: fold-clean stopped the pipes, clear-halt left them Stopped, this
+                        // arm re-read a stale Running and its cc=19 hard-fail took the whole
+                        // recovery down (`recover_bot_full=false`) — leaving the device phase
+                        // unreset and the stale CSW replaying forever.
                         serial_println!(
-                            ":: BOT: resync note dci={} dir={} illegal-stop-on-state read={} now={} — Context State Error on Stop Endpoint ::",
+                            ":: BOT: resync stage=stop-ep dci={} dir={} cc=19 treated as already-stopped (stale context read={} now={}) — proceeding to set-deq ::",
                             dci, dir, ep_state, after);
+                    } else {
+                        serial_println!("xHCI: BOT recover: Stop Endpoint failed (slot {} dci {})", slot_id, dci);
+                        return false;
                     }
-                    serial_println!("xHCI: BOT recover: Stop Endpoint failed (slot {} dci {})", slot_id, dci);
-                    return false;
                 }
             }
             3 => {
@@ -6826,6 +7917,255 @@ impl XhciController {
         true
     }
 
+    /// ZERO-DATA CSW FOLD ([piusb41]) — the device answered the CBW with its STATUS instead of the
+    /// data phase, so the status wrapper landed in the DATA-stage buffer. Called once, immediately
+    /// after an IN data stage's `run_bot_stage` returns (success, short, error OR timeout), before
+    /// anything is decided from that outcome and before the CSW stage is built. Returns
+    /// `Some(BotResult)` when the transaction has been FOLDED — the caller must return it as the
+    /// transaction's result and must NOT push a CSW stage — and `None` when this was an ordinary
+    /// data stage that should be judged normally.
+    ///
+    /// ## The defect this closes (boot21, Pi 4 metal, `[booted]` capture)
+    ///
+    /// READ CAPACITY(10) (`tag=5`, `cdb0=0x25`, `dCBWDataTransferLength=8`) is answered by the
+    /// stick with NO data phase at all: it sends its 13-byte CSW straight back on the bulk-IN pipe.
+    /// The host's outstanding IN TD at that moment is the 8-byte DATA stage, so the first 8 bytes
+    /// of that CSW — `55 53 42 53 05 00 00 00`, i.e. `USBS` followed by the command's OWN
+    /// `dCBWTag` — are DMA-written into the data buffer. `[piusb40] readcap-wedge` photographs
+    /// exactly that, with `landed=true` against the 0xA5 poison, so the bytes are a hard DRAM fact,
+    /// not an inference.
+    ///
+    /// The engine had no handling for it. Under `cbw=always-awaited` the data stage's wait can only
+    /// be released by a transfer completion for the data TRB, so it burned the full ~6 s budget, the
+    /// recovery ladder reset both endpoints, the retry (`tag=6`) met the identical response, and
+    /// bring-up surrendered the disk. A post-wedge INQUIRY over the control pipe returned `Ok`, so
+    /// the pipes were fully alive: the failure is TRANSACTION-shaped, not transport-shaped, and no
+    /// amount of endpoint resetting could ever have cleared it.
+    ///
+    /// Zero-data replies are legal BOT behaviour, not a device bug. USB MSC BOT 1.0 §6.7.2 case 2
+    /// (`Hi > Dn`) is precisely "the host expected data IN, the device sent none and went straight to
+    /// its status phase"; the host is obliged to accept the CSW and complete the command. The only
+    /// non-conformance on the wire is WHERE the status landed, and that is the host's own doing —
+    /// the host had an 8-byte TD posted where the device expected the status to be read.
+    ///
+    /// ## Why the fold must NOT then wait for a CSW stage
+    ///
+    /// This is the whole point of the fix, and skipping it would be worse than the wedge. The device
+    /// has ALREADY sent its status; its own BOT state machine is back at "await CBW". If the host
+    /// went on to push the 13-byte CSW TRB anyway, one of two things happens, and both are phase
+    /// SHIFTS that outlive the transaction:
+    ///   * nothing answers the IN token (the device has nothing to send) — the CSW stage burns its
+    ///     own full budget, converting a recoverable misphase into the same wedge one stage later; or
+    ///   * the token is answered by the status of the NEXT command the host issues, so from then on
+    ///     every command reads the PREVIOUS command's CSW. Tags would then mismatch forever
+    ///     (`BOT_TAG_MISMATCH`), and a `Passed` verdict would be attributed to the wrong CDB —
+    ///     a silent-corruption shape, not a stall.
+    /// So the fold completes the command HERE, from the status the device already sent, and the
+    /// caller returns without ever building stage 3.
+    ///
+    /// ## What is actually readable, and what is assumed
+    ///
+    /// Only `min(data_len, 13)` bytes of the CSW can be in the data buffer — the TD is `data_len`
+    /// long and the controller cannot write past it. For the READ CAPACITY case that is 8 bytes:
+    /// `dCSWSignature` + `dCSWTag` and nothing else. The tail 5 bytes (`dCSWDataResidue` +
+    /// `bCSWStatus`) were NOT written anywhere the host can read: a device packet longer than the
+    /// TD's remaining buffer is an overflow, which this controller reports on the transfer event
+    /// (Babble Detected, cc=3, xHCI 1.2 §6.4.5) and whose excess bytes it DISCARDS — there is no
+    /// second buffer they spill into. `handle_event_trb` claims that event by TRB address like any
+    /// other error, and the data-stage arm below treats a cc it does not recognise as a hard fault;
+    /// neither path can reconstruct the missing 5 bytes. So:
+    ///   * `data_len >= 13` — the whole CSW is present; `residue` and `status` are the DEVICE's own,
+    ///     parsed and reported verbatim.
+    ///   * `data_len < 13` — `bCSWStatus` is unreadable. The transaction is completed as `Failed`
+    ///     with `residue = data_len`, and the witness says `status=Failed(tail-truncated)` so the
+    ///     assumption is never mistaken for a reading. `Failed` is the only safe choice: the
+    ///     requested bytes provably did NOT arrive (the buffer holds the status wrapper, not
+    ///     payload), so reporting `Passed` would hand `scsi_read_capacity10` four bytes of `USBS`
+    ///     as a block size. `Failed` routes into `bot_check_condition` -> REQUEST SENSE, which is
+    ///     both the BOT-legal next command and the one that makes the device state its own reason.
+    ///     `residue = data_len` is the literal truth: none of the requested transfer moved.
+    ///
+    /// ## Detection criterion
+    ///
+    /// The buffer's own first 8 bytes: `dCSWSignature == "USBS"` AND `dCSWTag ==` the tag of the
+    /// CBW that is in flight RIGHT NOW. Deliberately NOT gated on the stage's completion code or on
+    /// a short residue, and that is a widening on purpose — boot21's data stage produced NO
+    /// completion the pump could claim at all, so any criterion phrased in terms of the transfer
+    /// event would miss the one capture the fix exists for, and a controller that reported the
+    /// 8-byte TD as a plain `cc=1 residue=0` success would miss it too. The criterion costs nothing
+    /// in false positives: real payload would have to match a fixed 4-byte signature AND a
+    /// monotonically-increasing 32-bit tag that no earlier transaction can carry — 2^-64 per stage.
+    fn bot_fold_zero_data_csw(&mut self, slot_id: u8, cdb0: u8, tag: u32,
+        data_phys: u64, data_len: u32, in_dci: u8, out_dci: u8, csw_phys: u64) -> Option<BotResult>
+    {
+        // Below 8 bytes there is no room for signature + tag, so the transaction cannot be
+        // identified and nothing may be folded on a guess.
+        if data_len < 8 {
+            return None;
+        }
+        let avail = data_len.min(13) as usize;
+        // XHCI-COHERENCE: consumer boundary. The buffer was `clean`ed before the doorbell and
+        // DMA-written by the controller, so there is no dirty line to lose; invalidate so this reads
+        // DRAM rather than the pre-transfer cache. Idempotent with the full-length invalidate the
+        // normal IN path performs later over a superset of this range.
+        dma_coherency::inval(data_phys as usize, avail);
+        let d = unsafe { core::slice::from_raw_parts(data_phys as *const u8, avail) };
+        let sig = (d[0] as u32) | ((d[1] as u32) << 8) | ((d[2] as u32) << 16) | ((d[3] as u32) << 24);
+        let buf_tag = (d[4] as u32) | ((d[5] as u32) << 8) | ((d[6] as u32) << 16) | ((d[7] as u32) << 24);
+        if sig != 0x53425355 || buf_tag != tag {
+            return None; // an ordinary data stage — judge it normally
+        }
+
+        let (status, status_name, residue) = if avail >= 13 {
+            let res = (d[8] as u32) | ((d[9] as u32) << 8) | ((d[10] as u32) << 16) | ((d[11] as u32) << 24);
+            match d[12] {
+                0 => (CswStatus::Passed, "Passed", res),
+                1 => (CswStatus::Failed, "Failed", res),
+                2 => (CswStatus::PhaseError, "PhaseError", res),
+                _ => (CswStatus::Unknown, "Unknown", res),
+            }
+        } else {
+            // See "What is actually readable" above: the status byte rode off the end of an
+            // undersized TD and was discarded by the controller's overflow handling.
+            (CswStatus::Failed, "Failed(tail-truncated)", data_len)
+        };
+
+        serial_println!(
+            ":: BOT: [piusb41] zero-data CSW folded — cdb0={:#04x} tag={:#010x} status={} residue={} — the device declined the data phase; command completed from the data-stage CSW ::",
+            cdb0, tag, status_name, residue);
+
+        // PHASE-RESYNC. Two things are left over and both must go before the next CBW is born.
+        //   * The data TD. On the timeout path it is still outstanding on the bulk-IN ring with the
+        //     controller parked on it; on the overflow path the endpoint is HALTED (Babble is a halt
+        //     condition, xHCI 1.2 §4.10.2.4) and the TD is un-retired either way. A stranded TD that
+        //     the next doorbell can be pointed at is exactly the condition `bot_clean_rings` exists
+        //     to end — §14's stale-CBW replay.
+        //   * Any event the stop/reset itself produces, which must not be mistaken for the next
+        //     transaction's completion.
+        // `bot_clean_rings` does both — Stop/Reset Endpoint (whichever the EP State admits), the
+        // authoritative pre/post strand scans, Set TR Dequeue to our enqueue position, and the
+        // drains around them. REUSED verbatim rather than reimplemented: this is the same cleanup
+        // the error chokepoint in `bot_transfer` performs, and it is the only code in the driver
+        // whose `live=0` post-scan is a real assertion. It is invoked HERE because the fold returns
+        // `Ok`, and `bot_transfer` only cleans on `Err` — without this call a folded transaction
+        // would be the one success path that could return with a dirty ring.
+        //
+        // boot23 (PA32): the fold's own pre-clean is GONE. It stopped the pipes, then
+        // `recover_bot_full`'s resync re-read a stale Running, issued a second Stop, ate cc=19 and
+        // hard-failed the whole recovery — the double-clean was the provocation. Recovery owns the
+        // complete resync (and the cc=19 arm below it is now stale-read-tolerant besides).
+        // boot22 (PA31) proved host-side ring cleanup alone is NOT enough after a fold: the
+        // device is still a phase ahead, and the 13-byte CSW's 5-byte TAIL survived into the head
+        // of the RETRY's data buffer — no USBS at offset 0, so the fold correctly declined, and
+        // CSW-tail+capacity-fragment minted `Disk block_size=83886080`. The device's phase must be
+        // reset too: Bulk-Only Mass Storage Reset + clear-halts, the same `recover_bot_full` the
+        // timeout ladder uses (it re-proves the pipes with TUR). Only after BOTH sides reset is the
+        // next transaction's data stage guaranteed to start at its own first byte.
+        let recovered = self.recover_bot_full(slot_id, BotError::TransferError(13), None);
+        serial_println!(
+            ":: BOT: [piusb41] post-fold device phase reset — recover_bot_full={} — a fold means the device already re-entered its CBW wait out of step; host-only ring cleanup leaves its next CSW tail in our next data buffer (boot22's garbage-geometry lesson) ::",
+            recovered
+        );
+        // `run_bot_stage` parks the failed stage record here on a timeout for recovery's evidence
+        // line. The fold IS the resolution, so drop it — otherwise a later transaction's recovery
+        // could attribute this stage's pipe to itself.
+        self.bot_failed = None;
+        // boot24 (PA33): even a SUCCESSFUL Mass Storage Reset does not make this hardware discard
+        // the CSW the host never consumed — the device replayed its tag-5 CSW into the retry's
+        // data stage AFTER recover_bot_full=true (the geometry clamp caught it; 'Generic USB SD
+        // Reader'). On this silicon the only consume is a READ: drain the IN pipe with bare CSW-
+        // sized TDs until it goes quiet, so the next real transaction's data stage starts at its
+        // own first byte.
+        self.bot_drain_stale_csw(slot_id, in_dci, out_dci, csw_phys);
+        // PA34's verdict closed the queue theory: the drain found the pipe QUIET and the very next
+        // command still received the stale CSW — the device re-manufactures it. State machines are
+        // not drained, they are power-cycled; two consecutive folds is the stuck signature and the
+        // rescue ladder's port-cycle rung is the one act that reaches device-internal state. The
+        // re-enumeration it delegates gives the reader a cold BOT engine and bring-up a fresh run.
+        // [piusb41] S1Z: mark this attempt as a fold (so its own Ok return cannot end the streak
+        // it just joined) and latch fold-seen for the bring-up-scoped widened trigger (fold +
+        // geometry-clamp reject on one bring-up — consumed in `bring_up_storage`'s error arm).
+        self.bot_txn_folded = true;
+        self.bot_fold_seen = true;
+        let streak = BOT_FOLD_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+        if streak >= 2 {
+            BOT_FOLD_STREAK.store(0, Ordering::Relaxed);
+            serial_println!(
+                ":: BOT: [piusb41] fold streak={} — drain-quiet + repeat fold = the device re-manufactures its stale CSW (stuck BOT state machine, media seated) — escalating to port power-cycle ::",
+                streak);
+            let cycled = self.rescue_port_cycle(slot_id);
+            serial_println!(
+                ":: BOT: [piusb41] port power-cycle result={} — {} ::",
+                cycled,
+                if cycled { "device re-enumerates cold; bring-up re-runs on the fresh slot" }
+                else { "cycle refused/failed — the surrender path owns what remains" });
+        }
+
+        Some(BotResult { status, residue })
+    }
+
+    /// [piusb41] boot24 — drain the IN pipe of replayed CSWs after a fold. Evidence chain, one
+    /// boot per link: boot22 proved the CSW's tail leaks into the next data buffer; boot23 proved
+    /// the recovery ladder can be made to succeed; boot24 proved that even a SUCCESSFUL Bulk-Only
+    /// Mass Storage Reset leaves the unconsumed CSW queued — the device ('Generic USB SD Reader')
+    /// replays it to every IN until something reads it. So something reads it: a bare CSW-sized IN
+    /// TD, no CBW in front, pointed at the CSW buffer, up to two passes.
+    ///
+    /// A TIMEOUT here is the CLEAN outcome — the pipe had nothing queued — and costs one
+    /// escalation-scale budget, not the first-attempt 3x: this path has already burned a full
+    /// budget by definition, and "empty" must be cheap. The timed-out drain TD is stranded by
+    /// construction and is ended by the same `bot_clean_rings` every timeout path uses; the parked
+    /// failure record is dropped so no later transaction's recovery can claim this pipe.
+    fn bot_drain_stale_csw(&mut self, slot_id: u8, in_dci: u8, out_dci: u8, csw_phys: u64) {
+        for pass in 0..2u32 {
+            unsafe { core::ptr::write_bytes(csw_phys as *mut u8, 0, 13); }
+            dma_coherency::clean(csw_phys as usize, 13);
+            let trb_phys = {
+                let ring = match self.slots[slot_id as usize].bulk_in_ring.as_mut() {
+                    Some(r) => r,
+                    None => return,
+                };
+                let base = ring.get_ptr();
+                let idx = match ring.push(Trb {
+                    parameter: csw_phys, status: 13,
+                    control: (1 << 10) | (1 << 5) | (1 << 2), // Normal, IOC, ISP — the CSW-stage shape
+                }) {
+                    Ok(i) => i,
+                    Err(_) => return, // ring full mid-recovery: the next timeout's clean owns it
+                };
+                base + (idx as u64) * 16
+            };
+            self.bot_doorbell(slot_id, in_dci, true);
+            let saved = self.bot_budget_scale;
+            self.bot_budget_scale = BOT_BUDGET_SCALE_ESCALATION;
+            let stage = self.run_bot_stage(slot_id, in_dci, out_dci, trb_phys);
+            self.bot_budget_scale = saved;
+            match stage {
+                Ok((cc, residue)) => {
+                    dma_coherency::clean_inval(csw_phys as usize, 13);
+                    let d = unsafe { core::slice::from_raw_parts(csw_phys as *const u8, 13) };
+                    let sig = (d[0] as u32) | ((d[1] as u32) << 8) | ((d[2] as u32) << 16) | ((d[3] as u32) << 24);
+                    let stale_tag = (d[4] as u32) | ((d[5] as u32) << 8) | ((d[6] as u32) << 16) | ((d[7] as u32) << 24);
+                    let is_csw = sig == 0x5342_5355;
+                    serial_println!(
+                        ":: BOT: [piusb41] drained stale IN pass={} cc={} residue={} is_csw={} tag={:#010x} status_byte={:#04x} — {} ::",
+                        pass, cc, residue, is_csw, stale_tag, d[12],
+                        if is_csw { "a replayed CSW consumed off the pipe; the next data stage starts clean" }
+                        else { "the pipe carried something that is NOT a CSW — recorded raw above, drain stops here rather than eat unknown data" });
+                    if !is_csw { return; }
+                }
+                Err(_) => {
+                    self.bot_clean_rings(slot_id, BotError::Timeout);
+                    self.bot_failed = None;
+                    serial_println!(
+                        ":: BOT: [piusb41] drain pass={} — IN pipe quiet (timeout is the CLEAN outcome here); stranded drain TD cleaned ::",
+                        pass);
+                    return;
+                }
+            }
+        }
+    }
+
     /// The single-attempt Bulk-Only Transport transaction: CBW -> (optional data) -> CSW.
     /// `bot_transfer` wraps this with Reset Recovery + one bounded retry.
     fn bot_transfer_once(&mut self, slot_id: u8, cdb: &[u8], data_phys: u64, data_len: u32, dir: Direction)
@@ -6838,9 +8178,50 @@ impl XhciController {
             (cbw, csw, slot.bulk_in_ep, slot.bulk_out_ep)
         };
         if in_addr == 0 || out_addr == 0 { return Err(BotError::NoDevice); }
+        // BOT-PARK (`botwedge`, default OFF): the synthetic transport wedge. Refuses AFTER the
+        // device has had its first `BOT_WEDGE_AFTER` transactions, so enumeration, bring-up and the
+        // geometry publish all succeed exactly as they do today and the wedge lands on a live disk —
+        // which is what the metal capture shows. Nothing is queued and no doorbell is rung, so the
+        // ring stays provably idle and the pump's dead-ring classification sees the real signature.
+        #[cfg(feature = "botwedge")]
+        {
+            /// Transactions allowed through before the synthetic wedge closes. Enough for
+            /// SET_CONFIGURATION, the TUR loop, INQUIRY and READ CAPACITY on QEMU's `usb-storage`.
+            const BOT_WEDGE_AFTER: u64 = 24;
+            static BOT_WEDGE_N: AtomicU64 = AtomicU64::new(0);
+            if slot_id != 0 && slot_id == self.storage_slot {
+                let n = BOT_WEDGE_N.fetch_add(1, Ordering::Relaxed) + 1;
+                if n > BOT_WEDGE_AFTER {
+                    if n == BOT_WEDGE_AFTER + 1 {
+                        serial_println!(
+                            ":: BOT: WEDGE-INJECT slot={} after={} — synthetic transport wedge armed (botwedge); every further BOT attempt on this slot fails Timeout with nothing on the wire ::",
+                            slot_id, BOT_WEDGE_AFTER);
+                    }
+                    // R24: charge the wait this refusal STANDS IN FOR. The injection returns before
+                    // `pump_until_bot_done` runs, so before this arc it accrued nothing — no cycles,
+                    // no dead-ring streak — and the ledger's wall-clock clause (`BOT_PARK_CYCLE_MAX_MS`)
+                    // was unreachable in QEMU by construction, which is why the gate could only ever
+                    // watch the back-off decline attempts. The charge is the budget the wait WOULD
+                    // have paid, classified `dead` because the injected wedge is exactly the
+                    // [piusb40] necropsy signature: nothing queued, no doorbell, a provably idle
+                    // ring. Real elapsed time is unchanged — this buys the fixture the ledger's
+                    // arithmetic, not the metal's seconds.
+                    let synthetic = crate::arch::hw_wait_budget()
+                        .saturating_mul(self.bot_budget_scale.max(1));
+                    self.bot_park_charge(slot_id, synthetic, true);
+                    self.bot_park_credit_backoff(slot_id, synthetic);
+                    return Err(BotError::Timeout);
+                }
+            }
+        }
         let in_dci = ((in_addr & 0x0F) * 2) + 1;
         let out_dci = (out_addr & 0x0F) * 2;
 
+        // [piusb41] S1Z: this attempt has not folded (yet). The marker is what lets
+        // `bot_rescue_clear` distinguish a REAL completion (ends the fold streak) from the fold's
+        // own `Ok` return (IS the streak) — without it fold #1's completion-clear wiped the streak
+        // before fold #2 could increment it, and the PA34 two-fold trigger was vacuous.
+        self.bot_txn_folded = false;
         // PIUSB-38: latched when the data stage halts (STALL/Babble). It steers the status stage
         // into Reset Recovery: on a data-phase stall we still collect the CSW (resync), and if the
         // CSW itself fails we escalate to a full Bulk-Only Mass Storage Reset.
@@ -7012,7 +8393,23 @@ impl XhciController {
             self.bot_doorbell(slot_id, out_dci, false);
             if data_dci != out_dci { self.bot_doorbell(slot_id, data_dci, true); }
 
-            let (code, residue) = self.run_bot_stage(slot_id, in_dci, out_dci, data_trb_phys)?;
+            let stage = self.run_bot_stage(slot_id, in_dci, out_dci, data_trb_phys);
+            // ZERO-DATA CSW FOLD ([piusb41]) — BEFORE the outcome above is judged and before the
+            // `?` can propagate a timeout. The device may have skipped the data phase and put its
+            // 13-byte CSW where this data stage's buffer is; when it did, the transaction is
+            // complete already and stage 3 must never be built. See `bot_fold_zero_data_csw` for
+            // the criterion, the truncation rule, and why a CSW-stage wait after a fold is the
+            // phase shift this fix exists to prevent. IN only: an OUT data stage's buffer is
+            // host-written and the device cannot have put anything in it.
+            if !data_out {
+                if let Some(folded) = self.bot_fold_zero_data_csw(
+                    slot_id, *cdb.first().unwrap_or(&0), tag, data_phys, data_len,
+                    in_dci, out_dci, csw_phys)
+                {
+                    return Ok(folded);
+                }
+            }
+            let (code, residue) = stage?;
             // BOT-PHASE fix 3 — SHORT-TRANSFER HONESTY.
             //
             // The Transfer Event's TRB Transfer Length field is the RESIDUE: the bytes of this TD
@@ -8284,13 +9681,28 @@ impl XhciController {
         BOT_RESCUE_PORT_CYCLE.fetch_add(1, Ordering::Relaxed);
         let port = self.slots[slot_id as usize].port_id;
         let downstream = self.slots[slot_id as usize].is_downstream;
-        if port == 0 || port > self.max_ports || downstream {
+        // BOT-PARK: this rung is ABOUT to cause a disconnect and a re-enumeration. Say so, so the
+        // unpark rule can tell the driver's own cure apart from an operator replug. Armed before
+        // the hand-off below as well, because the hub twin cycles the same physical device.
+        {
+            let route = self.slots[slot_id as usize].route_string;
+            self.bot_park_arm_self_cycle(port, route);
+        }
+        if downstream {
             // A hub-downstream device's power is the HUB's to switch, via a class request on the
-            // hub's slot — a different pipe, and one this rung has no business reaching for while
-            // the device it would have to ask through may itself be the sick one.
+            // hub's slot — a different pipe, and PORTSC PP here would cut the whole hub. [piusb41]
+            // PA37 stopped at this line with `why=downstream-port-not-root`; the rung it named is
+            // now written, so hand off to it rather than refusing. `port` (the ROOT port the chain
+            // starts at) is deliberately NOT touched on this path.
             serial_println!(
-                ":: BOT: rescue stage=port-cycle slot={} port={} ok=no why={} ::",
-                slot_id, port, if downstream { "downstream-port-not-root" } else { "no-root-port" });
+                ":: BOT: rescue stage=port-cycle slot={} port={} ok=no why=downstream-port-not-root next=hub-port-cycle ::",
+                slot_id, port);
+            return self.rescue_hub_port_cycle(slot_id);
+        }
+        if port == 0 || port > self.max_ports {
+            serial_println!(
+                ":: BOT: rescue stage=port-cycle slot={} port={} ok=no why=no-root-port ::",
+                slot_id, port);
             return false;
         }
         // Preserve everything except the write-1-to-act bits; then drop PP.
@@ -8314,6 +9726,180 @@ impl XhciController {
             BOT_RESCUE_PORT_OFF_MS, BOT_RESCUE_PORT_ON_MS,
             before, off, after, (off >> 9) & 1, ccs, (after >> 1) & 1, (after >> 5) & 0xF,
             BOT_RESCUE_PORT_CYCLE.load(Ordering::Relaxed));
+        ccs != 0
+    }
+
+    /// [piusb41] BOT-RESCUE escalation (b'): the HUB-downstream twin of `rescue_port_cycle`.
+    ///
+    /// A device behind a hub has no PORTSC of its own — its VBUS is switched by the HUB, through
+    /// class requests aimed at ONE named downstream port on the hub's control pipe
+    /// (USB 2.0 §11.24.2): `ClearPortFeature(PORT_POWER)` then `SetPortFeature(PORT_POWER)`,
+    /// bmRequestType 0x23 (H2D, class, OTHER), feature selector 8, `wIndex` = the hub port number.
+    /// This is the exact request-building path `bring_up_hub` already uses to power the ports on at
+    /// bring-up; nothing new is invented here, only the OFF half and the aim.
+    ///
+    /// **Aim, and why it is safe on a shared hub.** The port number is the one RECORDED for this
+    /// slot at enumeration (`parent_hub_slot`/`parent_hub_port`, written in `enumerate_downstream`),
+    /// not one derived or guessed, and it is cross-checked against the slot's own route string
+    /// before a single request goes out: the route nibble for the parent's tier must equal this port
+    /// and the tier depth must be exactly one below this device's. A sibling on the same hub (the
+    /// bench mouse) sits on a DIFFERENT downstream port and is untouched — per-port power is exactly
+    /// what the hub-class feature switches. The hub itself is never reset, never re-configured, and
+    /// never powered off; `ClearPortFeature(PORT_POWER)` reaches one port only. If any active slot
+    /// other than this one claims the same (hub, port) pair — which would mean the recorded aim is
+    /// stale or aliased — the rung refuses rather than cut power under a live device.
+    ///
+    /// **Precondition: the hub's control pipe is healthy.** The rung has to ask THROUGH a device to
+    /// reach the sick one. An invalid/absent hub slot, or a control transfer that errors, is an
+    /// honest refusal (`why=hub-pipe-dead`) — not something to retry or work around.
+    ///
+    /// **Re-enumeration is DELEGATED**, exactly as the root rung delegates: dropping and restoring
+    /// port power makes the hub latch C_PORT_CONNECTION, which it reports on its Status Change
+    /// Endpoint; the settles below drain the event ring, so that interrupt-IN completion queues the
+    /// (hub, port) pair and the main loop's `service_hub_changes` -> `service_one_hub_change` does
+    /// the disconnect teardown and the fresh reset+enumerate. Nothing here open-codes a re-address,
+    /// and nothing here clears a change feature — clearing C_PORT_CONNECTION would erase the very
+    /// edge the delegated path re-enumerates on.
+    ///
+    /// Returns true if the hub reports a device connected on that port after the cycle.
+    fn rescue_hub_port_cycle(&mut self, slot_id: u8) -> bool {
+        BOT_RESCUE_HUB_PORT_CYCLE.fetch_add(1, Ordering::Relaxed);
+        let n = BOT_RESCUE_HUB_PORT_CYCLE.load(Ordering::Relaxed);
+        let (hub_slot, hub_port, route, depth) = {
+            let s = &self.slots[slot_id as usize];
+            (s.parent_hub_slot, s.parent_hub_port, s.route_string, s.route_depth)
+        };
+        // BOT-PARK: as for the root rung — this is the driver's own cure, and the disconnect it
+        // raises must not read as an operator replug. (Idempotent with the arm in `rescue_port_cycle`
+        // when reached through its hand-off; this call covers the direct-entry path.)
+        {
+            let port = self.slots[slot_id as usize].port_id;
+            self.bot_park_arm_self_cycle(port, route);
+        }
+        if hub_slot == 0 || hub_port == 0 {
+            // Slot 0 is never a device and hub ports are 1-based, so this pair means "not recorded"
+            // — a device enumerated before this arc, or a root device that reached here in error.
+            serial_println!(
+                ":: BOT: rescue stage=hub-port-cycle slot={} hub=0 hubport=0 ok=no why=no-parent-hub n={} ::",
+                slot_id, n);
+            return false;
+        }
+        // The hub must be a live, configured hub with a usable control pipe and its own DMA buffer.
+        let (hub_ok, hub_nbr_ports, hub_depth, hub_speed, buf) = {
+            let h = &self.slots[hub_slot as usize];
+            let speed = unsafe {
+                if h.output_context.is_null() { 0 } else { (*(h.output_context as *const u32) >> 20) & 0xF }
+            };
+            (h.active && h.is_hub && h.ep0_ring.is_some() && !h.descriptor_buffer.is_null(),
+             h.hub_nbr_ports, h.route_depth, speed, h.descriptor_buffer as u64)
+        };
+        if !hub_ok {
+            serial_println!(
+                ":: BOT: rescue stage=hub-port-cycle slot={} hub={} hubport={} ok=no why=hub-pipe-dead n={} ::",
+                slot_id, hub_slot, hub_port, n);
+            return false;
+        }
+        if hub_port > hub_nbr_ports {
+            serial_println!(
+                ":: BOT: rescue stage=hub-port-cycle slot={} hub={} hubport={} nbrports={} ok=no why=hub-port-out-of-range n={} ::",
+                slot_id, hub_slot, hub_port, hub_nbr_ports, n);
+            return false;
+        }
+        // SAFETY CROSS-CHECK 1 — the recorded port must agree with the route this slot was ADDRESSED
+        // with. `bring_up_hub` builds a child's route as `hub_route | (min(port,15) << (4*hub_depth))`
+        // at depth `hub_depth+1`; re-derive that nibble and refuse on any disagreement. A stale or
+        // aliased pair fails here, before any power is switched.
+        let route_nibble_ok = hub_depth < 5
+            && depth == hub_depth + 1
+            && ((route >> (4 * hub_depth)) & 0xF) == (hub_port as u32).min(15);
+        if !route_nibble_ok {
+            serial_println!(
+                ":: BOT: rescue stage=hub-port-cycle slot={} hub={} hubport={} ok=no why=port-not-ours route={:#x} depth={} hubdepth={} n={} ::",
+                slot_id, hub_slot, hub_port, route, depth, hub_depth, n);
+            return false;
+        }
+        // SAFETY CROSS-CHECK 2 — no OTHER LIVE device may claim this same (hub, port). One port
+        // carries one device; a second live claimant means the bookkeeping is wrong, and cutting
+        // power on a guess could darken a healthy sibling. Refuse instead.
+        //
+        // [piusb41] PA38: "live" must mean what the REST of the driver means by it, not merely
+        // `active`. `bot_clean` (see its `skipped=` line) treats a slot with a null output context
+        // or a SURRENDERED slot as having no reachable ring and no possible further transfer — a
+        // corpse the driver has already stopped addressing. Such a slot cannot be a healthy sibling
+        // to darken, so it must not veto its successor's power cycle. On PA38 the coalesced-re-plug
+        // hole above left exactly that shape behind (surrendered slot 2 still claiming hub 1 port
+        // 2) and this check refused `port-shared` against it. The hole is closed above; this is the
+        // predicate saying the same thing, so no future path can resurrect the false positive. The
+        // genuinely-impossible-but-defended case is UNCHANGED: a second slot that is active, has an
+        // output context and is not surrendered still refuses, and a live sibling on a DIFFERENT
+        // port of the same hub never matched in the first place (the `parent_hub_port` term).
+        if let Some(other) = (1..self.slots.len()).find(|&i| {
+            i != slot_id as usize
+                && self.slots[i].active
+                && !self.slots[i].output_context.is_null()
+                && self.bot_surrendered_slot != i as u8
+                && self.slots[i].parent_hub_slot == hub_slot
+                && self.slots[i].parent_hub_port == hub_port
+        }) {
+            serial_println!(
+                ":: BOT: rescue stage=hub-port-cycle slot={} hub={} hubport={} ok=no why=port-shared other={} n={} ::",
+                slot_id, hub_slot, hub_port, other, n);
+            return false;
+        }
+
+        // R22 lesson (see reset_downstream_port / bring_up_hub): a SuperSpeed hub's wPortStatus does
+        // NOT lay out like a USB2 hub's — PORT_POWER is bit 9 on SS and bit 8 on USB2, and the USB2
+        // speed bits do not apply on SS at all. Only CCS (bit 0) is common to both, so CCS is what
+        // the verdict is drawn from; the power bit is decoded speed-aware and printed as evidence
+        // only. The class REQUESTS are identical on both (feature selector 8 either way).
+        let is_ss = hub_speed >= 4;
+        let pp_bit = if is_ss { 9 } else { 8 };
+        // Read one port status word (GET_PORT_STATUS, 0xA3/0x00) without acknowledging anything.
+        let port_status = |me: &mut Self| -> Option<(u16, u16)> {
+            if me.sync_control(hub_slot, 0xA3, 0x00, 0, hub_port as u16, 4, buf, true).is_err() {
+                return None;
+            }
+            unsafe {
+                let p = buf as *const u8;
+                Some(((*p.add(0) as u16) | ((*p.add(1) as u16) << 8),
+                      (*p.add(2) as u16) | ((*p.add(3) as u16) << 8)))
+            }
+        };
+        let before = port_status(self).map(|s| s.0).unwrap_or(0xFFFF);
+
+        // OFF: ClearPortFeature(PORT_POWER) on this port only.
+        let off_res = self.sync_control(hub_slot, 0x23, 0x01, 8, hub_port as u16, 0, 0, false);
+        if !matches!(off_res, Ok(1)) {
+            // The pipe we must ask through did not answer. Power was never removed, but exit
+            // POWERED on every path regardless — best-effort SetPortFeature, then refuse honestly.
+            let _ = self.sync_control(hub_slot, 0x23, 0x03, 8, hub_port as u16, 0, 0, false);
+            serial_println!(
+                ":: BOT: rescue stage=hub-port-cycle slot={} hub={} hubport={} ok=no why=hub-pipe-dead phase=off res={:?} n={} ::",
+                slot_id, hub_slot, hub_port, off_res, n);
+            return false;
+        }
+        self.settle_ms(BOT_RESCUE_PORT_OFF_MS);
+        let off = port_status(self).map(|s| s.0).unwrap_or(0xFFFF);
+
+        // ON: SetPortFeature(PORT_POWER) — the same request bring_up_hub issues at hub init.
+        let on_res = self.sync_control(hub_slot, 0x23, 0x03, 8, hub_port as u16, 0, 0, false);
+        self.settle_ms(BOT_RESCUE_PORT_ON_MS);
+        let (after, change) = port_status(self).unwrap_or((0xFFFF, 0));
+        if !matches!(on_res, Ok(1)) {
+            serial_println!(
+                ":: BOT: rescue stage=hub-port-cycle slot={} hub={} hubport={} ok=no why=hub-pipe-dead phase=on res={:?} status={:#06x} n={} ::",
+                slot_id, hub_slot, hub_port, on_res, after, n);
+            return false;
+        }
+        // No change feature is cleared here: C_PORT_CONNECTION is the edge service_one_hub_change
+        // re-enumerates on, and it acknowledges the full wPortChange word itself once it has.
+        let ccs = after & 1;
+        serial_println!(
+            ":: BOT: rescue stage=hub-port-cycle slot={} hub={} hubport={} ok={} link={} off_ms={} on_ms={} status={:#06x}->{:#06x}->{:#06x} change={:#06x} pp_off={} ccs={} route={:#x} depth={} n={} — power switched at the hub's own port; re-enum DELEGATED to the status-change path ::",
+            slot_id, hub_slot, hub_port, if ccs != 0 { "yes" } else { "no" },
+            if is_ss { "ss" } else { "usb2" },
+            BOT_RESCUE_PORT_OFF_MS, BOT_RESCUE_PORT_ON_MS,
+            before, off, after, change, (off >> pp_bit) & 1, ccs, route, depth, n);
         ccs != 0
     }
 
@@ -8494,6 +10080,123 @@ impl XhciController {
         self.port_link_witness("timeout");
     }
 
+    /// [piusb40] witness 3 — the event-ring necropsy. Photograph the ring at the instant of a BOT
+    /// timeout, BEFORE any recovery touches it.
+    ///
+    /// The two surviving explanations for the READ CAPACITY wedge are indistinguishable in every
+    /// pre-arc capture: an event that was posted and never consumed (consumer behind the producer,
+    /// or reading the wrong colour) leaves the same log as an event that was never posted at all.
+    /// The difference lives in the ring itself — where the controller's dequeue pointer sits
+    /// against ours, and what colour the slots around our position carry. Both go on one line here.
+    ///
+    /// Ordering is the whole point of the call site. This runs before `return Err(Timeout)` and
+    /// therefore before the escalation ladder resets endpoints or republishes the ERDP; a necropsy
+    /// taken after recovery would be a photograph of the recovery.
+    ///
+    /// Read it WITH witness 1, not instead of it. The ring can only report what the controller did
+    /// on the event path — it cannot say whether bytes moved, which is witness 1's question, and
+    /// the two verdicts are built to agree. When they disagree, believe witness 1: DRAM contents
+    /// are a harder fact than a pointer comparison against a producer that may have moved between
+    /// the two reads.
+    fn bot_event_necropsy(&self) {
+        // (index, cycle, trb_type) for the 8-slot window around our dequeue position.
+        let mut slots = [(0usize, 0u32, 0u32); 8];
+        let (sw_deq, colour, popped) = {
+            let guard = EVENT_RING.lock();
+            let ring = match guard.as_ref() {
+                Some(r) => r,
+                None => {
+                    serial_println!(
+                        ":: BOT: [piusb40] necropsy — event ring uninitialised — no photograph possible, this timeout predates the interrupter ::");
+                    return;
+                }
+            };
+            let deq = ring.dequeue_index;
+            for k in 0..8 {
+                // deq-2 .. deq+5: two slots BEHIND the pointer so the line shows what we just
+                // consumed and in which colour, and five ahead so a producer that ran past us is
+                // visible rather than inferred. `+ EVENT_RING_SIZE` before the subtraction keeps
+                // the arithmetic in usize when deq is 0 or 1.
+                let i = (deq + event::EVENT_RING_SIZE - 2 + k) % event::EVENT_RING_SIZE;
+                // TRUNK-LANDING SEAM: the ring segment is a private heap pointer now (the DMA-window
+                // move), not an inline array, so the slot read goes through `peek_slot` — which does
+                // exactly what this site did inline: clean_inval the slot's line(s), then copy the
+                // whole `packed` TRB out volatile (a reference to an individual field would be
+                // unaligned — see `has_event`). Same two operations, same read-only photograph.
+                let t = ring.peek_slot(i);
+                slots[k] = (i, t.control & 1, (t.control >> 10) & 0x3F);
+            }
+            (deq, if ring.cycle_bit { 1u32 } else { 0u32 }, ring.popped)
+        };
+
+        let (iman, erdp) = unsafe {
+            let rtsoff = core::ptr::read_volatile((self.base_addr + 0x18) as *const u32) & !0x1F;
+            let ir0_base = self.base_addr + rtsoff as usize + 0x20;
+            let iman = core::ptr::read_volatile(ir0_base as *const u32);
+            // TWO 32-bit reads, never one 64-bit load: the brcmstb RC forces a genuine 32-bit split
+            // on this register, which is the same hardware fact that makes `write_erdp` store the
+            // high dword first. A u64 read here would return mirror garbage in the high half and
+            // the derived slot index would be nonsense.
+            let lo = core::ptr::read_volatile((ir0_base + 0x18) as *const u32) as u64;
+            let hi = core::ptr::read_volatile((ir0_base + 0x1C) as *const u32) as u64;
+            (iman, (hi << 32) | lo)
+        };
+
+        // Where the CONTROLLER thinks our dequeue pointer sits. -1 means EVENT_RING_PHYS_BASE is
+        // still 0, so no derivation is possible and only the raw ERDP above carries information. An
+        // out-of-range positive index is NOT an arithmetic bug — an ERDP pointing outside our own
+        // ring is itself a finding, so it is printed exactly as computed.
+        let phys_base = unsafe { EVENT_RING_PHYS_BASE };
+        let hw_slot: i64 = if phys_base == 0 {
+            -1
+        } else {
+            (((erdp & !0xF).wrapping_sub(phys_base)) / 16) as i64
+        };
+
+        // slots[0..2] are behind the pointer, slots[2] IS the dequeue slot, slots[3..] are ahead.
+        let at_deq_fresh = slots[2].1 == colour;
+        let ahead_fresh = slots[3..].iter().any(|s| s.1 == colour);
+        // The two BEHIND-slots are excluded from this one clause, and only from this one.
+        // `slots[0]` and `slots[1]` sit at deq-2 and deq-1: events this pump ALREADY CONSUMED. A
+        // consumed event necessarily carries the CURRENT colour — that is what made it consumable —
+        // so including them made `all_stale` false on a ring where the producer had posted nothing
+        // at all. boot21's necropsy #1 is exactly that: a plain nothing-posted pattern that fell
+        // through every clause and was graded "inconclusive" by the catch-all. The proposition
+        // being tested is "nothing was posted that we have not already taken", which is a claim
+        // about the dequeue slot and the slots AHEAD of it, so it is computed over precisely those.
+        // The raw slot list printed below is UNCHANGED — a reader still sees both behind-slots'
+        // colours and can check this reasoning against the same line.
+        let all_stale = slots[2..].iter().all(|s| s.1 != colour);
+        let pos_agree = hw_slot == sw_deq as i64;
+        // Each clause claims only what its pattern can carry. None of them can name WHICH transfer
+        // an event belongs to — that is the shape line's job — and none can prove a negative about
+        // the device, only about this ring.
+        let verdict = if at_deq_fresh {
+            "an event in OUR colour is sitting AT the dequeue slot — it was posted and never consumed. Consumer-side defect: the pump's drain walked past a fresh TRB rather than the controller staying silent"
+        } else if ahead_fresh {
+            "a slot AHEAD of our pointer carries our colour while the slot AT it does not — producer and consumer are desynced, the controller wrote past a position we never advanced through. Proves an event reached DRAM; does NOT identify which transfer posted it"
+        } else if all_stale && pos_agree {
+            "every photographed slot is stale-coloured and the controller's ERDP agrees with ours — nothing was posted on this ring at all. Transport verdict, and it should agree with the readcap-wedge line reading landed=false"
+        } else if !pos_agree {
+            "no fresh colour in view, but hw ERDP and our dequeue disagree on position — the controller is working from a pointer we did not publish (torn or stale ERDP), which is a different fault from a missing event and is not evidence about the device"
+        } else {
+            "no fresh colour, positions agree, but the window is not uniformly stale — inconclusive; read the raw slots on this line, not this clause"
+        };
+
+        serial_println!(
+            ":: BOT: [piusb40] necropsy — sw deq={} colour={} popped={} | hw ERDP={:#x} (slot {}) IMAN={:#x} | ring: {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} — {} ::",
+            sw_deq, colour, popped, erdp, hw_slot, iman,
+            slots[0].0, slots[0].1, slots[0].2,
+            slots[1].0, slots[1].1, slots[1].2,
+            slots[2].0, slots[2].1, slots[2].2,
+            slots[3].0, slots[3].1, slots[3].2,
+            slots[4].0, slots[4].1, slots[4].2,
+            slots[5].0, slots[5].1, slots[5].2,
+            slots[6].0, slots[6].1, slots[6].2,
+            slots[7].0, slots[7].1, slots[7].2,
+            verdict);
+    }
+
     /// BOT-RESCUE escalation (c): SURRENDER. Mark the disk FAILED, retract it from the block
     /// registry, and stop issuing transfers to the slot.
     ///
@@ -8510,13 +10213,524 @@ impl XhciController {
     /// arc's actual guarantee: a sick disk can never again spin the system at ~6 s per attempt
     /// forever. It is cleared when the slot is disposed or re-enumerated, so a physical replug is a
     /// clean slate and needs no operator action beyond the replug.
-    fn bot_surrender(&mut self, slot_id: u8, cause: BotError) {
+    // ==================== BOT-PARK: the global floor ====================
+
+    /// The physical identity behind a slot id, or `None` when the slot cannot name one (slot 0, an
+    /// inactive slot, or a slot with no root port). A `None` identity is charged nothing and gated
+    /// on nothing: the ledger only ever acts on devices it can place.
+    ///
+    /// **R24 boot5/boot6 — the miss.** This function used to return `None` for any slot whose
+    /// `vid`/`pid` were both zero, on the reasoning that a device the driver cannot name is a device
+    /// it should not judge. On the bench that reasoning is inverted: `slots[].vid/pid` are written
+    /// in exactly one place, the intercepted device-descriptor event on the ROOT enumeration path,
+    /// so every hub-downstream device carries 0000:0000 forever. The wedged SD reader hangs off a
+    /// 2109:3431 hub. Every BOT-PARK hook — `bot_park_charge`, `bot_park_note_ladder`,
+    /// `bot_park_note_surrender`, `bot_park_budget_cap`, `bot_park_gate`, the census — begins with
+    /// this call, so all of them were no-ops for the one device the whole mechanism was built for.
+    /// The capture proves it three ways at once: 60 `park yield` lines (so the ladder WAS entered,
+    /// 60 times, and `bot_park_note_ladder` charged none of them against a `LADDER_MAX` of 6), 97
+    /// pump waits every one of which reports the full `budget=450000000` (so the dead-ring cut never
+    /// engaged either), and no census line at all.
+    ///
+    /// The port is now the whole requirement. A device this driver is running BOT transfers against
+    /// is a device it has addressed, configured and found bulk endpoints on; refusing to hold it to
+    /// account because a descriptor banner never printed is the bug.
+    fn bot_ident(&self, slot_id: u8) -> Option<BotDevIdent> {
+        let i = slot_id as usize;
+        if i == 0 || i >= self.slots.len() || !self.slots[i].active {
+            return None;
+        }
+        let s = &self.slots[i];
+        if s.port_id == 0 {
+            return None; // no attachment point: nothing to key an account on
+        }
+        Some(BotDevIdent { port: s.port_id, route: s.route_string, vid: s.vid, pid: s.pid })
+    }
+
+    /// The park gate, consulted before any transfer is built. Two refusals, both up front and both
+    /// free:
+    ///   * PARKED — this identity has spent its whole account. It gets nothing: no CBW, no pump, no
+    ///     rung. This is the guarantee the arc exists for, and unlike `bot_surrendered_slot` it
+    ///     survives the device being handed a different slot id.
+    ///   * BACKING OFF — this identity's next ladder entry is not due yet. Declining here is what
+    ///     makes the back-off cooperative: the caller returns to the main loop, the frame paints,
+    ///     and the retry happens on a later pass instead of inside a `settle_ms` spin.
+    fn bot_park_gate(&mut self, slot_id: u8) -> Result<(), BotError> {
+        let id = match self.bot_ident(slot_id) { Some(i) => i, None => return Ok(()) };
+        let idx = match bot_park_find(&self.bot_park, id) { Some(i) => i, None => return Ok(()) };
+        if self.bot_park[idx].parked {
+            // BOTLATCH M2 (finding 5) — THE ONE RE-PROBE. A dead ring and a NAKing-but-healthy
+            // device (cold spin-up, card just inserted) are byte-identical on the event ring: both
+            // post nothing. The park is therefore right about the evidence and can be wrong about
+            // the device, and before this it was unrecoverable without an operator. So: after
+            // `BOT_PARK_REPROBE_MS` of uptime, a dead-ring park unparks itself ONCE and falls
+            // through to the verdict below with its dead-ring allowance restored. If the device has
+            // become ready, its next completion runs `bot_park_note_success` and the account is
+            // simply clear. If the ring is really dead, the probe costs one wait at the CUT budget
+            // (~0.3 s — `dead_streak` is preserved across the unpark precisely so it does) and the
+            // re-park is permanent, because `reprobed` is now set.
+            //
+            // Read on the wire as: PARKED, then this line ~60 s later, then either silence (the
+            // device is back) or a second PARKED (it was not). `parked_total` counts both, which is
+            // correct — two parks did happen, and the pair is the evidence.
+            let now = crate::arch::now_cycles();
+            if !self.bot_park[idx].reprobe_due(now) {
+                BOT_PARK_REFUSED.fetch_add(1, Ordering::Relaxed);
+                return Err(BotError::NoDevice);
+            }
+            self.bot_park[idx].take_reprobe();
+            BOT_PARK_REPROBES.fetch_add(1, Ordering::Relaxed);
+            let e = self.bot_park[idx];
+            serial_println!(
+                ":: BOT: park re-probe slot={} port={} route={:#x} vid={:04x} pid={:04x} after_ms={} dead_streak={} dead_max={} reprobes={} — this identity was PARKED on the dead-ring clause, which cannot tell a dead ring from a device that was NAKing (cold spin-up, card just inserted). One automatic probe, once per account: the dead-ring count is zeroed, the budget cut is KEPT so this costs ~1/{} of a wait, and if it dead-rings again the park is permanent (only a physical replug re-arms this) ::",
+                slot_id, id.port, id.route, id.vid, id.pid,
+                BOT_PARK_REPROBE_MS, e.dead_streak, BOT_PARK_DEAD_MAX,
+                BOT_PARK_REPROBES.load(Ordering::Relaxed), BOT_PARK_DEAD_DIV);
+            // Fall through. The verdict below re-reads the account: any OTHER clause still at its
+            // bound re-parks the identity in this same call, and permanently — which is the right
+            // answer, since the cooldown is evidence about a ring, not about a ladder budget.
+        }
+        // THE VERDICT, TAKEN OFF THE LADDER'S CRITICAL PATH (R24 boot6). Before this arc
+        // `verdict()` was consulted in exactly one place — `bot_park_note_ladder`, i.e. only when a
+        // ladder was ENTERED. The wall-clock and dead-ring clauses are charged by the PUMP, which
+        // runs whether or not any ladder follows, so a flow that accrues time without entering
+        // ladders could accrue it forever: boot6's 60 ladder entries all yielded at the per-pass cap
+        // before running a rung, and its 84 timeouts were charged nowhere at all. The gate is the
+        // one place every transfer and every bring-up passes through, so the clause that fires is
+        // now read here, in constant time, from an account that already exists.
+        if let Some(why) = self.bot_park[idx].verdict(Self::cycles_per_ms().max(1)) {
+            self.bot_park_device(slot_id, why, BotError::Timeout);
+            // A park reached here has NOT come through the ladder, so nothing else will retract the
+            // block layer's publish. Surrender against the CURRENT publish generation — the PA35
+            // ladder-gen capture exists to stop a ladder retracting a publish made after it started,
+            // and there is no ladder in flight on this path.
+            let pubgen = crate::drivers::block::usb_publish_gen();
+            self.bot_surrender(slot_id, BotError::Timeout, pubgen);
+            BOT_PARK_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return Err(BotError::NoDevice);
+        }
+        // BOUNDED WORK PER PASS. Reached only for an identity that already has an account, so a
+        // device nothing has gone wrong with never tests this. The wait this declines is the SECOND
+        // (or fourth) multi-second wait of one main-loop pass — the composition the boot3
+        // per-pass measurement caught at 1.0-2.0 BILLION cycles while the same log's normal pass
+        // cost 119-134. Nothing in flight is truncated; the pass simply does not begin another one.
+        if self.bot_pass_exhausted(slot_id) {
+            BOT_PARK_PASS_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return Err(BotError::NoDevice);
+        }
+        let until = self.bot_park[idx].backoff_until;
+        if until != 0 {
+            if crate::arch::now_cycles().wrapping_sub(until) as i64 >= 0 {
+                self.bot_park[idx].backoff_until = 0;
+            } else {
+                BOT_PARK_BACKOFF_REFUSED.fetch_add(1, Ordering::Relaxed);
+                // FIXTURE ONLY (`botwedge`): the same clock reconciliation as the injection's own
+                // credit, applied on the side of the gate that does the refusing. The refusal is
+                // real and is counted; what is credited is the fictional wait the refused attempt
+                // would have paid on metal — ~7.2 s at 62.5 MHz, longer than any back-off this
+                // ledger arms. Without it the gate refuses forever on a clock nothing advances:
+                // the previous run of this gate ended `backoff_refused=15 cycles=900000000
+                // ms=14400`, i.e. two charged waits out of sixteen attempts, and PARKED stayed
+                // unreachable in QEMU. Nothing here is compiled into a normal build.
+                #[cfg(feature = "botwedge")]
+                {
+                    let synthetic = crate::arch::hw_wait_budget()
+                        .saturating_mul(self.bot_budget_scale.max(1));
+                    self.bot_park_credit_backoff(slot_id, synthetic);
+                }
+                return Err(BotError::NoDevice);
+            }
+        }
+        Ok(())
+    }
+
+    /// Has this main-loop pass already spent `BOT_PARK_PASS_MS` on this identity?
+    ///
+    /// True only for an identity that HAS an account — i.e. one something has already gone wrong
+    /// with. A healthy device is never subject to the bound, which is what lets the bound be tight
+    /// enough to matter: the boot3 capture's entire healthy BOT time was ~5 s (`sum=304556240`),
+    /// half of this, while its four pathological PASSES cost 20-37 s each.
+    ///
+    /// Consulted at every point where a further multi-second wait would be STARTED — the park gate,
+    /// the post-recovery retry, and each rung's retry — because those are the composition, not any
+    /// single wait, that the measurement convicted.
+    /// Open a new main-loop pass. Called where the desktop loop hands the driver its synchronous
+    /// BOT time: `poll_events` (every desktop iteration) and `service_storage`.
+    fn bot_pass_begin(&mut self) {
+        self.bot_pass_ladders = 0;
+        self.bot_pass_pump = 0;
+        self.bot_pass_start = crate::arch::now_cycles();
+    }
+
+    /// End the pass on its own wall clock when the caller loop never offered a boundary.
+    ///
+    /// **R24 boot6 — why this exists.** The `park yield` lines in that capture read
+    /// `pass_ladders=2,3,4 … 33` and then, after the reader re-enumerated onto a different slot,
+    /// `2,3,4 … 29`. The counter is reset in `poll_events` and `service_storage`, so 33 consecutive
+    /// ladder entries without a reset is proof that the flow reaching the ladder never returned
+    /// through either: the SCSI probe/diagnostic sequences are straight-line chains of commands
+    /// inside ONE desktop iteration. A per-pass cap whose pass never ends is not a cap, it is an
+    /// off switch — every entry after the first yielded at the top, so no rung ever ran, no
+    /// surrender was ever reached, and the ladder was silently defanged for the entire boot while
+    /// the pump went on paying `budget=450000000` per attempt.
+    ///
+    /// Rolling on `BOT_PARK_PASS_MS` restores forward progress without loosening anything: the
+    /// per-pass caps still hold inside each window, and the throttle's own budget
+    /// (`BOT_PARK_PASS_PUMP_MS`) is what bounds the cost of a window.
+    fn bot_pass_roll(&mut self) {
+        if self.bot_pass_start == 0 {
+            self.bot_pass_begin();
+            return;
+        }
+        let span = Self::cycles_per_ms().max(1).saturating_mul(BOT_PARK_PASS_MS);
+        if crate::arch::now_cycles().wrapping_sub(self.bot_pass_start) >= span {
+            self.bot_pass_begin();
+        }
+    }
+
+    /// THE DESKTOP THROTTLE. Has this main-loop pass already spent `BOT_PARK_PASS_PUMP_MS` inside
+    /// TIMED-OUT BOT pump waits?
+    ///
+    /// Timed-out waits only, and that is the whole safety argument. A completion is charged nothing,
+    /// so a healthy bulk read — the FAT layer walking a large file through dozens of sequential
+    /// READ(10)s inside one desktop frame — can never trip this no matter how much work it does.
+    /// What it bounds is the pass's UNPRODUCTIVE time: on boot6 one wedged attempt cost a full
+    /// `budget=450000000` and a pass paid several of them back to back, on the desktop's own thread,
+    /// with the vug at wf=1-2. Two seconds is under one such budget, so once a pass has eaten a
+    /// timeout it starts no further transfer at all — the caller returns, the frame paints, and the
+    /// next pass decides again.
+    ///
+    /// Unlike `bot_pass_exhausted` this is NOT gated on the identity having an account: the first
+    /// wedged attempt of a device the ledger has never heard of is precisely the case the metal
+    /// capture is made of.
+    fn bot_pump_throttled(&self) -> bool {
+        if self.bot_pass_start == 0 {
+            return false;
+        }
+        self.bot_pass_pump >= Self::cycles_per_ms().max(1).saturating_mul(BOT_PARK_PASS_PUMP_MS)
+    }
+
+    /// Cycles of pump budget this pass has left before the throttle closes it, never reported below
+    /// `hw_wait_budget()` — the base metal-earned handshake budget, which nothing in this arc is
+    /// allowed to shorten a wait below.
+    fn bot_pass_pump_left(&self) -> u64 {
+        let cap = Self::cycles_per_ms().max(1).saturating_mul(BOT_PARK_PASS_PUMP_MS);
+        cap.saturating_sub(self.bot_pass_pump).max(crate::arch::hw_wait_budget())
+    }
+
+    fn bot_pass_exhausted(&self, slot_id: u8) -> bool {
+        if self.bot_pass_start == 0 {
+            return false;
+        }
+        let id = match self.bot_ident(slot_id) { Some(i) => i, None => return false };
+        if bot_park_find(&self.bot_park, id).is_none() {
+            return false;
+        }
+        let spent = crate::arch::now_cycles().wrapping_sub(self.bot_pass_start);
+        spent >= Self::cycles_per_ms().max(1).saturating_mul(BOT_PARK_PASS_MS)
+    }
+
+    /// Charge one pump wait to a slot's identity. `dead` = the wait ended in a timeout with a
+    /// PROVABLY idle ring (the [piusb40] necropsy signature); it drives the budget cap, and any
+    /// wait that is not dead clears the streak.
+    ///
+    /// Opens no account on the happy path: a device with no history is charged only once it has a
+    /// ledger entry, so a healthy boot pays one 4-entry scan of `used` flags per stage and nothing
+    /// else.
+    fn bot_park_charge(&mut self, slot_id: u8, used: u64, dead: bool) {
+        let id = match self.bot_ident(slot_id) { Some(i) => i, None => return };
+        let idx = if dead {
+            match bot_park_open(&mut self.bot_park, id) { Some(i) => i, None => return }
+        } else {
+            match bot_park_find(&self.bot_park, id) { Some(i) => i, None => return }
+        };
+        self.bot_park[idx].cycles = self.bot_park[idx].cycles.saturating_add(used);
+        if dead {
+            self.bot_park[idx].dead_streak = self.bot_park[idx].dead_streak.saturating_add(1);
+            // BOTLATCH: the same event, charged to the counter the PARK verdict reads. The streak
+            // above is reset by any live wait and so can only ever arm a budget cut; this one is
+            // the identity's standing record of how many times its ring has been proven idle.
+            self.bot_park[idx].dead_total = self.bot_park[idx].dead_total.saturating_add(1);
+        } else {
+            self.bot_park[idx].dead_streak = 0;
+        }
+    }
+
+    /// BOTLATCH M2 (finding 4). A BOT transfer COMPLETED for this slot's identity: the device's own
+    /// transfer event landed on the ring. Zero the dead-ring verdict counter.
+    ///
+    /// WHERE THIS IS CALLED FROM, and why nowhere else. Exactly one site: `pump_until_bot_done`'s
+    /// `Some(p) if p.done` arm — the arm reached only when the awaited stage has its completion
+    /// event. Not the timeout arm, not the `None` (nothing-pending) arm, and not anything that
+    /// merely observes traffic. That distinction is the whole content of the fix: `dead_streak` is
+    /// already refunded by any live wait, INCLUDING one made live by another device's events on the
+    /// shared ring, and a verdict counter that could be refunded the same way would be `dead_streak`
+    /// under a second name — the exact defect BOTLATCH exists to close.
+    ///
+    /// A non-SUCCESS completion code still counts, and should: a STALL or a babble is the device
+    /// ANSWERING. It disproves "provably idle ring" just as loudly as a Passed CSW, and the failure
+    /// it does describe is already charged to `ladders`/`surrenders`, whose bounds are untouched
+    /// here. What cannot reach this call is the wedge: boot5's reader posted no event of any kind.
+    ///
+    /// Opens no account (`find`, not `open`) and returns immediately on the overwhelmingly common
+    /// path — a healthy device's completion costs one 4-entry scan and a compare against zero.
+    fn bot_park_note_success(&mut self, slot_id: u8) {
+        let id = match self.bot_ident(slot_id) { Some(i) => i, None => return };
+        let idx = match bot_park_find(&self.bot_park, id) { Some(i) => i, None => return };
+        if self.bot_park[idx].note_success() {
+            BOT_PARK_DEAD_FORGIVEN.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// FIXTURE ONLY (`botwedge`). Advance an identity's back-off deadline by the wait the injected
+    /// wedge stands in for.
+    ///
+    /// The two clocks have to agree or the fixture is vacuous, and the first attempt at this arc's
+    /// gate proved it: the injection returns without pumping, so 13 retries land inside one 200 ms
+    /// back-off window in microseconds, and the run ends with `backoff_refused=15`,
+    /// `cycles=900000000 ms=14400` — accruing on a fictional clock while the gate refuses on the
+    /// real one, so the wall-clock clause is unreachable in QEMU for a second reason after the
+    /// first was fixed. On metal no credit is needed and none is given: a real wait of
+    /// `hw_wait_budget() * BOT_BUDGET_SCALE_FIRST` (~7.2 s at 62.5 MHz) already outlasts even
+    /// `BOT_PARK_BACKOFF_MAX_MS`, so the deadline expires inside the wait by itself. This only
+    /// hands the fixture the same arithmetic.
+    #[cfg(feature = "botwedge")]
+    fn bot_park_credit_backoff(&mut self, slot_id: u8, elapsed: u64) {
+        let id = match self.bot_ident(slot_id) { Some(i) => i, None => return };
+        let idx = match bot_park_find(&self.bot_park, id) { Some(i) => i, None => return };
+        let until = self.bot_park[idx].backoff_until;
+        if until == 0 {
+            return;
+        }
+        let remaining = until.wrapping_sub(crate::arch::now_cycles());
+        self.bot_park[idx].backoff_until = if (remaining as i64) <= 0 || remaining <= elapsed {
+            0
+        } else {
+            until.wrapping_sub(elapsed)
+        };
+    }
+
+    /// The dead-ring budget cap for a slot, or `None` when the identity has not earned one. Applied
+    /// as a `min` against the scaled budget, so it can only ever SHORTEN a wait — a healthy device
+    /// never reaches the streak and never sees this number.
+    fn bot_park_budget_cap(&self, slot_id: u8) -> Option<u64> {
+        let id = self.bot_ident(slot_id)?;
+        let idx = bot_park_find(&self.bot_park, id)?;
+        if self.bot_park[idx].dead_streak >= BOT_PARK_DEAD_STREAK {
+            Some((crate::arch::hw_wait_budget() / BOT_PARK_DEAD_DIV).max(1))
+        } else {
+            None
+        }
+    }
+
+    /// Charge one ladder entry and return the park verdict, arming the escalating back-off for the
+    /// next entry either way. `Some(why)` = this identity is done.
+    fn bot_park_note_ladder(&mut self, slot_id: u8) -> Option<&'static str> {
+        let id = self.bot_ident(slot_id)?;
+        let idx = bot_park_open(&mut self.bot_park, id)?;
+        let per_ms = Self::cycles_per_ms().max(1);
+        self.bot_park[idx].ladders = self.bot_park[idx].ladders.saturating_add(1);
+        let back = self.bot_park[idx].backoff_cycles(per_ms);
+        self.bot_park[idx].backoff_until = crate::arch::now_cycles().wrapping_add(back);
+        self.bot_park[idx].verdict(per_ms)
+    }
+
+    /// Charge one surrender. Separate from the ladder charge because a surrender is the ladder's
+    /// own verdict on a whole generation, and two of them across a cold re-enumeration is the
+    /// signature the metal cycle is made of.
+    fn bot_park_note_surrender(&mut self, slot_id: u8) {
+        let id = match self.bot_ident(slot_id) { Some(i) => i, None => return };
+        if let Some(idx) = bot_park_open(&mut self.bot_park, id) {
+            self.bot_park[idx].surrenders = self.bot_park[idx].surrenders.saturating_add(1);
+        }
+    }
+
+    /// Note a fresh enumeration of an identity. It does NOT reset the account and it does NOT
+    /// unpark: a re-enumeration is what the wedge produces, not what cures it. It only counts, so
+    /// the census can say how many times the same reader came back.
+    fn bot_park_note_gen(&mut self, slot_id: u8) {
+        let id = match self.bot_ident(slot_id) { Some(i) => i, None => return };
+        if let Some(idx) = bot_park_find(&self.bot_park, id) {
+            self.bot_park[idx].gens = self.bot_park[idx].gens.saturating_add(1);
+        }
+    }
+
+    /// A slot bound to a device has been disposed. Two things happen here, and they are the two
+    /// halves of "a disconnect must end a ladder":
+    ///
+    ///   1. TEARDOWN. If the ladder is currently walking THIS slot, latch the abort so it stops
+    ///      between rungs instead of driving resets, port cycles and retries at a device that has
+    ///      physically left. Before this arc a mid-ladder disconnect ran `bot_rescue_clear`, which
+    ///      reset `bot_fail_streak` and `bot_rescue_stage` — both driver-global, not per-slot — so
+    ///      the in-flight ladder did not merely survive the unplug, it got its allowance BACK.
+    ///
+    ///   2. THE UNPARK RULE. A disconnect this driver did not cause is an operator event: the
+    ///      device was pulled, and whatever comes back deserves a clean slate, so the account is
+    ///      closed. A disconnect inside the window `rescue_port_cycle`/`rescue_hub_port_cycle`
+    ///      armed on this route is OUR OWN act — the cure — and closing the account there is
+    ///      precisely the hole the metal capture fell through. The park therefore survives every
+    ///      re-enumeration the ladder itself causes, and only a real replug clears it.
+    fn bot_park_note_disconnect(&mut self, slot_id: u8) {
+        if self.bot_ladder_slot != 0 && self.bot_ladder_slot == slot_id {
+            self.bot_ladder_abort = true;
+            BOT_PARK_ABORTS.fetch_add(1, Ordering::Relaxed);
+            serial_println!(
+                ":: BOT: park ladder-abort slot={} — the slot under the running rescue ladder was disposed; no further rungs, retries or transfers on it ::",
+                slot_id);
+        }
+        let id = match self.bot_ident(slot_id) { Some(i) => i, None => return };
+        let now = crate::arch::now_cycles();
+        let ours = self.bot_self_cycle_until != 0
+            && (now.wrapping_sub(self.bot_self_cycle_until) as i64) < 0
+            && self.bot_self_cycle_port == id.port
+            && self.bot_self_cycle_route == id.route;
+        if ours {
+            serial_println!(
+                ":: BOT: park keep slot={} port={} route={:#x} vid={:04x} pid={:04x} — disconnect attributed to THIS DRIVER'S OWN port cycle; the ledger is NOT cleared ::",
+                slot_id, id.port, id.route, id.vid, id.pid);
+            return;
+        }
+        if bot_park_forget(&mut self.bot_park, id) {
+            serial_println!(
+                ":: BOT: park clear slot={} port={} route={:#x} vid={:04x} pid={:04x} — operator disconnect (outside any self-cycle window); ledger closed, a replug is a clean slate ::",
+                slot_id, id.port, id.route, id.vid, id.pid);
+        }
+    }
+
+    /// Arm the self-cycle attribution window. Called by both power-cycle rungs with the route they
+    /// just cut power to. The window covers the off dwell, the on settle and a full second of
+    /// re-enumeration slack — long enough that the disconnect and reconnect the rung causes both
+    /// land inside it, short enough that an operator replug seconds later does not.
+    fn bot_park_arm_self_cycle(&mut self, port: u8, route: u32) {
+        let per_ms = Self::cycles_per_ms().max(1);
+        let ms = BOT_RESCUE_PORT_OFF_MS + BOT_RESCUE_PORT_ON_MS + 1_000;
+        self.bot_self_cycle_until = crate::arch::now_cycles()
+            .wrapping_add(per_ms.saturating_mul(ms));
+        self.bot_self_cycle_port = port;
+        self.bot_self_cycle_route = route;
+    }
+
+    /// THE census line. One per parked device, naming the identity, the clause that fired, and what
+    /// the ladder spent getting there — so the next metal wedge diagnoses itself off the log instead
+    /// of off a reconstruction. `cycles=`/`ms=` is the number the 2026-08-17 sitting had to measure
+    /// by watching a core sit at 99%.
+    fn bot_park_device(&mut self, slot_id: u8, why: &'static str, cause: BotError) {
+        let id = match self.bot_ident(slot_id) { Some(i) => i, None => return };
+        let idx = match bot_park_open(&mut self.bot_park, id) { Some(i) => i, None => return };
+        if self.bot_park[idx].parked {
+            return; // one verdict line per device, not one per caller
+        }
+        self.bot_park[idx].parked = true;
+        BOT_PARK_COUNT.fetch_add(1, Ordering::Relaxed);
+        let per_ms = Self::cycles_per_ms().max(1);
+        // BOTLATCH M2 (finding 5): a DEAD-RING park — and only a dead-ring park — arms the one
+        // automatic re-probe. The other three clauses are the ladder's own verdicts on work it
+        // actually did (entries, surrenders, wall-clock); a cooldown does not make any of that
+        // evidence less true, so nothing there is provisional. `arm_reprobe` is a no-op on an
+        // account that has already spent its probe, which is what makes a second park permanent.
+        if why == "dead-ring" {
+            self.bot_park[idx].arm_reprobe(crate::arch::now_cycles(), per_ms);
+        }
+        let e = self.bot_park[idx];
+        serial_println!(
+            ":: BOT: PARKED slot={} port={} route={:#x} vid={:04x} pid={:04x} why={} cause={:?} ladders={}/{} surrenders={}/{} gens={} cycles={} ms={} max_ms={} dead={}/{} dead_streak={} refused={} capped={} yields={} parked_total={} — device account CLOSED: no transfer, no bring-up and no rescue rung on this identity until it is physically replugged (a re-enumeration this driver causes does NOT unpark it) ::",
+            slot_id, id.port, id.route, id.vid, id.pid, why, cause,
+            e.ladders, BOT_PARK_LADDER_MAX, e.surrenders, BOT_PARK_SURRENDER_MAX, e.gens,
+            e.cycles, e.cycles / per_ms, BOT_PARK_CYCLE_MAX_MS,
+            e.dead_total, BOT_PARK_DEAD_MAX, e.dead_streak,
+            BOT_PARK_REFUSED.load(Ordering::Relaxed)
+                + BOT_PARK_PASS_REFUSED.load(Ordering::Relaxed),
+            BOT_PARK_CAPPED.load(Ordering::Relaxed),
+            BOT_PARK_YIELDS.load(Ordering::Relaxed),
+            BOT_PARK_COUNT.load(Ordering::Relaxed));
+        // THE CENSUS, ON THE WIRE, AT THE VERDICT. `log_summary_once` fires on the main loop's
+        // 2000th pass, and R24 boot6 never reached it: the wedge held the desktop at wf=1-2 for the
+        // whole sitting, so the capture contains no `park census`/`park rollup` line at all and the
+        // ledger's state had to be inferred from what was missing. A verdict that cannot be read off
+        // the log is half an instrument — so the census is printed HERE too, where it is guaranteed
+        // to reach the wire the moment a device is parked.
+        self.bot_park_census();
+    }
+
+    /// The ledger's boot rollup, on its own line so every pre-existing BOT line stays byte-
+    /// comparable with captures taken before this arc. Prints even when empty: "no device ever
+    /// opened an account" is a finding, and an absent line would be indistinguishable from an
+    /// absent instrument.
+    fn bot_park_census(&self) {
+        let per_ms = Self::cycles_per_ms().max(1);
+        let mut n = 0usize;
+        // BOTLATCH: the reading key, printed once ahead of the accounts. The R24 boot5 sitting had
+        // to be reconstructed from what the log did NOT contain; the next one should be readable
+        // off the wire without a source tree. Four clauses, any one of which closes an account —
+        // stated with their bounds so a capture's numbers can be compared to them directly.
+        serial_println!(
+            ":: PIUSB: [botpark] key — an identity is (root port + route string); it survives re-enumeration and slot-id reuse, which is what the per-slot surrender could not. Four PARK clauses, first to reach its bound closes the account: surrenders>={} (the ladder's verdict on two whole generations) | ladders>={} (retry entries across all generations) | ms>={} (pump wall-clock charged to the identity) | dead>={} (pump timeouts on a PROVABLY IDLE ring — no event, no foreign event, no doorbell for the whole wait; CUMULATIVE, so a live wait does not refund it). dead_streak>={} additionally CUTS the pump budget to 1/{} of base — read dead= not dead_streak= when asking why a device did or did not park. named=no means hub-downstream (no VID:PID banner) and is normal. BOTLATCH M2: the dead clause is the only one with a forgiveness rule, because it is the only one that can be wrong about a HEALTHY device (a NAKing spin-up posts no event, exactly like a dead ring) — a COMPLETED transfer zeroes dead=, and a dead-ring park unparks itself once after {} ms for a single probe at the cut budget (reprobe= says none/armed/spent; a second park on the same identity is permanent) ::",
+            BOT_PARK_SURRENDER_MAX, BOT_PARK_LADDER_MAX, BOT_PARK_CYCLE_MAX_MS, BOT_PARK_DEAD_MAX,
+            BOT_PARK_DEAD_STREAK, BOT_PARK_DEAD_DIV, BOT_PARK_REPROBE_MS);
+        for e in self.bot_park.iter().filter(|e| e.used) {
+            n += 1;
+            serial_println!(
+                ":: BOT: park census port={} route={:#x} vid={:04x} pid={:04x} parked={} ladders={} surrenders={} gens={} cycles={} ms={} dead={} dead_streak={} result=CENSUS ::",
+                e.ident.port, e.ident.route, e.ident.vid, e.ident.pid,
+                if e.parked { "yes" } else { "no" },
+                e.ladders, e.surrenders, e.gens, e.cycles, e.cycles / per_ms,
+                e.dead_total, e.dead_streak);
+            // BOTLATCH: the same account read as DISTANCE TO EACH BOUND, tagged `[botpark]` so one
+            // awk family pulls the whole ledger out of a metal capture. `why=` is what `verdict()`
+            // says about this account RIGHT NOW — `none` on a live account is the ledger stating
+            // that it has seen the device and is not yet done with it, which is exactly the fact
+            // boot5's log could not distinguish from "the ledger is switched off".
+            serial_println!(
+                ":: PIUSB: [botpark] account port={} route={:#x} vid={:04x} pid={:04x} named={} parked={} why={} surrenders={}/{} ladders={}/{} ms={}/{} dead={}/{} dead_streak={}/{} budget_cut={} gens={} reprobe={} ::",
+                e.ident.port, e.ident.route, e.ident.vid, e.ident.pid,
+                if e.ident.anonymous() { "no" } else { "yes" },
+                if e.parked { "yes" } else { "no" },
+                e.verdict(per_ms).unwrap_or("none"),
+                e.surrenders, BOT_PARK_SURRENDER_MAX, e.ladders, BOT_PARK_LADDER_MAX,
+                e.cycles / per_ms, BOT_PARK_CYCLE_MAX_MS,
+                e.dead_total, BOT_PARK_DEAD_MAX,
+                e.dead_streak, BOT_PARK_DEAD_STREAK,
+                if e.dead_streak >= BOT_PARK_DEAD_STREAK { "on" } else { "off" },
+                e.gens,
+                // BOTLATCH M2 (finding 5). `armed` = this park is provisional and a probe is due;
+                // `spent` = the one probe has been used, so any park on this identity is now
+                // permanent; `none` = no dead-ring park has been taken on this account.
+                if e.reprobed { "spent" } else if e.reprobe_at != 0 { "armed" } else { "none" });
+        }
+        serial_println!(
+            ":: BOT: park rollup accounts={} parked={} refused={} backoff_refused={} pass_refused={} aborts={} capped={} yields={} pump_refused={} anon={} ladder_max={} surrender_max={} cycle_max_ms={} dead_max={} pass_ms={} pass_pump_ms={} reprobes={} dead_forgiven={} reprobe_ms={} result=CENSUS ::",
+            n, BOT_PARK_COUNT.load(Ordering::Relaxed),
+            BOT_PARK_REFUSED.load(Ordering::Relaxed),
+            BOT_PARK_BACKOFF_REFUSED.load(Ordering::Relaxed),
+            BOT_PARK_PASS_REFUSED.load(Ordering::Relaxed),
+            BOT_PARK_ABORTS.load(Ordering::Relaxed),
+            BOT_PARK_CAPPED.load(Ordering::Relaxed),
+            BOT_PARK_YIELDS.load(Ordering::Relaxed),
+            BOT_PARK_PUMP_REFUSED.load(Ordering::Relaxed),
+            BOT_PARK_ANON.load(Ordering::Relaxed),
+            BOT_PARK_LADDER_MAX, BOT_PARK_SURRENDER_MAX, BOT_PARK_CYCLE_MAX_MS, BOT_PARK_DEAD_MAX,
+            BOT_PARK_PASS_MS, BOT_PARK_PASS_PUMP_MS,
+            // BOTLATCH M2: the two forgiveness meters, appended so every pre-existing field on this
+            // line keeps its name and position. `reprobes=` is parks that were given their one
+            // automatic second chance; `dead_forgiven=` is dead-ring accounts a COMPLETED transfer
+            // zeroed. Both are zero on a healthy boot, and a non-zero `dead_forgiven=` with
+            // `parked=0` is the finding-4 case that used to end in a permanent park.
+            BOT_PARK_REPROBES.load(Ordering::Relaxed),
+            BOT_PARK_DEAD_FORGIVEN.load(Ordering::Relaxed),
+            BOT_PARK_REPROBE_MS);
+    }
+
+    fn bot_surrender(&mut self, slot_id: u8, cause: BotError, ladder_gen: u64) {
         if self.bot_surrendered_slot == slot_id {
             return; // already surrendered; one verdict line per disk, not one per caller
         }
         BOT_RESCUE_SURRENDER.fetch_add(1, Ordering::Relaxed);
+        // BOT-PARK: charge the surrender to the DEVICE before it is bound to a slot id. A second
+        // surrender on one identity — necessarily across a cold re-enumeration, since that is what
+        // the ladder's last rung causes — is the metal cycle's signature and parks it below.
+        self.bot_park_note_surrender(slot_id);
         self.bot_surrendered_slot = slot_id;
-        let retracted = crate::drivers::block::unpublish_usb_geometry(slot_id);
+        let retracted = crate::drivers::block::unpublish_usb_geometry(slot_id, ladder_gen);
         if self.storage_slot == slot_id {
             self.storage_slot = 0;
             self.storage_pending_bringup = false;
@@ -8532,6 +10746,22 @@ impl XhciController {
             BOT_RESCUE_RESET_DEVICE.load(Ordering::Relaxed),
             BOT_RESCUE_PORT_CYCLE.load(Ordering::Relaxed),
             if retracted { "yes" } else { "no-registry-entry" });
+        // BOT-PARK: take the verdict HERE too, not only at the next ladder entry. The whole reason
+        // the surrender was insufficient on metal is that the ladder's last rung re-enumerates the
+        // device, so "the next ladder entry" arrives on a DIFFERENT slot id with a clean per-slot
+        // state — the account is the only thing that remembers, and it must be able to close the
+        // door on the way out rather than one generation later.
+        if let Some(why) = self.bot_park_verdict(slot_id) {
+            self.bot_park_device(slot_id, why, cause);
+        }
+    }
+
+    /// The park verdict for a slot's identity, without charging anything. `None` when the identity
+    /// has no account or the account is still open.
+    fn bot_park_verdict(&self, slot_id: u8) -> Option<&'static str> {
+        let id = self.bot_ident(slot_id)?;
+        let idx = bot_park_find(&self.bot_park, id)?;
+        self.bot_park[idx].verdict(Self::cycles_per_ms().max(1))
     }
 
     /// BOT-RESCUE: clear a slot's escalation state — called when a transaction COMPLETES (the
@@ -8540,6 +10770,15 @@ impl XhciController {
     fn bot_rescue_clear(&mut self, slot_id: u8) {
         self.bot_fail_streak = 0;
         self.bot_rescue_stage = 0;
+        // [piusb41] PA34 + S1Z: a completed transaction ends the fold streak ONLY when it was a
+        // REAL completion — the fold's own `Ok` return is a member of the streak, not its end.
+        // Unconditional, this line made the PA34 two-fold trigger unfireable: fold #1 returned
+        // `Ok`, the caller's completion-clear ran this store, and fold #2's increment started
+        // from zero again. (The fresh-enumeration clean slate PA34 wanted lives explicitly in
+        // `bring_up_storage` now.)
+        if !self.bot_txn_folded {
+            BOT_FOLD_STREAK.store(0, Ordering::Relaxed);
+        }
         if self.bot_surrendered_slot == slot_id {
             self.bot_surrendered_slot = 0;
         }
@@ -8552,6 +10791,25 @@ impl XhciController {
     fn bot_rescue_retry(&mut self, slot_id: u8, cdb: &[u8], data_phys: u64, data_len: u32,
         dir: Direction, rung: &'static str) -> Option<Result<BotResult, BotError>>
     {
+        // BOT-PARK: a rung's retry is still a transfer. If the slot went away while the rung was
+        // driving hardware (a port cycle raises a disconnect BY DESIGN), do not put a CBW on a dead
+        // pipe and do not pay another pump budget for it.
+        if self.bot_ladder_abort {
+            serial_println!(
+                ":: BOT: park retry-refused rung={} slot={} — slot disposed mid-ladder; the retry is not issued ::",
+                rung, slot_id);
+            return Some(Err(BotError::NoDevice));
+        }
+        // BOT-PARK: same bound at the rung's own retry. A ladder chains several waits — first
+        // attempt, post-recovery retry, then one per rung — and it is that COMPOSITION the boot3
+        // per-pass measurement caught at 1.0-2.0 billion cycles, not any one wait.
+        if self.bot_pass_exhausted(slot_id) {
+            BOT_PARK_PASS_REFUSED.fetch_add(1, Ordering::Relaxed);
+            serial_println!(
+                ":: BOT: park pass-refused slot={} what=rung-retry rung={} pass_ms={} — the rung ran; its retry waits for a later main-loop pass ::",
+                slot_id, rung, BOT_PARK_PASS_MS);
+            return None;
+        }
         self.bot_budget_scale = BOT_BUDGET_SCALE_ESCALATION;
         let r = self.bot_transfer_once(slot_id, cdb, data_phys, data_len, dir);
         self.bot_budget_scale = BOT_BUDGET_SCALE_FIRST;
@@ -8584,6 +10842,40 @@ impl XhciController {
     fn bot_rescue_escalate(&mut self, slot_id: u8, cdb: &[u8], data_phys: u64, data_len: u32,
         dir: Direction, cause: BotError) -> Result<BotResult, BotError>
     {
+        // PA35 race: the ladder may itself resurrect the device (its port-cycle re-enumerates and
+        // the fresh bring-up PUBLISHES mid-ladder). The surrender at the ladder's end may only
+        // retract the publish generation the ladder was earned against — captured HERE, at entry.
+        let ladder_gen = crate::drivers::block::usb_publish_gen();
+        // BOT-PARK (1/3): the ladder now has an owner, so a disconnect can tear it down. Latched
+        // here and released on every exit below.
+        self.bot_ladder_slot = slot_id;
+        self.bot_ladder_abort = false;
+        // BOT-PARK (2/3): charge the entry against the DEVICE and take the global verdict BEFORE
+        // any rung runs. Reached only on a failed recovery+retry, so a healthy device never gets
+        // here at all — but a device that keeps arriving here has now spent something it cannot
+        // earn back by being re-enumerated, and when the account is empty the rungs are SKIPPED.
+        // Skipping them is the point: rung (b)/(b') is a port power cycle, and the power cycle is
+        // what re-enumerated the wedged reader into a fresh slot id and a fresh allowance on metal.
+        if let Some(why) = self.bot_park_note_ladder(slot_id) {
+            self.bot_park_device(slot_id, why, cause);
+            self.bot_surrender(slot_id, cause, ladder_gen);
+            self.bot_ladder_slot = 0;
+            return Err(cause);
+        }
+        // BOT-PARK (3/3): bounded work per main-loop pass. The pump is scheduled cooperatively —
+        // `main.rs`'s desktop loop calls `service_storage`, and the block layer's reads run from the
+        // same loop — so yielding means returning to the caller and letting the frame paint. One
+        // ladder per pass, with the escalating back-off armed above deciding when the next pass may
+        // charge another. The wait is therefore paid in rendered frames, not in `settle_ms` spin.
+        self.bot_pass_ladders = self.bot_pass_ladders.saturating_add(1);
+        if self.bot_pass_ladders > BOT_PARK_PASS_LADDERS {
+            BOT_PARK_YIELDS.fetch_add(1, Ordering::Relaxed);
+            serial_println!(
+                ":: BOT: park yield slot={} cause={:?} pass_ladders={} max={} — ladder deferred to a later main-loop pass; the core goes back to the desktop ::",
+                slot_id, cause, self.bot_pass_ladders, BOT_PARK_PASS_LADDERS);
+            self.bot_ladder_slot = 0;
+            return Err(cause);
+        }
         self.bot_fail_streak = self.bot_fail_streak.saturating_add(1);
         let streak = self.bot_fail_streak;
         // Exponential back-off: a device wedged mid-internal-stall is made worse by being hammered.
@@ -8595,7 +10887,15 @@ impl XhciController {
         if streak < BOT_RESCUE_N_CONSEC {
             // Not yet enough evidence that the fault is permanent: report the failure as the
             // pre-arc code did, and let the caller decide whether to come back.
+            self.bot_ladder_slot = 0;
             return Err(cause);
+        }
+        // BOT-PARK: the settle above drained the event ring, so a disconnect raised during it has
+        // been seen by now. If it took this ladder's slot with it, stop here — every rung below
+        // drives hardware at a device that is gone.
+        if self.bot_ladder_abort {
+            self.bot_ladder_slot = 0;
+            return Err(BotError::NoDevice);
         }
 
         // (a) Ring rebase — ONSET-2 (M1a) replaced Reset Device + Configure Endpoint here; see
@@ -8604,10 +10904,15 @@ impl XhciController {
             self.bot_rescue_stage = 1;
             if self.rescue_ring_rebase(slot_id) {
                 if let Some(r) = self.bot_rescue_retry(slot_id, cdb, data_phys, data_len, dir, "ring-rebase") {
+                    self.bot_ladder_slot = 0;
                     return r;
                 }
             }
             self.settle_ms(backoff);
+            if self.bot_ladder_abort {
+                self.bot_ladder_slot = 0;
+                return Err(BotError::NoDevice);
+            }
         }
 
         // (b) Port power-cycle + (delegated) re-enumeration.
@@ -8615,13 +10920,15 @@ impl XhciController {
             self.bot_rescue_stage = 2;
             if self.rescue_port_cycle(slot_id) {
                 if let Some(r) = self.bot_rescue_retry(slot_id, cdb, data_phys, data_len, dir, "port-cycle") {
+                    self.bot_ladder_slot = 0;
                     return r;
                 }
             }
         }
 
         // (c) Surrender.
-        self.bot_surrender(slot_id, cause);
+        self.bot_surrender(slot_id, cause, ladder_gen);
+        self.bot_ladder_slot = 0;
         Err(cause)
     }
 
@@ -8689,6 +10996,40 @@ impl XhciController {
         // `BOT_BUDGET_SCALE_ESCALATION` and restores it immediately after. A healthy device never
         // reaches an escalation retry, so it never sees anything but the historical budget.
         let budget = crate::arch::hw_wait_budget().saturating_mul(self.bot_budget_scale);
+        // BOT-PARK: bounded work per pass. A device whose ring the [piusb40] necropsy has twice
+        // found PROVABLY idle across a whole wait — no events, no foreign events, no doorbells,
+        // IRQ_COUNT flat — has demonstrated that the remaining seconds of this budget buy no
+        // information; they only hold the core. `min`, never `max`: this can shorten a wait and can
+        // never lengthen one, and a device that has not earned the streak never sees it.
+        let budget = match self.bot_pending.as_ref().map(|p| p.slot_id)
+            .and_then(|s| self.bot_park_budget_cap(s))
+        {
+            Some(cap) if cap < budget => {
+                BOT_PARK_CAPPED.fetch_add(1, Ordering::Relaxed);
+                cap
+            }
+            _ => budget,
+        };
+        // THE DESKTOP THROTTLE, second half. `bot_transfer_body` refuses to START a transfer once
+        // the pass is over its pump budget; this clamps the wait that is still allowed to begin to
+        // what the pass has LEFT, so the pass's total is bounded rather than bounded-plus-one-budget.
+        // Two guards keep it honest, and both matter:
+        //   * it applies only to an identity that already has an account — a device nothing has gone
+        //     wrong with keeps `hw_wait_budget() * BOT_BUDGET_SCALE_FIRST` exactly as it always had,
+        //     which is what stops a slow-but-healthy stick becoming a false failure; and
+        //   * `bot_pass_pump_left` never reports below `hw_wait_budget()`, so no rung's retry and no
+        //     recovery wait can be starved under the base metal-earned handshake budget.
+        // `min`, never `max`, exactly as the dead-ring cap above.
+        let budget = match self.bot_pending.as_ref().map(|p| p.slot_id) {
+            Some(s) if self.bot_ident(s).and_then(|id| bot_park_find(&self.bot_park, id)).is_some() => {
+                let left = self.bot_pass_pump_left();
+                if left < budget {
+                    BOT_PARK_CAPPED.fetch_add(1, Ordering::Relaxed);
+                    left
+                } else { budget }
+            }
+            _ => budget,
+        };
         BOT_PUMP_BUDGET.store(budget, Ordering::Relaxed);
         // IVY: snapshot the waiting slot's topology up front, so the witness (and any timeout line)
         // says whether this transfer rode a root port or a hub route — the one fact the 2026-07-17
@@ -8719,6 +11060,16 @@ impl XhciController {
             match &self.bot_pending {
                 Some(p) if p.done => {
                     Self::note_bot_pump(start, budget, route, depth, slot);
+                    // BOT-PARK: charge the wait to the device and clear its dead-ring streak — a
+                    // completion is proof the ring is alive. Opens no account: a device with no
+                    // history is not given one for succeeding.
+                    let used = crate::arch::now_cycles().wrapping_sub(start);
+                    self.bot_park_charge(slot, used, false);
+                    // BOTLATCH M2 (finding 4): and clear the DEAD-RING VERDICT counter, which the
+                    // charge above deliberately does not touch. This is the only place in the driver
+                    // that forgives `dead_total`, and it is reached only with the awaited stage's
+                    // completion event in hand. See `bot_park_note_success`.
+                    self.bot_park_note_success(slot);
                     return Ok(());
                 }
                 None => {
@@ -8750,6 +11101,17 @@ impl XhciController {
             crate::hlt();
             let elapsed = crate::arch::now_cycles().wrapping_sub(start);
             if elapsed >= budget {
+                // BOTCLAIM: the expiry-instant peek — taken FIRST, before a single byte of the
+                // timeout printout below, because the question it answers is precisely whether a
+                // completion was consumable at the moment the budget died or only landed DURING
+                // the multi-line serial dump (tens of ms at metal baud — the window in which the
+                // [piusb40] necropsy can photograph "an event in OUR colour at the dequeue slot"
+                // that did not exist when the pump last looked). Read-only: `has_event` invalidates
+                // and reads the dequeue TRB, consumes nothing, moves no pointer.
+                let bc_fresh_at_expiry = {
+                    let guard = EVENT_RING.lock();
+                    guard.as_ref().map(|r| r.has_event()).unwrap_or(false)
+                };
                 BOT_PUMP_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
                 unsafe {
                     let ir0 = XHCI_IR0_BASE.load(Ordering::Acquire);
@@ -8812,6 +11174,50 @@ impl XhciController {
                     let db_in_d = BOT_DB_IN.load(Ordering::Relaxed).wrapping_sub(db_in_at_entry);
                     let db_out_d = BOT_DB_OUT.load(Ordering::Relaxed).wrapping_sub(db_out_at_entry);
                     self.bot_timeout_witness(&p, foreign, evts, db_in_d, db_out_d);
+                }
+                // [piusb40] witness 3. HERE, and not one line later: everything past this return
+                // is recovery, and recovery mutates the ring it would be photographing. Unlike the
+                // witnesses above it is unconditional on `bot_pending` — a timeout with nothing
+                // pending still has an event ring worth reading, and that combination is itself
+                // one of the patterns the verdict clauses distinguish.
+                // BOTCLAIM discriminator: the same predicate read AGAIN now that the timeout block
+                // above has been printed, paired with the expiry-instant reading. Printed BEFORE
+                // the necropsy so its verdict clauses can be read against this line. Three
+                // readings, three verdicts:
+                //   * fresh_at_expiry=yes (repeatedly) -> consumer-side defect — the pump's own
+                //     drain failed to consume a live event, and the necropsy's "posted and never
+                //     consumed" clause is a true finding about `has_event`/cycle bookkeeping;
+                //   * fresh_at_expiry=no fresh_now=yes -> print-latency artifact — the event
+                //     landed during this printout, and a necropsy that now finds a fresh event at
+                //     the dequeue slot photographed its own serial delay, not a consumer defect;
+                //   * fresh_at_expiry=no fresh_now=no  -> the transport-wedge verdict stands.
+                let bc_fresh_now = {
+                    let guard = EVENT_RING.lock();
+                    guard.as_ref().map(|r| r.has_event()).unwrap_or(false)
+                };
+                serial_println!(
+                    ":: BOT: [botclaim] expiry-peek slot={} fresh_at_expiry={} fresh_now={} — yes/* convicts the pump's consumer; no/yes convicts print-latency (a necropsy 'posted and never consumed' verdict below is an instrumentation artifact); no/no confirms the transport wedge ::",
+                    slot,
+                    if bc_fresh_at_expiry { "yes" } else { "no" },
+                    if bc_fresh_now { "yes" } else { "no" });
+                self.bot_event_necropsy();
+                // BOT-PARK: charge the exhausted budget to the DEVICE, and classify the wait. A
+                // wait is "dead" only when NOTHING moved anywhere for its whole duration — no event
+                // drained here, no foreign event for any other slot, and no doorbell rung. That
+                // conjunction is the [piusb40] necropsy signature and nothing weaker: a boot with a
+                // live FTDI console produces foreign events continuously, so a device on a working
+                // controller cannot accidentally look dead.
+                {
+                    let foreign_d = BOT_FOREIGN_EVENTS.load(Ordering::Relaxed)
+                        .wrapping_sub(foreign_at_entry);
+                    let db_d = BOT_DB_IN.load(Ordering::Relaxed).wrapping_sub(db_in_at_entry)
+                        | BOT_DB_OUT.load(Ordering::Relaxed).wrapping_sub(db_out_at_entry);
+                    let dead = evts == 0 && foreign_d == 0 && db_d == 0;
+                    self.bot_park_charge(slot, elapsed, dead);
+                    // THE DESKTOP THROTTLE's meter. Charged HERE and only here — on the timeout
+                    // arm — so the pass's budget measures unproductive time and a healthy device's
+                    // completions, however many, are free. See `bot_pump_throttled`.
+                    self.bot_pass_pump = self.bot_pass_pump.saturating_add(elapsed);
                 }
                 return Err(BotError::Timeout);
             }
@@ -8935,14 +11341,62 @@ impl XhciController {
     }
 
     /// SCSI READ CAPACITY(10) (0x25), 8 bytes BE. Returns (block_size, last_lba).
+    ///
+    /// [piusb40] witness 1 — the data-landed discriminator. boot20 wedges HERE, deterministically
+    /// and identically across two enumerations: TUR and INQUIRY complete (the pump reports n=1,2
+    /// result=OK, and INQUIRY's 36-byte data-in provably landed — the shape line carries
+    /// maxlen=36), then this 8-byte data-IN times out with no transfer event and a CSW that never
+    /// reaches DRAM. Every instrument the arc had before this reads the SAME on two incompatible
+    /// stories: a transfer that ran and lost its completion event, and a transfer that never ran at
+    /// all. IMAN=0x3 cannot break the tie either — it is Pi steady state on the success lines too.
+    ///
+    /// Poison breaks it. The 8-byte reply window is ours until the controller DMAs over it, so a
+    /// byte that is no longer 0xA5 is positive proof the data phase executed, and an intact window
+    /// is positive proof nothing moved. The `clean` is load-bearing, not hygiene: poison left
+    /// sitting in a dirty cache line would read back "unchanged" from the CPU no matter what the
+    /// controller did, and the witness would lie in the direction of the wrong verdict.
     fn scsi_read_capacity10(&mut self, slot: u8) -> Result<(u32, u32), BotError> {
         let data_phys = self.storage_data_phys(slot)?;
         let cdb = [0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        self.bot_transfer(slot, &cdb, data_phys, 8, Direction::In)?;
+        unsafe { core::ptr::write_bytes(data_phys as *mut u8, 0xA5, 8); }
+        dma_coherency::clean(data_phys as usize, 8);
+        match self.bot_transfer(slot, &cdb, data_phys, 8, Direction::In) {
+            Ok(_) => {}
+            Err(e) => {
+                // Pull the window back FROM DRAM, not from whatever the CPU cached before the wedge.
+                dma_coherency::clean_inval(data_phys as usize, 8);
+                let d = unsafe { core::slice::from_raw_parts(data_phys as *const u8, 8) };
+                let landed = d.iter().any(|&b| b != 0xA5);
+                serial_println!(
+                    ":: PIUSB: [piusb40] readcap-wedge — err={:?} data=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] poison=0xA5 landed={} — {} ::",
+                    e, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], landed,
+                    if landed {
+                        "the 8 bytes ARE in DRAM: the transfer COMPLETED and only its completion event went missing — event-path defect, read the necropsy line"
+                    } else {
+                        "no byte moved: the transfer never ran — transport-side, upstream of the event ring"
+                    });
+                return Err(e);
+            }
+        }
         unsafe {
             let d = core::slice::from_raw_parts(data_phys as *const u8, 8);
             let last_lba = ((d[0] as u32) << 24) | ((d[1] as u32) << 16) | ((d[2] as u32) << 8) | (d[3] as u32);
             let block_size = ((d[4] as u32) << 24) | ((d[5] as u32) << 16) | ((d[6] as u32) << 8) | (d[7] as u32);
+            // [piusb41] geometry sanity — boot22's lesson: a phase-shifted reply (CSW tail + real
+            // capacity fragment) parsed here as block_size=83886080 and MINTED A DISK. No real
+            // USB stick reports anything but a small power-of-two sector; anything else is not a
+            // strange disk, it is a corrupt reply, and the honest verdict is Failed-shaped refusal
+            // upstream (the caller's sense/retry path), never a Disk line the block layer trusts.
+            if !(block_size.is_power_of_two() && (512..=4096).contains(&block_size)) {
+                serial_println!(
+                    ":: PIUSB: [piusb41] READ CAPACITY reply REJECTED — block_size={} last_lba={:#010x} is not a sane sector geometry (want a power of two in 512..=4096) — phase-shifted or corrupt reply, no disk is minted from it ::",
+                    block_size, last_lba
+                );
+                // [piusb41] PA36: recorded, not acted on — `bring_up_storage` decides after the
+                // post-wedge INQUIRY control has taken its photograph of the pipes.
+                self.bot_geom_reject = true;
+                return Err(BotError::TransferError(8));
+            }
             Ok((block_size, last_lba))
         }
     }
@@ -8994,6 +11448,12 @@ impl XhciController {
     pub fn storage_read10(&mut self, lba: u32, blocks: u16) -> Result<BotResult, BotError> {
         let slot = self.storage_slot;
         if slot == 0 { return Err(BotError::NoDevice); }
+        // BOTSEQ: while the deferred diagnostics are armed, ANY transaction through this
+        // block-layer API is post-publish traffic — the mount attempt reaching the wire (the
+        // bring-up's own sanity reads run BEFORE arming; the matrices run AFTER the latch is
+        // consumed, so neither can trip this). Marked at issue time, before the outcome, so a
+        // mount read that fails still counts as the attempt it was.
+        if self.storage_diag_pending { self.storage_postpublish_io = true; }
         self.scsi_read10(slot, lba, blocks)
     }
 
@@ -9001,6 +11461,9 @@ impl XhciController {
     pub fn storage_write10(&mut self, lba: u32, blocks: u16) -> Result<BotResult, BotError> {
         let slot = self.storage_slot;
         if slot == 0 { return Err(BotError::NoDevice); }
+        // BOTSEQ: see storage_read10 — post-publish block-layer traffic releases the deferred
+        // diagnostics on the next service_storage pass.
+        if self.storage_diag_pending { self.storage_postpublish_io = true; }
         self.scsi_write10(slot, lba, blocks)
     }
 
@@ -9009,9 +11472,33 @@ impl XhciController {
     fn bring_up_storage(&mut self) -> Result<(), BotError> {
         let slot = self.storage_slot;
         if slot == 0 { return Err(BotError::NoDevice); }
+        // BOT-PARK: the gate that closes the metal cycle. Everything below this line — the fresh
+        // clean slate, the two-strike allowance, the whole bring-up chain — is what a parked device
+        // used to get back simply by being re-enumerated by the ladder's own port-cycle rung. The
+        // account is keyed by the device, not the slot, so the reader that came back as slot 5 and
+        // then again as slot 2 is refused here, once, in constant time.
+        self.bot_park_note_gen(slot);
+        if let Err(e) = self.bot_park_gate(slot) {
+            let id = self.bot_ident(slot);
+            serial_println!(
+                ":: BOT: park refuse-bringup slot={} port={} route={:#x} vid={:04x} pid={:04x} — this device is PARKED; the SCSI bring-up is not run and nothing is published ::",
+                slot,
+                id.map(|i| i.port).unwrap_or(0), id.map(|i| i.route).unwrap_or(0),
+                id.map(|i| i.vid).unwrap_or(0), id.map(|i| i.pid).unwrap_or(0));
+            self.storage_note = "storage device PARKED (BOT retry budget exhausted)";
+            return Err(e);
+        }
         // BOT-RESCUE: a freshly enumerated disk inherits no escalation state, even if the
         // controller handed it a slot id a surrendered disk once held.
         self.bot_rescue_clear(slot);
+        // [piusb41] PA34 + S1Z: the fresh-enumeration clean slate, explicit and unconditional —
+        // a post-cycle device gets its two-strike allowance back, and this bring-up's fold latch
+        // starts unlit. (`bot_rescue_clear` can no longer be the home of these: its streak clear
+        // is conditioned on the fold marker, and at this point the marker still describes the
+        // PREVIOUS device's last transaction.)
+        BOT_FOLD_STREAK.store(0, Ordering::Relaxed);
+        self.bot_fold_seen = false;
+        self.bot_txn_folded = false;
 
         // Put the device in the USB CONFIGURED state before touching its bulk endpoints. Real USB
         // Mass-Storage requires a SET_CONFIGURATION before its bulk IN/OUT endpoints become active;
@@ -9064,10 +11551,71 @@ impl XhciController {
         space_add(SP_INQ, t_inq);
         let (vendor, product) = inq?;
         self.storage_note = "READ CAPACITY";
+        // [piusb40] witness 2 — the post-wedge pipe control. Witness 1 says whether the reply bytes
+        // reached DRAM; it says nothing about whether the bulk pipes are still alive afterwards,
+        // and "0x25 specifically is cursed" and "the transport died" predict the same silence.
+        // INQUIRY is the right probe precisely because it is the command that provably completed on
+        // these same two endpoints moments earlier in this very function — so any difference
+        // between then and now belongs to the wedge, not to the command.
+        //
+        // Run ONCE, and never retried: the escalation ladder would reset the pipes, and a recovered
+        // transport is exactly the state the necropsy line is trying to photograph. This costs the
+        // failure path one round-trip and the success path nothing at all.
+        //
+        // SPACE (merge): the timing brackets the READ CAPACITY transaction only — taken before
+        // the error arm below, so the failure path's control probe / port-cycle never inflates
+        // SP_RDCAP (same semantics as the pre-merge `space_add` + `?` ordering).
         let t_rdcap = crate::arch::now_cycles();
         let rdcap = self.scsi_read_capacity10(slot);
         space_add(SP_RDCAP, t_rdcap);
-        let (block_size, last_lba) = rdcap?;
+        let (block_size, last_lba) = match rdcap {
+            Ok(v) => v,
+            Err(e) => {
+                let ctl = self.scsi_inquiry(slot);
+                let ctl_s: &str = match &ctl {
+                    Ok(_) => "Ok",
+                    Err(BotError::Timeout) => "Err(Timeout)",
+                    Err(BotError::Stall) => "Err(Stall)",
+                    Err(_) => "Err(other)",
+                };
+                serial_println!(
+                    ":: PIUSB: [piusb40] post-wedge INQUIRY control — result={} — {} ::",
+                    ctl_s,
+                    if ctl.is_ok() {
+                        "the bulk pipes still complete a full CBW/data/CSW round-trip AFTER the wedge: the failure is specific to the READ CAPACITY transaction, not a dead pipe"
+                    } else {
+                        "the pipes are dead from the wedge onward: whatever wedged 0x25 took the transport with it"
+                    });
+                // [piusb41] PA36: the widened port-cycle trigger. PA36 arrived with the reader
+                // ALREADY stuck from power-on: bring-up saw ONE fold, then the next reply came
+                // phase-shifted and the geometry clamp rejected it — bring-up exited here and the
+                // two-fold streak trigger above never fired, leaving the stuck reader stuck for
+                // the whole boot. A fold followed by a clamp-reject on the SAME bring-up is the
+                // same stuck signature as fold+fold (the device is answering commands with
+                // re-manufactured/phase-shifted state, not data), and PA35's physical replug
+                // proved cold re-enumeration cures exactly this state. The publish-generations
+                // guard (8134a5cd) protects the resurrection from stale ladders. The photograph
+                // above is already taken, so acting on the pipes is now admissible.
+                // The latch, not the live streak: the garbage-carrying READ CAPACITY *completes*
+                // as a transaction before its content reaches the clamp, and a real completion
+                // legitimately ends the streak — so at this point the streak may already read 0
+                // on exactly the boot this trigger exists for. `bot_fold_seen` is scoped to this
+                // bring-up (set at any fold, cleared at bring-up start) and survives that wipe.
+                let geom = core::mem::take(&mut self.bot_geom_reject);
+                if geom && core::mem::take(&mut self.bot_fold_seen) {
+                    BOT_FOLD_STREAK.store(0, Ordering::Relaxed);
+                    serial_println!(
+                        ":: BOT: [piusb41] fold + geometry-clamp reject on one bring-up — the widened stuck signature (PA36: a power-on-stuck reader folds once, then feeds the clamp garbage and exits before streak=2) — escalating to port power-cycle ::");
+                    let cycled = self.rescue_port_cycle(slot);
+                    serial_println!(
+                        ":: BOT: [piusb41] port power-cycle result={} — {} ::",
+                        cycled,
+                        if cycled { "device re-enumerates cold; bring-up re-runs on the fresh slot" }
+                        else { "cycle refused/failed — the surrender path owns what remains" });
+                }
+                return Err(e);
+            }
+        };
         let num_blocks = last_lba as u64 + 1;
         // SPACE: everything from here to the end of the bring-up is the publish/witness tail.
         let t_pub = crate::arch::now_cycles();
@@ -9262,6 +11810,28 @@ impl XhciController {
     }
 
     pub fn service_storage(&mut self) {
+        // BOTSEQ — deferred-diagnostics pass. The PIUSB-36/37/38 probe matrices + the write
+        // selftest no longer run inline at the end of the bring-up pass: BOTCLAIM convicted that
+        // chain of wedging Peter's card reader BEFORE the piusb27 mount ever ran (the mount read
+        // was born onto pipes the probes had already killed). The bring-up pass now only ARMS
+        // `storage_diag_pending`; this branch fires the diagnostics on a LATER service_storage
+        // call, and only once `storage_postpublish_io` says a block-layer transaction — the mount
+        // attempt, which every platform's storage-ready pass tail issues (piusb27_service on Pi,
+        // probe_once on x86) in the SAME pass that armed us — has already reached the wire. So the
+        // mount verdict precedes the matrices by construction, and no probe was deleted or changed.
+        if self.storage_diag_pending && !self.storage_pending_bringup {
+            if !self.storage_postpublish_io { return; }
+            // Same pacing gate as the bring-up: never start the multi-second diagnostic chain
+            // while a port (e.g. a hub-cycle re-enumeration) is mid-flight. Latch stays set.
+            if self.enum_active || !self.ports_to_enumerate.is_empty() { return; }
+            self.storage_diag_pending = false;
+            if self.storage_slot == 0 { return; } // device left before the diagnostics pass
+            // BOT-PARK: this is a fresh synchronous hand-off from the desktop loop, exactly like
+            // the bring-up pass — the diagnostics get their own pass ladder, as they always had.
+            self.bot_pass_begin();
+            self.storage_diag_matrices();
+            return;
+        }
         if !self.storage_pending_bringup { return; }
         // BOOTPACE M2 — CONSOLE-FIRST. Defer the whole SCSI bring-up until the enumeration queue
         // has drained. The latch is left SET (this is a `return`, not a consume), so the bring-up is
@@ -9285,6 +11855,11 @@ impl XhciController {
         if self.enum_active || !self.ports_to_enumerate.is_empty() { return; }
         self.storage_pending_bringup = false;
         if self.storage_slot == 0 { return; }
+        // BOT-PARK: a new main-loop pass. This is the cooperative half of the retry discipline —
+        // `BOT_PARK_PASS_LADDERS` bounds what one pass may spend, and the counter is what makes
+        // "one pass" mean anything. Reset here, at the single place the desktop loop hands the
+        // driver its synchronous BOT time.
+        self.bot_pass_begin();
 
         // SPACE: close `wait` — the ladder gap between this bring-up being ARMED (at the
         // Configure-Endpoint completion, inside `poll_events`) and this body being reached. It is
@@ -9361,8 +11936,10 @@ impl XhciController {
                 });
         }
 
-        // Sanity read of LBA 0.
-        match self.storage_read10(0, 1) {
+        // Sanity read of LBA 0. BOTSEQ: the CSW verdict feeds the `[botseq]` sequencing witness
+        // below, so the deferral line can say whether the bring-up chain itself was healthy at
+        // the moment the mount was handed the first post-publish slot.
+        let lba0_ok = match self.storage_read10(0, 1) {
             Ok(res) => {
                 serial_println!("xHCI: READ(10) LBA0 CSW status={:?} residue={}", res.status, res.residue);
                 if let Some(p) = self.storage_data_ptr() {
@@ -9435,10 +12012,41 @@ impl XhciController {
                         }
                     }
                 }
+                res.status == CswStatus::Passed
             }
-            Err(e) => serial_println!("xHCI: READ(10) LBA0 failed: {:?}", e),
-        }
+            Err(e) => { serial_println!("xHCI: READ(10) LBA0 failed: {:?}", e); false }
+        };
 
+        // BOTSEQ — arm the deferred diagnostics instead of running them inline. BOTCLAIM's
+        // conviction: on the metal card reader the PIUSB-36/37/38 matrices (notably piusb37's
+        // read12-lba0, tag 0x19, and its READ CAPACITY, tag 5) wedge the device, Stop-EP/
+        // Set-TR-Dequeue recovery fails cc=19, and the piusb27 mount read — which used to run
+        // AFTER this whole chain in the same pump pass — timed out on the dead pipes every cycle.
+        // The storage-ready edge was raised inside `bring_up_storage` above, so the pass tail's
+        // `piusb27_service`/`probe_once` mounts THIS pass; the matrices + write selftest run
+        // unchanged on the next `service_storage` pass (see the diag branch at the top).
+        //
+        // [botseq] READING KEY (the BOTCLAIM implication, recorded): the bring-up chain
+        // (TUR/INQUIRY/READ CAPACITY/READ10-LBA0) passes every metal cycle, and the mount read is
+        // the SAME command shape (READ(10) LBA0) the bring-up just passed. Until now the mount sat
+        // at a fixed POSITION (after the probe matrices), so "the wedge follows certain commands"
+        // and "the wedge follows sequence position" were collinear — un-testable apart. With the
+        // mount now issued before the matrices, a next metal flight where the mount SURVIVES while
+        // matrices are deferred breaks that collinearity: the probes' command mix (read12/read16/
+        // pre-sense/induced-stall...), not sequence depth, is what kills the reader.
+        self.storage_diag_pending = true;
+        self.storage_postpublish_io = false;
+        serial_println!(
+            ":: BOT: [botseq] mount-first attempted lba0={} matrices=deferred ::",
+            if lba0_ok { "ok" } else { "err" });
+    }
+
+    /// BOTSEQ: the deferred diagnostics pass — the exact PIUSB-36/37/38 matrices + write selftest
+    /// that used to run inline at the end of the bring-up pass, moved verbatim (internals
+    /// untouched) so the piusb27/probe_once mount attempt precedes them on the wire. Invoked only
+    /// from `service_storage`'s diag branch, once `storage_postpublish_io` proves the mount's
+    /// block-layer transaction has already been issued.
+    fn storage_diag_matrices(&mut self) {
         // PIUSB-36: one-boot decisive experiment matrix for the Pi-only 512-B-read-returns-zeros
         // wedge (READ CAPACITY 8 B works, READ(10) 512 B returns Passed/residue=0/zeros). Read-only;
         // aarch64 witness only — no-op on x86 (never compiled). Runs after the baseline witnesses so
@@ -10235,13 +12843,14 @@ impl XhciController {
                 continue;
             }
             if kbd && self.set_hid_boot_protocol(slot, kbd_intf, "keyboard") {
-                // HID-KEYS: SET_IDLE(0) on the keyboard interface. Duration 0 = "report only on
-                // change" (USB HID 1.11 §7.2.4): a keyboard that powered up with a nonzero idle
-                // rate (periodic resends) stops re-sending an unchanged report, so a held key is
-                // one press + one release edge rather than a stream of duplicate reports. Bounded
-                // and tolerated — some keyboards NAK/STALL it; we witness either way and move on.
-                // Only issued after SET_PROTOCOL succeeded (a STALL there halts EP0, so a following
-                // request would just time out).
+                // HID-KEYS / USB-HID-MULTI: SET_IDLE(0) on the keyboard interface. Duration 0 =
+                // "report only on change" (USB HID 1.11 §7.2.4): a keyboard that powered up with a
+                // nonzero idle rate (periodic resends) stops re-sending an unchanged report, so a
+                // held key is one press + one release edge rather than a stream of duplicates. The
+                // Orin tablet-combo keyboard is the metal case that NEEDS this: its default idle
+                // never spontaneously reports a key edge on our poll cadence (shell saw "zero keys
+                // ever"). Bounded and tolerated — some keyboards NAK/STALL it; we witness either
+                // way and move on. Sent LAST on this EP0: a STALL here halts EP0 harmlessly.
                 self.set_hid_idle(slot, kbd_intf);
             }
         }
@@ -10309,6 +12918,33 @@ impl XhciController {
         }
     }
 
+    // (hw-jetson's 3-arg labeled set_hid_idle was superseded at the 2026-08-18 sync by the
+    // 2-arg HID-KEYS version above — same request bytes, same tolerance; the [hidkeys] witness
+    // replaced the labeled xHCI: SET_IDLE lines.)
+
+    /// USB-HID-MULTI: every HID keyboard whose interrupt-IN read is ARMED (keyboard_state == 3, set
+    /// once the device-level SET_CONFIGURATION completed and `queue_keyboard_read` pushed the first
+    /// Normal TRB), as (slot id, root port). More than one composite keyboard can be armed at once —
+    /// each slot's read is re-armed independently in `poll_events`, and every decoded key is pushed
+    /// to the shared `pal` queue, so the platform pump drains a MERGED stream. Ordered by slot id.
+    pub fn armed_keyboards(&self) -> Vec<(u8, u8)> {
+        let mut v = Vec::new();
+        for (i, s) in self.slots.iter().enumerate() {
+            if s.active && s.is_keyboard && s.keyboard_state == 3 {
+                v.push((i as u8, s.port_id));
+            }
+        }
+        v
+    }
+
+    /// USB-HID-MULTI: count of HID pointers whose interrupt-IN read is ARMED (mouse_state == 3).
+    pub fn armed_pointer_count(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|s| s.active && s.is_mouse && s.mouse_state == 3)
+            .count()
+    }
+
     fn bring_up_hub(&mut self, hub_slot: u8) {
         if hub_slot == 0 || self.slots[hub_slot as usize].ep0_ring.is_none() {
             return;
@@ -10319,9 +12955,9 @@ impl XhciController {
         // 1. SET_CONFIGURATION(1) so the hub's ports become controllable.
         //    bmRequestType 0x00 (H2D, standard, device), bRequest 9 (SET_CONFIGURATION).
         match self.sync_control(hub_slot, 0x00, 0x09, 1, 0, 0, 0, false) {
-            Ok(1) => {}
-            Ok(c) => serial_println!("xHCI: HUB set-config returned code {}", c),
-            Err(_) => { serial_println!("xHCI: HUB set-config timed out"); return; }
+            Ok(1) => serial_println!("xHCI: HUB slot {} SET_CONFIGURATION(1) -> code 1 (OK)", hub_slot),
+            Ok(c) => serial_println!("xHCI: HUB slot {} SET_CONFIGURATION(1) -> code {}", hub_slot, c),
+            Err(_) => { serial_println!("xHCI: HUB slot {} SET_CONFIGURATION(1) timed out", hub_slot); return; }
         }
 
         // 2. GET_DESCRIPTOR (HUB) -> downstream port count + characteristics.
@@ -10357,7 +12993,12 @@ impl XhciController {
         }
 
         let root_hub_port = self.slots[hub_slot as usize].port_id;
-        let ttt = ((characteristics >> 5) & 0x3) as u32; // TT Think Time (wHubCharacteristics bits 5-6)
+        // TT Think Time (USB2 Hub Descriptor wHubCharacteristics bits 5-6). A SuperSpeed hub has NO
+        // Transaction Translator, and its SS Hub Descriptor (0x2A) wHubCharacteristics does NOT define
+        // bits 5-6 as TTT (reserved / device-defined). Feeding those bits into the slot context's TTT
+        // field would submit a garbage TTT for the SS hub; force 0 for SS (spec-correct for a TT-less
+        // hub). USB2 hubs keep the real decoded value, so their path is byte-identical.
+        let ttt = if is_ss { 0 } else { ((characteristics >> 5) & 0x3) as u32 };
         // This hub's own Route String + tier depth (0 for a hub sitting on a root port). Children
         // extend it: a device on downstream port P gets `hub_route | (P << (4*hub_depth))` at depth
         // hub_depth+1 — 4 bits per tier, so nibble `hub_depth` carries P (see DeviceSlot.route_*).
@@ -10373,9 +13014,42 @@ impl XhciController {
             return;
         }
 
+        // 2b. SET_HUB_DEPTH (USB 3.x SuperSpeed hubs ONLY). ORIN-USB-FIX-5: a SuperSpeed hub must be
+        //     told its tier depth after SET_CONFIGURATION so it knows which nibble of the 20-bit Route
+        //     String selects its downstream port. Without it the hub cannot decode route strings and
+        //     refuses to forward ANY downstream transaction — the very first downstream packet
+        //     (SET_ADDRESS during the child's ADDRESS_DEVICE) dies as a Transaction Error (completion
+        //     code 4), exactly the Orin boot-4 symptom (stick on the 0bda:0489 SS hub, ADDRESS_DEVICE
+        //     code 4 ×3). USB2 hubs have no such request (it is a USB3-only class request) and route
+        //     via the parent-hub/port slot-context fields instead, so they keep their unchanged path.
+        //     bmRequestType 0x20 (H2D, class, device), bRequest 12 (SET_HUB_DEPTH), wValue = hub depth.
+        //     Hub depth = the Route-String nibble index this hub decodes = our route_depth (0 for a hub
+        //     directly on a root port; +1 per tier) — identical to Linux's `hdev->level - 1`.
+        if is_ss {
+            let depth = hub_depth as u16;
+            match self.sync_control(hub_slot, 0x20, 0x0C, depth, 0, 0, 0, false) {
+                Ok(1) => serial_println!("xHCI: HUB slot {} SET_HUB_DEPTH({}) -> code 1 (OK)", hub_slot, depth),
+                Ok(c) => serial_println!("xHCI: HUB slot {} SET_HUB_DEPTH({}) -> code {}", hub_slot, depth, c),
+                Err(_) => serial_println!("xHCI: HUB slot {} SET_HUB_DEPTH({}) timed out", hub_slot, depth),
+            }
+        }
+
         // 3. Mark the slot as a hub (Hub bit + Number of Ports + TTT) so the controller will route
-        //    transactions through it to downstream devices.
-        self.set_hub_slot_context(hub_slot, nbr_ports, ttt);
+        //    transactions through it to downstream devices. ORIN-USB-FIX-4: this MUST succeed before
+        //    any downstream port work. If the xHC rejects the hub's Configure-Endpoint (metal Orin:
+        //    the Tegra XUSB FW appears to refuse the SS hub's slot-context update), the hub is NOT
+        //    marked in the controller's view — every downstream ADDRESS_DEVICE then targets a device
+        //    the xHC cannot route to and fails with code 4 (USB Transaction Error), exactly the Orin
+        //    stick-behind-SS-hub strand. Previously this failure was printed and IGNORED, and the walk
+        //    barrelled on into the doomed enumeration. Now fail closed: log honestly (the summary +
+        //    slot-state dump live in set_hub_slot_context) and stop the bring-up here.
+        if !self.set_hub_slot_context(hub_slot, nbr_ports, ttt, is_ss) {
+            serial_println!(
+                "xHCI: HUB slot {} could not be configured as a hub; downstream bring-up ABORTED (fail-closed).",
+                hub_slot);
+            serial_println!("xHCI: === HUB slot {} bring-up complete (aborted) ===", hub_slot);
+            return;
+        }
 
         // 4. Power on every downstream port (SET_FEATURE PORT_POWER = feature 8), then settle.
         for port in 1..=nbr_ports {
@@ -10434,8 +13108,15 @@ impl XhciController {
     /// Mark a slot as a USB hub in its slot context (Hub bit, Number of Ports, TT Think Time) via
     /// a Configure-Endpoint command updating only the slot context. Required before the controller
     /// will route to the hub's downstream devices.
-    fn set_hub_slot_context(&mut self, hub_slot: u8, nbr_ports: u8, ttt: u32) {
-        unsafe {
+    ///
+    /// ORIN-USB-FIX-4: returns `true` only on a `code 1` completion. The caller (`bring_up_hub`) fails
+    /// closed on `false` — an un-marked hub cannot route downstream traffic, so continuing would strand
+    /// every device behind it on a code-4 ADDRESS_DEVICE. On success a one-line input-context summary is
+    /// printed (route / speed / ports / hub-bit / ttt) so a metal verdict reads in one line; on failure
+    /// the completion code, the input Add-Context flags, and the hub's live output Slot State are dumped
+    /// (a code-17 Context State Error means the xHC disagrees with our slot state — the dump names which).
+    fn set_hub_slot_context(&mut self, hub_slot: u8, nbr_ports: u8, ttt: u32, is_ss: bool) -> bool {
+        let (add_flags, hub_route, hub_speed) = unsafe {
             let input_ctx_virt = self.slots[hub_slot as usize].input_context;
             let output_ctx_virt = self.slots[hub_slot as usize].output_context;
             let base_ptr = input_ctx_virt as *mut u32;
@@ -10453,7 +13134,13 @@ impl XhciController {
             slot_ctx.add(0).write_volatile(slot_ctx.add(0).read_volatile() | (1 << 26));
             slot_ctx.add(1).write_volatile((slot_ctx.add(1).read_volatile() & 0x00FF_FFFF) | ((nbr_ports as u32) << 24));
             slot_ctx.add(2).write_volatile((slot_ctx.add(2).read_volatile() & !(0x3 << 16)) | (ttt << 16));
-        }
+            let dw0 = slot_ctx.add(0).read_volatile();
+            (base_ptr.add(1).read_volatile(), dw0 & 0xFFFFF, (dw0 >> 20) & 0xF)
+        };
+        // One-line input-context summary of what we are about to submit (metal verdict aid).
+        serial_println!(
+            "xHCI: HUB slot {} configure-input: route {:#x} speed {} ({}) ports {} hub-bit 1 ttt {} add-flags {:#x}",
+            hub_slot, hub_route, hub_speed, if is_ss { "SS" } else { "HS/FS" }, nbr_ports, ttt, add_flags);
         let trb = Trb {
             parameter: self.slots[hub_slot as usize].input_context as u64,
             status: 0,
@@ -10466,9 +13153,25 @@ impl XhciController {
                 self.slots[hub_slot as usize].is_hub = true;
                 self.slots[hub_slot as usize].hub_nbr_ports = nbr_ports;
                 serial_println!("xHCI: HUB slot {} marked as hub ({} ports)", hub_slot, nbr_ports);
+                true
             }
-            Ok((c, _)) => serial_println!("xHCI: HUB slot {} configure-endpoint code {}", hub_slot, c),
-            Err(_) => serial_println!("xHCI: HUB slot {} configure-endpoint timed out", hub_slot),
+            Ok((c, _)) => {
+                // Dump WHY: the input Add-Context flags we submitted and the hub's live output Slot
+                // State (output-context DW3 bits 31:27). Code 17 = Context State Error → the xHC's
+                // notion of the slot state disagrees with an A0-only Configure Endpoint from here.
+                let slot_state = unsafe {
+                    let oc = self.slots[hub_slot as usize].output_context as *const u32;
+                    if oc.is_null() { 0xFF } else { (core::ptr::read_volatile(oc.add(3)) >> 27) & 0x1F }
+                };
+                serial_println!(
+                    "xHCI: HUB slot {} configure-endpoint FAILED code {} (add-flags {:#x}, output Slot State {}); hub NOT marked.",
+                    hub_slot, c, add_flags, slot_state);
+                false
+            }
+            Err(_) => {
+                serial_println!("xHCI: HUB slot {} configure-endpoint timed out; hub NOT marked.", hub_slot);
+                false
+            }
         }
     }
 
@@ -10492,33 +13195,87 @@ impl XhciController {
         // it and enumerates cleanly, and QEMU's downstream devices are USB2 — this branch leaves the
         // HS/FS/LS path byte-identical.
         let (reset_sel, done_bit) = if is_ss { (28u16, 1u32 << 21) } else { (4u16, 1u32 << 20) };
-        let _ = self.sync_control(hub_slot, 0x23, 0x03, reset_sel, port as u16, 0, 0, false); // SET (BH_)PORT_RESET
 
+        // ORIN-USB-FIX-3: the warm (BH) reset re-trains the SS link, so the *reset* completing is not
+        // the same event as the *port* enabling. On the Realtek 0bda:0489 SS hub the warm reset latches
+        // C_BH_PORT_RESET (reset done) but leaves the link back in training — metal Orin read
+        // wPortStatus 0x1002b1: C_PORT_RESET set (change half), yet PED=0 and PLS (bits 8:5) = 5 =
+        // Rx.Detect (status half). A hot reset used to leave the port Enabled/U0 immediately (device
+        // present but unaddressable — the code-4 that FIX-2 addressed); the warm reset FIX-2 introduced
+        // instead needs a bounded, paced settle for the link to walk Rx.Detect → Polling → U0 before
+        // the port reads Enabled. FIX-2's walk gave up the instant the reset completed. So on SS: after
+        // the reset completes, poll wPortStatus for PED=1 AND PLS=U0(0) on a wall-clock deadline
+        // (~300 ms/attempt, the now_cycles/hw_wait_budget idiom the enum FSM already uses), and if the
+        // link does not land in budget, redo the warm reset once before honest failure. USB2 keeps the
+        // single hot reset with no training wait — byte-identical to FIX-2.
         let mut pstatus = 0u32;
-        for _ in 0..50 {
-            for _ in 0..20 { if !self.drain_event_ring_once() { crate::hlt(); } }
-            if self.sync_control(hub_slot, 0xA3, 0x00, 0, port as u16, 4, buf, true).is_err() {
-                return None;
+        let mut trained = false;
+        let max_attempts: u32 = if is_ss { 2 } else { 1 };
+        for attempt in 0..max_attempts {
+            let _ = self.sync_control(hub_slot, 0x23, 0x03, reset_sel, port as u16, 0, 0, false); // SET (BH_)PORT_RESET
+
+            for _ in 0..50 {
+                for _ in 0..20 { if !self.drain_event_ring_once() { crate::hlt(); } }
+                if self.sync_control(hub_slot, 0xA3, 0x00, 0, port as u16, 4, buf, true).is_err() {
+                    return None;
+                }
+                pstatus = unsafe {
+                    let p = buf as *const u8;
+                    (*p.add(0) as u32) | ((*p.add(1) as u32) << 8)
+                        | ((*p.add(2) as u32) << 16) | ((*p.add(3) as u32) << 24)
+                };
+                // Reset complete when the matching change bit latches: C_BH_PORT_RESET (bit 21) for a warm
+                // reset, C_PORT_RESET (bit 20) for a hot one. Some SS hubs assert C_PORT_RESET on a warm
+                // reset too, so accept either on the SS path rather than spin past a genuine completion.
+                if pstatus & done_bit != 0 || (is_ss && pstatus & (1 << 20) != 0) { break; }
             }
-            pstatus = unsafe {
-                let p = buf as *const u8;
-                (*p.add(0) as u32) | ((*p.add(1) as u32) << 8)
-                    | ((*p.add(2) as u32) << 16) | ((*p.add(3) as u32) << 24)
-            };
-            // Reset complete when the matching change bit latches: C_BH_PORT_RESET (bit 21) for a warm
-            // reset, C_PORT_RESET (bit 20) for a hot one. Some SS hubs assert C_PORT_RESET on a warm
-            // reset too, so accept either on the SS path rather than spin past a genuine completion.
-            if pstatus & done_bit != 0 || (is_ss && pstatus & (1 << 20) != 0) { break; }
-        }
-        // Deassert every reset-related change this reset latched so the hub's Status Change Endpoint
-        // can quiesce later: C_PORT_RESET always; on SS additionally C_BH_PORT_RESET (asserted by the
-        // warm reset) and C_PORT_LINK_STATE (the warm reset drives the link U0→Recovery→U0). Leaving
-        // C_PORT_LINK_STATE latched storms the SCE — the same class of defect the hot-plug ack path
-        // (service_one_hub_change) already guards, mirrored here for the one-shot boot walk.
-        let _ = self.sync_control(hub_slot, 0x23, 0x01, 20, port as u16, 0, 0, false); // CLEAR C_PORT_RESET
-        if is_ss {
+            // Deassert every reset-related change this reset latched so the hub's Status Change Endpoint
+            // can quiesce later: C_PORT_RESET always; on SS additionally C_BH_PORT_RESET (asserted by the
+            // warm reset) and C_PORT_LINK_STATE (the warm reset drives the link U0→Recovery→U0). Leaving
+            // C_PORT_LINK_STATE latched storms the SCE — the same class of defect the hot-plug ack path
+            // (service_one_hub_change) already guards, mirrored here for the one-shot boot walk.
+            let _ = self.sync_control(hub_slot, 0x23, 0x01, 20, port as u16, 0, 0, false); // CLEAR C_PORT_RESET
+            if !is_ss { break; } // USB2: reset complete, no SS link training — fall through unchanged.
             let _ = self.sync_control(hub_slot, 0x23, 0x01, 29, port as u16, 0, 0, false); // CLEAR C_BH_PORT_RESET
             let _ = self.sync_control(hub_slot, 0x23, 0x01, 25, port as u16, 0, 0, false); // CLEAR C_PORT_LINK_STATE
+
+            // SS link-training wait: poll wPortStatus until the link reaches U0 and the port enables,
+            // or the per-attempt wall-clock budget expires. PLS = wPortStatus bits 8:5.
+            let start = crate::arch::now_cycles();
+            let budget = crate::arch::hw_wait_budget() / 8; // ~300 ms at the fixed 2.5 s base budget.
+            let mut polls = 0u32;
+            let mut pls = (pstatus >> 5) & 0xF;
+            loop {
+                if pstatus & (1 << 1) != 0 && pls == 0 { trained = true; break; }
+                if crate::arch::now_cycles().wrapping_sub(start) >= budget { break; }
+                for _ in 0..20 { if !self.drain_event_ring_once() { crate::hlt(); } }
+                if self.sync_control(hub_slot, 0xA3, 0x00, 0, port as u16, 4, buf, true).is_err() {
+                    return None;
+                }
+                pstatus = unsafe {
+                    let p = buf as *const u8;
+                    (*p.add(0) as u32) | ((*p.add(1) as u32) << 8)
+                        | ((*p.add(2) as u32) << 16) | ((*p.add(3) as u32) << 24)
+                };
+                pls = (pstatus >> 5) & 0xF;
+                polls += 1;
+                // The link drives C_PORT_LINK_STATE (change bit 6) as it walks to U0; clear it each poll
+                // so the SCE does not storm after we hand the port on.
+                if pstatus & (1 << 6) != 0 {
+                    let _ = self.sync_control(hub_slot, 0x23, 0x01, 25, port as u16, 0, 0, false);
+                }
+            }
+            let elapsed = crate::arch::now_cycles().wrapping_sub(start);
+            if trained {
+                serial_println!(
+                    "xHCI: HUB port {} SS link trained (status {:#x} PLS={} U0, {} polls, {} cyc, attempt {})",
+                    port, pstatus, pls, polls, elapsed, attempt);
+                break;
+            }
+            serial_println!(
+                "xHCI: HUB port {} SS link not trained (status {:#x} PLS={} PED={}, {} polls, {} cyc, attempt {}); {}",
+                port, pstatus, pls, (pstatus >> 1) & 1, polls, elapsed, attempt,
+                if attempt + 1 < max_attempts { "retrying warm reset" } else { "giving up" });
         }
 
         if pstatus & (1 << 1) == 0 {
@@ -10634,6 +13391,7 @@ impl XhciController {
             ep.add(1).write_volatile((7 << 3) | (3 << 1) | ((mps as u32) << 16));
             ep.add(2).write_volatile((phys as u32) | 1);
             ep.add(3).write_volatile((phys >> 32) as u32);
+            x200_witness(self.op_base, &alloc::format!("slot{} hub-int TRdeq", hub_slot), phys);
             ep.add(4).write_volatile(mps as u32);
         }
         let trb = Trb {
@@ -10759,6 +13517,32 @@ impl XhciController {
                     "xHCI: HUB slot {} port {} connect ignored (hub at max USB tier depth {}).",
                     hub_slot, port, hub_depth);
             } else {
+                // [piusb41] PA38: a hub COALESCES change bits. If a downstream device drops and
+                // comes back between two status polls, the only thing left latched is
+                // C_PORT_CONNECTION with CCS=1 — this branch — and the disconnect half (M3 below)
+                // is never serviced. Enumerating straight through would leave the PREDECESSOR slot
+                // `active`, still holding this (hub, port) pair and a live DCBAA pointer, while the
+                // same physical device came up on a fresh slot: a leak, and a ghost claimant that
+                // made `rescue_hub_port_cycle`'s exclusivity check refuse `why=port-shared` against
+                // a corpse. (PA38 metal: reader 058f:6362 on hub 1 port 2 enumerated as slot 2,
+                // stuck and surrendered, then re-enumerated as slot 5 through THIS line with no
+                // disconnect ever serviced for port 2; slot 5's hub-port-cycle was then blocked by
+                // slot 2 and the disk was surrendered.) The root path already guards exactly this
+                // way in `start_next_port` ("deferred re-plug: disposed N stale slot(s)"); the hub
+                // path must too. `disconnect_hub_port` IS the M3 teardown, route-prefix scoped to
+                // this port's subtree, so sibling ports and other trees are provably untouched —
+                // and it is a no-op when nothing claims the port.
+                let stale = (1..self.slots.len()).any(|i| {
+                    self.slots[i].active
+                        && self.slots[i].parent_hub_slot == hub_slot
+                        && self.slots[i].parent_hub_port == port
+                });
+                if stale {
+                    serial_println!(
+                        "xHCI: HUB slot {} port {} connect: stale slot(s) still claim this port (coalesced re-plug) — tearing down before re-enumeration.",
+                        hub_slot, port);
+                    self.disconnect_hub_port(hub_slot, port);
+                }
                 serial_println!("xHCI: HUB slot {} port {} connect: resetting + enumerating downstream device.", hub_slot, port);
                 // reset_downstream_port issues CLEAR C_PORT_CONNECTION + SET PORT_RESET, awaits
                 // C_PORT_RESET (bounded/paced), clears it, and reads the trained speed.
@@ -10862,7 +13646,20 @@ impl XhciController {
             // USB-UNPLUG: same retraction as the root-port teardown — a disk pulled from a HUB port
             // must leave the block registry too, or the installer keeps listing it. Slot-id matched,
             // so only the slot that actually published geometry is retracted.
-            crate::drivers::block::unpublish_usb_geometry(i as u8);
+            crate::drivers::block::unpublish_usb_geometry(i as u8, crate::drivers::block::usb_publish_gen());
+            // [piusb41] PA38: mirror the root-port teardown — a slot that leaves takes its BOT
+            // escalation state with it. Without this, a surrendered hub-downstream disk's slot id
+            // stayed marked after teardown, so the next device the controller handed that id would
+            // have every transfer refused up front, and the id would go on reading as "surrendered"
+            // to the rescue ladder's liveness tests. The surrender binds to the disk that earned
+            // it, not to a number.
+            //
+            // BOT-PARK: the hub-subtree twin of the root-port teardown's call — ladder teardown and
+            // the unpark rule, before `bot_rescue_clear` flattens the global streak/stage. This is
+            // the path the [pi0-b1b2] capture actually took (the reader hung off hub slot 1 port 1),
+            // so it is the one the fix must reach.
+            self.bot_park_note_disconnect(i as u8);
+            self.bot_rescue_clear(i as u8);
             if self.configuring_slot == i as u8 { self.configuring_slot = 0; }
             if self.ftdi_configuring_slot == i as u8 { self.ftdi_configuring_slot = 0; }
             if self.ftdi_slot == i as u8 {
@@ -10931,6 +13728,7 @@ impl XhciController {
             // XHCI-COHERENCE: producer boundary — clean the DCBAA entry the controller reads to
             // locate this slot's output context. No-op x86.
             dma_coherency::clean(self.dcbaap.add(slot_id as usize) as usize, core::mem::size_of::<u64>());
+            x200_witness(self.op_base, &alloc::format!("DCBAA[{}](out-ctx,downstream)", slot_id), output_ctx_virt as u64);
 
             let base_ptr = input_ctx_virt as *mut u32;
             core::ptr::write_bytes(base_ptr as *mut u8, 0, core::mem::size_of::<InputContext>());
@@ -10968,6 +13766,7 @@ impl XhciController {
             ep0_ctx.add(1).write_volatile((4 << 3) | (3 << 1) | (mps0 << 16));
             ep0_ctx.add(2).write_volatile((ep0_ring_phys as u32) | 1);
             ep0_ctx.add(3).write_volatile((ep0_ring_phys >> 32) as u32);
+            x200_witness(self.op_base, &alloc::format!("slot{} ep0 TRdeq(downstream)", slot_id), ep0_ring_phys);
             ep0_ctx.add(4).write_volatile(8);
         }
         // XENUM-3 M2: bounded, paced ADDRESS_DEVICE retry. The root-port path gives a stalled device
@@ -11120,6 +13919,15 @@ impl XhciController {
         if !self.address_downstream(slot_id, root_hub_port, route_string, depth, speed, tt_hub_slot, tt_port) {
             self.dispose_downstream_slot(slot_id as u8);
             return;
+        }
+        // [piusb41] Record the IMMEDIATE parent (hub slot + hub downstream port) the moment the slot
+        // exists. This is the ONE place a downstream slot is born, and the pair is not recoverable
+        // afterwards (route_string carries nibbles, not slot ids), so the rescue ladder's hub-port
+        // power-cycle rung would otherwise have nothing exact to aim a class request at.
+        {
+            let s = &mut self.slots[slot_id as usize];
+            s.parent_hub_slot = hub_slot;
+            s.parent_hub_port = port;
         }
         let buf = self.slots[slot_id as usize].descriptor_buffer as u64;
 
@@ -11704,6 +14512,7 @@ impl XhciController {
 
         let input_ctx_virt;
         let max_dci;
+        let op_base = self.op_base; // captured before the slot borrow (X200 witness below)
         unsafe {
             let slot = &mut self.slots[slot_id as usize];
             input_ctx_virt = slot.input_context;
@@ -11752,6 +14561,7 @@ impl XhciController {
                 ep.add(2).write_volatile((phys as u32) | 1);
                 ep.add(3).write_volatile((phys >> 32) as u32);
                 ep.add(4).write_volatile(mps);
+                x200_witness(op_base, &alloc::format!("slot{} kbd TRdeq", slot_id), phys);
                 add_flags |= 1 << dci;
                 mdci = mdci.max(dci);
                 slot.keyboard_state = 1;
@@ -11775,6 +14585,7 @@ impl XhciController {
                 ep.add(2).write_volatile((phys as u32) | 1);
                 ep.add(3).write_volatile((phys >> 32) as u32);
                 ep.add(4).write_volatile(mps);
+                x200_witness(op_base, &alloc::format!("slot{} mouse TRdeq", slot_id), phys);
                 add_flags |= 1 << dci;
                 mdci = mdci.max(dci);
                 slot.mouse_state = 1;

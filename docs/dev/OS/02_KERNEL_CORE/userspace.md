@@ -1282,6 +1282,69 @@
     `arch/aarch64/syscall.rs` (the U7 fixture blob + `u7_run`) + the spec + this doc. QEMU-green ≠ correct:
     the metal confirmation rides the next attended boot, where the property to watch is simply the U7 line —
     `-> PASS` rather than the `parent=0x3` partial.
+- **U11FIX (this arc)** — **the same defect, three more blobs**: U7FIX repaired the iteration-denominated park
+  in the U7 fixture and nowhere else, but three later fixture blobs had been copied from the *pre-fix* U7 blob
+  and carried the bug forward verbatim. PA41 was an attended Pi 4 boot on a tip QEMU-gated 108/108 green, and
+  U11-defer was the failing line:
+  `:: U11-defer: cross-process unlink-defers-free FAIL — head=28471 ff_busy=28468 measured=true want_ff=28468 a_w=0x1 b_w=0x0 opened=true unlinked=false read=false done=2 killed=0 cleared=true c1(gone=false,alive=true) c2_alive=true c3(freed=false,reuse=true) ::`
+  - **`b_w=0x0` with `done=2` is the whole conviction.** B's witness bits are `b0` open of A's file, `b1`
+    unlink accepted, `b2` re-open of the gone name `-ENOENT`. `0x0` means B set *none* of them — yet `done=2`
+    says B ran its `SYS_EXIT` and `killed=0` says nothing terminated it. The only path through program B that
+    reaches its exit with an empty witness and no fault is the **unlink-GO park falling off the end of its
+    budget**. `a_w=0x1` is the same statement about A one step later: A created and grow-wrote the file
+    (`b0`), reported `A_OPENED`, and then gave up in its read-GO park while the launcher was burning its full
+    5 s waiting for a `B_UNLINKED` cue that could never come. Every remaining field follows mechanically —
+    `unlinked=false`, `read=false`, `c1(gone=false)` because the name was never removed, `c3(freed=false)`
+    because A never reached its last close. `cleared=true` because both fixtures shut down cleanly, having
+    simply given up. **Nothing was wrong with the cross-process unlink-defer path**, which is the verdict
+    worth stating plainly: `sys_unlink`'s deferred free was never reached, let alone implicated.
+  - **The reaper did NOT cover this leak** — worth correcting, because the boot log invites the opposite
+    reading. `U11-defer: reaper freed teardown-orphaned chain @cluster 28474` appears further down PA41's
+    wire, but the defer file's measured head was **28471**. 28474 is the U11-**reap** fixture's chain (the two
+    demos share that one log string). DEFER.BIN's chain was left allocated *with its directory entry intact* —
+    an ordinary file, not an orphan, and therefore not something the reaper is even looking for.
+  - **Why this one lost harder than U7 did.** The currencies mismatch exactly as in P63 — launcher deadlines in
+    wall clock, fixture parks in `SYS_YIELD` iterations — but the interval B must outlast is far longer than
+    U7's. B parks at spawn and is not released until the launcher has (a) let A create DEFER.BIN and grow-write
+    it, which costs an `alloc_cluster` first-fit scan, and (b) run the U11-MEASURE mount, which calls
+    `first_free_cluster` — a linear first-fit scan from cluster 2. On PA41 the free set started at **28468**,
+    so that is ~28k FAT entries ≈ 222 sector reads *per scan*, against a real SD card. The QEMU margins the fix
+    now prints are the measurement: **B parked 83 ms** before its unlink-GO, where U7's child parked 3 ms.
+    Under QEMU an emulated yield round trip costs ~1 ms, so the old `0x8000` budget covered ~30 s and 83 ms fit
+    with three orders of magnitude to spare — 108/108, every run. On a Cortex-A72 the same budget retires in
+    **single-digit milliseconds** while the work it must outlast grows by the SD card's latency. That is not a
+    race PA41 happened to lose; it is one the fixture could not win, which is why the failure was deterministic
+    rather than flaky.
+  - **Fix: the U7FIX park, applied everywhere it was missed.** All seven remaining bounded GO parks — three in
+    the u11defer blob, three in u11reap, two in u6owner — now step on `SYS_SLEEP_MS(1)` instead of a bare
+    `SYS_YIELD`, making `0x8000` ~131 s of real 250 Hz ticks on metal and leaving QEMU's cooperative-yield
+    behaviour unchanged. The budget constant, the launcher deadlines and every on-disk checkpoint are untouched.
+  - **Witness: `:: [u11fix] park margin — … ::`,** `+1` spec REQUIRE and `+3` FORBIDs (108 → 109). Same
+    limitation as u7fix, stated up front: `SYS_SLEEP_MS` degrades to a yield under QEMU, so **QEMU cannot gate
+    the park primitive itself** — that confirmation belongs to the bench. What it does gate is the launcher's
+    **parked-out assertion**: B must still be parked when its unlink-GO is released, and A must still be parked
+    at both of its releases. A fixture that gave up has already run `SYS_EXIT`. B legitimately exits right
+    after its `B_UNLINKED` cue, so the bare `EL0_U11DEFER_DONE` count cannot serve for A's two checks; a
+    name-keyed `EL0_U11DEFER_A_EXITED` flag makes them exact. This is the fact that names the defect directly,
+    and its absence is precisely why `b_w=0x0` was indistinguishable from a failed `SYS_OPEN`.
+  - **Sharper witness words, so the next flight discriminates for free.** The fixtures now mark *which* park
+    died: bit4 on a read-GO/unlink-GO timeout, bit5 on a close-GO timeout, bit6 when `SYS_OPEN(O_CREAT)` itself
+    failed. PA41's line would have read `a_w=0x11 b_w=0x10` — self-describing — instead of a `0x1`/`0x0` pair
+    that had to be traced back through the assembly. The PASS masks stay `0xF`/`0x7` exactly, so every added
+    bit still fails the verdict: the fixture can still fail, and now says why.
+  - **Self-heal: a failure must not disable its own detector.** The pre-flight skipped the whole demo if
+    DEFER.BIN was already present ("stale image"). On a fresh QEMU image that never fires; on the bench the SD
+    card is persistent, so PA41's leftover would have skipped U11-defer on **every subsequent boot** — the fix
+    would have been unverifiable on the very next flight. The pre-flight now deletes the residue (it can only
+    be a prior failed run's — a PASSing run leaves the name unlinked) and proceeds, logging that it did so;
+    only an *undeletable* copy still skips. This restores the documented precondition rather than relaxing any
+    check: all three on-disk checkpoints run exactly as before, against a freshly created file.
+  - Gates: `./arroyo check` green x86_64 + aarch64, `UNAOS_WC=1 ./arroyo check` green; `./arroyo kernel8-test
+    210` → **109/109 required witnesses, 0 forbidden**. Lane: `arch/aarch64/syscall.rs` (the u11defer/u11reap/
+    u6owner fixture blobs + `u11defer_run` + the sentinel-exit hook) + the spec + this doc. QEMU-green ≠
+    correct: the metal confirmation rides the next attended boot, where the properties to watch are the
+    `[u11fix] park margin` line (all three `parked_out` reading `0`/`false`, and the margins themselves — on
+    metal they will be much larger than QEMU's 83/97/101 ms) and the U11-defer line reading `-> PASS`.
 - **BG-SPREAD (this arc)** — the **stacked background parent**: every `bg` launch pinned its parent task to
   the launcher's core, so background programs piled onto one core no matter how idle the rest of the machine
   was. P62 was an attended sitting: four bg vugs, each visibly slower than the last, while
@@ -3037,6 +3100,49 @@
     heaviest frame this program can draw). All three are 8.3-clean and staged on both the ESP and the
     x86 data volume beside `STAT.ELF`/`PULSE.ELF`.
 
+  - **KVUG — the in-kernel vug, carried into EL0 (`VUGK.ELF`, `hw-jetson` only).** Peter's ruling: the
+    in-kernel software vug (`unaos/crates/kernel/src/vug.rs`, deleted on every other branch by
+    `ee6bfd97`) survives here, and its *content* belongs in the userspace vug — "for those with super
+    extremely slow machines / for history — it's a thing for fun and work". A fourth cargo feature,
+    `kvug`, links the same source into **VUGK.ELF** / **VUGK-X86.ELF**, where the `m` key cycles the
+    kernel demo's three screens:
+
+    | mode | what it draws | kernel origin |
+    | --- | --- | --- |
+    | 0 | the classic wireframe crystal | `run_crystal` with `Mode::Wire` |
+    | 1 | the faceted amethyst crystal — 24 triangles, screen-space backface cull, painter's-algorithm depth sort, flat Lambert against a fixed key light, cap-seam highlights | `run_crystal` with `Mode::Solid` |
+    | 2 | the BeBox GeekPort tribute — two LED columns on the `(i + col) % 3` pattern | `run_bebox_mode` |
+
+    The kernel's fixed-point maths is carried **verbatim** (`isqrt`, `TRIS`, `LIGHT`, `AMETHYST`, the
+    Lambert/ambient fold), which is the point of the exercise — it is the historical artifact, and it is
+    `no_std`-friendly and float-free for the same reason it was in the kernel. Only `pal.fill_triangle`
+    had to be rewritten, because there is no PAL at EL0; the replacement is a band-clipped scanline fill,
+    so the two worker threads still own disjoint halves of the surface and no pixel has two writers.
+
+    **It is a separate image because both renderers do not fit one.** `.text` is capped at `0x2000` by a
+    page cliff (see the SIZE note in `crates/user-vug/src/main.rs`): one byte past it and `.bss` moves a
+    page, the file grows 4096 bytes in one step, the 16 KiB `USER_REGION_SIZE` check rejects it — and
+    `.bss` lands on `base + 0x3000`, which is worker A's stack. The kernel renderer measures 2143 bytes
+    against 461 (aarch64) / 169 (x86) of headroom, so `kvug` also compiles **out** the shard raytracer it
+    replaces. That is the right trade rather than a compromise: the shard costs O(pixels × 18 planes) and
+    the kernel's facet fill costs O(filled pixels), and "slow machine" is the whole brief. Measured
+    `.text`: `0x1f75` aarch64 / `0x1fc5` x86 with `kvug`, against an unchanged `0x1e33` / `0x1f57`
+    without it.
+
+    **Additive by construction.** Every hunk is `#[cfg(feature = "kvug")]`; `VUG.ELF`, `VUGC.ELF` and
+    `VUGX.ELF` are byte-identical to what they were. The mode is forced to 0 whenever `overlay` is false,
+    which is exactly the foreground/no-input path the checksum witness runs, so `VUGK.ELF` prints
+    `checksum=0xe68285b85121ac7c` on the fixture legs like every other image of this source.
+
+    **Not ported, and why.** The kernel HUD's *text* (`VUG // quartz`, the mode/faces/frame line) needs a
+    letter font; this program carries a 5×7 **digit** font only, and a letter font is the one thing the
+    `.text` ceiling genuinely cannot hold. The drawn-face count — `draw_stats`'s `faces` stat — is
+    rendered as a digit readout instead. The CPU pulse strip (`draw_pulse_bar`, `CpuPulse`,
+    `classify_load`, the PARKED/breath states) is **already** an EL0 program: `PULSE.ELF`
+    (`crates/user-pulse`), which reads the counters through `SYS_CPUPULSE(49)` — a verb the **x86 kernel
+    alone** dispatches (ABIFREEZE divergence D2), so it could not have worked in a vug on this branch's
+    arch regardless.
+
   - **The 300-frame checksum is untouched, and by construction rather than by luck.** The scene is gated
     on `overlay` (`detached || interactive`) — the same predicate that already gates the fps overlay — so
     the foreground/no-input path that the checksum witness runs on renders level 0, the unmodified
@@ -3196,6 +3302,67 @@
   check (signatures / allowlist — U2 loads unverified bytes today, safe only
   because ring-3 isolation contains them).
 
+## CRYSTAL-HD — the window surface cap rises to 288, on both arches (2026-08-18)
+
+Peter's sign-off, 2026-08-18, verbatim option "1": **`FB_WIN_MAX` 128 → 288, window slots 8 → 4,
++15 MiB `.bss`.** The held `crystal-graphics-hold` commit (`e65d5d9b`) proposed it for x86 only; this
+landing applies it to **both** arches, because a `target_arch` gate in the experience layer with no
+hardware reason behind it is what the ONE-OS ruling (2026-08-13) fails at review.
+
+**The constants, both arches.** `arch/x86_64/memory.rs` and `arch/aarch64/boot.rs` now carry the same
+cluster: `FB_WIN_MAX_W/H = 288`, `FB_WIN_SLOT_SIZE = 0x51000` (81 pages — exactly 288×288 ARGB8888),
+`FB_WIN_SLOTS = 8 → 4`, `USER_STATIC_SIZE = 0x149000`. The slot count comes down because the slot
+size went up 5×: the whole per-slot FB region must still fit the ONE page table each arch's
+`build_slot` wires (512 × 4 KiB = 2 MiB; 0x149000 is 329 of those pages), and four windows per
+address space is still 4× what any shipped program opens. On aarch64 the `USER_REGION` VA anchor's
+alignment moves 0x100000 → 0x200000 with it — the old alignment guaranteed "cannot straddle a 2 MiB
+L3 block" only because the size was ≤ 0x100000, and 0x149000 is not.
+
+**What it costs the Pi, measured.** The aarch64 kernel heap is hand-placed at 32 MiB
+(`boot::MEM_REGIONS`), so `.bss` has a hard ceiling there. `readelf -S` on the `kernel8` build:
+`.bss` at `0x200000`, size `0x68fb88` → `0xeafb88`, i.e. **end 8.56 MiB → 16.69 MiB, margin to the
+heap floor 15.31 MiB**. The SD image does not grow by a byte — `.bss` is NOBITS and `kernel8.img` is
+an objcopy of the loaded sections only. No memory-gated cap was needed.
+
+**Two seams the cap divergence opened, both closed here.**
+
+* `WIN_MAX == FB_WIN_SLOTS` on aarch64 became `FB_WIN_SLOTS <= WIN_MAX`, matching the x86 twin. The
+  two count different things: `WIN_MAX` (8) is how many windows the SYSTEM may have live,
+  `FB_WIN_SLOTS` (4) how many surface slots ONE address space reserves.
+* `sys_win_create`'s region-slot search on aarch64 ranged over `WIN_MAX`, which was harmless only
+  while the caps were equal. With 4 slots and 8 ids it would have handed out region slot 4..7 and
+  `map_slot_fb_win` would have mapped 81 pages past the end of the FB region, into the next slot's
+  backing. The CANDIDATE range is now `FB_WIN_SLOTS`; the SCAN range stays `WIN_MAX` (any global row
+  could belong to this ASID). The fifth window gets the `-EMFILE` the verb already documents.
+
+**The `el0-wcb` fixture, updated honestly, ledger unchanged.** The witness mask stays `0x3ffff` —
+all eighteen bits, go-red preserved — but three facts inside it had to move with the cap: b7's
+over-max create is `create(289, 10)` (129 is now legal), region slot 1's surface in the blob is
+`base + 0x56000` (was `base + 0x15000`, the 64 KiB stride), and `wcb_expected_checksum` is over the
+fixture's OWN 128×128 window (new `WCB_W`) rather than over `FB_WIN_MAX_W/H`, which was only ever a
+coincidence. QEMU-verified: `:: EL0: window verbs — create/present/present_rows/move/close
+witness=0x3ffff surface=128x128 checksum=0xfabe809492cf2325 :: PASS ::`.
+
+**SPEC UPDATE, deliberate — the 300-frame auto checksum changes again.** `user-vug`'s surface is
+288×288 on both arches now (`FOCAL` 24 → 54, so the framing is identical and the change is
+resolution), and the checksum is a pure function of the render:
+`:: UVUG: frames=300 threads=2 checksum=0xf18f983557b87a55 ::`, **superseding
+`0xe68285b85121ac7c`** (which itself superseded `0x48221e4101db3924`). Re-pinned in
+`scripts/specs/pi4-regression.spec`, both the `REQUIRE` and the negative-lookahead `FORBID`.
+Reproduced identically across separate `kernel8-test` runs.
+
+**CRYSTAL-PACE is NOT landed, and the ABI records why.** The held commit's third half made
+`SYS_WIN_PRESENT` answer a new status (`WIN_PRESENT_COALESCED = 2`) so `user-vug` could park until
+the x86 compositor's frame edge admitted a present. Both the status and the ring-3 pace loop are
+dropped. Peter's ruling of 2026-08-13 (`9d12e7e0`, `08_VIDEO/PARITY.md` §5.1) is that a vug renders
+**unpaced on every chip** — "more drawing complexity, never artificial pacing" — and a status whose
+only consumer is a self-pacing render loop is that pacer with the sleep moved one syscall outward.
+Independently, keeping `0` for every success is what keeps verb 30's contract **identical on both
+arches**: aarch64 has no coalescing pacer and could never answer a third status. The LOD ladder's
+`LOD_UP` climb threshold is likewise unchanged — the held commit replaced it with a render-time
+utilisation license on the premise that a paced meter reads ~60 regardless of headroom, and that
+premise was the pace loop's.
+
 ## The chain
 
 | Arc | x86_64 (lead) | aarch64 (port) |
@@ -3277,7 +3444,7 @@ Conventions shared across arches:
   | 26 | `SYS_FUTEX` | Y | Y | uaddr, op, val → op-specific. `FUTEX_WAIT`=0, `FUTEX_WAKE`=1 |
   | 27 | `SYS_INPUT_POLL` | Y | Y | — → packed event / `-EAGAIN`. `[55:48]` = type, low 32 = payload, bit 63 always clear |
   | 28 | `SYS_INPUT_WAIT` | Y | Y | — → 0 / `-EINVAL`. Blocks; dequeues nothing, so it composes with 27 |
-  | 29 | `SYS_WIN_CREATE` | Y | Y | w, h → win id / `-errno`. ARGB8888, `stride = w*4`, 1..=128 each |
+  | 29 | `SYS_WIN_CREATE` | Y | Y | w, h → win id / `-errno`. ARGB8888, `stride = w*4`, 1..=288 each (CRYSTAL-HD; was 1..=128) |
   | 30 | `SYS_WIN_PRESENT` | Y | Y | win → 0 / `-errno`. Whole-window damage |
   | 31 | `SYS_WIN_MOVE` | - | Y | win, x, y → 0 / `-errno` |
   | 32 | `SYS_WIN_CLOSE` | - | Y | win → 0 / `-errno` |
@@ -3292,3 +3459,26 @@ Conventions shared across arches:
   is matched (task, vector/EC, address) so demos assert exact outcomes.
 - **User pages are never executable-and-writable**; code pages are read-only
   to the kernel after load.
+- **An executable segment may never reach the final window page (RXFINAL64, aarch64,
+  2026-08-21; the x86 twin is RX-FINALPAGE, `27298f70`).** Both loaders park every
+  program's initial stack pointer at the window TOP (`map_image_into_slot`:
+  `sp = (base + size) & !0xF`), so the window's LAST 4 KiB page is the first stack page
+  of EVERY program — and an executable PT_LOAD is mapped read-only, so an RX `memsz`
+  that spills into that page is loaded-to-die: the program's first stack write takes a
+  permission fault and the fault net kills it at RUNTIME with no load-time diagnosis
+  (the WINX-8 metal fault class). `validate_elf` now refuses it at LOAD time on both
+  arches, with the same witness family:
+  `:: elf: REFUSED rx-crosses-final-window-page seg=[..) carve=[..) ::` and the
+  `&'static str` "rx segment crosses the final window page (the initial stack page)".
+  Boundary: refuse iff `PF_X && memsz > 0 && (vaddr - min_vaddr) + memsz >
+  win_size - 4 KiB`, strict — a segment ending exactly AT the boundary owns no byte of
+  the final page and loads (`min_vaddr` is finalised over ALL program headers before
+  the bounds loop runs). **The scope is loader-universal ONLY**: program-private stack
+  carves lower in the window (user-vug's worker stacks) are a PROGRAM contract, not
+  loader law, and are deliberately NOT enforced here — every correct program satisfies
+  this check by construction, because `sp` always starts in that final page. Proven
+  both polarities on aarch64 QEMU via a SUITETYPE typed run against an SDIMG-override
+  card carrying two hand-built one-segment ELFs: `BADRX.ELF` (RX span `[0,0x3001)`,
+  one byte into the final page) is REFUSED with the witness; `RXEDGE.ELF` (`[0,0x3000)`,
+  exactly at the boundary) loads, runs, and exits 0 — asserted by a second mbench spec
+  after pi4-regression.spec passed 117/117 on the same capture.
