@@ -1317,6 +1317,25 @@ pub fn vfs2_fat_write_witness() {
     if DONE.swap(true, Ordering::Relaxed) {
         return;
     }
+    // FATGROW (2026-08-22): the FAT directory-chain growth witness rides this pass.
+    //
+    // WHY HERE. It needs exactly what this function already has — a live writable FAT volume on the
+    // boot block device, reached once, from a task with a real stack — and this is the only pass in
+    // the `fs/` layer that has it: `fat::probe_once` is NOT reached on the Pi bare-metal boot
+    // (verified against `target/serial-pi.log`: no `FS: FAT mounted` line), and every other FAT
+    // write fixture lives in `arch/aarch64/syscall.rs`'s u7 launcher chain. Hanging it here keeps
+    // the whole arc inside `fs/`.
+    //
+    // It runs BEFORE this witness's own scratch file rather than after, because the two are strictly
+    // sequential and each is self-cleaning, and a leading call cannot be skipped by one of the early
+    // `return`s below. `fatgrow_witness_once` does its own mount, its own storage-ready check and its
+    // own honest SKIPPED line, so it costs this witness nothing but the call.
+    //
+    // ⚠ `#[cfg]` FOLDED ONTO THE STATEMENT (PARITY §5.3): this function is compiled into every
+    // aarch64 build while `fatgrow_witness_once` is `witness`-gated, so the gate has to sit on the
+    // call, not around the function. Knob-off, the statement does not exist before MIR.
+    #[cfg(feature = "witness")]
+    crate::fs::fat::fatgrow_witness_once();
     if crate::fs::fat::mount().is_err() {
         serial_println!(":: VFS2-fat: no FAT filesystem — skipped ::");
         return;

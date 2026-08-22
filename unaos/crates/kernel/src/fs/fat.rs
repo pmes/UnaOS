@@ -39,6 +39,21 @@
 //! directory `size` (the reader's truth) is bumped **last**, so a crash mid-grow leaves a consistent
 //! smaller file. FAT type is determined strictly by the data-cluster count per the Microsoft FAT
 //! specification (the only correct method). FAT12 and non-512-byte logical sectors are rejected.
+//!
+//! **FATGROW (2026-08-22) — directories grow too.** Until this arc, allocation had a file half and no
+//! directory half: `write_grow` extended a FILE's cluster chain, but a DIRECTORY whose every 32-byte slot
+//! held a live entry answered `NoSpace` forever, and four doc-comments said so ("extending a directory
+//! chain is out of scope"). That is reachable, not theoretical — a 4 KiB cluster is 128 slots and a VFAT
+//! long name spends `1 + ceil(chars / 13)` of them, so an ordinary directory fills its first cluster after
+//! a few dozen creates. [`FatFs::grow_dir_chain`] closes it by composing the SAME primitives `write_grow`
+//! uses — `alloc_cluster` (claim in all FAT copies, then **zero-fill**) then one `set_fat_entry` to link
+//! the old tail — so the U10 invariants above extend to directories unchanged. Two things make a
+//! directory grow SAFER than a file grow rather than riskier: a directory has no `size` field to publish,
+//! so there is nothing that can outrun its data; and an appended all-`0x00` cluster is itself a correct
+//! end-of-directory marker, so the volume is consistent at every instant of the operation. The variants
+//! differ where the FORMAT differs, not where this driver chooses to: the FAT32 root is an ordinary chain
+//! and grows, while the FAT16 fixed root is sized at format time by `BPB_RootEntCnt` and **cannot** —
+//! that `NoSpace` is permanent and correct. Growth stops at the spec's 65 536-entry directory cap.
 
 use alloc::string::String;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -67,8 +82,10 @@ pub enum FatError {
     IsDirectory,
     /// The cluster chain is malformed (free/bad cluster mid-chain, or a loop).
     BadChain,
-    /// U10: no free space — the free-cluster search found no free cluster (volume full), or a directory has
-    /// no free slot for a new entry (root-directory-chain extension is out of scope). Surfaces as `-ENOSPC`.
+    /// U10: no free space — the free-cluster search found no free cluster (volume full). FATGROW: a directory
+    /// that is merely out of SLOTS no longer lands here, because a cluster-chain directory now grows; what
+    /// still does is the FAT16 fixed root (which cannot grow, by the format) and a directory that has reached
+    /// the FAT spec's 65 536-entry cap. Surfaces as `-ENOSPC`.
     NoSpace,
     /// PARTITION (GR9): a derived LBA fell outside THIS volume's own extent (`part_lba .. part_lba +
     /// vol_sectors`). Distinct from [`FatError::Io`] on purpose: `Io` means the medium refused a legal
@@ -2975,10 +2992,17 @@ impl FatFs {
     /// with attribute `attr` (a plain file is `0x20`). Finds a free directory slot (a `0x00` end-of-directory or
     /// a `0xE5` deleted slot) and writes the 8.3 name + zeroed metadata there; the first `write_grow` of the
     /// 0-cluster file allocates its first cluster and sets `first_cluster`. Returns the parsed entry with its
-    /// on-disk (LBA, slot-offset). `NoSpace` if the root directory has no free slot (extending the root-dir chain
-    /// is out of scope); `Unsupported` if the name is not a representable short name. Allocates NO clusters and
-    /// touches NO FAT — only the one directory sector. The caller must have confirmed the name is absent (this
-    /// does not de-duplicate); a 0-length entry never aliases another file's data (it owns no clusters).
+    /// on-disk (LBA, slot-offset). `Unsupported` if the name is not a representable short name; `NoSpace` if no
+    /// slot can be had — which since FATGROW means the VOLUME is full (or the spec entry cap is reached) on
+    /// FAT32, whose root is a growable chain, and still means the ROOT is full on FAT16, whose fixed root
+    /// cannot grow. The caller must have confirmed the name is absent (this does not de-duplicate); a 0-length
+    /// entry never aliases another file's data (it owns no clusters).
+    ///
+    /// FATGROW amends one claim this doc used to make: "allocates NO clusters and touches NO FAT". In the
+    /// common case that is still exactly true — one directory-sector RMW. But on the FAT32 root's LAST slot,
+    /// `find_free_root_slot` now appends a cluster, so the call MAY allocate one cluster and write the FAT
+    /// (all copies) before the slot write. Every such mutation rides the existing `FAT_MUTATION` primitives,
+    /// and `grow_dir_chain` documents why each of its failure points is benign.
     pub fn create_in_root(&self, name: &str, attr: u8) -> Result<(DirEntry, u64, usize), FatError> {
         let raw = format_83(name).ok_or(FatError::Unsupported)?;
         let (lba, off) = self.find_free_root_slot()?;
@@ -3040,12 +3064,17 @@ impl FatFs {
 
     /// JD6: create a fresh 0-length entry `name` in the directory at `first_cluster` (`0` ⇒ the
     /// volume root ⇒ [`FatFs::create_in_root`]). The dir-aware twin of `create_in_root`: the free
-    /// slot comes from the existing private `free_slot_in_dir_chain` (a FULL subdirectory — no free
-    /// slot; extending a subdir's cluster chain is out of scope this arc — is an honest `NoSpace`),
-    /// and the slot WRITE below is a VERBATIM copy of `create_in_root`'s `with_dir_lock` RMW.
+    /// slot comes from the existing private `free_slot_in_dir_chain`, and the slot WRITE below is a
+    /// VERBATIM copy of `create_in_root`'s `with_dir_lock` RMW.
     /// ⚠ TWIN — keep the `with_dir_lock` body in sync with `create_in_root` (the seat review diffs
-    /// the two). Allocates NO clusters and touches NO FAT — only the one directory sector. The
-    /// caller must have confirmed the name is absent (this does not de-duplicate).
+    /// the two). The caller must have confirmed the name is absent (this does not de-duplicate).
+    ///
+    /// FATGROW: a FULL subdirectory is no longer an `NoSpace` dead end — `free_slot_in_dir_chain`
+    /// appends a zeroed cluster and returns its first slot, so `NoSpace` from here now means the
+    /// VOLUME is full (or the directory hit the FAT spec's 65 536-entry cap). This also amends the
+    /// old "allocates NO clusters and touches NO FAT" claim: usually still one directory-sector RMW,
+    /// but on the parent's LAST slot the call allocates one cluster and writes the FAT (all copies)
+    /// first. See `grow_dir_chain` for the ordering and why each failure point is benign.
     pub fn create_in_dir(
         &self,
         first_cluster: u32,
@@ -3166,8 +3195,10 @@ impl FatFs {
     ///
     /// Mirrors `create_in_dir`'s de-dup contract: the CALLER confirms `name` is absent first (as
     /// shell.rs's `fs_touch` does for files) — this does not de-duplicate. Errors: `Unsupported` (name
-    /// not a representable 8.3 short name), `NoSpace` (no free cluster, or the parent directory is full —
-    /// subdir-chain extension is out of scope), `Io`/`BadChain`/`NoDisk` from the primitives.
+    /// not a representable 8.3 short name), `NoSpace` (no free cluster on the VOLUME — FATGROW: a parent
+    /// that is merely out of slots now grows instead of refusing, so this needs TWO free clusters where the
+    /// parent is also full: one for the child, one for the parent's new directory cluster),
+    /// `Io`/`BadChain`/`NoDisk` from the primitives.
     pub fn create_dir(
         &self,
         parent_first_cluster: u32,
@@ -3448,9 +3479,14 @@ impl FatFs {
     }
 
     /// U10: the on-disk location of the first FREE root-directory slot (a `0x00` end marker or a `0xE5` deleted
-    /// slot). `NoSpace` if the root directory is full — extending the root-directory chain is out of scope this
-    /// arc. Writing into the first `0x00` slot preserves the terminator (the slots after it stay `0x00`), and a
+    /// slot). Writing into the first `0x00` slot preserves the terminator (the slots after it stay `0x00`), and a
     /// `0xE5` slot is mid-directory, so either choice keeps the directory correctly terminated.
+    ///
+    /// FATGROW: the two variants answer a FULL root DIFFERENTLY, and that asymmetry is the on-disk format's,
+    /// not this driver's. A **FAT32** root is an ordinary cluster chain rooted at `BPB_RootClus`, so it grows
+    /// like any other directory (`free_slot_in_dir_chain`). A **FAT16** root is a fixed-size region sized at
+    /// FORMAT time by `BPB_RootEntCnt` and living BEFORE the data region, with no FAT entry of its own and
+    /// nowhere to grow into — it answers `NoSpace` forever, and no driver can do otherwise.
     fn find_free_root_slot(&self) -> Result<(u64, usize), FatError> {
         match self.kind {
             FatKind::Fat32 => self.free_slot_in_dir_chain(self.root_cluster),
@@ -3458,8 +3494,10 @@ impl FatFs {
         }
     }
 
+    /// The FAT16 fixed root. `NoSpace` on exhaustion — permanently, by the format's construction (see
+    /// `find_free_root_slot`). FAT16 SUBdirectories are ordinary cluster chains and DO grow; only the root
+    /// is capped, at the `BPB_RootEntCnt` the formatter chose.
     fn free_slot_in_fixed_root16(&self) -> Result<(u64, usize), FatError> {
-        // MULTIBLK: `NoSpace` on exhaustion, exactly as before — a fixed root cannot be extended.
         self.free_slot_in_dir_sectors(None)
     }
 
@@ -3482,10 +3520,101 @@ impl FatFs {
         found.ok_or(FatError::NoSpace)
     }
 
-    /// A directory stored as a cluster chain. `NoSpace` when the chain holds no free slot — extending
-    /// a directory chain remains out of scope, exactly as before MULTIBLK.
+    /// FATGROW: the FAT specification's hard cap on a directory — no directory may hold more than 65 536
+    /// 32-byte entries (2 MiB of slots). Growth stops HERE rather than at "the volume is full", so a
+    /// runaway create loop cannot inflate one directory past what other FAT implementations will read back.
+    const MAX_DIR_SLOTS: u64 = 65_536;
+
+    /// A directory stored as a cluster chain — the FAT32 root, or ANY subdirectory on either variant.
+    ///
+    /// FATGROW: the chain's own slots first; when every one of them is taken, append a cluster
+    /// (`grow_dir_chain`) and hand back its first — zeroed, therefore free — slot. `NoSpace` out of here now
+    /// means what it should always have meant: the VOLUME has no free cluster, or the directory has reached
+    /// the FAT spec's entry cap. It no longer means merely "this directory's current clusters are full",
+    /// which is a condition an ordinary card reaches after a few dozen creates.
+    ///
+    /// Only `NoSpace` triggers growth. An `Io`/`BadChain`/`NoDisk` from the scan is a real fault and
+    /// propagates untouched — a failed READ of a directory must never be answered by WRITING to it.
     fn free_slot_in_dir_chain(&self, start: u32) -> Result<(u64, usize), FatError> {
-        self.free_slot_in_dir_sectors(Some(start))
+        match self.free_slot_in_dir_sectors(Some(start)) {
+            Err(FatError::NoSpace) => self.grow_dir_chain(start),
+            other => other,
+        }
+    }
+
+    /// FATGROW: append one freshly zeroed cluster to the directory chain starting at `start`, and return the
+    /// (LBA, offset) of its FIRST 32-byte slot — free BY CONSTRUCTION, because the whole cluster is `0x00`.
+    ///
+    /// This is the missing half of directory allocation. Before it, a directory whose every slot held a live
+    /// entry answered `NoSpace` forever, and on a real card that is reachable rather than theoretical: a
+    /// 4096-byte cluster is 128 slots, and a VFAT long name spends `1 + ceil(chars / 13)` of them, so a
+    /// directory of ordinarily-named files exhausts its first cluster after ~40 creates, not ~128.
+    ///
+    /// It does NOT introduce a second allocator. It is exactly `write_grow`'s step 2 for a chain one cluster
+    /// longer: `alloc_cluster` (bounded first-fit free search, F3-M1 compare-and-claim of EOC in ALL
+    /// `num_fats` copies, then ZERO-FILL) followed by one `set_fat_entry` linking the old tail onto it
+    /// (again ALL copies). No new FAT-mutation primitive, no new lock, no new on-disk field.
+    ///
+    /// **Why every failure here is benign, and why that is easier than it is for a file.** A directory has no
+    /// size field — the chain is the truth and a `0x00` slot is the terminator — so there is nothing to
+    /// publish afterwards and nothing that can claim bytes it does not have:
+    ///   * `alloc_cluster` fails (volume FULL) -> `NoSpace` with NOTHING mutated. The chain is byte-for-byte
+    ///     what it was; the caller's create fails exactly as it did before this arc. There is no window in
+    ///     which the chain is half-linked, because the link is a single FAT entry written after the claim.
+    ///   * the tail link fails -> the new cluster stays an EOC-terminated UNLINKED orphan: one leaked
+    ///     cluster (chkdsk-reclaimable, the same benign class `alloc_cluster` and `delete_located` already
+    ///     ledger), never a truncated chain and never a directory that reads differently than before.
+    ///   * the CALLER's subsequent slot write fails -> the directory simply owns one more all-zero cluster,
+    ///     which is a legal, correctly terminated, entirely ordinary FAT directory with free slots in it.
+    ///
+    /// **Zeroing, and the classic corruption it avoids.** The zero-fill happens INSIDE `alloc_cluster`,
+    /// i.e. strictly BEFORE the link exists, so no reader can ever walk from the old tail into stale bytes.
+    /// An unzeroed directory cluster is read back as garbage entries — a freed file's data interpreted as
+    /// names, attributes and cluster numbers — which is the textbook way to corrupt a FAT volume. The
+    /// ordering that prevents it is `alloc_cluster`'s existing claim -> zero -> return, not a new rule here.
+    ///
+    /// **The `0x00` terminator vs the `0xE5` tombstone.** `free_slot_in_dir_sectors` reports exhaustion only
+    /// when NO slot in the entire chain is `0x00` or `0xE5` — which means the old tail cluster is packed with
+    /// live entries and carries no end marker at all. That is a legal FAT directory: a reader ends it by
+    /// running out of chain, not by finding a terminator. Appending an all-`0x00` cluster puts the terminator
+    /// back at the new cluster's slot 0, and writing one entry into that slot leaves slots 1.. still `0x00`.
+    /// So the directory is correctly terminated before the growth, after the growth, and after the create —
+    /// and the previous cluster's tail needs no fixup, because a full cluster never held a terminator to
+    /// damage. (A `0xE5` slot would have been claimed by the scan and no growth would have happened at all.)
+    ///
+    /// **Tail validation.** The link overwrites only an entry that reads EOC. If the walked chain's last
+    /// cluster does not — a walk truncated at `collect_chain`'s bound, or a chain mutated under us — we
+    /// refuse with `BadChain` rather than splice the new cluster over a live link, which would orphan every
+    /// cluster beyond it and, worse, hand those clusters back to `alloc_cluster` while a directory still
+    /// referenced them.
+    ///
+    /// **FSInfo** is deliberately untouched, exactly as `alloc_cluster` leaves it: this driver does not
+    /// maintain FAT32's `FSI_Free_Count`/`FSI_Nxt_Free` at all (`ALLOC_HINT` is the in-memory stand-in, and
+    /// its doc-comment records why the sector is not written). Growth therefore adds no on-disk field that
+    /// could drift stale — it inherits an existing, ledgered position rather than opening a new gap.
+    ///
+    /// **Concurrency** is the FATDIRS residual class, unchanged: each FAT mutation is individually atomic
+    /// under `FAT_MUTATION`, but scan -> grow is not one hold. Two racing growers can each append a cluster,
+    /// which leaks one (benign) and never aliases, since `alloc_cluster`'s compare-and-claim cannot hand the
+    /// same cluster to both. EXCLUDED_BY_SEQUENCING today for the same reason FATDIRS ledgers.
+    fn grow_dir_chain(&self, start: u32) -> Result<(u64, usize), FatError> {
+        // The chain as it stands, bounded exactly as the read walkers bound it.
+        let chain = self.collect_chain(start, self.count_of_clusters as usize + 1)?;
+        let tail = *chain.last().ok_or(FatError::BadChain)?;
+        // The spec cap, checked BEFORE anything is claimed so a capped directory leaks no cluster.
+        let slots_per_clus = self.sec_per_clus as u64 * SECTOR_SIZE as u64 / 32;
+        if (chain.len() as u64 + 1).saturating_mul(slots_per_clus) > Self::MAX_DIR_SLOTS {
+            return Err(FatError::NoSpace);
+        }
+        // Never link onto anything that is not the real end of the chain (see TAIL VALIDATION above).
+        if !self.is_eoc(self.fat_entry(tail)?) {
+            return Err(FatError::BadChain);
+        }
+        // Claim + zero-fill, all FAT copies. A failure here leaves the volume exactly as it was.
+        let fresh = self.alloc_cluster()?;
+        // Publish: the old tail now points at `fresh`, in all FAT copies. `fresh` is already zeroed.
+        self.set_fat_entry(tail, fresh)?;
+        Ok((self.cluster_lba(fresh), 0))
     }
 
     /// U11-M2: mark a directory entry deleted (first byte -> `0xE5`) via RMW, preserving the rest of the sector.
@@ -4301,5 +4430,242 @@ fn piusb27_walk_subtree(fs: &FatFs, entries: &[DirEntry], prefix: &str, depth: u
             }
             Err(e) => serial_println!(":: piusb27: {} read error ({}) ::", path, fat_reason(e)),
         }
+    }
+}
+
+// =================================================================================================
+// FATGROW witness (pi4 lane, 2026-08-22) — THE TEST THAT WOULD HAVE CAUGHT THE MISSING HALF.
+//
+// The defect this arc fixes was not a crash and not a corruption: it was an honest `NoSpace` that
+// nobody could see, because no gate ever filled a directory. `write_grow` (files) has been covered
+// since U10 by the planted `GROW.BIN` fixture; directories had the symmetric primitive missing and
+// the symmetric fixture missing, which is exactly how a gap survives four batons.
+//
+// This witness closes both halves at once. It is deliberately SELF-CONTAINED — it plants nothing at
+// build time, needs no staged file, and cleans up after itself — so it runs anywhere a writable FAT
+// volume is mounted, on QEMU raspi4b and on the bench card alike.
+//
+// WHY IT IS AN *UNCOUNTED* WITNESS (`… PASS ::`, no `->` arrow). `pi4-regression.spec`'s
+// `COUNT 26 :: (…): .*-> PASS ::` counts arrow-form verdicts, and its maintenance rule is that a new
+// counted fixture must raise the floor in the same commit — which would mean editing a spec outside
+// this arc's lane and moving the 117/117 the gate is quoted at. The arrow is therefore omitted, the
+// FATDIRS / FATMOVE / CLOCK3-fat convention. The failure spelling is chosen with the same care and
+// the opposite intent: `FAIL ::` is one of `mbench.py`'s DEFAULT_FORBIDS, so a regression here reds
+// the gate with NO spec entry at all. (FATDIRS spells its failure `FAIL [w=0x..]`, which escapes the
+// default forbids and is why it needs an explicit `FORBID` line; this one does not.)
+// =================================================================================================
+
+/// FATGROW: the 8.3 name of the scratch directory this witness builds and then removes. Distinct
+/// from every staged fixture name (`HELLO`/`SCRATCH`/`GROW`/`K2*`/`MIDDEN`/`*.ELF`) and from
+/// FATDIRS' `FDSUB` / FATMOVE's `FM?.BIN`, so the two can never collide in the same root.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+const FATGROW_DIR: &str = "FGROWDIR";
+
+/// FATGROW: an upper bound on slots-per-cluster this witness is willing to fill. A 512-byte cluster
+/// (what `mkfs.fat` gives the Pi image, and what `GROW.BIN`'s one-cluster assumption already relies
+/// on) is 16 slots, so the boundary is 15 creates away. A 32 KiB-cluster card would be 1024, and
+/// spending a thousand round trips to prove the same thing is not worth a gate's seconds — above
+/// this bound the witness says SKIPPED and why, rather than running long or lying.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+const FATGROW_MAX_SLOTS: usize = 256;
+
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+fn fatgrow_name(i: usize) -> String {
+    alloc::format!("FG{:03}.BIN", i)
+}
+
+/// FATGROW: remove the scratch directory and everything in it, if it is there. Best-effort by
+/// design — it runs BEFORE the test (to clear a previous boot's crash residue on a persistent card)
+/// and AFTER it (as the real teardown, whose success is part of the verdict).
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+fn fatgrow_teardown(fs: &FatFs) -> Result<(), FatError> {
+    let (de, _, _) = match fs.locate_in_dir(0, FATGROW_DIR) {
+        Ok(t) => t,
+        Err(_) => return Ok(()), // not there — nothing to undo
+    };
+    let dir = de.first_cluster();
+    if dir != 0 {
+        // Delete every child. `read_dir` includes `.` and `..`; those are the directory's own
+        // structure and are freed with it, never unlinked individually.
+        for e in fs.read_dir(dir)? {
+            let n = e.name();
+            if n == "." || n == ".." {
+                continue;
+            }
+            let name = String::from(n);
+            if let Ok((_, l, o)) = fs.locate_in_dir(dir, &name) {
+                let _ = fs.delete_located(l, o, e.first_cluster());
+            }
+        }
+    }
+    fs.remove_dir(0, FATGROW_DIR)?;
+    Ok(())
+}
+
+/// FATGROW: fill a directory until its last 32-byte slot is taken, then create ONE more entry —
+/// the create that, before this arc, was a permanent `-ENOSPC`. Returns the detail string for the
+/// witness line.
+///
+/// What each step is actually proving, in order:
+///  1. **the boundary is where we think it is** — the fill creates must NOT grow the chain. If the
+///     chain grew early the test would be measuring nothing, so `mid == 1` is asserted, not assumed;
+///  2. **the chain grew by exactly one cluster** — not zero (the defect), not two (a double-append);
+///  3. **the new entry landed in slot 0 of the new cluster** — the LBA is checked against
+///     `cluster_lba(fresh)`, so "it grew" and "the create used the growth" are one claim, not two;
+///  4. **the new cluster was ZEROED before it joined the chain** — the rest of its first sector is
+///     read back and required to be all `0x00`. This is the classic FAT corruption: an unzeroed
+///     directory cluster is read back as garbage entries built out of a freed file's data. It is
+///     checked directly rather than inferred, because inferring it is how it gets missed;
+///  5. **BOTH FAT copies carry the link** — `fat_entry_copy` per copy, for the tail's forward
+///     pointer AND the new cluster's EOC. A one-FAT write is a corrupt volume that reads fine until
+///     something consults the mirror;
+///  6. **it is on the DISK, not in a cache** — the census re-mounts and re-walks. Every created name
+///     must be present exactly once, plus `.` and `..`, and NOTHING else. A garbage entry from an
+///     unzeroed cluster, a lost entry from a botched terminator, or a `0x00` written over a live
+///     slot would all surface here as a count mismatch;
+///  7. **the grown chain frees cleanly** — teardown removes the directory and both its clusters, so
+///     the witness leaves the volume exactly as it found it and a leak cannot accumulate per boot.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+fn fatgrow_run() -> Result<String, FatError> {
+    let fs = mount()?;
+    let slots = (fs.cluster_size() as usize) / 32;
+    if slots < 4 || slots > FATGROW_MAX_SLOTS {
+        return Err(FatError::Unsupported); // reported as SKIPPED by the caller, with the bound
+    }
+    // Clear a previous boot's residue on a persistent card before measuring anything.
+    let _ = fatgrow_teardown(&fs);
+
+    // A fresh subdirectory: one cluster, `.` and `..` in slots 0 and 1.
+    let (de, _, _) = fs.create_dir(0, FATGROW_DIR)?;
+    let dir = de.first_cluster();
+    if dir == 0 {
+        return Err(FatError::BadChain);
+    }
+    let before = fs.chain_clusters(dir)?.len();
+
+    // (1) Fill the remaining slots EXACTLY. `create_in_dir` writes a single 8.3 slot per call.
+    let fill = slots - 2;
+    for i in 0..fill {
+        fs.create_in_dir(dir, &fatgrow_name(i), 0x20)?;
+    }
+    let mid = fs.chain_clusters(dir)?.len();
+
+    // (2) THE BOUNDARY CREATE — the one this arc exists for.
+    let (_, blba, boff) = fs.create_in_dir(dir, &fatgrow_name(fill), 0x20)?;
+    let chain = fs.chain_clusters(dir)?;
+    if before != 1 || mid != 1 || chain.len() != 2 {
+        return Err(FatError::BadChain);
+    }
+    let (tail, fresh) = (chain[0], chain[1]);
+
+    // (3) The entry landed in slot 0 of the cluster that was just appended.
+    if boff != 0 || blba != fs.cluster_lba(fresh) {
+        return Err(FatError::BadChain);
+    }
+
+    // (4) The new cluster was zeroed before it joined the chain: everything after the one entry we
+    //     just wrote into slot 0 must still be 0x00 — including slot 1, the end-of-directory marker.
+    let mut sec = [0u8; SECTOR_SIZE];
+    fs.rd_sector(blba, &mut sec)?;
+    if sec[32..].iter().any(|&b| b != 0) {
+        return Err(FatError::BadChain);
+    }
+
+    // (5) Both FAT copies: the tail points at `fresh`, and `fresh` is EOC. In BOTH.
+    for f in 0..fs.num_fats() {
+        if fs.fat_entry_copy(tail, f)? != fresh || !fs.is_eoc(fs.fat_entry_copy(fresh, f)?) {
+            return Err(FatError::BadChain);
+        }
+    }
+
+    // (6) The durability + census pass, on a FRESH mount so nothing in memory can answer for disk.
+    let fs2 = mount()?;
+    let (de2, _, _) = fs2.locate_in_dir(0, FATGROW_DIR)?;
+    let dir2 = de2.first_cluster();
+    let entries = fs2.read_dir(dir2)?;
+    let mut dots = 0usize;
+    let mut found = alloc::vec![false; fill + 1];
+    let mut alien = 0usize;
+    for e in &entries {
+        let n = e.name();
+        if n == "." || n == ".." {
+            dots += 1;
+            continue;
+        }
+        match (0..=fill).find(|&i| n == fatgrow_name(i).as_str()) {
+            Some(i) if !found[i] => found[i] = true,
+            _ => alien += 1, // a duplicate, or an entry nobody created (garbage from a stale cluster)
+        }
+    }
+    let missing = found.iter().filter(|&&f| !f).count();
+    if dots != 2 || alien != 0 || missing != 0 || entries.len() != fill + 3 {
+        return Err(FatError::BadChain);
+    }
+    // The boundary entry specifically must be findable by name through the ordinary lookup path.
+    fs2.locate_in_dir(dir2, &fatgrow_name(fill))?;
+
+    // (7) Teardown, and it must actually work: the grown chain frees like any other.
+    fatgrow_teardown(&fs2)?;
+    if fs2.locate_in_dir(0, FATGROW_DIR).is_ok() {
+        return Err(FatError::BadChain);
+    }
+
+    Ok(alloc::format!(
+        "cluster={}B slots/clus={} filled={} boundary={} chain {}->{} (tail={} fresh={}) \
+         new-cluster-zeroed=yes fats={} agree entries={} re-mounted=yes freed=yes",
+        fs.cluster_size(),
+        slots,
+        fill,
+        fatgrow_name(fill),
+        before,
+        chain.len(),
+        tail,
+        fresh,
+        fs.num_fats(),
+        entries.len(),
+    ))
+}
+
+/// FATGROW: the one-shot witness. Runs once per boot from the storage-ready pass, mutates only its
+/// own scratch directory, and leaves the volume byte-equivalent to how it found it.
+///
+/// Three distinguishable outcomes, on purpose:
+///   * `… PASS ::` — the boundary create succeeded and all seven checks in `fatgrow_run` held;
+///   * `… SKIPPED — <reason> ::` — no volume, or a geometry outside `FATGROW_MAX_SLOTS`. Never a
+///     silent return: a gate that cannot tell "did not run" from "passed" is the failure mode
+///     `sdhc_probe_once`'s doc-comment already argues at length;
+///   * `… FAIL ::` — a real regression. Spelled to hit `mbench.py`'s DEFAULT_FORBIDS directly.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+pub fn fatgrow_witness_once() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if crate::drivers::block::info().is_none() {
+        return; // storage not up yet — the caller retries on the next pass
+    }
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    match fatgrow_run() {
+        Ok(detail) => serial_println!(
+            ":: FATGROW: directory chain grew on slot exhaustion — {} PASS ::",
+            detail
+        ),
+        Err(FatError::NoDisk) | Err(FatError::NotFat) => {
+            serial_println!(":: FATGROW: SKIPPED — no FAT volume on the boot block device ::")
+        }
+        Err(FatError::Unsupported) => serial_println!(
+            ":: FATGROW: SKIPPED — cluster geometry outside the witness bound ({} slots/cluster max) ::",
+            FATGROW_MAX_SLOTS
+        ),
+        // The two failure flavours are worth telling apart at a glance, and `fat_reason` cannot:
+        // it has no `NoSpace` arm and would render the interesting one as "mount failed".
+        //   * `NoSpace`  -> the boundary create was REFUSED. That is the original defect back:
+        //                   `free_slot_in_dir_chain` stopped growing the chain.
+        //   * `BadChain` -> the create succeeded but one of `fatgrow_run`'s seven checks did not
+        //                   hold — the chain, the zeroing, the FAT mirror or the census is wrong,
+        //                   which is worse than a refusal and must not be confused with one.
+        Err(e) => serial_println!(
+            ":: FATGROW: directory chain growth on slot exhaustion ({:?}) FAIL ::",
+            e
+        ),
     }
 }
