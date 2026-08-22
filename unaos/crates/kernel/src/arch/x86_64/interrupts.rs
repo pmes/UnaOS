@@ -414,6 +414,20 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
     // EOI BEFORE any context switch: otherwise the in-service bit would block this CPU's
     // subsequent timer ticks for the whole descheduled lifetime of a preempted task.
     crate::arch::apic::eoi();
+    // DEADMAN — the once-per-second witness that survives a wedged render-service pass.
+    //
+    // POSITION IS LOAD-BEARING, both ends. AFTER `eoi()`: the emit is the longest thing this handler
+    // can do, and holding the in-service bit across it would block this core's own subsequent timer
+    // ticks — the instrument would suppress the very heartbeat it rides. BEFORE `timer_preempt()`:
+    // that call can switch away and not return for the descheduled lifetime of the task, so anything
+    // after it is not on the timer's clock at all, which is the entire property this witness exists
+    // to have.
+    //
+    // Steady-state cost on 999 of every 1000 ticks, on every core, is one relaxed load of the
+    // per-CPU index, one relaxed load of the deadline and one compare. `tick()` returns immediately
+    // on every core but the BSP (the only core that advances `APIC_TICKS`, hence the only one whose
+    // clock reading is the wall clock). A no-op inline shim when the knob is off.
+    crate::deadman::tick();
     // Preemption point. No-op unless a scheduled task is running on THIS cpu and its quantum
     // expired; runs with IF=0 (interrupt gate) and the preempted task's `iretq` restores its IF.
     crate::arch::sched::timer_preempt();

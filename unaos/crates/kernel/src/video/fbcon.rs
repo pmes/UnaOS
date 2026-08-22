@@ -577,8 +577,16 @@ pub fn init(fb_addr: u64, fb_len: usize, info: FrameBufferInfo) {
 /// WHAT IS DELIBERATELY NOT EXCLUDED: `[wc-x]` — the console's own route / first-paint / decline
 /// announcements, which are exactly what a bench reader is looking FOR; `[fbcon]` and `[mirror]`,
 /// which announce mirror loss; boot milestones; every untagged line; and PANIC text.
+///
+/// `[deadman]` joins the list for BOTH reasons at once, and its case is the strongest of the six. It
+/// is periodic telemetry with no on-glass reader (like `[wcn]`/`[schedx86]`) — but it is also emitted
+/// from the APIC TIMER ISR, and routing it to the panel would push a console present, and therefore
+/// compositor-adjacent work, inside an interrupt handler once a second. The wire keeps every byte of
+/// it: this policy governs the GLASS only, and the FTDI ring, `UNAOS.LOG` and the `tste` ring all tap
+/// upstream in `arch::serial::_print`.
 #[cfg(all(target_arch = "x86_64", not(feature = "bootlog")))]
-const PANEL_MUTE_TAGS: [&[u8]; 5] = [b"[wc-g]", b"[wc-h]", b"[wc-d]", b"[wcn]", b"[schedx86]"];
+const PANEL_MUTE_TAGS: [&[u8]; 6] =
+    [b"[wc-g]", b"[wc-h]", b"[wc-d]", b"[wcn]", b"[schedx86]", b"[deadman]"];
 
 /// Bytes of a line's head the sniff needs in order to decide — the longest [`PANEL_MUTE_TAGS`] entry.
 #[cfg(all(target_arch = "x86_64", not(feature = "bootlog")))]

@@ -12541,6 +12541,17 @@ impl Controller {
             {
                 e.kbdwit_last_ms = crate::arch::ms();
             }
+            // DEADMAN — `[deadman] hid=`. Charged at the SAME point and for the same reason as the
+            // KBDWIT stamp above: above every decoder, length gate and `dead` path, and before any
+            // `pal::EVENT_QUEUE` push, so no report layout can influence whether a completion counts.
+            //
+            // ⚠ This is a qTD RETIREMENT, not an interrupt. The brief this was built to asked for an
+            // IRQ-side counter; on this machine that site does not exist, because this driver takes
+            // no interrupts at all (see the module header, line 19: "No interrupts: no USBINTR write,
+            // no IDT vector, no MSI"). The gap is not papered over — it is made readable by pairing
+            // this with `pmp=` (poll passes), so `hid=0` can be told apart from "nobody looked".
+            // See the HID-IN GAP section of `crate::deadman`.
+            crate::deadman::note_hid_completion();
             if tok & QTD_ERR_MASK != 0 {
                 // KBDWIT-2: the silence ended, but it ended in a HALT — see
                 // `kbdwit_note_silence_end` for why this exit gets its own verdict word instead of
@@ -15990,6 +16001,12 @@ fn bt_request_retrigger(source: u32) {
 /// Main-loop service hook (the EHCI analogue of `service_hubs`): poll every armed HID endpoint,
 /// decode + deliver completed reports, re-arm. Cheap when nothing completed.
 pub fn service_ehci_hid() {
+    // DEADMAN — `[deadman] pmp=`. Stamped at ENTRY, above the `EHCI_HID.lock()` and above the
+    // `is_none()` early return, because the question it answers is "did anything call the poll",
+    // not "did the poll find a controller". This is the term that stops `hid=0` from being misread
+    // as "the input hardware went dead" when what actually happened is that the `x86_usb_pump` task
+    // stopped running — the difference between a bad bug and a much worse one.
+    crate::deadman::note_hid_poll();
     let mut g = EHCI_HID.lock();
     let Some(ctrls) = g.as_mut() else { return };
     for c in ctrls.iter_mut() {

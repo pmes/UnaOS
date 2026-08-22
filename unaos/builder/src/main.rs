@@ -361,6 +361,10 @@ fn main() {
     // byte-inert. This list reaches the KERNEL build for MEDIA, so a metal boot can arm the ruler.
     // Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_RTWIT").is_ok() { feats.push("rtwit"); }
+    // DEADMAN: UNAOS_DEADMAN=1 arms the timer-ISR witness that survives a wedged render-service
+    // pass — one unconditional `[deadman]` line per second, so silence is distinguishable from
+    // idleness. Kept in sync with arroyo.
+    if std::env::var("UNAOS_DEADMAN").is_ok() { feats.push("deadman"); }
     // R1 / RTPI: UNAOS_RTPI=1 arms PRIORITY INHERITANCE on the x86 sleeping `Mutex` plus its `[rtpi]`
     // witness. Unlike RTWIT, this CHANGES scheduling — the holder of a contended `Mutex` inherits a
     // blocked higher-priority task's priority (transitively) until release. x86_64-only in effect;

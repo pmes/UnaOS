@@ -1306,6 +1306,13 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>, expect_owner: Option<
     // lock (dropped at the block above), per this file's standing rule.
     #[cfg(feature = "witness")]
     wcn_note_present(id, skip);
+    // DEADMAN — the ATTACH term of the phantom-composite question, charged in the same place and by
+    // the same rule as `wcn_note_present` above: the owner's ATTEMPT, outside the table lock, before
+    // the suppression branch. A no-op inline shim when the knob is off. `[deadman] dmg=N/S` reads a
+    // row as static iff this counter has not moved since the last completed pass, so charging it
+    // here — where the owner handed over a surface — is what makes `S` mean "damage with no attach
+    // behind it" rather than "damage with no composite behind it".
+    crate::deadman::note_attach(id);
     if skip {
         #[cfg(feature = "witness")]
         {
@@ -3835,6 +3842,12 @@ pub fn composite() {
             COMP_PENDING.store(true, Release);
             #[cfg(feature = "witness")]
             WCSER_DECLINED.fetch_add(1, Relaxed);
+            // DEADMAN — charge the decline to THIS core. `WCSER_DECLINED` above is one global total
+            // drained by a rollup that rides the render-service pass, so it says nothing during the
+            // wedge it would be most useful for. `[deadman] dec=` is the per-core roster, emitted
+            // from the timer ISR, and during a leaked hold it is the enumerated list of which cores
+            // kept arriving and kept being turned away. A no-op inline shim when the knob is off.
+            crate::deadman::note_decline();
             // DROPWAKE — a decline while a drop is armed is a pass the drop waited on and did not
             // get; the count is the trace's "the gate was busy" term.
             #[cfg(feature = "witness")]
@@ -4154,6 +4167,16 @@ fn composite_once() {
         C2_INSPAN_CYC.fetch_add(in_span, Relaxed);
         C2_STRADDLE_CYC.fetch_add(pass.saturating_sub(in_span), Relaxed);
     }
+    // DEADMAN — the pass COMPLETED. Stamps `[deadman] comp_ms=`'s clock and snapshots the per-row
+    // attach sequences that the next `dmg=N/S` reading is measured against.
+    //
+    // Placed HERE, at the tail, and NOT witness-gated (the COMPOSITE-2 ledger above is; this must
+    // speak on any boot that arms the knob). The position is the whole meaning of the field: a pass
+    // that STARTED and never returned must not advance this stamp, because "the compositor is stuck
+    // inside a pass" is precisely the state `comp_ms` growing without bound exists to make visible.
+    // Two relaxed stores plus twelve — no lock, no print, no allocation, so it cannot lengthen the
+    // pass it closes.
+    crate::deadman::note_composite_done();
     // CTRLWIT — the pass is over and every `table()` guard it took has dropped, so this is the first
     // legal place to SPEAK a decline `controls` armed while painting. After the COMPOSITE-2 ledger,
     // not before it: a serial line inside the clock would charge the pass for the instrument's own
@@ -20005,4 +20028,78 @@ pub fn dmgovlp_selftest() {
     }
     // Un-name the synthetic focus owner, drop the shell back, repaint the live set.
     focus_reset();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// DEADMAN — two NON-BLOCKING samplers for `crate::deadman`, the timer-ISR witness.
+//
+// These exist here, rather than in `deadman.rs`, only because `COMP_HOLDER_CORE`, `COMP_HOLD_T0_MS`
+// and `TABLE` are private to this module. They are READ-ONLY: neither one touches `COMP_GATE`, marks
+// or clears damage, or mutates a single field. Both are gated on the knob, so a knob-off build
+// carries neither symbol.
+//
+// THE SAFETY PROPERTY, stated once for both: they are called from the APIC timer ISR with IF=0, and
+// an instrument that can block on what it instruments is the bug, not the tool. So neither may wait
+// on anything. `deadman_gate_sample` waits on nothing at all (two relaxed loads);
+// `deadman_damage_sample` uses `TABLE.try_lock()` and returns `None` on contention — the same
+// pardon-on-busy discipline `occluders_above`/`OCC_EXCUSE_BUSY` established in this file, and the
+// same reason: "An instrument must never be able to wedge the thing it instruments."
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// DEADMAN — who holds `COMP_GATE`, and for how long, WITHOUT taking it.
+///
+/// Returns `(Some(core), held_ms)` when the gate is held, `(None, 0)` when it is free.
+///
+/// This is a read of two gauges this file already maintains and documents as "loaded, never
+/// drained" — `COMP_HOLDER_CORE` (`usize::MAX` == free) and `COMP_HOLD_T0_MS` — using the exact
+/// pattern `wcser_emit` and `wcser_overdue_probe` already use. **It cannot block: there is no lock
+/// to acquire, no CAS, and no retry.** Reading a torn pair (a holder that released between the two
+/// loads) costs at worst one line reporting a stale age for a gate that has just gone free, which
+/// `saturating_sub` keeps non-negative.
+///
+/// One honest limit: `COMP_HOLD_T0_MS` is re-stamped per rerun inside the pass loop, so `held_ms` is
+/// the age of the CURRENT pass, not of the held epoch. That is the right reading for the wedge
+/// question anyway — a leaked hold performs no reruns, so nothing re-stamps it and the age grows
+/// without bound, which is exactly the signal `[deadman] gate=` exists to show.
+#[cfg(all(target_arch = "x86_64", feature = "deadman"))]
+pub fn deadman_gate_sample() -> (Option<usize>, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let holder = COMP_HOLDER_CORE.load(Relaxed);
+    if holder == usize::MAX {
+        return (None, 0);
+    }
+    let t0 = COMP_HOLD_T0_MS.load(Relaxed);
+    (Some(holder), crate::arch::ms().saturating_sub(t0))
+}
+
+/// DEADMAN — `(rows currently marked damaged, of those, rows with NO attach since the last pass)`.
+///
+/// Returns `None` when `TABLE` was held at the instant of the sample. `None` is reported as `?/?`,
+/// never as `0/0`: "the table was busy" and "nothing is damaged" are different facts and an
+/// instrument that conflates them is worse than one that admits it looked away.
+///
+/// **It cannot block.** `TABLE.try_lock()` returns immediately either way — this deliberately does
+/// NOT use `table()`, which is a blocking, IRQ-masked `TABLE.lock()` spin and would deadlock outright
+/// if the timer ISR landed on a core that already held it. The critical section is a bounded
+/// `0..MAX_WINDOWS` (12) walk of two `bool`s and one relaxed load per row, with no print, no
+/// allocation and no nested lock — inside this file's standing rule for `TABLE` sections.
+///
+/// The "static" test is strict by construction: a row counts as static iff its attach sequence is
+/// UNCHANGED since the snapshot taken at the last completed composite pass. Any `present()` naming
+/// the row breaks it. No threshold, no decay, no smoothing — so the number this returns is evidence
+/// about the damage-tracking leak, not a knob tuned toward an expected answer.
+#[cfg(all(target_arch = "x86_64", feature = "deadman"))]
+pub fn deadman_damage_sample() -> Option<(u32, u32)> {
+    let t = TABLE.try_lock()?;
+    let mut rows = 0u32;
+    let mut stat = 0u32;
+    for (i, r) in t.rows.iter().enumerate() {
+        if r.used && r.damaged {
+            rows += 1;
+            if crate::deadman::row_static(i) {
+                stat += 1;
+            }
+        }
+    }
+    Some((rows, stat))
 }

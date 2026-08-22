@@ -570,6 +570,18 @@ _feats=""
 # inline shim and a zero-sized HoldTimer, so the boot is byte-inert on the hot path. Emits one `[rtwit]`
 # rollup line per ~5 s from the x86 render-service witness gate. Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_RTWIT:-}" ] && _feats="${_feats}rtwit,"
+# DEADMAN: UNAOS_DEADMAN=1 arms THE INSTRUMENT THAT SURVIVES THE WEDGE (`deadman`) — one `[deadman]`
+# line per second driven from the APIC TIMER ISR, emitted UNCONDITIONALLY (including when every counter
+# is zero) so that SILENCE IS DISTINGUISHABLE FROM IDLENESS. Every other x86 instrument (`spread`,
+# `rtwit`, `schedx86`, `dock`, `menubar`) is emitted BY the render-service pass, so metal boot 11 lost
+# all five in ONE event and left 91 s with no data at all; `shell.rs` already names the gap ("on x86
+# there is NO instrument that survives a starved shell"). This is that instrument. It never takes
+# `COMP_GATE`, never calls the blocking `pal::event_queue_depth()` or `wm::table()`, and reports `?`
+# rather than waiting when `TABLE` is busy. Pure measurement: changes no scheduling/locking/present
+# behaviour. x86_64-only in effect (the real impl is `target_arch = "x86_64"`-gated; aarch64 gets the
+# inline shim). DEFAULT OFF => every hook is an empty inline shim, so an unarmed kernel carries no
+# counter and no `[deadman]` string. Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_DEADMAN:-}" ] && _feats="${_feats}deadman,"
 # R1 / RTPI: UNAOS_RTPI=1 arms PRIORITY INHERITANCE on the x86 sleeping `Mutex` (arch::x86_64::sched)
 # plus its `[rtpi]` witness. Unlike RTWIT (a pure ruler), this CHANGES scheduling: while a strictly-
 # higher task blocks on a `Mutex`, the holder inherits the blocker's priority (transitively) until

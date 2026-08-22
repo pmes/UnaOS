@@ -6,6 +6,18 @@ license = "GPL-3.0-or-later"
 
 [features]
 default = []
+# DEADMAN: the instrument that SURVIVES THE WEDGE. Arms `[deadman]` — one line per second driven from
+# the APIC timer ISR, emitted UNCONDITIONALLY (including when every counter is zero) so that silence
+# is distinguishable from idleness. Every other x86 instrument (`spread`, `rtwit`, `schedx86`, `dock`,
+# `menubar`) is emitted BY the render-service pass; metal boot 11 lost all five in ONE event and left
+# 91 seconds with no data. This one rides the timer instead, never takes the compositor's `COMP_GATE`,
+# never calls the blocking `pal::event_queue_depth()` or `wm::table()`, and reports `?` rather than
+# waiting when `TABLE` is busy. Pure measurement: no scheduling/locking/present behaviour changes.
+# x86_64-only in effect (the real impl is `target_arch = "x86_64"`-gated; aarch64 gets the inline
+# shim). DEFAULT OFF => every hook degrades to an empty inline shim, so no counter, no `[deadman]`
+# string and no timer-ISR work exists in an unarmed kernel. Enable via `UNAOS_DEADMAN=1`. Kept in sync
+# with arroyo AND builder/src/main.rs.
+deadman = []
 # R0 / rtwit: the WORST-CASE RULER. Arms the `[rtwit]` tail instruments (input→present latency,
 # per-lock max hold, max interrupt-mask span) — MAXes only, never a mean. Pure measurement: no
 # scheduling/locking/present behaviour changes. DEFAULT OFF => every hook degrades to an empty inline
