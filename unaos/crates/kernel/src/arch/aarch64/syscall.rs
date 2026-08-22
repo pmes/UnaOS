@@ -14931,10 +14931,10 @@ fn wcb_launcher(_demo_cpu: usize) {
     crate::video::wm::ctrldecline_selftest();
     // DRAG-PI M4: the drag COST witness, after the control battery for the same reason it sits after
     // the hit-test one — it mints a row, drives it edge to edge twice and reaps it, so it must not run while another fixture's one-shots are still owed. It restores nothing because it takes nothing: `move_to` on its own row, and a grab it cancels itself.
-    #[cfg(all(feature = "witness", feature = "pidesk"))]
+    #[cfg(all(feature = "witness", feature = "pidesk", feature = "baremetal"))]
     crate::video::wm::dragperf_selftest();
     // DRAGWEDGE: the PA41 freeze fixture, immediately after the drag COST witness because it is the same shape of scene one hazard over — it mints a KERNEL-BAND row, presses its title strip through this file's own router, then holds a `BlitGuard` open to reproduce the metal's `blit_active=1` and proves the drag path is BOUNDED, that the grab it could not service is RELEASED, that a fresh grab is REFUSED while the stall stands, and that the refusal LIFTS when the compositor recovers. It runs AFTER `dragperf` deliberately: that fixture measures a healthy drag path and this one deliberately stalls the compositor for a bounded interval, so the order keeps the measurement out of the stall's shadow.
-    #[cfg(all(feature = "witness", feature = "pidesk"))]
+    #[cfg(all(feature = "witness", feature = "pidesk", feature = "baremetal"))]
     crate::video::wm::dragwedge_selftest();
     // PAPER: the kit texture's determinism fixture, LAST — it neither mints a window nor reads the
     // panel, so it perturbs nothing above it, and its only side effect is generating the one tile

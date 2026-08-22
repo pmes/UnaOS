@@ -256,6 +256,100 @@ has its fix already built: JETSON-EL0 M1b introduced the `uslots` facade
 `super::boot`; `quarry` needs the same substitution. Adding `tegra_el0` to the leg
 resolves the `dock.rs` pair on its own.
 
+#### §3.5.1 RESOLVED 2026-08-22 (rung 1) — what landed, and what did not
+
+Re-measured at `fdbc0dfc` before any edit: all three errors reproduced exactly as
+tabulated above (`dock.rs:204`/`:218`; `quarry/live.rs:1089`; the `dragperf`/
+`dragwedge` pair, at `arch/aarch64/syscall.rs:14935`/`:14938` on this tip rather
+than the `3dc889e7` line numbers the table quotes). Two of the three are fixed and
+the armed configuration now type-checks; the third is a `video/` edit and is held.
+
+| Error | Disposition |
+| --- | --- |
+| `video/dock.rs:204`, `:218` — `syscall` not found | **Fixed by the leg.** The new `arm-tegra-desk` leg carries `tegra_el0`, which is the only satisfiable way to give aarch64 `pidesk` the `arch::aarch64::syscall` module (`baremetal` implies `pi`, and `pi` + `tegra` is a `compile_error!`). No source change |
+| `arch/aarch64/syscall.rs` — `dragperf_selftest` / `dragwedge_selftest` not found | **Fixed at the CALL SITE, not the definition.** Both call sites gained `feature = "baremetal"`, matching the gate the definitions already carry. This is the conservative side: `video/wm.rs:17930-17941` states outright that the definitions' `target_arch`/`baremetal` gate exists because leg 1 drives *the shipped Pi router*, so the definitions' gate is deliberate and the call sites' was the oversight — invisible on Pi, where `baremetal` is always on. Line-neutral, and both edits are inert on Pi (see the identity measurement below) |
+| `video/quarry/live.rs:1089` — `boot` not found | **NOT fixed — out of lane.** The fix is one line and is written out in §3.5.2, but `video/` is a shared lane. `quarry` is therefore absent from the `arm-tegra-desk` leg and `UNAOS_QUARRY=1` on a tegra build is still E0433 |
+
+**The leg.** `arm-tegra-desk` = `arm-tegra-el0`'s feature list verbatim +
+`pidesk,livecon`. `KERNEL_CFG_MATRIX` goes 10 → 11 board legs and the gate 18 → 19
+legs (the mix-leg count is untouched: `pidesk` was already arm-only via `arm-pi`,
+and `livecon` is already in `x86_cfg_universe` via `x86-all`, so the universe does
+not move). `UNAOS_TEGRA=1 ./arroyo check` → green, 19/19.
+
+**The go-red proof**, because a leg that has never gone red is not evidence.
+Re-introducing the `dragperf` mismatch alone (dropping `feature = "baremetal"` from
+that one call site) and re-running the gate reds **exactly one leg**:
+
+```
+✅ arm-pi   ✅ arm-tegra   ✅ arm-tegra-el0   ✅ arm-tegra-orindesk   ✅ arm-tegra-jd1dc
+error[E0425]: cannot find function `dragperf_selftest` in module `crate::video::wm`
+❌ arm-tegra-desk — unaos-kernel FAILED to compile
+   configuration: --target ../../aarch64-unaos.json --features …,tegra_el0,pidesk,livecon
+❌ kernel cfg coverage FAILED (crate unaos-kernel), legs: arm-tegra-desk
+```
+
+`arm-pi` stays green (its `baremetal` satisfies the definition) and `arm-tegra-el0`
+stays green (its `pidesk` is off) — which is the point: no pre-existing leg can see
+this defect, and the new one names it and its configuration. Restored → green again.
+
+**Identity, measured and not argued** (throwaway worktree at `fdbc0dfc`, same path
+for both builds, `llvm-objcopy -O binary` then `cmp`):
+
+| Image | Loadable image | `.elf` |
+| --- | --- | --- |
+| jetson disarmed (`tegra,tegrasmp`) | **identical**, 1 524 304 B | **identical** — `syscall.rs` is not compiled at all on this build |
+| jetson armed-EL0 (`tegra,tegrasmp,tegra_el0`) | **identical**, 1 723 078 B | 16 B shorter, `.strtab` only |
+| Pi (`baremetal,skip_xhci,witness,pidesk,quarry,livecon`) | **identical**, 2 144 632 B | 20 B shorter, `.strtab` only |
+
+In both `.elf` cases `readelf -S`/`-l` show every other section and every program
+header unchanged in size and address — the documented benign `.llvm.<hash>`
+internal-symbol-suffix class, the same one the JB11 note in `arroyo` records. The
+Pi row matters because `arch/aarch64/syscall.rs` **is** compiled into `kernel8.img`:
+the change is line-neutral, so no panic `Location` moves, which is the discipline
+PI-DESK's own byte-identity note in `arroyo` establishes.
+
+#### §3.5.2 The held `video/` patch — `quarry`'s `uslots` substitution
+
+One line, and it is the *verbatim* shape of the JETSON-EL0 M1b migration already
+sitting at `shell.rs:4388` (same `const CAP`, same facade, same trailing comment):
+
+```diff
+--- a/unaos/crates/kernel/src/video/quarry/live.rs
++++ b/unaos/crates/kernel/src/video/quarry/live.rs
+@@ -1086,7 +1086,7 @@ fn launch(path: &str) -> String {
+-    const CAP: u64 = crate::arch::aarch64::boot::USER_REGION_SIZE as u64;
++    const CAP: u64 = crate::arch::aarch64::uslots::USER_REGION_SIZE as u64; // JETSON-EL0: uslots facade (boot.rs on pi / mmu_tegra_el0.rs on tegra)
+```
+
+Verified in a throwaway worktree, not merely reasoned: with it applied the
+`arm-tegra-desk` list **plus `quarry`** type-checks green, `arm-pi` (which carries
+`quarry` and `baremetal`) stays green, the x86 `quarry` leg stays green, and the Pi
+loadable image is byte-identical to the same build without it — `uslots` re-exports
+`boot::*` under `baremetal`, so `USER_REGION_SIZE` resolves to the same constant.
+
+When it lands, **append `,quarry` to the `arm-tegra-desk` leg** (the leg carries a
+comment saying so). A family leg missing a member is the same silent hole the leg
+exists to close.
+
+#### §3.5.3 Corrections to this section
+
+- **`x86-vsyncpace` does not carry the desktop family.** §3.5 lists it beside
+  `x86-all` as one of "the two x86 legs that do". Its feature list is
+  `nvidia-kepler,nvidia-kepler-takeover,wc,witness,vsyncpace,ehcihid,smolnet` — no
+  `quarry`, no `livecon`, no `pidesk`. It reaches the furniture only through `wc`,
+  which is the x86 arm of the `any(all(x86_64, wc), all(aarch64, pidesk))` gate.
+  The section's conclusion is unaffected (both are x86 legs and neither can cover
+  `tegra`), but the reason is `wc`, not the family knobs.
+- **`quarry` and `livecon` are *in* `x86_cfg_universe`, `pidesk` is not.** §3.5 says
+  the universe drops "`tegra` and `pidesk` both", which is right as far as it goes;
+  the other two are named by `x86-all` and so ride the eight mix legs. That is real
+  coverage of their x86 arm and no coverage at all of their aarch64 arm, which is
+  why the new leg is the first thing to compile either of them on `tegra`.
+- **Board-leg count and line numbers have drifted.** §3.5's "nine board legs" and
+  its `:1828`/`:1833`/`:1896`/`:1908`/`:1919`/`:1940` citations were true at
+  `3dc889e7`; `arm-tegra-orindesk` (rung 0), `arm-tegra-jd1dc` and now
+  `arm-tegra-desk` have been appended since. Count the array, do not trust the line.
+
 ### §3.6 No aarch64 render service on tegra
 
 `main.rs:4686`, `#[cfg(all(target_arch = "aarch64", feature = "baremetal"))] fn
@@ -375,7 +469,7 @@ names the seat that owns the files under the parallel-arc rules in `CLAUDE.md`.
 | # | Rung | What lands | Metal witness | Lane |
 | --- | --- | --- | --- | --- |
 | **0** | **One composited window** | call `wm::reserve_stage` on the tegra path after heap init (§3.3); mint one `wm` row; present it. No furniture, no `pidesk`, no cascade | one window visible on the Orin panel over the JD2 console; `wm` present counters non-zero on the wire | jetson |
-| **1** | **The cfg leg** | fix the three gate mismatches in §3.5; add an `arm-tegra-desk` leg to `KERNEL_CFG_MATRIX`; add `pidesk`/`quarry`/`livecon` to arroyo's env map or to an `esp-jetson` curated list | `./arroyo check` green with the new leg — i.e. the combination is type-checked by something for the first time | jetson (arroyo + `video/` gates; `arch/aarch64/syscall.rs` needs the pi/rmbp seat's agreement) |
+| **1** | **The cfg leg** — ✅ **LANDED 2026-08-22, less `quarry`** (§3.5.1) | `arm-tegra-desk` leg added (gate 18 → 19 legs); `pidesk`/`quarry`/`livecon` mapped in arroyo's env map; two of the three gate mismatches fixed | `UNAOS_TEGRA=1 ./arroyo check` green 19/19, and green again under `UNAOS_TEGRA_EL0=1 UNAOS_PIDESK=1 UNAOS_LIVECON=1`; the new leg proven to go red on a re-introduced mismatch | jetson (arroyo + `arch/aarch64/syscall.rs`); the `quarry` line is a `video/` edit and is **held** in §3.5.2 |
 | **2** | **The desktop seam** | a tegra-shaped arming wrapper inside `tegra_early_stop` (§3.1, §3.2), replacing the unsatisfiable `pidesk`+`baremetal` gate at `main.rs:6238` | `pidesk::activate()` runs on an Orin boot and its floors print their verdicts | jetson |
 | **3** | **Input routing** | `jd2_console_pump`'s `Event::Button` arm calls `wc_click_route` instead of `serial_println!` (§3.4) | a click on the Orin panel raises and focuses a window; `[clickroute]` on the wire | jetson |
 | **4** | **Console as a window** | route the JD2 console into a `wm` row; `fbcon::console_is_routed`; skip the handoff detach when routing succeeded | the boot log keeps updating *inside a window*, and the minimise control has somewhere to go back to | jetson |
@@ -409,15 +503,19 @@ before rung 2 if the seam is to be type-checked by anything). Rung 5 is gated on
 
 ## §7 What this document does not claim
 
-- **No rung is claimed done.** Rung 0 is not started. Every PROVEN cell in §1 that
-  is ✅ refers to the JD1/JD2/JD20 panel path, not to the compositor.
+- **Only rung 1 is claimed done, and only as a type-check.** Every PROVEN cell in
+  §1 that is ✅ refers to the JD1/JD2/JD20 panel path, not to the compositor. Rung
+  1's claim is exactly "the armed tegra desktop configuration compiles and a gate
+  leg compiles it" — nothing on this branch arms `pidesk::activate()` at runtime,
+  and §5.2's stop-line is untouched.
 - **The COMPILES column is a type-check, not a link or a boot.** `./arroyo check`
   green proves nothing about what the builder's env→feature map actually puts in
   the image — the full-knob rule in `docs/dev/LAWS.md` requires a `strings` check
   on the artifact, and no rung here has earned one.
 - **Rung sizing is an estimate.** "Commit-sized" is a judgement about scope, not a
-  measurement. Rung 1's error list is exhaustive as measured; whether fixing those
-  three reveals a fourth is unknown until it is run.
+  measurement. Rung 1's error list was exhaustive as measured, and is now settled:
+  fixing them revealed **no fourth error** — `arm-tegra-desk` is green, and green
+  with `quarry` added once §3.5.2's held line is applied.
 - **The `[u7stk]` numbers quoted in §5 are Pi numbers.** The Orin's stack
   high-water on its own cascade has never been measured. `[u7stk]` is present and
   `witness`-gated here, so it can be — but until it is, §5's bound is inherited,

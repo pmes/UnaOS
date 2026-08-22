@@ -1612,6 +1612,68 @@ fatperf = []
 # `UNAOS_LIVECON=1 UNAOS_PIDESK=1` so the seam that routes the console into a window exists at all.
 livecon = []
 
+# ORIN-WM1 (`UNAOS_ORINDESK=1`): the Jetson Orin's FIRST real compositor window — one `wm` row minted
+# over a heap-backed ARGB surface and composited onto the JD1 inherited scanout, from
+# `arch/aarch64/display_tegra.rs::orin_wm1`, wired into `tegra_early_stop` on the step-3c heap line.
+#
+# It is ONE WINDOW and deliberately not a desktop: no `pidesk::activate`, no furniture, no
+# dock/strip/menubar/crystal. The compositor itself is already in every jetson image (`video/mod.rs`
+# declares `pub mod wm;` unconditionally and the tegra path already calls `wm::retile_on_ready()`), so
+# this feature adds no module — what it adds is the `wm::reserve_stage` call the Orin never had, because
+# the Orin seeds `video::WRITER` by hand and never reaches `video::init_panel`, the tree's only caller.
+#
+# STANDALONE, mirroring `smpmark` — it does NOT imply `tegra`. Every one of its sites lives inside a
+# `tegra`-gated module (`display_tegra`) or a `tegra`-gated block (`tegra_early_stop`), so
+# `UNAOS_ORINDESK=1` on its own compiles nothing at all; arm it as
+# `UNAOS_TEGRA=1 UNAOS_ORINDESK=1 ./arroyo check`, or `UNAOS_ORINDESK=1 ./arroyo esp-jetson` (which
+# forces `tegra`). The ARMED polarity is type-checked by the `arm-tegra-orindesk` leg of
+# KERNEL_CFG_MATRIX in `arroyo`, never by the knob mapping.
+#
+# Default OFF => the statics, the function and the appended call site all vanish, NO LINE MOVES in any
+# file compiled knob-off (both edits are appends — see the ORIN-WM1 tail blocks in main.rs and
+# display_tegra.rs), and the jetson image is byte-identical to baseline. MEASURED, not argued: build
+# `esp-jetson` either side and compare sha256 of `kernel.elf` and of its `llvm-objcopy -O binary`
+# flattening. See arch_arm64.md §ORIN-WM1.
+orindesk = []
+
+# JD1-DC (`UNAOS_JD1DC=1`): the Jetson Orin's BPMP-GUARDED, READ-ONLY nvdisplay register probe —
+# `arch/aarch64/display_tegra.rs::jd1_dc_probe`, wired into `tegra_early_stop` as the last statement
+# of the BPMP block. It answers the one question the whole Orin display stack rests on and has never
+# measured: can the CCPLEX see the nvdisplay registers, and do they still hold what the firmware
+# programmed? Everything above it today is inference from a DRAM carveout — JD1 inherits a scanout
+# address out of the DTB and paints into it, which proves only that something is still scanning that
+# memory out.
+#
+# READ-ONLY, ABSOLUTELY. Every access is `core::ptr::read_volatile`; there is no `write_volatile` in
+# the rung and there must not be (the DCE R5 is live on the other side of that aperture, and a write
+# is a two-writer race against 11.8 MiB of authenticated firmware). The census line carries
+# `writes=0` so the capture certifies it.
+#
+# THE GUARD is the safety story: a read of a power-gated Tegra block is EL3-FATAL (JX1: SError
+# ESR 0xbe000011, EC=0x2F, BL31 "Unhandled Exception in EL3"), so the probe asks BPMP —
+# MRQ_PG CMD_PG_GET_STATE, the id read off the DTB's own `display@` node — and reads nothing at all
+# unless every listed domain answers ON. It never issues SET_STATE: powering (or cycling) the display
+# domain would tear down the inherited scanout and is unrecoverable for that boot.
+#
+# The feature also arms the GENERALISED DTB id reader (`fdt_tegra::node_ids`, the file-tail block):
+# `xusb_ids`'s walk with the node name lifted into a parameter, which is what lets the guard read
+# `display@13800000`'s `power-domains` with the same code rather than a second copy of it.
+#
+# STANDALONE, mirroring `smpmark`/`orindesk` — it does NOT imply `tegra`. Every site lives inside a
+# `tegra`-gated module (`display_tegra`, `fdt_tegra`, `bpmp_tegra`) or a `tegra`-gated block
+# (`tegra_early_stop`), so `UNAOS_JD1DC=1` alone compiles nothing; arm it as
+# `UNAOS_TEGRA=1 UNAOS_JD1DC=1 ./arroyo check`, or `UNAOS_JD1DC=1 ./arroyo esp-jetson` (which forces
+# `tegra`). The ARMED polarity is type-checked by the `arm-tegra-jd1dc` leg of KERNEL_CFG_MATRIX in
+# `arroyo`, never by the knob mapping.
+#
+# Default OFF => the probe, the generalised reader, the scanout latch and all three call sites vanish,
+# and NO LINE MOVES in any file compiled knob-off: every edit to already-compiled code is a statement
+# APPENDED to an existing line (the panic-`Location` line-shift class is how byte-identity is usually
+# lost silently). MEASURED, not argued — build the aarch64 kernel either side and compare sha256 of
+# `unaos-kernel` and of its `llvm-objcopy -O binary` flattening. Witness on the wire:
+# `JD1-DC VERDICT=`. See arch_arm64.md §JD1-DC.
+jd1dc = []
+
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }

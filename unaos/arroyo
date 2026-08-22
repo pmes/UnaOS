@@ -630,6 +630,41 @@ _feats=""
 # vanishes and the tegra image is byte-identical to baseline. The ARMED build is type-checked by the
 # `arm-tegra-smpmark` leg of KERNEL_CFG_MATRIX, not by this mapping.
 [ -n "${UNAOS_SMPMARK:-}" ] && _feats="${_feats}smpmark,"
+# ORIN-WM1 (ORINDESK): UNAOS_ORINDESK=1 arms the Jetson Orin's FIRST real compositor window —
+# `arch/aarch64/display_tegra.rs::orin_wm1`, called from `tegra_early_stop`'s step-3c heap line. It
+# calls `wm::reserve_stage` (the Orin's missing half: this board seeds `video::WRITER` by hand and never
+# reaches `video::init_panel`, the tree's only caller), mints ONE `wm` row over a heap-backed ARGB
+# surface and composites it onto the JD1 inherited scanout. ONE WINDOW ONLY — no `pidesk::activate`, no
+# furniture, no dock/strip/menubar/crystal; the Pi's desktop-arming cascade has twice overflowed a
+# 16 KiB kernel stack and that failure does not reproduce on the QEMU gate. Standalone feature (does NOT
+# imply tegra, mirroring smpmark), but every site is tegra-gated, so arm it WITH tegra:
+# `UNAOS_TEGRA=1 UNAOS_ORINDESK=1 ./arroyo check`, or `UNAOS_ORINDESK=1 ./arroyo esp-jetson` (esp-jetson
+# forces tegra). Default OFF; when unset the window vanishes, no line moves in any file compiled
+# knob-off (both edits are appends), and the tegra image is byte-identical to baseline. The ARMED build
+# is type-checked by the `arm-tegra-orindesk` leg of KERNEL_CFG_MATRIX, not by this mapping. Witness on
+# the wire: `[orinwm1] win=... -> COMPOSITED`.
+[ -n "${UNAOS_ORINDESK:-}" ] && _feats="${_feats}orindesk,"
+# JD1-DC (JD1DC): UNAOS_JD1DC=1 arms the Jetson Orin's BPMP-GUARDED, READ-ONLY nvdisplay register
+# probe — `arch/aarch64/display_tegra.rs::jd1_dc_probe`, called as the LAST statement of
+# `tegra_early_stop`'s BPMP block. It settles, in one attended boot, whether the CCPLEX can see the
+# nvdisplay registers at all and whether they still hold what the firmware programmed — the question
+# every rung of the Orin display stack currently ASSUMES an answer to (JD1 inherits a scanout address
+# out of the DTB; the lit panel proves only that something still scans that memory out).
+# READ-ONLY: every access is `read_volatile`, there is no `write_volatile` in the rung, and the census
+# line carries `writes=0`. GUARDED: a read of a power-gated Tegra block is EL3-FATAL (JX1 — SError
+# ESR 0xbe000011, EC=0x2F, BL31 "Unhandled Exception in EL3"), so it asks BPMP MRQ_PG GET_STATE for
+# the `display@` node's own power-domain ids first and reads NOTHING unless every one answers ON. It
+# never issues SET_STATE (powering or cycling DISP would tear down the inherited scanout —
+# unrecoverable for that boot). The knob also arms `fdt_tegra::node_ids`, `xusb_ids`'s walk with the
+# node name lifted into a parameter, which is how the guard reads display@13800000's power-domains
+# with the same code instead of a second copy of it. Standalone feature (does NOT imply tegra,
+# mirroring smpmark/orindesk), but every site is tegra-gated, so arm it WITH tegra:
+# `UNAOS_TEGRA=1 UNAOS_JD1DC=1 ./arroyo check`, or `UNAOS_JD1DC=1 ./arroyo esp-jetson` (esp-jetson
+# forces tegra). Default OFF; when unset the probe vanishes, no line moves in any file compiled
+# knob-off (all three edits to compiled code are statements appended to existing lines), and the
+# jetson image is byte-identical to baseline. The ARMED build is type-checked by the `arm-tegra-jd1dc`
+# leg of KERNEL_CFG_MATRIX, not by this mapping. Witness on the wire: `JD1-DC VERDICT=`.
+[ -n "${UNAOS_JD1DC:-}" ] && _feats="${_feats}jd1dc,"
 # JETSON-EL0 (M1b): UNAOS_TEGRA_EL0=1 arms the Orin EL0/userspace chain — `arch/aarch64/mmu_tegra_el0.rs`
 # (the M6d per-task address-space slots ported to the tegra EL1 regime), the widened `syscall`/`bus`/
 # `sched::spawn_user*` gates, and the el0-hello round-trip spawned from `tegra_early_stop`. The
@@ -648,6 +683,45 @@ _feats=""
 # Mirrors the PORTSW-1/SMOLNET default-ON/negative-knob policy. See arch_arm64.md §ORIN-SMP.
 [ -n "${UNAOS_TEGRASMP:-}" ] && _feats="${_feats}tegrasmp,tegra,"
 [ -n "${UNAOS_TEGRA:-}" ] && [ -z "${UNAOS_NOTEGRASMP:-}" ] && _feats="${_feats}tegrasmp,tegra,"
+# ── ORINDESK rung 1: the DESKTOP FAMILY reaches this map at all ────────────────────────────────────
+#
+# `pidesk`, `quarry` and `livecon` are the three desktop-family knobs. Until this block they existed
+# ONLY inside `kernel8()`'s curated `K8_FEATS` (see the three blocks in that function), which `check`
+# never calls — so `UNAOS_PIDESK=1 ./arroyo check` armed NOTHING, and the combination `tegra` + the
+# desktop family was reachable from no command in this script. That is why it had never been compiled:
+# an unreachable configuration is an untested one, and it did not in fact compile (three gate
+# mismatches, measured 2026-08-22; see docs/dev/OS/08_VIDEO/orin-desktop.md §3.5).
+#
+# These three are NOT tegra features and do NOT imply `tegra` — they are the shared compositor
+# furniture, already carried by `arm-pi` (all three) and `x86-all` (`quarry`, `livecon`). Mapping them
+# here changes nothing for the Pi, whose images are still built from `K8_FEATS`; what it buys is that
+# the aarch64/x86 DEFAULT legs of `check` can now be pointed at the armed desktop.
+#
+# ⚠ PRECONDITION ON aarch64, and it is a hard one, not a style note. `video/dock.rs`'s `focus_set` /
+# `focus_get` reach `crate::arch::aarch64::syscall::user_input_{set_active,active}`, and
+# `arch/aarch64/mod.rs` gates `pub mod syscall;` on `any(feature = "baremetal", feature = "tegra_el0")`.
+# So `pidesk` on aarch64 needs ONE of those two, or the build is E0433 "cannot find `syscall` in
+# `aarch64`". `baremetal` implies `pi`, and `pi` + `tegra` is a hard `compile_error!`
+# (arch/aarch64/serial.rs) — so on the ORIN the answer is `tegra_el0`, and the invocation that works is
+#     UNAOS_TEGRA_EL0=1 UNAOS_PIDESK=1 UNAOS_LIVECON=1 ./arroyo check
+# (`tegra_el0` implies `tegra`). `UNAOS_TEGRA=1 UNAOS_PIDESK=1 ./arroyo check` REDS the default aarch64
+# leg, by design and not by accident: it is a configuration that genuinely does not exist.
+[ -n "${UNAOS_PIDESK:-}" ] && _feats="${_feats}pidesk,"
+# LIVECON: the console window's text stays LIVE (the deferral + the two fbcon hooks). Pair it with
+# UNAOS_PIDESK — `livecon` compiles the deferral, `pidesk` is what routes the console into a window in
+# the first place. Board-neutral; type-checked on tegra by the `arm-tegra-desk` leg below.
+[ -n "${UNAOS_LIVECON:-}" ] && _feats="${_feats}livecon,"
+# QUARRY: UnaOS's file manager (`video/quarry.rs` + `video/quarry/live.rs`). Pair it with UNAOS_PIDESK
+# — `quarry` compiles the module, `pidesk` is what opens the window and routes keys and clicks to it.
+#
+# ⚠ NOT YET TYPE-CHECKED ON tegra, and deliberately absent from the `arm-tegra-desk` leg below:
+# `video/quarry/live.rs` names `crate::arch::aarch64::boot::USER_REGION_SIZE`, and `boot` is the Pi's
+# BCM2711 slot module (`#[cfg(feature = "baremetal")]`). The fix is the JETSON-EL0 M1b `uslots` facade
+# substitution `super::boot::` -> `super::uslots::` — a one-line change in `video/`, which is a SHARED
+# lane; it is written up in orin-desktop.md §3.5 and is not applied here. Until it lands,
+# `UNAOS_QUARRY=1` on a tegra build is E0433 and the mapping exists so the knob is at least reachable
+# and its failure visible rather than silent.
+[ -n "${UNAOS_QUARRY:-}" ] && _feats="${_feats}quarry,"
 # JB11-ESCAPE: UNAOS_NOJB11=1 suppresses the Falcon firmware-header census
 # (arch/aarch64/xusb_tegra.rs::jb11_fw_header_census) so a bench sitting can take an UN-INSTRUMENTED
 # CONTROL boot. Default UNSET => the census runs on every tegra boot, unchanged — the census is the
@@ -1938,6 +2012,118 @@ KERNEL_CFG_MATRIX=(
   # sites are under `src/arch/aarch64/`). The mix-leg count is unchanged — C(8,4) = 70 is still >= the
   # universe size — so this is +1 board leg and +0 mix legs: 15 -> 16.
   "arm-tegra-smpmark ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,smpmark"
+  # ORINDESK armed (appended 2026-08-22, ORIN-WM1) — `orindesk` gates the Orin's first real compositor
+  # window: `arch/aarch64/display_tegra.rs::orin_wm1` (the function, its two statics) plus the one
+  # appended statement in `main.rs`'s `tegra_early_stop`. BOTH of those sites also sit behind `tegra`
+  # (`display_tegra` is a `#[cfg(feature = "tegra")] pub mod`, and `tegra_early_stop` is
+  # `#[cfg(all(feature = "tegra", target_arch = "aarch64"))]`), so ONLY a leg carrying `tegra` compiles
+  # them at all — and there was no leg anywhere carrying `tegra` plus the desktop family before this
+  # one. Without it the ARMED polarity would be compiled by NOTHING: the exact tegra_el0 / simmer_test /
+  # xusbfw / smpmark shape, and the reason the standing law is that a cfg widen's gates must compile the
+  # configuration the widen turns ON.
+  #
+  # WHY ITS OWN TAIL LEG rather than `,orindesk` appended to `arm-tegra`. Same reason as the four legs
+  # above: `arm-tegra` is the DISARMED twin and is the only leg anywhere that compiles the SHIPPED
+  # default jetson image. Arming the knob there would trade this hole for that one, and a red on a tail
+  # leg names the knob. Hosted on `arm-tegra`'s list verbatim + `orindesk`.
+  #
+  # There is no `not(feature = "orindesk")` site in src/, so no disarmed asymmetry is created — every
+  # other leg (including `arm-tegra` itself) already carries the OFF polarity.
+  #
+  # WHAT THIS LEG ACTUALLY EXERCISES that no other does: `wm.rs`'s ungated `pub fn` surface
+  # (`reserve_stage`, `spawn_geometry`, `create_at`, `present_outcome`, `composite`, and the
+  # `Presented` variants) called from `arch/aarch64/` on a `tegra`-but-NOT-`baremetal`, NOT-`pidesk`
+  # configuration. `arm-pi` compiles those callers with `baremetal` on; `x86-all` compiles them with
+  # `wc` on. This is the only leg with the desktop family armed and both of those off.
+  #
+  # Same universe side effect as tegra_el0's / simmer_test's / smpmark's: naming `orindesk` on an arm-*
+  # leg removes it from `x86_cfg_universe`, where it would have been vacuous (its only sites are under
+  # `src/arch/aarch64/` and inside a `target_arch = "aarch64"`-qualified `main.rs` fn). The universe
+  # size is therefore unchanged by this arc (+1 feature in the table, -1 claimed by this leg), so the
+  # mix-leg count is unchanged too — C(8,4) = 70 is still >= it. +1 board leg and +0 mix legs: 16 -> 17.
+  "arm-tegra-orindesk ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,orindesk"
+  # JD1DC armed (appended 2026-08-22, JD1-DC) — `jd1dc` gates the Orin's BPMP-guarded, read-only
+  # nvdisplay register probe: `display_tegra.rs::jd1_dc_probe` + the `JD1DC_SCANOUT` latch,
+  # `fdt_tegra.rs::node_ids`/`node_ids_stop` (the generalised DTB id reader) + the delegation appended
+  # to `xusb_ids`'s opening line, `bpmp_tegra.rs::pg_get_state`, and the one appended statement in
+  # `main.rs`'s `tegra_early_stop`. EVERY one of those sites also sits behind `tegra` (all three
+  # modules are `#[cfg(feature = "tegra")] pub mod`s and `tegra_early_stop` is
+  # `#[cfg(all(feature = "tegra", target_arch = "aarch64"))]`), so ONLY a leg carrying `tegra`
+  # compiles them at all — and no leg anywhere carries `tegra` plus this knob but this one. Without it
+  # the ARMED polarity would be compiled by NOTHING: the exact tegra_el0 / simmer_test / xusbfw /
+  # smpmark / orindesk shape, and the reason the standing law is that a cfg widen's gates must compile
+  # the configuration the widen turns ON.
+  #
+  # WHY ITS OWN TAIL LEG rather than `,jd1dc` appended to `arm-tegra`. Same reason as the five legs
+  # above: `arm-tegra` is the DISARMED twin and the only leg anywhere that compiles the SHIPPED
+  # default jetson image — the image whose byte-identity to baseline this arc measures. Arming the
+  # knob there would trade this hole for that one, and a red on a tail leg names the knob. Hosted on
+  # `arm-tegra`'s list verbatim + `jd1dc`.
+  #
+  # There is no `not(feature = "jd1dc")` site in src/, so no disarmed asymmetry is created — every
+  # other leg (including `arm-tegra` itself) already carries the OFF polarity.
+  #
+  # WHAT THIS LEG ACTUALLY EXERCISES that no other does: the ARMED shape of the three appended-to-an-
+  # existing-line statements (a `#[cfg]`-erased `if let` inside `xusb_ids`, a `#[cfg]`-erased store
+  # after an `if` block in `jd1_survey`, and a `#[cfg]`-erased call in `tegra_early_stop`) — the
+  # byte-identity idiom this arc leans on, type-checked in the polarity where it is NOT erased.
+  #
+  # Same universe side effect as tegra_el0's / simmer_test's / smpmark's / orindesk's: naming `jd1dc`
+  # on an arm-* leg removes it from `x86_cfg_universe`, where it would have been vacuous (every site
+  # is under `src/arch/aarch64/` or inside a `target_arch = "aarch64"`-qualified `main.rs` fn). The
+  # universe size is therefore unchanged by this arc (+1 feature in the table, -1 claimed by this
+  # leg), so the mix-leg count is unchanged too — C(8,4) = 70 is still >= it. This arc's delta is
+  # exactly +1 board leg and +0 mix legs. (The absolute total is deliberately not quoted here: three
+  # tracks append tail legs concurrently, and a hardcoded "N -> N+1" in a comment is stale the moment
+  # a peer lands one. `./arroyo check` prints the live board/mix counts every run — read it there.)
+  "arm-tegra-jd1dc ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,jd1dc"
+  # ORINDESK rung 1 — the DESKTOP FAMILY on tegra (appended 2026-08-22). Until this leg, NOTHING in
+  # this tree compiled `tegra` together with `pidesk`/`livecon`: `arm-pi` carries the desktop family
+  # but also `pi,baremetal` (mutually exclusive with `tegra` by `compile_error!`), the five tegra legs
+  # above carry none of it, and the derived `x86-mix-N` legs are all emitted against
+  # `x86_64-unaos.json` with `pidesk` already removed from `x86_cfg_universe` (it is named by `arm-pi`
+  # and not by `x86-all`). So this configuration was type-checked by no leg — and it did not compile.
+  # Three gate mismatches, all measured 2026-08-22 and all invisible on the Pi because `baremetal` is
+  # always on there; see docs/dev/OS/08_VIDEO/orin-desktop.md §3.5 for the enumeration.
+  #
+  # WHY THIS LEG CARRIES `tegra_el0`, and why that is a finding and not a convenience. `video/dock.rs`'s
+  # `focus_set`/`focus_get` name `crate::arch::aarch64::syscall::user_input_{set_active,active}`, and
+  # `arch/aarch64/mod.rs` gates `pub mod syscall;` on `any(baremetal, tegra_el0)`. `pidesk` on aarch64
+  # therefore REQUIRES one of those two; `baremetal` implies `pi` and `pi` + `tegra` is a hard
+  # `compile_error!` (arch/aarch64/serial.rs), so on the Orin the only satisfiable term is `tegra_el0`.
+  # The leg is `arm-tegra-el0`'s list verbatim + `pidesk,livecon` for exactly that reason — it is the
+  # SHAPE OF THE CONFIGURATION, not a wider net cast to make a red go away.
+  #
+  # WHY `quarry` IS NOT ON THIS LEG. It is the one member of the family that still does not compile
+  # here: `video/quarry/live.rs` reads `crate::arch::aarch64::boot::USER_REGION_SIZE`, and `boot` is the
+  # Pi's BCM2711 slot module (`#[cfg(feature = "baremetal")]`). The fix is the JETSON-EL0 M1b `uslots`
+  # facade substitution — the same one that let `syscall.rs` reach the Orin — but it lands in `video/`,
+  # a SHARED lane, so it is written up in orin-desktop.md §3.5 rather than applied from the jetson seat.
+  # ⚠ APPEND `,quarry` TO THIS LINE the moment that one-liner lands; a family leg missing a member is
+  # the same silent hole this leg exists to close.
+  #
+  # WHY ITS OWN TAIL LEG rather than `,pidesk,livecon` appended to `arm-tegra` or `arm-tegra-el0`: the
+  # standing reason from the five legs above. `arm-tegra` is the DISARMED twin and the only leg that
+  # compiles the SHIPPED default jetson image; `arm-tegra-el0` is the shipped ARMED-EL0 twin and the
+  # only leg that compiles `tegra_el0` with the desktop family OFF — which is a live polarity, since
+  # the two `#[cfg(all(witness, pidesk, baremetal))]` fixture call sites in `arch/aarch64/syscall.rs`
+  # are compiled-out on both. Arming the family on either would trade this hole for that one, and a red
+  # on a tail leg names the knob.
+  #
+  # WHAT THIS LEG ACTUALLY EXERCISES that no other does: `video/{strip,dock,menubar,crystal}.rs` and
+  # `video/pidesk.rs` compiled for aarch64 against the `tegra_el0` syscall surface instead of the Pi's
+  # `baremetal` one — i.e. every `#[cfg(feature = "pidesk")]` site in `wm.rs` and `syscall.rs` reached
+  # with `baremetal` OFF, which is the polarity `arm-pi` can never compile and `x86-all` reaches only
+  # through `wc`.
+  #
+  # UNIVERSE SIDE EFFECT: none, unlike the four legs above. `pidesk` is already arm-only (named by
+  # `arm-pi`, not by `x86-all`) and `livecon` is already IN the universe (named by `x86-all`), so
+  # `x86_cfg_universe` is unchanged by this leg and the mix-leg count is unchanged: +1 board leg and
+  # +0 mix legs, 18 -> 19.
+  #
+  # PRECONDITION: like `arm-tegra-el0`, this leg compiles `arch/aarch64/syscall.rs`, which
+  # `include_bytes!`s `target/user_blob.bin`. `ensure_user_blob` (see check_both) supplies it.
+  "arm-tegra-desk ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,pidesk,livecon"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────

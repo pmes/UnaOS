@@ -2124,7 +2124,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
                         // the pads down, so they arrive live and the RMW was dead code.)
                     }
                     None => serial_println!(":: tegra: JB1c — no usb@3610000 ids in DTB; SKIP ::"),
-                }
+                } #[cfg(feature = "jd1dc")] unaos_kernel::arch::display_tegra::jd1_dc_probe(&chan, boot_info.dtb_addr, boot_info.dtb_size, mmu.ram_gib_mask); // JD1-DC (UNAOS_JD1DC=1, default OFF) — the BPMP-guarded, READ-ONLY nvdisplay register probe; see the JD1-DC tail block in display_tegra.rs. THIS instruction is the only point in the boot where both of its ordering constraints hold: BPMP-FIRST (the `chan` this borrows was established by `jb1b_ping` ~60 lines up, and without it the MRQ_PG GET_STATE guard that earns the first read cannot be asked — which is why the probe could NOT stay at its old site inside `jd1_survey`), and JD1-FIRST (the scanout resolution, `map_fb_region`, `fbcon::init` and the `WRITER` seed are ~90 lines up, so panel + serial + shell are already live on a framebuffer resolved by a pure DTB RAM walk and a probe that goes wrong costs the experiment, not the boot). Last in the BPMP block so every other diagnostic has already reached the wire before the one read that could end it. Appended to this line, never a new one: knob-off it is cfg-erased and no panic `Location` below moves.
             }
         }
         None => serial_println!(":: tegra: JB1b — geometry unresolved from DTB; SKIP ::"),
@@ -2182,7 +2182,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // (dtb fields are Copy; grabbed before `memory::init` consumes the &'static mut borrow.)
     let (dtb_addr, dtb_size) = (boot_info.dtb_addr, boot_info.dtb_size);
     unaos_kernel::arch::memory::init(boot_info);
-    serial_println!(":: KERNEL HEAP ALLOCATED ::");
+    serial_println!(":: KERNEL HEAP ALLOCATED ::"); #[cfg(feature = "orindesk")] unaos_kernel::arch::display_tegra::orin_wm1(); // ORIN-WM1 — one wm window on the JD1 scanout (tail block)
     // XCARVE-2 temporal bracket: heap carved + span-B top published (`select_heap_region`). span-B now
     // covers the 0x26b900000 target, so this is the first bracket whose bisect can fire on the target.
     unaos_kernel::vugras::phase("post-heap-init");
@@ -6257,3 +6257,43 @@ fn pidesk_activate_maybe() -> bool {
 fn pidesk_activate_maybe() -> bool {
     false
 }
+
+// =================================================================================================
+// ORIN-WM1 (tail block) — why the call site above is ONE APPENDED STATEMENT and where it sits.
+// =================================================================================================
+//
+// THE STATEMENT. `tegra_early_stop`'s step 3c line, `serial_println!(":: KERNEL HEAP ALLOCATED ::");`,
+// carries `#[cfg(feature = "orindesk")] unaos_kernel::arch::display_tegra::orin_wm1();` APPENDED to it
+// rather than a new line of its own. That is the `smpmark` / DARKWIN-GUARD idiom in this tree, and the
+// reason is measured, not stylistic: inserting a line into `main.rs` shifts the line-number constants
+// baked into every panic `Location` below it, which moves the loadable image even when not one
+// instruction of logic changed. Appending keeps the file's line count identical, which is what lets the
+// DISARMED jetson image be byte-identical to baseline rather than merely argued to be.
+//
+// WHY HERE AND NOT `kernel_main`. `tegra_early_stop` is declared `-> !` and DIVERGES: `kernel_main`'s
+// own `memory::init`, its `video::init_panel` (the tree's only `wm::reserve_stage` caller) and every
+// later step are unreachable on this board. A desktop seam hung off `kernel_main` would be dead code on
+// the Orin. The two live seams are this function and `jd2_console_pump`.
+//
+// WHY THIS LINE AND NOT `jd2_console_pump`. Four preconditions have to hold at once, and this is the
+// first instruction on the tegra path where they do:
+//
+//   * PANEL — `video::WRITER` carries real geometry. Seeded in the JD1 block ~170 lines above; before
+//     it, `spawn_geometry` declines and a row would be born unplaced.
+//   * HEAP — `wm::reserve_stage` grows a `Vec` with `try_reserve`. The heap is carved by the
+//     `memory::init` two lines above; this statement rides the line that ANNOUNCES it, so the ordering
+//     is not merely correct, it is legible.
+//   * IRQs LIVE, NO PASS IN FLIGHT — `reserve_stage`'s own stated contract (it must not be the growth
+//     that happens inside a present's IRQ mask). JM4's `enable_irq` is ~15 lines above; the scheduler
+//     has not started, and this is the boot core alone.
+//   * STACK — `composite_inner`'s aarch64 stack cost is on the ledger (occ62 records stack exhaustion
+//     as the reason that function was reshaped), and the Pi hit a 16 KiB kernel-stack overflow in the
+//     desktop cascade twice. `tegra_early_stop` runs on the BOOT stack; `jd2_console_pump` is a
+//     `sched::spawn`ed task on a `TASK_STACK_SIZE` stack. This rung takes the boot stack.
+//
+// DARKWIN. Every `serial_println!` `orin_wm1` can emit is downstream of `serial::mark_mmio_ready()` —
+// which is armed on the MMU line at the very top of `tegra_early_stop`, some 280 lines above — so no
+// byte of it can reach an unmapped UARTC.
+//
+// SCOPE. One window. `pidesk::activate` is NOT called from here and no furniture is armed; see the
+// ORIN-WM1 block in `arch/aarch64/display_tegra.rs` for the cascade hazard that keeps it that way.

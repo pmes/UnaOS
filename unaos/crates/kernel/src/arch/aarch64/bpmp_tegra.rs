@@ -549,3 +549,24 @@ pub fn jb7_clocks_query(chan: &Chan, ids: &super::fdt_tegra::XusbIds) {
     }
 }
 
+/// JD1-DC (`jd1dc`, default OFF): the read-only power-state query the nvdisplay probe's guard is
+/// built on — MRQ_PG `CMD_PG_GET_STATE` for ONE domain id, returning `Some((err, state))` with
+/// `state == PG_STATE_ON (1)` meaning the partition is powered. A pure query: zero mutation, the
+/// same wire shape `jb5_pg_on` already proves on metal, just per-id so the caller can name the
+/// domain that refused.
+///
+/// This exists because a read of a POWER-GATED Tegra block is EL3-FATAL (the JX1 event: SError
+/// `ESR 0xbe000011`, EC=0x2F, NVIDIA's BL31 printing "Unhandled Exception in EL3") — so the display
+/// aperture may not be touched at all until the CCPLEX has been told, by the only authority that
+/// knows, that the domain is ON. There is no CAR/clock register path the CPU could ask instead:
+/// on Tegra234 the DISP domain, its ~60 clocks and its 4 resets are BPMP's alone, over HSP+IVC.
+/// That makes this query not belt-and-braces but the ONLY way to earn the first read.
+///
+/// The counterpart `CMD_PG_SET_STATE` is deliberately NOT wrapped here. Powering the display domain
+/// on (or worse, cycling it) would tear down the live scanout UEFI handed us — the one thing the
+/// whole JD1 inheritance is built on — and is unrecoverable for that boot. The probe reads or
+/// refuses; it never powers anything.
+#[cfg(feature = "jd1dc")]
+pub fn pg_get_state(chan: &Chan, id: u32) -> Option<(i32, u32)> {
+    chan.transfer(MRQ_PG, &[CMD_PG_GET_STATE, id]).map(|(err, out)| (err, out[0]))
+}

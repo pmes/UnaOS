@@ -375,7 +375,7 @@ pub struct XusbIds {
 /// Every abandon rung names itself on serial (`JB1c-IDS STOP`): the caller's line is the generic
 /// "no usb@3610000 ids in DTB; SKIP", which cannot say whether the DTB was absent, unmapped,
 /// malformed, node-less, or merely id-less — and without ids the whole XUSB ungate is skipped.
-pub fn xusb_ids(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<XusbIds> {
+pub fn xusb_ids(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<XusbIds> { #[cfg(feature = "jd1dc")] if let Some(ids) = node_ids(dtb_addr, dtb_size, ram_gib_mask, b"usb@3610000") { return Some(ids); } // JD1-DC: on an ARMED build these ids come from the GENERALISED reader at this file's tail — the same walk with the node name lifted into a parameter, which is what lets the nvdisplay probe's MRQ_PG guard read `display@13800000`'s power-domains with this code instead of a second copy of it. APPENDED to this line, never a new one, so every `core::panic::Location` below keeps its line number and the disarmed image is untouched. FALL-THROUGH, not replacement: `None` drops into the original body below, so a bug in the generic reader can cost an armed flight one extra STOP line and never its keyboard.
     if dtb_addr == 0 || dtb_size == 0 {
         return ids_stop("no DTB handed off", dtb_addr, dtb_size as u64);
     }
@@ -1559,4 +1559,150 @@ pub fn cpu_affinities(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64, out: &m
         n += 1;
     });
     n
+}
+
+// =================================================================================================
+// JD1-DC — the DTB resource-id reader, GENERALISED off its one node name. `jd1dc`, DEFAULT OFF.
+// =================================================================================================
+//
+// WHAT THIS IS. `xusb_ids` above is a perfectly good `clocks`/`resets`/`power-domains` reader that
+// happens to have ONE thing hardcoded to XUSB: the node-name literal `b"usb@3610000"` it matches on.
+// The JD1-DC nvdisplay probe needs exactly the same three lists off a DIFFERENT node
+// (`display@13800000`), because its MRQ_PG guard cannot prove a power domain is ON without the
+// domain's id, and the id lives in the firmware's own tree (verify-don't-assume — never a header
+// guess, the JB1c rule). So the reader is parameterised by node name here, and `xusb_ids` routes
+// THROUGH it on an armed build.
+//
+// WHY IT IS AN APPENDED, FEATURE-GATED COPY OF THE WALK RATHER THAN AN IN-PLACE EDIT OF `xusb_ids`.
+// The arc's hard constraint is that the DISARMED jetson image is byte-identical to baseline, and
+// that constraint is stronger than it first looks: ANY edit to source the disarmed build compiles
+// changes the image. Not just code — the two `ids_stop` message literals in `xusb_ids` say
+// "usb@3610000", and a generalised reader must not print that when it was asked for a display node,
+// so an in-place parameterisation necessarily rewrites .rodata. Worse, inserting or deleting a
+// LINE anywhere above an existing panic site in this file shifts that site's `core::panic::Location`
+// (file/line/col is baked into the image), which moves bytes for free. Hence the shape below: the
+// generic walk is `#[cfg(feature = "jd1dc")]` and lives at the file TAIL where it shifts nothing,
+// and the single edit to `xusb_ids` is a `#[cfg]`-erased statement APPENDED to its existing opening
+// line. Knob off => not one byte of this block, and not one moved line, reaches the image.
+//
+// THE ONE DELIBERATE BEHAVIOURAL DIFFERENCE from `xusb_ids`: the "found the node but it carries
+// nothing" abandon also requires `n_pds == 0`. `xusb_ids` abandons on `n_clocks == 0 && n_resets == 0`
+// because for XUSB a node with no clocks and no resets cannot be ungated — but a display node whose
+// only BPMP resource in this firmware's tree is `power-domains` is EXACTLY the node the guard wants,
+// and abandoning it would refuse the probe for the wrong reason. For `usb@3610000` the two
+// conditions cannot disagree (that node carries nine clocks — JB5, metal-proven), which is why
+// routing `xusb_ids` through here is safe.
+//
+// FALL-THROUGH, NOT REPLACEMENT. `xusb_ids`'s armed-build delegation returns only on `Some`: if this
+// reader ever answered `None` where the original body would have answered `Some`, the original body
+// still runs and the XUSB ungate is unharmed. An armed JD1-DC flight therefore cannot lose its
+// keyboard to a bug in this function — the worst case is one extra STOP line on the wire. That
+// fall-through is also the self-test: on an armed boot the `JB1c — XUSB ids from DTB: 9 clocks,
+// 4 resets, 1 power-domains` line is produced BY this reader, against a node whose answer is known.
+
+/// JD1-DC: `xusb_ids`'s walk with the node name lifted into a parameter — read one DTB node's
+/// `clocks` / `resets` / `power-domains` id lists (the odd-index word of each [phandle, id] pair).
+///
+/// `node_name` is matched as a SUBSTRING of the node path, identically to `xusb_ids` and to
+/// `nvdisplay_base` — so passing `b"display@"` here resolves the SAME node `nvdisplay_base` resolves
+/// (same predicate, same `for_each_prop` order, first match wins). That identity is load-bearing for
+/// the probe: the power domain the guard proves ON must be the domain that owns the aperture the
+/// sweep reads, and matching on the same string is what makes that true by construction rather than
+/// by assumption.
+///
+/// Read-only RAM walk — no MMIO, no allocation. Every abandon names itself on the wire
+/// (`JD1-DC-IDS STOP`) with the node it was asked for.
+#[cfg(feature = "jd1dc")]
+pub fn node_ids(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64, node_name: &[u8]) -> Option<XusbIds> {
+    if node_name.is_empty() || node_name.len() > MAX_PATH {
+        // `windows(0)` panics and a name longer than a path can never match; refuse both up front.
+        return node_ids_stop(node_name, "node name length out of range (len / MAX_PATH)", node_name.len() as u64, MAX_PATH as u64);
+    }
+    if dtb_addr == 0 || dtb_size == 0 {
+        return node_ids_stop(node_name, "no DTB handed off (addr / size)", dtb_addr, dtb_size as u64);
+    }
+    let g_lo = dtb_addr >> 30;
+    let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
+    let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
+    if !mapped(g_lo) || !mapped(g_hi) {
+        return node_ids_stop(node_name, "DTB GiB unmapped (GiB lo / RAM-GiB-mask)", g_lo, ram_gib_mask);
+    }
+    let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
+    let Some(fdt) = Fdt::new(blob) else {
+        return node_ids_stop(
+            node_name,
+            "bad DTB header (magic/bounds) at Fdt::new; first two words",
+            be32(blob, 0).unwrap_or(0) as u64,
+            be32(blob, 4).unwrap_or(0) as u64,
+        );
+    };
+    let mut path = [0u8; MAX_PATH];
+    let mut plen = 0usize;
+    fdt.for_each_prop(|e| {
+        if plen == 0 && e.path.windows(node_name.len()).any(|w| w == node_name) {
+            let l = e.path.len().min(MAX_PATH);
+            path[..l].copy_from_slice(&e.path[..l]);
+            plen = l;
+        }
+    });
+    if plen == 0 {
+        return node_ids_stop(node_name, "no node whose path contains this name", 0, 0);
+    }
+    let node = &path[..plen];
+    // [phandle, id] pairs -> collect the odd-index words. Verbatim from `xusb_ids`.
+    let pick = |p: &PropWords, out: &mut [u32], n: &mut usize| {
+        let mut i = 1;
+        while i < p.n && *n < out.len() {
+            out[*n] = p.words[i];
+            *n += 1;
+            i += 2;
+        }
+    };
+    let mut ids = XusbIds { clocks: [0; 9], n_clocks: 0, resets: [0; 4], n_resets: 0, pds: [0; 4], n_pds: 0 };
+    let clocks = fdt.prop_at(node, b"clocks");
+    let resets = fdt.prop_at(node, b"resets");
+    let pds = fdt.prop_at(node, b"power-domains");
+    pick(&clocks, &mut ids.clocks, &mut ids.n_clocks);
+    pick(&resets, &mut ids.resets, &mut ids.n_resets);
+    pick(&pds, &mut ids.pds, &mut ids.n_pds);
+    if ids.n_clocks == 0 && ids.n_resets == 0 && ids.n_pds == 0 {
+        return node_ids_stop(
+            node_name,
+            "node found but carries NO clocks, NO resets and NO power-domains (raw prop cell counts clocks.n / resets.n)",
+            clocks.n as u64,
+            resets.n as u64,
+        );
+    }
+    // Two lines rather than one with conditional fragments: a format that splices "" and 0 together
+    // when there are no power-domains reads as `...0 power-domains0 ::` on the wire, and a capture a
+    // decision rests on may not contain a number that means nothing.
+    serial_println!(
+        ":: tegra: JD1-DC-IDS — node '{}' (path '{}'): {} clocks, {} resets, {} power-domains ::",
+        core::str::from_utf8(node_name).unwrap_or("?"),
+        core::str::from_utf8(node).unwrap_or("?"),
+        ids.n_clocks,
+        ids.n_resets,
+        ids.n_pds,
+    );
+    for i in 0..ids.n_pds {
+        serial_println!(":: tegra: JD1-DC-IDS —   power-domain[{}] id = {} ({:#x}) ::", i, ids.pds[i], ids.pds[i]);
+    }
+    Some(ids)
+}
+
+/// One named JD1-DC-IDS abandon witness + the `None` the rung returns (tail-helper convention: each
+/// abandon stays a single `return` line, so no call-site `Location` moves). Names the node it was
+/// asked for — the whole reason the generalised reader could not reuse `ids_stop`, whose two
+/// messages say "usb@3610000" and whose text may not change without moving the disarmed image.
+#[cfg(feature = "jd1dc")]
+#[inline(never)]
+fn node_ids_stop(node_name: &[u8], why: &str, a: u64, b: u64) -> Option<XusbIds> {
+    serial_println!(
+        ":: tegra: JD1-DC-IDS STOP — node '{}': {} = {:#x} / {:#x}; resource ids unresolved ::",
+        core::str::from_utf8(node_name).unwrap_or("?"),
+        why,
+        a,
+        b,
+    );
+    None
 }
