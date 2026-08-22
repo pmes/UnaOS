@@ -13248,3 +13248,232 @@ both `[wm] tile-fit` format strings and the `-> DISTINCT` / `ALIASED` tails are 
 `target/x86_64_esp/kernel.elf`, and `nm` shows `video::wm::place::LAST_SIG` allocated beside the
 pre-existing `place::LAST_TOP` — the witness's own latch, inside the function boot 11 already proves
 runs on metal (`[wc-a] create` is emitted by `place`'s caller immediately after it returns).
+
+## DEADMAN — the instrument the wedge cannot erase (x86, `deadman` knob, 2026-08-22)
+
+### The defect
+
+Metal boot 11 wedged at **117.668 s**. The glass stayed frozen for the last **91 seconds** — 43 % of
+the operator's session — and **there is no data for that stretch at all**. `spread`, `rtwit`,
+`schedx86`, `dock` and `menubar` did not fail one after another; they went silent in **one event**.
+
+That is structural, not bad luck. Every one of those instruments is emitted **by the render-service
+pass**. When the pass stopped, so did the evidence of it stopping. *The wedge erases the evidence of
+itself.*
+
+The gap was already written down. `shell.rs` (the `storm` verb) says it in as many words:
+
+> …on x86 there is NO instrument that survives a starved shell (the `[schedx86] load` heartbeat runs
+> on the same render-service task as this dispatch; on aarch64 the timer-driven `:: SCHED: load ::` /
+> `[pulse5]` / `[spin1]` train does survive). A silent x86 tail is settled only by the next boot's
+> slice, honestly.
+
+`[deadman]` is the x86 half of that train.
+
+### The shape
+
+Driven from the **APIC timer ISR** (`arch/x86_64/interrupts.rs`, `timer_interrupt_handler`), not from
+any service pass. **One line per second, unconditionally — including when every counter is zero.**
+
+That unconditional emission is the whole design, not a convenience. An all-zero `[deadman]` line says
+*"the machine is alive and nothing is happening."* **No `[deadman]` line at all** says *"the timer ISR
+or the console transport is gone"* — a different and much larger claim. Boot 11 could produce neither
+reading, because an instrument that only speaks when there is something to report cannot distinguish
+its own death from quiet.
+
+The hook sits **after `apic::eoi()`** — holding the in-service bit across the emit would block this
+core's own subsequent timer ticks, i.e. the instrument would suppress the heartbeat it rides — and
+**before `sched::timer_preempt()`**, which can switch away and not return for the descheduled lifetime
+of a task. Anything after that call is not on the timer's clock at all, which is the entire property
+this witness exists to have.
+
+### The line
+
+```text
+[deadman] up=117 hid=42 pmp=998 hq=3 hid_ms=118 comp_ms=91234 gate=2/8891 dec=00200000 dmg=3/3
+```
+
+| field | meaning |
+|---|---|
+| `up=` | seconds since boot (`APIC_TICKS / 1000`) — the anchor a capture is read against |
+| `hid=` | HID IN-token completions in the last second (see **the HID-IN gap** below) |
+| `pmp=` | `service_ehci_hid()` passes in the last second — the poll's own liveness |
+| `hq=` | input event-queue depth |
+| `hid_ms=` | age of the most recent HID report; `-` if none ever |
+| `comp_ms=` | age of the last **completed** composite pass; `-` if none ever |
+| `gate=` | `COMP_GATE` holder core `/` hold age in ms; `-` when free |
+| `dec=` | per-core composite **declines** in the last second, one hex nibble per core, saturating at `f` |
+| `dmg=` | rows currently marked damaged `/` of those, rows with **no attach since the last pass** |
+
+~95 bytes. Deliberately: `USB-DEBUG: MOUSE` was measured at 49 bytes per report and was **20.8 % of
+all serial output** before it was removed. One 95-byte line per second is ~0.8 % of a 115200-baud wire.
+
+Sentinels are never `0`. A field that never populated reads `-`; a damage sample that could not be
+taken reads `?`. `0` always means a real measured zero.
+
+### THE SAFETY ARGUMENT, PER FIELD
+
+The property that matters most: **an instrument that can block on what it instruments is the bug, not
+the tool.** This runs in the timer ISR with `IF=0`, so any wait is a wait the machine cannot break.
+Field by field:
+
+| field | how it is read | why it cannot block |
+|---|---|---|
+| `up=` | `APIC_TICKS.load(Relaxed)` | one relaxed load of an `AtomicU64`. Wait-free; no lock, no MMIO, no `cli`. |
+| `hid=` | `HID_IN.swap(0, Relaxed)` | single relaxed RMW on a module-private atomic. Nothing else can hold it. |
+| `pmp=` | `HID_POLL.swap(0, Relaxed)` | as above. |
+| `hq=` | `pal::event_queue_stats()` — five relaxed loads, then `push − drop − pop` | **`pal::event_queue_depth()` is deliberately NOT used.** That accessor is `without_interrupts(\|\| EVENT_QUEUE.lock().len())` — a `cli` plus a blocking spin-lock acquire against a mutex the main loop holds across `push_locked`/`pop_event`. The conservation-law read touches no lock at all. Cost: the counter bump and the head/tail move are not one atomic step, so a concurrent push can skew the sum by ±1. For a gauge that is irrelevant, and it is stated rather than hidden. |
+| `hid_ms=` | `HID_LAST_MS.load(Relaxed)` | module-private atomic, stamped at the EHCI completion point. |
+| `comp_ms=` | `COMP_LAST_MS.load(Relaxed)` | module-private atomic, stamped at the *tail* of `composite_once`. |
+| `gate=` | `wm::deadman_gate_sample()` — `COMP_HOLDER_CORE` + `COMP_HOLD_T0_MS`, two relaxed loads | **`COMP_GATE` itself is never touched** — no CAS, no acquire, no retry. These two are gauges `wm` already maintains and documents as "loaded, never drained", and reading them is the same pattern `wcser_emit`/`wcser_overdue_probe` already use. A torn pair (holder released between the two loads) costs one line reporting a stale age for a gate that just went free; `saturating_sub` keeps it non-negative. |
+| `dec=` | `DEC[core].swap(0, Relaxed)` per core | **single-writer per core** — core *i* is the only writer of slot *i*, so the slots never contend. |
+| `dmg=` | `wm::deadman_damage_sample()` — `TABLE.try_lock()`, then a bounded 12-row walk | **`wm::table()` is deliberately NOT used**: it is `IrqMask::new()` + a blocking `TABLE.lock()` spin and would deadlock outright if the ISR landed on a core already holding it. `try_lock` returns immediately either way and reports `?/?` on contention — the pardon-on-busy discipline `occluders_above`/`OCC_EXCUSE_BUSY` established in `wm.rs`, for the reason recorded there: *"An instrument must never be able to wedge the thing it instruments."* The critical section is 12 iterations of two `bool`s and one relaxed load, with no print, no allocation and no nested lock. |
+
+**The emit itself.** `serial_println!` is safe from an ISR, and that is a property of
+`arch::serial::_print`, not an assumption: it takes `SERIAL1` with **`try_lock` only, never `lock`**,
+and on the rMBP — which has no 16550 at `0x3F8` — the `UART_STATE == 2` arm breaks out immediately
+without even entering the back-pressure loop. Its four downstream taps (`fbcon`, the FTDI console
+ring, the `tste` ring, the flight recorder) are each documented `try_lock`-only, alloc-free and safe
+from an IRQ-masked context. Formatting goes into a bounded 160-byte stack buffer — no allocation.
+
+`[deadman]` is added to `fbcon`'s `PANEL_MUTE_TAGS`. It is periodic telemetry with no on-glass reader
+(like `[wcn]`/`[schedx86]`), but its case is the strongest of the six: routing it to the panel would
+push a console present, and therefore compositor-adjacent work, **inside an interrupt handler** once a
+second. The wire keeps every byte — the mute governs the glass only.
+
+### ⚠ THE TRANSPORT IS NOT PART OF THE GUARANTEE
+
+Stated plainly so nobody over-reads the instrument. On the rMBP there is no 16550; the console is the
+**FTDI bulk-OUT**, drained by `Controller::service_ftdi()` from the **`x86_usb_pump` task**.
+
+What this design buys is that `x86_usb_pump` is a **different task from the render-service task** that
+carries `spread`/`rtwit`/`comp2`/`schedx86`. So a compositor wedge no longer takes the instrument with
+it: the sample is taken and staged lock-free from the ISR regardless, and the line reaches the cable
+as long as the usb-pump task still runs. Boot 11's silence was **one** pass dying. `[deadman]` goes
+silent only if a **second, independent** pass also dies — and that silence is itself now a reading,
+because the line is unconditional.
+
+### ⚠ THE HID-IN GAP — named, not papered over
+
+The brief this was built to asked for `hid_in` incremented **inside the EHCI IRQ handler, before any
+queue or lock**. **That site does not exist on this machine.** `drivers/ehci/mod.rs:19` is explicit:
+
+> No interrupts: no USBINTR write, no IDT vector, no MSI.
+
+The rMBP's internal keyboard and trackpad are serviced by `service_ehci_hid()`, **polled** from
+`x86_usb_pump`. `USBINTR` is never written, `arch/x86_64/interrupts.rs` has no EHCI vector, and so no
+EHCI interrupt is ever delivered. There is no IRQ-side counter to keep.
+
+Rather than weaken the requirement by calling a polled call site an ISR, the field is **split** so the
+gap is visible in the reading itself:
+
+* `hid=` is stamped at the **earliest honest point** — the qTD retirement (`ehci/mod.rs`, the same
+  spot as the KBDWIT stamp), above every decoder, length gate and `dead` path, and before any
+  `pal::EVENT_QUEUE` push, so no report layout can influence whether a completion counts.
+* `pmp=` is stamped at `service_ehci_hid()` **entry** — above the lock and above the `is_none()` early
+  return, because the question is "did anything call the poll", not "did the poll find a controller".
+
+**The residual, stated:** when `pmp = 0` this instrument cannot see HID hardware liveness at all.
+Closing it needs a read-only sample of `USBSTS.USBINT` (which `QTD_IOC` still sets even with `USBINTR`
+masked) taken from the timer ISR off a base cached at init. That is a separate rung and is
+**deliberately not built here** — it puts an MMIO read of a device BAR inside the timer ISR, which
+needs its own power-state and mapping argument.
+
+### ⚠ `ser_wait[0..7]` — DROPPED, and why
+
+The brief asked for a per-core count of threads **blocked on** the compositor's serialization lock.
+**No such set exists, because `COMP_GATE` is not a lock.** It is an `AtomicBool` gate (`wm.rs`) taken
+with `compare_exchange`; on failure the caller **declines** — publishes `COMP_PENDING` and returns
+immediately. Nothing ever blocks on it.
+
+A "threads blocked" field would therefore be structurally always zero, and would read *"nobody was
+waiting"* during precisely the wedge it was built to explain. That is worse than no field.
+
+`dec=` is the honest analogue with the same job: a per-core count of composite passes **turned away**
+by the gate. It answers what was actually asked — it converts "nothing ran right" into an enumerated
+list of which cores tried and were refused — while naming the real mechanism. During a leaked hold,
+`dec=` is the roster of cores that kept arriving and kept being sent away, and `gate=` names the core
+that never let go. (`WCSER_DECLINED` is a single global total drained by a rollup that rides the
+render-service pass, so it says nothing during the wedge it would be most useful for.)
+
+### THE EXACT METAL WATCH LINES
+
+Watch with `awk '/\[deadman\]/' <log>` — not `grep`; control bytes in the logs break it.
+
+**1 — healthy boot, desktop idle.** The screen is up, nobody is touching it.
+
+```text
+[deadman] up=42 hid=0 pmp=997 hq=0 hid_ms=8112 comp_ms=1043 gate=- dec=00000000 dmg=0/0
+```
+
+Read it as: the poll is running (`pmp≈1000`, once per pump pass); nothing arrived (`hid=0`) and the
+last report was 8 s ago; the compositor last **finished** a pass 1 s ago and the gate is **free**; no
+core was turned away; nothing is damaged. **An all-zero-ish line is the healthy idle reading** — and
+it is emitted, which is the point.
+
+**2 — healthy boot, operator typing and dragging.**
+
+```text
+[deadman] up=44 hid=126 pmp=996 hq=2 hid_ms=4 comp_ms=12 gate=3/1 dec=00010000 dmg=2/0
+```
+
+Input arriving, queue shallow, composites recent, the gate briefly held by core 3, one decline on core
+3, two rows damaged and **`dmg=2/0` — every damaged row has an attach behind it.** This is what
+correct damage tracking looks like.
+
+**3 — DURING A WEDGE (the boot-11 shape).**
+
+```text
+[deadman] up=140 hid=31 pmp=998 hq=64 hid_ms=6 comp_ms=22412 gate=5/22409 dec=0000f000 dmg=7/7
+[deadman] up=141 hid=28 pmp=997 hq=64 hid_ms=11 comp_ms=23415 gate=5/23412 dec=0000f000 dmg=7/7
+```
+
+`comp_ms` and the gate hold age **grow together, second by second, without bound**; core 5 took the
+gate and never released it; core 4 is hammering it and being refused every time; the input queue is
+**full at 64** because nothing is draining it.
+
+#### Which reading answers which question
+
+**(a) Was input actually dead, or did the operator stop trying?** → **`hid=` and `pmp=` read
+together, against `comp_ms=`.** Neither decides it alone:
+
+* `pmp > 0`, `hid > 0`, `comp_ms` growing without bound ⇒ **input is alive and arriving; only the
+  glass is dead.** The operator was still typing into a frozen screen. (This is what example 3 shows.)
+* `pmp > 0`, `hid = 0`, `comp_ms` growing ⇒ the poll is alive and the hardware genuinely reported
+  nothing. The input path still runs; the operator stopped trying — or the device went quiet.
+* `pmp = 0` ⇒ **the leaked hold took the input path with it.** The EHCI poll itself stopped, so
+  nothing can be said about the hardware — only that the pass which would have harvested it is gone.
+  **This is the materially worse bug**, and it is now nameable instead of invisible.
+
+The capture from boot 11 showed zero HID lines after 117.759 s and **could not tell these apart**.
+
+**(b) Are the phantom composites a damage-tracking leak?** → **`dmg=N/S`, the second term.**
+
+In the 40.8–105 s stretch the screen was provably static yet the compositor did **1.56 composites per
+attach**, where boots 9/10 do exactly **1.00**.
+
+* `S > 0` on a static screen ⇒ **a leak is proven**, and `S` quantifies it: that many rows are being
+  carried into a pass with no attach behind them.
+* `dmg=N/0` ⇒ the extra passes are **not** a damage leak, and the 1.56 must be explained elsewhere.
+
+The test is strict by construction: a row counts as static iff its attach sequence is **unchanged**
+since the snapshot taken at the last **completed** composite pass, and any `present()` naming the row
+breaks it. No threshold, no decay, no smoothing on either term. **A sibling arc owns fixing that
+defect; this instrument only adjudicates it, and it was built to the definition rather than toward a
+hoped-for answer.**
+
+### Gating
+
+`deadman` (`UNAOS_DEADMAN=1`), **default OFF**, `target_arch = "x86_64"` for the real impl; aarch64
+gets an empty `#[inline(always)]` shim so the hooks in `arch/x86_64/interrupts.rs`,
+`drivers/ehci/mod.rs` and `video/wm.rs` stay `#[cfg]`-free.
+
+Named on **both** the `x86-all` and `arm-pi` type-check legs — the `wm.rs` hooks (`note_attach`,
+`note_composite_done`) are **arch-neutral call sites**, so the shim half must compile armed on aarch64
+or the seam is covered on neither arch. **Stripped by `arm_features`** so aarch64 *media* stay
+byte-identical: the real instrument emits not one byte of aarch64 code, but an enabled feature is
+hashed into cargo's `-Cmetadata`, so leaving it in would shift every Pi/Jetson image hash for zero
+observable change.
+
+With the knob off, an unarmed image contains **no `[deadman]` string, no counter and no symbol** —
+including the `PANEL_MUTE_TAGS` entry, which is itself knob-gated so that claim is exact.
