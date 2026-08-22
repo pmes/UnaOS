@@ -1632,7 +1632,18 @@ FORBID BGSPREAD: .*-> FAIL
 # ---    on EVERY boot, not occasionally. `depth=1` is carried in the line because it names the victim
 # ---    depth the move had to clear — the same population `[spread4] d1=` counts cumulatively on
 # ---    metal. See docs/dev/OS/02_KERNEL_CORE/scheduler.md (aarch64, VUGSPREAD-PI).
-REQUIRE VUGSPREAD: floor test — tasks=2 cores-used=[2-9] depth=1 :: PASS
+# ---
+# ---    FLAKEHUNT — `tries=` is an INSERTION after `depth=1`, and the REQUIRE keys on it so the field
+# ---    cannot silently disappear. The leg's staging and its pass condition are unchanged; what
+# ---    changed is that the second task is now queued on an OBSERVATION that the first is on-core
+# ---    (rather than after a blind 2 ms), the window the sibling has to look in is ~25 ms rather than
+# ---    ~3 ms, and the attempt is retried up to 4 times. A build whose floor refuses the move reports
+# ---    `cores-used=1` at every attempt, so `tries=[1-9]` never converts a red into a green — it only
+# ---    stops a DESCHEDULED SIBLING from being reported as a scheduler defect. Under QEMU
+# ---    `busy_delay_ms` is CNTPCT, which advances with the host clock whether or not the guest core is
+# ---    on a host CPU, so the old 3 ms window could pass with an idle sibling executing nothing at
+# ---    all; two Pi seats measured that at roughly one red in four runs of an otherwise green suite.
+REQUIRE VUGSPREAD: floor test — tasks=2 cores-used=[2-9] depth=1 tries=[1-9] :: PASS
 FORBID VUGSPREAD: floor test .*:: FAIL
 
 # SPREAD-2 — VUG-PAR band distribution. The `[spread2]` rollup only exists when the image carries the

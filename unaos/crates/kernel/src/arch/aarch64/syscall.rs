@@ -8460,6 +8460,10 @@ const PF_W: u32 = 0x2; // p_flags — writable
 const EHDR_SIZE: usize = 64; // sizeof(Elf64_Ehdr)
 const PHDR_SIZE: usize = 56; // sizeof(Elf64_Phdr)
 const MAX_LOAD_SEGS: usize = 8; // a minimal loader ceiling (a real ELF here has 2); reject more, fail-closed
+/// The slot window's page granule (4 KiB — the translation granule every slot table in `boot.rs` maps
+/// with; `USER_REGION_SIZE` is documented as "16 KiB = 4 pages" of exactly this size). Named so the
+/// RXFINAL64 final-page bound below derives from the same unit the loader's page permissions use.
+const WINDOW_PAGE: usize = 0x1000;
 
 /// One validated PT_LOAD segment: its file offset/size, virtual address, in-memory size (>= filesz for a
 /// .bss tail), and flags. Bounds are already checked against the image and the slot window at collection.
@@ -8584,6 +8588,37 @@ fn validate_elf(b: &[u8], win_size: usize) -> Result<ElfPlan, &'static str> {
         let span_end = win_off.checked_add(s.memsz).ok_or("segment span overflow")?;
         if span_end > win_size {
             return Err("segment overflows the slot window");
+        }
+        // RXFINAL64 (WINX-8 defence-in-depth — the aarch64 twin of x86's RX-FINALPAGE, 27298f70): REFUSE
+        // an RX segment that crosses into the FINAL window page.
+        //
+        // The loader itself parks the initial EL0 stack pointer at the window TOP
+        // (`map_image_into_slot`: `sp = (base + size) & !0xF`), so the LAST page of the window is the
+        // first stack page of EVERY program this loader starts — the program's first frame push lands in
+        // it. An executable segment is mapped read-only (`protect_user_slot_code_range` flips every page a
+        // PF_X segment covers to RO+EL0-exec, and the W^X check above already refused W+X), so an
+        // executable memsz that spills into that page is loaded-to-die: the first stack write takes a
+        // permission fault and the fault net kills the program at RUNTIME with no load-time diagnosis —
+        // the WINX-8 fault class. Refuse it HERE, with a witness, instead.
+        //
+        // Deliberately ONLY the final page — the one bound the LOADER itself imposes (its own `sp`
+        // choice). Program-private stack carves lower in the window (user-vug parks worker stacks below
+        // the top) are a PROGRAM contract, not loader law, and are NOT enforced here. The boundary is
+        // exclusive at the page edge: an RX segment ending exactly AT `win_size - WINDOW_PAGE` owns no
+        // byte of the final page and loads. `min_vaddr` is already FINAL here — the collection loop over
+        // ALL program headers finished before this bounds loop began.
+        if s.flags & PF_X != 0 && s.memsz > 0 {
+            let carve_off = win_size - WINDOW_PAGE; // first byte of the final (initial-stack) page
+            if span_end > carve_off {
+                serial_println!(
+                    ":: elf: REFUSED rx-crosses-final-window-page seg=[{:#x},{:#x}) carve=[{:#x},{:#x}) ::",
+                    s.vaddr,
+                    s.vaddr + s.memsz as u64,
+                    min_vaddr + carve_off as u64,
+                    min_vaddr + win_size as u64
+                );
+                return Err("rx segment crosses the final window page (the initial stack page)");
+            }
         }
         // The entry must land inside an EXECUTABLE segment's mapped range (a data-only entry would fault).
         if s.flags & PF_X != 0 && e_entry >= s.vaddr && e_entry < s.vaddr + s.memsz as u64 {
