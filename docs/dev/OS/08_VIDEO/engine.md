@@ -16391,9 +16391,32 @@ drains the channel again. `x86_input_service` fills the 64 slots, blocks forever
 `Channel::send`'s `slots.wait()`, and therefore stops calling `pal::next_event()`. EVENT_QUEUE stops
 draining, and `hq=25` is what that looks like from the ISR.
 
-The USB poll underneath is untouched: `pmp` stays in its ordinary band (avg 152/s, min 48, max 396)
-for the whole post-steal stretch. **The hardware is being asked and is answering; the service that
-carries the answers to the desktop is gone.**
+The USB poll underneath keeps running, but it is NOT untouched, and the distinction matters. Its
+rate steps down at the steal and stays down:
+
+| window | samples | median `pmp` | min | max |
+|---|---|---|---|---|
+| pre-wedge steady, `up=20..76` | 57 | **818** | 0 | 1008 |
+| post-steal, `up=88..579` | 492 | **140** | 48 | 396 |
+
+A ~5.8x sustained step, taken at the steal and held for 492 consecutive samples. The likely cause is
+plain oversubscription rather than anything subtle: `usb-pump` and `input` were both dispatched on
+c7, and after the steal c7 also carries the compositor passes it took from c1. That is a hypothesis,
+not a measurement — nothing on the wire attributes the step — and it is recorded here as one.
+
+**What does NOT follow from the step, and is the actual point:** the poll is degraded, not dead. It
+runs at ~140 passes/s for the remaining 510 seconds, which is two orders of magnitude more than
+enough to carry a trackpad at its 1–5 ms report cadence. **The hardware is being asked and is
+answering; the service that carries the answers to the desktop is gone.** A reader who sees the
+5.8x step and concludes "the USB stack fell over" has the wrong defect: at 140 polls/s the pad
+would still work if anything downstream were draining.
+
+> **A number on the shared board was wrong in both directions, and both corrections are recorded
+> here so neither survives.** The original claim was "`pmp` collapses ~990 → ~110" — endpoints
+> picked from extremes rather than from the distribution. The correction offered to it was "the USB
+> poll did not collapse", drawn from whole-window averages that straddle a dip at `up=77..82` and
+> so washed the step out. Both are wrong. The measured answer is the table above: a real step, of
+> 5.8x rather than 9x, that leaves the poll far above the rate the defect would require.
 
 > **A caveat stated rather than buried.** The blocked-in-`send` step is an inference, not a direct
 > reading, because the one instrument that would have shown the channel filling — `[schedx86] depth
