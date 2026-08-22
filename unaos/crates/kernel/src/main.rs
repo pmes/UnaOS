@@ -1336,12 +1336,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 // micro (see `[piusb26]` — a `poll_events` on an empty ring), it naps between them,
                 // and it is the whole latency budget of a moving mouse: a pump pass that queues behind
                 // a spinning vug is a pointer report that arrives late, which is the P73 symptom.
-                unaos_kernel::arch::sched::spawn_prio(
+                unaos_kernel::arch::sched::spawn_prio_stack(
                     "usb-pump",
                     usb_pump,
                     0,
                     input_cpu,
-                    unaos_kernel::arch::sched::PRIO_SERVICE,
+                    unaos_kernel::arch::sched::PRIO_SERVICE, PUMP_PATH_STACK_SIZE, // STACKPOOL — the HID pump gets a RIGHT-SIZED kernel stack, the U7STK cure applied to the THIRD task SPIN-6 has convicted of running its own frame chain off the bottom of the blanket 16 KiB. Pi METAL only, dsktp boot 11 — QEMU raspi4b delivers no Group-1 timer IRQ on this path, so no preemption frame ever lands on this task's stack there and no gate in this tree can reproduce it: `[spin6] cpu=3 REFUSING corrupt switch-in: task=98:usb-pump ctx_sp=0x207df00 outside its stack [0x207e000,0x2082000)`, 256 B below its OWN low bound — and `ctx_sp` is a field of the heap `Task`, not a word on this stack, so a neighbour writing IN could not have produced it (see the tail block). THIS TASK IS PETER'S "close the quarry, reopen it -> wedge": the dock tile's reopen latch drains on the INPUT path (`wc_click_route` -> `strip::press_route` -> `quarry::service`), so a FAT directory listing and a compositor window create run on the HID pump's stack, on top of the BOT storage subtree that only started running to completion once his card actually mounted. Const + the discriminator + the four measurements at the file tail, and the arg FOLDED onto this line: knob-off line-neutrality, PARITY §5.3.
                 );
             }
             // SCHED-PRIO — the two panel service tasks join the band (see `sched::PRIO_SERVICE` for
@@ -1360,12 +1360,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // first two are coarse periodic pokes with no latency requirement (a late 4 Hz strip
             // sample is invisible), and the reaper is background block I/O. Elevating them would put
             // the strip's `format!` + full-width band fill ahead of the fleet for no panel benefit.
-            unaos_kernel::arch::sched::spawn_prio(
+            unaos_kernel::arch::sched::spawn_prio_stack(
                 "input",
                 input_service,
                 0,
                 input_cpu,
-                unaos_kernel::arch::sched::PRIO_SERVICE,
+                unaos_kernel::arch::sched::PRIO_SERVICE, PUMP_PATH_STACK_SIZE, // STACKPOOL — the input ROUTER takes the same size for the same reason, and it is not defensive: `input_service`'s poll-nap branch calls `pump_usb_into_gui()` (line 4301) — the identical function `usb-pump` faulted inside — so the quarry-reopen chain that ran task 98 off the bottom of its 16 KiB is reachable on THIS task's stack too. Which of the two takes it is a race the timer decides: on metal both exist and `usb-pump` gets there first at its ~4 ms cadence, but the poll-nap branch is the ONLY caller under QEMU raspi4b (`usb-pump` is timer-gated at spawn, line 1322, so it is never spawned there). Sizing one and not the other would have left the defect wearing the other task's name — and losing `input` is strictly worse: it is the sole drain of the UART/HID source, so its death takes the keyboard with it. Shared const, one rationale, at the file tail. ⚠ FOLDED onto the pre-existing arg line — PARITY §5.3.
             );
             unaos_kernel::arch::sched::spawn_prio_stack(
                 "render",
@@ -3837,7 +3837,7 @@ fn pump_usb_into_gui() {
     if !PIUSB28_ARMED.swap(true, core::sync::atomic::Ordering::Relaxed) {
         serial_println!(":: piusb28: mount-trigger armed (pi pump path) ::");
     }
-    unaos_kernel::fs::fat::piusb27_service();
+    unaos_kernel::fs::fat::piusb27_service(); #[cfg(feature = "witness")] stackpool_stk_probe(); // STACKPOOL — the instrument half of `PUMP_PATH_STACK_SIZE`, placed HERE rather than at either spawn site because this function is the shared body BOTH sized tasks execute, and whichever of them is running gets named by the probe's own `task=id:name` field. It is the last statement of the pass, so `hw` already includes whatever the quarry-reopen and BOT chains above reached — a high-water is a lifetime reading, so a probe after the fact still reports a subtree that has long since returned. The early `return` at the `user_input_active()` branch skips it; that costs nothing for the same reason. Rate limit + rationale at the file tail. ⚠ FOLDED, `#[cfg]` on the statement — PARITY §5.3.
 }
 
 /// PIUSB-24: rate-limited (~4 Hz) `[piusb24]` serial witness of a pointer report reaching the GUI
@@ -6119,3 +6119,171 @@ fn shellup_census_maybe() {
         SCREEN_APP_ACTIVE.load(Ordering::Relaxed)
     );
 }
+
+// ── STACKPOOL — the THIRD task SPIN-6 has convicted on the blanket 16 KiB ────────────────────────
+//
+// Tail-appended, and every wire-in for it is FOLDED onto a pre-existing source line, for the reason
+// PARITY §5.3 gives and SHELLUP's `RENDER_STACK_SIZE` block above already obeys: `main.rs` is
+// compiled into the knob-off `kernel8.img` whose byte-identity is this track's standing proof, and a
+// line inserted anywhere renumbers every panic `Location` below it. Nothing is below this.
+//
+// THE DEFECT (Pi METAL, dsktp boot 11, `~/unaos-bench/capture/pi3-boot11/boot11.log:7420-7426`).
+// Peter's on-glass reproducer is "close the quarry, reopen it -> wedge". The capture's last lines
+// are that reproducer, in order:
+//
+//   7420  [dock] press at (467,1157) tile=0/10 quarry=pin -> open requested
+//   7421  [fatperf] op=list path=/ sectors=0 us=15035
+//   7422  [fatperf] op=list path=/fat sectors=11 us=4361
+//   7423  [wc-a] create win=2 asid=0xffffff03 surf=1152x720 stride=4608 scale=1x at (384,242) z=162
+//   7424  [spin6] cpu=3 REFUSING corrupt switch-in: task=98:usb-pump ctx_sp=0x207df00
+//         outside its stack [0x207e000,0x2082000) — the parked frame was OVERWRITTEN
+//   7425  === AARCH64 EXCEPTION: SYNCHRONOUS ===   ESR=0x2000000 (EC=0x00) ELR=0x1228 FAR=0x0
+//
+// All of 7420-7423 run ON TASK 98, in ONE frame chain, SYNCHRONOUSLY:
+//
+//   usb_pump (4908) -> pump_usb_into_gui (3549) -> wc_click_route (3800 -> syscall.rs:13722)
+//     -> strip::press_route -> dock::press_route (dock.rs:937) -> quarry::service()
+//     -> quarry::open() (video/quarry/live.rs) = panel read + two VFS read_dir + surface alloc
+//        + full paint + wm::create_at
+//
+// THE LATCH DEFERS NOTHING. `dock.rs:929-932` and the quarry's own header both state the design
+// intent — "this runs inside a click router, and Quarry's open READS DIRECTORIES", so the open is
+// latched to be drained "from the arch's input-drain task, which is where a volume read belongs."
+// The intent is right and the implementation honours it; what nobody sized is the STACK that intent
+// hands the work to. `syscall.rs:13731` drains the latch on the SAME SOURCE LINE that consumed the
+// press — `if strip::press_route(x, y) { quarry::service(); .. }` — so "latched" and "performed"
+// are one frame apart, not one task apart.
+//
+// WHY IT HAD NEVER FIRED BEFORE, and it is not the card. The boot-time quarry open runs the same
+// two paths at the same cost (`/` 14030 us vs 15035, `/fat` 3680 us vs 4361) — but it runs from
+// `pidesk_activate_maybe()` at line 1316, on the BSP's 512 KiB BOOT stack, ~24 lines before
+// `usb-pump` is spawned at all. THE REOPEN IS THE FIRST TIME `quarry::open()` EVER RAN ON A TASK
+// STACK. Boot 11 contains exactly ONE `[dock] press` line in 7436 lines: n=1, and it faulted. (The
+// tempting story that Peter's card finally mounting deepened the listing is REFUTED on the same
+// wire: `/usb` is not in the quarry's namespace — its own census reads `mounts=["/", "/fat"]
+// roots=["/"]`.)
+//
+// WHY IT IS THIS TASK'S OWN CHAIN AND NOT A NEIGHBOUR — the discriminator, which the refusal's own
+// message ("neighboring stack overflow?") only guesses at. Two structural arguments, and the full
+// version lives beside the refusal in `arch/aarch64/sched.rs`:
+//
+//   1. `ctx_sp` DOES NOT LIVE ON THE STACK. It is a field of the heap-allocated `Task`
+//      (`sched.rs`, `Box::new(Task { .. ctx_sp .. })`), and SPIN-6 tests exactly that field against
+//      the task's own bounds. A neighbour overflowing INTO this stack corrupts the parked FRAME —
+//      bytes inside [0x207e000,0x2082000) — and leaves `ctx_sp` in range, so it could not produce
+//      this line. `ctx_sp < base` is reachable only by this task's own SP.
+//   2. THERE IS NO POOL TO CROWD. Every kernel stack is its own heap allocation
+//      (`alloc::vec![0u8; stack_bytes].into_boxed_slice()` in `spawn_inner`), so SHELLUP's `render`
+//      16K->32K could not have displaced anyone. The wire agrees: `render` grew IN PLACE
+//      ([0x2086000,0x208a000) -> [0x2086000,0x208e000)) while `usb-pump`, allocated before it, kept
+//      the identical [0x207e000,0x2082000) it had in boot 10. The 16 KiB between them —
+//      0x2082000..0x2086000 — is the `input` task, spawned between the two at the blanket size.
+//
+// So it is the U7STK signature for the third time, on the third task: `u7-launch` (144-928 B below
+// its low bound), `render` (96-128 B), `usb-pump` (256 B).
+//
+// THE ESCALATION — why boot 11 WEDGED where boot 10 only dropped a task. SPIN-6 validates the
+// victim's stack POINTER; it cannot see a SMASHED NEIGHBOUR. Task 98's ~176-byte preemption frame
+// landed at 0x207df00, inside the slab BELOW it, over that task's parked saved-`x30`. SPIN-6 refused
+// task 98 (its `ctx_sp` is out of bounds) and PASSED the neighbour (whose `ctx_sp`, being a heap
+// field, is untouched) — then `switch_context` restored the smashed `x30` and `ret`'d to it.
+// `ELR=0x1228` is BELOW the kernel's first byte (`pi-baremetal.ld` links at 0x80000), and
+// `EC=0x00`/`FAR=0x0` says the fetch SUCCEEDED and decoded as UNDEFINED — an unmapped fetch would be
+// `EC=0x21` with `FAR` set. A corrupted return address into mapped low RAM, then `hlt_loop()`: cpu 3
+// dead for the rest of the boot, taking the `input` router with it. `[pulse5] c3=816ms
+// span_max=816ms window=250ms` and `:: SCHED: load .. c3=100% ::` are the same event from outside.
+// That is Peter's wedge. It is why this arc sizes BOTH tasks on the path and not just the convict.
+//
+// NOT REPRODUCIBLE ON ANY GATE IN THIS TREE, structurally, exactly as for `render`: the overrun is a
+// preemption frame stacked on an already-deep pass, and QEMU raspi4b delivers no Group-1 timer IRQ
+// on this path, so neither task is ever preempted there. `kernel8-test` green proves non-regression,
+// not the cure — which is why the size ships WITH its instrument rather than alone. What the gate
+// CAN now do is replay: `pi4-regression.spec` already carries `FORBID REFUSING corrupt switch-in:
+// task=` and `FORBID AARCH64 EXCEPTION`, so a metal capture run against the spec convicts both
+// halves of boot 11 without a new rule.
+//
+// SIZING VS ROUTING — the ruling, because the asymmetry is real and someone will ask. `dock.rs:942`
+// routes the SHELL pin's reopen to the render service (32 KiB); `dock.rs:934` routes the QUARRY
+// pin's to the input band (16 KiB). Two heavyweight reopens, two different stacks. The routing is
+// nonetheless CORRECT and is not what this arc changes: the quarry's open reads volumes, the render
+// task is the compositor's pass owner and must not block on disk, and `dock.rs:929-932` chose the
+// input-drain task deliberately and says so. The defect is that the task the design chose was left
+// at the blanket size. Sizing is the fix; routing is not. (It is also out of this arc's lane —
+// `video/dock.rs` belongs to the video lane and `syscall.rs:13731` is line-neutral-LOCKED, so a
+// restructure of where the latch drains would have to be its own arc with its own byte-identity
+// control.)
+
+/// STACKPOOL — the kernel stack for the TWO tasks that can execute `pump_usb_into_gui`, and hence
+/// the quarry-reopen chain above: `usb-pump` (the ~4 ms HID pump, metal) and `input` (the router,
+/// whose poll-nap branch is the only caller under QEMU). 32 KiB, not the scheduler's blanket 16 KiB
+/// (`TASK_STACK_SIZE`). Third application of the U7STK cure, same bound as `u7-launch`'s
+/// `U7_LAUNCH_STACK_SIZE` and `render`'s `RENDER_STACK_SIZE`. What the number rests on:
+///
+///   * FLOOR, this task, from the fault itself. `ctx_sp = 0x207df00` is 256 B below its own low
+///     bound, so when it banked its context the chain was **>= 16640 B** deep. A floor, not a peak:
+///     the bank point is wherever the preemption landed, not the deepest point of the pass.
+///   * STATIC, this exact chain, measured off the ARMED pi ELF (`UNAOS_PIDESK=1 UNAOS_QUARRY=1
+///     ./arroyo kernel8`, prologue `sub sp` + `stp x29,x30,[sp,#-N]!` per frame):
+///
+///       usb_pump 80 · pump_usb_into_gui 992 · wc_click_route 288 (strip/dock `press_route` are
+///       INLINED into it) · quarry::live::open 928, and then the deeper of its two subtrees —
+///       repaint 992 + text 1232 + wm::create_at 64 + wm::composite 6736 = 9024, versus the listing
+///       side's FatBackend::read_dir 1792 + its Map/Filter iterator 1696 + read_dir_chain 736 = 4224.
+///
+///     Enumerated total **11312 B**, and that is a FLOOR too: it counts only the frames named above,
+///     not the leaves below `composite`, not the ~176 B preemption frame that has to land on top,
+///     and not `switch_context`'s own.
+///   * CEILING, from the two deepest UNSATURATED readings in the tree, both of comparable work.
+///     `[u7stk] at=after:pidesk_arm hw=16496` (sched.rs) — the desktop-ARMING subtree alone, with
+///     nothing above it. `[u7stk] at=render:pass hw=18064` (boot11:7407) — a full compositor pass,
+///     i.e. the same 6736-byte `wm::composite` frame this chain reaches, measured end to end.
+///
+/// ⚠ AND THE INSTRUMENT SATURATES, so read every `[u7stk]` number above as a LOWER BOUND. `stk_probe`
+/// scans up from `base`, so `hw <= len` and `headroom >= 0` by construction — a chain that stopped
+/// exactly at its floor and one that ran 256 B past it both print `hw=16384 headroom=0`. That is why
+/// the size is NOT set to "the measurement plus a bit": there is no measurement of this chain yet,
+/// only bounds — three of them, converging on 11-18 KiB. 32 KiB is 2.8x the enumerated static chain,
+/// 1.9x the dynamic floor and 1.8x the deepest comparable pass; it is the same multiple of static
+/// worst case (1.84x) that sized `u7-launch`, and the bound has now held twice on this cascade
+/// without recurring. The `at=pumppath:pass` probe is what converts it from a precedent into a
+/// reading on the next boot. If that reading comes back near `headroom=0`, the answer is a bigger
+/// number AND a redzone below every stack — not a re-argued guess off a saturated instrument.
+///
+/// `TASK_STACK_SIZE` stays untouched — `sched.rs` records why on `spawn_stack`: raising the blanket
+/// charges every kernel task in the system for one path's frame. Cost here is 16 KiB of heap each,
+/// for two tasks, once.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+const PUMP_PATH_STACK_SIZE: usize = 32 * 1024;
+
+/// STACKPOOL — the `[u7stk] at=pumppath:pass` witness, rate-limited to ~5 s. Called from the tail of
+/// `pump_usb_into_gui`, i.e. from BOTH tasks `PUMP_PATH_STACK_SIZE` sizes, which is the point: on
+/// metal `usb-pump` reaches it at its ~4 ms cadence, and under QEMU raspi4b — where `usb-pump` is
+/// never spawned at all, being timer-gated at line 1322 — the `input` router's poll-nap branch
+/// (line 4301) is the only caller, so the gate can still see the instrument fire. Same shape as
+/// SHELLUP's poll-nap census twin above, and for the same reason: an instrument only one of the two
+/// paths can reach is an instrument that is silent on the boot it exists for.
+///
+/// Neither task had EVER been measured before this arc — boot 11 emitted `[u7stk]` for `u7-launch`
+/// and `render` only, which is exactly why the depth of the chain that killed task 98 had to be
+/// inferred from a 256-byte overrun instead of read off the wire.
+///
+/// One shared limiter for both callers is deliberate: they are the same body, the reading is a
+/// lifetime high-water either way, and a per-task limiter would only buy duplicate lines. What this
+/// cadence CANNOT report is a pass that kills its task before the next tick — the failure the size
+/// fix removes, and which `pi4-regression.spec`'s `FORBID REFUSING corrupt switch-in: task=` catches
+/// on a replayed capture if it does not.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+fn stackpool_stk_probe() {
+    use core::sync::atomic::Ordering;
+    let now = unaos_kernel::arch::ms();
+    let last = STACKPOOL_LAST_PROBE_MS.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) >= 5000 || last == 0 {
+        STACKPOOL_LAST_PROBE_MS.store(now.max(1), Ordering::Relaxed);
+        unaos_kernel::arch::sched::stk_probe("pumppath:pass");
+    }
+}
+
+/// STACKPOOL — the ~5 s limiter behind [`stackpool_stk_probe`]. Shared by both pump-path tasks.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+static STACKPOOL_LAST_PROBE_MS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);

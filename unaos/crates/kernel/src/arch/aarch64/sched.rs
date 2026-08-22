@@ -79,8 +79,8 @@ pub const STACK_POISON: u8 = 0xAB;
 /// Kernel-stack high-water probe. Prints one raw-word `[u7stk]` line for the CURRENT task:
 ///   `at=` checkpoint name · `sp=` live stack pointer · `low=`/`top=` the task's own bounds ·
 ///   `used=` top-sp at this instant · `hw=` the high-water (deepest point EVER reached) ·
-///   `headroom=` len-hw, i.e. what is left before SPIN-6 fires. `headroom` goes NEGATIVE once the
-///   chain has already run off the bottom (printed signed for exactly that reason).
+///   `headroom=` len-hw, what is left before SPIN-6 fires. ⚠ SATURATING — the scan starts AT `base`,
+///   so `hw<=len` and `headroom>=0` ALWAYS: `hw=len headroom=0` is a LOWER BOUND, never a depth.
 ///
 /// Safe to call from any kernel task; a no-op outside a scheduled task (no `current`).
 #[cfg(feature = "witness")]
@@ -8854,3 +8854,52 @@ pub fn spawn_prio_stack(
 ) -> u64 {
     spawn_inner(name, entry, arg, cpu, priority, None, stack_bytes)
 }
+
+// ── STACKPOOL — READ THE SPIN-6 MESSAGE'S PARENTHETICAL AS A QUESTION, NEVER AS A FINDING ────────
+//
+// Tail-appended below `spawn_prio_stack` for the same PARITY §5.3 reason that helper gives: nothing
+// is below this, so no panic `Location` in the knob-off `kernel8.img` moves. Prose only — the
+// STACKPOOL fix itself needed no new machinery here, because `spawn_prio_stack` above is already
+// exactly the `spawn_stack` x `spawn_prio` cross the third convicted task needs.
+//
+// The refusal above prints "(neighboring stack overflow?)". That was the LEADING SUSPECT when SPIN-6
+// was written, and it has now been the wrong suspect three times running — `u7-launch`, `render`
+// (SHELLUP) and `usb-pump` (STACKPOOL, dsktp boot 11, `task=98:usb-pump ctx_sp=0x207df00 outside its
+// stack [0x207e000,0x2082000)`). Every one was the task's OWN frame chain. Two structural facts say
+// it can never be anything else, and they are written down here so the fourth reading of this line
+// does not spend an arc re-deriving them:
+//
+//   1. `ctx_sp` IS NOT ON THE STACK IT NAMES. It is a field of the heap-allocated `Task`
+//      (`Box::new(Task { .. ctx_sp .. })` in `spawn_inner`), and the refusal tests THAT FIELD
+//      against the task's own bounds. A neighbour overflowing INTO this stack corrupts the parked
+//      FRAME — bytes inside [base, top) — and leaves `ctx_sp` in range, so it produces a wild
+//      restore, a wedge, or a fault, but NOT this refusal. `ctx_sp < base` is only reachable by this
+//      task's own SP having walked below its own low bound and banked there.
+//   2. THERE IS NO STACK POOL TO CROWD. Every kernel stack is an INDIVIDUAL heap allocation —
+//      `alloc::vec![0u8; stack_bytes].into_boxed_slice()` in `spawn_inner`, likewise in
+//      `spawn_user_inner` and `spawn_user_thread`. Growing one task's stack cannot shrink another's;
+//      a size change moves nobody's bounds but its own. Boot 11 shows this on the wire: SHELLUP grew
+//      `render` from [0x2086000,0x208a000) to [0x2086000,0x208e000) — same low bound, in place —
+//      while `usb-pump`, allocated BEFORE it, kept the identical [0x207e000,0x2082000) it had in
+//      boot 10.
+//
+// So the diagnostic order for the NEXT one is: the named task's own depth first (paint is already
+// on, put a `stk_probe` on its path and read `hw`), a right-sized stack via `spawn_stack` /
+// `spawn_prio_stack` second, and `TASK_STACK_SIZE` never — see the note on `spawn_stack` for why the
+// blanket is the wrong trade. The parenthetical stays in the message unchanged: it is honest about
+// being a question, and rewording it would move the knob-off image for a comment.
+//
+// AND THE REFUSAL'S REAL BLIND SPOT, which is not the parenthetical: SPIN-6 validates the VICTIM'S
+// STACK POINTER. It cannot see the task the overrun SMASHED. Boot 11 is the whole failure mode in
+// four lines: `usb-pump`'s ~176-byte preemption frame landed at 0x207df00, inside the heap slab
+// BELOW its stack, on top of THAT task's parked saved-`x30`. This check refused `usb-pump` — its
+// `ctx_sp` is out of bounds — and PASSED the neighbour, whose `ctx_sp`, being a heap field of its
+// own `Task`, is untouched and perfectly in range. `switch_context` then restored the smashed `x30`
+// and `ret`'d to it: `ELR=0x1228`, below the kernel's first byte (`pi-baremetal.ld` links at
+// 0x80000), with `EC=0x00`/`FAR=0x0` — the fetch SUCCEEDED and decoded as UNDEFINED, which an
+// unmapped fetch (`EC=0x21`, `FAR` set) would not have. Then `hlt_loop()`, and cpu 3 was gone for
+// the rest of the boot with the `input` router pinned to it. That is the difference between boot 10
+// (a task dropped, the machine limps) and boot 11 (a core dead, the panel wedges) — SAME defect,
+// one extra victim. Closing it properly means a REDZONE (an unpoisoned guard span below each stack
+// whose first touch is the fault) rather than a wider bounds test here, since by the time this code
+// runs the neighbour's frame is already gone. Not this arc's; recorded so the shape is known.

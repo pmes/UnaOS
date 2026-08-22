@@ -3151,6 +3151,69 @@ the residency reads and the ledger are wired.
 
 ---
 
+### 2.x Kernel stack sizing — SPIN-6's three convictions, and what the refusal does NOT mean
+
+Kernel task stacks are **individual heap allocations**, not a pool:
+`alloc::vec![0u8; stack_bytes].into_boxed_slice()` (`sched.rs:3088`, and likewise
+3233, 3320, 8494). Growing one allocation cannot shrink another. This matters
+because SPIN-6's refusal text asks `(neighboring stack overflow?)` and that
+suspect has now been **wrong three times running**.
+
+**What the refusal actually proves.** `ctx_sp` is a field of the heap-allocated
+`Task`, and SPIN-6 tests exactly that field (`sched.rs:4657-4660`). A neighbour
+overflowing *into* this stack corrupts the parked **frame** — bytes inside
+`[base, top)` — and leaves `ctx_sp` in range, so it cannot produce the line at
+all. `ctx_sp < base` is reachable **only by the task's own SP**. Every SPIN-6
+refusal to date has been self-overflow.
+
+| task | observed | overrun | cure |
+|---|---|---|---|
+| `u7-launch` | `ctx_sp=0x20c9e70` vs `[0x20ca000,0x20ce000)` | 400 B | 32 KiB |
+| `render` (boot 10, both flights) | `ctx_sp=0x2089f80` vs `[0x208a000,0x208e000)` | 128 B / 96 B | `RENDER_STACK_SIZE` |
+| `usb-pump` (boot 11) | `ctx_sp=0x207df00` vs `[0x207e000,0x2082000)` | 256 B | `PUMP_PATH_STACK_SIZE` |
+
+**The pump path.** Boot 11's fault was Peter's quarry close/reopen on glass.
+`quarry::open()` — panel read, two VFS `read_dir` calls, surface allocation, a
+full paint and `wm::create_at` — runs **synchronously at click-router depth** on
+the input-drain task: `usb_pump` → `pump_usb_into_gui` → `wc_click_route`
+(`syscall.rs:13731`, where `strip`/`dock::press_route` inline) → `quarry::service`
+→ `open`. The dock latches the open rather than performing it, but the drain is
+called on the same source line, one frame below — **the latch defers nothing**.
+The boot-time open ran identical work on the BSP's 512 KiB boot stack, ~24 lines
+before `usb-pump` exists, which is why only the reopen faulted.
+
+The routing is nonetheless **correct and deliberate** (`dock.rs:929-932`): a
+volume read belongs on the input-drain band, not on the compositor pass owner.
+What was never done is sizing the task the design handed the work to. `input` is
+sized with the same constant, because `input_service`'s poll-nap branch calls the
+same `pump_usb_into_gui()` (`main.rs:4301`) and is the *only* caller under QEMU.
+
+**⚠ `[u7stk]`'s `headroom` SATURATES — it cannot go negative.** The high-water
+scan starts at `base` (`sched.rs:108-131`), so `hw <= len` and
+`headroom = len - hw >= 0` always. A chain that ran 256 B past its floor and one
+that stopped exactly at it print the identical `hw=16384 headroom=0`. Any stack
+size chosen from a reading at or near `headroom=0` is chosen from a **saturated
+instrument**, and every depth it reports is a *lower bound*. Sizing evidence must
+say so. (The doc comment above the probe claimed the opposite until this arc.)
+
+**The residual: SPIN-6 validates the pointer, not the frame.** This is why
+boot 10 merely lost a task where boot 11 wedged a core. The overrunning task's
+preemption frame lands in the slab *below* it, smashing that task's parked
+callee-saved registers — including its saved `x30`. SPIN-6 refuses the
+overflower (its `ctx_sp` is out of bounds) but **passes the victim**, whose
+`ctx_sp` is an untouched heap field; `switch_context` then restores the smashed
+`x30` and returns into it. Boot 11 landed at `ELR=0x1228` — below the kernel's
+first byte (`pi-baremetal.ld` links at `0x80000`) — with `EC=0x00`/`FAR=0x0`,
+i.e. the fetch *succeeded* and decoded as UNDEFINED, then `hlt_loop()`. The core
+died holding the `input` router, which is the on-glass wedge. The fix shape is a
+**redzone below each stack whose first touch faults**; it is not this arc.
+
+`FORBID REFUSING corrupt switch-in: task=` and `FORBID AARCH64 EXCEPTION` both
+already exist in `pi4-regression.spec` — replaying a metal capture against the
+spec convicts this class without a new rule.
+
+---
+
 ## 3. Blocking and synchronization primitives
 
 All primitives live in `sched.rs` and are built to be **lost-wakeup-safe** (the
