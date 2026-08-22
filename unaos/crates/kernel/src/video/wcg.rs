@@ -394,6 +394,30 @@ static W_WITUS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 // relaxed atomic stores, no lock, no branch on the render or input path. `begin` snapshots the
 // counter above `t0` (one relaxed load, paid before the clock starts, per the ordering law on the
 // `Probe` literal); a convicting `end` reads it again and prints `[wcgseam]` with the bracket delta.
+//
+// ### None of the four is ever reset, and that is deliberate — all four or none, and it is NONE
+//
+// This module's between-tenants reset is [`paygo_recycle`], and it clears per-SLOT state
+// (`PAYGO_CLOSED`, `WCG_CUR`, `WCG_BUSY`, `WCG_CHUNKS`, `WCG_HOLD_MAX_US`, `APP_OFF`). The census is
+// not slot state and is deliberately not in it — nor in any other reset, on any path.
+//
+// Clearing [`SEAM_WRITES`] would not rescope the instrument, it would break it: [`end`] convicts on
+// `seam_now - p.seam0`, a difference of a MONOTONE counter, so a clear landing between [`begin`] and
+// [`end`] saturates that delta to zero and reports every writer caught IN THE ACT as
+// `-> QUIET-BRACKET` — the precise false negative this census exists to rule out. [`SEAM_LOCKED`] is
+// the whole-boot denominator its own doc names, and [`SEAM_LAST_CYC`] is an absolute stamp that
+// `last_age_us=` measures backwards from; neither carries meaning rescoped to one sample.
+// [`SEAM_WIN`] is last-write-wins on the same footing, and the routed console is a boot-lifetime
+// singleton — `panel_console_window_open` returns the existing id rather than opening a second — so
+// "the window fbcon last charged" and "the routed console" name the same window while one exists.
+//
+// One edge is known and unremedied, and it is x86-only: `wc_close_furniture` (the close disc, the
+// sole caller of `fbcon::panel_console_window_closed`) clears `CONSOLE_WIN` while deliberately
+// leaving the glyph ROUTE installed, so charges continue with `win=0`. The counters keep counting
+// into the orphaned surface and `SEAM_WIN` keeps naming the closed id, which `wm` can recycle to a
+// new tenant. On aarch64/`pidesk` that path has no caller at all and the edge is unreachable: the
+// only other clear of `CONSOLE_WIN` is `panic_screen`, which takes `win_store` and so ends the
+// census with the boot.
 
 /// WCGSEAM — glyph-raster paint batches fbcon has landed in the ROUTED console-window surface, for
 /// the whole boot. One count per `write_byte` on the classic path (a glyph or a newline's fills),
