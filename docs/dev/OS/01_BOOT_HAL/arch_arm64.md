@@ -6364,9 +6364,53 @@ that to multi-cluster directories. Same verify discipline downstream: every file
 SHA-checked through the engine's own `verify_extents`.
 
 **The flow** (each step a serial line; any engine/read error is a single named `FAIL`):
-GPT (parse-back verified) → zero the ESP metadata region → FAT32 format → **mount the USB stick + clone its
-boot tree file-by-file** → **per-file `sha256=… VERIFIED`** manifest (the real manifest replacing INSTALL-1's
-single `UNAOS.IMG`) → `ORIN-INSTALL-2 SD install — gpt+zero+fat32+clone(N files) verify => PASS`.
+UnaFS `SIZING-GATE-1` (pre-GPT, whole-card upper bound) → GPT (parse-back verified) → zero the ESP metadata
+region → FAT32 format → **UnaFS `SIZING-GATE-2` + format partition 2 as a native UnaFS volume + mount it back**
+→ **mount the USB stick + clone its boot tree file-by-file** → **per-file `sha256=… VERIFIED`** manifest (the
+real manifest replacing INSTALL-1's single `UNAOS.IMG`) → `ORIN-INSTALL-2 SD install —
+gpt+zero+fat32+clone(N files)+unafs verify => PASS — p1 UNAOS-ESP = FAT32 (N files sha-verified) ·
+p2 UNAOS-DATA = UnaFS v5 (131072 blk / 512 MiB, mounted back off the card)`.
+
+**TEGRA-UNAFS-FMT — the second volume is no longer raw.** INSTALL-2 carved `UNAOS-DATA` and never populated
+it. Partition 2 is now formatted as a **native UnaFS volume** through a private `unafs::storage::BlockDevice`
+adapter (`SdUnafsDevice`) over `SdInstallTarget`'s already-armed CMD24/CMD25 primitives — never registered as a
+`drivers::block` backend, so `drivers::block::write_block_tegra_sd`'s unconditional refusal is untouched and the
+card's only write door is still the `sdmmc` → `sdmmc_arm` → `install_target` ladder. All of it is
+`install_target`-gated, so the byte-identity claim above is unchanged.
+
+- **Cap: 512 MiB = 131,072 blocks**, applied at the adapter's `block_count`, not by carving a third GPT entry
+  (`install/gpt.rs` is a shared file). The partition keeps its full span; the volume inside it is smaller, and
+  `UnaFS::mount` sizes its refcount map from the **superblock**, so a capped volume inside a larger partition
+  mounts correctly. Three reasons for that number: the map costs 8 B per 4096 B block against a 48 MiB aarch64
+  heap (full-span on the bench card = 1.24× the whole heap; at the cap = 1 MiB = 2.0 %); the ORIN-UNAFS-ROOT
+  rung-4 probe-mount is gated on `sdmmc`, **not** `install_target`, so it re-reads every refmap leaf on every
+  sdmmc boot through `BlockAdapter` — 8 single-sector CMD17s per 4096 B block — which is ~1,000 polled reads at
+  512 MiB versus ~8,200 at 4 GiB; and 131,072 ≤ `MAX_BLOCK_COUNT_ONE_LEVEL` (524,288), so the map stays
+  **single-level** rather than putting the v5 two-level index-of-indexes on metal for the first time on the boot
+  path. A `const` assertion in `sdmmc_tegra.rs` holds the single-level property structurally.
+- **The sizing gates are an ORDERING guarantee, not a proof.** `SIZING-GATE-1` runs on the whole-card capacity
+  before the first byte of the GPT, so an over-large geometry is refused while the card is still exactly as it
+  was found; `SIZING-GATE-2` runs on the real p2 span and returns the volume's `block_count`. Neither proves
+  the format cannot fail for heap reasons: the comparison is against total `allocator::HEAP_SIZE`, never free
+  heap, and `RefMap::try_new` needs two contiguous multi-MiB runs out of a `linked_list_allocator::Heap`. A
+  format-time heap failure fails the install, closed, on its own named line. At the current cap the refusal
+  branch is unreachable by arithmetic (1,048,576 B against a 12,582,900 B limit) and is kept as the
+  future-proofing bound that makes raising either the cap or the heap size fail loudly.
+- **The proof is a mount.** After the format, the step re-reads the static superblock for a precise diagnostic
+  and then calls `UnaFS::mount` on a fresh handle over the same span: that reads and bound-validates the root
+  record, the imap index and leaves, the refmap index and all 128 refmap leaves, and rebuilds the refcount map
+  from what is on the card; `ls(ROOT_INODE_ID)` then walks the root directory through that reconstructed state.
+  Re-reading the superblock and root record alone touches 2 of the ~139 blocks the format wrote and cannot
+  carry the claim. The mount is read-only by construction — a fresh volume's reclaim queue is empty, so
+  `reclaim_drain` returns without committing — and costs the same 1 MiB the format released one statement
+  earlier. Terminator `=> UNAFS-VERIFIED ::`, distinct from the per-file `=> VERIFIED ::`.
+- **Floor: 12 blocks.** A p2 span below it is an honest SKIP (the install continues and still ends `=> PASS`,
+  with `p2 UNAOS-DATA = NO NATIVE VOLUME` in the verdict), not a failure. 12 is measured against this build:
+  1–2 blocks fail `Superblock::validate` ("volume too small"), 3–11 fail the format commit with `NoSpace`. It
+  matters because `install/gpt.rs` can emit a **1-sector** data partition — a card of exactly 133,154 sectors
+  gives `last_usable = 133,120`, a full 64 MiB ESP at 2048..133,119, and a 1 MiB-aligned data start of 133,120,
+  i.e. `data_first == data_last` — which is 0 whole blocks, and would otherwise reach
+  `Superblock::new(0).validate()` and fail an install that previously succeeded.
 
 **Byte-identity.** Every INSTALL-2 line — including the `Card` `Clone`/`Copy` derive and the stash — is
 `install_target`-gated (`fat32.rs`'s additions live in the `install` module, itself compiled only under

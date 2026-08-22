@@ -1434,6 +1434,526 @@ mod metal {
         }
     }
 
+    // ══════════════════════════════════════════════════════════════════════════════════════════════════
+    // TEGRA-UNAFS-FMT (M4.2 / M4.3 / M4.4) — the NATIVE volume on partition 2.
+    //
+    // The installer wrote two GPT partitions from its first rung and only ever populated the first
+    // (`UNAOS-ESP`, FAT32). `UNAOS-DATA` was carved and then left raw. This section closes that gap:
+    // a `unafs::storage::BlockDevice` over the SAME armed CMD24/CMD25 primitives the rest of the
+    // installer writes through, a sizing policy that keeps the volume's in-RAM refcount map inside
+    // the kernel heap, and a pre-write refusal that fires BEFORE the GPT is committed.
+    //
+    // ## Why this bridge does NOT go through `drivers::block`
+    //
+    // `drivers::block::write_block_tegra_sd` refuses in EVERY cfg by design — registering the card as
+    // a block backend must not open a fourth door past the `sdmmc` → `sdmmc_arm` → `install_target`
+    // ladder, and that refusal propagates into `fs::unafs`'s `handle_write(TegraSd)` arm and into
+    // `fs::fat`. Nothing here weakens it: this device is a PRIVATE adapter over `SdInstallTarget`,
+    // constructed only inside `install_flow`, never registered as a block backend, and compiled out
+    // entirely without `install_target`. The card's only write door is still the three-gate ladder.
+    //
+    // ## The sizing constraint (M4.3), derived
+    //
+    // `RefMap::try_new(block_count)` holds TWO `Vec<u32>` views (current + frozen) = **8 bytes per
+    // 4096 B volume block**, and `UnaFS::mount` re-derives that size from the SUPERBLOCK's
+    // `block_count`, not from the partition span — which is exactly what makes a capped volume inside
+    // a larger partition mount correctly later.
+    //
+    // On the bench card (62,333,952 sectors) the GPT above yields `UNAOS-DATA` = LBA 133,120 ..
+    // 62,333,918 = 62,200,799 sectors = 7,775,099 whole blocks. A full-span volume would therefore
+    // need 62,200,792 B ≈ **59.3 MiB** of refmap against an aarch64 `allocator::HEAP_SIZE` of 48 MiB
+    // (50,331,648 B) — **1.24× the entire heap**. Format and mount would BOTH fail.
+    //
+    // So the volume is capped at [`UNAFS_CAP_BLOCKS`] = 512 MiB = 131,072 blocks → 1,048,576 B =
+    // 1 MiB of refmap = 2.0 % of the heap. The cap is applied AT THE ADAPTER (`block_count` on the
+    // device below), not by carving a third GPT entry — `install/gpt.rs` is a shared file.
+    //
+    // ### Why 512 MiB and not something larger
+    //
+    // The cap is not only a heap budget — it sets the RECURRING cost of the volume on every later
+    // boot, and it picks which refcount-map SHAPE the card carries:
+    //
+    // * **Boot-path read cost.** `main.rs`'s ORIN-UNAFS-ROOT rung-4 probe-mount is gated on the
+    //   `sdmmc` feature, NOT on `install_target`, so it mounts this volume on EVERY sdmmc boot.
+    //   `UnaFS::mount` → `load_committed` reads the refmap index plus every refmap LEAF, and that
+    //   path runs through `unafs::adapter::BlockAdapter`, whose `read_block` issues EIGHT separate
+    //   512 B `read_sector` calls per 4096 B block (it has no multi-block door — unlike
+    //   [`SdUnafsDevice`] below, which sits on `SdInstallTarget`'s CMD18/CMD25 path). Leaves scale
+    //   as `block_count / 1024`: at 512 MiB that is 128 leaves + 1 index ≈ 1,032 polled CMD17
+    //   transfers at EL2 per boot; at 4 GiB it would be 1,024 leaves + 1 index + 2 mid blocks
+    //   ≈ 8,216. An 8× standing tax on every boot for capacity nothing uses yet.
+    // * **Refcount-map shape.** 131,072 ≤ `superblock::MAX_BLOCK_COUNT_ONE_LEVEL` (524,288), so the
+    //   volume is SINGLE-LEVEL: one index block of leaf pointers, the shape v3/v4 always had and the
+    //   shape every existing volume in the tree uses. A 4 GiB cap crosses that line and would put the
+    //   two-level index-of-indexes path (v5, host-tested only) on metal for the first time, on the
+    //   boot path, on the same landing that first writes the volume at all. The const assertion under
+    //   [`UNAFS_CAP_BLOCKS`] holds the single-level property structurally rather than by comment.
+    //
+    // 512 MiB is far more space than the native volume has any consumer for today, and the cap is a
+    // POLICY number in one place: raising it is a one-line change once a consumer and a multi-block
+    // read path exist.
+    //
+    // `UnaFS::format` does refuse a too-large volume cleanly (`StorageError::AllocRefused` out of
+    // `RefMap::try_new`), but it would do so AFTER the GPT and the FAT32 ESP had already been
+    // written — a half-installed card. [`unafs_sizing_guard`] therefore runs the same arithmetic
+    // BEFORE the first byte of the GPT, on a whole-card upper bound, and refuses with a named witness
+    // line while the card is still untouched. What that gives is an ORDERING guarantee (the refusal
+    // lands before the first write), NOT a proof that the later format cannot fail — see the guard's
+    // own docblock for exactly what it does and does not establish.
+    // ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+    /// 512 B sectors per 4096 B UnaFS block (8) — the crate's own constant, bound locally so the
+    /// arithmetic in this section reads without a jump.
+    #[cfg(feature = "install_target")]
+    const UNAFS_SECTORS_PER_BLOCK: u64 = ::unafs::adapter::SECTORS_PER_BLOCK;
+
+    /// M4.3 — the volume SIZING CAP in 4096 B blocks: 512 MiB (131,072 blocks). See the section
+    /// header for the full derivation; the short form is three numbers. The in-RAM refcount map costs
+    /// [`UNAFS_REFMAP_BYTES_PER_BLOCK`] per volume block against a 48 MiB aarch64 heap, so a
+    /// full-span volume on the bench card would need 1.24× the whole heap (at the cap the map is
+    /// 1 MiB = 2.0 %). The rung-4 probe-mount re-reads every refmap leaf on EVERY sdmmc boot through
+    /// a single-sector adapter, so leaf count is a per-boot cost (128 leaves here, 1,024 at 4 GiB).
+    /// And 131,072 keeps the volume inside `MAX_BLOCK_COUNT_ONE_LEVEL`, i.e. single-level.
+    ///
+    /// A card whose data partition is SMALLER than the cap gets the whole partition.
+    #[cfg(feature = "install_target")]
+    const UNAFS_CAP_BLOCKS: u64 = 512 * 1024 * 1024 / ::unafs::storage::BLOCK_SIZE;
+
+    /// The cap in MiB — printed by the witness lines, so the number an operator reads and the number
+    /// the code enforces are the same expression.
+    #[cfg(feature = "install_target")]
+    const UNAFS_CAP_MIB: u64 = UNAFS_CAP_BLOCKS * ::unafs::storage::BLOCK_SIZE / (1024 * 1024);
+
+    /// The SINGLE-LEVEL property, held structurally. A volume at or under
+    /// `superblock::MAX_BLOCK_COUNT_ONE_LEVEL` (524,288 blocks = 2 GiB) uses one refmap index block
+    /// of leaf pointers; past it the map becomes a two-level index-of-indexes (v5). Raising
+    /// [`UNAFS_CAP_BLOCKS`] past that line is a real decision — it puts a code path this platform has
+    /// never run on the boot path — so it must break the build rather than pass silently.
+    #[cfg(feature = "install_target")]
+    const _: () = assert!(
+        UNAFS_CAP_BLOCKS <= ::unafs::superblock::MAX_BLOCK_COUNT_ONE_LEVEL,
+        "UNAFS_CAP_BLOCKS past MAX_BLOCK_COUNT_ONE_LEVEL would make the p2 volume two-level"
+    );
+
+    /// In-RAM refcount-map cost per volume block: TWO `Vec<u32>` views (`current` + `frozen`) in
+    /// `unafs::refmap::RefMap`, i.e. 4 + 4 bytes. This is the number the whole sizing policy turns on.
+    #[cfg(feature = "install_target")]
+    const UNAFS_REFMAP_BYTES_PER_BLOCK: u64 = 8;
+
+    /// The share of `allocator::HEAP_SIZE` the refcount map is allowed to claim. The map is a
+    /// permanent resident of a mounted volume and the heap serves everything else too, so a quarter
+    /// is the stated ceiling; at the 512 MiB cap the map takes 2.0 %, far inside it.
+    #[cfg(feature = "install_target")]
+    const UNAFS_REFMAP_HEAP_PERCENT: u64 = 25;
+
+    /// The smallest volume `UnaFS::format` can actually build, in 4096 B blocks — MEASURED against
+    /// this build of the crate, not guessed: a host harness formatted every size from 1 upward and
+    /// 12 is the first that both formats and mounts back. 1–2 blocks fail
+    /// `Superblock::validate` ("volume too small", its own floor is 3) and 3–11 blocks fail the
+    /// format commit itself with `NoSpace` — the format writes 12 blocks before it can commit
+    /// generation 1 (superblock, root area, 4 reserved inodes, 2 system-object data blocks, imap
+    /// index + leaf, refmap index + leaf).
+    ///
+    /// This is a SKIP threshold, not a refusal: below it the card simply gets no native volume, and
+    /// the install continues. `install/gpt.rs` really can emit a data partition this small —
+    /// a card of exactly 133,154 sectors yields `data_first == data_last == 133,120`, one sector,
+    /// zero blocks — and before this floor existed that card installed fine until this rung turned
+    /// its 0-block volume into `Superblock::new(0).validate()` and failed the whole install.
+    #[cfg(feature = "install_target")]
+    const UNAFS_MIN_VOLUME_BLOCKS: u64 = 12;
+
+    /// The `unafs_sizing_guard` gate tags. Each witness line carries a UNIQUE token so a boot-spec
+    /// REQUIRE pattern can name exactly one of the two calls; the parenthesised prose is for the
+    /// operator, the `SIZING-GATE-n` token is for the matcher.
+    #[cfg(feature = "install_target")]
+    const UNAFS_GATE_PRE_GPT: &str = "SIZING-GATE-1 (pre-GPT whole-card upper bound)";
+    #[cfg(feature = "install_target")]
+    const UNAFS_GATE_P2: &str = "SIZING-GATE-2 (p2 UNAOS-DATA span)";
+
+    /// `n/d` as (whole percent, tenths digit) — integer-only, for witness lines that must print a
+    /// percentage a comment can quote EXACTLY. Plain `n * 100 / d` truncates (the 512 MiB cap's
+    /// 2.083 % printed as "2", which no comment saying "~2 %" would match character for character);
+    /// one decimal place makes the printed value and the documented value the same string.
+    #[cfg(feature = "install_target")]
+    fn unafs_pct_tenths(n: u64, d: u64) -> (u64, u64) {
+        if d == 0 {
+            return (0, 0);
+        }
+        let tenths = n.saturating_mul(1000) / d;
+        (tenths / 10, tenths % 10)
+    }
+
+    /// M4.3 — the PRE-WRITE sizing bound, and the one place the policy arithmetic lives.
+    ///
+    /// Returns the block count a UnaFS volume would be given for a span of `span_sectors`:
+    /// `min(span_sectors / 8, UNAFS_CAP_BLOCKS)`. Refuses — with a named witness line and WITHOUT
+    /// touching the card — when the resulting refcount map would exceed
+    /// [`UNAFS_REFMAP_HEAP_PERCENT`] of the kernel heap.
+    ///
+    /// Called TWICE on purpose. First from the top of [`install_flow`] with the whole-card capacity,
+    /// which is an UPPER BOUND on any partition inside it, so the refusal lands before the GPT write
+    /// rather than on a half-installed card. Second at the real partition span, where the number it
+    /// returns is the volume's actual `block_count`. `gate` names which call is speaking, and each
+    /// tag is unique so a spec pattern can address one call and not the other.
+    ///
+    /// ## What this guard does NOT prove
+    ///
+    /// Passing the first call does **not** prove the later format cannot fail for heap reasons, and
+    /// no wording here should suggest it does. Two independent reasons:
+    ///
+    /// * The comparison is against `allocator::HEAP_SIZE` — the heap's TOTAL size, a compile-time
+    ///   constant — never against the heap's FREE bytes at the moment of the format. Everything the
+    ///   boot already allocated is invisible to it.
+    /// * The allocator is a `linked_list_allocator::Heap`. `RefMap::try_new` needs TWO CONTIGUOUS
+    ///   multi-MiB runs (`current` and `frozen`), and fragmentation can refuse a 1 MiB contiguous
+    ///   request with far more than 1 MiB free.
+    ///
+    /// What it DOES give is an ordering guarantee and a static bound: an over-large geometry is
+    /// rejected while the card is still exactly as it was found, and the cap keeps the request small
+    /// relative to the heap. A heap-pressure failure at format time remains possible and is handled
+    /// where it lands — `UnaFS::format` returns `AllocRefused` and [`format_unafs_volume`] fails the
+    /// install with a named line, fail-closed.
+    ///
+    /// With [`UNAFS_CAP_BLOCKS`] at 131,072 the refusal branch is currently UNREACHABLE by
+    /// arithmetic: `planned ≤ 131,072` ⇒ `refmap ≤ 1,048,576 B` against a limit of 12,582,900 B, so
+    /// it can only fire if `allocator::HEAP_SIZE` ever drops below ~4,194,400 B. It is kept as the
+    /// future-proofing bound it is — the cap and the heap size are independent knobs, and this is
+    /// what makes raising either one fail loudly instead of silently over-committing RAM.
+    ///
+    /// `InstallError::NoSpace` is the refusal code: this file's lane cannot add a variant to the
+    /// shared `install::InstallError`, and "no space for the request" is the closest true statement —
+    /// the space that is missing is the heap's, not the card's, and the witness line says so.
+    #[cfg(feature = "install_target")]
+    fn unafs_sizing_guard(span_sectors: u64, gate: &str) -> Result<u64, crate::install::InstallError> {
+        let planned = core::cmp::min(span_sectors / UNAFS_SECTORS_PER_BLOCK, UNAFS_CAP_BLOCKS);
+        let refmap = planned.saturating_mul(UNAFS_REFMAP_BYTES_PER_BLOCK);
+        let heap = crate::allocator::HEAP_SIZE as u64;
+        let limit = heap / 100 * UNAFS_REFMAP_HEAP_PERCENT;
+        let (pct, tenth) = unafs_pct_tenths(refmap, heap);
+        if refmap > limit {
+            serial_println!(
+                "{}   INSTALL: UNAFS {} => REFUSED — {} blk would need {} B of in-RAM refmap ({} B/blk) = {}.{}% of the {} B kernel heap, over the {} B limit ({}%); NOTHING was written to the card ::",
+                PS, gate, planned, refmap, UNAFS_REFMAP_BYTES_PER_BLOCK, pct, tenth, heap,
+                limit, UNAFS_REFMAP_HEAP_PERCENT
+            );
+            return Err(crate::install::InstallError::NoSpace);
+        }
+        serial_println!(
+            "{}   INSTALL: UNAFS {} => OK — cap {} blk ({} MiB), planned {} blk, refmap {} B = {}.{}% of the {} B heap (limit {}% = {} B) ::",
+            PS, gate, UNAFS_CAP_BLOCKS, UNAFS_CAP_MIB, planned, refmap, pct, tenth, heap,
+            UNAFS_REFMAP_HEAP_PERCENT, limit
+        );
+        Ok(planned)
+    }
+
+    /// M4.2 — a `unafs::storage::BlockDevice` over the armed Tegra SD write path.
+    ///
+    /// One 4096 B UnaFS block is the eight contiguous 512 B sectors at `base_lba + id * 8`, exactly
+    /// as `unafs::adapter::BlockAdapter` maps them; `block_count` bounds the exposed volume and is
+    /// the CAPPED figure (see the section header), so the volume is smaller than the partition that
+    /// holds it by construction. All of the offset arithmetic is `checked_*`, so a hostile or corrupt
+    /// span can never wrap into an in-bounds sector.
+    ///
+    /// The I/O goes through [`SdInstallTarget`]'s `InstallTarget` methods, which means a whole-block
+    /// access is ONE 8-block CMD25/CMD18 multi-block transfer and a 512 B access is ONE CMD24/CMD17
+    /// single-block command. Nothing here is registered as a `drivers::block` backend.
+    #[cfg(feature = "install_target")]
+    struct SdUnafsDevice<'t, 'c> {
+        t: &'t mut SdInstallTarget<'c>,
+        /// The partition's first LBA — every block id is relative to this.
+        base_lba: u64,
+        /// The volume's block count (the CAPPED figure, not the partition's).
+        block_count: u64,
+    }
+
+    #[cfg(feature = "install_target")]
+    impl SdUnafsDevice<'_, '_> {
+        /// Absolute LBA of `sector` within block `id`, fully bound-checked.
+        fn lba_for(&self, id: u64, sector: u64) -> Result<u64, ::unafs::storage::Error> {
+            if id >= self.block_count {
+                return Err(::unafs::storage::Error::OutOfBounds(id));
+            }
+            id.checked_mul(UNAFS_SECTORS_PER_BLOCK)
+                .and_then(|s| s.checked_add(sector))
+                .and_then(|s| self.base_lba.checked_add(s))
+                .ok_or(::unafs::storage::Error::OutOfBounds(id))
+        }
+
+        fn dev_read(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), crate::install::InstallError> {
+            use crate::install::InstallTarget;
+            self.t.read_sectors(lba, buf)
+        }
+
+        fn dev_write(&mut self, lba: u64, buf: &[u8]) -> Result<(), crate::install::InstallError> {
+            use crate::install::InstallTarget;
+            self.t.write_sectors(lba, buf)
+        }
+    }
+
+    #[cfg(feature = "install_target")]
+    impl ::unafs::storage::BlockDevice for SdUnafsDevice<'_, '_> {
+        fn read_block(&mut self, id: u64, buf: &mut [u8]) -> Result<(), ::unafs::storage::Error> {
+            if buf.len() as u64 != ::unafs::storage::BLOCK_SIZE {
+                return Err(::unafs::storage::Error::BadBlockSize(
+                    buf.len(),
+                    ::unafs::storage::BLOCK_SIZE,
+                ));
+            }
+            let lba = self.lba_for(id, 0)?;
+            self.dev_read(lba, buf).map_err(|e| {
+                ::unafs::storage::Error::Io(alloc::format!("tegra sd read blk {} @LBA {}: {:?}", id, lba, e))
+            })
+        }
+
+        fn write_block(&mut self, id: u64, buf: &[u8]) -> Result<(), ::unafs::storage::Error> {
+            if buf.len() as u64 != ::unafs::storage::BLOCK_SIZE {
+                return Err(::unafs::storage::Error::BadBlockSize(
+                    buf.len(),
+                    ::unafs::storage::BLOCK_SIZE,
+                ));
+            }
+            let lba = self.lba_for(id, 0)?;
+            self.dev_write(lba, buf).map_err(|e| {
+                ::unafs::storage::Error::Io(alloc::format!("tegra sd write blk {} @LBA {}: {:?}", id, lba, e))
+            })
+        }
+
+        fn block_count(&self) -> u64 {
+            self.block_count
+        }
+
+        /// LOAD-BEARING NO-OP, for the same reason `fs::unafs`'s `SdSectorDevice::flush` is one:
+        /// every write below is SYNCHRONOUS-TO-MEDIUM. Both `write_block_at` (CMD24) and
+        /// `write_blocks_at` (CMD25) wait for `ST_DAT_INHIBIT` to clear — the card releasing DAT0
+        /// after its internal programming — before returning, so by the time the crate calls this as
+        /// its pre-root-flip barrier every fresh block is already on the card. The copy-on-write
+        /// guarantee ("the old tree or the new one, never a hybrid") rests on exactly that. If the
+        /// Tegra write path ever gains DMA-deferred completion or a write cache, this MUST become a
+        /// real drain.
+        fn flush(&mut self) -> Result<(), ::unafs::storage::Error> {
+            Ok(())
+        }
+
+        /// The K8a ROOT-FLIP primitive: ONE real 512 B sector write to the medium.
+        ///
+        /// The trait's default is a read-modify-write of the whole 4096 B block, which would be a
+        /// CORRECTNESS BUG here — the commit's atomic point must be a single-sector write, and an
+        /// RMW would put the other seven sectors of the root block back on the card alongside it.
+        /// The single-block CMD24 path serves this natively (a 512 B `write_sectors` call takes the
+        /// `n == 1` arm of [`SdInstallTarget::write_sectors`]), so the override is exact rather than
+        /// emulated — the same property `BlockAdapter::write_sector_in_block` provides on the pi.
+        fn write_sector_in_block(
+            &mut self,
+            id: u64,
+            sector: usize,
+            buf: &[u8],
+        ) -> Result<(), ::unafs::storage::Error> {
+            if buf.len() as u64 != ::unafs::adapter::SECTOR_SIZE {
+                return Err(::unafs::storage::Error::BadBlockSize(
+                    buf.len(),
+                    ::unafs::adapter::SECTOR_SIZE,
+                ));
+            }
+            if sector as u64 >= UNAFS_SECTORS_PER_BLOCK {
+                return Err(::unafs::storage::Error::OutOfBounds(id));
+            }
+            let lba = self.lba_for(id, sector as u64)?;
+            self.dev_write(lba, buf).map_err(|e| {
+                ::unafs::storage::Error::Io(alloc::format!(
+                    "tegra sd root-flip blk {} sec {} @LBA {}: {:?}", id, sector, lba, e
+                ))
+            })
+        }
+    }
+
+    /// M4.4 — format partition 2 (`UNAOS-DATA`) as a native UnaFS volume, then PROVE it off the card
+    /// by MOUNTING it.
+    ///
+    /// Returns the volume's block count, or 0 when the GPT layout carried no usable data partition
+    /// (see [`UNAFS_MIN_VOLUME_BLOCKS`] — a span too small for a volume is an honest skip, never an
+    /// install failure).
+    ///
+    /// ## The proof is a mount
+    ///
+    /// The static superblock is re-read first, for a precise diagnostic (magic / parse /
+    /// `block_count`) at the cost of one block. But the guarantee this step claims is that the
+    /// volume WORKS, and re-reading two of the ~139 blocks the format wrote cannot carry that claim:
+    /// it never touches the inode map, the refcount-map index, or any of its leaves. So the step
+    /// then calls `UnaFS::mount` on a fresh handle over the same span. That reads and bound-validates
+    /// the root record, the imap index and every imap leaf, the refmap index and every refmap leaf,
+    /// and rebuilds the refcount map from what is actually on the card — and `ls(ROOT_INODE_ID)`
+    /// afterwards walks the root directory through that reconstructed state. A volume that mounts
+    /// and lists is proven; a volume whose superblock parses is not.
+    ///
+    /// The mount is READ-ONLY here by construction: `UnaFS::mount` writes only via `reclaim_drain`,
+    /// which returns early on an empty reclaim queue, and a freshly formatted volume's queue is empty
+    /// by definition. It costs the ~1 MiB of heap the refcount map takes at the cap — the same 1 MiB
+    /// `drop(fs)` released one statement earlier, and the same 1 MiB [`unafs_sizing_guard`] licensed.
+    ///
+    /// The whole verification runs THROUGH THE SAME TARGET the format wrote through, so what is
+    /// checked is what is on the medium, not what is in RAM.
+    #[cfg(feature = "install_target")]
+    fn format_unafs_volume(
+        t: &mut SdInstallTarget,
+        layout: &crate::install::gpt::GptLayout,
+    ) -> Result<u64, crate::install::InstallError> {
+        use ::unafs::storage::BlockDevice as _;
+        use crate::install::InstallError;
+
+        // ONE skip clause, on the BLOCK COUNT rather than on `data_first_lba` alone. `install/gpt.rs`
+        // can carve a data partition of a single sector — a card of exactly 133,154 sectors puts
+        // `data_first == data_last == 133,120`, since the ESP takes its full 64 MiB and the 1 MiB
+        // alignment lands the data start on the last usable LBA — and 1 sector is 0 whole blocks.
+        // Testing only `data_first_lba == 0` let that card through to a 0-block volume, where
+        // `UnaFS::format` falls back to `size_mb` (also 0) and `Superblock::new(0).validate()` fails
+        // "volume too small": a card that installed cleanly before this rung existed would fail its
+        // whole install because of it. Everything under the floor is skipped, and the install goes on.
+        let part_sectors = if layout.data_first_lba == 0 || layout.data_last_lba < layout.data_first_lba
+        {
+            0
+        } else {
+            layout.data_last_lba - layout.data_first_lba + 1
+        };
+        let part_blocks = part_sectors / UNAFS_SECTORS_PER_BLOCK;
+        if part_blocks < UNAFS_MIN_VOLUME_BLOCKS {
+            serial_println!(
+                "{}   INSTALL: UNAFS p2 SKIPPED — the GPT layout's UNAOS-DATA span is {} sectors = {} blk, under the {} blk floor a UnaFS format needs; p2 left raw, the install continues ::",
+                PS, part_sectors, part_blocks, UNAFS_MIN_VOLUME_BLOCKS
+            );
+            return Ok(0);
+        }
+
+        // The cap is applied HERE, at the adapter's block_count — not by carving a third GPT entry
+        // (`install/gpt.rs` is a shared file). The partition keeps its full span; the volume inside
+        // it is smaller, and `UnaFS::mount` sizes its refmap from the SUPERBLOCK, so that is sound.
+        let blocks = unafs_sizing_guard(part_sectors, UNAFS_GATE_P2)?;
+        let refmap_bytes = blocks * UNAFS_REFMAP_BYTES_PER_BLOCK;
+        let volume_mib = blocks * ::unafs::storage::BLOCK_SIZE / (1024 * 1024);
+        // Say "CAPPED" only when the cap actually bit: on a card whose data partition is smaller than
+        // [`UNAFS_CAP_BLOCKS`] the volume spans the whole partition and nothing was capped.
+        if blocks < part_blocks {
+            serial_println!(
+                "{}   INSTALL: UNAFS formatting p2 UNAOS-DATA — LBA {}..{} = {} sectors = {} blk; volume CAPPED to {} blk ({} MiB), refmap {} B ::",
+                PS, layout.data_first_lba, layout.data_last_lba, part_sectors, part_blocks,
+                blocks, volume_mib, refmap_bytes
+            );
+        } else {
+            serial_println!(
+                "{}   INSTALL: UNAFS formatting p2 UNAOS-DATA — LBA {}..{} = {} sectors = {} blk; volume UNCAPPED at the full {} blk ({} MiB), refmap {} B ::",
+                PS, layout.data_first_lba, layout.data_last_lba, part_sectors, part_blocks,
+                blocks, volume_mib, refmap_bytes
+            );
+        }
+
+        // The format itself. Scoped so the mount is dropped (and its device borrow released) before
+        // the verification re-opens the same span on a fresh handle.
+        {
+            let dev = SdUnafsDevice {
+                t: &mut *t,
+                base_lba: layout.data_first_lba,
+                block_count: blocks,
+            };
+            // `size_mb` is only consulted when the device reports 0 blocks. Ours cannot: the
+            // [`UNAFS_MIN_VOLUME_BLOCKS`] floor above already returned for anything under 12, so
+            // `block_count` here is >= 12 by construction. (It is exactly the fallback this file used
+            // to walk into — a 1-sector data partition gave 0 blocks AND `size_mb` 0, and
+            // `Superblock::new(0).validate()` failed the install.) Passed as the true figure so the
+            // call site does not read as a lie even though it is never consulted.
+            let size_mb = blocks * ::unafs::storage::BLOCK_SIZE / (1024 * 1024);
+            match ::unafs::UnaFS::format(dev, size_mb) {
+                Ok(fs) => drop(fs),
+                Err(e) => {
+                    serial_println!("{}   INSTALL: UNAFS format of p2 => FAIL ({:?}) ::", PS, e);
+                    return Err(InstallError::Io);
+                }
+            }
+        }
+
+        // ── Step 1: the static superblock, for a precise diagnostic ──
+        // One block. `UnaFS::mount` below re-does all of this, but it collapses every shape of
+        // failure into one `FileSystemError`; these three checks name which one it was.
+        let sb = {
+            let mut dev = SdUnafsDevice {
+                t: &mut *t,
+                base_lba: layout.data_first_lba,
+                block_count: blocks,
+            };
+            let mut blk0 = alloc::vec![0u8; ::unafs::storage::BLOCK_SIZE as usize];
+            if let Err(e) = dev.read_block(0, &mut blk0) {
+                serial_println!("{}   INSTALL: UNAFS superblock re-read => FAIL ({:?}) ::", PS, e);
+                return Err(InstallError::Io);
+            }
+            if blk0[..::unafs::superblock::MAGIC.len()] != ::unafs::superblock::MAGIC {
+                serial_println!(
+                    "{}   INSTALL: UNAFS superblock magic ABSENT at p2 block 0 => FAIL ::",
+                    PS
+                );
+                return Err(InstallError::VerifyFailed);
+            }
+            let sb = match ::unafs::superblock::Superblock::from_bytes(&blk0) {
+                Ok(sb) => sb,
+                Err(e) => {
+                    serial_println!("{}   INSTALL: UNAFS superblock parse => FAIL ({:?}) ::", PS, e);
+                    return Err(InstallError::VerifyFailed);
+                }
+            };
+            if sb.block_count != blocks {
+                serial_println!(
+                    "{}   INSTALL: UNAFS superblock block_count {} != the {} blk formatted => FAIL ::",
+                    PS, sb.block_count, blocks
+                );
+                return Err(InstallError::VerifyFailed);
+            }
+            sb
+        };
+
+        // ── Step 2: THE PROOF — mount the volume off the card ──
+        // Everything the format wrote that matters is read back here: the A/B root record (its
+        // checksum and its non-zero generation are `RootRecord::from_sector`'s own preconditions, so
+        // a mount that succeeds cannot be holding an uncommitted root — there is no separate
+        // generation check to make), the imap index and leaves, the refmap index and every refmap
+        // leaf, each bound-validated against the superblock's own `block_count`. `ls` then walks the
+        // root directory through the state that reconstruction produced.
+        let mut fs = match ::unafs::UnaFS::mount(SdUnafsDevice {
+            t: &mut *t,
+            base_lba: layout.data_first_lba,
+            block_count: blocks,
+        }) {
+            Ok(fs) => fs,
+            Err(e) => {
+                serial_println!(
+                    "{}   INSTALL: UNAFS p2 volume MOUNT-BACK => FAIL ({:?}) — the superblock parsed but the volume does not mount ::",
+                    PS, e
+                );
+                return Err(InstallError::VerifyFailed);
+            }
+        };
+        let entries = match fs.ls(::unafs::superblock::ROOT_INODE_ID) {
+            Ok(v) => v.len(),
+            Err(e) => {
+                serial_println!(
+                    "{}   INSTALL: UNAFS p2 root directory listing => FAIL ({:?}) — the volume mounted but its root inode does not read ::",
+                    PS, e
+                );
+                return Err(InstallError::VerifyFailed);
+            }
+        };
+        let generation = fs.root_generation();
+        let free = fs.free_blocks();
+        // One mount at a time on this span, and the device borrow of `t` ends here.
+        drop(fs);
+
+        let heap = crate::allocator::HEAP_SIZE as u64;
+        let (pct, tenth) = unafs_pct_tenths(refmap_bytes, heap);
+        let refmap_leaves = blocks.div_ceil(::unafs::refmap::REFS_PER_LEAF);
+        serial_println!(
+            "{}   INSTALL: UNAFS p2 volume MOUNTED BACK off the card — v{} magic ok, {} blk ({} MiB) at LBA {}, refmap {} B ({}.{}% of the {} B heap) rebuilt from {} leaf blk + 1 index blk (single-level), root gen {}, {} free blk, root dir lists {} entries => UNAFS-VERIFIED ::",
+            PS, sb.version, sb.block_count, volume_mib, layout.data_first_lba,
+            refmap_bytes, pct, tenth, heap, refmap_leaves, generation, free, entries
+        );
+        Ok(blocks)
+    }
+
     /// The DEFERRED install entry point (ORIN-INSTALL-2). Called from the boot sequence AFTER the JB2b
     /// pump window has enumerated the USB boot stick as a block device — the position where the running
     /// system's real boot payload is readable (`drivers::block::info()` is Some). Consumes the card
@@ -1491,10 +2011,27 @@ mod metal {
 
         let mut t = SdInstallTarget { base, card };
         match install_flow(&mut t) {
-            Ok(n) => serial_println!(
-                "{} ORIN-INSTALL-2 SD install — gpt+zero+fat32+clone({} files) verify => PASS ::",
-                PS, n
-            ),
+            Ok((n, unafs_blocks)) => {
+                // M4.4: the verdict names BOTH volumes — the ESP the clone populated and the native
+                // UnaFS volume on partition 2. A card whose data span is absent or below the format
+                // floor says so rather than reporting a zero-block volume as if it existed.
+                let p2 = if unafs_blocks == 0 {
+                    alloc::string::String::from(
+                        "p2 UNAOS-DATA = NO NATIVE VOLUME (span absent or below the format floor)",
+                    )
+                } else {
+                    alloc::format!(
+                        "p2 UNAOS-DATA = UnaFS v{} ({} blk / {} MiB, mounted back off the card)",
+                        ::unafs::superblock::VERSION,
+                        unafs_blocks,
+                        unafs_blocks * ::unafs::storage::BLOCK_SIZE / (1024 * 1024)
+                    )
+                };
+                serial_println!(
+                    "{} ORIN-INSTALL-2 SD install — gpt+zero+fat32+clone({} files)+unafs verify => PASS — p1 UNAOS-ESP = FAT32 ({} files sha-verified) · {} ::",
+                    PS, n, n, p2
+                );
+            }
             Err(e) => serial_println!("{} ORIN-INSTALL-2 SD install => FAIL ({:?}) ::", PS, e),
         }
     }
@@ -1509,12 +2046,23 @@ mod metal {
         size: usize,
     }
 
-    /// The engine driver: returns the number of files cloned (so `?` early-returns land on the single
-    /// FAIL line above). Mounts the USB boot stick and mirrors its ESP tree onto the freshly-formatted
-    /// microSD ESP, sha-extent-verifying every copied file.
+    /// The engine driver: returns `(files cloned, UnaFS block count)` — so `?` early-returns land on
+    /// the single FAIL line above, and the verdict can name both volumes. Mounts the USB boot stick
+    /// and mirrors its ESP tree onto the freshly-formatted microSD ESP, sha-extent-verifying every
+    /// copied file, then formats partition 2 as a native UnaFS volume.
     #[cfg(feature = "install_target")]
-    fn install_flow(t: &mut SdInstallTarget) -> Result<usize, crate::install::InstallError> {
+    fn install_flow(t: &mut SdInstallTarget) -> Result<(usize, u64), crate::install::InstallError> {
         use crate::install::{fat32, gpt, verify_extents, InstallError, InstallTarget};
+
+        // 0) M4.3 — THE SIZING BOUND, BEFORE THE FIRST BYTE. The card capacity is an upper bound on
+        //    any partition the GPT below can carve, so an over-large geometry is rejected here, while
+        //    the card is still exactly as it was found. ORDERING is the whole point: `UnaFS::format`
+        //    would refuse cleanly on its own (`AllocRefused`), but only AFTER the GPT and the ESP had
+        //    been written, leaving a half-installed card. This is NOT a proof that the later format
+        //    cannot fail for heap reasons — the guard compares against total `HEAP_SIZE`, never free
+        //    heap, and the format still needs two contiguous runs out of a linked-list allocator. See
+        //    `unafs_sizing_guard`'s docblock; a format-time heap failure fails the install, closed.
+        unafs_sizing_guard(t.capacity_sectors(), UNAFS_GATE_PRE_GPT)?;
 
         // 1) GPT: protective MBR + primary/backup + ESP + data, with the engine's own parse-back verify.
         let layout = gpt::write_gpt(t)?;
@@ -1544,6 +2092,12 @@ mod metal {
             "{}   INSTALL: ESP formatted FAT32 — fat_sz={}sec clusters={} data@vol+{} ::",
             PS, geom.fat_sz, geom.count_of_clusters, geom.data_start
         );
+
+        // 3b) THE NATIVE VOLUME (M4.2/M4.3/M4.4): format partition 2 (UNAOS-DATA) as UnaFS over the
+        //     same armed CMD24/CMD25 primitives, then re-read its superblock + root record off the
+        //     card. Runs BEFORE the self-clone so a card that cannot carry the native volume fails
+        //     before the long file-by-file copy, not after it.
+        let unafs_blocks = format_unafs_volume(t, &layout)?;
 
         // 4) THE SELF-CLONE: mount the USB boot stick's own ESP through the in-tree FAT reader and mirror
         //    its whole boot tree onto the microSD ESP. `fs::fat::mount()` reads `drivers::block` — the USB
@@ -1608,7 +2162,7 @@ mod metal {
         // NOTE: the in-tree `fs::fat::mount()` interop self-check the x86 engine witness runs on ITS target
         // is not run on the SD here — `mount()` reads `drivers::block` (the USB source), not this armed SD
         // target. The per-file SD content-verify above IS the by-content proof.
-        Ok(recs.len())
+        Ok((recs.len(), unafs_blocks))
     }
 
     /// Depth-first mirror of a source directory onto the SD `TreeWriter`. Builds THIS directory's cluster
