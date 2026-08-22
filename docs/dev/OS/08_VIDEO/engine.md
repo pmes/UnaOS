@@ -13118,3 +13118,133 @@ Cost on every panel this kernel drives: one `usize` compare per drain against a 
 builder-path artifact built with `UNAOS_WC=1` plus the kepler knobs: the `[wck4] erase clip
 OVERFLOW` literal is ABSENT from that image before this change and PRESENT after — which is the
 whole of the finding, restated as an artifact fact.
+
+## TILEFIT — the tiler's last-resort clamp was idempotent, and two windows shared one box (x86 `wc`, 2026-08-22)
+
+Peter, from the boot-11 metal sitting: *"storm usually should fire up 6 but only managed 5 windows."*
+
+All six launched. All six loaded, got a pid, created a window, took a focus raise, passed `[wc-d]`
+and reported `live=yes` for the rest of the boot. The operator still counted five, and he was right:
+**two of the seven live windows were given the same outer box, to the pixel.**
+
+### The mapping, first — because the join key is a trap
+
+`BGRUN`'s `asid=` is **not** the compositor's asid. `spawn_user_image_bg` returns
+`Ok((pid, mapped.slot as u64, entry))`, so the shell prints the user SLOT, while the window layer is
+armed with `spawn_focus_arm(slot + 1)`. The whole boot-11 storm therefore joins as:
+
+| vug | pid | `BGRUN asid=` (slot) | wm asid | win | content origin |
+|-----|-----|----------------------|---------|-----|----------------|
+| 1 | 38 | 1 | `0x2` | 4 | (807, 85) |
+| 2 | 39 | 2 | `0x3` | 5 | (1597, 85) |
+| 3 | 42 | 3 | `0x4` | 6 | **(17, 826)** |
+| 4 | 47 | 4 | `0x5` | 7 | (807, 826) |
+| 5 | 48 | 5 | `0x6` | 8 | (1597, 826) |
+| 6 | 49 | 6 | `0x7` | 9 | **(17, 826)** |
+
+Six vugs, **five distinct rectangles**. That is the operator's count, on the wire:
+
+```
+[wc-a] create win=6 asid=0x4 surf=128x128 stride=512 scale=6x at (17,826) z=77
+[wc-a] create win=9 asid=0x7 surf=128x128 stride=512 scale=6x at (17,826) z=83
+```
+
+### The mechanism — the clamp saturates, and a new row restarts `cx`
+
+`place` is a greedy left-to-right flow. PULSE-2's last-resort clamp pulls a row back up when `cy`
+walks past the work area:
+
+```rust
+r.y = cy.min(wtop.saturating_add(usable_h.saturating_sub(bh)));
+```
+
+That clamp is **idempotent**. Once the flow overflows, every subsequent row is pinned to the same
+`y` — and because each new row restarts `cx` at `GAP`, the first box of each overflow row comes out
+byte-identical to the first box of the last row that fit.
+
+Boot 11's arithmetic, exactly: panel 2880x1800, `wtop=34` (menu bar), `chrome_h=162`,
+`usable_h=1604`; 128x128 surfaces at `scale=6` give `bw=778`, `bh=812` (`GAP=12`, `BORDER=5`,
+`TITLE_H=34`), so three columns fit. Row 1 sits at `y=85`. Row 2 wants `85+812+12 = 909`, is clamped
+to `34+1604-812 = 826`. Row 3 wants `909+812+12 = 1733`, is clamped to **826 again**, with `cx` back
+at `GAP` — so win 9 landed on win 6 at (17, 826), `778x812`, both.
+
+Seven live tiled windows (the six vugs plus the console-adjacent window already at (17, 85)) in a
+grid with room for six. The seventh had nowhere to go and the clamp gave it somebody else's seat.
+
+The clamp's own note argued that overlap is *"a legibility problem the operator can fix by closing
+one"*. True of PARTIAL overlap. False of an exact alias: `wc_click_route_at` answers with the top
+row, so the covered window cannot be focused, dragged or closed by pointer, and nothing on the panel
+says it is there. This is **"the operator cannot see it"**, not "it does not exist".
+
+### A refuted alternative, recorded because it looks convincing
+
+A parallel reading held that `win=9 asid=0x7` *"was never raised"*, on the strength of `above=no` in
+its `[wcn]` rollups at 110.961 s and 121.482 s. It does not survive the log:
+
+* **win 9 was raised, three times** — `[wc-fv] focus raise asid=0x7 ... top_win=9` at 105.102 s
+  (`z=84`), 111.689 s (`z=92`) and 114.756 s (`z=100`).
+* **`above=` is not "was raised"** — it is `above_shell()`, i.e. `r.z > shell_z`. It answers "is this
+  window above the SHELL right now", which every window fails as soon as the operator clicks the
+  console.
+* **The premise that only win 9 carries it is false** — at 110.961 s win 8 (`asid=0x6`) also reads
+  `above=no`; at 116.430 s wins 5, 6, 7, 8 *and* 9 all read `above=no`.
+* **The timing is wrong** — at 105.102 s, when the operator was counting, win 9 was `z=84` against
+  `shell_z=0`: freshly raised, focused, and the topmost window in the set. A raise-path defect cannot
+  explain a symptom observed while the window is on top.
+
+At that instant it was win 6 (`asid=0x4`, pid 42) that the operator could not see, underneath win 9.
+Later focus churn swaps which of the pair is visible; the defect is the shared box, and it costs
+exactly one visible rectangle for the whole life of the layout. (`wins=9` holds to the end of the
+capture and no `[wc-a] create` fires after 105.102 s, so the alias was permanent.)
+
+### The fix — ask the capacity question, then guarantee uniqueness
+
+Two arms, in `place`:
+
+1. **The capacity search.** `place_scale` is a function of ONE window and the panel; the flow that
+   consumes it is a function of the whole LIVE SET, and nothing asked the second question.
+   `fit_cap` now finds the largest scale cap whose flow fits, by the same predicate the clamp uses
+   (`flow_fits`), and `place` lays out under it. On boot 11's inputs this takes the storm from
+   `scale=6` (3 columns, 3 rows, overflow) to `scale=5` (`bw=650`, `bh=684`, 4 columns, 2 rows,
+   `1380 <= 1604`) — **all seven windows fully visible, none clamped.**
+2. **The cascade.** The floor (`min_width_scale`, WMMINW) may refuse to shrink, so capacity alone
+   cannot be a guarantee. When the clamp does bite, the row now walks UP into the work area — never
+   down, so PULSE-2's reservation is untouched — taking the first candidate whose outer box is not
+   already spoken for this pass. `step` divides the available span by `MAX_WINDOWS`, so enough
+   distinct candidates exist on any real panel and there are at most `MAX_WINDOWS - 1` boxes to
+   avoid.
+
+`fit_cap` returns `usize::MAX` — `scale_in`'s identity cap — whenever the natural layout already
+fits, so **every panel and window count that worked before this arc is byte-identical after it.**
+The search runs only from a create or a close, and only on a layout that was already going to alias.
+
+### The witness — `[wm] tile-fit`
+
+The gap boot 11 exposed is that nothing on the wire said the two boxes were the SAME box; the fact
+was recoverable only by reading six `at (x,y)` fields out of scattered lines and noticing that two
+matched. The verdict now asks that question where the whole layout is visible at once, and names the
+pair. Change-triggered on `[wm] tile-top`'s pattern, emitted with the table released:
+
+```
+[wm] tile-fit n=7 panel=2880x1800 work=34+1604 scale=5 rows=2 shrunk=yes clamped=0 alias=none -> DISTINCT
+```
+
+and, if a layout ever aliases again:
+
+```
+[wm] tile-fit n=7 panel=2880x1800 work=34+1604 scale=6 rows=3 shrunk=no clamped=2 alias=win=6(asid=0x4)/win=9(asid=0x7) at (17,787) 778x812 -> ALIASED
+```
+
+`-> ALIASED` is the red. It is derived from the same `placed` array the cascade consults, so the
+verdict cannot silently disagree with the fix it reports on. **A pre-fix kernel replaying boot 11's
+inputs prints `-> ALIASED` naming win 6 and win 9; this kernel prints `-> DISTINCT`.**
+
+### Gates
+
+`./arroyo check` green both arches · `UNAOS_WC=1 ./arroyo check` green both arches. No QEMU leg (the
+symptom is metal-only: it needs seven live tiled windows on a 2880x1800 panel). The targeted proof is
+a `strings` reachability check on the builder-path artifact built with `UNAOS_WC=1 UNAOS_WITNESS=1`:
+both `[wm] tile-fit` format strings and the `-> DISTINCT` / `ALIASED` tails are present in
+`target/x86_64_esp/kernel.elf`, and `nm` shows `video::wm::place::LAST_SIG` allocated beside the
+pre-existing `place::LAST_TOP` — the witness's own latch, inside the function boot 11 already proves
+runs on metal (`[wc-a] create` is emitted by `place`'s caller immediately after it returns).

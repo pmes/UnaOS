@@ -17729,11 +17729,33 @@ fn work_h(pw: usize, ph: usize) -> usize {
 /// midden's 24x16 readout goes 4x -> 7x (`ceil(148/24)`, box 168 px). Everything already wide enough
 /// is untouched — the 64x64 window stays 3x on the gate panel and 4x on the bench.
 fn place_scale(pw: usize, ph: usize, w: usize, h: usize) -> usize {
-    let usable_h = work_h(pw, ph);
+    scale_in(pw, ph, work_h(pw, ph), w, h, usize::MAX)
+}
+
+/// TILEFIT — [`place_scale`]'s body, with the work-area height HOISTED and a scale CAP threaded
+/// through. Two callers, two reasons, and neither of them changes the rule:
+///
+///  * [`place`] derives `usable_h` once per pass and then asks this question once per row. Before
+///    this split every one of those questions re-entered [`work_h`], and therefore
+///    `ui_status::top_chrome_h`, which on x86-with-`wc` reads `menubar::strip_rect`. The capacity
+///    search below asks the question up to `natural` times MORE often, so the hoist is what keeps
+///    that search free rather than merely cheap.
+///  * `cap` is the capacity search's one lever. It is applied AFTER the legibility cap and BEFORE
+///    the [`min_width_scale`] floor — the same order the three existing terms already stand in:
+///    *fit, cap, THEN floor*. The floor stays the only term that may RAISE the answer, so a
+///    capacity search can never shrink a window out of its own control cluster. It simply stops
+///    being able to help once every row has bottomed out on its floor, which is exactly the residue
+///    the cascade in [`place`] exists to catch.
+///
+/// At `cap == usize::MAX` the `.min(cap.max(1))` is the identity and this function IS the old
+/// `place_scale` body, term for term — which is what makes every panel and window count that fits
+/// today byte-identical after this arc.
+fn scale_in(pw: usize, ph: usize, usable_h: usize, w: usize, h: usize, cap: usize) -> usize {
     (pw / 2 / w.max(1))
         .min(usable_h / 2 / h.max(1))
         .min(legibility_cap(ph))
         .max(1)
+        .min(cap.max(1))
         // WMMINW — the minimum-width floor, applied LAST so it wins over both the fit rule and the
         // legibility cap. `w.max(1)` for the same reason every other term here carries it: a zero
         // width reaches this function through `spawn_geometry`, and `ceil(148/0)` would otherwise
@@ -17806,6 +17828,88 @@ fn min_width_scale(pw: usize, usable_h: usize, w: usize, h: usize) -> usize {
     if c <= fit_scale(pw, usable_h, w, h) { c } else { 1 }
 }
 
+/// TILEFIT — **does the greedy flow fit inside the work area at this scale cap?**
+///
+/// The predicate is written in the SAME terms as [`place`]'s last-resort clamp — `cy` against
+/// `wtop + (usable_h - bh)` — rather than as a second derivation of "the bottom of the last row",
+/// so the search below cannot disagree with the clamp it exists to keep quiet. A `false` here is
+/// exactly "the clamp will bite at least once", and the clamp biting is the whole defect.
+///
+/// Costs one pass over the table (`MAX_WINDOWS` rows of integer arithmetic) and takes no locks: the
+/// caller already holds the table.
+fn flow_fits(t: &Table, pw: usize, ph: usize, wtop: usize, usable_h: usize, cap: usize) -> bool {
+    let mut cx = GAP;
+    let mut cy = wtop + GAP + TITLE_H + BORDER;
+    let mut row_h = 0usize;
+    for i in 0..MAX_WINDOWS {
+        let r = &t.rows[i];
+        if !r.used || r.compat || r.pinned {
+            continue;
+        }
+        let (w, h) = (r.w.max(1), r.h.max(1));
+        let scale = scale_in(pw, ph, usable_h, w, h, cap);
+        let bw = w.saturating_mul(scale).saturating_add(2 * BORDER);
+        let bh = h
+            .saturating_mul(scale)
+            .saturating_add(TITLE_H + 2 * BORDER);
+        if cx.saturating_add(bw) > pw && cx > GAP {
+            cx = GAP;
+            cy = cy.saturating_add(row_h).saturating_add(GAP);
+            row_h = 0;
+        }
+        if cy > wtop.saturating_add(usable_h.saturating_sub(bh)) {
+            return false;
+        }
+        cx = cx.saturating_add(bw).saturating_add(GAP);
+        row_h = row_h.max(bh);
+    }
+    true
+}
+
+/// TILEFIT — **the largest scale cap whose layout fits the work area**, or [`usize::MAX`] when the
+/// natural layout already fits.
+///
+/// ### Why the tiler needs a capacity question at all
+/// [`place_scale`] is a function of ONE window and the panel: *"how big may a window of this surface
+/// get?"*. The flow that consumes it is a function of the whole LIVE SET. Nothing asked the second
+/// question, so the layout could want more rows than the work area has — and the clamp's answer to
+/// that was to pin every overflow row to the same `y` (see [`place`]). The fix is to ask the
+/// question the flow actually needs answered, and the only lever that changes the answer is scale.
+///
+/// ### It returns [`usize::MAX`], not `natural`, for the common case
+/// `usize::MAX` is `scale_in`'s identity cap, so an already-fitting layout takes the exact code path
+/// and the exact arithmetic it took before this arc — no re-derivation, nothing to drift. The search
+/// only runs on a boot that was ALREADY going to alias two windows onto one box.
+///
+/// ### The search is linear and bounded
+/// From `natural - 1` down to 1, at most `legibility_cap(ph)` steps (8 on an 1800p-class panel, 4
+/// below), each one table pass. It runs only from a create or a close, never from a present or a
+/// composite, so it is nowhere near a hot path. `1` is returned when nothing fits: the floor has won
+/// on every row, no cap can help, and [`place`]'s cascade takes it from there.
+fn fit_cap(t: &Table, pw: usize, ph: usize, wtop: usize, usable_h: usize) -> usize {
+    if flow_fits(t, pw, ph, wtop, usable_h, usize::MAX) {
+        return usize::MAX;
+    }
+    // The largest scale any live row would take unbounded — the first cap worth trying is one below
+    // it, because `usize::MAX` has just been refused.
+    let mut natural = 1usize;
+    for i in 0..MAX_WINDOWS {
+        let r = &t.rows[i];
+        if !r.used || r.compat || r.pinned {
+            continue;
+        }
+        natural = natural.max(scale_in(pw, ph, usable_h, r.w.max(1), r.h.max(1), usize::MAX));
+    }
+    let mut cap = natural;
+    while cap > 1 {
+        cap -= 1;
+        if flow_fits(t, pw, ph, wtop, usable_h, cap) {
+            return cap;
+        }
+    }
+    1
+}
+
 fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]) {
     let mut vacated = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
     let mut nv = 0usize;
@@ -17861,6 +17965,22 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
     }
 
     let mut t = table();
+    // TILEFIT — the capacity question, asked ONCE per pass, before a single row is moved. Returns
+    // `usize::MAX` (the identity cap) whenever the natural layout already fits, which is every panel
+    // and window count that worked before this arc.
+    let cap = fit_cap(&t, pw, ph, wtop, usable_h);
+    // TILEFIT — the outer boxes this pass has already handed out, so the cascade below can refuse to
+    // hand out the same one twice. Bounded by the table it mirrors; `np` is its live length.
+    let mut placed = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
+    // TILEFIT — who each of those boxes belongs to, so the witness can NAME an aliased pair instead
+    // of merely counting one. Same index space as `placed`.
+    let mut pids = [(0u32, 0u64); MAX_WINDOWS];
+    let mut np = 0usize;
+    // TILEFIT — the three facts the witness reports about this layout: how many flow rows it took,
+    // the largest scale it actually handed out, and how many rows the clamp had to pull back up.
+    let mut flow_rows = 1usize;
+    let mut smax = 0usize;
+    let mut clamped = 0usize;
     let mut cx = GAP;
     // MENUFIT — the first row's CONTENT origin starts one full chrome below the work area's top, so
     // its OUTER box begins at `wtop + GAP`: a whole title bar, discs included, below the strip.
@@ -17872,7 +17992,7 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
             continue;
         }
         let (w, h) = (r.w.max(1), r.h.max(1));
-        let scale = place_scale(pw, ph, w, h);
+        let scale = scale_in(pw, ph, usable_h, w, h, cap);
         // F5 — saturating throughout; `w`/`h` come from the caller via `create`.
         let bw = w.saturating_mul(scale).saturating_add(2 * BORDER);
         let bh = h
@@ -17882,6 +18002,49 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
             cx = GAP;
             cy = cy.saturating_add(row_h).saturating_add(GAP);
             row_h = 0;
+            flow_rows += 1;
+        }
+        smax = smax.max(scale);
+        // PULSE-2 — the last-resort clamp's bound: the lowest CONTENT origin whose outer box still
+        // ends above the instrument reservation.
+        let ceiling = wtop.saturating_add(usable_h.saturating_sub(bh));
+        let mut ry = cy.min(ceiling);
+        // TILEFIT — **the clamp bit, so this row did not fit where the flow put it.**
+        //
+        // The clamp on its own is IDEMPOTENT, and that is the defect this arm closes. Every row past
+        // the work area's bottom is pinned to `ceiling`, and a new row restarts `cx` at `GAP`, so the
+        // first box of each overflow row comes out byte-identical to the first box of the last row
+        // that fit — same x, same y, same w, same h. Two windows, one box. The lower one is not
+        // merely occluded: `wc_click_route_at` answers with the top row, so it cannot be focused,
+        // dragged or closed, and the operator has no affordance to discover that it is there at all.
+        // The clamp's own note argues that overlap is "a legibility problem the operator can fix by
+        // closing one" — true of PARTIAL overlap, false of an exact alias, which is what it produced.
+        //
+        // Proven on metal, boot 11 (2880x1800, `wtop=34`, `usable_h=1604`, six 128x128 vugs launched
+        // over one already-open window): scale 6 gives `bw=778`/`bh=812` and three columns, so row 2
+        // clamped to `y=826` and row 3 clamped to `y=826` as well with `cx` back at `GAP` — window 9
+        // (asid 0x7) landed on window 6 (asid 0x4) to the pixel, and the operator counted five vugs
+        // out of six.
+        //
+        // The fix walks UP into the work area, never down, so PULSE-2's reservation is untouched:
+        // a window over the instrument panel stays impossible. `step` divides the whole available
+        // span by `MAX_WINDOWS`, so `MAX_WINDOWS` distinct candidates exist whenever the span is at
+        // least that many rows — i.e. on every real panel — and there are at most `MAX_WINDOWS - 1`
+        // boxes to avoid. Failing that (a degenerate span), the last candidate stands and the
+        // `alias=` field of the witness below says so rather than the operator finding out.
+        if ry < cy {
+            clamped += 1;
+            let step = (ceiling.saturating_sub(wtop) / MAX_WINDOWS).max(1);
+            for k in 0..MAX_WINDOWS {
+                let cand = ceiling
+                    .saturating_sub(k.saturating_mul(step))
+                    .max(wtop);
+                let by = cand.saturating_sub(TITLE_H + BORDER);
+                if !placed[..np].contains(&(cx, by, bw, bh)) {
+                    ry = cand;
+                    break;
+                }
+            }
         }
         let r = &mut t.rows[i];
         // WC-J — the box this row occupied BEFORE the tiler moved it. A tiled window's position is a
@@ -17894,24 +18057,102 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
         r.x = cx + BORDER;
         // PULSE-2 — the last-resort clamp. The scale rule already keeps a single row inside
         // `usable_h`, but rows STACK: enough windows and `cy` walks off the bottom. When that happens
-        // the window is pulled back up so its box ends at the reservation. Two windows overlapping
-        // each other is a legibility problem the operator can fix by closing one; a window over the
+        // the window is pulled back up so its box ends at the reservation; a window over the
         // instrument panel silently breaks the one surface that is supposed to be always readable.
         //
         // MENUFIT — the bound is the same bound, translated into the work area: `usable_h` is now the
         // work area's HEIGHT rather than its bottom coordinate, so the bottom coordinate is
         // `wtop + usable_h` and the clamp is written as `wtop + (usable_h - bh)`. At `wtop == 0` that
         // reduces to the pre-MENUFIT expression character for character, degenerate case included.
-        r.y = cy.min(wtop.saturating_add(usable_h.saturating_sub(bh)));
+        //
+        // TILEFIT — `ry` IS that clamp (`cy.min(ceiling)`), plus the cascade that keeps two clamped
+        // rows off one another's box. When the clamp does not bite, `ry == cy` and this assignment is
+        // the pre-TILEFIT assignment unchanged.
+        r.y = ry;
         r.damage_all();
-        if outer_box(r) != before && before.2 != 0 && before.3 != 0 {
+        let now = outer_box(r);
+        if now != before && before.2 != 0 && before.3 != 0 {
             vacated[nv] = before;
             nv += 1;
         }
+        // TILEFIT — record what this row was actually given, so the next clamped row can avoid it.
+        placed[np] = now;
+        pids[np] = (r.id, r.owner_asid);
+        np += 1;
         cx = cx.saturating_add(bw).saturating_add(GAP);
         row_h = row_h.max(bh);
     }
+
     drop(t);
+
+    // TILEFIT — **THE LAYOUT VERDICT: the line boot 11 did not have.**
+    //
+    // Boot 11 printed a `[wc-a] create` for all six vugs, a `[wc-fv] focus raise` for all six, a
+    // `[wc-d] verify … -> PASS` for all six and a `[wcn] … live=yes` for all six — and the operator
+    // still counted five windows. Nothing on the wire said the two boxes were the SAME box; the fact
+    // was recoverable only by reading six `at (x,y)` fields out of scattered lines and noticing that
+    // two of them matched. This line asks that question directly, at the one place that can see the
+    // whole layout at once, and answers it with the pair's ids and asids.
+    //
+    // Change-triggered, on `[wm] tile-top`'s pattern: a boot that opens and closes windows all day
+    // prints one line per DISTINCT layout, not one per lifecycle event. The signature is forced odd
+    // so the `0` initialiser can never be mistaken for a real layout and swallow the first line.
+    //
+    // `alias=` is the only field that can go bad, and it is a `->` verdict for exactly that reason.
+    //
+    // Emitted with the table RELEASED (`drop(t)` immediately above), on `[wm] tile-top`'s discipline
+    // — it prints before taking the table for the same reason. `placed`/`pids` are this frame's own
+    // copies, so the verdict describes the layout this pass just published without holding anything
+    // across a serial write.
+    #[cfg(feature = "witness")]
+    {
+        use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        let mut alias: Option<(usize, usize)> = None;
+        'scan: for a in 0..np {
+            for b in (a + 1)..np {
+                if placed[a] == placed[b] {
+                    alias = Some((a, b));
+                    break 'scan;
+                }
+            }
+        }
+        let sig = (np
+            .wrapping_mul(0x9E37)
+            ^ smax.wrapping_mul(0x85EB)
+            ^ flow_rows.wrapping_mul(0xC2B2)
+            ^ clamped.wrapping_mul(0x27D4)
+            ^ pw.wrapping_mul(31)
+            ^ ph
+            ^ (alias.is_some() as usize).wrapping_mul(0x165667B1))
+            | 1;
+        static LAST_SIG: AtomicUsize = AtomicUsize::new(0);
+        if np > 0 && LAST_SIG.swap(sig, Relaxed) != sig {
+            match alias {
+                None => serial_println!(
+                    "[wm] tile-fit n={} panel={}x{} work={}+{} scale={} rows={} shrunk={} clamped={} alias=none -> DISTINCT",
+                    np, pw, ph, wtop, usable_h, smax, flow_rows,
+                    if cap == usize::MAX { "no" } else { "yes" },
+                    clamped
+                ),
+                Some((a, b)) => serial_println!(
+                    "[wm] tile-fit n={} panel={}x{} work={}+{} scale={} rows={} shrunk={} clamped={} alias=win={}(asid={:#x})/win={}(asid={:#x}) at ({},{}) {}x{} -> ALIASED",
+                    np, pw, ph, wtop, usable_h, smax, flow_rows,
+                    if cap == usize::MAX { "no" } else { "yes" },
+                    clamped,
+                    pids[a].0, pids[a].1, pids[b].0, pids[b].1,
+                    placed[a].0, placed[a].1, placed[a].2, placed[a].3
+                ),
+            }
+        }
+    }
+
+    // TILEFIT — the verdict's four bookkeeping terms are witness-only reads. The cascade's `placed`
+    // is NOT among them: it is load-bearing on every build.
+    #[cfg(not(feature = "witness"))]
+    {
+        let _ = (&pids, smax, flow_rows, clamped);
+    }
+
     (nv, vacated)
 }
 
