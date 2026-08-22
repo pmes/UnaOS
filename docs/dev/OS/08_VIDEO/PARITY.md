@@ -2182,6 +2182,11 @@ here as §8, exactly as that fragment's integrator note directed.
 
 Baseline for this section: hw-jetson @ `92997297`, audited 2026-08-18 against
 `origin/hw-pi4` (shared-arc locations) and `origin/UnaOS-gemini` @ `122ed63e`.
+**Re-baselined 2026-08-22 (ORINDESK) to hw-jetson @ `3dc889e7`** — the base sync
+(`ceaa32b8`) landed between the two and invalidated §8.0's headline outright; see
+the correction there, and [`orin-desktop.md`](orin-desktop.md) for the inventory
+that replaces it. §8.2–§8.4 were re-read against `3dc889e7`; the two cells that
+went stale are marked inline.
 Vocabulary follows the body: dispositions PORT IT / LEGIT ARCH-SPECIFIC / RULED
 OUT; row classes (a) ported already / (b) experience gap / (c) legit
 arch-specific / (d) in flight.
@@ -2190,19 +2195,42 @@ arch-specific / (d) in flight.
 
 ### §8.0 The honest headline
 
-There is no window manager on this branch. `video/` on hw-jetson HEAD contains
-exactly `fbcon.rs, framebuffer.rs, mod.rs, screen.rs, vperf.rs, witness.rs` — no
-`wm.rs`, `strip.rs`, `dock.rs`, `menubar.rs`, `crystal.rs`, `pulsewin.rs`,
-`pidesk.rs`, `quarry*`. The kernel Cargo.toml here has no `wc`, `pidesk`,
-`quarry`, or `wcg-paygo` feature. The panel today is: boot log on fbcon, then the
-JD2 full-screen console (first key or ~8 s), with JD20 pointer drawing a cursor
-whose clicks log `:: tegra: JD20 — pointer BUTTON … ::` and drive nothing.
+> **CORRECTED 2026-08-22 (ORINDESK), and the correction is the point.** This
+> section originally opened "There is no window manager on this branch", listed
+> `video/` as six files, and stated that the kernel `Cargo.toml` here carried no
+> `wc`, `pidesk`, `quarry` or `wcg-paygo`. **Every one of those claims is false at
+> `3dc889e7`.** They were true of the `92997297` baseline the section was written
+> against; the base sync landed in between — `ceaa32b8`, "Merge trunk @ `122ed63e`
+> into hw-jetson — the month of desktop/userspace/net work lands on the Orin
+> track" — and nothing re-read the headline afterwards. **The operative
+> consequence: §8.1's step 1 is DONE, and the Orin desktop work is that section's
+> steps 2–4.** The measured inventory, the blockers with file:line evidence, and
+> the rung ladder are in [`orin-desktop.md`](orin-desktop.md); this section keeps
+> the headline and the seam.
 
-Consequence: almost every desktop row's Orin cell is not "owed a port" but
-**"arrives at base sync"** — the desktop stack is knob-gated on the paired
-predicate `any(all(x86_64, wc), all(aarch64, pidesk))`, whose aarch64 arm is
-arch-generic, not Pi-specific. The Orin does not port the desktop; it inherits
-it at the next rebase and lights it with a build knob. The per-row exceptions
+The window manager IS on this branch. `wm.rs` (20 652 lines) arrived with the
+WC-A…WC-K series at `51d03376`; `pidesk.rs` at `0750e011`; both are ancestors of
+HEAD (`git merge-base --is-ancestor`, verified 2026-08-22). `video/` carries the
+full family — `wm.rs`, `strip.rs`, `dock.rs`, `menubar.rs`, `crystal.rs`,
+`pulsewin.rs`, `pidesk.rs`, `quarry.rs` + `quarry/live.rs`, `cursor.rs`,
+`screen.rs`, `wcf.rs`, `wcg.rs`, `wcx.rs`, `theme.rs` — and the kernel
+`Cargo.toml` carries `wc`, `wcg-paygo`, `pidesk`, `quarry` and `livecon`.
+
+What is still true is the panel. Boot log on fbcon, then the JD2 full-screen
+console (first key or ~8 s), with JD20 pointer drawing a cursor whose clicks log
+`:: tegra: JD20 — pointer BUTTON … ::` (`main.rs:2843`, in `jd2_console_pump`)
+and drive nothing. `wm.rs` compiles into the Orin kernel — `video/mod.rs:46`
+declares `pub mod wm;` **unconditionally** — and is even called on the tegra path
+(`main.rs:2026`, `wm::retile_on_ready()`), but its table is empty and nothing is
+composited. EXISTS, COMPILES, REACHABLE and PROVEN are four different states;
+only the first three are earned here, and the third only trivially.
+
+Consequence, unchanged in shape and now more precise: the desktop stack is gated
+on the paired predicate `any(all(x86_64, wc), all(aarch64, pidesk))`
+(`video/mod.rs:97, 105, 115, 125, 441`; `pidesk` itself at `video/mod.rs:413`),
+whose aarch64 arm is arch-generic, not Pi-specific. The Orin does not port the
+desktop. What it owes is a build recipe, a seam on the tegra flow, and input
+routing — none of which the base sync could have brought. The per-row exceptions
 are §8.2.
 
 ### §8.1 The display seam, precisely
@@ -2218,7 +2246,9 @@ What drives the Orin panel today (JD1, `arch/aarch64/display_tegra.rs`, gated
   display MMIO (a powergated nvdisplay read is EL3-fatal — the JX1 lesson;
   `JD1_DC_PROBE` stays default-off), maps the region Normal-WB into both tables
   (`mmu_tegra::map_fb_region`, survives the JM6 EL2→EL1 drop), and hands the
-  result to `video::fbcon::init` + `video::WRITER` (`main.rs:1284–1300`). The
+  result to `video::fbcon::init` + `video::WRITER` (`main.rs:2010` and `2016`,
+  both inside `tegra_early_stop`; the `main.rs:1284–1300` citation this line
+  carried until 2026-08-22 was the *x86/`kernel_main`* seam, not this one). The
   DCE keeps scanning that DRAM; fbcon's `flush_*` cleans CPU writes to PoC
   (the Pi-HVS recipe — the DCE does not snoop).
 - Inherit-don't-reinit is the standing rule (the JB6→JB9 XUSB lesson applied to
@@ -2228,15 +2258,34 @@ What drives the Orin panel today (JD1, `arch/aarch64/display_tegra.rs`, gated
 What the desktop knob needs from this seam: nothing new. The seam already yields
 base/len/pitch/format through the same `PixelFormat` contract `wm`/`fbcon`
 consume on the Pi. Lighting the desktop on Orin =
-1. take the base sync (brings `wm.rs` and the whole video stack),
+1. ~~take the base sync (brings `wm.rs` and the whole video stack)~~ — **DONE at
+   `ceaa32b8`.** `wm.rs` (`51d03376`) and `pidesk.rs` (`0750e011`) are both
+   ancestors of HEAD; see §8.0's correction. Steps 2–4 are the whole remaining
+   job, which is why this is a short arc and not a long one.
 2. add `pidesk` to the tegra build recipe — note the knob class: `pidesk`/
    `quarry`/`pirast` are curated in arroyo's `K8_FEATS` block, not
-   `builder/src/main.rs`; the Orin analogue is the `esp-jetson` recipe,
+   `builder/src/main.rs`; the Orin analogue is the `esp-jetson` recipe. **This is
+   larger than one list entry:** `pidesk`/`quarry`/`livecon` have no
+   env→feature mapping in arroyo's top-level `_feats` map at all, so
+   `UNAOS_PIDESK=1 ./arroyo check` arms nothing, and `tegra` + the desktop family
+   is type-checked by **no** cfg-matrix leg. Measured 2026-08-22 at `3dc889e7`:
+   the combination does not currently compile, and the full error list (three
+   errors, all gate mismatches) is in [`orin-desktop.md`](orin-desktop.md) §3.
 3. wire JD20 pointer events into `wc_click_route`/`strip::press_route` instead
-   of the log line,
+   of the log line — the router already exists on this arch
+   (`arch/aarch64/syscall.rs::wc_click_route`) and is ungated; what is missing is
+   the call from `jd2_console_pump`,
 4. re-verify pacing: `wm`'s present paths assume the Pi's timer tick; the tegra
    timer (`crate::arch::ms()` CNTVCT fallback) needs the `[el0live]`/pacing tick
    sources re-checked on this seat.
+
+Two blockers sit *between* steps 2 and 3 and are not visible from this list;
+they are stated with evidence in [`orin-desktop.md`](orin-desktop.md) §3. In
+short: `tegra_early_stop` (`main.rs:1902`) is `-> !` and diverges before
+`kernel_main` ever reaches `pidesk::activate()` (`main.rs:6240`), so the seam
+must attach to the tegra flow; and `wm::reserve_stage` (`video/mod.rs:278`) is
+called only from `init_panel`, which the tegra path skips, so the compositor's
+staging buffer is never allocated.
 
 Vsync-accurate pacing on the DCE (true vblank) is future DC work — class (c)
 until someone proves a safe non-powergated vblank source.
@@ -2248,9 +2297,9 @@ until someone proves a safe non-powergated vblank source.
 | steal-half scheduler (`sched_spread.rs`) | shared top-level, consumers in both `arch/*/sched.rs` | **(a) at base sync** | arch-neutral policy file by design; `cr3_live` correctly not ported (aarch64 TLBI is IS-broadcast) — RULED OUT stays ruled out here too |
 | `[el0live]` EL0-extinction witness | `arch/aarch64/sched.rs` + `timer.rs`, ungated | **(a) at base sync** | re-verify the tick source against the tegra timer divergences in `timer.rs` |
 | EL0 fixture park fixes (real sleeps) | inline blobs in `arch/aarch64/syscall.rs` | **(a) at base sync** | ⚠ highest-conflict merge surface: the Orin copy of `syscall.rs` diverged heavily (JB/JD/JX); same park-fix class WILL bite tegra fixtures — verify, don't assume |
-| `SYS_WIN_PRESENT_ROWS` aarch64 arm | ABI shared; aarch64 dispatch in shared `syscall.rs`; impl in `video/wm.rs` | **(a) at sync, inert** | no consumer until `wm.rs` arrives; nothing Orin-specific owed |
+| `SYS_WIN_PRESENT_ROWS` aarch64 arm | ABI shared; aarch64 dispatch in shared `syscall.rs`; impl in `video/wm.rs` | **(a) ARRIVED, inert** | ⟵ corrected 2026-08-22: `wm.rs` is here and the aarch64 dispatch arm is live (`arch/aarch64/syscall.rs:6922`). Inert now for the *other* reason — the Orin composites nothing, so nothing calls it |
 | serial-focus split | `main.rs` `serial_focus_selftest`, gated `all(aarch64, baremetal, witness)` and `baremetal = ["pi"]` | **(b) OWED — gate widening** | body is aarch64-generic but compiled out of every tegra image; Orin needs a tegra arm on the gate + a serial `shell_inbox` equivalent on the tegra console path |
-| DRAGWEDGE interactive drain bound | `video/wm.rs` + fixture in shared `syscall.rs` | **(a) at sync, inert** | arrives only with `wm.rs`; fixture has no compositor to drive until then |
+| DRAGWEDGE interactive drain bound | `video/wm.rs` + fixture in shared `syscall.rs` | **(a) ARRIVED, inert** | ⟵ corrected 2026-08-22: `wm.rs` is here. The fixture is not: `wm::dragwedge_selftest` (`video/wm.rs:17951`) is gated `all(witness, aarch64, baremetal, pidesk)` and `baremetal` implies `pi`, which `compile_error!`s against `tegra` (`arch/aarch64/serial.rs:22-23`) — see `orin-desktop.md` §3 |
 | BOT-PARK identity parking | `drivers/xhci/mod.rs` (shared driver, already on this branch) | **(a) at base sync — most directly transferable** | ⚠ composition with the xHCI-wall rules is UNVERIFIED: NEVER write CRCR at RS=1 on the inherit path stands; BOT-PARK's ladder must be audited against XCARVE/CRCRQ before it runs on Orin metal. Ledger evidence is a `2109:3431` hub — re-validate against the Orin's HS hub |
 
 ### §8.3 Class (c) on this seat — legit hardware-specific
