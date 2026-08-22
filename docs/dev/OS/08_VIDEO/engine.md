@@ -13249,6 +13249,200 @@ both `[wm] tile-fit` format strings and the `-> DISTINCT` / `ALIASED` tails are 
 pre-existing `place::LAST_TOP` — the witness's own latch, inside the function boot 11 already proves
 runs on metal (`[wc-a] create` is emitted by `place`'s caller immediately after it returns).
 
+## PAYGOBAND / NOATT — the 4 Hz whole-box repaint nobody attached to (x86 `wc` + `wcg-paygo`, 2026-08-22)
+
+The operator sat through metal boot 11 and said "nothing ran right the whole time it was booted". One
+of the four mechanisms that decomposes into is this one, and it is the one that raised **no failing
+verdict at all**: `[wcn]` reported a healthy `-> LIVE` throughout, so every other investigation
+walked past it.
+
+### The reading
+
+`~/unaos-bench/capture/rmbp3-boot11/ttyUSB0.log`, 40.8–105.0 s — three windows, the operator "just
+using it". The screen is provably static: the `[wcn]` rollups at 55.8 / 60.9 / 65.9 / 70.9 s are
+byte-identical at `att=97 comp=151 passes=115`. Yet `[comp2]` reads
+
+```
+[comp2] rollup passes=115 pass_us=4942 ... blit_us=4932 ... dmg_px_pp=817617 box_px_pp=984425 wcd_us=194081 util_pct=11
+```
+
+against a genuinely idle desktop's
+
+```
+[comp2] rollup passes=99  pass_us=2033 ... blit_us=2024 ... dmg_px_pp=631736 box_px_pp=631736 wcd_us=0     util_pct=3
+```
+
+— 2.4x the pass, 3.7x the utilisation. The per-window census names the payer:
+
+```
+[wcn] win=1 asid=0xffffff01 ... att=0 comp=18 ... z=1  pre=18 drg=0  dout=18 dkpx=13302 drly=0
+[wcn] win=2 asid=0xffffff02 ... att=0 comp=18 ... z=3  pre=0  drg=18 dout=0  dkpx=0     drly=18
+[wcn] win=3 asid=0x1        ... att=97 comp=115 ... z=71 pre=97 drg=18 dout=0 dkpx=0    drly=0
+```
+
+`win=1` is fbcon's console window (`KERNEL_OWNER_CONSOLE`, `surf=1232x688` at (819,453)). `att=0` —
+its owner presented **nothing** — beside eighteen composites of its **own** damage (`pre=18`, so it
+was in the seed set, not dragged in). Its damage then drags the shell in (`dout=18 dkpx=13302`, i.e.
+739 kilopixels per event) and the shell relays to the vug (`drly=18`). Three windows repainted, 18
+times per 5 s, on a screen that did not move. `[wcser]` reads `declined_pct=7..11` across the whole
+stretch: **this is not contention, it is work nothing asked for.**
+
+18 per 5.02 s is 3.58 Hz, which is `PAYGO_SVC_PERIOD_US` (250 ms). `[comp2] wcd_us=194081` names what
+those passes bought.
+
+### The mechanism — `paygo_service_pass`, `video/wm.rs`
+
+The WC-D / WC-G pay-as-you-go battery has a service taker (PAYGO-TERM): past `defer_ms`, an owed
+sample is taken whether or not anyone is drawing. It takes it by marking one row damaged and running
+a composite, and the mark was the **whole box**:
+
+```rust
+r.damaged = true;
+r.dmg_y0 = 0;
+r.dmg_y1 = 0;
+```
+
+The read-back it enables is **chunked**. `verify_window` resumes at `WCD_CUR[i]` and walks at most
+`WCD_CHUNK_ROWS_MAX` (64) source rows, and on the metal the `WCD_CHUNK_US` (2 ms) time stop cuts it
+far shorter than that. The terminal lines say by exactly how much:
+
+```
+[wc-d] paygo win=1 state=complete ... -> PAID chunks=345   (surf 1232x688 — 688 rows)
+[wc-d] paygo win=2 state=complete ... -> PAID chunks=444   (surf 1440x883 — 883 rows)
+```
+
+688/345 = 1.99 and 883/444 = 1.99: **~2 source rows of verdict per whole-box repaint of the window**,
+~345 times, at 4 Hz. That is 86 s of panel-scale blitting per window to close one battery, and 2 s of
+it lands inside every 5 s `[comp2]` span while it runs.
+
+### Boots 9 and 10 are not the control they looked like
+
+The comparison that made boot 11 look unique — boot 9 and boot 10 idling at `comp/att = 1.00`, with
+`win=1` and `win=2` emitting nothing at all — was taken from stretches **after** those boots'
+batteries terminated:
+
+| boot | leak live | how it ended | first clean `[comp2]` |
+|---|---|---|---|
+| 9  | ~42 s → 111 s | `paygo-taker STOP-NOTE win=1` @111 532 ms, `win=2` @115 662 ms (cap of `PAYGO_SVC_MAX`) | 112 510 ms, `pass_us=2058 wcd_us=0` |
+| 10 | ~17 s → 188 s | `[wc-d] paygo win=1 -> PAID` @111 831 ms, `win=2 -> PAID` @188 371 ms | 193 596 ms, `pass_us=2033 wcd_us=0` |
+| 11 | ~42 s → 122 s | `paygo-taker STOP-NOTE win=1` @122 000 ms, `win=2` @126 016 ms | (the operator's session ended at ~105 s) |
+
+Over the **comparable** window (~40–105 s uptime) all three boots carry the identical leak at the
+identical rate — boot 9 at 47 209 ms reads `win=1 att=0 comp=16 dout=16 dkpx=11824`, boot 10 at
+29 258 ms reads `win=1 att=0 comp=20 dout=20 dkpx=14780`. Boot 10's `win=2 -> PAID` at 188 371 ms is
+followed by the very next `[comp2]` falling to `pass_us=2033 wcd_us=0`: the battery closing is what
+ends it.
+
+**No delta in the boot-11 image caused this.** KBDFLAP, KBDWIT-LATCH, PTRDEAD, RX-FINALPAGE and
+DMGOVLP-BITE are all innocent of it — PTRDEAD included, and it was checked first because it touched
+the pointer event path: the taker is on `bootpace::service_dump`'s lane, reads no pointer state, and
+its 4 Hz cadence is `PAYGO_SVC_PERIOD_US`, not an input rate. The mechanism predates all five and is
+on the wire, unchanged, in both comparison boots.
+
+What boot 11 *did* change is the **price** of each take: boot 10's late layout had the shell at
+(1302,777), so the drag billed `dkpx=1558` for 19 events (~82 kpx each); boot 11's storm-era layout
+overlaps the console and the shell heavily, so the same 18 events bill `dkpx=13302` (~739 kpx each),
+and the chain reaches a third window. The geometry is the amplifier; the taker is the source.
+
+### The fix — mark the chunk, not the box
+
+`verify_reference` clips the band to `[cur, min(row1, cur + WCD_CHUNK_ROWS_MAX))` itself, so a mark of
+exactly `[cur, cur + WCD_CHUNK_ROWS_MAX)` hands it the same rows it was going to walk. The ledger line
+this replaces read *"a banded mark would hand `verify_reference` a band to narrow the very verdict this
+taker exists to complete"* — true of an arbitrary band, false of the chunk's own extent.
+
+The guard is `!wcg_ripe && wcd_ripe && cur > 0 && cur + WCD_CHUNK_ROWS_MAX < visible`, where `visible`
+is `verify_reference`'s own `rows` expression evaluated from the same four row fields and a panel
+height read before the table lock. Under it, that function derives `row0 == cur`, `row1 == r1 == cur +
+64`, `banded` already true via its own `cur > 0` term, and `cksum_pre` unchanged — **the walk and every
+printed field are identical to the whole-box mark's; only the repaint shrinks.** Everything outside the
+guard keeps the whole box, deliberately:
+
+* `cur == 0` — stage 1 has no cursor (`WCD_CUR` is stage-2 only) and its lattice verdict *is* "the band
+  this present offered, once", so banding there would genuinely narrow it. One pass in ~345.
+* `wcg_ripe` — `wcg::begin` has no band test and samples the whole surface.
+* `cur + 64 >= visible` — includes `cur >= visible`, the SHRUNK-box close arm, which needs `row1 == rows`
+  and is reachable only from a whole-box mark.
+
+`damage_rows` unions rather than assigns, so a band a real present already owes is never dropped.
+
+One race, stated: another core can bank a chunk between the mark and the composite, leaving `cur` ahead
+of the marked band; `verify_reference` unwinds and the take is wasted. `PAYGO_SVC_BUSY` excludes a
+second taker, so it needs an ordinary present in the gap — and a present that banks a chunk calls
+`paygo_svc_progress`, which clears the row's try count. Cost: one 250 ms cycle, liveness bound intact.
+
+### The discriminator — `[noatt]`
+
+`[wcn]` can say a window composited more often than it presented (`comp_rate` above `att_rate`) and
+WCN-CAUSE can say whether the excess was the occlusion closure (`drg`) or the window's own damage
+(`pre`). It cannot say whether there was an **attach behind that damage at all**, because `pre` is
+counted per blit and `att` per present and the two are never joined inside a pass. That join is the
+new instrument. Per composite pass, over the SEED set only:
+
+```
+[noatt] scope=live passes=115 seeds=115 noatt=18 noatt_kpx=13300 rate=3.5/s taker=18 span=5024ms -> TAKER
+```
+
+`noatt` counts seed rows whose per-id attach sequence has not moved since the previous pass;
+`noatt_kpx` bills them at `damaged_box` area in the same unit `[wcn] dkpx=` uses; `taker` counts marks
+made by `paygo_service_pass`, at the one site that makes them. `-> TAKER` when `taker >= noatt`,
+`-> TAKER+` when something else is also marking, `-> UNATTRIBUTED` when nothing here can explain it
+(which sends the reader to `cursor::repair`'s `damage_intersecting`, `focus_changed`, `repaint`, or
+the erase drain). Self-silencing on `noatt == 0`, so a healthy desktop is as quiet as before and the
+line's presence is itself the finding. x86 only, like `[wcser]`, under which it sits.
+
+### The metal watch lines
+
+A **healthy** pass reads, together:
+
+```
+[comp2] rollup passes=99 pass_us~2033 ... dmg_px_pp == box_px_pp ... wcd_us=0 util_pct=3
+[wcn]   win=N ... att=K comp=K ... pre=K drg=0 dout=0 dkpx=0
+(no [noatt] line at all)
+```
+
+The **leak** reads:
+
+```
+[comp2] rollup ... pass_us 2.4x the idle figure ... wcd_us in the 10^5 per 5 s span
+[wcn]   win=1 asid=0xffffff01 att=0 comp=18 ... pre=18 dout=18 dkpx=13302
+[noatt] ... noatt≈18 taker≈18 rate≈3.5/s -> TAKER
+[wc-d]  paygo win=1 state=waiting ... clock=drag taken=1 budget=2 -> DEFERRED   (the battery still owed)
+```
+
+`att=0` beside a non-zero `comp` is the whole tell, and `wcd_us` is the corroborator: it is the only
+`[comp2]` account the read-back charges, so `wcd_us=0` on a busy span exonerates this mechanism
+outright. With PAYGOBAND landed the same battery still runs — the take count is set by the time stop,
+not by the mark — but `[noatt] noatt_kpx` falls ~11x for the console and ~14x for the shell, and
+`[comp2] pass_us` should track it down.
+
+### Gates
+
+`./arroyo check` green both arches · `UNAOS_WC=1 ./arroyo check` green both arches ·
+`UNAOS_WITNESS=1 UNAOS_WCG_PAYGO=1 UNAOS_WC=1 ./arroyo check` green both arches (without the last one
+the gate is **vacuous**: `wcg-paygo` is off by default, so neither the taker nor this arc's edit is
+compiled at all). Per-feature legs checked directly: `{}`, `witness`, `wc`, `wcg-paygo`,
+`witness,wc`, `witness,wcg-paygo,wc` on x86; `{}` and `witness` on aarch64. No QEMU leg — the symptom
+is metal-only (it needs a matured battery on a panel-scale window, which QEMU's RAM-fast probes close
+in a dozen chunks rather than 345).
+
+Targeted proofs, both non-QEMU:
+
+1. **Host-compiled decision extraction.** `paygo_service_pass`'s extent decision and
+   `verify_reference`'s `rows` / band clip / `WCD_ST_FULL_RUN` cursor arm lifted verbatim to the host
+   and swept over 5 660 928 `(panel_h, scale, h, y, stride, surf_len, cur, wcg_ripe, wcd_ripe)`
+   combinations. Every one of the 20 474 banded decisions derives a tuple `(row0, row1, r1, banded,
+   cksum_pre)` **identical** to the whole-box mark's; every declined decision is the pre-arc behaviour
+   bit for bit, including the SHRUNK close; the repaint is `<= 64` rows in every banded case, never
+   larger than the whole-box one, and 10.8x / 13.8x smaller on boot 11's actual `win=1` / `win=2`
+   geometry.
+2. **`strings` / `nm` reachability on the release-linked kernel ELF** built with
+   `--features witness,wcg-paygo,wc`: `[noatt] scope=`, ` noatt=` and ` noatt_kpx=` are present in
+   `target/x86_64-unaos/release/unaos-kernel`, all seven `video::wm::NOATT_*` statics are allocated,
+   and `objdump -d` of `unaos_kernel::video::wm::paygo_service` (with `paygo_service_pass` inlined)
+   shows both new paths in the emitted code — a second `lea ... WCD_CUR` beside the pre-existing one,
+   and `lock incq ... NOATT_TAKER`.
+
 ## DEADMAN — the instrument the wedge cannot erase (x86, `deadman` knob, 2026-08-22)
 
 ### The defect
