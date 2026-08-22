@@ -791,6 +791,26 @@ fn wait_for_cnr_clear(op_base: usize) -> bool {
 pub static XHCI_IR0_BASE: AtomicUsize = AtomicUsize::new(0);
 /// MMIO address of the operational registers (USBSTS at +0x04). 0 = not yet initialized.
 pub static XHCI_OP_BASE: AtomicUsize = AtomicUsize::new(0);
+
+/// USBSTS.EINT — Event Interrupt (xHCI 1.2 §5.4.2, bit 3, RW1C). Set when the controller has posted
+/// an event and asserted the interrupter; the ack path (`interrupt_ack`, `advance_erdp`) clears it
+/// by writing `1 << 3`, which is the only USBSTS bit either of them touches.
+const USBSTS_EINT: u32 = 1 << 3;
+/// USBSTS.PCD — Port Change Detect (xHCI 1.2 §5.4.2, bit 4, RW1C). Set when any root-hub port has a
+/// change bit pending in its PORTSC; it stays set until software writes 1 to it.
+///
+/// BOTBOUND (R24 boot11) — WHY THIS DEFINITION EXISTS. This tree named bit 3 in three places and
+/// bit 4 in none, so `USBSTS=0x18` on the BOT timeout line was legible only as "EINT plus something
+/// undocumented", and the R24 boot11 read of that capture took it for EINT alone. 0x18 is EINT|PCD:
+/// a port-change notification standing unacknowledged alongside the event interrupt. That is a
+/// materially different reading of the same word — it says the root hub had something to report
+/// while the pump was blocked — and it was unavailable to anyone decoding the log from this source.
+///
+/// Definition only. Nothing here clears PCD and nothing should from these paths: the ack sites are
+/// interrupt-acknowledge paths for the EVENT ring, and RW1C-ing a port-change bit from them would
+/// discard a notification the port-status machinery is the rightful consumer of. The value of the
+/// bit here is that a status word can now be read correctly, not that it be cleared sooner.
+const USBSTS_PCD: u32 = 1 << 4;
 /// Count of xHCI interrupts taken — a diagnostic to confirm the MSI-X path is live.
 pub static XHCI_IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -956,6 +976,22 @@ const BOT_RESCUE_PORT_ON_MS: u64 = 300;
 /// device has already burned two full ladders' worth of budget without answering, the question the
 /// retry asks is "did the heavy reset revive it", and a revived device answers in milliseconds —
 /// so the extra 4 s buys no information and is paid in frozen desktop.
+///
+/// BOTBOUND (R24 boot11) — THE SECONDS ABOVE ARE WRONG ON THIS PLATFORM, and the correction matters
+/// because every "~N s" in this module is derived from them. `hw_wait_budget()` is a fixed
+/// 150,000,000 CNTVCT ticks on aarch64, and `arch::aarch64::HW_WAIT_BUDGET`'s own doc calls that
+/// "~2.5 s at a ~60 MHz generic-timer rate". The Pi 4's CNTFRQ_EL0 is 54 MHz — read off the wire in
+/// boot11 — so the real figures on the bench Pi are:
+///   * `hw_wait_budget()`                     = 150,000,000 / 54 MHz = **2.78 s**
+///   * first attempt (x`BOT_BUDGET_SCALE_FIRST`) = 450,000,000 / 54 MHz = **8.33 s**
+///   * dead-ring cut (/`BOT_PARK_DEAD_DIV`)      =  18,750,000 / 54 MHz = **0.347 s**
+/// All three are confirmed to the cycle by boot11's own timeout lines (`used=450128237`,
+/// `spent_ms=2779`, `budget=18750000`). The "~6 s" and "~2 s" above date from a 62.5 MHz QEMU-virt
+/// assumption and understate the Pi by ~39%.
+///
+/// The one-line doc fix belongs in `arch/aarch64/mod.rs` at `HW_WAIT_BUDGET`, which is outside this
+/// arc's lane; it is recorded here, where the budget is actually spent, and flagged for the
+/// integrator rather than edited across the lane boundary.
 const BOT_BUDGET_SCALE_FIRST: u64 = 3;
 const BOT_BUDGET_SCALE_ESCALATION: u64 = 1;
 /// BOT-RESCUE M3 witness 4: Transfer Events observed for a slot OTHER than the one a BOT stage is
@@ -1162,18 +1198,51 @@ const BOT_PARK_PASS_MS: u64 = 10_000;
 /// on a device the ledger has never heard of costs a full first-attempt budget, and boot6's log
 /// shows a pass paying several of them back to back.
 ///
-/// Two seconds, enforced in two places that together make the bound total:
+/// Two seconds, enforced in two places that together make the bound total — and, since BOTBOUND
+/// (R24 boot11), applying to the same population, which is the whole of that fix:
 ///   * `bot_transfer_body`'s entry declines a transfer once the pass is over budget — no CBW, no
 ///     wait, return to the desktop loop, paint the frame, resume next pass.
-///   * `pump_until_bot_done` `min`s the pass REMAINDER into its budget for an identity that already
-///     has an account, so the second wedged wait of a pass is short rather than merely refused
-///     afterwards.
+///   * `pump_until_bot_done` `min`s the pass REMAINDER into its budget for ANY identity with a live
+///     pass clock, so a wedged wait is short rather than merely refused afterwards.
 ///
-/// It never shortens the first wait of a pass for a device with no history: `hw_wait_budget()` and
-/// `BOT_BUDGET_SCALE_FIRST` are metal-earned and a slow-but-healthy stick must keep them. The worst
-/// case is therefore ONE first-attempt budget per pass, decaying to `BOT_PARK_DEAD_DIV` of it as
-/// soon as the dead-ring streak opens the account — and then to nothing, at PARKED.
+/// BOTBOUND changed the second bullet. It used to apply only to an identity that already had an
+/// account, on the theory that `hw_wait_budget()` and `BOT_BUDGET_SCALE_FIRST` are metal-earned and
+/// a slow-but-healthy stick must keep them whole. boot11 priced that theory: the FIRST timeout on an
+/// identity the ledger had never heard of ran unclamped at `budget=450000000 used=450128237` —
+/// 8.34 s of frozen desktop, the largest single blocking item in the capture — because an account
+/// opens only on a dead-ring charge or a ladder entry, i.e. never in time to bound the wait that
+/// opens it. The entry half above was already account-blind by design; the two halves now agree.
+///
+/// What is NOT given up, and is the reason this is a bound and not a shortening:
+/// `bot_pass_pump_left` never reports below `hw_wait_budget()`, so the clamp's floor IS the base
+/// metal-earned handshake budget. The worst case per pass is therefore ONE `hw_wait_budget()` —
+/// 2.78 s at the Pi 4's 54 MHz CNTFRQ — instead of one first-attempt budget, decaying to
+/// `BOT_PARK_DEAD_DIV` of it as soon as the dead-ring streak opens the account, and then to nothing
+/// at PARKED. A slow-but-healthy stick keeps 2.78 s; boot11's longest wait that ever COMPLETED was
+/// `peak=25480105` (0.47 s), 5.9x under that floor.
 const BOT_PARK_PASS_PUMP_MS: u64 = 2_000;
+
+/// BOTBOUND (R24 boot11) instrument 1 — how long, after its budget expired, the pump keeps PEEKING
+/// at the event ring before it prints a word.
+///
+/// The question it answers. boot11's eight timeouts include two reading
+/// `fresh_at_expiry=no fresh_now=yes`: no consumable event when the budget died, one present by the
+/// time the multi-line timeout dump finished. Those two are today unclassifiable. Either the
+/// completion landed DURING the printout — in which case the budget was 1-2% short for a slow
+/// device and the ring is fine — or the `fresh_now` reading is photographing serial latency and the
+/// ring is genuinely dead. The difference decides whether the budgets want raising or the transport
+/// wants fixing, and the two hypotheses are indistinguishable without a NUMBER for how late the
+/// event was.
+///
+/// Fifty milliseconds is chosen against what it has to separate, not against the budget: a
+/// completion that is one part in fifty late on a 2.78 s wait lands inside 56 ms, so a window this
+/// size catches the "budget marginally short" hypothesis whole, while a genuinely dead ring pays it
+/// only on a wait that has ALREADY cost 2.78 s (a 1.8% surcharge on a timeout, and nothing at all
+/// on any other path). It is skipped outright when `fresh_at_expiry` is already true — there is
+/// nothing to wait for — and it short-circuits the instant an event appears, so a live device pays
+/// microseconds. Read-only throughout: `has_event` invalidates and reads the dequeue TRB, consumes
+/// nothing and moves no pointer, so the necropsy below still photographs an untouched ring.
+const BOT_EXPIRY_REPEEK_MS: u64 = 50;
 
 /// Devices parked this boot. Zero on a clean boot, so any non-zero reading is itself the finding.
 pub static BOT_PARK_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -2252,7 +2321,9 @@ pub fn interrupt_ack() {
     let op = XHCI_OP_BASE.load(Ordering::Acquire);
     if op != 0 {
         unsafe {
-            core::ptr::write_volatile((op + 0x04) as *mut u32, 1 << 3); // USBSTS.EINT
+            // USBSTS.EINT only. Bit 4 (PCD) is also RW1C and is deliberately NOT written here —
+            // see `USBSTS_PCD`.
+            core::ptr::write_volatile((op + 0x04) as *mut u32, USBSTS_EINT);
         }
     }
     XHCI_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -3519,10 +3590,11 @@ impl XhciController {
             // Acknowledge the interrupter: clear IMAN.IP (bit 0, RW1C) and USBSTS.EINT
             // (bit 3, RW1C). QEMU's xHC will not post the next event until the prior
             // Interrupt Pending is acknowledged, so a tight poll loop can otherwise stall
-            // after one event even though the transfer completed.
+            // after one event even though the transfer completed. USBSTS bit 4 (PCD) is RW1C
+            // too and is deliberately left alone here — see `USBSTS_PCD`.
             let iman = core::ptr::read_volatile(ir0_base as *const u32);
             core::ptr::write_volatile(ir0_base as *mut u32, iman | 1);
-            core::ptr::write_volatile((self.op_base + 0x04) as *mut u32, 1 << 3);
+            core::ptr::write_volatile((self.op_base + 0x04) as *mut u32, USBSTS_EINT);
 
             let new_dequeue_ptr = EVENT_RING_PHYS_BASE + (dequeue_index as u64 * 16);
             // Bit 3 (EHB) is write-1-to-clear. High-dword-first (write_erdp) so the
@@ -10258,6 +10330,9 @@ impl XhciController {
         } else {
             match bot_park_find(&self.bot_park, id) { Some(i) => i, None => return }
         };
+        // BOTBOUND instrument 3 — the BEFORE half. See the print below for why this exists.
+        let (was_streak, was_total) =
+            (self.bot_park[idx].dead_streak, self.bot_park[idx].dead_total);
         self.bot_park[idx].cycles = self.bot_park[idx].cycles.saturating_add(used);
         if dead {
             self.bot_park[idx].dead_streak = self.bot_park[idx].dead_streak.saturating_add(1);
@@ -10267,6 +10342,35 @@ impl XhciController {
             self.bot_park[idx].dead_total = self.bot_park[idx].dead_total.saturating_add(1);
         } else {
             self.bot_park[idx].dead_streak = 0;
+        }
+        // BOTBOUND instrument 3 — the dead counters AT THE CHARGE, not only in the end-of-boot
+        // rollup. Pure observation: nothing above this line changed, and in particular the reset
+        // semantics on the `else` arm are exactly as they were.
+        //
+        // The question it answers. boot11's PARKED line reads `dead=2/8 dead_streak=0` — the streak
+        // was wiped, and the capture cannot say WHEN or by which charge, because the only place
+        // these counters were ever printed is the rollup after the device is already parked. That is
+        // precisely the evidence the open question about `dead_streak`'s reset semantics needs
+        // before it can be decided: a streak reset by THIS device's own live wait is the mechanism
+        // working, and a streak reset by a wait made live only by OTHER slots' traffic on the shared
+        // ring is the mechanism defeating itself. `dead=` says both happened; only a per-charge
+        // trace says which, how often, and in what order.
+        //
+        // Printed ONLY when a counter actually moved, which is what keeps this off the hot path: a
+        // healthy device charges `dead=false` against an already-zero streak on every completed
+        // stage — hundreds of times per boot in boot11 alone (`n=302`) — and every one of those is
+        // silent. What survives the filter is exactly the transitions: each increment, and each
+        // wipe. The line count is therefore the number of state changes, not the number of charges.
+        let (now_streak, now_total) =
+            (self.bot_park[idx].dead_streak, self.bot_park[idx].dead_total);
+        if now_streak != was_streak || now_total != was_total {
+            serial_println!(
+                ":: BOT: [botbound] dead-charge slot={} port={} route={:#x} dead={} streak={}->{} total={}->{} cut={} used={} — every move of the dead counters, at the charge that moved it. streak 0<-N is a WIPE: the wait was live, so the budget cut disarms; read it against the [botclaim] line of the same wait to see whether this device's own completion or another slot's traffic made it live ::",
+                slot_id, id.port, id.route,
+                if dead { "yes" } else { "no" },
+                was_streak, now_streak, was_total, now_total,
+                if now_streak >= BOT_PARK_DEAD_STREAK { "on" } else { "off" },
+                used);
         }
     }
 
@@ -10291,8 +10395,18 @@ impl XhciController {
     fn bot_park_note_success(&mut self, slot_id: u8) {
         let id = match self.bot_ident(slot_id) { Some(i) => i, None => return };
         let idx = match bot_park_find(&self.bot_park, id) { Some(i) => i, None => return };
+        // BOTBOUND instrument 3, the OTHER wipe site. `bot_park_charge` traces every move of
+        // `dead_streak`; this is the only place in the driver that forgives `dead_total`, so a trace
+        // of the counters that skipped it would be exactly as unreadable as the rollup it replaces.
+        // Free on the common path: `note_success` returns false unless it actually zeroed something,
+        // so a healthy device prints nothing here, ever.
+        let was_total = self.bot_park[idx].dead_total;
         if self.bot_park[idx].note_success() {
             BOT_PARK_DEAD_FORGIVEN.fetch_add(1, Ordering::Relaxed);
+            serial_println!(
+                ":: BOT: [botbound] dead-forgive slot={} port={} route={:#x} total={}->0 forgiven={} — a COMPLETED transfer for this identity zeroed the dead-ring verdict counter. The one legitimate wipe of dead=, and the only one: no charge, no foreign traffic and no doorbell can reach it ::",
+                slot_id, id.port, id.route, was_total,
+                BOT_PARK_DEAD_FORGIVEN.load(Ordering::Relaxed));
         }
     }
 
@@ -10827,15 +10941,40 @@ impl XhciController {
         // THE DESKTOP THROTTLE, second half. `bot_transfer_body` refuses to START a transfer once
         // the pass is over its pump budget; this clamps the wait that is still allowed to begin to
         // what the pass has LEFT, so the pass's total is bounded rather than bounded-plus-one-budget.
-        // Two guards keep it honest, and both matter:
-        //   * it applies only to an identity that already has an account — a device nothing has gone
-        //     wrong with keeps `hw_wait_budget() * BOT_BUDGET_SCALE_FIRST` exactly as it always had,
-        //     which is what stops a slow-but-healthy stick becoming a false failure; and
+        // One guard keeps it honest, and it is the load-bearing one:
         //   * `bot_pass_pump_left` never reports below `hw_wait_budget()`, so no rung's retry and no
-        //     recovery wait can be starved under the base metal-earned handshake budget.
+        //     recovery wait can be starved under the base metal-earned handshake budget. That floor
+        //     is what makes this clamp a bound rather than a shortening, and every claim below rests
+        //     on it: the worst this can do to ANY wait is take it down TO `hw_wait_budget()`.
         // `min`, never `max`, exactly as the dead-ring cap above.
+        //
+        // BOTBOUND (R24 boot11) — WHY THE ACCOUNT GUARD IS GONE. It used to read "applies only to an
+        // identity that already has an account", on the theory that a device nothing had gone wrong
+        // with should keep `hw_wait_budget() * BOT_BUDGET_SCALE_FIRST` untouched. boot11 measured
+        // what that theory costs. An account opens only on a dead-ring charge or a ladder entry, so
+        // the FIRST timeout on an identity the ledger has never heard of runs with no clamp at all:
+        // `budget=450000000 used=450128237` — 8.34 s of frozen desktop, on the desktop's own thread,
+        // paid before the ledger is allowed to have an opinion. It is the single largest blocking
+        // item in that capture (the other seven timeouts together cost 17.0 s across six clamped
+        // 2.78 s waits and one 0.347 s dead-ring-cut wait).
+        //
+        // The asymmetry was never intentional: this clamp's own sibling — `bot_pump_throttled`, the
+        // ENTRY half of the same throttle — already says in terms that it "is NOT gated on the
+        // identity having an account: the first wedged attempt of a device the ledger has never
+        // heard of is precisely the case the metal capture is made of." Two halves of one throttle
+        // disagreed about who they applied to. They now agree, and share one precondition: a live
+        // pass clock. (`bot_transfer_body` calls `bot_pass_roll` before every transaction, so any
+        // wait that reaches this line has one; the check mirrors `bot_pump_throttled` rather than
+        // relying on that.)
+        //
+        // What the healthy device actually gives up, measured rather than assumed: `peak=` in the
+        // same capture is 25480105 cycles — 0.47 s, the longest wait boot11 ever NEEDED, 5.9x under
+        // the `hw_wait_budget()` floor this clamp can never go below. The slow-but-healthy stick
+        // keeps 2.78 s, not 8.34 s; that is a real reduction in headroom and it is stated here so
+        // the next capture can falsify it — a `result=OK` witness with `used=` above ~150000000
+        // would be the counter-evidence, and there is none in any capture to date.
         let budget = match self.bot_pending.as_ref().map(|p| p.slot_id) {
-            Some(s) if self.bot_ident(s).and_then(|id| bot_park_find(&self.bot_park, id)).is_some() => {
+            Some(_) if self.bot_pass_start != 0 => {
                 let left = self.bot_pass_pump_left();
                 if left < budget {
                     BOT_PARK_CAPPED.fetch_add(1, Ordering::Relaxed);
@@ -10926,6 +11065,42 @@ impl XhciController {
                     let guard = EVENT_RING.lock();
                     guard.as_ref().map(|r| r.has_event()).unwrap_or(false)
                 };
+                // BOTBOUND instrument 1 — the expiry RE-PEEK. Here, between the expiry-instant peek
+                // above and the first `serial_println!` below, because that ordering is the entire
+                // content of the measurement: anything printed first puts serial latency inside the
+                // window being measured and reproduces the ambiguity this exists to remove. See
+                // `BOT_EXPIRY_REPEEK_MS` for the reading key. `bb_late` says an event appeared
+                // within the window; `bb_late_ms` says how long after expiry it took (and, when
+                // `bb_late` is false, is the full window — i.e. "at least this late, or never").
+                let (bb_late_ms, bb_late) = if bc_fresh_at_expiry {
+                    (0, false) // consumable already at expiry: not a lateness question at all
+                } else {
+                    let per_ms = Self::cycles_per_ms().max(1);
+                    let window = per_ms.saturating_mul(BOT_EXPIRY_REPEEK_MS);
+                    let t0 = crate::arch::now_cycles();
+                    let mut seen: Option<u64> = None;
+                    loop {
+                        let d = crate::arch::now_cycles().wrapping_sub(t0);
+                        let fresh = {
+                            let guard = EVENT_RING.lock();
+                            guard.as_ref().map(|r| r.has_event()).unwrap_or(false)
+                        };
+                        if fresh {
+                            seen = Some(d);
+                            break;
+                        }
+                        if d >= window {
+                            break;
+                        }
+                        // Same yield the pump loop above uses, for the same reason: on TCG a pure
+                        // spin never exits to the main loop that would DMA the event in.
+                        crate::hlt();
+                    }
+                    match seen {
+                        Some(d) => (d / per_ms, true),
+                        None => (window / per_ms, false),
+                    }
+                };
                 BOT_PUMP_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
                 unsafe {
                     let ir0 = XHCI_IR0_BASE.load(Ordering::Acquire);
@@ -10935,6 +11110,31 @@ impl XhciController {
                     serial_println!(
                         "xHCI: BOT pump TIMEOUT after {} cycles (IRQ_COUNT={} IMAN={:#x} USBSTS={:#x})",
                         elapsed, XHCI_IRQ_COUNT.load(Ordering::Relaxed), iman, usbsts);
+                    // BOTBOUND instrument 2 — IMOD READBACK, on its own line so the line above stays
+                    // byte-comparable with every capture taken before this arc.
+                    //
+                    // `init_interrupter` WRITES IMOD (interrupter 0, +0x04) = 0 — "no moderation,
+                    // fire ASAP" — and nothing in this driver has ever read it back. On a controller
+                    // that silently latches a nonzero moderation interval, IRQ delivery is throttled
+                    // to IMODI*250 ns and every reading taken downstream of it is mis-attributed.
+                    // One volatile read on a path that has already spent seconds settles it.
+                    //
+                    // Reading key. `imodi=` is the interval in 250 ns units (0 = off, i.e. the write
+                    // took); `imodc=` is the down-counter. imodi=0 removes moderation from the list
+                    // of suspects permanently. imodi!=0 on a controller we wrote 0 to is a finding
+                    // in its own right — the write was dropped or the part ignores it.
+                    //
+                    // USBSTS is decoded here rather than left as a bare word because boot11's
+                    // `USBSTS=0x18` was read as bit 3 alone; it is EINT|PCD. See `USBSTS_PCD`.
+                    let imod = if ir0 != 0 { core::ptr::read_volatile((ir0 + 0x04) as *const u32) } else { 0 };
+                    serial_println!(
+                        ":: BOT: [botbound] expiry-repeek late={} late_ms={} window_ms={} | imod={:#x} imodi={} imodc={} | usbsts={:#x} eint={} pcd={} — late=yes means the completion landed within {} ms of the budget expiring (the budget is SHORT, not the ring dead); late=no with fresh_at_expiry=no is the transport-wedge reading. imodi!=0 means the controller latched interrupter moderation this driver wrote 0 to ::",
+                        if bb_late { "yes" } else { "no" }, bb_late_ms, BOT_EXPIRY_REPEEK_MS,
+                        imod, imod & 0xffff, (imod >> 16) & 0xffff,
+                        usbsts,
+                        if usbsts & USBSTS_EINT != 0 { 1 } else { 0 },
+                        if usbsts & USBSTS_PCD != 0 { 1 } else { 0 },
+                        BOT_EXPIRY_REPEEK_MS);
                 }
                 // IVY: the measurable half of the timeout — how the exhausted budget compares to the
                 // largest wait this boot ever needed. `used == budget` with a `peak` far below it says
@@ -11001,16 +11201,22 @@ impl XhciController {
                 //   * fresh_at_expiry=yes (repeatedly) -> consumer-side defect — the pump's own
                 //     drain failed to consume a live event, and the necropsy's "posted and never
                 //     consumed" clause is a true finding about `has_event`/cycle bookkeeping;
-                //   * fresh_at_expiry=no fresh_now=yes -> print-latency artifact — the event
-                //     landed during this printout, and a necropsy that now finds a fresh event at
-                //     the dequeue slot photographed its own serial delay, not a consumer defect;
-                //   * fresh_at_expiry=no fresh_now=no  -> the transport-wedge verdict stands.
+                //   * fresh_at_expiry=no fresh_now=yes -> the event landed after expiry. BOTBOUND
+                //     splits this case, which is the whole reason instrument 1 exists: read
+                //     `late=` on the `[botbound]` line above. late=yes means it landed inside the
+                //     50 ms re-peek, BEFORE a byte was printed — the budget was SHORT for a slow
+                //     device, not the ring dead. late=no means it appeared only during the printout
+                //     that followed — the print-latency artifact, and a necropsy "posted and never
+                //     consumed" verdict below is then instrumentation, not a consumer defect;
+                //   * fresh_at_expiry=no fresh_now=no  -> the transport-wedge verdict stands, and
+                //     late=no on the `[botbound]` line is the independent confirmation that the
+                //     ring stayed silent for a further 50 ms past a budget it had already blown.
                 let bc_fresh_now = {
                     let guard = EVENT_RING.lock();
                     guard.as_ref().map(|r| r.has_event()).unwrap_or(false)
                 };
                 serial_println!(
-                    ":: BOT: [botclaim] expiry-peek slot={} fresh_at_expiry={} fresh_now={} — yes/* convicts the pump's consumer; no/yes convicts print-latency (a necropsy 'posted and never consumed' verdict below is an instrumentation artifact); no/no confirms the transport wedge ::",
+                    ":: BOT: [botclaim] expiry-peek slot={} fresh_at_expiry={} fresh_now={} — yes/* convicts the pump's consumer; no/yes is split by late= on the [botbound] line above (late=yes: the budget was short; late=no: print-latency, so a necropsy 'posted and never consumed' verdict below is an instrumentation artifact); no/no confirms the transport wedge ::",
                     slot,
                     if bc_fresh_at_expiry { "yes" } else { "no" },
                     if bc_fresh_now { "yes" } else { "no" });
