@@ -3588,11 +3588,13 @@ const _: () = assert!(BIN_TILEALLOC_BYTES >= MESA_MIN_TILE_ALLOC_BYTES);
 // `v3d_vs_set_prog_data` (broadcom/compiler/vir.c) NEVER emits 1: it computes
 //   vcm_cache_size = CLAMP(vpm_output_batches - 1, 2, 4)   (the field's HW-valid floor is 2, ceiling 4)
 // and `v3d_compute_vpm_config` copies it verbatim into VCM_CACHE_SIZE's binning+rendering fields
-// (vpm_cfg{,_bin}->Vc). For our fixed minimal draw on the Pi 4's 16 KiB VPM:
-//   sector = V3D_CHANNELS(16)·4·8 = 512 B → 16384/512 = 32 sectors → half = 16;
+// (vpm_cfg{,_bin}->Vc). For our fixed minimal draw on the MEASURED part — boot 14's [v3d103] VPMSIZE
+// read 8 KB of VPM off V3D_CTL_IDENT1 (this comment previously assumed 16 KiB, pre-measurement):
+//   sector = V3D_CHANNELS(16)·4·8 = 512 B → 8192/512 = 16 sectors → half = 8;
 //   vpm_output_size = 1 sector (6-word coord output rounds to 1); vpm_input_size folds to 0
-//   (separate_segments = false, vir.c) → vpm_output_batches = 16/1 = 16 → CLAMP(15,2,4) = 4.
-// The CLAMP ceiling is 4, so any 1-sector-output shader yields 4 regardless of exact VPM size. THE
+//   (separate_segments = false, vir.c) → vpm_output_batches = 8/1 = 8 → CLAMP(7,2,4) = 4.
+// The CLAMP ceiling is 4, so any 1-sector-output shader yields 4 on every part ≥ 8 KB (the old
+// 16 KiB derivation gave CLAMP(15,2,4) = 4 — same value; audit v3d.md §49.25.9a). THE
 // PI-V3D-23 empty-bin fix: Vc = 1 is below the GFXH-1744 floor (Mesa: "we can't go lower than 2 due to
 // GFXH-1744, which makes an odd hardware bug that manifests as corrupt vertices"); a starved VCM cannot
 // stage the coord shader's binned vertices for the PTB, so the PTB emits nothing — pool stays all-zero,
