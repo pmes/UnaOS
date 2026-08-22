@@ -1688,7 +1688,7 @@ any MTRR type, so the MSR was the only missing piece.
 
 ```
 :: SCHED-X86: RENDER on core 1 + INPUT/usb-pump on core 7 (7 AP(s) dispatching) — OS on its own scheduler ::
-:: SCHED-X86 PLACE: aps=7 render=c1 svc=c7 worker=[c2,c3,c4] xhci=[c2,c3] tier=exclusive pool=5 ::
+:: SCHED-X86 PLACE: aps=7 rsvc=c1 svc=c7 worker=[c2,c3,c4] xhci=[c2,c3] tier=exclusive pool=5 sched=all-cores ::
 :: SCHED-X86: BSP entered run loop cpu=0 ::
 :: SCHED-X86: usb-pump task dispatched on core 7 ::
 :: SCHED-X86: input task dispatched on core 7 ::
@@ -1938,18 +1938,36 @@ migration cannot falsify what it was built for). For `CPU_AUTO` it scans the
 **dispatching** cores — `ONLINE_MASK`, set at the top of `run()`, which is the "is this
 core actually popping its queue" predicate `bg_place_cpu` has wanted since WINX-3 — and
 picks by (1) shallowest ready queue, (2) lowest SCHEDLOAD-X86 busy percent, (3) a
-rotating cursor. Three exclusions, of two different kinds:
+rotating cursor. **Two** exclusions, of two different kinds:
 
 | # | excluded | kind | relaxes? |
 | --- | --- | --- | --- |
 | 1 | core 0, for a **cooperative** (IF=0) ring-3 task | correctness — it masks the timer for its lifetime and freezes the global ms-clock | **never** |
 | 2 | the **service** core | deadlock — `x86_usb_pump` holds the raw `XHCI_CONTROLLER` spinlock there, and a co-located preemptible task that also takes it (any ring-3 program touching storage) can preempt the holder then spin on a lock whose owner cannot run. This is `xhci_worker_cpu`'s rule, which DECLINES rather than co-locate | tier 2 |
-| 3 | the **render** core | performance — it owns the panel and hosts the shell, and it is the core the imbalance piled onto | tier 3 |
 
-Rules 2 and 3 relax in tiers mirroring `smp::worker_pool`'s
-`Exclusive`/`SvcShared`/`RenderShared`, so a machine with too few dispatching cores
-still places somewhere real. Rule 1 has no tier. `run_user_image` and `bg_place_cpu`
-now pass `CPU_AUTO`, which closes the open item above.
+Rule 2 relaxes in one tier so a machine with too few dispatching cores still places
+somewhere real. Rule 1 has no tier. `run_user_image` and `bg_place_cpu` now pass
+`CPU_AUTO`, which closes the open item above.
+
+**NO RESERVING CORES — the third exclusion is gone (Peter, 2026-08-19).** A rule 3 used
+to sit in that table: the **render** core, excluded on performance grounds ("it owns the
+panel and hosts the shell, and it is the core the imbalance piled onto"), relaxing at
+tier 3. The bench refuted it. Across a full six-vug sitting the metal capture read c1 at
+**0–5 %** while every other core ran **64–82 %** — the machine holding 12.5 % of itself
+idle for a latency budget that is never spent there, because the composite actually runs
+on the *presenting task's* core. Peter's ruling is verbatim: **"THERE IS NO RESERVING
+CORES."** The render core is now an ordinary member of the dispatch pool — placed onto by
+`pick_cpu` and `sibling_online_cpu` on the same key chain as any other core, a steal thief
+in `try_steal`, and a victim as it always was. The render *service task* is unchanged:
+still spawned pinned to its core, where it blocks in `GUI_CHANNEL` `recv` and costs that
+core nothing while it does.
+
+The service-core exclusion (rule 2, and its `try_steal` twin) **survives the ruling** and
+must never be cited as precedent for reviving a reservation: it prevents a deadlock, it
+does not hold capacity. The same goes for `smp::worker_pool`'s render exclusion, which is
+about WHERE a handful of named fixtures are spawned (a cooperative IF=0 fixture parked on
+the render core stalls the panel; `xhci_worker_cpu`'s takers share a raw spinlock with the
+shell) and holds no capacity idle.
 
 **Correction — `try_steal`.** Placement is one guess made at spawn; stealing is what
 makes a wrong guess cheap. An idle core — one whose own queue came up empty — takes one
@@ -1958,9 +1976,11 @@ the **victim's lock only** (re-checking depth), release, re-home `task.cpu`, pus
 locally. One lock at a time, so no ordering hazard. `STEAL_MIN_DEPTH = 2` leaves the
 last ready task at home, which is what stops two idle cores ping-ponging a lone task.
 `steal_one` scans **LOW→HIGH** priority — take a core's background work, never its most
-urgent task. Neither the render core nor the service core steals — exclusions 2 and 3
-above, repeated here because a steal is a placement decision `pick_cpu` never sees — but
-both remain valid *victims*, since draining eligible work off them is the point.
+urgent task. The **service** core does not steal — exclusion 2 above, repeated here
+because a steal is a placement decision `pick_cpu` never sees — but it remains a valid
+*victim*, since draining eligible work off it is the point. (The render core used to be
+excluded here too; the 2026-08-19 no-reservation ruling removed it, and it now steals like
+any other core.)
 Exclusion 1 is likewise repeated in `steal_one`'s predicate.
 
 **Eligibility is the pin contract, and on x86 that includes ring-3 tasks.** `Task.steal_ok`
@@ -2015,7 +2035,7 @@ the conditional exists for.
 **Witnesses.**
 
 ```
-:: SCHEDPLACE-X86: '<name>' -> c<N> (q=<depth> load=<pct>% from c<caller>) ::   (first 24 auto-placements)
+:: SCHEDPLACE-X86: '<name>' -> c<N> (ld=<key> cred=<inflight> load=<pct>% from c<caller>) ::  (first 24 auto-placements)
 :: [smpbal] steal '<name>' c<A>->c<B> ::                                       (first 24 migrations)
 [schedx86] load c0=…% … sw=[…] q=[…] steal=<moves>/<passes> asgen=<gen>/<reloads>  (every ~5 s)
 ```
@@ -2092,9 +2112,11 @@ passes, over ten minutes, on a visibly lopsided machine.**
 stop — it starts exactly where `sys_thread_spawn` asked and an idle core may correct it
 later, which is this arch's whole stated model. `sibling_online_cpu` now chooses among the
 eligible cores with `pick_cpu`'s key chain (shallowest queue, then lowest rolling busy
-percent, then the shared rotating cursor), deprioritising render/service in a two-step
-ladder rather than excluding them — excluding them outright would reintroduce the silent
-`bg_place_cpu` hang its probe exists to prevent. And the floor is asked of the *victim*:
+percent, then the shared rotating cursor), deprioritising the service core in a two-step
+ladder rather than excluding it — excluding it outright would reintroduce the silent
+`bg_place_cpu` hang its probe exists to prevent. (It deprioritised the render core on the
+same rung until the 2026-08-19 no-reservation ruling; that core is now scored like any
+other sibling.) And the floor is asked of the *victim*:
 depth 1 suffices when the victim is running something (that is two runnable tasks), while a
 victim at `PRIO_IDLE` keeps the floor of 2, because that core is between tasks and about to
 dispatch the very task a thief would take — which is the ping-pong the constant was
@@ -2277,7 +2299,10 @@ depth-1 rebalance VUGSPREAD added is untouched; the rtpi priority-boost exemptio
 holder is always stealable) is untouched; and knob-off the `not(rtpi)` branch remains the vug-storm
 code with only the window widened.
 
-**The decay question, decided: `Task::migrations` never resets.** The gate is RECENCY-based — a
+**The decay question, decided: `Task::migrations` never resets.** *(SUPERSEDED 2026-08-19 by
+SPREADSETTLE, below. The argument in this paragraph is sound about STRANDING and wrong about COST,
+and the boot-4 capture measured the difference. Kept verbatim because the next person to reach for a
+decay must know which half of it still holds.)* The gate is RECENCY-based — a
 `migrate_ms` older than the capped 256 ms window clears it regardless of how large the count has
 grown — so a long-settled task is always immediately stealable and history alone can never strand a
 task on a bad core: a genuine topology change (a vug CLOSE freeing a core) sees every settled
@@ -2297,6 +2322,107 @@ keeps climbing at hundreds per second, or where `pack`+`spare` co-existence pers
 seconds of storm with `pinned=0`, refutes the escalation shape itself — the next lever is the cap or
 the base, and the revert criterion above (restore `steal_floor` to `STEAL_MIN_DEPTH`) still stands
 behind it, unchanged in its numbers.
+
+### The escalation saturated, and the placement was blind (x86_64, SPREADSETTLE)
+
+The boot-4 capture of 2026-08-19 answered the paragraph above with a refutation, on the escalation's
+own terms. Over 350 s of a six-vug sitting: `remig/moves = 1.00` sustained, `cool=` climbing
+6 600–11 500/s, `pack >= 1` **with** `spare >= 1` in every 5 s sample, ~184 k whole-TLB flushes per
+5 s bought with it. That is the "refutes the escalation shape itself" row, and it convicts two
+independent defects — one in the corrector, one in the placer.
+
+#### Defect A — the cooldown ladder had no gear left
+
+`steal_cooldown_ms` was keyed on `Task::migrations`, a **lifetime tally that only climbs**. Any task
+surviving four re-steals is parked at the terminal 256 ms window permanently, so the corrector re-pays
+a quarter-second refusal storm for every single move it makes, forever. The window did not terminate
+the ping-pong; it set the ping-pong's period and then ran out of ladder.
+
+**Repair 1 — the ladder decays.** Policy moves off `migrations` onto a new `Task::steal_esc`
+(`0..=STEAL_COOLDOWN_ESC_CAP`), which goes **up** one per migration and **down** one per full
+cooldown window served sitting still (`decayed_esc`). `migrations` keeps counting for the witness and
+is no longer policy input at all. This is not a retreat from the never-reset argument, it is that
+argument applied to the right quantity: what must not be erased is evidence of *recent* churn, and a
+ping-ponging task is by construction re-stolen *inside* its window, so it serves no window and decays
+nothing. What is erased is history the task has demonstrably stopped exhibiting — 496 ms of stillness
+walks a level-4 task back to level 0. The wake-side-reset objection is untouched and still honoured:
+decay is keyed on `migrate_ms` residency, not on queue events, so block → wake → push decays nothing.
+
+`decayed_esc` cannot change the cooldown *test*'s answer — its first step requires
+`resident >= steal_cooldown_ms(esc)`, the exact negation of the test — so the test stays a single
+shift and the walk runs once, on the steal path, bounded to four iterations by the write-side clamp.
+
+**Repair 2 — a sustained-idle thief is not a ping-pong thief.** Decay alone cannot collapse `cool`:
+in a limit cycle whose period *is* the window, one level decayed and one earned cancel and the ladder
+sits at equilibrium — correct for the ladder, useless for the machine, because the refusals in
+between are the 11 500/s. The term that ends them is the one this file's own `[spread]` reading table
+already prescribed ("let a depth-1 steal through when the thief has been idle for more than one
+pass"). A thief that has been **continuously empty** for at least `STEAL_COOL_BYPASS_MS` (= the base
+window, 16 ms) may take a cooling task from a victim that is genuinely packed — running, with ready
+work behind it. Both conditions are required. The brake's premise is a thief that went idle for a few
+hundred microseconds while a vug sat in `SYS_WIN_PRESENT`; a core that has held nothing for a whole
+base window is not that thief, and the imbalance it is looking at is real. New per-core state:
+`SchedCpu::idle_since_ms`, set on the empty-queue arm (only when unset, so a staying-empty core
+accumulates one span) and cleared at the single dispatch site.
+
+Rate-bounded by construction rather than by a counter: a bypass steal gives the thief work, so it
+must re-earn the whole window before bypassing again — at most one cooldown-overriding move per idle
+core per 16 ms, against the ~540/s boot-4 measured. The pin contract and the cooperative-ring-3 /
+core-0 rule are **never** bypassed; only the cooldown is, because only the cooldown is tuning.
+
+#### Defect B — spawn placement was blind on an idle machine
+
+`pick_cpu` / `sibling_online_cpu` keyed on (queue depth, rolling busy percent, rotating cursor). On
+an idle machine during a burst, **both measured keys go blind at the same time and for opposite
+reasons**: a placed task is popped and running before the next spawn reads the queue, so depth reads
+0 everywhere; and 47 ms of new work does not move a ~250 ms lagging window, so the percent reads 0
+too. The whole decision fell to the cursor — and the cursor was itself collapsing, because it was
+applied modulo `MAX_CPUS` while the choice was over the *eligible* cores: every cursor value landing
+on an excluded core handed its turn to the same successor (2 of 8 values with the service core
+excluded, 3 of 8 with core 0 also excluded for a cooperative spawn). Four of six vugs landed
+together, every `SCHEDPLACE-X86` line printing `load=0%`.
+
+**Repair 3 — an in-flight placement credit.** `PLACE_BURST` / `PLACE_LAST_MS` record how many
+`CPU_AUTO` placements each core has been handed within `PLACE_BURST_MS` (pinned to `LOAD_WINDOW_MS`,
+250 ms — the identity is the argument: the credit covers exactly the interval `busy_pct` is
+structurally blind in). The primary key becomes `max(depth, credit)` — `max`, not `+`, so a task that
+*is* still queued is never counted twice. The credit is the one number that is neither instantaneous
+nor lagging: it is what the placer has already decided, which no measurement of the machine can
+report yet. `pick_cpu` and `sibling_online_cpu` share it, for the same reason they share the cursor.
+
+**Repair 4 — rotate over the eligible set.** Both functions now gather the eligible cores into a
+stack array (`MAX_CPUS` triples, no allocation, lock discipline unchanged) and then choose with the
+cursor taken modulo `n`. That is what round-robin means and what the cursor was always documented to
+provide.
+
+**Wire.** `[spread]` gains `byp=` (`STEAL_COOL_BYPASS` — cooldown overrides that took a task the
+window refused) and `dcy=` (`STEAL_ESC_DECAYED` — escalation levels shed). `SCHEDPLACE-X86`'s `q=`
+becomes `ld=` (the key is now `max(depth, credit)`, so a field labelled `q=` would print a queue
+depth the queue does not have) and gains `cred=`.
+
+**Falsifiers, and they are three-term readings — `cool` is never read alone again.**
+
+| the next boot shows | reading |
+| --- | --- |
+| six-vug launch: six `SCHEDPLACE-X86` lines on **distinct** cores, `cred=` stepping up within the burst | **PASS** on Defect B. |
+| a launch burst still clumping, with `cred=` climbing on the winner | the credit is live and being outvoted — the blindness is not in the keys this arc repaired. Look at `ld=`: if it is 0 on a core that just took a placement, `place_charge` is not reaching the path the spawn used. |
+| steady state: `cool` / `byp` / `dcy` all flat after the launch transient, `remig/moves` off 1.00, `pack`+`spare` co-existence closed | **PASS** on Defect A. |
+| `cool` climbing with `dcy=0` and `remig/moves` at 1.00 | the ladder is at equilibrium — every task re-stolen strictly inside its window, so nothing serves a window and nothing decays. Not a decay failure; decay has nothing to act on. The working term here is `byp`; if that is also flat the fleet is genuinely thrashing and the *base* window is the lever. |
+| `pack>=1`, `spare>=1`, `decl p:` and `cool` climbing, `byp=0` | **unreachable post-fix.** A core that stays spare earns the bypass within 16 ms, so either `byp` climbs or the `spare` column is lying about an idle core. |
+| `byp` climbing steadily rather than settling flat | **the bypass became the ping-pong.** 16 ms of continuous idleness is not separating a correcting thief from a `SYS_WIN_PRESENT` blip on this hardware. Raise `STEAL_COOL_BYPASS_MS`; do not remove the mechanism, which restores the boot-4 refusal storm verbatim. |
+
+**Metal falsifier (this arc's DONE is QEMU + `strings`; the behaviour is metal).** Six-vug launch
+spreads across distinct cores; steady-state `remig/moves` collapses from 1.00; no core sitting at 0 %
+while another is packed.
+
+**Tuning constants are bench-priced, not portable.** `STEAL_COOLDOWN_MS`, `STEAL_COOLDOWN_ESC_CAP`,
+`STEAL_COOL_BYPASS_MS` and `PLACE_BURST_MS` are priced against the 8-core rMBP. The pi track carries
+its own spreadtune numbers; both sets are to be re-priced together at the next trunk sync rather than
+assumed to transfer.
+
+**No capacity is held.** Nothing here reintroduces a reservation (Peter's NO-RESERVING-CORES ruling,
+`f4bd5a73`): the bypass *widens* who may take work and the credit only reorders equally-idle
+candidates. The service-core steal exclusion is untouched — it is a deadlock rule, not a reservation.
 
 **Naming the moves.** `STEAL_LOG_COUNT` is reset at each `storm_census` boundary. The cap of
 24 named migrations per boot was generous when a boot produced one steal; with the corrector

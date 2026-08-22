@@ -289,6 +289,17 @@ const OUT_OPEN: u8 = 1;
 const OUT_PICK: u8 = 2;
 const OUT_KEPT: u8 = 3;
 const OUT_DISMISS: u8 = 4;
+// ARC D M1 — **THE CLICK-HOLD DUPLICATE GUARD IS GONE FROM THIS FILE.** `ACTED_GEN`, `OUT_DUP` and
+// the `dup-hold` outcome word existed because the input path could deliver TWO press edges for one
+// physical click: `ehci::note_buttons`'s quiet-gap arm manufactured a press out of a drifting hold,
+// and the x86 router's stale-latch arm routed it. This menu was the only press target where that was
+// visible — every other one is idempotent, while a TOGGLE opened and immediately closed, "1 click to
+// activate and 1 to open" (bench, 2026-08-18).
+//
+// The producer now guarantees one press edge per gesture (motion discriminates a drift from a
+// re-landed finger, and a recovered press synthesises its own missing release first), so a second
+// edge inside one hold cannot be produced and this guard could never fire again. A guard that cannot
+// fire is not protection, it is a claim that the bug is still there — so it comes out with the bug.
 
 /// CLOBBER-REPAIR (PA41) — passes in which a window the compositor painted had intersected the rows
 /// the OPEN dropdown last painted. The bar's and the dock's counter, on the same terms; `clob=` on the
@@ -622,6 +633,9 @@ pub fn press_at(x: i32, y: i32) -> bool {
         (fb.width(), fb.height())
     };
 
+    // ARC D M1 — every press that reaches this function is a press. The duplicate guard that used
+    // to stand here (a release-generation comparison against the live hold) is gone: the input
+    // producer no longer emits two edges for one click. See the section above the constants.
     if OPEN.load(Ordering::Acquire) {
         if let Some(r) = menu_rect(pw, ph) {
             if menu_contains(r, px, py) {
@@ -724,12 +738,23 @@ fn repaint_vacated(r: strip::Rect) {
 pub fn compose() -> bool {
     if !OPEN.load(Ordering::Relaxed) {
         // Closed. Owe the pixels of a menu just dismissed, once — and hand them back to their OWNERS.
+        //
+        // CRYSTAL-DISMISS (metal boot 8 review) — the ERASE lands before the slot is cleared, not
+        // after. `strip::erase_rect` can DECLINE (a contended scratch under storm load, a surface
+        // that is not ready), and clearing first turned that decline into a silent loss: the slot
+        // read empty, [`paint_owed`] answered "nothing owed", and the dismissed dropdown's pixels
+        // stood on the glass with no pass ever coming back for them — the state machine right and
+        // the glass wrong, the mirror image of the boot-8 leak. Keeping the slot until the erase
+        // has PAINTED keeps the debt visible: `paint_owed` stays true, and the gate holder's re-run
+        // loop / the next composite retries the erase.
         if SLOT.packed() != 0 {
             let r = SLOT.rect();
+            if !strip::erase_rect(r) {
+                return false; // erase declined: still owed, still in the slot — the next pass retries
+            }
             SLOT.clear();
-            let painted = strip::erase_rect(r);
             repaint_vacated(r);
-            return painted;
+            return true;
         }
         return false;
     }
@@ -757,13 +782,17 @@ pub fn compose() -> bool {
     );
 
     // The menu cannot be placed on this panel (too small) — erase anything we owed and stand down.
+    // CRYSTAL-DISMISS — erase-then-clear, as on the dismissed path above and for the same reason: a
+    // declined erase must stay owed, not be silently forgotten with its pixels still on the glass.
     let Some(r) = rect else {
         if SLOT.packed() != 0 {
             let old = SLOT.rect();
+            if !strip::erase_rect(old) {
+                return false;
+            }
             SLOT.clear();
-            let painted = strip::erase_rect(old);
             repaint_vacated(old);
-            return painted;
+            return true;
         }
         return false;
     };

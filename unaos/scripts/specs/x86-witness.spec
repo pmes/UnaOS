@@ -1199,18 +1199,39 @@ FORBID \[wc-k\] .*outside=[1-9]
 # --- WCH-STALL: THE TEAR TEST'S STALL GUARD, ASSERTED FOR SELF-CONSISTENCY -------------------
 # --- The [wc-h] rollup's `stalls=` (inserted after `torn=`) counts slow presents the tear test
 # --- convicted of DESCHED rather than tear: present_us outran the beam but the per-4KiB rate was
-# --- > STALL_SPREAD (8) x this window's own floor (video/wcg.rs, H_STALL). The [wc-h] family
+# --- > STALL_SPREAD x this window's own floor (video/wcg.rs, H_STALL). The [wc-h] family
 # --- stays the pi4 gate's subject (see the bullet above); what belongs HERE is the guard's
 # --- internal consistency, because a conviction REQUIRES a spread: a present convicted as a stall
-# --- implies an earned floor >= 1 and rate > 8x it, so maxrate/minrate >= 8 and `presspread=` in
-# --- single digits 0-7 beside a counted stall is arithmetic the emitter cannot honestly produce.
+# --- implies an earned floor >= 1 and rate > STALL_SPREAD x it, so maxrate/minrate >= STALL_SPREAD
+# --- and `presspread=` in single digits 0-7 beside a counted stall is arithmetic the emitter cannot
+# --- honestly produce.
+# --- STALL_SPREAD IS PER-ARCH AS OF THE x86 RE-PRICE (2026-08-19): aarch64 8, x86_64 256. The pin
+# --- is a hardware-population fact, measured per tree and unioned at merge (the WMCTRL ruling) --
+# --- x86's HEALTHY presspread population is a gapless continuum to 118 across 8133 metal rollups,
+# --- so a pin of 8 would let an honest present buy a tear SUPPRESSION. See the STALL-SPREAD section
+# --- of docs/dev/OS/08_VIDEO/engine.md for the tables and the reasoning.
+# --- The FORBID below is left at 0-7 rather than tightened to the x86 pin: it stays sound (a
+# --- conviction here now implies presspread >= 256, so the forbidden arithmetic is impossible by a
+# --- WIDER margin than when this was written), and the loose form is the one both trees can share.
+# --- The raise ships WITH a stall-shaped replacement assertion -- `longpres=`/`stallbound_us=` on
+# --- this rollup and the one-shot `[wc-h] ... -> STALL` line, bounding a single present's absolute
+# --- duration at 2 frames. It is deliberately NOT asserted here: maxpresent_us suffers the same
+# --- QEMU vCPU-compression that floods presspread, so a FORBID on `longpres=` would go flaky-red on
+# --- a loaded host. The metal playbook carries that assertion.
 # --- THE BOUND IS >= 2, not >= 1 (review, 2026-08-18): a window-id recycle racing an in-flight
 # --- composite of the dead tenant can land ONE stray stall count after wch_recycle reset the rate
 # --- extrema — the same bounded one-fold exposure paygo_recycle accepts — and that lone stray
 # --- beside a fresh tenant's honest presspread=1 must not wedge this gate red for the rest of the
 # --- boot. One stray cannot reach 2 (every recycle resets the counter first), while a live guard
 # --- defect convicts repeatedly, so the >= 2 form keeps the falsifier and sheds the false red.
-FORBID \[wc-h\] rollup .*stalls=([2-9]|[1-9][0-9]+) .*presspread=[0-7] pop=constant
+# --- SYNC-FOLD RE-ARM (trunk fold, 2026-08-22). THIS FORBID FAILED OPEN AT THE MERGE, SILENTLY.
+# --- Both parents carried the line above VERBATIM, so git auto-merged the file with no signal at
+# --- all — and the merged `[wc-h]` rollup inserts WCHFIX's `presspop=` BETWEEN `presspread=` and
+# --- `pop=constant` (see `wcg.rs`, key order load-bearing). `presspread=[0-7] pop=constant` can
+# --- therefore never match again, and the tripwire scores zero hits on a tree that has the
+# --- forbidden arithmetic on the wire. The new key is named EXPLICITLY rather than covered by
+# --- `.*`, so nothing further can be inserted between the two without tripping this comment.
+FORBID \[wc-h\] rollup .*stalls=([2-9]|[1-9][0-9]+) .*presspread=[0-7] presspop=[0-9]+ pop=constant
 
 # --- WCK4: THE ERASE-DISCIPLINE VERDICTS, FORBIDDEN ------------------------------------------
 # --- The [drag-occ] witness measures pixels PUBLISHED into the dragged window's live box by

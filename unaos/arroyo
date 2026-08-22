@@ -177,6 +177,15 @@ _feats=""
 # same variable (`UNAOS_WCG_PAYGO` -> `wcg-paygo`) — so the knob reaches the ESP a metal boot runs and
 # not only `check`. A knob wired into arroyo alone never reaches the boot media.
 [ -n "${UNAOS_WCG_PAYGO:-}" ] && _feats="${_feats}wcg-paygo,"
+# WCD-VALVE (boot-9 discriminator): UNAOS_WCDVALVE=1 arms the `wcdvalve` feature — suppress WC-D
+# scan-out read-back ADMISSION while composite utilisation is high (close >= 60%, reopen < 35%,
+# read from the [comp2] counters), one `[wc-d] valve CLOSED/OPEN` line per episode. A suppressed
+# admission postpones the verdict (no WCD state moved), so the battery is paid normally once the
+# valve reopens. Needs UNAOS_WITNESS to reach anything (the WC-D machinery is witness-gated);
+# x86_64 only. Default OFF => compiled out, media byte-identical. Kept in sync with
+# builder/src/main.rs, which maps this same variable — a knob wired into arroyo alone never
+# reaches the boot media.
+[ -n "${UNAOS_WCDVALVE:-}" ] && _feats="${_feats}wcdvalve,"
 [ -n "${UNAOS_SKIP_XHCI:-}" ] && _feats="${_feats}skip_xhci,"
 [ -n "${UNAOS_BOOTLOG:-}" ] && _feats="${_feats}bootlog,"
 # CLOCK-2: UNAOS_LOGTS=1 arms the `logts` feature — a compact timestamp prefix on each serial LINE
@@ -446,6 +455,31 @@ _feats=""
 # sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature disabled
 # while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson).
 [ -n "${UNAOS_BTC:-}" ] && _feats="${_feats}btc,"
+# BT-BOND M1 / HOLOCRON: UNAOS_HOLOCRON=1 arms the kernel-side classed-record store — one CRC'd file
+# (`/HCRON/BTBOND.DAT`) on the writable FAT volume, a fixed in-RAM table, and the load/flush pair that
+# lets a record be PRODUCED under a driver lock (`EHCI_HID`, where the Bluetooth link key arrives) and
+# WRITTEN somewhere else entirely (the main loop, storage-gated, no lock held). `src/fs/holocron.rs`
+# is the seam; `src/drivers/ehci/btbond.rs` is its first client (class 0x01, one bond record).
+# NOT stripped by `arm_features` below, unlike bt/btc: the seam is arch-neutral and emits real
+# aarch64 code, so stripping it would DISARM the knob on aarch64 rather than preserve byte-identity.
+# The bond client sits inside the x86-gated `drivers/ehci/`, so an armed aarch64 build gets the store
+# and its framing fixture and nothing Bluetooth-shaped. M1 adds no HCI command and no radio access at
+# all; the SSP wiring is M2 and rides `btc`. Default OFF => both modules and every call site vanish,
+# media byte-identical on both arches. Kept in sync with builder/src/main.rs — a knob mapped HERE and
+# missing THERE ships the feature disabled while the banner claims it is on (s42/INSTGUI, WXN-M3b).
+[ -n "${UNAOS_HOLOCRON:-}" ] && _feats="${_feats}holocron,"
+# BT-BOND M1 / HOLOCRON SELFTESTS: UNAOS_HCRONST=1 arms the store's two BOOT-TIME-WRITE selftests —
+# `holocron::selftest_once` (writes then unlinks /HCRON/HCRNTEST.DAT) and `btbond::selftest_once`
+# (stages a fixture bond through the REAL flush, which creates /HCRON/BTBOND.DAT and leaves it behind
+# as an empty store). Its own knob and NOT part of UNAOS_HOLOCRON, by the same rule that gives `sdw` a
+# knob apart from `sdhcblk`: a boot that did not ask to WRITE the boot medium must be incapable of
+# doing so, and M2's real consumer must be able to have the store without the tests' writes. Implies
+# `holocron` in Cargo.toml, so setting this alone arms both. NOT stripped by `arm_features` below, for
+# the same reason `holocron` is not. The deferral-bound fixture is NOT behind this knob — it writes
+# nothing and rides `holocron`. Default OFF => both selftests and their call sites vanish. Kept in
+# sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature disabled
+# while the banner claims it is on (s42/INSTGUI, WXN-M3b).
+[ -n "${UNAOS_HCRONST:-}" ] && _feats="${_feats}hcronst,"
 # INSTALL-CORE: UNAOS_INSTALLDEMO=1 arms the installer engine + its x86 boot witness (GPT writer +
 # FAT32 formatter + extent content-verify). The builder attaches a dedicated BLANK scratch disk over
 # the usb-storage slot under this knob (see builder/src/main.rs), against which the engine writes a
@@ -514,6 +548,41 @@ _feats=""
 # both would put a duplicate `wifi` in the comma list on a `UNAOS_WIFI=1 UNAOS_WIFI2=1` build, which
 # is the shape the arm_features strip below rewrites textually.
 [ -n "${UNAOS_WIFI2:-}" ] && _feats="${_feats}wifi2,"
+# WVAL-REPLAY: UNAOS_WIFIVAL=1 arms the census-ABSENT REPLAY leg — the QEMU-reachable half of arc 2.
+# QEMU models no BCM4331, so the census refuses at S_START and the module parks, and everything
+# downstream of it — the FAT search, the bounds checks, `classify_header`'s container verdict and
+# arc 2's full set-validation dry-run — has never run anywhere but on the bench rMBP. With this knob
+# the ABSENT branch prints a REPLAY-armed witness, proceeds to the storage wait, stages the set off
+# the media as usual, and then runs `bringup::validate_replay()`: the set-completeness gate,
+# `validate_set()`, and one park line. That function makes NO PCI config access, maps no BAR, moves
+# no window selector and walks no core table — arc 2's device rungs are not in its call graph at all,
+# which is what scripts/specs/x86-wifival.spec's FORBIDs assert from the capture side. Routing is on
+# the RECORDED census outcome, not on the feature: with the radio PRESENT the latch is false and
+# `finish_and_park` runs `bringup_once()` exactly as today, so a wifival image on metal behaves
+# byte-identically to a wifi2 one. IMPLIES `wifi2` (and through it `wifi`). x86_64-only and stripped
+# by arm_features below. Default OFF => byte-identical media. Kept in sync with builder/src/main.rs.
+# Pushed ALONE for the same reason `wifi2` is, one rung further along: the Cargo implication pulls
+# `wifi2` and `wifi` in, and pushing them too would put duplicates in the comma list on a
+# `UNAOS_WIFI2=1 UNAOS_WIFIVAL=1` build — the shape the arm_features strip below rewrites textually.
+# See docs/dev/OS/06_NETWORK_STACK/wifi_bcma.md.
+[ -n "${UNAOS_WIFIVAL:-}" ] && _feats="${_feats}wifival,"
+# WIFI-3: UNAOS_WIFI3=1 arms arc 3's UPLOAD rung — the bcm4331 microcode upload
+# (`upload_ucode` in crates/kernel/src/wifi/bringup.rs). W5 pinned the routing gate 3 refused
+# on from the b43 open specification (SHM routing 0x0300 = microcode memory, control word
+# 0x03000000; bcm-specs.sipsolutions.net/SHM/ + /MicrocodeUpload/ + /ChipInit/ — see
+# docs/dev/OS/06_NETWORK_STACK/bcm4331.md §S4-W5), so the default build's refusal now reads
+# reason=wifi3-not-armed rather than claiming the fact is unpinned. DESTRUCTIVE on metal: the
+# upload's prologue asserts the core reset that clears MACCTL.PSM_RUN and destroys the
+# microcode the radio arrives running (bcm4331.md §5 risk 4); only a successful upload +
+# revision handshake restores a working state, which is why the rung arms only under this
+# explicit knob and the first UNAOS_WIFI3=1 boot is Peter's to schedule. QEMU models no
+# BCM4331 (the census refuses at S_START), so the upload is UNREACHABLE in QEMU and the QEMU
+# gate for this feature is compile + strings only. IMPLIES `wifi2` (the Cargo implication
+# pulls wifi2+wifi in; pushed alone for the same duplicate-token reason wifi2/wifival are).
+# x86_64-only and stripped by arm_features below. Default OFF => not one byte of the upload
+# in the image. Kept in sync with builder/src/main.rs. See
+# docs/dev/OS/06_NETWORK_STACK/bcm4331.md.
+[ -n "${UNAOS_WIFI3:-}" ] && _feats="${_feats}wifi3,"
 # VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
 [ -n "${UNAOS_VIDEOCAP:-}" ] && _feats="${_feats}videocap,"
 
@@ -528,6 +597,14 @@ _feats=""
 [ -n "${UNAOS_KEPLER_TAKEOVER:-}" ] && _feats="${_feats}nvidia-kepler-takeover,"
 [ -n "${UNAOS_KEPLER_FIFO:-}" ] && _feats="${_feats}nvidia-kepler-fifo,"
 [ -n "${UNAOS_KDISP_HOLD:-}" ] && _feats="${_feats}nvidia-kepler-kdisp-hold,"
+# PCIH / NOASPM: UNAOS_NOASPM=1 clears the ASPM-control bits (LNKCTL[1:0]) on BOTH the Kepler root
+# port and the endpoint at kepler init (drivers/gpu/pcihealth.rs) — the BAR1-wedge ASPM experiment.
+# RMW confined to LNKCTL[1:0]; prints one '[pcih] aspm cleared rp XXXX->XXXX ep XXXX->XXXX' witness
+# line. Implies nvidia-kepler (Cargo-side). The unconditional census + wedge sampler ride EVERY
+# kepler boot regardless of this knob; the knob arms only the clear. Default OFF => the clear is not
+# linked, unarmed media byte-identical. ⚠ NOT yet mapped in builder/src/main.rs (out of this arc's
+# lane) — until that one-liner lands, esp-x86 metal media cannot arm it; flagged in the arc NOTES.
+[ -n "${UNAOS_NOASPM:-}" ] && _feats="${_feats}noaspm,"
 # CE-LADDER: UNAOS_KEPLER_CE=1 arms the read-only copy-engine reconnaissance
 # (drivers/gpu/kepler_ce.rs) — R1 PTOP sweep, R2 CE PRI probe, R3 wide runlist scan, R5
 # firmware instance-block walk. Runs from kepler::init ABOVE the fifo leg, so it is upstream
@@ -566,6 +643,18 @@ _feats=""
 # inline shim and a zero-sized HoldTimer, so the boot is byte-inert on the hot path. Emits one `[rtwit]`
 # rollup line per ~5 s from the x86 render-service witness gate. Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_RTWIT:-}" ] && _feats="${_feats}rtwit,"
+# DEADMAN: UNAOS_DEADMAN=1 arms THE INSTRUMENT THAT SURVIVES THE WEDGE (`deadman`) — one `[deadman]`
+# line per second driven from the APIC TIMER ISR, emitted UNCONDITIONALLY (including when every counter
+# is zero) so that SILENCE IS DISTINGUISHABLE FROM IDLENESS. Every other x86 instrument (`spread`,
+# `rtwit`, `schedx86`, `dock`, `menubar`) is emitted BY the render-service pass, so metal boot 11 lost
+# all five in ONE event and left 91 s with no data at all; `shell.rs` already names the gap ("on x86
+# there is NO instrument that survives a starved shell"). This is that instrument. It never takes
+# `COMP_GATE`, never calls the blocking `pal::event_queue_depth()` or `wm::table()`, and reports `?`
+# rather than waiting when `TABLE` is busy. Pure measurement: changes no scheduling/locking/present
+# behaviour. x86_64-only in effect (the real impl is `target_arch = "x86_64"`-gated; aarch64 gets the
+# inline shim). DEFAULT OFF => every hook is an empty inline shim, so an unarmed kernel carries no
+# counter and no `[deadman]` string. Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_DEADMAN:-}" ] && _feats="${_feats}deadman,"
 # R1 / RTPI: UNAOS_RTPI=1 arms PRIORITY INHERITANCE on the x86 sleeping `Mutex` (arch::x86_64::sched)
 # plus its `[rtpi]` witness. Unlike RTWIT (a pure ruler), this CHANGES scheduling: while a strictly-
 # higher task blocks on a `Mutex`, the holder inherits the blocker's priority (transitively) until
@@ -863,6 +952,18 @@ arm_features() {
     # every aarch64 media hash between a default build and a `UNAOS_NOKBDWIT=1` one for zero
     # observable change. Stripped => aarch64 media are byte-identical either way.
     f="${f//,kbdwit,/,}"
+    # DEADMAN rides the same strip, for the same reason: the real instrument is
+    # `all(feature = "deadman", target_arch = "x86_64")`-gated and every counter, the emit and both
+    # `wm` samplers live inside it, so `deadman` emits not one byte of aarch64 CODE — the aarch64
+    # half is the empty `#[inline(always)]` shim, which compiles to nothing. But an enabled feature
+    # is hashed into cargo's `-Cmetadata` fingerprint, so leaving it in would shift every aarch64
+    # media hash between a default build and a `UNAOS_DEADMAN=1` one for zero observable change.
+    # Stripped => the x86 track can arm a timer-ISR witness without touching Pi or Jetson media.
+    # ⚠ This strip governs MEDIA only. `deadman` IS named on the `arm-pi` type-check leg above, and
+    # must stay there: the hooks in `video/wm.rs` (`note_attach`, `note_composite_done`) are
+    # ARCH-NEUTRAL call sites, so the shim half has to compile armed on aarch64 or the seam is
+    # covered on neither arch.
+    f="${f//,deadman,/,}"
     # SDHC-4a rides the same strip, for the same reason: `drivers/sdhc.rs` is reached only from
     # `arch/x86_64/pci.rs`, so `sdw` emits not one byte of aarch64 CODE — but leaving it enabled would
     # shift every aarch64 media hash between a default build and a `UNAOS_SDW=1` one for zero
@@ -870,6 +971,11 @@ arm_features() {
     # points, which is the property that lets the x86 track arm a card-write knob without touching the
     # Pi or Jetson media at all.
     f="${f//,sdw,/,}"
+    # WCD-VALVE rides the same strip, for the same reason: every valve item is x86_64-gated, so
+    # `wcdvalve` emits not one byte of aarch64 CODE — but an enabled feature is hashed into cargo's
+    # `-Cmetadata` fingerprint, and leaving it in would shift the aarch64 media hash between a
+    # default build and a `UNAOS_WCDVALVE=1` one for zero observable change.
+    f="${f//,wcdvalve,/,}"
     # SDHC-4b rides the same strip: the registration call site is inside `drivers/sdhc.rs` (reached only
     # from `arch/x86_64/pci.rs`) and every block/FAT arm the knob adds is gated
     # `all(target_arch = "x86_64", feature = "sdhcblk")`, so `sdhcblk` emits not one byte of aarch64
@@ -914,6 +1020,26 @@ arm_features() {
     # does not contain `,wifi,` as a substring (the trailing comma is part of the pattern), so the
     # `wifi` strip above cannot half-rewrite it and the two lines are order-independent.
     f="${f//,wifi2,/,}"
+    # WVAL-REPLAY rides the same strip, for the same reason and as a consequence of the same fact:
+    # `wifival` implies `wifi2`, whose only code is the x86-gated `src/wifi/`, and `validate_replay`
+    # is a sibling function inside `bringup.rs` under that same gate — so `wifival` emits not one
+    # byte of aarch64 CODE. An enabled feature is still hashed into cargo's `-Cmetadata` fingerprint,
+    # so leaving it in (or its implied `wifi2`/`wifi`, both stripped above) would shift every
+    # Pi/Jetson media hash between a default build and a `UNAOS_WIFIVAL=1` one for zero observable
+    # change. Order-independent with the two strips above by the same argument they make about each
+    # other: `,wifival,` does not contain `,wifi,` or `,wifi2,` as a substring, because the trailing
+    # comma is part of every pattern.
+    f="${f//,wifival,/,}"
+    # WIFI-3 rides the same strip, for the same reason and as a consequence of the same fact:
+    # `wifi3` implies `wifi2`, whose only code is the x86-gated `src/wifi/`, and `upload_ucode`
+    # is a sibling function inside `bringup.rs` under that same gate — so `wifi3` emits not one
+    # byte of aarch64 CODE. An enabled feature is still hashed into cargo's `-Cmetadata`
+    # fingerprint, so leaving it in (or its implied `wifi2`/`wifi`, both stripped above) would
+    # shift every Pi/Jetson media hash between a default build and a `UNAOS_WIFI3=1` one for
+    # zero observable change. Order-independent with the strips above by their own argument:
+    # `,wifi3,` does not contain `,wifi,` or `,wifi2,` as a substring, because the trailing
+    # comma is part of every pattern.
+    f="${f//,wifi3,/,}"
     # BT-L0 (GR21) rides the same strip, for the same reason and by the same mechanism as `kbdwit`
     # above: every line `bt` gates lives in `drivers/ehci/mod.rs`, which is declared
     # `#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]`, so `bt` emits not one byte of
@@ -954,6 +1080,12 @@ arm_features() {
     # too, which makes this paragraph true as written and demotes the strip back to what every other
     # entry here is: fingerprint hygiene, not a load-bearing dependency.
     f="${f//,gen7,/,}"
+    # PCIH / NOASPM rides the same strip, for the same reason: every noaspm-gated byte lives in
+    # the x86_64-only half of drivers/gpu/pcihealth.rs, so the feature emits not one byte of
+    # aarch64 CODE — but an enabled feature is hashed into cargo's -Cmetadata fingerprint, so
+    # leaving it in would shift every aarch64 media hash for zero observable change. Stripped =>
+    # the x86 track can run the ASPM experiment without touching Pi or Jetson media.
+    f="${f//,noaspm,/,}"
     f="${f#,}"; f="${f%,}"
     if [ -n "$f" ]; then printf -- '--features %s' "$f"; fi
     return 0
@@ -1644,7 +1776,7 @@ check_user_arch() {
 }
 
 # GATE-CFG: the DEFAULT feature set is a tiny fraction of this kernel. `[features]` in
-# crates/kernel/Cargo.toml carries 87 knobs plus `default = []`, so the two legs below compile only
+# crates/kernel/Cargo.toml carries 98 knobs plus `default = []` (RE-COUNTED with the awk one-liner below on the PCIH tree, 2026-08-19: the 87 recorded on GR21 had gone stale by ten other-lane knobs before `noaspm` — the 98th, and on `x86-all` below — landed), so the two legs below compile only
 # (this count was stale at 78 when GR20's `bcmarecon` was added — the real count was already 82,
 # four other-lane knobs having landed without it being bumped; and it was stale AGAIN at 84 for
 # `sdhcblk` — the real count at that base was 85, `wxnro` having landed on `x86-all` without the
@@ -1747,9 +1879,15 @@ KERNEL_CFG_MATRIX=(
   # `cfg!(...)` expression, not a `#[cfg]` item, so the DISARMED polarity of `wxn_ro_stage` is already
   # type-checked by every leg. What this leg adds is the ARMED polarity — the constant folds the other
   # way, which is the build the metal flight actually carries.
+  # BT-BOND M1: `holocron,hcronst` are APPENDED at the end, and they MUST be named on an x86-* leg
+  # even though the arm-pi leg below also carries them. `x86_cfg_universe` computes "aarch64-only" as
+  # "named by an arm-* leg and NOT by any x86-* leg" and SUBTRACTS that set from the pairwise-mix
+  # universe — so adding them to arm-pi alone would have silently deleted them from the x86 mix legs,
+  # trading the aarch64 coverage hole for an x86 one. Named on both legs, the universe is unchanged
+  # and both arches type-check the seam.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the
@@ -1757,7 +1895,15 @@ KERNEL_CFG_MATRIX=(
   # PI-DESK (`pidesk` — the desktop furniture family on the Pi panel; this leg carries `witness`, so it
   # is also the only place the dock/menubar/crystal FIXTURES are type-checked on aarch64).
   # Cannot carry the tegra family — see the mutual-exclusion note above.
-  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,pidesk,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon"
+  # BT-BOND M1: `holocron,hcronst` are APPENDED at the end, and this is the coverage hole they close.
+  # Those two knobs are deliberately NOT stripped by `arm_features` — on the stated grounds that the
+  # seam emits real aarch64 CODE (`fs/mod.rs` declares the module with no arch gate; the framing
+  # fixture and the load/flush pair run on both arches) and that stripping would silently DISARM the
+  # knob there. But until now `holocron` appeared in no aarch64 leg at all, so the standing gate would
+  # not have caught an aarch64 regression in the very file the "do not strip" decision exists to
+  # protect. It is a type-check leg, so it shifts no Pi or Jetson MEDIA: `arm_features` (which media
+  # builds go through) is untouched, and `kernel8` builds from its own curated K8_FEATS.
+  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,pidesk,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman"
   # aarch64 board leg 2 — Jetson Orin Nano (Tegra234), plus the board-neutral aarch64 features that
   # would otherwise ride nothing: ORIN-SMP (tegrasmp/smpprobe), the four XCARVE levers, ORIN-NET-1..4
   # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET

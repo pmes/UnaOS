@@ -493,11 +493,95 @@ static H_MAXRATE: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 /// alone, so a stall can never manufacture `-> AT-RISK` and metal FORBIDs keep their teeth.
 static H_STALL: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
 /// WCH-STALL — how many times the window's floor rate a slow present must exceed to be convicted a
-/// stall. The measured separation is wide: real bench presents hold `presspread=1` while desched'd
-/// QEMU boots read 58–407 (the GR27 discriminator ledger), so 8 sits an order of magnitude under
-/// the smallest observed stall and a factor of 8 above the honest spread. Integer, because the
-/// rates it multiplies are.
+/// stall.
+///
+/// **This constant is arch-conditional, and that is a hardware-population fact rather than a
+/// behavioural divergence.** The number is a threshold on a MEASURED distribution, and the two
+/// trees measure different machines; pinning one value would either disarm the guard on one of them
+/// or make it convict honest presents on the other. Per-tree exact pins, unioned at merge — the
+/// WMCTRL ruling. Both pins are cited from their own tree's metal capture below.
+///
+/// **aarch64 = 8 (the pi seat's boot-8 baseline, unchanged).** There the healthy presspread
+/// population is 1–7 sustained, the AT-RISK population is `{32, 33, 84, 136}`, and the 7..32 band is
+/// EMPTY — a clean bimodal gap, so 8 is the lowest defensible threshold above the honest population.
+/// Each pi outlier is one huge `maxpresent_us` (e.g. 218876 µs) beside a normal floor (2594 µs):
+/// the desched shape this guard was built to divert.
+///
+/// **x86_64 = 256, and the reason is that this machine's honest population has no such gap.**
+/// Measured over `rmbp1-boot1/ttyUSB0.log` — 7 boots, 8133 `[wc-h] rollup` lines, every one of them
+/// `torn=0 stalls=0 -> TEAR-FREE`, i.e. an entirely HEALTHY population — `presspread=` is a dense
+/// continuum, not a pair of clusters:
+///
+/// ```text
+/// 1:4646  2:591  3:511  4:434  6:109  8:143  9:119  10:44  11:100  13:13  14:293  15:394
+/// 22:249  27:1  29:17  30:9  33:179  36:1  44:2  45:1  46:78  51:16  53:1  63:1  73:1  74:9
+/// 75:23  88:9  91:16  94:14  111:4  112:11  118:94
+/// ```
+///
+/// 20.9% of healthy x86 rollups (1699 of 8133) sit ABOVE 8, the honest ceiling is 118, and the
+/// widest interior gap (94..111) is nowhere near clean. The banded-console geometry that produced
+/// this tree's hard-won honest `presspread=8` is the same geometry that produces 36, 63, 91 and 112.
+///
+/// So on x86 the pin cannot be read off a gap; it has to be read off which ERROR is affordable. The
+/// guard only ever DIVERTS `torn=` into `stalls=`, so a false conviction SUPPRESSES a tear and
+/// disarms the `-> AT-RISK` FORBID, while a false acquittal merely lets a QEMU desched print as a
+/// tear — loud, in QEMU, where it is read by a human. At 8, an honest x86 present anywhere in that
+/// 20.9% tail that also outran the beam would be silently convicted and its tear suppressed. 256
+/// clears the entire observed honest population by 2.2x, and still sits inside the desched band the
+/// guard was priced against (58–407, the GR27 discriminator ledger), so it keeps teeth against the
+/// worst of the shape it exists for while no MEASURED honest present on this machine can buy a
+/// suppression.
+///
+/// **The x86 population also overlaps that desched band (118 honest vs 58–407 desched), which means
+/// `presspread` alone cannot discriminate on this machine at all.** That is precisely why the raise
+/// does not ship alone: [`STALL_PRESENT_US`] is the stall-SHAPED replacement assertion, and it
+/// separates cleanly on both trees where the ratio does not.
+///
+/// Integer, because the rates it multiplies are.
+#[cfg(target_arch = "aarch64")]
 const STALL_SPREAD: u64 = 8;
+#[cfg(target_arch = "x86_64")]
+const STALL_SPREAD: u64 = 256;
+
+/// WCH-LONGPRES — the STALL-SHAPED assertion: the absolute duration, in microseconds, above which a
+/// single present is named a stall in its own right, independent of any ratio.
+///
+/// **Why this exists.** [`STALL_SPREAD`]'s x86 re-price raises a threshold, and a raised threshold
+/// that suppresses verdicts must ship WITH a replacement assertion rather than as a quiet change
+/// (the pi seat's caveat, adopted here as a design rule). `presspread` is a RATIO, and a ratio can be
+/// blown out from either end — on this x86 tree the tail is driven by an anomalously FAST present at
+/// the floor (`minpresent_us` of 23–38 µs beside a normal maximum), which is not a stall at all.
+/// A stall has a shape the ratio cannot state: one present that took an ABSURD wall-clock time.
+///
+/// **The price, from both trees' metal.** Across all 8133 x86 rollups the largest `maxpresent_us`
+/// ever recorded is 7276 µs — under half a frame — and the p50 is 2384 µs. The pi's four AT-RISK
+/// outliers are single presents of ~218876 µs, thirteen frames. Two frames sits 4.6x above every
+/// present either machine has been observed to make while healthy, and 6.5x below the smallest
+/// stall-shaped present ever captured. That is the wide two-sided separation `presspread` has on the
+/// pi and has lost on x86, recovered in a quantity that does not depend on a floor.
+const STALL_PRESENT_US: u64 = 2 * FRAME_US;
+
+/// WCH-LONGPRES — per-id: presents whose wall-clock duration exceeded [`STALL_PRESENT_US`].
+///
+/// Counted over EVERY present, beside `torn=`/`stalls=` and on the same side of the budget gate, for
+/// the reason [`H_TORN`]'s move records: a census that stops at four samples describes a startup
+/// burst. Unlike `stalls=`, this counter is NOT a diversion — it does not take a present away from
+/// `torn=`, and it does not require the present to have outrun the beam. A present can be both torn
+/// and long, and both counters will say so. It therefore cannot weaken any existing verdict; it only
+/// adds a reading the ratio cannot express.
+static H_LONGPRES: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+/// WCH-LONGPRES — per-id: whether the one-shot `-> STALL` line has already been emitted for this
+/// window, so a wedged machine names its first offender and then stops paying UART for the rest.
+static H_LONGSAID: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+/// WCH-LONGPRES — per-id: the offending present's measured duration, handed from the recorder to
+/// [`stage_flush`] so the naming line is PRINTED outside the clock that timed it.
+///
+/// This is the same deferral [`emit_sample`] exists for, and for the identical reason: a
+/// `serial_println!` inside `stage_note` runs inside WC-G's clock, so the witness would be charged to
+/// the very measurement it is reporting. Zero means nothing pending — a present of zero microseconds
+/// cannot exceed [`STALL_PRESENT_US`], so the sentinel is unambiguous.
+static H_LONGUS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+
 /// WCHFIX — per-id: how many presents actually entered the rate census above. Published as the
 /// rollup's `presspop=`, immediately beside `presspread=`, because a ratio without its population
 /// is not a reading.
@@ -888,6 +972,18 @@ pub fn stage_note(
             H_TORN[i].fetch_add(1, Ordering::Relaxed);
         }
     }
+    // WCH-LONGPRES — the stall-SHAPED test, taken beside the ratio test and deliberately INDEPENDENT
+    // of it. No `present_us > rectscan_us` precondition: a present that ran for two frames is a stall
+    // whether or not the geometry it was copying happens to make that longer than the beam's own scan
+    // of the same rows. No floor precondition either — that is the whole point of the quantity. It
+    // diverts nothing, so `torn=`, `stalls=` and the verdict precedence are all exactly as they were.
+    if present_us > STALL_PRESENT_US {
+        H_LONGPRES[i].fetch_add(1, Ordering::Relaxed);
+        // Only the FIRST offender is handed to the printer; the counter keeps the rest.
+        if H_LONGSAID[i].load(Ordering::Relaxed) == 0 {
+            H_LONGUS[i].store(present_us, Ordering::Relaxed);
+        }
+    }
     H_MAXPRES[i].fetch_max(present_us, Ordering::Relaxed);
     // WCH-SPREAD — the floor and the two rate extremes, taken here for exactly the reasons the tear
     // test and `maxpresent_us` are taken here: they are censuses over EVERY present, and a spread
@@ -972,6 +1068,30 @@ pub fn stage_flush(id: u32) {
     let n = H_PEND[i].swap(0, Ordering::AcqRel);
     if n != 0 {
         emit_sample(id, i);
+    }
+    // WCH-LONGPRES — name the first present that exceeded the absolute bound, with the number it
+    // measured, once per window. Printed HERE rather than at the record for the reason this
+    // function's note gives: `stage_note` runs inside WC-G's clock.
+    //
+    // The verdict token is on its OWN line, not on the rollup's terminal. `-> TEAR-FREE` /
+    // `-> AT-RISK` / `-> UNSTAGED` are matched by two tracks' regression specs (see
+    // [`stage_rollup`]'s key-order note), and a fourth terminal arm would change what a line those
+    // specs already guard is claiming. A new line is an insertion in the same sense a new field is:
+    // it adds an assertion without redefining an existing one. The rollup carries the COUNT
+    // (`longpres=`) and the BOUND (`stallbound_us=`); this line carries the evidence.
+    let longus = H_LONGUS[i].swap(0, Ordering::Relaxed);
+    if longus != 0 && H_LONGSAID[i].swap(1, Ordering::Relaxed) == 0 {
+        // `minpresent_us=` beside it is what makes the reading a SHAPE rather than a number: a stall
+        // is one absurd present beside a normal floor, which is exactly the pi's 218876-vs-2594. A
+        // window whose floor is up there with it is uniformly slow, which is a different fault.
+        let minp = H_MINPRES[i].load(Ordering::Relaxed);
+        serial_println!(
+            "[wc-h] win={} present_us={} bound_us={} minpresent_us={} -> STALL",
+            id,
+            longus,
+            STALL_PRESENT_US,
+            if minp == u64::MAX { 0 } else { minp },
+        );
     }
     // FBCON-DMG — the whole-box rollup fires as it always did, at the first flush that observes the
     // whole-box/decline budget spent. The banded one is new and fires on its own budget, which in a
@@ -1325,8 +1445,17 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
     // rule, directly after `torn=` — the population it was diverted from — and WCHUN's
     // `decl_geom=`/`decl_cap=`/`decl_lock=`/`decl_alloc=` go directly after the `declines=` total they
     // decompose, inside `pop=all-presents` because they share that population exactly.
+    //
+    // WCH-LONGPRES adds two, by the same rule and on the same reasoning about which marker owns
+    // which kind of number: `longpres=` is a MEASURED census, so it goes inside `pop=all-presents`
+    // beside the two counters it is read against; `stallbound_us=` is a compile-time constant, so it
+    // goes after `pop=constant` beside `frame_us=`, where a reader can see the bound the count was
+    // taken against without knowing the source. Both are insertions; the terminal stays terminal.
+    //
+    // SYNC-FOLD 2026-08-22 — `presspop=` sits DIRECTLY after `presspread=`: the pi4 spec's AT-RISK
+    // FORBID and the re-armed x86-witness FORBID both key on that adjacency. Arity is 27 = 27.
     serial_println!(
-        "[wc-h] rollup win={} scope={} emit={} age_ms={} pop=budgeted samples={} budget={} pop=all-presents torn={} stalls={} declines={} decl_geom={} decl_cap={} decl_lock={} decl_alloc={} fixture={} whole={} banded={} lines={} minspan={} minspan_bytes={} maxpresent_us={} minpresent_us={} presspread={} presspop={} pop=constant frame_us={} -> {}",
+        "[wc-h] rollup win={} scope={} emit={} age_ms={} pop=budgeted samples={} budget={} pop=all-presents torn={} stalls={} longpres={} declines={} decl_geom={} decl_cap={} decl_lock={} decl_alloc={} fixture={} whole={} banded={} lines={} minspan={} minspan_bytes={} maxpresent_us={} minpresent_us={} presspread={} presspop={} pop=constant frame_us={} stallbound_us={} -> {}",
         id,
         scope,
         emit,
@@ -1335,6 +1464,7 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
         SAMPLES,
         torn_n,
         H_STALL[i].load(Ordering::Relaxed),
+        H_LONGPRES[i].load(Ordering::Relaxed),
         decl_n,
         declby(DECL_GEOM),
         declby(DECL_CAP),
@@ -1351,6 +1481,7 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
         presspread,
         H_RATEN[i].load(Ordering::Relaxed),
         FRAME_US,
+        STALL_PRESENT_US,
         verdict
     );
     // Re-arm the refresh from AFTER the serial write, so `CENSUS_PERIOD_US` bounds the duty cycle
@@ -2562,6 +2693,12 @@ pub(super) fn wch_recycle(i: usize) {
     W_WITUS[i].store(0, Ordering::Relaxed);
     H_TORN[i].store(0, Ordering::Relaxed);
     H_STALL[i].store(0, Ordering::Relaxed);
+    // WCH-LONGPRES — the census, the one-shot latch and the pending hand-off all belong to the DEAD
+    // tenant. The latch especially: leaving it set would spend the new tenant's one naming line
+    // before it has presented once, and the count would then be the only evidence a stall happened.
+    H_LONGPRES[i].store(0, Ordering::Relaxed);
+    H_LONGSAID[i].store(0, Ordering::Relaxed);
+    H_LONGUS[i].store(0, Ordering::Relaxed);
     H_MAXPRES[i].store(0, Ordering::Relaxed);
     H_MINPRES[i].store(u64::MAX, Ordering::Relaxed);
     H_MINRATE[i].store(u64::MAX, Ordering::Relaxed);
