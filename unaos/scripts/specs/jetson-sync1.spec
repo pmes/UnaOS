@@ -62,6 +62,24 @@
 # used to read PASS. That is correct and not a regression in the spec — a spec adjudicates
 # the NEXT flight, the argument this file already makes for the IRQEL FAIL wording — but a
 # reader reaching for boot5c as a green reference should know it is no longer one.
+#
+# 2026-08-25 (exec-spec, third pass): DEFECT 4 — `REQUIRE TEGRA-SD.*block backend published`
+# failed on CONFIGURATION, not on health, and had been reading a healthy boot7f 12/13 for it.
+# Replaced by `PENDING` + two `FORBID`s on the armed-path non-publish outcomes; the argument
+# and the six-way enumeration are at the row itself. THE EXPECTED COUNTS ARE NOW A FUNCTION
+# OF THE KNOB SET, and stating that plainly is part of the fix:
+#   15 REQUIREs total (13 before this arc, +3 promoted, -1 demoted here), and ALL FIFTEEN
+#     are forced by `tegra` + `tegra_el0` alone — no other knob moves the required tally.
+#   `UNAOS_TEGRA_EL0=1` (or `UNAOS_ORINCLICK=1` / `UNAOS_TEGRADESK=1`, which imply it) is
+#     therefore the minimum this file adjudicates at all.
+#   WITHOUT `UNAOS_SDMMC=1`: a healthy flight is 15/15 PASS and the microSD publish reads ⏳.
+#     boot7f is this case, and it now reads PASS instead of the 12/13 FAIL it had earned
+#     only by not being asked for a card.
+#   WITH `UNAOS_SDMMC=1`: still 15/15 PASS, and the publish row reads ✅ with mbench advising
+#     a promotion it must NOT be given — the row is PENDING on purpose, permanently. A card
+#     that does not publish reds through the two FORBIDs, naming the rung that stopped.
+#   The knob-gated instruments (`orindesk` / `orinclick` / `jd1dc`) never move the count in
+#     either direction; that is what their PENDING/OPTIONAL kinds are for.
 
 # --- boot bring-up witnesses (the JD/JB chain — all previously metal-proven) --------
 REQUIRE JD1.*scanout:.*sane=true
@@ -81,15 +99,71 @@ REQUIRE CAPSTONE COMPLETE
 # M1b: the first EL0 round-trip on Orin metal (tegra_el0 knob armed on the image).
 REQUIRE TEGRA-EL0.*el0-hello round-trip -> PASS
 # M2 step 1: the microSD becomes block-layer-visible (read-only backend).
-# PROMOTED PENDING -> REQUIRE (orin 3, 2026-08-22) on capture, per the standing rule that
-# nothing is promoted without one. Evidence: `capture/orin2-boot5c-gui.log:1051` carries it
-# verbatim — `:: TEGRA-SD: block backend published - 62333952 sectors (read-only) ::` — and
-# the board records it published on BOTH boot5c flights, so it is repeatable and not a
-# single-trial call. It was THE BLOCKER for six boots; a silent regression here takes the
-# installer, the native volume and `uls` with it, and every one of those reds would be
-# misattributed downstream. The publish is also strictly upstream of ORIN-INSTALL-2, which
-# takes its target from the same census.
-REQUIRE TEGRA-SD.*block backend published
+# DEFECT 4, FIXED HERE (exec-spec, 2026-08-25). This was `REQUIRE`, promoted on capture at
+# orin 3 (2026-08-22) on `capture/orin2-boot5c-gui.log:1051` — `:: TEGRA-SD: block backend
+# published — 62333952 sectors (read-only) ::` — and the promotion was right about the
+# EVIDENCE and wrong about the KIND. `sdmmc_tegra.rs` is `#[cfg(feature = "sdmmc")]` end to
+# end and the knob is `UNAOS_SDMMC=1` (arroyo:1015), default OFF. boot5c was flown
+# `knobs=TEGRA+TEGRA_EL0+RAST+SDMMC+NOJB11` (capture/line-acm0/marks.txt); boot7f was not.
+# So a REQUIRE here fails on CONFIGURATION, not on health — the exact error the SMPMARK
+# block below argues against — and boot7f, a completely healthy flight, has been reading
+# 12/13 for it. `capture/orin2-boot4f.log` is the same story: marks.txt calls that flight
+# the `nosdmmc-control`.
+#
+# THE FIX HAS TO KEEP BOTH HALVES, and a plain demotion keeps only one: an sdmmc-ARMED boot
+# that fails to publish must still red. It was THE BLOCKER for six boots, a silent
+# regression takes the installer, the native volume and `uls` with it, and the publish is
+# strictly upstream of ORIN-INSTALL-2, which takes its target from the same census.
+#
+# mbench HAS NO CONDITIONAL REQUIRE — no `WHEN <guard> REQUIRE <rx>` (the grammar hole
+# x86-witness.spec writes up), and matching is per-line, so "armed implies published" cannot
+# be written as one row: the arming witness and the publish are different LINES. An
+# alternation `published|<not-armed marker>` was the other candidate and is impossible for
+# the same reason in reverse — an unarmed image prints NO sdmmc line at all, so there is no
+# marker to key the second branch on, and tegra prints no `kernel features:` banner
+# (measured: zero hits in every Orin capture) to run a lookahead against.
+#
+# SO THE CONDITIONAL IS BUILT OUT OF THE TWO KINDS THAT DO EXIST, and it is exact:
+#   PENDING on the publish  — an unarmed image reads ⏳ and never fails; an armed image that
+#                             publishes reads ✅ and mbench advises the promotion, which is
+#                             the honest state of a row whose arming is an operator choice
+#   FORBID on every armed-path NON-publish outcome (below) — those lines exist ONLY in the
+#                             `sdmmc` build, so they cannot fire on an unarmed boot at all,
+#                             and on an armed boot they name WHICH rung stopped instead of
+#                             reporting an anonymous missing witness. Strictly more
+#                             informative than the REQUIRE it replaces.
+PENDING TEGRA-SD.*block backend published
+# THE ARMED HALF. Every path an `sdmmc` build can take that reaches the recon and does NOT
+# reach `publish_block_backend` prints exactly one of these, and there are six of them —
+# enumerated from the source, not guessed, by walking every `return` between the entry
+# banner (sdmmc_tegra.rs:2563) and the publish call (:2714):
+#   :2569  `recon SKIPPED (no resolvable microSD-slot SDMMC controller)`
+#   :2584  `M1: controller window … is outside the already-mapped GiB windows … — recon
+#           SKIPPED (no unmapped deref)`
+#   :2598  `M1: CAPABILITIES[…] = … — POISON … — recon REFUSED (no reset, no writes)`
+#   :2687  `ORIN-SDMMC-1 recon done at M2 (no identified card / honest stop)`
+#   :2694  `ORIN-SDMMC-1 recon STOPPED at M3 (sector-0 read failed)`
+#   block.rs:1684 `TEGRA-SD: REFUSED to publish the microSD block backend — num_blocks=0`
+# The first row below covers the five SDMMC-side stops, the second the block layer's refusal.
+# THE SEVENTH ARM IS DELIBERATELY NOT FORBIDDEN: sdmmc_tegra.rs:85's `no Tegra234 SDMMC on
+# this build (QEMU virt) — recon is metal-only` is the honest not-on-metal answer and carries
+# none of the tokens below, so it cannot fire either row. Checked, not assumed.
+# `recon done at M2 (no identified card)` IS FORBIDDEN AND THAT IS THE DELIBERATE PART:
+# an empty slot on an armed flight is a configuration state, but it is the OPERATOR'S
+# configuration on a flight that asked for the card, and the old REQUIRE red it too. This
+# preserves that verdict exactly; the only behaviour that changes is the UNARMED image's.
+# EM DASHES: two of the five stops put their verdict after one, so both patterns key on the
+# contiguous-ASCII verdict token itself and never span the dash.
+# MEASURED AGAINST THE WHOLE CORPUS, both directions. `recon (SKIPPED|REFUSED|STOPPED at
+# M3|done at M2)` takes FIVE real hits and ZERO false ones — `capture/line-acm0/orin.log:114`
+# and `:5772` (two armed-sdmmc flights that stopped with no card seated),
+# `capture/line-acm0/raw.log` x2, `capture/orin1-boot2/boot2-recovered.log` x2,
+# `capture/orin1-boot3/boot3-banked-0258.log:…` and `capture/pi4-pi1-b1/ttyACM0.log` x2 —
+# all of them genuine armed stops. The bare token `recon` appears 862 times across the tree
+# (`disp-userd-recon`, `recon-pre`, `recon-post`, `reconfig`, …), which is exactly why the
+# verdict word is part of the pattern and not just the tag.
+FORBID recon (SKIPPED|REFUSED|STOPPED at M3|done at M2)
+FORBID TEGRA-SD: REFUSED to publish
 
 # --- EL0-EL1CORE: where an EL0 task was placed, and what happens when it cannot be -----
 # The arc that motivated this block (sched.rs `EL0-EL1CORE`) established that on the
