@@ -52,6 +52,11 @@ belongs here, on the day it is made.
   regression's `FAIL` must never be able to evaporate. Enforced every run by
   the SERWIT-1 fixture; see
   [`docs/dev/OS/02_KERNEL_CORE/serial_transport.md`](OS/02_KERNEL_CORE/serial_transport.md).
+- **A flake is an observation, not a re-run** (2026-08-18). An intermittently
+  red gate is diagnosed against the fixture-flake corpus —
+  [`docs/dev/FIXTURE_FLAKES.md`](FIXTURE_FLAKES.md) — before it is re-run:
+  match the witness text, capture what the entry asks for, then re-run. New
+  classes are recorded there rather than carried in session memory.
 - **Default-quiet boot** (2026-07-18). Confirmed test families are not
   re-run on default boots; batteries live behind knobs (QEMU gates arm
   them). Gate, never delete.

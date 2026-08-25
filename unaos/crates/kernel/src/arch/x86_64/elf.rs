@@ -189,6 +189,41 @@ pub fn validate_elf(b: &[u8], win_size: usize) -> Result<ElfPlan, &'static str> 
         if span_end > win_size {
             return Err("segment overflows the slot window");
         }
+        // WINX-8 defence-in-depth — REFUSE an RX segment that crosses into the FINAL window page.
+        //
+        // The loader itself parks the initial ring-3 RSP at the window TOP ([`map_image_into_slot`]:
+        // `sp = (base + size) & !0xF`), so the LAST page of the window is the first stack page of
+        // EVERY program this loader starts — the program's first frame push lands in it. An
+        // executable segment is mapped read-only (`protect_user_slot_range` clears the writable bit
+        // on every page a non-`PF_W` segment covers, and the W^X check above already refused W+X),
+        // so an executable memsz that spills into that page is loaded-to-die: the first stack write
+        // takes `#PF err=0x7` and the fault net kills the program at RUNTIME with no load-time
+        // diagnosis — the WINX-8 metal fault class (VUG's FILEHDR-layout RX memsz under a stack
+        // carve). Refuse it HERE, with a witness, instead.
+        //
+        // Deliberately ONLY the final page — the one bound the LOADER itself imposes (its own `sp`
+        // choice). Program-private stack carves lower in the window (user-vug parks worker stacks
+        // at `base + 0x3000` / `base + 0x3800` — see `crates/user-vug/src/main.rs`) are a PROGRAM
+        // contract, not loader law: a future image may legitimately claim page 2 as text and place
+        // its stacks elsewhere, so those bounds are NOT enforced here. The boundary is exclusive at
+        // the page edge: an RX segment ending exactly AT `win_size - 4 KiB` owns no byte of the
+        // final page and loads.
+        if s.flags & PF_X != 0 && s.memsz > 0 {
+            // Derivations: `win_size` is the caller's `syscall::user_window_size()` (=
+            // `USER_WINDOW_PAGES` * 4 KiB, documented "code, data, and two stack pages"); the page
+            // size is `memory::PAGE_4K`, the same constant the flat path bounds against.
+            let carve_off = win_size - memory::PAGE_4K as usize; // first byte of the final page
+            if span_end > carve_off {
+                serial_println!(
+                    ":: elf: REFUSED rx-crosses-final-window-page seg=[{:#x},{:#x}) carve=[{:#x},{:#x}) ::",
+                    s.vaddr,
+                    s.vaddr + s.memsz as u64,
+                    min_vaddr + carve_off as u64,
+                    min_vaddr + win_size as u64
+                );
+                return Err("rx segment crosses the final window page (the initial stack page)");
+            }
+        }
         // The entry must land inside an EXECUTABLE segment's mapped range (a data-only entry would fault).
         if s.flags & PF_X != 0 && e_entry >= s.vaddr && e_entry < s.vaddr + s.memsz as u64 {
             entry_in_exec = true;

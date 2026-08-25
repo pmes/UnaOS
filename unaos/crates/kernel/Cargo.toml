@@ -6,6 +6,18 @@ license = "GPL-3.0-or-later"
 
 [features]
 default = []
+# DEADMAN: the instrument that SURVIVES THE WEDGE. Arms `[deadman]` — one line per second driven from
+# the APIC timer ISR, emitted UNCONDITIONALLY (including when every counter is zero) so that silence
+# is distinguishable from idleness. Every other x86 instrument (`spread`, `rtwit`, `schedx86`, `dock`,
+# `menubar`) is emitted BY the render-service pass; metal boot 11 lost all five in ONE event and left
+# 91 seconds with no data. This one rides the timer instead, never takes the compositor's `COMP_GATE`,
+# never calls the blocking `pal::event_queue_depth()` or `wm::table()`, and reports `?` rather than
+# waiting when `TABLE` is busy. Pure measurement: no scheduling/locking/present behaviour changes.
+# x86_64-only in effect (the real impl is `target_arch = "x86_64"`-gated; aarch64 gets the inline
+# shim). DEFAULT OFF => every hook degrades to an empty inline shim, so no counter, no `[deadman]`
+# string and no timer-ISR work exists in an unarmed kernel. Enable via `UNAOS_DEADMAN=1`. Kept in sync
+# with arroyo AND builder/src/main.rs.
+deadman = []
 # R0 / rtwit: the WORST-CASE RULER. Arms the `[rtwit]` tail instruments (input→present latency,
 # per-lock max hold, max interrupt-mask span) — MAXes only, never a mean. Pure measurement: no
 # scheduling/locking/present behaviour changes. DEFAULT OFF => every hook degrades to an empty inline
@@ -25,6 +37,16 @@ rtwit = []
 rtpi = []
 # Cleanroom GPU driver features
 nvidia-kepler = []
+# PCIH / NOASPM: `UNAOS_NOASPM=1` — clear the ASPM-control bits (LNKCTL[1:0]) on BOTH the
+# Kepler root port and the endpoint at kepler init (drivers/gpu/pcihealth.rs), for the BAR1
+# wedge theory: if the metal hangs are the GK107 host interface dropping into a firmware-armed
+# ASPM low-power state, a noaspm boot should stop wedging. Read-modify-write confined to
+# LNKCTL[1:0] — endpoint first, then root port, the disable order the spec asks for — and one
+# `[pcih] aspm cleared ...` witness line. Implies `nvidia-kepler` (the clear runs at kepler
+# init and nowhere else). DEFAULT OFF => the clear is not linked and unarmed builds are
+# byte-identical. Kept in sync with arroyo (builder/src/main.rs mapping is a flagged follow-up
+# — out of this arc's lane).
+noaspm = ["nvidia-kepler"]
 nvidia-kepler-takeover = []
 nvidia-kepler-fifo = []
 nvidia-kepler-kdisp-hold = []
@@ -148,6 +170,17 @@ wxnro = []
 # every `[wc-g]` line is byte-identical to the pre-M3 wire and aarch64 is unaffected either way.
 # Enable via `UNAOS_WCG_PAYGO=1`. See video/wcg.rs §WC-G/M3.
 wcg-paygo = []
+# WCD-VALVE (boot-9 discriminator): suppress WC-D scan-out read-back ADMISSION while composite
+# utilisation is high (close >= 60% of the [comp2] span's wall clock inside a pass, reopen < 35%,
+# judged from the counters the instrument already keeps). A suppressed admission touches no WCD
+# state — the verdict is postponed, never blinded — and each episode prints one line each way
+# (`[wc-d] valve CLOSED util~N% suspended=K` / `[wc-d] valve OPEN resumed suspended=K`). Purpose:
+# metal boot 8 ties ~4.0M us of wcd read-back per 5 s rollup (uncached Kepler BAR1 reads) to a
+# reproducible compositor wedge under the 6-vug storm; boot 9 with the valve armed discriminates —
+# wedge gone while CLOSED implicates the read pressure, wedge anyway exonerates the reads.
+# Requires `witness` (the WC-D machinery it throttles is witness-gated); x86_64 only. DEFAULT OFF =>
+# every valve item is compiled out and the build is byte-identical. Enable via `UNAOS_WCDVALVE=1`.
+wcdvalve = []
 # Skip xHCI/USB bring-up entirely (`pci::init`). For real-hardware video bring-up where the
 # firmware/SMM may still own the xHCI controller (this branch has no BIOS->OS handoff) and wedge
 # its reset handshake — the controller's status bits never flip, so the bounded-but-slow timeout
@@ -358,6 +391,38 @@ wifi = []
 # Enable via `UNAOS_WIFI2=1`. Kept in sync with arroyo and builder/src/main.rs. See
 # docs/dev/OS/06_NETWORK_STACK/wifi_bcma.md.
 wifi2 = ["wifi"]
+# WVAL-REPLAY: a QEMU-REACHABLE leg for the set-validation dry-run. QEMU models no BCM4331, so
+# `wifi::service()`'s census refuses at `S_START` and parks — which means the firmware staging pass
+# and arc 2's `validate_set()` dry-run (pure byte-level work on the staged images: container-header
+# classification, the per-role layout rules, the initvals record walk) have never been exercised
+# anywhere but on metal, and a regression in the classifier could only be caught by a bench round.
+# Under `wifival` a census that comes up ABSENT prints a REPLAY-armed witness and proceeds to the
+# storage wait instead of parking, and the terminal `finish_and_park` runs `bringup::validate_replay()`
+# — the set-completeness gate + `validate_set()` + one park line, and NOTHING else. That leg makes no
+# PCI config access, maps no BAR, moves no window selector and walks no core table; arc 2's device
+# rungs are not reachable from it, which is what the companion spec's FORBIDs assert.
+# IMPLIES `wifi2` (it calls into `bringup.rs` and reads the same staged-header accessors arc 2 gates
+# on). On the census-SUCCESS path — the metal path — this feature changes NOTHING: the ABSENT branch
+# is the only place it is consulted, so a radio-present boot runs `bringup_once()` exactly as before.
+# x86_64-only and stripped by arroyo's arm_features. Default OFF => byte-identical media. Enable via
+# `UNAOS_WIFIVAL=1`. Kept in sync with arroyo and builder/src/main.rs. See
+# docs/dev/OS/06_NETWORK_STACK/wifi_bcma.md.
+wifival = ["wifi2"]
+# WIFI-3: arc 3's UPLOAD rung — the bcm4331 microcode upload (`upload_ucode` in
+# `src/wifi/bringup.rs`). W5 pinned the one value gate 3 refused on (SHM routing 0x0300 =
+# microcode memory, control word 0x03000000 — the b43 open specification,
+# bcm-specs.sipsolutions.net/SHM/ + /MicrocodeUpload/ + /ChipInit/; see
+# docs/dev/OS/06_NETWORK_STACK/bcm4331.md §S4-W5), so the refusal's reason is no longer an
+# unpinned fact — it is this feature being off. DESTRUCTIVE on metal: the upload's prologue
+# asserts the core reset that clears MACCTL.PSM_RUN and destroys the resident microcode
+# (bcm4331.md §5 risk 4); only a successful upload + handshake restores a working state, which
+# is why the rung arms only under an explicit knob. Default build: gate 3's refusal survives
+# byte-for-byte in shape with reason=wifi3-not-armed. QEMU models no BCM4331, so this code is
+# unreachable there (the census refuses at S_START); metal-first by construction.
+# IMPLIES `wifi2` (and through it `wifi`). x86_64-only and stripped by arroyo's arm_features.
+# Default OFF => byte-identical media. Enable via `UNAOS_WIFI3=1`. Kept in sync with arroyo
+# and builder/src/main.rs. See docs/dev/OS/06_NETWORK_STACK/bcm4331.md.
+wifi3 = ["wifi2"]
 # VPERF video-path bench instrumentation (x86_64 only — the module is additionally target-gated,
 # so aarch64 artifacts are byte-identical with this on or off): scroll/VRAM-read/put_pixel
 # counters + serial-only cadence lines, the effective framebuffer memory-type readout (MTRR +
@@ -529,6 +594,49 @@ bt = ["ehcihid"]
 # `drivers/ehci/mod.rs`. Default OFF => the page code, its constants and the classic latch vanish.
 # x86_64 only; `arm_features` strips it so aarch64 media stay byte-identical.
 btc = ["bt"]
+# BT-BOND M1 / HOLOCRON: `UNAOS_HOLOCRON=1` arms the kernel-side classed-record store — one CRC'd
+# file (`/HCRON/BTBOND.DAT`) on the writable FAT volume, a fixed in-RAM table, and the load/flush
+# pair that lets a record be PRODUCED under a driver lock and WRITTEN somewhere else entirely.
+#
+# WHY IT IS ITS OWN KNOB rather than riding `btc`. The seam is not Bluetooth: `src/fs/holocron.rs` is
+# arch-neutral (it drives only `fs::fat` + `crate::hash`) and it is the module the future userspace
+# Holocron vault adopts. `src/drivers/ehci/btbond.rs` is its first CLIENT — class 0x01, one bond
+# record — and it is pure byte handling with no MMIO and no `Controller`, so it compiles and its
+# fixture runs on a build that never touches a radio. M2 wires that client into `bt_ssp_pair`, and
+# THAT half is `btc`-gated, where the standing "a boot that did not ask for a page must be incapable
+# of issuing one" argument belongs.
+#
+# NOT stripped by `arm_features`, unlike `bt`/`btc`: the seam emits real aarch64 CODE (the module is
+# declared in `fs/mod.rs` with no arch gate and the framing fixture runs on both arches), so
+# stripping it would silently DISARM the knob on aarch64 rather than preserve a byte-identity that
+# does not apply. The bond CLIENT lives inside the x86-gated `drivers/ehci/`, so an armed aarch64
+# build gets the store and the framing proof and nothing Bluetooth-shaped.
+#
+# DEFAULT OFF => `fs/holocron.rs`, `drivers/ehci/btbond.rs` and every call site vanish, and both
+# arches are byte-identical to a build without the knob. Kept in sync with arroyo.
+holocron = []
+# BT-BOND M1 / HOLOCRON SELFTESTS: `UNAOS_HCRONST=1` arms the store's two BOOT-TIME-WRITE selftests —
+# `fs::holocron::selftest_once` (writes then unlinks `/HCRON/HCRNTEST.DAT`) and
+# `drivers::ehci::btbond::selftest_once` (stages a fixture bond through the real flush, which creates
+# `/HCRON/BTBOND.DAT` and leaves it behind as an empty store).
+#
+# WHY IT IS ITS OWN KNOB. Both check `write_veto()` first and both self-clean, so neither is reckless
+# — but this repo's convention for a destructive write is a DEDICATED arming knob: `sdw` gates
+# `sdhc::write_block_512` separately from `sdhcblk`, so a build can carry the block backend without
+# carrying the card-write. The same shape applies here. `holocron` arms the STORE — the seam M2's real
+# consumer adopts, which touches the medium only when a bond is actually staged — and `hcronst` arms
+# the TESTS that write at boot. Without the split, M2's consumer could not have the store without the
+# selftests' writes to the user's boot medium.
+#
+# Implies `holocron` (the `btc = ["bt"]` shape), so setting this alone arms both. The deferral-bound
+# fixture is deliberately NOT here: it writes nothing (every driven pass takes the guard's deferral
+# return), so it rides `holocron` itself and arming the store arms its own bound-proof.
+#
+# NOT stripped by `arm_features`, for the same reason `holocron` is not: the selftests sit in the
+# arch-neutral seam and emit real aarch64 code, so stripping would silently DISARM the knob there.
+# DEFAULT OFF => both selftests and their call sites vanish. Kept in sync with arroyo and
+# builder/src/main.rs.
+hcronst = ["holocron"]
 # SMOLNET-DEFAULT (2026-07-17): the mature smoltcp TCP/IP stack (ROADMAP §1b) is the DEFAULT x86 net
 # path — the shell's ping/arp/netinfo, the socket syscall family (SOCK-2..7), the DNS sinkhole
 # (zeolite), and the boot witnesses. Pulls in the x86-only smoltcp optional dependency and compiles

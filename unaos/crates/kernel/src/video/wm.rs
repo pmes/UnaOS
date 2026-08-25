@@ -493,6 +493,131 @@ pub fn shell_z() -> u32 {
     SHELL_Z.load(core::sync::atomic::Ordering::Acquire)
 }
 
+// ---- SPAWN-FOCUS: the launch a person asked for ------------------------------------------------
+
+/// SPAWN-FOCUS — the owners an OPERATOR explicitly launched, each awaiting its FIRST window.
+///
+/// ### The defect, stated before the fix (rMBP boot 2, metal)
+///
+/// The operator typed a launch command at the shell; `pulse`'s window appeared; **the keyboard stayed
+/// with the shell.** That is one symptom of two distinct failures at the same seam, and both are fixed
+/// against this table:
+///
+///  1. **The grant was half a grant.** The x86 first-window rule published `USER_INPUT_ACTIVE` and
+///     nothing else. It never called [`focus_changed`], so `FOCUS_ASID` still named the shell, the new
+///     row was never raised, and its chrome drew in the resting colours. The two halves of focus
+///     disagreed: the routing half said the new window had the keyboard and the VISIBLE half said the
+///     shell did. `clickshell_windowless_leg` already states the rule this broke — *"a fix that did
+///     only the first would read as focused and look unfocused"* — and this was the one focus-granting
+///     site in the kernel that did exactly that. Every other one (`dock::restore`, the TAB cycle, the
+///     click router) calls `user_input_set_active` and then `focus_changed`, in that order.
+///  2. **The grant was too weak to fire at all** once anything else held focus. The rule was
+///     "take focus only if NOBODY has it", which is right for a window that opened on its own and
+///     wrong for the one the operator just asked for by name: launch a second vessel from the shell
+///     while the first is focused and the new window opens behind the keyboard.
+///
+/// ### The policy this table encodes
+///
+/// **A window opened by an explicit user action takes focus on creation. A window created by anything
+/// else never steals it.** The two are not distinguishable at [`create`] — a window create looks
+/// identical either way — so the distinction is carried from the place that KNOWS it: the launch. An
+/// operator-driven launch arms this table with the owner it is about to create; the owner's first
+/// window consumes the token and is focused unconditionally. Nothing else is armed, so nothing else
+/// can take the keyboard off a window the operator is using.
+///
+/// * **Explicit spawn** — the operator named the launch at the shell: `run <path>`, `bg <path>`, and
+///   the bare-name launch. All three reach the loader through the arch's spawn entry points, and the
+///   token is armed INSIDE the spawn.
+/// * **Background-created — never focused on creation** — the compositor's own desktop app
+///   (`wcx::desktop_app_service`, already exempt via `SLOT_NO_AUTOFOCUS`), the compat row, kernel
+///   furniture, selftest fixtures, and — the case with no flag anywhere — **every window after an
+///   app's first.** The token is a ONE-SHOT: an app that opens a second window has already spent it,
+///   so a program cannot re-take the keyboard by re-creating a window in a loop.
+///
+/// ### Why the token is armed at the SPAWN and not by the launcher afterwards
+///
+/// The task is runnable the instant it is spawned and could reach its window create before the
+/// launcher's next instruction. `SLOT_DETACHED` and `SLOT_NO_AUTOFOCUS` are both set inside the spawn
+/// for precisely this reason and say so; this is the third flag under the same rule, and "afterwards"
+/// is a race the operator would lose intermittently — the worst possible failure for a focus policy.
+///
+/// ### Arch-neutrality
+///
+/// The POLICY lives here, in the shared compositor, ungated and free of `target_arch` — the Pi runs
+/// this same module and inherits the rule the moment its syscall layer arms and consumes the token.
+/// What stays per-arch is only the WIRING, because the routing half of focus (`USER_INPUT_ACTIVE`) is
+/// an arch-local static in each `arch::*::syscall`, and `wm` may not call into the syscall layer at
+/// all (the layering invariant `sys_win_present` states: nothing under `wm` calls back into a window
+/// verb). So `wm` owns the decision and the arch seam — which is the one place BOTH halves of focus
+/// are reachable — performs it. x86 is wired by this arc; aarch64 needs no change here to adopt it.
+///
+/// Owners are the compositor's own `owner_asid` namespace (`slot + 1`-biased on x86, the ASID on
+/// aarch64) — the same values [`create`] and [`focus_changed`] take, so no translation happens here.
+/// `0` is never armed: it is the SHELL, which is not a spawn.
+///
+/// Sized to [`MAX_WINDOWS`] because a token is only ever consumed by a window create, so the table can
+/// hold no more pending owners than the compositor can hold windows. Full is fail-closed: the launch
+/// still happens, it simply does not carry a focus grant.
+static SPAWN_FOCUS: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
+
+/// SPAWN-FOCUS — arm `owner`'s one-shot focus token. Called from the arch spawn path, BEFORE the task
+/// can run. Returns whether a slot was taken (`false` = table full, or `owner == 0`).
+///
+/// Idempotent: re-arming an owner that already holds a token is a no-op rather than a second entry, so
+/// a relaunch into the same owner cannot consume two slots. The scan is a linear walk over twelve
+/// atomics under no lock, which is sound because each cell is claimed by a single CAS — two cores
+/// arming different owners cannot both win the same cell, and two cores arming the SAME owner leave
+/// one token, which is the idempotence above.
+pub fn spawn_focus_arm(owner: u64) -> bool {
+    use core::sync::atomic::Ordering;
+    if owner == 0 {
+        return false;
+    }
+    // Already armed — nothing to do. Checked before claiming so the common relaunch case does not
+    // consume a second cell for an owner that is still waiting for its first window.
+    if SPAWN_FOCUS.iter().any(|c| c.load(Ordering::Acquire) == owner) {
+        return true;
+    }
+    for cell in SPAWN_FOCUS.iter() {
+        if cell
+            .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// SPAWN-FOCUS — CONSUME `owner`'s token: `true` exactly once per arming, `false` ever after.
+///
+/// The one-shot is the whole safety property. It is what makes "the operator asked for this window"
+/// a claim about a single window rather than a standing licence: the app's first create spends it,
+/// and its second, and every create by an app nobody launched by name, take the ordinary weak rule
+/// that can never steal focus.
+pub fn spawn_focus_take(owner: u64) -> bool {
+    use core::sync::atomic::Ordering;
+    if owner == 0 {
+        return false;
+    }
+    SPAWN_FOCUS.iter().any(|cell| {
+        cell.compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    })
+}
+
+/// SPAWN-FOCUS — drop `owner`'s token unconsumed, at slot teardown.
+///
+/// Per TENANT, not per slot, for the reason every other flag on this path is: owners are recycled
+/// slot aliases. A program that was launched by name and exited before ever opening a window would
+/// otherwise leave a live token on its owner value, and the NEXT tenant of that slot — which may be
+/// the desktop app, or anything the operator did not ask for — would consume it and take the
+/// keyboard. That is the exact failure this table exists to prevent, arriving through the back door.
+pub fn spawn_focus_forget(owner: u64) {
+    let _ = spawn_focus_take(owner);
+}
+
 // ---- VUGMIN-B: hidden-owner plumbing -----------------------------------------------------------
 
 /// VUGMIN-B — `wm`'s SHADOW of the hidden bitmask `arch::aarch64::syscall` owns, one bit per ASID.
@@ -1188,6 +1313,13 @@ fn present_banded(id: WinId, band: Option<(usize, usize)>, expect_owner: Option<
     // lock (dropped at the block above), per this file's standing rule.
     #[cfg(feature = "witness")]
     wcn_note_present(id, skip);
+    // DEADMAN — the ATTACH term of the phantom-composite question, charged in the same place and by
+    // the same rule as `wcn_note_present` above: the owner's ATTEMPT, outside the table lock, before
+    // the suppression branch. A no-op inline shim when the knob is off. `[deadman] dmg=N/S` reads a
+    // row as static iff this counter has not moved since the last completed pass, so charging it
+    // here — where the owner handed over a surface — is what makes `S` mean "damage with no attach
+    // behind it" rather than "damage with no composite behind it".
+    crate::deadman::note_attach(id);
     if skip {
         #[cfg(feature = "witness")]
         {
@@ -3139,9 +3271,75 @@ impl OccSnap {
 /// chargeable. Compat rows are excluded for the reason [`occluders`] gives — a compat row IS the
 /// full-screen present path, and while it owns the panel the render task is parked and not
 /// verifying anyway.
+/// CURSTICK — excuse snapshots that declined to spin, on the `[wcser]` rollup as `exbusy=`. Each
+/// count is one witness sample pardoned whole instead of blocking the blit loop on the table; a
+/// climbing count under a storm is the census of collisions the old blocking acquire used to eat
+/// silently, IRQ-masked, inside the compositor.
+///
+/// SYNC-FOLD 2026-08-22 (must-carry 4) — WRITTEN ARCH-NEUTRALLY, ON PURPOSE. The rmbp track gated
+/// this static and [`occluders_above`] on `all(witness, x86_64)`; trunk's occ62 widened
+/// `occluders_above` to plain `witness` while its body still took the BLOCKING lock. Reconciling
+/// the two gives aarch64 the try-lock PARDON — and its only reader, [`wcser_emit`]'s `exbusy=`, is
+/// x86-only, so an aarch64 pardon would suppress a `[wc-d]`/`[wc-g]` verdict with NOTHING on the
+/// wire and no dead-code warning (the static IS written). The hazard is born at this merge and
+/// exists in neither parent. The counter therefore stays arch-neutral, `exbusy=` stays exactly as
+/// it was on x86, and the `[occ62] pardon` line below gives aarch64 a reader of its own.
+#[cfg(feature = "witness")]
+static OCC_EXCUSE_BUSY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// SYNC-FOLD — how many `[occ62] pardon` lines one boot may pay for. The pardon site runs PER DRAWN
+/// WINDOW PER COMPOSITE PASS, so an unbounded print is a UART storm inside the very loop CURSTICK
+/// stopped blocking; four is the same figure `wcg`'s per-window witnesses budget, for the same
+/// reason — enough to tell a steady state from a one-off, few enough that the serial writes cannot
+/// perturb the path they report on. Never reset: this is a per-BOOT budget, not a refreshing one.
+#[cfg(feature = "witness")]
+const OCC62_PARDON_BUDGET: u32 = 4;
+
+/// SYNC-FOLD — pardons already named on the wire, against [`OCC62_PARDON_BUDGET`].
+#[cfg(feature = "witness")]
+static OCC62_PARDON_SAID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 #[cfg(feature = "witness")]
 fn occluders_above(z: u32, id: u32) -> OccSnap {
-    let t = table();
+    // CURSTICK — REFUSE, DON'T WAIT. This runs inside the composite blit loop, per drawn window,
+    // as an argument to `wcg::begin`/`end` — and its old body took `table()`, a BLOCKING
+    // IRQ-MASKED spin, which made a WITNESS the only blocking primitive in the whole pass. An
+    // instrument must never be able to wedge the thing it instruments. On contention the sample
+    // is pardoned whole (one full-coverage box: `covers()` answers yes everywhere, so no pixel
+    // can be charged and no FAIL can be manufactured) and the refusal is counted. The pardon is
+    // the fail-safe direction — witness coverage lost for one window for one pass, said on the
+    // wire, against the alternative boot 7 paid.
+    let _irq = crate::arch::IrqMask::new();
+    let t = match TABLE.try_lock() {
+        Some(g) => g,
+        None => {
+            OCC_EXCUSE_BUSY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let say = OCC62_PARDON_SAID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                < OCC62_PARDON_BUDGET;
+            let mut snap = OccSnap::none();
+            snap.boxes[0] = (0, 0, usize::MAX, usize::MAX);
+            snap.n = 1;
+            // SYNC-FOLD (must-carry 4) — SAY IT, ON BOTH ARCHES. `exbusy=` on the `[wcser]` rollup
+            // is x86-only, so without this line an aarch64 pardon is a silent full-coverage excuse:
+            // every pixel excused, every `[wc-d]`/`[wc-g]` verdict for this window suppressed for
+            // this pass, and nothing on the wire to say a sample was ever pardoned. Gated on plain
+            // `witness` with NO `UNAOS_WC` dependency, because the compositor knob is x86's and the
+            // arm that needs the reader is aarch64's.
+            //
+            // Printed with INTERRUPTS RESTORED. The lock is NOT held on this arm (that is the whole
+            // point of the arm), so the mask has nothing left to protect, and CURSTICK's rule — an
+            // instrument must never be able to wedge the thing it instruments — forbids paying for
+            // a UART write inside the composite loop's masked window.
+            drop(_irq);
+            if say {
+                serial_println!(
+                    "[occ62] pardon win={} cause=contended suppressed=wc-d/wc-g coverage=whole",
+                    id
+                );
+            }
+            return snap;
+        }
+    };
     let mut snap = OccSnap::none();
     for r in t.rows.iter() {
         if !r.used || r.compat {
@@ -3272,6 +3470,19 @@ pub(super) fn occluders_aged(
 /// idle path is one atomic read ahead of a lock acquisition that was already happening.
 pub fn service_damage() {
     if DEFER_N.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+        // MENU-DRIVE / CRYSTAL-DISMISS — the SHARD menu's owed paint/erase is the THIRD thing this
+        // backstop must see, exactly as it is the third term in the gate holder's own "is anything
+        // OWED" tests. The MENU-DRIVE ledger names this function as the standing backstop for a
+        // MASKED holder (one pass, no re-run loop, no lost-wakeup pass) — but until now it tested
+        // only the erase queue and window damage, so a `COMP_PENDING` whose ONLY freight was the
+        // menu (an open-in-state dropdown, or a dismissed one still on the glass) had no taker on a
+        // desktop where nothing else was drawing. Two relaxed loads on the idle path, x86-gated
+        // with the term itself (aarch64 compiles no menu).
+        #[cfg(target_arch = "x86_64")]
+        if menu_paint_owed() {
+            composite();
+            return;
+        }
         let t = table();
         if !t.rows.iter().any(|r| r.used && r.damaged) {
             return;
@@ -3408,6 +3619,32 @@ fn paygo_service_pass() {
     if !super::wcg::paygo_clock().2 {
         return;
     }
+    // WCD-GESTURE — and nothing is taken while a DRAG is live, for two reasons, the second of which
+    // is a correctness one rather than a cost one.
+    //
+    // COST: the mark below is a repaint at 4 Hz — a WHOLE-BOX one before a chunk has banked, and
+    // PAYGOBAND's chunk-sized one after. During a drag even the banded mark is a blit interleaved
+    // with the motion reports, on the same `COMP_GATE` the drag composite needs.
+    //
+    // CORRECTNESS: [`PAYGO_SVC_TRIES`] is incremented by the mark and cleared only by chunk PROGRESS
+    // (see the re-arm in [`verify_window`]'s banking arm). With `wcd_admit` now declining for the
+    // length of a gesture, a taker that kept marking would burn all [`PAYGO_SVC_MAX`] tries against
+    // a gate that cannot open, hit the cap, print the STOP-NOTE and leave the battery owed FOREVER —
+    // turning a deferral into the permanent blinding this arc is careful not to be. The taker and
+    // the admit gate must therefore observe the SAME predicate; this is that predicate.
+    //
+    // Terminating by construction: `drag_end`/`drag_cancel` clear `DRAG_WIN` on the button lift and
+    // on every failure arm, so the gate is bounded by one gesture and the next service pass (<=250 ms
+    // later) resumes the walk with its try count untouched.
+    if drag_active() != WIN_NONE {
+        return;
+    }
+    // PAYGOBAND — the panel height, read BEFORE the table lock (this file's standing rule: nothing is
+    // called out from under `TABLE`). `*WRITER.lock()` is the single-statement `Copy` read every other
+    // site in this file uses, so the guard dies at the semicolon. A framebuffer that is not ready
+    // reports height 0, which makes `visible` 0 for every row and every mark below whole-box — the
+    // pre-PAYGOBAND behaviour exactly, which is the fail-safe direction this whole block preserves.
+    let panel_h = super::WRITER.lock().info().height;
     let mut marked = None;
     // The STOP-NOTE gets its OWN slot. Sharing `marked` was the defect: a capped row wrote its note
     // into the slot and a later takeable row overwrote it in the same pass, and because the note was
@@ -3439,7 +3676,11 @@ fn paygo_service_pass() {
                 continue;
             }
             let i = r.id as usize;
-            if !(super::wcg::paygo_ripe(i) || wcd_ripe(i)) {
+            // PAYGOBAND — the two wires are read SEPARATELY now, because the mark's extent depends on
+            // WHICH of them is owed. Same disjunction as before, same order, no new call.
+            let wcg_r = super::wcg::paygo_ripe(i);
+            let wcd_r = wcd_ripe(i);
+            if !(wcg_r || wcd_r) {
                 continue;
             }
             // THE BOUND, and it is not decoration. Every predicate above is a property of state the
@@ -3462,12 +3703,89 @@ fn paygo_service_pass() {
                 }
                 continue;
             }
-            r.damaged = true;
-            // Whole box, not a band: the deferred pass is the FULL-coverage one by definition, and a
-            // banded mark would hand `verify_reference` a band to narrow the very verdict this taker
-            // exists to complete.
-            r.dmg_y0 = 0;
-            r.dmg_y1 = 0;
+            // ### PAYGOBAND — mark the CHUNK, not the box, once the walk is under way
+            //
+            // **The defect, from the metal (rmbp3 boot 11, 40.8–105.0 s — the operator's session).**
+            // The screen is provably static across that stretch: four consecutive `[wcn]` rollups are
+            // byte-identical at `att=97 comp=151 passes=115`. Yet `[comp2] pass_us` reads 4911–4949
+            // against 2033 on a genuinely idle desktop, and the console window reads
+            //
+            // ```text
+            // [wcn] win=1 asid=0xffffff01 att=0 comp=18 ... pre=18 drg=0 dout=18 dkpx=13302
+            // ```
+            //
+            // `att=0` — its owner presented NOTHING — beside 18 whole-box composites per 5 s. That is
+            // 3.6 Hz, which is this taker at [`PAYGO_SVC_PERIOD_US`], and `[comp2] wcd_us=` (~194 000
+            // per span) names the read-back those 18 passes bought. It is not contention: `[wcser]`
+            // reads `declined_pct=7..11` throughout.
+            //
+            // **What the whole box actually bought.** The mark was `dmg_y0 = dmg_y1 = 0`, so the pass
+            // repainted all 688 source rows of a 1232x688 console (plus, through the occlusion
+            // closure, `dkpx=739` kilopixels of the shell above it, and the vug above that). The
+            // read-back it enabled is CHUNKED: [`verify_window`] resumes at [`WCD_CUR`] and walks at
+            // most [`WCD_CHUNK_ROWS_MAX`] rows, and on the metal the [`WCD_CHUNK_US`] time stop cuts
+            // it far shorter than that. The terminal lines say by how much — boot 10 closed `win=1`
+            // (688 rows) with `chunks=345` and `win=2` (883 rows) with `chunks=444`, i.e. **~2 source
+            // rows of verdict per whole-box repaint of the window**, ~345 times, at 4 Hz: 86 s of
+            // panel-scale blitting per window to buy one battery. Boot 10's `win=2` printed
+            // `-> PAID` at 188 371 ms and the very next `[comp2]` fell to `pass_us=2033 wcd_us=0`.
+            //
+            // **The fix is to mark what the chunk will read.** `verify_reference` clips the band to
+            // `[cur, min(row1, cur + WCD_CHUNK_ROWS_MAX))` itself, so a mark of exactly
+            // `[cur, cur + WCD_CHUNK_ROWS_MAX)` hands it the SAME rows it was going to walk. The
+            // ledger line this replaces said a banded mark would "narrow the very verdict this taker
+            // exists to complete" — true of an arbitrary band, and false of this one, which is the
+            // chunk's own extent by construction.
+            //
+            // **Wire-identical, and the guard is what makes it so.** `hi < visible` (`visible` being
+            // `verify_reference`'s `rows`, computed from the same four row fields and the panel
+            // height read above) gives, in that function: `row0 == cur` so `cur < row0` is false;
+            // `row1 == hi > cur` so `cur >= row1` is false; `r1 = row1.min(cur + CHUNK) == hi`, which
+            // is what the whole-box mark's `rows.min(cur + CHUNK)` also yields; `banded` was ALREADY
+            // true via its `cur > 0` term; and `cksum_pre`'s `row1 < rows` is unchanged. So the
+            // walk, the verdict and every printed field are the same — only the REPAINT shrinks,
+            // from the box to at most 64 source rows.
+            //
+            // **Everything outside that guard stays whole-box, deliberately:**
+            //  * `cur == 0` — a battery that has banked no chunk. Stage 1 has no cursor at all
+            //    (`WCD_CUR` is stage-2 only) and its lattice verdict IS "the band this present
+            //    offered, once", so a banded mark there would genuinely narrow it. One pass in ~345.
+            //  * `wcg_r` — the wc-g wire has no band test in `wcg::begin` and samples the whole
+            //    surface, so a wc-g take keeps the box it has always had.
+            //  * `hi >= visible` — includes `cur >= visible`, the SHRUNK box, whose close arm in
+            //    `verify_window` needs `row1 == rows` and is reachable only from a whole-box mark.
+            //
+            // **The one race, stated.** Another core can bank a chunk between this mark and the
+            // composite, leaving `cur` ahead of the marked band; `verify_reference` then unwinds and
+            // the take is wasted. `PAYGO_SVC_BUSY` excludes a second taker, so it takes an ordinary
+            // present landing in the gap — and a present that banks a chunk calls
+            // [`paygo_svc_progress`], which clears this row's try count. So the cost is one 250 ms
+            // cycle, the liveness bound is not consumed, and the next pass re-marks at the new cursor.
+            let cur = WCD_CUR[i].load(core::sync::atomic::Ordering::Relaxed) as usize;
+            let hi = cur.saturating_add(WCD_CHUNK_ROWS_MAX);
+            // `verify_reference`'s `rows`, from the same expression. Zero on a degenerate row (which
+            // that function `-> SKIP`s anyway) or an unready panel, and zero fails the guard.
+            let visible = if r.scale == 0 || r.stride < 4 || r.y >= panel_h {
+                0
+            } else {
+                (panel_h - r.y)
+                    .div_ceil(r.scale)
+                    .min(r.h)
+                    .min(r.surf_len / r.stride)
+            };
+            if !wcg_r && wcd_r && cur > 0 && hi < visible {
+                // Widening, not assignment: a band some present already owes must not be dropped by
+                // this mark. `damage_rows` unions, and its whole-box arm (an unserviced `damage_all`
+                // already standing) short-circuits — both are the conservative direction.
+                r.damage_rows(cur, hi);
+            } else {
+                r.damaged = true;
+                r.dmg_y0 = 0;
+                r.dmg_y1 = 0;
+            }
+            // NOATT — the attribution half of the discriminator, counted at the ONE site that makes
+            // this class of mark. See the ledger above [`NOATT_SEQ`].
+            noatt_note_taker();
             marked = Some(r.id);
             break;
         }
@@ -3583,19 +3901,60 @@ pub fn paygo_service() {}
 ///
 /// Compat rows are included: they are a full-screen present whose rect covers the panel, so a stale
 /// patch there is exactly as visible as anywhere else.
+///
+/// ### DMG-DISJOINT — the rect's ROWS, not the window's whole box
+///
+/// The WC-K3 ledger already names what this function used to cost: *"a five-pixel exposure at the
+/// edge of a neighbour costs that neighbour a WHOLE-BOX repaint"*. Every caller here hands in a
+/// RECT — a vacated drag sliver, the cursor's save-under box, a closing dropdown — and every one of
+/// them was rounded up to the full outer box of every window it grazed, because [`Window`]'s band
+/// could not name chrome rows and so could not name "the top of this box down to row k".
+/// [`band_for_rows`] closes that, and this is its first consumer: a rect that crosses a window's
+/// middle now damages that window's middle. Six 768x768 surfaces whose mutual overlaps are slivers
+/// stop each charging their whole box on every pass, which is what collapsed `[comp2]`'s
+/// `dmg_px_pp`/`box_px_pp` onto each other at panel area.
+///
+/// Fail-safe unchanged: `None` from [`band_for_rows`] — a rect covering the whole box, a degenerate
+/// row, a compat row it spans — takes [`Window::damage_all`] exactly as before.
+///
+/// ### The skip is now narrower, and that is a fix
+///
+/// The loop used to `continue` on `t.rows[i].damaged`, which is correct only when the standing
+/// damage is a WHOLE BOX. A row already carrying a BAND (the routed console under
+/// `route_present_banded`) was skipped too, and the rows this rect exposed OUTSIDE that band were
+/// then never repainted at all — the pass servicing the band clears the flag and the exposure
+/// survives on the glass. The skip now tests what it always meant: a whole-box repaint is already
+/// owed. A banded row is WIDENED through [`Window::damage_rows`], whose own fail-safe promotes to
+/// the whole box rather than narrowing anything.
+///
+/// The return value keeps its meaning — rows this call newly damaged — so no caller reads
+/// differently; a widening of a row that was already dirty was never counted and still is not.
 pub fn damage_intersecting(x: usize, y: usize, w: usize, h: usize) -> usize {
     if w == 0 || h == 0 {
         return 0;
     }
     let rect = (x, y, w, h);
+    let py1 = y.saturating_add(h);
     let mut t = table();
     let mut n = 0usize;
     for i in 0..MAX_WINDOWS {
-        if !t.rows[i].used || t.rows[i].damaged {
+        let r = &mut t.rows[i];
+        if !r.used {
             continue;
         }
-        if boxes_overlap(rect, outer_box(&t.rows[i])) {
-            t.rows[i].damage_all();
+        // A whole-box repaint is already owed; it covers this rect whatever rows it names.
+        if r.damaged && r.dmg_y1 <= r.dmg_y0 {
+            continue;
+        }
+        if !boxes_overlap(rect, outer_box(r)) {
+            continue;
+        }
+        let fresh = !r.damaged;
+        match band_for_rows(r, y, py1) {
+            Some((sy0, sy1)) => r.damage_rows(sy0, sy1),
+            None => r.damage_all(),
+        }
+        if fresh {
             n += 1;
         }
     }
@@ -3876,9 +4235,65 @@ pub fn composite() {
     #[cfg(target_arch = "x86_64")]
     {
         use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
-        if COMP_GATE
-            .compare_exchange(false, true, AcqRel, Relaxed)
-            .is_err()
+        // WCSER-STEAL — TAKE THE GATE FROM A HOLDER THAT IS NEVER COMING BACK.
+        //
+        // Boots 13/14/15 all wedged the same way: core 1 enters `stage_window`'s present blit and
+        // stops inside ONE store into the Kepler BAR1. Boot 15's ISR-driven row trace is what makes
+        // that exact rather than inferred — SEVENTEEN consecutive one-second samples reading
+        // `win=9 phase=33 row=897`, the row never once advancing. A crawling loop moves; this does
+        // not. The core is architecturally parked on a single instruction.
+        //
+        // Nothing in software can un-park it. What software CAN stop doing is letting one parked
+        // core take the whole desktop with it: every other core was refused for the rest of the
+        // boot (`entered=0 declined_pct=100`, 78 s and counting), which is why the glass freezes
+        // even though `[deadman] pmp≈990` says the machine is otherwise alive.
+        //
+        // So: a holder that has been in-pass past [`COMP_GATE_STEAL_MS`] is declared dead and its
+        // gate is taken. The bound is 4x the tripwire's own overdue bound, which is itself 3x the
+        // worst honest pass this compositor has ever measured (302 ms), so no legal pass can reach
+        // it. The cost of a false steal is two cores compositing at once for one pass; the cost of
+        // not stealing is the whole desktop, measured, three boots running.
+        //
+        // The revenant hazard is closed at the RELEASE sites, not here: if the parked core ever
+        // does return, its store completes into a framebuffer (harmless — it writes pixels) and it
+        // then tries to release a gate it no longer owns. Every release now checks
+        // [`COMP_HOLDER_CORE`] first and a revenant simply declines to release. See
+        // `comp_gate_release`.
+        let mut stole = false;
+        if COMP_GATE.load(Acquire) {
+            let held = crate::arch::ms().saturating_sub(COMP_HOLD_T0_MS.load(Relaxed));
+            let dead = COMP_HOLDER_CORE.load(Relaxed);
+            if held >= COMP_GATE_STEAL_MS && dead != usize::MAX {
+                let me = crate::arch::sched::meter_current_cpu();
+                if dead != me
+                    && COMP_HOLDER_CORE
+                        .compare_exchange(dead, me, AcqRel, Relaxed)
+                        .is_ok()
+                {
+                    stole = true;
+                    COMP_HOLD_T0_MS.store(crate::arch::ms(), Relaxed);
+                    #[cfg(feature = "witness")]
+                    {
+                        COMP_STEALS.fetch_add(1, Relaxed);
+                        COMP_OVERDUE_REPORTED.store(false, Relaxed);
+                        serial_println!(
+                            ":: [wcser] GATE STOLEN from c{} by c{} after {}ms — the holder was in \
+                             phase {} row {} and had not moved; desktop resumes on this core, the \
+                             dead core is not recovered == tripwire ::",
+                            dead,
+                            me,
+                            held,
+                            COMP_PASS_PHASE.load(Relaxed),
+                            COMP_PASS_ROW.load(Relaxed)
+                        );
+                    }
+                }
+            }
+        }
+        if !stole
+            && COMP_GATE
+                .compare_exchange(false, true, AcqRel, Relaxed)
+                .is_err()
         {
             // DECLINED. This pass composites nothing and — crucially — CLEARS NOTHING: it never
             // reached the table snapshot, so every `damaged` flag it would have consumed is still
@@ -3886,6 +4301,18 @@ pub fn composite() {
             COMP_PENDING.store(true, Release);
             #[cfg(feature = "witness")]
             WCSER_DECLINED.fetch_add(1, Relaxed);
+            // DEADMAN — charge the decline to THIS core. `WCSER_DECLINED` above is one global total
+            // drained by a rollup that rides the render-service pass, so it says nothing during the
+            // wedge it would be most useful for. `[deadman] dec=` is the per-core roster, emitted
+            // from the timer ISR, and during a leaked hold it is the enumerated list of which cores
+            // kept arriving and kept being turned away. A no-op inline shim when the knob is off.
+            crate::deadman::note_decline();
+            // DROPWAKE — a decline while a drop is armed is a pass the drop waited on and did not
+            // get; the count is the trace's "the gate was busy" term.
+            #[cfg(feature = "witness")]
+            if DW_ARMED.load(Relaxed) != WIN_NONE {
+                DW_DECLINED.fetch_add(1, Relaxed);
+            }
             // `wm::erase` takes the sprite down and leaves the composite that follows to put it back.
             // That contract predates WC-I and a decline may not break it, so a declined pass still
             // discharges the sprite duty — but it DEFERS it rather than performing it.
@@ -3912,6 +4339,11 @@ pub fn composite() {
         }
         #[cfg(feature = "witness")]
         WCSER_ENTERED.fetch_add(1, Relaxed);
+        // WCSER-H — stamp the holder BEFORE the pass, t0 first so a set core never carries a stale
+        // age. Two relaxed stores on the acquire path; the probe that reads them runs on the input
+        // service's clock, not here.
+        COMP_HOLD_T0_MS.store(crate::arch::ms(), Relaxed);
+        COMP_HOLDER_CORE.store(crate::arch::sched::meter_current_cpu(), Relaxed);
         composite_once();
         // Service what was declined while we held the gate. Each round is a FULL pass — its own
         // snapshot, its own upward closure, its own back-to-front order and its own cursor tail — so
@@ -3983,9 +4415,17 @@ pub fn composite() {
             rounds += 1;
             #[cfg(feature = "witness")]
             WCSER_RERUNS.fetch_add(1, Relaxed);
+            // WCSER-H (landing panel F3) — the overdue bound is priced per PASS (3x the 302ms
+            // worst honest pass), so the clock re-bases per pass: a legal 4-pass storm epoch must
+            // not cross the 1s wire on accumulated honest work. A wedged pass stops re-basing by
+            // definition, so the tripwire's real target is unaffected.
+            COMP_HOLD_T0_MS.store(crate::arch::ms(), Relaxed);
             composite_once();
         }
-        COMP_GATE.store(false, Release);
+        // WCSER-H — this held epoch ends: clear the holder and re-arm the tripwire latch before
+        // the release publishes the gate.
+        comp_mark(0, 0);
+        comp_gate_release();
         // THE LOST WAKEUP, closed. A decliner that publishes `COMP_PENDING` after our last `swap`
         // and before the release above would otherwise leave its damage on the table with no core
         // committed to drawing it, and on a static desktop no later present would arrive to find it.
@@ -4000,6 +4440,9 @@ pub fn composite() {
                 .compare_exchange(false, true, AcqRel, Relaxed)
                 .is_ok()
         {
+            // WCSER-H — the re-acquire winner is a holder like any other: stamp it, t0 first.
+            COMP_HOLD_T0_MS.store(crate::arch::ms(), Relaxed);
+            COMP_HOLDER_CORE.store(crate::arch::sched::meter_current_cpu(), Relaxed);
             if COMP_PENDING.swap(false, AcqRel) {
                 let dmg = any_damaged();
                 let owed = deferred_owed();
@@ -4026,7 +4469,9 @@ pub fn composite() {
                     composite_once();
                 }
             }
-            COMP_GATE.store(false, Release);
+            // WCSER-H — same epoch-end discipline as the main release.
+            comp_mark(0, 0);
+            comp_gate_release();
         }
     }
 }
@@ -4180,6 +4625,10 @@ fn composite_pass_half() -> Owed {
     // only place this widening changed arithmetic.
     #[cfg(feature = "witness")]
     let c2_t0 = crate::arch::now_cycles();
+    // DROPWAKE — the pass hook: refresh the pass stamp, count the pass against an armed drop, and
+    // fire the quarter-second audit if the drop has waited that long. Same clock read as `c2_t0`.
+    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    dropwake_pass_tick(c2_t0);
     let mut tail = composite_inner();
     // DOCK — the strip is the pass's LAST layer under the sprite: after every window, before the
     // cursor tail. Two lines, and both of them gated to the arch and knob the dock exists on.
@@ -4283,6 +4732,16 @@ fn cash_tail(owed: Owed) {
         C2_INSPAN_CYC.fetch_add(in_span, Relaxed);
         C2_STRADDLE_CYC.fetch_add(pass.saturating_sub(in_span), Relaxed);
     }
+    // DEADMAN — the pass COMPLETED. Stamps `[deadman] comp_ms=`'s clock and snapshots the per-row
+    // attach sequences that the next `dmg=N/S` reading is measured against.
+    //
+    // Placed HERE, at the tail, and NOT witness-gated (the COMPOSITE-2 ledger above is; this must
+    // speak on any boot that arms the knob). The position is the whole meaning of the field: a pass
+    // that STARTED and never returned must not advance this stamp, because "the compositor is stuck
+    // inside a pass" is precisely the state `comp_ms` growing without bound exists to make visible.
+    // Two relaxed stores plus twelve — no lock, no print, no allocation, so it cannot lengthen the
+    // pass it closes.
+    crate::deadman::note_composite_done();
     // CTRLWIT — the pass is over and every `table()` guard it took has dropped, so this is the first
     // legal place to SPEAK a decline `controls` armed while painting. After the COMPOSITE-2 ledger,
     // not before it: a serial line inside the clock would charge the pass for the instrument's own
@@ -4297,6 +4756,12 @@ fn cash_tail(owed: Owed) {
     // tenant), but it is a real perturbation of a real instrument, and a decline storm across a full
     // table is the worst case worth knowing about when reading a capture whose `torn=` moved.
     controls_declined_drain();
+    // STAGE-PHYS — the one-shot blit-source contiguity witness, last in the pass for the same reason
+    // `CTRLWIT` is second-to-last: the ledger is closed, every guard the pass took has dropped, and a
+    // serial line here cannot inflate `pass_us`. Spends itself on the first pass that finds a staged
+    // buffer (see `physwit_once`); every pass after that is one relaxed load.
+    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    physwit_once();
 }
 
 /// What [`composite_inner`] owes the sprite when it returns.
@@ -4761,83 +5226,200 @@ fn composite_inner() -> CursorTail {
         (t.rows, dirty, bands, guard)
     };
 
-    // Close the damage set upwards over occlusion, to a fixed point (at most MAX_WINDOWS passes).
-    //
-    // FBCON-DMG — the closure now reads the DAMAGED region of `i` (its band-clipped box) rather than
-    // its whole box, and the windows it drags in are promoted to a WHOLE-BOX repaint. Both halves are
-    // the conservative direction: a narrower `bi` can only reach fewer windows, and every window it
-    // does reach repaints at least the rows `i` is about to overwrite. A `j` that was itself banded is
-    // widened here too, which is why `bands[j].is_some()` re-enters the fixed point — without it a
-    // banded window could stay banded while a lower window repainted rows outside that band.
-    // WCN-CAUSE — the SEED set, snapshotted before the closure runs. Every row dirty here had its
-    // damage flag set by something outside this pass (its owner's `present`, a cursor rect, an erase
-    // drain); every row the loop below adds is compositor work its owner never asked for. The two
-    // sets are disjoint by construction and their union is what the blit loop draws, which is what
-    // makes `comp` DERIVABLE as `pre + drg` rather than counted a third time.
-    #[cfg(feature = "witness")]
-    let seed = dirty;
-    for _ in 0..MAX_WINDOWS {
-        let mut grew = false;
-        for i in 0..MAX_WINDOWS {
-            if !dirty[i] {
-                continue;
-            }
-            let bi = damaged_box(&rows[i], bands[i]);
-            for j in 0..MAX_WINDOWS {
-                if !rows[j].used || rows[j].z <= rows[i].z {
-                    continue;
-                }
-                if dirty[j] && bands[j].is_none() {
-                    continue;
-                }
-                if boxes_overlap(bi, outer_box(&rows[j])) {
-                    // WCN-CAUSE — charge this drag to `i`, the window whose damage reached `j`.
-                    //
-                    // THE EDGE AND THE BILL ARE DIFFERENT EVENTS, and D4 is that they were conflated.
-                    // `dout` is an EDGE: a window ADDED to the pass, so it is `!dirty[j]` only.
-                    // `dkpx` is the whole-box PROMOTION BILL that `bands[j] = None` below commits
-                    // this pass to, and a `j` that was already dirty WITH A BAND is promoted here
-                    // too — it pays the same widening and was previously charged nowhere. That case
-                    // is exactly the banded console under `route_present_banded`, which is the route
-                    // Q3 turns on, so missing it hid the one reading the question needed. The guard
-                    // three lines up (`dirty[j] && bands[j].is_none()` -> continue) means everything
-                    // reaching here satisfies `!dirty[j] || bands[j].is_some()`, so the bill is
-                    // charged unconditionally and the condition is stated by the guard, not repeated.
-                    //
-                    // SEED-GATED, and D3 is why: `dout` charged to a relay window made "topmost
-                    // reads dout≈0" a THEOREM (the closure only ever walks upward, so the top of the
-                    // stack can charge nobody) and let a window that was itself dragged in be billed
-                    // for damage it merely FORWARDED — the fixed point re-reads `bi` from the row it
-                    // just promoted. Only a window acting on its OWN damage is a dragger; a relay is
-                    // counted as `drly`, which is what makes the win=5 -> win=10 chain read as a
-                    // chain rather than as six independent draggers.
-                    #[cfg(feature = "witness")]
-                    {
-                        let (_, _, jw, jh) = outer_box(&rows[j]);
-                        let px = jw as u64 * jh as u64;
-                        if seed[i] {
-                            wcn_note_dragout(rows[i].id, px, !dirty[j]);
-                        } else if !dirty[j] {
-                            wcn_note_relay(rows[i].id);
-                        }
-                    }
-                    dirty[j] = true;
-                    bands[j] = None;
-                    grew = true;
-                }
-            }
-        }
-        if !grew {
-            break;
-        }
-    }
-
     // Back-to-front: ascending z, ties by id (creation order).
+    //
+    // DMG-DISJOINT — HOISTED ABOVE THE CLOSURE, because the closure now walks it. See below.
     let mut order = [0usize; MAX_WINDOWS];
     for (i, slot) in order.iter_mut().enumerate() {
         *slot = i;
     }
     order.sort_unstable_by_key(|&i| (rows[i].z, rows[i].id));
+
+    // Close the damage set upwards over occlusion.
+    //
+    // FBCON-DMG — the closure reads the DAMAGED region of `i` (its band-clipped box) rather than its
+    // whole box. A narrower `bi` can only reach fewer windows, and every window it does reach
+    // repaints at least the rows `i` is about to overwrite.
+    //
+    // ### DMG-DISJOINT — THE DRAG IS BANDED, and this is the arc's main lever
+    //
+    // **The defect, from the metal (boot-4 sitting capture, six vugs idle):**
+    //
+    // ```text
+    // [comp2] ... dmg_px_pp=5190533 box_px_pp=5190533 ...
+    // ```
+    //
+    // Not "approximately equal" — EQUAL, on a 2880x1800 (5 184 000 px) panel. That exactness is the
+    // diagnosis. `dmg_px` is what `draw_window` painted and `box_px` is what the same call would
+    // have painted whole, so the two can only differ when a window in the pass carries a BAND; and
+    // the line below was `bands[j] = None`, an unconditional promotion of every window the closure
+    // touched to a WHOLE-BOX repaint. With no routed console in the pass the only other band
+    // producer is `present_rows`, so on a vug desktop NO window ever carried a band and the equality
+    // was a tautology of the mechanism rather than a measurement of it. Six 768x768 surfaces plus
+    // their chrome, each charged whole because a neighbour's sliver grazed it, is how a sitting
+    // desktop came to repaint the panel ~21 ms at a time.
+    //
+    // **The fix is to say what was actually damaged.** `j` is dragged in because `i`'s blit will
+    // overwrite the pixels where their boxes MEET — so `j` is damaged over that intersection, not
+    // over its whole box. The intersection's panel rows go back through [`band_for_rows`], which is
+    // `damaged_box`'s inverse and rounds outward, and the result is UNIONED with whatever band `j`
+    // already had. `None` from it (the rect spans `j` whole, or names nothing expressible) is the
+    // old behaviour exactly, so the fail-safe direction is unchanged: every path that cannot narrow
+    // still whole-boxes.
+    //
+    // ### Why ONE sweep is now a fixed point, where before it needed a loop
+    //
+    // The drag edge requires `rows[j].z > rows[i].z` STRICTLY, so the closure is a DAG over ascending
+    // z and `order` is a topological sort of it. Walking `order` means every contribution to
+    // `bands[i]` has already been applied when `i` is read, so `bi` is final at the moment it is
+    // used and no second round can widen it. The old slot-order walk had no such guarantee and paid
+    // for it with a `MAX_WINDOWS`-round fixed point — up to `MAX_WINDOWS^3` overlap tests per
+    // composite. Banding made that loop's termination argument harder as well (a band can widen many
+    // times, where a whole-box promotion can happen once), and the topological order removes the
+    // question rather than answering it.
+    //
+    // WCN-CAUSE — the SEED set, snapshotted before the closure runs. Every row dirty here had its
+    // damage flag set by something outside this pass (its owner's `present`, a cursor rect, an erase
+    // drain); every row the loop below adds is compositor work its owner never asked for. The two
+    // sets are disjoint by construction and their union is what the blit loop draws, which is what
+    // makes `comp` DERIVABLE as `pre + drg` rather than counted a third time.
+    // CURSTICK — the sprite must stay ADOPTABLE under banded drags, and this is the boot-7 lesson.
+    //
+    // The overlay offer is made per staged band, and `compose_into` declines unless the sprite's box
+    // sits wholly inside the rows the band holds. Pre-arc, every window the closure dragged in was
+    // whole-boxed, so the topmost window under the pointer always contained the sprite and the
+    // pass's tail was `Adopt` — a session close, no repaint, no re-damage. The banded drag broke
+    // that by accident: a dragged-in band covering a neighbour's sliver almost never covers the
+    // sprite's rows, so no window took the overlay, `overlaid` stayed false, and the tail became
+    // `Repaint` — whose `repair()` re-damages the pointer-stack windows through
+    // `damage_intersecting` AFTER this pass's snapshot cleared them. Under six overlapping vugs
+    // with the pointer parked on the stack, that is a self-feeding composite storm: every pass
+    // re-arms the next, the holder burns its full re-run budget per call, and `[wcser]` climbs to
+    // the declined_pct=93..98 that preceded boot 7's wedge.
+    //
+    // The fix is a WIDENING, in the fail-safe direction the arc already owns: any dirty banded
+    // window whose outer box wholly contains the sprite's box — the only geometry that can take
+    // the offer at all — has the sprite's panel rows unioned into its band. Cost: the sprite is
+    // ~2 chrome-heights of rows on one or two windows per pass; the alternative was those windows'
+    // WHOLE boxes on every pass, which is the pre-arc price this arc exists to stop paying. A
+    // whole-box window (`bands[i] == None`) already contains the sprite and is skipped; a band the
+    // rows cannot express falls back to `None`, the pre-arc behaviour exactly.
+    //
+    // ABOVE THE CLOSURE, and that placement is load-bearing (landing panel F1): the closure's
+    // guarantee — every pixel a lower window's blit touches is repainted by any window above it —
+    // is computed from `bands[i]` as the sweep reads them. A post-closure widening would blit rows
+    // the closure never propagated; on x86 `occ_clip` masks that, but on aarch64 the closure IS
+    // the occlusion mechanism and a clean higher window over the sprite rows would be overwritten
+    // and never repainted. Hoisted here, the widened band participates in the sweep like any other
+    // damage and the invariant holds on every arch.
+    if let Some(p) = plan {
+        for i in 0..MAX_WINDOWS {
+            if !dirty[i] {
+                continue;
+            }
+            let Some((c, d)) = bands[i] else { continue };
+            let (bx, by, bw, bh) = outer_box(&rows[i]);
+            if p.bx >= bx
+                && p.bx.saturating_add(p.bw) <= bx.saturating_add(bw)
+                && p.by >= by
+                && p.by.saturating_add(p.bh) <= by.saturating_add(bh)
+            {
+                bands[i] = match band_for_rows(&rows[i], p.by, p.by.saturating_add(p.bh)) {
+                    Some((a, b)) => Some((a.min(c), b.max(d))),
+                    None => None,
+                };
+            }
+        }
+    }
+
+    #[cfg(feature = "witness")]
+    let seed = dirty;
+    // NOATT — the discriminator, taken HERE: `seed` is the damage set as the table snapshot found it,
+    // so every row in it was marked by something OUTSIDE this pass, and `bands` still holds each
+    // row's OWN declared extent (the closure below only ever widens rows ABOVE a dragger). Both facts
+    // are gone one loop later. See [`noatt_emit`] for what the reading means.
+    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    noatt_note_pass(&rows, &seed, &bands);
+    for oi in 0..MAX_WINDOWS {
+        let i = order[oi];
+        if !dirty[i] {
+            continue;
+        }
+        let bi = damaged_box(&rows[i], bands[i]);
+        if bi.2 == 0 || bi.3 == 0 {
+            continue;
+        }
+        for j in 0..MAX_WINDOWS {
+            if !rows[j].used || rows[j].z <= rows[i].z {
+                continue;
+            }
+            if dirty[j] && bands[j].is_none() {
+                continue;
+            }
+            let bj = outer_box(&rows[j]);
+            if !boxes_overlap(bi, bj) {
+                continue;
+            }
+            // DMG-DISJOINT — the rows of `j` that `i`'s blit will actually cross, unioned with the
+            // band `j` already carried. `damage_rows`' widening rule, expressed on the pass's local
+            // arrays because the table lock is long gone by here.
+            let py0 = bi.1.max(bj.1);
+            let py1 = bi.1.saturating_add(bi.3).min(bj.1.saturating_add(bj.3));
+            let drag = band_for_rows(&rows[j], py0, py1);
+            let next = match (drag, bands[j]) {
+                // Not expressible, or the whole box: promote, exactly as before this arc.
+                (None, _) => None,
+                // `j` was already dirty with a band (the guard above admits only that case, or a
+                // clean `j` whose `bands[j]` is `None` MEANING "not damaged" rather than "whole
+                // box" — which is why this arm tests `dirty[j]` and not `bands[j]` alone).
+                (Some((a, b)), Some((c, d))) if dirty[j] => Some((a.min(c), b.max(d))),
+                (Some(ab), _) => Some(ab),
+            };
+            // WCN-CAUSE — charge this drag to `i`, the window whose damage reached `j`.
+            //
+            // THE EDGE AND THE BILL ARE DIFFERENT EVENTS, and D4 is that they were conflated.
+            // `dout` is an EDGE: a window ADDED to the pass, so it is `!dirty[j]` only.
+            // `dkpx` is the PROMOTION BILL the assignment below commits this pass to, and a `j`
+            // that was already dirty WITH A BAND pays it too — it is widened here and was
+            // previously charged nowhere. That case is exactly the banded console under
+            // `route_present_banded`, which is the route Q3 turns on, so missing it hid the one
+            // reading the question needed. The guard above (`dirty[j] && bands[j].is_none()` ->
+            // continue) means everything reaching here satisfies `!dirty[j] || bands[j].is_some()`,
+            // so the bill is charged unconditionally and the condition is stated by the guard.
+            //
+            // DMG-DISJOINT — the bill is now the pixels ADDED rather than `j`'s whole box, which is
+            // what keeps it honest against a banded drag: `dkpx` is the quantity this closure's
+            // cost is read from, and billing a whole box for a sliver would hide the very saving
+            // the arc exists to make. Whole-box promotions still bill the whole box, because
+            // `damaged_box(_, None)` IS the outer box, so nothing about the old reading moves on a
+            // pass that could not narrow.
+            //
+            // SEED-GATED, and D3 is why: `dout` charged to a relay window made "topmost reads
+            // dout≈0" a THEOREM (the closure only ever walks upward, so the top of the stack can
+            // charge nobody) and let a window that was itself dragged in be billed for damage it
+            // merely FORWARDED. Only a window acting on its OWN damage is a dragger; a relay is
+            // counted as `drly`, which is what makes the win=5 -> win=10 chain read as a chain
+            // rather than as six independent draggers.
+            #[cfg(feature = "witness")]
+            {
+                let before = if dirty[j] {
+                    let d = damaged_box(&rows[j], bands[j]);
+                    d.2 as u64 * d.3 as u64
+                } else {
+                    0
+                };
+                let after = damaged_box(&rows[j], next);
+                let px = (after.2 as u64 * after.3 as u64).saturating_sub(before);
+                if seed[i] {
+                    wcn_note_dragout(rows[i].id, px, !dirty[j]);
+                } else if !dirty[j] {
+                    wcn_note_relay(rows[i].id);
+                }
+            }
+            dirty[j] = true;
+            bands[j] = next;
+        }
+    }
 
     // FOCUS-VIS — one snapshot of the shell's z for the whole pass, so every window in it is judged
     // against the same shell position (a concurrent focus change either lands wholly before this pass
@@ -4896,6 +5478,8 @@ fn composite_inner() -> CursorTail {
         // shared by the blit and by every witness that has to excuse what the blit withheld. Built
         // per window rather than once per pass because the set is relative to the painter; the scan
         // is `MAX_WINDOWS` rows against a call that is about to copy a box.
+        // WCSER-H — breadcrumb: this window's draw begins (clip + shadow pin next).
+        comp_mark(rows[i].id, 1);
         let clip = occ_clip(&rows, i, shell, fb.info().width, fb.info().height);
         // WPACE-TEXT — blit from the present-boundary shadow when this window has one: `rw` is the
         // pass's working copy of the row, with `surf` swapped onto the shadow buffer, and the guard
@@ -4952,9 +5536,16 @@ fn composite_inner() -> CursorTail {
         // first thing after it: the `blit`/`after` checksums mean "the surface as the copy found it"
         // and "as the copy left it", and anything inserted between them widens the interval they
         // measure into something other than the copy. Budgeted per window id; `None` once spent.
-        // GR21/WCD-OCC — the occluder set as of the blit is handed to `wcg::begin` on x86, so the
-        // glass read-back can excuse a pixel a higher window owns exactly as `[wc-d]` does. aarch64
-        // keeps the four-argument call and its byte-identical wire.
+        // GR21/WCD-OCC — the occluder set as of the blit lets the glass read-back excuse a pixel a
+        // higher window owns exactly as `[wc-d]` does. SYNC-FOLD 2026-08-22: the set is no longer an
+        // ARGUMENT here. OCC62 moved it to `wcg::end`, passed BY REFERENCE, from the single `occ_pre`
+        // snapshot taken above — four 392-byte by-value `OccSnap` copies per frame overflowed the
+        // aarch64 kernel task stack. `begin` is now the same four-argument call on BOTH arches; the
+        // rmbp track's five-argument x86 form is retired, not merely unused. (The three lines this
+        // replaces still said "aarch64 keeps the four-argument call" on both parents, which occ62
+        // had already made wrong in trunk.)
+        // WCSER-H — breadcrumb: entering the wcg bracket.
+        comp_mark(rw.id, 2);
         #[cfg(feature = "witness")]
         let wcg_probe = super::wcg::begin(rw.id, rw.surf, rw.surf_len, rw.compat);
         // CURSOR-3 — WHICH WINDOWS MAY CARRY THE SPRITE. WC-I's invariant "no verified pixel is ever
@@ -5009,6 +5600,7 @@ fn composite_inner() -> CursorTail {
         }
         // FOCUS-HL: `focus == 0` is shell focus and highlights nothing — and the explicit `!= 0` also
         // keeps a compat row (owner ASID 0) from matching it by accident.
+        comp_mark(rw.id, 3);
         overlaid |= draw_window(
             &fb,
             &rw,
@@ -5021,12 +5613,18 @@ fn composite_inner() -> CursorTail {
             // CURSOR-15 — `deferred` answers the same question yes: the `Settle` tail owes every
             // deferred pixel its verdict, so a deferring pass must not arm `PRESENT_DIRTY` either.
             disturbed || deferred,
-            // FBCON-DMG — the band this window's damage was declared over. `None` for every window
-            // dragged in by the occlusion closure and for every whole-box present, which is every
-            // caller that predates this arc.
+            // FBCON-DMG — the band this window's damage was declared over. `None` for every
+            // whole-box present.
+            //
+            // DMG-DISJOINT — and NO LONGER `None` for every window the occlusion closure dragged in:
+            // the drag is banded to the rows the dragging window's blit actually crosses, which is
+            // what makes `[comp2] dmg_px_pp` fall below `box_px_pp` on an idle multi-window desktop
+            // instead of being pinned to it by construction.
             bands[i],
             &clip,
         );
+        // WCSER-H — breadcrumb: draw returned; the post-draw witnesses (wcg end / wc-d) run next.
+        comp_mark(rw.id, 4);
         #[cfg(feature = "witness")]
         if let Some(p) = wcg_probe {
             let r = &rw;
@@ -5664,7 +6262,18 @@ fn verify_window(
     // reference time; the pair is now DIAGNOSTIC only — WCD-PRE explains why a whole-surface bracket cannot
     // be a verdict input on a routed console — but it stays printed on the LIVE line, where the question
     // "did the surface move at all" is exactly what the reader wants next.
-    let cksum = surface_checksum(r);
+    // WCD-FNV — LAZY, for the reason given at `cksum_pre`'s site in [`verify_reference`]: this is a
+    // whole-surface byte-wise FNV (20.7 MB on a panel-width Retina window) and every one of its
+    // readers is a `serial_println!` argument. A silent banked chunk — the common case under
+    // chunking, and every chunk of a drag-fed battery — reached none of them and paid it anyway.
+    // A closure, not a `lazy` cell: the call sites are all in tail position on mutually exclusive
+    // arms, so it evaluates at most once per pass by construction.
+    //
+    // The reading now lands a few atomic ops LATER than it did (after the banking block rather than
+    // immediately after the second read-back pass). Deliberately accepted and stated: `cksum` is
+    // DIAGNOSTIC, never a verdict input — see the note this replaces — and the shift is nanoseconds
+    // against a span the module already measures in milliseconds.
+    let cksum = || surface_checksum(r);
     // The worse of the two passes: a pixel whose reference moved during EITHER read-back is unadjudicated,
     // and taking the max keeps a single moving pixel from being averaged out of the line.
     let moved = moved_cache.max(moved_ram);
@@ -5744,7 +6353,7 @@ fn verify_window(
             "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} rect={}x{}+{}+{} fills={}->{} fact={}/{} desk={}->{} dact={}/{} aborts={}/{} retry={} -> SKIP (teardown)",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
             checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero,
-            occluded, occ_before.count(), occ_after.count(), cksum,
+            occluded, occ_before.count(), occ_after.count(), cksum(),
             // WCD-TEARDOWN — the mismatching pixel from whichever arm actually fired. `bad` writes
             // `first`, `moved` writes `first_moved`, and printing the wrong one is how the first cut
             // would have invented a black pixel on the arm meant to diagnose black pixels.
@@ -5877,7 +6486,7 @@ fn verify_window(
             "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} cksum_pre={:#018x} fills={}->{} fact={}/{} desk={}->{} dact={}/{} -> LIVE (unverifiable)",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
             checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero,
-            occluded, occ_before.count(), occ_after.count(), cksum, cksum_pre,
+            occluded, occ_before.count(), occ_after.count(), cksum(), cksum_pre,
             seq.fills, seq_end.fills, seq.fill_active, seq_end.fill_active,
             seq.desk, seq_end.desk, seq.desk_active, seq_end.desk_active
         );
@@ -5886,7 +6495,7 @@ fn verify_window(
             "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} cksum_pre={:#018x} -> LIVE (unverifiable)",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
             checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero,
-            occluded, occ_before.count(), occ_after.count(), cksum, cksum_pre
+            occluded, occ_before.count(), occ_after.count(), cksum(), cksum_pre
         );
     } else if ok {
         // WCD-TEARDOWN — the interlock's reading rides the PASS line too, on x86.
@@ -5906,7 +6515,7 @@ fn verify_window(
             "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache=0 bad_ram=0 ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=none fills={}->{} fact={}/{} desk={}->{} dact={}/{} stable={} -> PASS",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
             checked, coverage, yn(ram_indep), moved, sprite_px, nonzero,
-            occluded, occ_before.count(), occ_after.count(), cksum,
+            occluded, occ_before.count(), occ_after.count(), cksum(),
             seq.fills, seq_end.fills, seq.fill_active, seq_end.fill_active,
             seq.desk, seq_end.desk, seq.desk_active, seq_end.desk_active, yn(stable)
         );
@@ -5915,7 +6524,7 @@ fn verify_window(
             "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache=0 bad_ram=0 ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=none -> PASS",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
             checked, coverage, yn(ram_indep), moved, sprite_px, nonzero,
-            occluded, occ_before.count(), occ_after.count(), cksum
+            occluded, occ_before.count(), occ_after.count(), cksum()
         );
     } else {
         // WCD-TEARDOWN — the FAIL line carries the interlock reading too, and this arm is the reason
@@ -5934,7 +6543,7 @@ fn verify_window(
             "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} fills={}->{} fact={}/{} desk={}->{} dact={}/{} -> FAIL",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
             checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero,
-            occluded, occ_before.count(), occ_after.count(), cksum,
+            occluded, occ_before.count(), occ_after.count(), cksum(),
             first.0, first.1, first.2, first.3,
             seq.fills, seq_end.fills, seq.fill_active, seq_end.fill_active,
             seq.desk, seq_end.desk, seq.desk_active, seq_end.desk_active
@@ -5944,7 +6553,7 @@ fn verify_window(
             "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} -> FAIL",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
             checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero,
-            occluded, occ_before.count(), occ_after.count(), cksum,
+            occluded, occ_before.count(), occ_after.count(), cksum(),
             first.0, first.1, first.2, first.3
         );
     }
@@ -6049,6 +6658,155 @@ struct VerifyRef {
     full_rows: usize,
 }
 
+// ---------------------------------------------------------------------------------------------
+// WCD-VALVE — the boot-9 read-back pressure DISCRIMINATOR (UNAOS_WCDVALVE=1, feature `wcdvalve`)
+// ---------------------------------------------------------------------------------------------
+// THE METAL FACT (boot 8): under the 6-vug storm `[comp2]` reads `wcd_us` ≈ 4.0–4.1 M per 5000 ms
+// rollup — the WC-D scan-out read-back (uncached PCIe reads from the Kepler BAR1) at ~80 % duty —
+// and that read pressure PRECEDES a reproducible full compositor wedge. The endpoint-hang theory
+// says the sustained uncached read stream is what wedges the endpoint; nothing on the wire can yet
+// separate that from a compositor-side cause.
+//
+// THE VALVE IS THE EXPERIMENT, NOT A FIX. When armed, WC-D read-back ADMISSION is suppressed while
+// composite load is high: `verify_reference` returns before `wcd_admit`, so NO state transitions
+// are made, no decline is counted, no latch is burned — the battery stays exactly as owed and the
+// standing machinery (`wcd_pending` / the paygo taker / the next admitted present) pays it when the
+// valve reopens. Boot 9 then discriminates: wedge gone with the valve CLOSED under storm ⇒ the
+// read-back pressure is implicated; wedge anyway ⇒ the reads are exonerated.
+//
+// THE SIGNAL is the `[comp2]` utilisation the instrument already maintains: `C2_INSPAN_CYC` over
+// `now − C2_EPOCH_CYC` is the fraction of the CURRENT rollup span's wall clock spent inside a
+// composite pass — the same numerator/denominator pair `util_pct` prints, read mid-span. Chosen as
+// the cheapest HONEST signal available here: two relaxed loads and one `now_cycles`, no lock, no
+// table scan, and it measures the pressure itself (composite duty) rather than a proxy like a
+// window count (six parked vugs that stopped presenting are no load at all). Hysteresis
+// (close ≥ 60 %, reopen < 35 %) plus a 50 ms minimum span keep a fresh epoch's near-zero reading
+// and a boundary wobble from flapping the valve.
+//
+// Default OFF, and the unarmed build is byte-identical: every item below is `wcdvalve`-gated and
+// compiles out with the feature. Witness-gated with the WC-D machinery it throttles; x86-only with
+// the BAR1 read-back the theory indicts.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+static WCDVALVE_SHUT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// One `CLOSED` line per suppression episode; re-armed by the reopen.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+static WCDVALVE_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Admissions suppressed in the CURRENT episode — `suspended=` on both episode lines.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+static WCDVALVE_SUSPENDED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The utilisation reading that closed the valve — `util~` on the episode line.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+static WCDVALVE_UTIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The read-back-duty reading that closed the valve — `wcd~` on the episode line.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+static WCDVALVE_WCD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Close at or above this composite utilisation (percent of span wall clock inside a pass).
+///
+/// ### WCDVALVE-PRICE (boot 13, 2026-08-22) — 60 COULD NOT FIRE, AND THE REASON IS A UNIT ERROR
+/// Boot 13 armed this valve, wedged at 34 s, and printed **zero** `[wc-d] valve` lines. The wire
+/// says why in the instrument's own field: `[comp2] util_pct` read **0, 11, 16** across the whole
+/// boot. The close threshold was 60. It was never reachable and the boot tested nothing.
+///
+/// The 60 came from this module's own header — *"boot 8: `wcd_us` ≈ 4.0–4.1 M per 5000 ms rollup —
+/// the WC-D scan-out read-back at ~80 % duty"*. That is **`wcd_us` duty**, the read-back's share of
+/// the span. The valve was then wired to `C2_INSPAN_CYC`, which is **composite-pass duty** — a
+/// different numerator entirely. A threshold sized against one signal was applied to another, and
+/// nothing on the wire could show the mismatch because the valve printed only when it acted.
+///
+/// Re-priced from boot 13's measured peak (`util_pct` 16, so the storm's own ceiling): close at 12,
+/// reopen at 8. Both are now falsifiable every epoch by the `valve READ` line below — if a boot
+/// shows `util~` never reaching 12, say so and re-price again rather than reading silence as a pass.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+const WCDVALVE_CLOSE_PCT: u64 = 12;
+/// Reopen strictly below this — the hysteresis gap is what keeps the valve from flapping at the
+/// threshold while suppression itself lowers the measured load.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+const WCDVALVE_OPEN_PCT: u64 = 8;
+/// WCDVALVE-PRICE — the SECOND signal, and the one the design was actually sized against: the WC-D
+/// read-back's own share of the span, `C2_WCD_CYC` over the span. It is charged inside the read-back
+/// on every exit path (see COMP2-WCD), so unlike the composite-pass duty it accumulates DURING a
+/// pass rather than only at its end. Boot 13 measured 11 % of a 5002 ms span (`wcd_us=550603`)
+/// against the header's remembered 80 % from boot 8 — so either that workload was far heavier or
+/// PAYGOBAND has already taken most of the pressure out. Close at 8, reopen at 5.
+///
+/// EITHER signal closes the valve; BOTH must fall to reopen it. The read-back is what this valve
+/// exists to stand down, so a high read-back duty is sufficient reason on its own.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+const WCDVALVE_WCD_CLOSE_PCT: u64 = 8;
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+const WCDVALVE_WCD_OPEN_PCT: u64 = 5;
+/// WCDVALVE-READ — the `[comp2]` epoch the reading line last named, so it prints ONCE per span.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+static WCDVALVE_READ_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Hold the standing verdict until the current `[comp2]` span is at least this old: a rollup drain
+/// zeroes `C2_INSPAN_CYC`, and judging the first instants of a fresh epoch would read ~0 % on a
+/// storm that has not paused at all.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+const WCDVALVE_MIN_SPAN_US: u64 = 50_000;
+
+/// WCD-VALVE — is the valve CLOSED for this admission? Called by [`verify_reference`] ahead of
+/// [`wcd_admit`]; a `true` suppresses the read-back with no WC-D state touched. Also the place both
+/// episode transitions are judged and printed, so the wire carries one line per episode each way:
+/// `[wc-d] valve CLOSED util~N% suspended=K` at the first suppressed admission, and
+/// `[wc-d] valve OPEN resumed suspended=K` (K = the episode's total) when the load falls away.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+fn wcdvalve_closed() -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let now = crate::arch::now_cycles();
+    let epoch = C2_EPOCH_CYC.load(Relaxed);
+    let span = now.saturating_sub(epoch);
+    if epoch != 0 && super::wcg::cycles_to_us(span) >= WCDVALVE_MIN_SPAN_US {
+        // `span > 0` is implied by the minimum-age test, so the division is safe.
+        let util = C2_INSPAN_CYC.load(Relaxed).saturating_mul(100) / span;
+        let wcd = C2_WCD_CYC.load(Relaxed).saturating_mul(100) / span;
+        let shut = WCDVALVE_SHUT.load(Relaxed);
+        // WCDVALVE-READ — SAY WHAT WAS MEASURED, once per `[comp2]` epoch, EVEN WHEN NOTHING
+        // HAPPENS. Boot 13 armed this valve and printed nothing at all, and "the threshold was
+        // never crossed" was indistinguishable on the wire from "the valve never ran" — a
+        // discriminator that cannot report a null result discriminates nothing. One line per span
+        // is the same budget `[comp2]` itself pays, and it makes the thresholds falsifiable from
+        // any boot instead of only from one that happens to trip them.
+        if WCDVALVE_READ_EPOCH.swap(epoch, Relaxed) != epoch {
+            serial_println!(
+                "[wc-d] valve READ util~{}% wcd~{}% span={}ms close_at=util{}%/wcd{}% state={}",
+                util,
+                wcd,
+                super::wcg::cycles_to_us(span) / 1000,
+                WCDVALVE_CLOSE_PCT,
+                WCDVALVE_WCD_CLOSE_PCT,
+                if shut { "CLOSED" } else { "open" }
+            );
+        }
+        if !shut && (util >= WCDVALVE_CLOSE_PCT || wcd >= WCDVALVE_WCD_CLOSE_PCT) {
+            WCDVALVE_UTIL.store(util, Relaxed);
+            WCDVALVE_WCD.store(wcd, Relaxed);
+            WCDVALVE_SUSPENDED.store(0, Relaxed);
+            WCDVALVE_SAID.store(false, Relaxed);
+            WCDVALVE_SHUT.store(true, Relaxed);
+        } else if shut && util < WCDVALVE_OPEN_PCT && wcd < WCDVALVE_WCD_OPEN_PCT {
+            WCDVALVE_SHUT.store(false, Relaxed);
+            serial_println!(
+                "[wc-d] valve OPEN resumed suspended={}",
+                WCDVALVE_SUSPENDED.load(Relaxed)
+            );
+            return false;
+        }
+    }
+    if WCDVALVE_SHUT.load(Relaxed) {
+        let k = WCDVALVE_SUSPENDED.fetch_add(1, Relaxed) + 1;
+        if !WCDVALVE_SAID.swap(true, Relaxed) {
+            serial_println!(
+                "[wc-d] valve CLOSED util~{}% wcd~{}% suspended={}",
+                WCDVALVE_UTIL.load(Relaxed),
+                WCDVALVE_WCD.load(Relaxed),
+                k
+            );
+        }
+        return true;
+    }
+    false
+}
+
 /// WC-D — capture the read-back's reference, from the composite loop, BEFORE `draw_window` runs.
 ///
 /// The eligibility test and the one-shot latch live here rather than at the read-back because whoever takes
@@ -6084,6 +6842,14 @@ fn verify_reference(
     // the ONE reference, or (PAYGO) the deferral gate is shut, in which case the decline has already
     // been counted and, on cadence, printed. See [`WCD_STATE`].
     let i = r.id as usize;
+    // WCD-VALVE — suppression is judged BEFORE `wcd_admit`, deliberately: a suppressed admission
+    // moves no `WCD_STATE`, burns no latch and counts no decline, so the verdict is POSTPONED, not
+    // blinded — the battery stays owed and is paid the ordinary way once the valve reopens. See the
+    // ledger above [`wcdvalve_closed`]. Compiled out entirely without the `wcdvalve` knob.
+    #[cfg(all(target_arch = "x86_64", feature = "wcdvalve"))]
+    if wcdvalve_closed() {
+        return None;
+    }
     let (step, running) = wcd_admit(r.id, i)?;
     // The reference is this core's alone from here — `wcd_admit`'s compare_exchange is the winner
     // test — so every `serial_println!` below is emitted once. The geometry `-> SKIP`s call
@@ -6297,6 +7063,28 @@ fn verify_reference(
             }
         }
     }
+    // WCD-FNV — the pre-blit FNV, taken ONLY on a pass that can print it.
+    //
+    // [`surface_checksum`] is a byte-at-a-time `read_volatile` FNV over the WHOLE surface slot. The
+    // module's own budget ledger calls the pair "~6 ms each" — measured on a 1312x736 window
+    // (3.86 MB). A panel-width Retina window is 2880x1800x4 = 20.7 MB, i.e. ~5.4x that, and the pair
+    // is then the LARGEST term in a chunk, above the 11 ms one-row probe floor it was assumed to be
+    // negligible against. Under chunking it was paid on EVERY chunk while being printed on almost
+    // none.
+    //
+    // `cksum_pre` reaches the wire on exactly ONE arm — `-> LIVE (unverifiable)` — and under
+    // chunking that arm is reachable only from the CLOSING chunk: a non-closing clean-or-merely-moved
+    // chunk banks and returns before it, a non-closing `!ok` chunk takes the FAIL arm (which prints
+    // `cksum` and not `cksum_pre`), and the teardown abort prints neither. `row1 == rows` is the
+    // closing chunk's ask, so a skipped checksum is a checksum no format string can reach. Stage 1
+    // and every unchunked build take it as before, byte-identical.
+    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    let cksum_pre = if running == WCD_ST_FULL_RUN && row1 < rows {
+        0
+    } else {
+        surface_checksum(r)
+    };
+    #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
     let cksum_pre = surface_checksum(r);
     // WCD-TEARDOWN — open the panel-write window LAST, so it spans everything whose result the
     // verdict rests on: `draw_window`'s copy and both read-back passes. An erase landing before this
@@ -6990,8 +7778,39 @@ fn wcd_admit(id: u32, i: usize) -> Option<(usize, u32)> {
                 let (since_ms, clock, payable) = super::wcg::paygo_clock();
                 // PAYGO-TERM/PAY-AT-CLOSE — a window being torn down has no later to defer into. See
                 // [`WCD_FORCE`], and `wcg::PAYGO_FORCE` for the argument in full.
-                let payable =
-                    payable || WCD_FORCE[i].load(core::sync::atomic::Ordering::Relaxed) != 0;
+                let forced = WCD_FORCE[i].load(core::sync::atomic::Ordering::Relaxed) != 0;
+                // WCD-GESTURE — a LIVE DRAG is a deferral reason of its own, and it is the deferral
+                // this arc exists for.
+                //
+                // Stage 2 is CHUNKED but its chunk is FLOORED AT ONE SOURCE ROW: the time stop is
+                // checked BETWEEN rows (`row > row0` in [`verify_window`]'s `pass`), so a row wider
+                // than the 2 000 us budget can buy overruns it and cannot be cut. On a panel-width
+                // Retina window that row is 2 880 destination probes through the WC-mapped Kepler
+                // BAR, twice (the `bad_cache` and `bad_ram` passes) — an unavoidable ~11 ms per
+                // admitted composite, on top of which the full-surface FNVs rode until the WCD-FNV
+                // change below. `drag_motion` composites once per motion report, so the floor is
+                // paid per motion report and the drag renders in slow motion. No row-granular budget
+                // can fix that: the floor is one row and one row is over budget.
+                //
+                // So DEFER, which is the mechanism this battery already has, rather than sub-row
+                // chunking, which would put a COLUMN cursor beside the row cursor and break three
+                // invariants the module rests on (a `scale x scale` upscale cell is always probed
+                // whole; the lattice phase is `row % step` over a whole row; `band=` names the walk).
+                // The verdict is NOT BLINDED — it is postponed by the length of one gesture:
+                // [`wcd_decline`] counts it, prints it on the census cadence with `clock=drag`, and
+                // sets `WCD_SAID`, which is exactly the predicate [`wcd_pending`] uses to hand the
+                // battery to `paygo_service`'s 4 Hz taker the moment the button lifts. A part-paid
+                // cursor is pending too (`WCD_CUR != 0`), so a battery deferred MID-BOX is reached by
+                // the same taker.
+                //
+                // `forced` OVERRIDES the gesture gate, and must: pay-at-close has no later to defer
+                // into, and a window closed mid-drag would otherwise seal `-> UNPAID` — the silent
+                // shape this module forbids and `x86-witness.spec` FORBIDs on the wire.
+                if !forced && drag_active() != WIN_NONE {
+                    wcd_decline(id, i, since_ms, "drag");
+                    return None;
+                }
+                let payable = payable || forced;
                 if !payable {
                     wcd_decline(id, i, since_ms, clock);
                     return None;
@@ -7647,6 +8466,115 @@ static SIDEBYSIDE_WITNESSED: core::sync::atomic::AtomicBool =
 #[cfg(target_arch = "x86_64")]
 static COMP_GATE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// WCSER-H — who holds [`COMP_GATE`] and since when. `usize::MAX` = free. Written only by the
+/// acquire-CAS winner (t0 first, then core, so a set core always has a current t0) and cleared
+/// before each release store. Gauges — loaded, never drained: a wedged holder leaves them
+/// standing, which is the whole point (boot 7 held the gate for 440+ s and no drained counter
+/// could have named it).
+#[cfg(target_arch = "x86_64")]
+static COMP_HOLDER_CORE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+#[cfg(target_arch = "x86_64")]
+static COMP_HOLD_T0_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// WCSER-H — once-per-held-epoch latch for the overdue tripwire, re-armed at release so the NEXT
+/// wedge also names itself; paired pacer for the standing 5 s repeat while a pass stays held.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+static COMP_OVERDUE_REPORTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+static COMP_OVERDUE_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// WCSER-H — the overdue bound. `[comp2]` has priced a legitimate masked-reopen pass at ~302 ms,
+/// so the tripwire sits at 1 s: 3x the worst honest pass on record, two decades under boot 7's
+/// 440 s wedge.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+const COMP_PASS_OVERDUE_MS: u64 = 1_000;
+
+/// WCSER-STEAL — a holder in-pass longer than this is DEAD and its gate is taken.
+///
+/// Priced at 4x [`COMP_PASS_OVERDUE_MS`], which is itself 3x the worst honest pass this
+/// compositor has ever measured (302 ms), so no legal pass can reach it. It is a liveness bound,
+/// not a performance one: the thing it fires on has been measured three times and is not slow, it
+/// is stopped — boot 15's trace read `row=897` seventeen times in a row, one sample a second,
+/// without the row advancing once.
+#[cfg(target_arch = "x86_64")]
+const COMP_GATE_STEAL_MS: u64 = 4_000;
+
+/// WCSER-STEAL — how many times a dead holder's gate has been taken this boot. Never drained: a
+/// standing nonzero is the desktop having survived something that used to end the session.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+static COMP_STEALS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WCSER-STEAL — release [`COMP_GATE`], but ONLY if this core is still its recorded holder.
+///
+/// This is the whole safety argument for stealing. A core parked inside a non-returning MMIO store
+/// is not coming back; but "not coming back" is a claim about a device, and if the device ever does
+/// answer, the store completes, the present loop finishes writing pixels into a framebuffer
+/// (harmless), and the revenant walks into a release for a gate a live core now owns. Unconditional
+/// `COMP_GATE.store(false)` — which is what both release sites used to do, and which the module's
+/// own DOUBLE-RELEASE note already flagged as a shape to be careful with — would hand a second
+/// compositor the panel while the first was mid-pass.
+///
+/// So the release is now conditional on identity. The revenant finds [`COMP_HOLDER_CORE`] naming
+/// someone else, declines, and returns to its own loop; the live holder releases normally. A core
+/// that was never stolen from always matches and the path is byte-identical to the old one.
+#[cfg(target_arch = "x86_64")]
+fn comp_gate_release() {
+    use core::sync::atomic::Ordering::{Relaxed, Release};
+    let me = crate::arch::sched::meter_current_cpu();
+    if COMP_HOLDER_CORE.load(Relaxed) != me {
+        // Stolen from under us while we were in-pass. Not ours to release, and not ours to clear.
+        #[cfg(feature = "witness")]
+        COMP_REVENANTS.fetch_add(1, Relaxed);
+        return;
+    }
+    COMP_HOLDER_CORE.store(usize::MAX, Relaxed);
+    #[cfg(feature = "witness")]
+    COMP_OVERDUE_REPORTED.store(false, Relaxed);
+    COMP_GATE.store(false, Release);
+}
+
+/// WCSER-STEAL — cores that came back from the dead and correctly declined to release. Zero is the
+/// expected reading; a nonzero one means a stuck BAR store DID eventually complete, which is worth
+/// more than the counter costs because it converts "never returns" into "returns after N seconds".
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+static COMP_REVENANTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WCSER-H — the pass BREADCRUMB: which window the blit loop is on and which phase of its draw
+/// (0 idle, 1 shadow-pin, 2 wcg-begin, 3 draw, 4 post-draw witnesses). Gauges, relaxed, stamped
+/// by the holder and read by the overdue probe — so a wedged pass names not just its core but
+/// its exact rung: boot 7's "hung between win8 and win9" cost a session of forensics to place;
+/// the next one costs one serial line.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+static COMP_PASS_WIN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+static COMP_PASS_PHASE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// WCSER-H — one breadcrumb stamp: two relaxed stores.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+#[inline]
+fn comp_mark(win: u32, phase: u32) {
+    use core::sync::atomic::Ordering::Relaxed;
+    COMP_PASS_WIN.store(win, Relaxed);
+    COMP_PASS_PHASE.store(phase, Relaxed);
+}
+#[cfg(not(all(target_arch = "x86_64", feature = "witness")))]
+#[inline]
+fn comp_mark(_win: u32, _phase: u32) {}
+
+/// WCSER-H — the row gauge beside the breadcrumb: the panel row the flush loop last emitted
+/// (or the band row the compose last painted), so a wedge inside a row loop names its row.
+/// One relaxed store per row; the loops it rides are ~10^2-10^3 iterations per band.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+static COMP_PASS_ROW: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+#[inline]
+fn comp_mark_row(y: usize) {
+    COMP_PASS_ROW.store(y, core::sync::atomic::Ordering::Relaxed);
+}
+#[cfg(not(all(target_arch = "x86_64", feature = "witness")))]
+#[inline]
+fn comp_mark_row(_y: usize) {}
+
 /// WCSER — a pass was declined and its damage is still on the table. Cleared by the holder's re-run
 /// loop; see `composite` for the lost-wakeup close.
 #[cfg(target_arch = "x86_64")]
@@ -7734,13 +8662,24 @@ fn wcser_emit(scope: &str, span: u64) {
     let total = entered.saturating_add(declined);
     // Tenths of a percent would be noise; whole percent of passes that had to be excluded.
     let pct = declined.saturating_mul(100) / total.max(1);
+    // WCSER-H — the holder columns. `holder=-1` reads "free"; a held gate names its core and the
+    // age of the pass it is running, so a WEDGED verdict carries its culprit on the same line.
+    let holder = COMP_HOLDER_CORE.load(Relaxed);
+    let held_ms = if holder == usize::MAX {
+        0
+    } else {
+        crate::arch::ms().saturating_sub(COMP_HOLD_T0_MS.load(Relaxed))
+    };
     serial_println!(
-        "[wcser] scope={} entered={} declined={} reruns={} declined_pct={} span={}ms -> {}",
+        "[wcser] scope={} entered={} declined={} reruns={} declined_pct={} holder={} held_ms={} exbusy={} span={}ms -> {}",
         scope,
         entered,
         declined,
         reruns,
         pct,
+        holder as isize,
+        held_ms,
+        OCC_EXCUSE_BUSY.swap(0, Relaxed),
         span,
         // WEDGED is tested first and outranks SERIAL: a period in which every pass was declined and
         // none was ever entered is a permanently-held gate, not successful serialisation.
@@ -7752,6 +8691,60 @@ fn wcser_emit(scope: &str, span: u64) {
             "SOLO"
         }
     );
+}
+
+/// WCSER-H — the overdue-pass probe, called from `x86_input_service`'s ~1 kHz loop: a core the
+/// compositor never runs on, and one boot 7 proved survives the wedge (trackpad witnesses kept
+/// printing at t=150s while c1 spun). Deliberately NOT pumped by `wcn_tick` — that pump is the
+/// presenting tasks, and a wedge with no surviving presenters silences it, which is exactly the
+/// blindness this probe exists to close. One loud `== tripwire ::` line at the crossing, then one
+/// standing line per 5 s while the pass is still held, so the wedge stays on the wire after every
+/// other witness has died. `serial_println` is safe from here: `_print` try-locks and defers to
+/// the ring, never blocks.
+///
+/// Known residual blindness, recorded rather than argued away: `arch::ms()` advances only on the
+/// BSP, so a wedge OF the BSP freezes `age` — the probe still prints if the bound was crossed
+/// before the freeze, and a BSP wedge is otherwise a follow-up brief, not this arc's.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+pub fn wcser_overdue_probe() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let holder = COMP_HOLDER_CORE.load(Relaxed);
+    if holder == usize::MAX {
+        return; // gate free — the overwhelmingly common read: two relaxed loads total
+    }
+    let now = crate::arch::ms();
+    let age = now.saturating_sub(COMP_HOLD_T0_MS.load(Relaxed));
+    if age < COMP_PASS_OVERDUE_MS {
+        return;
+    }
+    let first = !COMP_OVERDUE_REPORTED.swap(true, Relaxed);
+    // WCSER-ISR (boot 13) — the standing repeat is 1 s, not 5 s, and it is now driven from the
+    // timer ISR rather than the input-service loop. The point of the repeat is the `row=` field: a
+    // FROZEN row is one MMIO write into the Kepler BAR that never returned, a CRAWLING row is the
+    // same present loop running at microscopic speed, and those are different bugs. Boot 13 got one
+    // sample and could not tell them apart. At 1 s a 78-second hold yields 78 points on the trace
+    // instead of 15, and the cost is one `serial_println!` per second — the budget DEADMAN already
+    // pays on the same ISR, on the same core, through the same wedge.
+    if !first && now.saturating_sub(COMP_OVERDUE_LAST_MS.load(Relaxed)) < 1_000 {
+        return; // standing repeat, paced to DEADMAN's cadence
+    }
+    COMP_OVERDUE_LAST_MS.store(now, Relaxed);
+    serial_println!(
+        ":: [wcser] PASS OVERDUE holder=c{} age_ms={} pending={} win={} phase={} row={} == tripwire ::",
+        holder,
+        age,
+        COMP_PENDING.load(core::sync::atomic::Ordering::Acquire),
+        COMP_PASS_WIN.load(Relaxed),
+        COMP_PASS_PHASE.load(Relaxed),
+        COMP_PASS_ROW.load(Relaxed),
+    );
+    // PCIH — root-port-at-wedge sampler, on the same cadence as the tripwire line (first
+    // crossing + each 5 s standing repeat). ROOT PORT registers only: its config space
+    // completes from the root complex, so this cannot capture the last surviving core the
+    // way an endpoint read would if the GK107 host interface is the thing that hung. If
+    // kepler never initialized (or found no bridge above it), this prints nothing.
+    #[cfg(feature = "nvidia-kepler")]
+    crate::drivers::gpu::pcihealth::rp_at_wedge();
 }
 
 /// WCPAR — per-CPU count of window composes that reached the [`STAGE`] pool, since the last rollup.
@@ -9850,10 +10843,16 @@ struct WcnRow {
     /// impose on it. Seed-gated: see the charge site for why a relay must not be billed as a
     /// dragger.
     dout: core::sync::atomic::AtomicU64,
-    /// WCN-CAUSE — the whole-box PROMOTION bill those drags commit the pass to, in units of 1024 px.
-    /// Charged on every promotion this window's own damage causes, including a `j` that was already
-    /// dirty with a BAND and is widened to its whole box — that case adds no window and so raises no
-    /// `dout`, but it is real pixels and it is the console's case.
+    /// WCN-CAUSE — the PROMOTION bill those drags commit the pass to, in units of 1024 px. Charged
+    /// on every promotion this window's own damage causes, including a `j` that was already dirty
+    /// with a BAND and is merely widened — that case adds no window and so raises no `dout`, but it
+    /// is real pixels and it is the console's case.
+    ///
+    /// DMG-DISJOINT — the bill is the pixels ADDED to `j`'s damaged extent, not `j`'s whole box.
+    /// The closure no longer whole-boxes what it drags in, so a whole-box charge would report a cost
+    /// the pass does not pay and would hide the saving this counter exists to measure. A drag that
+    /// genuinely cannot be narrowed still bills the whole box, because `damaged_box(_, None)` IS the
+    /// outer box — no pre-arc reading of this field moves.
     dkpx: core::sync::atomic::AtomicU64,
     /// WCN-CAUSE — drag-in edges this row caused while it was itself a DRAGGEE, forwarding damage
     /// the closure had just given it. Separated from `dout` so a chain of overlapping windows reads
@@ -9994,6 +10993,17 @@ static C2_DMG_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 /// area of. Never used as a denominator; it exists so the line can be read against itself.
 #[cfg(feature = "witness")]
 static C2_BOX_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DMGOVLP — CUMULATIVE shadows of [`C2_DMG_PX`]/[`C2_BOX_PX`], charged beside them in
+/// [`draw_window`] and NEVER drained. `comp2_emit` SWAPS the pair above to zero on its own rollup
+/// cadence, so a fixture that read those for a before/after delta would be racing the rollup for
+/// its own numbers and could read a truncated interval on a healthy kernel. These two only ever
+/// grow; a delta across them is a claim about the interval and nothing else. Read exclusively by
+/// [`dmgovlp_selftest`] (x86); on aarch64 they are written and never read, the same lifecycle every
+/// per-slot WCN counter already has there, and with the `witness` knob off neither exists at all.
+#[cfg(feature = "witness")]
+static C2_DMG_PX_TOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static C2_BOX_PX_TOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// COMP2-WCD — cycles spent inside [`verify_window`] this span: the WC-D witness's glass read-back
 /// (both passes), its attribution walks, its repair redraw and its verdict UART, charged by a drop
 /// guard so every exit path pays. Printed as `wcd_us=`, a TOTAL for the span like `straddle_us`
@@ -10690,6 +11700,16 @@ fn wcn_slot(id: WinId) -> Option<&'static WcnRow> {
 #[cfg(feature = "witness")]
 fn wcn_note_present(id: WinId, hidden: bool) {
     use core::sync::atomic::Ordering::Relaxed;
+    // NOATT — the monotone sequence, bumped for EVERY present attempt (the suppressed path included,
+    // for `att`'s own reason: an attempt is what the owner did). Before the slot lookup's early
+    // return would be wrong — an out-of-range id has no census row and no seed row either — so it
+    // rides the same `Some` the census does.
+    #[cfg(target_arch = "x86_64")]
+    if let Some(i) = (id as usize).checked_sub(1) {
+        if i < MAX_WINDOWS {
+            NOATT_SEQ[i].fetch_add(1, Relaxed);
+        }
+    }
     let Some(s) = wcn_slot(id) else { return };
     s.att.fetch_add(1, Relaxed);
     if hidden {
@@ -10737,10 +11757,34 @@ fn wcn_note_drawn(id: WinId, dragged: bool) {
 /// side. The pair is what makes the census two-sided — a window can read a large `drg` (it is
 /// expensive to OTHERS' presents) or a large `dout` (others are expensive to ITS presents), and the
 /// two are different defects with different fixes. Nothing in the census forces them to agree.
+/// DMGOVLP — cumulative machine-wide shadows of the per-slot drag/relay census, charged at the top
+/// of [`wcn_note_dragout`]/[`wcn_note_relay`] BEFORE the `wcn_slot` lookup, so a fixture window
+/// that never earns a census slot still charges them. Two properties the per-slot counters cannot
+/// offer a fixture:
+///  * `OVLP_DRAG_PX` is RAW pixels, not `px / 1024` — a banded 8-px sliver drag rounds to ZERO
+///    kilopixels, so `dkpx` (and therefore `[wcn] dkpx=`) is structurally blind to exactly the
+///    slivers the DMGOVLP leg exists to force. Never assert `dkpx > 0` for a sliver.
+///  * They are never drained: the WCN rollup swaps its slots on its own cadence, and a fixture
+///    reading swap-drained counters races the rollup for its own numbers (the C2_*_TOT argument).
+#[cfg(feature = "witness")]
+static OVLP_DRAG_EVT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DMGOVLP — raw pixels the occlusion closure's promotions billed (see [`OVLP_DRAG_EVT`]).
+#[cfg(feature = "witness")]
+static OVLP_DRAG_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DMGOVLP — relay events: forwarded damage adding a higher-z window (see [`OVLP_DRAG_EVT`]).
+#[cfg(feature = "witness")]
+static OVLP_RELAY_EVT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 #[cfg(feature = "witness")]
 fn wcn_note_dragout(id: WinId, px: u64, added: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    // DMGOVLP — unconditional and first: the shadow census must see every promotion, including one
+    // charged to a row the per-slot table declined.
+    if added {
+        OVLP_DRAG_EVT.fetch_add(1, Relaxed);
+    }
+    OVLP_DRAG_PX.fetch_add(px, Relaxed);
     if let Some(s) = wcn_slot(id) {
-        use core::sync::atomic::Ordering::Relaxed;
         if added {
             s.dout.fetch_add(1, Relaxed);
         }
@@ -10752,10 +11796,162 @@ fn wcn_note_dragout(id: WinId, px: u64, added: bool) {
 /// to the pass. The chain's middle, kept out of `dout` so the chain's FOOT stays identifiable.
 #[cfg(feature = "witness")]
 fn wcn_note_relay(id: WinId) {
+    // DMGOVLP — unconditional shadow, before the slot lookup (see [`OVLP_DRAG_EVT`]).
+    OVLP_RELAY_EVT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if let Some(s) = wcn_slot(id) {
         s.drly
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
+}
+
+// ---- NOATT — the discriminator: damage nobody attached to -------------------------------------
+//
+// ### The question every earlier investigation walked past
+//
+// The `[wcn]` census can already say that a window composited more often than it presented — that is
+// `comp_rate` above `att_rate`, and the WCN-CAUSE split says whether the excess was the occlusion
+// closure (`drg`) or the window's own damage (`pre`). What it CANNOT say is the thing that matters
+// when a desktop is burning a core while the glass does not move: **was there an attach behind that
+// damage at all?** A row with `att=0 comp=18 pre=18` is exactly that shape — eighteen composites of
+// its OWN damage across a span in which its owner presented nothing — and on rmbp3 boot 11 it sat on
+// the wire for 64 seconds under a healthy `-> LIVE` verdict while four separate investigations read
+// past it.
+//
+// `pre` alone cannot answer it, for a structural reason: `pre` is counted per BLIT and `att` per
+// PRESENT, and the two are drained on the same cadence but never joined per pass. A window
+// presenting at 19/s and compositing at 22/s reads the same `pre > 0` as one presenting at 0/s and
+// compositing at 3.6/s. The join has to happen INSIDE the pass, against the attach count as of the
+// previous pass, and that is the whole of this instrument.
+//
+// ### What it counts
+//
+// Per composite pass, over the SEED set (rows the table snapshot found damaged — the closure's
+// dragged-in rows are excluded by construction, because their cause is named already):
+//
+//  * `noatt` — seed rows whose per-id attach sequence has not moved since the previous pass. Damage
+//    a present did not put there.
+//  * `noatt_kpx` — what those rows charged the pass, as `damaged_box` area in kilopixels: the same
+//    quantity `[wcn] dkpx=` uses, so the two are directly addable.
+//  * `taker` — how many of the span's marks came from [`paygo_service_pass`]. This is the
+//    ATTRIBUTION half: `noatt == taker` convicts the pay-as-you-go taker outright, `noatt > taker`
+//    says something else is also marking, and `taker == 0` with `noatt > 0` sends the reader to the
+//    other unattached-damage paths (`cursor::repair`'s `damage_intersecting`, `focus_changed`,
+//    `repaint`, the erase drain).
+//
+// ### The readings
+//
+// A healthy idle desktop reads NOTHING — the line is self-silencing on `noatt == 0`, which is what
+// rmbp2 boot 10 past 193 596 ms and boot 9 past 112 510 ms would both have printed. The boot-11
+// leak reads `passes=115 seeds=115 noatt=18 noatt_kpx=~13300 taker=18 -> TAKER`. A cursor path
+// re-damaging a still pointer would read `taker=0 -> UNATTRIBUTED` with `noatt` near the pass count.
+//
+// x86 only, like `[wcser]`/`[wcpar]`: the taker it attributes to is x86 + `wcg-paygo`, and the
+// aarch64 wire gains no line.
+
+/// NOATT — per-id monotone attach sequence. Bumped by [`wcn_note_present`] for every present the
+/// owner attempted, and NEVER drained: the reading is a DIFFERENCE against [`NOATT_SEEN`], so a
+/// counter the rollup swapped would manufacture a fresh "no attach" the instant it fired.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static NOATT_SEQ: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
+
+/// NOATT — per-id: [`NOATT_SEQ`] as the PREVIOUS composite pass saw it. Stamped for every slot on
+/// every pass, so "since the previous pass" is literal and a row that sat out a pass does not
+/// accumulate a spurious quiet interval.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static NOATT_SEEN: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
+
+/// NOATT — per-span: passes that reached the seed snapshot.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static NOATT_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// NOATT — per-span: seed rows, all causes. The denominator `noatt` is read against.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static NOATT_SEEDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// NOATT — per-span: seed rows with no attach since the previous pass.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static NOATT_ROWS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// NOATT — per-span: what those rows charged, in kilopixels (`[wcn] dkpx=`'s unit).
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static NOATT_KPX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// NOATT — per-span: marks made by [`paygo_service_pass`]. The attribution half.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static NOATT_TAKER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// NOATT — the pay-as-you-go taker's mark, counted where it is made. Called under no lock, one
+/// relaxed increment; compiled out with the taker itself.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+fn noatt_note_taker() {
+    NOATT_TAKER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// NOATT — fold one composite pass's seed set into the span. See the ledger above [`NOATT_SEQ`].
+///
+/// The stamp is taken for EVERY slot, not only the seeded ones: "since the previous pass" has to
+/// mean the previous pass, or a window that presents once every ten passes would read as unattached
+/// on nine of them. The `swap` is the stamp and the read in one operation, so two cores compositing
+/// concurrently cannot both claim the same quiet interval.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn noatt_note_pass(
+    rows: &[Window; MAX_WINDOWS],
+    seed: &[bool; MAX_WINDOWS],
+    bands: &[Option<(usize, usize)>; MAX_WINDOWS],
+) {
+    use core::sync::atomic::Ordering::Relaxed;
+    NOATT_PASSES.fetch_add(1, Relaxed);
+    let (mut seeds, mut noatt, mut kpx) = (0u64, 0u64, 0u64);
+    for i in 0..MAX_WINDOWS {
+        let seq = NOATT_SEQ[i].load(Relaxed);
+        let seen = NOATT_SEEN[i].swap(seq, Relaxed);
+        if !seed[i] {
+            continue;
+        }
+        seeds += 1;
+        if seq != seen {
+            continue;
+        }
+        noatt += 1;
+        // `damaged_box`, not `outer_box`: a banded row charges its band, which is the whole point of
+        // the PAYGOBAND change this instrument has to be able to measure.
+        let d = damaged_box(&rows[i], bands[i]);
+        kpx += (d.2 as u64 * d.3 as u64) / 1024;
+    }
+    NOATT_SEEDS.fetch_add(seeds, Relaxed);
+    NOATT_ROWS.fetch_add(noatt, Relaxed);
+    NOATT_KPX.fetch_add(kpx, Relaxed);
+}
+
+/// NOATT — drain and print, on `[wcn]`'s cadence and from its emitter, so the span is the same span.
+///
+/// SELF-SILENCING: a period in which every damaged row had an attach behind it prints nothing. That
+/// is the property that makes the line worth its bytes — it appears exactly when there is work
+/// nobody asked for, and its absence is the healthy reading rather than an absent instrument. The
+/// per-span counters are still drained on a silent period, so a leak cannot bank quiet spans and
+/// then report them all against one noisy one.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn noatt_emit(scope: &str, span: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let passes = NOATT_PASSES.swap(0, Relaxed);
+    let seeds = NOATT_SEEDS.swap(0, Relaxed);
+    let rows = NOATT_ROWS.swap(0, Relaxed);
+    let kpx = NOATT_KPX.swap(0, Relaxed);
+    let taker = NOATT_TAKER.swap(0, Relaxed);
+    if rows == 0 {
+        return;
+    }
+    // Tenths, per this file's rate convention.
+    let rate = rows.saturating_mul(10_000) / span.max(1);
+    let verdict = if taker >= rows {
+        "TAKER"
+    } else if taker > 0 {
+        "TAKER+"
+    } else {
+        "UNATTRIBUTED"
+    };
+    serial_println!(
+        "[noatt] scope={} passes={} seeds={} noatt={} noatt_kpx={} rate={}.{}/s taker={} span={}ms -> {}",
+        scope, passes, seeds, rows, kpx, rate / 10, rate % 10, taker, span, verdict
+    );
 }
 
 /// WC-N — record that `id`'s row was in a pass's dirty set and declined for sitting below the shell.
@@ -11018,6 +12214,12 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
     // is contention. x86 only, for the reason the gate itself is.
     #[cfg(target_arch = "x86_64")]
     wcser_emit(scope, span);
+    // NOATT — the discriminator rides the same cadence and span, directly under `[wcser]` because it
+    // answers the question `[wcser]` cannot: a `comp_rate` far above `att_rate` with `declined_pct`
+    // in single figures is not contention, and this line says whether it was work anybody asked for.
+    // Self-silencing, so a healthy desktop is as quiet as it was before. x86 only, like `[wcser]`.
+    #[cfg(target_arch = "x86_64")]
+    noatt_emit(scope, span);
     // WPACE-PANEL — the present pacer's ledger rides the same cadence, directly under `[wcser]`
     // whose `declined=` it is the cure for: `coalesced=` climbing while `declined=` falls is the
     // pacer converting gate contention into absorbed presents. Same identity snapshot as the
@@ -11447,15 +12649,94 @@ fn damaged_box(r: &Window, band: Option<(usize, usize)>) -> (usize, usize, usize
     }
     // F5 discipline: saturating throughout, so a nonsense band degrades to a large box the panel
     // clip bounds rather than to a small one that under-damages.
-    let y0 = r.y.saturating_add(sy0.saturating_mul(r.scale)).max(by);
-    let y1 = r
-        .y
-        .saturating_add(sy1.saturating_mul(r.scale))
-        .min(by.saturating_add(bh));
+    //
+    // DMG-DISJOINT — THE EXTREMES REACH THE CHROME, and that is what lets a band express the damage
+    // a NEIGHBOUR inflicts rather than only the damage an owner presents.
+    //
+    // The mapping `r.y + sy * r.scale` addresses CONTENT rows only, so before this arc the topmost
+    // panel row any band could name was `r.y` — the first content row — and the title bar and top
+    // border above it were unreachable. Any damage that touched a window's top edge therefore had to
+    // be spelled `damage_all()`, which is precisely why `damage_intersecting` and the occlusion
+    // closure whole-boxed: not because the whole box was dirty, but because the band had no way to
+    // say "from the top of the box down to row k".
+    //
+    // Now it can: `sy0 == 0` means the top of the OUTER box and `sy1 >= r.h` means the bottom of it.
+    // Both are WIDENINGS — the rows added are chrome rows the alternative repainted anyway — so no
+    // caller can lose a pixel by this, and the only pre-existing producer of a band
+    // (`present_rows`, the routed console) is affected exactly when it presents its first or last
+    // source row, where it now also repaints the frame those rows sit in. Conservative in the one
+    // direction that is always safe.
+    let y0 = if sy0 == 0 {
+        by
+    } else {
+        r.y.saturating_add(sy0.saturating_mul(r.scale)).max(by)
+    };
+    let y1 = if sy1 >= r.h {
+        by.saturating_add(bh)
+    } else {
+        r.y.saturating_add(sy1.saturating_mul(r.scale))
+            .min(by.saturating_add(bh))
+    };
     if y1 <= y0 {
         return (bx, by, bw, 0);
     }
     (bx, y0, bw, y1 - y0)
+}
+
+/// DMG-DISJOINT — the inverse of [`damaged_box`]: the SOURCE band of `r` that covers panel rows
+/// `[py0, py1)`, or `None` when the rows are not expressible as a band and the caller must fall back
+/// to a whole-box [`Window::damage_all`].
+///
+/// This is the primitive that stops widely-separated small surfaces from unioning into the panel.
+/// Two callers had no choice but to whole-box before it existed, and both are per-composite hot:
+///
+/// * [`damage_intersecting`] — the erase drains, the cursor repair and the menu close. The WC-K3
+///   ledger states the cost in its own words: *"a five-pixel exposure at the edge of a neighbour
+///   costs that neighbour a WHOLE-BOX repaint"*.
+/// * the upward occlusion closure in [`composite_inner`], which promoted every higher-z window it
+///   dragged in to `bands[j] = None`.
+///
+/// `None` is returned for "the whole box" as well as for "not expressible", because those are the
+/// same instruction to the caller. Rounding is OUTWARD on both ends (`floor` at the top, `ceil` at
+/// the bottom) so an upscaled window never under-damages the source row a partial panel row reads
+/// from, and the result is clipped to `r`'s own outer box so a rect that overhangs the window cannot
+/// name a row the window does not have.
+///
+/// Width is deliberately not part of the answer. A band is full-box-width by construction
+/// (`stage_window` paints `paint_window` across the whole clipped box for each chunk it stages), and
+/// the win this arc is after is vertical: six 768x768 surfaces whose mutual overlaps are slivers no
+/// longer each charge their whole box on every pass.
+fn band_for_rows(r: &Window, py0: usize, py1: usize) -> Option<(usize, usize)> {
+    if r.h == 0 || r.scale == 0 || py1 <= py0 {
+        return None;
+    }
+    let (_, by, _, bh) = outer_box(r);
+    let py0 = py0.max(by);
+    let py1 = py1.min(by.saturating_add(bh));
+    if py1 <= py0 {
+        return None;
+    }
+    // The content band, in the same coordinate `damaged_box` maps back out of. `py0 <= r.y` is the
+    // chrome case and `sy0 = 0` is exactly how `damaged_box` now spells it.
+    let sy0 = if py0 <= r.y { 0 } else { (py0 - r.y) / r.scale };
+    // Landing panel F2 — a rect ENTIRELY inside the top chrome (`py1 <= r.y`) has no content row
+    // to name: `py1 - r.y` below would underflow (wrapping to the safe whole-box answer only by
+    // accident of release-mode semantics, and to a panic under any overflow-checks profile). Say
+    // the fail-safe out loud instead: whole box.
+    if py1 <= r.y {
+        return None;
+    }
+    let cy1 = r.y.saturating_add(r.h.saturating_mul(r.scale));
+    let sy1 = if py1 >= cy1 {
+        r.h
+    } else {
+        // ceil, so a panel row that reads from a source row only partly covered still damages it.
+        (py1 - r.y).div_ceil(r.scale).min(r.h)
+    };
+    if sy1 <= sy0 || (sy0 == 0 && sy1 >= r.h) {
+        return None; // empty, inverted, or the whole box — all "damage_all" to the caller.
+    }
+    Some((sy0, sy1))
 }
 
 /// CLOSE-BOX (P79, bench: "put a close button in the upper right of the windows to exit"; WMCTRL,
@@ -12548,6 +13829,230 @@ static DRAG_BOX_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 #[cfg(feature = "witness")]
 static DRAG_FLASH_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+// ---- DROPWAKE: the ghost-drop witness ------------------------------------------------------------
+//
+// Peter reports drop-ghosting — a released window leaves a stale image behind — while boot 7/8's
+// `[dragrel]` reads CLEAN. Every existing witness measures the GESTURE; none measures the DROP: the
+// interval from the release edge to the vacated slivers' desktop fill actually reaching the glass.
+// This trace times exactly that interval, per drop, and when it blows the deadline an audit line
+// names which piece of drag state survived the release. One boot with it discriminates present-lag
+// (`[dropwake] -> LAG` with `[dropres] stale=+vacfill`) from residual drag state (`[dropwake]`
+// CLEAN beside a seen ghost, with `[dropres]` naming the survivor).
+/// DROPWAKE — the window whose drop is being timed, or [`WIN_NONE`] when no drop is in flight.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DW_ARMED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(WIN_NONE);
+/// DROPWAKE — `now_cycles` at the release ([`drag_end`]/[`drag_cancel`], after `drag_report`).
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DW_REL_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DROPWAKE — `now_cycles` when the LAST motion published its erase slivers (the damage). Zero
+/// means the gesture never moved, and the drop is not worth a line. Published LAST in
+/// [`drag_note_move`]'s stamp block so a reader that sees it nonzero sees the box it covers.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DW_DMG_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DROPWAKE — `now_cycles` when a drained fill overlapping [`DW_VAC`] was flushed to the panel.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DW_GLASS_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DROPWAKE — entry stamp of the composite pass whose drain reached the glass ([`DW_PASS_T0`] at
+/// glass time), so the trace splits "waiting for a pass" from "inside the pass".
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DW_COMP_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DROPWAKE — entry stamp of the most recent composite pass, refreshed at [`composite_once`]'s
+/// `c2_t0` read.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DW_PASS_T0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DROPWAKE — `COMP_GATE` declines observed while a drop was armed: passes that WOULD have run and
+/// were bounced to `COMP_PENDING` instead.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DW_DECLINED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DROPWAKE — composite passes that RAN while the drop was armed and still did not put the vacated
+/// slivers on the glass.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DW_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DROPWAKE — union box (`x`, `y`, `w`, `h`) of the LAST motion's erase slivers. `w == 0` means no
+/// box is held. This is what the glass hook and the audit test overlap against.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DW_VAC: [core::sync::atomic::AtomicUsize; 4] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; 4];
+/// DROPWAKE — one bounded budget shared by `[dropwake]` and `[dropres]`, so a pathological boot
+/// cannot turn the drop witness into a serial storm.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static DW_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+const DW_LOG_MAX: u64 = 128;
+/// DROPWAKE — the deadline that turns a drop's `rel->glass` into a LAG verdict: two 60 Hz frames.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+const DROPWAKE_LAG_US: u64 = 33_000;
+/// DROPRES — how long an armed drop may wait for its glass before the audit fires and the trace
+/// gives up on it.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+const DROPRES_MS: u64 = 250;
+
+/// DROPWAKE — emit the finished drop's erase-latency trace and retire its state.
+///
+/// `glass_known == false` is the timeout arm: the fill never reached the glass inside
+/// [`DROPRES_MS`], so the comp/glass terms print 0 and the verdict is LAG by construction.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn dropwake_emit(win: WinId, glass_known: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    // Retire the drop FIRST, so a budget-exhausted boot still disarms cleanly.
+    DW_ARMED.store(WIN_NONE, Relaxed);
+    let rel = DW_REL_CYC.load(Relaxed);
+    let dmg = DW_DMG_CYC.swap(0, Relaxed);
+    let comp = DW_COMP_CYC.load(Relaxed);
+    let glass = DW_GLASS_CYC.load(Relaxed);
+    let declined = DW_DECLINED.swap(0, Relaxed);
+    let passes = DW_PASSES.swap(0, Relaxed);
+    if DW_LOG.fetch_add(1, Relaxed) >= DW_LOG_MAX {
+        return;
+    }
+    let us = |a: u64, b: u64| super::wcg::cycles_to_us(b.saturating_sub(a));
+    let rel_glass = if glass_known { us(rel, glass) } else { 0 };
+    // LAG on either count: the glass never came, or it came slower than two frames.
+    let lag = !glass_known || rel_glass > DROPWAKE_LAG_US;
+    serial_println!(
+        "[dropwake] win={} rel->dmg={}us dmg->comp={}us comp->glass={}us rel->glass={}us declined={} passes_waited={} -> {}",
+        win,
+        us(rel, dmg),
+        if glass_known { us(dmg, comp) } else { 0 },
+        if glass_known { us(comp, glass) } else { 0 },
+        rel_glass,
+        declined,
+        passes,
+        if lag { "LAG" } else { "CLEAN" }
+    );
+}
+
+/// DROPWAKE — arm the drop timer at a gesture's end. Called from BOTH ends ([`drag_end`] and
+/// [`drag_cancel`]) immediately after `drag_report`, for `drag_report`'s own reason: the bench's
+/// real gestures mostly end in `release-level`/`focus-key`.
+///
+/// Silent for a gesture that never moved (`DW_DMG_CYC == 0`). If the drained fill already reached
+/// the glass BEFORE the release — the queue drained mid-drag and nothing is owed — the trace is
+/// emitted CLEAN right here rather than armed, because there is nothing left to wait for.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn dropwake_arm(id: WinId) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if DW_DMG_CYC.load(Relaxed) == 0 {
+        return;
+    }
+    DW_REL_CYC.store(crate::arch::now_cycles(), Relaxed);
+    if DW_GLASS_CYC.load(Relaxed) != 0 {
+        dropwake_emit(id, true);
+        return;
+    }
+    DW_ARMED.store(id, Relaxed);
+}
+
+/// DROPWAKE — the composite-pass hook, called at [`composite_once`] entry with its own `c2_t0`.
+///
+/// Refreshes [`DW_PASS_T0`] unconditionally (one relaxed store on an idle boot); while a drop is
+/// armed it counts the pass and, past [`DROPRES_MS`], fires the [`dropres_audit`] and retires the
+/// drop as LAG — a drop that old is not going to resolve into a latency number worth waiting for.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn dropwake_pass_tick(t0: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    DW_PASS_T0.store(t0, Relaxed);
+    let id = DW_ARMED.load(Relaxed);
+    if id == WIN_NONE {
+        return;
+    }
+    DW_PASSES.fetch_add(1, Relaxed);
+    let rel = DW_REL_CYC.load(Relaxed);
+    if super::wcg::cycles_to_us(t0.saturating_sub(rel)) > DROPRES_MS * 1000 {
+        dropres_audit(id);
+        dropwake_emit(id, false);
+    }
+}
+
+/// DROPWAKE — the glass hook, called from [`drain_deferred`] at its `flush_rect` site with the box
+/// just flushed. If the box meets the vacated slivers and the glass is not yet stamped, this IS the
+/// erase reaching the panel: stamp comp+glass, and if the release has already happened, emit and
+/// disarm. (Un-armed stamping is deliberate — a queue that drains mid-drag is what lets
+/// [`dropwake_arm`] emit CLEAN at the release itself.)
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn dropwake_glass_note(x: usize, y: usize, w: usize, h: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if DW_DMG_CYC.load(Relaxed) == 0 || DW_GLASS_CYC.load(Relaxed) != 0 {
+        return;
+    }
+    let vw = DW_VAC[2].load(Relaxed);
+    if vw == 0 {
+        return;
+    }
+    let vac = (
+        DW_VAC[0].load(Relaxed),
+        DW_VAC[1].load(Relaxed),
+        vw,
+        DW_VAC[3].load(Relaxed),
+    );
+    if !boxes_overlap(vac, (x, y, w, h)) {
+        return;
+    }
+    DW_COMP_CYC.store(DW_PASS_T0.load(Relaxed), Relaxed);
+    DW_GLASS_CYC.store(crate::arch::now_cycles(), Relaxed);
+    let id = DW_ARMED.load(Relaxed);
+    if id != WIN_NONE {
+        dropwake_emit(id, true);
+    }
+}
+
+/// DROPRES — name what is still stale a quarter-second after the drop. Each term is one cheap
+/// relaxed peek at a mechanism the ghost could be hiding in; only the nonempty ones print.
+///
+/// * `vacfill` — the [`DEFER`] queue still holds a box overlapping the vacated slivers: the erase
+///   is QUEUED and no pass has drained it. Present-lag. (A `try_lock` peek, bounded at
+///   [`MAX_DEFER`] entries; a contended lock skips the term rather than waiting.)
+/// * `comppend` — [`COMP_PENDING`] is set: a decliner published a wakeup nobody has consumed.
+/// * `dragocc` — [`DO_BOX`] still carries a dragged-window box after the gesture retired it: a
+///   pass re-published drag geometry post-release, i.e. residual drag state.
+/// * `ring`/`pend` — the release edge is still in the input ring / still unrouted
+///   ([`crate::pal::release_edge_in_ring`] / [`crate::pal::release_edge_pending`]).
+/// * `sprite-vac` — the cursor sprite's live box sits on the vacated slivers: the ghost could be a
+///   sprite save-under.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn dropres_audit(win: WinId) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if DW_LOG.fetch_add(1, Relaxed) >= DW_LOG_MAX {
+        return;
+    }
+    let vac = (
+        DW_VAC[0].load(Relaxed),
+        DW_VAC[1].load(Relaxed),
+        DW_VAC[2].load(Relaxed),
+        DW_VAC[3].load(Relaxed),
+    );
+    let mut vacfill = false;
+    if vac.2 != 0 {
+        if let Some(q) = DEFER.try_lock() {
+            let (boxes, n) = &*q;
+            vacfill = boxes[..*n]
+                .iter()
+                .any(|&b| b.2 != 0 && b.3 != 0 && boxes_overlap(b, vac));
+        }
+    }
+    let comppend = COMP_PENDING.load(core::sync::atomic::Ordering::Acquire);
+    let dragocc = DO_BOX[2].load(Relaxed) != 0;
+    let ring = crate::pal::release_edge_in_ring() > 0;
+    let pend = crate::pal::release_edge_pending() > 0;
+    let sprite = vac.2 != 0
+        && super::cursor::live_box_relaxed()
+            .map(|sb| boxes_overlap(sb, vac))
+            .unwrap_or(false);
+    let none = !(vacfill || comppend || dragocc || ring || pend || sprite);
+    serial_println!(
+        "[dropres] win={} t={}ms stale={}{}{}{}{}{}{}",
+        win,
+        DROPRES_MS,
+        if vacfill { "+vacfill" } else { "" },
+        if comppend { "+comppend" } else { "" },
+        if dragocc { "+dragocc" } else { "" },
+        if ring { "+ring" } else { "" },
+        if pend { "+pend" } else { "" },
+        if sprite { "+sprite-vac" } else { "" },
+        if none { "none" } else { "" }
+    );
+}
+
 // ---- WC-K3: the OCCLUDEE witness ---------------------------------------------------------------
 //
 // **The gap this closes, stated as the reason the bleed shipped.** `[drag] … flash_px=0 -> ONCE`
@@ -13041,6 +14546,31 @@ fn drag_note_move(
     DRAG_ERASE_PX.fetch_add(px, Relaxed);
     DRAG_BOX_PX.fetch_add(old.2 as u64 * old.3 as u64, Relaxed);
     DRAG_FLASH_PX.fetch_add(flash, Relaxed);
+    // DROPWAKE — this motion's erase slivers are the box the drop will be timed against. Clear the
+    // glass stamp FIRST (the previous motion's fill no longer answers for this one), then the union,
+    // then publish `DW_DMG_CYC` LAST so a reader that sees the stamp sees the box it covers.
+    #[cfg(target_arch = "x86_64")]
+    {
+        DW_GLASS_CYC.store(0, Relaxed);
+        DW_COMP_CYC.store(0, Relaxed);
+        let mut v = (usize::MAX, usize::MAX, 0usize, 0usize); // (x0, y0, x1, y1)
+        for &p in parts.iter() {
+            if p.2 == 0 || p.3 == 0 {
+                continue;
+            }
+            v.0 = v.0.min(p.0);
+            v.1 = v.1.min(p.1);
+            v.2 = v.2.max(p.0 + p.2);
+            v.3 = v.3.max(p.1 + p.3);
+        }
+        if v.2 > v.0 && v.3 > v.1 {
+            DW_VAC[0].store(v.0, Relaxed);
+            DW_VAC[1].store(v.1, Relaxed);
+            DW_VAC[2].store(v.2 - v.0, Relaxed);
+            DW_VAC[3].store(v.3 - v.1, Relaxed);
+            DW_DMG_CYC.store(crate::arch::now_cycles(), Relaxed);
+        }
+    }
 }
 
 /// DRAGFLICK — emit the finished drag's paint budget and clear the counters for the next gesture.
@@ -13353,6 +14883,14 @@ pub fn drag_begin(id: WinId, x: i32, y: i32) -> bool {
         DRAG_ERASE_PX.store(0, Ordering::Relaxed);
         DRAG_BOX_PX.store(0, Ordering::Relaxed);
         DRAG_FLASH_PX.store(0, Ordering::Relaxed);
+        // DROPWAKE — a superseding begin invalidates the previous drop's trace: whatever it was
+        // waiting for now belongs to a gesture that no longer describes the panel.
+        #[cfg(target_arch = "x86_64")]
+        {
+            DW_ARMED.store(WIN_NONE, Ordering::Relaxed);
+            DW_DMG_CYC.store(0, Ordering::Relaxed);
+            DW_VAC[2].store(0, Ordering::Relaxed);
+        }
     }
     DRAG_OWNER.store(owner, Ordering::Release);
     // Published LAST: `DRAG_WIN` is the flag every other entry point tests, so it must not become
@@ -13622,6 +15160,10 @@ pub fn drag_end() -> WinId {
         // DRAGFLICK — the gesture's paint budget, on its own line and on its own budget.
         #[cfg(feature = "witness")]
         drag_report(id, owner, "placed", n);
+        // DROPWAKE — start the drop clock, after the gesture report so the pair reads
+        // budget-then-drop in a capture.
+        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+        dropwake_arm(id);
     }
     id
 }
@@ -13646,6 +15188,10 @@ pub fn drag_cancel(why: &str) {
         // too. Emitted before the `[wm-act]` line so the pair reads cost-then-reason in a capture.
         #[cfg(feature = "witness")]
         drag_report(id, owner, why, n);
+        // DROPWAKE — a cancelled drop ghosts exactly like a placed one, and most of the bench's
+        // real releases end here, so the drop clock starts on this arm too.
+        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+        dropwake_arm(id);
         #[cfg(not(feature = "witness"))]
         let _ = n;
         wm_act(
@@ -13805,12 +15351,37 @@ const MENU_OCC_MAX: usize = 1;
 /// [`OCC_CLIP_MAX`]), never the panel.
 ///
 /// MENU-OCC — plus [`MENU_OCC_MAX`] transient slots for the modal surfaces that are not strip
-/// tenants (the SHARD dropdown). `erase_clip`'s worst case is still `MAX_WINDOWS + FURNITURE_MAX`
-/// (it does not carry the transient — the DESKTOP present subtracts the menu directly, see
-/// `Screen::present_background`), so the array keeps one box of headroom for it; `occ_clip`'s worst
-/// case grows by the menu to `MAX_WINDOWS - 1 + FURNITURE_MAX + MENU_OCC_MAX` and keeps its own one
-/// box of headroom too. Both terms are one below `OCC_MAX`.
+/// tenants (the SHARD dropdown). CRYSTAL-DISMISS (metal boot 8) — `erase_clip` now carries the
+/// transient too: the earlier claim that "the DESKTOP present subtracts the menu directly" named
+/// the wrong painter, because the deferred desktop FILL is neither the desktop present nor a
+/// window blit and was publishing `DESKTOP_BG` over the open dropdown (see the push in
+/// [`erase_clip`]). `erase_clip`'s worst case is therefore `MAX_WINDOWS + FURNITURE_MAX +
+/// MENU_OCC_MAX` — an EXACT fit for the array, with `push`'s bound check and the `dropped` report
+/// standing behind it; `occ_clip`'s worst case stays `MAX_WINDOWS - 1 + FURNITURE_MAX +
+/// MENU_OCC_MAX`, one below `OCC_MAX`.
+///
+/// ### MGL1 — the exact fit STAYS exact, and the report it rests on is no longer `witness`-gated
+///
+/// A review asked whether the spare box `erase_clip` used to carry should be restored, now that this
+/// caller sits flush against the array. It should NOT, and the reason is written two docstrings down
+/// in this same file: [`OCC_CLIP_MAX`]'s ⚠ paragraph convicts WCK5 for shipping a bound with "a whole
+/// box of slack", which "stopped guarding exactly when a SECOND strip made the guard relevant".
+/// Slack is not headroom, it is room to be wrong in quietly. The tightest true statement about the
+/// population is the RIGHT size for the array, and this is it.
+///
+/// What was actually wrong is that the run-time half of the guard was invisible where it counts.
+/// `FURNITURE_MAX` growing past the registry fails the BUILD, and `occ_clip`'s population is bound by
+/// [`OCC_CLIP_MAX`]'s assert — but [`MENU_OCC_MAX`] is a hand count of transient pushes with no
+/// registry to assert against, so a second transient beside `crystal::open_rect` would compile clean
+/// and drop a box on the glass. The `dropped` report is the only witness that direction has, and it
+/// was compiled out of the media builds. It is un-gated and latched at the report site now; see the
+/// MGL1 block in `drain_deferred`.
 const OCC_MAX: usize = MAX_WINDOWS + FURNITURE_MAX + MENU_OCC_MAX;
+
+/// MGL1 — has the `erase_clip` overflow been said? One line per boot, not one per drain; see the
+/// MGL1 block in `drain_deferred` for why the latch is load-bearing rather than tidy.
+static ERASE_CLIP_OVERFLOW_SAID: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// WCK5 × STRIPFACTOR — **[`occ_clip`]'s own population bound, now that it carries EVERY strip.**
 ///
@@ -14566,6 +16137,30 @@ fn erase_clip(pw: usize, ph: usize) -> (OccClip, usize) {
                 );
             }
             let _ = present;
+
+            // MENU-OCC / CRYSTAL-DISMISS (metal boot 8) — **the open SHARD dropdown, in the ERASE
+            // clip too.** `occ_clip` has carried it since MENU-OCC, but this clip did not, on the
+            // recorded premise that "the DESKTOP present subtracts the menu directly". That premise
+            // named the wrong painter: the deferred desktop FILL (`drain_deferred` -> `stage_fill`,
+            // the DESKTOP_BG stamp over a vacated window box) is neither the desktop present nor a
+            // window blit, and it was the ONE front-buffer painter left that could publish over an
+            // open dropdown. Under the 6-vug storm a queued erase box crossing the menu did exactly
+            // that: the dropdown's pixels went to desktop colour with NO dismiss recorded — and
+            // because `crystal::compose`'s damage signature (`SLOT`) still matched, every later pass
+            // SKIPPED the repaint as up-to-date. Boot 8's wire is the residue: `[crystal] …
+            // state=open opens=8 dismisses=7` over a visually closed menu, and the reopen press
+            // spent itself dismissing a dropdown that was not on the glass.
+            //
+            // Same accessor, same law as the strips: one relaxed load while closed, the rect while
+            // open. Capacity is exact rather than spare from here — every row plus both strips plus
+            // the menu is `MAX_WINDOWS + FURNITURE_MAX + MENU_OCC_MAX == OCC_MAX` — so a dropped
+            // box still reports through `dropped`, and the OCC_MAX ledger records the new worst
+            // case.
+            if let Some(b) = super::crystal::open_rect(pw, ph) {
+                if !c.push(b) {
+                    dropped += 1;
+                }
+            }
         }
         // REVIEW (D1) — and how many boxes the clip ended up with, so an EMPTY clip cannot pass for a
         // clean gesture. Stored last, after every `push`, and after the dock arm so the count
@@ -14955,18 +16550,43 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
     // before returning, which is the same acquisition `damage_intersecting` makes below, in the same
     // function, on every box it publishes.
     let (clip, clip_dropped) = erase_clip(info.width, info.height);
-    // Loud, once, if a future furniture layer ever overflows the clip: a box that did not fit is a
-    // region the erase will publish over, which is the whole defect this arc closes. Not reachable on
-    // any panel this kernel drives — `MAX_WINDOWS` rows plus one dock strip is exactly `OCC_MAX`.
-    #[cfg(feature = "witness")]
-    if clip_dropped > 0 {
+    // Loud, once, if a furniture or transient layer ever overflows the clip: a box that did not fit
+    // is a region the erase will publish over, which is the whole defect the CRYSTAL-DISMISS arc
+    // closes.
+    //
+    // MGL1 — **UN-GATED FROM `witness`, and that is the point of the line.** `erase_clip`'s worst
+    // case stopped being `MAX_WINDOWS` rows plus one dock strip a long time before this comment
+    // stopped saying so: it is `MAX_WINDOWS + FURNITURE_MAX + MENU_OCC_MAX`, which is `OCC_MAX`
+    // EXACTLY, with no spare box left in the array. Two of those three terms fail the BUILD if they
+    // grow without the array (`FURNITURE_MAX` is `const`-asserted equal to `strip::STRIP_MAX`, and
+    // [`OCC_CLIP_MAX`] binds the other caller) — but the third does NOT and structurally cannot:
+    // `MENU_OCC_MAX` is a HAND COUNT of the transient surfaces `erase_clip` pushes, with no registry
+    // behind it to assert against. A second transient added beside `crystal::open_rect` therefore
+    // compiles clean and starts dropping a box at run time, and a dropped occluder is precisely the
+    // MENU-GHOST failure re-entering by a new route.
+    //
+    // This report is the ONLY backstop that direction has, so gating it on `witness` put it on every
+    // artifact EXCEPT the one that ships: the boot/media builds (`x86`/`esp-*`) leave `witness` off,
+    // so on the metal image the box was dropped with nothing said — the exact silence the
+    // `FURNITURE_MAX` ledger already convicts one screen up. Un-gated it costs one `usize` compare
+    // per drain against a value that is zero on every panel this kernel drives.
+    //
+    // LATCHED, on `strip::paint`'s `not-word4` precedent: a clip that overflows once overflows every
+    // pass, and an unlatched line would flood a 115200-baud wire from the compositor's own drain —
+    // turning a witness into a second defect. Said once; the condition is a property of the BUILD,
+    // not of the pass that happened to notice it.
+    if clip_dropped > 0
+        && !ERASE_CLIP_OVERFLOW_SAID.swap(true, core::sync::atomic::Ordering::Relaxed)
+    {
         serial_println!(
-            "[wck4] erase clip OVERFLOW dropped={} cap={} — the erase may publish over live pixels",
+            "[wck4] erase clip OVERFLOW dropped={} cap={} worst={}+{}+{} — the erase may publish over live pixels",
             clip_dropped,
-            OCC_MAX
+            OCC_MAX,
+            MAX_WINDOWS,
+            FURNITURE_MAX,
+            MENU_OCC_MAX
         );
     }
-    let _ = clip_dropped;
     let mut painted = false;
     for &(x, y, w, h) in boxes[..n].iter() {
         // Re-clip: a coalesced union is a synthesised box, and the panel geometry it was clipped
@@ -14984,6 +16604,11 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
         if y1 > y0 {
             // COMPOSITE-2 — the fill's own columns, not full-width scanlines (see `draw_window`).
             fb.flush_rect(x, y0, w, y1 - y0);
+            // DROPWAKE — the glass stamp: this flush is the moment a drained fill becomes panel
+            // pixels, so if it covers the drop's vacated slivers the drop is resolved here.
+            // `drain_deferred` is arch-neutral, so the hook carries the full witness+x86 gate.
+            #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+            dropwake_glass_note(x, y0, w, y1 - y0);
         }
         damage_intersecting(x, y, w, h);
         // WC-K2r REVIEW CONDITION 6 — THE SPRITE'S NET, restored where it can be exact.
@@ -15102,6 +16727,240 @@ const STAGE_CPUS: usize = crate::ui_status::PSTRIP_MAX_CPUS;
 const _: () = assert!(STAGE_CPUS == 8, "wcpar_emit prints c0..c7; widen it if STAGE_CPUS changes");
 static STAGE: [Mutex<alloc::vec::Vec<u8>>; STAGE_CPUS] =
     [const { Mutex::new(alloc::vec::Vec::new()) }; STAGE_CPUS];
+
+// ---------------------------------------------------------------------------------------------
+// STAGE-PHYS — the one-shot physical-contiguity witness over the compositor's blit SOURCES.
+// ---------------------------------------------------------------------------------------------
+//
+// THE QUESTION, and why it is worth a boot's worth of page walks. Every GPU-offload sketch for this
+// compositor (gen7 blitter, Kepler copy engine) reads its source from RAM by PHYSICAL address, and
+// the shape of that read is decided by one number nobody has printed: are the blit sources — the
+// per-core [`STAGE`] scratch and the desktop's `Screen::back_store` — physically contiguous, and if
+// not, what is the run-length distribution? A single 28 MiB contiguous back store is ONE descriptor.
+// A thousand scattered 4 KiB runs is a scatter list (or a bounce buffer, and a second full copy of
+// every frame). Both ladder drafts carry this as an UNKNOWN; this witness closes it with a
+// measurement instead of an assumption.
+//
+// WHAT IT COSTS. At most `MAX_STAGE_BYTES * STAGE_CPUS + back_store` bytes' worth of 4 KiB pages —
+// (4 MiB x 8 + ~28 MiB) / 4 KiB is about 15 k `translate` calls — ONCE per boot, and in practice far
+// fewer because a `STAGE` entry only carries the largest box ITS core actually staged. Each call is
+// a read-only 4-level walk of the live CR3 tables (~4 dependent loads). The measured cost is printed
+// as `cost_cyc=` on every line, so the reading is never a claim about its own price.
+//
+// WHAT IT IS NOT. It writes nothing, maps nothing, and takes no lock the compositor could wait on:
+// spans are captured under `try_lock` and the walk runs after the guard drops. It is
+// `witness`-gated and x86-only (`arch::memory::translate` is the x86 walker gen7 R4 already relies
+// on), so a default build has neither the code nor a single load of its state.
+
+/// STAGE-PHYS — spent once the witness has printed. One-shot for the life of the boot.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static PHYSWIT_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// STAGE-PHYS — composite passes seen since boot, used only to bound the wait for an armed
+/// [`STAGE`]. See [`physwit_once`] for why the witness does not simply fire on pass one.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static PHYSWIT_PASSES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// STAGE-PHYS — how many composite passes the witness will wait for a `STAGE` allocation before it
+/// prints anyway. A boot whose compositor never stages (every present took the direct path) is a
+/// real, reportable state: the witness says `pages=0` for those entries rather than staying silent
+/// and leaving the gate unable to tell "no staging" from "witness never ran".
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+const PHYSWIT_DEADLINE_PASSES: u32 = 32;
+
+/// STAGE-PHYS — one buffer's contiguity reading.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+struct PhysRuns {
+    /// 4 KiB pages the span touches (from the page holding its first byte through the page holding
+    /// its last), so a span that straddles a page boundary is counted honestly.
+    pages: usize,
+    /// Maximal physically-contiguous runs. `runs == 1` is the single-descriptor case.
+    runs: usize,
+    /// Pages with no live translation. Expected 0 for a kernel-heap `Vec`; a nonzero value would
+    /// mean the span is not what this witness assumes and the rest of the line is not to be trusted.
+    unmapped: usize,
+    min: usize,
+    med: usize,
+    max: usize,
+    /// Page index, from the start of the span, at which the LONGEST run begins — the offset a
+    /// single-descriptor DMA would have to start from to cover `max` pages in one go.
+    largest_off: usize,
+}
+
+/// STAGE-PHYS — walk `[base, base + len)` page by page through the live page tables and reduce it to
+/// a run-length reading.
+///
+/// Contiguity is decided the only way a DMA engine would decide it: page *i*'s physical frame must be
+/// exactly one page above page *i-1*'s. An unmapped page breaks the run and is counted; it never
+/// joins one.
+///
+/// The run lengths are collected so a MEDIAN can be reported — a mean would hide the shape this
+/// measurement exists to expose (one 6000-page run plus a tail of singletons has a flattering mean
+/// and a damning median). The vector is bounded by `pages` (about 7 k entries for a 28 MiB store, so
+/// ~28 KiB) and is taken with `try_reserve`: an allocation failure returns `None` and the caller
+/// prints an honest refusal rather than panicking from composite context.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn physwit_walk(base: usize, len: usize) -> Option<PhysRuns> {
+    const PAGE: usize = 4096;
+    if len == 0 {
+        return None;
+    }
+    let first = base & !(PAGE - 1);
+    let last = base.checked_add(len - 1)? & !(PAGE - 1);
+    let pages = (last - first) / PAGE + 1;
+    let mut lens: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    if lens.try_reserve(pages).is_err() {
+        return None;
+    }
+    let mut prev: Option<u64> = None;
+    let mut run = 0usize;
+    let mut run_start = 0usize;
+    let mut best = 0usize;
+    let mut best_off = 0usize;
+    let mut unmapped = 0usize;
+    for i in 0..pages {
+        let va = (first + i * PAGE) as u64;
+        let pa = crate::arch::memory::translate(va);
+        let cont = match (pa, prev) {
+            (Some(p), Some(q)) => p == q + PAGE as u64,
+            _ => false,
+        };
+        if cont {
+            run += 1;
+        } else {
+            if run > 0 {
+                lens.push(run as u32);
+                if run > best {
+                    best = run;
+                    best_off = run_start;
+                }
+            }
+            if pa.is_some() {
+                run = 1;
+                run_start = i;
+            } else {
+                run = 0;
+                unmapped += 1;
+            }
+        }
+        prev = pa;
+    }
+    if run > 0 {
+        lens.push(run as u32);
+        if run > best {
+            best = run;
+            best_off = run_start;
+        }
+    }
+    if lens.is_empty() {
+        return Some(PhysRuns {
+            pages,
+            runs: 0,
+            unmapped,
+            min: 0,
+            med: 0,
+            max: 0,
+            largest_off: 0,
+        });
+    }
+    lens.sort_unstable();
+    let n = lens.len();
+    Some(PhysRuns {
+        pages,
+        runs: n,
+        unmapped,
+        min: lens[0] as usize,
+        med: lens[n / 2] as usize,
+        // `best` and `lens[n - 1]` are the same number by construction — reported from the tracked
+        // maximum so that `run_max` and `largest_off` can never disagree about WHICH run they name.
+        max: best,
+        largest_off: best_off,
+    })
+}
+
+/// STAGE-PHYS — print one buffer's line, or the honest refusal when the span is empty or the run
+/// vector could not be allocated.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn physwit_emit(tag: &str, cpu: i32, base: usize, len: usize) {
+    let t0 = crate::arch::now_cycles();
+    let r = physwit_walk(base, len);
+    let cost = crate::arch::now_cycles().saturating_sub(t0);
+    match r {
+        Some(r) => serial_println!(
+            ":: STAGE-PHYS: buf={} cpu={} bytes={} pages={} runs={} unmapped={} run_min={} \
+             run_med={} run_max={} largest_off={} cost_cyc={} ::",
+            tag,
+            cpu,
+            len,
+            r.pages,
+            r.runs,
+            r.unmapped,
+            r.min,
+            r.med,
+            r.max,
+            r.largest_off,
+            cost
+        ),
+        None => serial_println!(
+            ":: STAGE-PHYS: buf={} cpu={} bytes={} pages=0 runs=0 unmapped=0 run_min=0 run_med=0 \
+             run_max=0 largest_off=0 cost_cyc={} ::",
+            tag,
+            cpu,
+            len,
+            cost
+        ),
+    }
+}
+
+/// STAGE-PHYS — the one-shot itself. Called at the very end of [`composite_once`], after the pass's
+/// ledger and after every guard the pass took has dropped, which is the same placement `CTRLWIT`
+/// uses and for the same reason: a polled-UART line inside the clock would charge the pass for the
+/// instrument's own transmit time.
+///
+/// ARMING. Firing on pass one would measure nothing — a `STAGE` entry is grown LAZILY by
+/// `stage_window`, so on the first composite every entry is still a zero-capacity `Vec`. The witness
+/// therefore waits for the first pass at which some entry carries an allocation, and gives up
+/// waiting after [`PHYSWIT_DEADLINE_PASSES`] so a never-staging boot still produces a line.
+///
+/// Steady state after it has spent itself is ONE relaxed load.
+///
+/// SPANS, NOT GUARDS. Each entry's `(ptr, capacity)` is captured under `try_lock` and the guard is
+/// dropped before any walking, so the witness never holds a `STAGE` entry across ~1 k page walks
+/// where a compositing core would meet it. `capacity`, not `len`, because the allocation is what a
+/// DMA source descriptor would have to cover. An entry another core holds right now is reported as
+/// `pages=0` rather than waited for — declining is the same answer the compositor's own `try_lock`
+/// gives, and this is a diagnostic, not a barrier.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn physwit_once() {
+    use core::sync::atomic::Ordering::Relaxed;
+    if PHYSWIT_DONE.load(Relaxed) {
+        return;
+    }
+    let passes = PHYSWIT_PASSES.fetch_add(1, Relaxed).saturating_add(1);
+    let mut spans = [(0usize, 0usize); STAGE_CPUS];
+    let mut armed = passes >= PHYSWIT_DEADLINE_PASSES;
+    for (i, e) in STAGE.iter().enumerate() {
+        if let Some(g) = e.try_lock() {
+            spans[i] = (g.as_ptr() as usize, g.capacity());
+        }
+    }
+    if !armed && spans.iter().any(|&(_, c)| c > 0) {
+        armed = true;
+    }
+    if !armed {
+        return;
+    }
+    // Exactly one core prints, even if two reach the arming condition on the same pass.
+    if PHYSWIT_DONE.swap(true, Relaxed) {
+        return;
+    }
+    for (i, &(p, c)) in spans.iter().enumerate() {
+        physwit_emit("stage", i as i32, p, c);
+    }
+    let bp = super::screen::BACK_STORE_PTR.load(Relaxed);
+    let bl = super::screen::BACK_STORE_LEN.load(Relaxed);
+    physwit_emit("back", -1, bp, bl);
+}
 
 /// WCPAR — the calling core's entry in the [`STAGE`] pool. `meter_current_cpu()` is the same reading
 /// the pstrip and `[wcn]`'s census already use; a core index at or beyond the pool (more physical cores
@@ -15468,6 +17327,11 @@ fn draw_window(
             (y0, y1)
         }
     };
+    // WCSER-H — sub-phase 30: entering the staged path. Boot 8's wedge read phase=3 (inside
+    // draw_window, window 7) and no finer; these stamps split phase 3 so the next tripwire
+    // line names the loop: 30 stage entry, 31 band compose, 32 sprite offer, 33 span flush
+    // (row= carries the panel row), 34 direct fallback, 35 cursor uncover tail.
+    comp_mark(r.id, 30);
     let staged = stage_window(
         fb,
         r,
@@ -15495,6 +17359,7 @@ fn draw_window(
         if dragocc_target(r).is_some() {
             DO_DIRECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
+        comp_mark(r.id, 34);
         paint_window(fb, r, 0, 0, bx, by, bw, bh, pw, ph, focused, false);
     }
     // CURSOR-4 — this window has just painted its clipped outer box. If it did NOT compose the
@@ -15503,6 +17368,7 @@ fn draw_window(
     // LOWER window may have claimed for those pixels is stale — its layer save describes content
     // these pixels no longer hold. Clearing here, in back-to-front draw order, makes the topmost
     // painter of each pixel the one whose verdict the tail acts on.
+    comp_mark(r.id, 35);
     if let (Some(p), false) = (cur, overlaid) {
         // CURSOR-6 — a clear that could not be applied is not a shrug. `overlay_uncover` now reports
         // it, and the session is marked untrustworthy so the tail takes the whole-sprite refresh
@@ -15621,6 +17487,11 @@ fn draw_window(
         C2_BYTES.fetch_add((wrote * info.bytes_per_pixel) as u64, Relaxed);
         C2_DMG_PX.fetch_add(wrote as u64, Relaxed);
         C2_BOX_PX.fetch_add((bw * bh) as u64, Relaxed);
+        // DMGOVLP — the cumulative shadows, charged from the SAME two expressions so the fixture's
+        // deltas and `[comp2]`'s spans can never disagree about what a call painted. See the
+        // statics for why the fixture cannot read the swap-drained pair above.
+        C2_DMG_PX_TOT.fetch_add(wrote as u64, Relaxed);
+        C2_BOX_PX_TOT.fetch_add((bw * bh) as u64, Relaxed);
         crate::arch::now_cycles()
     };
     if y1 > y0 {
@@ -16111,6 +17982,11 @@ fn paint_window(
     let swap = matches!(dinfo.pixel_format, unaos_boot_info::PixelFormat::Rgb);
     let surf = r.surf as *const u8;
     for row in 0..rows {
+        // WCSER-H — row gauge on the DIRECT path only (`!dup` = painting the panel, not a RAM
+        // layer): a phase=34 wedge otherwise leaves `row=` stale from the last staged window.
+        if !dup {
+            comp_mark_row(row);
+        }
         // WC-M — where this source row's `scale` destination lines start, in the DESTINATION's own
         // coordinates. Negative means the row begins above `dst`'s row 0, which only a chunked
         // stage's second-or-later band can produce.
@@ -16489,6 +18365,8 @@ fn stage_window(
         // with no panel margin — which is what makes each row a single contiguous run. WC-M: its
         // HEIGHT is the band's, and its length the band's bytes, so every clip `put_pixel` and `blit`
         // already performed now also fences the compose to the rows this buffer holds.
+        comp_mark(r.id, 31);
+        comp_mark_row(band);
         let mut layer = super::FrameBuffer::new();
         layer.init(
             stage.as_mut_ptr() as usize,
@@ -16530,6 +18408,7 @@ fn stage_window(
             let whole = chunk_rows >= span
                 || (plan.by >= by + band && plan.by + plan.bh <= by + band + rows);
             if whole {
+                comp_mark(r.id, 32);
                 let c = super::cursor::compose_into(&layer, bx, by + band, plan);
                 *overlaid |= c.taken > 0;
                 #[cfg(feature = "witness")]
@@ -16551,9 +18430,11 @@ fn stage_window(
         // tear-free contract is unchanged — a span is as atomic as a row was. What changes is only
         // which bytes are published, and the bytes withheld are bytes the pass is about to overwrite
         // from the window that owns them.
+        comp_mark(r.id, 33);
         for y in 0..rows {
             let src = y * row_bytes;
             let py = by + band + y;
+            comp_mark_row(py);
             if clip.n == 0 {
                 fb.blit(py * fb_row + bx * bpp, &stage[src..src + row_bytes]);
                 #[cfg(all(feature = "witness", target_arch = "x86_64"))]
@@ -19037,11 +20918,33 @@ fn work_h(pw: usize, ph: usize) -> usize {
 /// midden's 24x16 readout goes 4x -> 7x (`ceil(148/24)`, box 168 px). Everything already wide enough
 /// is untouched — the 64x64 window stays 3x on the gate panel and 4x on the bench.
 fn place_scale(pw: usize, ph: usize, w: usize, h: usize) -> usize {
-    let usable_h = work_h(pw, ph);
+    scale_in(pw, ph, work_h(pw, ph), w, h, usize::MAX)
+}
+
+/// TILEFIT — [`place_scale`]'s body, with the work-area height HOISTED and a scale CAP threaded
+/// through. Two callers, two reasons, and neither of them changes the rule:
+///
+///  * [`place`] derives `usable_h` once per pass and then asks this question once per row. Before
+///    this split every one of those questions re-entered [`work_h`], and therefore
+///    `ui_status::top_chrome_h`, which on x86-with-`wc` reads `menubar::strip_rect`. The capacity
+///    search below asks the question up to `natural` times MORE often, so the hoist is what keeps
+///    that search free rather than merely cheap.
+///  * `cap` is the capacity search's one lever. It is applied AFTER the legibility cap and BEFORE
+///    the [`min_width_scale`] floor — the same order the three existing terms already stand in:
+///    *fit, cap, THEN floor*. The floor stays the only term that may RAISE the answer, so a
+///    capacity search can never shrink a window out of its own control cluster. It simply stops
+///    being able to help once every row has bottomed out on its floor, which is exactly the residue
+///    the cascade in [`place`] exists to catch.
+///
+/// At `cap == usize::MAX` the `.min(cap.max(1))` is the identity and this function IS the old
+/// `place_scale` body, term for term — which is what makes every panel and window count that fits
+/// today byte-identical after this arc.
+fn scale_in(pw: usize, ph: usize, usable_h: usize, w: usize, h: usize, cap: usize) -> usize {
     (pw / 2 / w.max(1))
         .min(usable_h / 2 / h.max(1))
         .min(legibility_cap(ph))
         .max(1)
+        .min(cap.max(1))
         // WMMINW — the minimum-width floor, applied LAST so it wins over both the fit rule and the
         // legibility cap. `w.max(1)` for the same reason every other term here carries it: a zero
         // width reaches this function through `spawn_geometry`, and `ceil(148/0)` would otherwise
@@ -19114,6 +21017,88 @@ fn min_width_scale(pw: usize, usable_h: usize, w: usize, h: usize) -> usize {
     if c <= fit_scale(pw, usable_h, w, h) { c } else { 1 }
 }
 
+/// TILEFIT — **does the greedy flow fit inside the work area at this scale cap?**
+///
+/// The predicate is written in the SAME terms as [`place`]'s last-resort clamp — `cy` against
+/// `wtop + (usable_h - bh)` — rather than as a second derivation of "the bottom of the last row",
+/// so the search below cannot disagree with the clamp it exists to keep quiet. A `false` here is
+/// exactly "the clamp will bite at least once", and the clamp biting is the whole defect.
+///
+/// Costs one pass over the table (`MAX_WINDOWS` rows of integer arithmetic) and takes no locks: the
+/// caller already holds the table.
+fn flow_fits(t: &Table, pw: usize, ph: usize, wtop: usize, usable_h: usize, cap: usize) -> bool {
+    let mut cx = GAP;
+    let mut cy = wtop + GAP + TITLE_H + BORDER;
+    let mut row_h = 0usize;
+    for i in 0..MAX_WINDOWS {
+        let r = &t.rows[i];
+        if !r.used || r.compat || r.pinned {
+            continue;
+        }
+        let (w, h) = (r.w.max(1), r.h.max(1));
+        let scale = scale_in(pw, ph, usable_h, w, h, cap);
+        let bw = w.saturating_mul(scale).saturating_add(2 * BORDER);
+        let bh = h
+            .saturating_mul(scale)
+            .saturating_add(TITLE_H + 2 * BORDER);
+        if cx.saturating_add(bw) > pw && cx > GAP {
+            cx = GAP;
+            cy = cy.saturating_add(row_h).saturating_add(GAP);
+            row_h = 0;
+        }
+        if cy > wtop.saturating_add(usable_h.saturating_sub(bh)) {
+            return false;
+        }
+        cx = cx.saturating_add(bw).saturating_add(GAP);
+        row_h = row_h.max(bh);
+    }
+    true
+}
+
+/// TILEFIT — **the largest scale cap whose layout fits the work area**, or [`usize::MAX`] when the
+/// natural layout already fits.
+///
+/// ### Why the tiler needs a capacity question at all
+/// [`place_scale`] is a function of ONE window and the panel: *"how big may a window of this surface
+/// get?"*. The flow that consumes it is a function of the whole LIVE SET. Nothing asked the second
+/// question, so the layout could want more rows than the work area has — and the clamp's answer to
+/// that was to pin every overflow row to the same `y` (see [`place`]). The fix is to ask the
+/// question the flow actually needs answered, and the only lever that changes the answer is scale.
+///
+/// ### It returns [`usize::MAX`], not `natural`, for the common case
+/// `usize::MAX` is `scale_in`'s identity cap, so an already-fitting layout takes the exact code path
+/// and the exact arithmetic it took before this arc — no re-derivation, nothing to drift. The search
+/// only runs on a boot that was ALREADY going to alias two windows onto one box.
+///
+/// ### The search is linear and bounded
+/// From `natural - 1` down to 1, at most `legibility_cap(ph)` steps (8 on an 1800p-class panel, 4
+/// below), each one table pass. It runs only from a create or a close, never from a present or a
+/// composite, so it is nowhere near a hot path. `1` is returned when nothing fits: the floor has won
+/// on every row, no cap can help, and [`place`]'s cascade takes it from there.
+fn fit_cap(t: &Table, pw: usize, ph: usize, wtop: usize, usable_h: usize) -> usize {
+    if flow_fits(t, pw, ph, wtop, usable_h, usize::MAX) {
+        return usize::MAX;
+    }
+    // The largest scale any live row would take unbounded — the first cap worth trying is one below
+    // it, because `usize::MAX` has just been refused.
+    let mut natural = 1usize;
+    for i in 0..MAX_WINDOWS {
+        let r = &t.rows[i];
+        if !r.used || r.compat || r.pinned {
+            continue;
+        }
+        natural = natural.max(scale_in(pw, ph, usable_h, r.w.max(1), r.h.max(1), usize::MAX));
+    }
+    let mut cap = natural;
+    while cap > 1 {
+        cap -= 1;
+        if flow_fits(t, pw, ph, wtop, usable_h, cap) {
+            return cap;
+        }
+    }
+    1
+}
+
 fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]) {
     let mut vacated = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
     let mut nv = 0usize;
@@ -19169,6 +21154,22 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
     }
 
     let mut t = table();
+    // TILEFIT — the capacity question, asked ONCE per pass, before a single row is moved. Returns
+    // `usize::MAX` (the identity cap) whenever the natural layout already fits, which is every panel
+    // and window count that worked before this arc.
+    let cap = fit_cap(&t, pw, ph, wtop, usable_h);
+    // TILEFIT — the outer boxes this pass has already handed out, so the cascade below can refuse to
+    // hand out the same one twice. Bounded by the table it mirrors; `np` is its live length.
+    let mut placed = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
+    // TILEFIT — who each of those boxes belongs to, so the witness can NAME an aliased pair instead
+    // of merely counting one. Same index space as `placed`.
+    let mut pids = [(0u32, 0u64); MAX_WINDOWS];
+    let mut np = 0usize;
+    // TILEFIT — the three facts the witness reports about this layout: how many flow rows it took,
+    // the largest scale it actually handed out, and how many rows the clamp had to pull back up.
+    let mut flow_rows = 1usize;
+    let mut smax = 0usize;
+    let mut clamped = 0usize;
     let mut cx = GAP;
     // MENUFIT — the first row's CONTENT origin starts one full chrome below the work area's top, so
     // its OUTER box begins at `wtop + GAP`: a whole title bar, discs included, below the strip.
@@ -19180,7 +21181,7 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
             continue;
         }
         let (w, h) = (r.w.max(1), r.h.max(1));
-        let scale = place_scale(pw, ph, w, h);
+        let scale = scale_in(pw, ph, usable_h, w, h, cap);
         // F5 — saturating throughout; `w`/`h` come from the caller via `create`.
         let bw = w.saturating_mul(scale).saturating_add(2 * BORDER);
         let bh = h
@@ -19190,6 +21191,49 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
             cx = GAP;
             cy = cy.saturating_add(row_h).saturating_add(GAP);
             row_h = 0;
+            flow_rows += 1;
+        }
+        smax = smax.max(scale);
+        // PULSE-2 — the last-resort clamp's bound: the lowest CONTENT origin whose outer box still
+        // ends above the instrument reservation.
+        let ceiling = wtop.saturating_add(usable_h.saturating_sub(bh));
+        let mut ry = cy.min(ceiling);
+        // TILEFIT — **the clamp bit, so this row did not fit where the flow put it.**
+        //
+        // The clamp on its own is IDEMPOTENT, and that is the defect this arm closes. Every row past
+        // the work area's bottom is pinned to `ceiling`, and a new row restarts `cx` at `GAP`, so the
+        // first box of each overflow row comes out byte-identical to the first box of the last row
+        // that fit — same x, same y, same w, same h. Two windows, one box. The lower one is not
+        // merely occluded: `wc_click_route_at` answers with the top row, so it cannot be focused,
+        // dragged or closed, and the operator has no affordance to discover that it is there at all.
+        // The clamp's own note argues that overlap is "a legibility problem the operator can fix by
+        // closing one" — true of PARTIAL overlap, false of an exact alias, which is what it produced.
+        //
+        // Proven on metal, boot 11 (2880x1800, `wtop=34`, `usable_h=1604`, six 128x128 vugs launched
+        // over one already-open window): scale 6 gives `bw=778`/`bh=812` and three columns, so row 2
+        // clamped to `y=826` and row 3 clamped to `y=826` as well with `cx` back at `GAP` — window 9
+        // (asid 0x7) landed on window 6 (asid 0x4) to the pixel, and the operator counted five vugs
+        // out of six.
+        //
+        // The fix walks UP into the work area, never down, so PULSE-2's reservation is untouched:
+        // a window over the instrument panel stays impossible. `step` divides the whole available
+        // span by `MAX_WINDOWS`, so `MAX_WINDOWS` distinct candidates exist whenever the span is at
+        // least that many rows — i.e. on every real panel — and there are at most `MAX_WINDOWS - 1`
+        // boxes to avoid. Failing that (a degenerate span), the last candidate stands and the
+        // `alias=` field of the witness below says so rather than the operator finding out.
+        if ry < cy {
+            clamped += 1;
+            let step = (ceiling.saturating_sub(wtop) / MAX_WINDOWS).max(1);
+            for k in 0..MAX_WINDOWS {
+                let cand = ceiling
+                    .saturating_sub(k.saturating_mul(step))
+                    .max(wtop);
+                let by = cand.saturating_sub(TITLE_H + BORDER);
+                if !placed[..np].contains(&(cx, by, bw, bh)) {
+                    ry = cand;
+                    break;
+                }
+            }
         }
         let r = &mut t.rows[i];
         // WC-J — the box this row occupied BEFORE the tiler moved it. A tiled window's position is a
@@ -19202,24 +21246,102 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
         r.x = cx + BORDER;
         // PULSE-2 — the last-resort clamp. The scale rule already keeps a single row inside
         // `usable_h`, but rows STACK: enough windows and `cy` walks off the bottom. When that happens
-        // the window is pulled back up so its box ends at the reservation. Two windows overlapping
-        // each other is a legibility problem the operator can fix by closing one; a window over the
+        // the window is pulled back up so its box ends at the reservation; a window over the
         // instrument panel silently breaks the one surface that is supposed to be always readable.
         //
         // MENUFIT — the bound is the same bound, translated into the work area: `usable_h` is now the
         // work area's HEIGHT rather than its bottom coordinate, so the bottom coordinate is
         // `wtop + usable_h` and the clamp is written as `wtop + (usable_h - bh)`. At `wtop == 0` that
         // reduces to the pre-MENUFIT expression character for character, degenerate case included.
-        r.y = cy.min(wtop.saturating_add(usable_h.saturating_sub(bh)));
+        //
+        // TILEFIT — `ry` IS that clamp (`cy.min(ceiling)`), plus the cascade that keeps two clamped
+        // rows off one another's box. When the clamp does not bite, `ry == cy` and this assignment is
+        // the pre-TILEFIT assignment unchanged.
+        r.y = ry;
         r.damage_all();
-        if outer_box(r) != before && before.2 != 0 && before.3 != 0 {
+        let now = outer_box(r);
+        if now != before && before.2 != 0 && before.3 != 0 {
             vacated[nv] = before;
             nv += 1;
         }
+        // TILEFIT — record what this row was actually given, so the next clamped row can avoid it.
+        placed[np] = now;
+        pids[np] = (r.id, r.owner_asid);
+        np += 1;
         cx = cx.saturating_add(bw).saturating_add(GAP);
         row_h = row_h.max(bh);
     }
+
     drop(t);
+
+    // TILEFIT — **THE LAYOUT VERDICT: the line boot 11 did not have.**
+    //
+    // Boot 11 printed a `[wc-a] create` for all six vugs, a `[wc-fv] focus raise` for all six, a
+    // `[wc-d] verify … -> PASS` for all six and a `[wcn] … live=yes` for all six — and the operator
+    // still counted five windows. Nothing on the wire said the two boxes were the SAME box; the fact
+    // was recoverable only by reading six `at (x,y)` fields out of scattered lines and noticing that
+    // two of them matched. This line asks that question directly, at the one place that can see the
+    // whole layout at once, and answers it with the pair's ids and asids.
+    //
+    // Change-triggered, on `[wm] tile-top`'s pattern: a boot that opens and closes windows all day
+    // prints one line per DISTINCT layout, not one per lifecycle event. The signature is forced odd
+    // so the `0` initialiser can never be mistaken for a real layout and swallow the first line.
+    //
+    // `alias=` is the only field that can go bad, and it is a `->` verdict for exactly that reason.
+    //
+    // Emitted with the table RELEASED (`drop(t)` immediately above), on `[wm] tile-top`'s discipline
+    // — it prints before taking the table for the same reason. `placed`/`pids` are this frame's own
+    // copies, so the verdict describes the layout this pass just published without holding anything
+    // across a serial write.
+    #[cfg(feature = "witness")]
+    {
+        use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        let mut alias: Option<(usize, usize)> = None;
+        'scan: for a in 0..np {
+            for b in (a + 1)..np {
+                if placed[a] == placed[b] {
+                    alias = Some((a, b));
+                    break 'scan;
+                }
+            }
+        }
+        let sig = (np
+            .wrapping_mul(0x9E37)
+            ^ smax.wrapping_mul(0x85EB)
+            ^ flow_rows.wrapping_mul(0xC2B2)
+            ^ clamped.wrapping_mul(0x27D4)
+            ^ pw.wrapping_mul(31)
+            ^ ph
+            ^ (alias.is_some() as usize).wrapping_mul(0x165667B1))
+            | 1;
+        static LAST_SIG: AtomicUsize = AtomicUsize::new(0);
+        if np > 0 && LAST_SIG.swap(sig, Relaxed) != sig {
+            match alias {
+                None => serial_println!(
+                    "[wm] tile-fit n={} panel={}x{} work={}+{} scale={} rows={} shrunk={} clamped={} alias=none -> DISTINCT",
+                    np, pw, ph, wtop, usable_h, smax, flow_rows,
+                    if cap == usize::MAX { "no" } else { "yes" },
+                    clamped
+                ),
+                Some((a, b)) => serial_println!(
+                    "[wm] tile-fit n={} panel={}x{} work={}+{} scale={} rows={} shrunk={} clamped={} alias=win={}(asid={:#x})/win={}(asid={:#x}) at ({},{}) {}x{} -> ALIASED",
+                    np, pw, ph, wtop, usable_h, smax, flow_rows,
+                    if cap == usize::MAX { "no" } else { "yes" },
+                    clamped,
+                    pids[a].0, pids[a].1, pids[b].0, pids[b].1,
+                    placed[a].0, placed[a].1, placed[a].2, placed[a].3
+                ),
+            }
+        }
+    }
+
+    // TILEFIT — the verdict's four bookkeeping terms are witness-only reads. The cascade's `placed`
+    // is NOT among them: it is load-bearing on every build.
+    #[cfg(not(feature = "witness"))]
+    {
+        let _ = (&pids, smax, flow_rows, clamped);
+    }
+
     (nv, vacated)
 }
 
@@ -20649,4 +22771,535 @@ pub fn ctrldecline_selftest() {
         );
     }
     repaint();
+}
+
+// =============================================================================================
+// DMGOVLP — the overlap-forcing QEMU leg, with the pointer ON the stack.
+//
+// DMG-DISJOINT landed a banded damage closure, was reverted after boot 7's composite storm, and
+// re-landed with the CURSTICK widening. Boot 8 (metal) then wedged inside `draw_window` under six
+// OVERLAPPING windows with the sprite parked on the stack — and the QEMU gate had no leg that
+// could see either failure class, because no fixture ever drives banded presents through
+// overlapping rows, let alone under a live cursor plan. This fixture is that leg. Two claims:
+//
+//  * **The closure narrows.** A banded seed under an overlapping neighbour drags a SLIVER, not a
+//    whole box: cumulatively, painted pixels stay strictly under whole-box pixels on a banded
+//    pass. Regressing to whole-box promotion (the fat leg) flips `narrow=` low.
+//  * **The damage set DRAINS.** After a present (and its composite), one extra `composite()` adds
+//    ZERO painted pixels within K=3 tries. The boot-7/boot-8 storm class — a cursor `Repaint` tail
+//    re-damaging the pointer stack after the pass's snapshot cleared it, every pass re-arming the
+//    next — cannot satisfy this: it reads DRAIN-STUCK (or trips the 1000 ms WEDGE wire) instead.
+//
+// Appended at the END of the file, after `focus_reset`, on that function's own argument: every
+// definition here is `witness`-gated, and appending keeps the knob-off artifact byte-identical on
+// both targets (`core::panic::Location` renumbering — see `focus_reset`'s doc block).
+// `ctrldecline_selftest` already extended the tail the same way.
+
+/// DMGOVLP — the fixture. See the module tail note above for what it asserts and why it exists.
+///
+/// ### Fixture shape
+/// Six kernel-band rows (`KERNEL_OWNER_BASE + 0x40..=0x45` — pace-exempt, never VUGMIN-hidden,
+/// [`above_shell`]-exempt; the x86 ladder never runs `ctrldecline_selftest`, the one other tenant
+/// of `+0x40`, and that fixture reaps its row regardless) against the shared [`HT_SURF`], pinned
+/// at scale 1 via [`move_to`] so the disjoint tiler can never re-place them:
+///
+///  * **CHAIN** `w0-w2`: three boxes in a row, each overlapping its neighbour by an 8-px sliver,
+///    with `w0 ∩ w2 = ∅` — so damage seeded at `w0` can only reach `w2` through `w1`, and the
+///    RELAY arm of the closure (`wcn_note_relay`) must fire or `w2` goes stale.
+///  * **STAIRCASE** `w3-w5`: three boxes at quarter-box offsets, sharing a common three-way
+///    overlap region. The real sprite is parked at that region's centre (`pal::cursor::set_abs`
+///    + `cursor::ensure_drawn`, the `wmdirect_selftest` pointer idiom), so every pass runs the
+///    CURSOR-3 overlay-offer path over banded overlapping rows — CURSTICK's exact territory.
+///
+/// The two groups are vertically disjoint, so the chain's claims stay clean of the sprite's.
+///
+/// ### Drive
+/// M=12 passes: the first eight cycle (A) a banded seed at the chain FOOT
+/// (`present_rows(w0, 0..2)`), (B) a banded seed under the three-way stack
+/// (`present_rows(w3, 0..2)`), (C) a whole present of the stack's TOP (`present(w5)`); the last
+/// FOUR are the STRETCH — consecutive banded seeds of the top's OWN last rows
+/// (`present_rows(w5, FIX_H-2..FIX_H)`), the shape whose adoption can come ONLY through the
+/// CURSTICK widening (below). The sprite is re-touched before every pass (`set_abs` at the same
+/// point) so `pal::cursor::visible()`'s 1.5 s auto-hide cannot silently disarm the cursor leg
+/// mid-battery.
+///
+/// ### The STRETCH and `adopt_stretch=` — the CURSTICK conviction, MEASURED not assumed
+/// The first RED calibration (12aa8a33-content, no CURSTICK widening, legs A/B/C only) read
+/// PASS, and both reasons are structural:
+///
+///  * **`adopt=` cannot convict.** [`tail_of`] answers `Adopt` for ANY pass that opened an
+///    overlay session — carried or not (`session && disturbed`, with `overlaid` deliberately
+///    unread since CURSOR-4) — and with the sprite parked over the stack a session opens on
+///    every pass on every kernel. The counter that discriminates is [`CUR3_TAKEN`]: it moves
+///    only when a staged window actually CARRIED sprite pixels through its present.
+///  * **Legs B/C cannot isolate the widening.** Every window B drags in has its sliver land in
+///    the neighbour's CHROME rows; `band_for_rows` cannot express chrome, so the drag promotes
+///    to a WHOLE box — and a whole-box window carries the sprite on any kernel. C is whole-box
+///    by definition. Both legs read `taken > 0` with CURSTICK absent.
+///  * **The pointer keep-alive donates whole boxes too** (second RED calibration, via the
+///    stretch probe line): on x86 every `set_abs` runs the motion repaint, whose undraw hands
+///    its restored rect back through `damage_intersecting` — chrome-inexpressible for these
+///    rows, so the whole staircase re-damages WHOLE before every present. The keep-alive is
+///    therefore excluded from the stretch (see the loop), where the probe then reads
+///    `pre=(false,..)` and the carry question is finally CURSTICK's alone.
+///
+/// The stretch is the shape with no rescue: `w5` is the stack's TOP (its damage drags nothing
+/// else into the pass), its box contains the parked sprite, and its seed band is its LAST two
+/// source rows — panel rows strictly below the arrow. Without the widening the staged band
+/// excludes the sprite's rows, the offer cannot land, and `CUR3_TAKEN` does not move for four
+/// consecutive passes; with it, `w5`'s band gains the sprite's rows (an 8-row surface cannot
+/// express them, so the fail-safe `None` arm rounds to the whole box) and every stretch pass
+/// carries. `adopt_stretch=N/4` counts stretch passes whose present+drain moved `CUR3_TAKEN`,
+/// and PASS requires at least one — RED is structurally zero, so the floor is set for GREEN
+/// robustness (a stage-declined direct fallback legitimately carries nothing).
+///
+/// During the stretch nothing else is staged over the sprite: only `w5` is dirty, the chain and
+/// the furniture sit clear of the arrow, and a drained pass paints nothing extra — which is what
+/// makes the four-pass window a claim about the WIDENING rather than about whoever else happened
+/// to composite.
+///
+/// ### What is measured, and what is deliberately NOT
+/// All counters are CUMULATIVE shadows read as before/after deltas — [`C2_DMG_PX_TOT`]/
+/// [`C2_BOX_PX_TOT`] beside `draw_window`'s swap-drained pair, [`OVLP_DRAG_EVT`]/[`OVLP_DRAG_PX`]
+/// (RAW pixels)/[`OVLP_RELAY_EVT`] beside the per-slot census, and the never-drained
+/// [`CUR3_ADOPT`]/[`CUR3_REPAINT`] tail counters read directly. NEVER asserted: `[wcn] dkpx > 0`
+/// (px/1024 rounds an 8-px sliver to zero — see [`OVLP_DRAG_EVT`]) and never a delta over any
+/// swap-drained counter (the rollup would race the fixture for its own numbers).
+///
+/// Wall-clock per present AND per drain composite via [`crate::arch::ms`]; any single one over
+/// [`DMGOVLP_WEDGE_MS`] prints the WEDGE line and fails — that wire is the boot-8 class stated
+/// as a bound rather than as a symptom.
+///
+/// ### Verdict grammar (spec-regex-stable, one line)
+/// `[dmgovlp] verdict passes=N/12 drained=N/12 drag_evt=N drag_px=N relay=N narrow=k/12
+/// cur=N/12 adopt=N repaint=N max_ms=N adopt_stretch=N/4 -> PASS|FAIL` (`adopt_stretch=` is
+/// APPENDED at the tail, this file's standing insertion rule, and the spec's REQUIRE moved with
+/// it), plus `[dmgovlp] WEDGE ... -> FAIL`, `[dmgovlp] DRAIN-STUCK ... -> FAIL` and
+/// `[dmgovlp] verdict -> SKIP (...)` variants. `scripts/specs/x86-wc.spec` REQUIREs the PASS
+/// shape and FORBIDs the other three.
+///
+/// PASS thresholds: every pass runs and drains; `drag_evt`/`drag_px`/`relay` all moved;
+/// `adopt_stretch >= 1` (the stretch's conviction — RED is structurally 0/4, GREEN 4/4);
+/// `narrow >= 2` and `cur >= 4` (the sprite-leg floor: at least 4 of the 12 passes must run the
+/// overlay-offer path with a live plan).
+///
+/// **Why the narrow floor is 2 and not 8** (measured on this leg's calibration runs): only the
+/// CHAIN passes — three of them now the stretch owns the tail of the battery — can narrow. The
+/// STAIRCASE passes run under the parked sprite, and the CURSTICK widening — deliberately
+/// fail-safe — unions the sprite's panel rows into every banded window whose box contains the
+/// sprite box; against an [`FIX_H`] = 8-row surface an ~18-px sprite spans the WHOLE content, so
+/// the union rounds those bands (the stretch's included) to the full box and `Δdmg == Δbox`,
+/// exactly as designed. Pass C is whole-box by construction. So the honest GREEN expectation is
+/// `narrow = 3/12`, and the floor is 2 to tolerate one stage-declined direct fallback (which
+/// legitimately repaints whole). The claim still bites: a fat-leg regression whole-boxes the
+/// CHAIN passes too and reads `narrow = 0`.
+///
+/// Self-cleaning: `close` by id (the kernel band refuses `close_owner` — CLOSEISO — so the sweep
+/// is per-id and the leak check is against the table), then [`focus_reset`] + its repaint.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wc"))]
+pub fn dmgovlp_selftest() {
+    use core::sync::atomic::{AtomicBool, Ordering, Ordering::Relaxed};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    /// One wedge bound for every measured interval in the battery.
+    const DMGOVLP_WEDGE_MS: u64 = 1000;
+    /// Passes driven, and the denominator of three verdict fields.
+    const M: usize = 12;
+    /// Drain-check budget: extra composites allowed to absorb a foreign present before the pass
+    /// must read Δdmg == 0.
+    const K: usize = 3;
+    /// PASS floor for the narrowing claim — see the doc block: only the three CHAIN passes can
+    /// narrow (the sprite widening whole-boxes the staircase, by design), minus one fallback.
+    const NARROW_MIN: usize = 2;
+    /// PASS floor for passes run with a live cursor plan — see the doc block.
+    const CUR_MIN: usize = 4;
+    /// First pass of the STRETCH (the last `M - STRETCH_AT` passes are the stretch), and the
+    /// PASS floor on its carry count — see the doc block's stretch section.
+    const STRETCH_AT: usize = 8;
+    const STRETCH_MIN: usize = 1;
+    /// The six owners, kernel-band and pace-exempt. Const-asserted into the band.
+    const OWNERS: [u64; 6] = [
+        KERNEL_OWNER_BASE + 0x40,
+        KERNEL_OWNER_BASE + 0x41,
+        KERNEL_OWNER_BASE + 0x42,
+        KERNEL_OWNER_BASE + 0x43,
+        KERNEL_OWNER_BASE + 0x44,
+        KERNEL_OWNER_BASE + 0x45,
+    ];
+    const _: () = assert!(is_kernel_owner(OWNERS[0]) && is_kernel_owner(OWNERS[5]));
+    const _: () =
+        assert!(OWNERS[0] != KERNEL_OWNER_CONSOLE && OWNERS[0] != KERNEL_OWNER_DESKTOP);
+
+    let (pw, ph) = {
+        let fb = *super::WRITER.lock();
+        if !fb.is_ready() {
+            serial_println!("[dmgovlp] verdict -> SKIP (framebuffer not ready)");
+            return;
+        }
+        let i = fb.info();
+        (i.width, i.height)
+    };
+    if pw < 512 || ph < 400 {
+        serial_println!("[dmgovlp] verdict -> SKIP (panel {}x{} too small)", pw, ph);
+        return;
+    }
+
+    // ---- geometry, from the REAL panel ------------------------------------------------------
+    // Outer boxes at scale 1: the fixture pins the scale itself, so these are exact, not layout
+    // guesses. All coordinates below are OUTER-BOX coordinates; content origins (what `move_to`
+    // takes) are derived at the pin loop.
+    let bw = FIX_W + 2 * BORDER; // 170 at the shipping theme
+    let bh = FIX_H + TITLE_H + 2 * BORDER; // 52 at the shipping theme
+    let (qx, qy) = (bw / 4, bh / 4);
+    let top = work_top(pw, ph);
+    let x0 = 8usize;
+    let ya = top + 8; // chain group's box top
+    let yb = ya + bh + 16; // staircase group's box top — groups vertically DISJOINT
+    // Chain: 8-px sliver overlaps, w0 ∩ w2 empty because bw > 16.
+    // Staircase: quarter-box offsets, three-way overlap region of (bw - 2*qx) x (bh - 2*qy).
+    let boxes: [(usize, usize); 6] = [
+        (x0, ya),
+        (x0 + (bw - 8), ya),
+        (x0 + 2 * (bw - 8), ya),
+        (x0, yb),
+        (x0 + qx, yb + qy),
+        (x0 + 2 * qx, yb + 2 * qy),
+    ];
+    // Defensive fit check — the 512x400 floor above covers the shipping theme; this covers a
+    // future chrome resize without letting `move_to`'s clamp silently shear the overlap geometry.
+    let need_w = x0 + 2 * (bw - 8) + bw + BORDER;
+    let need_h = yb + 2 * qy + bh + 8;
+    if need_w > pw || need_h > ph {
+        serial_println!(
+            "[dmgovlp] verdict -> SKIP (panel {}x{} under fixture extent {}x{})",
+            pw, ph, need_w, need_h
+        );
+        return;
+    }
+
+    // ---- rows: create, then pin at scale 1, then place --------------------------------------
+    let s = &raw const HT_SURF as usize;
+    let len = core::mem::size_of_val(&HT_SURF);
+    let mut w = [WIN_NONE; 6];
+    let titles: [&[u8]; 6] = [b"ov0", b"ov1", b"ov2", b"ov3", b"ov4", b"ov5"];
+    for i in 0..6 {
+        w[i] = create(OWNERS[i], s, len, FIX_W as u32, FIX_H as u32, FIX_STRIDE as u32, titles[i]);
+    }
+    if w.iter().any(|&id| id == WIN_NONE) {
+        serial_println!(
+            "[dmgovlp] verdict -> SKIP (window table full: {} {} {} {} {} {})",
+            w[0], w[1], w[2], w[3], w[4], w[5]
+        );
+        for &id in w.iter() {
+            close(id);
+        }
+        return;
+    }
+    // Scale FIRST, under the table lock, so the `move_to` clamp below computes against the box
+    // the fixture is actually claiming (the tiler may have granted a larger upscale at create).
+    // `pinned` comes with it so no re-tile can re-place — and re-scale — a row in the gap.
+    {
+        let mut t = table();
+        for &id in w.iter() {
+            if let Some(r) = row_mut(&mut t, id) {
+                r.scale = 1;
+                r.pinned = true;
+                r.damage_all();
+            }
+        }
+    }
+    // Placement through the REAL verb — `move_to` pins, damages and composites exactly as a drag
+    // does — then READ BACK: a clamp that moved a row moved the overlap geometry, and a fixture
+    // that measured anyway would be asserting about a layout it does not have.
+    let mut placed = true;
+    for i in 0..6 {
+        let (bx, by) = boxes[i];
+        let (cx, cy) = (bx + BORDER, by + TITLE_H + BORDER);
+        move_to(w[i], cx, cy);
+        placed &= info(w[i]).map(|inf| (inf.x, inf.y)) == Some((cx, cy));
+    }
+    if !placed {
+        serial_println!("[dmgovlp] verdict -> SKIP (placement clamped off the fixture geometry)");
+        for &id in w.iter() {
+            close(id);
+        }
+        return;
+    }
+    // No row below the shell: the kernel band is `above_shell`-exempt by construction, and the
+    // raise puts the stack's top where the sprite leg expects it. Restored by `focus_reset`.
+    focus_changed(OWNERS[5]);
+
+    // ---- the sprite, parked ON the stack -----------------------------------------------------
+    // The three-way overlap region's centre, in panel pixels. The sprite box (9 * sprite-scale,
+    // ~18 px at QEMU's metrics) sits wholly inside all three staircase boxes here, which is the
+    // only geometry that can take the overlay offer at all — CURSTICK's adoptability condition.
+    let ov_x = x0 + 2 * qx + (bw - 2 * qx) / 2;
+    let ov_y = yb + 2 * qy + (bh - 2 * qy) / 2;
+    // `set_abs` takes HID space (0..=32767) — the same conversion `wmdirect_selftest` drives, so
+    // the panel position the sprite lands on is derived by the shipping code, not by this witness.
+    let hid = |v: usize, span: usize| -> i32 {
+        ((v as i64 * 32767) / (span as i64 - 1).max(1)) as i32
+    };
+    let (hx, hy) = (hid(ov_x, pw), hid(ov_y, ph));
+    crate::pal::cursor::set_abs(hx, hy, pw as i32, ph as i32);
+    super::cursor::ensure_drawn();
+
+    // ---- settle, then baseline (CTRLWIT's lesson: flush BEFORE the measured interval) --------
+    // Drain whatever the creates, moves, raise and sprite arming left pending, so the deltas
+    // below start from a closed damage set. Bounded: a set that will not settle here is already
+    // the defect the loop exists to catch, and the loop will catch it against its own baseline.
+    for _ in 0..K + 1 {
+        let before = C2_DMG_PX_TOT.load(Relaxed);
+        composite();
+        if C2_DMG_PX_TOT.load(Relaxed) == before {
+            break;
+        }
+    }
+    let de0 = OVLP_DRAG_EVT.load(Relaxed);
+    let dp0 = OVLP_DRAG_PX.load(Relaxed);
+    let rl0 = OVLP_RELAY_EVT.load(Relaxed);
+    let ad0 = CUR3_ADOPT.load(Relaxed);
+    let rp0 = CUR3_REPAINT.load(Relaxed);
+
+    // ---- the drive loop -----------------------------------------------------------------------
+    let mut passes_n = 0usize;
+    let mut drained_n = 0usize;
+    let mut narrow_k = 0usize;
+    let mut cur_n = 0usize;
+    let mut adopt_stretch = 0usize;
+    let mut max_ms = 0u64;
+    let mut wedged = false;
+    let mut stuck = false;
+    for m in 0..M {
+        // Re-touch the pointer at the SAME point: refreshes the 1.5 s visibility clock without
+        // moving the sprite, so the cursor leg cannot silently disarm mid-battery.
+        //
+        // NEVER inside the stretch, and the exclusion is measured, not stylistic: on x86
+        // (`SPRITE_OWNS_PAINT`) every `set_abs` runs `repaint_on_move` -> `cursor::repaint()`,
+        // whose undraw hands its restored rect back through `repair()` ->
+        // [`damage_intersecting`] — and the sprite's rows are CHROME rows for `w5`, so the band
+        // is inexpressible and all three staircase rows are re-damaged WHOLE. The stretch probe
+        // read `pre=(true,0,0) dd=db taken=3` on a de-widened kernel: the fixture's own
+        // keep-alive was donating the whole-box carry the stretch exists to withhold. The
+        // stretch runs a few milliseconds after pass 7's touch (`max_ms` bounds every interval
+        // at 1 s against a 1.5 s hide), so the clock cannot lapse inside it — and `cur=` still
+        // asserts a live plan on every stretch pass, so a lapse would fail loudly, not skew
+        // silently.
+        if m < STRETCH_AT {
+            crate::pal::cursor::set_abs(hx, hy, pw as i32, ph as i32);
+            super::cursor::ensure_drawn();
+        }
+        // The plan the NEXT pass will be offered. One acquisition, before the present, outside
+        // every lock the pass takes.
+        if super::cursor::sprite_plan().is_some() {
+            cur_n += 1;
+        }
+        let d0 = C2_DMG_PX_TOT.load(Relaxed);
+        let b0 = C2_BOX_PX_TOT.load(Relaxed);
+        // The stretch's per-pass carry baseline — CUR3_TAKEN is cumulative and load-only (its
+        // rollups never drain it), the same discipline every other counter here leans on.
+        let tk0 = CUR3_TAKEN.load(Relaxed);
+        let of0 = CUR3_OFFERS.load(Relaxed);
+        // Stretch probe: `w5`'s damage state as the present finds it. A stretch pass is only the
+        // widening's witness if the row is CLEAN here — a pre-dirtied row unions to the whole box
+        // and carries the sprite on any kernel. Printed per stretch pass so a capture can convict
+        // the fixture's own preconditions instead of leaving them assumed.
+        let pre = if m >= STRETCH_AT {
+            let t = table();
+            row(&t, w[5]).map(|r| (r.damaged, r.dmg_y0, r.dmg_y1)).unwrap_or((false, 0, 0))
+        } else {
+            (false, 0, 0)
+        };
+        let t0 = crate::arch::ms();
+        let ran = if m < STRETCH_AT {
+            match m % 3 {
+                // (A) banded seed at the chain FOOT: w1 drags by the sliver, w2 only by relay.
+                0 => present_rows(w[0], 0, 2),
+                // (B) banded seed under the three-way stack, beneath the parked sprite.
+                1 => present_rows(w[3], 0, 2),
+                // (C) whole present of the stack's top — may legitimately not narrow.
+                _ => present(w[5]),
+            }
+        } else {
+            // THE STRETCH — the top's own last rows, strictly below the arrow, dragging nothing:
+            // the one shape whose carry can only come through the CURSTICK widening. See the doc
+            // block's stretch section.
+            present_rows(w[5], FIX_H - 2, FIX_H)
+        };
+        let dt = crate::arch::ms().wrapping_sub(t0);
+        max_ms = max_ms.max(dt);
+        if ran {
+            passes_n += 1;
+        }
+        if dt > DMGOVLP_WEDGE_MS {
+            serial_println!("[dmgovlp] WEDGE pass={} ms={} -> FAIL", m, dt);
+            wedged = true;
+            break;
+        }
+        // Drain check: one extra composite must add NOTHING, within K tries (the tries absorb a
+        // foreign present — a caret blink, a furniture strip — landing between the reads; damage
+        // that keeps arriving on every try is the storm signature, not noise).
+        let mut drained = false;
+        let mut last_dpx = 0u64;
+        for _ in 0..K {
+            let before = C2_DMG_PX_TOT.load(Relaxed);
+            let c0 = crate::arch::ms();
+            composite();
+            let cdt = crate::arch::ms().wrapping_sub(c0);
+            max_ms = max_ms.max(cdt);
+            if cdt > DMGOVLP_WEDGE_MS {
+                serial_println!("[dmgovlp] WEDGE pass={} ms={} -> FAIL", m, cdt);
+                wedged = true;
+                break;
+            }
+            last_dpx = C2_DMG_PX_TOT.load(Relaxed).wrapping_sub(before);
+            if last_dpx == 0 {
+                drained = true;
+                break;
+            }
+        }
+        if wedged {
+            break;
+        }
+        if drained {
+            drained_n += 1;
+        } else {
+            serial_println!("[dmgovlp] DRAIN-STUCK pass={} k={} dpx={} -> FAIL", m, K, last_dpx);
+            stuck = true;
+        }
+        // The narrowing claim, over the whole pass INCLUDING its drain composites: pixels painted
+        // strictly under whole-box pixels means at least one row went banded.
+        let dd = C2_DMG_PX_TOT.load(Relaxed).wrapping_sub(d0);
+        let db = C2_BOX_PX_TOT.load(Relaxed).wrapping_sub(b0);
+        if dd < db {
+            narrow_k += 1;
+        }
+        // The stretch's carry claim, over the same interval: this pass's present (or its drain)
+        // put sprite pixels through a staged window. Only the widening can make that true here.
+        if m >= STRETCH_AT {
+            if CUR3_TAKEN.load(Relaxed) != tk0 {
+                adopt_stretch += 1;
+            }
+            serial_println!(
+                "[dmgovlp] stretch pass={} pre=({},{},{}) dd={} db={} offers={} taken={}",
+                m, pre.0, pre.1, pre.2, dd, db,
+                CUR3_OFFERS.load(Relaxed).wrapping_sub(of0),
+                CUR3_TAKEN.load(Relaxed).wrapping_sub(tk0)
+            );
+        }
+    }
+
+    let drag_evt = OVLP_DRAG_EVT.load(Relaxed).wrapping_sub(de0);
+    let drag_px = OVLP_DRAG_PX.load(Relaxed).wrapping_sub(dp0);
+    let relay = OVLP_RELAY_EVT.load(Relaxed).wrapping_sub(rl0);
+    let adopt = CUR3_ADOPT.load(Relaxed).wrapping_sub(ad0);
+    let repaint_n = CUR3_REPAINT.load(Relaxed).wrapping_sub(rp0);
+    let ok = !wedged
+        && !stuck
+        && passes_n == M
+        && drained_n == M
+        && drag_evt > 0
+        && drag_px > 0
+        && relay > 0
+        && narrow_k >= NARROW_MIN
+        && cur_n >= CUR_MIN
+        // The stretch's conviction: at least one of its four passes CARRIED the sprite through
+        // a staged band — impossible without the CURSTICK widening (RED reads 0/4).
+        && adopt_stretch >= STRETCH_MIN;
+    serial_println!(
+        "[dmgovlp] verdict passes={}/12 drained={}/12 drag_evt={} drag_px={} relay={} narrow={}/12 cur={}/12 adopt={} repaint={} max_ms={} adopt_stretch={}/4 -> {}",
+        passes_n, drained_n, drag_evt, drag_px, relay, narrow_k, cur_n, adopt, repaint_n, max_ms,
+        adopt_stretch,
+        if ok { "PASS" } else { "FAIL" }
+    );
+
+    // ---- teardown: by ID (kernel band — CLOSEISO refuses `close_owner`), asserted -------------
+    let mut leaked = 0usize;
+    for &id in w.iter() {
+        if !(close(id) && info(id).is_none()) {
+            leaked += 1;
+        }
+    }
+    if leaked > 0 {
+        serial_println!("[dmgovlp] teardown LEAK — {} fixture row(s) still live -> FAIL", leaked);
+    }
+    // Un-name the synthetic focus owner, drop the shell back, repaint the live set.
+    focus_reset();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// DEADMAN — two NON-BLOCKING samplers for `crate::deadman`, the timer-ISR witness.
+//
+// These exist here, rather than in `deadman.rs`, only because `COMP_HOLDER_CORE`, `COMP_HOLD_T0_MS`
+// and `TABLE` are private to this module. They are READ-ONLY: neither one touches `COMP_GATE`, marks
+// or clears damage, or mutates a single field. Both are gated on the knob, so a knob-off build
+// carries neither symbol.
+//
+// THE SAFETY PROPERTY, stated once for both: they are called from the APIC timer ISR with IF=0, and
+// an instrument that can block on what it instruments is the bug, not the tool. So neither may wait
+// on anything. `deadman_gate_sample` waits on nothing at all (two relaxed loads);
+// `deadman_damage_sample` uses `TABLE.try_lock()` and returns `None` on contention — the same
+// pardon-on-busy discipline `occluders_above`/`OCC_EXCUSE_BUSY` established in this file, and the
+// same reason: "An instrument must never be able to wedge the thing it instruments."
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// DEADMAN — who holds `COMP_GATE`, and for how long, WITHOUT taking it.
+///
+/// Returns `(Some(core), held_ms)` when the gate is held, `(None, 0)` when it is free.
+///
+/// This is a read of two gauges this file already maintains and documents as "loaded, never
+/// drained" — `COMP_HOLDER_CORE` (`usize::MAX` == free) and `COMP_HOLD_T0_MS` — using the exact
+/// pattern `wcser_emit` and `wcser_overdue_probe` already use. **It cannot block: there is no lock
+/// to acquire, no CAS, and no retry.** Reading a torn pair (a holder that released between the two
+/// loads) costs at worst one line reporting a stale age for a gate that has just gone free, which
+/// `saturating_sub` keeps non-negative.
+///
+/// One honest limit: `COMP_HOLD_T0_MS` is re-stamped per rerun inside the pass loop, so `held_ms` is
+/// the age of the CURRENT pass, not of the held epoch. That is the right reading for the wedge
+/// question anyway — a leaked hold performs no reruns, so nothing re-stamps it and the age grows
+/// without bound, which is exactly the signal `[deadman] gate=` exists to show.
+#[cfg(all(target_arch = "x86_64", feature = "deadman"))]
+pub fn deadman_gate_sample() -> (Option<usize>, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let holder = COMP_HOLDER_CORE.load(Relaxed);
+    if holder == usize::MAX {
+        return (None, 0);
+    }
+    let t0 = COMP_HOLD_T0_MS.load(Relaxed);
+    (Some(holder), crate::arch::ms().saturating_sub(t0))
+}
+
+/// DEADMAN — `(rows currently marked damaged, of those, rows with NO attach since the last pass)`.
+///
+/// Returns `None` when `TABLE` was held at the instant of the sample. `None` is reported as `?/?`,
+/// never as `0/0`: "the table was busy" and "nothing is damaged" are different facts and an
+/// instrument that conflates them is worse than one that admits it looked away.
+///
+/// **It cannot block.** `TABLE.try_lock()` returns immediately either way — this deliberately does
+/// NOT use `table()`, which is a blocking, IRQ-masked `TABLE.lock()` spin and would deadlock outright
+/// if the timer ISR landed on a core that already held it. The critical section is a bounded
+/// `0..MAX_WINDOWS` (12) walk of two `bool`s and one relaxed load per row, with no print, no
+/// allocation and no nested lock — inside this file's standing rule for `TABLE` sections.
+///
+/// The "static" test is strict by construction: a row counts as static iff its attach sequence is
+/// UNCHANGED since the snapshot taken at the last completed composite pass. Any `present()` naming
+/// the row breaks it. No threshold, no decay, no smoothing — so the number this returns is evidence
+/// about the damage-tracking leak, not a knob tuned toward an expected answer.
+#[cfg(all(target_arch = "x86_64", feature = "deadman"))]
+pub fn deadman_damage_sample() -> Option<(u32, u32)> {
+    let t = TABLE.try_lock()?;
+    let mut rows = 0u32;
+    let mut stat = 0u32;
+    for (i, r) in t.rows.iter().enumerate() {
+        if r.used && r.damaged {
+            rows += 1;
+            if crate::deadman::row_static(i) {
+                stat += 1;
+            }
+        }
+    }
+    Some((rows, stat))
 }

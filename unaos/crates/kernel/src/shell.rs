@@ -4123,9 +4123,23 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             let rows = crate::arch::syscall::proc_table_rows();
             let (rows_free, rows_running, rows_exited, rows_orphaned) =
                 crate::arch::syscall::proc_table_headroom();
-            let (jobs_free, jobs_rows) = {
+            // BGREAP-CLOSE: `dead` counts occupied rows whose pid the kernel no longer knows — the
+            // close-box residue. It is the term that made the metal reading unreadable: `job rows
+            // free=4/12` next to `proc rows free=9 of 10` looked like a leak with no name, and the
+            // count says how much of the shortfall the next launch will reclaim by itself.
+            let (jobs_free, jobs_rows, jobs_dead) = {
                 let j = BG_JOBS.lock();
-                (j.iter().filter(|s| s.is_none()).count(), j.len())
+                let dead = j
+                    .iter()
+                    .flatten()
+                    .filter(|job| {
+                        matches!(
+                            crate::arch::syscall::bg_poll(job.pid, false),
+                            crate::arch::syscall::BgPoll::Gone
+                        )
+                    })
+                    .count();
+                (j.iter().filter(|s| s.is_none()).count(), j.len(), dead)
             };
             let slots_free = storm_slots::user_slots_free();
             console.println(&alloc::format!(
@@ -4134,9 +4148,9 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 slots_free, storm_slots::USER_SLOTS
             ));
             serial_println!(
-                ":: STORM: begin n={} | proc rows free={} running={} exited={} porphaned={} of {} | job rows free={}/{} | user slots free={}/{} ::",
+                ":: STORM: begin n={} | proc rows free={} running={} exited={} porphaned={} of {} | job rows free={}/{} dead={} | user slots free={}/{} ::",
                 n, rows_free, rows_running, rows_exited, rows_orphaned, rows,
-                jobs_free, jobs_rows, slots_free, storm_slots::USER_SLOTS
+                jobs_free, jobs_rows, jobs_dead, slots_free, storm_slots::USER_SLOTS
             );
             crate::arch::sched::storm_census("pre");
             let mut launched = 0usize;
@@ -4702,6 +4716,85 @@ struct BgJob {
 #[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
 static BG_JOBS: spin::Mutex<[Option<BgJob>; 12]> = spin::Mutex::new([None; 12]);
 
+/// BGREAP-CLOSE: claim a row in [`BG_JOBS`], reclaiming provably-finished rows when the table is
+/// full. **Every insert into that table must come through here** — `jobs` is the only path that
+/// drops an entry, and there are launches whose job never reaches a `jobs` sweep.
+///
+/// ### The defect this closes
+/// The kernel `Proc` row has a scavenger (`proc_reserve`'s BGRUN-SCAV) and the thread table has one
+/// (WINX-7's `sys_thread_spawn` sweep). The SHELL's table had neither, and a close-box press is
+/// exactly the event that needs one: `wc_close_click` -> `bg_kill` reaps the Proc row IN PLACE
+/// (PROCREAP) without ever touching `BG_JOBS`, because it runs from the input pump and cannot take
+/// the shell's lock across a compositor repaint. So every window the operator closes retires a Proc
+/// row and a user slot while leaving a `BG_JOBS` row pointing at a pid that no longer exists.
+/// Metal, 2026-08-18: `proc rows free=9 of 10 | job rows free=4/12 | user slots free=11/12` — the
+/// job table was the only census that did not recover, and it is a hard ceiling on the next storm.
+///
+/// ### Shape: lazy reclaim, not eager free
+/// The WINX-7 idiom, for the same reason: the eager site (`wc_close_click`) runs on the input pump
+/// and taking this lock there would put a compositor repaint inside the shell's critical section.
+/// Under pressure the lock is already held by the one caller that needs the row.
+///
+/// Two tiers, so job history stays readable for as long as it can be:
+///  * **Gone** — the kernel does not know the pid. Killed by the close box, or scavenged by
+///    BGRUN-SCAV. The exit status is ALREADY unrecoverable, so reclaiming loses nothing.
+///  * **finished** — exited/faulted/closed and never reaped. Reclaimed only when tier 1 freed
+///    nothing, and the witness PRINTS THE OUTCOME, so the status the operator would have seen from
+///    `jobs` is on the wire rather than dropped (the BGRUN-SCAV "never silent" rule).
+///
+/// A `Running` row is never touched: a full table of live jobs is a genuine refusal, and the caller
+/// still kills the pid it just spawned rather than leave it untrackable.
+#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+fn bg_jobs_claim(jobs: &mut [Option<BgJob>; 12]) -> Option<usize> {
+    use crate::arch::syscall::BgPoll;
+    if let Some(i) = jobs.iter().position(|s| s.is_none()) {
+        return Some(i);
+    }
+    let mut freed: Option<usize> = None;
+    // Tier 1 — rows the kernel has already forgotten. Lossless.
+    for i in 0..jobs.len() {
+        let Some(job) = jobs[i] else { continue };
+        if matches!(crate::arch::syscall::bg_poll(job.pid, false), BgPoll::Gone) {
+            jobs[i] = None;
+            serial_println!(
+                ":: BGREAP: job table full — reclaimed row {} from dead pid {} ({}) (the kernel row is already gone: closed, killed or scavenged) ::",
+                i,
+                job.pid,
+                core::str::from_utf8(&job.name[..job.nlen as usize]).unwrap_or("?")
+            );
+            if freed.is_none() {
+                freed = Some(i);
+            }
+        }
+    }
+    if freed.is_some() {
+        return freed;
+    }
+    // Tier 2 — finished but unreaped. `bg_poll(reap = true)` is safe under this lock for the same
+    // reason `bg_jobs` relies on (a PEXITED row's `done` permit is posted before the state is
+    // published, and the reap arm uses `try_wait`); a `Running` row is unaffected by the flag.
+    for i in 0..jobs.len() {
+        let Some(job) = jobs[i] else { continue };
+        let verdict = crate::arch::syscall::bg_poll(job.pid, true);
+        if matches!(verdict, BgPoll::Running) {
+            continue;
+        }
+        match verdict {
+            BgPoll::Exited(code) => serial_println!(
+                ":: BGREAP: job table full — reclaimed row {} from pid {} (exit={} DISCARDED; `jobs` never read it) ::",
+                i, job.pid, code
+            ),
+            _ => serial_println!(
+                ":: BGREAP: job table full — reclaimed row {} from finished pid {} (no exit status to report; `jobs` never read it) ::",
+                i, job.pid
+            ),
+        }
+        jobs[i] = None;
+        return Some(i);
+    }
+    None
+}
+
 /// STORM-FATW: the bounded USB-traffic writer `storm [n] fat` arms — the driver-claim half of the
 /// WEDGE-8/F3 metal provocation (the vug fleet is the preemption half). Two legs, decided once at
 /// start by whether the stick carries a mountable FAT volume:
@@ -4858,7 +4951,10 @@ fn bg_program(console: &mut Console, path: &str) -> bool {
     match crate::arch::syscall::spawn_user_image_bg(&bytes) {
         Ok((pid, asid, entry)) => {
             let mut jobs = BG_JOBS.lock();
-            let Some(slot) = jobs.iter_mut().find(|s| s.is_none()) else {
+            // BGREAP-CLOSE: `bg_jobs_claim` reclaims rows whose job is provably finished before it
+            // reports the table full — a close-box press retires the kernel row without telling this
+            // table, and `jobs` is the only other path that drops an entry.
+            let Some(idx) = bg_jobs_claim(&mut jobs) else {
                 // The kernel row exists but the shell can no longer track it; kill it rather than
                 // leak an untrackable job (`jobs` could never reap what it never recorded).
                 drop(jobs);
@@ -4872,10 +4968,10 @@ fn bg_program(console: &mut Console, path: &str) -> bool {
             let mut name = [0u8; 32];
             let nlen = path.len().min(32);
             name[..nlen].copy_from_slice(&path.as_bytes()[..nlen]);
-            *slot = Some(BgJob { pid, asid, name, nlen: nlen as u8 });
+            jobs[idx] = Some(BgJob { pid, asid, name, nlen: nlen as u8 });
             console.println(&alloc::format!("bg: {} started — pid {} (see `jobs`)", path, pid));
             serial_println!(
-                ":: BGRUN: bg {} — loaded {} bytes, entry {:#x}, pid={} asid={} DETACHED ::",
+                ":: BGRUN: bg {} — loaded {} bytes, entry {:#x}, pid={} slot={} (window layer arms asid=slot+1) DETACHED ::",
                 path, n, entry, pid, asid
             );
             true
@@ -5023,13 +5119,14 @@ fn bg_kill_cmd(console: &mut Console, pid: u64) {
 #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
 pub(crate) fn adopt_bg_job(pid: u64, slot: u64, name: &str) -> bool {
     let mut jobs = BG_JOBS.lock();
-    let Some(free) = jobs.iter_mut().find(|s| s.is_none()) else {
+    // BGREAP-CLOSE: same claim as `bg_program`'s — see `bg_jobs_claim`.
+    let Some(idx) = bg_jobs_claim(&mut jobs) else {
         return false;
     };
     let mut buf = [0u8; 32];
     let nlen = name.len().min(32);
     buf[..nlen].copy_from_slice(&name.as_bytes()[..nlen]);
-    *free = Some(BgJob { pid, asid: slot, name: buf, nlen: nlen as u8 });
+    jobs[idx] = Some(BgJob { pid, asid: slot, name: buf, nlen: nlen as u8 });
     true
 }
 

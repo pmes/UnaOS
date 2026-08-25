@@ -388,6 +388,22 @@ impl core::fmt::Display for CpuOpt {
 /// U6x/U6bx/U7x/U6gx and their launchers/verdict tasks); `xhci[0]` is `irqstorage`'s `storage-svc`
 /// and `xhci[1]` is its `bx-blockreq` self-test. A `-` means that consumer got NO core and will skip
 /// — the short-pool signal, printed rather than rounded up to PASS.
+///
+/// THE FIELD IS `rsvc=`, NOT `render=`, SINCE 2026-08-19 — and the rename is the witness catching up
+/// with a policy change, not cosmetics. `render=cN` was read (correctly, while it was true) as "cN is
+/// carved out for the panel": the scheduler excluded that core as a steal thief and deprioritised it
+/// at `CPU_AUTO` placement. Peter ended that — "THERE IS NO RESERVING CORES" — after the bench showed
+/// the carved-out core at 0–5 % through a six-vug sitting while the rest of the machine ran 64–82 %.
+/// `rsvc=cN` states what remains true and only that: cN is where the render SERVICE TASK was spawned
+/// and where `confirm_render_core` expects to find itself. The scheduler now treats cN as an ordinary
+/// dispatching core, which the `sched=all-cores` term on this line says explicitly so that no reader
+/// has to infer a policy from a core index. A witness describing a dead policy is a lie on the wire.
+///
+/// The pool exclusions this line reports are NOT a reservation and do not fall to that ruling: they
+/// place NAMED work, and they exist because a cooperative (IF=0) ring-3 fixture parked on the render
+/// core stalls the panel for its lifetime, and because `xhci_worker_cpu`'s takers share a raw
+/// spinlock with the shell/render task. They constrain WHERE a handful of fixtures are spawned; they
+/// do not hold capacity idle, and the dispatch pool behind them is now every core.
 pub fn publish_sched_split(render: usize, service: usize) {
     SPLIT.store(((render as u64) << 32) | (service as u64 & 0xffff_ffff), Ordering::Release);
 
@@ -400,7 +416,7 @@ pub fn publish_sched_split(render: usize, service: usize) {
     let x = [CpuOpt(xhci_worker_cpu(0)), CpuOpt(xhci_worker_cpu(1))];
 
     serial_println!(
-        ":: SCHED-X86 PLACE: aps={} render=c{} svc=c{} worker=[{},{},{}] xhci=[{},{}] tier={} pool={} ::",
+        ":: SCHED-X86 PLACE: aps={} rsvc=c{} svc=c{} worker=[{},{},{}] xhci=[{},{}] tier={} pool={} sched=all-cores ::",
         online_aps().len(),
         render,
         service,

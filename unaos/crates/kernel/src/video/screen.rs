@@ -342,6 +342,29 @@ fn spread2_note(self_cpu: usize, helpers: &[usize], jobs: &[BandJob]) {
 /// render task's own next present consumes it, on its own thread, under its own ownership.
 static FULL_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// STAGE-PHYS (witness) — the virtual span of the panel `Screen`'s back store, published so the
+/// compositor's one-shot physical-contiguity witness (`wm::physwit_once`) can walk it.
+///
+/// WHY A STATIC AND NOT AN ACCESSOR. Exactly the reason [`FULL_PRESENT`] is a flag: the `Screen` is
+/// OWNED by the render task and there is no global handle another core could reach it through. The
+/// witness needs the *address range* of the allocation, not the `Screen`, and that range is fixed
+/// for the life of the screen — `back_store` is allocated once at its final size in [`Screen::new`]
+/// and never grown or shrunk (see the `back` field's SAFETY note), so the heap buffer never moves.
+/// Publishing the span once at construction is therefore exact, not a snapshot.
+///
+/// Written only by [`Screen::new`], and only for a double-buffered screen (a SHELLWIN-OOM `direct`
+/// screen has an EMPTY `back_store` and publishes nothing). Zero length = "no panel back store
+/// observed yet", which is what the witness reports rather than guessing.
+///
+/// Off by default: `witness`-gated on both the definition and its single writer, so a non-witness
+/// build has neither the statics nor the two relaxed stores.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+pub static BACK_STORE_PTR: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+pub static BACK_STORE_LEN: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
 /// FOCUS-VIS — ask the desktop layer to repaint the whole panel on its next present. Idempotent; the
 /// request is consumed by the first [`Screen::flush`] that follows.
 ///
@@ -611,6 +634,18 @@ impl Screen {
             );
         }
         let mut back_store = vec![0u8; len];
+        // STAGE-PHYS — publish the back store's span for the compositor's one-shot contiguity
+        // witness. Taken here rather than after the move because the `Vec` HEADER moves into `Self`
+        // while its heap buffer does not, so this address is the one that stays valid. Two relaxed
+        // stores on a path that runs once per screen; absent entirely without `witness`.
+        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+        if len > 0 {
+            BACK_STORE_PTR.store(
+                back_store.as_ptr() as usize,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            BACK_STORE_LEN.store(len, core::sync::atomic::Ordering::Relaxed);
+        }
         let mut back = FrameBuffer::new();
         back.init(back_store.as_mut_ptr() as usize, len, info);
         // WC-BBSYNC — adopt the desktop colour the compositor put on the glass, if one was recorded

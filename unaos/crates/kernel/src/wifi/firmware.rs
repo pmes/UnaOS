@@ -47,25 +47,28 @@
 //     headroom. Outside the band is a hard REJECT, because staging a 4 GiB "firmware" into the kernel
 //     heap is a worse failure than refusing it. A short read (chain ends before the directory size)
 //     is likewise a REJECT, never a silent truncation.
-//   * **Word alignment** — pinned by `bcm4331.md` §S4: "the payload is a stream of big-endian 32-bit
-//     words". So the payload length must be a multiple of 4 whatever the header turns out to be.
-//     Reported, not enforced, because it is a property of the header layout question below.
-//   * **Container header — a DOCUMENTED DISAGREEMENT, reported rather than resolved by fiat.**
-//     `bcm4331.md` §S4 records "a 4-byte header (`type`, `ver`, reserved, big-endian `size`)". Those
-//     four fields cannot fit in four bytes — a `be32` size alone is four — so the record is internally
-//     inconsistent and cannot be implemented as written. Rather than pick a reading and call it
-//     pinned, `classify_header` tries BOTH self-consistent candidates and reports which one (if
-//     either) the file actually satisfies:
+//   * **Container header — W3 ANSWERED ON METAL (rmbp1-boot1, 2026-08).** The old A-vs-B
+//     "documented disagreement" is resolved: the header is ALWAYS the 8-byte form — `type` u8,
+//     `ver` u8, 2 reserved, `be32 size` — and what varies per file is the MEANING of `size` and the
+//     SHAPE of the payload, selected by the `type` byte:
 //
-//       - **Layout A (8-byte):** `type` u8, `ver` u8, 2 reserved, `be32 size`; consistent iff
-//         `size == len - 8`.
-//       - **Layout B (4-byte):** `type` u8, `ver` u8, 2 reserved, no declared size; consistent iff
-//         `(len - 4) % 4 == 0` (payload is whole 32-bit words) and layout A does not hold.
+//       - **`type` 0x75 (`hdr=words`)** — the microcode: `size` is the payload BYTE count
+//         (`size == len - 8`), payload a stream of be32 words. Measured: ucode29_mimo.fw
+//         len=39760 declared=39752, whole words.
+//       - **`type` 0x69 (`hdr=records`)** — the initvals: `size` is the payload RECORD count, and
+//         the payload is a stream of variable-length records — `be16 offset` (bit 15 flags a
+//         32-bit value) followed by a `be16` or `be32` value (4 or 6 bytes per record). Measured:
+//         ht0initvals29.fw declared=477, walks as exactly 477 records consuming the payload
+//         exactly; ht0bsinitvals29.fw declared=35, likewise exact — the same file both old
+//         layouts REJECTED (178 bytes: not len-8, not whole words).
 //
-//     The ACCEPT decision rests only on presence and bounds, so a file in either container — or in
-//     neither — still stages, and says which. **This is the metal probe for the disagreement:** the
-//     first boot with the real set prints `hdr=A|B|unrecognized`, `type=`, `ver=`, `declared=` and an
-//     FNV-1a digest per file, and that capture is what corrects `bcm4331.md` §S4 and gates arc 2.
+//     PROVENANCE of the record framing: hypothesis-falsification against the user's own extracted
+//     set on this bench plus the rmbp1-boot1 capture — the framing above is the one reading under
+//     which both initvals files' walked record counts equal their declared `size` while consuming
+//     their payloads exactly. No driver source was read. What the walk pins is the FRAMING; what
+//     the `offset` field means to the d11 core is arc-3 evidence, not this module's claim.
+//     `classify_header` therefore VERIFIES rather than guesses: a `records` verdict is issued only
+//     when the walk itself succeeds with the declared count.
 //
 // ## Failure posture — SETTLED vs DEFERRED, and why the difference is not cosmetic
 // Every file gets one line and the pass ends with exactly one terminal verdict. No panic.
@@ -179,20 +182,25 @@ pub fn with_staged<R>(role: &str, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
 /// One staged image's container verdict and geometry, for arc 2's SET-VALIDATION rung (WIFI-SETVAL).
 ///
 /// Everything here is DERIVED from the staged bytes by this module's own `classify_header` and
-/// `fnv1a32` — arc 2 re-derives nothing. W3 — `bcm4331.md` §S4's internally inconsistent header
-/// record — is still an open UNKNOWN, and two independent implementations of an unresolved rule is
-/// exactly how the loader's `hdr=` verdict and a consumer's payload offset come to disagree without
-/// either one looking wrong. One `classify_header`, every reader.
+/// `fnv1a32` — arc 2 re-derives nothing. W3 is ANSWERED (see the module note), but the one-source
+/// rule stands for the same reason it was written: two independent implementations of the container
+/// rule is exactly how the loader's `hdr=` verdict and a consumer's payload offset come to disagree
+/// without either one looking wrong. One `classify_header`, every reader.
 #[cfg(feature = "wifi2")]
 pub(crate) struct StagedHeader {
     pub role: &'static str,
     pub layout: &'static str,
     pub kind: u8,
     pub ver: u8,
-    /// Layout A's declared payload length. Meaningless unless `layout == "A"`.
+    /// The header's declared `size`: payload BYTES for `hdr=words`, payload RECORD count for
+    /// `hdr=records`.
     pub declared: u32,
     pub len: usize,
-    pub words_ok: bool,
+    /// Records actually walked. Zero unless `layout == "records"`.
+    pub records: u32,
+    /// The payload satisfies its layout's shape rule: whole be32 words (`words`), or a clean record
+    /// walk whose count equals `declared` (`records`).
+    pub stream_ok: bool,
     pub digest: u32,
 }
 
@@ -217,7 +225,8 @@ pub(crate) fn set_headers() -> Vec<StagedHeader> {
                 ver: v.ver,
                 declared: v.declared,
                 len: s.bytes.len(),
-                words_ok: v.words_ok,
+                records: v.records,
+                stream_ok: v.stream_ok,
                 digest: s.digest,
             });
         }
@@ -255,35 +264,74 @@ fn fnv1a32(data: &[u8]) -> u32 {
     h
 }
 
-/// Which container layout, if any, the leading bytes satisfy. See the module note: this REPORTS the
-/// documented disagreement, it does not resolve it.
+/// The `type` byte of a word-stream image (the microcode). Pinned on metal, rmbp1-boot1.
+const HDR_TYPE_WORDS: u8 = 0x75;
+/// The `type` byte of a record-stream image (both initvals). Pinned on metal, rmbp1-boot1.
+const HDR_TYPE_RECORDS: u8 = 0x69;
+/// Bit 15 of a record's `be16 offset` field flags a 32-bit value (6-byte record); clear = 16-bit
+/// (4-byte record). Pinned by the exact-consume walk over the bench set (module note, PROVENANCE).
+const REC_FLAG_32BIT: u16 = 0x8000;
+
+/// Which container shape the file satisfies. See the module note: W3 is answered on metal, and the
+/// `records` verdict is issued only when the walk it claims actually succeeds.
 struct HdrVerdict {
     kind: u8,
     ver: u8,
-    /// Layout A's declared payload length. Meaningless unless `layout == "A"`.
+    /// The header's declared `size`: payload BYTES (`words`) or payload RECORD count (`records`).
     declared: u32,
     layout: &'static str,
-    /// Payload is a whole number of big-endian 32-bit words under the chosen layout (§S4).
-    words_ok: bool,
+    /// Records actually walked. Zero unless `layout == "records"`.
+    records: u32,
+    /// The payload satisfies its layout's shape rule (whole be32 words, or a clean count-matching
+    /// record walk).
+    stream_ok: bool,
+}
+
+/// Walk a record-stream payload: `be16 offset` (bit 15 = 32-bit value) then `be16`/`be32` value.
+/// Returns the record count iff the walk consumes the payload exactly; a trailing fragment is a
+/// refusal, not a truncation.
+fn walk_records(payload: &[u8]) -> Option<u32> {
+    let mut off = 0usize;
+    let mut recs: u32 = 0;
+    while off < payload.len() {
+        if off + 2 > payload.len() {
+            return None;
+        }
+        let osz = u16::from_be_bytes([payload[off], payload[off + 1]]);
+        let need = 2 + if osz & REC_FLAG_32BIT != 0 { 4 } else { 2 };
+        if off + need > payload.len() {
+            return None;
+        }
+        off += need;
+        recs += 1;
+    }
+    Some(recs)
 }
 
 fn classify_header(data: &[u8]) -> HdrVerdict {
     if data.len() < 8 {
-        return HdrVerdict { kind: 0, ver: 0, declared: 0, layout: "shorter-than-header", words_ok: false };
+        return HdrVerdict { kind: 0, ver: 0, declared: 0, layout: "shorter-than-header", records: 0, stream_ok: false };
     }
     let kind = data[0];
     let ver = data[1];
     let declared = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-    let len = data.len() as u64;
-    // Layout A: 8-byte header carrying an explicit big-endian payload length.
-    if declared as u64 == len - 8 {
-        return HdrVerdict { kind, ver, declared, layout: "A", words_ok: (len - 8) % 4 == 0 };
+    let payload = &data[8..];
+    match kind {
+        // Word-stream: `size` is the payload byte count and the payload is whole be32 words.
+        HDR_TYPE_WORDS => {
+            let ok = declared as usize == payload.len() && payload.len() % 4 == 0;
+            HdrVerdict { kind, ver, declared, layout: "words", records: 0, stream_ok: ok }
+        }
+        // Record-stream: `size` is the record count; verify by walking, never by arithmetic alone.
+        HDR_TYPE_RECORDS => match walk_records(payload) {
+            Some(recs) => {
+                let ok = recs == declared;
+                HdrVerdict { kind, ver, declared, layout: "records", records: recs, stream_ok: ok }
+            }
+            None => HdrVerdict { kind, ver, declared, layout: "records", records: 0, stream_ok: false },
+        },
+        _ => HdrVerdict { kind, ver, declared, layout: "unrecognized", records: 0, stream_ok: false },
     }
-    // Layout B: 4-byte header, payload length implied by the file size.
-    if (len - 4) % 4 == 0 {
-        return HdrVerdict { kind, ver, declared, layout: "B", words_ok: true };
-    }
-    HdrVerdict { kind, ver, declared, layout: "unrecognized", words_ok: false }
 }
 
 /// Human-readable description of the names searched for one role, built from the spec so the message
@@ -409,9 +457,9 @@ fn stage_role(fs: &FatFs, root: &[DirEntry], spec: &FwSpec, vol: &str) -> RoleRe
             let digest = fnv1a32(&data);
             let len = data.len();
             serial_println!(
-                ":: wifi: {} STAGED {} bytes={} on {} fnv1a={:#010x} hdr={} type={:#04x} ver={:#04x} declared={} words={} ::",
-                spec.role, path, len, vol, digest, v.layout, v.kind, v.ver, v.declared,
-                if v.words_ok { "ok" } else { "not-32bit-aligned" },
+                ":: wifi: {} STAGED {} bytes={} on {} fnv1a={:#010x} hdr={} type={:#04x} ver={:#04x} declared={} records={} stream={} ::",
+                spec.role, path, len, vol, digest, v.layout, v.kind, v.ver, v.declared, v.records,
+                if v.stream_ok { "ok" } else { "violates-layout" },
             );
             STAGED.lock().push(StagedImage { role: spec.role, path, bytes: data, digest });
             return RoleResult::Staged;

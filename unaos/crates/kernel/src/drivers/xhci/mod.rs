@@ -949,6 +949,16 @@ static FTDI_PUMP_PEAK: AtomicU64 = AtomicU64::new(0);
 static FTDI_PUMP_COUNT: AtomicU64 = AtomicU64::new(0);
 /// FTDI TX pump waits that hit the wall-clock deadline.
 static FTDI_PUMP_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+/// PTBURST — device-service passes that left the console drain with the capture ring still non-empty
+/// because the pass had spent [`Controller::FTDI_DRAIN_SLICE_MS`] (see [`Controller::drain_ftdi`]).
+///
+/// The falsifiable half of the bound. Zero over a whole boot means the console never once had more
+/// backlog than one slice could carry, i.e. the bound never bound and the pointer path was never
+/// waiting on it; a rising count means it DID bind, and each increment is one device-service pass —
+/// one EHCI HID re-arm — that happened when it would otherwise have been deferred behind the rest of
+/// a burst. Read on `[uvug10]`-class captures beside `EHCIDARK`, which measures the other end of the
+/// same mechanism.
+static FTDI_SLICE_YIELDS: AtomicU64 = AtomicU64::new(0);
 /// The peak last PRINTED as a `:: FTDI: … result=OK ::` witness — the doubling throttle's reference.
 static FTDI_PUMP_REPORTED: AtomicU64 = AtomicU64::new(0);
 
@@ -12363,10 +12373,66 @@ impl XhciController {
         self.drain_ftdi();
     }
 
-    /// Drain the FTDI boot-capture ring out the console's bulk-OUT endpoint, ≤512 B per transfer,
-    /// until the ring is empty. Bounded + non-blocking by construction: any timeout / non-success
-    /// completion turns the sink OFF permanently and drops all further output — the kernel must never
-    /// wedge on console TX.
+    /// PTBURST — bytes staged into ONE bulk-OUT transfer. **64, the FT232's full-speed bulk max packet
+    /// size: one wire packet per transfer, so a single transfer can never cost more than one packet's
+    /// worth of line time.** It used to be 512.
+    ///
+    /// The chunk is a LATENCY bound, not a throughput one, and the distinction is the whole of
+    /// PTBURST. `ftdi_tx_stage` AWAITS its completion ([`Controller::pump_until_ftdi_done`]), and the
+    /// FT232 completes a bulk-OUT only once its ~128-byte TX FIFO has room — which, on a console
+    /// running flat out, means at the 115200 line rate of 11.52 bytes/ms. A 512-byte transfer into a
+    /// saturated FIFO therefore parks the ENTIRE device-service pass for ~33 ms; 64 bytes caps that at
+    /// ~5.6 ms, which is under the rMBP trackpad's own 8 ms report period. Throughput is unchanged
+    /// because the wire, not the transfer count, is the bottleneck — the same bytes leave in the same
+    /// milliseconds, in more and smaller pieces.
+    const FTDI_TX_CHUNK: usize = 64;
+
+    /// PTBURST — the most wall-clock ONE device-service pass may spend inside the console drain.
+    ///
+    /// 4 ms, chosen against the thing it protects rather than tuned: the internal trackpad reports
+    /// every 8 ms, so a pass that returns within 4 ms re-arms the interrupt endpoint at least once per
+    /// report period even while the console is running at full line rate.
+    ///
+    /// It costs the console NOTHING in the steady state and nothing at boot either. When the FT232's
+    /// FIFO has room a 64-byte transfer completes in microseconds, so a boot replaying tens of
+    /// kilobytes still moves thousands of bytes per pass and remains limited by the cable exactly as
+    /// before; the slice only binds once the FIFO is full, and at that point the ring is draining at
+    /// 11.52 bytes/ms no matter how long this function is allowed to sit here.
+    const FTDI_DRAIN_SLICE_MS: u64 = 4;
+
+    /// Drain the FTDI boot-capture ring out the console's bulk-OUT endpoint,
+    /// ≤[`Self::FTDI_TX_CHUNK`] B per transfer and ≤[`Self::FTDI_DRAIN_SLICE_MS`] of wall clock per
+    /// call, until the ring is empty. Bounded + non-blocking by construction: any timeout /
+    /// non-success completion turns the sink OFF permanently and drops all further output — the kernel
+    /// must never wedge on console TX.
+    ///
+    /// ### PTBURST — **the console was starving the pointer, one service pass at a time**
+    ///
+    /// This function is called from `x86_usb_pump`, the single-threaded x86 device-service pass, and
+    /// it used to drain "until the ring is empty" in 512-byte awaited transfers. `service_ehci_hid()`
+    /// — the internal keyboard and trackpad — runs LATER IN THE SAME PASS. So every character the
+    /// kernel printed delayed the next poll of the trackpad by that character's time on the wire, and
+    /// a ~1 kB witness burst (a drag release emits `[dragrel]` + `[wm-act]` + `[drag]` + `[drag-occ]`
+    /// + `[dropwake]`) held the whole pass for ~87 ms.
+    ///
+    /// **The EHCI interrupt endpoint holds exactly ONE report and cannot hold more on this silicon**
+    /// (`mps=64` against 8-byte Report ID 0x02 reports: every report is a SHORT packet and retires the
+    /// qTD), so for those ~87 ms the endpoint was DARK — the pad kept generating reports every 8 ms
+    /// and they were dropped on the wire, uncounted. That is what EHCIDARK in `drivers/ehci` now
+    /// measures, and this bound is what it is measuring the effect of.
+    ///
+    /// **What was traded, and what was deliberately NOT.** The bound costs no console throughput (see
+    /// [`Self::FTDI_DRAIN_SLICE_MS`]) and buys a per-pass stall an order of magnitude shorter. What is
+    /// NOT changed is the ORDER of the pass: `service_ftdi` still runs ahead of `service_ehci_hid`,
+    /// i.e. BOOTPACE M2's console-first rule stands. Inverting them would save the report already
+    /// sitting in the endpoint one drain-slice of delivery latency — at most 4 ms once the bound is in
+    /// place, half a report period — while putting the console behind a call that can spend a whole
+    /// `hw_wait_budget()` (~2 s) inside one control transfer on a stalled EP0 (the KBDFLAP
+    /// `ClearFeature` and the lock-LED `SET_REPORT` paths). Two seconds of console blackout, at the
+    /// exact moment an attended bench sitting most needs the log, is not worth 4 ms of pointer
+    /// latency. The darkness itself is unaffected by the order either way: the endpoint is re-armed
+    /// once per pass wherever in the pass that happens, so it is the pass PERIOD that sets the dark
+    /// window — which is precisely what this bound shortens.
     fn drain_ftdi(&mut self) {
         if !ftdi::is_live() {
             return;
@@ -12388,11 +12454,19 @@ impl XhciController {
         }
         let out_dci = (out_ep & 0x0F) * 2;
 
+        // PTBURST — the slice clock, and the flag that keeps the `-> PASS` announcement below honest.
+        // The loop now has TWO exits and only one of them means "the backlog is gone"; a pass that
+        // simply ran out of its slice must not claim the mirror caught up.
+        let slice_t0 = crate::arch::ms();
+        let mut ring_emptied = false;
+
         loop {
-            // Stage up to 512 B of the oldest ring bytes into the FTDI slot's DMA buffer (reused as
-            // the TX staging buffer — the FTDI slot never runs BOT, so its `scsi_data_buffer` is free).
-            let n = unsafe { ftdi::drain_into(data_phys as *mut u8, 512) };
+            // Stage up to `FTDI_TX_CHUNK` B of the oldest ring bytes into the FTDI slot's DMA buffer
+            // (reused as the TX staging buffer — the FTDI slot never runs BOT, so its
+            // `scsi_data_buffer` is free).
+            let n = unsafe { ftdi::drain_into(data_phys as *mut u8, Self::FTDI_TX_CHUNK) };
             if n == 0 {
+                ring_emptied = true;
                 break; // ring drained
             }
             // SPACE: charge this awaited bulk-OUT to the console ONLY while a storage bring-up is
@@ -12421,6 +12495,22 @@ impl XhciController {
                     return;
                 }
             }
+            // PTBURST — the slice, checked AFTER the transfer rather than before it, so this loop
+            // always makes at least one packet of progress per pass. A pass that has spent its slice
+            // leaves the rest of the ring for the next one: the bytes are not lost, they are queued in
+            // a 256 KiB drop-oldest ring, and the wire could not have carried them any sooner anyway.
+            if crate::arch::ms().wrapping_sub(slice_t0) >= Self::FTDI_DRAIN_SLICE_MS {
+                FTDI_SLICE_YIELDS.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+        }
+        // PTBURST — and the announcement below is gated on the RING-EMPTY exit, not merely on having
+        // pushed a byte. Before the slice existed the loop had one exit and the two were the same
+        // thing; now a first pass that pushes 64 bytes and yields would otherwise print
+        // `-> PASS (64 boot bytes replayed)` in the middle of a 65 kB replay, turning the gate's
+        // conservation line into a number that means nothing.
+        if !ring_emptied {
+            return;
         }
         // First clean empty of the backlog: announce the mirror is live. The PASS line itself enters
         // the ring and rides the NEXT drain — that is expected, and is the gate's proof the sink stays
@@ -12522,10 +12612,16 @@ impl XhciController {
         let reported = FTDI_PUMP_REPORTED.load(Ordering::Relaxed);
         if used >= reported.saturating_mul(2).max(1) {
             FTDI_PUMP_REPORTED.store(used, Ordering::Relaxed);
+            // PTBURST — `yields=` rides this line rather than getting one of its own, because it is
+            // the same question read from the other side: `used=` is how long ONE transfer waited on
+            // the cable, `yields=` is how many device-service passes handed the rest of the backlog
+            // to the next pass rather than sitting here for it. The throttle above is log-scale, so
+            // adding a field costs nothing at boot and the LAST such line carries the final count.
             serial_println!(
-                ":: FTDI: tx pump budget={} used={} n={} timeouts={} result=OK ::",
+                ":: FTDI: tx pump budget={} used={} n={} timeouts={} yields={} result=OK ::",
                 budget, used, FTDI_PUMP_COUNT.load(Ordering::Relaxed),
-                FTDI_PUMP_TIMEOUTS.load(Ordering::Relaxed));
+                FTDI_PUMP_TIMEOUTS.load(Ordering::Relaxed),
+                FTDI_SLICE_YIELDS.load(Ordering::Relaxed));
         }
     }
 

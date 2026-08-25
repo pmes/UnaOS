@@ -1087,7 +1087,37 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // takeover, no fbcon detach) and run the full main-loop USB path, printing each input event.
     // So external USB storage/keyboard/mouse enumeration AND live input are visible + photographable
     // on metal. (Net service is intentionally skipped here so a non-e1000 NIC isn't poked.)
-    #[cfg(feature = "usbdebug")]
+    //
+    // USBDBG-INVERT — **THIS BLOCK IS NO LONGER THE TERMINAL STATE OF AN x86 DESKTOP BUILD**, and the
+    // cfg above is where that inversion is spelled. Peter's ruling (2026-08-19): *a diagnosis card
+    // must be THE REAL DESKTOP plus instruments, not a parallel half-desktop.* The evidence is three
+    // patches deep and each one only bought back a piece of the desktop this loop had replaced —
+    // USBDBG-CURSOR gave it an arrow, USBDBG-ROUTE gave it clicks, and metal boot 6 then found the
+    // shell window greyed and dead because the console SERVICE lives in the GUI loop this loop never
+    // reaches. There is no end to that list: it is the whole of `x86_render_service`, re-implemented
+    // one incident at a time. So on `x86_64` + `wc` the block is COMPILED OUT and the boot proceeds
+    // into the ordinary GUI takeover — the same SCHED-X86 handoff a non-usbdebug build takes — with
+    // the debug capabilities riding INSIDE it behind the knob:
+    //
+    //   * the per-pass services this loop uniquely ran now have a home on the normal path (see the
+    //     service-mapping notes at `x86_usb_pump`; every one of them was already there except the
+    //     boot-milestone re-dump, whose gate this arc widened to `witness OR usbdebug`);
+    //   * the `USB-DEBUG:` event lines ride the real drains — `usbdebug_event_print` is called from
+    //     `x86_render_service` and from the inline BSP GUI loop, keyed on the RAW report and printed
+    //     BEFORE routing, so the card prints AND routes rather than printing INSTEAD of routing;
+    //   * the `PTR:` press witnesses were never this loop's: they print from inside the EHCI HID
+    //     service (`drivers/ehci`), which every x86 path polls, so they are loop-independent;
+    //   * `USBDBG-INVERT` itself prints at the GUI takeover, so the wire names the regime.
+    //
+    // WHAT STILL COMPILES THIS BLOCK, and why the gate is the BUILD and not `wcx::is_active()`:
+    // `usbdebug` WITHOUT `wc` (the knob's original purpose — pre-GUI bring-up on a card with no
+    // compositor at all) and every aarch64 usbdebug build. Those regimes keep the print-only view
+    // BYTE-FOR-BYTE, which is why the loop body below is otherwise untouched. A runtime gate was
+    // considered and rejected: `wcx::activate` has exactly one caller (the Kepler takeover), so a
+    // runtime test would make QEMU — where no Kepler exists — take the terminal loop, and the
+    // inversion's own falsifier is a headless `UNAOS_USBDEBUG=1 UNAOS_WC=1` run reaching the GUI
+    // selftests. A build that asks for the desktop gets the desktop, on metal and in QEMU alike.
+    #[cfg(all(feature = "usbdebug", not(all(target_arch = "x86_64", feature = "wc"))))]
     {
         // VPERF M3: attach fbcon's cached-RAM shadow at the post-heap seam. From here the console
         // scrolls in cached RAM and the framebuffer only receives write-only blits — the
@@ -1142,6 +1172,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }
             // Once storage is up, mount + log the FAT volume geometry (one-shot).
             unaos_kernel::fs::fat::probe_once();
+            // BT-BOND M1 (holocron knob): the classed-record store's whole main-loop presence — one call,
+            // here, beside `probe_once` and for the same reason that one is here rather than in a driver: the
+            // deferred write MUST run with no driver lock held. The Bluetooth chain that produces the record
+            // this store exists for runs inside `service_ehci_hid()` holding `EHCI_HID`, and the writable FAT
+            // volume rides USB mass storage serviced from that same pass — so a filesystem write issued from
+            // in there would contend the xHCI storage loan from inside the EHCI service pass AND hold the
+            // internal keyboard and trackpad hostage for its duration. The producer marks RAM dirty under the
+            // lock; THIS call site does the I/O. `flush_if_dirty` re-checks that invariant rather than trusting
+            // the placement (it DEFERS while `EHCI_HID` is busy — it does not refuse; see HCR1), so a call site that gets it wrong
+            // goes loud instead of wedging. One-shot inside: the pure fixtures fire on the first pass, the load
+            // latches once storage is up, and the flush costs a relaxed atomic load per iteration thereafter.
+            // Like `fatverb_storage_witness`, it sits at ALL THREE storage-ready passes this file carries,
+            // because which pass a given build reaches depends on its knobs.
+            #[cfg(feature = "holocron")]
+            unaos_kernel::fs::holocron::service();
             // SELFHOST-2 (x86, selfhost knob): verify the medium's own SRC.TGZ against SRC.SHA and
             // walk the tar, one-shot. It belongs beside `probe_once` for the same reason that one
             // does: it needs storage up and the volume lock free. Read-only throughout. Like the
@@ -1235,6 +1280,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // settles on the scenario tail (what the DONE-gate screendump compares).
             #[cfg(all(target_arch = "x86_64", feature = "videobench"))]
             unaos_kernel::video::vperf::scenario_tick();
+            // USBDBG-INVERT postscript — the drain of the PRESERVED regime, and it is a VIEWER
+            // again, nothing more. USBDBG-ROUTE's `usbdebug_route`/`usbdebug_route_tail` and
+            // USBDBG-CURSOR's `usbdebug_cursor_service` stood exactly here; all three were compiled
+            // only under `usbdebug` + `wc` + `x86_64`, which is precisely the regime the inversion
+            // moved onto the real desktop, so their call sites (and the helpers, and the auto-hide
+            // edge that partnered the cursor service) are gone with them. On the path that still
+            // compiles this loop there is no compositor to route to and no sprite to move — the
+            // three patches were runtime no-ops here already (`wcx::is_active()` is false with no
+            // Kepler takeover), so this deletion is behaviour-preserving for it.
             while let Some(event) = unaos_kernel::pal::next_event() {
                 match event {
                     unaos_kernel::pal::Event::Key(c) => {
@@ -1442,6 +1496,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // path that is proven not to allocate. Must precede the spawns.
             GUI_CHANNEL_X86.init();
 
+            // USBDBG-INVERT — the regime witness, printed at the takeover it exists to prove. Ahead
+            // of the detach below, so the line also lands on the panel of a serial-less diagnosis
+            // card. A no-op line on every build without the knob (the whole fn is cfg'd out).
+            #[cfg(all(feature = "usbdebug", feature = "wc"))]
+            usbdebug_invert_witness();
             // The handoff milestones, replicated from below in their existing order and fired BEFORE
             // any task can paint. HANDOFF-CLEAN: record + detach strictly before the first console
             // frame, so the milestone's on-panel leg draws on the PRE-GUI panel and nothing paints
@@ -1521,6 +1580,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // "flash of text that garbles the prompt" Peter saw at the end of boot). Now the milestone
     // paints on the pre-GUI panel, detach flips GUI_ACTIVE, and NOTHING may paint behind the GUI
     // after this point (a panic still re-attaches).
+    //
+    // USBDBG-INVERT — the regime witness on the OTHER x86 takeover: this inline path is what a card
+    // with fewer than two dispatching APs falls into, and a diagnosis card is exactly the kind of
+    // machine that can land here, so the line must not be exclusive to the scheduled handoff.
+    #[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+    usbdebug_invert_witness();
     unaos_kernel::bootlog::record("gui:handoff");
     // BPACE: the desktop-up number — the one the operator's stopwatch has been approximating. Every
     // trim this arc's successor considers is measured against `gui=` on the total line.
@@ -1576,6 +1641,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // Once storage is up, mount + log the FAT volume geometry (one-shot). Runs with the xHCI
         // lock released; read_block re-locks it briefly, so there is no nested-lock hazard.
         unaos_kernel::fs::fat::probe_once();
+        // BT-BOND M1 (holocron knob): the classed-record store's whole main-loop presence — one call,
+        // here, beside `probe_once` and for the same reason that one is here rather than in a driver: the
+        // deferred write MUST run with no driver lock held. The Bluetooth chain that produces the record
+        // this store exists for runs inside `service_ehci_hid()` holding `EHCI_HID`, and the writable FAT
+        // volume rides USB mass storage serviced from that same pass — so a filesystem write issued from
+        // in there would contend the xHCI storage loan from inside the EHCI service pass AND hold the
+        // internal keyboard and trackpad hostage for its duration. The producer marks RAM dirty under the
+        // lock; THIS call site does the I/O. `flush_if_dirty` re-checks that invariant rather than trusting
+        // the placement (it DEFERS while `EHCI_HID` is busy — it does not refuse; see HCR1), so a call site that gets it wrong
+        // goes loud instead of wedging. One-shot inside: the pure fixtures fire on the first pass, the load
+        // latches once storage is up, and the flush costs a relaxed atomic load per iteration thereafter.
+        // Like `fatverb_storage_witness`, it sits at ALL THREE storage-ready passes this file carries,
+        // because which pass a given build reaches depends on its knobs.
+        #[cfg(feature = "holocron")]
+        unaos_kernel::fs::holocron::service();
         // SELFHOST-2 (x86, selfhost knob): the source-verify + tar walk, one-shot — see the note at
         // the first loop site. This is the pass a headless `test`/`test-fat` boot reaches.
         #[cfg(all(target_arch = "x86_64", feature = "selfhost"))]
@@ -1609,7 +1689,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // land from inside this loop — verifiable in serial.log without keyboard input, the M3 proof
         // path. Absent from a real metal GUI build (not witness); there the `bootlog` shell verb reads
         // the same ring on-panel. Serial-only + bounded (one print per new milestone).
-        #[cfg(feature = "witness")]
+        // USBDBG-INVERT: `usbdebug` joins the gate here for the reason the scheduled pump's copy
+        // gives — the terminal loop called this UNGATED, and an inverted card that falls into this
+        // inline loop (fewer than two dispatching APs) must not lose the M3 proof path either.
+        #[cfg(any(feature = "witness", feature = "usbdebug"))]
         unaos_kernel::bootlog::service_serial_dump();
         // BPACE: re-emit the boot-phase timing ledger whenever it grows. NOT under the `witness`
         // gate above, and that difference is the point: the media `./arroyo esp-x86` writes carries
@@ -1737,6 +1820,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             #[cfg(target_arch = "x86_64")]
             let (raw, ev) = {
                 let raw = pal.poll_event();
+                // USBDBG-INVERT — the debug view, PRINTED AND THEN ROUTED. The terminal loop this
+                // replaces printed INSTEAD of routing; here the instrument reads the raw report on
+                // its way past and consumes nothing, so a `usbdebug` card and a stock card route
+                // identically. Compiled out without the knob.
+                #[cfg(all(feature = "usbdebug", feature = "wc"))]
+                usbdebug_event_print(raw);
                 (raw, unaos_kernel::arch::x86_64::syscall::wc_route_event(raw))
             };
             #[cfg(not(target_arch = "x86_64"))]
@@ -2950,6 +3039,41 @@ fn gui_send_x86(ev: unaos_kernel::pal::Event) {
     GUI_CHANNEL_X86.send(ev);
 }
 
+/// PTRCH — relative-motion events SUMMED into the event in front of them by the render service's
+/// drain rather than dispatched on their own (see the fold in `x86_render_service`).
+///
+/// Deliberately NOT subtracted from `GUI_RECV_X86`, and for the same conservation reason PTRDEAD
+/// keeps `EVQ_COALESCE_PTR` out of `EVQ_PUSH_PTR`: `sent - recv` is read as the channel's LIVE
+/// OCCUPANCY, and a folded event HAS left the channel, so it must be counted as received. This is a
+/// separate term describing what the consumer then did with it — and a nonzero reading is the
+/// operator's answer to "did the render core fall behind the pad": it is the count of reports the
+/// arrow was handed all at once instead of walking.
+#[cfg(target_arch = "x86_64")]
+static GUI_FOLD_X86: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// PTRCH — take one event OFF `GUI_CHANNEL_X86` without parking, charge the depth ledger, and show it
+/// to the `usbdebug` witness. The single non-blocking choke point, so `GUI_RECV_X86` can never
+/// disagree with the real receive count and no path can pull an event past the instrument.
+#[cfg(target_arch = "x86_64")]
+fn gui_try_recv_x86() -> Option<unaos_kernel::pal::Event> {
+    let ev = GUI_CHANNEL_X86.try_recv()?;
+    GUI_RECV_X86.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    #[cfg(all(feature = "usbdebug", feature = "wc"))]
+    usbdebug_event_print(ev);
+    Some(ev)
+}
+
+/// PTRCH — the blocking twin of [`gui_try_recv_x86`]: park until an event arrives, then charge the
+/// same ledger and show it to the same witness.
+#[cfg(target_arch = "x86_64")]
+fn gui_recv_blocking_x86() -> unaos_kernel::pal::Event {
+    let ev = GUI_CHANNEL_X86.recv();
+    GUI_RECV_X86.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    #[cfg(all(feature = "usbdebug", feature = "wc"))]
+    usbdebug_event_print(ev);
+    ev
+}
+
 /// One-shot guard: log "RX interrupt live" exactly once, from the input task (never the ISR).
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 static RX_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -3051,6 +3175,186 @@ static CLICK2_LEFT_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::
 fn gui_send(ev: unaos_kernel::pal::Event) {
     GUI_SENT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     GUI_CHANNEL.send(ev);
+}
+
+/// USBDBG-INVERT — the one line that names the regime on the wire, printed at the x86 GUI takeover.
+///
+/// THE CLAIM IT MAKES. This build carries `usbdebug` AND `wc`, and it did NOT stop in the terminal
+/// bring-up loop: it is handing the panel to the ordinary desktop with the debug instruments riding
+/// inside it. That is the whole content of the inversion, so it is one literal line, emitted from the
+/// same seam that records `gui:handoff` — the last moment before `fbcon::detach` — and therefore
+/// visible on the panel of a serial-less metal card as well as in a headless capture. It is the
+/// SPIRIT of the retired `USBDBG-CURSOR: ... ARMED` / `USBDBG-ROUTE: ... ARMED` witnesses, which
+/// existed to prove from the wire that a debug card had a working pointer and working clicks: those
+/// two facts are no longer this build's to prove, because on the inverted path they are the desktop's
+/// own (`x86_render_service` moves the sprite and `wc_route_event` routes the click for every x86
+/// build alike). What IS this build's to prove is that it reached that desktop at all.
+///
+/// Latched, so a boot that somehow crossed the seam twice still prints once, and cheap: one relaxed
+/// swap on the single takeover pass.
+#[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+fn usbdebug_invert_witness() {
+    static PRINTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if !PRINTED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        serial_println!(
+            ":: USBDBG-INVERT: debug instruments riding the real desktop == witness ::"
+        );
+    }
+}
+
+/// USBDBG-INVERT — the `USB-DEBUG:` event view, relocated from the terminal loop onto the drains the
+/// real desktop actually runs (`x86_render_service`, and the inline BSP GUI loop taken when fewer
+/// than two APs came online).
+///
+/// PRINT **AND** ROUTE, IN THAT ORDER, KEYED ON THE RAW REPORT. The old loop printed instead of
+/// routing, which is the defect Peter's ruling names; here the call sits ahead of `wc_route_event` and
+/// consumes nothing, so the event goes on to be routed exactly as it is on a build without the knob.
+/// Keying on the RAW report rather than the routed outcome is what keeps the instrument HONEST: a
+/// report consumed into a focused ring-3 window's ring comes back `Event::Unknown`, so a routed-keyed
+/// print would fall silent for precisely the input that is working — the operator would read "no
+/// events" off a card whose events are being delivered. Raw is what the hardware sent, which is the
+/// question a bring-up card is asked.
+///
+/// `Event::Button` is printed here and was NOT printed by the loop this replaces — the loop's `match`
+/// dropped presses into `_ => {}`, which is the hole USBDBG-ROUTE was chasing on boot 5. A card whose
+/// clicks are the thing under investigation should say so on the wire.
+///
+/// The KEY / MOUSE line formats are carried over verbatim, so every eye and every `awk` that reads a
+/// diagnosis capture keeps working across the inversion.
+///
+/// ### PTRWIT — **the pointer witness had become the biggest thing on the wire, and it was starving
+/// the pointer it was watching.**
+///
+/// Measured, boot 10 of `rmbp2-boot8` (the `UNAOS_USBDEBUG=1` desktop Peter flies): `USB-DEBUG: MOUSE
+/// relative …` appeared 2456 times for **121,164 bytes — 20.8 % of the entire boot's serial output,
+/// the single largest producer in the capture, ahead of `[wc-h] rollup` at 98 kB.** Mean line length
+/// with the `logts` prefix and the newline: **49.33 bytes**, i.e. **4.28 ms of 115200-baud line time
+/// per pointer report**. The pad's own cadence in that same slice is 8 ms flat (p50 gap = 8 ms), so
+/// **over half of every pointer interval was spent printing the pointer** — and the witness therefore
+/// could not keep up with the thing it existed to witness: 6.2 kB/s of pointer text against an 11.5
+/// kB/s wire, before a single other subsystem printed anything.
+///
+/// That is not an instrument observing a system, it is an instrument loading it. The standing ruling
+/// is that a diagnosis card runs the REAL desktop, which makes the witness's cost part of the
+/// desktop's behaviour — so the cost has to come down without the diagnosis going away.
+///
+/// ### What replaces it, and what it still answers
+///  * **The first [`USBDBG_PTR_VERBATIM`] relative reports of the boot print in the OLD FORMAT, byte
+///    for byte.** That is the bring-up question — "did a real report arrive, and what did it say" —
+///    and it is asked once per boot, not 125 times a second. Every `awk` written against
+///    `USB-DEBUG: MOUSE relative dx=` keeps matching.
+///  * **After that, motion FOLDS into a rollup** emitted at most every [`USBDBG_PTR_ROLLUP_MS`], and
+///    flushed immediately ahead of any non-motion event so the wire stays chronological: a drag reads
+///    `MOUSE rel n=… ` then `BUTTON mask=0x00` in that order, which is what makes a gesture legible.
+///    The rollup carries the two facts the steady state is actually read for — **how many reports
+///    arrived and over what span** (i.e. the cadence, which is where a dead zone shows up) — plus the
+///    summed travel, which is exactly what the queue would have folded anyway (`pal`'s PTRDEAD).
+///  * `Event::Timer` — the input service's 250 ms pulse — lands in the `_` arm and flushes, so the
+///    LAST rollup of a gesture reaches the wire promptly instead of waiting for the next motion. The
+///    pulse rate and the rollup rate are the same 250 ms by construction, not by coincidence.
+///
+/// KEY, BUTTON and absolute-motion lines are untouched and stay per-event: they are human-rate
+/// (a keystroke, a click, a QEMU tablet report), they are never the amplifier, and they are the lines
+/// a bring-up card is read for.
+///
+/// **The arithmetic.** 49.33 bytes/report -> one 64-byte rollup per 250 ms, i.e. 2.05 bytes/report at
+/// the pad's 125 Hz: **4.28 ms -> 0.18 ms of line time per report, a 24x reduction**, and the pointer
+/// path's steady-state share of the wire drops from 54 % of the report interval to 2.2 %.
+#[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+fn usbdebug_event_print(raw: unaos_kernel::pal::Event) {
+    use core::sync::atomic::Ordering::Relaxed;
+    match raw {
+        unaos_kernel::pal::Event::Key(c) => {
+            usbdebug_ptr_rollup_flush();
+            let ch = c as char;
+            serial_println!("USB-DEBUG: KEY {:#04x} '{}'", c, if c >= 32 && c < 127 { ch } else { '.' });
+        }
+        unaos_kernel::pal::Event::Mouse { x, y } => {
+            // The bounded verbatim prologue: the old line, unchanged, for the first reports of the
+            // boot. `fetch_add` on a saturating compare rather than a swap so the two mutually
+            // exclusive drains (the render service and the inline BSP loop) share one budget.
+            if PTR_VERBATIM_SEEN.load(Relaxed) < USBDBG_PTR_VERBATIM {
+                PTR_VERBATIM_SEEN.fetch_add(1, Relaxed);
+                serial_println!("USB-DEBUG: MOUSE relative dx={} dy={}", x, y);
+                return;
+            }
+            let now = unaos_kernel::arch::ms();
+            if PTR_ROLL_N.fetch_add(1, Relaxed) == 0 {
+                PTR_ROLL_FIRST_MS.store(now, Relaxed);
+            }
+            PTR_ROLL_DX.fetch_add(x as i64, Relaxed);
+            PTR_ROLL_DY.fetch_add(y as i64, Relaxed);
+            if now.wrapping_sub(PTR_ROLL_FIRST_MS.load(Relaxed)) >= USBDBG_PTR_ROLLUP_MS {
+                usbdebug_ptr_rollup_flush();
+            }
+        }
+        unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
+            usbdebug_ptr_rollup_flush();
+            serial_println!("USB-DEBUG: MOUSE absolute x={} y={}", x, y);
+        }
+        unaos_kernel::pal::Event::Button(mask) => {
+            usbdebug_ptr_rollup_flush();
+            serial_println!("USB-DEBUG: BUTTON mask={:#04x}", mask);
+        }
+        // `Event::None` is the inline BSP drain's END-OF-QUEUE SENTINEL, not an event — `pal.poll_event()`
+        // hands it back once per frame with nothing behind it. It must NOT flush: on that drain a
+        // flush-on-None would fire once per FRAME, turning a 250 ms rollup into a 60 Hz one and giving
+        // back most of what PTRWIT just saved. It is also the one variant here that is not a report.
+        unaos_kernel::pal::Event::None => {}
+        // Timer (the 250 ms pulse), KeyUp, Unknown — real reports with nothing of their own to print,
+        // and the seam that gets the tail of a gesture onto the wire while the hand is still.
+        _ => usbdebug_ptr_rollup_flush(),
+    }
+}
+
+/// PTRWIT — relative motion reports printed VERBATIM, in the pre-rollup format, before the fold
+/// starts. One per report is affordable exactly once per boot; it is the steady state that is not.
+#[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+const USBDBG_PTR_VERBATIM: u32 = 16;
+
+/// PTRWIT — the rollup's minimum spacing. 250 ms, which is [`X86_GUI_PULSE_MS`]: the input service
+/// already posts an `Event::Timer` at that cadence and that Timer flushes this rollup, so a second,
+/// different period here would only ever produce a ragged line rate.
+#[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+const USBDBG_PTR_ROLLUP_MS: u64 = X86_GUI_PULSE_MS;
+
+/// PTRWIT — reports the verbatim prologue has spent (see [`USBDBG_PTR_VERBATIM`]).
+#[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+static PTR_VERBATIM_SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// PTRWIT — relative reports folded into the pending rollup. 0 = nothing pending, and the flush is
+/// a single relaxed load on every event that is not motion.
+#[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+static PTR_ROLL_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// PTRWIT — summed dx / dy of the pending rollup. `i64` because the sum is unbounded in principle and
+/// a wrapped total would read as travel in the wrong direction.
+#[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+static PTR_ROLL_DX: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+static PTR_ROLL_DY: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+/// PTRWIT — `ms()` of the FIRST report folded into the pending rollup, so the line's `span=` is the
+/// real interval those reports arrived over and `n/span` is the pad's measured cadence.
+#[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+static PTR_ROLL_FIRST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// PTRWIT — emit the pending relative-motion rollup, if there is one, and reset it.
+///
+/// Idempotent and free when nothing is pending (one relaxed load), which is what lets it be called
+/// unconditionally from every non-motion arm — the ordering guarantee ("the rollup is always on the
+/// wire AHEAD of the edge that ended it") is worth more than the branch it costs.
+#[cfg(all(target_arch = "x86_64", feature = "usbdebug", feature = "wc"))]
+fn usbdebug_ptr_rollup_flush() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let n = PTR_ROLL_N.swap(0, Relaxed);
+    if n == 0 {
+        return;
+    }
+    let dx = PTR_ROLL_DX.swap(0, Relaxed);
+    let dy = PTR_ROLL_DY.swap(0, Relaxed);
+    let span = unaos_kernel::arch::ms().wrapping_sub(PTR_ROLL_FIRST_MS.load(Relaxed));
+    serial_println!(
+        "USB-DEBUG: MOUSE rel n={} dx={} dy={} span={}ms",
+        n, dx, dy, span
+    );
 }
 
 /// SERIAL-FOCUS — at most ONE wake token from the serial console is outstanding in `GUI_CHANNEL` at
@@ -5320,6 +5624,21 @@ fn x86_usb_pump(cpu: usize) {
         // Once storage is up, mount + log the FAT volume geometry (one-shot). Runs with the xHCI lock
         // released; `read_block` re-locks it briefly.
         unaos_kernel::fs::fat::probe_once();
+        // BT-BOND M1 (holocron knob): the classed-record store's whole main-loop presence — one call,
+        // here, beside `probe_once` and for the same reason that one is here rather than in a driver: the
+        // deferred write MUST run with no driver lock held. The Bluetooth chain that produces the record
+        // this store exists for runs inside `service_ehci_hid()` holding `EHCI_HID`, and the writable FAT
+        // volume rides USB mass storage serviced from that same pass — so a filesystem write issued from
+        // in there would contend the xHCI storage loan from inside the EHCI service pass AND hold the
+        // internal keyboard and trackpad hostage for its duration. The producer marks RAM dirty under the
+        // lock; THIS call site does the I/O. `flush_if_dirty` re-checks that invariant rather than trusting
+        // the placement (it DEFERS while `EHCI_HID` is busy — it does not refuse; see HCR1), so a call site that gets it wrong
+        // goes loud instead of wedging. One-shot inside: the pure fixtures fire on the first pass, the load
+        // latches once storage is up, and the flush costs a relaxed atomic load per iteration thereafter.
+        // Like `fatverb_storage_witness`, it sits at ALL THREE storage-ready passes this file carries,
+        // because which pass a given build reaches depends on its knobs.
+        #[cfg(feature = "holocron")]
+        unaos_kernel::fs::holocron::service();
         // SELFHOST-2 (x86, selfhost knob): the source-verify + tar walk, one-shot — see the note at
         // the first loop site. This is the pass the GUI/desktop boot reaches, i.e. the metal boot.
         #[cfg(all(target_arch = "x86_64", feature = "selfhost"))]
@@ -5352,7 +5671,13 @@ fn x86_usb_pump(cpu: usize) {
         #[cfg(all(target_arch = "x86_64", feature = "wifi"))]
         unaos_kernel::wifi::service();
         // GUI-WITNESS M3 (witness knob): re-dump the boot-milestone ring to serial on growth.
-        #[cfg(feature = "witness")]
+        //
+        // USBDBG-INVERT — and on `usbdebug` too, which is the ONE service the terminal loop provided
+        // that this pass did not. That loop called `service_serial_dump()` UNGATED (a bring-up card's
+        // recorder ring is half its value), so gating it on `witness` alone here would have made the
+        // inverted card quietly lose the M3 proof path the moment it stopped looping. Same call, same
+        // placement, one knob wider.
+        #[cfg(any(feature = "witness", feature = "usbdebug"))]
         unaos_kernel::bootlog::service_serial_dump();
         // BPACE: re-emit the boot-phase timing ledger whenever it grows. Deliberately NOT under the
         // witness gate — the media `./arroyo esp-x86` writes carries neither `witness` nor
@@ -5413,6 +5738,12 @@ fn x86_input_service(cpu: usize) {
     serial_println!(":: SCHED-X86: input task dispatched on core {} ::", cpu);
     let mut pulse_ms = unaos_kernel::arch::ms();
     loop {
+        // WCSER-H — the overdue probe runs FIRST, before the event pump: boot 8B proved the pump
+        // can block into a wedged GUI (zero input lines within ~100ms of the hold, and the probe's
+        // 5s repeats died with it — boot 8C, which survived one repeat, is the control). A probe
+        // behind the pump dies with the wedge it exists to report.
+        #[cfg(feature = "witness")]
+        unaos_kernel::video::wm::wcser_overdue_probe();
         if SCREEN_APP_ACTIVE.load(Ordering::Relaxed) {
             // A full-screen app owns the panel and the queue. Re-base the pulse clock so the first
             // pass after it exits does not fire a stale backlog of one Timer.
@@ -5700,10 +6031,29 @@ fn x86_render_service(cpu: usize) {
     // sprite exactly once. Driven by the input service's `Event::Timer` pulse when nothing is typed.
     let mut cursor_was_visible = false;
 
+    // PTRCH — an event this task has taken OFF the channel and has not dispatched yet: the one
+    // non-motion report the fold below had to pull in order to discover that a run of motion had
+    // ended. It is dispatched next, in its own turn and in its own order; nothing is ever dropped or
+    // reordered by carrying it here.
+    //
+    // **It lives outside BOTH loops, and that placement is the correctness of the whole fold.** The
+    // drain has early exits that are not "the channel is empty" — `handle_key` answering `true` means
+    // a command took the whole screen, and the drain stops so the rest of the burst is not painted
+    // over it before it is presented. An event held here across one of those exits is off the channel
+    // and cannot be re-read from it, so a `pending` scoped to the outer loop's BODY would be
+    // re-initialised to `None` on the next pass and the event would be gone — one keystroke or one
+    // click swallowed, nondeterministically, only on the boots where a full-screen command ran. Held
+    // out here it is instead the first thing the next pass dispatches.
+    let mut pending: Option<unaos_kernel::pal::Event> = None;
+
     loop {
-        // Block until an event arrives — an idle render core burns nothing.
-        let mut raw = GUI_CHANNEL_X86.recv();
-        GUI_RECV_X86.fetch_add(1, Ordering::Relaxed);
+        // Block until an event arrives — an idle render core burns nothing. PTRCH: unless one is
+        // already in hand, in which case parking would be a deadlock against an event we ourselves
+        // removed from the channel.
+        let mut raw = match pending.take() {
+            Some(ev) => ev,
+            None => gui_recv_blocking_x86(),
+        };
 
         // SCHED-X86 DRAIN: dispatch EVERY queued event, then present ONCE below — the dismantled
         // BSP loop's semantic, kept deliberately. Presenting per event is the regression this file
@@ -5712,6 +6062,58 @@ fn x86_render_service(cpu: usize) {
         // seconds late". A keystroke burst or one trackpad sweep queues dozens of events into the
         // 64-slot channel, and each would otherwise cost its own full present.
         loop {
+            // PTRCH — **THE CHANNEL'S OWN FOLD, and the reason PTRDEAD's is not enough on its own.**
+            //
+            // PTRDEAD folds a relative-motion backlog in `pal::EVENT_QUEUE`. That is the right place
+            // for the producer's backlog — but on the SCHED-X86 split the backlog does not sit there.
+            // `x86_input_service` runs on its own core and drains `pal::next_event()` to exhaustion
+            // every ~1 ms, so the ring is essentially always empty and there is nothing there to fold
+            // INTO; what the input service does with each event is `gui_send_x86` it into this
+            // 64-slot channel, one slot per report. So a render core stalled inside a witness burst
+            // accumulates the whole gesture HERE, as 64 separate entries, and then walks them one at
+            // a time — each costing a `wc_route_event`, a witness line and a `wc_route_tail`. Same
+            // defect, one pipe stage downstream, and the ring's fold cannot see it.
+            //
+            // The fold is PTRDEAD's, in PTRDEAD's shape, for PTRDEAD's reason: relative deltas are
+            // ADDITIVE (`cursor::move_rel` adds; `wc_drag_motion` reads the resulting ABSOLUTE
+            // position, so a folded run steers a live drag to exactly the same place), so summing a
+            // run of them changes neither the cursor's destination nor any window's.
+            //
+            // Three properties it shares with the ring's, each load-bearing:
+            //   * **it never crosses another event.** The run stops at the first non-`Event::Mouse`
+            //     the channel hands back, and that event becomes `pending` — dispatched next, in
+            //     order. So a `Button` can never end up behind motion that arrived after it, which
+            //     is the ordering GHOST-DRAG's cure is built on. In particular the release edge that
+            //     DRAGGLIDE hoisted ahead of its own lift arrives here already ahead of it, and this
+            //     fold cannot move it back: it stops AT the edge.
+            //   * **`MouseAbsolute` is never folded** — absolute positions are not additive, and the
+            //     QEMU tablet fixtures that assert an exact resting coordinate drive that variant.
+            //   * **the ledger stays exact.** `GUI_RECV_X86` is charged inside the recv helpers, so
+            //     every event pulled by the fold is counted the moment it leaves the channel and
+            //     `sent - recv` still reads as live occupancy. The fold gets its OWN term.
+            if let unaos_kernel::pal::Event::Mouse { x, y } = raw {
+                let (mut sx, mut sy) = (x, y);
+                loop {
+                    let next = match pending.take() {
+                        Some(e) => Some(e),
+                        None => gui_try_recv_x86(),
+                    };
+                    match next {
+                        Some(unaos_kernel::pal::Event::Mouse { x: nx, y: ny }) => {
+                            // `saturating_add` for the reason `pal` uses it: the fold is unbounded in
+                            // principle, and a wrapped delta would throw the arrow across the panel.
+                            sx = sx.saturating_add(nx);
+                            sy = sy.saturating_add(ny);
+                            GUI_FOLD_X86.fetch_add(1, Ordering::Relaxed);
+                        }
+                        other => {
+                            pending = other;
+                            break;
+                        }
+                    }
+                }
+                raw = unaos_kernel::pal::Event::Mouse { x: sx, y: sy };
+            }
             // WINX-7 / CLICK-X86 — the router pair, in the dismantled loop's exact order. A pointer
             // BUTTON is ADDRESSED before it is DELIVERED: `user_input_route` routes by FOCUS, which is
             // right for a keystroke and wrong for a click (that belongs to the window under the cursor),
@@ -5723,6 +6125,18 @@ fn x86_render_service(cpu: usize) {
             // intercepting it after `user_input_route` would mean the focused app swallows the only
             // exit from its own window. This is the seam the bench media actually runs, so it is the
             // one Boot AH's trap was sprung on.
+            // USBDBG-INVERT — the debug view on the seam the bench media actually runs: PRINT, then
+            // ROUTE. Keyed on the RAW report (see `usbdebug_event_print`) so a report consumed into a
+            // focused window's ring is still seen by the operator, and placed ahead of the router so
+            // nothing about routing changes on a knob build.
+            //
+            // PTRCH — the call MOVED from here into [`gui_try_recv_x86`]/[`gui_recv_blocking_x86`],
+            // i.e. onto the moment an event leaves the CHANNEL rather than the moment this loop
+            // dispatches it. That is the honest seam once the fold above exists: printing here would
+            // show one line for a run of reports the hardware genuinely sent, and the operator would
+            // read a pad that had gone quiet off a capture in which it was streaming. Raw is what the
+            // hardware sent — the fold is this loop's business, not the witness's — and the print is
+            // still ahead of every router, still consumes nothing, and still keys on the raw report.
             let ev = unaos_kernel::arch::x86_64::syscall::wc_route_event(raw);
 
             match ev {
@@ -5820,11 +6234,12 @@ fn x86_render_service(cpu: usize) {
             // Take the next queued event if one is already waiting; otherwise the burst is drained
             // and we fall through to the single present. Never parks, so an empty channel costs one
             // failed semaphore try rather than a deschedule.
-            match GUI_CHANNEL_X86.try_recv() {
-                Some(next) => {
-                    GUI_RECV_X86.fetch_add(1, Ordering::Relaxed);
-                    raw = next;
-                }
+            //
+            // PTRCH — `pending` FIRST: an event the fold above pulled out of the channel to discover
+            // the end of a motion run is already off the channel and already counted, so taking it
+            // from here is what keeps the drain in arrival order.
+            match pending.take().or_else(gui_try_recv_x86) {
+                Some(next) => raw = next,
                 None => break,
             }
         }
@@ -5944,12 +6359,18 @@ fn x86_render_service(cpu: usize) {
             GUI_DEPTH_LAST_MS.store(now_ms.max(1), Ordering::Relaxed);
             let sent = GUI_SENT_X86.load(Ordering::Relaxed);
             let recv = GUI_RECV_X86.load(Ordering::Relaxed);
+            // PTRCH — `fold` is APPENDED at the tail (the standing insertion rule), and it is the term
+            // that separates the two ways `inflight=0` can be true. A channel that is empty because
+            // nothing was queued and a channel that is empty because the consumer summed a whole
+            // gesture into one dispatch read identically in `sent`/`recv`/`inflight`; `fold` is how
+            // many reports took the second path, i.e. how far behind the pad this core fell.
             serial_println!(
-                "[schedx86] depth sent={} recv={} inflight={} (render core {})",
+                "[schedx86] depth sent={} recv={} inflight={} (render core {}) fold={}",
                 sent,
                 recv,
                 sent.wrapping_sub(recv),
-                cpu
+                cpu,
+                GUI_FOLD_X86.load(Ordering::Relaxed)
             );
             // SCHEDLOAD-X86 load witness, riding the depth line's clock gate — the two are the answer
             // halves of one question and are worth reading as a pair: `depth` says whether the GUI

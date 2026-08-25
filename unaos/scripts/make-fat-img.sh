@@ -202,6 +202,31 @@ EOF
     printf 'level one file\n' > "${S}/subdir/level1.txt"
     echo "    added nested tree (subdir/ -> 'Nested Directory'/ -> 'deep file.txt')"
 
+    # WVAL-REPLAY: the b43 firmware SET, staged into B43/ — one of the three directories the kernel's
+    # loader searches (`firmware.rs` SEARCH_DIRS: /, /B43/, /FIRMWARE/). This is what gives the
+    # `UNAOS_WIFIVAL=1` replay leg real bytes to classify and validate in QEMU, instead of only ever
+    # on the bench rMBP.
+    #
+    # THE REPO NEVER CARRIES THESE BLOBS. They come from the operator's own b43-fwcutter extraction at
+    # BUILD time, from a directory named by UNAOS_B43_DIR — CLEAN_ROOM_POLICY.md §4's runtime-supply
+    # shape, and the images built here are local test media, never a distributed artifact. Absent
+    # directory (or absent files inside it) => skip SILENTLY: a checkout without the extraction must
+    # build every other fixture exactly as it does today, and the wifival spec is the thing that goes
+    # red when the blobs are missing, not this script.
+    local B43_DIR="${UNAOS_B43_DIR:-/home/pmes/Downloads/bcout/b43}"
+    if [ -d "$B43_DIR" ]; then
+        local b43_staged=0 f
+        for f in ucode29_mimo.fw ht0initvals29.fw ht0bsinitvals29.fw; do
+            if [ -f "${B43_DIR}/${f}" ]; then
+                mkdir -p "${S}/B43"
+                COPYFILE_DISABLE=1 cp "${B43_DIR}/${f}" "${S}/B43/${f}"
+                b43_staged=$(( b43_staged + 1 ))
+            fi
+        done
+        [ "$b43_staged" -gt 0 ] && \
+            echo "    added B43/ (${b43_staged}/3 of the user-supplied b43 set from ${B43_DIR}) for the WVAL-REPLAY validation leg"
+    fi
+
     # WINX-7 PKG: the x86 DATA volume tree (target/x86_64_data) is what the KERNEL reads on metal —
     # HELLO.BIN / STAT.ELF / VUG.ELF / PULSE.ELF / hello.txt. Copied LAST so a one-device QEMU image carries exactly
     # the bytes a staged stick would, including hello.txt's "DATA volume" probe line.
