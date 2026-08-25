@@ -1761,6 +1761,137 @@ const BT_C1_LINK_TYPE_ACL: u8 = 0x01;
 const BT_C1_CONN_MS: u64 = 5600;
 
 // ---------------------------------------------------------------------------------------------
+// BT-DIR — THE DIRECTION TEST. Everything above this line pages OUTWARD; this asks the other way.
+//
+// WHAT IS SETTLED AND IS NOT RE-LITIGATED HERE (BTREGRESS, merged f8210a6a). There is no
+// regression: BR/EDR never reliably worked, the two 2026-08-11 links were 2 of 12 blind page
+// trains on one day, and the RSSI readings once cited as evidence were `bt-l2 evt=ADV_IND` — the
+// LE scan, not the classic inquiry, which reported `responses=0 target_found=false` in those same
+// boots. The peer is settled: `88:c6:26:cc:2d:3c`, `class_of_device=0x240418` = Audio/Video,
+// Audio + Rendering — an audio sink, confirmed 2026-08-22. And the failure STAGE is unambiguous:
+// the page goes out, the controller certifies the full train (`observed=5123ms` against a
+// `5120ms` deadline it read back to us), and the answer is `Connection Complete status=0x04`
+// PAGE TIMEOUT — both attempts, every boot.
+//
+// THE ONE SURVIVING HYPOTHESIS, and why it needs a different instrument. Answering an inquiry
+// proves the peer is INQUIRY-scanning. Page scan is a SEPARATE enable (Vol 4 Part E §7.3.18), and
+// "discoverable but not connectable" is the ordinary resting state of a speaker already bonded
+// somewhere else. Every attempt this project has ever made tested ONE direction: us paging it.
+// If the peer can page US, the RF path works both ways and the fault is in our train (clock
+// offset, page-scan repetition mode) rather than in the peer's radio. If it cannot, no host-side
+// page change will ever fix it and this line of work should stop.
+//
+// SO THE TEST IS: enable page scan on THIS host, hold one page window, and report what arrives.
+//
+// TWO PHASES, NEVER CONCURRENT, AND THAT IS THE WHOLE DESIGN. A controller with page scan enabled
+// time-slices between its inbound scan windows and any outbound page train it is running. Doing
+// both at once would degrade the very train this arc has spent four boots measuring and hand back
+// a confounded result. So:
+//   * PHASE 1 is the existing outbound page train with scan DISABLED — byte-identical in
+//     behaviour to a `btc` boot, because every line of this section is `btdir`-gated and sits
+//     strictly AFTER `bt_c1_tally` has already printed phase 1's verdict. Phase 1 remains the
+//     CONTROL and this arc must not perturb it.
+//   * PHASE 2 writes `Scan_Enable = 0x03`, holds `BT_DIR_WINDOW_MS`, and logs what came.
+//   * PHASE 3 writes `Scan_Enable = 0x00` back and READS IT BACK. Not for safety — for experiment
+//     hygiene: a machine left in a different radio state than the one the next boot's control
+//     assumes is a contaminated control.
+//
+// NO ACCEPT PATH IS ADDED, and that is scope, not caution. The reading this arc needs is the
+// `Connection Request` EVENT arriving. Accepting it is a different feature (`Accept_Connection_
+// Request` 0x0409 does not exist anywhere in this tree, and neither does SDP, RFCOMM, a local
+// name, or a written Class of Device) and is not what is being measured.
+//
+// HOW TO READ THE RESULT — all four exits are printed by `bt_dir_probe`'s own result line, on
+// every path, so no source dive is needed at the bench:
+//   * REQUEST   — a `Connection Request` (0x04) arrived. RF works in BOTH directions and the peer
+//                 CAN page. The fault is our page train or the peer's page-scan enable being off
+//                 in the outbound direction only.
+//   * NEGATIVE  — nothing arrived, and the SAME boot's inquiry DID hear the target. The peer is
+//                 not connectable in either direction; no host-side page change fixes that.
+//   * VOID      — nothing arrived AND the inquiry did not hear the target either. The peer was
+//                 absent or off for this boot. THE TEST DID NOT RUN AGAINST ANYTHING. This is the
+//                 MOST LIKELY outcome — recent boots report `responses=0` — and a void run
+//                 misread as a negative is exactly how a wrong conclusion gets recorded, which is
+//                 why the word VOID is printed rather than left to be inferred.
+//   * SCAN NOT ENABLED — the controller refused the `Write_Scan_Enable`, or the readback says a
+//                 different value is in force. NOTHING about the peer is learned. Without this
+//                 exit a machine that never enabled scan would print a silence indistinguishable
+//                 from NEGATIVE, which is the "instrument that cannot fire in the state it exists
+//                 for" failure this repo has hit four times in one week.
+// ---------------------------------------------------------------------------------------------
+
+/// BT-DIR — `HCI_Write_Scan_Enable`: OGF 0x03 (Controller & Baseband) / OCF 0x001A => opcode
+/// 0x0C1A. One parameter byte (Scan_Enable); returns status(1) in a **Command Complete**. Vol 4
+/// Part E §7.3.18.
+#[cfg(feature = "btdir")]
+const BT_HCI_WRITE_SCAN_ENABLE: u16 = 0x0C1A;
+/// BT-DIR — `HCI_Read_Scan_Enable`: OGF 0x03 / OCF 0x0019 => opcode 0x0C19. No parameters; returns
+/// status(1) Scan_Enable(1). Vol 4 Part E §7.3.17.
+///
+/// IT IS NOT DECORATION. `Write_Scan_Enable` answering status=0x00 says ACCEPTED; it does not say
+/// IN FORCE. The whole phase-2 reading is "the host was page-scannable and nothing paged it", and
+/// that sentence is worthless if the first clause was never true. Same discipline BT-C1/AGE
+/// already applies to `Read_Page_Timeout`, and for the same reason.
+#[cfg(feature = "btdir")]
+const BT_HCI_READ_SCAN_ENABLE: u16 = 0x0C19;
+/// BT-DIR — `HCI_Read_Page_Scan_Activity`: OGF 0x03 / OCF 0x001B => opcode 0x0C1B. No parameters;
+/// returns status(1) Page_Scan_Interval(2) Page_Scan_Window(2), both in 0.625 ms slots. Vol 4
+/// Part E §7.3.19.
+///
+/// Read-only, and it is what makes `BT_DIR_WINDOW_MS` a MEASURED bound rather than an assumed one:
+/// the window must span several of THIS controller's page-scan intervals, and the interval is the
+/// controller's parameter, not ours. A boot where this read fails still runs the window — it just
+/// says on its own line that the interval it was sized against is unread.
+#[cfg(feature = "btdir")]
+const BT_HCI_READ_PAGE_SCAN_ACTIVITY: u16 = 0x0C1B;
+/// BT-DIR — `Scan_Enable` = **0x03**: bit 0 inquiry scan + bit 1 page scan (Vol 4 Part E §7.3.18).
+///
+/// BOTH BITS, not page scan alone. A BR/EDR peer that has never bonded with this host has no
+/// reason to page an address it has not discovered, and inquiry scan is what makes the host
+/// answerable at all; enabling only bit 1 would test "can the peer page a host it cannot see",
+/// which is a question nobody asked. It also costs nothing extra — the two scans share the same
+/// idle-mode slots.
+#[cfg(feature = "btdir")]
+const BT_DIR_SCAN_BOTH: u8 = 0x03;
+/// BT-DIR — `Scan_Enable` = **0x00**: no inquiry scan, no page scan. The controller's own reset
+/// default, and the value phase 3 writes back. It is a named constant and not an inline `0x00`
+/// because the restoration line PRINTS it: "restored" must be a value the reader can check, not a
+/// claim the code makes about itself.
+#[cfg(feature = "btdir")]
+const BT_DIR_SCAN_OFF: u8 = 0x00;
+/// BT-DIR — HCI event code 0x04 = `Connection Request` (classic). Ten parameters:
+/// BD_ADDR(6) Class_of_Device(3) Link_Type(1) => 12 bytes on the wire. Vol 4 Part E §7.7.4.
+///
+/// IT IS ALREADY UNMASKED. Bit 3 of the event mask is set in the reset default that BT-L1 writes
+/// and BT-C1 extends, so this arc writes no mask — exactly as BT-C1 writes none for
+/// `Connection Complete`. That matters: a masked event would produce a silence identical to a peer
+/// that never paged, and this arc would have printed VOID over a controller that was gagged.
+#[cfg(feature = "btdir")]
+const BT_EVT_CONN_REQUEST: u8 = 0x04;
+/// BT-DIR — how long phase 2 holds the page-scan window, in ms: **6400**.
+///
+/// FIVE PAGE-SCAN INTERVALS at the controller's reset default (0x0800 slots x 0.625 ms = 1.28 s,
+/// Vol 4 Part E §7.3.19) — and the actual interval is READ, not assumed, by
+/// `BT_HCI_READ_PAGE_SCAN_ACTIVITY` above, with the ratio printed so a controller running a longer
+/// interval makes the shortfall visible instead of silent. Five is chosen against the OTHER side
+/// of the exchange: a peer paging us runs its own page train under its own page timeout, commonly
+/// the 5.12 s spec default, and a window shorter than that could close while the peer was still
+/// mid-train — manufacturing precisely the FALSE NEGATIVE this arc exists to avoid. It is spent
+/// only on a boot that set `UNAOS_BTDIR=1`, once, after the page stage has already finished.
+#[cfg(feature = "btdir")]
+const BT_DIR_WINDOW_MS: u64 = 6400;
+/// BT-DIR — how many times phase 2 may re-enter `bt_l3_await` before giving up on the window.
+///
+/// `bt_l3_await` carries a STRUCTURAL cap of `BT_L3_EVT_MAX` (16) events per call, and a busy room
+/// can spend that cap on traffic that is not a `Connection Request` — at which point the call
+/// returns `Timeout` with most of the wall clock still unspent. Re-entering is what keeps the
+/// window a WALL-CLOCK window rather than an event-count one; without it a noisy bench would end
+/// phase 2 in milliseconds and print a silence that was never listened for. The wall clock is
+/// still the real bound: every re-entry is given only what remains of `BT_DIR_WINDOW_MS`.
+#[cfg(feature = "btdir")]
+const BT_DIR_AWAIT_REENTRIES: u32 = 64;
+
+// ---------------------------------------------------------------------------------------------
 // BT-C1/INQUIRY — the step Boot D proved was missing.
 //
 // BOOT D IS THE GROUND FACT THIS EXISTS FOR. Peter confirmed the MEGABOOM was in PAIRING MODE for
@@ -9028,6 +9159,537 @@ impl Controller {
         // correct path this writes `None`, so a later re-trigger re-pages as normal; when it writes
         // `Some`, the re-trigger reports "already connected" and refuses to page a link still held.
         self.bt_left_link = if live { Some(handle) } else { None };
+
+        // ---- 7. BT-DIR — THE OTHER DIRECTION, AND ONLY NOW -------------------------------------
+        // LAST STATEMENT OF THE STAGE, AND THE PLACEMENT IS THE EXPERIMENT. Phase 1 above — the
+        // outbound page train — is this arc's CONTROL, and a controller with page scan enabled
+        // time-slices its idle mode between inbound scan windows and any outbound train it is
+        // running. Arming the scan anywhere earlier would degrade the very train four boots have
+        // been measuring and hand back a confounded number. So every byte of BT-DIR sits after
+        // `bt_c1_tally` has printed phase 1's verdict, after the teardown, and after the retry
+        // latch is written: nothing above this line can observe it, and on a build without
+        // `btdir` the line does not exist at all — which is what makes a `btc` boot byte-identical
+        // to the boots the control was taken from.
+        //
+        // `!live && !outstanding` is the gate, and it is not tidiness. Both are phase 1's
+        // MUST-NOT-APPEAR conditions: `live` means a BR/EDR link the teardown did not confirm
+        // released, `outstanding` means the controller may STILL BE PAGING. Enabling page scan on
+        // top of either is precisely the concurrency this arc is built to avoid, so the probe
+        // refuses — and says so on its own result line rather than skipping silently.
+        #[cfg(feature = "btdir")]
+        self.bt_dir_probe(
+            t, intf, e, toggle, armed, &mut st, &mut seen, &mut asm, !live && !outstanding,
+        );
+    }
+
+    /// BT-DIR — PHASE 2 AND PHASE 3: make this host page-scannable, hold one window, report what
+    /// arrived, and put the radio back the way phase 1's control assumes it.
+    ///
+    /// WHAT THIS MEASURES, IN ONE SENTENCE: every BR/EDR attempt this project has ever made tested
+    /// one direction — us paging the peer — and all of them ended at `Connection Complete
+    /// status=0x04` PAGE TIMEOUT. Answering an inquiry proves the peer is INQUIRY-scanning; page
+    /// scan is a separate enable, and "discoverable but not connectable" is the ordinary resting
+    /// state of a speaker already bonded elsewhere. If the peer can page US, the RF path works
+    /// both ways and the fault is in our train. If it cannot, no host-side page change fixes it.
+    ///
+    /// IT ADDS NO ACCEPT PATH, and that is scope rather than caution: the reading wanted is the
+    /// `Connection Request` EVENT arriving. `HCI_Accept_Connection_Request` (0x0409) exists
+    /// nowhere in this tree, and neither does a reject, an event filter, SDP, RFCOMM, a written
+    /// local name or a written Class of Device — so an inbound request is witnessed and then left
+    /// to the controller's own connection-accept timeout, which is the whole of what is being
+    /// measured. A request arriving and going unanswered is the RESULT, not a bug.
+    ///
+    /// THE WINDOW IS ONLY SPENT WHEN THE INSTRUMENT EXISTS. `bt_hci_command`'s Command Complete
+    /// status is checked before the wait runs: a controller that REFUSED `Write_Scan_Enable` gets
+    /// no 6.4-second silence recorded against the peer, because that silence would be
+    /// indistinguishable from a peer that never paged — the "an instrument that cannot fire in the
+    /// state it exists for is an ABSENT instrument, not a cheaper one" failure this repo has hit
+    /// five times in one week, `COMP_REVENANTS` most recently. The one asymmetry is deliberate: an
+    /// ACCEPTED write whose READBACK could not be obtained still spends the window, because a
+    /// `Connection Request` arriving is SELF-CERTIFYING — nothing can page a host whose page scan
+    /// is off — while a silence under an unconfirmed readback is reported as `SCAN-UNCONFIRMED`
+    /// and is not evidence about the peer.
+    ///
+    /// THE FIVE EXITS, all printed by the one `BT-DIR RESULT` line so no source dive is needed at
+    /// the bench:
+    /// * `REQUEST`            — a `Connection Request` (0x04) arrived. RF works in BOTH directions
+    ///   and the peer CAN page. The fault is our page train (clock offset / page-scan repetition
+    ///   mode) or the peer's page-scan enable in the outbound direction only.
+    /// * `NEGATIVE`           — nothing arrived, and THIS SAME BOOT's inquiry did hear the target.
+    ///   The peer is not connectable in either direction; no host-side page change fixes that and
+    ///   this line of work should stop.
+    /// * `VOID`               — nothing arrived AND the inquiry heard nothing either. The peer was
+    ///   absent or off and THE TEST DID NOT RUN AGAINST ANYTHING. This is the MOST LIKELY outcome
+    ///   — recent boots report `responses=0` — and a void run misread as a negative is exactly how
+    ///   a wrong conclusion gets recorded, which is why the word is printed rather than inferred.
+    /// * `SCAN-NOT-ENABLED`   — the controller refused the write. Nothing about the peer is learned.
+    /// * `SCAN-UNCONFIRMED`   — accepted but the readback did not come back saying 0x03.
+    /// * `SKIPPED-PHASE1-UNCLEAN` — phase 1 left a link or an unresolved page; see the call site.
+    ///
+    /// PHASE 3 IS NOT SAFETY, IT IS HYGIENE. A machine left page-scannable is a machine in a
+    /// different radio state than the one the NEXT boot's control assumes, which is a contaminated
+    /// control. The restoration writes `BT_DIR_SCAN_OFF`, READS IT BACK, and prints both — the
+    /// same discipline BT-C1/AGE applies to `Read_Page_Timeout`, and for the same reason: a write
+    /// answering 0x00 says ACCEPTED, not IN FORCE.
+    #[cfg(feature = "btdir")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn bt_dir_probe(
+        &mut self,
+        t: &Target,
+        intf: u8,
+        e: &BtEvtEp,
+        toggle: &mut bool,
+        armed: &mut bool,
+        // Phase 1's state, READ ONLY for the verdict — `inq_found` is what separates NEGATIVE from
+        // VOID — and passed by `&mut` because `bt_l3_await` requires it and latches into it.
+        st: &mut BtL3State,
+        seen: &mut u32,
+        asm: &mut [u8],
+        phase1_clean: bool,
+    ) {
+        let t0 = crate::arch::now_cycles();
+
+        // ---- 0. THE GATE ----------------------------------------------------------------------
+        // It prints. A skip that says nothing is the same silence as a window that heard nothing,
+        // and the whole point of this stage is that those two must never be confusable.
+        if !phase1_clean {
+            serial_println!(
+                ":: bt-dir: [{}] BT-DIR RESULT — result=SKIPPED-PHASE1-UNCLEAN scan_enable_written=none window_held_ms=0 connection_requests=0 -> phase 1 ended holding a live link or an unresolved page, so enabling page scan would have overlapped an outbound train. NOTHING was written to the radio and NOTHING about the peer is learned == witness ::",
+                self.idx
+            );
+            return;
+        }
+
+        // ---- 1. SIZE THE WINDOW AGAINST THE CONTROLLER'S OWN INTERVAL --------------------------
+        // `BT_DIR_WINDOW_MS` is meant to span several page-scan intervals, and the interval is the
+        // CONTROLLER's parameter, not ours. Read it so the ratio is a measurement; a read that
+        // fails does not stop the window, it just says on this line that the number the window was
+        // sized against is unread.
+        let mut rp = [0u8; 8];
+        let (psi, psw, act_ok, act_status) = match self.bt_hci_command(
+            t, intf, e, toggle, BT_HCI_READ_PAGE_SCAN_ACTIVITY, &[], &mut rp, armed,
+        ) {
+            // `rp` is a ZEROED local, so a no-response command would leave `rp[0]` reading 0x00 —
+            // a SUCCESS status the wire never supplied. Every status below is therefore carried as
+            // an `Option` and printed as `none` when absent; the same trap is why the readbacks in
+            // steps 3 and 5 do the same. This is the exact placeholder the inquiry-result line's
+            // three-piece emission was written to avoid.
+            Some(n) if n >= 5 => (
+                (rp[1] as u16) | ((rp[2] as u16) << 8),
+                (rp[3] as u16) | ((rp[4] as u16) << 8),
+                rp[0] == 0x00,
+                Some(rp[0]),
+            ),
+            Some(n) if n >= 1 => (0u16, 0u16, false, Some(rp[0])),
+            _ => (0u16, 0u16, false, None),
+        };
+        // 0.625 ms per slot, Vol 4 Part E §7.3.19.
+        let psi_ms = (psi as u64 * 625) / 1000;
+        let psw_ms = (psw as u64 * 625) / 1000;
+        serial_print!(
+            ":: bt-dir: [{}] HCI_Read_Page_Scan_Activity (0x0C1B) status=",
+            self.idx
+        );
+        match act_status {
+            Some(s) => { serial_print!("{:#04x}", s); }
+            None => { serial_print!("none"); }
+        }
+        serial_println!(
+            " interval={:#06x}(={}ms) window={:#06x}(={}ms) -> {} == witness ::",
+            psi, psi_ms, psw, psw_ms,
+            if !act_ok {
+                "UNREAD — the hold below still runs its full BT_DIR_WINDOW_MS, but the claim that it spans several scan intervals is UNVERIFIED this boot"
+            } else if psi_ms != 0 && BT_DIR_WINDOW_MS / psi_ms >= 3 {
+                "the hold below spans at least 3 of this controller's page-scan intervals"
+            } else {
+                "SHORT — the hold below spans fewer than 3 of this controller's page-scan intervals, so a silence is WEAKER evidence than the constant's rationale assumes"
+            }
+        );
+
+        // ---- 2. PHASE 2a: MAKE THIS HOST ANSWERABLE --------------------------------------------
+        // `HCI_Write_Scan_Enable` (Vol 4 Part E §7.3.18) answers with a COMMAND COMPLETE carrying
+        // one status byte — not a Command Status — so `bt_hci_command`'s return IS the completion
+        // status and there is no deferred event to chase.
+        let mut wr = [0u8; 8];
+        let (wr_status, write_accepted) = match self.bt_hci_command(
+            t, intf, e, toggle, BT_HCI_WRITE_SCAN_ENABLE, &[BT_DIR_SCAN_BOTH], &mut wr, armed,
+        ) {
+            Some(n) if n >= 1 => (Some(wr[0]), wr[0] == 0x00),
+            Some(_) => (None, false),
+            None => (None, false),
+        };
+        // Emitted in pieces because the status is OPTIONAL — the same reason the inquiry-result
+        // line is. A controller that answered nothing must print `none` here, not a placeholder
+        // number the wire never supplied.
+        serial_print!(
+            ":: bt-dir: [{}] PHASE 2 HCI_Write_Scan_Enable (0x0C1A) scan_enable={:#04x} (bit0 inquiry scan + bit1 page scan) status=",
+            self.idx, BT_DIR_SCAN_BOTH
+        );
+        match wr_status {
+            Some(s) => { serial_print!("{:#04x}", s); }
+            None => { serial_print!("none"); }
+        }
+        serial_println!(
+            " -> {} == witness ::",
+            match wr_status {
+                Some(0x00) => "ACCEPTED — this host is now page-scannable",
+                Some(_) => "REFUSED — the window below is NOT spent and NOTHING about the peer can be concluded",
+                None => "UNREAD — the command went out on EP0 but no Command Complete came back, so whether this host is page-scannable RIGHT NOW is UNKNOWN. The window below is NOT spent",
+            }
+        );
+
+        // ---- 3. PHASE 2b: HOLD THE WINDOW ------------------------------------------------------
+        // THE READBACK IS DELIBERATELY NOT HERE. It used to sit between the write and this loop,
+        // and REVIEW FOUND THAT IT ATE THE MEASUREMENT: `bt_hci_command_ex`'s drain has none of
+        // `bt_l3_await`'s latching — it `continue`s past every event that is not the Command
+        // Complete it asked for — so a `Connection Request` arriving in the readback's drain would
+        // have been logged as a skipped `bt-l0` event and never reached `conn_reqs`, and the boot
+        // could print NEGATIVE over a request that DID arrive. The readback runs AFTER the window
+        // instead, where it is at least as probative: `Scan_Enable` still reading 0x03 on the far
+        // side proves the scan was in force ACROSS the window rather than merely at its start.
+        //
+        // Re-entered because `bt_l3_await` carries a STRUCTURAL cap of `BT_L3_EVT_MAX` events per
+        // Re-entered because `bt_l3_await` carries a STRUCTURAL cap of `BT_L3_EVT_MAX` events per
+        // call: a busy room can spend that cap on traffic that is not a `Connection Request` and
+        // return `Timeout` with most of the wall clock unspent. Re-entering is what keeps this a
+        // WALL-CLOCK window; every re-entry is handed only what remains of it, so the total is
+        // still bounded by `BT_DIR_WINDOW_MS` and not by `BT_DIR_AWAIT_REENTRIES`.
+        let blind_at_entry = st.blind;
+        let seen_at_entry = *seen;
+        let win_cy = Self::bt_l3_budget(BT_DIR_WINDOW_MS);
+        let w0 = crate::arch::now_cycles();
+        // TWO COUNTERS, AND THE SPLIT IS THE WHOLE VERDICT. `Scan_Enable = 0x03` makes this host
+        // answerable to EVERY device in the room and no `Set_Event_Filter` exists in this tree, so
+        // "a Connection Request arrived" and "THE PEER paged us" are different facts. Counting them
+        // together would let a neighbour's phone print the one conclusion that redirects this whole
+        // project. This file already settled the rule for the same event family: `bt_l3_await`'s
+        // classic latch refuses to adopt a `Connection Complete` whose BD_ADDR is not
+        // `BT_L3_PEER_ADDR_BYTES`, on the reasoning that an inbound connection from some other
+        // device "is exactly the event shape being matched here". BT-DIR is the case that comment
+        // anticipated.
+        let mut conn_reqs = 0u32;
+        let mut conn_reqs_peer = 0u32;
+        let mut reentries = 0u32;
+        let mut ep_stopped = false;
+        if write_accepted {
+            while reentries < BT_DIR_AWAIT_REENTRIES {
+                let el = crate::arch::now_cycles().wrapping_sub(w0);
+                if el >= win_cy {
+                    break;
+                }
+                reentries += 1;
+                match self.bt_l3_await(
+                    e, toggle, armed,
+                    BtL3Want::Evt(BT_EVT_CONN_REQUEST),
+                    win_cy - el, seen, st, asm,
+                ) {
+                    BtL3Await::Got(len) => {
+                        conn_reqs += 1;
+                        // `Connection Request` (Vol 4 Part E §7.7.4): EventCode(1)
+                        // Parameter_Total_Length(1) BD_ADDR(6) Class_of_Device(3) Link_Type(1)
+                        // => 12 bytes on the wire. Bounds-checked before ANY field is read: this
+                        // arrived off the air and nothing authenticated it.
+                        if len >= 12 {
+                            let a = [asm[2], asm[3], asm[4], asm[5], asm[6], asm[7]];
+                            let text = bt_addr_render_msb(&a);
+                            let (major, minor, sink) =
+                                bt_c1_cod_decode([asm[8], asm[9], asm[10]]);
+                            let ours = bt_addr_eq(&a, &BT_L3_PEER_ADDR_BYTES);
+                            if ours {
+                                conn_reqs_peer += 1;
+                            }
+                            serial_println!(
+                                ":: bt-dir: [{}] INBOUND Connection Request (0x04) — addr={} is_our_peer={} class_of_device={:02x}{:02x}{:02x}(major={} minor={} audio_sink={}) link_type={:#04x}({}) -> {}. It is NOT answered: no Accept/Reject exists in this tree and adding one is out of this arc's scope; the controller's own connection-accept timeout resolves it == witness ::",
+                                self.idx,
+                                core::str::from_utf8(&text).unwrap_or("??:??:??:??:??:??"),
+                                ours,
+                                asm[10], asm[9], asm[8], major, minor, sink,
+                                asm[11],
+                                match asm[11] {
+                                    0x00 => "SCO",
+                                    0x01 => "ACL",
+                                    0x02 => "eSCO",
+                                    _ => "reserved",
+                                },
+                                if ours {
+                                    "THE PEER PAGED THIS HOST — this is the arc's REQUEST outcome"
+                                } else {
+                                    "A DIFFERENT DEVICE paged this host. It does NOT answer this arc's question, but it is not nothing either: it proves this host's page scan is genuinely live. The window keeps running"
+                                }
+                            );
+                            // Only OUR peer ends the window. Breaking on a stranger would spend the
+                            // measurement on a device nobody asked about and make the peer
+                            // unhearable for the rest of the hold.
+                            if ours {
+                                break;
+                            }
+                            continue;
+                        }
+                        // A request too short to carry an address cannot be attributed. It counts
+                        // toward `conn_reqs` (something paged us) and NOT toward `conn_reqs_peer`,
+                        // and it does not end the window — the peer may still be about to page.
+                        st.blind = true;
+                        serial_println!(
+                            ":: bt-dir: [{}] INBOUND Connection Request (0x04) arrived but carries {} bytes, short of the 12 the layout requires — the address and class are NOT decoded, so it CANNOT be attributed to the peer. The ARRIVAL still stands: something paged this host, which proves this host's page scan is live. The window keeps running == witness ::",
+                            self.idx, len
+                        );
+                        continue;
+                    }
+                    BtL3Await::Timeout => continue,
+                    BtL3Await::Stop => {
+                        ep_stopped = true;
+                        break;
+                    }
+                }
+            }
+        }
+        // `epace_ms` returns None when the TSC rate is unknown, and the rule this file states on it
+        // is "the caller then prints raw cycles rather than a fabricated millisecond (the
+        // `[vugfps]` lesson)". `.unwrap_or(0)` would have printed `window_held_ms=0` — and worse,
+        // an uncalibrated TSC ALSO makes `bt_l3_budget` fall back to `hw_wait_budget() / 4`, which
+        // is roughly 0.27 s, so the window really would have been ~24x shorter than the constant
+        // the line prints. Unknown is carried as `None` and reaches the VERDICT below, where it
+        // blocks NEGATIVE and VOID, rather than being flattened into a number.
+        let held = epace_ms(crate::arch::now_cycles().wrapping_sub(w0));
+        let (held_v, held_u) = epace_fmt(crate::arch::now_cycles().wrapping_sub(w0));
+
+        // ---- 4. PHASE 2c: READ THE SCAN ENABLE BACK, ON THE FAR SIDE OF THE WINDOW --------------
+        // NOT DECORATION. The whole phase-2 reading is "the host was page-scannable and nothing
+        // paged it", and that sentence is worthless if its first clause was never true. Placed
+        // after the hold rather than before it — see the note at the top of step 3 for why putting
+        // a full command drain between the write and the wait discarded the very event being
+        // measured. Reading 0x03 here proves the scan was in force ACROSS the window, which is a
+        // stronger statement than reading it at the start.
+        let mut rb = [0u8; 8];
+        let (rb_val, rb_status, readback_confirms) = match self.bt_hci_command(
+            t, intf, e, toggle, BT_HCI_READ_SCAN_ENABLE, &[], &mut rb, armed,
+        ) {
+            // Return parameters: Status(1) Scan_Enable(1). The VALUE is offered only when the
+            // status says the read succeeded — a Scan_Enable byte under a nonzero status is not a
+            // reading, and offering it would let `scan_enable_in_force=0x03` print off a failed
+            // command, which is the one number this whole stage rests on.
+            Some(n) if n >= 2 => (
+                if rb[0] == 0x00 { Some(rb[1]) } else { None },
+                Some(rb[0]),
+                rb[0] == 0x00 && rb[1] == BT_DIR_SCAN_BOTH,
+            ),
+            Some(n) if n >= 1 => (None, Some(rb[0]), false),
+            _ => (None, None, false),
+        };
+        serial_print!(
+            ":: bt-dir: [{}] PHASE 2 HCI_Read_Scan_Enable (0x0C19) status=",
+            self.idx
+        );
+        match rb_status {
+            Some(s) => { serial_print!("{:#04x}", s); }
+            None => { serial_print!("none"); }
+        }
+        serial_print!(" scan_enable_in_force=");
+        match rb_val {
+            Some(v) => { serial_print!("{:#04x}", v); }
+            None => { serial_print!("none"); }
+        }
+        serial_println!(
+            " -> {} == witness ::",
+            if readback_confirms {
+                "CONFIRMED IN FORCE ACROSS THE WINDOW — a silence above is evidence about the peer"
+            } else if write_accepted {
+                "NOT CONFIRMED — the write was accepted but the controller did not read back 0x03 afterwards; a silence above is NOT evidence about the peer, though an arriving request still would be"
+            } else {
+                "NOT IN FORCE — as expected from the refused or unread write above"
+            }
+        );
+
+        // ---- 5. PHASE 3: PUT THE RADIO BACK ----------------------------------------------------
+        // Unconditional once phase 2a was attempted — including after a REFUSED write, because
+        // "the write was refused so scan must still be off" is an inference and this stage does
+        // not trade in those. The value written and the value read back are both PRINTED.
+        //
+        // BUT IT MUST NOT READ THROUGH A HALT. `BtL3State::stopped`'s docblock makes this a rule
+        // and not a preference: once latched, a later `bt_read_full_event` sees `armed == false`
+        // after the halt cleared it, re-arms, and writes a fresh `QTD_ACTIVE` overlay — which
+        // clears the QH's Halted bit while the DEVICE's STALL is untouched. `bt_read_full_event`
+        // has no self-guard; the guard lives in the callers, and the two that already exist
+        // (`bt_l3_disconnect`'s early return, and the C1 cancel path) do exactly what this does.
+        // EP0 is NOT affected by an event-endpoint halt, so the restore still goes out — it is
+        // sent with `bt_hci_send`, whose reply is deliberately unread, and the line says so rather
+        // than reporting the missing confirmation as "NOT RESTORED".
+        let ep_dead = st.stopped || ep_stopped;
+        let mut r3 = [0u8; 8];
+        let (r3_status, restore_accepted, restore_sent) = if ep_dead {
+            let sent = self.bt_hci_send(t, intf, BT_HCI_WRITE_SCAN_ENABLE, &[BT_DIR_SCAN_OFF]);
+            (None, false, sent)
+        } else {
+            match self.bt_hci_command(
+                t, intf, e, toggle, BT_HCI_WRITE_SCAN_ENABLE, &[BT_DIR_SCAN_OFF], &mut r3, armed,
+            ) {
+                Some(n) if n >= 1 => (Some(r3[0]), r3[0] == 0x00, true),
+                _ => (None, false, true),
+            }
+        };
+        let mut r4 = [0u8; 8];
+        let (r4_val, r4_status, restore_confirms) = if ep_dead {
+            (None, None, false)
+        } else {
+            match self.bt_hci_command(
+                t, intf, e, toggle, BT_HCI_READ_SCAN_ENABLE, &[], &mut r4, armed,
+            ) {
+                Some(n) if n >= 2 => (
+                    if r4[0] == 0x00 { Some(r4[1]) } else { None },
+                    Some(r4[0]),
+                    r4[0] == 0x00 && r4[1] == BT_DIR_SCAN_OFF,
+                ),
+                Some(n) if n >= 1 => (None, Some(r4[0]), false),
+                _ => (None, None, false),
+            }
+        };
+        serial_print!(
+            ":: bt-dir: [{}] PHASE 3 POSTURE RESTORED — wrote scan_enable={:#04x} status=",
+            self.idx, BT_DIR_SCAN_OFF
+        );
+        match r3_status {
+            Some(s) => { serial_print!("{:#04x}", s); }
+            None => { serial_print!("none"); }
+        }
+        // The readback's OWN status, separately from its value: `readback=none` under a silent
+        // controller and `readback=none` under a controller that answered with a nonzero status
+        // are different facts, and "the posture is restored" is exactly the claim that must not be
+        // allowed to rest on the two being printed identically.
+        serial_print!(" readback_status=");
+        match r4_status {
+            Some(s) => { serial_print!("{:#04x}", s); }
+            None => { serial_print!("none"); }
+        }
+        serial_print!(" readback=");
+        match r4_val {
+            Some(v) => { serial_print!("{:#04x}", v); }
+            None => { serial_print!("none"); }
+        }
+        serial_println!(
+            " -> {} == witness ::",
+            if restore_accepted && restore_confirms {
+                "RESTORED AND CONFIRMED — the radio is back in the posture the next boot's control assumes"
+            } else if restore_accepted {
+                "ACCEPTED BUT UNCONFIRMED — the readback did not come back 0x00; the NEXT boot's control may be contaminated and its result must be read with that in mind"
+            } else if ep_dead && restore_sent {
+                "SENT BUT UNVERIFIABLE — the event endpoint was no longer readable, so the restore went out on EP0 (which a halt does not touch) with its reply deliberately UNREAD. It very probably took; this stage cannot say so, and will not claim it"
+            } else if ep_dead {
+                "NOT SENT — the event endpoint was dead AND the EP0 write failed. THE NEXT BOOT'S CONTROL IS CONTAMINATED unless the radio is power-cycled"
+            } else {
+                "NOT RESTORED — the controller would not take the restore write. THE NEXT BOOT'S CONTROL IS CONTAMINATED unless the radio is power-cycled"
+            }
+        );
+
+        // ---- 6. THE ONE RESULT LINE, ON EVERY PATH ---------------------------------------------
+        // Every exit prints here, including "nothing arrived". A line that only fired on success
+        // could not tell "no request" from "this code never ran", which is the exact defect the
+        // brief names and the exact defect `COMP_REVENANTS` shipped.
+        //
+        // THE ORDER IS THE STANDING LAW "an absence is only evidence if the thing that would have
+        // produced it was actually attempted", applied three times before the peer is ever blamed.
+        // A `Connection Request` cannot be READ off an event endpoint that is no longer readable,
+        // and it cannot arrive in a window that closed early — so both of those states have to be
+        // eliminated before a silence is allowed to mean `VOID` or `NEGATIVE`, exactly as a refused
+        // `Write_Scan_Enable` does. `bt_hci_command` rides EP0, which a halted EVENT endpoint does
+        // not touch, so `write_accepted` can be true on a boot where nothing could ever be heard:
+        // that is not a corner, it is the specific way this stage would otherwise lie.
+        let window_truncated = reentries >= BT_DIR_AWAIT_REENTRIES;
+        // A hold that is unmeasurable, or that came in under three quarters of the constant the
+        // line prints, is not the window this stage's rationale is written about. Both collapse to
+        // "not held", because both make a silence unciteable for the same reason.
+        let window_short = held.map_or(true, |h| h * 4 < BT_DIR_WINDOW_MS * 3);
+        // Reads that went incomplete DURING the window — a truncated event, or one the structural
+        // cap stepped over. Snapshotted at entry so phase 1's own blindness is not charged here.
+        let reads_incomplete = st.blind && !blind_at_entry;
+        let result = if conn_reqs_peer > 0 {
+            "REQUEST"
+        } else if conn_reqs > 0 && !write_accepted {
+            // Cannot happen (the loop only runs when the write was accepted), but ordering the
+            // ladder so that an arrival can never be overwritten by an instrument complaint is
+            // cheaper than reasoning about it every time this code is edited.
+            "REQUEST-OTHER"
+        } else if wr_status.is_none() {
+            "SCAN-UNREAD"
+        } else if !write_accepted {
+            "SCAN-NOT-ENABLED"
+        } else if conn_reqs > 0 {
+            // Something paged this host, but not the peer — or not identifiably the peer. It does
+            // not answer the arc's question and must never be printed as if it did; it is still a
+            // real finding, because it proves this host's page scan was genuinely live.
+            "REQUEST-OTHER"
+        } else if ep_stopped || st.stopped {
+            "EVENT-ENDPOINT-DEAF"
+        } else if window_truncated {
+            // The loop tests the wall clock BEFORE it tests the cap, so exhausting the cap means
+            // the clock had NOT expired: the window was cut short by re-entries, not by time. No
+            // timing arithmetic is involved in this reading and none can go stale.
+            "WINDOW-TRUNCATED"
+        } else if window_short {
+            "WINDOW-SHORT"
+        } else if reads_incomplete {
+            "READS-INCOMPLETE"
+        } else if !readback_confirms {
+            "SCAN-UNCONFIRMED"
+        } else if st.inq_found {
+            "NEGATIVE"
+        } else {
+            "VOID"
+        };
+        let (elapsed, unit) = epace_fmt(crate::arch::now_cycles().wrapping_sub(t0));
+        serial_print!(
+            ":: bt-dir: [{}] BT-DIR RESULT — result={} elapsed={}{} scan_enable_written={:#04x} scan_enable_status=",
+            self.idx, result, elapsed, unit, BT_DIR_SCAN_BOTH
+        );
+        match wr_status {
+            Some(s) => { serial_print!("{:#04x}", s); }
+            None => { serial_print!("none"); }
+        }
+        serial_print!(" scan_enable_readback=");
+        match rb_val {
+            Some(v) => { serial_print!("{:#04x}", v); }
+            None => { serial_print!("none"); }
+        }
+        serial_println!(
+            " window_ms={} window_held={}{} page_scan_interval_ms={} intervals_covered={} await_reentries={} connection_requests={} connection_requests_from_peer={} events_read={} endpoint_readable={} reads_complete={} inquiry_responses={} inquiry_target_found={} restored={:#04x} restore_confirmed={} == witness ::",
+            BT_DIR_WINDOW_MS, held_v, held_u,
+            if act_ok { psi_ms } else { 0 },
+            // Both the interval and the hold must be KNOWN for a ratio to mean anything; an
+            // uncalibrated TSC makes `held` None and this prints 0, which `window_held=...cy`
+            // on the same line explains.
+            match (act_ok, held) {
+                (true, Some(h)) if psi_ms != 0 => h / psi_ms,
+                _ => 0,
+            },
+            reentries, conn_reqs, conn_reqs_peer, seen.saturating_sub(seen_at_entry),
+            !ep_stopped && !st.stopped,
+            !reads_incomplete,
+            st.inq_responses, st.inq_found,
+            BT_DIR_SCAN_OFF, restore_accepted && restore_confirms,
+        );
+        // The reading, spelled out on its own line so the bench does not have to carry the mapping
+        // in its head. Deliberately a SECOND line: the one above is the numbers, this one is the
+        // conclusion they license — and the conclusions differ enough that compressing them into a
+        // suffix would make the important one (VOID) the easiest to skim past.
+        serial_println!(
+            ":: bt-dir: [{}] BT-DIR READING — {} == witness ::",
+            self.idx,
+            match result {
+                "REQUEST" => "the peer CAN page this host, so the RF path works in BOTH directions and the fault is our page train (clock offset / page-scan repetition mode) or the peer's page-scan enable in the outbound direction only",
+                "NEGATIVE" => "nothing paged this host while THIS SAME BOOT's inquiry DID hear the target: the peer is not connectable in either direction, and no host-side page change will fix that",
+                "VOID" => "VOID, NOT NEGATIVE. Nothing paged this host AND the inquiry heard nothing either, so the peer was absent or off and THE TEST DID NOT RUN AGAINST ANYTHING. Do not record this as evidence about the peer",
+                "SCAN-UNCONFIRMED" => "the scan enable was accepted but never confirmed in force, so the silence during it says NOTHING about the peer — re-run and read the 0x0C19 line, printed above on the far side of the window",
+                "REQUEST-OTHER" => "SOME device paged this host, but NOT the peer (or not identifiably: a request too short to carry an address cannot be attributed). This does NOT answer the arc's question — but it is not nothing, because it proves this host's page scan was genuinely live, which upgrades every other verdict this boot could have printed",
+                "SCAN-UNREAD" => "the Write_Scan_Enable went out on EP0 but no Command Complete came back, so whether page scan is in force is UNKNOWN — NOT known to be off. Nothing about the peer is learned, and the PHASE 3 posture line above is the one to read next",
+                "EVENT-ENDPOINT-DEAF" => "page scan WAS enabled, but the HCI event endpoint stopped being readable, so a Connection Request could not have been observed even if the peer sent one. This says NOTHING about the peer: the deafness is this host's",
+                "WINDOW-TRUNCATED" => "page scan WAS enabled, but the listening window was ended by the re-entry cap rather than by the clock — the room was busy enough to spend every re-entry on other traffic. The window was NOT held to term and this says NOTHING about the peer; raise BT_DIR_AWAIT_REENTRIES and re-run",
+                "WINDOW-SHORT" => "page scan WAS enabled, but the window actually held is far under BT_DIR_WINDOW_MS or could not be measured at all — an uncalibrated TSC also shrinks bt_l3_budget's fallback to a fraction of the intended hold. The window this stage's rationale describes did not happen, so this says NOTHING about the peer",
+                "READS-INCOMPLETE" => "page scan WAS enabled and the window ran, but an event went past that could not be read in full — and it MIGHT have been the Connection Request. A silence that was not read to term is not a silence; this says nothing about the peer",
+                "SCAN-NOT-ENABLED" => "the controller REFUSED the write, so page scan was never enabled and this boot learned NOTHING about the peer. The silence is the instrument's, not the radio's",
+                // Not a catch-all for convenience: every token above is spelled out, so a token
+                // added without a reading announces itself instead of borrowing someone else's.
+                _ => "NO READING IS DEFINED FOR THIS RESULT TOKEN — that is a defect in bt_dir_probe, not a fact about the radio. Do not interpret this boot",
+            }
+        );
     }
 
     /// BT-C1 — the end-of-stage tally, in the shape BT-L3's is: `left_outstanding=` reads `none` on

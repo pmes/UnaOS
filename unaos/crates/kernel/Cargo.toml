@@ -594,8 +594,10 @@ bt = ["ehcihid"]
 # must be structurally incapable of issuing one — a compile-time property, not a runtime check.
 #
 # Prerequisites, with the Core spec sections: `HCI_Write_Scan_Enable` (Vol 4 Part E §7.3.18) is NOT
-# written — it governs INBOUND inquiry/page scan and paging out needs none of it, while enabling it
-# would make this machine discoverable. `HCI_Write_Page_Timeout` (§7.3.16) IS written, shortening
+# written by THIS knob — it governs INBOUND inquiry/page scan and paging out needs none of it, while
+# enabling it would make this machine discoverable. (BT-DIR's separate `btdir` knob below does write
+# it, which is exactly why it is separate: a `btc` boot is byte-identical to the boots this arc's
+# control was taken from.) `HCI_Write_Page_Timeout` (§7.3.16) IS written, shortening
 # the 5.12 s reset default to 1.28 s so a powered-off speaker cannot cost the boot five seconds.
 # Gated additionally on the LMP feature mask NOT setting BR/EDR-Not-Supported.
 #
@@ -603,6 +605,35 @@ bt = ["ehcihid"]
 # `drivers/ehci/mod.rs`. Default OFF => the page code, its constants and the classic latch vanish.
 # x86_64 only; `arm_features` strips it so aarch64 media stay byte-identical.
 btc = ["bt"]
+# BT-DIR: `UNAOS_BTDIR=1` arms THE DIRECTION TEST — the one question four boots of outbound paging
+# could not ask. Every BR/EDR attempt this project has made pages the peer and ends at
+# `Connection Complete status=0x04` PAGE TIMEOUT. Answering an inquiry proves the peer is INQUIRY-
+# scanning; page scan is a SEPARATE enable (Vol 4 Part E §7.3.18), and "discoverable but not
+# connectable" is the ordinary resting state of a speaker already bonded elsewhere. This knob writes
+# `HCI_Write_Scan_Enable` (0x0C1A) = 0x03 so the peer can page US, holds one page window, reports
+# what arrived, and writes 0x00 back — reading the value back on both writes.
+#
+# WHY IT IS ITS OWN KNOB AND NOT PART OF `btc`. Two reasons, and the first is the experiment itself.
+# `btc`'s outbound page train is this arc's CONTROL, and a controller with page scan enabled
+# time-slices its idle mode between inbound scan windows and any outbound train it is running — so
+# a `btc` build must stay BYTE-IDENTICAL to the builds the control was measured on, which a shared
+# knob would destroy. Second, it is a distinct air-side posture: `btc` makes this machine noisy but
+# not addressable, while this makes it DISCOVERABLE and CONNECTABLE for the length of one window.
+# The `btc` docblock above says Write_Scan_Enable is not written, and that stays true of `btc`.
+#
+# NO ACCEPT PATH IS ADDED, deliberately: the reading wanted is the `Connection Request` EVENT
+# arriving. `HCI_Accept_Connection_Request` (0x0409), a reject, an event filter, SDP, RFCOMM, a
+# written local name and a written Class of Device all do not exist anywhere in this tree, so an
+# inbound request is witnessed and left to the controller's own accept timeout.
+#
+# Implies `btc` (and through it `bt`, `ehcihid`) — phase 1 IS the control and must run for the
+# result to be readable, and every line lives in the same x86-gated `drivers/ehci/mod.rs`, strictly
+# after `bt_c1_tally` has printed phase 1's verdict. Boot cost on an armed boot: one window
+# (`BT_DIR_WINDOW_MS` = 6400 ms) plus four HCI commands, once, and only when phase 1 ended clean.
+# Default OFF => `bt_dir_probe`, its constants and its call site vanish and a `btc` build is
+# byte-identical to one built without this knob. x86_64 only; `arm_features` strips it so aarch64
+# media stay byte-identical. Kept in sync with arroyo and builder/src/main.rs.
+btdir = ["btc"]
 # BT-BOND M1 / HOLOCRON: `UNAOS_HOLOCRON=1` arms the kernel-side classed-record store — one CRC'd
 # file (`/HCRON/BTBOND.DAT`) on the writable FAT volume, a fixed in-RAM table, and the load/flush
 # pair that lets a record be PRODUCED under a driver lock and WRITTEN somewhere else entirely.

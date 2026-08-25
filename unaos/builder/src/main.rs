@@ -308,6 +308,21 @@ fn main() {
     // and WXN-M3b failure). Default OFF => the page code and its constants unlinked, media
     // byte-identical. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_BTC").is_ok() { feats.push("btc"); }
+    // BT-DIR: UNAOS_BTDIR=1 arms THE DIRECTION TEST — after the outbound page stage has printed its
+    // tally, write HCI_Write_Scan_Enable (0x0C1A) = 0x03 so the peer can page THIS host, hold one
+    // 6400 ms page window, report whether a Connection Request (event 0x04) arrived, then write
+    // 0x00 back and read it back. Its own knob, and NOT part of UNAOS_BTC, because the outbound
+    // train is this arc's CONTROL: a controller with page scan enabled time-slices between inbound
+    // scan windows and any outbound train, so a `btc` build must stay byte-identical to the builds
+    // the control was measured on. It is also a distinct air-side posture — the machine is
+    // DISCOVERABLE AND CONNECTABLE for the length of that window. `btdir` implies `btc` in
+    // Cargo.toml, so pushing `btdir` alone arms the page and the whole BT stack. THIS list is what
+    // reaches the kernel binary for MEDIA builds, so a knob wired into arroyo alone would ship the
+    // direction test DISABLED while the banner claims it is on (the s42/INSTGUI and WXN-M3b
+    // failure), which for this arc would mean recording a silence produced by absent code as a
+    // silence produced by the radio. Default OFF => bt_dir_probe, its constants and its call site
+    // unlinked, media byte-identical. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_BTDIR").is_ok() { feats.push("btdir"); }
     // BT-BOND M1 / HOLOCRON: UNAOS_HOLOCRON=1 arms the kernel-side classed-record store
     // (`src/fs/holocron.rs`) and its first client, the bond record codec + table
     // (`src/drivers/ehci/btbond.rs`). THIS list is what reaches the kernel binary for MEDIA builds

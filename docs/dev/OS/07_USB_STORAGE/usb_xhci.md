@@ -8169,6 +8169,13 @@ discoverable and page-scannable, which is precisely what BT-C1's existing witnes
 arc deliberately does *not* do ("paging out needs none of it, while enabling it would make this
 machine discoverable"). It is a new posture, not a tweak, and it belongs behind its own knob.
 
+> **Built as §32 (BT-DIR, 2026-08-25), behind its own `UNAOS_BTDIR=1` knob.** Two of this
+> subsection's details did not survive contact and §32 records why: the write goes **after** the
+> outbound page train, not before it (before would time-slice the controller against the very train
+> this section's evidence is drawn from, destroying the control), and the two outcomes above are
+> **three** — a boot whose inquiry heard nothing is `VOID`, not `NEGATIVE`, and recent boots report
+> `responses=0`, so VOID is the likely one.
+
 ---
 
 <!-- SYNC-FOLD 2026-08-22: trunk added this section as §28 while the rmbp track added §§28-30
@@ -8215,6 +8222,162 @@ collinear. With the mount first: a boot where `[botseq] ... lba0=ok` is followed
 and THEN the wedge inside the matrices convicts the probes' command mix (read12/read16/pre-sense/
 induced-stall), not sequence depth — and the desktop line gets its filesystem before the reader
 dies. A mount that still times out ahead of any matrix reopens the position/depth theory.
+
+## 32. BT-DIR — the direction test: let the peer page **us** (`UNAOS_BTDIR=1`, 2026-08-25)
+
+§30.5 named the one surviving hypothesis and the one boot that settles it. This is that boot's
+instrument. Everything §30.5's five subsections established is taken as settled here and is not
+re-argued: there is no regression, the peer is `88:c6:26:cc:2d:3c` with `class_of_device=0x240418`
+(Audio/Video, Audio + Rendering — an audio sink), the RSSI premise was an LE measurement
+misattributed to BR/EDR, and the failure stage is unambiguous — the controller certifies a full
+page train (`observed=5123ms` against a `5120ms` deadline it reads back to us) and answers
+`Connection Complete status=0x04` PAGE TIMEOUT, both attempts, every boot.
+
+**The question, and why no outbound page can ask it.** Answering an inquiry proves the peer is
+*inquiry*-scanning. Page scan is a separate enable (Core Vol 4 Part E §7.3.18), and "discoverable
+but not connectable" is the ordinary resting state of a speaker already bonded elsewhere. Every
+attempt this project has ever made tested one direction. So: make **this host** page-scannable, hold
+one page window, and report what arrives.
+
+### The phase structure is the experiment
+
+A controller with page scan enabled time-slices its idle mode between inbound scan windows and any
+outbound page train it is running. Running both at once would degrade the very train four boots have
+been measuring and hand back a confounded number — which is why §30.5's "before BT-C1's outbound
+attempts" is the one part of that sketch this section overrides.
+
+| Phase | What runs | Scan state |
+|---|---|---|
+| 1 | The existing `btc` outbound page train, through `bt_c1_tally` and the teardown | **disabled** — behaviourally identical to a plain `btc` boot |
+| 2 | `Write_Scan_Enable = 0x03`, read back, hold `BT_DIR_WINDOW_MS` (6400 ms) | enabled (inquiry scan + page scan) |
+| 3 | `Write_Scan_Enable = 0x00`, read back, print both | disabled again |
+
+**Phase 1 is proven unperturbed by construction, not by care.** `bt_dir_probe` is the *last
+statement* of `bt_c1_page` — after the tally has printed, after the teardown, after the BT-RETRY
+latch is written — and every line of it, including its constants and its call site, is
+`#[cfg(feature = "btdir")]`. A build without the knob does not contain it, so a `btc` boot is
+byte-identical to the boots this arc's control was measured on. That is also the arc's `strings`
+control: the `UNAOS_BTC=1` artifact carries 74 `:: bt-c1: [` strings and **zero** `:: bt-dir: [`
+strings; the `UNAOS_BTDIR=1` artifact carries nine.
+
+Phase 2 additionally refuses to run at all when phase 1 ended holding a live link or an unresolved
+page (`live || outstanding` — both are phase 1's own MUST-NOT-APPEAR conditions), because enabling
+page scan on top of either is exactly the overlap being avoided. **The refusal prints**
+(`result=SKIPPED-PHASE1-UNCLEAN`): a skip that says nothing is the same silence as a window that
+heard nothing, and those two must never be confusable.
+
+### No accept path, and that is scope
+
+The reading wanted is the `Connection Request` **event** arriving. `HCI_Accept_Connection_Request`
+(0x0409), `Reject_Connection_Request` (0x040A), `Set_Event_Filter`, SDP, RFCOMM, A2DP, a written
+local name and a written Class of Device exist nowhere in this tree, so nothing would meet an
+inbound connection anyway. A request arriving and going unanswered — resolved by the controller's
+own connection-accept timeout — **is the result, not a bug**.
+
+### The exits, all printed by one line
+
+`bt_dir_probe` emits `BT-DIR RESULT` (the numbers) and `BT-DIR READING` (the conclusion they
+license) on **every** path including "nothing arrived". A line that fired only on success could not
+tell "no request" from "the code never ran" — the `COMP_REVENANTS` defect, which this repo has now
+shipped five times in a week.
+
+| `result=` | Meaning |
+|---|---|
+| `REQUEST` | A `Connection Request` (0x04) arrived **from `88:c6:26:cc:2d:3c`**. RF works **both** ways and the peer CAN page. The fault is our train (clock offset / page-scan repetition mode) or the peer's page-scan enable in the outbound direction only. The arc moves to `Write_Page_Scan_Activity`/train-length work. |
+| `REQUEST-OTHER` | A request arrived from some *other* device, or from one whose event was too short to carry an attributable address. `Scan_Enable = 0x03` makes this host answerable to the whole room and there is no `Set_Event_Filter` in this tree, so this is an ordinary outcome — and it must never print as `REQUEST`, which is the one verdict that redirects the project. It is still a real finding: it proves this host's page scan was genuinely live, which strengthens every other verdict the boot could have reached. A stranger's request does **not** end the window; only the peer's does. |
+| `NEGATIVE` | Nothing arrived **and this same boot's inquiry heard the target**. The peer is not connectable in either direction; no host-side page change fixes it and this line of work should stop. |
+| `VOID` | Nothing arrived **and the inquiry heard nothing either**. The peer was absent or off: *the test did not run against anything*. **This is the most likely outcome** — recent boots report `responses=0` — and a void run misread as a negative is exactly how a wrong conclusion gets recorded, which is why the word is printed rather than inferred. |
+| `SCAN-NOT-ENABLED` | The controller **refused** `Write_Scan_Enable` (nonzero status). Nothing about the peer is learned; the silence is the instrument's, not the radio's. |
+| `SCAN-UNREAD` | The write went out on EP0 but no Command Complete came back. Distinct from `SCAN-NOT-ENABLED` because the posture differs: the radio may be page-scannable *right now*. "The write was unread so scan must be off" is exactly the inference this stage refuses to make. |
+| `EVENT-ENDPOINT-DEAF` | Page scan was enabled, but the HCI event endpoint stopped being readable, so a request could not have been *observed* even if one was sent. `bt_hci_command` rides EP0, which a halted event endpoint does not touch — so the write can succeed on a boot where nothing could ever be heard. The deafness is this host's. |
+| `WINDOW-TRUNCATED` | Page scan was enabled, but the window ended on the re-entry cap rather than the clock: the room was busy enough to spend all 64 re-entries on other traffic. The window was not held to term. |
+| `WINDOW-SHORT` | The measured hold came in under three quarters of `BT_DIR_WINDOW_MS`, or could not be measured at all. The uncalibrated-TSC case is the one that matters: `epace_ms` returns `None` **and** `bt_l3_budget` falls back to `hw_wait_budget() / 4` (~0.27 s), so the window really is ~24x shorter than the constant on the same line. |
+| `READS-INCOMPLETE` | The window ran, but an event went past that could not be read in full (`st.blind` set during the window, snapshotted at entry so phase 1's blindness is not charged here) — and it might have been the request. A silence not read to term is not a silence. |
+| `SCAN-UNCONFIRMED` | Accepted, but `Read_Scan_Enable` did not come back `0x03`. A silence under it is not evidence — though an arriving request still would be, since nothing can page a host whose page scan is off. |
+| `SKIPPED-PHASE1-UNCLEAN` | Phase 1 left a live link or an unresolved page. Nothing was written to the radio. |
+
+### The witness discipline, in three specifics
+
+1. **The window is only spent when the instrument exists.** The Command Complete status of
+   `Write_Scan_Enable` is checked *before* the wait runs, so a refused write never records a
+   6.4-second silence against the peer. The one deliberate asymmetry: an **accepted** write whose
+   readback could not be obtained still spends the window, because an arriving request is
+   self-certifying.
+2. **The write is not assumed to have taken.** `HCI_Read_Scan_Enable` (0x0C19) reads it back and the
+   value is printed — the same discipline BT-C1/AGE applies to `Read_Page_Timeout`, for the same
+   reason: status `0x00` says ACCEPTED, not IN FORCE. Both the status byte and the readback print
+   `none` rather than a placeholder when the wire supplied nothing.
+
+   The readback runs on the **far side** of the window, not between the write and the wait. Review
+   caught the original ordering eating the measurement: `bt_hci_command_ex`'s drain has none of
+   `bt_l3_await`'s latching — it `continue`s past every event that is not the Command Complete it
+   asked for — so a `Connection Request` landing in the readback's drain would have been logged only
+   as a skipped `bt-l0` event and the boot could have printed `NEGATIVE` over a request that did
+   arrive. Reading `0x03` after the hold is also the stronger statement: the scan was in force
+   *across* the window, not merely at its start.
+3. **The window is a wall clock, not an event count.** `bt_l3_await` caps at `BT_L3_EVT_MAX` (16)
+   events per call, so a busy room can burn the cap on unrelated traffic and return with most of the
+   window unspent. Phase 2 re-enters it (up to `BT_DIR_AWAIT_REENTRIES` = 64), each time handing it
+   only what remains, so the total is bounded by `BT_DIR_WINDOW_MS` and not by the re-entry count.
+   `window_held_ms` on the result line is the measured hold, not the constant. And if the re-entry
+   cap *is* what ended the loop, that is `WINDOW-TRUNCATED`, not a silence — the loop tests the
+   clock before it tests the cap, so exhausting the cap proves the clock had not expired, and the
+   reading needs no timing arithmetic that could go stale.
+
+4. **Phase 3 does not read through a halt.** `BtL3State::stopped` makes this a rule, not a
+   preference: once latched, a later `bt_read_full_event` re-arms and writes a fresh `QTD_ACTIVE`
+   overlay, clearing the QH's Halted bit while the *device's* STALL is untouched. `bt_read_full_event`
+   has no self-guard — the guard lives in the callers, as it does in `bt_l3_disconnect` and the C1
+   cancel path. So when the event endpoint is dead the restore goes out with `bt_hci_send` (EP0,
+   which a halt does not touch) and its reply is deliberately unread; the line reports
+   `SENT BUT UNVERIFIABLE` rather than claiming a confirmation it cannot have — or claiming
+   `NOT RESTORED` about a write that almost certainly took.
+
+The ordering of the verdict chain is the standing law *an absence is only evidence if the thing that
+would have produced it was actually attempted*, applied **six** times before the peer is ever blamed:
+a refused write, an unread write, a request from the wrong device, a deaf event endpoint, a
+truncated or short window, and reads that did not complete are each eliminated ahead of `VOID` and
+`NEGATIVE`. Five of those six rungs came out of the arc's adversarial review, which is the honest
+record: the first draft would have printed `REQUEST` for a neighbour's phone and `NEGATIVE` after a
+window that listened for zero milliseconds.
+
+`BT_DIR_WINDOW_MS` = 6400 ms is five page-scan intervals at the controller's reset default (0x0800
+slots x 0.625 ms = 1.28 s), and the actual interval is **read** by `HCI_Read_Page_Scan_Activity`
+(0x0C1B) with `intervals_covered=` printed, so a controller running a longer interval makes the
+shortfall visible instead of silent. Five is sized against the *other* side: a peer paging us runs
+its own train under its own page timeout, commonly the 5.12 s default, and a shorter window could
+close mid-train — manufacturing the exact false negative this arc exists to avoid.
+
+### Posture restoration is hygiene, not safety
+
+Phase 3 is unconditional once phase 2 was attempted — **including after a refused write**, because
+"the write was refused so scan must still be off" is an inference and this stage does not trade in
+those. It writes `BT_DIR_SCAN_OFF` (0x00), reads it back, and prints both values:
+
+```
+:: bt-dir: [N] PHASE 3 POSTURE RESTORED — wrote scan_enable=0x00 status=0x00 readback_status=0x00
+   readback=0x00 -> RESTORED AND CONFIRMED — the radio is back in the posture the next boot's
+   control assumes
+```
+
+`readback_status` is printed apart from `readback` because "the controller answered with a nonzero
+status" and "the controller answered nothing" are different facts that would otherwise both render
+as `readback=none` — and "the posture is restored" is precisely the claim that must not rest on two
+different failures printing identically. Every status field on every `bt-dir` line follows this
+rule: the buffers are zeroed locals, so a silent command would otherwise read back a `0x00` success
+the wire never supplied.
+
+The reason is not the radio's safety. A machine left in a different radio state than the one the
+*next* boot's control assumes is a contaminated control, so a restore that is accepted but
+unconfirmed, or refused outright, says so in those words on its own line and the result line carries
+`restore_confirmed=`.
+
+### What QEMU proves, and what it does not
+
+**QEMU has no Bluetooth radio.** `UNAOS_WC=1 ./arroyo test` proves the build and the boot are intact
+and **nothing** about the link: the test artifact carries zero `bt-c1`, zero `bt-dir` and zero
+`bt-l0` strings, because the test path arms neither knob. This section's exits can only be read off
+a bench boot with `UNAOS_BTDIR=1`, the speaker in pairing mode, and the peer in the room.
 
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.

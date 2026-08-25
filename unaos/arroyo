@@ -455,6 +455,36 @@ _feats=""
 # sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature disabled
 # while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson).
 [ -n "${UNAOS_BTC:-}" ] && _feats="${_feats}btc,"
+# BT-DIR: UNAOS_BTDIR=1 arms THE DIRECTION TEST. Every BR/EDR attempt this project has ever made
+# tested ONE direction — this host paging the speaker — and all of them ended at Connection Complete
+# status=0x04 PAGE TIMEOUT with the controller certifying the full train. Answering an inquiry only
+# proves the peer is INQUIRY-scanning; page scan is a separate enable (Core Vol 4 Part E §7.3.18),
+# and "discoverable but not connectable" is the ordinary resting state of a speaker already bonded
+# elsewhere. So this knob asks the other way: after the outbound page stage has finished and printed
+# its tally, write HCI_Write_Scan_Enable (0x0C1A) = 0x03 (inquiry scan + page scan), hold ONE page
+# window (6400 ms, sized against the controller's own page-scan interval, which is READ), report
+# what arrived, then write 0x00 back and READ IT BACK.
+# AIR-SIDE POSTURE, stated plainly as the UNAOS_BTC paragraph above states its own: a UNAOS_BTDIR=1
+# boot makes this machine DISCOVERABLE AND CONNECTABLE for the length of that one window. It is a
+# private bench machine and the window is bounded and restored, but the posture is real and belongs
+# in this list rather than in a source comment.
+# NO ACCEPT PATH: the reading wanted is the Connection Request EVENT arriving. Accept/Reject
+# (0x0409/0x040A), Set_Event_Filter, SDP, RFCOMM, a local name and a written Class of Device exist
+# nowhere in this tree, so nothing would meet an inbound connection and the controller's own accept
+# timeout resolves it. That is the measurement, not a gap.
+# TWO PHASES, NEVER CONCURRENT, and that is the whole design: a controller with page scan enabled
+# time-slices between inbound scan windows and an outbound train, so running both at once would
+# confound the very measurement UNAOS_BTC spent four boots taking. Every byte is btdir-gated and
+# sits strictly AFTER the C1 tally, which is what keeps a plain UNAOS_BTC=1 build byte-identical to
+# the builds its control was measured on — and is also this arc's `strings` control.
+# Implies `btdir = ["btc"]` in Cargo.toml (phase 1 IS the control and must run), so setting this
+# alone arms the whole BT stack and the page. Costs an armed boot one 6400 ms window plus four HCI
+# commands, once, and only when phase 1 ended without a live link or an unresolved page.
+# x86_64 only; stripped from aarch64 builds by `arm_features` below. Default OFF => bt_dir_probe,
+# its constants and its call site unlinked, media byte-identical. Kept in sync with
+# builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature disabled while the
+# banner claims it is on (the s42/INSTGUI and WXN-M3b lesson).
+[ -n "${UNAOS_BTDIR:-}" ] && _feats="${_feats}btdir,"
 # BT-BOND M1 / HOLOCRON: UNAOS_HOLOCRON=1 arms the kernel-side classed-record store — one CRC'd file
 # (`/HCRON/BTBOND.DAT`) on the writable FAT volume, a fixed in-RAM table, and the load/flush pair that
 # lets a record be PRODUCED under a driver lock (`EHCI_HID`, where the Bluetooth link key arrives) and
@@ -1074,6 +1104,14 @@ arm_features() {
     # observable change. Stripped => the x86 track can page a speaker without touching Pi or Jetson
     # media at all.
     f="${f//,btc,/,}"
+    # BT-DIR rides the same strip, for the same reason and as a consequence of the same fact:
+    # `btdir` implies `btc` implies `bt`, whose only code is inside the x86-gated
+    # `drivers/ehci/mod.rs`, so `btdir` emits not one byte of aarch64 CODE — but an enabled feature
+    # is hashed into cargo's `-Cmetadata` fingerprint, so leaving it in (or either of the two
+    # implied features stripped just above) would shift every aarch64 media hash between a default
+    # build and a `UNAOS_BTDIR=1` one for zero observable change. Stripped => the x86 track can run
+    # the direction test without touching Pi or Jetson media at all.
+    f="${f//,btdir,/,}"
     # VSYNC-PACE (GR22, polarity inverted GR25) rides the same strip, for the same reason: every line
     # `vsyncpace` gates lives in `arch/x86_64/syscall.rs` and is additionally `wc`-gated (an x86-only
     # feature), so `vsyncpace` emits not one byte of aarch64 CODE — but an enabled feature is hashed into
@@ -1837,7 +1875,11 @@ check_user_arch() {
 # the BCMA-S1 tree, 2026-08-07; and AGAIN on the BT-L0 tree, GR21, where the table holds 87 and the
 # union 86, with `nvidia-kepler-kdisp-hold` still the sole gap): compare the `[features]` table
 # (minus `default`) against the union of the three leg feature lists below. `sdhcblk` (SDHC-4b),
-# `bcmaS1` (BCMA-S1) and `bt` (BT-L0) are all on `x86-all`, so no arc widens the gap.
+# `bcmaS1` (BCMA-S1) and `bt` (BT-L0) are all on `x86-all`, so no arc widens the gap. `btdir`
+# (BT-DIR, the direction test) is appended to `x86-all` for the same reason: it is x86-family and
+# would otherwise ride the derived mix legs as an unclaimed knob, which type-checks it but does not
+# say so — and this one MUST be visibly checked, because a `btdir` build whose code failed to
+# compile is indistinguishable at the bench from a radio that heard nothing.
 #
 # ⚠ RE-COUNTED 2026-08-19 (GR26, the tegra_el0 leg) AND STALE AGAIN, by a wide margin: the table holds
 # 100 knobs and the board legs' union 92. EIGHT are named by no board leg, and they do NOT all mean the
@@ -1904,7 +1946,7 @@ KERNEL_CFG_MATRIX=(
   # and both arches type-check the seam.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wedgeinj"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wedgeinj,btdir"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the
