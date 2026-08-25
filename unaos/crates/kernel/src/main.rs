@@ -2848,8 +2848,8 @@ fn jd2_console_pump(_arg: usize) {
                     }
                 }
                 Event::Button(mask) => {
-                    // Log clicks as a JD2 line for now (no UI action wired yet).
-                    serial_println!(":: tegra: JD20 — pointer BUTTON {:#04x} (down) ::", mask);
+                    // JD20's raw line: an event reached the PUMP. ORIN-CLICK (rung 3) then hands the same edge to the window layer — a separate claim, kept on a separate line, so a capture can tell a decoder fault from a routing fault. ⚠ LINE-NEUTRAL: the routing call is APPENDED to the JD20 statement, never given a line of its own — panic `Location` records embed line numbers, so a line added anywhere in this file breaks the knob-off byte-identity proof.
+                    serial_println!(":: tegra: JD20 — pointer BUTTON {:#04x} (down) ::", mask); #[cfg(feature = "orinclick")] unaos_kernel::arch::display_tegra::orin_click(mask); // ORIN-CLICK rung 3 — route the edge into `wc_click_route`; witness `[orinclick] edge=...`
                 }
                 _ => {}
             }
@@ -2884,7 +2884,7 @@ fn jd2_console_pump(_arg: usize) {
         // console pump was live at shell entry with no vug run). No-op with the knob off.
         if cntpct().wrapping_sub(last_sweep) >= sweep_ticks {
             last_sweep = cntpct();
-            unaos_kernel::vugras::idle_sweep(sweep_tick);
+            unaos_kernel::vugras::idle_sweep(sweep_tick); #[cfg(feature = "orinclick")] unaos_kernel::arch::display_tegra::orin_click_census(sweep_tick); // ORIN-CLICK rung 3 — the ARM line, then the ~10 s click census. Emitted FROM THIS LOOP on purpose: it is the routing task's own liveness, so `[orinclick] census` stopping is a dead pump and `btn=0` is "nobody clicked", not "routing failed". ⚠ LINE-NEUTRAL append — see the Button arm above.
             sweep_tick += 1;
         }
         unaos_kernel::arch::sched::yield_now();
@@ -6346,13 +6346,13 @@ static TEGRADESK_ENTERED: core::sync::atomic::AtomicBool =
 /// §6.1 of the ladder, which calls this ordering "not negotiable": `pidesk::activate` opens the
 /// console window, that window carries a minimise disc, and `video/pidesk.rs:39-44` states the
 /// CONSWIN law — the only route back from that park is the dock, and the dock is only a way back
-/// once clicks route. `jd2_console_pump`'s `Event::Button` arm still does nothing but
-/// `serial_println!` the mask (§3.4), so arming today would ship a control that hides the console
-/// with no way back: strictly worse than the full-screen console it replaces.
-///
-/// **Flip this to `true` in the same commit that makes that arm call `wc_click_route`, not before.**
+/// once clicks route. **DISCHARGED 2026-08-25 by ORIN-CLICK (rung 3, orin-desktop.md §3.7):** that
+/// arm now calls `wc_click_route` (`main.rs:2852`), behind `orinclick`. ⚠ NOT a literal `true`, and
+/// the difference IS the safety property: `tegradesk` does NOT imply `orinclick`, so a hard `true`
+/// would assert a route back on an image that has none — the one-way trip re-entered through the very
+/// constant meant to prevent it. DERIVED FROM THE BUILD. Routing is UNFLOWN; §5.2 still holds.
 #[cfg(all(target_arch = "aarch64", feature = "tegradesk"))]
-const TEGRADESK_CLICK_ROUTED: bool = false;
+const TEGRADESK_CLICK_ROUTED: bool = cfg!(feature = "orinclick");
 
 /// DESKSEAM STOP-LINE 2 — **§5.2, the inherited stack hazard.** The Pi overflowed a 16 KiB kernel
 /// stack in the desktop-arming cascade TWICE on consecutive metal boots (2026-08-22, boots 10 and

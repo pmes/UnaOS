@@ -665,6 +665,40 @@ _feats=""
 # jetson image is byte-identical to baseline. The ARMED build is type-checked by the `arm-tegra-jd1dc`
 # leg of KERNEL_CFG_MATRIX, not by this mapping. Witness on the wire: `JD1-DC VERDICT=`.
 [ -n "${UNAOS_JD1DC:-}" ] && _feats="${_feats}jd1dc,"
+# ORIN-CLICK (rung 3): UNAOS_ORINCLICK=1 wires the Orin console pump's pointer BUTTON edge into the
+# WINDOW LAYER. `jd2_console_pump`'s `Event::Button` arm has logged the press and dropped it since JD20
+# ("no UI action wired yet"); this knob appends a call to `arch/aarch64/syscall.rs::wc_click_route` —
+# the router that has been compiled into every `tegra_el0` Orin kernel and has never had a caller on
+# this arch — plus the `[orinclick]` instrument in `arch/aarch64/display_tegra.rs`.
+#
+# WHY THIS RUNG BEFORE "CONSOLE AS A WINDOW". `video/pidesk.rs:39-44` — the console window's minimise
+# disc parks it and THE ONLY ROUTE BACK IS THE DOCK, which is a route back only once clicks route.
+# Landing the console window first ships a one-way trip. Nothing here routes the console into a `wm` row.
+#
+# IT DOES NOT CROSS THE STOP-LINE (orin-desktop.md §5.2). `orinclick` implies `tegra_el0` and nothing
+# else, so every furniture arm of the router — `strip::press_route`, `quarry::service`,
+# `pulsewin::press_route`, `quarry::press_route`, the DRAG-PI chrome arm, the SHELLWIN-PI arm — stays
+# `#[cfg(feature = "pidesk")]` and COMPILED OUT. `quarry::open()` at click-router depth is precisely
+# what overflowed the Pi's 16 KiB kernel stack on boot 11, and it is not in this build. No dock, no
+# strip, no menubar, no crystal, no render_service.
+#
+# NOT STANDALONE, unlike smpmark/orindesk/jd1dc: `wc_click_route` lives in `arch/aarch64/syscall.rs`,
+# which `arch/aarch64/mod.rs:46` gates on `any(baremetal, tegra_el0)` — and `baremetal` implies `pi`,
+# which `pi`+`tegra`'s `compile_error!` forbids here. `tegra_el0` is the ONLY satisfiable term, so the
+# Cargo feature declares it (`orinclick = ["tegra_el0"]`) rather than leaving a knob that arms nothing
+# unless the operator also guesses UNAOS_TEGRA_EL0=1. `tegra_el0` implies `tegra`, so this knob is
+# self-sufficient: `UNAOS_ORINCLICK=1 ./arroyo check` and `UNAOS_ORINCLICK=1 ./arroyo esp-jetson` both
+# build the armed configuration with no second knob.
+#
+# Default OFF; when unset the seam vanishes, no line moves in any file compiled knob-off (the
+# display_tegra.rs half is a file-tail block; both main.rs edits are statements appended to existing
+# lines), and the jetson image is byte-identical to baseline. The ARMED build is type-checked by the
+# `arm-tegra-orinclick` leg of KERNEL_CFG_MATRIX and the `pidesk` cross by `arm-tegra-desk`, not by
+# this mapping. Witness on the wire: `[orinclick] arm`, `[orinclick] edge=`, `[orinclick] census`
+# (the census prints every ~10 s from the pump's own loop, so `btn=0 -> IDLE-NO-CLICKS` means "alive,
+# nobody clicked" and a census that STOPS means the pump died — an absent `[clickroute]` is otherwise
+# not evidence of anything).
+[ -n "${UNAOS_ORINCLICK:-}" ] && _feats="${_feats}orinclick,"
 # JETSON-EL0 (M1b): UNAOS_TEGRA_EL0=1 arms the Orin EL0/userspace chain — `arch/aarch64/mmu_tegra_el0.rs`
 # (the M6d per-task address-space slots ported to the tegra EL1 regime), the widened `syscall`/`bus`/
 # `sched::spawn_user*` gates, and the el0-hello round-trip spawned from `tegra_early_stop`. The
@@ -2191,7 +2225,57 @@ KERNEL_CFG_MATRIX=(
   # items in `main.rs`) — and `pidesk` was already arm-only while `livecon`/`quarry` are already
   # in the universe via `x86-all`. +1 board leg, +0 mix legs. `./arroyo check` prints the live
   # board/mix counts every run — read them there rather than trusting a number in a comment.
-  "arm-tegra-seam ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,pidesk,livecon,quarry,tegradesk"
+  # ⚠ `,orinclick` APPENDED 2026-08-25 (ORIN-CLICK, rung 3), and it belongs HERE rather than on
+  # `arm-tegra-desk`. This leg is the ARMED-SEAM configuration, and since rung 3 the seam's own
+  # `TEGRADESK_CLICK_ROUTED` stop-line reads `true` — i.e. `tegra_desk_arm` now asserts, in source,
+  # that clicks route. The leg that compiles the seam armed is therefore the leg that must also
+  # compile the routing armed, or the assertion is type-checked by nothing. It is also the only place
+  # the rung-3 caller meets the router's `pidesk` arms (`strip`/`quarry`/`pulsewin`/chrome/SHELLWIN),
+  # which `arm-tegra-orinclick` deliberately compiles OUT. `arm-tegra-desk` is left exactly as rung 2
+  # set it — the disarmed twin for BOTH knobs — and there is no `#[cfg(not(feature = "orinclick"))]`
+  # site in src/, so no disarmed asymmetry is created. TYPE-CHECK only: booting `pidesk` + the cascade
+  # is rung 5 and stays blocked by orin-desktop.md §5.2 (the seam's second stop-line is still `false`).
+  "arm-tegra-seam ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,pidesk,livecon,quarry,tegradesk,orinclick"
+
+  # ORIN-CLICK rung 3 armed (appended 2026-08-25) — `orinclick` wires `jd2_console_pump`'s
+  # `Event::Button` arm into `arch/aarch64/syscall.rs::wc_click_route` and adds the `[orinclick]`
+  # instrument at the tail of `arch/aarch64/display_tegra.rs`. Without a leg the ARMED polarity would
+  # be compiled by NOTHING — the exact tegra_el0 / simmer_test / xusbfw / smpmark / orindesk / jd1dc
+  # shape this matrix has now closed six times, and the reason the standing law is that a knob's gates
+  # must compile the configuration the knob turns ON.
+  #
+  # WHY IT IS HOSTED ON `arm-tegra-el0`'s LIST AND NOT `arm-tegra`'s — the one place this leg differs
+  # from its six predecessors, and it is forced. `orinclick` DECLARES `tegra_el0` as a Cargo feature
+  # dependency, because `wc_click_route` lives in `arch/aarch64/syscall.rs` and `arch/aarch64/mod.rs:46`
+  # gates that module on `any(baremetal, tegra_el0)`; `baremetal` implies `pi` and `pi` + `tegra` is a
+  # `compile_error!`, so `tegra_el0` is the only satisfiable term on this board. Hosting on `arm-tegra`
+  # would have named a feature set cargo would silently widen back to this one anyway; naming it
+  # explicitly makes the leg's line the configuration it actually compiles.
+  #
+  # WHAT THIS LEG EXERCISES THAT `arm-tegra-desk` DOES NOT: the SHIPPABLE armed shape — the router
+  # reached with `pidesk` OFF, i.e. every furniture arm (`strip::press_route`, `quarry::service`,
+  # `pulsewin::press_route`, `quarry::press_route`, DRAG-PI chrome, SHELLWIN-PI) compiled OUT. That is
+  # the configuration a bench boot of this rung would actually carry, and it is the one that stays
+  # below the orin-desktop.md §5.2 stop-line: `quarry::open()` running synchronously at click-router
+  # depth is what overflowed the Pi's 16 KiB kernel stack on boot 11, and it is not in this build.
+  # `arm-tegra-seam` (with `,orinclick` appended above) covers the opposite cross — the armed seam
+  # with the router's `pidesk` arms compiled in.
+  #
+  # WHY ITS OWN TAIL LEG rather than `,orinclick` appended to `arm-tegra-el0`: the standing reason from
+  # the six legs above. `arm-tegra-el0` is the shipped ARMED-EL0 twin and the only leg that compiles
+  # `tegra_el0` with the desktop family AND this knob off; arming it there would trade this hole for
+  # that one, and a red on a tail leg NAMES the knob.
+  #
+  # UNIVERSE SIDE EFFECT: none that moves a count. `orinclick` is a NEW entry in `[features]`, and
+  # naming it on an arm-* leg keeps it OUT of `x86_cfg_universe` (which is the table minus what the arm
+  # legs name and `x86-all` does not), so the universe size and the derived mix-leg count are both
+  # exactly what they were before this arc. Board legs 12 -> 13; gate 20 -> 21 (counted against rung
+  # 2's `088d17c1`, which had already taken them 11 -> 12 / 19 -> 20 while this arc was in flight).
+  # `./arroyo check` prints the live board/mix counts every run — read them there, not here.
+  #
+  # PRECONDITION: like `arm-tegra-el0` and `arm-tegra-desk`, this leg compiles `arch/aarch64/syscall.rs`,
+  # which `include_bytes!`s `target/user_blob.bin`. `ensure_user_blob` (see check_both) supplies it.
+  "arm-tegra-orinclick ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,orinclick"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────

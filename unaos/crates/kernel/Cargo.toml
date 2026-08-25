@@ -1708,6 +1708,44 @@ jd1dc = []
 # mapping. Witness on the wire: `[deskseam]`. See docs/dev/OS/08_VIDEO/orin-desktop.md §6 rung 2.
 tegradesk = ["pidesk", "tegra_el0"]
 
+# ORIN-CLICK (`UNAOS_ORINCLICK=1`): rung 3 of the Orin desktop ladder — `jd2_console_pump`'s
+# `Event::Button` arm hands the edge to `arch/aarch64/syscall.rs::wc_click_route` instead of logging
+# it and dropping it. The router, `wm::hit_test`, `wm::focus_changed` and the control arms have all
+# been compiled into every Orin kernel that carries `tegra_el0` and have never had a caller on this
+# arch (orin-desktop.md §3.4); this knob is that caller plus the `[orinclick]` instrument.
+#
+# THIS RUNG IS THE SAFETY PRECONDITION FOR RUNG 4, not an optional polish. `video/pidesk.rs:39-44`
+# states the CONSOLEWIN law — the console window carries a minimise disc and the only route back from
+# that park is the dock, which is a route back only once clicks route. "A control that hides a window
+# with no way back is worse than no control." Nothing here routes the console into a `wm` row.
+#
+# IT DOES NOT CROSS THE §5.2 STOP-LINE. It implies `tegra_el0` and NOTHING else, so every furniture arm
+# inside the router (`strip::press_route`, `quarry::service`, `pulsewin::press_route`,
+# `quarry::press_route`, the DRAG-PI chrome arm, the SHELLWIN-PI arm) stays `#[cfg(feature = "pidesk")]`
+# and compiled out — including `quarry::open()`, which is what overflowed the Pi's 16 KiB kernel stack
+# at click-router depth on boot 11. No dock, no strip, no menubar, no crystal, no `render_service`.
+#
+# NOT STANDALONE, and that is the shape of the configuration rather than a convenience. `wc_click_route`
+# lives in `arch/aarch64/syscall.rs`; `arch/aarch64/mod.rs:46` gates that module on
+# `any(baremetal, tegra_el0)`; `baremetal` implies `pi`; and `pi` + `tegra` is a hard `compile_error!`
+# (`arch/aarch64/serial.rs:22`). On the Orin the only satisfiable term is `tegra_el0`, so declaring the
+# dependency here is what stops `orinclick = []` from being a knob that compiles nothing unless the
+# operator separately guesses `UNAOS_TEGRA_EL0=1` — a vacuous gate wearing a green verdict.
+# `tegra_el0` implies `tegra`, so `UNAOS_ORINCLICK=1 ./arroyo check` and
+# `UNAOS_ORINCLICK=1 ./arroyo esp-jetson` are both self-sufficient. The ARMED polarity is type-checked
+# by the `arm-tegra-orinclick` leg of KERNEL_CFG_MATRIX in `arroyo` and the `pidesk` CROSS by
+# `arm-tegra-seam` (rung 2's armed-seam leg, which since this arc also carries `orinclick` — the seam
+# asserts `TEGRADESK_CLICK_ROUTED` in source, so the leg that compiles the assertion must compile the
+# routing too), never by the knob mapping.
+#
+# Default OFF => the statics, the three functions and both call sites vanish, and NO LINE MOVES in any
+# file compiled knob-off: the `display_tegra.rs` half is a file-TAIL block and both `main.rs` edits are
+# statements APPENDED to existing lines (the panic-`Location` line-shift class is how byte-identity is
+# usually lost silently). MEASURED, not argued — build the aarch64 kernel either side and compare
+# sha256 of `unaos-kernel` and of its `llvm-objcopy -O binary` flattening. Witness on the wire:
+# `[orinclick] arm`, `[orinclick] edge=`, `[orinclick] census`. See orin-desktop.md §3.7.
+orinclick = ["tegra_el0"]
+
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }

@@ -871,3 +871,447 @@ pub fn jd1_dc_probe(chan: &super::bpmp_tegra::Chan, dtb_addr: u64, dtb_size: usi
         );
     }
 }
+
+// =================================================================================================
+// ORIN-CLICK — rung 3 of the Orin desktop ladder. `orinclick`, DEFAULT OFF.
+// =================================================================================================
+//
+// WHAT THIS RUNG IS. `jd2_console_pump`'s `Event::Button` arm has, since JD20, LOGGED the press and
+// dropped it ("no UI action wired yet", main.rs). Every other board routes that edge into the window
+// layer through `arch/aarch64/syscall.rs::wc_click_route`; the Orin was the one arch where the router
+// existed, compiled, and had no caller (orin-desktop.md §3.4). This block is that caller, plus the
+// instrument that says on the wire whether it worked.
+//
+// WHY IT IS RUNG 3 AND NOT RUNG 4. `video/pidesk.rs:39-44` states the CONSOLEWIN law: the console
+// window carries a minimise disc and THE ONLY ROUTE BACK FROM THAT PARK IS THE DOCK. The dock is a
+// route back only once clicks route. Landing "console as a window" before this rung would ship a
+// minimise button that is a one-way trip — "a control that hides a window with no way back is worse
+// than no control". So this is the enabling safety precondition, and nothing here routes the console
+// into a `wm` row.
+//
+// WHAT THIS RUNG IS NOT — the §5.2 STOP-LINE, restated because this file is where it would be broken.
+// The Pi overflowed a 16 KiB kernel stack in the desktop-arming cascade TWICE on consecutive metal
+// boots (boots 10 and 11), and neither reproduces on any QEMU gate in this tree. Boot 11's victim was
+// `quarry::open()` running SYNCHRONOUSLY AT CLICK-ROUTER DEPTH on the input-drain task — i.e. exactly
+// this call stack. This rung therefore does NOT arm `pidesk`: `orinclick` implies `tegra_el0` and
+// NOTHING ELSE, so every furniture arm inside `wc_click_route` (`strip::press_route`,
+// `quarry::service`, `pulsewin::press_route`, `quarry::press_route`, the DRAG-PI chrome arm and the
+// SHELLWIN-PI furniture arm) is `#[cfg(feature = "pidesk")]` and COMPILED OUT. What is left is the
+// window half: `wm::hit_test`, `wm::close_box_hit`/`minimise_hit`/`zoom_hit`, `focus_changed`, and
+// `user_input_set_active` — none of which opens a file, and none of which is on either recorded
+// overflow's path. No dock, no strip, no menubar, no crystal, no `render_service`.
+//
+// WHY `orinclick` IMPLIES `tegra_el0`, and why that is the SHAPE OF THE CONFIGURATION rather than a
+// wider net. `wc_click_route` lives in `arch/aarch64/syscall.rs`, and `arch/aarch64/mod.rs:46` gates
+// `pub mod syscall;` on `any(feature = "baremetal", feature = "tegra_el0")`. `baremetal` implies `pi`
+// and `pi` + `tegra` is a hard `compile_error!` (`arch/aarch64/serial.rs:22`), so on the Orin the ONLY
+// satisfiable term is `tegra_el0`. A standalone `orinclick = []` in the `orindesk`/`jd1dc`/`smpmark`
+// mould would have been a knob that compiles NOTHING unless the operator happens to also set
+// `UNAOS_TEGRA_EL0=1` — a vacuous gate wearing a green verdict, the defect class `arroyo`'s own
+// KERNEL_CFG_MATRIX preamble is written against. `tegra_el0` implies `tegra`, so
+// `UNAOS_ORINCLICK=1 ./arroyo check` and `UNAOS_ORINCLICK=1 ./arroyo esp-jetson` are both
+// self-sufficient. The ARMED polarity is type-checked by the `arm-tegra-orinclick` leg of
+// KERNEL_CFG_MATRIX, and the `pidesk` CROSS by `arm-tegra-desk` — never by the knob mapping.
+//
+// DEFAULT OFF AND MEASURED. With `orinclick` unset every item below vanishes and the two call sites
+// in `main.rs` are `#[cfg]`-erased STATEMENTS APPENDED TO EXISTING LINES, so no line moves in any file
+// compiled knob-off (the panic-`Location` line-shift class is how byte-identity is usually lost
+// silently) and the jetson image is byte-identical to baseline. Measured, not argued — see
+// orin-desktop.md §3.7.
+//
+// ── THE INSTRUMENT ───────────────────────────────────────────────────────────────────────────────
+//
+// THE PROBLEM THIS INSTRUMENT EXISTS TO SOLVE IS NOT "did the click work". It is: **an ABSENCE is
+// only evidence if the thing that would have produced it was actually attempted.** `[clickroute]`
+// missing from a capture where nobody touched the mouse is not a failing test, it is an UNRUN one,
+// and the router's own lines cannot tell those apart — `wc_click_route` prints on exactly two of its
+// arms (a press that MOVED focus to a window, and a miss while some app held focus) and is SILENT on
+// a re-click of the focused window, on every release, and on every press while focus is already the
+// shell, which on a fresh Orin boot is all of them.
+//
+// So three kinds of line, and the census is the load-bearing one:
+//
+//   1. `[orinclick] arm ...`   — ONCE, from the phase-2 drain loop's own cadence. Proves the caller
+//      is wired and names what it has to aim at. Its verdict is DECLINED, not passed, when the `wm`
+//      table is empty — which is the DEFAULT armed boot (`orindesk` off), so this instrument's
+//      non-pass path is the one a real boot takes.
+//   2. `[orinclick] edge=... -> VERDICT` — one per Button event, verdict DERIVED from the hit-test,
+//      the focus either side of the call, and the router's own return value. Never asserted.
+//   3. `[orinclick] census ... -> VERDICT` — every ~10 s FROM INSIDE THE DRAIN LOOP, unconditionally,
+//      whether or not anything was clicked.
+//
+// WHAT THE CENSUS BUYS, spelled out because it is the whole design:
+//
+//   * `census ... btn=0 -> IDLE-NO-CLICKS`  =  the pump is ALIVE and NOBODY CLICKED. UNRUN, not
+//     failed. This is the line that makes a missing `[clickroute]` interpretable.
+//   * `census ... btn=N ... -> FAIL/DECLINE` = clicks arrived and did not route. FAILED.
+//   * `arm` printed and the census then STOPS = the drain task is DEAD or wedged. This matters here
+//     specifically: pi's boot 11 killed cpu 3 and `[el0live] verdict=LIVE` printed ONE LINE LATER,
+//     while `:: SCHED: load ::` read `c3=100%` for the corpse. Nothing in this tree inherits a dead
+//     task's singleton roles (`steal_ok` is false for every explicitly-pinned task and there is no
+//     re-home path at all), so if this pump dies, clicks stop routing permanently and no other
+//     instrument will say so. This census cannot make that mistake, because it is not an observer of
+//     the routing task — it IS the routing task. A dead task prints nothing.
+//   * `arm` ABSENT while `:: tegra: JD2 — console OWNS the panel` is present = the drain loop was
+//     entered and did not survive its first quarter-second. `arm` absent AND that line absent = the
+//     knob is off, or the boot was headless and the pump delegated to `kbd_pump_body`.
+//   * `seq=` increments by exactly 1 per census, so a gap names a LOST serial line rather than
+//     letting one evaporate (the SERWIT law), and `up=` is read from `CNTPCT_EL0` at print time on
+//     this task's own core, so two consecutive census lines cannot carry the same clock.
+
+/// ORIN-CLICK — Button events handed to this seam by `jd2_console_pump`. The denominator of everything.
+#[cfg(feature = "orinclick")]
+static CLK_BTN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// ORIN-CLICK — our OWN mirror of the button mask, used to classify press/release/no-edge as the PUMP
+/// saw it. Deliberately not the router's `CLICK_PREV_MASK` (which is private, and which this call
+/// swaps): keeping a second mirror means the verdict below is an independent reading rather than a
+/// restatement of the router's own bookkeeping. On tegra this seam is `wc_click_route`'s only caller
+/// (`route_input_to_active_el0`'s call site is `#[cfg(feature = "baremetal")]`), so the two mirrors
+/// track each other; if a future caller appears they can disagree, and the `[orinclick]` line and the
+/// router's adjacent `[clickroute]` line are then both on the wire to be compared.
+#[cfg(feature = "orinclick")]
+static CLK_PREV_MASK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// ORIN-CLICK — press edges, release edges, and calls that carried no edge at all.
+#[cfg(feature = "orinclick")]
+static CLK_PRESS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "orinclick")]
+static CLK_REL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "orinclick")]
+static CLK_NOEDGE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// ORIN-CLICK — press dispositions. `RAISED` is the rung's whole point (a click moved focus to the
+/// window under the cursor); `SAME` is a re-click of the already-focused window; `MISS` is the
+/// desktop/console; `CONSUMED` is a furniture or control arm (only reachable on a `pidesk` build).
+#[cfg(feature = "orinclick")]
+static CLK_RAISED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "orinclick")]
+static CLK_SAME: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "orinclick")]
+static CLK_MISS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "orinclick")]
+static CLK_CONSUMED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// ORIN-CLICK — **the FAIL counter.** A press that hit a window the focus was NOT on, was not
+/// consumed by any arm, and did not move the focus: the router failing the one contract this rung
+/// exists to exercise. Sticky — once nonzero the census reports FAIL for the rest of the boot.
+#[cfg(feature = "orinclick")]
+static CLK_STUCK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// ORIN-CLICK — hit-tests that ran with NO panel geometry (`panel_info_nonblocking` refused because
+/// `WRITER` was contended), so the cursor position was the (0,0) clamp `click_pointer_pos` gives and
+/// the hit-test is not a statement about where the operator pointed. Counted, never silently folded
+/// into the miss count.
+#[cfg(feature = "orinclick")]
+static CLK_NOGEOM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// ORIN-CLICK — per-edge lines emitted, and the ones a chattering button cost us. `CLK_LOG_MAX` is a
+/// LIFETIME cap, not a rate: clicks are human-rate by construction, so hitting it at all means a
+/// stuck switch or a decoder fault, and the census names the suppressed count rather than letting
+/// the loss go unrecorded.
+#[cfg(feature = "orinclick")]
+static CLK_LOGGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "orinclick")]
+const CLK_LOG_MAX: u32 = 512;
+/// ORIN-CLICK — census bookkeeping: the arm latch, the tick the last census printed at, its sequence
+/// number, and the `CNTPCT_EL0` reading taken when the seam armed.
+#[cfg(feature = "orinclick")]
+static CLK_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "orinclick")]
+static CLK_CENSUS_TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "orinclick")]
+static CLK_CENSUS_SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "orinclick")]
+static CLK_T0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// ORIN-CLICK — census cadence, in `jd2_console_pump` sweep ticks. The pump's sweep tick is
+/// `CNTFRQ_EL0 / 4`, i.e. ~250 ms, so 40 ticks is ~10 s: slow enough to be free at 115200 baud, fast
+/// enough that "the census stopped" localises a dead pump to within one line of the death.
+#[cfg(feature = "orinclick")]
+const CLK_CENSUS_PERIOD: u64 = 40;
+
+/// ORIN-CLICK — `CNTPCT_EL0` and `CNTFRQ_EL0`, read on the calling core. The pump is a cooperative
+/// EL1 task with no timer IRQ after the JM6 drop (the JD3 timerless mechanism), so the free-running
+/// system counter is the only clock available to it — the same one `jd2_console_pump` already builds
+/// its 8 s phase-1 deadline and its sweep cadence out of.
+#[cfg(feature = "orinclick")]
+fn clk_now_freq() -> (u64, u64) {
+    let (now, freq): (u64, u64);
+    unsafe {
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) now, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq, options(nomem, nostack, preserves_flags));
+    }
+    (now, freq)
+}
+
+/// ORIN-CLICK — the pointer position the ROUTER will use, read the same way the router's own private
+/// `click_pointer_pos` reads it (`arch/aarch64/syscall.rs:13636`): panel geometry non-blocking, then
+/// `pal::cursor::pos` clamped to it. Returns `None` for the geometry when `WRITER` was contended, so
+/// the caller can say so on the wire instead of reporting a (0,0) clamp as if it were a hit-test.
+#[cfg(feature = "orinclick")]
+fn clk_pointer_pos() -> (Option<(i32, i32)>, i32, i32) {
+    let geom = crate::video::panel_info_nonblocking().map(|i| (i.width as i32, i.height as i32));
+    let (w, h) = geom.unwrap_or((0, 0));
+    let (x, y) = crate::pal::cursor::pos(w, h);
+    (geom, x, y)
+}
+
+/// **ORIN-CLICK — route ONE pointer button edge from the Orin console pump into the window layer.**
+///
+/// Called from `jd2_console_pump`'s `Event::Button` arm (`main.rs`), immediately after the JD20 log
+/// line that arm has always emitted. That line is deliberately KEPT: it is the raw evidence that an
+/// event reached the PUMP, which is a different claim from "the router made a decision", and the two
+/// being separable is what lets a capture distinguish a decoder fault from a routing fault. (It is
+/// also what makes the knob-off image byte-identical — removing it would move every line below it in
+/// `main.rs`, and panic `Location` records embed line numbers.)
+///
+/// The whole routing decision is `wc_click_route`'s; this function adds no policy and takes no arm of
+/// its own. It reads the state either side of the call and NAMES what happened:
+///
+/// | verdict | meaning |
+/// | --- | --- |
+/// | `RAISED` | press hit a window that did not hold focus, and focus moved to it — the rung's contract |
+/// | `HIT-SAME` | press hit the already-focused window; nothing to move |
+/// | `CONSUMED` | press was taken by a control or furniture arm (close/minimise/zoom, or `pidesk` chrome) |
+/// | `MISS-SHELL` | press hit no window while an app held focus; consumed, focus returned to the shell |
+/// | `MISS-IDLE` | press hit no window and focus was already the shell; not consumed, nothing to do |
+/// | `MISS-FULLSCREEN` | press hit no window but the focused app owns the panel through the compat row |
+/// | `RELEASE-DROPPED` / `RELEASE-DELIVERED` | the release edge, following the press's target |
+/// | `NO-EDGE` | the mask did not change — a re-report of a held button |
+/// | `DECLINE reason=no-geometry` | `WRITER` was contended, so the cursor read is the (0,0) clamp and the hit-test says nothing |
+/// | **`FAIL reason=no-raise`** | press hit an unfocused window, was not consumed, and focus DID NOT MOVE |
+/// | **`FAIL reason=miss-unhandled`** | press hit nothing while an app held focus, and was neither consumed nor excused by a full-screen compat row |
+///
+/// **What reachable boot state makes this print FAIL?** `no-raise` fires whenever the router returns
+/// `false` from a press on an unfocused window without having moved `USER_INPUT_ACTIVE` — which is
+/// what a broken `user_input_set_active`, a `focus_changed` that declined the owner, or a widened
+/// `#[cfg]` that compiled out the `owner != cur` arm would each produce. It is also the honest
+/// reading of the ONE benign race this seam has: `hit_test` is asked here and again inside the
+/// router under two separate acquisitions of `wm`'s `TABLE`, so a row closing between them would be
+/// seen as a hit here and a miss there. On this branch nothing closes rows on the Orin (the only
+/// minter is `orin_wm1`, which is idempotent and never closes), so that race is theoretical — and if
+/// it ever fires, the router's own `[clickroute]` line is printed adjacent to this one and the two
+/// disagreeing is exactly the evidence needed. `miss-unhandled` fires when the router's miss arm
+/// neither consumes nor is excused, i.e. its `cur != 0` guard and `USER_INPUT_ACTIVE` have drifted
+/// apart between the two reads.
+///
+/// **A note on where the keyboard goes, because it is a real consequence and not an oversight.** With
+/// `pidesk` OFF the SHELLWIN-PI arm (`is_kernel_owner` -> hand the keyboard to asid 0) is compiled
+/// out, so a press on `orin_wm1`'s row — owner `wm::KERNEL_OWNER_DESKTOP` — takes the ordinary
+/// `owner != cur` arm and leaves `USER_INPUT_ACTIVE` holding that kernel pseudo-ASID. On the Orin
+/// that is INERT for the keyboard and it was verified rather than assumed: the only consumer of
+/// `USER_INPUT_ACTIVE` for keystrokes is `pump_usb_into_gui`'s `user_input_active() != 0` branch
+/// (`main.rs:3887`), which is `#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]` and does
+/// not exist on tegra; `jd2_console_pump` feeds every `Event::Key` straight through `handle_key`
+/// regardless of focus. The focus either side of the call is printed on every line so the operator
+/// can see the pseudo-ASID land rather than having to take this paragraph on trust. When rung 5 arms
+/// `pidesk`, the SHELLWIN-PI arm compiles in and takes over — no change is owed here.
+#[cfg(feature = "orinclick")]
+pub fn orin_click(mask: u8) {
+    use core::sync::atomic::Ordering;
+    use crate::arch::aarch64::syscall as sc;
+    use crate::video::wm;
+
+    CLK_BTN.fetch_add(1, Ordering::Relaxed);
+    let prev = CLK_PREV_MASK.swap(mask as u32, Ordering::Relaxed) as u8;
+    let (geom, x, y) = clk_pointer_pos();
+    if geom.is_none() {
+        CLK_NOGEOM.fetch_add(1, Ordering::Relaxed);
+    }
+    let pressed = mask & !prev;
+    let released = prev & !mask;
+
+    // The hit-test is asked BEFORE the call, because the router consumes the edge and the answer is
+    // not recoverable afterwards. `hit_test` takes and releases `wm`'s TABLE; the router takes it
+    // again. Sequential, never nested — nothing here holds a lock across the call.
+    let target = if pressed != 0 { wm::hit_test(x, y) } else { None };
+    let focus_before = sc::user_input_active();
+    let consumed = sc::wc_click_route(crate::pal::Event::Button(mask));
+    let focus_after = sc::user_input_active();
+
+    let (edge, verdict) = if pressed != 0 {
+        CLK_PRESS.fetch_add(1, Ordering::Relaxed);
+        let v = if geom.is_none() {
+            "DECLINE reason=no-geometry"
+        } else {
+            match target {
+                Some((_win, owner, _z)) => {
+                    if consumed {
+                        CLK_CONSUMED.fetch_add(1, Ordering::Relaxed);
+                        "CONSUMED"
+                    } else if owner == focus_before {
+                        CLK_SAME.fetch_add(1, Ordering::Relaxed);
+                        "HIT-SAME"
+                    } else if focus_after == owner {
+                        CLK_RAISED.fetch_add(1, Ordering::Relaxed);
+                        "RAISED"
+                    } else {
+                        CLK_STUCK.fetch_add(1, Ordering::Relaxed);
+                        "FAIL reason=no-raise"
+                    }
+                }
+                None => {
+                    if consumed {
+                        CLK_MISS.fetch_add(1, Ordering::Relaxed);
+                        "MISS-SHELL"
+                    } else if focus_before == 0 {
+                        CLK_MISS.fetch_add(1, Ordering::Relaxed);
+                        "MISS-IDLE"
+                    } else if wm::compat_live() {
+                        CLK_MISS.fetch_add(1, Ordering::Relaxed);
+                        "MISS-FULLSCREEN"
+                    } else {
+                        CLK_STUCK.fetch_add(1, Ordering::Relaxed);
+                        "FAIL reason=miss-unhandled"
+                    }
+                }
+            }
+        };
+        ("press", v)
+    } else if released != 0 {
+        CLK_REL.fetch_add(1, Ordering::Relaxed);
+        ("release", if consumed { "RELEASE-DROPPED" } else { "RELEASE-DELIVERED" })
+    } else {
+        CLK_NOEDGE.fetch_add(1, Ordering::Relaxed);
+        ("none", "NO-EDGE")
+    };
+
+    if CLK_LOGGED.fetch_add(1, Ordering::Relaxed) < CLK_LOG_MAX {
+        let (hit, win, owner) = match target {
+            Some((w, o, _)) => ("yes", w as u64, o),
+            None => ("no", u64::from(wm::WIN_NONE), 0),
+        };
+        serial_println!(
+            "[orinclick] edge={} btn={:#04x} at ({},{}) geom={} hit={} win={} owner={:#x} focus {:#x}->{:#x} consumed={} -> {}",
+            edge, mask, x, y, if geom.is_some() { "yes" } else { "REFUSED" },
+            hit, win, owner, focus_before, focus_after, consumed as u8, verdict
+        );
+    }
+}
+
+/// **ORIN-CLICK — the ARM line and the periodic CENSUS, emitted from inside the pump's own drain loop.**
+///
+/// Called from `jd2_console_pump`'s phase-2 idle cadence (`main.rs`), on the same ~250 ms sweep tick
+/// the VUGRAS writeback sweep rides. `tick` is that loop's own counter; this function decides how
+/// often to print, so the CADENCE IS THE PUMP'S and a stalled pump cannot produce a census line.
+///
+/// FIRST call emits the ARM line and nothing else. Its verdict is derived from the panel and the `wm`
+/// table as they actually are:
+///
+/// | verdict | meaning |
+/// | --- | --- |
+/// | `ARMED` | a panel, and at least one row in the `wm` table for a click to land on |
+/// | `DECLINE reason=no-target` | the router is wired and the table is EMPTY — every press will take the miss arm. **This is the DEFAULT armed boot**: `orinclick` without `orindesk` mints no window, so nothing on this Orin is clickable and the instrument says so instead of reporting a healthy arm |
+/// | `DECLINE reason=no-panel` | `WRITER` carries zero geometry (structurally unreachable from phase 2, which is only entered on a non-zero panel width — printed rather than assumed away) |
+/// | `DECLINE reason=panel-locked` | `panel_info_nonblocking` refused; the geometry every hit-test clamps to is unknown this instant |
+///
+/// `rows=` is `wm::count()`, which counts every USED row including a COMPAT (full-screen) row that
+/// `hit_test` deliberately skips, so `compat=` is printed beside it: `rows=1 compat=1` means the one
+/// row is not hittable and `-> ARMED` would be over-claiming. This is stated rather than corrected
+/// because narrowing the count would need a new accessor in `video/wm.rs`, a shared lane.
+///
+/// EVERY LATER call prints the census on the cadence, unconditionally — including, and especially,
+/// when nothing has happened:
+///
+/// | verdict | meaning |
+/// | --- | --- |
+/// | **`FAIL reason=stuck-focus`** | at least one press hit an unfocused window and did not move the focus. Sticky for the rest of the boot |
+/// | `IDLE-NO-CLICKS` | the pump is alive and NO button event has arrived. **UNRUN, not failed** — this is the line that makes a missing `[clickroute]` interpretable |
+/// | `DECLINE reason=no-target` | button events arrived but the `wm` table is empty; there is nothing on this panel to click |
+/// | `DECLINE reason=release-only` | button events arrived and not one of them was a press edge — a decoder emitting only the up half |
+/// | `DECLINE reason=all-miss` | presses arrived, rows exist, and every single press landed off every window |
+/// | `DECLINE reason=geometry-refused` | every button event this boot ran against a refused panel read |
+/// | `ROUTING` | at least one press reached a window (raised, re-clicked or consumed) and nothing is stuck |
+///
+/// **What reachable boot state makes this print FAIL?** `stuck-focus` is the propagation of
+/// `orin_click`'s `FAIL reason=no-raise`, so it fires for every state that one does. And the
+/// DECLINEs are not decoration: `no-target` is what the default armed boot prints, on every census,
+/// until `UNAOS_ORINDESK=1` puts a row on the panel.
+///
+/// **What the wire shows if this task DIES** — the hazard this census is shaped around. The lines
+/// simply STOP. That is the honest answer and it is the only one available, because nothing in this
+/// tree inherits a dead task's singleton roles: `steal_ok` is false for every explicitly-pinned task
+/// and there is no re-home path anywhere in the source, so a dead `jd2_console_pump` means clicks
+/// stop routing for the rest of the boot with no other subsystem noticing. The reason this instrument
+/// can be trusted about that where the liveness instruments could not — pi's boot 11 printed
+/// `[el0live] verdict=LIVE` one line after the synchronous exception that killed cpu 3, and
+/// `:: SCHED: load ::` read `c3=100%` for the dead core — is that it is not an OBSERVER of the
+/// routing task. It is the routing task, printing on its own core off its own counter. It cannot
+/// report liveness it does not have.
+#[cfg(feature = "orinclick")]
+pub fn orin_click_census(tick: u64) {
+    use core::sync::atomic::Ordering;
+    use crate::arch::aarch64::syscall as sc;
+    use crate::video::wm;
+
+    // FOOTPRINT: this runs on the INPUT DRAIN LOOP, ~4x/s. `wm::count` and `wm::compat_live` each take
+    // `wm`'s TABLE, and the one thing this seam must never do is add lock traffic to the path whose
+    // death it exists to report. So the cadence gate is decided FIRST, off two system-register reads,
+    // and the table is touched only on the ~1-in-40 pass that actually prints. Sequential acquisitions,
+    // never nested, and never under `WRITER` — the WRITER/TABLE order stays acyclic (`orin_wm1`'s rule).
+    let (now, freq) = clk_now_freq();
+    let armed = CLK_ARMED.swap(true, Ordering::Relaxed);
+    if armed && tick.wrapping_sub(CLK_CENSUS_TICK.load(Ordering::Relaxed)) < CLK_CENSUS_PERIOD {
+        return;
+    }
+    let rows = wm::count();
+    let compat = wm::compat_live();
+
+    if !armed {
+        CLK_T0.store(now, Ordering::Relaxed);
+        CLK_CENSUS_TICK.store(tick, Ordering::Relaxed);
+        let geom = crate::video::panel_info_nonblocking();
+        let (pw, ph) = geom.map_or((0, 0), |i| (i.width, i.height));
+        let verdict = if geom.is_none() {
+            "DECLINE reason=panel-locked"
+        } else if pw == 0 || ph == 0 {
+            "DECLINE reason=no-panel"
+        } else if rows == 0 {
+            "DECLINE reason=no-target (wm table empty — arm UNAOS_ORINDESK=1 for a row to click)"
+        } else {
+            "ARMED"
+        };
+        serial_println!(
+            "[orinclick] arm panel={}x{} rows={} compat={} focus={:#x} pidesk={} t={} -> {}",
+            pw, ph, rows, compat as u8, sc::user_input_active(),
+            cfg!(feature = "pidesk") as u8, tick, verdict
+        );
+        return;
+    }
+
+    if tick.wrapping_sub(CLK_CENSUS_TICK.load(Ordering::Relaxed)) < CLK_CENSUS_PERIOD {
+        return;
+    }
+    CLK_CENSUS_TICK.store(tick, Ordering::Relaxed);
+    let seq = CLK_CENSUS_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+
+    let btn = CLK_BTN.load(Ordering::Relaxed);
+    let press = CLK_PRESS.load(Ordering::Relaxed);
+    let rel = CLK_REL.load(Ordering::Relaxed);
+    let noedge = CLK_NOEDGE.load(Ordering::Relaxed);
+    let raised = CLK_RAISED.load(Ordering::Relaxed);
+    let same = CLK_SAME.load(Ordering::Relaxed);
+    let miss = CLK_MISS.load(Ordering::Relaxed);
+    let consumed = CLK_CONSUMED.load(Ordering::Relaxed);
+    let stuck = CLK_STUCK.load(Ordering::Relaxed);
+    let nogeom = CLK_NOGEOM.load(Ordering::Relaxed);
+    let logged = CLK_LOGGED.load(Ordering::Relaxed);
+    let dropped = logged.saturating_sub(CLK_LOG_MAX.min(logged));
+
+    let verdict = if stuck != 0 {
+        "FAIL reason=stuck-focus"
+    } else if btn == 0 {
+        "IDLE-NO-CLICKS"
+    } else if nogeom >= btn {
+        "DECLINE reason=geometry-refused"
+    } else if rows == 0 {
+        "DECLINE reason=no-target"
+    } else if press == 0 {
+        "DECLINE reason=release-only"
+    } else if raised == 0 && same == 0 && consumed == 0 {
+        "DECLINE reason=all-miss"
+    } else {
+        "ROUTING"
+    };
+
+    let up = if freq == 0 { 0 } else { now.wrapping_sub(CLK_T0.load(Ordering::Relaxed)) / freq };
+    serial_println!(
+        "[orinclick] census seq={} t={} up={}s btn={} press={} rel={} noedge={} raised={} same={} miss={} consumed={} stuck={} nogeom={} dropped={} rows={} compat={} focus={:#x} -> {}",
+        seq, tick, up, btn, press, rel, noedge, raised, same, miss, consumed, stuck,
+        nogeom, dropped, rows, compat as u8, sc::user_input_active(), verdict
+    );
+}
