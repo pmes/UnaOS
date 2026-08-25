@@ -9631,6 +9631,59 @@ lines below are what it CAN read.
   the box height, `banded=0` with `minspan=0 minspan_bytes=0`, and never a `scope=window-band`
   rollup. A band-carrying field with any other value on aarch64 is itself the finding.
 
+### CHROMEBAND — the chrome painter walked the box once per band (x86 `wc`, 2026-08-25)
+
+Reported by the pi track as "chrome repainted once per band, 3x at 1920-wide". The count is real —
+`stage_window` calls `paint_window` once per band and always did — but the cost is x86's, and the
+reason is not in `wm.rs` at all.
+
+`FrameBuffer::fill_rect` has two arms. The aarch64 arm clamps `y1` to the surface height and then
+walks; **the x86_64 arm is the per-pixel loop with no height pre-clip**, so every row past the
+destination's last was still walked and every pixel of it still paid a call and four bounds checks
+to be rejected. `fill_rect_v` clipped only the TOP edge (WC-M's concern), and `fill_rect_ceramic`
+clipped neither — it is an explicit row loop that paid a `ceramic::shade` (a table lookup, three
+multiplies, a clamp per channel) to produce a colour for a row the destination then threw away. The
+side-border rects are the content's full height, so a five-band present walked them five times over.
+
+`clip_rows` now states the arithmetic once and both callers use it. **The pixel set does not move**:
+for `y >= 0` the old call filled `[y, min(y + h, dh))` after `put_pixel`'s rejections, and for
+`y < 0` it filled `[0, min(h - skip, dh))` — exactly what `clip_rows` returns. `shade` is a pure
+function of the box-local row, which the clip does not move, so the grain still anchors to the
+window and still runs continuously across a band seam.
+
+**Measured, on both paths, at bench geometry:**
+
+```
+before  [wc-b] fixture geom=2880x1800 chunk_rows=364 bands=5 chrome_rows=10280 chrome_rows_used=2056 amp=5.00x -> AMPLIFIED
+after   [wc-b] fixture geom=2880x1800 chunk_rows=364 bands=5 chrome_rows=2056  chrome_rows_used=2056 amp=1.00x -> CLEAN
+```
+
+`chrome_rows=` counts loop iterations executed; `chrome_rows_used=` is an INDEPENDENT test of each
+iteration's row against the destination's own height. Neither is derived from the other, so `1.00x`
+is a measurement and not a tautology, and a regression that widens the walk separates them again.
+
+#### The gate cannot reach this path, and that is why the fixture exists
+
+Banding needs `bw * span > 1 048 576` px (`MAX_STAGE_BYTES / 4`). Measured on this track:
+
+| panel | largest box the gate builds | banded? |
+|---|---|---|
+| 1280x800 (QEMU default) | the whole panel is 1 024 000 px — **24 576 short** | never, in principle |
+| 1920x1200 (forced) | 522x556 = 290 232 px | never |
+
+Both runs printed `banded=0 maxbands=1` over every present. **`UNAOS_FBW`/`UNAOS_FBH` do not help:
+they are read with `option_env!` by `arch/aarch64/mailbox.rs` and have no effect on x86** — the x86
+panel comes from the bootloader's GOP mode selection, which takes EDID or the firmware's current
+mode. (`UNAOS_QEMU_EXTRA="-vga none -device VGA,edid=on,xres=…,yres=…"` does move it, and is how the
+1920x1200 row above was taken.) Even at bench width the gate has no full-panel-width window: the
+banded present on the bench is the console-as-a-window, which this gate does not route.
+
+So a green gate over the shipped path would have certified nothing about banding. `chromeband_fixture`
+drives the band loop's own `paint_window` call at 2880x1800 against a one-band scratch buffer — never
+touching the panel, so it cannot disturb `[wc-d]`'s read-back — and puts `bands=5` on the wire of
+every x86 witness boot. It is labelled `fixture` on that wire, and reads `-> NOT-BANDED` if the
+geometry ever stops exercising the defect.
+
 ## CURSOR-VUG — a focused app was swallowing the pointer, and the arrow with it (2026-08-08)
 
 Peter, Boots AL and AO: *"vug blocks mouse cursor" / "vug covers mouse"* — the arrow disappears over
@@ -13543,6 +13596,67 @@ gate leak. The proof owed is knob-off **210 green**, which it is. The `pidesk`-g
 the usual discipline regardless: `arch/aarch64/syscall.rs` and `main.rs` are both exactly
 **line-neutral** (22504 and 5032 lines, unchanged), each added line paid for by a line of prose
 compressed in the same file, so the gated arm cannot shift a panic `Location` in the knob-off build.
+
+### DRAGWIDE — M1's narrowing was undone in the same breath it was taken (x86 `wc`, 2026-08-25)
+
+Convicted independently on both tracks, at the same site. M1 narrowed `move_to_inner` from
+`request_full_present()` to the old box and the new one. But `move_to_inner` ends in `composite()`,
+`composite_inner` opens by calling `drain_deferred`, and `drain_deferred` ended with
+
+```rust
+if painted { super::screen::request_full_present(); }
+```
+
+so on every move whose vacated sliver was non-empty — every drag step — `FULL_PRESENT` was re-armed
+**after** M1's two rect requests. `present_background` then took the `mark_full()` branch, threw the
+queue away, and republished the panel. The narrowing was defeated on precisely the path it was
+written for.
+
+**The widening was deliberate in purpose and wrong in extent**, so the guard was scoped, not removed.
+WC-J's duty is real: only the desktop can put its own content (console text, status strip) back under
+a departed window, since the erase can only paint `DESKTOP_BG`. But the content needing restoration
+is the content the erase just covered — this box, and nothing outside it. That is M1's own argument,
+applied where M1 stopped. Overflow is safe: `request_present_rect` merges into the least-growth slot
+when the queue is full and disjoint, so the result is always a superset of what was owed. No rect is
+dropped; the failure mode is a slower present, not a wrong one.
+
+**Measured on x86 (gate panel 1280x800):**
+
+```
+before  [wc-w] rollup presents=49 requested_px=430548  presented_px=4096000 amp=9.51x full_presents=3 -> WIDENED
+after   [wc-w] rollup presents=57 requested_px=1086744 presented_px=3072000 amp=2.82x full_presents=2 -> WIDENED
+```
+
+Exactly one whole panel (1 024 000 px) leaves the present budget and the drain's escalation is gone.
+`requested_px` RISES because the drain's boxes now appear as honest requests instead of being
+replaced. The two surviving full presents are `focus_changed` and the menu's `repaint_vacated`, which
+are not this path's — the line still reads `WIDENED` because that verdict is about the panel-escalation
+count, not about this arc, and suppressing it would be the instrument lying about traffic it can see.
+
+#### Why no instrument caught it, and what does now
+
+`[dragperf] px_per_move=` is charged at the REQUEST site, in `move_to_inner`. It therefore reported
+M1's `extent_speedup` faithfully while the drain behind it republished the panel — a witness sitting
+directly beside the defect it could not see. The presented side is now counted in
+`present_background`, from the damage set, at the same instant the requested side is read from the
+queue it drained. `[wc-w] rollup` is the **x86** reader: without it these counters would be a census
+nobody prints, since `[dragperf]` is driven only from `arch/aarch64`.
+
+#### The general shape: motion rate vs event rate
+
+The class this belongs to is *"an always-on maintenance path escalating to full-surface at MOTION
+rate rather than EVENT rate."* Audited on x86 after the fix, the surviving `request_full_present()`
+callers are `focus_changed` (asid 0), `minimise`, `zoom`, `reclaim`, and `crystal::repaint_vacated` —
+**all event rate**, one per user action. `drain_deferred` was the only motion-rate member, and it is
+gone. The cursor bracket and the deferred erase were already off this path (FLICKER-2 removed the
+bracket from the drain, FLICKER-3 from `Screen::flush`, and WC-K2 made `erase` queue rather than
+paint). `screen.rs`'s other `mark_full` callers — `fill_screen`, `paint_desktop_scene`, `scroll_up` —
+are startup or event rate likewise.
+
+The two defects on this arc do compound in the stated direction — an inflated publish is what pushes
+`span` past `chunk_rows` — but they are not one cause: DRAGWIDE inflates the DESKTOP's damage set,
+while banding is a function of a WINDOW's own box, and the gate's windows are two orders of magnitude
+short of the threshold either way.
 
 ## CONSWIN-PI / MENUBAR-PI — the console gets a window and the bar gets turned on (aarch64 `pidesk`, 2026-08-13)
 
