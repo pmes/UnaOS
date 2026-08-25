@@ -35,6 +35,33 @@
 # scoped to move them. Required witnesses are unchanged at 13 (a `COMPLETE` is never
 # counted into the tally — mbench.py:176); spec-declared FORBID rows go 5 -> 7, three
 # arrive and the one that could never match is gone.
+#
+# 2026-08-25 (exec-spec, second pass): THE PENDING SWEEP. All 8 PENDING rows matched on
+# boot7f, and "it matched" was NOT treated as sufficient — the test applied to each was
+# whether promoting it adds a way for a HEALTHY boot to red. Three passed and were
+# promoted (the EL0-EL1CORE trio); five were left PENDING, every one of them because its
+# emitter is behind a `#[cfg(feature = …)]` that this spec does NOT already force, so a
+# REQUIRE would fail on CONFIGURATION rather than on health — the SMPMARK argument, and
+# the same shape as the TEGRA-SD defect fixed below:
+#   `[orinwm1] win=`           `#[cfg(feature = "orindesk")]`, display_tegra.rs:376
+#                              (arroyo:735, `UNAOS_ORINDESK=1`, default OFF)
+#   `[orinclick] arm`          `#[cfg(feature = "orinclick")]`, display_tegra.rs:1265
+#   `[orinclick] census`       same gate (arroyo:790, `UNAOS_ORINCLICK=1`, default OFF)
+#   `JD1-DC VERDICT=`          `#[cfg(feature = "jd1dc")]`, display_tegra.rs:631
+#                              (arroyo:756, `UNAOS_JD1DC=1`, "default OFF" in its own note)
+# and one for a different and stronger reason:
+#   `IRQEL-RT: first IRQ taken at EL1`  NOT knob-gated, but it is the PASS arm of a
+#     THREE-WAY verdict whose FAIL arm real metal has actually printed (boot5c,
+#     `capture/line-acm0/orin.log:8311`). This file already says a REQUIRE here "would
+#     convert the instrument into a rubber stamp", and one capture of the good arm does
+#     not turn a measurement into an invariant. Promotion needs a second flight at
+#     minimum — the two-trial bar this file itself set for TEGRA-SD.
+# THE PROMOTIONS COST ONE THING AND IT IS STATED RATHER THAN DISCOVERED LATER: boot5c
+# (orin2-boot5c-gui.log) carries ZERO hits for all three promoted rows, because 4309446
+# predates the EL0-EL1CORE arc. Replaying boot5c against this file now reads FAIL where it
+# used to read PASS. That is correct and not a regression in the spec — a spec adjudicates
+# the NEXT flight, the argument this file already makes for the IRQEL FAIL wording — but a
+# reader reaching for boot5c as a green reference should know it is no longer one.
 
 # --- boot bring-up witnesses (the JD/JB chain — all previously metal-proven) --------
 REQUIRE JD1.*scanout:.*sane=true
@@ -98,11 +125,20 @@ REQUIRE TEGRA-SD.*block backend published
 # lines above stop for good at `EL0_REFUSE_LOG_MAX` (one cap-announce, then silence); the rollup is
 # rate-limited to ~1/s but never goes permanently blind, because its guard is "the count CHANGED"
 # — so the wire converges on the true total within a second of the last refusal.
-# PENDING, not REQUIRE: the line is code ahead of its bench. It was `#[cfg(feature = "pi")]`
-# for the whole tegra_el0 bring-up, so NO Orin capture can carry it — boot5c
-# (orin2-boot5c-gui.log) has zero hits for `SCHED: task`, which is exactly the blindness the
-# arc removed. Promote to REQUIRE on the first capture that carries it, per the standing rule.
-PENDING SCHED: task 'el0-hello' -> core 0 \(policy: caller-pinned EL0 residents=[0-9]+, no-migrate\)
+# PROMOTED PENDING -> REQUIRE (exec-spec, 2026-08-25), on exactly the capture the old note
+# asked for. It was `#[cfg(feature = "pi")]` for the whole tegra_el0 bring-up, so no Orin
+# capture COULD carry it — boot5c (orin2-boot5c-gui.log) still has ZERO hits for `SCHED: task`,
+# which is the blindness the arc removed. boot7f is the first capture that carries it:
+#   `:: SCHED: task 'el0-hello' -> core 0 (policy: caller-pinned EL0 residents=1, no-migrate) ::`
+#   — boot7f, `capture/line-acm0/orin.log:11395`
+# THE TEST THE PROMOTION HAD TO PASS IS NOT "A CAPTURE HAS IT" BUT "IT ADDS NO NEW WAY FOR A
+# HEALTHY BOOT TO RED", and it passes: `spawn_user_inner`'s witness (sched.rs:3800) is un-gated,
+# and the only knob anywhere in the chain is `tegra_el0` — which `REQUIRE TEGRA-EL0 ..
+# round-trip -> PASS` above ALREADY demands. Any image that can satisfy that row spawns this
+# task and prints this line; any image that cannot was already going to red on that row. So
+# this is NOT the knob-gated trap the SMPMARK block argues against. The pin to `core 0` is
+# main.rs:6108's deliberate `spawn_user("el0-hello", .., 0)`.
+REQUIRE SCHED: task 'el0-hello' -> core 0 \(policy: caller-pinned EL0 residents=[0-9]+, no-migrate\)
 OPTIONAL SCHED: EL0 placement REFUSED \([a-z]+\) '[^']*' req=-?[0-9]+
 # The LAST-INSTANT backstop in `user_task_trampoline`, and this one IS a fault signature —
 # the only FORBID in this file that is not a hardware fault. It prints when an EL0 task
@@ -126,16 +162,32 @@ FORBID SCHED: EL0 entry REFUSED
 #   obvious site, after the inner `while`, is RUNTIME DEAD on tegra: main.rs stages the infinite
 #   `jd2_console_pump`, so that queue never drains and the inner loop never returns.) The baseline
 #   is the falsifier for the whole instrument: `EL0_ROLLUP_LAST` starts at `u64::MAX`, so `0 != MAX`
-#   and a boot that refuses NOTHING still prints one `el0refuse=0`. PENDING, therefore, and not
-#   OPTIONAL: absence on the next tegra capture means the reader is not linked or not reached, which
-#   is a real regression and should advise promotion once a capture carries it.
-PENDING \[el0core\] rollup: el0refuse=[0-9]+ el1cores=0x[0-9a-f]+
-#   sched.rs:3209 THE STAMP. `mark_el1_core` is called from main.rs:2588, inside `tegra_early_stop`
+#   and a boot that refuses NOTHING still prints one `el0refuse=0`.
+#   PROMOTED PENDING -> REQUIRE (exec-spec, 2026-08-25). Evidence:
+#     `:: SCHED: [el0core] rollup: el0refuse=0 el1cores=0x1 (EL0-EL1CORE) ::`
+#     — boot7f, `capture/line-acm0/orin.log:11407`
+#   AND THE BASELINE CALL IS WHAT MAKES THE PROMOTION SAFE: sched.rs:9831 runs it
+#   unconditionally before the drive loop, inside `run_capstone_boot_core`, which
+#   `REQUIRE CAPSTONE COMPLETE` above already demands. The function body is guarded by a `cfg!`
+#   CONSTANT (not `#[cfg]`) on `any(baremetal, tegra_el0)` — sched.rs:3351 says so and sched.rs:3356
+#   spells out that an unarmed build "reaches `run_capstone_boot_core` and prints NOTHING". On THIS
+#   spec that costs nothing: `tegra_el0` is already forced by `REQUIRE TEGRA-EL0 .. -> PASS`, so
+#   every image that can pass this file has the reader linked AND reached, and a boot that refuses
+#   nothing still prints the `el0refuse=0` baseline. Absence now means not-linked or not-reached,
+#   which is the regression this row was always meant to catch.
+REQUIRE \[el0core\] rollup: el0refuse=[0-9]+ el1cores=0x[0-9a-f]+
+#   sched.rs:3209 THE STAMP. `mark_el1_core` is called from main.rs:2677, inside `tegra_early_stop`
 #   (`#[cfg(all(feature = "tegra", target_arch = "aarch64"))]`), with NO runtime knob and strictly
 #   before `tegra_el0_start_maybe()` — an unstamped mask would refuse the pinned `el0-hello`, so the
 #   `REQUIRE TEGRA-EL0 .. round-trip -> PASS` above cannot pass without this line having printed.
-#   Unconditional on a tegra image, therefore PENDING-promotable on the first capture that has it.
-PENDING \[el0core\] el1 core MEASURED: cpu=[0-9]+ mask=0x[0-9a-f]+
+#   PROMOTED PENDING -> REQUIRE (exec-spec, 2026-08-25). Evidence:
+#     `:: SCHED: [el0core] el1 core MEASURED: cpu=0 mask=0x1 (EL0-EL1CORE) ::`
+#     — boot7f, `capture/line-acm0/orin.log:11384`
+#   THE STRONGEST OF THE THREE PROMOTIONS: `mark_el1_core` carries no `#[cfg]` of its own and its
+#   call site (main.rs:2677) carries none either — it sits bare on the statement before
+#   `exceptions::install()` and `el1_oneshot_proof()`, and `REQUIRE IRQEL-RT: EL1 one-shot proof`
+#   above already demands the line printed two statements later. Unconditional on a tegra image.
+REQUIRE \[el0core\] el1 core MEASURED: cpu=[0-9]+ mask=0x[0-9a-f]+
 #   sched.rs:3194 and :3202 THE TWO FAIL-CLOSED ARMS, sharing the prefix below (CurrentEL != 1, and
 #   cpu_index out of range). OPTIONAL, and the kind is the decision, exactly as for the IRQEL trio:
 #   this is a FAULT path. A boot that works correctly never prints it, so PENDING would advise
