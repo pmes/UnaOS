@@ -389,6 +389,116 @@ const MAX_PRESENT_RECTS: usize = 8;
 static PRESENT_RECTS: Mutex<([(usize, usize, usize, usize); MAX_PRESENT_RECTS], usize)> =
     Mutex::new(([(0, 0, 0, 0); MAX_PRESENT_RECTS], 0));
 
+// ---- DRAGWIDE: the desktop present's amplification census --------------------------------------
+//
+// DRAG-PI M1 narrowed `move_to_inner` from a whole-panel present to the old box and the new one, and
+// `[dragperf] mode=rects px_per_move=` measures that narrowing at the REQUEST site. What no
+// instrument measured was whether the present the desktop then took honoured it — and it did not:
+// the drain at the head of the very `composite()` a move ends with re-armed `FULL_PRESENT`, so the
+// panel was republished anyway and `[dragperf]` reported the speedup regardless. An instrument that
+// cannot see the defect it sits next to is the shape of witness the laws forbid, so the presented
+// side is now counted beside the requested one.
+//
+// Monotone totals, drained by `desk_present_take` exactly as `move_present_take` drains the request
+// side, so the two halves of the ratio are taken over the same window of presents.
+#[cfg(feature = "witness")]
+static DESK_REQ_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static DESK_PRES_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static DESK_FULL_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAGWIDE — charge one desktop present: what its queue asked for, what its damage set published,
+/// and whether the whole-panel flag replaced the former with the latter.
+#[cfg(feature = "witness")]
+fn desk_present_note(req_px: u64, pres_px: u64, full: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    DESK_REQ_PX.fetch_add(req_px, Relaxed);
+    DESK_PRES_PX.fetch_add(pres_px, Relaxed);
+    DESK_N.fetch_add(1, Relaxed);
+    if full {
+        DESK_FULL_N.fetch_add(1, Relaxed);
+    }
+}
+
+/// DRAGWIDE — the desktop present census as a SNAPSHOT: `(requested_px, presented_px, full_presents,
+/// presents)`. Non-destructive, on `wcg::stage_rollup`'s rule — every quantity here is a monotone
+/// total incremented once per present at record time, so re-reading one cannot double-count and two
+/// readers cannot rob each other. A caller wanting a delta (the `[dragperf]` sweep) takes a snapshot
+/// either side and subtracts.
+#[cfg(feature = "witness")]
+pub(super) fn desk_present_snapshot() -> (u64, u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        DESK_REQ_PX.load(Relaxed),
+        DESK_PRES_PX.load(Relaxed),
+        DESK_FULL_N.load(Relaxed),
+        DESK_N.load(Relaxed),
+    )
+}
+
+/// DRAGWIDE — `presented / requested` in hundredths, so the wire carries two decimals without a
+/// float. No request (`req == 0`) answers 0 rather than dividing: a present nobody asked for has no
+/// amplification, and 0 cannot be confused with `100`.
+#[cfg(feature = "witness")]
+#[inline]
+fn desk_amp_x100(req: u64, pres: u64) -> u64 {
+    if req == 0 {
+        0
+    } else {
+        pres.saturating_mul(100) / req
+    }
+}
+
+/// DRAGWIDE — the x86 READER. Without it these counters would be a census nobody prints, which is
+/// the `COMP_REVENANTS` failure exactly: `[dragperf]` is the only other reader and it is driven from
+/// `arch/aarch64`, so on this track the numbers would have existed and never reached a wire.
+///
+/// Rate-gated to one line a second and emitted from [`Screen::flush`]'s tail, after the blit, so a
+/// desktop presenting at frame rate costs one compare per present and never a serial write inside
+/// the copy it would otherwise be timing.
+///
+/// **How to read it.** `amp=1.00x` means the desktop published about what its queue asked for.
+/// `full_presents=` is the discriminator beside it: a whole-panel escalation throws the queue away,
+/// so a non-zero count on a drag is the DRAGWIDE defect back. The ratio alone is not enough — the
+/// damage set also carries console text and strip damage this queue never asked for, so a ratio a
+/// little over 1 is ordinary traffic and a ratio of several is the panel being republished.
+#[cfg(feature = "witness")]
+fn desk_amp_flush() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let last = DESK_LASTROLL.load(Relaxed);
+    let now = crate::arch::now_cycles();
+    if super::wcg::cycles_to_us(now.saturating_sub(last)) < 1_000_000 {
+        return;
+    }
+    if DESK_LASTROLL
+        .compare_exchange(last, now, core::sync::atomic::Ordering::AcqRel, Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let (req, pres, full, n) = desk_present_snapshot();
+    if n == 0 {
+        return;
+    }
+    let a = desk_amp_x100(req, pres);
+    serial_println!(
+        "[wc-w] rollup presents={} requested_px={} presented_px={} amp={}.{:02}x full_presents={} -> {}",
+        n,
+        req,
+        pres,
+        a / 100,
+        a % 100,
+        full,
+        if full > 0 { "WIDENED" } else { "HONOURED" }
+    );
+}
+
+#[cfg(feature = "witness")]
+static DESK_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static DESK_LASTROLL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// DRAG-PI M1 — **ask the desktop layer to repaint exactly this box on its next present.**
 ///
 /// The narrow twin of [`request_full_present`], and the whole of the drag arc's desktop-side saving.
@@ -1047,6 +1157,10 @@ impl Screen {
         } else {
             super::wm::service_damage();
         }
+        // DRAGWIDE — the desktop amplification rollup, at the tail of the flush and after the blit,
+        // so the once-a-second serial write is never charged to the copy it reports on.
+        #[cfg(feature = "witness")]
+        desk_amp_flush();
     }
 
     /// FLICKER-3 — does this present owe the sprite the CURSOR-13 bracket?
@@ -1119,7 +1233,19 @@ impl Screen {
             q.1 = 0;
             (q.0, n)
         };
-        if FULL_PRESENT.swap(false, core::sync::atomic::Ordering::AcqRel) {
+        // DRAGWIDE — what this present was ASKED for, read from the queue it just drained and BEFORE
+        // the full flag can replace it. Post-merge, so two overlapping drag boxes count as the one
+        // rect the queue actually holds rather than twice over.
+        #[cfg(feature = "witness")]
+        let req_px: u64 = owed.0[..owed.1]
+            .iter()
+            .map(|&(_, _, w, h)| (w as u64).saturating_mul(h as u64))
+            .sum();
+        #[cfg(feature = "witness")]
+        let full = FULL_PRESENT.swap(false, core::sync::atomic::Ordering::AcqRel);
+        #[cfg(not(feature = "witness"))]
+        let full = FULL_PRESENT.swap(false, core::sync::atomic::Ordering::AcqRel);
+        if full {
             self.mark_full();
         } else {
             for &(x, y, w, h) in owed.0.iter().take(owed.1) {
@@ -1127,6 +1253,23 @@ impl Screen {
             }
         }
         let n = self.damage.len;
+        // DRAGWIDE — and what it is about to PUBLISH, taken from the damage set at the same instant
+        // and from a different source than `req_px`. The pair is the amplification: a present that
+        // honoured its request reads `1.00x`, and one that threw the queue away for `mark_full`
+        // reads the panel over the box. `full_presents=` is the discriminator beside the ratio —
+        // the damage set can also carry console text and strip damage this queue never asked for, so
+        // a ratio slightly over 1 is ordinary and a full-panel escalation is not.
+        #[cfg(feature = "witness")]
+        {
+            let pres_px: u64 = self.damage.rects[..n]
+                .iter()
+                .map(|d| {
+                    (d.x1.saturating_sub(d.x0) as u64)
+                        .saturating_mul(d.y1.saturating_sub(d.y0) as u64)
+                })
+                .sum();
+            desk_present_note(req_px, pres_px, full);
+        }
         self.damage.clear();
         self.last_flush_bytes = 0;
         self.last_flush_bands = 1;

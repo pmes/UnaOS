@@ -17214,7 +17214,8 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
             MENU_OCC_MAX
         );
     }
-    let mut painted = false;
+    // DRAGWIDE — `painted` is gone with the whole-panel request it guarded: the desktop repaint is
+    // now asked for per box, inside the loop, so there is no end-of-drain decision left to latch.
     for &(x, y, w, h) in boxes[..n].iter() {
         // Re-clip: a coalesced union is a synthesised box, and the panel geometry it was clipped
         // against belonged to the original erase.
@@ -17261,12 +17262,29 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
                 super::cursor::note_present_over_sprite(sprite_hit);
             }
         }
-        painted = true;
-    }
-    if painted {
-        // WC-J's third step: only the desktop can put its own content (console text, status strip)
-        // back under a departed window; the erase above can only paint `DESKTOP_BG`.
-        super::screen::request_full_present();
+        // DRAGWIDE — WC-J's third step, scoped to THIS BOX. Only the desktop can put its own content
+        // (console text, status strip) back under a departed window; the erase above can only paint
+        // `DESKTOP_BG`. That duty is real and is unchanged — what changes is its extent.
+        //
+        // **This line was `request_full_present()`, hoisted out of the loop, and it silently undid
+        // DRAG-PI M1.** M1 narrowed `move_to_inner` from a whole-panel present to the old box and the
+        // new one, measuring the 8.5x it removed. But `move_to_inner` ends in `composite()`, and
+        // `composite_inner` opens by calling this drain — so on every move whose vacated sliver is
+        // non-empty, `painted` went true and `FULL_PRESENT` was re-armed AFTER M1's two rect
+        // requests. `present_background` then took the `mark_full()` branch, threw the queue away and
+        // republished the panel. M1's narrowing was defeated on precisely the path it was written
+        // for, and `[dragperf]`'s `px_per_move=` could not see it because it is charged at the
+        // request site.
+        //
+        // The narrowing here is M1's own argument, verbatim and on the same authority: the desktop
+        // content that needs restoring is the content the erase just covered, which is this box and
+        // nothing outside it. `damage_intersecting` above already reaches only rows overlapping it.
+        //
+        // Overflow is the queue's and is SAFE: `request_present_rect` merges into the least-growth
+        // slot when it is full and disjoint (`screen.rs`), so the result is always a superset of what
+        // was owed. No rect is dropped, so the narrowing cannot introduce a ghost — the failure mode
+        // is a slower present, not a wrong one.
+        super::screen::request_present_rect(x, y, w, h);
     }
     // FLICKER-2 — the caller owes the sprite a repaint exactly when this drain disturbed it, which
     // is the `sprite_hit` arm and NOT `painted`: a masked handback whose boxes all re-deferred has
@@ -20648,6 +20666,11 @@ pub fn dragperf_selftest() {
     // measurement needed or possible to establish it. Quoting it as a measurement would be dressing
     // an identity up as evidence; quoting it as what the removed line charged is simply reading it.
     let _ = move_present_take();
+    // DRAGWIDE — the PRESENTED side, snapshotted either side of the same sweep that measures the
+    // requested side. This fixture could previously only see what a move ASKED for, so it reported
+    // M1's `extent_speedup` while the drain behind it was still republishing the whole panel. See
+    // `screen::desk_present_snapshot`.
+    let desk_before = super::screen::desk_present_snapshot();
     let mut moves_b = 0usize;
     for i in 0..STEPS {
         if move_to(w, BORDER + i * step, oy) {
@@ -20671,6 +20694,21 @@ pub fn dragperf_selftest() {
     serial_println!(
         "[dragperf] mode=rects measured steps={} moves={} reqs={} px={} px_per_move={}",
         STEPS * 2, moves_b, reqs_b, px_b, pm_b
+    );
+    // DRAGWIDE — what the desktop actually PUBLISHED over the same sweep, as a delta against the
+    // snapshot above. `full_presents=` is the conviction: before this arc the drain re-armed
+    // `FULL_PRESENT` after every move that vacated a sliver, so this count equalled the move count
+    // and `presented_px` was the panel over and over. Zero is the fixed reading.
+    let desk_after = super::screen::desk_present_snapshot();
+    let d_req = desk_after.0.saturating_sub(desk_before.0);
+    let d_pres = desk_after.1.saturating_sub(desk_before.1);
+    let d_full = desk_after.2.saturating_sub(desk_before.2);
+    let d_n = desk_after.3.saturating_sub(desk_before.3);
+    let damp = if d_req == 0 { 0 } else { d_pres.saturating_mul(100) / d_req };
+    serial_println!(
+        "[dragperf] desk presents={} requested_px={} presented_px={} amp={}.{:02}x full_presents={} -> {}",
+        d_n, d_req, d_pres, damp / 100, damp % 100, d_full,
+        if d_full > 0 { "WIDENED" } else { "HONOURED" }
     );
 
     // ---- Half 1b: THE ROUTER ARM IS REACHABLE ---------------------------------------------------
