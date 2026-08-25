@@ -1046,10 +1046,24 @@ impl CoreAccount {
         // is the case SCHED-8 introduced it for; `fold_age_cyc` is deliberately left untouched, so
         // WEDGE-1's much tighter "may I pin work here" gate keeps reading the raw fold age and
         // still disqualifies a core that is not going round the dispatch loop.
+        //
+        // SMPINSTR (2026-08-25) — READ THIS ARM AS AN INSTRUMENT WRITER. It is UNCONDITIONAL: any
+        // non-zero `run_t0` means tracked, with no bound on how long that span has been open. A core
+        // that took an exception mid-task and never came back keeps `run_t0` pinned at its dispatch
+        // stamp forever (only `account()` clears it, and a dead core never reaches a fold), so this
+        // arm reports `tracked = true` for a corpse for the rest of the boot — and `busy_pct()`'s
+        // case 1 (`live >= budget`) reports that corpse 100%. That is the pi boot-11 reading:
+        // `:: SCHED: load :: c3=100%` for a core killed by a synchronous exception, one line after
+        // `[el0live] verdict=LIVE`. The arm is NOT removed here: it is correct for the case it was
+        // added for (a genuinely compute-bound core), and this predicate is also read by
+        // `ui_status`, so weakening it would re-open the "45% unused while vugs starved" hole. The
+        // fix is a rule on CONSUMERS — no printer may emit this boolean, or the percent it
+        // qualifies, without the RAW fold age beside it and a staleness tell. `fold_stale_cyc()` is
+        // factored out of the line below so a teller can name this exact arm; see `load_columns`.
         if self.run_t0.load(Ordering::Relaxed) != 0 {
             return true;
         }
-        now_cyc().wrapping_sub(last) < load_window_cyc().saturating_mul(2)
+        now_cyc().wrapping_sub(last) < fold_stale_cyc()
     }
 
     /// WEDGE-1 — cycles since the last fold, or `u64::MAX` if this core has never folded a span.
@@ -1149,6 +1163,17 @@ pub struct CoreLoad {
 /// for one frame, a false "fresh" costs a task parked forever.
 pub fn dispatch_fresh_cyc() -> u64 {
     (load_window_cyc() / 8).max(1)
+}
+
+/// SMPINSTR — the fold-age bound `CoreAccount::tracked()` thresholds when it is NOT short-circuited
+/// by an in-flight span: two load windows, ~500 ms. Factored out of `tracked()` (whose body was the
+/// only definition) so a witness can ask the question `tracked()` skips — "is this core's freshness
+/// claim backed by an actual FOLD, or only by a `run_t0` that nothing will ever clear?" — against the
+/// SAME number, with no way for the two to drift apart. A core that is `tracked()` while its
+/// `fold_age_cyc` is at or past this bound is tracked SOLELY by the unconditional `run_t0` arm; that
+/// is the wedge signature, and it is what `load_columns` prints as `!NOFOLD`.
+fn fold_stale_cyc() -> u64 {
+    load_window_cyc().saturating_mul(2)
 }
 
 /// SCHED-2 — read this core's live load: recent busy percent (rolling window), cumulative context
@@ -8102,11 +8127,22 @@ pub fn core_load_report() {
 const LOAD_WITNESS_INTERVAL: u64 = 1024;
 /// Aggregate tick accumulator across cores (whichever core lands on the interval boundary emits).
 static LOAD_WITNESS_TICKS: AtomicU64 = AtomicU64::new(0);
-/// Packed busy-percents of the last emitted line (`c0 | c1<<8 | c2<<16 | c3<<24`), for change-only
-/// suppression — a steady-state system stops re-printing an unchanged load line.
-static LOAD_WITNESS_LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Packed per-core busy-percent bytes of the last emitted line (`c0 | c1<<8 | .. | c7<<56`), for
+/// change-only suppression — a steady-state system stops re-printing an unchanged load line.
+///
+/// SMPINSTR — the "nothing emitted yet" seed is `0xC8` in every byte, not `u64::MAX`. A byte is a
+/// percent (0..=100) or one of two reserved sentinels (255 untracked, 254 tracked-but-not-folding),
+/// so 200 is unreachable and cannot be mistaken for a real reading. `u64::MAX` was safe only while
+/// the packer covered 4 cores and the top four bytes were structurally 0; with `NUM_CPUS == 8` on
+/// tegra an all-cores-untracked machine packs to exactly `u64::MAX`, which would have compared equal
+/// to the seed and suppressed the FIRST line — silencing the witness on precisely the machine whose
+/// every core is unaccounted. The seed must be a value the packer cannot produce.
+static LOAD_WITNESS_LAST: AtomicU64 = AtomicU64::new(0xC8C8_C8C8_C8C8_C8C8);
 /// `ctx_switches` sum snapshot at the last emission, to derive the per-window context-switch delta.
 static LOAD_WITNESS_CTX: AtomicU64 = AtomicU64::new(0);
+/// SMPINSTR — CNTPCT deadline for the cooperative-terminus poll (`load_witness_poll`); the tegra/virt
+/// rate limit, in the shape `EL0_ROLLUP_NEXT` established for the same drive loop.
+static LOAD_POLL_NEXT: AtomicU64 = AtomicU64::new(0);
 
 /// PULSE-5 — count of load windows closed by a FOLD (`account` reaching the budget at a dispatch
 /// boundary). It is the denominator of the arc's claim: reads are no longer waiting on these. Bumped
@@ -8126,6 +8162,81 @@ fn cyc_to_ms(cyc: u64) -> u64 {
     cyc / (frq / 1000).max(1)
 }
 
+/// SMPINSTR — one core's load reading taken at a single instant, so the change-signature and the
+/// printed line are computed from the SAME sample rather than from two `core_load` calls a few
+/// microseconds apart. Three fields only: the derived percent, the boolean that qualifies it, and
+/// the RAW fold age that neither of the first two exposes.
+#[derive(Clone, Copy)]
+struct CoreSnap {
+    pct: u32,
+    tracked: bool,
+    fold_age: u64,
+}
+
+/// SMPINSTR — render the per-core columns of the `:: SCHED: load ::` line.
+///
+/// TWO defects are fixed here, both of which made this witness lie about the exact condition it
+/// exists to expose.
+///
+///   1. **Half the machine had no column.** The format string hard-coded `c0..c3` while `NUM_CPUS`
+///      is 8 on tegra, so cores 4..7 were invisible: a wedge, a never-started core and a saturated
+///      core up there all printed identically, i.e. not at all. The columns are now derived from
+///      `NUM_CPUS`, so the line's width IS the array bound it reads. On the Orin that is 8 columns
+///      for a part whose DTB `/cpus` names 6 (see `percpu::METER_CPU_COUNT`); the two surplus slots
+///      report `--/f=never-folded`, which is the honest reading for an accounting slot no core ever
+///      touched, and is deliberately preferred to hiding them — a slot that is silently not printed
+///      cannot be distinguished from one that is printed and dead.
+///
+///   2. **A wedged core read `busy=100% tracked=true` forever.** `run_t0` is stamped at dispatch and
+///      cleared only by `account()`, which a core that never returns from its task never reaches, so
+///      `CoreAccount::tracked()`'s unconditional `run_t0` arm keeps answering yes and
+///      `busy_pct()`'s case 1 keeps answering 100 — for the rest of the boot. The one state this
+///      instrument exists to expose was byte-for-byte identical to a healthy busy core.
+///
+/// So every column carries its raw word and a staleness tell, never a derived value alone:
+///
+/// ```text
+///   c0=7%/f=2ms          derived 7%, last folded 2 ms ago — busy AND going round the dispatch loop
+///   c3=100%/f=12040ms!NOFOLD   derived 100%, has not folded in 12 s — the corpse reading
+///   c5=--/f=830ms        untracked: no live number offered, and how stale is said out loud
+///   c7=--/f=never-folded this accounting slot has never been folded at all
+/// ```
+///
+/// `f=` is `CoreLoad::fold_age_cyc`, the RAW measurement under both `tracked()` and this tell, in
+/// ms against the same cached CNTFRQ every other witness ms is expressed in (`cyc_to_ms`).
+/// `!NOFOLD` fires exactly when `tracked` is true while the fold age has reached
+/// `fold_stale_cyc()` — that is, precisely when the freshness claim came from the `run_t0` arm and
+/// from nothing else. It is a NAME for a condition, never an assertion: a genuinely compute-bound
+/// core holding one task for 12 s prints it too, and correctly, because from outside the core those
+/// two states are not distinguishable and claiming otherwise would be the same lie in a new place.
+/// What the reader gets is the raw span to judge against, and `[pulse5]`/`[spin1]` beside it name
+/// the task. Reads only, allocation is one `String`, and it is reached only on a window that
+/// actually prints.
+fn load_columns(snap: &[CoreSnap; NUM_CPUS]) -> alloc::string::String {
+    use core::fmt::Write as _;
+    let stale = fold_stale_cyc();
+    let mut s = alloc::string::String::new();
+    for (i, c) in snap.iter().enumerate() {
+        if c.tracked {
+            let _ = write!(s, "c{}={}%", i, c.pct);
+        } else {
+            // SCHED-8: an untracked core prints `--` (no live number) rather than its frozen
+            // last-window percent.
+            let _ = write!(s, "c{}=--", i);
+        }
+        if c.fold_age == u64::MAX {
+            let _ = write!(s, "/f=never-folded");
+        } else {
+            let _ = write!(s, "/f={}ms", cyc_to_ms(c.fold_age));
+        }
+        if c.tracked && c.fold_age >= stale {
+            let _ = write!(s, "!NOFOLD");
+        }
+        let _ = write!(s, " ");
+    }
+    s
+}
+
 /// SCHED-2 periodic load heartbeat: called once per `timer_preempt` (per core, per tick, metal-only).
 /// The core whose atomic increment lands exactly on the `LOAD_WITNESS_INTERVAL` boundary is the sole
 /// emitter for that window (fetch_add hands each multiple to exactly one core), so there is no
@@ -8142,36 +8253,111 @@ fn load_witness_tick() {
     // liveness census on load movement would mute it exactly when it is the only line worth having.
     // It carries its own (liveness-shaped) suppression instead; see `el0live_tick`.
     el0live_tick();
+    if !load_witness_emit() {
+        return; // unchanged since the last window — stay quiet
+    }
+    spread4_witness(); // SPREAD-4: the placement signal beside the load it is derived from
+    prio_witness(); // SCHED-PRIO: who WON those dispatches, beside where they were placed
+}
+
+/// SMPINSTR — the `:: SCHED: load ::` line's EMISSION PATH ON THE ONLY LOOP THE ORIN RUNS.
+///
+/// WHY THIS EXISTS AT ALL. `load_witness_tick` above has exactly one caller, `timer_preempt`, and
+/// `timer_preempt` returns at its first line unless `SCHED_ACTIVE` is set. On aarch64 `SCHED_ACTIVE`
+/// has exactly ONE setter — `start_aps` — whose only call site is `main.rs`'s
+/// `#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]` block. `baremetal` implies `pi`, and
+/// `pi` + `tegra` is a hard `compile_error!` in `arch/aarch64/serial.rs`. So on the Orin
+/// `SCHED_ACTIVE` is false for the whole boot, `timer_preempt` no-ops on every tick, and the load
+/// witness — the `[pulse5]` live-span line and the `[spin1]` wedge namer with it — HAS NEVER EMITTED
+/// A SINGLE LINE ON THIS BOARD. Making the formatter honest without this would have shipped an
+/// honest formatter behind a dead trigger, which is an absent instrument with better comments.
+///
+/// WHERE IT IS CALLED FROM, AND WHY. `run_capstone_boot_core`'s drive loop —
+/// `loop { while dispatch_next(cpu) { .. } spin_loop(); }` — is the tegra terminus and the only place
+/// on that board where dispatch happens at all. The poll goes INSIDE the inner `while`, beside
+/// `el0_refusal_rollup`, for the reason that call site already records: `main.rs` stages
+/// `jd2_console_pump` (infinite, cooperatively yielding), so on tegra the inner loop never returns and
+/// anything wired after it is runtime-dead. One unconditional baseline call precedes the loop, so a
+/// capture always carries a first reading to diff against.
+///
+/// NOT FEATURE-GATED, deliberately. `run_capstone_boot_core` is reached by tegra AND by `virt` (the
+/// `test-arm` battery) and NEVER by pi, which dispatches through `run`/`run_bsp` — so the call site
+/// alone scopes this exactly, and the QEMU battery EXECUTES the new formatter instead of merely
+/// compiling it. (`el0_refusal_rollup`'s extra `cfg!` guard answers a question that does not arise
+/// here: its counter cannot be incremented on virt, so its zero would be false. Load accounting on
+/// virt is real — `dispatch_next` folds every pass — so the reading is true wherever it prints.)
+///
+/// THE POLL IS THE LOOP, not an observer of it. If the drive loop dies, these lines stop, and their
+/// stopping is the measurement — the same property `orin_click_census` is built around. No instrument
+/// here claims liveness on behalf of a core it is not running on.
+///
+/// COST ON THE DISPATCH PATH: one CNTPCT read and one compare per pass, everything else behind the
+/// ~1 s rate limit and then behind the change-only suppression inside `load_witness_emit`.
+fn load_witness_poll() {
+    let now = timer::cntpct();
+    if now < LOAD_POLL_NEXT.load(Ordering::Relaxed) {
+        return; // rate limit — at most one sample per second off the dispatch loop
+    }
+    // CNTFRQ reads 31.25 MHz on Orin silicon; a firmware that leaves it 0 (timer.rs's CNTFRQ-SUB
+    // case) would make the interval zero and disable the rate limit, so the same substitute
+    // `el0_refusal_rollup` uses is applied here rather than dividing by a fabricated rate.
+    let freq = timer::cntfrq();
+    LOAD_POLL_NEXT.store(now + if freq == 0 { 62_500_000 } else { freq }, Ordering::Relaxed);
+    let _ = load_witness_emit();
+}
+
+/// SMPINSTR — take ONE snapshot of every core's accounting slot, decide whether it differs from the
+/// last emitted line, and if so print the load line plus its raw-staleness partner `[pulse5]`.
+/// Returns whether it printed, so the tick path can keep its "suppressed ⇒ the whole train stays
+/// quiet" behaviour byte-for-byte.
+///
+/// The snapshot is taken ONCE and reused for the change-signature, the wedge mask and the printed
+/// columns. The pre-SMPINSTR code read `core_load` once for the signature and AGAIN inside the
+/// printing closure, so the suppression decision and the printed line described two different
+/// instants — a core could fold, or go stale, between them, and the line would then contradict the
+/// signature that admitted it.
+fn load_witness_emit() -> bool {
+    let stale = fold_stale_cyc();
+    let mut snap = [CoreSnap { pct: 0, tracked: false, fold_age: u64::MAX }; NUM_CPUS];
     let mut packed = 0u64;
+    let mut nofold = 0u64;
     let mut ctx_now = 0u64;
     for cpu in 0..NUM_CPUS.min(8) {
         let ld = core_load(cpu);
+        // SMPINSTR: tracked, but the freshness claim is NOT backed by a fold — `tracked()` said yes
+        // only through its unconditional `run_t0` arm (see there). This is the dead-core signature.
+        let wedged = ld.tracked && ld.fold_age_cyc >= stale;
+        snap[cpu] = CoreSnap { pct: ld.busy_pct_recent, tracked: ld.tracked, fold_age: ld.fold_age_cyc };
         // SCHED-8: pack 255 for an untracked (stale/never-run) core so a tracked→untracked transition
         // changes the signature and re-emits the line; real percents are 0..100 so 255 never collides.
-        let byte = if ld.tracked { ld.busy_pct_recent.min(254) as u64 } else { 255 };
+        // SMPINSTR: 254 is the second reserved sentinel — tracked-but-NOT-FOLDING. It exists because
+        // a wedged core's percent is CONSTANT (100%) by construction, so without it the onset of a
+        // wedge changes no byte, the change-only suppression swallows the line, and the one event
+        // this witness exists to announce is the one it goes quiet for. Percents are 0..=100, so
+        // neither sentinel can collide with a real reading.
+        let byte = if !ld.tracked {
+            255
+        } else if wedged {
+            nofold |= 1u64 << cpu;
+            254
+        } else {
+            ld.busy_pct_recent.min(253) as u64
+        };
         packed |= byte << (cpu * 8);
         ctx_now += ld.ctx_switches;
     }
     if packed == LOAD_WITNESS_LAST.swap(packed, Ordering::Relaxed) {
-        return; // unchanged since the last window — stay quiet
+        return false; // unchanged since the last window — stay quiet
     }
     let ctx_delta = ctx_now.saturating_sub(LOAD_WITNESS_CTX.swap(ctx_now, Ordering::Relaxed));
-    // SCHED-8: an untracked core prints `--` (no live number) rather than its frozen last-window percent.
-    let c = |i: usize| {
-        let ld = core_load(i);
-        if ld.tracked {
-            alloc::format!("{}%", ld.busy_pct_recent)
-        } else {
-            alloc::string::String::from("--")
-        }
-    };
     serial_println!(
-        ":: SCHED: load c0={} c1={} c2={} c3={} (ctx +{}/win) ::",
-        c(0), c(1), c(2), c(3), ctx_delta
+        ":: SCHED: load {}(ctx +{}/win nofold={:#x}) ::",
+        load_columns(&snap),
+        ctx_delta,
+        nofold,
     );
     pulse5_witness();
-    spread4_witness(); // SPREAD-4: the placement signal beside the load it is derived from
-    prio_witness(); // SCHED-PRIO: who WON those dispatches, beside where they were placed
+    true
 }
 
 /// PULSE-5 — the proof line for age-on-read. It says three things and nothing else: how long each
@@ -8190,8 +8376,11 @@ fn load_witness_tick() {
 /// storm verb's launch boundaries, from task context, so a fleet capture reads this line at the
 /// instant the fleet changes size rather than at the timer's). Reads only; safe from any core.
 fn pulse5_witness() {
-    let mut live_ms = [0u64; 4];
-    for cpu in 0..NUM_CPUS.min(4) {
+    // SMPINSTR: `NUM_CPUS`, not a hard-coded 4. On tegra the old bound made this line — and, worse,
+    // `span_max`, the arc's own headline number — blind to cores 4..7 entirely: a task holding core
+    // 5 for a minute contributed nothing to the high-water mark and had no column to appear in.
+    let mut live_ms = [0u64; NUM_CPUS];
+    for cpu in 0..NUM_CPUS {
         let span = ACCT[cpu].live_span_cyc();
         PULSE5_SPAN_MAX_CYC.fetch_max(span, Ordering::Relaxed);
         live_ms[cpu] = cyc_to_ms(span);
@@ -8201,7 +8390,9 @@ fn pulse5_witness() {
     // — and until now the line never NAMED the task. Cross-CPU current read: the pointer load is
     // atomic; deref is safe in practice because a task that has been current for 10 s is
     // definitionally not mid-drop. Prints every witness pass while the condition holds.
-    for cpu in 0..NUM_CPUS.min(4) {
+    // SMPINSTR: swept over `NUM_CPUS`, not 4 — a core in the upper half is exactly as capable of
+    // owning one task forever, and this is the only line that NAMES the task when it does.
+    for cpu in 0..NUM_CPUS {
         if cyc_to_ms(ACCT[cpu].live_span_cyc()) > 10_000 {
             let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
             if !raw.is_null() {
@@ -8246,8 +8437,16 @@ fn pulse5_witness() {
         }
     }
     serial_println!(
-        "[pulse5] live c0={}ms c1={}ms c2={}ms c3={}ms span_max={}ms window={}ms folds={}",
-        live_ms[0], live_ms[1], live_ms[2], live_ms[3],
+        "[pulse5] live {}span_max={}ms window={}ms folds={}",
+        {
+            // SMPINSTR: one column per accounting slot, derived from `NUM_CPUS`.
+            use core::fmt::Write as _;
+            let mut s = alloc::string::String::new();
+            for (cpu, ms) in live_ms.iter().enumerate() {
+                let _ = write!(s, "c{}={}ms ", cpu, ms);
+            }
+            s
+        },
         cyc_to_ms(PULSE5_SPAN_MAX_CYC.load(Ordering::Relaxed)),
         cyc_to_ms(load_window_cyc()),
         PULSE5_FOLD_WINDOWS.load(Ordering::Relaxed),
@@ -9829,11 +10028,18 @@ pub fn run_capstone_boot_core(cpu: usize) -> ! {
     // linked and reached on THIS platform. See `el0_refusal_rollup` for why the in-loop poll below sits
     // inside the inner `while` and not after it (the inner loop never returns on tegra).
     el0_refusal_rollup();
+    // SMPINSTR — the load witness's BASELINE emit on this terminus, and the reason it exists at all:
+    // `load_witness_tick`'s only driver is `timer_preempt`, which no-ops until `SCHED_ACTIVE`, which
+    // only `start_aps` sets, which only the `baremetal`(⇒`pi`) boot calls — so on tegra the load /
+    // `[pulse5]` / `[spin1]` train has never printed a line. Same placement argument as
+    // `el0_refusal_rollup` directly above: baseline before the loop, poll inside the INNER `while`
+    // (the outer one is runtime-dead on tegra, where the queue never drains). See `load_witness_poll`.
+    let _ = load_witness_emit();
     // Cooperative dispatch loop: drain the run queue, then busy-poll (never WFI). `dispatch_next` returns
     // false only once the queue drains — after CAPSTONE has fully completed — at which point the core just
     // idle-spins (a headless regression captures the log within its timeout).
     loop {
-        while dispatch_next(cpu) { el0_refusal_rollup(); }
+        while dispatch_next(cpu) { el0_refusal_rollup(); load_witness_poll(); }
         core::hint::spin_loop();
     }
 }
