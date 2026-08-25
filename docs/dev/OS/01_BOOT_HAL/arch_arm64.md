@@ -10210,3 +10210,123 @@ so the licence question and the correctness question point the same way.
 and encrypted with boot-ROM-enforced verification, so no permissive path opens it. That bounds the
 GPU, not the display engine — nvdisplay and the DCE are a different block, and nothing on the
 desktop ladder needs the GPU (`docs/dev/OS/08_VIDEO/orin-desktop.md` §4).
+
+### FLOWN 2026-08-25 (boot7g) — JX2-NVC67D: the channel census answers, and the firmware still owns the display
+
+The rung that replaced the Tegra186/194 window sweep. Where JD1-DC-MODEL asked *which manual
+describes this block*, JX2-NVC67D asks the only question the FE block can actually answer once that
+manual is known: **which display channels did the firmware leave alive, and do we own any of them?**
+
+Source: `~/unaos-bench/capture/line-acm0/orin.log`, boot id `boot7g`, media
+`boot7g-clickchrome-20260825T2124Z-1f2545c` (image built at `1f2545cb`). **Capture line numbers are
+the primary anchor.** The slice runs from the MB1 coldboot banner at capture line 11542 to line
+13151; the sitting was still appending when this was folded, so later content is unscored here.
+
+**Why there is nothing to sweep.** NVD_40 / `NVC67D` window *surface* state is CHANNEL state,
+pushed as methods (`NVC67D_UPDATE` at method `0x200`, `clc67d.h`), not MMIO at any offset. The
+rung's own opening line says so, capture line 12576:
+
+> `NOT ONE REGISTER IS WRITTEN and NO CHANNEL IS OPENED: FE_CHNCTL_CORE bit 5 says the core channel
+> is EFI-owned and it is feeding the panel this console is on`
+
+Offsets come from NVIDIA/open-gpu-doc `manuals/ampere/ga102/dev_display_withoffset.ref.txt`, not
+from Linux `drm/tegra` `hub.c` — the map the previous rung convicted.
+
+#### Every read survived — 26 announce/survive pairs, zero silences
+
+The per-read `NEXTTOUCH` / `READSURVIVED` discipline that made boot7e's fatal register a single
+address rather than a candidate set was applied to all 26 reads of this rung. **26 `NEXTTOUCH`
+lines, 26 `READSURVIVED` lines, no unmatched announce** — the count is exact, and it includes the
+one this rung flagged as its own new-page risk:
+
+```
+JX2-NVC67D NEXTTOUCH: about to read NV_PDISP_FE_RM_INTR_STAT_HEAD_TIMING(i) (+0x01c00 + i*4, FIRST TOUCH OF THE 0x611xxx PAGE) index=0 @0x13801c00 …
+JX2-NVC67D READSURVIVED: NV_PDISP_FE_RM_INTR_STAT_HEAD_TIMING(i) (+0x01c00 + i*4, FIRST TOUCH OF THE 0x611xxx PAGE) index=0 @0x13801c00 = 0x00000007
+```
+
+(capture lines 12635 and 12636). The `0x611xxx` page had never been touched from the CCPLEX on this
+silicon; it decodes.
+
+#### The read table
+
+| capture line | register | value | reading |
+| --- | --- | --- | --- |
+| 12578 | `NV_PDISP_FE_CHNSTATUS_CORE` (+0x00630) | `0x20070000` | `STATE(20:16)=0x07` → **`EFI_OPERATION`** — the core channel is in a firmware-owned running state |
+| 12581 | `NV_PDISP_FE_CHNCTL_CORE` (+0x004e0, re-read) | `0x00000021` | `ALLOCATION(0)=1 CONNECTION(1)=0 EFI(5)=1` — unchanged from boot7f, so the firmware did not move the channel between rungs |
+| 12584 | `NV_PDISP_FE_IP_VER` (+0x00018) | `0x04020000` | `MAJOR=4 MINOR=2` — NVDisplay IP rev 4.2; a MAJOR of 4 corroborates NVD_40 from a second hardwired word, independent of `FE_CLASSES` |
+| 12587 | `NV_PDISP_FE_MISC_CONFIGA` (+0x00074) | `0x00404202` | `NUM_HEADS=2 NUM_SORS=2 NUM_WINDOWS=4` — **agrees with boot7f's `FE_HW_SYS_CAP`/`CAPB` census**, which is the cross-check that says both offsets are the registers this rung thinks they are |
+| 12590 | `NV_PDISP_FE_HW_LOCK_PIN_CAP` (+0x00068) | `0x00000020` | `SCAN_LOCK_PINS=2` — a cheap independent check on the access path |
+| 12594 | `NV_PDISP_FE_CHNCTL_WIN(0)` (+0x004e4) | `0x00000001` | `ALLOCATION=1` — **window channel 0 is allocated** |
+| 12603 / 12612 / 12621 | `NV_PDISP_FE_CHNCTL_WIN(1..3)` | `0x00000000` | `ALLOCATION=0` — windows 1, 2 and 3 are not allocated |
+| 12597 | `NV_PDISP_FE_CHNSTATUS_WIN(0)` (+0x00664) | `0x24010100` | `STATE(19:16)=0x1` → `UNCONNECTED`, `UPD_STATE=IDLE`, `READ_PENDING=YES` |
+| 12606 / 12615 / 12624 | `NV_PDISP_FE_CHNSTATUS_WIN(1..3)` | `0x21000100` | `STATE=0x0` → `DEALLOC`, `FIRSTTIME=YES` — never used since reset |
+| 12600 / 12609 / 12618 / 12627 | `NV_PDISP_FE_CHNSTATUS_WINIM(0..3)` | `0x20010000`, then `0x21000000` ×3 | the window IMMEDIATE siblings track their window channels exactly |
+| 12630 / 12633 | `NV_PDISP_FE_CHNSTATUS_CURS(0..1)` | `0x01000000` | both cursor channels `DEALLOC` |
+| 12636 / 12639 | `NV_PDISP_FE_RM_INTR_STAT_HEAD_TIMING(0..1)` | `0x00000007` / `0x00000000` | head 0 has `LOADV`, `LAST_DATA` and `VBLANK` latched, head 1 nothing — **the raster generator has been running on head 0**, which corroborates the inherited scanout coming from the display block rather than from the framebuffer |
+| 12642 / 12645 / 12648 / 12651 / 12654 | `RM_INTR_STAT_EXC_WIN` / `EXC_WINIM` / `EXC_OTHER` / `CTRL_DISP` / `OR` | all `0x00000000` | no exception is latched on any channel the firmware owns |
+
+**The `WIN(0)` asymmetry is the finding of the walk.** `CHNCTL_WIN(0)=1` against `1..3=0`, and
+`CHNSTATUS_WIN(0)=0x24010100` (`UNCONNECTED`) against `WIN(1..3)=0x21000100` (`DEALLOC`,
+`FIRSTTIME=YES`): exactly one window channel has ever been allocated on this boot, and it is not
+ours. **`CHNCTL_WIN` carries no owner field**, and the rung says so rather than guessing — on
+`NVC67D` a window's head binding is set by the *core*-channel method
+`NVC67D_WINDOW_SET_CONTROL(a)_OWNER` (`clc67d.h`), so window-to-head binding is not readable from
+the FE block at all.
+
+#### The verdict, and the consequence it states
+
+Capture line 12656, boot7g:
+
+```
+JX2-VERDICT=EFI-OWNED-LIVE — CHNSTATUS_CORE=0x20070000, STATE=0x07 -> EFI_OPERATION. The core
+channel is in a firmware-owned state, which corroborates FE_CHNCTL_CORE bit 5 (EFI=1) from the
+opposite side of the block: two independent registers agreeing that the firmware still drives this
+display. CONSEQUENCE: the inherited scanout JD1 is drawing into is presented by a channel WE DO NOT
+OWN, so the next display rung is a deliberate handoff — allocate our own window channel and bind it
+with NVC67D_WINDOW_SET_CONTROL_OWNER through a core channel we have taken — never an opportunistic
+MMIO poke. WHAT THIS DOES NOT MEAN: it does not say the handoff will work, only that nothing is
+currently free for the taking.
+```
+
+The corroboration is the load-bearing part: `CHNCTL_CORE` bit 5 is a *configuration* bit and
+`CHNSTATUS_CORE` `STATE` is a *live* state field, in different registers, and they agree. One of
+them alone could be a stale flag; both together are the firmware actually driving the panel.
+
+**The binding rule for every future display rung on this chip, stated once:** the handoff is
+deliberate — take a core channel, then bind a window with `NVC67D_WINDOW_SET_CONTROL_OWNER`.
+**Never an opportunistic MMIO poke.** The `EFI-OWNED-LIVE` verdict is what makes that a rule rather
+than a preference: there is nothing free to take.
+
+#### The JX1 false cause is now retracted ON THE WIRE
+
+Two lines on this flight close the loop the JX1 gate opened, and both are the instrument correcting
+its own earlier reading rather than a doc note about it.
+
+`JX2-SWEEPDISABLED`, capture line 12657:
+
+> `the Tegra186/194 window sweep below is GATED TO AN EMPTY SLICE and DOES NOT RUN. Every count it
+> feeds is therefore zero BY CONSTRUCTION (swept=0 enabled=0 all_ones=0 all_zero=0 heads=0), not by
+> measurement: nothing was read, so nothing could match.`
+
+and the retraction inside `JD1-DC VERDICT=DECODES-NOMATCH`, capture line 12659:
+
+> `the earlier reading of swept=0 as 'the aperture held the FE capability word but no complete
+> head-0 window bank' was a FALSE CAUSE and is retracted here. Nothing was swept, so nothing could
+> match, and this verdict says NOTHING about where the scanout is fed from. That question moved to
+> the JX2-VERDICT= line above.`
+
+The census beside it, capture line 12658, is `heads=0 windows=0 … | reads=5 writes=0` — five reads,
+**zero writes**, unchanged. **This is the fix being wire-proven, not merely committed:** a reader of
+this capture cannot mistake a gated-off zero for a measured zero, because the log says which it is
+at the point of reading.
+
+#### What boot7g does NOT establish about the display engine
+
+* **Nothing about the handoff.** No channel was opened and no register was written. `EFI-OWNED-LIVE`
+  says the firmware holds the display; it says nothing about whether taking it from the firmware
+  will work.
+* **Nothing about window-to-head binding.** It is not in the FE block. Any claim about which window
+  feeds which head has to come from the core channel, which we do not own.
+* **The desktop side of the same flight** — rung 3 routing on metal and the `CHROME-ON-GLASS`
+  read-back — is recorded in
+  [`../08_VIDEO/orin-desktop.md`](../08_VIDEO/orin-desktop.md) §3.8.1, not here.

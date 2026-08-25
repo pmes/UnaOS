@@ -932,6 +932,183 @@ the JD1-DC-MODEL section. The two headlines that bear on this ladder:
 * **Nothing about stack cost.** `[u7stk]` was not pointed at the click-router depth on this boot;
   §5's numbers remain Pi numbers.
 
+> ⚠ **The first two bullets above are DISCHARGED by boot7g — see §3.8.1 immediately below.** They
+> are left standing as written because they are the correct reading of *boot7f*; what changed is
+> the flight, not the reading.
+
+#### §3.8.1 FLOWN 2026-08-25 (boot7g) — the click ROUTES, and the chrome is ON THE GLASS
+
+The successor flight to boot7f, and the one that closes both halves boot7f left owed. Same capture
+file, same anchoring law: `~/unaos-bench/capture/line-acm0/orin.log`, **capture line numbers are
+the primary anchor**, boot id `boot7g` beside each. The slice begins at the MB1 coldboot banner,
+capture line 11542 (`[0000.068] I> MB1 (version: 1.0.1.17-t234-54845784-9b0d5809)`) — the sixth and
+last coldboot in that file.
+
+Media: `boot7g-clickchrome-20260825T2124Z-1f2545c`, image built at `1f2545cb`. **What that image
+does NOT contain matters as much as what it does:** every fold landed after `1f2545cb` is absent —
+`orinconwin` (rung 4, §3.9), the SMPINSTR follow-ups and NET-4F. Nothing in this subsection may be
+read as evidence about rung 4.
+
+⚠ **The sitting was still live when this was folded.** The slice scored and quoted here ends at
+capture line 13151 (byte 1020297); the board was at `up=230s` and still appending. Anything the
+capture gains past line 13151 is **unscored** by this subsection.
+
+##### Rung 3, the wire half — CLOSED
+
+Somebody finally pressed the button. Capture lines 13084-13085, boot7g:
+
+```
+[clickroute] press hit asid=4294967042 win=1 (was 0) delivered
+[orinclick] edge=press btn=0x01 at (1009,546) geom=yes hit=yes win=1 owner=0xffffff02 focus 0x0->0xffffff02 consumed=0 -> RAISED
+```
+
+`focus 0x0->0xffffff02` is the whole claim: the router entered `wc_click_route`, hit-tested the
+row rung 0 put on the panel, and **raised it**. `asid=4294967042` is `0xffffff02` in decimal, so
+the `[clickroute]` and `[orinclick]` lines name the same window from two different call sites. The
+release completed the pair, capture line 13087:
+
+```
+[orinclick] edge=release btn=0x00 at (1009,546) geom=yes hit=no win=0 owner=0x0 focus 0xffffff02->0xffffff02 consumed=0 -> RELEASE-DELIVERED
+```
+
+and the census flipped off its UNRUN verdict on the next tick, capture line 13089:
+
+```
+[orinclick] census seq=6 t=271 up=60s btn=2 press=1 rel=1 noedge=0 raised=1 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=1 compat=0 focus=0xffffff02 -> ROUTING
+```
+
+`IDLE-NO-CLICKS -> ROUTING` is the census transition §3.7 designed it to make, and it happened
+because `btn` moved, not because a timer fired.
+
+**The second press discriminates a raise from a no-op.** Capture line 13092:
+
+```
+[orinclick] edge=press btn=0x01 at (1066,408) geom=yes hit=yes win=1 owner=0xffffff02 focus 0xffffff02->0xffffff02 consumed=0 -> HIT-SAME
+```
+
+A click on the already-focused window returns `HIT-SAME`, not `RAISED` — the router distinguishes
+"raise this window" from "this window is already on top", which a stub that unconditionally printed
+`RAISED` could not. Three further verdicts printed on the same flight and each is a different
+branch of the router, so the coverage is not one path taken six times:
+
+| capture line | verdict | what it exercises |
+| --- | --- | --- |
+| 13125 | `-> CONSUMED` (with `[clickroute] close=win1 … settle=furniture-refused`, line 13124) | a hit on the close control — consumed by the furniture layer, which then *declined* to settle because `pidesk` is compiled out |
+| 13133 | `-> MISS-SHELL` (with `[clickroute] press miss at (384,209) -> shell focus (was 4294967042)`, line 13132) | a click outside every row drops focus back to the shell — `focus 0xffffff02->0x0` |
+| 13135 | `-> RELEASE-DROPPED` | the release half of a consumed press, correctly not delivered to a window |
+
+Final census in the scored slice, capture line 13151: `[orinclick] census seq=23 t=951 up=230s
+btn=12 press=6 rel=6 noedge=0 raised=1 same=3 miss=1 consumed=1 stuck=0 nogeom=0 dropped=0 rows=1
+compat=0 focus=0x0 -> ROUTING`. **`stuck=0`, `nogeom=0`, `dropped=0`
+across six press/release pairs** — the three failure counters the instrument carries specifically
+so that a routing claim cannot be made over a silently degraded path all read zero.
+
+##### Chrome on the glass — the on-glass question is CLOSED for rungs 0 and 3
+
+`[orinchrome]` — the instrument §3.8 recorded as landed-but-unflyable, because `e98d798b` is not an
+ancestor of the boot7f media — flew on this image and read the panel back. All six frame probes and
+the content probe MATCHed, capture lines 12680-12686, boot7g:
+
+```
+[orinchrome] probe=kl_top   at (960,378) got=0xb4b4b9 want=0xb4b4b9 -> MATCH
+[orinchrome] probe=kl_bot   at (960,821) got=0xb4b4b9 want=0xb4b4b9 -> MATCH
+[orinchrome] probe=kl_left  at (635,600) got=0xb4b4b9 want=0xb4b4b9 -> MATCH
+[orinchrome] probe=kl_right at (1284,600) got=0xb4b4b9 want=0xb4b4b9 -> MATCH
+[orinchrome] probe=bev_lt   at (960,379) got=0xffffff want=0xffffff -> MATCH
+[orinchrome] probe=bev_sh   at (960,820) got=0xaaaaaf want=0xaaaaaf -> MATCH
+[orinchrome] win=1 box=650x444 at (635,378) frame=6/6 content=0xff00ff@(960,617) MATCH strip=0xf1f1f3 face=0xe9e9eb ctrl=0xf4f4f5 (ceramic — raw, compare with [crispy]) -> CHROME-ON-GLASS
+```
+
+(The four `kl_*` probes are reproduced with their columns aligned for reading; the wire text is one
+probe per line, unpadded.)
+
+**Why this is a glass claim and not another wire claim.** The `want=` values are the theme's own
+constants — `keyline=0xb4b4b9`, `bevels=0xffffff/0xaaaaaf` on the `[crispy]` line four rows above at
+capture line 12675 — and the `got=` values are **read back out of the scanout the panel is being
+fed from**, at absolute panel coordinates derived from the box `[orinwm1]` reported. A composite
+that ran and produced nothing visible cannot make `got` equal `want` at six independent
+coordinates. The bevel probes are the sharp ones: `bev_lt` at `(960,379)` and `bev_sh` at
+`(960,820)` are each **one pixel inside** their keyline neighbours at `(960,378)` and `(960,821)`,
+and they return *different* colours. That is a one-pixel-accurate frame, not a fill.
+
+The content probe closes the other half: `content=0xff00ff@(960,617) MATCH` — the window's magenta
+body is present at the box centre, so the frame is not sitting over an empty or stale interior.
+
+Rung 0's own line printed on this flight too, capture line 12679, byte-identical in shape to
+boot7f's:
+
+```
+[orinwm1] win=1 panel=1920x1200 surf=640x400 box=650x444 at (635,378) scale=1 stage=4194304 present=Composited -> COMPOSITED
+```
+
+so `[orinchrome]`'s box and `[orinwm1]`'s box are the same box, and the on-glass verdict attaches to
+the composite that the wire verdict describes.
+
+##### OPERATOR OBSERVATION (Peter, boot7g) — the composite does NOT survive the console blit
+
+Recorded because it is a measurement the serial cannot make, and because it answers a question §7
+had left open. The operator, watching the panel through the sitting:
+
+> "once I clicked the ghost of the window filled in, otherwise there is basic function."
+
+Trigger event, capture line 13085, boot7g — the same `RAISED` quoted above:
+
+```
+[orinclick] edge=press btn=0x01 at (1009,546) geom=yes hit=yes win=1 owner=0xffffff02 focus 0x0->0xffffff02 consumed=0 -> RAISED
+```
+
+**Mechanism.** Between composites the JD2 console's back-buffer blit overdraws the composited
+window's body: `jd2_console_pump` owns the panel through a double-buffered `Screen` whose
+`pal.render()` writes the console buffer over the front scanout, and on this image nothing subtracts
+the window from it. The window therefore decays to a "ghost" — the frame outlives the body, because
+only the body is where the console writes. `focus_changed` ends in `composite()`, so **the click
+repainted it**, which is exactly what the operator saw.
+
+**This does not weaken the `CHROME-ON-GLASS` verdict — it explains its timing.** The `[orinchrome]`
+probes ran at capture lines 12680-12686, immediately after the composite at line 12679, i.e. inside
+the window between a composite and the next console blit. The verdict is true as measured: those
+pixels *did* reach the glass. What the operator adds is that they do not *stay* there without a
+recomposite.
+
+**Consequence, and it is already built.** Rung 4 (`orinconwin`, §3.9, landed at `68c47585`) is the
+designed fix: a routed console stops writing the panel behind the compositor's back, because
+`Screen::present_background` subtracts `wm::occluders`. **It is NOT in the flown image** — `68c47585`
+post-dates `1f2545cb` — so nothing here measures it. What boot7g *does* do for rung 4 is discharge
+its §6.1 precondition: the metal `RAISED` capture that section demanded before rung 4 may lean on
+the dock as a way back now exists, at capture line 13085.
+
+##### The display engine and the rest of the board, same flight
+
+* **JX2-NVC67D answered, all reads survived.** The channel-state probe and its
+  `JX2-VERDICT=EFI-OWNED-LIVE` are recorded with the rest of the nvdisplay work in
+  [`../01_BOOT_HAL/arch_arm64.md`](../01_BOOT_HAL/arch_arm64.md), **FLOWN 2026-08-25 (boot7g)**.
+  The consequence for this ladder: the scanout rung 0 composites into is presented by a channel
+  **we do not own**, so any future rung that wants the display engine takes it by a deliberate
+  channel handoff, never by an MMIO poke.
+* **The JX1 false cause is retracted on the wire.** `JX2-SWEEPDISABLED` (capture line 12657) and
+  the retraction inside `JD1-DC VERDICT=DECODES-NOMATCH` (capture line 12659) both printed, so the
+  gated-to-empty sweep now says so in its own output instead of being read as a measurement.
+* **EL0 and SMP clean.** `[el0core] rollup: el0refuse=0 el1cores=0x1` at capture line 12983; all
+  five APs online with the SMPMARK tag sequence `:P: :R1: :A: :R2: :A: :R3: :A: :R4: :A: :A: :R5:`
+  (capture lines 12930-12949) — every AP reached the far side of `enable_mmu_virt`, **no park**.
+  The shell came up: `JD2 — OUT | JD2: interactive shell on the inherited scanout. Type 'help'.`,
+  capture line 12998.
+* **Spec replay: PASS.** `unaos/scripts/mbench.py --replay` of the slice against
+  `unaos/scripts/specs/jetson-sync1.spec` reports
+  `✅ MBENCH PASS — 15/15 required witnesses, 0 forbidden hit(s), 1612 lines scanned, pending 5/6 matched`.
+  The one unmatched PENDING is `TEGRA-SD.*block backend published`, which this flight does not
+  exercise.
+
+##### What this flight still did NOT establish
+
+* **Nothing about rung 4.** `orinconwin` is not in the image. Every `[orinconwin]` verdict in §3.9
+  remains unprinted.
+* **Nothing about persistence.** The operator observation above is precisely the boundary: the
+  chrome is on the glass *at composite time*, and a mechanism is named for why it does not persist.
+  "The desktop stays on the glass" is a rung-4 claim and is not made here.
+* **Nothing about stack cost.** `[u7stk]` was still not pointed at the click-router depth; §5's
+  numbers remain Pi numbers.
+
 ### §3.9 LANDED 2026-08-25 (rung 4) — the console as a window, DEFAULT OFF and UNFLOWN
 
 **Measured against `e98d798b`.** Rung 4's row asked for three things — *"route the JD2 console into
@@ -1263,10 +1440,10 @@ names the seat that owns the files under the parallel-arc rules in `CLAUDE.md`.
 
 | # | Rung | What lands | Metal witness | Lane |
 | --- | --- | --- | --- | --- |
-| **0** | **One composited window** — ✅ **LANDED, and FLOWN 2026-08-25 on the wire** (§3.8) | call `wm::reserve_stage` on the tegra path after heap init (§3.3); mint one `wm` row; present it. No furniture, no `pidesk`, no cascade | **wire half CLOSED**: boot7f, capture line 11110, `[orinwm1] win=1 panel=1920x1200 surf=640x400 box=650x444 at (635,378) scale=1 stage=4194304 present=Composited -> COMPOSITED`. **On-glass half STILL OWED** — no serial line says the box's pixels reached the panel | jetson |
+| **0** | **One composited window** — ✅ **LANDED, FLOWN, and CLOSED ON BOTH HALVES 2026-08-25** (§3.8, §3.8.1) | call `wm::reserve_stage` on the tegra path after heap init (§3.3); mint one `wm` row; present it. No furniture, no `pidesk`, no cascade | **wire half CLOSED**: boot7f, capture line 11110 (and again boot7g, capture line 12679), `[orinwm1] win=1 panel=1920x1200 surf=640x400 box=650x444 at (635,378) scale=1 stage=4194304 present=Composited -> COMPOSITED`. **On-glass half CLOSED**: boot7g, capture line 12686, `[orinchrome] win=1 box=650x444 at (635,378) frame=6/6 content=0xff00ff@(960,617) MATCH … -> CHROME-ON-GLASS` — six frame probes and the content probe read back out of the scanout at panel coordinates, all MATCH. ⚠ **at composite time**: the operator measured that the JD2 console blit overdraws the body between composites (§3.8.1), which is rung 4's problem, not rung 0's | jetson |
 | **1** | **The cfg leg** — ✅ **LANDED 2026-08-22, less `quarry`** (§3.5.1) | `arm-tegra-desk` leg added (gate 18 → 19 legs); `pidesk`/`quarry`/`livecon` mapped in arroyo's env map; two of the three gate mismatches fixed | `UNAOS_TEGRA=1 ./arroyo check` green 19/19, and green again under `UNAOS_TEGRA_EL0=1 UNAOS_PIDESK=1 UNAOS_LIVECON=1`; the new leg proven to go red on a re-introduced mismatch | jetson (arroyo + `arch/aarch64/syscall.rs`); the `quarry` line is a `video/` edit and is **held** in §3.5.2 |
 | **2** | **The desktop seam** — ✅ **LANDED 2026-08-25, and it REFUSES** (§3.2.1) | `tegradesk` feature + `main.rs::tegra_desk_arm` on `tegra_early_stop`'s terminus line + `UNAOS_TEGRADESK` env map + the `arm-tegra-seam` leg (11 → 12 board legs). The seam evaluates its floors and declines at two named stop-lines | **the floors half is UNFLOWN**: `[deskseam] floors …` + `REFUSE reason=…` print on an armed Orin boot, and nobody has taken one. **The `activate()` half is WITHDRAWN, not owed**: `pidesk::activate()` opens the console window and enables the bar, so running it crosses §6.1 *and* §5.2 — it belongs to rungs 3/5, and this row previously asked for something the same document forbids | jetson |
-| **3** | **Input routing** — ✅ **LANDED 2026-08-25 as a DEFAULT-OFF knob; FLOWN AND ARMED, CLICK UNTESTED** (§3.7, §3.8) | `orinclick` (implies `tegra_el0`) wires `jd2_console_pump`'s `Event::Button` arm into `wc_click_route` (§3.4) and adds the `[orinclick]` instrument at the tail of `display_tegra.rs`. **⚠ HANDSHAKE WITH RUNG 2, DISCHARGED IN THIS ARC:** `main.rs`'s `TEGRADESK_CLICK_ROUTED` no longer reads `false` — it reads `cfg!(feature = "orinclick")`, **not** a literal `true`, because `tegradesk` does not imply `orinclick` and a hard `true` would assert a route back on an image that has none: the one-way trip re-entered through the constant meant to prevent it. `arm-tegra-seam` now carries `orinclick` so the assertion is type-checked. COMPILES: gate green 21/21 knob off and on; the new `arm-tegra-orinclick` leg proven to go red. No gate in this tree can boot it — QEMU models no Tegra234 | ⚠ **PART-DISCHARGED, boot7f 2026-08-25** (§3.8): the knob flew, the router **armed** from inside the pump (`[orinclick] arm panel=1920x1200 rows=1 compat=0 focus=0x0 pidesk=0 t=31 -> ARMED`, capture line 11424) and 48 consecutive `IDLE-NO-CLICKS` censuses proved the routing task alive with `btn=0`. **Still owed: the click.** No `[orinclick] edge=…` line and no `[clickroute]` line exists in any capture, because nobody has pressed the button on this board | jetson |
+| **3** | **Input routing** — ✅ **LANDED 2026-08-25 as a DEFAULT-OFF knob; FLOWN, ARMED, and ROUTING ON METAL** (§3.7, §3.8, §3.8.1) | `orinclick` (implies `tegra_el0`) wires `jd2_console_pump`'s `Event::Button` arm into `wc_click_route` (§3.4) and adds the `[orinclick]` instrument at the tail of `display_tegra.rs`. **⚠ HANDSHAKE WITH RUNG 2, DISCHARGED IN THIS ARC:** `main.rs`'s `TEGRADESK_CLICK_ROUTED` no longer reads `false` — it reads `cfg!(feature = "orinclick")`, **not** a literal `true`, because `tegradesk` does not imply `orinclick` and a hard `true` would assert a route back on an image that has none: the one-way trip re-entered through the constant meant to prevent it. `arm-tegra-seam` now carries `orinclick` so the assertion is type-checked. COMPILES: gate green 21/21 knob off and on; the new `arm-tegra-orinclick` leg proven to go red. No gate in this tree can boot it — QEMU models no Tegra234 | ✅ **DISCHARGED, boot7g 2026-08-25** (§3.8.1): `[clickroute] press hit asid=4294967042 win=1 (was 0) delivered` (capture line 13084) and `[orinclick] edge=press btn=0x01 at (1009,546) geom=yes hit=yes win=1 owner=0xffffff02 focus 0x0->0xffffff02 consumed=0 -> RAISED` (capture line 13085); release `-> RELEASE-DELIVERED` (13087); census `IDLE-NO-CLICKS -> ROUTING` (13089); a second press on the focused row `-> HIT-SAME` (13092), plus `CONSUMED` (13125), `MISS-SHELL` (13133) and `RELEASE-DROPPED` (13135). Six press/release pairs with `stuck=0 nogeom=0 dropped=0`. **The prior owed item — boot7f's armed-but-unclicked state (`-> ARMED`, capture line 11424, then 48 `IDLE-NO-CLICKS`) — is closed.** Still owed: nothing on the wire; stack cost on this path (§5) is still a Pi number | jetson |
 | **4** | **Console as a window** — ✅ **LANDED 2026-08-25 as a DEFAULT-OFF knob, UNFLOWN** (§3.9) | `orinconwin` (implies `pidesk` + `tegra_el0`, and deliberately NOT `orindesk`/`orinclick`) calls the SHARED console-window machinery from `display_tegra::orin_conwin` on `tegra_early_stop`'s terminus line — `panel_console_face_arm` → `panel_console_window_open` → `console_is_routed` — and folds `jd2_console_pump`'s phase-2 `fbcon::detach()` to `if !tegra_conwin_live() { … }` so a routed console stays LIVE. **§6.1 IS NOW A BRANCH:** both ordering terms are read through `cfg!()` and an image missing either gets `[orinconwin] DECLINE reason=ordering-rule held=…` and NO window — measured on the artifact both ways. No `video/` edit; no `pidesk::activate()`, so §5.2 is untouched. Gate green 23/23 knob off and on; `arm-tegra-conwin` proven to go red; knob-off loadable image byte-identical. NOT run on any board | metal-owed: the boot log keeps updating *inside a window* while the JD2 shell holds the desktop layer around it, and the minimise control has somewhere to go back to. Wire: `[orinconwin] gate …` then `[orinconwin] win=… route=true live=LIVE -> ROUTED`, plus `[wc-x] console-window …` from the shared `fbcon` path | jetson |
 | **5** | **The real desktop** | dock, strip, menubar, crystal armed; the full `pidesk` cascade; a tegra `render_service` (§3.6) | the Orin comes up to a desktop | jetson — **blocked by §5.2** |
 | **6** | **EL0 tenants** | user windows from EL0 through `SYS_WIN_*`, on the `tegra_el0` regime | an EL0 program owns a window on the Orin panel | jetson |
@@ -1363,11 +1540,17 @@ image the console window ships in". Two things follow and neither is optional:
 1. **Rung 4 may not ship a console window on an image where `orinclick` is off.** The knob
    and the console window have to travel together, or the minimise disc is a one-way trip
    again — the `#[cfg]` cannot express the law, so the rung-4 arc has to.
-2. **The routing half is still UNFLOWN.** No Orin boot has carried `orinclick`, so "clicks
-   route" is a compile-time claim today. Rung 4 wants a metal capture showing
-   `[orinclick] edge=… -> RAISED` before it leans on the dock as a way back — and note the
-   default armed boot prints `DECLINE reason=no-target` until `UNAOS_ORINDESK=1` (or rung 4
-   itself) puts a row on the panel.
+2. ~~**The routing half is still UNFLOWN.**~~ ✅ **DISCHARGED 2026-08-25 by boot7g** (§3.8.1).
+   This item asked for "a metal capture showing `[orinclick] edge=… -> RAISED` before rung 4
+   leans on the dock as a way back". That capture exists: capture line 13085,
+   `[orinclick] edge=press btn=0x01 at (1009,546) geom=yes hit=yes win=1 owner=0xffffff02 focus
+   0x0->0xffffff02 consumed=0 -> RAISED`, with `[clickroute] … delivered` beside it at line
+   13084. Clicks route on this board; the claim is no longer compile-time. Item 1 above is
+   **unaffected and still binding** — the knob and the console window must still travel
+   together, because a routed console on an `orinclick`-off image has the same one-way
+   minimise disc it always had. Note also that the default armed boot still prints
+   `DECLINE reason=no-target` until `UNAOS_ORINDESK=1` (or rung 4 itself) puts a row on the
+   panel; boot7g avoided it by carrying `orindesk`, which is why its arm line reads `rows=1`.
 
 Rungs 0–2 have no ordering constraint among themselves beyond the obvious (rung 1
 before rung 2 if the seam is to be type-checked by anything). Rung 5 is gated on
@@ -1389,32 +1572,54 @@ before rung 2 if the seam is to be type-checked by anything). Rung 5 is gated on
   refers to the JD1/JD2/JD20 panel path, not to the compositor". That is no longer true —
   boot7f made the window-manager, staging-buffer and pointer-routing rows PROVEN in their
   own right (§3.8), and each of those cells names its capture line.
-- **Rung 3 is claimed LANDED, COMPILED and ARMED-ON-METAL — never ROUTING.** ⚠ Updated
-  2026-08-25 by boot7f (§3.8): an Orin boot has now carried `orinclick`, so
-  `[orinclick] … -> ARMED` and `-> IDLE-NO-CLICKS` are lines that have printed, not
-  descriptions of code that has not. **Every other `[orinclick]` verdict is still
-  unprinted.** `wc_click_route` has not been entered on this board — no `edge=` line
-  exists in any capture — so "clicks route on the Orin" remains an unmade measurement,
-  and `IDLE-NO-CLICKS` is explicitly the census's UNRUN verdict, not a pass. In
-  particular: **that a raise reaches the GLASS is NOT claimed.** `focus_changed` ends in
-  `composite()`, which writes the front scanout, while `jd2_console_pump` owns the panel
-  through a double-buffered `Screen` whose `pal.render()` blits the console back buffer
-  over it. Whether the composited z-change survives that blit is unmeasured on this
-  board and is rung-4 territory. The wire evidence and the on-glass evidence are two
-  claims, and only the first is designed for here.
-- **Rung 0 is claimed COMPOSITED ON THE WIRE, not ON THE GLASS.** ⚠ Added 2026-08-25.
-  boot7f's `[orinwm1] … present=Composited -> COMPOSITED` (§3.8) is the compositor's own
-  derived verdict about a pass it ran; it is not a statement that those pixels are
-  visible on the DisplayPort panel, and no field on that line could be. The chrome
-  painter demonstrably ran — `[crispy]` latched four lines above it and `paint_window` /
-  `draw_title` are reachable in the flown artifact — so "the window has no frame" is
-  refuted; "the frame is on the glass" is simply not yet measured here.
+- **Rung 3 is claimed LANDED, COMPILED, ARMED and ROUTING ON METAL.** ⚠ Rewritten
+  2026-08-25 by boot7g (§3.8.1). This bullet previously read "never ROUTING" and said
+  `wc_click_route` had not been entered on this board. **That is no longer true and the
+  claim is now made outright:** clicks route. Capture line 13085 is
+  `[orinclick] edge=press … focus 0x0->0xffffff02 … -> RAISED`, with
+  `[clickroute] press hit asid=4294967042 win=1 (was 0) delivered` beside it at line 13084,
+  and five further router verdicts printed on the same flight (`HIT-SAME`,
+  `RELEASE-DELIVERED`, `CONSUMED`, `MISS-SHELL`, `RELEASE-DROPPED`) — so this is branch
+  coverage, not one path taken repeatedly. The census reads `-> ROUTING` with
+  `stuck=0 nogeom=0 dropped=0`. **What is still NOT claimed:** the stack cost of the router
+  on this board (§5's numbers remain Pi numbers), and anything about a build with `pidesk`
+  furniture present — boot7g's close-control click printed `settle=furniture-refused`,
+  which is the compiled-out path declining, not the furniture working.
+- **That a raise PERSISTS on the glass is NOT claimed — and it is now measured that it does
+  not.** ⚠ Rewritten 2026-08-25. This bullet used to say "whether the composited z-change
+  survives that blit is unmeasured on this board". It is measured, by the operator's eyes on
+  boot7g (§3.8.1): **it does not survive, and the recomposite restores it.** The mechanism is
+  the one this bullet already named — `focus_changed` ends in `composite()`, which writes the
+  front scanout, while `jd2_console_pump` owns the panel through a double-buffered `Screen`
+  whose `pal.render()` blits the console back buffer over it. On the flown image nothing
+  subtracts the window from that blit, so the body is overdrawn between composites and the
+  frame outlives it; the click's `composite()` repaints the body, which is what the operator
+  saw. This is rung-4 territory exactly as stated: `orinconwin` (§3.9) makes
+  `Screen::present_background` subtract `wm::occluders`, and `orinconwin` is not in the
+  boot7g image. **Until rung 4 flies, "the desktop stays on the glass" is not a claim this
+  document makes.**
+- **Rung 0 is claimed COMPOSITED ON THE WIRE AND ON THE GLASS.** ⚠ Rewritten 2026-08-25 by
+  boot7g (§3.8.1). This bullet previously said the on-glass half was "simply not yet measured
+  here". It is measured. `[orinwm1] … present=Composited -> COMPOSITED` remains the
+  compositor's own derived verdict about a pass it ran — but boot7g added an independent
+  read-back: `[orinchrome] … frame=6/6 content=0xff00ff@(960,617) MATCH … -> CHROME-ON-GLASS`
+  (capture line 12686), six frame probes at absolute panel coordinates whose `want=` values
+  are the theme constants on the `[crispy]` line and whose `got=` values come out of the
+  scanout the panel is fed from, plus a content probe at the box centre. Two probes one pixel
+  apart return different colours, so this is a one-pixel-accurate frame and not a fill.
+  **The claim is scoped to composite time**, for the reason in the bullet above: the probes ran
+  immediately after the composite, and persistence is a separate, refuted question.
 - **Rung 4 is claimed LANDED and COMPILED, and nothing more.** No board has booted an image with
   `orinconwin` set, so every `[orinconwin]` verdict in §3.9 describes code that has never printed.
   In particular: **that the routed console's glyphs reach the GLASS is NOT claimed.** §3.9 answers
   §7's old `pal.render()` question from SOURCE — `Screen::present_background` subtracts
-  `wm::occluders` on both cfg arms — and a source reading is not a metal measurement. The stack cost
-  of `route_present_banded` on this board is likewise unmeasured; the numbers below stay Pi numbers.
+  `wm::occluders` on both cfg arms — and a source reading is not a metal measurement. ⚠ Updated
+  2026-08-25: boot7g measured the **un-routed** side of that question on metal (§3.8.1 — the console
+  blit does overdraw the composited body, exactly as the source reading predicted it would without
+  rung 4), which makes the case for rung 4 a measurement rather than an argument. It does **not**
+  make rung 4 flown: no board has booted an image with `orinconwin` set, so whether the occluder
+  subtraction actually holds the desktop on the glass is still owed. The stack cost of
+  `route_present_banded` on this board is likewise unmeasured; the numbers below stay Pi numbers.
 - **The stack cost of the routing path on Orin is unmeasured.** `[u7stk]` exists
   here and `witness`-gates cleanly, and has never been pointed at the click-router
   depth on this board. §5's numbers remain Pi numbers.
