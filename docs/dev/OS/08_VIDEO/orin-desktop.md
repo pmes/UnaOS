@@ -764,6 +764,37 @@ names the seat that owns the files under the parallel-arc rules in `CLAUDE.md`.
 | **5** | **The real desktop** | dock, strip, menubar, crystal armed; the full `pidesk` cascade; a tegra `render_service` (§3.6) | the Orin comes up to a desktop | jetson — **blocked by §5.2** |
 | **6** | **EL0 tenants** | user windows from EL0 through `SYS_WIN_*`, on the `tegra_el0` regime | an EL0 program owns a window on the Orin panel | jetson |
 
+### §6.0 INHERITED FROM PI, NOT YET TAKEN — two shared-stack fixes waiting on the shelf
+
+Both landed on `origin/hw-pi4` and are portable. Neither is on this branch. Pick
+from `hw-pi4` and run this track's own battery — pi's combined battery has NOT
+run (bgspread and chromeband both edited `pi4-regression.spec`; the picks
+auto-merged but nothing re-ran under pi's hold).
+
+| sha | what | when it becomes ours |
+| --- | --- | --- |
+| `99b0c867` | **CHROMEBAND** — `wm.rs`: where `row_bytes` makes `chunk_rows < box height`, `paint_window` runs per band but `fill_rect_ceramic` did not clip its row walk to the band | **rung 3+**, when boxes stop being panel/3 |
+| `1c44ea4b` | **BGSPREAD** — aarch64 `syscall.rs` fixture over-asserted "3 distinct cores"; correct contract is argmin membership on `el0_active` per launch (`inmin=3`). Same edit fixes the doc's tiebreak order: **key 1 = `el0_active`, key 2 = queue depth** | whenever this track copies or inherits that fixture |
+
+**Rung 0 is NOT exposed to CHROMEBAND, measured rather than assumed.** Its window
+is deliberately panel/3 each way, so at 1920x1200 the box is 640x400:
+`row_bytes = 2560`, `chunk_rows = 4 MiB / 2560 = 1638` against a 400-row box —
+**single band, chrome paints once.** Exposure needs `cw * ch > 1 Mpixel`, i.e. a
+panel above ~9.4 Mpixel; 4K (8.3 M) does not reach it.
+
+**The mechanism refinement is the part to remember, because it explains why this
+survived so long.** The defect is **not** triple-painted pixels — out-of-band rows
+were already clipped at the bottom of the chain. The 3x is per-row **OVERHEAD**
+(ceramic shade, `encode4`, call + bounds) for rows that land nothing: pure
+`compose_us` waste, **invisible on glass**. No visual witness could ever have
+caught it, and none did. The fix clamps the row walk to the band and leaves the
+single-band path verbatim-unchanged; pi measured `waste = 980 -> 0` at 1920x1200
+and added a spec leg that REQUIREs `waste=0`, red-proven before the fix.
+
+This is the same family as everything else this branch has paid for: **an
+instrument that could not have failed.** Here there was no instrument at all,
+because the symptom never reached a pixel.
+
 ### §6.1 The ordering constraint, and why it is not negotiable
 
 **Rung 3 (input routing) must land before rung 4 (console as a window).**

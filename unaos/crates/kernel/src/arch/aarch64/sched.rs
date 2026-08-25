@@ -9875,6 +9875,84 @@ fn capstone_queue_pre_staged(cpu: usize) -> bool {
     true
 }
 
+// ── SHELLUP — `spawn_prio` WITH A CALLER-SIZED KERNEL STACK ─────────────────────────────────────
+//
+// Appended at the FILE TAIL rather than beside its `spawn_prio` / `spawn_stack` siblings, for the
+// reason PARITY §5.3 gives and the U7STK block at the head of this file already obeys: a definition
+// inserted higher up renumbers every panic `Location` recorded below it, and `arch/aarch64/sched.rs`
+// is compiled into the knob-off `kernel8.img` whose byte-identity is this track's standing proof.
+// Nothing is below this, so nothing moves.
+//
+// ORIN NOTE (cherry-pick of `e8dcb09c` onto `hw-jetson`, 2026-08-25). Two claims above are pi's and
+// are read differently here. (1) "Nothing is below this": on this branch the STACKPOOL prose block
+// follows, which is COMMENTS ONLY — it records no panic `Location`, so the §5.3 argument still holds
+// verbatim and the upstream order (SHELLUP, then STACKPOOL below it) is preserved, which is also what
+// makes STACKPOOL's own "below `spawn_prio_stack` … `spawn_prio_stack` above" read true here.
+// (2) "see the spawn site in `main.rs`": THERE IS NO SPAWN SITE ON THIS BRANCH. SHELLUP's `main.rs`
+// half — pi's `render` spawn, `RENDER_STACK_SIZE`, the `[u7stk] at=render:pass` probe and the
+// `[shellup]` census — was DELIBERATELY NOT TAKEN under the same H2 split that dropped STACKPOOL's
+// `main.rs` hunk: every one of those sites is inside `#[cfg(feature = "baremetal")]`, `baremetal`
+// implies `pi`, and `pi` + `tegra` is a hard `compile_error!` (`arch/aarch64/serial.rs:23`) — so on
+// ANY tegra build they compile to nothing and carry zero Orin value. What is taken is the HELPER
+// only. It has NO CALLER on this branch today; the tegra render task of `orin-desktop.md` rung 5
+// is what will supply one, with its OWN measured size, from `tegra_early_stop` and not from
+// `kernel_main`'s pi-topology M5 block.
+//
+// (3) AND THEREFORE THE `#[cfg(feature = "baremetal")]` BELOW, which upstream does not have.
+// MEASURED on this base, not reasoned — two independent `CARGO_TARGET_DIR`s, same source directory,
+// only this one input varying, `llvm-objcopy -O binary` on `target/aarch64-unaos/release/unaos-kernel`
+// then `cmp` (features `ehcihid,tegra,tegrasmp`, i.e. what `./arroyo esp-jetson` links):
+//
+//   baseline f0106408                            cc0a0693…c239147f
+//   + this whole comment block, NO `pub fn`      cc0a0693…c239147f   IDENTICAL — prose is free
+//   + the UNGATED `pub fn`, no caller anywhere   95fc91d7…d7c51936   71591 BYTES DIFFER, same size
+//   + the `pub fn` GATED as below                cc0a0693…c239147f   IDENTICAL
+//
+// The middle row is the point. `llvm-nm` finds NO `spawn_prio_stack` symbol in that image — it was
+// dead-stripped, it references nothing, it emits no string — and the loadable image STILL got
+// re-laid-out end to end at unchanged length. A `pub fn` in this crate is public lib API, so it is
+// codegen'd into the rlib before `--gc-sections` ever sees it, and its presence alone reseeds the CGU
+// partition. Ungated, this helper would have silently spent this track's standing byte-identity proof
+// on a function no tegra build can call. The same control on the default (virt) aarch64 image:
+// 4bdab783…5df4a149 both sides.
+//
+// WHEN TO WIDEN THE GATE: the arc that adds a tegra caller widens it, in the same commit as the
+// caller, and pays the resulting image delta as a DECLARED delta with its own measurement. Not before.
+//
+// WHAT IT IS. The `spawn_stack` × `spawn_prio` CROSS. The Pi render service needs both halves at
+// once — the interactive SERVICE priority band AND a stack larger than the blanket 16 KiB
+// [`TASK_STACK_SIZE`] — and neither existing helper gives both: `spawn_stack` takes a size but pins
+// `PRIO_NORMAL`, `spawn_prio` takes a band but hard-codes the blanket size.
+//
+// WHY IT EXISTS. The render task is the SECOND task the SPIN-6 refusal below has convicted of running
+// its own frame chain off the bottom of the blanket 16 KiB — after `u7-launch`, whose cure was this
+// same one (32 KiB; see the U7STK block). Pi metal, dsktp boot 10, BOTH flights:
+//
+//   [spin6] cpu=1 REFUSING corrupt switch-in: task=103:render ctx_sp=0x2089f80
+//   outside its stack [0x208a000,0x208e000)      — flight 1, 128 B below its OWN low bound
+//   [spin6] cpu=1 REFUSING corrupt switch-in: task=98:render ctx_sp=0x2085fa0
+//   outside its stack [0x2086000,0x208a000)      — flight 2, 96 B below
+//
+// `ctx_sp` below the task's own low bound is the U7STK signature exactly — this task's frame chain,
+// not a neighbour writing into it. The corroborating measurement is already on the same wire: the
+// `[u7stk] at=after:pidesk_arm` probe reports `hw=16496` for `u7-launch`, i.e. the desktop-arming
+// subtree ALONE carries a high-water 112 bytes past 16 KiB, while the render task overflowed its own
+// 16 KiB by 96..128. Same cascade, same order of depth, same cure.
+//
+// As with `spawn_stack`, a size passed here MUST come with its measurement. The render task's is the
+// `[u7stk] at=render:pass` probe folded onto its `[sched6]` cadence — see the spawn site in `main.rs`.
+#[cfg(feature = "baremetal")]
+pub fn spawn_prio_stack(
+    name: &'static str,
+    entry: fn(usize),
+    arg: usize,
+    cpu: usize,
+    priority: u8,
+    stack_bytes: usize,
+) -> u64 {
+    spawn_inner(name, entry, arg, cpu, priority, None, stack_bytes)
+}
+
 // ── STACKPOOL — READ THE SPIN-6 MESSAGE'S PARENTHETICAL AS A QUESTION, NEVER AS A FINDING ────────
 //
 // Tail-appended below `spawn_prio_stack` for the same PARITY §5.3 reason that helper gives: nothing
