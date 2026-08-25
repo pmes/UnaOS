@@ -38,7 +38,7 @@ use super::percpu::{self, NUM_CPUS};
 use super::timer;
 
 /// Per-thread kernel stack. 16 KiB matches the x86 scheduler.
-const TASK_STACK_SIZE: usize = 16 * 1024;
+const TASK_STACK_SIZE: usize = 16 * 1024; const STACK_REDZONE: usize = 1024; const STACK_HIGHGUARD: usize = 512; const GUARD_FILL: u8 = 0x5A; static GUARD_LO_REPORTS: AtomicU32 = AtomicU32::new(0); static GUARD_HI_REPORTS: AtomicU32 = AtomicU32::new(0); static GUARD_LO_LAST: AtomicU64 = AtomicU64::new(u64::MAX); static GUARD_HI_LAST: AtomicU64 = AtomicU64::new(u64::MAX);
 
 // =============================================================================================
 // U7STK — the kernel-stack HIGH-WATER instrument (PARITY §6.1b).
@@ -79,8 +79,8 @@ pub const STACK_POISON: u8 = 0xAB;
 /// Kernel-stack high-water probe. Prints one raw-word `[u7stk]` line for the CURRENT task:
 ///   `at=` checkpoint name · `sp=` live stack pointer · `low=`/`top=` the task's own bounds ·
 ///   `used=` top-sp at this instant · `hw=` the high-water (deepest point EVER reached) ·
-///   `headroom=` len-hw, i.e. what is left before SPIN-6 fires. `headroom` goes NEGATIVE once the
-///   chain has already run off the bottom (printed signed for exactly that reason).
+///   `headroom=` len-hw, what is left before SPIN-6 fires. ⚠ SATURATING — the scan starts AT `base`,
+///   so `hw<=len` and `headroom>=0` ALWAYS: `hw=len headroom=0` is a LOWER BOUND, never a depth.
 ///
 /// Safe to call from any kernel task; a no-op outside a scheduled task (no `current`).
 #[cfg(feature = "witness")]
@@ -97,8 +97,8 @@ pub fn stk_probe(at: &str) {
     // Read the bounds out of the live Task. This is the task running on THIS core, so nothing can
     // free the Box underneath us; the fields are read, never written.
     let task = unsafe { &*raw };
-    let base = task.stack.as_ptr() as u64;
-    let len = task.stack.len() as u64;
+    let base = task.stack.as_ptr() as u64 + STACK_REDZONE as u64;
+    let len = task.stack.len() as u64 - (STACK_REDZONE + STACK_HIGHGUARD) as u64;
     let top = base + len;
     // High-water: the first byte from the LOW end that is no longer poison.
     //
@@ -1739,8 +1739,8 @@ extern "C" fn user_task_trampoline() -> ! {
 /// 16-aligned top; x30's slot holds the trampoline, DAIF's slot holds IRQ-masked, the rest (x19-x29,
 /// pad, d8-d15) zero.
 fn build_initial_frame(stack: &mut [u8], trampoline: extern "C" fn() -> !) -> u64 {
-    let base = stack.as_mut_ptr() as usize;
-    let top = (base + stack.len()) & !0xF;
+    let base = stack.as_mut_ptr() as usize; let n = stack.len(); stack[..STACK_REDZONE].fill(GUARD_FILL); stack[n - STACK_HIGHGUARD..].fill(GUARD_FILL);
+    let top = (base + n - STACK_HIGHGUARD) & !0xF;
     let sp = top - 176;
     unsafe {
         let p = sp as *mut u64;
@@ -1751,7 +1751,7 @@ fn build_initial_frame(stack: &mut [u8], trampoline: extern "C" fn() -> !) -> u6
         p.add(12).write(INITIAL_DAIF); // DAIF slot (offset 96)
     }
     sp as u64
-}
+} #[inline] fn guard_state(g: &[u8]) -> u32 { let p = g.as_ptr(); let n = g.len(); unsafe { (if core::ptr::read_volatile(p.add(n - 1)) != GUARD_FILL { 1 } else { 0 }) | (if core::ptr::read_volatile(p) != GUARD_FILL { 2 } else { 0 }) } }
 
 // ---------------------------------------------------------------------------------------------
 // SCHED-3 — load-balanced placement for UNPINNED spawns
@@ -3545,7 +3545,7 @@ fn spawn_inner(
 ) -> u64 {
     let cpu = pick_cpu(requested_cpu);
     assert!(cpu < NUM_CPUS, "spawn: cpu out of range");
-    let mut stack: Box<[u8]> = alloc::vec![0u8; stack_bytes].into_boxed_slice();
+    let mut stack: Box<[u8]> = alloc::vec![0u8; stack_bytes + STACK_REDZONE + STACK_HIGHGUARD].into_boxed_slice();
     // U7STK: paint before the initial frame is laid down, so `stk_probe`'s low-end scan measures
     // real touched depth rather than the allocator's zero fill. Witness-gated (see STACK_POISON).
     #[cfg(feature = "witness")]
@@ -3736,7 +3736,7 @@ fn spawn_user_inner(
     assert!(cpu < NUM_CPUS, "spawn_user: cpu out of range");
     // BG-SPREAD witness aid — record the decision so the caller can read back where its task landed.
     LAST_USER_PLACEMENT.store(cpu, Ordering::Release);
-    let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
+    let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE + STACK_REDZONE + STACK_HIGHGUARD].into_boxed_slice();
     let ctx_sp = build_initial_frame(&mut stack, user_task_trampoline);
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
     let task = Box::new(Task {
@@ -3858,7 +3858,7 @@ pub fn spawn_user_thread(
     assert!(cpu < NUM_CPUS, "spawn_user_thread: cpu out of range");
     let done = Arc::new(Semaphore::new(0));
     done.init(); // reserve the waiter list BEFORE the thread can run + post (alloc-free park)
-    let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
+    let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE + STACK_REDZONE + STACK_HIGHGUARD].into_boxed_slice();
     let ctx_sp = build_initial_frame(&mut stack, user_task_trampoline);
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
     let task = Box::new(Task {
@@ -5220,13 +5220,13 @@ fn dispatch_next(cpu: usize) -> bool {
     // overwritten (leading suspect: a neighboring kernel-stack overflow). Refuse the switch loudly
     // — a named refusal beats an anonymous dead core — and drop the task as unrecoverable.
     {
-        let base = task.stack.as_ptr() as u64;
-        let top = base + task.stack.len() as u64;
-        let sp = task.ctx_sp;
-        if sp < base || sp > top {
+        let base = task.stack.as_ptr() as u64 + STACK_REDZONE as u64; let hg = guard_state(&task.stack[task.stack.len() - STACK_HIGHGUARD..]);
+        let top = task.stack.as_ptr() as u64 + (task.stack.len() - STACK_HIGHGUARD) as u64;
+        let sp = task.ctx_sp; if hg == 1 && GUARD_HI_LAST.swap(task.id, Ordering::Relaxed) != task.id && GUARD_HI_REPORTS.fetch_add(1, Ordering::Relaxed) < 16 { serial_println!("[redzone] cpu={} HIGH-GUARD entered task={}:{} — a NEIGHBOUR's overrun crossed into this stack's slab from ABOVE; the {} B guard ABSORBED it, the parked frame is intact and this task IS resumed. The overflower names itself on its own [redzone] LOW-REDZONE line", cpu, task.id, task.name, STACK_HIGHGUARD); }
+        if sp < base || sp > top || hg & 2 != 0 {
             serial_println!(
-                "[spin6] cpu={} REFUSING corrupt switch-in: task={}:{} ctx_sp={:#x} outside its stack [{:#x},{:#x}) — the parked frame was OVERWRITTEN (neighboring stack overflow?). Task dropped; core keeps dispatching",
-                cpu, task.id, task.name, sp, base, top
+                "[spin6] cpu={} REFUSING corrupt switch-in: task={}:{} ctx_sp={:#x} vs its stack [{:#x},{:#x}) higuard={} — the parked frame was OVERWRITTEN (ctx_sp out of bounds = this task's OWN frame chain; higuard&2 = a NEIGHBOUR's overrun TRAVERSED the high guard and reached the parked frame, which is SPIN-6's old blind spot now named). Task dropped; core keeps dispatching",
+                cpu, task.id, task.name, sp, base, top, hg
             );
             if task.user_entry != 0 {
                 // Same phantom-credit reasoning as park_blocked's dead-arm: it is never coming back.
@@ -5295,7 +5295,7 @@ fn dispatch_next(cpu: usize) -> bool {
     unsafe {
         switch_context(SCHED[cpu].scheduler_sp.as_ptr(), entry_sp);
     }
-    spin8(cpu, SPIN8_DISPATCH);
+    spin8(cpu, SPIN8_DISPATCH); let lz = unsafe { guard_state(&(&(*raw).stack)[..STACK_REDZONE]) }; if lz != 0 { let (lid, lnm) = unsafe { ((*raw).id, (*raw).name) }; if GUARD_LO_LAST.swap(lid, Ordering::Relaxed) != lid && GUARD_LO_REPORTS.fetch_add(1, Ordering::Relaxed) < 16 { serial_println!("[redzone] cpu={} LOW-REDZONE {} task={}:{} — this task's OWN SP crossed its usable floor into the {} B absorber below it{}", cpu, if lz & 2 != 0 { "TRAVERSED" } else { "entered" }, lid, lnm, STACK_REDZONE, if lz & 2 != 0 { "; the absorber is EXHAUSTED, so the slab BELOW this stack may already hold a SMASHED parked frame — grow this task's stack NOW" } else { ", which ABSORBED it, so no neighbour was reached — grow this task's stack" }); } }
     let busy_cyc = now_cyc().wrapping_sub(busy_t0);
     // The switch-back always lands IRQ-masked (yield_now/exit mask first; timer_preempt runs in the
     // auto-masked IRQ handler), so the Box reclaim below can't race a re-entrant preempt on this
@@ -9492,7 +9492,7 @@ fn smpbal_worker(_: usize) {
 /// loaded core". Mirrors `spawn_inner` minus the placement policy/log; used solely by `smpbal_steal_witness`.
 #[cfg(all(feature = "pi", feature = "witness"))]
 fn spawn_stealable_on(name: &'static str, entry: fn(usize), arg: usize, cpu: usize) {
-    let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
+    let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE + STACK_REDZONE + STACK_HIGHGUARD].into_boxed_slice();
     let ctx_sp = build_initial_frame(&mut stack, task_trampoline);
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
     let task = Box::new(Task {
@@ -9874,3 +9874,52 @@ fn capstone_queue_pre_staged(cpu: usize) -> bool {
     );
     true
 }
+
+// ── STACKPOOL — READ THE SPIN-6 MESSAGE'S PARENTHETICAL AS A QUESTION, NEVER AS A FINDING ────────
+//
+// Tail-appended below `spawn_prio_stack` for the same PARITY §5.3 reason that helper gives: nothing
+// is below this, so no panic `Location` in the knob-off `kernel8.img` moves. Prose only — the
+// STACKPOOL fix itself needed no new machinery here, because `spawn_prio_stack` above is already
+// exactly the `spawn_stack` x `spawn_prio` cross the third convicted task needs.
+//
+// The refusal above prints "(neighboring stack overflow?)". That was the LEADING SUSPECT when SPIN-6
+// was written, and it has now been the wrong suspect three times running — `u7-launch`, `render`
+// (SHELLUP) and `usb-pump` (STACKPOOL, dsktp boot 11, `task=98:usb-pump ctx_sp=0x207df00 outside its
+// stack [0x207e000,0x2082000)`). Every one was the task's OWN frame chain. Two structural facts say
+// it can never be anything else, and they are written down here so the fourth reading of this line
+// does not spend an arc re-deriving them:
+//
+//   1. `ctx_sp` IS NOT ON THE STACK IT NAMES. It is a field of the heap-allocated `Task`
+//      (`Box::new(Task { .. ctx_sp .. })` in `spawn_inner`), and the refusal tests THAT FIELD
+//      against the task's own bounds. A neighbour overflowing INTO this stack corrupts the parked
+//      FRAME — bytes inside [base, top) — and leaves `ctx_sp` in range, so it produces a wild
+//      restore, a wedge, or a fault, but NOT this refusal. `ctx_sp < base` is only reachable by this
+//      task's own SP having walked below its own low bound and banked there.
+//   2. THERE IS NO STACK POOL TO CROWD. Every kernel stack is an INDIVIDUAL heap allocation —
+//      `alloc::vec![0u8; stack_bytes].into_boxed_slice()` in `spawn_inner`, likewise in
+//      `spawn_user_inner` and `spawn_user_thread`. Growing one task's stack cannot shrink another's;
+//      a size change moves nobody's bounds but its own. Boot 11 shows this on the wire: SHELLUP grew
+//      `render` from [0x2086000,0x208a000) to [0x2086000,0x208e000) — same low bound, in place —
+//      while `usb-pump`, allocated BEFORE it, kept the identical [0x207e000,0x2082000) it had in
+//      boot 10.
+//
+// So the diagnostic order for the NEXT one is: the named task's own depth first (paint is already
+// on, put a `stk_probe` on its path and read `hw`), a right-sized stack via `spawn_stack` /
+// `spawn_prio_stack` second, and `TASK_STACK_SIZE` never — see the note on `spawn_stack` for why the
+// blanket is the wrong trade. The parenthetical stays in the message unchanged: it is honest about
+// being a question, and rewording it would move the knob-off image for a comment.
+//
+// AND THE REFUSAL'S REAL BLIND SPOT, which is not the parenthetical: SPIN-6 validates the VICTIM'S
+// STACK POINTER. It cannot see the task the overrun SMASHED. Boot 11 is the whole failure mode in
+// four lines: `usb-pump`'s ~176-byte preemption frame landed at 0x207df00, inside the heap slab
+// BELOW its stack, on top of THAT task's parked saved-`x30`. This check refused `usb-pump` — its
+// `ctx_sp` is out of bounds — and PASSED the neighbour, whose `ctx_sp`, being a heap field of its
+// own `Task`, is untouched and perfectly in range. `switch_context` then restored the smashed `x30`
+// and `ret`'d to it: `ELR=0x1228`, below the kernel's first byte (`pi-baremetal.ld` links at
+// 0x80000), with `EC=0x00`/`FAR=0x0` — the fetch SUCCEEDED and decoded as UNDEFINED, which an
+// unmapped fetch (`EC=0x21`, `FAR` set) would not have. Then `hlt_loop()`, and cpu 3 was gone for
+// the rest of the boot with the `input` router pinned to it. That is the difference between boot 10
+// (a task dropped, the machine limps) and boot 11 (a core dead, the panel wedges) — SAME defect,
+// one extra victim. Closing it properly means a REDZONE (an unpoisoned guard span below each stack
+// whose first touch is the fault) rather than a wider bounds test here, since by the time this code
+// runs the neighbour's frame is already gone. Not this arc's; recorded so the shape is known.
