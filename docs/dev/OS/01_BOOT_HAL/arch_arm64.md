@@ -8685,6 +8685,73 @@ allocation that overshot the heap into firewalled DRAM. Fix: clamp to the spec-s
 bits (xHCI 5.4.3 mandatory 4 KiB fallback), null/heap-bounds guard, heap-PA witness. No
 behavior change on healthy controllers (Pi VL805 reads bit 0 set → 4 KiB, unchanged).
 
+### NET-4V — the DHCP no-lease LOCALIZED, and the one-line window-close verdict (rtl8168_tegra.rs)
+
+**The finding.** The Orin's DHCP no-lease is **not** a defect in the DHCP path. The standing reading —
+"the OFFER passes every driver-visible check, so the drop is ABOVE the driver, in the smoltcp `dhcpv4`
+socket" (boot-11) — is refuted by the R23s1 capture that produced it
+(`~/unaos-bench/capture/orin-r23s1/cu.usbmodem143402.log`). In every DHCP window of that sitting the
+ladder reads:
+
+```
+[net4d] rx[1] len=346 … DHCP 192.168.2.1:67->192.168.2.2:68 op=2 type=2(OFFER) xid=0x51fb1e94 vs-DISCOVER 0x51fb1e94 [MATCH] yiaddr=192.168.2.2
+[net4j] smoltcp ACCEPT: IPv4 csum OK, UDP csum OK , chaddr==MAC, server-id=192.168.2.1 — the OFFER passes every smoltcp gate
+[net4k] TX DHCP 3(REQUEST) xid=0x51fb1e94 (udp 68->67, 316 bytes) tx#2
+[net4d] rx[2] len=346 dst=00:00:00:00:00:00 src=00:00:00:00:00:00 et=0x0000 class=other
+[net4d] rx[3] len=346 dst=00:00:00:00:00:00 src=00:00:00:00:00:00 et=0x0000 class=other
+NET: no lease within 5000 ms (39949772 polls) — falling back to static 192.168.1.2/24
+```
+
+`dhcpv4::Socket::dispatch` emits a REQUEST from **no state but `Requesting`**, and the socket enters
+`Requesting` **only** by accepting an OFFER in `process`. So the REQUEST line is a positive proof that
+smoltcp consumed the OFFER and did its job. What follows is the tell: `rx[2]`/`rx[3]` complete with
+**len=346 — the ACK's length, twice — over an all-zero buffer**. The lease dies at the **ACK**, and the
+mechanism is **NET-4A** (the payload lands somewhere other than the completing descriptor's buffer),
+not the DHCP path. Two adjacent hypotheses are also closed by this evidence:
+
+- **Checksum capabilities / trailing FCS (NET-4k) — ACQUITTED.** The driver hands smoltcp the frame with
+  the 4-byte FCS still appended (`trailing=4 B`), but smoltcp bounds every slice by a header length
+  field — `Ipv4Packet::payload()` slices `header_len..total_len`, `UdpPacket::payload()` and
+  `verify_checksum()` both slice `..self.len()` — so trailing bytes never enter a checksum. The Pi's
+  GENET `rx_frame_raw` does not strip the FCS either **and leases**, which settles it by differential.
+- **RX filtering — ACQUITTED.** `RCR` is written `AAP|APM|AM|AB` (fully promiscuous, broadcast accepted),
+  readback-witnessed by `[net4y]`. A broadcast ACK is not filtered out.
+
+The bind seams are otherwise identical: Pi and Orin both build `Config::new(Ethernet(mac))` +
+`Interface::new` and call the **same shared** `net_phy::dhcp_or_static`, over the same shared
+`SmoltcpPhy` with the same `DeviceCapabilities` (Ethernet, MTU 1500, default checksum caps). Only the
+`random_seed`, the static fallback, and the `now_ms` source differ — and the Orin's CNTPCT clock is
+proven live by the honest `5000 ms` window bound the log prints.
+
+**The second, independent fact the summary was already carrying unread:** `total popped` is **exactly
+32 = `NUM_RX`** in *every* recorded window, across ~40 million polls of a 5 s window. The ring delivers
+one full pass and then goes permanently dry.
+
+**NET-4V — the witness.** `net4v_verdict`, emitted once at window close right after the
+`[net4d window-close]` line, puts the whole ladder on one line so the next flight convicts or acquits
+without a hand-correlation pass over a 2 MB log:
+
+```
+[net4V no-lease verdict] dhcp-tx: discover=N request=N | dhcp-rx: offer=N ack=N nak=N |
+  ring: popped=N/32 zero-payload=N [RING-DRY after exactly one pass] => <VERDICT>
+```
+
+The verdicts are mutually exclusive and exhaustive over "no lease", so the line can never be silent
+about the cause:
+
+| Verdict | Fires when | What it convicts |
+|---|---|---|
+| `ACK-STARVED` | offer delivered **and** request emitted, no ACK | smoltcp EXONERATED; the lease dies at the ACK — read `zero-payload` for the NET-4A rate |
+| `SOCKET-DROP` | offer delivered, **no** request | the boot-11 reading, and the only way it can be true: the drop IS in `dhcpv4::Socket::process`; `[net4j]` names the gate |
+| `NO-OFFER` | discover sent, no offer delivered | wire / server / RX filter — the DHCP path was never exercised |
+| `ACK-SEEN` | an ACK **was** delivered and still no lease | a genuinely NEW defect — `parse_ack`, lease/renew durations |
+| `NO-DISCOVER` | nothing on the TX ladder | smoltcp never dispatched, or the bind never ran |
+
+Go-red: on the evidence to date the next boot must print `ACK-STARVED` with `request=1 ack=0` and a
+non-zero `zero-payload`. If it prints `SOCKET-DROP` instead, the DHCP path really is at fault and this
+finding is wrong — one line separates them. The tallies are pure counters on paths that already ran
+(read-only, no device access, unbounded so a REQUEST past `NET4K_TX_WITNESS_MAX` cannot be under-counted).
+
 ## PH-3 — is the aarch64 block-write path "fully polled emmc2"? (verdict: **premise FALSE**)
 
 An answer owed to the pi4 lane, which was deciding on the `fs/fat.rs` `FAT_MUTATION` span

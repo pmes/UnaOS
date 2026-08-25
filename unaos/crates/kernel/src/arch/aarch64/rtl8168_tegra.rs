@@ -921,6 +921,21 @@ mod metal {
         net4a_prev_slot: i64,
         net4a_run: u64,
         net4a_fired: bool,
+        /// NET-4V: the DHCP LADDER tallies that carry the window-close verdict. Every DHCP frame the
+        /// driver hands smoltcp (`dhcp_rx_*`) and every DHCP frame smoltcp hands the driver
+        /// (`dhcp_tx_*`) is counted by message type, unbounded (DHCP is inherently low-volume; only the
+        /// per-frame witness LINES are bounded). The PAIR of ladders is what localizes the no-lease: a
+        /// REQUEST on the TX ladder PROVES the dhcpv4 socket consumed a DELIVERED OFFER and left
+        /// `Discovering`, because `dhcpv4::Socket::dispatch` emits a REQUEST from no other state.
+        dhcp_tx_discover: u64,
+        dhcp_tx_request: u64,
+        dhcp_rx_offer: u64,
+        dhcp_rx_ack: u64,
+        dhcp_rx_nak: u64,
+        /// NET-4V: completed RX descriptors whose OWN buffer read all-zero in its leading 12 bytes —
+        /// the direct NET-4A rate (a real descriptor length over an empty buffer). Counted on every pop
+        /// from the `slot_head_zero` probe the pop path already computes; read-only.
+        rx_zero_payload: u64,
     }
 
     // The driver owns raw DMA pointers; on the single-CPU main-loop/poll discipline it is only ever
@@ -1491,6 +1506,14 @@ mod metal {
                 if self.d_xid.is_none() && di.op == 1 && di.mtype == 1 {
                     self.d_xid = Some(di.xid);
                 }
+                // NET-4V: the TX half of the DHCP ladder. UNBOUNDED (unlike the witness line below), so
+                // the window-close verdict can never under-count a REQUEST that fell past
+                // NET4K_TX_WITNESS_MAX.
+                match di.mtype {
+                    1 => self.dhcp_tx_discover += 1,
+                    3 => self.dhcp_tx_request += 1,
+                    _ => {}
+                }
                 if self.dhcp_tx_witnessed < NET4K_TX_WITNESS_MAX {
                     self.dhcp_tx_witnessed += 1;
                     serial_println!(
@@ -1698,6 +1721,15 @@ mod metal {
             // BOOTP/DHCP: full line ALWAYS (unbounded), the frame the investigation is about.
             if let Some(di) = decode_dhcp(frame) {
                 self.rxcat[RXCAT_DHCP] += 1;
+                // NET-4V: the RX half of the DHCP ladder, tallied BEFORE any of the branches below can
+                // return, so "DELIVERED to smoltcp" is exactly what it counts (this classifier is
+                // read-only — the frame reaches the socket either way).
+                match di.mtype {
+                    2 => self.dhcp_rx_offer += 1,
+                    5 => self.dhcp_rx_ack += 1,
+                    6 => self.dhcp_rx_nak += 1,
+                    _ => {}
+                }
                 self.rxcls_full = self.rxcls_full.saturating_add(1);
                 let (xtok, xexp) = match self.d_xid {
                     Some(x) if x == di.xid => ("MATCH", x),
@@ -1890,6 +1922,7 @@ mod metal {
                 self.rx_count, xid,
                 if self.d_xid.is_some() { "sent" } else { "NEVER SENT" }
             );
+            self.net4v_verdict();
             // NET-4E (armed-diagnostic builds only): QUENCH RX DMA at window close. The NIC's
             // misdirected payload writes (NET-4A mechanism, cause unfound) continue as long as RX
             // is enabled and the segment carries traffic — post-window they serve no verdict and
@@ -1904,6 +1937,67 @@ mod metal {
                     P4, cr, cr & !CR_RE
                 );
             }
+        }
+
+        /// NET-4V — THE ONE-LINE NO-LEASE VERDICT. Emitted once, at DHCP-window close, right after the
+        /// `[net4d window-close]` category summary.
+        ///
+        /// ## What it decides, and why one line is enough
+        ///
+        /// Every previous no-lease sitting required correlating a 2 MB serial log by hand: find the
+        /// `[net4k] TX DHCP …` lines, find the `[net4d] rx[…] DHCP …` lines, and reason about what is
+        /// ABSENT. That is how the boot-11 reading ("the OFFER passes every check, so the drop is ABOVE
+        /// the driver, in the smoltcp dhcpv4 path") survived past the boot that refuted it: the very
+        /// same capture contains `[net4k] TX DHCP 3(REQUEST)`, and a REQUEST can only be dispatched
+        /// from `ClientState::Requesting`, which the socket enters ONLY by accepting an OFFER. The
+        /// evidence was on the wire and nobody had to look at it in one place.
+        ///
+        /// This line puts the whole ladder in one place and names the verdict, so the next flight
+        /// convicts or acquits without a correlation pass. The three verdicts are mutually exclusive
+        /// and exhaustive over "no lease", so the line can never be silent about the cause:
+        ///
+        ///   * `ACK-STARVED`  — an OFFER was DELIVERED **and** a REQUEST was EMITTED, but no ACK was
+        ///     ever delivered. The socket left `Discovering`; smoltcp did its job. The lease died at
+        ///     the ACK, and `zero-payload` names why: the ACK completed a descriptor carrying a real
+        ///     length over an empty buffer (NET-4A). ⇒ smoltcp/dhcpv4 EXONERATED; the RX
+        ///     payload-landing defect owns the no-lease.
+        ///   * `SOCKET-DROP` — an OFFER was DELIVERED and NO REQUEST followed. This, and ONLY this, is
+        ///     the boot-11 reading: the drop really is above the driver, inside
+        ///     `dhcpv4::Socket::process`. The `[net4j]` gate lines then name which gate.
+        ///   * `NO-OFFER`    — a DISCOVER left the NIC and no OFFER was ever delivered. Wire, server,
+        ///     or RX filter — the DHCP path was never exercised at all.
+        ///
+        /// `ACK-SEEN` (an ACK WAS delivered and there is still no lease) is the fourth, and would be a
+        /// genuinely NEW defect — `parse_ack` / lease-duration territory, nothing yet seen on this
+        /// silicon. `NO-DISCOVER` closes the ladder at the bottom.
+        ///
+        /// The `ring` column is the second, independent fact the window-close summary has been carrying
+        /// unread: `popped` has been EXACTLY `NUM_RX` in every recorded sitting — one full pass of the
+        /// ring and then permanently dry, across ~40 million polls of a 5 s window. `RING-DRY` flags
+        /// that explicitly so a boot where the ring DOES wrap is immediately distinguishable.
+        ///
+        /// Read-only: pure tallies accumulated on paths that already ran. No device access.
+        fn net4v_verdict(&self) {
+            let verdict = if self.dhcp_rx_ack > 0 {
+                "ACK-SEEN: an ACK WAS delivered to smoltcp and no lease followed — NOT the known defect; suspect dhcpv4::Socket::parse_ack (lease/renew durations, subnet mask) and re-read the [net4j] gates"
+            } else if self.dhcp_rx_offer > 0 && self.dhcp_tx_request > 0 {
+                "ACK-STARVED: OFFER delivered AND REQUEST emitted (the socket left Discovering — dispatch emits a REQUEST from no other state), then NO ACK ever arrived readable. smoltcp/dhcpv4 EXONERATED; the lease dies at the ACK. See zero-payload below: a real descriptor length over an empty buffer is NET-4A eating the reply"
+            } else if self.dhcp_rx_offer > 0 {
+                "SOCKET-DROP: an OFFER was DELIVERED and NO REQUEST followed — the drop IS above the driver, inside dhcpv4::Socket::process; the [net4j] gate lines above name which gate"
+            } else if self.dhcp_tx_discover > 0 {
+                "NO-OFFER: a DISCOVER left the NIC and no OFFER was ever delivered — wire / server / RX filter; the DHCP path above the driver was never exercised"
+            } else {
+                "NO-DISCOVER: no DHCP DISCOVER ever reached the TX path — smoltcp never dispatched, or the bind never ran"
+            };
+            serial_println!(
+                "{}   [net4V no-lease verdict] dhcp-tx: discover={} request={} | dhcp-rx: offer={} ack={} nak={} | ring: popped={}/{} zero-payload={} [{}] => {} ::",
+                P4,
+                self.dhcp_tx_discover, self.dhcp_tx_request,
+                self.dhcp_rx_offer, self.dhcp_rx_ack, self.dhcp_rx_nak,
+                self.rx_count, NUM_RX, self.rx_zero_payload,
+                if self.rx_count == NUM_RX as u64 { "RING-DRY after exactly one pass" } else { "ring wrapped" },
+                verdict
+            );
         }
 
         /// Pop one completed RX descriptor's raw Ethernet frame into `out` and recycle the descriptor
@@ -2029,6 +2123,13 @@ mod metal {
                 }
                 z
             };
+            // NET-4V: tally the completing descriptor's OWN-buffer emptiness on EVERY pop (the probe
+            // above is already unconditional; this only counts it). `rx_zero_payload` vs `rx_count` is
+            // the NET-4A rate the window-close verdict quotes — a real descriptor length over an empty
+            // buffer is the signature, and the ACK is the frame it costs the lease.
+            if slot_head_zero {
+                self.rx_zero_payload += 1;
+            }
             let mut harvest: *mut u8 = core::ptr::null_mut();
             let mut harvest_idx: usize = 0;
             if option_env!("UNAOS_NET4_BUF1").is_some() && slot_head_zero {
@@ -3430,6 +3531,12 @@ mod metal {
             net4a_prev_slot: -2,
             net4a_run: 0,
             net4a_fired: false,
+            dhcp_tx_discover: 0,
+            dhcp_tx_request: 0,
+            dhcp_rx_offer: 0,
+            dhcp_rx_ack: 0,
+            dhcp_rx_nak: 0,
+            rx_zero_payload: 0,
         };
 
         // ── M2/M3 GUARD: poison-honest readback through the NEW window BEFORE any register write ──
