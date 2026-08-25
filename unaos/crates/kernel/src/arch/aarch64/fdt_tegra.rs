@@ -1477,7 +1477,7 @@ pub fn nvdisplay_base(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Opti
     if plen == 0 {
         return None;
     }
-    let reg = fdt.prop_at(&path[..plen], b"reg");
+    let reg = fdt.prop_at(&path[..plen], b"reg"); #[cfg(feature = "jd1dc")] nvdisplay_reg_census(&fdt, &path[..plen], &reg); // JD1-DC-REG: `reg` on this node is MULTI-ENTRY (the DRIVE OS T234 binding declares four — nvdisplay, dpaux0, hdacodec, mipical) and the two lines below take entry[0] and never say so, while `total_len` — the property's TRUE byte length, captured at `PropWords::capture` and the one datum that would reveal it — is discarded silently. This gated call prints total_len, the entry count it implies, every captured (addr,size) pair and the `reg-names` byte list, so a capture PROVES entry[0] is `nvdisplay` instead of assuming it. APPENDED to this line, never a new one: knob-off it is cfg-erased and not one `core::panic::Location` below moves.
     if reg.n < 4 {
         return None;
     }
@@ -1665,6 +1665,69 @@ pub fn node_ids(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64, node_name: &[
     pick(&clocks, &mut ids.clocks, &mut ids.n_clocks);
     pick(&resets, &mut ids.resets, &mut ids.n_resets);
     pick(&pds, &mut ids.pds, &mut ids.n_pds);
+    // JD1-DC — TRUNCATION IS LOUD, AND FOR power-domains IT IS FATAL TO THE FLIGHT.
+    //
+    // `pick` above drops silently at TWO caps and neither is visible in its output: `PropWords`
+    // stops capturing at `MAX_WORDS` (= 20 words = 10 [phandle,id] pairs, whatever the property),
+    // and the loop stops again at `out.len()` (9 clocks / 4 resets / 4 power-domains). Only
+    // `p.total_len` — the property's TRUE byte length, kept by `PropWords::capture` — knows how many
+    // entries the DTB actually declared. This project has already been bitten by exactly this class
+    // in exactly this function: the `XusbIds.clocks` comment above records the JB5 finding, where an
+    // 8-slot cap dropped `usb@3610000`'s ninth clock without a word on the wire.
+    //
+    // The two properties are NOT treated alike, and the asymmetry is the point. A truncated
+    // `clocks`/`resets` list costs this rung NOTHING — JD1-DC never enables a clock and never
+    // deasserts a reset; it reads MMIO. A truncated `power-domains` list, by contrast, destroys the
+    // ONE claim the guard exists to make: "every domain this node lists answered ON". With entries
+    // dropped, `jd1_dc_probe` would print `GUARD PASSED: all 4 display@ power domain(s) ON` and read
+    // a block whose 5th domain was never asked about — a read of a gated Tegra block is EL3-FATAL
+    // (JX1). So clocks/resets get a loud line and the walk continues; power-domains gets the loud
+    // line and then `None`, which the caller already renders as `VERDICT=REFUSED reason=no-ids` and
+    // NOT ONE nvdisplay register is read.
+    //
+    // `total_len % 8 != 0` is checked separately and is a DIFFERENT defect: it means the property is
+    // not a whole number of [phandle,id] pairs at all — a provider with `#power-domain-cells = <0>`
+    // yields 1-word entries, and `pick`'s odd-index extraction would then harvest phandles as ids.
+    // That is silent corruption rather than silent loss, so it is named as its own reason.
+    let trunc = |what: &str, p: &PropWords, taken: usize, cap: usize| -> bool {
+        if !p.found {
+            return false; // absent is not truncated — `n_* == 0` already says so on the census line.
+        }
+        let declared = p.total_len / 8; // [phandle, id] pairs the DTB declares, from the TRUE length
+        let ragged = p.total_len % 8 != 0;
+        if !ragged && declared <= taken {
+            return false;
+        }
+        serial_println!(
+            ":: tegra: JD1-DC-IDS TRUNCATED — '{}' on this node: total_len={} B => {} [phandle,id] pair(s) declared{}, but this reader kept {} id(s). Caps: PropWords MAX_WORDS={} words = {} pairs (captured n={}), destination array = {} ids. {} ::",
+            what,
+            p.total_len,
+            declared,
+            if ragged { " (RAGGED — total_len is not a multiple of 8, so this property is NOT a list of [phandle,id] pairs and the odd-index extraction below is reading the WRONG cells)" } else { "" },
+            taken,
+            MAX_WORDS,
+            MAX_WORDS / 2,
+            p.n,
+            cap,
+            if what == "power-domains" {
+                "The guard's 'all domains ON' claim cannot be made over a list this reader did not fully see, so the ids are REFUSED (None) and JD1-DC will read no nvdisplay register this boot"
+            } else {
+                "JD1-DC enables no clock and deasserts no reset, so the walk CONTINUES — this line exists so the capture records what was dropped, not to stop the flight"
+            },
+        );
+        true
+    };
+    let pds_trunc = trunc("power-domains", &pds, ids.n_pds, ids.pds.len());
+    let _ = trunc("clocks", &clocks, ids.n_clocks, ids.clocks.len());
+    let _ = trunc("resets", &resets, ids.n_resets, ids.resets.len());
+    if pds_trunc {
+        return node_ids_stop(
+            node_name,
+            "power-domains TRUNCATED or RAGGED (see the JD1-DC-IDS TRUNCATED line above); the guard cannot prove every listed domain is ON, and a read of a gated block is EL3-fatal — declared pair count / ids kept",
+            (pds.total_len / 8) as u64,
+            ids.n_pds as u64,
+        );
+    }
     if ids.n_clocks == 0 && ids.n_resets == 0 && ids.n_pds == 0 {
         return node_ids_stop(
             node_name,
@@ -1705,4 +1768,89 @@ fn node_ids_stop(node_name: &[u8], why: &str, a: u64, b: u64) -> Option<XusbIds>
         b,
     );
     None
+}
+
+/// JD1-DC-REG — say out loud what `nvdisplay_base` silently assumes about the `display@` node's
+/// `reg`, so a capture can CHECK the assumption instead of inheriting it.
+///
+/// The assumption: `nvdisplay_base` takes `reg.words[0..4]` — entry[0] — as the nvdisplay aperture.
+/// The DRIVE OS Tegra234 binding declares FOUR entries on this node, `reg-names =
+/// "nvdisplay", "dpaux0", "hdacodec", "mipical"`, and entry[0] IS the nvdisplay one — so the reader
+/// is right, but right by luck of ordering rather than by design, and nothing on the wire has ever
+/// said which entry was taken or how many there were. **Whether the L4T DTB this board actually
+/// hands us matches that binding — same order, same names — is UNMEASURED.** This is the instrument
+/// that would measure it.
+///
+/// Read-only RAM walk; prints, decides nothing, returns nothing. Every value here is a DTB datum —
+/// no MMIO is touched by this function and none may be: it runs long before the BPMP power guard.
+#[cfg(feature = "jd1dc")]
+fn nvdisplay_reg_census(fdt: &Fdt<'_>, node: &[u8], reg: &PropWords) {
+    // `reg` on this wrapper is (addr:2, size:2) cells = 16 bytes per entry. `total_len` is the
+    // property's TRUE byte length; `n` is how many words `PropWords` managed to capture (cap
+    // MAX_WORDS = 20 words = 5 entries). The two disagreeing is itself a finding.
+    let entries = reg.total_len / 16;
+    let ragged = reg.total_len % 16 != 0;
+    let captured = reg.n / 4;
+    serial_println!(
+        ":: tegra: JD1-DC-REG — node '{}': reg total_len={} B => {} entry/entries of (addr:2,size:2) cells{}; PropWords captured n={} words = {} whole entry/entries (cap MAX_WORDS={}). nvdisplay_base USES ENTRY[0] AND ONLY ENTRY[0]{} ::",
+        core::str::from_utf8(node).unwrap_or("?"),
+        reg.total_len,
+        entries,
+        if ragged { " (RAGGED — total_len is not a multiple of 16, so this is NOT a clean (addr:2,size:2) list and the decode below is unreliable)" } else { "" },
+        reg.n,
+        captured,
+        MAX_WORDS,
+        if entries > captured {
+            " — and MORE ENTRIES EXIST THAN WERE CAPTURED, so the list below is incomplete"
+        } else if entries > 1 {
+            " — the other entries are NOT dpaux/hdacodec/mipical by proof, only by the vendor binding; check reg-names below"
+        } else {
+            ""
+        },
+    );
+    // Every captured entry, so a reader can see for themselves which one is 0x13800000-shaped.
+    let mut e = 0usize;
+    while e < captured {
+        let a = ((reg.words[e * 4] as u64) << 32) | reg.words[e * 4 + 1] as u64;
+        let s = ((reg.words[e * 4 + 2] as u64) << 32) | reg.words[e * 4 + 3] as u64;
+        serial_println!(
+            ":: tegra: JD1-DC-REG —   entry[{}] addr={:#x} size={:#x}{} ::",
+            e,
+            a,
+            s,
+            if e == 0 { "  <== THIS is the aperture JD1-DC reads" } else { "" },
+        );
+        e += 1;
+    }
+    // `reg-names` is a NUL-separated string list, not cells. `PropWords` holds it as big-endian
+    // words, so rebuild the bytes and print them with NUL shown as '|' — this is what turns
+    // "entry[0] is nvdisplay" from an assumption into a wire fact. A missing `reg-names` is itself
+    // reported, because then the ordering claim has NO evidence on this board at all.
+    let names = fdt.prop_at(node, b"reg-names");
+    if !names.found {
+        serial_println!(
+            ":: tegra: JD1-DC-REG —   reg-names ABSENT on this node: nothing on this board identifies entry[0] as the nvdisplay aperture. The identification rests ENTIRELY on the vendor binding and on entry[0] being 0x13800000-shaped ::"
+        );
+        return;
+    }
+    let mut buf = [b'?'; MAX_WORDS * 4];
+    let mut w = 0usize;
+    while w < names.n && w * 4 < buf.len() {
+        let b = names.words[w].to_be_bytes();
+        let mut k = 0usize;
+        while k < 4 {
+            let c = b[k];
+            buf[w * 4 + k] = if c == 0 { b'|' } else if (0x20..0x7f).contains(&c) { c } else { b'.' };
+            k += 1;
+        }
+        w += 1;
+    }
+    let shown = (names.total_len).min(w * 4);
+    serial_println!(
+        ":: tegra: JD1-DC-REG —   reg-names total_len={} B, showing {} B ('|' = NUL): '{}'{} ::",
+        names.total_len,
+        shown,
+        core::str::from_utf8(&buf[..shown]).unwrap_or("<non-utf8>"),
+        if names.total_len > w * 4 { " (TRUNCATED by the PropWords word cap — more names exist)" } else { "" },
+    );
 }

@@ -9628,3 +9628,178 @@ set (`ehcihid,tegra,tegrasmp`) either side of the change, in a frozen worktree w
 QEMU models no Tegra234, so the verdict is **metal-owed** and the probe is **not armed on the
 currently-planned flight** — that image already carries other questions. Arm it, alone and attended,
 with `UNAOS_TEGRA=1 UNAOS_JD1DC=1` (or `UNAOS_JD1DC=1 ./arroyo esp-jetson`, which forces `tegra`).
+
+### JD1-DC-MODEL — which register model does this silicon present? (same knob, same guard)
+
+**Why this exists.** The five outcomes above have a hole in them, and it is in the instrument, not in
+the silicon. `VERDICT=DECODES-NOMATCH` can be printed for two reasons that point in opposite
+directions, and until this rung the wire could not tell them apart:
+
+1. the aperture is live and the scanout is fed from a window the sweep did not cover — *sweep wider*; or
+2. the aperture is live, our reads are perfectly legal, and **the register map we read it through is
+   Tegra194's while this silicon is Tegra234** — *throw the map away*.
+
+The reason to take (2) seriously is documented, not speculative. Upstream Linux `drm/tegra` — the
+source `jd1_dc_survey`'s window offsets are derived from — has **no Tegra234 support at all**: its
+`of_match` tables end at `nvidia,tegra194-dc` / `-display` / `-sor`, and `tegra234.dtsi` carries no
+`display@13800000` node. NVIDIA's own T234 display driver uses a different model entirely, NVDisplay
+class channels (`NVC67D`). Flying a probe whose headline verdict is ambiguous between (1) and (2)
+spends an attended bench session on an answer nobody can read.
+
+**What it adds: four more read-only reads and one verdict line on an ORTHOGONAL axis.** `VERDICT=`
+answers *does the aperture decode, and did a window hold the scanout base*. `MODEL-VERDICT=` answers
+*and through which register map were we reading*. The two are read together:
+
+| `VERDICT=` | `MODEL-VERDICT=` | reading |
+| --- | --- | --- |
+| `DECODES-NOMATCH` | `NVDISPLAY-CLASS-C670` | the sweep's offsets are wrong, the aperture is not. Replace the window map; do not sweep wider |
+| `DECODES-NOMATCH` | `DECODES-NOT-NVDISPLAY` | the opposite — keep the offsets, widen the sweep |
+| `REACHABLE` | anything | the T194 offsets are vindicated empirically whatever the class word says, and the disagreement is itself a finding |
+
+The hypothesis under test is that the Tegra234 nvdisplay aperture is the standard NVIDIA `NV_PDISP`
+block **rebased to offset 0**, so Tegra byte offset *X* ≡ `NV_PDISP`-relative address *X* ≡
+open-gpu-doc "withoffset" address `0x610000 + X`. **No NVIDIA source states that rebasing**; testing
+it is the whole point of the rung, which is why a negative gets its own named verdict instead of
+being folded into "garbage".
+
+| offset | register | withoffset | what it settles |
+| --- | --- | --- | --- |
+| `+0x00000` | `NV_PDISP_FE_CLASSES` | `0x00610000` | `CLASS_ID` 31:16, `CLASS_REV` 15:8, `API_REV` 7:4, `HW_REV` 3:0 — **the discriminator** |
+| `+0x00060` | `NV_PDISP_FE_HW_SYS_CAP` | `0x00610060` | `HEAD0..7_EXISTS` 0:7, `SOR0..7_EXISTS` 8:15 |
+| `+0x00064` | `NV_PDISP_FE_HW_SYS_CAPB` | `0x00610064` | `WINDOW0..31_EXISTS` 0:31 — how many windows the sweep's six-per-head model should have found |
+| `+0x004E0` | `NV_PDISP_FE_CHNCTL_CORE` | `0x006104E0` | `ALLOCATION` 0:0, `CONNECTION` 1:1, `PUTPTR_WRITE` 4:4, **`EFI` 5:5**, `SKIP_NOTIF` 9:9, `IGNORE_INTERLOCK` 11:11, `ERRCHECK_WHEN_DISCONNECTED` 12:12, `TRASH_MODE` 14:13, `INTR_DURING_SHTDWN` 15:15 — what UEFI left on the core channel |
+
+All four are quoted from **NVIDIA/open-gpu-doc (MIT)**,
+`manuals/{volta/gv100,turing/tu102,ampere/ga102}/dev_display_withoffset.ref.txt`, and the definitions
+are **identical in all three architectures** — which is why one wrong-generation guess cannot explain
+a match. `CHNCTL_CORE`'s address is independently confirmed in NVIDIA/open-gpu-kernel-modules
+`src/common/inc/swref/published/disp/v03_00/dev_disp.h`.
+
+**Two corrections to the plan this rung was written from, both of which changed what gets read.**
+
+* **`+0x30000` is weaker evidence than it looked, and `+0x60`/`+0x64` are the registers that carry
+  the claim.** The probe's existing FIRST TOUCH is at `+0x30000`, which edk2-nvidia's `NvDisplayHw.c`
+  calls `DISPLAY_FE_SW_SYS_CAP`. That name appears **nowhere** in open-gpu-doc's three display
+  manuals or in open-gpu-kernel-modules' `swref/published/disp/*`. What *is* documented there is the
+  **aperture**: `NV_PDISP_FE_SW 0x00640FFF:0x00640000` (`disp/v03_00/dev_disp.h`) — i.e.
+  `NV_PDISP`-relative `0x30000`, a 4 KiB software-written mirror region. So the existing first read
+  is a read of a real named aperture at a *register identity* resting on edk2 plus an inference from
+  nouveau's `gv100_disp_init()`, which masks `0x100 << i` at `0x640000` and `1 << i` at `0x640004` —
+  the `HW_SYS_CAP` / `CAPB` bit layouts exactly. The hardware registers at `+0x60`/`+0x64` are
+  primary-sourced, so they are read too and the two are **cross-checked against each other on the
+  wire** (`JD1-DC-MODEL — CAP CROSS-CHECK`). Disagreement there is not an error; it is the finding.
+* **`CLASS_ID` reads `0xC670`, not `0xC67D`.** The core-channel class *number* is
+  `NVC67D = 0x0000C67D` (`classes/display/clc67d.h`), but the `CLASS_ID` **field** holds the
+  "Software Class Number" from `classes/display/README.txt`: the manuals' `NV_PDISP_FE_CLASSES_0`
+  reset values are `0xC3700310` (gv100), `0xC5700400` (tu102), `0xC6700410` (ga102). The trailing `D`
+  is the core-channel nibble of the class number, not part of the ID in the register. A probe
+  comparing against `0xC67D` would never match and would report a live Ampere-class display block as
+  an unknown model — the exact confident-wrong-decode this rung exists to prevent.
+
+| `CLASS_ID` | class | generation |
+| --- | --- | --- |
+| `0xC370` | NVD_20 / `NVC37D` | Volta gv100 |
+| `0xC570` | NVD_30 / `NVC57D` | Turing tu10x, tu11x |
+| `0xC670` | NVD_40 / `NVC67D` | Ampere ga10x — **the class NVIDIA's own Tegra234 display driver drives** |
+| `0xC770` | NVD_40 / `NVC77D` | Ada ad10x |
+| `0xCA70` | NVD_50 / `NVCA7D` | Blackwell gb20x |
+
+**The verdicts, and what reachable state makes each print.** A verdict that cannot fail is a defect,
+so each is stated with its trigger:
+
+| verdict | prints when |
+| --- | --- |
+| `MODEL-VERDICT=NVDISPLAY-CLASS-<id>` | `FE_CLASSES` `CLASS_ID` matched the table. The aperture IS `NV_PDISP` at offset 0 and we know which generation |
+| `MODEL-VERDICT=NVDISPLAY-CLASS-UNKNOWN-<hex>` | `CLASS_ID` is class-**shaped** (`0xC??0`) but not in the table — a generation newer than the sources. Model confirmed, id deliberately **not** guessed |
+| `MODEL-VERDICT=DECODES-NOT-NVDISPLAY` | at least one read returned a non-trivial value, so the aperture answers, but `FE_CLASSES` holds nothing class-shaped. This is what the flat Tegra `DC_*` model predicts — its word `0x000` is `DC_CMD_GENERAL_INCR_SYNCPT`. **It does not CONFIRM the T194 map; it removes the strongest reason to doubt it** |
+| `MODEL-VERDICT=DISCRIMINATOR-TRIVIAL` | the aperture answers somewhere but `FE_CLASSES` itself read `0` or `~0`. `CLASS_ID` is hardwired nonzero on every documented generation, so this **refutes** `NV_PDISP`-at-offset-0 — and is **consistent with** the flat `DC_*` model, whose word `0x000` may legitimately read zero on an idle block. Deliberately weaker than `DECODES-NOT-NVDISPLAY` and reported separately |
+| `MODEL-VERDICT=UNDETERMINED reason=discriminator-not-read` | other reads answered but `FE_CLASSES` lay outside the declared `reg` size and was never fetched. Undetermined, **not** refuted — no claim about `+0x00000` may be read off that boot |
+| `MODEL-VERDICT=NOT-DECODING` | every read returned `0x00000000` or `0xFFFFFFFF`. Leaves the model question UNANSWERED rather than answering it negatively, and says so |
+| `MODEL-VERDICT=REFUSED reason=no-reads` | every offset lay outside the DTB-declared `reg` size. Not "the aperture is dead" — "the DTB gave us less aperture than `0x4E4`" |
+
+Each of the four reads also carries its own sub-line with its own named failing condition — zero
+heads (*refutes the `+0x60` mapping*), more than four heads (*implausible: Tegra234 documents exactly
+two head pixel clocks, `TEGRA234_CLK_NVDISPLAY_P0/_P1`*), zero windows (*the entire sweep is reading
+registers that do not exist*), `CHNCTL_CORE` bits outside every documented field (*either this offset
+is not that register, or this generation defines fields the sources do not*). `CHNCTL_CORE == 0` is
+explicitly called out as **legitimate, not a decode failure** — every field's documented INIT is 0 —
+while noting that a lit panel beside a zero here means the scanout is not driven through an allocated
+core channel from this register file, which is itself the finding.
+
+**The FIRST-TOUCH / READ-SURVIVED pair is per read, not per rung.** `jd1_dc_model_read` announces
+`JD1-DC-MODEL — NEXT TOUCH: about to read <name> @0x…` before each of the four and prints
+`READ SURVIVED: <name> @0x… = 0x…` after it. A single pair around all four would leave "which one
+killed the boot" unanswerable; with the pair per read, silence names the fatal register.
+
+**Nothing about the safety envelope moved.** The reads are `core::ptr::read_volatile` only — there is
+no `write_volatile` in JD1-DC and there must not be; verified in the armed artifact's disassembly,
+where `jd1_dc_model_read`'s only non-stack memory access is a single `ldr w9, [x8]` and every `str`
+is an `[sp, #…]` spill. Every read is bounds-checked against the **DTB-declared** `reg` size, never a
+constant. The probe still sits at the last statement of `tegra_early_stop`'s BPMP block, and all four
+new reads happen **inside** the `MRQ_PG GET_STATE` guard, after it has passed and after the existing
+FIRST TOUCH has already survived. `MRQ_PG SET_STATE` is not issued, named or reachable from this
+rung. The `CENSUS` line's `reads=` count was widened to `swept*9 + 1 + JD1DC_MODEL_READS` so it stays
+exact — `writes=0` beside an inexact read count certifies nothing.
+
+**Three in-tree instrument defects fixed in the same pass.**
+
+1. **`display_tegra.rs` no longer calls the `0x10000` head stride "the one bench-confirm number".**
+   JD1-DC has never fired, so no nvdisplay register has ever been read on this board and nothing
+   about the head layout is bench-confirmed. Both the `jd1_dc_survey` doc comment and the sweep's
+   in-function comment now say **T186/T194-derived, not documented for T234, UNCONFIRMED**, and point
+   at the rung that tests it. (`MILESTONES.md` repeats the old phrasing and was left alone — it is a
+   historical ledger, not a live claim, and it is outside this lane.)
+2. **`nvdisplay_base` now says what it assumes about a multi-entry `reg`.** The DRIVE OS T234 binding
+   declares **four** entries (`nvdisplay`, `dpaux0`, `hdacodec`, `mipical`); the reader takes
+   entry[0] and was correct by luck of ordering, while `PropWords::total_len` — the one datum that
+   would have revealed the other three — was captured and never printed. A `#[cfg]`-erased call
+   appended to the existing `let reg = …` line now emits `JD1-DC-REG`: `total_len`, the entry count
+   it implies, a RAGGED flag if it is not a multiple of 16, every captured `(addr, size)` pair with
+   entry[0] marked, and the **`reg-names` byte list** with NUL shown as `|` — which turns "entry[0]
+   is the nvdisplay aperture" from an assumption into a wire fact. A missing `reg-names` is reported
+   as its own line, because then the ordering claim has no evidence on this board at all.
+3. **`node_ids`' silent truncation is now loud, and for `power-domains` it is fatal to the flight.**
+   `pick` dropped entries at two invisible caps — `PropWords`' `MAX_WORDS` (20 words = 10 pairs) and
+   the destination array (9 clocks / 4 resets / 4 domains). The two properties are deliberately **not**
+   treated alike. A truncated `clocks`/`resets` list costs this rung nothing (JD1-DC enables no clock
+   and deasserts no reset), so it gets a `JD1-DC-IDS TRUNCATED` line and the walk continues. A
+   truncated `power-domains` list destroys the one claim the guard exists to make — it would print
+   `GUARD PASSED: all 4 … domain(s) ON` and then read a block whose fifth domain was never asked
+   about, and a read of a gated Tegra block is EL3-fatal — so it gets the loud line **and** `None`,
+   which the caller already renders as `VERDICT=REFUSED reason=no-ids` with not one nvdisplay
+   register read. `total_len % 8 != 0` is reported separately as **RAGGED**: a provider with
+   `#power-domain-cells = <0>` yields one-word entries and the odd-index extraction would harvest
+   phandles as ids — silent corruption rather than silent loss. This is the same class as the JB5
+   finding this function's own comment records, where an 8-slot cap dropped `usb@3610000`'s ninth
+   clock without a word on the wire. XUSB is unaffected: its lists (9 clocks, 4 resets, 2 domains)
+   fit every cap, and the `xusb_ids` delegation is still fall-through.
+
+**Default OFF is measured again, on this base.** Two private `CARGO_TARGET_DIR`s, the jetson matrix
+feature set, only the source varying:
+
+* **objcopy'd loadable image byte-identical** — `ab75577f8aaf183c6cac3b7e826f76986081310cd973257fa55de44babe39bc0` both sides, `cmp` clean.
+* **all 10,216 symbol addresses and types identical**; every allocated section header identical (name, address, offset, size, flags).
+* the ELF *container* differs by 904 bytes, entirely in the **non-allocated `.strtab`** —
+  LLVM's internal `anon.….llvm.<module-hash>` suffixes change digit count whenever any library source
+  file changes. Same class as this section's earlier measurement. **Note the shipped `kernel.elf` is
+  the unstripped ELF, so its sha256 moves while the bytes the machine executes do not.**
+* knob-off, `jd1_dc_probe`, `jd1_dc_model_read`, `nvdisplay_base` and `node_ids` are **absent from the
+  image entirely** (0 symbols; positive control `tegra_early_stop` present).
+* every new item is `#[cfg(feature = "jd1dc")]` and **none is `pub`** — an ungated `pub fn` was
+  measured on this base to perturb the knob-off image by 71,591 bytes even dead-stripped, because a
+  lib target makes it public API before `--gc-sections` runs.
+
+**Reachability proven by disassembly, not by the banner.** In the armed image:
+`tegra_early_stop` @`0x7f000` → `bl 0x17f300 jd1_dc_probe` at `0x7f52c`; `jd1_dc_probe` (1,136
+instructions, 20 `bl serial::__print`) → **four** `bl 0x180714 jd1_dc_model_read` at `0x17f644`,
+`0x17f668`, `0x17f68c`, `0x17f6ac` — one per read, `jd1_dc_model` inlined into its caller;
+`jd1_dc_probe` → `bl 0xd8310 nvdisplay_base`, which armed is 617 instructions and calls
+`serial::__print`, `Fdt::prop_at` and `from_utf8` (the `JD1-DC-REG` census, inlined); `node_ids`
+armed is 847 instructions with 8 `bl serial::__print`.
+
+**Still UNFLOWN.** JD1-DC has never executed on hardware — armed images have been staged and none
+booted. Every sentence above about what a register *will* read is a **prediction**. The nearest
+cheap follow-up, deliberately left out of this rung to keep it to four reads:
+`NV_PDISP_FE_CHNSTATUS_CORE` at `+0x00630` (withoffset `0x00610630`), whose `STATE` field has
+`_EFI_INIT1 = 0x5`, `_EFI_INIT2 = 0x6`, `_EFI_OPERATION = 0x7` — the live counterpart to
+`CHNCTL_CORE`'s configuration bit, from the same `disp/v03_00/dev_disp.h`.

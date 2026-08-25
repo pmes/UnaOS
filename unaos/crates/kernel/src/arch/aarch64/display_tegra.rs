@@ -238,15 +238,15 @@ pub fn jd1_test_pattern(fb: &ScanoutFb) {
 /// the GiB-0 device window). The read value is an SMMU IOVA (identity-mapped on this firmware) with
 /// bit 39 a GPU sector-swizzle flag to mask.
 ///
-/// nvdisplay per-window aperture (Linux Tegra DRM `hub.c`, T186+/T234): window `i` registers live at
-/// `head_base + 0x2800 + 0xC00*i`, with (byte offsets within the aperture) `WIN_OPTIONS`(WIN_ENABLE
-/// bit30) `+0x600`, `WINDOWGROUP_SET_CONTROL`(OWNER low nibble) `+0x608`, `COLOR_DEPTH` `+0x60c`,
-/// `SIZE`(output) `+0x614`, `CROPPED_SIZE`(source) `+0x618`, `PLANAR_STORAGE`(stride/64) `+0x624`,
-/// `START_ADDR`(lo) `+0x700`, `SURFACE_KIND`(0=pitch) `+0x72c`, `START_ADDR_HI` `+0x734` — all plain
-/// config registers (read-safe, not the read-to-clear status region). The per-head sub-aperture
-/// stride inside the `display@13800000` wrapper is `0x10000` (4 heads; T194-derived, the one
-/// bench-confirm number), so all four candidate heads are swept and the real one is the enabled
-/// window with sane (≈1920×1200) geometry.
+/// nvdisplay per-window aperture, derived from Linux Tegra DRM `hub.c` — whose `of_match` ends at
+/// `nvidia,tegra194-display`, so this layout is **T186/T194's and is NOT documented for T234**:
+/// window `i` registers live at `head_base + 0x2800 + 0xC00*i`, with (byte offsets within the
+/// aperture) `WIN_OPTIONS`(WIN_ENABLE bit30) `+0x600`, `WINDOWGROUP_SET_CONTROL`(OWNER low nibble)
+/// `+0x608`, `COLOR_DEPTH` `+0x60c`, `SIZE`(output) `+0x614`, `CROPPED_SIZE`(source) `+0x618`,
+/// `PLANAR_STORAGE`(stride/64) `+0x624`, `START_ADDR`(lo) `+0x700`, `SURFACE_KIND`(0=pitch) `+0x72c`,
+/// `START_ADDR_HI` `+0x734` — all plain config registers (read-safe, not read-to-clear). The
+/// per-head stride `0x10000` (4 heads) is T194-derived and **UNCONFIRMED — no nvdisplay register has
+/// ever been read on this board**; see the JD1-DC-MODEL block at this file's tail, which tests it.
 fn jd1_dc_survey(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
     let Some((base, size)) = fdt_tegra::nvdisplay_base(dtb_addr, dtb_size, ram_gib_mask) else {
         serial_println!(":: tegra: JD1-DC — no display@ node in DTB; DC register survey skipped ::");
@@ -738,15 +738,15 @@ pub fn jd1_dc_probe(chan: &super::bpmp_tegra::Chan, dtb_addr: u64, dtb_size: usi
         ":: tegra: JD1-DC — FIRST READ SURVIVED: {}={:#010x} — the CCPLEX decodes this aperture without an EL3 abort ::",
         if have_cap { "DISPLAY_FE_SW_SYS_CAP" } else { "head+0x0 win0 WIN_OPTIONS" },
         first,
-    );
+    ); jd1_dc_model(base, size, have_cap, first); // JD1-DC-MODEL — the WHICH-CHIP discriminator, four more read-only reads, appended here because this is the first instruction at which an nvdisplay read is known non-fatal and the long window sweep has not yet risked the boot. Without it `VERDICT=DECODES-NOMATCH` is AMBIGUOUS between "the aperture is not live" and "our register map is Tegra194's and this silicon is Tegra234" — two answers that send the display arc in opposite directions. See the JD1-DC-MODEL block at this file's tail. APPENDED to this line, never a new one: knob-off it is cfg-erased and not one `core::panic::Location` below moves.
 
     // 5. THE WINDOW SWEEP — read-only, every field, every window, EMPTY WINDOWS INCLUDED. The legacy
     //    `jd1_dc_survey` skips all-zero windows to keep its log short; this rung prints them, because
     //    "every window read zero" and "the sweep never ran" must not look alike in a capture that a
     //    decision rests on, and because a later save/restore rung needs the full field set from the
-    //    same data. Offsets are the Linux Tegra DRM (`hub.c`, T186+/T234) window layout documented on
-    //    `jd1_dc_survey`; per-head stride 0x10000, bounded by the DTB-declared aperture size so no
-    //    read can leave the block's own decode window.
+    //    same data. Offsets are the Linux Tegra DRM `hub.c` window layout documented on
+    //    `jd1_dc_survey` — T186/T194's, NOT documented for T234, which is exactly what JD1-DC-MODEL
+    //    tests; per-head stride 0x10000 (unconfirmed), bounded by the DTB-declared aperture size.
     let mut swept = 0u32;
     let mut all_ones = 0u32;
     let mut all_zero = 0u32;
@@ -838,7 +838,7 @@ pub fn jd1_dc_probe(chan: &super::bpmp_tegra::Chan, dtb_addr: u64, dtb_size: usi
         all_zero,
         enabled,
         matched,
-        swept * 9 + 1,
+        swept * 9 + 1 + JD1DC_MODEL_READS.load(Ordering::Relaxed), // +1 = the FE cap word read as `first`; + however many of the JD1-DC-MODEL reads passed their own bounds check (0..4). A census that under-counts its own reads is an instrument that lies about its own footprint, and `writes=0` beside it only means anything if the read count is exact.
     );
     if matched > 0 {
         serial_println!(
@@ -854,7 +854,7 @@ pub fn jd1_dc_probe(chan: &super::bpmp_tegra::Chan, dtb_addr: u64, dtb_size: usi
     // bank (`swept == 0`), and a decoding block whose windows are simply all disabled.
     } else if (have_cap && first != 0xFFFF_FFFF && first != 0) || enabled > 0 {
         serial_println!(
-            ":: tegra: JD1-DC VERDICT=DECODES-NOMATCH — the aperture DECODES ({} window(s) at WIN_ENABLE=1 out of {} swept), but no START_ADDR equalled the JD1 scanout base {:#x}{}. Reachability is ESTABLISHED; the scanout is fed from a window this sweep's head model did not cover (swept=0 means the aperture held the FE capability word but no complete head-0 window bank) — compare the RAW lines above against DISPLAY_FE_SW_SYS_CAP={:#010x}, which is UEFI's own head/SOR enumeration ::",
+            ":: tegra: JD1-DC VERDICT=DECODES-NOMATCH — the aperture DECODES ({} window(s) at WIN_ENABLE=1 out of {} swept), but no START_ADDR equalled the JD1 scanout base {:#x}{}. Reachability is ESTABLISHED; the scanout is fed from a window this sweep's head model did not cover (swept=0 means the aperture held the FE capability word but no complete head-0 window bank) — compare the RAW lines above against DISPLAY_FE_SW_SYS_CAP={:#010x}, which is UEFI's own head/SOR enumeration. THIS VERDICT DOES NOT SAY WHY: on its own it cannot separate 'the aperture is live and the window is somewhere we did not look' from 'our window offsets are Tegra194's and this silicon is not Tegra194'. The JD1-DC MODEL-VERDICT line ABOVE is the one that separates them — read it first ::",
             enabled,
             swept,
             scanout,
@@ -863,7 +863,7 @@ pub fn jd1_dc_probe(chan: &super::bpmp_tegra::Chan, dtb_addr: u64, dtb_size: usi
         );
     } else {
         serial_println!(
-            ":: tegra: JD1-DC VERDICT=NOT-DECODING — {} of {} windows read all-ones and {} read all-zero, none enabled. READ THIS CAREFULLY: UEFI drives THESE registers on THIS board from THIS core by plain MmioRead32/MmioWrite32 (edk2-nvidia NvDisplayControllerDxe/NvDisplayHw.c), and the string 'dce' appears nowhere in that tree — so this result is NOT 'the DCE holds the block'. It is a finding about OUR access path: our aperture/mapping, the domain or clock state at our probe point, or an SCR narrower for us than for UEFI. FE_SW_SYS_CAP read {:#010x} ::",
+            ":: tegra: JD1-DC VERDICT=NOT-DECODING — {} of {} windows read all-ones and {} read all-zero, none enabled. READ THIS CAREFULLY: UEFI drives THESE registers on THIS board from THIS core by plain MmioRead32/MmioWrite32 (edk2-nvidia NvDisplayControllerDxe/NvDisplayHw.c), and the string 'dce' appears nowhere in that tree — so this result is NOT 'the DCE holds the block'. It is a finding about OUR access path: our aperture/mapping, the domain or clock state at our probe point, or an SCR narrower for us than for UEFI. FE_SW_SYS_CAP read {:#010x}. AND IT IS NOT A STATEMENT ABOUT THE WINDOW OFFSETS EITHER — a wrong register map produces DECODES-NOMATCH, not this; if the JD1-DC MODEL-VERDICT line above says the aperture answered anything at all, prefer that line's reading of it over this one ::",
             all_ones,
             swept,
             all_zero,
@@ -1314,4 +1314,371 @@ pub fn orin_click_census(tick: u64) {
         seq, tick, up, btn, press, rel, noedge, raised, same, miss, consumed, stuck,
         nogeom, dropped, rows, compat as u8, sc::user_input_active(), verdict
     );
+}
+
+// =================================================================================================
+// JD1-DC-MODEL — WHICH REGISTER MODEL DOES THIS SILICON PRESENT? `jd1dc`, DEFAULT OFF.
+// =================================================================================================
+//
+// THE DEFECT THIS FIXES, AND IT IS A DEFECT IN THE INSTRUMENT, NOT IN THE CODE UNDER TEST.
+// JD1-DC as it stood could print `VERDICT=DECODES-NOMATCH` for two reasons that point in OPPOSITE
+// directions, and the wire could not tell them apart:
+//
+//   (a) the aperture is live, and the scanout is fed from a window this sweep did not cover; or
+//   (b) the aperture is live, our reads are perfectly legal — and the register map we read it
+//       through is Tegra194's, while this silicon is Tegra234.
+//
+// (a) says "sweep wider". (b) says "throw the map away". Flying a probe whose headline verdict is
+// ambiguous between them spends an attended bench session on an unreadable answer. The reason to
+// take (b) seriously: upstream Linux `drm/tegra` — the source `jd1_dc_survey`'s window offsets are
+// derived from — has NO Tegra234 support at all. Its `of_match` tables end at `nvidia,tegra194-dc` /
+// `-display` / `-sor`, and `tegra234.dtsi` carries no `display@13800000` node. NVIDIA's own T234
+// display driver uses a different model entirely: NVDisplay class channels (`NVC67D`).
+//
+// WHAT THIS RUNG ADDS: FOUR MORE READ-ONLY READS, and one verdict line that decomposes the one
+// above. Every read is `read_volatile`, every read is bounds-checked against the DTB-declared
+// aperture length (never a constant), and every read sits INSIDE the BPMP `MRQ_PG GET_STATE` guard —
+// this function is only ever called after that guard has passed and after the FIRST TOUCH read has
+// already survived. NOT ONE REGISTER IS WRITTEN, here or anywhere in JD1-DC; the DCE R5 is live on
+// the other side of this aperture and a write is a two-writer race against it.
+//
+// THE FOUR OFFSETS AND WHERE EACH COMES FROM. The hypothesis under test is that the Tegra234
+// nvdisplay aperture is the standard NVIDIA `NV_PDISP` block rebased to offset 0, so that Tegra byte
+// offset X == `NV_PDISP`-relative address X == open-gpu-doc "withoffset" address `0x610000 + X`.
+// All four are quoted from NVIDIA/open-gpu-doc (MIT), `manuals/{volta/gv100,turing/tu102,
+// ampere/ga102}/dev_display_withoffset.ref.txt` — the definitions are IDENTICAL in all three
+// architectures, which is why a single wrong-generation guess cannot explain a match:
+//
+//   +0x00000  NV_PDISP_FE_CLASSES        0x00610000  CLASS_ID 31:16, CLASS_REV 15:8, API_REV 7:4,
+//                                                    HW_REV 3:0                    <== DISCRIMINATOR
+//   +0x00060  NV_PDISP_FE_HW_SYS_CAP     0x00610060  HEAD0..7_EXISTS 0:7, SOR0..7_EXISTS 8:15
+//   +0x00064  NV_PDISP_FE_HW_SYS_CAPB    0x00610064  WINDOW0..31_EXISTS 0:31
+//   +0x004E0  NV_PDISP_FE_CHNCTL_CORE    0x006104E0  ALLOCATION 0:0, CONNECTION 1:1,
+//                                                    PUTPTR_WRITE 4:4, EFI 5:5, SKIP_NOTIF 9:9,
+//                                                    IGNORE_INTERLOCK 11:11,
+//                                                    ERRCHECK_WHEN_DISCONNECTED 12:12,
+//                                                    TRASH_MODE 14:13, INTR_DURING_SHTDWN 15:15
+//
+// TWO CORRECTIONS TO THE PLAN THIS RUNG WAS WRITTEN FROM, both of which change what gets read:
+//
+//   1. `+0x30000` — the probe's existing FIRST TOUCH, which edk2-nvidia's `NvDisplayHw.c` calls
+//      `DISPLAY_FE_SW_SYS_CAP` — is NOT documented under that name in open-gpu-doc, and a source
+//      sweep of the three display manuals plus open-gpu-kernel-modules' `swref/published/disp/*`
+//      found no `SW_SYS` symbol at all. What IS documented there is the APERTURE:
+//      `NV_PDISP_FE_SW  0x00640FFF:0x00640000` (open-gpu-kernel-modules
+//      `src/common/inc/swref/published/disp/v03_00/dev_disp.h`), i.e. NV_PDISP-relative 0x30000, a
+//      4 KiB software-written mirror region. So the existing first read is a read of a real named
+//      aperture at a register identity that rests on edk2 plus an inference from nouveau's
+//      `gv100_disp_init()` (which masks `0x100 << i` at `0x640000` and `1 << i` at `0x640004` —
+//      the HW_SYS_CAP / CAPB bit layouts exactly). `+0x60` and `+0x64` are the HARDWARE registers
+//      the plan wanted the evidence of, primary-sourced, so they are read too and the two are
+//      cross-checked against each other on the wire.
+//   2. The core-channel class number is `NVC67D = 0x0000C67D` (`classes/display/clc67d.h`) but the
+//      CLASS_ID FIELD does NOT hold `0xC67D`. The manuals' reset values are `0xC3700310` (gv100),
+//      `0xC5700400` (tu102), `0xC6700410` (ga102) — CLASS_ID `0xC370`/`0xC570`/`0xC670`, matching
+//      the "Software Class Number" column of `classes/display/README.txt`. The trailing `D` is the
+//      core-channel nibble of the class NUMBER, not part of the ID in the register. A probe
+//      comparing against `0xC67D` would never match and would report a live Ampere-class display
+//      block as an unknown model. That is the exact class of confident-wrong-decode this rung is
+//      supposed to prevent, so the table below uses `0xC?70` and says why.
+//
+// WHAT THIS RUNG DOES NOT KNOW, said here rather than implied by silence. That the Tegra234
+// aperture is NV_PDISP rebased to offset 0 is a HYPOTHESIS. No NVIDIA source states it; no Tegra
+// nvdisplay register header exists publicly; `tegra234.dtsi` has no display node to check against.
+// Testing that hypothesis is the entire purpose of this rung, which is why a NEGATIVE result here
+// is a real result and is given its own named verdict rather than being folded into "garbage".
+//
+// AND IT IS UNFLOWN. JD1-DC has never executed on hardware — three armed images have been staged and
+// zero have been booted. Every sentence above about what a register WILL read is a prediction.
+
+/// JD1-DC-MODEL: how many of this rung's reads actually happened, so the CENSUS line's `reads=`
+/// count stays exact. A bounds refusal decrements nothing — it simply never increments.
+#[cfg(feature = "jd1dc")]
+static JD1DC_MODEL_READS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// JD1-DC-MODEL: one bounded, announced, read-only 32-bit MMIO read.
+///
+/// Carries the FIRST-TOUCH / READ-SURVIVED pair per read rather than once for the rung, which is
+/// what makes SILENCE attributable: if the boot ends after `NEXT TOUCH … FE_CHNCTL_CORE` with no
+/// matching `READ SURVIVED`, THAT read was the EL3-fatal one and the capture names it. A single
+/// pair around all four reads would leave "which one killed it" unanswerable.
+///
+/// `None` = the offset lies outside the DTB-declared aperture and NOTHING was read. Reading past a
+/// DTB-declared aperture is the JX1 class itself, so the bound is checked against the length the
+/// device tree gave us, never against a hardcoded `0xEFFFF`.
+#[cfg(feature = "jd1dc")]
+#[inline(never)]
+fn jd1_dc_model_read(base: u64, size: u64, off: u64, name: &str) -> Option<u32> {
+    if off.saturating_add(4) > size {
+        serial_println!(
+            ":: tegra: JD1-DC-MODEL — {} @+{:#x} needs 4 bytes and the display@ node declares reg size={:#x}; that read would leave the DTB-declared aperture, so it was NOT performed and this register is UNKNOWN this boot ::",
+            name,
+            off,
+            size,
+        );
+        return None;
+    }
+    serial_println!(
+        ":: tegra: JD1-DC-MODEL — NEXT TOUCH: about to read {} @{:#x} (read-only; this rung issues no MMIO write of any kind, so an audit grep for the write intrinsic finds nothing but prose in this file). If this is the LAST line on the wire, THAT read was EL3-fatal (JX1 class) and the boot ended inside it ::",
+        name,
+        base + off,
+    );
+    let v = unsafe { core::ptr::read_volatile((base + off) as *const u32) };
+    JD1DC_MODEL_READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    serial_println!(
+        ":: tegra: JD1-DC-MODEL — READ SURVIVED: {} @{:#x} = {:#010x} ::",
+        name,
+        base + off,
+        v,
+    );
+    Some(v)
+}
+
+/// JD1-DC-MODEL: NVDisplay core-channel CLASS_ID -> the generation that presents it.
+///
+/// Quoted from NVIDIA/open-gpu-doc `classes/display/README.txt` ("Software Class Number" column)
+/// and cross-checked against the `NV_PDISP_FE_CLASSES_0` reset values in the gv100 / tu102 / ga102
+/// `dev_display_withoffset.ref.txt` manuals. NOTE the trailing `0`, not `D` — see the block comment.
+///
+/// `None` = not a class id this table knows. That is NOT the same as "not a display block": a
+/// generation newer than this table (Blackwell's `0xCA70` is here, but its successor is not) would
+/// land here too, which is why the caller distinguishes "class-SHAPED but unknown" from "not a
+/// class id at all" instead of collapsing both into a failure.
+#[cfg(feature = "jd1dc")]
+fn jd1_dc_class_name(id: u32) -> Option<&'static str> {
+    match id {
+        0xC370 => Some("NVD_20 / class NVC37D — Volta gv100"),
+        0xC570 => Some("NVD_30 / class NVC57D — Turing tu10x,tu11x"),
+        0xC670 => Some("NVD_40 / class NVC67D — Ampere ga10x (the class NVIDIA's own Tegra234 display driver drives)"),
+        0xC770 => Some("NVD_40 / class NVC77D — Ada ad10x"),
+        0xCA70 => Some("NVD_50 / class NVCA7D — Blackwell gb20x"),
+        _ => None,
+    }
+}
+
+/// **JD1-DC-MODEL — the WHICH-CHIP discriminator.** Four read-only reads and exactly one
+/// `MODEL-VERDICT=` line, on an axis ORTHOGONAL to `JD1-DC VERDICT=`.
+///
+/// The two axes answer different questions and must not be conflated: `VERDICT=` answers "does the
+/// aperture decode, and did a window hold the scanout base"; `MODEL-VERDICT=` answers "and through
+/// WHICH register map were we reading". `DECODES-NOMATCH` + `MODEL-VERDICT=NVDISPLAY-CLASS-C670`
+/// means the sweep's offsets are wrong, not the aperture. `DECODES-NOMATCH` +
+/// `MODEL-VERDICT=DECODES-NOT-NVDISPLAY` means the opposite: keep the offsets, widen the sweep.
+///
+/// The verdicts, and — the part that matters for an instrument — WHAT REACHABLE STATE MAKES EACH
+/// PRINT:
+///
+/// * `MODEL-VERDICT=NVDISPLAY-CLASS-<id>` — `FE_CLASSES` CLASS_ID matched [`jd1_dc_class_name`].
+///   Prints when the aperture is NV_PDISP rebased to offset 0 and the silicon is a generation this
+///   table knows. Says WHICH.
+/// * `MODEL-VERDICT=NVDISPLAY-CLASS-UNKNOWN-<hex>` — CLASS_ID is class-SHAPED (`0xC??0`) but not in
+///   the table. Prints on a generation newer than this table. Still confirms the model.
+/// * `MODEL-VERDICT=DECODES-NOT-NVDISPLAY` — at least one read returned a non-trivial value, so the
+///   aperture answers, but `FE_CLASSES` holds nothing class-shaped in EITHER half-word. Prints when
+///   offset 0 of this aperture is not `NV_PDISP_FE_CLASSES` — which is what the Tegra194 flat `DC_*`
+///   model predicts, since its word 0x000 is `DC_CMD_GENERAL_INCR_SYNCPT`. This is the verdict that
+///   SURVIVES the map we already have.
+/// * `MODEL-VERDICT=NOT-DECODING` — every read this rung performed returned `0x00000000` or
+///   `0xFFFFFFFF`. Prints when the aperture answers nothing distinguishable, and says so about the
+///   ACCESS PATH, not about the silicon.
+/// * `MODEL-VERDICT=REFUSED reason=no-reads` — every offset lay outside the DTB-declared aperture,
+///   so nothing was read. Prints on a display node whose `reg` size is smaller than `0x4E4`.
+///
+/// Each of the four reads also carries its own sub-line with its own failing condition, named on the
+/// wire, so a verdict cannot be reached without the evidence that produced it being legible.
+#[cfg(feature = "jd1dc")]
+fn jd1_dc_model(base: u64, size: u64, have_cap: bool, sw_cap: u32) {
+    // Offsets: NV_PDISP-relative == open-gpu-doc "withoffset" minus 0x610000. See the block comment
+    // for the quoted define of each.
+    const OFF_FE_CLASSES: u64 = 0x0000_0000;
+    const OFF_FE_HW_SYS_CAP: u64 = 0x0000_0060;
+    const OFF_FE_HW_SYS_CAPB: u64 = 0x0000_0064;
+    const OFF_FE_CHNCTL_CORE: u64 = 0x0000_04E0;
+    // Every bit CHNCTL_CORE has a documented field for, in tu102/ga102 (gv100 adds SKIP_SEMA 10:10,
+    // which is included so the mask is the UNION and cannot produce a false "undocumented bit").
+    const CHNCTL_DOCUMENTED: u32 = 0xFE33;
+
+    serial_println!(
+        ":: tegra: JD1-DC-MODEL — the WHICH-REGISTER-MODEL discriminator: 4 read-only reads inside the same BPMP power guard, testing the hypothesis that this aperture is NVIDIA NV_PDISP rebased to offset 0 (Tegra byte offset X == open-gpu-doc withoffset 0x610000+X). If it is, the window offsets JD1-DC sweeps — Linux drm/tegra hub.c, whose of_match ENDS AT tegra194 — have no documented basis on this chip ::"
+    );
+
+    let classes = jd1_dc_model_read(base, size, OFF_FE_CLASSES, "NV_PDISP_FE_CLASSES (+0x00000)");
+    let hw_cap = jd1_dc_model_read(base, size, OFF_FE_HW_SYS_CAP, "NV_PDISP_FE_HW_SYS_CAP (+0x00060)");
+    let hw_capb = jd1_dc_model_read(base, size, OFF_FE_HW_SYS_CAPB, "NV_PDISP_FE_HW_SYS_CAPB (+0x00064)");
+    let chnctl = jd1_dc_model_read(base, size, OFF_FE_CHNCTL_CORE, "NV_PDISP_FE_CHNCTL_CORE (+0x004e0)");
+
+    let trivial = |v: u32| v == 0 || v == 0xFFFF_FFFF;
+
+    // ---- FE_CLASSES: the discriminator, decoded field by field (all four fields DOCUMENTED) ----
+    match classes {
+        Some(v) if !trivial(v) => {
+            let id = (v >> 16) & 0xFFFF;
+            serial_println!(
+                ":: tegra: JD1-DC-MODEL — FE_CLASSES={:#010x}: CLASS_ID(31:16)={:#06x} CLASS_REV(15:8)={:#04x} API_REV(7:4)={:#03x} HW_REV(3:0)={:#03x} -> {} | reference reset values: gv100 0xC3700310, tu102 0xC5700400, ga102 0xC6700410 ::",
+                v,
+                id,
+                (v >> 8) & 0xFF,
+                (v >> 4) & 0xF,
+                v & 0xF,
+                match jd1_dc_class_name(id) {
+                    Some(n) => n,
+                    None if (id & 0xF00F) == 0xC000 => "CLASS-SHAPED (0xC??0) but not in this table — a display generation newer than the sources this rung was built from; the NV_PDISP model still holds",
+                    None => "NOT a class id in any shape this table recognises — offset 0 of this aperture is probably NOT NV_PDISP_FE_CLASSES",
+                },
+            );
+        }
+        Some(v) => serial_println!(
+            ":: tegra: JD1-DC-MODEL — FE_CLASSES={:#010x} — trivial (all-zero or all-ones). A live NV_PDISP block cannot read 0 or ~0 here: CLASS_ID is a hardwired R--4R field with a nonzero reset value on every documented architecture. This is a statement about our ACCESS PATH, not about the silicon ::",
+            v,
+        ),
+        None => serial_println!(
+            ":: tegra: JD1-DC-MODEL — FE_CLASSES was NOT READ (outside the DTB-declared aperture); the model question is UNANSWERED this boot ::"
+        ),
+    }
+
+    // ---- FE_HW_SYS_CAP / CAPB: the head / SOR / window census, and the sanity test on it ----
+    match hw_cap {
+        Some(v) if !trivial(v) => {
+            let heads = v & 0xFF;
+            let sors = (v >> 8) & 0xFF;
+            serial_println!(
+                ":: tegra: JD1-DC-MODEL — FE_HW_SYS_CAP={:#010x}: HEAD_EXISTS(0:7)={:#04x} ({} head(s)) SOR_EXISTS(8:15)={:#04x} ({} SOR(s)) upper(31:16)={:#06x}{}{} ::",
+                v,
+                heads,
+                heads.count_ones(),
+                sors,
+                sors.count_ones(),
+                (v >> 16) & 0xFFFF,
+                if heads == 0 { " | FAILING: ZERO heads exist. A display block with no head is not a display block — this REFUTES the +0x60 == NV_PDISP_FE_HW_SYS_CAP mapping rather than reporting the hardware" } else { "" },
+                if heads.count_ones() > 4 { " | IMPLAUSIBLE: more than 4 heads. Tegra234 documents exactly two head pixel clocks (TEGRA234_CLK_NVDISPLAY_P0/_P1, dt-bindings/clock/tegra234-clock.h) and no public source accounts for more than 4 heads on this SoC" } else { "" },
+            );
+        }
+        Some(v) => serial_println!(
+            ":: tegra: JD1-DC-MODEL — FE_HW_SYS_CAP={:#010x} — trivial. Like FE_CLASSES this is a hardwired capability word; 0 means 'no head and no SOR exists', ~0 means 'all eight of each', and neither is a possible Tegra234. Treat as an access-path finding ::",
+            v,
+        ),
+        None => serial_println!(":: tegra: JD1-DC-MODEL — FE_HW_SYS_CAP was NOT READ (outside the DTB-declared aperture) ::"),
+    }
+    match hw_capb {
+        Some(v) if !trivial(v) => serial_println!(
+            ":: tegra: JD1-DC-MODEL — FE_HW_SYS_CAPB={:#010x}: WINDOW_EXISTS(0:31) -> {} window(s) exist. JD1-DC's sweep assumes SIX windows per head at 0xC00 stride inside a 0x10000 head bank; a count that is not a multiple of the swept 6, or a count of 0, means the sweep's window model does not describe this block ::",
+            v,
+            v.count_ones(),
+        ),
+        Some(v) => serial_println!(
+            ":: tegra: JD1-DC-MODEL — FE_HW_SYS_CAPB={:#010x} — trivial. 0 = no window exists at all, in which case JD1-DC's ENTIRE window sweep is reading registers that do not exist; ~0 = all 32 exist, which no Tegra234 source accounts for ::",
+            v,
+        ),
+        None => serial_println!(":: tegra: JD1-DC-MODEL — FE_HW_SYS_CAPB was NOT READ (outside the DTB-declared aperture) ::"),
+    }
+    // The two capability words are read from two different evidence classes — +0x60/+0x64 are
+    // primary-sourced NVIDIA manual registers, +0x30000 is edk2's name for an offset inside the
+    // documented NV_PDISP_FE_SW aperture — so making them agree (or not) on the wire is worth more
+    // than either alone. Disagreement is not an error here; it is the finding.
+    if have_cap {
+        match hw_cap {
+            Some(hw) => serial_println!(
+                ":: tegra: JD1-DC-MODEL — CAP CROSS-CHECK: +0x30000 (edk2 'DISPLAY_FE_SW_SYS_CAP', inside the documented NV_PDISP_FE_SW 0x640FFF:0x640000 aperture) = {:#010x} -> heads={:#04x} sors={:#04x}; +0x00060 (NV_PDISP_FE_HW_SYS_CAP, open-gpu-doc) = {:#010x} -> heads={:#04x} sors={:#04x} -> {} ::",
+                sw_cap, sw_cap & 0xFF, (sw_cap >> 8) & 0xFF,
+                hw, hw & 0xFF, (hw >> 8) & 0xFF,
+                if sw_cap == hw {
+                    "AGREE — the software mirror holds what the hardware register holds, which corroborates BOTH the edk2 register identity at +0x30000 and the NV_PDISP-at-offset-0 hypothesis"
+                } else if trivial(sw_cap) != trivial(hw) {
+                    "DISAGREE, one of them trivially — only the NON-trivial one is evidence; the trivial one says its offset is not the register we named"
+                } else {
+                    "DISAGREE — both decode, neither mirrors the other. At most one of the two register identities is right, and this rung cannot say which. NOTE the SW register identity is the weaker of the two: open-gpu-doc documents the APERTURE at NV_PDISP-relative 0x30000 but no register inside it"
+                },
+            ),
+            None => serial_println!(
+                ":: tegra: JD1-DC-MODEL — CAP CROSS-CHECK not possible: +0x30000 read {:#010x} but +0x00060 was not read ::",
+                sw_cap,
+            ),
+        }
+    } else {
+        serial_println!(
+            ":: tegra: JD1-DC-MODEL — CAP CROSS-CHECK not possible: the aperture was too small for +0x30000, so JD1-DC's FIRST TOUCH was a window register and there is no software-mirror value to compare ::"
+        );
+    }
+
+    // ---- FE_CHNCTL_CORE: what UEFI left behind on the core channel ----
+    match chnctl {
+        Some(v) if v != 0xFFFF_FFFF => {
+            let undoc = v & !CHNCTL_DOCUMENTED;
+            serial_println!(
+                ":: tegra: JD1-DC-MODEL — FE_CHNCTL_CORE={:#010x}: ALLOCATION(0)={} CONNECTION(1)={} PUTPTR_WRITE(4)={} EFI(5)={} SKIP_NOTIF(9)={} IGNORE_INTERLOCK(11)={} ERRCHECK_WHEN_DISCONNECTED(12)={} TRASH_MODE(14:13)={} INTR_DURING_SHTDWN(15)={}{}{} ::",
+                v,
+                if v & 1 != 0 { "ALLOCATE" } else { "DEALLOCATE" },
+                if v & 2 != 0 { "CONNECT" } else { "DISCONNECT" },
+                (v >> 4) & 1,
+                if (v >> 5) & 1 != 0 { "ENABLE — UEFI left the core channel flagged as EFI-owned" } else { "DISABLE" },
+                (v >> 9) & 1,
+                (v >> 11) & 1,
+                (v >> 12) & 1,
+                (v >> 13) & 3,
+                (v >> 15) & 1,
+                if v == 0 { " | ALL-ZERO, WHICH IS A LEGITIMATE VALUE AND NOT A DECODE FAILURE: every field's documented INIT is 0, so this reads as 'no core channel allocated, not connected, EFI off'. If the panel is lit while this reads zero, the scanout is NOT being driven through an allocated core channel from this register file — which is itself the finding" } else { "" },
+                if undoc != 0 { " | SUSPECT: bits outside EVERY documented field of this register are set — see the mask in the block comment. Either this offset is not FE_CHNCTL_CORE, or this generation defines fields the sources this rung was built from do not" } else { "" },
+            );
+        }
+        Some(v) => serial_println!(
+            ":: tegra: JD1-DC-MODEL — FE_CHNCTL_CORE={:#010x} — all-ones. This register's documented fields occupy bits 0:15 only, so ~0 is not a decodable value; the offset is not answering ::",
+            v,
+        ),
+        None => serial_println!(":: tegra: JD1-DC-MODEL — FE_CHNCTL_CORE was NOT READ (outside the DTB-declared aperture); what UEFI left on the core channel is UNKNOWN this boot ::"),
+    }
+
+    // ---- THE VERDICT: exactly one line, on the model axis ----
+    let read_any = classes.is_some() || hw_cap.is_some() || hw_capb.is_some() || chnctl.is_some();
+    let any_nontrivial = [classes, hw_cap, hw_capb, chnctl].iter().any(|o| matches!(o, Some(v) if !trivial(*v)));
+    if !read_any {
+        serial_println!(
+            ":: tegra: JD1-DC-MODEL MODEL-VERDICT=REFUSED reason=no-reads — every one of the four offsets lay outside the display@ node's declared reg size ({:#x}); NOT ONE of this rung's registers was read and the register model is UNDETERMINED. This does NOT mean the aperture is dead — it means the DTB gave us less aperture than the smallest of these offsets needs ::",
+            size,
+        );
+        return;
+    }
+    if !any_nontrivial {
+        serial_println!(
+            ":: tegra: JD1-DC-MODEL MODEL-VERDICT=NOT-DECODING — every read this rung performed returned 0x00000000 or 0xFFFFFFFF. WHAT THIS DOES NOT MEAN: it is not evidence that Tegra234's display block is unreachable in principle — NVIDIA's own UEFI drives this aperture from this core on this board by plain MmioRead32/MmioWrite32. It is a finding about OUR access path (aperture/mapping, the clock state at our probe point, or an SCR narrower for us than for UEFI), and it leaves the register-model question UNANSWERED rather than answering it negatively ::"
+        );
+        return;
+    }
+    // From here on the verdict is a statement ABOUT FE_CLASSES, so the two states in which we have no
+    // FE_CLASSES value get their own verdicts rather than being folded into one that would claim
+    // something about a register this boot did not read (or read as noise). Saying
+    // "+0x00000 holds nothing class-shaped" about a word we never fetched is exactly the kind of
+    // unearned claim this rung exists to stop.
+    let Some(cls) = classes else {
+        serial_println!(
+            ":: tegra: JD1-DC-MODEL MODEL-VERDICT=UNDETERMINED reason=discriminator-not-read — the aperture ANSWERS (at least one of this rung's other reads returned a non-trivial value), but FE_CLASSES @+0x00000 was outside the display@ node's declared reg size ({:#x}) and was NEVER FETCHED. The register model is UNDETERMINED — not refuted. Whatever the head/SOR/window lines above showed, no claim about +0x00000 may be read off this boot ::",
+            size,
+        );
+        return;
+    };
+    if trivial(cls) {
+        serial_println!(
+            ":: tegra: JD1-DC-MODEL MODEL-VERDICT=DISCRIMINATOR-TRIVIAL — the aperture ANSWERS somewhere (another read came back non-trivial) but FE_CLASSES @+0x00000 read {:#010x}. CLASS_ID is a hardwired read-only field with a nonzero reset value on every documented NVDisplay generation, so this REFUTES 'this aperture is NV_PDISP rebased to offset 0'. It does NOT refute much else, and specifically it is CONSISTENT with the flat Tegra DC_* model JD1-DC already uses, whose word 0x000 is DC_CMD_GENERAL_INCR_SYNCPT and may legitimately read zero on an idle block. Weaker evidence than DECODES-NOT-NVDISPLAY, and reported separately for that reason ::",
+            cls,
+        );
+        return;
+    }
+    let id = (cls >> 16) & 0xFFFF;
+    let shaped = (id & 0xF00F) == 0xC000 && id != 0;
+    match jd1_dc_class_name(id) {
+        Some(name) => serial_println!(
+            ":: tegra: JD1-DC-MODEL MODEL-VERDICT=NVDISPLAY-CLASS-{:04X} — {}. The aperture at {:#x} IS NVIDIA NV_PDISP rebased to offset 0, and this silicon presents that class. CONSEQUENCE FOR THE VERDICT BELOW: JD1-DC's window offsets come from Linux drm/tegra hub.c, whose of_match ends at tegra194 and which describes a DIFFERENT register model — so a DECODES-NOMATCH below is expected, is NOT evidence against reachability, and the correct next step is to replace the window map with the NV_PDISP one (open-gpu-doc, MIT), not to sweep wider. WHAT THIS DOES NOT MEAN: it does not say the display is programmable from here, only that we now know which manual describes it ::",
+            id,
+            name,
+            base,
+        ),
+        _ if shaped => serial_println!(
+            ":: tegra: JD1-DC-MODEL MODEL-VERDICT=NVDISPLAY-CLASS-UNKNOWN-{:04X} — FE_CLASSES holds a CLASS-SHAPED id (0xC??0) that this rung's table does not name. The NV_PDISP-at-offset-0 model is CONFIRMED; the generation is newer than, or otherwise absent from, NVIDIA/open-gpu-doc's classes/display/README.txt as read for this rung. The raw word is on the FE_CLASSES line above and the decode of the id itself is UNKNOWN — deliberately not guessed ::",
+            id,
+        ),
+        _ => serial_println!(
+            ":: tegra: JD1-DC-MODEL MODEL-VERDICT=DECODES-NOT-NVDISPLAY — the aperture ANSWERS (at least one of this rung's reads returned a non-trivial value) but +0x00000 holds nothing class-shaped: CLASS_ID={:#06x} from FE_CLASSES={:#010x}. So this aperture is NOT NV_PDISP rebased to offset 0, and the surviving candidate is the model JD1-DC already uses — the flat Tegra DC_* layout, whose word 0x000 is DC_CMD_GENERAL_INCR_SYNCPT and would read exactly like this. WHAT THIS DOES NOT MEAN: it does not CONFIRM the T194 map — it removes the strongest reason to doubt it. Only a window START_ADDR matching the JD1 scanout base (VERDICT=REACHABLE below) confirms it ::",
+            id,
+            cls,
+        ),
+    }
 }
