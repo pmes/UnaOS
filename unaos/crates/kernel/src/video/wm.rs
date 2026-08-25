@@ -6765,22 +6765,158 @@ const WCDVALVE_OPEN_PCT: u64 = 8;
 /// on every exit path (see COMP2-WCD), so unlike the composite-pass duty it accumulates DURING a
 /// pass rather than only at its end. Boot 13 measured 11 % of a 5002 ms span (`wcd_us=550603`)
 /// against the header's remembered 80 % from boot 8 — so either that workload was far heavier or
-/// PAYGOBAND has already taken most of the pressure out. Close at 8, reopen at 5.
+/// PAYGOBAND has already taken most of the pressure out. Closes at 8.
 ///
-/// EITHER signal closes the valve; BOTH must fall to reopen it. The read-back is what this valve
-/// exists to stand down, so a high read-back duty is sufficient reason on its own.
+/// EITHER signal closes the valve. The read-back is what this valve exists to stand down, so a high
+/// read-back duty is sufficient reason on its own.
+///
+/// **`wcd` CLOSES the valve and takes no part in reopening it — see WCDVALVE-LOOP below.** Its
+/// companion `WCDVALVE_WCD_OPEN_PCT = 5` is deleted rather than kept, because a reopen threshold on
+/// a quantity that is structurally 0 whenever the valve is shut is not a conservative setting, it is
+/// a term that is unconditionally true. It never governed anything and it read on the wire as if it
+/// did. The reopen is now the dwell plus `util`, and `wcd` is printed as `?` while closed.
 #[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
 const WCDVALVE_WCD_CLOSE_PCT: u64 = 8;
-#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
-const WCDVALVE_WCD_OPEN_PCT: u64 = 5;
 /// WCDVALVE-READ — the `[comp2]` epoch the reading line last named, so it prints ONCE per span.
 #[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
 static WCDVALVE_READ_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Hold the standing verdict until the current `[comp2]` span is at least this old: a rollup drain
 /// zeroes `C2_INSPAN_CYC`, and judging the first instants of a fresh epoch would read ~0 % on a
 /// storm that has not paused at all.
+///
+/// WCDVALVE-LOOP keeps this floor for CLOSING and adds a much higher one for REOPENING
+/// ([`WCDVALVE_REOPEN_SPAN_US`]). The two floors are deliberately asymmetric and both err the same
+/// way — toward the valve being SHUT — because a shut valve defers a verdict and never drops one,
+/// while an open one is the pressure this valve exists to remove.
 #[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
 const WCDVALVE_MIN_SPAN_US: u64 = 50_000;
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// WCDVALVE-LOOP — THE VALVE MEASURES A QUANTITY THAT ONLY EXISTS WHILE IT IS OPEN
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+//
+// Boot 16 flapped this valve on a ~5.2 s period for the whole pre-wedge session:
+//
+//   [ 40630ms] [wc-d] valve READ util~0% wcd~0% span=51ms close_at=util12%/wcd8% state=CLOSED
+//   [ 40630ms] [wc-d] valve OPEN resumed suspended=380
+//   [ 40699ms] [wc-d] valve CLOSED util~7% wcd~12% suspended=1
+//
+// repeating with `suspended=` 380, 235, 234, 471, 233, 477 — each cycle releasing hundreds of
+// suspended admissions and reclosing 43-69 ms later. The thresholds are NOT the defect, and
+// re-pricing them cannot fix it. Here is the mechanism, traced through the source rather than
+// inferred from the wire:
+//
+//   1. `wcdvalve_closed() == true` makes [`verify_reference`] return `None`.
+//   2. `None` means `wcd_ref` is `None`, so the `if let Some(vr)` in the composite loop never calls
+//      [`verify_window`].
+//   3. `verify_window`'s `WcdClock` drop guard is the ONE AND ONLY `fetch_add` on [`C2_WCD_CYC`] in
+//      the entire module.
+//
+// Therefore **`wcd` is structurally 0 while the valve is CLOSED.** Not measured-zero: unmeasurable.
+// It is an observable of the valve's own open state, not of the load.
+//
+// **THE SHARPEST STATEMENT OF THE DEFECT, and the reason a threshold change is not a fix.** The
+// close condition is `util >= 12 OR wcd >= 8`; the reopen condition is `util < 8 AND wcd < 5`. A
+// closure taken on the `wcd` term ALONE — which is every closure boot 16 recorded, `wcd` 9-29 %
+// while `util` sat at 7-9 %, below its own 12 — has, at the instant it is taken, a reopen predicate
+// already satisfied on every term that remains measurable. `util < 8` is precisely the condition
+// under which the `util` term declined to close it. **A `wcd`-driven closure is self-cancelling by
+// construction**, and no pair of numbers assigned to `WCDVALVE_WCD_CLOSE_PCT` /
+// `WCDVALVE_WCD_OPEN_PCT` changes that: 0 is below every positive reopen threshold.
+//
+// A SECOND, INDEPENDENT DEFECT sets the observed period. `comp2_emit` swaps both `C2_INSPAN_CYC`
+// and `C2_WCD_CYC` to zero and restamps `C2_EPOCH_CYC` every ~5 s, and [`WCDVALVE_MIN_SPAN_US`]
+// then admits a judgement 50 ms later — 1 % of the epoch, immediately after a drain that zeroed
+// both numerators. That is why every `valve READ` in boot 16's flapping epochs reads
+// `util~0% wcd~0%` at `span=51ms` while the same boot's `[comp2]` epochs report real duty. **The
+// reopen was being decided by the rollup drain, not by the load**, which is also why the period is
+// the rollup's period and not the valve's.
+//
+// **THE FIX IS NOT TO STOP THE CYCLE.** A valve that suppresses the very quantity it closes on
+// cannot be a level-triggered gate — it can never learn that the pressure went away without
+// opening to look. It must be a DUTY-CYCLED SAMPLER: shut for a stated dwell, then a bounded trial
+// open to re-measure. Boot 16's valve was already doing exactly that, one ~60 ms trial per ~5.2 s,
+// but BY ACCIDENT: the period was an alias of the `[comp2]` cadence and the decision was taken on a
+// non-measurement. So the cycle is made deliberate instead of removed —
+//
+//   * `wcd` while CLOSED is UNKNOWN, not 0. It is dropped from the reopen predicate (where it was a
+//     tautology) and printed as `wcd~?` (where it was a lie on the wire).
+//   * A minimum CLOSED dwell ([`WCDVALVE_DWELL_US`]) sets the sampler's period explicitly.
+//   * The reopen is judged only on a span old enough to BE a sample
+//     ([`WCDVALVE_REOPEN_SPAN_US`]), so `util` is the load and not the drain.
+//   * The close path is untouched: same 50 ms floor, same `util >= 12 OR wcd >= 8`. Suppression
+//     stays as prompt as it was.
+//
+// **THE CONTROL THIS MUST NOT BREAK, AND WHY IT DOES NOT.** After ~77.5 s boot 16's valve stayed
+// closed with `wcd~0%` straight through the wedge — read-back suppressed, measured at zero duty,
+// wedged anyway — and that is the EXPERIMENTAL REFUTATION of the read-back theory. A future boot
+// must still be able to demonstrate a closed valve across a wedge. It can: that boot's `util` read
+// 98 % and 79 % in the straddling epochs, an order of magnitude above `WCDVALVE_OPEN_PCT`, so the
+// reopen fails on the `util` term with or without this change. The dwell can only ever EXTEND a
+// closure, never shorten one. And note what the refutation actually rested on — `state=CLOSED` and
+// `suspended=`, never `wcd~0%`, which was a tautology of the closure and was never independent
+// evidence. Printing `wcd~?` makes the refutation's own footing honest rather than weakening it.
+//
+// **WHAT IT COSTS, stated rather than left to be discovered.** The valve can now reopen MID-epoch,
+// where before it could only reopen at an epoch top. That is the entire cost and it is bounded by
+// construction: at most one trial per dwell, so the trial rate goes from ~1 per 5.2 s to ~1 per
+// ~2.06 s and admitted read-back duty roughly 2.4x, from ~1.2 % of wall clock to ~2.9 %. Episodes
+// also get shorter and more frequent, so `suspended=` per episode falls from the 233-477 range boot
+// 16 recorded; a harvest keyed to those magnitudes reads differently and is meant to.
+
+/// WCDVALVE-LOOP — the minimum time the valve stays CLOSED before a trial reopen is considered.
+///
+/// This is the load-bearing constant of the fix: it is what converts an accidental oscillator into
+/// a stated sampling period. Sized against two measurements, not guessed:
+///
+/// * It must be far above the 43-69 ms reclose interval boot 16 measured, or the trial is just the
+///   flap again. 2 s is 30-45x that interval.
+/// * It is deliberately NOT a divisor or multiple of the ~5 s `[comp2]` rollup epoch. The whole
+///   reason the old behaviour read as a mysterious 5.2 s cycle is that the valve's period was an
+///   ALIAS of the rollup's; picking a dwell coprime-ish to that cadence means an observer can tell
+///   the two apart on the wire instead of having to disentangle them.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+const WCDVALVE_DWELL_US: u64 = 2_000_000;
+
+/// WCDVALVE-LOOP — a REOPEN may only be judged on a `[comp2]` span at least this old.
+///
+/// [`WCDVALVE_MIN_SPAN_US`]'s 50 ms is 1 % of a ~5 s epoch and begins at a forced zero, so a reopen
+/// decided there is a reading of the drain. 1 s is 20x that floor and at least a fifth of the epoch:
+/// enough accumulation that `util` is the load. Errs toward staying shut, like every other floor
+/// here.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+const WCDVALVE_REOPEN_SPAN_US: u64 = 1_000_000;
+
+/// WCDVALVE-LOOP — `now_cycles()` at the most recent close, for the dwell.
+///
+/// Starts at 0, which would read as an infinitely old close — unreachable, because the valve boots
+/// OPEN and the reopen branch is guarded on `shut`, so no dwell is ever tested before a close has
+/// stamped this.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+static WCDVALVE_CLOSED_AT_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WCDVALVE-LOOP — formats the `wcd~` field, which is a MEASUREMENT while the valve is open and
+/// UNKNOWN while it is closed. Same shape as [`crate::arch::smp::worker_cpu`]'s `CpuOpt` adapter,
+/// and for the same reason: the alternative is printing a placeholder value that a reader cannot
+/// distinguish from a real one.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+struct WcdRead {
+    pct: u64,
+    shut: bool,
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wcdvalve"))]
+impl core::fmt::Display for WcdRead {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.shut {
+            // Suppressed, therefore unmeasured. `0%` here was a tautology of the closure that read
+            // on the wire exactly like an observation of an idle read-back.
+            f.write_str("?")
+        } else {
+            write!(f, "{}%", self.pct)
+        }
+    }
+}
 
 /// WCD-VALVE — is the valve CLOSED for this admission? Called by [`verify_reference`] ahead of
 /// [`wcd_admit`]; a `true` suppresses the read-back with no WC-D state touched. Also the place both
@@ -6804,15 +6940,24 @@ fn wcdvalve_closed() -> bool {
         // discriminator that cannot report a null result discriminates nothing. One line per span
         // is the same budget `[comp2]` itself pays, and it makes the thresholds falsifiable from
         // any boot instead of only from one that happens to trip them.
+        // WCDVALVE-LOOP — how long this closure has stood. Zero while open; the reopen's dwell gate.
+        let closed_us = if shut {
+            super::wcg::cycles_to_us(now.saturating_sub(WCDVALVE_CLOSED_AT_CYC.load(Relaxed)))
+        } else {
+            0
+        };
         if WCDVALVE_READ_EPOCH.swap(epoch, Relaxed) != epoch {
             serial_println!(
-                "[wc-d] valve READ util~{}% wcd~{}% span={}ms close_at=util{}%/wcd{}% state={}",
+                "[wc-d] valve READ util~{}% wcd~{} span={}ms close_at=util{}%/wcd{}% state={} dwell_ms={}/{}",
                 util,
-                wcd,
+                // WCDVALVE-LOOP — `?`, not `0%`, while CLOSED. See [`WcdRead`].
+                WcdRead { pct: wcd, shut },
                 super::wcg::cycles_to_us(span) / 1000,
                 WCDVALVE_CLOSE_PCT,
                 WCDVALVE_WCD_CLOSE_PCT,
-                if shut { "CLOSED" } else { "open" }
+                if shut { "CLOSED" } else { "open" },
+                closed_us / 1000,
+                WCDVALVE_DWELL_US / 1000
             );
         }
         if !shut && (util >= WCDVALVE_CLOSE_PCT || wcd >= WCDVALVE_WCD_CLOSE_PCT) {
@@ -6820,12 +6965,38 @@ fn wcdvalve_closed() -> bool {
             WCDVALVE_WCD.store(wcd, Relaxed);
             WCDVALVE_SUSPENDED.store(0, Relaxed);
             WCDVALVE_SAID.store(false, Relaxed);
+            // WCDVALVE-LOOP — stamp the dwell BEFORE publishing the closure, so the first admission
+            // to observe `shut` can never read a stale (older, therefore already-expired) close time
+            // and reopen on the same instant it shut.
+            WCDVALVE_CLOSED_AT_CYC.store(now, Relaxed);
             WCDVALVE_SHUT.store(true, Relaxed);
-        } else if shut && util < WCDVALVE_OPEN_PCT && wcd < WCDVALVE_WCD_OPEN_PCT {
+        } else if shut
+            // WCDVALVE-LOOP — THREE gates, and `wcd` is not one of them.
+            //
+            // (a) The DWELL. Without it the reopen fires 43-69 ms after the close, because a closure
+            //     taken on `wcd` leaves `util` sitting below its own reopen threshold by definition.
+            //     This is what makes the sampler's period a stated quantity instead of an alias of
+            //     the `[comp2]` drain.
+            // (b) The SPAN floor. `util` computed 50 ms into a freshly-drained epoch is a reading of
+            //     the drain; at a second or more it is a reading of the load.
+            // (c) `util` alone. `wcd` is UNKNOWN while closed — its sole charge site is inside
+            //     `verify_window`, which this closure is what prevents from running — so testing it
+            //     here tested a tautology. Dropping it is a truth fix, not a behaviour change: the
+            //     term it removes was unconditionally true.
+            //
+            // `util` STAYS, and it is what preserves boot 16's control: that boot read `util~98%`
+            // and `util~79%` across the wedge, so the valve remains shut through it on this term
+            // exactly as it did before.
+            && closed_us >= WCDVALVE_DWELL_US
+            && super::wcg::cycles_to_us(span) >= WCDVALVE_REOPEN_SPAN_US
+            && util < WCDVALVE_OPEN_PCT
+        {
             WCDVALVE_SHUT.store(false, Relaxed);
             serial_println!(
-                "[wc-d] valve OPEN resumed suspended={}",
-                WCDVALVE_SUSPENDED.load(Relaxed)
+                "[wc-d] valve OPEN resumed suspended={} after {}ms closed (trial: wcd is only \
+                 measurable while open)",
+                WCDVALVE_SUSPENDED.load(Relaxed),
+                closed_us / 1000
             );
             return false;
         }
