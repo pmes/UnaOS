@@ -1854,6 +1854,54 @@ tegradesk = ["pidesk", "tegra_el0"]
 # `[orinclick] arm`, `[orinclick] edge=`, `[orinclick] census`. See orin-desktop.md §3.7.
 orinclick = ["tegra_el0"]
 
+# ORIN-CONWIN (`UNAOS_ORINCONWIN=1`): rung 4 of the Orin desktop ladder — **the console becomes a
+# WINDOW.** `arch/aarch64/display_tegra.rs::orin_conwin` calls the SHARED console-window machinery
+# (`fbcon::panel_console_face_arm` -> `fbcon::panel_console_window_open` -> `fbcon::console_is_routed`)
+# from `tegra_early_stop`'s terminus line, and `jd2_console_pump`'s phase-2 `fbcon::detach()` is
+# guarded by the route so a routed console stays LIVE instead of freezing at the handoff. There is no
+# second console renderer: one `panel_console_window_open`, one `route_present_banded`, three arches
+# reaching them.
+#
+# WHY IT IMPLIES `pidesk` + `tegra_el0`, exactly like `tegradesk` and for the same measured reason.
+# `panel_console_window_open`, `console_is_routed`, `panel_console_face_arm` and `video::dock` (the
+# CONSOLEWIN law's geometry half) are every one of them gated
+# `any(all(x86_64, wc), all(aarch64, pidesk))`, and `pidesk` on aarch64 reaches
+# `arch::aarch64::syscall` through `dock::focus_set`, which `arch/aarch64/mod.rs` gates on
+# `any(baremetal, tegra_el0)`. `baremetal` implies `pi` and `pi` + `tegra` is a hard `compile_error!`
+# (`arch/aarch64/serial.rs`), so `tegra_el0` is the only satisfiable term on this board. A standalone
+# spelling would let `UNAOS_ORINCONWIN=1 UNAOS_TEGRA=1` compile the rung's ABSENCE and report green —
+# the "gate whose knob cannot satisfy it" defect rung 2 removed. `tegra_el0` implies `tegra`, so
+# `UNAOS_ORINCONWIN=1 ./arroyo check` and `UNAOS_ORINCONWIN=1 ./arroyo esp-jetson` are self-sufficient.
+#
+# ⚠ IT DOES NOT IMPLY `orindesk` OR `orinclick`, AND THAT IS THE WHOLE SAFETY PROPERTY. orin-desktop.md
+# §6.1 (the ordering rule, "not negotiable"): *"Rung 4 may not ship a console window on an image where
+# `orinclick` is off"* — the console window carries a minimise disc whose only route back is the dock,
+# and the dock is a route back only once clicks route. `orin_conwin` therefore reads BOTH knobs at
+# runtime through `cfg!()` (the `TEGRADESK_CLICK_ROUTED` idiom, never a literal `true`) and DECLINES,
+# named, on any image missing either. Implying them would make that decline unreachable and the rule
+# unenforceable by anything but a comment; leaving them separate makes the ordering rule a branch this
+# build can actually take, and `UNAOS_ORINCONWIN=1` alone is the image that takes it.
+#
+# IT DOES NOT CROSS THE §5.2 STOP-LINE. `pidesk::activate()` — the full desktop cascade, the thing that
+# overflowed the Pi's 16 KiB kernel stack twice on metal — is NOT called: rung 4 takes exactly the two
+# steps of `pidesk::activate`'s sequence that the console window needs (face, open) and none of the
+# rest (no DESKTOP-CLEAR, no `menubar::set_enabled`, no crystal, no render service). `quarry` is NOT
+# implied either, so `quarry::open()` at click-router depth — boot 11's actual overflow — is the
+# `#[cfg(not(feature = "quarry"))]` `false` stub in this build. What `pidesk` DOES compile into the
+# router here is `strip::press_route` -> `crystal::press_at` + `dock::press_at`, and that is not a
+# widening to be tolerated but the POINT: `dock::press_at` IS §6.1's route back.
+#
+# Default OFF => the statics, the function and both call sites vanish, and NO LINE MOVES in any file
+# compiled knob-off: the `display_tegra.rs` half is a file-TAIL block, the `main.rs` call site is a
+# statement APPENDED to the existing terminus line, the detach guard is folded IN PLACE on the line it
+# guards, and the shim is at `main.rs`'s file tail. MEASURED, not argued — build `esp-jetson` either
+# side and compare sha256 of `kernel.elf` and of its `llvm-objcopy -O binary` flattening. The ARMED
+# polarity is type-checked by the `arm-tegra-conwin` leg of KERNEL_CFG_MATRIX, never by the knob
+# mapping. UNFLOWN: no Orin has booted this rung, and it stays behind its knobs until the rung-3 click
+# flight returns its verdict. Witness on the wire: `[orinconwin] gate`, `[orinconwin] win=`,
+# `[orinconwin] DECLINE`. See docs/dev/OS/08_VIDEO/orin-desktop.md §6 rung 4 and §3.8.
+orinconwin = ["pidesk", "tegra_el0"]
+
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }

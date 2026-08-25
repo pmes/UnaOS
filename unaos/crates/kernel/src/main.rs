@@ -2676,7 +2676,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // `el0-hello` task, and an unstamped mask would refuse it (see sched.rs `EL1_CORE_MASK`).
     unaos_kernel::arch::percpu::init(0); unaos_kernel::arch::sched::mark_el1_core();
     unaos_kernel::arch::exceptions::install();
-    unaos_kernel::arch::timer::el1_oneshot_proof(); tegra_el0_start_maybe(); #[cfg(feature = "tegradesk")] tegra_desk_arm(); tegra_rast_demo_maybe(); unaos_kernel::arch::sched::run_capstone_boot_core(0); // IRQEL-RT EL1 one-shot proof (first: one interrupt taken AT EL1 through the runtime-banked __vec_irq, then self-disarms — see timer.rs tail) + ORINDESK RUNG 2 desktop seam (no-op unless UNAOS_TEGRADESK=1; DESKSEAM tail block) + RAST-TEGRA demo (no-op unless UNAOS_RAST=1), all on the same line as the terminus so the wire-ins add ZERO source lines before any panic Location — the tegra knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helpers defined at file tail / timer.rs tail.
+    unaos_kernel::arch::timer::el1_oneshot_proof(); tegra_el0_start_maybe(); #[cfg(feature = "tegradesk")] tegra_desk_arm(); #[cfg(feature = "orinconwin")] unaos_kernel::arch::display_tegra::orin_conwin(); tegra_rast_demo_maybe(); unaos_kernel::arch::sched::run_capstone_boot_core(0); // IRQEL-RT EL1 one-shot proof (first: one interrupt taken AT EL1 through the runtime-banked __vec_irq, then self-disarms — see timer.rs tail) + ORINDESK RUNG 2 desktop seam (no-op unless UNAOS_TEGRADESK=1; DESKSEAM tail block) + RAST-TEGRA demo (no-op unless UNAOS_RAST=1), all on the same line as the terminus so the wire-ins add ZERO source lines before any panic Location — the tegra knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helpers defined at file tail / timer.rs tail.
 }
 
 /// Handle one keyboard byte against the console: printable ASCII extends the input line, backspace
@@ -2832,7 +2832,7 @@ fn jd2_console_pump(_arg: usize) {
 
     // Phase 2: the console owns the panel. Detach the fbcon serial mirror FIRST so a CAPSTONE
     // straggler line can't paint over the console frame (serial output is unaffected).
-    unaos_kernel::video::fbcon::detach();
+    if !tegra_conwin_live() { unaos_kernel::video::fbcon::detach(); } // ORIN-CONWIN rung 4 — the detach is GUARDED BY THE ROUTE, exactly as the Pi's GUI handoff guards it (`main.rs`'s CONSWIN-PI line). `tegra_conwin_live()` answers true only when `fbcon::console_is_routed()` does, and a routed console does not write the panel — `FbCon::draw_fb` hands back `win_fb`, kernel RAM no scan-out reads — so the ONE thing this detach exists to guarantee (exactly one writer on the panel while the JD2 Screen console owns it) is already true, and skipping it leaves the console window LIVE instead of freezing it with the boot log. Knob-off it is `#[inline(always)] false`, so this folds to the bare `detach();` it has always been. ⚠ FOLDED IN PLACE, never added lines: panic `Location` records embed line numbers and the knob-off jetson image's byte-identity is this track's standing proof.
     let mut screen = unaos_kernel::video::Screen::new(front_fb);
     // VUGRAS: the Screen back buffer PA is only known now — add it to the candidate table.
     unaos_kernel::vugras::note_screen(&screen);
@@ -6929,4 +6929,62 @@ fn tegra_desk_arm() -> bool {
         pw, ph, staged, activated, routed_after, verdict
     );
     activated && routed_after
+}
+
+// =================================================================================================
+// ORIN-CONWIN (tail block) — rung 4's SECOND half: the handoff detach, guarded by the route.
+// =================================================================================================
+//
+// THE TWO EDITS IN THIS FILE, and why neither adds a source line. Rung 4's entry is
+// `arch::display_tegra::orin_conwin`, called as a statement APPENDED to `tegra_early_stop`'s terminus
+// line beside DESKSEAM's — the `smpmark` / ORIN-WM1 / JD1-DC convention, whose reason is PI-V3D-1 and
+// is bisect-proven rather than stylistic: `panic!`/`assert!`/bounds-check sites bake a
+// `core::panic::Location` (file AND LINE) into rodata, so inserting even a comment line ahead of them
+// shifts every later `Location` and the knob-off image stops being byte-identical. The second edit is
+// `jd2_console_pump`'s phase-2 `fbcon::detach()`, folded IN PLACE to `if !tegra_conwin_live() { … }`.
+// This block is at the FILE TAIL, below every `Location` in `main.rs`, so nothing moves.
+//
+// WHY THE GUARD IS THE WHOLE OF RUNG 4'S "LIVE" CLAIM. `detach` sets `GUI_ACTIVE`, after which
+// `fbcon::_print` returns at its first test and not one further kernel line reaches the console by any
+// path. A console window opened at the terminus and then detached at phase 2 would hold the boot log
+// and never change again — the frozen snapshot x86's desktop lane ships (`wcx.rs` calls its row "a
+// FROZEN BOOT-LOG SNAPSHOT for the rest of the boot"). The Orin does not have to inherit that, for the
+// Pi's reason, restated for this board: the REASON for the detach is discharged by the route itself.
+// The detach exists so that exactly one core writes the PANEL once the JD2 `Screen` console owns it —
+// and a routed console does not write the panel. `FbCon::draw_fb` hands back `win_fb`, cached kernel
+// RAM no scan-out reads, and the pixels reach glass only through `wm`'s staged present, damage-limited
+// and paced. So on a boot where the route was installed, the handoff SKIPS the detach and the window
+// stays LIVE; on every other boot the guard is `false` and phase 2 detaches exactly as it always did.
+//
+// FAIL-CLOSED BY CONSTRUCTION. `console_is_routed()` answers `false` for every decline arm the open
+// path has AND for every arm `orin_conwin` itself takes — no panel, the ordering rule, the dock law,
+// an open that declined — so a rung that refused anywhere leaves the detach taken, unchanged.
+
+/// ORIN-CONWIN — **is the console routed into a compositor window on THIS boot?** The one fact
+/// `jd2_console_pump`'s phase-2 detach is guarded by. Read from `fbcon` rather than from a local, for
+/// `pidesk::activate`'s reason: a route declined deep inside the open path must not be reported as
+/// installed by a caller that remembers having asked for one.
+///
+/// ⚠ THE `target_arch` TERM IS FORCED AND ITS REASON IS MEASURED — it is not an arch reflex.
+/// `arroyo`'s env map appends `tegra` to ONE shared feature list that BOTH legs of `./arroyo check`
+/// are built with, so `feature = "tegra"` alone is TRUE on an x86_64 build; the callee
+/// `fbcon::console_is_routed` is gated `all(target_arch = "aarch64", feature = "pidesk")` and does not
+/// exist there. That is an E0425 this arc's first check actually produced, not a hypothetical. Every
+/// tegra helper at this file's tail carries the same term for the same reason (`jd2_console_pump`,
+/// `tegra_rast_demo_maybe`, `tegra_desk_arm`, `tegra_el0_start_maybe`). The KNOB still does the
+/// gating; the arch term only stops a `tegra`-flavoured x86 leg from compiling an aarch64 call.
+#[cfg(all(feature = "tegra", feature = "orinconwin", target_arch = "aarch64"))]
+#[inline(always)]
+fn tegra_conwin_live() -> bool {
+    unaos_kernel::video::fbcon::console_is_routed()
+}
+
+/// Knob-off (every tegra build without `orinconwin`, and every x86 leg `arroyo` hands `tegra` to): the
+/// guard compiles to nothing. `#[inline(always)]` on a body that is a constant `false` means the call
+/// site emits zero instructions and folds to the bare `fbcon::detach()` it has always been, so the
+/// jetson image stays byte-identical.
+#[cfg(all(feature = "tegra", not(all(feature = "orinconwin", target_arch = "aarch64"))))]
+#[inline(always)]
+fn tegra_conwin_live() -> bool {
+    false
 }

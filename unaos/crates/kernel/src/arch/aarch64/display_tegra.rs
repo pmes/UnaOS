@@ -2425,3 +2425,264 @@ fn jx2_nvc67d_status(base: u64, size: u64) {
         );
     }
 }
+
+// =================================================================================================
+// ORIN-CONWIN — RUNG 4 OF THE ORIN DESKTOP LADDER: THE CONSOLE AS A WINDOW. `orinconwin`, DEFAULT OFF.
+// =================================================================================================
+//
+// WHAT THIS RUNG IS. `orin-desktop.md` §6 rung 4: *"route the JD2 console into a `wm` row;
+// `fbcon::console_is_routed`; skip the handoff detach when routing succeeded"*. Both halves land here:
+// this function opens the console window on `tegra_early_stop`'s terminus line, and
+// `jd2_console_pump`'s phase-2 `fbcon::detach()` is folded to
+// `if !tegra_conwin_live() { …detach(); }` so a routed console is NOT frozen at the handoff.
+//
+// NO SECOND CONSOLE RENDERER, and that is the shape the rung was asked for. Every verb below is the
+// SHARED implementation the Pi and x86 already reach — `fbcon::panel_console_face_arm`,
+// `fbcon::panel_console_window_open`, `fbcon::console_is_routed`, `dock::Layout::for_panel`,
+// `wm::reserve_stage`, `wm::present_outcome`, `wm::composite`. There is one
+// `panel_console_window_open`, one `route_present_banded`, one `Pending`, and this board now runs
+// those same bytes. Nothing in `video/` is edited by this rung; the whole of it is this file's tail
+// block, one appended statement and one in-place fold in `main.rs`, one `[features]` entry and the
+// arroyo wiring.
+//
+// ── THE ORDERING RULE (§6.1), AND WHY IT IS A BRANCH RATHER THAN A COMMENT ───────────────────────
+//
+// `video/pidesk.rs:39-44` states the CONSOLEWIN law, inherited from `wcx`: the console window carries
+// a minimise disc, the only route back from that park is the dock, and *"a control that hides a window
+// with no way back is worse than no control"*. §6.1 turns that into an obligation on THIS rung:
+//
+//     "Rung 4 may not ship a console window on an image where `orinclick` is off. The knob and the
+//      console window have to travel together, or the minimise disc is a one-way trip again — the
+//      `#[cfg]` cannot express the law, so the rung-4 arc has to."
+//
+// So `orinconwin` does NOT imply `orindesk` or `orinclick`. Both are read at runtime through `cfg!()`
+// — the `main.rs::TEGRADESK_CLICK_ROUTED` idiom, and NOT a literal `true`, for that constant's own
+// reason: an assertion that clicks route, on an image that has none, is the one-way trip re-entered
+// through the very construct meant to prevent it. An image missing either knob gets the DECLINE below
+// and no console window, which is §6.1 enforced by codegen instead of by discipline.
+//
+// WHY `orindesk` IS IN THE CONJUNCTION and not just `orinclick`. §6.1's letter names `orinclick`
+// alone; the conjunction is strictly stronger and it is deliberate. §6.1's own caveat records that on
+// an `orinclick` image with no row on the panel the router prints `DECLINE reason=no-target` for every
+// press — i.e. the "way back" is unexercisable and its verdict unreadable. `orindesk` puts ORIN-WM1's
+// row on the glass, so the console window is not the only clickable thing on the panel and a raise can
+// be told from a miss. The rung declines rather than shipping a console window onto a panel where the
+// only evidence about the route back would be its own absence.
+//
+// THE DECLINE PRINTS, and that is load-bearing rather than tidy. An instrument that cannot fire in the
+// state it exists for is an absent one. `[orinconwin] gate …` is emitted UNCONDITIONALLY, above every
+// refusal, carrying `orindesk=`/`orinclick=` read off the build — so a capture always names the
+// ordering rule's two terms whichever way they point. The refusal itself is ONE `serial_println!` with
+// a `held` string chosen by a `match` over both terms, for the reason `main.rs`'s DESKSEAM stop-line
+// block records as MEASURED: written as two sequential `if !CONST` blocks the second one's string is
+// dead code the moment the first const is `false`, and `LC_ALL=C grep -a -o` on the armed artifact
+// found one reason and not the other.
+//
+// ── WHAT IT DOES NOT DO: THE §5.2 STOP-LINE IS NOT CROSSED ───────────────────────────────────────
+//
+// `pidesk::activate()` is NOT called. §5.2 blocks the desktop-ARMING CASCADE — the Pi overflowed a
+// 16 KiB kernel stack in it on two consecutive metal boots and no QEMU gate in this tree can stack the
+// preemption frame that does it. This rung takes exactly the two steps of `activate`'s sequence the
+// console window needs (2a FONT-PI, 2-3 CONSOLEWIN) and none of the rest: no PIDESK DESKTOP-CLEAR
+// (which would paint over ORIN-WM1's row and whose soundness argument is an empty window table — the
+// floor `main.rs`'s DESKSEAM refuses on), no `menubar::set_enabled`, no crystal, no `render_service`,
+// no window population. `quarry` is not implied, so `quarry::open()` — boot 11's ACTUAL overflow, at
+// click-router depth — is the `#[cfg(not(feature = "quarry"))]` `false` stub in this build.
+//
+// WHAT `pidesk` DOES BRING INTO THE ROUTER, stated because §3.7 promised the opposite for `orinclick`
+// alone and the difference must not pass unnoticed: `wc_click_route`'s furniture arms
+// (`strip::press_route` -> `crystal::press_at` + `dock::press_at`, `pulsewin::press_route`, the DRAG-PI
+// chrome arm, the SHELLWIN-PI arm) are compiled IN on an `orinconwin` image. That is not a tolerated
+// widening — it is the rung's precondition. `dock::press_at` IS §6.1's route back; without `pidesk`
+// there is no dock in the image at all (`video/mod.rs` gates the whole furniture family on it), so a
+// minimise disc really would be one-way. `pulsewin::press_route` returns on a NONE window id and
+// `quarry::press_route` is the stub, so the two deep arms are unreachable on this build.
+//
+// ── WHERE IT RUNS, AND THE STACK ─────────────────────────────────────────────────────────────────
+//
+// `tegra_early_stop`'s terminus line — the boot core's own entry frame, the same placement and the
+// same argument DESKSEAM records: panel seeded (JD1), heap carved (step 3c), IRQs live (JM4), SMP
+// secondaries kicked, EL2->EL1 dropped, run queue populated but not driven. `panel_console_window_open`
+// ends in `create_at`, which composites, and `composite_inner` is the function whose aarch64 stack
+// exhaustion is on the ledger (occ62) — so it runs HERE and not in `jd2_console_pump`, which is a
+// `sched::spawn`ed task on a `TASK_STACK_SIZE` stack. ORIN-WM1 made the same choice for the same
+// reason.
+//
+// NOT MEASURED, stated rather than implied: once the route is installed every subsequent
+// `serial_println!` reaches `route_present_banded` from WHATEVER stack is printing, not from the boot
+// stack. That is exactly what the Pi ships (paced at 60 Hz, damage-limited), and the Orin's own
+// `[u7stk]` high-water for it has never been read on this board. §7's standing note applies: every
+// stack number quoted for this ladder so far is a Pi number.
+//
+// ── THE OTHER WRITER, AND WHY IT DOES NOT ERASE THE WINDOW ────────────────────────────────────────
+//
+// §7 left this open and named it rung-4 territory: `jd2_console_pump` owns the panel through a
+// double-buffered `Screen` whose `pal.render()` blits the console back buffer, and whether a
+// composited row survives that blit was unmeasured. The answer in SOURCE is that it does —
+// `Screen::present_background` subtracts the window layer (`wm::occluders`, the WC-I loop) on BOTH of
+// its cfg arms, the aarch64 one included, so the desktop present never writes a pixel inside a live
+// window's box. That is a source reading, NOT a metal measurement, and this rung does not claim
+// otherwise: the on-glass half stays owed to a bench boot.
+//
+// ── DEFAULT OFF AND MEASURED ──────────────────────────────────────────────────────────────────────
+//
+// With `orinconwin` unset every item below vanishes, the terminus call site is one `#[cfg]`-erased
+// statement, and the phase-2 guard folds to the bare `fbcon::detach()` it has always been
+// (`#[inline(always)]` on a constant `false`). No line moves in any file compiled knob-off — this is a
+// FILE-TAIL block, and both `main.rs` edits are same-line. The feature is NOT standalone (see
+// `Cargo.toml`): it implies `pidesk` + `tegra_el0`, and `tegra_el0` implies `tegra`, so
+// `UNAOS_ORINCONWIN=1 ./arroyo esp-jetson` builds the armed configuration with no second knob — and
+// prints the ordering-rule DECLINE, because neither `orindesk` nor `orinclick` came with it.
+
+/// ORIN-CONWIN — one-shot latch. `tegra_early_stop` runs once per boot on the boot core, so this
+/// cannot fire today; it is here for `pidesk::activate`'s own reason — `panel_console_window_open` is
+/// idempotent behind `CONSOLE_WIN` and would hand the same row straight back, but a second pass would
+/// re-arm the face and re-present, and a seam that cannot say it has already run cannot be told from
+/// one that declined.
+#[cfg(feature = "orinconwin")]
+static ORINCONWIN_ENTERED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// ORIN-CONWIN ORDERING TERM 1 — **is there a row on this panel to click?** `cfg!`, never a literal:
+/// `orinconwin` does not imply `orindesk`, and asserting a target that the build does not contain is
+/// the defect `main.rs::TEGRADESK_CLICK_ROUTED` was written to avoid. See the ORDERING RULE above.
+#[cfg(feature = "orinconwin")]
+const ORINCONWIN_DESK_ROW: bool = cfg!(feature = "orindesk");
+
+/// ORIN-CONWIN ORDERING TERM 2 — **do clicks route on this image?** §6.1's binding term: *"Rung 4 may
+/// not ship a console window on an image where `orinclick` is off."* DERIVED FROM THE BUILD, for
+/// `TEGRADESK_CLICK_ROUTED`'s reason. Routing itself is UNFLOWN — no Orin has booted `orinclick` — so
+/// this const says the caller is COMPILED IN, never that a press has ever reached the window layer.
+#[cfg(feature = "orinconwin")]
+const ORINCONWIN_CLICK_ROUTED: bool = cfg!(feature = "orinclick");
+
+/// **ORIN-CONWIN — route the Orin's kernel console into a `wm` row, or decline and say why.**
+///
+/// Returns `true` iff the console is ROUTED, read back from [`crate::video::fbcon::console_is_routed`]
+/// rather than inferred from this function's own control flow — `pidesk::activate`'s discipline, for
+/// its reason: a route declined deep inside the open path must never be reported as installed by a
+/// caller reading a stale local. That return value is the ONE fact the caller acts on: it is what
+/// `jd2_console_pump`'s phase-2 detach is guarded by.
+///
+/// Every decline is named on the wire and none of them is fatal: a headless Orin, a panel too small to
+/// guarantee the dock, an image the ordering rule refuses, or a console that would not open all boot
+/// exactly as they did before, with the detach taken as it always was.
+#[cfg(feature = "orinconwin")]
+pub fn orin_conwin() -> bool {
+    use crate::video::{dock, fbcon, wm};
+    use core::sync::atomic::Ordering;
+
+    if ORINCONWIN_ENTERED.swap(true, Ordering::AcqRel) {
+        serial_println!("[orinconwin] DECLINE reason=already-armed (the seam is one-shot; a second pass would re-arm the face and re-present a row panel_console_window_open would hand straight back)");
+        return fbcon::console_is_routed();
+    }
+
+    // 1. THE PANEL, live off the surface the compositor composites onto, never assumed. Copy the info
+    //    out and drop `WRITER` immediately: nothing below may hold it across a `wm` call, which is what
+    //    keeps the WRITER/TABLE acquisition order acyclic (ORIN-WM1's rule). A headless Orin — no DTB
+    //    `simple-framebuffer` handoff, or geometry that failed JD1's sanity — never seeded `WRITER`.
+    let info = {
+        let fb = *crate::video::WRITER.lock();
+        if !fb.is_ready() {
+            serial_println!("[orinconwin] DECLINE reason=no-panel (headless boot — JD1 seeded no scanout; there is no glass for a console window to be composited onto)");
+            return false;
+        }
+        fb.info()
+    };
+    let (pw, ph) = (info.width, info.height);
+
+    // 2. THE STAGING BUFFER (§3.3). Grow-only and idempotent, so this is safe beside ORIN-WM1's own
+    //    call and DESKSEAM's; it is repeated here because neither of those is guaranteed to be in the
+    //    image. `wm`'s staged presents run inside `SYS_WIN_PRESENT`'s IRQ mask, so a buffer that GREW
+    //    on the pass would be a masked acquisition of the global heap `Mutex` — the F1-F5 defect
+    //    family — and the routed console presents on every printed line. A short reserve is REPORTED,
+    //    not fatal: `wm` keeps its lazy-growth fallback.
+    let staged = wm::reserve_stage(&info);
+
+    // 3. THE CONSOLEWIN LAW'S GEOMETRY HALF, evaluated with the SAME call `pidesk` makes —
+    //    `MAX_WINDOWS`, not the live count, because the check must hold for every table state the boot
+    //    can reach. Pure integer geometry; paints nothing.
+    let dock_ok = dock::Layout::for_panel(wm::MAX_WINDOWS, pw, ph).is_some();
+    let live = wm::count();
+    let routed_before = fbcon::console_is_routed();
+
+    // THE CENSUS. Printed UNCONDITIONALLY, above every refusal below it, so a capture always carries
+    // both ordering terms and every floor's measured value rather than the first one that said no.
+    serial_println!(
+        "[orinconwin] gate panel={}x{}x{} stage={} table={} dock={} route={} orindesk={} orinclick={} rows={}",
+        pw, ph, info.bytes_per_pixel,
+        staged, live,
+        if dock_ok { "GRANTED" } else { "WITHHELD" },
+        if routed_before { "ROUTED" } else { "UNROUTED" },
+        ORINCONWIN_DESK_ROW as u8,
+        ORINCONWIN_CLICK_ROUTED as u8,
+        wm::MAX_WINDOWS
+    );
+
+    // 4. THE ORDERING RULE (§6.1) — ONE decision and ONE line, a `match` over BOTH terms rather than
+    //    the first that said no, for the reason DESKSEAM measured on its own artifact.
+    if !(ORINCONWIN_DESK_ROW && ORINCONWIN_CLICK_ROUTED) {
+        let held = match (ORINCONWIN_DESK_ROW, ORINCONWIN_CLICK_ROUTED) {
+            (false, false) => "no-desk-row+clicks-unrouted",
+            (true, false) => "clicks-unrouted",
+            _ => "no-desk-row",
+        };
+        serial_println!("[orinconwin] DECLINE reason=ordering-rule held={} panel={}x{} dock={} (§6.1, not negotiable: the console window carries a minimise disc and video/pidesk.rs:39-44 states the CONSOLEWIN law — the only route back from that park is the dock, and the dock is a route back only once clicks route, so rung 4 may not ship a console window on an image where orinclick is off. UNAOS_ORINDESK is in the conjunction too: without a second row on the panel every press takes the router's no-target arm and the route back has no readable verdict. Arm UNAOS_ORINCONWIN=1 UNAOS_ORINDESK=1 UNAOS_ORINCLICK=1 together or ship no console window)", held, pw, ph, if dock_ok { "GRANTED" } else { "WITHHELD" });
+        return false;
+    }
+
+    // 5. THE CONSOLEWIN LAW'S REFUSAL. Narrowed exactly as `pidesk` narrows it: this guards the console
+    //    WINDOW and nothing else, because the law's own justification is about ONE control on ONE
+    //    window. Nothing else on this boot is withheld by it — there is no bar here to follow.
+    if !dock_ok {
+        serial_println!("[orinconwin] DECLINE reason=dock-cannot-host-full-strip panel={}x{} rows={} (the console's minimise disc would have no way back — dock::Layout::for_panel returns None when the strip will not fit at MAX_WINDOWS, and the check is made against MAX_WINDOWS rather than the live count because it must hold for every table state this boot can reach)", pw, ph, wm::MAX_WINDOWS);
+        return false;
+    }
+
+    // 6. FONT-PI ON THE ORIN — the console leaves font8x8 BEFORE the window is sized, by necessity:
+    //    `panel_console_window_open` reads `c.cell_w`/`c.cell_h` to size the surface in whole cells, so
+    //    it must see the face's cell and not the bitmap's. On the 1920x1200 bench panel the 8x8 cell at
+    //    scale 1 is ~0.8 mm — metal sitting #30 recorded it as simply not visible — and a console
+    //    window whose text cannot be read would make this rung's own metal witness unreadable. A
+    //    decline here is reported and NOT fatal: the window still opens, with the bitmap cell.
+    let face_cell = fbcon::panel_console_face_arm();
+    if face_cell.is_none() {
+        serial_println!("[orinconwin] console-face DECLINE reason=console-not-ready (the console keeps font8x8; the window still opens, sized in 8x8 cells)");
+    }
+
+    // 7. THE CONSOLE BECOMES A WINDOW. The shared implementation, reached from a third seam — its own
+    //    `[wc-x] console-window …` line reports the geometry and the panic fallback, emitted by the
+    //    `fbcon` code the Pi widened rather than by anything tegra-specific.
+    let win = fbcon::panel_console_window_open();
+    let routed = fbcon::console_is_routed();
+    if win == wm::WIN_NONE || !routed {
+        serial_println!("[orinconwin] DECLINE reason=open-declined win={} route={} panel={}x{} (fbcon named its own reason on the line above this one — console not ready, allocation refused, geometry unavailable, create failed or install contended; the boot continues and jd2_console_pump takes its detach exactly as it always did)", win, routed, pw, ph);
+        return false;
+    }
+
+    // 8. PRESENT + COMPOSITE — `present_outcome` over `present` for the naming alone, ORIN-WM1's
+    //    reason: `present`'s `bool` folds "the pass ran" into "the pass was suppressed", and on a rung
+    //    whose verdict is "did the console's pixels reach glass" those two must not look alike. The
+    //    trailing verdict is DERIVED from the outcome CROSSED with the route read back, never asserted.
+    let outcome = wm::present_outcome(win);
+    wm::composite();
+    let (pres, ok) = match outcome {
+        wm::Presented::Composited => ("Composited", true),
+        wm::Presented::Coalesced => ("Coalesced", true),
+        wm::Presented::Suppressed => ("Suppressed", false),
+        wm::Presented::NoRow => ("NoRow", false),
+    };
+    let (cw, ch) = face_cell.unwrap_or((0, 0));
+    serial_println!(
+        "[orinconwin] win={} panel={}x{} cell={}x{} stage={} table={} present={} route={} live={} -> {}",
+        win, pw, ph, cw, ch, staged, wm::count(), pres, routed,
+        // LIVE vs FROZEN is the rung's second half and it is read from the BUILD, not from this
+        // function: `jd2_console_pump`'s phase-2 detach is guarded by `tegra_conwin_live()`, which is
+        // this same route. On this build the guard exists, so a routed console stays live — every
+        // kernel line printed after the handoff lands in the window and is composited, damage-limited
+        // and paced, by the machinery `fbcon` already carries.
+        "LIVE",
+        if ok && routed { "ROUTED" } else { "PRESENT-DECLINED" }
+    );
+    routed
+}

@@ -932,6 +932,140 @@ the JD1-DC-MODEL section. The two headlines that bear on this ladder:
 * **Nothing about stack cost.** `[u7stk]` was not pointed at the click-router depth on this boot;
   §5's numbers remain Pi numbers.
 
+### §3.9 LANDED 2026-08-25 (rung 4) — the console as a window, DEFAULT OFF and UNFLOWN
+
+**Measured against `e98d798b`.** Rung 4's row asked for three things — *"route the JD2 console into
+a `wm` row; `fbcon::console_is_routed`; skip the handoff detach when routing succeeded"* — and all
+three landed, behind `orinconwin`, **plus the ordering rule of §6.1 turned from an obligation on the
+arc into a branch the build can take.** As with rungs 2 and 3: this COMPILES and is REACHED in
+codegen; **no Orin has booted it.** QEMU models no Tegra234, so the metal witness is owed.
+
+#### What landed
+
+| where | what |
+| --- | --- |
+| `crates/kernel/Cargo.toml` | `orinconwin = ["pidesk", "tegra_el0"]` — self-sufficient, and deliberately does NOT imply `orindesk`/`orinclick` |
+| `arch/aarch64/display_tegra.rs` (file TAIL) | `orin_conwin()`, its one-shot latch, and the two ordering-term consts `ORINCONWIN_DESK_ROW`/`ORINCONWIN_CLICK_ROUTED` (`cfg!()`, never literals) |
+| `main.rs` terminus line | `#[cfg(feature = "orinconwin")] …display_tegra::orin_conwin();` appended beside DESKSEAM's call — zero source lines added |
+| `main.rs` `jd2_console_pump` phase 2 | `fbcon::detach()` folded IN PLACE to `if !tegra_conwin_live() { … }` |
+| `main.rs` file tail | `tegra_conwin_live()`, both cfg polarities; the off arm is `#[inline(always)] false` |
+| `arroyo` | `UNAOS_ORINCONWIN` env map + the `arm-tegra-conwin` cfg-matrix leg (board legs 13 → 14, gate 22 → 23) |
+
+**No `video/` edit, and none was needed.** Every verb is the shared implementation the Pi and x86
+already reach: `fbcon::panel_console_face_arm`, `fbcon::panel_console_window_open`,
+`fbcon::console_is_routed`, `dock::Layout::for_panel`, `wm::reserve_stage`, `wm::present_outcome`,
+`wm::composite`. There is one `panel_console_window_open`, one `route_present_banded`, one
+`Pending`, and this board now runs those same bytes — proven by disassembly, not by linkage:
+`orin_conwin`'s only `bl` targets in the armed `kernel.elf` are `wm::reserve_stage`,
+`fbcon::panel_console_window_open`, `wm::present_banded`, `wm::composite` and `serial::__print`.
+
+#### The ordering rule is now a BRANCH, not a promise
+
+§6.1's binding sentence — *"Rung 4 may not ship a console window on an image where `orinclick` is
+off"* — is enforced by `orin_conwin` reading BOTH knobs through `cfg!()` (the
+`TEGRADESK_CLICK_ROUTED` idiom, never a literal `true`) and declining, named, on an image missing
+either. `orinconwin` therefore implies NEITHER, which is what keeps the decline reachable. The
+conjunction adds `orindesk` to §6.1's letter, deliberately and one way only — stricter: §6.1's own
+caveat records that on an `orinclick` image with no row on the panel every press takes the router's
+`no-target` arm, so the "route back" would be unexercisable and its verdict unreadable.
+
+**Both polarities were measured on real artifacts, because a decline that cannot print is an absent
+instrument.** `LC_ALL=C grep -a -o` on `kernel.elf`:
+
+| image | `[orinconwin] gate` | `DECLINE reason=ordering-rule` | `win=` / `dock-cannot-host-full-strip` |
+| --- | :-: | :-: | :-: |
+| knob-off jetson | 0 | 0 | 0 |
+| `UNAOS_ORINCONWIN=1` alone | 1 | **1**, `held=no-desk-row+clicks-unrouted` | 0 (const-folded away) |
+| `+UNAOS_ORINDESK=1 +UNAOS_ORINCLICK=1` | 1 | 0 (const-folded away) | 1 each |
+
+That the ordering DECLINE is *absent* from the fully-armed image is the correct answer, not a hole:
+on that image the rule cannot hold anything off. The refusal is ONE `serial_println!` with a `held`
+string chosen by a `match` over both terms, for the reason DESKSEAM measured on its own artifact —
+written as two sequential `if !CONST` blocks the second string is dead code the moment the first
+const is `false`.
+
+#### The detach guard, and why it is the whole of the "LIVE" claim
+
+`detach` sets `GUI_ACTIVE`, after which `fbcon::_print` returns at its first test. A console window
+opened at the terminus and then detached at phase 2 would hold the boot log and never change again —
+the frozen snapshot `wcx.rs` ships on x86. The Orin does not inherit it, for the Pi's reason: the
+REASON for the detach is discharged by the route itself. A routed console does not write the panel
+(`FbCon::draw_fb` hands back `win_fb`), so "exactly one writer on the panel" is already true.
+Codegen, in the armed `kernel.elf` inside `jd2_console_pump`:
+
+```
+72388:  bl   0xe49c0 <…video::fbcon::console_is_routed>
+7238c:  tbnz w0, #0x0, 0x72394          ; routed → skip
+72390:  bl   0xe574c <…video::fbcon::detach>
+```
+
+Fail-closed by construction: `console_is_routed()` answers `false` for every decline arm the open
+path has AND for every arm `orin_conwin` itself takes, so a rung that refused anywhere leaves the
+detach taken, unchanged.
+
+#### §7's open question, answered in SOURCE only
+
+§7 left this as rung-4 territory: `jd2_console_pump` owns the panel through a double-buffered
+`Screen` whose `pal.render()` blits the console back buffer, and whether a composited row survives
+that blit was unmeasured. In source it does — `Screen::present_background` subtracts the window
+layer (`wm::occluders`, the WC-I loop) on **both** of its cfg arms, the aarch64 one included, so the
+desktop present never writes a pixel inside a live window's box. **That is a source reading, not a
+metal measurement**, and this rung does not claim otherwise.
+
+#### The §5.2 stop-line is NOT crossed
+
+`pidesk::activate()` is not called. Rung 4 takes exactly the two steps of `activate`'s sequence the
+console window needs — 2a FONT-PI, 2-3 CONSOLEWIN — and none of the rest: no PIDESK DESKTOP-CLEAR,
+no `menubar::set_enabled`, no crystal, no `render_service`, no window population.
+`TEGRADESK_CASCADE_OK` was not touched. `quarry` is not implied, so `quarry::open()` — boot 11's
+actual 16 KiB overflow, at click-router depth — is the `#[cfg(not(feature = "quarry"))]` `false`
+stub in this build.
+
+**What `pidesk` DOES bring in, stated because §3.7 promised the opposite for `orinclick` alone and
+the difference must not pass unnoticed.** On an `orinconwin` image `wc_click_route`'s furniture arms
+(`strip::press_route` → `crystal::press_at` + `dock::press_at`, `pulsewin::press_route`, the DRAG-PI
+chrome arm, the SHELLWIN-PI arm) are compiled IN. That is not a tolerated widening — it is the
+rung's precondition: `dock::press_at` **is** §6.1's route back, and `video/mod.rs` gates the whole
+furniture family on `pidesk`, so without it a minimise disc really would be one-way.
+`pulsewin::press_route` returns on a `WIN_NONE` id and `quarry::press_route` is the stub, so the two
+deep arms are unreachable on this build.
+
+#### Gate
+
+* `UNAOS_TEGRA=1 ./arroyo check` — green, **23 legs** (13 → 14 board legs, 9 mix legs unchanged);
+  green again under `UNAOS_ORINCONWIN=1 UNAOS_ORINDESK=1 UNAOS_ORINCLICK=1`.
+* `arm-tegra-conwin` proven to go RED on a re-introduced mismatch (`panel_console_face_arm` renamed
+  inside `orin_conwin`): that leg alone failed E0425 and every other leg stayed green.
+* `./arroyo test-arm` — green, `MISSION SUCCESS`.
+* **Knob-off byte identity, MEASURED at the LOADABLE-IMAGE level.** `esp-jetson` built knob-off in a
+  worktree at `e98d798b` and in this arc's tree: `llvm-objcopy -O binary kernel.elf` →
+  `71f98f5360ee222a7b32d858cd9eb792ea1a0a660a45897ea3691e85b2fecf12` on both, and every allocated
+  section (`.text`/`.rodata`/`.data`) hashes identically. The two `.elf` FILES differ only in
+  `.strtab` size (non-loaded; the `.llvm.<hash>` internal-symbol suffixes JB11's arroyo note already
+  records as a build-path artefact) — compare the binary image, not the `.elf` sha256.
+* Armed artifact: every new witness one-hit-grepped (table above), and `orin_conwin` proven
+  REACHABLE by disassembly — `72fec: bl 0xf8ecc <…display_tegra::orin_conwin>`, its single caller,
+  inside `tegra_early_stop` (`0x7275c`).
+
+#### What this rung deliberately did NOT do
+
+* **No rung 5.** No dock/strip/menubar/crystal arming, no tegra `render_service`,
+  `TEGRADESK_CASCADE_OK` untouched.
+* **No `video/` edit.** None was needed; if one had been, it would have been written up here rather
+  than made, exactly as §3.5.2 was.
+* **`tegradesk` was not put on the new leg, and rung 2's seam was not modified.** DESKSEAM's
+  `table-not-empty` floor refuses when `orindesk` has already minted a row, so the two seams do not
+  ship together and the matrix does not pretend they do.
+* **The stack question is asked but not answered.** `orin_conwin` runs on the BOOT stack (the
+  terminus line) for ORIN-WM1's reason, but once the route is installed every subsequent
+  `serial_println!` reaches `route_present_banded` from whatever stack is printing. That is exactly
+  what the Pi ships (paced, damage-limited) and the Orin's own `[u7stk]` high-water for it has never
+  been read. §7's standing note applies: every stack number quoted for this ladder is a Pi number.
+* **UNFLOWN, and it stays behind its knobs until the rung-3 click flight returns its verdict.**
+  §6.1's second obligation — *"Rung 4 wants a metal capture showing `[orinclick] edge=… -> RAISED`
+  before it leans on the dock as a way back"* — is NOT discharged by this arc. Nothing here makes
+  the console window reachable on a default image.
+
 ---
 
 ## §4 The GA10B boundary — stated once so nobody re-asks
@@ -1133,7 +1267,7 @@ names the seat that owns the files under the parallel-arc rules in `CLAUDE.md`.
 | **1** | **The cfg leg** — ✅ **LANDED 2026-08-22, less `quarry`** (§3.5.1) | `arm-tegra-desk` leg added (gate 18 → 19 legs); `pidesk`/`quarry`/`livecon` mapped in arroyo's env map; two of the three gate mismatches fixed | `UNAOS_TEGRA=1 ./arroyo check` green 19/19, and green again under `UNAOS_TEGRA_EL0=1 UNAOS_PIDESK=1 UNAOS_LIVECON=1`; the new leg proven to go red on a re-introduced mismatch | jetson (arroyo + `arch/aarch64/syscall.rs`); the `quarry` line is a `video/` edit and is **held** in §3.5.2 |
 | **2** | **The desktop seam** — ✅ **LANDED 2026-08-25, and it REFUSES** (§3.2.1) | `tegradesk` feature + `main.rs::tegra_desk_arm` on `tegra_early_stop`'s terminus line + `UNAOS_TEGRADESK` env map + the `arm-tegra-seam` leg (11 → 12 board legs). The seam evaluates its floors and declines at two named stop-lines | **the floors half is UNFLOWN**: `[deskseam] floors …` + `REFUSE reason=…` print on an armed Orin boot, and nobody has taken one. **The `activate()` half is WITHDRAWN, not owed**: `pidesk::activate()` opens the console window and enables the bar, so running it crosses §6.1 *and* §5.2 — it belongs to rungs 3/5, and this row previously asked for something the same document forbids | jetson |
 | **3** | **Input routing** — ✅ **LANDED 2026-08-25 as a DEFAULT-OFF knob; FLOWN AND ARMED, CLICK UNTESTED** (§3.7, §3.8) | `orinclick` (implies `tegra_el0`) wires `jd2_console_pump`'s `Event::Button` arm into `wc_click_route` (§3.4) and adds the `[orinclick]` instrument at the tail of `display_tegra.rs`. **⚠ HANDSHAKE WITH RUNG 2, DISCHARGED IN THIS ARC:** `main.rs`'s `TEGRADESK_CLICK_ROUTED` no longer reads `false` — it reads `cfg!(feature = "orinclick")`, **not** a literal `true`, because `tegradesk` does not imply `orinclick` and a hard `true` would assert a route back on an image that has none: the one-way trip re-entered through the constant meant to prevent it. `arm-tegra-seam` now carries `orinclick` so the assertion is type-checked. COMPILES: gate green 21/21 knob off and on; the new `arm-tegra-orinclick` leg proven to go red. No gate in this tree can boot it — QEMU models no Tegra234 | ⚠ **PART-DISCHARGED, boot7f 2026-08-25** (§3.8): the knob flew, the router **armed** from inside the pump (`[orinclick] arm panel=1920x1200 rows=1 compat=0 focus=0x0 pidesk=0 t=31 -> ARMED`, capture line 11424) and 48 consecutive `IDLE-NO-CLICKS` censuses proved the routing task alive with `btn=0`. **Still owed: the click.** No `[orinclick] edge=…` line and no `[clickroute]` line exists in any capture, because nobody has pressed the button on this board | jetson |
-| **4** | **Console as a window** | route the JD2 console into a `wm` row; `fbcon::console_is_routed`; skip the handoff detach when routing succeeded | the boot log keeps updating *inside a window*, and the minimise control has somewhere to go back to | jetson |
+| **4** | **Console as a window** — ✅ **LANDED 2026-08-25 as a DEFAULT-OFF knob, UNFLOWN** (§3.9) | `orinconwin` (implies `pidesk` + `tegra_el0`, and deliberately NOT `orindesk`/`orinclick`) calls the SHARED console-window machinery from `display_tegra::orin_conwin` on `tegra_early_stop`'s terminus line — `panel_console_face_arm` → `panel_console_window_open` → `console_is_routed` — and folds `jd2_console_pump`'s phase-2 `fbcon::detach()` to `if !tegra_conwin_live() { … }` so a routed console stays LIVE. **§6.1 IS NOW A BRANCH:** both ordering terms are read through `cfg!()` and an image missing either gets `[orinconwin] DECLINE reason=ordering-rule held=…` and NO window — measured on the artifact both ways. No `video/` edit; no `pidesk::activate()`, so §5.2 is untouched. Gate green 23/23 knob off and on; `arm-tegra-conwin` proven to go red; knob-off loadable image byte-identical. NOT run on any board | metal-owed: the boot log keeps updating *inside a window* while the JD2 shell holds the desktop layer around it, and the minimise control has somewhere to go back to. Wire: `[orinconwin] gate …` then `[orinconwin] win=… route=true live=LIVE -> ROUTED`, plus `[wc-x] console-window …` from the shared `fbcon` path | jetson |
 | **5** | **The real desktop** | dock, strip, menubar, crystal armed; the full `pidesk` cascade; a tegra `render_service` (§3.6) | the Orin comes up to a desktop | jetson — **blocked by §5.2** |
 | **6** | **EL0 tenants** | user windows from EL0 through `SYS_WIN_*`, on the `tegra_el0` regime | an EL0 program owns a window on the Orin panel | jetson |
 
@@ -1275,6 +1409,12 @@ before rung 2 if the seam is to be type-checked by anything). Rung 5 is gated on
   painter demonstrably ran — `[crispy]` latched four lines above it and `paint_window` /
   `draw_title` are reachable in the flown artifact — so "the window has no frame" is
   refuted; "the frame is on the glass" is simply not yet measured here.
+- **Rung 4 is claimed LANDED and COMPILED, and nothing more.** No board has booted an image with
+  `orinconwin` set, so every `[orinconwin]` verdict in §3.9 describes code that has never printed.
+  In particular: **that the routed console's glyphs reach the GLASS is NOT claimed.** §3.9 answers
+  §7's old `pal.render()` question from SOURCE — `Screen::present_background` subtracts
+  `wm::occluders` on both cfg arms — and a source reading is not a metal measurement. The stack cost
+  of `route_present_banded` on this board is likewise unmeasured; the numbers below stay Pi numbers.
 - **The stack cost of the routing path on Orin is unmeasured.** `[u7stk]` exists
   here and `witness`-gates cleanly, and has never been pointed at the click-router
   depth on this board. §5's numbers remain Pi numbers.

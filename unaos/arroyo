@@ -883,6 +883,43 @@ _feats=""
 # ARMED polarity is type-checked by the `arm-tegra-seam` leg of KERNEL_CFG_MATRIX, never by this
 # mapping. Witness on the wire: `[deskseam]`. See docs/dev/OS/08_VIDEO/orin-desktop.md §6 rung 2.
 [ -n "${UNAOS_TEGRADESK:-}" ] && _feats="${_feats}tegradesk,pidesk,tegra_el0,tegra,"
+# ORIN-CONWIN (rung 4): UNAOS_ORINCONWIN=1 turns the Orin's kernel console into a compositor WINDOW.
+# `arch/aarch64/display_tegra.rs::orin_conwin` runs on `tegra_early_stop`'s terminus line and calls the
+# SHARED console-window machinery — `fbcon::panel_console_face_arm`, `fbcon::panel_console_window_open`,
+# `fbcon::console_is_routed`, `dock::Layout::for_panel`, `wm::reserve_stage`/`present_outcome` — and
+# `jd2_console_pump`'s phase-2 `fbcon::detach()` is folded to `if !tegra_conwin_live() { … }` so a
+# ROUTED console stays LIVE instead of freezing at the handoff. There is no second console renderer.
+#
+# SELF-SUFFICIENT, like `tegradesk` and unlike `orindesk`/`jd1dc`/`smpmark`:
+# `orinconwin = ["pidesk", "tegra_el0"]` and `tegra_el0` implies `tegra`, because every one of the
+# callees above is gated `any(all(x86_64, wc), all(aarch64, pidesk))` and `pidesk` on aarch64 reaches
+# `arch::aarch64::syscall` through `dock::focus_set` (`any(baremetal, tegra_el0)`; `baremetal` implies
+# `pi` and `pi`+`tegra` is a `compile_error!`). A standalone spelling would let
+# `UNAOS_ORINCONWIN=1 UNAOS_TEGRA=1` compile the rung's ABSENCE and report green. The terms are
+# appended here as well as implied by Cargo so the banner shows the configuration it actually built.
+#
+# ⚠ IT DOES NOT IMPLY UNAOS_ORINDESK OR UNAOS_ORINCLICK, AND THAT IS THE SAFETY PROPERTY.
+# orin-desktop.md §6.1: "Rung 4 may not ship a console window on an image where `orinclick` is off" —
+# the minimise disc's only route back is the dock, and the dock is a route back only once clicks route.
+# `orin_conwin` reads BOTH knobs through `cfg!()` and DECLINES, named, on an image missing either. So
+# `UNAOS_ORINCONWIN=1 ./arroyo esp-jetson` builds a jetson image that prints
+# `[orinconwin] DECLINE reason=ordering-rule held=no-desk-row+clicks-unrouted …` and opens NO window;
+# the armed rung is
+#     UNAOS_ORINCONWIN=1 UNAOS_ORINDESK=1 UNAOS_ORINCLICK=1 ./arroyo esp-jetson
+# and the DECLINE polarity is a REACHABLE verdict of this script, not a hypothetical.
+#
+# IT DOES NOT CROSS THE §5.2 STOP-LINE: `pidesk::activate()` is not called (no DESKTOP-CLEAR, no
+# menubar, no crystal, no render service), and `quarry` is not implied — `quarry::open()` at
+# click-router depth, boot 11's actual 16 KiB overflow, is the `not(feature = "quarry")` stub here.
+# What `pidesk` DOES compile into the router is `dock::press_at`, which IS §6.1's route back.
+#
+# Default OFF => the statics, the function, the terminus statement and the guard all vanish, no line
+# moves in any file compiled knob-off (file-tail blocks; both main.rs edits are same-line), and the
+# jetson image is byte-identical to baseline. The ARMED polarity is type-checked by the
+# `arm-tegra-conwin` leg of KERNEL_CFG_MATRIX, never by this mapping. UNFLOWN — no Orin has booted it.
+# Witness on the wire: `[orinconwin] gate`, `[orinconwin] win=`, `[orinconwin] DECLINE`.
+# See docs/dev/OS/08_VIDEO/orin-desktop.md §6 rung 4 and §3.8.
+[ -n "${UNAOS_ORINCONWIN:-}" ] && _feats="${_feats}orinconwin,pidesk,tegra_el0,tegra,"
 # JB11-ESCAPE: UNAOS_NOJB11=1 suppresses the Falcon firmware-header census
 # (arch/aarch64/xusb_tegra.rs::jb11_fw_header_census) so a bench sitting can take an UN-INSTRUMENTED
 # CONTROL boot. Default UNSET => the census runs on every tegra boot, unchanged — the census is the
@@ -2426,6 +2463,46 @@ KERNEL_CFG_MATRIX=(
   # PRECONDITION: like `arm-tegra-el0` and `arm-tegra-desk`, this leg compiles `arch/aarch64/syscall.rs`,
   # which `include_bytes!`s `target/user_blob.bin`. `ensure_user_blob` (see check_both) supplies it.
   "arm-tegra-orinclick ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,orinclick"
+
+  # ORIN-CONWIN rung 4 armed (appended 2026-08-25) — `orinconwin` gates
+  # `arch/aarch64/display_tegra.rs::orin_conwin` (the rung, its latch, its two ordering-term consts),
+  # the statement appended to `tegra_early_stop`'s terminus line, and `main.rs`'s `tegra_conwin_live`
+  # guard on `jd2_console_pump`'s phase-2 detach. Without a leg the ARMED polarity would be compiled by
+  # NOTHING — the tegra_el0 / simmer_test / xusbfw / smpmark / orindesk / jd1dc / tegradesk / orinclick
+  # shape this matrix has now closed eight times, and the reason the standing law is that a knob's
+  # gates must compile the configuration the knob turns ON.
+  #
+  # WHY IT IS THE FULLY-ARMED CROSS AND NOT THE BARE KNOB. `orinconwin` alone is a real and reachable
+  # configuration (it is the one that takes the §6.1 ordering DECLINE), but both ordering terms are
+  # `cfg!()` and therefore TYPE-CHECKED in every leg whichever way they point — the WXNRO lesson. What
+  # only this leg compiles is the ARMED-AND-ALLOWED body past the ordering gate:
+  # `fbcon::panel_console_face_arm`, `fbcon::panel_console_window_open`, `wm::present_outcome` on the
+  # console row, and `tegra_conwin_live`'s TRUE arm, all reached from `main.rs`'s tegra path with
+  # `orindesk` also in the image so `orin_wm1`'s row and the console row are in one window table.
+  #
+  # WHY IT IS HOSTED ON `arm-tegra-desk`'s LIST. `orinconwin = ["pidesk", "tegra_el0"]` is not
+  # standalone, so hosting it on `arm-tegra` would name a feature set cargo silently widens back to
+  # this one anyway — rung 2's and rung 3's reason, unchanged. `arm-tegra-desk` (rung 1's family leg)
+  # verbatim + `orinconwin,orindesk,orinclick` keeps the leg's line the configuration it compiles.
+  #
+  # WHAT IT EXERCISES THAT `arm-tegra-seam` DOES NOT: `arm-tegra-seam` compiles `pidesk::activate`
+  # called from `main.rs`. This leg compiles the console-window path WITHOUT `activate` — the §5.2
+  # stop-line's whole point — from a THIRD seam, and it is the only leg in the matrix where
+  # `orindesk` and the desktop family are compiled together (`arm-tegra-orindesk` carries neither
+  # `pidesk` nor `tegra_el0`; `arm-tegra-desk`/`-seam` carry neither `orindesk`). `tegradesk` is
+  # deliberately NOT on this leg: DESKSEAM's `table-not-empty` floor refuses when `orindesk` has
+  # already minted a row, so the two seams do not ship together and the matrix should not pretend they
+  # do.
+  #
+  # UNIVERSE SIDE EFFECT: none that moves a mix count. `orinconwin` is a NEW `[features]` entry named
+  # only on an arm-* leg, so `x86_cfg_universe` drops it (its sites are all inside `feature = "tegra"`
+  # items) and the derived mix-leg count is unchanged. Board legs +1; gate +1. `./arroyo check` prints
+  # the live board/mix counts every run — read them there, not here.
+  #
+  # PRECONDITION: like `arm-tegra-el0`, `arm-tegra-desk` and `arm-tegra-seam`, this leg compiles
+  # `arch/aarch64/syscall.rs`, which `include_bytes!`s `target/user_blob.bin`. `ensure_user_blob` (see
+  # check_both) supplies it.
+  "arm-tegra-conwin ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,pidesk,livecon,quarry,orinconwin,orindesk,orinclick"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────
