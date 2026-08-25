@@ -4744,7 +4744,7 @@ static BG_JOBS: spin::Mutex<[Option<BgJob>; 12]> = spin::Mutex::new([None; 12]);
 ///
 /// A `Running` row is never touched: a full table of live jobs is a genuine refusal, and the caller
 /// still kills the pid it just spawned rather than leave it untrackable.
-#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+#[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
 fn bg_jobs_claim(jobs: &mut [Option<BgJob>; 12]) -> Option<usize> {
     use crate::arch::syscall::BgPoll;
     if let Some(i) = jobs.iter().position(|s| s.is_none()) {
