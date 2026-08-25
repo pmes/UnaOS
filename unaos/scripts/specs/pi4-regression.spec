@@ -1603,13 +1603,18 @@ FORBID REFUSING corrupt switch-in: task=
 # ---    placement the orphan-reaper already uses) now. Placement is still decided ONCE, at spawn:
 # ---    EL0 slots stay no-migrate and non-steal-eligible.
 # ---
-# ---    The leg launches 3 parked, thread-free fixtures, records each parent's chosen core, and then
-# ---    kills + reaps all three (table left as found). `distinct >= 2` rather than `== 3`: a
-# ---    load-balanced policy may legally reuse a core, and `== 3` would make a correct scheduler flap.
-# ---    A/B: on the pre-arc code all three launches run from one witness task on one core, so
-# ---    `distinct` is 1 BY CONSTRUCTION and the leg fails on every boot; with CPU_AUTO the rotating
-# ---    tie-break in `pick_cpu` gives 2..=3. See docs/dev/OS/02_KERNEL_CORE/userspace.md BG-SPREAD.
-REQUIRE BGSPREAD: 3 bg launches over [0-9]+ online cores -> cores [0-9]+,[0-9]+,[0-9]+ distinct=[2-9] \(want >= 2\) PASS
+# ---    The leg launches 3 parked, thread-free fixtures back to back, snapshotting every online
+# ---    core's `el0_active` (`pick_cpu`'s PRIMARY key) immediately before each spawn, and REQUIREs
+# ---    each chosen core held the snapshot minimum (argmin membership) — then kills + reaps all
+# ---    three (table left as found). Argmin membership rather than a distinct-core count: boot 12
+# ---    redded `distinct >= 2` while the scheduler was CORRECT (SPINHUNT residue held cores 0/2/3;
+# ---    core 1 was the strict minimum and legally won all three launches). A distinct count claims
+# ---    a load pattern; argmin membership is the placement policy itself, and it stays green under
+# ---    residual load because the argmin set only shrinks with it. The line prints each launch as
+# ---    `chosen-core-load/snapshot-min`. A/B teeth: on the pre-arc `this_cpu()` code, launch 2
+# ---    lands on the launcher's core while it still holds launch 1's committed resident — outside
+# ---    the argmin set BY CONSTRUCTION. See docs/dev/OS/02_KERNEL_CORE/userspace.md BG-SPREAD.
+REQUIRE BGSPREAD: 3 bg launches over [0-9]+ online cores -> cores [0-9]+,[0-9]+,[0-9]+ el0min [0-9]+/[0-9]+,[0-9]+/[0-9]+,[0-9]+/[0-9]+ inmin=3 \(want == 3\) PASS
 FORBID BGSPREAD: .*-> FAIL
 
 # --- VUGSPREAD (PARITY.md §6.6c/§6.7) — the steal floor must SEE two-on-one packing.
