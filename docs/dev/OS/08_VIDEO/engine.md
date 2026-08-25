@@ -16246,6 +16246,13 @@ measurably not running, and **the machine wedged anyway.** Boot 13 could not del
 because its threshold was unreachable (below); boot 16 delivered it, and it is the answer the
 WCDVALVE experiment was built to get.
 
+> **Correction to this paragraph's FOOTING, not to its conclusion (WCDVALVE-LOOP, 2026-08-25).**
+> The `wcd~0%` above is not independent evidence and never was: closing the valve is precisely what
+> stops `verify_window` from running, and `verify_window`'s drop guard is the only writer of
+> `C2_WCD_CYC`, so `wcd` reads 0 *because* the valve is shut. The refutation rests entirely on
+> `state=CLOSED` and `suspended=` — the suppression itself — which is sound, and on those terms it
+> stands. The field now prints `wcd~?` while closed for exactly this reason. See §WCDVALVE-LOOP.
+
 **What the refutation rules out, and what it does not.** It rules out the read-back as the *site* of
 the hang and as its *trigger*. It does not exonerate write-combine pressure generally — a saturated
 drain remains the measured precursor to these holds (`declined_pct` climbing 69 → 98 over ~17 s,
@@ -16342,6 +16349,11 @@ rather than about us: it would mean a stuck BAR store *does* eventually retire.
 > is weaker than a reading. This is a **fifth** instance of the law one subsection up, found while
 > writing this section: appending both to the `[wcser]` rollup — the standing tail-insertion rule,
 > no existing key moves — is one line each and is owed.
+>
+> **PAID 2026-08-25 (WCSER-READER, `acf5d175`).** The rollup now carries `steals=` and `revenants=`
+> ahead of `span=`, loaded and never swapped, and printing a zero rather than omitting one. The
+> statement above stands as the record of what boot 16's claim actually rested on. See
+> §WCSER-READER below, which also records the residual the fix could not close from `wm.rs`.
 
 **What this does NOT do, stated here as it is stated in the commit rather than left to be
 discovered:** the parked core is not recovered, its window is not recovered, and the non-returning
@@ -16697,3 +16709,209 @@ the recovery reads none of them — it reads the gate, the holder and the clock.
 
 It weakens no protection, adds no path to an unarmed build (the call site is an empty inline shim),
 and costs one AP for the rest of the run by design. **Never arm it on bench media.**
+
+### WCSER-PICK — the steal handed the gate to the worst possible core, and it did so by design
+
+WCSER-STEAL declared a dead holder's gate free and let **the next core to ask** win it. Boot 16
+measured the consequence: `[deadman] gate=` names **c7 in 383 of the 492 post-steal samples** — 88 %
+of those naming any core — and c7 is the **device-service core**, carrying `x86_usb_pump` and
+`x86_input_service`. *Finding 1* above establishes the mechanism; what was never stated is that this
+outcome is **structural, not luck**, and therefore fixable at the acquisition site.
+
+`x86_usb_pump`'s loop body composites on the calling core (`wcx::desktop_app_service` →
+`wm::pace_service`, `fbcon::console_service` → `route_present_banded`). Before the steal every one of
+those calls was refused at the `COMP_GATE` compare-exchange in nanoseconds, because the corpse held
+the gate. After the steal they ran full passes on the device core. The whole 5.8x `pmp` step is the
+compositor's cost, charged to the one core the SCHED-X86 placement rules exist to keep it off.
+
+> **A steal that hands a resource to WHOEVER ASKS NEXT hands it to the BUSIEST core, because the
+> busiest core asks most often.** A free-for-all acquisition is not neutral with respect to
+> placement; it is biased against it, in proportion to exactly the property placement exists to
+> protect.
+
+`main.rs` already published the right answer. `smp::publish_sched_split(render, service)` exists to
+keep composite work off the service core, and `smp` exposes `render_cpu()`/`service_cpu()` so callers
+**ask** rather than re-derive. The steal was the one acquisition site in the compositor that never
+asked. It asks now (`1d04b3df`), and no `smp` or `main.rs` change was needed to make it ask.
+
+**The acquirer cannot literally be chosen, and the shape follows from that.** `composite()` runs *on*
+the acquirer and the acquirer then runs the pass, so the only lever available inside `wm` is whether
+*this* caller is admitted to steal. The preference is therefore a **time-staged admission**, and it
+must be bounded: a preferred core that never calls `composite()` would otherwise hold the desktop
+dead forever.
+
+| rung | admits | from | why it exists |
+|---|---|---|---|
+| `unpublished` | the first asker | the 4 s bound | No split published, so no preference exists and there is nothing to wait for. Mirrors `smp::worker_cpu`'s `PlaceTier::Unpublished`. |
+| `render` | `me == render_cpu()` | the 4 s bound | The placement answer. Composite work belongs on the core the split named for it, and the render service's own channel drain lives there. |
+| `pool` | any core that is neither the corpse nor `service_cpu()` | +1 grace | **The rung that fires on the measured fault.** |
+| `any` | anyone, including the service core | +2 graces | The floor. A desktop on the wrong core still beats a dead desktop — WCSER-STEAL's trade, not reversed — and `pick=any` says so on the wire. |
+
+Two details carry most of the value:
+
+* **Rung `render` is skipped, not waited out, when the corpse IS the render core.** That is not an
+  edge case, it is the only case ever measured: `holder=c1` on boots 11, 13, 14, 15 and 16, against
+  `:: SCHED-X86: RENDER on core 1 … ::` on every one of them. An unsatisfiable rung is answered, not
+  slept on — the same discipline `xhci_worker_cpu` applies when it returns `None` instead of
+  degrading. So the measured fault pays one grace, not two.
+* **Liveness of the acquirer needs no test.** It is `meter_current_cpu()`, so "is the chosen core
+  alive?" is answered by the fact that it is asking. The pre-existing `dead != me` term is the whole
+  of it.
+
+`COMP_STEAL_GRACE_MS` is **250 ms**, sized off a measurement rather than guessed: boot 16's
+`dec=f0ffffff` roster saturates its per-core nibble at `f`, so every core but the corpse arrived at
+the gate at least 15 times a second, and 250 ms is at least three arrivals per candidate *at that
+floor*. Worst case the two graces add 500 ms to a 4 s recovery bound — 12.5 % more frozen glass on a
+panel frozen for four seconds.
+
+**What the QEMU gate can and cannot show.** With `UNAOS_WC=1 UNAOS_DEADMAN=1 UNAOS_WEDGEINJ=1`:
+
+```
+:: [wcser] GATE STOLEN from c1 by c5 after 4251ms — the holder was in phase 33 row 897 and had
+   not moved. The acquirer was CHOSEN, not next in line: pick=any render=1 svc=5; desktop resumes
+   on this core, c1 is DEAD and its singleton roles are owed a re-home == tripwire ::
+```
+
+Read that honestly: `pick=any` is **the fallback firing**, because the x86 QEMU gate composites
+almost nothing and the service core is the only core that asks — the same property WEDGEINJ's own
+ledger records. The picker withheld the gate from the pump for the full 250 ms grace and then handed
+it over rather than leaving the desktop dead, which is correct, and the `4251ms` against
+WCSER-STEAL's `4006ms` is the stated cost appearing on the wire. **QEMU cannot demonstrate the `pool`
+rung; metal can, and boot 16's decline roster says it would have.** That is the reading a metal boot
+should be checked against: `pick=pool` with `pmp` holding near its pre-wedge median is the win this
+arc is claiming.
+
+### WCSER-READER — the two counters that had no reader
+
+`COMP_REVENANTS` and `COMP_STEALS` were incremented from the moment WCSER-STEAL landed and appeared
+on **no serial line anywhere in the tree**. The grep is the whole finding: two declarations, two
+`fetch_add`s, two prose mentions in comments, no reader. Boot 16's operator playbook asked Peter to
+watch `COMP_REVENANTS`, and **he could not have seen it however hard he looked.**
+
+`revenants` is not decoration. It counts cores that came back from the dead and correctly declined to
+release a gate a live core now owns, so a nonzero reading is **news about the device, not about us**:
+a stuck BAR1 store eventually *completed*. WCSER-STEAL's safety argument rests on "the parked core
+never comes back" being an **observation** rather than an invariant, and this field is the only thing
+in the tree that could ever contradict it.
+
+Both are now on the `[wcser]` rollup ahead of `span=`, where `exbusy=` went in and for the same
+reason (`acf5d175`):
+
+```
+[wcser] scope=live entered=3 declined=0 reruns=0 declined_pct=0 holder=-1 held_ms=0 exbusy=0
+        steals=0 revenants=0 span=11597ms -> SOLO
+```
+
+**Loaded, never swapped — and not merely because they are boot-cumulative gauges.** `wcser_emit`
+*self-silences* on a period with no compositing. A drained steal counter would therefore be destroyed
+by any silent period following a steal: the steal counted, the rollup declining to print, and the
+swap that never ran leaving the evidence nowhere. Cumulative reading makes the self-silencing
+harmless. The one thing it gives up — which 5 s window a steal fell in — is already carried, with its
+own timestamp, by the `GATE STOLEN == tripwire ::` line.
+
+**A zero is printed, not omitted.** A counter that appears only when nonzero cannot distinguish *"no
+revenants"* from *"the reader is dead"*.
+
+> **The residual, named rather than left to be discovered — and it is a SEVENTH instance of the
+> absent-instrument law.** `[wcser]`'s rollup is paced by **presents, not by passes**: `wcn_tick()`
+> is called only from `present()`, so a desktop that composites without any window presenting emits
+> no rollup at all. The `wedgeinj` gate shows it — one `[wcn] rollup` at 11.7 s and never again,
+> while `[deadman] comp_ms` reads 62–100 ms at `up=41..57`, i.e. passes completing at 10+/s for the
+> whole post-steal half of the run, reported by nothing. So in QEMU the new fields can be shown
+> printing a measured **zero** but not a measured **one**. On metal the reader works — boot 16
+> printed `[wcser] -> SERIAL` rollups continuously for 510 s after its steal at `entered` averaging
+> 261 per 5 s window — so this is QEMU-gate blindness rather than a metal defect. **The
+> structurally stronger home for both counters is the `[deadman]` timer-ISR line**, the one emitter
+> this section has already established survives the wedge; `deadman.rs` was held by a concurrent
+> executor during this arc and the move is owed.
+
+### WCDVALVE-LOOP — the valve measures a quantity that only exists while it is open
+
+Boot 16 flapped the WC-D valve on a ~5.2 s period for the whole pre-wedge session:
+
+```
+[ 40630ms] [wc-d] valve READ util~0% wcd~0% span=51ms close_at=util12%/wcd8% state=CLOSED
+[ 40630ms] [wc-d] valve OPEN resumed suspended=380
+[ 40699ms] [wc-d] valve CLOSED util~7% wcd~12% suspended=1
+```
+
+repeating with `suspended=` 380, 235, 234, 471, 233, 477 — each cycle releasing hundreds of suspended
+admissions and reclosing 43–69 ms later. **The thresholds are not the defect and re-pricing them
+cannot fix it.** Traced through the source rather than inferred from the wire:
+
+1. `wcdvalve_closed() == true` makes `verify_reference` return `None`.
+2. `None` means `wcd_ref` is `None`, so the composite loop's `if let Some(vr)` never calls
+   `verify_window`.
+3. `verify_window`'s `WcdClock` drop guard is the **one and only** `fetch_add` on `C2_WCD_CYC` in the
+   module.
+
+So `wcd` is not measured-zero while CLOSED, it is **unmeasurable**. It is an observable of the
+valve's own open state, not of the load.
+
+**The sharpest statement, and why no threshold fixes it.** Close is `util >= 12 OR wcd >= 8`; reopen
+is `util < 8 AND wcd < 5`. Every closure boot 16 recorded was taken on the `wcd` term alone — `wcd`
+9–29 % while `util` sat at 7–9 %, *below its own 12*. Such a closure has, at the instant it is taken,
+a reopen predicate **already satisfied on every term that remains measurable**, because `util < 8` is
+precisely the condition under which the `util` term declined to close it.
+
+> **A `wcd`-driven closure is self-cancelling by construction.** No pair of numbers changes that: 0
+> is below every positive reopen threshold.
+
+**A second, independent defect set the observed period.** `comp2_emit` swaps both `C2_INSPAN_CYC` and
+`C2_WCD_CYC` to zero and restamps `C2_EPOCH_CYC` every ~5 s; `WCDVALVE_MIN_SPAN_US` then admits a
+judgement 50 ms later — **1 % of the epoch, immediately after a drain that zeroed both numerators.**
+That is why every `valve READ` in the flapping epochs reads `util~0% wcd~0%` at `span=51ms` while the
+same boot's `[comp2]` reports real duty. The reopen was being decided by the rollup drain, which is
+also why the period was the *rollup's* and not the valve's.
+
+**The fix is not to stop the cycle.** A valve that suppresses the very quantity it closes on cannot be
+a level-triggered gate — it can never learn the pressure went away without opening to look. It must
+be a **duty-cycled sampler**: shut for a stated dwell, then a bounded trial open to re-measure. Boot
+16's valve was already doing exactly that, one ~60 ms trial per ~5.2 s, but *by accident*. So the
+cycle is made deliberate rather than removed (`a4e7cd9c`):
+
+* **`wcd` while CLOSED is UNKNOWN.** Dropped from the reopen predicate, where it was a tautology, and
+  printed `wcd~?`, where it was a lie on the wire.
+* **`WCDVALVE_DWELL_US` = 2 s** — the minimum closed dwell, and the load-bearing constant. 30–45x the
+  measured 43–69 ms reclose, and deliberately *not* a divisor or multiple of the ~5 s rollup epoch:
+  the aliasing is what made the old behaviour read as a mysterious 5.2 s cycle, so the two cadences
+  are now tellable apart.
+* **`WCDVALVE_REOPEN_SPAN_US` = 1 s** — a reopen may only be judged on a span old enough to *be* a
+  sample.
+* **`WCDVALVE_WCD_OPEN_PCT` = 5 is deleted**, not kept. A reopen threshold on a quantity that is
+  structurally 0 whenever the valve is shut is not a conservative setting; it is a term that is
+  unconditionally true. It never governed anything and read on the wire as if it did.
+* **The close path is untouched.** Same 50 ms floor, same `util >= 12 OR wcd >= 8`. Both floors err
+  the same way — toward the valve being **shut** — because a shut valve defers a verdict and never
+  drops one.
+
+**The control this must not break, and why it does not.** After ~77.5 s boot 16's valve stayed closed
+through the wedge, which is the experimental refutation of the read-back theory, and a future boot
+must still be able to demonstrate that. It can: that boot read `util~98%` and `util~79%` across the
+wedge, an order of magnitude above `WCDVALVE_OPEN_PCT`, so the reopen fails on the `util` term with
+or without this change, and a dwell can only ever **extend** a closure. The QEMU gate demonstrates
+the same shape directly — `util~68%`, valve closes at 175 ms, never reopens.
+
+**What it costs.** The valve can now reopen *mid-epoch* where before it could only reopen at an epoch
+top. That is the entire cost, bounded by construction: at most one trial per dwell, so the trial rate
+goes from ~1 per 5.2 s to ~1 per ~2.06 s and admitted read-back duty roughly 2.4x, ~1.2 % of wall
+clock to ~2.9 %. Episodes get shorter, so `suspended=` per episode falls below boot 16's 233–477
+range; a harvest keyed to those magnitudes reads differently and is meant to.
+
+**What QEMU cannot show, stated so no one reads the green as more than it is.** QEMU cannot reproduce
+the oscillation: it needs `util` in the 7–9 % band that only a metal desktop produces, and QEMU's
+composite duty is ~68 %. It also cannot print `wcd~?`, because the `[comp2]` epoch only advances from
+the `[wcn]` pump, which needs a window to present — the same blindness §WCSER-READER records. Both new
+witnesses were confirmed present in the artifact by `strings` instead.
+
+> **A standing red on the `wcdvalve` knob, established by A/B and NOT caused by this arc.**
+> `UNAOS_WC=1 UNAOS_WCDVALVE=1 ./arroyo test` fails `[dmgovlp] … adopt_stretch=0/4 -> FAIL`; the
+> same run without the knob reads `adopt_stretch=4/4 -> PASS`. It reproduces identically at the arc
+> baseline `f8210a6a` (diff snapshotted, `git apply -R`, re-run, re-applied — never stashed), so it
+> predates WCDVALVE-LOOP. Mechanism, partially known: arming the valve suppresses `verify_window`
+> from 175 ms onward and the CURSTICK stretch stops carrying, but `CUR3_TAKEN` moves in
+> `note_cursor_overlay` from `stage_window`, so the coupling is **indirect** and is its own arc. Two
+> acceptable outcomes there: the fixture is legitimately incompatible with a suppressed read-back
+> and should SKIP with a stated reason rather than FAIL, or the valve is suppressing something the
+> compositor's correctness depends on — which would be far more interesting. Decide by evidence, not
+> by relaxing the threshold.
