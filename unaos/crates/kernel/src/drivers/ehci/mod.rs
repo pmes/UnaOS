@@ -16,7 +16,15 @@
 //! async schedule with ONE reusable control QH for synchronous enumeration, a periodic frame
 //! list with one interrupt QH per HID endpoint, and a main-loop `service_ehci_hid()` poll that
 //! feeds boot reports through the same decode idiom (and scancode table) as the xHCI HID path.
-//! No interrupts: no USBINTR write, no IDT vector, no MSI.
+//! ISRARM (2026-08-22) — **that poll is no longer the only thing that re-arms an endpoint, and this
+//! line used to say the opposite.** It read *"No interrupts: no USBINTR write, no IDT vector, no
+//! MSI"*, and all three are now false by design: `USBINTR.USBINT` is unmasked, IDT vector
+//! `EHCI_MSI_VECTOR` is registered, and each controller's MSI is routed to the local APIC. The
+//! driver still takes no OTHER interrupt — error, port-change and frame-rollover causes stay masked
+//! and are handled by the poll exactly as before. The polled pass remains the LOAD-BEARING path and
+//! the sole fallback: on a controller with no MSI capability, or a boot where the vector is never
+//! delivered, nothing about this driver's behaviour changes and an `ISRARM IRQ DEAD` line says so.
+//! See the ISRARM block for the defect, the measurement, and why a deeper qTD ring was refused.
 //!
 //! Topology fork (the M1 evidence gate): the first GET_DESCRIPTOR on the root-port device
 //! decides on a serial line whether it is the integrated Rate-Matching Hub (bDeviceClass 0x09 →
@@ -73,6 +81,10 @@ use super::ehci_scout::{
 };
 use crate::arch::pci::{read_config_16, read_config_32, write_config_32};
 use alloc::vec::Vec;
+// ISRARM: the completion-interrupt path's whole state is atomics — see the ISRARM block. Imported
+// rather than spelled out per use because the ISR touches a dozen of them and the full paths would
+// bury the ordering annotations, which are the part a reader has to check.
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use qh::*;
 use spin::Mutex;
 
@@ -126,17 +138,32 @@ struct Target {
     hub_port: u8,
 }
 
-/// One armed HID interrupt-IN endpoint: its periodic QH, single re-armed qTD, report buffer,
-/// and the software-tracked data toggle (QH runs DTC=1 so the toggle is explicit here, never
-/// hidden controller state).
+/// One armed HID interrupt-IN endpoint: its periodic QH, single re-armed qTD and report buffer.
+///
+/// ⚠ **"Single re-armed qTD" is a statement about the ENDPOINT'S DEPTH, not an invitation to make it
+/// deeper.** A chained ring of qTDs is unbuildable on this silicon — `Controller::overlay_mode` is
+/// true on both of the rMBP's EHCI functions, the controller HSEs on the qTD fetch, and in that mode
+/// the qTD below is not even visible to it. The dark window this shape produces is closed by
+/// re-arming from the completion INTERRUPT instead; see the ISRARM block for the measurement, the
+/// refusal and the design.
+///
+/// The data toggle is NOT here. It lives in `ISR_EPS[isr_slot].toggle`, because the ISR and the
+/// polled pass both re-arm and a toggle with two owners is a toggle with none.
 struct IntEp {
     qh: *mut Qh,
     qtd: *mut Qtd,
-    qtd_phys: u64,
     buf: *mut u8,
-    buf_phys: u64,
     mps: u16,
-    toggle: bool,
+    // ISRARM: `qtd_phys` and `buf_phys` are GONE from here. They were only ever read by the re-arm,
+    // and the re-arm now lives in `isr_rearm` off `ISR_EPS[isr_slot]` — where the ISR can reach it
+    // without the `EHCI_HID` lock. Two copies of a DMA address that must agree with what the
+    // controller was programmed with is exactly the kind of second truth this driver keeps
+    // eliminating; the registry is the one that the hardware path reads, so it is the one that
+    // survives. (`qh`, `qtd` and `buf` stay: the decoders and the KBDWIT probe read them directly.)
+    /// ISRARM: this endpoint's index into `ISR_EPS` / `ISR_RINGS`. DERIVED at arm time as
+    /// `idx * MAX_INT_EPS + int_next`, so it is unique by construction and cannot fail to be
+    /// allocated — see `ISR_MAX_EPS`.
+    isr_slot: usize,
     is_kbd: bool,
     is_rel_mouse: bool,
     /// EHCI-4 M2: Some for a report-protocol pointer (the trackpad path) — the field map parsed
@@ -206,11 +233,6 @@ struct IntEp {
     /// button, or idle keep-alive). The re-press recovery below reads the SILENCE between reports,
     /// so it must be stamped by every report, not only by button ones. 0 = no report yet.
     last_report_ms: u64,
-    /// EHCIDARK — `arch::ms()` at the last service pass that EXAMINED this endpoint, whatever it
-    /// found. The denominator of the whole census: it is the only thing in the driver that knows how
-    /// long the endpoint went un-re-armed, because a re-arm can happen nowhere else but a pass.
-    /// 0 = never polled.
-    dark_poll_ms: u64,
     /// EHCIDARK — the SMALLEST service-pass gap ever observed to end in a completion on this
     /// endpoint, i.e. the device's own report cadence, self-calibrated on the passes that kept up.
     /// `u32::MAX` until the first completion.
@@ -12287,6 +12309,11 @@ impl Controller {
             return false;
         };
         self.int_next += 1;
+        // ISRARM: this endpoint's registry index, DERIVED rather than allocated. `int_next` was just
+        // bounds-checked against `MAX_INT_EPS` above and `idx` against `MAX_CONTROLLERS` at
+        // construction, so this is unique and in range by construction — which is what lets the
+        // publish below have no failure path for the ISR to carry.
+        let isr_slot = self.idx * MAX_INT_EPS + (self.int_next - 1);
 
         // MT-INVESTIGATION (IVY) — how many bytes ONE armed transfer may accept.
         //
@@ -12371,14 +12398,23 @@ impl Controller {
         // per endpoint on the arming path; `None` is carried honestly rather than defaulted to 0.
         #[cfg(feature = "kbdwit")]
         let kbdwit_fr0 = mmio_read32(self.op + KBDWIT_OP_FRINDEX);
+        // ISRARM: publish HERE — after the QH is linked, after PSE is on, after the first transfer
+        // is armed. That order is load-bearing in one direction only: the ISR may not see this
+        // endpoint before the controller is already executing it, because the very first thing it
+        // would do is read a token that does not yet describe a real transfer. (`USBINTR` is still
+        // masked at this point regardless — `isr_arm_controller` runs at the end of `init` — so the
+        // publish cannot be raced by an interrupt during enumeration at all. Both guards are kept:
+        // one is about this function, the other about the boot sequence, and they fail differently.)
+        let now_armed_ms = crate::arch::ms();
+        isr_publish_ep(
+            isr_slot, qh, qtd, qtd_phys, buf, buf_phys, rx_total, self.overlay_mode, now_armed_ms,
+        );
         self.int_eps.push(IntEp {
             qh,
             qtd,
-            qtd_phys,
             buf,
-            buf_phys,
             mps,
-            toggle: false,
+            isr_slot,
             is_kbd,
             is_rel_mouse: is_rel,
             layout,
@@ -12398,10 +12434,12 @@ impl Controller {
             last_report_ms: 0,
             // EHCIDARK — the census clock starts at the moment the endpoint becomes armed, for the
             // same reason KBDWIT's silence clock does: the interval it measures is "armed and
-            // expected to complete", never "still being set up". The cadence starts UNKNOWN
-            // (`u32::MAX`) so the first completion cannot manufacture a window out of the arm-to-
-            // first-report gap, which is a property of the operator's hand and not of any stall.
-            dark_poll_ms: crate::arch::ms(),
+            // expected to complete", never "still being set up". ISRARM moved that clock itself into
+            // `ISR_EPS[isr_slot].seen_ms` (seeded by `isr_publish_ep` from the same `now_armed_ms`),
+            // because with two re-armers the gap that matters is "since ANYONE last looked". The
+            // cadence still starts UNKNOWN (`u32::MAX`) so the first completion cannot manufacture a
+            // window out of the arm-to-first-report gap, which is a property of the operator's hand
+            // and not of any stall.
             dark_cad_ms: u32::MAX,
             dark_windows: 0,
             dark_ms: 0,
@@ -12474,30 +12512,29 @@ impl Controller {
     /// path's, unchanged; the QH is still linked into the frame list and PSE is still on, so
     /// nothing about the schedule needs touching.
     unsafe fn rearm_after_halt_clear(&mut self, ep_i: usize) {
-        let om = self.overlay_mode;
-        let e = &mut self.int_eps[ep_i];
-        e.toggle = false;
-        // MT-INVESTIGATION (IVY): re-arm for the SAME total the endpoint was armed with — a
-        // `#[cfg]` pair for the identical reason the service-loop re-arm carries one.
-        #[cfg(not(feature = "mtraw"))]
-        let rx = e.mps as u32;
-        #[cfg(feature = "mtraw")]
-        let rx = e.rx_total;
-        if om {
-            (*e.qh).overlay[0] = PTR_TERMINATE;
-            (*e.qh).overlay[1] = PTR_TERMINATE;
-            (*e.qh).overlay[3] = e.buf_phys as u32;
-            (*e.qh).overlay[4] = 0;
-            core::ptr::write_volatile(
-                &mut (*e.qh).overlay[2],
-                QTD_ACTIVE | QTD_CERR3 | (rx << QTD_TOTAL_SHIFT) | QTD_PID_IN | QTD_IOC,
-            );
-        } else {
-            write_qtd(e.qtd, PTR_TERMINATE, QTD_PID_IN | QTD_IOC, rx, e.buf_phys);
-            (*e.qh).overlay[1] = PTR_TERMINATE;
-            core::ptr::write_volatile(&mut (*e.qh).overlay[2], 0);
-            core::ptr::write_volatile(&mut (*e.qh).overlay[0], e.qtd_phys as u32);
+        let slot = self.int_eps[ep_i].isr_slot;
+        // ISRARM: take the claim. The ISR refuses a halted token outright, so it is not competing
+        // for this endpoint right now — but the instant the token below goes Active it will be, and
+        // the claim is what makes the transition atomic against it rather than nearly so. Try-only,
+        // like every other claim in this driver: if the ISR somehow holds it, skip the re-arm and
+        // let the next service pass find the endpoint still halted and retire it, which is the
+        // pre-KBDFLAP behaviour and not a new failure mode.
+        if !isr_claim_poll(slot) {
+            POLL_CONTENDED.fetch_add(1, Ordering::Relaxed);
+            return;
         }
+        // Re-arm DATA0 on the SHARED toggle. `ClearFeature(ENDPOINT_HALT)` resets the DEVICE-side
+        // toggle to DATA0 (USB 2.0 §9.4.5), so both re-armers have to agree on it here or the very
+        // first packet after the recovery is discarded by the device — silently, which is the same
+        // "armed and silent" reading this whole endpoint path has been burned by before.
+        //
+        // Seeded to DATA1 because `isr_rearm` FLIPS before it arms: one flip from 1 lands on DATA0.
+        // Going through it rather than open-coding the arm is deliberate — the overlay-direct /
+        // qTD-chain fork exists once in this driver, and a private copy here is exactly how the
+        // toggle came to have two owners in the first place.
+        ISR_EPS[slot].toggle.store(1, Ordering::Relaxed);
+        isr_rearm(&ISR_EPS[slot]);
+        isr_release_poll(slot);
     }
 
     /// Main-loop poll: ack USBSTS, then for each armed endpoint consume a completed report,
@@ -12540,6 +12577,13 @@ impl Controller {
         // the pass's own period, so a per-endpoint read would only add jitter to the quantity being
         // measured (and cost an MMIO/TSC read per armed endpoint on a ~1 kHz loop).
         let now_ms = crate::arch::ms();
+        // ISRARM: the pass's landing buffer for a hand-off report. One per PASS, not one per
+        // endpoint — the ring is drained to exhaustion before the loop moves on, so a single
+        // scratch is reused and never holds two live reports at once. On the stack and 64 bytes, so
+        // it costs the pass nothing and, unlike the endpoint's own DMA buffer, the controller
+        // cannot write to it while the decoders below are reading it. That property is the reason
+        // the ISR can re-arm before the pass has decoded anything.
+        let mut isr_scratch = [0u8; ISR_SLOT_LEN];
         for (ep_i, e) in self.int_eps.iter_mut().enumerate() {
             if e.dead {
                 // KBDWIT-LATCH: a retired endpoint is no longer SERVICED, but it must still be able
@@ -12570,448 +12614,529 @@ impl Controller {
                 }
                 continue;
             }
-            // EHCIDARK — the pass gap for THIS endpoint, taken before anything else can `continue`
-            // past it. Every exit below leaves `dark_poll_ms` describing this pass, so the next gap
-            // is measured against a real visit rather than against the last visit that happened to
-            // find a report.
-            let dark_gap_ms = now_ms.wrapping_sub(e.dark_poll_ms);
-            e.dark_poll_ms = now_ms;
-            let tok = if om {
-                core::ptr::read_volatile(&(*e.qh).overlay[2])
-            } else {
-                core::ptr::read_volatile(&(*e.qtd).token)
-            };
-            if tok & QTD_ACTIVE != 0 {
-                // KBDWIT-2: is the CONTROLLER actually walking to this queue head? Two volatile
-                // reads of words only it writes (split progress — see `IntEp::kbdwit_walks`),
-                // compared against the previous poll. This runs on every pass, before and after the
-                // deadline dump, because the dump's `sched=` verdict and the `SILENCE-BROKE` line's
-                // rate both read it. Read-only: nothing here writes a controller-visible word.
-                #[cfg(feature = "kbdwit")]
-                {
-                    let split = ((core::ptr::read_volatile(&(*e.qh).overlay[4]) as u64) << 32)
-                        | core::ptr::read_volatile(&(*e.qh).overlay[5]) as u64;
-                    e.kbdwit_polls = e.kbdwit_polls.saturating_add(1);
-                    e.kbdwit_split_or |= split;
-                    if split != e.kbdwit_split_prev {
-                        e.kbdwit_walks = e.kbdwit_walks.saturating_add(1);
-                        e.kbdwit_split_prev = split;
-                    }
-                }
-                // KBDWIT: still armed, nothing came back this pass — the only state from which the
-                // s58 silence is observable. The probe self-bounds (one dump per endpoint per boot)
-                // and returns after a single bool test once it has fired or before its deadline.
-                #[cfg(feature = "kbdwit")]
-                kbdwit_probe(e, idx, om, kw_op, kw_fl, tok);
-                continue;
-            }
-            // KBDWIT: the qTD retired — a COMPLETION, whether or not it carried report bytes.
-            // Stamped here, above every decoder, so no report layout, length gate or `dead` path
-            // can influence whether this endpoint counts as alive.
-            #[cfg(feature = "kbdwit")]
-            {
-                e.kbdwit_last_ms = crate::arch::ms();
-            }
-            // DEADMAN — `[deadman] hid=`. Charged at the SAME point and for the same reason as the
-            // KBDWIT stamp above: above every decoder, length gate and `dead` path, and before any
-            // `pal::EVENT_QUEUE` push, so no report layout can influence whether a completion counts.
+            // ══════════════════════════════════════════════════════════════════════════════════
+            // ISRARM — a pass now has TWO sources for a report, and the order between them is the
+            // correctness of the whole arc.
             //
-            // ⚠ This is a qTD RETIREMENT, not an interrupt. The brief this was built to asked for an
-            // IRQ-side counter; on this machine that site does not exist, because this driver takes
-            // no interrupts at all (see the module header, line 19: "No interrupts: no USBINTR write,
-            // no IDT vector, no MSI"). The gap is not papered over — it is made readable by pairing
-            // this with `pmp=` (poll passes), so `hid=0` can be told apart from "nobody looked".
-            // See the HID-IN GAP section of `crate::deadman`.
-            crate::deadman::note_hid_completion();
-            if tok & QTD_ERR_MASK != 0 {
-                // KBDWIT-2: the silence ended, but it ended in a HALT — see
-                // `kbdwit_note_silence_end` for why this exit gets its own verdict word instead of
-                // sharing `SILENCE-BROKE` with the clean one below.
-                //
-                // KBDWIT-LATCH: routed through `kbdwit_note_halt` rather than straight at
-                // `kbdwit_note_silence_end`, because that function's first act is to return when
-                // the deadline dump has not fired — and on boot 10 it had not, and could not have:
-                // the halt landed at 2444 ms and the earliest service pass that could have reached
-                // the deadline was 15219 ms. A halt that BEATS the deadline is precisely the case
-                // KBDWIT exists to catch, and it was the one case KBDWIT could not say a word
-                // about. `kbdwit_note_halt` keeps the post-deadline exit byte-identical and adds
-                // the pre-deadline one.
-                #[cfg(feature = "kbdwit")]
-                kbdwit_note_halt(e, idx, tok);
-                // KBDFLAP: WHICH endpoint, decided from the QH's OWN `ep_chars` — the word the
-                // controller is executing — rather than from a software copy, for the same reason
-                // KBDWIT decodes its identity that way. Boot 10's version of this line carried a
-                // bare token and was therefore indistinguishable from the two BT-proxy halts that
-                // print on every boot; see the KBDFLAP section comment for the full derivation.
-                let h_chars = core::ptr::read_volatile(&(*e.qh).ep_chars);
-                let (h_addr, h_ep) = (h_chars & 0x7F, (h_chars >> 8) & 0xF);
-                let (h_class, h_recoverable) = halt_class(tok);
-                // Recover only the class §9.4.5 actually answers, only while budget remains, and
-                // only if the deferred-clear array has room. `n_clr` can reach `MAX_INT_EPS` only
-                // if every armed endpoint stalls in the SAME pass, in which case the last one is
-                // retired rather than dropped in silence — the `-> retire` word says which.
-                let h_clear = h_recoverable
-                    && e.halt_clears < HALT_CLEARS_MAX
-                    && n_clr < clear_halts.len();
-                serial_println!(
-                    ":: EHCI-HID: [{}] STOP-NOTE interrupt endpoint halted addr={} ep=IN{} kind={} mps={} class={} tok={:#010x} cerr={} halted={} xact={} babble={} dbuf={} missed={} err={} reports={} clears={}/{} -> {} == witness ::",
-                    idx, h_addr, h_ep, int_ep_kind(e), e.mps, h_class, tok,
-                    (tok >> 10) & 0x3,
-                    (tok >> 6) & 1, (tok >> 3) & 1, (tok >> 4) & 1,
-                    (tok >> 5) & 1, (tok >> 2) & 1, tok & 1,
-                    e.reports, e.halt_clears, HALT_CLEARS_MAX,
-                    if h_clear { "clear-halt" } else { "retire" }
-                );
-                if h_clear {
-                    // Deferred, not sent here: the control transfer needs `&mut self` and this loop
-                    // holds an exclusive borrow of `int_eps`. The endpoint is deliberately NOT
-                    // marked dead and its held keys are NOT flushed — `flush_held_releases` also
-                    // bumps `pal::note_keyboard_detached()`, and this keyboard is not detached. If
-                    // the clear fails, the post-loop stage does both, so nothing is skipped, only
-                    // deferred by one pass of the ~1 kHz poll.
-                    clear_halts[n_clr] = Some((ep_i, e.kbd_target, h_ep as u8));
-                    n_clr += 1;
-                    e.halt_clears += 1;
-                    continue;
-                }
-                e.dead = true;
-                // EHCI-KEYUP F2: the endpoint is retired for the rest of the boot — this loop
-                // `continue`s past a `dead` entry forever after — so any key down at this instant
-                // would NEVER receive its release. Flush them. See `flush_held_releases` for why
-                // this is the one asymmetric case the poll-gap argument does not cover, and why
-                // ring 3 cannot recover from it on its own.
-                flush_held_releases(e, idx);
-                continue;
-            }
-            // KBDWIT-2: a clean retirement — the endpoint answered. THE decision-table entry.
-            #[cfg(feature = "kbdwit")]
-            kbdwit_note_silence_end(e, idx, "SILENCE-BROKE", tok);
-            // MT-INVESTIGATION (IVY): bytes actually received = armed total minus the residue the
-            // controller left in Total Bytes To Transfer. Knob-off the armed total IS `e.mps`, so
-            // the expression is unchanged; knob-on, on the vendor-multitouch endpoint, it is the
-            // buffer size and the difference is the true length of a multi-packet raw frame.
-            // (Written as a `#[cfg]` PAIR rather than one hoisted local because hoisting would
-            // keep the value live across the decode block and cost 16 bytes of `.text` knob-off —
-            // this arc's default media must stay byte-identical.)
-            #[cfg(not(feature = "mtraw"))]
-            let len = (e.mps as u32).saturating_sub((tok >> QTD_TOTAL_SHIFT) & 0x7FFF) as usize;
-            #[cfg(feature = "mtraw")]
-            let len = e.rx_total.saturating_sub((tok >> QTD_TOTAL_SHIFT) & 0x7FFF) as usize;
-            if len > 0 {
-                // ══════════════════════════════════════════════════════════════════════════════
-                // EHCIDARK — **the reports this endpoint could not accept, counted.**
-                //
-                // The endpoint holds exactly ONE report and cannot hold more on this silicon: `mps`
-                // is 64 against 8-byte Report ID 0x02 reports, so every report is a SHORT packet and
-                // retires the qTD. (That is also why the multi-packet arming the `mtraw` path uses is
-                // unavailable here — the controller stops at the first short packet whatever `total`
-                // says.) From that instant until a service pass rewrites the overlay the endpoint is
-                // DARK, and everything the pad sends is dropped ON THE WIRE. Nothing downstream can
-                // see it: `EVQ_DROP_PTR` counts a full ring, `pointer_motion_coalesced` counts a slow
-                // drain, and both of those are about reports that at least reached memory. Until this
-                // block there was no term anywhere in the driver for the ones that never did — which
-                // is the difference between "the pointer feels bad" and a number.
-                //
-                // The arithmetic is deliberately conservative in the only direction that could
-                // mislead. `dark_gap_ms` is this endpoint's whole service-pass gap, and the report we
-                // are holding landed SOMEWHERE inside it — so the dark stretch is AT MOST that gap
-                // and the reports the device could have generated within it at most `gap / cadence`,
-                // of which we got one. A pass that finds the qTD still ACTIVE contributes nothing at
-                // all, so a still hand — the ordinary case, a change-only pad reporting nothing —
-                // can never inflate this.
-                //
-                // `dark_cad_ms` is learned from the passes that KEPT UP (the running minimum gap),
-                // so the estimate calibrates itself against this device on this boot instead of
-                // trusting a `bInterval` that describes neither the host's poll rate nor the hand's.
-                // It is updated AFTER the window test so a pass cannot be judged against a cadence
-                // it is itself establishing.
-                if e.dark_cad_ms != u32::MAX && e.dark_cad_ms > 0 {
-                    let slots = (dark_gap_ms / e.dark_cad_ms as u64) as u32;
-                    if slots > 1 {
-                        e.dark_windows = e.dark_windows.saturating_add(1);
-                        e.dark_ms = e.dark_ms.saturating_add(dark_gap_ms);
-                        e.dark_max_ms = e.dark_max_ms.max(dark_gap_ms.min(u32::MAX as u64) as u32);
-                        e.dark_missed = e.dark_missed.saturating_add((slots - 1) as u64);
-                    }
-                }
-                // Saturate rather than cast: a gap past `u32::MAX` ms is unreachable in a boot, but a
-                // TRUNCATING cast is the one way it could turn into a small number and drive the
-                // cadence — and therefore every later `missed<=` — from a value that never happened.
-                let gap_u32 = dark_gap_ms.min(u32::MAX as u64) as u32;
-                if gap_u32 > 0 && gap_u32 < e.dark_cad_ms {
-                    e.dark_cad_ms = gap_u32;
-                }
-                // The rollup. Silent on a healthy endpoint by construction — it needs the census to
-                // have MOVED since the last line — and rate-limited to one line per
-                // `EHCIDARK_ROLLUP_MS` when it has, because an instrument built to shorten a witness
-                // burst must not become one. Identity is decoded from the QH's own `ep_chars`, the
-                // word the controller is executing, for the reason KBDFLAP's STOP-NOTE line decodes
-                // it that way: a census that named the wrong endpoint would be worse than none.
-                if e.dark_missed != e.dark_missed_logged
-                    && now_ms.wrapping_sub(e.dark_log_ms) >= EHCIDARK_ROLLUP_MS
-                {
-                    e.dark_log_ms = now_ms;
-                    e.dark_missed_logged = e.dark_missed;
-                    let chars = core::ptr::read_volatile(&(*e.qh).ep_chars);
-                    serial_println!(
-                        ":: EHCI-HID: [{}] EHCIDARK addr={} ep=IN{} kind={} reports={} cad={}ms windows={} dark={}ms max={}ms missed<={} == witness ::",
-                        idx, chars & 0x7F, (chars >> 8) & 0xF, int_ep_kind(e),
-                        e.reports.wrapping_add(1), e.dark_cad_ms, e.dark_windows,
-                        e.dark_ms, e.dark_max_ms, e.dark_missed
-                    );
-                }
-                // ══════════════════════════════════════════════════════════════════════════════
-                // Boot reports are ≤ 8 B; a parsed report-pointer report can be longer (the
-                // buffer is 64 B), so cap by kind.
-                // MT-INVESTIGATION: knob-on the layout cap becomes the (grown) buffer length —
-                // still a hard cap, never larger than the allocation, so the slice below can
-                // never run off the buffer even if the controller reported nonsense residue.
-                #[cfg(not(feature = "mtraw"))]
-                let cap = if e.layout.is_some() { len.min(64) } else { len.min(8) };
-                #[cfg(feature = "mtraw")]
-                let cap = if e.layout.is_some() { len.min(INT_BUF_LEN) } else { len.min(8) };
-                let report = core::slice::from_raw_parts(e.buf, cap);
-                e.reports = e.reports.wrapping_add(1);
-                if let Some(l) = e.layout {
-                    if l.vendor_mt {
-                        // M1 (RMBP-FIX, 2026-07-18): the raw-report dump exists ONLY to capture the
-                        // opaque stream's byte layout, and that characterization is COMPLETE. Bound it
-                        // hard — usbdebug builds only, first 4 reports total per device — so it can
-                        // never flood the framebuffer console (~100+ heap-allocating lines/sec under
-                        // touch, the "machine appears hung" defect). Its `String` alloc is off the
-                        // default hot path ENTIRELY: on a GUI/default build this whole `#[cfg]` block
-                        // (and `dump_vendor_report`) is compiled out — zero dumps, zero allocation.
-                        #[cfg(feature = "usbdebug")]
-                        if e.reports <= 4 {
-                            dump_vendor_report(idx, e.reports, report);
+            //   1. The hand-off ring, drained OLDEST FIRST. These are completions the ISR already
+            //      lifted out of the endpoint and re-armed behind.
+            //   2. The endpoint itself, exactly as before this arc — the fallback, and the only
+            //      source that exists at all on a boot where the vector never fires.
+            //
+            // Ring first is not a preference. Everything in the ring is strictly older than
+            // anything still sitting in the endpoint, so draining it first is what keeps a delta
+            // stream monotonic across two producers. Trackpad reports are deltas; delivering them
+            // out of order is worse than dropping them.
+            //
+            // The endpoint yields at most one report per pass — it holds exactly one — so the loop
+            // terminates on the pass arm whatever the ring did.
+            // ══════════════════════════════════════════════════════════════════════════════════
+            // ISRARM: the drain is BOUNDED, and the bound is not decoration. The hand-off ring has
+            // a producer that runs at interrupt priority on a core the pass does not control, so
+            // "drain until empty" is a loop whose exit condition another agent can keep pushing
+            // away. In practice it cannot — the ISR only produces on a real completion, a few per
+            // millisecond at most, and the pass empties a slot in microseconds — but "in practice"
+            // is not a termination proof, and this loop runs under the `EHCI_HID` mutex that the
+            // whole input path waits on.
+            //
+            // THE PROOF, explicitly: every iteration takes exactly one of two arms.
+            //   * The hand-off arm runs only while `drained < ISR_RING` and increments `drained`
+            //     every time it runs, so it can be taken at most `ISR_RING` (8) times — and the
+            //     counter is local to this endpoint's loop, so the ISR cannot reset or slow it
+            //     however fast it produces.
+            //   * The pass arm ends in `break` on EVERY path through it (claim lost, still ACTIVE,
+            //     halted-recoverable, halted-retire, and the normal re-arm at the foot), so it is
+            //     taken at most once.
+            // The loop therefore executes at most ISR_RING + 1 = 9 iterations per endpoint per
+            // pass, with no dependence on the producer's rate. That is the bound.
+            //
+            // Anything beyond it is not lost: it stays in the ring and the next pass, ~1 ms later,
+            // takes it, which is also exactly the state `depth_max=` and `ringfull=` report on.
+            let mut drained = 0usize;
+            loop {
+                // THE BOUND, in one statement so it cannot be missed: once `drained` reaches
+                // `ISR_RING` the hand-off ring stops being consulted AT ALL, whatever it still
+                // holds. Hoisted out of the `if let` scrutinee below rather than nested inside it
+                // because the termination argument is the thing a reader has to check, and it
+                // should not have to be recovered from a parenthesised expression.
+                let handoff = if drained < ISR_RING {
+                    isr_take(e.isr_slot, &mut isr_scratch)
+                } else {
+                    None
+                };
+                // `_at_ms` carries the leading underscore because KBDWIT is its only consumer and
+                // KBDWIT is knob-gated: on a default build the binding is genuinely unused, and a name
+                // that says so is better than an `#[allow]` that would also hide a real one later.
+                let (rpt_ptr, len, dark_gap_ms, _at_ms, from_isr) =
+                    if let Some((n, slot_ms, gap)) = handoff {
+                        drained += 1;
+                        (isr_scratch.as_ptr(), n, gap, slot_ms, true)
+                    } else {
+                        // ISRARM: claim the endpoint against the ISR for the direct read. Try-only — a pass
+                        // that loses does NOT wait: the ISR is inside this endpoint right now, and whatever it
+                        // finds lands in the hand-off ring for the next pass. The cost of losing is one pass of
+                        // latency on one endpoint; the cost of waiting would be an unbounded hold of `EHCI_HID`
+                        // taken from a path that already holds it across a `hw_wait_budget()` control transfer.
+                        if !isr_claim_poll(e.isr_slot) {
+                            POLL_CONTENDED.fetch_add(1, Ordering::Relaxed);
+                            break;
                         }
-                        // MT-INVESTIGATION (IVY, `mtraw` only): the capture window. Hex-dump at
-                        // most `MT_RAW_DUMP_MAX` reports of at most `MT_RAW_DUMP_BYTES` bytes each
-                        // — bounded twice over, because the FTDI console is a 64 KiB drop-oldest
-                        // ring and an unbounded dump evicts the boot log that gives it context.
-                        // The pointer decode below still runs on these reports: if the raw mode
-                        // never engaged they are ordinary 0x02 relative reports and the cursor
-                        // keeps moving; if it DID engage, `decode_trackpad_rel`'s length + ID gate
-                        // rejects them and nothing is pushed. Either way no clamp is weakened.
+                        // EHCIDARK — the gap for THIS endpoint, taken before anything else can leave the loop.
+                        // The stamp lives in `ISR_EPS[..].seen_ms` and is written by BOTH re-armers, so the gap
+                        // is "time since anyone last looked" rather than "time since the last pass" — which is
+                        // the only reading that stays honest once completions are being consumed off the
+                        // interrupt. Every exit below has already stamped, so the next gap is measured against a
+                        // real visit rather than against the last visit that happened to find a report.
+                        let dark_gap_ms = isr_mark_seen(e.isr_slot, now_ms);
+                        let tok = if om {
+                            core::ptr::read_volatile(&(*e.qh).overlay[2])
+                        } else {
+                            core::ptr::read_volatile(&(*e.qtd).token)
+                        };
+                        if tok & QTD_ACTIVE != 0 {
+                            isr_release_poll(e.isr_slot);
+                            // KBDWIT-2: is the CONTROLLER actually walking to this queue head? Two volatile
+                            // reads of words only it writes (split progress — see `IntEp::kbdwit_walks`),
+                            // compared against the previous poll. This runs on every pass, before and after the
+                            // deadline dump, because the dump's `sched=` verdict and the `SILENCE-BROKE` line's
+                            // rate both read it. Read-only: nothing here writes a controller-visible word.
+                            #[cfg(feature = "kbdwit")]
+                            {
+                                let split = ((core::ptr::read_volatile(&(*e.qh).overlay[4]) as u64) << 32)
+                                    | core::ptr::read_volatile(&(*e.qh).overlay[5]) as u64;
+                                e.kbdwit_polls = e.kbdwit_polls.saturating_add(1);
+                                e.kbdwit_split_or |= split;
+                                if split != e.kbdwit_split_prev {
+                                    e.kbdwit_walks = e.kbdwit_walks.saturating_add(1);
+                                    e.kbdwit_split_prev = split;
+                                }
+                            }
+                            // KBDWIT: still armed, nothing came back this pass — the only state from which the
+                            // s58 silence is observable. The probe self-bounds (one dump per endpoint per boot)
+                            // and returns after a single bool test once it has fired or before its deadline.
+                            #[cfg(feature = "kbdwit")]
+                            kbdwit_probe(e, idx, om, kw_op, kw_fl, tok);
+                            break;
+                        }
+                        if tok & QTD_ERR_MASK != 0 {
+                            // ISRARM: the claim is released BEFORE the halt is handled. Everything below this
+                            // point — the STOP-NOTE, `flush_held_releases`, the deferred `ClearFeature` — is
+                            // long, prints, and is the pass's exclusive business anyway: the ISR refuses a
+                            // halted token outright and will never touch this endpoint again on its own.
+                            isr_release_poll(e.isr_slot);
+                            // KBDWIT-2: the silence ended, but it ended in a HALT — see
+                            // `kbdwit_note_silence_end` for why this exit gets its own verdict word instead of
+                            // sharing `SILENCE-BROKE` with the clean one below.
+                            //
+                            // KBDWIT-LATCH: routed through `kbdwit_note_halt` rather than straight at
+                            // `kbdwit_note_silence_end`, because that function's first act is to return when
+                            // the deadline dump has not fired — and on boot 10 it had not, and could not have:
+                            // the halt landed at 2444 ms and the earliest service pass that could have reached
+                            // the deadline was 15219 ms. A halt that BEATS the deadline is precisely the case
+                            // KBDWIT exists to catch, and it was the one case KBDWIT could not say a word
+                            // about. `kbdwit_note_halt` keeps the post-deadline exit byte-identical and adds
+                            // the pre-deadline one.
+                            #[cfg(feature = "kbdwit")]
+                            kbdwit_note_halt(e, idx, tok);
+                            // KBDFLAP: WHICH endpoint, decided from the QH's OWN `ep_chars` — the word the
+                            // controller is executing — rather than from a software copy, for the same reason
+                            // KBDWIT decodes its identity that way. Boot 10's version of this line carried a
+                            // bare token and was therefore indistinguishable from the two BT-proxy halts that
+                            // print on every boot; see the KBDFLAP section comment for the full derivation.
+                            let h_chars = core::ptr::read_volatile(&(*e.qh).ep_chars);
+                            let (h_addr, h_ep) = (h_chars & 0x7F, (h_chars >> 8) & 0xF);
+                            let (h_class, h_recoverable) = halt_class(tok);
+                            // Recover only the class §9.4.5 actually answers, only while budget remains, and
+                            // only if the deferred-clear array has room. `n_clr` can reach `MAX_INT_EPS` only
+                            // if every armed endpoint stalls in the SAME pass, in which case the last one is
+                            // retired rather than dropped in silence — the `-> retire` word says which.
+                            let h_clear = h_recoverable
+                                && e.halt_clears < HALT_CLEARS_MAX
+                                && n_clr < clear_halts.len();
+                            serial_println!(
+                                ":: EHCI-HID: [{}] STOP-NOTE interrupt endpoint halted addr={} ep=IN{} kind={} mps={} class={} tok={:#010x} cerr={} halted={} xact={} babble={} dbuf={} missed={} err={} reports={} clears={}/{} -> {} == witness ::",
+                                idx, h_addr, h_ep, int_ep_kind(e), e.mps, h_class, tok,
+                                (tok >> 10) & 0x3,
+                                (tok >> 6) & 1, (tok >> 3) & 1, (tok >> 4) & 1,
+                                (tok >> 5) & 1, (tok >> 2) & 1, tok & 1,
+                                e.reports, e.halt_clears, HALT_CLEARS_MAX,
+                                if h_clear { "clear-halt" } else { "retire" }
+                            );
+                            if h_clear {
+                                // Deferred, not sent here: the control transfer needs `&mut self` and this loop
+                                // holds an exclusive borrow of `int_eps`. The endpoint is deliberately NOT
+                                // marked dead and its held keys are NOT flushed — `flush_held_releases` also
+                                // bumps `pal::note_keyboard_detached()`, and this keyboard is not detached. If
+                                // the clear fails, the post-loop stage does both, so nothing is skipped, only
+                                // deferred by one pass of the ~1 kHz poll.
+                                clear_halts[n_clr] = Some((ep_i, e.kbd_target, h_ep as u8));
+                                n_clr += 1;
+                                e.halt_clears += 1;
+                                break;
+                            }
+                            e.dead = true;
+                            // EHCI-KEYUP F2: the endpoint is retired for the rest of the boot — this loop
+                            // `continue`s past a `dead` entry forever after — so any key down at this instant
+                            // would NEVER receive its release. Flush them. See `flush_held_releases` for why
+                            // this is the one asymmetric case the poll-gap argument does not cover, and why
+                            // ring 3 cannot recover from it on its own.
+                            flush_held_releases(e, idx);
+                            break;
+                        }
+                        // KBDWIT-2: a clean retirement — the endpoint answered. THE decision-table entry. This
+                        // stays on the POLL arm alone because it needs the live `tok` to render its verdict, and
+                        // because it only ever speaks after the deadline dump has fired — which, now that
+                        // `kbdwit_last_ms` is stamped for ISR-consumed completions too (below), an endpoint the
+                        // interrupt is servicing can no longer reach.
+                        #[cfg(feature = "kbdwit")]
+                        kbdwit_note_silence_end(e, idx, "SILENCE-BROKE", tok);
+                        // MT-INVESTIGATION (IVY): bytes actually received = armed total minus the residue the
+                        // controller left in Total Bytes To Transfer. Knob-off the armed total IS `e.mps`, so
+                        // the expression is unchanged; knob-on, on the vendor-multitouch endpoint, it is the
+                        // buffer size and the difference is the true length of a multi-packet raw frame.
+                        #[cfg(not(feature = "mtraw"))]
+                        let len = (e.mps as u32).saturating_sub((tok >> QTD_TOTAL_SHIFT) & 0x7FFF) as usize;
                         #[cfg(feature = "mtraw")]
-                        if let Some(n) = mt_dumped.as_mut() {
-                            if *n < MT_RAW_DUMP_MAX {
-                                *n += 1;
-                                dump_raw_report(idx, *n, &report[..report.len().min(MT_RAW_DUMP_BYTES)]);
-                                // MT-INVESTIGATION (IVY, decode prep): run the TYPE2 decoder on
-                                // the SAME bounded first-N frames and print one witness line. The
-                                // decoder is total — a non-raw (HID-mode) report simply fails its
-                                // length gate and the line says so — so this cannot misread the
-                                // 8-byte 0x02 stream as finger data.
-                                dump_type2_frame(idx, e.mps, report);
-                            }
+                        let len = e.rx_total.saturating_sub((tok >> QTD_TOTAL_SHIFT) & 0x7FFF) as usize;
+                        // ISRARM: the poll arm's tuple. The buffer pointer is `e.buf` — the endpoint's own DMA
+                        // buffer, read in place exactly as before this arc — and the claim taken above is still
+                        // held, which is what stops the ISR re-arming underneath the decode below. It is
+                        // released after the re-arm at the foot of the loop.
+                        (e.buf as *const u8, len, dark_gap_ms, now_ms, false)
+                    };
+                // ISRARM: from here down the two sources are indistinguishable — one body, one decoder,
+                // one census. Everything below reads `rpt_ptr` / `len` / `dark_gap_ms` / `at_ms` and
+                // never the token again.
+                //
+                // KBDWIT: the completion stamp. `at_ms` rather than a fresh clock read, because for a
+                // hand-off report that is the instant the ISR took it OFF the endpoint — the true
+                // completion time — and stamping "now" would make an endpoint the interrupt is serving
+                // perfectly look like one whose reports arrive late. Getting this wrong in the other
+                // direction is worse than cosmetic: KBDWIT's deadline dump fires on the ABSENCE of this
+                // stamp, so a version that only counted poll-consumed completions would declare a
+                // healthy, ISR-serviced endpoint silent.
+                #[cfg(feature = "kbdwit")]
+                {
+                    e.kbdwit_last_ms = _at_ms;
+                }
+                // DEADMAN — `[deadman] hid=`. Charged above every decoder, length gate and `dead` path,
+                // and before any `pal::EVENT_QUEUE` push, so no report layout can influence whether a
+                // completion counts.
+                //
+                // ⚠ THE IRQ-SIDE COUNTER THIS FIELD'S BRIEF ASKED FOR NOW EXISTS. The comment that used
+                // to stand here said the site did not — "this driver takes no interrupts at all" — and
+                // that is no longer true: see ISRARM. `hid=` still counts RETIREMENTS rather than
+                // interrupts, deliberately, because a retirement is what a report actually is; the
+                // interrupt's own count is `irq=` on the `ISRARM` line, and the two are meant to be
+                // read together. Pairing with `pmp=` (poll passes) is unchanged.
+                crate::deadman::note_hid_completion();
+                if len > 0 {
+                    // ══════════════════════════════════════════════════════════════════════════════
+                    // EHCIDARK — **the reports this endpoint could not accept, counted.**
+                    //
+                    // The endpoint holds exactly ONE report and cannot hold more on this silicon: `mps`
+                    // is 64 against 8-byte Report ID 0x02 reports, so every report is a SHORT packet and
+                    // retires the qTD. (That is also why the multi-packet arming the `mtraw` path uses is
+                    // unavailable here — the controller stops at the first short packet whatever `total`
+                    // says.) From that instant until a service pass rewrites the overlay the endpoint is
+                    // DARK, and everything the pad sends is dropped ON THE WIRE. Nothing downstream can
+                    // see it: `EVQ_DROP_PTR` counts a full ring, `pointer_motion_coalesced` counts a slow
+                    // drain, and both of those are about reports that at least reached memory. Until this
+                    // block there was no term anywhere in the driver for the ones that never did — which
+                    // is the difference between "the pointer feels bad" and a number.
+                    //
+                    // The arithmetic is deliberately conservative in the only direction that could
+                    // mislead. `dark_gap_ms` is this endpoint's whole service-pass gap, and the report we
+                    // are holding landed SOMEWHERE inside it — so the dark stretch is AT MOST that gap
+                    // and the reports the device could have generated within it at most `gap / cadence`,
+                    // of which we got one. A pass that finds the qTD still ACTIVE contributes nothing at
+                    // all, so a still hand — the ordinary case, a change-only pad reporting nothing —
+                    // can never inflate this.
+                    //
+                    // `dark_cad_ms` is learned from the passes that KEPT UP (the running minimum gap),
+                    // so the estimate calibrates itself against this device on this boot instead of
+                    // trusting a `bInterval` that describes neither the host's poll rate nor the hand's.
+                    // It is updated AFTER the window test so a pass cannot be judged against a cadence
+                    // it is itself establishing.
+                    if e.dark_cad_ms != u32::MAX && e.dark_cad_ms > 0 {
+                        let slots = (dark_gap_ms / e.dark_cad_ms as u64) as u32;
+                        if slots > 1 {
+                            e.dark_windows = e.dark_windows.saturating_add(1);
+                            e.dark_ms = e.dark_ms.saturating_add(dark_gap_ms);
+                            e.dark_max_ms = e.dark_max_ms.max(dark_gap_ms.min(u32::MAX as u64) as u32);
+                            e.dark_missed = e.dark_missed.saturating_add((slots - 1) as u64);
                         }
-                        // MT-INVESTIGATION (IVY, `mtraw_inject` sub-knob ONLY, default OFF): turn
-                        // the first finger's ABSOLUTE position into pointer deltas. Deliberately
-                        // gated behind a second knob: the pointer path stays 0x02-driven until
-                        // metal proves raw mode is stable, so the default `mtraw` build DECODES
-                        // and WITNESSES without ever touching the event queue.
-                        #[cfg(feature = "mtraw_inject")]
-                        mt_inject_first_finger(report, &mut e.mt_prev);
-                        // M2 (RMBP-FIX silicon retarget): after the bcm5974 mode switch the internal
-                        // trackpad does NOT stream the descriptor's opaque 0x44 / 511-byte multitouch
-                        // frame — that hypothesis is REFUTED on this device path (the decode it drove,
-                        // `decode_vendor_first_finger` + `VMT_FINGER_*`, is KEPT below as documented
-                        // history + self-test, never as the live path). Ground truth from silicon: it
-                        // streams 8-byte Report ID 0x02 reports — [0]=id, [1]=buttons (0x00 up /
-                        // 0x01 down), [2]=dx i8, [3]=dy i8, [4..8] zero/unknown. Decode those straight
-                        // into the RELATIVE pointer path (the same `pal::Event::Mouse` seam the
-                        // boot-mouse path uses). Length-checked + ID-gated inside `decode_trackpad_rel`:
-                        // a short or non-0x02 report yields None → no event, no state change.
-                        if let Some((buttons, dx, dy)) = decode_trackpad_rel(report) {
-                            // Bounded one-line format witness on the first decoded report.
-                            if e.reports == 1 {
-                                serial_println!(
-                                    ":: EHCI-HID: [{}] trackpad format witness: 8-byte id=0x02 rel — buttons={:#04x} dx={} dy={} == witness ::",
-                                    idx, buttons, dx, dy
-                                );
+                    }
+                    // Saturate rather than cast: a gap past `u32::MAX` ms is unreachable in a boot, but a
+                    // TRUNCATING cast is the one way it could turn into a small number and drive the
+                    // cadence — and therefore every later `missed<=` — from a value that never happened.
+                    let gap_u32 = dark_gap_ms.min(u32::MAX as u64) as u32;
+                    if gap_u32 > 0 && gap_u32 < e.dark_cad_ms {
+                        e.dark_cad_ms = gap_u32;
+                    }
+                    // The rollup. Silent on a healthy endpoint by construction — it needs the census to
+                    // have MOVED since the last line — and rate-limited to one line per
+                    // `EHCIDARK_ROLLUP_MS` when it has, because an instrument built to shorten a witness
+                    // burst must not become one. Identity is decoded from the QH's own `ep_chars`, the
+                    // word the controller is executing, for the reason KBDFLAP's STOP-NOTE line decodes
+                    // it that way: a census that named the wrong endpoint would be worse than none.
+                    if e.dark_missed != e.dark_missed_logged
+                        && now_ms.wrapping_sub(e.dark_log_ms) >= EHCIDARK_ROLLUP_MS
+                    {
+                        e.dark_log_ms = now_ms;
+                        e.dark_missed_logged = e.dark_missed;
+                        let chars = core::ptr::read_volatile(&(*e.qh).ep_chars);
+                        serial_println!(
+                            ":: EHCI-HID: [{}] EHCIDARK addr={} ep=IN{} kind={} reports={} cad={}ms windows={} dark={}ms max={}ms missed<={} == witness ::",
+                            idx, chars & 0x7F, (chars >> 8) & 0xF, int_ep_kind(e),
+                            e.reports.wrapping_add(1), e.dark_cad_ms, e.dark_windows,
+                            e.dark_ms, e.dark_max_ms, e.dark_missed
+                        );
+                    }
+                    // ══════════════════════════════════════════════════════════════════════════════
+                    // Boot reports are ≤ 8 B; a parsed report-pointer report can be longer (the
+                    // buffer is 64 B), so cap by kind.
+                    // MT-INVESTIGATION: knob-on the layout cap becomes the (grown) buffer length —
+                    // still a hard cap, never larger than the allocation, so the slice below can
+                    // never run off the buffer even if the controller reported nonsense residue.
+                    #[cfg(not(feature = "mtraw"))]
+                    let cap = if e.layout.is_some() { len.min(64) } else { len.min(8) };
+                    #[cfg(feature = "mtraw")]
+                    let cap = if e.layout.is_some() { len.min(INT_BUF_LEN) } else { len.min(8) };
+                    // ISRARM: `rpt_ptr` is `e.buf` on the poll arm (read in place, as before) and the
+                    // pass's own stack scratch on the hand-off arm. `cap` bounds it either way, and on
+                    // the hand-off arm `len` is additionally bounded by `ISR_SLOT_LEN` at the producer,
+                    // so the slice can never run off either allocation.
+                    let report = core::slice::from_raw_parts(rpt_ptr, cap);
+                    e.reports = e.reports.wrapping_add(1);
+                    if let Some(l) = e.layout {
+                        if l.vendor_mt {
+                            // M1 (RMBP-FIX, 2026-07-18): the raw-report dump exists ONLY to capture the
+                            // opaque stream's byte layout, and that characterization is COMPLETE. Bound it
+                            // hard — usbdebug builds only, first 4 reports total per device — so it can
+                            // never flood the framebuffer console (~100+ heap-allocating lines/sec under
+                            // touch, the "machine appears hung" defect). Its `String` alloc is off the
+                            // default hot path ENTIRELY: on a GUI/default build this whole `#[cfg]` block
+                            // (and `dump_vendor_report`) is compiled out — zero dumps, zero allocation.
+                            #[cfg(feature = "usbdebug")]
+                            if e.reports <= 4 {
+                                dump_vendor_report(idx, e.reports, report);
                             }
-                            // CLICK-1 (metal verdict): emit ONE `Event::Button` per button-DOWN
-                            // edge (0x00 -> 0x01 on this pad) — the click observable: a click
-                            // while vug/pulse runs exits the demo like a keystroke. Release
-                            // emits nothing. Serial line per press (human-rate, bounded).
-                            // CLICK-3: the edge test plus re-press recovery (see `note_buttons`) —
-                            // this is the path the rMBP internal trackpad takes, and the one where
-                            // the stale latch swallowed every stationary second click.
-                            // DRAGREL: and ONE more on the release edge (buttons == 0x00 here), so a
-                            // gesture whose end matters — a title-bar drag — has an event that says
-                            // so. The press half above is untouched.
-                            //
-                            // DRAGGLIDE: this report's motion and its button edge go in as ONE
-                            // thing (`push_pointer_report`), so the reorder that puts a release
-                            // edge ahead of its own lift KNOWS which lift is its own instead of
-                            // inferring it. THIS pad is half of why: it and an xHCI mouse are
-                            // concurrent producers, and a foreign motion landing between two
-                            // separate pushes would send the swap at the wrong entry.
-                            //
-                            // ARC D M1: `dx != 0 || dy != 0` is the motion discriminator, taken
-                            // from the ALREADY-DECODED deltas (the 0x02 byte decode is untouched)
-                            // and identical to the predicate this same call decides to emit a
-                            // `Mouse` event on. This is THE path the boot-3 phantom storm was
-                            // measured on.
-                            let (press, release) = e.note_buttons(buttons, dx != 0 || dy != 0, idx);
+                            // MT-INVESTIGATION (IVY, `mtraw` only): the capture window. Hex-dump at
+                            // most `MT_RAW_DUMP_MAX` reports of at most `MT_RAW_DUMP_BYTES` bytes each
+                            // — bounded twice over, because the FTDI console is a 64 KiB drop-oldest
+                            // ring and an unbounded dump evicts the boot log that gives it context.
+                            // The pointer decode below still runs on these reports: if the raw mode
+                            // never engaged they are ordinary 0x02 relative reports and the cursor
+                            // keeps moving; if it DID engage, `decode_trackpad_rel`'s length + ID gate
+                            // rejects them and nothing is pushed. Either way no clamp is weakened.
+                            #[cfg(feature = "mtraw")]
+                            if let Some(n) = mt_dumped.as_mut() {
+                                if *n < MT_RAW_DUMP_MAX {
+                                    *n += 1;
+                                    dump_raw_report(idx, *n, &report[..report.len().min(MT_RAW_DUMP_BYTES)]);
+                                    // MT-INVESTIGATION (IVY, decode prep): run the TYPE2 decoder on
+                                    // the SAME bounded first-N frames and print one witness line. The
+                                    // decoder is total — a non-raw (HID-mode) report simply fails its
+                                    // length gate and the line says so — so this cannot misread the
+                                    // 8-byte 0x02 stream as finger data.
+                                    dump_type2_frame(idx, e.mps, report);
+                                }
+                            }
+                            // MT-INVESTIGATION (IVY, `mtraw_inject` sub-knob ONLY, default OFF): turn
+                            // the first finger's ABSOLUTE position into pointer deltas. Deliberately
+                            // gated behind a second knob: the pointer path stays 0x02-driven until
+                            // metal proves raw mode is stable, so the default `mtraw` build DECODES
+                            // and WITNESSES without ever touching the event queue.
+                            #[cfg(feature = "mtraw_inject")]
+                            mt_inject_first_finger(report, &mut e.mt_prev);
+                            // M2 (RMBP-FIX silicon retarget): after the bcm5974 mode switch the internal
+                            // trackpad does NOT stream the descriptor's opaque 0x44 / 511-byte multitouch
+                            // frame — that hypothesis is REFUTED on this device path (the decode it drove,
+                            // `decode_vendor_first_finger` + `VMT_FINGER_*`, is KEPT below as documented
+                            // history + self-test, never as the live path). Ground truth from silicon: it
+                            // streams 8-byte Report ID 0x02 reports — [0]=id, [1]=buttons (0x00 up /
+                            // 0x01 down), [2]=dx i8, [3]=dy i8, [4..8] zero/unknown. Decode those straight
+                            // into the RELATIVE pointer path (the same `pal::Event::Mouse` seam the
+                            // boot-mouse path uses). Length-checked + ID-gated inside `decode_trackpad_rel`:
+                            // a short or non-0x02 report yields None → no event, no state change.
+                            if let Some((buttons, dx, dy)) = decode_trackpad_rel(report) {
+                                // Bounded one-line format witness on the first decoded report.
+                                if e.reports == 1 {
+                                    serial_println!(
+                                        ":: EHCI-HID: [{}] trackpad format witness: 8-byte id=0x02 rel — buttons={:#04x} dx={} dy={} == witness ::",
+                                        idx, buttons, dx, dy
+                                    );
+                                }
+                                // CLICK-1 (metal verdict): emit ONE `Event::Button` per button-DOWN
+                                // edge (0x00 -> 0x01 on this pad) — the click observable: a click
+                                // while vug/pulse runs exits the demo like a keystroke. Release
+                                // emits nothing. Serial line per press (human-rate, bounded).
+                                // CLICK-3: the edge test plus re-press recovery (see `note_buttons`) —
+                                // this is the path the rMBP internal trackpad takes, and the one where
+                                // the stale latch swallowed every stationary second click.
+                                // DRAGREL: and ONE more on the release edge (buttons == 0x00 here), so a
+                                // gesture whose end matters — a title-bar drag — has an event that says
+                                // so. The press half above is untouched.
+                                //
+                                // DRAGGLIDE: this report's motion and its button edge go in as ONE
+                                // thing (`push_pointer_report`), so the reorder that puts a release
+                                // edge ahead of its own lift KNOWS which lift is its own instead of
+                                // inferring it. THIS pad is half of why: it and an xHCI mouse are
+                                // concurrent producers, and a foreign motion landing between two
+                                // separate pushes would send the swap at the wrong entry.
+                                //
+                                // ARC D M1: `dx != 0 || dy != 0` is the motion discriminator, taken
+                                // from the ALREADY-DECODED deltas (the 0x02 byte decode is untouched)
+                                // and identical to the predicate this same call decides to emit a
+                                // `Mouse` event on. This is THE path the boot-3 phantom storm was
+                                // measured on.
+                                let (press, release) = e.note_buttons(buttons, dx != 0 || dy != 0, idx);
+                                crate::pal::push_pointer_report(
+                                    if dx != 0 || dy != 0 {
+                                        Some(crate::pal::Event::Mouse { x: dx, y: dy })
+                                    } else {
+                                        None
+                                    },
+                                    if press || release {
+                                        Some(crate::pal::Event::Button(buttons))
+                                    } else {
+                                        None
+                                    },
+                                );
+                                if press {
+                                    serial_println!(
+                                        ":: EHCI-HID: [{}] trackpad click (button-down edge, buttons={:#04x}) == witness ::",
+                                        idx, buttons
+                                    );
+                                } else if release {
+                                    serial_println!(
+                                        ":: EHCI-HID: [{}] trackpad release (button-up edge, buttons={:#04x}) == witness ::",
+                                        idx, buttons
+                                    );
+                                }
+                            }
+                        } else {
+                            // M2 report-pointer path: decode X/Y/buttons from the parsed field map.
+                            // Relative axes (a mouse) → pal::Event::Mouse; absolute (tablet / trackpad)
+                            // → MouseAbsolute — the SAME pointer-event path the xHCI HID stack delivers.
+                            let (x, y, buttons, fingers) = decode_report_pointer(report, &l);
+                            // CLICK-1: primary-button DOWN edge → one Button event (same semantic as
+                            // the trackpad path above).
+                            // DRAGREL: plus the release edge, same semantic as the trackpad path above.
+                            // DRAGGLIDE: motion + edge enter the ring as ONE report (see the trackpad
+                            // path above).
+                            let btn = (buttons & 0xFF) as u8;
+                            // ARC D M1 — the motion discriminator, on the SAME predicate this site
+                            // already uses to decide whether the report carries motion at all (below).
+                            // For a RELATIVE layout that is exactly "dx/dy != 0". For an ABSOLUTE one it
+                            // reads "not at the panel origin", which is the in-tree convention at this
+                            // site and errs in the SAFE direction: a stationary absolute hold reports
+                            // `moved = true` and so the quiet-gap arm simply never fires for it — no
+                            // phantom presses, only the (rare) rescue foregone. The rMBP trackpad this
+                            // arc is about takes the relative 0x02 path above, not this one.
+                            let (press, release) = e.note_buttons(btn, x != 0 || y != 0, idx);
+                            let motion = if x == 0 && y == 0 {
+                                None
+                            } else if l.relative {
+                                Some(crate::pal::Event::Mouse { x, y })
+                            } else {
+                                Some(crate::pal::Event::MouseAbsolute { x, y })
+                            };
                             crate::pal::push_pointer_report(
-                                if dx != 0 || dy != 0 {
-                                    Some(crate::pal::Event::Mouse { x: dx, y: dy })
-                                } else {
-                                    None
-                                },
+                                motion,
                                 if press || release {
-                                    Some(crate::pal::Event::Button(buttons))
+                                    Some(crate::pal::Event::Button(btn))
                                 } else {
                                     None
                                 },
                             );
-                            if press {
+                            if e.reports == 1 || e.reports % 32 == 0 {
                                 serial_println!(
-                                    ":: EHCI-HID: [{}] trackpad click (button-down edge, buttons={:#04x}) == witness ::",
-                                    idx, buttons
-                                );
-                            } else if release {
-                                serial_println!(
-                                    ":: EHCI-HID: [{}] trackpad release (button-up edge, buttons={:#04x}) == witness ::",
-                                    idx, buttons
+                                    ":: EHCI-HID: [{}] report-pointer {} reports, last {} x={} y={} buttons={:#04x} fingers={} == witness ::",
+                                    idx, e.reports,
+                                    if l.relative { "rel" } else { "abs" },
+                                    x, y, buttons, fingers
                                 );
                             }
                         }
-                    } else {
-                        // M2 report-pointer path: decode X/Y/buttons from the parsed field map.
-                        // Relative axes (a mouse) → pal::Event::Mouse; absolute (tablet / trackpad)
-                        // → MouseAbsolute — the SAME pointer-event path the xHCI HID stack delivers.
-                        let (x, y, buttons, fingers) = decode_report_pointer(report, &l);
-                        // CLICK-1: primary-button DOWN edge → one Button event (same semantic as
-                        // the trackpad path above).
-                        // DRAGREL: plus the release edge, same semantic as the trackpad path above.
-                        // DRAGGLIDE: motion + edge enter the ring as ONE report (see the trackpad
-                        // path above).
-                        let btn = (buttons & 0xFF) as u8;
-                        // ARC D M1 — the motion discriminator, on the SAME predicate this site
-                        // already uses to decide whether the report carries motion at all (below).
-                        // For a RELATIVE layout that is exactly "dx/dy != 0". For an ABSOLUTE one it
-                        // reads "not at the panel origin", which is the in-tree convention at this
-                        // site and errs in the SAFE direction: a stationary absolute hold reports
-                        // `moved = true` and so the quiet-gap arm simply never fires for it — no
-                        // phantom presses, only the (rare) rescue foregone. The rMBP trackpad this
-                        // arc is about takes the relative 0x02 path above, not this one.
-                        let (press, release) = e.note_buttons(btn, x != 0 || y != 0, idx);
-                        let motion = if x == 0 && y == 0 {
-                            None
-                        } else if l.relative {
-                            Some(crate::pal::Event::Mouse { x, y })
-                        } else {
-                            Some(crate::pal::Event::MouseAbsolute { x, y })
-                        };
+                    } else if e.is_kbd {
+                        // EHCI-KEYUP: the decoder now carries the previous report's keycodes so it can
+                        // emit release edges. `report` is built from `e.buf` through `from_raw_parts`, a
+                        // raw pointer with no borrow of `e`, so handing the decoder `&mut e.kbd_prev_keys`
+                        // alongside it is not an aliasing violation — the buffer and the diff state are
+                        // disjoint memory.
+                        // ALLKEYS P1: the decoder also owns the lock-key state now. It reports back
+                        // whether this report toggled one; the SET_REPORT that lights the key is queued
+                        // for after the loop, where `self` is borrowable again.
+                        if decode_boot_keyboard(
+                            report,
+                            &mut e.kbd_prev_keys,
+                            &mut e.kbd_prev_mods,
+                            &mut e.kbd_leds,
+                        ) && e.kbd_led_ok
+                            && n_led < led_pushes.len()
+                        {
+                            led_pushes[n_led] = Some((ep_i, e.kbd_target, e.kbd_intf, e.kbd_leds));
+                            n_led += 1;
+                        }
+                        if e.reports == 1 || e.reports % 32 == 0 {
+                            serial_println!(
+                                ":: EHCI-HID: [{}] kbd {} reports, last {:02x} {:02x} .. == witness ::",
+                                idx, e.reports, report[0], report.get(2).copied().unwrap_or(0)
+                            );
+                        }
+                    } else if e.is_rel_mouse && len >= 3 {
+                        let (dx, dy) = (report[1] as i8 as i32, report[2] as i8 as i32);
+                        // CLICK-1: boot-mouse buttons live in report[0]; primary DOWN edge → Button.
+                        // DRAGREL: and the primary UP edge, same as the other two pointer paths.
+                        // DRAGGLIDE: motion + edge enter the ring as ONE report (see the trackpad path
+                        // above).
+                        // ARC D M1 — the motion discriminator; a boot mouse is relative, so this is
+                        // literally "this report moved".
+                        let (press, release) = e.note_buttons(report[0], dx != 0 || dy != 0, idx);
                         crate::pal::push_pointer_report(
-                            motion,
+                            if dx != 0 || dy != 0 {
+                                Some(crate::pal::Event::Mouse { x: dx, y: dy })
+                            } else {
+                                None
+                            },
                             if press || release {
-                                Some(crate::pal::Event::Button(btn))
+                                Some(crate::pal::Event::Button(report[0]))
                             } else {
                                 None
                             },
                         );
                         if e.reports == 1 || e.reports % 32 == 0 {
                             serial_println!(
-                                ":: EHCI-HID: [{}] report-pointer {} reports, last {} x={} y={} buttons={:#04x} fingers={} == witness ::",
-                                idx, e.reports,
-                                if l.relative { "rel" } else { "abs" },
-                                x, y, buttons, fingers
+                                ":: EHCI-HID: [{}] mouse {} reports, last dx={} dy={} buttons={:#04x} == witness ::",
+                                idx, e.reports, dx, dy, report[0]
                             );
                         }
                     }
-                } else if e.is_kbd {
-                    // EHCI-KEYUP: the decoder now carries the previous report's keycodes so it can
-                    // emit release edges. `report` is built from `e.buf` through `from_raw_parts`, a
-                    // raw pointer with no borrow of `e`, so handing the decoder `&mut e.kbd_prev_keys`
-                    // alongside it is not an aliasing violation — the buffer and the diff state are
-                    // disjoint memory.
-                    // ALLKEYS P1: the decoder also owns the lock-key state now. It reports back
-                    // whether this report toggled one; the SET_REPORT that lights the key is queued
-                    // for after the loop, where `self` is borrowable again.
-                    if decode_boot_keyboard(
-                        report,
-                        &mut e.kbd_prev_keys,
-                        &mut e.kbd_prev_mods,
-                        &mut e.kbd_leds,
-                    ) && e.kbd_led_ok
-                        && n_led < led_pushes.len()
-                    {
-                        led_pushes[n_led] = Some((ep_i, e.kbd_target, e.kbd_intf, e.kbd_leds));
-                        n_led += 1;
-                    }
-                    if e.reports == 1 || e.reports % 32 == 0 {
-                        serial_println!(
-                            ":: EHCI-HID: [{}] kbd {} reports, last {:02x} {:02x} .. == witness ::",
-                            idx, e.reports, report[0], report.get(2).copied().unwrap_or(0)
-                        );
-                    }
-                } else if e.is_rel_mouse && len >= 3 {
-                    let (dx, dy) = (report[1] as i8 as i32, report[2] as i8 as i32);
-                    // CLICK-1: boot-mouse buttons live in report[0]; primary DOWN edge → Button.
-                    // DRAGREL: and the primary UP edge, same as the other two pointer paths.
-                    // DRAGGLIDE: motion + edge enter the ring as ONE report (see the trackpad path
-                    // above).
-                    // ARC D M1 — the motion discriminator; a boot mouse is relative, so this is
-                    // literally "this report moved".
-                    let (press, release) = e.note_buttons(report[0], dx != 0 || dy != 0, idx);
-                    crate::pal::push_pointer_report(
-                        if dx != 0 || dy != 0 {
-                            Some(crate::pal::Event::Mouse { x: dx, y: dy })
-                        } else {
-                            None
-                        },
-                        if press || release {
-                            Some(crate::pal::Event::Button(report[0]))
-                        } else {
-                            None
-                        },
-                    );
-                    if e.reports == 1 || e.reports % 32 == 0 {
-                        serial_println!(
-                            ":: EHCI-HID: [{}] mouse {} reports, last dx={} dy={} buttons={:#04x} == witness ::",
-                            idx, e.reports, dx, dy, report[0]
-                        );
-                    }
                 }
-            }
-            // Re-arm in the controller's transfer mode: flip the software toggle (QH_DTC —
-            // the toggle lives here), then either rewrite the overlay in place
-            // (overlay-direct; no qTD fetch — this metal) or refresh + point at the qTD.
-            e.toggle = !e.toggle;
-            let dt = if e.toggle { QTD_DT } else { 0 };
-            // MT-INVESTIGATION (IVY): re-arm for the SAME total the endpoint was armed with. Each
-            // statement is a `#[cfg]` PAIR whose knob-off member is the ORIGINAL expression,
-            // verbatim and in place. Every less repetitive shape tried here (one hoisted local, or
-            // a local inside each branch) changes `service_ehci_hid`'s register allocation — same
-            // instruction count, same symbol size, but NOT byte-identical, which this arc's default
-            // media must be. The duplication is the price of that guarantee.
-            if om {
-                (*e.qh).overlay[0] = PTR_TERMINATE;
-                (*e.qh).overlay[1] = PTR_TERMINATE;
-                (*e.qh).overlay[3] = e.buf_phys as u32;
-                (*e.qh).overlay[4] = 0;
-                #[cfg(not(feature = "mtraw"))]
-                core::ptr::write_volatile(
-                    &mut (*e.qh).overlay[2],
-                    QTD_ACTIVE | QTD_CERR3 | ((e.mps as u32) << QTD_TOTAL_SHIFT) | QTD_PID_IN | QTD_IOC | dt,
-                );
-                #[cfg(feature = "mtraw")]
-                core::ptr::write_volatile(
-                    &mut (*e.qh).overlay[2],
-                    QTD_ACTIVE | QTD_CERR3 | (e.rx_total << QTD_TOTAL_SHIFT) | QTD_PID_IN | QTD_IOC | dt,
-                );
-            } else {
-                #[cfg(not(feature = "mtraw"))]
-                write_qtd(e.qtd, PTR_TERMINATE, QTD_PID_IN | QTD_IOC | dt, e.mps as u32, e.buf_phys);
-                #[cfg(feature = "mtraw")]
-                write_qtd(e.qtd, PTR_TERMINATE, QTD_PID_IN | QTD_IOC | dt, e.rx_total, e.buf_phys);
-                (*e.qh).overlay[1] = PTR_TERMINATE;
-                core::ptr::write_volatile(&mut (*e.qh).overlay[2], 0);
-                core::ptr::write_volatile(&mut (*e.qh).overlay[0], e.qtd_phys as u32);
+                // ISRARM — the foot of the two-source loop.
+                //
+                // A hand-off report was ALREADY re-armed behind, by the ISR, at the instant it was
+                // taken off the endpoint; re-arming again here would arm an endpoint that is already
+                // live and advance the shared data toggle a second time, which on a `QH_DTC` queue head
+                // makes the device silently discard every following packet. So the hand-off arm loops
+                // straight back for the next queued report instead.
+                if from_isr {
+                    continue;
+                }
+                // The poll arm's re-arm, still under the claim taken at the top. It goes through
+                // `isr_rearm` — the SINGLE re-arm implementation, shared with the ISR — so the
+                // overlay-direct / qTD-chain fork and the data toggle each exist exactly once in this
+                // driver. (That is what retired the `#[cfg]`-paired duplication that used to live here:
+                // `IsrEp::rx_total` already carries `mps` knob-off and the `mtraw` total knob-on, so
+                // there is one expression rather than two.)
+                isr_rearm(&ISR_EPS[e.isr_slot]);
+                POLL_REARMS.fetch_add(1, Ordering::Relaxed);
+                isr_release_poll(e.isr_slot);
+                // The endpoint holds exactly one report and it has just been taken, so there is nothing
+                // further to drain on this pass. This is the loop's only unconditional exit.
+                break;
             }
         }
         // ALLKEYS P1: the endpoint borrow is released here, so EP0 is usable again — light (or
@@ -13155,6 +13280,729 @@ const HALT_CLEARS_MAX: u8 = 2;
 /// wearing the shape of its own diagnosis. Paired with the "only when the count MOVED" gate at the
 /// call site, a healthy boot emits this line ZERO times.
 const EHCIDARK_ROLLUP_MS: u64 = 5000;
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// ISRARM — THE COMPLETION INTERRUPT THIS CONTROLLER WAS ALREADY RAISING, FINALLY CONSUMED.
+//
+// ## The defect, in the units EHCIDARK measured it in
+// An armed HID interrupt-IN endpoint holds exactly ONE report. From the instant the controller
+// retires it until a service pass rewrites the overlay the endpoint is DARK and everything the pad
+// sends is dropped ON THE WIRE. The census above counts it; the metal corpus says how much:
+//
+//   EHCIDARK addr=8 ep=IN1 kind=vendor-mt reports=132 cad=1ms windows=57 dark=400ms  max=55ms missed<=343
+//   EHCIDARK addr=8 ep=IN1 kind=vendor-mt reports=291 cad=1ms windows=89 dark=2666ms max=80ms missed<=2390
+//   EHCIDARK addr=8 ep=IN3 kind=kbd       reports=13  cad=1ms windows=4  dark=144ms  max=96ms missed<=140
+//
+// `dark_gap_ms` is a SERVICE-PASS GAP (`now_ms - seen_ms`). The dark window is therefore the PASS
+// PERIOD, not a property of the endpoint's depth — which is why the fix is to stop waiting for the
+// pass, not to make the endpoint deeper.
+//
+// ## Why depth was refused
+// The obvious alternative — a chained ring of qTDs behind the same QH — CANNOT BE BUILT ON THIS
+// SILICON, and the refusal is recorded here rather than in a session log because the next reader of
+// `IntEp`'s "single re-armed qTD" doc-comment will otherwise reach for it. See
+// `docs/dev/OS/07_USB_STORAGE/usb_xhci.md` §32b ("The ring that cannot be built") for the full
+// argument; the short form is `Controller::overlay_mode`. Both EHCI functions on the 2012 rMBP run
+// OVERLAY-DIRECT — the controller master-aborts (HSE) on the qTD fetch, which is what probe-14
+// found and what every metal boot re-witnesses:
+//
+//   :: EHCI-HID: [0] qTD-fetch HSE — OVERLAY-DIRECT mode + full HCRESET re-init (probe-14 silicon finding) ::
+//   :: EHCI-HID: [1] chain-HSE verdict CARRIED from an earlier controller — OVERLAY-DIRECT for this port walk ::
+//
+// In that mode `arm_interrupt_ep` writes the transfer straight into the QH overlay, pins
+// `overlay[0]`/`overlay[1]` to `PTR_TERMINATE` and explicitly discards the descriptor
+// (`let _ = (qtd, qtd_phys); // slot storage retained; the controller never sees it`). There is no
+// qTD in the controller's world to chain, and giving it one means taking the fetch path that wedges
+// it — an HSE'd controller does not recover from RS alone, so the failure mode is "no trackpad AND
+// no keyboard", strictly worse than the defect. Controller [1], the one the internal trackpad is
+// on, inherits the verdict without measuring it, so it is never even probed in chain mode.
+//
+// ## The shape that DOES work in both modes
+// `QTD_IOC` is already set on every arm — including the overlay-direct one — so the controller has
+// been raising `USBSTS.USBINT` on every single completion all along. Nothing listened: the module
+// header still said *"No interrupts: no USBINTR write, no IDT vector, no MSI"*, and `deadman`'s own
+// residual note observes that `QTD_IOC` sets `USBINT` even with `USBINTR` masked. This block writes
+// `USBINTR`, routes the function's MSI to the local APIC, and re-arms the endpoint FROM THE
+// COMPLETION ITSELF. The dark window stops being the pass period and becomes interrupt latency.
+// It needs no qTD, so it is indifferent to `overlay_mode` — the property the ring could never have.
+//
+// ## THE POLLED PATH IS STILL THE LOAD-BEARING ONE
+// This is the whole risk posture and it is deliberate. `service()` is unchanged in what it can do:
+// it still reads the token, still decodes, still re-arms, still retires a halted endpoint. The ISR
+// is a LATENCY LAYER on top — it gets there first when it is alive, and when it is not alive (no
+// MSI capability, MSI programmed but never delivered, a chipset that routes it somewhere we are
+// not) the pass finds the completion exactly where it always did and the boot is indistinguishable
+// from today except in the counters below. There is no state in which a dead interrupt produces a
+// dead trackpad.
+//
+// ## Why nothing here can wedge the machine
+//   * **No lock the ISR can wait on.** `EHCI_HID` is a `Mutex` the service pass holds across the
+//     whole walk — including `set_hid_leds`, which can spend a `hw_wait_budget()` (~2 s) inside one
+//     control transfer. Taking it here would self-deadlock exactly as the xHCI MSI handler's comment
+//     warns. So the ISR does not touch `Controller` at all: `arm_interrupt_ep` PUBLISHES the four
+//     pointers and two scalars an endpoint needs into `ISR_EPS`, plain atomics, and the ISR reads
+//     only those.
+//   * **The per-endpoint claim is `try` on BOTH sides and spins on neither.** The pass may run on a
+//     different core than the MSI target, so "just mask interrupts" is not a mutual exclusion. A
+//     `compare_exchange` decides; the loser walks away. The ISR losing costs one pass period — i.e.
+//     today's behaviour. The pass losing costs nothing: the report is in the hand-off ring.
+//   * **No allocation, no `Vec`, no `String`, no formatting.** The registry, the ring and the
+//     counters are `static`. The ISR never prints — every line this block produces is emitted by
+//     the polled pass, which can afford `serial_println!`.
+//   * **Bounded work.** `ISR_MAX_EPS` (12) iterations, each a handful of volatile reads and at most
+//     an `ISR_SLOT_LEN`-byte copy. No loop here can fail to terminate.
+//   * **Halts are NOT the ISR's business.** A token with `QTD_ERR_MASK` set is left exactly where it
+//     is; the pass retires the endpoint, flushes held key releases and prints the STOP-NOTE, none of
+//     which belongs in interrupt context.
+//
+// ## Why the ISR copies instead of just re-arming
+// Re-arming hands the buffer back to the controller, which may fill it again before the pass looks.
+// So the report is lifted into a per-endpoint hand-off ring FIRST and the pass decodes from there.
+// Reports leave the ring oldest-first and the pass drains the ring BEFORE reading the endpoint
+// directly, so a delta stream stays in order across both producers — trackpad reports are deltas,
+// and delivering them out of order is worse than dropping them.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// EHCI operational-register offset of USBINTR (EHCI 1.0 §2.3.3). Not in `ehci_scout`'s list
+/// because until this block nothing in the tree ever wrote it.
+const OP_USBINTR: u64 = 0x08;
+/// USBINTR bit 0 — USB Interrupt Enable: a qTD carrying `QTD_IOC` retired. This is the only cause
+/// this driver arms. Error / port-change / frame-rollover stay masked: every one of them is already
+/// handled by the polled pass, and an interrupt this handler would only acknowledge is an interrupt
+/// worth not taking.
+const INTR_USBINT: u32 = 1 << 0;
+/// USBSTS bit 0 — the completion status bit `INTR_USBINT` unmasks, and **the ONLY bit the ISR is
+/// allowed to write back.**
+///
+/// This is not tidiness, it is a bug that was written and then removed before it shipped. The
+/// obvious ack is the same blind `STS_RW1C` (0x3F) that `service()` uses at the head of every pass —
+/// but that mask includes `STS_HSE`, and `STS_HSE` is READ post-init by four separate sites on the
+/// control-transfer path (the chain-mode HSE check at `chain_txn`, the latched re-check after it,
+/// and the quiesce test) to decide whether this silicon has wedged. An ISR that cleared it would
+/// make an HSE'd controller look healthy to the very code whose job is to notice — a race the
+/// polled pass cannot lose today because it is the only writer. Since `USBINTR` unmasks bit 0 and
+/// nothing else, bit 0 is also the only bit that can be asserting the interrupt, so acking exactly
+/// it is both sufficient to let the controller raise again and incapable of eating anyone's
+/// evidence.
+const STS_USBINT: u32 = 1 << 0;
+
+/// Every endpoint slot the ISR can serve: one per `int_slots` entry per controller. The bound is
+/// exact rather than generous — `arm_interrupt_ep` refuses past `MAX_INT_EPS` and `init` past
+/// `MAX_CONTROLLERS`, so `idx * MAX_INT_EPS + int_next` can never collide and can never overflow.
+/// That is what lets an endpoint's slot index be DERIVED instead of allocated, which in turn keeps
+/// the publish path free of a failure mode the ISR would otherwise have to carry.
+const ISR_MAX_EPS: usize = MAX_CONTROLLERS * MAX_INT_EPS;
+/// Hand-off ring depth per endpoint. This is NOT hardware depth and must not be read as the qTD ring
+/// this arc refused: the endpoint still holds exactly one report. It is how many completions the ISR
+/// may lift out and hold for a pass that is late. Eight is the same number the refused ring wanted,
+/// for the same arithmetic (8 report periods), except that here it costs 8 x 64 B of kernel image
+/// per endpoint and no controller behaviour whatsoever.
+const ISR_RING: usize = 8;
+/// Bytes of one hand-off slot. `INT_BUF_LEN` knob-off is exactly 64, so on default media no
+/// completion can ever exceed it. Knob-on (`mtraw`, 1024) the vendor-multitouch endpoint's frames
+/// can, and those are DECLINED by the ISR (`ISR_OVERSIZE`) and left for the pass — a bounded,
+/// counted, knob-only degradation to today's behaviour rather than a 96 KiB static.
+const ISR_SLOT_LEN: usize = 64;
+
+/// One hand-off slot: the report bytes plus the two clock facts the EHCIDARK census needs, taken at
+/// the moment of CONSUMPTION rather than at decode time. Without `gap_ms` the census would measure
+/// "how late was the pass that decoded this", which under a live ISR is not the dark window and
+/// would make the instrument report a defect this block had already removed.
+#[repr(C)]
+struct IsrRingSlot {
+    len: u32,
+    gap_ms: u32,
+    at_ms: u64,
+    data: [u8; ISR_SLOT_LEN],
+}
+
+/// The ISR's whole view of one armed endpoint. Everything the re-arm needs, republished as atomics
+/// so no `Controller` field — and therefore no `EHCI_HID` lock — is on the interrupt path.
+struct IsrEp {
+    /// Published (1) by `arm_interrupt_ep` AFTER every other field is written and the QH is linked.
+    /// Read with `Acquire` so the ISR can never observe a half-built slot.
+    live: AtomicU32,
+    /// 0 free / 1 held. Try-only on both sides; see the block comment.
+    claim: AtomicU32,
+    qh: AtomicU64,
+    qtd: AtomicU64,
+    qtd_phys: AtomicU64,
+    buf: AtomicU64,
+    buf_phys: AtomicU64,
+    /// Bytes this endpoint is armed for — `mps` knob-off, the `mtraw` total knob-on. One field for
+    /// both, so the re-arm has a single source of truth for the arming size.
+    rx_total: AtomicU32,
+    /// `Controller::overlay_mode` at arm time, mirrored here because the ISR cannot reach the
+    /// controller. It is latched for the controller's lifetime, so a mirror cannot go stale.
+    om: AtomicU32,
+    /// THE DATA TOGGLE, and the single authority for it. It moved out of `IntEp` because two
+    /// re-armers cannot each own half a toggle: a QH running `QH_DTC` takes DT from the token the
+    /// re-arm writes, so a toggle the ISR advanced and the pass did not would make the device
+    /// silently discard every following packet.
+    toggle: AtomicU32,
+    /// `arch::ms()` at the last EXAMINATION of this endpoint by either path — the EHCIDARK clock.
+    /// Shared for the same reason the toggle is: the census's conservatism depends on the gap being
+    /// "time since anyone last looked", and a pass-only clock would keep reporting windows the ISR
+    /// had already closed.
+    seen_ms: AtomicU64,
+    /// Hand-off ring cursors. Single producer (the ISR; MSI targets exactly one APIC id, so there is
+    /// never more than one), single consumer (the pass, under `EHCI_HID`). Free-running counters —
+    /// occupancy is `tail - head`, which is wrap-safe.
+    head: AtomicU32,
+    tail: AtomicU32,
+}
+
+impl IsrEp {
+    const fn new() -> Self {
+        Self {
+            live: AtomicU32::new(0),
+            claim: AtomicU32::new(0),
+            qh: AtomicU64::new(0),
+            qtd: AtomicU64::new(0),
+            qtd_phys: AtomicU64::new(0),
+            buf: AtomicU64::new(0),
+            buf_phys: AtomicU64::new(0),
+            rx_total: AtomicU32::new(0),
+            om: AtomicU32::new(0),
+            toggle: AtomicU32::new(0),
+            seen_ms: AtomicU64::new(0),
+            head: AtomicU32::new(0),
+            tail: AtomicU32::new(0),
+        }
+    }
+}
+
+static ISR_EPS: [IsrEp; ISR_MAX_EPS] = [const { IsrEp::new() }; ISR_MAX_EPS];
+
+/// The hand-off payloads. `static mut` + `addr_of_mut!` rather than a lock, because the ISR is the
+/// only writer of a slot it has claimed and the pass is the only reader of a slot the producer has
+/// published; the `Release`/`Acquire` pair on `tail` is what orders the bytes against the cursor.
+static mut ISR_RINGS: [[IsrRingSlot; ISR_RING]; ISR_MAX_EPS] = unsafe { core::mem::zeroed() };
+
+/// Cached operational-register base per controller, for the ISR's USBSTS acknowledge. 0 = no
+/// controller in this index. Published by `isr_arm_controller` after the controller is fully up.
+static ISR_OP: [AtomicU64; MAX_CONTROLLERS] = [const { AtomicU64::new(0) }; MAX_CONTROLLERS];
+
+// ── The counters. Every one of these is read by the polled pass and printed by `isr_rollup`. ────
+/// ISR invocations. **The falsifier.** Zero here after the arming line printed means the vector is
+/// not being delivered, and `isr_rollup` says so in words.
+static ISR_ENTRIES: AtomicU64 = AtomicU64::new(0);
+/// Endpoints re-armed FROM THE INTERRUPT. This is the number that is the fix: under the old code it
+/// was structurally impossible for it to be anything but zero, because the site did not exist.
+static ISR_REARMS: AtomicU64 = AtomicU64::new(0);
+/// Endpoints re-armed from the polled pass — today's path, kept and counted so the two are legible
+/// side by side. `isr_rearm=0 poll_rearm=N` is the honest picture of a boot where the interrupt
+/// never arrived.
+static POLL_REARMS: AtomicU64 = AtomicU64::new(0);
+/// Claims the ISR lost to a pass already inside the endpoint. Not an error: the pass finishes the
+/// job. A large number means the two are fighting over the same endpoint, which is worth seeing.
+static ISR_CONTENDED: AtomicU64 = AtomicU64::new(0);
+/// Claims the PASS lost to an ISR already inside the endpoint. Also not an error, and it is the
+/// half that cannot cost a report: whatever the ISR is doing in there ends in the hand-off ring.
+static POLL_CONTENDED: AtomicU64 = AtomicU64::new(0);
+/// Completions the ISR found with a full hand-off ring — it declined and left them for the pass.
+/// **This is the residual defect**: the pass was >= 8 reports late even with the interrupt live.
+static ISR_RING_FULL: AtomicU64 = AtomicU64::new(0);
+/// Completions longer than one hand-off slot (`mtraw` only), declined and left for the pass.
+static ISR_OVERSIZE: AtomicU64 = AtomicU64::new(0);
+/// Deepest hand-off occupancy ever observed, across all endpoints. 1 means the pass was never more
+/// than one report behind; `ISR_RING` means it hit the ceiling and `ISR_RING_FULL` should be nonzero.
+static ISR_DEPTH_MAX: AtomicU32 = AtomicU32::new(0);
+/// Controllers on which MSI + USBINTR were successfully armed.
+static ISR_ARMED: AtomicU32 = AtomicU32::new(0);
+/// Controllers whose MSI could not be armed (no capability, or the enable did not stick).
+static ISR_REFUSED: AtomicU32 = AtomicU32::new(0);
+/// `arch::ms()` of the last `ISRARM` rollup line, and the `ISR_REARMS` value it carried.
+static ISR_LOG_MS: AtomicU64 = AtomicU64::new(0);
+static ISR_LOG_REARMS: AtomicU64 = AtomicU64::new(0);
+/// One-shot latch for the "the interrupt never arrived" verdict, so it is stated ONCE and loudly
+/// rather than every rollup for the rest of the boot.
+static ISR_DEAD_SAID: AtomicU32 = AtomicU32::new(0);
+
+/// Minimum spacing between `ISRARM` rollup lines. The same five seconds as `EHCIDARK_ROLLUP_MS`,
+/// for the same reason: this arc sits downstream of a witness burst that was starving the pointer,
+/// and an instrument for it must not become one.
+const ISRARM_ROLLUP_MS: u64 = 5000;
+/// How long after boot the ISR may stay silent before the pass declares the vector dead. Five
+/// seconds is comfortably past enumeration on the slowest metal boot in the corpus, so a verdict
+/// here is about DELIVERY and not about a device nobody has touched yet.
+const ISRARM_DEAD_MS: u64 = 5000;
+
+/// Publish one armed endpoint into the ISR's registry. Called from `arm_interrupt_ep` AFTER the QH
+/// is linked and the first transfer is armed, so the ISR can only ever see an endpoint the
+/// controller is already executing.
+#[allow(clippy::too_many_arguments)]
+unsafe fn isr_publish_ep(
+    slot: usize,
+    qh: *mut Qh,
+    qtd: *mut Qtd,
+    qtd_phys: u64,
+    buf: *mut u8,
+    buf_phys: u64,
+    rx_total: u32,
+    om: bool,
+    now_ms: u64,
+) {
+    let ep = &ISR_EPS[slot];
+    ep.qh.store(qh as u64, Ordering::Relaxed);
+    ep.qtd.store(qtd as u64, Ordering::Relaxed);
+    ep.qtd_phys.store(qtd_phys, Ordering::Relaxed);
+    ep.buf.store(buf as u64, Ordering::Relaxed);
+    ep.buf_phys.store(buf_phys, Ordering::Relaxed);
+    ep.rx_total.store(rx_total, Ordering::Relaxed);
+    ep.om.store(om as u32, Ordering::Relaxed);
+    // DATA0 is what `arm_interrupt_ep` just armed, so the shared toggle starts where the hardware
+    // is — not at whatever a previous endpoint left in this slot.
+    ep.toggle.store(0, Ordering::Relaxed);
+    ep.seen_ms.store(now_ms, Ordering::Relaxed);
+    ep.head.store(0, Ordering::Relaxed);
+    ep.tail.store(0, Ordering::Relaxed);
+    // LAST, and with `Release`: everything above must be visible to any core that observes `live`.
+    ep.live.store(1, Ordering::Release);
+}
+
+/// Re-arm one endpoint for another IN transfer. **The single re-arm implementation** — the ISR and
+/// the polled pass both come here, so the overlay-direct / qTD-chain fork and the data toggle each
+/// exist exactly once. Writes only this endpoint's own QH/qTD; takes nothing, allocates nothing,
+/// cannot block.
+unsafe fn isr_rearm(ep: &IsrEp) {
+    // Flip first, then use the NEW value: `fetch_xor` returns the old one.
+    let toggle = ep.toggle.fetch_xor(1, Ordering::Relaxed) ^ 1;
+    let dt = if toggle & 1 != 0 { QTD_DT } else { 0 };
+    let qh = ep.qh.load(Ordering::Relaxed) as *mut Qh;
+    let total = ep.rx_total.load(Ordering::Relaxed);
+    let buf_phys = ep.buf_phys.load(Ordering::Relaxed);
+    if ep.om.load(Ordering::Relaxed) != 0 {
+        (*qh).overlay[0] = PTR_TERMINATE;
+        (*qh).overlay[1] = PTR_TERMINATE;
+        (*qh).overlay[3] = buf_phys as u32;
+        (*qh).overlay[4] = 0;
+        // Token written LAST (volatile), the discipline `write_qtd` states: the controller must
+        // never see a half-built descriptor.
+        core::ptr::write_volatile(
+            &mut (*qh).overlay[2],
+            QTD_ACTIVE | QTD_CERR3 | (total << QTD_TOTAL_SHIFT) | QTD_PID_IN | QTD_IOC | dt,
+        );
+    } else {
+        let qtd = ep.qtd.load(Ordering::Relaxed) as *mut Qtd;
+        write_qtd(qtd, PTR_TERMINATE, QTD_PID_IN | QTD_IOC | dt, total, buf_phys);
+        (*qh).overlay[1] = PTR_TERMINATE;
+        core::ptr::write_volatile(&mut (*qh).overlay[2], 0);
+        core::ptr::write_volatile(
+            &mut (*qh).overlay[0],
+            ep.qtd_phys.load(Ordering::Relaxed) as u32,
+        );
+    }
+}
+
+/// Take the oldest hand-off report for `slot` into `out`, returning `(len, at_ms, gap_ms)`.
+/// Consumer side of the SPSC ring; called ONLY from the polled pass, under `EHCI_HID`.
+unsafe fn isr_take(slot: usize, out: &mut [u8; ISR_SLOT_LEN]) -> Option<(usize, u64, u64)> {
+    let ep = &ISR_EPS[slot];
+    let head = ep.head.load(Ordering::Relaxed);
+    // `Acquire`: pairs with the producer's `Release` store, which is what makes the slot bytes
+    // written before it visible here.
+    if head == ep.tail.load(Ordering::Acquire) {
+        return None;
+    }
+    let s = &(*core::ptr::addr_of_mut!(ISR_RINGS))[slot][(head as usize) % ISR_RING];
+    let len = (s.len as usize).min(ISR_SLOT_LEN);
+    out[..len].copy_from_slice(&s.data[..len]);
+    let r = (len, s.at_ms, s.gap_ms as u64);
+    ep.head.store(head.wrapping_add(1), Ordering::Release);
+    Some(r)
+}
+
+/// Claim one endpoint for the POLLED pass. Blocking is not allowed here either — the ISR may hold
+/// the claim for the length of a 64-byte copy and nothing longer, so a pass that loses simply skips
+/// the endpoint this round and takes the report out of the hand-off ring next time. Returns false
+/// if the claim was not taken.
+fn isr_claim_poll(slot: usize) -> bool {
+    ISR_EPS[slot]
+        .claim
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_ok()
+}
+
+fn isr_release_poll(slot: usize) {
+    ISR_EPS[slot].claim.store(0, Ordering::Release);
+}
+
+/// The data toggle currently armed on `e`'s endpoint, for the instruments that print it. It lives
+/// in the shared registry now (see `IsrEp::toggle`), so this is the one place that translates.
+#[cfg(feature = "kbdwit")]
+fn isr_toggle_of(e: &IntEp) -> bool {
+    ISR_EPS[e.isr_slot].toggle.load(Ordering::Relaxed) & 1 != 0
+}
+
+/// Stamp an examination of `slot` at `now_ms` and return the gap since the previous one — the
+/// EHCIDARK clock, shared between the two paths (see `IsrEp::seen_ms`).
+fn isr_mark_seen(slot: usize, now_ms: u64) -> u64 {
+    now_ms.wrapping_sub(ISR_EPS[slot].seen_ms.swap(now_ms, Ordering::Relaxed))
+}
+
+/// Service one endpoint from interrupt context. Every early return leaves the endpoint EXACTLY as
+/// the polled pass would find it today, which is what makes each of them a degradation to the old
+/// behaviour rather than a loss.
+unsafe fn isr_service_ep(slot: usize, now_ms: u64) {
+    let ep = &ISR_EPS[slot];
+    if ep.live.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    // Try-claim. NEVER spin — losing means a pass owns this endpoint right now and will do
+    // precisely what the driver did before this block existed.
+    if ep
+        .claim
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        ISR_CONTENDED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let qh = ep.qh.load(Ordering::Relaxed) as *mut Qh;
+    let tok = if ep.om.load(Ordering::Relaxed) != 0 {
+        core::ptr::read_volatile(&(*qh).overlay[2])
+    } else {
+        core::ptr::read_volatile(&(*(ep.qtd.load(Ordering::Relaxed) as *mut Qtd)).token)
+    };
+    // Still running, or halted. A halt is the pass's business — it retires the endpoint, flushes
+    // held key releases and prints — and none of that belongs on an interrupt stack.
+    if tok & (QTD_ACTIVE | QTD_ERR_MASK) != 0 {
+        ep.claim.store(0, Ordering::Release);
+        return;
+    }
+    let len = ep
+        .rx_total
+        .load(Ordering::Relaxed)
+        .saturating_sub((tok >> QTD_TOTAL_SHIFT) & 0x7FFF) as usize;
+    if len > ISR_SLOT_LEN {
+        ISR_OVERSIZE.fetch_add(1, Ordering::Relaxed);
+        ep.claim.store(0, Ordering::Release);
+        return;
+    }
+    let head = ep.head.load(Ordering::Acquire);
+    let tail = ep.tail.load(Ordering::Relaxed);
+    let depth = tail.wrapping_sub(head);
+    if depth as usize >= ISR_RING {
+        // The pass is more than a ring behind. Decline: the report stays in the endpoint buffer and
+        // the endpoint stays un-re-armed — i.e. exactly today's state — and the pass takes it.
+        ISR_RING_FULL.fetch_add(1, Ordering::Relaxed);
+        ep.claim.store(0, Ordering::Release);
+        return;
+    }
+    // The census's gap, taken HERE — at the consumption — not where the report is later decoded.
+    let gap = now_ms.wrapping_sub(ep.seen_ms.swap(now_ms, Ordering::Relaxed));
+    let s = &mut (*core::ptr::addr_of_mut!(ISR_RINGS))[slot][(tail as usize) % ISR_RING];
+    core::ptr::copy_nonoverlapping(
+        ep.buf.load(Ordering::Relaxed) as *const u8,
+        s.data.as_mut_ptr(),
+        len,
+    );
+    s.len = len as u32;
+    s.at_ms = now_ms;
+    s.gap_ms = gap.min(u32::MAX as u64) as u32;
+    // The report is safely out of the buffer, so the endpoint goes back on the wire BEFORE the
+    // cursor is published. This ordering is the entire point of the arc: it is the shortest path
+    // from "the controller retired the transfer" to "the controller is listening again".
+    isr_rearm(ep);
+    ISR_REARMS.fetch_add(1, Ordering::Relaxed);
+    // `Release`: publishes the slot bytes above to the consumer's `Acquire` load of `tail`.
+    ep.tail.store(tail.wrapping_add(1), Ordering::Release);
+    ISR_DEPTH_MAX.fetch_max(depth + 1, Ordering::Relaxed);
+    ep.claim.store(0, Ordering::Release);
+}
+
+/// The EHCI MSI handler's driver half (IDT vector `EHCI_MSI_VECTOR`). Acknowledge every armed
+/// controller's status register so it can raise again, then lift and re-arm every endpoint that
+/// completed. Lock-free, allocation-free, print-free, and bounded at `ISR_MAX_EPS` endpoints.
+///
+/// The acknowledge is `STS_USBINT` ONLY — never the blind `STS_RW1C` the polled pass uses; see that
+/// constant for the HSE-eating race that shape would have introduced. It is applied to every armed
+/// controller because MSI carries no cause and the ISR cannot tell which function raised; acking one
+/// that did not raise writes back a bit that was already clear, which is a no-op by RW1C's own
+/// definition.
+pub fn interrupt_ack() {
+    ISR_ENTRIES.fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        for op in ISR_OP.iter() {
+            let base = op.load(Ordering::Relaxed);
+            if base == 0 {
+                continue;
+            }
+            if let Some(sts) = mmio_read32(base + OP_USBSTS) {
+                if sts & STS_USBINT != 0 {
+                    let _ = mmio_write32(base + OP_USBSTS, STS_USBINT);
+                }
+            }
+        }
+        let now_ms = crate::arch::ms();
+        for slot in 0..ISR_MAX_EPS {
+            isr_service_ep(slot, now_ms);
+        }
+    }
+}
+
+/// Arm the completion interrupt on one controller: route its MSI to the local APIC, then unmask
+/// `USBINTR.USBINT`. Called once per controller at the very END of `init`, after every endpoint is
+/// armed and published — so the first interrupt this function makes possible can only ever find a
+/// registry that is already complete.
+///
+/// **Every failure here is a REFUSAL, not an error.** No MSI capability, an enable bit that does not
+/// stick, an unmapped operational base: each one leaves the controller exactly as it was, prints why,
+/// and the driver goes on polling. That is the same posture `bt_acl_txn` takes when it refuses chain
+/// mode rather than invent an unexercised path, and for the same reason.
+///
+/// **INTx is not a fallback and is deliberately not attempted.** This kernel is a pure local-APIC
+/// system with no IOAPIC redirection programming anywhere in the tree (`arch/x86_64/apic.rs` has no
+/// redirection-entry writer), so a legacy INTA# assertion has nowhere to be delivered. Enabling MSI
+/// masks INTx per PCI spec, which is the correct end state either way; a controller without MSI
+/// simply stays polled.
+unsafe fn isr_arm_controller(idx: usize, bus: u8, dev: u8, func: u8, op: u64) {
+    // Cache the operational base FIRST: the ISR needs it to acknowledge USBSTS, and an interrupt
+    // that arrives before the base is published would leave the status bit set and the controller
+    // unable to raise again.
+    if idx < MAX_CONTROLLERS {
+        ISR_OP[idx].store(op, Ordering::Relaxed);
+    }
+    let msg_addr = 0xFEE0_0000u32 | ((crate::arch::x86_64::apic::apic_id() as u32) << 12);
+    if !crate::drivers::pci::PciScanner::enable_msi(
+        bus,
+        dev,
+        func,
+        msg_addr,
+        crate::arch::interrupts::EHCI_MSI_VECTOR as u32,
+    ) {
+        ISR_REFUSED.fetch_add(1, Ordering::Relaxed);
+        if idx < MAX_CONTROLLERS {
+            ISR_OP[idx].store(0, Ordering::Relaxed);
+        }
+        serial_println!(
+            ":: EHCI-HID: [{}] ISRARM REFUSED — this function offers no usable MSI capability, and there is no IOAPIC in this kernel to route INTx to. The endpoint stays on the POLLED re-arm path, which is unchanged; the dark window EHCIDARK measures is unchanged with it == witness ::",
+            idx
+        );
+        return;
+    }
+    // Unmask ONLY the IOC completion cause. Read-modify-write so a bit firmware left set is not
+    // silently cleared, and read back so "enabled" is a MEASUREMENT rather than a write we hope
+    // landed — a masked USBINTR is exactly the state that would make the ISR silently absent.
+    let prev = mmio_read32(op + OP_USBINTR).unwrap_or(0);
+    let _ = mmio_write32(op + OP_USBINTR, prev | INTR_USBINT);
+    let now = mmio_read32(op + OP_USBINTR).unwrap_or(0);
+    if now & INTR_USBINT == 0 {
+        ISR_REFUSED.fetch_add(1, Ordering::Relaxed);
+        ISR_OP[idx].store(0, Ordering::Relaxed);
+        serial_println!(
+            ":: EHCI-HID: [{}] ISRARM REFUSED — USBINTR write did not stick ({:#010x} -> {:#010x}); the completion cause is still masked, so the vector could never fire. Staying on the POLLED re-arm path == witness ::",
+            idx, prev, now
+        );
+        return;
+    }
+    ISR_ARMED.fetch_add(1, Ordering::Relaxed);
+    serial_println!(
+        ":: EHCI-HID: [{}] ISRARM armed — MSI vector {:#04x} -> apic {:#x}, USBINTR {:#010x} -> {:#010x} (USBINT unmasked). The polled pass REMAINS the fallback: if this vector never fires, an `ISRARM IRQ DEAD` line follows and nothing else changes == witness ::",
+        idx,
+        crate::arch::interrupts::EHCI_MSI_VECTOR,
+        msg_addr,
+        prev,
+        now
+    );
+}
+
+/// ISRARM — the completion-interrupt fixture, run once at `init` before any endpoint is armed.
+///
+/// **Why it exists.** The interrupt cannot fire in QEMU: `hcd-ehci` advertises no PCI capability
+/// list, so `isr_arm_controller` refuses MSI and every automated gate in this repo would run with
+/// `isr_service_ep`, the hand-off ring and the shared re-arm as unexecuted code. This drives them
+/// for real — a hand-built completion token, the actual ISR entry point, the actual consumer — so a
+/// regression in the interrupt path fails a QEMU boot instead of waiting for a bench sitting.
+///
+/// **Why it is safe to run here.** It borrows `DMA_POOLS[0].int_slots[0]` and `ISR_EPS[0]` at a
+/// moment when both are provably unowned: no controller has been constructed, no endpoint has been
+/// armed, `USBINTR` is masked on every function and no MSI is routed, so nothing else in the machine
+/// can be looking at either. `arm_interrupt_ep` rewrites both from scratch when the slot is really
+/// used, and the fixture puts `live`, the cursors and the counters back before it returns — the
+/// operational numbers on the `ISRARM` line start from zero, not from the fixture's tally.
+///
+/// It runs in BOTH transfer modes on purpose. The metal takes the overlay-direct fork and QEMU takes
+/// the qTD-chain one, so a fixture that tested only the mode it happens to be booting on would be
+/// blind to exactly the half this arc's own risk lives in.
+unsafe fn isr_selftest() {
+    let pool = &mut DMA_POOLS[0] as *mut qh::DmaPool;
+    let slot0 = &mut (*pool).int_slots[0];
+    let (qh, qtd, buf) = (
+        &mut slot0.qh as *mut Qh,
+        &mut slot0.qtd as *mut Qtd,
+        slot0.buf.0.as_mut_ptr(),
+    );
+    let (Some(qh_phys), Some(qtd_phys), Some(buf_phys)) =
+        (phys_of(qh, 32), phys_of(qtd, 32), phys_of(buf, INT_BUF_ALIGN))
+    else {
+        serial_println!(
+            ":: EHCI-HID: ISRARM self-test SKIPPED — the static pool failed the phys/alignment contract, which is the same refusal `arm_interrupt_ep` would make. Nothing was exercised; treat the ISR path as UNTESTED on this boot == witness ::"
+        );
+        return;
+    };
+    let _ = qh_phys;
+    // Snapshot the operational counters: the fixture drives the real ISR, so it necessarily moves
+    // them, and a boot's `ISRARM` line must count the machine's work rather than the test's.
+    let saved = (
+        ISR_REARMS.load(Ordering::Relaxed),
+        ISR_RING_FULL.load(Ordering::Relaxed),
+        ISR_CONTENDED.load(Ordering::Relaxed),
+        ISR_DEPTH_MAX.load(Ordering::Relaxed),
+    );
+    const RX: u32 = 8;
+    let mut order_ok = true;
+    let mut payload_ok = true;
+    let mut rearm_ok = true;
+    let mut toggle_ok = true;
+    let mut full_ok = true;
+    let mut modes = 0u32;
+    for om in [false, true] {
+        isr_publish_ep(0, qh, qtd, qtd_phys, buf, buf_phys, RX, om, 0);
+        // Push ISR_RING + 1 completions. The first `ISR_RING` must land; the last must be REFUSED
+        // with the endpoint left un-re-armed — that refusal is the residual-defect path
+        // (`ISR_RING_FULL`) and the one branch a live machine hits only when it is already late.
+        let full_before = ISR_RING_FULL.load(Ordering::Relaxed);
+        for k in 1..=(ISR_RING + 1) {
+            // Stand in for the controller: land a payload and retire the transfer. Active clear,
+            // no error bits, zero residue => the ISR should read exactly RX bytes.
+            core::ptr::write_volatile(buf, k as u8);
+            core::ptr::write_volatile(buf.add(1), 0xA5);
+            let done = QTD_CERR3 | QTD_PID_IN;
+            if om {
+                core::ptr::write_volatile(&mut (*qh).overlay[2], done);
+            } else {
+                core::ptr::write_volatile(&mut (*qtd).token, done);
+            }
+            isr_service_ep(0, k as u64);
+            // The endpoint must be back on the wire after every accepted completion, and must NOT
+            // be after the refused one — that is the whole contract the pass depends on.
+            let tok = if om {
+                core::ptr::read_volatile(&(*qh).overlay[2])
+            } else {
+                core::ptr::read_volatile(&(*qtd).token)
+            };
+            let armed = tok & QTD_ACTIVE != 0;
+            let expect_armed = k <= ISR_RING;
+            if armed != expect_armed {
+                rearm_ok = false;
+            }
+            // The data toggle, read off the token the re-arm actually wrote rather than off the
+            // atomic, so this checks the wire contract and not the bookkeeping that produced it.
+            //
+            // The FIRST re-arm is DATA1, not DATA0, and that ordering is the whole point of
+            // checking it: `arm_interrupt_ep` puts DATA0 on the wire itself when it arms the
+            // endpoint, so re-arm #1 is the SECOND transfer of the pipe. (The fixture asserted
+            // DATA0 here on its first run and this line failed the gate — which is the fixture
+            // doing its job: it is genuinely executing `isr_rearm`, not agreeing with it.)
+            if expect_armed {
+                let want_dt = if k % 2 == 1 { QTD_DT } else { 0 };
+                if tok & QTD_DT != want_dt {
+                    toggle_ok = false;
+                }
+            }
+        }
+        if ISR_RING_FULL.load(Ordering::Relaxed) != full_before + 1 {
+            full_ok = false;
+        }
+        // Drain. FIFO across the wrap, payload intact, and the ring empty afterwards.
+        let mut out = [0u8; ISR_SLOT_LEN];
+        for k in 1..=ISR_RING {
+            match isr_take(0, &mut out) {
+                Some((n, at_ms, _gap)) => {
+                    if n != RX as usize || at_ms != k as u64 {
+                        order_ok = false;
+                    }
+                    if out[0] != k as u8 || out[1] != 0xA5 {
+                        payload_ok = false;
+                    }
+                }
+                None => order_ok = false,
+            }
+        }
+        if isr_take(0, &mut out).is_some() {
+            order_ok = false;
+        }
+        modes += 1;
+    }
+    // Put the slot and the counters back. `live = 0` is the important one: until a real endpoint is
+    // published here, the ISR must not treat this slot as anything.
+    ISR_EPS[0].live.store(0, Ordering::Release);
+    ISR_EPS[0].head.store(0, Ordering::Relaxed);
+    ISR_EPS[0].tail.store(0, Ordering::Relaxed);
+    ISR_EPS[0].claim.store(0, Ordering::Release);
+    core::ptr::write_bytes(&mut (*qh) as *mut Qh as *mut u8, 0, core::mem::size_of::<Qh>());
+    core::ptr::write_bytes(&mut (*qtd) as *mut Qtd as *mut u8, 0, core::mem::size_of::<Qtd>());
+    core::ptr::write_bytes(buf, 0, INT_BUF_LEN);
+    ISR_REARMS.store(saved.0, Ordering::Relaxed);
+    ISR_RING_FULL.store(saved.1, Ordering::Relaxed);
+    ISR_CONTENDED.store(saved.2, Ordering::Relaxed);
+    ISR_DEPTH_MAX.store(saved.3, Ordering::Relaxed);
+    let ok = order_ok && payload_ok && rearm_ok && toggle_ok && full_ok && modes == 2;
+    serial_println!(
+        ":: EHCI-HID: ISRARM self-test: modes={} (overlay-direct + qTD-chain) depth={} fifo={} payload={} rearm={} toggle={} ringfull-refuses={} -> {} == witness ::",
+        modes, ISR_RING, order_ok, payload_ok, rearm_ok, toggle_ok, full_ok,
+        if ok { "PASS" } else { "FAIL" }
+    );
+}
+
+/// The `ISRARM` rollup, emitted from the POLLED pass (never from the ISR). Two jobs, and the second
+/// is the one that matters: it makes a DEAD vector a printed statement rather than an absence.
+///
+/// Rate-limited to `ISRARM_ROLLUP_MS` and gated on `ISR_REARMS` having MOVED, so a boot in which the
+/// interrupt is doing its job emits one line per five seconds of actual pointer activity and nothing
+/// at all while the machine is idle. The dead verdict does NOT share that gate — it fires precisely
+/// because the counter is not moving.
+fn isr_rollup(now_ms: u64) {
+    let armed = ISR_ARMED.load(Ordering::Relaxed);
+    if armed == 0 && ISR_REFUSED.load(Ordering::Relaxed) == 0 {
+        return; // nothing was ever attempted — nothing to report
+    }
+    let entries = ISR_ENTRIES.load(Ordering::Relaxed);
+    let rearms = ISR_REARMS.load(Ordering::Relaxed);
+    // ── THE NEGATIVE CASE, SAID OUT LOUD, ONCE. ────────────────────────────────────────────────
+    // An instrument that cannot fire in the state it exists for is not a cheaper guard, it is an
+    // absent one — so "we armed the vector and it has never been delivered" gets its own sentence
+    // in the capture instead of being inferred from a line that is missing.
+    if armed > 0
+        && entries == 0
+        && now_ms >= ISRARM_DEAD_MS
+        && ISR_DEAD_SAID
+            .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        // The counts ride along on THIS line, not only on the rollup below. The rollup is gated on
+        // `ISR_REARMS` having MOVED, and in precisely this state it never will — so a dead-vector
+        // boot would otherwise carry the verdict without a single number behind it, and an operator
+        // would have to take "everything still polled" on the driver's word. `poll_rearm=` is that
+        // word's evidence: nonzero here means the fallback is not merely nominated but working.
+        serial_println!(
+            ":: EHCI-HID: ISRARM IRQ DEAD — MSI armed on {} controller(s) and USBINTR enabled, but the vector has NOT been delivered once in {} ms (irq={} isr_rearm={} poll_rearm={}). Every endpoint is being re-armed by the POLLED pass, exactly as before this arc; the dark window is unchanged and EHCIDARK still measures it. This is the fallback working, not a crash == witness ::",
+            armed, now_ms, entries, rearms, POLL_REARMS.load(Ordering::Relaxed)
+        );
+    }
+    if rearms == ISR_LOG_REARMS.load(Ordering::Relaxed)
+        || now_ms.wrapping_sub(ISR_LOG_MS.load(Ordering::Relaxed)) < ISRARM_ROLLUP_MS
+    {
+        return;
+    }
+    ISR_LOG_MS.store(now_ms, Ordering::Relaxed);
+    ISR_LOG_REARMS.store(rearms, Ordering::Relaxed);
+    serial_println!(
+        ":: EHCI-HID: ISRARM armed={} refused={} irq={} isr_rearm={} poll_rearm={} depth_max={} ringfull={} cont_isr={} cont_poll={} oversize={} == witness ::",
+        armed,
+        ISR_REFUSED.load(Ordering::Relaxed),
+        entries,
+        rearms,
+        POLL_REARMS.load(Ordering::Relaxed),
+        ISR_DEPTH_MAX.load(Ordering::Relaxed),
+        ISR_RING_FULL.load(Ordering::Relaxed),
+        ISR_CONTENDED.load(Ordering::Relaxed),
+        POLL_CONTENDED.load(Ordering::Relaxed),
+        ISR_OVERSIZE.load(Ordering::Relaxed),
+    );
+}
 
 /// KBDFLAP — the software name for what an armed interrupt endpoint is, shared by the halt
 /// STOP-NOTE and the KBDWIT dump so the two lines can be joined by eye. It is the DRIVER'S belief;
@@ -13690,7 +14538,10 @@ unsafe fn kbdwit_note_halt(e: &mut IntEp, idx: usize, tok: u32) {
         e.kbdwit_walks,
         e.kbdwit_split_or,
         e.reports,
-        e.toggle as u8,
+        // ISRARM: the toggle moved to the shared registry — see `IsrEp::toggle`. Read here rather
+        // than dropped, because a dump whose fields quietly stopped covering the endpoint's state
+        // would be a worse instrument than one that never had the field.
+        isr_toggle_of(e) as u8,
     );
 }
 
@@ -13765,7 +14616,10 @@ unsafe fn kbdwit_note_silence_end(e: &mut IntEp, idx: usize, verdict: &str, tok:
         e.kbdwit_walks,
         e.kbdwit_split_or,
         e.reports,
-        e.toggle as u8,
+        // ISRARM: the toggle moved to the shared registry — see `IsrEp::toggle`. Read here rather
+        // than dropped, because a dump whose fields quietly stopped covering the endpoint's state
+        // would be a worse instrument than one that never had the field.
+        isr_toggle_of(e) as u8,
     );
 }
 
@@ -13929,7 +14783,7 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
         e.kbdwit_polls, e.kbdwit_walks, e.kbdwit_split_or,
         now.wrapping_sub(since),
         e.kbdwit_armed_ms, e.kbdwit_last_ms, now,
-        e.reports, e.toggle as u8, e.dead as u8,
+        e.reports, isr_toggle_of(e) as u8, e.dead as u8,
     );
     // 2/7 — the token, raw, from all three vantage points (see the honesty note on `seen=`).
     // `qtd_driven=0` marks `qtd_tok` as NOT DRIVEN: on the overlay-direct path the controller is
@@ -13969,7 +14823,14 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
         (chars >> 16) & 0x7FF, kbdwit_eps(chars), (chars >> 14) & 1,
         caps & 0xFF, (caps >> 8) & 0xFF, (caps >> 16) & 0x7F, (caps >> 23) & 0x7F,
         (caps >> 30) & 3,
-        e.buf_phys, e.qtd_phys, fl0,
+        // ISRARM: read out of the registry rather than a per-endpoint copy — the registry holds the
+        // addresses the re-arm actually programs, and this dump exists to be compared against what
+        // the controller is executing. A stale second copy here would make the probe agree with
+        // itself while disagreeing with the hardware, which is the one failure a witness must not
+        // have.
+        ISR_EPS[e.isr_slot].buf_phys.load(Ordering::Relaxed),
+        ISR_EPS[e.isr_slot].qtd_phys.load(Ordering::Relaxed),
+        fl0,
     );
     // 6/7 — controller state. `ok=0` means the MMIO read itself failed and the hex is a
     // placeholder, NOT a set of clear status bits.
@@ -15473,12 +16334,22 @@ unsafe fn pci_evidence(bus: u8, dev: u8, func: u8, idx: usize) {
 /// flip / xhci::init (the internal HID sit on non-switchable EHCI-only ports, so the two
 /// stacks' port sets are disjoint by hardware — PORTSW-1 §7f).
 pub fn init() {
-    serial_println!(":: EHCI-HID: begin (EHCI-3 driver, polling model, knob-gated) ::");
+    serial_println!(
+        ":: EHCI-HID: begin (EHCI-3 driver, polled model + ISRARM completion interrupt, knob-gated) ::"
+    );
     // EPACE: the module's own entry→exit span — the self-check target for the per-phase split.
     let init_t0 = crate::arch::now_cycles();
     // Hardening self-test up front (default-ON driver parses ANY device's descriptor): proves the
     // report-parser is bounded against a hostile Report Count before we enumerate anything.
     unsafe { parser_selftest() };
+    // ISRARM: and the completion-interrupt half, for a blunter reason — on QEMU the interrupt CANNOT
+    // fire. QEMU's `hcd-ehci` exposes no PCI capability list at all, so `isr_arm_controller` refuses
+    // MSI and the entire ISR body would otherwise be dead code in every automated gate this repo
+    // runs. An instrument that cannot fire in the state it exists for is not a cheaper guard, it is
+    // an absent one, and the same is true of the mechanism under it. This fixture drives the real
+    // `isr_service_ep` against a hand-built completion so the ISR path is exercised on every boot,
+    // QEMU included. See `isr_selftest`.
+    unsafe { isr_selftest() };
     let selftest_cy = crate::arch::now_cycles().wrapping_sub(init_t0);
     let mut ctrls: Vec<Controller> = Vec::new();
     // BUY-1 (GR18): the port walk moved out of this loop into a second pass, so each woken
@@ -16042,6 +16913,17 @@ pub fn init() {
 
     let n = ctrls.len();
     let armed: usize = ctrls.iter().map(|c| c.int_eps.len()).sum();
+    // ISRARM — arm the completion interrupt, LAST, and only on controllers that actually armed a
+    // HID endpoint. Last because everything the ISR reads must already exist: every endpoint is
+    // published into `ISR_EPS`, every QH is linked, PSE is on. A controller with no armed endpoint
+    // gets nothing — there would be no completion to serve and the vector would only cost the
+    // machine interrupts to acknowledge.
+    for c in ctrls.iter() {
+        if c.int_eps.is_empty() {
+            continue;
+        }
+        unsafe { isr_arm_controller(c.idx, c.bus, c.dev, c.func, c.op) };
+    }
     *EHCI_HID.lock() = Some(ctrls);
     serial_println!(
         ":: EHCI-HID: end ({} controllers, {} HID endpoints armed) ::",
@@ -16083,6 +16965,11 @@ pub fn service_ehci_hid() {
     for c in ctrls.iter_mut() {
         unsafe { c.service() };
     }
+    // ISRARM: the completion interrupt's own rollup, and its DEAD verdict. Emitted from here — the
+    // polled pass — and never from the ISR, which does not print at all. Placed after the walk so a
+    // line reports the state the pass just left the endpoints in, and outside it so it is charged
+    // once per pass rather than once per controller.
+    isr_rollup(crate::arch::ms());
     // BT-RETRY: drain a pending re-trigger AFTER the service pass, still under the `EHCI_HID` lock,
     // so the chain runs serialized against every controller's service exactly as the boot chain did.
     // One chain per pass; the first controller that claimed a radio owns it.
