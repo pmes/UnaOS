@@ -516,7 +516,171 @@ pub fn orin_wm1() -> crate::video::wm::WinId {
         "[orinwm1] win={} panel={}x{} surf={}x{} box={}x{} at ({},{}) scale={} stage={} present={} -> {}",
         id, pw, ph, cw, ch, ow, oh, ox, oy, scale, staged, pres, verdict
     );
+
+    // 8. CHROME ON GLASS — READ THE PANEL BACK. See `orin_chrome_probe` for why the wire needed this
+    //    and for what each sample can and cannot prove.
+    orin_chrome_probe(id, ox, oy, ow, oh, cw, ch, scale);
     id
+}
+
+// -------------------------------------------------------------------------------------------------
+// ORIN-CHROME — the GROUND-TRUTH read-back of the window's frame. `orindesk`, rides ORIN-WM1.
+// -------------------------------------------------------------------------------------------------
+//
+// WHY THIS EXISTS, STATED AS THE ERROR IT PREVENTS. The orin-5 baton recorded, as a MEASURED fact,
+// that boot7f's window "has NO FRAME ... `chrome_raster`, `CHROME_CELL`, `caption` are all 0 symbols
+// in the flown ELF, dead-stripped." Every one of those three names is a COMPILE-TIME construct —
+// `chrome_raster` is a `const fn` (`video/font.rs`) consumed only by `const CHROME_SIZE`,
+// `CHROME_CELL_W`/`_H` are the `pub const`s it feeds, and the caption's painter is not called
+// `caption` at all (it is `wm::draw_title`). Const-evaluated constants leave NO runtime symbol
+// whether or not the chrome paints, so that check could not have come out any other way, and it was
+// read as evidence of absence. It was wrong: `[crispy] theme=us-crispy-modern@0787ba9f frame=5
+// bevel=1 title_h=34 …` is in the SAME boot7f capture, three lines above `[orinwm1]`, and
+// `wm::crispy_witness` has exactly one caller — `paint_window`'s `if !r.compat` chrome arm, latched
+// once per boot. The frame was painted on the first Orin window ever composited.
+//
+// So the gap this rung closes is not a missing painter. It is that NOTHING on this board's wire
+// distinguishes "the chrome painter RAN" from "chrome pixels are IN THE SCANOUT". `[crispy]` proves
+// the first and cannot prove the second; this panel is a DRAM carveout scanned out by a block that
+// does not snoop, so the compose's trailing `flush_rect` is a real step that can fail on its own. A
+// read-back is the only answer that is about the GLASS.
+//
+// WHAT IS SAMPLED, AND WHY THESE POINTS. `paint_window` machines the window FACE and the TITLE STRIP
+// through `video::ceramic` (a per-row modulation of up to ~2 % of a channel) and the control discs
+// through `ceramic` + `video::knurl`, so none of those pixels equals a theme constant and none can
+// carry an EXACT verdict. The KEYLINE and the two BEVEL hairlines are documented in that same
+// function as deliberately NOT machined ("a single-pixel edge has no room to show a grain"), so they
+// are `theme::FRAME_LINE`, `theme::BEVEL_LIGHT` and `theme::BEVEL_SHADOW` exactly — six pixels whose
+// expected value is a constant this file can compare against without re-deriving one line of chrome
+// arithmetic. Their coordinates are `paint_window`'s own `fill_rect_v` extents read off the outer
+// box: keyline on all four edges at `kw = theme::BEVEL`, bevel light one row inside the top, bevel
+// shadow one row inside the bottom. All six are sampled at the box's MID-EDGE, which clears
+// `theme::CORNER_RADIUS` at both ends by construction (2*12 « 650).
+//
+// THE CONTENT PROBE IS THE DISCRIMINATOR, and it is what keeps this line from raising a false alarm.
+// The surface's magenta centre block is written by step 5 as `0x00FF_00FF` and reaches the panel at
+// `scale = 1` through the same compose and the same `flush_rect` as the frame. Frame probes all
+// missing WITH the content probe hitting means chrome specifically did not land — the shape the
+// baton feared. Both missing means nothing from this pass reached the scanout and the frame is not
+// the story. Two ceramic-modulated samples (the strip's blank right end, the face beside the
+// content) are printed RAW beside them for a reader to compare against `[crispy]`'s own `face=` /
+// `title_act=` fields; a verdict on those would be a verdict on the material, not on the frame.
+//
+// SAFETY AND COST. `FrameBuffer::read_pixel` is the compositor's own verify primitive — bounds-checked
+// against the mapped length, `None` off-panel, and the one place the read-back ban is lifted by name.
+// Nine reads, once, on the boot core with no scheduler running. `WRITER` is copied out and its guard
+// dropped in a single statement, so no `wm` lock is ever taken under it (ORIN-WM1's acyclic rule);
+// `close_box_rect` takes the window TABLE and is called BEFORE that copy, never under it.
+#[cfg(feature = "orindesk")]
+fn orin_chrome_probe(
+    id: crate::video::wm::WinId,
+    ox: usize,
+    oy: usize,
+    ow: usize,
+    oh: usize,
+    cw: usize,
+    ch: usize,
+    scale: usize,
+) {
+    use crate::video::{theme, wm};
+
+    // Read BEFORE `WRITER` is taken: `control_disc_rect` locks the window table, and the
+    // WRITER -> TABLE order this file keeps acyclic forbids that nesting.
+    let disc = wm::close_box_rect(id);
+
+    let fb = *crate::video::WRITER.lock();
+    if !fb.is_ready() {
+        serial_println!("[orinchrome] DECLINE reason=no-panel");
+        return;
+    }
+
+    // `paint_window`'s own widths, not a second copy of them: the keyline is `kw = theme::BEVEL`
+    // thick, and the bevel is `theme::BEVEL` thick drawn inset by the keyline's width.
+    let kw = theme::BEVEL;
+    let mx = ox + ow / 2; // mid-edge column — clear of both top corner arcs
+    let my = oy + oh / 2; // mid-edge row
+    let probes: [(&str, usize, usize, u32); 6] = [
+        ("kl_top", mx, oy, theme::FRAME_LINE),
+        ("kl_bot", mx, oy + oh - kw, theme::FRAME_LINE),
+        ("kl_left", ox, my, theme::FRAME_LINE),
+        ("kl_right", ox + ow - kw, my, theme::FRAME_LINE),
+        ("bev_lt", mx, oy + kw, theme::BEVEL_LIGHT),
+        ("bev_sh", mx, oy + oh - kw - theme::BEVEL, theme::BEVEL_SHADOW),
+    ];
+    let mut hit = 0usize;
+    let mut read = 0usize;
+    for (name, x, y, want) in probes.iter() {
+        match fb.read_pixel(*x, *y) {
+            Some(got) => {
+                read += 1;
+                if got == *want {
+                    hit += 1;
+                }
+                serial_println!(
+                    "[orinchrome] probe={} at ({},{}) got={:#08x} want={:#08x} -> {}",
+                    name,
+                    x,
+                    y,
+                    got,
+                    want,
+                    if got == *want { "MATCH" } else { "MISS" }
+                );
+            }
+            None => serial_println!(
+                "[orinchrome] probe={} at ({},{}) -> UNMAPPED (off-panel, or past the mapped length)",
+                name,
+                x,
+                y
+            ),
+        }
+    }
+
+    // THE DISCRIMINATOR — the surface's magenta centre block, unmodulated. The content rectangle is
+    // `paint_window`'s own (`w * scale` by `h * scale` at the content origin), so this is the centre
+    // of the block at ANY integer scale the placer picks, not only at the bench panel's 1.
+    let (cx, cy) = (
+        ox + wm::BORDER + cw * scale / 2,
+        oy + wm::TITLE_H + wm::BORDER + ch * scale / 2,
+    );
+    let content = fb.read_pixel(cx, cy);
+    let content_ok = content == Some(0x00FF_00FF);
+
+    // CERAMIC'S POPULATION — printed raw, never judged.
+    let strip = fb.read_pixel(ox + ow - wm::BORDER - 2, oy + wm::BORDER + wm::TITLE_H / 2);
+    let face = fb.read_pixel(ox + kw + theme::BEVEL, cy);
+    let ctrl = disc.and_then(|(bx, by, d)| fb.read_pixel(bx + d / 2, by + d / 2));
+
+    // The verdict is DERIVED from the counts above, never asserted — the law `[orinwm1]`'s own
+    // trailing verdict is written under.
+    let verdict = if read == 0 {
+        "UNREADABLE"
+    } else if hit == read {
+        "CHROME-ON-GLASS"
+    } else if hit > 0 {
+        "CHROME-PARTIAL"
+    } else if content_ok {
+        "CHROME-MISSING"
+    } else {
+        "COMPOSITE-NOT-ON-GLASS"
+    };
+    serial_println!(
+        "[orinchrome] win={} box={}x{} at ({},{}) frame={}/{} content={:#08x}@({},{}) {} strip={:#08x} face={:#08x} ctrl={:#08x} (ceramic — raw, compare with [crispy]) -> {}",
+        id,
+        ow,
+        oh,
+        ox,
+        oy,
+        hit,
+        read,
+        content.unwrap_or(0),
+        cx,
+        cy,
+        if content_ok { "MATCH" } else { "MISS" },
+        strip.unwrap_or(0),
+        face.unwrap_or(0),
+        ctrl.unwrap_or(0),
+        verdict
+    );
 }
 
 // =================================================================================================

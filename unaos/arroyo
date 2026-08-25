@@ -728,10 +728,14 @@ _feats=""
 # 16 KiB kernel stack and that failure does not reproduce on the QEMU gate. Standalone feature (does NOT
 # imply tegra, mirroring smpmark), but every site is tegra-gated, so arm it WITH tegra:
 # `UNAOS_TEGRA=1 UNAOS_ORINDESK=1 ./arroyo check`, or `UNAOS_ORINDESK=1 ./arroyo esp-jetson` (esp-jetson
-# forces tegra). Default OFF; when unset the window vanishes, no line moves in any file compiled
-# knob-off (both edits are appends), and the tegra image is byte-identical to baseline. The ARMED build
+# forces tegra). Default OFF; when unset the window vanishes and the knob-off jetson OBJCOPY'D LOADABLE
+# IMAGE is byte-identical to baseline — measured on `llvm-objcopy -O binary kernel.elf`, not on
+# `kernel.elf` (build-path/debug metadata) and not on the ESP (it embeds SRC.TGZ). The ARMED build
 # is type-checked by the `arm-tegra-orindesk` leg of KERNEL_CFG_MATRIX, not by this mapping. Witness on
-# the wire: `[orinwm1] win=... -> COMPOSITED`.
+# the wire: `[orinwm1] win=... -> COMPOSITED`, then ORIN-CHROME's ground-truth read-back of the frame
+# — six `[orinchrome] probe=` lines and one `[orinchrome] win=... -> CHROME-ON-GLASS` verdict. The
+# chrome PAINTER needs no knob and never did (`wm::paint_window` carries no `#[cfg]`); what the probe
+# adds is proof the frame's PIXELS reached the non-snooping scanout, which `[crispy]` cannot give.
 [ -n "${UNAOS_ORINDESK:-}" ] && _feats="${_feats}orindesk,"
 # JD1-DC (JD1DC): UNAOS_JD1DC=1 arms the Jetson Orin's BPMP-GUARDED, READ-ONLY nvdisplay register
 # probe — `arch/aarch64/display_tegra.rs::jd1_dc_probe`, called as the LAST statement of

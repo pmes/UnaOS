@@ -9474,6 +9474,58 @@ Every decline is named on the same `[orinwm1]` tag and none is fatal to the boot
 `reason=no-panel` (headless: no JD1 scanout), `reason=alloc`, `reason=geometry-unavailable`,
 `reason=create-failed`, `reason=extent-overflow`, `reason=empty-extent`.
 
+### ORIN-CHROME — the window's frame, and the read-back that proves it reached glass
+
+**The chrome painter was never gated off on this board, and boot7f proves it.** The orin-5 baton
+recorded "the window has NO FRAME … `chrome_raster`, `CHROME_CELL`, `caption` are all 0 symbols in
+the flown ELF, dead-stripped". All three are compile-time constructs — `chrome_raster` is a
+`const fn` in `video/font.rs` consumed only by `const CHROME_SIZE`, `CHROME_CELL_W`/`_H` are the
+`pub const`s it feeds, and the caption's painter is `wm::draw_title`, not `caption`. Const-evaluated
+constants leave no runtime symbol whether or not the chrome paints, so that check could not have
+come out any other way.
+
+The positive evidence is in the same capture, three lines above `[orinwm1]`:
+
+```
+[crispy] theme=us-crispy-modern@0787ba9f frame=5 bevel=1 title_h=34 radius=12 ctrl=24 gap=12 face=0xececee …
+[ceramic] derived=peter-2026-08-09 algo=brushed-1d …
+[knurl]   derived=peter-2026-08-09 algo=crosshatch-2x45 …
+```
+
+`wm::crispy_witness` has exactly one caller — `paint_window`'s `if !r.compat` chrome arm — and is
+latched once per boot, so its presence proves a window was framed rather than that the constants
+exist. `paint_window` itself carries **no `#[cfg]` at all**: the `wc` / `pidesk` gates in
+`composite_pass_half` and `composite_inner` cover *furniture* (`strip::compose_all`, the
+dock/crystal sprite arming), never window chrome. Reachability on the armed jetson build is a `bl`
+chain, not an inference: `orin_wm1` → `wm::composite` → `wm::paint_window` → `wm::draw_title`.
+
+**What the wire could NOT say** is whether those pixels reached the scanout. `[crispy]` proves the
+painter ran; this panel is a DRAM carveout scanned out by a block that does not snoop, so the
+compose's trailing `flush_rect` is a real step that can fail on its own. `orin_chrome_probe` closes
+that with a ground-truth read-back through `FrameBuffer::read_pixel` (the compositor's own verify
+primitive — bounds-checked, `None` off-panel), nine reads, once, on the boot core:
+
+```
+[orinchrome] probe=kl_top at (960,378) got=0x00b4b4b9 want=0x00b4b4b9 -> MATCH
+…
+[orinchrome] win=1 box=650x444 at (635,378) frame=6/6 content=0x00ff00ff@(960,600) MATCH strip=… face=… ctrl=… -> CHROME-ON-GLASS
+```
+
+Six probes carry an EXACT verdict and only six can: `paint_window` machines the window face, the
+title strip and the control discs through `video::ceramic` (and the discs additionally through
+`video::knurl`), so none of those pixels equals a theme constant. The keyline and the two bevel
+hairlines are documented in that same function as deliberately **not** machined, so they are
+`theme::FRAME_LINE`, `theme::BEVEL_LIGHT` and `theme::BEVEL_SHADOW` exactly — sampled at the box's
+mid-edge, which clears `theme::CORNER_RADIUS` at both ends by construction. The ceramic population
+(`strip=`, `face=`, `ctrl=`) is printed **raw and unjudged**, for comparison against `[crispy]`'s own
+`face=` / `title_act=` fields.
+
+The **content probe is the discriminator**: the surface's magenta centre reaches the panel at
+`scale = 1` through the same compose and the same `flush_rect` as the frame. Frame probes all
+missing *with* the content probe hitting is `CHROME-MISSING` — chrome specifically did not land.
+Both missing is `COMPOSITE-NOT-ON-GLASS` and the frame is not the story. The verdict is DERIVED from
+the hit counts, never asserted, on `[orinwm1]`'s own rule.
+
 ### Gating and verification status
 
 `orindesk` is standalone (it does **not** imply `tegra`, mirroring `smpmark`), but every one of its
@@ -9492,10 +9544,15 @@ QEMU models no Tegra234, so the behavioural verdict is **metal-owed**: an attend
 DisplayPort monitor should show one bordered window with a title bar, centred on the panel, over a
 still-readable boot log, and the `[orinwm1] ... -> COMPOSITED` line in the serial capture.
 
-Default OFF is **measured, not argued**: both source edits are appends (a statement appended to an
-existing `main.rs` line, a function appended to the end of `display_tegra.rs`), so no line moves in any
-file compiled knob-off and no panic `Location` shifts. `esp-jetson` built either side of the change
-yields a byte-identical `kernel.elf`.
+Default OFF is **measured, not argued**: the `main.rs` edit is a statement appended to an existing
+line, so no line moves in any file compiled knob-off outside `display_tegra.rs` itself, and that file
+is `tegra`-gated in full (neither the Pi nor x86 compiles a byte of it). ORIN-CHROME inserts its
+probe *inside* `display_tegra.rs`, which does shift panic `Location` line numbers later in that one
+file — so the claim is made on the artefact rather than on the edit shape: `esp-jetson` built
+knob-off either side of the change yields a **byte-identical objcopy'd loadable image**
+(`llvm-objcopy -O binary kernel.elf`, sha256 `d16934db6713…`). The staged `kernel.elf` itself is
+*not* compared — it carries build-path and debug metadata — and neither is the ESP, which embeds
+`SRC.TGZ` and is a guaranteed false positive.
 
 ## JD1-DC — can the CCPLEX see nvdisplay? (`UNAOS_JD1DC`, default OFF, read-only)
 
