@@ -2838,6 +2838,8 @@ pub fn focus_changed(asid: u64) {
         erase(&hidden[..nhidden]);
     }
     if asid == 0 {
+        #[cfg(feature = "witness")]
+        DW_FULL_FOCUS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         super::screen::request_full_present();
     }
     #[cfg(feature = "witness")]
@@ -12338,6 +12340,8 @@ pub fn minimise(id: WinId) -> &'static str {
     let barrier = DrainBarrier::drain();
     erase(&[vacated]);
     damage_intersecting(vacated.0, vacated.1, vacated.2, vacated.3);
+    #[cfg(feature = "witness")]
+    DW_FULL_PARK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     super::screen::request_full_present();
     drop(barrier);
     // WC-K2 — no CURSOR-14 bracket-closer here any more. `erase` paints nothing and takes the sprite
@@ -12479,6 +12483,8 @@ pub fn zoom(id: WinId) -> &'static str {
         let barrier = DrainBarrier::drain();
         erase(&[b]);
         damage_intersecting(b.0, b.1, b.2, b.3);
+        #[cfg(feature = "witness")]
+        DW_FULL_ZOOM.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         super::screen::request_full_present();
         drop(barrier);
         // WC-K2 — no CURSOR-14 bracket-closer here any more. `erase` paints nothing and takes the sprite
@@ -13656,6 +13662,24 @@ pub fn drag_route_tail(ev: crate::pal::Event) -> bool {
     let (x, y) = crate::pal::cursor::pos(pw, ph);
     drag_motion_paced(x, y)
 }
+
+/// DRAGWIDE — per-site census of the whole-panel present requests, so the `[dragwide]` line can NAME
+/// the widener instead of inferring it. One counter per `request_full_present` call site in this
+/// module; the drain's WAS the only one a drag could reach once per admitted move, which is what
+/// made it the 4.2x — its counter stays on the wire as the regression witness (`drain=` must read 0
+/// now that the drain requests per-box rects; see `drain_deferred`'s tail). Witness-only, swapped by
+/// the `[dragperf]` fixture.
+#[cfg(feature = "witness")]
+#[allow(dead_code)] // kept on the [dragwide] wire as the structural-zero regression witness
+static DW_FULL_DRAIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static DW_FULL_PARK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static DW_FULL_ZOOM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static DW_FULL_FOCUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static DW_FULL_RECLAIM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// DRAG-PI M4 — the MOVE PATH's desktop-repaint bill: how many moves asked, and for how many pixels.
 /// Charged at the two `request_present_rect` calls in [`move_to_inner`] and nowhere else, so the
@@ -15172,13 +15196,32 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
                 super::cursor::note_present_over_sprite(sprite_hit);
             }
         }
+        // DRAGWIDE — the desktop is owed a re-derive of exactly THIS box, so exactly this box is
+        // what the request carries. See the ledger at the (removed) whole-panel request below.
+        super::screen::request_present_rect(x, y, w, h);
         painted = true;
     }
-    if painted {
-        // WC-J's third step: only the desktop can put its own content (console text, status strip)
-        // back under a departed window; the erase above can only paint `DESKTOP_BG`.
-        super::screen::request_full_present();
-    }
+    // DRAGWIDE — the whole-panel request that used to stand here was THE WIDENER, convicted by
+    // measurement rather than by reading. WC-J's third step is real: only the desktop can put its
+    // own content (console text, the status strip) back under a departed window, because the fills
+    // above can only paint `DESKTOP_BG`. But that duty is PER-PIXEL, and this drain runs at the
+    // head of the `composite()` every `move_to_inner` performs — so during a drag the line below
+    // was reached once per admitted motion, and `request_full_present()` here undid DRAG-PI M1's
+    // narrowing wholesale: the move path requested (old box ∪ new box) and this tail escalated the
+    // very same present to the panel. The 1920x1200 fixture read it directly:
+    // `[dragwide] moves=48 full_reqs=47 by_site drain=47 park=0 zoom=0 focus=0 reclaim=0` — every
+    // whole-panel request of the sweep came from this one site — against a move path that had asked
+    // for `px_per_move=98800`, i.e. 4.3% of the panel. The bench read the same shape as 4.2x
+    // whole-panel republish per composite on a no-load shell drag.
+    //
+    // The cure is DRAG-PI M1's, applied to the drain's own boxes: each box that PUBLISHES above now
+    // requests exactly itself (`request_present_rect` in the loop), which satisfies the per-pixel
+    // duty over precisely the pixels this drain turned `DESKTOP_BG` and not one more. A box that
+    // re-deferred publishes nothing and owes nothing yet; it makes its request on the pass that
+    // lands it. The sites that legitimately WANT a whole-panel re-derive — the shell raise
+    // (`focus_changed`), minimise's park, zoom's restore, `reclaim` — each carry their OWN
+    // `request_full_present` and are untouched: they are event-rate, not motion-rate, and their
+    // extent argument ("the layout as a whole moved") is genuinely panel-wide.
     // FLICKER-2 — the caller owes the sprite a repaint exactly when this drain disturbed it, which
     // is the `sprite_hit` arm and NOT `painted`: a masked handback whose boxes all re-deferred has
     // still taken pixels down (MUST-FIX 1's argument, unchanged), while a drain whose fills never met
@@ -17993,6 +18036,16 @@ pub fn dragperf_selftest() {
     // measurement needed or possible to establish it. Quoting it as a measurement would be dressing
     // an identity up as evidence; quoting it as what the removed line charged is simply reading it.
     let _ = move_present_take();
+    // DRAGWIDE — zero the widening census so the sweep below is the only traffic it reads.
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        let _ = super::screen::dragwide::take();
+        DW_FULL_DRAIN.store(0, Relaxed);
+        DW_FULL_PARK.store(0, Relaxed);
+        DW_FULL_ZOOM.store(0, Relaxed);
+        DW_FULL_FOCUS.store(0, Relaxed);
+        DW_FULL_RECLAIM.store(0, Relaxed);
+    }
     let mut moves_b = 0usize;
     for i in 0..STEPS {
         if move_to(w, BORDER + i * step, oy) {
@@ -18009,6 +18062,30 @@ pub fn dragperf_selftest() {
     let (reqs_b, px_b) = move_present_take();
     let pm_a = (pinfo.width as u64).saturating_mul(pinfo.height as u64);
     let pm_b = if reqs_b > 0 { px_b / reqs_b } else { 0 };
+    // DRAGWIDE — the widening census over the same sweep. Settle ~1.3 s first so the render task's
+    // presents against the sweep's requests land (its floor is the 1 Hz strip tick), then print what
+    // the desktop PUBLISHED beside what the move path REQUESTED, with every whole-panel request
+    // named by its site. `px_per_present` beside `px_per_move` (the `mode=rects` line above) is the
+    // 4.2x divergence, on one wire.
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        let t0 = crate::arch::ms();
+        while crate::arch::ms().wrapping_sub(t0) < 1300 {
+            core::hint::spin_loop();
+        }
+        let (freqs, pres, fulls, dpx) = super::screen::dragwide::take();
+        serial_println!(
+            "[dragwide] moves={} full_reqs={} by_site drain={} park={} zoom={} focus={} reclaim={} desk_presents={} desk_fulls={} desk_px={} px_per_present={}",
+            moves_b, freqs,
+            DW_FULL_DRAIN.swap(0, Relaxed),
+            DW_FULL_PARK.swap(0, Relaxed),
+            DW_FULL_ZOOM.swap(0, Relaxed),
+            DW_FULL_FOCUS.swap(0, Relaxed),
+            DW_FULL_RECLAIM.swap(0, Relaxed),
+            pres, fulls, dpx,
+            if pres > 0 { dpx / pres } else { 0 }
+        );
+    }
     serial_println!(
         "[dragperf] mode=whole analytic px_per_move={} (one panel, what request_full_present charged)",
         pm_a
@@ -19492,6 +19569,8 @@ fn reclaim(vacated: &[(usize, usize, usize, usize)]) {
     for &(x, y, w, h) in vacated.iter() {
         damage_intersecting(x, y, w, h);
     }
+    #[cfg(feature = "witness")]
+    DW_FULL_RECLAIM.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     super::screen::request_full_present();
 }
 

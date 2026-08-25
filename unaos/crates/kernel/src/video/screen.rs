@@ -351,7 +351,34 @@ static FULL_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::Atomic
 /// windows' boxes to the desktop colour immediately, and this restores the console's *text* on top of
 /// that erase when the desktop next runs.
 pub fn request_full_present() {
+    #[cfg(feature = "witness")]
+    dragwide::FULL_REQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     FULL_PRESENT.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// DRAGWIDE — the desktop-present WIDENING census. The `[dragperf]` fixture measured what the move
+/// path REQUESTS (`MOVE_PRESENT_PX`: old box ∪ new box) and nothing measured what the desktop layer
+/// then PUBLISHES — the two diverged 4.2x on the bench because a caller between
+/// [`request_present_rect`] and [`Screen::flush`] escalated every gesture to the whole panel. This
+/// counts both ends of that seam so the divergence is on the wire instead of inferred: `FULL_REQS`
+/// is every whole-panel request (any site), `PRESENTS`/`FULL_PRESENTS`/`PX` are what
+/// [`Screen::flush`]'s background half actually published. Read by `wm::dragperf_selftest`.
+#[cfg(feature = "witness")]
+pub(crate) mod dragwide {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub static FULL_REQS: AtomicU64 = AtomicU64::new(0);
+    pub static PRESENTS: AtomicU64 = AtomicU64::new(0);
+    pub static FULL_PRESENTS: AtomicU64 = AtomicU64::new(0);
+    pub static PX: AtomicU64 = AtomicU64::new(0);
+    /// Take and clear: `(full_reqs, presents, full_presents, px)`.
+    pub fn take() -> (u64, u64, u64, u64) {
+        (
+            FULL_REQS.swap(0, Relaxed),
+            PRESENTS.swap(0, Relaxed),
+            FULL_PRESENTS.swap(0, Relaxed),
+            PX.swap(0, Relaxed),
+        )
+    }
 }
 
 /// DRAG-PI M1 — how many rect-scoped present requests may be owed at once before the queue gives up
@@ -1075,6 +1102,11 @@ impl Screen {
             q.1 = 0;
             (q.0, n)
         };
+        // DRAGWIDE — whether THIS present was widened to the whole panel, recorded at the one point
+        // where the escalation becomes irreversible. Bound before the publish-count below so a
+        // present that early-returns (nothing to do / front not ready) charges nothing.
+        #[cfg(feature = "witness")]
+        let dw_full = FULL_PRESENT.load(core::sync::atomic::Ordering::Acquire);
         if FULL_PRESENT.swap(false, core::sync::atomic::Ordering::AcqRel) {
             self.mark_full();
         } else {
@@ -1220,6 +1252,13 @@ impl Screen {
         {
             let (mut ux0, mut uy0, mut ux1, mut uy1) = (usize::MAX, usize::MAX, 0usize, 0usize);
             let mut live = 0usize;
+            // DRAGWIDE — published area of this present, summed over the clipped damage rects.
+            // `DamageSet::add` merges overlapping rects, so the sum is the publish to within the
+            // one caveat its own doc states: a full-set fold can leave a slight overlap, so this
+            // can over-count marginally — never under-count, which is the direction a widening
+            // witness must not err in.
+            #[cfg(feature = "witness")]
+            let mut dw_px = 0u64;
             for idx in 0..n {
                 let d = self.damage.rects[idx];
                 let x1 = d.x1.min(self.info.width);
@@ -1228,12 +1267,25 @@ impl Screen {
                     continue;
                 }
                 live += 1;
+                #[cfg(feature = "witness")]
+                {
+                    dw_px += ((x1 - d.x0) as u64).saturating_mul((y1 - d.y0) as u64);
+                }
                 ux0 = ux0.min(d.x0);
                 uy0 = uy0.min(d.y0);
                 ux1 = ux1.max(x1);
                 uy1 = uy1.max(y1);
             }
             self.last_flush_rects = live;
+            #[cfg(feature = "witness")]
+            {
+                use core::sync::atomic::Ordering::Relaxed;
+                dragwide::PRESENTS.fetch_add(1, Relaxed);
+                if dw_full {
+                    dragwide::FULL_PRESENTS.fetch_add(1, Relaxed);
+                }
+                dragwide::PX.fetch_add(dw_px, Relaxed);
+            }
             if ux1 > ux0 && uy1 > uy0 {
                 self.last_union_w = ux1 - ux0;
                 self.last_union_h = uy1 - uy0;
