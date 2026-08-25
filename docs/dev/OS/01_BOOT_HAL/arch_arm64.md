@@ -8652,6 +8652,12 @@ non-regression only.
   NET-4j reproducer stay PASS).
 
 - **NET-4v→4A — the RX payload sinks to a STUCK buffer; mechanism localized below the driver lane.**
+  > **[REFUTED by NET-4F — read that entry first.]** The "stuck at buffer 1 / last descriptor of a 2-deep
+  > prefetch burst" signature below is an ARTIFACT of `[net4z]`'s content-matching scan: with the completed
+  > slot's buffer unwritten, `out` is all zeros and the scan returns the first UNWRITTEN buffer, which is
+  > index 1 once buffer[0] holds the one frame that lands. The same boot contradicts it one line apart
+  > (`[net4m] rx[1] … nonzero=false` vs `[net4z] rx[1] … landed-in-buffer-index=1`). The narrative below is
+  > retained as the investigation record; the mechanism-(a) *shape* it asserts does not stand.
   With the inbound alias armed and readback-proven (net4v `covers=ALL`), both SMMU instances globally
   bypassed (net4x), and the descriptor rings clean-published to the PoC (net4x), the residual RX defect
   was scaled and localized: only slot-0 recycles ever carried payload while later slots read DRAM-zero at
@@ -8675,6 +8681,91 @@ non-regression only.
   net4z's per-pop landing indices and emits ONE verdict line when ≥4 consecutive pops land in the same
   buffer while the completed slot advances 1:1 — machine-checkable proof of the reuse on the next boot,
   and its refutation if a future change makes landing-index == completed-slot.
+
+- **NET-4F — the ring makes ONE PASS and goes dry; and the NET-4A verdict is an artifact of its own
+  witness. `[REFUTES NET-4A; withdraws NET-4C's motivating evidence]`**
+
+  **(1) The structural fact, from the record, not a new boot.** `[net4d window-close] … total popped=N`
+  appears **53 times** across the bench capture set, spanning the whole campaign. **N never once exceeds
+  `NUM_RX` = 32**, and most windows land exactly on 32
+  (`awk 'match($0,/total popped=[0-9]+/)…' ⇒ windows: 53  MAX: 32`). `rx_count` is cumulative for the
+  boot, so this is not per-window: **no recorded boot has ever popped a 33rd frame**, and `rx_cur` has
+  never wrapped 31 → 0. The RX ring delivers exactly one pass through the descriptors published before
+  RxEnb and then stops for good. A driver whose per-descriptor addressing were merely wrong would keep
+  completing frames; something ends the ring at the RECYCLE.
+  The C+ engine has a documented way to stop exactly like that: fetching a HOST-owned descriptor — which
+  happens the instant it catches up with a driver re-arming behind it — raises **ISR.RDU (Rx Descriptor
+  Unavailable, bit 4)** and halts RX consumption, and ISR is a **write-1-to-clear latch**. The driver
+  wrote `ISR = 0xffff` ONCE at bring-up, set `IMR = 0`, and never wrote the register again, so a latched
+  RDU stands for the life of the boot. Servicing RX status is an obligation a polled driver inherits from
+  the interrupt-driven one, and it was simply absent. `net4f_rx_service` supplies it (RX latches only, so
+  `[net4c]`'s since-bring-up TOK/TER keep their meaning), on every recycle and every 4096th empty poll.
+  **Boot oracle — `[net4F] RX ring pass verdict` at window close, three mutually exclusive readings:**
+  `wraps > 0` ⇒ the ring recycled past one pass, defect CLOSED; `wraps == 0, RDU-clears > 0` ⇒ the engine
+  did stop on a host-owned descriptor (latch was the halt; if clearing it still does not restart the ring,
+  RDU is the symptom and the descriptor re-fetch is the cause); `wraps == 0, RDU-clears == 0` ⇒ the
+  un-serviced latch is REFUTED and the engine is not re-fetching recycled descriptors at all.
+  A `[net4F] ring WRAP #n` line fires at the wrap itself with ISR/CR/RxEnb.
+
+  **(2) NET-4A is refuted by its own boot.** `[net4z]`'s landing scan searched the ring for the first
+  buffer whose head matches `out[..16]` — but `out` is a copy of the **completed slot's** buffer, so when
+  that buffer was never written `out` is the arena fill (all zeros) and the scan returns **the first
+  UNWRITTEN buffer**. Once buffer[0] holds the one frame per RxEnb that does land, that index is 1 — for
+  every pop, forever. Which is exactly the boot-36 signature the verdict was built on (`rx[0]→0, rx[1]→1,
+  rx[2..7]→1 STUCK`). The contradiction is inside boot-36-retry, one line apart:
+  `[net4m] rx[1] slot=1 len=66 … buf[0..16]=0000000000000000… nonzero=false` beside
+  `[net4z] rx[1] … frame-landed-in-buffer-index=1 … per-descriptor addressing WORKS` — buffer 1 is empty
+  and is simultaneously reported as the landing site. So `rx[1]→1` was a false POSITIVE and `rx[2..7]→1`
+  phantom landings. **NET-4A's mechanism-(a) shape ("the NIC latches desc[1]'s address, the LAST
+  descriptor of a 2-deep prefetch burst") is REFUTED**: there is no evidence of a 2-deep burst nor that
+  the reused address is desc[1]'s. **NET-4C's PCIe MPS/MRRS theory was built to explain "the observed
+  32-B-then-stuck signature", which never existed** — the audit + readback table stand, its motivating
+  evidence is withdrawn. What survives is the older, un-artifacted NET-4m fact: exactly ONE buffer per
+  RxEnb receives payload while every other completion advances OWN/len with nothing written into the ring.
+
+  **(3) The replacement discriminator (`[net4F]`, UNCONDITIONAL, read-only, 8 pops).** Every witness this
+  campaign used asked "which buffer's CONTENT looks like this frame" — unanswerable when the frame is
+  absent, and its wrong answer is the NET-4A verdict. Each RX buffer is now stamped with a distinct
+  **landing TAG** when its descriptor is armed (`net4f_tag`, re-stamped in `rearm_current_rx`); a buffer
+  the NIC wrote no longer carries its tag. The witness reports which buffers the NIC ACTUALLY WROTE:
+  `own-buffer-written=yes` every pop ⇒ per-descriptor addressing WORKS; `own=no, buffers-written=[j]`
+  fixed ⇒ a genuine single-address latch, and `j` finally NAMES the reused descriptor's address;
+  `own=no, buffers-written=[] (count=0)` ⇒ **the payload is not in the ring at all** — OWN/len advance
+  while nothing is written anywhere, which an address REUSE cannot produce, retiring mechanism (a) on the
+  wire. The three are mutually exclusive and one is true every pop. `[net4z]`'s scan is guarded to refuse
+  an unwritten slot rather than manufacture a landing, and the `[net4A]` correlation now only fires on a
+  real landing in a real written buffer.
+
+  **(4) Three real descriptor defects, fixed.** RX **error status** was never read: the writeback's RES
+  (bit 21) marks a frame whose length field is meaningless and we delivered it at that length anyway —
+  now dropped, counted, and recycled through the same publish discipline (`rearm_current_rx`, lifted out
+  so the error path cannot leak a ring slot). The **4-byte FCS was never stripped**: the C+ engine DMAs
+  the CRC into the buffer and COUNTS it in the writeback length, so every frame reached smoltcp with four
+  trailing CRC bytes — proven by the record, not assumed (every minimum-size pop in boots 36..44 reads
+  `len=64` = the 60-byte Ethernet minimum + 4); stripped on the LAST segment with a first-pop witness
+  printing raw vs delivered length and FS/LS. The **multicast hash filter (MAR0..7, 0x08/0x0C) was never
+  programmed** while `RCR.AM` has been set since the first bring-up — AM admits a multicast frame only if
+  its address hashes to a set bit in that table, which held reset/firmware residue; now written all-ones
+  (the promiscuous bring-up value) inside the CFG9346 window and read back.
+  Plus one assumption converted to a checked fact: the NET-4y RX-mode value is FAMILY-SPECIFIC
+  (`RX_EARLY_OFF` bit 11, `RX_MULTI_EN` bit 14 are modern-8168 bits) and the driver read the chip-id
+  register every boot without using it. `[net4F] MAC chip id` decodes `TCR[31:20] & 0xfcf` and compares
+  against this bench's recorded value (TCR = `0x57100f00` ⇒ id `0x541`, the RTL8111H) — MATCH confirms the
+  RX mode belongs to this part, MISMATCH says so on line one.
+
+  **Audited and EXONERATED** (so the next arc need not re-walk them): EOR is set on the last descriptor at
+  init and preserved on every re-arm, both rings; the OWN protocol's barriers are correctly placed and
+  encoded (`dma_wmb` = `dmb oshst` before the OWN publish, `dma_rmb` = `dmb oshld` between observing
+  OWN-clear and reading the buffer, with the OWN-carrying descriptor read before that barrier and the
+  payload read after); RMS equals the advertised descriptor buffer size (2048) and the RX buffer block is
+  exactly 32 × 2048, so a max-size frame cannot overrun into the TX ring at `+0x20000`; TX posts FS|LS on
+  every single-buffer frame. And the RxConfig-after-ChipCmd order NET-4y introduced is exonerated by the
+  record — boots 32/33 wrote RxConfig BEFORE ChipCmd and produced the identical one-buffer signature.
+
+  QEMU cannot exercise the tegra path; the gates prove non-regression only (`UNAOS_TEGRA=1 ./arroyo check`
+  — 22 cfg legs, x86_64 + aarch64 OK; `./arroyo test-arm` MISSION SUCCESS; the ten new `[net4F]` witnesses
+  one-hit-grepped in the `esp-jetson` artifact, which needs `UNAOS_NET4=1` on the command line — the
+  documented jetson knob set alone builds a feature line with no `net4`, so the driver is not in it).
 
 ### XCARVE-4 — the endgame (2026-07-20, boots 21/22)
 The XCARVE writer is named and fixed. XCARVE-3's unmap converted the SNOC RAS into a precise
