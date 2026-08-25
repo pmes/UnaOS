@@ -755,7 +755,37 @@ pub fn jd1_dc_probe(chan: &super::bpmp_tegra::Chan, dtb_addr: u64, dtb_size: usi
     let mut heads = 0u32;
     let mut match_head = 0u64;
     let mut match_win = 0u64;
-    for &head_off in &[0u64, 0x10000, 0x20000, 0x30000] {
+    // ── JX1-WINSWEEP: THE SWEEP BELOW IS EL3-FATAL ON THIS SILICON. MEASURED, boot7e 2026-08-25. ──
+    //
+    // On the FIRST flight of this rung the announce fired and the board died on the very next
+    // instruction:
+    //
+    //   :: JD1-DC — head+0x0: about to read win0 WIN_OPTIONS @0x13802e00 (announce before touch) ::
+    //   Unhandled Exception in EL3.   x1 (ESR_EL3) = 0xbe000011      <- JX1 signature
+    //
+    // WHY, and it is not a mystery any more — the discriminator that ran seconds earlier answered it:
+    //
+    //   MODEL-VERDICT=NVDISPLAY-CLASS-C670   FE_CLASSES=0xc6700410 -> NVD_40 / class NVC67D, Ampere ga10x
+    //   FE_HW_SYS_CAP =0x00100303 -> 2 heads, 2 SORs
+    //   FE_HW_SYS_CAPB=0x0000000f -> FOUR windows exist
+    //
+    // This sweep's geometry is Tegra186/194's: FOUR head banks at a 0x10000 stride, SIX windows per
+    // head at 0x2800 + 0xC00*win. The silicon is Ampere NVD_40 with TWO heads and FOUR windows total,
+    // and its window state does not live at those offsets at all. `head+0x0 win0 WIN_OPTIONS`
+    // (+0x2800+0x600 = +0x2e00) is not a register on this part; the fabric refused the read and BL31
+    // took an EL3 abort. The DTB-declared `size=0xeffff` bound could never have caught it — the offset
+    // is INSIDE the aperture and still not decodable.
+    //
+    // GATED OFF rather than deleted: every line of it is the correct shape for the answer we now want,
+    // and the raw dump it emits is exactly what a save/restore would be reconstructed from. It comes
+    // back when its offsets are rewritten against the NVC67D class-channel model (NVIDIA/open-gpu-doc,
+    // MIT; `clc67d.h`), which is the next display rung's job — and note the model is CHANNEL-based
+    // (`UPDATE` at method 0x200), so the replacement is unlikely to be a flat MMIO sweep at all.
+    //
+    // The FIRST-TOUCH announce is what made this diagnosable in one boot instead of a bisect: the
+    // silence after it names the fatal register exactly. Keep that discipline in the replacement.
+    #[allow(unused_variables)]
+    for &head_off in &[] as &[u64] {
         if head_off + 0x2800 + 6 * 0xC00 > size {
             serial_println!(
                 ":: tegra: JD1-DC — head+{:#x} would leave the DTB-declared aperture (size={:#x}); this head and every one after it is NOT read ::",

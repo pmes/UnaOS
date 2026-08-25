@@ -1021,8 +1021,42 @@ auto-merged but nothing re-ran under pi's hold).
 
 | sha | what | when it becomes ours |
 | --- | --- | --- |
-| `99b0c867` | **CHROMEBAND** — `wm.rs`: where `row_bytes` makes `chunk_rows < box height`, `paint_window` runs per band but `fill_rect_ceramic` did not clip its row walk to the band | **rung 3+**, when boxes stop being panel/3 |
+| `99b0c867` | **CHROMEBAND** — `wm.rs`: where `row_bytes` makes `chunk_rows < box height`, `paint_window` runs per band but `fill_rect_ceramic` did not clip its row walk to the band | ⚠️ **DO NOT TAKE WITHOUT THE CLOSE-THE-WINDOW TEST — see the conviction below** |
 | `1c44ea4b` | **BGSPREAD** — aarch64 `syscall.rs` fixture over-asserted "3 distinct cores"; correct contract is argmin membership on `el0_active` per launch (`inmin=3`). Same edit fixes the doc's tiebreak order: **key 1 = `el0_active`, key 2 = queue depth** | whenever this track copies or inherits that fixture |
+
+> ### ⚠️ CONVICTED ON METAL 2026-08-25 — the banded-path fixes WEDGED the x86 compositor
+>
+> The rmbp seat took the same two shared-compositor fixes onto x86 (their own
+> commits, their own base: `CHROMEBAND 6eba58f7`, `DRAGWIDE 237d9dc9`) and flew
+> them. **Closing the shell window under six vugs wedged the board.** Same
+> sitting, same workload, discriminated against a clean control:
+>
+> | image | close the window | wedge |
+> | --- | --- | --- |
+> | b17, pre-arc | **survived** | `phase=33 row=56` — classic BAR1 blit stall |
+> | integration, post-arc | **WEDGED** | `phase=31 row=0` |
+>
+> **`phase=31` is the band-compose setup (`wm.rs:19375`), building the back layer
+> over `stage` — cached RAM, band ZERO. It never reached BAR1.** So this is NOT
+> the unanswerable-store class; it is a NEW SOFTWARE STALL in the banded path,
+> and the banded path is exactly what these two commits change. `phase=31` is old
+> instrumentation (`c9eebcf7`), so the stall genuinely RELOCATED rather than
+> being newly labelled — the discriminator was clean.
+>
+> **What this does and does not say.** It convicts *rmbp's* rebases on *rmbp's*
+> base. pi's `441755bb`/`4440cb59` are different commits on a different base and
+> are not automatically implicated. But it is the same class of change to the
+> same shared code, so:
+>
+> **BEFORE TAKING EITHER FIX ONTO THIS TRACK, CLOSE A WINDOW UNDER LOAD ON METAL
+> AND PROVE IT SURVIVES.** A green gate says nothing here — the wedge needs a
+> real close under real load, which no QEMU leg reproduces. The shelf row above
+> stands as a record of what the fixes DO, not as permission to take them.
+>
+> Note the shape, because it is the one this ladder keeps meeting: the original
+> defect was **invisible on glass** (per-row overhead, no pixel ever wrong) and
+> the fix for it is **visible only as a wedge**, under a workload nobody runs on
+> a gate. Neither end of that pair has an instrument that fires in CI.
 
 **Rung 0 is NOT exposed to CHROMEBAND, measured rather than assumed.** Its window
 is deliberately panel/3 each way, so at 1920x1200 the box is 640x400:
