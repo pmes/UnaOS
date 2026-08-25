@@ -8216,7 +8216,189 @@ and THEN the wedge inside the matrices convicts the probes' command mix (read12/
 induced-stall), not sequence depth — and the desktop line gets its filesystem before the reader
 dies. A mount that still times out ahead of any matrix reopens the position/depth theory.
 
+## 32. ISRARM — the HID endpoint is re-armed from the completion interrupt (2026-08-22)
+
+### 32a. The defect, and the number it costs
+
+An armed HID interrupt-IN endpoint on the EHCI-3 driver holds **exactly one report**. From the
+instant the controller retires the transfer until a service pass rewrites the overlay, the endpoint
+is DARK: the device has nowhere to land a report, so what it sends is dropped **on the wire**. No
+downstream instrument can see it — `EVQ_DROP_PTR` counts a full event ring and
+`pointer_motion_coalesced` counts a slow drain, and both are about reports that at least reached
+memory.
+
+EHCIDARK (§ the `[EHCIDARK]` census, `drivers/ehci/mod.rs`) put numbers on it. From the bench corpus:
+
+```
+EHCIDARK addr=8 ep=IN1 kind=vendor-mt reports=132 cad=1ms windows=57 dark=400ms  max=55ms missed<=343
+EHCIDARK addr=8 ep=IN1 kind=vendor-mt reports=232 cad=1ms windows=64 dark=1853ms max=80ms missed<=1602
+EHCIDARK addr=8 ep=IN1 kind=vendor-mt reports=291 cad=1ms windows=89 dark=2666ms max=80ms missed<=2390
+EHCIDARK addr=8 ep=IN3 kind=kbd       reports=13  cad=1ms windows=4  dark=144ms  max=96ms missed<=140
+```
+
+This is the operator-facing defect described as *"quite a bit of sliding to wake up the pointer"*.
+The worst single dark window in the corpus is **96 ms**, not the 55 ms a single boot suggested, and
+the census's own self-calibrated cadence reads **1 ms and 5 ms — never 8 ms**. Any design sized
+against "8 ms cadence, 55 ms worst case" is sized against numbers the corpus does not support.
+
+### 32b. THE RING THAT CANNOT BE BUILT — read this before reaching for depth
+
+The natural fix is depth: convert the single re-armed qTD into a chained ring of qTDs so the
+endpoint can hold 8 reports instead of 1. **It cannot be built on this silicon, and attempting it
+does not degrade — it wedges the controller.** This section exists because `IntEp`'s doc-comment
+says "single re-armed qTD" and the next reader will otherwise reach for exactly this.
+
+The blocker is `Controller::overlay_mode` (§10). Both EHCI functions on the 2012 rMBP run
+**overlay-direct**, and every metal boot in the corpus (14 of 14 that reach HID arming) re-witnesses
+it:
+
+```
+:: EHCI-HID: [0] qTD-fetch HSE — OVERLAY-DIRECT mode + full HCRESET re-init (probe-14 silicon finding) ::
+:: EHCI-HID: [1] chain-HSE verdict CARRIED from an earlier controller — OVERLAY-DIRECT for this port walk ::
+```
+
+Controller **[1]** is the one carrying the internal trackpad (`addr=8 ep=IN1 kind=vendor-mt`). It
+does not even run the probe — it inherits the verdict through `CHAIN_HSE_SEEN`.
+
+In overlay-direct mode `arm_interrupt_ep` writes the transfer straight into the QH overlay, pins
+both `overlay[0]` (Next qTD Pointer) and `overlay[1]` (Alternate Next) to `PTR_TERMINATE`, and
+discards the descriptor outright:
+
+```rust
+let _ = (qtd, qtd_phys); // slot storage retained; the controller never sees it
+```
+
+So:
+
+1. **There is no qTD in the controller's world to chain.** A ring is a chain of Next qTD Pointers;
+   this controller is never given one.
+2. **Giving it one means taking the fetch path that master-aborts.** That is what probe-14 measured
+   and what `overlay_mode` exists to avoid. An HSE'd controller is wedged — the driver's own note
+   records that `RS` alone does not recover it, only a full `HCRESET` re-init — so the failure mode
+   is *no trackpad and no keyboard for the boot*, strictly worse than the reports being dropped.
+3. **Even in chain mode the naive ring is wrong.** Every trackpad report is a SHORT packet (8-byte
+   Report ID 0x02 against `mps=64`), and EHCI 1.0 §4.10.2 advances a queue retired by a short IN
+   through the **Alternate Next qTD Pointer** — which `write_qtd` hardcodes to `PTR_TERMINATE`. A
+   ring chained only on `next` would go idle after member 0, reproducing the defect. Both pointers
+   would have to chain.
+4. **And depth 8 would not have been enough anyway.** 8 × 8 ms = 64 ms does not cover the corpus's
+   80 ms and 96 ms windows, and at the census's own measured `cad=1ms` the depth required for a
+   55 ms window is ~55.
+
+A depth-8 chain of **QHs** (rather than qTDs) for the same endpoint would sidestep (1) and (2), since
+it uses only overlay-direct arming and periodic-list traversal — both already proven on this metal.
+It is **parked, not rejected**: it needs a software toggle sequenced across 8 queue heads, it burns
+8 static slots per endpoint, and it issues several INs per frame to one interrupt endpoint. It has
+never been tried on this silicon and must not be shipped to the daily-driver machine unmeasured.
+
+### 32c. The shape that works in both modes
+
+`QTD_IOC` is set on every arm — **including the overlay-direct one** — so the controller has been
+raising `USBSTS.USBINT` on every completion since the driver was written. Nothing listened: the
+module header used to read *"No interrupts: no USBINTR write, no IDT vector, no MSI"*, and
+`deadman`'s residual note had already observed that `QTD_IOC` sets `USBINT` even with `USBINTR`
+masked.
+
+ISRARM consumes it. `USBINTR.USBINT` is unmasked, the function's MSI is routed to the local APIC on
+IDT vector `EHCI_MSI_VECTOR` (0x43), and the endpoint is re-armed **from the completion itself**. The
+dark window stops being the service-pass period and becomes interrupt latency. It needs no qTD, so
+it is indifferent to `overlay_mode` — the property the ring could never have.
+
+### 32d. The polled path is still the load-bearing one
+
+This is the risk posture, and it is deliberate.
+
+`service()` is unchanged in what it *can* do: it still reads the token, decodes, re-arms, and retires
+a halted endpoint. The ISR is a **latency layer on top**. On a controller with no MSI capability, or
+a boot where the vector is never delivered, the pass finds the completion exactly where it always did
+and the boot is indistinguishable from before this arc except in the counters. **There is no state in
+which a dead interrupt produces a dead trackpad.**
+
+INTx is not a fallback and is not attempted: this kernel is a pure local-APIC system with no IOAPIC
+redirection programming anywhere in the tree, so a legacy INTA# assertion has nowhere to be
+delivered. A controller without MSI simply stays polled, and says so.
+
+### 32e. The mechanism
+
+| piece | what it is |
+|---|---|
+| `ISR_EPS[12]` | the ISR's whole view of an armed endpoint — QH/qTD/buffer pointers, transfer total, `overlay_mode`, the data toggle, the EHCIDARK clock, ring cursors. Plain atomics, published by `arm_interrupt_ep`. The ISR never touches `Controller` and therefore never the `EHCI_HID` mutex. |
+| slot index | DERIVED as `idx * MAX_INT_EPS + int_next`, so it is unique by construction and the publish path has no failure mode for the ISR to carry. |
+| hand-off ring | 8 slots × 64 B per endpoint. **Not hardware depth** — the endpoint still holds one report. It is where the ISR puts a report so it can re-arm before the pass has decoded anything. SPSC: the ISR produces (MSI targets one APIC id), the pass consumes under `EHCI_HID`. |
+| per-endpoint claim | one `AtomicU32`, `compare_exchange` **try-only on both sides, spinning on neither**. The pass may run on a different core than the MSI target, so masking interrupts is not mutual exclusion. The ISR losing costs one pass period — today's behaviour. The pass losing costs nothing: the report is in the ring. |
+| `isr_rearm` | the **single** re-arm implementation. The overlay-direct/qTD-chain fork and the data toggle each exist exactly once; `IntEp::toggle`, `IntEp::qtd_phys` and `IntEp::buf_phys` were removed because a second copy of either is a second truth. |
+| `STS_USBINT` ack | the ISR writes back **bit 0 only**, never the blind `STS_RW1C` (0x3F) the pass uses. That mask includes `STS_HSE`, which four control-transfer sites READ post-init to decide whether the silicon has wedged; an ISR clearing it would make an HSE'd controller look healthy to the code whose job is to notice. `USBINTR` unmasks bit 0 and nothing else, so bit 0 is the only bit that can be asserting the interrupt. |
+
+**Ordering is the correctness of the whole arc.** A pass drains the hand-off ring **before** it reads
+the endpoint directly. Everything in the ring is strictly older than anything still in the endpoint,
+so ring-first is what keeps a delta stream monotonic across two producers — trackpad reports are
+deltas, and delivering them out of order is worse than dropping them. Both sources then feed **one**
+body: one decoder, one census, one set of `pal` pushes, differing only in the pointer they read from.
+
+**Nothing on the interrupt path can wedge the machine.** No lock it can wait on (`EHCI_HID` is held
+by the pass across a `hw_wait_budget()` control transfer — taking it there would self-deadlock
+exactly as the xHCI MSI handler's comment warns). No allocation, no formatting, no printing — every
+ISRARM line is emitted by the polled pass. Work bounded at 12 endpoints × (a few volatile reads + a
+≤64-byte copy). Halts are refused outright and left to the pass, which owns the STOP-NOTE, the
+`ClearFeature` recovery and `flush_held_releases`.
+
+### 32f. What to read in a capture
+
+```
+:: EHCI-HID: ISRARM self-test: modes=2 (overlay-direct + qTD-chain) depth=8 fifo=true payload=true rearm=true toggle=true ringfull-refuses=true -> PASS == witness ::
+:: EHCI-HID: [1] ISRARM armed — MSI vector 0x43 -> apic 0xfee00000, USBINTR 0x00000000 -> 0x00000001 (USBINT unmasked) ... == witness ::
+:: EHCI-HID: ISRARM armed=2 refused=0 irq=8412 isr_rearm=8390 poll_rearm=19 depth_max=2 ringfull=0 cont_isr=3 cont_poll=0 oversize=0 == witness ::
+```
+
+| field | meaning |
+|---|---|
+| `irq=` | ISR invocations. **The falsifier.** Zero after an `armed` line means the vector is not being delivered. |
+| `isr_rearm=` | endpoints re-armed FROM THE INTERRUPT — **the number that is the fix.** Before this arc the site did not exist, so it was structurally zero. |
+| `poll_rearm=` | re-arms from the polled pass. `isr_rearm=0 poll_rearm=N` is the honest picture of a boot where the interrupt never arrived. |
+| `depth_max=` | deepest hand-off occupancy. 1 = the pass was never more than one report behind. |
+| `ringfull=` | **the residual defect** — the pass was ≥ 8 reports late even with the interrupt live. |
+| `cont_isr=` / `cont_poll=` | claims lost in each direction. Neither is an error. |
+| `oversize=` | `mtraw`-only: a frame larger than one hand-off slot, declined and left for the pass. |
+
+Two negative cases are **printed statements, not absences**, because an instrument that cannot fire
+in the state it exists for is an absent one:
+
+- `ISRARM REFUSED` — no usable MSI capability, or the `USBINTR` write did not stick. Read back and
+  verified, never assumed.
+- `ISRARM IRQ DEAD` — armed, and the vector has not been delivered once in 5 s. One-shot. It
+  carries `irq=`/`isr_rearm=`/`poll_rearm=` itself, because the rollup below is gated on
+  `isr_rearm` having moved and in this exact state it never does: without the counts on this line
+  a dead-vector boot would state "everything still polled" with no number behind it. A nonzero
+  `poll_rearm=` here is the fallback proving it is working, not merely nominated.
+
+**The proof the fix worked is `max=` on the EHCIDARK census collapsing** from the 80–96 ms in §32a
+toward interrupt latency, on the same instrument and the same 5 s cadence. The census's clock moved
+into `IsrEp::seen_ms` and is stamped by BOTH re-armers, so the gap it reports is "time since anyone
+last looked" — the only reading that stays honest once completions are consumed off the interrupt.
+
+### 32g. What QEMU can and cannot gate
+
+**QEMU cannot run the interrupt at all.** `hcd-ehci` exposes no PCI capability list
+(`[MSI] 0:3.0 has no capability list.`), so `isr_arm_controller` refuses and the boot stays fully
+polled. A green QEMU run is therefore **not** evidence that the ISR works on the rMBP: QEMU is also
+chain-mode (`overlay_mode == false`), the opposite fork from the metal.
+
+That gap is why `isr_selftest` exists. It runs at `init` before any endpoint is armed, borrows
+`DMA_POOLS[0].int_slots[0]` and `ISR_EPS[0]` at a moment when both are provably unowned, and drives
+the **real** `isr_service_ep` against a hand-built completion token — in **both** transfer modes,
+checking FIFO order across the ring wrap, payload fidelity, that the endpoint is genuinely re-armed
+after each accepted completion and genuinely *not* after a refused one, that the data toggle
+alternates from DATA1 (re-arm #1 is the pipe's second transfer), and that occupancy 8 refuses. It
+restores the slot and the operational counters before returning, so a boot's `ISRARM` line counts the
+machine's work and not the fixture's.
+
+Metal falsifiers, in order: (1) `ISRARM armed` on both functions rather than `ISRARM REFUSED`;
+(2) `irq=` and `isr_rearm=` rising; (3) EHCIDARK's `max=` collapsing, or the census going silent
+altogether because `dark_missed` stops moving; (4) `ringfull=` — nonzero means a residual window
+remains and depth is worth revisiting, with §32b's parked QH-chain on the table.
+
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
-- `unaos/crates/kernel/src/drivers/ehci/`, `drivers/ehci_scout.rs` — the EHCI-3 HID driver (§10) and the EHCI-1/2 scout + shared wake (§9/§9a).
+- `unaos/crates/kernel/src/drivers/ehci/`, `drivers/ehci_scout.rs` — the EHCI-3 HID driver (§10), the EHCI-1/2 scout + shared wake (§9/§9a), and the ISRARM completion interrupt (§32).
+- `unaos/crates/kernel/src/arch/x86_64/interrupts.rs` — `EHCI_MSI_VECTOR` (0x43) and `ehci_msi_handler`, the only ISRARM code outside `drivers/ehci/`.
 - [`scheduler.md`](../02_KERNEL_CORE/scheduler.md) — why the lock-free MSI handler and the main-loop service split matter under a live scheduler.
