@@ -5680,6 +5680,18 @@ fn composite_inner() -> CursorTail {
         // `[wc-g] us=`. See `wcg::stage_flush`.
         #[cfg(feature = "witness")]
         super::wcg::stage_flush(rw.id);
+        // CHROMEBAND — the band census, printed here for exactly the reason the line above is: both
+        // emit to the UART and both would be charged to `[wc-g] us=` inside the bracket.
+        #[cfg(feature = "witness")]
+        band_flush(rw.id);
+        // CHROMEBAND — the bench-geometry band fixture, once per boot. Here because this is a point
+        // where a live `Window` and the panel's dimensions are both in hand, and because it is past
+        // `wcg::end` like every other print on this screen. See `chromeband_fixture`.
+        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+        {
+            let pinfo = fb.info();
+            chromeband_fixture(&rw, pinfo.width, pinfo.height);
+        }
         // WC-D — verify this window's blit against the scan-out, once per window id, from inside the pass
         // that drew it (the only place both the source surface and the destination rows are known).
         //
@@ -18132,21 +18144,344 @@ fn draw_window(
     overlaid
 }
 
+// ---- CHROMEBAND: the per-band chrome census ----------------------------------------------------
+//
+// WHAT THIS INSTRUMENT ASSERTS, and why it can be wrong. `paint_window` runs once per WC-M band and
+// re-derives the whole box's chrome each time; only the rows the band holds can be written. The
+// question the witness has to answer is not "how many bands were there" (arithmetic, and knowable
+// without running anything) but "did the chrome painter WALK rows it could not write" — because that
+// is the work the clip removes and the only thing a regression could put back.
+//
+// So the two numbers are taken from different places on purpose. `walked` is incremented once per
+// executed loop iteration in `fill_rect_ceramic`; `used` is an independent test of that iteration's
+// row against the DESTINATION's own height. Their ratio is `amp=`. A correct clip makes them equal
+// and prints `1.00x`; the pre-CHROMEBAND walk printed the band count. Neither number is derived from
+// the other, so `1.00x` is a measurement rather than a tautology — which is the whole reason the
+// census sits inside the loop instead of being computed from `chunk_rows` at the top.
+//
+// Per-core, indexed by `stage_pool_index`, because two cores composite at once (a present on one, a
+// desktop-flush repaint on the other) and a shared pair would interleave two windows' walks into one
+// ratio. The compositor runs IRQ-masked, so the index is stable across a pass.
+#[cfg(feature = "witness")]
+static CB_WALKED: [core::sync::atomic::AtomicU64; STAGE_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; STAGE_CPUS];
+#[cfg(feature = "witness")]
+static CB_USED: [core::sync::atomic::AtomicU64; STAGE_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; STAGE_CPUS];
+
+/// CHROMEBAND — charge one executed chrome-row iteration, and say whether the destination could
+/// hold it. See the block comment above for why `used` is passed in rather than inferred here.
+#[cfg(feature = "witness")]
+#[inline]
+fn chrome_row_note(used: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let i = stage_pool_index();
+    CB_WALKED[i].fetch_add(1, Relaxed);
+    if used {
+        CB_USED[i].fetch_add(1, Relaxed);
+    }
+}
+
+/// CHROMEBAND — zero this core's chrome census. Called by [`stage_window`] immediately before its
+/// band loop, so the pair that comes back out describes exactly ONE present.
+#[cfg(feature = "witness")]
+#[inline]
+fn chrome_rows_reset() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let i = stage_pool_index();
+    CB_WALKED[i].store(0, Relaxed);
+    CB_USED[i].store(0, Relaxed);
+}
+
+/// CHROMEBAND — this core's `(walked, used)` since the last [`chrome_rows_reset`].
+#[cfg(feature = "witness")]
+#[inline]
+fn chrome_rows_take() -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let i = stage_pool_index();
+    (CB_WALKED[i].load(Relaxed), CB_USED[i].load(Relaxed))
+}
+
+/// CHROMEBAND — per-sample line budget for the whole boot. Small on purpose: the steady-state answer
+/// lives on the rollup, and this wire is 115200 baud shared with the compositor's other witnesses.
+#[cfg(feature = "witness")]
+const CB_SAMPLES: u64 = 6;
+
+/// CHROMEBAND — the pending sample one core recorded, waiting for [`band_flush`] to print it outside
+/// WC-G's clock. One slot per core, exactly as [`STAGE`] is, and armed last so a reader that sees
+/// `CB_P_ARM` set sees the fields that go with it.
+#[cfg(feature = "witness")]
+static CB_P_ARM: [core::sync::atomic::AtomicBool; STAGE_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; STAGE_CPUS];
+#[cfg(feature = "witness")]
+static CB_P_FIELDS: [[core::sync::atomic::AtomicU64; 6]; STAGE_CPUS] =
+    [const { [const { core::sync::atomic::AtomicU64::new(0) }; 6] }; STAGE_CPUS];
+
+/// CHROMEBAND — boot-long totals, the population the rollup reports. Monotone; nothing here is a
+/// delta, so re-reading them cannot double-count.
+#[cfg(feature = "witness")]
+static CB_PRESENTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static CB_BANDED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static CB_MAXBANDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static CB_TOT_WALK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static CB_TOT_USED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static CB_LINES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static CB_LASTROLL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// CHROMEBAND — record one staged present's band census. Called from [`stage_window`] beside
+/// `wcg::stage_note`, and for the same reason it writes nothing to the UART: this runs inside WC-G's
+/// clock, and a witness that inflates the number printed next to it is worse than no witness. The
+/// print is [`band_flush`]'s.
+#[cfg(feature = "witness")]
+#[allow(clippy::too_many_arguments)]
+fn band_note(id: u32, bands: u64, span: u64, bh: u64, walked: u64, used: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    CB_PRESENTS.fetch_add(1, Relaxed);
+    if bands > 1 {
+        CB_BANDED.fetch_add(1, Relaxed);
+    }
+    CB_MAXBANDS.fetch_max(bands, Relaxed);
+    CB_TOT_WALK.fetch_add(walked, Relaxed);
+    CB_TOT_USED.fetch_add(used, Relaxed);
+    let i = stage_pool_index();
+    let f = &CB_P_FIELDS[i];
+    f[0].store(id as u64, Relaxed);
+    f[1].store(bands, Relaxed);
+    f[2].store(span, Relaxed);
+    f[3].store(bh, Relaxed);
+    f[4].store(walked, Relaxed);
+    f[5].store(used, Relaxed);
+    CB_P_ARM[i].store(true, Relaxed);
+}
+
+/// CHROMEBAND — `walked / used` in hundredths, so the wire can carry two decimals without a float.
+/// `used == 0` (a present whose chrome landed nowhere) answers 0 rather than dividing — the honest
+/// reading, and it cannot be confused with `100`.
+#[cfg(feature = "witness")]
+#[inline]
+fn cb_amp_x100(walked: u64, used: u64) -> u64 {
+    if used == 0 {
+        0
+    } else {
+        walked.saturating_mul(100) / used
+    }
+}
+
+/// CHROMEBAND — print this core's pending `[wc-b]` sample, and refresh the rollup on a cadence.
+///
+/// Called from the composite pass beside `wcg::stage_flush`, which is where the compositor already
+/// puts every print that must land AFTER `wcg::end` has stopped the clock.
+///
+/// **How to read the line.** `amp=1.00x` means the chrome painter walked exactly the rows it wrote:
+/// the clip is in place and doing its job, at any band count. `amp=` above `1.00x` means it walked
+/// rows it could not write, and the value is how many times over — `bands=5 amp=5.00x` is the
+/// pre-CHROMEBAND regime restored. `bands=` above 1 is what proves the multi-band path was reached
+/// at all; a run that never bands prints `bands=1` and its `amp=` certifies nothing about banding.
+#[cfg(feature = "witness")]
+fn band_flush(id: u32) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let i = stage_pool_index();
+    if CB_P_ARM[i].swap(false, Relaxed) {
+        let f = &CB_P_FIELDS[i];
+        if f[0].load(Relaxed) == id as u64 && CB_LINES.load(Relaxed) < CB_SAMPLES {
+            CB_LINES.fetch_add(1, Relaxed);
+            let (bands, walked, used) =
+                (f[1].load(Relaxed), f[4].load(Relaxed), f[5].load(Relaxed));
+            let a = cb_amp_x100(walked, used);
+            serial_println!(
+                "[wc-b] win={} span={} bh={} bands={} chrome_paints={} chrome_rows={} chrome_rows_used={} amp={}.{:02}x -> {}",
+                id,
+                f[2].load(Relaxed),
+                f[3].load(Relaxed),
+                bands,
+                bands,
+                walked,
+                used,
+                a / 100,
+                a % 100,
+                if bands > 1 { "BANDED" } else { "WHOLE" }
+            );
+        }
+    }
+    // The rollup: the steady-state answer, rate-gated so a compositor running at frame rate cannot
+    // flood the wire with it. Only one core prints per period — the `compare_exchange` loser returns.
+    let last = CB_LASTROLL.load(Relaxed);
+    let now = crate::arch::now_cycles();
+    if super::wcg::cycles_to_us(now.saturating_sub(last)) < 1_000_000 {
+        return;
+    }
+    if CB_LASTROLL.compare_exchange(last, now, core::sync::atomic::Ordering::AcqRel, Relaxed).is_err()
+    {
+        return;
+    }
+    let presents = CB_PRESENTS.load(Relaxed);
+    if presents == 0 {
+        return;
+    }
+    let (walked, used) = (CB_TOT_WALK.load(Relaxed), CB_TOT_USED.load(Relaxed));
+    let a = cb_amp_x100(walked, used);
+    let banded = CB_BANDED.load(Relaxed);
+    serial_println!(
+        "[wc-b] rollup presents={} banded={} maxbands={} chrome_rows={} chrome_rows_used={} amp={}.{:02}x -> {}",
+        presents,
+        banded,
+        CB_MAXBANDS.load(Relaxed),
+        walked,
+        used,
+        a / 100,
+        a % 100,
+        // The verdict is about the CLIP, not about the banding: a boot that never banded has nothing
+        // to amplify and says so, rather than claiming a fix it never exercised.
+        if banded == 0 {
+            "UNBANDED"
+        } else if a <= 100 {
+            "CLEAN"
+        } else {
+            "AMPLIFIED"
+        }
+    );
+}
+
+/// CHROMEBAND — the rMBP panel's own banding, driven once per boot so the gate can SEE it.
+///
+/// ### Why this fixture has to exist
+///
+/// The defect only appears when `span > chunk_rows`, i.e. when `bw * span` exceeds
+/// [`MAX_STAGE_BYTES`]/4 = 1 048 576 pixels. **No present the x86 QEMU gate makes can reach that.**
+/// Measured, not assumed: at QEMU's default 1280x800 the WHOLE PANEL is 1 024 000 px — 24 576 short
+/// of the threshold, so nothing can band even in principle; forced to 1920x1200 the largest window
+/// box the gate builds is 522x556 = 290 232 px. Both runs printed `banded=0 maxbands=1` over every
+/// present. The banded path is real on the bench (a 2880x1800 panel gives the console-as-a-window a
+/// 2880-wide box, `chunk_rows = 364`, five bands) and structurally unreachable on the gate.
+///
+/// So a green gate over the shipped path would have certified nothing about banding, which is the
+/// exact shape of absent instrument the laws forbid. This fixture drives the chrome half of
+/// [`stage_window`]'s band loop at the BENCH's geometry — 2880x1800, five bands — against a scratch
+/// band buffer, so `[wc-b] fixture bands=5` is on the wire of every witness boot regardless of what
+/// panel QEMU handed us.
+///
+/// **It is a fixture and says so on the wire.** It composes into scratch and never touches the
+/// panel, so it cannot disturb `[wc-d]`'s read-back or any other pass. One-shot per boot, on the
+/// `FALLBACK_FIXTURE` latch's precedent one screen down. x86-only: the 4 MiB scratch is a fifth of
+/// the aarch64 heap, and taking it there to close an x86 question would be the GR27 famine again.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+static CB_FIXTURE_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// CHROMEBAND — see [`CB_FIXTURE_DONE`]. Runs the band loop's `paint_window` call at bench geometry
+/// and reports what the chrome painter walked against what it could write.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+fn chromeband_fixture(r: &Window, pw: usize, ph: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if CB_FIXTURE_DONE.swap(true, Relaxed) {
+        return;
+    }
+    // The bench panel, stated as constants rather than read from `info`: the whole point is to reach
+    // a geometry this build's panel does not have. `chunk_rows` is `MAX_STAGE_BYTES / row_bytes`
+    // exactly as `stage_window` computes it, so the band count is the shipped arithmetic and not a
+    // second copy of it.
+    const FIX_BW: usize = 2880;
+    const FIX_BH: usize = 1800;
+    let bpp = 4usize;
+    let row_bytes = FIX_BW * bpp;
+    let chunk_rows = (MAX_STAGE_BYTES / row_bytes).min(FIX_BH);
+    if chunk_rows == 0 {
+        return;
+    }
+    let need = row_bytes * chunk_rows;
+    // One band's worth of scratch, taken once and dropped at the end of this call. `try_reserve` so
+    // an exhausted heap declines instead of panicking from the compositor.
+    let mut scratch: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if scratch.try_reserve(need).is_err() {
+        serial_println!("[wc-b] fixture -> SKIP (scratch {} bytes unavailable)", need);
+        return;
+    }
+    scratch.resize(need, 0);
+    chrome_rows_reset();
+    let mut bands = 0u64;
+    let mut band = 0usize;
+    while band < FIX_BH {
+        let rows = chunk_rows.min(FIX_BH - band);
+        bands += 1;
+        let mut layer = super::FrameBuffer::new();
+        layer.init(
+            scratch.as_mut_ptr() as usize,
+            rows * row_bytes,
+            unaos_boot_info::FrameBufferInfo {
+                width: FIX_BW,
+                height: rows,
+                stride: FIX_BW,
+                bytes_per_pixel: bpp,
+                pixel_format: unaos_boot_info::PixelFormat::Bgr,
+            },
+        );
+        // The band loop's own call, argument for argument: the BOX is fixed at `(0, 0, bw, bh)` and
+        // only the destination ORIGIN walks down it. That difference is the whole of the banding.
+        paint_window(&layer, r, 0, band, 0, 0, FIX_BW, FIX_BH, pw, ph, true, true);
+        band += rows;
+    }
+    let (walked, used) = chrome_rows_take();
+    let a = cb_amp_x100(walked, used);
+    serial_println!(
+        "[wc-b] fixture geom={}x{} chunk_rows={} bands={} chrome_paints={} chrome_rows={} chrome_rows_used={} amp={}.{:02}x -> {}",
+        FIX_BW, FIX_BH, chunk_rows, bands, bands, walked, used,
+        a / 100, a % 100,
+        // The fixture's own falsification: fewer than two bands means the geometry stopped exercising
+        // the defect and the `amp=` beside it certifies nothing.
+        if bands < 2 { "NOT-BANDED" } else if a <= 100 { "CLEAN" } else { "AMPLIFIED" }
+    );
+}
+
+/// CHROMEBAND — the rows of a chrome rect that land inside a destination `dh` rows tall, given a
+/// vertical origin that may lie ABOVE row 0. Returns `(first_row, count)` in the DESTINATION's own
+/// coordinates, `count == 0` when the rect misses it entirely.
+///
+/// This is the arithmetic [`fill_rect_v`] used to leave half-done and [`fill_rect_ceramic`] used to
+/// not do at all. Stated once, here, so the two callers cannot drift apart — and so the census in
+/// `chrome_row_note` can test the SAME rows against the SAME bound by an independent predicate.
+#[inline]
+fn clip_rows(y: isize, h: usize, dh: usize) -> (usize, usize) {
+    if h == 0 {
+        return (0, 0);
+    }
+    let lo = y.max(0);
+    let hi = y.saturating_add(h as isize).min(dh as isize);
+    if hi <= lo {
+        return (0, 0);
+    }
+    (lo as usize, (hi - lo) as usize)
+}
+
 /// WC-M — [`super::FrameBuffer::fill_rect`] with a vertical origin that may lie ABOVE the
-/// destination's row 0. The rows above are dropped and the remainder is filled at its true position;
-/// everything else clips inside `fill_rect` exactly as before. For `y >= 0` this IS
-/// `fill_rect(x, y as usize, w, h, color)` — the direct path and every single-band stage take that
-/// branch, so neither sees any change at all.
+/// destination's row 0. The rows above are dropped and the remainder is filled at its true position.
+///
+/// ### CHROMEBAND — and the rows BELOW it are dropped here too, not inside `fill_rect`
+///
+/// WC-M clipped the top edge and left the bottom to `fill_rect`. That is correct on aarch64, whose
+/// `fill_rect` clamps `y1` to the surface height before it walks anything — but on **x86_64
+/// `fill_rect` is the per-pixel loop**, `for row in 0..h { for col in 0..w { put_pixel } }`, with no
+/// height pre-clip at all: every row past the destination's last is still walked, and every pixel of
+/// it still pays a call and four bounds checks to be rejected. A banded stage passes chrome rects
+/// whose height is the whole BOX (the keyline and bevel verticals are `bh` tall, and
+/// [`fill_rect_ceramic`]'s side borders are the content's full height), so on the rMBP's 2880x1800
+/// panel — five bands for a full-height box — each band walked the rows of every band below it.
+///
+/// Clipping both edges here makes the walk exactly the rows that can be written. **The pixel set is
+/// unchanged**: for `y >= 0` the old call filled `[y, min(y + h, dh))` after `put_pixel`'s rejections,
+/// and for `y < 0` it filled `[0, min(h - skip, dh))`; `clip_rows` returns precisely those ranges.
+/// What changes is only what is WALKED to produce them.
 fn fill_rect_v(dst: &super::FrameBuffer, x: usize, y: isize, w: usize, h: usize, color: u32) {
-    if y >= 0 {
-        dst.fill_rect(x, y as usize, w, h, color);
+    let (y0, rows) = clip_rows(y, h, dst.info().height);
+    if rows == 0 {
         return;
     }
-    let skip = (-y) as usize;
-    if skip >= h {
-        return;
-    }
-    dst.fill_rect(x, 0, w, h - skip, color);
+    dst.fill_rect(x, y0, w, rows, color);
 }
 
 /// CERAMIC — `fill_rect_v` with the brushed-aluminium material on it: the same rectangle, but each
@@ -18162,6 +18497,19 @@ fn fill_rect_v(dst: &super::FrameBuffer, x: usize, y: isize, w: usize, h: usize,
 /// work and adds, per ROW, one table lookup, three channel multiplies and one `encode4`. See
 /// `ceramic`'s module header for why the material is per-row in the first place, and
 /// `ceramic::selftest` leg 6 for the measured cost of the multiply.
+/// ### CHROMEBAND — the walk is the BAND's rows, not the rect's
+///
+/// This loop is the compositor's single largest per-band chrome cost, and before this arc it ran
+/// `h` times per band no matter how few of those rows the band could hold. Each wasted iteration
+/// paid a [`super::ceramic::shade`] — a table lookup, three multiplies and a clamp per channel — to
+/// produce a colour for a row that was then thrown away by the destination's bounds. On the rMBP's
+/// 2880x1800 panel a full-height window bands five ways, and the two side-border rects are the
+/// content's full height, so the face fill walked ~5x the rows it could write.
+///
+/// The loop now runs the clipped range from [`clip_rows`]. `shade` is a pure function of the
+/// BOX-LOCAL row (`dy - lby`), which the clip does not move, so every colour written is bit-for-bit
+/// the colour written before — the grain still anchors to the window and still runs continuously
+/// across a band seam.
 fn fill_rect_ceramic(
     dst: &super::FrameBuffer,
     x: usize,
@@ -18174,8 +18522,20 @@ fn fill_rect_ceramic(
     if w == 0 {
         return;
     }
-    for j in 0..h {
+    let dh = dst.info().height;
+    let (_, rows) = clip_rows(y, h, dh);
+    // The first rect row that lands in `dst`: the rows above it were composed and presented by an
+    // earlier band. Zero on the direct path and on every single-band stage.
+    let j0 = if y < 0 { (-y) as usize } else { 0 };
+    for j in j0..j0 + rows {
         let dy = y + j as isize;
+        // CHROMEBAND — the census. `walked` is this iteration; `used` is an INDEPENDENT test of the
+        // same row against the destination's own height, so the ratio the witness prints is not an
+        // assertion about itself. After the clip the two must agree exactly; a regression that
+        // widens the walk again separates them and `[wc-b] amp=` rises off 1.00x. See
+        // [`chrome_row_note`].
+        #[cfg(feature = "witness")]
+        chrome_row_note(dy >= 0 && dy < dh as isize);
         // Rows above the box cannot occur (every chrome rect starts at or below `lby`), but the
         // saturating form keeps the index total rather than relying on that.
         let brow = (dy - lby).max(0) as usize;
@@ -18968,9 +19328,23 @@ fn stage_window(
     // FBCON-DMG — it starts at the damaged range's first row and stops at its last, instead of
     // walking the whole box. `dy0 == 0 && dy1 == bh` is the unbanded present and is the pre-FBCON-DMG
     // loop verbatim.
+    // CHROMEBAND — zero the chrome census immediately before the loop that feeds it, so the pair
+    // read out below describes this present and no other. Past every `decline!`, which all return
+    // before here, so a declined present neither resets nor charges.
+    #[cfg(feature = "witness")]
+    chrome_rows_reset();
+    // CHROMEBAND — how many times this present ran the band body, i.e. how many times `paint_window`
+    // re-derived this window's chrome. NOT `bh / chunk_rows`: the loop's own trip count is the thing
+    // the witness is entitled to report, and `dy0`/`dy1` are the damaged range rather than the box.
+    #[cfg(feature = "witness")]
+    let mut bands_run = 0u64;
     let mut band = dy0;
     while band < dy1 {
         let rows = chunk_rows.min(dy1 - band);
+        #[cfg(feature = "witness")]
+        {
+            bands_run += 1;
+        }
 
         #[cfg(feature = "witness")]
         let b0 = crate::arch::now_cycles();
@@ -19179,6 +19553,14 @@ fn stage_window(
         compose_cyc,
         ph,
     );
+    // CHROMEBAND — record beside `stage_note`, print from `band_flush`, and for the identical
+    // reason: this site is inside WC-G's clock. `[wc-h] band=` already says WHETHER this present
+    // banded; `[wc-b] bands=` says how many times, and pairs it with what the chrome painter walked.
+    #[cfg(feature = "witness")]
+    {
+        let (walked, used) = chrome_rows_take();
+        band_note(r.id, bands_run, span as u64, bh as u64, walked, used);
+    }
     true
 }
 
