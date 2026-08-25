@@ -164,6 +164,25 @@ drop_el2_to_el1_tegra:
     // exceptions::install at EL2 — the boot core no longer routes to its abandoned EL2 vectors).
     mov   x0, #(1 << 31)
     msr   hcr_el2, x0
+    // IRQEL-RT2 evidence latch. These four registers decide where a physical IRQ taken at EL1 goes
+    // (HCR_EL2.IMO/TGE), whether EL1 may touch CNTP_*/CNTPCT at all (CNTHCTL_EL2), and whether an
+    // ICC_*_EL1 access at EL1 is even defined (ICC_SRE_EL1) — and NONE of them is readable once we
+    // eret: an `mrs` of an EL2 register from EL1 is UNDEFINED and would take a sync exception into
+    // the very vectors under test. So snapshot them HERE, at the last instant they are readable and
+    // in their FINAL post-programming values (both writes above are already retired), into RAM the
+    // EL1 twin maps Normal-WB on the same core — no barrier needed for a same-core read-back.
+    // x1/x2 are dead scratch at this point; x0 is reloaded immediately below and x30 is untouched,
+    // so the "no stack traffic, x30 preserved" contract of this stub still holds.
+    adrp  x1, {latch}
+    add   x1, x1, :lo12:{latch}
+    mrs   x2, hcr_el2
+    str   x2, [x1]
+    mrs   x2, cnthctl_el2
+    str   x2, [x1, #8]
+    mrs   x2, S3_0_C12_C12_5      // ICC_SRE_EL1 — gates EL1's ICC_* system-register CPU interface
+    str   x2, [x1, #16]
+    mrs   x2, S3_4_C12_C9_5       // ICC_SRE_EL2
+    str   x2, [x1, #24]
     // Land at EL1h (SPx = SP_EL1) with DAIF masked; SP_EL1 = current SP so the stack is continuous;
     // ELR_EL2 = x30 so the eret returns to our caller now running at EL1.
     mov   x0, sp
@@ -173,8 +192,34 @@ drop_el2_to_el1_tegra:
     msr   elr_el2, x30
     isb
     eret
-"#
+"#,
+    latch = sym JM6_EL2_LATCH,
 );
+
+/// IRQEL-RT2 — the four EL2-only registers the drop asm latches immediately before its `eret`, in
+/// their final post-programming values: `[0]` HCR_EL2, `[1]` CNTHCTL_EL2, `[2]` ICC_SRE_EL1,
+/// `[3]` ICC_SRE_EL2. Written once, by that asm, at EL2; read-only afterwards. `AtomicU64` (not
+/// `static mut`) so the read-back needs no `unsafe` and no raw-reference lint exception — the layout
+/// is a plain `u64` either way, which is what the `str x2, [x1, #N]` above writes.
+pub static JM6_EL2_LATCH: [core::sync::atomic::AtomicU64; 4] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// Read back the JM6 drop's EL2 latch as `(HCR_EL2, CNTHCTL_EL2, ICC_SRE_EL1, ICC_SRE_EL2)`. All
+/// zeroes means the drop has not run on this core yet (the statics' initial value), which is itself
+/// honest: HCR_EL2 is never legitimately 0 here — the drop always sets RW (bit 31).
+pub fn jm6_el2_latch() -> (u64, u64, u64, u64) {
+    use core::sync::atomic::Ordering;
+    (
+        JM6_EL2_LATCH[0].load(Ordering::Relaxed),
+        JM6_EL2_LATCH[1].load(Ordering::Relaxed),
+        JM6_EL2_LATCH[2].load(Ordering::Relaxed),
+        JM6_EL2_LATCH[3].load(Ordering::Relaxed),
+    )
+}
 
 unsafe extern "C" {
     /// Drop this core EL2 -> EL1 and return to the caller now executing at EL1. Call at EL2 AFTER

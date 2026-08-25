@@ -2213,7 +2213,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
                         // the pads down, so they arrive live and the RMW was dead code.)
                     }
                     None => serial_println!(":: tegra: JB1c — no usb@3610000 ids in DTB; SKIP ::"),
-                }
+                } #[cfg(feature = "jd1dc")] unaos_kernel::arch::display_tegra::jd1_dc_probe(&chan, boot_info.dtb_addr, boot_info.dtb_size, mmu.ram_gib_mask); // JD1-DC (UNAOS_JD1DC=1, default OFF) — the BPMP-guarded, READ-ONLY nvdisplay register probe; see the JD1-DC tail block in display_tegra.rs. THIS instruction is the only point in the boot where both of its ordering constraints hold: BPMP-FIRST (the `chan` this borrows was established by `jb1b_ping` ~60 lines up, and without it the MRQ_PG GET_STATE guard that earns the first read cannot be asked — which is why the probe could NOT stay at its old site inside `jd1_survey`), and JD1-FIRST (the scanout resolution, `map_fb_region`, `fbcon::init` and the `WRITER` seed are ~90 lines up, so panel + serial + shell are already live on a framebuffer resolved by a pure DTB RAM walk and a probe that goes wrong costs the experiment, not the boot). Last in the BPMP block so every other diagnostic has already reached the wire before the one read that could end it. Appended to this line, never a new one: knob-off it is cfg-erased and no panic `Location` below moves.
             }
         }
         None => serial_println!(":: tegra: JB1b — geometry unresolved from DTB; SKIP ::"),
@@ -2271,7 +2271,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // (dtb fields are Copy; grabbed before `memory::init` consumes the &'static mut borrow.)
     let (dtb_addr, dtb_size) = (boot_info.dtb_addr, boot_info.dtb_size);
     unaos_kernel::arch::memory::init(boot_info);
-    serial_println!(":: KERNEL HEAP ALLOCATED ::");
+    serial_println!(":: KERNEL HEAP ALLOCATED ::"); #[cfg(feature = "orindesk")] unaos_kernel::arch::display_tegra::orin_wm1(); // ORIN-WM1 — one wm window on the JD1 scanout (tail block)
     // XCARVE-2 temporal bracket: heap carved + span-B top published (`select_heap_region`). span-B now
     // covers the 0x26b900000 target, so this is the first bracket whose bisect can fire on the target.
     unaos_kernel::vugras::phase("post-heap-init");
@@ -2478,6 +2478,72 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(all(feature = "install_target", feature = "tegra"))]
     unaos_kernel::arch::sdmmc_tegra::sdmmc_install_from_usb();
 
+    // ORIN-UNAFS-ROOT rung 4 (arc M4): probe-mount the microSD's NATIVE unafs volume on its OWN
+    // block handle — `unafs::mount_on(BlockHandle::TegraSd)`, the consumer the SDSEAM arms in
+    // fs/unafs.rs were written for. Position is load-bearing, three ways:
+    //   * AFTER `sdmmc_census` (~line 2188): the census's `publish_block_backend` is what fills
+    //     `TEGRA_SD_BLOCK_DEVICE`; before it, `tegra_sd_info()` is None and every read answers
+    //     `NotReady` — mounting earlier could only witness its own prematurity.
+    //   * AFTER `sdmmc_install_from_usb` (directly above): the installer REWRITES card content
+    //     (never capacity). A mount taken between census and install would read the pre-install
+    //     bytes and report a stale verdict on the very boot that changed the answer.
+    //   * BEFORE the JM6 drop / CAPSTONE (below): still at EL2 with the JM4 timer live, so the
+    //     polled CMD17 path's bounded waits behave exactly as they did for the census's own M3
+    //     read; and the JD2 console task, though already spawned, is not dispatched until
+    //     `run_capstone_boot_core`, so this witness lands on serial before any shell interaction.
+    // PROBE, not an installation: `mount_on` returns a fresh `KernelUnaFS`, witnessed and DROPPED.
+    // The shared `fs::unafs::MOUNT` cache (what the shell's `with_unafs` verbs use) stays bound to
+    // `BlockHandle::Global` — the USB boot stick — untouched: rebinding it is fs-lane work and a
+    // negotiation with the pi seat, not this rung. Two live mounts would be the K4 write-coherence
+    // hazard unafs.rs names; dropping ours before proceeding, plus the block layer's unconditional
+    // `write_block_tegra_sd` refusal (the card has NO writer outside `sdmmc_arm`), keeps this
+    // read-only and momentary by construction. `program_source` is likewise undisturbed — its
+    // `TegraSd` arm is `None` ("cannot be reached"), so the EL0 program volume stays the stick.
+    // Compiled out without `sdmmc` => byte-identical to baseline. See docs/dev/OS/orin-unafs-root.md.
+    #[cfg(feature = "sdmmc")]
+    {
+        use unaos_kernel::drivers::block;
+        use unaos_kernel::fs::unafs;
+        match block::tegra_sd_info() {
+            // Publish absent: the census stopped before M3 (or refused num_blocks=0). This is the
+            // expected line while the census SError is being fixed — the probe names the missing
+            // precondition instead of a misleading NoStorage.
+            None => serial_println!(
+                ":: TEGRA-UNAFS: probe SKIPPED — no TegraSd block backend published this boot (census did not reach its publish) ::"
+            ),
+            Some(dev) => match unafs::mount_on(block::BlockHandle::TegraSd) {
+                Ok(fs) => {
+                    serial_println!(
+                        ":: TEGRA-UNAFS: native unafs volume MOUNTED read-only on TegraSd — card {} sectors, {} committed root flip(s) on the volume ::",
+                        dev.num_blocks,
+                        fs.commit_stats().commits
+                    );
+                    // Dropped HERE: one mount at a time (K4), and the shared MOUNT stays Global.
+                    drop(fs);
+                }
+                // The expected verdict until the installer has written a unafs partition: the card
+                // is readable end to end (the partition scan ran off it), it just carries no volume.
+                Err(unafs::MountError::NoVolume) => serial_println!(
+                    ":: TEGRA-UNAFS: card readable ({} sectors) but NO partition carries a unafs superblock — installer has not written the native volume yet ::",
+                    dev.num_blocks
+                ),
+                // Partition table unparseable — a raw/blank card reads this way; also expected pre-install.
+                Err(unafs::MountError::Part(e)) => serial_println!(
+                    ":: TEGRA-UNAFS: partition scan on TegraSd FAILED — {:?} (card {} sectors; raw/blank card reads this way pre-install) ::",
+                    e,
+                    dev.num_blocks
+                ),
+                // Everything else (NoStorage race, BadSectorSize, Fs, Busy): a real defect worth a capture.
+                Err(e) => serial_println!(
+                    ":: TEGRA-UNAFS: mount on TegraSd FAILED — {:?} (card {} sectors; unexpected — capture this boot) ::",
+                    e,
+                    dev.num_blocks
+                ),
+            },
+        }
+    }
+
+
     // 3d. JX1 RESULT (probe removed — metal-answered 2026-07-06, capture serial-orin-jx1.log): the
     //     Tegra234 XUSB host block @ 0x0361_0000 is NOT accessible after ExitBootServices. The
     //     probe's first read fired an SError (ESR 0xbe000011, EC=0x2F/ISS=0x11) fatal to EL3 —
@@ -2599,9 +2665,18 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
             sctlr,
         );
     }
-    unaos_kernel::arch::percpu::init(0);
+    // EL0-EL1CORE — STAMP THE EL1 CORE, and do it here rather than one statement earlier or later.
+    // `percpu::init` on the line above is the first instant at which BOTH facts the stamp records are
+    // true: this core is at EL1 (the `drop_to_el1` two statements up returns only through its `eret`,
+    // so reaching this line IS the drop having completed) and TPIDR_EL1 now resolves to this core's
+    // block, so `cpu_index` is the index the SCHEDULER will dispatch under rather than a constant
+    // asserted about it. `mark_el1_core` re-measures `CurrentEL` itself and stamps nothing if it is not
+    // EL1, so the placement filter fails CLOSED — refusing every EL0 spawn — if this ever moves above
+    // the drop. It must stay ABOVE `tegra_el0_start_maybe()` on the next line: that spawns the pinned
+    // `el0-hello` task, and an unstamped mask would refuse it (see sched.rs `EL1_CORE_MASK`).
+    unaos_kernel::arch::percpu::init(0); unaos_kernel::arch::sched::mark_el1_core();
     unaos_kernel::arch::exceptions::install();
-    tegra_el0_start_maybe(); tegra_rast_demo_maybe(); unaos_kernel::arch::sched::run_capstone_boot_core(0); // RAST-TEGRA demo (no-op unless UNAOS_RAST=1) on the same line as the terminus so the wire-in adds ZERO source lines before any panic Location — the tegra knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helper defined at file tail.
+    unaos_kernel::arch::timer::el1_oneshot_proof(); tegra_el0_start_maybe(); #[cfg(feature = "tegradesk")] tegra_desk_arm(); tegra_rast_demo_maybe(); unaos_kernel::arch::sched::run_capstone_boot_core(0); // IRQEL-RT EL1 one-shot proof (first: one interrupt taken AT EL1 through the runtime-banked __vec_irq, then self-disarms — see timer.rs tail) + ORINDESK RUNG 2 desktop seam (no-op unless UNAOS_TEGRADESK=1; DESKSEAM tail block) + RAST-TEGRA demo (no-op unless UNAOS_RAST=1), all on the same line as the terminus so the wire-ins add ZERO source lines before any panic Location — the tegra knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helpers defined at file tail / timer.rs tail.
 }
 
 /// Handle one keyboard byte against the console: printable ASCII extends the input line, backspace
@@ -2862,8 +2937,8 @@ fn jd2_console_pump(_arg: usize) {
                     }
                 }
                 Event::Button(mask) => {
-                    // Log clicks as a JD2 line for now (no UI action wired yet).
-                    serial_println!(":: tegra: JD20 — pointer BUTTON {:#04x} (down) ::", mask);
+                    // JD20's raw line: an event reached the PUMP. ORIN-CLICK (rung 3) then hands the same edge to the window layer — a separate claim, kept on a separate line, so a capture can tell a decoder fault from a routing fault. ⚠ LINE-NEUTRAL: the routing call is APPENDED to the JD20 statement, never given a line of its own — panic `Location` records embed line numbers, so a line added anywhere in this file breaks the knob-off byte-identity proof.
+                    serial_println!(":: tegra: JD20 — pointer BUTTON {:#04x} (down) ::", mask); #[cfg(feature = "orinclick")] unaos_kernel::arch::display_tegra::orin_click(mask); // ORIN-CLICK rung 3 — route the edge into `wc_click_route`; witness `[orinclick] edge=...`
                 }
                 _ => {}
             }
@@ -2898,7 +2973,7 @@ fn jd2_console_pump(_arg: usize) {
         // console pump was live at shell entry with no vug run). No-op with the knob off.
         if cntpct().wrapping_sub(last_sweep) >= sweep_ticks {
             last_sweep = cntpct();
-            unaos_kernel::vugras::idle_sweep(sweep_tick);
+            unaos_kernel::vugras::idle_sweep(sweep_tick); #[cfg(feature = "orinclick")] unaos_kernel::arch::display_tegra::orin_click_census(sweep_tick); // ORIN-CLICK rung 3 — the ARM line, then the ~10 s click census. Emitted FROM THIS LOOP on purpose: it is the routing task's own liveness, so `[orinclick] census` stopping is a dead pump and `btn=0` is "nobody clicked", not "routing failed". ⚠ LINE-NEUTRAL append — see the Button arm above.
             sweep_tick += 1;
         }
         unaos_kernel::arch::sched::yield_now();
@@ -6602,4 +6677,256 @@ fn pidesk_activate_maybe() -> bool {
 #[inline(always)]
 fn pidesk_activate_maybe() -> bool {
     false
+}
+
+// =================================================================================================
+// ORIN-WM1 (tail block) — why the call site above is ONE APPENDED STATEMENT and where it sits.
+// =================================================================================================
+//
+// THE STATEMENT. `tegra_early_stop`'s step 3c line, `serial_println!(":: KERNEL HEAP ALLOCATED ::");`,
+// carries `#[cfg(feature = "orindesk")] unaos_kernel::arch::display_tegra::orin_wm1();` APPENDED to it
+// rather than a new line of its own. That is the `smpmark` / DARKWIN-GUARD idiom in this tree, and the
+// reason is measured, not stylistic: inserting a line into `main.rs` shifts the line-number constants
+// baked into every panic `Location` below it, which moves the loadable image even when not one
+// instruction of logic changed. Appending keeps the file's line count identical, which is what lets the
+// DISARMED jetson image be byte-identical to baseline rather than merely argued to be.
+//
+// WHY HERE AND NOT `kernel_main`. `tegra_early_stop` is declared `-> !` and DIVERGES: `kernel_main`'s
+// own `memory::init`, its `video::init_panel` (the tree's only `wm::reserve_stage` caller) and every
+// later step are unreachable on this board. A desktop seam hung off `kernel_main` would be dead code on
+// the Orin. The two live seams are this function and `jd2_console_pump`.
+//
+// WHY THIS LINE AND NOT `jd2_console_pump`. Four preconditions have to hold at once, and this is the
+// first instruction on the tegra path where they do:
+//
+//   * PANEL — `video::WRITER` carries real geometry. Seeded in the JD1 block ~170 lines above; before
+//     it, `spawn_geometry` declines and a row would be born unplaced.
+//   * HEAP — `wm::reserve_stage` grows a `Vec` with `try_reserve`. The heap is carved by the
+//     `memory::init` two lines above; this statement rides the line that ANNOUNCES it, so the ordering
+//     is not merely correct, it is legible.
+//   * IRQs LIVE, NO PASS IN FLIGHT — `reserve_stage`'s own stated contract (it must not be the growth
+//     that happens inside a present's IRQ mask). JM4's `enable_irq` is ~15 lines above; the scheduler
+//     has not started, and this is the boot core alone.
+//   * STACK — `composite_inner`'s aarch64 stack cost is on the ledger (occ62 records stack exhaustion
+//     as the reason that function was reshaped), and the Pi hit a 16 KiB kernel-stack overflow in the
+//     desktop cascade twice. `tegra_early_stop` runs on the BOOT stack; `jd2_console_pump` is a
+//     `sched::spawn`ed task on a `TASK_STACK_SIZE` stack. This rung takes the boot stack.
+//
+// DARKWIN. Every `serial_println!` `orin_wm1` can emit is downstream of `serial::mark_mmio_ready()` —
+// which is armed on the MMU line at the very top of `tegra_early_stop`, some 280 lines above — so no
+// byte of it can reach an unmapped UARTC.
+//
+// SCOPE. One window. `pidesk::activate` is NOT called from here and no furniture is armed; see the
+// ORIN-WM1 block in `arch/aarch64/display_tegra.rs` for the cascade hazard that keeps it that way.
+
+// =================================================================================================
+// ORINDESK RUNG 2 — DESKSEAM: the Orin's DESKTOP SEAM. `tegradesk`, DEFAULT OFF, and it REFUSES
+// even when armed. Ladder: docs/dev/OS/08_VIDEO/orin-desktop.md §3.1, §3.2, §5.2, §6, §6.1.
+// =================================================================================================
+//
+// THE DEFECT THIS CLOSES. `pidesk_activate_maybe` above is gated
+// `all(aarch64, feature = "pidesk", feature = "baremetal")`. `Cargo.toml` has `baremetal = ["pi"]`
+// and `arch/aarch64/serial.rs` has `#[cfg(all(feature = "pi", feature = "tegra"))] compile_error!`,
+// so on a tegra build that gate is not merely unset — it is UNSATISFIABLE, and the wrapper always
+// resolves to its constant-`false` twin. The desktop-arming code has existed on this branch since
+// the base sync and could never once have run here. `tegra_desk_arm` is the gate that CAN be
+// satisfied on this board. The Pi wrapper above is UNTOUCHED: it is live and correct on `hw-pi4`,
+// and this is an addition beside it, not a widening of it.
+//
+// WHY THE CALL SITE IS THE TERMINUS LINE (§3.1). `tegra_early_stop` is declared `-> !` and DIVERGES;
+// `kernel_main` — where `pidesk_activate_maybe` is wired, behind the `fbcon::detach()` handoff — is
+// never reached on this board. §3.1's conclusion is that the arming point "has to be chosen inside
+// `tegra_early_stop`, after the heap and the scheduler are up", and the last instruction before
+// `run_capstone_boot_core(0)` (which never returns) is the only point on this path where all of it
+// holds at once: panel seeded (JD1, ~570 lines above), heap carved (step 3c), IRQs live (JM4), SMP
+// secondaries kicked off (JM5, ~95 lines above — `wm::reserve_stage` sizes one stage entry per LIVE
+// core, so §3.3's ordering constraint is inherited), EL2 -> EL1 dropped, `percpu`/`mark_el1_core`
+// stamped, and the run queue populated but not yet driven. It is also the tegra counterpart of the
+// Pi's `main.rs:1316` GUI-handoff line in every respect that matters.
+//
+// AND IT RUNS ON THE BOOT STACK, which is a better stack story than the Pi's and is stated here
+// because §5's hazard is a stack hazard: both Pi overflows were `TASK_STACK_SIZE` (16 KiB) task
+// stacks under a preemption frame. `tegra_early_stop` is the boot core's own entry frame. That is
+// NOT a claim that the cascade fits — see the stop-line below and the report's NOT-MEASURED list.
+//
+// ZERO SOURCE LINES. The call site is a statement APPENDED to the existing terminus line and this
+// block is at the FILE TAIL, below every panic `Location` in `main.rs`. Inserting a line anywhere
+// above would renumber those `Location`s and move the loadable image even with the knob off — the
+// PI-V3D-1 bisect-proven constraint the `smpmark`/ORIN-WM1/JD1-DC wire-ins all obey.
+
+/// DESKSEAM — one-shot latch. `tegra_early_stop` runs once per boot on the boot core, so this cannot
+/// fire today; it is here because the two `#[cfg]` mazes above this line have both grown a second
+/// reachable path in the past, and `pidesk::activate` has its own latch for exactly that reason.
+#[cfg(all(target_arch = "aarch64", feature = "tegradesk"))]
+static TEGRADESK_ENTERED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// DESKSEAM STOP-LINE 1 — **has rung 3 (input routing) landed?** `display_tegra::JD1_DC_PROBE`'s
+/// idiom: a compile-time precondition held `false` in source, flipped by the rung that discharges it.
+///
+/// §6.1 of the ladder, which calls this ordering "not negotiable": `pidesk::activate` opens the
+/// console window, that window carries a minimise disc, and `video/pidesk.rs:39-44` states the
+/// CONSWIN law — the only route back from that park is the dock, and the dock is only a way back
+/// once clicks route. **DISCHARGED 2026-08-25 by ORIN-CLICK (rung 3, orin-desktop.md §3.7):** that
+/// arm now calls `wc_click_route` (`main.rs:2852`), behind `orinclick`. ⚠ NOT a literal `true`, and
+/// the difference IS the safety property: `tegradesk` does NOT imply `orinclick`, so a hard `true`
+/// would assert a route back on an image that has none — the one-way trip re-entered through the very
+/// constant meant to prevent it. DERIVED FROM THE BUILD. Routing is UNFLOWN; §5.2 still holds.
+#[cfg(all(target_arch = "aarch64", feature = "tegradesk"))]
+const TEGRADESK_CLICK_ROUTED: bool = cfg!(feature = "orinclick");
+
+/// DESKSEAM STOP-LINE 2 — **§5.2, the inherited stack hazard.** The Pi overflowed a 16 KiB kernel
+/// stack in the desktop-arming cascade TWICE on consecutive metal boots (2026-08-22, boots 10 and
+/// 11), and both commits state that no gate in this tree can reproduce it: the overflow needs a
+/// preemption frame on an already-deep pass, and raspi4b delivers no timer IRQ on that path. A green
+/// `test-arm` is therefore not evidence about this, and treating it as evidence is the failure.
+///
+/// Arming the full cascade is RUNG 5 and is blocked. Rung 2 lands the seam, not the desktop.
+///
+/// Flipping this alone is not enough and is not the intended route: the flip belongs to the rung that
+/// can show the Orin's own `[u7stk]`/`[redzone]` numbers for this cascade on this board. §7 of the
+/// ladder is explicit that every stack number quoted for it so far is a **Pi** number.
+#[cfg(all(target_arch = "aarch64", feature = "tegradesk"))]
+const TEGRADESK_CASCADE_OK: bool = false;
+
+/// **DESKSEAM — the Orin's desktop seam: evaluate the floors, print them, and refuse.**
+///
+/// Returns `true` iff `pidesk::activate()` both ran and left the console ROUTED. Every other path
+/// returns `false` and names its reason on the wire. Nothing the caller does depends on the value
+/// today — the tegra path has no `fbcon::detach()` handoff to guard, which is the one thing the Pi
+/// wrapper's return value exists for — so this is a leaf, and a refusal costs the boot nothing.
+///
+/// **EVERY VERDICT BELOW IS DERIVED FROM A VALUE READ ON THIS BOOT, never asserted.** The floors are
+/// the same ones `video/pidesk.rs` evaluates internally, hoisted to the seam so that a refusal names
+/// itself BEFORE the cascade is entered rather than from inside it — and two of them (`table` and
+/// the stage) are floors `pidesk` does not check at all, because on the Pi they cannot fail.
+#[cfg(all(target_arch = "aarch64", feature = "tegradesk"))]
+fn tegra_desk_arm() -> bool {
+    use core::sync::atomic::Ordering;
+    use unaos_kernel::video::{dock, fbcon, pidesk, wm};
+
+    if TEGRADESK_ENTERED.swap(true, Ordering::AcqRel) {
+        serial_println!("[deskseam] REFUSE reason=already-armed (the seam is one-shot; a second pass would re-enter pidesk's own latch and re-ask for a window it would hand straight back)");
+        return false;
+    }
+
+    // FLOOR 1 — THE PANEL, live off the surface the compositor composites onto, never assumed.
+    // Copy the info out and drop `WRITER` immediately: nothing below may hold it across a `wm` call
+    // (the WRITER/TABLE acquisition order, ORIN-WM1's rule). FAILS on a headless Orin — no DTB
+    // `simple-framebuffer` handoff means the JD1 block printed `JB1b — geometry unresolved` and
+    // never seeded `WRITER`, and every floor after this one is a function of panel geometry.
+    let info = {
+        let fb = *unaos_kernel::video::WRITER.lock();
+        if !fb.is_ready() {
+            serial_println!("[deskseam] REFUSE reason=no-panel (headless boot — JD1 seeded no scanout; every floor below is a function of panel geometry)");
+            return false;
+        }
+        fb.info()
+    };
+    // NO SEPARATE ZERO-GEOMETRY FLOOR, and it was removed rather than never written: `pidesk`'s own
+    // step 1 tests `pw == 0 || ph == 0` after reading `WRITER`, so the obvious thing was to hoist
+    // that test here too. `FrameBuffer::is_ready` (framebuffer.rs) is
+    // `base != 0 && len != 0 && info.width != 0 && info.height != 0` — the extent test is already
+    // inside the readiness test, so the hoisted arm was unreachable. It was written, and the ARMED
+    // artifact convicted it: `LC_ALL=C grep -a -o` found every other `[deskseam]` string in
+    // `unaos-kernel` and not that one, because the optimiser had proved it dead. A DECLINE arm that
+    // cannot be reached is not a floor, it is a comment that costs image bytes.
+    let (pw, ph) = (info.width, info.height);
+
+    // FLOOR 2 — THE STAGING BUFFER (§3.3), and this is the floor the Orin uniquely needs. `wm`'s
+    // staged presents run inside `SYS_WIN_PRESENT`'s IRQ mask, so a buffer that GREW on the pass
+    // would be a masked acquisition of the global heap `Mutex` — the F1-F5 defect family. The tree's
+    // only `reserve_stage` caller is `video::init_panel`, and the tegra path never reaches it (it
+    // seeds `WRITER` by hand instead), so without this line every composite the cascade drives would
+    // take the lazy-growth path. Grow-only and idempotent, so it is safe beside ORIN-WM1's own call.
+    // FAILS when the 48 MiB aarch64 heap cannot spare entry 0 at all.
+    let staged = wm::reserve_stage(&info);
+    if staged == 0 {
+        serial_println!("[deskseam] REFUSE reason=stage-unreserved panel={}x{} stage=0 (wm::reserve_stage got nothing for entry 0 — every composite would grow its buffer under SYS_WIN_PRESENT's IRQ mask, the F1-F5 shape)", pw, ph);
+        return false;
+    }
+    let panel_bytes = pw.saturating_mul(ph).saturating_mul(info.bytes_per_pixel);
+    let cover = if panel_bytes == 0 { 0 } else { staged.saturating_mul(100) / panel_bytes };
+
+    // FLOOR 3 — THE WINDOW TABLE MUST BE EMPTY, read from `wm::count()`.
+    // `video/pidesk.rs` step 1b writes the WHOLE PANEL to `DESKTOP_BG` through the FRONT buffer, and
+    // its own argument for why that direct write is sound is "the window table is empty at this
+    // line, so a direct front-buffer write collides with no compositor-owned pixel". On the Pi that
+    // is true by construction. On the Orin it is NOT: rung 0 (`orindesk`) mints and composites a row
+    // ~400 lines above this one, so `UNAOS_ORINDESK=1 UNAOS_TEGRADESK=1` reaches this seam with a
+    // live window on the glass and `pidesk`'s clear would paint over it while asserting it could not.
+    // This is a REACHABLE failing verdict from two knobs in `arroyo` today, not a hypothetical.
+    let live = wm::count();
+
+    // FLOOR 4 — THE DOCK, i.e. the CONSOLEWIN law's geometry half, evaluated with the SAME call
+    // `pidesk` makes (`MAX_WINDOWS`, not the live count — the check must hold for every table state
+    // the boot can reach). `for_panel` is pure integer geometry and paints nothing. Two-sided in
+    // codegen and derived from the live panel — but the WITHHELD arm's REACH is stated as measured
+    // rather than inherited from the Pi: on this build `for_panel` INLINES and const-folds its
+    // step-down loop to two compares, `ph >= 76 && pw >= 576` (`cmp x21, #0x4c` /
+    // `ccmp x20, #0x240, hs` / `cset w20, lo` in the armed `unaos-kernel`), so no Orin panel this
+    // branch has seen withholds it. The Pi's `DECLINE reason=dock-cannot-host-full-strip
+    // panel=640x480 rows=12` was measured under that track's cell metrics and does NOT transfer —
+    // 640x480 clears the floor above. Reported as the console-window CENSUS term rather than as a
+    // refusal because a withheld console window is not fatal to `pidesk` either: the bar follows
+    // regardless, which is the one place `pidesk`'s sequence deliberately differs from `wcx`'s.
+    let cwin_ok = dock::Layout::for_panel(wm::MAX_WINDOWS, pw, ph).is_some();
+    let routed_now = fbcon::console_is_routed();
+
+    // THE CENSUS. Printed unconditionally, before any refusal below it, so a capture always carries
+    // every floor's measured value and not merely the first one that said no.
+    serial_println!(
+        "[deskseam] floors panel={}x{}x{} stage={} cover={}% table={} console-window={} route={} click-route={} cascade={} rows={}",
+        pw, ph, info.bytes_per_pixel,
+        staged, cover, live,
+        if cwin_ok { "GRANTED" } else { "WITHHELD" },
+        if routed_now { "ROUTED" } else { "UNROUTED" },
+        if TEGRADESK_CLICK_ROUTED { "LANDED" } else { "UNLANDED" },
+        if TEGRADESK_CASCADE_OK { "CLEARED" } else { "HELD" },
+        wm::MAX_WINDOWS
+    );
+
+    if live != 0 {
+        serial_println!("[deskseam] REFUSE reason=table-not-empty live={} (pidesk's DESKTOP-CLEAR writes the whole panel through the FRONT buffer and its soundness argument is an EMPTY window table — ORIN-WM1's row is already composited on this glass; drop UNAOS_ORINDESK to arm the seam)", live);
+        return false;
+    }
+
+    // THE STOP-LINES — ONE decision and ONE line, not two sequential gates, and the reason is a
+    // MATCH over both terms rather than the first one that said no.
+    //
+    // That shape is not a style choice; the artifact forced it. Written as two sequential
+    // `if !CONST { … return }` blocks, the second one's string is DEAD CODE the moment the first
+    // const is `false` — `LC_ALL=C grep -a -o` on the armed `unaos-kernel` found `rung3-unlanded`
+    // and did NOT find `stop-line-5.2`, so an operator's capture would have named the ordering
+    // obligation and been silent about the STACK HAZARD, which is the more dangerous of the two.
+    // The `match` keeps both in the string the build can actually print.
+    if !(TEGRADESK_CLICK_ROUTED && TEGRADESK_CASCADE_OK) {
+        let held = match (TEGRADESK_CLICK_ROUTED, TEGRADESK_CASCADE_OK) {
+            (false, false) => "rung3-unlanded+stop-line-5.2",
+            (false, true) => "rung3-unlanded",
+            _ => "stop-line-5.2",
+        };
+        serial_println!("[deskseam] REFUSE reason={} console-window={} panel={}x{} stage={} (§6.1: pidesk::activate opens the console window, whose minimise disc's only route back is the dock, and jd2_console_pump's Event::Button arm still only logs the mask — the disc would be a one-way trip until rung 3 lands. §5.2: arming the full cascade is rung 5 and is BLOCKED — the Pi overflowed a 16 KiB kernel stack in it on two consecutive metal boots and no QEMU gate in this tree can stack the preemption frame that does it, so a green test-arm is not evidence here)", held, if cwin_ok { "GRANTED" } else { "WITHHELD" }, pw, ph, staged);
+        return false;
+    }
+
+    // THE ARMED PATH. Type-checked by the `arm-tegra-seam` leg; not reached on any boot this branch
+    // can produce, because both consts above are `false` in source. The verdict is DERIVED from the
+    // call's own return CROSSED with `fbcon::console_is_routed()` read back afterwards — `activate`
+    // already reads the route back rather than inferring it, and this line disagreeing with it would
+    // itself be the finding.
+    let activated = pidesk::activate();
+    let routed_after = fbcon::console_is_routed();
+    let verdict = match (activated, routed_after) {
+        (true, true) => "ROUTED",
+        (false, false) => "UNROUTED",
+        // `activate` returns `fbcon::console_is_routed()`; a disagreement means the route changed
+        // between the two reads, which nothing on this path may do.
+        _ => "INCOHERENT",
+    };
+    serial_println!(
+        "[deskseam] ARMED panel={}x{} stage={} activate={} route={} -> {}",
+        pw, ph, staged, activated, routed_after, verdict
+    );
+    activated && routed_after
 }

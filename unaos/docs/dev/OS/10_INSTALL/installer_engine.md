@@ -216,8 +216,45 @@ Verify discipline is unchanged: every copied file is re-read off the card and SH
 `verify_extents`, and the flow prints a **per-file `sha256=… VERIFIED` manifest** — the installer's
 content-verify IS the bench's content-verify, now native.
 
-**Flow:** GPT → zero-ESP-metadata → FAT32 → **mount USB stick + clone its boot tree file-by-file** → per-file
-sha manifest → `ORIN-INSTALL-2 SD install — gpt+zero+fat32+clone(N files) verify => PASS`.
+**Flow:** UnaFS sizing gate 1 (pre-GPT, whole-card) → GPT → zero-ESP-metadata → FAT32 → **UnaFS sizing gate 2 +
+format partition 2 as a native UnaFS volume + mount it back** → **mount USB stick + clone its boot tree
+file-by-file** → per-file sha manifest → `ORIN-INSTALL-2 SD install — gpt+zero+fat32+clone(N files)+unafs
+verify => PASS — p1 UNAOS-ESP = FAT32 (N files sha-verified) · p2 UNAOS-DATA = UnaFS v5 (131072 blk / 512 MiB,
+mounted back off the card)`.
+
+**The second volume (TEGRA-UNAFS-FMT).** INSTALL-2 originally carved `UNAOS-DATA` and left it raw; it is now
+formatted as a **native UnaFS volume**, through a private `unafs::storage::BlockDevice` adapter over
+`SdInstallTarget`'s already-armed CMD24/CMD25 primitives (`arch/aarch64/sdmmc_tegra.rs`, `install_target`-gated).
+The adapter is never registered as a `drivers::block` backend, so the unconditional
+`drivers::block::write_block_tegra_sd` refusal is untouched and the card's only write door is still the
+`sdmmc` → `sdmmc_arm` → `install_target` ladder.
+
+- **Sizing.** The volume is **capped at 512 MiB (131,072 blocks)** inside whatever span p2 has. Three reasons,
+  all in `sdmmc_tegra.rs`'s section header: the in-RAM refcount map costs 8 B per 4096 B block against a 48 MiB
+  aarch64 heap (a full-span volume on the bench card would want 1.24× the whole heap; at the cap it is 1 MiB =
+  2.0 %); the boot-path probe-mount re-reads every refmap leaf on every `sdmmc` boot through a single-sector
+  adapter, and leaves scale with the volume; and 131,072 stays inside `MAX_BLOCK_COUNT_ONE_LEVEL`, keeping the
+  refcount map single-level. `UnaFS::mount` sizes its map from the **superblock**, not the partition span, so a
+  capped volume inside a larger partition mounts correctly. The cap is a policy constant in one place.
+- **Ordering.** `unafs_sizing_guard` runs once on the whole-card capacity **before the first byte of the GPT**
+  (`SIZING-GATE-1`) and once on the real p2 span (`SIZING-GATE-2`). What that buys is ordering — an over-large
+  geometry is refused while the card is still exactly as it was found, rather than on a half-installed card. It
+  is **not** a proof that the format cannot fail for heap reasons: the comparison is against total `HEAP_SIZE`,
+  never free heap, and `RefMap::try_new` still needs two contiguous runs out of a linked-list allocator. A
+  format-time heap failure fails the install, closed.
+- **Verification is a mount.** The step re-reads the static superblock for a precise diagnostic, then calls
+  `UnaFS::mount` on a fresh handle over the same span — which reads and bound-validates the root record, the
+  imap index and leaves, the refmap index and all 128 refmap leaves, and rebuilds the refcount map from the
+  card — and then `ls(ROOT_INODE_ID)` walks the root directory through that reconstructed state. Checking a
+  superblock and a root record alone would assert far more than two blocks can carry. The mount is read-only by
+  construction (a fresh volume's reclaim queue is empty, so `reclaim_drain` returns without committing) and its
+  1 MiB is the same 1 MiB the format just released. Witness terminator: `=> UNAFS-VERIFIED ::`, deliberately
+  distinct from the per-file `=> VERIFIED ::`.
+- **Floor.** A p2 span under **12 blocks** is an honest SKIP, not a failure — the install continues and still
+  ends `=> PASS`, with the verdict naming `p2 UNAOS-DATA = NO NATIVE VOLUME`. 12 is measured against this build
+  of the crate: 1–2 blocks fail `Superblock::validate` and 3–11 fail the format commit with `NoSpace`. The
+  floor is load-bearing because `install/gpt.rs` really can emit a **1-sector** data partition (a card of
+  exactly 133,154 sectors puts `data_first == data_last == 133,120`), which is 0 whole blocks.
 
 **Witness.** Virt: one honest metal-only line (both arches). x86 `UNAOS_INSTALLDEMO` still covers the engine
 end-to-end (the `TreeWriter` additions do not perturb it — `write_payload_file` is unchanged). First execution

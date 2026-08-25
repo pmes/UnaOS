@@ -6123,6 +6123,178 @@ metal boot-stick default only after a clean multi-boot metal record. The staged 
 declare it the stick default. (The xHCI-takeover wall of §JETSON-XCARVE is image-layout-sensitive; a
 new default layout may sample it — that is expected wall data, not an arc failure. QEMU cannot fire it.)
 
+### ORIN-SMP-3-PARK — the intermittent bring-up park: the ESR decode + the SMPMARK discriminator (`UNAOS_SMPMARK`, instrument-only)
+
+§ORIN-SMP-DEFAULT promoted the 6-core kick-off to the tegra default with one failure still open: on a
+minority of SMP-armed boots the board dies during secondary bring-up, before the run reaches the JM6
+drop. This section records what the park's own syndrome says, and the instrument that names which side
+of the PSCI wake it happens on.
+
+**The rate, corrected.** Measured **2 parks / 3 clean** at the kick-off across the boot5b–5c window
+(2026-08-21/22), and **~30% across the whole record**: 2 parks / 2 boots on 2026-07-15 (the §ORIN-SMP-3
+STOP record), 1 park / 2 clean on the 2026-07-17 R21b sitting, 0 parks / 6 clean in the 2026-07-16
+SMP-8 sitting. A session note put this at "3 of the last 4"; that is too high and is retired here. The
+figure is load-bearing rather than cosmetic — it sets how many flights a one-shot discriminator needs
+before it is worth arming, and at ~30% a single armed boot has a ~70% chance of returning a *clean*
+trace that convicts nothing.
+
+**The unread evidence: the ESR, decoded.** Every park prints the same ATF line, and it has been carried
+verbatim in captures since 2026-07-15 without once being decoded:
+
+```
+ERROR:   Exception reason=1 syndrome=0x82000010
+```
+
+`syndrome=0x82000010` = **EC=0x20** (INSTRUCTION abort from a *lower* EL), **IL=1**, **IFSC=0x10**
+("synchronous external abort, not on a translation-table walk"). The fault is an instruction **FETCH**
+external abort — not a data abort, not a translation fault. That decode is what makes the hypothesis
+below testable at all, because it excludes every data-side theory the arc had been carrying.
+
+**H1 — the MMU-off Device-nGnRnE fetch window.** A PSCI-woken AP resets with `SCTLR_EL2.M = 0` and
+`SCTLR_EL2.I = 0`. Per ARM ARM D5.2.9, with stage-1 translation disabled data accesses are
+Device-nGnRnE, and instruction accesses are Device-nGnRnE while `SCTLR_ELx.I == 0`. So the AP's ~40
+instructions between its PSCI reset and the `msr SCTLR_EL2` inside `enable_mmu_virt` are Device-nGnRnE
+instruction fetches — one fabric transaction each, spread over two pages ~28 KiB apart — plus ~10
+Device loads and 1 Device store: **≈51 I/O-routed transactions per woken core**. That is the only
+Device-typed instruction fetch anywhere in the boot, and the only construct in the boot that matches
+EC=0x20.
+
+**What the layout axis already excluded.** boot5c flights #1 (park) and #2 (clean) shared
+`VBAR_EL2 = 0x25b115800` and `TTBR0 = 0x25b26a000` — same binary, same physical load base, minutes
+apart, opposite outcomes. An image-layout theory cannot explain that pair; a timing/attribute theory
+must. (This is the same discipline §ORIN-SMP-8 applied to the layout axis, and it closes it here.)
+
+**Why marks and not more logging.** The existing per-core `CPU_ON … -> SUCCESS` line is ~95 chars ≈
+8.2 ms of UART at 115200 8N1. Under H1 the AP powers up and faults well *inside* that window, so a
+capture that ends mid-line cannot distinguish "the SMC never returned" from "the SMC returned and the
+AP killed the box while the BSP was still printing". Three short tags, emitted with `serial_print!`
+(no newline, minimal format work, minimal lock hold), collapse that ambiguity:
+
+| mark | emitted where | what its presence proves |
+|---|---|---|
+| `:P:` | `start_secondaries_tegra`, immediately after the publication block (ctx capture + `SEC_CTX` clean + stack `DC CIVAC` sweep) | the BSP survived publication and is about to issue `CPU_ON` |
+| `:R<idx>:` | same function, immediately after `psci_cpu_on` returns for linear index `<idx>` | the `CPU_ON` SMC **returned** to the BSP |
+| `:A:` | `__secondary_rust_virt`, immediately after `enable_mmu_virt` | that AP crossed MMU-off → MMU-on, i.e. survived the Device window |
+
+**Reading a parked capture — what each possible tail proves:**
+
+| capture tail | verdict |
+|---|---|
+| `ORIN-SMP-3 enumerated core 5 …` then RAS | the BSP publication block itself died; no `CPU_ON` was ever issued. Suspect the `DC CIVAC` sweep over `SECONDARY_STACKS` or `capture_secondary_ctx`. **REFUTES H1.** |
+| `:P:` then RAS | publication survived; the very first `CPU_ON` SMC did not return. The fault is inside PSCI/ATF or the SMC path, **on the BSP** — not our AP entry code. **REFUTES H1.** |
+| `:P::R1:` then RAS, with **no** `:A:` | the SMC returned cleanly *and* the AP never reached the far side of `enable_mmu_virt`. The AP died in its MMU-off window. **CONVICTS H1**, and localises the fault to the entry stub + `enable_mmu_virt` — ~40 instructions of known text. |
+| `:P::R1::A:` then RAS | the AP got the MMU on and died *after*. **H1 REFUTED** as the cause; look downstream at `exceptions::install`, `percpu::init`, `gic::init_secondary_v3` (the first non-BSP redistributor touch), or the AP's first cacheable access. |
+
+A clean flight reads `:P::R1::A::R2::A:…`. **Caveat, load-bearing:** the interleaving order of `:R<n>:`
+against an earlier core's `:A:` is a two-cores-one-UART race by construction and carries **no meaning**.
+Only the **presence** of a tag and the **last tag before the park** are evidence — never the order.
+
+**The honest limit of `:A:`.** It runs *before* `exceptions::install()`, so the AP's `VBAR_EL2` is still
+the firmware's. An abort taken between the PSCI reset and that point — including one taken by
+`serial_print!` itself — is reported by ATF/UEFI, not by us. That is exactly the park's own signature,
+and it is why the mark is a presence/absence oracle rather than a handler. It sits at the first
+instruction where a spinlock is legal at all (`ldxr`/`stxr` with the MMU off is CONSTRAINED
+UNPREDICTABLE), i.e. the earliest point an AP can say anything.
+
+**Gating and byte-identity.** Every mark is `#[cfg(feature = "smpmark")]`, armed by `UNAOS_SMPMARK=1`;
+default OFF the marks vanish and the tegra image is byte-identical to baseline. All three are *appended
+to a pre-existing source line* rather than given lines of their own — written the natural way the
+disarmed image differed in 8 bytes, every one a panic `Location` line-number constant belonging to code
+further down `smp_virt.rs` (the same Location-shift defect the `serial.rs` DARKWIN-GUARD tail mod and
+the `sched.rs` VUGFIX one-liner are shaped to avoid). If you edit a mark, keep it on its host line. The
+armed configuration is type-checked by the `arm-tegra-smpmark` leg of `KERNEL_CFG_MATRIX` (16 legs).
+
+**Spec wiring.** `unaos/scripts/specs/jetson-sync1.spec` carries the three marks as `OPTIONAL` — a
+`REQUIRE` would red every *unarmed* boot, failing on configuration rather than on health — plus a
+`FORBID` on the `Exception reason=1 syndrome=0x82000010` signature so a parked flight is named rather
+than inferred from a pile of missing `REQUIRE`s. `:P:` is anchored `^:P:` there because a bare `:P:`
+takes a false hit on a pre-existing `KERNEL HEAP ALLOCATED :P: released cores …` line.
+
+### ORIN-RAS-ADDR — reading a Tegra RAS `ADDR` field: it is sometimes a location and sometimes a sink
+
+A rule this file has so far only half-recorded, written down because reading it wrong cost this lane a
+wrong claim to a peer seat.
+
+**The field has two meanings and the format does not tell you which.** Both readings are already
+documented here, separately:
+
+* **As a SINK.** §ORIN-NET-4 / NET-4m records `ADDR 0x8000000000000200` as the CBB/IOB fabric sink for a
+  transaction that matched **no region** — the real address is *stripped* and what remains (`0x200`) is
+  the slave-error terminal, not a place in DRAM. The same value appears in the ORIN-SMP-3 park, in the
+  SMP-4 legs, and in SMP-7.
+* **As a LOCATION.** `mmu_tegra.rs:136` (§XCARVE-10) records boot-34-retry hitting SNOC Carveout
+  Uncorrectable + ACI FillWrite at `ADDR 0x800000026c6be4a0` → PA `0x26c6be4a0` — a **real** address,
+  and the whole XCARVE-9→10→11 widening chain was driven by taking it as one.
+
+**The reading rule.** Strip bit 63 (set in both cases — it is a fabric tag, not part of the address) and
+look at what remains. A residue that lands inside a known DRAM span is a **location** and may be acted
+on; a small constant residue (`0x200`, `0x0`, `0xb5c`) is a **sink** and names only *that the transaction
+matched nothing* — it is evidence about routing, never about a place. The trap is that a low round
+residue is exactly where the two readings are indistinguishable by inspection: `0x…0200` is both a
+plausible stripped sink and a syntactically valid low address, and nothing in the record disambiguates
+it. **When the residue is small and round, the ADDR is not a lead** — resolve it from the accompanying
+`IERR`/`SERR` pair and the boot's own position instead, and say which reading you took.
+
+**Corollary, learned the hard way: never key a witness or a spec rule on an ADDR value.** Two different
+faults on this board share `0x8000000000000200`, and two different faults share the *shape*
+`0x8000000000000000`. The ORIN-SMP-3 park is `Status = 0xe4000612` / `SERR` slave-error `0x12` / `IERR`
+CBB Interface Error `0x6`, and carries an `Exception reason=1 syndrome=0x82000010` line; the `bg`-verb
+fault is `Status = 0xec000612` / `IERR` SNOC Write Error `0xd` / `ADDR 0x8000000000000000` and carries
+**no** `Exception reason=` line at all. Key on the syndrome and the `IERR`/`SERR` pair, and **write the
+boot id beside every quoted RAS line** — a quoted syndrome with no boot id is what produced the
+cross-seat disagreement this rule exists to prevent.
+
+### IRQEL-RT2 — the EL1 one-shot proof is CORE-scoped: an AP answered, the routing was never wrong
+
+**The report.** Metal boot 5c printed, honestly,
+`:: IRQEL-RT: one-shot proof IRQ taken at EL2 — NOT the EL1 proof (investigate) ::`
+(`capture/line-acm0/orin.log:8311`). Every routing mechanism was then audited and found **correct**:
+`HCR_EL2` cleared at the JM6 drop (IMO/FMO/AMO/TGE all 0), `CNTHCTL_EL2` EL1PCTEN/EL1PCEN set, `CNTP_*`
+rather than `CNTHP_*`/`CNTV_*`, GIC PPI 30 banked per core, DAIF masked across the drop,
+`SPSR_EL2`/`ELR_EL2` landing witnessed at EL1.
+
+**The defect was SCOPE, not routing.** `EL1_PROOF_ARMED` was a machine-global `AtomicBool` on a machine
+that had stopped being single-core. §ORIN-SMP-3 runs **before** the JM6 drop and brings five secondaries
+online that (a) stay at EL2 — `smp_virt::secondary_entry` calls `exceptions::install()` there, which
+sets `HCR_EL2.IMO|FMO|AMO` so their physical IRQs target EL2 — and (b) each arm their own 250 Hz PPI 30
+via `arm_this_core_ap`. That is ~1250 timer IRQs/s entering the same dispatch from cores that never
+dropped. The boot core set the flag; the first AP tick consumed it, read `CurrentEL` **on that AP**, and
+printed EL2. The boot core's one-shot is a full 4 ms out while each AP's next tick is uniform in
+[0, 4 ms), so an AP wins with probability ~1 — **deterministic, not flaky**. The instrument was right;
+its window's scope was wrong.
+
+**The fix.** `EL1_PROOF_CORE: AtomicU32` (`u32::MAX` = disarmed) holds the *arming core's* `cpu_index`;
+the intercept returns early for any other core, so every other core's tick falls through to `on_tick`
+unchanged. The `CurrentEL` test is byte-for-byte unchanged and the guard is strictly upstream of the
+verdict, so **the proof can still fail**: if the arming core's own IRQ lands at EL2 the failure verdict
+still prints. The change converts a spurious FAIL into either a real FAIL or an INCONCLUSIVE — never
+into a PASS.
+
+**Collateral fixed with it.** The old intercept's `msr CNTP_CTL_EL0, xzr` ran on whichever core answered
+— i.e. on an **AP** — permanently killing that secondary's only wake source while `AP_LOCAL_TICK` still
+told `hlt` it had one: a wake-less WFI park on one of five cores, every boot.
+
+**Why the drop stub now latches four EL2 registers.** The adjudicating `[irqel2a]` snapshot must print
+`HCR_EL2` / `CNTHCTL_EL2` / `ICC_SRE_EL1` / `ICC_SRE_EL2` — `HCR_EL2.IMO` being *the* bit that decides
+whether an IRQ taken at EL1 targets EL1 — but an `mrs` of an EL2 register from EL1 is **UNDEFINED** and
+would fault into the very vectors under test. So `boot_tegra::jm6_el2_latch` captures them into RAM at
+the last instant they are readable, inside the JM6 drop asm, and the snapshot reads them back from
+there. `[irqel2b]` (the GIC view) is printed *second* on purpose: it is the only part performing an
+`ICC_*_EL1` access at EL1, which is UNDEFINED unless `ICC_SRE_EL1.SRE == 1` — a bit `[irqel2a]` has
+already put on the wire, and when the latch says `SRE == 0` the snapshot is **skipped and says so**
+rather than taken.
+
+**Status: the EL1 arm remains unproven on metal.** No capture in the record carries `first IRQ taken at
+EL1`, and none carries `proof INCONCLUSIVE` or `[irqel2a]` either — the FAIL branch is the only one
+metal has ever printed, and IRQEL-RT2 is the reason to expect that to change. The spec models the
+outcome as a genuine three-way rather than a required PASS: the PASS line is `PENDING`, and the FAIL and
+MISS lines are `OPTIONAL` — never `FORBID`, because an honest negative result must not red a flight, and
+never `PENDING`, because a matched `PENDING` advises "consider promoting to REQUIRE", which is exactly
+wrong for a fault path. The proof's ability to fail without being suppressed is its most valuable
+property. Only the *arm* line is `REQUIRE`, and only because it is unconditional on a tegra image and
+sits on the same `main.rs` statement strictly ahead of `run_capstone_boot_core(0)`, whose
+`CAPSTONE COMPLETE` is already required.
+
 ### ORIN-SDMMC — Tegra234 microSD-slot SDMMC controller READ-ONLY recon (`UNAOS_SDMMC`, knob-gated; the installer line's first rung)
 
 **Context — the installer line.** The Orin devkit is the "mule" for a UnaOS-native installer: it has the
@@ -6364,9 +6536,53 @@ that to multi-cluster directories. Same verify discipline downstream: every file
 SHA-checked through the engine's own `verify_extents`.
 
 **The flow** (each step a serial line; any engine/read error is a single named `FAIL`):
-GPT (parse-back verified) → zero the ESP metadata region → FAT32 format → **mount the USB stick + clone its
-boot tree file-by-file** → **per-file `sha256=… VERIFIED`** manifest (the real manifest replacing INSTALL-1's
-single `UNAOS.IMG`) → `ORIN-INSTALL-2 SD install — gpt+zero+fat32+clone(N files) verify => PASS`.
+UnaFS `SIZING-GATE-1` (pre-GPT, whole-card upper bound) → GPT (parse-back verified) → zero the ESP metadata
+region → FAT32 format → **UnaFS `SIZING-GATE-2` + format partition 2 as a native UnaFS volume + mount it back**
+→ **mount the USB stick + clone its boot tree file-by-file** → **per-file `sha256=… VERIFIED`** manifest (the
+real manifest replacing INSTALL-1's single `UNAOS.IMG`) → `ORIN-INSTALL-2 SD install —
+gpt+zero+fat32+clone(N files)+unafs verify => PASS — p1 UNAOS-ESP = FAT32 (N files sha-verified) ·
+p2 UNAOS-DATA = UnaFS v5 (131072 blk / 512 MiB, mounted back off the card)`.
+
+**TEGRA-UNAFS-FMT — the second volume is no longer raw.** INSTALL-2 carved `UNAOS-DATA` and never populated
+it. Partition 2 is now formatted as a **native UnaFS volume** through a private `unafs::storage::BlockDevice`
+adapter (`SdUnafsDevice`) over `SdInstallTarget`'s already-armed CMD24/CMD25 primitives — never registered as a
+`drivers::block` backend, so `drivers::block::write_block_tegra_sd`'s unconditional refusal is untouched and the
+card's only write door is still the `sdmmc` → `sdmmc_arm` → `install_target` ladder. All of it is
+`install_target`-gated, so the byte-identity claim above is unchanged.
+
+- **Cap: 512 MiB = 131,072 blocks**, applied at the adapter's `block_count`, not by carving a third GPT entry
+  (`install/gpt.rs` is a shared file). The partition keeps its full span; the volume inside it is smaller, and
+  `UnaFS::mount` sizes its refcount map from the **superblock**, so a capped volume inside a larger partition
+  mounts correctly. Three reasons for that number: the map costs 8 B per 4096 B block against a 48 MiB aarch64
+  heap (full-span on the bench card = 1.24× the whole heap; at the cap = 1 MiB = 2.0 %); the ORIN-UNAFS-ROOT
+  rung-4 probe-mount is gated on `sdmmc`, **not** `install_target`, so it re-reads every refmap leaf on every
+  sdmmc boot through `BlockAdapter` — 8 single-sector CMD17s per 4096 B block — which is ~1,000 polled reads at
+  512 MiB versus ~8,200 at 4 GiB; and 131,072 ≤ `MAX_BLOCK_COUNT_ONE_LEVEL` (524,288), so the map stays
+  **single-level** rather than putting the v5 two-level index-of-indexes on metal for the first time on the boot
+  path. A `const` assertion in `sdmmc_tegra.rs` holds the single-level property structurally.
+- **The sizing gates are an ORDERING guarantee, not a proof.** `SIZING-GATE-1` runs on the whole-card capacity
+  before the first byte of the GPT, so an over-large geometry is refused while the card is still exactly as it
+  was found; `SIZING-GATE-2` runs on the real p2 span and returns the volume's `block_count`. Neither proves
+  the format cannot fail for heap reasons: the comparison is against total `allocator::HEAP_SIZE`, never free
+  heap, and `RefMap::try_new` needs two contiguous multi-MiB runs out of a `linked_list_allocator::Heap`. A
+  format-time heap failure fails the install, closed, on its own named line. At the current cap the refusal
+  branch is unreachable by arithmetic (1,048,576 B against a 12,582,900 B limit) and is kept as the
+  future-proofing bound that makes raising either the cap or the heap size fail loudly.
+- **The proof is a mount.** After the format, the step re-reads the static superblock for a precise diagnostic
+  and then calls `UnaFS::mount` on a fresh handle over the same span: that reads and bound-validates the root
+  record, the imap index and leaves, the refmap index and all 128 refmap leaves, and rebuilds the refcount map
+  from what is on the card; `ls(ROOT_INODE_ID)` then walks the root directory through that reconstructed state.
+  Re-reading the superblock and root record alone touches 2 of the ~139 blocks the format wrote and cannot
+  carry the claim. The mount is read-only by construction — a fresh volume's reclaim queue is empty, so
+  `reclaim_drain` returns without committing — and costs the same 1 MiB the format released one statement
+  earlier. Terminator `=> UNAFS-VERIFIED ::`, distinct from the per-file `=> VERIFIED ::`.
+- **Floor: 12 blocks.** A p2 span below it is an honest SKIP (the install continues and still ends `=> PASS`,
+  with `p2 UNAOS-DATA = NO NATIVE VOLUME` in the verdict), not a failure. 12 is measured against this build:
+  1–2 blocks fail `Superblock::validate` ("volume too small"), 3–11 fail the format commit with `NoSpace`. It
+  matters because `install/gpt.rs` can emit a **1-sector** data partition — a card of exactly 133,154 sectors
+  gives `last_usable = 133,120`, a full 64 MiB ESP at 2048..133,119, and a 1 MiB-aligned data start of 133,120,
+  i.e. `data_first == data_last` — which is 0 whole blocks, and would otherwise reach
+  `Superblock::new(0).validate()` and fail an install that previously succeeded.
 
 **Byte-identity.** Every INSTALL-2 line — including the `Card` `Clone`/`Copy` derive and the stash — is
 `install_target`-gated (`fat32.rs`'s additions live in the `install` module, itself compiled only under
@@ -9179,3 +9395,411 @@ behavioural proof is a **bench item** — a `UNAOS_PIUSB=1` metal boot with noth
 should print the `EMPTY-PORTS exit at 8s` line and reach the shell ~22 s earlier than before.
 
 M1 is on the default path and is proven in QEMU by the gate below.
+
+## ORIN-WM1 — the Orin's first real `wm` window on the inherited scanout (`UNAOS_ORINDESK`)
+
+The first rung of the Orin desktop ladder: **one** compositor window, minted and composited onto the
+JD1 inherited scanout. Default OFF, one cargo feature (`orindesk`), one knob (`UNAOS_ORINDESK=1`).
+
+### Why it is a small change
+
+`video/mod.rs` declares `pub mod wm;` **unconditionally**, so the ~20k-line window manager and
+compositor has been compiling into the jetson image since the module existed, and `tegra_early_stop`
+already calls `wm::retile_on_ready()` at the JD1/JD2 seam — `wm` is linked *and reached* on this board
+today. Its table is simply empty. Everything this rung calls (`reserve_stage`, `spawn_geometry`,
+`create_at`, `present_outcome`, `composite`) is an ungated `pub fn`; **no file under `video/` is
+touched**, and the `pidesk`-gated arms inside `wm` (dock, strip, crystal, the panel-wide `DESKTOP_BG`
+clear) stay off, because `orindesk` is a different feature. No furniture is armed.
+
+### The one real gap it closed
+
+`wm::reserve_stage` — which sizes the compositor's staging buffer — has exactly one caller in the
+tree: `video::init_panel`. **The Orin never calls it.** This board seeds `video::WRITER` directly, in
+`tegra_early_stop`'s JD1 block, so the staging buffer was never allocated here and every composite
+would have fallen back to lazy growth (`try_reserve` inside a present's IRQ mask — the WEDGE-12 shape
+that site exists to prevent).
+
+`reserve_stage` grows a `Vec`, so it must run **after the heap**. On the tegra path that is *not*
+`kernel_main`'s `memory::init`: `tegra_early_stop` is `-> !` and diverges before `kernel_main` ever
+reaches that line. The call therefore rides `tegra_early_stop`'s **own** step 3c heap line,
+`:: KERNEL HEAP ALLOCATED ::`, which is the first instruction on this board where all four of
+`reserve_stage`'s preconditions hold at once:
+
+| precondition | satisfied by | position |
+| --- | --- | --- |
+| panel geometry known | the JD1 `WRITER` seed | ~170 lines above |
+| heap live | `memory::init` (step 3c) | 2 lines above |
+| IRQs live | JM4 `exceptions::enable_irq` | ~15 lines above |
+| no composite pass in flight | boot core alone, scheduler not started | — |
+
+`live_core_count()` is 1 on tegra (the build carries `tegra`, not `baremetal`), so entry 0 alone is
+sized; `stage_worst_case` caps at `MAX_STAGE_BYTES` = 4 MiB against the 48 MiB aarch64 heap.
+
+### Why not `jd2_console_pump`
+
+It is the other live tegra seam, and it is the wrong one for this rung. `jd2_console_pump` is a
+`sched::spawn`ed task on a `TASK_STACK_SIZE` stack, and `composite_inner`'s aarch64 stack cost is
+already on the ledger (occ62 records stack exhaustion as the reason that function was reshaped) — the
+Pi has twice overflowed a 16 KiB kernel stack in the desktop-arming cascade, a failure that does **not**
+reproduce on the QEMU gate. `tegra_early_stop` runs on the boot stack. The rung that hands the panel
+to a desktop has to answer the stack question; this one declines to ask it.
+
+### What lands on glass
+
+`wm` paints no panel-wide backdrop on this build (the whole-panel `DESKTOP_BG` clear is `pidesk`-gated
+on aarch64 — `wcf.rs` reports it as `NOCLEAR`), so the composite writes the window's box and nothing
+else: the JD1 boot log keeps the rest of the panel. The staged blit `flush_rect`s what it wrote, which
+is what makes the pixels visible to a DCE that scans the carveout from DRAM and does not snoop.
+
+The surface is a heap-backed `Bgr`/4-byte `FrameBuffer` — a statement about `wm`, not about the panel:
+`wm::draw_window` reads each source pixel as the little-endian word `0x00RRGGBB`, and the compositor
+converts into whatever the panel actually is when it blits. Content is four quadrants (red / green /
+blue field / yellow) with a magenta centre block and a white 4 px frame, in the `0x00RRGGBB`
+convention `jd1_test_pattern` uses, so a swapped red/blue would name a conversion defect rather than
+hide one.
+
+### Witness
+
+One line, on the wire, from `orin_wm1`:
+
+```
+[orinwm1] win=1 panel=1920x1200 surf=640x400 box=650x444 at (635,378) scale=1 stage=4194304 present=Composited -> COMPOSITED
+```
+
+The trailing verdict is DERIVED from `present_outcome`, not asserted: a present that came back
+`Suppressed` or `NoRow` prints `-> PRESENT-DECLINED` instead, so the line a bench capture is counted
+from cannot claim a composite that did not happen.
+
+Every decline is named on the same `[orinwm1]` tag and none is fatal to the boot —
+`reason=no-panel` (headless: no JD1 scanout), `reason=alloc`, `reason=geometry-unavailable`,
+`reason=create-failed`, `reason=extent-overflow`, `reason=empty-extent`.
+
+### Gating and verification status
+
+`orindesk` is standalone (it does **not** imply `tegra`, mirroring `smpmark`), but every one of its
+sites is inside a `tegra`-gated module (`arch/aarch64/display_tegra.rs`) or a `tegra`-gated block
+(`tegra_early_stop`), so `UNAOS_ORINDESK=1` alone compiles nothing. Arm it as
+`UNAOS_TEGRA=1 UNAOS_ORINDESK=1 ./arroyo check`, or `UNAOS_ORINDESK=1 ./arroyo esp-jetson` (which
+forces `tegra`).
+
+The ARMED polarity is type-checked by the **`arm-tegra-orindesk`** leg of `KERNEL_CFG_MATRIX` —
+`arm-tegra`'s list verbatim plus `orindesk`, added because no leg anywhere carried `tegra` together
+with the desktop family, i.e. the armed configuration was compiled by nothing (the
+`tegra_el0` / `simmer_test` / `xusbfw` / `smpmark` shape). Board legs 8 → 9, mix legs unchanged at 8,
+total cfg legs **16 → 17**.
+
+QEMU models no Tegra234, so the behavioural verdict is **metal-owed**: an attended Orin boot with a
+DisplayPort monitor should show one bordered window with a title bar, centred on the panel, over a
+still-readable boot log, and the `[orinwm1] ... -> COMPOSITED` line in the serial capture.
+
+Default OFF is **measured, not argued**: both source edits are appends (a statement appended to an
+existing `main.rs` line, a function appended to the end of `display_tegra.rs`), so no line moves in any
+file compiled knob-off and no panic `Location` shifts. `esp-jetson` built either side of the change
+yields a byte-identical `kernel.elf`.
+
+## JD1-DC — can the CCPLEX see nvdisplay? (`UNAOS_JD1DC`, default OFF, read-only)
+
+**The question.** Every rung of the Orin display stack above JD1 assumes an answer to one thing
+nobody has measured: *can this core see the Tegra234 nvdisplay registers at all, and do they still
+hold what the firmware programmed?* JD1 itself does not answer it — it inherits a scanout **address**
+from the DTB (`simple-framebuffer`) and paints into that DRAM, so a lit panel proves only that
+something is still scanning that memory out. `display_tegra.rs::jd1_dc_survey` was written to answer
+it and **has never run**: it sits inside `jd1_survey`, ~70 lines before the BPMP channel exists, and
+it must not run without a power-state guard. JD1-DC is that survey given the guard, the ordering and
+the verdicts it needs to be fired once and read once.
+
+**What is known going in (2026-08-22, primary sources).** The Tegra234 display controller **is**
+directly programmable from the CCPLEX by plain MMIO, and NVIDIA's own UEFI proves it on this board:
+`edk2-nvidia`'s `Silicon/NVIDIA/Drivers/NvDisplayControllerDxe/NvDisplayHw.c` does raw
+`MmioRead32`/`MmioWrite32` against this aperture — `DISPLAY_FE_SW_SYS_CAP` (+0x0003_0000) to
+enumerate heads and SORs, then `DISPLAY_FE_CMGR_CLK_RG`/`_SOR` to program clocks — and the string
+`dce` appears **nowhere** in that tree. UEFI sets the mode on this board's DisplayPort, draws its
+splash and runs its menu without ever speaking to the DCE. The DCE-RPC path is NVIDIA's *Linux
+runtime* driver architecture, one of two that exist; it is not a hardware gate, and the "display is
+behind a hypervisor" reports trace to DRIVE OS automotive virtualization, not to Jetson. Since UEFI
+reaches this aperture from the CCPLEX here, MB1/MB2's Security Configuration Registers already grant
+CCPLEX access by default. The block is the standard NVIDIA `NV_PDISP` rebased to offset 0 of the
+`0x1380_0000` aperture (RM's `kdispGetBaseOffset_v04_02()` returns `0x0 - DRF_BASE(NV_PDISP)`), so the
+register semantics are the familiar NVIDIA display ones.
+
+**That inverts the reading of one outcome, and the wire says so.** "All-ones / all-zero / garbage"
+used to be the expected answer. It is now the *surprising* one: on a board where UEFI demonstrably
+drives these registers from this core, a garbage read is a finding about **our** access path — our
+aperture/mapping, the domain or clock state at our probe point, or an SCR narrower for us than for
+UEFI — and **not** a finding about Tegra234. The `VERDICT=NOT-DECODING` line carries that sentence,
+because the next reader of the capture would otherwise conclude "the DCE holds it", which is now
+known to be false.
+
+**The guard is the whole safety story.** A read of a power-gated Tegra block is EL3-FATAL — the JX1
+event took an SError with `ESR 0xbe000011` (EC=0x2F) and NVIDIA's BL31 printed "Unhandled Exception in
+EL3"; the boot ends inside the read and nothing further reaches the wire. So before the **first**
+nvdisplay read the probe asks the only authority that knows — BPMP, over the HSP+IVC channel JB1b
+proved — via `MRQ_PG CMD_PG_GET_STATE` for the power-domain ids read off the DTB's own `display@`
+node, and reads nothing at all unless every one answers `err=0 state=0x1`. There is no CPU-side
+register that could answer instead: on Tegra234 the DISP power domain, its ~60 clocks, its resets and
+its ISO bandwidth are BPMP's alone. The guard is not belt-and-braces; it is the only way to earn the
+first read. **It never powers anything** — `MRQ_PG SET_STATE` is deliberately not reachable from this
+feature (`bpmp_tegra` exposes only the getter), because powering or cycling DISP would tear down the
+inherited scanout the whole JD1 inheritance rests on and is unrecoverable for that boot. Domain not
+ON is a **refusal**, printed and named.
+
+**Not one register is written.** Every nvdisplay access is `core::ptr::read_volatile`; there is no
+`write_volatile` in the rung and there must not be — the DCE R5 is live on the other side of that
+aperture running 11.8 MiB of authenticated firmware, and a write is a two-writer race against it
+(`JD1_DC_PROBE`'s own inherit-don't-reinit rule, one rung out). The census line carries `writes=0` so
+the capture certifies it.
+
+**Where it runs, and why that point and no other.** `main.rs::tegra_early_stop`, as the **last
+statement of the BPMP block** (appended to the closing line of the `match jb5_ids` that follows
+`jb1c_ungate_xusb`). That instruction is the only one in the boot where both ordering constraints
+hold:
+
+* **BPMP-first** — the `chan` it borrows is established ~60 lines earlier by `jb1b_ping`; without it
+  the guard cannot be asked at all. This is exactly why the probe could not stay at its old site
+  inside `jd1_survey`, which runs ~70 lines *before* the channel exists.
+* **JD1-first** — the scanout resolution, `map_fb_region`, `fbcon::init` and the `video::WRITER` seed
+  are all ~90 lines earlier, so panel, serial and shell are already alive on a framebuffer resolved by
+  a pure DTB RAM walk. That ordering is what makes the fail-back **structural** rather than hopeful: a
+  probe that goes wrong costs the experiment, not the boot.
+* Being *last* in the BPMP block is the third, weaker reason: every other diagnostic that block
+  produces has already reached the wire before the one read that could end the boot.
+
+**What lands on the wire — one boot, five distinguishable outcomes.** Exactly one `JD1-DC VERDICT=`
+line is printed on every path:
+
+| outcome | witness |
+| --- | --- |
+| reachable, and we see what UEFI programmed | `JD1-DC VERDICT=REACHABLE — … head+N winM holds START_ADDR 0x279e00000, the very base JD1 inherited` |
+| reachable, but no window matched | `JD1-DC VERDICT=DECODES-NOMATCH — … reachability is ESTABLISHED; the scanout is fed from a window this sweep's head model did not cover` |
+| all-ones / all-zero / garbage | `JD1-DC VERDICT=NOT-DECODING — … NOT 'the DCE holds the block'. It is a finding about OUR access path` |
+| the guard said no — nothing was read | `JD1-DC VERDICT=REFUSED reason=<no-aperture\|no-ids\|no-power-domains\|domain-not-on\|pg-timeout>` |
+| EL3-fatal SError inside the read | **no verdict line at all** — the capture ends on `JD1-DC — FIRST TOUCH of a new MMIO class: about to read … @0x…`, which says in as many words that its own silence is the result |
+
+The fifth outcome is why every new MMIO class is announced before it is touched (this platform's own
+rule, and why JX1 was diagnosable at all). The first touch is `DISPLAY_FE_SW_SYS_CAP` — UEFI's own
+first read on this aperture, hence the best-evidenced safe one available to us and the single most
+decisive value on the flight — followed immediately by `JD1-DC — FIRST READ SURVIVED: …`, the one
+line that settles the central question. It is also a cross-check on the survey's head model: the
+four-heads-at-`0x10000`-stride layout would put head 3 at that very offset, and both cannot be right.
+
+Between them, a `JD1-DC RAW head+… win…:` line per window — **every window, empty ones included**
+(the legacy survey skips all-zero windows, and "every window read zero" must not look like "the sweep
+never ran"), carrying every field the sweep touches raw plus its T194-layout derivation, so a later
+save/restore rung can be reconstructed from these lines alone — and a `JD1-DC CENSUS —
+heads=… windows=… all-ones=… all-zero=… WIN_ENABLE=… START==JD1-scanout=… | reads=… writes=0` line.
+
+**The generalised DTB id reader.** The guard needs `display@13800000`'s `power-domains`, and
+`fdt_tegra::xusb_ids` was already the right walk with one thing hardcoded — the node-name literal. It
+is parameterised as `fdt_tegra::node_ids(dtb, size, mask, node_name)` at that file's tail, and
+`xusb_ids` routes **through** it on an armed build via a `#[cfg]`-erased statement appended to its
+opening line. Two properties are deliberate: the match is the same substring predicate
+`nvdisplay_base` uses, so `b"display@"` resolves the *same* node the aperture came from (the domain
+proven ON owns the aperture read — true by construction, not by assumption); and the delegation is
+**fall-through, not replacement**, so a `None` still runs the original body and a bug in the generic
+reader can cost an armed flight one extra STOP line, never its keyboard. `node_ids` differs from
+`xusb_ids` in exactly one behaviour: it also accepts a node whose only BPMP resource is
+`power-domains` (for XUSB the two conditions cannot disagree — that node carries nine clocks, JB5
+metal-proven).
+
+**Files.** `arch/aarch64/display_tegra.rs` (the probe, the `JD1DC_SCANOUT` latch),
+`arch/aarch64/fdt_tegra.rs` (`node_ids`/`node_ids_stop` + the `xusb_ids` delegation),
+`arch/aarch64/bpmp_tegra.rs` (`pg_get_state`), `main.rs` (the one appended call), plus the `jd1dc`
+feature in `crates/kernel/Cargo.toml` and the `UNAOS_JD1DC` mapping + `arm-tegra-jd1dc` matrix leg in
+`arroyo`. This arc's delta is exactly **+1 board leg, +0 mix legs** (board 9 → 10, mix unchanged at 8),
+so the first gate run reported **17 → 18 legs**. A peer track landed `arm-tegra-desk` minutes later and
+the final gate run reports **19** (11 board + 8 mix), `arm-tegra-jd1dc` green in both polarities. Tail
+legs are appended concurrently by three tracks: read the live count off `./arroyo check` rather than
+trusting an absolute in prose.
+
+**Default OFF is measured, not argued.** All three edits to already-compiled code are statements
+**appended to existing lines** (a `#[cfg]`-erased `if let` inside `xusb_ids`, a `#[cfg]`-erased store
+after the `if !sane` block in `jd1_survey`, and a `#[cfg]`-erased call in `tegra_early_stop`), so no
+line moves in any file compiled knob-off and no panic `core::panic::Location` shifts — the line-shift
+class that silently breaks byte-identity. Measured on the aarch64 kernel built with the jetson feature
+set (`ehcihid,tegra,tegrasmp`) either side of the change, in a frozen worktree with a private
+`CARGO_TARGET_DIR` (the build is bit-reproducible: same source → same sha, verified twice):
+
+* **objcopy'd loadable image: byte-identical** — `1fec51d822ed23244fc67b316357d108a4c52267586989e89f2fdb992231d775` both sides.
+* `.text`, `.rodata`, `.data`, `.bss`: all four allocated sections hash identically.
+* the ELF *container* differs by 48 bytes (`8eedcd75…` → `6ad77163…`), entirely in the **non-allocated
+  `.strtab`**: LLVM's internal-symbol `.llvm.<module-hash>` suffixes have different digit counts once
+  any library source file changes. Nothing loadable moves; the machine executes identical bytes.
+
+QEMU models no Tegra234, so the verdict is **metal-owed** and the probe is **not armed on the
+currently-planned flight** — that image already carries other questions. Arm it, alone and attended,
+with `UNAOS_TEGRA=1 UNAOS_JD1DC=1` (or `UNAOS_JD1DC=1 ./arroyo esp-jetson`, which forces `tegra`).
+
+### JD1-DC-MODEL — which register model does this silicon present? (same knob, same guard)
+
+**Why this exists.** The five outcomes above have a hole in them, and it is in the instrument, not in
+the silicon. `VERDICT=DECODES-NOMATCH` can be printed for two reasons that point in opposite
+directions, and until this rung the wire could not tell them apart:
+
+1. the aperture is live and the scanout is fed from a window the sweep did not cover — *sweep wider*; or
+2. the aperture is live, our reads are perfectly legal, and **the register map we read it through is
+   Tegra194's while this silicon is Tegra234** — *throw the map away*.
+
+The reason to take (2) seriously is documented, not speculative. Upstream Linux `drm/tegra` — the
+source `jd1_dc_survey`'s window offsets are derived from — has **no Tegra234 support at all**: its
+`of_match` tables end at `nvidia,tegra194-dc` / `-display` / `-sor`, and `tegra234.dtsi` carries no
+`display@13800000` node. NVIDIA's own T234 display driver uses a different model entirely, NVDisplay
+class channels (`NVC67D`). Flying a probe whose headline verdict is ambiguous between (1) and (2)
+spends an attended bench session on an answer nobody can read.
+
+**What it adds: four more read-only reads and one verdict line on an ORTHOGONAL axis.** `VERDICT=`
+answers *does the aperture decode, and did a window hold the scanout base*. `MODEL-VERDICT=` answers
+*and through which register map were we reading*. The two are read together:
+
+| `VERDICT=` | `MODEL-VERDICT=` | reading |
+| --- | --- | --- |
+| `DECODES-NOMATCH` | `NVDISPLAY-CLASS-C670` | the sweep's offsets are wrong, the aperture is not. Replace the window map; do not sweep wider |
+| `DECODES-NOMATCH` | `DECODES-NOT-NVDISPLAY` | the opposite — keep the offsets, widen the sweep |
+| `REACHABLE` | anything | the T194 offsets are vindicated empirically whatever the class word says, and the disagreement is itself a finding |
+
+The hypothesis under test is that the Tegra234 nvdisplay aperture is the standard NVIDIA `NV_PDISP`
+block **rebased to offset 0**, so Tegra byte offset *X* ≡ `NV_PDISP`-relative address *X* ≡
+open-gpu-doc "withoffset" address `0x610000 + X`. **No NVIDIA source states that rebasing**; testing
+it is the whole point of the rung, which is why a negative gets its own named verdict instead of
+being folded into "garbage".
+
+| offset | register | withoffset | what it settles |
+| --- | --- | --- | --- |
+| `+0x00000` | `NV_PDISP_FE_CLASSES` | `0x00610000` | `CLASS_ID` 31:16, `CLASS_REV` 15:8, `API_REV` 7:4, `HW_REV` 3:0 — **the discriminator** |
+| `+0x00060` | `NV_PDISP_FE_HW_SYS_CAP` | `0x00610060` | `HEAD0..7_EXISTS` 0:7, `SOR0..7_EXISTS` 8:15 |
+| `+0x00064` | `NV_PDISP_FE_HW_SYS_CAPB` | `0x00610064` | `WINDOW0..31_EXISTS` 0:31 — how many windows the sweep's six-per-head model should have found |
+| `+0x004E0` | `NV_PDISP_FE_CHNCTL_CORE` | `0x006104E0` | `ALLOCATION` 0:0, `CONNECTION` 1:1, `PUTPTR_WRITE` 4:4, **`EFI` 5:5**, `SKIP_NOTIF` 9:9, `IGNORE_INTERLOCK` 11:11, `ERRCHECK_WHEN_DISCONNECTED` 12:12, `TRASH_MODE` 14:13, `INTR_DURING_SHTDWN` 15:15 — what UEFI left on the core channel |
+
+All four are quoted from **NVIDIA/open-gpu-doc (MIT)**,
+`manuals/{volta/gv100,turing/tu102,ampere/ga102}/dev_display_withoffset.ref.txt`, and the definitions
+are **identical in all three architectures** — which is why one wrong-generation guess cannot explain
+a match. `CHNCTL_CORE`'s address is independently confirmed in NVIDIA/open-gpu-kernel-modules
+`src/common/inc/swref/published/disp/v03_00/dev_disp.h`.
+
+**Two corrections to the plan this rung was written from, both of which changed what gets read.**
+
+* **`+0x30000` is weaker evidence than it looked, and `+0x60`/`+0x64` are the registers that carry
+  the claim.** The probe's existing FIRST TOUCH is at `+0x30000`, which edk2-nvidia's `NvDisplayHw.c`
+  calls `DISPLAY_FE_SW_SYS_CAP`. That name appears **nowhere** in open-gpu-doc's three display
+  manuals or in open-gpu-kernel-modules' `swref/published/disp/*`. What *is* documented there is the
+  **aperture**: `NV_PDISP_FE_SW 0x00640FFF:0x00640000` (`disp/v03_00/dev_disp.h`) — i.e.
+  `NV_PDISP`-relative `0x30000`, a 4 KiB software-written mirror region. So the existing first read
+  is a read of a real named aperture at a *register identity* resting on edk2 plus an inference from
+  nouveau's `gv100_disp_init()`, which masks `0x100 << i` at `0x640000` and `1 << i` at `0x640004` —
+  the `HW_SYS_CAP` / `CAPB` bit layouts exactly. The hardware registers at `+0x60`/`+0x64` are
+  primary-sourced, so they are read too and the two are **cross-checked against each other on the
+  wire** (`JD1-DC-MODEL — CAP CROSS-CHECK`). Disagreement there is not an error; it is the finding.
+* **`CLASS_ID` reads `0xC670`, not `0xC67D`.** The core-channel class *number* is
+  `NVC67D = 0x0000C67D` (`classes/display/clc67d.h`), but the `CLASS_ID` **field** holds the
+  "Software Class Number" from `classes/display/README.txt`: the manuals' `NV_PDISP_FE_CLASSES_0`
+  reset values are `0xC3700310` (gv100), `0xC5700400` (tu102), `0xC6700410` (ga102). The trailing `D`
+  is the core-channel nibble of the class number, not part of the ID in the register. A probe
+  comparing against `0xC67D` would never match and would report a live Ampere-class display block as
+  an unknown model — the exact confident-wrong-decode this rung exists to prevent.
+
+| `CLASS_ID` | class | generation |
+| --- | --- | --- |
+| `0xC370` | NVD_20 / `NVC37D` | Volta gv100 |
+| `0xC570` | NVD_30 / `NVC57D` | Turing tu10x, tu11x |
+| `0xC670` | NVD_40 / `NVC67D` | Ampere ga10x — **the class NVIDIA's own Tegra234 display driver drives** |
+| `0xC770` | NVD_40 / `NVC77D` | Ada ad10x |
+| `0xCA70` | NVD_50 / `NVCA7D` | Blackwell gb20x |
+
+**The verdicts, and what reachable state makes each print.** A verdict that cannot fail is a defect,
+so each is stated with its trigger:
+
+| verdict | prints when |
+| --- | --- |
+| `MODEL-VERDICT=NVDISPLAY-CLASS-<id>` | `FE_CLASSES` `CLASS_ID` matched the table. The aperture IS `NV_PDISP` at offset 0 and we know which generation |
+| `MODEL-VERDICT=NVDISPLAY-CLASS-UNKNOWN-<hex>` | `CLASS_ID` is class-**shaped** (`0xC??0`) but not in the table — a generation newer than the sources. Model confirmed, id deliberately **not** guessed |
+| `MODEL-VERDICT=DECODES-NOT-NVDISPLAY` | at least one read returned a non-trivial value, so the aperture answers, but `FE_CLASSES` holds nothing class-shaped. This is what the flat Tegra `DC_*` model predicts — its word `0x000` is `DC_CMD_GENERAL_INCR_SYNCPT`. **It does not CONFIRM the T194 map; it removes the strongest reason to doubt it** |
+| `MODEL-VERDICT=DISCRIMINATOR-TRIVIAL` | the aperture answers somewhere but `FE_CLASSES` itself read `0` or `~0`. `CLASS_ID` is hardwired nonzero on every documented generation, so this **refutes** `NV_PDISP`-at-offset-0 — and is **consistent with** the flat `DC_*` model, whose word `0x000` may legitimately read zero on an idle block. Deliberately weaker than `DECODES-NOT-NVDISPLAY` and reported separately |
+| `MODEL-VERDICT=UNDETERMINED reason=discriminator-not-read` | other reads answered but `FE_CLASSES` lay outside the declared `reg` size and was never fetched. Undetermined, **not** refuted — no claim about `+0x00000` may be read off that boot |
+| `MODEL-VERDICT=NOT-DECODING` | every read returned `0x00000000` or `0xFFFFFFFF`. Leaves the model question UNANSWERED rather than answering it negatively, and says so |
+| `MODEL-VERDICT=REFUSED reason=no-reads` | every offset lay outside the DTB-declared `reg` size. Not "the aperture is dead" — "the DTB gave us less aperture than `0x4E4`" |
+
+Each of the four reads also carries its own sub-line with its own named failing condition — zero
+heads (*refutes the `+0x60` mapping*), more than four heads (*implausible: Tegra234 documents exactly
+two head pixel clocks, `TEGRA234_CLK_NVDISPLAY_P0/_P1`*), zero windows (*the entire sweep is reading
+registers that do not exist*), `CHNCTL_CORE` bits outside every documented field (*either this offset
+is not that register, or this generation defines fields the sources do not*). `CHNCTL_CORE == 0` is
+explicitly called out as **legitimate, not a decode failure** — every field's documented INIT is 0 —
+while noting that a lit panel beside a zero here means the scanout is not driven through an allocated
+core channel from this register file, which is itself the finding.
+
+**The FIRST-TOUCH / READ-SURVIVED pair is per read, not per rung.** `jd1_dc_model_read` announces
+`JD1-DC-MODEL — NEXT TOUCH: about to read <name> @0x…` before each of the four and prints
+`READ SURVIVED: <name> @0x… = 0x…` after it. A single pair around all four would leave "which one
+killed the boot" unanswerable; with the pair per read, silence names the fatal register.
+
+**Nothing about the safety envelope moved.** The reads are `core::ptr::read_volatile` only — there is
+no `write_volatile` in JD1-DC and there must not be; verified in the armed artifact's disassembly,
+where `jd1_dc_model_read`'s only non-stack memory access is a single `ldr w9, [x8]` and every `str`
+is an `[sp, #…]` spill. Every read is bounds-checked against the **DTB-declared** `reg` size, never a
+constant. The probe still sits at the last statement of `tegra_early_stop`'s BPMP block, and all four
+new reads happen **inside** the `MRQ_PG GET_STATE` guard, after it has passed and after the existing
+FIRST TOUCH has already survived. `MRQ_PG SET_STATE` is not issued, named or reachable from this
+rung. The `CENSUS` line's `reads=` count was widened to `swept*9 + 1 + JD1DC_MODEL_READS` so it stays
+exact — `writes=0` beside an inexact read count certifies nothing.
+
+**Three in-tree instrument defects fixed in the same pass.**
+
+1. **`display_tegra.rs` no longer calls the `0x10000` head stride "the one bench-confirm number".**
+   JD1-DC has never fired, so no nvdisplay register has ever been read on this board and nothing
+   about the head layout is bench-confirmed. Both the `jd1_dc_survey` doc comment and the sweep's
+   in-function comment now say **T186/T194-derived, not documented for T234, UNCONFIRMED**, and point
+   at the rung that tests it. (`MILESTONES.md` repeats the old phrasing and was left alone — it is a
+   historical ledger, not a live claim, and it is outside this lane.)
+2. **`nvdisplay_base` now says what it assumes about a multi-entry `reg`.** The DRIVE OS T234 binding
+   declares **four** entries (`nvdisplay`, `dpaux0`, `hdacodec`, `mipical`); the reader takes
+   entry[0] and was correct by luck of ordering, while `PropWords::total_len` — the one datum that
+   would have revealed the other three — was captured and never printed. A `#[cfg]`-erased call
+   appended to the existing `let reg = …` line now emits `JD1-DC-REG`: `total_len`, the entry count
+   it implies, a RAGGED flag if it is not a multiple of 16, every captured `(addr, size)` pair with
+   entry[0] marked, and the **`reg-names` byte list** with NUL shown as `|` — which turns "entry[0]
+   is the nvdisplay aperture" from an assumption into a wire fact. A missing `reg-names` is reported
+   as its own line, because then the ordering claim has no evidence on this board at all.
+3. **`node_ids`' silent truncation is now loud, and for `power-domains` it is fatal to the flight.**
+   `pick` dropped entries at two invisible caps — `PropWords`' `MAX_WORDS` (20 words = 10 pairs) and
+   the destination array (9 clocks / 4 resets / 4 domains). The two properties are deliberately **not**
+   treated alike. A truncated `clocks`/`resets` list costs this rung nothing (JD1-DC enables no clock
+   and deasserts no reset), so it gets a `JD1-DC-IDS TRUNCATED` line and the walk continues. A
+   truncated `power-domains` list destroys the one claim the guard exists to make — it would print
+   `GUARD PASSED: all 4 … domain(s) ON` and then read a block whose fifth domain was never asked
+   about, and a read of a gated Tegra block is EL3-fatal — so it gets the loud line **and** `None`,
+   which the caller already renders as `VERDICT=REFUSED reason=no-ids` with not one nvdisplay
+   register read. `total_len % 8 != 0` is reported separately as **RAGGED**: a provider with
+   `#power-domain-cells = <0>` yields one-word entries and the odd-index extraction would harvest
+   phandles as ids — silent corruption rather than silent loss. This is the same class as the JB5
+   finding this function's own comment records, where an 8-slot cap dropped `usb@3610000`'s ninth
+   clock without a word on the wire. XUSB is unaffected: its lists (9 clocks, 4 resets, 2 domains)
+   fit every cap, and the `xusb_ids` delegation is still fall-through.
+
+**Default OFF is measured again, on this base.** Two private `CARGO_TARGET_DIR`s, the jetson matrix
+feature set, only the source varying:
+
+* **objcopy'd loadable image byte-identical** — `ab75577f8aaf183c6cac3b7e826f76986081310cd973257fa55de44babe39bc0` both sides, `cmp` clean.
+* **all 10,216 symbol addresses and types identical**; every allocated section header identical (name, address, offset, size, flags).
+* the ELF *container* differs by 904 bytes, entirely in the **non-allocated `.strtab`** —
+  LLVM's internal `anon.….llvm.<module-hash>` suffixes change digit count whenever any library source
+  file changes. Same class as this section's earlier measurement. **Note the shipped `kernel.elf` is
+  the unstripped ELF, so its sha256 moves while the bytes the machine executes do not.**
+* knob-off, `jd1_dc_probe`, `jd1_dc_model_read`, `nvdisplay_base` and `node_ids` are **absent from the
+  image entirely** (0 symbols; positive control `tegra_early_stop` present).
+* every new item is `#[cfg(feature = "jd1dc")]` and **none is `pub`** — an ungated `pub fn` was
+  measured on this base to perturb the knob-off image by 71,591 bytes even dead-stripped, because a
+  lib target makes it public API before `--gc-sections` runs.
+
+**Reachability proven by disassembly, not by the banner.** In the armed image:
+`tegra_early_stop` @`0x7f000` → `bl 0x17f300 jd1_dc_probe` at `0x7f52c`; `jd1_dc_probe` (1,136
+instructions, 20 `bl serial::__print`) → **four** `bl 0x180714 jd1_dc_model_read` at `0x17f644`,
+`0x17f668`, `0x17f68c`, `0x17f6ac` — one per read, `jd1_dc_model` inlined into its caller;
+`jd1_dc_probe` → `bl 0xd8310 nvdisplay_base`, which armed is 617 instructions and calls
+`serial::__print`, `Fdt::prop_at` and `from_utf8` (the `JD1-DC-REG` census, inlined); `node_ids`
+armed is 847 instructions with 8 `bl serial::__print`.
+
+**Still UNFLOWN.** JD1-DC has never executed on hardware — armed images have been staged and none
+booted. Every sentence above about what a register *will* read is a **prediction**. The nearest
+cheap follow-up, deliberately left out of this rung to keep it to four reads:
+`NV_PDISP_FE_CHNSTATUS_CORE` at `+0x00630` (withoffset `0x00610630`), whose `STATE` field has
+`_EFI_INIT1 = 0x5`, `_EFI_INIT2 = 0x6`, `_EFI_OPERATION = 0x7` — the live counterpart to
+`CHNCTL_CORE`'s configuration bit, from the same `disp/v03_00/dev_disp.h`.

@@ -1086,7 +1086,7 @@ fn launch(path: &str) -> String {
             VfsError::Backend(s) => alloc::format!("backend: {}", s),
         }
     }
-    const CAP: u64 = crate::arch::aarch64::boot::USER_REGION_SIZE as u64;
+    const CAP: u64 = crate::arch::aarch64::uslots::USER_REGION_SIZE as u64; // JETSON-EL0: uslots facade (boot.rs on pi / mmu_tegra_el0.rs on tegra)
     reap_jobs();
     if JOBS.lock().len() >= MAX_JOBS {
         let s = alloc::format!("{} live jobs — kill one first", MAX_JOBS);

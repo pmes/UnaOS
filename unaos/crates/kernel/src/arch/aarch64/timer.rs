@@ -378,3 +378,255 @@ fn cntfrq_substituted(used: u64) {
         used
     );
 }
+
+// ── IRQEL-RT EL1 one-shot proof (tail-defined per the Location-shift convention; everything below
+// is `tegra`-gated so the pi and QEMU-virt images stay byte-identical). M1 item 4: 0a60e260 made
+// the tegra `__vec_irq` bank ELR/SPSR by RUNTIME CurrentEL so one table serves EL2 and EL1 in one
+// boot — but only the EL2 arm is metal-proven (JM4's `verify_live`, every boot). The EL1 arm had
+// NEVER executed: the JM6 drop disables CNTP and the post-drop core runs cooperatively, so no
+// interrupt was ever TAKEN at EL1. This pair arms exactly ONE CNTP tick inside a bounded,
+// self-disarming IRQ-unmask window right after the drop (the `self_sgi_smoke` shape), witnesses
+// the first IRQ taken at EL1 from inside the handler — i.e. on the far side of the runtime
+// `irq_bank!`/`irq_unbank!` machinery this exists to prove — and leaves the machine in byte-exactly
+// the pre-existing post-drop state: timer off, IRQ masked, `LIVE` false. The cooperative scheduler
+// gains NO periodic tick (the intercept consumes the delivery INSTEAD of `on_tick`'s re-arm). ─────
+
+/// IRQEL-CORE sentinel for [`EL1_PROOF_CORE`]: no core owns the one-shot window.
+#[cfg(feature = "tegra")]
+const EL1_PROOF_NO_CORE: u32 = u32::MAX;
+
+/// The one-shot proof window is open ON EXACTLY ONE CORE: this is that core's `cpu_index`
+/// ([`EL1_PROOF_NO_CORE`] = disarmed). While it is armed, `el1_proof_intercept` consumes the next
+/// timer PPI **on that core only** instead of letting `on_tick` re-arm a periodic tick. Set/cleared
+/// only by `el1_oneshot_proof` + the intercept.
+///
+/// IRQEL-CORE — why this is a core id and not a bool. It was `static EL1_PROOF_ARMED: AtomicBool`,
+/// i.e. MACHINE-GLOBAL, and that is the defect boot 5c convicted. ORIN-SMP-3 (`UNAOS_TEGRASMP=1`,
+/// `main.rs` `start_secondaries_tegra`, called BEFORE the JM6 drop) brings five Orin secondaries
+/// online that (a) stay at EL2 — `smp_virt::secondary_entry` calls `exceptions::install()` there,
+/// which sets HCR_EL2.IMO|FMO|AMO so their physical IRQs target EL2 — and (b) each arm their OWN
+/// periodic 250 Hz PPI 30 via `arm_this_core_ap`. That is ~1250 timer IRQs/s entering this very
+/// dispatch from cores that never dropped. Against a global flag the first AP tick after the arm
+/// consumed the window: each AP's next tick is uniform in [0, 4 ms) while the boot core's one-shot
+/// is a full 4 ms out, so an AP won with probability ~1 — deterministically, not flakily. The
+/// intercept then read `CurrentEL` **on that AP** and honestly reported EL2. The instrument was
+/// right; the window's scope was wrong. Scoping it to the arming core makes every other core's tick
+/// fall through to `on_tick` unchanged — which also stops the old code from writing `CNTP_CTL=0` on
+/// a SECONDARY, permanently killing that core's only wake source while `AP_LOCAL_TICK` still told
+/// `hlt` it had one (a wake-less WFI park).
+#[cfg(feature = "tegra")]
+static EL1_PROOF_CORE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(EL1_PROOF_NO_CORE);
+/// Latched by the intercept once the proof IRQ was taken; the arming spin watches it.
+#[cfg(feature = "tegra")]
+static EL1_PROOF_TAKEN: AtomicBool = AtomicBool::new(false);
+
+/// Called from `gic::handle_irq_v3` for `TIMER_INTID`, INSIDE the IRQ handler. Returns `true` iff
+/// the armed one-shot was consumed here: the timer is DISARMED first (CNTP_CTL=0 + isb, deasserting
+/// the level-sensitive PPI before the caller's EOI — the same ordering rule `on_tick` documents)
+/// and the witness printed. `false` (window not armed, or armed for a DIFFERENT core — every
+/// periodic tick on every other path) leaves the pre-existing `on_tick` flow untouched.
+#[cfg(feature = "tegra")]
+pub fn el1_proof_intercept() -> bool {
+    // IRQEL-CORE (see `EL1_PROOF_CORE`): the window belongs to exactly ONE core — the one that armed
+    // it. The five ORIN-SMP-3 secondaries reach this same dispatch ~1250x/s from EL2 with their own
+    // periodic PPI 30, and against the old machine-global flag one of them ALWAYS won the race and
+    // printed the EL2 verdict. This guard decides only WHOSE delivery is the proof; the EL test below
+    // is untouched, so the proof can still FAIL honestly — if the ARMING core's own IRQ lands at EL2
+    // it is reported exactly as before (`this_cpu()` resolves to the same block at either EL: the
+    // boot core's TPIDR_EL2 was seeded by the pre-drop `percpu::init(0)` and its TPIDR_EL1 by the
+    // post-drop one, both with `cpu_index` 0).
+    let armed = EL1_PROOF_CORE.load(Ordering::Acquire);
+    if armed == EL1_PROOF_NO_CORE {
+        return false;
+    }
+    let cpu = super::percpu::this_cpu().cpu_index;
+    if cpu != armed {
+        // Another core's periodic tick. Fall through to `on_tick` exactly as before this instrument
+        // existed — and, load-bearing, do NOT write CNTP_CTL=0 here: the old code disarmed the
+        // SECONDARY's timer, permanently removing that core's only wake source while
+        // `this_core_has_local_tick()` kept telling `hlt` to WFI-park on it.
+        return false;
+    }
+    unsafe {
+        core::arch::asm!("msr CNTP_CTL_EL0, xzr", options(nomem, nostack, preserves_flags));
+        core::arch::asm!("isb", options(nomem, nostack, preserves_flags));
+    }
+    EL1_PROOF_CORE.store(EL1_PROOF_NO_CORE, Ordering::Release);
+    // Verify-don't-assume: name the EL this IRQ was actually TAKEN at (CurrentEL — the same runtime
+    // test `irq_bank!` ran moments ago on the way in), not the EL we hope it was. The core id is on
+    // the line too: it is what makes an "EL2" verdict self-diagnosing (boot 5c's line could not
+    // distinguish "the boot core's IRQ was routed to EL2" from "another core answered"). Printing
+    // from IRQ context is safe here: the interrupted context is the lock-free arming spin below,
+    // which holds no serial (or any other) lock.
+    let el = super::exceptions::current_el();
+    if el == 1 {
+        serial_println!(
+            ":: IRQEL-RT: first IRQ taken at EL1 on cpu {} — banked vector path live (ELR_EL1 bank) ::",
+            cpu
+        );
+    } else {
+        serial_println!(
+            ":: IRQEL-RT: one-shot proof IRQ taken at EL{} on cpu {} (the ARMING core) — NOT the EL1 proof; HCR_EL2.IMO routed it up, see the [irqel2a] EL2 latch above (investigate) ::",
+            el, cpu
+        );
+    }
+    EL1_PROOF_TAKEN.store(true, Ordering::Release);
+    true
+}
+
+/// M1 item 4 — called ONCE from `main.rs`, immediately after the post-drop `exceptions::install()`
+/// (EL1, DAIF fully masked, timer off per `set_not_live`): arm CNTP for a SINGLE tick (~4 ms) and
+/// open a bounded ~100 ms IRQ-unmask window (save DAIF, unmask I, spin on the flag off the
+/// free-running CNTPCT, restore DAIF — the `self_sgi_smoke` shape) so exactly one interrupt is
+/// taken AT EL1 through the runtime-banked `__vec_irq`. Self-disarming on EVERY path: delivered =>
+/// the intercept already wrote CNTP_CTL=0 (and printed the proof witness); not delivered => the
+/// window expiry disarms and prints the INCONCLUSIVE line. Never stalls boot beyond the window,
+/// and the post-window machine state is exactly today's (timer off, IRQ masked, `LIVE` false).
+#[cfg(feature = "tegra")]
+pub fn el1_oneshot_proof() {
+    let freq = cntfrq();
+    let freq = if freq == 0 { 62_500_000 } else { freq };
+    let cpu = super::percpu::this_cpu().cpu_index;
+    // Armed witness BEFORE the unmask, so the serial lock is free again when the handler prints.
+    serial_println!(
+        ":: IRQEL-RT: EL1 one-shot proof — arming CNTP for a single tick at EL1 on cpu {} (~100 ms window; CORE-LOCAL, other cores' periodic PPI{} is NOT this proof) ::",
+        cpu, TIMER_INTID
+    );
+    // Adjudicating pair (IRQEL-RT2): the machine state IMMEDIATELY BEFORE the arm — including the
+    // GICR PPI enable, which answers the "the EL2-era enable persists across the drop" assumption
+    // below that has never actually been read back — and again immediately after it.
+    el1_proof_snapshot("pre-arm");
+    // Re-assert the (banked) timer PPI enable at this core's redistributor. The EL2-era enable
+    // persists across the JM6 drop (GICR state is EL-independent), but the re-enable is idempotent
+    // and cheap — verify-don't-assume.
+    super::gic::enable_ppi(TIMER_INTID);
+    EL1_PROOF_TAKEN.store(false, Ordering::Relaxed);
+    EL1_PROOF_CORE.store(cpu, Ordering::Release);
+    write_tval(freq / TICK_HZ);
+    unsafe {
+        core::arch::asm!("msr CNTP_CTL_EL0, {}", in(reg) 1u64, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("isb", options(nomem, nostack, preserves_flags));
+    }
+    // Still masked here, so this print cannot deadlock against the handler's own.
+    el1_proof_snapshot("armed");
+    let daif: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, DAIF", out(reg) daif, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("msr daifclr, #2", options(nomem, nostack, preserves_flags));
+        core::arch::asm!("isb", options(nomem, nostack, preserves_flags));
+    }
+    let budget = freq / 10; // ~100 ms — the verify_live/self_sgi_smoke window
+    let start = cntpct();
+    while cntpct().wrapping_sub(start) < budget {
+        if EL1_PROOF_TAKEN.load(Ordering::Acquire) {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    unsafe {
+        // Restore the entry DAIF (post-drop: fully masked) FIRST, then disarm unconditionally (a
+        // no-op when the intercept already did): the one-shot must not outlive its window whatever
+        // happened inside it, and no further IRQ can land once I is re-masked.
+        core::arch::asm!("msr daif, {}", in(reg) daif, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("msr CNTP_CTL_EL0, xzr", options(nomem, nostack, preserves_flags));
+        core::arch::asm!("isb", options(nomem, nostack, preserves_flags));
+    }
+    EL1_PROOF_CORE.store(EL1_PROOF_NO_CORE, Ordering::Release);
+    if !EL1_PROOF_TAKEN.load(Ordering::Acquire) {
+        // Bounded, non-blocking miss path (the instrument-exists law): note it with the same
+        // diagnostics `diagnose` reads and PROCEED — boot must not stall on an unproven vector arm.
+        serial_println!(
+            ":: IRQEL-RT: EL1 one-shot NOT delivered in ~100 ms — proof INCONCLUSIVE (CNTP_CTL={:#x}, GICR PPI{} pending={}); timer disarmed, boot proceeds ::",
+            cntp_ctl(),
+            TIMER_INTID,
+            super::gic::ppi_pending(TIMER_INTID)
+        );
+        // The miss path gets the same adjudicating snapshot as the arm, so an INCONCLUSIVE capture
+        // still names WHICH precondition moved (PPI enable dropped, PMR masked, RPR stuck on an
+        // un-EOI'd interrupt, comparator never reached) instead of only that nothing arrived.
+        el1_proof_snapshot("miss");
+    }
+}
+
+/// IRQEL-RT2 — one adjudicating state dump for the EL1 one-shot proof, taken on the arming core at
+/// `when` ∈ {`pre-arm`, `armed`, `miss`}. Every value here is EL1-legal, and the two lines are
+/// SPLIT deliberately:
+///
+///  * `[irqel2a]` carries the CPU-side state, including the four **EL2-only** registers that decide
+///    where a physical IRQ goes. HCR_EL2 / CNTHCTL_EL2 / ICC_SRE_EL2 cannot be read at EL1 (an
+///    `mrs` of an EL2 register from EL1 is UNDEFINED — it would take a sync exception into the very
+///    vectors under test), so they are latched by the JM6 drop asm at the last instant they are
+///    readable and read back here from RAM: `boot_tegra::jm6_el2_latch`. HCR_EL2.IMO is THE bit
+///    that answers "EL1 or EL2" — 0 means a physical IRQ taken at EL1 targets EL1.
+///  * `[irqel2b]` carries the GIC view, and is second on purpose: it is the only part that performs
+///    an `ICC_*_EL1` system-register access at EL1, which is UNDEFINED unless ICC_SRE_EL1.SRE == 1.
+///    That bit is printed by `[irqel2a]`, which is therefore already on the wire if `[irqel2b]`
+///    faults — and when the latch says SRE == 0 the snapshot is skipped and SAID so rather than
+///    taken. (`gic::wedgeprobe_snapshot` is reused rather than duplicated: it is read-only, takes no
+///    lock and enters no wait, and its banked-state fields are exactly this proof's preconditions.)
+///
+/// The CNTP_* reads need CNTHCTL_EL2.EL1PCTEN/EL1PCEN, which the drop sets and boot 5c already
+/// proved effective — that boot's `write_tval` (`msr CNTP_TVAL_EL0`) and `cntpct()` both executed at
+/// EL1 with no trap. Cost is four serial lines on one tegra boot, all after `tegra_early_stop` has
+/// armed the UARTC latch (DARKWIN), and the whole block is `tegra`-gated.
+#[cfg(feature = "tegra")]
+#[inline(never)]
+fn el1_proof_snapshot(when: &str) {
+    let daif: u64;
+    unsafe { core::arch::asm!("mrs {}, DAIF", out(reg) daif, options(nomem, nostack, preserves_flags)) };
+    let (hcr, cnthctl, sre1, sre2) = super::boot_tegra::jm6_el2_latch();
+    let ctl = cntp_ctl();
+    let (cval, now) = (cntp_cval(), cntpct());
+    serial_println!(
+        ":: [irqel2a] {} cpu={} CurrentEL={} DAIF={:#x} (I={}) | JM6 EL2 latch: HCR_EL2={:#x} \
+         IMO={} FMO={} AMO={} TGE={} E2H={} RW={} | CNTHCTL_EL2={:#x} EL1PCTEN={} EL1PCEN={} | \
+         ICC_SRE_EL1={:#x} ICC_SRE_EL2={:#x} | CNTP_CTL={:#x} ENABLE={} IMASK={} ISTATUS={} \
+         CVAL-CNTPCT={}cyc CNTFRQ={} :: (IMO=0 is what makes an IRQ taken at EL1 target EL1)",
+        when,
+        super::percpu::this_cpu().cpu_index,
+        super::exceptions::current_el(),
+        daif,
+        (daif >> 7) & 1,
+        hcr,
+        (hcr >> 4) & 1,
+        (hcr >> 3) & 1,
+        (hcr >> 5) & 1,
+        (hcr >> 27) & 1,
+        (hcr >> 34) & 1,
+        (hcr >> 31) & 1,
+        cnthctl,
+        cnthctl & 1,
+        (cnthctl >> 1) & 1,
+        sre1,
+        sre2,
+        ctl,
+        ctl & 1,
+        (ctl >> 1) & 1,
+        (ctl >> 2) & 1,
+        cval.wrapping_sub(now) as i64,
+        cntfrq(),
+    );
+    if sre1 & 1 == 0 {
+        serial_println!(
+            ":: [irqel2b] {} SKIPPED — the JM6 latch says ICC_SRE_EL1.SRE=0, so any ICC_*_EL1 access at EL1 is UNDEFINED; the GIC view is NOT read (and the handler's own ICC_IAR1_EL1 would fault) ::",
+            when
+        );
+        return;
+    }
+    let g = super::gic::wedgeprobe_snapshot();
+    serial_println!(
+        ":: [irqel2b] {} GICD_CTLR={:#x} | this core's banked PPI{}: enab={} pend={} act={} | \
+         ICC_IGRPEN1_EL1={:#x} ICC_PMR_EL1={:#x} ICC_RPR_EL1={:#x} ICC_HPPIR1_EL1={} ::",
+        when,
+        g.gicd_ctlr,
+        TIMER_INTID,
+        g.timer_enabled as u8,
+        g.timer_pending as u8,
+        g.timer_active as u8,
+        g.cpuif_ctlr,
+        g.pmr,
+        g.rpr,
+        g.hppir,
+    );
+}

@@ -30,7 +30,7 @@ pub enum Event {
     Mouse { x: i32, y: i32 },
     MouseAbsolute { x: i32, y: i32 },
     /// CLICK-1: a pointer button-DOWN edge (payload = the report's button bitmask, bit 0 = primary).
-    /// Emitted once per press by the HID decoders (edge-detected there); release emits nothing.
+    /// Emitted by the HID decoders on ANY button-mask CHANGE — press edge AND release edge (GUI-CLICK-2).
     Button(u8),
     /// WHEEL: one scroll-wheel report, carrying the HID boot-mouse wheel byte as a SIGNED delta —
     /// POSITIVE is scroll-up / away from the user, negative is scroll-down. This is a DELTA, not an

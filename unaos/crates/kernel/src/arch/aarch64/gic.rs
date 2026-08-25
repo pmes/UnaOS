@@ -964,6 +964,17 @@ fn handle_irq_v3() {
     if intid < 16 {
         crate::arch::percpu::count_ipi();
     } else if intid == crate::arch::timer::TIMER_INTID {
+        // IRQEL-RT (tegra, M1 item 4): while the post-JM6 EL1 one-shot proof window is armed, this
+        // delivery IS the proof — the intercept consumes it (disarms CNTP + isb, deasserting the
+        // level-sensitive PPI before the EOI below, and prints the EL1 witness) and `on_tick` is
+        // SKIPPED, so the cooperative post-drop scheduler gains no periodic tick. Unarmed (every
+        // other delivery, and the whole EL2 boot stretch) the pre-existing flow runs unchanged;
+        // off tegra this statement does not exist and the arm below it is the original line.
+        #[cfg(feature = "tegra")]
+        if !crate::arch::timer::el1_proof_intercept() {
+            crate::arch::timer::on_tick();
+        }
+        #[cfg(not(feature = "tegra"))]
         crate::arch::timer::on_tick();
     }
     // ICC_EOIR1_EL1: writing the acked value drops priority and (EOImode=0) deactivates.

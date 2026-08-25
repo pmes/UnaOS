@@ -662,6 +662,18 @@ tegra = []
 # const). Enable via `UNAOS_SMPPROBE=<n> UNAOS_TEGRA=1 ./arroyo esp-jetson`.
 smpprobe = []
 
+# SMPMARK (ORIN-SMP-3): the `UNAOS_SMPMARK=1` one-flight discriminator for the intermittent
+# secondary-bring-up park (arch/aarch64/smp_virt.rs). Three short `serial_print!` tags — `:A:` (an AP
+# crossed MMU-off -> MMU-on), `:P:` (the BSP finished publishing SEC_CTX + the stack cache sweep) and
+# `:R<idx>:` (the `CPU_ON` SMC returned) — that between them say WHICH side of the PSCI wake the park
+# is on. The tags exist because the verbose per-core success line is ~8.2 ms of UART at 115200, long
+# enough for the woken AP to fault mid-line; the marks close that window to ~430 us. Standalone
+# (does NOT imply `tegra`, mirroring `smpprobe`) so the `:A:` mark can also be type-checked on the
+# non-tegra aarch64 path it shares. Pure instrumentation; with the feature OFF (default) every mark
+# vanishes and the tegra image is byte-identical to baseline. Enable via
+# `UNAOS_SMPMARK=1 UNAOS_TEGRA=1 ./arroyo esp-jetson`. See arch_arm64.md §ORIN-SMP.
+smpmark = []
+
 # VUG-RAS-LOCALIZER: the `UNAOS_VUGRAS=1` RAS localizer (vugras.rs) — a knob-gated DC CIVAC writeback
 # sweep (vug frame loop + JD2 console-idle pump) plus a boot candidate-PA witness, to make the Orin
 # SNOC+ACI FillWrite RAS fire at/near the offending store and name the address it decodes to. Pure
@@ -1707,6 +1719,140 @@ fatperf = []
 # `kernel8.img` is byte-identical to baseline. Arming it does NOT imply `pidesk`; a Pi build wants
 # `UNAOS_LIVECON=1 UNAOS_PIDESK=1` so the seam that routes the console into a window exists at all.
 livecon = []
+
+# ORIN-WM1 (`UNAOS_ORINDESK=1`): the Jetson Orin's FIRST real compositor window — one `wm` row minted
+# over a heap-backed ARGB surface and composited onto the JD1 inherited scanout, from
+# `arch/aarch64/display_tegra.rs::orin_wm1`, wired into `tegra_early_stop` on the step-3c heap line.
+#
+# It is ONE WINDOW and deliberately not a desktop: no `pidesk::activate`, no furniture, no
+# dock/strip/menubar/crystal. The compositor itself is already in every jetson image (`video/mod.rs`
+# declares `pub mod wm;` unconditionally and the tegra path already calls `wm::retile_on_ready()`), so
+# this feature adds no module — what it adds is the `wm::reserve_stage` call the Orin never had, because
+# the Orin seeds `video::WRITER` by hand and never reaches `video::init_panel`, the tree's only caller.
+#
+# STANDALONE, mirroring `smpmark` — it does NOT imply `tegra`. Every one of its sites lives inside a
+# `tegra`-gated module (`display_tegra`) or a `tegra`-gated block (`tegra_early_stop`), so
+# `UNAOS_ORINDESK=1` on its own compiles nothing at all; arm it as
+# `UNAOS_TEGRA=1 UNAOS_ORINDESK=1 ./arroyo check`, or `UNAOS_ORINDESK=1 ./arroyo esp-jetson` (which
+# forces `tegra`). The ARMED polarity is type-checked by the `arm-tegra-orindesk` leg of
+# KERNEL_CFG_MATRIX in `arroyo`, never by the knob mapping.
+#
+# Default OFF => the statics, the function and the appended call site all vanish, NO LINE MOVES in any
+# file compiled knob-off (both edits are appends — see the ORIN-WM1 tail blocks in main.rs and
+# display_tegra.rs), and the jetson image is byte-identical to baseline. MEASURED, not argued: build
+# `esp-jetson` either side and compare sha256 of `kernel.elf` and of its `llvm-objcopy -O binary`
+# flattening. See arch_arm64.md §ORIN-WM1.
+orindesk = []
+
+# JD1-DC (`UNAOS_JD1DC=1`): the Jetson Orin's BPMP-GUARDED, READ-ONLY nvdisplay register probe —
+# `arch/aarch64/display_tegra.rs::jd1_dc_probe`, wired into `tegra_early_stop` as the last statement
+# of the BPMP block. It answers the one question the whole Orin display stack rests on and has never
+# measured: can the CCPLEX see the nvdisplay registers, and do they still hold what the firmware
+# programmed? Everything above it today is inference from a DRAM carveout — JD1 inherits a scanout
+# address out of the DTB and paints into it, which proves only that something is still scanning that
+# memory out.
+#
+# READ-ONLY, ABSOLUTELY. Every access is `core::ptr::read_volatile`; there is no `write_volatile` in
+# the rung and there must not be (the DCE R5 is live on the other side of that aperture, and a write
+# is a two-writer race against 11.8 MiB of authenticated firmware). The census line carries
+# `writes=0` so the capture certifies it.
+#
+# THE GUARD is the safety story: a read of a power-gated Tegra block is EL3-FATAL (JX1: SError
+# ESR 0xbe000011, EC=0x2F, BL31 "Unhandled Exception in EL3"), so the probe asks BPMP —
+# MRQ_PG CMD_PG_GET_STATE, the id read off the DTB's own `display@` node — and reads nothing at all
+# unless every listed domain answers ON. It never issues SET_STATE: powering (or cycling) the display
+# domain would tear down the inherited scanout and is unrecoverable for that boot.
+#
+# The feature also arms the GENERALISED DTB id reader (`fdt_tegra::node_ids`, the file-tail block):
+# `xusb_ids`'s walk with the node name lifted into a parameter, which is what lets the guard read
+# `display@13800000`'s `power-domains` with the same code rather than a second copy of it.
+#
+# STANDALONE, mirroring `smpmark`/`orindesk` — it does NOT imply `tegra`. Every site lives inside a
+# `tegra`-gated module (`display_tegra`, `fdt_tegra`, `bpmp_tegra`) or a `tegra`-gated block
+# (`tegra_early_stop`), so `UNAOS_JD1DC=1` alone compiles nothing; arm it as
+# `UNAOS_TEGRA=1 UNAOS_JD1DC=1 ./arroyo check`, or `UNAOS_JD1DC=1 ./arroyo esp-jetson` (which forces
+# `tegra`). The ARMED polarity is type-checked by the `arm-tegra-jd1dc` leg of KERNEL_CFG_MATRIX in
+# `arroyo`, never by the knob mapping.
+#
+# Default OFF => the probe, the generalised reader, the scanout latch and all three call sites vanish,
+# and NO LINE MOVES in any file compiled knob-off: every edit to already-compiled code is a statement
+# APPENDED to an existing line (the panic-`Location` line-shift class is how byte-identity is usually
+# lost silently). MEASURED, not argued — build the aarch64 kernel either side and compare sha256 of
+# `unaos-kernel` and of its `llvm-objcopy -O binary` flattening. Witness on the wire:
+# `JD1-DC VERDICT=`. See arch_arm64.md §JD1-DC.
+jd1dc = []
+
+# ORINDESK RUNG 2 (TEGRADESK) — the Jetson Orin's DESKTOP SEAM: the tegra-shaped arming wrapper
+# `main.rs::tegra_desk_arm`, wired into `tegra_early_stop`'s terminus line. It is the tegra
+# counterpart of `main.rs::pidesk_activate_maybe`, which the Orin can NEVER reach: that wrapper is
+# gated `all(aarch64, pidesk, baremetal)`, `baremetal = ["pi"]`, and `pi` + `tegra` is a hard
+# `compile_error!` in `arch/aarch64/serial.rs`. So on every tegra build the existing wrapper resolves
+# to its constant-`false` twin. This feature is the gate that CAN be satisfied on this board.
+#
+# WHY IT IMPLIES RATHER THAN STANDS ALONE, and this is the whole point of the rung. `orindesk`,
+# `jd1dc` and `smpmark` are standalone because their sites need nothing but `tegra`. This one calls
+# `video::pidesk::activate`, which is `#[cfg(all(aarch64, pidesk))]`, and `pidesk` on aarch64 needs
+# `arch::aarch64::syscall` (via `dock::focus_set`), which `arch/aarch64/mod.rs` gates on
+# `any(baremetal, tegra_el0)` — `baremetal` being unsatisfiable here, the only term left is
+# `tegra_el0` (which implies `tegra`). A STANDALONE spelling would therefore let
+# `UNAOS_TEGRADESK=1 UNAOS_TEGRA=1` compile the ABSENCE of the seam and report green, which is
+# EXACTLY the defect class this rung exists to remove: a gate whose knob cannot satisfy it. The
+# implication makes `UNAOS_TEGRADESK=1` self-sufficient and unable to arm a stub.
+#
+# IT DOES NOT ARM THE DESKTOP. Armed, the seam evaluates its floors, prints a derived census, and
+# then REFUSES at two named stop-lines (`main.rs`'s `TEGRADESK_CLICK_ROUTED` / `TEGRADESK_CASCADE_OK`,
+# both `const false`, the `display_tegra::JD1_DC_PROBE` idiom): rung 3 (click routing) has not landed,
+# so a console window's minimise disc would be a one-way trip (orin-desktop.md §6.1), and the full
+# desktop cascade is §5.2's stop-line — the Pi overflowed a 16 KiB kernel stack in it twice on metal
+# and it does not reproduce on any QEMU gate. `pidesk::activate()` is COMPILED and TYPE-CHECKED here
+# and is not reached on any boot this branch can produce.
+#
+# Default OFF => the wrapper, its statics and its call site vanish, and NO LINE MOVES in any file
+# compiled knob-off (the call site is a statement APPENDED to `tegra_early_stop`'s existing terminus
+# line; the wrapper is appended at the FILE TAIL below every panic `Location` in `main.rs`). MEASURED,
+# not argued — build the aarch64 kernel either side with `--features ehcihid,tegra,tegrasmp` and
+# compare sha256 of `unaos-kernel` and of its `llvm-objcopy -O binary` flattening. The ARMED polarity
+# is type-checked by the `arm-tegra-seam` leg of KERNEL_CFG_MATRIX in `arroyo`, never by the knob
+# mapping. Witness on the wire: `[deskseam]`. See docs/dev/OS/08_VIDEO/orin-desktop.md §6 rung 2.
+tegradesk = ["pidesk", "tegra_el0"]
+
+# ORIN-CLICK (`UNAOS_ORINCLICK=1`): rung 3 of the Orin desktop ladder — `jd2_console_pump`'s
+# `Event::Button` arm hands the edge to `arch/aarch64/syscall.rs::wc_click_route` instead of logging
+# it and dropping it. The router, `wm::hit_test`, `wm::focus_changed` and the control arms have all
+# been compiled into every Orin kernel that carries `tegra_el0` and have never had a caller on this
+# arch (orin-desktop.md §3.4); this knob is that caller plus the `[orinclick]` instrument.
+#
+# THIS RUNG IS THE SAFETY PRECONDITION FOR RUNG 4, not an optional polish. `video/pidesk.rs:39-44`
+# states the CONSOLEWIN law — the console window carries a minimise disc and the only route back from
+# that park is the dock, which is a route back only once clicks route. "A control that hides a window
+# with no way back is worse than no control." Nothing here routes the console into a `wm` row.
+#
+# IT DOES NOT CROSS THE §5.2 STOP-LINE. It implies `tegra_el0` and NOTHING else, so every furniture arm
+# inside the router (`strip::press_route`, `quarry::service`, `pulsewin::press_route`,
+# `quarry::press_route`, the DRAG-PI chrome arm, the SHELLWIN-PI arm) stays `#[cfg(feature = "pidesk")]`
+# and compiled out — including `quarry::open()`, which is what overflowed the Pi's 16 KiB kernel stack
+# at click-router depth on boot 11. No dock, no strip, no menubar, no crystal, no `render_service`.
+#
+# NOT STANDALONE, and that is the shape of the configuration rather than a convenience. `wc_click_route`
+# lives in `arch/aarch64/syscall.rs`; `arch/aarch64/mod.rs:46` gates that module on
+# `any(baremetal, tegra_el0)`; `baremetal` implies `pi`; and `pi` + `tegra` is a hard `compile_error!`
+# (`arch/aarch64/serial.rs:22`). On the Orin the only satisfiable term is `tegra_el0`, so declaring the
+# dependency here is what stops `orinclick = []` from being a knob that compiles nothing unless the
+# operator separately guesses `UNAOS_TEGRA_EL0=1` — a vacuous gate wearing a green verdict.
+# `tegra_el0` implies `tegra`, so `UNAOS_ORINCLICK=1 ./arroyo check` and
+# `UNAOS_ORINCLICK=1 ./arroyo esp-jetson` are both self-sufficient. The ARMED polarity is type-checked
+# by the `arm-tegra-orinclick` leg of KERNEL_CFG_MATRIX in `arroyo` and the `pidesk` CROSS by
+# `arm-tegra-seam` (rung 2's armed-seam leg, which since this arc also carries `orinclick` — the seam
+# asserts `TEGRADESK_CLICK_ROUTED` in source, so the leg that compiles the assertion must compile the
+# routing too), never by the knob mapping.
+#
+# Default OFF => the statics, the three functions and both call sites vanish, and NO LINE MOVES in any
+# file compiled knob-off: the `display_tegra.rs` half is a file-TAIL block and both `main.rs` edits are
+# statements APPENDED to existing lines (the panic-`Location` line-shift class is how byte-identity is
+# usually lost silently). MEASURED, not argued — build the aarch64 kernel either side and compare
+# sha256 of `unaos-kernel` and of its `llvm-objcopy -O binary` flattening. Witness on the wire:
+# `[orinclick] arm`, `[orinclick] edge=`, `[orinclick] census`. See orin-desktop.md §3.7.
+orinclick = ["tegra_el0"]
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
