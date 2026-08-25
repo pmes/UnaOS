@@ -618,9 +618,13 @@ static JD1DC_SCANOUT: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 ///
 /// * `VERDICT=REACHABLE` — registers decode AND a window's `START_ADDR` equals the inherited scanout
 ///   base. The CCPLEX can see nvdisplay and we are looking at what the firmware programmed.
-/// * `VERDICT=DECODES-NOMATCH` — registers decode and windows are enabled, but no `START_ADDR`
-///   matched. The pipe is reachable; the scanout is being fed from somewhere this sweep did not read
-///   (a different head layout, or a window base the DTB handoff does not correspond to).
+/// * `VERDICT=DECODES-NOMATCH` — the FE capability word decodes but no `START_ADDR` matched. SINCE
+///   JX1 THIS IS THE ONLY OUTCOME THE WINDOW HALF CAN PRODUCE, and it is produced with `swept=0`:
+///   the Tegra194 window sweep is gated to an empty slice (its first read was EL3-fatal on this
+///   silicon), so no window is ever read, none is ever enabled, and no `START_ADDR` can ever match.
+///   The verdict now rests entirely on the FE capability word. It is NOT evidence that the scanout
+///   is fed from a window the sweep missed — nothing was swept. The window question moved to
+///   `JX2-VERDICT=`, which asks it in the NVC67D channel model this silicon actually presents.
 /// * `VERDICT=NOT-DECODING` — all-ones / all-zero / no enabled window. See the block comment: on this
 ///   board that is a finding about OUR access path, not about the silicon.
 /// * `VERDICT=REFUSED` — the guard said no (or could not be asked) and NOT ONE register was read.
@@ -738,7 +742,7 @@ pub fn jd1_dc_probe(chan: &super::bpmp_tegra::Chan, dtb_addr: u64, dtb_size: usi
         ":: tegra: JD1-DC — FIRST READ SURVIVED: {}={:#010x} — the CCPLEX decodes this aperture without an EL3 abort ::",
         if have_cap { "DISPLAY_FE_SW_SYS_CAP" } else { "head+0x0 win0 WIN_OPTIONS" },
         first,
-    ); jd1_dc_model(base, size, have_cap, first); // JD1-DC-MODEL — the WHICH-CHIP discriminator, four more read-only reads, appended here because this is the first instruction at which an nvdisplay read is known non-fatal and the long window sweep has not yet risked the boot. Without it `VERDICT=DECODES-NOMATCH` is AMBIGUOUS between "the aperture is not live" and "our register map is Tegra194's and this silicon is Tegra234" — two answers that send the display arc in opposite directions. See the JD1-DC-MODEL block at this file's tail. APPENDED to this line, never a new one: knob-off it is cfg-erased and not one `core::panic::Location` below moves.
+    ); jd1_dc_model(base, size, have_cap, first); jx2_nvc67d_status(base, size); // JD1-DC-MODEL — the WHICH-CHIP discriminator, four more read-only reads, appended here because this is the first instruction at which an nvdisplay read is known non-fatal and the long window sweep has not yet risked the boot. Without it `VERDICT=DECODES-NOMATCH` is AMBIGUOUS between "the aperture is not live" and "our register map is Tegra194's and this silicon is Tegra234" — two answers that send the display arc in opposite directions. See the JD1-DC-MODEL block at this file's tail. APPENDED to this line, never a new one: knob-off it is cfg-erased and not one `core::panic::Location` below moves. || AND JX2-NVC67D, appended to the same line for the same two reasons: this is still the first instruction at which an nvdisplay read is KNOWN non-fatal on this boot, and appending rather than adding a statement line keeps every `core::panic::Location` below unmoved. It runs AFTER the discriminator because it CONSUMES the discriminator's answer — boot7f's `MODEL-VERDICT=NVDISPLAY-CLASS-C670` / `FE_CLASSES=0xc6700410` is the entire licence for its offsets — and it SUPERSEDES the JX1-gated Tegra194 window sweep immediately below, which is left in place as the record of why. See the JX2-NVC67D block at this file's tail.
 
     // 5. THE WINDOW SWEEP — read-only, every field, every window, EMPTY WINDOWS INCLUDED. The legacy
     //    `jd1_dc_survey` skips all-zero windows to keep its log short; this rung prints them, because
@@ -784,6 +788,13 @@ pub fn jd1_dc_probe(chan: &super::bpmp_tegra::Chan, dtb_addr: u64, dtb_size: usi
     //
     // The FIRST-TOUCH announce is what made this diagnosable in one boot instead of a bisect: the
     // silence after it names the fatal register exactly. Keep that discipline in the replacement.
+    // THE WIRE HAS TO SAY THIS, not just the source. `swept=0` on a capture is otherwise indis-
+    // tinguishable from "the sweep ran and found nothing", and the DECODES-NOMATCH line below used to
+    // offer exactly that false cause. One line, printed unconditionally, so no future capture can be
+    // read the wrong way round.
+    serial_println!(
+        ":: tegra: JX2-SWEEPDISABLED — the Tegra186/194 window sweep below is GATED TO AN EMPTY SLICE and DOES NOT RUN. Every count it feeds is therefore zero BY CONSTRUCTION (swept=0 enabled=0 all_ones=0 all_zero=0 heads=0), not by measurement: nothing was read, so nothing could match. WHY: boot7e, 2026-08-25 — its first read, head+0x0 win0 WIN_OPTIONS @+0x2e00, was EL3-fatal (SError ESR 0xbe000011, BL31 'Unhandled Exception in EL3') on silicon that boot7f then identified as NVDISPLAY class NVC67D / NVD_40, whose window state is not MMIO at those offsets or any others. The replacement is the JX2-NVC67D rung, whose JX2-VERDICT= line above is where the window question is now answered ::"
+    );
     #[allow(unused_variables)]
     for &head_off in &[] as &[u64] {
         if head_off + 0x2800 + 6 * 0xC00 > size {
@@ -884,7 +895,7 @@ pub fn jd1_dc_probe(chan: &super::bpmp_tegra::Chan, dtb_addr: u64, dtb_size: usi
     // bank (`swept == 0`), and a decoding block whose windows are simply all disabled.
     } else if (have_cap && first != 0xFFFF_FFFF && first != 0) || enabled > 0 {
         serial_println!(
-            ":: tegra: JD1-DC VERDICT=DECODES-NOMATCH — the aperture DECODES ({} window(s) at WIN_ENABLE=1 out of {} swept), but no START_ADDR equalled the JD1 scanout base {:#x}{}. Reachability is ESTABLISHED; the scanout is fed from a window this sweep's head model did not cover (swept=0 means the aperture held the FE capability word but no complete head-0 window bank) — compare the RAW lines above against DISPLAY_FE_SW_SYS_CAP={:#010x}, which is UEFI's own head/SOR enumeration. THIS VERDICT DOES NOT SAY WHY: on its own it cannot separate 'the aperture is live and the window is somewhere we did not look' from 'our window offsets are Tegra194's and this silicon is not Tegra194'. The JD1-DC MODEL-VERDICT line ABOVE is the one that separates them — read it first ::",
+            ":: tegra: JD1-DC VERDICT=DECODES-NOMATCH — the aperture DECODES ({} window(s) at WIN_ENABLE=1 out of {} swept), but no START_ADDR equalled the JD1 scanout base {:#x}{}. Reachability is ESTABLISHED — by the FE capability word alone. READ THE WINDOW COUNTS AS ZERO BY CONSTRUCTION, NOT AS A MEASUREMENT: since JX1 the Tegra194 sweep is gated to an empty slice and never runs, so swept=0 and enabled=0 always, and the earlier reading of swept=0 as 'the aperture held the FE capability word but no complete head-0 window bank' was a FALSE CAUSE and is retracted here. Nothing was swept, so nothing could match, and this verdict says NOTHING about where the scanout is fed from. That question moved to the JX2-VERDICT= line above. Compare the RAW lines above against DISPLAY_FE_SW_SYS_CAP={:#010x}, which is UEFI's own head/SOR enumeration. THIS VERDICT DOES NOT SAY WHY: on its own it cannot separate 'the aperture is live and the window is somewhere we did not look' from 'our window offsets are Tegra194's and this silicon is not Tegra194'. The JD1-DC MODEL-VERDICT line ABOVE is the one that separates them — read it first ::",
             enabled,
             swept,
             scanout,
@@ -893,7 +904,7 @@ pub fn jd1_dc_probe(chan: &super::bpmp_tegra::Chan, dtb_addr: u64, dtb_size: usi
         );
     } else {
         serial_println!(
-            ":: tegra: JD1-DC VERDICT=NOT-DECODING — {} of {} windows read all-ones and {} read all-zero, none enabled. READ THIS CAREFULLY: UEFI drives THESE registers on THIS board from THIS core by plain MmioRead32/MmioWrite32 (edk2-nvidia NvDisplayControllerDxe/NvDisplayHw.c), and the string 'dce' appears nowhere in that tree — so this result is NOT 'the DCE holds the block'. It is a finding about OUR access path: our aperture/mapping, the domain or clock state at our probe point, or an SCR narrower for us than for UEFI. FE_SW_SYS_CAP read {:#010x}. AND IT IS NOT A STATEMENT ABOUT THE WINDOW OFFSETS EITHER — a wrong register map produces DECODES-NOMATCH, not this; if the JD1-DC MODEL-VERDICT line above says the aperture answered anything at all, prefer that line's reading of it over this one ::",
+            ":: tegra: JD1-DC VERDICT=NOT-DECODING — {} of {} windows read all-ones and {} read all-zero, none enabled. THOSE THREE COUNTS ARE ZERO BY CONSTRUCTION SINCE JX1 (the Tegra194 sweep is gated to an empty slice and never runs), so they are not evidence of anything; the only load-bearing term in this verdict is the FE capability word. READ THIS CAREFULLY: UEFI drives THESE registers on THIS board from THIS core by plain MmioRead32/MmioWrite32 (edk2-nvidia NvDisplayControllerDxe/NvDisplayHw.c), and the string 'dce' appears nowhere in that tree — so this result is NOT 'the DCE holds the block'. It is a finding about OUR access path: our aperture/mapping, the domain or clock state at our probe point, or an SCR narrower for us than for UEFI. FE_SW_SYS_CAP read {:#010x}. AND IT IS NOT A STATEMENT ABOUT THE WINDOW OFFSETS EITHER — a wrong register map produces DECODES-NOMATCH, not this; if the JD1-DC MODEL-VERDICT line above says the aperture answered anything at all, prefer that line's reading of it over this one ::",
             all_ones,
             swept,
             all_zero,
@@ -1710,5 +1721,543 @@ fn jd1_dc_model(base: u64, size: u64, have_cap: bool, sw_cap: u32) {
             id,
             cls,
         ),
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// JX2-NVC67D — THE REPLACEMENT FOR THE JX1-GATED WINDOW SWEEP, WRITTEN AGAINST THE REGISTER MODEL
+// THE SILICON ACTUALLY PRESENTS.
+//
+// WHAT boot7e AND boot7f ESTABLISHED, and this rung starts from rather than re-asks:
+//
+//   FIRST READ SURVIVED: DISPLAY_FE_SW_SYS_CAP=0x00100303   <- the CCPLEX decodes this aperture
+//   MODEL-VERDICT=NVDISPLAY-CLASS-C670   FE_CLASSES=0xc6700410 -> NVD_40 / class NVC67D, ga10x
+//   FE_HW_SYS_CAP =0x00100303 -> 2 heads, 2 SORs
+//   FE_HW_SYS_CAPB=0x0000000f -> 4 windows
+//   FE_CHNCTL_CORE=0x00000021 -> ALLOCATION(0)=1, EFI(5)=1 — UEFI left the CORE CHANNEL EFI-OWNED
+//
+// So the aperture IS NVIDIA `NV_PDISP` rebased to offset 0, and it is the Ampere NVD_40 generation
+// whose core channel is class `NVC67D`. That is exactly the map the JX1-gated sweep did NOT use:
+// that sweep carried Tegra186/194's flat `DC_*` geometry (four head banks at 0x10000 stride, six
+// windows per head at 0x2800 + 0xC00*win) and its very first read, `head+0x0 win0 WIN_OPTIONS`
+// @+0x2e00, was EL3-FATAL (SError ESR 0xbe000011, BL31 "Unhandled Exception in EL3") even though
+// +0x2e00 is INSIDE the DTB-declared `size=0xeffff`. NOT ONE T194 offset is resurrected here.
+//
+// WHY THIS IS NOT A SWEEP AT ALL, which is the substantive design change. On NVD_40 the per-window
+// and per-head surface state is NOT MMIO. It is pushed through a CHANNEL as methods — `NVC67D_UPDATE`
+// at method offset 0x00000200, `NVC67D_WINDOW_SET_CONTROL(a)` at 0x00001000 + a*0x80 with its
+// `OWNER` field naming the head (NVIDIA/open-gpu-kernel-modules `clc67d.h`, MIT) — and the ARM/ASSY
+// pair that a save/restore would want is read back THROUGH that channel's pushbuffer/PIO region, not
+// out of the FE register block. There is no FE-level register that spells a window's START_ADDR.
+// This rung therefore does NOT try: it reads the FE block's own CHANNEL STATE, which is the honest
+// FE-level answer to "what did the firmware leave running, and is anything of ours allowed near it".
+//
+// AND IT OPENS NO CHANNEL. `FE_CHNCTL_CORE` bit 5 says the core channel is EFI-owned; taking it, or
+// touching any CHNCTL bit, would be a two-writer race against the firmware that is currently feeding
+// the panel this boot's console is on. NOT ONE REGISTER IS WRITTEN by this rung — every offset below
+// is documented `R--4R`/`R--4A` (read-only) except the two `CHNCTL` words, which are read, not written.
+//
+// THE OFFSETS, all quoted from NVIDIA/open-gpu-doc (MIT), `manuals/ampere/ga102/
+// dev_display_withoffset.ref.txt`, NV_PDISP-relative == "withoffset" address minus 0x610000:
+//
+//   +0x00018  NV_PDISP_FE_IP_VER              0x00610018  DEV 7:0, ECO 15:8, MINOR 23:16, MAJOR 31:24
+//   +0x00068  NV_PDISP_FE_HW_LOCK_PIN_CAP     0x00610068  FLIP_LOCK_PINS 3:0, SCAN_LOCK_PINS 7:4,
+//                                                         STEREO_PINS 11:8
+//   +0x00074  NV_PDISP_FE_MISC_CONFIGA        0x00610074  NUM_HEADS 3:0, NUM_SORS 11:8,
+//                                                         NUM_WINDOWS 25:20   <== SECOND CENSUS
+//   +0x004E0  NV_PDISP_FE_CHNCTL_CORE         0x006104E0  (re-read; decoded by JD1-DC-MODEL)
+//   +0x004E4  NV_PDISP_FE_CHNCTL_WIN(i)       0x006104E4+i*4   __SIZE_1 = 32
+//   +0x00630  NV_PDISP_FE_CHNSTATUS_CORE      0x00610630  STG1_STATE 3:0, STG2_STATE 7:4,
+//                                                         STATE 20:16, FIRSTTIME 24, METHOD_FIFO 25,
+//                                                         READ_PENDING 26, NOTIF_WRITE_PENDING 27,
+//                                                         SUBDEVICE_STATUS 29, QUIESCENT 30,
+//                                                         METHOD_EXEC 31          <== THE RUNG'S POINT
+//   +0x00664  NV_PDISP_FE_CHNSTATUS_WIN(i)    0x00610664+i*4   __SIZE_1 = 32
+//   +0x006E4  NV_PDISP_FE_CHNSTATUS_WINIM(i)  0x006106E4+i*4   __SIZE_1 = 32
+//   +0x00784  NV_PDISP_FE_CHNSTATUS_CURS(i)   0x00610784+i*4   __SIZE_1 = 8
+//   +0x01C00  NV_PDISP_FE_RM_INTR_STAT_HEAD_TIMING(i)  0x00611C00+i*4  __SIZE_1 = 8
+//   +0x01C24  NV_PDISP_FE_RM_INTR_STAT_EXC_WIN         0x00611C24
+//   +0x01C28  NV_PDISP_FE_RM_INTR_STAT_EXC_WINIM       0x00611C28
+//   +0x01C2C  NV_PDISP_FE_RM_INTR_STAT_EXC_OTHER       0x00611C2C
+//   +0x01C30  NV_PDISP_FE_RM_INTR_STAT_CTRL_DISP       0x00611C30
+//   +0x01C34  NV_PDISP_FE_RM_INTR_STAT_OR              0x00611C34
+//
+// READ ORDER IS A RISK ORDER, deliberately. `CHNSTATUS_CORE` and the three capability words share
+// page 0x610000 with the four offsets boot7f already proved answer, so they go first and cheapest.
+// The `RM_INTR_STAT` block at +0x01C00 is a DIFFERENT 4 KiB page that NOTHING has yet touched on
+// this silicon, so it goes LAST: if that page is the one the fabric refuses, everything above it is
+// already on the wire and the capture is still worth a boot. JX1 is the whole argument for this —
+// in-aperture is NOT the same as decodable, and only ordering decides what survives being wrong.
+//
+// FIRST-TOUCH DISCIPLINE, KEPT VERBATIM FROM JX1. Every read announces the exact register name,
+// array index and absolute address BEFORE the load and prints the value after. Silence between the
+// two convicts that read by name, which is what turned JX1 into one boot instead of a bisect. The
+// bound is always the DTB-declared `size`, never a hardcoded 0xEFFFF. A refused read prints its own
+// `OUTOFAPERTURE` line and the decode below simply does not run — an absent decode line is never
+// silently confused with a zero value.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// JX2-NVC67D: one bounded, announced, read-only 32-bit MMIO read.
+///
+/// `idx` is the array subscript for the `(i)`-indexed registers and `-1` for the scalar ones, so the
+/// announce line names the exact element and not merely the family — `CHNSTATUS_WIN` is four
+/// registers and "which one killed the boot" has to be answerable from the last line on the wire.
+///
+/// `None` = the offset lies outside the DTB-declared aperture and NOTHING was read.
+#[cfg(feature = "jd1dc")]
+#[inline(never)]
+fn jx2_read(base: u64, size: u64, off: u64, name: &str, idx: i32) -> Option<u32> {
+    if off.saturating_add(4) > size {
+        serial_println!(
+            ":: tegra: JX2-NVC67D OUTOFAPERTURE: {} index={} @+{:#x} needs 4 bytes and the display@ node declares reg size={:#x}; that read would leave the DTB-declared aperture, so it was NOT performed and this register is UNKNOWN this boot ::",
+            name,
+            idx,
+            off,
+            size,
+        );
+        return None;
+    }
+    serial_println!(
+        ":: tegra: JX2-NVC67D NEXTTOUCH: about to read {} index={} @{:#x} (read-only; this rung issues no MMIO write of any kind and opens no display channel). If this is the LAST line on the wire, THAT read was EL3-fatal (JX1 class: SError ESR 0xbe000011, EC=0x2F, BL31 'Unhandled Exception in EL3') and the boot ended inside it ::",
+        name,
+        idx,
+        base + off,
+    );
+    let v = unsafe { core::ptr::read_volatile((base + off) as *const u32) };
+    serial_println!(
+        ":: tegra: JX2-NVC67D READSURVIVED: {} index={} @{:#x} = {:#010x} ::",
+        name,
+        idx,
+        base + off,
+        v,
+    );
+    Some(v)
+}
+
+/// JX2-NVC67D: `NV_PDISP_FE_CHNSTATUS_CORE_STATE` (20:16). Enum quoted verbatim from
+/// NVIDIA/open-gpu-doc `manuals/ampere/ga102/dev_display_withoffset.ref.txt`.
+#[cfg(feature = "jd1dc")]
+fn jx2_core_state(s: u32) -> &'static str {
+    match s {
+        0x00 => "DEALLOC",
+        0x01 => "DEALLOC_LIMBO",
+        0x02 => "VBIOS_INIT1",
+        0x03 => "VBIOS_INIT2",
+        0x04 => "VBIOS_OPERATION",
+        0x05 => "EFI_INIT1",
+        0x06 => "EFI_INIT2",
+        0x07 => "EFI_OPERATION",
+        0x08 => "UNCONNECTED",
+        0x09 => "INIT1",
+        0x0A => "INIT2",
+        0x0B => "IDLE",
+        0x0C => "BUSY",
+        0x0D => "SHUTDOWN1",
+        0x0E => "SHUTDOWN2",
+        _ => "NOT-A-DOCUMENTED-STATE (ga102 defines 0x0..0xE only; a value above that is evidence about the offset, not about the channel)",
+    }
+}
+
+/// JX2-NVC67D: `NV_PDISP_FE_CHNSTATUS_WIN_STATE` / `..._WINIM_STATE` (19:16), same enum for both.
+#[cfg(feature = "jd1dc")]
+fn jx2_win_state(s: u32) -> &'static str {
+    match s {
+        0x0 => "DEALLOC",
+        0x1 => "UNCONNECTED",
+        0x2 => "INIT1",
+        0x3 => "INIT2",
+        0x4 => "IDLE",
+        0x5 => "BUSY",
+        0x6 => "SHUTDOWN1",
+        0x7 => "SHUTDOWN2",
+        _ => "NOT-A-DOCUMENTED-STATE",
+    }
+}
+
+/// JX2-NVC67D: `NV_PDISP_FE_CHNSTATUS_WIN_UPD_STATE` (11:8) — where an in-flight `UPDATE` is parked.
+#[cfg(feature = "jd1dc")]
+fn jx2_upd_state(s: u32) -> &'static str {
+    match s {
+        0x0 => "INIT",
+        0x1 => "IDLE",
+        0x2 => "WAIT_BLOCK",
+        0x3 => "WAIT_MPI",
+        0x4 => "WAIT_ILK_PH_1",
+        0x5 => "WAIT_STATE_ERRCHK",
+        0x6 => "WAIT_RDY_TO_FLIP",
+        0x7 => "WAIT_ILK_PH_2",
+        0x8 => "CHECK_PEND_LOADV",
+        0x9 => "SEND_UPD",
+        0xA => "WAIT_PRM",
+        0xB => "EXCEPTION",
+        0xC => "WAIT_ILK_ABORT",
+        _ => "NOT-A-DOCUMENTED-STATE",
+    }
+}
+
+/// JX2-NVC67D: the NVC67D-correct read-only channel-state probe.
+///
+/// Called from the same place, and under the same BPMP `MRQ_PG GET_STATE` power guard, as
+/// [`jd1_dc_model`] — i.e. only after the display@ power domains are known ON and only after the
+/// aperture's first read is known non-fatal. Supersedes the JX1-gated Tegra194 window sweep, which
+/// is left in place above (gated to an empty slice) because it is the record of why this exists.
+///
+/// Emits exactly one `JX2-VERDICT=` line, on an axis ORTHOGONAL to both `JD1-DC VERDICT=`
+/// (reachability) and `MODEL-VERDICT=` (which register map). This one answers: **what state did the
+/// firmware leave the display channels in, and does the FE block agree that a scanout is running.**
+///
+/// * `JX2-VERDICT=REFUSED` — the DTB aperture held none of this rung's offsets; nothing was read.
+/// * `JX2-VERDICT=NOT-DECODING` — every read returned `0x00000000` or `0xFFFFFFFF`. A finding about
+///   our access path, NOT about the silicon: boot7f read four non-trivial words out of this aperture.
+/// * `JX2-VERDICT=CORE-NOT-READ` — other reads answered but `CHNSTATUS_CORE` itself was refused.
+/// * `JX2-VERDICT=EFI-OWNED-LIVE` — core channel `STATE` is one of `EFI_INIT1`/`EFI_INIT2`/
+///   `EFI_OPERATION`, which corroborates `CHNCTL_CORE` bit 5 from the far side of the block: the
+///   firmware still owns the scanout and any takeover must displace it deliberately, not by accident.
+/// * `JX2-VERDICT=NOT-EFI-OWNED` — `STATE` is something else, named in the line. This is the case
+///   that would change the display arc's plan, so it is reported separately rather than folded in.
+#[cfg(feature = "jd1dc")]
+fn jx2_nvc67d_status(base: u64, size: u64) {
+    const OFF_IP_VER: u64 = 0x0000_0018;
+    const OFF_HW_LOCK_PIN_CAP: u64 = 0x0000_0068;
+    const OFF_MISC_CONFIGA: u64 = 0x0000_0074;
+    const OFF_CHNCTL_CORE: u64 = 0x0000_04E0;
+    const OFF_CHNCTL_WIN: u64 = 0x0000_04E4;
+    const OFF_CHNSTATUS_CORE: u64 = 0x0000_0630;
+    const OFF_CHNSTATUS_WIN: u64 = 0x0000_0664;
+    const OFF_CHNSTATUS_WINIM: u64 = 0x0000_06E4;
+    const OFF_CHNSTATUS_CURS: u64 = 0x0000_0784;
+    const OFF_INTR_HEAD_TIMING: u64 = 0x0000_1C00;
+    // Every bit CHNCTL_WIN has a documented field for on ga102 — ALLOCATION 0, CONNECTION 1,
+    // IN_ORDER 2, PUTPTR_WRITE 4, SKIP_SYNCPOINT 6, IGNORE_TIMESTAMP 7, IGNORE_PI 8, SKIP_NOTIF 9,
+    // SKIP_SEMA 10, IGNORE_INTERLOCK 11, TRASH_MODE 14:13.
+    const CHNCTL_WIN_DOCUMENTED: u32 = 0x6FD7;
+    // `__SIZE_1` caps from the manual, so a corrupt census can never walk this rung off the end of
+    // the register file: WIN/WINIM are 32 deep, CURS and HEAD_TIMING are 8 deep. The extra clamp to
+    // 8 windows is ours — this part has four, and a census claiming 32 is itself the finding.
+    const MAX_WIN: u32 = 8;
+    const MAX_HEAD: u32 = 8;
+
+    serial_println!(
+        ":: tegra: JX2-NVC67D RUNG-BEGIN — read-only NVC67D channel-state probe, superseding the JX1-gated Tegra194 window sweep. boot7f settled the map (FE_CLASSES=0xc6700410 -> NVD_40 / class NVC67D, Ampere ga10x), so these offsets come from NVIDIA/open-gpu-doc manuals/ampere/ga102/dev_display_withoffset.ref.txt, NOT from Linux drm/tegra hub.c. NVD_40 window surface state is CHANNEL state (NVC67D_UPDATE @ method 0x200, clc67d.h), not MMIO, so there is nothing here to sweep — what the FE block CAN answer is which channels the firmware left alive, and that is all this rung asks. NOT ONE REGISTER IS WRITTEN and NO CHANNEL IS OPENED: FE_CHNCTL_CORE bit 5 says the core channel is EFI-owned and it is feeding the panel this console is on ::"
+    );
+
+    let mut reads = 0u32;
+    let mut nontrivial = 0u32;
+    let mut rd = |off: u64, name: &str, idx: i32| -> Option<u32> {
+        let r = jx2_read(base, size, off, name, idx);
+        if let Some(v) = r {
+            reads += 1;
+            if v != 0 && v != 0xFFFF_FFFF {
+                nontrivial += 1;
+            }
+        }
+        r
+    };
+
+    // ---- 1. THE NAMED NEXT READ. Cheapest, most decisive, same page as everything boot7f proved. --
+    let core_st = rd(OFF_CHNSTATUS_CORE, "NV_PDISP_FE_CHNSTATUS_CORE (+0x00630)", -1);
+    if let Some(v) = core_st {
+        serial_println!(
+            ":: tegra: JX2-NVC67D CORECHN={:#010x}: STATE(20:16)={:#04x} -> {} | STG1_STATE(3:0)={:#03x} STG2_STATE(7:4)={:#03x} FIRSTTIME(24)={} METHOD_FIFO(25)={} READ_PENDING(26)={} NOTIF_WRITE_PENDING(27)={} SUBDEVICE_STATUS(29)={} QUIESCENT(30)={} METHOD_EXEC(31)={} ::",
+            v,
+            (v >> 16) & 0x1F,
+            jx2_core_state((v >> 16) & 0x1F),
+            v & 0xF,
+            (v >> 4) & 0xF,
+            if (v >> 24) & 1 == 1 { "YES" } else { "NO" },
+            if (v >> 25) & 1 == 1 { "NOTEMPTY" } else { "EMPTY" },
+            if (v >> 26) & 1 == 1 { "YES" } else { "NO" },
+            if (v >> 27) & 1 == 1 { "YES" } else { "NO" },
+            if (v >> 29) & 1 == 1 { "ACTIVE" } else { "INACTIVE" },
+            if (v >> 30) & 1 == 1 { "YES" } else { "NO" },
+            if (v >> 31) & 1 == 1 { "RUNNING" } else { "IDLE" },
+        );
+    }
+
+    // ---- 2. CHNCTL_CORE, RE-READ. JD1-DC-MODEL already decoded it field by field a few lines
+    //         earlier; the value is repeated here for ONE reason — it is the pair to the CHNSTATUS
+    //         word above, and a disagreement between "EFI owns it" (CHNCTL bit 5) and "the channel
+    //         is not in an EFI state" (CHNSTATUS STATE) is the single most informative thing this
+    //         rung could find. Re-reading also shows whether the value MOVED across the probe.
+    let core_ctl = rd(OFF_CHNCTL_CORE, "NV_PDISP_FE_CHNCTL_CORE (+0x004e0, re-read)", -1);
+    if let Some(v) = core_ctl {
+        serial_println!(
+            ":: tegra: JX2-NVC67D CORECTL={:#010x}: ALLOCATION(0)={} CONNECTION(1)={} PUTPTR_WRITE(4)={} EFI(5)={} — boot7f measured 0x00000021 here; a DIFFERENT value now means the firmware moved the core channel between JD1-DC-MODEL and this rung, which no read of ours can cause ::",
+            v,
+            v & 1,
+            (v >> 1) & 1,
+            (v >> 4) & 1,
+            (v >> 5) & 1,
+        );
+    }
+
+    // ---- 3. THE SECOND CENSUS. FE_MISC_CONFIGA counts heads/SORs/windows independently of
+    //         FE_HW_SYS_CAP/CAPB, which JD1-DC-MODEL read from the other side of the block. Two
+    //         hardwired census words that DISAGREE would refute the offset, not the hardware — which
+    //         is why the disagreement is called out on the wire instead of one being trusted.
+    let ip_ver = rd(OFF_IP_VER, "NV_PDISP_FE_IP_VER (+0x00018)", -1);
+    if let Some(v) = ip_ver {
+        serial_println!(
+            ":: tegra: JX2-NVC67D IPVER={:#010x}: MAJOR(31:24)={} MINOR(23:16)={} ECO(15:8)={} DEV(7:0)={} — the NVDisplay IP revision, independent of FE_CLASSES; a MAJOR of 4 corroborates NVD_40 from a second hardwired word ::",
+            v,
+            (v >> 24) & 0xFF,
+            (v >> 16) & 0xFF,
+            (v >> 8) & 0xFF,
+            v & 0xFF,
+        );
+    }
+    let cfga = rd(OFF_MISC_CONFIGA, "NV_PDISP_FE_MISC_CONFIGA (+0x00074)", -1);
+    let (n_win, n_head, census_src) = match cfga {
+        Some(v) if v != 0 && v != 0xFFFF_FFFF => {
+            let nh = (v & 0xF).min(MAX_HEAD);
+            let ns = (v >> 8) & 0xF;
+            let nw = ((v >> 20) & 0x3F).min(MAX_WIN);
+            serial_println!(
+                ":: tegra: JX2-NVC67D CENSUS={:#010x}: NUM_HEADS(3:0)={} NUM_SORS(11:8)={} NUM_WINDOWS(25:20)={} — boot7f's OTHER census, FE_HW_SYS_CAP=0x00100303 / FE_HW_SYS_CAPB=0x0000000f, said 2 heads / 2 SORs / 4 windows. These two words are hardwired and must agree; if they do not, ONE of the two offsets is not the register this rung thinks it is, and no head or window count read off this boot may be trusted ::",
+                v,
+                v & 0xF,
+                ns,
+                (v >> 20) & 0x3F,
+            );
+            (
+                if nw == 0 { 4 } else { nw },
+                if nh == 0 { 2 } else { nh },
+                "FE_MISC_CONFIGA (this boot)",
+            )
+        }
+        _ => (
+            4,
+            2,
+            "boot7f fallback (FE_HW_SYS_CAP=0x00100303, FE_HW_SYS_CAPB=0x0000000f) — FE_MISC_CONFIGA was refused or trivial this boot",
+        ),
+    };
+    let lockpin = rd(OFF_HW_LOCK_PIN_CAP, "NV_PDISP_FE_HW_LOCK_PIN_CAP (+0x00068)", -1);
+    if let Some(v) = lockpin {
+        serial_println!(
+            ":: tegra: JX2-NVC67D LOCKPIN={:#010x}: FLIP_LOCK_PINS(3:0)={} SCAN_LOCK_PINS(7:4)={} STEREO_PINS(11:8)={} — the raster-lock pin census. Read here only because it is another hardwired capability word on a page already proven to answer, so a trivial value is a cheap independent check on the access path ::",
+            v,
+            v & 0xF,
+            (v >> 4) & 0xF,
+            (v >> 8) & 0xF,
+        );
+    }
+
+    serial_println!(
+        ":: tegra: JX2-NVC67D WALK — {} window channel(s) and {} head(s); source of those counts: {}. Manual caps: CHNSTATUS_WIN/WINIM __SIZE_1=32, CHNSTATUS_CURS and RM_INTR_STAT_HEAD_TIMING __SIZE_1=8, and this rung clamps to 8 of each on top ::",
+        n_win,
+        n_head,
+        census_src,
+    );
+
+    // ---- 4. THE WINDOW CHANNELS. This is the T194 sweep's question asked in the right register
+    //         model: not "what surface is window N showing" (that is channel state, unreachable from
+    //         here without taking a channel we must not take) but "does window channel N exist, is it
+    //         allocated, and is its state machine parked or running".
+    for w in 0..n_win as u64 {
+        let ctl = rd(
+            OFF_CHNCTL_WIN + w * 4,
+            "NV_PDISP_FE_CHNCTL_WIN(i) (+0x004e4 + i*4)",
+            w as i32,
+        );
+        if let Some(v) = ctl {
+            let undoc = v & !CHNCTL_WIN_DOCUMENTED;
+            serial_println!(
+                ":: tegra: JX2-NVC67D WINCTL={:#010x} win={}: ALLOCATION(0)={} CONNECTION(1)={} IN_ORDER(2)={} PUTPTR_WRITE(4)={} SKIP_SYNCPOINT(6)={} IGNORE_TIMESTAMP(7)={} IGNORE_PI(8)={} SKIP_NOTIF(9)={} SKIP_SEMA(10)={} IGNORE_INTERLOCK(11)={} TRASH_MODE(14:13)={} undocumented-bits={:#010x}{} — NOTE there is NO owner field here: on NVC67D a window's head is set by the CORE channel method NVC67D_WINDOW_SET_CONTROL(a)_OWNER (clc67d.h), so window-to-head binding is NOT readable from the FE block and this rung does not pretend to report it ::",
+                v,
+                w,
+                v & 1,
+                (v >> 1) & 1,
+                (v >> 2) & 1,
+                (v >> 4) & 1,
+                (v >> 6) & 1,
+                (v >> 7) & 1,
+                (v >> 8) & 1,
+                (v >> 9) & 1,
+                (v >> 10) & 1,
+                (v >> 11) & 1,
+                (v >> 13) & 3,
+                undoc,
+                if undoc != 0 { " | SUSPECT: bits outside every documented ga102 field are set — either this offset is not CHNCTL_WIN, or NVD_40 defines fields the ga102 manual does not" } else { "" },
+            );
+        }
+        let st = rd(
+            OFF_CHNSTATUS_WIN + w * 4,
+            "NV_PDISP_FE_CHNSTATUS_WIN(i) (+0x00664 + i*4)",
+            w as i32,
+        );
+        if let Some(v) = st {
+            serial_println!(
+                ":: tegra: JX2-NVC67D WINCHN={:#010x} win={}: STATE(19:16)={:#03x} -> {} | UPD_STATE(11:8)={:#03x} -> {} | STG1(3:0)={:#03x} STG2(7:4)={:#03x} FIRSTTIME(24)={} METHOD_FIFO(25)={} READ_PENDING(26)={} WRITE_PENDING(27)={} SUBDEVICE_STATUS(29)={} QUIESCENT(30)={} METHOD_EXEC(31)={} ::",
+                v,
+                w,
+                (v >> 16) & 0xF,
+                jx2_win_state((v >> 16) & 0xF),
+                (v >> 8) & 0xF,
+                jx2_upd_state((v >> 8) & 0xF),
+                v & 0xF,
+                (v >> 4) & 0xF,
+                if (v >> 24) & 1 == 1 { "YES" } else { "NO" },
+                if (v >> 25) & 1 == 1 { "NOTEMPTY" } else { "EMPTY" },
+                if (v >> 26) & 1 == 1 { "YES" } else { "NO" },
+                if (v >> 27) & 1 == 1 { "YES" } else { "NO" },
+                if (v >> 29) & 1 == 1 { "ACTIVE" } else { "INACTIVE" },
+                if (v >> 30) & 1 == 1 { "YES" } else { "NO" },
+                if (v >> 31) & 1 == 1 { "RUNNING" } else { "IDLE" },
+            );
+        }
+        let im = rd(
+            OFF_CHNSTATUS_WINIM + w * 4,
+            "NV_PDISP_FE_CHNSTATUS_WINIM(i) (+0x006e4 + i*4)",
+            w as i32,
+        );
+        if let Some(v) = im {
+            serial_println!(
+                ":: tegra: JX2-NVC67D WINIMCHN={:#010x} win={}: STATE(19:16)={:#03x} -> {} | MP_STATE(3:0)={:#03x} FIRSTTIME(24)={} METHOD_FIFO(25)={} READ_PENDING(26)={} WRITE_PENDING(27)={} SUBDEVICE_STATUS(29)={} QUIESCENT(30)={} METHOD_EXEC(31)={} — the window IMMEDIATE channel, the low-latency sibling of the window channel above; same STATE enum ::",
+                v,
+                w,
+                (v >> 16) & 0xF,
+                jx2_win_state((v >> 16) & 0xF),
+                v & 0xF,
+                if (v >> 24) & 1 == 1 { "YES" } else { "NO" },
+                if (v >> 25) & 1 == 1 { "NOTEMPTY" } else { "EMPTY" },
+                if (v >> 26) & 1 == 1 { "YES" } else { "NO" },
+                if (v >> 27) & 1 == 1 { "YES" } else { "NO" },
+                if (v >> 29) & 1 == 1 { "ACTIVE" } else { "INACTIVE" },
+                if (v >> 30) & 1 == 1 { "YES" } else { "NO" },
+                if (v >> 31) & 1 == 1 { "RUNNING" } else { "IDLE" },
+            );
+        }
+    }
+
+    // ---- 5. THE CURSOR CHANNELS, one per head. Narrower field set than WIN: STATE is 18:16 here,
+    //         three bits, not four — the manual's own layout, not a typo carried over.
+    for h in 0..n_head as u64 {
+        let cu = rd(
+            OFF_CHNSTATUS_CURS + h * 4,
+            "NV_PDISP_FE_CHNSTATUS_CURS(i) (+0x00784 + i*4)",
+            h as i32,
+        );
+        if let Some(v) = cu {
+            serial_println!(
+                ":: tegra: JX2-NVC67D CURSCHN={:#010x} head={}: STATE(18:16)={:#03x} -> {} | MP_STATE(3:0)={:#03x} FIRSTTIME(24)={} METHOD_EXEC(31)={} — ga102 documents only DEALLOC(0), INIT1(2), IDLE(4) and BUSY(5) for this field, so a value outside that set is named UNDOCUMENTED rather than guessed ::",
+                v,
+                h,
+                (v >> 16) & 7,
+                match (v >> 16) & 7 {
+                    0 => "DEALLOC",
+                    2 => "INIT1",
+                    4 => "IDLE",
+                    5 => "BUSY",
+                    _ => "NOT-A-DOCUMENTED-STATE",
+                },
+                v & 0xF,
+                if (v >> 24) & 1 == 1 { "YES" } else { "NO" },
+                if (v >> 31) & 1 == 1 { "RUNNING" } else { "IDLE" },
+            );
+        }
+    }
+
+    // ---- 6. LAST, AND ON PURPOSE: the +0x01C00 interrupt-status page. A DIFFERENT 4 KiB page from
+    //         every offset above and from every offset boot7f proved, so it carries the JX1 risk that
+    //         "inside the DTB aperture" does not retire. Everything of value is already on the wire
+    //         by the time this runs. HEAD_TIMING is the prize: LOADV/LAST_DATA/VBLANK latched on a
+    //         head is the FE block agreeing that a raster is actually running on it.
+    for h in 0..n_head as u64 {
+        let t = rd(
+            OFF_INTR_HEAD_TIMING + h * 4,
+            "NV_PDISP_FE_RM_INTR_STAT_HEAD_TIMING(i) (+0x01c00 + i*4, FIRST TOUCH OF THE 0x611xxx PAGE)",
+            h as i32,
+        );
+        if let Some(v) = t {
+            serial_println!(
+                ":: tegra: JX2-NVC67D HEADTIMING={:#010x} head={}: LOADV(0)={} LAST_DATA(1)={} VBLANK(2)={} VACTIVE_SPACE_VBLANK(3)={} RG_STALL(4)={} RG_LINE_A(5)={} RG_LINE_B(6)={} SEC_POLICY(8)={} — these are LATCHED status bits, read-only (R--4R) and NOT cleared by this rung. A head with VBLANK or LAST_DATA latched is a head the raster generator has been running on since the last clear, which corroborates the inherited scanout from the display block rather than from the framebuffer ::",
+                v,
+                h,
+                v & 1,
+                (v >> 1) & 1,
+                (v >> 2) & 1,
+                (v >> 3) & 1,
+                (v >> 4) & 1,
+                (v >> 5) & 1,
+                (v >> 6) & 1,
+                (v >> 8) & 1,
+            );
+        }
+    }
+    for &(off, full, short) in &[
+        (
+            0x0000_1C24u64,
+            "NV_PDISP_FE_RM_INTR_STAT_EXC_WIN (+0x01c24)",
+            "EXC_WIN (per-window-channel exception, bit i = window channel i)",
+        ),
+        (
+            0x0000_1C28u64,
+            "NV_PDISP_FE_RM_INTR_STAT_EXC_WINIM (+0x01c28)",
+            "EXC_WINIM (per-window-immediate-channel exception)",
+        ),
+        (
+            0x0000_1C2Cu64,
+            "NV_PDISP_FE_RM_INTR_STAT_EXC_OTHER (+0x01c2c)",
+            "EXC_OTHER (core and cursor channel exceptions)",
+        ),
+        (
+            0x0000_1C30u64,
+            "NV_PDISP_FE_RM_INTR_STAT_CTRL_DISP (+0x01c30)",
+            "CTRL_DISP (display controller level events)",
+        ),
+        (
+            0x0000_1C34u64,
+            "NV_PDISP_FE_RM_INTR_STAT_OR (+0x01c34)",
+            "OR (output resource / SOR level events)",
+        ),
+    ] {
+        if let Some(v) = rd(off, full, -1) {
+            serial_println!(
+                ":: tegra: JX2-NVC67D INTRSTAT={:#010x} reg={} — raw, undecoded per bit on purpose: what matters at this rung is whether ANY exception is latched on a channel the firmware owns. Nonzero here alongside a healthy CHNSTATUS means something already went wrong on that channel before we arrived, and it was not us ::",
+                v,
+                short,
+            );
+        }
+    }
+
+    // ---- 7. THE VERDICT: exactly one line, on the channel-state axis ----
+    if reads == 0 {
+        serial_println!(
+            ":: tegra: JX2-NVC67D JX2-VERDICT=REFUSED reason=no-reads — every offset this rung wanted lay outside the display@ node's declared reg size ({:#x}); NOT ONE register was read and the channel state is UNDETERMINED this boot. This does NOT mean the block is dead — it means the DTB gave us less aperture than the smallest of these offsets needs ::",
+            size,
+        );
+        return;
+    }
+    if nontrivial == 0 {
+        serial_println!(
+            ":: tegra: JX2-NVC67D JX2-VERDICT=NOT-DECODING — all {} read(s) this rung performed returned 0x00000000 or 0xFFFFFFFF. WHAT THIS DOES NOT MEAN: boot7f read four non-trivial words out of this same aperture in the same boot flow, so this is not evidence that the block is unreachable. It is a finding about OUR access path at THIS point in the boot — and note that an all-zero CHNSTATUS set is ALSO the legitimate reading of 'every channel is in DEALLOC or INIT', which is why this verdict refuses to choose between the two ::",
+            reads,
+        );
+        return;
+    }
+    let Some(cs) = core_st else {
+        serial_println!(
+            ":: tegra: JX2-NVC67D JX2-VERDICT=CORE-NOT-READ — the aperture ANSWERS ({} of {} reads came back non-trivial) but NV_PDISP_FE_CHNSTATUS_CORE @+0x00630 was outside the declared reg size ({:#x}) and was NEVER FETCHED. Whatever the window and head lines above showed, no claim about who owns the core channel may be read off this boot ::",
+            nontrivial,
+            reads,
+            size,
+        );
+        return;
+    };
+    let state = (cs >> 16) & 0x1F;
+    if matches!(state, 0x05 | 0x06 | 0x07) {
+        serial_println!(
+            ":: tegra: JX2-NVC67D JX2-VERDICT=EFI-OWNED-LIVE — CHNSTATUS_CORE={:#010x}, STATE={:#04x} -> {}. The core channel is in a firmware-owned state, which corroborates FE_CHNCTL_CORE bit 5 (EFI=1) from the opposite side of the block: two independent registers agreeing that the firmware still drives this display. CONSEQUENCE: the inherited scanout JD1 is drawing into is presented by a channel WE DO NOT OWN, so the next display rung is a deliberate handoff — allocate our own window channel and bind it with NVC67D_WINDOW_SET_CONTROL_OWNER through a core channel we have taken — never an opportunistic MMIO poke. WHAT THIS DOES NOT MEAN: it does not say the handoff will work, only that nothing is currently free for the taking ::",
+            cs,
+            state,
+            jx2_core_state(state),
+        );
+    } else {
+        serial_println!(
+            ":: tegra: JX2-NVC67D JX2-VERDICT=NOT-EFI-OWNED — CHNSTATUS_CORE={:#010x}, STATE={:#04x} -> {}, which is NOT one of EFI_INIT1, EFI_INIT2 or EFI_OPERATION. Read this against FE_CHNCTL_CORE, whose EFI bit boot7f measured SET: control says the firmware owns the core channel and status says the channel is not in a firmware state. Exactly one of the two is being misread, and the cheapest thing that settles it is the CORECTL line above — if it no longer reads 0x00000021 the firmware moved, and if it does, then this offset or this decode is wrong and the window and head lines above inherit that doubt ::",
+            cs,
+            state,
+            jx2_core_state(state),
+        );
     }
 }
