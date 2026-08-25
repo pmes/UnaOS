@@ -10045,6 +10045,22 @@ static C2_DMG_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 /// area of. Never used as a denominator; it exists so the line can be read against itself.
 #[cfg(feature = "witness")]
 static C2_BOX_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// CHROMEBAND — chrome rows [`fill_rect_ceramic`] actually issued to `fill_rect_v` this span.
+/// Per-pass on the wire (`rows_pp=`), so the number is comparable across spans and geometries: at
+/// 640x480 (one band always) it is simply the chrome row count of the pass's windows; at 1920x1200
+/// pre-CHROMEBAND it was ~3x that, because every band re-issued the whole box's chrome rows and
+/// only the bottom of the call chain threw the out-of-band ones away.
+#[cfg(feature = "witness")]
+static CB_ROWS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// CHROMEBAND — chrome rows issued OUTSIDE `dst`'s own height: per-row work (a ceramic `shade`,
+/// an `encode4`, a call and its bounds checks) paid for a row no byte of which can land. Zero BY
+/// CONSTRUCTION after CHROMEBAND — the loop in [`fill_rect_ceramic`] is clamped to `dst` before it
+/// runs, so this counter's increment is structurally unreachable. That is the point: it is the
+/// tripwire the spec's `waste=[1-9]` FORBID anchors on, and it fires again the moment a future
+/// edit re-opens an unclipped chrome row walk (the defect only a >=1366-wide panel can reach —
+/// QEMU's default 640x480 never bands, which is why it took the bench geometry to see it).
+#[cfg(feature = "witness")]
+static CB_WASTE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// COMP2-WCD — cycles spent inside [`verify_window`] this span: the WC-D witness's glass read-back
 /// (both passes), its attribution walks, its repair redraw and its verdict UART, charged by a drop
 /// guard so every exit path pays. Printed as `wcd_us=`, a TOTAL for the span like `straddle_us`
@@ -10387,6 +10403,28 @@ fn comp2_emit(span: u64) {
         passes.saturating_mul(10_000) / span.max(1) % 10,
         span
     );
+    // CHROMEBAND — the chrome row ledger, on `[comp2]`'s own cadence and beside it deliberately:
+    // `rows_pp` lives inside the `compose_us` term two fields up. A SEPARATE line rather than new
+    // `[comp2]` fields, so no positional harvest of that line moves. `rows_pp` is a per-pass mean
+    // like the line above's `_us` fields; `waste=` is a span TOTAL like `straddle_us`, because it
+    // is an alarm field whose healthy value is exactly zero — post-CHROMEBAND the clamp in
+    // [`fill_rect_ceramic`] makes it zero by construction, the spec REQUIREs the `waste=0` form
+    // and FORBIDs `waste=[1-9]`, and a future unclipped chrome walk reds the battery at ANY
+    // geometry that bands (pre-fix, 1920x1200 read ~3x rows_pp with waste in the thousands while
+    // 640x480 — one band always — was already clean, which is why QEMU's default geometry never
+    // saw the defect). Drained here rather than with the top-of-function sweep: an empty span
+    // accumulates into the next emitting one instead of being discarded, which for a
+    // zero-is-the-contract alarm loses nothing and can only refuse to lose a hit.
+    {
+        let cb_rows = CB_ROWS.swap(0, Relaxed);
+        let cb_waste = CB_WASTE.swap(0, Relaxed);
+        serial_println!(
+            "[chromeband] rollup rows_pp={} waste={} span={}ms",
+            cb_rows / passes,
+            cb_waste,
+            span
+        );
+    }
 }
 
 // ---- FLUID-3 — the vug-side wait ledger ----------------------------------------------------------
@@ -15813,8 +15851,37 @@ fn fill_rect_ceramic(
     if w == 0 {
         return;
     }
-    for j in 0..h {
+    // CHROMEBAND — the row walk is clamped to `dst` ITSELF before it runs, exactly as the content
+    // loop clips its rows to the band (`dy0 >= dh` break / negative-`dy0` skip in `draw_window`).
+    // Chrome never was: this loop walked the WHOLE box height on every call, and on a banded stage
+    // (`dst` is one `chunk_rows`-tall band of the box, WC-M) the out-of-band rows were discarded
+    // only at the bottom of the call chain — `fill_rect_v` for rows above the band, `fill_rect`'s
+    // height clamp below it — after this loop had already paid a ceramic `shade` (table lookup +
+    // three multiplies), a call and its bounds work PER ROW. At 640x480 `chunk_rows` = 1638 covers
+    // any box, one band always, so the clamp below is `0..h` verbatim and this function is
+    // behaviourally what it always was; at 1920x1200 (`chunk_rows` = 546) a full-height window is
+    // three bands and every composite re-walked each chrome rect once per band — ~2,400 wasted
+    // per-row fills per composite inside `[comp2]`'s compose term. The direct (unstaged) path is
+    // also byte-identical in effect: there `dst` is the front framebuffer, and the only rows the
+    // clamp removes are rows `fill_rect` was about to clip against the same `info.height` anyway.
+    //
+    // The pixel set cannot change, only shrink to its landing subset: a removed row is precisely a
+    // row `fill_rect_v`/`fill_rect` would have written no byte of.
+    let dh = dst.info().height as isize;
+    let j0 = if y < 0 { (-y) as usize } else { 0 };
+    let j1 = if dh > y { ((dh - y) as usize).min(h) } else { 0 };
+    for j in j0..j1 {
         let dy = y + j as isize;
+        #[cfg(feature = "witness")]
+        {
+            use core::sync::atomic::Ordering::Relaxed;
+            CB_ROWS.fetch_add(1, Relaxed);
+            // Structurally unreachable under the clamp above — see [`CB_WASTE`] for why the
+            // tripwire is kept live anyway.
+            if dy < 0 || dy >= dh {
+                CB_WASTE.fetch_add(1, Relaxed);
+            }
+        }
         // Rows above the box cannot occur (every chrome rect starts at or below `lby`), but the
         // saturating form keeps the index total rather than relying on that.
         let brow = (dy - lby).max(0) as usize;

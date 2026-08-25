@@ -14278,3 +14278,47 @@ arithmetically-forced `[dragperf] admitted=7` — nothing in the WC-C family, at
 **One flake recorded rather than smoothed over:** the first knob-off capture read 116/117 on
 `VUGSPREAD: floor test — tasks=2 cores-used=1`, a scheduler-spread witness the host's 23-deep run
 queue can starve. Re-run on the same image: 117/117, 0 forbidden.
+
+## CHROMEBAND — chrome row fills clip to the band, like content (aarch64 + x86 `wm`, 2026-08-25)
+
+**The defect is geometry-gated, which is why no QEMU-default gate ever saw it.** A staged present
+whose box exceeds `MAX_STAGE_BYTES` (4 MiB) is banded: `chunk_rows = MAX_STAGE_BYTES / row_bytes`
+whole rows per band (WC-M). At 640x480 (`row_bytes` = 2560) `chunk_rows` = 1638 covers any box —
+one band always, the banded path never entered. At 1920x1200 (`row_bytes` = 7680, pinned by
+`[wc-e] fb-geometry ... pitch=7680B`) `chunk_rows` = 546, so a full-height window is three bands.
+
+`paint_window` runs once per band. The CONTENT loop clips to the band — `dy0 >= dh` breaks, a
+negative `dy0` skips — but the CHROME did not: `fill_rect_ceramic` walked `for j in 0..h` over the
+WHOLE box height on every call, and the out-of-band rows were discarded only at the bottom of the
+call chain (`fill_rect_v` for rows above the band, `fill_rect`'s height clamp below it), after each
+had paid a ceramic `shade` (table lookup + three channel multiplies), an `encode4`, a call and its
+bounds work. Three bands times the box's chrome rows ≈ 2,400 wasted per-row fills per composite on
+a full-height bench window, all inside `[comp2]`'s `compose_us` term. No pixel was ever wrong —
+the waste was pure cost, which is exactly why only a counter could see it.
+
+**The fix is the content loop's own discipline applied to the chrome:** `fill_rect_ceramic` clamps
+its row walk to `dst` itself — `j0 = max(0, -y)`, `j1 = min(h, dst.height - y)` — before it runs.
+The pixel set cannot change, only shrink to its landing subset: every removed row is precisely a
+row the call chain would have written no byte of. Single-band behaviour is `0..h` verbatim (the
+clamp binds only when `dst` is shorter than the box, i.e. only on a banded stage), and the x86
+direct path — where `dst` is the front framebuffer — loses only rows `fill_rect` was about to clip
+against the same `info.height`.
+
+**The wire and the gate.** `[chromeband] rollup rows_pp= waste= span=` prints on `[comp2]`'s
+cadence (witness builds; a separate line, so no positional harvest of `[comp2]` moves): `rows_pp`
+is the per-pass chrome row count, `waste=` the span's rows issued outside the destination — zero BY
+CONSTRUCTION after the clamp, at every geometry, with the increment kept live as a tripwire.
+`pi4-regression.spec` REQUIREs the `waste=0` form and FORBIDs `waste=[1-9]` (§4a-band).
+
+Measured, QEMU raspi4b, `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 210` (this battery
+bands one console present per rollup span — `[wc-h] rollup win=1 ... banded=1 minspan=44`):
+
+* pre-fix (counters armed, clamp off): `[chromeband] rollup rows_pp=590 waste=980 span=2878ms`,
+  and the new spec leg reds on exactly that line — 118/118 required, **1 forbidden**.
+* post-fix, same battery: the matching span reads `rows_pp=590 waste=0`, every other span
+  `waste=0` at both geometries — 118/118, 0 forbidden at 640x480 AND at 1920x1200, with the
+  `[wc-d]` verify checksums green throughout, which is the pixel-identity witness.
+
+Hardware verification at the next arc boundary: on the bench the desktop windows are full-height
+class, so the expected reading is `waste=0` with `rows_pp` well below a pre-fix boot's, inside a
+`compose_us` that P83's ledger can compare across boots.

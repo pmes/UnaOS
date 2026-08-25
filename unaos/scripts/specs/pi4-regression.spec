@@ -576,6 +576,26 @@ REQUIRE \[wc-c\] side-by-side windows=2 drawn=2
 REQUIRE \[wc-d\] verify win=.*bad_cache=0 bad_ram=0.*-> PASS
 FORBID \[wc-d\] verify .*-> FAIL
 
+# --- 4a-band. CHROMEBAND (2026-08-25): chrome row fills are clipped to the band, like content.
+# ---    `fill_rect_ceramic` walked the WHOLE box height on every call; on a banded stage (WC-M,
+# ---    row_bytes past MAX_STAGE_BYTES / box rows) every band re-walked every chrome rect and the
+# ---    out-of-band rows were discarded only at the bottom of the call chain, after paying a
+# ---    ceramic shade + call + bounds work PER ROW. GEOMETRY-GATED DEFECT: 640x480 never bands
+# ---    (chunk_rows=1638 covers any box) so THIS battery could never see it; at 1920x1200
+# ---    (chunk_rows=546) a full-height window is 3 bands and a composite paid ~2,400 wasted
+# ---    per-row fills inside `[comp2] compose_us`. The `[chromeband]` rollup prints on `[comp2]`'s
+# ---    cadence: `rows_pp` is the per-pass chrome row count, `waste=` the span's rows issued
+# ---    outside the destination — zero BY CONSTRUCTION after the clamp, at every geometry, so the
+# ---    pair below holds at 640x480 AND under `UNAOS_FBW=1920 UNAOS_FBH=1200`, and the FORBID is
+# ---    the tripwire that reds ANY banding geometry the moment an unclipped chrome walk returns.
+# ---    Measured pre-fix at 1920x1200: `waste=980` on the banded rollup span (this battery bands
+# ---    one console present per span; a full-height window on the bench pays ~2,400 per
+# ---    composite); post-fix the same span reads `waste=0`, and this leg replayed against the
+# ---    pre-fix capture reds on exactly the FORBID below (118/118, 1 forbidden).
+# ---    Ledger: docs/dev/OS/08_VIDEO/engine.md §CHROMEBAND.
+REQUIRE \[chromeband\] rollup rows_pp=[0-9]+ waste=0
+FORBID \[chromeband\] rollup rows_pp=[0-9]+ waste=[1-9]
+
 # --- 4a-bis. DRAINSTALL (PA38 metal, 2026-08-12): the drain barrier's wait is BOUNDED, and reaching
 # ---    the bound is a FAULT, not a mode. `DrainBarrier::drain` abandons at DRAIN_ABANDON_SPINS and
 # ---    says so; abandoning means a composite may still be blitting from a row the teardown cleared,
