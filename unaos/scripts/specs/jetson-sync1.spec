@@ -18,6 +18,23 @@
 # carries and this spec had never heard of — `[orinwm1]`, `[orinclick]`, `JD1-DC`
 # (both verdict axes) and the always-on `[redzone]` guards — now have rows, all of
 # them OPTIONAL or PENDING. See the BOOT 7e banner below the EL0/IRQEL/SMPMARK blocks.
+#
+# 2026-08-25 (later, exec-spec): the three defects this file used to RECORD under a
+# "KNOWN DEFECTS … DELIBERATELY NOT FIXED" heading are fixed. That heading is gone; each
+# fix is argued where its rows live.
+#   1. `FORBID Serror` could never fire (the kernel emits `SError` / `SERROR`, the match
+#      is case-sensitive). Replaced by two rows keyed on the two FATAL emitters — see
+#      the regression block at the foot for why a `(?i)` fix was rejected as WORSE.
+#   2. Zero `COMPLETE` markers meant a cut capture read FAIL instead of TRUNCATED, on
+#      the one platform whose wire is known-lossy. One marker added; see the COMPLETE
+#      block above the regression block.
+#   3. The `[spin6]` unabsorbed-redzone task drop had no row and matched no default
+#      FORBID, so a boot that LOST a task still scored clean. FORBID added, in the
+#      REDZONE block beside the two OPTIONAL rows it must not be confused with.
+# All three MOVE A COUNT, which is exactly why the previous pass left them: this one was
+# scoped to move them. Required witnesses are unchanged at 13 (a `COMPLETE` is never
+# counted into the tally — mbench.py:176); spec-declared FORBID rows go 5 -> 7, three
+# arrive and the one that could never match is gone.
 
 # --- boot bring-up witnesses (the JD/JB chain — all previously metal-proven) --------
 REQUIRE JD1.*scanout:.*sane=true
@@ -310,11 +327,17 @@ OPTIONAL \[orinwm1\] DECLINE reason=
 #      loop, UNCONDITIONALLY, including and especially when nothing has happened. It is
 #      the routing task printing on its own core off its own counter, so its absence is
 #      a DEAD PUMP — the regression worth advising a promotion for. PENDING.
-#      STATED HOLE: a capture cut inside the first census period carries the arm line
-#      and no census, and nothing in this file can tell that apart from a dead pump,
-#      because this spec declares no `COMPLETE` marker (see KNOWN DEFECTS at the foot).
-#      PENDING never fails a run, so the row is safe either way; the reader checks the
-#      arm line by eye, exactly as for the IRQEL window above.
+#      STATED HOLE, NARROWED BUT NOT CLOSED BY THE `COMPLETE` MARKER ADDED AT THE FOOT
+#      (2026-08-25): a capture cut inside the first census period carries the arm line
+#      and no census, and this file still cannot tell that apart from a dead pump. The
+#      marker does not reach it — it is anchored at `main.rs:2846`'s shell banner, which
+#      is UPSTREAM of the arm line, so a capture that stops between the two reads
+#      "complete" and the missing census reads as a dead pump. Anchoring the marker on
+#      the census instead was considered and REJECTED: the census is `orinclick`-gated,
+#      and a marker that depends on CONFIGURATION would make every unarmed boot report
+#      TRUNCATED — the failure mode the SMPMARK block above argues in full, in the other
+#      verdict. PENDING never fails a run, so the row is safe either way; the reader
+#      checks the arm line by eye, exactly as for the IRQEL window above.
 #   3. THE EDGE LINE (display_tegra.rs:1179) — one per Button event, routed from
 #      main.rs:2852. An UNATTENDED boot prints none, and that is not a fault. OPTIONAL.
 #      Absence here means UNRUN, never failed — the census's `IDLE-NO-CLICKS` is the
@@ -441,41 +464,131 @@ OPTIONAL CAP CROSS-CHECK
 # that WORKED. The overrun was absorbed, the parked frame is intact, the task is
 # resumed, and both emitters are rate-limited to 16 reports. Redding a flight on an
 # absorbed overrun would suppress the one signal telling the next arc which stack to
-# grow. THE UNABSORBED CASE IS A STATED GAP, NOT A COVERED ONE: when the saved SP is
-# outside the task's own stack, sched.rs:5226 prints `[spin6] cpu=<n> REFUSING corrupt
-# switch-in: …` and drops the task — and that line has NO row in this file and is
-# matched by none of mbench's default FORBIDs, so a boot that loses a task that way
-# still scores clean. Checked, not assumed. Left alone here because a FORBID on it
-# would MOVE THE FORBIDDEN COUNT, which this pass is not permitted to do; it is the
-# next seat's call.
+# grow.
 # EM-DASH TRUNCATION: both lines carry an em dash immediately after `task={id}:{name}`,
 # so both patterns stop at `task=` and neither ever contains a multi-byte character.
 OPTIONAL \[redzone\] cpu=[0-9]+ LOW-REDZONE (entered|TRAVERSED) task=
 OPTIONAL \[redzone\] cpu=[0-9]+ HIGH-GUARD entered task=
+# THE UNABSORBED CASE — FORBID, and the kind is the whole point of the row (2026-08-25:
+# this was a STATED GAP in this file until now; a boot that lost a task this way scored
+# clean, checked and not assumed). When the saved SP is outside the task's own stack, or
+# the high guard was TRAVERSED rather than merely entered, `dispatch_next` refuses the
+# switch-in at sched.rs:5228 and DROPS the task. That is categorically NOT the two rows
+# above: those report a guard that WORKED and a task that IS resumed; this one reports a
+# guard that was overrun and a task that no longer exists. It is an invariant break, and
+# it must red the flight.
+# WHY IT NEEDED ITS OWN ROW rather than a default FORBID. mbench's always-on set is
+# `-> FAIL` / `FAIL ::` / `PANIC` (mbench.py:135) and this line carries none of the
+# three — it is `[spin6] cpu=… REFUSING corrupt switch-in: …`. Measured against the
+# whole bench tree, not assumed.
+# THE PATTERN STOPS AT `task=`, WHICH IS DELIBERATE AND BUYS TWO THINGS. (1) Everything
+# after `task={id}:{name}` is an em dash and then prose, and this file never puts a
+# multi-byte character inside a pattern that crosses UARTC. (2) The wording after that
+# point CHANGED — the corpus carries the pre-2026-08 text (`ctx_sp=… outside its stack
+# […] — the parked frame was OVERWRITTEN (neighboring stack overflow?)`) while the
+# current emitter writes `ctx_sp=… vs its stack […) higuard=N — …`. The prefix is
+# identical in both, so this row adjudicates old captures and new ones alike.
+# ARMED, AND THAT IS MEASURED: `[spin6] cpu=` and `REFUSING corrupt switch-in: task=`
+# are each present once in the staged boot7f kernel.elf
+# (`flash/orin/boot7f-nowinsweep-20260825T2034Z-04d46aa/kernel.elf`, read with
+# `LC_ALL=C grep -a -o -F`), so the emitter is linked on a tegra image — `sched.rs:41`
+# sizes the bands in every build and both readers sit on the dispatch path.
+# ZERO FALSE HITS ON THIS BOARD: the pattern takes 0 hits across every Orin/Jetson
+# capture in the bench tree and REAL hits on other platforms — pi4 (`pi3-boot11/
+# boot11.log:7424`, `pi4-pi1-b1/ttyACM0.log:1372`, `pi4-pi0-b1/ttyACM0.log:1324`) and
+# the pi bridge line (`line-acm0/pi.log:6971`, `:10241`, `:21160`). Those hits are what
+# prove the row can fire; the Orin zeroes are what prove arming it costs this lane
+# nothing on a healthy boot.
+FORBID \[spin6\] cpu=[0-9]+ REFUSING corrupt switch-in: task=
 
-# --- KNOWN DEFECTS IN THIS FILE — CONFIRMED 2026-08-25, DELIBERATELY NOT FIXED ------
-# Recorded so the next reader does not re-derive them, and so nobody trusts a green
-# table further than it deserves. Both are pre-existing and both are out of this pass's
-# scope; each needs its own decision, because each MOVES A COUNT.
+# --- COMPLETE: the END-OF-RUN MARKER this file spent its whole life without ----------
+# Until 2026-08-25 this spec declared ZERO `COMPLETE` markers, so mbench's TRUNCATED
+# verdict (rule 2 of `run_verdict`) could never fire for it and a capture cut short read
+# FAIL — a regression — rather than the honest INCONCLUSIVE. That mattered more here
+# than on any other platform: this medium is KNOWN-LOSSY (UARTC is shared with the SPE's
+# TCU), so a short capture is the ordinary case, not the exotic one.
 #
-#   1. `FORBID Serror` (below) CAN NEVER FIRE. The kernel emits `SError` and `SERROR`
-#      — the staged kernel.elf carries `SError` x2 and `SERROR` x6 and the literal
-#      `Serror` ZERO times — and mbench compiles every pattern with a bare
-#      `re.compile` (mbench.py:157), no `re.IGNORECASE`. Dates from 18813ed1
-#      (2026-08-18), this file's first commit. Fixing it arms a forbidden pattern that
-#      has never been armed, which is a real change in what this spec asserts.
-#   2. THIS SPEC DECLARES ZERO `COMPLETE` MARKERS, so mbench's TRUNCATED verdict
-#      (rule 2 of `run_verdict`) can never fire for it and a capture cut short reads
-#      FAIL rather than the honest INCONCLUSIVE. That matters more here than on any
-#      other platform: this medium is known-lossy (UARTC shared with the SPE's TCU),
-#      and several instruments added above — the click census, the JD1-DC FIRST TOUCH
-#      pair — are LATE and are exactly the ones a short capture drops.
-#      `pi4-regression.spec` and `x86-witness.spec` each declare 2; the jetson specs
-#      declare none.
+# THE MARKER IS THE LAST STRUCTURAL LINE, NEVER A VERDICT — the rule
+# `pi4-regression.spec:96` states and the reason there is only one row here. `main.rs:2846`
+# prints the shell banner through the JD11 serial sink UNCONDITIONALLY, and only THEN
+# does `match first_key` choose between the two console-ownership arms:
+#   `JD2 … console OWNS the panel …; first key 0x..`   (main.rs:2852 — attended boot)
+#   `JD4 … console OWNS the panel …; screen-on-boot`   (main.rs:2860 — quiescent boot)
+# So the banner is the latest point common to BOTH legitimate exits, and it sits exactly
+# ONE line ahead of `REQUIRE JD4.*console OWNS the panel`, the last REQUIRE in this file
+# in boot order. Every one of the 13 required witnesses is upstream of it.
+#
+# ANCHORING ON JD4 ITSELF WOULD HAVE BEEN THE DEFECT, not the fix: JD4 is a REQUIRE, and
+# a marker pinned to a witness lets a genuine JD4 regression re-badge itself as a short
+# log. The bias runs the other way on purpose — a capture severed in the ONE-line window
+# between the banner and JD4 reports FAIL rather than TRUNCATED, and both are red.
+#
+# MEASURED, NOT ASSUMED. The literal is present once in the staged boot7f kernel.elf and
+# lands verbatim on the wire in all three modern Orin captures, at the same position in
+# the same order (CAPSTONE COMPLETE -> UI1 -> banner -> JD4):
+#   boot7f `capture/line-acm0/orin.log:11422`
+#   boot5c `capture/orin2-boot5c-gui.log:1551`
+#   boot4f `capture/orin2-boot4f.log:1483`
+# The pattern deliberately starts AFTER the em dash in `:: tegra: JD2 — OUT | …`: the
+# fragment below is contiguous ASCII, so a DARKWIN-dropped byte cannot lossy-replace a
+# multi-byte character inside the one line the truncation verdict hangs on.
+COMPLETE JD2: interactive shell on the inherited scanout
 
 # --- regressions that would convict the merge, not the hardware ---------------------
 FORBID PANIC
-FORBID Serror
+# THE TWO SError ROWS THAT REPLACED `FORBID Serror` (2026-08-25). The old row COULD NEVER
+# FIRE and this file said so for a week without arming it: the kernel emits `SError` and
+# `SERROR`, the staged kernel.elf carries `SError` x2 and `SERROR` x6 and the literal
+# `Serror` ZERO times, and mbench compiles every pattern with a bare `re.compile`
+# (mbench.py:157) — no `re.IGNORECASE`, and the spec grammar has no flag directive.
+# Dates from 18813ed1 (2026-08-18), this file's first commit.
+#
+# A CASE-INSENSITIVE FIX WOULD HAVE BEEN WORSE THAN THE DEFECT, AND THAT IS THE WHOLE
+# REASON THESE ARE TWO NARROW ROWS INSTEAD OF ONE `(?i)serror`. Python DOES accept a
+# leading inline `(?i)`, so the loose fix was available and was REJECTED: of the eight
+# `SError`/`SERROR` literals in the staged kernel.elf, exactly TWO are fault text and
+# the others are BENIGN — and one of the benign ones already has an OPTIONAL row in this
+# very file. Measured with `LC_ALL=C grep -a -o -P` over
+# `flash/orin/boot7f-nowinsweep-20260825T2034Z-04d46aa/kernel.elf`:
+#   display_tegra.rs:676 `VERDICT=REFUSED reason=domain-not-on — … (JX1: SError ESR
+#     0xbe000011 …)` — a REFUSAL this spec deliberately scores ◦, not ❌
+#   exceptions.rs:530  `:: SERROR-DRAIN: consumed N latent async abort(s) … — machine
+#     clean ::` — the drain witness, printed when the guard WORKED
+#   sdmmc_tegra.rs:2678 `FWALL: vendor block DISABLED — metal conviction: SError with
+#     clocks proven on …` — a configuration witness
+#   + four `SERROR_DRAIN_*` symbol names, which are not wire text at all
+# `(?i)serror` would red a healthy boot on all three. So the rows key on the FAULT
+# emitters and nothing else.
+#
+# ROW 1 — `aarch64_fault_handler` (exceptions.rs:614), reached from `__vec_serror`
+# (exceptions.rs:371) ONLY after `aarch64_serror_drain_check` declines to consume the
+# abort, i.e. outside an armed drain window. It prints `=== AARCH64 EXCEPTION: {} ===`
+# with `what` = `"SERROR"` (exceptions.rs:687) and then `hlt_loop()`s. Fatal by
+# construction. LINKED ON A TEGRA IMAGE: `main.rs` calls `exceptions::install` on the
+# post-drop path — `REQUIRE IRQEL-RT: EL1 one-shot proof` above already depends on it —
+# and both halves of the line are in the staged kernel.elf (`=== AARCH64 EXCEPTION: `
+# x1, the merged `SYNCHRONOUSFIQSERROREL0-SYNC (no current task` blob x1). The assembled
+# wire form is not a prediction: it appears verbatim, seven times, in three captures
+# already in the bench tree — `capture/pi-r22s2/cu.usbmodem143402.log:96,197,281`,
+# `capture/pi4-p40/cu.usbmodem142402.log:678,1379,2641` and
+# `capture/rmbp-r23s12/cu.usbmodem142402.log:486` (an aarch64 session under a bridge
+# directory named for the other bench; the text is what matters, not the folder).
+# ZERO hits on any Orin/Jetson capture, so arming it costs this lane nothing.
+# The leading `=== ` is left off the pattern on purpose — three punctuation bytes are the
+# cheapest thing on this wire to lose, and the text after them is already unique.
+FORBID AARCH64 EXCEPTION: SERROR
+# ROW 2 — `tegra_fault_handler` (mmu_tegra.rs:1484), the EARLY-boot vectors that own the
+# machine before `exceptions::install` runs. Different printer, different wording, same
+# verdict: it prints `:: tegra: FAULT — entry {idx} ({kind}) ESR=… ::` with `kind` =
+# `"SError"` (mmu_tegra.rs:1491) and then spins forever. A tegra boot can take a fatal
+# SError on EITHER handler depending on WHEN, so one row cannot cover both — that is why
+# there are two and not one alternation.
+# THE PATTERN STARTS AFTER THE EM DASH in `:: tegra: FAULT — entry`, so `entry [0-9]+
+# \(SError\) ESR=` is contiguous ASCII. Both literals are in the staged kernel.elf
+# (`:: tegra: FAULT ` x1 and the merged `…syncIRQFIQSError` blob x1), so this row is
+# ARMED on the image; the `(SError)` and `) ESR=` halves are assembled at runtime, which
+# is why neither the whole line nor a `(SError) ESR=` fragment appears in the .elf.
+FORBID entry [0-9]+ \(SError\) ESR=
 FORBID X200 FLAG
 # The ORIN-SMP-3 park, NAMED rather than inferred. Without it a parked flight reds only as a
 # pile of missing REQUIREs and the operator diagnoses the cause by eye; with it the table
