@@ -4,7 +4,9 @@ Scope: what the window compositor already is on the `hw-jetson` track, what stop
 it reaching the panel, and the commit-sized rungs from here to a real desktop.
 
 **Baseline: `hw-jetson` @ `3dc889e7`**, surveyed and measured 2026-08-22
-(ORINDESK). Companion to [`PARITY.md`](PARITY.md) §8, whose §8.0 headline this
+(ORINDESK). **Flight results folded in 2026-08-25 at `04d46aae`** — boot7f took rungs 0 and 3 to
+metal; see §3.8, which is the load-bearing status update and which the older §1/§3.7/§6/§7 text is
+annotated against wherever it now reads stale. Companion to [`PARITY.md`](PARITY.md) §8, whose §8.0 headline this
 document was written to replace — that section claimed there was no window
 manager on this branch, which was true of its `92997297` baseline and false ever
 since the base sync (`ceaa32b8`, "Merge trunk @ `122ed63e` into hw-jetson — the
@@ -36,10 +38,10 @@ produced the headline this document corrects:
 
 | Component | File | EXISTS | COMPILES (aarch64+`tegra`) | REACHABLE (tegra boot) | PROVEN (Orin metal) |
 | --- | --- | :-: | :-: | :-: | :-: |
-| Window manager core | `video/wm.rs` (20 652 lines) | ✅ | ✅ `video/mod.rs:46` declares `pub mod wm;` **unconditionally** | ⚠️ *trivially* — `main.rs:2026` calls `wm::retile_on_ready()`, which returns 0 on an empty table | ❌ table empty, nothing composited |
-| Compositor staging buffer | `wm::reserve_stage`, `video/mod.rs:278` | ✅ | ✅ | ❌ sole caller is `init_panel`, which the tegra path skips (§3.3) | ❌ |
-| Hit-test / focus primitives | `wm::hit_test` `video/wm.rs:2434`, `wm::focus_changed` `:2514` | ✅ | ✅ — **no `#[cfg]` on either** | ❌ no tegra caller (§3.4) | ❌ |
-| Click router | `arch/aarch64/syscall.rs::wc_click_route` | ✅ | ✅ ungated within its module | ⚠ **has a caller since rung 3, behind `orinclick` (DEFAULT OFF)** — `orin_click` → `bl wc_click_route`, proven by disassembly; unreachable on any default image | ❌ UNFLOWN — no Orin boot has carried the knob |
+| Window manager core | `video/wm.rs` (20 652 lines) | ✅ | ✅ `video/mod.rs:46` declares `pub mod wm;` **unconditionally** | ✅ **non-trivially since boot7f** — one row minted and composited (§3.8); `main.rs:2026`'s `wm::retile_on_ready()` no longer walks an empty table | ✅ **boot7f 2026-08-25**, on the wire: `[orinwm1] … present=Composited -> COMPOSITED` (§3.8). On-glass NOT claimed |
+| Compositor staging buffer | `wm::reserve_stage`, `video/mod.rs:278` | ✅ | ✅ | ✅ **since rung 0** — called on `tegra_early_stop`'s own heap line | ✅ **boot7f**: `stage=4194304` (4 MiB = `MAX_STAGE_BYTES`) on the `[orinwm1]` line |
+| Hit-test / focus primitives | `wm::hit_test` `video/wm.rs:2434`, `wm::focus_changed` `:2514` | ✅ | ✅ — **no `#[cfg]` on either** | ⚠ called only from `orin_click`, i.e. only on a click that has not yet happened (§3.8) | ❌ no click has reached the router |
+| Click router | `arch/aarch64/syscall.rs::wc_click_route` | ✅ | ✅ ungated within its module | ⚠ **has a caller since rung 3, behind `orinclick` (DEFAULT OFF)** — `orin_click` → `bl wc_click_route`, proven by disassembly | ⚠ **FLOWN AND ARMED, ROUTE UNTESTED** — boot7f carried the knob and printed `-> ARMED`, but no click was made (§3.8) |
 | Dock / strip / menubar / crystal | `video/dock.rs`, `strip.rs`, `menubar.rs`, `crystal.rs` | ✅ | ❌ gated `any(all(x86_64, wc), all(aarch64, pidesk))` — `video/mod.rs:97, 105, 115, 125` | ❌ | ❌ |
 | Desktop-ready seam | `video/pidesk.rs` (564 lines) | ✅ | ❌ gated `all(aarch64, pidesk)` — `video/mod.rs:413` | ❌ and structurally unreachable (§3.1, §3.2) | ❌ |
 | Quarry (file browser) | `video/quarry.rs`, `video/quarry/live.rs` | ✅ | ❌ gated as the furniture — `video/mod.rs:441` | ❌ | ❌ |
@@ -50,7 +52,7 @@ produced the headline this document corrects:
 | Cache-clean to PoC | `FrameBuffer::flush_range` (`video/framebuffer.rs`) | ✅ | ✅ | ✅ | ✅ the DCE does not snoop; JD1/JD2 pixels land |
 | Keyboard input | `jd2_console_pump`, `main.rs:2665` | ✅ | ✅ `all(tegra, aarch64)`, `main.rs:2664` | ✅ | ✅ JD2 |
 | Pointer input | same pump | ✅ | ✅ | ✅ | ✅ JD20 |
-| Pointer **routing** | `arch/aarch64/display_tegra.rs::orin_click` (rung 3) | ✅ | ✅ `orinclick` (implies `tegra_el0`) — leg `arm-tegra-orinclick` | ⚠ knob-gated; `main.rs:2852` still logs the button, and now hands the same edge to the router when `orinclick` is on | ❌ UNFLOWN |
+| Pointer **routing** | `arch/aarch64/display_tegra.rs::orin_click` (rung 3) | ✅ | ✅ `orinclick` (implies `tegra_el0`) — leg `arm-tegra-orinclick` | ✅ **reached on boot7f** — the arm line printed from inside the pump; `main.rs:2852` still logs the button and hands the same edge to the router | ⚠ **ARMED, UNTESTED** — boot7f: `[orinclick] … -> ARMED` then 48 consecutive `IDLE-NO-CLICKS` censuses. The instrument is alive; the *route* has no evidence either way (§3.8) |
 
 The three rows that matter most:
 
@@ -68,6 +70,9 @@ The three rows that matter most:
    metal; the button arm logs and drops. `wm::hit_test` and `wm::focus_changed`
    carry no `#[cfg]` at all — they are already compiled into the Orin kernel and
    waiting for a caller.
+   ⚠ **UPDATED 2026-08-25 (boot7f).** On an `orinclick` image the caller exists and runs: the
+   router armed from inside the pump and the census has been printing ever since. What is still
+   missing is not a caller but an *event* — nobody has clicked on the Orin. See §3.8.
 
 ### §1.1 How the COMPILES column was measured
 
@@ -587,6 +592,11 @@ measurement, not of the code.
 
 ### §3.7 RESOLVED 2026-08-25 (rung 3) — input routing, DEFAULT OFF and UNFLOWN
 
+> ⚠ **STATUS SUPERSEDED the same day — see §3.8.** The "UNFLOWN" in this heading and every
+> "nothing here has run on any board" below describe the arc as it landed. boot7f then flew the
+> knob: the router armed and the census ran for 480 s. What remains unflown is the *click*, not the
+> code. The reasoning in this section is unchanged and still correct; only the status is stale.
+
 **Measured against `088d17c1` (rung 2's tip), not `f0106408`.** This arc opened on `f0106408`;
 rung 2 landed underneath it mid-flight, so every count, hash and gate result below was RE-RUN on
 the new base and the earlier numbers are discarded rather than carried.
@@ -825,6 +835,103 @@ stop-line constant and its doc comment) are line-neutral — **6511 lines either
   survives the console pump's own `Screen`/`pal.render()` blit is an on-glass question this rung
   has not answered and does not claim — see §7.
 
+### §3.8 FLOWN 2026-08-25 (boot7f) — rungs 0 and 3 reach metal: composited, armed, unclicked
+
+The first Orin flight to carry both `orindesk` and `orinclick`. Everything in this section is
+quoted from the bench serial capture `~/unaos-bench/capture/line-acm0/orin.log`; **capture line
+numbers are the primary anchor**, with the flight's boot id beside them, because the serial line is
+lossy and some boots in that file lost their kernel banner to it. boot7f's kernel banner is at
+capture line 11091 and the run's tail is line 11540.
+
+Media: `~/unaos-bench/flash/orin/boot7f-nowinsweep-20260825T2034Z-04d46aa/`. ⚠ That directory's
+`SRC.SHA` records `commit 29a55b9c` / `describe 29a55b9c-dirty` — the commit *before* the one the
+directory name claims. The image bytes carry the JX1 no-winsweep change regardless (proven by its
+own flight and by an artifact grep); it is the label that is wrong, not the kernel.
+
+#### Rung 0 — the first composited window on the Orin
+
+Capture line 11110:
+
+```
+[orinwm1] win=1 panel=1920x1200 surf=640x400 box=650x444 at (635,378) scale=1 stage=4194304 present=Composited -> COMPOSITED
+```
+
+`stage=4194304` closes §3.3 on metal: the compositor's staging buffer **is** allocated on the tegra
+path, at `MAX_STAGE_BYTES`, so no composite falls back to lazy growth. `present=Composited` is
+`present_outcome`'s own return and the trailing verdict is derived from it, so `-> COMPOSITED`
+cannot stand over a `Suppressed` or a `NoRow`.
+
+**The chrome was painted — the "no frame, painter dead-stripped" reading is REFUTED.** The theme
+latched on the same boot four lines earlier, capture line 11106:
+
+```
+[crispy] theme=us-crispy-modern@0787ba9f frame=5 bevel=1 title_h=34 radius=12 ctrl=24 gap=12 …
+```
+
+and the geometry on the `[orinwm1]` line matches those constants exactly: 640x400 of surface becomes
+a 650x444 box — `+2 x BORDER` (5+5) across and `+ TITLE_H + 2 x BORDER` (34+10) down, against
+`video/theme.rs`'s `FRAME = 5` and `TITLE_HEIGHT = 34`. The flown artifact confirms it in the
+codegen: `llvm-objdump -d` on that card's `kernel.elf` shows `video::wm::paint_window` and
+`video::wm::draw_title` each reached by two `bl` sites, so the painter is not merely linked, it is
+called. The open question was never whether the frame was drawn; it is **whether those pixels
+reached the glass**, which no `[orinwm1]` field answers.
+
+#### Rung 3 — the router armed, and then nothing was clicked
+
+Capture line 11424, printed from inside `jd2_console_pump`'s own drain loop:
+
+```
+[orinclick] arm panel=1920x1200 rows=1 compat=0 focus=0x0 pidesk=0 t=31 -> ARMED
+```
+
+`rows=1` is rung 0's window — the `DECLINE reason=no-target` arm §3.7 predicts for an
+`orinclick`-only image did not fire, because `orindesk` put a row on the panel. `pidesk=0` confirms
+the furniture is compiled out, as §3.7's stop-line argument requires.
+
+Then **48 consecutive `IDLE-NO-CLICKS` censuses**, `seq=1` at capture line 11425 through `seq=48` at
+line 11540, every one of the form:
+
+```
+[orinclick] census seq=1 t=71 up=10s btn=0 press=0 rel=0 noedge=0 raised=0 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=1 compat=0 focus=0x0 -> IDLE-NO-CLICKS
+```
+
+`seq` increments by exactly one across all 48, so no census line was lost to the serial; `up=`
+advances 10 s per line, so the drain task stayed alive for the whole 480 s. **This is the census
+doing precisely the job §3.7 built it for**: it proves the routing task is alive and reports
+`btn=0`, i.e. UNRUN — not passing, not failing.
+
+**The click itself is rung 3's open question and it is still open.** Nobody pressed the button on
+this flight, so `wc_click_route` has never been entered on this board and no `[orinclick] edge=…`
+line exists in any capture. Note that the pointer decoder *is* live on the same boot —
+`:: MOUSE-1: 192 reports, last dx=0 dy=1 buttons=0x00 == witness ::` at capture line 11435 — so the
+missing half is a button press, not a working pointer.
+
+#### The display engine, same flight
+
+boot7f also answered the register-model question and confirmed the window sweep must stay gated.
+Those results belong with the rest of the nvdisplay work and are recorded in
+[`../01_BOOT_HAL/arch_arm64.md`](../01_BOOT_HAL/arch_arm64.md), **FLOWN 2026-08-25** at the end of
+the JD1-DC-MODEL section. The two headlines that bear on this ladder:
+
+* `MODEL-VERDICT=NVDISPLAY-CLASS-C670` (capture line 11088) — the aperture is `NV_PDISP` rebased to
+  offset 0, class `NVC67D`, Ampere ga10x: 2 heads, 2 SORs, 4 windows, and
+  `FE_CHNCTL_CORE=0x00000021` says UEFI still owns the core channel. **The window map in this tree
+  was Tegra186/194's and is wrong for this chip.**
+* boot7e, twice, took an EL3 abort (`ESR 0xbe000011`) on the first window-register read at
+  `0x13802e00` — an offset *inside* the DTB-declared aperture. The sweep is gated off at
+  `04d46aae`. No rung on this ladder may reintroduce it against the T194 offsets.
+
+#### What this flight did NOT establish
+
+* **Nothing about the glass.** Every line above is a wire witness. §7's on-glass caveat stands
+  unchanged. The instrument that will answer it (`[orinchrome]`, verdicts `CHROME-ON-GLASS` /
+  `CHROME-PARTIAL` / `CHROME-MISSING` / `COMPOSITE-NOT-ON-GLASS`) landed at `e98d798b`, which is
+  **not an ancestor of `04d46aae`**; the boot7f media predates it and cannot emit those lines.
+* **Nothing about routing.** `-> ARMED` plus 48 `IDLE-NO-CLICKS` is a liveness claim about the
+  instrument, not a claim about `wc_click_route`.
+* **Nothing about stack cost.** `[u7stk]` was not pointed at the click-router depth on this boot;
+  §5's numbers remain Pi numbers.
+
 ---
 
 ## §4 The GA10B boundary — stated once so nobody re-asks
@@ -849,6 +956,24 @@ Two standing prohibitions apply to every rung:
 Mode-set, vsync and multi-head are DC-programming work that does not exist and is
 not required. Vsync-accurate pacing on the DCE stays future work until someone
 proves a safe non-powergated vblank source.
+
+⚠ **UPDATED 2026-08-25 — the second prohibition now has a metal conviction behind it, and a
+sharper reason.** JD1-DC flew on boot7e and boot7f (§3.8). The read-only survey found the
+aperture perfectly readable at the capability registers — the block is **not** powergated — and
+then took an EL3 abort on the first *window* register, `0x13802e00`, an offset **inside** the
+DTB-declared aperture. So on this silicon the hazard is not only "the block may be gated"; it is
+also "a correctly-bounded read of a sub-region the CCPLEX does not decode is EL3-fatal". The window
+sweep is gated off at `04d46aae` and the T194-derived offsets are convicted wrong for this chip
+(`MODEL-VERDICT=NVDISPLAY-CLASS-C670`). Full record:
+[`../01_BOOT_HAL/arch_arm64.md`](../01_BOOT_HAL/arch_arm64.md), **FLOWN 2026-08-25**.
+
+**Provenance for any future nvdisplay work, so the boundary above is not re-litigated.** The
+permissive reference path is NVIDIA/open-gpu-doc (MIT) plus OE4T/nv-kernel-display-driver-source
+(MIT per file), with NVIDIA/open-gpu-kernel-modules (MIT) for cross-checks. GPL Linux sources are
+not used and document the wrong generation anyway — `drm/tegra`'s `of_match` ends at `tegra194`,
+which is exactly the map boot7e disproved. **GA10B GPU-core acceleration remains closed**: its
+microcode is signed and encrypted with boot-ROM-enforced verification, so no permissive path opens
+it. That bounds the GPU only, and this ladder needs none of it.
 
 ---
 
@@ -1004,10 +1129,10 @@ names the seat that owns the files under the parallel-arc rules in `CLAUDE.md`.
 
 | # | Rung | What lands | Metal witness | Lane |
 | --- | --- | --- | --- | --- |
-| **0** | **One composited window** | call `wm::reserve_stage` on the tegra path after heap init (§3.3); mint one `wm` row; present it. No furniture, no `pidesk`, no cascade | one window visible on the Orin panel over the JD2 console; `wm` present counters non-zero on the wire | jetson |
+| **0** | **One composited window** — ✅ **LANDED, and FLOWN 2026-08-25 on the wire** (§3.8) | call `wm::reserve_stage` on the tegra path after heap init (§3.3); mint one `wm` row; present it. No furniture, no `pidesk`, no cascade | **wire half CLOSED**: boot7f, capture line 11110, `[orinwm1] win=1 panel=1920x1200 surf=640x400 box=650x444 at (635,378) scale=1 stage=4194304 present=Composited -> COMPOSITED`. **On-glass half STILL OWED** — no serial line says the box's pixels reached the panel | jetson |
 | **1** | **The cfg leg** — ✅ **LANDED 2026-08-22, less `quarry`** (§3.5.1) | `arm-tegra-desk` leg added (gate 18 → 19 legs); `pidesk`/`quarry`/`livecon` mapped in arroyo's env map; two of the three gate mismatches fixed | `UNAOS_TEGRA=1 ./arroyo check` green 19/19, and green again under `UNAOS_TEGRA_EL0=1 UNAOS_PIDESK=1 UNAOS_LIVECON=1`; the new leg proven to go red on a re-introduced mismatch | jetson (arroyo + `arch/aarch64/syscall.rs`); the `quarry` line is a `video/` edit and is **held** in §3.5.2 |
 | **2** | **The desktop seam** — ✅ **LANDED 2026-08-25, and it REFUSES** (§3.2.1) | `tegradesk` feature + `main.rs::tegra_desk_arm` on `tegra_early_stop`'s terminus line + `UNAOS_TEGRADESK` env map + the `arm-tegra-seam` leg (11 → 12 board legs). The seam evaluates its floors and declines at two named stop-lines | **the floors half is UNFLOWN**: `[deskseam] floors …` + `REFUSE reason=…` print on an armed Orin boot, and nobody has taken one. **The `activate()` half is WITHDRAWN, not owed**: `pidesk::activate()` opens the console window and enables the bar, so running it crosses §6.1 *and* §5.2 — it belongs to rungs 3/5, and this row previously asked for something the same document forbids | jetson |
-| **3** | **Input routing** — ✅ **LANDED 2026-08-25 as a DEFAULT-OFF knob, UNFLOWN** (§3.7) | `orinclick` (implies `tegra_el0`) wires `jd2_console_pump`'s `Event::Button` arm into `wc_click_route` (§3.4) and adds the `[orinclick]` instrument at the tail of `display_tegra.rs`. **⚠ HANDSHAKE WITH RUNG 2, DISCHARGED IN THIS ARC:** `main.rs`'s `TEGRADESK_CLICK_ROUTED` no longer reads `false` — it reads `cfg!(feature = "orinclick")`, **not** a literal `true`, because `tegradesk` does not imply `orinclick` and a hard `true` would assert a route back on an image that has none: the one-way trip re-entered through the constant meant to prevent it. `arm-tegra-seam` now carries `orinclick` so the assertion is type-checked. COMPILES: gate green 21/21 knob off and on; the new `arm-tegra-orinclick` leg proven to go red. NOT run on any board — QEMU models no Tegra234 | metal-owed: a click on the Orin panel raises and focuses a window; `[orinclick] edge=… -> RAISED` plus `[clickroute]` on the wire, and `[orinclick] census … -> IDLE-NO-CLICKS` on a boot where nobody clicked so the absence is readable | jetson |
+| **3** | **Input routing** — ✅ **LANDED 2026-08-25 as a DEFAULT-OFF knob; FLOWN AND ARMED, CLICK UNTESTED** (§3.7, §3.8) | `orinclick` (implies `tegra_el0`) wires `jd2_console_pump`'s `Event::Button` arm into `wc_click_route` (§3.4) and adds the `[orinclick]` instrument at the tail of `display_tegra.rs`. **⚠ HANDSHAKE WITH RUNG 2, DISCHARGED IN THIS ARC:** `main.rs`'s `TEGRADESK_CLICK_ROUTED` no longer reads `false` — it reads `cfg!(feature = "orinclick")`, **not** a literal `true`, because `tegradesk` does not imply `orinclick` and a hard `true` would assert a route back on an image that has none: the one-way trip re-entered through the constant meant to prevent it. `arm-tegra-seam` now carries `orinclick` so the assertion is type-checked. COMPILES: gate green 21/21 knob off and on; the new `arm-tegra-orinclick` leg proven to go red. No gate in this tree can boot it — QEMU models no Tegra234 | ⚠ **PART-DISCHARGED, boot7f 2026-08-25** (§3.8): the knob flew, the router **armed** from inside the pump (`[orinclick] arm panel=1920x1200 rows=1 compat=0 focus=0x0 pidesk=0 t=31 -> ARMED`, capture line 11424) and 48 consecutive `IDLE-NO-CLICKS` censuses proved the routing task alive with `btn=0`. **Still owed: the click.** No `[orinclick] edge=…` line and no `[clickroute]` line exists in any capture, because nobody has pressed the button on this board | jetson |
 | **4** | **Console as a window** | route the JD2 console into a `wm` row; `fbcon::console_is_routed`; skip the handoff detach when routing succeeded | the boot log keeps updating *inside a window*, and the minimise control has somewhere to go back to | jetson |
 | **5** | **The real desktop** | dock, strip, menubar, crystal armed; the full `pidesk` cascade; a tegra `render_service` (§3.6) | the Orin comes up to a desktop | jetson — **blocked by §5.2** |
 | **6** | **EL0 tenants** | user windows from EL0 through `SYS_WIN_*`, on the `tegra_el0` regime | an EL0 program owns a window on the Orin panel | jetson |
@@ -1097,9 +1222,9 @@ half of that law at runtime; the routing half is an ordering obligation on this
 ladder, because no `#[cfg]` can express it.
 
 ⚠ **UPDATED 2026-08-25, and this is a caveat rung 4 must not read past.** Rung 3 has
-LANDED (§3.7) — but as a **default-off knob that no board has run**. The obligation this
-section states is not "rung 3 is committed", it is "clicks actually route on the image the
-console window ships in". Two things follow and neither is optional:
+LANDED (§3.7) — but as a **default-off knob whose routing has never been exercised**. The
+obligation this section states is not "rung 3 is committed", it is "clicks actually route on the
+image the console window ships in". Two things follow and neither is optional:
 
 1. **Rung 4 may not ship a console window on an image where `orinclick` is off.** The knob
    and the console window have to travel together, or the minimise disc is a one-way trip
@@ -1123,21 +1248,33 @@ before rung 2 if the seam is to be type-checked by anything). Rung 5 is gated on
   on a build nobody has booted. **UNFLOWN on Orin metal.** Nothing on this
   branch reaches `pidesk::activate()`; §5.2's stop-line is untouched and is now
   enforced by codegen as well as by source.
-- **Only rung 1 is claimed done, and only as a type-check.** Every PROVEN cell in
-  §1 that is ✅ refers to the JD1/JD2/JD20 panel path, not to the compositor. Rung
-  1's claim is exactly "the armed tegra desktop configuration compiles and a gate
-  leg compiles it" — nothing on this branch arms `pidesk::activate()` at runtime,
-  and §5.2's stop-line is untouched.
-- **Rung 3 is claimed LANDED and COMPILED, and nothing more.** No board has booted
-  an image with `orinclick` set, so every `[orinclick]` verdict in §3.7 is a
-  description of code that has never printed. QEMU models no Tegra234, so no gate
-  in this tree can change that — the witness is metal-owed. In particular: **that a
-  raise reaches the GLASS is NOT claimed.** `focus_changed` ends in `composite()`,
-  which writes the front scanout, while `jd2_console_pump` owns the panel through a
-  double-buffered `Screen` whose `pal.render()` blits the console back buffer over
-  it. Whether the composited z-change survives that blit is unmeasured on this
-  board and is rung-4 territory. The wire evidence and the on-glass evidence are
-  two claims, and only the first is designed for here.
+- **Only rung 1 is claimed done, and only as a type-check.** Rung 1's claim is exactly
+  "the armed tegra desktop configuration compiles and a gate leg compiles it" — nothing
+  on this branch arms `pidesk::activate()` at runtime, and §5.2's stop-line is untouched.
+  ⚠ Corrected 2026-08-25: this bullet used to add "every PROVEN cell in §1 that is ✅
+  refers to the JD1/JD2/JD20 panel path, not to the compositor". That is no longer true —
+  boot7f made the window-manager, staging-buffer and pointer-routing rows PROVEN in their
+  own right (§3.8), and each of those cells names its capture line.
+- **Rung 3 is claimed LANDED, COMPILED and ARMED-ON-METAL — never ROUTING.** ⚠ Updated
+  2026-08-25 by boot7f (§3.8): an Orin boot has now carried `orinclick`, so
+  `[orinclick] … -> ARMED` and `-> IDLE-NO-CLICKS` are lines that have printed, not
+  descriptions of code that has not. **Every other `[orinclick]` verdict is still
+  unprinted.** `wc_click_route` has not been entered on this board — no `edge=` line
+  exists in any capture — so "clicks route on the Orin" remains an unmade measurement,
+  and `IDLE-NO-CLICKS` is explicitly the census's UNRUN verdict, not a pass. In
+  particular: **that a raise reaches the GLASS is NOT claimed.** `focus_changed` ends in
+  `composite()`, which writes the front scanout, while `jd2_console_pump` owns the panel
+  through a double-buffered `Screen` whose `pal.render()` blits the console back buffer
+  over it. Whether the composited z-change survives that blit is unmeasured on this
+  board and is rung-4 territory. The wire evidence and the on-glass evidence are two
+  claims, and only the first is designed for here.
+- **Rung 0 is claimed COMPOSITED ON THE WIRE, not ON THE GLASS.** ⚠ Added 2026-08-25.
+  boot7f's `[orinwm1] … present=Composited -> COMPOSITED` (§3.8) is the compositor's own
+  derived verdict about a pass it ran; it is not a statement that those pixels are
+  visible on the DisplayPort panel, and no field on that line could be. The chrome
+  painter demonstrably ran — `[crispy]` latched four lines above it and `paint_window` /
+  `draw_title` are reachable in the flown artifact — so "the window has no frame" is
+  refuted; "the frame is on the glass" is simply not yet measured here.
 - **The stack cost of the routing path on Orin is unmeasured.** `[u7stk]` exists
   here and `witness`-gates cleanly, and has never been pointed at the click-router
   depth on this board. §5's numbers remain Pi numbers.

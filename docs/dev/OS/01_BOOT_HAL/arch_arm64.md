@@ -9210,6 +9210,31 @@ Cost: **8.3 s** the first time a tree compiles that feature set, **0.06 s** (car
 after — a fully warm `./arroyo check` with all 13 legs is 2.2 s end to end. Leg count 12 → 13;
 `UNAOS_TEGRA=1 ./arroyo check` is green in 16.2 s.
 
+### EL0-EL1CORE on metal (boot7f, 2026-08-25) — `bg` refuses fail-closed instead of killing the board
+
+An EL0 task may only be dispatched from a core that is itself at EL1. On the Orin the boot core is
+the only such core, and `sched.rs` measures that rather than assuming it. boot7f is the first flight
+where the refusal was exercised from the shell.
+
+| capture line | on the wire (quoted) | reading |
+| --- | --- | --- |
+| 11384 | `:: SCHED: [el0core] el1 core MEASURED: cpu=0 mask=0x1 (EL0-EL1CORE) ::` | one core stamped at EL1, `cpu 0`; the mask is measured, not a constant (`arch/aarch64/sched.rs:3209`) |
+| 11492 | `:: tegra: JD2 — OUT \| bg: /fat/vug.elf: no core is at EL1 to host a background EL0 task on this platform (EL0-EL1CORE) ::` | the shell's own refusal text, on the panel and the wire |
+| 11493 | `:: BGRUN: bg /fat/vug.elf — rejected (no core is at EL1 to host a background EL0 task on this platform (EL0-EL1CORE)) ::` | the scheduler-side record of the same rejection |
+| 11407 | `:: SCHED: [el0core] rollup: el0refuse=0 el1cores=0x1 (EL0-EL1CORE) ::` | the rollup, printed before the `bg` attempt |
+
+**The point of the row is what did NOT happen: the board stayed up.** `bg` previously took an EL0
+task to a core that was not at EL1; the refusal above is the fail-closed replacement, and boot7f
+continued to a live shell and 45 further `[orinclick]` census lines after it (`seq=4` at capture
+line 11495 through `seq=48` at 11540).
+
+**Foreground EL0 is unaffected, and boot7f shows it directly** — the boot's own EL0 round trip ran
+to completion on the EL1 core: `:: TEGRA-EL0: el0-hello spawned at EL0 (boot core), verdict armed …`
+(capture line 11396), `hello from EL0` (11410), `:: TEGRA-EL0: el0-hello round-trip -> PASS ::`
+(11411). ⚠ The shell verb `run` was **not typed on boot7f** — only `bg` was — so "`run` is
+unaffected" rests on the refusal's scope in `sched.rs` and on the `el0-hello` round trip above, not
+on a captured `run` invocation.
+
 ## DARKWIN-GUARD — the 2026-08-18 trunk-merge boot hang, and the dark-window serial latch
 
 ### The failure
@@ -9621,6 +9646,47 @@ knob-off either side of the change yields a **byte-identical objcopy'd loadable 
 *not* compared — it carries build-path and debug metadata — and neither is the ESP, which embeds
 `SRC.TGZ` and is a guaranteed false positive.
 
+### FLOWN 2026-08-25 (boot7f) — the witness line printed on metal
+
+The wire half of the metal debt above is discharged. Serial capture
+`~/unaos-bench/capture/line-acm0/orin.log`; boot7f's kernel banner is at capture line 11091 and the
+run's tail is line 11540. At **capture line 11110**:
+
+```
+[orinwm1] win=1 panel=1920x1200 surf=640x400 box=650x444 at (635,378) scale=1 stage=4194304 present=Composited -> COMPOSITED
+```
+
+**This is the first composited window on the Orin.** Three things the line settles:
+
+* **The staging buffer is allocated on this path.** `stage=4194304` is `MAX_STAGE_BYTES` (4 MiB) —
+  the `reserve_stage` gap this rung was written to close, now measured rather than inferred.
+* **The present was a real composite.** `present=Composited` is `present_outcome`'s own return and
+  the trailing verdict is derived from it, so `-> COMPOSITED` cannot have printed over a
+  `Suppressed` or a `NoRow`.
+* **The box carries the full chrome geometry.** 640x400 of surface becomes a 650x444 box: `+2 x
+  BORDER` horizontally and `+ TITLE_H + 2 x BORDER` vertically, against `video/theme.rs`'s
+  `FRAME = 5` and `TITLE_HEIGHT = 34`. The same boot's theme latch agrees on the wire —
+  `[crispy] theme=us-crispy-modern@0787ba9f frame=5 bevel=1 title_h=34 …` at capture line 11106,
+  four lines above.
+
+The example line quoted under **Witness** above was written on 2026-08-22 at `ab168ba2`, before any
+flight. boot7f printed it verbatim, field for field.
+
+**The chrome painter ran; it was not stripped.** `[crispy]` latching immediately above `[orinwm1]`
+is the wire evidence, and the flown artifact
+(`~/unaos-bench/flash/orin/boot7f-nowinsweep-20260825T2034Z-04d46aa/kernel.elf`) carries
+`video::wm::paint_window` and `video::wm::draw_title` as reachable text — two `bl` sites each under
+`llvm-objdump -d`, not merely present symbols. Any claim that rung 0's window has no frame because
+the painter was dead-stripped is **refuted by both measurements**.
+
+**What boot7f does NOT settle: what reached the glass.** A serial capture is a wire witness. Whether
+the composited box survives `jd2_console_pump`'s own `Screen` / `pal.render()` blit is an on-glass
+question no `[orinwm1]` field answers — see `docs/dev/OS/08_VIDEO/orin-desktop.md` §7. The
+instrument for it (`[orinchrome]`, verdicts `CHROME-ON-GLASS` / `CHROME-PARTIAL` /
+`CHROME-MISSING` / `COMPOSITE-NOT-ON-GLASS`) landed at `e98d798b`, which is **not an ancestor of
+`04d46aae`** and so is not described by this section; the boot7f media predates it and cannot emit
+those lines.
+
 ## JD1-DC — can the CCPLEX see nvdisplay? (`UNAOS_JD1DC`, default OFF, read-only)
 
 **The question.** Every rung of the Orin display stack above JD1 assumes an answer to one thing
@@ -9752,6 +9818,12 @@ set (`ehcihid,tegra,tegrasmp`) either side of the change, in a frozen worktree w
 QEMU models no Tegra234, so the verdict is **metal-owed** and the probe is **not armed on the
 currently-planned flight** — that image already carries other questions. Arm it, alone and attended,
 with `UNAOS_TEGRA=1 UNAOS_JD1DC=1` (or `UNAOS_JD1DC=1 ./arroyo esp-jetson`, which forces `tegra`).
+
+> ⚠ **SUPERSEDED 2026-08-25 — the probe has flown.** The paragraph above records the status this
+> section carried before the flight and is kept for the reasoning, not for the status. JD1-DC ran on
+> Orin metal three times on 2026-08-25 (boot7e twice, boot7f once); the window sweep was EL3-fatal
+> both boot7e runs and is gated off at `04d46aae`, and boot7f answered the model question. Results,
+> capture lines and the reading law: **FLOWN 2026-08-25** at the end of JD1-DC-MODEL below.
 
 ### JD1-DC-MODEL — which register model does this silicon present? (same knob, same guard)
 
@@ -9921,9 +9993,104 @@ instructions, 20 `bl serial::__print`) → **four** `bl 0x180714 jd1_dc_model_re
 `serial::__print`, `Fdt::prop_at` and `from_utf8` (the `JD1-DC-REG` census, inlined); `node_ids`
 armed is 847 instructions with 8 `bl serial::__print`.
 
-**Still UNFLOWN.** JD1-DC has never executed on hardware — armed images have been staged and none
-booted. Every sentence above about what a register *will* read is a **prediction**. The nearest
-cheap follow-up, deliberately left out of this rung to keep it to four reads:
+The nearest cheap follow-up, deliberately left out of this rung to keep it to four reads:
 `NV_PDISP_FE_CHNSTATUS_CORE` at `+0x00630` (withoffset `0x00610630`), whose `STATE` field has
 `_EFI_INIT1 = 0x5`, `_EFI_INIT2 = 0x6`, `_EFI_OPERATION = 0x7` — the live counterpart to
 `CHNCTL_CORE`'s configuration bit, from the same `disp/v03_00/dev_disp.h`.
+
+### FLOWN 2026-08-25 — the model question is answered, and the window sweep is gated off
+
+> ⚠ **This subsection supersedes the "Still UNFLOWN" status the JD1-DC and JD1-DC-MODEL sections
+> carried until 2026-08-25.** JD1-DC has executed on Orin metal. Nothing above about the register
+> *definitions* changed; what changed is that the predictions now have answers.
+
+Source for everything below: the bench serial capture
+`~/unaos-bench/capture/line-acm0/orin.log`. **Capture line numbers are the primary anchor**, with
+the flight's boot id beside them — the serial line is lossy, two of the runs recorded here lost
+their kernel banner to it, and boot boundaries are read off the MB1 coldboot banners rather than
+off the kernel banner.
+
+#### The model verdict (boot7f) — the tree's window map is Tegra186/194's and is WRONG for this chip
+
+Every read survived; the discriminator answered on the first flight that reached it.
+
+| capture line | on the wire (quoted) | what it settles |
+| --- | --- | --- |
+| 11073 | `FIRST READ SURVIVED: DISPLAY_FE_SW_SYS_CAP=0x00100303` | the CCPLEX decodes the aperture with no EL3 abort |
+| 11076 | `READ SURVIVED: NV_PDISP_FE_CLASSES (+0x00000) @0x13800000 = 0xc6700410` | `+0x00000` is readable and non-trivial |
+| 11083 | `FE_CLASSES=0xc6700410: CLASS_ID(31:16)=0xc670 CLASS_REV(15:8)=0x04 API_REV(7:4)=0x1 HW_REV(3:0)=0x0 -> NVD_40 / class NVC67D` | Ampere ga10x — the `0xC670` row of the `CLASS_ID` table above |
+| 11084 | `FE_HW_SYS_CAP=0x00100303: HEAD_EXISTS(0:7)=0x03 (2 head(s)) SOR_EXISTS(8:15)=0x03 (2 SOR(s))` | **2 heads, 2 SORs** — both the "zero heads" and the "more than four heads" failing conditions stayed silent |
+| 11085 | `FE_HW_SYS_CAPB=0x0000000f: WINDOW_EXISTS(0:31) -> 4 window(s) exist` | **4 windows** — not a multiple of the sweep's six-per-head model, which is that model's own stated refutation |
+| 11086 | `CAP CROSS-CHECK: … -> AGREE` | the `+0x30000` software mirror and the `+0x00060` hardware register hold the same word |
+| 11087 | `FE_CHNCTL_CORE=0x00000021: ALLOCATION(0)=ALLOCATE CONNECTION(1)=DISCONNECT PUTPTR_WRITE(4)=0 EFI(5)=ENABLE` | **UEFI left the core channel flagged EFI-owned** |
+| 11088 | `MODEL-VERDICT=NVDISPLAY-CLASS-C670` | the aperture at `0x13800000` **is** `NV_PDISP` rebased to offset 0, and this silicon presents NVD_40 / `NVC67D` |
+| 11089 | `JD1-DC CENSUS — heads=0 windows=0 all-ones=0 all-zero=0 WIN_ENABLE=0 START==JD1-scanout=0 \| reads=5 writes=0` | five reads, **zero writes**, and the count is exact |
+| 11090 | `VERDICT=DECODES-NOMATCH` … `0 window(s) at WIN_ENABLE=1 out of 0 swept` | the sweep contributed nothing, because it is gated off (below) |
+
+**Reproduced three times, not once.** The same four reads returned the same four words on both
+boot7e runs before each died on the sweep — capture lines 8780/8787-8792 and 9928/9935-9940 carry
+`FE_CLASSES=0xc6700410`, `FE_HW_SYS_CAP=0x00100303`, `FE_HW_SYS_CAPB=0x0000000f`,
+`FE_CHNCTL_CORE=0x00000021` and `MODEL-VERDICT=NVDISPLAY-CLASS-C670` verbatim. The verdict does not
+rest on a single boot.
+
+**The consequence, stated plainly: `jd1_dc_survey`'s window offsets — derived from Linux
+`drm/tegra` `hub.c`, whose `of_match` ends at `tegra194` — do not describe this block.** The
+`NVDISPLAY-CLASS-C670` / `DECODES-NOMATCH` pair is exactly the first row of the two-verdict reading
+table above: *replace the window map, do not sweep wider*. Any rung that wants window state takes
+it from the `NV_PDISP` model.
+
+#### boot7e (twice) — the window sweep is EL3-fatal on this silicon
+
+Both runs announced the touch and died inside it. Identical text, identical syndrome:
+
+| run | announce | fault |
+| --- | --- | --- |
+| boot7e, run 1 | capture line 8793: `:: tegra: JD1-DC — head+0x0: about to read win0 WIN_OPTIONS @0x13802e00 (new decode region — announce before touch) ::` | capture line 8794 `Unhandled Exception in EL3.`; 8797 `x1 = 0x00000000be000011`; 8835 `esr_el3 = 0x00000000be000011` |
+| boot7e, run 2 | capture line 9941, the same line verbatim | capture line 9942 `Unhandled Exception in EL3.`; 9945 `x1 = 0x00000000be000011`; 9983 `esr_el3 = 0x00000000be000011` |
+
+`0xbe000011` is EC=`0x2F`, the JX1 SError signature, printed by NVIDIA's BL31 and not by this
+kernel. **The offset is inside the DTB-declared aperture and every bound the probe checks was
+satisfied**: `0x13802e00` is `nvdisplay_base + 0x2e00`, well inside the `size=0xeffff` the DTB
+declares, so the existing bounds check passed and was right to pass. The fault is not an
+out-of-range read; it is a read of a sub-region this silicon does not decode from the CCPLEX.
+
+The sweep is gated off at `04d46aae` (`tegra: JX1-WINSWEEP`); the gate and the conviction are
+recorded at the sweep itself, `arch/aarch64/display_tegra.rs:758-774`.
+
+#### The reading law this cost bought
+
+**No bounds check could have caught it, and none was missing.** The probe's safety envelope — every
+read bounds-checked against the DTB-declared `reg` size, never a constant — held on both fatal boots
+and would hold again. A register can be inside a declared aperture, correctly addressed, and still
+be EL3-fatal to touch: "in range" and "decodable" are different properties, and only the second one
+matters to BL31.
+
+**What made it one boot instead of a bisect was the FIRST-TOUCH announce.** The per-read
+announce/survive pair means silence names the fatal register directly — capture line 8793 is the
+last line of that run, so the fatal read is a single address rather than a candidate set. That is
+the whole return on the pair-per-read discipline documented above, and it is why the pair stays per
+read and not per rung.
+
+**The discriminator explained the fault as well as recording it.** `MODEL-VERDICT=NVDISPLAY-CLASS-C670`
+beside `FE_HW_SYS_CAPB=0x0000000f` (4 windows, against a six-per-head model) says the sweep was
+reading a register map that does not describe this chip, so the EL3 abort is what a wrong-generation
+offset *should* produce rather than an unexplained hazard.
+
+#### Licensing and provenance for the replacement register map
+
+The permissive reference path is the only one in use, and it is sufficient:
+
+| source | licence | role |
+| --- | --- | --- |
+| NVIDIA/open-gpu-doc | MIT | `dev_display_withoffset.ref.txt` for gv100 / tu102 / ga102 — the register and field definitions quoted throughout this section |
+| NVIDIA/open-gpu-kernel-modules | MIT | `swref/published/disp/v03_00/dev_disp.h`, `classes/display/clc67d.h` — the independent confirmation of `CHNCTL_CORE`'s address and of the class numbering |
+| OE4T/nv-kernel-display-driver-source | MIT per file | the Tegra-side display driver source, for the T234 channel model |
+
+**GPL Linux sources are not used, and would not help.** `drm/tegra` is the map that just proved
+wrong for this silicon — its `of_match` ends at `tegra194` and it documents the wrong generation —
+so the licence question and the correctness question point the same way.
+
+**Separately, and unchanged: GA10B GPU-core acceleration remains closed.** Its microcode is signed
+and encrypted with boot-ROM-enforced verification, so no permissive path opens it. That bounds the
+GPU, not the display engine — nvdisplay and the DCE are a different block, and nothing on the
+desktop ladder needs the GPU (`docs/dev/OS/08_VIDEO/orin-desktop.md` §4).
