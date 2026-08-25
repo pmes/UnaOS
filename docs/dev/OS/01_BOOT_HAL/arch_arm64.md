@@ -2890,6 +2890,31 @@ Attending-operator verdict: **pass 100%**. ⚠ Same evidence caveat as the §JB1
 host-side serial capture failed mid-bench, so the verdict is the attended panel observation (the
 JD6 card's checks are all panel-visible); no replay log exists for an mbench assert.
 
+**Replay evidence DOES exist for the write path — from the benches after JD6 (located 2026-08-25).**
+The JD5/JD6 caveat above is about *those two* benches and has been read since as "FAT write was never
+exercised on Orin", which is false. Once the shell mirrored its output to serial as `:: tegra: JD2 —
+OUT | … ::`, three later attended benches captured the whole write path on real silicon, and these
+are the files to cite instead of re-running the argument:
+
+- `~/unaos-bench/jetson-serial-2026-07-13-133055.log` — `:1306` `wrote 9 bytes to /a.txt (9 bytes)`;
+  `:1354` `appended 9 bytes to /a.txt (18 bytes)`; `:1392` `wrote 5 bytes to /b.txt (5 bytes)`;
+  `:1442` `wrote 11 bytes to /c.log (11 bytes)`; `:5394` `removed /A.TXT (1 cluster(s) freed)`.
+  **This log also carries the power-cycle leg on the wire**: `/a.txt` is written and appended to 18
+  bytes in the first boot, three MB1 re-boots follow (`:1654`, `:2564`, `:3890`), and the post-reboot
+  `ls` at `:5150` and `:5179` still lists `18  A.TXT` — the durability money-shot, replayable.
+- `~/unaos-bench/jetson-serial-2026-07-14-101517.log` — subdirectory writes and the `rm` guards:
+  `:3827` `wrote 5 bytes to /DOCS/a.txt (5 bytes)`; `:3955` `wrote 7 bytes to /DOCS/SUB/c.txt
+  (7 bytes)`; `:4029` `rm: /DOCS: is a directory (-EISDIR)`; `:4097` `rm: -r /: cannot remove the
+  root directory (-EBUSY)`; `:4199` `removed /SOLO.TXT (1 cluster(s) freed)`.
+- `~/unaos-bench/jetson-serial-2026-07-15-092500.log` — the `cp`/`mv` arcs on top of the same path,
+  e.g. `:1643` `wrote 8 bytes to /OLD/k.txt (8 bytes)`, `:2275` `wrote 5 bytes to
+  /MDST/MSRC/stale.txt (5 bytes)`.
+
+Every line above carries the `tegra:` prefix, i.e. the tegra console path on Orin silicon. Note the
+lookup hazard that hid this: these are bench-root `~/unaos-bench/jetson-serial-*.log` files, **not**
+`~/unaos-bench/capture/` — a sweep scoped to `capture/` finds no FAT-write evidence and will wrongly
+conclude the path was never exercised.
+
 ### FATDIRS — the `fat.rs` directory-mutation seam: `create_dir` / `remove_dir` (pi4-lane, `cdfe25b`)
 
 JD6 left `mkdir`/`rmdir` explicitly out of scope — its subdir writes reused the existing
