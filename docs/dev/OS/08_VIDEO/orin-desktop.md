@@ -172,6 +172,203 @@ dead code ("function `pidesk_activate_maybe` is never used").
 **Consequence:** a tegra desktop needs its own arming wrapper on a `tegra`-shaped
 gate, not a widened `baremetal` one.
 
+#### §3.2.1 RESOLVED 2026-08-25 (rung 2) — the seam LANDED, and it REFUSES
+
+Measured at `f0106408`. The wrapper exists, is compiled, is reached on a tegra
+boot, and declines with a named reason. It does **not** arm the desktop.
+
+| Item | Where | State |
+| --- | --- | --- |
+| `tegradesk` Cargo feature | `crates/kernel/Cargo.toml` (file tail) | landed — `tegradesk = ["pidesk", "tegra_el0"]` |
+| `tegra_desk_arm` wrapper | `crates/kernel/src/main.rs` (file tail) | landed, `#[cfg(all(target_arch = "aarch64", feature = "tegradesk"))]` |
+| Call site | `main.rs`'s `tegra_early_stop` terminus line, appended statement | landed — `bl` proven by disassembly, below |
+| `UNAOS_TEGRADESK=1` env map | `unaos/arroyo` | landed |
+| `arm-tegra-seam` matrix leg | `unaos/arroyo` `KERNEL_CFG_MATRIX` | landed — 11 → 12 board legs (counted, not inherited) |
+| `main.rs:6257 pidesk_activate_maybe` | unchanged | it is the live wire-in on a `pidesk`-armed Pi build (`main.rs:1316`, on the `kernel_main` path the Pi reaches and the Orin does not). This rung adds a wrapper BESIDE it; it does not widen, move or delete it. Its dead-code warning on a tegra build is still emitted, and is still the correct diagnosis |
+
+**The gate.** `tegradesk = ["pidesk", "tegra_el0"]` — it IMPLIES rather than
+standing alone, unlike `orindesk`/`jd1dc`/`smpmark`, and that is the rung's own
+lesson rather than a convenience. The seam calls `video::pidesk::activate`
+(`#[cfg(all(aarch64, pidesk))]`), and `pidesk` on aarch64 needs
+`arch::aarch64::syscall` via `dock::focus_set`, gated `any(baremetal,
+tegra_el0)` — `baremetal` being unsatisfiable here by §3.2's chain, the only
+term left is `tegra_el0`. A standalone spelling would have let
+`UNAOS_TEGRADESK=1 UNAOS_TEGRA=1` compile the seam's ABSENCE and report green,
+which is the same "gate its own knob cannot satisfy" defect this rung exists to
+remove.
+
+**The call site, and why it is the terminus line.** §3.1 concludes the arming
+point "has to be chosen inside `tegra_early_stop`, after the heap and the
+scheduler are up". The statement is appended to the line that ends
+`tegra_early_stop` — `el1_oneshot_proof(); tegra_el0_start_maybe();
+tegra_desk_arm(); tegra_rast_demo_maybe(); run_capstone_boot_core(0);` — the
+last instruction on this path, because everything the cascade needs holds there
+and nowhere earlier: panel seeded (JD1), heap carved (step 3c), IRQs live (JM4),
+SMP secondaries kicked off (JM5 — `wm::reserve_stage` sizes one stage entry per
+LIVE core, so §3.3's ordering constraint is inherited), EL2 → EL1 dropped,
+`percpu`/`mark_el1_core` stamped, run queue populated but not driven. It is the
+tegra counterpart of the Pi's `main.rs:1316` GUI-handoff line, and it mirrors
+that line's ordering: seam before the RAST demo. It also runs on the **boot
+stack** rather than a 16 KiB `TASK_STACK_SIZE` task stack, which is a better
+stack story than the Pi's — and is NOT a claim that the cascade fits.
+
+**What it prints.** Six `[deskseam]` strings in the ARMED artifact — one census
+and five refusals — every term derived from a value read on that boot, none
+asserted. (A seventh exists in source, the `ARMED panel=…` success line; it is
+eliminated with the branch the stop-line closes, and `LC_ALL=C grep -a -o` on
+`unaos-kernel` confirms it is absent. That is the intended reading: the strings
+in the image are exactly the verdicts this build can reach.)
+
+| Wire | Derived from | What makes it print |
+| --- | --- | --- |
+| `REFUSE reason=already-armed` | `TEGRADESK_ENTERED.swap` | a second entry to the seam |
+| `REFUSE reason=no-panel` | `FrameBuffer::is_ready()` | headless Orin — no DTB `simple-framebuffer`, JD1 printed `JB1b — geometry unresolved` and never seeded `WRITER` |
+| `REFUSE reason=stage-unreserved stage=0` | `wm::reserve_stage(&info)` | the 48 MiB aarch64 heap cannot spare stage entry 0 |
+| `floors panel=…x…x… stage=… cover=…% table=… console-window=GRANTED\|WITHHELD route=ROUTED\|UNROUTED click-route=… cascade=… rows=12` | all of the above + `wm::count()` + `dock::Layout::for_panel(MAX_WINDOWS, pw, ph)` + `fbcon::console_is_routed()` | every boot that clears the three floors |
+| `REFUSE reason=table-not-empty live=N` | `wm::count()` | **`UNAOS_ORINDESK=1 UNAOS_TEGRADESK=1`** — rung 0's row is already composited when the seam runs, and `pidesk`'s step-1b DESKTOP-CLEAR writes the whole panel through the FRONT buffer on the stated premise that the window table is empty. On the Pi that premise holds by construction; on the Orin it does not |
+| `REFUSE reason=rung3-unlanded+stop-line-5.2` | `match (TEGRADESK_CLICK_ROUTED, TEGRADESK_CASCADE_OK)` | every boot this branch can build |
+
+**Two instrument defects were found by checking the ARTIFACT, and both are
+recorded because neither was visible in the diff or in `./arroyo check`.**
+
+1. A `REFUSE reason=zero-geometry` floor was written, hoisting `pidesk`'s own
+   step-1 `pw == 0 || ph == 0` test. `LC_ALL=C grep -a -o` found every other
+   `[deskseam]` string in the armed `unaos-kernel` and not that one:
+   `FrameBuffer::is_ready` is `base != 0 && len != 0 && info.width != 0 &&
+   info.height != 0`, so the extent test is already inside the readiness test and
+   the optimiser had proved the arm dead. **Removed.** A DECLINE arm that cannot
+   be reached is not a floor.
+2. The two stop-lines were written as sequential `if !CONST { … return }` blocks.
+   The artifact carried `rung3-unlanded` and **not** `stop-line-5.2` — the
+   second string was dead code the moment the first const was `false`, so an
+   operator's capture would have named the ordering obligation and been SILENT
+   about the stack hazard, which is the more dangerous of the two. **Merged into
+   one `match` over both terms**, whose `(false, false)` arm is the string the
+   build actually carries.
+
+**The stop-line is enforced by CODEGEN, not merely by a runtime test** — a
+stronger statement than intended and worth recording. `llvm-nm` finds no
+`pidesk::activate` symbol in the armed image and `llvm-objdump -d` finds no
+reference to it anywhere: because both consts are `false` in source, the armed
+branch is eliminated before linking. `pidesk::activate()`'s call is therefore
+type-checked **only** by the `arm-tegra-seam` leg, which is exactly what that leg
+is for.
+
+**Verification, all at `f0106408` + this arc's diff — and all of it re-run in an
+ISOLATED THROWAWAY WORKTREE**, `git worktree add --detach` at `f0106408` with
+only this arc's four files copied in. That is not ceremony: a peer executor's
+in-flight SHELLUP cherry-pick appeared in `arch/aarch64/sched.rs` in the shared
+`../UnaOS-orin` tree at 12:07:38 while this arc's armed build and gates were
+running, and `sched.rs` compiles into every aarch64 image. A measurement taken
+across another seat's uncommitted edit is not a measurement of this arc. (Never
+`git stash` to get the clean baseline — one stack, shared across every worktree
+of this repo.)
+
+- `UNAOS_TEGRA=1 ./arroyo check` — **exit 0**. `✅ kernel cfg coverage OK
+  (20 legs)`, `12 board + 8 x86 pairwise-mix`, `✅ arm-tegra-seam`. The board
+  count is the +1 stated above, read off the run rather than asserted.
+- `UNAOS_TEGRADESK=1 ./arroyo check` — **exit 0**, same 20 legs, and the banner
+  confirms the knob maps through:
+  `⚡ kernel features: ehcihid,kbdwit,sdhcblk,smolnet,tegradesk,pidesk,tegra_el0,tegra`.
+- `./arroyo test-arm` — **exit 0**, `✅ aarch64 test complete`. `awk '/PANIC|panicked/'`
+  over `target/serial-arm.log` → 0 lines; the single `/FAIL/` hit is prose inside
+  a `[botclaim]` explanation, not a verdict. **This proves nothing about the
+  cascade** and the seam's own refusal line says so on the wire: `test-arm` is
+  the aarch64 *virt* machine, which compiles no `tegra` and no `tegradesk`
+  (`awk '/deskseam/'` → 0 lines). It is a no-regression gate, not a witness.
+- **`arm-tegra-seam` proven to GO RED**, because a leg that has never gone red is
+  not evidence. Renaming the seam's central call
+  (`pidesk::activate()` → `pidesk::activate_now()`) and re-running the gate reds
+  **exactly one leg**:
+
+  ```
+  ✅ arm-pi   ✅ arm-tegra   ✅ arm-tegra-el0   ✅ arm-tegra-simmer
+  ✅ arm-tegra-xusbfw   ✅ arm-tegra-smpmark   ✅ arm-tegra-orindesk
+  ✅ arm-tegra-jd1dc   ✅ arm-tegra-desk
+  error[E0425]: cannot find function `activate_now` in module `pidesk`
+  ❌ arm-tegra-seam — unaos-kernel FAILED to compile
+  ❌ kernel cfg coverage FAILED (crate unaos-kernel), legs: arm-tegra-seam
+  ```
+
+  (arm-* board legs quoted; the two x86 board legs and all eight mix legs stayed
+  green as well — the failure line names one leg and it is the new one.)
+
+  `arm-tegra-desk` stays green (it carries `pidesk` and `tegra_el0` but no
+  `tegradesk`, so it compiles the callee and not the caller) and `arm-pi` stays
+  green (it carries the whole desktop family, on `baremetal`, with no tegra
+  caller at all) — which is the point: **no pre-existing leg can see a defect in
+  the Orin's desktop-arming call site**, and the new one names both the defect
+  and its configuration. Restored → green again.
+- **Byte-identity, knob-off, at the KERNEL level** (never the ESP — that embeds
+  `SRC.TGZ`, a tarball of the working tree, so an ESP-level compare reports the
+  diff itself as a codegen change). Two independent `CARGO_TARGET_DIR`s, same
+  source path, `--features ehcihid,tegra,tegrasmp` (the shipped default jetson
+  set), `llvm-objcopy -O binary` for the loadable image:
+
+  | Artifact | Baseline `f0106408` | With this arc, knob off | |
+  | --- | --- | --- | --- |
+  | `unaos-kernel` (kernel.elf) | `b5ffbb7e…14f8`, 1 866 824 B | `b5ffbb7e…14f8` | **identical** |
+  | its `-O binary` flattening | `cc0a0693…147f`, 1 526 560 B | `cc0a0693…147f` | **identical** |
+
+  Control of the control, run first: the same pristine tree built into the two
+  target dirs produced the same `b5ffbb7e…14f8`, so the method has no
+  target-dir sensitivity to hide behind.
+
+- **Reachability by disassembly**, not by linkage:
+
+  ```
+  0000000000071250 <unaos_kernel::tegra_early_stop>:
+     71adc:   bl  0x709f4 <unaos_kernel::tegra_desk_arm>
+  ```
+
+  and inside `tegra_desk_arm`, the floors themselves:
+  `bl <video::wm::reserve_stage>`, `bl <video::wm::count>`,
+  `bl <video::fbcon::console_is_routed>`, and two `bl`/one tail-`b` to
+  `arch::aarch64::serial::_print`. `dock::Layout::for_panel` is **inlined**
+  rather than called, and const-folds to two comparisons —
+  `cmp x21, #0x4c` / `ccmp x20, #0x240, hs` / `cset w20, lo`, i.e.
+  `ph >= 76 && pw >= 576` — which then selects the literal `GRANTED` (7 bytes at
+  `.rodata` `0x341d8`) or `WITHHELD` (8 bytes at `0x340c0`). The `route=` term
+  selects `ROUTED` (`0x341df`) / `UNROUTED` (`0x33fe8`) off
+  `console_is_routed`'s return in the same shape. Both census terms are
+  therefore derived at the machine-code level, not only in source.
+
+- *Measurement artifact, not a code defect, and §3.6 predicted it:* the first
+  armed build in the isolated worktree failed with `couldn't read
+  …/target/user_blob.bin` at `arch/aarch64/syscall.rs:3327`. `tegradesk` implies
+  `tegra_el0`, which compiles that `include_bytes!`, and a fresh worktree has no
+  such artifact. Staged in before the run, exactly as §1.1 did. `./arroyo check`
+  supplies it itself via `ensure_user_blob`, so only the hand-rolled `cargo
+  build` needs the step.
+- Every new string proven NEW to this build, not inherited:
+  `git log --all -S` returns **0** commits for each of `[deskseam]`,
+  `tegra_desk_arm`, `tegradesk`, `arm-tegra-seam`, `TEGRADESK_CLICK_ROUTED`,
+  `reason=table-not-empty`, `reason=stage-unreserved`, `reason=rung3-unlanded`,
+  `reason=stop-line-5.2`.
+
+**NOT done by this rung, deliberately:**
+
+- **`pidesk::activate()` has not run and cannot run on this branch.** The rung-2
+  row in §6 gave its metal witness as "`pidesk::activate()` runs on an Orin boot
+  and its floors print their verdicts". Those are two different claims and only
+  the second is achievable now: `activate()` opens the console window (rung 4)
+  and enables the menu bar (furniture), so running it crosses **both** §6.1's
+  non-negotiable ordering constraint **and** §5.2's stop-line. The §6 row is
+  corrected accordingly. The floors do print their verdicts.
+- **No metal.** UNFLOWN. No Orin boot has been taken with `UNAOS_TEGRADESK=1`;
+  every claim above is a build-time or artifact measurement.
+- **The `WITHHELD` arm is live in codegen but not demonstrated reachable on Orin
+  hardware.** The fold above puts the dock floor at `pw >= 576 && ph >= 76`, and
+  no Orin panel this branch has seen is under it. It is reported as a census
+  term rather than as a refusal for that reason, and because a withheld console
+  window is not fatal to `pidesk` — the bar follows either way.
+- **The seam measures no stack headroom.** §5's whole hazard is a stack hazard
+  and §7 already records that every number quoted for it is a Pi number. The
+  boot stack's extent is not exposed by any symbol reachable from `main.rs` on
+  the tegra path, and a guessed extent would be a worse instrument than none.
+  This stays owed by the rung that flips `TEGRADESK_CASCADE_OK`.
+- **No `video/` edit.** None was needed.
+
 ### §3.3 The compositor's staging buffer is never allocated
 
 ```
@@ -333,6 +530,20 @@ exists to close.
 
 #### §3.5.3 Corrections to this section
 
+- **§3.5.1's `quarry` row and §3.5.2's "held" framing are STALE, and both are
+  superseded.** Re-measured 2026-08-25 at `f0106408`: the `uslots` substitution
+  landed at `e14a9008` (`tegra: EL0CORE-CITE + ORINDESK-QUARRY`, verified an
+  ancestor of HEAD by `git log -S "uslots::USER_REGION_SIZE" HEAD --
+  …/video/quarry/live.rs`), `video/quarry/live.rs:1089` now reads
+  `crate::arch::aarch64::uslots::USER_REGION_SIZE`, and `arm-tegra-desk` carries
+  `,quarry` as §3.5.2 instructed. §3.5.1's row saying "NOT fixed — out of lane"
+  and §3.5.2's title calling the patch "held" are both false as of that commit;
+  they are left in place as the record of why the substitution was written the
+  way it was, not as current state. **`arroyo`'s `UNAOS_QUARRY` env-map comment
+  carries the same stale claim** ("⚠ NOT YET TYPE-CHECKED ON tegra, and
+  deliberately absent from the `arm-tegra-desk` leg below") and was corrected in
+  the same turn.
+
 - **`x86-vsyncpace` does not carry the desktop family.** §3.5 lists it beside
   `x86-all` as one of "the two x86 legs that do". Its feature list is
   `nvidia-kepler,nvidia-kepler-takeover,wc,witness,vsyncpace,ehcihid,smolnet` — no
@@ -442,6 +653,37 @@ Verified at `3dc889e7` by `git merge-base --is-ancestor` and `git grep`:
 > is absent, so a `headroom=0` reading here means "at or past the floor, amount
 > unknown" — never "exactly zero left".**
 
+#### §5.1.1 Correction, re-measured 2026-08-25 at `f0106408` — the MECHANISMS arrived, the COMMITS did not, and SHELLUP still has not
+
+§5.1's table is stale in one direction and still correct in the other. Both
+halves were re-run this turn; neither is relayed from a previous session.
+
+| Claim in §5.1 | Re-measured at `f0106408` |
+| --- | --- |
+| STACKPOOL `71671423` / REDZONE `46c94c07` / SHELLUP `e8dcb09c` "not an ancestor of HEAD" | **still true.** `git merge-base --is-ancestor <sha> HEAD` → false for all three |
+| `sched::spawn_prio_stack` ❌ "SHELLUP only" | **now PRESENT** — `arch/aarch64/sched.rs` |
+| REDZONE absorber ❌ | **now PRESENT** — `STACK_REDZONE = 1024`, `STACK_HIGHGUARD = 512`, `GUARD_FILL`, and both `[redzone] LOW-REDZONE` / `HIGH-GUARD` reports, `arch/aarch64/sched.rs:41` and `:5225`/`:5298` |
+| `[shellup]` census / `at=render:pass` / `RENDER_STACK_SIZE` ❌ | **still absent**, 0 hits tree-wide |
+
+The mechanisms arrived on this branch through the track's own
+`f0106408` (`sched(aarch64): STACKPOOL + REDZONE`), not through a cherry-pick of
+the Pi commits — which is why the sha rows and the mechanism rows disagree, and
+why checking only the shas would have reported the absorber missing when it is
+present.
+
+**This does not lift §5.2.** SHELLUP's half is still absent; and per the REDZONE
+row above, the absorber on this branch is likewise **NOT-RUN on Orin metal** —
+a *missing* `[redzone]` line means "never fired", never "the absorber held".
+
+⚠ **This row has a known expiry.** A sibling executor's SHELLUP cherry-pick was
+observed IN FLIGHT (uncommitted `arch/aarch64/sched.rs` in `../UnaOS-orin`, 12:07
+on the day above) while this section was being written, taking the
+`spawn_prio_stack`-with-caller-sized-stack helper and gating it
+`#[cfg(feature = "baremetal")]` with no caller on this branch. Read the tree, not
+this table, once it commits — and note that a `baremetal`-gated item on
+`hw-jetson` compiles to nothing on every tegra build by §3.2's own chain, so its
+arrival will not by itself change what a tegra cascade runs on.
+
 ### §5.2 The stop-line
 
 The Orin has inherited the cascade *and* the detector, but not the fixes and not
@@ -516,8 +758,8 @@ names the seat that owns the files under the parallel-arc rules in `CLAUDE.md`.
 | --- | --- | --- | --- | --- |
 | **0** | **One composited window** | call `wm::reserve_stage` on the tegra path after heap init (§3.3); mint one `wm` row; present it. No furniture, no `pidesk`, no cascade | one window visible on the Orin panel over the JD2 console; `wm` present counters non-zero on the wire | jetson |
 | **1** | **The cfg leg** — ✅ **LANDED 2026-08-22, less `quarry`** (§3.5.1) | `arm-tegra-desk` leg added (gate 18 → 19 legs); `pidesk`/`quarry`/`livecon` mapped in arroyo's env map; two of the three gate mismatches fixed | `UNAOS_TEGRA=1 ./arroyo check` green 19/19, and green again under `UNAOS_TEGRA_EL0=1 UNAOS_PIDESK=1 UNAOS_LIVECON=1`; the new leg proven to go red on a re-introduced mismatch | jetson (arroyo + `arch/aarch64/syscall.rs`); the `quarry` line is a `video/` edit and is **held** in §3.5.2 |
-| **2** | **The desktop seam** | a tegra-shaped arming wrapper inside `tegra_early_stop` (§3.1, §3.2), replacing the unsatisfiable `pidesk`+`baremetal` gate at `main.rs:6238` | `pidesk::activate()` runs on an Orin boot and its floors print their verdicts | jetson |
-| **3** | **Input routing** | `jd2_console_pump`'s `Event::Button` arm calls `wc_click_route` instead of `serial_println!` (§3.4) | a click on the Orin panel raises and focuses a window; `[clickroute]` on the wire | jetson |
+| **2** | **The desktop seam** — ✅ **LANDED 2026-08-25, and it REFUSES** (§3.2.1) | `tegradesk` feature + `main.rs::tegra_desk_arm` on `tegra_early_stop`'s terminus line + `UNAOS_TEGRADESK` env map + the `arm-tegra-seam` leg (11 → 12 board legs). The seam evaluates its floors and declines at two named stop-lines | **the floors half is UNFLOWN**: `[deskseam] floors …` + `REFUSE reason=…` print on an armed Orin boot, and nobody has taken one. **The `activate()` half is WITHDRAWN, not owed**: `pidesk::activate()` opens the console window and enables the bar, so running it crosses §6.1 *and* §5.2 — it belongs to rungs 3/5, and this row previously asked for something the same document forbids | jetson |
+| **3** | **Input routing** | `jd2_console_pump`'s `Event::Button` arm calls `wc_click_route` instead of `serial_println!` (§3.4). **⚠ HANDSHAKE WITH RUNG 2: flip `main.rs`'s `TEGRADESK_CLICK_ROUTED` to `true` in the SAME commit.** It is the seam's §6.1 stop-line and it is held `false` precisely because this rung has not landed; leaving it `false` afterwards silently keeps the seam refusing for a reason that is no longer true, and flipping it early is the one-way-trip defect §6.1 exists to prevent | a click on the Orin panel raises and focuses a window; `[clickroute]` on the wire | jetson |
 | **4** | **Console as a window** | route the JD2 console into a `wm` row; `fbcon::console_is_routed`; skip the handoff detach when routing succeeded | the boot log keeps updating *inside a window*, and the minimise control has somewhere to go back to | jetson |
 | **5** | **The real desktop** | dock, strip, menubar, crystal armed; the full `pidesk` cascade; a tegra `render_service` (§3.6) | the Orin comes up to a desktop | jetson — **blocked by §5.2** |
 | **6** | **EL0 tenants** | user windows from EL0 through `SYS_WIN_*`, on the `tegra_el0` regime | an EL0 program owns a window on the Orin panel | jetson |
@@ -549,6 +791,11 @@ before rung 2 if the seam is to be type-checked by anything). Rung 5 is gated on
 
 ## §7 What this document does not claim
 
+- **Rung 2 is claimed landed and REFUSING, never working.** The seam compiles,
+  links, is reached (`bl` proven by disassembly) and prints derived verdicts —
+  on a build nobody has booted. **UNFLOWN on Orin metal.** Nothing on this
+  branch reaches `pidesk::activate()`; §5.2's stop-line is untouched and is now
+  enforced by codegen as well as by source.
 - **Only rung 1 is claimed done, and only as a type-check.** Every PROVEN cell in
   §1 that is ✅ refers to the JD1/JD2/JD20 panel path, not to the compositor. Rung
   1's claim is exactly "the armed tegra desktop configuration compiles and a gate

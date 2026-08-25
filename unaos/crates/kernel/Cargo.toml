@@ -1674,6 +1674,40 @@ orindesk = []
 # `JD1-DC VERDICT=`. See arch_arm64.md §JD1-DC.
 jd1dc = []
 
+# ORINDESK RUNG 2 (TEGRADESK) — the Jetson Orin's DESKTOP SEAM: the tegra-shaped arming wrapper
+# `main.rs::tegra_desk_arm`, wired into `tegra_early_stop`'s terminus line. It is the tegra
+# counterpart of `main.rs::pidesk_activate_maybe`, which the Orin can NEVER reach: that wrapper is
+# gated `all(aarch64, pidesk, baremetal)`, `baremetal = ["pi"]`, and `pi` + `tegra` is a hard
+# `compile_error!` in `arch/aarch64/serial.rs`. So on every tegra build the existing wrapper resolves
+# to its constant-`false` twin. This feature is the gate that CAN be satisfied on this board.
+#
+# WHY IT IMPLIES RATHER THAN STANDS ALONE, and this is the whole point of the rung. `orindesk`,
+# `jd1dc` and `smpmark` are standalone because their sites need nothing but `tegra`. This one calls
+# `video::pidesk::activate`, which is `#[cfg(all(aarch64, pidesk))]`, and `pidesk` on aarch64 needs
+# `arch::aarch64::syscall` (via `dock::focus_set`), which `arch/aarch64/mod.rs` gates on
+# `any(baremetal, tegra_el0)` — `baremetal` being unsatisfiable here, the only term left is
+# `tegra_el0` (which implies `tegra`). A STANDALONE spelling would therefore let
+# `UNAOS_TEGRADESK=1 UNAOS_TEGRA=1` compile the ABSENCE of the seam and report green, which is
+# EXACTLY the defect class this rung exists to remove: a gate whose knob cannot satisfy it. The
+# implication makes `UNAOS_TEGRADESK=1` self-sufficient and unable to arm a stub.
+#
+# IT DOES NOT ARM THE DESKTOP. Armed, the seam evaluates its floors, prints a derived census, and
+# then REFUSES at two named stop-lines (`main.rs`'s `TEGRADESK_CLICK_ROUTED` / `TEGRADESK_CASCADE_OK`,
+# both `const false`, the `display_tegra::JD1_DC_PROBE` idiom): rung 3 (click routing) has not landed,
+# so a console window's minimise disc would be a one-way trip (orin-desktop.md §6.1), and the full
+# desktop cascade is §5.2's stop-line — the Pi overflowed a 16 KiB kernel stack in it twice on metal
+# and it does not reproduce on any QEMU gate. `pidesk::activate()` is COMPILED and TYPE-CHECKED here
+# and is not reached on any boot this branch can produce.
+#
+# Default OFF => the wrapper, its statics and its call site vanish, and NO LINE MOVES in any file
+# compiled knob-off (the call site is a statement APPENDED to `tegra_early_stop`'s existing terminus
+# line; the wrapper is appended at the FILE TAIL below every panic `Location` in `main.rs`). MEASURED,
+# not argued — build the aarch64 kernel either side with `--features ehcihid,tegra,tegrasmp` and
+# compare sha256 of `unaos-kernel` and of its `llvm-objcopy -O binary` flattening. The ARMED polarity
+# is type-checked by the `arm-tegra-seam` leg of KERNEL_CFG_MATRIX in `arroyo`, never by the knob
+# mapping. Witness on the wire: `[deskseam]`. See docs/dev/OS/08_VIDEO/orin-desktop.md §6 rung 2.
+tegradesk = ["pidesk", "tegra_el0"]
+
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }

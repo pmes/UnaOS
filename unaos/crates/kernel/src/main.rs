@@ -2587,7 +2587,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // `el0-hello` task, and an unstamped mask would refuse it (see sched.rs `EL1_CORE_MASK`).
     unaos_kernel::arch::percpu::init(0); unaos_kernel::arch::sched::mark_el1_core();
     unaos_kernel::arch::exceptions::install();
-    unaos_kernel::arch::timer::el1_oneshot_proof(); tegra_el0_start_maybe(); tegra_rast_demo_maybe(); unaos_kernel::arch::sched::run_capstone_boot_core(0); // IRQEL-RT EL1 one-shot proof (first: one interrupt taken AT EL1 through the runtime-banked __vec_irq, then self-disarms — see timer.rs tail) + RAST-TEGRA demo (no-op unless UNAOS_RAST=1), all on the same line as the terminus so the wire-ins add ZERO source lines before any panic Location — the tegra knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helpers defined at file tail / timer.rs tail.
+    unaos_kernel::arch::timer::el1_oneshot_proof(); tegra_el0_start_maybe(); #[cfg(feature = "tegradesk")] tegra_desk_arm(); tegra_rast_demo_maybe(); unaos_kernel::arch::sched::run_capstone_boot_core(0); // IRQEL-RT EL1 one-shot proof (first: one interrupt taken AT EL1 through the runtime-banked __vec_irq, then self-disarms — see timer.rs tail) + ORINDESK RUNG 2 desktop seam (no-op unless UNAOS_TEGRADESK=1; DESKSEAM tail block) + RAST-TEGRA demo (no-op unless UNAOS_RAST=1), all on the same line as the terminus so the wire-ins add ZERO source lines before any panic Location — the tegra knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helpers defined at file tail / timer.rs tail.
 }
 
 /// Handle one keyboard byte against the console: printable ASCII extends the input line, backspace
@@ -6297,3 +6297,215 @@ fn pidesk_activate_maybe() -> bool {
 //
 // SCOPE. One window. `pidesk::activate` is NOT called from here and no furniture is armed; see the
 // ORIN-WM1 block in `arch/aarch64/display_tegra.rs` for the cascade hazard that keeps it that way.
+
+// =================================================================================================
+// ORINDESK RUNG 2 — DESKSEAM: the Orin's DESKTOP SEAM. `tegradesk`, DEFAULT OFF, and it REFUSES
+// even when armed. Ladder: docs/dev/OS/08_VIDEO/orin-desktop.md §3.1, §3.2, §5.2, §6, §6.1.
+// =================================================================================================
+//
+// THE DEFECT THIS CLOSES. `pidesk_activate_maybe` above is gated
+// `all(aarch64, feature = "pidesk", feature = "baremetal")`. `Cargo.toml` has `baremetal = ["pi"]`
+// and `arch/aarch64/serial.rs` has `#[cfg(all(feature = "pi", feature = "tegra"))] compile_error!`,
+// so on a tegra build that gate is not merely unset — it is UNSATISFIABLE, and the wrapper always
+// resolves to its constant-`false` twin. The desktop-arming code has existed on this branch since
+// the base sync and could never once have run here. `tegra_desk_arm` is the gate that CAN be
+// satisfied on this board. The Pi wrapper above is UNTOUCHED: it is live and correct on `hw-pi4`,
+// and this is an addition beside it, not a widening of it.
+//
+// WHY THE CALL SITE IS THE TERMINUS LINE (§3.1). `tegra_early_stop` is declared `-> !` and DIVERGES;
+// `kernel_main` — where `pidesk_activate_maybe` is wired, behind the `fbcon::detach()` handoff — is
+// never reached on this board. §3.1's conclusion is that the arming point "has to be chosen inside
+// `tegra_early_stop`, after the heap and the scheduler are up", and the last instruction before
+// `run_capstone_boot_core(0)` (which never returns) is the only point on this path where all of it
+// holds at once: panel seeded (JD1, ~570 lines above), heap carved (step 3c), IRQs live (JM4), SMP
+// secondaries kicked off (JM5, ~95 lines above — `wm::reserve_stage` sizes one stage entry per LIVE
+// core, so §3.3's ordering constraint is inherited), EL2 -> EL1 dropped, `percpu`/`mark_el1_core`
+// stamped, and the run queue populated but not yet driven. It is also the tegra counterpart of the
+// Pi's `main.rs:1316` GUI-handoff line in every respect that matters.
+//
+// AND IT RUNS ON THE BOOT STACK, which is a better stack story than the Pi's and is stated here
+// because §5's hazard is a stack hazard: both Pi overflows were `TASK_STACK_SIZE` (16 KiB) task
+// stacks under a preemption frame. `tegra_early_stop` is the boot core's own entry frame. That is
+// NOT a claim that the cascade fits — see the stop-line below and the report's NOT-MEASURED list.
+//
+// ZERO SOURCE LINES. The call site is a statement APPENDED to the existing terminus line and this
+// block is at the FILE TAIL, below every panic `Location` in `main.rs`. Inserting a line anywhere
+// above would renumber those `Location`s and move the loadable image even with the knob off — the
+// PI-V3D-1 bisect-proven constraint the `smpmark`/ORIN-WM1/JD1-DC wire-ins all obey.
+
+/// DESKSEAM — one-shot latch. `tegra_early_stop` runs once per boot on the boot core, so this cannot
+/// fire today; it is here because the two `#[cfg]` mazes above this line have both grown a second
+/// reachable path in the past, and `pidesk::activate` has its own latch for exactly that reason.
+#[cfg(all(target_arch = "aarch64", feature = "tegradesk"))]
+static TEGRADESK_ENTERED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// DESKSEAM STOP-LINE 1 — **has rung 3 (input routing) landed?** `display_tegra::JD1_DC_PROBE`'s
+/// idiom: a compile-time precondition held `false` in source, flipped by the rung that discharges it.
+///
+/// §6.1 of the ladder, which calls this ordering "not negotiable": `pidesk::activate` opens the
+/// console window, that window carries a minimise disc, and `video/pidesk.rs:39-44` states the
+/// CONSWIN law — the only route back from that park is the dock, and the dock is only a way back
+/// once clicks route. `jd2_console_pump`'s `Event::Button` arm still does nothing but
+/// `serial_println!` the mask (§3.4), so arming today would ship a control that hides the console
+/// with no way back: strictly worse than the full-screen console it replaces.
+///
+/// **Flip this to `true` in the same commit that makes that arm call `wc_click_route`, not before.**
+#[cfg(all(target_arch = "aarch64", feature = "tegradesk"))]
+const TEGRADESK_CLICK_ROUTED: bool = false;
+
+/// DESKSEAM STOP-LINE 2 — **§5.2, the inherited stack hazard.** The Pi overflowed a 16 KiB kernel
+/// stack in the desktop-arming cascade TWICE on consecutive metal boots (2026-08-22, boots 10 and
+/// 11), and both commits state that no gate in this tree can reproduce it: the overflow needs a
+/// preemption frame on an already-deep pass, and raspi4b delivers no timer IRQ on that path. A green
+/// `test-arm` is therefore not evidence about this, and treating it as evidence is the failure.
+///
+/// Arming the full cascade is RUNG 5 and is blocked. Rung 2 lands the seam, not the desktop.
+///
+/// Flipping this alone is not enough and is not the intended route: the flip belongs to the rung that
+/// can show the Orin's own `[u7stk]`/`[redzone]` numbers for this cascade on this board. §7 of the
+/// ladder is explicit that every stack number quoted for it so far is a **Pi** number.
+#[cfg(all(target_arch = "aarch64", feature = "tegradesk"))]
+const TEGRADESK_CASCADE_OK: bool = false;
+
+/// **DESKSEAM — the Orin's desktop seam: evaluate the floors, print them, and refuse.**
+///
+/// Returns `true` iff `pidesk::activate()` both ran and left the console ROUTED. Every other path
+/// returns `false` and names its reason on the wire. Nothing the caller does depends on the value
+/// today — the tegra path has no `fbcon::detach()` handoff to guard, which is the one thing the Pi
+/// wrapper's return value exists for — so this is a leaf, and a refusal costs the boot nothing.
+///
+/// **EVERY VERDICT BELOW IS DERIVED FROM A VALUE READ ON THIS BOOT, never asserted.** The floors are
+/// the same ones `video/pidesk.rs` evaluates internally, hoisted to the seam so that a refusal names
+/// itself BEFORE the cascade is entered rather than from inside it — and two of them (`table` and
+/// the stage) are floors `pidesk` does not check at all, because on the Pi they cannot fail.
+#[cfg(all(target_arch = "aarch64", feature = "tegradesk"))]
+fn tegra_desk_arm() -> bool {
+    use core::sync::atomic::Ordering;
+    use unaos_kernel::video::{dock, fbcon, pidesk, wm};
+
+    if TEGRADESK_ENTERED.swap(true, Ordering::AcqRel) {
+        serial_println!("[deskseam] REFUSE reason=already-armed (the seam is one-shot; a second pass would re-enter pidesk's own latch and re-ask for a window it would hand straight back)");
+        return false;
+    }
+
+    // FLOOR 1 — THE PANEL, live off the surface the compositor composites onto, never assumed.
+    // Copy the info out and drop `WRITER` immediately: nothing below may hold it across a `wm` call
+    // (the WRITER/TABLE acquisition order, ORIN-WM1's rule). FAILS on a headless Orin — no DTB
+    // `simple-framebuffer` handoff means the JD1 block printed `JB1b — geometry unresolved` and
+    // never seeded `WRITER`, and every floor after this one is a function of panel geometry.
+    let info = {
+        let fb = *unaos_kernel::video::WRITER.lock();
+        if !fb.is_ready() {
+            serial_println!("[deskseam] REFUSE reason=no-panel (headless boot — JD1 seeded no scanout; every floor below is a function of panel geometry)");
+            return false;
+        }
+        fb.info()
+    };
+    // NO SEPARATE ZERO-GEOMETRY FLOOR, and it was removed rather than never written: `pidesk`'s own
+    // step 1 tests `pw == 0 || ph == 0` after reading `WRITER`, so the obvious thing was to hoist
+    // that test here too. `FrameBuffer::is_ready` (framebuffer.rs) is
+    // `base != 0 && len != 0 && info.width != 0 && info.height != 0` — the extent test is already
+    // inside the readiness test, so the hoisted arm was unreachable. It was written, and the ARMED
+    // artifact convicted it: `LC_ALL=C grep -a -o` found every other `[deskseam]` string in
+    // `unaos-kernel` and not that one, because the optimiser had proved it dead. A DECLINE arm that
+    // cannot be reached is not a floor, it is a comment that costs image bytes.
+    let (pw, ph) = (info.width, info.height);
+
+    // FLOOR 2 — THE STAGING BUFFER (§3.3), and this is the floor the Orin uniquely needs. `wm`'s
+    // staged presents run inside `SYS_WIN_PRESENT`'s IRQ mask, so a buffer that GREW on the pass
+    // would be a masked acquisition of the global heap `Mutex` — the F1-F5 defect family. The tree's
+    // only `reserve_stage` caller is `video::init_panel`, and the tegra path never reaches it (it
+    // seeds `WRITER` by hand instead), so without this line every composite the cascade drives would
+    // take the lazy-growth path. Grow-only and idempotent, so it is safe beside ORIN-WM1's own call.
+    // FAILS when the 48 MiB aarch64 heap cannot spare entry 0 at all.
+    let staged = wm::reserve_stage(&info);
+    if staged == 0 {
+        serial_println!("[deskseam] REFUSE reason=stage-unreserved panel={}x{} stage=0 (wm::reserve_stage got nothing for entry 0 — every composite would grow its buffer under SYS_WIN_PRESENT's IRQ mask, the F1-F5 shape)", pw, ph);
+        return false;
+    }
+    let panel_bytes = pw.saturating_mul(ph).saturating_mul(info.bytes_per_pixel);
+    let cover = if panel_bytes == 0 { 0 } else { staged.saturating_mul(100) / panel_bytes };
+
+    // FLOOR 3 — THE WINDOW TABLE MUST BE EMPTY, read from `wm::count()`.
+    // `video/pidesk.rs` step 1b writes the WHOLE PANEL to `DESKTOP_BG` through the FRONT buffer, and
+    // its own argument for why that direct write is sound is "the window table is empty at this
+    // line, so a direct front-buffer write collides with no compositor-owned pixel". On the Pi that
+    // is true by construction. On the Orin it is NOT: rung 0 (`orindesk`) mints and composites a row
+    // ~400 lines above this one, so `UNAOS_ORINDESK=1 UNAOS_TEGRADESK=1` reaches this seam with a
+    // live window on the glass and `pidesk`'s clear would paint over it while asserting it could not.
+    // This is a REACHABLE failing verdict from two knobs in `arroyo` today, not a hypothetical.
+    let live = wm::count();
+
+    // FLOOR 4 — THE DOCK, i.e. the CONSOLEWIN law's geometry half, evaluated with the SAME call
+    // `pidesk` makes (`MAX_WINDOWS`, not the live count — the check must hold for every table state
+    // the boot can reach). `for_panel` is pure integer geometry and paints nothing. Two-sided in
+    // codegen and derived from the live panel — but the WITHHELD arm's REACH is stated as measured
+    // rather than inherited from the Pi: on this build `for_panel` INLINES and const-folds its
+    // step-down loop to two compares, `ph >= 76 && pw >= 576` (`cmp x21, #0x4c` /
+    // `ccmp x20, #0x240, hs` / `cset w20, lo` in the armed `unaos-kernel`), so no Orin panel this
+    // branch has seen withholds it. The Pi's `DECLINE reason=dock-cannot-host-full-strip
+    // panel=640x480 rows=12` was measured under that track's cell metrics and does NOT transfer —
+    // 640x480 clears the floor above. Reported as the console-window CENSUS term rather than as a
+    // refusal because a withheld console window is not fatal to `pidesk` either: the bar follows
+    // regardless, which is the one place `pidesk`'s sequence deliberately differs from `wcx`'s.
+    let cwin_ok = dock::Layout::for_panel(wm::MAX_WINDOWS, pw, ph).is_some();
+    let routed_now = fbcon::console_is_routed();
+
+    // THE CENSUS. Printed unconditionally, before any refusal below it, so a capture always carries
+    // every floor's measured value and not merely the first one that said no.
+    serial_println!(
+        "[deskseam] floors panel={}x{}x{} stage={} cover={}% table={} console-window={} route={} click-route={} cascade={} rows={}",
+        pw, ph, info.bytes_per_pixel,
+        staged, cover, live,
+        if cwin_ok { "GRANTED" } else { "WITHHELD" },
+        if routed_now { "ROUTED" } else { "UNROUTED" },
+        if TEGRADESK_CLICK_ROUTED { "LANDED" } else { "UNLANDED" },
+        if TEGRADESK_CASCADE_OK { "CLEARED" } else { "HELD" },
+        wm::MAX_WINDOWS
+    );
+
+    if live != 0 {
+        serial_println!("[deskseam] REFUSE reason=table-not-empty live={} (pidesk's DESKTOP-CLEAR writes the whole panel through the FRONT buffer and its soundness argument is an EMPTY window table — ORIN-WM1's row is already composited on this glass; drop UNAOS_ORINDESK to arm the seam)", live);
+        return false;
+    }
+
+    // THE STOP-LINES — ONE decision and ONE line, not two sequential gates, and the reason is a
+    // MATCH over both terms rather than the first one that said no.
+    //
+    // That shape is not a style choice; the artifact forced it. Written as two sequential
+    // `if !CONST { … return }` blocks, the second one's string is DEAD CODE the moment the first
+    // const is `false` — `LC_ALL=C grep -a -o` on the armed `unaos-kernel` found `rung3-unlanded`
+    // and did NOT find `stop-line-5.2`, so an operator's capture would have named the ordering
+    // obligation and been silent about the STACK HAZARD, which is the more dangerous of the two.
+    // The `match` keeps both in the string the build can actually print.
+    if !(TEGRADESK_CLICK_ROUTED && TEGRADESK_CASCADE_OK) {
+        let held = match (TEGRADESK_CLICK_ROUTED, TEGRADESK_CASCADE_OK) {
+            (false, false) => "rung3-unlanded+stop-line-5.2",
+            (false, true) => "rung3-unlanded",
+            _ => "stop-line-5.2",
+        };
+        serial_println!("[deskseam] REFUSE reason={} console-window={} panel={}x{} stage={} (§6.1: pidesk::activate opens the console window, whose minimise disc's only route back is the dock, and jd2_console_pump's Event::Button arm still only logs the mask — the disc would be a one-way trip until rung 3 lands. §5.2: arming the full cascade is rung 5 and is BLOCKED — the Pi overflowed a 16 KiB kernel stack in it on two consecutive metal boots and no QEMU gate in this tree can stack the preemption frame that does it, so a green test-arm is not evidence here)", held, if cwin_ok { "GRANTED" } else { "WITHHELD" }, pw, ph, staged);
+        return false;
+    }
+
+    // THE ARMED PATH. Type-checked by the `arm-tegra-seam` leg; not reached on any boot this branch
+    // can produce, because both consts above are `false` in source. The verdict is DERIVED from the
+    // call's own return CROSSED with `fbcon::console_is_routed()` read back afterwards — `activate`
+    // already reads the route back rather than inferring it, and this line disagreeing with it would
+    // itself be the finding.
+    let activated = pidesk::activate();
+    let routed_after = fbcon::console_is_routed();
+    let verdict = match (activated, routed_after) {
+        (true, true) => "ROUTED",
+        (false, false) => "UNROUTED",
+        // `activate` returns `fbcon::console_is_routed()`; a disagreement means the route changed
+        // between the two reads, which nothing on this path may do.
+        _ => "INCOHERENT",
+    };
+    serial_println!(
+        "[deskseam] ARMED panel={}x{} stage={} activate={} route={} -> {}",
+        pw, ph, staged, activated, routed_after, verdict
+    );
+    activated && routed_after
+}

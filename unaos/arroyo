@@ -714,14 +714,48 @@ _feats=""
 # QUARRY: UnaOS's file manager (`video/quarry.rs` + `video/quarry/live.rs`). Pair it with UNAOS_PIDESK
 # — `quarry` compiles the module, `pidesk` is what opens the window and routes keys and clicks to it.
 #
-# ⚠ NOT YET TYPE-CHECKED ON tegra, and deliberately absent from the `arm-tegra-desk` leg below:
-# `video/quarry/live.rs` names `crate::arch::aarch64::boot::USER_REGION_SIZE`, and `boot` is the Pi's
-# BCM2711 slot module (`#[cfg(feature = "baremetal")]`). The fix is the JETSON-EL0 M1b `uslots` facade
-# substitution `super::boot::` -> `super::uslots::` — a one-line change in `video/`, which is a SHARED
-# lane; it is written up in orin-desktop.md §3.5 and is not applied here. Until it lands,
-# `UNAOS_QUARRY=1` on a tegra build is E0433 and the mapping exists so the knob is at least reachable
-# and its failure visible rather than silent.
+# TYPE-CHECKED ON tegra since ORINDESK-QUARRY (`e14a9008`) and carried by the `arm-tegra-desk` leg
+# below. It was not, for a while, and the reason is worth keeping: `video/quarry/live.rs` named
+# `crate::arch::aarch64::boot::USER_REGION_SIZE`, and `boot` is the Pi's BCM2711 slot module
+# (`#[cfg(feature = "baremetal")]`), so `UNAOS_QUARRY=1` on a tegra build was E0433. The fix was the
+# JETSON-EL0 M1b `uslots` facade substitution `super::boot::` -> `super::uslots::`, one line in
+# `video/` — a SHARED lane, which is why it was written up in orin-desktop.md §3.5.2 and held before
+# it landed. Corrected here 2026-08-25 (this comment had gone stale by three commits; the leg below
+# already carried `,quarry`).
 [ -n "${UNAOS_QUARRY:-}" ] && _feats="${_feats}quarry,"
+# ORINDESK RUNG 2 (TEGRADESK): UNAOS_TEGRADESK=1 arms the Orin's DESKTOP SEAM — `main.rs`'s
+# `tegra_desk_arm`, called as an appended statement on `tegra_early_stop`'s terminus line (the last
+# instruction before `run_capstone_boot_core(0)`, which never returns). It is the tegra-shaped
+# counterpart of `main.rs::pidesk_activate_maybe`, whose `pidesk`+`baremetal` gate is UNSATISFIABLE on
+# this board (`baremetal = ["pi"]`; `pi` + `tegra` is a hard `compile_error!` in
+# `arch/aarch64/serial.rs`) — so the Orin's desktop-arming code existed and could never run.
+#
+# SELF-SUFFICIENT, unlike `orindesk`/`jd1dc`/`smpmark`: the Cargo feature is
+# `tegradesk = ["pidesk", "tegra_el0"]` and `tegra_el0` implies `tegra`, so `UNAOS_TEGRADESK=1`
+# alone builds the armed configuration. That is deliberate and it is the rung's own lesson: the seam
+# calls `video::pidesk::activate` (gated `all(aarch64, pidesk)`), and `pidesk` on aarch64 needs
+# `arch::aarch64::syscall` via `dock::focus_set`, gated `any(baremetal, tegra_el0)`. A standalone
+# spelling would let `UNAOS_TEGRADESK=1 UNAOS_TEGRA=1` compile the seam's ABSENCE and still report
+# green — the exact "gate its own knob cannot satisfy" defect this rung removes. The terms are
+# appended here as well as implied by Cargo so the banner shows the configuration it actually built.
+#
+# ⚠ IT DOES NOT ARM THE DESKTOP, and an armed build proves that on the wire rather than in a comment.
+# The seam evaluates its floors (panel geometry, `wm::reserve_stage`, `wm::count`,
+# `dock::Layout::for_panel` at `MAX_WINDOWS`), prints one `[deskseam] floors …` census derived from
+# them, and then REFUSES at two named stop-lines held `const false` in `main.rs`: rung 3 (click
+# routing) has not landed, so a console window's minimise disc would be a one-way trip
+# (orin-desktop.md §6.1), and the full cascade is §5.2's stop-line — the Pi overflowed a 16 KiB kernel
+# stack in it on two consecutive metal boots and no QEMU gate in this tree can reproduce it.
+# `pidesk::activate()` is COMPILED and TYPE-CHECKED and is not reached on any boot this branch builds.
+#
+# Combine with UNAOS_ORINDESK=1 to see the `table-not-empty` refusal: rung 0's row is already
+# composited by the time this seam runs, and `pidesk`'s DESKTOP-CLEAR is only sound on an empty table.
+#
+# Default OFF => the wrapper, its statics and its call site vanish, and no line moves in any file
+# compiled knob-off (call site appended to an existing line; wrapper at `main.rs`'s file tail). The
+# ARMED polarity is type-checked by the `arm-tegra-seam` leg of KERNEL_CFG_MATRIX, never by this
+# mapping. Witness on the wire: `[deskseam]`. See docs/dev/OS/08_VIDEO/orin-desktop.md §6 rung 2.
+[ -n "${UNAOS_TEGRADESK:-}" ] && _feats="${_feats}tegradesk,pidesk,tegra_el0,tegra,"
 # JB11-ESCAPE: UNAOS_NOJB11=1 suppresses the Falcon firmware-header census
 # (arch/aarch64/xusb_tegra.rs::jb11_fw_header_census) so a bench sitting can take an UN-INSTRUMENTED
 # CONTROL boot. Default UNSET => the census runs on every tegra boot, unchanged — the census is the
@@ -2124,6 +2158,40 @@ KERNEL_CFG_MATRIX=(
   # PRECONDITION: like `arm-tegra-el0`, this leg compiles `arch/aarch64/syscall.rs`, which
   # `include_bytes!`s `target/user_blob.bin`. `ensure_user_blob` (see check_both) supplies it.
   "arm-tegra-desk ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,pidesk,livecon,quarry"
+  # ORINDESK RUNG 2 — the DESKTOP SEAM armed (appended 2026-08-25). `tegradesk` gates `main.rs`'s
+  # `tegra_desk_arm` (the wrapper, its latch, its two stop-line consts) plus the one statement
+  # appended to `tegra_early_stop`'s terminus line. BOTH sites sit behind `tegra` as well
+  # (`tegra_early_stop` is `#[cfg(all(feature = "tegra", target_arch = "aarch64"))]`), and the
+  # wrapper's body reaches `video::pidesk`, `video::dock` and `video::fbcon::console_is_routed`,
+  # every one of which is gated `all(aarch64, pidesk)`. So only a leg carrying `tegra` AND the
+  # desktop family compiles it at all. Without this leg the ARMED polarity would be compiled by
+  # NOTHING — the tegra_el0 / simmer_test / xusbfw / smpmark / orindesk / jd1dc shape, and the reason
+  # the standing law is that a cfg widen's gates must compile the configuration the widen turns ON.
+  #
+  # WHY IT IS HOSTED ON `arm-tegra-desk` AND NOT ON `arm-tegra`, unlike the five tail legs above.
+  # Those knobs are standalone and their hosts are the disarmed shipped image. This one is not
+  # standalone — `tegradesk = ["pidesk", "tegra_el0"]` — so `arm-tegra` + `tegradesk` would silently
+  # BECOME this leg's feature set minus `livecon`/`quarry` via Cargo's own implication, i.e. a leg
+  # whose label and whose list disagree. Hosting it on `arm-tegra-desk` (rung 1's family leg) verbatim
+  # + `tegradesk` keeps the list honest and makes the delta exactly one feature.
+  #
+  # `arm-tegra-desk` stays as the DISARMED twin: the tegra desktop family compiled with the seam OFF,
+  # which is what the shipped armed-desktop configuration would be. There is no
+  # `not(feature = "tegradesk")` site in src/ (5 `tegradesk` sites, all positive, all in `main.rs`),
+  # so no disarmed asymmetry is created — every other leg already carries the OFF polarity.
+  #
+  # WHAT THIS LEG ACTUALLY EXERCISES that no other does: `video::pidesk::activate`,
+  # `video::dock::Layout::for_panel`, `video::fbcon::console_is_routed`, `wm::reserve_stage` and
+  # `wm::count` called FROM `main.rs`'s tegra path — the Orin's first compiled desktop-arming call
+  # site. `arm-pi` compiles the same callee set from a `baremetal` caller; `arm-tegra-desk` compiles
+  # the callees with no aarch64 caller at all.
+  #
+  # UNIVERSE SIDE EFFECT: none. `tegradesk` is named only by this arm-* leg, so `x86_cfg_universe`
+  # drops it, where it would have been vacuous (its only sites are `target_arch = "aarch64"`-qualified
+  # items in `main.rs`) — and `pidesk` was already arm-only while `livecon`/`quarry` are already
+  # in the universe via `x86-all`. +1 board leg, +0 mix legs. `./arroyo check` prints the live
+  # board/mix counts every run — read them there rather than trusting a number in a comment.
+  "arm-tegra-seam ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,pidesk,livecon,quarry,tegradesk"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────
