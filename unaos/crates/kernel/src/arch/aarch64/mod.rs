@@ -335,15 +335,15 @@ pub fn now_cycles() -> u64 {
     v
 }
 
-/// Busy-wait budget in `now_cycles()` (CNTVCT) units. ~2.5 s at a ~60 MHz generic-timer rate.
+/// Fixed FALLBACK busy-wait budget in `now_cycles()` (CNTVCT) units, and the whole budget off-tegra. NOT "~2.5 s at a ~60 MHz generic-timer rate", as this line claimed until 2026-08-25: no part in this tree runs at 60 MHz, and a fixed CYCLE count is a different DURATION on every one of them — 2.78 s on the Pi 4 (CNTFRQ=54000000 Hz on its own boot diag; BOTBOUND's boot 11 blew a 2000 ms budget printing `spent_ms=2779` against 150e6/54e6 = 2777.8 ms, agreement to the millisecond), 2.4 s on QEMU virt (62.5 MHz), and 4.8 s on the Jetson Orin (CNTFRQ=31250000 Hz, capture-proven over three boots — 92% past the figure this line advertised). `hw_wait_budget()` derives a DURATION from CNTFRQ on tegra; this constant is what that derivation falls back to when CNTFRQ_EL0 reads 0, and what it still returns verbatim off-tegra. ⚠ ONE LINE: this file is compiled knob-off and panic `Location` records embed line numbers.
 pub const HW_WAIT_BUDGET: u64 = 150_000_000;
 
-/// Busy-wait budget in `now_cycles()` (CNTVCT) units. Arch-neutral mirror of x86_64's
-/// `hw_wait_budget`; aarch64 has no PM-timer calibration path, so it returns the fixed budget.
-/// (CNTFRQ_EL0 gives the exact CNTVCT rate and could refine this later.)
+/// Busy-wait budget in `now_cycles()` (CNTVCT) units. Arch-neutral mirror of x86_64's `hw_wait_budget`,
+/// which is an honest `tsc_hz * HW_WAIT_SECONDS` once calibrated. The aarch64 twin needs no calibration
+/// — CNTFRQ_EL0 states the rate exactly — but only tegra takes it; see the tail block for why not all.
 #[inline]
 pub fn hw_wait_budget() -> u64 {
-    HW_WAIT_BUDGET
+    hw_wait_budget_derived()
 }
 
 /// WEDGE-7 — the RAII form of [`without_interrupts`], for spans that cannot be expressed as a
@@ -415,4 +415,67 @@ where
         core::arch::asm!("msr daif, {}", in(reg) daif, options(nomem, nostack, preserves_flags));
     }
     ret
+}
+
+// ── HWBUDGET: the CNTFRQ-derived busy-wait budget (tail-defined per the Location-shift convention
+// this file and `timer.rs` already follow; the non-tegra arm is byte-identical to the constant it
+// replaced, so the pi and QEMU-virt images stay byte-identical).
+//
+// The bug: [`HW_WAIT_BUDGET`] is a CYCLE count, and every caller reads it as a DURATION ("~2 s",
+// "~2.5 s", "~8.3 s on a failing transfer" — see `drivers/xhci/mod.rs` and `main.rs`). Those two
+// only agree at one frequency, and it is not a frequency any part in this tree runs at. The Orin
+// is the worst-off: CNTFRQ_EL0 = 31_250_000 Hz makes 150e6 cycles 4.8 s, 92% past the "~2.5 s"
+// the constant advertised. `arch/aarch64/xusb_tegra.rs` had already worked this out in-lane and
+// carries the correct "~4.8 s at Orin's 31.25 MHz"; the arch constant had not caught up.
+//
+// The fix is the one x86_64 already made: state the budget as WALL CLOCK and multiply by the
+// measured rate (`tsc_hz * HW_WAIT_SECONDS` there, `cntfrq * HW_WAIT_MS / 1000` here). aarch64
+// needs no calibration pass to do it — CNTFRQ_EL0 *is* the rate, architecturally.
+//
+// ⚠ WHY THIS IS TEGRA-GATED, AND WHAT THAT COSTS. Deriving on every aarch64 part would be more
+// correct and is NOT what this commit does, because it would silently RE-TIME the Pi 4 and QEMU
+// virt: at 54 MHz a 150e6-cycle budget is the 2.78 s BOTBOUND measured on boot 11, and any whole-
+// second target re-times it (2 s → -28%, 3 s → +8%). Re-timing the Pi's BOT pump is a behavioural
+// change to a platform this seat holds no boot evidence for and does not own; it belongs to the
+// pi seat, with its own metal gate. So: tegra derives, everyone else keeps the exact cycle count
+// they have always had. This is a deliberate asymmetry, flagged here so the next reader does not
+// mistake it for an oversight — the honest one-line summary is that the CONSTANT is wrong
+// everywhere and is only FIXED where the seat that owns the silicon can prove the fix.
+//
+// ⚠ WHY 4800 ms AND NOT 2500. Because 4.8 s is what the Orin has ALWAYS waited (31_250_000 × 4800
+// / 1000 = 150_000_000 exactly — the derivation reproduces today's budget to the cycle), and no
+// evidence in this tree says the Orin's storage path wants 2.5 s. Picking the doc's aspirational
+// "~2.5 s" would have been a real 48% shortening of every xHCI/BOT/FS wait on this platform,
+// dressed up as a comment fix. The correct Orin duration is genuinely open; this commit refuses to
+// settle it silently and preserves the measured status quo instead. What it BUYS is that the
+// number is now a duration: a Tegra part that clocks CNTFRQ differently (Tegra silicon has shipped
+// 19.2 MHz and 31.25 MHz) gets 4.8 s, where the raw constant would have handed it 7.8 s.
+//
+// CNTFRQ_EL0 = 0 falls back to [`HW_WAIT_BUDGET`] rather than deriving a budget of ZERO, which
+// would fail every bounded wait instantly. That is not hypothetical on this platform: `timer::init`
+// carries a whole tegra-gated witness (`CNTFRQ-SUB`) for a firmware that never programmed it, and
+// its own comment names "every wall-clock budget derived from it" as the blast radius. This is that
+// derivation, so it takes the same guard — and the fallback is exactly the cycle count that shipped
+// before, so an unprogrammed CNTFRQ behaves precisely as it did.
+#[cfg(feature = "tegra")]
+const HW_WAIT_MS: u64 = 4800;
+
+/// Backing derivation for [`hw_wait_budget`]. Split out so the tegra-only CNTFRQ read is defined at
+/// the tail of the file, where adding it cannot shift a panic `Location` line number above it.
+#[cfg(feature = "tegra")]
+#[inline]
+fn hw_wait_budget_derived() -> u64 {
+    let hz = timer::cntfrq();
+    if hz != 0 {
+        hz.saturating_mul(HW_WAIT_MS) / 1000
+    } else {
+        HW_WAIT_BUDGET
+    }
+}
+
+/// Off-tegra: the fixed cycle count, unchanged and un-re-timed. See the block above.
+#[cfg(not(feature = "tegra"))]
+#[inline]
+fn hw_wait_budget_derived() -> u64 {
+    HW_WAIT_BUDGET
 }
