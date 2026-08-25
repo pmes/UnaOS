@@ -9052,6 +9052,44 @@ static WCSER_RERUNS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 /// dirty-paced silent return below — no compositing at all is idleness, not a wedge.
 ///
 /// NO AUTOMATIC BREAKER — deliberately; see the stale-holder note above [`COMP_GATE`].
+///
+/// ### WCSER-READER — `steals=` AND `revenants=`, AND WHY THEY ARE LOADED RATHER THAN DRAINED
+///
+/// [`COMP_STEALS`] and [`COMP_REVENANTS`] were incremented from the moment WCSER-STEAL landed and
+/// **appeared on no serial line anywhere in the tree** — `grep` returned the declaration and the
+/// `fetch_add`, and nothing else. The cost was already paid: boot 16's operator playbook asked
+/// Peter to watch `COMP_REVENANTS`, and he could not have seen it however hard he looked. That is
+/// the SIXTH instance of this module's own standing law — *an instrument that cannot fire in the
+/// state it exists for is not a cheaper guard, it is an ABSENT one* — and the reader is the fix.
+///
+/// They are not decoration. `revenants` counts cores that came back from the dead and correctly
+/// declined to release a gate a live core now owns, so a nonzero reading is **news about the
+/// DEVICE, not about us**: it means a stuck BAR1 store eventually COMPLETED, which converts "the
+/// parked core never comes back" from an observation into a refuted one. WCSER-STEAL's own safety
+/// argument rests on that being an observation rather than an invariant, and this is the only field
+/// that could ever contradict it.
+///
+/// **LOADED, NEVER SWAPPED — and that is not merely because they are boot-cumulative gauges like
+/// `holder=`/`held_ms=` beside them.** This function SELF-SILENCES: a period with no compositing at
+/// all returns above without printing. A DRAINED steal counter would therefore be destroyed by any
+/// silent period that followed the steal — the steal would be counted, the rollup would decline to
+/// print, and the swap that never ran would leave the evidence nowhere. Cumulative reading makes
+/// the self-silencing harmless: the count survives every quiet period and is stated by the next
+/// rollup that prints for any reason. The one property a boot-cumulative reading gives up — which
+/// 5 s window a steal fell in — is already carried, loudly and with its own timestamp, by the
+/// `GATE STOLEN == tripwire ::` line.
+///
+/// **A ZERO IS PRINTED, NOT OMITTED.** Both fields are unconditional. A counter that appears only
+/// when non-zero cannot distinguish *"no revenants"* from *"the reader is dead"*, and this tree has
+/// now been bitten by that exact confusion six times. Standing law, restated because this is the
+/// commit that pays for having forgotten it: **an absence is only evidence if the thing that would
+/// have produced it was actually attempted.** `revenants=0` on a boot that also reads `steals=1` is
+/// a measurement; a missing field is not.
+///
+/// Tail-insertion, ahead of `span=`, exactly where `exbusy=` went in for the same reason: no
+/// existing key changes name, value, or its position relative to its neighbours, so every
+/// name-matching harvest reads as before. A positional harvest past `exbusy=` shifts by two, which
+/// is the standing property of every insertion this line has taken.
 #[cfg(all(target_arch = "x86_64", feature = "witness"))]
 fn wcser_emit(scope: &str, span: u64) {
     use core::sync::atomic::Ordering::Relaxed;
@@ -9073,7 +9111,7 @@ fn wcser_emit(scope: &str, span: u64) {
         crate::arch::ms().saturating_sub(COMP_HOLD_T0_MS.load(Relaxed))
     };
     serial_println!(
-        "[wcser] scope={} entered={} declined={} reruns={} declined_pct={} holder={} held_ms={} exbusy={} span={}ms -> {}",
+        "[wcser] scope={} entered={} declined={} reruns={} declined_pct={} holder={} held_ms={} exbusy={} steals={} revenants={} span={}ms -> {}",
         scope,
         entered,
         declined,
@@ -9082,6 +9120,10 @@ fn wcser_emit(scope: &str, span: u64) {
         holder as isize,
         held_ms,
         OCC_EXCUSE_BUSY.swap(0, Relaxed),
+        // WCSER-READER — LOADED, NOT SWAPPED, and the difference is load-bearing. See the ledger
+        // above this function.
+        COMP_STEALS.load(Relaxed),
+        COMP_REVENANTS.load(Relaxed),
         span,
         // WEDGED is tested first and outranks SERIAL: a period in which every pass was declined and
         // none was ever entered is a permanently-held gate, not successful serialisation.
