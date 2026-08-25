@@ -4265,7 +4265,17 @@ pub fn composite() {
             let dead = COMP_HOLDER_CORE.load(Relaxed);
             if held >= COMP_GATE_STEAL_MS && dead != usize::MAX {
                 let me = crate::arch::sched::meter_current_cpu();
-                if dead != me
+                // WCSER-PICK — the acquirer is CHOSEN, not merely NEXT. See [`comp_steal_pick`].
+                // `dead != me` is kept as the first term for the reason it always had: a core cannot
+                // steal from itself. It is ALSO the whole of the liveness test the tier below needs —
+                // the acquirer is `meter_current_cpu()`, i.e. the core executing this instruction, so
+                // "is the chosen core alive?" is answered by the fact that it is asking.
+                let pick = if dead == me {
+                    None
+                } else {
+                    comp_steal_pick(me, dead, held)
+                };
+                if pick.is_some()
                     && COMP_HOLDER_CORE
                         .compare_exchange(dead, me, AcqRel, Relaxed)
                         .is_ok()
@@ -4301,13 +4311,17 @@ pub fn composite() {
                         COMP_OVERDUE_REPORTED.store(false, Relaxed);
                         serial_println!(
                             ":: [wcser] GATE STOLEN from c{} by c{} after {}ms — the holder was in \
-                             phase {} row {} and had not moved; desktop resumes on this core, c{} is \
+                             phase {} row {} and had not moved. The acquirer was CHOSEN, not next in \
+                             line: pick={} render={} svc={}; desktop resumes on this core, c{} is \
                              DEAD and its singleton roles are owed a re-home == tripwire ::",
                             dead,
                             me,
                             held,
                             COMP_PASS_PHASE.load(Relaxed),
                             COMP_PASS_ROW.load(Relaxed),
+                            pick.map_or("-", StealPick::name),
+                            crate::arch::smp::render_cpu().map_or(-1, |c| c as isize),
+                            crate::arch::smp::service_cpu().map_or(-1, |c| c as isize),
                             dead
                         );
                     }
@@ -8522,6 +8536,169 @@ const COMP_PASS_OVERDUE_MS: u64 = 1_000;
 /// without the row advancing once.
 #[cfg(target_arch = "x86_64")]
 const COMP_GATE_STEAL_MS: u64 = 4_000;
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// WCSER-PICK — THE STEAL HANDS THE GATE TO THE WORST POSSIBLE CORE, AND IT DOES SO BY DESIGN.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+//
+// WCSER-STEAL declared a dead holder's gate free and let THE NEXT CORE TO ASK win it. Boot 16
+// measured what that means: `[deadman] gate=` names **c7 in 383 of the 492 post-steal samples**
+// (88 % of those naming any core), and c7 is the DEVICE-SERVICE core — `x86_usb_pump` plus
+// `x86_input_service`.
+//
+// That is structural, not luck. `x86_usb_pump`'s loop body composites on the calling core
+// (`wcx::desktop_app_service` -> `wm::pace_service`, `fbcon::console_service` ->
+// `route_present_banded`). Before the steal every one of those calls was refused at the
+// [`COMP_GATE`] compare-exchange in nanoseconds because the corpse held the gate, so the pump
+// free-ran; after the steal they ran FULL PASSES on the device core. A core inside a pass for 88 %
+// of wall clock runs its pump loop at ~12 % of its rate — 818 x 0.12 is about 98, against a
+// measured post-steal median `pmp` of 140 (pre-wedge median 818). The whole 5.8x `pmp` step is the
+// compositor's cost, charged to the device core.
+//
+// **THE GENERAL FORM, which is what this block is really for: a steal that hands a resource to
+// WHOEVER ASKS NEXT hands it to the BUSIEST CORE, because the busiest core asks most often.** A
+// "free for all" acquisition is not neutral with respect to placement; it is actively biased
+// against it, and the bias is proportional to exactly the property placement exists to protect.
+//
+// `main.rs` already publishes the right answer. `arch::smp::publish_sched_split(render, service)`
+// exists precisely to keep composite work off the service core, and `smp` exposes both halves so
+// that callers ASK rather than re-derive. The steal was the one acquisition site in the compositor
+// that never asked.
+//
+// WHY THE PREFERENCE IS EXPRESSED AS A TIME-STAGED ADMISSION rather than as a choice. This module
+// cannot hand the gate to a core of its choosing: `composite()` runs ON the acquirer and the
+// acquirer then runs the pass, so the only lever available here is whether THIS caller is admitted
+// to steal. A preference is therefore a window during which the preferred callers are admitted and
+// the others are not — and it MUST be bounded, because a preferred core that never calls
+// `composite()` would otherwise hold the desktop dead forever. Falling through to any live core is
+// not a weakening of the preference, it is the preference's terminating case: **a desktop on the
+// wrong core still beats a dead desktop.** That trade is WCSER-STEAL's and is not reversed here.
+
+/// WCSER-PICK — which rung admitted the acquirer. Named, and printed on the `GATE STOLEN` line, so
+/// the wire says WHY this core got the gate instead of leaving it to be inferred from an index.
+///
+/// The rungs, in order, and what each one exists for:
+///
+/// * `Unpublished` — no SCHED-X86 split has been published. There is no preference to honour, so
+///   there is nothing to wait for and the first asker is admitted immediately. This mirrors
+///   [`crate::arch::smp::worker_cpu`]'s `PlaceTier::Unpublished`, which likewise degrades to the
+///   raw core list rather than inventing a policy out of an absent one.
+/// * `Render` — the caller is the render core. This is the placement answer: composite work belongs
+///   on the core `publish_sched_split` named for it, and the render service's own drain lives there.
+/// * `Pool` — the caller is neither the corpse nor the SERVICE core. This is the rung that actually
+///   fires on the measured fault, because in all five recorded wedges the holder was `c1` and `c1`
+///   IS the render core — the corpse is the preferred core, so rung `Render` is empty by
+///   construction and the real question is only "anyone but the pump".
+/// * `Any` — the grace is spent and the service core may take it. Same discipline as
+///   [`crate::arch::smp::xhci_worker_cpu`] inverted, and deliberately so: that helper DECLINES
+///   rather than co-locate because co-locating is a deadlock, while here co-locating is merely
+///   expensive and declining is a dead desktop. The rung is named on the wire precisely so an
+///   expensive outcome is never a silent one.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StealPick {
+    Unpublished,
+    Render,
+    Pool,
+    Any,
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+impl StealPick {
+    /// Phrased as [`crate::arch::smp::PlaceTier::name`] phrases the same question.
+    fn name(self) -> &'static str {
+        match self {
+            StealPick::Unpublished => "unpublished",
+            StealPick::Render => "render",
+            StealPick::Pool => "pool",
+            StealPick::Any => "any",
+        }
+    }
+}
+
+/// WCSER-PICK — how long each rung holds the gate open for its own candidates before the next rung
+/// is admitted.
+///
+/// Sized off the measured arrival rate at the gate, not guessed. Boot 16's `[deadman] dec=` roster
+/// read `f0ffffff` through the hold: one hex nibble per core, SATURATING at `f`, so every core
+/// except the corpse registered at least 15 declines in every one-second sample. At that measured
+/// FLOOR a 250 ms window gives each candidate core at least three arrivals; the true rate is higher
+/// (the nibble is clamped, and `pmp` alone was running ~985 pump passes a second, each of which
+/// asks twice).
+///
+/// The cost is stated rather than left to be discovered: worst case this adds **two** graces, 500 ms,
+/// to a recovery bound of 4 s — 12.5 % more frozen glass on a panel that has by then been frozen for
+/// four seconds. It is spent only when the earlier rungs decline to fire, and rung `Render` is
+/// skipped outright when it is provably unsatisfiable (below), so the measured fault pays 250 ms.
+#[cfg(target_arch = "x86_64")]
+const COMP_STEAL_GRACE_MS: u64 = 250;
+
+/// WCSER-PICK — may THIS core take the dead holder's gate yet, and on which rung?
+///
+/// `None` means "not this core, not yet" — the caller falls through to the ordinary acquire CAS,
+/// which fails against the corpse's held gate, and the pass is declined exactly as it was before.
+/// Declining here costs nothing that was not already being paid: the gate has been held for
+/// [`COMP_GATE_STEAL_MS`] and every pass on every core is being refused regardless.
+///
+/// **The service core is excluded by NAME, on two rungs out of three, and admitted by name on the
+/// third.** `Render` requires `me == render`, and additionally requires that the render core is not
+/// itself the service core — `publish_sched_split` takes two indices and does not enforce that they
+/// differ, so a degenerate publish must not be able to smuggle the pump core in through the rung
+/// that exists to keep it out. `Pool` requires `Some(me) != svc` directly. `Any` is the only rung
+/// that can hand the gate to the pump, it fires only after both graces, and it says `pick=any` on
+/// the wire when it does.
+///
+/// **The split is read as TWO loads, and that is safe here for a reason worth stating** — `smp`'s
+/// own ledger warns that two loads of `SPLIT` can straddle the publish. The only interleaving that
+/// straddle can produce is `render_cpu() == None` followed by `service_cpu() == Some(_)`, which
+/// lands on the `Unpublished` arm below and admits immediately. That is the correct behaviour for
+/// an unpublished split anyway, so the race has no reachable wrong answer. The one-load helper
+/// (`smp::split`) is private, and this arc does not own `smp`.
+#[cfg(target_arch = "x86_64")]
+fn comp_steal_pick(me: usize, dead: usize, held: u64) -> Option<StealPick> {
+    let Some(render) = crate::arch::smp::render_cpu() else {
+        // No split: no preference exists, so there is nothing to wait for.
+        return Some(StealPick::Unpublished);
+    };
+    let svc = crate::arch::smp::service_cpu();
+
+    // Rung 0 — the render core, from the instant the steal bound is crossed.
+    if me == render && Some(me) != svc {
+        return Some(StealPick::Render);
+    }
+
+    // Rung 0 is UNSATISFIABLE when the corpse IS the render core, and that is not an edge case: it
+    // is the only case ever measured (`holder=c1` on boots 11, 13, 14, 15 and 16, against
+    // `:: SCHED-X86: RENDER on core 1 ... ::` on every one of them). Waiting out a grace for a
+    // candidate that cannot exist is pure frozen glass, so the rung is skipped rather than served.
+    // Same reason `xhci_worker_cpu` returns `None` instead of degrading — an unsatisfiable rule is
+    // answered, not slept on.
+    let after_render = COMP_GATE_STEAL_MS
+        + if dead == render || Some(render) == svc {
+            0
+        } else {
+            COMP_STEAL_GRACE_MS
+        };
+    if held < after_render {
+        return None;
+    }
+
+    // Rung 1 — any core that is not the device-service core. This is the rung that fires on the
+    // measured fault. Its satisfiability is NOT pre-checked: answering "does a core outside
+    // {corpse, service} exist?" means taking `ONLINE_APS`'s lock and cloning a `Vec` from inside a
+    // composite pass, which is a heap allocation on a path that may run under the table lock. The
+    // second grace is the answer instead — it costs 250 ms in the degenerate case and nothing in
+    // the normal one, and it needs no lock.
+    if Some(me) != svc {
+        return Some(StealPick::Pool);
+    }
+
+    // Rung 2 — the service core. The floor, and the reason there is one.
+    if held < after_render + COMP_STEAL_GRACE_MS {
+        return None;
+    }
+    Some(StealPick::Any)
+}
 
 /// WCSER-STEAL — how many times a dead holder's gate has been taken this boot. Never drained: a
 /// standing nonzero is the desktop having survived something that used to end the session.
