@@ -10,6 +10,14 @@
 #
 # Expected noise, deliberately NOT forbidden: `xHCI: >>> COMMAND FAILED (Code 11) <<<`
 # (hub-MSC intermittency, graceful fallthrough — unaos-jetson-resume).
+#
+# 2026-08-25 (orin 4): this file now also adjudicates BOOT 7e — the desktop / click /
+# display-probe flight staged at
+# `~/unaos-bench/flash/orin/boot7e-desk-click-jd1dcmodel-20260825T1927Z-24284e5/`
+# (SRC.SHA commit 24284e50, branch hw-jetson). Four instrument families that image
+# carries and this spec had never heard of — `[orinwm1]`, `[orinclick]`, `JD1-DC`
+# (both verdict axes) and the always-on `[redzone]` guards — now have rows, all of
+# them OPTIONAL or PENDING. See the BOOT 7e banner below the EL0/IRQEL/SMPMARK blocks.
 
 # --- boot bring-up witnesses (the JD/JB chain — all previously metal-proven) --------
 REQUIRE JD1.*scanout:.*sane=true
@@ -66,7 +74,7 @@ REQUIRE TEGRA-SD.*block backend published
 # by every refusing site, not a per-site sequence, so `n=1` says nothing about which lane
 # refused first and it cannot be anchored per-`bg`. Read `el0refuse=` on `[el0core] rollup:` for
 # the running total instead — NOT on `[spread4]`, which is LINK-TIME DEAD on a tegra build (every
-# caller of `spread4_witness` is unreachable there, so the linker drops the string; sched.rs:3215
+# caller of `spread4_witness` is unreachable there, so the linker drops the string; sched.rs:3223
 # records the `LC_ALL=C grep -a` over the linked `arm-tegra-el0` kernel that measured it). Pointing
 # a reader at `[spread4]` on THIS board was the exact blindness commit 2f4cd179 existed to remove:
 # the one platform that actually refuses could not read its own refusal counter. The per-event
@@ -92,12 +100,12 @@ FORBID SCHED: EL0 entry REFUSED
 #
 # THE `[el0core]` READERS — the counter's reader and the mask's stamp, on the platform that
 # refuses. All three patterns are pure ASCII in the source (verified with `LC_ALL=C grep -a -n`,
-# not assumed): unlike the cap-announce at sched.rs:3308, none of these lines carries an em-dash,
+# not assumed): unlike the cap-announce at sched.rs:3316, none of these lines carries an em-dash,
 # so none needs truncating before one. `{:#x}` renders a lowercase `0x…`, hence `0x[0-9a-f]+`.
 #
-#   sched.rs:3369 THE ROLLUP. `el0_refusal_rollup` has TWO call sites in
-#   `run_capstone_boot_core` — sched.rs:9815, an UNCONDITIONAL baseline BEFORE the drive loop is
-#   entered, and sched.rs:9820, a poll inside the inner `while dispatch_next(cpu)` body. (The
+#   sched.rs:3362 THE ROLLUP. `el0_refusal_rollup` has TWO call sites in
+#   `run_capstone_boot_core` — sched.rs:9831, an UNCONDITIONAL baseline BEFORE the drive loop is
+#   entered, and sched.rs:9836, a poll inside the inner `while dispatch_next(cpu)` body. (The
 #   obvious site, after the inner `while`, is RUNTIME DEAD on tegra: main.rs stages the infinite
 #   `jd2_console_pump`, so that queue never drains and the inner loop never returns.) The baseline
 #   is the falsifier for the whole instrument: `EL0_ROLLUP_LAST` starts at `u64::MAX`, so `0 != MAX`
@@ -105,13 +113,13 @@ FORBID SCHED: EL0 entry REFUSED
 #   OPTIONAL: absence on the next tegra capture means the reader is not linked or not reached, which
 #   is a real regression and should advise promotion once a capture carries it.
 PENDING \[el0core\] rollup: el0refuse=[0-9]+ el1cores=0x[0-9a-f]+
-#   sched.rs:3201 THE STAMP. `mark_el1_core` is called from main.rs:2588, inside `tegra_early_stop`
+#   sched.rs:3209 THE STAMP. `mark_el1_core` is called from main.rs:2588, inside `tegra_early_stop`
 #   (`#[cfg(all(feature = "tegra", target_arch = "aarch64"))]`), with NO runtime knob and strictly
 #   before `tegra_el0_start_maybe()` — an unstamped mask would refuse the pinned `el0-hello`, so the
 #   `REQUIRE TEGRA-EL0 .. round-trip -> PASS` above cannot pass without this line having printed.
 #   Unconditional on a tegra image, therefore PENDING-promotable on the first capture that has it.
 PENDING \[el0core\] el1 core MEASURED: cpu=[0-9]+ mask=0x[0-9a-f]+
-#   sched.rs:3186 and :3194 THE TWO FAIL-CLOSED ARMS, sharing the prefix below (CurrentEL != 1, and
+#   sched.rs:3194 and :3202 THE TWO FAIL-CLOSED ARMS, sharing the prefix below (CurrentEL != 1, and
 #   cpu_index out of range). OPTIONAL, and the kind is the decision, exactly as for the IRQEL trio:
 #   this is a FAULT path. A boot that works correctly never prints it, so PENDING would advise
 #   promoting a failure to REQUIRE, and REQUIRE would demand one. Present in the table, never a gate.
@@ -219,6 +227,251 @@ OPTIONAL \[irqel2b\] \S+ SKIPPED
 OPTIONAL ^:P:
 OPTIONAL :R[0-9]+:
 OPTIONAL :A:
+
+# =====================================================================================
+# BOOT 7e — THE DESKTOP / CLICK / DISPLAY-PROBE FLIGHT. Everything from here to the
+# regression block below is UNFLOWN: every pattern is a PREDICTION about a line that
+# has NEVER printed. Measured, not assumed — all 29 patterns take ZERO hits across all
+# nine Orin/Jetson captures in the bench tree (85,599 lines), scanned with `awk`.
+# Every string keyed on below was read out of the STAGED ARTIFACT
+# (`flash/orin/boot7e-desk-click-jd1dcmodel-20260825T1927Z-24284e5/kernel.elf`, SRC.SHA
+# commit 24284e50) with `LC_ALL=C grep -a -o` — never `strings`, whose default -n 4
+# silently drops short marks and whose runs break at em dashes and middle dots.
+#
+# THE IMAGE'S FEATURE SET, AND ONE CORRECTION TO THE OBVIOUS READING OF IT:
+#   tegra, tegrasmp, smpmark, orindesk, orinclick, jd1dc  (+ always-on redzone guards)
+# `tegradesk` and the installer are OUT. `tegra_el0` is IN — NOT because it was passed,
+# but because Cargo.toml:1747 declares `orinclick = ["tegra_el0"]`. So the EL0-EL1CORE
+# block above is ARMED on this flight and adjudicates normally; its lines are NOT
+# expected absent. Confirmed in the artifact rather than inferred from the feature
+# list: `TEGRA-EL0` x10, `[el0core]` x4, `el1 core MEASURED` x1, `SCHED: task '` x1.
+# (SMPMARK likewise already has its three rows above and needs nothing added here.)
+#
+# NOTHING BELOW IS A REQUIRE AND NOTHING BELOW IS A FORBID. That is the whole point:
+# this file promotes nothing without a capture, and not one of these lines has one.
+# The required/forbidden counts are unchanged by this block, by construction.
+# =====================================================================================
+
+# --- ORINWM1 (rung 0): the first composited window on Orin silicon -------------------
+# ARMED BY `orindesk`. `orin_wm1` (display_tegra.rs:377) is called UNCONDITIONALLY from
+# main.rs:2185 — appended to the `:: KERNEL HEAP ALLOCATED ::` statement, no runtime
+# knob. It emits EXACTLY ONE line per boot: one of six early-return DECLINEs
+# (display_tegra.rs:394/417/421/430/473/491) or the terminal `win=` line (:516).
+#
+# WHY THE `win=` LINE IS PENDING AND NOT OPTIONAL. It is what a healthy boot of THIS
+# image prints, and the only DECLINE a CONFIGURATION rather than a fault can cause is
+# `no-panel` — which this spec has already excluded: `orin_wm1` runs at main.rs:2185,
+# strictly AFTER JD1's `panel LIVE` at main.rs:2028, and `REQUIRE JD1.*panel LIVE`
+# above demands that line. On any capture this spec passes, `WRITER` is seeded and the
+# no-panel arm cannot fire. Absence of `win=` on such a boot is therefore a regression,
+# and PENDING is the directive that says "promote on the first capture that carries
+# it". NOT REQUIRE: no capture carries it yet, and this file promotes nothing without.
+#
+# THE `\[orinwm1\]` TAG IS LOAD-BEARING, and that is measured rather than stylistic.
+# The field shape ` win=<n> panel=<w>x<h> surf=<w>x<h>` is NOT unique to this rung —
+# dropping the tag takes two false hits in the existing corpus, both in
+# `capture/orin1-boot2/boot2-recovered.log`:
+#   `[wc-x] console-window win=1 panel=1920x1200 surf=1295x736 box=1305x780 at (307,158) ...`
+#   `[pulsewin] open win=3 panel=1920x1200 surf=1280x120 box=1290x164 at (10,922) ...`
+# An untagged pattern would report the x86 compositor's window as the Orin's.
+# NO EM-DASH TRUNCATION IS NEEDED HERE: display_tegra.rs:516's format string is pure
+# ASCII end to end. The one `[orinwm1]` line that DOES carry an em dash is the
+# `no-panel` DECLINE (`(headless boot — no JD1 scanout)`), and the DECLINE pattern
+# below stops at `reason=`, well before it.
+PENDING \[orinwm1\] win=[0-9]+ panel=[0-9]+x[0-9]+ surf=[0-9]+x[0-9]+
+# THE TWO VERDICT ARMS OF THAT LINE, and the kind IS the decision. `present=` is the
+# question rung 0 exists to ask — did pixels reach glass, or did the present pass run
+# and get suppressed — so BOTH answers are legitimate outcomes of a first flight and
+# NEITHER may red it. OPTIONAL, on exactly the IRQEL-trio argument above.
+# MEASURED CAVEAT, stated rather than glossed: `wm::Presented::Coalesced` also maps to
+# `-> COMPOSITED` (display_tegra.rs:511), but the literal `Coalesced` has ZERO
+# occurrences in the staged kernel.elf while `Composited`, `Suppressed` and `NoRow`
+# each have one — that arm is unreachable from `present_outcome` on this build and the
+# compiler dropped the string. So on THIS image `-> COMPOSITED` implies
+# `present=Composited`, and a future build could change that without warning.
+OPTIONAL \[orinwm1\] win=.* -> COMPOSITED
+OPTIONAL \[orinwm1\] win=.* -> PRESENT-DECLINED
+# The six refusal arms under their shared prefix — the `[el0core] NOT stamped:`
+# precedent. FAULT PATHS: a correct boot never prints one, so PENDING would advise
+# promoting a failure to REQUIRE and REQUIRE would demand one. OPTIONAL: in the table,
+# never a gate. The reason is on the line; the table says only that one of them fired.
+OPTIONAL \[orinwm1\] DECLINE reason=
+
+# --- ORINCLICK (rung 3): does a press actually reach a window? ----------------------
+# ARMED BY `orinclick`. THREE LINES, THREE KINDS, because they have three different
+# reachabilities — and flattening them is how this instrument would go quiet unnoticed.
+#
+#   1. THE ARM LINE (display_tegra.rs:1269) — ONCE, from the first call of
+#      `orin_click_census` (display_tegra.rs:1236), which main.rs:2887 appends to
+#      `jd2_console_pump`'s phase-2 sweep with no runtime knob. `REQUIRE JD2.*console
+#      pump live` above already demands that pump, so on any capture this spec passes
+#      the arm line should have printed. PENDING.
+#   2. THE CENSUS (display_tegra.rs:1313) — every ~10 s from inside that same drain
+#      loop, UNCONDITIONALLY, including and especially when nothing has happened. It is
+#      the routing task printing on its own core off its own counter, so its absence is
+#      a DEAD PUMP — the regression worth advising a promotion for. PENDING.
+#      STATED HOLE: a capture cut inside the first census period carries the arm line
+#      and no census, and nothing in this file can tell that apart from a dead pump,
+#      because this spec declares no `COMPLETE` marker (see KNOWN DEFECTS at the foot).
+#      PENDING never fails a run, so the row is safe either way; the reader checks the
+#      arm line by eye, exactly as for the IRQEL window above.
+#   3. THE EDGE LINE (display_tegra.rs:1179) — one per Button event, routed from
+#      main.rs:2852. An UNATTENDED boot prints none, and that is not a fault. OPTIONAL.
+#      Absence here means UNRUN, never failed — the census's `IDLE-NO-CLICKS` is the
+#      line that says which.
+PENDING \[orinclick\] arm panel=[0-9]+x[0-9]+ rows=[0-9]+
+PENDING \[orinclick\] census seq=[0-9]+ t=[0-9]+ up=[0-9]+s btn=[0-9]+
+OPTIONAL \[orinclick\] edge=(press|release|none) btn=0x[0-9a-f]+
+# THE CENSUS VERDICTS THAT ARE NOT FAILURES. `ROUTING` is the success answer and it is
+# deliberately NOT a REQUIRE: it can only be reached if a human actually pressed the
+# button, so a REQUIRE would red an unattended boot on CONFIGURATION rather than on
+# health — the argument the SMPMARK block above makes in full. `IDLE-NO-CLICKS` is the
+# UNRUN answer and is equally legitimate. Both OPTIONAL; between them they tell the
+# reader whether the click test was performed at all, which is the first thing anyone
+# adjudicating this flight needs to know.
+OPTIONAL \[orinclick\] census .* -> ROUTING
+OPTIONAL \[orinclick\] census .* -> IDLE-NO-CLICKS
+# The DECLINE arms of all three lines, keyed on the `-> ` that precedes every verdict:
+# `no-geometry` (edge); `panel-locked` / `no-panel` / `no-target` (arm); and
+# `geometry-refused` / `no-target` / `release-only` / `all-miss` (census). REFUSALS,
+# not failures — `DECLINE reason=no-target` is precisely what a correct `orinclick`
+# boot prints when no window exists to click. OPTIONAL. The pattern stops at `reason=`
+# on purpose: the ARM line's no-target text continues `(wm table empty — arm
+# UNAOS_ORINDESK=1 for a row to click)` and carries an em dash a lossy UART can replace.
+OPTIONAL \[orinclick\] .* -> DECLINE reason=
+# NO ROW IS WRITTEN FOR THIS RUNG'S THREE `FAIL` VERDICTS, AND THAT IS DELIBERATE.
+# `FAIL reason=no-raise` and `FAIL reason=miss-unhandled` (the edge line) and
+# `FAIL reason=stuck-focus` (the census) all render on the wire as `-> FAIL reason=…`,
+# which mbench's ALWAYS-ON default FORBID `-> FAIL` (mbench.py:135) already matches.
+# They red the flight with no help from this file, and that IS the correct outcome:
+# unlike the JD1-DC and IRQEL verdicts, a press that hit a window and did not move the
+# focus is an invariant break, not a measurement with a legitimate negative arm. A
+# second FORBID here would only double-report it.
+# READ THIS BEFORE THE FLIGHT: it means an attended click that finds `stuck-focus`
+# turns the WHOLE replay FAIL. That is the intended reading, not a spec defect.
+
+# --- JD1-DC: does the CCPLEX decode nvdisplay, and through WHICH register map? ------
+# ARMED BY `jd1dc`. `jd1_dc_probe` (display_tegra.rs:632) is called from main.rs:2127
+# with no runtime knob, inside the block guarded by JB1b's resolved DTB geometry —
+# which `REQUIRE JB1b.*MRQ_PING.*-> PASS` above already demands.
+#
+# TWO ORTHOGONAL AXES, AND CONFLATING THEM IS THE DEFECT THE `MODEL-VERDICT=` AXIS WAS
+# ADDED TO REMOVE. `VERDICT=` answers "does the aperture decode, and did a window hold
+# the inherited scanout base". `MODEL-VERDICT=` answers "and through WHICH register map
+# were we reading". `DECODES-NOMATCH` alone cannot separate a wrong-window sweep from a
+# wrong-chip register map; the two lines together can.
+#
+# AXIS 1 — `JD1-DC VERDICT=`. EXACTLY ONE prints on every path that reaches an
+# nvdisplay read or refuses to (display_tegra.rs:616 states the invariant; the six
+# REFUSED arms are the early returns at :640 / :649 / :656 / :676 / :686 / :723 and the
+# three read verdicts are at :845 / :857 / :866). Unconditional on this image, so the
+# UMBRELLA is PENDING: absence on the next capture means the rung is not linked or not
+# reached, which is a real regression and should advise the promotion.
+PENDING JD1-DC VERDICT=
+# THE FOUR ARMS ARE OPTIONAL AND NONE OF THEM MAY RED THE FLIGHT. This is a PROBE and
+# its polarity IS the finding: `NOT-DECODING` is not a failure of UnaOS, it is an answer
+# about Tegra234 silicon that nobody in this tree has ever had. A FORBID on any arm
+# would convert a measurement into a rubber stamp; a REQUIRE on `REACHABLE` would demand
+# an answer the hardware may simply not give. Every pattern stops before the em dash
+# that follows the verdict word on all nine of these lines — they are long and
+# prose-heavy and they cross a UART shared with the SPE's TCU.
+OPTIONAL JD1-DC VERDICT=REACHABLE
+OPTIONAL JD1-DC VERDICT=DECODES-NOMATCH
+OPTIONAL JD1-DC VERDICT=NOT-DECODING
+OPTIONAL JD1-DC VERDICT=REFUSED reason=[a-z-]+
+# THE HANG-FORENSICS PAIR (display_tegra.rs:732 and :738). The first announces a read
+# into an MMIO class this CCPLEX has never touched; the second says it came back. If
+# the board dies inside an EL3-fatal read, FIRST TOUCH is the LAST line on the wire and
+# the SURVIVED line never comes — that asymmetry IS the instrument. OPTIONAL, both:
+# they are reachable only once the BPMP power guard has passed, and a boot that refuses
+# at the guard legitimately prints neither.
+# THE PATTERNS DELIBERATELY START AFTER THE EM DASH. The wire text is
+# `:: tegra: JD1-DC — FIRST TOUCH …`; keying on the `JD1-DC` prefix would put a
+# multi-byte character inside the match on the exact line whose job is to survive a
+# board that is about to stop transmitting. Both fragments below are contiguous ASCII
+# in the staged kernel.elf and were read out of it.
+OPTIONAL FIRST TOUCH of a new MMIO class: about to read
+OPTIONAL FIRST READ SURVIVED:
+# AXIS 2 — `MODEL-VERDICT=` (`jd1_dc_model`, display_tegra.rs:1490, called from :741).
+# SEVEN ARMS, AND EVERY ONE OF THEM IS A LEGITIMATE RESULT. There is no failure arm on
+# this axis: the rung's entire purpose is to report which of seven states this silicon
+# is in, and a spec that let one of them red the flight would be asking the hardware to
+# BE something instead of measuring what it IS. So: ALL SEVEN OPTIONAL — and, unlike
+# `VERDICT=` above, NO PENDING UMBRELLA EITHER. `jd1_dc_model` is called downstream of
+# both the BPMP guard and the aperture-size check at :723, so a boot that prints
+# `VERDICT=REFUSED reason=aperture-too-small` prints no MODEL-VERDICT line at all and
+# is CORRECT to. A PENDING here would advise promoting a line that can legitimately be
+# absent — the same error as a REQUIRE, in the other direction.
+# THE TWO CLASS ARMS ARE DISJOINT BY CONSTRUCTION: `{:04X}` (display_tegra.rs:1669,
+# :1675) renders UPPERCASE hex, and `UNKNOWN` cannot match `[0-9A-F]{4}` because `U` is
+# not a hex digit — so the specific arm can never swallow the unknown one.
+OPTIONAL JD1-DC-MODEL MODEL-VERDICT=NVDISPLAY-CLASS-[0-9A-F]{4}
+OPTIONAL JD1-DC-MODEL MODEL-VERDICT=NVDISPLAY-CLASS-UNKNOWN-[0-9A-F]{4}
+OPTIONAL JD1-DC-MODEL MODEL-VERDICT=DECODES-NOT-NVDISPLAY
+OPTIONAL JD1-DC-MODEL MODEL-VERDICT=NOT-DECODING
+OPTIONAL JD1-DC-MODEL MODEL-VERDICT=DISCRIMINATOR-TRIVIAL
+OPTIONAL JD1-DC-MODEL MODEL-VERDICT=UNDETERMINED reason=discriminator-not-read
+OPTIONAL JD1-DC-MODEL MODEL-VERDICT=REFUSED reason=no-reads
+# THE SUPPORTING DUMPS. `JD1-DC-REG` is the DTB `reg`/`reg-names` decode, `JD1-DC-IDS`
+# the clocks/resets/power-domains resolution the BPMP guard is built out of, and
+# `CAP CROSS-CHECK` the +0x30000-vs-+0x00060 comparison that says whether the two
+# capability mirrors agree. DIAGNOSTICS ATTACHED TO A VERDICT, not verdicts — nothing
+# should ever be REQUIRED to print a state dump, exactly as argued for `[irqel2a]`.
+# All three tags are followed by an em dash on the wire; all three patterns stop first.
+OPTIONAL JD1-DC-REG
+OPTIONAL JD1-DC-IDS
+OPTIONAL CAP CROSS-CHECK
+
+# --- REDZONE: the kernel-stack guard bands, and they are ALWAYS ON ------------------
+# NOT knob-gated and NOT feature-gated: sched.rs:41 sizes a 1024 B low absorber
+# (`STACK_REDZONE`) and a 512 B high guard (`STACK_HIGHGUARD`) on every task stack in
+# every build, and both readers sit on the dispatch path. UNLIKE the SMPMARK block
+# above, therefore, absence here is NOT a configuration artifact — it is the good news.
+#
+#   sched.rs:5298 LOW-REDZONE — read AFTER the task returns from `switch_context`.
+#     `entered` = this task's own SP crossed into its absorber; `TRAVERSED` = the
+#     absorber is EXHAUSTED and the slab below it may already hold a smashed frame.
+#   sched.rs:5225 HIGH-GUARD — read BEFORE the switch. A NEIGHBOUR's overrun came into
+#     this stack's slab from ABOVE; the guard absorbed it and this task IS resumed.
+#
+# BOTH ARE FAULT PATHS, SO BOTH ARE OPTIONAL — the rule the `[el0core] NOT stamped:`
+# and `[orinwm1] DECLINE` rows follow. A correct boot never prints either, so PENDING
+# would advise promoting a stack overflow to REQUIRE. And NOT FORBID, which is the one
+# judgement call in this block and is made deliberately: these lines report a guard
+# that WORKED. The overrun was absorbed, the parked frame is intact, the task is
+# resumed, and both emitters are rate-limited to 16 reports. Redding a flight on an
+# absorbed overrun would suppress the one signal telling the next arc which stack to
+# grow. THE UNABSORBED CASE IS A STATED GAP, NOT A COVERED ONE: when the saved SP is
+# outside the task's own stack, sched.rs:5226 prints `[spin6] cpu=<n> REFUSING corrupt
+# switch-in: …` and drops the task — and that line has NO row in this file and is
+# matched by none of mbench's default FORBIDs, so a boot that loses a task that way
+# still scores clean. Checked, not assumed. Left alone here because a FORBID on it
+# would MOVE THE FORBIDDEN COUNT, which this pass is not permitted to do; it is the
+# next seat's call.
+# EM-DASH TRUNCATION: both lines carry an em dash immediately after `task={id}:{name}`,
+# so both patterns stop at `task=` and neither ever contains a multi-byte character.
+OPTIONAL \[redzone\] cpu=[0-9]+ LOW-REDZONE (entered|TRAVERSED) task=
+OPTIONAL \[redzone\] cpu=[0-9]+ HIGH-GUARD entered task=
+
+# --- KNOWN DEFECTS IN THIS FILE — CONFIRMED 2026-08-25, DELIBERATELY NOT FIXED ------
+# Recorded so the next reader does not re-derive them, and so nobody trusts a green
+# table further than it deserves. Both are pre-existing and both are out of this pass's
+# scope; each needs its own decision, because each MOVES A COUNT.
+#
+#   1. `FORBID Serror` (below) CAN NEVER FIRE. The kernel emits `SError` and `SERROR`
+#      — the staged kernel.elf carries `SError` x2 and `SERROR` x6 and the literal
+#      `Serror` ZERO times — and mbench compiles every pattern with a bare
+#      `re.compile` (mbench.py:157), no `re.IGNORECASE`. Dates from 18813ed1
+#      (2026-08-18), this file's first commit. Fixing it arms a forbidden pattern that
+#      has never been armed, which is a real change in what this spec asserts.
+#   2. THIS SPEC DECLARES ZERO `COMPLETE` MARKERS, so mbench's TRUNCATED verdict
+#      (rule 2 of `run_verdict`) can never fire for it and a capture cut short reads
+#      FAIL rather than the honest INCONCLUSIVE. That matters more here than on any
+#      other platform: this medium is known-lossy (UARTC shared with the SPE's TCU),
+#      and several instruments added above — the click census, the JD1-DC FIRST TOUCH
+#      pair — are LATE and are exactly the ones a short capture drops.
+#      `pi4-regression.spec` and `x86-witness.spec` each declare 2; the jetson specs
+#      declare none.
 
 # --- regressions that would convict the merge, not the hardware ---------------------
 FORBID PANIC
