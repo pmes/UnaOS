@@ -8903,3 +8903,19 @@ pub fn spawn_prio_stack(
 // one extra victim. Closing it properly means a REDZONE (an unpoisoned guard span below each stack
 // whose first touch is the fault) rather than a wider bounds test here, since by the time this code
 // runs the neighbour's frame is already gone. Not this arc's; recorded so the shape is known.
+
+/// BGSPREAD — per-core snapshot of `pick_cpu`'s PRIMARY key (`el0_active`: committed minus parked
+/// runnable EL0 residents) for the placement witness; `usize::MAX` for an offline or out-of-range
+/// core, so a min-scan over `0..NUM_CPUS` naturally ignores non-candidates. Introspection only —
+/// never consulted on a scheduling path (the `core_load` discipline). Its only caller is the
+/// `witness`-gated fixture battery, and the fn itself is `witness`-gated too: measured (BGSPREAD
+/// byte-identity control), even an UNREFERENCED pub item here perturbs the knob-off image's code
+/// layout, so the knob-off build must not contain the item at all. Appended at the END of this
+/// file deliberately, so no knob-off panic `Location` line number shifts.
+#[cfg(feature = "witness")]
+pub fn el0_active_snapshot(cpu: usize) -> usize {
+    if cpu >= NUM_CPUS || !ONLINE_MASK[cpu].load(Ordering::Acquire) {
+        return usize::MAX;
+    }
+    el0_active(cpu)
+}

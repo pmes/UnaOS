@@ -11493,46 +11493,46 @@ fn spinhunt_witness() {
 }
 
 /// BG-SPREAD — the regression leg for the P62 stacking. Launches `NBG` background programs and
-/// REQUIREs that their parent tasks did not all land on the same core.
+/// REQUIREs that each parent was PLACED on a core holding the minimum runnable-EL0-resident count
+/// (`el0_active`) at the instant of its own launch — the actual `CPU_AUTO` placement contract.
 ///
-/// WHAT THE EXISTING LEGS COULD NOT CATCH. Every `bg` leg in this file launches ONE program at a
-/// time, so none of them can observe a relationship BETWEEN launches — and stacking is only visible
-/// as a relationship. The `:: SCHED: task 'bg-user' -> core N ::` placement line has always carried
-/// the raw fact, but a spec REQUIRE matches one line at a time and cannot count distinct cores
-/// across several; this leg does the counting in the kernel and states the result in one assertable
-/// line. (The `SCHED: load` row cannot substitute: attended P62 showed it reading a flat
-/// `c0=51 c1=99 c2=52 c3=0` while four bg vugs each visibly slowed — the meter was correct and the
-/// placement was the fault, which is exactly why the assertion has to be on placement.)
+/// WHAT THE EXISTING LEGS COULD NOT CATCH. Every other `bg` leg launches ONE program at a time, so
+/// none can observe a relationship BETWEEN launches — and stacking is only visible as one (attended
+/// P62: four bg vugs slowed while `SCHED: load` read flat — the PLACEMENT was the fault).
 ///
-/// THE LEG. Spawn `NBG` copies of the BGSPREAD fixture back to back, reading each one's chosen core
-/// from `sched::last_user_placement()` immediately after its own spawn; then kill and reap all of
-/// them so the process table is left exactly as it was found (the KILLBOUND/SPINHUNT courtesy — this
-/// leg runs inside the same battery). The assertion is `distinct >= 2`.
+/// THE LEG. Immediately before each of `NBG` back-to-back spawns, snapshot every online core's
+/// `el0_active` (`sched::el0_active_snapshot` — `pick_cpu`'s PRIMARY key); spawn; read the chosen
+/// core from `sched::last_user_placement()`; REQUIRE the chosen core's snapshotted count to equal
+/// the minimum (argmin membership). Then kill + reap every launch (KILLBOUND/SPINHUNT courtesy).
 ///
-/// WHY `>= 2` AND NOT `== NBG`. The property under test is that placement is a function of LOAD, not
-/// of the launcher's core. A load-balanced policy is *allowed* to reuse a core — if two cores are
-/// genuinely the least loaded and one drains first, landing twice on it is correct behaviour, and a
-/// `== NBG` assertion would make a correct scheduler flap. `>= 2` is the strongest claim that is
-/// true for every legal execution, and it is still fatal to the bug: co-location can only ever
-/// produce 1.
+/// WHY ARGMIN MEMBERSHIP AND NOT "DISTINCT CORES". The first cut asserted `distinct >= 2`, and
+/// boot 12 redded it while the scheduler was CORRECT: SPINHUNT residue held cores 0/2/3
+/// (`load settled c0=8 c1=0 c2=38 c3=99`), core 1 was the strict key-1 minimum, and winning all
+/// three launches was right — the same code read `cores 3,0,1 distinct=3 PASS` on a clean boot. A
+/// distinct count claims a LOAD PATTERN; argmin membership is the policy itself, and residual
+/// load only shrinks the argmin set. Ties legal; keys 2-4 pick among them, deliberately unasserted.
 ///
-/// TEETH (the A/B). On the pre-arc code `spawn_user_image_bg` passed `this_cpu()`, and all `NBG`
-/// launches run from this one witness task on one core, so `distinct` is 1 BY CONSTRUCTION and the
-/// leg fails on every boot — it cannot pass for a lucky reason. With `CPU_AUTO`, spread is
-/// STRUCTURAL, not atmospheric (corrected 2026-07-26 after the U7FIX composition false-red): each
-/// fixture busy-spins boundedly before parking, so it still occupies its core's ready queue while
-/// the next placement is decided, and `pick_cpu`'s FIRST tiebreak (queue depth) avoids used cores
-/// by construction. The original claim leaned on the rotating tie-break, which only breaks FULL
-/// ties — the busy-fraction criterion almost never fully ties, and on a calm boot one strictly-least
-/// core legally won all three placements (`distinct=1`, correct policy, red leg).
+/// TIEBREAK ORDER, CORRECTED. An earlier revision of this block claimed queue depth was
+/// `pick_cpu`'s FIRST tiebreak. It is KEY 2: the PRIMARY key is `el0_active` (SPREAD-3/SPREAD-4,
+/// committed minus parked), then queue depth, then busy fraction, then the rotating cursor. The
+/// SPREAD-10 half-resident bonus only decides ties WITHIN the argmin set — never beats a resident.
 ///
-/// An honest skip on a boot with fewer than 2 online cores (the metal 3-of-4 variance in the spec
-/// header has a uniprocessor tail): with one candidate core there is no spread to observe, and a
-/// `distinct=1` there would be correct rather than a regression.
+/// TEETH (the A/B). On the pre-arc code `spawn_user_image_bg` passed `this_cpu()`, so launch 2
+/// lands back on the launcher's core while it still carries launch 1's committed resident (each
+/// fixture busy-spins boundedly before parking, so a back-to-back launch observes it) — count 1
+/// against a 0 elsewhere, outside the argmin set: the leg fails BY CONSTRUCTION, not by luck.
+///
+/// HONEST WINDOW. The snapshot precedes its own spawn with no yield between, and the battery runs
+/// no other slot spawner (`last_user_placement`'s argument). A PARK in the window could drop the
+/// true argmin below the recorded one — but the fixture's bounded busy-spin outlives the launch
+/// loop by design, and battery residue that is runnable (yield-polling) never parks.
+///
+/// An honest skip below 2 online cores (the metal 3-of-4 variance has a uniprocessor tail).
 fn bgspread_witness() {
-    /// Launches. Three is the smallest count that distinguishes "spread" from "alternates with the
-    /// launcher's core" — with two, a policy that merely bounced to the sibling would also pass.
+    /// Launches. Three preserved from the first cut: launch i's committed resident is on the board
+    /// when launch i+1 is placed, so the leg watches placement REACT to load it created itself.
     const NBG: usize = 3;
+    const NC: usize = super::percpu::NUM_CPUS; // snapshot width; offline cores read `usize::MAX`
 
     let online = super::sched::online_cpu_count();
     if online < 2 {
@@ -11549,33 +11549,38 @@ fn bgspread_witness() {
 
     let mut live: [(u64, u64); NBG] = [(0, 0); NBG]; // (pid, asid)
     let mut cores = [usize::MAX; NBG];
+    let mut loads = [usize::MAX; NBG]; // the chosen core's snapshotted el0_active, per launch
+    let mut mins = [usize::MAX; NBG]; // the snapshot minimum over online cores, per launch
+    let mut inmin = 0usize;
     let mut launched = 0usize;
     let mut first_fail = "";
+    #[cfg(feature = "witness")] let key1 = super::sched::el0_active_snapshot; // key-1 reader; the accessor itself is `witness`-gated in sched.rs so the knob-off image carries no extra item
+    #[cfg(not(feature = "witness"))] let key1 = |_c: usize| usize::MAX; // knob-off stub: this leg is UNREACHABLE without `witness` (`u7-launch` is gated at its main.rs spawn) — the stub only keeps the token stream compiling
     for i in 0..NBG {
+        // Key-1 snapshot FIRST: after the spawn the chosen core carries this launch's own resident.
+        let mut snap = [usize::MAX; NC];
+        let mut minv = usize::MAX;
+        for c in 0..NC {
+            snap[c] = key1(c); // `usize::MAX` when offline
+            if snap[c] < minv { minv = snap[c]; } // one line — this region is line-budgeted (see ⚠ below)
+        }
         match spawn_user_image_bg(blob) {
             Ok((pid, asid, _)) => {
                 // Read the placement the spawn just made. Sound here for the reason
                 // `last_user_placement` documents: this task made the call and reads it back before
                 // yielding, and the fixture-battery context has no other slot spawner running.
-                cores[i] = super::sched::last_user_placement();
+                let core = super::sched::last_user_placement();
+                cores[i] = core;
+                loads[i] = if core < NC { snap[core] } else { usize::MAX };
+                mins[i] = minv;
+                if loads[i] == minv { inmin += 1; } // ⚠ folded: knob-off line numbers are load-bearing in this file
                 live[i] = (pid, asid);
                 launched += 1;
             }
             Err(why) => {
-                if first_fail.is_empty() {
-                    first_fail = why;
-                }
+                if first_fail.is_empty() { first_fail = why; } // ⚠ folded, same budget
                 break;
             }
-        }
-    }
-
-    // Distinct cores among the launches that actually happened. NBG is 3, so an O(n^2) scan is the
-    // clearest way to say it and needs no allocation.
-    let mut distinct = 0usize;
-    for i in 0..launched {
-        if !cores[..i].contains(&cores[i]) {
-            distinct += 1;
         }
     }
 
@@ -11587,26 +11592,21 @@ fn bgspread_witness() {
         let t0 = super::timer::cntpct();
         let budget = super::timer::cntfrq().saturating_mul(5);
         loop {
-            if matches!(bg_poll(pid, true), BgPoll::Gone) {
-                settled += 1;
-                break;
-            }
-            if super::timer::cntpct().wrapping_sub(t0) >= budget {
-                break;
-            }
+            if matches!(bg_poll(pid, true), BgPoll::Gone) { settled += 1; break; } // ⚠ folded, same budget
+            if super::timer::cntpct().wrapping_sub(t0) >= budget { break; } // ⚠ folded, same budget
             super::sched::yield_now();
         }
     }
 
-    if launched == NBG && distinct >= 2 && settled == NBG {
+    if launched == NBG && inmin == NBG && settled == NBG {
         serial_println!(
-            ":: BGSPREAD: {} bg launches over {} online cores -> cores {},{},{} distinct={} (want >= 2) PASS ::",
-            launched, online, cores[0], cores[1], cores[2], distinct
+            ":: BGSPREAD: {} bg launches over {} online cores -> cores {},{},{} el0min {}/{},{}/{},{}/{} inmin={} (want == 3) PASS ::",
+            launched, online, cores[0], cores[1], cores[2], loads[0], mins[0], loads[1], mins[1], loads[2], mins[2], inmin
         );
     } else {
         serial_println!(
-            ":: BGSPREAD: launched={}/{} distinct={} settled={} first_fail='{}' -> FAIL ::",
-            launched, NBG, distinct, settled, first_fail
+            ":: BGSPREAD: launched={}/{} inmin={} cores={},{},{} el0min={}/{},{}/{},{}/{} settled={} first_fail='{}' -> FAIL ::",
+            launched, NBG, inmin, cores[0], cores[1], cores[2], loads[0], mins[0], loads[1], mins[1], loads[2], mins[2], settled, first_fail
         );
     }
 }
