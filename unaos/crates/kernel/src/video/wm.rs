@@ -13509,6 +13509,10 @@ pub fn drag_begin(id: WinId, x: i32, y: i32) -> bool {
     // this a grab that follows a recent gesture inside one frame period would sit still for up to
     // `DRAG_MOTION_MS` before the window began to move — the pacer's one chance to be visible as lag.
     DRAG_PACE_LAST_MS.store(0, Ordering::Relaxed);
+    // DRAG-ADMIT — the adaptive floor resets with the pacing clock and for the same reason: a fresh
+    // grab must not sit out the previous gesture's measured compositor weather.
+    #[cfg(target_arch = "aarch64")]
+    DRAG_LAST_MOVE_MS.store(0, Ordering::Relaxed);
     DRAG_PACE_ADMITTED.store(0, Ordering::Relaxed);
     DRAG_PACE_COALESCED.store(0, Ordering::Relaxed);
     // Review condition (dragflick adoption): a superseding `begin` is the THIRD way a gesture
@@ -13577,6 +13581,44 @@ pub const DRAG_MOTION_MS: u64 = 16;
 /// have to wait out a frame before the window starts following the hand.
 static DRAG_PACE_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// DRAG-ADMIT — **what the LAST admitted reposition actually cost, in ms** (0 = fresh gesture, no
+/// admitted move measured yet), and the aarch64 half of the pacer's admission floor.
+///
+/// [`DRAG_MOTION_MS`]'s own doc predicts the failure this closes: the constant paces admission at
+/// ~60 Hz on the argument that one reposition retires faster than the next report arrives — and on
+/// the bench panel it does not. A 1920x1200 shell drag retires composites at ~11/s while the 16 ms
+/// gate admits 62/s, so the pacer over-admits 5.7x and the queue grows for as long as the hand
+/// moves, which is the "can barely drag a window across the screen" shape M2 was built against,
+/// reproduced at bench geometry by the `[dragperf]` fixture itself (`admitted=9..11 coalesced=0`
+/// over a 320 ms 125 Hz sweep: every report admitted, nothing folded, because each admitted move
+/// consumed more than the whole 16 ms window before the next report was judged).
+///
+/// So the floor ADAPTS: admission is spaced by `max(DRAG_MOTION_MS, cost of the last admitted
+/// move)`. A compositor faster than 60 Hz is paced exactly as before (the measurement is below the
+/// constant and the `max` discards it); one slower stops being asked for work faster than it can
+/// retire it, and the gesture degrades to "the window steps at the rate the panel can actually
+/// paint" instead of to a growing backlog. Coalescing semantics are unchanged — nothing is dropped,
+/// a folded report's travel is applied by the next admitted move, exactly as M2 argues.
+///
+/// **aarch64 only, deliberately and narrowly.** [`DRAG_MOTION_MS`] is arch-neutral and read beyond
+/// this arch, so the constant is untouched; the adaptive term lives inside [`drag_motion_paced`]
+/// behind `target_arch = "aarch64"` and every other arch's admission arithmetic is literally the
+/// expression it was before this arc. x86's own throttle (`wc_drag_motion`, its own private
+/// `DRAG_MOTION_MS`) is another lane's file and is not touched.
+///
+/// The measurement is CAPPED ([`DRAG_ADMIT_CAP_MS`]) so one pathological pass — a stalled barrier's
+/// bounded give-up, a wedge fixture's deliberate stall — cannot freeze the gesture: the floor may
+/// reach 4 Hz, never lower. Reset to 0 by [`drag_begin`] with the rest of the pacing clock, so a
+/// fresh grab inherits nothing from the last gesture's compositor weather.
+#[cfg(target_arch = "aarch64")]
+static DRAG_LAST_MOVE_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAG-ADMIT — ceiling on the measured admission floor, in ms. See [`DRAG_LAST_MOVE_MS`]: the
+/// bench's slow regime is ~92 ms per retire, so 250 keeps every honest measurement while bounding
+/// the damage of a pathological one at four admissions a second.
+#[cfg(target_arch = "aarch64")]
+const DRAG_ADMIT_CAP_MS: u64 = 250;
+
 /// DRAG-PI M2 — **steer the live drag to `(x, y)`, at most once per [`DRAG_MOTION_MS`].**
 ///
 /// The COALESCING seam, and the whole of the arc's input-side saving. Without it every pointer
@@ -13600,13 +13642,33 @@ pub fn drag_motion_paced(x: i32, y: i32) -> bool {
     }
     let now = crate::arch::ms();
     let last = DRAG_PACE_LAST_MS.load(Relaxed);
-    if last != 0 && now.wrapping_sub(last) < DRAG_MOTION_MS {
+    // DRAG-ADMIT — the admission floor: the constant everywhere, raised on aarch64 to what the last
+    // admitted move measurably cost, so admission can never outrun retirement. See
+    // [`DRAG_LAST_MOVE_MS`] for the whole argument and the scoping rule.
+    #[cfg(target_arch = "aarch64")]
+    let floor = DRAG_MOTION_MS.max(DRAG_LAST_MOVE_MS.load(Relaxed));
+    #[cfg(not(target_arch = "aarch64"))]
+    let floor = DRAG_MOTION_MS;
+    if last != 0 && now.wrapping_sub(last) < floor {
         DRAG_PACE_COALESCED.fetch_add(1, Relaxed);
         return false;
     }
     DRAG_PACE_LAST_MS.store(now.max(1), Relaxed);
     DRAG_PACE_ADMITTED.fetch_add(1, Relaxed);
-    drag_motion(x, y)
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        drag_motion(x, y)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let moved = drag_motion(x, y);
+        // Measured across the whole admitted reposition (table lock, deferred erase, damage pass,
+        // composite) and stored unconditionally: a move that declined cheaply stores a small number
+        // and the floor decays back toward the constant on its own.
+        DRAG_LAST_MOVE_MS
+            .store(crate::arch::ms().wrapping_sub(now).min(DRAG_ADMIT_CAP_MS), Relaxed);
+        moved
+    }
 }
 
 /// DRAG-PI M3 — **what a pointer report owes the window system after a drain's own arms have run:**
