@@ -2100,6 +2100,87 @@ cannot move it, and arming it would buy a false "closed". The derived fix is one
 known-mutable, which is a different thing from suppressing the verdict. Not taken here: this arc
 convicted the mechanism, not the remedy.
 
+### 6.14b The `exec-wcg` arc — WCGSEAM read on the wire, and the honest bracket taken (2026-08-25)
+
+The census §6.9c's DISCRIMINATOR note pre-registered has now spoken, in the exact configuration it
+said the decision waits on (`UNAOS_PIDESK=1 UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 150`,
+QEMU raspi4b). The armed boot produced the standing red — 4 forbidden hits: 2 sample `COHER`, 1
+sample `BLIT`, 1 rollup `COHER` — and every conviction carried its census line, verbatim:
+
+```
+[wcgseam] win=1 seq=1 verdict=BLIT routed=yes glyphs=260 delta=149 locked=845 last_age_us=20568 -> GLYPH-RASTER
+[wcgseam] win=1 seq=2 verdict=COHER routed=yes glyphs=2032 delta=216 locked=2244 last_age_us=57492 -> GLYPH-RASTER
+[wcgseam] win=1 seq=3 verdict=COHER routed=yes glyphs=4906 delta=325 locked=5121 last_age_us=34883 -> GLYPH-RASTER
+```
+
+**The reading, against the pre-registered rules.** `delta>0` on ALL THREE convictions — the writer
+caught inside the bracket every time; the exoneration branch (`delta=0` with a large age) never
+occurred. §6.14's attribution is CONFIRMED on the wire: fbcon's glyph raster is the concurrent
+writer, and the verdicts are not artefacts of a phantom — the surface really mutates under the
+bracket (hundreds of glyph events per 10–19 ms span; `seq=3`'s four legs are four different hashes).
+`locked=` tracks the census total exactly (on aarch64 the split path does not exist), so the census
+is 100 % locked — remedy (a) sufficient in REACH, its price pure COST (an `FBCON` spinlock held
+across a 10–29 ms bracket, waited on from print context with IRQs masked). Note when reading
+`locked= > glyphs=`: `glyphs=` is the bracket-close snapshot, `locked=` is loaded at print time,
+tens of ms later, with the writer still running — a print-ordering artifact, not a data error.
+`last_age_us=` likewise ages from the bracket-close snapshot, so it includes the read-back + serial
+interval.
+
+**Where the census can and cannot fire — verified this arc, not assumed.** On tegra it cannot
+COMPILE (both fbcon charge sites lack a tegra arm — rmbp 6's finding, re-verified). On x86 QEMU it
+compiles (`strings` shows `[wcgseam] win=`, `GLYPH-RASTER`, `QUIET-BRACKET` in the image) but cannot
+FIRE: `:: kepler: no-device ::` → `wcx::activate` never runs (its sole caller is the Kepler
+takeover) → `panel_console_window_open` never runs → `CONSOLE_WIN` stays `WIN_NONE` → the charge
+sites' `routed` guards never pass → `SEAM_WIN` stays 0 and the print's `p.id == SEAM_WIN` gate is
+unsatisfiable. A `UNAOS_WC=1 UNAOS_KEPLER=1 UNAOS_KEPLER_TAKEOVER=1 ./arroyo test 150` boot
+confirmed it end-to-end: `[wc-g]` sampled four fixture windows, all CLEAN, zero `[wcgseam]`. The
+armed bench-geometry Pi boot is the one QEMU environment that discriminates, exactly as §6.9c's
+note said.
+
+**The remedy taken — the honest bracket (`WCGSEAM-HB`, `wcg.rs`).** Neither §6.14 candidate:
+(a) is sufficient in reach but is a `wm.rs` locking change with a print-stall price, and (b) blinds
+the instrument to the routed console outright. Instead the granting seats' preferred shape: a
+convicting sample of the census's own window whose FULL adjudication span is dirty (`rb_delta > 0`
+— a second census read taken after the read-back bracket, because a `BLIT` conviction can be caused
+by stores the checksum-span delta never sees) is REFUNDED — `TAKEN` is handed back and a later
+present re-arms the sample — rather than adjudicated. The refunded pass prints ONE line, its
+`[wcgseam]` census with ` rb_delta=N refunded=K/16` as a suffix after the terminal (standing
+insertion rule; the adjudicated `[wcgseam]` grammar above is byte-identical to the pre-registered
+form), skips the sample and `prof` lines (serial per pass goes DOWN), and still charges its four
+phases to `wit_us=` (the cost was paid; the ledger says so). Bounds: `REARM_MAX = 16` per window
+per boot, deliberately NOT recycled (exactly `TAKEN`'s per-boot rule) — a writer that never quiets
+(the livecon steady state §6.14 left unmeasured) exhausts the refunds and convictions resume.
+Compiled out on the x86 `wcg-paygo` build (a refund mid-chunk-battery would desync the paygo
+ledger; x86 metal has zero convictions on record, and a dirty-bracket conviction there adjudicates
+as before, census line beside it).
+
+**Why every FORBID keeps its teeth** (the four at x86-witness.spec and pi4-regression.spec, all
+textually untouched): a quiet-bracket conviction — metal cache incoherence, any non-fbcon writer, a
+deterministic blit defect (which reproduces on post-seam quiet samples) — refunds nothing and fires
+them exactly as before; a conviction on any window but the routed console never enters the gate;
+and the cap guarantees even the excused class convicts if it persists.
+
+**The A/B, read honestly — the seam class closes, and the surviving budget immediately proves the
+FORBIDs are still alive.** Control (this tree minus the remedy): 4 forbidden hits, all `win=1`, all
+seam-dirty (2 sample `COHER` + 1 sample `BLIT` + rollup `COHER`), census lines above. Fix tree, same
+boot: **zero `COHER`, zero `RACE` anywhere in the capture** — the boot-seam brackets were refunded
+(`refunded=1..4/16`, every one `GLYPH-RASTER` with `rb_delta>0`, including two `RACE-BLIT`s whose
+dirt only the full-span read sees) — and the replay is NOT green, because the re-armed budget then
+sampled a regime the control could never reach (its budget was spent inside the seam — §6.14's own
+"the instrument's budget is spent by the control" flaw, closed by the refund): three post-seam
+`win=1` samples on QUIET brackets (`delta=0`, `last_age_us=1.4–3.0 s`, all four hashes frozen)
+convicting `-> BLIT` at `fbbad=20734/100171/97507 of 953120` — the pre-registered exoneration
+branch, occurring for the BLIT class: NOT the glyph writer, a real glass-vs-surface divergence
+during the post-seam fixture traffic (banded presents + drag closure mid-drain is one candidate
+mechanism; a genuine blit defect at bench geometry is another — undiscriminated here, deliberately:
+this arc's instrument answers the WRITER question, not the drain question). The same capture also
+carries run-variant exceptional verdicts the refund gate structurally cannot touch (`win=4`
+`[wc-g] BLIT` + `[wc-d] FAIL` on a surface whose identical checksum PASSed in the control;
+`win=2` `[wc-h] AT-RISK`, the §6.13 QEMU shape — the control boot printed 50 AT-RISK rollups of
+which zero matched the FORBID's pattern, run variance in both polarities). OPEN, handed on: the
+post-seam `win=1` BLIT class at armed bench geometry, newly visible by construction, owner the
+compositor/damage lane — not closed by this arc and deliberately not excused by it.
+
 ---
 
 ### 6.15 WINX-8 — VUGSHRINK's two latent x86 faults, found by the fold, fixed at the crate
