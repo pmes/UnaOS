@@ -2586,17 +2586,17 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     //    first time the scheduler runs on Orin silicon. This is the tegra analogue of the virt JC3 call
     //    site (`kernel_main`), and it becomes the tegra terminus: `run_capstone_boot_core` never returns.
     //
-    //    Single-core, by design. JM5 (Orin SMP via PSCI CPU_ON) is PARKED and deliberately NOT invoked on
-    //    this path: on the real Orin the first `CPU_ON` triggers a fatal Tegra RAS Uncorrectable Error
-    //    (CBB fabric — a BL31/MCE firmware issue, NOT a JM5 code bug; see the "JM5 result" doc section)
-    //    and powers the box off BEFORE returning, which would prevent ever reaching CAPSTONE. JM6 needs no
-    //    SMP, so it sidesteps that wall entirely. (`smp_virt` stays compiled for tegra; it is simply not
-    //    called here. Re-attempting Orin SMP / iterating CPU_ON is out of scope for this arc.)
+    //    STALE-COMMENT REPAIR (2026-08-25; this block previously said "Single-core, by design / JM5
+    //    PARKED", which §ORIN-SMP-DEFAULT made false): secondaries ARE woken by default on tegra —
+    //    `start_secondaries_tegra` runs above (`UNAOS_NOTEGRASMP=1` is the opt-out), CPU_ON succeeds on
+    //    most boots, and the intermittent ORIN-SMP-3 park (~30%, H1: Device-typed instruction fetches
+    //    pre-MMU) is instrumented by SMPMARK, not avoided by staying single-core. The APs stay at EL2;
+    //    only the boot core drops. See arch_arm64.md §ORIN-SMP-DEFAULT.
     //
     //    JM4 above brought the timer up and PROVED IRQ delivery at EL2 (`verify_live`); the drop then
-    //    DISABLES the physical timer so no IRQ hits the EL2-banking `__vec_irq` stub once we are at EL1
-    //    (the stub reads ELR_EL2/SPSR_EL2 — a fault at EL1), and CAPSTONE runs cooperatively (exactly how
-    //    the Pi/virt CAPSTONE already runs under QEMU with no Group-1 delivery).
+    //    disables the EL2 one-shot. The old "no IRQ may hit `__vec_irq` at EL1" rationale died at
+    //    0a60e260 (runtime CurrentEL banking): IRQEL-RT proved an IRQ taken AT EL1 through this vector,
+    //    and ORIN-BSPTICK (UNAOS_BSPTICK) runs a periodic EL1 tick across the terminus. Default CAPSTONE stays cooperative (`on_tick` only; no preemption here until Candidate B arc 2).
     //
     //    JM7 (video): fbcon is deliberately NOT detached here (contrast JC3/virt, whose EL1 map omits
     //    the fb). mmu_tegra mapped the GOP GiBs into BOTH the live EL2 table and the EL1 twin, so the
