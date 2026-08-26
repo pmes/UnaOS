@@ -1063,6 +1063,69 @@ _feats=""
 # `[orindock] arm`, `[orindock] park`, `[orindock] restore`, `[orindock] census`. See
 # docs/dev/OS/08_VIDEO/orin-desktop.md §3.11.
 [ -n "${UNAOS_ORINLADDER:-}" ] && _feats="${_feats}orinladder,orinconwin,orinclick,orindesk,pidesk,tegra_el0,tegra,"
+# ORIN-FACE (FBCONPAR item 1): UNAOS_ORINFACE=1 arms `orinface` — the anti-aliased console face on an
+# ORDINARY Orin boot. This is the one item of the 2026-08-26 `video/` parity survey that an operator
+# can SEE: Orin console text renders font8x8 at scale 1, ~0.8 mm on the 1920x1200 bench panel, the
+# size metal sitting #30 recorded as simply not visible.
+#
+# THE CURE ALREADY EXISTED AND COULD NOT BE REACHED. x86 arms the face in
+# `video/fbcon.rs::panel_console_resume` from the end of `kepler_display::takeover_display`. The
+# aarch64 counterpart `fbcon::panel_console_face_arm` makes the identical four writes — and was gated
+# `all(target_arch = "aarch64", feature = "pidesk")` with two callers, neither of them on an ordinary
+# Orin boot: `video/pidesk.rs::activate` (whose `pidesk` + `baremetal` gate is UNSATISFIABLE here) and
+# `display_tegra::orin_conwin` (which needs `UNAOS_ORINCONWIN=1` and then still DECLINES
+# `reason=ordering-rule` unless `orindesk` AND `orinclick` are armed too, §6.1). Compiled,
+# type-checked, unreachable — the exact defect shape this survey went looking for.
+#
+# STANDALONE, mirroring `orindesk`/`orinclick` and NOT `orinconwin`/`tegradesk`. It opens no window,
+# takes no `wm` lock, needs no `dock` and no syscall surface, so there is nothing for `pidesk` /
+# `tegra_el0` to supply — and requiring them would put a FONT behind §5.2's stop-line. The `pidesk`
+# gate on `panel_console_face_arm` was INCIDENTAL (it recorded where the code was written, not what it
+# needs) and is WIDENED to `any(feature = "pidesk", feature = "orinface")`, so every `pidesk` build,
+# Pi included, sees exactly the function it saw before. Combine freely with UNAOS_ORINCONWIN=1: rung 4
+# re-arms the same four fields to the same values before it sizes the console window.
+#
+# THE SEAM IS `fbcon::init`, NOT THE TERMINUS LINE, and that is the whole of its value: `init` is what
+# resets the cell to font8x8, so arming at the terminus would leave the entire boot log at 0.8 mm.
+#
+# Default OFF => the tail wrapper, its two statics and its call site vanish; the call site is a
+# same-line append to `fbcon::init`'s existing `});`, so no line moves in a file compiled into the
+# knob-off `kernel8.img` whose byte-identity is the Pi track's standing proof. The ARMED polarity is
+# type-checked by the `arm-tegra-orinface` leg of KERNEL_CFG_MATRIX, never by this mapping.
+# UNFLOWN — no Orin has booted it. Witness on the wire: `[orinface] ARMED`, `[orinface] DECLINE`,
+# `[orinface] MISMATCH`.
+[ -n "${UNAOS_ORINFACE:-}" ] && _feats="${_feats}orinface,"
+# ORIN-DEFER (FBCONPAR item 2): UNAOS_ORINDEFER=1 arms `orindefer` — x86's PANEL-DEFER split
+# layout/paint route, ported to the aarch64 console.
+#
+# THE GAP. `video/fbcon.rs::_print` runs its `PanelSink` route under `#[cfg(target_arch = "x86_64")]`,
+# so every aarch64 console line falls to `print_masked`, which holds `without_interrupts` across the
+# WHOLE line — layout AND every glyph's pixel writes. x86's own finding applies unchanged: only the
+# LAYOUT half needs the mask (the lock is `try_lock`ed, and an IRQ-context printer reserves its own
+# disjoint cells), so armed, layout stays masked and locked and the pixel work runs with interrupts
+# enabled and no lock held.
+#
+# WHY IT MATTERS HERE BEYOND THE MASK SPAN: the wedge established 2026-08-26 runs `timer_preempt` ->
+# `load_witness_emit` -> `serial_println!` -> `fbcon::_print` -> ... -> `wm::composite_inner` -> a bare
+# `WRITER.lock()` FROM IRQ CONTEXT. This knob does not fix that lock (LOCKFIX owns `video/wm.rs`); it
+# shortens the masked region the console path holds while that window is open.
+#
+# THE PANIC PATH IS UNCHANGED ON BOTH ARCHES, and the aarch64 arm could not reuse x86's test to keep
+# it so: `PANIC_MIRROR`'s only `store` is `#[cfg(target_arch = "x86_64")]`, so on aarch64 that flag is
+# permanently false and reading it would route PANIC output down the split path. The aarch64 gate is
+# `serial_ring::in_panic_mode()`, which the `#[panic_handler]` sets before `panic_screen()` and before
+# its first `serial_println!`.
+#
+# STANDALONE: nothing here needs `pidesk`, `tegra_el0` or a compositor. On a `pidesk` aarch64 build
+# the routed branch inside `PanelSink::flush` becomes reachable and behaves exactly as x86's does.
+#
+# Default OFF => `_print`'s aarch64 arm folds back to the bare `print_masked(args)` it has always
+# been, the five counters and the census vanish, and the jetson AND pi images are byte-identical to
+# baseline. Every wire-in is a same-line fold, so no panic `Location` moves. The ARMED polarity is
+# type-checked by the `arm-tegra-orindefer` leg of KERNEL_CFG_MATRIX, never by this mapping.
+# UNFLOWN — no Orin has booted it. Witness on the wire: `[orindefer] census … -> DEFERRED` /
+# `-> CLASSIC-ONLY` / `-> LEDGER-MISMATCH`.
+[ -n "${UNAOS_ORINDEFER:-}" ] && _feats="${_feats}orindefer,"
 # JB11-ESCAPE: UNAOS_NOJB11=1 suppresses the Falcon firmware-header census
 # (arch/aarch64/xusb_tegra.rs::jb11_fw_header_census) so a bench sitting can take an UN-INSTRUMENTED
 # CONTROL boot. Default UNSET => the census runs on every tegra boot, unchanged — the census is the
@@ -2856,6 +2919,48 @@ KERNEL_CFG_MATRIX=(
   # PRECONDITION: like `arm-tegra-conwin`, this leg compiles `arch/aarch64/syscall.rs`, which
   # `include_bytes!`s `target/user_blob.bin`. `ensure_user_blob` (see check_both) supplies it.
   "arm-tegra-ladder ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,pidesk,livecon,quarry,orinconwin,orindesk,orinclick,orinladder"
+
+
+  # FBCONPAR armed (appended 2026-08-26) — the two knobs of the `video/` parity arc, on ONE leg
+  # because they are orthogonal and the pair is the configuration a bench flight would actually build.
+  # `orinface` gates the `orin_face_arm` wrapper + its two statics at `video/fbcon.rs`'s tail, its
+  # same-line call site inside `fbcon::init`, and the WIDENED gate on `panel_console_face_arm`.
+  # `orindefer` gates the aarch64 arm of `_print`'s PANEL-DEFER block, the `PanelSink` type and its two
+  # impls, `FbCon::take_dirty`, `CHUNK`, and the five counters + census at the same tail.
+  #
+  # WITHOUT A LEG THE ARMED POLARITY WOULD BE COMPILED BY NOTHING — the tegra_el0 / simmer_test /
+  # xusbfw / smpmark / orindesk / jd1dc / tegradesk / orinclick / orinconwin / orintenant / orinladder
+  # shape this matrix has now closed eleven times, and the standing law is that a knob's gates must
+  # compile the configuration the knob turns ON. It is the same law this arc's ITEM 1 exists to
+  # enforce one level down: `panel_console_face_arm` type-checked on every `pidesk` leg for months and
+  # was still unreachable on the board that needed it.
+  #
+  # HOSTED ON THE PLAIN `arm-tegra` LIST, deliberately, and NOT on `arm-tegra-conwin`'s conjunction.
+  # Both knobs are STANDALONE — no `pidesk`, no `tegra_el0`, no compositor — and hosting them on a
+  # `pidesk` leg would type-check only the configuration in which `win_store` EXISTS, hiding exactly
+  # the arm this arc had to get right: on a plain tegra image `FbCon` has no `win_store` and no
+  # `PANIC_MIRROR`, so `PanelSink::flush`'s routed branch and `_print`'s panic gate both fall to their
+  # absent-field arms. That is the polarity a jetson bench image is built at.
+  #
+  # WHAT THIS LEG EXERCISES THAT NO OTHER DOES: `PanelSink` and every callee it names
+  # (`OpList`, `paint_ops`, `plan_byte`, `take_dirty`, `route_present_rows`, `route_present_pending`,
+  # `TAP_FBCON.tear`) resolved for aarch64; `FbCon::shadowed`'s absent-field arm; `defer_route_open`'s
+  # `in_panic_mode` arm; and `panel_console_face_arm` compiled WITHOUT `pidesk`, which is the whole
+  # claim that its old gate was incidental rather than load-bearing.
+  #
+  # UNIVERSE SIDE EFFECT: none that moves a mix count. `orinface`/`orindefer` are new `[features]`
+  # entries named only on this arm-* leg, so `x86_cfg_universe` drops them. Board legs +1; gate +1.
+  # `./arroyo check` prints the live board/mix counts every run — read them there, not here.
+  "arm-tegra-fbconpar ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,orinface,orindefer"
+
+
+  # FBCONPAR CROSS (appended 2026-08-26) — the same two knobs on the FULL `pidesk` conjunction.
+  # Not redundant with the leg above and not redundant with `arm-tegra-ladder`: it is the only leg
+  # where `PanelSink::flush`'s ROUTED branch is compiled for aarch64 (`win_store` exists only under
+  # `all(aarch64, pidesk)`), where `panel_console_face_arm` is reached through BOTH of its gate terms
+  # at once, and where `orin_conwin`'s existing call to it coexists with `fbcon::init`'s new one — the
+  # double-arm this arc claims is idempotent. `orinconwin`'s host list, plus the two knobs.
+  "arm-tegra-fbconpar-cross ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,pidesk,livecon,quarry,orinconwin,orindesk,orinclick,orinface,orindefer"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────

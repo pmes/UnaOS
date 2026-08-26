@@ -2087,6 +2087,76 @@ supstate = ["tegra"]
 # `[oringlass] phase=`, `[orindock] arm`, `[orindock] park`, `[orindock] restore`,
 # `[orindock] census`. See docs/dev/OS/08_VIDEO/orin-desktop.md §3.11.
 orinladder = ["orinconwin", "orinclick", "orindesk"]
+# ORIN-FACE (FBCONPAR item 1): UNAOS_ORINFACE=1 — arm the shared anti-aliased console face on an
+# ORDINARY Orin boot, at `video::fbcon::init`, with no desktop and no compositor window involved.
+#
+# THE PARITY GAP IT CLOSES, stated as the survey found it. x86 arms the face in
+# `fbcon::panel_console_resume` (`video/fbcon.rs`, `#[cfg(target_arch = "x86_64")]`), from the end of
+# `kepler_display::takeover_display`. aarch64's counterpart `fbcon::panel_console_face_arm` was
+# written for the Pi's desktop seam and gated `all(target_arch = "aarch64", feature = "pidesk")`, and
+# on this board its only two callers are `video::pidesk::activate` (whose `pidesk` + `baremetal` gate
+# is UNSATISFIABLE here) and `display_tegra::orin_conwin` (which DECLINES unless `orindesk` AND
+# `orinclick` are also armed, per the §6.1 ordering rule). So the cure was compiled, type-checked and
+# UNREACHABLE on every Orin boot that is not the full rung-4 conjunction, and the console kept the
+# raw font8x8 cell at scale 1 — ~0.8 mm on the 1920x1200 bench panel, the size metal sitting #30
+# recorded as simply not visible.
+#
+# THE `pidesk` GATE WAS INCIDENTAL, NOT LOAD-BEARING, and that is why this knob widens it rather than
+# duplicating the body: `panel_console_face_arm` touches `FBCON`, four `FbCon` fields and
+# `video::font::CELL_W`/`CELL_H`, and `video::font` is declared unconditionally on both arches
+# (`video/mod.rs`). Nothing in it reaches `pidesk`, `dock`, `wm` or the compositor. The gate becomes
+# `all(target_arch = "aarch64", any(feature = "pidesk", feature = "orinface"))`, so every `pidesk`
+# build — Pi included — sees exactly the function it saw before.
+#
+# STANDALONE, and deliberately so, mirroring `orindesk`/`orinclick`'s spelling rather than
+# `orinconwin`'s: this rung opens NO window, takes NO `wm` lock, needs no `dock` and no
+# `syscall` surface, so there is nothing here for `pidesk`/`tegra_el0` to supply. It arms the CELL
+# and nothing else. It is orthogonal to `orinconwin`: with both armed the seam runs at `init` and
+# rung 4 re-arms idempotently before it sizes the window (`panel_console_face_arm` writes the same
+# four fields to the same values).
+#
+# DEFAULT OFF => the tail wrapper, its two statics and its call site vanish, `panel_console_face_arm`
+# is gated exactly as it was, and the jetson image is byte-identical to baseline. The call site is a
+# same-line append to `fbcon::init`'s existing `});`, so no line moves in a file compiled into the
+# knob-off `kernel8.img` whose byte-identity is the Pi track's standing proof.
+#
+# UNFLOWN — no Orin has booted it. Witness on the wire: `[orinface] ARMED`, `[orinface] DECLINE`,
+# `[orinface] MISMATCH`. Kept in sync with arroyo.
+orinface = []
+# ORIN-DEFER (FBCONPAR item 2): UNAOS_ORINDEFER=1 — port x86's PANEL-DEFER split layout/paint path
+# to the aarch64 console.
+#
+# THE PARITY GAP. `video/fbcon.rs::_print` runs its `PanelSink` route under
+# `#[cfg(target_arch = "x86_64")]`, so on aarch64 every console line falls to `print_masked`, which
+# holds `without_interrupts` across the WHOLE line — layout AND every glyph's pixel writes. The x86
+# finding that produced `PanelSink` applies unchanged here: only the LAYOUT half (cursor advance,
+# cell reservation, dirty-band accumulation) needs the mask, because the lock is `try_lock`ed and an
+# IRQ-context printer reserves its own disjoint cells. Armed, layout stays masked and locked and the
+# pixel work runs with interrupts enabled and no lock held.
+#
+# WHY IT MATTERS ON THIS BOARD BEYOND THE MASK SPAN: the wedge established 2026-08-26 runs
+# `timer_preempt` -> `load_witness_emit` -> `serial_println!` -> `fbcon::_print` -> ... ->
+# `wm::composite_inner` -> a bare `WRITER.lock()` FROM IRQ CONTEXT. This knob does not fix that lock
+# (LOCKFIX owns `video/wm.rs`); it shortens the masked region the console path holds while that
+# window is open.
+#
+# EVERY DEPENDENCY WAS ALREADY ARCH-NEUTRAL — `Op`, `OpList`, `OPS_PER_BYTE`, `paint_ops`,
+# `FbCon::plan_byte`/`plan_newline`/`mark_rows`/`draw_fb`, `route_present_rows`,
+# `route_present_pending` and `TAP_FBCON` all compile on both arches today. The only two x86 gates in
+# the way were `FbCon::take_dirty` and `CHUNK`/`PanelSink` themselves, plus one `shadow_store` field
+# reference (x86-only field, folded behind an arch-split `FbCon::shadowed()` helper). The panic path
+# is UNCHANGED on both arches: `PANIC_MIRROR` keeps the classic fully-masked route.
+#
+# STANDALONE: nothing here needs `pidesk`, `tegra_el0` or a compositor. On a `pidesk` aarch64 build
+# the routed branch inside `PanelSink::flush` becomes reachable and behaves exactly as x86's does.
+#
+# DEFAULT OFF => `_print`'s aarch64 arm folds back to the bare `print_masked(args)` it has always
+# been, the four counters and the census wrapper vanish, and the jetson AND pi images are
+# byte-identical to baseline. Every wire-in is a same-line fold, so no panic `Location` moves.
+#
+# UNFLOWN — no Orin has booted it. Witness on the wire: `[orindefer] census … -> DEFERRED` /
+# `-> CLASSIC-ONLY` / `-> LEDGER-MISMATCH`. Kept in sync with arroyo.
+orindefer = []
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
