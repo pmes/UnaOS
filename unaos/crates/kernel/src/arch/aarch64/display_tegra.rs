@@ -2992,3 +2992,105 @@ pub fn orin_tenant_census(tick: u64) {
         suppressed, sc::user_input_active(), cfg!(feature = "pidesk") as u8, verdict
     );
 }
+
+
+// =================================================================================================
+// ORIN-SUPSTATE — SMP-redesign Candidate A, arc 1: the console-surface STATE LIFT. `supstate`,
+// DEFAULT OFF.
+// =================================================================================================
+//
+// THE DEFECT THIS ARC ADDRESSES (F2 of the redesign record, ~/.claude/plans/unaos/review/
+// orin-smp-redesign.md): the whole interactive surface is ONE task on ONE core, and its entire
+// state — `Screen`, `TargetPal`, `Console` — lives on that task's own stack (`main.rs`,
+// `jd2_console_pump` phase 2). When the task dies, the state is unreachable even in principle:
+// there is nothing to hand a successor and no successor to hand it to. The census doc above
+// (`orin_click_census`) records the consequence in this file's own words: nothing in this tree
+// inherits a dead task's singleton roles.
+//
+// WHAT THIS MODULE IS. The ownership half of Candidate A: a module-owned handle for the console
+// surface, so the state OUTLIVES whichever task is currently driving it and a successor task COULD
+// adopt it. It follows the `ORINWM1_STORE` mould already in this file — a `spin::Mutex` static in
+// this track's lane — not a new invention. `TargetPal` is NOT stored: it is a borrow
+// (`pub surface: &'a mut Screen`), i.e. a VIEW, and storing it would make the handle
+// self-referential. It is reconstructed per lock scope from the stored `Screen` — via the public
+// field, deliberately NOT via `TargetPal::new`, because `new` prints the `:: UI1:` metrics line and
+// per-frame reconstruction would spam the wire. `TargetPal::new` is called exactly once, at
+// install, so the armed boot carries the same single UI1 line the baseline boot does.
+//
+// WHAT THIS MODULE IS NOT — arc 2's supervisor. There is no reap path, no restart, no generation
+// sweep here: A's supervisor needs a clock that survives a wedged task, core 0 has none post the
+// JM6 drop, and A-alone would ship a watchdog that cannot fire (the redesign record's own words:
+// "A alone is not deliverable; A-on-B is"). The `generation` field exists so arc 2 has something to
+// bump; nothing in arc 1 reads it back.
+//
+// LOCK DISCIPLINE, stated before the lock exists. `SURFACE` is strictly OUTERMOST: it may be held
+// while `video::WRITER` or `wm`'s TABLE are taken-and-released beneath it (a `handle_key` command
+// does both), and NOTHING that holds `WRITER` or TABLE ever takes `SURFACE` — the only callers of
+// this module are the console roles themselves. Beneath `SURFACE`, the existing rule is unchanged:
+// WRITER before TABLE, sequential, never nested (`orin_wm1`'s rule, restated at
+// `orin_click_census`). So the order is acyclic by construction: SURFACE -> WRITER -> TABLE.
+//
+// THE COOPERATIVE-CORE RULE, which is the one real hazard. Core 0 has NO preemption (F4: the tegra
+// path never sets `SCHED_ACTIVE`), so a bare `lock()` spin against a holder that yielded would be a
+// LIVELOCK: the spinner never yields, the holder never runs. Every acquisition in this module is
+// therefore `try_lock` + `yield_now` on failure — a waiter that cannot get the lock gives the core
+// back. The holder side has the complementary obligation, and one deliberate exception: the
+// DISPATCHER holds `SURFACE` across `handle_key`, whose full-screen commands (`vug`, `gneiss`)
+// yield from their own drain loops. That is safe under this discipline — the waiters yield, so the
+// holder's command keeps running and the lock is released when the command returns — and it is
+// exactly today's semantics: while a foreground command runs, the monolithic pump was blocked
+// inside `handle_key` and presented nothing either.
+
+/// ORIN-SUPSTATE — the module-owned console surface: the `Screen` + `Console` pair that was
+/// stack-local to `jd2_console_pump` since JD2. `TargetPal` is a view, reconstructed per lock scope
+/// (see the module header).
+#[cfg(feature = "supstate")]
+pub struct SupSurface {
+    pub screen: crate::video::Screen,
+    pub console: crate::console::Console,
+    /// Adoption counter for arc 2's supervisor: bumped by `sup_install`, read back by nothing in
+    /// arc 1. Starts at 0; the first install makes it 1.
+    pub generation: u32,
+}
+
+/// ORIN-SUPSTATE — the handle. `None` until the pump's phase 2 installs the surface it built.
+/// `spin::Mutex` in the `ORINWM1_STORE` mould; every access obeys the module header's discipline.
+#[cfg(feature = "supstate")]
+static SUP_SURFACE: spin::Mutex<Option<SupSurface>> = spin::Mutex::new(None);
+
+/// ORIN-SUPSTATE — install (or re-install: adoption) the console surface into the module handle.
+/// Called once from the pump's phase 2 today; arc 2's restart path would call it again, which is
+/// why it returns the new generation instead of asserting on a prior tenant.
+#[cfg(feature = "supstate")]
+pub fn sup_install(screen: crate::video::Screen, console: crate::console::Console) -> u32 {
+    loop {
+        if let Some(mut guard) = SUP_SURFACE.try_lock() {
+            let generation = guard.as_ref().map_or(0, |s| s.generation) + 1;
+            *guard = Some(SupSurface { screen, console, generation });
+            serial_println!(
+                "[supstate] lift gen={} screen+console module-owned (task-stack no longer the sole holder) -> ADOPTABLE",
+                generation
+            );
+            return generation;
+        }
+        crate::arch::sched::yield_now();
+    }
+}
+
+/// ORIN-SUPSTATE — run `f` against the module-owned surface. Returns `None` iff no surface is
+/// installed (phase 2 not reached, or a headless boot where phase 2 never runs); the lock itself is
+/// always acquired eventually — `try_lock` + `yield_now`, per the cooperative-core rule above.
+#[cfg(feature = "supstate")]
+pub fn sup_with_surface<R>(
+    f: impl FnOnce(&mut crate::video::Screen, &mut crate::console::Console) -> R,
+) -> Option<R> {
+    loop {
+        if let Some(mut guard) = SUP_SURFACE.try_lock() {
+            return match guard.as_mut() {
+                Some(s) => Some(f(&mut s.screen, &mut s.console)),
+                None => None,
+            };
+        }
+        crate::arch::sched::yield_now();
+    }
+}

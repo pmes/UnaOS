@@ -2828,7 +2828,7 @@ fn jd2_console_pump(_arg: usize) {
                 unaos_kernel::arch::sched::yield_now();
             }
         }
-    };
+    }; #[cfg(feature = "supstate")] jd2_supstate_phase2(front_fb, first_key, sweep_ticks, last_sweep, sweep_tick); // ORIN-SUPSTATE (Candidate A arc 1) — knob-on, phase 2 runs with the surface LIFTED into `display_tegra::supstate`'s module-owned handle (never returns; the legacy phase 2 below is then dead code, kept verbatim as the knob-off path). ⚠ LINE-NEUTRAL append — knob-off this statement is `#[cfg]`-erased and the file's line numbering is untouched (panic `Location` byte-identity, the orinclick rule).
 
     // Phase 2: the console owns the panel. Detach the fbcon serial mirror FIRST so a CAPSTONE
     // straggler line can't paint over the console frame (serial output is unaffected).
@@ -6987,4 +6987,195 @@ fn tegra_conwin_live() -> bool {
 #[inline(always)]
 fn tegra_conwin_live() -> bool {
     false
+}
+
+// =================================================================================================
+// ORIN-SUPSTATE — SMP-redesign Candidate A arc 1 (the console-surface STATE LIFT). `supstate`,
+// DEFAULT OFF. Appended at the file tail on purpose: knob-off these items are `#[cfg]`-erased and
+// nothing below them exists to be shifted, so the jetson image's panic-`Location` records — and with
+// them the knob-off byte-identity proof — are untouched (the orinclick line-neutrality rule).
+// =================================================================================================
+
+/// ORIN-SUPSTATE — `jd2_console_pump`'s phase 2 with the console surface LIFTED out of task-local
+/// storage. Entered from the pump's phase-1 boundary (the `#[cfg]`-appended hook on the phase-1
+/// loop's closing line) and never returns, exactly as the legacy phase 2 never returns.
+///
+/// WHAT IS DIFFERENT, and it is ownership only: `Screen` and `Console` are built here exactly as
+/// the legacy phase 2 builds them — same construction order, same serial lines, same first-key
+/// handling — and then INSTALLED into `display_tegra`'s module-owned handle (`sup_install`) instead
+/// of living out the boot as this task's stack locals. Every subsequent surface access goes through
+/// `sup_with_surface`, so the state outlives its holder: a successor task could adopt the very
+/// `Screen`/`Console` this task was driving when it died. `TargetPal` is a VIEW (`&mut Screen`) and
+/// is reconstructed per lock scope via its public `surface` field — `TargetPal::new` is called
+/// exactly once, below, so the armed boot carries the same single `:: UI1:` line the baseline does.
+///
+/// WHAT IS DELIBERATELY THE SAME: the drive loop below is the legacy pump's phase-2 loop, clause
+/// for clause (xHCI poll, coalesced pointer drain, save-under cursor bracket, ~250 ms sweep cadence
+/// with the census on the same counter phase 1 advanced, `yield_now` — never `sleep_ticks`, the JC3
+/// rule: this core's terminus drains no sleepers). Behavioural falsifier: the `[orinclick]` census
+/// and the `:: tegra: JD2 —` transcript, which must read identically knob-on vs knob-off.
+///
+/// Milestone 1 of the arc: ONE task still holds every role. The role split (input source /
+/// presenter / dispatcher, separate task identities, all still pinned to core 0) lands on top of
+/// this lift as the arc's second milestone; the supervisor/reap/restart half is arc 2's, gated on
+/// Candidate B's clock, and nothing here pretends otherwise.
+#[cfg(all(feature = "tegra", target_arch = "aarch64", feature = "supstate"))]
+fn jd2_supstate_phase2(
+    front_fb: unaos_kernel::video::FrameBuffer,
+    first_key: Option<u8>,
+    sweep_ticks: u64,
+    mut last_sweep: u64,
+    mut sweep_tick: u64,
+) {
+    use unaos_kernel::arch::display_tegra::{sup_install, sup_with_surface};
+    use unaos_kernel::pal::{cursor, Event, GneissPal};
+
+    // The pump's free-running clock, re-read here rather than passed: CNTPCT is EL-independent and
+    // per-core monotonic (the JD3 timerless mechanism), and `last_sweep`/`sweep_tick` carry the
+    // phase-1 cadence across the boundary so the sweep counter never restarts.
+    let cntpct = || -> u64 {
+        let v: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, CNTPCT_EL0", out(reg) v, options(nomem, nostack, preserves_flags));
+        }
+        v
+    };
+
+    // ——— the JD2/JD4 panel takeover: legacy phase 2, verbatim semantics ———————————————————————————
+    // Detach the fbcon serial mirror FIRST (guarded by the ORIN-CONWIN route exactly as the legacy
+    // line is), so a CAPSTONE straggler can't paint over the console frame.
+    if !tegra_conwin_live() {
+        unaos_kernel::video::fbcon::detach();
+    }
+    let mut screen = unaos_kernel::video::Screen::new(front_fb);
+    // VUGRAS: the Screen back buffer PA is only known now — add it to the candidate table.
+    unaos_kernel::vugras::note_screen(&screen);
+    // The single `TargetPal::new` of the armed boot — prints the one `:: UI1:` line.
+    let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen);
+    let mut console = unaos_kernel::console::Console::new();
+    // JD11: mirror every command-output line to serial (durable, mbench-able transcript).
+    console.set_output_sink(jd2_out_sink);
+    console.println("UnaOS — Jetson Orin Nano (Tegra234)");
+    console.println("JD2: interactive shell on the inherited scanout. Type 'help'.");
+    console.draw(&mut pal);
+    pal.render();
+    match first_key {
+        Some(c) => {
+            serial_println!(
+                ":: tegra: JD2 — console OWNS the panel (Screen back buffer live); first key {:#04x} ::",
+                c
+            );
+            // The wake-up keystroke is a real keystroke: feed it through, don't swallow it.
+            handle_key(c, &mut console, &mut pal);
+            pal.render();
+        }
+        None => serial_println!(
+            ":: tegra: JD4 — console OWNS the panel (Screen back buffer live); screen-on-boot (no key, ~8 s) ::"
+        ),
+    }
+
+    // ——— THE LIFT: the surface leaves this task's stack and becomes module-owned ————————————————
+    drop(pal); // end the view's borrow; the Screen it viewed moves into the handle next
+    sup_install(screen, console);
+
+    // ——— the drive loop: legacy phase-2 loop, every surface access through the handle ———————————
+    let mut announced = false;
+    loop {
+        if let Ok(mut x) = unaos_kernel::drivers::xhci::claim() {
+            x.poll_events();
+        }
+        let cursor_was_visible = cursor::visible();
+        let mut needs_render = false;
+        let mut key_repainted = false;
+        // ORIN-POINTER-FIX: coalesce all pointer motion in the frame to a single cursor update —
+        // per-frame cursor work is O(1) regardless of report rate (see the legacy loop's account).
+        let mut pending_rel: Option<(i32, i32)> = None;
+        let mut pending_abs: Option<(i32, i32)> = None;
+        while let Some(ev) = unaos_kernel::pal::next_event() {
+            match ev {
+                Event::Key(c) => {
+                    let took = sup_with_surface(|screen, console| {
+                        let mut pal = unaos_kernel::pal::TargetPal { surface: screen };
+                        // Erase the cursor BEFORE the console repaints, so the save-under stash
+                        // never captures cursor pixels (the legacy bracket, unchanged).
+                        cursor::restore(&mut pal);
+                        // Serial echo: the bench evidence line (panel + serial must agree).
+                        if (32..=126).contains(&c) {
+                            serial_println!(":: tegra: JD2 — KEY '{}' ::", c as char);
+                        } else {
+                            serial_println!(":: tegra: JD2 — KEY {:#04x} ::", c);
+                        }
+                        handle_key(c, console, &mut pal)
+                    })
+                    .unwrap_or(false);
+                    needs_render = true;
+                    key_repainted = true;
+                    if took {
+                        // A command took the whole screen: stop draining this frame (shared rule).
+                        break;
+                    }
+                }
+                Event::Mouse { x, y } => {
+                    let (ax, ay) = pending_rel.unwrap_or((0, 0));
+                    pending_rel = Some((ax + x, ay + y));
+                    if !announced {
+                        serial_println!(
+                            ":: tegra: JD20 — pointer live (relative mouse, cursor on scanout) ::"
+                        );
+                        announced = true;
+                    }
+                }
+                Event::MouseAbsolute { x, y } => {
+                    pending_abs = Some((x, y));
+                    if !announced {
+                        serial_println!(
+                            ":: tegra: JD20 — pointer live (absolute tablet, cursor on scanout) ::"
+                        );
+                        announced = true;
+                    }
+                }
+                Event::Button(mask) => {
+                    // JD20's raw line first (an event reached the PUMP), then the ORIN-CLICK route —
+                    // the same two separable claims the legacy arm keeps separable.
+                    serial_println!(":: tegra: JD20 — pointer BUTTON {:#04x} (down) ::", mask);
+                    #[cfg(feature = "orinclick")]
+                    unaos_kernel::arch::display_tegra::orin_click(mask);
+                }
+                _ => {}
+            }
+        }
+        // One cursor composite for the whole frame's pointer activity (the legacy bracket).
+        sup_with_surface(|screen, _console| {
+            let mut pal = unaos_kernel::pal::TargetPal { surface: screen };
+            if pending_rel.is_some() || pending_abs.is_some() {
+                cursor::restore(&mut pal);
+                if let Some((dx, dy)) = pending_rel {
+                    cursor::move_rel(dx, dy, pal.width() as i32, pal.height() as i32);
+                }
+                if let Some((ax, ay)) = pending_abs {
+                    cursor::set_abs(ax, ay, pal.width() as i32, pal.height() as i32);
+                }
+                cursor::draw_over(&mut pal);
+                needs_render = true;
+            } else if key_repainted && cursor::visible() {
+                cursor::draw_over(&mut pal);
+            }
+            if cursor_was_visible && !cursor::visible() {
+                cursor::restore(&mut pal);
+                needs_render = true;
+            }
+            if needs_render {
+                pal.render();
+            }
+        });
+        // VUGRAS writeback sweep + the ORIN-CLICK census, on the cadence phase 1 advanced.
+        if cntpct().wrapping_sub(last_sweep) >= sweep_ticks {
+            last_sweep = cntpct();
+            unaos_kernel::vugras::idle_sweep(sweep_tick);
+            #[cfg(feature = "orinclick")]
+            unaos_kernel::arch::display_tegra::orin_click_census(sweep_tick);
+            sweep_tick += 1;
+        }
+        unaos_kernel::arch::sched::yield_now();
+    }
 }

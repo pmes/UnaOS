@@ -824,6 +824,21 @@ _feats=""
 # nobody clicked" and a census that STOPS means the pump died — an absent `[clickroute]` is otherwise
 # not evidence of anything).
 [ -n "${UNAOS_ORINCLICK:-}" ] && _feats="${_feats}orinclick,"
+# ORIN-SUPSTATE (SMP-redesign Candidate A, arc 1): UNAOS_SUPSTATE=1 lifts the Orin console surface
+# (`Screen`+`Console`, stack-locals of `jd2_console_pump` phase 2 since JD2) into a module-owned
+# handle (`arch/aarch64/display_tegra.rs::sup_install`/`sup_with_surface`) and splits the pump's
+# roles into named task identities — input source / presenter / dispatcher — ALL STILL PINNED TO
+# CORE 0. Ownership changes; placement and scheduling do not. No supervisor/reap/restart (arc 2,
+# gated on Candidate B's clock). The `supstate` feature implies `tegra` (the tegrasmp shape), so the
+# knob is self-sufficient: `UNAOS_SUPSTATE=1 ./arroyo check` and `UNAOS_SUPSTATE=1 ./arroyo
+# esp-jetson` both work. Default OFF => the phase-2 hook is a `#[cfg]`-erased statement appended to
+# an existing line and every other item is a file-tail append, so the jetson image is byte-identical
+# to baseline (measured at the objcopy'd loadable-image level, the conwin method). The ARMED
+# polarity is type-checked by the `arm-tegra-supstate` leg of KERNEL_CFG_MATRIX, never by this
+# mapping. Witness on the wire: `[supstate] lift`, `[supstate] roles`. QEMU models no Tegra234, so
+# the behavioural falsifier (the `[orinclick]` census + the `:: tegra: JD2 —` transcript reading
+# identically knob-on) is metal-owed at the arc boundary.
+[ -n "${UNAOS_SUPSTATE:-}" ] && _feats="${_feats}supstate,"
 # JETSON-EL0 (M1b): UNAOS_TEGRA_EL0=1 arms the Orin EL0/userspace chain — `arch/aarch64/mmu_tegra_el0.rs`
 # (the M6d per-task address-space slots ported to the tegra EL1 regime), the widened `syscall`/`bus`/
 # `sched::spawn_user*` gates, and the el0-hello round-trip spawned from `tegra_early_stop`. The
@@ -2714,6 +2729,27 @@ KERNEL_CFG_MATRIX=(
   # items) and the derived mix-leg count is unchanged. Board legs +1; gate +1. `./arroyo check`
   # prints the live board/mix counts every run — read them there, not here.
   "arm-tegra-bsprun ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,bsptick,bsprun"
+
+
+  # ORIN-SUPSTATE armed (appended 2026-08-25) — `supstate` gates the console-surface STATE LIFT
+  # (Candidate A arc 1): `display_tegra.rs`'s `SupSurface`/`sup_install`/`sup_with_surface`, the
+  # role tasks at `main.rs`'s tail, and the one statement appended to `jd2_console_pump`'s phase-1
+  # boundary line. Without a leg the ARMED polarity would be compiled by NOTHING — the shape this
+  # matrix has closed for tegra_el0 / smpmark / orindesk / jd1dc / tegradesk / orinclick / orinconwin
+  # / selfup / orinwdt / bsptick, and the standing law is that a knob's gates must compile the
+  # configuration the knob turns ON. Hosted on `arm-tegra`'s list verbatim + `supstate` (the
+  # smpmark/bsptick shape: every site needs nothing beyond `tegra`). Deliberately WITHOUT
+  # `orinclick`: the census call sites inside the supstate roles carry their own `#[cfg(feature =
+  # "orinclick")]`, and this leg compiling with them ERASED proves the lift does not depend on the
+  # instrument (`arm-tegra-orinclick` keeps compiling the legacy pump's armed shape; the CROSS —
+  # supstate + orinclick together — rides `UNAOS_SUPSTATE=1 UNAOS_ORINCLICK=1 ./arroyo check`, run
+  # at this arc's gate).
+  #
+  # UNIVERSE SIDE EFFECT: none that moves a mix count — `supstate` is a NEW `[features]` entry named
+  # only on an arm-* leg, so `x86_cfg_universe` drops it (every site is inside
+  # `all(feature = "tegra", target_arch = "aarch64")` items) and the derived mix-leg count is
+  # unchanged. Board legs +1; gate +1. `./arroyo check` prints the live counts — read them there.
+  "arm-tegra-supstate ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,supstate"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────

@@ -10656,3 +10656,108 @@ the first real `:: SCHED: load ::` / `[pulse5]` emission on Orin silicon, and th
 still interactive under preemption — a keystroke and a click surviving quantum expiry is the whole
 point. What this arc deliberately does not do: no AP EL1 drop (Candidate C), no `steal_ok` change
 (F1 stays empty by design until C), no supervisor (Candidate A), no change to how many cores wake.
+
+
+## §ORIN-SUPSTATE — the console-surface state lift + role split (SMP-redesign Candidate A, arc 1; `supstate`, DEFAULT OFF)
+
+### The defect this arc addresses
+
+F2 of the SMP-redesign record (Peter's 2026-08-25 ruling: highest performance; B approved and in
+flight, A approved contingent on B — this arc is A's B-independent half): the whole interactive
+surface is ONE task on ONE core, and its entire state — `Screen`, `TargetPal`, `Console` — lives on
+`jd2_console_pump`'s own stack (`main.rs` phase 2). When that task dies the state is unreachable
+even in principle; `display_tegra.rs`'s census doc records in the tree's own words that nothing
+inherits a dead task's singleton roles. This arc is the OWNERSHIP half of the fix: state that
+outlives its holder, and named roles a future supervisor can supervise. It is NOT the supervisor —
+arc 2's reap/restart needs Candidate B's clock (a watchdog on core 0 today cannot fire; "A alone is
+not deliverable; A-on-B is").
+
+### What the knob changes (UNAOS_SUPSTATE=1 → feature `supstate`, implies `tegra`)
+
+* **The lift.** Phase 2 builds `Screen`/`Console` exactly as JD2/JD4 always did (same construction
+  order, same serial lines, single `:: UI1:` metrics print), then INSTALLS them into a module-owned
+  handle — `display_tegra.rs::SupSurface` behind `SUP_SURFACE`, the `ORINWM1_STORE` mould — via
+  `sup_install` (witness: `[supstate] lift gen=1 … -> ADOPTABLE`). Every later access goes through
+  `sup_with_surface`. `TargetPal` is a VIEW (`pub surface: &mut Screen`) and is reconstructed per
+  lock scope through its public field, never through `TargetPal::new` (which would re-print UI1 per
+  frame).
+* **The split.** The pump's roles become three task identities, ALL STILL PINNED TO CORE 0 —
+  ownership changes, placement and scheduling do not:
+  * **input source** — the existing `jd2-console` task: xHCI poll, PAL drain, pointer coalescing,
+    `Event::Button` → `orin_click` routing, the ~250 ms sweep cadence (VUGRAS + the `[orinclick]`
+    census — the census stays authored by the routing task, which is the property that makes it
+    trustworthy);
+  * **dispatcher** — `jd2-dispatch`: pops keys from the module-owned key queue, prints the
+    `:: tegra: JD2 — KEY … ::` echo, runs `handle_key` → `shell::dispatch_command` under the
+    surface lock;
+  * **presenter** — `jd2-present`: drains the frame board (coalesced pointer motion + key-repaint
+    marks), owns the save-under cursor composite and every `pal.render()` (the flush to glass),
+    and the cursor auto-hide erase.
+  Witness: `[supstate] roles input=jd2-console presenter=jd2-present dispatcher=jd2-dispatch …`.
+* **Lock discipline.** `SUP_SURFACE` is strictly OUTERMOST (SURFACE → WRITER → TABLE, acyclic by
+  construction: nothing that holds WRITER or TABLE ever takes SURFACE); beneath it the existing
+  WRITER-before-TABLE sequential-never-nested rule is unchanged. Core 0 has no preemption (F4), so
+  every acquisition in the module is `try_lock` + `yield_now` — a bare `lock()` spin against a
+  holder that yielded (the dispatcher across a full-screen command) would be a livelock. Role
+  queues (`SUP_KEYQ`, cap 64 = the PAL ring's depth; `SUP_FRAMES`, a fixed-size coalescing board)
+  are leaf locks never held across a yield.
+
+### Knob-on observable deltas, stated (the role-split honesty list)
+
+Knob-off there are none (byte-identity below). Knob-on, on the serial wire:
+
+1. `[orinclick]` census and VUGRAS idle-sweep lines CONTINUE during a foreground command (today the
+   monolithic pump is blocked inside `handle_key`, so they pause). This is the census becoming what
+   it claims to be — the routing task's own liveness — and is strictly more honest; the
+   IDLE-NO-CLICKS / dead-pump distinction is unchanged.
+2. A census or JD20 pointer line can interleave between a key's arrival and its
+   `:: tegra: JD2 — KEY … ::` echo (the echo now prints from the dispatcher). Per-key ordering
+   echo → command output is preserved (single sequential dispatcher), so the
+   `awk '/:: tegra: JD2 —/'` transcript reconstruction is unaffected.
+3. Two `[supstate]` witness lines at phase-2 entry.
+4. A key frame and a pointer frame that shared one present may now present as two (panel timing
+   only; damage-tracked flush, no serial trace).
+5. One race window, disclosed: a keystroke popped by the input source in the same ~250 µs pass in
+   which the dispatcher marks `SCREEN_APP_ACTIVE` goes to the shell after the command returns
+   rather than to the command's own pump — today's typed-ahead semantics, but the window is now one
+   input pass instead of zero. Human-rate keys; benign.
+
+While `SCREEN_APP_ACTIVE` is set the input source leaves the PAL queue alone (GUI-CLICK-2's
+contract: the command's own `pump_and_poll` is the consumer), and it keeps polling the xHCI —
+`drivers::xhci::claim()` is try-based on both sides, so the two pollers cannot deadlock.
+
+### Gating and verification status
+
+Sites: `display_tegra.rs` tail (`SupSurface`/`sup_install`/`sup_with_surface`, the key queue and
+frame board, all `#[cfg(feature = "supstate")]`), `main.rs` tail (`jd2_supstate_phase2` — the
+input-source loop — plus `jd2_supstate_presenter`/`jd2_supstate_dispatcher`), and ONE statement
+appended to `jd2_console_pump`'s phase-1 boundary line (the Location-shift convention: zero source
+lines added before any panic Location in either file). Armed polarity type-checked by the
+`arm-tegra-supstate` matrix leg (`arm-tegra` verbatim + `supstate`, the smpmark/bsptick shape —
+deliberately WITHOUT `orinclick`, proving the lift does not depend on the instrument; the cross
+rides `UNAOS_SUPSTATE=1 UNAOS_ORINCLICK=1 ./arroyo check`).
+
+Verified 2026-08-25 at exec-supstate (QEMU/build only — **not yet flown on metal**). STATUS AT
+THE MILESTONE-1 COMMIT (the wall-brace partial; each ☐ is owed before the arc's DONE):
+
+* ☑ milestone 1 (the LIFT) coded: `jd2_supstate_phase2` runs the legacy phase-2 loop clause for
+  clause with the surface module-owned; the ROLE SPLIT (milestone 2) is SPECIFIED above and not
+  yet coded — the roles/queues named in this section land in the next commit;
+* ☑ armed-leg compile green: `cargo check` on `arm-tegra-supstate`'s exact feature list;
+* ☑ knob-off byte-identity **measured** at the loadable-image level: `esp-jetson` built knob-off at
+  baseline `00124d1b` and with milestone 1 applied, `llvm-objcopy -O binary kernel.elf` sha256
+  `179a92d25de9ee34fb5d72b0e0953c3a884ece47bc9d9431f9523f9551bcffdb` both sides, `cmp` clean,
+  zero `supstate` strings knob-off. (NB: the brief's stated base flat `c3ae5a49…` did NOT
+  reproduce in this environment; both sides of the identity claim here were measured in ONE
+  environment, which is the load-bearing comparison. Discrepancy reported to the seat.);
+* ☐ `UNAOS_TEGRA=1 ./arroyo check` full battery (in flight at the commit);
+* ☐ `UNAOS_SUPSTATE=1` and `UNAOS_SUPSTATE=1 UNAOS_ORINCLICK=1` check runs;
+* ☐ `./arroyo test-arm` and `./arroyo test`;
+* ☐ armed-image `strings` reachability of the `[supstate]` witnesses.
+
+What the metal flight must show: the `[supstate] lift` and `[supstate] roles` lines at phase-2
+entry, then a JD2 interactive session and an `[orinclick]` census transcript that read identically
+to a knob-off boot apart from the deltas enumerated above. What this arc deliberately does not do:
+no supervisor, no reap, no restart, no heartbeat records (arc 2, gated on B's clock); no EL
+changes, no core wakes, no `steal_ok`, no migration — a role still dies on the core it lived on;
+the lift's whole point is that its STATE no longer dies with it.

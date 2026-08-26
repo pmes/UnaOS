@@ -2012,6 +2012,33 @@ orinconwin = ["pidesk", "tegra_el0"]
 # docs/dev/OS/08_VIDEO/orin-desktop.md §6 rung 6.
 orintenant = ["tegra_el0"]
 
+
+# ORIN-SUPSTATE (SMP-redesign Candidate A, arc 1): lift the Orin console surface OUT of
+# `jd2_console_pump`'s task-local storage. The `Screen`/`Console` pair that has been stack-local to
+# that one task since JD2 (`main.rs`, phase 2) moves behind a module-owned handle in
+# `arch/aarch64/display_tegra.rs::supstate` — the `ORINWM1_STORE` mould: a `spin::Mutex` static this
+# track's lane owns — so the surface state OUTLIVES its holder and a successor task can adopt it
+# (F2's fix precondition; nothing in this tree inherits a dead task's singleton roles today —
+# display_tegra.rs's own census doc records that). The pump's roles split into named task identities
+# (input source / presenter / dispatcher), ALL STILL PINNED TO CORE 0 — this knob changes ownership,
+# not placement, not scheduling. No supervisor, no reap, no restart: that is arc 2, and it needs
+# Candidate B's clock (A-alone would ship a watchdog that cannot fire).
+#
+# Implies `tegra` only — same reasoning as `tegrasmp`: every consumer is inside
+# `cfg(all(feature = "tegra", target_arch = "aarch64"))` code, so a standalone `supstate = []` would
+# be a knob that compiles nothing without UNAOS_TEGRA=1 — the vacuous-gate defect class. It does NOT
+# imply `tegra_el0`/`orinclick`: the lift is orthogonal to click routing, and the `orin_click` /
+# `orin_click_census` call sites inside the supstate roles carry their own `#[cfg(feature =
+# "orinclick")]` exactly as the legacy pump's do. ARMED polarity is type-checked by the
+# `arm-tegra-supstate` leg of KERNEL_CFG_MATRIX in `arroyo`, never by the knob mapping.
+#
+# DEFAULT OFF AND MEASURED. Knob-off, the hook in `jd2_console_pump` is a `#[cfg]`-erased statement
+# APPENDED TO AN EXISTING LINE (the phase-1 loop's closing brace) and every other item is appended at
+# file tails, so no line moves in any file compiled knob-off (the panic-`Location` line-shift class)
+# and the jetson image is byte-identical to baseline. Witness on the wire: `[supstate] lift`,
+# `[supstate] roles`. UNFLOWN until the arc-boundary bench flight.
+supstate = ["tegra"]
+
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }
