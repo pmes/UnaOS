@@ -451,7 +451,7 @@ impl FbCon {
 
     /// Take the accumulated dirty band and reset it, for a caller that will flush it itself
     /// (the deferred panel path flushes outside the lock). `(y0, y1)`, empty when `y0 >= y1`.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "orindefer")))] // ORIN-DEFER — the aarch64 arm of PANEL-DEFER needs the same take; the body is arch-neutral and unchanged. ⚠ SAME-LINE attribute widening, per `draw_fb`'s standing note.
     fn take_dirty(&mut self) -> (usize, usize) {
         let band = (self.dirty_y0, self.dirty_y1);
         self.dirty_y0 = 0;
@@ -544,7 +544,7 @@ pub fn init(fb_addr: u64, fb_len: usize, info: FrameBufferInfo) {
         c.ready = true;
         c.full_fb().fill_screen(BG_DEFAULT);
         c.full_fb().flush_all();
-    });
+    }); #[cfg(all(target_arch = "aarch64", feature = "orinface"))] orin_face_arm(); // ORIN-FACE — THE SEAM. Here and not the terminus line, because `init` is what RESETS the cell to font8x8 (`c.aa = false; c.cell_w = CELL_W;` twelve lines up) and everything an Orin operator reads is printed AFTER it: arming at the terminus would leave the whole boot log at ~0.8 mm. OUTSIDE the mask and OUTSIDE the lock the block above just released, because `panel_console_face_arm` takes `FBCON.try_lock()` itself and this wrapper prints its verdict (which mirrors back through `_print`). ⚠ SAME-LINE append to an existing statement's closing line: knob-off it is cfg-erased, no line moves, and no panic `Location` below renumbers.
 
     // VPERF-WC (x86, ALL builds — GUI blits benefit too): mark the framebuffer mapping
     // Write-Combining now that its range is known. The M3 shadow already made VRAM traffic
@@ -697,25 +697,25 @@ pub fn _print(args: core::fmt::Arguments) {
             return;
         }
     }
-    // PANEL-DEFER (x86): mirror through the split layout/paint path when the draw target is VRAM
-    // (no cached-RAM shadow) and we are not on the panic path. See `panel_mirror` for the invariant.
-    #[cfg(target_arch = "x86_64")]
-    if !PANIC_MIRROR.load(Ordering::Relaxed) {
+    // PANEL-DEFER (x86; aarch64 under ORIN-DEFER): mirror through the split layout/paint path when the
+    // draw target is VRAM (no cached-RAM shadow) and we are not on the panic path. See `panel_mirror`.
+    #[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "orindefer")))] // ORIN-DEFER — THE PORT. This is the one gate that kept the whole split layout/paint path x86-only; every callee below already compiled on aarch64. See the `orindefer` note in Cargo.toml. ⚠ SAME-LINE attribute widening.
+    if defer_route_open() { defer_note_seen(); // ORIN-DEFER — the panic gate, arch-split at the file tail. On x86 this IS `!PANIC_MIRROR.load(Relaxed)`, unchanged byte for byte. It could NOT be that on aarch64: `PANIC_MIRROR`'s only `store` is `#[cfg(target_arch = "x86_64")]` (`panic_screen`), so on this arch the flag is permanently `false` and reading it would route PANIC output through the split path — the one case the x86 design excludes by name. The aarch64 arm reads `serial_ring::in_panic_mode()` instead, which the `#[panic_handler]` sets BEFORE `panic_screen()` and before its first `serial_println!`. Then: one charge per line reaching the armed route, taken BEFORE it decides, so `seen` is the denominator every other counter is read against and the census fires even on a boot where the split path never once won. The census latch is set before its print, so the nested `_print` that print causes cannot re-enter it. ⚠ SAME-LINE fold.
         let mut sink = PanelSink::new();
         let _ = core::fmt::Write::write_fmt(&mut sink, args);
         if sink.finish() {
             // The split path owned this line, or there was nothing to paint at all.
             if sink.split {
-                tap.absorb();
+                tap.absorb(); defer_note_split(); // ORIN-DEFER — the split path OWNED this line: layout masked, pixels unmasked. ⚠ SAME-LINE fold.
             } else {
-                tap.suppress();
+                tap.suppress(); defer_note_empty(); // ORIN-DEFER — nothing to paint at all (control-only line). ⚠ SAME-LINE fold.
             }
             return;
         }
         // The route was decided against the split path on the FIRST flush — before any pixel was
         // painted — so the line is still untouched and the classic path can render all of it.
     }
-    print_masked(args);
+    defer_note_classic(); print_masked(args); // ORIN-DEFER — the line fell back to the fully-masked classic route (console not ready, shadow attached, or `FBCON` contended on the FIRST chunk, before any pixel was painted). Self-guarded on the same `defer_route_open()` the block above tests, so panic lines are not counted and the ledger identity `split + empty + classic <= seen` holds by construction. ⚠ SAME-LINE fold.
 }
 
 /// CONSOLE-WINDOW — declare the console window damaged so the compositor presents the glyphs that
@@ -1314,7 +1314,7 @@ static PANEL_UNANNOUNCED: AtomicU64 = AtomicU64::new(0);
 /// Bytes buffered before one layout/paint round-trip. Bounds the stack cost of the op buffer
 /// (`CHUNK * OPS_PER_BYTE` ops), which matters because an IRQ-context printer can nest inside the
 /// paint pass — see the invariant below.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "orindefer")))] // ORIN-DEFER — see the knob note in Cargo.toml. ⚠ SAME-LINE attribute widening.
 const CHUNK: usize = 16;
 
 /// PANEL-DEFER sink (finding: scale²-amplified VRAM pokes ran with IRQs masked).
@@ -1352,7 +1352,7 @@ const CHUNK: usize = 16;
 /// So the paint half still runs per chunk (it is cheap — cached RAM, no lock, no mask) and the
 /// PRESENT is deferred to [`PanelSink::finish`], over the union of every chunk's band. The two
 /// savings compose: one present per line instead of ~five, and a few rows per present instead of 750.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "orindefer")))] // ORIN-DEFER — the type is arch-neutral; every field and every callee it names already compiles on aarch64. ⚠ SAME-LINE attribute widening.
 struct PanelSink {
     buf: [u8; CHUNK],
     n: usize,
@@ -1368,7 +1368,7 @@ struct PanelSink {
     routed: bool,
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "orindefer")))] // ORIN-DEFER. ⚠ SAME-LINE attribute widening.
 impl PanelSink {
     fn new() -> Self {
         PanelSink {
@@ -1409,7 +1409,7 @@ impl PanelSink {
                 Some(c) => c,
                 None => return None,
             };
-            if !c.ready || c.shadow_store.is_some() {
+            if !c.ready || c.shadowed() { // ORIN-DEFER — `shadow_store` is an x86-only FIELD (the cached-RAM shadow the 2012 rMBP's uncached GOP reads need); `shadowed()` is its arch-split accessor at the file tail, `false` on aarch64 where the field does not exist. Same predicate on x86, byte for byte. ⚠ SAME-LINE fold.
                 return None;
             }
             let mut ops = OpList::<{ CHUNK * OPS_PER_BYTE }>::new();
@@ -1419,9 +1419,9 @@ impl PanelSink {
             // CONSOLE-WINDOW: `draw_fb` has already chosen the window surface if the console is
             // routed; the flag only tells the paint half how the result reaches the panel — a
             // compositor present instead of a cache clean of the panel's own rows.
-            #[cfg(feature = "wc")]
+            #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] // ORIN-DEFER — the SAME predicate `win_store`/`win_fb` are declared under, so the routed branch is reachable on an aarch64 build that has a console window and the field reference cannot outlive the field. Unchanged on x86 (`wc` is x86-only in effect). ⚠ SAME-LINE attribute widening.
             let routed = c.win_store.is_some();
-            #[cfg(not(feature = "wc"))]
+            #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] // ORIN-DEFER — the complement of the line above. ⚠ SAME-LINE attribute widening.
             let routed = false;
             let band = c.take_dirty();
             Some((*c.draw_fb(), c.fg, c.bg, c.scale, c.aa, ops, band, routed))
@@ -1439,7 +1439,7 @@ impl PanelSink {
                 //
                 // So the tail is legitimately lost, and — like every other loss in this arc — it is
                 // counted and announced rather than left to look like a short line.
-                crate::serial_ring::TAP_FBCON.tear();
+                crate::serial_ring::TAP_FBCON.tear(); defer_note_tear(); // ORIN-DEFER — charge the mid-line tear to this arc's OWN ledger as well as the tap's, so the `[orindefer] census` can report it beside the split/classic split it is drawn from. No-op (an `#[inline(always)]` empty fn) knob-off and on x86. ⚠ SAME-LINE fold.
                 PANEL_UNANNOUNCED.fetch_add(1, Ordering::Relaxed);
             }
             return;
@@ -1500,7 +1500,7 @@ impl PanelSink {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "orindefer")))] // ORIN-DEFER. ⚠ SAME-LINE attribute widening.
 impl core::fmt::Write for PanelSink {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         for &b in s.as_bytes() {
@@ -2201,7 +2201,7 @@ pub fn console_is_routed() -> bool {
 /// more there, not less. Idempotent: re-arming sets the same three fields to the same values.
 ///
 /// Returns the armed `(cell_w, cell_h)`, or `None` if the console was not ready to be re-homed.
-#[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))]
+#[cfg(all(target_arch = "aarch64", any(feature = "desktop_firmware", feature = "orinface")))] // ORIN-FACE — the `pidesk` gate was INCIDENTAL, not load-bearing: this body names `FBCON`, four `FbCon` fields and `video::font::CELL_W`/`CELL_H`, and `video::font` is declared unconditionally on both arches (`video/mod.rs`). Nothing in it reaches `pidesk`, `dock`, `wm` or the compositor — the gate recorded where the code was WRITTEN (the Pi's desktop seam), not what it needs. Widened, never moved: every `pidesk` build sees exactly the function it saw before. ⚠ SAME-LINE attribute widening, per `draw_fb`'s standing note.
 pub fn panel_console_face_arm() -> Option<(usize, usize)> {
     let mut armed = None;
     crate::arch::without_interrupts(|| {
@@ -2464,3 +2464,349 @@ pub fn console_live_service() {
 fn present_deferred() -> bool {
     false
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+// FBCONPAR — the two aarch64 halves of a `video/` parity survey (orin 8, 2026-08-26). Both live HERE,
+// in the APPEND-ONLY TAIL, for the reason stated at the tail marker above: a line ADDED anywhere else
+// in this file renumbers every panic `Location` below it, and this file is compiled into the knob-off
+// `kernel8.img` whose byte-identity is the Pi track's standing proof. Every wire-in above is a
+// SAME-LINE fold or a SAME-LINE attribute widening; nothing in this arc moved a line.
+//
+// NOTHING HERE HAS BEEN ON HARDWARE. Both knobs are default OFF and UNFLOWN.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ORIN-DEFER — is the cached-RAM shadow attached?
+///
+/// `FbCon::shadow_store` is an x86-ONLY field (the 2012 rMBP's uncached-GOP shadow), so
+/// [`PanelSink::flush`]'s own decline test could not survive the widening as a bare field read. This
+/// is that test, arch-split: the identical predicate on x86, a compile-time `false` on aarch64 where
+/// the field does not exist and the cost it exists to avoid does not either.
+impl FbCon {
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    fn shadowed(&self) -> bool {
+        self.shadow_store.is_some()
+    }
+    /// The absent-field arm. See the sibling above.
+    #[cfg(not(target_arch = "x86_64"))]
+    #[allow(dead_code)]
+    #[inline(always)]
+    fn shadowed(&self) -> bool {
+        false
+    }
+}
+
+// ─── ITEM 1 · ORIN-FACE ────────────────────────────────────────────────────────────────────────────
+
+/// ORIN-FACE — **arm the anti-aliased console face on an ordinary Orin boot.**
+///
+/// ### The parity gap, with both sides named
+///
+/// x86 arms the face in [`panel_console_resume`] (`#[cfg(target_arch = "x86_64")]`, this file), from
+/// the end of `drivers/gpu/kepler_display.rs::takeover_display`: `c.scale = 1; c.aa = true;
+/// c.cell_w = font::CELL_W; c.cell_h = font::CELL_H;` and a regrid. aarch64's counterpart
+/// [`panel_console_face_arm`] performs exactly those four writes and the same regrid — and was gated
+/// `all(target_arch = "aarch64", feature = "desktop_firmware")`, with two callers, NEITHER of which an ordinary
+/// Orin boot reaches:
+///
+///   * `video/pidesk.rs::activate` — its `pidesk` + `baremetal` gate is UNSATISFIABLE on this board
+///     (`baremetal = ["pi"]`, and `pi` + `tegra` is a hard `compile_error!` in
+///     `arch/aarch64/serial.rs`); and
+///   * `arch/aarch64/display_tegra.rs::orin_conwin` — which DECLINES with
+///     `reason=ordering-rule` unless `orindesk` AND `orinclick` are armed too (the §6.1 rule), and
+///     which in any case only exists on an image built with `UNAOS_ORINCONWIN=1`.
+///
+/// So the cure was present, compiled, type-checked and unreachable, and the Orin console kept the raw
+/// font8x8 cell at scale 1 — ~0.8 mm on the 1920x1200 bench panel, the size metal sitting #30
+/// recorded as simply not visible. That is the one item in this survey an operator can SEE.
+///
+/// ### Why a new knob rather than widening `pidesk`
+///
+/// `pidesk` on this board pulls in the whole desktop cascade — `dock::focus_set` reaches
+/// `arch::aarch64::syscall`, gated `any(baremetal, tegra_el0)` — and §5.2's stop-line stands over it
+/// (a 16 KiB stack overflow on two consecutive Pi metal boots that no QEMU gate in this tree can
+/// reproduce). Arming a FONT must not require crossing that. `orinface` is standalone, mirroring
+/// `orindesk`/`orinclick`'s spelling: no window, no `wm` lock, no `dock`, no syscall surface. The
+/// `pidesk` gate on `panel_console_face_arm` was INCIDENTAL — it recorded where the code was written,
+/// not what it needs — so it is WIDENED (`any(feature = "desktop_firmware", feature = "orinface")`) and every
+/// `pidesk` build, Pi included, sees exactly the function it saw before.
+///
+/// ### The seam, and why it is `init` and not the terminus line
+///
+/// [`init`] is what RESETS the cell to font8x8 (`c.aa = false; c.cell_w = CELL_W;`), and everything an
+/// Orin operator reads is printed after it. Arming at `tegra_early_stop`'s terminus would leave the
+/// entire boot log at 0.8 mm and fix only what prints afterwards. This runs on `init`'s closing line,
+/// OUTSIDE the interrupt mask and OUTSIDE the `FBCON` lock that block just released — required, since
+/// [`panel_console_face_arm`] takes `FBCON.try_lock()` itself and this wrapper then prints.
+///
+/// Idempotent, and composes with rung 4: with `orinconwin` also armed, `orin_conwin` re-arms the same
+/// four fields to the same values before it sizes the console window, exactly as it does today.
+///
+/// ### THE VERDICT, AND THE FALSE PASS IT MAKES IMPOSSIBLE
+///
+/// A wrapper that printed `ARMED` because it CALLED the arming function would be the same defect this
+/// whole item is about: a claim standing in for a fact. So the line is derived from a READBACK — the
+/// console state is re-taken after the arm and the fields are read out of it — and the verdict
+/// crosses that readback against `video::font`'s own constants:
+///
+///   * `[orinface] ARMED …` — read back `aa=1` and the cell equal to `font::CELL_W`x`CELL_H`.
+///   * `[orinface] MISMATCH …` — the arm returned a cell but the readback disagrees with it or with
+///     the face. This is the state that used to be indistinguishable from a pass.
+///   * `[orinface] DECLINE reason=console-not-ready …` — `panel_console_face_arm` answered `None`
+///     (`!c.ready`, or `FBCON` contended). The console keeps font8x8; the boot is otherwise unchanged.
+///   * `[orinface] DECLINE reason=readback-contended …` — the arm reported a cell but the lock could
+///     not be retaken to prove it. Reported as a decline, never as a pass.
+///
+/// One line per call, on every polarity, so a silent decline can never look like "never ran".
+#[cfg(all(target_arch = "aarch64", feature = "orinface"))]
+static ORINFACE_RUNS: AtomicU64 = AtomicU64::new(0);
+
+/// ORIN-FACE — runs whose READBACK confirmed the face. Drained by the `serial_println!` in
+/// [`orin_face_arm`], which is the only reader and ships in the same commit.
+#[cfg(all(target_arch = "aarch64", feature = "orinface"))]
+static ORINFACE_ARMED: AtomicU64 = AtomicU64::new(0);
+
+/// ORIN-FACE — the seam. See [`ORINFACE_RUNS`] for the whole argument.
+#[cfg(all(target_arch = "aarch64", feature = "orinface"))]
+pub fn orin_face_arm() {
+    let runs = ORINFACE_RUNS.fetch_add(1, Ordering::Relaxed) + 1;
+    let asked = panel_console_face_arm();
+    // THE READBACK. Re-take the console and read the fields out of it, rather than trusting the
+    // values we asked for — `orin_conwin`'s standing "read it back, do not infer it from having
+    // called it" discipline. `try_lock`, so a contended readback is reported as one.
+    let mut seen: Option<(bool, usize, usize, usize, usize, usize, usize)> = None;
+    crate::arch::without_interrupts(|| {
+        if let Some(c) = FBCON.try_lock() {
+            let info = c.fb.info();
+            seen = Some((c.aa, c.cell_w, c.cell_h, c.cols, c.rows, info.width, info.height));
+        }
+    });
+    let want = (crate::video::font::CELL_W, crate::video::font::CELL_H);
+    match (asked, seen) {
+        (None, _) => serial_println!(
+            "[orinface] DECLINE reason=console-not-ready runs={} armed={} want={}x{} (panel_console_face_arm answered None — the console was not ready or FBCON was contended; the console keeps font8x8 at scale 1 and nothing else about this boot changes)",
+            runs,
+            ORINFACE_ARMED.load(Ordering::Relaxed),
+            want.0,
+            want.1
+        ),
+        (Some((aw, ah)), None) => serial_println!(
+            "[orinface] DECLINE reason=readback-contended runs={} armed={} asked={}x{} want={}x{} (the arm reported a cell but FBCON could not be retaken to prove it — reported as a decline, never as a pass)",
+            runs,
+            ORINFACE_ARMED.load(Ordering::Relaxed),
+            aw,
+            ah,
+            want.0,
+            want.1
+        ),
+        (Some((aw, ah)), Some((aa, cw, ch, cols, rows, pw, ph))) => {
+            if aa && cw == want.0 && ch == want.1 && (cw, ch) == (aw, ah) {
+                let armed = ORINFACE_ARMED.fetch_add(1, Ordering::Relaxed) + 1;
+                serial_println!(
+                    "[orinface] ARMED runs={} armed={} panel={}x{} cell={}x{} grid={}x{} aa=1 face=noto16-aa (READ BACK from the console after the arm, not asserted from the call: the aarch64 counterpart of x86's panel_console_resume now runs on an ordinary Orin boot, at fbcon::init, with no desktop and no compositor window involved) -> ARMED",
+                    runs, armed, pw, ph, cw, ch, cols, rows
+                );
+            } else {
+                serial_println!(
+                    "[orinface] MISMATCH runs={} armed={} panel={}x{} asked={}x{} readback={}x{} aa={} grid={}x{} want={}x{} (the arm returned but the console does not hold the face — this is the state that used to be indistinguishable from a pass) -> MISMATCH",
+                    runs,
+                    ORINFACE_ARMED.load(Ordering::Relaxed),
+                    pw, ph, aw, ah, cw, ch, aa as u8, cols, rows, want.0, want.1
+                );
+            }
+        }
+    }
+}
+
+// ─── ITEM 2 · ORIN-DEFER ───────────────────────────────────────────────────────────────────────────
+
+/// ORIN-DEFER — **is the split layout/paint route open for this line?**
+///
+/// The panic gate, arch-split because it could not be shared. On x86 this is
+/// `!PANIC_MIRROR.load(Relaxed)` — the exact expression [`_print`] carried before this arc, unchanged
+/// byte for byte. On aarch64 it could NOT be: `PANIC_MIRROR`'s only `store` is
+/// `#[cfg(target_arch = "x86_64")]` (see [`panic_screen`]), so on this arch the flag is permanently
+/// `false` and reading it would send PANIC output down the split path — precisely the case the x86
+/// design excludes by name ("a panic must never find the `FBCON` lock held by a preempted paint").
+/// The aarch64 arm reads [`crate::serial_ring::in_panic_mode`], which the `#[panic_handler]` sets
+/// BEFORE `panic_screen()` and before its first `serial_println!`, and which is arch-neutral.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn defer_route_open() -> bool {
+    !PANIC_MIRROR.load(Ordering::Relaxed)
+}
+
+/// ORIN-DEFER — the aarch64 arm. See the sibling above for why it is not `PANIC_MIRROR`.
+#[cfg(all(target_arch = "aarch64", feature = "orindefer"))]
+#[inline(always)]
+fn defer_route_open() -> bool {
+    !crate::serial_ring::in_panic_mode()
+}
+
+/// ORIN-DEFER — the absent-knob arm: no split route exists, so it is never open.
+#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "orindefer"))))]
+#[allow(dead_code)]
+#[inline(always)]
+fn defer_route_open() -> bool {
+    false
+}
+
+/// ORIN-DEFER — **lines that reached the armed split route.** The denominator.
+///
+/// ### The ledger, and the false PASS it makes impossible
+///
+/// The defect this whole survey is about is a feature that is compiled, banner-visible and never
+/// actually reached. Porting PANEL-DEFER to aarch64 could reproduce it exactly: `orindefer` in the
+/// `⚡ kernel features:` banner, `PanelSink` linked into the image, and every line still falling to
+/// `print_masked` because the console was never ready, a shadow was attached, or `FBCON` lost its
+/// first chunk every time — with nothing on the wire to say so.
+///
+/// So the census fires on [`DEFER_SEEN`], never on [`DEFER_SPLIT`], and its verdict is DERIVED from
+/// the split count rather than from the feature being on:
+///
+///   * `-> DEFERRED` — `split > 0`. Lines were laid out masked and PAINTED UNMASKED. The claim.
+///   * `-> CLASSIC-ONLY` — `split == 0`. The route was armed, reached, and never once taken. This is
+///     the polarity that used to be silent, and it is now a named verdict on the wire.
+///   * `-> LEDGER-MISMATCH` — `split + empty + classic > seen`, which the wire-in makes impossible by
+///     construction (every charge is taken inside the same `defer_route_open()` test as `seen`).
+///     Recordable so that it cannot become unrecordable.
+///
+/// `unaccounted = seen - (split + empty + classic)` is the lines in flight on other cores at the
+/// instant of the read; it is expected to be small and non-negative, never zero-by-law.
+///
+/// One line per boot, at [`DEFER_CENSUS_AT`] lines. The latch is taken with `swap` BEFORE the print,
+/// so the nested `_print` the census line itself causes is bounded at depth one and cannot recurse.
+#[cfg(all(target_arch = "aarch64", feature = "orindefer"))]
+static DEFER_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// ORIN-DEFER — lines the split path OWNED: layout masked + locked, pixels unmasked + unlocked.
+#[cfg(all(target_arch = "aarch64", feature = "orindefer"))]
+static DEFER_SPLIT: AtomicU64 = AtomicU64::new(0);
+
+/// ORIN-DEFER — lines the route accepted that painted nothing (control-only: `\r`, ignored bytes).
+#[cfg(all(target_arch = "aarch64", feature = "orindefer"))]
+static DEFER_EMPTY: AtomicU64 = AtomicU64::new(0);
+
+/// ORIN-DEFER — lines that fell back to the fully-masked classic route, untouched and whole.
+#[cfg(all(target_arch = "aarch64", feature = "orindefer"))]
+static DEFER_CLASSIC: AtomicU64 = AtomicU64::new(0);
+
+/// ORIN-DEFER — mid-line tears: the first chunk won `FBCON` and painted, a later one lost it. The
+/// tail is legitimately lost (see [`PanelSink::flush`]); this arc's own count of it, beside the tap's.
+#[cfg(all(target_arch = "aarch64", feature = "orindefer"))]
+static DEFER_TEAR: AtomicU64 = AtomicU64::new(0);
+
+/// ORIN-DEFER — one-shot latch for the census.
+#[cfg(all(target_arch = "aarch64", feature = "orindefer"))]
+static DEFER_CENSUS_DONE: AtomicBool = AtomicBool::new(false);
+
+/// ORIN-DEFER — lines seen before the census speaks.
+///
+/// Not 1, and not 8. One line proves the wire-in compiled. This threshold has to be past the point
+/// where the console is unambiguously up and printing steadily, so that a `split == 0` reading is a
+/// real `CLASSIC-ONLY` verdict about a working console and not an artefact of counting the handful of
+/// lines that legitimately precede `fbcon::init`'s completion.
+#[cfg(all(target_arch = "aarch64", feature = "orindefer"))]
+const DEFER_CENSUS_AT: u64 = 64;
+
+/// ORIN-DEFER — charge one line reaching the armed route, and emit the census when it comes due.
+#[cfg(all(target_arch = "aarch64", feature = "orindefer"))]
+#[inline]
+fn defer_note_seen() {
+    let n = DEFER_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    if n < DEFER_CENSUS_AT || DEFER_CENSUS_DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let split = DEFER_SPLIT.load(Ordering::Relaxed);
+    let empty = DEFER_EMPTY.load(Ordering::Relaxed);
+    let classic = DEFER_CLASSIC.load(Ordering::Relaxed);
+    let accounted = split + empty + classic;
+    let verdict = if accounted > n {
+        "LEDGER-MISMATCH"
+    } else if split > 0 {
+        "DEFERRED"
+    } else {
+        "CLASSIC-ONLY"
+    };
+    serial_println!(
+        "[orindefer] census seen={} split={} empty={} classic={} tear={} unaccounted={} chunk={} -> {} (DEFERRED means aarch64 console lines were laid out under the interrupt mask and PAINTED OUTSIDE it, which is x86's PANEL-DEFER shape reached on this arch; CLASSIC-ONLY means the route was armed and reached and never once taken — the compiled-but-unreachable polarity this arc exists to make speakable)",
+        n,
+        split,
+        empty,
+        classic,
+        DEFER_TEAR.load(Ordering::Relaxed),
+        n.saturating_sub(accounted),
+        CHUNK,
+        verdict
+    );
+}
+
+/// ORIN-DEFER — charge a line the split path owned.
+#[cfg(all(target_arch = "aarch64", feature = "orindefer"))]
+#[inline]
+fn defer_note_split() {
+    DEFER_SPLIT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// ORIN-DEFER — charge a line the route accepted that painted nothing.
+#[cfg(all(target_arch = "aarch64", feature = "orindefer"))]
+#[inline]
+fn defer_note_empty() {
+    DEFER_EMPTY.fetch_add(1, Ordering::Relaxed);
+}
+
+/// ORIN-DEFER — charge a line that fell back to the classic fully-masked route. Guarded by the same
+/// [`defer_route_open`] test the block above uses, so panic lines are never counted and
+/// `split + empty + classic <= seen` holds by construction.
+#[cfg(all(target_arch = "aarch64", feature = "orindefer"))]
+#[inline]
+fn defer_note_classic() {
+    if defer_route_open() {
+        DEFER_CLASSIC.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// ORIN-DEFER — charge a mid-line tear.
+#[cfg(all(target_arch = "aarch64", feature = "orindefer"))]
+#[inline]
+fn defer_note_tear() {
+    DEFER_TEAR.fetch_add(1, Ordering::Relaxed);
+}
+
+/// ORIN-DEFER — the absent-knob arms. Every wire-in above folds to nothing on x86 and on any aarch64
+/// build without the knob, so those images are byte-identical to baseline.
+///
+/// `#[allow(dead_code)]` on four of the five, and it is load-bearing rather than cosmetic: three of
+/// these (`seen`, `split`, `empty`) are called ONLY from inside `_print`'s PANEL-DEFER block, which is
+/// itself `#[cfg]`'d away on an aarch64 build without the knob — so on the knob-off `arm-tegra` /
+/// `arm-pi` polarity they have no caller at all and would each raise a `dead_code` warning in the
+/// exact image whose byte-identity is the Pi track's standing proof. `classic` is the one that does
+/// NOT need it: its call site sits outside the block and is compiled on every arch and every build.
+#[cfg(not(all(target_arch = "aarch64", feature = "orindefer")))]
+#[allow(dead_code)]
+#[inline(always)]
+fn defer_note_seen() {}
+
+/// ORIN-DEFER — absent-knob arm. See the sibling above.
+#[cfg(not(all(target_arch = "aarch64", feature = "orindefer")))]
+#[allow(dead_code)]
+#[inline(always)]
+fn defer_note_split() {}
+
+/// ORIN-DEFER — absent-knob arm. See the sibling above.
+#[cfg(not(all(target_arch = "aarch64", feature = "orindefer")))]
+#[allow(dead_code)]
+#[inline(always)]
+fn defer_note_empty() {}
+
+/// ORIN-DEFER — absent-knob arm. See the sibling above. No `allow` here: this one's call site is
+/// outside the cfg'd block, so it is used on every arch and every build.
+#[cfg(not(all(target_arch = "aarch64", feature = "orindefer")))]
+#[inline(always)]
+fn defer_note_classic() {}
+
+/// ORIN-DEFER — absent-knob arm. See the sibling above.
+#[cfg(not(all(target_arch = "aarch64", feature = "orindefer")))]
+#[allow(dead_code)]
+#[inline(always)]
+fn defer_note_tear() {}
