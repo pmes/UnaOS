@@ -55,9 +55,9 @@ static INTERVAL: AtomicU64 = AtomicU64::new(0);
 #[cfg(not(feature = "pi"))]
 static AP_LOCAL_TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// The counter frequency (CNTFRQ_EL0), in Hz. On QEMU `virt` this is 62.5 MHz; on the Pi 4 the
-/// firmware programs it (19.2 MHz crystal-derived). Reading it instead of assuming keeps the tick
-/// rate correct on both.
+/// The counter frequency (CNTFRQ_EL0), in Hz — read at runtime, never assumed: QEMU `virt` reads
+/// 62.5 MHz, the Pi 4's firmware programs 54 MHz (its crystal; 19.2 MHz is the Pi 3's), and the Orin
+/// (Tegra234) reads 31.25 MHz (capture-proven; see `mod.rs` `HW_WAIT_BUDGET`). Zero => `init` substitutes.
 #[inline]
 pub fn cntfrq() -> u64 {
     let v: u64;
