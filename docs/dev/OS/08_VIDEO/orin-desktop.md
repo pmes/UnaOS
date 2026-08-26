@@ -1399,9 +1399,13 @@ win=1's were never overdrawn by the console.
 * **Glyphs-on-glass for win=2.** No `[orinchrome]`-style probe reads the console window's surface
   back off the scanout; `-> ROUTED` + the operator's use of the shell through the sitting is the
   evidence, and a read-back instrument for it would close this the way `[orinchrome]` closed
-  rung 0's. ⚠ **INSTRUMENTED 2026-08-25 (§3.11), still UNFLOWN** — `[oringlass]` is that read-back,
-  with the discriminator inverted (the population of the console's own paper and ink answers the
-  question; the six frame constants become the discriminator, not the subject).
+  rung 0's. ⚠ **INSTRUMENTED 2026-08-25 (§3.11); FLOWN boot7j 2026-08-26 and NOT YET CLOSED** —
+  `[oringlass]` is that read-back, with the discriminator inverted (the population of the console's
+  own paper and ink answers the question; the six frame constants become the discriminator, not the
+  subject). boot7j returned `paper=1001 ink=23 stem=0 -> INK-NO-STEM` stably with `frame=6/6` and
+  `onpanel=yes`; that verdict could not distinguish anti-aliased text of this console's own colour
+  from text in another colour from a foreign surface, so ORIN-GLASSINK (§3.11) split it into three
+  and the next flight is what settles which one it was.
 * **Stack cost.** Still Pi numbers (§5) — and the `[redzone]` absorb above is now a measured
   reason to care.
 
@@ -1644,9 +1648,52 @@ them `pub` would be exactly the shared-seam edit this rung refuses.
 | `UNREADABLE` | every sample fell outside the mapped length: the row's geometry and the panel's disagree. A defect, and one no present count could show |
 | `WIN2-NOT-ON-GLASS` | not ONE sample is the console's background. Whatever occupies those panel coordinates, it is not this window's surface |
 | `BLANK-NO-GLYPHS` | every sample IS the background: the surface reached the glass and its TEXT did not. **The exact shape §3.9.1 could not rule out** |
-| `INK-NO-STEM` | non-paper pixels inside the box, but not one fully covered stroke of the console's own ink |
+| `GLYPHS-AA-NO-CHROME` | no fully covered stroke, but blends are a supermajority of the ink: anti-aliased text of this console's own colour, with the frame overdrawn |
+| `GLYPHS-AA-ON-GLASS` | the same blend supermajority with the frame intact. **Rung (a) closed on anti-aliased evidence** — `stem=0` here is a property of the face, not a defect |
+| `INK-OFF-COLOUR` | no stroke, no blend supermajority, and one OFF-RAMP value holds a majority of the ink: text (or a fill) in a colour that is not `LAD_INK`. `ink1=` names the measured value |
+| `INK-NO-STEM` | non-paper pixels inside the box, but not one fully covered stroke of the console's own ink, no blend supermajority and no dominant colour — scattered foreign values |
 | `GLYPHS-NO-CHROME` | paper and ink strokes both on the glass, and the FRAME is not — §3.8.1's measured JD2-blit overdraw, caught in the act |
 | `GLYPHS-ON-GLASS` | frame and glyphs both read back at panel coordinates. **Rung (a) closed** |
+
+##### ORIN-GLASSINK — why the ink census names what it saw (2026-08-26)
+
+boot7j read `paper=1001 ink=23 stem=0 -> INK-NO-STEM`, stably, across at least four censuses, with
+all six chrome probes `MATCH` and `onpanel=yes` — and that verdict was then read as "the text is not
+on the glass". **It never supported that reading.** `ink` was defined as *not exactly `LAD_PAPER`* and
+`stem` as *exactly `LAD_INK`*, so the pair says only that 23 samples were neither exact black nor
+exact light-grey. Three different worlds produce it, and the probe reported `first=` (the first
+sample, which was paper) while throwing away the one datum that separates them — what the 23 ink
+samples actually WERE.
+
+The census now partitions the non-paper population by geometry in colour space. An anti-aliased glyph
+edge at coverage `a` is `paper + a*(ink - paper)` in every channel with the same `a`, so
+`lad_classify` recovers `a` from the channel with the widest paper→ink span and requires the other two
+to agree within `LAD_BLEND_TOL` (8 of 192, ~4%). The test is written against the two constants as
+VARIABLES, never against black: correct either constant and the test follows it.
+
+| field | what it counts |
+| --- | --- |
+| `blend=` | samples ON the PAPER→INK segment — partial coverage of exactly this console's two colours |
+| `off=` | non-paper, not exactly ink, and NOT on that segment — a foreign colour |
+| `ink1..ink3` / `n1..n3` | the heaviest non-paper values with their counts (`n=0` = no such entry) |
+| `inkvals=` / `exact=` | distinct non-paper values, and whether the counts are exact or LOWER BOUNDS |
+
+`paper + ink == read` and `stem + blend + off == ink` hold on every line: a line that does not balance
+is a defect in the instrument, not in the panel. The histogram is a fixed six-slot Misra-Gries table
+(48 bytes of stack, no allocation, one linear scan per non-paper sample), so any value above a seventh
+of the ink population is retained; once it has to start decrementing, `exact=no` says the counts are
+lower bounds — and `exact=no` is itself evidence, since it means more than six distinct non-paper
+values, the signature of a scattered field rather than of text in one colour.
+
+⚠ **`LAD_INK` was deliberately NOT changed to match the board.** A constant tuned to the observation
+would make the probe agree with reality by construction and prove nothing. If the evidence says it is
+wrong, `INK-OFF-COLOUR` reports the measured value and correcting it is a separate decision on
+separate evidence.
+
+Rung (b)'s ledger derives `painted` from `lad_glass_painted` — the one place the passing set is
+written down (`GLYPHS-ON-GLASS`, `GLYPHS-NO-CHROME`, `GLYPHS-AA-ON-GLASS`, `GLYPHS-AA-NO-CHROME`) —
+so an anti-aliased restore cannot read as `FAIL reason=restore-blank`. `INK-OFF-COLOUR` stays OUTSIDE
+that set on purpose: a foreign colour in the box is not a confirmation of this console's text.
 
 **`[orindock]` — rung (b), the round trip. It samples EVERY tick and prints every ~10 s**, and that
 asymmetry is the design. Rungs 3 and 6 census COUNTERS, which are monotone: a 10 s cadence loses
@@ -1727,6 +1774,21 @@ different line from a restore that paints.
   `UNREADABLE` and `UNMAPPED (off-panel`, are **shared string literals with `[orinchrome]`** and are
   deduplicated by the linker, so they hit in the negative control too and carry no discrimination.
   That is why the proof rests on the other 22 and not on them.
+* **ORIN-GLASSINK re-measured the same three properties on its own A/B (2026-08-26).** Knob-off jetson
+  flat image, `llvm-objcopy -O binary` on the `ehcihid,tegra,tegrasmp` build, baseline and changed tree
+  BOTH `f9f95424e16ac855408e4ecd2aa89419c47ec2a844183f94087706f4655046b2` and `cmp`-identical — the
+  same sha this section's baseline already carried, which is what makes the A/B the canonical one
+  rather than a private definition of it. The four new fragments (`GLYPHS-AA-ON-GLASS`,
+  `GLYPHS-AA-NO-CHROME`, `INK-OFF-COLOUR`, `" inkvals="`; 9-19 bytes) hit exactly once each in the
+  armed image by `grep -a -o -F` AND by `strings -a`, and **zero** in both negative controls — the
+  knob-off default and the same §6.1 conjunction built with `orinladder` OFF. Reachability by
+  disassembly: `tegra_early_stop -> orin_ladder_arm` (`bl` at `0x737f8`), `jd2_console_pump ->
+  orin_ladder_census` (`bl` at `0x72ed8`), `orin_ladder_arm -> orin_glass_probe` (`0xeda10`),
+  `orin_ladder_census -> orin_glass_probe` (`0xf0df8`, `0xf0e0c`); and every one of the eight verdict
+  strings is materialised by a live `adr` inside `orin_glass_probe` (the three new ones at `0x4109e`,
+  `0x410ac`, `0x410bf`), with `orin_ladder_census` itself referencing the two AA verdicts — which is
+  `lad_glass_painted` inlined, i.e. the proof that the passing set on the wire is the passing set the
+  round-trip ledger uses.
 * **Reachability by disassembly, not by banner.** `tegra_early_stop -> orin_ladder_arm`
   (`bl` at `0x747a4`, immediately after `orin_conwin`'s at `0x747a0`);
   `jd2_console_pump -> orin_ladder_census` (`bl` at `0x73e84`, after `orin_click_census`'s at
@@ -1746,18 +1808,34 @@ the terminus, in order — the `[orinconwin]` trio is boot7h's, unchanged, and i
 [wc-x] console-window win=2 panel=1920x1200 … cell=7x16 …
 [orinconwin] win=2 panel=1920x1200 cell=7x16 stage=4194304 table=2 present=Composited route=true live=LIVE -> ROUTED
 [oringlass] probe=kl_top  at (…) got=0x… want=0x… -> MATCH          ← six of these
-[oringlass] phase=arm win=2 box=…x… at (…,…) content=…x… at (…,…) scale=1 onpanel=yes frame=6/6 samples=1024 read=1024 paper=… ink=… stem=… first=0x00000000 uniform=no -> GLYPHS-ON-GLASS
+[oringlass] phase=arm win=2 box=…x… at (…,…) content=…x… at (…,…) scale=1 onpanel=yes frame=6/6 samples=1024 read=1024 paper=… ink=… stem=… blend=… off=… ink1=0x00c0c0c0 n1=… ink2=0x00…… n2=… ink3=0x00…… n3=… inkvals=… exact=yes first=0x00000000 uniform=no -> GLYPHS-ON-GLASS
 ```
 
 **Rung (a) is CLOSED iff that last line reads `-> GLYPHS-ON-GLASS` with `frame=6/6`, `paper>0` and
-`stem>0`.** Every other shape it can take, and what each one means:
+`stem>0`, OR `-> GLYPHS-AA-ON-GLASS` with `frame=6/6`, `paper>0` and a blend supermajority.** The
+second is the anti-aliased-evidence close ORIN-GLASSINK added; `stem=0` on its own is no longer a
+failure, because the face is anti-aliased and a 1024-sample grid can legitimately miss every fully
+covered pixel.
+
+**The three shapes `INK-NO-STEM` used to hide, and how to tell them apart from the wire alone.** All
+three print `stem=0`; the ink fields are what separate them, and only one of the three is a defect:
+
+| what prints | reading, and what to do |
+| --- | --- |
+| `blend=23 off=0 ink1=0x00…… inkvals≤6 exact=yes -> GLYPHS-AA-ON-GLASS` — the ink is a supermajority of PAPER→INK blends, `ink1` is a grey between `0x00000000` and `0x00c0c0c0`, `n1+n2+n3 ≈ ink` | **HEALTHY. Rung (a) is CLOSED.** The glyphs are on the glass and the sample grid landed only on anti-aliased edges. boot7j's `paper=1001 ink=23 stem=0` is expected to resolve to exactly this shape; if it does, the old `INK-NO-STEM` reading was a false conviction and nothing is wrong with the panel |
+| `blend=0 off=23 ink1=0x00…… n1≥12 exact=yes -> INK-OFF-COLOUR` — one value holds a majority of the ink and is NOT on the ramp | **the constant, or the face, is wrong — and the wire now names which value.** Read `ink1=`: that is the colour the console is actually painting. Cross with `[wc-x] console-window`'s cell and with `fbcon.rs`'s `FG_DEFAULT`. **Do NOT edit `LAD_INK` from the bench**: report the measured value, because a constant tuned to the board proves nothing. If `ink1=0x00ffffff` the face is being armed white; if it is a hue, something else is painting into the box |
+| `blend=… off=… exact=no` (or `exact=yes` with no dominant value) `-> INK-NO-STEM` | **the original reading, and now the only one it can carry.** Scattered unrelated values inside the content box: a foreign surface is over the content. `inkvals=` at the six-slot ceiling with `exact=no` is the signature. Cross with `frame=`: `6/6` says the window's own chrome is intact and something is painting INSIDE it. Report |
+
+Every other shape the line can take, and what each one means:
 
 | what prints instead | reading, and what to do |
 | --- | --- |
 | `-> BLANK-NO-GLYPHS` (`paper=1024 ink=0 stem=0 uniform=yes first=0x00000000`) | the window's surface reached the glass and its TEXT did not. `present=Composited` was true and no glyph is in the scanout — the glyph route painted into a surface the flush did not carry, or painted nowhere. **This is the failure §3.9.1 could not rule out, and the whole reason the rung exists.** Report it; do not "fix" it from the bench |
 | `-> WIN2-NOT-ON-GLASS` (`paper=0`) | not one sample is the console's background. Cross with `frame=`: `frame=0/6` = the whole window is absent from the scanout; `frame=6/6` = the FRAME landed and the CONTENT did not, which localises to the content flush |
 | `-> GLYPHS-NO-CHROME` (`stem>0`, `frame<6/6`) | text on the glass, frame overdrawn. This is §3.8.1's measured JD2 console-blit overdraw, and it is the first time an instrument has convicted it. Rung (a)'s own question (did the glyphs land) is ANSWERED YES; the frame damage is rung 4's problem |
-| `-> INK-NO-STEM` | non-paper pixels but not one fully covered `0x00C0_C0C0` stroke. Check `[wc-x] console-window`'s cell — if the face is not `FG_DEFAULT` on this image the constants in `display_tegra.rs` are stale; otherwise a foreign surface is over the content |
+| `-> INK-NO-STEM` / `-> INK-OFF-COLOUR` / `-> GLYPHS-AA-*` | the three `stem=0` shapes — see the table above, which is the only place the ink fields are read |
+| `-> GLYPHS-AA-NO-CHROME` (`stem=0`, blend supermajority, `frame<6/6`) | anti-aliased text on the glass with the frame overdrawn. Rung (a)'s own question is ANSWERED YES; the frame damage is rung 4's problem, exactly as for `GLYPHS-NO-CHROME` |
+| a line where `paper + ink != read`, or `stem + blend + off != ink` | **the instrument, not the panel.** The two identities hold by construction (one classification per sample, every counter derived from it), so a line that does not balance is a defect in `orin_glass_probe`. STOP and report |
 | `-> UNREADABLE` (`read=0`, six `UNMAPPED` probe lines) | the row's geometry and the panel's mapped length disagree. A real defect, invisible to any present count. STOP and report |
 | `-> DECLINE reason=no-console-row` | no console window. Read `[orinconwin] DECLINE reason=…` on the line above it — ordering-rule means **wrong media**, STOP |
 | no `[oringlass]` line at all | the terminus never reached `orin_ladder_arm`. Check the `⚡ kernel features:` banner for `orinladder`; if it is there, the boot died before the terminus and that is the finding |

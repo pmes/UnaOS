@@ -1,0 +1,15 @@
+docs: ORIN-GLASSINK — §3.11 gets the ink fields, the three verdicts and the three watch shapes
+
+boot7j's `paper=1001 ink=23 stem=0 -> INK-NO-STEM` is written down as what it was:
+a stable read with frame=6/6 and onpanel=yes that the instrument could not adjudicate,
+not a conviction. §3.9.1's owed item moves from UNFLOWN to FLOWN-AND-NOT-CLOSED.
+
+§3.11 gains: the three new verdicts in the `[oringlass]` table; an ORIN-GLASSINK
+subsection stating the ramp test, the four new fields, the two balance identities
+(paper+ink==read, stem+blend+off==ink) and why LAD_INK was not tuned to the board;
+the updated CLOSED-iff sentence; a table that separates the three stem=0 shapes with
+the exact field pattern each one prints; and the re-measured witness bullet (byte
+identity f9f95424, four fragments once each armed / zero in both negative controls,
+the four bl edges and the adr references to all eight verdict strings).
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
