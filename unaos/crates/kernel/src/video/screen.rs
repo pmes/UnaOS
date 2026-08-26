@@ -365,6 +365,128 @@ pub static BACK_STORE_PTR: core::sync::atomic::AtomicUsize =
 pub static BACK_STORE_LEN: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
+// ═══ ORIN-VPAR — THE aarch64 PARITY WITNESSES FOR THIS FILE'S THREE x86-ONLY ITEMS ═══════════════
+//
+// A parity survey of `video/` flagged four `all(feature = "witness", target_arch = "x86_64")` gates
+// in this file as PORT — the two [`BACK_STORE_PTR`]/[`BACK_STORE_LEN`] definitions above, their
+// single writer in [`Screen::new`], and the `wm::DeskWriteGuard` bracket in
+// [`Screen::present_background`] — plus [`Screen::paint_desktop_scene`]'s bare
+// `#[cfg(target_arch = "x86_64")]`. Three distinct items, and reading the code they depend on gives
+// three DIFFERENT answers. Each gets its own verdict token on the wire so a capture states which,
+// rather than leaving an aarch64 reader to infer it from silence.
+//
+// ── STAGEPAR — STAGE-PHYS. **DECLINED, and the blocker is an absent ARCH PRIMITIVE.** ────────────
+//
+// The consumer of the two statics above is `wm::physwit_once`, which walks the published span page
+// by page through `wm::physwit_walk`, and that walk's whole content is
+// `crate::arch::memory::translate(va)` — VA→PA through the live page tables. `pub fn translate`
+// exists in `arch/x86_64/memory.rs` and NOWHERE ELSE in the tree: `arch/aarch64/memory.rs` has no
+// counterpart, and neither does any other aarch64 module. So the walk cannot be made to compile on
+// this arch by widening a gate; something must first write an aarch64 AT S1E1R/PAR_EL1 translation
+// (or a software table walk), in `arch/aarch64/`, which is a different lane again.
+//
+// PUBLISHING THE SPAN ANYWAY WOULD BE THE DEFECT, NOT THE FIX. Ungating the two statics here would
+// give aarch64 a pair of counters with no reader — the exact shape this arc was sent to remove. So
+// they stay x86, and the aarch64 line below reports the span it WOULD have published together with
+// the name of the symbol that is missing, which is the actionable half.
+//
+// ── DESKPAR — WCD-TEARDOWN's `desk=` epoch. **PORTED, in the countable half.** ───────────────────
+//
+// `wm::DeskWriteGuard` brackets the loop that copies background spans to glass and bumps
+// `wm::PANEL_DESK_EPOCH`/`PANEL_DESK_ACTIVE`; it is `all(witness, x86_64)`, so on aarch64 the loop
+// runs completely uninstrumented — a desktop present that lands on a window's pixels leaves no trace
+// at all. The COUNTING half of that needs nothing from `wm`: the bracket is in THIS function, and an
+// epoch, a live depth and a byte total can be kept and drained here. That is what [`DeskParGuard`]
+// below is, and the `:: DESKPAR:` line drains every counter it defines.
+//
+// WHAT IS **NOT** PORTED, stated so the line is not read as full parity: `[wc-d]`'s panel-write
+// INTERLOCK consults `PANEL_DESK_ACTIVE` from the COMPOSITOR side, and a `screen.rs`-local static
+// cannot serve that — `wm` would have to read it, which is a `wm.rs` edit and another seat's lane.
+// So aarch64 gains "the desktop write loop ran N times and moved B bytes" and does not gain "the
+// compositor declined to tear down while it was running". `interlock=absent` on the line says so.
+//
+// ── SCENEPAR — `paint_desktop_scene`. **EQUIVALENT — declined for a STRUCTURAL reason.** ─────────
+//
+// This one is not drift at all, and porting it would be the wrong call. The method is
+// `back.fill_screen(DESKTOP_BG)` + `mark_full()`; on aarch64 the render service reaches the SAME
+// pair through `pal.clear_screen(wm::DESKTOP_BG)`, because `TargetPal::clear_screen` is
+// `surface.fill_screen`. `main.rs`'s own comment at that call site records why the NAMED method
+// cannot be reached from there — `pal` holds the `&mut Screen` for that task's life, so there is no
+// second mutable borrow to call it through — and concludes "which is also why `screen.rs` needs no
+// edit on this arc". An ownership fact, not a hardware one, and not "it was written on x86 first".
+//
+// THE RESIDUAL IS REAL AND IS NAMED RATHER THAN FIXED HERE: when the approved lake scene replaces
+// the flat fill inside this method, x86 picks it up and the aarch64 `clear_screen` call site does
+// not. The fix is one `TargetPal` passthrough at that call site (in `main.rs`), not a change to this
+// file, so `seam=main.rs:pal.clear_screen` is on the line for whoever takes that arc.
+
+/// ORIN-VPAR/DESKPAR — desktop write loops ENTERED since boot. The aarch64 port of
+/// `wm::PANEL_DESK_EPOCH`: it counts LOOPS, not rows written, so a fully-occluded present bumps it
+/// and copies nothing — the same reading rule the x86 term carries.
+#[cfg(all(feature = "witness", feature = "orinvpar", target_arch = "aarch64"))]
+static DESKPAR_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// ORIN-VPAR/DESKPAR — desktop write loops LIVE right now, the aarch64 port of
+/// `wm::PANEL_DESK_ACTIVE`'s depth. Only the depth: the interlock that consumes it on x86 lives in
+/// `wm`, which this arc may not touch (see the module note above).
+#[cfg(all(feature = "witness", feature = "orinvpar", target_arch = "aarch64"))]
+static DESKPAR_ACTIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// ORIN-VPAR/DESKPAR — the high-water mark of [`DESKPAR_ACTIVE`]. `>1` means two cores were inside
+/// the desktop write loop at once, which is the state `[wc-d]`'s interlock exists to reason about
+/// and which nothing on this arch could previously observe.
+#[cfg(all(feature = "witness", feature = "orinvpar", target_arch = "aarch64"))]
+static DESKPAR_ACTIVE_MAX: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// ORIN-VPAR/DESKPAR — bytes the bracketed loop copied to glass, summed over every loop counted by
+/// [`DESKPAR_EPOCH`]. Distinguishes "N loops ran and wrote nothing" from "N loops moved the panel".
+#[cfg(all(feature = "witness", feature = "orinvpar", target_arch = "aarch64"))]
+static DESKPAR_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// ORIN-VPAR — latch for the one-shot `:: STAGEPAR:` / `:: SCENEPAR:` declines. Those two state
+/// source-code facts that do not change across a boot, so they print once, from the first present,
+/// and never again.
+#[cfg(all(feature = "witness", feature = "orinvpar", target_arch = "aarch64"))]
+static VPAR_ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// ORIN-VPAR/DESKPAR — how many bracketed loops between `:: DESKPAR:` lines.
+///
+/// A per-present serial line would cost more than the thing it measures on a polled UART, and a
+/// one-shot would throw away the accumulation that makes the epoch worth keeping. A power of two so
+/// the test is a mask; 256 presents is seconds of an active desktop and never fires on an idle one.
+#[cfg(all(feature = "witness", feature = "orinvpar", target_arch = "aarch64"))]
+const DESKPAR_EMIT_EVERY: u64 = 256;
+
+/// ORIN-VPAR/DESKPAR — the aarch64 counterpart of `wm::DeskWriteGuard`, kept HERE rather than in
+/// `wm` for one reason: `wm::DeskWriteGuard` is `all(witness, x86_64)` and `video/wm.rs` is another
+/// seat's lane on this arc. The bracket it needs to wrap is in this file, and the counters it feeds
+/// are drained in this file, so nothing about the countable half requires crossing that line.
+///
+/// Same shape and same reading rule as the x86 guard: `enter()` bumps the epoch and the live depth,
+/// `Drop` releases the depth, and the epoch counts loops ENTERED — never rows written.
+#[cfg(all(feature = "witness", feature = "orinvpar", target_arch = "aarch64"))]
+struct DeskParGuard;
+
+#[cfg(all(feature = "witness", feature = "orinvpar", target_arch = "aarch64"))]
+impl DeskParGuard {
+    fn enter() -> Self {
+        use core::sync::atomic::Ordering::{AcqRel, Relaxed};
+        DESKPAR_EPOCH.fetch_add(1, Relaxed);
+        // `fetch_add` returns the PREVIOUS depth, so the depth this entry establishes is `+ 1`.
+        let depth = DESKPAR_ACTIVE.fetch_add(1, AcqRel).saturating_add(1);
+        DESKPAR_ACTIVE_MAX.fetch_max(depth, Relaxed);
+        DeskParGuard
+    }
+}
+
+#[cfg(all(feature = "witness", feature = "orinvpar", target_arch = "aarch64"))]
+impl Drop for DeskParGuard {
+    fn drop(&mut self) {
+        DESKPAR_ACTIVE.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// FOCUS-VIS — ask the desktop layer to repaint the whole panel on its next present. Idempotent; the
 /// request is consumed by the first [`Screen::flush`] that follows.
 ///
@@ -479,9 +601,9 @@ pub fn request_present_rect(x: usize, y: usize, w: usize, h: usize) {
 /// report it and the `+ 1` cannot come from `STRIP_MAX`. It is stated here, at the one array that
 /// has to hold it, rather than by promoting the menu to a tenant — which would spend a permanent
 /// occlusion slot on a surface that is absent for all but a few seconds of a boot.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
 const DESK_STRIP_MAX: usize = super::strip::STRIP_MAX + 1;
-#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
 const DESK_STRIP_MAX: usize = 0;
 
 /// SHELLDESK — the desktop present's occluder capacity: every window box ([`super::wm::occluders`]
@@ -498,7 +620,7 @@ const SEED_NONE: u32 = 0xFFFF_FFFF;
 
 /// WC-BBSYNC — the colour a newly-built [`Screen`]'s BACK buffer is born holding, once the window
 /// compositor has taken the panel. [`SEED_NONE`] means unarmed, which is every aarch64 build, every
-/// default x86 build, and every `wc` boot up to the instant `video::wcx::activate` clears the glass.
+/// default x86 build, and every `wc` boot up to the instant `video::desktop_uefi::activate` clears the glass.
 ///
 /// ### Why a latch, and why it is consumed HERE rather than set here
 ///
@@ -526,7 +648,7 @@ static DESKTOP_BG_SEED: core::sync::atomic::AtomicU32 =
 /// [`Screen`] built from here on starts its back buffer in agreement with it. Idempotent; the caller
 /// owns the colour (this module invents none).
 ///
-/// Armed only by `video::wcx`, which is `cfg(all(target_arch = "x86_64", feature = "wc"))`. On
+/// Armed only by `video::desktop_uefi`, which is `cfg(all(target_arch = "x86_64", feature = "wc"))`. On
 /// aarch64 and on every non-`wc` x86 build there is no caller, the latch stays [`SEED_NONE`], and
 /// [`Screen::new`] pays exactly one relaxed-cost atomic load.
 pub fn adopt_desktop_bg(color: u32) {
@@ -793,7 +915,7 @@ impl Screen {
     /// backdrop.
     ///
     /// The scene today is the flat [`super::wm::DESKTOP_BG`] fill — the same colour the compositor put
-    /// on the glass at `wcx::activate` and the same one [`adopt_desktop_bg`] seeds a fresh `Screen`
+    /// on the glass at `desktop_uefi::activate` and the same one [`adopt_desktop_bg`] seeds a fresh `Screen`
     /// with, so this agrees with both by construction. It is the SEAM the approved lake scene
     /// (white-board A1) renders through later: a scene richer than a fill replaces the body of this
     /// method and every caller keeps working, because the contract is "own the backdrop", not "fill
@@ -1177,11 +1299,11 @@ impl Screen {
         //
         // SHELLDESK REVIEW — the interval is bounded because the ENABLER COMPOSITES, and that had to
         // be made true rather than assumed. The original note here claimed the enable at
-        // `wcx::activate` was "immediately followed by the console window's own `create`, which
+        // `desktop_uefi::activate` was "immediately followed by the console window's own `create`, which
         // composites"; the order is the reverse — `panel_console_window_open` runs ABOVE the enable —
         // and the row it mints is fbcon's frozen boot-log snapshot, which never damages again. With
         // `wm::service_damage` declining to composite while no row is dirty, nothing was guaranteed to
-        // paint the withheld rows on a boot with no desktop app and no mouse. `wcx::activate` now
+        // paint the withheld rows on a boot with no desktop app and no mouse. `desktop_uefi::activate` now
         // composites at the enable seam, which is the bound this paragraph asserts.
         //
         // x86 + `wc` only — `video::strip` is not compiled on aarch64, where this is the WC-I array
@@ -1198,7 +1320,7 @@ impl Screen {
         // unchanged and `Console::page_rows` identical at 0x78 — i.e. the whole delta was here.
         // Written as two cfg arms, so the platform with no furniture fills `occ` in place exactly as
         // it always did and the promise is kept by construction rather than by assertion.
-        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
         let (nocc, nwin) = {
             // `occluders` writes exactly `MAX_WINDOWS` slots; the furniture tail is appended after.
             let mut wins = [(0usize, 0usize, 0usize, 0usize); super::wm::MAX_WINDOWS];
@@ -1230,7 +1352,7 @@ impl Screen {
             }
             (n, nw)
         };
-        #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
+        #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
         let (nocc, nwin) = {
             // `DESK_OCC_MAX == wm::MAX_WINDOWS` here (no strip registry is compiled), so this is the
             // WC-I call on the WC-I array, unchanged.
@@ -1397,6 +1519,14 @@ impl Screen {
         // `[wc-d]` prints this term rather than aborting on it.
         #[cfg(all(feature = "witness", target_arch = "x86_64"))]
         let _desk = super::wm::DeskWriteGuard::enter();
+        // ORIN-VPAR/DESKPAR — the SAME bracket, around the SAME loop, on aarch64. `wm::DeskWriteGuard`
+        // is `all(witness, x86_64)`, so without this the loop below is entirely uninstrumented on this
+        // arch: `desk=` has no aarch64 field, and a desktop present that walks over a window's pixels
+        // leaves nothing behind for a capture to convict it with. See the ORIN-VPAR block above the
+        // statics for what this does and does NOT recover (the epoch/depth/bytes, not `[wc-d]`'s
+        // compositor-side interlock, which would need a `wm` reader this arc may not add).
+        #[cfg(all(feature = "witness", feature = "orinvpar", target_arch = "aarch64"))]
+        let _deskpar = DeskParGuard::enter();
         for idx in 0..n {
             let d = self.damage.rects[idx];
             let x1 = d.x1.min(self.info.width);
@@ -1464,6 +1594,61 @@ impl Screen {
             self.front.flush_range(span_start, span_end - span_start);
         }
         self.last_flush_bytes = flushed;
+        // ORIN-VPAR — the three aarch64 parity verdicts, drained here because this is the one site in
+        // this file that is guaranteed reachable on every arch that presents at all (`Screen::new` is
+        // NOT: the Pi/Orin desktop path builds `direct` screens deliberately, so a witness hung off
+        // the constructor would be silent on exactly the boots it is for).
+        //
+        // BOTH OUTCOMES ARE ON THE WIRE. `DESKPAR` reports a counter set that FIRED; `STAGEPAR` and
+        // `SCENEPAR` report DECLINED with the blocking symbol named. A decline that printed nothing
+        // would be indistinguishable from a leg that never ran, which is the defect this whole knob
+        // exists to remove.
+        #[cfg(all(feature = "witness", feature = "orinvpar", target_arch = "aarch64"))]
+        {
+            use core::sync::atomic::Ordering::Relaxed;
+            DESKPAR_BYTES.fetch_add(flushed, Relaxed);
+            // The two source-code facts, once per boot, from the first present that gets here.
+            if !VPAR_ONCE.swap(true, Relaxed) {
+                // STAGE-PHYS. The span this screen WOULD publish is stated so the line is not merely
+                // an apology: it is the byte range `wm::physwit_walk` would have been handed. Read
+                // from `back_store` itself, not computed from `info` — a SHELLWIN-OOM `direct` screen
+                // has an EMPTY back store, and stating `stride*h*bpp` for one would be this witness
+                // inventing an allocation that is not there. `direct=` carries which kind it is.
+                serial_println!(
+                    ":: STAGEPAR: arch=aarch64 item=STAGE-PHYS direct={} back_bytes={} published=no \
+                     blocked_on=arch::memory::translate present_in=arch/x86_64/memory.rs \
+                     absent_in=arch/aarch64 consumer=wm::physwit_walk consumer_gate=witness+x86_64 \
+                     would_publish=BACK_STORE_PTR,BACK_STORE_LEN :: DECLINED ::",
+                    self.direct,
+                    self.back_store.len()
+                );
+                // paint_desktop_scene. NOT drift: the arm reaches the identical
+                // `fill_screen(DESKTOP_BG)` + `mark_full()` pair through `TargetPal::clear_screen`.
+                serial_println!(
+                    ":: SCENEPAR: arch=aarch64 item=paint_desktop_scene method=absent \
+                     behaviour=present via=TargetPal::clear_screen(wm::DESKTOP_BG) \
+                     reason=render_task_holds_&mut_Screen_for_its_life \
+                     residual=richer_scene_lands_in_method_only seam=main.rs:pal.clear_screen \
+                     :: EQUIVALENT ::"
+                );
+            }
+            // WCD-TEARDOWN's epoch, rate-limited. Every counter this arc defined is drained on this
+            // one line — there is no aarch64 parity static without a reader.
+            // `epoch == 1` as well as the modulus: waiting 256 presents for the FIRST line would put
+            // a short capture back in the silent state this knob exists to end.
+            let epoch = DESKPAR_EPOCH.load(Relaxed);
+            if epoch == 1 || epoch % DESKPAR_EMIT_EVERY == 0 {
+                serial_println!(
+                    ":: DESKPAR: arch=aarch64 item=WCD-TEARDOWN desk={} active={} active_max={} \
+                     bytes={} interlock=absent blocked_on=wm::PANEL_DESK_ACTIVE \
+                     blocker_gate=witness+x86_64 :: PORTED ::",
+                    epoch,
+                    DESKPAR_ACTIVE.load(Relaxed),
+                    DESKPAR_ACTIVE_MAX.load(Relaxed),
+                    DESKPAR_BYTES.load(Relaxed)
+                );
+            }
+        }
         #[cfg(feature = "witness")]
         if over_sprite {
             super::cursor::note_desktop_over_sprite();

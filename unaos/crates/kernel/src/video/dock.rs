@@ -44,7 +44,7 @@
 //! # Two panels now, and gated on each (PI-DESK)
 //!
 //! `#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature =
-//! "pidesk")))]` at the `mod` declaration in [`super`]. The composite seam in `wm::composite_once`
+//! "desktop_firmware")))]` at the `mod` declaration in [`super`]. The composite seam in `wm::composite_once`
 //! and the press seam in each arch's `syscall.rs` carry the same gate, so a knob-off build of EITHER
 //! arch has neither — and a knob-off `kernel8.img` is byte-identical to the pre-arc image, measured.
 //!
@@ -188,7 +188,7 @@ use super::{ceramic, strip, theme, wm};
 // line of this file is arithmetic over `wm` and the materials, and is arch-neutral by construction;
 // these two functions are the whole of what is not. They are seamed HERE, at the one call site each,
 // rather than by inventing a `crate::arch::user_input_*` re-export — the same shape `wm` uses for its
-// `wcx` reach, and it keeps the fact that the two arches have separate input tables visible instead of
+// `desktop_uefi` reach, and it keeps the fact that the two arches have separate input tables visible instead of
 // papering over it.
 //
 // The contract is identical on both sides: `0` means the SHELL (a kernel-owned row has no input ring,
@@ -1145,7 +1145,7 @@ pub fn selftest() {
     let (n, _) = wm::dock_scan(&mut rows, (0, 0, 0, 0));
     // SHELLPIN — the fixture routes over the PINNED model, because the router does (the module's
     // founding law: painter and router share the accessor, and this fixture is what asserts it).
-    // On a witness gate no KERNEL_OWNER_DESKTOP row exists (wcx never activates without a Kepler),
+    // On a witness gate no KERNEL_OWNER_DESKTOP row exists (desktop_uefi never activates without a Kepler),
     // so the raw count is one tile short of the strip press_at lays out: every boundary shifts, the
     // probe centre lands off its tile — and can land ON the pin tile, latching a spurious reopen.
     let n = pin_shell(&mut rows, n);

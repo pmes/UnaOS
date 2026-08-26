@@ -2890,6 +2890,31 @@ Attending-operator verdict: **pass 100%**. ⚠ Same evidence caveat as the §JB1
 host-side serial capture failed mid-bench, so the verdict is the attended panel observation (the
 JD6 card's checks are all panel-visible); no replay log exists for an mbench assert.
 
+**Replay evidence DOES exist for the write path — from the benches after JD6 (located 2026-08-25).**
+The JD5/JD6 caveat above is about *those two* benches and has been read since as "FAT write was never
+exercised on Orin", which is false. Once the shell mirrored its output to serial as `:: tegra: JD2 —
+OUT | … ::`, three later attended benches captured the whole write path on real silicon, and these
+are the files to cite instead of re-running the argument:
+
+- `~/unaos-bench/jetson-serial-2026-07-13-133055.log` — `:1306` `wrote 9 bytes to /a.txt (9 bytes)`;
+  `:1354` `appended 9 bytes to /a.txt (18 bytes)`; `:1392` `wrote 5 bytes to /b.txt (5 bytes)`;
+  `:1442` `wrote 11 bytes to /c.log (11 bytes)`; `:5394` `removed /A.TXT (1 cluster(s) freed)`.
+  **This log also carries the power-cycle leg on the wire**: `/a.txt` is written and appended to 18
+  bytes in the first boot, three MB1 re-boots follow (`:1654`, `:2564`, `:3890`), and the post-reboot
+  `ls` at `:5150` and `:5179` still lists `18  A.TXT` — the durability money-shot, replayable.
+- `~/unaos-bench/jetson-serial-2026-07-14-101517.log` — subdirectory writes and the `rm` guards:
+  `:3827` `wrote 5 bytes to /DOCS/a.txt (5 bytes)`; `:3955` `wrote 7 bytes to /DOCS/SUB/c.txt
+  (7 bytes)`; `:4029` `rm: /DOCS: is a directory (-EISDIR)`; `:4097` `rm: -r /: cannot remove the
+  root directory (-EBUSY)`; `:4199` `removed /SOLO.TXT (1 cluster(s) freed)`.
+- `~/unaos-bench/jetson-serial-2026-07-15-092500.log` — the `cp`/`mv` arcs on top of the same path,
+  e.g. `:1643` `wrote 8 bytes to /OLD/k.txt (8 bytes)`, `:2275` `wrote 5 bytes to
+  /MDST/MSRC/stale.txt (5 bytes)`.
+
+Every line above carries the `tegra:` prefix, i.e. the tegra console path on Orin silicon. Note the
+lookup hazard that hid this: these are bench-root `~/unaos-bench/jetson-serial-*.log` files, **not**
+`~/unaos-bench/capture/` — a sweep scoped to `capture/` finds no FAT-write evidence and will wrongly
+conclude the path was never exercised.
+
 ### FATDIRS — the `fat.rs` directory-mutation seam: `create_dir` / `remove_dir` (pi4-lane, `cdfe25b`)
 
 JD6 left `mkdir`/`rmdir` explicitly out of scope — its subdir writes reused the existing
@@ -8627,6 +8652,12 @@ non-regression only.
   NET-4j reproducer stay PASS).
 
 - **NET-4v→4A — the RX payload sinks to a STUCK buffer; mechanism localized below the driver lane.**
+  > **[REFUTED by NET-4F — read that entry first.]** The "stuck at buffer 1 / last descriptor of a 2-deep
+  > prefetch burst" signature below is an ARTIFACT of `[net4z]`'s content-matching scan: with the completed
+  > slot's buffer unwritten, `out` is all zeros and the scan returns the first UNWRITTEN buffer, which is
+  > index 1 once buffer[0] holds the one frame that lands. The same boot contradicts it one line apart
+  > (`[net4m] rx[1] … nonzero=false` vs `[net4z] rx[1] … landed-in-buffer-index=1`). The narrative below is
+  > retained as the investigation record; the mechanism-(a) *shape* it asserts does not stand.
   With the inbound alias armed and readback-proven (net4v `covers=ALL`), both SMMU instances globally
   bypassed (net4x), and the descriptor rings clean-published to the PoC (net4x), the residual RX defect
   was scaled and localized: only slot-0 recycles ever carried payload while later slots read DRAM-zero at
@@ -8650,6 +8681,148 @@ non-regression only.
   net4z's per-pop landing indices and emits ONE verdict line when ≥4 consecutive pops land in the same
   buffer while the completed slot advances 1:1 — machine-checkable proof of the reuse on the next boot,
   and its refutation if a future change makes landing-index == completed-slot.
+
+- **NET-4F — the ring makes ONE PASS and goes dry; and the NET-4A verdict is an artifact of its own
+  witness. `[REFUTES NET-4A; withdraws NET-4C's motivating evidence]`**
+
+  **(1) The structural fact, from the record, not a new boot.** `[net4d window-close] … total popped=N`
+  appears **53 times** across the bench capture set, spanning the whole campaign. **N never once exceeds
+  `NUM_RX` = 32**, and most windows land exactly on 32
+  (`awk 'match($0,/total popped=[0-9]+/)…' ⇒ windows: 53  MAX: 32`). `rx_count` is cumulative for the
+  boot, so this is not per-window: **no recorded boot has ever popped a 33rd frame**, and `rx_cur` has
+  never wrapped 31 → 0. The RX ring delivers exactly one pass through the descriptors published before
+  RxEnb and then stops for good. A driver whose per-descriptor addressing were merely wrong would keep
+  completing frames; something ends the ring at the RECYCLE.
+  The C+ engine has a documented way to stop exactly like that: fetching a HOST-owned descriptor — which
+  happens the instant it catches up with a driver re-arming behind it — raises **ISR.RDU (Rx Descriptor
+  Unavailable, bit 4)** and halts RX consumption, and ISR is a **write-1-to-clear latch**. The driver
+  wrote `ISR = 0xffff` ONCE at bring-up, set `IMR = 0`, and never wrote the register again, so a latched
+  RDU stands for the life of the boot. Servicing RX status is an obligation a polled driver inherits from
+  the interrupt-driven one, and it was simply absent. `net4f_rx_service` supplies it (RX latches only, so
+  `[net4c]`'s since-bring-up TOK/TER keep their meaning), on every recycle and every 4096th empty poll.
+  **Boot oracle — `[net4F] RX ring pass verdict` at window close, three mutually exclusive readings:**
+  `wraps > 0` ⇒ the ring recycled past one pass, defect CLOSED; `wraps == 0, RDU-clears > 0` ⇒ the engine
+  did stop on a host-owned descriptor (latch was the halt; if clearing it still does not restart the ring,
+  RDU is the symptom and the descriptor re-fetch is the cause); `wraps == 0, RDU-clears == 0` ⇒ the
+  un-serviced latch is REFUTED and the engine is not re-fetching recycled descriptors at all.
+  A `[net4F] ring WRAP #n` line fires at the wrap itself with ISR/CR/RxEnb.
+
+  **(2) NET-4A is refuted by its own boot.** `[net4z]`'s landing scan searched the ring for the first
+  buffer whose head matches `out[..16]` — but `out` is a copy of the **completed slot's** buffer, so when
+  that buffer was never written `out` is the arena fill (all zeros) and the scan returns **the first
+  UNWRITTEN buffer**. Once buffer[0] holds the one frame per RxEnb that does land, that index is 1 — for
+  every pop, forever. Which is exactly the boot-36 signature the verdict was built on (`rx[0]→0, rx[1]→1,
+  rx[2..7]→1 STUCK`). The contradiction is inside boot-36-retry, one line apart:
+  `[net4m] rx[1] slot=1 len=66 … buf[0..16]=0000000000000000… nonzero=false` beside
+  `[net4z] rx[1] … frame-landed-in-buffer-index=1 … per-descriptor addressing WORKS` — buffer 1 is empty
+  and is simultaneously reported as the landing site. So `rx[1]→1` was a false POSITIVE and `rx[2..7]→1`
+  phantom landings. **NET-4A's mechanism-(a) shape ("the NIC latches desc[1]'s address, the LAST
+  descriptor of a 2-deep prefetch burst") is REFUTED**: there is no evidence of a 2-deep burst nor that
+  the reused address is desc[1]'s. **NET-4C's PCIe MPS/MRRS theory was built to explain "the observed
+  32-B-then-stuck signature", which never existed** — the audit + readback table stand, its motivating
+  evidence is withdrawn. What survives is the older, un-artifacted NET-4m fact: exactly ONE buffer per
+  RxEnb receives payload while every other completion advances OWN/len with nothing written into the ring.
+
+  **(3) The replacement discriminator (`[net4F]`, UNCONDITIONAL, read-only, 8 pops).** Every witness this
+  campaign used asked "which buffer's CONTENT looks like this frame" — unanswerable when the frame is
+  absent, and its wrong answer is the NET-4A verdict. Each RX buffer is now stamped with a distinct
+  **landing TAG** when its descriptor is armed (`net4f_tag`, re-stamped in `rearm_current_rx`); a buffer
+  the NIC wrote no longer carries its tag. The witness reports which buffers the NIC ACTUALLY WROTE:
+  `own-buffer-written=yes` every pop ⇒ per-descriptor addressing WORKS; `own=no, buffers-written=[j]`
+  fixed ⇒ a genuine single-address latch, and `j` finally NAMES the reused descriptor's address;
+  `own=no, buffers-written=[] (count=0)` ⇒ **the payload is not in the ring at all** — OWN/len advance
+  while nothing is written anywhere, which an address REUSE cannot produce, retiring mechanism (a) on the
+  wire. The three are mutually exclusive and one is true every pop. `[net4z]`'s scan is guarded to refuse
+  an unwritten slot rather than manufacture a landing, and the `[net4A]` correlation now only fires on a
+  real landing in a real written buffer.
+
+  **(4) Three real descriptor defects, fixed.** RX **error status** was never read: the writeback's RES
+  (bit 21) marks a frame whose length field is meaningless and we delivered it at that length anyway —
+  now dropped, counted, and recycled through the same publish discipline (`rearm_current_rx`, lifted out
+  so the error path cannot leak a ring slot). The **4-byte FCS was never stripped**: the C+ engine DMAs
+  the CRC into the buffer and COUNTS it in the writeback length, so every frame reached smoltcp with four
+  trailing CRC bytes — proven by the record, not assumed (every minimum-size pop in boots 36..44 reads
+  `len=64` = the 60-byte Ethernet minimum + 4); stripped on the LAST segment with a first-pop witness
+  printing raw vs delivered length and FS/LS. The **multicast hash filter (MAR0..7, 0x08/0x0C) was never
+  programmed** while `RCR.AM` has been set since the first bring-up — AM admits a multicast frame only if
+  its address hashes to a set bit in that table, which held reset/firmware residue; now written all-ones
+  (the promiscuous bring-up value) inside the CFG9346 window and read back.
+  Plus one assumption converted to a checked fact: the NET-4y RX-mode value is FAMILY-SPECIFIC
+  (`RX_EARLY_OFF` bit 11, `RX_MULTI_EN` bit 14 are modern-8168 bits) and the driver read the chip-id
+  register every boot without using it. `[net4F] MAC chip id` decodes `TCR[31:20] & 0xfcf` and compares
+  against this bench's recorded value (TCR = `0x57100f00` ⇒ id `0x541`, the RTL8111H) — MATCH confirms the
+  RX mode belongs to this part, MISMATCH says so on line one.
+
+  **Audited and EXONERATED** (so the next arc need not re-walk them): EOR is set on the last descriptor at
+  init and preserved on every re-arm, both rings; the OWN protocol's barriers are correctly placed and
+  encoded (`dma_wmb` = `dmb oshst` before the OWN publish, `dma_rmb` = `dmb oshld` between observing
+  OWN-clear and reading the buffer, with the OWN-carrying descriptor read before that barrier and the
+  payload read after); RMS equals the advertised descriptor buffer size (2048) and the RX buffer block is
+  exactly 32 × 2048, so a max-size frame cannot overrun into the TX ring at `+0x20000`; TX posts FS|LS on
+  every single-buffer frame. And the RxConfig-after-ChipCmd order NET-4y introduced is exonerated by the
+  record — boots 32/33 wrote RxConfig BEFORE ChipCmd and produced the identical one-buffer signature.
+
+  QEMU cannot exercise the tegra path; the gates prove non-regression only (`UNAOS_TEGRA=1 ./arroyo check`
+  — 22 cfg legs, x86_64 + aarch64 OK; `./arroyo test-arm` MISSION SUCCESS; the ten new `[net4F]` witnesses
+  one-hit-grepped in the `esp-jetson` artifact, which needs `UNAOS_NET4=1` on the command line — the
+  documented jetson knob set alone builds a feature line with no `net4`, so the driver is not in it).
+
+- **NET-4G — the latch-SITE discriminator: NIC-internal address caching vs RC/iATU translation caching,
+  settled by one flight. `[builds on the boot7h-flown NET-4F conviction]`**
+
+  Boot7h (2026-08-25) flew the NET-4F tag instrument and it CONVICTED: `[net4F] VERDICT tag-proven
+  single-address latch` — four consecutive completions wrote ONLY buffer 17, measured by lost landing
+  tags, while ring DRAM held the correct distinct address for every slot. (The same flight REFUTED the
+  RDU-latch theory by its own discriminator: RDU never latched.) But "NIC/RC-internal" still names two
+  machines with fixes in different lanes: the **NIC** reusing a latched descriptor address (register/
+  errata work), or the **Tegra234 RC's inbound path** collapsing correctly-issued distinct addresses
+  onto one target (iATU/SMMU reprogramming). NET-4G is the instrument that names the site.
+
+  **The experiment** (`net4g_arm`/`net4g_on_pop` in `rtl8168_tegra.rs`; UNCONDITIONAL but self-gating —
+  it arms only when the `[net4F]` latch verdict fires, so a healthy NIC never runs it; one-shot per
+  boot). At verdict time, the `addr` of a still-NIC-owned descriptor `NET4G_LATCH_LEAD`(=3) slots ahead
+  (the **victim**) is rewritten mid-run to a **decoy** — a reserved, tag-stamped page in the same
+  Normal-NC DMA window as the buffers (NC window `+0x40000`, in-page offset `+0x400`; enumerated as its
+  own `[net4s]` block so its inbound reachability is proven identical to the buffers'). The in-page
+  offset is load-bearing: buffer starts sit at 0/0x800 (mod 0x1000), so no offset-preserving
+  translation can map the decoy onto a buffer start or vice versa. A third tag goes at the **C-site** =
+  latched buffer L's 4 KiB page base + 0x400 — exactly where an offset-preserving granule collapse
+  would land the decoy-addressed write. Between arm and the victim's completion, L's and the C-site's
+  tags are re-stamped after every pop (fresh attribution); the decoy tag is NEVER re-stamped (only the
+  victim's descriptor carries its address — its loss at any point is the datum). Two structural facts
+  are leaned on: descriptor writebacks land per-slot concurrently (so no RC latch on ALL inbound
+  writes), and translation structures preserve in-granule offsets.
+
+  **Verdict vocabulary** (announced up front in the `[net4G] DECOY ARMED` line; mutually exclusive by
+  decision order; emitted as `[net4G] VERDICT latch-site=…` on the victim's completion):
+  `RC-SIDE` — decoy written AND interim pops kept re-hitting L ⇒ the NIC re-fetched and issued the
+  rewritten address and the fabric delivered it while ring-addressed writes still collapsed ⇒ the NIC's
+  address path is live and the collapse is downstream: RC/iATU convicted. `NIC-SIDE` — decoy untouched,
+  L's re-stamped tag lost again (uncontaminated: next descriptor not yet complete) ⇒ the rewritten
+  address was never consumed: full-address reuse inside the NIC. `RC-PAGE` — C-site written ⇒
+  offset-preserving granule collapse: RC/SMMU/iATU page-translation caching convicted directly.
+  `PREFETCH-DEPTH` — the victim's ORIGINAL buffer written ⇒ the NIC had already fetched the victim's
+  descriptor at arm time; no site verdict, but it measures prefetch depth > lead (raise the lead, re-fly).
+  Honest arms: `UNDECIDED-CLEARED` (decoy written but no interim L re-hit — the latch may have
+  dissolved), `UNDECIDED-CONTAMINATED` (next descriptor already complete — two payloads share the
+  attribution window), `UNDECIDED-NO-LANDING` (victim completed, no tagged site anywhere lost its tag —
+  the write reached no visible DRAM; weight moves to inbound delivery loss; the ring tagged-mask is
+  printed as raw data), and `UNRESOLVED` at window close (`[net4G] latch-site status` line — the window
+  close is never silent about the experiment: concluded / arm-aborted / armed-unresolved / never-armed).
+  Cost: one frame's payload redirected out of the ring, on a boot whose RX is already convicted broken;
+  `rearm_current_rx` restores the victim's address on recycle by construction.
+
+  **Also folded (boot7h tail): the `[net4V]` ring bracket lied for a mid-pass death.** The old bracket
+  inferred wrap-ness from the popped COUNT (`popped != NUM_RX ⇒ "ring wrapped"`), so boot7h's
+  `popped=5` window printed "ring wrapped" while `[net4F] wraps=0` counted the truth one line up. The
+  bracket is now derived from the net4F wrap counter with three honest readings (WRAPPED / RING-DRY at
+  exactly one pass / died MID-PASS) plus an impossible-state flag, and the line carries `wraps=` beside
+  `popped=`.
+
+  QEMU cannot exercise the tegra path; gates prove non-regression only (`UNAOS_TEGRA=1 ./arroyo check` —
+  23 cfg legs, x86_64 + aarch64 OK, with and without `UNAOS_NET4=1`; `./arroyo test-arm` green unarmed
+  and armed; the `[net4G]` witnesses + the MID-PASS bracket one-hit-grepped in the `UNAOS_NET4=1
+  esp-jetson` `kernel.elf` and ZERO-hit in the un-armed one — the negative control).
 
 ### XCARVE-4 — the endgame (2026-07-20, boots 21/22)
 The XCARVE writer is named and fixed. XCARVE-3's unmap converted the SNOC RAS into a precise
@@ -8684,6 +8857,142 @@ lowest-set-bit; a garbage readback (Tegra234 no-HCRST takeover) demanded an 8 Mi
 allocation that overshot the heap into firewalled DRAM. Fix: clamp to the spec-sane 4–32 KiB
 bits (xHCI 5.4.3 mandatory 4 KiB fallback), null/heap-bounds guard, heap-PA witness. No
 behavior change on healthy controllers (Pi VL805 reads bit 0 set → 4 KiB, unchanged).
+
+### NET-4V — the DHCP no-lease LOCALIZED, and the one-line window-close verdict (rtl8168_tegra.rs)
+
+**The finding.** The Orin's DHCP no-lease is **not** a defect in the DHCP path. The standing reading —
+"the OFFER passes every driver-visible check, so the drop is ABOVE the driver, in the smoltcp `dhcpv4`
+socket" (boot-11) — is refuted by the R23s1 capture that produced it
+(`~/unaos-bench/capture/orin-r23s1/cu.usbmodem143402.log`). In every DHCP window of that sitting the
+ladder reads:
+
+```
+[net4d] rx[1] len=346 … DHCP 192.168.2.1:67->192.168.2.2:68 op=2 type=2(OFFER) xid=0x51fb1e94 vs-DISCOVER 0x51fb1e94 [MATCH] yiaddr=192.168.2.2
+[net4j] smoltcp ACCEPT: IPv4 csum OK, UDP csum OK , chaddr==MAC, server-id=192.168.2.1 — the OFFER passes every smoltcp gate
+[net4k] TX DHCP 3(REQUEST) xid=0x51fb1e94 (udp 68->67, 316 bytes) tx#2
+[net4d] rx[2] len=346 dst=00:00:00:00:00:00 src=00:00:00:00:00:00 et=0x0000 class=other
+[net4d] rx[3] len=346 dst=00:00:00:00:00:00 src=00:00:00:00:00:00 et=0x0000 class=other
+NET: no lease within 5000 ms (39949772 polls) — falling back to static 192.168.1.2/24
+```
+
+`dhcpv4::Socket::dispatch` emits a REQUEST from **no state but `Requesting`**, and the socket enters
+`Requesting` **only** by accepting an OFFER in `process`. So the REQUEST line is a positive proof that
+smoltcp consumed the OFFER and did its job. What follows is the tell: `rx[2]`/`rx[3]` complete with
+**len=346 — the ACK's length, twice — over an all-zero buffer**. The lease dies at the **ACK**, and the
+mechanism is **NET-4A** (the payload lands somewhere other than the completing descriptor's buffer),
+not the DHCP path. Two adjacent hypotheses are also closed by this evidence:
+
+- **Checksum capabilities / trailing FCS (NET-4k) — ACQUITTED.** The driver hands smoltcp the frame with
+  the 4-byte FCS still appended (`trailing=4 B`), but smoltcp bounds every slice by a header length
+  field — `Ipv4Packet::payload()` slices `header_len..total_len`, `UdpPacket::payload()` and
+  `verify_checksum()` both slice `..self.len()` — so trailing bytes never enter a checksum. The Pi's
+  GENET `rx_frame_raw` does not strip the FCS either **and leases**, which settles it by differential.
+- **RX filtering — ACQUITTED.** `RCR` is written `AAP|APM|AM|AB` (fully promiscuous, broadcast accepted),
+  readback-witnessed by `[net4y]`. A broadcast ACK is not filtered out.
+
+The bind seams are otherwise identical: Pi and Orin both build `Config::new(Ethernet(mac))` +
+`Interface::new` and call the **same shared** `net_phy::dhcp_or_static`, over the same shared
+`SmoltcpPhy` with the same `DeviceCapabilities` (Ethernet, MTU 1500, default checksum caps). Only the
+`random_seed`, the static fallback, and the `now_ms` source differ — and the Orin's CNTPCT clock is
+proven live by the honest `5000 ms` window bound the log prints.
+
+**The second, independent fact the summary was already carrying unread:** `total popped` is **exactly
+32 = `NUM_RX`** in *every* recorded window, across ~40 million polls of a 5 s window. The ring delivers
+one full pass and then goes permanently dry.
+
+**NET-4V — the witness.** `net4v_verdict`, emitted once at window close right after the
+`[net4d window-close]` line, puts the whole ladder on one line so the next flight convicts or acquits
+without a hand-correlation pass over a 2 MB log:
+
+```
+[net4V no-lease verdict] dhcp-tx: discover=N request=N | dhcp-rx: offer=N ack=N nak=N |
+  ring: popped=N/32 zero-payload=N [RING-DRY after exactly one pass] => <VERDICT>
+```
+
+The verdicts are mutually exclusive and exhaustive over "no lease", so the line can never be silent
+about the cause:
+
+| Verdict | Fires when | What it convicts |
+|---|---|---|
+| `ACK-STARVED` | offer delivered **and** request emitted, no ACK | smoltcp EXONERATED; the lease dies at the ACK — read `zero-payload` for the NET-4A rate |
+| `SOCKET-DROP` | offer delivered, **no** request | the boot-11 reading, and the only way it can be true: the drop IS in `dhcpv4::Socket::process`; `[net4j]` names the gate |
+| `NO-OFFER` | discover sent, no offer delivered | wire / server / RX filter — the DHCP path was never exercised |
+| `ACK-SEEN` | an ACK **was** delivered and still no lease | a genuinely NEW defect — `parse_ack`, lease/renew durations |
+| `NO-DISCOVER` | nothing on the TX ladder | smoltcp never dispatched, or the bind never ran |
+
+Go-red: on the evidence to date the next boot must print `ACK-STARVED` with `request=1 ack=0` and a
+non-zero `zero-payload`. If it prints `SOCKET-DROP` instead, the DHCP path really is at fault and this
+finding is wrong — one line separates them. The tallies are pure counters on paths that already ran
+(read-only, no device access, unbounded so a REQUEST past `NET4K_TX_WITNESS_MAX` cannot be under-counted).
+
+### FLOWN 2026-08-25 (boot7h) — the latch is CONVICTED by tag, buffer 17 is NAMED, and the go-red prediction took a third arm
+
+The first flight carrying NET-4F/NET-4V (`ca80655c`; media
+`boot7h-conwin-net4-20260825T2208Z-68c4758`, SRC.SHA `68c47585`, `UNAOS_NET4=1`). Capture:
+`~/unaos-bench/capture/line-acm0/orin.log`, boot7h slice lines 13159–16290; **capture line numbers
+are the anchor**, boot id `boot7h` throughout.
+
+**The tag discriminator fired its second arm and finally NAMED the reused descriptor.** The first
+pop was healthy; every subsequent completion's own buffer was untouched while buffer 17 was
+written, four in a row:
+
+```
+14511  [net4F] rx[0] slot=0 len=60 own-buffer-written=yes buffers-written(count=1)=[0,-1,-1,-1] — the payload IS in the completed slot's own buffer -> per-descriptor addressing WORKS
+14514  [net4F] rx[1] slot=1 len=60 own-buffer-written=no buffers-written(count=1)=[17,-1,-1,-1] — the completed slot's buffer was NOT written while another buffer WAS -> a real landing at a wrong index; the listed index names the descriptor address the NIC reused
+14524  [net4F] VERDICT tag-proven single-address latch: 4 consecutive completions (through slot 4) wrote ONLY buffer 17 — measured by lost landing tags, not by content match, so the NET-4A artifact cannot produce it. Ring DRAM holds the correct distinct addr for every slot (net4x MATCH) ⇒ the reuse is NIC/RC-internal
+```
+
+(rx[2]/rx[3]/rx[4] at 14517/14520/14523 are byte-identical in shape to 14514, all `[17,…]`.) This
+is what the tag mechanism was built to separate: measured by LOST LANDING TAGS, not content match,
+so the `[net4z]` scan artifact that manufactured the NET-4A verdict cannot produce it. The
+content side corroborates from the other direction: the four wrong-index pops were delivered as
+frames whose bytes ARE the landing-tag stamp — `dst=4e:45:54:34:45:5f` is ASCII `NET4E_`
+(`[net4t] other[0] … first32B=4e455434455f01fe…`, 14512) — i.e. the completed slots' unwritten
+buffers, read back with their arm-time stamps intact. **The reuse is NIC/RC-internal; the driver's
+ring DRAM is correct for every slot.** Which mechanism *below* the driver (RC inbound path vs NIC
+descriptor cache) is the next arc's question, not this capture's answer.
+
+**The ring-pass oracle took its third reading — the un-serviced-latch theory is REFUTED on the
+wire.** Capture 14528: `[net4F] RX ring pass verdict: pops=5 NUM_RX=32 wraps=0 RDU-clears=0
+RXOVW-clears=0 CR=0x0c RxEnb=1 ISR=0x0084 — one pass only, and RDU NEVER latched … the engine
+stops without reporting descriptor-unavailable, so it is not re-fetching the recycled descriptors
+at all`. `net4f_rx_service` was live and had nothing to clear: the one-pass halt is not the ISR.RDU
+latch this entry hypothesized. That fix stays (it is an obligation regardless), but the halt's
+cause moves down the stack with the latch conviction above.
+
+**The NET-4V verdict printed a third arm, not either predicted one.** The go-red paragraph above
+named `ACK-STARVED` (this finding right) vs `SOCKET-DROP` (this finding wrong). boot7h printed
+neither — capture 14529:
+
+```
+[net4V no-lease verdict] dhcp-tx: discover=1 request=0 | dhcp-rx: offer=0 ack=0 nak=0 | ring: popped=5/32 zero-payload=4 [ring wrapped] => NO-OFFER: a DISCOVER left the NIC and no OFFER was ever delivered — wire / server / RX filter; the DHCP path above the driver was never exercised
+```
+
+`NO-OFFER` neither confirms nor refutes the ACK-starvation reading: no OFFER was delivered *at
+all* this sitting (`[net4d window-close] … arp=1 dhcp=0 … other=4`, 14527), and with the ring
+latched onto buffer 17 after pop 0, any OFFER that did arrive would have landed there as
+zero-payload garbage — the latch is upstream of the DHCP question and must fall first. The boot
+fell back and bound: `no lease within 5000 ms … falling back to static 192.168.1.2/24` (14525),
+smoltcp `Interface BOUND … link UP` (14540), `ORIN-NET-4 DONE` (14541).
+
+⚠ **One witness defect surfaced by this flight, recorded not fixed: the net4V bracket lies when
+the wire is quiet.** The line above carries `[ring wrapped]` while `[net4F] RX ring pass verdict`
+on the same boot says `wraps=0`. The bracket is a two-arm check
+(`rtl8168_tegra.rs::net4v_verdict`): `rx_count == NUM_RX` prints `RING-DRY after exactly one
+pass`, *anything else* prints `ring wrapped` — written when every recorded sitting popped exactly
+32. boot7h popped 5 (a quiet wire: one ARP + four latch-garbage pops in the 5 s window), which is
+neither dry-after-one-pass nor wrapped, and the else-arm mislabels it. `[net4F]`'s `wraps=` is the
+counted truth; the bracket needs a third arm (`window closed before one pass`) keyed on
+`rx_count < NUM_RX`.
+
+**The smaller fixes all read back clean on their first flight:** MAR all-ones readback `[MATCH]`
+(14500), chip id `TCR=0x57100f00 xid=0x541 … RTL8111H class [MATCH]` (14502) so the NET-4y RX mode
+is the right family's, and the FCS strip witness on the first writeback: `raw-len=64
+delivered-len=60 (FCS stripped)` (14508) — the four CRC bytes no longer reach smoltcp.
+
+Spec rows for `[net4F]`/`[net4V]`/`ORIN-NET-4 DONE` were added to
+`unaos/scripts/specs/jetson-sync1.spec` in this fold (PENDING/OPTIONAL — `net4` is knob-gated, so
+the healthy-terminus rows must never become REQUIREs; the argument is at the rows).
 
 ## PH-3 — is the aarch64 block-write path "fully polled emmc2"? (verdict: **premise FALSE**)
 
@@ -9143,6 +9452,58 @@ Cost: **8.3 s** the first time a tree compiles that feature set, **0.06 s** (car
 after — a fully warm `./arroyo check` with all 13 legs is 2.2 s end to end. Leg count 12 → 13;
 `UNAOS_TEGRA=1 ./arroyo check` is green in 16.2 s.
 
+### EL0-EL1CORE on metal (boot7f, 2026-08-25) — `bg` refuses fail-closed instead of killing the board
+
+An EL0 task may only be dispatched from a core that is itself at EL1. On the Orin the boot core is
+the only such core, and `sched.rs` measures that rather than assuming it. boot7f is the first flight
+where the refusal was exercised from the shell.
+
+| capture line | on the wire (quoted) | reading |
+| --- | --- | --- |
+| 11384 | `:: SCHED: [el0core] el1 core MEASURED: cpu=0 mask=0x1 (EL0-EL1CORE) ::` | one core stamped at EL1, `cpu 0`; the mask is measured, not a constant (`arch/aarch64/sched.rs:3209`) |
+| 11492 | `:: tegra: JD2 — OUT \| bg: /fat/vug.elf: no core is at EL1 to host a background EL0 task on this platform (EL0-EL1CORE) ::` | the shell's own refusal text, on the panel and the wire |
+| 11493 | `:: BGRUN: bg /fat/vug.elf — rejected (no core is at EL1 to host a background EL0 task on this platform (EL0-EL1CORE)) ::` | the scheduler-side record of the same rejection |
+| 11407 | `:: SCHED: [el0core] rollup: el0refuse=0 el1cores=0x1 (EL0-EL1CORE) ::` | the rollup, printed before the `bg` attempt |
+
+**The point of the row is what did NOT happen: the board stayed up.** `bg` previously took an EL0
+task to a core that was not at EL1; the refusal above is the fail-closed replacement, and boot7f
+continued to a live shell and 45 further `[orinclick]` census lines after it (`seq=4` at capture
+line 11495 through `seq=48` at 11540).
+
+**Foreground EL0 is unaffected, and boot7f shows it directly** — the boot's own EL0 round trip ran
+to completion on the EL1 core: `:: TEGRA-EL0: el0-hello spawned at EL0 (boot core), verdict armed …`
+(capture line 11396), `hello from EL0` (11410), `:: TEGRA-EL0: el0-hello round-trip -> PASS ::`
+(11411). ⚠ The shell verb `run` was **not typed on boot7f** — only `bg` was — so "`run` is
+unaffected" rests on the refusal's scope in `sched.rs` and on the `el0-hello` round trip above, not
+on a captured `run` invocation.
+
+**Reproduced on boot7h (2026-08-25, image `68c47585`), second flight, same shape:** `el1 core
+MEASURED: cpu=0 mask=0x1` (capture line 14815), rollup `el0refuse=0 el1cores=0x1` (14844), the
+typed `bg /fat/vug.elf` refused with the same paired lines (`JD2 — OUT | bg: …` 15004, `BGRUN …
+rejected` 15005), and the board ran on for ~100 further minutes of census cadence. The fail-closed
+refusal is now a two-flight result. (`run` remains untyped on both flights.)
+
+### SMPINSTR on metal (boot7h, 2026-08-25) — the load witness prints its FIRST lines on Orin silicon
+
+Before `a50358f0` the `:: SCHED: load ::` witness had never emitted a line on this board — its only
+trigger sat behind `SCHED_ACTIVE`, which nothing on a tegra build sets (the full chain is in the
+commit and in the spec's SMPINSTR block). boot7h is the first capture that carries it, and it
+carries exactly two lines, which is the designed reading, not a shortfall:
+
+| capture line | on the wire (quoted) | reading |
+| --- | --- | --- |
+| 14845 | `:: SCHED: load c0=--/f=never-folded c1=0%/f=3ms c2=0%/f=1ms c3=0%/f=2ms c4=0%/f=2ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +0/win nofold=0x0) ::` | the unconditional BASELINE, before the drive loop. All 8 accounting slots print (`NUM_CPUS`, not the hard-coded `c0..c3` the arc removed); `c6`/`c7` are the surplus slots on a 6-core part and read `never-folded` honestly rather than being hidden |
+| 14846 | `[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=5` | the live-span line beside it — the staleness that used to be invisible, sampled at the witness |
+| 14848 | `:: SCHED: load c0=100%/f=0ms c1=0%/f=0ms … (ctx +1/win nofold=0x0) ::` | one poll later: the boot core at 100% with a **zero fold age** — busy AND folding, i.e. the healthy reading the `!NOFOLD` tell exists to be distinguished from |
+
+Then the lines stop, and their stopping is the measurement working as specified: the poll lives
+inside `run_capstone_boot_core`'s drive loop, `jd2_console_pump` is dispatched and never returns,
+so no further poll runs — "the poll is the loop, not an observer of it." No `!NOFOLD` printed
+(no wedge was injected; that tell remains proven-present, never yet triggered). The spec now
+carries `REQUIRE SCHED: load c0=(--|[0-9]+%)/f=` on the baseline's reachability argument (the
+`[el0core] rollup:` precedent verbatim), go-red-proven against boot7g's slice, which predates the
+arc and reds on exactly that row.
+
 ## DARKWIN-GUARD — the 2026-08-18 trunk-merge boot hang, and the dark-window serial latch
 
 ### The failure
@@ -9474,6 +9835,58 @@ Every decline is named on the same `[orinwm1]` tag and none is fatal to the boot
 `reason=no-panel` (headless: no JD1 scanout), `reason=alloc`, `reason=geometry-unavailable`,
 `reason=create-failed`, `reason=extent-overflow`, `reason=empty-extent`.
 
+### ORIN-CHROME — the window's frame, and the read-back that proves it reached glass
+
+**The chrome painter was never gated off on this board, and boot7f proves it.** The orin-5 baton
+recorded "the window has NO FRAME … `chrome_raster`, `CHROME_CELL`, `caption` are all 0 symbols in
+the flown ELF, dead-stripped". All three are compile-time constructs — `chrome_raster` is a
+`const fn` in `video/font.rs` consumed only by `const CHROME_SIZE`, `CHROME_CELL_W`/`_H` are the
+`pub const`s it feeds, and the caption's painter is `wm::draw_title`, not `caption`. Const-evaluated
+constants leave no runtime symbol whether or not the chrome paints, so that check could not have
+come out any other way.
+
+The positive evidence is in the same capture, three lines above `[orinwm1]`:
+
+```
+[crispy] theme=us-crispy-modern@0787ba9f frame=5 bevel=1 title_h=34 radius=12 ctrl=24 gap=12 face=0xececee …
+[ceramic] derived=peter-2026-08-09 algo=brushed-1d …
+[knurl]   derived=peter-2026-08-09 algo=crosshatch-2x45 …
+```
+
+`wm::crispy_witness` has exactly one caller — `paint_window`'s `if !r.compat` chrome arm — and is
+latched once per boot, so its presence proves a window was framed rather than that the constants
+exist. `paint_window` itself carries **no `#[cfg]` at all**: the `wc` / `pidesk` gates in
+`composite_pass_half` and `composite_inner` cover *furniture* (`strip::compose_all`, the
+dock/crystal sprite arming), never window chrome. Reachability on the armed jetson build is a `bl`
+chain, not an inference: `orin_wm1` → `wm::composite` → `wm::paint_window` → `wm::draw_title`.
+
+**What the wire could NOT say** is whether those pixels reached the scanout. `[crispy]` proves the
+painter ran; this panel is a DRAM carveout scanned out by a block that does not snoop, so the
+compose's trailing `flush_rect` is a real step that can fail on its own. `orin_chrome_probe` closes
+that with a ground-truth read-back through `FrameBuffer::read_pixel` (the compositor's own verify
+primitive — bounds-checked, `None` off-panel), nine reads, once, on the boot core:
+
+```
+[orinchrome] probe=kl_top at (960,378) got=0x00b4b4b9 want=0x00b4b4b9 -> MATCH
+…
+[orinchrome] win=1 box=650x444 at (635,378) frame=6/6 content=0x00ff00ff@(960,600) MATCH strip=… face=… ctrl=… -> CHROME-ON-GLASS
+```
+
+Six probes carry an EXACT verdict and only six can: `paint_window` machines the window face, the
+title strip and the control discs through `video::ceramic` (and the discs additionally through
+`video::knurl`), so none of those pixels equals a theme constant. The keyline and the two bevel
+hairlines are documented in that same function as deliberately **not** machined, so they are
+`theme::FRAME_LINE`, `theme::BEVEL_LIGHT` and `theme::BEVEL_SHADOW` exactly — sampled at the box's
+mid-edge, which clears `theme::CORNER_RADIUS` at both ends by construction. The ceramic population
+(`strip=`, `face=`, `ctrl=`) is printed **raw and unjudged**, for comparison against `[crispy]`'s own
+`face=` / `title_act=` fields.
+
+The **content probe is the discriminator**: the surface's magenta centre reaches the panel at
+`scale = 1` through the same compose and the same `flush_rect` as the frame. Frame probes all
+missing *with* the content probe hitting is `CHROME-MISSING` — chrome specifically did not land.
+Both missing is `COMPOSITE-NOT-ON-GLASS` and the frame is not the story. The verdict is DERIVED from
+the hit counts, never asserted, on `[orinwm1]`'s own rule.
+
 ### Gating and verification status
 
 `orindesk` is standalone (it does **not** imply `tegra`, mirroring `smpmark`), but every one of its
@@ -9492,10 +9905,56 @@ QEMU models no Tegra234, so the behavioural verdict is **metal-owed**: an attend
 DisplayPort monitor should show one bordered window with a title bar, centred on the panel, over a
 still-readable boot log, and the `[orinwm1] ... -> COMPOSITED` line in the serial capture.
 
-Default OFF is **measured, not argued**: both source edits are appends (a statement appended to an
-existing `main.rs` line, a function appended to the end of `display_tegra.rs`), so no line moves in any
-file compiled knob-off and no panic `Location` shifts. `esp-jetson` built either side of the change
-yields a byte-identical `kernel.elf`.
+Default OFF is **measured, not argued**: the `main.rs` edit is a statement appended to an existing
+line, so no line moves in any file compiled knob-off outside `display_tegra.rs` itself, and that file
+is `tegra`-gated in full (neither the Pi nor x86 compiles a byte of it). ORIN-CHROME inserts its
+probe *inside* `display_tegra.rs`, which does shift panic `Location` line numbers later in that one
+file — so the claim is made on the artefact rather than on the edit shape: `esp-jetson` built
+knob-off either side of the change yields a **byte-identical objcopy'd loadable image**
+(`llvm-objcopy -O binary kernel.elf`, sha256 `d16934db6713…`). The staged `kernel.elf` itself is
+*not* compared — it carries build-path and debug metadata — and neither is the ESP, which embeds
+`SRC.TGZ` and is a guaranteed false positive.
+
+### FLOWN 2026-08-25 (boot7f) — the witness line printed on metal
+
+The wire half of the metal debt above is discharged. Serial capture
+`~/unaos-bench/capture/line-acm0/orin.log`; boot7f's kernel banner is at capture line 11091 and the
+run's tail is line 11540. At **capture line 11110**:
+
+```
+[orinwm1] win=1 panel=1920x1200 surf=640x400 box=650x444 at (635,378) scale=1 stage=4194304 present=Composited -> COMPOSITED
+```
+
+**This is the first composited window on the Orin.** Three things the line settles:
+
+* **The staging buffer is allocated on this path.** `stage=4194304` is `MAX_STAGE_BYTES` (4 MiB) —
+  the `reserve_stage` gap this rung was written to close, now measured rather than inferred.
+* **The present was a real composite.** `present=Composited` is `present_outcome`'s own return and
+  the trailing verdict is derived from it, so `-> COMPOSITED` cannot have printed over a
+  `Suppressed` or a `NoRow`.
+* **The box carries the full chrome geometry.** 640x400 of surface becomes a 650x444 box: `+2 x
+  BORDER` horizontally and `+ TITLE_H + 2 x BORDER` vertically, against `video/theme.rs`'s
+  `FRAME = 5` and `TITLE_HEIGHT = 34`. The same boot's theme latch agrees on the wire —
+  `[crispy] theme=us-crispy-modern@0787ba9f frame=5 bevel=1 title_h=34 …` at capture line 11106,
+  four lines above.
+
+The example line quoted under **Witness** above was written on 2026-08-22 at `ab168ba2`, before any
+flight. boot7f printed it verbatim, field for field.
+
+**The chrome painter ran; it was not stripped.** `[crispy]` latching immediately above `[orinwm1]`
+is the wire evidence, and the flown artifact
+(`~/unaos-bench/flash/orin/boot7f-nowinsweep-20260825T2034Z-04d46aa/kernel.elf`) carries
+`video::wm::paint_window` and `video::wm::draw_title` as reachable text — two `bl` sites each under
+`llvm-objdump -d`, not merely present symbols. Any claim that rung 0's window has no frame because
+the painter was dead-stripped is **refuted by both measurements**.
+
+**What boot7f does NOT settle: what reached the glass.** A serial capture is a wire witness. Whether
+the composited box survives `jd2_console_pump`'s own `Screen` / `pal.render()` blit is an on-glass
+question no `[orinwm1]` field answers — see `docs/dev/OS/08_VIDEO/orin-desktop.md` §7. The
+instrument for it (`[orinchrome]`, verdicts `CHROME-ON-GLASS` / `CHROME-PARTIAL` /
+`CHROME-MISSING` / `COMPOSITE-NOT-ON-GLASS`) landed at `e98d798b`, which is **not an ancestor of
+`04d46aae`** and so is not described by this section; the boot7f media predates it and cannot emit
+those lines.
 
 ## JD1-DC — can the CCPLEX see nvdisplay? (`UNAOS_JD1DC`, default OFF, read-only)
 
@@ -9628,6 +10087,12 @@ set (`ehcihid,tegra,tegrasmp`) either side of the change, in a frozen worktree w
 QEMU models no Tegra234, so the verdict is **metal-owed** and the probe is **not armed on the
 currently-planned flight** — that image already carries other questions. Arm it, alone and attended,
 with `UNAOS_TEGRA=1 UNAOS_JD1DC=1` (or `UNAOS_JD1DC=1 ./arroyo esp-jetson`, which forces `tegra`).
+
+> ⚠ **SUPERSEDED 2026-08-25 — the probe has flown.** The paragraph above records the status this
+> section carried before the flight and is kept for the reasoning, not for the status. JD1-DC ran on
+> Orin metal three times on 2026-08-25 (boot7e twice, boot7f once); the window sweep was EL3-fatal
+> both boot7e runs and is gated off at `04d46aae`, and boot7f answered the model question. Results,
+> capture lines and the reading law: **FLOWN 2026-08-25** at the end of JD1-DC-MODEL below.
 
 ### JD1-DC-MODEL — which register model does this silicon present? (same knob, same guard)
 
@@ -9797,9 +10262,643 @@ instructions, 20 `bl serial::__print`) → **four** `bl 0x180714 jd1_dc_model_re
 `serial::__print`, `Fdt::prop_at` and `from_utf8` (the `JD1-DC-REG` census, inlined); `node_ids`
 armed is 847 instructions with 8 `bl serial::__print`.
 
-**Still UNFLOWN.** JD1-DC has never executed on hardware — armed images have been staged and none
-booted. Every sentence above about what a register *will* read is a **prediction**. The nearest
-cheap follow-up, deliberately left out of this rung to keep it to four reads:
+The nearest cheap follow-up, deliberately left out of this rung to keep it to four reads:
 `NV_PDISP_FE_CHNSTATUS_CORE` at `+0x00630` (withoffset `0x00610630`), whose `STATE` field has
 `_EFI_INIT1 = 0x5`, `_EFI_INIT2 = 0x6`, `_EFI_OPERATION = 0x7` — the live counterpart to
 `CHNCTL_CORE`'s configuration bit, from the same `disp/v03_00/dev_disp.h`.
+
+### FLOWN 2026-08-25 — the model question is answered, and the window sweep is gated off
+
+> ⚠ **This subsection supersedes the "Still UNFLOWN" status the JD1-DC and JD1-DC-MODEL sections
+> carried until 2026-08-25.** JD1-DC has executed on Orin metal. Nothing above about the register
+> *definitions* changed; what changed is that the predictions now have answers.
+
+Source for everything below: the bench serial capture
+`~/unaos-bench/capture/line-acm0/orin.log`. **Capture line numbers are the primary anchor**, with
+the flight's boot id beside them — the serial line is lossy, two of the runs recorded here lost
+their kernel banner to it, and boot boundaries are read off the MB1 coldboot banners rather than
+off the kernel banner.
+
+#### The model verdict (boot7f) — the tree's window map is Tegra186/194's and is WRONG for this chip
+
+Every read survived; the discriminator answered on the first flight that reached it.
+
+| capture line | on the wire (quoted) | what it settles |
+| --- | --- | --- |
+| 11073 | `FIRST READ SURVIVED: DISPLAY_FE_SW_SYS_CAP=0x00100303` | the CCPLEX decodes the aperture with no EL3 abort |
+| 11076 | `READ SURVIVED: NV_PDISP_FE_CLASSES (+0x00000) @0x13800000 = 0xc6700410` | `+0x00000` is readable and non-trivial |
+| 11083 | `FE_CLASSES=0xc6700410: CLASS_ID(31:16)=0xc670 CLASS_REV(15:8)=0x04 API_REV(7:4)=0x1 HW_REV(3:0)=0x0 -> NVD_40 / class NVC67D` | Ampere ga10x — the `0xC670` row of the `CLASS_ID` table above |
+| 11084 | `FE_HW_SYS_CAP=0x00100303: HEAD_EXISTS(0:7)=0x03 (2 head(s)) SOR_EXISTS(8:15)=0x03 (2 SOR(s))` | **2 heads, 2 SORs** — both the "zero heads" and the "more than four heads" failing conditions stayed silent |
+| 11085 | `FE_HW_SYS_CAPB=0x0000000f: WINDOW_EXISTS(0:31) -> 4 window(s) exist` | **4 windows** — not a multiple of the sweep's six-per-head model, which is that model's own stated refutation |
+| 11086 | `CAP CROSS-CHECK: … -> AGREE` | the `+0x30000` software mirror and the `+0x00060` hardware register hold the same word |
+| 11087 | `FE_CHNCTL_CORE=0x00000021: ALLOCATION(0)=ALLOCATE CONNECTION(1)=DISCONNECT PUTPTR_WRITE(4)=0 EFI(5)=ENABLE` | **UEFI left the core channel flagged EFI-owned** |
+| 11088 | `MODEL-VERDICT=NVDISPLAY-CLASS-C670` | the aperture at `0x13800000` **is** `NV_PDISP` rebased to offset 0, and this silicon presents NVD_40 / `NVC67D` |
+| 11089 | `JD1-DC CENSUS — heads=0 windows=0 all-ones=0 all-zero=0 WIN_ENABLE=0 START==JD1-scanout=0 \| reads=5 writes=0` | five reads, **zero writes**, and the count is exact |
+| 11090 | `VERDICT=DECODES-NOMATCH` … `0 window(s) at WIN_ENABLE=1 out of 0 swept` | the sweep contributed nothing, because it is gated off (below) |
+
+**Reproduced three times, not once.** The same four reads returned the same four words on both
+boot7e runs before each died on the sweep — capture lines 8780/8787-8792 and 9928/9935-9940 carry
+`FE_CLASSES=0xc6700410`, `FE_HW_SYS_CAP=0x00100303`, `FE_HW_SYS_CAPB=0x0000000f`,
+`FE_CHNCTL_CORE=0x00000021` and `MODEL-VERDICT=NVDISPLAY-CLASS-C670` verbatim. The verdict does not
+rest on a single boot.
+
+**The consequence, stated plainly: `jd1_dc_survey`'s window offsets — derived from Linux
+`drm/tegra` `hub.c`, whose `of_match` ends at `tegra194` — do not describe this block.** The
+`NVDISPLAY-CLASS-C670` / `DECODES-NOMATCH` pair is exactly the first row of the two-verdict reading
+table above: *replace the window map, do not sweep wider*. Any rung that wants window state takes
+it from the `NV_PDISP` model.
+
+#### boot7e (twice) — the window sweep is EL3-fatal on this silicon
+
+Both runs announced the touch and died inside it. Identical text, identical syndrome:
+
+| run | announce | fault |
+| --- | --- | --- |
+| boot7e, run 1 | capture line 8793: `:: tegra: JD1-DC — head+0x0: about to read win0 WIN_OPTIONS @0x13802e00 (new decode region — announce before touch) ::` | capture line 8794 `Unhandled Exception in EL3.`; 8797 `x1 = 0x00000000be000011`; 8835 `esr_el3 = 0x00000000be000011` |
+| boot7e, run 2 | capture line 9941, the same line verbatim | capture line 9942 `Unhandled Exception in EL3.`; 9945 `x1 = 0x00000000be000011`; 9983 `esr_el3 = 0x00000000be000011` |
+
+`0xbe000011` is EC=`0x2F`, the JX1 SError signature, printed by NVIDIA's BL31 and not by this
+kernel. **The offset is inside the DTB-declared aperture and every bound the probe checks was
+satisfied**: `0x13802e00` is `nvdisplay_base + 0x2e00`, well inside the `size=0xeffff` the DTB
+declares, so the existing bounds check passed and was right to pass. The fault is not an
+out-of-range read; it is a read of a sub-region this silicon does not decode from the CCPLEX.
+
+The sweep is gated off at `04d46aae` (`tegra: JX1-WINSWEEP`); the gate and the conviction are
+recorded at the sweep itself, `arch/aarch64/display_tegra.rs:758-774`.
+
+#### The reading law this cost bought
+
+**No bounds check could have caught it, and none was missing.** The probe's safety envelope — every
+read bounds-checked against the DTB-declared `reg` size, never a constant — held on both fatal boots
+and would hold again. A register can be inside a declared aperture, correctly addressed, and still
+be EL3-fatal to touch: "in range" and "decodable" are different properties, and only the second one
+matters to BL31.
+
+**What made it one boot instead of a bisect was the FIRST-TOUCH announce.** The per-read
+announce/survive pair means silence names the fatal register directly — capture line 8793 is the
+last line of that run, so the fatal read is a single address rather than a candidate set. That is
+the whole return on the pair-per-read discipline documented above, and it is why the pair stays per
+read and not per rung.
+
+**The discriminator explained the fault as well as recording it.** `MODEL-VERDICT=NVDISPLAY-CLASS-C670`
+beside `FE_HW_SYS_CAPB=0x0000000f` (4 windows, against a six-per-head model) says the sweep was
+reading a register map that does not describe this chip, so the EL3 abort is what a wrong-generation
+offset *should* produce rather than an unexplained hazard.
+
+#### Licensing and provenance for the replacement register map
+
+The permissive reference path is the only one in use, and it is sufficient:
+
+| source | licence | role |
+| --- | --- | --- |
+| NVIDIA/open-gpu-doc | MIT | `dev_display_withoffset.ref.txt` for gv100 / tu102 / ga102 — the register and field definitions quoted throughout this section |
+| NVIDIA/open-gpu-kernel-modules | MIT | `swref/published/disp/v03_00/dev_disp.h`, `classes/display/clc67d.h` — the independent confirmation of `CHNCTL_CORE`'s address and of the class numbering |
+| OE4T/nv-kernel-display-driver-source | MIT per file | the Tegra-side display driver source, for the T234 channel model |
+
+**GPL Linux sources are not used, and would not help.** `drm/tegra` is the map that just proved
+wrong for this silicon — its `of_match` ends at `tegra194` and it documents the wrong generation —
+so the licence question and the correctness question point the same way.
+
+**Separately, and unchanged: GA10B GPU-core acceleration remains closed.** Its microcode is signed
+and encrypted with boot-ROM-enforced verification, so no permissive path opens it. That bounds the
+GPU, not the display engine — nvdisplay and the DCE are a different block, and nothing on the
+desktop ladder needs the GPU (`docs/dev/OS/08_VIDEO/orin-desktop.md` §4).
+
+### FLOWN 2026-08-25 (boot7g) — JX2-NVC67D: the channel census answers, and the firmware still owns the display
+
+The rung that replaced the Tegra186/194 window sweep. Where JD1-DC-MODEL asked *which manual
+describes this block*, JX2-NVC67D asks the only question the FE block can actually answer once that
+manual is known: **which display channels did the firmware leave alive, and do we own any of them?**
+
+Source: `~/unaos-bench/capture/line-acm0/orin.log`, boot id `boot7g`, media
+`boot7g-clickchrome-20260825T2124Z-1f2545c` (image built at `1f2545cb`). **Capture line numbers are
+the primary anchor.** The slice runs from the MB1 coldboot banner at capture line 11542 to line
+13151; the sitting was still appending when this was folded, so later content is unscored here.
+
+**Why there is nothing to sweep.** NVD_40 / `NVC67D` window *surface* state is CHANNEL state,
+pushed as methods (`NVC67D_UPDATE` at method `0x200`, `clc67d.h`), not MMIO at any offset. The
+rung's own opening line says so, capture line 12576:
+
+> `NOT ONE REGISTER IS WRITTEN and NO CHANNEL IS OPENED: FE_CHNCTL_CORE bit 5 says the core channel
+> is EFI-owned and it is feeding the panel this console is on`
+
+Offsets come from NVIDIA/open-gpu-doc `manuals/ampere/ga102/dev_display_withoffset.ref.txt`, not
+from Linux `drm/tegra` `hub.c` — the map the previous rung convicted.
+
+#### Every read survived — 26 announce/survive pairs, zero silences
+
+The per-read `NEXTTOUCH` / `READSURVIVED` discipline that made boot7e's fatal register a single
+address rather than a candidate set was applied to all 26 reads of this rung. **26 `NEXTTOUCH`
+lines, 26 `READSURVIVED` lines, no unmatched announce** — the count is exact, and it includes the
+one this rung flagged as its own new-page risk:
+
+```
+JX2-NVC67D NEXTTOUCH: about to read NV_PDISP_FE_RM_INTR_STAT_HEAD_TIMING(i) (+0x01c00 + i*4, FIRST TOUCH OF THE 0x611xxx PAGE) index=0 @0x13801c00 …
+JX2-NVC67D READSURVIVED: NV_PDISP_FE_RM_INTR_STAT_HEAD_TIMING(i) (+0x01c00 + i*4, FIRST TOUCH OF THE 0x611xxx PAGE) index=0 @0x13801c00 = 0x00000007
+```
+
+(capture lines 12635 and 12636). The `0x611xxx` page had never been touched from the CCPLEX on this
+silicon; it decodes.
+
+#### The read table
+
+| capture line | register | value | reading |
+| --- | --- | --- | --- |
+| 12578 | `NV_PDISP_FE_CHNSTATUS_CORE` (+0x00630) | `0x20070000` | `STATE(20:16)=0x07` → **`EFI_OPERATION`** — the core channel is in a firmware-owned running state |
+| 12581 | `NV_PDISP_FE_CHNCTL_CORE` (+0x004e0, re-read) | `0x00000021` | `ALLOCATION(0)=1 CONNECTION(1)=0 EFI(5)=1` — unchanged from boot7f, so the firmware did not move the channel between rungs |
+| 12584 | `NV_PDISP_FE_IP_VER` (+0x00018) | `0x04020000` | `MAJOR=4 MINOR=2` — NVDisplay IP rev 4.2; a MAJOR of 4 corroborates NVD_40 from a second hardwired word, independent of `FE_CLASSES` |
+| 12587 | `NV_PDISP_FE_MISC_CONFIGA` (+0x00074) | `0x00404202` | `NUM_HEADS=2 NUM_SORS=2 NUM_WINDOWS=4` — **agrees with boot7f's `FE_HW_SYS_CAP`/`CAPB` census**, which is the cross-check that says both offsets are the registers this rung thinks they are |
+| 12590 | `NV_PDISP_FE_HW_LOCK_PIN_CAP` (+0x00068) | `0x00000020` | `SCAN_LOCK_PINS=2` — a cheap independent check on the access path |
+| 12594 | `NV_PDISP_FE_CHNCTL_WIN(0)` (+0x004e4) | `0x00000001` | `ALLOCATION=1` — **window channel 0 is allocated** |
+| 12603 / 12612 / 12621 | `NV_PDISP_FE_CHNCTL_WIN(1..3)` | `0x00000000` | `ALLOCATION=0` — windows 1, 2 and 3 are not allocated |
+| 12597 | `NV_PDISP_FE_CHNSTATUS_WIN(0)` (+0x00664) | `0x24010100` | `STATE(19:16)=0x1` → `UNCONNECTED`, `UPD_STATE=IDLE`, `READ_PENDING=YES` |
+| 12606 / 12615 / 12624 | `NV_PDISP_FE_CHNSTATUS_WIN(1..3)` | `0x21000100` | `STATE=0x0` → `DEALLOC`, `FIRSTTIME=YES` — never used since reset |
+| 12600 / 12609 / 12618 / 12627 | `NV_PDISP_FE_CHNSTATUS_WINIM(0..3)` | `0x20010000`, then `0x21000000` ×3 | the window IMMEDIATE siblings track their window channels exactly |
+| 12630 / 12633 | `NV_PDISP_FE_CHNSTATUS_CURS(0..1)` | `0x01000000` | both cursor channels `DEALLOC` |
+| 12636 / 12639 | `NV_PDISP_FE_RM_INTR_STAT_HEAD_TIMING(0..1)` | `0x00000007` / `0x00000000` | head 0 has `LOADV`, `LAST_DATA` and `VBLANK` latched, head 1 nothing — **the raster generator has been running on head 0**, which corroborates the inherited scanout coming from the display block rather than from the framebuffer |
+| 12642 / 12645 / 12648 / 12651 / 12654 | `RM_INTR_STAT_EXC_WIN` / `EXC_WINIM` / `EXC_OTHER` / `CTRL_DISP` / `OR` | all `0x00000000` | no exception is latched on any channel the firmware owns |
+
+**The `WIN(0)` asymmetry is the finding of the walk.** `CHNCTL_WIN(0)=1` against `1..3=0`, and
+`CHNSTATUS_WIN(0)=0x24010100` (`UNCONNECTED`) against `WIN(1..3)=0x21000100` (`DEALLOC`,
+`FIRSTTIME=YES`): exactly one window channel has ever been allocated on this boot, and it is not
+ours. **`CHNCTL_WIN` carries no owner field**, and the rung says so rather than guessing — on
+`NVC67D` a window's head binding is set by the *core*-channel method
+`NVC67D_WINDOW_SET_CONTROL(a)_OWNER` (`clc67d.h`), so window-to-head binding is not readable from
+the FE block at all.
+
+#### The verdict, and the consequence it states
+
+Capture line 12656, boot7g:
+
+```
+JX2-VERDICT=EFI-OWNED-LIVE — CHNSTATUS_CORE=0x20070000, STATE=0x07 -> EFI_OPERATION. The core
+channel is in a firmware-owned state, which corroborates FE_CHNCTL_CORE bit 5 (EFI=1) from the
+opposite side of the block: two independent registers agreeing that the firmware still drives this
+display. CONSEQUENCE: the inherited scanout JD1 is drawing into is presented by a channel WE DO NOT
+OWN, so the next display rung is a deliberate handoff — allocate our own window channel and bind it
+with NVC67D_WINDOW_SET_CONTROL_OWNER through a core channel we have taken — never an opportunistic
+MMIO poke. WHAT THIS DOES NOT MEAN: it does not say the handoff will work, only that nothing is
+currently free for the taking.
+```
+
+The corroboration is the load-bearing part: `CHNCTL_CORE` bit 5 is a *configuration* bit and
+`CHNSTATUS_CORE` `STATE` is a *live* state field, in different registers, and they agree. One of
+them alone could be a stale flag; both together are the firmware actually driving the panel.
+
+**The binding rule for every future display rung on this chip, stated once:** the handoff is
+deliberate — take a core channel, then bind a window with `NVC67D_WINDOW_SET_CONTROL_OWNER`.
+**Never an opportunistic MMIO poke.** The `EFI-OWNED-LIVE` verdict is what makes that a rule rather
+than a preference: there is nothing free to take.
+
+#### The JX1 false cause is now retracted ON THE WIRE
+
+Two lines on this flight close the loop the JX1 gate opened, and both are the instrument correcting
+its own earlier reading rather than a doc note about it.
+
+`JX2-SWEEPDISABLED`, capture line 12657:
+
+> `the Tegra186/194 window sweep below is GATED TO AN EMPTY SLICE and DOES NOT RUN. Every count it
+> feeds is therefore zero BY CONSTRUCTION (swept=0 enabled=0 all_ones=0 all_zero=0 heads=0), not by
+> measurement: nothing was read, so nothing could match.`
+
+and the retraction inside `JD1-DC VERDICT=DECODES-NOMATCH`, capture line 12659:
+
+> `the earlier reading of swept=0 as 'the aperture held the FE capability word but no complete
+> head-0 window bank' was a FALSE CAUSE and is retracted here. Nothing was swept, so nothing could
+> match, and this verdict says NOTHING about where the scanout is fed from. That question moved to
+> the JX2-VERDICT= line above.`
+
+The census beside it, capture line 12658, is `heads=0 windows=0 … | reads=5 writes=0` — five reads,
+**zero writes**, unchanged. **This is the fix being wire-proven, not merely committed:** a reader of
+this capture cannot mistake a gated-off zero for a measured zero, because the log says which it is
+at the point of reading.
+
+#### What boot7g does NOT establish about the display engine
+
+* **Nothing about the handoff.** No channel was opened and no register was written. `EFI-OWNED-LIVE`
+  says the firmware holds the display; it says nothing about whether taking it from the firmware
+  will work.
+* **Nothing about window-to-head binding.** It is not in the FE block. Any claim about which window
+  feeds which head has to come from the core channel, which we do not own.
+* **The desktop side of the same flight** — rung 3 routing on metal and the `CHROME-ON-GLASS`
+  read-back — is recorded in
+  [`../08_VIDEO/orin-desktop.md`](../08_VIDEO/orin-desktop.md) §3.8.1, not here.
+
+**Reproduced on boot7h (2026-08-25, image `68c47585`), second flight:** the full JX2-NVC67D pass
+ran again with every NEXTTOUCH read survived and the same verdict —
+`JX2-VERDICT=EFI-OWNED-LIVE — CHNSTATUS_CORE=0x20070000, STATE=0x07 -> EFI_OPERATION` (capture
+line 14273), `JX2-SWEEPDISABLED` (14274) and the `DECODES-NOMATCH` retraction (14276) beside it.
+The channel census is a two-flight result; both non-establishment bullets above stand unchanged.
+## ORIN-BSPTICK — a periodic EL1 tick on the boot core (`UNAOS_BSPTICK`, default OFF)
+
+**Candidate B arc 1** of the SMP redesign (Peter's 2026-08-25 ruling: highest performance, which
+orders B first among the code arcs). The Orin boot core post-JM6 has taken exactly ONE interrupt at
+EL1 in its life — the IRQEL-RT one-shot proof, which arms a single CNTP tick, witnesses it, and
+self-disarms, leaving the terminus with no clock. This knob replaces "once, then silence" with a
+standing 250 Hz periodic CNTP tick at EL1 that stays live across `run_capstone_boot_core`: the
+first periodic EL1 interrupt this terminus has ever taken, and the clock Candidate B arc 2 (the
+`run_bsp` swap + `SCHED_ACTIVE`) and Candidate A's supervisor both require.
+
+### The JM6 disarm, re-derived rather than reused
+
+The drop asm (`boot_tegra.rs`) writes `msr cntp_ctl_el0, xzr` for two stated reasons. **(1) "the
+shared `__vec_irq` would FAULT if an IRQ were taken at EL1 (it reads ELR_EL2/SPSR_EL2)"** — dead
+since `0a60e260` made the tegra `__vec_irq` bank ELR/SPSR by runtime `CurrentEL`; the IRQEL-RT
+one-shot exists precisely to prove that bank live at EL1, and this tick rides the same vector,
+armed only after the post-drop `exceptions::install()` (VBAR_EL1). **(2) "CAPSTONE runs
+cooperatively"** — a preference, not a constraint, and it survives: on the tegra (not-`baremetal`)
+build `gic::handle_irq_v3`'s timer arm calls only `on_tick` (`timer_preempt` is `baremetal`-gated;
+`SCHED_ACTIVE` has no tegra setter), so a tick re-arms TVAL and bumps counters but can never
+context-switch. The remaining hazards, each checked: **serial** — `_print` masks IRQs around the
+port lock and IRQ-context prints are `try_lock` + staging ring, so a tick landing mid-print cannot
+deadlock; **EL0** — the 0x480 lower-EL IRQ vector routes to the same banked `__vec_irq`
+(metal-proven on the Pi's preemptive path); **idle** — `LIVE` stays false, so `arch::hlt`'s
+timerless-core poll-spin decision (JD3, what keeps the pump's synchronous USB reads progressing) is
+untouched; **AP cross-talk** — below.
+
+### The IRQEL-CORE trap, re-applied
+
+The five ORIN-SMP-3 secondaries each arm their own 250 Hz PPI 30 routed to EL2 and enter the same
+`on_tick` dispatch ~1250x/s. Against machine-global state, an AP consumes the boot core's
+instrument with probability ~1 — the exact defect that burned the one-shot proof's first shape
+(boot 5c). Every piece of state this knob adds is therefore scoped to the arming core's
+`cpu_index` (`BSPTICK_CORE`, the `EL1_PROOF_CORE` pattern): `bsptick_witness` returns before
+touching anything on any core but the armer, so AP ticks fall through unchanged. The global
+side-effect that does return is deliberate and owned: the boot core resumes advancing the shared
+monotonic `TICKS` (frozen since the JM6 disarm) exactly as it did at EL2 — it is the global-clock
+owner (`arm_this_core`, not `arm_this_core_ap`), and the APs stay local-only tickers.
+
+### Witness
+
+`[orinbsptick]` (13 bytes — over the 8-byte immediate-encode floor, so `strings` on the objcopy'd
+image can see it). The arming banner prints before the unmask (serial lock free when the first
+tick's witness fires, the one-shot's own ordering), then the per-tick witness emits at tick 1 (the
+one-hit "the arm delivered") and every 250th tick (~1 line/s), carrying **count + re-measured
+CurrentEL + cpu**: the count advancing is what the one-shot could never say (periodic, not once),
+and an EL2 reading would mean HCR_EL2.IMO regressed — reported, not assumed away.
+
+### Gating and verification status
+
+Sites: `timer.rs` tail (`el1_bsptick_start`, `bsptick_witness`, two statics, all
+`all(tegra, bsptick)`), one statement appended to `on_tick`'s closing line, one statement appended
+to `main.rs`'s terminus line (the Location-shift convention: zero source lines added before any
+panic Location in either file). Armed polarity type-checked by the `arm-tegra-bsptick` matrix leg
+(`arm-tegra` verbatim + `bsptick`, the smpmark shape).
+
+Verified 2026-08-25 at exec-smpb (QEMU/build only — **not yet flown on metal**):
+
+* `UNAOS_TEGRA=1 ./arroyo check` green, 24 legs **as of this arc** (15 board + 9 x86 mix; this arc +1 board leg);
+* `./arroyo test-arm` green (default virt image; `[orinbsptick]` correctly absent);
+* knob-off byte-identity **measured**: `llvm-objcopy -O binary kernel.elf` sha256
+  `6ca63b9e677cf8cc28aae54fb4bd6f404a427358a0de234da31fae609dce4172` at baseline `b710fe4c` and
+  with this arc applied, identical; armed image differs and carries both `[orinbsptick]` format
+  strings (`strings`-proven reachable, 0 hits knob-off).
+
+What the metal flight must show: the arming banner at EL1 on cpu 0, tick 1, and the 1 Hz count
+advancing while the JD2 console stays interactive (the tick must not perturb the pump). What this
+arc deliberately does not do (arc 2, gated on the sched.rs peer grant): no `run_bsp` swap, no
+`run()` entry on the boot core, no `SCHED_ACTIVE`, no preemption, no placement change.
+
+## ORIN-BSPRUN — the boot core joins `run()` (`UNAOS_BSPRUN`, default OFF)
+
+**Candidate B arc 2** of the SMP redesign (Peter's 2026-08-25 highest-performance ruling; arc 1 =
+§ORIN-BSPTICK, `72d3d36e`). Arc 1 gave the post-JM6 boot core a standing 250 Hz EL1 clock and
+deliberately left dispatch `on_tick`-only; this arc is where the clock starts to mean something.
+`UNAOS_BSPRUN=1` swaps the tegra terminus from the cooperative, never-preempted
+`run_capstone_boot_core(0)` drive loop to `sched::run_bsp_tegra(0)` (sched.rs tail), which:
+
+* sets `SCHED_ACTIVE` — **the first tegra setter this flag has ever had** (the only other aarch64
+  setter is the Pi-only `start_aps`), un-gating `timer_preempt` and, through it,
+  `load_witness_tick`;
+* enters `run_bsp` → `mark_online(0)` → `run()`: core 0 gains `drain_due_sleepers` (a task that
+  sleeps on core 0 is no longer parked in `SLEEPERS[0]` forever), `try_steal`, the idle fold, the
+  `SCHED_PASSES` heartbeat, and membership in `ONLINE_MASK` — a legal `CPU_AUTO`/steal target for
+  the first time (F3's second half, per the design doc);
+* arms preemption delivery: `gic::handle_irq_v3` gains an `all(tegra, bsprun)`-gated post-EOI
+  `timer_preempt` call on the timer INTID, appended ON the EOI line (the v2/`baremetal` path's
+  proven ordering — on_tick re-arms and deasserts the level, EOI deactivates, preempt may
+  context-switch; and the Location-shift convention, zero source lines added).
+
+The result, on an armed boot: preemption and the `:: SCHED: load ::` / `[pulse5]` / `[spin1]`
+witness train exist on this board for the first time (F4 — `load_witness_tick`'s only caller is
+`timer_preempt`, which no-ops until `SCHED_ACTIVE`; the train has never printed a tegra line). The
+four-core print/scan widen the design doc names as this arc's dependency was already landed by
+SMPINSTR (`a50358f0`): `load_columns`, `load_witness_emit`, `pulse5_witness` and the `[spin1]`
+sweep are all `NUM_CPUS`-derived. (`storm_probe` keeps a `NUM_CPUS.min(4)` bound — a different
+instrument, the storm verb's, and not part of the named dependency.)
+
+### The knob rule — `bsprun` REQUIRES `bsptick`, enforced twice
+
+`timer_preempt` only ever runs from the timer IRQ, so preemption without the periodic EL1 tick is
+a flag with no clock: `SCHED_ACTIVE` true, zero preemptions, zero witness lines — false confidence
+by construction. arroyo's `UNAOS_BSPRUN=1` mapping therefore arms **both** features
+(`bsprun,bsptick`), and a `compile_error!` at sched.rs's tail refuses a hand-rolled `bsprun`
+without `bsptick` (verified firing: `--features tegra,tegrasmp,bsprun` errors with the ORIN-BSPRUN
+message). The converse is free and meaningful: `bsptick` alone is exactly arc 1 — tick,
+bookkeeping, terminus cooperative. `Cargo.toml` deliberately does NOT write
+`bsprun = ["bsptick"]`: the matrix leg names both features explicitly so its line IS the
+configuration it compiles, and a split list should fail loudly, not be silently widened.
+
+### What preemption can now interrupt that it never could (JB-CAPSTONE-GUARD accounting)
+
+The tegra queue is already non-empty at the terminus — `jd2_console_pump` (xHCI poll, panel,
+console, shell dispatch, click routing) is staged and infinite — so the swap turns the only
+interactive task this board has from cooperatively-yielding into preemptible: a quantum expiry can
+land mid xHCI event drain, mid console repaint, mid shell command. Soundness, hazard by hazard:
+**serial** — `_print` masks IRQs around the port lock, IRQ-context prints are try_lock + staging
+(no preemption mid-hold, no deadlock); **run queues** — every rq section is IRQ-masked (WEDGE-4),
+and `timer_preempt` carries the `IN_RQ_SECTION` tripwire; **EL0** — quantum preemption through the
+0x480 lower-EL vector is the Pi's metal-proven path, riding the same runtime-banked `__vec_irq`;
+**video/WM locks** — the pump can now be preempted while holding one, but no other core-0 task
+touches video state today, so there is no contender to deadlock with (the arc that adds one must
+re-derive this); **APs** — the IRQEL-CORE audit at the gic.rs call site: `timer_preempt` gates on
+`SCHED_ACTIVE` then indexes only per-cpu words by the caller's own `cpu_index`; an EL2 AP with an
+empty queue takes the null-`current` early return, and the one shared word it advances (the load
+witness cadence) is that witness's designed multi-core aggregate, exactly as on the 4-core Pi.
+
+What an armed boot gives up, stated: `run_bsp_tegra` bypasses `run_capstone_boot_core`, so no
+CAPSTONE is spawned (on tegra it only ever ran interleaved with the pre-staged pump) and the
+cooperative terminus's baseline emits are skipped — the two that prove reader linkage
+(`el0_refusal_rollup`, `load_witness_emit`) are re-emitted by `run_bsp_tegra` before `run()`
+entry, un-preempted by construction (the `SCHED_ACTIVE` store comes after them).
+
+### Witness
+
+`[orinbsprun]` (12 bytes, over the 8-byte immediate-encode floor) — the terminus banner, printed
+once, before the `SCHED_ACTIVE` store (so it cannot itself be the first preempted print). The
+arc's real payload witness is the load train itself. Arc 1's `[orinbsptick]` arming banner is
+cfg!-split so it stops claiming "no preemption" on a `bsprun` image.
+
+### Gating and verification status
+
+Sites: `main.rs` terminus line (cfg-selected swap, zero lines added), sched.rs FILE TAIL
+(`run_bsp_tegra` + `compile_error!`, all `all(tegra, bsprun)` — the run-loop/terminus region; no
+spawn-path site), `gic.rs` EOI line (post-EOI `timer_preempt`, `all(tegra, bsprun)`), `timer.rs`
+banner truth-split. Armed polarity type-checked by the `arm-tegra-bsprun` matrix leg (`arm-tegra`
+verbatim + `bsptick,bsprun`; the bsprun-without-bsptick polarity is compiled by NO leg — it is the
+`compile_error!`'s job).
+
+Verified 2026-08-25 at exec-smpb2 (QEMU/build only — **not yet flown on metal**):
+
+* `UNAOS_TEGRA=1 ./arroyo check` green, 27 legs **as of this arc** (18 board + 9 x86 mix; this arc +1 board leg =
+  `arm-tegra-bsprun`);
+* `./arroyo test-arm` green knob-off AND with `UNAOS_BSPRUN=1` (virt image byte-inert: every site
+  tegra-gated; `[orinbsprun]`/`[orinbsptick]` correctly absent from the armed virt log);
+* knob-off byte-identity **measured**: `llvm-objcopy -O binary kernel.elf` sha256
+  `c3ae5a49ed2427fd1bf4d0daf95307cb2cbad2929bc31c72b45287dcaf980518` at base `00124d1b` and with
+  this arc applied, identical (`cmp` clean); armed image
+  (`04201e5e7c94f660fce8445b6f17902c5d2a9be7fca43945b69afc0ff73e7d2f`) carries `[orinbsprun]`
+  exactly once (`strings`-proven; 0 hits knob-off) plus both `[orinbsptick]` strings (the mapping
+  folded `bsptick` in, as the knob rule requires).
+
+What the metal flight must show (a later image, not this arc's job): the `[orinbsprun]` banner,
+the first real `:: SCHED: load ::` / `[pulse5]` emission on Orin silicon, and the JD2 console
+still interactive under preemption — a keystroke and a click surviving quantum expiry is the whole
+point. What this arc deliberately does not do: no AP EL1 drop (Candidate C), no `steal_ok` change
+(F1 stays empty by design until C), no supervisor (Candidate A), no change to how many cores wake.
+
+
+## §ORIN-SUPSTATE — the console-surface state lift + role split (SMP-redesign Candidate A, arc 1; `supstate`, DEFAULT OFF)
+
+### The defect this arc addresses
+
+F2 of the SMP-redesign record (Peter's 2026-08-25 ruling: highest performance; B approved and in
+flight, A approved contingent on B — this arc is A's B-independent half): the whole interactive
+surface is ONE task on ONE core, and its entire state — `Screen`, `TargetPal`, `Console` — lives on
+`jd2_console_pump`'s own stack (`main.rs` phase 2). When that task dies the state is unreachable
+even in principle; `display_tegra.rs`'s census doc records in the tree's own words that nothing
+inherits a dead task's singleton roles. This arc is the OWNERSHIP half of the fix: state that
+outlives its holder, and named roles a future supervisor can supervise. It is NOT the supervisor —
+arc 2's reap/restart needs Candidate B's clock (a watchdog on core 0 today cannot fire; "A alone is
+not deliverable; A-on-B is").
+
+### What the knob changes (UNAOS_SUPSTATE=1 → feature `supstate`, implies `tegra`)
+
+* **The lift.** Phase 2 builds `Screen`/`Console` exactly as JD2/JD4 always did (same construction
+  order, same serial lines, single `:: UI1:` metrics print), then INSTALLS them into a module-owned
+  handle — `display_tegra.rs::SupSurface` behind `SUP_SURFACE`, the `ORINWM1_STORE` mould — via
+  `sup_install` (witness: `[supstate] lift gen=1 … -> ADOPTABLE`). Every later access goes through
+  `sup_with_surface`. `TargetPal` is a VIEW (`pub surface: &mut Screen`) and is reconstructed per
+  lock scope through its public field, never through `TargetPal::new` (which would re-print UI1 per
+  frame).
+* **The split.** The pump's roles become three task identities, ALL STILL PINNED TO CORE 0 —
+  ownership changes, placement and scheduling do not:
+  * **input source** — the existing `jd2-console` task: xHCI poll, PAL drain, pointer coalescing,
+    `Event::Button` → `orin_click` routing, the ~250 ms sweep cadence (VUGRAS + the `[orinclick]`
+    census — the census stays authored by the routing task, which is the property that makes it
+    trustworthy);
+  * **dispatcher** — `jd2-dispatch`: pops keys from the module-owned key queue, prints the
+    `:: tegra: JD2 — KEY … ::` echo, runs `handle_key` → `shell::dispatch_command` under the
+    surface lock;
+  * **presenter** — `jd2-present`: drains the frame board (coalesced pointer motion + key-repaint
+    marks), owns the save-under cursor composite and every `pal.render()` (the flush to glass),
+    and the cursor auto-hide erase.
+  Witness: `[supstate] roles input=jd2-console presenter=jd2-present dispatcher=jd2-dispatch …`.
+* **Lock discipline.** `SUP_SURFACE` is strictly OUTERMOST (SURFACE → WRITER → TABLE, acyclic by
+  construction: nothing that holds WRITER or TABLE ever takes SURFACE); beneath it the existing
+  WRITER-before-TABLE sequential-never-nested rule is unchanged. Core 0 has no preemption (F4), so
+  every acquisition in the module is `try_lock` + `yield_now` — a bare `lock()` spin against a
+  holder that yielded (the dispatcher across a full-screen command) would be a livelock. Role
+  queues (`SUP_KEYQ`, cap 64 = the PAL ring's depth; `SUP_FRAMES`, a fixed-size coalescing board)
+  are leaf locks never held across a yield.
+
+### Knob-on observable deltas, stated (the role-split honesty list)
+
+Knob-off there are none (byte-identity below). Knob-on, on the serial wire:
+
+1. `[orinclick]` census and VUGRAS idle-sweep lines CONTINUE during a foreground command (today the
+   monolithic pump is blocked inside `handle_key`, so they pause). This is the census becoming what
+   it claims to be — the routing task's own liveness — and is strictly more honest; the
+   IDLE-NO-CLICKS / dead-pump distinction is unchanged.
+2. A census or JD20 pointer line can interleave between a key's arrival and its
+   `:: tegra: JD2 — KEY … ::` echo (the echo now prints from the dispatcher). Per-key ordering
+   echo → command output is preserved (single sequential dispatcher), so the
+   `awk '/:: tegra: JD2 —/'` transcript reconstruction is unaffected.
+3. Two `[supstate]` witness lines at phase-2 entry.
+4. A key frame and a pointer frame that shared one present may now present as two (panel timing
+   only; damage-tracked flush, no serial trace).
+5. One race window, disclosed: a keystroke popped by the input source in the same ~250 µs pass in
+   which the dispatcher marks `SCREEN_APP_ACTIVE` goes to the shell after the command returns
+   rather than to the command's own pump — today's typed-ahead semantics, but the window is now one
+   input pass instead of zero. Human-rate keys; benign.
+
+While `SCREEN_APP_ACTIVE` is set the input source leaves the PAL queue alone (GUI-CLICK-2's
+contract: the command's own `pump_and_poll` is the consumer), and it keeps polling the xHCI —
+`drivers::xhci::claim()` is try-based on both sides, so the two pollers cannot deadlock.
+
+### Gating and verification status
+
+Sites: `display_tegra.rs` tail (`SupSurface`/`sup_install`/`sup_with_surface`, the key queue and
+frame board, all `#[cfg(feature = "supstate")]`), `main.rs` tail (`jd2_supstate_phase2` — the
+input-source loop — plus `jd2_supstate_presenter`/`jd2_supstate_dispatcher`), and ONE statement
+appended to `jd2_console_pump`'s phase-1 boundary line (the Location-shift convention: zero source
+lines added before any panic Location in either file). Armed polarity type-checked by the
+`arm-tegra-supstate` matrix leg (`arm-tegra` verbatim + `supstate`, the smpmark/bsptick shape —
+deliberately WITHOUT `orinclick`, proving the lift does not depend on the instrument; the cross
+rides `UNAOS_SUPSTATE=1 UNAOS_ORINCLICK=1 ./arroyo check`).
+
+Verified 2026-08-25 at exec-supstate (QEMU/build only — **not yet flown on metal**):
+
+* `UNAOS_TEGRA=1 ./arroyo check` green, **27 legs as of this arc** (`kernel cfg coverage OK (27 legs)`; this arc
+  +1 board leg, `arm-tegra-supstate`, which passed), userspace x86_64 (4 crates) + aarch64
+  (5 crates) + midden_core host tests all green, exit 0;
+* knob-off byte-identity **measured** at the loadable-image level: `./arroyo esp-jetson` built
+  knob-off, no environment overrides, in a worktree at baseline `00124d1b` and in this arc's tree
+  (M1+M2 applied) — `llvm-objcopy -O binary target/aarch64_esp/kernel.elf` sha256
+  `c3ae5a49ed2427fd1bf4d0daf95307cb2cbad2929bc31c72b45287dcaf980518` **both sides**, `cmp` clean,
+  zero `supstate`/`jd2-present`/`jd2-dispatch` strings. This reproduces the seat's stated base
+  flat exactly. The `.elf` files differ (`.strtab`-class, non-loaded — the JB11/conwin note);
+  compare the binary image, not the `.elf`.
+* **A false reading en route, disclosed** (it is baked into the M1/M2 commit messages and is
+  corrected here): the M1-commit "byte-identity `179a92d2…` GREEN" claim was VACUOUS — the two
+  builds it compared had both DIED early (a `CARGO_TARGET_DIR` override broke the EL0-program
+  sub-builds' per-crate paths under `set -e`) and the compared file, `unaos/build/esp/kernel.elf`,
+  is a GIT-TRACKED prebuilt artifact, identical in any two checkouts of the same commit by
+  construction. Lesson, the SERWIT shape: a byte-identity gate must first prove its artifact was
+  PRODUCED BY THE BUILD UNDER TEST (check the tool's own completion banner — `esp_jetson` prints
+  the staged path — and never hash a path `git ls-files` claims).
+* armed image (`UNAOS_SUPSTATE=1 ./arroyo esp-jetson`, flat sha256 `989f5f48…`): differs from
+  baseline as it must, carries BOTH `[supstate]` witness format strings (`strings`-proven; zero
+  knob-off), and is REACHABLE by disassembly, not merely linked: `jd2_console_pump` (0x5d0e0)
+  carries `bl <jd2_supstate_phase2>` at 0x5d258, and phase2's body carries
+  `bl <display_tegra::sup_install>` plus two `bl <sched::spawn>` (the presenter and dispatcher
+  spawns); `jd2_supstate_presenter` and `jd2_supstate_dispatcher` are present as task entries;
+* `UNAOS_SUPSTATE=1 ./arroyo check` green (27 legs, as of this arc) and the
+  `UNAOS_SUPSTATE=1 UNAOS_ORINCLICK=1` cross green (27 legs, as of this arc) — the armed polarity and the
+
+**MATRIX SIZE — CURRENT, and why every per-arc figure above disagrees with it.** After the orin-7
+fold batch (`ORIN-BSPRUN` + `ORIN-SUPSTATE` + `GA10B-PROBE1`, plus the `arm-tegra-conwin-tenant`
+rename at `dbda97fa`) `UNAOS_TEGRA=1 ./arroyo check` reports **31 legs = 22 board (20 `arm-*` +
+2 `x86-*`) + 9 x86 pairwise-mix**. The per-arc numbers above are NOT wrong — each was measured on
+a branch carrying only its own new leg, and each is a true record of that arc's gate. They are
+qualified "as of this arc" rather than rewritten, because a gate ledger that is edited to match
+today cannot be used to audit yesterday. **Read the live count from `./arroyo check`'s own output,
+never from this file.**
+  armed+instrument cross both compile everywhere;
+* `./arroyo test-arm` green, `MISSION SUCCESS`, and the arm serial log carries ZERO
+  `supstate`/`orinclick`/`jd2` lines (awk over `target/serial-arm.log` — correctly absent on the
+  default virt image);
+* `./arroyo test` green on re-run and green at baseline; the FIRST arc-tree run failed on
+  `[ptrdead] backlog … order=false -> FAIL` (serial.log:897) — an x86 pointer-channel ordering
+  witness in code this arc does not compile on x86 at all (every site is `aarch64`+`tegra`+
+  `supstate` gated and the knob-off image is byte-identical). Verdict: a FLAKY x86 instrument,
+  pre-existing — reported to the seat for relay to the rmbp track rather than papered over. The
+  three runs (arc-fail, arc-pass, base-pass) are the evidence; nothing in this arc can reach that
+  code path.
+
+What the metal flight must additionally show for the SPLIT (beyond the M-1 lift lines): the
+`[supstate] roles` line naming all three identities, keystroke echo + command output through the
+dispatcher, cursor motion through the presenter, and the `[orinclick]` census continuing on the
+input source's cadence — including DURING a foreground command, which is delta 1 of the honesty
+list above and the one place a knob-on capture must differ.
+
+What the metal flight must show: the `[supstate] lift` and `[supstate] roles` lines at phase-2
+entry, then a JD2 interactive session and an `[orinclick]` census transcript that read identically
+to a knob-off boot apart from the deltas enumerated above. What this arc deliberately does not do:
+no supervisor, no reap, no restart, no heartbeat records (arc 2, gated on B's clock); no EL
+changes, no core wakes, no `steal_ok`, no migration — a role still dies on the core it lived on;
+the lift's whole point is that its STATE no longer dies with it.
+
+
+## ORIN-INPUT — why HID never reached an EL0 tenant on the Orin, and the pump that fixes it
+
+The Jetson bench asked why a tenant that polls `SYS_INPUT_POLL` every frame received **zero events
+across 300 frames** on a board with live USB HID, and why almost every census line read `focus=0x0`.
+Traced end to end on `hw-jetson`: the EL0 input chain is entirely present on a `tegra_el0` image, and
+the loss is in the **two hops that feed it**, both of which are Pi-only code.
+
+**Nothing in this section has been on hardware.** It is a source trace plus a compile- and
+artifact-verified instrument.
+
+### The chain, hop by hop (aarch64, `tegra_el0`)
+
+| # | Hop | Where | On the Orin |
+|---|-----|-------|-------------|
+| 1 | Tegra XUSB attach + HID enumeration | `arch/aarch64/xusb_tegra.rs::jb2b_attach` | present |
+| 2 | Transfer-event drain + HID decode | `drivers/xhci/mod.rs::poll_events` | present |
+| 3 | Decoded edge -> kernel queue | `drivers/xhci/mod.rs` `push_event(Event::Key/KeyUp)` | present |
+| 4 | Queue drain | `pal.rs::next_event` / `pal.rs::pump_and_poll` | present |
+| 5 | **Independent HID pump task** | `main.rs::usb_pump` | **ABSENT — `cfg(baremetal)`** |
+| 6 | **Router: queue -> per-process ring** | `main.rs::route_input_to_active_el0` | **ABSENT — `cfg(baremetal)`** |
+| 7 | **Router call site** | `main.rs::pump_usb_into_gui` | **ABSENT — `cfg(baremetal)`** |
+| 8 | Router seam | `arch/aarch64/syscall.rs::user_input_enqueue` | present |
+| 9 | Focus registration | `arch/aarch64/syscall.rs::user_input_set_active`, called by `run_user_image` | present |
+| 10 | Per-process input ring | `arch/aarch64/syscall.rs`, ELF-5 block | present |
+| 11 | `SYS_INPUT_POLL` dispatch + handler | `arch/aarch64/syscall.rs` (SVC table) | present |
+| 12 | EL0 slot creation | `arch/aarch64/sched.rs::spawn_user_slot` | present |
+
+`pub mod syscall` is gated `any(feature = "baremetal", feature = "tegra_el0")`, so hops 8-12 are real on
+any `tegra_el0` image. Hops 5-7 are not: they are `cfg(all(target_arch = "aarch64", feature =
+"baremetal"))`, and `baremetal = ["pi"]` while `pi` + `tegra` is a `compile_error!`. A tegra image can
+therefore never carry them.
+
+### The two breaks, ranked
+
+**Break 1 — nothing pumps the controller while a tenant runs (primary).** The Pi drains xHCI from a
+dedicated `usb_pump` task at ~4 ms, independent of the shell. The Orin has no such task; its **only** HID
+pump is the drain inside `main.rs::jd2_console_pump`, and that task is **parked** inside `handle_key` ->
+`dispatch_command` -> `run_user_image` for the tenant's entire life. `run_user_image`'s wait loop was
+`super::sched::yield_now()` and nothing else. Across a whole run, **zero `poll_events()` calls happen**:
+no HID report is harvested and `pal::EVENT_QUEUE` stays empty. There is nothing for any router to route.
+
+**Break 2 — nothing routes keystrokes on tegra.** `route_input_to_active_el0` and its sole caller
+`pump_usb_into_gui` are `baremetal`-gated too. On tegra `jd2_console_pump` feeds every `Event::Key`
+straight through `handle_key` **regardless of focus** — `arch/aarch64/display_tegra.rs` states this in
+its own words beside `orin_click`, having verified it rather than assumed it. So even a harvested
+keystroke goes to the shell, never to the tenant's ring.
+
+### `focus=0x0` is a symptom of Break 1, not a focus bug
+
+`run_user_image` does grant focus (`user_input_set_active(asid)`) for the whole run. But the
+`[orinclick]` and `[orintenant]` censuses are emitted **from `jd2_console_pump`'s own ~10 s sweep** — the
+same task Break 1 parks — so **no census line can be emitted while a tenant holds focus**. A capture in
+which nearly every census line reads `focus=0x0` is exactly what Break 1 predicts: the census only ever
+samples the intervals when no tenant is running. It corroborates the parked pump rather than indicting
+focus assignment, which works.
+
+### What landed (`UNAOS_ORININPUT=1`)
+
+One pump pass driven from `run_user_image`'s wait loop — the one context that runs for exactly as long
+as the tenant does. Claim the controller, `poll_events()` to harvest and re-arm the HID rings, then drain
+`pal::EVENT_QUEUE` through the **same** `user_input_enqueue` seam the Pi router uses. No second seam and
+no bypass, so the compositor's TAB interception and click routing, the ring's drop-newest contract, and
+the `[uvug8]` takeover heartbeat all behave exactly as on the Pi. With no EL0 owner the pump harvests but
+drains nothing, leaving the queue for the console — the tegra twin of the Pi router's rule.
+
+Implementation: `arch/aarch64/xusb_tegra.rs` (`oi_pump` / `oi_reset` / `oi_rollup`) plus three call sites
+in `arch/aarch64/syscall.rs::run_user_image`.
+
+```
+[orininput] live  rollup passes=N nofocus=N decoded=N deliverable=N routed=N dropped=N focus=0xN :: <verdict> ::
+[orininput] final rollup passes=N nofocus=N decoded=N deliverable=N routed=N dropped=N focus=0xN :: <verdict> ::
+```
+
+Verdicts: `DELIVERED` / `ROUTER-DROP` / `QUEUE-INERT` / `NO-HID` / `NO-FOCUS` / `NEVER-RAN`. The
+load-bearing field is **`passes`**: it separates "the pump ran and the wire was quiet" (`NO-HID` — break
+upstream of `pal::EVENT_QUEUE`: enumeration, interrupt-IN re-arm, or SMMU-dropped DMA) from "the pump
+never ran" (`NEVER-RAN`). The `final` line is emitted unconditionally at the end of every run, so a run
+that delivered nothing says so rather than printing nothing.
+
+### Scope — what this deliberately does NOT fix
+
+Break 2 is **neutralised only for the duration of a `run`**, because the thief (`jd2_console_pump`) is
+parked exactly then. A `bg`-launched windowed tenant that holds focus while the shell runs is still
+robbed of its keystrokes. The obvious fix — gate `jd2_console_pump` on `user_input_active() != 0` — is
+**wrong** and must not be applied casually: with `pidesk` OFF, `USER_INPUT_ACTIVE` can hold the
+`wm::KERNEL_OWNER_DESKTOP` pseudo-ASID (see `display_tegra.rs`'s note beside `orin_click`), and routing
+keys into a pseudo-ASID ring would lock the operator out of the shell with no way back. That belongs with
+the `pidesk` rung that owns the pseudo-ASID question.
+
+### Gates
+
+`orininput` implies `tegra_el0`. Default OFF => the pump, its statics and all three call sites vanish;
+the jetson media and the Pi `kernel8.img` are both byte-identical to baseline. Verified:
+
+* `arm-tegra-tenant` + `orininput` — green.
+* `arm-tegra-tenant` knob off — green.
+* `arm-tegra` (shipped default jetson, no `tegra_el0`) — green.
+* Armed `esp-jetson` artifact: every verdict string present in `kernel.elf`
+  (`LC_ALL=C grep -a -o`, never `strings`).
+* Disarmed `esp-jetson` (`tegra_el0` aboard, `orininput` off): **zero** matches for `orininput`,
+  `rollup passes=`, `NEVER-RAN`, `ROUTER-DROP`, `QUEUE-INERT` — the strings are absent from the image,
+  not merely unreached.

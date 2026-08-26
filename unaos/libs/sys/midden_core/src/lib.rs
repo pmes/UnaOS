@@ -277,6 +277,14 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     ("tste", Avail::Always), ("selftest", Avail::Always), ("sched", Avail::Always),
     ("ps", Avail::Always), ("top", Avail::Always), ("batmon", Avail::Always),
     ("bootlog", Avail::Always), ("shutdown", Avail::Always), ("off", Avail::Always),
+    // ORIN-REBOOT (baton orin-6 §5.1 + the cold-boot ruling 2026-08-25): the arch-neutral
+    // WARM-REBOOT verb (`shutdown`/`off`, its cold sibling, was already registered above and
+    // its ring arm now powers off for real). Registered here so MIDDEN-M1's single
+    // interpreter routes it as Plan::Host to the ring's service arm (kernel `power::reboot` —
+    // aarch64: PSCI SYSTEM_RESET via SMC; unwired platforms refuse with an honest witness).
+    // Always: the VERB is one word on every UnaOS (ONE-OS law); the per-platform mechanism
+    // decides what it does, never whether the word exists.
+    ("reboot", Avail::Always),
     // processes
     ("run", Avail::Proc), ("bg", Avail::Proc), ("storm", Avail::Proc),
     ("jobs", Avail::Proc), ("kill", Avail::Proc),
@@ -578,7 +586,8 @@ pub fn help(facts: &Facts) -> String {
             facts.proc_rows
         ));
     }
-    say!("POWER:    batmon (SMC battery snapshot; x86 UNAOS_SMC=1 only)");
+    say!("POWER:    reboot (warm reboot), shutdown|off (power off, cold-boot-ready) — via the platform firmware");
+    say!("          batmon (SMC battery snapshot; x86 UNAOS_SMC=1 only)");
     say!("WITNESS:  bootlog (boot-milestone ring: PORTSW / FTDI console / EHCI HID / block / GUI handoff)");
     say!("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
     say!("NETWORK:  netinfo, ping <ip> [count], arp <ip>");

@@ -55,9 +55,9 @@ static INTERVAL: AtomicU64 = AtomicU64::new(0);
 #[cfg(not(feature = "pi"))]
 static AP_LOCAL_TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// The counter frequency (CNTFRQ_EL0), in Hz. On QEMU `virt` this is 62.5 MHz; on the Pi 4 the
-/// firmware programs it (19.2 MHz crystal-derived). Reading it instead of assuming keeps the tick
-/// rate correct on both.
+/// The counter frequency (CNTFRQ_EL0), in Hz — read at runtime, never assumed: QEMU `virt` reads
+/// 62.5 MHz, the Pi 4's firmware programs 54 MHz (its crystal; 19.2 MHz is the Pi 3's), and the Orin
+/// (Tegra234) reads 31.25 MHz (capture-proven; see `mod.rs` `HW_WAIT_BUDGET`). Zero => `init` substitutes.
 #[inline]
 pub fn cntfrq() -> u64 {
     let v: u64;
@@ -189,7 +189,7 @@ pub fn on_tick() {
             super::percpu::this_cpu().cpu_index,
             local + 1
         );
-    }
+    } #[cfg(all(feature = "tegra", feature = "bsptick"))] bsptick_witness(); // ORIN-BSPTICK (appended to this line per the Location-shift convention; see file tail)
 }
 
 /// Monotonic count of timer ticks since boot.
@@ -629,4 +629,129 @@ fn el1_proof_snapshot(when: &str) {
         g.rpr,
         g.hppir,
     );
+}
+
+// ── ORIN-BSPTICK (Candidate B arc 1; tail-defined per the Location-shift convention; everything
+// below is `tegra`+`bsptick`-gated so the knob-off image is byte-identical to baseline). A PERIODIC
+// EL1 generic-timer tick on the Orin boot core, armed from `tegra_early_stop`'s terminus line right
+// after the IRQEL-RT one-shot proof self-disarms — the first standing periodic interrupt the
+// post-drop boot core has ever had.
+//
+// THE JM6 DISARM, RE-DERIVED RATHER THAN REUSED. The drop asm (`boot_tegra.rs`) writes
+// `msr cntp_ctl_el0, xzr` for two stated reasons: (1) at the time, the shared `__vec_irq` stub read
+// ELR_EL2/SPSR_EL2 unconditionally and an IRQ taken at EL1 would have FAULTED in the stub; (2) the
+// post-drop CAPSTONE loop is cooperative and needs no tick. Reason (1) is dead: 0a60e260 made the
+// tegra `__vec_irq` bank ELR/SPSR by RUNTIME CurrentEL, and the IRQEL-RT one-shot exists precisely
+// to prove that bank live at EL1 — this periodic tick rides the same runtime-banked vector, armed
+// only AFTER the post-drop `exceptions::install()` has VBAR_EL1 pointing at it. Reason (2) was a
+// preference, not a constraint, and it SURVIVES this arc: on the tegra (not-`baremetal`) build the
+// v3 dispatch's timer arm calls ONLY `on_tick` (`gic::handle_irq_v3` — `timer_preempt` is
+// `baremetal`-gated and `SCHED_ACTIVE` is false on this board), so a tick re-arms TVAL and bumps
+// counters but can never context-switch: the terminus stays cooperative, now with a heartbeat.
+// [ORIN-BSPRUN, arc 2, supersedes the previous sentence WHEN ARMED: `bsprun` (which requires this
+// knob) adds a post-EOI `timer_preempt` arm to the v3 dispatch and a tegra `SCHED_ACTIVE` setter
+// at the terminus (`run_bsp_tegra`, sched.rs tail), so a bsptick+bsprun image IS preemptive. A
+// bsptick-only image keeps every claim above verbatim.]
+// The remaining hazards, one by one: SERIAL — `_print` masks IRQs around the port lock and an
+// IRQ-context print goes `try_lock` + staging ring, so a tick landing mid-print cannot deadlock;
+// EL0 — the 0x480 lower-EL IRQ vector routes to the same banked `__vec_irq` (metal-proven on the
+// Pi's preemptive EL0 path); IDLE — `LIVE` stays false, so `arch::hlt`'s timerless-core poll-spin
+// decision (JD3: what keeps the pump's synchronous USB reads progressing) is untouched; the tick
+// does not license WFI. AP CROSS-TALK is the IRQEL-CORE lesson re-applied below.
+//
+// WITNESS RULE: the `[orinbsptick]` token is 13 bytes — LLVM immediate-encodes tokens <= 8 bytes
+// (invisible to artifact grep), so this one is provable by `strings` on the objcopy'd image. ──────
+
+/// ORIN-BSPTICK sentinel for [`BSPTICK_CORE`]: no core owns the periodic tick.
+#[cfg(all(feature = "tegra", feature = "bsptick"))]
+const BSPTICK_NO_CORE: u32 = u32::MAX;
+
+/// The `cpu_index` of the ONE core whose periodic EL1 tick this instrument witnesses
+/// ([`BSPTICK_NO_CORE`] = disarmed). A core id and not a bool for the IRQEL-CORE reason
+/// (`EL1_PROOF_CORE` above): the five ORIN-SMP-3 secondaries each arm their OWN 250 Hz PPI 30 at
+/// EL2 and reach the SAME `on_tick` dispatch ~1250x/s — against machine-global state an AP consumes
+/// the boot core's window with probability ~1 (that exact bug burned the one-shot proof's first
+/// shape). Scoped to the arming core, every AP tick falls through this instrument unchanged.
+#[cfg(all(feature = "tegra", feature = "bsptick"))]
+static BSPTICK_CORE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(BSPTICK_NO_CORE);
+
+/// Ticks taken on the arming core since [`el1_bsptick_start`]. Written ONLY by that core (the
+/// [`BSPTICK_CORE`] guard in [`bsptick_witness`] runs before every bump), so it is boot-core-scoped
+/// by construction even though the cell itself is a static.
+#[cfg(all(feature = "tegra", feature = "bsptick"))]
+static BSPTICK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// ORIN-BSPTICK — arm THIS core's generic timer as a standing PERIODIC tick at EL1 and leave IRQs
+/// unmasked, permanently: every statement of the terminus line after this call, and the
+/// `run_capstone_boot_core` drive loop itself, now executes with a 250 Hz heartbeat landing through
+/// the runtime-banked `__vec_irq`. Call ONCE from `main.rs`, on the boot core, after the post-drop
+/// `exceptions::install()` (VBAR_EL1 must already be live) — in practice right after
+/// `el1_oneshot_proof` returns, whose self-disarm leaves exactly the state this function expects
+/// (timer off, IRQ masked, `EL1_PROOF_CORE` = none, GICR PPI enable persisting from its arm).
+#[cfg(all(feature = "tegra", feature = "bsptick"))]
+pub fn el1_bsptick_start() {
+    let freq = cntfrq();
+    let freq = if freq == 0 { 62_500_000 } else { freq };
+    let cpu = super::percpu::this_cpu().cpu_index;
+    // Re-seed INTERVAL (idempotent — JM4's `init` computed the same value at EL2; `on_tick` reloads
+    // TVAL from it on every tick, and a zero there would be an instant re-fire storm).
+    INTERVAL.store(freq / TICK_HZ, Ordering::Relaxed);
+    BSPTICK_COUNT.store(0, Ordering::Relaxed);
+    BSPTICK_CORE.store(cpu, Ordering::Release);
+    // Armed banner BEFORE the unmask, so the serial lock is free when the first tick's witness
+    // prints (the same ordering `el1_oneshot_proof` uses for the same reason).
+    serial_println!(
+        ":: [orinbsptick] arming PERIODIC CNTP at EL{} on cpu {} ({} Hz, PPI{}) — IRQs stay UNMASKED across the terminus; {} ::",
+        super::exceptions::current_el(), cpu, TICK_HZ, TIMER_INTID,
+        // ORIN-BSPRUN truth split: with `bsprun` also armed the old "no preemption" claim would be
+        // a lie on the wire — the gic.rs v3 dispatch gains a post-EOI `timer_preempt` arm and
+        // `run_bsp_tegra` sets SCHED_ACTIVE at the terminus (sched.rs tail §ORIN-BSPRUN).
+        // cfg!-selected so the banner states the dispatch regime this image actually carries.
+        // (Line-count changes inside this `all(tegra, bsptick)` block cannot move a knob-off
+        // Location: knob-off compiles none of it, and it sits at the file tail.)
+        if cfg!(feature = "bsprun") {
+            "dispatch is on_tick + post-EOI timer_preempt (ORIN-BSPRUN: SCHED_ACTIVE is set at the terminus — the run() loop is PREEMPTIVE)"
+        } else {
+            "dispatch is on_tick ONLY (no timer_preempt arm in the v3 dispatch without ORIN-BSPRUN, SCHED_ACTIVE false): no preemption, the capstone loop stays cooperative"
+        }
+    );
+    // The one-shot's own arm path, reused: banked GICR PPI enable + TVAL + ENABLE=1 + isb. NOT
+    // `arm_this_core_ap` — the boot core stays the global-clock owner, so `ticks()`/`ms()` resume
+    // advancing post-drop exactly as they did at EL2 (frozen since the JM6 disarm until now).
+    arm_this_core();
+    unsafe {
+        core::arch::asm!("msr daifclr, #2", options(nomem, nostack, preserves_flags));
+        core::arch::asm!("isb", options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// ORIN-BSPTICK per-tick witness, called from `on_tick` (IRQ context — safe: `_print` is
+/// `try_lock` + staging, see the block comment above). Counts ONLY the arming core's ticks (the
+/// IRQEL-CORE guard — the five EL2 APs reach this same dispatch with their own PPI 30 and must fall
+/// through unchanged) and emits at a low rate: tick 1 (the one-hit proof the arm delivered), then
+/// every [`TICK_HZ`]th tick (~1 line/s). The line carries count + CurrentEL + cpu: the count
+/// advancing proves the tick is PERIODIC (the one-shot could only ever say "once"), and the EL is
+/// re-measured per emission rather than assumed — an EL2 reading here would mean HCR_EL2.IMO
+/// regressed, reported instead of hidden.
+#[cfg(all(feature = "tegra", feature = "bsptick"))]
+#[inline(never)]
+fn bsptick_witness() {
+    let armed = BSPTICK_CORE.load(Ordering::Acquire);
+    if armed == BSPTICK_NO_CORE {
+        return;
+    }
+    let cpu = super::percpu::this_cpu().cpu_index;
+    if cpu != armed {
+        return;
+    }
+    let n = BSPTICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n % TICK_HZ == 0 {
+        serial_println!(
+            ":: [orinbsptick] tick {} taken at EL{} on cpu {} — periodic CNTP live across the terminus ::",
+            n,
+            super::exceptions::current_el(),
+            cpu
+        );
+    }
 }

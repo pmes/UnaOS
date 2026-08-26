@@ -1310,7 +1310,7 @@ FORBID :: MENUBAR-OCC: .* :: FAIL ::
 # --- line read healthy. With one tenant `dock=` answered that; with two it does not.
 # ---
 # --- `bar=0` WAS REQUIRED on the premise that nothing enables the bar. SHELLDESK (2026-08-11) ends
-# --- that premise: the crispy desktop shell asks for its menu bar at desktop-ready (`wcx::activate`,
+# --- that premise: the crispy desktop shell asks for its menu bar at desktop-ready (`desktop_uefi::activate`,
 # --- witnessed by `[wc-x] menubar ENABLED`), so on any boot that reaches the Kepler takeover the bar
 # --- legitimately owns the top `BAR_H` rows and `bar=` is legitimately the panel width. Peter, metal
 # --- Boot A: *"i cannot see the menu because a shell is still posing as the desktop"* — a spec that

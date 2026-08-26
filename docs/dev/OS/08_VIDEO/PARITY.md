@@ -368,7 +368,7 @@ geometry: the repair is structural and its firing is metal-owed.
 
 ### 5.5d BRINGUP-PAINT — read the paint back, do not infer it
 
-`pidesk::activate`'s step 5 printed `menubar PAINTED` from its own control flow — the inference the same
+`desktop_firmware::activate`'s step 5 printed `menubar PAINTED` from its own control flow — the inference the same
 function already refuses two steps above for `fbcon::console_is_routed`. `strip::paint` declines without
 touching a pixel on a contended `SCRATCH` (the dock is tenant #1 and takes the same scratch in the same
 pass) or on a surface that is not yet `word4`, and the bar is then left ENABLED — so
@@ -381,7 +381,7 @@ and re-runs once; the line carries `owns_pixels=` and `retried=`.
 `crystal::selftest`, `dock::selftest` and `menubar::selftest` are all invoked from
 `arch/x86_64/syscall.rs`. **No aarch64 boot had ever run one**, so the whole furniture family was
 unwitnessed on the arch it had just been ported to. `crystal::routed_selftest` (`:: SHARD-PRESS:`) is
-invoked from `video/pidesk.rs` — the only Pi point where the bar is known enabled and painted, and a
+invoked from `video/desktop_firmware.rs` — the only Pi point where the bar is known enabled and painted, and a
 file that is *not* compiled knob-off, so §5.3's line-neutral rule does not reach it
 (`arch/aarch64/syscall.rs` is compiled knob-off, which is why the call is not there). It drives
 `strip::press_route`, the live shared router core both arch routers call, and asserts `painted=` — the
@@ -515,7 +515,7 @@ and the fix, that one carries the bench evidence that motivated them. Nothing ou
 overlaps.)*
 
 **THE FINDING (exec-deskreal `b01feaa1`, off three metal boots + the PA44 capture
-`~/unaos-bench/capture/pi4-pi1-b1/ttyACM0.log`).** `video::pidesk::arm()` — the only writer of
+`~/unaos-bench/capture/pi4-pi1-b1/ttyACM0.log`).** `video::desktop_firmware::arm()` — the only writer of
 `ARMED`, and hence the gate on the shell-window mint, on `pal.clear_screen(DESKTOP_BG)` and on
 `retire_desktop_chrome` — has never executed on Pi hardware. It sits one statement after
 `wcb_launcher` inside `u7_launcher`, on the `u7-launch` task, and on metal the task is killed
@@ -1376,7 +1376,7 @@ three introduced — all three did was make it visible, louder, and unavoidable.
 `fbcon::_print` on x86 returns at its FIRST test unless `bootlog` or `PANEL_CONSOLE` is set, so a `wc`
 desktop is **never** mirrored to. aarch64 has no such gate: the whole serial stream paints the panel,
 from every core, until `GUI_ACTIVE`. Harmless while the Pi's glass *was* the console. Not harmless
-from the line `pidesk::activate` clears the panel to `DESKTOP_BG` and starts compositing onto it —
+from the line `desktop_firmware::activate` clears the panel to `DESKTOP_BG` and starts compositing onto it —
 from there until `panel_console_window_open` installs the glyph route there are **two writers on the
 same pixels**, and the compositor is the quiet one:
 
@@ -1412,7 +1412,7 @@ of this class (pi4-regression.spec, THE RESIDUE) reads `got=0xc0c0c0`.
 
 ### 6.9c DESKHOLD — the fix, and where it is *not*
 
-`fbcon::panel_mirror_hold(true)` is armed by `pidesk::activate` in the same block as the DESKTOP-CLEAR
+`fbcon::panel_mirror_hold(true)` is armed by `desktop_firmware::activate` in the same block as the DESKTOP-CLEAR
 that takes the glass. Held, `_print` charges the tap `suppressed` and returns **before it touches the
 console lock at all**; serial is untouched. It lifts by construction the moment `CONSOLE_WIN` is
 installed — from there `draw_fb()` is the window's surface and there is no panel write left to hold —
@@ -1422,7 +1422,7 @@ appended at `fbcon.rs`'s existing APPEND-ONLY TAIL.
 
 Two things this deliberately does **not** do. It does not touch a witness: `wcf.rs` and `wm.rs` are
 byte-identical to the merge tip, so every go-red path is the one CHROMESPEC proved. And it does not
-reach the residue class `pidesk.rs` already names and assigns — *"a console that presents from
+reach the residue class `desktop_firmware.rs` already names and assigns — *"a console that presents from
 arbitrary print context is an unsynchronised compositor client"*. After the route install fbcon writes
 the console window's **surface** from print context while the compositor blits and checksums it, which
 is what still produces the odd `[wc-g] win=1 … -> COHER` and, less often, a `[wc-d] verify win=1`
@@ -1670,7 +1670,7 @@ lesson: a census greps attributes, and a disclosure is not an attribute either.
 
 ### 6.12 The `exec-livecon` arc — the console window's text is LIVE, and it presents from the render core
 
-**What was owed.** CONSWIN-PI gave the Pi a console window and then, in `video/pidesk.rs`'s
+**What was owed.** CONSWIN-PI gave the Pi a console window and then, in `video/desktop_firmware.rs`'s
 live-console ledger, recorded the one thing it could not deliver: the window is a **frozen boot-log
 snapshot**. Keeping it live was implemented, measured at bench geometry, and reverted — a 108/108 run
 became **97/108 with 37 forbidden hits and a synchronous exception**. That ledger also named the
@@ -1709,7 +1709,7 @@ port leans on. Three statements:
    `fbcon::console_service()`, the hook x86's `usbdebug` loop has called since FBCON-PACE. This arc
    gives that hook its **second caller** rather than inventing a second mechanism. Also a LINE-NEUTRAL
    fold, into `main.rs`'s `let t0 = …` line.
-3. **`pidesk::activate` therefore returns `routed`**, so the GUI handoff's existing
+3. **`desktop_firmware::activate` therefore returns `routed`**, so the GUI handoff's existing
    `if !pidesk_activate_maybe() { detach(); }` guard skips the detach and `_print` keeps reaching the
    window's surface for the rest of the boot. The arming of the deferral is at the **tail** of
    `activate`, which is load-bearing: everything `activate` itself printed reached the window inline,
@@ -1733,7 +1733,7 @@ pass, a `console_flush`, or `detach`'s sync point — carries them.
 
 `render_service` blocks on `GUI_CHANNEL.recv()`, so a line printed by a core that generates no GUI
 event waits for the next pass. The floor on that is the strip pulse's `ui_status::PSTRIP_PERIOD_MS`
-timer — the same free wake `pidesk::armed()` rides. **The console is live at the pulse rate at worst
+timer — the same free wake `desktop_firmware::armed()` rides. **The console is live at the pulse rate at worst
 and immediately on interaction at best; it is not a 60 Hz console.** Adding a wake from print context
 would put channel traffic back on the very path this arc is taking work off, which is how the reverted
 cut failed.
@@ -1741,7 +1741,7 @@ cut failed.
 #### ONE OS: the gate is `feature = "livecon"`, never `target_arch`
 
 Every gate this arc adds is the knob and nothing else. On x86 the latch exists and is simply never
-armed (`wcx::activate` does not call `console_present_defer`), so the `wc` desktop and the `usbdebug`
+armed (`desktop_uefi::activate` does not call `console_present_defer`), so the `wc` desktop and the `usbdebug`
 bench lane are byte-unchanged — and x86's own desktop lane, which ships the same frozen snapshot for
 the same reason, is **one call site** from the same fix whenever that arc wants it.
 
@@ -1805,7 +1805,7 @@ Two residues named honestly rather than averaged away:
 #### What is still OWED after this arc
 
 1. **x86's desktop lane still freezes its console**, and now for no reason but a missing call:
-   `wcx::activate` needs the same `console_present_defer(true)` and `x86_render_service` the same
+   `desktop_uefi::activate` needs the same `console_present_defer(true)` and `x86_render_service` the same
    `console_live_service()` line. Deliberately not taken here — the lane, the files and the gate are
    x86's, and this is a Pi-track arc.
 2. **The default is still the frozen snapshot.** The knob exists because the fixed *shape* is argued
@@ -2060,7 +2060,7 @@ lines:
 | `livecon` 4 | 305 | 333 | 338 |
 | `livecon` 5 | 305 | 327 | 338 |
 
-The arming is at the tail of `pidesk::activate` **by design** (§6.12: "the last instant that is still
+The arming is at the tail of `desktop_firmware::activate` **by design** (§6.12: "the last instant that is still
 single-core through this seam"). `wc-g`'s budget for this window is gone by then. **The knob cannot
 move this red because the instrument has already gone dark when the knob takes effect.**
 
@@ -2099,6 +2099,87 @@ cannot move it, and arming it would buy a false "closed". The derived fix is one
 `console_is_routed() && !GUI_ACTIVE` — an *honest instrument decline* at a seam where the source is
 known-mutable, which is a different thing from suppressing the verdict. Not taken here: this arc
 convicted the mechanism, not the remedy.
+
+### 6.14b The `exec-wcg` arc — WCGSEAM read on the wire, and the honest bracket taken (2026-08-25)
+
+The census §6.9c's DISCRIMINATOR note pre-registered has now spoken, in the exact configuration it
+said the decision waits on (`UNAOS_PIDESK=1 UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 150`,
+QEMU raspi4b). The armed boot produced the standing red — 4 forbidden hits: 2 sample `COHER`, 1
+sample `BLIT`, 1 rollup `COHER` — and every conviction carried its census line, verbatim:
+
+```
+[wcgseam] win=1 seq=1 verdict=BLIT routed=yes glyphs=260 delta=149 locked=845 last_age_us=20568 -> GLYPH-RASTER
+[wcgseam] win=1 seq=2 verdict=COHER routed=yes glyphs=2032 delta=216 locked=2244 last_age_us=57492 -> GLYPH-RASTER
+[wcgseam] win=1 seq=3 verdict=COHER routed=yes glyphs=4906 delta=325 locked=5121 last_age_us=34883 -> GLYPH-RASTER
+```
+
+**The reading, against the pre-registered rules.** `delta>0` on ALL THREE convictions — the writer
+caught inside the bracket every time; the exoneration branch (`delta=0` with a large age) never
+occurred. §6.14's attribution is CONFIRMED on the wire: fbcon's glyph raster is the concurrent
+writer, and the verdicts are not artefacts of a phantom — the surface really mutates under the
+bracket (hundreds of glyph events per 10–19 ms span; `seq=3`'s four legs are four different hashes).
+`locked=` tracks the census total exactly (on aarch64 the split path does not exist), so the census
+is 100 % locked — remedy (a) sufficient in REACH, its price pure COST (an `FBCON` spinlock held
+across a 10–29 ms bracket, waited on from print context with IRQs masked). Note when reading
+`locked= > glyphs=`: `glyphs=` is the bracket-close snapshot, `locked=` is loaded at print time,
+tens of ms later, with the writer still running — a print-ordering artifact, not a data error.
+`last_age_us=` likewise ages from the bracket-close snapshot, so it includes the read-back + serial
+interval.
+
+**Where the census can and cannot fire — verified this arc, not assumed.** On tegra it cannot
+COMPILE (both fbcon charge sites lack a tegra arm — rmbp 6's finding, re-verified). On x86 QEMU it
+compiles (`strings` shows `[wcgseam] win=`, `GLYPH-RASTER`, `QUIET-BRACKET` in the image) but cannot
+FIRE: `:: kepler: no-device ::` → `desktop_uefi::activate` never runs (its sole caller is the Kepler
+takeover) → `panel_console_window_open` never runs → `CONSOLE_WIN` stays `WIN_NONE` → the charge
+sites' `routed` guards never pass → `SEAM_WIN` stays 0 and the print's `p.id == SEAM_WIN` gate is
+unsatisfiable. A `UNAOS_WC=1 UNAOS_KEPLER=1 UNAOS_KEPLER_TAKEOVER=1 ./arroyo test 150` boot
+confirmed it end-to-end: `[wc-g]` sampled four fixture windows, all CLEAN, zero `[wcgseam]`. The
+armed bench-geometry Pi boot is the one QEMU environment that discriminates, exactly as §6.9c's
+note said.
+
+**The remedy taken — the honest bracket (`WCGSEAM-HB`, `wcg.rs`).** Neither §6.14 candidate:
+(a) is sufficient in reach but is a `wm.rs` locking change with a print-stall price, and (b) blinds
+the instrument to the routed console outright. Instead the granting seats' preferred shape: a
+convicting sample of the census's own window whose FULL adjudication span is dirty (`rb_delta > 0`
+— a second census read taken after the read-back bracket, because a `BLIT` conviction can be caused
+by stores the checksum-span delta never sees) is REFUNDED — `TAKEN` is handed back and a later
+present re-arms the sample — rather than adjudicated. The refunded pass prints ONE line, its
+`[wcgseam]` census with ` rb_delta=N refunded=K/16` as a suffix after the terminal (standing
+insertion rule; the adjudicated `[wcgseam]` grammar above is byte-identical to the pre-registered
+form), skips the sample and `prof` lines (serial per pass goes DOWN), and still charges its four
+phases to `wit_us=` (the cost was paid; the ledger says so). Bounds: `REARM_MAX = 16` per window
+per boot, deliberately NOT recycled (exactly `TAKEN`'s per-boot rule) — a writer that never quiets
+(the livecon steady state §6.14 left unmeasured) exhausts the refunds and convictions resume.
+Compiled out on the x86 `wcg-paygo` build (a refund mid-chunk-battery would desync the paygo
+ledger; x86 metal has zero convictions on record, and a dirty-bracket conviction there adjudicates
+as before, census line beside it).
+
+**Why every FORBID keeps its teeth** (the four at x86-witness.spec and pi4-regression.spec, all
+textually untouched): a quiet-bracket conviction — metal cache incoherence, any non-fbcon writer, a
+deterministic blit defect (which reproduces on post-seam quiet samples) — refunds nothing and fires
+them exactly as before; a conviction on any window but the routed console never enters the gate;
+and the cap guarantees even the excused class convicts if it persists.
+
+**The A/B, read honestly — the seam class closes, and the surviving budget immediately proves the
+FORBIDs are still alive.** Control (this tree minus the remedy): 4 forbidden hits, all `win=1`, all
+seam-dirty (2 sample `COHER` + 1 sample `BLIT` + rollup `COHER`), census lines above. Fix tree, same
+boot: **zero `COHER`, zero `RACE` anywhere in the capture** — the boot-seam brackets were refunded
+(`refunded=1..4/16`, every one `GLYPH-RASTER` with `rb_delta>0`, including two `RACE-BLIT`s whose
+dirt only the full-span read sees) — and the replay is NOT green, because the re-armed budget then
+sampled a regime the control could never reach (its budget was spent inside the seam — §6.14's own
+"the instrument's budget is spent by the control" flaw, closed by the refund): three post-seam
+`win=1` samples on QUIET brackets (`delta=0`, `last_age_us=1.4–3.0 s`, all four hashes frozen)
+convicting `-> BLIT` at `fbbad=20734/100171/97507 of 953120` — the pre-registered exoneration
+branch, occurring for the BLIT class: NOT the glyph writer, a real glass-vs-surface divergence
+during the post-seam fixture traffic (banded presents + drag closure mid-drain is one candidate
+mechanism; a genuine blit defect at bench geometry is another — undiscriminated here, deliberately:
+this arc's instrument answers the WRITER question, not the drain question). The same capture also
+carries run-variant exceptional verdicts the refund gate structurally cannot touch (`win=4`
+`[wc-g] BLIT` + `[wc-d] FAIL` on a surface whose identical checksum PASSed in the control;
+`win=2` `[wc-h] AT-RISK`, the §6.13 QEMU shape — the control boot printed 50 AT-RISK rollups of
+which zero matched the FORBID's pattern, run variance in both polarities). OPEN, handed on: the
+post-seam `win=1` BLIT class at armed bench geometry, newly visible by construction, owner the
+compositor/damage lane — not closed by this arc and deliberately not excused by it.
 
 ---
 
@@ -2209,11 +2290,11 @@ arch-specific / (d) in flight.
 > the headline and the seam.
 
 The window manager IS on this branch. `wm.rs` (20 652 lines) arrived with the
-WC-A…WC-K series at `51d03376`; `pidesk.rs` at `0750e011`; both are ancestors of
+WC-A…WC-K series at `51d03376`; `desktop_firmware.rs` at `0750e011`; both are ancestors of
 HEAD (`git merge-base --is-ancestor`, verified 2026-08-22). `video/` carries the
 full family — `wm.rs`, `strip.rs`, `dock.rs`, `menubar.rs`, `crystal.rs`,
-`pulsewin.rs`, `pidesk.rs`, `quarry.rs` + `quarry/live.rs`, `cursor.rs`,
-`screen.rs`, `wcf.rs`, `wcg.rs`, `wcx.rs`, `theme.rs` — and the kernel
+`pulsewin.rs`, `desktop_firmware.rs`, `quarry.rs` + `quarry/live.rs`, `cursor.rs`,
+`screen.rs`, `wcf.rs`, `wcg.rs`, `desktop_uefi.rs`, `theme.rs` — and the kernel
 `Cargo.toml` carries `wc`, `wcg-paygo`, `pidesk`, `quarry` and `livecon`.
 
 What is still true is the panel. Boot log on fbcon, then the JD2 full-screen
@@ -2259,7 +2340,7 @@ What the desktop knob needs from this seam: nothing new. The seam already yields
 base/len/pitch/format through the same `PixelFormat` contract `wm`/`fbcon`
 consume on the Pi. Lighting the desktop on Orin =
 1. ~~take the base sync (brings `wm.rs` and the whole video stack)~~ — **DONE at
-   `ceaa32b8`.** `wm.rs` (`51d03376`) and `pidesk.rs` (`0750e011`) are both
+   `ceaa32b8`.** `wm.rs` (`51d03376`) and `desktop_firmware.rs` (`0750e011`) are both
    ancestors of HEAD; see §8.0's correction. Steps 2–4 are the whole remaining
    job, which is why this is a short arc and not a long one.
 2. add `pidesk` to the tegra build recipe — note the knob class: `pidesk`/
@@ -2282,7 +2363,7 @@ consume on the Pi. Lighting the desktop on Orin =
 Two blockers sit *between* steps 2 and 3 and are not visible from this list;
 they are stated with evidence in [`orin-desktop.md`](orin-desktop.md) §3. In
 short: `tegra_early_stop` (`main.rs:1902`) is `-> !` and diverges before
-`kernel_main` ever reaches `pidesk::activate()` (`main.rs:6240`), so the seam
+`kernel_main` ever reaches `desktop_firmware::activate()` (`main.rs:6240`), so the seam
 must attach to the tegra flow; and `wm::reserve_stage` (`video/mod.rs:278`) is
 called only from `init_panel`, which the tegra path skips, so the compositor's
 staging buffer is never allocated.
@@ -2298,7 +2379,7 @@ until someone proves a safe non-powergated vblank source.
 | `[el0live]` EL0-extinction witness | `arch/aarch64/sched.rs` + `timer.rs`, ungated | **(a) at base sync** | re-verify the tick source against the tegra timer divergences in `timer.rs` |
 | EL0 fixture park fixes (real sleeps) | inline blobs in `arch/aarch64/syscall.rs` | **(a) at base sync** | ⚠ highest-conflict merge surface: the Orin copy of `syscall.rs` diverged heavily (JB/JD/JX); same park-fix class WILL bite tegra fixtures — verify, don't assume |
 | `SYS_WIN_PRESENT_ROWS` aarch64 arm | ABI shared; aarch64 dispatch in shared `syscall.rs`; impl in `video/wm.rs` | **(a) ARRIVED, inert** | ⟵ corrected 2026-08-22: `wm.rs` is here and the aarch64 dispatch arm is live (`arch/aarch64/syscall.rs:6922`). Inert now for the *other* reason — the Orin composites nothing, so nothing calls it |
-| serial-focus split | `main.rs` `serial_focus_selftest`, gated `all(aarch64, baremetal, witness)` and `baremetal = ["pi"]` | **(b) OWED — gate widening** | body is aarch64-generic but compiled out of every tegra image; Orin needs a tegra arm on the gate + a serial `shell_inbox` equivalent on the tegra console path |
+| serial-focus split | `main.rs` `serial_focus_selftest`, gated `all(aarch64, baremetal, witness)` and `baremetal = ["pi"]` | **(c) LEGIT ARCH-SPECIFIC — NA on Orin** | ⟵ adjudicated 2026-08-25; was "(b) OWED — gate widening". The body is aarch64-generic and does compile out of every tegra image, but widening the gate would arbitrate a source this board does not have. **Hardware reason: the Orin's only console UART is UARTC `0x0C28_0000`, in the always-on cluster, and it is the port the SPE streams the Tegra Combined UART (TCU) console onto** (`arch/aarch64/serial.rs:30-34`; base CONFIRMED in `01_BOOT_HAL/arch_arm64.md:3983`, "NS16550, reg-shift 2 (AON/SPE TCU)"). The kernel deliberately inherits whatever firmware/SPE left and reprograms nothing (`serial.rs:42-44`), and there is no second port to fall back to — UARTA `0x0310_0000` / UARTE `0x0314_0000` are `status = disabled`, sit on the 40-pin header, and are not routed to the debug header (`serial.rs:32, 46-48`). The board is output-only, so the split has no serial byte to route. Consistent downstream: `jd2_console_pump` (`main.rs:2763`) drains `pal::next_event()` — the xHCI HID queue — exclusively; `input_service` (`main.rs:4787`), the only aarch64 task that calls `arch::poll_input()`, is spawned inside `#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]` (`main.rs:1358`, spawn at `1417`) and so never exists in a tegra image; `pal.rs:2023-2025` already states the rule in-tree ("the Orin's tegra console … there is no `input_service` on those paths"). Bench side records the same law: `~/unaos-bench/tools/line-butler.py:20` — "FIFO kept for injection (Pi uses serial input; the Orin is output-only — that law stands)"; one `/dev/ttyACM0` serves both boards and `inject.fifo` has a Pi consumer only. **Metal evidence, absence with the producing path attempted:** the tegra build DOES compile a UARTC RX read (`pal.rs:2030-2032`, the `not(baremetal)` aarch64 arm, over `serial.rs:81-101`), so the read is issued on this board — yet across 3 324 keystrokes in six Orin captures the JD2 echo count equals the xHCI HID count exactly (`capture/orin2-boot5c-gui.log` 82/82; `jetson-serial-2026-07-10-165211.log` 316/316; `-07-13-133055` 397/397; `-07-14-101517` 1059/1059; `-07-15-092500` 1361/1361; `capture/line-acm0/orin.log` 109 JD2 vs 118 xHCI — never the reverse). No key ever reached the Orin console from a non-HID source. Matching board-fragment row: `serial-in: na — output-only on this board; input is USB-keyboard only`. ⚠ The one `[serfocus] … PASS` in `capture/orin1-boot2/boot2-recovered.log:6770-6771` is **not** Orin — that file is a mixed-port capture and the line sits inside a Pi 4 boot section (`kernel8.img` loaded at `6257`, `UnaOS bare-metal — Pi 4, VideoCore framebuffer up` at `7017`); map port→machine by content, not filename |
 | DRAGWEDGE interactive drain bound | `video/wm.rs` + fixture in shared `syscall.rs` | **(a) ARRIVED, inert** | ⟵ corrected 2026-08-22: `wm.rs` is here. The fixture is not: `wm::dragwedge_selftest` (`video/wm.rs:17951`) is gated `all(witness, aarch64, baremetal, pidesk)` and `baremetal` implies `pi`, which `compile_error!`s against `tegra` (`arch/aarch64/serial.rs:22-23`) — see `orin-desktop.md` §3 |
 | BOT-PARK identity parking | `drivers/xhci/mod.rs` (shared driver, already on this branch) | **(a) at base sync — most directly transferable** | ⚠ composition with the xHCI-wall rules is UNVERIFIED: NEVER write CRCR at RS=1 on the inherit path stands; BOT-PARK's ladder must be audited against XCARVE/CRCRQ before it runs on Orin metal. Ledger evidence is a `2109:3431` hub — re-validate against the Orin's HS hub |
 

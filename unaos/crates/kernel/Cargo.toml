@@ -61,7 +61,7 @@ nvidia-kepler-kdisp-hold = []
 # site unlinked, media byte-identical. Kept in sync with arroyo AND builder/src/main.rs.
 nvidia-kepler-ce = ["nvidia-kepler"]
 # WC-X86: bring the window compositor (`video::wm`) up on the x86 panel path. Compiles
-# `video/wcx.rs` — the activation seam and the one kernel-drawn demo window — plus fbcon's
+# `video/desktop_uefi.rs` — the activation seam and the one kernel-drawn demo window — plus fbcon's
 # CONSOLE-WINDOW route (`panel_console_window_open`: the kernel console becomes an ordinary row in
 # the window table and its glyphs go to a cached-RAM surface the compositor presents), and its single
 # call site at the end of `kepler_display::takeover_display`. Panic output is exempt by law: a panic
@@ -674,6 +674,36 @@ smpprobe = []
 # `UNAOS_SMPMARK=1 UNAOS_TEGRA=1 ./arroyo esp-jetson`. See arch_arm64.md §ORIN-SMP.
 smpmark = []
 
+# ORIN-BSPTICK (Candidate B arc 1): the `UNAOS_BSPTICK=1` PERIODIC EL1 generic-timer tick on the
+# Orin boot core (arch/aarch64/timer.rs tail), armed from `tegra_early_stop`'s terminus line right
+# after the IRQEL-RT one-shot proof self-disarms — replacing "one interrupt taken at EL1, then
+# nothing" with a standing 250 Hz heartbeat that stays live across `run_capstone_boot_core`. IRQs
+# remain unmasked from the arm onward; dispatch is `on_tick` only (no `SCHED_ACTIVE`, no
+# preemption — the capstone loop stays cooperative). Witness: `[orinbsptick]` — tick 1, then every
+# 250th tick, carrying count + re-measured CurrentEL + cpu. Standalone (does NOT imply `tegra`,
+# mirroring `smpmark`) but every site is `all(tegra, bsptick)`-gated, so arm it WITH tegra. With the
+# feature OFF (default) every site vanishes and the tegra image is byte-identical to baseline.
+# Enable via `UNAOS_BSPTICK=1 ./arroyo esp-jetson`. See arch_arm64.md §ORIN-BSPTICK.
+bsptick = []
+
+# ORIN-BSPRUN (Candidate B arc 2): the `UNAOS_BSPRUN=1` terminus swap — the Orin boot core joins
+# the preemptive scheduler. `tegra_early_stop`'s terminus becomes `sched::run_bsp_tegra(0)`
+# (sched.rs tail) instead of the cooperative `run_capstone_boot_core(0)`: SCHED_ACTIVE gets its
+# first tegra setter, `mark_online(0)` + `run()` give core 0 sleeper drain / steal / the idle fold,
+# and `gic::handle_irq_v3` gains a post-EOI `timer_preempt` arm — preemption and the
+# `:: SCHED: load ::`/`[pulse5]`/`[spin1]` witness train exist on this board for the first time.
+# REQUIRES `bsptick` (the clock that drives `timer_preempt`): a `compile_error!` in sched.rs
+# refuses `bsprun` without it, and arroyo's UNAOS_BSPRUN mapping arms both. Deliberately NOT
+# `bsprun = ["bsptick"]`: the arm-tegra-bsprun matrix leg names both features explicitly so the
+# leg's line IS the configuration it compiles (the standing matrix rule), and a hand-rolled list
+# that splits them should fail loudly at the compile_error!, not be silently widened. Standalone
+# otherwise (does NOT imply `tegra`, mirroring `bsptick`) but every site is `all(tegra, bsprun)`-
+# gated (the main.rs terminus is inside tegra-gated code), so arm it WITH tegra. With the feature
+# OFF (default) every site vanishes and the tegra image is byte-identical to baseline. Witness:
+# `[orinbsprun]` — the terminus banner. Enable via `UNAOS_BSPRUN=1 ./arroyo esp-jetson`.
+# See arch_arm64.md §ORIN-BSPRUN.
+bsprun = []
+
 # VUG-RAS-LOCALIZER: the `UNAOS_VUGRAS=1` RAS localizer (vugras.rs) — a knob-gated DC CIVAC writeback
 # sweep (vug frame loop + JD2 console-idle pump) plus a boot candidate-PA witness, to make the Orin
 # SNOC+ACI FillWrite RAS fire at/near the offending store and name the address it decodes to. Pure
@@ -691,6 +721,22 @@ vugras = []
 # byte-identical to the pre-flip baseline (build twice, compare hashes). The DTB `/cpus` node is the
 # ONLY presence oracle (RIDER 1). See arch_arm64.md §ORIN-SMP.
 tegrasmp = ["tegra"]
+
+# ORIN-REBOOT (watchdog half, baton orin-6 §5.1): the `UNAOS_ORINWDT=1` Tegra234 TKE BOOT
+# WATCHDOG (arch/aarch64/wdt_tegra.rs) — WDT0 armed early in `tegra_early_stop` for a system
+# POR reset 300 s later, disarmed on the EL1 terminus line, so a WEDGED boot self-resets
+# without bench hands (there is deliberately no bench power-switch hardware) and a completed
+# boot leaves no watchdog running. Register recipe 1:1 with Linux timer-tegra186.c (the
+# documentation of record, per the pcie-tegra194/NET-3 precedent). Implies `tegra` (the TKE is
+# Tegra234 silicon — the xcarve/tegrasmp precedent), so `UNAOS_ORINWDT=1 ./arroyo check` is
+# self-sufficient. DEFAULT OFF => the module + both call sites vanish (both are statements
+# APPENDED to existing `tegra_early_stop` lines, so no panic Location shifts; the knob-off
+# image carries ZERO `[orinreboot] wdt` strings — measured — while the arc's UNCONDITIONAL
+# half, the power.rs verbs, ships in every image by design, so knob-off is NOT byte-identical
+# to the pre-arc baseline and does not claim to be). The ARMED polarity is type-checked by the
+# `arm-tegra-orinwdt` leg of KERNEL_CFG_MATRIX in `arroyo`, never by the knob mapping.
+# Witness family: `[orinreboot]` (the arch-neutral reboot VERB in power.rs shares it).
+orinwdt = ["tegra"]
 
 # JETSON-EL0 (M1b): the Jetson Orin (Tegra234) EL0/userspace chain. Through M1a the tegra path reached
 # EL1 + the scheduler (`boot_tegra`'s EL2 -> EL1 drop, `sched::run_capstone_boot_core`) and stopped
@@ -1602,7 +1648,7 @@ pirast = ["rast"]
 # PI-DESK: the desktop FURNITURE family on the Pi 4 panel (UNAOS_PIDESK=1). Deliberately a THIN
 # feature on `pirast`'s own terms — it pulls in no dependency and declares no module of its own. What
 # it gates is the aarch64 half of four gates that were `all(target_arch = "x86_64", feature = "wc")`
-# and are now `any(all(x86_64, wc), all(aarch64, pidesk))`: `video::strip` (the furniture-strip
+# and are now `any(all(x86_64, wc), all(aarch64, desktop_firmware))`: `video::strip` (the furniture-strip
 # primitive — edge-anchored geometry, the staged row-run painter, the vacated-pixel erase, the damage
 # slot, the tenant registry), `video::dock` (the window switcher — Peter's white-board Q10 ruling: a
 # switcher, NOT an app launcher), `video::menubar` (the top strip, DEFAULT OFF at runtime), and
@@ -1617,7 +1663,7 @@ pirast = ["rast"]
 # aarch64, no seam in `wm` or the click router exists, and kernel8.img is BYTE-IDENTICAL to baseline
 # (proven by sha256, not assumed). x86 is untouched in either direction: its half of every gate is
 # the `wc` term it always was.
-pidesk = []
+desktop_firmware = []
 
 # INSTALL-CORE: the `UNAOS_INSTALLDEMO=1` storage-agnostic installer engine + its boot witness
 # (crates/kernel/src/install/). Arms a GPT writer + FAT32 formatter + extent content-verify against a
@@ -1656,17 +1702,17 @@ piinstall_confirm = ["piinstall_arm"]
 # see `docs/dev/OS/05_USER_EXPERIENCE/quarry.md` §4).
 #
 # It rides the DESKTOP knob family rather than replacing it: `video::quarry` is declared under the
-# same gate the furniture family carries (`any(all(x86_64, wc), all(aarch64, pidesk))`), so BOTH
+# same gate the furniture family carries (`any(all(x86_64, wc), all(aarch64, desktop_firmware))`), so BOTH
 # arches type-check the module, and this feature decides whether that module is the implementation or
 # a handful of `#[inline(always)] false` stubs. That split is not cosmetic — Quarry's key and click
-# hooks are FOLDED INTO existing `#[cfg(feature = "pidesk")]` one-liners in
+# hooks are FOLDED INTO existing `#[cfg(feature = "desktop_firmware")]` one-liners in
 # `arch/aarch64/syscall.rs`, a file compiled into the knob-off `kernel8.img` where an added line
 # breaks byte-identity (panic `Location` records embed line numbers), so the hook could not carry a
 # second `cfg` of its own. See `video/quarry.rs`'s header.
 #
-# The knob class is `pidesk`'s (builder=0): kernel8's feature list is CURATED in `arroyo`'s K8_FEATS
+# The knob class is `desktop_firmware`'s (builder=0): kernel8's feature list is CURATED in `arroyo`'s K8_FEATS
 # block. Default OFF => `quarry/live.rs` is not compiled, the stubs inline to nothing, and
-# `kernel8.img` is byte-identical to baseline. Arming it does NOT imply `pidesk`; a Pi build wants
+# `kernel8.img` is byte-identical to baseline. Arming it does NOT imply `desktop_firmware`; a Pi build wants
 # `UNAOS_QUARRY=1 UNAOS_PIDESK=1` so the desktop seam that opens the window exists.
 quarry = []
 
@@ -1682,14 +1728,14 @@ quarry = []
 # caching, or migration onto ORIN's UnaFS) is a later arc, because the baton forbids building on the
 # FAT namespace twice and a repair chosen before the cost is measured is a guess.
 #
-# The knob class is `quarry`/`pidesk`'s (builder=0): kernel8's feature list is CURATED in `arroyo`'s
+# The knob class is `quarry`/`desktop_firmware`'s (builder=0): kernel8's feature list is CURATED in `arroyo`'s
 # K8_FEATS block. Default OFF => `fs/fatperf.rs` is not compiled, both shims inline to nothing, the
 # call sites sit on lines that already existed (no panic-`Location` line shift in `fat.rs`/`vfs.rs`,
 # which ARE compiled knob-off), and `kernel8.img` is byte-identical to baseline.
 fatperf = []
 
 # LIVECON (`UNAOS_LIVECON=1`) — **the console window's text stays LIVE, and it presents from the
-# RENDER core.** The second half of M3, and the arc `video/pidesk.rs`'s live-console ledger names:
+# RENDER core.** The second half of M3, and the arc `video/desktop_firmware.rs`'s live-console ledger names:
 # "move the console's presents off print context entirely and onto the RENDER core, one paced call
 # per frame, via the hook `fbcon::console_service` already provides".
 #
@@ -1697,7 +1743,7 @@ fatperf = []
 # (`route_present`, `route_present_rows`, `route_present_pending`) record their rows in the existing
 # `PEND` ledger and return WITHOUT compositing; (2) the Pi's `render_service` calls the existing
 # `fbcon::console_service()` once per pass, which is the paced take of that ledger; (3)
-# `pidesk::activate` therefore returns `routed`, so the GUI handoff SKIPS `fbcon::detach()` and
+# `desktop_firmware::activate` therefore returns `routed`, so the GUI handoff SKIPS `fbcon::detach()` and
 # `_print` keeps reaching the window's surface for the rest of the boot.
 #
 # WHY IT IS A KNOB AND NOT A DEFAULT. The live console was tried once and REVERTED with evidence: at
@@ -1708,15 +1754,15 @@ fatperf = []
 # default stays the frozen snapshot until a bench run says otherwise.
 #
 # ARCH-NEUTRAL BY CONSTRUCTION: every gate this knob adds is `feature = "livecon"`, never
-# `target_arch`. On x86 the deferral latch exists and is simply never armed (`wcx::activate` does not
+# `target_arch`. On x86 the deferral latch exists and is simply never armed (`desktop_uefi::activate` does not
 # call `console_present_defer`), so the `wc` desktop and the `usbdebug` bench lane are unchanged; the
 # x86 wire-in is one call site away when that arc wants it.
 #
-# The knob class is `pidesk`'s (builder=0): kernel8's feature list is CURATED in `arroyo`'s K8_FEATS
+# The knob class is `desktop_firmware`'s (builder=0): kernel8's feature list is CURATED in `arroyo`'s K8_FEATS
 # block. Default OFF => the latch is an `#[inline(always)] false`, the three entries fold back to the
-# bare `route_present_banded` call they have always been, the `render_service` and `pidesk` hooks are
+# bare `route_present_banded` call they have always been, the `render_service` and `desktop_firmware` hooks are
 # statement-level `#[cfg]`s that vanish, no line moves in any file compiled knob-off, and
-# `kernel8.img` is byte-identical to baseline. Arming it does NOT imply `pidesk`; a Pi build wants
+# `kernel8.img` is byte-identical to baseline. Arming it does NOT imply `desktop_firmware`; a Pi build wants
 # `UNAOS_LIVECON=1 UNAOS_PIDESK=1` so the seam that routes the console into a window exists at all.
 livecon = []
 
@@ -1724,7 +1770,7 @@ livecon = []
 # over a heap-backed ARGB surface and composited onto the JD1 inherited scanout, from
 # `arch/aarch64/display_tegra.rs::orin_wm1`, wired into `tegra_early_stop` on the step-3c heap line.
 #
-# It is ONE WINDOW and deliberately not a desktop: no `pidesk::activate`, no furniture, no
+# It is ONE WINDOW and deliberately not a desktop: no `desktop_firmware::activate`, no furniture, no
 # dock/strip/menubar/crystal. The compositor itself is already in every jetson image (`video/mod.rs`
 # declares `pub mod wm;` unconditionally and the tegra path already calls `wm::retile_on_ready()`), so
 # this feature adds no module — what it adds is the `wm::reserve_stage` call the Orin never had, because
@@ -1782,16 +1828,57 @@ orindesk = []
 # `JD1-DC VERDICT=`. See arch_arm64.md §JD1-DC.
 jd1dc = []
 
+# GA10B-PROBE1 (`UNAOS_GA10B_PROBE1=1`): the FIRST read-only probe rung for the Orin Nano's Ampere
+# GA10B iGPU (`arch/aarch64/ga10b_probe.rs`, one appended call site in `tegra_early_stop`). One
+# attended cold-boot flight, zero MMIO writes: a BPMP MRQ_PG rail-state gate FIRST (a read of a
+# power-gated Tegra block is EL3-fatal — JX1), then, only if the rail is provably ON, a risk-ordered
+# announce-before-read sweep of the GA10B security/boot-ROM/census registers (fuse opt_priv_sec_en ->
+# falcon hwcfg2 priv-lockdown -> priscv br_retcode -> priscv cpuctl halted -> top_num_gpcs), and the
+# flight ENDS in PSCI SYSTEM_OFF (`power::shutdown`) because a probe flight's next boot must be cold.
+# Every register offset/bit cites the ACKED facts file
+# docs/dev/OS/09_PLATFORM/ga10b-facts/ga10b-probe-rung1.facts.md — never nvgpu. IMPLIES `tegra` (the
+# whole module and the BAR0 aperture are Tegra234 silicon — the orinwdt/tegrasmp precedent), so
+# `UNAOS_GA10B_PROBE1=1 ./arroyo check` is self-sufficient, and `UNAOS_GA10B_PROBE1=1 ./arroyo
+# esp-jetson` builds an armed probe image. Default OFF => the module + its one appended call site
+# vanish, no panic `Location` moves (the call is appended to an existing line), and the jetson image
+# is byte-identical to baseline (measured: `llvm-objcopy -O binary kernel.elf`). The ARMED polarity is
+# type-checked by the `arm-tegra-ga10bprobe1` leg of KERNEL_CFG_MATRIX in `arroyo`, never by the knob
+# mapping. Witness family on the wire: `[ga10bprobe1]`.
+ga10bprobe1 = ["tegra"]
+
+# ORIN-SELFUP (`UNAOS_SELFUP=1`): the SELF-UPDATE core — the OS writes its own boot files. Gates
+# `arch/aarch64/selfup_tegra.rs` (staged whole-ESP payload UPDATE.PAK/UPDATE.SHA -> whole-payload +
+# per-file SHA-256 verify -> stage-beside + read-back verify -> ordered flip (matched-pair rule:
+# non-pair files, then BOOTAA64.EFI, then KERNEL.ELF LAST) -> payload consumed -> warm-reboot hook)
+# and its one call site in `main.rs::tegra_early_stop`, placed after the ORIN-INSTALL-2 site where
+# the boot volume is a readable (and write-permitted) block device. Writes go through the standing
+# `fs::fat` write path — the one the July 2026 bench replays proved on this board, power-cycle
+# survival included; this feature adds NO new writer and NO new call class to the FAT mutator roster
+# (file verbs on the mounted boot volume, boot core, pre-JM6, same as the shell's write verbs).
+#
+# STANDALONE, mirroring `smpmark`/`orindesk`/`jd1dc` — it does NOT imply `tegra`. Every site lives
+# inside a `tegra`-gated module or a `tegra`-gated block, so `UNAOS_SELFUP=1` alone compiles
+# nothing; arm it as `UNAOS_TEGRA=1 UNAOS_SELFUP=1 ./arroyo check`, or
+# `UNAOS_SELFUP=1 ./arroyo esp-jetson` (which forces `tegra`). The ARMED polarity is type-checked by
+# the `arm-tegra-selfup` leg of KERNEL_CFG_MATRIX in `arroyo`, never by the knob mapping.
+#
+# Default OFF => the module and its call site vanish and the tegra image is byte-identical to
+# baseline (the call site is a gated statement appended inside `tegra_early_stop`, no line moves).
+# Witness family on the wire: `[orinselfup]` (12-byte prefix — over the 8-byte LLVM
+# immediate-encoding bound, so `strings` on the artifact proves reachability). Payloads are built by
+# `./arroyo selfup-pak`. See docs/dev/OS/10_INSTALL/orin-selfupdate.md.
+selfup = []
+
 # ORINDESK RUNG 2 (TEGRADESK) — the Jetson Orin's DESKTOP SEAM: the tegra-shaped arming wrapper
 # `main.rs::tegra_desk_arm`, wired into `tegra_early_stop`'s terminus line. It is the tegra
-# counterpart of `main.rs::pidesk_activate_maybe`, which the Orin can NEVER reach: that wrapper is
-# gated `all(aarch64, pidesk, baremetal)`, `baremetal = ["pi"]`, and `pi` + `tegra` is a hard
+# counterpart of `main.rs::desktop_firmware_activate_maybe`, which the Orin can NEVER reach: that wrapper is
+# gated `all(aarch64, desktop_firmware, baremetal)`, `baremetal = ["pi"]`, and `pi` + `tegra` is a hard
 # `compile_error!` in `arch/aarch64/serial.rs`. So on every tegra build the existing wrapper resolves
 # to its constant-`false` twin. This feature is the gate that CAN be satisfied on this board.
 #
 # WHY IT IMPLIES RATHER THAN STANDS ALONE, and this is the whole point of the rung. `orindesk`,
 # `jd1dc` and `smpmark` are standalone because their sites need nothing but `tegra`. This one calls
-# `video::pidesk::activate`, which is `#[cfg(all(aarch64, pidesk))]`, and `pidesk` on aarch64 needs
+# `video::desktop_firmware::activate`, which is `#[cfg(all(aarch64, desktop_firmware))]`, and `desktop_firmware` on aarch64 needs
 # `arch::aarch64::syscall` (via `dock::focus_set`), which `arch/aarch64/mod.rs` gates on
 # `any(baremetal, tegra_el0)` — `baremetal` being unsatisfiable here, the only term left is
 # `tegra_el0` (which implies `tegra`). A STANDALONE spelling would therefore let
@@ -1804,7 +1891,7 @@ jd1dc = []
 # both `const false`, the `display_tegra::JD1_DC_PROBE` idiom): rung 3 (click routing) has not landed,
 # so a console window's minimise disc would be a one-way trip (orin-desktop.md §6.1), and the full
 # desktop cascade is §5.2's stop-line — the Pi overflowed a 16 KiB kernel stack in it twice on metal
-# and it does not reproduce on any QEMU gate. `pidesk::activate()` is COMPILED and TYPE-CHECKED here
+# and it does not reproduce on any QEMU gate. `desktop_firmware::activate()` is COMPILED and TYPE-CHECKED here
 # and is not reached on any boot this branch can produce.
 #
 # Default OFF => the wrapper, its statics and its call site vanish, and NO LINE MOVES in any file
@@ -1814,7 +1901,7 @@ jd1dc = []
 # compare sha256 of `unaos-kernel` and of its `llvm-objcopy -O binary` flattening. The ARMED polarity
 # is type-checked by the `arm-tegra-seam` leg of KERNEL_CFG_MATRIX in `arroyo`, never by the knob
 # mapping. Witness on the wire: `[deskseam]`. See docs/dev/OS/08_VIDEO/orin-desktop.md §6 rung 2.
-tegradesk = ["pidesk", "tegra_el0"]
+tegradesk = ["desktop_firmware", "tegra_el0"]
 
 # ORIN-CLICK (`UNAOS_ORINCLICK=1`): rung 3 of the Orin desktop ladder — `jd2_console_pump`'s
 # `Event::Button` arm hands the edge to `arch/aarch64/syscall.rs::wc_click_route` instead of logging
@@ -1822,14 +1909,14 @@ tegradesk = ["pidesk", "tegra_el0"]
 # been compiled into every Orin kernel that carries `tegra_el0` and have never had a caller on this
 # arch (orin-desktop.md §3.4); this knob is that caller plus the `[orinclick]` instrument.
 #
-# THIS RUNG IS THE SAFETY PRECONDITION FOR RUNG 4, not an optional polish. `video/pidesk.rs:39-44`
+# THIS RUNG IS THE SAFETY PRECONDITION FOR RUNG 4, not an optional polish. `video/desktop_firmware.rs:39-44`
 # states the CONSOLEWIN law — the console window carries a minimise disc and the only route back from
 # that park is the dock, which is a route back only once clicks route. "A control that hides a window
 # with no way back is worse than no control." Nothing here routes the console into a `wm` row.
 #
 # IT DOES NOT CROSS THE §5.2 STOP-LINE. It implies `tegra_el0` and NOTHING else, so every furniture arm
 # inside the router (`strip::press_route`, `quarry::service`, `pulsewin::press_route`,
-# `quarry::press_route`, the DRAG-PI chrome arm, the SHELLWIN-PI arm) stays `#[cfg(feature = "pidesk")]`
+# `quarry::press_route`, the DRAG-PI chrome arm, the SHELLWIN-PI arm) stays `#[cfg(feature = "desktop_firmware")]`
 # and compiled out — including `quarry::open()`, which is what overflowed the Pi's 16 KiB kernel stack
 # at click-router depth on boot 11. No dock, no strip, no menubar, no crystal, no `render_service`.
 #
@@ -1841,7 +1928,7 @@ tegradesk = ["pidesk", "tegra_el0"]
 # operator separately guesses `UNAOS_TEGRA_EL0=1` — a vacuous gate wearing a green verdict.
 # `tegra_el0` implies `tegra`, so `UNAOS_ORINCLICK=1 ./arroyo check` and
 # `UNAOS_ORINCLICK=1 ./arroyo esp-jetson` are both self-sufficient. The ARMED polarity is type-checked
-# by the `arm-tegra-orinclick` leg of KERNEL_CFG_MATRIX in `arroyo` and the `pidesk` CROSS by
+# by the `arm-tegra-orinclick` leg of KERNEL_CFG_MATRIX in `arroyo` and the `desktop_firmware` CROSS by
 # `arm-tegra-seam` (rung 2's armed-seam leg, which since this arc also carries `orinclick` — the seam
 # asserts `TEGRADESK_CLICK_ROUTED` in source, so the leg that compiles the assertion must compile the
 # routing too), never by the knob mapping.
@@ -1853,6 +1940,369 @@ tegradesk = ["pidesk", "tegra_el0"]
 # sha256 of `unaos-kernel` and of its `llvm-objcopy -O binary` flattening. Witness on the wire:
 # `[orinclick] arm`, `[orinclick] edge=`, `[orinclick] census`. See orin-desktop.md §3.7.
 orinclick = ["tegra_el0"]
+
+# ORIN-CONWIN (`UNAOS_ORINCONWIN=1`): rung 4 of the Orin desktop ladder — **the console becomes a
+# WINDOW.** `arch/aarch64/display_tegra.rs::orin_conwin` calls the SHARED console-window machinery
+# (`fbcon::panel_console_face_arm` -> `fbcon::panel_console_window_open` -> `fbcon::console_is_routed`)
+# from `tegra_early_stop`'s terminus line, and `jd2_console_pump`'s phase-2 `fbcon::detach()` is
+# guarded by the route so a routed console stays LIVE instead of freezing at the handoff. There is no
+# second console renderer: one `panel_console_window_open`, one `route_present_banded`, three arches
+# reaching them.
+#
+# WHY IT IMPLIES `desktop_firmware` + `tegra_el0`, exactly like `tegradesk` and for the same measured reason.
+# `panel_console_window_open`, `console_is_routed`, `panel_console_face_arm` and `video::dock` (the
+# CONSOLEWIN law's geometry half) are every one of them gated
+# `any(all(x86_64, wc), all(aarch64, desktop_firmware))`, and `desktop_firmware` on aarch64 reaches
+# `arch::aarch64::syscall` through `dock::focus_set`, which `arch/aarch64/mod.rs` gates on
+# `any(baremetal, tegra_el0)`. `baremetal` implies `pi` and `pi` + `tegra` is a hard `compile_error!`
+# (`arch/aarch64/serial.rs`), so `tegra_el0` is the only satisfiable term on this board. A standalone
+# spelling would let `UNAOS_ORINCONWIN=1 UNAOS_TEGRA=1` compile the rung's ABSENCE and report green —
+# the "gate whose knob cannot satisfy it" defect rung 2 removed. `tegra_el0` implies `tegra`, so
+# `UNAOS_ORINCONWIN=1 ./arroyo check` and `UNAOS_ORINCONWIN=1 ./arroyo esp-jetson` are self-sufficient.
+#
+# ⚠ IT DOES NOT IMPLY `orindesk` OR `orinclick`, AND THAT IS THE WHOLE SAFETY PROPERTY. orin-desktop.md
+# §6.1 (the ordering rule, "not negotiable"): *"Rung 4 may not ship a console window on an image where
+# `orinclick` is off"* — the console window carries a minimise disc whose only route back is the dock,
+# and the dock is a route back only once clicks route. `orin_conwin` therefore reads BOTH knobs at
+# runtime through `cfg!()` (the `TEGRADESK_CLICK_ROUTED` idiom, never a literal `true`) and DECLINES,
+# named, on any image missing either. Implying them would make that decline unreachable and the rule
+# unenforceable by anything but a comment; leaving them separate makes the ordering rule a branch this
+# build can actually take, and `UNAOS_ORINCONWIN=1` alone is the image that takes it.
+#
+# IT DOES NOT CROSS THE §5.2 STOP-LINE. `desktop_firmware::activate()` — the full desktop cascade, the thing that
+# overflowed the Pi's 16 KiB kernel stack twice on metal — is NOT called: rung 4 takes exactly the two
+# steps of `desktop_firmware::activate`'s sequence that the console window needs (face, open) and none of the
+# rest (no DESKTOP-CLEAR, no `menubar::set_enabled`, no crystal, no render service). `quarry` is NOT
+# implied either, so `quarry::open()` at click-router depth — boot 11's actual overflow — is the
+# `#[cfg(not(feature = "quarry"))]` `false` stub in this build. What `desktop_firmware` DOES compile into the
+# router here is `strip::press_route` -> `crystal::press_at` + `dock::press_at`, and that is not a
+# widening to be tolerated but the POINT: `dock::press_at` IS §6.1's route back.
+#
+# Default OFF => the statics, the function and both call sites vanish, and NO LINE MOVES in any file
+# compiled knob-off: the `display_tegra.rs` half is a file-TAIL block, the `main.rs` call site is a
+# statement APPENDED to the existing terminus line, the detach guard is folded IN PLACE on the line it
+# guards, and the shim is at `main.rs`'s file tail. MEASURED, not argued — build `esp-jetson` either
+# side and compare sha256 of `kernel.elf` and of its `llvm-objcopy -O binary` flattening. The ARMED
+# polarity is type-checked by the `arm-tegra-conwin` leg of KERNEL_CFG_MATRIX, never by the knob
+# mapping. UNFLOWN: no Orin has booted this rung, and it stays behind its knobs until the rung-3 click
+# flight returns its verdict. Witness on the wire: `[orinconwin] gate`, `[orinconwin] win=`,
+# `[orinconwin] DECLINE`. See docs/dev/OS/08_VIDEO/orin-desktop.md §6 rung 4 and §3.8.
+orinconwin = ["desktop_firmware", "tegra_el0"]
+
+# ORIN-TENANT (rung 6 of the Orin desktop ladder, orin-desktop.md §6): EL0 WINDOW TENANTS — the
+# `[orintenant]` instrument plus the tegra arming point for the EL0 window path. DEFAULT OFF.
+#
+# WHAT THE KNOB GATES, precisely — because the SYSCALLS are deliberately NOT behind it. The
+# SYS_WIN_* surface (create/present/present_rows/move/close, `arch/aarch64/syscall.rs`, numbers in
+# `una-abi`) is arch-neutral, shared with the Pi and the x86 twin, and compiles on this board under
+# `tegra_el0` alone — rung 6 adds no verb and gates none. What `orintenant` arms is:
+#   * `display_tegra::orin_tenant_arm` — appended to `tegra_early_stop`'s terminus line. Reserves the
+#     compositor staging buffer (`wm::reserve_stage`, idempotent/grow-only, §3.3's F-family reason:
+#     an EL0 `SYS_WIN_PRESENT` on an image with no other desktop rung would otherwise grow the stage
+#     under the present's IRQ mask) and prints the `[orintenant] arm` gate census.
+#   * the `[orintenant]` witness family — per-event create/refuse/close lines and the exit-path reap
+#     line from four line-neutral call sites in `arch/aarch64/syscall.rs`, plus the ~10 s census from
+#     `jd2_console_pump`'s sweep (the rung-3 idiom: the census IS the routing task's own liveness).
+#
+# WHAT IT DOES NOT GATE: the CRYSTAL-HD geometry parity fix in `arch/aarch64/mmu_tegra_el0.rs`
+# (FB_WIN 4 slots x 0x51000 / 288x288, matching `boot.rs` and the x86 twin) is a correctness fix to
+# the `tegra_el0` platform module and rides `tegra_el0` unconditionally — hiding an ABI-parity repair
+# behind a demo knob would leave every OTHER tegra_el0 image answering `-EINVAL` to the shipped
+# `user-vug`'s `SYS_WIN_CREATE(288, 288)` and faulting the WC-B fixture's slot-1 stores.
+#
+# WHY IT IMPLIES `tegra_el0` AND NOTHING ELSE — rung 3's argument, verbatim: the window verbs live in
+# `arch/aarch64/syscall.rs`, gated `any(baremetal, tegra_el0)`; `baremetal` implies `pi` and `pi` +
+# `tegra` is a hard `compile_error!`, so `tegra_el0` is the only satisfiable term on this board and a
+# standalone `orintenant = []` would be a knob that compiles nothing. It does NOT imply `desktop_firmware` (a
+# tenant needs no furniture; the close disc's CLOSE-CLEAN path and the ordinary raise arms are
+# ungated) and NOT `orindesk`/`orinclick`/`orinconwin` — the demonstration flight carries the
+# conjunction (see arroyo's UNAOS_ORINTENANT block), and the census REPORTS which of those are aboard
+# rather than pretending to enforce an ordering no `#[cfg]` here could express: SYS_WIN_CREATE is
+# reachable from EL0 on every `tegra_el0` image whatever this knob says.
+#
+# DEFAULT OFF => all of the above vanishes; the default jetson media (`tegra,tegrasmp` — no
+# `tegra_el0`, so no syscall surface and no `mmu_tegra_el0` at all) is byte-identical, and the Pi
+# `kernel8.img` is byte-identical because every `syscall.rs` call site is line-neutral and
+# `orintenant`-gated. The ARMED polarity is type-checked by the `arm-tegra-tenant` leg of
+# KERNEL_CFG_MATRIX and the `desktop_firmware`/conjunction cross by `arm-tegra-conwin-tenant` (which now carries
+# `orintenant`), never by the knob mapping. Witness on the wire: `[orintenant] arm`,
+# `[orintenant] create`, `[orintenant] close`, `[orintenant] reap`, `[orintenant] census`. See
+# docs/dev/OS/08_VIDEO/orin-desktop.md §6 rung 6.
+orintenant = ["tegra_el0"]
+
+# ORIN-EL1AP (baton orin-8 item 1, SMP-redesign Candidate C): `UNAOS_ORINEL1AP=1` — drop exactly ONE
+# PSCI-woken AP from EL2 to EL1 during `smp_virt` bring-up, so `sched::EL1_CORE_MASK` gains a second
+# bit and a BACKGROUND EL0 tenant has a core to live on.
+#
+# WHAT IT FIXES. `bg` is refused on this board every single time — `el0refuse=<n> el1cores=0x1` — and
+# the refusal is CORRECT: on the `smp_virt` path only the BSP drops, the APs stay at EL2, and an
+# `eret` at EL2 with HCR_EL2.E2H==0 banks ELR_EL2 (the convicted board-killer, sched.rs §EL0-EL1CORE).
+# The filter was always right; what was missing is that no core was ever made ELIGIBLE. The BSP is not
+# a candidate either — it runs the shell, which `run` keeps and `bg` may not. So there is no detached
+# app on the Orin at all today. This arms one.
+#
+# WHAT IT COMPILES: the ORIN-EL1AP block at the tail of `arch/aarch64/boot_tegra.rs` (the seat claim,
+# the bounded wait for the BSP-published EL1 root, the ICC_SRE_EL2.Enable grant, the latch save/restore
+# and the reuse of `enable_el1_regime` + `drop_el2_to_el1_tegra`), the one publishing statement inside
+# `drop_to_el1`, the post-drop re-init block in `smp_virt::__secondary_rust_virt`, and the read-only
+# `sched::el1_core_mask()` the witness prints.
+#
+# WHY IT IMPLIES `tegrasmp` AND `tegra_el0` AND NOTHING ELSE. `tegrasmp` because the drop happens on a
+# PSCI-woken AP and `start_secondaries_tegra` is itself `#[cfg(feature = "tegrasmp")]` — without it
+# there are no APs and this knob would arm a path with no cores on it. `tegra_el0` because an EL1 AP
+# exists to HOST an EL0 tenant, and the EL0 spawn surface (`sched`'s `spawn_user*`, `syscall.rs`) is
+# gated `any(baremetal, tegra_el0)`; `baremetal` implies `pi` and `pi` + `tegra` is a hard
+# `compile_error!` (`arch/aarch64/serial.rs`), so on this board `tegra_el0` is the only satisfiable
+# term and a standalone spelling would be a knob whose effect nothing could reach. Both imply `tegra`,
+# so `UNAOS_ORINEL1AP=1` is self-sufficient. It does NOT imply `bsprun`/`bsptick` — this arc changes
+# an AP's exception level, not the boot core's terminus.
+#
+# FAIL-CLOSED. Every exit that does not complete the drop leaves the core at EL2 and UNSTAMPED, so
+# `el1cores` keeps its current value and EL0 placement stays refused exactly as it is today. Exactly
+# one AP is affected (`EL1AP_SEAT`); the rest stay EL2 scheduler participants, so SPREAD balance for
+# ordinary kernel tasks is untouched.
+#
+# DEFAULT OFF => the whole block, the publishing statement, the call site and the accessor all vanish;
+# the default jetson media (`tegra,tegrasmp`) and the Pi `kernel8.img` are unaffected. The ARMED
+# polarity is type-checked by the `arm-tegra-el1ap` leg of KERNEL_CFG_MATRIX, never by the knob
+# mapping. Witness on the wire: every line carries `[el1ap]` — see arroyo's UNAOS_ORINEL1AP block.
+orinel1ap = ["tegrasmp", "tegra_el0"]
+# ORIN-INPUT: `UNAOS_ORININPUT=1` — make HID input actually REACH an EL0 tenant on the Orin. Adds the
+# pump/route/rollup in `arch/aarch64/xusb_tegra.rs` (`oi_pump`/`oi_reset`/`oi_rollup`) and its three
+# call sites inside `run_user_image`'s wait loop in `arch/aarch64/syscall.rs`.
+#
+# THE DEFECT. On a `tegra_el0` image the whole ELF-5 EL0 input chain is compiled in — the per-process
+# ring, `user_input_enqueue`, `user_input_set_active`, and `SYS_INPUT_POLL` on the SVC table — and
+# `run_user_image` registers the tenant as the active input target. A tenant that polls every frame
+# still receives nothing, because the two hops that FEED that seam are Pi-only:
+#   1. Nothing pumps the controller while a tenant runs. The Pi's `usb_pump` task is
+#      `cfg(feature = "baremetal")`; the tegra image has none, and the Orin's only HID pump
+#      (`main.rs::jd2_console_pump`) is PARKED inside `handle_key` -> `dispatch_command` ->
+#      `run_user_image` for the tenant's whole life. That wait loop was `yield_now()` and nothing else,
+#      so ZERO `poll_events()` calls happen across a run and `pal::EVENT_QUEUE` stays empty.
+#   2. Nothing routes keystrokes. `route_input_to_active_el0` / `pump_usb_into_gui` are `baremetal`-gated
+#      too; on tegra `jd2_console_pump` feeds every `Event::Key` to `handle_key` regardless of focus
+#      (`display_tegra.rs` states this beside `orin_click`, verified rather than assumed).
+# A bench capture where nearly every `[orinclick]`/`[orintenant]` census line reads `focus=0x0` is a
+# SYMPTOM of (1), not a focus bug: those censuses are emitted from the parked pump's own sweep, so they
+# can only ever sample the intervals when no tenant is running.
+#
+# SCOPE. This neutralises (2) for the duration of a `run` — the thief is parked exactly then — but NOT
+# for a `bg`-launched windowed tenant. Gating `jd2_console_pump` on `user_input_active() != 0` would be
+# the wrong fix there: with `pidesk` OFF, `USER_INPUT_ACTIVE` can hold the `wm::KERNEL_OWNER_DESKTOP`
+# pseudo-ASID, and routing keys into a pseudo-ASID ring locks the operator out of the shell. That
+# belongs to the `pidesk` rung that owns the pseudo-ASID question.
+#
+# WITNESS. `[orininput] … rollup passes=… nofocus=… decoded=… deliverable=… routed=… dropped=… focus=…`
+# with a named verdict (DELIVERED / ROUTER-DROP / QUEUE-INERT / NO-HID / NO-FOCUS / NEVER-RAN), at ~2 Hz
+# while a tenant runs and unconditionally at the end of every run — so a hop that delivered zero SAYS
+# zero. `passes` is load-bearing: it separates "pump ran, wire quiet" from "pump never ran".
+#
+# Implies `tegra_el0` (the seam it routes through is gated `any(baremetal, tegra_el0)`, and `baremetal`
+# implies `pi` which `compile_error!`s against `tegra` — so `tegra_el0` is the only satisfiable term on
+# this board and a standalone `orininput = []` would gate nothing). DEFAULT OFF => every item and all
+# three call sites vanish; the jetson media and the Pi `kernel8.img` are both byte-identical to
+# baseline. ARMED polarity type-checked by the `arm-tegra-tenant` leg of KERNEL_CFG_MATRIX, never by the
+# knob mapping. Enable via `UNAOS_ORININPUT=1 UNAOS_TEGRA=1 ./arroyo esp-jetson`.
+# See docs/dev/OS/01_BOOT_HAL/arch_arm64.md §ORIN-INPUT. NOT YET ON HARDWARE.
+orininput = ["tegra_el0"]
+# ORIN-VPAR: the aarch64 half of the `video/` PARITY WITNESSES — the instruments that say, on the
+# wire, whether an x86-side protection has an aarch64 counterpart and, when it does not, WHY.
+#
+# THE DEFECT IT EXISTS FOR. A parity survey of `video/` found a class of one-sided item whose
+# PROTECTION is arch-neutral but whose PROOF is not: `wm::occ_clip`'s furniture arm withholds the
+# menu bar's columns from a crossing window blit on `pidesk` aarch64 exactly as it does on x86+`wc`
+# (`video/wm.rs`, the `any(all(x86_64, wc), all(aarch64, pidesk))` arm), while the pair that PROVES
+# it fired — `OB_N`/`OB_BOX` → `occclip_bar=`/`occclip_bar_px=`, and the `MENUBAR-OCC` fixture that
+# drives them — is `all(witness, x86_64)`. An aarch64 regression in that clip therefore reads GREEN:
+# there is no field to go to zero. The same shape appears in `video/screen.rs` for WCD-TEARDOWN's
+# `desk=` epoch. This knob arms the aarch64 lines that make those states LOUD — a fired witness where
+# the counterpart could be built, and a DECLINED verdict NAMING its blocker where it could not.
+#
+# BOTH OUTCOMES ARE ON THE WIRE, which is the whole point: a decline that prints nothing is
+# indistinguishable from a leg that never ran, and that is the state this arc found.
+#
+# NEEDS `witness` TO REACH ANYTHING — every line it arms is an instrument, so the sites are
+# `all(feature = "witness", feature = "orinvpar", target_arch = "aarch64")`. Arm with
+# `UNAOS_WITNESS=1 UNAOS_ORINVPAR=1`.
+#
+# IMPLIES `pidesk` and nothing else: `video/menubar.rs` is declared behind
+# `any(all(x86_64, wc), all(aarch64, pidesk))` (`video/mod.rs`), so a standalone `orinvpar = []`
+# would be a knob whose menubar half compiles nothing on this arch. It does NOT imply `tegra`/
+# `tegra_el0` — `video/screen.rs` is ungated and the gap is an aarch64 gap, not a Tegra one, so a Pi
+# `pidesk` boot answers the same question. DEFAULT OFF => every site vanishes, no `MENUBAR-OCC-PAR`/
+# `DESKPAR`/`STAGEPAR`/`SCENEPAR` string exists in the image, and the default jetson and Pi media are
+# byte-identical. Witness on the wire: `:: MENUBAR-OCC-PAR:`, `:: DESKPAR:`, `:: STAGEPAR:`,
+# `:: SCENEPAR:`. Kept in sync with arroyo.
+orinvpar = ["desktop_firmware"]
+
+
+# ORIN-SUPSTATE (SMP-redesign Candidate A, arc 1): lift the Orin console surface OUT of
+# `jd2_console_pump`'s task-local storage. The `Screen`/`Console` pair that has been stack-local to
+# that one task since JD2 (`main.rs`, phase 2) moves behind a module-owned handle in
+# `arch/aarch64/display_tegra.rs::supstate` — the `ORINWM1_STORE` mould: a `spin::Mutex` static this
+# track's lane owns — so the surface state OUTLIVES its holder and a successor task can adopt it
+# (F2's fix precondition; nothing in this tree inherits a dead task's singleton roles today —
+# display_tegra.rs's own census doc records that). The pump's roles split into named task identities
+# (input source / presenter / dispatcher), ALL STILL PINNED TO CORE 0 — this knob changes ownership,
+# not placement, not scheduling. No supervisor, no reap, no restart: that is arc 2, and it needs
+# Candidate B's clock (A-alone would ship a watchdog that cannot fire).
+#
+# Implies `tegra` only — same reasoning as `tegrasmp`: every consumer is inside
+# `cfg(all(feature = "tegra", target_arch = "aarch64"))` code, so a standalone `supstate = []` would
+# be a knob that compiles nothing without UNAOS_TEGRA=1 — the vacuous-gate defect class. It does NOT
+# imply `tegra_el0`/`orinclick`: the lift is orthogonal to click routing, and the `orin_click` /
+# `orin_click_census` call sites inside the supstate roles carry their own `#[cfg(feature =
+# "orinclick")]` exactly as the legacy pump's do. ARMED polarity is type-checked by the
+# `arm-tegra-supstate` leg of KERNEL_CFG_MATRIX in `arroyo`, never by the knob mapping.
+#
+# DEFAULT OFF AND MEASURED. Knob-off, the hook in `jd2_console_pump` is a `#[cfg]`-erased statement
+# APPENDED TO AN EXISTING LINE (the phase-1 loop's closing brace) and every other item is appended at
+# file tails, so no line moves in any file compiled knob-off (the panic-`Location` line-shift class)
+# and the jetson image is byte-identical to baseline. Witness on the wire: `[supstate] lift`,
+# `[supstate] roles`. UNFLOWN until the arc-boundary bench flight.
+supstate = ["tegra"]
+
+
+# ORIN-LADDER — the two rungs orin 6 left owed (orin-desktop.md §3.9.1 "What this flight still did
+# NOT establish"): the win=2 GLYPHS-ON-GLASS read-back and the DOCK ROUND TRIP. DEFAULT OFF.
+#
+# WHAT IT ARMS. Nothing that moves a pixel or routes an event — the round trip's whole mechanism
+# already ships (rung 3's `minimise_hit` arm, `wm::minimise`, `strip::press_route` ->
+# `dock::press_at`, `focus_changed`'s raise+unhide). What this knob arms is the ADJUDICATOR: the
+# `[oringlass]` read-back of the console window's own text off the scanout, the `[orindock]`
+# park/restore edge detector, and the ~10 s census that says WHICH HALF of the trip is outstanding.
+# All of it is appended at the tail of `arch/aarch64/display_tegra.rs`; the two call sites are
+# LINE-NEUTRAL in-line appends to `main.rs`'s terminus and JD2-sweep lines. NOT ONE LINE OF `video/`
+# is touched, deliberately — see the block header in `display_tegra.rs` for the lane reason.
+#
+# WHY IT IMPLIES THE §6.1 CONJUNCTION RATHER THAN STANDING ALONE, and the implication set is FORCED,
+# not preferred. `orin_conwin` REFUSES to open a console window on an image missing either `orindesk`
+# or `orinclick` (`[orinconwin] DECLINE reason=ordering-rule`), and this instrument's entire subject
+# is that window and the minimise disc on it. So:
+#   * `orinladder = []` would arm a probe for a window the build guarantees does not exist;
+#   * `orinladder = ["orinconwin"]` would arm one for a window `orin_conwin` declines to open;
+#   * `orinclick` is additionally what makes the disc a GESTURE rather than a decoration — without
+#     the router the minimise disc cannot be pressed and rung (b) has no event to witness.
+# `orinconwin` transitively supplies `desktop_firmware` (the `dock`/`strip` modules this reads `strip_rect`,
+# `last_press_outcome` and `dock_scan` from) and `tegra_el0` -> `tegra`. The closure is therefore the
+# flight image exactly. This is `orinclick = ["tegra_el0"]`'s own argument applied one rung up.
+#
+# The ARMED polarity is type-checked by the `arm-tegra-ladder` leg of KERNEL_CFG_MATRIX in `arroyo`,
+# never by the knob mapping. Witness on the wire: `[oringlass] arm`, `[oringlass] probe=`,
+# `[oringlass] phase=`, `[orindock] arm`, `[orindock] park`, `[orindock] restore`,
+# `[orindock] census`. See docs/dev/OS/08_VIDEO/orin-desktop.md §3.11.
+orinladder = ["orinconwin", "orinclick", "orindesk"]
+# ORIN-DESKFURN: `UNAOS_ORINFURN=1` — **the Orin gets FURNITURE: the menu bar is ENABLED and PAINTED,
+# and the SHARD menu becomes pressable.** `main.rs::tegra_desk_furn`, on `tegra_early_stop`'s terminus
+# line after every existing rung. DEFAULT OFF.
+#
+# WHAT IT IS NOT, and this is the whole of its safety argument. It does **NOT** call
+# `desktop_firmware::activate()` and it does **NOT** touch `TEGRADESK_CASCADE_OK`, so orin-desktop.md §5.2's
+# stop-line is UNCROSSED and rung 5 is still blocked. `activate`'s sequence is nine steps — DESKTOP
+# CLEAR through the front buffer, the console window, the bar, the composite, `crystal::routed_selftest`,
+# `pulsewin::open`, window population, a tegra `render_service`, a filesystem walk. This knob takes
+# exactly TWO of them — `menubar::set_enabled(true)` and `wm::composite()` — because those two ARE the
+# bar, and nothing else in `activate` is. Rung 4 made the identical narrowing for the console window
+# (`orinconwin` takes `activate`'s steps 2a/2-3 and nothing else) and the argument is inherited, not
+# re-invented.
+#
+# WHY THE STACK ARGUMENT HOLDS WHERE §5.2's DOES NOT. §5.2's hazard is the CASCADE's depth, and its
+# named overflow is `quarry::open()` at click-router depth (Pi boot 11). `quarry` is not implied here,
+# so that call is the `not(feature = "quarry")` `false` stub. What this knob actually adds to the
+# terminus is one more `wm::composite()` — the same call ORIN-WM1 (rung 0), `orin_conwin`'s `create_at`
+# (rung 4) and `orin_tenant_arm` (rung 6) already make from this same line, on the boot core's own
+# entry frame, all three FLOWN on Orin metal (boot7f/7g/7h). It is not a new stack shape; it is a
+# fourth instance of a shape this board has run three times. ⚠ That is an ARGUMENT FROM THE LEDGER,
+# not a measurement: no `[u7stk]` number for this line exists, and `sched::stk_probe` cannot produce
+# one here — it returns early when `SCHED[cpu].current` is null, which is exactly the boot core before
+# the scheduler is driven. Stated because the stop-line asks for numbers this seam structurally cannot
+# take, and pretending otherwise is the failure mode this whole ladder is written against.
+#
+# IMPLIES `orinclick`. A bar whose crystal cannot be pressed is chrome, not furniture — and the SHARD
+# menu is half of what this knob exists to deliver. `orinclick = ["tegra_el0"]` (implies `tegra`) and
+# `desktop_firmware` brings the furniture family (`strip`/`dock`/`menubar`/`crystal`, gated
+# `any(all(x86_64, wc), all(aarch64, desktop_firmware))`), so the knob is SELF-SUFFICIENT like `tegradesk` and
+# `orinconwin` and unlike `orindesk`/`jd1dc`. It deliberately does NOT imply `orinconwin`: the bar and
+# the console window are independent furniture and each stands on its own floors.
+#
+# DEFAULT OFF => the statics, the function and the terminus statement all vanish, no line moves in any
+# file (file-tail block; the call site is appended to an existing line), and the jetson image is
+# byte-identical to baseline. The ARMED polarity is type-checked by the `arm-tegra-furn` leg of
+# KERNEL_CFG_MATRIX, never by the knob mapping. UNFLOWN — no Orin has booted it.
+# Witness on the wire: `[orinfurn] floors`, `[orinfurn] ARMED`, `[orinfurn] REFUSE`.
+# See docs/dev/OS/08_VIDEO/orin-desktop.md §3.12.
+orinfurn = ["desktop_firmware", "orinclick"]
+# ORIN-FACE (FBCONPAR item 1): UNAOS_ORINFACE=1 — arm the shared anti-aliased console face on an
+# ORDINARY Orin boot, at `video::fbcon::init`, with no desktop and no compositor window involved.
+#
+# THE PARITY GAP IT CLOSES, stated as the survey found it. x86 arms the face in
+# `fbcon::panel_console_resume` (`video/fbcon.rs`, `#[cfg(target_arch = "x86_64")]`), from the end of
+# `kepler_display::takeover_display`. aarch64's counterpart `fbcon::panel_console_face_arm` was
+# written for the Pi's desktop seam and gated `all(target_arch = "aarch64", feature = "desktop_firmware")`, and
+# on this board its only two callers are `video::desktop_firmware::activate` (whose `pidesk` + `baremetal` gate
+# is UNSATISFIABLE here) and `display_tegra::orin_conwin` (which DECLINES unless `orindesk` AND
+# `orinclick` are also armed, per the §6.1 ordering rule). So the cure was compiled, type-checked and
+# UNREACHABLE on every Orin boot that is not the full rung-4 conjunction, and the console kept the
+# raw font8x8 cell at scale 1 — ~0.8 mm on the 1920x1200 bench panel, the size metal sitting #30
+# recorded as simply not visible.
+#
+# THE `pidesk` GATE WAS INCIDENTAL, NOT LOAD-BEARING, and that is why this knob widens it rather than
+# duplicating the body: `panel_console_face_arm` touches `FBCON`, four `FbCon` fields and
+# `video::font::CELL_W`/`CELL_H`, and `video::font` is declared unconditionally on both arches
+# (`video/mod.rs`). Nothing in it reaches `pidesk`, `dock`, `wm` or the compositor. The gate becomes
+# `all(target_arch = "aarch64", any(feature = "desktop_firmware", feature = "orinface"))`, so every `pidesk`
+# build — Pi included — sees exactly the function it saw before.
+#
+# STANDALONE, and deliberately so, mirroring `orindesk`/`orinclick`'s spelling rather than
+# `orinconwin`'s: this rung opens NO window, takes NO `wm` lock, needs no `dock` and no
+# `syscall` surface, so there is nothing here for `pidesk`/`tegra_el0` to supply. It arms the CELL
+# and nothing else. It is orthogonal to `orinconwin`: with both armed the seam runs at `init` and
+# rung 4 re-arms idempotently before it sizes the window (`panel_console_face_arm` writes the same
+# four fields to the same values).
+#
+# DEFAULT OFF => the tail wrapper, its two statics and its call site vanish, `panel_console_face_arm`
+# is gated exactly as it was, and the jetson image is byte-identical to baseline. The call site is a
+# same-line append to `fbcon::init`'s existing `});`, so no line moves in a file compiled into the
+# knob-off `kernel8.img` whose byte-identity is the Pi track's standing proof.
+#
+# UNFLOWN — no Orin has booted it. Witness on the wire: `[orinface] ARMED`, `[orinface] DECLINE`,
+# `[orinface] MISMATCH`. Kept in sync with arroyo.
+orinface = []
+# ORIN-DEFER (FBCONPAR item 2): UNAOS_ORINDEFER=1 — port x86's PANEL-DEFER split layout/paint path
+# to the aarch64 console.
+#
+# THE PARITY GAP. `video/fbcon.rs::_print` runs its `PanelSink` route under
+# `#[cfg(target_arch = "x86_64")]`, so on aarch64 every console line falls to `print_masked`, which
+# holds `without_interrupts` across the WHOLE line — layout AND every glyph's pixel writes. The x86
+# finding that produced `PanelSink` applies unchanged here: only the LAYOUT half (cursor advance,
+# cell reservation, dirty-band accumulation) needs the mask, because the lock is `try_lock`ed and an
+# IRQ-context printer reserves its own disjoint cells. Armed, layout stays masked and locked and the
+# pixel work runs with interrupts enabled and no lock held.
+#
+# WHY IT MATTERS ON THIS BOARD BEYOND THE MASK SPAN: the wedge established 2026-08-26 runs
+# `timer_preempt` -> `load_witness_emit` -> `serial_println!` -> `fbcon::_print` -> ... ->
+# `wm::composite_inner` -> a bare `WRITER.lock()` FROM IRQ CONTEXT. This knob does not fix that lock
+# (LOCKFIX owns `video/wm.rs`); it shortens the masked region the console path holds while that
+# window is open.
+#
+# EVERY DEPENDENCY WAS ALREADY ARCH-NEUTRAL — `Op`, `OpList`, `OPS_PER_BYTE`, `paint_ops`,
+# `FbCon::plan_byte`/`plan_newline`/`mark_rows`/`draw_fb`, `route_present_rows`,
+# `route_present_pending` and `TAP_FBCON` all compile on both arches today. The only two x86 gates in
+# the way were `FbCon::take_dirty` and `CHUNK`/`PanelSink` themselves, plus one `shadow_store` field
+# reference (x86-only field, folded behind an arch-split `FbCon::shadowed()` helper). The panic path
+# is UNCHANGED on both arches: `PANIC_MIRROR` keeps the classic fully-masked route.
+#
+# STANDALONE: nothing here needs `pidesk`, `tegra_el0` or a compositor. On a `pidesk` aarch64 build
+# the routed branch inside `PanelSink::flush` becomes reachable and behaves exactly as x86's does.
+#
+# DEFAULT OFF => `_print`'s aarch64 arm folds back to the bare `print_masked(args)` it has always
+# been, the four counters and the census wrapper vanish, and the jetson AND pi images are
+# byte-identical to baseline. Every wire-in is a same-line fold, so no panic `Location` moves.
+#
+# UNFLOWN — no Orin has booted it. Witness on the wire: `[orindefer] census … -> DEFERRED` /
+# `-> CLASSIC-ONLY` / `-> LEDGER-MISMATCH`. Kept in sync with arroyo.
+orindefer = []
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage

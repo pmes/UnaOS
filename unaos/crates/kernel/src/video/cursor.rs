@@ -2688,7 +2688,7 @@ pub fn repaint() {
 /// * `repair` marks every window the restored rect overlaps, which takes the window TABLE lock —
 ///   a lock held by preemptible compositor code, i.e. exactly the acquire a masked core must not
 ///   make (INWEDGE's rule, one lock over).
-/// * `serial_println!` is the kernel's IRQ-context printer and on a `pidesk` build its panel mirror
+/// * `serial_println!` is the kernel's IRQ-context printer and on a `desktop_firmware` build its panel mirror
 ///   reaches `wm::present` → `composite`, which takes `WRITER` with a BLOCKING acquire. Printing
 ///   from inside a mask is the boot-8 wedge with the roles reversed: it is the *spinner*.
 ///

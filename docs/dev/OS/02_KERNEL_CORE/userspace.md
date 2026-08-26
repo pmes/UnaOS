@@ -1369,7 +1369,8 @@
     live `TTBR0_EL1`) covers a child that runs to completion on another core before the `pid` store lands.
     The pin bought nothing and cost the entire spread.
   - **Fix: `CPU_AUTO`.** `spawn_user_image_bg` now passes the SCHED-3 sentinel instead of `this_cpu()`, so
-    `pick_cpu` places the parent on the **least-loaded online core** — minimum ready-queue depth, then the
+    `pick_cpu` places the parent on the **least-loaded online core** — minimum `el0_active` (committed EL0
+    residents minus parked; `pick_cpu`'s PRIMARY key per SPREAD-3/4), then ready-queue depth, then the
     lower rolling-window busy fraction, then a rotating cursor so equal-load cores fill round-robin. This is
     the same discipline the orphan-reaper (SCHED-3b) and the ELF-2 worker threads already use; nothing new
     was invented. **Spreading happens at SPAWN only.** Placement is still decided exactly once and the task
@@ -1389,9 +1390,17 @@
     park on it forever — no `SYS_THREAD_SPAWN`, so three concurrent copies cannot exhaust the eight-row
     `THREAD_TABLE` and no worker's own spread muddies a witness whose subject is the parent), records each
     parent's core from `sched::last_user_placement()`, then kills and reaps all three so the process table is
-    left as it was found. The assertion is **`distinct >= 2`**, not `== 3`: a load-balanced policy may
-    legally reuse a core when it is genuinely still the least loaded, and `== 3` would make a correct
-    scheduler flap.
+    left as it was found. The assertion **was `distinct >= 2`** at this arc; since the argmin re-basis
+    (`989b32e3`, pi-authored as `1c44ea4b`, 2026-08-25) the leg asserts **argmin membership** instead: any
+    distinct-core count is a claim about the LOAD PATTERN the leg happens to run under — pi boot 12 redded
+    `distinct=1` while the scheduler was CORRECT (SPINHUNT residue held three cores; the one clean core was
+    the strict key-1 minimum, so winning all three launches *was* the policy). The fixture now snapshots
+    every online core's `el0_active` (`sched::el0_active_snapshot` — `pick_cpu`'s PRIMARY key) before each
+    spawn and requires every chosen core to have held the snapshot minimum: `inmin=3 (want == 3)` on the
+    PASS line (`arch/aarch64/syscall.rs:11602` key-1 reader; `:11648`/`:11653` verdict lines). Residual
+    load only shrinks the argmin set, so the leg stays green under boot-12-like residue by construction;
+    ties remain legal, and keys 2–4 (queue depth, busy fraction, rotating cursor) stay deliberately
+    unasserted (unsampleable atomically).
   - **Verified to have teeth (A/B).** Reverting the one-line placement change and nothing else, the leg
     reports `launched=3/3 distinct=1 settled=3 -> FAIL` and the gate drops to **77/78 with 3 forbidden hits**
     (all three the same line, matched by the generic `-> FAIL` FORBIDs). `distinct=1` there is not luck: all

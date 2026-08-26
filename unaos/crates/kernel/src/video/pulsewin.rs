@@ -68,7 +68,7 @@
 //!
 //! **And it does not PAINT.** A press flips one atomic and returns; the repaint is [`service`]'s, on the
 //! render core, one paced call per pulse period. That split is not tidiness — it is the ledger at the
-//! tail of `pidesk::activate` applied before the fact. The Pi's live routed console was MEASURED turning
+//! tail of `desktop_firmware::activate` applied before the fact. The Pi's live routed console was MEASURED turning
 //! a 108/108 bench-geometry run into 97/108 with a synchronous exception, and the diagnosis was not "who
 //! writes the panel" but *who drives the COMPOSITOR*: a surface that presents from arbitrary call
 //! context is an unsynchronised compositor client. A menu painting from the input task would be exactly
@@ -77,9 +77,9 @@
 //!
 //! ## Gating
 //!
-//! `any(x86 + wc, aarch64 + pidesk)` — the furniture family's gate, and for the furniture family's
+//! `any(x86 + wc, aarch64 + desktop_firmware)` — the furniture family's gate, and for the furniture family's
 //! reason: this is EXPERIENCE-layer code with no hardware in it, so it compiles on every chip and is
-//! turned on by a knob rather than by an arch. Only `pidesk::activate` ARMS the window today; on x86 the
+//! turned on by a knob rather than by an arch. Only `desktop_firmware::activate` ARMS the window today; on x86 the
 //! module compiles, type-checks and is unreferenced, which is what keeps the port from rotting.
 
 use super::{theme, wm};
@@ -381,7 +381,7 @@ fn pal() -> Option<SurfacePal> {
 /// call hands back the existing window rather than minting a second one.
 ///
 /// Every decline is NAMED on the wire and none of them is fatal to the caller: a desktop without a
-/// pulse window is a perfectly good desktop, exactly as `pidesk` argues for the console window.
+/// pulse window is a perfectly good desktop, exactly as `desktop_firmware` argues for the console window.
 pub fn open() -> wm::WinId {
     let existing = WIN.load(Ordering::Relaxed);
     if existing != wm::WIN_NONE {
@@ -579,7 +579,7 @@ pub fn service() {
     let mut loads = [PARKED; PSTRIP_MAX_CPUS];
     let ncpu = ui_status::loads(&mut loads);
     if WIN.load(Ordering::Acquire) == wm::WIN_NONE {
-        // THE OPEN ARM. `pidesk::activate` ARMS this window; the render pass OPENS it, on the first
+        // THE OPEN ARM. `desktop_firmware::activate` ARMS this window; the render pass OPENS it, on the first
         // pass where `ui_status` reports a live instrument. Two things are being bought, and both were
         // paid for by a measurement rather than argued into existence:
         //

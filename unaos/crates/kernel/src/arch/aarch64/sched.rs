@@ -44,7 +44,7 @@ const TASK_STACK_SIZE: usize = 16 * 1024; const STACK_REDZONE: usize = 1024; con
 // U7STK — the kernel-stack HIGH-WATER instrument (PARITY §6.1b).
 //
 // WHY IT EXISTS. `u7-launch` (`main.rs`, entry `syscall::u7_launcher`) is dropped on Pi METAL
-// between `wcb_launcher` and `video::pidesk::arm()` by the SPIN-6 refusal below:
+// between `wcb_launcher` and `video::desktop_firmware::arm()` by the SPIN-6 refusal below:
 //
 //   [spin6] cpu=2 REFUSING corrupt switch-in: task=70:u7-launch ctx_sp=0x20c9e70
 //   outside its stack [0x20ca000,0x20ce000) — the parked frame was OVERWRITTEN
@@ -61,9 +61,12 @@ const TASK_STACK_SIZE: usize = 16 * 1024; const STACK_REDZONE: usize = 1024; con
 // the call has already returned — which is exactly what convicts one launcher out of forty-seven
 // without instrumenting any of their interiors.
 //
-// SCOPE. Only `spawn_inner` (KERNEL tasks) paints. The EL0 spawn paths are deliberately left
-// alone — they are not what overflowed, and `stk_probe` on an unpainted stack would report the
-// allocator's zero fill as touched depth. Call the probe from kernel tasks only.
+// SCOPE. `spawn_inner` (KERNEL tasks) paints, and — since EL0STACK — so do `spawn_user_inner` and
+// `spawn_user_thread`: pi's shell-run finding moved the EL0 kernel stacks from "not what overflowed"
+// to "what dipped with no witness", and an unpainted stack is exactly the gauge that could not have
+// seen it (`stk_probe` on one would report the allocator's zero fill as touched depth). With every
+// spawn path painted, the probe is valid from any task and `el0_stk_report` (the retirement-time
+// EL0 reading — see it for why retirement is the honest sample point) reads real depth.
 //
 // COST. Painting is one `fill` of the task's stack per spawn; a probe is one byte scan of the
 // same span plus one serial line. Both are `witness`-gated, so the plain `./arroyo kernel8` media
@@ -139,6 +142,53 @@ pub fn stk_probe(at: &str) {
         used,
         hw,
         len as i64 - hw as i64
+    );
+}
+
+/// EL0STK — retirement-time high-water report for an EL0 task's KERNEL stack: the witness for the
+/// transient dip SPIN-6 is STRUCTURALLY blind to. SPIN-6 validates the PARKED frame pointer, and a
+/// parked task's `ctx_sp` is always in range — a syscall chain that dips below the usable floor and
+/// RETURNS before the task parks leaves nothing for it to see. The paint does not lie back: poison
+/// destroyed stays destroyed, so the deepest point EVER reached is readable at retirement even though
+/// the dip itself was transient. Same saturating caveat as `stk_probe`: the scan starts AT the usable
+/// base, so `hw=len headroom=0` is a LOWER bound, never a depth — which is why `loguard` is printed
+/// beside it: it is `guard_state` over the redzone (1 = the dip ENTERED the absorber below the floor,
+/// 3 = TRAVERSED it), the same reading the dispatch-time LOW-REDZONE report takes, delivered here at
+/// the task's END with its identity attached instead of only while the damage is parked.
+///
+/// One line per EL0 task, from `exit()` — the single funnel for every non-killed retirement
+/// (`sys_exit`, `SYS_THREAD_EXIT`, the M6b fault-kill and `kill_check_current` all land there). A
+/// task killed OFF-CPU skips it (`retire_killed` frees the Box without passing here); the population
+/// the instrument exists for — `shell-run` and the fixture programs, which retire via `exit()` —
+/// all report. Witness-gated like every U7STK instrument: media builds carry nothing.
+#[cfg(all(feature = "witness", any(feature = "baremetal", feature = "tegra_el0")))]
+fn el0_stk_report(task: &Task) {
+    let base = task.stack.as_ptr() as u64 + STACK_REDZONE as u64;
+    let len = task.stack.len() as u64 - (STACK_REDZONE + STACK_HIGHGUARD) as u64;
+    const POISON_WORD: u64 = u64::from_ne_bytes([STACK_POISON; 8]);
+    let mut untouched;
+    unsafe {
+        let w = base as *const u64;
+        let words = len / 8;
+        let mut i = 0u64;
+        while i < words && core::ptr::read_volatile(w.add(i as usize)) == POISON_WORD {
+            i += 1;
+        }
+        untouched = i * 8;
+        let p = base as *const u8;
+        while untouched < len && core::ptr::read_volatile(p.add(untouched as usize)) == STACK_POISON {
+            untouched += 1;
+        }
+    }
+    let hw = len - untouched;
+    serial_println!(
+        "[el0stkhw] task={}:{} len={} hw={} headroom={} loguard={}",
+        task.id,
+        task.name,
+        len,
+        hw,
+        untouched,
+        guard_state(&task.stack[..STACK_REDZONE])
     );
 }
 
@@ -1046,10 +1096,24 @@ impl CoreAccount {
         // is the case SCHED-8 introduced it for; `fold_age_cyc` is deliberately left untouched, so
         // WEDGE-1's much tighter "may I pin work here" gate keeps reading the raw fold age and
         // still disqualifies a core that is not going round the dispatch loop.
+        //
+        // SMPINSTR (2026-08-25) — READ THIS ARM AS AN INSTRUMENT WRITER. It is UNCONDITIONAL: any
+        // non-zero `run_t0` means tracked, with no bound on how long that span has been open. A core
+        // that took an exception mid-task and never came back keeps `run_t0` pinned at its dispatch
+        // stamp forever (only `account()` clears it, and a dead core never reaches a fold), so this
+        // arm reports `tracked = true` for a corpse for the rest of the boot — and `busy_pct()`'s
+        // case 1 (`live >= budget`) reports that corpse 100%. That is the pi boot-11 reading:
+        // `:: SCHED: load :: c3=100%` for a core killed by a synchronous exception, one line after
+        // `[el0live] verdict=LIVE`. The arm is NOT removed here: it is correct for the case it was
+        // added for (a genuinely compute-bound core), and this predicate is also read by
+        // `ui_status`, so weakening it would re-open the "45% unused while vugs starved" hole. The
+        // fix is a rule on CONSUMERS — no printer may emit this boolean, or the percent it
+        // qualifies, without the RAW fold age beside it and a staleness tell. `fold_stale_cyc()` is
+        // factored out of the line below so a teller can name this exact arm; see `load_columns`.
         if self.run_t0.load(Ordering::Relaxed) != 0 {
             return true;
         }
-        now_cyc().wrapping_sub(last) < load_window_cyc().saturating_mul(2)
+        now_cyc().wrapping_sub(last) < fold_stale_cyc()
     }
 
     /// WEDGE-1 — cycles since the last fold, or `u64::MAX` if this core has never folded a span.
@@ -1149,6 +1213,17 @@ pub struct CoreLoad {
 /// for one frame, a false "fresh" costs a task parked forever.
 pub fn dispatch_fresh_cyc() -> u64 {
     (load_window_cyc() / 8).max(1)
+}
+
+/// SMPINSTR — the fold-age bound `CoreAccount::tracked()` thresholds when it is NOT short-circuited
+/// by an in-flight span: two load windows, ~500 ms. Factored out of `tracked()` (whose body was the
+/// only definition) so a witness can ask the question `tracked()` skips — "is this core's freshness
+/// claim backed by an actual FOLD, or only by a `run_t0` that nothing will ever clear?" — against the
+/// SAME number, with no way for the two to drift apart. A core that is `tracked()` while its
+/// `fold_age_cyc` is at or past this bound is tracked SOLELY by the unconditional `run_t0` arm; that
+/// is the wedge signature, and it is what `load_columns` prints as `!NOFOLD`.
+fn fold_stale_cyc() -> u64 {
+    load_window_cyc().saturating_mul(2)
 }
 
 /// SCHED-2 — read this core's live load: recent busy percent (rolling window), cumulative context
@@ -3213,6 +3288,18 @@ pub fn mark_el1_core() -> bool {
     true
 }
 
+/// ORIN-EL1AP — [`EL1_CORE_MASK`] verbatim, for a witness that must PRINT `el1cores` rather than ask
+/// a yes/no question about one core ([`el1_core`] is the predicate; [`el0_placement_possible`] is the
+/// policy). Exposed only under the knob that adds such a witness, so the disarmed image is unchanged.
+///
+/// Read-only, and deliberately so: the mask is written in exactly one place ([`mark_el1_core`], by a
+/// core measuring its OWN `CurrentEL`), which is the property that makes it evidence instead of
+/// configuration. Nothing here can set a bit.
+#[cfg(feature = "orinel1ap")]
+pub fn el1_core_mask() -> u64 {
+    EL1_CORE_MASK.load(Ordering::Acquire)
+}
+
 /// EL0-EL1CORE — EL0 placements REFUSED because the EL1-filtered candidate set was empty.
 ///
 /// WHERE IT IS READABLE, measured on the built artifacts rather than assumed. It is echoed as `n=` on
@@ -3688,7 +3775,7 @@ pub fn spawn_auto(name: &'static str, entry: fn(usize), arg: usize) -> u64 {
 /// into `super::boot` (the Pi-gated user MMU), and the `virt` JC3 path runs kernel-thread CAPSTONE only.
 #[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 pub fn spawn_user(name: &'static str, user_entry: u64, user_sp: u64, cpu: usize) -> u64 {
-    spawn_user_inner(name, user_entry, user_sp, super::uslots::boot_ttbr0(), cpu)
+    spawn_user_inner(name, user_entry, user_sp, super::uslots::boot_ttbr0(), cpu, TASK_STACK_SIZE)
 }
 
 /// Like `spawn_user`, but the task runs in its OWN per-task address space (M6d): `user_ttbr0` is the
@@ -3703,7 +3790,29 @@ pub fn spawn_user_slot(
     user_ttbr0: u64,
     cpu: usize,
 ) -> u64 {
-    spawn_user_inner(name, user_entry, user_sp, user_ttbr0, cpu)
+    spawn_user_inner(name, user_entry, user_sp, user_ttbr0, cpu, TASK_STACK_SIZE)
+}
+
+/// EL0STK — `spawn_stack`'s EL0 twin: like `spawn_user_slot`, but with a caller-sized KERNEL stack for
+/// the task instead of the blanket [`TASK_STACK_SIZE`]. The stack being sized here is the EL1 stack the
+/// task's syscall/exception handling runs on (SP_EL0 — the user-window stack — is `user_sp`'s business,
+/// not this function's), and until this entry existed there was NO sized EL0 spawn anywhere in the tree:
+/// every EL0 task got the blanket 16 KiB however deep the kernel chains its syscalls actually reach.
+/// That asymmetry is what left `shell-run`'s transient floor dip with no honest fix — the kernel side
+/// has had `spawn_stack` since U7STK ("sizing a single task is the honest fix; raising `TASK_STACK_SIZE`
+/// would pay for every task in the system to cover one"), and that law applies verbatim here.
+///
+/// The size MUST come with its measurement — see the `run_user_image` spawn site for the shape.
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+pub fn spawn_user_slot_stack(
+    name: &'static str,
+    user_entry: u64,
+    user_sp: u64,
+    user_ttbr0: u64,
+    cpu: usize,
+    stack_bytes: usize,
+) -> u64 {
+    spawn_user_inner(name, user_entry, user_sp, user_ttbr0, cpu, stack_bytes)
 }
 
 #[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
@@ -3713,6 +3822,7 @@ fn spawn_user_inner(
     user_sp: u64,
     user_ttbr0: u64,
     requested_cpu: usize,
+    stack_bytes: usize,
 ) -> u64 {
     // SPREAD-10: bias toward the core(s) already holding this address space's tasks. For a fresh
     // slot the count is zero everywhere and this is byte-identical to the plain key chain.
@@ -3736,7 +3846,12 @@ fn spawn_user_inner(
     assert!(cpu < NUM_CPUS, "spawn_user: cpu out of range");
     // BG-SPREAD witness aid — record the decision so the caller can read back where its task landed.
     LAST_USER_PLACEMENT.store(cpu, Ordering::Release);
-    let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE + STACK_REDZONE + STACK_HIGHGUARD].into_boxed_slice();
+    let mut stack: Box<[u8]> = alloc::vec![0u8; stack_bytes + STACK_REDZONE + STACK_HIGHGUARD].into_boxed_slice();
+    // EL0STK: paint before the initial frame is laid down — the same U7STK instrument `spawn_inner`
+    // carries, extended to EL0 tasks so their kernel stacks stop being the unpainted gauge (see the
+    // SCOPE note on STACK_POISON). Read back at retirement by `el0_stk_report`.
+    #[cfg(feature = "witness")]
+    stack.fill(STACK_POISON);
     let ctx_sp = build_initial_frame(&mut stack, user_task_trampoline);
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
     let task = Box::new(Task {
@@ -3859,6 +3974,10 @@ pub fn spawn_user_thread(
     let done = Arc::new(Semaphore::new(0));
     done.init(); // reserve the waiter list BEFORE the thread can run + post (alloc-free park)
     let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE + STACK_REDZONE + STACK_HIGHGUARD].into_boxed_slice();
+    // EL0STK: paint — see `spawn_user_inner`. Threads retire through the same `exit()` funnel, so
+    // `el0_stk_report` reads their stacks too; an unpainted one would report zero fill as depth.
+    #[cfg(feature = "witness")]
+    stack.fill(STACK_POISON);
     let ctx_sp = build_initial_frame(&mut stack, user_task_trampoline);
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
     let task = Box::new(Task {
@@ -4869,6 +4988,11 @@ pub fn exit() -> ! {
             // split below subtracts the ones that were killed, so `exit - kill_oncpu` reads as
             // "left on its own terms" without this site needing to know which it was.
             EL0_REAPED.exit.fetch_add(1, Ordering::Relaxed);
+            // EL0STK: the retirement-time stack reading — this task's kernel stack is still live
+            // (we are executing on it, at shallow depth) and about to be freed, so this is the last
+            // and the honest moment to read the paint. See `el0_stk_report`.
+            #[cfg(all(feature = "witness", any(feature = "baremetal", feature = "tegra_el0")))]
+            el0_stk_report(&*raw);
         }
         // Settle any kill request naming this task (by tid, or by ASID for a whole-process kill). Placed
         // HERE — after the slot teardown and the joiner post, with only the state store and the final
@@ -4994,7 +5118,7 @@ pub fn timer_preempt() {
         SCHED[cpu].quantum.store(remaining - 1, Ordering::Relaxed);
         return;
     }
-    SCHED[cpu].quantum.store(0, Ordering::Relaxed);
+    SCHED[cpu].quantum.store(0, Ordering::Relaxed); #[cfg(feature = "supstate")] crate::arch::display_tegra::sup_note_preempt(); // ORIN-SUPSOUND — count the QUANTUM EXPIRY here and nowhere else: `ctx +N/win` conflates a voluntary `yield_now` with an involuntary preemption, and the whole SUPSTATE x BSPRUN hazard argument turns on which of the two happened. Reached only past the `SCHED_ACTIVE` gate at the top, so `preempt=+0` on the `[suppresent]` census is POSITIVE proof that the flight exercised the COOPERATIVE core and tested none of the preemption hazards. One relaxed atomic add in IRQ context — no lock, no print, no allocation. APPENDED to an existing line and `supstate`-gated, so the knob-off image is byte-identical and not one panic `Location` in this file moves.
     unsafe {
         (*raw).state.store(STATE_READY, Ordering::Release);
         switch_context(
@@ -8102,11 +8226,22 @@ pub fn core_load_report() {
 const LOAD_WITNESS_INTERVAL: u64 = 1024;
 /// Aggregate tick accumulator across cores (whichever core lands on the interval boundary emits).
 static LOAD_WITNESS_TICKS: AtomicU64 = AtomicU64::new(0);
-/// Packed busy-percents of the last emitted line (`c0 | c1<<8 | c2<<16 | c3<<24`), for change-only
-/// suppression — a steady-state system stops re-printing an unchanged load line.
-static LOAD_WITNESS_LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Packed per-core busy-percent bytes of the last emitted line (`c0 | c1<<8 | .. | c7<<56`), for
+/// change-only suppression — a steady-state system stops re-printing an unchanged load line.
+///
+/// SMPINSTR — the "nothing emitted yet" seed is `0xC8` in every byte, not `u64::MAX`. A byte is a
+/// percent (0..=100) or one of two reserved sentinels (255 untracked, 254 tracked-but-not-folding),
+/// so 200 is unreachable and cannot be mistaken for a real reading. `u64::MAX` was safe only while
+/// the packer covered 4 cores and the top four bytes were structurally 0; with `NUM_CPUS == 8` on
+/// tegra an all-cores-untracked machine packs to exactly `u64::MAX`, which would have compared equal
+/// to the seed and suppressed the FIRST line — silencing the witness on precisely the machine whose
+/// every core is unaccounted. The seed must be a value the packer cannot produce.
+static LOAD_WITNESS_LAST: AtomicU64 = AtomicU64::new(0xC8C8_C8C8_C8C8_C8C8);
 /// `ctx_switches` sum snapshot at the last emission, to derive the per-window context-switch delta.
 static LOAD_WITNESS_CTX: AtomicU64 = AtomicU64::new(0);
+/// SMPINSTR — CNTPCT deadline for the cooperative-terminus poll (`load_witness_poll`); the tegra/virt
+/// rate limit, in the shape `EL0_ROLLUP_NEXT` established for the same drive loop.
+static LOAD_POLL_NEXT: AtomicU64 = AtomicU64::new(0);
 
 /// PULSE-5 — count of load windows closed by a FOLD (`account` reaching the budget at a dispatch
 /// boundary). It is the denominator of the arc's claim: reads are no longer waiting on these. Bumped
@@ -8126,6 +8261,81 @@ fn cyc_to_ms(cyc: u64) -> u64 {
     cyc / (frq / 1000).max(1)
 }
 
+/// SMPINSTR — one core's load reading taken at a single instant, so the change-signature and the
+/// printed line are computed from the SAME sample rather than from two `core_load` calls a few
+/// microseconds apart. Three fields only: the derived percent, the boolean that qualifies it, and
+/// the RAW fold age that neither of the first two exposes.
+#[derive(Clone, Copy)]
+struct CoreSnap {
+    pct: u32,
+    tracked: bool,
+    fold_age: u64,
+}
+
+/// SMPINSTR — render the per-core columns of the `:: SCHED: load ::` line.
+///
+/// TWO defects are fixed here, both of which made this witness lie about the exact condition it
+/// exists to expose.
+///
+///   1. **Half the machine had no column.** The format string hard-coded `c0..c3` while `NUM_CPUS`
+///      is 8 on tegra, so cores 4..7 were invisible: a wedge, a never-started core and a saturated
+///      core up there all printed identically, i.e. not at all. The columns are now derived from
+///      `NUM_CPUS`, so the line's width IS the array bound it reads. On the Orin that is 8 columns
+///      for a part whose DTB `/cpus` names 6 (see `percpu::METER_CPU_COUNT`); the two surplus slots
+///      report `--/f=never-folded`, which is the honest reading for an accounting slot no core ever
+///      touched, and is deliberately preferred to hiding them — a slot that is silently not printed
+///      cannot be distinguished from one that is printed and dead.
+///
+///   2. **A wedged core read `busy=100% tracked=true` forever.** `run_t0` is stamped at dispatch and
+///      cleared only by `account()`, which a core that never returns from its task never reaches, so
+///      `CoreAccount::tracked()`'s unconditional `run_t0` arm keeps answering yes and
+///      `busy_pct()`'s case 1 keeps answering 100 — for the rest of the boot. The one state this
+///      instrument exists to expose was byte-for-byte identical to a healthy busy core.
+///
+/// So every column carries its raw word and a staleness tell, never a derived value alone:
+///
+/// ```text
+///   c0=7%/f=2ms          derived 7%, last folded 2 ms ago — busy AND going round the dispatch loop
+///   c3=100%/f=12040ms!NOFOLD   derived 100%, has not folded in 12 s — the corpse reading
+///   c5=--/f=830ms        untracked: no live number offered, and how stale is said out loud
+///   c7=--/f=never-folded this accounting slot has never been folded at all
+/// ```
+///
+/// `f=` is `CoreLoad::fold_age_cyc`, the RAW measurement under both `tracked()` and this tell, in
+/// ms against the same cached CNTFRQ every other witness ms is expressed in (`cyc_to_ms`).
+/// `!NOFOLD` fires exactly when `tracked` is true while the fold age has reached
+/// `fold_stale_cyc()` — that is, precisely when the freshness claim came from the `run_t0` arm and
+/// from nothing else. It is a NAME for a condition, never an assertion: a genuinely compute-bound
+/// core holding one task for 12 s prints it too, and correctly, because from outside the core those
+/// two states are not distinguishable and claiming otherwise would be the same lie in a new place.
+/// What the reader gets is the raw span to judge against, and `[pulse5]`/`[spin1]` beside it name
+/// the task. Reads only, allocation is one `String`, and it is reached only on a window that
+/// actually prints.
+fn load_columns(snap: &[CoreSnap; NUM_CPUS]) -> alloc::string::String {
+    use core::fmt::Write as _;
+    let stale = fold_stale_cyc();
+    let mut s = alloc::string::String::new();
+    for (i, c) in snap.iter().enumerate() {
+        if c.tracked {
+            let _ = write!(s, "c{}={}%", i, c.pct);
+        } else {
+            // SCHED-8: an untracked core prints `--` (no live number) rather than its frozen
+            // last-window percent.
+            let _ = write!(s, "c{}=--", i);
+        }
+        if c.fold_age == u64::MAX {
+            let _ = write!(s, "/f=never-folded");
+        } else {
+            let _ = write!(s, "/f={}ms", cyc_to_ms(c.fold_age));
+        }
+        if c.tracked && c.fold_age >= stale {
+            let _ = write!(s, "!NOFOLD");
+        }
+        let _ = write!(s, " ");
+    }
+    s
+}
+
 /// SCHED-2 periodic load heartbeat: called once per `timer_preempt` (per core, per tick, metal-only).
 /// The core whose atomic increment lands exactly on the `LOAD_WITNESS_INTERVAL` boundary is the sole
 /// emitter for that window (fetch_add hands each multiple to exactly one core), so there is no
@@ -8142,36 +8352,111 @@ fn load_witness_tick() {
     // liveness census on load movement would mute it exactly when it is the only line worth having.
     // It carries its own (liveness-shaped) suppression instead; see `el0live_tick`.
     el0live_tick();
+    if !load_witness_emit() {
+        return; // unchanged since the last window — stay quiet
+    }
+    spread4_witness(); // SPREAD-4: the placement signal beside the load it is derived from
+    prio_witness(); // SCHED-PRIO: who WON those dispatches, beside where they were placed
+}
+
+/// SMPINSTR — the `:: SCHED: load ::` line's EMISSION PATH ON THE ONLY LOOP THE ORIN RUNS.
+///
+/// WHY THIS EXISTS AT ALL. `load_witness_tick` above has exactly one caller, `timer_preempt`, and
+/// `timer_preempt` returns at its first line unless `SCHED_ACTIVE` is set. On aarch64 `SCHED_ACTIVE`
+/// has exactly ONE setter — `start_aps` — whose only call site is `main.rs`'s
+/// `#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]` block. `baremetal` implies `pi`, and
+/// `pi` + `tegra` is a hard `compile_error!` in `arch/aarch64/serial.rs`. So on the Orin
+/// `SCHED_ACTIVE` is false for the whole boot, `timer_preempt` no-ops on every tick, and the load
+/// witness — the `[pulse5]` live-span line and the `[spin1]` wedge namer with it — HAS NEVER EMITTED
+/// A SINGLE LINE ON THIS BOARD. Making the formatter honest without this would have shipped an
+/// honest formatter behind a dead trigger, which is an absent instrument with better comments.
+///
+/// WHERE IT IS CALLED FROM, AND WHY. `run_capstone_boot_core`'s drive loop —
+/// `loop { while dispatch_next(cpu) { .. } spin_loop(); }` — is the tegra terminus and the only place
+/// on that board where dispatch happens at all. The poll goes INSIDE the inner `while`, beside
+/// `el0_refusal_rollup`, for the reason that call site already records: `main.rs` stages
+/// `jd2_console_pump` (infinite, cooperatively yielding), so on tegra the inner loop never returns and
+/// anything wired after it is runtime-dead. One unconditional baseline call precedes the loop, so a
+/// capture always carries a first reading to diff against.
+///
+/// NOT FEATURE-GATED, deliberately. `run_capstone_boot_core` is reached by tegra AND by `virt` (the
+/// `test-arm` battery) and NEVER by pi, which dispatches through `run`/`run_bsp` — so the call site
+/// alone scopes this exactly, and the QEMU battery EXECUTES the new formatter instead of merely
+/// compiling it. (`el0_refusal_rollup`'s extra `cfg!` guard answers a question that does not arise
+/// here: its counter cannot be incremented on virt, so its zero would be false. Load accounting on
+/// virt is real — `dispatch_next` folds every pass — so the reading is true wherever it prints.)
+///
+/// THE POLL IS THE LOOP, not an observer of it. If the drive loop dies, these lines stop, and their
+/// stopping is the measurement — the same property `orin_click_census` is built around. No instrument
+/// here claims liveness on behalf of a core it is not running on.
+///
+/// COST ON THE DISPATCH PATH: one CNTPCT read and one compare per pass, everything else behind the
+/// ~1 s rate limit and then behind the change-only suppression inside `load_witness_emit`.
+fn load_witness_poll() {
+    let now = timer::cntpct();
+    if now < LOAD_POLL_NEXT.load(Ordering::Relaxed) {
+        return; // rate limit — at most one sample per second off the dispatch loop
+    }
+    // CNTFRQ reads 31.25 MHz on Orin silicon; a firmware that leaves it 0 (timer.rs's CNTFRQ-SUB
+    // case) would make the interval zero and disable the rate limit, so the same substitute
+    // `el0_refusal_rollup` uses is applied here rather than dividing by a fabricated rate.
+    let freq = timer::cntfrq();
+    LOAD_POLL_NEXT.store(now + if freq == 0 { 62_500_000 } else { freq }, Ordering::Relaxed);
+    let _ = load_witness_emit();
+}
+
+/// SMPINSTR — take ONE snapshot of every core's accounting slot, decide whether it differs from the
+/// last emitted line, and if so print the load line plus its raw-staleness partner `[pulse5]`.
+/// Returns whether it printed, so the tick path can keep its "suppressed ⇒ the whole train stays
+/// quiet" behaviour byte-for-byte.
+///
+/// The snapshot is taken ONCE and reused for the change-signature, the wedge mask and the printed
+/// columns. The pre-SMPINSTR code read `core_load` once for the signature and AGAIN inside the
+/// printing closure, so the suppression decision and the printed line described two different
+/// instants — a core could fold, or go stale, between them, and the line would then contradict the
+/// signature that admitted it.
+fn load_witness_emit() -> bool {
+    let stale = fold_stale_cyc();
+    let mut snap = [CoreSnap { pct: 0, tracked: false, fold_age: u64::MAX }; NUM_CPUS];
     let mut packed = 0u64;
+    let mut nofold = 0u64;
     let mut ctx_now = 0u64;
     for cpu in 0..NUM_CPUS.min(8) {
         let ld = core_load(cpu);
+        // SMPINSTR: tracked, but the freshness claim is NOT backed by a fold — `tracked()` said yes
+        // only through its unconditional `run_t0` arm (see there). This is the dead-core signature.
+        let wedged = ld.tracked && ld.fold_age_cyc >= stale;
+        snap[cpu] = CoreSnap { pct: ld.busy_pct_recent, tracked: ld.tracked, fold_age: ld.fold_age_cyc };
         // SCHED-8: pack 255 for an untracked (stale/never-run) core so a tracked→untracked transition
         // changes the signature and re-emits the line; real percents are 0..100 so 255 never collides.
-        let byte = if ld.tracked { ld.busy_pct_recent.min(254) as u64 } else { 255 };
+        // SMPINSTR: 254 is the second reserved sentinel — tracked-but-NOT-FOLDING. It exists because
+        // a wedged core's percent is CONSTANT (100%) by construction, so without it the onset of a
+        // wedge changes no byte, the change-only suppression swallows the line, and the one event
+        // this witness exists to announce is the one it goes quiet for. Percents are 0..=100, so
+        // neither sentinel can collide with a real reading.
+        let byte = if !ld.tracked {
+            255
+        } else if wedged {
+            nofold |= 1u64 << cpu;
+            254
+        } else {
+            ld.busy_pct_recent.min(253) as u64
+        };
         packed |= byte << (cpu * 8);
         ctx_now += ld.ctx_switches;
     }
     if packed == LOAD_WITNESS_LAST.swap(packed, Ordering::Relaxed) {
-        return; // unchanged since the last window — stay quiet
+        return false; // unchanged since the last window — stay quiet
     }
     let ctx_delta = ctx_now.saturating_sub(LOAD_WITNESS_CTX.swap(ctx_now, Ordering::Relaxed));
-    // SCHED-8: an untracked core prints `--` (no live number) rather than its frozen last-window percent.
-    let c = |i: usize| {
-        let ld = core_load(i);
-        if ld.tracked {
-            alloc::format!("{}%", ld.busy_pct_recent)
-        } else {
-            alloc::string::String::from("--")
-        }
-    };
     serial_println!(
-        ":: SCHED: load c0={} c1={} c2={} c3={} (ctx +{}/win) ::",
-        c(0), c(1), c(2), c(3), ctx_delta
+        ":: SCHED: load {}(ctx +{}/win nofold={:#x}) ::",
+        load_columns(&snap),
+        ctx_delta,
+        nofold,
     );
     pulse5_witness();
-    spread4_witness(); // SPREAD-4: the placement signal beside the load it is derived from
-    prio_witness(); // SCHED-PRIO: who WON those dispatches, beside where they were placed
+    true
 }
 
 /// PULSE-5 — the proof line for age-on-read. It says three things and nothing else: how long each
@@ -8190,8 +8475,11 @@ fn load_witness_tick() {
 /// storm verb's launch boundaries, from task context, so a fleet capture reads this line at the
 /// instant the fleet changes size rather than at the timer's). Reads only; safe from any core.
 fn pulse5_witness() {
-    let mut live_ms = [0u64; 4];
-    for cpu in 0..NUM_CPUS.min(4) {
+    // SMPINSTR: `NUM_CPUS`, not a hard-coded 4. On tegra the old bound made this line — and, worse,
+    // `span_max`, the arc's own headline number — blind to cores 4..7 entirely: a task holding core
+    // 5 for a minute contributed nothing to the high-water mark and had no column to appear in.
+    let mut live_ms = [0u64; NUM_CPUS];
+    for cpu in 0..NUM_CPUS {
         let span = ACCT[cpu].live_span_cyc();
         PULSE5_SPAN_MAX_CYC.fetch_max(span, Ordering::Relaxed);
         live_ms[cpu] = cyc_to_ms(span);
@@ -8201,7 +8489,9 @@ fn pulse5_witness() {
     // — and until now the line never NAMED the task. Cross-CPU current read: the pointer load is
     // atomic; deref is safe in practice because a task that has been current for 10 s is
     // definitionally not mid-drop. Prints every witness pass while the condition holds.
-    for cpu in 0..NUM_CPUS.min(4) {
+    // SMPINSTR: swept over `NUM_CPUS`, not 4 — a core in the upper half is exactly as capable of
+    // owning one task forever, and this is the only line that NAMES the task when it does.
+    for cpu in 0..NUM_CPUS {
         if cyc_to_ms(ACCT[cpu].live_span_cyc()) > 10_000 {
             let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
             if !raw.is_null() {
@@ -8246,8 +8536,16 @@ fn pulse5_witness() {
         }
     }
     serial_println!(
-        "[pulse5] live c0={}ms c1={}ms c2={}ms c3={}ms span_max={}ms window={}ms folds={}",
-        live_ms[0], live_ms[1], live_ms[2], live_ms[3],
+        "[pulse5] live {}span_max={}ms window={}ms folds={}",
+        {
+            // SMPINSTR: one column per accounting slot, derived from `NUM_CPUS`.
+            use core::fmt::Write as _;
+            let mut s = alloc::string::String::new();
+            for (cpu, ms) in live_ms.iter().enumerate() {
+                let _ = write!(s, "c{}={}ms ", cpu, ms);
+            }
+            s
+        },
         cyc_to_ms(PULSE5_SPAN_MAX_CYC.load(Ordering::Relaxed)),
         cyc_to_ms(load_window_cyc()),
         PULSE5_FOLD_WINDOWS.load(Ordering::Relaxed),
@@ -9829,11 +10127,18 @@ pub fn run_capstone_boot_core(cpu: usize) -> ! {
     // linked and reached on THIS platform. See `el0_refusal_rollup` for why the in-loop poll below sits
     // inside the inner `while` and not after it (the inner loop never returns on tegra).
     el0_refusal_rollup();
+    // SMPINSTR — the load witness's BASELINE emit on this terminus, and the reason it exists at all:
+    // `load_witness_tick`'s only driver is `timer_preempt`, which no-ops until `SCHED_ACTIVE`, which
+    // only `start_aps` sets, which only the `baremetal`(⇒`pi`) boot calls — so on tegra the load /
+    // `[pulse5]` / `[spin1]` train has never printed a line. Same placement argument as
+    // `el0_refusal_rollup` directly above: baseline before the loop, poll inside the INNER `while`
+    // (the outer one is runtime-dead on tegra, where the queue never drains). See `load_witness_poll`.
+    let _ = load_witness_emit();
     // Cooperative dispatch loop: drain the run queue, then busy-poll (never WFI). `dispatch_next` returns
     // false only once the queue drains — after CAPSTONE has fully completed — at which point the core just
     // idle-spins (a headless regression captures the log within its timeout).
     loop {
-        while dispatch_next(cpu) { el0_refusal_rollup(); }
+        while dispatch_next(cpu) { el0_refusal_rollup(); load_witness_poll(); }
         core::hint::spin_loop();
     }
 }
@@ -9935,7 +10240,7 @@ fn capstone_queue_pre_staged(cpu: usize) -> bool {
 //
 // `ctx_sp` below the task's own low bound is the U7STK signature exactly — this task's frame chain,
 // not a neighbour writing into it. The corroborating measurement is already on the same wire: the
-// `[u7stk] at=after:pidesk_arm` probe reports `hw=16496` for `u7-launch`, i.e. the desktop-arming
+// `[u7stk] at=after:desktop_firmware_arm` probe reports `hw=16496` for `u7-launch`, i.e. the desktop-arming
 // subtree ALONE carries a high-water 112 bytes past 16 KiB, while the render task overflowed its own
 // 16 KiB by 96..128. Same cascade, same order of depth, same cure.
 //
@@ -10001,3 +10306,250 @@ pub fn spawn_prio_stack(
 // one extra victim. Closing it properly means a REDZONE (an unpoisoned guard span below each stack
 // whose first touch is the fault) rather than a wider bounds test here, since by the time this code
 // runs the neighbour's frame is already gone. Not this arc's; recorded so the shape is known.
+
+/// BGSPREAD — per-core snapshot of `pick_cpu`'s PRIMARY key (`el0_active`: committed minus parked
+/// runnable EL0 residents) for the placement witness; `usize::MAX` for an offline or out-of-range
+/// core, so a min-scan over `0..NUM_CPUS` naturally ignores non-candidates. Introspection only —
+/// never consulted on a scheduling path (the `core_load` discipline). Its only caller is the
+/// `witness`-gated fixture battery, and the fn itself is `witness`-gated too: measured (BGSPREAD
+/// byte-identity control), even an UNREFERENCED pub item here perturbs the knob-off image's code
+/// layout, so the knob-off build must not contain the item at all. Appended at the END of this
+/// file deliberately, so no knob-off panic `Location` line number shifts.
+#[cfg(feature = "witness")]
+pub fn el0_active_snapshot(cpu: usize) -> usize {
+    if cpu >= NUM_CPUS || !ONLINE_MASK[cpu].load(Ordering::Acquire) {
+        return usize::MAX;
+    }
+    el0_active(cpu)
+}
+
+// ── ORIN-BSPRUN (Candidate B arc 2) — the boot core joins `run()` ───────────────────────────────
+//
+// Appended at the END of this file deliberately (the el0_active_snapshot / SHELLUP convention): the
+// whole block is `all(tegra, bsprun)`-gated, so the knob-off image contains none of it and no
+// knob-off panic `Location` line number shifts. Peter's 2026-08-25 highest-performance ruling,
+// arc 2 of Candidate B (`~/.claude/plans/unaos/review/orin-smp-redesign.md`): arc 1 (ORIN-BSPTICK,
+// 72d3d36e) gave the post-JM6 boot core a standing periodic EL1 clock; this arc makes the clock
+// mean something. `UNAOS_BSPRUN=1` swaps the tegra terminus from `run_capstone_boot_core(0)` (the
+// cooperative, never-preempted drive loop) to `run_bsp_tegra(0)` below, which sets `SCHED_ACTIVE`
+// — the first tegra setter this flag has ever had (its only other aarch64 setter is the Pi-only
+// `start_aps`) — and enters `run_bsp` -> `mark_online(0)` -> `run()`. What core 0 gains, from the
+// design doc's F3/F4 ledger: `drain_due_sleepers` (a task that sleeps on core 0 is no longer
+// parked forever — sched.rs's own ":3080" complaint), `try_steal`, the idle fold, membership in
+// `ONLINE_MASK` (a legal `CPU_AUTO`/steal target for the first time), and — through `SCHED_ACTIVE`
+// + the gic.rs post-EOI arm — `timer_preempt` and with it the `:: SCHED: load ::` / `[pulse5]` /
+// `[spin1]` witness train, which has NEVER emitted on this board (`load_witness_tick`'s only
+// caller is `timer_preempt`, which no-ops until `SCHED_ACTIVE`).
+//
+// KNOB RULE — `bsprun` REQUIRES `bsptick`, enforced twice. `timer_preempt` only ever runs from the
+// timer IRQ, so preemption without the ORIN-BSPTICK periodic EL1 tick is a flag with no clock:
+// `SCHED_ACTIVE` true, zero preemptions, zero witness lines — a config that can only produce false
+// confidence. And `run()`'s sleeper drain runs once per loop pass, so on a transiently-empty queue
+// the pass rate (and the worst-case sleeper wake latency) is set by the tick breaking `hlt()`.
+// (On this board `hlt()` poll-spins rather than WFIs — `LIVE` is false post-JM6 and the boot core
+// has no `local_tick` stamp — so the queue-empty case stays live even tickless, but the honest
+// cadence argument is the tick's.) arroyo's knob mapping therefore folds `bsptick` in with
+// `bsprun` (UNAOS_BSPRUN=1 arms BOTH), and the `compile_error!` below makes a hand-rolled
+// `--features bsprun` without `bsptick` unbuildable rather than silently inert. The converse is
+// unconstrained: `bsptick` without `bsprun` is exactly arc 1 — tick, `on_tick` bookkeeping, no
+// preemption, terminus cooperative.
+//
+// WHAT PREEMPTION CAN NOW INTERRUPT THAT IT NEVER COULD (the JB-CAPSTONE-GUARD accounting): the
+// tegra queue is already non-empty at the terminus — `jd2_console_pump` (xHCI poll, panel,
+// console, shell dispatch, click routing) is staged and infinite, plus the `tegra_el0` pair when
+// armed — so the swap turns tasks that have only ever run cooperatively into preemptible ones.
+// A quantum expiry can now land anywhere the pump runs IRQ-unmasked: mid xHCI event drain, mid
+// console repaint, mid shell command. Why that is sound, hazard by hazard: **serial** — `_print`
+// masks IRQs around the port lock (a print can't be preempted mid-hold; IRQ-context prints are
+// try_lock + staging, the ORIN-BSPTICK derivation); **run queues** — every rq section is
+// IRQ-masked (WEDGE-4 `rq` law), and `timer_preempt` carries the `IN_RQ_SECTION` tripwire;
+// **EL0** — the 0x480 lower-EL vector routes to the same runtime-banked `__vec_irq`, and quantum
+// preemption of EL0 tasks through it is the Pi's metal-proven path; **video/WM locks** — the pump
+// can now be preempted while holding one, but on this terminus every other core-0 task
+// (`el0-hello`, `tegra-el0-verdict`, CAPSTONE — see below) touches no video state, so there is no
+// contender to deadlock with today; the arc that adds a second video-touching task to core 0 must
+// re-derive this. **APs** — the five EL2 secondaries reach the same gic.rs dispatch ~1250x/s; the
+// IRQEL-CORE audit of the armed `timer_preempt` call is in gic.rs at the call site.
+//
+// WHAT THE ARMED TERMINUS GIVES UP, stated rather than discovered: `run_bsp_tegra` bypasses
+// `run_capstone_boot_core`, so an armed boot spawns NO CAPSTONE (on tegra it only ever ran
+// interleaved with the pre-staged pump — JB-CAPSTONE-GUARD's history), and skips the cooperative
+// terminus's baseline emits (`parked_display_witness`, `sched_bal_witness`, the in-loop
+// `el0_refusal_rollup`/`load_witness_poll` pair). The two baselines that prove reader linkage are
+// re-emitted below before `run()` entry; the in-loop polls are superseded by the real timer-driven
+// train this arc turns on. Knob-off, every one of those lines is byte-identical untouched.
+
+/// ORIN-BSPRUN terminus: set `SCHED_ACTIVE` (turning on `timer_preempt` + the load witness train),
+/// then enter the full scheduler as `run_bsp` -> `mark_online(0)` -> `run()`. Called ONCE from
+/// `tegra_early_stop`'s terminus line in place of `run_capstone_boot_core(0)`; never returns.
+/// The banner prints BEFORE the `SCHED_ACTIVE` store, so it cannot itself be the first preempted
+/// print; the two baseline emits sit between banner and store for the same reason.
+#[cfg(all(feature = "tegra", feature = "bsprun"))]
+pub fn run_bsp_tegra(cpu: usize) -> ! {
+    serial_println!(
+        ":: [orinbsprun] boot core {} joins run() — SCHED_ACTIVE=true, mark_online({}), preemptive terminus (clock: ORIN-BSPTICK); sleeper drain + steal + idle fold + the SCHED load/[pulse5]/[spin1] train are live on tegra for the first time ::",
+        cpu, cpu
+    );
+    // Baseline emits (the EL0-EL1CORE / SMPINSTR "prove the reader is linked and reached" rule),
+    // re-homed from the cooperative terminus this fn replaces. Un-preempted by construction: the
+    // SCHED_ACTIVE store below has not happened yet.
+    el0_refusal_rollup();
+    let _ = load_witness_emit();
+    SCHED_ACTIVE.store(true, Ordering::Release);
+    run_bsp(cpu)
+}
+
+/// ORIN-BSPRUN knob-rule backstop (see the block comment): `bsprun` without `bsptick` is
+/// preemption without a clock — `SCHED_ACTIVE` true and `timer_preempt` never called. arroyo's
+/// mapping always arms both; this makes a hand-rolled feature list that splits them unbuildable.
+#[cfg(all(feature = "bsprun", not(feature = "bsptick")))]
+compile_error!(
+    "ORIN-BSPRUN requires ORIN-BSPTICK: `bsprun` without `bsptick` sets SCHED_ACTIVE with no EL1 periodic tick to drive timer_preempt — arm via UNAOS_BSPRUN=1 (arroyo folds bsptick in), or add `bsptick` to the feature list."
+);
+
+// ── ORIN-SUPSOUND — the re-derivation ORIN-BSPRUN's own comment demanded ─────────────────────────
+//
+// The hazard block above ends with a condition, not a conclusion: *"on this terminus every other
+// core-0 task (`el0-hello`, `tegra-el0-verdict`, CAPSTONE) touches no video state, so there is no
+// contender to deadlock with today; the arc that adds a second video-touching task to core 0 must
+// re-derive this."* ORIN-SUPSTATE is that arc. It spawns TWO new core-0 tasks that touch video
+// state — `jd2-present` and `jd2-dispatch` (main.rs, `jd2_supstate_phase2`) — so BSPRUN's premise
+// is falsified and the argument has to be rebuilt rather than inherited. This block is that
+// rebuild, kept beside the argument it replaces so the next reader finds both. Appended at the file
+// tail behind no `#[cfg]` because it is comment only: not one byte of any image moves.
+//
+// **VERDICT: SOUND.** Not "sound-if", not "sound in QEMU": the wedge these two arcs are each afraid
+// of cannot form on this tree, and the residual is a QUANTITY (contention rate), not a property.
+// The reasoning is below, by lock, with the counter-example each step would need in order to fail.
+//
+// ── 0. FIRST, A CORRECTION TO THE CITATION THIS RE-DERIVATION WAS ASKED FOR ──────────────────────
+//
+// The bare `crate::video::WRITER.lock()` at `pal.rs:565` — cited as the presenter's exposure — is
+// inside `pal::cursor::track_routed`, which carries `#[cfg(target_arch = "x86_64")]`. It is not
+// compiled on this board and neither SUPSTATE role can reach it. The real chain is four frames
+// deeper and does not belong to SUPSTATE at all:
+//
+//     main.rs jd2_supstate_presenter -> pal.render()
+//       -> pal.rs:2161      TargetPal::render        -> self.surface.flush()
+//       -> screen.rs:1001   Screen::flush            -> wm::repaint() / wm::service_damage()
+//       -> wm.rs:3080/3471                           -> wm::composite()
+//       -> wm.rs:4232/4787  composite/composite_inner-> `let fb = *super::WRITER.lock();`
+//                                                       (wm.rs:4865, 4930, 4986, 5169)
+//
+// and, on `Screen::flush`'s cursor bracket, `video::cursor::undraw()`/`repaint()` — which take the
+// panel through `super::panel_snapshot()` (cursor.rs:1828, 2772), i.e. through LOCKFIX's own door
+// already. **The decisive fact: the LEGACY monolithic pump reaches the identical chain.** Its
+// phase-2 loop runs the same `cursor::restore` / `move_rel` / `draw_over` / `pal.render()` sequence
+// at main.rs:2949-2970. ORIN-SUPSTATE moves that code between task identities; it introduces NO new
+// `WRITER` acquisition anywhere. Whatever exposure the panel lock carries on this board is
+// ORIN-BSPRUN's alone and predates SUPSTATE by every commit in the arc.
+//
+// ── 1. WHAT PREEMPTION ACTUALLY DOES TO A HELD LOCK ──────────────────────────────────────────────
+//
+// `timer_preempt` (this file, ~:5071) does not abandon the incumbent: past the quantum countdown it
+// stores `STATE_READY` and `switch_context`s to the scheduler, which REQUEUES the task. A holder
+// caught off-CPU mid-hold is therefore a task that WILL be re-dispatched, on the next pass through
+// `run()`. So the only question a preempted holder raises is how long the machine burns before it
+// runs again — never whether it runs again.
+//
+// The failure that is NOT bounded is LOCKFIX's, stated once in `video/mod.rs` under `WRITER`: *"a
+// raw panel lock ... may not be blocked on from a context that cannot be preempted."* A MASKED
+// waiter can take no timer interrupt, so it can never be preempted off the core the holder needs;
+// holder and waiter are then permanently interlocked on one core. That is boot 8. It needs BOTH
+// halves — a preemptible holder AND a masked blocking waiter behind it.
+//
+// **The second half has no supplier in this tree, and that is measured rather than argued.** Of the
+// 86 blocking `WRITER.lock()` sites and 7 `try_lock` sites, a scan of the 25 source lines preceding
+// every one of the 86 finds not one inside an `IrqMask::new()` or `without_interrupts(` scope. Both
+// helpers that DO acquire the panel while masked — `panel_info_nonblocking` (video/mod.rs:214) and
+// `panel_snapshot`'s masked arm (video/mod.rs:239) — are `try_lock` and degrade instead of waiting.
+// And no tegra IRQ handler reaches `WRITER` at all: on this board the console is not routed through
+// `wm` (`fbcon`'s route is `all(x86_64, wc)` or `all(aarch64, desktop_firmware)`, and neither is armed here),
+// so the IRQ-context printer's panel path does not exist. A masked spinner on `WRITER` would be a
+// NEW defect someone had to write; none is present.
+//
+// What remains is an unmasked waiter spinning on a preempted holder. Its quantum expires
+// (`QUANTUM_TICKS = 3` at ~4 ms/tick, this file :196 / :4185), `timer_preempt` requeues it, the
+// holder is re-dispatched, the lock is released. **Bounded: ~12 ms of wasted core per contention.**
+// The sibling executor's guess — "the bare-lock spin gets broken by the quantum and degrades to a
+// spin-storm rather than a livelock" — is CONFIRMED in its conclusion. Its mechanism is only half
+// the story, though: the quantum breaking the spin is what bounds the cost, but what makes the
+// LIVELOCK impossible is the separate, stronger fact that the unbreakable (masked) spin has no call
+// site. `preempt=` and `surfwait=` on the `[suppresent]` census are what put the cost on the wire.
+//
+// ── 2. LOCK BY LOCK, EVERY MUTEX THE TWO NEW TASKS CAN REACH ─────────────────────────────────────
+//
+// * `wm::TABLE` — SAFE BY CONSTRUCTION, and it was already built for this. `fn table()`
+//   (wm.rs:440) masks BEFORE the acquire and, by struct-field declaration order, releases the lock
+//   BEFORE restoring the mask. It is the ONLY acquisition path (the module documents the grep and
+//   it still holds: one `TABLE.lock()` at wm.rs:444, plus two `try_lock` sites at :3313 and :23293
+//   that never block). So no TABLE holder is ever preemptible: the masked blocking acquire can
+//   never meet a preempted holder on its own core. WEDGE-7 wrote this rule for a preemptible world
+//   that x86 already had; ORIN-BSPRUN is aarch64 arriving in it.
+// * `pal::cursor::POS` — SAFE, by POSFIX's mask-everywhere rule (pal.rs:196-224, both takers inside
+//   `without_interrupts`, both critical sections constant-time). Same property as TABLE.
+// * `video::cursor::SPRITE_FREE` / `OVERLAY_FREE` — SAFE. Every claim is masked and NON-BLOCKING
+//   (`claim`, `claim_bounded` — which refuses outright when `arch::irqs_masked()`, cursor.rs:405 —
+//   `overlay_claim`). A refusal takes `owe_repaint`, never a wait.
+// * `pal::cursor::SAVED` and `screen::PRESENT_RECTS` — the only two locks the presenter and the
+//   dispatcher can genuinely contend, and the only ones where preemption changes anything. Both are
+//   bare, unmasked, short (a bounded pixel loop; an 8-entry rect scan), and — the load-bearing
+//   part — EVERY taker is unmasked. A preempted holder therefore meets only unmasked spinners, and
+//   §1's bound applies. This is the whole of the newly-created hazard, and it is a cost, not a wedge.
+// * `SUP_SURFACE` / `SUP_KEYQ` / `SUP_FRAMES` — `try_lock` + `yield_now` at every acquisition
+//   (display_tegra.rs `sup_lock`, `sup_with_surface`, `sup_install`). Never a spin at all.
+//
+// ── 3. ORDERING: NO CYCLE, AND THE CLAIM IS CHECKED RATHER THAN ASSERTED ─────────────────────────
+//
+// SUPSTATE declares `SURFACE -> WRITER -> TABLE` and says nothing holding WRITER or TABLE ever
+// takes SURFACE. That is checkable, because SURFACE is private to one module and reached only
+// through six `pub fn`s: `grep -rn 'sup_with_surface\|sup_install\|sup_key_\|sup_frame_'` over the
+// kernel returns display_tegra.rs itself and the three role bodies in main.rs, and nothing else in
+// the tree. No `WRITER`-holding or `TABLE`-holding path can call one. The order is acyclic, and
+// ORIN-BSPRUN adds no edge to it — preemption reorders execution, it does not create acquisitions.
+//
+// ── 4. THE DIRECTION NOBODY EXPECTED: BSPRUN MAKES SUPSTATE SAFER, NOT RISKIER ────────────────────
+//
+// SUPSTATE's module header states its own precondition as plainly as BSPRUN's does: *"Core 0 has NO
+// preemption (F4), so a bare `lock()` spin against a holder that yielded would be a LIVELOCK."*
+// That is a statement about a COOPERATIVE core, and ORIN-BSPRUN falsifies it in the safe direction.
+// Two consequences, both in SUPSTATE's favour:
+//   * the `try_lock`+`yield_now` discipline SUPSTATE describes as "defence, not load-bearing"
+//     remains defence — the thing it was defending against is the failure BSPRUN removes;
+//   * BSPRUN's `drain_due_sleepers` on core 0 retires a livelock SUPSTATE ALONE could not survive:
+//     a lock holder that blocks on this core was parked forever pre-BSPRUN (sched.rs's own ":3080"
+//     complaint), so any bare-lock waiter behind it waited forever too. Under BSPRUN the sleeper
+//     wakes and the waiter is released.
+// So the two arcs' preconditions each falsify the other's, and the resolution is not symmetric: the
+// combination is strictly better than SUPSTATE alone. A flight that arms SUPSTATE WITHOUT BSPRUN is
+// the weaker configuration, and the census says which one flew (`preempt=+0` means cooperative).
+//
+// ── 5. WHAT THIS DERIVATION DOES *NOT* DISPOSE OF — WHO MAY PAINT ────────────────────────────────
+//
+// Everything above is a LIVENESS argument. `WRITER` guards the framebuffer HANDLE and nothing more:
+// `FrameBuffer` is `Copy`, and both `*WRITER.lock()` and `panel_snapshot()` copy the handle and drop
+// the guard on the spot, so from that instant the pixels are written UNSERIALISED. Routing an
+// acquisition through LOCKFIX's doors closes the wedge; it grants no exclusion. "Who may paint" is a
+// separate mechanism at a higher layer, and it is a CORRECTNESS question (torn pixels), not a
+// deadlock one.
+//
+// On this board that mechanism exists and ORIN-SUPSTATE is what built it: **`SUP_SURFACE` is the
+// paint token.** Every `TargetPal` in the armed roles is constructed INSIDE a `sup_with_surface`
+// closure (main.rs: the dispatcher's and the presenter's, and they are the only two after the lift),
+// and the lock is held across the whole paint *including* `pal.render()` — including, by the arc's
+// one deliberate exception, across `handle_key`'s full-screen commands. Presenter and dispatcher
+// therefore cannot paint concurrently, with each other or with the input source, under preemption or
+// without it. That is STRICTLY STRONGER than what the legacy pump had, which was exclusion by stack
+// locality — a property no mutex enforced and no successor could inherit. Painters outside the token
+// (the compositor's own window blits, EL0 tenants through the present seam) are ordered by the
+// pre-existing `wm` layering, which this arc does not touch.
+//
+// ── 6. THE RESIDUAL, AND WHAT METAL MUST PRINT TO CLOSE IT ───────────────────────────────────────
+//
+// UNDECIDABLE WITHOUT METAL, and it is a quantity: **how often the newly-possible contention on
+// `SAVED`/`PRESENT_RECTS` actually happens, and what it costs.** QEMU models no Tegra234 and
+// delivers no HID, so the presenter's board is empty there and the contention rate is structurally
+// zero on every gate this tree can run. The three numbers that decide it are on the `[suppresent]`
+// census: `preempt=` (is preemption even armed), `surfwait=`/`seamwait=` (did a role ever have to
+// give the core back), and `pass=`/`flush=` (did the presenter keep up). A flight reading
+// `preempt=+0` has tested the cooperative core only and decides nothing about this section.

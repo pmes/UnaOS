@@ -2232,7 +2232,7 @@ recorder's gate passes and the derivation runs.
 `register_sdhc` runs synchronously inside `pci::init` (`sdhc::probe` → `bring_up`), while
 `publish_usb_geometry` runs from the main loop's deferred SCSI bring-up (`xhci::service_storage`,
 held until the enumeration queue drains). The card is therefore always registered first, and every
-poll-until-present consumer — `wifi::service`, `wcx::desktop_app_service`,
+poll-until-present consumer — `wifi::service`, `desktop_uefi::desktop_app_service`,
 `shell::fatverb_storage_witness` — resolved and parked on `Sdhc` at the first main-loop pass, long
 before a stick can arrive. What is NOT closed by construction is the INTRA-PASS window on the one
 pass where a stick claims the global: `service_storage` resets the verdict near the top of that

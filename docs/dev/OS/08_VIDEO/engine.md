@@ -1993,7 +1993,7 @@ of the z-order:
 1. **Nothing ever claimed the tenancy.** `video::menubar` is a default-off tenant of `video::strip`
    ("we will not always have a menu bar"), and `set_enabled(true)` had exactly one caller in the
    tree — the fixture, which turned it off again. A bar nothing enables is a bar the operator cannot
-   see, however correct its geometry. `wcx::activate` now enables it as the last step of bringing the
+   see, however correct its geometry. `desktop_uefi::activate` now enables it as the last step of bringing the
    crispy desktop up, and says so on the wire: `[wc-x] menubar ENABLED panel= rect= was=`. This is a
    SHELL's decision by construction — a spatial shell that never runs that seam never gets a bar,
    which is the whole point of the tenancy — and every DECLINE arm in `activate` returns before it,
@@ -2058,7 +2058,7 @@ Four defects were fixed on this branch. Two were in the arc's own code:
   fbcon's frozen boot-log snapshot, which never damages again. With `service_damage` declining to
   composite while no row is dirty, a boot whose desktop app does not land and whose operator does not
   move the mouse would have held the bar enabled, its rows withheld from the desktop, and the bar
-  never painted. `wcx::activate` now composites at the enable seam (`[wc-x] menubar PAINTED`).
+  never painted. `desktop_uefi::activate` now composites at the enable seam (`[wc-x] menubar PAINTED`).
 
 * **aarch64 was NOT "the WC-I loop, byte for byte", as the code claimed.** To append the furniture
   tail the occluder walk staged `wm::occluders` into its own array and `copy_from_slice`'d it into the
@@ -2293,18 +2293,18 @@ all of aarch64) nothing changes: the shell is still the desktop and draws exactl
 **What landed — the shell/scene wiring, not the compose mechanism.** Three seams, all outside
 `composite_inner` and the present gate (the concurrent `flicker` arc's lane), all `x86_64`-scoped:
 
-* **`video::wcx::is_active()`** — a plain load of the `ACTIVATED` latch, `true` from the instant
+* **`video::desktop_uefi::is_active()`** — a plain load of the `ACTIVATED` latch, `true` from the instant
   `activate_on` claims the compositor to end of boot. It is the render service's signal that the
   crispy desktop owns the backdrop. (Not a second flag like `DESKTOP_APP_ARMED`: the backdrop
   question wants exactly what the latch says now — a compositor that disowned the panel leaves the
   shell as the desktop, correctly.)
 * **`video::screen::Screen::paint_desktop_scene()`** — fills the desktop layer with the crispy scene
-  (today the flat `wm::DESKTOP_BG`, the same colour `wcx::activate` put on the glass and
+  (today the flat `wm::DESKTOP_BG`, the same colour `desktop_uefi::activate` put on the glass and
   `adopt_desktop_bg` seeds a fresh `Screen` with, so the three agree by construction) and arms a
   full-panel present. It is the SEAM the approved lake scene (white-board A1) renders through later:
   the contract is *own the backdrop*, not *fill one colour*, so a richer scene replaces the body and
   every caller keeps working. `#[cfg(target_arch = "x86_64")]` — aarch64 never sees it.
-* **`x86_render_service`** captures `desktop_owns_backdrop()` once at task start (`wcx::activate` runs
+* **`x86_render_service`** captures `desktop_owns_backdrop()` once at task start (`desktop_uefi::activate` runs
   during PCI enumeration, long before this task is spawned, so the answer is stable). When the crispy
   desktop is up it paints the scene instead of `console.draw`, and it drops the shell's key path
   (`handle_key`) — a keystroke that reached that arm was not consumed by the installer dialog and not
@@ -2520,8 +2520,8 @@ widened and **not one line of its body changed**, and `Screen::direct`, `Console
   surface there is 960x580x4 = 2.2 MB. `try_reserve_exact` + `direct` are not belt-and-braces on
   this arch; they are the whole margin. Never crash the machine to deliver a feature.
 * **The CASCADE latch — the one place the arches differ in kind, and the one claim this arc got
-  wrong before the gate corrected it (`video/pidesk.rs`).** The first cut argued the Pi needs no
-  runtime latch: x86 has `wcx::is_active()` only because its desktop arrives with a Kepler TAKEOVER,
+  wrong before the gate corrected it (`video/desktop_firmware.rs`).** The first cut argued the Pi needs no
+  runtime latch: x86 has `desktop_uefi::is_active()` only because its desktop arrives with a Kepler TAKEOVER,
   while `pidesk` is compile-time and the furniture composites the moment the panel is up — so
   `desktop_owns_backdrop()` returned a constant `true` and the window was minted at the head of the
   render service. **`UNAOS_PIDESK=1 ./arroyo kernel8-test` answered `MBENCH FAIL — 104/108`,** and
@@ -2541,7 +2541,7 @@ widened and **not one line of its body changed**, and `Screen::direct`, `Console
   x86 never met this because its latch already encodes the ordering — the takeover happens after the
   cascade, so there *"is the desktop up?"* and *"has the cascade released the panel?"* are
   accidentally the same question. **On the Pi they are two questions, and the second one needed
-  asking.** `video::pidesk::arm()` is called from the CALLER of the last panel-reading fixture —
+  asking.** `video::desktop_firmware::arm()` is called from the CALLER of the last panel-reading fixture —
   `arch::aarch64::syscall::u7_launcher`, on the line after `wcb_launcher` returns — and at the caller
   rather than inside that fn's tail on purpose: it has three early SKIP returns, and arming from
   inside would let a skipped fixture leave the Pi with no shell window and no line saying why. The
@@ -2552,7 +2552,7 @@ widened and **not one line of its body changed**, and `Screen::direct`, `Console
 
   It is deliberately NOT a `wcx` twin (no origin, no panel re-description, nothing to deactivate — a
   boolean is the whole of what is known). **It also is not a second question about the same thing as
-  `pidesk::activate`, and the merge with CONSWIN-PI is where that becomes visible.** `activate` — the
+  `desktop_firmware::activate`, and the merge with CONSWIN-PI is where that becomes visible.** `activate` — the
   Pi's DESKTOP-READY seam, called from the GUI handoff — answers *"is the Pi a desktop yet?"*: the bar
   is on, the console has a window, the compositor owns the glass. `arm` answers *"has the boot witness
   cascade let go of the panel?"*, and when `activate` returns, the answer is still no — `kernel_main`'s
@@ -2621,7 +2621,7 @@ supposed to mean.
 "a line in the Pi render service", which is this arc's file, so it is worth being exact about why it is
 still not one line. Three things, in order:
 
-1. **`pidesk::activate` must return `routed` instead of `false`** — the handoff then skips
+1. **`desktop_firmware::activate` must return `routed` instead of `false`** — the handoff then skips
    `fbcon::detach()` and the window stays live. One word, and it is the word that was measured at
    `97/108` with 37 forbidden hits, `wc-g -> RACE-BLIT`, `wc-d -> FAIL` and a synchronous exception.
 2. **`_print` must stop presenting.** The measured failure is not pacing — it is that
@@ -2646,7 +2646,7 @@ released the panel, furniture may land ::` at the hand-off.
 
 **The standing rule this arc adds, stated once.** *A desktop that appears before the boot witness
 cascade has released the panel is not early, it is wrong.* Any future Pi furniture — dock, menu bar,
-a second window — takes `video::pidesk::armed()` for the same reason the shell window does. The
+a second window — takes `video::desktop_firmware::armed()` for the same reason the shell window does. The
 fixtures read the panel back; furniture that is on the glass while they read is furniture inside
 their answer. **CONSWIN-PI's console window is the counter-example that proves the rule rather than an
 exception to it**: it is minted at the GUI handoff, ahead of the cascade, and M2 measured exactly what
@@ -2675,7 +2675,7 @@ name the **same four missing REQUIREs** — `[wc-c] side-by-side … drawn=2`, `
 four are CONSWIN-PI M2's standing conflict, unchanged: the console window's box occludes the fixtures,
 and `[clickroute]`'s CLICK-SHELL leg reports `shell=skip` because `clickshell_leg` returns `None` when
 the parked cursor is over a window, which at 1920x1200 it is. The shell window adds nothing to that
-list — it is minted after `pidesk::armed()`, which is the whole point of the latch.
+list — it is minted after `desktop_firmware::armed()`, which is the whole point of the latch.
 
 The numeric differences are confined to the present-TIMING counters — `[wc-h] … -> AT-RISK` (20 / 9 / 14
 across the three runs) and `[wc-g]`'s `slow=yes` classification — and they track host load rather than
@@ -2699,14 +2699,14 @@ not against a remembered number. (The `27d782b5…` recorded by the two arcs bef
 VUG-PARITY, ONECARD-PI and DRAG-PI all changed knob-off code between then and now. The baseline is the
 CURRENT tip's image, always built, never quoted.) This arc touches exactly ONE file that is compiled
 knob-off — `arch/aarch64/syscall.rs`,
-edited **line-NEUTRALLY 4/4**: the furniture arm and the `pidesk::arm()` call are one dense line each,
+edited **line-NEUTRALLY 4/4**: the furniture arm and the `desktop_firmware::arm()` call are one dense line each,
 each paid for by one comment line merged nearby (panic `Location` records embed line numbers, so an
 added line anywhere in that file renumbers every record below it). The other three are free by
 construction: `video/mod.rs` is **not touched** (CONSWIN-PI already declares `pidesk`, so the cascade
 latch costs its parent zero lines — the earlier cut's "a new module costs one line" argument is now
 moot, and the module lands for nothing); `screen.rs` is **not touched** either, because the backdrop
 claim goes through `TargetPal::clear_screen` rather than widening `paint_desktop_scene`'s gate; and
-`pidesk.rs` itself only exists under the knob. `main.rs` was **measured** rather than assumed — a probe
+`desktop_firmware.rs` itself only exists under the knob. `main.rs` was **measured** rather than assumed — a probe
 line inserted mid-`render_service`, rebuilt, left the image byte-identical — so its additions are
 written for legibility instead of packed.
 
@@ -2856,7 +2856,7 @@ table of owners an operator explicitly launched, each awaiting its first window.
 |---|---|---|
 | `run <path>`, `bg <path>`, bare-name launch | **yes, unconditionally** | the spawn arms a one-shot token; the first window consumes it |
 | an app's **second** and later windows | no | the token is a one-shot — already spent |
-| the compositor's desktop app (`wcx::desktop_app_service`) | no | never armed, *and* `SLOT_NO_AUTOFOCUS` at the grant |
+| the compositor's desktop app (`desktop_uefi::desktop_app_service`) | no | never armed, *and* `SLOT_NO_AUTOFOCUS` at the grant |
 | the compat row, kernel furniture, selftest fixtures | no | never armed |
 | any of the above, when nothing holds focus | yes | the pre-existing weak rule, unchanged |
 
@@ -5756,7 +5756,7 @@ it. So the sprite was never armed, `[cursor] armed` never printed, and zero curs
 for the entire boot.
 
 **The fix (`usbdebug_cursor_service`, main.rs).** In the usbdebug drain, gated on
-`video::wcx::is_active()` — the compositor's own runtime latch, not a build `cfg`, because a `wc` card
+`video::desktop_uefi::is_active()` — the compositor's own runtime latch, not a build `cfg`, because a `wc` card
 whose activation DECLINED has no desktop and should keep the old behaviour — move `pal::cursor` and take
 the idempotent `ensure_drawn()` tail, exactly as the console loop's arms do. The hide edge is mirrored
 too: `visible()` going false calls `video::cursor::undraw()` once (this loop owns no `GneissPal`, so it
@@ -5819,7 +5819,7 @@ returns `Event::Unknown` and **never** `Event::None`, which matters here for the
 in the GUI loop — `None` is this `while let Some(..)` drain's end-of-queue sentinel, so returning it
 would strand everything queued behind the first routed click.
 
-Gated on `video::wcx::is_active()`, the compositor's own runtime latch, exactly as the cursor service
+Gated on `video::desktop_uefi::is_active()`, the compositor's own runtime latch, exactly as the cursor service
 is: with no live desktop there is no window to address a click to, and the card's reason to exist on
 pre-GUI bring-up is the raw print-only view, which is preserved bit-for-bit on that path.
 
@@ -5887,7 +5887,7 @@ of `x86_render_service`*.
 **The inversion.** On `x86_64` + `wc` the `#[cfg(feature = "usbdebug")]` block in `main.rs` is compiled
 out entirely, and the boot runs the ORDINARY path: the SCHED-X86 handoff, the console service, the
 shell window, the compositor — with the debug capabilities riding inside it behind the knob. The gate
-is the BUILD (`all(target_arch = "x86_64", feature = "wc")`) and deliberately not `wcx::is_active()`:
+is the BUILD (`all(target_arch = "x86_64", feature = "wc")`) and deliberately not `desktop_uefi::is_active()`:
 that latch has exactly one setter (the Kepler takeover), so a runtime gate would send QEMU — where no
 Kepler exists — back into the terminal loop, and the inversion's own falsifier is a headless
 `UNAOS_USBDEBUG=1 UNAOS_WC=1` run reaching the GUI selftests.
@@ -5895,7 +5895,7 @@ Kepler exists — back into the terminal loop, and the inversion's own falsifier
 **What still compiles the terminal loop:** `usbdebug` WITHOUT `wc`, and every aarch64 usbdebug build.
 That is the knob's original purpose — pre-GUI bring-up on a card with no compositor at all — and its
 body is otherwise untouched, minus the three superseded call sites, which were runtime no-ops there
-(`wcx::is_active()` is false with no takeover).
+(`desktop_uefi::is_active()` is false with no takeover).
 
 **Where each debug-only service went.**
 
@@ -7756,7 +7756,7 @@ to be a policy about.** The audit is recorded here in full so it is not re-run.
    syscall-numbering note says so directly: 27 (`INPUT_POLL`) is reserved for x86's "later arcs".
    CLICK-PLAIN's central claim — that a focus-changing press is *delivered whole* into the raised
    owner's ring — has no addressee on x86.
-5. **Every window x86 puts on the panel is owned by ASID 0.** `video/wcx.rs` creates the demo and
+5. **Every window x86 puts on the panel is owned by ASID 0.** `video/desktop_uefi.rs` creates the demo and
    probe rows with owner 0, and `video/fbcon.rs`'s console window likewise; `hit_test` skips
    `owner_asid == 0` by design (a compat/kernel row names nobody as a focus target). So even if the
    press path existed and called `hit_test` today, it would resolve `None` for every persistent x86
@@ -8000,7 +8000,7 @@ the operator can click them — and that invariant died with the change. The sib
 table, reporting `skip` when the panel leaves none; the hit-test witness predates it and kept its
 constant. That is the whole of the difference between the two.
 
-Why QEMU never saw it: `wcx::activate` runs only from the Kepler display takeover, so on the QEMU x86
+Why QEMU never saw it: `desktop_uefi::activate` runs only from the Kepler display takeover, so on the QEMU x86
 gate neither the console window nor the desktop demo row exists at all. The gate panel is bare, every
 derived point is unowned, and the leg passes for a reason that has nothing to do with the leg. (The
 CLICK-X86 r2 note above says the x86 gate line was taken "with the console window live in the table";
@@ -8170,7 +8170,7 @@ instrument was simply unable to say so.
 | 3 | `fbcon::route_present_rows` → `wm::present_rows` → `present_banded` → `composite` | **one present per frame period** (FBCON-PACE, ab1f59dc) — routed-line damage merges in FBCON-DMG's `PEND` ledger and flushes when `pace_due()` (60 Hz off `tsc_hz`, degrade-to-present on hz=0), on urgency (route install, `clear()`, INSTGUI resume, `console_flush()` from `detach()`), and unconditionally under `PANIC_MIRROR` | **UP**, and this is the volume path when the console is not suspended | The print path takes no cursor bracket of its own. Suspended entirely while an INSTGUI dialog is open. Boot-7 replay: 799 presents → ~57; `[wc-h] span=` is now the merged union since the last present, not one line's damage. |
 | 4 | `arch::x86_64::syscall` window-present verb → `wm::present` | EL0 `SYS_WIN_PRESENT` | **UP** | Syscall context; no bracket anywhere above it. |
 | 5 | `instgui::repaint` → `wm::present` | dialog state change / keypress only | **UP** | Ordinary `wm::present`. **No special path** — see below. |
-| 6 | `wcx::activate` → `wm::present` / `create_at` | once, from PCI enumeration | DOWN, harmlessly | `wcx.rs:193` undraws before its one-shot `fill_screen`. Runs before the sprite has ever existed, so the undraw is a no-op. |
+| 6 | `desktop_uefi::activate` → `wm::present` / `create_at` | once, from PCI enumeration | DOWN, harmlessly | `desktop_uefi.rs:193` undraws before its one-shot `fill_screen`. Runs before the sprite has ever existed, so the undraw is a no-op. |
 | 7 | `wm::create_at` / `create_inner` → `composite` | window creation | **UP** | No caller-side bracket. |
 | 8 | `wm::focus_changed` → `composite` | focus raise | **UP** | No caller-side bracket. |
 | 9 | `wm::move_to` → `erase` → `composite` | window move | **was DOWN** | `erase` undraws; the composite ran inside that bracket. **Fixed this arc.** |
@@ -9071,7 +9071,7 @@ existing FORBIDs mean on a line they already guard.
   byte-identical to the pre-change baseline. That also proves the two FBCON-DMG-substrate
   `#[expect(dead_code)]` markers came off correctly: `damage_rows` and `damaged_box` both gained
   callers, and neither an unfulfilled-expectation nor a dead-code warning appears.
-* **No QEMU verdict, and none is possible.** `wcx::activate()` — the compositor's only x86 ignition —
+* **No QEMU verdict, and none is possible.** `desktop_uefi::activate()` — the compositor's only x86 ignition —
   has exactly one caller, `drivers/gpu/kepler_display.rs`, inside the Kepler takeover, for which QEMU
   has no part. A QEMU run of this path would be vacuous. **Metal is the only verdict.**
 
@@ -9204,11 +9204,11 @@ armed.** What discriminates:
 |---|---|---|
 | `[wc-x]` | 22 | 1 |
 | `kepler` | 102 | 1 |
-| symbol `video::wcx::activate` | present, 4181 B | **absent** |
+| symbol `video::desktop_uefi::activate` | present, 4181 B | **absent** |
 | symbol `kepler_display::takeover_display` | present, 7517 B | **absent** |
 
 The **symbol pair is the better witness**, for two reasons. It is exactly the ignition chain this
-subsystem's ground rules name: `takeover_display` is the ONE caller of `wcx::activate`
+subsystem's ground rules name: `takeover_display` is the ONE caller of `desktop_uefi::activate`
 (`drivers/gpu/kepler_display.rs:454`, the tree's only occurrence), so both symbols present means the
 chain is in the image and either absent means it cannot start. And it is a clean binary — where the
 two string counts fall to `1`, not to `0`, because a knob-independent literal survives in each case.
@@ -9409,10 +9409,10 @@ Neither is a video finding; both are recorded here because they are hit while re
 
 #### The window-id map — read this before attributing any `[wc-x]` or `[wc-h]` line
 
-Ids are table-slot order, assigned as `(slot + 1)` in `wm::create_inner`, and `wcx::activate()`
+Ids are table-slot order, assigned as `(slot + 1)` in `wm::create_inner`, and `desktop_uefi::activate()`
 creates in a fixed order: console, then probe.
 
-> ⚠ **CHANGED BY THE KERNEL-APPS EVICTION (move #1).** `wcx::activate()` no longer creates a demo
+> ⚠ **CHANGED BY THE KERNEL-APPS EVICTION (move #1).** `desktop_uefi::activate()` no longer creates a demo
 > window. Every capture taken before that arc maps `win=2` to the kernel-drawn 96x64 calibration
 > window (`[wc-x] demo win=2 surf=96x64 at (2103,1117) scale=8x z=2` → `[wc-x] present win=2
 > rows=1104..1630 ok=true`, outer box 770x526) and `win=3` to the MOVE-VACATE probe. **Read historical
@@ -9424,7 +9424,7 @@ creates in a fixed order: console, then probe.
 |----|------------|---------|-----------|-----------|
 | `win=1` | **the panel console** — fbcon routed into a window; the subject of this arc | 1312x736 | 1314x750 | `[wc-x] console-window win=1 panel=2880x1800 surf=1312x736 box=1314x750 at (783,444) …`, and `[wc-x] activate … console_win=1` |
 | `win=2` | the MOVE-VACATE probe — witness builds only, one-shot, opened and closed in a clear corner. It was `win=3` while the demo window still existed | 8x8 @ 8x | 66x78 | `[wc-x] move-vacate win=2 scale=8x from=(8,8) to=(90,8) box=66x78 painted=true … -> PASS` |
-| first free slot | **the desktop app** — `STAT.ELF`, launched by `wcx::desktop_app_service` from the device-service pass. A ring-3 window like any other: it takes whichever slot is free when its `SYS_WIN_CREATE` lands — and on a witness build that is now *after* the DMG-REFUSE hold releases, so its id follows the witness ladder's teardown state rather than racing it (Boot AL, pre-hold, saw it land in row 1 mid-ladder and void the refusal witness) | 128x128 | scale-dependent | `[wc-x] desktop-app LAUNCH name=/STAT.ELF bytes=8472 entry=0x… pid=P slot=S DETACHED, left RUNNING`, then `[wc-a] create win=<n> asid=<a> surf=128x128 …` |
+| first free slot | **the desktop app** — `STAT.ELF`, launched by `desktop_uefi::desktop_app_service` from the device-service pass. A ring-3 window like any other: it takes whichever slot is free when its `SYS_WIN_CREATE` lands — and on a witness build that is now *after* the DMG-REFUSE hold releases, so its id follows the witness ladder's teardown state rather than racing it (Boot AL, pre-hold, saw it land in row 1 mid-ladder and void the refusal witness) | 128x128 | scale-dependent | `[wc-x] desktop-app LAUNCH name=/STAT.ELF bytes=8472 entry=0x… pid=P slot=S DETACHED, left RUNNING`, then `[wc-a] create win=<n> asid=<a> surf=128x128 …` |
 
 The box arithmetic corroborates the wire independently, through `TITLE_H = 12` and `BORDER = 1`:
 8·8 + 2 = 66 and 8·8 + 12 + 2 = 78 for the probe. (The retired demo window's 96·8 + 2 = 770 and
@@ -9578,7 +9578,7 @@ lines below are what it CAN read.
 * **Before blaming the boot, confirm the image was armed — and do not confirm it with `[wc-h]`.**
   Every `[wc-h]` literal this arc added is present with `UNAOS_WITNESS=1` alone, identically in an
   image built with the compositor knobs OFF, so finding them on a stick proves nothing about the
-  compositor. The witnesses that discriminate are the symbols `video::wcx::activate` and
+  compositor. The witnesses that discriminate are the symbols `video::desktop_uefi::activate` and
   `kepler_display::takeover_display` — present together, or the ignition chain is not in the image at
   all. Note also that `strings`/`nm` are **not** on this host: an empty probe result is a broken
   instrument until proven otherwise. Full counts and method under *ARTIFACT-AUDIT* above.
@@ -11437,7 +11437,7 @@ The ruling separates them, and both halves are now law:
   owner 0), shellwin-a's `PARKED_Z` term in `above_shell` is intact on trunk, and
   `dock_scan` still enumerates kernel-owned rows. The dock is the *only* way back
   — `focus_ring_apps` filters the reserved band out of the `<TAB>` rotation — and
-  `wcx::activate` still declines the console window outright on a panel too
+  `desktop_uefi::activate` still declines the console window outright on a panel too
   narrow to host a `MAX_WINDOWS` dock strip, so the disc cannot strand the row.
   Pinned by `dock::selftest`'s furniture-park leg and by x86-witness.spec's
   `furniture park=parked/true` rule, both unchanged.
@@ -11481,7 +11481,7 @@ console itself.**
 
 The console close is permanent for the boot: `panel_console_window_open` is
 idempotent behind `CONSOLE_WIN` and is reached from one one-shot latch in
-`wcx::activate`, so nothing re-mints the row once it is closed. Clearing
+`desktop_uefi::activate`, so nothing re-mints the row once it is closed. Clearing
 `CONSOLE_WIN` leaves that re-open *possible* — the function would build a fresh
 surface and row — but no caller invokes it. A normal app's reopen route is the
 launcher, and the console has none; building one is the Console APP arc's lane
@@ -11561,7 +11561,7 @@ recorded here rather than half-applied:
   two land together.
 
 The eventual end state is not minting the console as a `wm` row at all
-(`fbcon::panel_console_window_open` / `wcx::activate`): the boot console renders
+(`fbcon::panel_console_window_open` / `desktop_uefi::activate`): the boot console renders
 to the fbcon panel handle, and once the desktop is up the boot log lives only in
 serial + `TERM_RING`, which the Console APP (a sibling arc) subscribes to. That
 is sequenced after the two pieces above and after the Console APP.
@@ -12778,7 +12778,7 @@ interactive paths — "window dragging performance is shot" (operator, on glass)
 out ~60 of those frames a second; the other ~390 composites/s bought pixels no eye could see, at the
 direct cost of the composites an operator was waiting on.
 
-### The mechanism (`wm.rs`: `pace_admit` / `pace_service`; drain hook in `wcx.rs`)
+### The mechanism (`wm.rs`: `pace_admit` / `pace_service`; drain hook in `desktop_uefi.rs`)
 
 A present is **coalesced, never slept**. In `present_banded`, after the row is marked damaged and
 `presented` (unchanged), the pacer asks one question: has this window already composited inside the
@@ -12793,7 +12793,7 @@ current panel frame (16 667 µs, measured in rdtsc cycles as `tsc_hz / 60`)?
   atomics. A pending bit (`PACE_PENDING`, one u32 bitmask over `MAX_WINDOWS`) is raised before the
   return.
 * **The tail** — a stream that stops mid-frame still reaches glass within one frame:
-  `wm::pace_service`, called from `wcx::desktop_app_service` on `x86_usb_pump`'s ~1 kHz
+  `wm::pace_service`, called from `desktop_uefi::desktop_app_service` on `x86_usb_pump`'s ~1 kHz
   device-service pass (the PAYGO-TERM taker's lane, same unmasked main-loop context `composite`
   already runs in), drains any pending window whose frame has ended. Idle cost is one relaxed load
   per pass. Worst-case time-to-glass for a deferred present: one frame plus one service tick.
@@ -12971,7 +12971,7 @@ blocker is architectural rather than mechanical:
   / `win_fb` fields and their `FbCon::new` inits, `draw_fb`'s routed branch, `flush`'s band
   hand-back, the `route_present*` family, `PANIC_MIRROR`) is tedious but not deep.
 * **Architecturally it has no consumer on the Pi, and that is the stopper.** On x86 the caller is
-  `wcx::activate`, the Kepler-takeover seam; the Pi has no `wcx` and no twin of it. Worse, the Pi
+  `desktop_uefi::activate`, the Kepler-takeover seam; the Pi has no `wcx` and no twin of it. Worse, the Pi
   boot **detaches fbcon** at GUI handoff (`main.rs`, the `fbcon::detach()` on the PI-RAST line) and
   the shell/midden console then paints through its own `Screen` over the front framebuffer, via
   `screen::present_surface`'s compat row — *not through fbcon at all*. So opening a console window
@@ -13364,7 +13364,7 @@ run read `0x1b1a3a` where the theme says `0x2d2b55`, at a corner the probe had p
 A witness that called that a `MISS` would be convicting the chrome for a contract the arch never
 made, so it prints `NOCLEAR` — outside the verdict's arithmetic, and a distinct token a spec rule can
 be written against **once the aarch64 desktop-clear exists to be required**. That clear is NAMED
-here, not written: it is an aarch64 twin of `wcx::DESKTOP-CLEAR` plus its `screen::adopt_desktop_bg`
+here, not written: it is an aarch64 twin of `desktop_uefi::DESKTOP-CLEAR` plus its `screen::adopt_desktop_bg`
 seam, which is a new panel-wide writer on the Pi's compose path and belongs to its own arc with its
 own WC-BBSYNC argument — not to a witness arc.
 
@@ -13558,7 +13558,7 @@ DEFAULT OFF, on the Pi too… compiling a tenant is not enabling it."* That is s
 What was missing is the other half of it — **something has to ask.**
 
 On x86 something does. SHELLDESK (`ca6094a2`, driven by Peter's metal Boot A: *"i cannot see the menu
-because a shell is still posing as the desktop"*) made `wcx::activate` the asker, and it is the ONLY
+because a shell is still posing as the desktop"*) made `desktop_uefi::activate` the asker, and it is the ONLY
 live `set_enabled(true)` in the tree. The other three are `witness` fixtures — `menubar::selftest`'s
 legs 3-4, its MENUBAR-OCC probe, `crystal::selftest` — and every one of them restores the flag before
 it returns. On the Pi there was no asker at all, so the bar was compiled, composed (three relaxed
@@ -13584,7 +13584,7 @@ PI-DESK M4 stopped here and named the blocker:
 > writes to after handoff: a correct window containing a frozen log.
 
 **The premise is exactly right and the inference does not hold, because x86 ships that window.** On
-x86's desktop lane the same row is, in `wcx.rs`'s own words, *"a FROZEN BOOT-LOG SNAPSHOT for the rest
+x86's desktop lane the same row is, in `desktop_uefi.rs`'s own words, *"a FROZEN BOOT-LOG SNAPSHOT for the rest
 of the boot"* — the desktop's boot-log pane, and one of the two kernel windows an x86 desktop carries
 (the other being `main.rs`'s `open_shell_window`, a DIFFERENT window on a different path). A frozen
 boot-log console window is not a failure mode on either arch; it is the feature.
@@ -13598,8 +13598,8 @@ means PRESENT, so a board whose rate cannot be read paces per line exactly as be
 No second implementation of anything: one `route_present_banded`, one `Pending`, one
 `panel_console_window_open`, two arches running the same bytes.
 
-The seam that calls it is `video/pidesk.rs` — the Pi's DESKTOP-READY point, the counterpart of
-`wcx::activate` and deliberately not a port of its body (the Kepler takeover, the backbuffer resync
+The seam that calls it is `video/desktop_firmware.rs` — the Pi's DESKTOP-READY point, the counterpart of
+`desktop_uefi::activate` and deliberately not a port of its body (the Kepler takeover, the backbuffer resync
 and the deferred desktop-app launch are x86 display-driver concerns with no Pi twin). What is shared
 is the decision SEQUENCE: panel, dock-hostability, console window, bar enable, composite.
 
@@ -13633,7 +13633,7 @@ it; a routed console does not write the panel (`draw_fb` hands back the window s
 kernel RAM no scan-out reads, and the pixels reach glass only through `wm`'s staged present). So the
 detach's reason is discharged by the routing, and the handoff can skip it.
 
-It was implemented — `pidesk::activate` returned `routed`, `main.rs`'s handoff line became
+It was implemented — `desktop_firmware::activate` returned `routed`, `main.rs`'s handoff line became
 `if !pidesk_activate_maybe() { fbcon::detach(); }` — and then measured, and **the argument is
 incomplete**. Discharging *who writes the panel* does not discharge *who drives the COMPOSITOR*. A
 routed console presents from PRINT context, on whatever core printed, and after the handoff the Pi
@@ -13655,7 +13655,7 @@ A synchronous exception is not a pacing problem and would not have been fixed by
 `usbdebug` bench lane — no render service, no witness battery, effectively one service loop — while
 the lane an operator actually boots detaches unconditionally. That was not documented as a hazard
 anywhere. This arc rediscovered it from the other end, on the other arch, and the ledger in
-`pidesk.rs` is the first place either tree says WHY.
+`desktop_firmware.rs` is the first place either tree says WHY.
 
 So the real blocker is one layer below the one M4 named, and it applies to BOTH arches: **a console
 that presents from arbitrary print context is an unsynchronised compositor client.** The Pi ships the
@@ -13704,7 +13704,7 @@ code. `fbcon.rs` is **52 added / 52 removed** with every widening done in place,
 statement (`draw_fb`'s aarch64 routed branch) is written on the line it shares with `&self.fb`.
 `ui_status.rs` is 2/2, `screen.rs` 4/4. Everything genuinely new lives where nothing is below it:
 appended to `fbcon.rs`'s tail, appended to `video/mod.rs`'s tail, appended to `main.rs`'s tail, or in
-`video/pidesk.rs`, which is a new file and moves nothing. `main.rs`'s call site rides the existing
+`video/desktop_firmware.rs`, which is a new file and moves nothing. `main.rs`'s call site rides the existing
 `fbcon::detach()` line on the discipline PI-RAST established, and folds to the bare `detach()` when the
 knob is off because `pidesk_activate_maybe` is then `#[inline(always)] false`.
 
@@ -13751,7 +13751,7 @@ Line-neutrality of every file compiled into the knob-off image, from `git show -
 126 54 video/fbcon.rs               (52/52 in place + 74 appended at the tail)
 36 1   main.rs                      (1/1 at the call site + 35 appended at the tail)
 10 0   video/mod.rs                 (appended at the tail)
-226 0  video/pidesk.rs              (new file)
+226 0  video/desktop_firmware.rs              (new file)
 ```
 
 And the bar and the console on the bench panel path:
@@ -13974,19 +13974,19 @@ boxes; `wm::erase` paints boxes windows have VACATED (that half has always been 
 is ungated, so close/move exposure on the Pi was already repainted `DESKTOP_BG`, and this arc found
 nothing owed there). Neither has any claim on panel pixels the window layer has never owned. Every
 pre-desktop pixel — `init_panel`'s fill, the direct-painted fbcon boot log, whatever a demo left — is
-outside every damage box in the system. x86 solved this in 2026-07 with `wcx::activate`'s WC-X
-DESKTOP-CLEAR; the Pi had no such point until `pidesk::activate` existed, and then had the point but
+outside every damage box in the system. x86 solved this in 2026-07 with `desktop_uefi::activate`'s WC-X
+DESKTOP-CLEAR; the Pi had no such point until `desktop_firmware::activate` existed, and then had the point but
 not the step.
 
 ### The change
 
-One block, in `video/pidesk.rs`, between step 1 (panel geometry) and step 2-3 (the console window):
+One block, in `video/desktop_firmware.rs`, between step 1 (panel geometry) and step 2-3 (the console window):
 `cursor::undraw()`, a direct `WRITER` `fill_screen(wm::DESKTOP_BG)` + `flush_all()`, and a witness
 line. Fifty-five added lines in one file, forty-eight of them the argument.
 
 **Why a direct front-buffer write is sound here, PROVEN on this arch rather than inherited.** The
 no-direct-writes law protects COMPOSITOR-OWNED pixels from a second writer. x86 argues there are none
-at `wcx::activate` because it runs from inside PCI enumeration. That argument does not transfer — the
+at `desktop_uefi::activate` because it runs from inside PCI enumeration. That argument does not transfer — the
 Pi's seam runs from the GUI handoff, with the whole M6b..U7 fixture cascade already spawned on the APs
 — so it was checked against the capture instead of asserted: in the armed bench log the FIRST
 `[wc-a] create` of the boot is `win=1`, the console window minted by `panel_console_window_open`
@@ -14161,12 +14161,12 @@ a second anyway. The cost is that a pick appears on the next tick rather than in
 for the furniture family's reason: this is EXPERIENCE-layer code with no hardware in it, so it builds
 once and runs on every chip. `./arroyo check`'s `x86-all` leg carries `wc` and its `arm-pi` leg carries
 `pidesk`, so both compilations are covered by the standing gate rather than by assertion. Only
-`pidesk::activate` opens the window today; on x86 the module compiles and is unreferenced, which is what
+`desktop_firmware::activate` opens the window today; on x86 the module compiles and is unreferenced, which is what
 keeps the port from rotting.
 
 ### The window is ARMED by the desktop seam and OPENED by the render pass
 
-`pidesk::activate` calls `pulsewin::arm()`; `pulsewin::service()` performs the open, on the first render
+`desktop_firmware::activate` calls `pulsewin::arm()`; `pulsewin::service()` performs the open, on the first render
 pass where `ui_status::loads` reports a live instrument. That split was not a design preference — the
 gate convicted the direct call, and the readback is worth keeping:
 
@@ -15614,7 +15614,7 @@ including the `PANEL_MUTE_TAGS` entry, which is itself knob-gated so that claim 
 `UNAOS_PIDESK=1 UNAOS_QUARRY=1 ./arroyo kernel8-test 300` was red on the merged trunk: **106/111
 required witnesses**, and *not one* of the five missing ones was about the thing it convicted. The
 whole family had one cause with two faces — a Pi desktop that puts **permanent furniture on the
-glass before the boot witness cascade has finished reading it** — and `video/pidesk.rs` had already
+glass before the boot witness cascade has finished reading it** — and `video/desktop_firmware.rs` had already
 written the rule down and named the exception:
 
 > *A desktop that appears before the boot witness cascade has released the panel is not early, it is
@@ -15663,7 +15663,7 @@ from an ordinary armed run — the flake caught and cured in the same boot:
 
 ### Face 2 — FURNITURE-OCC: `old_desktop=` was asking the wrong question
 
-`pidesk::activate` mints `[wc-x] console-window win=1 … box=570x396 at (35,4)` — **89 % by 82 % of a
+`desktop_firmware::activate` mints `[wc-x] console-window win=1 … box=570x396 at (35,4)` — **89 % by 82 % of a
 640x480 panel** — and the cascade then places its probe windows *inside* it. The vacate legs asserted
 `== DESKTOP_BG` byte-for-byte at eleven points and read `(0/5)`, `(0/3)`, `(0/3)`: eleven correct
 repaints reported as eleven failures, because the compositor was doing the right thing — erase, then

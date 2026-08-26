@@ -1949,3 +1949,212 @@ pub fn kbd_pump_body(_arg: usize) {
         super::sched::yield_now();
     }
 }
+
+// ── ORIN-INPUT ──────────────────────────────────────────────────────────────────────────────────
+// INPUT INTO AN EL0 TENANT, ON THE TEGRA PATH — the pump the Orin never had.
+//
+// THE DEFECT. On a `tegra_el0` image the whole ELF-5 EL0 input chain EXISTS: the per-process ring
+// (`syscall.rs`, the ELF-5 block), the `user_input_enqueue` router seam, `user_input_set_active`, and
+// `SYS_INPUT_POLL` dispatched from the SVC table. `run_user_image` registers the launched program as the
+// active input target before its wait loop. Every hop is compiled in. And yet a tenant that polls
+// `SYS_INPUT_POLL` every frame receives nothing, because TWO hops between the controller and that seam
+// are missing on tegra — both of them Pi-only code:
+//
+//   1. NOTHING PUMPS THE CONTROLLER WHILE A TENANT RUNS. The Pi drains xHCI from a dedicated `usb_pump`
+//      task at ~4 ms (`main.rs`, `cfg(all(target_arch = "aarch64", feature = "baremetal"))`). The tegra
+//      image has no `baremetal`, so that task does not exist. The Orin's ONLY HID pump is the drain
+//      inside `main.rs::jd2_console_pump` — and that task is PARKED inside `handle_key` ->
+//      `dispatch_command` -> `run_user_image` for the tenant's entire life. `run_user_image`'s wait loop
+//      is `super::sched::yield_now()` and nothing else. So across a whole run, ZERO `poll_events()`
+//      calls happen: no HID report is harvested and `pal::EVENT_QUEUE` stays empty.
+//   2. NOTHING ROUTES KEYSTROKES. `main.rs::route_input_to_active_el0` and its sole caller
+//      `pump_usb_into_gui` are `cfg(all(target_arch = "aarch64", feature = "baremetal"))` too. On tegra
+//      `jd2_console_pump` feeds every `Event::Key` straight through `handle_key` REGARDLESS OF FOCUS —
+//      `display_tegra.rs` says so in its own words beside `orin_click`, having verified it rather than
+//      assumed it. So even a harvested keystroke goes to the shell, never to the tenant's ring.
+//
+// WHY THE BENCH'S `focus=0x0` IS A SYMPTOM, NOT THE CAUSE. `run_user_image` does grant focus
+// (`user_input_set_active(asid)`), so focus is non-zero for the whole run. But the `[orinclick]` and
+// `[orintenant]` censuses are emitted FROM `jd2_console_pump`'s own sweep — the same task that is parked
+// for the duration — so no census line can be emitted WHILE a tenant holds focus. A capture in which
+// almost every census line reads `focus=0x0` is therefore exactly what defect 1 predicts: the census
+// only ever samples the intervals when no tenant is running. It corroborates the parked pump; it is not
+// an independent focus bug.
+//
+// WHAT THIS ADDS. One pump pass driven from `run_user_image`'s wait loop — the one context that runs for
+// exactly as long as the tenant does. Claim the controller, `poll_events()` to harvest and re-arm the HID
+// rings, then drain `pal::EVENT_QUEUE` through the SAME `user_input_enqueue` seam the Pi router uses. No
+// second seam and no bypass, so the compositor's TAB interception and click routing, the ring's
+// drop-newest contract, and the `[uvug8]` takeover heartbeat all behave exactly as they do on the Pi.
+//
+// WHAT IT DELIBERATELY DOES NOT FIX. Defect 2 above is only NEUTRALISED FOR THE DURATION OF A `run`,
+// because the thief (`jd2_console_pump`) is parked exactly then. A `bg`-launched windowed tenant that
+// holds focus while the shell runs is still robbed of its keystrokes, and the honest fix there is NOT to
+// gate `jd2_console_pump` on `user_input_active() != 0`: with `pidesk` OFF, `USER_INPUT_ACTIVE` can hold
+// the `wm::KERNEL_OWNER_DESKTOP` pseudo-ASID (see `display_tegra.rs`'s note beside `orin_click`), and
+// routing keys into a pseudo-ASID ring would lock the operator out of the shell with no way back. That
+// belongs with the `pidesk` rung that owns the pseudo-ASID question, not here.
+//
+// WITNESS. Every hop counts, and the rollup is emitted at the END of EVERY `run_user_image` on this path,
+// so a run that delivered nothing SAYS so with a named verdict instead of printing nothing. `passes` is
+// the load-bearing field: it separates "the pump ran and the wire was quiet" from "the pump never ran",
+// which is precisely the ambiguity the bench capture could not resolve.
+//
+// KNOB. `orininput` (UNAOS_ORININPUT=1), implying `tegra_el0`. DEFAULT OFF => every item below and its
+// three call sites in `run_user_image` vanish; the jetson media and the Pi `kernel8.img` are both
+// byte-identical to baseline. Gated rather than shipped-on because it changes WHERE a keystroke goes
+// during a `run` (tenant ring instead of nowhere) and adds xHCI MMIO from a call site that never touched
+// the controller before.
+//
+// NOTHING BELOW HAS BEEN ON HARDWARE.
+
+/// ORIN-INPUT: pump passes inside the current `run_user_image`. `0` in the rollup means the wait loop
+/// never called us — which is NOT the same reading as "the wire was quiet".
+#[cfg(feature = "orininput")]
+static OI_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Passes on which no EL0 program held input focus, so the queue was left for the console's own drain.
+#[cfg(feature = "orininput")]
+static OI_NOFOCUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Events drained off `pal::EVENT_QUEUE` by this pump — HID edges that reached the kernel queue.
+#[cfg(feature = "orininput")]
+static OI_DECODED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Of those, the ones that carry something for EL0 (Key/KeyUp/Mouse/MouseAbsolute/Button). Timer/None/
+/// Unknown count in `decoded` but their non-arrival is not a delivery failure.
+#[cfg(feature = "orininput")]
+static OI_DELIVERABLE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Events `user_input_enqueue` actually queued into the focused tenant's ring.
+#[cfg(feature = "orininput")]
+static OI_ROUTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Deliverable events the seam refused: ring full (drop-newest), focus moved between the load and the
+/// push, or consumed by the compositor (TAB / a click addressed to the desktop).
+#[cfg(feature = "orininput")]
+static OI_DROPPED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// CNTPCT tick of the last in-flight rollup, rate-limiting it to ~2 Hz. A held key or a moving mouse must
+/// not flood the bench transcript.
+#[cfg(feature = "orininput")]
+static OI_LAST_TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// ORIN-INPUT: zero the per-run counters. Called by `run_user_image` immediately before its wait loop so
+/// the rollup reports THIS tenant's input rather than the boot's accumulated total.
+#[cfg(feature = "orininput")]
+pub fn oi_reset() {
+    use core::sync::atomic::Ordering;
+    OI_PASSES.store(0, Ordering::Relaxed);
+    OI_NOFOCUS.store(0, Ordering::Relaxed);
+    OI_DECODED.store(0, Ordering::Relaxed);
+    OI_DELIVERABLE.store(0, Ordering::Relaxed);
+    OI_ROUTED.store(0, Ordering::Relaxed);
+    OI_DROPPED.store(0, Ordering::Relaxed);
+    OI_LAST_TICK.store(0, Ordering::Relaxed);
+}
+
+/// ORIN-INPUT: one pump pass — harvest the controller, then route to the focused tenant's ring.
+///
+/// Called once per `run_user_image` wait-loop pass, from the parked shell task, at EL1, on the boot core.
+/// `claim`, not `lock`: a Busy claim means a BOT transaction is in flight elsewhere, and skipping the
+/// pass is correct — the next pass is microseconds away. `jd2_console_pump` and `kbd_pump_body` take the
+/// same claim on the same controller, and only one of the three is ever runnable at a time.
+///
+/// `poll_events` ONLY — never the `service_*` pumps, whose bounded waits ride `hlt()` and would park this
+/// core forever post-drop with the EL2 timer off (the JB2b rule stated above `kbd_pump_body`).
+#[cfg(feature = "orininput")]
+pub fn oi_pump() {
+    use core::sync::atomic::Ordering;
+    OI_PASSES.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut x) = xhci::claim() {
+        x.poll_events();
+    }
+    // No EL0 owner: harvest only, drain nothing. The events belong to the console's drain, and
+    // `user_input_enqueue` would refuse every one of them WITHOUT consuming — so draining here would
+    // destroy the operator's keystrokes instead of delivering them. This is the tegra twin of the Pi
+    // router's "leave the events for the app's own drain" rule.
+    if super::syscall::user_input_active() == 0 {
+        OI_NOFOCUS.fetch_add(1, Ordering::Relaxed);
+        oi_rollup_maybe();
+        return;
+    }
+    while let Some(ev) = crate::pal::next_event() {
+        OI_DECODED.fetch_add(1, Ordering::Relaxed);
+        let deliverable = !matches!(
+            ev,
+            crate::pal::Event::Timer | crate::pal::Event::None | crate::pal::Event::Unknown
+        );
+        if deliverable {
+            OI_DELIVERABLE.fetch_add(1, Ordering::Relaxed);
+        }
+        if super::syscall::user_input_enqueue(ev) {
+            OI_ROUTED.fetch_add(1, Ordering::Relaxed);
+        } else if deliverable {
+            OI_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    oi_rollup_maybe();
+}
+
+/// ORIN-INPUT: the in-flight rollup, rate-limited to ~2 Hz on CNTPCT (free-running and EL-independent —
+/// the post-drop EL1 core has no timer IRQ, the JD3 mechanism). The first pass of a run always prints, so
+/// the transcript shows the pump alive before any HID edge has had a chance to arrive.
+#[cfg(feature = "orininput")]
+fn oi_rollup_maybe() {
+    use core::sync::atomic::Ordering;
+    let now = cntpct();
+    let last = OI_LAST_TICK.load(Ordering::Relaxed);
+    if last != 0 && now.wrapping_sub(last) < cntfrq() / 2 {
+        return;
+    }
+    OI_LAST_TICK.store(now.max(1), Ordering::Relaxed);
+    oi_rollup("live");
+}
+
+/// ORIN-INPUT: name what every hop saw, with a verdict that separates the ways a run can end with an
+/// empty tenant ring. Emitted unconditionally at the end of every `run_user_image` on this path — zero
+/// MUST say zero, and `passes=0` MUST be distinguishable from `decoded=0`.
+///
+/// Verdicts:
+///   * `DELIVERED`   — events reached the tenant's ring; the wire works end to end.
+///   * `ROUTER-DROP` — HID edges reached `pal::EVENT_QUEUE` but the seam refused every one. A large
+///                     `dropped` means the tenant is not draining its ring; otherwise the compositor
+///                     consumed them (TAB / a desktop click) or focus moved mid-pass.
+///   * `QUEUE-INERT` — only Timer/None/Unknown reached the queue. Pump and router are live; the HID
+///                     decode produced nothing a tenant can use.
+///   * `NO-HID`      — the pump ran WITH focus held and the controller produced no event at all. The
+///                     break is upstream of `pal::EVENT_QUEUE`: enumeration, the interrupt-IN re-arm, or
+///                     SMMU-dropped DMA. Trustworthy only because `passes` proves the pump ran.
+///   * `NO-FOCUS`    — the pump ran but no tenant ever held focus, so nothing was routed BY DESIGN.
+///                     Not an input defect; a focus one.
+///   * `NEVER-RAN`   — `passes=0`. The wait loop made no pump pass; every other number is meaningless.
+#[cfg(feature = "orininput")]
+pub fn oi_rollup(tag: &str) {
+    use core::sync::atomic::Ordering;
+    let passes = OI_PASSES.load(Ordering::Relaxed);
+    let nofocus = OI_NOFOCUS.load(Ordering::Relaxed);
+    let decoded = OI_DECODED.load(Ordering::Relaxed);
+    let deliverable = OI_DELIVERABLE.load(Ordering::Relaxed);
+    let routed = OI_ROUTED.load(Ordering::Relaxed);
+    let dropped = OI_DROPPED.load(Ordering::Relaxed);
+    let verdict = if passes == 0 {
+        "NEVER-RAN — the run_user_image wait loop made no pump pass"
+    } else if routed != 0 {
+        "DELIVERED"
+    } else if dropped != 0 {
+        "ROUTER-DROP — HID reached EVENT_QUEUE, the enqueue seam refused every event"
+    } else if decoded != 0 {
+        "QUEUE-INERT — only Timer/None/Unknown reached EVENT_QUEUE"
+    } else if passes != nofocus {
+        "NO-HID — pump ran with focus held, controller produced no event (break is upstream of EVENT_QUEUE)"
+    } else {
+        "NO-FOCUS — pump ran, no EL0 tenant ever held input focus"
+    };
+    serial_println!(
+        "[orininput] {} rollup passes={} nofocus={} decoded={} deliverable={} routed={} dropped={} focus={:#x} :: {} ::",
+        tag,
+        passes,
+        nofocus,
+        decoded,
+        deliverable,
+        routed,
+        dropped,
+        super::syscall::user_input_active(),
+        verdict
+    );
+}

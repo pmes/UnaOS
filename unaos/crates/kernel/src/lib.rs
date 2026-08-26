@@ -69,6 +69,14 @@ pub mod allocator;
 pub mod shell;
 pub mod selftest;
 
+// ORIN-REBOOT (baton orin-6 §5.1 + the cold-boot ruling 2026-08-25): the arch-neutral POWER
+// VERBS — `reboot` (warm) and `shutdown` (power off, cold-boot-ready). One word each on
+// every UnaOS; the per-platform mechanisms (aarch64: PSCI SYSTEM_RESET / SYSTEM_OFF via SMC
+// — invoke ATF/the firmware, never build power logic; x86 shutdown: the real ACPI S5;
+// unwired slots: honest witnesses) live behind them. Witness families `[orinreboot]` /
+// `[orinshutoff]`. See power.rs.
+pub mod power;
+
 // INSTALL-CORE: the storage-agnostic installer engine (GPT writer + FAT32 formatter + extent
 // content-verify) over the arch-neutral `InstallTarget` trait. The engine is arch-neutral and
 // compiles on both arches under `installdemo` (UNAOS_INSTALLDEMO=1); its witness `run_demo` is invoked
@@ -97,7 +105,7 @@ pub mod install;
     feature = "install_target",
     feature = "piinstall",
     feature = "selfhost",
-    feature = "holocron"
+    feature = "holocron", feature = "selfup" // ORIN-SELFUP: selfup_tegra streams Sha256 over the payload + every staged file
 ))]
 pub mod hash;
 

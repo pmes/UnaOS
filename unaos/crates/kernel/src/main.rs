@@ -125,9 +125,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // 0a. WRITER-SEED (x86). `video::WRITER` and fbcon are two handles to the SAME physical
     //     framebuffer, and `WRITER` is the one every panel-geometry consumer reads (`wm`'s
-    //     composite path, `cursor`, `screen`, `wcx::activate`). Until this seam existed, x86
+    //     composite path, `cursor`, `screen`, `desktop_uefi::activate`). Until this seam existed, x86
     //     seeded it only far down `kernel_main` (step 3's `framebuffer_addr != 0` block), which is
-    //     AFTER the Kepler takeover runs — so `wcx::activate` found `is_ready() == false` and
+    //     AFTER the Kepler takeover runs — so `desktop_uefi::activate` found `is_ready() == false` and
     //     declined the console window on metal (`[wc-x] activate DECLINE reason=fb-not-ready`)
     //     while fbcon was fully live on the very same surface. A `WRITER` that lies about the
     //     panel is a general defect, not a compositor one, so this is UNCONDITIONAL — not gated on
@@ -1109,11 +1109,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     //     service (`drivers/ehci`), which every x86 path polls, so they are loop-independent;
     //   * `USBDBG-INVERT` itself prints at the GUI takeover, so the wire names the regime.
     //
-    // WHAT STILL COMPILES THIS BLOCK, and why the gate is the BUILD and not `wcx::is_active()`:
+    // WHAT STILL COMPILES THIS BLOCK, and why the gate is the BUILD and not `desktop_uefi::is_active()`:
     // `usbdebug` WITHOUT `wc` (the knob's original purpose — pre-GUI bring-up on a card with no
     // compositor at all) and every aarch64 usbdebug build. Those regimes keep the print-only view
     // BYTE-FOR-BYTE, which is why the loop body below is otherwise untouched. A runtime gate was
-    // considered and rejected: `wcx::activate` has exactly one caller (the Kepler takeover), so a
+    // considered and rejected: `desktop_uefi::activate` has exactly one caller (the Kepler takeover), so a
     // runtime test would make QEMU — where no Kepler exists — take the terminal loop, and the
     // inversion's own falsifier is a headless `UNAOS_USBDEBUG=1 UNAOS_WC=1` run reaching the GUI
     // selftests. A build that asks for the desktop gets the desktop, on metal and in QEMU alike.
@@ -1287,7 +1287,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // moved onto the real desktop, so their call sites (and the helpers, and the auto-hide
             // edge that partnered the cursor service) are gone with them. On the path that still
             // compiles this loop there is no compositor to route to and no sprite to move — the
-            // three patches were runtime no-ops here already (`wcx::is_active()` is false with no
+            // three patches were runtime no-ops here already (`desktop_uefi::is_active()` is false with no
             // Kepler takeover), so this deletion is behaviour-preserving for it.
             while let Some(event) = unaos_kernel::pal::next_event() {
                 match event {
@@ -1367,7 +1367,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             typematic_selftest(); // UVUG-6: prove the dropped-KeyUp wedge is closed (report-level + guards)
             inwedge_selftest(); // INWEDGE: prove the input router refuses a held panel lock instead of wedging the input core on it
             unaos_kernel::arch::serial::RX_READY.init(); // M5c: the RX-wake semaphore's waiter list
-            if !pidesk_activate_maybe() { unaos_kernel::video::fbcon::detach(); } pi_rast_demo_maybe(); // CONSWIN-PI: the DESKTOP-READY seam rides the detach line on the same zero-source-lines discipline PI-RAST established, and it GUARDS the detach — `pidesk_activate_maybe` answers true only when the console is ROUTED into a compositor window, and a routed console does not write the panel (`fbcon::draw_fb` hands back the window surface), so the one thing the detach exists to guarantee — exactly one core writing the panel — is already true and skipping it leaves the console window LIVE instead of freezing it at the handoff. Knob-off it is `#[inline(always)] false`, so this folds to the bare `detach(); pi_rast_demo_maybe();` it has always been. // PI-RAST demo (no-op unless UNAOS_PIRAST=1) on the SAME source line as the detach it rides, so the wire-in adds ZERO source lines ahead of any panic Location — the pi knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helper defined at file tail; runs here because the panel is up, fbcon has just stopped mirroring, and the input/render service tasks below are not spawned yet (nothing else paints).
+            if !desktop_firmware_activate_maybe() { unaos_kernel::video::fbcon::detach(); } pi_rast_demo_maybe(); // CONSWIN-PI: the DESKTOP-READY seam rides the detach line on the same zero-source-lines discipline PI-RAST established, and it GUARDS the detach — `desktop_firmware_activate_maybe` answers true only when the console is ROUTED into a compositor window, and a routed console does not write the panel (`fbcon::draw_fb` hands back the window surface), so the one thing the detach exists to guarantee — exactly one core writing the panel — is already true and skipping it leaves the console window LIVE instead of freezing it at the handoff. Knob-off it is `#[inline(always)] false`, so this folds to the bare `detach(); pi_rast_demo_maybe();` it has always been. // PI-RAST demo (no-op unless UNAOS_PIRAST=1) on the SAME source line as the detach it rides, so the wire-in adds ZERO source lines ahead of any panic Location — the pi knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helper defined at file tail; runs here because the panel is up, fbcon has just stopped mirroring, and the input/render service tasks below are not spawned yet (nothing else paints).
             // M5c: on metal, route + enable the PL011 RX interrupt (SPI 153) to the input core so the
             // input task is woken by the UART instead of polling. GICD config stays BSP-only (this is
             // global distributor state). A backstop task also periodically wakes the input service so
@@ -2061,7 +2061,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // fatal path busy-spins (timer::LIVE is still false), and the IRQ entries stay dormant —
     // install()'s HCR_EL2.AMO|IMO|FMO routing changes where a physical IRQ WOULD land, but DAIF
     // stays fully masked until JM4's enable_irq below, by which point the GIC is up.
-    unaos_kernel::arch::exceptions::install();
+    unaos_kernel::arch::exceptions::install(); #[cfg(feature = "orinwdt")] unaos_kernel::arch::wdt_tegra::boot_arm(); // ORIN-REBOOT: arm the TKE boot watchdog HERE — MMU device window live (the TKE is MMIO), serial live (the witness must land), vectors healed — so every later wedge (GIC, USB, panel, the drop) sits inside the covered window. Disarmed on the terminus line; knob-off the statement vanishes (APPENDED to this line, so no panic Location shifts).
     // JM7 (video): report the GOP the firmware handed off (addr=0 = headless boot, fbcon inert).
     // With a monitor connected, fbcon has been mirroring serial output onto this framebuffer since
     // kernel_main step 0 (under the UEFI map), and mmu_tegra just mapped its GiBs into BOTH tables
@@ -2213,7 +2213,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
                         // the pads down, so they arrive live and the RMW was dead code.)
                     }
                     None => serial_println!(":: tegra: JB1c — no usb@3610000 ids in DTB; SKIP ::"),
-                } #[cfg(feature = "jd1dc")] unaos_kernel::arch::display_tegra::jd1_dc_probe(&chan, boot_info.dtb_addr, boot_info.dtb_size, mmu.ram_gib_mask); // JD1-DC (UNAOS_JD1DC=1, default OFF) — the BPMP-guarded, READ-ONLY nvdisplay register probe; see the JD1-DC tail block in display_tegra.rs. THIS instruction is the only point in the boot where both of its ordering constraints hold: BPMP-FIRST (the `chan` this borrows was established by `jb1b_ping` ~60 lines up, and without it the MRQ_PG GET_STATE guard that earns the first read cannot be asked — which is why the probe could NOT stay at its old site inside `jd1_survey`), and JD1-FIRST (the scanout resolution, `map_fb_region`, `fbcon::init` and the `WRITER` seed are ~90 lines up, so panel + serial + shell are already live on a framebuffer resolved by a pure DTB RAM walk and a probe that goes wrong costs the experiment, not the boot). Last in the BPMP block so every other diagnostic has already reached the wire before the one read that could end it. Appended to this line, never a new one: knob-off it is cfg-erased and no panic `Location` below moves.
+                } #[cfg(feature = "jd1dc")] unaos_kernel::arch::display_tegra::jd1_dc_probe(&chan, boot_info.dtb_addr, boot_info.dtb_size, mmu.ram_gib_mask); #[cfg(feature = "ga10bprobe1")] unaos_kernel::arch::ga10b_probe::ga10bprobe1_run(&chan, boot_info.dtb_addr, boot_info.dtb_size, mmu.ram_gib_mask); // JD1-DC (UNAOS_JD1DC=1, default OFF) — the BPMP-guarded, READ-ONLY nvdisplay register probe; see the JD1-DC tail block in display_tegra.rs. THIS instruction is the only point in the boot where both of its ordering constraints hold: BPMP-FIRST (the `chan` this borrows was established by `jb1b_ping` ~60 lines up, and without it the MRQ_PG GET_STATE guard that earns the first read cannot be asked — which is why the probe could NOT stay at its old site inside `jd1_survey`), and JD1-FIRST (the scanout resolution, `map_fb_region`, `fbcon::init` and the `WRITER` seed are ~90 lines up, so panel + serial + shell are already live on a framebuffer resolved by a pure DTB RAM walk and a probe that goes wrong costs the experiment, not the boot). Last in the BPMP block so every other diagnostic has already reached the wire before the one read that could end it. Appended to this line, never a new one: knob-off it is cfg-erased and no panic `Location` below moves. GA10B-PROBE1 (UNAOS_GA10B_PROBE1=1, default OFF) — the first read-only GA10B iGPU probe rung: it borrows the SAME `chan` `jb1b_ping` established (BPMP-first: the rail gate that earns the first BAR0 read cannot be asked without it), reads the risk-ordered register list announce-first, and ENDS THE BOOT in PSCI SYSTEM_OFF (`power::shutdown`) per the cold-boot bench law — so it never returns and no later boot phase runs on a probe flight. Its own media by design (co-arming with other tegra knobs is not a supported flight). Appended to this line, never a new one: knob-off it is cfg-erased and no panic `Location` below moves.
             }
         }
         None => serial_println!(":: tegra: JB1b — geometry unresolved from DTB; SKIP ::"),
@@ -2476,7 +2476,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // waits still have the JM4 timer as their wake source. Metal + tegra-gated; compiled out knob-off =>
     // byte-identical to baseline. See arch_arm64.md §ORIN-INSTALL-2 and scripts/orin-sdmmc1-bench.md.
     #[cfg(all(feature = "install_target", feature = "tegra"))]
-    unaos_kernel::arch::sdmmc_tegra::sdmmc_install_from_usb();
+    unaos_kernel::arch::sdmmc_tegra::sdmmc_install_from_usb(); #[cfg(all(feature = "tegra", feature = "selfup"))] unaos_kernel::arch::selfup_tegra::selfup_service(); // ORIN-SELFUP: self-update service — same preconditions as ORIN-INSTALL-2, AFTER it so an install and an update on one boot see the media final; appended to THIS line for knob-off byte-identity (no line moves). See docs/dev/OS/10_INSTALL/orin-selfupdate.md.
 
     // ORIN-UNAFS-ROOT rung 4 (arc M4): probe-mount the microSD's NATIVE unafs volume on its OWN
     // block handle — `unafs::mount_on(BlockHandle::TegraSd)`, the consumer the SDSEAM arms in
@@ -2572,13 +2572,13 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         ram_gib_mask: mmu.ram_gib_mask,
     });
 
-    // ORIN-SMP-3 (the real 6-core Orin bring-up, `UNAOS_TEGRASMP=1`): with the `tegrasmp` feature
-    // armed, kick off the secondaries HERE — after JM4 (GIC/timer/heap/SMC all live) and while the
-    // BSP is still at EL2 (before the JM6 drop, so the woken cores replay the EL2 regime). Presence is
-    // sourced from the DTB `/cpus` node ALONE (RIDER 1); the kick-off STOPs (single-core) if `/cpus`
-    // names nothing. Default OFF => the whole call + the enumerator vanish and the tegra image is
-    // byte-identical to baseline. The metal verdict is the attended Orin bench (see §ORIN-SMP-3); on
-    // firmware where the JM5 `CPU_ON` wall still stands this would RAS-fault, so it is knob-gated.
+    // ORIN-SMP-3 (the real 6-core Orin bring-up): with the `tegrasmp` feature armed, kick off the
+    // secondaries HERE — after JM4 (GIC/timer/heap/SMC all live) and while the BSP is still at EL2
+    // (before the JM6 drop, so the woken cores replay the EL2 regime). Presence is sourced from the
+    // DTB `/cpus` node ALONE (RIDER 1); the kick-off STOPs (single-core) if `/cpus` names nothing.
+    // §ORIN-SMP-DEFAULT: `tegrasmp` is DEFAULT-ON for every tegra build (arroyo arms it for
+    // `UNAOS_TEGRA=1` and `esp-jetson` alike, metal-proven across SMP-1..8) unless `UNAOS_NOTEGRASMP=1`
+    // opts out, dropping call + enumerator => pre-flip baseline. Flip record: arch_arm64.md §ORIN-SMP-DEFAULT.
     #[cfg(feature = "tegrasmp")]
     unaos_kernel::arch::smp_virt::start_secondaries_tegra(dtb_addr, dtb_size, mmu.ram_gib_mask);
 
@@ -2586,17 +2586,17 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     //    first time the scheduler runs on Orin silicon. This is the tegra analogue of the virt JC3 call
     //    site (`kernel_main`), and it becomes the tegra terminus: `run_capstone_boot_core` never returns.
     //
-    //    Single-core, by design. JM5 (Orin SMP via PSCI CPU_ON) is PARKED and deliberately NOT invoked on
-    //    this path: on the real Orin the first `CPU_ON` triggers a fatal Tegra RAS Uncorrectable Error
-    //    (CBB fabric — a BL31/MCE firmware issue, NOT a JM5 code bug; see the "JM5 result" doc section)
-    //    and powers the box off BEFORE returning, which would prevent ever reaching CAPSTONE. JM6 needs no
-    //    SMP, so it sidesteps that wall entirely. (`smp_virt` stays compiled for tegra; it is simply not
-    //    called here. Re-attempting Orin SMP / iterating CPU_ON is out of scope for this arc.)
+    //    STALE-COMMENT REPAIR (2026-08-25; this block previously said "Single-core, by design / JM5
+    //    PARKED", which §ORIN-SMP-DEFAULT made false): secondaries ARE woken by default on tegra —
+    //    `start_secondaries_tegra` runs above (`UNAOS_NOTEGRASMP=1` is the opt-out), CPU_ON succeeds on
+    //    most boots, and the intermittent ORIN-SMP-3 park (~30%, H1: Device-typed instruction fetches
+    //    pre-MMU) is instrumented by SMPMARK, not avoided by staying single-core. The APs stay at EL2;
+    //    only the boot core drops. See arch_arm64.md §ORIN-SMP-DEFAULT.
     //
     //    JM4 above brought the timer up and PROVED IRQ delivery at EL2 (`verify_live`); the drop then
-    //    DISABLES the physical timer so no IRQ hits the EL2-banking `__vec_irq` stub once we are at EL1
-    //    (the stub reads ELR_EL2/SPSR_EL2 — a fault at EL1), and CAPSTONE runs cooperatively (exactly how
-    //    the Pi/virt CAPSTONE already runs under QEMU with no Group-1 delivery).
+    //    disables the EL2 one-shot. The old "no IRQ may hit `__vec_irq` at EL1" rationale died at
+    //    0a60e260 (runtime CurrentEL banking): IRQEL-RT proved an IRQ taken AT EL1 through this vector,
+    //    and ORIN-BSPTICK (UNAOS_BSPTICK) runs a periodic EL1 tick across the terminus. Default CAPSTONE stays cooperative (`on_tick` only); ORIN-BSPRUN (UNAOS_BSPRUN, Candidate B arc 2 — implies bsptick) swaps the terminus to the preemptive `run_bsp_tegra(0)`: SCHED_ACTIVE + mark_online(0) + `run()`, no CAPSTONE spawn. See sched.rs tail §ORIN-BSPRUN.
     //
     //    JM7 (video): fbcon is deliberately NOT detached here (contrast JC3/virt, whose EL1 map omits
     //    the fb). mmu_tegra mapped the GOP GiBs into BOTH the live EL2 table and the EL1 twin, so the
@@ -2676,7 +2676,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // `el0-hello` task, and an unstamped mask would refuse it (see sched.rs `EL1_CORE_MASK`).
     unaos_kernel::arch::percpu::init(0); unaos_kernel::arch::sched::mark_el1_core();
     unaos_kernel::arch::exceptions::install();
-    unaos_kernel::arch::timer::el1_oneshot_proof(); tegra_el0_start_maybe(); #[cfg(feature = "tegradesk")] tegra_desk_arm(); tegra_rast_demo_maybe(); unaos_kernel::arch::sched::run_capstone_boot_core(0); // IRQEL-RT EL1 one-shot proof (first: one interrupt taken AT EL1 through the runtime-banked __vec_irq, then self-disarms — see timer.rs tail) + ORINDESK RUNG 2 desktop seam (no-op unless UNAOS_TEGRADESK=1; DESKSEAM tail block) + RAST-TEGRA demo (no-op unless UNAOS_RAST=1), all on the same line as the terminus so the wire-ins add ZERO source lines before any panic Location — the tegra knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helpers defined at file tail / timer.rs tail.
+    unaos_kernel::arch::timer::el1_oneshot_proof(); #[cfg(feature = "bsptick")] unaos_kernel::arch::timer::el1_bsptick_start(); tegra_el0_start_maybe(); #[cfg(feature = "tegradesk")] tegra_desk_arm(); #[cfg(feature = "orinconwin")] unaos_kernel::arch::display_tegra::orin_conwin(); #[cfg(feature = "orintenant")] unaos_kernel::arch::display_tegra::orin_tenant_arm(); #[cfg(feature = "orinladder")] unaos_kernel::arch::display_tegra::orin_ladder_arm(); #[cfg(feature = "orinfurn")] tegra_desk_furn(); tegra_rast_demo_maybe(); #[cfg(feature = "orinwdt")] unaos_kernel::arch::wdt_tegra::boot_ok_disarm(); #[cfg(not(feature = "bsprun"))] unaos_kernel::arch::sched::run_capstone_boot_core(0); #[cfg(feature = "bsprun")] unaos_kernel::arch::sched::run_bsp_tegra(0); // IRQEL-RT EL1 one-shot proof (first: one interrupt taken AT EL1 through the runtime-banked __vec_irq, then self-disarms — see timer.rs tail) + ORIN-BSPTICK periodic EL1 tick (no-op unless UNAOS_BSPTICK=1; arms right where the one-shot self-disarmed and leaves IRQs unmasked across the terminus — timer.rs tail) + ORINDESK RUNG 2 desktop seam (no-op unless UNAOS_TEGRADESK=1; DESKSEAM tail block) + ORIN-DESKFURN, the menu bar + SHARD menu (no-op unless UNAOS_ORINFURN=1; DESKFURN tail block — LAST of the rungs on purpose, so every earlier rung's probe still reads a panel with no bar on it and its captures stay comparable to boot7f/7g/7h; and still AHEAD of `boot_ok_disarm`, so the boot watchdog covers the composite it drives) + RAST-TEGRA demo (no-op unless UNAOS_RAST=1), all on the same line as the terminus so the wire-ins add ZERO source lines before any panic Location — the tegra knob-off byte-identity constraint (PI-V3D-1 bisect-proven). The terminus itself is knob-selected (ORIN-BSPRUN, Candidate B arc 2): default = the cooperative `run_capstone_boot_core(0)` drive loop, UNAOS_BSPRUN=1 = `run_bsp_tegra(0)` (sched.rs tail — SCHED_ACTIVE + mark_online(0) + the preemptive `run()` loop; requires/implies bsptick, arroyo folds it in). Helpers defined at file tail / sched.rs tail / timer.rs tail. Helpers defined at file tail / timer.rs tail.
 }
 
 /// Handle one keyboard byte against the console: printable ASCII extends the input line, backspace
@@ -2822,17 +2822,17 @@ fn jd2_console_pump(_arg: usize) {
                 }
                 if cntpct().wrapping_sub(last_sweep) >= sweep_ticks {
                     last_sweep = cntpct();
-                    unaos_kernel::vugras::idle_sweep(sweep_tick);
+                    unaos_kernel::vugras::idle_sweep(sweep_tick); #[cfg(feature = "rast")] unaos_kernel::arch::display_tegra::orin_rast_census(sweep_tick); // ORIN-RASTGLASS: the `late` read-back, and THIS is the site that makes it mean anything — phase 1 is the interval between RAST returning and the console taking the panel, i.e. the only window in which the cube is supposed to be visible, and it is bounded at 8 s / 32 sweeps. The phase-2 twin below keeps sampling afterwards, but a repaint observed THERE is the console doing its job (RAST-SUPERSEDED-BY-CONSOLE), not the defect. ⚠ LINE-NEUTRAL append.
                     sweep_tick += 1;
                 }
                 unaos_kernel::arch::sched::yield_now();
             }
         }
-    };
+    }; #[cfg(feature = "supstate")] jd2_supstate_phase2(front_fb, first_key, sweep_ticks, last_sweep, sweep_tick); // ORIN-SUPSTATE (Candidate A arc 1) — knob-on, phase 2 runs with the surface LIFTED into `display_tegra::supstate`'s module-owned handle (never returns; the legacy phase 2 below is then dead code, kept verbatim as the knob-off path). ⚠ LINE-NEUTRAL append — knob-off this statement is `#[cfg]`-erased and the file's line numbering is untouched (panic `Location` byte-identity, the orinclick rule).
 
     // Phase 2: the console owns the panel. Detach the fbcon serial mirror FIRST so a CAPSTONE
     // straggler line can't paint over the console frame (serial output is unaffected).
-    unaos_kernel::video::fbcon::detach();
+    if !tegra_conwin_live() { unaos_kernel::video::fbcon::detach(); } #[cfg(feature = "rast")] unaos_kernel::arch::display_tegra::orin_rast_console_owns(); // ORIN-RASTGLASS: the phase-2 boundary latch — from here the console owns the glass, so a cube repainted away is the design, not a defect, and the census says RAST-SUPERSEDED-BY-CONSOLE instead of RAST-PAINTED-OVERWRITTEN. Placed on the FIRST statement of phase 2 and outside the conwin guard: the console takes the panel on both routes, only the detach differs. ⚠ LINE-NEUTRAL append. // ORIN-CONWIN rung 4 — the detach is GUARDED BY THE ROUTE, exactly as the Pi's GUI handoff guards it (`main.rs`'s CONSWIN-PI line). `tegra_conwin_live()` answers true only when `fbcon::console_is_routed()` does, and a routed console does not write the panel — `FbCon::draw_fb` hands back `win_fb`, kernel RAM no scan-out reads — so the ONE thing this detach exists to guarantee (exactly one writer on the panel while the JD2 Screen console owns it) is already true, and skipping it leaves the console window LIVE instead of freezing it with the boot log. Knob-off it is `#[inline(always)] false`, so this folds to the bare `detach();` it has always been. ⚠ FOLDED IN PLACE, never added lines: panic `Location` records embed line numbers and the knob-off jetson image's byte-identity is this track's standing proof.
     let mut screen = unaos_kernel::video::Screen::new(front_fb);
     // VUGRAS: the Screen back buffer PA is only known now — add it to the candidate table.
     unaos_kernel::vugras::note_screen(&screen);
@@ -2973,7 +2973,7 @@ fn jd2_console_pump(_arg: usize) {
         // console pump was live at shell entry with no vug run). No-op with the knob off.
         if cntpct().wrapping_sub(last_sweep) >= sweep_ticks {
             last_sweep = cntpct();
-            unaos_kernel::vugras::idle_sweep(sweep_tick); #[cfg(feature = "orinclick")] unaos_kernel::arch::display_tegra::orin_click_census(sweep_tick); // ORIN-CLICK rung 3 — the ARM line, then the ~10 s click census. Emitted FROM THIS LOOP on purpose: it is the routing task's own liveness, so `[orinclick] census` stopping is a dead pump and `btn=0` is "nobody clicked", not "routing failed". ⚠ LINE-NEUTRAL append — see the Button arm above.
+            unaos_kernel::vugras::idle_sweep(sweep_tick); #[cfg(feature = "orinclick")] unaos_kernel::arch::display_tegra::orin_click_census(sweep_tick); #[cfg(feature = "orintenant")] unaos_kernel::arch::display_tegra::orin_tenant_census(sweep_tick); #[cfg(feature = "orinladder")] unaos_kernel::arch::display_tegra::orin_ladder_census(sweep_tick); #[cfg(feature = "rast")] unaos_kernel::arch::display_tegra::orin_rast_census(sweep_tick); // ORIN-RASTGLASS: the `late` half of the cube read-back — combined with the latched `post` it separates painted-and-survived from painted-and-overwritten from never-painted, which the RAST path could not say at all. `rast` alone is the gate (it does NOT imply tegra), and this fn is already `cfg(all(tegra, aarch64))`, so the conjunction is exact. ⚠ LINE-NEUTRAL append — see the Button arm above. // ORIN-CLICK rung 3 — the ARM line, then the ~10 s click census. Emitted FROM THIS LOOP on purpose: it is the routing task's own liveness, so `[orinclick] census` stopping is a dead pump and `btn=0` is "nobody clicked", not "routing failed". ⚠ LINE-NEUTRAL append — see the Button arm above.
             sweep_tick += 1;
         }
         unaos_kernel::arch::sched::yield_now();
@@ -3452,7 +3452,7 @@ fn serial_to_shell(byte: u8) {
 //      It is not: `fbcon::_print` takes `FBCON.try_lock` (`video/fbcon.rs`) and `serial::_print` takes
 //      `SERIAL_PORT.try_lock` — neither can block. The blocking `WRITER.lock()` on the print path is in
 //      `wm::composite` (`video/wm.rs`), reached via `route_present_rows` → `wm::present` when the panel
-//      console owns the glass, i.e. on `pidesk`/`wc` builds. The mechanism, the interleaving and the fix
+//      console owns the glass, i.e. on `desktop_firmware`/`wc` builds. The mechanism, the interleaving and the fix
 //      are unchanged — only the callee's name was wrong, and a wrong name sends the next reader to a
 //      file that is already safe. `docs/dev/OS/…/scheduler.md` §INWEDGE carries the same correction.
 //   5. The acquire never returns. The core is masked, so the holder it displaced can never be
@@ -3578,10 +3578,10 @@ fn route_input_to_active_el0() -> usize {
             // two things inside it were still forbidden there. (1) `repaint`'s WRITER takes were
             // BLOCKING acquires — a masked core spinning on a lock a preempted holder owns is the
             // boot-8 death with the roles reversed, i.e. the mask converted a recoverable stall into
-            // an unrecoverable wedge, on every `pidesk` boot. Those takes now go through
+            // an unrecoverable wedge, on every `desktop_firmware` boot. Those takes now go through
             // `video::panel_snapshot`, which blocks only when interrupts are enabled. (2) `repaint`
             // printed two witness lines and marked compositor damage from in here; `serial_println!`
-            // on a `pidesk` build mirrors to the panel through `wm::present` → `composite`, whose
+            // on a `desktop_firmware` build mirrors to the panel through `wm::present` → `composite`, whose
             // `WRITER.lock()` is blocking, and `repair` takes the window TABLE lock. Both are now
             // handed back as a `RepaintTail` and run BELOW, with interrupts restored. What remains
             // inside the mask is pixels and atomics — no blocking lock, no printing.
@@ -3603,7 +3603,7 @@ fn route_input_to_active_el0() -> usize {
             });
             tail.finish(); // LOCKFIX — damage + witness lines, UNMASKED. A no-op for the `_` arm.
         }
-        #[cfg(feature = "pidesk")] unaos_kernel::video::wm::drag_route_tail(ev); // DRAG-PI M3 — STEER a live title-bar grab from the FOCUSED-APP drain, after the cursor keep-alive above has applied this report and before the event is routed onward. This is the path a grab actually takes: the chrome arm focuses the dragged window's own owner, so every subsequent pointer report arrives here and is PACKED into that app's ring — the shell drain never sees it. Keyed on the raw event inside `drag_route_tail`, so a non-pointer event and an idle boot both cost one match and one atomic load. Delivery is unchanged: the app still receives the report, exactly as it does today.
+        #[cfg(feature = "desktop_firmware")] unaos_kernel::video::wm::drag_route_tail(ev); // DRAG-PI M3 — STEER a live title-bar grab from the FOCUSED-APP drain, after the cursor keep-alive above has applied this report and before the event is routed onward. This is the path a grab actually takes: the chrome arm focuses the dragged window's own owner, so every subsequent pointer report arrives here and is PACKED into that app's ring — the shell drain never sees it. Keyed on the raw event inside `drag_route_tail`, so a non-pointer event and an idle boot both cost one match and one atomic load. Delivery is unchanged: the app still receives the report, exactly as it does today.
         let queued = unaos_kernel::arch::aarch64::syscall::user_input_enqueue(ev);
         // WHEEL — account the wheel's fate at the ONE seam that knows it. `user_input_enqueue`
         // collapses "no EL0 target", "not deliverable" and "ring full" into a single `false`, and for
@@ -5006,24 +5006,24 @@ fn render_service(_: usize) {
     let mut screen = unaos_kernel::video::Screen::new(front_fb);
 
     // SHELLWIN-PI — does the Pi desktop own the backdrop on this build? Captured ONCE, exactly as the
-    // x86 service captures `wcx::is_active()`, so every arm below reads one stable answer.
+    // x86 service captures `desktop_uefi::is_active()`, so every arm below reads one stable answer.
     //
     // When it is true the SCENE owns the glass and the live text shell comes off it. That sentence is
     // a bigger change on this arch than on x86, because on the Pi the shell's whole-panel
     // `clear_screen` was the ONLY writer that ever made a non-window panel pixel read `DESKTOP_BG` —
     // `wcf`'s chrome-truth probe reported exactly that as NOCLEAR ("no aarch64 panel-wide DESKTOP_BG
-    // clear; wcx is x86+wc"), and it read as a desktop only because `console::Console::BG` and
+    // clear; desktop_uefi is x86+wc"), and it read as a desktop only because `console::Console::BG` and
     // `wm::DESKTOP_BG` are the same number by coincidence. The desktop write is deliberate and NAMED
     // on this arch now, which is the arc the NOCLEAR note asked for.
     //
     // NOTE the backdrop is NOT claimed here. `desktop` says this BUILD runs a desktop; the pass that
-    // CLAIMS the glass is the mint arm in the drain loop, once `pidesk::armed()` reports the witness
+    // CLAIMS the glass is the mint arm in the drain loop, once `desktop_firmware::armed()` reports the witness
     // cascade done. Claiming it at task start would leave a backdrop going stale across the whole
     // cascade, and the first keystroke arriving before the arming would splash a whole-panel
     // `console.draw` across a scene nothing would repaint.
-    #[cfg(feature = "pidesk")]
+    #[cfg(feature = "desktop_firmware")]
     let desktop = desktop_owns_backdrop();
-    #[cfg(not(feature = "pidesk"))]
+    #[cfg(not(feature = "desktop_firmware"))]
     let desktop = false;
 
     let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen);
@@ -5033,25 +5033,25 @@ fn render_service(_: usize) {
     // the reason the x86 twin gives: a persistent `TargetPal` borrows its `Screen`, and a per-keystroke
     // `TargetPal::new` would also spam the once-per-surface `:: UI1:` line. `_shell_store` is bound and
     // never read again ON PURPOSE — the `wm` row holds a raw pointer into its heap buffer, and this
-    // task never returns, so the binding IS the lifetime. Knob-off (`pidesk` off) not one of these
+    // task never returns, so the binding IS the lifetime. Knob-off (`desktop_firmware` off) not one of these
     // bindings exists and the shell keeps painting the panel exactly as it always did.
     // They start EMPTY and cost nothing: the window is minted LATER, by the lazy arm in the drain
-    // loop, once `video::pidesk::armed()` says the boot witness cascade has released the panel. See
+    // loop, once `video::desktop_firmware::armed()` says the boot witness cascade has released the panel. See
     // that arm — the ordering is not a nicety, it is 4 of the 108 regression witnesses.
-    #[cfg(feature = "pidesk")]
+    #[cfg(feature = "desktop_firmware")]
     let (mut _shell_store, mut shell_screen, mut shell_console, mut shell_id) = (
         alloc::vec::Vec::new(),
         unaos_kernel::video::Screen::direct(unaos_kernel::video::FrameBuffer::new()),
         unaos_kernel::console::Console::new(),
         unaos_kernel::video::wm::WIN_NONE,
     );
-    #[cfg(feature = "pidesk")]
+    #[cfg(feature = "desktop_firmware")]
     let mut shell_pal = unaos_kernel::pal::TargetPal::new(&mut shell_screen);
-    #[cfg(feature = "pidesk")]
+    #[cfg(feature = "desktop_firmware")]
     let mut shell_dirty = false;
     // One decline is final. `open_shell_window` already named the reason on the wire; retrying it
     // every pass would turn a full heap into a serial flood.
-    #[cfg(feature = "pidesk")]
+    #[cfg(feature = "desktop_firmware")]
     let mut shell_declined = false;
 
     // SHELLWIN-PI — UNCHANGED, and deliberately so. At boot the shell still draws the panel on every
@@ -5096,7 +5096,7 @@ fn render_service(_: usize) {
         // Block until an event arrives (recv parks the task — an idle render core burns nothing).
         let ev = GUI_CHANNEL.recv();
         GUI_RECV.fetch_add(1, core::sync::atomic::Ordering::Relaxed); // GUI-CLICK-2 depth accounting
-        let t0 = unaos_kernel::arch::now_cycles(); #[cfg(feature = "livecon")] unaos_kernel::video::fbcon::console_live_service(); // LIVECON — THE PORT. The console window's presents come off print context (`fbcon::present_deferred`) and land HERE, on the one core that drives the compositor, at this pass's cadence — which is the arc `video/pidesk.rs`'s live-console ledger names. `console_live_service` is a readback bracket around the hook x86's `usbdebug` service loop has called since FBCON-PACE (`fbcon::console_service`) — the service call is unchanged and the bracket only counts presents that actually happened, which is what the one-line `[wc-x] livecon census` proof is read off. It is the PACED take, not a forced flush: `console_service` can only move a present earlier within the frame it was already going to happen in, it is free on a clean ledger (`pend_take` -> `Owed::Nothing`, nothing composited), and it is a no-op on every build where the console is not routed into a window. Top of the pass and not the tail, because a pass has many exits and a deferred band must not be able to miss one. ⚠ FOLDED onto an existing line — `main.rs` is compiled into the knob-off `kernel8.img` whose byte-identity is this track's standing proof and panic `Location` records embed line numbers (PARITY §5.3); knob-off the statement does not exist and no line moves.
+        let t0 = unaos_kernel::arch::now_cycles(); #[cfg(feature = "livecon")] unaos_kernel::video::fbcon::console_live_service(); // LIVECON — THE PORT. The console window's presents come off print context (`fbcon::present_deferred`) and land HERE, on the one core that drives the compositor, at this pass's cadence — which is the arc `video/desktop_firmware.rs`'s live-console ledger names. `console_live_service` is a readback bracket around the hook x86's `usbdebug` service loop has called since FBCON-PACE (`fbcon::console_service`) — the service call is unchanged and the bracket only counts presents that actually happened, which is what the one-line `[wc-x] livecon census` proof is read off. It is the PACED take, not a forced flush: `console_service` can only move a present earlier within the frame it was already going to happen in, it is free on a clean ledger (`pend_take` -> `Owed::Nothing`, nothing composited), and it is a no-op on every build where the console is not routed into a window. Top of the pass and not the tail, because a pass has many exits and a deferred band must not be able to miss one. ⚠ FOLDED onto an existing line — `main.rs` is compiled into the knob-off `kernel8.img` whose byte-identity is this track's standing proof and panic `Location` records embed line numbers (PARITY §5.3); knob-off the statement does not exist and no line moves.
         s6_passes += 1;
         // `dirty` — did this pass draw anything that must be presented? `strip_dirty` — must the
         // status strip be (re)composed on top this pass?
@@ -5115,9 +5115,9 @@ fn render_service(_: usize) {
         // the click must both go on behaving exactly as they did before this arc. Sampled HERE, ahead
         // of the mint arm further down that can flip `shell_id` within this same pass, so every arm in
         // one pass agrees about which surface it is talking to.
-        #[cfg(feature = "pidesk")]
+        #[cfg(feature = "desktop_firmware")]
         let windowed = desktop && shell_id != unaos_kernel::video::wm::WIN_NONE;
-        #[cfg(not(feature = "pidesk"))]
+        #[cfg(not(feature = "desktop_firmware"))]
         let windowed = false;
         match ev {
             unaos_kernel::pal::Event::Key(c) => {
@@ -5126,7 +5126,7 @@ fn render_service(_: usize) {
                 // the SHELL. On the Pi desktop the shell is a WINDOW, so it is dispatched into that
                 // window's own `Console`/`TargetPal` and the backdrop scene is never typed on; the
                 // window's surface is flushed and composited once per drained burst at the tail. Off
-                // the desktop (`pidesk` off, or the window declined) the shell is still the panel and
+                // the desktop (`desktop_firmware` off, or the window declined) the shell is still the panel and
                 // this is the pre-arc line unchanged, `dirty`/`strip_dirty` and all.
                 //
                 // Note which flags do NOT get set on the window path: the PANEL was not drawn on, so
@@ -5134,7 +5134,7 @@ fn render_service(_: usize) {
                 // `dirty` there would present the whole backdrop on every keystroke — the exact
                 // per-key full-panel cost SCHED-6's dirty pacing exists to refuse.
                 if windowed {
-                    #[cfg(feature = "pidesk")]
+                    #[cfg(feature = "desktop_firmware")]
                     {
                         handle_key(c, &mut shell_console, &mut shell_pal);
                         shell_dirty = true;
@@ -5166,7 +5166,7 @@ fn render_service(_: usize) {
                     );
                     unaos_kernel::video::cursor::repaint();
                 }
-                #[cfg(feature = "pidesk")] unaos_kernel::video::wm::drag_route_tail(ev); // DRAG-PI M3 — STEER a live grab from the SHELL path, and it has to be HERE rather than in the drain that forwarded this event. On this arch the shell's cursor is applied one `GUI_CHANNEL` hop downstream — by this very arm — so a tail call in `pump_usb_into_gui` would read the position as of the PREVIOUS report and the window would trail the arrow by one report for the whole gesture. The render task is where the cursor becomes current, so it is where the window is allowed to follow it. Reached for kernel-band and focus-exempt rows, whose chrome arm hands the keyboard to the shell.
+                #[cfg(feature = "desktop_firmware")] unaos_kernel::video::wm::drag_route_tail(ev); // DRAG-PI M3 — STEER a live grab from the SHELL path, and it has to be HERE rather than in the drain that forwarded this event. On this arch the shell's cursor is applied one `GUI_CHANNEL` hop downstream — by this very arm — so a tail call in `pump_usb_into_gui` would read the position as of the PREVIOUS report and the window would trail the arrow by one report for the whole gesture. The render task is where the cursor becomes current, so it is where the window is allowed to follow it. Reached for kernel-band and focus-exempt rows, whose chrome arm hands the keyboard to the shell.
             }
             unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
                 // Absolute report (0..=32767 HID space), same shared sprite. An unchanged position
@@ -5176,7 +5176,7 @@ fn render_service(_: usize) {
                     unaos_kernel::pal::cursor::set_abs(x, y, pal.width() as i32, pal.height() as i32);
                     unaos_kernel::video::cursor::repaint();
                 }
-                #[cfg(feature = "pidesk")] unaos_kernel::video::wm::drag_route_tail(ev); // DRAG-PI M3 — the absolute twin of the arm above, same reasoning and same seam.
+                #[cfg(feature = "desktop_firmware")] unaos_kernel::video::wm::drag_route_tail(ev); // DRAG-PI M3 — the absolute twin of the arm above, same reasoning and same seam.
             }
             // GUI-CLICK-1: a Button report carries no cursor motion — dispatch it against the shared
             // GUI model at the current sprite position (hit-test → deliver to the hit view). Press
@@ -5227,7 +5227,7 @@ fn render_service(_: usize) {
             let Some(b) = unaos_kernel::arch::serial::shell_inbox::take() else { break };
             serial_budget -= 1;
             if windowed {
-                #[cfg(feature = "pidesk")]
+                #[cfg(feature = "desktop_firmware")]
                 {
                     handle_key(b, &mut shell_console, &mut shell_pal);
                     shell_dirty = true;
@@ -5256,7 +5256,7 @@ fn render_service(_: usize) {
             // PULSE-STRIP: the paced path. `tick` samples the per-core meters at most once a second
             // and returns whether it actually drew; an unchanged strip on an unchanged panel adds no
             // present at all, which is what keeps the always-running pulse off the render core's back.
-            dirty |= unaos_kernel::ui_status::tick(&mut pal); #[cfg(feature = "pidesk")] unaos_kernel::video::pulsewin::service(); // PULSEWIN — the pulse WINDOW is a second VIEW of the numbers `tick` has just published, so it repaints on the same cadence from the same envelope and never takes a second sample. It presents through its own `wm` row, not through `pal`, so it neither reads nor sets `dirty`. ⚠ FOLDED onto this line rather than added below it: `main.rs` is compiled into the knob-off `kernel8.img` whose byte-identity is this track's standing proof and panic `Location` records embed line numbers — PARITY.md §5.3.
+            dirty |= unaos_kernel::ui_status::tick(&mut pal); #[cfg(feature = "desktop_firmware")] unaos_kernel::video::pulsewin::service(); // PULSEWIN — the pulse WINDOW is a second VIEW of the numbers `tick` has just published, so it repaints on the same cadence from the same envelope and never takes a second sample. It presents through its own `wm` row, not through `pal`, so it neither reads nor sets `dirty`. ⚠ FOLDED onto this line rather than added below it: `main.rs` is compiled into the knob-off `kernel8.img` whose byte-identity is this track's standing proof and panic `Location` records embed line numbers — PARITY.md §5.3.
         }
         // SHELLWIN-PI — MINT THE SHELL WINDOW, once, on the first pass after the desktop is armed.
         //
@@ -5271,16 +5271,16 @@ fn render_service(_: usize) {
         // x86 never had to think about this because its latch already encodes the ordering: the
         // Kepler takeover happens after the cascade, so there "is the desktop up?" and "has the
         // cascade released the panel?" are accidentally the same question. On the Pi they are not,
-        // and `video::pidesk::armed()` is the second question asked in its own right.
+        // and `video::desktop_firmware::armed()` is the second question asked in its own right.
         //
         // The wake is free: the strip pulse posts an `Event::Timer` every `PSTRIP_PERIOD_MS` from a
         // cooperative `yield_now` loop that needs no timer IRQ, so this fires within ~250 ms of the
         // cascade ending on metal and in QEMU raspi4b alike — no polling task, no new event variant.
-        #[cfg(feature = "pidesk")]
+        #[cfg(feature = "desktop_firmware")]
         if desktop
             && shell_id == unaos_kernel::video::wm::WIN_NONE
             && !shell_declined
-            && unaos_kernel::video::pidesk::armed()
+            && unaos_kernel::video::desktop_firmware::armed()
         {
             let info = front_fb.info();
             match open_shell_window(info.width, info.height) {
@@ -5378,7 +5378,7 @@ fn render_service(_: usize) {
         //
         // Deliberately NOT counted into `s6_composites`: that witness measures PANEL composites, and
         // folding a window present into it would report the backdrop presenting when it did not.
-        #[cfg(feature = "pidesk")]
+        #[cfg(feature = "desktop_firmware")]
         if shell_dirty {
             shell_pal.render();
             let _ = unaos_kernel::video::wm::present_outcome_owned(
@@ -5643,7 +5643,7 @@ fn x86_usb_pump(cpu: usize) {
         // the first loop site. This is the pass the GUI/desktop boot reaches, i.e. the metal boot.
         #[cfg(all(target_arch = "x86_64", feature = "selfhost"))]
         unaos_kernel::selfhost::verify_source_once();
-        // DESKTOP-APP (wc knob): the deferred half of kernel-apps eviction move #1. `wcx::activate`
+        // DESKTOP-APP (wc knob): the deferred half of kernel-apps eviction move #1. `desktop_uefi::activate`
         // used to open a kernel-drawn demo window at the Kepler takeover seam; it now ARMS a launch
         // there and this pass performs it, putting `STAT.ELF` on the desktop as a real ring-3 process
         // with a real ASID instead of ~110 lines of ring-0 furniture.
@@ -5655,7 +5655,7 @@ fn x86_usb_pump(cpu: usize) {
         // SCHED-X86 finding), and it must WAIT for xHCI to enumerate storage, which only a repeating
         // service pass can do. One-shot inside; two atomic loads on every pass but one.
         #[cfg(feature = "wc")]
-        unaos_kernel::video::wcx::desktop_app_service();
+        unaos_kernel::video::desktop_uefi::desktop_app_service();
         // SDHC-4b (x86, sdhcblk knob): mount the INTERNAL SD card READ-ONLY once registered (one-shot).
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         unaos_kernel::fs::fat::sdhc_probe_once();
@@ -5764,14 +5764,14 @@ fn x86_input_service(cpu: usize) {
 
 /// SHELLNOTDESK — does the crispy desktop compositor own the backdrop on this build/boot?
 ///
-/// True only on x86-`wc` once [`unaos_kernel::video::wcx::activate`] has taken the panel. When it is
+/// True only on x86-`wc` once [`unaos_kernel::video::desktop_uefi::activate`] has taken the panel. When it is
 /// true the render service paints the CRISPY SCENE as the desktop layer and keeps the live text shell
 /// off the glass — the shell is not the desktop, it is plumbing behind the facade. On a `wc`-off x86
 /// build (and, by the caller's own `cfg`, aarch64 never reaches here) it is a compile-time `false`,
 /// so the shell keeps painting the desktop exactly as before — the whole change folds away.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 fn desktop_owns_backdrop() -> bool {
-    unaos_kernel::video::wcx::is_active()
+    unaos_kernel::video::desktop_uefi::is_active()
 }
 #[cfg(all(target_arch = "x86_64", not(feature = "wc")))]
 fn desktop_owns_backdrop() -> bool {
@@ -5779,20 +5779,20 @@ fn desktop_owns_backdrop() -> bool {
 }
 /// SHELLWIN-PI — the aarch64 twin, and the one place the two arches genuinely differ in KIND.
 ///
-/// x86 has a runtime latch because the crispy desktop arrives with a TAKEOVER: `wcx::activate` runs
+/// x86 has a runtime latch because the crispy desktop arrives with a TAKEOVER: `desktop_uefi::activate` runs
 /// off the Kepler display path during PCI enumeration, so "is the desktop up?" is a question with a
-/// boot-time answer. The Pi has no takeover. `pidesk` is a compile-time family (Cargo.toml: it
+/// boot-time answer. The Pi has no takeover. `desktop_firmware` is a compile-time family (Cargo.toml: it
 /// "declares no module of its own"), and the furniture composites from `wm::composite_once` the
 /// moment the panel is up — which, by the time this task is dispatched, it is. So the honest answer
 /// on this arch is the feature itself, and inventing an `AtomicBool` to launder a constant into a
 /// latch would be ceremony, not information.
 ///
-/// What x86 gets from `wcx::is_active` returning `false` — a boot that comes up with the shell still
+/// What x86 gets from `desktop_uefi::is_active` returning `false` — a boot that comes up with the shell still
 /// on the backdrop — the Pi gets from [`open_shell_window`]'s FALLIBLE path instead: a declined
 /// surface leaves `shell_id == WIN_NONE`, the scene still owns the glass, and the decline is on the
 /// wire. That is the GR26 lesson applied to the arch with a 48 MiB heap (x86 has 256 MiB): the
 /// window is allowed to not exist, and it is never allowed to panic the machine into existing.
-#[cfg(all(target_arch = "aarch64", feature = "pidesk"))]
+#[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))]
 fn desktop_owns_backdrop() -> bool {
     true
 }
@@ -5817,7 +5817,7 @@ fn desktop_owns_backdrop() -> bool {
 /// unusably small or the allocation fails; the desktop then comes up with no shell window and the
 /// keystroke path stays inert (the caller logs it).
 ///
-/// SHELLWIN-PI — the gate is now `x86_64 + wc` OR `aarch64 + pidesk`, and NOT ONE LINE OF THE BODY
+/// SHELLWIN-PI — the gate is now `x86_64 + wc` OR `aarch64 + desktop_firmware`, and NOT ONE LINE OF THE BODY
 /// CHANGED to make that true. Every verb it calls (`wm::spawn_geometry`, `wm::create_at`,
 /// `ui_status::top_chrome_h`) is ungated and already compiled on aarch64, and the surface it mints is
 /// its OWN heap store, so the `Bgr`/4-byte choice is a statement about the word `wm::draw_window`
@@ -5825,7 +5825,7 @@ fn desktop_owns_backdrop() -> bool {
 /// that IS different is the budget: at the bench panel (1920x1200) this asks for 960x580x4 = 2.2 MB
 /// of a 48 MiB heap that already carries a ~9.2 MiB panel back buffer, so `try_reserve_exact` is
 /// load-bearing here in a way it never was on x86's 256 MiB.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn open_shell_window(
     pw: usize,
     ph: usize,
@@ -5917,7 +5917,7 @@ fn x86_render_service(cpu: usize) {
     let front_fb = *unaos_kernel::video::WRITER.lock();
     let mut screen = unaos_kernel::video::Screen::new(front_fb);
 
-    // SHELLNOTDESK — is the crispy desktop up? Captured ONCE: `wcx::activate` runs during PCI
+    // SHELLNOTDESK — is the crispy desktop up? Captured ONCE: `desktop_uefi::activate` runs during PCI
     // enumeration, long before this task is spawned, and never releases the latch on the success
     // path, so the answer is stable for the life of the render service.
     //
@@ -6480,7 +6480,7 @@ fn tegra_rast_demo_maybe() {
     unaos_kernel::video::fbcon::detach();
     serial_println!(":: RAST: tegra — first 3D pixels on the Orin panel (inherited scanout) ::");
     let mut screen = unaos_kernel::video::Screen::new(front_fb);
-    unaos_kernel::rast_demo::run_mc(&mut screen); unaos_kernel::rast_demo::run(&mut screen); // RAST-MC: the multi-core rung runs FIRST (1-core baseline + frame-pipelined pass, both unpaced) so the paced visible spin stays the last panel content of the boot; same-line per the zero-added-lines convention above.
+    unaos_kernel::rast_demo::run_mc(&mut screen); unaos_kernel::rast_demo::run(&mut screen); drop(screen); unaos_kernel::arch::display_tegra::orin_rast_glass_post(); // RAST-MC: the multi-core rung runs FIRST (1-core baseline + frame-pipelined pass, both unpaced) so the paced visible spin stays the last panel content of the boot; same-line per the zero-added-lines convention above. ORIN-RASTGLASS: the `post` glass read-back, fired the instant `run` returns — nothing is dispatched on this core in between, so it is the ONE sample that can establish whether the blit reached the scan-out at all (`late`, from the pump sweep, then says whether it survived). `drop(screen)` first so the double buffer's own `flush` has certainly landed before the panel is read back; also releases the back buffer to the heap ahead of ~2048 volatile VRAM reads. Same-line per the convention above.
 }
 
 // Knob-off / non-rast tegra build: the wire-in compiles to nothing. `#[inline(always)]` on an empty
@@ -6661,21 +6661,21 @@ fn pi_rast_demo_maybe() {}
 // the detach and the console window stays LIVE for the rest of the boot.
 //
 // Worth recording that this makes the Pi's console window BETTER than x86's rather than equal to it:
-// on x86's desktop lane the same row is, in `wcx.rs`'s own words, "a FROZEN BOOT-LOG SNAPSHOT for the
+// on x86's desktop lane the same row is, in `desktop_uefi.rs`'s own words, "a FROZEN BOOT-LOG SNAPSHOT for the
 // rest of the boot", because that lane detaches unconditionally. The live routed console exists on
 // x86 only on the `usbdebug` bench lane, which never detaches at all. Same code, three lanes, and the
 // Pi now runs it on the one that matters to an operator.
-#[cfg(all(target_arch = "aarch64", feature = "pidesk", feature = "baremetal"))]
-fn pidesk_activate_maybe() -> bool {
-    unaos_kernel::video::pidesk::activate()
+#[cfg(all(target_arch = "aarch64", feature = "desktop_firmware", feature = "baremetal"))]
+fn desktop_firmware_activate_maybe() -> bool {
+    unaos_kernel::video::desktop_firmware::activate()
 }
 
-// Knob-off (and every non-baremetal aarch64 build): the wire-in compiles to nothing. `#[inline(always)]`
-// on a body that is a constant `false` means the call site emits zero instructions and folds to the
-// bare `detach()` it has always been, so the image stays byte-identical.
-#[cfg(all(target_arch = "aarch64", not(all(feature = "pidesk", feature = "baremetal"))))]
+// Knob-off ON THE PATH THAT HAS THE CALLER: the wire-in compiles to nothing. `#[inline(always)]` on a
+// constant `false` means the call site emits zero instructions and folds to the bare `detach()` it has
+// always been. ⚠ Gate NARROWED from `not(all(desktop_firmware, baremetal))` — see DEAD-STUB in the DESKFURN block.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal", not(feature = "desktop_firmware")))]
 #[inline(always)]
-fn pidesk_activate_maybe() -> bool {
+fn desktop_firmware_activate_maybe() -> bool {
     false
 }
 
@@ -6716,7 +6716,7 @@ fn pidesk_activate_maybe() -> bool {
 // which is armed on the MMU line at the very top of `tegra_early_stop`, some 280 lines above — so no
 // byte of it can reach an unmapped UARTC.
 //
-// SCOPE. One window. `pidesk::activate` is NOT called from here and no furniture is armed; see the
+// SCOPE. One window. `desktop_firmware::activate` is NOT called from here and no furniture is armed; see the
 // ORIN-WM1 block in `arch/aarch64/display_tegra.rs` for the cascade hazard that keeps it that way.
 
 // =================================================================================================
@@ -6724,8 +6724,8 @@ fn pidesk_activate_maybe() -> bool {
 // even when armed. Ladder: docs/dev/OS/08_VIDEO/orin-desktop.md §3.1, §3.2, §5.2, §6, §6.1.
 // =================================================================================================
 //
-// THE DEFECT THIS CLOSES. `pidesk_activate_maybe` above is gated
-// `all(aarch64, feature = "pidesk", feature = "baremetal")`. `Cargo.toml` has `baremetal = ["pi"]`
+// THE DEFECT THIS CLOSES. `desktop_firmware_activate_maybe` above is gated
+// `all(aarch64, feature = "desktop_firmware", feature = "baremetal")`. `Cargo.toml` has `baremetal = ["pi"]`
 // and `arch/aarch64/serial.rs` has `#[cfg(all(feature = "pi", feature = "tegra"))] compile_error!`,
 // so on a tegra build that gate is not merely unset — it is UNSATISFIABLE, and the wrapper always
 // resolves to its constant-`false` twin. The desktop-arming code has existed on this branch since
@@ -6734,7 +6734,7 @@ fn pidesk_activate_maybe() -> bool {
 // and this is an addition beside it, not a widening of it.
 //
 // WHY THE CALL SITE IS THE TERMINUS LINE (§3.1). `tegra_early_stop` is declared `-> !` and DIVERGES;
-// `kernel_main` — where `pidesk_activate_maybe` is wired, behind the `fbcon::detach()` handoff — is
+// `kernel_main` — where `desktop_firmware_activate_maybe` is wired, behind the `fbcon::detach()` handoff — is
 // never reached on this board. §3.1's conclusion is that the arming point "has to be chosen inside
 // `tegra_early_stop`, after the heap and the scheduler are up", and the last instruction before
 // `run_capstone_boot_core(0)` (which never returns) is the only point on this path where all of it
@@ -6756,7 +6756,7 @@ fn pidesk_activate_maybe() -> bool {
 
 /// DESKSEAM — one-shot latch. `tegra_early_stop` runs once per boot on the boot core, so this cannot
 /// fire today; it is here because the two `#[cfg]` mazes above this line have both grown a second
-/// reachable path in the past, and `pidesk::activate` has its own latch for exactly that reason.
+/// reachable path in the past, and `desktop_firmware::activate` has its own latch for exactly that reason.
 #[cfg(all(target_arch = "aarch64", feature = "tegradesk"))]
 static TEGRADESK_ENTERED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
@@ -6764,8 +6764,8 @@ static TEGRADESK_ENTERED: core::sync::atomic::AtomicBool =
 /// DESKSEAM STOP-LINE 1 — **has rung 3 (input routing) landed?** `display_tegra::JD1_DC_PROBE`'s
 /// idiom: a compile-time precondition held `false` in source, flipped by the rung that discharges it.
 ///
-/// §6.1 of the ladder, which calls this ordering "not negotiable": `pidesk::activate` opens the
-/// console window, that window carries a minimise disc, and `video/pidesk.rs:39-44` states the
+/// §6.1 of the ladder, which calls this ordering "not negotiable": `desktop_firmware::activate` opens the
+/// console window, that window carries a minimise disc, and `video/desktop_firmware.rs:39-44` states the
 /// CONSWIN law — the only route back from that park is the dock, and the dock is only a way back
 /// once clicks route. **DISCHARGED 2026-08-25 by ORIN-CLICK (rung 3, orin-desktop.md §3.7):** that
 /// arm now calls `wc_click_route` (`main.rs:2852`), behind `orinclick`. ⚠ NOT a literal `true`, and
@@ -6786,24 +6786,32 @@ const TEGRADESK_CLICK_ROUTED: bool = cfg!(feature = "orinclick");
 /// Flipping this alone is not enough and is not the intended route: the flip belongs to the rung that
 /// can show the Orin's own `[u7stk]`/`[redzone]` numbers for this cascade on this board. §7 of the
 /// ladder is explicit that every stack number quoted for it so far is a **Pi** number.
+///
+/// ⚠ **AND THAT CLEARING CONDITION CANNOT BE MET WHERE THE CASCADE RUNS** (ORIN-DESKFURN, 2026-08-26,
+/// orin-desktop.md §3.12). `sched::stk_probe` loads `SCHED[cpu].current` and RETURNS EARLY when it is
+/// null — which is exactly the boot core at this terminus, before `run_capstone_boot_core` drives the
+/// queue. So every rung on this line is a place where `[u7stk]` is a no-op. Clearing §5.2 needs an
+/// instrument this ladder does not have (a boot-stack high-water probe, or the cascade moved off the
+/// boot stack); it does NOT license flipping this constant on the argument that the numbers are
+/// unobtainable. Recorded here so the next reader of this stop-line meets the gap, not just the hold.
 #[cfg(all(target_arch = "aarch64", feature = "tegradesk"))]
 const TEGRADESK_CASCADE_OK: bool = false;
 
 /// **DESKSEAM — the Orin's desktop seam: evaluate the floors, print them, and refuse.**
 ///
-/// Returns `true` iff `pidesk::activate()` both ran and left the console ROUTED. Every other path
+/// Returns `true` iff `desktop_firmware::activate()` both ran and left the console ROUTED. Every other path
 /// returns `false` and names its reason on the wire. Nothing the caller does depends on the value
 /// today — the tegra path has no `fbcon::detach()` handoff to guard, which is the one thing the Pi
 /// wrapper's return value exists for — so this is a leaf, and a refusal costs the boot nothing.
 ///
 /// **EVERY VERDICT BELOW IS DERIVED FROM A VALUE READ ON THIS BOOT, never asserted.** The floors are
-/// the same ones `video/pidesk.rs` evaluates internally, hoisted to the seam so that a refusal names
+/// the same ones `video/desktop_firmware.rs` evaluates internally, hoisted to the seam so that a refusal names
 /// itself BEFORE the cascade is entered rather than from inside it — and two of them (`table` and
-/// the stage) are floors `pidesk` does not check at all, because on the Pi they cannot fail.
+/// the stage) are floors `desktop_firmware` does not check at all, because on the Pi they cannot fail.
 #[cfg(all(target_arch = "aarch64", feature = "tegradesk"))]
 fn tegra_desk_arm() -> bool {
     use core::sync::atomic::Ordering;
-    use unaos_kernel::video::{dock, fbcon, pidesk, wm};
+    use unaos_kernel::video::{dock, fbcon, desktop_firmware, wm};
 
     if TEGRADESK_ENTERED.swap(true, Ordering::AcqRel) {
         serial_println!("[deskseam] REFUSE reason=already-armed (the seam is one-shot; a second pass would re-enter pidesk's own latch and re-ask for a window it would hand straight back)");
@@ -6823,7 +6831,7 @@ fn tegra_desk_arm() -> bool {
         }
         fb.info()
     };
-    // NO SEPARATE ZERO-GEOMETRY FLOOR, and it was removed rather than never written: `pidesk`'s own
+    // NO SEPARATE ZERO-GEOMETRY FLOOR, and it was removed rather than never written: `desktop_firmware`'s own
     // step 1 tests `pw == 0 || ph == 0` after reading `WRITER`, so the obvious thing was to hoist
     // that test here too. `FrameBuffer::is_ready` (framebuffer.rs) is
     // `base != 0 && len != 0 && info.width != 0 && info.height != 0` — the extent test is already
@@ -6849,17 +6857,17 @@ fn tegra_desk_arm() -> bool {
     let cover = if panel_bytes == 0 { 0 } else { staged.saturating_mul(100) / panel_bytes };
 
     // FLOOR 3 — THE WINDOW TABLE MUST BE EMPTY, read from `wm::count()`.
-    // `video/pidesk.rs` step 1b writes the WHOLE PANEL to `DESKTOP_BG` through the FRONT buffer, and
+    // `video/desktop_firmware.rs` step 1b writes the WHOLE PANEL to `DESKTOP_BG` through the FRONT buffer, and
     // its own argument for why that direct write is sound is "the window table is empty at this
     // line, so a direct front-buffer write collides with no compositor-owned pixel". On the Pi that
     // is true by construction. On the Orin it is NOT: rung 0 (`orindesk`) mints and composites a row
     // ~400 lines above this one, so `UNAOS_ORINDESK=1 UNAOS_TEGRADESK=1` reaches this seam with a
-    // live window on the glass and `pidesk`'s clear would paint over it while asserting it could not.
+    // live window on the glass and `desktop_firmware`'s clear would paint over it while asserting it could not.
     // This is a REACHABLE failing verdict from two knobs in `arroyo` today, not a hypothetical.
     let live = wm::count();
 
     // FLOOR 4 — THE DOCK, i.e. the CONSOLEWIN law's geometry half, evaluated with the SAME call
-    // `pidesk` makes (`MAX_WINDOWS`, not the live count — the check must hold for every table state
+    // `desktop_firmware` makes (`MAX_WINDOWS`, not the live count — the check must hold for every table state
     // the boot can reach). `for_panel` is pure integer geometry and paints nothing. Two-sided in
     // codegen and derived from the live panel — but the WITHHELD arm's REACH is stated as measured
     // rather than inherited from the Pi: on this build `for_panel` INLINES and const-folds its
@@ -6868,8 +6876,8 @@ fn tegra_desk_arm() -> bool {
     // branch has seen withholds it. The Pi's `DECLINE reason=dock-cannot-host-full-strip
     // panel=640x480 rows=12` was measured under that track's cell metrics and does NOT transfer —
     // 640x480 clears the floor above. Reported as the console-window CENSUS term rather than as a
-    // refusal because a withheld console window is not fatal to `pidesk` either: the bar follows
-    // regardless, which is the one place `pidesk`'s sequence deliberately differs from `wcx`'s.
+    // refusal because a withheld console window is not fatal to `desktop_firmware` either: the bar follows
+    // regardless, which is the one place `desktop_firmware`'s sequence deliberately differs from `desktop_uefi`'s.
     let cwin_ok = dock::Layout::for_panel(wm::MAX_WINDOWS, pw, ph).is_some();
     let routed_now = fbcon::console_is_routed();
 
@@ -6915,7 +6923,7 @@ fn tegra_desk_arm() -> bool {
     // call's own return CROSSED with `fbcon::console_is_routed()` read back afterwards — `activate`
     // already reads the route back rather than inferring it, and this line disagreeing with it would
     // itself be the finding.
-    let activated = pidesk::activate();
+    let activated = desktop_firmware::activate();
     let routed_after = fbcon::console_is_routed();
     let verdict = match (activated, routed_after) {
         (true, true) => "ROUTED",
@@ -6929,4 +6937,571 @@ fn tegra_desk_arm() -> bool {
         pw, ph, staged, activated, routed_after, verdict
     );
     activated && routed_after
+}
+
+// =================================================================================================
+// ORIN-CONWIN (tail block) — rung 4's SECOND half: the handoff detach, guarded by the route.
+// =================================================================================================
+//
+// THE TWO EDITS IN THIS FILE, and why neither adds a source line. Rung 4's entry is
+// `arch::display_tegra::orin_conwin`, called as a statement APPENDED to `tegra_early_stop`'s terminus
+// line beside DESKSEAM's — the `smpmark` / ORIN-WM1 / JD1-DC convention, whose reason is PI-V3D-1 and
+// is bisect-proven rather than stylistic: `panic!`/`assert!`/bounds-check sites bake a
+// `core::panic::Location` (file AND LINE) into rodata, so inserting even a comment line ahead of them
+// shifts every later `Location` and the knob-off image stops being byte-identical. The second edit is
+// `jd2_console_pump`'s phase-2 `fbcon::detach()`, folded IN PLACE to `if !tegra_conwin_live() { … }`.
+// This block is at the FILE TAIL, below every `Location` in `main.rs`, so nothing moves.
+//
+// WHY THE GUARD IS THE WHOLE OF RUNG 4'S "LIVE" CLAIM. `detach` sets `GUI_ACTIVE`, after which
+// `fbcon::_print` returns at its first test and not one further kernel line reaches the console by any
+// path. A console window opened at the terminus and then detached at phase 2 would hold the boot log
+// and never change again — the frozen snapshot x86's desktop lane ships (`desktop_uefi.rs` calls its row "a
+// FROZEN BOOT-LOG SNAPSHOT for the rest of the boot"). The Orin does not have to inherit that, for the
+// Pi's reason, restated for this board: the REASON for the detach is discharged by the route itself.
+// The detach exists so that exactly one core writes the PANEL once the JD2 `Screen` console owns it —
+// and a routed console does not write the panel. `FbCon::draw_fb` hands back `win_fb`, cached kernel
+// RAM no scan-out reads, and the pixels reach glass only through `wm`'s staged present, damage-limited
+// and paced. So on a boot where the route was installed, the handoff SKIPS the detach and the window
+// stays LIVE; on every other boot the guard is `false` and phase 2 detaches exactly as it always did.
+//
+// FAIL-CLOSED BY CONSTRUCTION. `console_is_routed()` answers `false` for every decline arm the open
+// path has AND for every arm `orin_conwin` itself takes — no panel, the ordering rule, the dock law,
+// an open that declined — so a rung that refused anywhere leaves the detach taken, unchanged.
+
+/// ORIN-CONWIN — **is the console routed into a compositor window on THIS boot?** The one fact
+/// `jd2_console_pump`'s phase-2 detach is guarded by. Read from `fbcon` rather than from a local, for
+/// `desktop_firmware::activate`'s reason: a route declined deep inside the open path must not be reported as
+/// installed by a caller that remembers having asked for one.
+///
+/// ⚠ THE `target_arch` TERM IS FORCED AND ITS REASON IS MEASURED — it is not an arch reflex.
+/// `arroyo`'s env map appends `tegra` to ONE shared feature list that BOTH legs of `./arroyo check`
+/// are built with, so `feature = "tegra"` alone is TRUE on an x86_64 build; the callee
+/// `fbcon::console_is_routed` is gated `all(target_arch = "aarch64", feature = "desktop_firmware")` and does not
+/// exist there. That is an E0425 this arc's first check actually produced, not a hypothetical. Every
+/// tegra helper at this file's tail carries the same term for the same reason (`jd2_console_pump`,
+/// `tegra_rast_demo_maybe`, `tegra_desk_arm`, `tegra_el0_start_maybe`). The KNOB still does the
+/// gating; the arch term only stops a `tegra`-flavoured x86 leg from compiling an aarch64 call.
+#[cfg(all(feature = "tegra", feature = "orinconwin", target_arch = "aarch64"))]
+#[inline(always)]
+fn tegra_conwin_live() -> bool {
+    unaos_kernel::video::fbcon::console_is_routed()
+}
+
+/// Knob-off (every tegra build without `orinconwin`, and every x86 leg `arroyo` hands `tegra` to): the
+/// guard compiles to nothing. `#[inline(always)]` on a body that is a constant `false` means the call
+/// site emits zero instructions and folds to the bare `fbcon::detach()` it has always been, so the
+/// jetson image stays byte-identical.
+#[cfg(all(feature = "tegra", not(all(feature = "orinconwin", target_arch = "aarch64"))))]
+#[inline(always)]
+fn tegra_conwin_live() -> bool {
+    false
+}
+
+// =================================================================================================
+// ORIN-SUPSTATE — SMP-redesign Candidate A arc 1 (the console-surface STATE LIFT). `supstate`,
+// DEFAULT OFF. Appended at the file tail on purpose: knob-off these items are `#[cfg]`-erased and
+// nothing below them exists to be shifted, so the jetson image's panic-`Location` records — and with
+// them the knob-off byte-identity proof — are untouched (the orinclick line-neutrality rule).
+// =================================================================================================
+
+/// ORIN-SUPSTATE — `jd2_console_pump`'s phase 2 with the console surface LIFTED out of task-local
+/// storage. Entered from the pump's phase-1 boundary (the `#[cfg]`-appended hook on the phase-1
+/// loop's closing line) and never returns, exactly as the legacy phase 2 never returns.
+///
+/// WHAT IS DIFFERENT, and it is ownership only: `Screen` and `Console` are built here exactly as
+/// the legacy phase 2 builds them — same construction order, same serial lines, same first-key
+/// handling — and then INSTALLED into `display_tegra`'s module-owned handle (`sup_install`) instead
+/// of living out the boot as this task's stack locals. Every subsequent surface access goes through
+/// `sup_with_surface`, so the state outlives its holder: a successor task could adopt the very
+/// `Screen`/`Console` this task was driving when it died. `TargetPal` is a VIEW (`&mut Screen`) and
+/// is reconstructed per lock scope via its public `surface` field — `TargetPal::new` is called
+/// exactly once, below, so the armed boot carries the same single `:: UI1:` line the baseline does.
+///
+/// WHAT IS DELIBERATELY THE SAME: the drive loop below is the legacy pump's phase-2 loop, clause
+/// for clause (xHCI poll, coalesced pointer drain, save-under cursor bracket, ~250 ms sweep cadence
+/// with the census on the same counter phase 1 advanced, `yield_now` — never `sleep_ticks`, the JC3
+/// rule: this core's terminus drains no sleepers). Behavioural falsifier: the `[orinclick]` census
+/// and the `:: tegra: JD2 —` transcript, which must read identically knob-on vs knob-off.
+///
+/// Milestone 1 of the arc: ONE task still holds every role. The role split (input source /
+/// presenter / dispatcher, separate task identities, all still pinned to core 0) lands on top of
+/// this lift as the arc's second milestone; the supervisor/reap/restart half is arc 2's, gated on
+/// Candidate B's clock, and nothing here pretends otherwise.
+#[cfg(all(feature = "tegra", target_arch = "aarch64", feature = "supstate"))]
+fn jd2_supstate_phase2(
+    front_fb: unaos_kernel::video::FrameBuffer,
+    first_key: Option<u8>,
+    sweep_ticks: u64,
+    mut last_sweep: u64,
+    mut sweep_tick: u64,
+) {
+    use unaos_kernel::arch::display_tegra::sup_install;
+    use unaos_kernel::pal::{Event, GneissPal};
+
+    // The pump's free-running clock, re-read here rather than passed: CNTPCT is EL-independent and
+    // per-core monotonic (the JD3 timerless mechanism), and `last_sweep`/`sweep_tick` carry the
+    // phase-1 cadence across the boundary so the sweep counter never restarts.
+    let cntpct = || -> u64 {
+        let v: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, CNTPCT_EL0", out(reg) v, options(nomem, nostack, preserves_flags));
+        }
+        v
+    };
+
+    // ——— the JD2/JD4 panel takeover: legacy phase 2, verbatim semantics ———————————————————————————
+    // Detach the fbcon serial mirror FIRST (guarded by the ORIN-CONWIN route exactly as the legacy
+    // line is), so a CAPSTONE straggler can't paint over the console frame.
+    if !tegra_conwin_live() {
+        unaos_kernel::video::fbcon::detach();
+    }
+    let mut screen = unaos_kernel::video::Screen::new(front_fb);
+    // VUGRAS: the Screen back buffer PA is only known now — add it to the candidate table.
+    unaos_kernel::vugras::note_screen(&screen);
+    // The single `TargetPal::new` of the armed boot — prints the one `:: UI1:` line.
+    let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen);
+    let mut console = unaos_kernel::console::Console::new();
+    // JD11: mirror every command-output line to serial (durable, mbench-able transcript).
+    console.set_output_sink(jd2_out_sink);
+    console.println("UnaOS — Jetson Orin Nano (Tegra234)");
+    console.println("JD2: interactive shell on the inherited scanout. Type 'help'.");
+    console.draw(&mut pal);
+    pal.render();
+    match first_key {
+        Some(c) => {
+            serial_println!(
+                ":: tegra: JD2 — console OWNS the panel (Screen back buffer live); first key {:#04x} ::",
+                c
+            );
+            // The wake-up keystroke is a real keystroke: feed it through, don't swallow it.
+            handle_key(c, &mut console, &mut pal);
+            pal.render();
+        }
+        None => serial_println!(
+            ":: tegra: JD4 — console OWNS the panel (Screen back buffer live); screen-on-boot (no key, ~8 s) ::"
+        ),
+    }
+
+    // ——— THE LIFT: the surface leaves this task's stack and becomes module-owned ————————————————
+    drop(pal); // end the view's borrow; the Screen it viewed moves into the handle next
+    sup_install(screen, console);
+
+    // ——— THE SPLIT (milestone 2): the roles get separate task identities ————————————————————————
+    // Both new roles are PINNED TO CORE 0 exactly as this task is — this arc changes ownership,
+    // never placement. Spawned only now, after `sup_install`, so neither role can ever observe an
+    // uninstalled surface. This task carries on as the INPUT SOURCE below.
+    unaos_kernel::arch::sched::spawn("jd2-present", jd2_supstate_presenter, 0, 0);
+    unaos_kernel::arch::sched::spawn("jd2-dispatch", jd2_supstate_dispatcher, 0, 0);
+    serial_println!(
+        "[supstate] roles input=jd2-console presenter=jd2-present dispatcher=jd2-dispatch core=0 (pinned; ownership split, placement unchanged) -> SPLIT"
+    );
+
+    // ——— the INPUT SOURCE loop: xHCI poll + PAL drain + click routing + the sweep cadence ————————
+    // What stays here is exactly the legacy loop's input half: the controller poll, the event
+    // drain with per-frame pointer coalescing, the JD20 announce/Button lines, `orin_click`, and
+    // the ~250 ms sweep (VUGRAS + the `[orinclick]` census — the census stays AUTHORED BY THE
+    // ROUTING TASK, which is the property that makes it trustworthy; see display_tegra.rs).
+    // What left: keys go over the key seam to the dispatcher; presentation goes to the board.
+    let mut announced = false;
+    loop {
+        if let Ok(mut x) = unaos_kernel::drivers::xhci::claim() {
+            x.poll_events();
+        }
+        // ORIN-POINTER-FIX: coalesce all pointer motion in the frame to a single cursor update —
+        // per-frame cursor work is O(1) regardless of report rate (see the legacy loop's account).
+        let mut pending_rel: Option<(i32, i32)> = None;
+        let mut pending_abs: Option<(i32, i32)> = None;
+        // GUI-CLICK-2's contract, honoured across the split: while a foreground command owns the
+        // screen, its own pump_and_poll is the PAL queue's consumer — this drain stands down and
+        // only the xHCI poll above keeps feeding the ring (claim() is try-based on both sides).
+        // And the key seam's bound is checked BEFORE each pop, so a key is never popped-then-lost:
+        // when the dispatcher is 64 keys behind, events wait in the PAL ring exactly as they do
+        // today while the monolithic pump is busy inside `handle_key`.
+        if !SCREEN_APP_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
+            while !unaos_kernel::arch::display_tegra::sup_key_full() {
+                let Some(ev) = unaos_kernel::pal::next_event() else { break };
+                match ev {
+                    Event::Key(c) => {
+                        // Cannot fail: the seam's bound was checked before the pop above.
+                        let _ = unaos_kernel::arch::display_tegra::sup_key_push(c);
+                    }
+                    Event::Mouse { x, y } => {
+                        let (ax, ay) = pending_rel.unwrap_or((0, 0));
+                        pending_rel = Some((ax + x, ay + y));
+                        if !announced {
+                            serial_println!(
+                                ":: tegra: JD20 — pointer live (relative mouse, cursor on scanout) ::"
+                            );
+                            announced = true;
+                        }
+                    }
+                    Event::MouseAbsolute { x, y } => {
+                        pending_abs = Some((x, y));
+                        if !announced {
+                            serial_println!(
+                                ":: tegra: JD20 — pointer live (absolute tablet, cursor on scanout) ::"
+                            );
+                            announced = true;
+                        }
+                    }
+                    Event::Button(mask) => {
+                        // JD20's raw line first (an event reached the PUMP), then the ORIN-CLICK
+                        // route — the same two separable claims the legacy arm keeps separable.
+                        serial_println!(":: tegra: JD20 — pointer BUTTON {:#04x} (down) ::", mask);
+                        #[cfg(feature = "orinclick")]
+                        unaos_kernel::arch::display_tegra::orin_click(mask);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if pending_rel.is_some() || pending_abs.is_some() {
+            unaos_kernel::arch::display_tegra::sup_frame_pointer(pending_rel, pending_abs);
+        }
+        // VUGRAS writeback sweep + the ORIN-CLICK census, on the cadence phase 1 advanced.
+        if cntpct().wrapping_sub(last_sweep) >= sweep_ticks {
+            last_sweep = cntpct();
+            unaos_kernel::vugras::idle_sweep(sweep_tick); unaos_kernel::arch::display_tegra::sup_present_census(sweep_tick); // ORIN-SUPSOUND — the ~10 s presenter census, authored by the INPUT SOURCE on purpose: this board's UART is shared with the SPE's TCU and drops bytes, so a dead presenter must produce a REPEATING LINE (`pass=+0 -> DEAD`), never a silence. Appended to an existing statement, and un-`#[cfg]`ed because this whole block is already `supstate`-gated.
+            #[cfg(feature = "orinclick")]
+            unaos_kernel::arch::display_tegra::orin_click_census(sweep_tick);
+            sweep_tick += 1;
+        }
+        unaos_kernel::arch::sched::yield_now();
+    }
+}
+
+/// ORIN-SUPSTATE — the DISPATCHER role (`jd2-dispatch`, pinned core 0): pop keys off the seam,
+/// echo them (the bench evidence line — panel + serial must agree, and the echo lives with the
+/// task that makes the panel agree), and run `handle_key` -> `shell::dispatch_command` under the
+/// surface lock. Sequential by construction, so the per-key ordering echo -> command output that
+/// the `awk '/:: tegra: JD2 —/'` transcript reconstruction relies on is preserved exactly.
+///
+/// The one deliberate lock-discipline exception lives here: this task HOLDS the surface across
+/// `handle_key`, whose full-screen commands (`vug`, `gneiss`) yield from their own drain loops.
+/// Safe under the module's rule — every other waiter is `try_lock` + `yield_now`, so the holder's
+/// command keeps running — and identical to today's semantics, where the monolithic pump was
+/// blocked inside `handle_key` and presented nothing until the command returned.
+#[cfg(all(feature = "tegra", target_arch = "aarch64", feature = "supstate"))]
+fn jd2_supstate_dispatcher(_arg: usize) {
+    use unaos_kernel::arch::display_tegra::{sup_frame_key_repaint, sup_key_pop, sup_with_surface};
+    use unaos_kernel::pal::cursor;
+    loop {
+        let mut handled = false;
+        while let Some(c) = sup_key_pop() {
+            handled = true;
+            let took = sup_with_surface(|screen, console| {
+                let mut pal = unaos_kernel::pal::TargetPal { surface: screen };
+                // Erase the cursor BEFORE the console repaints, so the save-under stash never
+                // captures cursor pixels (the legacy bracket, unchanged).
+                cursor::restore(&mut pal);
+                if (32..=126).contains(&c) {
+                    serial_println!(":: tegra: JD2 — KEY '{}' ::", c as char);
+                } else {
+                    serial_println!(":: tegra: JD2 — KEY {:#04x} ::", c);
+                }
+                handle_key(c, console, &mut pal)
+            })
+            .unwrap_or(false);
+            if took {
+                // A command took the whole screen: stop draining this pass, exactly as the legacy
+                // frame stopped, so a queued keystroke can't paint the console back over it.
+                break;
+            }
+        }
+        if handled {
+            // The console repainted into the back buffer; the presenter re-composites the cursor
+            // on top and presents (the legacy frame's key_repainted/needs_render pair, as a mark).
+            sup_frame_key_repaint();
+        }
+        unaos_kernel::arch::display_tegra::sup_dispatch_pass(); unaos_kernel::arch::sched::yield_now(); // ORIN-SUPSOUND — the dispatcher's own liveness numerator: `disp=+0` beside a live `pass=+N` says the keys stopped being drained while the panel kept presenting, which is a different defect from a dead presenter and reads identically on the wire without this.
+    }
+}
+
+/// ORIN-SUPSTATE — the PRESENTER role (`jd2-present`, pinned core 0): drain the frame board and
+/// own every flush to glass — the coalesced cursor composite (R22 save-under bracket), the
+/// re-composite over a key repaint, the ~1.5 s auto-hide erase, and `pal.render()`. Nothing else
+/// presents: the dispatcher's `handle_key` draws only into the back buffer (the `pal.render`
+/// calls inside full-screen commands own the panel by definition and are unchanged).
+#[cfg(all(feature = "tegra", target_arch = "aarch64", feature = "supstate"))]
+fn jd2_supstate_presenter(_arg: usize) {
+    use unaos_kernel::arch::display_tegra::{sup_frame_take, sup_with_surface};
+    use unaos_kernel::pal::{cursor, GneissPal};
+    let mut last_visible = cursor::visible();
+    // ORIN-SUPSOUND — the presenter's FIRST wire line, and the only one it prints itself: it means
+    // "this task was DISPATCHED", which `spawn`'s own `:: SCHED: task` witness cannot say on this
+    // board (that line is `#[cfg(feature = "pi")]`, a deliberate wire-cost re-gate). Everything
+    // after this is carried by the ~10 s `[suppresent] census`, which the INPUT SOURCE prints —
+    // see the ORIN-SUPSOUND header in display_tegra.rs for why a lossy UART forbids a witness
+    // whose death signal is silence.
+    unaos_kernel::arch::display_tegra::sup_present_up();
+    loop {
+        let board = sup_frame_take();
+        // The auto-hide transition is edge-detected across passes, exactly as the legacy frame
+        // edge-detected it across one drain (`cursor_was_visible` at frame start vs after).
+        let vis_now = cursor::visible();
+        let auto_hide_erase = last_visible && !vis_now;
+        last_visible = vis_now;
+        // ORIN-SUPSOUND — `work` (the board had something to present) and `flushed` (pixels
+        // actually reached glass) are separated deliberately: work-without-flush is the STALLED
+        // verdict, the frozen-glass failure that a happy-path-only witness cannot distinguish
+        // from health. The closure now RETURNS `needs_render` so the flush is observed rather
+        // than assumed; `unwrap_or(false)` folds the no-surface case into "did not present".
+        let work = board.rel.is_some() || board.abs.is_some() || board.key_repaint || auto_hide_erase;
+        let mut flushed = false;
+        if work {
+            flushed = sup_with_surface(|screen, _console| {
+                let mut pal = unaos_kernel::pal::TargetPal { surface: screen };
+                let mut needs_render = board.key_repaint;
+                if board.rel.is_some() || board.abs.is_some() {
+                    // One cursor composite for the board's whole pointer activity (legacy bracket).
+                    cursor::restore(&mut pal);
+                    if let Some((dx, dy)) = board.rel {
+                        cursor::move_rel(dx, dy, pal.width() as i32, pal.height() as i32);
+                    }
+                    if let Some((ax, ay)) = board.abs {
+                        cursor::set_abs(ax, ay, pal.width() as i32, pal.height() as i32);
+                    }
+                    cursor::draw_over(&mut pal);
+                    needs_render = true;
+                } else if board.key_repaint && cursor::visible() {
+                    // A key repaint erased the cursor and redrew the console; put the arrow back.
+                    cursor::draw_over(&mut pal);
+                }
+                if auto_hide_erase {
+                    // Auto-hide swept the cursor off: erase it once so no arrow is left parked.
+                    cursor::restore(&mut pal);
+                    needs_render = true;
+                }
+                if needs_render {
+                    pal.render();
+                }
+                needs_render
+            })
+            .unwrap_or(false);
+        }
+        unaos_kernel::arch::display_tegra::sup_present_pass(work, flushed); unaos_kernel::arch::sched::yield_now(); // ORIN-SUPSOUND — two relaxed atomic adds on the per-frame path, no lock and no print; the ~10 s census turns them into the liveness verdict.
+    }
+}
+
+// =================================================================================================
+// ORIN-DESKFURN — THE FURNITURE. `orinfurn`, DEFAULT OFF. The Orin's menu bar is ENABLED and PAINTED
+// and the SHARD menu becomes pressable. Ladder: docs/dev/OS/08_VIDEO/orin-desktop.md §3.12.
+// =================================================================================================
+//
+// THE DEFECT THIS CLOSES. `menubar::ENABLED` starts `false` and there are exactly TWO
+// `menubar::set_enabled(true)` calls in this tree: `video/desktop_uefi.rs:552` (x86) and
+// `video/desktop_firmware.rs:292`. Neither is reachable on this board — `desktop_uefi` is x86_64-only, and `desktop_firmware`'s
+// is inside `activate()`, which the tegra path never calls (see the DESKSEAM block above: that seam
+// exists, IS wired to the terminus, and REFUSES at `TEGRADESK_CASCADE_OK`). So the Orin composites
+// windows with no bar above them, and a press where the crystal should be lands on empty desktop.
+// `strip`, `dock`, `menubar` and `crystal` are all COMPILED into any image carrying `desktop_firmware`, and
+// `wc_click_route`'s furniture arm already calls `strip::press_route` -> `crystal::press_at` ahead of
+// every window arm (display_tegra.rs's rung-4 block records exactly this). Everything is present;
+// nothing turns it on. This turns it on.
+//
+// ⚠ WHAT THIS IS NOT, AND THE STOP-LINE IS NOT CROSSED. `desktop_firmware::activate()` is NOT called and
+// `TEGRADESK_CASCADE_OK` is NOT touched — §5.2 stands and rung 5 is still blocked. `activate`'s
+// sequence is nine steps; this takes TWO, `menubar::set_enabled(true)` and `wm::composite()`, because
+// those two ARE the bar and nothing else in `activate` is. What is deliberately NOT taken, each for
+// its own reason rather than as a blanket: the step-1b DESKTOP-CLEAR (a whole-panel write through the
+// FRONT buffer whose soundness argument is an EMPTY window table — false here the moment rung 0 or
+// rung 4 has minted a row); the console window (rung 4's, `orinconwin`, and it stands alone);
+// `crystal::routed_selftest` (a `witness` fixture that drives presses through the live router — the
+// deep arm, and the one closest in shape to Pi boot 11's overflow); `pulsewin::open`; the window
+// population; the tegra `render_service` (§3.6, unbuilt); and the closing filesystem walk.
+//
+// WHY THE STACK ARGUMENT HOLDS HERE WHERE §5.2's DOES NOT. §5.2's hazard is the CASCADE's DEPTH and
+// its named overflow is `quarry::open()` at click-router depth (Pi boot 11). `orinfurn` does not
+// imply `quarry`, so that call is the `not(feature = "quarry")` `false` stub in this build — the same
+// fact rung 4 leaned on. What this adds to the terminus is ONE more `wm::composite()`: the same call
+// ORIN-WM1 (rung 0), `orin_conwin`'s `create_at` (rung 4) and `orin_tenant_arm` (rung 6) already make
+// from this same line on the boot core's own entry frame, all three FLOWN on Orin metal (boot7f,
+// boot7g, boot7h). A fourth instance of a shape this board has run three times is not a new shape.
+//
+// ⚠ AND THAT IS AN ARGUMENT FROM THE LEDGER, NOT A MEASUREMENT — said plainly because §7 of the
+// ladder exists to stop exactly this sentence from being read as a number. No `[u7stk]` reading for
+// this line exists on this board, and `sched::stk_probe` CANNOT take one here: it loads
+// `SCHED[cpu].current` and returns early when that is null, which is precisely the boot core before
+// `run_capstone_boot_core` drives the queue. So the terminus is a place where §5.2's own evidence
+// requirement is structurally unsatisfiable. That is a finding ABOUT the stop-line, not a licence to
+// step over it, and it is why this block narrows the work instead of flipping the constant.
+//
+// DEAD-STUB (the second edit in this file, and the whole of it is one `#[cfg]`). The knob-off
+// `desktop_firmware_activate_maybe` above read `all(aarch64, not(all(desktop_firmware, baremetal)))`, which compiled the
+// constant-`false` stub on every NON-baremetal aarch64 build — including every tegra one, where its
+// only call site does not exist: that site is `kernel_main`'s GUI-handoff line, itself
+// `all(aarch64, baremetal)`, and on this board `kernel_main` is unreachable anyway because
+// `tegra_early_stop` is `-> !` and diverges. Hence `desktop_firmware_activate_maybe is never used` in every
+// tegra gate log for weeks, and the warning was right. Narrowed to
+// `all(aarch64, baremetal, not(desktop_firmware))` so the pair exists exactly where its caller does.
+// BEHAVIOURALLY INERT: under `baremetal` both arms resolve exactly as before, so the Pi is
+// unaffected; elsewhere it deletes a function that emitted no instructions. LINE-NEUTRAL: one
+// attribute and its comment rewritten in place, no line added or removed in `main.rs`, so no panic
+// `Location` moves and the knob-off byte-identity proof is intact.
+//
+// ZERO SOURCE LINES. The call site is a statement APPENDED to the existing terminus line and this
+// block is at the FILE TAIL — the `smpmark`/ORIN-WM1/DESKSEAM/ORIN-CONWIN convention, whose reason is
+// PI-V3D-1 and is bisect-proven: panic `Location` records embed line numbers, so a line inserted
+// ahead of them moves the loadable image even with every knob off.
+//
+// WHERE ON THE LINE. LAST of the rungs — after `orin_ladder_arm`, before `tegra_rast_demo_maybe` —
+// for two reasons. (1) Every earlier rung's probe (`[orinwm1]`, `[orinchrome]`, `[orinconwin]`,
+// `[orintenant]`, `[oringlass]`, `[orindock]`) then still reads a panel with no bar on it, so an
+// armed capture stays directly comparable to boot7f/7g/7h. (2) It is still AHEAD of
+// `boot_ok_disarm`, so the `orinwdt` boot watchdog covers the composite this drives — if the bar's
+// composite is where the board dies, the watchdog is still armed to say so.
+
+/// DESKFURN — one-shot latch, for DESKSEAM's stated reason: `tegra_early_stop` runs once per boot on
+/// the boot core so this cannot fire today, but the `#[cfg]` maze above has grown a second reachable
+/// path before, and `menubar::set_enabled` is not idempotent in its WITNESS (it bumps `TOGGLES` and
+/// latches `DEFAULT_LATCH`), so a second pass would make the bar's own instrument read a history that
+/// did not happen.
+#[cfg(all(target_arch = "aarch64", feature = "orinfurn"))]
+static ORINFURN_ENTERED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// **ORIN-DESKFURN — enable the menu bar, composite it, and READ THE PAINT BACK.**
+///
+/// Returns `true` iff the bar is enabled AND owns pixels when this returns. Nothing the caller does
+/// depends on the value: like DESKSEAM this is a leaf, because the tegra path has no
+/// `fbcon::detach()` handoff for a return value to guard — rung 4's `tegra_conwin_live` guards that
+/// one, off the ROUTE, and the bar has no bearing on it.
+///
+/// **EVERY VERDICT IS DERIVED FROM A VALUE READ ON THIS BOOT.** The floors are read live; the paint is
+/// read back through `menubar::owns_pixels()` rather than inferred from having called `composite` —
+/// `video/menubar.rs` documents that load as the one thing distinguishing "enabled" from "on the
+/// glass", and `desktop_firmware` reads it for the same reason at the same seam.
+#[cfg(all(target_arch = "aarch64", feature = "orinfurn"))]
+fn tegra_desk_furn() -> bool {
+    use core::sync::atomic::Ordering;
+    use unaos_kernel::video::{menubar, wm};
+
+    // THE ENTRY LINE, printed before anything can decline. A silent `false` must never be
+    // indistinguishable from "the seam was never called" — that ambiguity is exactly what made the
+    // missing bar read as a mystery rather than as a refusal, and one unconditional line closes it.
+    // The sibling knobs are named because this rung's usefulness is a function of them: without
+    // `orinconwin` the bar has no window caption to show, and `orinclick` is IMPLIED by `orinfurn`
+    // (Cargo.toml) so `click=1` here is a structural fact, printed to be falsifiable rather than
+    // trusted.
+    serial_println!(
+        "[orinfurn] arm click={} conwin={} desk={} tenant={} deskseam={} (ORIN-DESKFURN entered on the tegra terminus; §5.2 UNCROSSED — pidesk::activate is NOT called)",
+        cfg!(feature = "orinclick") as u8,
+        cfg!(feature = "orinconwin") as u8,
+        cfg!(feature = "orindesk") as u8,
+        cfg!(feature = "orintenant") as u8,
+        cfg!(feature = "tegradesk") as u8
+    );
+
+    if ORINFURN_ENTERED.swap(true, Ordering::AcqRel) {
+        serial_println!("[orinfurn] REFUSE reason=already-armed (the seam is one-shot; a second pass would re-toggle ENABLED, bump menubar's TOGGLES counter and make its DEFAULT_LATCH witness read a history that did not happen)");
+        return false;
+    }
+
+    // FLOOR 1 — THE PANEL, off the surface the compositor composites onto, never assumed. Copy the
+    // info out and drop `WRITER` immediately: nothing below may hold it across a `wm` call, which is
+    // ORIN-WM1's WRITER/TABLE acquisition-order rule. FAILS on a headless Orin — no DTB
+    // `simple-framebuffer` handoff means JD1 printed `JB1b — geometry unresolved` and seeded no
+    // scanout, and every floor below is a function of panel geometry.
+    let info = {
+        let fb = *unaos_kernel::video::WRITER.lock();
+        if !fb.is_ready() {
+            serial_println!("[orinfurn] REFUSE reason=no-panel (headless boot — JD1 seeded no scanout; the bar's geometry, its floors and the composite that paints it are all functions of panel geometry)");
+            return false;
+        }
+        fb.info()
+    };
+    let (pw, ph) = (info.width, info.height);
+
+    // FLOOR 2 — THE STAGING BUFFER, here for DESKSEAM's reason restated: `wm`'s staged presents run
+    // inside `SYS_WIN_PRESENT`'s IRQ mask, so a stage that GREW on the pass would be a masked
+    // acquisition of the global heap `Mutex` — the F1-F5 defect family. The tree's only
+    // `reserve_stage` caller on a normal boot is `video::init_panel`, which the tegra path never
+    // reaches (it seeds `WRITER` by hand instead). Grow-only and idempotent, so it is safe beside the
+    // identical calls rungs 0/2/4/6 make from this same line. FAILS when the 48 MiB aarch64 heap
+    // cannot spare entry 0 at all.
+    let staged = wm::reserve_stage(&info);
+    if staged == 0 {
+        serial_println!("[orinfurn] REFUSE reason=stage-unreserved panel={}x{} stage=0 (wm::reserve_stage got nothing for entry 0 — the bar's composite would grow its buffer under SYS_WIN_PRESENT's IRQ mask, the F1-F5 shape)", pw, ph);
+        return false;
+    }
+
+    // FLOOR 3 — THE BAR'S OWN GEOMETRY FLOOR, read through THE ONE accessor (`menubar::strip_rect`,
+    // which is also what `strip::TENANTS` and `wm::erase_clip` read — there is no second copy of the
+    // bar's rectangle anywhere). `None` on a panel shorter than `FLOOR_H` or narrower than `FLOOR_W`.
+    // REACHABLE rather than hypothetical: the floor admits 640x480 and refuses below it, so a boot
+    // that came up on a fallback mode instead of the bench's 1920x1200 can land here.
+    let rect = menubar::strip_rect(pw, ph);
+    let live = wm::count();
+    let was_enabled = menubar::enabled();
+    let owned_before = menubar::owns_pixels();
+
+    // THE CENSUS. Unconditional, and ahead of the refusal below it, so a capture always carries every
+    // measured floor and not merely the first one that said no.
+    serial_println!(
+        "[orinfurn] floors panel={}x{}x{} stage={} rect={:?} table={} bar-was={} owned-was={} rows={}",
+        pw, ph, info.bytes_per_pixel, staged, rect, live, was_enabled, owned_before, wm::MAX_WINDOWS
+    );
+
+    if rect.is_none() {
+        serial_println!("[orinfurn] REFUSE reason=panel-below-bar-floor panel={}x{} (menubar::strip_rect declined this panel — shorter than FLOOR_H or narrower than FLOOR_W; enabling the bar anyway would subtract rows from every present that no composite could then fill)", pw, ph);
+        return false;
+    }
+
+    // THE ARM — the tenancy is CLAIMED. Two statements, and the second is load-bearing rather than a
+    // flourish: from the instant the bar is enabled `Screen::present_background` subtracts its rect,
+    // so those rows stop being desktop pixels and ONLY a composite can fill them, and
+    // `wm::service_damage` returns without compositing while no row is dirty. On the quiet boot this
+    // board actually has, nothing would ever paint them. One pass at the seam closes that by
+    // construction — `desktop_firmware`'s step 5, and SHELLDESK's exact symptom, reached on a third seam.
+    let bar_was = menubar::set_enabled(true);
+    wm::composite();
+
+    // READ THE PAINT BACK; do not infer it from having called `composite`. `strip::paint` declines a
+    // pass without touching a pixel on a contended `SCRATCH` (the dock is tenant #1 and takes the
+    // same scratch in the same pass) or a surface not yet `word4`, and `menubar::compose` then
+    // returns `false` with its slot untouched. One re-run discharges it — `owns_pixels` is the same
+    // packed load `compose` acts on, so the retry runs iff the first pass did not land.
+    let retried = if menubar::enabled() && !menubar::owns_pixels() {
+        wm::composite();
+        true
+    } else {
+        false
+    };
+    let painted = menubar::owns_pixels();
+
+    if !painted {
+        // ROLLBACK, and this is where this seam deliberately DIFFERS from `desktop_firmware::activate`, which
+        // reports the miss and leaves the bar ENABLED. On the Orin that outcome is worse than no bar:
+        // `jd2_console_pump` owns the panel through a `Screen` whose `present_background` subtracts
+        // the bar's rect on every present, so an enabled-but-unpainted bar is a permanent dead band
+        // across the top of the console for the rest of the boot, with no damage condition able to
+        // notice it. Putting `ENABLED` back makes those rows desktop pixels again and the next
+        // present fills them. The disagreement with `desktop_firmware` is stated rather than hidden: it is a
+        // behaviour difference between two seams, and only a bench boot can say which is right here.
+        menubar::set_enabled(bar_was);
+        serial_println!(
+            "[orinfurn] REFUSE reason=composite-declined panel={}x{} stage={} retried={} rolled-back-to={} passes={} (menubar::compose left its slot untouched — strip::paint declines on a contended SCRATCH or a surface not yet word4. ENABLED restored: an enabled bar with no pixels is a dead band Screen::present_background subtracts forever)",
+            pw, ph, staged, retried, bar_was, if retried { 2 } else { 1 }
+        );
+        return false;
+    }
+
+    serial_println!(
+        "[orinfurn] ARMED panel={}x{} stage={} rect={:?} bar-was={} retried={} owns_pixels={} table={} -> BAR-ON-GLASS",
+        pw, ph, staged, rect, bar_was, retried, painted, live
+    );
+    // The SHARD menu is reachable from this instant, and that is a SECOND claim, not a restatement:
+    // "the bar is painted" and "the bar is live" are two sentences and a capture should not have to
+    // infer the second. `crystal::press_at` hit-tests `menubar::crystal_corner_abs` (FITTS-CORNER —
+    // the bar's whole upper-left corner cell, not just the glyph), and `wc_click_route`'s furniture
+    // arm calls `strip::press_route` ahead of every window arm on an image carrying `desktop_firmware`, which
+    // `orinfurn` implies. ⚠ UNFLOWN: no Orin has pressed it. The falsifier is an
+    // `[orinclick] edge=press … at (x,y)` INSIDE the corner rect printed here that still ends
+    // `-> RAISED` or `MISS-SHELL` — the press reaching a window or the desktop means the menu band
+    // did not consume it, which is the bar not being live however painted it looks.
+    serial_println!(
+        "[orinfurn] crystal LIVE corner={:?} — press the crystal for the SHARD menu (About is real on aarch64; Sleep/Restart/Shut Down print their honest unimplemented lines — no PSCI wiring on this track). UNFLOWN on Orin metal",
+        menubar::crystal_corner_abs(pw, ph)
+    );
+    true
 }

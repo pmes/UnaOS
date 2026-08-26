@@ -296,7 +296,7 @@ pub(crate) const HID_LOCK_KEYS: [(u8, u8); 3] = [
 /// Wall-clock budget for hardware handshakes, in `crate::arch::now_cycles()` units (rdtsc cycles on
 /// x86_64, CNTVCT ticks on aarch64). Resolved per-arch so the same ~wall-clock window holds despite
 /// the very different counter rates. On x86 it is an honest ~2 s once the TSC is calibrated against
-/// the ACPI PM timer (see `arch::hw_wait_budget`); a fixed guess otherwise. ~2.5 s under QEMU/TCG.
+/// the ACPI PM timer (see `arch::hw_wait_budget`); otherwise the fixed `HW_WAIT_BUDGET` = 2.5e9-CYCLE guess — a duration only once a TSC rate is assumed. (The "~2.5 s under QEMU/TCG" this line stated until 2026-08-25 back-computes to a ~1 GHz TCG-virtual TSC that nothing in this tree states or has measured — an unverified estimate of unknown provenance, retired; and under QEMU the ACPI PM timer IS present, so what actually runs there is the calibrated 2 s path. `usb_xhci.md` §32.1.)
 ///
 /// Why a cycle budget and not an iteration count: the previous `50_000_000`-*iteration* budget
 /// assumed cheap loop turns, but each turn does an uncached MMIO read (~0.5–1 µs on real silicon),
@@ -857,8 +857,8 @@ static XHCI_CNR_OK: AtomicBool = AtomicBool::new(true);
 /// latches). The pre-HCRST reset writes (USBCMD.RS clear to halt, then HCRST) are the ONLY register
 /// writes that legitimately precede this wait — per spec 4.2 the CNR wait belongs AFTER HCRST, which
 /// is exactly where this runs (the reset path is in `init()` / `reset()`; this gates the ring/
-/// interrupter programming that follows). Bounded by `hw_wait_budget()` (~2.5 s aarch64 / ~2 s x86,
-/// comfortably over the VL805's fw-load); a few-ms interval between polls. Returns false on timeout
+/// interrupter programming that follows). Bounded by `hw_wait_budget()` (2.78 s Pi 4 / 4.8 s Orin /
+/// ~2 s x86, comfortably over the VL805's fw-load); a few-ms interval between polls. Returns false on timeout
 /// so the caller aborts loudly rather than programming a not-ready controller (no hang either way —
 /// the budget is a hard wall-clock bound).
 fn wait_for_cnr_clear(op_base: usize) -> bool {
@@ -1048,7 +1048,7 @@ pub static BOT_RETRY_FAIL: AtomicU64 = AtomicU64::new(0);
 /// Reset Recovery exists to absorb (PIUSB-38's induced stall recovers on the first try, and a
 /// marginal device on a long cable can lose one transaction and be fine), so escalating on the
 /// first would fire the heavy rungs against devices the light one already fixed. Two, not three or
-/// more: every extra rung costs a full first-attempt budget (~6 s) of desktop-starving busy-spin,
+/// more: every extra rung costs a full first-attempt budget (6–14.4 s by arch) of desktop-starving busy-spin,
 /// and the failure this arc addresses is PERMANENT — a device that fails the ladder twice in a row
 /// has never, in any capture, recovered on the third.
 const BOT_RESCUE_N_CONSEC: u32 = 2;
@@ -1068,11 +1068,11 @@ const BOT_RESCUE_PORT_OFF_MS: u64 = 100;
 /// case without turning a doomed rung into a second multi-second stall.
 const BOT_RESCUE_PORT_ON_MS: u64 = 300;
 /// Multiplier on `hw_wait_budget()` for a BOT stage's wall-clock wait. THREE on the first attempt
-/// (~6 s): a real device can legitimately stall 1–4 s on a write, and shortening this would turn a
-/// slow-but-healthy stick into a false failure. ONE (~2 s) for an escalation retry: by then the
-/// device has already burned two full ladders' worth of budget without answering, the question the
-/// retry asks is "did the heavy reset revive it", and a revived device answers in milliseconds —
-/// so the extra 4 s buys no information and is paid in frozen desktop.
+/// (3 × the base budget — 6 s x86, 8.3 s Pi 4, 14.4 s Orin; base 2 s / 2.78 s / 4.8 s, see arch
+/// `hw_wait_budget`): a real device can legitimately stall 1–4 s on a write, and shortening this
+/// would turn a slow-but-healthy stick into a false failure. ONE (the base budget) for an
+/// escalation retry: by then the device has burned two full ladders without answering, the retry
+/// asks only "did the heavy reset revive it", and a revived device answers in milliseconds.
 const BOT_BUDGET_SCALE_FIRST: u64 = 3;
 const BOT_BUDGET_SCALE_ESCALATION: u64 = 1;
 /// BOT-RESCUE M3 witness 4: Transfer Events observed for a slot OTHER than the one a BOT stage is
@@ -1139,7 +1139,7 @@ const BOT_PARK_LADDER_MAX: u32 = 6;
 const BOT_PARK_SURRENDER_MAX: u32 = 2;
 /// Total pump wall-clock, in milliseconds, one identity may burn before parking regardless of how
 /// that time divides into ladders. The bound the metal sitting actually needed: 45 s is ~5 first-
-/// attempt budgets (`hw_wait_budget() * BOT_BUDGET_SCALE_FIRST` ≈ 8.3 s on Pi 4), i.e. a device gets
+/// attempt budgets (`hw_wait_budget() * BOT_BUDGET_SCALE_FIRST` — 8.3 s Pi 4, 14.4 s Orin), i.e. a device gets
 /// several honest chances to be merely slow, and the desktop gets its core back inside a minute
 /// instead of losing it for the boot.
 const BOT_PARK_CYCLE_MAX_MS: u64 = 45_000;
@@ -1175,9 +1175,9 @@ const BOT_PARK_DEAD_DIV: u64 = 8;
 /// reversible budget cut; it cannot carry a permanent verdict, because the thing that resets it is
 /// unrelated to the device being judged.
 ///
-/// EIGHT. Two arm the cut at the full budget (~7.2 s each on Pi 4 at `BOT_BUDGET_SCALE_FIRST`),
-/// then six more at the cut (~0.3 s each) — i.e. the device is given six further chances to answer
-/// AFTER it has proven itself idle twice, and the whole verdict costs ~16 s instead of the ≥45 s
+/// EIGHT. Two arm the cut at the full budget (8.3 s each on Pi 4 at `BOT_BUDGET_SCALE_FIRST`),
+/// then six more at the cut (~0.35 s each) — i.e. the device is given six further chances to answer
+/// AFTER it has proven itself idle twice, and the whole verdict costs ~19 s on Pi 4 instead of the ≥45 s
 /// the wall-clock clause needs (and never reaches once the cut is on). A healthy device is charged
 /// none of these: a completion is `dead=false`, and a live ring posts events, foreign events or
 /// doorbells, any one of which disqualifies the wait. **That defence was overstated, and BOTLATCH M2
@@ -1224,7 +1224,7 @@ const BOT_PARK_DEAD_MAX: u32 = 8;
 /// not spun — `reprobe_at` is a deadline the next gate consultation tests, so the wait itself costs
 /// nothing. The unpark zeroes `dead_total` (the device needs a real allowance again, or the gate's
 /// own `verdict()` would re-park it inside the same call) and leaves `dead_streak` alone (so the
-/// probe is charged at the CUT budget, ~0.3 s, not a fresh ~7.2 s), and it sets `reprobed`, which is
+/// probe is charged at the CUT budget, ~0.35 s Pi 4, not a fresh 8.3 s), and it sets `reprobed`, which is
 /// sticky for the life of the account. A SECOND park on the same identity is therefore permanent,
 /// and only an operator replug clears the flag.
 ///
@@ -3079,7 +3079,7 @@ pub struct XhciController {
     bot_rescue_stage: u8,
     /// Slot the ladder has SURRENDERED on (0 = none). While set, `bot_transfer` refuses every
     /// transfer to that slot up front — the guarantee that a sick disk can never again spin the
-    /// system at ~6 s per attempt forever. Cleared when the slot is disposed (disconnect) or
+    /// system at one first-attempt budget (6 s x86 / 8.3 s Pi 4 / 14.4 s Orin) per attempt forever. Cleared when the slot is disposed (disconnect) or
     /// re-enumerated, so a replug is a clean slate.
     bot_surrendered_slot: u8,
     /// Live multiplier on `hw_wait_budget()` for `pump_until_bot_done` — `BOT_BUDGET_SCALE_FIRST`
@@ -7214,7 +7214,7 @@ impl XhciController {
     {
         // BOT-RESCUE (c): a surrendered slot never sees another transfer. This is the one gate that
         // makes the guarantee absolute — every path into the driver's storage I/O comes through
-        // here, so a disk the ladder gave up on cannot be revived into another ~6 s stall by a
+        // here, so a disk the ladder gave up on cannot be revived into another full-budget stall by a
         // caller that missed the retraction. Cleared on disposal / re-enumeration.
         if slot_id != 0 && self.bot_surrendered_slot == slot_id {
             return Err(BotError::NoDevice);
@@ -10210,7 +10210,7 @@ impl XhciController {
     /// It matches by slot id, so a microSD published with `slot_id: 0` can never be retracted here.
     ///
     /// `bot_surrendered_slot` then refuses every later transfer to this slot up front. That is the
-    /// arc's actual guarantee: a sick disk can never again spin the system at ~6 s per attempt
+    /// arc's actual guarantee: a sick disk can never again spin the system at a first-attempt budget per attempt
     /// forever. It is cleared when the slot is disposed or re-enumerated, so a physical replug is a
     /// clean slate and needs no operator action beyond the replug.
     // ==================== BOT-PARK: the global floor ====================
@@ -10327,7 +10327,7 @@ impl XhciController {
                 // FIXTURE ONLY (`botwedge`): the same clock reconciliation as the injection's own
                 // credit, applied on the side of the gate that does the refusing. The refusal is
                 // real and is counted; what is credited is the fictional wait the refused attempt
-                // would have paid on metal — ~7.2 s at 62.5 MHz, longer than any back-off this
+                // would have paid on metal — 8.3 s Pi 4, 14.4 s Orin — longer than any back-off this
                 // ledger arms. Without it the gate refuses forever on a clock nothing advances:
                 // the previous run of this gate ended `backoff_refused=15 cycles=900000000
                 // ms=14400`, i.e. two charged waits out of sixteen attempts, and PARKED stayed
@@ -10491,7 +10491,7 @@ impl XhciController {
     /// `cycles=900000000 ms=14400` — accruing on a fictional clock while the gate refuses on the
     /// real one, so the wall-clock clause is unreachable in QEMU for a second reason after the
     /// first was fixed. On metal no credit is needed and none is given: a real wait of
-    /// `hw_wait_budget() * BOT_BUDGET_SCALE_FIRST` (~7.2 s at 62.5 MHz) already outlasts even
+    /// `hw_wait_budget() * BOT_BUDGET_SCALE_FIRST` (8.3 s Pi 4 metal, 14.4 s Orin) already outlasts even
     /// `BOT_PARK_BACKOFF_MAX_MS`, so the deadline expires inside the wait by itself. This only
     /// hands the fixture the same arithmetic.
     #[cfg(feature = "botwedge")]
@@ -10785,7 +10785,7 @@ impl XhciController {
     }
 
     /// BOT-RESCUE: ONE retry after an escalation rung, on the SHORTER budget
-    /// (`BOT_BUDGET_SCALE_ESCALATION` — see the constant for why the first attempt keeps ~6 s and
+    /// (`BOT_BUDGET_SCALE_ESCALATION` — see the constant for why the first attempt keeps 3× and
     /// this does not). `Some(_)` = the rung settled the question (the transfer completed, whatever
     /// its CSW says); `None` = keep escalating.
     fn bot_rescue_retry(&mut self, slot_id: u8, cdb: &[u8], data_phys: u64, data_len: u32,
@@ -10991,7 +10991,7 @@ impl XhciController {
         // the base handshake budget; only a FAILING transfer (dead DMA / wedged endpoint) ever pays
         // the full wait — the happy path returns the instant the completion event drains.
         // BOT-RESCUE: the multiple is `bot_budget_scale`, which is `BOT_BUDGET_SCALE_FIRST` (3 —
-        // the pre-arc constant, so the first attempt's ~6 s is unchanged) at all times except
+        // the pre-arc constant, so the first attempt's 3× budget is unchanged) at all times except
         // inside an escalation retry, where the caller briefly drops it to
         // `BOT_BUDGET_SCALE_ESCALATION` and restores it immediately after. A healthy device never
         // reaches an escalation retry, so it never sees anything but the historical budget.

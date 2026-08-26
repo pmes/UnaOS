@@ -235,8 +235,267 @@ unsafe extern "C" {
 /// before running the scheduler. Call at EL2 AFTER JM4's GIC/timer bring-up (the drop disables the timer,
 /// so IRQs are about to be irrelevant); `tegra`-only (this module mirrors `boot_virt`'s `virt`-only role).
 pub unsafe fn drop_to_el1(l1_pa: u64) {
+    // ORIN-EL1AP: publish the root we are about to install, for the one AP that will replay this same
+    // drop on its own core (see the ORIN-EL1AP block at the file tail). Placed BEFORE the drop rather
+    // than after because there is no "after" on this side — `drop_el2_to_el1_tegra` returns to our
+    // CALLER, not to us. Knob-off the statement does not exist.
+    #[cfg(feature = "orinel1ap")]
+    EL1_ROOT.store(l1_pa, core::sync::atomic::Ordering::Release);
     unsafe {
         enable_el1_regime(l1_pa);
         drop_el2_to_el1_tegra();
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+// ORIN-EL1AP (baton orin-8 item 1, Candidate C) — drop ONE PSCI-woken AP from EL2 to EL1
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// THE GAP THIS CLOSES. `sched.rs`'s EL0-EL1CORE filter admits an EL0 task only onto a core that has
+// MEASURED itself at EL1 (`EL1_CORE_MASK`, stamped by `sched::mark_el1_core`). On the `smp_virt` path
+// only the BSP ever drops, so the mask holds exactly `0x1` — and the BSP is the core running the
+// shell, which `run` keeps and `bg` may not. The refusal is therefore correct and permanent: every
+// `bg` answers `el0refuse=<n> el1cores=0x1`. Nothing was ever made ELIGIBLE. This makes exactly one
+// AP eligible, so `el1cores` gains a second bit and a background EL0 tenant has a core to live on —
+// one whose dispatch loop is the full `sched::run()` (`secondary_run`), which unlike the boot core's
+// `run_capstone_boot_core` DOES drain due sleepers, so a tenant that sleeps is actually woken.
+//
+// EXACTLY ONE AP, BY CONSTRUCTION (`EL1AP_SEAT`). The minimum that closes the gap, and the minimum
+// blast radius: every other AP stays at EL2 as a scheduler participant with byte-identical behaviour,
+// so the SCHED-3/SPREAD-* balance for ordinary kernel tasks across the remaining cores is untouched.
+// The seat is a one-shot claim, not a retry loop — a claimant that then fails does NOT hand the seat
+// back, because a core that could not complete the drop is evidence about the platform, not a
+// transient, and a retry storm across five APs is a worse failure than one refusal line.
+//
+// IT REUSES THE BSP'S DROP, IT DOES NOT CLONE IT. `enable_el1_regime` + `drop_el2_to_el1_tegra` are
+// called verbatim — the same Rust fn, the same naked asm symbol. Every register that sequence writes
+// is per-core banked (MAIR/TCR/TTBR0/TTBR1/SCTLR_EL1, CPACR_EL1, VMPIDR/VPIDR_EL2, CPTR_EL2,
+// MDCR_EL2, CNTHCTL_EL2, CNTVOFF_EL2, CNTP_CTL_EL0, HCR_EL2, SP_EL1, SPSR_EL2, ELR_EL2), so running
+// it on an AP programs THAT AP's copy and nothing else. Two of them are load-bearing here in a way
+// they are not on the BSP and are worth naming:
+//
+//   * `mrs x0, mpidr_el1 ; msr vmpidr_el2, x0` — at EL1 an `MPIDR_EL1` read returns VMPIDR_EL2. The
+//     AP seeds its OWN affinity because the asm runs on the AP, so `gic::this_affinity()` (and with
+//     it `sgi_target_for_index`, the reschedule poke, `init_secondary_v3`'s redistributor match)
+//     keeps answering the truth after the drop. A hand-written second drop is exactly where this
+//     would have been got wrong.
+//   * `mov x0, sp ; msr sp_el1, x0` — SP_EL1 becomes this AP's own 64 KiB `SECONDARY_STACKS` slot,
+//     because that is the SP the AP is running on. No stack is shared and none is switched.
+//
+// WHAT THE BSP'S SEQUENCE DOES *NOT* PROGRAM, AND WHO DOES IT INSTEAD. `VBAR_EL1` — the caller must
+// re-run `exceptions::install()` on the far side (it picks the EL from `CurrentEL` at runtime), and
+// `percpu::init()` must re-seed `TPIDR_EL1` (the pre-drop `init` seeded TPIDR_EL2 and TPIDR_EL1 is
+// RESET-UNKNOWN). Both are the BSP's own post-drop statements at `main.rs`'s tegra terminus; the AP
+// call site repeats them for the same reasons. The drop also lands with DAIF MASKED and CNTP
+// DISABLED, which is right for the BSP (cooperative CAPSTONE, no preemption) and wrong for an AP that
+// must take its own PPI 30 tick and the reschedule SGI — so the call site re-arms the tick and
+// unmasks IRQ. `__vec_irq`'s `irq_bank!`/`irq_unbank!` are RUNTIME `CurrentEL` branches on `tegra`
+// (`exceptions.rs`), so an IRQ taken at EL1 on this AP banks ELR_EL1/SPSR_EL1 correctly.
+//
+// WHY IT WAITS FOR THE BSP INSTEAD OF DERIVING THE ROOT ITSELF. TTBR0_EL1 must be `mmu_tegra`'s
+// EL1-PRECISE twin `L1_EL1`, never the live EL2 `L1` (the module header's AP[1]-forces-PXN lesson —
+// five dark boots). The AP could not take it from `SEC_CTX`: that captures the EL2 regime, whose
+// `ttbr0` is exactly the wrong table. It takes the value from the BSP's own `drop_to_el1` call
+// instead, so the AP installs the table the BSP DEMONSTRABLY landed on rather than a second reference
+// that could drift — the argument `mmu_tegra_el0::BOOT_ROOT` makes for reading the live register. It
+// also means `mmu_tegra.rs` needs no edit at all, which matters beyond tidiness: a fully
+// `#[cfg]`-gated append to that file was MEASURED to move the jetson media hash (arch_arm64.md
+// §JETSON-EL0).
+//
+// THE COST OF THAT WAIT, STATED PLAINLY. The BSP publishes at `main.rs`'s drop, which is late — past
+// the whole device-probe stretch. The claiming AP therefore stalls before `sched::secondary_run`, so
+// for that window ONE core is not yet in `ONLINE_MASK` and is not a placement candidate. Only the
+// claimant waits (the seat is taken BEFORE the wait, so every other AP falls straight through to
+// today's path), the wait is bounded, and both ends of it are on the wire. Knob-off, none of it
+// exists.
+//
+// FAIL-CLOSED AT EVERY EXIT. Wrong EL, seat already held, root never published, or an eret that
+// somehow did not land at EL1 — each returns `false` having stamped NOTHING, so `EL1_CORE_MASK` keeps
+// its pre-existing value and EL0 placement stays REFUSED exactly as it is today. There is no partial
+// state: the drop is one `eret`, and the stamp happens strictly after it, in the caller. And every
+// one of those exits PRINTS — silence must never be indistinguishable from "the code never ran".
+
+/// ORIN-EL1AP — how long the claiming AP will wait for the BSP to publish its EL1 root, in seconds.
+/// Generous on purpose: the BSP reaches its drop only after PCIe/USB/SD enumeration, and a budget
+/// tight enough to expire during a slow probe would turn a healthy boot into a refusal. Bounded all
+/// the same — a BSP that never drops must not park an AP forever.
+#[cfg(feature = "orinel1ap")]
+const EL1AP_ROOT_WAIT_S: u64 = 30;
+
+/// ORIN-EL1AP — the EL1 root the BSP ACTUALLY installed (`mmu_tegra`'s `L1_EL1` PA), published by
+/// [`drop_to_el1`] on its way through. Zero = the BSP has not dropped yet, which is why zero is the
+/// value the AP refuses on rather than a sentinel it could mistake for a table at PA 0.
+#[cfg(feature = "orinel1ap")]
+static EL1_ROOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// ORIN-EL1AP — the single AP-at-EL1 seat. `swap(true)` is the claim; there is no release.
+#[cfg(feature = "orinel1ap")]
+static EL1AP_SEAT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// ORIN-EL1AP — the claiming AP's own copy of the four EL2 registers `drop_el2_to_el1_tegra` latches
+/// (same order as [`JM6_EL2_LATCH`]: HCR_EL2, CNTHCTL_EL2, ICC_SRE_EL1, ICC_SRE_EL2).
+///
+/// It exists because the drop asm writes ONE global latch, and the AP runs that asm too. Left alone,
+/// an AP drop would overwrite the BSP's IRQEL-RT2 evidence — which `timer.rs`'s `[irqel2a]` witness
+/// reads back from RAM precisely BECAUSE those registers are unreadable at EL1. So the AP snapshots
+/// the latch before its drop and restores it after, publishing its own four values here instead. The
+/// restore is what keeps `[irqel2a]` honest; this array is the AP's half of the same evidence.
+#[cfg(feature = "orinel1ap")]
+pub static JM6_AP_LATCH: [core::sync::atomic::AtomicU64; 4] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// ORIN-EL1AP — read back the claiming AP's EL2 latch as
+/// `(HCR_EL2, CNTHCTL_EL2, ICC_SRE_EL1, ICC_SRE_EL2)`. All zeroes means no AP has dropped, which is
+/// honest for the same reason [`jm6_el2_latch`]'s is: HCR_EL2 is never legitimately 0 after the drop
+/// (it always sets RW, bit 31).
+#[cfg(feature = "orinel1ap")]
+pub fn jm6_ap_latch() -> (u64, u64, u64, u64) {
+    use core::sync::atomic::Ordering;
+    (
+        JM6_AP_LATCH[0].load(Ordering::Relaxed),
+        JM6_AP_LATCH[1].load(Ordering::Relaxed),
+        JM6_AP_LATCH[2].load(Ordering::Relaxed),
+        JM6_AP_LATCH[3].load(Ordering::Relaxed),
+    )
+}
+
+/// ORIN-EL1AP — claim the single AP-at-EL1 seat and drop THIS core EL2 -> EL1, reusing the BSP's
+/// `enable_el1_regime` + `drop_el2_to_el1_tegra` verbatim. `cpu` is the caller's MPIDR-derived linear
+/// index (`smp_virt::__secondary_rust_virt` re-derives it from `gic::this_affinity()` with the MMU on,
+/// so it NAMES this core rather than being asserted about it — which is exactly the property
+/// `sched::mark_el1_core`'s doc demands of an AP-side stamp).
+///
+/// Returns `true` having landed at EL1 with DAIF masked and CNTP disabled — the caller MUST then
+/// re-seed `percpu::init(cpu)` (TPIDR_EL1), re-run `exceptions::install()` (VBAR_EL1), stamp
+/// `sched::mark_el1_core()`, re-arm the tick and unmask IRQ. Returns `false` having changed NOTHING
+/// about this core's EL: it is still at EL2, still unstamped, and the caller carries on exactly as an
+/// un-knobbed boot does.
+///
+/// Prints on every path, including every refusal.
+#[cfg(feature = "orinel1ap")]
+pub unsafe fn drop_ap_to_el1(cpu: usize) -> bool {
+    use core::sync::atomic::Ordering;
+
+    // (1) MEASURE the EL before touching the seat. An AP the firmware monitor started at some other
+    // EL must not burn the one seat to discover it cannot use it. (`_secondary_start_virt` already
+    // parks a non-EL2 core in WFE before it reaches any Rust, so this is belt-and-braces — but it is
+    // a register read that cannot fault, and the alternative is an `msr` that UNDEFs.)
+    let el: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, CurrentEL", out(reg) el, options(nomem, nostack, preserves_flags));
+    }
+    let el = (el >> 2) & 0b11;
+    if el != 2 {
+        serial_println!(
+            ":: tegra: [el1ap] REFUSED cpu={} — CurrentEL={}, not EL2; core stays at EL2 and out of el1cores ::",
+            cpu,
+            el
+        );
+        return false;
+    }
+
+    // (2) CLAIM BEFORE WAITING, so exactly ONE AP pays the wait. Every other AP is told so and falls
+    // straight through to the unchanged path — no stall, no second candidate, no race at the drop.
+    if EL1AP_SEAT.swap(true, Ordering::AcqRel) {
+        serial_println!(
+            ":: tegra: [el1ap] REFUSED cpu={} — the EL1 seat is already held; core stays at EL2 and out of el1cores ::",
+            cpu
+        );
+        return false;
+    }
+
+    // (3) Wait (bounded) for the BSP's own drop to publish the root it installed. Off CNTPCT, which
+    // free-runs regardless of the timer's enable state and is readable at EL2 without permission.
+    let freq = super::timer::cntfrq();
+    let freq = if freq == 0 { 62_500_000 } else { freq };
+    let deadline = super::timer::cntpct() + freq.saturating_mul(EL1AP_ROOT_WAIT_S);
+    serial_println!(
+        ":: tegra: [el1ap] seat claimed by cpu={} — waiting up to {} s for the BSP EL1 root ::",
+        cpu,
+        EL1AP_ROOT_WAIT_S
+    );
+    let mut root = EL1_ROOT.load(Ordering::Acquire);
+    while root == 0 && super::timer::cntpct() < deadline {
+        core::hint::spin_loop();
+        root = EL1_ROOT.load(Ordering::Acquire);
+    }
+    if root == 0 {
+        serial_println!(
+            ":: tegra: [el1ap] REFUSED cpu={} — the BSP EL1 root was not published within {} s (the BSP drop did not complete); core stays at EL2 and out of el1cores ::",
+            cpu,
+            EL1AP_ROOT_WAIT_S
+        );
+        return false;
+    }
+
+    // (4) ICC_SRE_EL2: set SRE (bit 0) and **Enable** (bit 3) before leaving EL2. `gic.rs`'s
+    // `init_cpu_interface_v3` sets SRE only — enough while the core stays at EL2, where nothing traps
+    // to itself. `Enable` is the bit that stops an EL1 access to ICC_SRE_EL1 trapping UP into EL2
+    // vectors this core is about to abandon; setting it is purely permissive (it removes a trap and
+    // grants nothing else), and it is done HERE, in the AP path only, rather than in the shared drop
+    // asm, so the BSP's byte-for-byte sequence is untouched. RMW to preserve the rest of the field.
+    unsafe {
+        let sre2: u64;
+        core::arch::asm!("mrs {}, S3_4_C12_C9_5", out(reg) sre2, options(nomem, nostack, preserves_flags));
+        core::arch::asm!(
+            "msr S3_4_C12_C9_5, {}",
+            in(reg) sre2 | (1u64 << 3) | 1u64,
+            options(nomem, nostack, preserves_flags)
+        );
+        core::arch::asm!("isb", options(nomem, nostack, preserves_flags));
+    }
+
+    // (5) Snapshot the shared drop latch — our asm is about to overwrite it (see `JM6_AP_LATCH`).
+    let saved = [
+        JM6_EL2_LATCH[0].load(Ordering::Relaxed),
+        JM6_EL2_LATCH[1].load(Ordering::Relaxed),
+        JM6_EL2_LATCH[2].load(Ordering::Relaxed),
+        JM6_EL2_LATCH[3].load(Ordering::Relaxed),
+    ];
+
+    // The last line printable with this core's EL2 identity intact.
+    serial_println!(
+        ":: tegra: [el1ap] cpu={} dropping EL2 -> EL1 (TTBR0_EL1={:#x}, the BSP-installed L1_EL1) ::",
+        cpu,
+        root
+    );
+
+    // (6) THE DROP — the BSP's, reused. `enable_el1_regime` arms the EL1&0 regime with the MMU on
+    // (dormant while we remain at EL2), then the naked asm erets to our caller now at EL1.
+    unsafe {
+        enable_el1_regime(root);
+        drop_el2_to_el1_tegra();
+    }
+
+    // ── Everything below runs at EL1. TPIDR_EL1 is still UNKNOWN, so NOTHING here may resolve
+    //    `percpu::this_cpu()`. `serial_println!` does not (the BSP prints its own JM6b landing proof
+    //    before its `percpu::init(0)` for the same reason), and the latch move is plain atomics. ──
+
+    // (7) Publish our four values and give the BSP its evidence back.
+    for i in 0..4 {
+        JM6_AP_LATCH[i].store(JM6_EL2_LATCH[i].load(Ordering::Relaxed), Ordering::Relaxed);
+        JM6_EL2_LATCH[i].store(saved[i], Ordering::Relaxed);
+    }
+
+    // (8) MEASURE where we actually landed. Unreachable in practice — an `eret` to EL1h either lands
+    // or the core is gone — but the stamp downstream is only sound if this is EL1, and a measured
+    // answer costs one `mrs`.
+    let el: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, CurrentEL", out(reg) el, options(nomem, nostack, preserves_flags));
+    }
+    let el = (el >> 2) & 0b11;
+    if el != 1 {
+        serial_println!(
+            ":: tegra: [el1ap] REFUSED cpu={} — post-eret CurrentEL={}, not EL1; core stays out of el1cores ::",
+            cpu,
+            el
+        );
+        return false;
+    }
+    true
 }
