@@ -10489,3 +10489,72 @@ ran again with every NEXTTOUCH read survived and the same verdict —
 `JX2-VERDICT=EFI-OWNED-LIVE — CHNSTATUS_CORE=0x20070000, STATE=0x07 -> EFI_OPERATION` (capture
 line 14273), `JX2-SWEEPDISABLED` (14274) and the `DECODES-NOMATCH` retraction (14276) beside it.
 The channel census is a two-flight result; both non-establishment bullets above stand unchanged.
+## ORIN-BSPTICK — a periodic EL1 tick on the boot core (`UNAOS_BSPTICK`, default OFF)
+
+**Candidate B arc 1** of the SMP redesign (Peter's 2026-08-25 ruling: highest performance, which
+orders B first among the code arcs). The Orin boot core post-JM6 has taken exactly ONE interrupt at
+EL1 in its life — the IRQEL-RT one-shot proof, which arms a single CNTP tick, witnesses it, and
+self-disarms, leaving the terminus with no clock. This knob replaces "once, then silence" with a
+standing 250 Hz periodic CNTP tick at EL1 that stays live across `run_capstone_boot_core`: the
+first periodic EL1 interrupt this terminus has ever taken, and the clock Candidate B arc 2 (the
+`run_bsp` swap + `SCHED_ACTIVE`) and Candidate A's supervisor both require.
+
+### The JM6 disarm, re-derived rather than reused
+
+The drop asm (`boot_tegra.rs`) writes `msr cntp_ctl_el0, xzr` for two stated reasons. **(1) "the
+shared `__vec_irq` would FAULT if an IRQ were taken at EL1 (it reads ELR_EL2/SPSR_EL2)"** — dead
+since `0a60e260` made the tegra `__vec_irq` bank ELR/SPSR by runtime `CurrentEL`; the IRQEL-RT
+one-shot exists precisely to prove that bank live at EL1, and this tick rides the same vector,
+armed only after the post-drop `exceptions::install()` (VBAR_EL1). **(2) "CAPSTONE runs
+cooperatively"** — a preference, not a constraint, and it survives: on the tegra (not-`baremetal`)
+build `gic::handle_irq_v3`'s timer arm calls only `on_tick` (`timer_preempt` is `baremetal`-gated;
+`SCHED_ACTIVE` has no tegra setter), so a tick re-arms TVAL and bumps counters but can never
+context-switch. The remaining hazards, each checked: **serial** — `_print` masks IRQs around the
+port lock and IRQ-context prints are `try_lock` + staging ring, so a tick landing mid-print cannot
+deadlock; **EL0** — the 0x480 lower-EL IRQ vector routes to the same banked `__vec_irq`
+(metal-proven on the Pi's preemptive path); **idle** — `LIVE` stays false, so `arch::hlt`'s
+timerless-core poll-spin decision (JD3, what keeps the pump's synchronous USB reads progressing) is
+untouched; **AP cross-talk** — below.
+
+### The IRQEL-CORE trap, re-applied
+
+The five ORIN-SMP-3 secondaries each arm their own 250 Hz PPI 30 routed to EL2 and enter the same
+`on_tick` dispatch ~1250x/s. Against machine-global state, an AP consumes the boot core's
+instrument with probability ~1 — the exact defect that burned the one-shot proof's first shape
+(boot 5c). Every piece of state this knob adds is therefore scoped to the arming core's
+`cpu_index` (`BSPTICK_CORE`, the `EL1_PROOF_CORE` pattern): `bsptick_witness` returns before
+touching anything on any core but the armer, so AP ticks fall through unchanged. The global
+side-effect that does return is deliberate and owned: the boot core resumes advancing the shared
+monotonic `TICKS` (frozen since the JM6 disarm) exactly as it did at EL2 — it is the global-clock
+owner (`arm_this_core`, not `arm_this_core_ap`), and the APs stay local-only tickers.
+
+### Witness
+
+`[orinbsptick]` (13 bytes — over the 8-byte immediate-encode floor, so `strings` on the objcopy'd
+image can see it). The arming banner prints before the unmask (serial lock free when the first
+tick's witness fires, the one-shot's own ordering), then the per-tick witness emits at tick 1 (the
+one-hit "the arm delivered") and every 250th tick (~1 line/s), carrying **count + re-measured
+CurrentEL + cpu**: the count advancing is what the one-shot could never say (periodic, not once),
+and an EL2 reading would mean HCR_EL2.IMO regressed — reported, not assumed away.
+
+### Gating and verification status
+
+Sites: `timer.rs` tail (`el1_bsptick_start`, `bsptick_witness`, two statics, all
+`all(tegra, bsptick)`), one statement appended to `on_tick`'s closing line, one statement appended
+to `main.rs`'s terminus line (the Location-shift convention: zero source lines added before any
+panic Location in either file). Armed polarity type-checked by the `arm-tegra-bsptick` matrix leg
+(`arm-tegra` verbatim + `bsptick`, the smpmark shape).
+
+Verified 2026-08-25 at exec-smpb (QEMU/build only — **not yet flown on metal**):
+
+* `UNAOS_TEGRA=1 ./arroyo check` green, 24 legs (15 board + 9 x86 mix; this arc +1 board leg);
+* `./arroyo test-arm` green (default virt image; `[orinbsptick]` correctly absent);
+* knob-off byte-identity **measured**: `llvm-objcopy -O binary kernel.elf` sha256
+  `6ca63b9e677cf8cc28aae54fb4bd6f404a427358a0de234da31fae609dce4172` at baseline `b710fe4c` and
+  with this arc applied, identical; armed image differs and carries both `[orinbsptick]` format
+  strings (`strings`-proven reachable, 0 hits knob-off).
+
+What the metal flight must show: the arming banner at EL1 on cpu 0, tick 1, and the 1 Hz count
+advancing while the JD2 console stays interactive (the tick must not perturb the pump). What this
+arc deliberately does not do (arc 2, gated on the sched.rs peer grant): no `run_bsp` swap, no
+`run()` entry on the boot core, no `SCHED_ACTIVE`, no preemption, no placement change.

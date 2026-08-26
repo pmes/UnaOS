@@ -719,6 +719,20 @@ _feats=""
 # vanishes and the tegra image is byte-identical to baseline. The ARMED build is type-checked by the
 # `arm-tegra-smpmark` leg of KERNEL_CFG_MATRIX, not by this mapping.
 [ -n "${UNAOS_SMPMARK:-}" ] && _feats="${_feats}smpmark,"
+# ORIN-BSPTICK (Candidate B arc 1): UNAOS_BSPTICK=1 arms the PERIODIC EL1 generic-timer tick on the
+# Orin boot core — timer.rs `el1_bsptick_start`, called from `tegra_early_stop`'s terminus line right
+# after the IRQEL-RT one-shot proof self-disarms. The boot core keeps a standing 250 Hz CNTP tick at
+# EL1 with IRQs unmasked across `run_capstone_boot_core`; dispatch is `on_tick` only (SCHED_ACTIVE
+# stays false, `timer_preempt` is baremetal-gated), so the terminus stays cooperative — this is the
+# clock, not the preemption (that is Candidate B arc 2). Standalone feature (does NOT imply tegra,
+# mirroring smpmark), but every site is tegra-gated, so arm it WITH tegra:
+# `UNAOS_TEGRA=1 UNAOS_BSPTICK=1 ./arroyo check`, or `UNAOS_BSPTICK=1 ./arroyo esp-jetson` (esp-jetson
+# forces tegra). Default OFF; when unset every site vanishes and the knob-off jetson OBJCOPY'D
+# LOADABLE IMAGE is byte-identical to baseline (measured on `llvm-objcopy -O binary kernel.elf`, the
+# orindesk precedent). The ARMED build is type-checked by the `arm-tegra-bsptick` leg of
+# KERNEL_CFG_MATRIX, not by this mapping. Witness on the wire: `[orinbsptick]` — tick 1, then every
+# 250th tick, count + re-measured CurrentEL + cpu.
+[ -n "${UNAOS_BSPTICK:-}" ] && _feats="${_feats}bsptick,"
 # ORIN-WM1 (ORINDESK): UNAOS_ORINDESK=1 arms the Jetson Orin's FIRST real compositor window —
 # `arch/aarch64/display_tegra.rs::orin_wm1`, called from `tegra_early_stop`'s step-3c heap line. It
 # calls `wm::reserve_stage` (the Orin's missing half: this board seeds `video::WRITER` by hand and never
@@ -2555,6 +2569,30 @@ KERNEL_CFG_MATRIX=(
   # items) and the derived mix-leg count is unchanged. Board legs +1; gate +1. `./arroyo check` prints
   # the live board/mix counts every run — read them there, not here.
   "arm-tegra-orinwdt ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,orinwdt"
+  # ORIN-BSPTICK armed (appended 2026-08-25, Candidate B arc 1) — `bsptick` gates the periodic-EL1-tick
+  # block at `arch/aarch64/timer.rs`'s tail (`el1_bsptick_start`, `bsptick_witness`, the two statics),
+  # the statement appended to `on_tick`'s closing line, and the statement appended to `main.rs`'s
+  # terminus line. EVERY site is additionally `tegra`-gated (`all(tegra, bsptick)` in timer.rs; the
+  # terminus is inside `#[cfg(all(feature = "tegra", target_arch = "aarch64"))] tegra_early_stop`), so
+  # ONLY a leg carrying `tegra` compiles them at all — and no leg carries `tegra` plus this knob but
+  # this one. Without it the ARMED polarity would be compiled by NOTHING: the exact tegra_el0 /
+  # simmer_test / xusbfw / smpmark / orindesk / jd1dc / tegradesk / orinclick / orinconwin shape, and
+  # the reason the standing law is that a knob's gates must compile the configuration the knob turns ON.
+  #
+  # WHY ITS OWN TAIL LEG rather than `,bsptick` appended to `arm-tegra`. Same reason as every leg
+  # above: `arm-tegra` is the DISARMED twin and the only leg anywhere that compiles the SHIPPED default
+  # jetson image — the image whose byte-identity to baseline this arc measures. Arming the knob there
+  # would trade this hole for that one, and a red on a tail leg names the knob. Hosted on `arm-tegra`'s
+  # list verbatim + `bsptick` (the smpmark shape: the knob's sites need nothing beyond `tegra`).
+  #
+  # There is no `not(feature = "bsptick")` site in src/, so no disarmed asymmetry is created — every
+  # other leg (including `arm-tegra` itself) already carries the OFF polarity.
+  #
+  # UNIVERSE SIDE EFFECT: none that moves a mix count. `bsptick` is a NEW `[features]` entry named
+  # only on an arm-* leg, so `x86_cfg_universe` drops it (every site is inside `feature = "tegra"`
+  # items) and the derived mix-leg count is unchanged. Board legs +1; gate +1. `./arroyo check` prints
+  # the live board/mix counts every run — read them there, not here.
+  "arm-tegra-bsptick ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,bsptick"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────

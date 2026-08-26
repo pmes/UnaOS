@@ -674,6 +674,18 @@ smpprobe = []
 # `UNAOS_SMPMARK=1 UNAOS_TEGRA=1 ./arroyo esp-jetson`. See arch_arm64.md §ORIN-SMP.
 smpmark = []
 
+# ORIN-BSPTICK (Candidate B arc 1): the `UNAOS_BSPTICK=1` PERIODIC EL1 generic-timer tick on the
+# Orin boot core (arch/aarch64/timer.rs tail), armed from `tegra_early_stop`'s terminus line right
+# after the IRQEL-RT one-shot proof self-disarms — replacing "one interrupt taken at EL1, then
+# nothing" with a standing 250 Hz heartbeat that stays live across `run_capstone_boot_core`. IRQs
+# remain unmasked from the arm onward; dispatch is `on_tick` only (no `SCHED_ACTIVE`, no
+# preemption — the capstone loop stays cooperative). Witness: `[orinbsptick]` — tick 1, then every
+# 250th tick, carrying count + re-measured CurrentEL + cpu. Standalone (does NOT imply `tegra`,
+# mirroring `smpmark`) but every site is `all(tegra, bsptick)`-gated, so arm it WITH tegra. With the
+# feature OFF (default) every site vanishes and the tegra image is byte-identical to baseline.
+# Enable via `UNAOS_BSPTICK=1 ./arroyo esp-jetson`. See arch_arm64.md §ORIN-BSPTICK.
+bsptick = []
+
 # VUG-RAS-LOCALIZER: the `UNAOS_VUGRAS=1` RAS localizer (vugras.rs) — a knob-gated DC CIVAC writeback
 # sweep (vug frame loop + JD2 console-idle pump) plus a boot candidate-PA witness, to make the Orin
 # SNOC+ACI FillWrite RAS fire at/near the offending store and name the address it decodes to. Pure
