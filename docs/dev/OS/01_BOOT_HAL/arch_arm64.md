@@ -10763,9 +10763,25 @@ Verified 2026-08-25 at exec-supstate (QEMU/build only — **not yet flown on met
   carries `bl <jd2_supstate_phase2>` at 0x5d258, and phase2's body carries
   `bl <display_tegra::sup_install>` plus two `bl <sched::spawn>` (the presenter and dispatcher
   spawns); `jd2_supstate_presenter` and `jd2_supstate_dispatcher` are present as task entries;
-* `UNAOS_SUPSTATE=1 ./arroyo check`, the `UNAOS_SUPSTATE=1 UNAOS_ORINCLICK=1` cross,
-  `./arroyo test-arm` and `./arroyo test`: see the gate row appended at the arc's final commit
-  (they run after this ledger's commit; the arc is not DONE until that row reads green).
+* `UNAOS_SUPSTATE=1 ./arroyo check` green (27 legs) and the
+  `UNAOS_SUPSTATE=1 UNAOS_ORINCLICK=1` cross green (27 legs) — the armed polarity and the
+  armed+instrument cross both compile everywhere;
+* `./arroyo test-arm` green, `MISSION SUCCESS`, and the arm serial log carries ZERO
+  `supstate`/`orinclick`/`jd2` lines (awk over `target/serial-arm.log` — correctly absent on the
+  default virt image);
+* `./arroyo test` green on re-run and green at baseline; the FIRST arc-tree run failed on
+  `[ptrdead] backlog … order=false -> FAIL` (serial.log:897) — an x86 pointer-channel ordering
+  witness in code this arc does not compile on x86 at all (every site is `aarch64`+`tegra`+
+  `supstate` gated and the knob-off image is byte-identical). Verdict: a FLAKY x86 instrument,
+  pre-existing — reported to the seat for relay to the rmbp track rather than papered over. The
+  three runs (arc-fail, arc-pass, base-pass) are the evidence; nothing in this arc can reach that
+  code path.
+
+What the metal flight must additionally show for the SPLIT (beyond the M-1 lift lines): the
+`[supstate] roles` line naming all three identities, keystroke echo + command output through the
+dispatcher, cursor motion through the presenter, and the `[orinclick]` census continuing on the
+input source's cadence — including DURING a foreground command, which is delta 1 of the honesty
+list above and the one place a knob-on capture must differ.
 
 What the metal flight must show: the `[supstate] lift` and `[supstate] roles` lines at phase-2
 entry, then a JD2 interactive session and an `[orinclick]` census transcript that read identically
