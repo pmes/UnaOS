@@ -3662,8 +3662,9 @@ fn lad_glass_painted(v: &str) -> bool {
 /// | `UNREADABLE` | every sample fell outside the mapped length: the row's geometry and the panel's disagree. A defect, and one no present count could show |
 /// | `WIN2-NOT-ON-GLASS` | not ONE sample is the console's background. Whatever occupies those panel coordinates, it is not this window's surface |
 /// | `BLANK-NO-GLYPHS` | every sample IS the background: the surface reached the glass and its TEXT did not. The exact shape §3.9.1 could not rule out, and the one a present count can never see |
-/// | `GLYPHS-AA-NO-CHROME` | no fully covered stroke, but the ink population is a supermajority of PAPER→INK blends: anti-aliased text of this console's own colour, with the frame overdrawn |
+/// | `GLYPHS-AA-NO-CHROME` | no fully covered stroke, but the ink population is a supermajority of PAPER→INK blends AT TWO OR MORE COVERAGE LEVELS: anti-aliased text of this console's own colour, with the frame overdrawn |
 /// | `GLYPHS-AA-ON-GLASS` | the same blend supermajority with the frame intact. **Rung (a) closed on anti-aliased evidence** — `stem=0` here is a property of the face, not a defect |
+/// | `INK-FLAT-FILL` | a blend supermajority at exactly ONE level (`blevels=1`): a flat fill of a colour that happens to sit on the ramp, not text. `video::PANEL_BG` (`0x001E_1E1E`) is such a colour, so this is the arm that stops the desktop showing through from reading as a pass |
 /// | `INK-OFF-COLOUR` | no stroke, no blend supermajority, and ONE off-ramp value holds a majority of the ink population. Text (or a fill) in a colour that is not `LAD_INK`; `ink1=` names the measured value. A finding about the CONSTANT, reported and not silently adopted |
 /// | `INK-NO-STEM` | non-paper pixels inside the box, but not one fully covered stroke of the console's own ink, no blend supermajority and no dominant colour: scattered foreign values — something is over the content that is not this console's text |
 /// | `GLYPHS-NO-CHROME` | the console's paper and its ink strokes are both on the glass, and the FRAME is not. Text landed, the window's own chrome was overdrawn — §3.8.1's measured JD2-blit overdraw, caught in the act |
@@ -3672,6 +3673,8 @@ fn lad_glass_painted(v: &str) -> bool {
 /// THE INK FIELDS, and the reading each one settles. `paper + ink == read` and
 /// `stem + blend + off == ink` hold on every line, so a line that does not balance is a defect in the
 /// instrument and not in the panel. `blend` counts samples on the PAPER→INK segment (`lad_classify`),
+/// `blevels` is `0`/`1`/`2+` — how many DISTINCT blend levels were seen, which is what separates
+/// anti-aliased text (several) from a flat fill of a ramp colour (exactly one).
 /// `off` counts non-paper values that are not on it, and `ink1..ink3`/`n1..n3` are the heaviest
 /// non-paper values with their counts (`n=0` = no such entry; `inkvals`/`exact` say whether the
 /// histogram had to start decrementing — see `lad_hist_add`).
@@ -3757,6 +3760,12 @@ pub fn orin_glass_probe(phase: &str) -> &'static str {
     // ORIN-GLASSINK — the three populations `ink` used to hide, and the heaviest values in it.
     let mut blend = 0usize;
     let mut off = 0usize;
+    // ORIN-GLASSINK — how many DISTINCT blend levels were seen, as the only distinction that matters:
+    // one, or more than one. See `blend_multi`'s use in `ramp` below for why a single level is not
+    // evidence of text.
+    let mut blend_first: u32 = 0;
+    let mut blend_seen = false;
+    let mut blend_multi = false;
     let mut hv = [0u32; LAD_TOPN];
     let mut hc = [0u32; LAD_TOPN];
     let mut hdistinct = 0u32;
@@ -3796,6 +3805,12 @@ pub fn orin_glass_probe(phase: &str) -> &'static str {
                         LAD_CLASS_BLEND => {
                             ink += 1;
                             blend += 1;
+                            if !blend_seen {
+                                blend_first = v;
+                                blend_seen = true;
+                            } else if v != blend_first {
+                                blend_multi = true;
+                            }
                             lad_hist_add(&mut hv, &mut hc, &mut hdistinct, &mut hevict, v);
                         }
                         _ => {
@@ -3825,7 +3840,16 @@ pub fn orin_glass_probe(phase: &str) -> &'static str {
     let (i1v, i1c) = lad_hist_rank(&hv, &hc, 0);
     let (i2v, i2c) = lad_hist_rank(&hv, &hc, 1);
     let (i3v, i3c) = lad_hist_rank(&hv, &hc, 2);
-    let ramp = blend != 0 && blend * LAD_RAMP_DEN >= ink * LAD_RAMP_NUM;
+    //
+    // ⚠ `blend_multi` IS LOAD-BEARING, and a host run of this file's own `lad_classify` is what found
+    // out why. `video::PANEL_BG` is `0x001E_1E1E` — a GREY, therefore ON the black→light-grey ramp,
+    // therefore a "blend" by the segment test. A box holding some paper and a lot of desktop would
+    // otherwise clear the supermajority and read as a PASS. What separates a flat fill from
+    // anti-aliased text is not the colour, it is the NUMBER OF COVERAGE LEVELS: a fill has exactly
+    // one, and glyph edges sampled across many strokes have several. Requiring two distinct blend
+    // values costs two locals and closes the only false-PASS path this rung has.
+    let ramp = blend != 0 && blend_multi && blend * LAD_RAMP_DEN >= ink * LAD_RAMP_NUM;
+    let flat = blend != 0 && !blend_multi && blend * LAD_RAMP_DEN >= ink * LAD_RAMP_NUM;
     let offdom = i1c != 0 && (i1c as usize) * 2 > ink && lad_classify(i1v) == LAD_CLASS_OFF;
 
     // DERIVED, never asserted — the whole point of the line.
@@ -3845,6 +3869,8 @@ pub fn orin_glass_probe(phase: &str) -> &'static str {
             } else {
                 "GLYPHS-AA-NO-CHROME"
             }
+        } else if flat {
+            "INK-FLAT-FILL"
         } else if offdom {
             "INK-OFF-COLOUR"
         } else {
@@ -3856,12 +3882,20 @@ pub fn orin_glass_probe(phase: &str) -> &'static str {
         "GLYPHS-NO-CHROME"
     };
     serial_println!(
-        "[oringlass] phase={} win={} box={}x{} at ({},{}) content={}x{} at ({},{}) scale={} onpanel={} frame={}/{} samples={} read={} paper={} ink={} stem={} blend={} off={} ink1={:#010x} n1={} ink2={:#010x} n2={} ink3={:#010x} n3={} inkvals={} exact={} first={:#08x} uniform={} -> {}",
+        "[oringlass] phase={} win={} box={}x{} at ({},{}) content={}x{} at ({},{}) scale={} onpanel={} frame={}/{} samples={} read={} paper={} ink={} stem={} blend={} blevels={} off={} ink1={:#010x} n1={} ink2={:#010x} n2={} ink3={:#010x} n3={} inkvals={} exact={} first={:#08x} uniform={} -> {}",
         phase, i.id, ow, oh, ox, oy, cwp, chp, i.x, i.y, i.scale,
         if on_panel { "yes" } else { "PARKED" },
         fhit, fread,
         LAD_BANDS * LAD_RUNS * LAD_RUN,
-        read, paper, ink, stem, blend, off,
+        read, paper, ink, stem, blend,
+        if !blend_seen {
+            "0"
+        } else if blend_multi {
+            "2+"
+        } else {
+            "1"
+        },
+        off,
         i1v, i1c, i2v, i2c, i3v, i3c,
         hdistinct,
         if hevict == 0 { "yes" } else { "no" },
