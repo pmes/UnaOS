@@ -10798,3 +10798,107 @@ to a knob-off boot apart from the deltas enumerated above. What this arc deliber
 no supervisor, no reap, no restart, no heartbeat records (arc 2, gated on B's clock); no EL
 changes, no core wakes, no `steal_ok`, no migration — a role still dies on the core it lived on;
 the lift's whole point is that its STATE no longer dies with it.
+
+
+## ORIN-INPUT — why HID never reached an EL0 tenant on the Orin, and the pump that fixes it
+
+The Jetson bench asked why a tenant that polls `SYS_INPUT_POLL` every frame received **zero events
+across 300 frames** on a board with live USB HID, and why almost every census line read `focus=0x0`.
+Traced end to end on `hw-jetson`: the EL0 input chain is entirely present on a `tegra_el0` image, and
+the loss is in the **two hops that feed it**, both of which are Pi-only code.
+
+**Nothing in this section has been on hardware.** It is a source trace plus a compile- and
+artifact-verified instrument.
+
+### The chain, hop by hop (aarch64, `tegra_el0`)
+
+| # | Hop | Where | On the Orin |
+|---|-----|-------|-------------|
+| 1 | Tegra XUSB attach + HID enumeration | `arch/aarch64/xusb_tegra.rs::jb2b_attach` | present |
+| 2 | Transfer-event drain + HID decode | `drivers/xhci/mod.rs::poll_events` | present |
+| 3 | Decoded edge -> kernel queue | `drivers/xhci/mod.rs` `push_event(Event::Key/KeyUp)` | present |
+| 4 | Queue drain | `pal.rs::next_event` / `pal.rs::pump_and_poll` | present |
+| 5 | **Independent HID pump task** | `main.rs::usb_pump` | **ABSENT — `cfg(baremetal)`** |
+| 6 | **Router: queue -> per-process ring** | `main.rs::route_input_to_active_el0` | **ABSENT — `cfg(baremetal)`** |
+| 7 | **Router call site** | `main.rs::pump_usb_into_gui` | **ABSENT — `cfg(baremetal)`** |
+| 8 | Router seam | `arch/aarch64/syscall.rs::user_input_enqueue` | present |
+| 9 | Focus registration | `arch/aarch64/syscall.rs::user_input_set_active`, called by `run_user_image` | present |
+| 10 | Per-process input ring | `arch/aarch64/syscall.rs`, ELF-5 block | present |
+| 11 | `SYS_INPUT_POLL` dispatch + handler | `arch/aarch64/syscall.rs` (SVC table) | present |
+| 12 | EL0 slot creation | `arch/aarch64/sched.rs::spawn_user_slot` | present |
+
+`pub mod syscall` is gated `any(feature = "baremetal", feature = "tegra_el0")`, so hops 8-12 are real on
+any `tegra_el0` image. Hops 5-7 are not: they are `cfg(all(target_arch = "aarch64", feature =
+"baremetal"))`, and `baremetal = ["pi"]` while `pi` + `tegra` is a `compile_error!`. A tegra image can
+therefore never carry them.
+
+### The two breaks, ranked
+
+**Break 1 — nothing pumps the controller while a tenant runs (primary).** The Pi drains xHCI from a
+dedicated `usb_pump` task at ~4 ms, independent of the shell. The Orin has no such task; its **only** HID
+pump is the drain inside `main.rs::jd2_console_pump`, and that task is **parked** inside `handle_key` ->
+`dispatch_command` -> `run_user_image` for the tenant's entire life. `run_user_image`'s wait loop was
+`super::sched::yield_now()` and nothing else. Across a whole run, **zero `poll_events()` calls happen**:
+no HID report is harvested and `pal::EVENT_QUEUE` stays empty. There is nothing for any router to route.
+
+**Break 2 — nothing routes keystrokes on tegra.** `route_input_to_active_el0` and its sole caller
+`pump_usb_into_gui` are `baremetal`-gated too. On tegra `jd2_console_pump` feeds every `Event::Key`
+straight through `handle_key` **regardless of focus** — `arch/aarch64/display_tegra.rs` states this in
+its own words beside `orin_click`, having verified it rather than assumed it. So even a harvested
+keystroke goes to the shell, never to the tenant's ring.
+
+### `focus=0x0` is a symptom of Break 1, not a focus bug
+
+`run_user_image` does grant focus (`user_input_set_active(asid)`) for the whole run. But the
+`[orinclick]` and `[orintenant]` censuses are emitted **from `jd2_console_pump`'s own ~10 s sweep** — the
+same task Break 1 parks — so **no census line can be emitted while a tenant holds focus**. A capture in
+which nearly every census line reads `focus=0x0` is exactly what Break 1 predicts: the census only ever
+samples the intervals when no tenant is running. It corroborates the parked pump rather than indicting
+focus assignment, which works.
+
+### What landed (`UNAOS_ORININPUT=1`)
+
+One pump pass driven from `run_user_image`'s wait loop — the one context that runs for exactly as long
+as the tenant does. Claim the controller, `poll_events()` to harvest and re-arm the HID rings, then drain
+`pal::EVENT_QUEUE` through the **same** `user_input_enqueue` seam the Pi router uses. No second seam and
+no bypass, so the compositor's TAB interception and click routing, the ring's drop-newest contract, and
+the `[uvug8]` takeover heartbeat all behave exactly as on the Pi. With no EL0 owner the pump harvests but
+drains nothing, leaving the queue for the console — the tegra twin of the Pi router's rule.
+
+Implementation: `arch/aarch64/xusb_tegra.rs` (`oi_pump` / `oi_reset` / `oi_rollup`) plus three call sites
+in `arch/aarch64/syscall.rs::run_user_image`.
+
+```
+[orininput] live  rollup passes=N nofocus=N decoded=N deliverable=N routed=N dropped=N focus=0xN :: <verdict> ::
+[orininput] final rollup passes=N nofocus=N decoded=N deliverable=N routed=N dropped=N focus=0xN :: <verdict> ::
+```
+
+Verdicts: `DELIVERED` / `ROUTER-DROP` / `QUEUE-INERT` / `NO-HID` / `NO-FOCUS` / `NEVER-RAN`. The
+load-bearing field is **`passes`**: it separates "the pump ran and the wire was quiet" (`NO-HID` — break
+upstream of `pal::EVENT_QUEUE`: enumeration, interrupt-IN re-arm, or SMMU-dropped DMA) from "the pump
+never ran" (`NEVER-RAN`). The `final` line is emitted unconditionally at the end of every run, so a run
+that delivered nothing says so rather than printing nothing.
+
+### Scope — what this deliberately does NOT fix
+
+Break 2 is **neutralised only for the duration of a `run`**, because the thief (`jd2_console_pump`) is
+parked exactly then. A `bg`-launched windowed tenant that holds focus while the shell runs is still
+robbed of its keystrokes. The obvious fix — gate `jd2_console_pump` on `user_input_active() != 0` — is
+**wrong** and must not be applied casually: with `pidesk` OFF, `USER_INPUT_ACTIVE` can hold the
+`wm::KERNEL_OWNER_DESKTOP` pseudo-ASID (see `display_tegra.rs`'s note beside `orin_click`), and routing
+keys into a pseudo-ASID ring would lock the operator out of the shell with no way back. That belongs with
+the `pidesk` rung that owns the pseudo-ASID question.
+
+### Gates
+
+`orininput` implies `tegra_el0`. Default OFF => the pump, its statics and all three call sites vanish;
+the jetson media and the Pi `kernel8.img` are both byte-identical to baseline. Verified:
+
+* `arm-tegra-tenant` + `orininput` — green.
+* `arm-tegra-tenant` knob off — green.
+* `arm-tegra` (shipped default jetson, no `tegra_el0`) — green.
+* Armed `esp-jetson` artifact: every verdict string present in `kernel.elf`
+  (`LC_ALL=C grep -a -o`, never `strings`).
+* Disarmed `esp-jetson` (`tegra_el0` aboard, `orininput` off): **zero** matches for `orininput`,
+  `rollup passes=`, `NEVER-RAN`, `ROUTER-DROP`, `QUEUE-INERT` — the strings are absent from the image,
+  not merely unreached.

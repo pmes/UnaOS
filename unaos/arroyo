@@ -1074,6 +1074,24 @@ _feats=""
 #
 # NOT PROVEN ON HARDWARE. Nothing in this arc has been on the bench.
 [ -n "${UNAOS_ORINEL1AP:-}" ] && _feats="${_feats}orinel1ap,tegrasmp,tegra_el0,tegra,"
+# ORIN-INPUT: UNAOS_ORININPUT=1 arms the tegra input pump + route inside `run_user_image`'s wait loop
+# (arch/aarch64/xusb_tegra.rs `oi_*` + three call sites in arch/aarch64/syscall.rs), so HID actually
+# REACHES an EL0 tenant on the Orin. The chain itself is already compiled in on `tegra_el0` (per-process
+# ring, user_input_enqueue, user_input_set_active, SYS_INPUT_POLL); what is missing is the two hops that
+# feed it, both Pi-only: `usb_pump` and `route_input_to_active_el0`/`pump_usb_into_gui` are all
+# `baremetal`-gated, and the Orin's ONLY HID pump (`jd2_console_pump`) is parked inside
+# `handle_key` -> `dispatch_command` -> `run_user_image` for the tenant's whole life, whose wait loop was
+# `yield_now()` alone — zero poll_events() across a run. (That parked pump is also why a capture's
+# `[orinclick]`/`[orintenant]` census lines read `focus=0x0`: they are emitted from the parked task's own
+# sweep, so they only sample the intervals when no tenant runs. Symptom, not cause.) Emits
+# `[orininput] … rollup passes=… nofocus=… decoded=… deliverable=… routed=… dropped=… focus=… :: <verdict> ::`
+# (~2 Hz live, plus one unconditional line per run, so zero SAYS zero; verdicts DELIVERED / ROUTER-DROP /
+# QUEUE-INERT / NO-HID / NO-FOCUS / NEVER-RAN, with `passes` separating "pump ran, wire quiet" from "pump
+# never ran"). Implies `tegra_el0`. Default OFF => pump, statics and all three call sites vanish; jetson
+# media AND the Pi kernel8.img byte-identical to baseline. ARMED polarity type-checked by the
+# `arm-tegra-tenant` leg of KERNEL_CFG_MATRIX, never by this mapping.
+# See docs/dev/OS/01_BOOT_HAL/arch_arm64.md §ORIN-INPUT. NOT YET ON HARDWARE.
+[ -n "${UNAOS_ORININPUT:-}" ] && _feats="${_feats}orininput,tegra_el0,tegra,"
 # ORIN-LADDER: UNAOS_ORINLADDER=1 arms `orinladder` — the two rungs orin 6 left owed
 # (orin-desktop.md §3.9.1): the win=2 GLYPHS-ON-GLASS read-back (`[oringlass]`) and the DOCK ROUND
 # TRIP adjudicator (`[orindock]`). DEFAULT OFF; unset, every item is compiled out and the jetson
@@ -2908,7 +2926,7 @@ KERNEL_CFG_MATRIX=(
   #
   # PRECONDITION: compiles `arch/aarch64/syscall.rs`, which `include_bytes!`s `target/user_blob.bin`.
   # `ensure_user_blob` (see check_both) supplies it.
-  "arm-tegra-tenant ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,orintenant"
+  "arm-tegra-tenant ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,orintenant,orininput"
 
   # ORIN-BSPRUN armed (appended 2026-08-25, Candidate B arc 2) — `bsprun` gates the terminus swap
   # (`main.rs`'s terminus line: `run_bsp_tegra(0)` in place of `run_capstone_boot_core(0)`), the

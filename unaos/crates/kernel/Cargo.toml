@@ -2067,6 +2067,45 @@ orintenant = ["tegra_el0"]
 # polarity is type-checked by the `arm-tegra-el1ap` leg of KERNEL_CFG_MATRIX, never by the knob
 # mapping. Witness on the wire: every line carries `[el1ap]` — see arroyo's UNAOS_ORINEL1AP block.
 orinel1ap = ["tegrasmp", "tegra_el0"]
+# ORIN-INPUT: `UNAOS_ORININPUT=1` — make HID input actually REACH an EL0 tenant on the Orin. Adds the
+# pump/route/rollup in `arch/aarch64/xusb_tegra.rs` (`oi_pump`/`oi_reset`/`oi_rollup`) and its three
+# call sites inside `run_user_image`'s wait loop in `arch/aarch64/syscall.rs`.
+#
+# THE DEFECT. On a `tegra_el0` image the whole ELF-5 EL0 input chain is compiled in — the per-process
+# ring, `user_input_enqueue`, `user_input_set_active`, and `SYS_INPUT_POLL` on the SVC table — and
+# `run_user_image` registers the tenant as the active input target. A tenant that polls every frame
+# still receives nothing, because the two hops that FEED that seam are Pi-only:
+#   1. Nothing pumps the controller while a tenant runs. The Pi's `usb_pump` task is
+#      `cfg(feature = "baremetal")`; the tegra image has none, and the Orin's only HID pump
+#      (`main.rs::jd2_console_pump`) is PARKED inside `handle_key` -> `dispatch_command` ->
+#      `run_user_image` for the tenant's whole life. That wait loop was `yield_now()` and nothing else,
+#      so ZERO `poll_events()` calls happen across a run and `pal::EVENT_QUEUE` stays empty.
+#   2. Nothing routes keystrokes. `route_input_to_active_el0` / `pump_usb_into_gui` are `baremetal`-gated
+#      too; on tegra `jd2_console_pump` feeds every `Event::Key` to `handle_key` regardless of focus
+#      (`display_tegra.rs` states this beside `orin_click`, verified rather than assumed).
+# A bench capture where nearly every `[orinclick]`/`[orintenant]` census line reads `focus=0x0` is a
+# SYMPTOM of (1), not a focus bug: those censuses are emitted from the parked pump's own sweep, so they
+# can only ever sample the intervals when no tenant is running.
+#
+# SCOPE. This neutralises (2) for the duration of a `run` — the thief is parked exactly then — but NOT
+# for a `bg`-launched windowed tenant. Gating `jd2_console_pump` on `user_input_active() != 0` would be
+# the wrong fix there: with `pidesk` OFF, `USER_INPUT_ACTIVE` can hold the `wm::KERNEL_OWNER_DESKTOP`
+# pseudo-ASID, and routing keys into a pseudo-ASID ring locks the operator out of the shell. That
+# belongs to the `pidesk` rung that owns the pseudo-ASID question.
+#
+# WITNESS. `[orininput] … rollup passes=… nofocus=… decoded=… deliverable=… routed=… dropped=… focus=…`
+# with a named verdict (DELIVERED / ROUTER-DROP / QUEUE-INERT / NO-HID / NO-FOCUS / NEVER-RAN), at ~2 Hz
+# while a tenant runs and unconditionally at the end of every run — so a hop that delivered zero SAYS
+# zero. `passes` is load-bearing: it separates "pump ran, wire quiet" from "pump never ran".
+#
+# Implies `tegra_el0` (the seam it routes through is gated `any(baremetal, tegra_el0)`, and `baremetal`
+# implies `pi` which `compile_error!`s against `tegra` — so `tegra_el0` is the only satisfiable term on
+# this board and a standalone `orininput = []` would gate nothing). DEFAULT OFF => every item and all
+# three call sites vanish; the jetson media and the Pi `kernel8.img` are both byte-identical to
+# baseline. ARMED polarity type-checked by the `arm-tegra-tenant` leg of KERNEL_CFG_MATRIX, never by the
+# knob mapping. Enable via `UNAOS_ORININPUT=1 UNAOS_TEGRA=1 ./arroyo esp-jetson`.
+# See docs/dev/OS/01_BOOT_HAL/arch_arm64.md §ORIN-INPUT. NOT YET ON HARDWARE.
+orininput = ["tegra_el0"]
 
 
 # ORIN-SUPSTATE (SMP-redesign Candidate A, arc 1): lift the Orin console surface OUT of
