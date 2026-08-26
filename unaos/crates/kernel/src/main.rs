@@ -2676,7 +2676,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // `el0-hello` task, and an unstamped mask would refuse it (see sched.rs `EL1_CORE_MASK`).
     unaos_kernel::arch::percpu::init(0); unaos_kernel::arch::sched::mark_el1_core();
     unaos_kernel::arch::exceptions::install();
-    unaos_kernel::arch::timer::el1_oneshot_proof(); #[cfg(feature = "bsptick")] unaos_kernel::arch::timer::el1_bsptick_start(); tegra_el0_start_maybe(); #[cfg(feature = "tegradesk")] tegra_desk_arm(); #[cfg(feature = "orinconwin")] unaos_kernel::arch::display_tegra::orin_conwin(); #[cfg(feature = "orintenant")] unaos_kernel::arch::display_tegra::orin_tenant_arm(); #[cfg(feature = "orinladder")] unaos_kernel::arch::display_tegra::orin_ladder_arm(); tegra_rast_demo_maybe(); #[cfg(feature = "orinwdt")] unaos_kernel::arch::wdt_tegra::boot_ok_disarm(); #[cfg(not(feature = "bsprun"))] unaos_kernel::arch::sched::run_capstone_boot_core(0); #[cfg(feature = "bsprun")] unaos_kernel::arch::sched::run_bsp_tegra(0); // IRQEL-RT EL1 one-shot proof (first: one interrupt taken AT EL1 through the runtime-banked __vec_irq, then self-disarms — see timer.rs tail) + ORIN-BSPTICK periodic EL1 tick (no-op unless UNAOS_BSPTICK=1; arms right where the one-shot self-disarmed and leaves IRQs unmasked across the terminus — timer.rs tail) + ORINDESK RUNG 2 desktop seam (no-op unless UNAOS_TEGRADESK=1; DESKSEAM tail block) + RAST-TEGRA demo (no-op unless UNAOS_RAST=1), all on the same line as the terminus so the wire-ins add ZERO source lines before any panic Location — the tegra knob-off byte-identity constraint (PI-V3D-1 bisect-proven). The terminus itself is knob-selected (ORIN-BSPRUN, Candidate B arc 2): default = the cooperative `run_capstone_boot_core(0)` drive loop, UNAOS_BSPRUN=1 = `run_bsp_tegra(0)` (sched.rs tail — SCHED_ACTIVE + mark_online(0) + the preemptive `run()` loop; requires/implies bsptick, arroyo folds it in). Helpers defined at file tail / sched.rs tail / timer.rs tail. Helpers defined at file tail / timer.rs tail.
+    unaos_kernel::arch::timer::el1_oneshot_proof(); #[cfg(feature = "bsptick")] unaos_kernel::arch::timer::el1_bsptick_start(); tegra_el0_start_maybe(); #[cfg(feature = "tegradesk")] tegra_desk_arm(); #[cfg(feature = "orinconwin")] unaos_kernel::arch::display_tegra::orin_conwin(); #[cfg(feature = "orintenant")] unaos_kernel::arch::display_tegra::orin_tenant_arm(); #[cfg(feature = "orinladder")] unaos_kernel::arch::display_tegra::orin_ladder_arm(); #[cfg(feature = "orinfurn")] tegra_desk_furn(); tegra_rast_demo_maybe(); #[cfg(feature = "orinwdt")] unaos_kernel::arch::wdt_tegra::boot_ok_disarm(); #[cfg(not(feature = "bsprun"))] unaos_kernel::arch::sched::run_capstone_boot_core(0); #[cfg(feature = "bsprun")] unaos_kernel::arch::sched::run_bsp_tegra(0); // IRQEL-RT EL1 one-shot proof (first: one interrupt taken AT EL1 through the runtime-banked __vec_irq, then self-disarms — see timer.rs tail) + ORIN-BSPTICK periodic EL1 tick (no-op unless UNAOS_BSPTICK=1; arms right where the one-shot self-disarmed and leaves IRQs unmasked across the terminus — timer.rs tail) + ORINDESK RUNG 2 desktop seam (no-op unless UNAOS_TEGRADESK=1; DESKSEAM tail block) + ORIN-DESKFURN, the menu bar + SHARD menu (no-op unless UNAOS_ORINFURN=1; DESKFURN tail block — LAST of the rungs on purpose, so every earlier rung's probe still reads a panel with no bar on it and its captures stay comparable to boot7f/7g/7h; and still AHEAD of `boot_ok_disarm`, so the boot watchdog covers the composite it drives) + RAST-TEGRA demo (no-op unless UNAOS_RAST=1), all on the same line as the terminus so the wire-ins add ZERO source lines before any panic Location — the tegra knob-off byte-identity constraint (PI-V3D-1 bisect-proven). The terminus itself is knob-selected (ORIN-BSPRUN, Candidate B arc 2): default = the cooperative `run_capstone_boot_core(0)` drive loop, UNAOS_BSPRUN=1 = `run_bsp_tegra(0)` (sched.rs tail — SCHED_ACTIVE + mark_online(0) + the preemptive `run()` loop; requires/implies bsptick, arroyo folds it in). Helpers defined at file tail / sched.rs tail / timer.rs tail. Helpers defined at file tail / timer.rs tail.
 }
 
 /// Handle one keyboard byte against the console: printable ASCII extends the input line, backspace
@@ -6670,10 +6670,10 @@ fn pidesk_activate_maybe() -> bool {
     unaos_kernel::video::pidesk::activate()
 }
 
-// Knob-off (and every non-baremetal aarch64 build): the wire-in compiles to nothing. `#[inline(always)]`
-// on a body that is a constant `false` means the call site emits zero instructions and folds to the
-// bare `detach()` it has always been, so the image stays byte-identical.
-#[cfg(all(target_arch = "aarch64", not(all(feature = "pidesk", feature = "baremetal"))))]
+// Knob-off ON THE PATH THAT HAS THE CALLER: the wire-in compiles to nothing. `#[inline(always)]` on a
+// constant `false` means the call site emits zero instructions and folds to the bare `detach()` it has
+// always been. ⚠ Gate NARROWED from `not(all(pidesk, baremetal))` — see DEAD-STUB in the DESKFURN block.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal", not(feature = "pidesk")))]
 #[inline(always)]
 fn pidesk_activate_maybe() -> bool {
     false
@@ -6786,6 +6786,14 @@ const TEGRADESK_CLICK_ROUTED: bool = cfg!(feature = "orinclick");
 /// Flipping this alone is not enough and is not the intended route: the flip belongs to the rung that
 /// can show the Orin's own `[u7stk]`/`[redzone]` numbers for this cascade on this board. §7 of the
 /// ladder is explicit that every stack number quoted for it so far is a **Pi** number.
+///
+/// ⚠ **AND THAT CLEARING CONDITION CANNOT BE MET WHERE THE CASCADE RUNS** (ORIN-DESKFURN, 2026-08-26,
+/// orin-desktop.md §3.12). `sched::stk_probe` loads `SCHED[cpu].current` and RETURNS EARLY when it is
+/// null — which is exactly the boot core at this terminus, before `run_capstone_boot_core` drives the
+/// queue. So every rung on this line is a place where `[u7stk]` is a no-op. Clearing §5.2 needs an
+/// instrument this ladder does not have (a boot-stack high-water probe, or the cascade moved off the
+/// boot stack); it does NOT license flipping this constant on the argument that the numbers are
+/// unobtainable. Recorded here so the next reader of this stop-line meets the gap, not just the hold.
 #[cfg(all(target_arch = "aarch64", feature = "tegradesk"))]
 const TEGRADESK_CASCADE_OK: bool = false;
 
@@ -7273,4 +7281,227 @@ fn jd2_supstate_presenter(_arg: usize) {
         }
         unaos_kernel::arch::display_tegra::sup_present_pass(work, flushed); unaos_kernel::arch::sched::yield_now(); // ORIN-SUPSOUND — two relaxed atomic adds on the per-frame path, no lock and no print; the ~10 s census turns them into the liveness verdict.
     }
+}
+
+// =================================================================================================
+// ORIN-DESKFURN — THE FURNITURE. `orinfurn`, DEFAULT OFF. The Orin's menu bar is ENABLED and PAINTED
+// and the SHARD menu becomes pressable. Ladder: docs/dev/OS/08_VIDEO/orin-desktop.md §3.12.
+// =================================================================================================
+//
+// THE DEFECT THIS CLOSES. `menubar::ENABLED` starts `false` and there are exactly TWO
+// `menubar::set_enabled(true)` calls in this tree: `video/wcx.rs:552` (x86) and
+// `video/pidesk.rs:292`. Neither is reachable on this board — `wcx` is x86_64-only, and `pidesk`'s
+// is inside `activate()`, which the tegra path never calls (see the DESKSEAM block above: that seam
+// exists, IS wired to the terminus, and REFUSES at `TEGRADESK_CASCADE_OK`). So the Orin composites
+// windows with no bar above them, and a press where the crystal should be lands on empty desktop.
+// `strip`, `dock`, `menubar` and `crystal` are all COMPILED into any image carrying `pidesk`, and
+// `wc_click_route`'s furniture arm already calls `strip::press_route` -> `crystal::press_at` ahead of
+// every window arm (display_tegra.rs's rung-4 block records exactly this). Everything is present;
+// nothing turns it on. This turns it on.
+//
+// ⚠ WHAT THIS IS NOT, AND THE STOP-LINE IS NOT CROSSED. `pidesk::activate()` is NOT called and
+// `TEGRADESK_CASCADE_OK` is NOT touched — §5.2 stands and rung 5 is still blocked. `activate`'s
+// sequence is nine steps; this takes TWO, `menubar::set_enabled(true)` and `wm::composite()`, because
+// those two ARE the bar and nothing else in `activate` is. What is deliberately NOT taken, each for
+// its own reason rather than as a blanket: the step-1b DESKTOP-CLEAR (a whole-panel write through the
+// FRONT buffer whose soundness argument is an EMPTY window table — false here the moment rung 0 or
+// rung 4 has minted a row); the console window (rung 4's, `orinconwin`, and it stands alone);
+// `crystal::routed_selftest` (a `witness` fixture that drives presses through the live router — the
+// deep arm, and the one closest in shape to Pi boot 11's overflow); `pulsewin::open`; the window
+// population; the tegra `render_service` (§3.6, unbuilt); and the closing filesystem walk.
+//
+// WHY THE STACK ARGUMENT HOLDS HERE WHERE §5.2's DOES NOT. §5.2's hazard is the CASCADE's DEPTH and
+// its named overflow is `quarry::open()` at click-router depth (Pi boot 11). `orinfurn` does not
+// imply `quarry`, so that call is the `not(feature = "quarry")` `false` stub in this build — the same
+// fact rung 4 leaned on. What this adds to the terminus is ONE more `wm::composite()`: the same call
+// ORIN-WM1 (rung 0), `orin_conwin`'s `create_at` (rung 4) and `orin_tenant_arm` (rung 6) already make
+// from this same line on the boot core's own entry frame, all three FLOWN on Orin metal (boot7f,
+// boot7g, boot7h). A fourth instance of a shape this board has run three times is not a new shape.
+//
+// ⚠ AND THAT IS AN ARGUMENT FROM THE LEDGER, NOT A MEASUREMENT — said plainly because §7 of the
+// ladder exists to stop exactly this sentence from being read as a number. No `[u7stk]` reading for
+// this line exists on this board, and `sched::stk_probe` CANNOT take one here: it loads
+// `SCHED[cpu].current` and returns early when that is null, which is precisely the boot core before
+// `run_capstone_boot_core` drives the queue. So the terminus is a place where §5.2's own evidence
+// requirement is structurally unsatisfiable. That is a finding ABOUT the stop-line, not a licence to
+// step over it, and it is why this block narrows the work instead of flipping the constant.
+//
+// DEAD-STUB (the second edit in this file, and the whole of it is one `#[cfg]`). The knob-off
+// `pidesk_activate_maybe` above read `all(aarch64, not(all(pidesk, baremetal)))`, which compiled the
+// constant-`false` stub on every NON-baremetal aarch64 build — including every tegra one, where its
+// only call site does not exist: that site is `kernel_main`'s GUI-handoff line, itself
+// `all(aarch64, baremetal)`, and on this board `kernel_main` is unreachable anyway because
+// `tegra_early_stop` is `-> !` and diverges. Hence `pidesk_activate_maybe is never used` in every
+// tegra gate log for weeks, and the warning was right. Narrowed to
+// `all(aarch64, baremetal, not(pidesk))` so the pair exists exactly where its caller does.
+// BEHAVIOURALLY INERT: under `baremetal` both arms resolve exactly as before, so the Pi is
+// unaffected; elsewhere it deletes a function that emitted no instructions. LINE-NEUTRAL: one
+// attribute and its comment rewritten in place, no line added or removed in `main.rs`, so no panic
+// `Location` moves and the knob-off byte-identity proof is intact.
+//
+// ZERO SOURCE LINES. The call site is a statement APPENDED to the existing terminus line and this
+// block is at the FILE TAIL — the `smpmark`/ORIN-WM1/DESKSEAM/ORIN-CONWIN convention, whose reason is
+// PI-V3D-1 and is bisect-proven: panic `Location` records embed line numbers, so a line inserted
+// ahead of them moves the loadable image even with every knob off.
+//
+// WHERE ON THE LINE. LAST of the rungs — after `orin_ladder_arm`, before `tegra_rast_demo_maybe` —
+// for two reasons. (1) Every earlier rung's probe (`[orinwm1]`, `[orinchrome]`, `[orinconwin]`,
+// `[orintenant]`, `[oringlass]`, `[orindock]`) then still reads a panel with no bar on it, so an
+// armed capture stays directly comparable to boot7f/7g/7h. (2) It is still AHEAD of
+// `boot_ok_disarm`, so the `orinwdt` boot watchdog covers the composite this drives — if the bar's
+// composite is where the board dies, the watchdog is still armed to say so.
+
+/// DESKFURN — one-shot latch, for DESKSEAM's stated reason: `tegra_early_stop` runs once per boot on
+/// the boot core so this cannot fire today, but the `#[cfg]` maze above has grown a second reachable
+/// path before, and `menubar::set_enabled` is not idempotent in its WITNESS (it bumps `TOGGLES` and
+/// latches `DEFAULT_LATCH`), so a second pass would make the bar's own instrument read a history that
+/// did not happen.
+#[cfg(all(target_arch = "aarch64", feature = "orinfurn"))]
+static ORINFURN_ENTERED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// **ORIN-DESKFURN — enable the menu bar, composite it, and READ THE PAINT BACK.**
+///
+/// Returns `true` iff the bar is enabled AND owns pixels when this returns. Nothing the caller does
+/// depends on the value: like DESKSEAM this is a leaf, because the tegra path has no
+/// `fbcon::detach()` handoff for a return value to guard — rung 4's `tegra_conwin_live` guards that
+/// one, off the ROUTE, and the bar has no bearing on it.
+///
+/// **EVERY VERDICT IS DERIVED FROM A VALUE READ ON THIS BOOT.** The floors are read live; the paint is
+/// read back through `menubar::owns_pixels()` rather than inferred from having called `composite` —
+/// `video/menubar.rs` documents that load as the one thing distinguishing "enabled" from "on the
+/// glass", and `pidesk` reads it for the same reason at the same seam.
+#[cfg(all(target_arch = "aarch64", feature = "orinfurn"))]
+fn tegra_desk_furn() -> bool {
+    use core::sync::atomic::Ordering;
+    use unaos_kernel::video::{menubar, wm};
+
+    // THE ENTRY LINE, printed before anything can decline. A silent `false` must never be
+    // indistinguishable from "the seam was never called" — that ambiguity is exactly what made the
+    // missing bar read as a mystery rather than as a refusal, and one unconditional line closes it.
+    // The sibling knobs are named because this rung's usefulness is a function of them: without
+    // `orinconwin` the bar has no window caption to show, and `orinclick` is IMPLIED by `orinfurn`
+    // (Cargo.toml) so `click=1` here is a structural fact, printed to be falsifiable rather than
+    // trusted.
+    serial_println!(
+        "[orinfurn] arm click={} conwin={} desk={} tenant={} deskseam={} (ORIN-DESKFURN entered on the tegra terminus; §5.2 UNCROSSED — pidesk::activate is NOT called)",
+        cfg!(feature = "orinclick") as u8,
+        cfg!(feature = "orinconwin") as u8,
+        cfg!(feature = "orindesk") as u8,
+        cfg!(feature = "orintenant") as u8,
+        cfg!(feature = "tegradesk") as u8
+    );
+
+    if ORINFURN_ENTERED.swap(true, Ordering::AcqRel) {
+        serial_println!("[orinfurn] REFUSE reason=already-armed (the seam is one-shot; a second pass would re-toggle ENABLED, bump menubar's TOGGLES counter and make its DEFAULT_LATCH witness read a history that did not happen)");
+        return false;
+    }
+
+    // FLOOR 1 — THE PANEL, off the surface the compositor composites onto, never assumed. Copy the
+    // info out and drop `WRITER` immediately: nothing below may hold it across a `wm` call, which is
+    // ORIN-WM1's WRITER/TABLE acquisition-order rule. FAILS on a headless Orin — no DTB
+    // `simple-framebuffer` handoff means JD1 printed `JB1b — geometry unresolved` and seeded no
+    // scanout, and every floor below is a function of panel geometry.
+    let info = {
+        let fb = *unaos_kernel::video::WRITER.lock();
+        if !fb.is_ready() {
+            serial_println!("[orinfurn] REFUSE reason=no-panel (headless boot — JD1 seeded no scanout; the bar's geometry, its floors and the composite that paints it are all functions of panel geometry)");
+            return false;
+        }
+        fb.info()
+    };
+    let (pw, ph) = (info.width, info.height);
+
+    // FLOOR 2 — THE STAGING BUFFER, here for DESKSEAM's reason restated: `wm`'s staged presents run
+    // inside `SYS_WIN_PRESENT`'s IRQ mask, so a stage that GREW on the pass would be a masked
+    // acquisition of the global heap `Mutex` — the F1-F5 defect family. The tree's only
+    // `reserve_stage` caller on a normal boot is `video::init_panel`, which the tegra path never
+    // reaches (it seeds `WRITER` by hand instead). Grow-only and idempotent, so it is safe beside the
+    // identical calls rungs 0/2/4/6 make from this same line. FAILS when the 48 MiB aarch64 heap
+    // cannot spare entry 0 at all.
+    let staged = wm::reserve_stage(&info);
+    if staged == 0 {
+        serial_println!("[orinfurn] REFUSE reason=stage-unreserved panel={}x{} stage=0 (wm::reserve_stage got nothing for entry 0 — the bar's composite would grow its buffer under SYS_WIN_PRESENT's IRQ mask, the F1-F5 shape)", pw, ph);
+        return false;
+    }
+
+    // FLOOR 3 — THE BAR'S OWN GEOMETRY FLOOR, read through THE ONE accessor (`menubar::strip_rect`,
+    // which is also what `strip::TENANTS` and `wm::erase_clip` read — there is no second copy of the
+    // bar's rectangle anywhere). `None` on a panel shorter than `FLOOR_H` or narrower than `FLOOR_W`.
+    // REACHABLE rather than hypothetical: the floor admits 640x480 and refuses below it, so a boot
+    // that came up on a fallback mode instead of the bench's 1920x1200 can land here.
+    let rect = menubar::strip_rect(pw, ph);
+    let live = wm::count();
+    let was_enabled = menubar::enabled();
+    let owned_before = menubar::owns_pixels();
+
+    // THE CENSUS. Unconditional, and ahead of the refusal below it, so a capture always carries every
+    // measured floor and not merely the first one that said no.
+    serial_println!(
+        "[orinfurn] floors panel={}x{}x{} stage={} rect={:?} table={} bar-was={} owned-was={} rows={}",
+        pw, ph, info.bytes_per_pixel, staged, rect, live, was_enabled, owned_before, wm::MAX_WINDOWS
+    );
+
+    if rect.is_none() {
+        serial_println!("[orinfurn] REFUSE reason=panel-below-bar-floor panel={}x{} (menubar::strip_rect declined this panel — shorter than FLOOR_H or narrower than FLOOR_W; enabling the bar anyway would subtract rows from every present that no composite could then fill)", pw, ph);
+        return false;
+    }
+
+    // THE ARM — the tenancy is CLAIMED. Two statements, and the second is load-bearing rather than a
+    // flourish: from the instant the bar is enabled `Screen::present_background` subtracts its rect,
+    // so those rows stop being desktop pixels and ONLY a composite can fill them, and
+    // `wm::service_damage` returns without compositing while no row is dirty. On the quiet boot this
+    // board actually has, nothing would ever paint them. One pass at the seam closes that by
+    // construction — `pidesk`'s step 5, and SHELLDESK's exact symptom, reached on a third seam.
+    let bar_was = menubar::set_enabled(true);
+    wm::composite();
+
+    // READ THE PAINT BACK; do not infer it from having called `composite`. `strip::paint` declines a
+    // pass without touching a pixel on a contended `SCRATCH` (the dock is tenant #1 and takes the
+    // same scratch in the same pass) or a surface not yet `word4`, and `menubar::compose` then
+    // returns `false` with its slot untouched. One re-run discharges it — `owns_pixels` is the same
+    // packed load `compose` acts on, so the retry runs iff the first pass did not land.
+    let retried = if menubar::enabled() && !menubar::owns_pixels() {
+        wm::composite();
+        true
+    } else {
+        false
+    };
+    let painted = menubar::owns_pixels();
+
+    if !painted {
+        // ROLLBACK, and this is where this seam deliberately DIFFERS from `pidesk::activate`, which
+        // reports the miss and leaves the bar ENABLED. On the Orin that outcome is worse than no bar:
+        // `jd2_console_pump` owns the panel through a `Screen` whose `present_background` subtracts
+        // the bar's rect on every present, so an enabled-but-unpainted bar is a permanent dead band
+        // across the top of the console for the rest of the boot, with no damage condition able to
+        // notice it. Putting `ENABLED` back makes those rows desktop pixels again and the next
+        // present fills them. The disagreement with `pidesk` is stated rather than hidden: it is a
+        // behaviour difference between two seams, and only a bench boot can say which is right here.
+        menubar::set_enabled(bar_was);
+        serial_println!(
+            "[orinfurn] REFUSE reason=composite-declined panel={}x{} stage={} retried={} rolled-back-to={} passes={} (menubar::compose left its slot untouched — strip::paint declines on a contended SCRATCH or a surface not yet word4. ENABLED restored: an enabled bar with no pixels is a dead band Screen::present_background subtracts forever)",
+            pw, ph, staged, retried, bar_was, if retried { 2 } else { 1 }
+        );
+        return false;
+    }
+
+    serial_println!(
+        "[orinfurn] ARMED panel={}x{} stage={} rect={:?} bar-was={} retried={} owns_pixels={} table={} -> BAR-ON-GLASS",
+        pw, ph, staged, rect, bar_was, retried, painted, live
+    );
+    // The SHARD menu is reachable from this instant, and that is a SECOND claim, not a restatement:
+    // "the bar is painted" and "the bar is live" are two sentences and a capture should not have to
+    // infer the second. `crystal::press_at` hit-tests `menubar::crystal_corner_abs` (FITTS-CORNER —
+    // the bar's whole upper-left corner cell, not just the glyph), and `wc_click_route`'s furniture
+    // arm calls `strip::press_route` ahead of every window arm on an image carrying `pidesk`, which
+    // `orinfurn` implies. ⚠ UNFLOWN: no Orin has pressed it. The falsifier is an
+    // `[orinclick] edge=press … at (x,y)` INSIDE the corner rect printed here that still ends
+    // `-> RAISED` or `MISS-SHELL` — the press reaching a window or the desktop means the menu band
+    // did not consume it, which is the bar not being live however painted it looks.
+    serial_println!(
+        "[orinfurn] crystal LIVE corner={:?} — press the crystal for the SHARD menu (About is real on aarch64; Sleep/Restart/Shut Down print their honest unimplemented lines — no PSCI wiring on this track). UNFLOWN on Orin metal",
+        menubar::crystal_corner_abs(pw, ph)
+    );
+    true
 }

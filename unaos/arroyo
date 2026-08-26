@@ -1100,6 +1100,50 @@ _feats=""
 # `[orindock] arm`, `[orindock] park`, `[orindock] restore`, `[orindock] census`. See
 # docs/dev/OS/08_VIDEO/orin-desktop.md §3.11.
 [ -n "${UNAOS_ORINLADDER:-}" ] && _feats="${_feats}orinladder,orinconwin,orinclick,orindesk,pidesk,tegra_el0,tegra,"
+# ORIN-DESKFURN: UNAOS_ORINFURN=1 gives the Orin FURNITURE — `main.rs::tegra_desk_furn` on
+# `tegra_early_stop`'s terminus line ENABLES the menu bar (`menubar::set_enabled(true)`), COMPOSITES it
+# (`wm::composite`), reads the paint back off `menubar::owns_pixels()` and makes the SHARD menu
+# pressable. Before this knob the board had no furniture at all: the tree's only two
+# `menubar::set_enabled(true)` calls are `video/wcx.rs` (x86_64-only) and `video/pidesk.rs` (inside
+# `activate()`, which the tegra path never reaches), so the bar was compiled, composed and permanently
+# invisible on this arch.
+#
+# SELF-SUFFICIENT, like `tegradesk`/`orinconwin` and unlike `orindesk`/`jd1dc`/`smpmark`:
+# `orinfurn = ["pidesk", "orinclick"]` and `orinclick = ["tegra_el0"]` -> `tegra`. `pidesk` is what
+# compiles the furniture family at all (`strip`/`dock`/`menubar`/`crystal` are gated
+# `any(all(x86_64, wc), all(aarch64, pidesk))`), so a standalone spelling would let
+# `UNAOS_ORINFURN=1 UNAOS_TEGRA=1` compile the rung's ABSENCE and report green. The terms are appended
+# here as well as implied by Cargo so the banner shows the configuration it actually built.
+#
+# ⚠ IT IMPLIES UNAOS_ORINCLICK, and that is the one implication it must have: a bar whose crystal
+# cannot be pressed is chrome, not furniture, and the SHARD menu is half of what this knob delivers.
+# It deliberately does NOT imply `orinconwin` or `orindesk` — the bar, the console window and rung 0's
+# demo row are independent furniture and each stands on its own floors. The bar is more USEFUL beside
+# `orinconwin` (it has a window caption to show), so the intended bench image is
+#     UNAOS_ORINFURN=1 UNAOS_ORINCONWIN=1 UNAOS_ORINDESK=1 ./arroyo esp-jetson
+# and `UNAOS_ORINFURN=1` alone is a sound, narrower boot that arms the bar and nothing else.
+#
+# ⚠ IT DOES NOT CROSS THE §5.2 STOP-LINE, and this is the knob's whole safety argument.
+# `pidesk::activate()` is NOT called and `TEGRADESK_CASCADE_OK` is NOT touched — rung 5 stays blocked.
+# `activate` is a nine-step cascade; this takes exactly two of its steps (the enable and the
+# composite) because those two ARE the bar. No DESKTOP-CLEAR, no console window, no
+# `crystal::routed_selftest`, no `pulsewin`, no window population, no render service, no filesystem
+# walk. `quarry` is not implied, so `quarry::open()` at click-router depth — Pi boot 11's actual
+# 16 KiB overflow — is the `not(feature = "quarry")` stub here, the same fact rung 4 leaned on. What
+# it adds to the terminus is ONE more `wm::composite()`, the call rungs 0/4/6 already make from this
+# line on the boot stack, all three FLOWN on Orin metal (boot7f/7g/7h).
+#
+# ⚠ UNMEASURED, STATED: no `[u7stk]` number exists for this line and `sched::stk_probe` cannot take
+# one here (it returns early when `SCHED[cpu].current` is null — the boot core before the scheduler is
+# driven). The stack claim above is an argument from the ledger, not a reading.
+#
+# Default OFF => the statics, the function and the terminus statement all vanish, no line moves in any
+# file (file-tail block; the call site is appended to an existing line), and the jetson image is
+# byte-identical to baseline. The ARMED polarity is type-checked by the `arm-tegra-furn` leg of
+# KERNEL_CFG_MATRIX, never by this mapping. UNFLOWN — no Orin has booted it.
+# Witness on the wire: `[orinfurn] arm`, `[orinfurn] floors`, `[orinfurn] ARMED`, `[orinfurn] REFUSE`,
+# `[orinfurn] crystal LIVE`. See docs/dev/OS/08_VIDEO/orin-desktop.md §3.12.
+[ -n "${UNAOS_ORINFURN:-}" ] && _feats="${_feats}orinfurn,pidesk,orinclick,tegra_el0,tegra,"
 # JB11-ESCAPE: UNAOS_NOJB11=1 suppresses the Falcon firmware-header census
 # (arch/aarch64/xusb_tegra.rs::jb11_fw_header_census) so a bench sitting can take an UN-INSTRUMENTED
 # CONTROL boot. Default UNSET => the census runs on every tegra boot, unchanged — the census is the
@@ -2903,6 +2947,35 @@ KERNEL_CFG_MATRIX=(
   # PRECONDITION: like `arm-tegra-conwin`, this leg compiles `arch/aarch64/syscall.rs`, which
   # `include_bytes!`s `target/user_blob.bin`. `ensure_user_blob` (see check_both) supplies it.
   "arm-tegra-ladder ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,pidesk,livecon,quarry,orinconwin,orindesk,orinclick,orinladder"
+  # ORIN-DESKFURN armed (appended 2026-08-26) — `orinfurn` is the FURNITURE knob: `tegra_desk_furn`
+  # enables the menu bar on the tegra terminus, composites it and reads the paint back. It is the
+  # first tegra caller of `menubar::set_enabled`, `menubar::strip_rect`, `menubar::owns_pixels`,
+  # `menubar::crystal_corner_abs` and a bare `wm::composite()`, so no other leg type-checks those
+  # symbols resolved from a `tegra` caller under `pidesk`.
+  #
+  # HOSTED ON `arm-tegra-conwin`'s LIST + `orinfurn`, not on `arm-tegra`'s, and the reason is that the
+  # INTENDED bench image carries both: the bar's caption field is the FOCUSED WINDOW's, so a leg that
+  # compiled the bar with no window path would type-check the rung in a configuration nobody boots.
+  # `orinfurn` implies `pidesk` + `orinclick` on its own (Cargo.toml), so the leg's `orinconwin`,
+  # `orindesk` and `quarry` terms are the CONTEXT, not the closure.
+  #
+  # ⚠ THE `quarry` TERM IS PRESENT ON PURPOSE AND IS THE ADVERSARIAL HALF. `orinfurn` does NOT imply
+  # `quarry` — its §5.2 argument rests on `quarry::open()` being the `not(feature = "quarry")` stub —
+  # but this leg compiles the bar WITH `quarry` on, so the furniture's own call graph is type-checked
+  # against the deep router arm too. A future edit that reached `quarry` from the bar path would go
+  # red here rather than on a bench boot.
+  #
+  # WHAT IT DOES NOT COVER, said so nobody reads the green as more than it is: this is a TYPE CHECK.
+  # No gate in this tree can boot it — QEMU models no Tegra234 — so the bar's paint, the crystal press
+  # and the §5.2 stack claim are all Orin-metal verdicts and all UNFLOWN.
+  #
+  # UNIVERSE SIDE EFFECT: none that moves a mix count — `orinfurn` is named only on an arm-* leg and
+  # every site is inside `feature = "tegra"`/aarch64 items, so `x86_cfg_universe` drops it. Board legs
+  # +1; gate +1. `./arroyo check` prints the live counts every run — read them there, not here.
+  #
+  # PRECONDITION: like `arm-tegra-conwin`, this leg compiles `arch/aarch64/syscall.rs`, which
+  # `include_bytes!`s `target/user_blob.bin`. `ensure_user_blob` (see check_both) supplies it.
+  "arm-tegra-furn ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,pidesk,livecon,quarry,orinconwin,orindesk,orinclick,orinfurn"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────
