@@ -109,6 +109,18 @@
 # the one unmatched) and remains the green reference. Go-red proven both directions this
 # session: the boot7h slice PASSes 17/17 with the promoted row ✅; the same slice with the
 # one IRQEL-RT PASS line removed reds on exactly this row (16/17).
+#
+# 2026-08-25 (exec-boot7iprep): BOOT 7i ARMED AHEAD OF ITS CUT — five witness families
+# from the forming metal batch (ORIN-REBOOT's verb+watchdog halves, ORIN-SHUTOFF,
+# ORIN-SELFUP's S0..S6 ladder, ORIN-BSPTICK, NET-4G) get rows in a BOOT 7i banner block
+# below the BOOT 7h one. NO COUNT MOVES: the boot7i image is uncut and not one of the
+# nineteen new patterns has ever printed on this bench (zero hits across the whole
+# capture tree AND the boot7h slice — the per-block banner carries the numbers), so
+# everything arms as PENDING (the lines an armed boot prints unconditionally) or
+# OPTIONAL (operator-driven verbs, payload-conditional ladder stages, self-gating
+# NET-4G arms), promote-on-evidence. boot7h remains the green reference: 17/17, 0
+# forbidden, pending 8/15 matched after this fold (TEGRA-SD unmatched as before; the
+# six new PENDINGs read ⏳ until boot7i flies).
 
 # --- boot bring-up witnesses (the JD/JB chain — all previously metal-proven) --------
 REQUIRE JD1.*scanout:.*sane=true
@@ -778,6 +790,168 @@ OPTIONAL \[net4F\] MAC chip id:
 #   without a lease — a leased boot legitimately never prints it, so no PENDING umbrella
 #   (the MODEL-VERDICT argument above, in the other direction).
 OPTIONAL \[net4V no-lease verdict\]
+
+# =====================================================================================
+# BOOT 7i — THE METAL BATCH, ARMED AHEAD OF ITS CUT (2026-08-25, exec-boot7iprep).
+# Unlike the BOOT 7h banner above, NOTHING here is captured: every pattern is a
+# PREDICTION about a line that has NEVER printed on this bench. Measured, not assumed —
+# all nineteen patterns below take ZERO hits across the whole bench capture tree (277
+# log/txt files, ~2.5M lines, scanned with the compiled patterns themselves), and the
+# boot7h green-reference slice (orin.log 13159-16290) carries none of the five family
+# tags, so replaying boot7h against this file is UNCHANGED by this block: 17/17, 0
+# forbidden, the new rows all ⏳/◦. That is the negative control, run before commit.
+# Every string below was read out of the SOURCE (power.rs, wdt_tegra.rs,
+# selfup_tegra.rs, the timer.rs tail, rtl8168_tegra.rs) — the boot7i image is not yet
+# cut, so there is no staged artifact to grep; the artifact-side check (each family's
+# token in the staged kernel.elf, `LC_ALL=C grep -a`) is owed at cut time with the
+# MANIFEST. Rows arm as PENDING/OPTIONAL now and promote on the boot7i capture, per
+# promote-on-evidence.
+# REQUIRED/FORBIDDEN COUNTS ARE UNCHANGED BY THIS BLOCK, BY CONSTRUCTION. Four of the
+# five families are knob-gated, default OFF — `orinwdt` (UNAOS_ORINWDT=1, arroyo:838),
+# `selfup` (UNAOS_SELFUP=1, arroyo:963), `bsptick` (UNAOS_BSPTICK=1, arroyo:735), and
+# [net4G] rides `net4` (UNAOS_NET4=1, arroyo:1045) — so a REQUIRE on any of them would
+# red every unarmed boot on CONFIGURATION rather than on health: the SMPMARK/TEGRA-SD
+# argument, permanently binding. mbench still has no conditional REQUIRE (`WHEN <guard>
+# REQUIRE <rx>`, the x86-witness.spec grammar hole), so "REQUIRE on an armed boot" is
+# spelled the only way the grammar can spell it: PENDING on the lines an armed boot
+# prints unconditionally — the TEGRA-SD idiom exactly. The fifth family (the power
+# VERBS) is OPERATOR-DRIVEN: an unattended boot legitimately prints none of it — the
+# [orinclick]-edge argument, so OPTIONAL end to end.
+# TOKEN LENGTHS, per the >8-byte immediate-encoding trap the timer.rs tail writes up:
+# `[orinreboot]` 12 B, `[orinshutoff]` 13 B, `[orinselfup]` 12 B, `[orinbsptick]` 14 B —
+# all artifact-grep-able as bare tags. `[net4G]` is EXACTLY 8 bytes, at the LLVM bound:
+# grep the staged artifact for the longer fragment `latch-site status` (17 B, same
+# format literal) rather than the bare tag when doing the cut-time check.
+# =====================================================================================
+
+# --- ORIN-REBOOT (watchdog half): the TKE boot watchdog, ARMED/DISARMED pair ---------
+# ARMED BY `orinwdt`. Both lines are UNCONDITIONAL on an armed boot that completes:
+# `boot_arm()` fires at main.rs:2064 (right after `exceptions::install`, EL2, MMU device
+# window live) and prints `wdt ARMED` with read-backs; `boot_ok_disarm()` fires on the
+# EL1 terminus line (main.rs:2679, strictly BEFORE `run_capstone_boot_core`) and prints
+# `wdt DISARMED`. So on an armed image, any boot that satisfies `REQUIRE CAPSTONE
+# COMPLETE` has printed BOTH — the orinconwin gate/terminus shape, PENDING both.
+# THE PAIR IS THE MEASUREMENT: ARMED without DISARMED on a capture that then goes dark
+# is the watchdog ABOUT TO FIRE — a wedged boot self-resetting, which is the instrument
+# WORKING, and it reds through the missing REQUIREs downstream, never through these
+# rows. No FORBID is writable for it: the signature is an absence, and mbench forbids
+# lines, not absences.
+# EM DASHES: both lines put one immediately after the verdict token (`ARMED — POR reset
+# in …` / `DISARMED — boot reached …`), so both patterns stop at the token and never
+# span the dash. `wdt ARMED` cannot false-hit the DISARMED line (`DISARMED` does not
+# contain ` ARMED` after `wdt `), and both carry the 12-byte family tag.
+PENDING \[orinreboot\] wdt ARMED
+PENDING \[orinreboot\] wdt DISARMED
+
+# --- ORIN-REBOOT / ORIN-SHUTOFF (verb half): the power verbs at the shell ------------
+# NOT knob-gated (power.rs compiles on every build; the aarch64 non-pi arm is the PSCI
+# one) but OPERATOR-DRIVEN: the only callers are the shell verbs `reboot` and
+# `shutdown`/`off` (shell.rs:4041) and selfup's S6 hook below. An unattended boot prints
+# none of these, so every row is OPTIONAL — the [orinclick]-edge argument verbatim:
+# absence means UNRUN, never failed.
+# THE SUCCESS SIGNATURE IS SILENCE, and that must be read from the wire shape, not from
+# a row: on success the PSCI dispatch line (`… via SMC — firmware owns the machine from
+# here`) is the LAST line this kernel ever prints — SYSTEM_RESET warm-resets into
+# firmware chatter, SYSTEM_OFF goes DARK and stays dark. A dark board after the
+# `[orinshutoff]` PSCI line is the shutdown verb PASSING (Peter's cold-boot ruling:
+# the dark board IS the cold-boot-ready signal), not a hang. No spec row can assert
+# "nothing printed after"; the playbook carries that reading.
+# THE `RETURNED` ARMS ARE HONEST REFUSALS, NOT FAULTS: a returning PSCI call is the
+# firmware declining (negative return per DEN0022) and the kernel parking in hlt with
+# the machine's refusal stated — a measurement about ATF, not a UnaOS invariant break,
+# so OPTIONAL and deliberately not FORBID (the JD1-DC rule). Patterns stop before each
+# line's em dash; `{:#010x}` renders lowercase `0x…`, hence `0x[0-9a-f]+`.
+OPTIONAL \[orinreboot\] reboot verb invoked
+OPTIONAL \[orinreboot\] PSCI SYSTEM_RESET \(0x[0-9a-f]+\) via SMC
+OPTIONAL \[orinreboot\] PSCI SYSTEM_RESET RETURNED
+OPTIONAL \[orinshutoff\] shutdown verb invoked
+OPTIONAL \[orinshutoff\] PSCI SYSTEM_OFF \(0x[0-9a-f]+\) via SMC
+OPTIONAL \[orinshutoff\] PSCI SYSTEM_OFF RETURNED
+
+# --- ORIN-SELFUP: the staged-payload self-update ladder (S0..S6) ---------------------
+# ARMED BY `selfup` (main.rs:2479 — after ORIN-INSTALL-2's slot, before the JM6 drop).
+# S0 IS THE ONLY UNCONDITIONAL LINE: `selfup_service` opens with the S0 scan banner on
+# EVERY armed boot — payload or no payload, mountable volume or not, every arm of the
+# S0 match prints an `S0 scan` line (selfup_tegra.rs:108/114/122/131/137/143). So S0 is
+# PENDING (the gate-line shape) and EVERYTHING ELSE IS PAYLOAD-CONDITIONAL: a normal
+# armed boot with no UPDATE.PAK prints S0 alone, and that is the healthy common case —
+# S1..S6 on such a boot would be a defect, which is why none of them can be PENDING
+# (promoting a payload-conditional line reds every payload-less armed boot).
+PENDING \[orinselfup\] S0 scan
+# THE LADDER, one row per stage so the table names how far an update got — read TOP-DOWN
+# on an update boot; the deepest ✅ is the stage the ladder reached. Wire order on a
+# successful update: S0 (staged) -> S1 verify -> S2 parse -> S3 write (once PER FILE) ->
+# S4 flip (window OPEN / per-pair `is live` / window CLOSED) -> S5 clean ->
+# UPDATE APPLIED -> S6 reboot -> the [orinreboot] verb pair above -> RESET (silence,
+# then firmware chatter — the boot that follows is the UPDATED kernel). S6's line is
+# NOT the last before reset: the [orinreboot] PSCI SYSTEM_RESET dispatch line is.
+# Every stage token is followed by an em dash on the wire; every pattern stops at the
+# stage word. The REFUSED line (`UPDATE REFUSED — S2 parse — …`) cannot false-hit the
+# ladder rows: the rows anchor the stage token directly after the family tag.
+OPTIONAL \[orinselfup\] S1 verify
+OPTIONAL \[orinselfup\] S2 parse
+OPTIONAL \[orinselfup\] S3 write
+OPTIONAL \[orinselfup\] S4 flip
+OPTIONAL \[orinselfup\] S5 clean
+OPTIONAL \[orinselfup\] S6 reboot
+# THE TWO TERMINAL ARMS. APPLIED is the success verdict; REFUSED is the fail-closed core
+# WORKING (bad sha, bad magic, short read, missing pair — live boot set untouched, the
+# machine boots its old self normally). An honest refusal must not red the flight — the
+# JD1-DC rule — and no FORBID is added: none of selfup's refusal text carries ` FAIL`
+# (checked against the module, zero hits), so mbench's default FORBIDs stay silent too.
+# On a payload boot the reader adjudicates by eye: APPLIED ✅ + REFUSED ◦ is the round
+# trip; REFUSED ✅ is the finding to quote whole, reason and all.
+OPTIONAL \[orinselfup\] UPDATE APPLIED
+OPTIONAL \[orinselfup\] UPDATE REFUSED
+
+# --- ORIN-BSPTICK: the standing periodic EL1 tick across the terminus ----------------
+# ARMED BY `bsptick`. Both lines are UNCONDITIONAL on an armed boot: `el1_bsptick_start`
+# is called on the terminus line (main.rs:2679, right after `el1_oneshot_proof`) and
+# prints the arming banner BEFORE the unmask; the per-tick witness prints tick 1 (the
+# arm-delivered proof) and then every TICK_HZ-th tick (~1/s) FOREVER — unlike SCHED:
+# load's poll, this emitter lives in IRQ context off the timer itself, so the lines do
+# NOT stop when the drive loop dispatches the pump. PENDING both (the wdt-pair shape).
+# THE COUNT ADVANCING IS THE MEASUREMENT — periodic, not one-shot — and the EL is
+# re-measured per emission (an EL2 reading would mean HCR_EL2.IMO regressed, printed
+# rather than hidden; the pattern deliberately matches ANY EL digit so a regressed line
+# still lands in the table where a reader sees the digit). The banner's em dash sits
+# after `(… Hz, PPI…)`; both patterns stop well before their line's first non-ASCII.
+PENDING \[orinbsptick\] arming PERIODIC CNTP at EL[0-9]+ on cpu [0-9]+
+PENDING \[orinbsptick\] tick [0-9]+ taken at EL[0-9]+ on cpu [0-9]+
+
+# --- NET-4G: the latch-SITE discriminator (rides `net4`, self-gating) ----------------
+# THE TAG IS CASE-SENSITIVE AND THAT IS LOAD-BEARING, measured: lowercase `[net4g]` is
+# the OLDER NET-4g RX-descriptor dump (rtl8168_tegra.rs:1976), which the boot7h slice
+# already carries 9 times. mbench compiles patterns with a bare `re.compile` (no
+# IGNORECASE), so the uppercase rows below cannot credit the dump — do not "fix" the
+# case. The experiment itself SELF-GATES on a conviction: `net4g_arm` runs only when the
+# [net4F] tag-discriminator has just proven a single-address latch (the boot7h
+# conviction, buffer 17), so on a healthy-NIC armed boot the DECOY never arms and only
+# the status line prints.
+# THE STATUS LINE IS THE UNCONDITIONAL ONE (rtl8168_tegra.rs:2298): it prints at EVERY
+# armed window close — concluded, aborted, armed-but-unresolved, or never-armed are its
+# four arms, all legitimate — so the window close is never silent about the experiment.
+# PENDING (the ORIN-NET-4 DONE shape above, and the same permanent no-promote rule).
+# Pattern stops at the colon: the arm texts carry em dashes.
+PENDING \[net4G\] latch-site status:
+# THE CONVICTED-BOOT LINES, all OPTIONAL — each fires only downstream of a [net4F]
+# latch conviction, which a healthy NIC never produces (the boot7h-block argument for
+# `VERDICT tag-proven single-address latch`, inherited whole):
+#   DECOY ARMED  the victim-slot rewrite, with the full verdict vocabulary pre-stated
+#                on the line itself; prints once per boot at most.
+#   VERDICT      the victim completed and exactly one of seven arms names the site —
+#                RC-SIDE | NIC-SIDE | RC-PAGE | PREFETCH-DEPTH | UNDECIDED-CLEARED |
+#                UNDECIDED-CONTAMINATED | UNDECIDED-NO-LANDING. Every arm is a
+#                MEASUREMENT about NIC/RC silicon (the JD1-DC rule): no arm may red the
+#                flight, no arm is a REQUIRE, and the UNDECIDED arms are honest re-fly
+#                verdicts, not failures. `[A-Z-]+` covers all seven; the meaning prose
+#                after the final em dash is never part of the pattern.
+#   arm ABORTED  no NIC-owned victim in reach at conviction time — UNRESOLVED, re-fly.
+#   interim pop  the between-arm-and-verdict attribution bookkeeping, one per pop.
+OPTIONAL \[net4G\] DECOY ARMED: victim slot [0-9]+
+OPTIONAL \[net4G\] VERDICT latch-site=[A-Z-]+
+OPTIONAL \[net4G\] arm ABORTED:
+OPTIONAL \[net4G\] interim pop slot=[0-9]+
 
 # --- COMPLETE: the END-OF-RUN MARKER this file spent its whole life without ----------
 # Until 2026-08-25 this spec declared ZERO `COMPLETE` markers, so mbench's TRUNCATED
