@@ -950,9 +950,9 @@ pub fn handle_irq() {
 }
 
 /// GICv3 IRQ acknowledge/dispatch/EOI via the system-register CPU interface (ICC_IAR1_EL1 /
-/// ICC_EOIR1_EL1). This is the QEMU virt/Orin (non-baremetal) path: the scheduler, the PL011 RX SPI
-/// and timer preemption are all baremetal(pi)-only, so the v3 dispatch tree is just the SGI counter
-/// and the generic timer. INTID 1020-1023 are spurious/special and take no EOI (as on v2).
+/// ICC_EOIR1_EL1). This is the QEMU virt/Orin (non-baremetal) path: the scheduler and the PL011 RX
+/// SPI are baremetal(pi)-only, so the v3 tree is the SGI counter, the generic timer, and — under
+/// `all(tegra,bsprun)` ONLY — the post-EOI `timer_preempt` arm. 1020-1023 spurious, take no EOI.
 #[cfg(not(feature = "pi"))]
 fn handle_irq_v3() {
     let iar: u64;

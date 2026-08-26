@@ -10547,7 +10547,7 @@ panic Location in either file). Armed polarity type-checked by the `arm-tegra-bs
 
 Verified 2026-08-25 at exec-smpb (QEMU/build only — **not yet flown on metal**):
 
-* `UNAOS_TEGRA=1 ./arroyo check` green, 24 legs (15 board + 9 x86 mix; this arc +1 board leg);
+* `UNAOS_TEGRA=1 ./arroyo check` green, 24 legs **as of this arc** (15 board + 9 x86 mix; this arc +1 board leg);
 * `./arroyo test-arm` green (default virt image; `[orinbsptick]` correctly absent);
 * knob-off byte-identity **measured**: `llvm-objcopy -O binary kernel.elf` sha256
   `6ca63b9e677cf8cc28aae54fb4bd6f404a427358a0de234da31fae609dce4172` at baseline `b710fe4c` and
@@ -10640,7 +10640,7 @@ verbatim + `bsptick,bsprun`; the bsprun-without-bsptick polarity is compiled by 
 
 Verified 2026-08-25 at exec-smpb2 (QEMU/build only — **not yet flown on metal**):
 
-* `UNAOS_TEGRA=1 ./arroyo check` green, 27 legs (18 board + 9 x86 mix; this arc +1 board leg =
+* `UNAOS_TEGRA=1 ./arroyo check` green, 27 legs **as of this arc** (18 board + 9 x86 mix; this arc +1 board leg =
   `arm-tegra-bsprun`);
 * `./arroyo test-arm` green knob-off AND with `UNAOS_BSPRUN=1` (virt image byte-inert: every site
   tegra-gated; `[orinbsprun]`/`[orinbsptick]` correctly absent from the armed virt log);
@@ -10739,7 +10739,7 @@ rides `UNAOS_SUPSTATE=1 UNAOS_ORINCLICK=1 ./arroyo check`).
 
 Verified 2026-08-25 at exec-supstate (QEMU/build only — **not yet flown on metal**):
 
-* `UNAOS_TEGRA=1 ./arroyo check` green, **27 legs** (`kernel cfg coverage OK (27 legs)`; this arc
+* `UNAOS_TEGRA=1 ./arroyo check` green, **27 legs as of this arc** (`kernel cfg coverage OK (27 legs)`; this arc
   +1 board leg, `arm-tegra-supstate`, which passed), userspace x86_64 (4 crates) + aarch64
   (5 crates) + midden_core host tests all green, exit 0;
 * knob-off byte-identity **measured** at the loadable-image level: `./arroyo esp-jetson` built
@@ -10763,8 +10763,17 @@ Verified 2026-08-25 at exec-supstate (QEMU/build only — **not yet flown on met
   carries `bl <jd2_supstate_phase2>` at 0x5d258, and phase2's body carries
   `bl <display_tegra::sup_install>` plus two `bl <sched::spawn>` (the presenter and dispatcher
   spawns); `jd2_supstate_presenter` and `jd2_supstate_dispatcher` are present as task entries;
-* `UNAOS_SUPSTATE=1 ./arroyo check` green (27 legs) and the
-  `UNAOS_SUPSTATE=1 UNAOS_ORINCLICK=1` cross green (27 legs) — the armed polarity and the
+* `UNAOS_SUPSTATE=1 ./arroyo check` green (27 legs, as of this arc) and the
+  `UNAOS_SUPSTATE=1 UNAOS_ORINCLICK=1` cross green (27 legs, as of this arc) — the armed polarity and the
+
+**MATRIX SIZE — CURRENT, and why every per-arc figure above disagrees with it.** After the orin-7
+fold batch (`ORIN-BSPRUN` + `ORIN-SUPSTATE` + `GA10B-PROBE1`, plus the `arm-tegra-conwin-tenant`
+rename at `dbda97fa`) `UNAOS_TEGRA=1 ./arroyo check` reports **31 legs = 22 board (20 `arm-*` +
+2 `x86-*`) + 9 x86 pairwise-mix**. The per-arc numbers above are NOT wrong — each was measured on
+a branch carrying only its own new leg, and each is a true record of that arc's gate. They are
+qualified "as of this arc" rather than rewritten, because a gate ledger that is edited to match
+today cannot be used to audit yesterday. **Read the live count from `./arroyo check`'s own output,
+never from this file.**
   armed+instrument cross both compile everywhere;
 * `./arroyo test-arm` green, `MISSION SUCCESS`, and the arm serial log carries ZERO
   `supstate`/`orinclick`/`jd2` lines (awk over `target/serial-arm.log` — correctly absent on the
