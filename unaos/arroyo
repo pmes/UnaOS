@@ -1033,7 +1033,7 @@ _feats=""
 #
 # `orintenant = ["tegra_el0"]` (implies `tegra`), so the knob is self-sufficient. The ARMED polarity
 # is type-checked by the `arm-tegra-tenant` leg of KERNEL_CFG_MATRIX and the full-conjunction cross
-# by `arm-tegra-conwin` (which carries `orintenant` since this rung), never by this mapping.
+# by `arm-tegra-conwin-tenant` (which carries `orintenant` since this rung), never by this mapping.
 # Witness on the wire: `[orintenant] arm`, `[orintenant] create`, `[orintenant] close`,
 # `[orintenant] reap`, `[orintenant] census`. See docs/dev/OS/08_VIDEO/orin-desktop.md §6 rung 6.
 [ -n "${UNAOS_ORINTENANT:-}" ] && _feats="${_feats}orintenant,tegra_el0,tegra,"
@@ -2689,7 +2689,16 @@ KERNEL_CFG_MATRIX=(
   # items) and the derived mix-leg count is unchanged. Board legs +1; gate +1. `./arroyo check` prints
   # the live board/mix counts every run — read them there, not here.
   "arm-tegra-bsptick ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,bsptick"
-  "arm-tegra-conwin ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,pidesk,livecon,quarry,orinconwin,orindesk,orinclick,orintenant"
+  # NAME COLLISION REPAIR (orin 7, 2026-08-25): rung 6 (bc735850) meant to append `orintenant`
+  # to `arm-tegra-conwin` in place, but the fold unioned instead of editing and the tree carried
+  # TWO rows both named `arm-tegra-conwin`. The matrix is a bash array iterated by row, so both
+  # polarities WERE type-checked — the cost was a duplicate cargo build every gate and a red that
+  # could not say which configuration produced it. Renamed rather than deleted, per this file's
+  # own standing rule (see `arm-tegra-bsprun`): the plain-conwin row is the SHIPPED boot7h
+  # polarity (routed console + furniture, no EL0 tenants) and deleting it would leave that
+  # configuration type-checked by no leg. This row is the full-conjunction cross — the flight
+  # image's own type-check — and now says so in its name.
+  "arm-tegra-conwin-tenant ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,pidesk,livecon,quarry,orinconwin,orindesk,orinclick,orintenant"
 
   # ORIN-TENANT rung 6 armed (appended 2026-08-25) — `orintenant` gates
   # `arch/aarch64/display_tegra.rs`'s `[orintenant]` instrument block (arm/create/refuse/close/reap/
@@ -2708,7 +2717,7 @@ KERNEL_CFG_MATRIX=(
   # family and the stats fold compiled with `pidesk` OFF and no other desktop knob, i.e. an EL0
   # tenant composited beside the raw JD2 console with the furniture arms compiled out. The
   # full-conjunction cross (tenant + orindesk row + click routing + routed console + furniture) is
-  # `,orintenant` appended to `arm-tegra-conwin` above — the flight image's own type-check. NOTE the
+  # `,orintenant` appended to `arm-tegra-conwin-tenant` above — the flight image's own type-check. NOTE the
   # `mmu_tegra_el0.rs` parity fix is NOT this leg's to prove: it compiles on every `tegra_el0` leg
   # (`arm-tegra-el0` onward) because it is not knob-gated.
   #

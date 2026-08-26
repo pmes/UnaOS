@@ -2024,7 +2024,7 @@ orinconwin = ["pidesk", "tegra_el0"]
 # `tegra_el0`, so no syscall surface and no `mmu_tegra_el0` at all) is byte-identical, and the Pi
 # `kernel8.img` is byte-identical because every `syscall.rs` call site is line-neutral and
 # `orintenant`-gated. The ARMED polarity is type-checked by the `arm-tegra-tenant` leg of
-# KERNEL_CFG_MATRIX and the `pidesk`/conjunction cross by `arm-tegra-conwin` (which now carries
+# KERNEL_CFG_MATRIX and the `pidesk`/conjunction cross by `arm-tegra-conwin-tenant` (which now carries
 # `orintenant`), never by the knob mapping. Witness on the wire: `[orintenant] arm`,
 # `[orintenant] create`, `[orintenant] close`, `[orintenant] reap`, `[orintenant] census`. See
 # docs/dev/OS/08_VIDEO/orin-desktop.md §6 rung 6.

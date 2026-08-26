@@ -1490,7 +1490,7 @@ shared present body), so no present verb was touched. All tokens are longer than
 * `UNAOS_TEGRA=1 ./arroyo check` — green, **24 legs (15 board + 9 x86 pairwise-mix)**; green again
   under `UNAOS_ORINTENANT=1` alone (knob self-sufficient) and under the full four-knob conjunction.
 * **Go-red proven:** renaming `orin_tenant_win_stats` reds **exactly**
-  `arm-tegra-conwin` + `arm-tegra-tenant` — the two legs carrying the knob — every other leg green.
+  `arm-tegra-conwin-tenant` + `arm-tegra-tenant` — the two legs carrying the knob — every other leg green.
   Restored -> green.
 * `./arroyo test-arm` and `./arroyo test` (x86) — both green; `awk '/PANIC|panicked/'` over
   `serial-arm.log` -> 0 (the single `/FAIL/` hit is the known `[botclaim]` prose).
