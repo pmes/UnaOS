@@ -2030,6 +2030,36 @@ orinconwin = ["pidesk", "tegra_el0"]
 # docs/dev/OS/08_VIDEO/orin-desktop.md §6 rung 6.
 orintenant = ["tegra_el0"]
 
+# ORIN-VPAR: the aarch64 half of the `video/` PARITY WITNESSES — the instruments that say, on the
+# wire, whether an x86-side protection has an aarch64 counterpart and, when it does not, WHY.
+#
+# THE DEFECT IT EXISTS FOR. A parity survey of `video/` found a class of one-sided item whose
+# PROTECTION is arch-neutral but whose PROOF is not: `wm::occ_clip`'s furniture arm withholds the
+# menu bar's columns from a crossing window blit on `pidesk` aarch64 exactly as it does on x86+`wc`
+# (`video/wm.rs`, the `any(all(x86_64, wc), all(aarch64, pidesk))` arm), while the pair that PROVES
+# it fired — `OB_N`/`OB_BOX` → `occclip_bar=`/`occclip_bar_px=`, and the `MENUBAR-OCC` fixture that
+# drives them — is `all(witness, x86_64)`. An aarch64 regression in that clip therefore reads GREEN:
+# there is no field to go to zero. The same shape appears in `video/screen.rs` for WCD-TEARDOWN's
+# `desk=` epoch. This knob arms the aarch64 lines that make those states LOUD — a fired witness where
+# the counterpart could be built, and a DECLINED verdict NAMING its blocker where it could not.
+#
+# BOTH OUTCOMES ARE ON THE WIRE, which is the whole point: a decline that prints nothing is
+# indistinguishable from a leg that never ran, and that is the state this arc found.
+#
+# NEEDS `witness` TO REACH ANYTHING — every line it arms is an instrument, so the sites are
+# `all(feature = "witness", feature = "orinvpar", target_arch = "aarch64")`. Arm with
+# `UNAOS_WITNESS=1 UNAOS_ORINVPAR=1`.
+#
+# IMPLIES `pidesk` and nothing else: `video/menubar.rs` is declared behind
+# `any(all(x86_64, wc), all(aarch64, pidesk))` (`video/mod.rs`), so a standalone `orinvpar = []`
+# would be a knob whose menubar half compiles nothing on this arch. It does NOT imply `tegra`/
+# `tegra_el0` — `video/screen.rs` is ungated and the gap is an aarch64 gap, not a Tegra one, so a Pi
+# `pidesk` boot answers the same question. DEFAULT OFF => every site vanishes, no `MENUBAR-OCC-PAR`/
+# `DESKPAR`/`STAGEPAR`/`SCENEPAR` string exists in the image, and the default jetson and Pi media are
+# byte-identical. Witness on the wire: `:: MENUBAR-OCC-PAR:`, `:: DESKPAR:`, `:: STAGEPAR:`,
+# `:: SCENEPAR:`. Kept in sync with arroyo.
+orinvpar = ["pidesk"]
+
 
 # ORIN-SUPSTATE (SMP-redesign Candidate A, arc 1): lift the Orin console surface OUT of
 # `jd2_console_pump`'s task-local storage. The `Screen`/`Console` pair that has been stack-local to

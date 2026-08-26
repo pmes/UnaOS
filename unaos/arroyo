@@ -842,6 +842,28 @@ _feats=""
 # nobody clicked" and a census that STOPS means the pump died — an absent `[clickroute]` is otherwise
 # not evidence of anything).
 [ -n "${UNAOS_ORINCLICK:-}" ] && _feats="${_feats}orinclick,"
+# ORIN-VPAR: UNAOS_ORINVPAR=1 arms the aarch64 half of the `video/` PARITY WITNESSES — the lines that
+# state, on the wire, whether an x86-side protection has an aarch64 counterpart and, when it does
+# not, WHICH symbol blocks it. The class it exists for: `wm::occ_clip`'s furniture arm WITHHOLDS the
+# menu bar's columns from a crossing window blit on `pidesk` aarch64 (the arm is
+# `any(all(x86_64, wc), all(aarch64, pidesk))`), but the pair that PROVES it fired —
+# `occclip_bar=`/`occclip_bar_px=` and the `MENUBAR-OCC` fixture — is `all(witness, x86_64)`, so an
+# aarch64 regression in that clip reads GREEN because there is no field to go to zero.
+#
+# NEEDS UNAOS_WITNESS=1 to reach anything (every site is `witness`-gated; the lines are instruments,
+# not behaviour). Implies `pidesk` in Cargo.toml, because `video/menubar.rs` is only DECLARED on that
+# gate for this arch — so `UNAOS_WITNESS=1 UNAOS_ORINVPAR=1 ./arroyo check` is self-sufficient.
+# Deliberately NOT tegra-implying: the gap is an aarch64 gap, not a Tegra one, and a Pi `pidesk` boot
+# answers the same question.
+#
+# Default OFF => every site vanishes and the default jetson/Pi media are byte-identical (the strings
+# below are the falsifier: absent unarmed, present armed). Witness on the wire, one verdict token per
+# survey item: `:: MENUBAR-OCC-PAR:` (the clip's aarch64 population/px pair — DECLINED, blocker
+# named), `:: DESKPAR:` (WCD-TEARDOWN's `desk=` epoch — PORTED, counted, drained on the same line),
+# `:: STAGEPAR:` (STAGE-PHYS — DECLINED, `arch::memory::translate` has no aarch64 impl),
+# `:: SCENEPAR:` (`paint_desktop_scene` — EQUIVALENT, the arm reaches the same pair through
+# `TargetPal::clear_screen`). Kept in sync with Cargo.toml.
+[ -n "${UNAOS_ORINVPAR:-}" ] && _feats="${_feats}orinvpar,"
 # ORIN-SUPSTATE (SMP-redesign Candidate A, arc 1): UNAOS_SUPSTATE=1 lifts the Orin console surface
 # (`Screen`+`Console`, stack-locals of `jd2_console_pump` phase 2 since JD2) into a module-owned
 # handle (`arch/aarch64/display_tegra.rs::sup_install`/`sup_with_surface`) and splits the pump's
