@@ -4029,11 +4029,22 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 }
             }
         },
+        // ORIN-REBOOT (baton orin-6 §5.1 + Peter's cold-boot ruling 2026-08-25): the arch-neutral
+        // POWER VERBS' service arms — thin hooks only. The mechanisms live in `power::reboot` /
+        // `power::shutdown` (aarch64: PSCI SYSTEM_RESET / SYSTEM_OFF via SMC — the firmware owns
+        // the machine; x86 shutdown routes to the real ACPI S5; unwired platform slots refuse with
+        // honest witnesses + hlt park). This retires the old `shutdown` TODO stub, which "shut
+        // down" by double-parking in `hlt` — a machine that idles when asked to power off is
+        // neither cold-boot-ready nor honest. The console line goes out BEFORE each call because a
+        // successful reset/off kills the machine mid-instruction — same last-line discipline as
+        // `acpi_power::poweroff`.
         "shutdown" | "off" => {
-             // TODO: Create arch::shutdown()
-             serial_println!("Shutdown requested");
-             crate::hlt_loop();
-             crate::hlt_loop();
+            console.println("shutting down: invoking the platform firmware mechanism...");
+            crate::power::shutdown();
+        },
+        "reboot" => {
+            console.println("rebooting: invoking the platform firmware mechanism...");
+            crate::power::reboot();
         },
         #[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
         "bg" => {
