@@ -3288,6 +3288,18 @@ pub fn mark_el1_core() -> bool {
     true
 }
 
+/// ORIN-EL1AP — [`EL1_CORE_MASK`] verbatim, for a witness that must PRINT `el1cores` rather than ask
+/// a yes/no question about one core ([`el1_core`] is the predicate; [`el0_placement_possible`] is the
+/// policy). Exposed only under the knob that adds such a witness, so the disarmed image is unchanged.
+///
+/// Read-only, and deliberately so: the mask is written in exactly one place ([`mark_el1_core`], by a
+/// core measuring its OWN `CurrentEL`), which is the property that makes it evidence instead of
+/// configuration. Nothing here can set a bit.
+#[cfg(feature = "orinel1ap")]
+pub fn el1_core_mask() -> u64 {
+    EL1_CORE_MASK.load(Ordering::Acquire)
+}
+
 /// EL0-EL1CORE — EL0 placements REFUSED because the EL1-filtered candidate set was empty.
 ///
 /// WHERE IT IS READABLE, measured on the built artifacts rather than assumed. It is echoed as `n=` on

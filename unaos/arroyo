@@ -1037,6 +1037,43 @@ _feats=""
 # Witness on the wire: `[orintenant] arm`, `[orintenant] create`, `[orintenant] close`,
 # `[orintenant] reap`, `[orintenant] census`. See docs/dev/OS/08_VIDEO/orin-desktop.md §6 rung 6.
 [ -n "${UNAOS_ORINTENANT:-}" ] && _feats="${_feats}orintenant,tegra_el0,tegra,"
+# ORIN-EL1AP (baton orin-8 item 1, SMP-redesign Candidate C): UNAOS_ORINEL1AP=1 arms `orinel1ap` —
+# drop exactly ONE PSCI-woken AP from EL2 to EL1 during `smp_virt` bring-up, so `el1cores` gains a
+# second bit and `bg` has a core to host a background EL0 tenant on.
+#
+# TODAY, UNARMED: only the BSP is at EL1 and it runs the shell, so every `bg` answers
+#   `BGRUN: rejected (no core is at EL1 to host a background EL0 task)`
+# two lines above `rollup: el0refuse=<n> el1cores=0x1`. The refusal is CORRECT and hardware-proven —
+# an `eret` on an EL2 AP banks ELR_EL2 and kills the core — so this does NOT touch the filter. It
+# supplies the thing the filter was always waiting for: a core that has MEASURED itself at EL1.
+#
+# WHAT ARMING CHANGES: one AP (whichever secondary reaches the claim first — the witness names it)
+# waits for the BSP's own JM6 drop to publish its EL1 root, then replays that same drop
+# (`enable_el1_regime` + `drop_el2_to_el1_tegra`, reused verbatim — every register they write is
+# per-core banked) on itself, re-seeds TPIDR_EL1/VBAR_EL1, stamps `EL1_CORE_MASK`, unmasks IRQ and
+# enters `sched::secondary_run` at EL1. Every OTHER AP is untouched and stays an EL2 scheduler
+# participant, so SPREAD balance for ordinary kernel tasks does not move.
+#
+# READ IT ON THE WIRE — every line carries `[el1ap]`, refusals included (silence must never be
+# indistinguishable from "never ran"):
+#     LC_ALL=C grep -a -o '\[el1ap\][^:]*' <log>
+#   `[el1ap] seat claimed by cpu=N — waiting up to 30 s for the BSP EL1 root`
+#   `[el1ap] cpu=N dropping EL2 -> EL1 (TTBR0_EL1=0x... , the BSP-installed L1_EL1)`
+#   `[el1ap] cpu=N LANDED at EL1 — stamped=true el1cores=0x... irq=unmasked (EL0-EL1CORE)`
+#   `[el1ap] REFUSED cpu=N — ...` (wrong EL / seat held / root not published / post-eret not EL1)
+# The corroborating line is sched.rs's own `[el0core] el1 core MEASURED: cpu=N mask=0x...`, and the
+# verdict is the rollup: `el1cores=` must show TWO bits, and `bg` must stop answering el0refuse.
+#
+# `orinel1ap = ["tegrasmp", "tegra_el0"]` (both imply `tegra`), so the knob is self-sufficient:
+# `tegrasmp` because the AP must exist to be dropped (`start_secondaries_tegra` is itself
+# `#[cfg(feature = "tegrasmp")]`), `tegra_el0` because an EL1 AP exists to host an EL0 tenant and the
+# spawn surface is gated `any(baremetal, tegra_el0)` — `baremetal` implies `pi`, and `pi` + `tegra` is
+# a hard `compile_error!`, so `tegra_el0` is the only satisfiable term on this board. DEFAULT OFF =>
+# the block, the publishing statement, the call site and the accessor all vanish. The ARMED polarity
+# is type-checked by the `arm-tegra-el1ap` leg of KERNEL_CFG_MATRIX, never by this mapping.
+#
+# NOT PROVEN ON HARDWARE. Nothing in this arc has been on the bench.
+[ -n "${UNAOS_ORINEL1AP:-}" ] && _feats="${_feats}orinel1ap,tegrasmp,tegra_el0,tegra,"
 # ORIN-LADDER: UNAOS_ORINLADDER=1 arms `orinladder` — the two rungs orin 6 left owed
 # (orin-desktop.md §3.9.1): the win=2 GLYPHS-ON-GLASS read-back (`[oringlass]`) and the DOCK ROUND
 # TRIP adjudicator (`[orindock]`). DEFAULT OFF; unset, every item is compiled out and the jetson
@@ -2386,6 +2423,16 @@ KERNEL_CFG_MATRIX=(
   # pairwise guarantee is unaffected — it is a property of the mask construction, not of which
   # features are in the set.
   "arm-tegra-el0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0"
+  # ORIN-EL1AP armed (baton orin-8 item 1) — the arm-tegra-el0 row verbatim + `orinel1ap`, the literal
+  # precedent one leg above (the feature implies `tegrasmp` + `tegra_el0` -> `tegra`; every site is
+  # under `src/arch/aarch64/`, so it is aarch64-only in effect and inherits onto the x86 mix legs as
+  # the empty set). It needs its OWN leg rather than being appended to `arm-tegra-el0` for the reason
+  # `arm-tegra-el0` itself needed one: `arm-tegra-el0` is the DISARMED twin, and the disarmed polarity
+  # has real code behind it — the AP path in `smp_virt::__secondary_rust_virt` with no drop block, and
+  # `boot_tegra::drop_to_el1` with no publishing statement. Folding the knob into that row would leave
+  # `orinel1ap`-OFF compiled by nothing on this arch, which is the "gate whose knob cannot satisfy it"
+  # defect in the other direction. Two legs type-check both polarities.
+  "arm-tegra-el1ap ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,orinel1ap"
   # SIMMER armed (appended 2026-08-21) — closes one of the two "real holes wearing a green verdict"
   # the RE-COUNTED 2026-08-19 note above records. `simmer_test = []` is board-neutral aarch64: its
   # four cfg sites all live in `arch/aarch64/sched.rs` (three self-test fns + the boot-core spawn in

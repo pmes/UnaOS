@@ -325,6 +325,44 @@ extern "C" fn __secondary_rust_virt(_advisory: u64) -> ! {
     // per-CPU `percpu.ticks` and never the shared `TICKS`/`ms()` wall-clock (the double-count that held
     // this back). The tick does not preempt here (the `virt`/tegra `run()` path leaves `SCHED_ACTIVE`
     // false and `handle_irq_v3` calls only `on_tick`) — it just breaks the idle WFI so the loop re-polls.
+    //
+    // ORIN-EL1AP (baton orin-8 item 1, Candidate C) — the EL2 -> EL1 drop for ONE AP goes HERE, in the
+    // window between "this core is fully brought up at EL2" and "this core arms its tick and enters
+    // `run()` forever", and the boundaries of that window are what fix the position:
+    //
+    //   * AFTER `gic::init_secondary_v3()`, because `init_cpu_interface_v3` programs ICC_SRE_EL2 and
+    //     is guarded on `current_el() >= 2` — run it after the drop and the CPU interface is never
+    //     set up. The redistributor/PMR/CTLR/IGRPEN1 state it leaves is per-core banked and survives
+    //     the drop, so EL1 inherits a live Group-1 interface.
+    //   * BEFORE `timer::arm_this_core_ap()`, because the drop's asm ends the physical timer
+    //     (`msr cntp_ctl_el0, xzr`) — correct for the BSP's cooperative CAPSTONE, fatal for an AP
+    //     that idles in WFI. Arming AFTER re-enables CNTP from EL1, which CNTHCTL_EL2.EL1PCEN|EL1PCTEN
+    //     (set by the same drop) is what makes legal.
+    //   * BEFORE `sched::secondary_run(core)`, which never returns.
+    //
+    // Knob-off this whole block does not exist and the AP path is the untouched EL2 one.
+    #[cfg(feature = "orinel1ap")]
+    if unsafe { super::boot_tegra::drop_ap_to_el1(core) } {
+        // At EL1 now, DAIF masked, TPIDR_EL1 UNKNOWN, VBAR_EL1 unset. These four statements are the
+        // BSP's own post-drop terminus (`main.rs`), for the same reasons and in the same order.
+        percpu::init(core); // re-seed: the pre-drop init seeded TPIDR_EL2
+        exceptions::install(); // VBAR_EL1 (at EL1 this arm touches no HCR_EL2 — the drop already set it)
+        // EL0-EL1CORE — stamp. Sound on an AP precisely because `core` came from the MPIDR-affinity
+        // re-derivation above, not from a literal: `mark_el1_core` re-measures `CurrentEL` itself and
+        // stamps NOTHING if it is not EL1, so a broken drop leaves the mask (and the refusal) as-is.
+        let stamped = sched::mark_el1_core();
+        // The drop landed with DAIF masked. An AP that stays masked would idle in `run()` with its
+        // tick and the reschedule SGI both undeliverable — WFI would still wake on a pending IRQ, but
+        // the IRQ would never be TAKEN, so `on_tick` would never re-arm and EOI would never issue.
+        exceptions::enable_irq();
+        serial_println!(
+            ":: AARCH64 SMP: [el1ap] cpu={} LANDED at EL{} — stamped={} el1cores={:#x} irq=unmasked (EL0-EL1CORE) ::",
+            core,
+            exceptions::current_el(),
+            stamped,
+            sched::el1_core_mask()
+        );
+    }
     timer::arm_this_core_ap();
 
     // ORIN-SMP-RUN: enter the preemptive scheduler `run()` loop instead of the old `note_core_idle`
