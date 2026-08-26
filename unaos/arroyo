@@ -3594,12 +3594,26 @@ EOF
 #     ./arroyo selfup-pak [src_esp_dir] [out_dir]     # defaults: $ESP_DIR_ARM, its parent (target/)
 # Stage the two outputs into the BOOT VOLUME ROOT of a running Orin (bench card loop today; a network
 # transport later delivers the same two names) and boot a `UNAOS_SELFUP=1` image to apply.
+#
+# PAYLOAD COMPOSITION (2026-08-26, boot7i): THE PAYLOAD IS THE MATCHED PAIR, NOT THE WHOLE TREE.
+# boot7i staged a whole-tree pak — 10 entries, 14282148 bytes, of which SRC.TGZ alone was 11523546
+# (80.7%) — and the flight LOOPED: `orinwdt`'s 300 s POR watchdog (wdt_tegra.rs TIMEOUT_SECS, armed
+# in `tegra_early_stop` and disarmed only at the EL1 terminus, which is AFTER `selfup_service`) fired
+# mid-SRC.TGZ on every attempt, so the board POR-reset back into the same S0..S3 prefix forever
+# (capture/line-acm0/orin.log:16302/17014-17032 then 17967/18677-18695, each followed by a fresh
+# `Boot-mode : Coldboot`). Only the LOADER + KERNEL are the boot ABI; SRC.TGZ and the demo ELFs are
+# media furniture that the media build (`esp-jetson`) already puts on a card, and re-shipping them
+# through a self-update buys nothing and costs the watchdog window. The kernel side needs no change:
+# `parse_header` requires exactly `count in 1..=MAX_ENTRIES` plus the pair — every other member is
+# optional by construction (selfup_tegra.rs:392-402), so a 2-entry pak parses, stages and flips on an
+# UNCHANGED receiver. Reversible: `UNAOS_SELFUP_WHOLE=1 ./arroyo selfup-pak` restores the whole-tree
+# walk for a bench run that deliberately wants it.
 selfup_pak() {
     local src="${1:-$ESP_DIR_ARM}"
     local out="${2:-$(dirname "$ESP_DIR_ARM")}"
     [ -d "$src" ] || { echo -e "${COLOR_RED}selfup-pak: source ESP dir not found: $src (run ./arroyo esp-jetson first)${COLOR_RESET}" >&2; return 1; }
     mkdir -p "$out"
-    SELFUP_SRC="$src" SELFUP_OUT="$out" python3 - <<'PYPAK' || return 1
+    SELFUP_SRC="$src" SELFUP_OUT="$out" SELFUP_WHOLE="${UNAOS_SELFUP_WHOLE:-}" python3 - <<'PYPAK' || return 1
 import hashlib, os, struct, sys
 
 src = os.environ["SELFUP_SRC"]
@@ -3632,12 +3646,34 @@ if skipped:
     print("selfup-pak: SKIPPED (non-8.3 / dotfile):", ", ".join(skipped), file=sys.stderr)
 if not entries:
     sys.exit("selfup-pak: no packable files under " + src)
-if len(entries) > MAX_ENTRIES:
-    sys.exit(f"selfup-pak: {len(entries)} files exceeds the kernel's {MAX_ENTRIES}-entry bound")
 upper = {e.upper() for e in entries}
 if "EFI/BOOT/BOOTAA64.EFI" not in upper or "KERNEL.ELF" not in upper:
     sys.exit("selfup-pak: MATCHED-PAIR RULE — the tree must carry BOTH EFI/BOOT/BOOTAA64.EFI and "
              "kernel.elf (whole ESP or nothing); refusing to build a partial payload")
+
+# PAYLOAD COMPOSITION: the pair alone, unless UNAOS_SELFUP_WHOLE=1 asks for the whole tree. The
+# gate above ran on the FULL walk on purpose — a source tree that never had a loader/kernel is
+# still refused here, before the narrowing, so the build-time half of the matched-pair rule is
+# unchanged. What the narrowing drops (SRC.TGZ, the demo ELFs, SRC.SHA) is media furniture that
+# `esp-jetson` writes when the card is built; it is not boot ABI and must not ride the watchdog
+# window. See the comment above the function for the boot7i evidence.
+PAIR = ("EFI/BOOT/BOOTAA64.EFI", "KERNEL.ELF")
+if os.environ.get("SELFUP_WHOLE"):
+    print("selfup-pak: WHOLE-TREE payload (UNAOS_SELFUP_WHOLE=1) — every packable file rides along",
+          file=sys.stderr)
+else:
+    dropped = [e for e in entries if e.upper() not in PAIR]
+    entries = [e for e in entries if e.upper() in PAIR]
+    if dropped:
+        drop_bytes = sum(os.path.getsize(os.path.join(src, d.replace("/", os.sep))) for d in dropped)
+        print("selfup-pak: MATCHED PAIR ONLY — dropped %d non-pair file(s), %d bytes (%s). "
+              "UNAOS_SELFUP_WHOLE=1 packs the whole tree."
+              % (len(dropped), drop_bytes, ", ".join(dropped)), file=sys.stderr)
+# The entry-count bound is a bound on the CONTAINER, so it is checked on what actually gets packed
+# (it used to run on the raw walk, which would have refused a >64-file staging tree even when the
+# pair-only payload it produces is two entries).
+if len(entries) > MAX_ENTRIES:
+    sys.exit(f"selfup-pak: {len(entries)} files exceeds the kernel's {MAX_ENTRIES}-entry bound")
 
 table = b""
 blobs = []

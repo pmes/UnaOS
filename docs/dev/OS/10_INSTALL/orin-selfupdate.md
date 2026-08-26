@@ -33,13 +33,57 @@ The pick keeps every permanent line transport-blind: a future TCP receiver's who
 
 Two files in the boot volume root:
 
-* `UPDATE.PAK` — the UPK1 container (§4) holding the complete new ESP tree.
+* `UPDATE.PAK` — the UPK1 container (§4) holding the new **matched pair** (§3.1).
 * `UPDATE.SHA` — sha256 hex of `UPDATE.PAK` (`sha256sum` line shape; hash first, rest ignored — the
   same shape SOURCE-ALONG's `SRC.SHA` already uses).
 
 Built on the host by `./arroyo selfup-pak [src_esp_dir] [out_dir]` (defaults: the `esp-jetson`
 output tree, `target/`). The builder enforces the matched-pair rule at build time too, so a partial
 payload is refused on the host before it ever reaches a card.
+
+### 3.1 Payload composition — the pair, not the tree (2026-08-26, boot7i)
+
+**The payload is `EFI/BOOT/BOOTAA64.EFI` + `KERNEL.ELF` and nothing else.** boot7i shipped the
+whole-tree pak this section used to describe and the flight **looped forever**:
+
+| pak | entries | bytes | how measured |
+|---|---|---|---|
+| whole tree (boot7i, as flown) | 10 | **14 282 148** | metal witness `S1 verify … over 14282148 bytes` (`capture/line-acm0/orin.log:17027`); reproduced byte-for-byte on the host, same sha256 `65d2afe4…` |
+| matched pair (now the default) | 2 | **2 703 283** | `./arroyo selfup-pak` over the same staged tree; 123 B header + 2 635 576 (`kernel.elf`) + 67 584 (`BOOTAA64.EFI`) |
+
+`SRC.TGZ` alone was 11 523 546 B — 80.7% of the old pak — and the eight dropped members total
+11 578 494 B. The failure was not a hang: `orinwdt`'s **300 s POR watchdog**
+(`wdt_tegra.rs` `TIMEOUT_SECS`, armed in `tegra_early_stop`, disarmed only at the EL1 terminus,
+which is *after* `selfup_service`) fired while S3 was streaming `SRC.TGZ` — entry index 4, the
+member straight after the last line the bench ever printed (`S3 write — SRC.SHA … UPD3.TMP`) — and
+the POR reset the board back into the identical S0..S3 prefix, twice in the capture and
+indefinitely in principle (`orin.log:16302/17014-17032`, then `17967/18677-18695`, each followed by
+a fresh `Boot-mode : Coldboot`).
+
+Why the pair is the right unit: only the loader and the kernel are boot ABI. `SRC.TGZ`, `SRC.SHA`
+and the demo ELFs are media furniture that `esp-jetson` writes when the card is built — shipping
+them through a self-update re-transfers bytes the media path already places, and charges the
+watchdog window for it. **The receiver is unchanged**: `parse_header` requires `count` in
+`1..=MAX_ENTRIES` plus the pair, and imposes no per-name requirement on anything else
+(`selfup_tegra.rs:392-402`) — every non-pair member is optional by construction, so a 2-entry pak
+parses, stages and flips on a receiver that was never touched. `UNAOS_SELFUP_WHOLE=1
+./arroyo selfup-pak` restores the whole-tree walk for a bench run that deliberately wants it.
+
+Watchdog arithmetic, in the terms the capture supports: S3 costs ~3 passes per member (read out of
+the pak, write, read back), so the whole-tree pak asked the window for `14 282 148` (S1) +
+`3 x 14 281 654` (S3) = **57 127 110 B** of volume traffic, against **10 812 763 B** for the pair —
+5.28x less. The capture carries no per-line timestamps, so there is **no measured B/s** to quote;
+what it does prove is that `14 324 828 B of reads` completed inside the armed window (the whole S1
+pass plus the four staged small files), which is **1.77x** the pair pak's entire read demand of
+`8 109 603 B`. The write side has no comparable witness — only 21 340 B of writes are attested — so
+the pair pak's 2 703 160 B of writes is the part still to be shown on metal. Two structural facts
+argue it fits with room: `write_grow` re-walks the whole cluster chain per 32 KiB chunk
+(`fat.rs:2320` `chain_clusters` → uncached `fat_entry` → one 512 B read per hop), which makes S3
+cost grow with the **square** of the member size — `kernel.elf` at 2 635 576 B costs ~19x less than
+`SRC.TGZ` at 11 523 546 B, not 4.4x — and the interleaved `MOUSE-1`/xHCI lines after the last S3
+line show the machine was pumping USB throughout, i.e. it was making progress, just not enough of
+it. The FAT chain-walk cost is a real defect and is **not** fixed here; this change is payload
+composition only.
 
 ## 4. UPK1 container
 
@@ -96,7 +140,9 @@ Twice, deliberately redundant:
 
 1. **Parse gate (S2)**: a payload without BOTH `EFI/BOOT/BOOTAA64.EFI` and `KERNEL.ELF` is refused
    before the first write. There is no file-level update verb to misuse — the only unit the code can
-   apply is the whole container, and `selfup-pak` refuses to build a partial one.
+   apply is the whole container, and `selfup-pak` refuses to build a partial one. Note the gate is a
+   floor, not a roster: it names the two members a payload MUST carry and says nothing about any
+   other, which is exactly why the pair-only payload of §3.1 needed no receiver change.
 2. **Flip order (S4)**: bytes for every file are already on the volume before the first flip; the
    pair flips last and adjacent, loader before kernel — so at no instant does a fresh kernel sit
    beside an old loader (the rule's named forbidden state).
