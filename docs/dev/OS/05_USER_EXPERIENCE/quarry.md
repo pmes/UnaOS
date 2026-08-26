@@ -275,7 +275,7 @@ measured rather than assumed.
 | --- | --- | --- |
 | module declaration | `video/mod.rs`, **at the file tail** | below `pidesk`, for `pidesk`'s reason: a `mod` line inserted higher renumbers every panic `Location` below it and moves the knob-off `kernel8.img` hash. Nothing is below this, so nothing moves. |
 | knob seam | `video/quarry.rs` | the module is compiled under the furniture gate (`any(all(x86_64, wc), all(aarch64, pidesk))`) so **both** arches type-check it; `feature = "quarry"` decides whether the name resolves to the implementation or to `#[inline(always)] false`. See below for why the knob is here and not on the call sites. |
-| open | `video/pidesk.rs` step 6 | the Pi's DESKTOP-READY seam, **last** in the sequence: Quarry reads directories and every step before it is pure geometry or a flag, so a slow or declined volume cannot delay the menu bar's paint. This mints no second launcher — Quarry is not a program, it is kernel furniture, the same class as the console window `panel_console_window_open` mints thirty lines above. |
+| open | `video/desktop_firmware.rs` step 6 | the Pi's DESKTOP-READY seam, **last** in the sequence: Quarry reads directories and every step before it is pure geometry or a flag, so a slow or declined volume cannot delay the menu bar's paint. This mints no second launcher — Quarry is not a program, it is kernel furniture, the same class as the console window `panel_console_window_open` mints thirty lines above. |
 | keyboard | `arch/aarch64/syscall.rs`, `user_input_enqueue` | folded onto the existing `crystal::key_escape` one-liner, **after** it: an open SHARD menu is modal and its `Esc` beats Quarry's. Before `wc_focus_key`, and Quarry does not bind TAB, so the compositor's key is never hostage. |
 | pointer | `arch/aarch64/syscall.rs`, `wc_click_route` press edge | folded onto the existing `strip::press_route` one-liner, **after** it (the strips composite on top of the window layer). Quarry asks `wm::hit_test` itself and acts only when the top-most window at the point is its own, so folding it in this early can never let it claim a press that landed on a window above it. |
 | dock tile | `video/dock.rs`, `pin_quarry` | see §6.2. |
@@ -318,7 +318,7 @@ directories, so the tile sets a flag and `quarry::service()` drains it from the 
 task — after `pump_usb_into_gui` has dropped its xHCI loan, which is the same context the shell's own
 `ls` reads a volume from. The drain call is folded into the same aarch64 router line as the rest, so
 **x86 has no drain yet**: when the x86 wiring lands it must place `service()` off the render core, for
-the reason `wcx::desktop_app_service` documents (the render core holds the xHCI lock).
+the reason `desktop_uefi::desktop_app_service` documents (the render core holds the xHCI lock).
 
 ---
 
@@ -366,7 +366,7 @@ A third item is a bookkeeping debt rather than a capability:
 ## 8. The witness
 
 `:: QUARRY: … :: PASS ::`, **twelve** legs (M1's five, M2's six, and QSCROLL's wheel), `witness`-gated, run from
-`pidesk::activate` step 6 **before** `open()` — its legs are pure functions over synthetic input (no
+`desktop_firmware::activate` step 6 **before** `open()` — its legs are pure functions over synthetic input (no
 panel, no volume, no window table), so a DECLINE in the thing it proves the arithmetic of must not be
 able to skip it.
 

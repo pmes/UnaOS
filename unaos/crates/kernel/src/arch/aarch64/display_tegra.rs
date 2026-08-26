@@ -296,7 +296,7 @@ fn jd1_dc_survey(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
 //
 // WHAT THIS IS, AND WHAT IT DELIBERATELY IS NOT. This is ONE window: `reserve_stage`, one heap-backed
 // ARGB surface, one `create_at` row, one `present`, one `composite`. It is NOT the desktop. It does not
-// call `pidesk::activate`, does not enable furniture, and touches no `dock`/`strip`/`menubar`/`crystal`
+// call `desktop_firmware::activate`, does not enable furniture, and touches no `dock`/`strip`/`menubar`/`crystal`
 // seam — the Pi hit a 16 KiB kernel-stack overflow in the desktop-ARMING CASCADE twice, and that failure
 // is not reproducible on the QEMU gate, so the cascade stays unarmed until the rung that owns it. One
 // window is the whole rung: it settles, on metal, whether the compositor `wm` already links into the
@@ -327,7 +327,7 @@ fn jd1_dc_survey(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
 // have to answer the stack question; this one declines to ask it.
 //
 // WHAT LANDS ON GLASS. `wm` paints NO panel-wide backdrop on this build — the whole-panel `DESKTOP_BG`
-// clear is `pidesk`-gated on aarch64 (`wcf.rs` says so in its own NOCLEAR verdict) — so the composite
+// clear is `desktop_firmware`-gated on aarch64 (`wcf.rs` says so in its own NOCLEAR verdict) — so the composite
 // writes the window's box and nothing else: the JD1 boot log keeps the rest of the panel. The blit path
 // `flush_rect`s what it wrote, which is what makes the pixels visible to a DCE that scans the carveout
 // from DRAM and does not snoop.
@@ -1087,7 +1087,7 @@ pub fn jd1_dc_probe(chan: &super::bpmp_tegra::Chan, dtb_addr: u64, dtb_size: usi
 // existed, compiled, and had no caller (orin-desktop.md §3.4). This block is that caller, plus the
 // instrument that says on the wire whether it worked.
 //
-// WHY IT IS RUNG 3 AND NOT RUNG 4. `video/pidesk.rs:39-44` states the CONSOLEWIN law: the console
+// WHY IT IS RUNG 3 AND NOT RUNG 4. `video/desktop_firmware.rs:39-44` states the CONSOLEWIN law: the console
 // window carries a minimise disc and THE ONLY ROUTE BACK FROM THAT PARK IS THE DOCK. The dock is a
 // route back only once clicks route. Landing "console as a window" before this rung would ship a
 // minimise button that is a one-way trip — "a control that hides a window with no way back is worse
@@ -1098,10 +1098,10 @@ pub fn jd1_dc_probe(chan: &super::bpmp_tegra::Chan, dtb_addr: u64, dtb_size: usi
 // The Pi overflowed a 16 KiB kernel stack in the desktop-arming cascade TWICE on consecutive metal
 // boots (boots 10 and 11), and neither reproduces on any QEMU gate in this tree. Boot 11's victim was
 // `quarry::open()` running SYNCHRONOUSLY AT CLICK-ROUTER DEPTH on the input-drain task — i.e. exactly
-// this call stack. This rung therefore does NOT arm `pidesk`: `orinclick` implies `tegra_el0` and
+// this call stack. This rung therefore does NOT arm `desktop_firmware`: `orinclick` implies `tegra_el0` and
 // NOTHING ELSE, so every furniture arm inside `wc_click_route` (`strip::press_route`,
 // `quarry::service`, `pulsewin::press_route`, `quarry::press_route`, the DRAG-PI chrome arm and the
-// SHELLWIN-PI furniture arm) is `#[cfg(feature = "pidesk")]` and COMPILED OUT. What is left is the
+// SHELLWIN-PI furniture arm) is `#[cfg(feature = "desktop_firmware")]` and COMPILED OUT. What is left is the
 // window half: `wm::hit_test`, `wm::close_box_hit`/`minimise_hit`/`zoom_hit`, `focus_changed`, and
 // `user_input_set_active` — none of which opens a file, and none of which is on either recorded
 // overflow's path. No dock, no strip, no menubar, no crystal, no `render_service`.
@@ -1116,7 +1116,7 @@ pub fn jd1_dc_probe(chan: &super::bpmp_tegra::Chan, dtb_addr: u64, dtb_size: usi
 // KERNEL_CFG_MATRIX preamble is written against. `tegra_el0` implies `tegra`, so
 // `UNAOS_ORINCLICK=1 ./arroyo check` and `UNAOS_ORINCLICK=1 ./arroyo esp-jetson` are both
 // self-sufficient. The ARMED polarity is type-checked by the `arm-tegra-orinclick` leg of
-// KERNEL_CFG_MATRIX, and the `pidesk` CROSS by `arm-tegra-desk` — never by the knob mapping.
+// KERNEL_CFG_MATRIX, and the `desktop_firmware` CROSS by `arm-tegra-desk` — never by the knob mapping.
 //
 // DEFAULT OFF AND MEASURED. With `orinclick` unset every item below vanishes and the two call sites
 // in `main.rs` are `#[cfg]`-erased STATEMENTS APPENDED TO EXISTING LINES, so no line moves in any file
@@ -1185,7 +1185,7 @@ static CLK_REL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::n
 static CLK_NOEDGE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// ORIN-CLICK — press dispositions. `RAISED` is the rung's whole point (a click moved focus to the
 /// window under the cursor); `SAME` is a re-click of the already-focused window; `MISS` is the
-/// desktop/console; `CONSUMED` is a furniture or control arm (only reachable on a `pidesk` build).
+/// desktop/console; `CONSUMED` is a furniture or control arm (only reachable on a `desktop_firmware` build).
 #[cfg(feature = "orinclick")]
 static CLK_RAISED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 #[cfg(feature = "orinclick")]
@@ -1271,7 +1271,7 @@ fn clk_pointer_pos() -> (Option<(i32, i32)>, i32, i32) {
 /// | --- | --- |
 /// | `RAISED` | press hit a window that did not hold focus, and focus moved to it — the rung's contract |
 /// | `HIT-SAME` | press hit the already-focused window; nothing to move |
-/// | `CONSUMED` | press was taken by a control or furniture arm (close/minimise/zoom, or `pidesk` chrome) |
+/// | `CONSUMED` | press was taken by a control or furniture arm (close/minimise/zoom, or `desktop_firmware` chrome) |
 /// | `MISS-SHELL` | press hit no window while an app held focus; consumed, focus returned to the shell |
 /// | `MISS-IDLE` | press hit no window and focus was already the shell; not consumed, nothing to do |
 /// | `MISS-FULLSCREEN` | press hit no window but the focused app owns the panel through the compat row |
@@ -1295,7 +1295,7 @@ fn clk_pointer_pos() -> (Option<(i32, i32)>, i32, i32) {
 /// apart between the two reads.
 ///
 /// **A note on where the keyboard goes, because it is a real consequence and not an oversight.** With
-/// `pidesk` OFF the SHELLWIN-PI arm (`is_kernel_owner` -> hand the keyboard to asid 0) is compiled
+/// `desktop_firmware` OFF the SHELLWIN-PI arm (`is_kernel_owner` -> hand the keyboard to asid 0) is compiled
 /// out, so a press on `orin_wm1`'s row — owner `wm::KERNEL_OWNER_DESKTOP` — takes the ordinary
 /// `owner != cur` arm and leaves `USER_INPUT_ACTIVE` holding that kernel pseudo-ASID. On the Orin
 /// that is INERT for the keyboard and it was verified rather than assumed: the only consumer of
@@ -1304,7 +1304,7 @@ fn clk_pointer_pos() -> (Option<(i32, i32)>, i32, i32) {
 /// not exist on tegra; `jd2_console_pump` feeds every `Event::Key` straight through `handle_key`
 /// regardless of focus. The focus either side of the call is printed on every line so the operator
 /// can see the pseudo-ASID land rather than having to take this paragraph on trust. When rung 5 arms
-/// `pidesk`, the SHELLWIN-PI arm compiles in and takes over — no change is owed here.
+/// `desktop_firmware`, the SHELLWIN-PI arm compiles in and takes over — no change is owed here.
 #[cfg(feature = "orinclick")]
 pub fn orin_click(mask: u8) {
     use core::sync::atomic::Ordering;
@@ -1473,7 +1473,7 @@ pub fn orin_click_census(tick: u64) {
         serial_println!(
             "[orinclick] arm panel={}x{} rows={} compat={} focus={:#x} pidesk={} t={} -> {}",
             pw, ph, rows, compat as u8, sc::user_input_active(),
-            cfg!(feature = "pidesk") as u8, tick, verdict
+            cfg!(feature = "desktop_firmware") as u8, tick, verdict
         );
         return;
     }
@@ -2447,7 +2447,7 @@ fn jx2_nvc67d_status(base: u64, size: u64) {
 //
 // ── THE ORDERING RULE (§6.1), AND WHY IT IS A BRANCH RATHER THAN A COMMENT ───────────────────────
 //
-// `video/pidesk.rs:39-44` states the CONSOLEWIN law, inherited from `wcx`: the console window carries
+// `video/desktop_firmware.rs:39-44` states the CONSOLEWIN law, inherited from `desktop_uefi`: the console window carries
 // a minimise disc, the only route back from that park is the dock, and *"a control that hides a window
 // with no way back is worse than no control"*. §6.1 turns that into an obligation on THIS rung:
 //
@@ -2480,7 +2480,7 @@ fn jx2_nvc67d_status(base: u64, size: u64) {
 //
 // ── WHAT IT DOES NOT DO: THE §5.2 STOP-LINE IS NOT CROSSED ───────────────────────────────────────
 //
-// `pidesk::activate()` is NOT called. §5.2 blocks the desktop-ARMING CASCADE — the Pi overflowed a
+// `desktop_firmware::activate()` is NOT called. §5.2 blocks the desktop-ARMING CASCADE — the Pi overflowed a
 // 16 KiB kernel stack in it on two consecutive metal boots and no QEMU gate in this tree can stack the
 // preemption frame that does it. This rung takes exactly the two steps of `activate`'s sequence the
 // console window needs (2a FONT-PI, 2-3 CONSOLEWIN) and none of the rest: no PIDESK DESKTOP-CLEAR
@@ -2489,11 +2489,11 @@ fn jx2_nvc67d_status(base: u64, size: u64) {
 // no window population. `quarry` is not implied, so `quarry::open()` — boot 11's ACTUAL overflow, at
 // click-router depth — is the `#[cfg(not(feature = "quarry"))]` `false` stub in this build.
 //
-// WHAT `pidesk` DOES BRING INTO THE ROUTER, stated because §3.7 promised the opposite for `orinclick`
+// WHAT `desktop_firmware` DOES BRING INTO THE ROUTER, stated because §3.7 promised the opposite for `orinclick`
 // alone and the difference must not pass unnoticed: `wc_click_route`'s furniture arms
 // (`strip::press_route` -> `crystal::press_at` + `dock::press_at`, `pulsewin::press_route`, the DRAG-PI
 // chrome arm, the SHELLWIN-PI arm) are compiled IN on an `orinconwin` image. That is not a tolerated
-// widening — it is the rung's precondition. `dock::press_at` IS §6.1's route back; without `pidesk`
+// widening — it is the rung's precondition. `dock::press_at` IS §6.1's route back; without `desktop_firmware`
 // there is no dock in the image at all (`video/mod.rs` gates the whole furniture family on it), so a
 // minimise disc really would be one-way. `pulsewin::press_route` returns on a NONE window id and
 // `quarry::press_route` is the stub, so the two deep arms are unreachable on this build.
@@ -2530,12 +2530,12 @@ fn jx2_nvc67d_status(base: u64, size: u64) {
 // statement, and the phase-2 guard folds to the bare `fbcon::detach()` it has always been
 // (`#[inline(always)]` on a constant `false`). No line moves in any file compiled knob-off — this is a
 // FILE-TAIL block, and both `main.rs` edits are same-line. The feature is NOT standalone (see
-// `Cargo.toml`): it implies `pidesk` + `tegra_el0`, and `tegra_el0` implies `tegra`, so
+// `Cargo.toml`): it implies `desktop_firmware` + `tegra_el0`, and `tegra_el0` implies `tegra`, so
 // `UNAOS_ORINCONWIN=1 ./arroyo esp-jetson` builds the armed configuration with no second knob — and
 // prints the ordering-rule DECLINE, because neither `orindesk` nor `orinclick` came with it.
 
 /// ORIN-CONWIN — one-shot latch. `tegra_early_stop` runs once per boot on the boot core, so this
-/// cannot fire today; it is here for `pidesk::activate`'s own reason — `panel_console_window_open` is
+/// cannot fire today; it is here for `desktop_firmware::activate`'s own reason — `panel_console_window_open` is
 /// idempotent behind `CONSOLE_WIN` and would hand the same row straight back, but a second pass would
 /// re-arm the face and re-present, and a seam that cannot say it has already run cannot be told from
 /// one that declined.
@@ -2559,7 +2559,7 @@ const ORINCONWIN_CLICK_ROUTED: bool = cfg!(feature = "orinclick");
 /// **ORIN-CONWIN — route the Orin's kernel console into a `wm` row, or decline and say why.**
 ///
 /// Returns `true` iff the console is ROUTED, read back from [`crate::video::fbcon::console_is_routed`]
-/// rather than inferred from this function's own control flow — `pidesk::activate`'s discipline, for
+/// rather than inferred from this function's own control flow — `desktop_firmware::activate`'s discipline, for
 /// its reason: a route declined deep inside the open path must never be reported as installed by a
 /// caller reading a stale local. That return value is the ONE fact the caller acts on: it is what
 /// `jd2_console_pump`'s phase-2 detach is guarded by.
@@ -2599,7 +2599,7 @@ pub fn orin_conwin() -> bool {
     //    not fatal: `wm` keeps its lazy-growth fallback.
     let staged = wm::reserve_stage(&info);
 
-    // 3. THE CONSOLEWIN LAW'S GEOMETRY HALF, evaluated with the SAME call `pidesk` makes —
+    // 3. THE CONSOLEWIN LAW'S GEOMETRY HALF, evaluated with the SAME call `desktop_firmware` makes —
     //    `MAX_WINDOWS`, not the live count, because the check must hold for every table state the boot
     //    can reach. Pure integer geometry; paints nothing.
     let dock_ok = dock::Layout::for_panel(wm::MAX_WINDOWS, pw, ph).is_some();
@@ -2631,7 +2631,7 @@ pub fn orin_conwin() -> bool {
         return false;
     }
 
-    // 5. THE CONSOLEWIN LAW'S REFUSAL. Narrowed exactly as `pidesk` narrows it: this guards the console
+    // 5. THE CONSOLEWIN LAW'S REFUSAL. Narrowed exactly as `desktop_firmware` narrows it: this guards the console
     //    WINDOW and nothing else, because the law's own justification is about ONE control on ONE
     //    window. Nothing else on this boot is withheld by it — there is no bar here to follow.
     if !dock_ok {
@@ -2717,9 +2717,9 @@ pub fn orin_conwin() -> bool {
 // teardown funnel reaps the row. Nothing here changes that; the census counts it.
 //
 // MINIMISE, reported rather than repainted as policy: the minimise arm in `wc_click_route` is
-// ungated, so a tenant CAN be parked on any image. The routes back are the dock (`pidesk` aboard —
+// ungated, so a tenant CAN be parked on any image. The routes back are the dock (`desktop_firmware` aboard —
 // the conjunction image) or kill/exit; the dock round-trip is the ladder's next attended item
-// (§3.9.1) and is NOT claimed here. The census prints `pidesk=` so a capture names which image shape
+// (§3.9.1) and is NOT claimed here. The census prints `desktop_firmware=` so a capture names which image shape
 // the park happened on.
 //
 // WITNESSES (tokens all LONGER than 8 bytes — LLVM immediate-encodes shorter ones invisibly to an
@@ -2867,7 +2867,7 @@ pub fn orin_tenant_arm() {
         crate::arch::aarch64::uslots::FB_WIN_MAX_W, crate::arch::aarch64::uslots::FB_WIN_MAX_H,
         crate::arch::aarch64::uslots::FB_WIN_SLOTS, crate::arch::aarch64::uslots::USER_SLOTS,
         cfg!(feature = "orindesk") as u8, cfg!(feature = "orinclick") as u8,
-        cfg!(feature = "orinconwin") as u8, cfg!(feature = "pidesk") as u8
+        cfg!(feature = "orinconwin") as u8, cfg!(feature = "desktop_firmware") as u8
     );
     TEN_ARMED.store(true, Ordering::Release);
 }
@@ -3165,7 +3165,7 @@ pub fn orin_tenant_census(tick: u64) {
     serial_println!(
         "[orintenant] census seq={} t={} up={}s rows={} bound={} creates={} headless={} refused={} closes={} reaped={} faults={} unattrib={} presents={} suppressed={} focus={:#x} pidesk={} -> {}",
         seq, tick, up, rows, bound, creates, headless, refused, closes, reaped, faults, unattrib,
-        presents, suppressed, sc::user_input_active(), cfg!(feature = "pidesk") as u8, verdict
+        presents, suppressed, sc::user_input_active(), cfg!(feature = "desktop_firmware") as u8, verdict
     );
 }
 
@@ -3425,7 +3425,7 @@ pub fn sup_frame_take() -> SupFrameBoard {
 // and its minimise disc. A standalone `orinladder = []` would arm a probe for a window the build
 // guarantees does not exist, and a `["orinconwin"]` would arm one for a window `orin_conwin`
 // declines to open. `orinclick` is also what makes the DISC a gesture rather than a decoration, and
-// `orinconwin` transitively supplies `pidesk` (the `dock`/`strip` modules) and `tegra_el0` ->
+// `orinconwin` transitively supplies `desktop_firmware` (the `dock`/`strip` modules) and `tegra_el0` ->
 // `tegra`. So the closure is the flight image, exactly — this is `orinclick = ["tegra_el0"]`'s
 // argument applied one rung up.
 //
@@ -4175,7 +4175,7 @@ pub fn orin_ladder_arm() {
         info.as_ref().map(|i| i.id).unwrap_or(wm::WIN_NONE),
         dx, dy, dd, sx, sy, sw, sh, tiles, glass,
         cfg!(feature = "orinconwin") as u8, cfg!(feature = "orinclick") as u8,
-        cfg!(feature = "orindesk") as u8, cfg!(feature = "pidesk") as u8,
+        cfg!(feature = "orindesk") as u8, cfg!(feature = "desktop_firmware") as u8,
         verdict
     );
     LAD_ARMED.store(true, Ordering::Release);
@@ -4998,7 +4998,7 @@ pub fn orin_rast_census(tick: u64) {
         RG_VERDICTS[late as usize],
         owns as u8,
         cfg!(feature = "orinconwin") as u8,
-        cfg!(feature = "pidesk") as u8,
+        cfg!(feature = "desktop_firmware") as u8,
         RG_DONE.load(Ordering::Acquire) as u8,
         verdict
     );

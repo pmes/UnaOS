@@ -13,11 +13,11 @@ several sessions can work in parallel without stepping on each other.
   `kernel8` / `kernel8-run` / `kernel8-test` (Pi 4 bare-metal image / QEMU raspi4b).
   Env knobs: `UNAOS_WC` (**arms the x86 window compositor — any gate touching
   the video stack MUST carry `UNAOS_WC=1`, and the run MUST show `wc` in the
-  `⚡ kernel features:` banner. It gates `video/wcx.rs` — the x86 panel path —
+  `⚡ kernel features:` banner. It gates `video/desktop_uefi.rs` — the x86 panel path —
   and the console-window routing, NOT the whole video stack: `video/mod.rs`
   declares `pub mod wm;` unconditionally, so a *type* gate on `wm.rs` is not
   vacuous without it. What IS vacuous without it is any gate that claims to
-  exercise the compositor, because `wcx::activate()` has exactly one caller,
+  exercise the compositor, because `desktop_uefi::activate()` has exactly one caller,
   `drivers/gpu/kepler_display.rs` — on x86 the compositor's ignition is the
   Kepler takeover, so a behavioural video gate needs `UNAOS_WC` AND the
   kepler knobs, and must be verified reachable (`strings`), not merely

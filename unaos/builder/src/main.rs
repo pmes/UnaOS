@@ -346,7 +346,7 @@ fn main() {
     // banner claims it is on (the s42/INSTGUI and WXN-M3b failure). Kept in sync with arroyo.
     if std::env::var("UNAOS_KEPLER_CE").is_ok() { feats.push("nvidia-kepler-ce"); }
     if std::env::var("UNAOS_KDISP_HOLD").is_ok() { feats.push("nvidia-kepler-kdisp-hold"); }
-    // WC-X86: UNAOS_WC=1 arms the window compositor on the x86 panel path (video/wcx.rs) — activated
+    // WC-X86: UNAOS_WC=1 arms the window compositor on the x86 panel path (video/desktop_uefi.rs) — activated
     // at the END of the Kepler takeover seam, after `fbcon::panel_console_resume`. x86_64-only
     // module; DEFAULT OFF => module + call site unlinked => byte-identical media. Needs
     // UNAOS_KEPLER + UNAOS_KEPLER_TAKEOVER to reach its seam. Kept in sync with arroyo's mapping.

@@ -623,7 +623,7 @@ static CHROME_TRUTH_DEFERRED: AtomicBool = AtomicBool::new(false);
 /// `create_at` — `fbcon::panel_console_window_open` mints the row, `create_at` composites it, and
 /// this function reads its chrome off the glass immediately afterwards. At that instant the panel has
 /// TWO writers: the console glyph route is not installed until `panel_console_window_open` returns
-/// (`[wc-x] console-window …` and `[pidesk] activate … routed=true` both print AFTER this witness's
+/// (`[wc-x] console-window …` and `[desktop_firmware] activate … routed=true` both print AFTER this witness's
 /// verdict in the capture), so every other core's `serial_println!` is still being painted DIRECTLY
 /// onto the panel by `fbcon`, over the chrome that was correct when it was written.
 ///
@@ -752,10 +752,10 @@ fn chrome_probes(
 ///
 /// ## The desktop reading is REPORTED BUT NOT JUDGED
 ///
-/// On x86 the panel-wide `DESKTOP_BG` clear is `wcx`'s DESKTOP-CLEAR. **The Pi now has its twin —
-/// `pidesk::activate`'s PIDESK DESKTOP-CLEAR, written because this probe named the gap** (bench
+/// On x86 the panel-wide `DESKTOP_BG` clear is `desktop_uefi`'s DESKTOP-CLEAR. **The Pi now has its twin —
+/// `desktop_firmware::activate`'s PIDESK DESKTOP-CLEAR, written because this probe named the gap** (bench
 /// capture PA41 boot2: `want=0x2d2b55 got=0x1e1e1e -> NOCLEAR`, i.e. `video::PANEL_BG` still on the
-/// glass at desktop-ready). It is `feature = "pidesk"` and one-shot at bring-up, so the promise is
+/// glass at desktop-ready). It is `feature = "desktop_firmware"` and one-shot at bring-up, so the promise is
 /// conditional in two ways this witness must not paper over: knob-off there is still no clear, and
 /// a clear at bring-up is not a claim about a pixel some LATER writer repaints — the Pi's
 /// `render_service` still owns the backdrop (PARITY §6.1), so a probe that latches late reads
@@ -985,7 +985,7 @@ pub fn chrome_truth(fb: &FrameBuffer, rows: &[super::wm::Window], order: &[usize
             serial_println!(
                 "[chrome-truth] pt=desktop at=({},{}) want={:#08x} got={:#08x} -> {}",
                 dx, dy, DESKTOP_BG, got.unwrap_or(0),
-                if ok { "HIT" } else if cfg!(feature = "pidesk") {
+                if ok { "HIT" } else if cfg!(feature = "desktop_firmware") {
                     "NOCLEAR (pidesk cleared the panel at bring-up; a later writer owns this pixel — PARITY 6.1)"
                 } else {
                     "NOCLEAR (no panel-wide DESKTOP_BG clear in this build; it is pidesk-gated on aarch64)"

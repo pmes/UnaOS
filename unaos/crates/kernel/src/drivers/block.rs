@@ -242,7 +242,7 @@ pub fn usb_info() -> Option<BlockDeviceInfo> {
 // x86 is fixed: `register_sdhc` runs synchronously inside `pci::init` (`sdhc::probe` -> `bring_up`),
 // while `publish_usb_geometry` runs from the main loop's deferred SCSI bring-up
 // (`xhci::service_storage`, held until the enumeration queue drains). So the card is always
-// registered FIRST, and every poll-until-present consumer — `wifi::service`, `wcx::desktop_app_service`,
+// registered FIRST, and every poll-until-present consumer — `wifi::service`, `desktop_uefi::desktop_app_service`,
 // `shell::fatverb_storage_witness` — resolved and parked on `Sdhc` at the first main-loop pass, long
 // before any stick arrives. What remains is the INTRA-PASS window on the one pass where a stick
 // claims the global: `service_storage` resets the verdict to `BM_UNKNOWN` near the top of the pass

@@ -479,9 +479,9 @@ pub fn request_present_rect(x: usize, y: usize, w: usize, h: usize) {
 /// report it and the `+ 1` cannot come from `STRIP_MAX`. It is stated here, at the one array that
 /// has to hold it, rather than by promoting the menu to a tenant — which would spend a permanent
 /// occlusion slot on a surface that is absent for all but a few seconds of a boot.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
 const DESK_STRIP_MAX: usize = super::strip::STRIP_MAX + 1;
-#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
 const DESK_STRIP_MAX: usize = 0;
 
 /// SHELLDESK — the desktop present's occluder capacity: every window box ([`super::wm::occluders`]
@@ -498,7 +498,7 @@ const SEED_NONE: u32 = 0xFFFF_FFFF;
 
 /// WC-BBSYNC — the colour a newly-built [`Screen`]'s BACK buffer is born holding, once the window
 /// compositor has taken the panel. [`SEED_NONE`] means unarmed, which is every aarch64 build, every
-/// default x86 build, and every `wc` boot up to the instant `video::wcx::activate` clears the glass.
+/// default x86 build, and every `wc` boot up to the instant `video::desktop_uefi::activate` clears the glass.
 ///
 /// ### Why a latch, and why it is consumed HERE rather than set here
 ///
@@ -526,7 +526,7 @@ static DESKTOP_BG_SEED: core::sync::atomic::AtomicU32 =
 /// [`Screen`] built from here on starts its back buffer in agreement with it. Idempotent; the caller
 /// owns the colour (this module invents none).
 ///
-/// Armed only by `video::wcx`, which is `cfg(all(target_arch = "x86_64", feature = "wc"))`. On
+/// Armed only by `video::desktop_uefi`, which is `cfg(all(target_arch = "x86_64", feature = "wc"))`. On
 /// aarch64 and on every non-`wc` x86 build there is no caller, the latch stays [`SEED_NONE`], and
 /// [`Screen::new`] pays exactly one relaxed-cost atomic load.
 pub fn adopt_desktop_bg(color: u32) {
@@ -793,7 +793,7 @@ impl Screen {
     /// backdrop.
     ///
     /// The scene today is the flat [`super::wm::DESKTOP_BG`] fill — the same colour the compositor put
-    /// on the glass at `wcx::activate` and the same one [`adopt_desktop_bg`] seeds a fresh `Screen`
+    /// on the glass at `desktop_uefi::activate` and the same one [`adopt_desktop_bg`] seeds a fresh `Screen`
     /// with, so this agrees with both by construction. It is the SEAM the approved lake scene
     /// (white-board A1) renders through later: a scene richer than a fill replaces the body of this
     /// method and every caller keeps working, because the contract is "own the backdrop", not "fill
@@ -1177,11 +1177,11 @@ impl Screen {
         //
         // SHELLDESK REVIEW — the interval is bounded because the ENABLER COMPOSITES, and that had to
         // be made true rather than assumed. The original note here claimed the enable at
-        // `wcx::activate` was "immediately followed by the console window's own `create`, which
+        // `desktop_uefi::activate` was "immediately followed by the console window's own `create`, which
         // composites"; the order is the reverse — `panel_console_window_open` runs ABOVE the enable —
         // and the row it mints is fbcon's frozen boot-log snapshot, which never damages again. With
         // `wm::service_damage` declining to composite while no row is dirty, nothing was guaranteed to
-        // paint the withheld rows on a boot with no desktop app and no mouse. `wcx::activate` now
+        // paint the withheld rows on a boot with no desktop app and no mouse. `desktop_uefi::activate` now
         // composites at the enable seam, which is the bound this paragraph asserts.
         //
         // x86 + `wc` only — `video::strip` is not compiled on aarch64, where this is the WC-I array
@@ -1198,7 +1198,7 @@ impl Screen {
         // unchanged and `Console::page_rows` identical at 0x78 — i.e. the whole delta was here.
         // Written as two cfg arms, so the platform with no furniture fills `occ` in place exactly as
         // it always did and the promise is kept by construction rather than by assertion.
-        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
         let (nocc, nwin) = {
             // `occluders` writes exactly `MAX_WINDOWS` slots; the furniture tail is appended after.
             let mut wins = [(0usize, 0usize, 0usize, 0usize); super::wm::MAX_WINDOWS];
@@ -1230,7 +1230,7 @@ impl Screen {
             }
             (n, nw)
         };
-        #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
+        #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
         let (nocc, nwin) = {
             // `DESK_OCC_MAX == wm::MAX_WINDOWS` here (no strip registry is compiled), so this is the
             // WC-I call on the WC-I array, unchanged.

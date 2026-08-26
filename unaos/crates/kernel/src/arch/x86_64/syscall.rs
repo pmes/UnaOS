@@ -3195,7 +3195,7 @@ fn sys_sleep_ms(ms: u64) -> i64 {
 // =============================================================================================
 // WINX-1 — the WINDOW SURFACE/VERB SEAM. The x86 twin of the aarch64 WC-B block, wired to the SAME
 // arch-neutral compositor (`video::wm`), which has always been arch-neutral and until this seam had
-// no x86 caller other than `video/wcx.rs`'s activation. (That activation's own windows were the
+// no x86 caller other than `video/desktop_uefi.rs`'s activation. (That activation's own windows were the
 // console and a kernel-drawn demo window; since the kernel-apps eviction only the console remains,
 // and the desktop's second window comes through THESE verbs like any other program's.)
 //
@@ -3353,7 +3353,7 @@ static SLOT_DETACHED: [AtomicBool; crate::arch::memory::USER_SLOTS] =
 /// `sys_win_create` gives input focus to any process that opens a window while `USER_INPUT_ACTIVE`
 /// is 0 — the minimum viable policy that makes a `bg`'d interactive app reachable at all, and it is
 /// right for every launch an OPERATOR asks for. The kernel-apps eviction introduced the first launch
-/// nobody asks for: `wcx::desktop_app_service` starts `STAT.ELF` at boot, as the compositor's
+/// nobody asks for: `desktop_uefi::desktop_app_service` starts `STAT.ELF` at boot, as the compositor's
 /// furniture, and its window opens at a moment when the shell is by definition idle. Unqualified,
 /// that grant would fire on it — and `STAT.ELF` never calls `SYS_INPUT_POLL` (it is a paint loop with
 /// no input path at all), so the boot would end with the keyboard published to a program that cannot
@@ -3377,7 +3377,7 @@ static SLOT_DETACHED: [AtomicBool; crate::arch::memory::USER_SLOTS] =
 ///
 /// ### `wc`-gated, and what that does and does not buy
 ///
-/// The exemption exists for `video::wcx`'s desktop app, which does not exist without `UNAOS_WC=1`.
+/// The exemption exists for `video::desktop_uefi`'s desktop app, which does not exist without `UNAOS_WC=1`.
 /// The flag, both of its readers ([`slot_is_focus_exempt`] and [`owner_is_focus_exempt`]) and the
 /// spawn entry point are all gated, so a plain x86 kernel carries no static, no branch on the
 /// `SYS_WIN_CREATE` path, no arm in the click router and neither witness string — no feature code at
@@ -5160,7 +5160,7 @@ pub fn user_input_route(ev: crate::pal::Event) -> crate::pal::Event {
 /// helper's own contract already claims to return and what it actually returns only on aarch64.
 ///
 /// `focus_ring` filters `used && !compat && owner_asid != 0`. On aarch64 that IS the app set: every
-/// row belongs to an EL0 ASID. On x86 it is not — `fbcon::panel_console_window_open` and `wcx`'s
+/// row belongs to an EL0 ASID. On x86 it is not — `fbcon::panel_console_window_open` and `desktop_uefi`'s
 /// desktop demo create rows owned by `wm::KERNEL_OWNER_CONSOLE` / `KERNEL_OWNER_DESKTOP`, values
 /// far above `USER_SLOTS` that pass the `!= 0` test. Left in, the cycle would step onto one of them
 /// and `user_input_set_active` would REFUSE it (`slot >= USER_SLOTS`, an early return that publishes
@@ -5362,7 +5362,7 @@ pub fn wc_focus_key(ev: crate::pal::Event) -> bool {
     // console is a window row". It is, and that row is not the console the operator types into. On
     // the bench path `fbcon::detach()` runs at the SCHED-X86 handoff, `_print` returns at its first
     // test from that store on, and fbcon's `KERNEL_OWNER_CONSOLE` row — opened earlier by
-    // `wcx::activate` — is a FROZEN BOOT-LOG SNAPSHOT for the rest of the boot. The live prompt is
+    // `desktop_uefi::activate` — is a FROZEN BOOT-LOG SNAPSHOT for the rest of the boot. The live prompt is
     // `console::Console` drawn through `TargetPal`/`Screen` inside `x86_render_service`: the DESKTOP
     // layer, which is the layer `SHELL_Z` is. So `focus_changed(0)` is the correct call on this arch
     // for the same reason it is on the other, and only its arm does the three things this gesture
@@ -13632,7 +13632,7 @@ struct Proc {
 ///     request table, so there is no aarch64-style `MAX_KILL_REQS` coupling to assert here.
 ///
 /// HEADROOM (Boot AL, rMBP) — raised 6 -> 10, x86 only (aarch64 keeps PROCS-6). The number the
-/// operator meets is not this one: `video::wcx::desktop_app_service` launches `STAT.ELF` at boot and
+/// operator meets is not this one: `video::desktop_uefi::desktop_app_service` launches `STAT.ELF` at boot and
 /// it never exits, so at 6 a `storm` fleet capped at **5**. The target is a fleet of 8 vugs with the
 /// desktop app still resident and a foreground `run` still possible — 8 + 1 = 9 rows in use, so 10.
 ///
@@ -16105,7 +16105,7 @@ pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str
 }
 
 /// DESKTOP-APP: [`spawn_user_image_bg`] for a launch NOBODY ASKED FOR — the compositor's own desktop
-/// app, started at boot by `video::wcx::desktop_app_service`.
+/// app, started at boot by `video::desktop_uefi::desktop_app_service`.
 ///
 /// Identical in every respect but one: the slot is marked [`SLOT_NO_AUTOFOCUS`] before the task can
 /// run, so the program's first `SYS_WIN_CREATE` does not take the keyboard off an idle shell. That
@@ -16147,7 +16147,7 @@ fn spawn_user_image_bg_inner(
     // `!no_autofocus` IS the operator predicate and not a convenient proxy for one: this function's
     // two public wrappers are exactly "the launch the operator asked for" (`spawn_user_image_bg` —
     // `bg`, and the bare-name launch) and "the launch NOBODY asked for" (`..._no_autofocus`, whose
-    // one caller is `wcx::desktop_app_service`). The desktop app is therefore excluded HERE, at the
+    // one caller is `desktop_uefi::desktop_app_service`). The desktop app is therefore excluded HERE, at the
     // arming, as well as at the grant — it never holds a token to consume, so its exemption does not
     // depend on `slot_is_focus_exempt` alone.
     if !no_autofocus {
@@ -16823,7 +16823,7 @@ fn winx2_launcher(_demo_cpu: usize) {
     // REVIEW C3 — THE FREE BUCKET ALONE CANNOT BE ATTRIBUTED, and the first cut of this check claimed it
     // could ("this witness's own program is the only thing that retires between the two reads; nothing
     // else in the launcher chain spawns here"). That was a false invariant with a live counterexample in
-    // this same tree: `video::wcx::desktop_app_service` (wcx.rs:514) runs on the DEVICE-SERVICE task and
+    // this same tree: `video::desktop_uefi::desktop_app_service` (desktop_uefi.rs:514) runs on the DEVICE-SERVICE task and
     // is gated on the same storage-enumeration event this launcher's `fat::mount()` is, so on a
     // `UNAOS_WC` metal boot it can `proc_reserve` a row INSIDE `bg_kill`'s up-to-`KILL_CONFIRM_MS`
     // confirm window. Kill frees one, launch takes one, net delta zero — and an `== free_before + 1`
@@ -18158,7 +18158,7 @@ fn dmg_code(w: u64, i: usize) -> u32 {
 ///      tell its own race from a kernel bug is worse than no fixture.
 ///   5. Release the owner, wait for its exit and both slots' teardown, then grade.
 ///
-/// SETTLE FLAG: `video::wcx::desktop_app_service` holds the desktop-app launch (bounded, out loud)
+/// SETTLE FLAG: `video::desktop_uefi::desktop_app_service` holds the desktop-app launch (bounded, out loud)
 /// until this witness has had its empty-table entry — Boot AL's launch at 13.257s beat the witness to
 /// row 1 (DMG entry 13.859s) and it printed NOT RUN for the first time in the capture. The flag is
 /// published on EVERY exit (the wrapper stores it after the body returns, NOT RUN paths included).

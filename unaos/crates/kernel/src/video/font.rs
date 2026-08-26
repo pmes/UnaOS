@@ -92,7 +92,7 @@
 //!
 //! * **Before the seam — font8x8, and rightly.** [`super::fbcon`]'s console from reset until the
 //!   arch's desktop-ready point (x86: the Kepler takeover's `panel_console_resume`; aarch64:
-//!   [`super::pidesk::activate`]'s `panel_console_face_arm`), and the panic screen when it lands
+//!   [`super::desktop_firmware::activate`]'s `panel_console_face_arm`), and the panic screen when it lands
 //!   before that point. This face costs an allocator-free table lookup and a static atlas — both
 //!   available at reset — so the fold is not about capability; it is that the early console's job
 //!   is to survive, and re-homing its cell grid mid-boot is a state change a boot that is already

@@ -60,7 +60,7 @@
 //! # Two panels now, and gated on each
 //!
 //! `#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature =
-//! "pidesk")))]` at the `mod` declaration in [`super`] — the same gate [`super::dock`],
+//! "desktop_firmware")))]` at the `mod` declaration in [`super`] — the same gate [`super::dock`],
 //! [`super::menubar`] and [`super::crystal`] carry. It used to be the x86 term alone; PI-DESK added
 //! the second half, and the two are independent.
 //!

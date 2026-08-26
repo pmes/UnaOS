@@ -98,7 +98,7 @@
 //!
 //! # PI-DESK — compiled on the Pi, and STILL DEFAULT OFF there
 //!
-//! The `mod` gate is now `any(all(x86_64, wc), all(aarch64, pidesk))`, so this tenant exists on the
+//! The `mod` gate is now `any(all(x86_64, wc), all(aarch64, desktop_firmware))`, so this tenant exists on the
 //! BCM2711 panel too. Nothing about its POLICY moved with it. Peter's direction — *"we will not
 //! always have a menu bar"* — is a runtime statement, and `ENABLED` still starts `false` on both
 //! arches: a Pi boot with `UNAOS_PIDESK=1` gets the dock strip and the SHARD menu machinery and NO
@@ -257,7 +257,7 @@ static CLOBBERS: AtomicU64 = AtomicU64::new(0);
 ///
 /// [`selftest`]'s leg 1 ("absent by default") read [`ENABLED`] live, and its own comment named the
 /// condition that would break it: *"if a future shell enables the bar before the battery runs, this
-/// leg reds"*. The desktop shell now DOES enable the bar at desktop-ready (`wcx::activate`), so a
+/// leg reds"*. The desktop shell now DOES enable the bar at desktop-ready (`desktop_uefi::activate`), so a
 /// live read would report the shell's decision instead of the build's default and the leg would
 /// answer a question nobody asked.
 ///
@@ -324,7 +324,7 @@ pub fn enabled() -> bool {
 /// bar is enabled `screen::present_background` subtracts its rect, so those rows stop being desktop
 /// pixels and only a composite can fill them — and a composite whose [`strip::paint`] declined
 /// (contended scratch, a surface not yet `word4`) leaves the bar enabled, its rows withheld, and
-/// nothing on the glass. `super::pidesk::activate` reads this back after its enable-seam composite
+/// nothing on the glass. `super::desktop_firmware::activate` reads this back after its enable-seam composite
 /// instead of assuming the composite painted, on the same "read the fact, do not infer it from your
 /// own control flow" rule that seam already applies to `fbcon::console_is_routed`.
 #[inline]
@@ -790,7 +790,7 @@ pub fn selftest() {
     // a reader sees what was observed rather than trusting that claim — if a future shell enables the
     // bar before the battery runs, this leg reds and the line says why.
     // SHELLDESK — the default is read from the LATCH, not from the live flag. The desktop shell
-    // enables the bar at desktop-ready (`wcx::activate`), which on a Kepler boot happens long before
+    // enables the bar at desktop-ready (`desktop_uefi::activate`), which on a Kepler boot happens long before
     // this battery runs; a live read would then report the SHELL's decision and call the artifact's
     // default a defect. `initial=` on the line is still the live flag, so a reader sees both facts.
     // The fault injection the original leg was hardened by still reds this: `ENABLED` initialised to

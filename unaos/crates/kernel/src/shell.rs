@@ -2702,7 +2702,7 @@ static WITNESS_WAIT_SINCE_MS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
 /// FATVERB: how long to wait for a block device before witnessing an empty census anyway. Same
-/// value and same reasoning as `video::wcx::STORAGE_WAIT_MS` — generous against the deferred SCSI
+/// value and same reasoning as `video::desktop_uefi::STORAGE_WAIT_MS` — generous against the deferred SCSI
 /// bring-up on this bench, and the number matters far less than the wait terminating in a line.
 #[cfg(target_arch = "x86_64")]
 const STORAGE_WAIT_MS: u64 = 30_000;
@@ -2756,7 +2756,7 @@ pub fn fatverb_storage_witness() {
     // first pass, and the `test-fat sf` shape had nothing at all, so the two differ and neither can
     // be assumed.
     //
-    // The shape is `wcx::desktop_app_service`'s, deliberately — including its law that the wait
+    // The shape is `desktop_uefi::desktop_app_service`'s, deliberately — including its law that the wait
     // TERMINATES IN A LINE rather than in silence. A boot that genuinely never gets a block device
     // must still emit these legs (a read verb with no volume is Boot AR's own symptom, and a spec
     // REQUIRE must not go red because the machine had no card in it), so the deadline expires into
@@ -4709,7 +4709,7 @@ struct BgJob {
 ///   * **aarch64** — 6 bg jobs with no foreground `run` (5 with one), unchanged by this arc.
 ///
 /// ⚠ KERNEL-APPS EVICTION — **on a `wc` x86 boot the ceiling is one lower than a bare reading of
-/// `MAX_PROCS` says.** `video::wcx::desktop_app_service` launches the desktop app (`STAT.ELF`) at
+/// `MAX_PROCS` says.** `video::desktop_uefi::desktop_app_service` launches the desktop app (`STAT.ELF`) at
 /// boot and it never exits, so it permanently holds one Proc row, one user slot, one `wm` window and
 /// one row of THIS table. With `MAX_PROCS = 10` the operator's budget on such a boot is therefore
 /// **9** bg jobs with no foreground `run` (8 with one) — which is exactly the fleet HEADROOM was
@@ -5123,7 +5123,7 @@ fn bg_kill_cmd(console: &mut Console, pid: u64) {
 /// NAME for it comes from here.
 ///
 /// `pub(crate)` since the kernel-apps eviction, for ONE second caller:
-/// [`crate::video::wcx::desktop_app_service`], which launches the desktop app at boot with nobody at
+/// [`crate::video::desktop_uefi::desktop_app_service`], which launches the desktop app at boot with nobody at
 /// the prompt to type `bg`. Registering it here is what keeps `jobs` and `kill` TRUTHFUL —
 /// `bg_kill_cmd` resolves a pid through this table and REFUSES one it cannot find, so an
 /// unregistered launch would be a running ring-3 program the operator can neither list nor stop.

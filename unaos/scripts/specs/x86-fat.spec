@@ -148,7 +148,7 @@ FORBID :: WXN-FBWC: .*-> SKIPPED ::
 # --- SCOPE: `witness` only. They need no FAT image and no `sdhcblk` — the summary line's census
 # --- reads `sdhc=unbuilt` on this spec's build and the legs still carry content, because the
 # --- handle-agreement and counter halves are independent of which handles exist. The wait is
-# --- BOUNDED (30 s, wcx's threshold): a boot that never gets a block device still emits all three
+# --- BOUNDED (30 s, desktop_uefi's threshold): a boot that never gets a block device still emits all three
 # --- lines with an empty census, so these REQUIREs cannot go red for want of a card.
 # --- MINIMUM BUILD GENERATION — the FATVERB commit (2026-08-09); older images cannot print them.
 REQUIRE :: TSTE: fatverb\.readvol -> PASS ::

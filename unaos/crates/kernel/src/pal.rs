@@ -1358,7 +1358,7 @@ pub fn push_pointer_report(motion: Option<Event>, button: Option<Event>) {
 // These three counters separate those cases at a glance. They are plain relaxed atomics on a path
 // that already does MMIO and DMA, bumped only when a wheel is actually in play (`note_decoded` is
 // called for nonzero deltas only), so an idle boot and a boot with no wheel at all pay nothing. The
-// PRINTING is knob-gated at the call site (`pidesk`); the COUNTING is unconditional, so a metal
+// PRINTING is knob-gated at the call site (`desktop_firmware`); the COUNTING is unconditional, so a metal
 // capture can read the census from any build that can reach a witness.
 
 /// Nonzero wheel deltas decoded out of HID pointer reports since boot.

@@ -44,7 +44,7 @@ const TASK_STACK_SIZE: usize = 16 * 1024; const STACK_REDZONE: usize = 1024; con
 // U7STK — the kernel-stack HIGH-WATER instrument (PARITY §6.1b).
 //
 // WHY IT EXISTS. `u7-launch` (`main.rs`, entry `syscall::u7_launcher`) is dropped on Pi METAL
-// between `wcb_launcher` and `video::pidesk::arm()` by the SPIN-6 refusal below:
+// between `wcb_launcher` and `video::desktop_firmware::arm()` by the SPIN-6 refusal below:
 //
 //   [spin6] cpu=2 REFUSING corrupt switch-in: task=70:u7-launch ctx_sp=0x20c9e70
 //   outside its stack [0x20ca000,0x20ce000) — the parked frame was OVERWRITTEN
@@ -10240,7 +10240,7 @@ fn capstone_queue_pre_staged(cpu: usize) -> bool {
 //
 // `ctx_sp` below the task's own low bound is the U7STK signature exactly — this task's frame chain,
 // not a neighbour writing into it. The corroborating measurement is already on the same wire: the
-// `[u7stk] at=after:pidesk_arm` probe reports `hw=16496` for `u7-launch`, i.e. the desktop-arming
+// `[u7stk] at=after:desktop_firmware_arm` probe reports `hw=16496` for `u7-launch`, i.e. the desktop-arming
 // subtree ALONE carries a high-water 112 bytes past 16 KiB, while the render task overflowed its own
 // 16 KiB by 96..128. Same cascade, same order of depth, same cure.
 //
@@ -10464,7 +10464,7 @@ compile_error!(
 // helpers that DO acquire the panel while masked — `panel_info_nonblocking` (video/mod.rs:214) and
 // `panel_snapshot`'s masked arm (video/mod.rs:239) — are `try_lock` and degrade instead of waiting.
 // And no tegra IRQ handler reaches `WRITER` at all: on this board the console is not routed through
-// `wm` (`fbcon`'s route is `all(x86_64, wc)` or `all(aarch64, pidesk)`, and neither is armed here),
+// `wm` (`fbcon`'s route is `all(x86_64, wc)` or `all(aarch64, desktop_firmware)`, and neither is armed here),
 // so the IRQ-context printer's panel path does not exist. A masked spinner on `WRITER` would be a
 // NEW defect someone had to write; none is present.
 //

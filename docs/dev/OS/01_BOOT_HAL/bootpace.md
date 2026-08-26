@@ -1870,7 +1870,7 @@ lane's decomposition instrument, merged in `505a129e`, replaced that single phas
 macro and cannot leave a silent remainder. Boot Z reads those five, not this one; §10j gives
 them, and `kdisp_takeover` inherits 328 of the 331. **Note before quoting them:**
 `kdisp_takeover` spans more than the calibration blit — `panel_console_resume`
-does a second full-surface pass over the same framebuffer, and `wcx::activate()`, a 2 M-iteration
+does a second full-surface pass over the same framebuffer, and `desktop_uefi::activate()`, a 2 M-iteration
 `spin_loop`, and 4096 uncached BAR0 reads are all inside it — so that number alone cannot
 attribute the cost to the blit. Inner bounds are assigned.)
 and nothing inside it is a deliberate wait: the span contains no spin loop at all. It is MMIO
@@ -1974,7 +1974,7 @@ longer appears on the wire.
 quoted as though it did.** The stamp charges everything between the pre-takeover mirror dump and the
 return from `takeover_display()`, and besides the calibration blit that span contains
 `panel_console_resume()`'s **second** full-surface pass over the same framebuffer
-(`kepler_display.rs:448`), `wcx::activate()` (`:458`), a 2,000,000-iteration `spin_loop` between the
+(`kepler_display.rs:448`), `desktop_uefi::activate()` (`:458`), a 2,000,000-iteration `spin_loop` between the
 two EVO-core passes (`:195`), and 4096 uncached BAR0 reads. Any of those can carry tens of
 milliseconds on this panel and this bus. **328 is an upper bound on the blit and nothing more until
 the inner bounds land** — they are assigned to the kepler lane, and the number is not evidence for
@@ -2266,7 +2266,7 @@ kernel leaf is M3b's to create, and when it lands WP is already waiting for it.
 
 **Separately, §10j's `kdisp_takeover=328` decomposed under adversarial replay**
 (`scratch/gr20/verify-kdisp-gaps.md`, Boots Y and Z, both reconciling to the millisecond):
-blit **50 ms**, `panel_console_resume` **15 ms**, `wcx::activate` **259–260 ms** — and
+blit **50 ms**, `panel_console_resume` **15 ms**, `desktop_uefi::activate` **259–260 ms** — and
 ~190 ms of the 260 (73%) is **witness instrumentation reading the framebuffer back** at
 the uncached-read rate (~1.7–2.3 µs/read vs 2.7–6.8 ns/px for writes; four independent
 instruments agree on the ratio). The next pace target in this window is the probe

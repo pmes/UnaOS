@@ -92,7 +92,7 @@ pub const MAX_TITLE: usize = 16;
 ///
 /// CRISPYWIRE — **this is `theme::TITLE_HEIGHT`, not a compositor number.** WC-A's invented `12`
 /// is gone: the strip is the kit's `metrics.title_height`, and it changes when the kit changes.
-/// The name is kept because it is load-bearing across four modules (`wm`, `wcx`, `fbcon`,
+/// The name is kept because it is load-bearing across four modules (`wm`, `desktop_uefi`, `fbcon`,
 /// `instgui`) and the x86 syscall selftests — every one of them derives its geometry from this
 /// symbol, so re-pointing it at the table moves all of them at once and leaves no stale literal.
 pub const TITLE_H: usize = super::theme::TITLE_HEIGHT;
@@ -529,7 +529,7 @@ pub fn shell_z() -> u32 {
 ///   the bare-name launch. All three reach the loader through the arch's spawn entry points, and the
 ///   token is armed INSIDE the spawn.
 /// * **Background-created — never focused on creation** — the compositor's own desktop app
-///   (`wcx::desktop_app_service`, already exempt via `SLOT_NO_AUTOFOCUS`), the compat row, kernel
+///   (`desktop_uefi::desktop_app_service`, already exempt via `SLOT_NO_AUTOFOCUS`), the compat row, kernel
 ///   furniture, selftest fixtures, and — the case with no flag anywhere — **every window after an
 ///   app's first.** The token is a ONE-SHOT: an app that opens a second window has already spent it,
 ///   so a program cannot re-take the keyboard by re-creating a window in a loop.
@@ -1008,7 +1008,7 @@ pub fn compat_live() -> bool {
 // The x86 trunk's CLICK-X86 lineage gives the kernel's own windows (panel console, desktop demo)
 // clickable owner rows in a reserved band — hittable furniture that remains outside focus_ring
 // and close_owner's reach. The full lineage (its hit_test/focus_changed integration and the
-// fbcon/wcx registrations) re-lands as the x86 seat's own reviewed arc per the tier-3 baseline
+// fbcon/desktop_uefi registrations) re-lands as the x86 seat's own reviewed arc per the tier-3 baseline
 // ruling; what is grafted HERE is only the seam `arch/x86_64/syscall.rs` already depends on:
 // the band constants and the band predicate. Content taken verbatim from the x86 trunk's wm.rs
 // (UnaOS-gemini f36ab3d5); doc text condensed, semantics untouched.
@@ -1023,7 +1023,7 @@ pub const KERNEL_OWNER_BASE: u64 = 0xFFFF_FF00;
 pub const KERNEL_OWNER_CONSOLE: u64 = KERNEL_OWNER_BASE + 1;
 
 /// CLICK-X86: the desktop furniture's row. **No producer since the kernel-apps eviction** — it named
-/// `wcx::activate`'s kernel-drawn demo window, which is now a ring-3 process (`STAT.ELF`) owning an
+/// `desktop_uefi::activate`'s kernel-drawn demo window, which is now a ring-3 process (`STAT.ELF`) owning an
 /// ordinary user row. Kept as a RESERVED value rather than deleted: [`is_kernel_owner`] is a range
 /// test over the whole band, the console row above still uses it, and the next piece of kernel-owned
 /// desktop furniture should take this number rather than mint a third one.
@@ -1489,7 +1489,7 @@ fn pace_admit(id: WinId, exempt: bool) -> bool {
 /// rides `Screen::flush`, whose idle cadence is the status strip's ~1/s — visibly late). This is
 /// the same liveness structure the deferred-erase queue has (WC-L), with the same class of taker.
 ///
-/// Called from `wcx::desktop_app_service` — the `wc`-gated body on `x86_usb_pump`'s ~1 kHz
+/// Called from `desktop_uefi::desktop_app_service` — the `wc`-gated body on `x86_usb_pump`'s ~1 kHz
 /// device-service pass — so a deferred present reaches glass within one frame plus one service
 /// tick. Main-loop context, never IRQ, unmasked: exactly the context `composite` already runs in
 /// from `service_damage` and the paygo taker, and the WCSER re-run loop treats it as an unmasked
@@ -4645,9 +4645,9 @@ fn composite_pass_half() -> Owed {
     // tenant in registry order and ORs the results, so a second strip is a registry entry rather than a second line here
     // and neither can short-circuit the other's damage test (a disabled tenant returns on one relaxed load). PI-DESK — the
     // aarch64 half of the gate below is the WHOLE of M2: same seam, same position, same duty, same layering.
-    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     let strip_painted = super::strip::compose_all();
-    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))))]
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     let strip_painted = false;
     #[cfg(feature = "witness")]
     let c2_t1 = crate::arch::now_cycles();
@@ -4922,7 +4922,7 @@ fn composite_inner() -> CursorTail {
         // paint set uses, so the arming block below can price the dock's rect without a second
         // `TABLE` lock (occ_clip's "no second table lock" rule is per-window in the blit loop; this
         // is once per pass, and here it is free).
-        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
         let mut sprite_dock_tiles = 0usize;
         #[allow(unused_mut)]
         let mut hit = {
@@ -4933,7 +4933,7 @@ fn composite_inner() -> CursorTail {
                     npaint += 1;
                 }
             }
-            #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+            #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
             {
                 sprite_dock_tiles = dock_tiles(&t.rows);
             }
@@ -5007,7 +5007,7 @@ fn composite_inner() -> CursorTail {
         //
         // TRUNK LANDING 2026-08-19 — THE CFG WIDEN. This block and the two `sprite_dock_tiles` sites
         // above were `all(x86_64, wc)`; they are now
-        // `any(all(x86_64, wc), all(aarch64, pidesk))`, because the furniture this arms against is
+        // `any(all(x86_64, wc), all(aarch64, desktop_firmware))`, because the furniture this arms against is
         // not x86 furniture: `crystal::open_rect` and `dock::Layout::for_panel` are ungated and
         // `dock_tiles` was already dual-gated, so the Pi desktop carries the identical poison (a
         // dragged window under the dock, an open dropdown over the pointer) and had no arm for it.
@@ -5020,10 +5020,10 @@ fn composite_inner() -> CursorTail {
         // STACK EXHAUSTION as the reason that function was reshaped. It is therefore gated at ARMED
         // BENCH GEOMETRY (`UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test`), not at QEMU's
         // 640x480, and that leg is part of this landing's battery.
-        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
         {
             // LOCKFIX — through [`super::panel_snapshot`], refusal degrading CONSERVATIVELY, and on
-            // THIS site that matters most: the cfg above compiles this block in on `pidesk`, i.e. on
+            // THIS site that matters most: the cfg above compiles this block in on `desktop_firmware`, i.e. on
             // exactly the aarch64 images that are wedge-capable with no tenant.
             //
             // `false` here would assert "the open dropdown and the dock are clear of the sprite" —
@@ -5112,7 +5112,7 @@ fn composite_inner() -> CursorTail {
                     CUR3_DECL_BUDGET.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     // CURSOR-12 — `reserved` counts the WC-F probe (aarch64) and MENU-UNDER's
                     // furniture decline (x86 `wc`, and since the 2026-08-19 trunk landing aarch64
-                    // `pidesk` too — so the two are NO LONGER structurally exclusive per arch and
+                    // `desktop_firmware` too — so the two are NO LONGER structurally exclusive per arch and
                     // this field can mix them). It is still read against `budget`, which also
                     // carries the per-window `may_overlay` exclusions; see [`CUR12_RESERVED`].
                     CUR12_RESERVED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -10449,8 +10449,8 @@ static CUR12_NOHIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 /// MENU-UNDER's furniture decline — the open SHARD dropdown and the dock.
 ///
 /// TRUNK LANDING 2026-08-19: MENU-UNDER's sites were widened from `all(x86_64, wc)` to
-/// `any(all(x86_64, wc), all(aarch64, pidesk))`, so the old claim that each source is
-/// "structurally 0 on the other arch" NO LONGER HOLDS: an aarch64 `pidesk` build compiles both,
+/// `any(all(x86_64, wc), all(aarch64, desktop_firmware))`, so the old claim that each source is
+/// "structurally 0 on the other arch" NO LONGER HOLDS: an aarch64 `desktop_firmware` build compiles both,
 /// and this one field can mix them. It still answers exactly one question — how many passes
 /// declined the overlay for a reserved box — which is what it is read against `budget` for; it no
 /// longer attributes WHICH box, and a per-source split would need two counters.
@@ -13173,15 +13173,15 @@ fn controls_declined_drain() {
 // 4. NOT MOVED: `close_owner` STILL REFUSES KERNEL-BAND ROWS, and furniture gets NO close disc.
 //    CLOSEISO's structural backstop stands — nothing in this tree can mint a second console row
 //    (`fbcon::panel_console_window_open` is idempotent behind `CONSOLE_WIN`, reached from one one-shot
-//    latch, `wcx::activate` from the Kepler takeover), so the console cannot be reaped and re-made.
+//    latch, `desktop_uefi::activate` from the Kepler takeover), so the console cannot be reaped and re-made.
 //    The panic path is independent of all of this: `panic_screen` clears `CONSOLE_WIN` and paints the
 //    PANEL directly, so panic output never depends on the console being a window (verified this arc).
 //
-// 5. EVENTUAL END STATE — the console is never MINTED as a window (fbcon/wcx).
+// 5. EVENTUAL END STATE — the console is never MINTED as a window (fbcon/desktop_uefi).
 //    The fullest expression of "plumbing, not a window" is not minting the console as a `wm` row at
 //    all: the boot console renders to the fbcon PANEL handle (as it does pre-takeover), and once the
 //    desktop is up the boot log lives only in serial + `TERM_RING`, which the Console APP subscribes
-//    to. That removal lives in `fbcon::panel_console_window_open` / `wcx::activate` (this arc's lane)
+//    to. That removal lives in `fbcon::panel_console_window_open` / `desktop_uefi::activate` (this arc's lane)
 //    but is entangled with the Console APP sibling arc taking over the boot-log display and with the
 //    desktop bring-up owning the panel; it is sequenced AFTER entries 2-3, not before.
 //
@@ -15352,7 +15352,7 @@ fn boxes_overlap(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize
 // still a subset of the pixels the read-back declines to charge — on either arch.
 //
 // The FURNITURE arm (dock strip, menu bar, the SHARD dropdown) stays `x86_64 + wc` for now; §6.2's
-// second milestone moves it to the `wc`/`pidesk` dual gate the rest of the furniture family carries.
+// second milestone moves it to the `wc`/`desktop_firmware` dual gate the rest of the furniture family carries.
 // Until then an aarch64 clip holds windows and nothing else.
 //
 // **"Pixel-identical", not "byte for byte", and the review was right to separate them.** The first
@@ -15380,7 +15380,7 @@ fn boxes_overlap(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize
 /// only where the registry exists.
 const FURNITURE_MAX: usize = 2;
 
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))] // PI-DESK: two arch/knob pairs now
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] // PI-DESK: two arch/knob pairs now
 const _: () = assert!(FURNITURE_MAX == super::strip::STRIP_MAX);
 
 /// MENU-OCC — occluder slots for TRANSIENT modal surfaces that are NOT `strip::TENANTS` members.
@@ -15521,7 +15521,7 @@ impl OccClip {
     /// unconditional on both arches (see [`erase_clip`]) and, unlike `occ_clip`'s, it admits through
     /// `push` rather than by direct write — because it has no `boxes_overlap` pre-filter to bound it
     /// and must REPORT the drop rather than write past the end. So `push` is reachable on the
-    /// knob-off aarch64 build, where the old `any(x86_64, all(aarch64, pidesk))` gate did not compile
+    /// knob-off aarch64 build, where the old `any(x86_64, all(aarch64, desktop_firmware))` gate did not compile
     /// it. Widening the gate compiles one more small function into that build and moves no pixel on
     /// any other.
     fn push(&mut self, b: (usize, usize, usize, usize)) -> bool {
@@ -15739,7 +15739,7 @@ impl OccRows {
 ///
 /// ### OCC62 M2 — THE FURNITURE ARM IS ON BOTH ARCHES, ON THE FURNITURE FAMILY'S OWN GATE
 ///
-/// The arm is `any(all(x86_64, wc), all(aarch64, pidesk))` — the identical gate `video/mod.rs`
+/// The arm is `any(all(x86_64, wc), all(aarch64, desktop_firmware))` — the identical gate `video/mod.rs`
 /// declares `dock`, `strip`, `menubar` and `crystal` under. That is the whole justification and it
 /// is a tight one: the strips are admitted to the clip on exactly the boots that composite them
 /// onto the glass, so there is no boot where the clip reserves columns for furniture that is not
@@ -15789,10 +15789,10 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: u
         // ledger above: `composite_once` paints it after this whole loop has run.
         //
         // OCC62 M2 — and the FURNITURE arm now rides the SAME dual gate the furniture family
-        // itself carries (`video/mod.rs`: x86+`wc` OR aarch64+`pidesk`), so the strips are in the
+        // itself carries (`video/mod.rs`: x86+`wc` OR aarch64+`desktop_firmware`), so the strips are in the
         // clip on exactly the boots that put them on the glass. `dock`, `strip`, `menubar` and
         // `crystal` were already declared on that gate; this is the consumer catching up.
-        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
         {
             let rect = super::dock::Layout::for_panel(dock_tiles(rows), pw, ph).map(|l| l.rect());
             // WCK4-D1's lesson, restated on this side: the strip's geometry goes on the wire whether
@@ -16148,13 +16148,13 @@ fn erase_clip(pw: usize, ph: usize) -> (OccClip, usize) {
         // ERASECLIP M1 — the FURNITURE arm takes the FURNITURE FAMILY'S OWN dual gate, which is the
         // identical move `occ_clip`'s arm made under OCC62 M2 and for the identical reason: `dock`,
         // `strip`, `menubar` and `crystal` are declared in `video/mod.rs` under
-        // `any(all(x86_64, wc), all(aarch64, pidesk))`, so admitting their rects here on exactly that
+        // `any(all(x86_64, wc), all(aarch64, desktop_firmware))`, so admitting their rects here on exactly that
         // gate means the erase withholds strip columns on precisely the boots that composite strips
         // onto the glass. Off both knobs the arm is STRUCTURALLY absent — `super::strip` is never
         // named — and `pw`/`ph` are two arguments the build pays and cannot use.
         #[cfg(any(
             all(target_arch = "x86_64", feature = "wc"),
-            all(target_arch = "aarch64", feature = "pidesk")
+            all(target_arch = "aarch64", feature = "desktop_firmware")
         ))]
         {
             // STRIPFACTOR — EVERY registered furniture strip, from the registry, in one walk.
@@ -19664,7 +19664,7 @@ fn movevacate_selftest() {
 /// panel too small to drag across, no free row. `panel=`/`box=` are printed on the verdict line
 /// because the ratio is only interpretable beside them: the whole mechanism is "panel area becomes
 /// box area", so a reader who cannot see both cannot check the arithmetic.
-#[cfg(all(feature = "witness", target_arch = "aarch64", feature = "baremetal", feature = "pidesk"))]
+#[cfg(all(feature = "witness", target_arch = "aarch64", feature = "baremetal", feature = "desktop_firmware"))]
 pub fn dragperf_selftest() {
     let fb = *super::WRITER.lock();
     if !fb.is_ready() {
@@ -19883,7 +19883,7 @@ pub fn dragperf_selftest() {
 /// `target_arch = "aarch64"` is here for leg 1 and only leg 1: it drives
 /// `arch::aarch64::syscall::wc_click_route`, the shipped Pi router, because a fixture that called
 /// `drag_begin` directly would prove the window layer and leave the press path untested — the exact
-/// shape of witness DRAG-PI M4 was sent to fix. `baremetal`/`pidesk` are the knobs that name the
+/// shape of witness DRAG-PI M4 was sent to fix. `baremetal`/`desktop_firmware` are the knobs that name the
 /// desktop it presses on. The MECHANISM under test is arch-neutral (`wm.rs`, reached identically by
 /// x86's router), so this gate scopes the fixture's press, not the cure.
 ///
@@ -19893,7 +19893,7 @@ pub fn dragperf_selftest() {
     feature = "witness",
     target_arch = "aarch64",
     feature = "baremetal",
-    feature = "pidesk"
+    feature = "desktop_firmware"
 ))]
 pub fn dragwedge_selftest() {
     use core::sync::atomic::Ordering::Relaxed;
@@ -20295,7 +20295,7 @@ fn closeiso_selftest() {
     // says so in its own doc comment**: *"down, but the owner still has another window above the
     // shell, so it keeps rendering. Not an error: minimise is a WINDOW gesture and hiding is an OWNER
     // property."* This fixture mints `wk` in the `KERNEL_OWNER_CONSOLE` band, and on the armed Pi
-    // desktop `pidesk::activate` has ALREADY minted a real window in that same band — so the owner
+    // desktop `desktop_firmware::activate` has ALREADY minted a real window in that same band — so the owner
     // legitimately keeps a window up, `minimise` returns `parked-visible`, `owner_hidden` answers
     // false, and the leg reported `park=parked-visible/0x2d2b55/false` for machinery that did exactly
     // what it promises.
@@ -20593,10 +20593,10 @@ fn desktop_owns(x: usize, y: usize) -> bool {
 /// come back as THAT WINDOW."* DECRUD-4 states the complement as a separate leg; this states it as
 /// the rule the vacate legs themselves keep.
 ///
-/// It became load-bearing when the Pi grew a desktop. `pidesk::activate` mints the console window at
+/// It became load-bearing when the Pi grew a desktop. `desktop_firmware::activate` mints the console window at
 /// the GUI handoff — `[wc-x] console-window win=1 … box=570x396 at (35,4)` — which on the 640x480
 /// gate panel covers `x 35..605, y 4..400`, i.e. 89 % by 82 % of the glass, and the boot witness
-/// cascade then places its probe windows INSIDE it. `pidesk.rs` records the collision as a standing
+/// cascade then places its probe windows INSIDE it. `desktop_firmware.rs` records the collision as a standing
 /// one ("a standing conflict left for the integrator"). Under the old rule the legs read
 /// `close_desktop=false (0/5)`, `old_desktop=false (0/3)` — five and three CORRECT repaints reported
 /// as five and three failures, because the console window under them was faithfully redrawn and the
@@ -21781,7 +21781,7 @@ fn clickshell_windowless_leg(asid: u64) -> Option<bool> {
     // window: that is the HIT arm, not the desktop arm"). Leg 7 inherited every other part of that
     // fixture and not this one, which was invisible for as long as panel centre was empty.
     //
-    // The armed Pi desktop makes it visible: `pidesk::activate` mints the console window over
+    // The armed Pi desktop makes it visible: `desktop_firmware::activate` mints the console window over
     // `x 35..605, y 4..400` of a 640x480 panel and the headless gate parks the cursor at panel
     // CENTRE, i.e. inside it. The press is then a legitimate HIT, the router correctly declines to
     // treat it as a desktop click, and the leg reported `bare=false` — the fixture's own precondition
@@ -22212,7 +22212,7 @@ pub fn hittest_selftest() {
     // made them hittable, and that invariant died with it — on the rMBP's 2880x1800 panel the console
     // window is 1314x750 centred at (783,444) and swallows the whole upper-middle quadrant this
     // fixture probes, which is why the s50 bench boot read `outside=false` while the QEMU gate (no
-    // Kepler takeover, so `wcx::activate` never runs and neither furniture row exists) kept reading
+    // Kepler takeover, so `desktop_uefi::activate` never runs and neither furniture row exists) kept reading
     // `outside=true`. The sibling `clickroute_selftest` was written IN that arc and already finds its
     // desktop point this way; this witness predates it, which is the whole of the difference.
     //
@@ -22421,7 +22421,7 @@ pub fn focus_reset() {
 ///
 /// A SNAPSHOT, never a handle, on [`info`]'s rule: re-read it after any mutating call. The caption is
 /// copied rather than borrowed because the table lock is released before the dock draws anything.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 #[derive(Clone, Copy)]
 pub struct DockEntry {
     /// Window id (`1..=MAX_WINDOWS`).
@@ -22440,7 +22440,7 @@ pub struct DockEntry {
     pub focused: bool,
 }
 
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 impl DockEntry {
     /// A zeroed entry, for the caller's scratch array.
     pub const fn empty() -> Self {
@@ -22476,7 +22476,7 @@ impl DockEntry {
 ///
 /// Cost and locks: one `TABLE` acquisition, one bounded `MAX_WINDOWS` scan, no allocation, no nested
 /// lock, no new lock order — [`focus_ring`]'s and [`occluders`]'s shape exactly.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn dock_scan(
     out: &mut [DockEntry; MAX_WINDOWS],
     rect: (usize, usize, usize, usize),
@@ -22530,7 +22530,7 @@ pub fn dock_scan(
 /// path that cannot take `dock_scan`'s `TABLE` lock. A predicate copied into that path would have
 /// been a second definition of which windows the strip is sized by — free to drift, and drifting
 /// silently, since the two would only disagree about the strip's WIDTH.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 #[inline]
 fn dock_addressable(r: &Window) -> bool {
     r.used && !r.compat && r.owner_asid != 0
@@ -22543,7 +22543,7 @@ fn dock_addressable(r: &Window) -> bool {
 /// acquisition would be both a cost and a fresh interleave in a loop that deliberately takes none
 /// (see its ledger). The snapshot is also the RIGHT input — it is the geometry this pass is drawing
 /// against, and the count `dock::compose` will reach at the tail of the same pass.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn dock_tiles(rows: &[Window; MAX_WINDOWS]) -> usize {
     let n = rows.iter().filter(|r| dock_addressable(r)).count();
     // SHELLPIN (integrator, GR27) — mirror `dock::pin_shell`: with no live KERNEL_OWNER_DESKTOP

@@ -368,7 +368,7 @@ geometry: the repair is structural and its firing is metal-owed.
 
 ### 5.5d BRINGUP-PAINT — read the paint back, do not infer it
 
-`pidesk::activate`'s step 5 printed `menubar PAINTED` from its own control flow — the inference the same
+`desktop_firmware::activate`'s step 5 printed `menubar PAINTED` from its own control flow — the inference the same
 function already refuses two steps above for `fbcon::console_is_routed`. `strip::paint` declines without
 touching a pixel on a contended `SCRATCH` (the dock is tenant #1 and takes the same scratch in the same
 pass) or on a surface that is not yet `word4`, and the bar is then left ENABLED — so
@@ -381,7 +381,7 @@ and re-runs once; the line carries `owns_pixels=` and `retried=`.
 `crystal::selftest`, `dock::selftest` and `menubar::selftest` are all invoked from
 `arch/x86_64/syscall.rs`. **No aarch64 boot had ever run one**, so the whole furniture family was
 unwitnessed on the arch it had just been ported to. `crystal::routed_selftest` (`:: SHARD-PRESS:`) is
-invoked from `video/pidesk.rs` — the only Pi point where the bar is known enabled and painted, and a
+invoked from `video/desktop_firmware.rs` — the only Pi point where the bar is known enabled and painted, and a
 file that is *not* compiled knob-off, so §5.3's line-neutral rule does not reach it
 (`arch/aarch64/syscall.rs` is compiled knob-off, which is why the call is not there). It drives
 `strip::press_route`, the live shared router core both arch routers call, and asserts `painted=` — the
@@ -515,7 +515,7 @@ and the fix, that one carries the bench evidence that motivated them. Nothing ou
 overlaps.)*
 
 **THE FINDING (exec-deskreal `b01feaa1`, off three metal boots + the PA44 capture
-`~/unaos-bench/capture/pi4-pi1-b1/ttyACM0.log`).** `video::pidesk::arm()` — the only writer of
+`~/unaos-bench/capture/pi4-pi1-b1/ttyACM0.log`).** `video::desktop_firmware::arm()` — the only writer of
 `ARMED`, and hence the gate on the shell-window mint, on `pal.clear_screen(DESKTOP_BG)` and on
 `retire_desktop_chrome` — has never executed on Pi hardware. It sits one statement after
 `wcb_launcher` inside `u7_launcher`, on the `u7-launch` task, and on metal the task is killed
@@ -1376,7 +1376,7 @@ three introduced — all three did was make it visible, louder, and unavoidable.
 `fbcon::_print` on x86 returns at its FIRST test unless `bootlog` or `PANEL_CONSOLE` is set, so a `wc`
 desktop is **never** mirrored to. aarch64 has no such gate: the whole serial stream paints the panel,
 from every core, until `GUI_ACTIVE`. Harmless while the Pi's glass *was* the console. Not harmless
-from the line `pidesk::activate` clears the panel to `DESKTOP_BG` and starts compositing onto it —
+from the line `desktop_firmware::activate` clears the panel to `DESKTOP_BG` and starts compositing onto it —
 from there until `panel_console_window_open` installs the glyph route there are **two writers on the
 same pixels**, and the compositor is the quiet one:
 
@@ -1412,7 +1412,7 @@ of this class (pi4-regression.spec, THE RESIDUE) reads `got=0xc0c0c0`.
 
 ### 6.9c DESKHOLD — the fix, and where it is *not*
 
-`fbcon::panel_mirror_hold(true)` is armed by `pidesk::activate` in the same block as the DESKTOP-CLEAR
+`fbcon::panel_mirror_hold(true)` is armed by `desktop_firmware::activate` in the same block as the DESKTOP-CLEAR
 that takes the glass. Held, `_print` charges the tap `suppressed` and returns **before it touches the
 console lock at all**; serial is untouched. It lifts by construction the moment `CONSOLE_WIN` is
 installed — from there `draw_fb()` is the window's surface and there is no panel write left to hold —
@@ -1422,7 +1422,7 @@ appended at `fbcon.rs`'s existing APPEND-ONLY TAIL.
 
 Two things this deliberately does **not** do. It does not touch a witness: `wcf.rs` and `wm.rs` are
 byte-identical to the merge tip, so every go-red path is the one CHROMESPEC proved. And it does not
-reach the residue class `pidesk.rs` already names and assigns — *"a console that presents from
+reach the residue class `desktop_firmware.rs` already names and assigns — *"a console that presents from
 arbitrary print context is an unsynchronised compositor client"*. After the route install fbcon writes
 the console window's **surface** from print context while the compositor blits and checksums it, which
 is what still produces the odd `[wc-g] win=1 … -> COHER` and, less often, a `[wc-d] verify win=1`
@@ -1670,7 +1670,7 @@ lesson: a census greps attributes, and a disclosure is not an attribute either.
 
 ### 6.12 The `exec-livecon` arc — the console window's text is LIVE, and it presents from the render core
 
-**What was owed.** CONSWIN-PI gave the Pi a console window and then, in `video/pidesk.rs`'s
+**What was owed.** CONSWIN-PI gave the Pi a console window and then, in `video/desktop_firmware.rs`'s
 live-console ledger, recorded the one thing it could not deliver: the window is a **frozen boot-log
 snapshot**. Keeping it live was implemented, measured at bench geometry, and reverted — a 108/108 run
 became **97/108 with 37 forbidden hits and a synchronous exception**. That ledger also named the
@@ -1709,7 +1709,7 @@ port leans on. Three statements:
    `fbcon::console_service()`, the hook x86's `usbdebug` loop has called since FBCON-PACE. This arc
    gives that hook its **second caller** rather than inventing a second mechanism. Also a LINE-NEUTRAL
    fold, into `main.rs`'s `let t0 = …` line.
-3. **`pidesk::activate` therefore returns `routed`**, so the GUI handoff's existing
+3. **`desktop_firmware::activate` therefore returns `routed`**, so the GUI handoff's existing
    `if !pidesk_activate_maybe() { detach(); }` guard skips the detach and `_print` keeps reaching the
    window's surface for the rest of the boot. The arming of the deferral is at the **tail** of
    `activate`, which is load-bearing: everything `activate` itself printed reached the window inline,
@@ -1733,7 +1733,7 @@ pass, a `console_flush`, or `detach`'s sync point — carries them.
 
 `render_service` blocks on `GUI_CHANNEL.recv()`, so a line printed by a core that generates no GUI
 event waits for the next pass. The floor on that is the strip pulse's `ui_status::PSTRIP_PERIOD_MS`
-timer — the same free wake `pidesk::armed()` rides. **The console is live at the pulse rate at worst
+timer — the same free wake `desktop_firmware::armed()` rides. **The console is live at the pulse rate at worst
 and immediately on interaction at best; it is not a 60 Hz console.** Adding a wake from print context
 would put channel traffic back on the very path this arc is taking work off, which is how the reverted
 cut failed.
@@ -1741,7 +1741,7 @@ cut failed.
 #### ONE OS: the gate is `feature = "livecon"`, never `target_arch`
 
 Every gate this arc adds is the knob and nothing else. On x86 the latch exists and is simply never
-armed (`wcx::activate` does not call `console_present_defer`), so the `wc` desktop and the `usbdebug`
+armed (`desktop_uefi::activate` does not call `console_present_defer`), so the `wc` desktop and the `usbdebug`
 bench lane are byte-unchanged — and x86's own desktop lane, which ships the same frozen snapshot for
 the same reason, is **one call site** from the same fix whenever that arc wants it.
 
@@ -1805,7 +1805,7 @@ Two residues named honestly rather than averaged away:
 #### What is still OWED after this arc
 
 1. **x86's desktop lane still freezes its console**, and now for no reason but a missing call:
-   `wcx::activate` needs the same `console_present_defer(true)` and `x86_render_service` the same
+   `desktop_uefi::activate` needs the same `console_present_defer(true)` and `x86_render_service` the same
    `console_live_service()` line. Deliberately not taken here — the lane, the files and the gate are
    x86's, and this is a Pi-track arc.
 2. **The default is still the frozen snapshot.** The knob exists because the fixed *shape* is argued
@@ -2060,7 +2060,7 @@ lines:
 | `livecon` 4 | 305 | 333 | 338 |
 | `livecon` 5 | 305 | 327 | 338 |
 
-The arming is at the tail of `pidesk::activate` **by design** (§6.12: "the last instant that is still
+The arming is at the tail of `desktop_firmware::activate` **by design** (§6.12: "the last instant that is still
 single-core through this seam"). `wc-g`'s budget for this window is gone by then. **The knob cannot
 move this red because the instrument has already gone dark when the knob takes effect.**
 
@@ -2129,7 +2129,7 @@ interval.
 **Where the census can and cannot fire — verified this arc, not assumed.** On tegra it cannot
 COMPILE (both fbcon charge sites lack a tegra arm — rmbp 6's finding, re-verified). On x86 QEMU it
 compiles (`strings` shows `[wcgseam] win=`, `GLYPH-RASTER`, `QUIET-BRACKET` in the image) but cannot
-FIRE: `:: kepler: no-device ::` → `wcx::activate` never runs (its sole caller is the Kepler
+FIRE: `:: kepler: no-device ::` → `desktop_uefi::activate` never runs (its sole caller is the Kepler
 takeover) → `panel_console_window_open` never runs → `CONSOLE_WIN` stays `WIN_NONE` → the charge
 sites' `routed` guards never pass → `SEAM_WIN` stays 0 and the print's `p.id == SEAM_WIN` gate is
 unsatisfiable. A `UNAOS_WC=1 UNAOS_KEPLER=1 UNAOS_KEPLER_TAKEOVER=1 ./arroyo test 150` boot
@@ -2290,11 +2290,11 @@ arch-specific / (d) in flight.
 > the headline and the seam.
 
 The window manager IS on this branch. `wm.rs` (20 652 lines) arrived with the
-WC-A…WC-K series at `51d03376`; `pidesk.rs` at `0750e011`; both are ancestors of
+WC-A…WC-K series at `51d03376`; `desktop_firmware.rs` at `0750e011`; both are ancestors of
 HEAD (`git merge-base --is-ancestor`, verified 2026-08-22). `video/` carries the
 full family — `wm.rs`, `strip.rs`, `dock.rs`, `menubar.rs`, `crystal.rs`,
-`pulsewin.rs`, `pidesk.rs`, `quarry.rs` + `quarry/live.rs`, `cursor.rs`,
-`screen.rs`, `wcf.rs`, `wcg.rs`, `wcx.rs`, `theme.rs` — and the kernel
+`pulsewin.rs`, `desktop_firmware.rs`, `quarry.rs` + `quarry/live.rs`, `cursor.rs`,
+`screen.rs`, `wcf.rs`, `wcg.rs`, `desktop_uefi.rs`, `theme.rs` — and the kernel
 `Cargo.toml` carries `wc`, `wcg-paygo`, `pidesk`, `quarry` and `livecon`.
 
 What is still true is the panel. Boot log on fbcon, then the JD2 full-screen
@@ -2340,7 +2340,7 @@ What the desktop knob needs from this seam: nothing new. The seam already yields
 base/len/pitch/format through the same `PixelFormat` contract `wm`/`fbcon`
 consume on the Pi. Lighting the desktop on Orin =
 1. ~~take the base sync (brings `wm.rs` and the whole video stack)~~ — **DONE at
-   `ceaa32b8`.** `wm.rs` (`51d03376`) and `pidesk.rs` (`0750e011`) are both
+   `ceaa32b8`.** `wm.rs` (`51d03376`) and `desktop_firmware.rs` (`0750e011`) are both
    ancestors of HEAD; see §8.0's correction. Steps 2–4 are the whole remaining
    job, which is why this is a short arc and not a long one.
 2. add `pidesk` to the tegra build recipe — note the knob class: `pidesk`/
@@ -2363,7 +2363,7 @@ consume on the Pi. Lighting the desktop on Orin =
 Two blockers sit *between* steps 2 and 3 and are not visible from this list;
 they are stated with evidence in [`orin-desktop.md`](orin-desktop.md) §3. In
 short: `tegra_early_stop` (`main.rs:1902`) is `-> !` and diverges before
-`kernel_main` ever reaches `pidesk::activate()` (`main.rs:6240`), so the seam
+`kernel_main` ever reaches `desktop_firmware::activate()` (`main.rs:6240`), so the seam
 must attach to the tegra flow; and `wm::reserve_stage` (`video/mod.rs:278`) is
 called only from `init_panel`, which the tegra path skips, so the compositor's
 staging buffer is never allocated.

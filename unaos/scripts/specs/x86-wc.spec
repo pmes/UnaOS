@@ -17,7 +17,7 @@
 # SCOPE — a `UNAOS_WC=1 ./arroyo test` boot and nothing else. `wc` gates the fixture's cfg and the
 # console-window routing, NOT the whole video stack; without the knob the fixture does not compile
 # and every line below is red. The plain `./arroyo test` run is x86-witness/x86-fat territory and
-# is deliberately NOT asserted here. QEMU has no Kepler, so `wcx::activate` never runs — the
+# is deliberately NOT asserted here. QEMU has no Kepler, so `desktop_uefi::activate` never runs — the
 # fixture drives `wm::` directly from the witness ladder and needs no kepler knob; the METAL
 # compositor path stays the bench's business (x86-witness.spec).
 #

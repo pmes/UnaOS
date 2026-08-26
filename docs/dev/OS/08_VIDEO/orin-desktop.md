@@ -43,7 +43,7 @@ produced the headline this document corrects:
 | Hit-test / focus primitives | `wm::hit_test` `video/wm.rs:2434`, `wm::focus_changed` `:2514` | ✅ | ✅ — **no `#[cfg]` on either** | ⚠ called only from `orin_click`, i.e. only on a click that has not yet happened (§3.8) | ❌ no click has reached the router |
 | Click router | `arch/aarch64/syscall.rs::wc_click_route` | ✅ | ✅ ungated within its module | ⚠ **has a caller since rung 3, behind `orinclick` (DEFAULT OFF)** — `orin_click` → `bl wc_click_route`, proven by disassembly | ⚠ **FLOWN AND ARMED, ROUTE UNTESTED** — boot7f carried the knob and printed `-> ARMED`, but no click was made (§3.8) |
 | Dock / strip / menubar / crystal | `video/dock.rs`, `strip.rs`, `menubar.rs`, `crystal.rs` | ✅ | ❌ gated `any(all(x86_64, wc), all(aarch64, pidesk))` — `video/mod.rs:97, 105, 115, 125` | ❌ | ❌ |
-| Desktop-ready seam | `video/pidesk.rs` (564 lines) | ✅ | ❌ gated `all(aarch64, pidesk)` — `video/mod.rs:413` | ❌ and structurally unreachable (§3.1, §3.2) | ❌ |
+| Desktop-ready seam | `video/desktop_firmware.rs` (564 lines) | ✅ | ❌ gated `all(aarch64, pidesk)` — `video/mod.rs:413` | ❌ and structurally unreachable (§3.1, §3.2) | ❌ |
 | Quarry (file browser) | `video/quarry.rs`, `video/quarry/live.rs` | ✅ | ❌ gated as the furniture — `video/mod.rs:441` | ❌ | ❌ |
 | Panel / inherited scanout | `arch/aarch64/display_tegra.rs`, `jd1_survey` at `:95` | ✅ | ✅ `feature = "tegra"` | ✅ | ✅ JD1 |
 | Framebuffer + `WRITER` handle | `video/framebuffer.rs`, seeded `main.rs:2016` | ✅ | ✅ | ✅ | ✅ JD2 |
@@ -63,7 +63,7 @@ The three rows that matter most:
    the lib.
 2. **The furniture's aarch64 arm is arch-generic, not Pi-specific.** The
    predicate is `all(target_arch = "aarch64", feature = "pidesk")` — no `pi`, no
-   `baremetal`, no BCM2711. `video/pidesk.rs`'s body touches no VideoCore mailbox
+   `baremetal`, no BCM2711. `video/desktop_firmware.rs`'s body touches no VideoCore mailbox
    and no BCM2711 register; its floors are panel geometry and dock capacity, both
    board-neutral.
 3. **Input is proven and unrouted.** Keyboard and pointer both reach the pump on
@@ -105,7 +105,7 @@ written on the Pi track, for an aarch64 panel, and x86 was added afterwards.
 | It entered trunk through the Pi parent | `c4b913cf`, `Merge hw-pi4 window-compositor arc to main (wc-op1, Peter-approved)`. `51d03376` is an ancestor of the second (hw-pi4) parent `3cad6111` and **not** of the first parent `8e9720c2` — it did not exist on main before that merge |
 | It had no arch gating at birth | `git show 51d03376:…/wm.rs` contains zero hits for `aarch64`/`x86`/`target_arch`/`cfg(` — it was written against the single Pi kernel build. Its module doc names the **HVS** (the BCM2711 Hardware Video Scaler) and "EL0", an ARM exception level |
 | x86 arrived later, inside `wm.rs` | First commit introducing `target_arch` into `wm.rs`: `95b46fdf` (WC-D, 2026-07-25). First introducing the string `x86`: `cdb00b02` (2026-07-26) |
-| `pidesk.rs` was created by `0750e011` | `video: CONSWIN-PI / MENUBAR-PI M1 — the console gets a window and the bar gets turned on`, 2026-08-13, +226 lines |
+| `desktop_firmware.rs` was created by `0750e011` | `video: CONSWIN-PI / MENUBAR-PI M1 — the console gets a window and the bar gets turned on`, 2026-08-13, +226 lines |
 | Both are ancestors of HEAD | `git merge-base --is-ancestor 51d03376 HEAD` → yes; same for `0750e011` |
 
 Direction is **aarch64 → x86**. The Orin is not importing foreign code; it is
@@ -128,12 +128,12 @@ none is discoverable from the feature list alone.
 ```
 main.rs:1902   fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
 main.rs:190        tegra_early_stop(boot_info);
-main.rs:6240       unaos_kernel::video::pidesk::activate()
+main.rs:6240       unaos_kernel::video::desktop_firmware::activate()
 ```
 
 `tegra_early_stop` is declared `-> !` and diverges. It is entered at `main.rs:190`
 and never returns, so `kernel_main` never runs on the Orin — and
-`pidesk::activate()` at `main.rs:6240` sits on the `kernel_main` path, behind the
+`desktop_firmware::activate()` at `main.rs:6240` sits on the `kernel_main` path, behind the
 `fbcon::detach()` handoff at `main.rs:1316`. The code in `main.rs` already knows
 this and says so at `main.rs:2018`: "`tegra_early_stop` diverges before
 `kernel_main` step 3 ever runs".
@@ -147,7 +147,7 @@ the *call* is not enough; the arming point has to be chosen inside
 ```
 main.rs:6238   #[cfg(all(target_arch = "aarch64", feature = "pidesk", feature = "baremetal"))]
 main.rs:6239   fn pidesk_activate_maybe() -> bool {
-main.rs:6240       unaos_kernel::video::pidesk::activate()
+main.rs:6240       unaos_kernel::video::desktop_firmware::activate()
 main.rs:6241   }
 main.rs:6246   #[cfg(all(target_arch = "aarch64", not(all(feature = "pidesk", feature = "baremetal"))))]
 main.rs:6248   fn pidesk_activate_maybe() -> bool { false }
@@ -193,7 +193,7 @@ boot, and declines with a named reason. It does **not** arm the desktop.
 
 **The gate.** `tegradesk = ["pidesk", "tegra_el0"]` — it IMPLIES rather than
 standing alone, unlike `orindesk`/`jd1dc`/`smpmark`, and that is the rung's own
-lesson rather than a convenience. The seam calls `video::pidesk::activate`
+lesson rather than a convenience. The seam calls `video::desktop_firmware::activate`
 (`#[cfg(all(aarch64, pidesk))]`), and `pidesk` on aarch64 needs
 `arch::aarch64::syscall` via `dock::focus_set`, gated `any(baremetal,
 tegra_el0)` — `baremetal` being unsatisfiable here by §3.2's chain, the only
@@ -253,9 +253,9 @@ recorded because neither was visible in the diff or in `./arroyo check`.**
 
 **The stop-line is enforced by CODEGEN, not merely by a runtime test** — a
 stronger statement than intended and worth recording. `llvm-nm` finds no
-`pidesk::activate` symbol in the armed image and `llvm-objdump -d` finds no
+`desktop_firmware::activate` symbol in the armed image and `llvm-objdump -d` finds no
 reference to it anywhere: because both consts are `false` in source, the armed
-branch is eliminated before linking. `pidesk::activate()`'s call is therefore
+branch is eliminated before linking. `desktop_firmware::activate()`'s call is therefore
 type-checked **only** by the `arm-tegra-seam` leg, which is exactly what that leg
 is for.
 
@@ -283,7 +283,7 @@ of this repo.)
   (`awk '/deskseam/'` → 0 lines). It is a no-regression gate, not a witness.
 - **`arm-tegra-seam` proven to GO RED**, because a leg that has never gone red is
   not evidence. Renaming the seam's central call
-  (`pidesk::activate()` → `pidesk::activate_now()`) and re-running the gate reds
+  (`desktop_firmware::activate()` → `desktop_firmware::activate_now()`) and re-running the gate reds
   **exactly one leg**:
 
   ```
@@ -353,8 +353,8 @@ of this repo.)
 
 **NOT done by this rung, deliberately:**
 
-- **`pidesk::activate()` has not run and cannot run on this branch.** The rung-2
-  row in §6 gave its metal witness as "`pidesk::activate()` runs on an Orin boot
+- **`desktop_firmware::activate()` has not run and cannot run on this branch.** The rung-2
+  row in §6 gave its metal witness as "`desktop_firmware::activate()` runs on an Orin boot
   and its floors print their verdicts". Those are two different claims and only
   the second is achievable now: `activate()` opens the console window (rung 4)
   and enables the menu bar (furniture), so running it crosses **both** §6.1's
@@ -639,7 +639,7 @@ been a knob that compiles *nothing* unless the operator separately guessed
 `quarry::open()`, which is what boot 11 overflowed the 16 KiB stack on, *at click-router
 depth on the input-drain task* — i.e. exactly this call stack. What remains is the window
 half: `hit_test`, the three control-disc arms, `focus_changed`, `user_input_set_active`. No
-dock, no strip, no menubar, no crystal, no `render_service`, no `pidesk::activate`.
+dock, no strip, no menubar, no crystal, no `render_service`, no `desktop_firmware::activate`.
 
 Checked in the artifact rather than argued. `orin_click` (`0x100da0`–`0x1013e0` in the armed
 jetson kernel) contains **exactly five `bl` targets**, and this is the whole list:
@@ -1173,7 +1173,7 @@ const is `false`.
 
 `detach` sets `GUI_ACTIVE`, after which `fbcon::_print` returns at its first test. A console window
 opened at the terminus and then detached at phase 2 would hold the boot log and never change again —
-the frozen snapshot `wcx.rs` ships on x86. The Orin does not inherit it, for the Pi's reason: the
+the frozen snapshot `desktop_uefi.rs` ships on x86. The Orin does not inherit it, for the Pi's reason: the
 REASON for the detach is discharged by the route itself. A routed console does not write the panel
 (`FbCon::draw_fb` hands back `win_fb`), so "exactly one writer on the panel" is already true.
 Codegen, in the armed `kernel.elf` inside `jd2_console_pump`:
@@ -1199,7 +1199,7 @@ metal measurement**, and this rung does not claim otherwise.
 
 #### The §5.2 stop-line is NOT crossed
 
-`pidesk::activate()` is not called. Rung 4 takes exactly the two steps of `activate`'s sequence the
+`desktop_firmware::activate()` is not called. Rung 4 takes exactly the two steps of `activate`'s sequence the
 console window needs — 2a FONT-PI, 2-3 CONSOLEWIN — and none of the rest: no PIDESK DESKTOP-CLEAR,
 no `menubar::set_enabled`, no crystal, no `render_service`, no window population.
 `TEGRADESK_CASCADE_OK` was not touched. `quarry` is not implied, so `quarry::open()` — boot 11's
@@ -1916,7 +1916,7 @@ independent confirmation of `[orindock]`'s verdict from the dock's OWN counters.
   `fbcon.rs` are textually untouched, so the `hw-rmbp` sync meets no conflict from this arc.
 * **No behaviour.** No new control, no new routing arm, no pixel path. If the round trip does not work
   on metal, this rung did not break it and cannot fix it — it can only say so.
-* **No rung 5.** No furniture arming, no `pidesk::activate()`, no tegra `render_service`; §5.2 is
+* **No rung 5.** No furniture arming, no `desktop_firmware::activate()`, no tegra `render_service`; §5.2 is
   untouched and `TEGRADESK_CASCADE_OK` is not read.
 * **No timed verdict.** `FAIL reason=park-no-tile` is structural (the tile model, asked at the moment
   of the park). There is deliberately no "the operator took too long" arm: a slow hand must never
@@ -1936,7 +1936,7 @@ recorded first.
 
 #### What was actually wrong
 
-`tegra_desk_arm` — rung 2's DESKSEAM (§3.2.1) — *already* calls `pidesk::activate()`
+`tegra_desk_arm` — rung 2's DESKSEAM (§3.2.1) — *already* calls `desktop_firmware::activate()`
 from `tegra_early_stop`'s terminus line, and has since 2026-08-25. It is wired, it is
 reached, and it **refuses**, because `TEGRADESK_CASCADE_OK` is a literal `false` in
 source and §5.2 says it stays that way until someone can show this board's own
@@ -1945,8 +1945,8 @@ wire. It was a stop-line doing its job, and the operator could not tell the two 
 from the panel.
 
 Beneath that, the narrower fact: `menubar::ENABLED` starts `false`, and this tree has
-exactly **two** `menubar::set_enabled(true)` calls — `video/wcx.rs:552` (x86_64-only)
-and `video/pidesk.rs:292` (inside `activate()`). Neither is reachable on tegra. The
+exactly **two** `menubar::set_enabled(true)` calls — `video/desktop_uefi.rs:552` (x86_64-only)
+and `video/desktop_firmware.rs:292` (inside `activate()`). Neither is reachable on tegra. The
 bar was compiled, composed on every pass, and permanently invisible.
 
 #### ⚠ A finding about the stop-line itself
@@ -1982,7 +1982,7 @@ argument DESKSEAM states), and the bar's own geometry floor (`menubar::strip_rec
 `menubar::owns_pixels()`, never inferred from having called `composite`.
 
 **One deliberate divergence from `pidesk`, flagged for the bench:** on a declined
-composite this seam **rolls `ENABLED` back**, where `pidesk::activate` reports the miss
+composite this seam **rolls `ENABLED` back**, where `desktop_firmware::activate` reports the miss
 and leaves the bar on. On this board an enabled-but-unpainted bar is a permanent dead
 band across the top of the JD2 console — `Screen::present_background` subtracts its
 rect on every present and no damage condition can notice. Only a bench boot can say
@@ -1990,7 +1990,7 @@ which behaviour is right here.
 
 #### Why §5.2 is NOT crossed
 
-* `pidesk::activate()` is not called; `TEGRADESK_CASCADE_OK` is not read or written.
+* `desktop_firmware::activate()` is not called; `TEGRADESK_CASCADE_OK` is not read or written.
   Rung 5 remains blocked and DESKSEAM still prints `REFUSE reason=stop-line-5.2`.
 * `orinfurn` does not imply `quarry`, so `quarry::open()` — Pi boot 11's actual 16 KiB
   overflow, at click-router depth — is the `not(feature = "quarry")` stub. Same fact
@@ -2039,9 +2039,9 @@ rather than on a bench boot.
 #### What this rung deliberately did NOT do
 
 * **No `video/` edit of any kind.** `menubar.rs`, `strip.rs`, `crystal.rs`, `dock.rs`,
-  `wm.rs` and `pidesk.rs` are textually untouched; every symbol is consumed through its
+  `wm.rs` and `desktop_firmware.rs` are textually untouched; every symbol is consumed through its
   existing public accessor.
-* **No rung 5.** No `pidesk::activate()`, no DESKTOP-CLEAR, no tegra `render_service`,
+* **No rung 5.** No `desktop_firmware::activate()`, no DESKTOP-CLEAR, no tegra `render_service`,
   `TEGRADESK_CASCADE_OK` untouched.
 * **UNFLOWN, and this is the whole of what is owed.** No Orin has booted an `orinfurn`
   image. Unproven on metal: that the bar paints at all; that it paints at 1920x1200 rather
@@ -2250,10 +2250,10 @@ names the seat that owns the files under the parallel-arc rules in `CLAUDE.md`.
 | --- | --- | --- | --- | --- |
 | **0** | **One composited window** — ✅ **LANDED, FLOWN, and CLOSED ON BOTH HALVES 2026-08-25** (§3.8, §3.8.1) | call `wm::reserve_stage` on the tegra path after heap init (§3.3); mint one `wm` row; present it. No furniture, no `pidesk`, no cascade | **wire half CLOSED**: boot7f, capture line 11110 (and again boot7g, capture line 12679), `[orinwm1] win=1 panel=1920x1200 surf=640x400 box=650x444 at (635,378) scale=1 stage=4194304 present=Composited -> COMPOSITED`. **On-glass half CLOSED**: boot7g, capture line 12686, `[orinchrome] win=1 box=650x444 at (635,378) frame=6/6 content=0xff00ff@(960,617) MATCH … -> CHROME-ON-GLASS` — six frame probes and the content probe read back out of the scanout at panel coordinates, all MATCH. ⚠ **at composite time**: the operator measured that the JD2 console blit overdraws the body between composites (§3.8.1), which is rung 4's problem, not rung 0's | jetson |
 | **1** | **The cfg leg** — ✅ **LANDED 2026-08-22, less `quarry`** (§3.5.1) | `arm-tegra-desk` leg added (gate 18 → 19 legs); `pidesk`/`quarry`/`livecon` mapped in arroyo's env map; two of the three gate mismatches fixed | `UNAOS_TEGRA=1 ./arroyo check` green 19/19, and green again under `UNAOS_TEGRA_EL0=1 UNAOS_PIDESK=1 UNAOS_LIVECON=1`; the new leg proven to go red on a re-introduced mismatch | jetson (arroyo + `arch/aarch64/syscall.rs`); the `quarry` line is a `video/` edit and is **held** in §3.5.2 |
-| **2** | **The desktop seam** — ✅ **LANDED 2026-08-25, and it REFUSES** (§3.2.1) | `tegradesk` feature + `main.rs::tegra_desk_arm` on `tegra_early_stop`'s terminus line + `UNAOS_TEGRADESK` env map + the `arm-tegra-seam` leg (11 → 12 board legs). The seam evaluates its floors and declines at two named stop-lines | **the floors half is UNFLOWN**: `[deskseam] floors …` + `REFUSE reason=…` print on an armed Orin boot, and nobody has taken one. **The `activate()` half is WITHDRAWN, not owed**: `pidesk::activate()` opens the console window and enables the bar, so running it crosses §6.1 *and* §5.2 — it belongs to rungs 3/5, and this row previously asked for something the same document forbids | jetson |
+| **2** | **The desktop seam** — ✅ **LANDED 2026-08-25, and it REFUSES** (§3.2.1) | `tegradesk` feature + `main.rs::tegra_desk_arm` on `tegra_early_stop`'s terminus line + `UNAOS_TEGRADESK` env map + the `arm-tegra-seam` leg (11 → 12 board legs). The seam evaluates its floors and declines at two named stop-lines | **the floors half is UNFLOWN**: `[deskseam] floors …` + `REFUSE reason=…` print on an armed Orin boot, and nobody has taken one. **The `activate()` half is WITHDRAWN, not owed**: `desktop_firmware::activate()` opens the console window and enables the bar, so running it crosses §6.1 *and* §5.2 — it belongs to rungs 3/5, and this row previously asked for something the same document forbids | jetson |
 | **3** | **Input routing** — ✅ **LANDED 2026-08-25 as a DEFAULT-OFF knob; FLOWN, ARMED, and ROUTING ON METAL** (§3.7, §3.8, §3.8.1) | `orinclick` (implies `tegra_el0`) wires `jd2_console_pump`'s `Event::Button` arm into `wc_click_route` (§3.4) and adds the `[orinclick]` instrument at the tail of `display_tegra.rs`. **⚠ HANDSHAKE WITH RUNG 2, DISCHARGED IN THIS ARC:** `main.rs`'s `TEGRADESK_CLICK_ROUTED` no longer reads `false` — it reads `cfg!(feature = "orinclick")`, **not** a literal `true`, because `tegradesk` does not imply `orinclick` and a hard `true` would assert a route back on an image that has none: the one-way trip re-entered through the constant meant to prevent it. `arm-tegra-seam` now carries `orinclick` so the assertion is type-checked. COMPILES: gate green 21/21 knob off and on; the new `arm-tegra-orinclick` leg proven to go red. No gate in this tree can boot it — QEMU models no Tegra234 | ✅ **DISCHARGED, boot7g 2026-08-25** (§3.8.1): `[clickroute] press hit asid=4294967042 win=1 (was 0) delivered` (capture line 13084) and `[orinclick] edge=press btn=0x01 at (1009,546) geom=yes hit=yes win=1 owner=0xffffff02 focus 0x0->0xffffff02 consumed=0 -> RAISED` (capture line 13085); release `-> RELEASE-DELIVERED` (13087); census `IDLE-NO-CLICKS -> ROUTING` (13089); a second press on the focused row `-> HIT-SAME` (13092), plus `CONSUMED` (13125), `MISS-SHELL` (13133) and `RELEASE-DROPPED` (13135). Six press/release pairs with `stuck=0 nogeom=0 dropped=0`. **The prior owed item — boot7f's armed-but-unclicked state (`-> ARMED`, capture line 11424, then 48 `IDLE-NO-CLICKS`) — is closed.** Still owed: nothing on the wire; stack cost on this path (§5) is still a Pi number | jetson |
-| **4** | **Console as a window** — ✅ **LANDED 2026-08-25 as a DEFAULT-OFF knob; FLOWN AND ROUTED the same day** (§3.9, §3.9.1) | `orinconwin` (implies `pidesk` + `tegra_el0`, and deliberately NOT `orindesk`/`orinclick`) calls the SHARED console-window machinery from `display_tegra::orin_conwin` on `tegra_early_stop`'s terminus line — `panel_console_face_arm` → `panel_console_window_open` → `console_is_routed` — and folds `jd2_console_pump`'s phase-2 `fbcon::detach()` to `if !tegra_conwin_live() { … }` so a routed console stays LIVE. **§6.1 IS NOW A BRANCH:** both ordering terms are read through `cfg!()` and an image missing either gets `[orinconwin] DECLINE reason=ordering-rule held=…` and NO window — measured on the artifact both ways. No `video/` edit; no `pidesk::activate()`, so §5.2 is untouched. Gate green 23/23 knob off and on; `arm-tegra-conwin` proven to go red; knob-off loadable image byte-identical | ✅ **DISCHARGED, boot7h 2026-08-25** (§3.9.1): `[orinconwin] gate … dock=GRANTED … orindesk=1 orinclick=1` (capture line 14828), then `[orinconwin] win=2 panel=1920x1200 cell=7x16 stage=4194304 table=2 present=Composited route=true live=LIVE -> ROUTED` (14833) with the `[wc-x] console-window / console-route first-paint / panic-fallback armed` trio beside it (14830–14832). The route stayed LIVE for a ~107-minute sitting — shell banner, keystroke echoes and verb output all landed through the window path; chrome clicks CONSUMED and the close control `REFUSED furniture` (14926–14927). **Still owed:** the dock round-trip (`presses=0` on every `[dock]` line — the minimise disc was never clicked) and a win=2 glyphs-on-glass read-back — ⚠ **both INSTRUMENTED 2026-08-25 under `orinladder`, both still UNFLOWN: see §3.11 for the two flight cards and every broken shape each one reads as** | jetson |
-| **5** | **The real desktop** — ⚠ **PARTIALLY LANDED 2026-08-26 as `orinfurn`: the MENU BAR half only** (§3.12) | the full row is unchanged: dock, strip, menubar, crystal armed; the full `pidesk` cascade; a tegra `render_service` (§3.6). What `orinfurn` takes is TWO of `activate`'s nine steps — `menubar::set_enabled(true)` + `wm::composite()` + the `owns_pixels` read-back — on the terminus line, DEFAULT OFF, with `pidesk::activate()` NOT called and `TEGRADESK_CASCADE_OK` NOT touched. The cascade, the DESKTOP-CLEAR, `crystal::routed_selftest`, window population and the render service are all still owed | the Orin comes up to a desktop. **`orinfurn`'s own half is UNFLOWN**: `[orinfurn] ARMED … -> BAR-ON-GLASS` and a crystal press consumed by the menu band are both Orin-metal verdicts nobody has taken | jetson — the CASCADE is still **blocked by §5.2**; ⚠ and see §3.12 for why §5.2's `[u7stk]` evidence requirement is *structurally unsatisfiable at the terminus* (`stk_probe` returns early with no current task), which is a defect in the stop-line's clearing condition, not a reason to step over it |
+| **4** | **Console as a window** — ✅ **LANDED 2026-08-25 as a DEFAULT-OFF knob; FLOWN AND ROUTED the same day** (§3.9, §3.9.1) | `orinconwin` (implies `pidesk` + `tegra_el0`, and deliberately NOT `orindesk`/`orinclick`) calls the SHARED console-window machinery from `display_tegra::orin_conwin` on `tegra_early_stop`'s terminus line — `panel_console_face_arm` → `panel_console_window_open` → `console_is_routed` — and folds `jd2_console_pump`'s phase-2 `fbcon::detach()` to `if !tegra_conwin_live() { … }` so a routed console stays LIVE. **§6.1 IS NOW A BRANCH:** both ordering terms are read through `cfg!()` and an image missing either gets `[orinconwin] DECLINE reason=ordering-rule held=…` and NO window — measured on the artifact both ways. No `video/` edit; no `desktop_firmware::activate()`, so §5.2 is untouched. Gate green 23/23 knob off and on; `arm-tegra-conwin` proven to go red; knob-off loadable image byte-identical | ✅ **DISCHARGED, boot7h 2026-08-25** (§3.9.1): `[orinconwin] gate … dock=GRANTED … orindesk=1 orinclick=1` (capture line 14828), then `[orinconwin] win=2 panel=1920x1200 cell=7x16 stage=4194304 table=2 present=Composited route=true live=LIVE -> ROUTED` (14833) with the `[wc-x] console-window / console-route first-paint / panic-fallback armed` trio beside it (14830–14832). The route stayed LIVE for a ~107-minute sitting — shell banner, keystroke echoes and verb output all landed through the window path; chrome clicks CONSUMED and the close control `REFUSED furniture` (14926–14927). **Still owed:** the dock round-trip (`presses=0` on every `[dock]` line — the minimise disc was never clicked) and a win=2 glyphs-on-glass read-back — ⚠ **both INSTRUMENTED 2026-08-25 under `orinladder`, both still UNFLOWN: see §3.11 for the two flight cards and every broken shape each one reads as** | jetson |
+| **5** | **The real desktop** — ⚠ **PARTIALLY LANDED 2026-08-26 as `orinfurn`: the MENU BAR half only** (§3.12) | the full row is unchanged: dock, strip, menubar, crystal armed; the full `pidesk` cascade; a tegra `render_service` (§3.6). What `orinfurn` takes is TWO of `activate`'s nine steps — `menubar::set_enabled(true)` + `wm::composite()` + the `owns_pixels` read-back — on the terminus line, DEFAULT OFF, with `desktop_firmware::activate()` NOT called and `TEGRADESK_CASCADE_OK` NOT touched. The cascade, the DESKTOP-CLEAR, `crystal::routed_selftest`, window population and the render service are all still owed | the Orin comes up to a desktop. **`orinfurn`'s own half is UNFLOWN**: `[orinfurn] ARMED … -> BAR-ON-GLASS` and a crystal press consumed by the menu band are both Orin-metal verdicts nobody has taken | jetson — the CASCADE is still **blocked by §5.2**; ⚠ and see §3.12 for why §5.2's `[u7stk]` evidence requirement is *structurally unsatisfiable at the terminus* (`stk_probe` returns early with no current task), which is a defect in the stop-line's clearing condition, not a reason to step over it |
 | **6** | **EL0 tenants** — ✅ **LANDED 2026-08-25 as the CRYSTAL-HD parity fix + a DEFAULT-OFF instrument knob; UNFLOWN** (§3.10) | the `SYS_WIN_*` surface needed NO new verb — the gap was `mmu_tegra_el0.rs` carrying the pre-CRYSTAL-HD FB geometry (128x128 cap, 0x1_0000 slot stride), which refused the shipped vug's `SYS_WIN_CREATE(288,288)` with `-EINVAL` and mis-mapped the WC-B fixture's slot 1. Parity restored (4 slots x 0x51000, 288x288, unconditional under `tegra_el0`); `orintenant = ["tegra_el0"]` arms the terminus `reserve_stage` + the `[orintenant]` arm/create/close/reap/census instrument. Tenant close policy: CLOSE-CLEAN (tenants close; furniture refuses). Gate green 24/24; `arm-tegra-tenant` + the `arm-tegra-conwin-tenant` conjunction cross both go-red-proven; knob-off jetson AND Pi loadable images byte-identical | an EL0 program owns a window on the Orin panel: `run /fat/vug.elf` on the four-knob conjunction image -> `[orintenant] create … surf=288x288 wm-bound=1 -> TENANT-WINDOW`, census `IDLE-NO-TENANTS -> TENANT-LIVE`, and a clean exit reaps (§3.10 flight card) | jetson |
 
 ### §6.0 INHERITED FROM PI, NOT YET TAKEN — two shared-stack fixes waiting on the shelf
@@ -2325,7 +2325,7 @@ because the symptom never reached a pixel.
 
 **Rung 3 (input routing) must land before rung 4 (console as a window).**
 
-The reason is written into the seam itself. `video/pidesk.rs:39-44` states the
+The reason is written into the seam itself. `video/desktop_firmware.rs:39-44` states the
 CONSOLEWIN law, inherited unchanged from `wcx`:
 
 > the console window carries a minimise disc; the only route back from that park
@@ -2336,7 +2336,7 @@ CONSOLEWIN law, inherited unchanged from `wcx`:
 
 The dock is only a way back once clicks route. Land rung 4 first and the Orin
 ships a console window whose minimise button is a one-way trip — strictly worse
-than the full-screen console it replaced. `pidesk.rs` enforces the panel-geometry
+than the full-screen console it replaced. `desktop_firmware.rs` enforces the panel-geometry
 half of that law at runtime; the routing half is an ordering obligation on this
 ladder, because no `#[cfg]` can express it.
 
@@ -2379,11 +2379,11 @@ before rung 2 if the seam is to be type-checked by anything). Rung 5 is gated on
 - **Rung 2 is claimed landed and REFUSING, never working.** The seam compiles,
   links, is reached (`bl` proven by disassembly) and prints derived verdicts —
   on a build nobody has booted. **UNFLOWN on Orin metal.** Nothing on this
-  branch reaches `pidesk::activate()`; §5.2's stop-line is untouched and is now
+  branch reaches `desktop_firmware::activate()`; §5.2's stop-line is untouched and is now
   enforced by codegen as well as by source.
 - **Only rung 1 is claimed done, and only as a type-check.** Rung 1's claim is exactly
   "the armed tegra desktop configuration compiles and a gate leg compiles it" — nothing
-  on this branch arms `pidesk::activate()` at runtime, and §5.2's stop-line is untouched.
+  on this branch arms `desktop_firmware::activate()` at runtime, and §5.2's stop-line is untouched.
   ⚠ Corrected 2026-08-25: this bullet used to add "every PROVEN cell in §1 that is ✅
   refers to the JD1/JD2/JD20 panel path, not to the compositor". That is no longer true —
   boot7f made the window-manager, staging-buffer and pointer-routing rows PROVEN in their

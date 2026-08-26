@@ -483,15 +483,15 @@ pub unsafe fn takeover_display(
     // takeover is about to repoint, and the takeover would win silently. Knob-gated (`UNAOS_WC=1`),
     // so this call site does not exist in a default build.
     #[cfg(feature = "wc")]
-    crate::video::wcx::activate();
+    crate::video::desktop_uefi::activate();
 
     #[cfg(feature = "wc")]
-    let wcx_state = "ON";
+    let desktop_uefi_state = "ON";
     #[cfg(not(feature = "wc"))]
-    let wcx_state = "OFF";
+    let desktop_uefi_state = "OFF";
 
     kdisp_phase!("wcx_activate");
-    serial_println!(":: kdisp: inner phase wcx_activate cfg_wc={} ::", wcx_state);
+    serial_println!(":: kdisp: inner phase wcx_activate cfg_wc={} ::", desktop_uefi_state);
 
     let _ = t_last;
     // Completed fb-draw cycle: return the gop pointer so the late recap

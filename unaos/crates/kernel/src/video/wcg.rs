@@ -3611,9 +3611,9 @@ pub fn end(
                     .saturating_add(readback_us),
                 Ordering::Relaxed,
             );
-            #[cfg(all(target_arch = "aarch64", feature = "pidesk"))]
+            #[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))]
             let routed = if super::fbcon::console_is_routed() { "yes" } else { "no" };
-            #[cfg(not(all(target_arch = "aarch64", feature = "pidesk")))]
+            #[cfg(not(all(target_arch = "aarch64", feature = "desktop_firmware")))]
             let routed = "?";
             serial_println!(
                 "[wcgseam] win={} seq={} verdict={} routed={} glyphs={} delta={} locked={} last_age_us={} -> {} rb_delta={} refunded={}/{}",
@@ -3721,9 +3721,9 @@ pub fn end(
     // in `begin`. A new tag deliberately: no pi4 FORBID matches `\[wcgseam\]`, and none may be
     // taught to until the discriminator has spoken on the bench.
     if verdict != "CLEAN" && p.id != 0 && p.id == SEAM_WIN.load(Ordering::Relaxed) {
-        #[cfg(all(target_arch = "aarch64", feature = "pidesk"))]
+        #[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))]
         let routed = if super::fbcon::console_is_routed() { "yes" } else { "no" };
-        #[cfg(not(all(target_arch = "aarch64", feature = "pidesk")))]
+        #[cfg(not(all(target_arch = "aarch64", feature = "desktop_firmware")))]
         let routed = "?";
         serial_println!(
             "[wcgseam] win={} seq={} verdict={} routed={} glyphs={} delta={} locked={} last_age_us={} -> {}",

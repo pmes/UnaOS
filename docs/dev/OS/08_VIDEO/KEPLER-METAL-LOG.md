@@ -205,7 +205,7 @@ scale and rows survive the composite path). Wire chain:
 
 - **s39 (0c4eb448+WC): console window DECLINED** — `[wc-x] activate DECLINE reason=fb-not-ready`.
   Root cause: `video::WRITER` was seeded at main.rs step 3, long AFTER the kepler
-  takeover where wcx::activate runs; fbcon worked because it reads BootInfo directly.
+  takeover where desktop_uefi::activate runs; fbcon worked because it reads BootInfo directly.
   Fixed by seeding WRITER beside fbcon::init from the same triple (5701b9a8). Units
   audit: stride is pixels end-to-end; no consumer carries its own pitch assumption.
 - **SMC quiet: proven at s40** — 2 lines the whole boot (one-shot unresponsive note +
