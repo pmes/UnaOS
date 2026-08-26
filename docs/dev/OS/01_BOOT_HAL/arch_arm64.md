@@ -10558,3 +10558,101 @@ What the metal flight must show: the arming banner at EL1 on cpu 0, tick 1, and 
 advancing while the JD2 console stays interactive (the tick must not perturb the pump). What this
 arc deliberately does not do (arc 2, gated on the sched.rs peer grant): no `run_bsp` swap, no
 `run()` entry on the boot core, no `SCHED_ACTIVE`, no preemption, no placement change.
+
+## ORIN-BSPRUN — the boot core joins `run()` (`UNAOS_BSPRUN`, default OFF)
+
+**Candidate B arc 2** of the SMP redesign (Peter's 2026-08-25 highest-performance ruling; arc 1 =
+§ORIN-BSPTICK, `72d3d36e`). Arc 1 gave the post-JM6 boot core a standing 250 Hz EL1 clock and
+deliberately left dispatch `on_tick`-only; this arc is where the clock starts to mean something.
+`UNAOS_BSPRUN=1` swaps the tegra terminus from the cooperative, never-preempted
+`run_capstone_boot_core(0)` drive loop to `sched::run_bsp_tegra(0)` (sched.rs tail), which:
+
+* sets `SCHED_ACTIVE` — **the first tegra setter this flag has ever had** (the only other aarch64
+  setter is the Pi-only `start_aps`), un-gating `timer_preempt` and, through it,
+  `load_witness_tick`;
+* enters `run_bsp` → `mark_online(0)` → `run()`: core 0 gains `drain_due_sleepers` (a task that
+  sleeps on core 0 is no longer parked in `SLEEPERS[0]` forever), `try_steal`, the idle fold, the
+  `SCHED_PASSES` heartbeat, and membership in `ONLINE_MASK` — a legal `CPU_AUTO`/steal target for
+  the first time (F3's second half, per the design doc);
+* arms preemption delivery: `gic::handle_irq_v3` gains an `all(tegra, bsprun)`-gated post-EOI
+  `timer_preempt` call on the timer INTID, appended ON the EOI line (the v2/`baremetal` path's
+  proven ordering — on_tick re-arms and deasserts the level, EOI deactivates, preempt may
+  context-switch; and the Location-shift convention, zero source lines added).
+
+The result, on an armed boot: preemption and the `:: SCHED: load ::` / `[pulse5]` / `[spin1]`
+witness train exist on this board for the first time (F4 — `load_witness_tick`'s only caller is
+`timer_preempt`, which no-ops until `SCHED_ACTIVE`; the train has never printed a tegra line). The
+four-core print/scan widen the design doc names as this arc's dependency was already landed by
+SMPINSTR (`a50358f0`): `load_columns`, `load_witness_emit`, `pulse5_witness` and the `[spin1]`
+sweep are all `NUM_CPUS`-derived. (`storm_probe` keeps a `NUM_CPUS.min(4)` bound — a different
+instrument, the storm verb's, and not part of the named dependency.)
+
+### The knob rule — `bsprun` REQUIRES `bsptick`, enforced twice
+
+`timer_preempt` only ever runs from the timer IRQ, so preemption without the periodic EL1 tick is
+a flag with no clock: `SCHED_ACTIVE` true, zero preemptions, zero witness lines — false confidence
+by construction. arroyo's `UNAOS_BSPRUN=1` mapping therefore arms **both** features
+(`bsprun,bsptick`), and a `compile_error!` at sched.rs's tail refuses a hand-rolled `bsprun`
+without `bsptick` (verified firing: `--features tegra,tegrasmp,bsprun` errors with the ORIN-BSPRUN
+message). The converse is free and meaningful: `bsptick` alone is exactly arc 1 — tick,
+bookkeeping, terminus cooperative. `Cargo.toml` deliberately does NOT write
+`bsprun = ["bsptick"]`: the matrix leg names both features explicitly so its line IS the
+configuration it compiles, and a split list should fail loudly, not be silently widened.
+
+### What preemption can now interrupt that it never could (JB-CAPSTONE-GUARD accounting)
+
+The tegra queue is already non-empty at the terminus — `jd2_console_pump` (xHCI poll, panel,
+console, shell dispatch, click routing) is staged and infinite — so the swap turns the only
+interactive task this board has from cooperatively-yielding into preemptible: a quantum expiry can
+land mid xHCI event drain, mid console repaint, mid shell command. Soundness, hazard by hazard:
+**serial** — `_print` masks IRQs around the port lock, IRQ-context prints are try_lock + staging
+(no preemption mid-hold, no deadlock); **run queues** — every rq section is IRQ-masked (WEDGE-4),
+and `timer_preempt` carries the `IN_RQ_SECTION` tripwire; **EL0** — quantum preemption through the
+0x480 lower-EL vector is the Pi's metal-proven path, riding the same runtime-banked `__vec_irq`;
+**video/WM locks** — the pump can now be preempted while holding one, but no other core-0 task
+touches video state today, so there is no contender to deadlock with (the arc that adds one must
+re-derive this); **APs** — the IRQEL-CORE audit at the gic.rs call site: `timer_preempt` gates on
+`SCHED_ACTIVE` then indexes only per-cpu words by the caller's own `cpu_index`; an EL2 AP with an
+empty queue takes the null-`current` early return, and the one shared word it advances (the load
+witness cadence) is that witness's designed multi-core aggregate, exactly as on the 4-core Pi.
+
+What an armed boot gives up, stated: `run_bsp_tegra` bypasses `run_capstone_boot_core`, so no
+CAPSTONE is spawned (on tegra it only ever ran interleaved with the pre-staged pump) and the
+cooperative terminus's baseline emits are skipped — the two that prove reader linkage
+(`el0_refusal_rollup`, `load_witness_emit`) are re-emitted by `run_bsp_tegra` before `run()`
+entry, un-preempted by construction (the `SCHED_ACTIVE` store comes after them).
+
+### Witness
+
+`[orinbsprun]` (12 bytes, over the 8-byte immediate-encode floor) — the terminus banner, printed
+once, before the `SCHED_ACTIVE` store (so it cannot itself be the first preempted print). The
+arc's real payload witness is the load train itself. Arc 1's `[orinbsptick]` arming banner is
+cfg!-split so it stops claiming "no preemption" on a `bsprun` image.
+
+### Gating and verification status
+
+Sites: `main.rs` terminus line (cfg-selected swap, zero lines added), sched.rs FILE TAIL
+(`run_bsp_tegra` + `compile_error!`, all `all(tegra, bsprun)` — the run-loop/terminus region; no
+spawn-path site), `gic.rs` EOI line (post-EOI `timer_preempt`, `all(tegra, bsprun)`), `timer.rs`
+banner truth-split. Armed polarity type-checked by the `arm-tegra-bsprun` matrix leg (`arm-tegra`
+verbatim + `bsptick,bsprun`; the bsprun-without-bsptick polarity is compiled by NO leg — it is the
+`compile_error!`'s job).
+
+Verified 2026-08-25 at exec-smpb2 (QEMU/build only — **not yet flown on metal**):
+
+* `UNAOS_TEGRA=1 ./arroyo check` green, 27 legs (18 board + 9 x86 mix; this arc +1 board leg =
+  `arm-tegra-bsprun`);
+* `./arroyo test-arm` green knob-off AND with `UNAOS_BSPRUN=1` (virt image byte-inert: every site
+  tegra-gated; `[orinbsprun]`/`[orinbsptick]` correctly absent from the armed virt log);
+* knob-off byte-identity **measured**: `llvm-objcopy -O binary kernel.elf` sha256
+  `c3ae5a49ed2427fd1bf4d0daf95307cb2cbad2929bc31c72b45287dcaf980518` at base `00124d1b` and with
+  this arc applied, identical (`cmp` clean); armed image
+  (`04201e5e7c94f660fce8445b6f17902c5d2a9be7fca43945b69afc0ff73e7d2f`) carries `[orinbsprun]`
+  exactly once (`strings`-proven; 0 hits knob-off) plus both `[orinbsptick]` strings (the mapping
+  folded `bsptick` in, as the knob rule requires).
+
+What the metal flight must show (a later image, not this arc's job): the `[orinbsprun]` banner,
+the first real `:: SCHED: load ::` / `[pulse5]` emission on Orin silicon, and the JD2 console
+still interactive under preemption — a keystroke and a click surviving quantum expiry is the whole
+point. What this arc deliberately does not do: no AP EL1 drop (Candidate C), no `steal_ok` change
+(F1 stays empty by design until C), no supervisor (Candidate A), no change to how many cores wake.
