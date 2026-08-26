@@ -136,20 +136,52 @@ pub const USER_CODE_SIZE: usize = 0x1000;
 // The per-process framebuffer surface hole above the program window (ELF-3 / WC-B). Values are
 // byte-for-byte those of `boot.rs`: the EL0-visible VA layout must be IDENTICAL on both platforms
 // because the SAME user binaries (and the same `syscall.rs` arithmetic) run against it.
+//
+// ORIN-TENANT (rung 6) — the CRYSTAL-HD parity fix, and the rot it removes. This module was written
+// (JETSON-EL0 M1b, 2026-08-18 10:09) ten hours AFTER CRYSTAL-HD (`92435fb8`, 2026-08-18 00:23) took
+// `boot.rs` and the x86 twin from 8 slots x 64 KiB / 128x128 to 4 slots x 0x51000 / 288x288 — and it
+// copied the PRE-CRYSTAL-HD table, so the paragraph above was false at this module's birth. The
+// divergence was not cosmetic; it was two live defects, both removed by restoring the parity the
+// paragraph claims:
+//   * `run /fat/VUG.ELF` on the Orin died at its first syscall: the shipped `user-vug` asks
+//     `SYS_WIN_CREATE(288, 288)` (its `SW`/`SH` — CRYSTAL-HD's 288-as-committed, Peter-ruled
+//     2026-08-18) and the 128 cap here answered `-EINVAL`, so the program printed
+//     `:: UVUG: SYS_WIN_CREATE failed ::` and exited(1) — no EL0 program could ever own a
+//     compositor window on this board.
+//   * the WC-B window-verb fixture hardcodes region slot 1's surface at `base + 0x5000 + 0x51000`
+//     (`syscall.rs`, `add x12, x9, #0x56, lsl #12`) — the Pi stride. Against the 0x1_0000 stride
+//     here the kernel mapped slot 1's leaves at `base + 0x15000`, so the fixture's b10/b11 stores
+//     aimed at RESERVED (invalid) leaves: a latent EL0 fault in every `tegra_el0` witness image.
+// The slot-0 offset (`base + 0x5000`, what `SYS_FB_MAP` returns and what every shipped binary uses)
+// is unchanged by this fix — only the per-slot STRIDE, the slot COUNT and the negotiable CAP move,
+// and each is published per window in the RO info page rather than assumed by ring 3. `syscall.rs`
+// cross-checks the parity at compile time against whichever module `uslots` selects (its WC-B const
+// asserts: `FB_WIN_SLOTS <= WIN_MAX`, `FB_WIN_MAX_W * FB_WIN_MAX_H * 4 == FB_WIN_SLOT_SIZE`), and
+// the asserts below hold the local arithmetic.
 pub const FB_INFO_SIZE: usize = 0x1000;
 pub const FB_SURFACE_W: u32 = 32;
 pub const FB_SURFACE_H: u32 = 32;
 pub const FB_SURFACE_STRIDE: u32 = FB_SURFACE_W * 4;
 pub const FB_SURFACE_SIZE: usize = (FB_SURFACE_STRIDE * FB_SURFACE_H) as usize;
-pub const FB_WIN_SLOTS: usize = 8;
-pub const FB_WIN_SLOT_SIZE: usize = 0x1_0000;
-pub const FB_WIN_MAX_W: u32 = 128;
-pub const FB_WIN_MAX_H: u32 = 128;
+pub const FB_WIN_SLOTS: usize = 4;
+pub const FB_WIN_SLOT_SIZE: usize = 0x5_1000;
+pub const FB_WIN_MAX_W: u32 = 288;
+pub const FB_WIN_MAX_H: u32 = 288;
 pub const FB_REGION_SIZE: usize = FB_INFO_SIZE + FB_WIN_SLOTS * FB_WIN_SLOT_SIZE;
 
-/// Total per-address-space backing: the program window + the FB hole. 0x85000 (532 KiB), a page
-/// multiple, and well under the 2 MiB the single L3 covers.
+/// Total per-address-space backing: the program window + the FB hole. 0x149000 (1.29 MiB) since the
+/// CRYSTAL-HD parity fix above — `boot.rs` asserts the same literal on its side. Unlike the Pi
+/// (where this is 8 slots of `.bss` against a hand-placed heap floor), every backing here is
+/// `alloc_zeroed`ed lazily from the 48 MiB tegra heap: 1 shared + up to `USER_SLOTS` slots =
+/// 9 x 0x149000 = 11.6 MiB worst case, and a slot never claimed costs nothing.
 pub const USER_STATIC_SIZE: usize = USER_REGION_SIZE + FB_REGION_SIZE;
+const _: () = assert!(USER_STATIC_SIZE == 0x149000);
+/// The whole region must fit the ONE per-slot L3 (512 x 4 KiB = 2 MiB), or the FB leaves would spill
+/// into a table `build_slot` never wired. 0x149000 = 329 of those 512 pages. (`boot.rs` carries the
+/// identical assert; the `USER_VA_BASE` GiB alignment is what guarantees non-straddling here.)
+const _: () = assert!(USER_STATIC_SIZE <= 512 * 0x1000);
+/// A `FB_WIN_MAX_W` x `FB_WIN_MAX_H` ARGB8888 surface must fit a window's VA slot exactly.
+const _: () = assert!((FB_WIN_MAX_W * FB_WIN_MAX_H * 4) as usize == FB_WIN_SLOT_SIZE);
 
 /// Number of per-task user address-space slots. STOP tripwire, inherited verbatim from `boot.rs`: this
 /// cap is deliberate — do not raise it to satisfy a demo; a real user-memory allocator is a later arc.
