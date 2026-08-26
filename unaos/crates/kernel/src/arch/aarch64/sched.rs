@@ -10310,3 +10310,87 @@ pub fn el0_active_snapshot(cpu: usize) -> usize {
     }
     el0_active(cpu)
 }
+
+// ── ORIN-BSPRUN (Candidate B arc 2) — the boot core joins `run()` ───────────────────────────────
+//
+// Appended at the END of this file deliberately (the el0_active_snapshot / SHELLUP convention): the
+// whole block is `all(tegra, bsprun)`-gated, so the knob-off image contains none of it and no
+// knob-off panic `Location` line number shifts. Peter's 2026-08-25 highest-performance ruling,
+// arc 2 of Candidate B (`~/.claude/plans/unaos/review/orin-smp-redesign.md`): arc 1 (ORIN-BSPTICK,
+// 72d3d36e) gave the post-JM6 boot core a standing periodic EL1 clock; this arc makes the clock
+// mean something. `UNAOS_BSPRUN=1` swaps the tegra terminus from `run_capstone_boot_core(0)` (the
+// cooperative, never-preempted drive loop) to `run_bsp_tegra(0)` below, which sets `SCHED_ACTIVE`
+// — the first tegra setter this flag has ever had (its only other aarch64 setter is the Pi-only
+// `start_aps`) — and enters `run_bsp` -> `mark_online(0)` -> `run()`. What core 0 gains, from the
+// design doc's F3/F4 ledger: `drain_due_sleepers` (a task that sleeps on core 0 is no longer
+// parked forever — sched.rs's own ":3080" complaint), `try_steal`, the idle fold, membership in
+// `ONLINE_MASK` (a legal `CPU_AUTO`/steal target for the first time), and — through `SCHED_ACTIVE`
+// + the gic.rs post-EOI arm — `timer_preempt` and with it the `:: SCHED: load ::` / `[pulse5]` /
+// `[spin1]` witness train, which has NEVER emitted on this board (`load_witness_tick`'s only
+// caller is `timer_preempt`, which no-ops until `SCHED_ACTIVE`).
+//
+// KNOB RULE — `bsprun` REQUIRES `bsptick`, enforced twice. `timer_preempt` only ever runs from the
+// timer IRQ, so preemption without the ORIN-BSPTICK periodic EL1 tick is a flag with no clock:
+// `SCHED_ACTIVE` true, zero preemptions, zero witness lines — a config that can only produce false
+// confidence. And `run()`'s sleeper drain runs once per loop pass, so on a transiently-empty queue
+// the pass rate (and the worst-case sleeper wake latency) is set by the tick breaking `hlt()`.
+// (On this board `hlt()` poll-spins rather than WFIs — `LIVE` is false post-JM6 and the boot core
+// has no `local_tick` stamp — so the queue-empty case stays live even tickless, but the honest
+// cadence argument is the tick's.) arroyo's knob mapping therefore folds `bsptick` in with
+// `bsprun` (UNAOS_BSPRUN=1 arms BOTH), and the `compile_error!` below makes a hand-rolled
+// `--features bsprun` without `bsptick` unbuildable rather than silently inert. The converse is
+// unconstrained: `bsptick` without `bsprun` is exactly arc 1 — tick, `on_tick` bookkeeping, no
+// preemption, terminus cooperative.
+//
+// WHAT PREEMPTION CAN NOW INTERRUPT THAT IT NEVER COULD (the JB-CAPSTONE-GUARD accounting): the
+// tegra queue is already non-empty at the terminus — `jd2_console_pump` (xHCI poll, panel,
+// console, shell dispatch, click routing) is staged and infinite, plus the `tegra_el0` pair when
+// armed — so the swap turns tasks that have only ever run cooperatively into preemptible ones.
+// A quantum expiry can now land anywhere the pump runs IRQ-unmasked: mid xHCI event drain, mid
+// console repaint, mid shell command. Why that is sound, hazard by hazard: **serial** — `_print`
+// masks IRQs around the port lock (a print can't be preempted mid-hold; IRQ-context prints are
+// try_lock + staging, the ORIN-BSPTICK derivation); **run queues** — every rq section is
+// IRQ-masked (WEDGE-4 `rq` law), and `timer_preempt` carries the `IN_RQ_SECTION` tripwire;
+// **EL0** — the 0x480 lower-EL vector routes to the same runtime-banked `__vec_irq`, and quantum
+// preemption of EL0 tasks through it is the Pi's metal-proven path; **video/WM locks** — the pump
+// can now be preempted while holding one, but on this terminus every other core-0 task
+// (`el0-hello`, `tegra-el0-verdict`, CAPSTONE — see below) touches no video state, so there is no
+// contender to deadlock with today; the arc that adds a second video-touching task to core 0 must
+// re-derive this. **APs** — the five EL2 secondaries reach the same gic.rs dispatch ~1250x/s; the
+// IRQEL-CORE audit of the armed `timer_preempt` call is in gic.rs at the call site.
+//
+// WHAT THE ARMED TERMINUS GIVES UP, stated rather than discovered: `run_bsp_tegra` bypasses
+// `run_capstone_boot_core`, so an armed boot spawns NO CAPSTONE (on tegra it only ever ran
+// interleaved with the pre-staged pump — JB-CAPSTONE-GUARD's history), and skips the cooperative
+// terminus's baseline emits (`parked_display_witness`, `sched_bal_witness`, the in-loop
+// `el0_refusal_rollup`/`load_witness_poll` pair). The two baselines that prove reader linkage are
+// re-emitted below before `run()` entry; the in-loop polls are superseded by the real timer-driven
+// train this arc turns on. Knob-off, every one of those lines is byte-identical untouched.
+
+/// ORIN-BSPRUN terminus: set `SCHED_ACTIVE` (turning on `timer_preempt` + the load witness train),
+/// then enter the full scheduler as `run_bsp` -> `mark_online(0)` -> `run()`. Called ONCE from
+/// `tegra_early_stop`'s terminus line in place of `run_capstone_boot_core(0)`; never returns.
+/// The banner prints BEFORE the `SCHED_ACTIVE` store, so it cannot itself be the first preempted
+/// print; the two baseline emits sit between banner and store for the same reason.
+#[cfg(all(feature = "tegra", feature = "bsprun"))]
+pub fn run_bsp_tegra(cpu: usize) -> ! {
+    serial_println!(
+        ":: [orinbsprun] boot core {} joins run() — SCHED_ACTIVE=true, mark_online({}), preemptive terminus (clock: ORIN-BSPTICK); sleeper drain + steal + idle fold + the SCHED load/[pulse5]/[spin1] train are live on tegra for the first time ::",
+        cpu, cpu
+    );
+    // Baseline emits (the EL0-EL1CORE / SMPINSTR "prove the reader is linked and reached" rule),
+    // re-homed from the cooperative terminus this fn replaces. Un-preempted by construction: the
+    // SCHED_ACTIVE store below has not happened yet.
+    el0_refusal_rollup();
+    let _ = load_witness_emit();
+    SCHED_ACTIVE.store(true, Ordering::Release);
+    run_bsp(cpu)
+}
+
+/// ORIN-BSPRUN knob-rule backstop (see the block comment): `bsprun` without `bsptick` is
+/// preemption without a clock — `SCHED_ACTIVE` true and `timer_preempt` never called. arroyo's
+/// mapping always arms both; this makes a hand-rolled feature list that splits them unbuildable.
+#[cfg(all(feature = "bsprun", not(feature = "bsptick")))]
+compile_error!(
+    "ORIN-BSPRUN requires ORIN-BSPTICK: `bsprun` without `bsptick` sets SCHED_ACTIVE with no EL1 periodic tick to drive timer_preempt — arm via UNAOS_BSPRUN=1 (arroyo folds bsptick in), or add `bsptick` to the feature list."
+);

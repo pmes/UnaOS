@@ -648,6 +648,10 @@ fn el1_proof_snapshot(when: &str) {
 // v3 dispatch's timer arm calls ONLY `on_tick` (`gic::handle_irq_v3` — `timer_preempt` is
 // `baremetal`-gated and `SCHED_ACTIVE` is false on this board), so a tick re-arms TVAL and bumps
 // counters but can never context-switch: the terminus stays cooperative, now with a heartbeat.
+// [ORIN-BSPRUN, arc 2, supersedes the previous sentence WHEN ARMED: `bsprun` (which requires this
+// knob) adds a post-EOI `timer_preempt` arm to the v3 dispatch and a tegra `SCHED_ACTIVE` setter
+// at the terminus (`run_bsp_tegra`, sched.rs tail), so a bsptick+bsprun image IS preemptive. A
+// bsptick-only image keeps every claim above verbatim.]
 // The remaining hazards, one by one: SERIAL — `_print` masks IRQs around the port lock and an
 // IRQ-context print goes `try_lock` + staging ring, so a tick landing mid-print cannot deadlock;
 // EL0 — the 0x480 lower-EL IRQ vector routes to the same banked `__vec_irq` (metal-proven on the
@@ -698,8 +702,19 @@ pub fn el1_bsptick_start() {
     // Armed banner BEFORE the unmask, so the serial lock is free when the first tick's witness
     // prints (the same ordering `el1_oneshot_proof` uses for the same reason).
     serial_println!(
-        ":: [orinbsptick] arming PERIODIC CNTP at EL{} on cpu {} ({} Hz, PPI{}) — IRQs stay UNMASKED across the terminus; dispatch is on_tick ONLY (timer_preempt is baremetal-gated, SCHED_ACTIVE false): no preemption, the capstone loop stays cooperative ::",
-        super::exceptions::current_el(), cpu, TICK_HZ, TIMER_INTID
+        ":: [orinbsptick] arming PERIODIC CNTP at EL{} on cpu {} ({} Hz, PPI{}) — IRQs stay UNMASKED across the terminus; {} ::",
+        super::exceptions::current_el(), cpu, TICK_HZ, TIMER_INTID,
+        // ORIN-BSPRUN truth split: with `bsprun` also armed the old "no preemption" claim would be
+        // a lie on the wire — the gic.rs v3 dispatch gains a post-EOI `timer_preempt` arm and
+        // `run_bsp_tegra` sets SCHED_ACTIVE at the terminus (sched.rs tail §ORIN-BSPRUN).
+        // cfg!-selected so the banner states the dispatch regime this image actually carries.
+        // (Line-count changes inside this `all(tegra, bsptick)` block cannot move a knob-off
+        // Location: knob-off compiles none of it, and it sits at the file tail.)
+        if cfg!(feature = "bsprun") {
+            "dispatch is on_tick + post-EOI timer_preempt (ORIN-BSPRUN: SCHED_ACTIVE is set at the terminus — the run() loop is PREEMPTIVE)"
+        } else {
+            "dispatch is on_tick ONLY (no timer_preempt arm in the v3 dispatch without ORIN-BSPRUN, SCHED_ACTIVE false): no preemption, the capstone loop stays cooperative"
+        }
     );
     // The one-shot's own arm path, reused: banked GICR PPI enable + TVAL + ENABLE=1 + isb. NOT
     // `arm_this_core_ap` — the boot core stays the global-clock owner, so `ticks()`/`ms()` resume

@@ -724,8 +724,8 @@ _feats=""
 # after the IRQEL-RT one-shot proof self-disarms. The boot core keeps a standing 250 Hz CNTP tick at
 # EL1 with IRQs unmasked across `run_capstone_boot_core`; dispatch is `on_tick` only (SCHED_ACTIVE
 # stays false, `timer_preempt` is baremetal-gated), so the terminus stays cooperative — this is the
-# clock, not the preemption (that is Candidate B arc 2). Standalone feature (does NOT imply tegra,
-# mirroring smpmark), but every site is tegra-gated, so arm it WITH tegra:
+# clock, not the preemption (that is ORIN-BSPRUN, the next mapping). Standalone feature (does NOT
+# imply tegra, mirroring smpmark), but every site is tegra-gated, so arm it WITH tegra:
 # `UNAOS_TEGRA=1 UNAOS_BSPTICK=1 ./arroyo check`, or `UNAOS_BSPTICK=1 ./arroyo esp-jetson` (esp-jetson
 # forces tegra). Default OFF; when unset every site vanishes and the knob-off jetson OBJCOPY'D
 # LOADABLE IMAGE is byte-identical to baseline (measured on `llvm-objcopy -O binary kernel.elf`, the
@@ -733,6 +733,24 @@ _feats=""
 # KERNEL_CFG_MATRIX, not by this mapping. Witness on the wire: `[orinbsptick]` — tick 1, then every
 # 250th tick, count + re-measured CurrentEL + cpu.
 [ -n "${UNAOS_BSPTICK:-}" ] && _feats="${_feats}bsptick,"
+# ORIN-BSPRUN (Candidate B arc 2): UNAOS_BSPRUN=1 swaps the tegra terminus to the PREEMPTIVE
+# scheduler — `sched::run_bsp_tegra(0)` (sched.rs tail) in place of the cooperative
+# `run_capstone_boot_core(0)`: SCHED_ACTIVE set (first tegra setter), mark_online(0), the full
+# `run()` loop (sleeper drain + steal + idle fold), and a post-EOI `timer_preempt` arm in
+# `gic::handle_irq_v3` — preemption and the `SCHED: load`/`[pulse5]`/`[spin1]` train reach this
+# board for the first time. KNOB RULE, enforced here: BSPRUN IMPLIES BSPTICK (preemption without
+# the periodic EL1 tick is a flag with no clock — SCHED_ACTIVE true, timer_preempt never called),
+# so this mapping arms BOTH features; the converse is free (BSPTICK alone = arc 1, tick only,
+# terminus cooperative). A hand-rolled feature list carrying bsprun without bsptick trips a
+# compile_error! in sched.rs rather than building silently inert. Standalone feature (does NOT
+# imply tegra, mirroring bsptick), but every site is tegra-gated, so arm it WITH tegra:
+# `UNAOS_TEGRA=1 UNAOS_BSPRUN=1 ./arroyo check`, or `UNAOS_BSPRUN=1 ./arroyo esp-jetson`
+# (esp-jetson forces tegra). Default OFF; when unset every site vanishes and the knob-off jetson
+# OBJCOPY'D LOADABLE IMAGE is byte-identical to baseline (measured, the bsptick/orindesk
+# precedent). The ARMED build is type-checked by the `arm-tegra-bsprun` leg of KERNEL_CFG_MATRIX,
+# not by this mapping. Witness on the wire: `[orinbsprun]` — the terminus banner (then the load
+# train itself, whose emission IS the arc's payload).
+[ -n "${UNAOS_BSPRUN:-}" ] && { _feats="${_feats}bsprun,"; case ",${_feats}" in *",bsptick,"*) ;; *) _feats="${_feats}bsptick,";; esac; }
 # ORIN-WM1 (ORINDESK): UNAOS_ORINDESK=1 arms the Jetson Orin's FIRST real compositor window —
 # `arch/aarch64/display_tegra.rs::orin_wm1`, called from `tegra_early_stop`'s step-3c heap line. It
 # calls `wm::reserve_stage` (the Orin's missing half: this board seeds `video::WRITER` by hand and never
@@ -2668,6 +2686,34 @@ KERNEL_CFG_MATRIX=(
   # PRECONDITION: compiles `arch/aarch64/syscall.rs`, which `include_bytes!`s `target/user_blob.bin`.
   # `ensure_user_blob` (see check_both) supplies it.
   "arm-tegra-tenant ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,orintenant"
+
+  # ORIN-BSPRUN armed (appended 2026-08-25, Candidate B arc 2) — `bsprun` gates the terminus swap
+  # (`main.rs`'s terminus line: `run_bsp_tegra(0)` in place of `run_capstone_boot_core(0)`), the
+  # `run_bsp_tegra` + compile_error! block at `arch/aarch64/sched.rs`'s tail, and the post-EOI
+  # `timer_preempt` statement appended to `gic::handle_irq_v3`'s EOI line. EVERY site is additionally
+  # `tegra`-gated (`all(tegra, bsprun)`; the terminus is inside tegra-gated `tegra_early_stop`), so
+  # only a leg carrying `tegra` compiles them — and no leg carries `tegra` plus this knob but this
+  # one. Without it the ARMED polarity would be compiled by NOTHING (the standing tegra_el0 /
+  # smpmark / orindesk / bsptick shape and its law: a knob's gates must compile the configuration
+  # the knob turns ON).
+  #
+  # WHY THE LEG CARRIES `bsptick` TOO, and MUST: bsprun REQUIRES bsptick (sched.rs tail
+  # compile_error!; arroyo's UNAOS_BSPRUN mapping arms both), so `arm-tegra` + `bsprun` alone would
+  # go red at the compile_error! by construction — the leg's list names the configuration the knob
+  # actually turns on (arm-tegra verbatim + `bsptick,bsprun`), per the standing matrix rule that a
+  # leg's line IS the configuration it compiles. The bsprun-without-bsptick polarity is deliberately
+  # compiled by NO leg: it is not a configuration, it is the compile_error!'s job.
+  #
+  # WHY ITS OWN TAIL LEG rather than `,bsprun` appended to `arm-tegra-bsptick`: same standing reason
+  # — `arm-tegra-bsptick` is arc 1's armed polarity (tick WITHOUT preemption, the shipped shape when
+  # only UNAOS_BSPTICK=1 is set) and folding arc 2 in would leave that polarity type-checked by no
+  # leg; a red on a tail leg names the knob.
+  #
+  # UNIVERSE SIDE EFFECT: none that moves a mix count. `bsprun` is a NEW `[features]` entry named
+  # only on an arm-* leg, so `x86_cfg_universe` drops it (every site is inside `feature = "tegra"`
+  # items) and the derived mix-leg count is unchanged. Board legs +1; gate +1. `./arroyo check`
+  # prints the live board/mix counts every run — read them there, not here.
+  "arm-tegra-bsprun ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,bsptick,bsprun"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────

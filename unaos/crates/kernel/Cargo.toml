@@ -686,6 +686,24 @@ smpmark = []
 # Enable via `UNAOS_BSPTICK=1 ./arroyo esp-jetson`. See arch_arm64.md §ORIN-BSPTICK.
 bsptick = []
 
+# ORIN-BSPRUN (Candidate B arc 2): the `UNAOS_BSPRUN=1` terminus swap — the Orin boot core joins
+# the preemptive scheduler. `tegra_early_stop`'s terminus becomes `sched::run_bsp_tegra(0)`
+# (sched.rs tail) instead of the cooperative `run_capstone_boot_core(0)`: SCHED_ACTIVE gets its
+# first tegra setter, `mark_online(0)` + `run()` give core 0 sleeper drain / steal / the idle fold,
+# and `gic::handle_irq_v3` gains a post-EOI `timer_preempt` arm — preemption and the
+# `:: SCHED: load ::`/`[pulse5]`/`[spin1]` witness train exist on this board for the first time.
+# REQUIRES `bsptick` (the clock that drives `timer_preempt`): a `compile_error!` in sched.rs
+# refuses `bsprun` without it, and arroyo's UNAOS_BSPRUN mapping arms both. Deliberately NOT
+# `bsprun = ["bsptick"]`: the arm-tegra-bsprun matrix leg names both features explicitly so the
+# leg's line IS the configuration it compiles (the standing matrix rule), and a hand-rolled list
+# that splits them should fail loudly at the compile_error!, not be silently widened. Standalone
+# otherwise (does NOT imply `tegra`, mirroring `bsptick`) but every site is `all(tegra, bsprun)`-
+# gated (the main.rs terminus is inside tegra-gated code), so arm it WITH tegra. With the feature
+# OFF (default) every site vanishes and the tegra image is byte-identical to baseline. Witness:
+# `[orinbsprun]` — the terminus banner. Enable via `UNAOS_BSPRUN=1 ./arroyo esp-jetson`.
+# See arch_arm64.md §ORIN-BSPRUN.
+bsprun = []
+
 # VUG-RAS-LOCALIZER: the `UNAOS_VUGRAS=1` RAS localizer (vugras.rs) — a knob-gated DC CIVAC writeback
 # sweep (vug frame loop + JD2 console-idle pump) plus a boot candidate-PA witness, to make the Orin
 # SNOC+ACI FillWrite RAS fire at/near the offending store and name the address it decodes to. Pure
