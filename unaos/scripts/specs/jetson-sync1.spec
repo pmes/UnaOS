@@ -121,6 +121,33 @@
 # NET-4G arms), promote-on-evidence. boot7h remains the green reference: 17/17, 0
 # forbidden, pending 8/15 matched after this fold (TEGRA-SD unmatched as before; the
 # six new PENDINGs read ⏳ until boot7i flies).
+#
+# 2026-08-25 (exec-o7-boot7jspec): BOOT 7j ARMED AHEAD OF ITS CUT — the FOCUSED flight for
+# the two arcs that each put a real new risk on this board's interactive surface, given
+# their own banner block below the BOOT 7i one: ORIN-BSPRUN (the first preemption ever on
+# this surface — terminus swap to `run_bsp_tegra`, the first tegra `SCHED_ACTIVE` setter,
+# and the post-EOI `timer_preempt` arm that was ABSENT from `handle_irq_v3`) and
+# ORIN-SUPSTATE (the first restructure of the one working pump — the console surface lifted
+# to a module-owned handle and the pump split into three named roles). SMPMARK is armed as
+# always and needs no new row (checked, not assumed — its three marks are pre-terminus).
+# ONE ROW IS WIDENED AND ONE FORBID IS ADDED; NOTHING ELSE MOVES A COUNT:
+#   `REQUIRE CAPSTONE COMPLETE` -> `REQUIRE (CAPSTONE COMPLETE|[orinbsprun] boot core N joins
+#     run())`. IT HAD TO MOVE: ORIN-BSPRUN replaces `run_capstone_boot_core` at the terminus,
+#     so an armed boot spawns NO capstone and the old row failed on CONFIGURATION — the
+#     TEGRA-SD defect, on this file's oldest scheduler invariant. Unlike TEGRA-SD an
+#     alternation IS available, because the armed image prints a marker on the statement that
+#     replaces the one that would have printed the old witness. Argued at the row; the widened
+#     pattern takes the SAME 217 hits tree-wide as the bare one, so it costs no strength.
+#   Spec-declared FORBIDs 9 -> 10: `[wedge4] preempt-in-section`, the WEDGE-4 tripwire that
+#     lives inside `timer_preempt` and that ORIN-BSPRUN makes reachable on tegra for the first
+#     time. Zero hits across the whole tree; it can only ever speak about a bsprun flight.
+#   REQUIREs stay 17. PENDINGs 15 -> 20, OPTIONALs 60 -> 68.
+# boot7h REMAINS THE GREEN REFERENCE and this fold does not move it: 17/17, 0 forbidden,
+# pending 8/20 (the five new PENDINGs ⏳ until boot7j flies). Every direction proven before
+# commit: the widened REQUIRE reds on a boot7h slice with its `CAPSTONE COMPLETE` removed
+# (16/17) and greens again when that line is replaced by the `[orinbsprun]` banner (17/17);
+# an armed-shape synthetic flips all five new PENDINGs (14/20, PASS); an all-rows synthetic
+# proves every one of the fourteen new rows matchable and reds on the new FORBID.
 
 # --- boot bring-up witnesses (the JD/JB chain — all previously metal-proven) --------
 REQUIRE JD1.*scanout:.*sane=true
@@ -134,7 +161,44 @@ REQUIRE JD2.*console pump live
 REQUIRE JD4.*console OWNS the panel
 
 # --- scheduler: the post-merge trunk scheduler on Orin metal ------------------------
-REQUIRE CAPSTONE COMPLETE
+# WIDENED 2026-08-25 (exec-o7-boot7jspec, the boot7j fold) — AND THE WIDENING IS THE ONLY
+# WAY THIS ROW SURVIVES ORIN-BSPRUN. `CAPSTONE COMPLETE` is printed by `capstone_body`
+# (sched.rs:8185), which runs only if `run_capstone_boot_core` SPAWNED it. ORIN-BSPRUN
+# (`bsprun`, UNAOS_BSPRUN=1) replaces that whole function at the terminus with
+# `run_bsp_tegra(0)` (main.rs:2679's cfg-selected statement), which spawns NO capstone —
+# the arc's own commit says so in as many words ("`run_bsp_tegra` bypasses
+# `run_capstone_boot_core`, so no CAPSTONE is spawned"). So the un-widened row FAILS ON
+# CONFIGURATION on a perfectly healthy bsprun flight: the TEGRA-SD defect, in a new place,
+# and this time on the row that is this file's oldest scheduler invariant.
+#
+# WHY AN ALTERNATION IS AVAILABLE HERE AND WAS NOT AVAILABLE FOR TEGRA-SD. The TEGRA-SD
+# note above rejects exactly this shape and gives the reason: "an unarmed image prints NO
+# sdmmc line at all, so there is no marker to key the second branch on". The bsprun case is
+# the mirror — the armed image prints a marker, `[orinbsprun]`, at the terminus, on the
+# statement that REPLACES the one that would have printed `CAPSTONE COMPLETE`. The two
+# branches are the two termini, exactly one of which runs on any boot, so the alternation IS
+# the conditional the grammar cannot otherwise spell.
+#
+# IT COSTS NOTHING ON AN UNARMED FLIGHT, and that is measured rather than argued: `bsprun`
+# is `#[cfg]`-gated end to end and the string `[orinbsprun]` is not in a knob-off image at
+# all, so on every image this file has ever adjudicated the second branch is unsatisfiable
+# and the row is byte-for-byte as strong as the one it replaces. Across the whole bench
+# capture tree (313 files, 2,383,287 lines) the widened pattern takes exactly the same 217
+# hits as the bare `CAPSTONE COMPLETE` — the second branch contributes ZERO. Go-red proven
+# both directions on the boot7h slice: 17/17 unchanged; the same slice with its one
+# `CAPSTONE COMPLETE` line removed reds on exactly this row (16/17); the same slice with
+# that line REPLACED by the `[orinbsprun]` banner reads 17/17 again.
+#
+# THE ONE THING THE WIDENING GIVES UP, STATED. Three rows below (`SCHED: load`,
+# `[el0core] rollup:`, `IRQEL-RT: EL1 one-shot proof`) justify their REQUIRE by pointing at
+# this one: "CAPSTONE COMPLETE prints AFTER the baseline emits, so any image that passes
+# this file has reached them". `[orinbsprun]` prints BEFORE them, not after. The argument is
+# not lost, it changes shape: on the armed terminus the banner, `el0_refusal_rollup()` and
+# `load_witness_emit()` are three CONSECUTIVE statements of `run_bsp_tegra` with nothing
+# between them that can legitimately decline, so a boot that prints the banner and not the
+# other two has faulted in between — a genuine regression that SHOULD red. No new way for a
+# healthy boot to red, in either polarity.
+REQUIRE (CAPSTONE COMPLETE|\[orinbsprun\] boot core [0-9]+ joins run\(\))
 
 # --- NEW this boot: witnesses shipped ahead of their bench (promote on capture) -----
 # M1b: the first EL0 round-trip on Orin metal (tegra_el0 knob armed on the image).
@@ -952,6 +1016,311 @@ OPTIONAL \[net4G\] DECOY ARMED: victim slot [0-9]+
 OPTIONAL \[net4G\] VERDICT latch-site=[A-Z-]+
 OPTIONAL \[net4G\] arm ABORTED:
 OPTIONAL \[net4G\] interim pop slot=[0-9]+
+
+# =====================================================================================
+# BOOT 7j — THE FOCUSED SCHEDULER/PUMP FLIGHT, ARMED AHEAD OF ITS CUT
+# (2026-08-25, exec-o7-boot7jspec). boot7j exists because two arcs are each a REAL new
+# risk on this board's INTERACTIVE surface, and flying them inside the boot7i batch
+# would muddy every verdict in it:
+#   ORIN-BSPRUN  (`bsprun`, UNAOS_BSPRUN=1 — ARMS `bsptick` TOO, arroyo folds it in and a
+#                `compile_error!` at sched.rs's tail refuses the split) — the boot core
+#                joins `run()`. The FIRST PREEMPTION EVER on this board's interactive
+#                surface: terminus swap `run_capstone_boot_core(0)` -> `run_bsp_tegra(0)`,
+#                the first tegra `SCHED_ACTIVE` setter, and a post-EOI `timer_preempt` arm
+#                in `gic::handle_irq_v3` — which was ABSENT there, so the setter alone
+#                would have been inert.
+#   ORIN-SUPSTATE (`supstate`, UNAOS_SUPSTATE=1, implies `tegra`) — the FIRST RESTRUCTURE
+#                of the one working pump: the console surface lifts out of
+#                `jd2_console_pump`'s stack into `display_tegra::SUP_SURFACE`, and the pump
+#                splits into jd2-console (input) / jd2-dispatch / jd2-present, all still
+#                pinned to core 0.
+#   SMPMARK      armed as always. IT NEEDS NO NEW ROW: its three marks already have rows
+#                in the SMPMARK block above, they are emitted at PSCI wake time (strictly
+#                pre-terminus), and neither arc touches that path. Checked, not assumed.
+#
+# EVERY PATTERN IN THIS BLOCK WAS READ OUT OF THE EMITTING SOURCE at hw-jetson cd568275,
+# not out of the commit prose — `sched.rs` tail (`run_bsp_tegra`, sched.rs:10378), the
+# `timer.rs` `cfg!` truth-split (:714/:716), `display_tegra.rs` (`sup_install`, :3071),
+# `main.rs` (`jd2_supstate_phase2`'s roles line, :7088), and the load train's own emitters
+# (`load_witness_emit` :8441, `pulse5_witness` :8527, `spread4_witness` :9009,
+# `el0live_witness` :8696, `prio_witness` :8589, the WEDGE-4 tripwires :5085 / :1494).
+# BOTH ARCS ARE ALREADY IN THE TREE (SUPSTATE at b9e59a54, BSPRUN at ea182855 — the exec
+# branches' shas were rebased on landing), so the strings below are the tree's, not a
+# branch's. The boot7j image is not yet cut; the artifact-side check (each family's token
+# in the staged kernel.elf, `LC_ALL=C grep -a` — never `strings`, whose default -n 4 drops
+# short marks) is owed at cut time with the MANIFEST.
+#
+# TOKEN LENGTHS, per the >8-byte immediate-encoding trap: `[orinbsprun]` 12 B,
+# `[supstate]` 11 B, `[spread4]` 10 B, `[el0live]` 10 B, `[wedge4]` 9 B, `[spin1]` 8 B and
+# `[prio]` 7 B — the last two are AT OR UNDER the LLVM immediate-encode floor, so an
+# artifact grep for either must use the longer fragment from its own format literal
+# (`one task has owned this core the whole span` for `[spin1]`, `defer= agedin=`'s
+# neighbourhood for `[prio]`), never the bare tag. This is the `[net4G]` trap, restated
+# because it has already bitten this file once.
+#
+# WHAT MOVES A COUNT, STATED UP FRONT RATHER THAN DISCOVERED IN THE TABLE:
+#   REQUIREs stay at 17. One row is WIDENED (`CAPSTONE COMPLETE` -> the terminus
+#     alternation, argued in full at the row, in the scheduler block above); no REQUIRE is
+#     added, because every line in this block is behind a knob this file does not force —
+#     the SMPMARK/TEGRA-SD argument, permanently binding.
+#   Spec-declared FORBIDs go 9 -> 10: `[wedge4] preempt-in-section`, argued at the row. It
+#     is the ONE addition here that can red a flight, it takes ZERO hits across the whole
+#     bench tree, and ORIN-BSPRUN is the arc that makes it reachable on tegra for the FIRST
+#     TIME (it fires only from inside `timer_preempt`).
+#   PENDINGs go 15 -> 20, OPTIONALs 60 -> 68. (Row census, measured on the file itself:
+#     REQUIRE 17, PENDING 20, OPTIONAL 68, FORBID 10 spec-declared + 3 mbench defaults,
+#     COMPLETE 1.)
+# boot7h REMAINS THE GREEN REFERENCE and this block does not move it: replayed against this
+# file it reads 17/17, 0 forbidden, pending 8/20 — the five new PENDINGs all ⏳, two of the
+# eight new OPTIONALs ✅ (the cooperative-terminus tell and the JD2 key echo, both of which
+# an unarmed attended flight legitimately prints), six ◦. That is the negative control, run
+# before commit.
+#
+# READ THIS BEFORE FLYING BOTH KNOBS TOGETHER — it is a FINDING, not a row. ORIN-BSPRUN's
+# soundness derivation for video/WM locks is CONDITIONAL, and it names its own condition:
+# "the pump can now be preempted while holding one, but on this terminus every other core-0
+# task touches no video state, so there is no contender to deadlock with today; the arc that
+# adds a second video-touching task to core 0 must re-derive this". ORIN-SUPSTATE ADDS
+# EXACTLY TWO SUCH TASKS: `jd2-present` and `jd2-dispatch` both enter `sup_with_surface` and,
+# through the PAL, reach `video::WRITER` at a BARE `lock()` (pal.rs:565). A combined
+# boot7j image is therefore OUTSIDE the derivation BSPRUN's own commit wrote, and the
+# re-derivation that commit demands has not been written anywhere in the tree. The
+# mitigating half, also stated: with preemption armed a bare-lock spin is broken by the
+# quantum, so the shape is a spin-storm and not the hard livelock the SUPSTATE header
+# feared on a non-preemptive core — but "we think it degrades gracefully" is not a
+# derivation, and no row in this file can adjudicate it. Fly the knobs SEPARATELY first if
+# the flight can afford two boots.
+#
+# WHAT THIS BLOCK COULD NOT WRITE A ROW FOR — the honest list, because an unadjudicable
+# change is worth more stated than papered over with a plausible row:
+#   1. `jd2-present` HAS NO WIRE VOICE AT ALL. The presenter (main.rs:7218) contains not one
+#      `serial_println!`: it drains the frame board, owns the save-under cursor composite and
+#      every `pal.render()`, and says nothing. A DEAD PRESENTER IS FROZEN GLASS AND A
+#      PERFECTLY HEALTHY-LOOKING SERIAL LOG. This spec cannot see it; only the panel can.
+#      It is the single largest blind spot ORIN-SUPSTATE introduces.
+#   2. THE ROLE SPAWNS THEMSELVES ARE INVISIBLE. `sched::spawn`'s `:: SCHED: task '<name>' ->
+#      core <n> … ::` witness is `#[cfg(feature = "pi")]` (sched.rs:3681), so on tegra the
+#      `jd2-present` / `jd2-dispatch` spawns print nothing. The `[supstate] roles` row below
+#      proves `spawn` RETURNED (it is printed after both calls) and nothing more — it is not
+#      evidence that either task was ever DISPATCHED.
+#   3. THE 64-DEEP KEY SEAM HAS NO DROP WITNESS. The input source checks `sup_key_full()`
+#      BEFORE each pop, so a backed-up dispatcher leaves keys in the PAL ring rather than
+#      dropping them — but if the PAL ring then overflows the loss is silent on this wire.
+#   4. A `SUP_SURFACE` LOCK-ORDER INVERSION IS A LIVELOCK, NOT A DEADLOCK, and livelocks are
+#      absences. Every acquisition in the module is `try_lock` + `yield_now`, so an inverted
+#      order does not hang the core, it spins the roles against each other forever. Its
+#      signature is "the load train keeps printing while the `:: tegra: JD2 —` transcript
+#      stops" — mbench forbids LINES, not absences, so no FORBID is writable. `[spin1]` does
+#      not catch it either: a yielding task accumulates no live span.
+#   5. PREEMPTION HAS NO COUNTER ON THE WIRE. `(ctx +N/win …)` on the `SCHED: load` line
+#      aggregates cooperative yields and quantum preemptions into one number and cannot
+#      separate them, so "how many times did the pump actually get preempted" is not a
+#      question this spec can put to a capture. `[spread4]`'s presence answers only the
+#      binary "at least once".
+#   6. THE ARC'S OWN HEADLINE CLAIM IS A PANEL READING. ORIN-BSPRUN's commit says the point
+#      is "a keystroke and a click surviving quantum expiry"; a keystroke's SURVIVAL shows on
+#      serial (the KEY-echo row below), a click's does not, and neither says whether the
+#      glass kept up. The playbook carries that half.
+# =====================================================================================
+
+# --- ORIN-BSPRUN, half 1: WHICH TERMINUS DID THIS BOOT ACTUALLY TAKE? ----------------
+# THE PAIR IS THE MEASUREMENT, and it is the cleanest binary in this whole file: exactly
+# ONE of the next two lines prints on any tegra boot, because main.rs:2679 selects between
+# them with `#[cfg(not(feature = "bsprun"))]` / `#[cfg(feature = "bsprun")]` on the same
+# statement. The banner is UNCONDITIONAL on an armed boot that reaches the terminus and is
+# printed BEFORE the `SCHED_ACTIVE` store (deliberately — so it cannot itself be the first
+# preempted print), which is why it is a PENDING of the gate-line shape and not an OPTIONAL.
+# THE BROKEN SHAPES THIS PAIR NAMES:
+#   banner ✅, cooperative tell ◦   the armed terminus ran. Read half 2 next.
+#   banner ◦, cooperative tell ✅   THE KNOB DID NOT TAKE. Either the image was not built
+#                                  with `bsprun` (check the MANIFEST — this is the common
+#                                  and boring cause) or `run_bsp_tegra` was not reached.
+#                                  Everything in half 2 is then meaningless and reads ⏳,
+#                                  which is the correct verdict, not a failure.
+#   BOTH ◦                         the boot never reached the terminus at all. The missing
+#                                  REQUIREs upstream say where it stopped; this pair adds
+#                                  nothing and must not be read as a scheduler fault.
+#   BOTH ✅                         IMPOSSIBLE on one boot from one image — a merged or
+#                                  multi-flight capture (the `line-acm0/raw.log` hazard the
+#                                  half-2 note explains). Re-slice and re-run.
+# The pattern stops at `run()` — the wire text continues `— SCHED_ACTIVE=true, …` past an
+# em dash — and `run\(\)` is contiguous ASCII with the 12-byte family tag in front of it.
+# ZERO hits across the whole bench capture tree (313 files, 2,383,287 lines) and zero on
+# the boot7h slice; the cooperative tell takes 6 hits on `capture/line-acm0/orin.log` (one
+# per Orin flight on that wire) and 1 on the boot7h slice, which is exactly what it should.
+PENDING \[orinbsprun\] boot core [0-9]+ joins run\(\)
+OPTIONAL running the full M4 CAPSTONE cooperatively
+# THE SECOND, INDEPENDENT REGIME TELL — and it is worth having BOTH because it is emitted
+# from a different file by a different arc. ORIN-BSPTICK's arming banner (timer.rs:705, in
+# `el1_bsptick_start` at :693) had its regime clause `cfg!`-split by ORIN-BSPRUN precisely
+# so it would stop claiming "no
+# preemption" on a bsprun image, so the two arms below are a second binary that cannot lie:
+#   `dispatch is on_tick + post-EOI timer_preempt`  the v3 dispatch CARRIES the arm
+#   `dispatch is on_tick ONLY (no timer_preempt …)` arc 1 alone — tick, no preemption
+# Both arms live INSIDE the `all(tegra, bsptick)` banner, so a bsptick-less image prints
+# NEITHER and both read ◦ — which is why the second is OPTIONAL and not the PENDING its
+# unconditionality would otherwise earn: on the boot7i/boot7j knob set `bsprun` implies
+# `bsptick`, so an armed boot7j boot prints the FIRST arm unconditionally (PENDING) while
+# the second arm belongs to a configuration boot7j is not flying (OPTIONAL).
+# CROSS-CHECK AGAINST HALF 1, and this is the row's real value: banner ✅ with `on_tick
+# ONLY` ✅ would mean `run_bsp_tegra` ran while the gic.rs arm was compiled out — a
+# feature-list split that the `compile_error!` is supposed to make unbuildable. If that
+# combination ever appears on a wire, the backstop has a hole and it is a finding, not a
+# flight result. Both patterns are contiguous ASCII well before their line's first em dash.
+# ZERO hits tree-wide for both.
+PENDING dispatch is on_tick \+ post-EOI timer_preempt
+OPTIONAL dispatch is on_tick ONLY \(no timer_preempt arm
+
+# --- ORIN-BSPRUN, half 2: DID PREEMPTION ACTUALLY DELIVER, OR IS THE FLAG INERT? -----
+# THE FAILURE MODE THIS HALF EXISTS FOR. `SCHED_ACTIVE` true with no timer arm, or a timer
+# arm that never fires, gives a flight that LOOKS armed — banner ✅, half 1 green — and has
+# taken exactly zero preemptions. Nothing in half 1 can tell that apart from a working one,
+# and "the image says preemptive" is not "the board preempted".
+#
+# THE DISCRIMINATOR IS `[spread4]`, AND THE REASON IS A LINK-TIME ONE, MEASURED IN-TREE.
+# `spread4_witness` has exactly one steady-state caller, `load_witness_tick` (sched.rs:8346),
+# whose only caller is `timer_preempt`, which returns immediately unless `SCHED_ACTIVE`.
+# Before ORIN-BSPRUN nothing on a tegra image reached it at all: sched.rs:3401 records the
+# `LC_ALL=C grep -a` over the LINKED `arm-tegra-el0` kernel that found no `[spread4] live`
+# in the image — "the string is in the rlib and the linker drops it, because every caller of
+# `spread4_witness` is unreachable on that configuration". ORIN-BSPRUN's post-EOI arm is what
+# makes that caller reachable. So `[spread4] live` on an Orin wire is not merely evidence
+# that preemption fired — before this arc it could not have been PRINTED, and the same
+# reachability change is what turns `[el0live]` and `[prio]` live on this board.
+# CONSEQUENCE WORTH STATING SEPARATELY: the sched.rs:3401 and `EL0_REFUSALS` notes both say
+# `[spread4]` is link-time dead on tegra and that `[el0core] rollup:` exists because of it.
+# THAT CLAIM IS TRUE ONLY KNOB-OFF. On a bsprun image `[spread4]` carries `el0refuse=` again,
+# and the two readers will then disagree only if one of them is broken.
+#
+# THE FALSE-POSITIVE HAZARD IS REAL AND IS MEASURED, because these three are CROSS-PLATFORM
+# strings and the Pi prints them constantly. Across the bench tree: `[spread4] live c0=`
+# 32,337 hits, `[el0live] verdict=` 11,837, `[prio] svc=` 45,113 — overwhelmingly Pi. Scoped
+# to genuinely-Orin captures the picture is the one the rows need: `capture/line-acm0/orin.log`
+# — the Orin scoring wire, 211 `tegra: JD1` lines — carries ZERO of all three, as does every
+# other single-board Orin capture and the boot7h slice. The 2,846 / 5,466 / 3,990 "Orin-ish"
+# hits are ALL in files that are not one Orin boot: `line-acm0/pi.log` and `line-acm0/unknown.log`
+# (the bridge directory is SHARED between benches), `line-acm0/raw.log` (both boards merged), and
+# `orin1-boot2/boot2-recovered.log` (7 tegra lines against a Pi session — `[spin1] … task=99:input`
+# on `cpu=3` is the Pi's task on the Pi's 4-core geometry). NEVER REPLAY THIS FILE AGAINST
+# `raw.log`: it would read another board's preemption as this board's. Score a per-flight LINE
+# RANGE of `orin.log`, which is this file's standing convention anyway.
+# PENDING, AND PERMANENTLY NO-PROMOTE — the TEGRA-SD rule. It is knob-gated by `bsprun`; a
+# REQUIRE would red every unarmed boot on CONFIGURATION. mbench will advise the promotion on
+# the first armed capture; the advice must not be taken, ever.
+PENDING \[spread4\] live c0=[0-9]+/[0-9]+
+# THE TWO COMPANIONS THE SAME TICK CHAINS. `[el0live]` is chained UNCONDITIONALLY from
+# `load_witness_tick` (before the change-suppression, deliberately — sched.rs:8342 says why);
+# `[prio]` is chained only when the load line actually printed. Neither is ever a gate: they
+# are state dumps, and nothing should be REQUIRED to print one (the `[irqel2a]` rule). They
+# are OPTIONAL rather than PENDING for a second reason too — both are change-suppressed, so a
+# genuinely quiet armed board can legitimately print `[spread4]` and not these, and a PENDING
+# would advise promoting a line whose absence is legal.
+# WHAT THEY BUY THE READER: `[el0live] verdict=` names whether the EL0 fleet is NONE / LIVE /
+# STARVED / EXTINCT under preemption, which is the first thing to check if `el0-hello` stops
+# round-tripping; `[prio] svc=`'s per-window deltas say who WON the dispatches the new quantum
+# started handing out. Every arm of both is a MEASUREMENT, never a failure (the JD1-DC rule).
+OPTIONAL \[el0live\] verdict=[A-Z]+ el0 runnable/parked/committed=
+OPTIONAL \[prio\] svc=[0-9]+ el0=[0-9]+ defer=[0-9]+ agedin=[0-9]+ /win
+# THE WEDGE NAMER, AND THE ONE ROW THAT ADJUDICATES "PREEMPTION FIRED AND KILLED THE BOARD".
+# `[spin1]` fires from `pulse5_witness` when a core has been inside ONE task for >10 s while
+# the witness still runs. Knob-off it is unreachable in practice — the cooperative terminus
+# emits the load train exactly TWICE (baseline + one poll before the infinite pump is
+# dispatched; the boot7h slice is the proof, and the SMPINSTR block above says so), and two
+# passes cannot observe a 10 s span. With `bsprun` the train is IRQ-driven and runs FOREVER,
+# so `[spin1]` becomes a live instrument on this board for the first time.
+# IT IS A LEAD, NEVER A VERDICT — the `!NOFOLD` rule verbatim: sched.rs says on the emitter
+# that a genuinely compute-bound core holding one task for 12 s prints it too, and from
+# outside the core those two states are not distinguishable. So OPTIONAL, and no FORBID.
+# HOW TO READ IT ON THIS FLIGHT: `task=<id>:jd2-console` / `:jd2-dispatch` / `:jd2-present`
+# beside a JD2 transcript that has stopped is the interactive-surface wedge boot7j exists to
+# catch. `sched phase=` and `passes=` on the same line say whether the CORE's own loop is
+# still turning (frozen = the dispatch/resume path; advancing = `current` is a lie).
+OPTIONAL \[spin1\] cpu=[0-9]+ span=[0-9]+ms task=[0-9]+:
+# WEDGE-4 W4-B, the rq-acquisition stall namer (sched.rs:1494, emitted ONCE per stalled
+# acquisition at `RQ_STALL_SPINS`; the caller then keeps spinning, so behaviour is unchanged
+# and this only makes a silent wedge legible). ORIN-BSPRUN is what makes rq contention real
+# on this board: core 0 joins `ONLINE_MASK` and becomes a legal steal target for the first
+# time. OPTIONAL and deliberately not FORBID — a recovered stall is a lead about contention,
+# not an invariant break; its FORBID-worthy sibling is the next row and they must not be
+# confused. Written through `w4_str` (raw port writes, `\r\n`-delimited), which mbench splits
+# on; contiguous ASCII.
+OPTIONAL \[wedge4\] RQ STALL core=[0-9]+
+# WEDGE-4 W4-A — THE FIX'S OWN TRIPWIRE, AND THE ONE COUNT THIS BLOCK MOVES (spec-declared
+# FORBIDs 7 -> 8). It prints from INSIDE `timer_preempt` (sched.rs:5085) when a timer IRQ
+# landed while this core was inside a run-queue section. Every rq section runs IRQ-masked
+# (the WEDGE-4 `rq` law), so the word it reads MUST be zero there; sched.rs states the
+# invariant on the emitter — "a line from it means the discipline has been breached again,
+# i.e. some acquisition reached the lock without masking". That is an invariant break, not a
+# measurement, so FORBID is the right kind and not the `!NOFOLD`/`[spin1]` treatment above.
+# IT CANNOT FIRE ON ANY BOOT THIS FILE HAS EVER ADJUDICATED. `timer_preempt` returns at its
+# first line unless `SCHED_ACTIVE`, whose only other aarch64 setter is the Pi-only
+# `start_aps`; ORIN-BSPRUN is the first tegra setter this flag has ever had. Measured: ZERO
+# hits across the bench tree (313 files, 2,383,287 lines) and zero on the boot7h slice, so
+# arming it costs every existing capture nothing and it can only ever speak about a bsprun
+# flight. Rate-limited at `W4A_PRINT_MAX`, so a breached boot reds on the first few and then
+# goes quiet — the count is not the evidence, the presence is.
+FORBID \[wedge4\] preempt-in-section core=[0-9]+
+
+# --- ORIN-SUPSTATE: the lift, the split, and the half-restructure between them -------
+# ARMED BY `supstate` (UNAOS_SUPSTATE=1, implies `tegra`; default OFF, knob-off image
+# byte-identical). BOTH LINES BELOW ARE UNCONDITIONAL ON AN ARMED BOOT THAT REACHES PHASE 2,
+# and phase 2 is a place this file already demands: `REQUIRE JD4.*console OWNS the panel`
+# and `REQUIRE JD2.*console pump live` above are printed on the same path, the JD4/JD2 line
+# LITERALLY three statements before `sup_install`. So they are PENDINGs of the gate-line
+# shape — the ORINCONWIN/TEGRA-SD idiom — and permanently no-promote for the standing reason:
+# a REQUIRE would red every unarmed boot on CONFIGURATION.
+#
+# THE ORDER IS THE INSTRUMENT, AND THE GAP BETWEEN THEM IS THE DANGEROUS SHAPE. `lift`
+# prints from `sup_install` (display_tegra.rs:3071) the instant the surface leaves the task
+# stack; `roles` prints from `jd2_supstate_phase2` (main.rs:7088) after BOTH role spawns.
+# Between them there is nothing but two `sched::spawn` calls.
+#   lift ✅ + roles ✅   the restructure completed. Read the liveness rows below next.
+#   lift ✅ + roles ⏳   THE HALF-RESTRUCTURE. The surface is module-owned and NO ROLE OWNS
+#                       IT — the console's state outlived its holder and nothing inherited
+#                       it, which is the exact condition this arc exists to remove, reached
+#                       by the arc itself. Quote the last five lines of the capture whole.
+#   lift ⏳ + roles ⏳   phase 2 was not reached, or the image is unarmed. The JD2/JD4
+#                       REQUIREs above already say which; this pair adds nothing.
+#   lift ⏳ + roles ✅   IMPOSSIBLE from one image — `sup_install` is the statement before
+#                       the spawns. A merged capture; re-slice.
+# NO FORBID IS WRITABLE FOR THE HALF-RESTRUCTURE and that is a grammar limit, not an
+# oversight: its signature is an ABSENCE, and mbench forbids lines, not absences. The
+# reading above is the instrument.
+# Both patterns are pure ASCII end to end — these two lines carry no em dash, which is why
+# they can key on their full leading fragment rather than stopping at a tag. `screen\+console`
+# escapes the `+`. ZERO hits tree-wide for both.
+PENDING \[supstate\] lift gen=[0-9]+ screen\+console module-owned
+PENDING \[supstate\] roles input=jd2-console presenter=jd2-present dispatcher=jd2-dispatch core=0
+# THE ADOPTION COUNTER, AND WHY `gen=1` IS THE ONLY HEALTHY VALUE TODAY. `sup_install` bumps
+# `generation` on every install and arc 1 calls it EXACTLY ONCE, from phase 2; the counter
+# exists for arc 2's supervisor, which does not exist yet ("Adoption counter for arc 2's
+# supervisor: bumped by `sup_install`, read back by nothing in arc 1"). So on boot7j a
+# `gen=2` or higher is a SECOND install with no supervisor to have ordered it — a finding to
+# quote, not a pass. OPTIONAL rather than FORBID because the honest reading is "something
+# re-installed the surface" and this file does not yet know what a legitimate arc-2
+# re-adoption will look like; converting an unknown into a red is the JD1-DC error.
+OPTIONAL \[supstate\] lift gen=([2-9]|[1-9][0-9]+) screen\+console
+# THE ONLY WIRE SIGNAL EITHER NEW ROLE HAS, and its scarcity is itself a finding (see the
+# unadjudicable list in the banner). Under `supstate` the `:: tegra: JD2 — KEY … ::` echo is
+# printed BY THE DISPATCHER (main.rs:7190/7192, inside `sup_with_surface`), not by the
+# monolithic pump — so on an ARMED, ATTENDED flight this line present means `jd2-dispatch`
+# is alive, took the SURFACE lock, and got to `handle_key`. Absent on an attended armed
+# flight whose `[orinclick]` census (above) keeps ticking is the split's characteristic
+# half-death: the input source lives, the dispatcher does not.
+# OPTIONAL, NEVER PENDING: an UNATTENDED boot prints none of these and is not faulty — the
+# `[orinclick]`-edge argument verbatim. Absence means UNRUN unless a keystroke is known to
+# have been sent.
+# THE PATTERN STARTS AFTER THE EM DASH. The wire text is `:: tegra: JD2 — KEY …`; keying on
+# the `JD2` prefix would put a multi-byte character inside the match on a line that arrives
+# 16+ times per attended flight over a UART shared with the SPE's TCU. Both arms are covered:
+# `'c'` for printable ASCII (main.rs:7190) and `0x0a` for everything else (:7192). MEASURED
+# ACROSS THE WHOLE TREE, and every single hit is a genuine `:: tegra: JD2 — KEY … ::`: 146 on
+# the Orin scoring wire (`capture/line-acm0/orin.log`), 141 across the other single-board Orin
+# captures, 146 in the mixed bridge files (the same lines again, via `raw.log`), 176 under
+# pi4-named bridge directories that are in fact carrying this board's traffic — and 16 on the
+# boot7h slice. ZERO false hits, which the trailing ` ::` is what buys: `JD2` is tegra-only
+# text and no other line in the corpus ends `KEY <quoted-char-or-byte> ::`.
+OPTIONAL KEY ('.'|0x[0-9a-f]{2}) ::
 
 # --- COMPLETE: the END-OF-RUN MARKER this file spent its whole life without ----------
 # Until 2026-08-25 this spec declared ZERO `COMPLETE` markers, so mbench's TRUNCATED
