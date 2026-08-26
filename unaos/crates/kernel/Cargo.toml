@@ -2030,6 +2030,44 @@ orinconwin = ["pidesk", "tegra_el0"]
 # docs/dev/OS/08_VIDEO/orin-desktop.md §6 rung 6.
 orintenant = ["tegra_el0"]
 
+# ORIN-EL1AP (baton orin-8 item 1, SMP-redesign Candidate C): `UNAOS_ORINEL1AP=1` — drop exactly ONE
+# PSCI-woken AP from EL2 to EL1 during `smp_virt` bring-up, so `sched::EL1_CORE_MASK` gains a second
+# bit and a BACKGROUND EL0 tenant has a core to live on.
+#
+# WHAT IT FIXES. `bg` is refused on this board every single time — `el0refuse=<n> el1cores=0x1` — and
+# the refusal is CORRECT: on the `smp_virt` path only the BSP drops, the APs stay at EL2, and an
+# `eret` at EL2 with HCR_EL2.E2H==0 banks ELR_EL2 (the convicted board-killer, sched.rs §EL0-EL1CORE).
+# The filter was always right; what was missing is that no core was ever made ELIGIBLE. The BSP is not
+# a candidate either — it runs the shell, which `run` keeps and `bg` may not. So there is no detached
+# app on the Orin at all today. This arms one.
+#
+# WHAT IT COMPILES: the ORIN-EL1AP block at the tail of `arch/aarch64/boot_tegra.rs` (the seat claim,
+# the bounded wait for the BSP-published EL1 root, the ICC_SRE_EL2.Enable grant, the latch save/restore
+# and the reuse of `enable_el1_regime` + `drop_el2_to_el1_tegra`), the one publishing statement inside
+# `drop_to_el1`, the post-drop re-init block in `smp_virt::__secondary_rust_virt`, and the read-only
+# `sched::el1_core_mask()` the witness prints.
+#
+# WHY IT IMPLIES `tegrasmp` AND `tegra_el0` AND NOTHING ELSE. `tegrasmp` because the drop happens on a
+# PSCI-woken AP and `start_secondaries_tegra` is itself `#[cfg(feature = "tegrasmp")]` — without it
+# there are no APs and this knob would arm a path with no cores on it. `tegra_el0` because an EL1 AP
+# exists to HOST an EL0 tenant, and the EL0 spawn surface (`sched`'s `spawn_user*`, `syscall.rs`) is
+# gated `any(baremetal, tegra_el0)`; `baremetal` implies `pi` and `pi` + `tegra` is a hard
+# `compile_error!` (`arch/aarch64/serial.rs`), so on this board `tegra_el0` is the only satisfiable
+# term and a standalone spelling would be a knob whose effect nothing could reach. Both imply `tegra`,
+# so `UNAOS_ORINEL1AP=1` is self-sufficient. It does NOT imply `bsprun`/`bsptick` — this arc changes
+# an AP's exception level, not the boot core's terminus.
+#
+# FAIL-CLOSED. Every exit that does not complete the drop leaves the core at EL2 and UNSTAMPED, so
+# `el1cores` keeps its current value and EL0 placement stays refused exactly as it is today. Exactly
+# one AP is affected (`EL1AP_SEAT`); the rest stay EL2 scheduler participants, so SPREAD balance for
+# ordinary kernel tasks is untouched.
+#
+# DEFAULT OFF => the whole block, the publishing statement, the call site and the accessor all vanish;
+# the default jetson media (`tegra,tegrasmp`) and the Pi `kernel8.img` are unaffected. The ARMED
+# polarity is type-checked by the `arm-tegra-el1ap` leg of KERNEL_CFG_MATRIX, never by the knob
+# mapping. Witness on the wire: every line carries `[el1ap]` — see arroyo's UNAOS_ORINEL1AP block.
+orinel1ap = ["tegrasmp", "tegra_el0"]
+
 
 # ORIN-SUPSTATE (SMP-redesign Candidate A, arc 1): lift the Orin console surface OUT of
 # `jd2_console_pump`'s task-local storage. The `Screen`/`Console` pair that has been stack-local to
