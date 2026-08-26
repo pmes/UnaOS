@@ -61,9 +61,12 @@ const TASK_STACK_SIZE: usize = 16 * 1024; const STACK_REDZONE: usize = 1024; con
 // the call has already returned — which is exactly what convicts one launcher out of forty-seven
 // without instrumenting any of their interiors.
 //
-// SCOPE. Only `spawn_inner` (KERNEL tasks) paints. The EL0 spawn paths are deliberately left
-// alone — they are not what overflowed, and `stk_probe` on an unpainted stack would report the
-// allocator's zero fill as touched depth. Call the probe from kernel tasks only.
+// SCOPE. `spawn_inner` (KERNEL tasks) paints, and — since EL0STACK — so do `spawn_user_inner` and
+// `spawn_user_thread`: pi's shell-run finding moved the EL0 kernel stacks from "not what overflowed"
+// to "what dipped with no witness", and an unpainted stack is exactly the gauge that could not have
+// seen it (`stk_probe` on one would report the allocator's zero fill as touched depth). With every
+// spawn path painted, the probe is valid from any task and `el0_stk_report` (the retirement-time
+// EL0 reading — see it for why retirement is the honest sample point) reads real depth.
 //
 // COST. Painting is one `fill` of the task's stack per spawn; a probe is one byte scan of the
 // same span plus one serial line. Both are `witness`-gated, so the plain `./arroyo kernel8` media
@@ -139,6 +142,53 @@ pub fn stk_probe(at: &str) {
         used,
         hw,
         len as i64 - hw as i64
+    );
+}
+
+/// EL0STK — retirement-time high-water report for an EL0 task's KERNEL stack: the witness for the
+/// transient dip SPIN-6 is STRUCTURALLY blind to. SPIN-6 validates the PARKED frame pointer, and a
+/// parked task's `ctx_sp` is always in range — a syscall chain that dips below the usable floor and
+/// RETURNS before the task parks leaves nothing for it to see. The paint does not lie back: poison
+/// destroyed stays destroyed, so the deepest point EVER reached is readable at retirement even though
+/// the dip itself was transient. Same saturating caveat as `stk_probe`: the scan starts AT the usable
+/// base, so `hw=len headroom=0` is a LOWER bound, never a depth — which is why `loguard` is printed
+/// beside it: it is `guard_state` over the redzone (1 = the dip ENTERED the absorber below the floor,
+/// 3 = TRAVERSED it), the same reading the dispatch-time LOW-REDZONE report takes, delivered here at
+/// the task's END with its identity attached instead of only while the damage is parked.
+///
+/// One line per EL0 task, from `exit()` — the single funnel for every non-killed retirement
+/// (`sys_exit`, `SYS_THREAD_EXIT`, the M6b fault-kill and `kill_check_current` all land there). A
+/// task killed OFF-CPU skips it (`retire_killed` frees the Box without passing here); the population
+/// the instrument exists for — `shell-run` and the fixture programs, which retire via `exit()` —
+/// all report. Witness-gated like every U7STK instrument: media builds carry nothing.
+#[cfg(all(feature = "witness", any(feature = "baremetal", feature = "tegra_el0")))]
+fn el0_stk_report(task: &Task) {
+    let base = task.stack.as_ptr() as u64 + STACK_REDZONE as u64;
+    let len = task.stack.len() as u64 - (STACK_REDZONE + STACK_HIGHGUARD) as u64;
+    const POISON_WORD: u64 = u64::from_ne_bytes([STACK_POISON; 8]);
+    let mut untouched;
+    unsafe {
+        let w = base as *const u64;
+        let words = len / 8;
+        let mut i = 0u64;
+        while i < words && core::ptr::read_volatile(w.add(i as usize)) == POISON_WORD {
+            i += 1;
+        }
+        untouched = i * 8;
+        let p = base as *const u8;
+        while untouched < len && core::ptr::read_volatile(p.add(untouched as usize)) == STACK_POISON {
+            untouched += 1;
+        }
+    }
+    let hw = len - untouched;
+    serial_println!(
+        "[el0stkhw] task={}:{} len={} hw={} headroom={} loguard={}",
+        task.id,
+        task.name,
+        len,
+        hw,
+        untouched,
+        guard_state(&task.stack[..STACK_REDZONE])
     );
 }
 
@@ -3785,6 +3835,11 @@ fn spawn_user_inner(
     // BG-SPREAD witness aid — record the decision so the caller can read back where its task landed.
     LAST_USER_PLACEMENT.store(cpu, Ordering::Release);
     let mut stack: Box<[u8]> = alloc::vec![0u8; stack_bytes + STACK_REDZONE + STACK_HIGHGUARD].into_boxed_slice();
+    // EL0STK: paint before the initial frame is laid down — the same U7STK instrument `spawn_inner`
+    // carries, extended to EL0 tasks so their kernel stacks stop being the unpainted gauge (see the
+    // SCOPE note on STACK_POISON). Read back at retirement by `el0_stk_report`.
+    #[cfg(feature = "witness")]
+    stack.fill(STACK_POISON);
     let ctx_sp = build_initial_frame(&mut stack, user_task_trampoline);
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
     let task = Box::new(Task {
@@ -3907,6 +3962,10 @@ pub fn spawn_user_thread(
     let done = Arc::new(Semaphore::new(0));
     done.init(); // reserve the waiter list BEFORE the thread can run + post (alloc-free park)
     let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE + STACK_REDZONE + STACK_HIGHGUARD].into_boxed_slice();
+    // EL0STK: paint — see `spawn_user_inner`. Threads retire through the same `exit()` funnel, so
+    // `el0_stk_report` reads their stacks too; an unpainted one would report zero fill as depth.
+    #[cfg(feature = "witness")]
+    stack.fill(STACK_POISON);
     let ctx_sp = build_initial_frame(&mut stack, user_task_trampoline);
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
     let task = Box::new(Task {
@@ -4917,6 +4976,11 @@ pub fn exit() -> ! {
             // split below subtracts the ones that were killed, so `exit - kill_oncpu` reads as
             // "left on its own terms" without this site needing to know which it was.
             EL0_REAPED.exit.fetch_add(1, Ordering::Relaxed);
+            // EL0STK: the retirement-time stack reading — this task's kernel stack is still live
+            // (we are executing on it, at shallow depth) and about to be freed, so this is the last
+            // and the honest moment to read the paint. See `el0_stk_report`.
+            #[cfg(all(feature = "witness", any(feature = "baremetal", feature = "tegra_el0")))]
+            el0_stk_report(&*raw);
         }
         // Settle any kill request naming this task (by tid, or by ASID for a whole-process kill). Placed
         // HERE — after the slot teardown and the joiner post, with only the state store and the final
