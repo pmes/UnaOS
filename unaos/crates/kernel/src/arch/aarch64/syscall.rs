@@ -7807,6 +7807,26 @@ const EXEC_KILLED_STATUS: i32 = i32::MIN;
 /// with a real exit code for the same reason the kill sentinel does not.
 const EXEC_CLOSED_STATUS: i32 = i32::MIN + 1;
 
+/// EL0STACK — the `run` task's KERNEL stack size, and the measurement the U7STK law demands with it.
+///
+/// This is the stack the program's SYSCALL CHAINS run on, and those chains carry the largest frames in
+/// the kernel (`wm::composite` 6640 B; the `fbcon::__print -> composite` subtree 5520 B on its own) on
+/// behalf of whatever the EL0 program asks for. The blanket 16 KiB was measured EXHAUSTED on the very
+/// first armed reading (kernel8-test QEMU raspi4b, 2026-08-25, the EXEC-UVUG 300-frame vug run):
+///
+///   [el0stkhw] task=114:shell-run len=16384 hw=16384 headroom=0 loguard=1
+///   [redzone] cpu=2 LOW-REDZONE entered task=114:shell-run — … ABSORBED … grow this task's stack
+///
+/// `hw=16384` is SATURATING (a lower bound, never a depth) and `loguard=1` says the dip went past the
+/// floor into the 1024 B absorber — transiently: the run exited 0 and SPIN-6 saw nothing, which is
+/// exactly pi's finding (a parked task's ctx_sp is always in range; the dip happens between parks).
+/// The rest of the GUI-app class reads within a few hundred bytes of the same floor on the same boot
+/// (el0-fb headroom=1408, el0-wcb 344, el0-midden 344, one bg-user 344), and the U7STK conviction
+/// showed metal adds ~5.5 KiB of xHCI/fbcon subtree under chains QEMU never takes. 2x the blanket
+/// clears the measured (saturated) 16.4+ KiB with metal margin — the same figure the u7-launch and
+/// input tasks were sized to from their own converging lower bounds.
+const RUN_IMAGE_KSTACK_SIZE: usize = 32 * 1024;
+
 /// EXEC-1: load an already-read program IMAGE (flat or ELF64) into a fresh EL0 slot, run it to completion
 /// on THIS core, and return its exit status. The synchronous shell `run <path>` entry: the EL1/ASID-0 panel
 /// shell reads the bytes off the VFS and hands them here. We map (via the shared `map_image_into_slot`),
@@ -7896,7 +7916,14 @@ pub fn run_user_image(
     // wide with no UART write inside, which is why only this launcher ever failed on metal. See
     // `proc_find_unpublished` for the full accounting of which publishers can match and why.
     PROCS[pi].asid.store(asid, Ordering::Release);
-    let pid = super::sched::spawn_user_slot(name, mapped.base, mapped.sp, mapped.ttbr0, cpu);
+    let pid = super::sched::spawn_user_slot_stack(
+        name,
+        mapped.base,
+        mapped.sp,
+        mapped.ttbr0,
+        cpu,
+        RUN_IMAGE_KSTACK_SIZE,
+    );
     // Publish the pid. The row may ALREADY be `PEXITED` by now (the late-publish rescue fired inside the
     // window); storing the pid onto a reaped-but-not-yet-freed row is harmless — the row is not recycled
     // until `proc_free`, and the wait loop below observes `PEXITED` on its very first pass.
