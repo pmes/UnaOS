@@ -2177,9 +2177,29 @@ KERNEL_CFG_MATRIX=(
   # universe — so adding them to arm-pi alone would have silently deleted them from the x86 mix legs,
   # trading the aarch64 coverage hole for an x86 one. Named on both legs, the universe is unchanged
   # and both arches type-check the seam.
+  # WCD-VALVE (appended 2026-08-25): `wcdvalve` is APPENDED at the end — until now it was named by
+  # NO leg of this matrix at all, the tegra_el0/simmer_test/selfup shape one lane over: every valve
+  # item in `video/wm.rs` is gated `all(target_arch = "x86_64", feature = "witness",
+  # feature = "wcdvalve")`, so the configuration `UNAOS_WCDVALVE=1` turns ON was type-checked by
+  # nothing NAMED. Being arm-named nowhere, `wcdvalve` does ride the derived mix legs under the
+  # "unclaimed => assume x86" rule — but the gated items need `witness` AND `wcdvalve` both ON, and
+  # the pairwise array guarantees only ordered pairs (Y on, X off), never both-ON for a chosen pair;
+  # any both-ON mix leg that happens to exist is INDEX-DERIVED and stale the moment a feature lands
+  # (the `x86-vsyncpace` REVIEW C3 lesson, verbatim — and live: reconstructing `build_cfg_legs`
+  # against today's Cargo.toml finds two mix legs carrying the pair, which is luck of the mask
+  # indices, not a guarantee). This leg carries `witness` already, so naming `wcdvalve` here
+  # compiles the armed valve by construction, named rather than derived. Verified non-vacuous the
+  # GATE-CFG way, measured not assumed: a deliberate type error planted in a `wcdvalve`-gated item
+  # reds THIS configuration naming the wm.rs line, and compiles out of every board leg.
+  # UNIVERSE SIDE EFFECT: none. `wcdvalve` is named by no arm-* leg, so it was already IN
+  # `x86_cfg_universe` (unclaimed) and naming it on an x86-* leg removes nothing — universe size,
+  # mix-leg count and board-leg count are all unchanged: +0 legs, one list one knob longer.
+  # `./arroyo check` prints the live board/mix counts every run — read them there, not here. The
+  # aarch64 half needs no leg: `arm_features` strips `wcdvalve` from arm media builds (see the
+  # -Cmetadata note there) precisely because it emits not one byte of aarch64 code.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the
