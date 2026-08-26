@@ -7943,6 +7943,12 @@ pub fn run_user_image(
     // Timeout path (task still alive, no teardown yet). Setting a focus RESETS the ring, so a fresh program
     // starts with an empty input queue.
     user_input_set_active(asid);
+    // ORIN-INPUT: zero the per-run input counters so the rollup below reports THIS tenant's input rather
+    // than the boot's running total. See `xusb_tegra`'s ORIN-INPUT block for why the tegra path needs a
+    // pump of its own: no `baremetal` => no `usb_pump` task and no `route_input_to_active_el0`, and the
+    // Orin's only HID pump (`jd2_console_pump`) is parked in this very call stack for the whole run.
+    #[cfg(feature = "orininput")]
+    super::xusb_tegra::oi_reset();
     // Deadline-bounded cooperative wait: yield so the co-located task runs; its SYS_EXIT (or the fault-kill
     // path) marks PROCS[pi] EXITED and records the status via the GENERIC child-reap short-circuit.
     //
@@ -8069,6 +8075,14 @@ pub fn run_user_image(
         if run_deadline_timed_out(in_takeover, now, budget_start, deadline_ticks) {
             break;
         }
+        // ORIN-INPUT: the tegra input pump. This wait loop is the ONE context that runs for exactly as
+        // long as the tenant does — the shell task is parked here, so on the Orin nothing else is polling
+        // the controller (`jd2_console_pump`, the board's only pump, is blocked further down this same
+        // call stack, which is also why its `[orinclick]`/`[orintenant]` censuses cannot emit during a
+        // run). Harvest xHCI, then route through the shared `user_input_enqueue` seam. Placed AFTER the
+        // deadline check and BEFORE the yield so a run about to end does not take a fresh claim.
+        #[cfg(feature = "orininput")]
+        super::xusb_tegra::oi_pump();
         super::sched::yield_now();
     }
     let outcome = if PROCS[pi].state.load(Ordering::Acquire) == PEXITED {
@@ -8080,6 +8094,12 @@ pub fn run_user_image(
     } else {
         RunOutcome::Timeout
     };
+    // ORIN-INPUT: the per-run input rollup, emitted UNCONDITIONALLY — a run that delivered nothing must
+    // say so with a named verdict, because a silent hop is indistinguishable from a hop that never ran.
+    // Printed BEFORE the focus clear just below so its `focus=` field still shows the ASID this run
+    // actually held, not the 0 the clear is about to install.
+    #[cfg(feature = "orininput")]
+    super::xusb_tegra::oi_rollup("final");
     // INPUT-WIRE: drop input focus so the shell regains the keyboard the instant this program returns.
     // Belt-and-suspenders with `clear_handle_row`'s teardown clear (which fired already if the program
     // exited/was killed and its slot was torn down) — and the SOLE clear on the Timeout path, where the
