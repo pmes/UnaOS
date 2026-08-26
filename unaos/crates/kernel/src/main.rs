@@ -2572,13 +2572,13 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
         ram_gib_mask: mmu.ram_gib_mask,
     });
 
-    // ORIN-SMP-3 (the real 6-core Orin bring-up, `UNAOS_TEGRASMP=1`): with the `tegrasmp` feature
-    // armed, kick off the secondaries HERE — after JM4 (GIC/timer/heap/SMC all live) and while the
-    // BSP is still at EL2 (before the JM6 drop, so the woken cores replay the EL2 regime). Presence is
-    // sourced from the DTB `/cpus` node ALONE (RIDER 1); the kick-off STOPs (single-core) if `/cpus`
-    // names nothing. Default OFF => the whole call + the enumerator vanish and the tegra image is
-    // byte-identical to baseline. The metal verdict is the attended Orin bench (see §ORIN-SMP-3); on
-    // firmware where the JM5 `CPU_ON` wall still stands this would RAS-fault, so it is knob-gated.
+    // ORIN-SMP-3 (the real 6-core Orin bring-up): with the `tegrasmp` feature armed, kick off the
+    // secondaries HERE — after JM4 (GIC/timer/heap/SMC all live) and while the BSP is still at EL2
+    // (before the JM6 drop, so the woken cores replay the EL2 regime). Presence is sourced from the
+    // DTB `/cpus` node ALONE (RIDER 1); the kick-off STOPs (single-core) if `/cpus` names nothing.
+    // §ORIN-SMP-DEFAULT: `tegrasmp` is DEFAULT-ON for every tegra build (arroyo arms it for
+    // `UNAOS_TEGRA=1` and `esp-jetson` alike, metal-proven across SMP-1..8) unless `UNAOS_NOTEGRASMP=1`
+    // opts out, dropping call + enumerator => pre-flip baseline. Flip record: arch_arm64.md §ORIN-SMP-DEFAULT.
     #[cfg(feature = "tegrasmp")]
     unaos_kernel::arch::smp_virt::start_secondaries_tegra(dtb_addr, dtb_size, mmu.ram_gib_mask);
 
