@@ -2686,3 +2686,309 @@ pub fn orin_conwin() -> bool {
     );
     routed
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+// ORIN-TENANT — rung 6 of the Orin desktop ladder. `orintenant`, DEFAULT OFF.
+//
+// EL0 WINDOW TENANTS: an EL0 program (`run /fat/VUG.ELF`) owns a compositor window through the
+// arch-neutral SYS_WIN_* surface instead of the raw panel. The verbs themselves are NOT this rung's —
+// they are the shared WC-B implementation `arch/aarch64/syscall.rs` has carried since the Pi arc, and
+// they compile on this board under `tegra_el0` alone. What this rung adds is (a) the CRYSTAL-HD
+// geometry parity fix in `mmu_tegra_el0.rs` (unconditional under `tegra_el0` — see the block comment
+// there for the two live defects it removes), and (b) THIS instrument: the arming point that gives
+// the EL0 present path an unmasked staging buffer, and the `[orintenant]` witness family that lets a
+// metal flight adjudicate "vug owns a window" from the wire.
+//
+// THE OWNERSHIP MODEL, stated because the x86 seat's standing warning (rmbp 6, 2026-08-25) is about
+// exactly this seam: THE TENANT SURFACE IS KERNEL-OWNED, NEVER TASK-OWNED. The compositor row's
+// `surf` pointer names the slot's FB backing — `alloc_zeroed`ed once per slot from the kernel heap
+// (`mmu_tegra_el0::SLOT_BACKING`), never freed, recycled per tenant with a `build_slot` scrub — and
+// is mapped INTO the tenant at the fixed window VA, not lent BY it. No compositor pointer ever names
+// memory whose lifetime is the EL0 task's. On task exit the teardown funnel
+// (`syscall::clear_handle_row` -> `win_close_asid` -> `wm::close_owner` -> `close_compat` ->
+// `focus_release`) unmaps the surface leaves and retires every row the ASID owned, so a window row
+// can never outlive its owner into the next tenant's frames — that funnel predates this rung and is
+// shared with the Pi; the `[orintenant] reap` line below is its wire witness on this board.
+//
+// CLOSE POLICY, decided and stated (the boot7h contrast): kernel furniture REFUSES close
+// (`close_owner` on a pseudo-ASID -> `furniture-refused`, the CONSOLEWIN law). A TENANT CLOSES: the
+// close disc on an EL0-owned window runs the ungated CLOSE-CLEAN chain — `close_owner(asid)` kills
+// the process with `EXEC_CLOSED_STATUS`, `run` reports `closed (window close box)`, and the same
+// teardown funnel reaps the row. Nothing here changes that; the census counts it.
+//
+// MINIMISE, reported rather than repainted as policy: the minimise arm in `wc_click_route` is
+// ungated, so a tenant CAN be parked on any image. The routes back are the dock (`pidesk` aboard —
+// the conjunction image) or kill/exit; the dock round-trip is the ladder's next attended item
+// (§3.9.1) and is NOT claimed here. The census prints `pidesk=` so a capture names which image shape
+// the park happened on.
+//
+// WITNESSES (tokens all LONGER than 8 bytes — LLVM immediate-encodes shorter ones invisibly to an
+// artifact grep):
+//   1. `[orintenant] arm ...`         — ONCE, from the terminus line: panel, stage reserve, caps.
+//   2. `[orintenant] create ... -> V` — one per SYS_WIN_CREATE outcome (TENANT-WINDOW /
+//      HEADLESS-COMPOSITOR-REFUSED / DECLINE reason=geometry-over-max).
+//   3. `[orintenant] close ...`       — one per owner SYS_WIN_CLOSE.
+//   4. `[orintenant] reap ...`        — the exit-path sweep, when it actually reaped rows.
+//   5. `[orintenant] census ... -> V` — every ~10 s from the pump's own drain loop (rung 3's idiom:
+//      the census IS the liveness; `IDLE-NO-TENANTS` is UNRUN, never PASS).
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ORIN-TENANT — lifetime counters, bumped from the four line-neutral `syscall.rs` call sites and
+/// read by the census. Creates that returned an id; creates the compositor refused a row for
+/// (`wm_id == WIN_NONE` — the verbs still work, nothing reaches the panel); geometry refusals
+/// (`-EINVAL` over the 288x288 cap — the exact answer the pre-parity kernel gave the shipped vug,
+/// so this counter going nonzero after the fix is a FAIL the census names); owner closes; and rows
+/// reaped by the exit-path teardown funnel.
+#[cfg(feature = "orintenant")]
+static TEN_CREATES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "orintenant")]
+static TEN_HEADLESS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "orintenant")]
+static TEN_GEOM_REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "orintenant")]
+static TEN_CLOSES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "orintenant")]
+static TEN_REAPED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// ORIN-TENANT — per-ASID rows reaped by the CURRENT teardown pass (index = asid, 0 unused). Bumped
+/// row-by-row inside `win_close_asid`'s masked loop (a bump is lock-safe where a print is not),
+/// swapped to 0 and PRINTED by `orin_tenant_note_reap_done` after the funnel releases `WINDOWS`.
+/// One teardown of one ASID runs on one core, so the pair cannot interleave against itself.
+#[cfg(feature = "orintenant")]
+static TEN_REAP_PENDING: [core::sync::atomic::AtomicU32; 9] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; 9];
+/// ORIN-TENANT — census bookkeeping, `orinclick`'s shape: arm latch, last-census tick, sequence,
+/// and the CNTPCT reading at arm time.
+#[cfg(feature = "orintenant")]
+static TEN_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "orintenant")]
+static TEN_CENSUS_TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "orintenant")]
+static TEN_CENSUS_SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "orintenant")]
+static TEN_T0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// ORIN-TENANT — census cadence in pump sweep ticks (~250 ms each): 40 ≈ 10 s, `orinclick`'s number
+/// for `orinclick`'s reason (free at 115200 baud; a stopped census localises a dead pump).
+#[cfg(feature = "orintenant")]
+const TEN_CENSUS_PERIOD: u64 = 40;
+/// ORIN-TENANT — per-event line budget. Creates/closes are program-rate, not frame-rate, so this is
+/// a stuck-loop guard, not a rate limit: an EL0 program looping on SYS_WIN_CREATE would otherwise
+/// own the UART. The census reports the suppressed remainder.
+#[cfg(feature = "orintenant")]
+static TEN_LOGGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "orintenant")]
+const TEN_LOG_MAX: u32 = 256;
+
+/// ORIN-TENANT — CNTPCT/CNTFRQ on the calling core (the pump is timerless-cooperative post-JM6; the
+/// free-running counter is its only clock — `clk_now_freq`'s reason, duplicated because that fn is
+/// `orinclick`-gated and this rung must not imply that knob).
+#[cfg(feature = "orintenant")]
+fn ten_now_freq() -> (u64, u64) {
+    let (now, freq): (u64, u64);
+    unsafe {
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) now, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq, options(nomem, nostack, preserves_flags));
+    }
+    (now, freq)
+}
+
+/// **ORIN-TENANT — the arming point.** Appended to `tegra_early_stop`'s terminus line (zero source
+/// lines added — the tegra knob-off byte-identity constraint), after `orin_conwin`'s statement so a
+/// conjunction boot's console row is already in the table this census counts.
+///
+/// Two jobs, in order:
+///   1. **Reserve the compositor staging buffer** (§3.3, the F-family reason). `wm`'s staged
+///      presents run inside `SYS_WIN_PRESENT`'s IRQ mask; on an image where no other rung called
+///      `reserve_stage` (plain `orintenant`, no `orindesk`/`orinconwin`), the tenant's FIRST present
+///      would grow the stage under that mask — a masked acquisition of the global heap `Mutex`.
+///      `reserve_stage` is idempotent and grow-only, so repeating it beside the other rungs' calls
+///      costs nothing on the conjunction image.
+///   2. **Print the pre-state** the flight scores create lines against: panel, stage bytes, live
+///      table rows, the negotiable cap (`FB_WIN_MAX_*` — 288x288 iff the parity fix is aboard, so
+///      the arm line itself is the parity witness), slot count, and which sibling knobs are aboard.
+///
+/// A headless boot DECLINES, named: with no panel there is no stage to size and nothing for a
+/// tenant present to reach — the verbs still answer (fail-closed at the `wm` layer, `WIN_NONE`
+/// rows), and the census will report any such creates as HEADLESS rather than losing them.
+#[cfg(feature = "orintenant")]
+pub fn orin_tenant_arm() {
+    use crate::video::wm;
+    use core::sync::atomic::Ordering;
+
+    let (now, _) = ten_now_freq();
+    TEN_T0.store(now, Ordering::Relaxed);
+    let info = {
+        let fb = *crate::video::WRITER.lock();
+        if !fb.is_ready() {
+            serial_println!(
+                "[orintenant] arm -> DECLINE reason=no-panel (headless boot — JD1 seeded no scanout; \
+                 SYS_WIN_* still answers, every row is compositor-refused and the census will say so)"
+            );
+            TEN_ARMED.store(true, Ordering::Release);
+            return;
+        }
+        fb.info()
+    };
+    let staged = wm::reserve_stage(&info);
+    serial_println!(
+        "[orintenant] arm panel={}x{}x{} stage={} table={} cap={}x{} rslots={} uslots={} orindesk={} orinclick={} orinconwin={} pidesk={} -> ARMED",
+        info.width, info.height, info.bytes_per_pixel,
+        staged, wm::count(),
+        crate::arch::aarch64::uslots::FB_WIN_MAX_W, crate::arch::aarch64::uslots::FB_WIN_MAX_H,
+        crate::arch::aarch64::uslots::FB_WIN_SLOTS, crate::arch::aarch64::uslots::USER_SLOTS,
+        cfg!(feature = "orindesk") as u8, cfg!(feature = "orinclick") as u8,
+        cfg!(feature = "orinconwin") as u8, cfg!(feature = "pidesk") as u8
+    );
+    TEN_ARMED.store(true, Ordering::Release);
+}
+
+/// ORIN-TENANT — a SYS_WIN_CREATE the geometry gate refused (`-EINVAL`, over the negotiated cap).
+/// Called from the refusal line itself, BEFORE the verb takes any lock, so the print is unheld.
+/// This is the exact wire the pre-parity kernel would have produced for the shipped vug; after the
+/// parity fix it is reachable only by a program asking past 288 — and the census turns a nonzero
+/// count into `FAIL reason=geometry-refused`, because a shipped binary being refused geometry is
+/// rung 6's own defect class, not an app bug to shrug at.
+#[cfg(feature = "orintenant")]
+pub fn orin_tenant_note_refuse(w: u64, h: u64) {
+    use core::sync::atomic::Ordering;
+    TEN_GEOM_REFUSED.fetch_add(1, Ordering::Relaxed);
+    if TEN_LOGGED.fetch_add(1, Ordering::Relaxed) < TEN_LOG_MAX {
+        serial_println!(
+            "[orintenant] create surf={}x{} -> DECLINE reason=geometry-over-max cap={}x{}",
+            w, h,
+            crate::arch::aarch64::uslots::FB_WIN_MAX_W,
+            crate::arch::aarch64::uslots::FB_WIN_MAX_H
+        );
+    }
+}
+
+/// ORIN-TENANT — a SYS_WIN_CREATE that returned an id. `wm_bound` is whether the compositor minted
+/// a row (`wm_id != WIN_NONE`); false is the HEADLESS shape — verbs succeed, nothing reaches the
+/// panel — which the census surfaces as a DECLINE rather than letting a green exit code stand over
+/// an invisible window.
+///
+/// PRINTED UNDER THE `WINDOWS` HOLD (the verb holds it to its last expression), and that is
+/// deliberate rather than an oversight: the global order is `WINDOWS` ⊃ `wm::TABLE` ⊃ `WRITER`
+/// (WC-B's own doc), a routed console's `serial_println!` descends exactly that way
+/// (`route_present_banded` -> `TABLE`, then per-band `WRITER` micro-holds), and nothing under
+/// `video/` can re-enter the syscall layer. Cost is one bounded UART/composite per CREATE — a
+/// program-rate event, the same class of masked hold `sys_win_present` already takes per frame.
+#[cfg(feature = "orintenant")]
+pub fn orin_tenant_note_create(asid: u64, id: u64, w: u32, h: u32, wm_bound: bool) {
+    use core::sync::atomic::Ordering;
+    TEN_CREATES.fetch_add(1, Ordering::Relaxed);
+    if !wm_bound {
+        TEN_HEADLESS.fetch_add(1, Ordering::Relaxed);
+    }
+    if TEN_LOGGED.fetch_add(1, Ordering::Relaxed) < TEN_LOG_MAX {
+        serial_println!(
+            "[orintenant] create asid={} win={} surf={}x{} wm-bound={} -> {}",
+            asid, id, w, h, wm_bound as u8,
+            if wm_bound { "TENANT-WINDOW" } else { "HEADLESS-COMPOSITOR-REFUSED" }
+        );
+    }
+}
+
+/// ORIN-TENANT — an owner's own SYS_WIN_CLOSE completed (row freed, surface unmapped, compositor
+/// row destroyed). Printed after the verb released `WINDOWS` and ran the wm drain barrier.
+#[cfg(feature = "orintenant")]
+pub fn orin_tenant_note_close(asid: u64, id: u64) {
+    use core::sync::atomic::Ordering;
+    TEN_CLOSES.fetch_add(1, Ordering::Relaxed);
+    if TEN_LOGGED.fetch_add(1, Ordering::Relaxed) < TEN_LOG_MAX {
+        serial_println!("[orintenant] close asid={} win={} -> CLOSED-BY-OWNER", asid, id);
+    }
+}
+
+/// ORIN-TENANT — one row reaped by `win_close_asid`'s masked sweep (exit-path teardown). Bump only:
+/// this runs inside the `WINDOWS` hold in an already-IRQ-masked teardown, where a print would be a
+/// gratuitous hold extension; `orin_tenant_note_reap_done` prints the total once the funnel is past
+/// the lock.
+#[cfg(feature = "orintenant")]
+#[inline(never)] // cold (task-exit only), and a `bl` in the artifact is the reachability proof this family carries
+pub fn orin_tenant_note_reap_row(asid: u64) {
+    use core::sync::atomic::Ordering;
+    if (asid as usize) < TEN_REAP_PENDING.len() {
+        TEN_REAP_PENDING[asid as usize].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// ORIN-TENANT — the exit-path reap's wire witness, printed from `clear_handle_row` after
+/// `win_close_asid` returned (WINDOWS released; the funnel's own IRQ mask still held, as every
+/// teardown print on this arch is). Silent when the dying ASID owned no windows — el0-hello and
+/// every non-window fixture exit without a line, so the reap wire is evidence, not noise.
+#[cfg(feature = "orintenant")]
+#[inline(never)] // cold (task-exit only), and a `bl` in the artifact is the reachability proof this family carries
+pub fn orin_tenant_note_reap_done(asid: u64) {
+    use core::sync::atomic::Ordering;
+    if (asid as usize) >= TEN_REAP_PENDING.len() {
+        return;
+    }
+    let n = TEN_REAP_PENDING[asid as usize].swap(0, Ordering::Relaxed);
+    if n == 0 {
+        return;
+    }
+    TEN_REAPED.fetch_add(n, Ordering::Relaxed);
+    if TEN_LOGGED.fetch_add(1, Ordering::Relaxed) < TEN_LOG_MAX {
+        serial_println!("[orintenant] reap asid={} rows={} -> TENANT-REAPED (exit-path funnel: win_close_asid unmapped + freed, wm::close_owner retires the compositor rows next)", asid, n);
+    }
+}
+
+/// **ORIN-TENANT — the ~10 s census, from `jd2_console_pump`'s idle sweep** (appended line-neutral
+/// beside `orin_click_census`'s call). Rung 3's whole argument applies verbatim: this seam's death
+/// is a dead pump, nothing re-homes a dead pump's roles, and a census that stops IS the report. It
+/// prints on its own core off its own CNTPCT, so it cannot report liveness it does not have;
+/// `seq=` increments by one per line so a serial gap names itself.
+///
+/// Verdict ladder (first match wins), each reachable and none constant:
+///   * `FAIL reason=geometry-refused`  — a create was refused over the cap: the pre-parity defect
+///     observed live; must never print on a post-parity image running the shipped fixtures.
+///   * `DECLINE reason=headless-rows`  — creates succeeded but the compositor refused rows (no
+///     panel, or `wm` table full): verbs green, glass empty, said out loud.
+///   * `TENANT-LIVE`                   — at least one EL0-owned row is in the table NOW.
+///   * `TENANT-EXITED-CLEAN`           — tenants existed and every one left through close/reap.
+///   * `IDLE-NO-TENANTS`               — nobody ran an EL0 window program. **UNRUN, never PASS.**
+#[cfg(feature = "orintenant")]
+pub fn orin_tenant_census(tick: u64) {
+    use crate::arch::aarch64::syscall as sc;
+    use core::sync::atomic::Ordering;
+
+    // FOOTPRINT — rung 3's rule: cadence decided first, off register reads; the WINDOWS table is
+    // touched only on the ~1-in-40 pass that prints. `orin_tenant_win_stats` is a masked micro-hold
+    // (count + fold, no pixel work), sequential with — never nested inside — any lock here.
+    if !TEN_ARMED.load(Ordering::Acquire) {
+        return;
+    }
+    if tick.wrapping_sub(TEN_CENSUS_TICK.load(Ordering::Relaxed)) < TEN_CENSUS_PERIOD {
+        return;
+    }
+    TEN_CENSUS_TICK.store(tick, Ordering::Relaxed);
+    let seq = TEN_CENSUS_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    let (now, freq) = ten_now_freq();
+    let up = if freq == 0 { 0 } else { now.wrapping_sub(TEN_T0.load(Ordering::Relaxed)) / freq };
+
+    let (rows, bound, presents) = sc::orin_tenant_win_stats();
+    let creates = TEN_CREATES.load(Ordering::Relaxed);
+    let headless = TEN_HEADLESS.load(Ordering::Relaxed);
+    let refused = TEN_GEOM_REFUSED.load(Ordering::Relaxed);
+    let closes = TEN_CLOSES.load(Ordering::Relaxed);
+    let reaped = TEN_REAPED.load(Ordering::Relaxed);
+    let logged = TEN_LOGGED.load(Ordering::Relaxed);
+    let suppressed = logged.saturating_sub(TEN_LOG_MAX.min(logged));
+
+    let verdict = if refused != 0 {
+        "FAIL reason=geometry-refused"
+    } else if creates != 0 && headless != 0 {
+        "DECLINE reason=headless-rows"
+    } else if rows != 0 {
+        "TENANT-LIVE"
+    } else if creates != 0 {
+        "TENANT-EXITED-CLEAN"
+    } else {
+        "IDLE-NO-TENANTS"
+    };
+    serial_println!(
+        "[orintenant] census seq={} t={} up={}s rows={} bound={} creates={} headless={} refused={} closes={} reaped={} presents={} suppressed={} focus={:#x} pidesk={} -> {}",
+        seq, tick, up, rows, bound, creates, headless, refused, closes, reaped, presents,
+        suppressed, sc::user_input_active(), cfg!(feature = "pidesk") as u8, verdict
+    );
+}

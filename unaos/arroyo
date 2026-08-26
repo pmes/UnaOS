@@ -961,6 +961,31 @@ _feats=""
 # mapping. Witness on the wire: `[orinselfup]`. Payloads: `./arroyo selfup-pak`.
 # See docs/dev/OS/10_INSTALL/orin-selfupdate.md.
 [ -n "${UNAOS_SELFUP:-}" ] && _feats="${_feats}selfup,"
+# ORIN-TENANT (rung 6): UNAOS_ORINTENANT=1 arms the EL0 window-tenant instrument — the terminus-line
+# `orin_tenant_arm` (which pre-sizes the compositor staging buffer so an EL0 SYS_WIN_PRESENT never
+# grows it under its own IRQ mask — §3.3's F-family reason, on an image where no other desktop rung
+# reserved it), the `[orintenant]` create/refuse/close/reap wires in `arch/aarch64/syscall.rs` (all
+# line-neutral, all cfg-gated), and the ~10 s `[orintenant] census` from the JD2 pump's sweep.
+#
+# THE SYSCALLS ARE NOT BEHIND THIS KNOB. SYS_WIN_CREATE/_PRESENT/_PRESENT_ROWS/_MOVE/_CLOSE are the
+# shared arch-neutral WC-B surface and compile under `tegra_el0` alone; rung 6's enabling change — the
+# CRYSTAL-HD geometry parity fix in `mmu_tegra_el0.rs` (4 slots x 0x51000 / 288x288, matching
+# `boot.rs` and the x86 twin, so the shipped `user-vug`'s SYS_WIN_CREATE(288,288) is granted instead
+# of -EINVAL) — rides `tegra_el0` unconditionally. This knob is the INSTRUMENT and the arming point.
+#
+# THE DEMONSTRATION FLIGHT is the §6.1 conjunction PLUS this knob:
+#     UNAOS_ORINTENANT=1 UNAOS_ORINCONWIN=1 UNAOS_ORINDESK=1 UNAOS_ORINCLICK=1 ./arroyo esp-jetson
+# then `run /fat/vug.elf` at the shell — the census flips IDLE-NO-TENANTS -> TENANT-LIVE and the
+# create line names the window. `orintenant` alone is also sound (stage reserved, witnesses live,
+# tenants composited beside the raw console) but carries no dock and no click routing; the census
+# prints `pidesk=`/knob fields so a capture names which image shape it ran on.
+#
+# `orintenant = ["tegra_el0"]` (implies `tegra`), so the knob is self-sufficient. The ARMED polarity
+# is type-checked by the `arm-tegra-tenant` leg of KERNEL_CFG_MATRIX and the full-conjunction cross
+# by `arm-tegra-conwin` (which carries `orintenant` since this rung), never by this mapping.
+# Witness on the wire: `[orintenant] arm`, `[orintenant] create`, `[orintenant] close`,
+# `[orintenant] reap`, `[orintenant] census`. See docs/dev/OS/08_VIDEO/orin-desktop.md §6 rung 6.
+[ -n "${UNAOS_ORINTENANT:-}" ] && _feats="${_feats}orintenant,tegra_el0,tegra,"
 # JB11-ESCAPE: UNAOS_NOJB11=1 suppresses the Falcon firmware-header census
 # (arch/aarch64/xusb_tegra.rs::jb11_fw_header_census) so a bench sitting can take an UN-INSTRUMENTED
 # CONTROL boot. Default UNSET => the census runs on every tegra boot, unchanged — the census is the
@@ -2613,6 +2638,36 @@ KERNEL_CFG_MATRIX=(
   # items) and the derived mix-leg count is unchanged. Board legs +1; gate +1. `./arroyo check` prints
   # the live board/mix counts every run — read them there, not here.
   "arm-tegra-bsptick ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,bsptick"
+  "arm-tegra-conwin ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,pidesk,livecon,quarry,orinconwin,orindesk,orinclick,orintenant"
+
+  # ORIN-TENANT rung 6 armed (appended 2026-08-25) — `orintenant` gates
+  # `arch/aarch64/display_tegra.rs`'s `[orintenant]` instrument block (arm/create/refuse/close/reap/
+  # census), the statement appended to `tegra_early_stop`'s terminus line, the census call on the JD2
+  # sweep line, four line-neutral call sites in `arch/aarch64/syscall.rs`, and that file's tail
+  # `orin_tenant_win_stats`. Without a leg the ARMED polarity would be compiled by NOTHING — the
+  # shape this matrix has now closed nine times; a knob's gates must compile the configuration the
+  # knob turns ON.
+  #
+  # HOSTED ON `arm-tegra-el0`'s LIST + `orintenant`, rung 3's reason verbatim: `orintenant` DECLARES
+  # `tegra_el0` (the window verbs live in `arch/aarch64/syscall.rs`, gated `any(baremetal,
+  # tegra_el0)`; `baremetal` implies `pi`, `pi` + `tegra` is a `compile_error!`), so hosting on
+  # `arm-tegra` would name a list cargo silently widens back to this one.
+  #
+  # WHAT THIS LEG EXERCISES THAT NO OTHER DOES: the SHIPPABLE bare-tenant shape — the `[orintenant]`
+  # family and the stats fold compiled with `pidesk` OFF and no other desktop knob, i.e. an EL0
+  # tenant composited beside the raw JD2 console with the furniture arms compiled out. The
+  # full-conjunction cross (tenant + orindesk row + click routing + routed console + furniture) is
+  # `,orintenant` appended to `arm-tegra-conwin` above — the flight image's own type-check. NOTE the
+  # `mmu_tegra_el0.rs` parity fix is NOT this leg's to prove: it compiles on every `tegra_el0` leg
+  # (`arm-tegra-el0` onward) because it is not knob-gated.
+  #
+  # UNIVERSE SIDE EFFECT: none that moves a mix count — `orintenant` is a new `[features]` entry named
+  # only on arm-* legs, so `x86_cfg_universe` drops it. Board legs +1; gate +1. `./arroyo check`
+  # prints the live counts every run — read them there, not here.
+  #
+  # PRECONDITION: compiles `arch/aarch64/syscall.rs`, which `include_bytes!`s `target/user_blob.bin`.
+  # `ensure_user_blob` (see check_both) supplies it.
+  "arm-tegra-tenant ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,orintenant"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────

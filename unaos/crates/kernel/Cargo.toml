@@ -1953,6 +1953,47 @@ orinclick = ["tegra_el0"]
 # `[orinconwin] DECLINE`. See docs/dev/OS/08_VIDEO/orin-desktop.md §6 rung 4 and §3.8.
 orinconwin = ["pidesk", "tegra_el0"]
 
+# ORIN-TENANT (rung 6 of the Orin desktop ladder, orin-desktop.md §6): EL0 WINDOW TENANTS — the
+# `[orintenant]` instrument plus the tegra arming point for the EL0 window path. DEFAULT OFF.
+#
+# WHAT THE KNOB GATES, precisely — because the SYSCALLS are deliberately NOT behind it. The
+# SYS_WIN_* surface (create/present/present_rows/move/close, `arch/aarch64/syscall.rs`, numbers in
+# `una-abi`) is arch-neutral, shared with the Pi and the x86 twin, and compiles on this board under
+# `tegra_el0` alone — rung 6 adds no verb and gates none. What `orintenant` arms is:
+#   * `display_tegra::orin_tenant_arm` — appended to `tegra_early_stop`'s terminus line. Reserves the
+#     compositor staging buffer (`wm::reserve_stage`, idempotent/grow-only, §3.3's F-family reason:
+#     an EL0 `SYS_WIN_PRESENT` on an image with no other desktop rung would otherwise grow the stage
+#     under the present's IRQ mask) and prints the `[orintenant] arm` gate census.
+#   * the `[orintenant]` witness family — per-event create/refuse/close lines and the exit-path reap
+#     line from four line-neutral call sites in `arch/aarch64/syscall.rs`, plus the ~10 s census from
+#     `jd2_console_pump`'s sweep (the rung-3 idiom: the census IS the routing task's own liveness).
+#
+# WHAT IT DOES NOT GATE: the CRYSTAL-HD geometry parity fix in `arch/aarch64/mmu_tegra_el0.rs`
+# (FB_WIN 4 slots x 0x51000 / 288x288, matching `boot.rs` and the x86 twin) is a correctness fix to
+# the `tegra_el0` platform module and rides `tegra_el0` unconditionally — hiding an ABI-parity repair
+# behind a demo knob would leave every OTHER tegra_el0 image answering `-EINVAL` to the shipped
+# `user-vug`'s `SYS_WIN_CREATE(288, 288)` and faulting the WC-B fixture's slot-1 stores.
+#
+# WHY IT IMPLIES `tegra_el0` AND NOTHING ELSE — rung 3's argument, verbatim: the window verbs live in
+# `arch/aarch64/syscall.rs`, gated `any(baremetal, tegra_el0)`; `baremetal` implies `pi` and `pi` +
+# `tegra` is a hard `compile_error!`, so `tegra_el0` is the only satisfiable term on this board and a
+# standalone `orintenant = []` would be a knob that compiles nothing. It does NOT imply `pidesk` (a
+# tenant needs no furniture; the close disc's CLOSE-CLEAN path and the ordinary raise arms are
+# ungated) and NOT `orindesk`/`orinclick`/`orinconwin` — the demonstration flight carries the
+# conjunction (see arroyo's UNAOS_ORINTENANT block), and the census REPORTS which of those are aboard
+# rather than pretending to enforce an ordering no `#[cfg]` here could express: SYS_WIN_CREATE is
+# reachable from EL0 on every `tegra_el0` image whatever this knob says.
+#
+# DEFAULT OFF => all of the above vanishes; the default jetson media (`tegra,tegrasmp` — no
+# `tegra_el0`, so no syscall surface and no `mmu_tegra_el0` at all) is byte-identical, and the Pi
+# `kernel8.img` is byte-identical because every `syscall.rs` call site is line-neutral and
+# `orintenant`-gated. The ARMED polarity is type-checked by the `arm-tegra-tenant` leg of
+# KERNEL_CFG_MATRIX and the `pidesk`/conjunction cross by `arm-tegra-conwin` (which now carries
+# `orintenant`), never by the knob mapping. Witness on the wire: `[orintenant] arm`,
+# `[orintenant] create`, `[orintenant] close`, `[orintenant] reap`, `[orintenant] census`. See
+# docs/dev/OS/08_VIDEO/orin-desktop.md §6 rung 6.
+orintenant = ["tegra_el0"]
+
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }

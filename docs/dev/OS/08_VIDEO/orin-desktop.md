@@ -1399,6 +1399,147 @@ win=1's were never overdrawn by the console.
 * **Stack cost.** Still Pi numbers (§5) — and the `[redzone]` absorb above is now a measured
   reason to care.
 
+### §3.10 LANDED 2026-08-25 (rung 6) — EL0 window tenants: the parity fix, the knob, and the instrument. UNFLOWN
+
+**Measured against `ca4fa538`.** Rung 6's row asked for *"user windows from EL0 through `SYS_WIN_*`,
+on the `tegra_el0` regime"* — and the survey found the surface ALREADY THERE and one platform constant
+table quietly forbidding it. As with rungs 2-4: everything below COMPILES and is REACHED in codegen;
+**no Orin has booted it.** QEMU models no Tegra234 (and `test-arm`'s virt build compiles neither
+`tegra` nor `tegra_el0`), so the metal witness is owed, and it rides a later image batch.
+
+#### The finding first: the syscalls were never the gap — the GEOMETRY was
+
+`SYS_WIN_CREATE/_PRESENT/_PRESENT_ROWS/_MOVE/_CLOSE` are the shared arch-neutral WC-B surface
+(`arch/aarch64/syscall.rs`, numbers in `una-abi`, x86 twin in `arch/x86_64/syscall.rs`), compiled on
+this board by `tegra_el0` alone since JETSON-EL0 M1b. Rung 6 adds **no verb and gates none**. What it
+fixes is `arch/aarch64/mmu_tegra_el0.rs`'s FB-region table: that module was written **ten hours
+after** CRYSTAL-HD (`92435fb8`, 2026-08-18 00:23 vs `c2d916c1`, 10:09 the same day) and copied the
+PRE-CRYSTAL-HD geometry — 8 slots x 64 KiB, 128x128 cap — under a header claiming the values are
+"byte-for-byte those of `boot.rs`". False at birth, and two live defects grew out of it:
+
+| defect | mechanism |
+| --- | --- |
+| **No EL0 program could ever own a window on the Orin** | the shipped `user-vug` asks `SYS_WIN_CREATE(288, 288)` (`SW`/`SH`, 288-as-committed, Peter-ruled 2026-08-18); tegra's 128 cap answered `-EINVAL`, vug printed `:: UVUG: SYS_WIN_CREATE failed ::` and exited(1). `run /fat/vug.elf` on this board died at its first syscall |
+| **Latent EL0 fault in every `tegra_el0` witness image** | the WC-B window-verb fixture hardcodes region slot 1's surface at `base + 0x5000 + 0x51000` (the Pi stride, `add x12, x9, #0x56, lsl #12`); against tegra's 0x1_0000 stride the kernel mapped slot 1 at `base + 0x15000`, so the fixture's b10/b11 stores aimed at RESERVED (invalid) leaves |
+
+**The fix is parity, unconditional under `tegra_el0`** (not knob-gated — hiding an ABI repair behind
+a demo knob would leave every other `tegra_el0` image broken): `FB_WIN_SLOTS` 8 -> 4,
+`FB_WIN_SLOT_SIZE` 0x1_0000 -> 0x5_1000, `FB_WIN_MAX_W/H` 128 -> 288, matching `boot.rs` and the x86
+twin exactly. The slot-0 offset (`base + 0x5000`, what `SYS_FB_MAP` returns) is untouched. The
+arithmetic is held by three new local const asserts plus `syscall.rs`'s pre-existing WC-B cross-checks
+(`FB_WIN_SLOTS <= WIN_MAX`, `cap x cap x 4 == slot size`), which now bind against the tegra values on
+every `tegra_el0` leg. Heap cost: per-slot backing 0x85000 -> 0x149000, `alloc_zeroed`ed lazily — 1
+shared + 8 slots = 11.6 MiB worst case against the 48 MiB tegra heap, and a slot never claimed costs
+nothing.
+
+#### The ownership model, stated against rmbp 6's standing warning
+
+The x86 seat's open wedge is a wm row holding pointers into a dead render function's task-owned
+memory. **The aarch64 tenant surface has never had that shape, verified end-to-end this arc:** the
+compositor row's `surf` names the slot's FB backing — kernel-heap, allocated once per slot
+(`SLOT_BACKING`), never freed, recycled per tenant with a `build_slot` scrub — mapped INTO the tenant
+at the fixed window VA, never lent BY it. No compositor pointer ever names memory whose lifetime is
+the EL0 task's. Exit path (shared with the Pi, both platform teardowns funnel through it):
+`clear_handle_row` -> `win_close_asid` (unmap surfaces, free rows, under `WINDOWS`) ->
+`wm::close_owner` + `close_compat` (outside the hold, drain-barrier reason) -> `focus_release`. A
+window row cannot outlive its owner into the next tenant's frames, and `[orintenant] reap` is that
+funnel's wire witness on this board.
+
+#### Close and minimise policy for tenants, decided and stated
+
+* **A tenant CLOSES** — the boot7h contrast. Kernel furniture refuses the close disc
+  (`furniture-refused`, the CONSOLEWIN law); an EL0-owned window runs the ungated CLOSE-CLEAN chain:
+  `close_owner(asid)` kills the process with `EXEC_CLOSED_STATUS`, `run` reports
+  `closed (window close box)`, the teardown funnel reaps the row. Already built, arch-neutral,
+  untouched by this rung.
+* **Minimise is reported, not repainted as policy.** The minimise arm is ungated, so a tenant can be
+  parked on any image; the routes back are the dock (`pidesk` aboard — the conjunction image) or
+  kill/exit, and the dock round-trip is still the ladder's next attended item (§3.9.1). The census
+  prints `pidesk=` and the arm line prints all four sibling knobs so a capture names which image
+  shape a park happened on.
+
+#### What landed
+
+| where | what |
+| --- | --- |
+| `crates/kernel/src/arch/aarch64/mmu_tegra_el0.rs` | the CRYSTAL-HD parity fix + 3 const asserts (unconditional under `tegra_el0`) |
+| `crates/kernel/Cargo.toml` | `orintenant = ["tegra_el0"]` — implies nothing else; the syscalls are deliberately NOT behind it |
+| `arch/aarch64/display_tegra.rs` (file TAIL, all `#[cfg(orintenant)]`) | `orin_tenant_arm` (terminus: `wm::reserve_stage` — §3.3's F-family reason, so a bare-`orintenant` image's first EL0 present never grows the stage under its own IRQ mask — plus the pre-state line), the five note fns, `orin_tenant_census` |
+| `main.rs` terminus line + JD2 sweep line | `orin_tenant_arm()` / `orin_tenant_census(sweep_tick)` appended — **line-neutral, 6990 -> 6990 lines** |
+| `arch/aarch64/syscall.rs` | four LINE-NEUTRAL in-place call sites (create-refuse, create, close, reap-row/reap-done) + file-tail `orin_tenant_win_stats` (+26 lines, all past old EOF; Pi panic Locations unmoved) |
+| `arroyo` | `UNAOS_ORINTENANT` env map; `arm-tegra-tenant` leg (arm-tegra-el0's list + `orintenant` — the shippable bare-tenant shape, `pidesk` OFF); `,orintenant` appended to `arm-tegra-conwin` (the full-conjunction flight cross). Board legs 14 -> 15, gate 23 -> 24 |
+
+**No `video/` edit, and none was needed** — `wm::create/present/close_owner/reserve_stage/count` and
+the whole chrome/close/raise vocabulary are the shared implementation already reached from three
+seams; this board now runs those same bytes from a fourth caller, EL0's SVC.
+
+#### The instrument
+
+Per-event wires (`create -> TENANT-WINDOW` / `-> HEADLESS-COMPOSITOR-REFUSED` /
+`DECLINE reason=geometry-over-max`, `close -> CLOSED-BY-OWNER`, `reap -> TENANT-REAPED`) plus the
+~10 s census from the pump's own drain loop — rung 3's liveness argument verbatim. Census verdict
+ladder, each arm reachable and none constant: `FAIL reason=geometry-refused` (a create was refused
+over the cap — the pre-parity defect observed live; must never print on a post-parity image running
+shipped binaries) > `DECLINE reason=headless-rows` (verbs green, compositor refused rows — glass
+empty, said out loud) > `TENANT-LIVE` > `TENANT-EXITED-CLEAN` > `IDLE-NO-TENANTS` (**UNRUN, never
+PASS**). Presents are counted from the pre-existing global `FB_PRESENT_COUNT` (bumped by the ONE
+shared present body), so no present verb was touched. All tokens are longer than 8 bytes.
+
+#### Gate, measured on artifacts
+
+* `UNAOS_TEGRA=1 ./arroyo check` — green, **24 legs (15 board + 9 x86 pairwise-mix)**; green again
+  under `UNAOS_ORINTENANT=1` alone (knob self-sufficient) and under the full four-knob conjunction.
+* **Go-red proven:** renaming `orin_tenant_win_stats` reds **exactly**
+  `arm-tegra-conwin` + `arm-tegra-tenant` — the two legs carrying the knob — every other leg green.
+  Restored -> green.
+* `./arroyo test-arm` and `./arroyo test` (x86) — both green; `awk '/PANIC|panicked/'` over
+  `serial-arm.log` -> 0 (the single `/FAIL/` hit is the known `[botclaim]` prose).
+* **Knob-off byte identity, loadable-image level** (same tree, same absolute path, arc applied vs
+  `git apply -R`, two independent `CARGO_TARGET_DIR`s; method control ran first and matched):
+  jetson default (`tegra,tegrasmp`) `cccc97c9…` 1 541 332 B **identical**; Pi `kernel8.img`
+  (`baremetal,skip_xhci,witness,pidesk,quarry,livecon`) `0d3f47a5…` 2 162 320 B **identical** (elf
+  delta `.strtab`-only, program headers identical — the documented benign class). The armed-EL0
+  image (`tegra,tegrasmp,tegra_el0`) **differs by design** — that is M1 landing — and the knob-on
+  image differs from default, so the knob is not vacuous.
+* **Witness presence:** all 11 `[orintenant]` marks/verdict strings one-hit in the armed artifacts
+  (`LC_ALL=C grep -a -o -F`, never `strings`), **zero** in the knob-off default AND in the
+  armed-EL0-without-knob image (negative control).
+* **Reachability by disassembly**, all eight edges: `tegra_early_stop -> orin_tenant_arm`,
+  `jd2_console_pump -> orin_tenant_census`, `aarch64_svc_handler -> note_refuse/note_create/
+  note_close` (the verbs inline into the SVC dispatcher — the EL0 path itself),
+  `win_close_asid -> note_reap_row`, `clear_handle_row -> note_reap_done`,
+  `census -> syscall::orin_tenant_win_stats`.
+* **Freshness:** `git log --all -S` -> 0 prior commits for `orintenant`, `[orintenant]`,
+  `IDLE-NO-TENANTS`, `TENANT-WINDOW`, `TENANT-REAPED`, `orin_tenant_arm`, `arm-tegra-tenant`,
+  `UNAOS_ORINTENANT`.
+
+#### What the metal flight must watch for
+
+Image: the §6.1 conjunction + this knob
+(`UNAOS_ORINTENANT=1 UNAOS_ORINCONWIN=1 UNAOS_ORINDESK=1 UNAOS_ORINCLICK=1`), then
+`run /fat/vug.elf` at the shell. Expected wire, in order: `[orintenant] arm … cap=288x288 rslots=4 …
+-> ARMED` (the arm line IS the parity witness — a pre-parity image reads `cap=128x128`);
+`[orintenant] create asid=… win=… surf=288x288 wm-bound=1 -> TENANT-WINDOW`; census
+`IDLE-NO-TENANTS -> TENANT-LIVE`; presents climbing; on ESC/exit either `close -> CLOSED-BY-OWNER`
+or `reap … -> TENANT-REAPED`, census `-> TENANT-EXITED-CLEAN`. `FAIL reason=geometry-refused` on
+this flight = the parity fix is not in the image (STOP: wrong media). Watch also: the `[redzone]`
+guard (boot7h already absorbed a LOW-REDZONE on `jd2-console`; the tenant's present path adds load —
+§5's stack numbers are still Pi numbers), and the EL0 input delivery (`run` has never been typed on
+this board's metal — boot7f/g/h all confirm — so the census plus vug's own witnesses adjudicate the
+whole `run`-plus-input chain, not only the window half). `bg /fat/vug.elf` stays REFUSED
+(EL0-EL1CORE) — use `run`, pinned core 0; placement policy untouched.
+
+#### What this rung deliberately did NOT do
+
+* **No rung 5.** No furniture arming, no tegra `render_service`, `TEGRADESK_CASCADE_OK` untouched.
+* **No `video/` edit**, and no `sched.rs` edit (two parallel executors hold claims there).
+* **No ordering-rule enforcement in the arm.** Unlike `orin_conwin`, this rung cannot decline its
+  way out of the hazard it reports: `SYS_WIN_CREATE` is reachable from EL0 on every `tegra_el0`
+  image whatever the knob says, so the census REPORTS the image shape instead of pretending a
+  `#[cfg]` could hold the syscall off.
+* **UNFLOWN.** Every claim above is a build-time or artifact measurement. The flight card above is
+  the adjudicator.
+
 ---
 
 ## §4 The GA10B boundary — stated once so nobody re-asks
@@ -1602,7 +1743,7 @@ names the seat that owns the files under the parallel-arc rules in `CLAUDE.md`.
 | **3** | **Input routing** — ✅ **LANDED 2026-08-25 as a DEFAULT-OFF knob; FLOWN, ARMED, and ROUTING ON METAL** (§3.7, §3.8, §3.8.1) | `orinclick` (implies `tegra_el0`) wires `jd2_console_pump`'s `Event::Button` arm into `wc_click_route` (§3.4) and adds the `[orinclick]` instrument at the tail of `display_tegra.rs`. **⚠ HANDSHAKE WITH RUNG 2, DISCHARGED IN THIS ARC:** `main.rs`'s `TEGRADESK_CLICK_ROUTED` no longer reads `false` — it reads `cfg!(feature = "orinclick")`, **not** a literal `true`, because `tegradesk` does not imply `orinclick` and a hard `true` would assert a route back on an image that has none: the one-way trip re-entered through the constant meant to prevent it. `arm-tegra-seam` now carries `orinclick` so the assertion is type-checked. COMPILES: gate green 21/21 knob off and on; the new `arm-tegra-orinclick` leg proven to go red. No gate in this tree can boot it — QEMU models no Tegra234 | ✅ **DISCHARGED, boot7g 2026-08-25** (§3.8.1): `[clickroute] press hit asid=4294967042 win=1 (was 0) delivered` (capture line 13084) and `[orinclick] edge=press btn=0x01 at (1009,546) geom=yes hit=yes win=1 owner=0xffffff02 focus 0x0->0xffffff02 consumed=0 -> RAISED` (capture line 13085); release `-> RELEASE-DELIVERED` (13087); census `IDLE-NO-CLICKS -> ROUTING` (13089); a second press on the focused row `-> HIT-SAME` (13092), plus `CONSUMED` (13125), `MISS-SHELL` (13133) and `RELEASE-DROPPED` (13135). Six press/release pairs with `stuck=0 nogeom=0 dropped=0`. **The prior owed item — boot7f's armed-but-unclicked state (`-> ARMED`, capture line 11424, then 48 `IDLE-NO-CLICKS`) — is closed.** Still owed: nothing on the wire; stack cost on this path (§5) is still a Pi number | jetson |
 | **4** | **Console as a window** — ✅ **LANDED 2026-08-25 as a DEFAULT-OFF knob; FLOWN AND ROUTED the same day** (§3.9, §3.9.1) | `orinconwin` (implies `pidesk` + `tegra_el0`, and deliberately NOT `orindesk`/`orinclick`) calls the SHARED console-window machinery from `display_tegra::orin_conwin` on `tegra_early_stop`'s terminus line — `panel_console_face_arm` → `panel_console_window_open` → `console_is_routed` — and folds `jd2_console_pump`'s phase-2 `fbcon::detach()` to `if !tegra_conwin_live() { … }` so a routed console stays LIVE. **§6.1 IS NOW A BRANCH:** both ordering terms are read through `cfg!()` and an image missing either gets `[orinconwin] DECLINE reason=ordering-rule held=…` and NO window — measured on the artifact both ways. No `video/` edit; no `pidesk::activate()`, so §5.2 is untouched. Gate green 23/23 knob off and on; `arm-tegra-conwin` proven to go red; knob-off loadable image byte-identical | ✅ **DISCHARGED, boot7h 2026-08-25** (§3.9.1): `[orinconwin] gate … dock=GRANTED … orindesk=1 orinclick=1` (capture line 14828), then `[orinconwin] win=2 panel=1920x1200 cell=7x16 stage=4194304 table=2 present=Composited route=true live=LIVE -> ROUTED` (14833) with the `[wc-x] console-window / console-route first-paint / panic-fallback armed` trio beside it (14830–14832). The route stayed LIVE for a ~107-minute sitting — shell banner, keystroke echoes and verb output all landed through the window path; chrome clicks CONSUMED and the close control `REFUSED furniture` (14926–14927). **Still owed:** the dock round-trip (`presses=0` on every `[dock]` line — the minimise disc was never clicked) and a win=2 glyphs-on-glass read-back | jetson |
 | **5** | **The real desktop** | dock, strip, menubar, crystal armed; the full `pidesk` cascade; a tegra `render_service` (§3.6) | the Orin comes up to a desktop | jetson — **blocked by §5.2** |
-| **6** | **EL0 tenants** | user windows from EL0 through `SYS_WIN_*`, on the `tegra_el0` regime | an EL0 program owns a window on the Orin panel | jetson |
+| **6** | **EL0 tenants** — ✅ **LANDED 2026-08-25 as the CRYSTAL-HD parity fix + a DEFAULT-OFF instrument knob; UNFLOWN** (§3.10) | the `SYS_WIN_*` surface needed NO new verb — the gap was `mmu_tegra_el0.rs` carrying the pre-CRYSTAL-HD FB geometry (128x128 cap, 0x1_0000 slot stride), which refused the shipped vug's `SYS_WIN_CREATE(288,288)` with `-EINVAL` and mis-mapped the WC-B fixture's slot 1. Parity restored (4 slots x 0x51000, 288x288, unconditional under `tegra_el0`); `orintenant = ["tegra_el0"]` arms the terminus `reserve_stage` + the `[orintenant]` arm/create/close/reap/census instrument. Tenant close policy: CLOSE-CLEAN (tenants close; furniture refuses). Gate green 24/24; `arm-tegra-tenant` + the `arm-tegra-conwin` conjunction cross both go-red-proven; knob-off jetson AND Pi loadable images byte-identical | an EL0 program owns a window on the Orin panel: `run /fat/vug.elf` on the four-knob conjunction image -> `[orintenant] create … surf=288x288 wm-bound=1 -> TENANT-WINDOW`, census `IDLE-NO-TENANTS -> TENANT-LIVE`, and a clean exit reaps (§3.10 flight card) | jetson |
 
 ### §6.0 INHERITED FROM PI, NOT YET TAKEN — two shared-stack fixes waiting on the shelf
 

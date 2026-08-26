@@ -4555,7 +4555,7 @@ pub fn clear_handle_row(asid: u64) {
     // and for the same reason: a window row outliving its owner would name a surface inside a backing
     // frame the slot's NEXT tenant gets, so the next program's private memory would be composited to the
     // panel. Unmaps the surfaces too, so the reused ASID starts with the reserved EL1-only leaves.
-    win_close_asid(asid);
+    win_close_asid(asid); #[cfg(feature = "orintenant")] super::display_tegra::orin_tenant_note_reap_done(asid); // ORIN-TENANT: the exit-path reap's wire witness — WINDOWS released by now; silent when the dying ASID owned no windows. Line-NEUTRAL.
     // WC-INT: the COMPOSITOR-side teardown, after WC-B's table teardown above and never before it. Order is
     // load-bearing in both directions:
     //   * WC-B first — `win_close_asid` unmaps the surfaces and frees the rows while holding `WINDOWS`, then
@@ -12371,7 +12371,7 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     // Reject BEFORE any truncation could hide an out-of-range request (a 64-bit arg cast to u32 could
     // otherwise wrap a huge value into a legal one).
     if w > super::uslots::FB_WIN_MAX_W as u64 || h > super::uslots::FB_WIN_MAX_H as u64 {
-        return EINVAL;
+        { #[cfg(feature = "orintenant")] super::display_tegra::orin_tenant_note_refuse(w, h); return EINVAL; } // ORIN-TENANT: name the over-cap refusal on the wire (unheld — no lock is taken yet). Line-NEUTRAL per this file's PANIC-Location rule.
     }
     let pages = match win_pages_for(w32, h32) {
         Some(p) => p,
@@ -12443,7 +12443,7 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
         }
     }
     fb_info_write_win(slot, id, &e);
-    id as i64
+    { #[cfg(feature = "orintenant")] super::display_tegra::orin_tenant_note_create(asid, id as u64, w32, h32, e.wm_id != crate::video::wm::WIN_NONE); id as i64 } // ORIN-TENANT: the create's wire witness. Printed UNDER the WINDOWS hold deliberately — global order WINDOWS ⊃ wm::TABLE ⊃ WRITER, a routed console's println descends exactly that way, and a create is program-rate (the same masked-hold class sys_win_present takes per frame). Line-NEUTRAL per this file's PANIC-Location rule.
 }
 
 /// SYS_WIN_PRESENT(win): damage-mark + composite the caller's window. Ownership-gated (`-EBADF`/`-EACCES`).
@@ -12686,7 +12686,7 @@ fn sys_win_close(win: u64) -> i64 {
     // that spins until in-flight composites finish, and the surface it is draining has just been unmapped
     // above, so the drain must not be nested inside the lock a racing presenter may be waiting on.
     wc_shim::destroy(wm_id);
-    0
+    { #[cfg(feature = "orintenant")] super::display_tegra::orin_tenant_note_close(asid, win); 0 } // ORIN-TENANT: the owner-close wire witness, after the WINDOWS release and the wm drain above. Line-NEUTRAL per this file's PANIC-Location rule.
 }
 
 /// WC-B: close every window still owned by `asid` — the teardown half, called from `clear_handle_row`
@@ -12711,7 +12711,7 @@ pub fn win_close_asid(asid: u64) {
             unsafe { super::uslots::unmap_slot_fb_win(slot, e.rslot as usize, e.pages as usize) };
             fb_info_clear_win(slot, e.rslot as usize);
             t[id] = WinEntry::FREE;
-            closed[id] = e.wm_id;
+            closed[id] = e.wm_id; #[cfg(feature = "orintenant")] super::display_tegra::orin_tenant_note_reap_row(asid); // ORIN-TENANT: bump only — inside the WINDOWS hold a print would be a gratuitous hold extension; note_reap_done prints the total past the lock. Line-NEUTRAL.
         }
     }
     // WC-INT: outside the `WINDOWS` hold, for the drain-barrier reason spelled out in `sys_win_close`.
@@ -23259,4 +23259,30 @@ pub fn tegra_el0_verdict(_: usize) {
             unexp
         );
     }
+}
+
+/// ORIN-TENANT (rung 6) — the census's read of the WC-B window table, for
+/// `display_tegra::orin_tenant_census`. Returns `(live_rows, wm_bound_rows, presents)`: rows a real
+/// EL0 ASID owns right now, how many of those hold a compositor row (`wm_id != WIN_NONE` — the
+/// difference is the HEADLESS shape the census names), and the lifetime `FB_PRESENT_COUNT` (bumped
+/// by the ONE shared present body all three present verbs run, so it counts tenant frames without
+/// this rung touching any present path). A masked micro-hold — count and fold only, the same class
+/// as `sys_win_move`'s re-check hold; called ~1/10 s from the pump's sweep, never nested inside any
+/// other lock. FILE-TAIL on purpose: `syscall.rs` compiles into the knob-off Pi `kernel8.img`, and
+/// this file's standing PANIC-Location rule means new lines may land only at the tail (or inside
+/// existing lines) — `#[cfg(orintenant)]` keeps even that out of every non-tenant build.
+#[cfg(feature = "orintenant")]
+pub fn orin_tenant_win_stats() -> (u32, u32, u64) {
+    let _irq = IrqGuard::mask_save();
+    let t = WINDOWS.lock();
+    let (mut rows, mut bound) = (0u32, 0u32);
+    for e in t.iter() {
+        if e.owner != 0 {
+            rows += 1;
+            if e.wm_id != crate::video::wm::WIN_NONE {
+                bound += 1;
+            }
+        }
+    }
+    (rows, bound, FB_PRESENT_COUNT.load(Ordering::Acquire))
 }
