@@ -1392,10 +1392,16 @@ win=1's were never overdrawn by the console.
 * **The dock round-trip.** `presses=0 raises=0 unhides=0` on every `[dock]` line: the minimise
   disc was never clicked, so "the dock is a route back" remains exercised only as geometry
   (`dock=GRANTED`), never as a click. That is the next attended item for this ladder.
+  ⚠ **INSTRUMENTED 2026-08-25 (§3.11), still UNFLOWN** — `[orindock] park`/`restore`/`census` now
+  adjudicate the gesture and its two halves separately. Nothing about the flight's absence changed;
+  what changed is that a flight can now be scored from the wire, and the arm line prints the disc's
+  and the strip's rects so the operator does not have to guess where to click.
 * **Glyphs-on-glass for win=2.** No `[orinchrome]`-style probe reads the console window's surface
   back off the scanout; `-> ROUTED` + the operator's use of the shell through the sitting is the
   evidence, and a read-back instrument for it would close this the way `[orinchrome]` closed
-  rung 0's.
+  rung 0's. ⚠ **INSTRUMENTED 2026-08-25 (§3.11), still UNFLOWN** — `[oringlass]` is that read-back,
+  with the discriminator inverted (the population of the console's own paper and ink answers the
+  question; the six frame constants become the discriminator, not the subject).
 * **Stack cost.** Still Pi numbers (§5) — and the `[redzone]` absorb above is now a measured
   reason to care.
 
@@ -1539,6 +1545,260 @@ whole `run`-plus-input chain, not only the window half). `bg /fat/vug.elf` stays
   `#[cfg]` could hold the syscall off.
 * **UNFLOWN.** Every claim above is a build-time or artifact measurement. The flight card above is
   the adjudicator.
+
+---
+
+### §3.11 LANDED 2026-08-25 — the two items §3.9.1 left owed get an adjudicator. UNFLOWN
+
+§3.9.1's "What this flight still did NOT establish" named two things after boot7h and gave neither an
+instrument: **glyphs-on-glass for win=2**, and **the dock round trip** (`presses=0 raises=0 unhides=0`
+on every `[dock]` line — the minimise disc has never been pressed on this board). This section is
+that pair of instruments, landed as one DEFAULT-OFF knob.
+
+#### The finding first: neither rung was missing a MECHANISM
+
+It is worth saying plainly, because it changes what the metal flight is for. The dock round trip
+already ships end to end on this branch, and has since rung 3:
+
+| step | who does it | since |
+| --- | --- | --- |
+| a press on the minimise disc is recognised | `wc_click_route`'s `minimise_hit` arm (`arch/aarch64/syscall.rs`) | rung 3 |
+| the row is parked below the shell | `wm::minimise` — `z = 0`, and `set_hidden` publishes the owner's hidden bit | shared |
+| the parked row still appears in the dock's tile model | `wm::dock_scan` enumerates rows regardless of visibility, deliberately | shared |
+| a press on the strip beats every window arm | `strip::press_route`, called from the router's `pidesk` furniture arm | PI-DESK |
+| the tile press raises and un-hides | `dock::press_at` -> `focus_set` + `wm::focus_changed` | shared |
+
+Nothing in that column is new and nothing in it is knob-gated beyond `pidesk`, which `orinconwin`
+already carries. **What was missing is an ADJUDICATOR** — a wire that says which half of the trip
+happened, and a read-back that says whether the half that happened reached the glass. So this rung
+adds no behaviour at all: not one pixel path, not one routing decision, not one control.
+
+#### What landed
+
+`orinladder`, DEFAULT OFF, arming two instrument families at the tail of
+`arch/aarch64/display_tegra.rs`, plus two LINE-NEUTRAL statements appended to `main.rs`'s
+`tegra_early_stop` terminus line and its JD2 phase-2 sweep line.
+
+**⚠ NOT ONE LINE OF `video/` IS TOUCHED, and that is a lane decision rather than a convenience.** The
+`hw-rmbp` track carries an unlanded ~1200-line `wm.rs`/`screen.rs` delta that meets this branch at the
+next sync, so every fact the instrument needs was taken through an accessor that already exists:
+
+| fact | accessor | note |
+| --- | --- | --- |
+| which row is the console window | `wm::info` over `1..=MAX_WINDOWS`, matching `owner_asid == wm::KERNEL_OWNER_CONSOLE` | a public const; `close_owner` refuses the reserved kernel band, so that owner names exactly one row. No "which window is the console" accessor was minted |
+| its box on the panel | `wm::info`'s `x`/`y`/`w`/`h`/`scale` | the outer box is re-derived the way `panel_console_window_open` built it — content origin minus `BORDER` and `TITLE_H + BORDER` |
+| where the minimise disc is | `wm::control_disc_rect(id, Ctrl::Minimise)` | the painter's own accessor, for `close_box_rect`'s stated reason: a fixture must press the disc the compositor actually drew |
+| whether a way back exists | `dock::strip_rect` + `wm::dock_scan` | the registry hook `wm::erase_clip` reads, so the strip named is the strip that will be painted |
+| what the dock's last press did | `dock::last_press_outcome` | CLICK-BAND's own witness word |
+| what is actually on the glass | `FrameBuffer::read_pixel` | the compositor's own verify primitive and the one place the read-back ban is lifted by name — `orin_chrome_probe`'s reason, verbatim |
+
+If any of those had needed a new signature, a new field or a reordering in `wm.rs`, the arc would have
+stopped and asked. None did.
+
+#### The knob, and why its implication set is FORCED rather than chosen
+
+`orinladder = ["orinconwin", "orinclick", "orindesk"]`, env `UNAOS_ORINLADDER`.
+
+`orin_conwin` itself REFUSES to open a console window on an image missing either `orindesk` or
+`orinclick` (`[orinconwin] DECLINE reason=ordering-rule`, §6.1), and this instrument's entire subject
+is that window and the minimise disc on it. So:
+
+* `orinladder = []` would arm a probe for a window the build guarantees does not exist;
+* `orinladder = ["orinconwin"]` would arm one for a window `orin_conwin` declines to open;
+* `orinclick` is additionally what makes the disc a GESTURE rather than a decoration — without the
+  router there is no press to witness.
+
+`orinconwin` transitively supplies `pidesk` (the `dock`/`strip` modules) and `tegra_el0` -> `tegra`,
+so the closure IS the flight image. **One env var now arms what boot7h needed three for.** This is
+`orinclick = ["tegra_el0"]`'s own argument applied one rung up.
+
+New leg `arm-tegra-ladder` (board legs 19 -> 20, gate 28 -> 29), hosted on `arm-tegra-conwin`'s
+full-conjunction list + `orinladder`; no lighter host exists, because cargo would widen any shorter
+list straight back to this one. It deliberately does NOT carry `orintenant` — rung 6's tenant path is
+orthogonal and already has its own leg.
+
+#### The instruments
+
+**`[oringlass]` — rung (a), the win=2 read-back. Its discriminator is INVERTED from `[orinchrome]`'s.**
+That probe knew a constant inside the CONTENT (the magenta block `orin_wm1` writes) and used it to
+separate "chrome missing" from "nothing landed". Here the content is anti-aliased TEXT: nobody can
+predict which glyph is at any coordinate, and `panel_console_face_arm` sets `c.aa = true`, so glyph
+EDGE pixels are alpha blends and no single pixel carries an exact expectation. What IS predictable is
+the POPULATION — a text surface on the glass shows the console's own paper AND fully covered strokes
+of its own ink, and nothing else on this panel shows that pair. So the roles swap: the CENSUS answers
+the question, and the six frame constants become the discriminator.
+
+Sampling: 8 scanlines spread down the content box, 4 contiguous 32-pixel runs each, 1024 samples.
+Contiguous runs rather than an even grid because at the bench panel the content box is ~1900 px wide
+against a 7-px cell — an evenly spread scanline samples about one pixel per four character cells and
+can miss every stroke on a sparse line, where a 32-pixel run crosses ~4.5 cells end to end. The
+question wants LOCAL density and GLOBAL spread; this is the cheapest shape with both. Classified
+against `fbcon`'s own documented pair (`BG_DEFAULT = 0x0000_0000`, `FG_DEFAULT = 0x00C0_C0C0`,
+`fbcon.rs:114-115`), restated in `display_tegra.rs` with provenance rather than reached for — making
+them `pub` would be exactly the shared-seam edit this rung refuses.
+
+| verdict | what the wire is saying |
+| --- | --- |
+| `DECLINE reason=no-console-row` | no `wm` row carries `KERNEL_OWNER_CONSOLE`. Not a failure of this rung — the image is not the conjunction, or `orin_conwin` declined and named its own reason above |
+| `DECLINE reason=no-panel` | headless boot; there is no scanout to read back |
+| `UNREADABLE` | every sample fell outside the mapped length: the row's geometry and the panel's disagree. A defect, and one no present count could show |
+| `WIN2-NOT-ON-GLASS` | not ONE sample is the console's background. Whatever occupies those panel coordinates, it is not this window's surface |
+| `BLANK-NO-GLYPHS` | every sample IS the background: the surface reached the glass and its TEXT did not. **The exact shape §3.9.1 could not rule out** |
+| `INK-NO-STEM` | non-paper pixels inside the box, but not one fully covered stroke of the console's own ink |
+| `GLYPHS-NO-CHROME` | paper and ink strokes both on the glass, and the FRAME is not — §3.8.1's measured JD2-blit overdraw, caught in the act |
+| `GLYPHS-ON-GLASS` | frame and glyphs both read back at panel coordinates. **Rung (a) closed** |
+
+**`[orindock]` — rung (b), the round trip. It samples EVERY tick and prints every ~10 s**, and that
+asymmetry is the design. Rungs 3 and 6 census COUNTERS, which are monotone: a 10 s cadence loses
+timing, never events. This one reads a STATE — the console row's `z` — and the event is a park
+followed by a restore that an operator completes in seconds. A 10 s sampler would see the row on the
+panel, then on the panel again, and report `IDLE-NEVER-PARKED` for a round trip that happened. So the
+edge detector runs every tick (one `wm::info` walk, ~12 table lookups under one lock, ~4/s — a
+strictly smaller footprint than the `wm::hit_test` rung 3 already takes per pointer event) and only
+the census PRINT is at the 10 s period.
+
+The `park` line carries whether the dock's tile model contains the row **at the moment of the park**,
+because that is the question §6.1 is about. The `restore` line derives `via=` from
+`dock::last_press_outcome()`, so a `<TAB>` back is `RESTORED-OFF-DOCK` and is **not credited** as the
+round trip; and it re-fires the read-back, which is what makes "a restore that paints nothing" a
+different line from a restore that paints.
+
+| census verdict | what the wire is saying |
+| --- | --- |
+| `DECLINE reason=no-console-row` | no console window on this image. No subject; not a failure |
+| `DECLINE reason=no-dock-strip` | the panel cannot host the strip. The trip is not merely untaken, it is impossible |
+| `FAIL reason=park-no-tile` | parked NOW and the dock's tile model does not contain the row. **The one-way trip, realised.** Structural, never timed — a slow operator must not read as a failure |
+| `FAIL reason=restore-blank` | it came back and every read-back said the content did not paint |
+| `PARKED-AWAITING-DOCK` | parked, a tile names it, nobody has pressed it. The honest in-flight state |
+| `DOCK-ROUNDTRIP` | a dock tile press brought it back AND the read-back found its glyphs on the glass. **Rung (b) closed** |
+| `RESTORED-NOT-VIA-DOCK` | it came back, but not through a dock tile. NOT closed, and the census refuses to pretend |
+| `IDLE-NEVER-PARKED` | the disc has not been pressed. **UNRUN, never PASS** — boot7h's state, and it must stay distinguishable from a passing one |
+
+#### Gate, measured on artifacts
+
+* `UNAOS_TEGRA=1 ./arroyo check` — green, **29 legs (20 board + 9 x86 pairwise-mix)**, exit 0; green
+  again under `UNAOS_TEGRA=1 UNAOS_ORINLADDER=1`, whose DEFAULT aarch64 leg banner reads
+  `ehcihid,kbdwit,sdhcblk,smolnet,tegra,tegrasmp,orinladder,orinconwin,orinclick,orindesk,pidesk,tegra_el0`
+  — the ARMED polarity, not merely the knob-off twin.
+* **Go-red proven:** renaming `orin_ladder_arm` reds **exactly** `arm-tegra-ladder`
+  (`error[E0425]: cannot find function orin_ladder_arm`, exit 101) while `arm-tegra-conwin` and
+  `arm-tegra` stay green (exit 0). Restored -> green.
+* `./arroyo test-arm` exit 0 — 2 `-> PASS`, 0 `-> FAIL`, 0 `PANIC|panicked` over 193 `::` markers;
+  the single `/FAIL/` hit is the known `[botclaim]` prose. `./arroyo test` (x86) exit 0 — **44
+  `-> PASS`, 0 `-> FAIL`, 0 `PANIC|panicked`**.
+* **Knob-off byte identity, MEASURED on `objcopy -O binary` FLAT images** (never `.elf` shas — a
+  `.strtab` uniquing moves without a mapped byte). Same worktree, same absolute path
+  (`~/unaos-bench/scratch/orin7/ladder`), arc applied vs `git apply -R`, independent
+  `CARGO_TARGET_DIR`s, **method control run FIRST and matched**. Jetson default (`tegra,tegrasmp`):
+
+  | image | sha256 of the flat image | bytes |
+  | --- | --- | --- |
+  | B (arc applied) | `0de025c1a645ee1826969b65f76705f762928d6dc3fe8038a3f6cd87150f07ec` | 1 543 316 |
+  | B2 (method control, same source, second target dir) | `0de025c1a645ee1826969b65f76705f762928d6dc3fe8038a3f6cd87150f07ec` | 1 543 316 |
+  | A (`git apply -R`, baseline) | `0de025c1a645ee1826969b65f76705f762928d6dc3fe8038a3f6cd87150f07ec` | 1 543 316 |
+
+  **A == B == control — identical.** `main.rs` is 6990 lines before and after, so no panic `Location`
+  renumbers; every one of the 645 new source lines is APPENDED at the tail of `display_tegra.rs`.
+  The armed image differs by design (`5c1cdaf7…`, 1 906 984 B), so the knob is not vacuous.
+* **Witness presence, and TWO negative controls.** All 22 `[oringlass]`/`[orindock]` marks and verdict
+  strings hit in the armed flat image (`LC_ALL=C grep -a -o -F`, fragments >8 bytes throughout);
+  **zero** in the knob-off jetson default AND **zero** in the same §6.1 conjunction built with
+  `orinladder` OFF (`f55dc2d7…` — boot7h's own image shape). The second control is the sharp one: it
+  proves the marks come from this knob and not from a sibling.
+* **Reachability by disassembly, not by banner.** `tegra_early_stop -> orin_ladder_arm`
+  (`bl` at `0x747a4`, immediately after `orin_conwin`'s at `0x747a0`);
+  `jd2_console_pump -> orin_ladder_census` (`bl` at `0x73e84`, after `orin_click_census`'s at
+  `0x73e7c`); `orin_ladder_arm -> orin_glass_probe` / `dock::strip_rect` / `wm::dock_scan`;
+  `orin_ladder_census -> wm::dock_scan` (x2) / `dock::strip_rect` / `orin_glass_probe`.
+  **Those two `bl` edges are also the append-after-comment negative control** — both call sites are
+  in-line appends before a line's trailing `//`, and a statement that had fallen into comment text
+  would compile vacuously with the feature banner unchanged and no `bl` in the caller.
+
+#### What the metal flight must watch for — RUNG (a), both outcomes
+
+Image: `UNAOS_ORINLADDER=1` **alone** (it implies the conjunction). Rides **boot7j**. Expected wire at
+the terminus, in order — the `[orinconwin]` trio is boot7h's, unchanged, and is the precondition:
+
+```
+[orinconwin] gate panel=1920x1200x4 stage=4194304 table=1 dock=GRANTED route=UNROUTED orindesk=1 orinclick=1 rows=12
+[wc-x] console-window win=2 panel=1920x1200 … cell=7x16 …
+[orinconwin] win=2 panel=1920x1200 cell=7x16 stage=4194304 table=2 present=Composited route=true live=LIVE -> ROUTED
+[oringlass] probe=kl_top  at (…) got=0x… want=0x… -> MATCH          ← six of these
+[oringlass] phase=arm win=2 box=…x… at (…,…) content=…x… at (…,…) scale=1 onpanel=yes frame=6/6 samples=1024 read=1024 paper=… ink=… stem=… first=0x00000000 uniform=no -> GLYPHS-ON-GLASS
+```
+
+**Rung (a) is CLOSED iff that last line reads `-> GLYPHS-ON-GLASS` with `frame=6/6`, `paper>0` and
+`stem>0`.** Every other shape it can take, and what each one means:
+
+| what prints instead | reading, and what to do |
+| --- | --- |
+| `-> BLANK-NO-GLYPHS` (`paper=1024 ink=0 stem=0 uniform=yes first=0x00000000`) | the window's surface reached the glass and its TEXT did not. `present=Composited` was true and no glyph is in the scanout — the glyph route painted into a surface the flush did not carry, or painted nowhere. **This is the failure §3.9.1 could not rule out, and the whole reason the rung exists.** Report it; do not "fix" it from the bench |
+| `-> WIN2-NOT-ON-GLASS` (`paper=0`) | not one sample is the console's background. Cross with `frame=`: `frame=0/6` = the whole window is absent from the scanout; `frame=6/6` = the FRAME landed and the CONTENT did not, which localises to the content flush |
+| `-> GLYPHS-NO-CHROME` (`stem>0`, `frame<6/6`) | text on the glass, frame overdrawn. This is §3.8.1's measured JD2 console-blit overdraw, and it is the first time an instrument has convicted it. Rung (a)'s own question (did the glyphs land) is ANSWERED YES; the frame damage is rung 4's problem |
+| `-> INK-NO-STEM` | non-paper pixels but not one fully covered `0x00C0_C0C0` stroke. Check `[wc-x] console-window`'s cell — if the face is not `FG_DEFAULT` on this image the constants in `display_tegra.rs` are stale; otherwise a foreign surface is over the content |
+| `-> UNREADABLE` (`read=0`, six `UNMAPPED` probe lines) | the row's geometry and the panel's mapped length disagree. A real defect, invisible to any present count. STOP and report |
+| `-> DECLINE reason=no-console-row` | no console window. Read `[orinconwin] DECLINE reason=…` on the line above it — ordering-rule means **wrong media**, STOP |
+| no `[oringlass]` line at all | the terminus never reached `orin_ladder_arm`. Check the `⚡ kernel features:` banner for `orinladder`; if it is there, the boot died before the terminus and that is the finding |
+
+#### What the metal flight must watch for — RUNG (b), both outcomes
+
+The arm line tells the operator exactly where to click, because a flight that has to guess at a 24-px
+disc on a 1920x1200 panel reports "nothing happened" when the truth was "you missed":
+
+```
+[orindock] arm panel=1920x1200 win=2 disc=(X,Y,D) strip=(x,y,WxH) tiles=N glass=GLYPHS-ON-GLASS orinconwin=1 orinclick=1 orindesk=1 pidesk=1 -> ARMED
+```
+
+**Click 1 — the minimise disc, at `(X + D/2, Y + D/2)`.** Expected:
+
+```
+[orinclick] edge=press btn=0x01 at (…,…) geom=yes hit=yes win=2 owner=0xffffff01 focus …->… consumed=1 -> CONSUMED
+[wm-act] minimise win=2 owner=4294967041 at (…,…) -> settle=…
+[orindock] park win=2 z=0 shellz=… tiles=… tiled=1 t=… -> PARKED
+```
+
+**Click 2 — a tile in the dock strip, inside the `strip=` rect.** Expected:
+
+```
+[dock] press at (…,…) tile=t/n win=2 owner=0xffffff01 was_hidden=true -> raised=true unhid=true
+[oringlass] phase=restore … -> GLYPHS-ON-GLASS
+[orindock] restore win=2 z=… shellz=… via=dock dockpress=raise parked=…t glass=GLYPHS-ON-GLASS t=… -> RESTORED
+[orindock] census seq=… vis=panel tiles=… tiled=1 parks=1 restores=1 viadock=1 painted=1 blank=0 … -> DOCK-ROUNDTRIP
+```
+
+**Rung (b) is CLOSED iff one `park -> PARKED` is followed by one `restore … via=dock … -> RESTORED`
+and the census settles on `-> DOCK-ROUNDTRIP`.** Every broken shape, and what each one means:
+
+| what prints instead | reading, and what to do |
+| --- | --- |
+| census `parks=0 … -> IDLE-NEVER-PARKED` | the disc was never pressed. Read the `[orinclick] edge=press` line for that coordinate: `hit=no` = the press missed the window entirely (re-read `disc=` off the arm line); `hit=yes -> CONSUMED` with no `[wm-act] minimise` = it landed on the window but on a DIFFERENT control — `[clickroute] close=` or `[wm-act] zoom` will name which |
+| `park … tiled=0 … -> PARKED-NO-WAY-BACK`, census `-> FAIL reason=park-no-tile` | **the one-way trip §6.1 exists to forbid, realised on metal.** The row parked and the dock's tile model does not contain it. STOP and report: this convicts `dock_scan`'s enumeration or the pin arithmetic, and it means the console window on this image is a trap |
+| census `-> PARKED-AWAITING-DOCK`, persisting | the park half is done and the tile has not been pressed. Not a failure — press it. If a tile press produces NO `[dock] press` line at all, the strip is not consuming the point: compare the coordinate against `strip=` on the arm line, and note `dock::Layout::contains` DECLINES the strip's cut CORNERS by design, so aim at a tile centre |
+| `[dock] press at (…) -> strip tiles=N raised=none` | the press hit the dock's own BACKGROUND rather than a tile. Consumed, raises nothing, by design. Aim at a tile |
+| `restore … via=other … -> RESTORED-OFF-DOCK`, census `-> RESTORED-NOT-VIA-DOCK` | the window came back, but not through a dock tile press (a `<TAB>`, or a focus change). **Rung (b) is NOT closed** and the census refuses to credit it. Re-park and use the tile |
+| `restore … glass=BLANK-NO-GLYPHS … -> RESTORED-BLANK`, census `-> FAIL reason=restore-blank` | **"a restore that paints nothing".** The raise moved the row above the shell and no glyph reached the glass. Cross with the `frame=` field on the `[oringlass] phase=restore` line: `frame=6/6` = the chrome repainted and the content did not (a damage/present defect in the restore path); `frame=0/6` = the composite never ran for this row. Either way, report; this is a real defect and the instrument is doing its job |
+| census `-> DECLINE reason=no-console-row` AFTER a park | the window was CLOSED, not minimised — check for `[clickroute] close=win2 … settle=` (boot7h showed the close disc `REFUSED furniture`, so this should not happen) |
+| no `[orindock]` lines at all after `arm` | the JD2 pump's phase-2 drain loop is dead — the same liveness reading `[orinclick] census` carries. A pump failure, not a rung failure |
+
+Watch also, as rung 6's card says: the `[redzone]` guard (boot7h already absorbed a LOW-REDZONE on
+`jd2-console`; the read-back adds ~1030 `read_pixel` calls to the arm and to each restore, and §5's
+stack numbers are still Pi numbers), and the `[dock]` ledger line's own `presses= raises= unhides=`
+tail — after a successful round trip those must read `presses>=1 raises>=1 unhides>=1`, which is the
+independent confirmation of `[orindock]`'s verdict from the dock's OWN counters.
+
+#### What this rung deliberately did NOT do
+
+* **No `video/` edit of any kind** — see the accessor table above. `wm.rs`, `dock.rs`, `strip.rs` and
+  `fbcon.rs` are textually untouched, so the `hw-rmbp` sync meets no conflict from this arc.
+* **No behaviour.** No new control, no new routing arm, no pixel path. If the round trip does not work
+  on metal, this rung did not break it and cannot fix it — it can only say so.
+* **No rung 5.** No furniture arming, no `pidesk::activate()`, no tegra `render_service`; §5.2 is
+  untouched and `TEGRADESK_CASCADE_OK` is not read.
+* **No timed verdict.** `FAIL reason=park-no-tile` is structural (the tile model, asked at the moment
+  of the park). There is deliberately no "the operator took too long" arm: a slow hand must never
+  read as a broken dock.
+* **UNFLOWN.** Every claim above is a build-time or artifact measurement. The two flight cards are the
+  adjudicators.
 
 ---
 
@@ -1741,7 +2001,7 @@ names the seat that owns the files under the parallel-arc rules in `CLAUDE.md`.
 | **1** | **The cfg leg** — ✅ **LANDED 2026-08-22, less `quarry`** (§3.5.1) | `arm-tegra-desk` leg added (gate 18 → 19 legs); `pidesk`/`quarry`/`livecon` mapped in arroyo's env map; two of the three gate mismatches fixed | `UNAOS_TEGRA=1 ./arroyo check` green 19/19, and green again under `UNAOS_TEGRA_EL0=1 UNAOS_PIDESK=1 UNAOS_LIVECON=1`; the new leg proven to go red on a re-introduced mismatch | jetson (arroyo + `arch/aarch64/syscall.rs`); the `quarry` line is a `video/` edit and is **held** in §3.5.2 |
 | **2** | **The desktop seam** — ✅ **LANDED 2026-08-25, and it REFUSES** (§3.2.1) | `tegradesk` feature + `main.rs::tegra_desk_arm` on `tegra_early_stop`'s terminus line + `UNAOS_TEGRADESK` env map + the `arm-tegra-seam` leg (11 → 12 board legs). The seam evaluates its floors and declines at two named stop-lines | **the floors half is UNFLOWN**: `[deskseam] floors …` + `REFUSE reason=…` print on an armed Orin boot, and nobody has taken one. **The `activate()` half is WITHDRAWN, not owed**: `pidesk::activate()` opens the console window and enables the bar, so running it crosses §6.1 *and* §5.2 — it belongs to rungs 3/5, and this row previously asked for something the same document forbids | jetson |
 | **3** | **Input routing** — ✅ **LANDED 2026-08-25 as a DEFAULT-OFF knob; FLOWN, ARMED, and ROUTING ON METAL** (§3.7, §3.8, §3.8.1) | `orinclick` (implies `tegra_el0`) wires `jd2_console_pump`'s `Event::Button` arm into `wc_click_route` (§3.4) and adds the `[orinclick]` instrument at the tail of `display_tegra.rs`. **⚠ HANDSHAKE WITH RUNG 2, DISCHARGED IN THIS ARC:** `main.rs`'s `TEGRADESK_CLICK_ROUTED` no longer reads `false` — it reads `cfg!(feature = "orinclick")`, **not** a literal `true`, because `tegradesk` does not imply `orinclick` and a hard `true` would assert a route back on an image that has none: the one-way trip re-entered through the constant meant to prevent it. `arm-tegra-seam` now carries `orinclick` so the assertion is type-checked. COMPILES: gate green 21/21 knob off and on; the new `arm-tegra-orinclick` leg proven to go red. No gate in this tree can boot it — QEMU models no Tegra234 | ✅ **DISCHARGED, boot7g 2026-08-25** (§3.8.1): `[clickroute] press hit asid=4294967042 win=1 (was 0) delivered` (capture line 13084) and `[orinclick] edge=press btn=0x01 at (1009,546) geom=yes hit=yes win=1 owner=0xffffff02 focus 0x0->0xffffff02 consumed=0 -> RAISED` (capture line 13085); release `-> RELEASE-DELIVERED` (13087); census `IDLE-NO-CLICKS -> ROUTING` (13089); a second press on the focused row `-> HIT-SAME` (13092), plus `CONSUMED` (13125), `MISS-SHELL` (13133) and `RELEASE-DROPPED` (13135). Six press/release pairs with `stuck=0 nogeom=0 dropped=0`. **The prior owed item — boot7f's armed-but-unclicked state (`-> ARMED`, capture line 11424, then 48 `IDLE-NO-CLICKS`) — is closed.** Still owed: nothing on the wire; stack cost on this path (§5) is still a Pi number | jetson |
-| **4** | **Console as a window** — ✅ **LANDED 2026-08-25 as a DEFAULT-OFF knob; FLOWN AND ROUTED the same day** (§3.9, §3.9.1) | `orinconwin` (implies `pidesk` + `tegra_el0`, and deliberately NOT `orindesk`/`orinclick`) calls the SHARED console-window machinery from `display_tegra::orin_conwin` on `tegra_early_stop`'s terminus line — `panel_console_face_arm` → `panel_console_window_open` → `console_is_routed` — and folds `jd2_console_pump`'s phase-2 `fbcon::detach()` to `if !tegra_conwin_live() { … }` so a routed console stays LIVE. **§6.1 IS NOW A BRANCH:** both ordering terms are read through `cfg!()` and an image missing either gets `[orinconwin] DECLINE reason=ordering-rule held=…` and NO window — measured on the artifact both ways. No `video/` edit; no `pidesk::activate()`, so §5.2 is untouched. Gate green 23/23 knob off and on; `arm-tegra-conwin` proven to go red; knob-off loadable image byte-identical | ✅ **DISCHARGED, boot7h 2026-08-25** (§3.9.1): `[orinconwin] gate … dock=GRANTED … orindesk=1 orinclick=1` (capture line 14828), then `[orinconwin] win=2 panel=1920x1200 cell=7x16 stage=4194304 table=2 present=Composited route=true live=LIVE -> ROUTED` (14833) with the `[wc-x] console-window / console-route first-paint / panic-fallback armed` trio beside it (14830–14832). The route stayed LIVE for a ~107-minute sitting — shell banner, keystroke echoes and verb output all landed through the window path; chrome clicks CONSUMED and the close control `REFUSED furniture` (14926–14927). **Still owed:** the dock round-trip (`presses=0` on every `[dock]` line — the minimise disc was never clicked) and a win=2 glyphs-on-glass read-back | jetson |
+| **4** | **Console as a window** — ✅ **LANDED 2026-08-25 as a DEFAULT-OFF knob; FLOWN AND ROUTED the same day** (§3.9, §3.9.1) | `orinconwin` (implies `pidesk` + `tegra_el0`, and deliberately NOT `orindesk`/`orinclick`) calls the SHARED console-window machinery from `display_tegra::orin_conwin` on `tegra_early_stop`'s terminus line — `panel_console_face_arm` → `panel_console_window_open` → `console_is_routed` — and folds `jd2_console_pump`'s phase-2 `fbcon::detach()` to `if !tegra_conwin_live() { … }` so a routed console stays LIVE. **§6.1 IS NOW A BRANCH:** both ordering terms are read through `cfg!()` and an image missing either gets `[orinconwin] DECLINE reason=ordering-rule held=…` and NO window — measured on the artifact both ways. No `video/` edit; no `pidesk::activate()`, so §5.2 is untouched. Gate green 23/23 knob off and on; `arm-tegra-conwin` proven to go red; knob-off loadable image byte-identical | ✅ **DISCHARGED, boot7h 2026-08-25** (§3.9.1): `[orinconwin] gate … dock=GRANTED … orindesk=1 orinclick=1` (capture line 14828), then `[orinconwin] win=2 panel=1920x1200 cell=7x16 stage=4194304 table=2 present=Composited route=true live=LIVE -> ROUTED` (14833) with the `[wc-x] console-window / console-route first-paint / panic-fallback armed` trio beside it (14830–14832). The route stayed LIVE for a ~107-minute sitting — shell banner, keystroke echoes and verb output all landed through the window path; chrome clicks CONSUMED and the close control `REFUSED furniture` (14926–14927). **Still owed:** the dock round-trip (`presses=0` on every `[dock]` line — the minimise disc was never clicked) and a win=2 glyphs-on-glass read-back — ⚠ **both INSTRUMENTED 2026-08-25 under `orinladder`, both still UNFLOWN: see §3.11 for the two flight cards and every broken shape each one reads as** | jetson |
 | **5** | **The real desktop** | dock, strip, menubar, crystal armed; the full `pidesk` cascade; a tegra `render_service` (§3.6) | the Orin comes up to a desktop | jetson — **blocked by §5.2** |
 | **6** | **EL0 tenants** — ✅ **LANDED 2026-08-25 as the CRYSTAL-HD parity fix + a DEFAULT-OFF instrument knob; UNFLOWN** (§3.10) | the `SYS_WIN_*` surface needed NO new verb — the gap was `mmu_tegra_el0.rs` carrying the pre-CRYSTAL-HD FB geometry (128x128 cap, 0x1_0000 slot stride), which refused the shipped vug's `SYS_WIN_CREATE(288,288)` with `-EINVAL` and mis-mapped the WC-B fixture's slot 1. Parity restored (4 slots x 0x51000, 288x288, unconditional under `tegra_el0`); `orintenant = ["tegra_el0"]` arms the terminus `reserve_stage` + the `[orintenant]` arm/create/close/reap/census instrument. Tenant close policy: CLOSE-CLEAN (tenants close; furniture refuses). Gate green 24/24; `arm-tegra-tenant` + the `arm-tegra-conwin-tenant` conjunction cross both go-red-proven; knob-off jetson AND Pi loadable images byte-identical | an EL0 program owns a window on the Orin panel: `run /fat/vug.elf` on the four-knob conjunction image -> `[orintenant] create … surf=288x288 wm-bound=1 -> TENANT-WINDOW`, census `IDLE-NO-TENANTS -> TENANT-LIVE`, and a clean exit reaps (§3.10 flight card) | jetson |
 
