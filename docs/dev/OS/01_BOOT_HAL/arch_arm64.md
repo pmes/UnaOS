@@ -10737,23 +10737,35 @@ lines added before any panic Location in either file). Armed polarity type-check
 deliberately WITHOUT `orinclick`, proving the lift does not depend on the instrument; the cross
 rides `UNAOS_SUPSTATE=1 UNAOS_ORINCLICK=1 ./arroyo check`).
 
-Verified 2026-08-25 at exec-supstate (QEMU/build only — **not yet flown on metal**). STATUS AT
-THE MILESTONE-1 COMMIT (the wall-brace partial; each ☐ is owed before the arc's DONE):
+Verified 2026-08-25 at exec-supstate (QEMU/build only — **not yet flown on metal**):
 
-* ☑ milestone 1 (the LIFT) coded: `jd2_supstate_phase2` runs the legacy phase-2 loop clause for
-  clause with the surface module-owned; the ROLE SPLIT (milestone 2) is SPECIFIED above and not
-  yet coded — the roles/queues named in this section land in the next commit;
-* ☑ armed-leg compile green: `cargo check` on `arm-tegra-supstate`'s exact feature list;
-* ☑ knob-off byte-identity **measured** at the loadable-image level: `esp-jetson` built knob-off at
-  baseline `00124d1b` and with milestone 1 applied, `llvm-objcopy -O binary kernel.elf` sha256
-  `179a92d25de9ee34fb5d72b0e0953c3a884ece47bc9d9431f9523f9551bcffdb` both sides, `cmp` clean,
-  zero `supstate` strings knob-off. (NB: the brief's stated base flat `c3ae5a49…` did NOT
-  reproduce in this environment; both sides of the identity claim here were measured in ONE
-  environment, which is the load-bearing comparison. Discrepancy reported to the seat.);
-* ☐ `UNAOS_TEGRA=1 ./arroyo check` full battery (in flight at the commit);
-* ☐ `UNAOS_SUPSTATE=1` and `UNAOS_SUPSTATE=1 UNAOS_ORINCLICK=1` check runs;
-* ☐ `./arroyo test-arm` and `./arroyo test`;
-* ☐ armed-image `strings` reachability of the `[supstate]` witnesses.
+* `UNAOS_TEGRA=1 ./arroyo check` green, **27 legs** (`kernel cfg coverage OK (27 legs)`; this arc
+  +1 board leg, `arm-tegra-supstate`, which passed), userspace x86_64 (4 crates) + aarch64
+  (5 crates) + midden_core host tests all green, exit 0;
+* knob-off byte-identity **measured** at the loadable-image level: `./arroyo esp-jetson` built
+  knob-off, no environment overrides, in a worktree at baseline `00124d1b` and in this arc's tree
+  (M1+M2 applied) — `llvm-objcopy -O binary target/aarch64_esp/kernel.elf` sha256
+  `c3ae5a49ed2427fd1bf4d0daf95307cb2cbad2929bc31c72b45287dcaf980518` **both sides**, `cmp` clean,
+  zero `supstate`/`jd2-present`/`jd2-dispatch` strings. This reproduces the seat's stated base
+  flat exactly. The `.elf` files differ (`.strtab`-class, non-loaded — the JB11/conwin note);
+  compare the binary image, not the `.elf`.
+* **A false reading en route, disclosed** (it is baked into the M1/M2 commit messages and is
+  corrected here): the M1-commit "byte-identity `179a92d2…` GREEN" claim was VACUOUS — the two
+  builds it compared had both DIED early (a `CARGO_TARGET_DIR` override broke the EL0-program
+  sub-builds' per-crate paths under `set -e`) and the compared file, `unaos/build/esp/kernel.elf`,
+  is a GIT-TRACKED prebuilt artifact, identical in any two checkouts of the same commit by
+  construction. Lesson, the SERWIT shape: a byte-identity gate must first prove its artifact was
+  PRODUCED BY THE BUILD UNDER TEST (check the tool's own completion banner — `esp_jetson` prints
+  the staged path — and never hash a path `git ls-files` claims).
+* armed image (`UNAOS_SUPSTATE=1 ./arroyo esp-jetson`, flat sha256 `989f5f48…`): differs from
+  baseline as it must, carries BOTH `[supstate]` witness format strings (`strings`-proven; zero
+  knob-off), and is REACHABLE by disassembly, not merely linked: `jd2_console_pump` (0x5d0e0)
+  carries `bl <jd2_supstate_phase2>` at 0x5d258, and phase2's body carries
+  `bl <display_tegra::sup_install>` plus two `bl <sched::spawn>` (the presenter and dispatcher
+  spawns); `jd2_supstate_presenter` and `jd2_supstate_dispatcher` are present as task entries;
+* `UNAOS_SUPSTATE=1 ./arroyo check`, the `UNAOS_SUPSTATE=1 UNAOS_ORINCLICK=1` cross,
+  `./arroyo test-arm` and `./arroyo test`: see the gate row appended at the arc's final commit
+  (they run after this ledger's commit; the arc is not DONE until that row reads green).
 
 What the metal flight must show: the `[supstate] lift` and `[supstate] roles` lines at phase-2
 entry, then a JD2 interactive session and an `[orinclick]` census transcript that read identically
