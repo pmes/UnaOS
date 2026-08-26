@@ -99,6 +99,16 @@
 #     hits — a50358f0 postdates both images — so replaying either against this file now reads
 #     FAIL on that one row. Correct, not a regression: a spec adjudicates the NEXT flight.
 #     boot7h (13159-) is the green reference now: 16/16, 0 forbidden.
+#
+# 2026-08-25 (exec-smallfix): IRQEL-RT PASS-arm promotion — the second flight the PENDING
+# SWEEP above demanded has arrived. `IRQEL-RT: first IRQ taken at EL1` is captured on two
+# CONSECUTIVE metal flights (boot7g `orin.log:12967`, boot7h `:14822`), both post-IRQEL-RT2,
+# so the row goes PENDING -> REQUIRE (argument in full at the row, including the one cost the
+# promotion buys). REQUIREs 16 -> 17; spec-declared PENDINGs 10 -> 9. Supersedes the tallies
+# in the exec-tailfold note above: boot7h replays 17/17, 0 forbidden, pending 8/9 (TEGRA-SD
+# the one unmatched) and remains the green reference. Go-red proven both directions this
+# session: the boot7h slice PASSes 17/17 with the promoted row ✅; the same slice with the
+# one IRQEL-RT PASS line removed reds on exactly this row (16/17).
 
 # --- boot bring-up witnesses (the JD/JB chain — all previously metal-proven) --------
 REQUIRE JD1.*scanout:.*sane=true
@@ -340,33 +350,45 @@ OPTIONAL !NOFOLD
 #   FAIL  `taken at EL<x> on cpu <n> (the ARMING core)`   the ARMING core's own IRQ went up
 #   MISS  `proof INCONCLUSIVE`                            nothing arrived; not a verdict
 #
-# THE KINDS ENCODE THAT AND NOTHING MORE. PASS is PENDING — code ahead of its bench, never
-# yet captured (boot 4f: "IRQEL-RT EL1 live-arm: still unproven on metal") — so it reads ⏳
-# until a capture carries it and mbench then advises the promotion. FAIL and MISS are
-# OPTIONAL: NOT PENDING, because a matched PENDING advises "consider promoting to REQUIRE",
-# which is exactly wrong for a fault path (x86-witness.spec's `[wc-d]` teardown block makes
-# the identical argument — nobody should ever REQUIRE a failure); and NOT FORBID, because
-# an honest negative result must not red the flight. The proof's ability to FAIL without
-# being suppressed is its most valuable property, and a REQUIRE on the PASS line would
-# convert the instrument into a rubber stamp.
+# THE KINDS: PASS is REQUIRE — promoted 2026-08-25 (exec-smallfix) at the two-trial bar
+# this file itself set for TEGRA-SD: two CONSECUTIVE metal flights carry the line verbatim
+# (boot7g `capture/line-acm0/orin.log:12967`, boot7h `:14822`, cpu 0 both), both flown
+# AFTER IRQEL-RT2 removed the machine-global-flag artifact that produced the only FAIL
+# metal ever printed (boot5c). The old objection — a REQUIRE on the PASS line "would
+# convert the instrument into a rubber stamp" — was an objection to requiring the good arm
+# while the FAIL arm was a live outcome of a HEALTHY boot; post-IRQEL-RT2 a FAIL means the
+# ARMING core's own IRQ went up at EL2, i.e. the banked EL1 vector path is NOT live — a
+# genuine regression that SHOULD red. The emitter is un-gated (`tegra` only, no runtime
+# knob) on the same path the `REQUIRE IRQEL-RT: EL1 one-shot proof` arm line below already
+# proves reached. THE COST, STATED: a boot printing MISS (`proof INCONCLUSIVE` — designed
+# as "not a verdict") now reds via this missing REQUIRE. Accepted deliberately: on both
+# flights the one-shot arrived well inside the ~100 ms window, and a metal boot where it
+# does not is a flight a human adjudicates, not one a spec waves through. FAIL and MISS
+# stay OPTIONAL: NOT FORBID (an honest negative reds ONCE, as this missing REQUIRE, never
+# double-counted), and nobody should ever REQUIRE a failure (x86-witness.spec's `[wc-d]`
+# argument, unchanged).
 #
-# THE HOLE, STATED RATHER THAN GLOSSED: since none of the three fails the run, a boot where
-# the proof ARMS and no verdict prints scores clean. mbench has no conditional REQUIRE
-# (`WHEN <guard> REQUIRE <rx>` — the grammar hole x86-witness.spec already writes up), so
-# the arm line is the guard a reader checks BY EYE: arm line present + all three verdicts ◦
-# = the window was entered and never closed. Patterns are kept ASCII on purpose: these lines
-# carry em-dashes, and a DARKWIN-dropped byte mid-sequence would lossy-replace them.
-# CAPTURE STATUS, measured against the record rather than assumed: the FAIL branch is the
-# ONLY one metal has ever printed (boot5c, `capture/line-acm0/orin.log:8311`, in its
-# PRE-IRQEL-RT2 wording `taken at EL2 — NOT the EL1 proof (investigate)`); `first IRQ taken
-# at EL1`, `proof INCONCLUSIVE` and `[irqel2a]` have ZERO hits anywhere in the bench tree.
-# The FAIL pattern below deliberately matches the NEW wording only, so replaying boot5c
-# against this spec reads it as ◦ — that is correct, not a miss: boot5c's verdict was the
-# machine-global-flag artifact IRQEL-RT2 removed, and a spec adjudicates the NEXT flight.
-PENDING IRQEL-RT: first IRQ taken at EL1 on cpu [0-9]+
+# THE HOLE, NOW CLOSED BY THE PROMOTION: pre-promotion, since none of the three failed the
+# run, a boot where the proof ARMS and no verdict prints scored clean. With the PASS arm
+# REQUIRE, a no-verdict boot reds on that row — the by-eye guard (arm line present + all
+# three verdicts ◦) is no longer load-bearing, though mbench still has no conditional
+# REQUIRE (`WHEN <guard> REQUIRE <rx>` — the grammar hole x86-witness.spec writes up).
+# Patterns are kept ASCII on purpose: these lines carry em-dashes, and a DARKWIN-dropped
+# byte mid-sequence would lossy-replace them.
+# CAPTURE STATUS, measured against the record rather than assumed: `first IRQ taken at
+# EL1` is captured TWICE (boot7g `orin.log:12967`, boot7h `:14822` — consecutive flights);
+# the FAIL branch's only metal print remains boot5c (`orin.log:8311`, in its
+# PRE-IRQEL-RT2 wording `taken at EL2 — NOT the EL1 proof (investigate)`, the removed
+# artifact); `proof INCONCLUSIVE` and `[irqel2a]` still have ZERO hits anywhere in the
+# bench tree. The FAIL pattern below deliberately matches the NEW wording only, so
+# replaying boot5c against this spec reads it as ◦ — that is correct, not a miss: boot5c's
+# verdict was the machine-global-flag artifact IRQEL-RT2 removed, and a spec adjudicates
+# the NEXT flight.
+REQUIRE IRQEL-RT: first IRQ taken at EL1 on cpu [0-9]+
 OPTIONAL IRQEL-RT: one-shot proof IRQ taken at EL[0-9]+ on cpu [0-9]+ \(the ARMING core\)
 OPTIONAL IRQEL-RT: EL1 one-shot NOT delivered in ~100 ms
-# The arm line is REQUIRE, and it is the one promotion this block makes. Justification, in
+# The arm line is REQUIRE — the block's first promotion (the PASS arm above, 2026-08-25,
+# is its second). Justification, in
 # full, because a REQUIRE that cannot match is the defect this file guards against:
 #   (1) CAPTURED — boot5c `orin.log:8310` carries it verbatim; the pattern is the prefix the
 #       IRQEL-RT2 rewording left untouched, so it matches the old and the new text alike.
