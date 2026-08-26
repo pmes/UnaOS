@@ -31,7 +31,7 @@ const MAX_TOKENS: usize = 400_000;
 /// Depth cap for the node-name stack (real trees are < 10 deep).
 const MAX_DEPTH: usize = 16;
 /// Longest node-name path we keep (bytes, '/'-joined).
-const MAX_PATH: usize = 160;
+pub const MAX_PATH: usize = 160;
 /// Most raw u32 words we capture from one property (the XUSB `clocks` list is 9 [phandle, id]
 /// pairs = 18 words — keep headroom above that).
 const MAX_WORDS: usize = 20;

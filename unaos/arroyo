@@ -790,6 +790,24 @@ _feats=""
 # jetson image is byte-identical to baseline. The ARMED build is type-checked by the `arm-tegra-jd1dc`
 # leg of KERNEL_CFG_MATRIX, not by this mapping. Witness on the wire: `JD1-DC VERDICT=`.
 [ -n "${UNAOS_JD1DC:-}" ] && _feats="${_feats}jd1dc,"
+# GA10B-PROBE1 (GA10BPROBE1): UNAOS_GA10B_PROBE1=1 arms the FIRST read-only probe rung for the Orin
+# Nano's Ampere GA10B iGPU — `arch/aarch64/ga10b_probe.rs::ga10bprobe1_run`, called as an appended
+# statement in `tegra_early_stop`'s BPMP block (it borrows the `chan` `jb1b_ping` proved). One
+# attended COLD-BOOT flight: a BPMP MRQ_PG rail-state gate FIRST (a read of a power-gated Tegra block
+# is EL3-fatal — JX1), then, only if the rail is provably ON, a risk-ordered ANNOUNCE-BEFORE-READ
+# sweep (fuse opt_priv_sec_en -> falcon hwcfg2 priv-lockdown bit13 -> priscv br_retcode -> priscv
+# cpuctl halted bit4 -> top_num_gpcs) with ZERO MMIO WRITES, and the flight ENDS in PSCI SYSTEM_OFF
+# (`power::shutdown`) — a dark board is the ready-for-cold-boot signal (2026-08-25 bench law). Every
+# register offset/bit cites the ACKED facts file ga10b-probe-rung1.facts.md, never nvgpu. The GA10B
+# BAR0 base and power-domain id are resolved from the firmware DTB `gpu@` node (EXT), never hardcoded.
+# `ga10bprobe1` IMPLIES `tegra` (the module + BAR0 aperture are Tegra234 silicon — the orinwdt/tegrasmp
+# precedent), so this knob is self-sufficient: `UNAOS_GA10B_PROBE1=1 ./arroyo check` and
+# `UNAOS_GA10B_PROBE1=1 ./arroyo esp-jetson` both arm it (esp-jetson also forces `tegra`/`tegrasmp`).
+# Default OFF => the module + its one appended call site vanish, no panic Location moves, and the
+# jetson OBJCOPY'D flat image is byte-identical to baseline (measured on `llvm-objcopy -O binary
+# kernel.elf`). The ARMED polarity is type-checked by the `arm-tegra-ga10bprobe1` leg of
+# KERNEL_CFG_MATRIX, not by this mapping. Witness family on the wire: `[ga10bprobe1]`.
+[ -n "${UNAOS_GA10B_PROBE1:-}" ] && _feats="${_feats}ga10bprobe1,"
 # ORIN-CLICK (rung 3): UNAOS_ORINCLICK=1 wires the Orin console pump's pointer BUTTON edge into the
 # WINDOW LAYER. `jd2_console_pump`'s `Event::Button` arm has logged the press and dropped it since JD20
 # ("no UI action wired yet"); this knob appends a call to `arch/aarch64/syscall.rs::wc_click_route` —
@@ -2750,6 +2768,27 @@ KERNEL_CFG_MATRIX=(
   # `all(feature = "tegra", target_arch = "aarch64")` items) and the derived mix-leg count is
   # unchanged. Board legs +1; gate +1. `./arroyo check` prints the live counts — read them there.
   "arm-tegra-supstate ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,supstate"
+
+  # GA10B-PROBE1 armed (appended 2026-08-25) — `ga10bprobe1` gates `arch/aarch64/ga10b_probe.rs` (the
+  # whole first-probe-rung module) and its one appended call site in `tegra_early_stop`. Without a leg
+  # the ARMED polarity would be compiled by NOTHING — the tegra_el0 / simmer_test / xusbfw / smpmark /
+  # orindesk / jd1dc / tegradesk / orinclick / orinconwin / selfup / orinwdt / bsptick shape this matrix
+  # has now closed many times, and the standing law is that a knob's gates must compile the configuration
+  # the knob turns ON. Hosted on `arm-tegra`'s list verbatim + `ga10bprobe1` (the smpmark/jd1dc shape:
+  # every site needs nothing beyond `tegra`, which `ga10bprobe1` implies — no standalone-vacuity trap).
+  #
+  # WHY ITS OWN TAIL LEG rather than `,ga10bprobe1` appended to `arm-tegra`: the standing reason from
+  # every leg above — `arm-tegra` is the DISARMED twin and the only leg anywhere that compiles the
+  # SHIPPED default jetson image, whose byte-identity to baseline this arc measures. Arming the knob
+  # there would trade this hole for that one, and a red on a tail leg names the knob. There is no
+  # `not(feature = "ga10bprobe1")` site in src/, so no disarmed asymmetry is created — every other leg
+  # (including `arm-tegra` itself) already carries the OFF polarity.
+  #
+  # UNIVERSE SIDE EFFECT: none that moves a mix count. `ga10bprobe1` is a NEW `[features]` entry named
+  # only on this arm-* leg, so `x86_cfg_universe` drops it (its sites are all inside `feature = "tegra"`
+  # items, under `src/arch/aarch64/`) and the derived mix-leg count is unchanged. Board legs +1; gate
+  # +1. `./arroyo check` prints the live board/mix counts every run — read them there, not here.
+  "arm-tegra-ga10bprobe1 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe1"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────

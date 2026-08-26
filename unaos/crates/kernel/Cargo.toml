@@ -1828,6 +1828,24 @@ orindesk = []
 # `JD1-DC VERDICT=`. See arch_arm64.md §JD1-DC.
 jd1dc = []
 
+# GA10B-PROBE1 (`UNAOS_GA10B_PROBE1=1`): the FIRST read-only probe rung for the Orin Nano's Ampere
+# GA10B iGPU (`arch/aarch64/ga10b_probe.rs`, one appended call site in `tegra_early_stop`). One
+# attended cold-boot flight, zero MMIO writes: a BPMP MRQ_PG rail-state gate FIRST (a read of a
+# power-gated Tegra block is EL3-fatal — JX1), then, only if the rail is provably ON, a risk-ordered
+# announce-before-read sweep of the GA10B security/boot-ROM/census registers (fuse opt_priv_sec_en ->
+# falcon hwcfg2 priv-lockdown -> priscv br_retcode -> priscv cpuctl halted -> top_num_gpcs), and the
+# flight ENDS in PSCI SYSTEM_OFF (`power::shutdown`) because a probe flight's next boot must be cold.
+# Every register offset/bit cites the ACKED facts file
+# docs/dev/OS/09_PLATFORM/ga10b-facts/ga10b-probe-rung1.facts.md — never nvgpu. IMPLIES `tegra` (the
+# whole module and the BAR0 aperture are Tegra234 silicon — the orinwdt/tegrasmp precedent), so
+# `UNAOS_GA10B_PROBE1=1 ./arroyo check` is self-sufficient, and `UNAOS_GA10B_PROBE1=1 ./arroyo
+# esp-jetson` builds an armed probe image. Default OFF => the module + its one appended call site
+# vanish, no panic `Location` moves (the call is appended to an existing line), and the jetson image
+# is byte-identical to baseline (measured: `llvm-objcopy -O binary kernel.elf`). The ARMED polarity is
+# type-checked by the `arm-tegra-ga10bprobe1` leg of KERNEL_CFG_MATRIX in `arroyo`, never by the knob
+# mapping. Witness family on the wire: `[ga10bprobe1]`.
+ga10bprobe1 = ["tegra"]
+
 # ORIN-SELFUP (`UNAOS_SELFUP=1`): the SELF-UPDATE core — the OS writes its own boot files. Gates
 # `arch/aarch64/selfup_tegra.rs` (staged whole-ESP payload UPDATE.PAK/UPDATE.SHA -> whole-payload +
 # per-file SHA-256 verify -> stage-beside + read-back verify -> ordered flip (matched-pair rule:

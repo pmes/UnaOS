@@ -133,6 +133,18 @@ boot still applies: rung 1 reads the set above in a single flight because they a
 already-safe apertures (fuse, GSP falcon, top) *once the rail is proven*; the first flight that
 reaches a **new** aperture class beyond these advances by one step only.
 
+**Implementation status (2026-08-25):** the proposal above is now IN THE TREE as
+[`arch/aarch64/ga10b_probe.rs`](../../../../crates/kernel/src/arch/aarch64/ga10b_probe.rs)
+(`ga10bprobe1_run`), gated behind the `ga10bprobe1` Cargo feature (`UNAOS_GA10B_PROBE1=1`, implies
+`tegra`) and wired as an appended, `#[cfg]`-erased call in `tegra_early_stop`'s BPMP block — so the
+disarmed jetson image stays byte-identical to baseline. The BAR0 base and power-domain id are
+resolved from the firmware DTB `gpu@` node (EXT), never hardcoded. Two adjustments to the
+proposal, made in code and reflected here: the witness family is emitted BRACKETED (`[ga10bprobe1]`)
+to match the tree's other Orin witness families and to stay well over the 8-byte LLVM
+immediate-encode floor; and the run ends in the REAL `power::shutdown()` (PSCI `SYSTEM_OFF`, in tree
+since 38d95900), not the stub — exec-reboot's verb has landed. The armed polarity is type-checked by
+the `arm-tegra-ga10bprobe1` leg of `KERNEL_CFG_MATRIX`.
+
 ## 4. What this rung does not do
 
 It boots no firmware, writes no engine register, and asserts no reset. The write-path facts in
