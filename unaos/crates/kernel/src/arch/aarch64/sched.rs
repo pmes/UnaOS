@@ -3713,7 +3713,7 @@ pub fn spawn_auto(name: &'static str, entry: fn(usize), arg: usize) -> u64 {
 /// into `super::boot` (the Pi-gated user MMU), and the `virt` JC3 path runs kernel-thread CAPSTONE only.
 #[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
 pub fn spawn_user(name: &'static str, user_entry: u64, user_sp: u64, cpu: usize) -> u64 {
-    spawn_user_inner(name, user_entry, user_sp, super::uslots::boot_ttbr0(), cpu)
+    spawn_user_inner(name, user_entry, user_sp, super::uslots::boot_ttbr0(), cpu, TASK_STACK_SIZE)
 }
 
 /// Like `spawn_user`, but the task runs in its OWN per-task address space (M6d): `user_ttbr0` is the
@@ -3728,7 +3728,29 @@ pub fn spawn_user_slot(
     user_ttbr0: u64,
     cpu: usize,
 ) -> u64 {
-    spawn_user_inner(name, user_entry, user_sp, user_ttbr0, cpu)
+    spawn_user_inner(name, user_entry, user_sp, user_ttbr0, cpu, TASK_STACK_SIZE)
+}
+
+/// EL0STK — `spawn_stack`'s EL0 twin: like `spawn_user_slot`, but with a caller-sized KERNEL stack for
+/// the task instead of the blanket [`TASK_STACK_SIZE`]. The stack being sized here is the EL1 stack the
+/// task's syscall/exception handling runs on (SP_EL0 — the user-window stack — is `user_sp`'s business,
+/// not this function's), and until this entry existed there was NO sized EL0 spawn anywhere in the tree:
+/// every EL0 task got the blanket 16 KiB however deep the kernel chains its syscalls actually reach.
+/// That asymmetry is what left `shell-run`'s transient floor dip with no honest fix — the kernel side
+/// has had `spawn_stack` since U7STK ("sizing a single task is the honest fix; raising `TASK_STACK_SIZE`
+/// would pay for every task in the system to cover one"), and that law applies verbatim here.
+///
+/// The size MUST come with its measurement — see the `run_user_image` spawn site for the shape.
+#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+pub fn spawn_user_slot_stack(
+    name: &'static str,
+    user_entry: u64,
+    user_sp: u64,
+    user_ttbr0: u64,
+    cpu: usize,
+    stack_bytes: usize,
+) -> u64 {
+    spawn_user_inner(name, user_entry, user_sp, user_ttbr0, cpu, stack_bytes)
 }
 
 #[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
@@ -3738,6 +3760,7 @@ fn spawn_user_inner(
     user_sp: u64,
     user_ttbr0: u64,
     requested_cpu: usize,
+    stack_bytes: usize,
 ) -> u64 {
     // SPREAD-10: bias toward the core(s) already holding this address space's tasks. For a fresh
     // slot the count is zero everywhere and this is byte-identical to the plain key chain.
@@ -3761,7 +3784,7 @@ fn spawn_user_inner(
     assert!(cpu < NUM_CPUS, "spawn_user: cpu out of range");
     // BG-SPREAD witness aid — record the decision so the caller can read back where its task landed.
     LAST_USER_PLACEMENT.store(cpu, Ordering::Release);
-    let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE + STACK_REDZONE + STACK_HIGHGUARD].into_boxed_slice();
+    let mut stack: Box<[u8]> = alloc::vec![0u8; stack_bytes + STACK_REDZONE + STACK_HIGHGUARD].into_boxed_slice();
     let ctx_sp = build_initial_frame(&mut stack, user_task_trampoline);
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
     let task = Box::new(Task {
