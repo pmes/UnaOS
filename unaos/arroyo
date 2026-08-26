@@ -1037,6 +1037,32 @@ _feats=""
 # Witness on the wire: `[orintenant] arm`, `[orintenant] create`, `[orintenant] close`,
 # `[orintenant] reap`, `[orintenant] census`. See docs/dev/OS/08_VIDEO/orin-desktop.md §6 rung 6.
 [ -n "${UNAOS_ORINTENANT:-}" ] && _feats="${_feats}orintenant,tegra_el0,tegra,"
+# ORIN-LADDER: UNAOS_ORINLADDER=1 arms `orinladder` — the two rungs orin 6 left owed
+# (orin-desktop.md §3.9.1): the win=2 GLYPHS-ON-GLASS read-back (`[oringlass]`) and the DOCK ROUND
+# TRIP adjudicator (`[orindock]`). DEFAULT OFF; unset, every item is compiled out and the jetson
+# image is byte-identical to baseline (MEASURED on `objcopy -O binary` flat images, not `.elf` shas).
+#
+# IT ADDS NO BEHAVIOUR. The round trip already ships end to end — rung 3's `minimise_hit` arm ->
+# `wm::minimise`, and `strip::press_route` -> `dock::press_at` -> `focus_changed`'s raise+unhide.
+# What this knob adds is the wire that says WHICH HALF happened and whether the half that happened
+# reached the glass. `video/` is not touched at all: every fact is taken through an existing public
+# accessor (`wm::info`, `wm::control_disc_rect`, `wm::dock_scan`, `dock::strip_rect`,
+# `dock::last_press_outcome`, `FrameBuffer::read_pixel`), which is a deliberate lane decision while
+# hw-rmbp carries an unlanded `wm.rs`/`screen.rs` delta.
+#
+# NOT STANDALONE, and the implication set is FORCED rather than chosen:
+# `orinladder = ["orinconwin", "orinclick", "orindesk"]`. `orin_conwin` itself refuses to open a
+# console window on an image missing either sibling (`[orinconwin] DECLINE reason=ordering-rule`,
+# §6.1), and this instrument's whole subject is that window and its minimise disc — so a standalone
+# knob would arm a probe for a window the build guarantees does not exist. `orinconwin` transitively
+# supplies `pidesk` and `tegra_el0` -> `tegra`, so the closure named below IS the flight image. One
+# env var now arms what boot7h needed three for.
+#
+# The ARMED polarity is type-checked by the `arm-tegra-ladder` leg of KERNEL_CFG_MATRIX, never by
+# this mapping. Witness on the wire: `[oringlass] arm`, `[oringlass] probe=`, `[oringlass] phase=`,
+# `[orindock] arm`, `[orindock] park`, `[orindock] restore`, `[orindock] census`. See
+# docs/dev/OS/08_VIDEO/orin-desktop.md §3.11.
+[ -n "${UNAOS_ORINLADDER:-}" ] && _feats="${_feats}orinladder,orinconwin,orinclick,orindesk,pidesk,tegra_el0,tegra,"
 # JB11-ESCAPE: UNAOS_NOJB11=1 suppresses the Falcon firmware-header census
 # (arch/aarch64/xusb_tegra.rs::jb11_fw_header_census) so a bench sitting can take an UN-INSTRUMENTED
 # CONTROL boot. Default UNSET => the census runs on every tegra boot, unchanged — the census is the
@@ -2798,6 +2824,38 @@ KERNEL_CFG_MATRIX=(
   # items, under `src/arch/aarch64/`) and the derived mix-leg count is unchanged. Board legs +1; gate
   # +1. `./arroyo check` prints the live board/mix counts every run — read them there, not here.
   "arm-tegra-ga10bprobe1 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe1"
+
+
+  # ORIN-LADDER armed (appended 2026-08-25) — `orinladder` gates the tail block of
+  # `arch/aarch64/display_tegra.rs` (`orin_glass_probe` / `orin_ladder_arm` / `orin_ladder_census`
+  # plus their statics) and the two LINE-NEUTRAL statements appended to `main.rs`'s
+  # `tegra_early_stop` terminus line and its JD2 phase-2 sweep line. Without a leg the ARMED polarity
+  # would be compiled by NOTHING — the tegra_el0 / simmer_test / xusbfw / smpmark / orindesk / jd1dc
+  # / tegradesk / orinclick / orinconwin / orintenant shape this matrix has now closed ten times, and
+  # the standing law is that a knob's gates must compile the configuration the knob turns ON.
+  #
+  # HOSTED ON `arm-tegra-conwin`'s FULL-CONJUNCTION LIST + `orinladder`, and there is no lighter host
+  # available: `orinladder` DECLARES `orinconwin` + `orinclick` + `orindesk`, so cargo would widen any
+  # shorter list straight back to this one (`orinclick`'s and `orintenant`'s reason, verbatim). That
+  # is not a defect of the leg — it is the point of the knob: the closure IS the flight image, so
+  # this leg type-checks the exact configuration `UNAOS_ORINLADDER=1` builds and nothing else.
+  # `orintenant` is deliberately NOT on this list: rung 6's tenant path is orthogonal to the two
+  # rungs this one closes, and the tenant CROSS already has its own leg above.
+  #
+  # WHAT THIS LEG EXERCISES THAT NO OTHER DOES: the read-back and adjudicator block itself — every
+  # `wm`/`dock` accessor it reaches through (`info`, `control_disc_rect`, `dock_scan`, `DockEntry`,
+  # `shell_z`, `KERNEL_OWNER_CONSOLE`, `strip_rect`, `last_press_outcome`, `read_pixel`) resolved
+  # from a `tegra` caller under `pidesk`. Those are exactly the symbols an unlanded shared-compositor
+  # delta could move, so this leg is also the early-warning for the hw-rmbp `wm.rs` sync.
+  #
+  # UNIVERSE SIDE EFFECT: none that moves a mix count — `orinladder` is a new `[features]` entry
+  # named only on an arm-* leg, so `x86_cfg_universe` drops it (every site is inside `feature =
+  # "tegra"` items). Board legs +1; gate +1. `./arroyo check` prints the live counts every run —
+  # read them there, not here.
+  #
+  # PRECONDITION: like `arm-tegra-conwin`, this leg compiles `arch/aarch64/syscall.rs`, which
+  # `include_bytes!`s `target/user_blob.bin`. `ensure_user_blob` (see check_both) supplies it.
+  "arm-tegra-ladder ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,pidesk,livecon,quarry,orinconwin,orindesk,orinclick,orinladder"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────

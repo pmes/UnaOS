@@ -2057,6 +2057,37 @@ orintenant = ["tegra_el0"]
 # `[supstate] roles`. UNFLOWN until the arc-boundary bench flight.
 supstate = ["tegra"]
 
+
+# ORIN-LADDER — the two rungs orin 6 left owed (orin-desktop.md §3.9.1 "What this flight still did
+# NOT establish"): the win=2 GLYPHS-ON-GLASS read-back and the DOCK ROUND TRIP. DEFAULT OFF.
+#
+# WHAT IT ARMS. Nothing that moves a pixel or routes an event — the round trip's whole mechanism
+# already ships (rung 3's `minimise_hit` arm, `wm::minimise`, `strip::press_route` ->
+# `dock::press_at`, `focus_changed`'s raise+unhide). What this knob arms is the ADJUDICATOR: the
+# `[oringlass]` read-back of the console window's own text off the scanout, the `[orindock]`
+# park/restore edge detector, and the ~10 s census that says WHICH HALF of the trip is outstanding.
+# All of it is appended at the tail of `arch/aarch64/display_tegra.rs`; the two call sites are
+# LINE-NEUTRAL in-line appends to `main.rs`'s terminus and JD2-sweep lines. NOT ONE LINE OF `video/`
+# is touched, deliberately — see the block header in `display_tegra.rs` for the lane reason.
+#
+# WHY IT IMPLIES THE §6.1 CONJUNCTION RATHER THAN STANDING ALONE, and the implication set is FORCED,
+# not preferred. `orin_conwin` REFUSES to open a console window on an image missing either `orindesk`
+# or `orinclick` (`[orinconwin] DECLINE reason=ordering-rule`), and this instrument's entire subject
+# is that window and the minimise disc on it. So:
+#   * `orinladder = []` would arm a probe for a window the build guarantees does not exist;
+#   * `orinladder = ["orinconwin"]` would arm one for a window `orin_conwin` declines to open;
+#   * `orinclick` is additionally what makes the disc a GESTURE rather than a decoration — without
+#     the router the minimise disc cannot be pressed and rung (b) has no event to witness.
+# `orinconwin` transitively supplies `pidesk` (the `dock`/`strip` modules this reads `strip_rect`,
+# `last_press_outcome` and `dock_scan` from) and `tegra_el0` -> `tegra`. The closure is therefore the
+# flight image exactly. This is `orinclick = ["tegra_el0"]`'s own argument applied one rung up.
+#
+# The ARMED polarity is type-checked by the `arm-tegra-ladder` leg of KERNEL_CFG_MATRIX in `arroyo`,
+# never by the knob mapping. Witness on the wire: `[oringlass] arm`, `[oringlass] probe=`,
+# `[oringlass] phase=`, `[orindock] arm`, `[orindock] park`, `[orindock] restore`,
+# `[orindock] census`. See docs/dev/OS/08_VIDEO/orin-desktop.md §3.11.
+orinladder = ["orinconwin", "orinclick", "orindesk"]
+
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }

@@ -3197,3 +3197,649 @@ pub fn sup_frame_key_repaint() {
 pub fn sup_frame_take() -> SupFrameBoard {
     core::mem::take(&mut *sup_lock(&SUP_FRAMES))
 }
+
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+// ORIN-LADDER — the two rungs orin 6 left owed. `orinladder`, DEFAULT OFF.
+//
+// orin-desktop.md §3.9.1 ("What this flight still did NOT establish") names exactly two items after
+// boot7h, and neither has an instrument:
+//
+//   (a) **Glyphs-on-glass for win=2.** No probe reads the CONSOLE WINDOW's surface back off the
+//       scanout. `[orinconwin] … -> ROUTED` proves the compositor believes it presented, and the
+//       operator's ~107-minute use of the shell through the window is strong human evidence, but
+//       neither is a READ-BACK. `[orinchrome]` closed exactly this question for rung 0's win=1 and
+//       the same shape is owed here.
+//   (b) **The dock round-trip.** `presses=0 raises=0 unhides=0` on every `[dock]` line of boot7h —
+//       the minimise disc has never been pressed on this board. "The dock is a route back" is the
+//       load-bearing premise of §6.1's ordering rule, and it has been exercised only as GEOMETRY
+//       (`dock=GRANTED`), never as a gesture.
+//
+// WHAT THIS RUNG ADDS, AND WHAT IT DELIBERATELY DOES NOT. It adds NO behaviour: not one pixel path,
+// not one routing decision, not one new control. Everything the round trip needs already ships —
+// `wc_click_route`'s `minimise_hit` arm (rung 3), `wm::minimise`, `strip::press_route` ->
+// `dock::press_at`, and `focus_changed`'s raise+unhide. What is missing is an ADJUDICATOR: a wire
+// that says which half of the trip happened, and a read-back that says whether the half that
+// happened reached the glass. This block is that adjudicator and nothing else.
+//
+// ⚠ NOT ONE LINE OF `video/` IS TOUCHED BY THIS RUNG, and that is a deliberate lane decision, not a
+// convenience. The `hw-rmbp` track carries an unlanded ~1200-line `wm.rs`/`screen.rs` delta that
+// meets this branch at the next sync, so every fact this instrument needs is taken through an
+// EXISTING public accessor:
+//   * the console row is found by `owner_asid == wm::KERNEL_OWNER_CONSOLE` (a public const) over
+//     `wm::info(1..=MAX_WINDOWS)` — no new "which window is the console" accessor is minted;
+//   * geometry comes from `wm::info`, the control disc from `wm::control_disc_rect`, the dock's
+//     strip from `dock::strip_rect`, its tile model from `wm::dock_scan`, and what its last press
+//     did from `dock::last_press_outcome`;
+//   * the read-back is `FrameBuffer::read_pixel`, the compositor's own verify primitive and the one
+//     place the read-back ban is lifted by name — `orin_chrome_probe`'s reason, verbatim.
+// If a fact needed a new signature, a new field or a reordering in `wm.rs`, the rung would have
+// stopped and asked rather than taken it. None did.
+//
+// WHY THE KNOB IMPLIES THE §6.1 CONJUNCTION, and why that is forced rather than chosen.
+// `orinladder = ["orinconwin", "orinclick", "orindesk"]`. That set is not a preference: `orin_conwin`
+// itself REFUSES to open a console window unless BOTH `orindesk` and `orinclick` are in the build
+// (`[orinconwin] DECLINE reason=ordering-rule`), and this instrument's whole subject is that window
+// and its minimise disc. A standalone `orinladder = []` would arm a probe for a window the build
+// guarantees does not exist, and a `["orinconwin"]` would arm one for a window `orin_conwin`
+// declines to open. `orinclick` is also what makes the DISC a gesture rather than a decoration, and
+// `orinconwin` transitively supplies `pidesk` (the `dock`/`strip` modules) and `tegra_el0` ->
+// `tegra`. So the closure is the flight image, exactly — this is `orinclick = ["tegra_el0"]`'s
+// argument applied one rung up.
+//
+// DEFAULT OFF AND MEASURED. With `orinladder` unset every item below vanishes and the two call sites
+// in `main.rs` — both LINE-NEUTRAL in-line appends, never new source lines — compile to nothing. The
+// ARMED polarity is type-checked by the `arm-tegra-ladder` leg of `KERNEL_CFG_MATRIX`.
+//
+// THE WIRE, in five families:
+//   1. `[oringlass] arm …`      — ONCE from the terminus, the win=2 read-back's first sample.
+//   2. `[oringlass] probe=… `   — six frame probes per sample, `[orinchrome]`'s six constants.
+//   3. `[oringlass] phase=… `   — the terminal glyph verdict for one sample.
+//   4. `[orindock] arm …`       — ONCE: the minimise disc's rect and the dock strip's rect, so an
+//                                 attended flight knows WHERE to click without guessing.
+//   5. `[orindock] park/restore/census …` — the round trip's two halves as they happen, plus the
+//                                 ~10 s census that says which half is outstanding.
+// -------------------------------------------------------------------------------------------------
+
+/// ORIN-LADDER — arm latch, census bookkeeping and the CNTPCT reading at arm time. `orintenant`'s
+/// shape, which is `orinclick`'s shape.
+#[cfg(feature = "orinladder")]
+static LAD_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "orinladder")]
+static LAD_CENSUS_TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "orinladder")]
+static LAD_CENSUS_SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "orinladder")]
+static LAD_T0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// ORIN-LADDER — the round-trip ledger. `parks` and `restores` are edges of the console row's own
+/// visibility predicate (`z > shell_z()`, the SAME one `dock::press_at` reports `raised=` from), not
+/// a second notion of "minimised" invented here. `dock_restores` is the subset of restores taken
+/// with the dock's last consumed press reading `raise` — a `<TAB>` back to the window is a restore
+/// but it is NOT the dock round trip, and the census refuses to credit it as one. `blank_restores`
+/// counts restores whose read-back found no glyphs: "a restore that paints nothing".
+#[cfg(feature = "orinladder")]
+static LAD_PARKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "orinladder")]
+static LAD_RESTORES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "orinladder")]
+static LAD_DOCK_RESTORES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "orinladder")]
+static LAD_BLANK_RESTORES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "orinladder")]
+static LAD_GOOD_RESTORES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// ORIN-LADDER — the last sampled visibility of the console row, as a tri-state so the FIRST sample
+/// cannot manufacture an edge: 0 = no row seen yet (or the row is gone), 1 = on the panel,
+/// 2 = parked below the shell. Every transition between 1 and 2 is an edge and prints.
+#[cfg(feature = "orinladder")]
+static LAD_LAST_VIS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// ORIN-LADDER — the tick at which the row last entered the parked state, for the census's
+/// `parked=Ns`. Informational: no verdict below is timer-driven (see `FAIL reason=park-no-tile`,
+/// which is STRUCTURAL — an operator who is merely slow must never read as a failure).
+#[cfg(feature = "orinladder")]
+static LAD_PARK_TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// ORIN-LADDER — census cadence in pump sweep ticks (~250 ms each): 40 ≈ 10 s, rung 3's number for
+/// rung 3's reason. NOTE the SAMPLING cadence is every tick and only the PRINT is at this period —
+/// see `orin_ladder_census` for why a 10 s sampler would miss the event this rung exists to witness.
+#[cfg(feature = "orinladder")]
+const LAD_CENSUS_PERIOD: u64 = 40;
+/// ORIN-LADDER — read-back budget. The probe is ~1030 `read_pixel` calls; a park/restore storm must
+/// not turn the UART and the scanout into a treadmill. The census reports the suppressed remainder.
+#[cfg(feature = "orinladder")]
+const LAD_GLASS_MAX: u32 = 32;
+#[cfg(feature = "orinladder")]
+static LAD_GLASS_TAKEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// ORIN-LADDER — the console face's PAPER and INK, as the values `fbcon` writes them.
+///
+/// `fbcon.rs:114-115` — `FG_DEFAULT = 0x00C0_C0C0` ("light grey text"), `BG_DEFAULT = 0x0000_0000`
+/// ("black background"). Both are private `const`s in that module, so they are restated here rather
+/// than reached for: importing them would mean a `pub` edit to `video/fbcon.rs`, which is precisely
+/// the shared-seam edit this rung refuses to make. `orin_chrome_probe` restates `0x00FF_00FF` for
+/// the same reason and with the same provenance note.
+///
+/// ⚠ THE FACE IS ANTI-ALIASED (`panel_console_face_arm` sets `c.aa = true`), so a glyph's EDGE
+/// pixels are alpha blends of these two and equal NEITHER. That is why the census below counts three
+/// things and not two: `paper` (exact background), `stem` (exact foreground — a fully covered pixel
+/// inside a stroke) and `ink` (everything that is not paper, blends included). A verdict resting on
+/// `ink` alone would be satisfied by any foreign window overlapping the box; `stem` is what makes it
+/// this console's own text.
+#[cfg(feature = "orinladder")]
+const LAD_PAPER: u32 = 0x0000_0000;
+#[cfg(feature = "orinladder")]
+const LAD_INK: u32 = 0x00C0_C0C0;
+
+/// ORIN-LADDER — the read-back grid: `LAD_BANDS` scanlines spread down the content box, each
+/// sampling `LAD_RUNS` CONTIGUOUS runs of `LAD_RUN` pixels. 8 x 4 x 32 = 1024 samples.
+///
+/// WHY CONTIGUOUS RUNS AND NOT AN EVEN GRID. At the bench panel the content box is ~1900 px wide and
+/// the routed cell is 7 px, so an evenly spread 64-point scanline samples about one pixel per four
+/// character cells and can miss every stroke on a sparse line. A 32-pixel run crosses ~4.5 cells
+/// end to end, and four of them spread across the width sample four independent stretches of the
+/// same text row. The question "is there text here" wants LOCAL density and GLOBAL spread, and this
+/// is the cheapest shape that has both.
+#[cfg(feature = "orinladder")]
+const LAD_BANDS: usize = 8;
+#[cfg(feature = "orinladder")]
+const LAD_RUNS: usize = 4;
+#[cfg(feature = "orinladder")]
+const LAD_RUN: usize = 32;
+
+/// ORIN-LADDER — CNTPCT/CNTFRQ on the calling core. Duplicated from `ten_now_freq`/`clk_now_freq`
+/// for their reason: those are gated on knobs this rung must not imply.
+#[cfg(feature = "orinladder")]
+fn lad_now_freq() -> (u64, u64) {
+    let (now, freq): (u64, u64);
+    unsafe {
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) now, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq, options(nomem, nostack, preserves_flags));
+    }
+    (now, freq)
+}
+
+/// ORIN-LADDER — **the console window's table row, found by OWNER.**
+///
+/// `panel_console_window_open` creates its row with `wm::KERNEL_OWNER_CONSOLE`, a public const, and
+/// that owner names exactly one row: `close_owner` refuses the reserved kernel band, so nothing else
+/// can mint one. Walking `wm::info` over the id space is O(MAX_WINDOWS) = 12 table lookups and needs
+/// no new accessor in `wm.rs` — which is the point (see this block's header).
+///
+/// `None` means there is no console WINDOW: `orin_conwin` declined, the image is not the conjunction,
+/// or the window was closed. Every caller below names that case rather than treating it as a failure
+/// of the round trip.
+#[cfg(feature = "orinladder")]
+fn lad_console_info() -> Option<crate::video::wm::WindowInfo> {
+    use crate::video::wm;
+    for id in 1..=(wm::MAX_WINDOWS as wm::WinId) {
+        if let Some(i) = wm::info(id) {
+            if i.owner_asid == wm::KERNEL_OWNER_CONSOLE {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// ORIN-LADDER — is the console row ON THE PANEL? The compositor's own predicate, spelled the way
+/// `dock::press_at` spells it when it reports `raised=`: `z > shell_z()`. There is no separate
+/// "minimised" flag on this system and none is invented here — `wm::minimise` parks a row by
+/// dropping its `z` to zero, and this is the reading of that.
+#[cfg(feature = "orinladder")]
+fn lad_on_panel(i: &crate::video::wm::WindowInfo) -> bool {
+    i.z > crate::video::wm::shell_z()
+}
+
+/// **ORIN-GLASS — rung (a): the win=2 GLYPHS-ON-GLASS read-back.**
+///
+/// The question, stated as the error it prevents. After boot7h the console window's evidence is
+/// `[orinconwin] … present=Composited … -> ROUTED` plus an operator who typed at it for 107 minutes.
+/// The first is the COMPOSITOR'S BELIEF — `present_outcome` reports that the pass ran, and this
+/// panel is a DRAM carveout scanned out by a block that does not snoop, so the trailing `flush_rect`
+/// is a real step that can fail on its own. The second is a human reading glass in a room, which is
+/// not a capture. §3.9.1 asked for "a read-back instrument … the way `[orinchrome]` closed rung 0's",
+/// and this is it, one rung up and with a different discriminator.
+///
+/// WHY THE DISCRIMINATOR IS INVERTED FROM `[orinchrome]`'s. That probe knew a constant it could
+/// compare against inside the CONTENT (the magenta block `orin_wm1` writes) and used it to
+/// discriminate "chrome missing" from "nothing landed". Here the content is TEXT: nobody can predict
+/// which glyph is at any coordinate, and the face is anti-aliased, so no single pixel carries an
+/// exact expectation. What IS predictable is the POPULATION — a text surface on the glass shows the
+/// console's own paper AND fully covered strokes of its own ink, and no other object on this panel
+/// shows that pair. So the roles swap: the CENSUS answers the rung's question, and the six FRAME
+/// constants (`[orinchrome]`'s own, re-derived from this row's box) are the discriminator that
+/// separates "the window is not there" from "the window is there and its text is not".
+///
+/// WHAT IS SAMPLED. `LAD_BANDS` scanlines down the content box, `LAD_RUNS` contiguous runs of
+/// `LAD_RUN` pixels each; the content box is `wm::info`'s own `(x, y)` and `w*scale` by `h*scale`,
+/// so this follows the placer at any integer scale rather than assuming the bench panel's 1. Each
+/// sample is classified against the two documented console colours (see `LAD_PAPER`/`LAD_INK`).
+///
+/// THE VERDICT LADDER — first match wins, every arm reachable, none constant:
+///
+/// | verdict | what the wire is saying |
+/// | --- | --- |
+/// | `DECLINE reason=no-console-row` | no `wm` row is owned by `KERNEL_OWNER_CONSOLE`. Not a failure of this rung: the image is not the conjunction, or `orin_conwin` declined and named its own reason above |
+/// | `DECLINE reason=no-panel` | headless boot — there is no scanout to read back |
+/// | `UNREADABLE` | every sample fell outside the mapped length: the row's geometry and the panel's disagree. A defect, and one no present count could show |
+/// | `WIN2-NOT-ON-GLASS` | not ONE sample is the console's background. Whatever occupies those panel coordinates, it is not this window's surface |
+/// | `BLANK-NO-GLYPHS` | every sample IS the background: the surface reached the glass and its TEXT did not. The exact shape §3.9.1 could not rule out, and the one a present count can never see |
+/// | `INK-NO-STEM` | non-paper pixels inside the box, but not one fully covered stroke of the console's own ink: something is over the content that is not this console's text |
+/// | `GLYPHS-NO-CHROME` | the console's paper and its ink strokes are both on the glass, and the FRAME is not. Text landed, the window's own chrome was overdrawn — §3.8.1's measured JD2-blit overdraw, caught in the act |
+/// | `GLYPHS-ON-GLASS` | frame and glyphs both read back at panel coordinates. **This is rung (a) closed** |
+///
+/// SAFETY AND COST. `read_pixel` is bounds-checked against the mapped length and answers `None`
+/// off-panel. The `wm` reads all happen BEFORE `WRITER` is taken and its guard is dropped in a single
+/// statement, so no window-table lock is ever held under the framebuffer lock (ORIN-WM1's acyclic
+/// rule, and `orin_chrome_probe`'s own discipline). ~1030 reads, budgeted by `LAD_GLASS_MAX`.
+#[cfg(feature = "orinladder")]
+pub fn orin_glass_probe(phase: &str) -> &'static str {
+    use crate::video::{theme, wm};
+
+    // Read the TABLE first and hold nothing: `WRITER` is taken below and the two locks must never
+    // nest in this direction.
+    let Some(i) = lad_console_info() else {
+        serial_println!(
+            "[oringlass] phase={} -> DECLINE reason=no-console-row (no wm row carries KERNEL_OWNER_CONSOLE — this image opened no console window; orin_conwin named its own reason on its own line)",
+            phase
+        );
+        return "DECLINE";
+    };
+
+    // The outer box, re-derived from the row exactly as `panel_console_window_open` built it:
+    // `create_at` was handed the CONTENT origin (`ox + BORDER`, `oy + TITLE_H + BORDER`), so the
+    // frame's own origin is that minus the same two terms. `w`/`h` are SOURCE pixels; the panel
+    // extent is `* scale`.
+    let cwp = i.w.saturating_mul(i.scale);
+    let chp = i.h.saturating_mul(i.scale);
+    let ox = i.x.saturating_sub(wm::BORDER);
+    let oy = i.y.saturating_sub(wm::TITLE_H + wm::BORDER);
+    let ow = cwp + 2 * wm::BORDER;
+    let oh = chp + wm::TITLE_H + 2 * wm::BORDER;
+    let on_panel = lad_on_panel(&i);
+
+    let fb = *crate::video::WRITER.lock();
+    if !fb.is_ready() {
+        serial_println!("[oringlass] phase={} win={} -> DECLINE reason=no-panel", phase, i.id);
+        return "DECLINE";
+    }
+
+    // THE DISCRIMINATOR — `[orinchrome]`'s six frame constants, at the box's mid-edges (which clear
+    // `theme::CORNER_RADIUS` at both ends by construction). Deliberately NOT machined by `ceramic`:
+    // `paint_window` documents the keyline and the two bevel hairlines as exact theme values,
+    // because "a single-pixel edge has no room to show a grain".
+    let kw = theme::BEVEL;
+    let mx = ox + ow / 2;
+    let my = oy + oh / 2;
+    let probes: [(&str, usize, usize, u32); 6] = [
+        ("kl_top", mx, oy, theme::FRAME_LINE),
+        ("kl_bot", mx, oy + oh.saturating_sub(kw), theme::FRAME_LINE),
+        ("kl_left", ox, my, theme::FRAME_LINE),
+        ("kl_right", ox + ow.saturating_sub(kw), my, theme::FRAME_LINE),
+        ("bev_lt", mx, oy + kw, theme::BEVEL_LIGHT),
+        ("bev_sh", mx, oy + oh.saturating_sub(kw + theme::BEVEL), theme::BEVEL_SHADOW),
+    ];
+    let mut fhit = 0usize;
+    let mut fread = 0usize;
+    for (name, x, y, want) in probes.iter() {
+        match fb.read_pixel(*x, *y) {
+            Some(got) => {
+                fread += 1;
+                if got == *want {
+                    fhit += 1;
+                }
+                serial_println!(
+                    "[oringlass] probe={} at ({},{}) got={:#08x} want={:#08x} -> {}",
+                    name, x, y, got, want,
+                    if got == *want { "MATCH" } else { "MISS" }
+                );
+            }
+            None => serial_println!(
+                "[oringlass] probe={} at ({},{}) -> UNMAPPED (off-panel, or past the mapped length)",
+                name, x, y
+            ),
+        }
+    }
+
+    // THE GLYPH CENSUS. Contiguous runs, spread — see `LAD_BANDS` for why that shape.
+    let mut read = 0usize;
+    let mut paper = 0usize;
+    let mut ink = 0usize;
+    let mut stem = 0usize;
+    let mut first: u32 = 0;
+    let mut got_first = false;
+    let mut uniform = true;
+    for b in 0..LAD_BANDS {
+        // The vertical centre of the b-th of LAD_BANDS equal bands of the content.
+        let y = i.y + (2 * b + 1) * chp / (2 * LAD_BANDS);
+        for r in 0..LAD_RUNS {
+            // The run's centre at the r-th of LAD_RUNS equal columns, backed off by half a run and
+            // clamped so a narrow content box cannot walk the run past its own right edge.
+            let centre = (2 * r + 1) * cwp / (2 * LAD_RUNS);
+            let start = centre.saturating_sub(LAD_RUN / 2).min(cwp.saturating_sub(LAD_RUN));
+            for k in 0..LAD_RUN {
+                let x = i.x + start + k;
+                if let Some(v) = fb.read_pixel(x, y) {
+                    read += 1;
+                    if !got_first {
+                        first = v;
+                        got_first = true;
+                    } else if v != first {
+                        uniform = false;
+                    }
+                    if v == LAD_PAPER {
+                        paper += 1;
+                    } else {
+                        ink += 1;
+                    }
+                    if v == LAD_INK {
+                        stem += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // DERIVED, never asserted — the whole point of the line.
+    let verdict = if read == 0 {
+        "UNREADABLE"
+    } else if paper == 0 {
+        "WIN2-NOT-ON-GLASS"
+    } else if paper == read {
+        "BLANK-NO-GLYPHS"
+    } else if stem == 0 {
+        "INK-NO-STEM"
+    } else if fread != 0 && fhit == fread {
+        "GLYPHS-ON-GLASS"
+    } else {
+        "GLYPHS-NO-CHROME"
+    };
+    serial_println!(
+        "[oringlass] phase={} win={} box={}x{} at ({},{}) content={}x{} at ({},{}) scale={} onpanel={} frame={}/{} samples={} read={} paper={} ink={} stem={} first={:#08x} uniform={} -> {}",
+        phase, i.id, ow, oh, ox, oy, cwp, chp, i.x, i.y, i.scale,
+        if on_panel { "yes" } else { "PARKED" },
+        fhit, fread,
+        LAD_BANDS * LAD_RUNS * LAD_RUN,
+        read, paper, ink, stem, first,
+        if got_first && uniform { "yes" } else { "no" },
+        verdict
+    );
+    verdict
+}
+
+/// ORIN-LADDER — the read-back with its budget applied. Returns the verdict, or `"BUDGET"` once the
+/// budget is spent: a suppressed sample must not look like a passing one, so the census carries both
+/// the taken count and the suppressed remainder rather than silently thinning the evidence.
+#[cfg(feature = "orinladder")]
+fn lad_glass_budgeted(phase: &str) -> &'static str {
+    use core::sync::atomic::Ordering;
+    if LAD_GLASS_TAKEN.fetch_add(1, Ordering::Relaxed) >= LAD_GLASS_MAX {
+        return "BUDGET";
+    }
+    orin_glass_probe(phase)
+}
+
+/// **ORIN-LADDER — the arming point.** Appended to `tegra_early_stop`'s terminus line (ZERO source
+/// lines added — the tegra knob-off byte-identity constraint), AFTER `orin_conwin`'s and
+/// `orin_tenant_arm`'s statements so the console row this rung is entirely about is already in the
+/// table when the first sample is taken.
+///
+/// Three jobs, in order:
+///   1. Take the FIRST win=2 read-back, labelled `phase=arm`. It is the baseline every later sample
+///      is read against, and on its own it is already rung (a)'s answer for the boot's opening state.
+///   2. Print WHERE THE OPERATOR MUST CLICK. `wm::control_disc_rect(id, Ctrl::Minimise)` is the
+///      painter's own accessor — the disc the compositor actually drew, never a re-derivation — and
+///      `dock::strip_rect` is the registry hook `wm::erase_clip` reads, so the strip named here is
+///      the strip that will be painted. An attended flight that has to GUESS at a 24-px disc on a
+///      1920x1200 panel is a flight that reports "nothing happened" when the truth was "you missed".
+///   3. Seed the visibility tri-state so the first census tick cannot manufacture a park edge out of
+///      the boot's opening state.
+///
+/// Every decline is named and none is fatal: this rung reads, it never acts.
+#[cfg(feature = "orinladder")]
+pub fn orin_ladder_arm() {
+    use crate::video::{dock, wm};
+    use core::sync::atomic::Ordering;
+
+    let (now, _) = lad_now_freq();
+    LAD_T0.store(now, Ordering::Relaxed);
+
+    // Rung (a), first sample.
+    let glass = lad_glass_budgeted("arm");
+
+    // Rung (b), the arm line. Panel first, and the guard dropped in one statement.
+    let (pw, ph, ready) = {
+        let fb = *crate::video::WRITER.lock();
+        if fb.is_ready() {
+            let info = fb.info();
+            (info.width, info.height, true)
+        } else {
+            (0, 0, false)
+        }
+    };
+    if !ready {
+        serial_println!("[orindock] arm -> DECLINE reason=no-panel (headless boot — JD1 seeded no scanout; there is no dock, no disc and nothing to park)");
+        LAD_ARMED.store(true, Ordering::Release);
+        return;
+    }
+
+    let info = lad_console_info();
+    let disc = info
+        .as_ref()
+        .and_then(|i| wm::control_disc_rect(i.id, wm::Ctrl::Minimise));
+    let strip = dock::strip_rect(pw, ph);
+    let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+    let (tiles, _) = wm::dock_scan(&mut rows, (0, 0, 0, 0));
+
+    // The tri-state seed. `None` leaves it at 0 (no row seen), which is exactly right.
+    if let Some(ref i) = info {
+        LAD_LAST_VIS.store(if lad_on_panel(i) { 1 } else { 2 }, Ordering::Relaxed);
+    }
+
+    let verdict = if info.is_none() {
+        // NOT a failure of this rung — and it must not read as one. `orin_conwin` declines on a
+        // non-conjunction image and says so on its own line; this rung then has no subject.
+        "DECLINE reason=no-console-row"
+    } else if disc.is_none() {
+        // A console window with no minimise disc would make §6.1's whole ordering rule moot and this
+        // rung unrunnable. `ctrls_for` decides the row's cluster, so this is the wire asking it.
+        "DECLINE reason=no-minimise-disc"
+    } else if strip.is_none() {
+        // `dock::Layout::for_panel` refused the strip on this panel — the CONSOLEWIN law's geometry
+        // half, which `orin_conwin` also tests before opening. Reaching here means the panel changed
+        // under the boot; a park would be a one-way trip and the wire says so BEFORE one is taken.
+        "DECLINE reason=no-dock-strip"
+    } else {
+        "ARMED"
+    };
+    let (dx, dy, dd) = disc.unwrap_or((0, 0, 0));
+    let (sx, sy, sw, sh) = strip.unwrap_or((0, 0, 0, 0));
+    serial_println!(
+        "[orindock] arm panel={}x{} win={} disc=({},{},{}) strip=({},{},{}x{}) tiles={} glass={} orinconwin={} orinclick={} orindesk={} pidesk={} -> {}",
+        pw, ph,
+        info.as_ref().map(|i| i.id).unwrap_or(wm::WIN_NONE),
+        dx, dy, dd, sx, sy, sw, sh, tiles, glass,
+        cfg!(feature = "orinconwin") as u8, cfg!(feature = "orinclick") as u8,
+        cfg!(feature = "orindesk") as u8, cfg!(feature = "pidesk") as u8,
+        verdict
+    );
+    LAD_ARMED.store(true, Ordering::Release);
+}
+
+/// **ORIN-LADDER — rung (b): the DOCK ROUND TRIP, sampled every tick and adjudicated every ~10 s.**
+///
+/// Called from `jd2_console_pump`'s phase-2 idle cadence (`main.rs`), on the same ~250 ms sweep tick
+/// rung 3's and rung 6's censuses ride, so a stalled pump produces no line at all rather than a
+/// stale reassuring one.
+///
+/// ⚠ WHY THIS SAMPLES EVERY TICK WHERE RUNGS 3 AND 6 SAMPLE ONLY ON THE PRINTING PASS. Those
+/// censuses read COUNTERS, which are monotone: a 10 s cadence loses timing, never events. This one
+/// reads a STATE — the console row's `z` — and the event it exists to witness is a park followed by
+/// a restore, which an operator completes in a couple of seconds. A 10 s sampler would see the row
+/// on the panel, then on the panel again, and report `IDLE-NEVER-PARKED` for a round trip that
+/// actually happened. So the EDGE DETECTOR runs every tick (one `wm::info` walk, ~12 table lookups
+/// under one lock, ~4/s) and only the CENSUS PRINT is at the 10 s period. That is a strictly smaller
+/// footprint than the `wm::hit_test` rung 3 already takes per pointer event.
+///
+/// THE TWO HALVES, each with its own line, printed the tick they happen:
+///
+///   * `[orindock] park …` — the row's `z` dropped below the shell. That is `wm::minimise`'s park
+///     and nothing else can produce it. The line carries whether the dock's tile model contains the
+///     row, because THAT is the question §6.1 is about: a park with no tile is the one-way trip the
+///     ordering rule exists to forbid, and it is named at the moment it is taken.
+///   * `[orindock] restore …` — the row came back above the shell. `via=` is derived from
+///     `dock::last_press_outcome()`: a `raise` is the dock's own tile press, anything else is a
+///     restore by some other route (`<TAB>`, a focus change) and is NOT credited as the round trip.
+///     `glass=` is rung (a)'s read-back re-fired on the restored window, which is what makes
+///     "a restore that paints nothing" a DIFFERENT LINE from a restore that paints.
+///
+/// THE CENSUS VERDICT LADDER — first match wins, every arm reachable, none constant:
+///
+/// | verdict | what the wire is saying |
+/// | --- | --- |
+/// | `DECLINE reason=no-console-row` | there is no console window on this image. No subject; not a failure |
+/// | `DECLINE reason=no-dock-strip` | the panel cannot host the strip. There is no way back, so the trip is not merely untaken, it is impossible |
+/// | `FAIL reason=park-no-tile` | the row is parked NOW and the dock's tile model does not contain it. **The one-way trip, realised.** Structural, not timed — a slow operator never reads as this |
+/// | `FAIL reason=restore-blank` | the row came back and every read-back said the content did not paint. "A restore that paints nothing" |
+/// | `PARKED-AWAITING-DOCK` | parked, a tile names it, nobody has pressed it yet. The honest in-flight state |
+/// | `DOCK-ROUNDTRIP` | a dock tile press brought it back AND the read-back found its glyphs on the glass. **This is rung (b) closed** |
+/// | `RESTORED-NOT-VIA-DOCK` | it came back, but not through a dock tile. The round trip is NOT closed and the wire refuses to pretend it is |
+/// | `IDLE-NEVER-PARKED` | the minimise disc has not been pressed. **UNRUN, never PASS** — boot7h's state, and it must stay distinguishable from a passing one |
+#[cfg(feature = "orinladder")]
+pub fn orin_ladder_census(tick: u64) {
+    use crate::video::{dock, wm};
+    use core::sync::atomic::Ordering;
+
+    if !LAD_ARMED.load(Ordering::Acquire) {
+        return;
+    }
+
+    // ── the EDGE DETECTOR, every tick ────────────────────────────────────────────────────────────
+    let info = lad_console_info();
+    let now_vis = match info {
+        Some(ref i) => {
+            if lad_on_panel(i) {
+                1u32
+            } else {
+                2u32
+            }
+        }
+        None => 0u32,
+    };
+    let was = LAD_LAST_VIS.swap(now_vis, Ordering::Relaxed);
+    if let Some(ref i) = info {
+        if was == 1 && now_vis == 2 {
+            // PARK. Ask the dock's tile model for the way back AT THE MOMENT OF THE PARK — the
+            // answer is what §6.1's rule is about, and asking later would let a table change hide it.
+            let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+            let (n, _) = wm::dock_scan(&mut rows, (0, 0, 0, 0));
+            let tiled = rows[..n].iter().any(|r| r.id == i.id);
+            LAD_PARKS.fetch_add(1, Ordering::Relaxed);
+            LAD_PARK_TICK.store(tick, Ordering::Relaxed);
+            serial_println!(
+                "[orindock] park win={} z={} shellz={} tiles={} tiled={} t={} -> {}",
+                i.id, i.z, wm::shell_z(), n, tiled as u8, tick,
+                if tiled { "PARKED" } else { "PARKED-NO-WAY-BACK" }
+            );
+        } else if was == 2 && now_vis == 1 {
+            // RESTORE. `via` first (the dock's latch is read before anything below can disturb it),
+            // then the read-back on the window as it now stands.
+            let via_dock = dock::last_press_outcome() == "raise";
+            LAD_RESTORES.fetch_add(1, Ordering::Relaxed);
+            if via_dock {
+                LAD_DOCK_RESTORES.fetch_add(1, Ordering::Relaxed);
+            }
+            let glass = lad_glass_budgeted("restore");
+            let painted = glass == "GLYPHS-ON-GLASS" || glass == "GLYPHS-NO-CHROME";
+            if painted {
+                LAD_GOOD_RESTORES.fetch_add(1, Ordering::Relaxed);
+            } else if glass != "BUDGET" && glass != "DECLINE" {
+                LAD_BLANK_RESTORES.fetch_add(1, Ordering::Relaxed);
+            }
+            let parked_ticks = tick.wrapping_sub(LAD_PARK_TICK.load(Ordering::Relaxed));
+            serial_println!(
+                "[orindock] restore win={} z={} shellz={} via={} dockpress={} parked={}t glass={} t={} -> {}",
+                i.id, i.z, wm::shell_z(),
+                if via_dock { "dock" } else { "other" },
+                dock::last_press_outcome(), parked_ticks, glass, tick,
+                match (via_dock, painted) {
+                    (true, true) => "RESTORED",
+                    (true, false) => "RESTORED-BLANK",
+                    (false, true) => "RESTORED-OFF-DOCK",
+                    (false, false) => "RESTORED-OFF-DOCK-BLANK",
+                }
+            );
+        }
+    }
+
+    // ── the CENSUS PRINT, every LAD_CENSUS_PERIOD ticks ──────────────────────────────────────────
+    if tick.wrapping_sub(LAD_CENSUS_TICK.load(Ordering::Relaxed)) < LAD_CENSUS_PERIOD {
+        return;
+    }
+    LAD_CENSUS_TICK.store(tick, Ordering::Relaxed);
+    let seq = LAD_CENSUS_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    let (now, freq) = lad_now_freq();
+    let up = if freq == 0 {
+        0
+    } else {
+        now.wrapping_sub(LAD_T0.load(Ordering::Relaxed)) / freq
+    };
+
+    let parks = LAD_PARKS.load(Ordering::Relaxed);
+    let restores = LAD_RESTORES.load(Ordering::Relaxed);
+    let dock_restores = LAD_DOCK_RESTORES.load(Ordering::Relaxed);
+    let blanks = LAD_BLANK_RESTORES.load(Ordering::Relaxed);
+    let good = LAD_GOOD_RESTORES.load(Ordering::Relaxed);
+    let taken = LAD_GLASS_TAKEN.load(Ordering::Relaxed);
+    let suppressed = taken.saturating_sub(LAD_GLASS_MAX.min(taken));
+
+    let (pw, ph) = {
+        let fb = *crate::video::WRITER.lock();
+        if fb.is_ready() {
+            (fb.width(), fb.height())
+        } else {
+            (0, 0)
+        }
+    };
+    let strip = dock::strip_rect(pw, ph);
+    let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+    let (tiles, _) = wm::dock_scan(&mut rows, (0, 0, 0, 0));
+    let tiled = info
+        .as_ref()
+        .map(|i| rows[..tiles].iter().any(|r| r.id == i.id))
+        .unwrap_or(false);
+    let parked_now = now_vis == 2;
+
+    let verdict = if info.is_none() {
+        "DECLINE reason=no-console-row"
+    } else if strip.is_none() {
+        "DECLINE reason=no-dock-strip"
+    } else if parked_now && !tiled {
+        "FAIL reason=park-no-tile"
+    } else if restores != 0 && good == 0 && blanks != 0 {
+        "FAIL reason=restore-blank"
+    } else if parked_now {
+        "PARKED-AWAITING-DOCK"
+    } else if dock_restores != 0 && good != 0 {
+        "DOCK-ROUNDTRIP"
+    } else if restores != 0 {
+        "RESTORED-NOT-VIA-DOCK"
+    } else {
+        "IDLE-NEVER-PARKED"
+    };
+    serial_println!(
+        "[orindock] census seq={} t={} up={}s win={} vis={} tiles={} tiled={} parks={} restores={} viadock={} painted={} blank={} probes={} suppressed={} dockpress={} strip={} -> {}",
+        seq, tick, up,
+        info.as_ref().map(|i| i.id).unwrap_or(wm::WIN_NONE),
+        match now_vis {
+            1 => "panel",
+            2 => "parked",
+            _ => "norow",
+        },
+        tiles, tiled as u8, parks, restores, dock_restores, good, blanks,
+        taken.min(LAD_GLASS_MAX), suppressed,
+        dock::last_press_outcome(),
+        if strip.is_some() { "yes" } else { "REFUSED" },
+        verdict
+    );
+}
