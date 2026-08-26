@@ -97,7 +97,7 @@ pub mod install;
     feature = "install_target",
     feature = "piinstall",
     feature = "selfhost",
-    feature = "holocron"
+    feature = "holocron", feature = "selfup" // ORIN-SELFUP: selfup_tegra streams Sha256 over the payload + every staged file
 ))]
 pub mod hash;
 

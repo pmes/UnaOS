@@ -920,6 +920,21 @@ _feats=""
 # Witness on the wire: `[orinconwin] gate`, `[orinconwin] win=`, `[orinconwin] DECLINE`.
 # See docs/dev/OS/08_VIDEO/orin-desktop.md §6 rung 4 and §3.8.
 [ -n "${UNAOS_ORINCONWIN:-}" ] && _feats="${_feats}orinconwin,pidesk,tegra_el0,tegra,"
+# ORIN-SELFUP: UNAOS_SELFUP=1 arms the `selfup` feature — the SELF-UPDATE core in
+# `arch/aarch64/selfup_tegra.rs` (staged whole-ESP payload UPDATE.PAK/UPDATE.SHA on the boot volume
+# -> whole-payload + per-file SHA-256 verify -> stage-beside with read-back verify -> matched-pair
+# ordered flip: non-pair files, then BOOTAA64.EFI, then KERNEL.ELF LAST -> payload consumed ->
+# warm-reboot hook (the exec-reboot arc's verb; a witnessed no-op until it lands)). One call site,
+# appended after the ORIN-INSTALL-2 statement in `tegra_early_stop`. Writes go through the standing
+# `fs::fat` write path — no new writer, no new FAT-mutator call class. STANDALONE, mirroring
+# smpmark/orindesk/jd1dc — it does NOT imply `tegra`; every site is tegra-gated, so arm it WITH
+# tegra: `UNAOS_TEGRA=1 UNAOS_SELFUP=1 ./arroyo check`, or `UNAOS_SELFUP=1 ./arroyo esp-jetson`
+# (esp-jetson forces tegra). Default OFF => the module and its call site vanish and the jetson image
+# is byte-identical to baseline (the call site is an appended gated statement — no line moves). The
+# ARMED build is type-checked by the `arm-tegra-selfup` leg of KERNEL_CFG_MATRIX, not by this
+# mapping. Witness on the wire: `[orinselfup]`. Payloads: `./arroyo selfup-pak`.
+# See docs/dev/OS/10_INSTALL/orin-selfupdate.md.
+[ -n "${UNAOS_SELFUP:-}" ] && _feats="${_feats}selfup,"
 # JB11-ESCAPE: UNAOS_NOJB11=1 suppresses the Falcon firmware-header census
 # (arch/aarch64/xusb_tegra.rs::jb11_fw_header_census) so a bench sitting can take an UN-INSTRUMENTED
 # CONTROL boot. Default UNSET => the census runs on every tegra boot, unchanged — the census is the
@@ -2503,6 +2518,18 @@ KERNEL_CFG_MATRIX=(
   # `arch/aarch64/syscall.rs`, which `include_bytes!`s `target/user_blob.bin`. `ensure_user_blob` (see
   # check_both) supplies it.
   "arm-tegra-conwin ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,pidesk,livecon,quarry,orinconwin,orindesk,orinclick"
+
+  # ORIN-SELFUP armed (appended 2026-08-25) — `selfup` gates `arch/aarch64/selfup_tegra.rs` (the
+  # self-update core) and its one appended call site in `tegra_early_stop`. Without a leg the ARMED
+  # polarity would be compiled by NOTHING — the tegra_el0 / simmer_test / xusbfw / smpmark / orindesk
+  # / jd1dc / tegradesk / orinclick / orinconwin shape this matrix has now closed nine times, and the
+  # standing law is that a knob's gates must compile the configuration the knob turns ON. Hosted on
+  # `arm-tegra`'s list verbatim + `selfup` (the jd1dc pattern): every site needs nothing but `tegra`
+  # and the always-on fs/hash modules, so the bare-board list is the configuration a bench boot of
+  # this rung actually carries. UNIVERSE SIDE EFFECT: none that moves a count — `selfup` is a NEW
+  # `[features]` entry named on an arm-* leg only, so it stays out of `x86_cfg_universe` and the
+  # derived mix-leg count is unchanged. `./arroyo check` prints the live counts every run.
+  "arm-tegra-selfup ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,selfup"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────
@@ -3227,6 +3254,84 @@ esp_jetson() {
          FSx:\\EFI\\BOOT\\BOOTAA64.EFI     # launch UnaOS  (x = the number map showed)
   Serial console: Raspberry Pi Debug Probe on the board TTL header (pin 3 = RX, pin 4 = TX), 115200.
 EOF
+}
+
+# ORIN-SELFUP payload builder — the SCAFFOLDING-SIDE half of the self-update transport seam.
+# Packs a staged ESP tree (default: the esp-jetson output at $ESP_DIR_ARM) into the UPK1 container
+# the kernel's `arch/aarch64/selfup_tegra.rs` parses, plus its detached digest:
+#     UPDATE.PAK   magic "UNAOSUP1" | u32 LE count | u32 LE header_len |
+#                  per entry: u16 LE path_len, path, u32 LE size, 32-byte sha256 | data packed in order
+#     UPDATE.SHA   sha256 hex of UPDATE.PAK (sha256sum line shape — hash first)
+# MATCHED-PAIR RULE (BOOTABI) enforced at BUILD time too: refuses a tree missing EFI/BOOT/BOOTAA64.EFI
+# or kernel.elf, so a bad payload is caught on the host, not on the bench. Dotfiles/AppleDouble junk
+# are skipped with a warning (the kernel would refuse their non-8.3 names anyway). Usage:
+#     ./arroyo selfup-pak [src_esp_dir] [out_dir]     # defaults: $ESP_DIR_ARM, its parent (target/)
+# Stage the two outputs into the BOOT VOLUME ROOT of a running Orin (bench card loop today; a network
+# transport later delivers the same two names) and boot a `UNAOS_SELFUP=1` image to apply.
+selfup_pak() {
+    local src="${1:-$ESP_DIR_ARM}"
+    local out="${2:-$(dirname "$ESP_DIR_ARM")}"
+    [ -d "$src" ] || { echo -e "${COLOR_RED}selfup-pak: source ESP dir not found: $src (run ./arroyo esp-jetson first)${COLOR_RESET}" >&2; return 1; }
+    mkdir -p "$out"
+    SELFUP_SRC="$src" SELFUP_OUT="$out" python3 - <<'PYPAK' || return 1
+import hashlib, os, struct, sys
+
+src = os.environ["SELFUP_SRC"]
+out = os.environ["SELFUP_OUT"]
+MAGIC = b"UNAOSUP1"
+MAX_ENTRIES, MAX_PATH = 64, 128
+
+def ok83(comp):
+    base, dot, ext = comp.rpartition(".")
+    if not dot:
+        base, ext = comp, ""
+    if not base or len(base) > 8 or len(ext) > 3 or "." in base:
+        return False
+    return all(c.isalnum() or c in "_-~" for c in base + ext)
+
+entries = []
+skipped = []
+for root, dirs, files in os.walk(src):
+    dirs.sort(); files.sort()
+    for f in files:
+        rel = os.path.relpath(os.path.join(root, f), src).replace(os.sep, "/")
+        if rel.upper() in ("UPDATE.PAK", "UPDATE.SHA"):
+            continue
+        comps = rel.split("/")
+        if any(c.startswith(".") or not ok83(c) for c in comps) or len(rel) > MAX_PATH:
+            skipped.append(rel)
+            continue
+        entries.append(rel)
+if skipped:
+    print("selfup-pak: SKIPPED (non-8.3 / dotfile):", ", ".join(skipped), file=sys.stderr)
+if not entries:
+    sys.exit("selfup-pak: no packable files under " + src)
+if len(entries) > MAX_ENTRIES:
+    sys.exit(f"selfup-pak: {len(entries)} files exceeds the kernel's {MAX_ENTRIES}-entry bound")
+upper = {e.upper() for e in entries}
+if "EFI/BOOT/BOOTAA64.EFI" not in upper or "KERNEL.ELF" not in upper:
+    sys.exit("selfup-pak: MATCHED-PAIR RULE — the tree must carry BOTH EFI/BOOT/BOOTAA64.EFI and "
+             "kernel.elf (whole ESP or nothing); refusing to build a partial payload")
+
+table = b""
+blobs = []
+for rel in entries:
+    data = open(os.path.join(src, rel.replace("/", os.sep)), "rb").read()
+    if len(data) >= 2**32:
+        sys.exit("selfup-pak: " + rel + " exceeds the u32 size field")
+    pb = rel.encode()
+    table += struct.pack("<H", len(pb)) + pb + struct.pack("<I", len(data)) + hashlib.sha256(data).digest()
+    blobs.append(data)
+header = MAGIC + struct.pack("<II", len(entries), 16 + len(table)) + table
+pak = header + b"".join(blobs)
+pak_path = os.path.join(out, "UPDATE.PAK")
+open(pak_path, "wb").write(pak)
+digest = hashlib.sha256(pak).hexdigest()
+open(os.path.join(out, "UPDATE.SHA"), "w").write(digest + "  UPDATE.PAK\n")
+print(f"selfup-pak: {len(entries)} files, {len(pak)} bytes -> {pak_path}")
+print(f"selfup-pak: sha256 {digest} -> UPDATE.SHA")
+PYPAK
+    echo -e "${COLOR_GREEN}✅ self-update payload: ${out}/UPDATE.PAK + UPDATE.SHA — stage BOTH into the boot volume root, then boot a UNAOS_SELFUP=1 image${COLOR_RESET}"
 }
 
 # Bare-metal Raspberry Pi 4: build a flat kernel8.img the GPU ROM loads directly from the microSD
@@ -5155,6 +5260,9 @@ case "${1:-}" in
         ;;
     esp-jetson|esp_jetson|jetson)
         esp_jetson
+        ;;
+    selfup-pak|selfup_pak)
+        selfup_pak "${2:-}" "${3:-}"
         ;;
     vm-image|vm_image|vmimage|vm)
         vm_image

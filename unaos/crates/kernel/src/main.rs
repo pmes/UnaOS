@@ -2476,7 +2476,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // waits still have the JM4 timer as their wake source. Metal + tegra-gated; compiled out knob-off =>
     // byte-identical to baseline. See arch_arm64.md §ORIN-INSTALL-2 and scripts/orin-sdmmc1-bench.md.
     #[cfg(all(feature = "install_target", feature = "tegra"))]
-    unaos_kernel::arch::sdmmc_tegra::sdmmc_install_from_usb();
+    unaos_kernel::arch::sdmmc_tegra::sdmmc_install_from_usb(); #[cfg(all(feature = "tegra", feature = "selfup"))] unaos_kernel::arch::selfup_tegra::selfup_service(); // ORIN-SELFUP: self-update service — same preconditions as ORIN-INSTALL-2, AFTER it so an install and an update on one boot see the media final; appended to THIS line for knob-off byte-identity (no line moves). See docs/dev/OS/10_INSTALL/orin-selfupdate.md.
 
     // ORIN-UNAFS-ROOT rung 4 (arc M4): probe-mount the microSD's NATIVE unafs volume on its OWN
     // block handle — `unafs::mount_on(BlockHandle::TegraSd)`, the consumer the SDSEAM arms in

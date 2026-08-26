@@ -1782,6 +1782,29 @@ orindesk = []
 # `JD1-DC VERDICT=`. See arch_arm64.md §JD1-DC.
 jd1dc = []
 
+# ORIN-SELFUP (`UNAOS_SELFUP=1`): the SELF-UPDATE core — the OS writes its own boot files. Gates
+# `arch/aarch64/selfup_tegra.rs` (staged whole-ESP payload UPDATE.PAK/UPDATE.SHA -> whole-payload +
+# per-file SHA-256 verify -> stage-beside + read-back verify -> ordered flip (matched-pair rule:
+# non-pair files, then BOOTAA64.EFI, then KERNEL.ELF LAST) -> payload consumed -> warm-reboot hook)
+# and its one call site in `main.rs::tegra_early_stop`, placed after the ORIN-INSTALL-2 site where
+# the boot volume is a readable (and write-permitted) block device. Writes go through the standing
+# `fs::fat` write path — the one the July 2026 bench replays proved on this board, power-cycle
+# survival included; this feature adds NO new writer and NO new call class to the FAT mutator roster
+# (file verbs on the mounted boot volume, boot core, pre-JM6, same as the shell's write verbs).
+#
+# STANDALONE, mirroring `smpmark`/`orindesk`/`jd1dc` — it does NOT imply `tegra`. Every site lives
+# inside a `tegra`-gated module or a `tegra`-gated block, so `UNAOS_SELFUP=1` alone compiles
+# nothing; arm it as `UNAOS_TEGRA=1 UNAOS_SELFUP=1 ./arroyo check`, or
+# `UNAOS_SELFUP=1 ./arroyo esp-jetson` (which forces `tegra`). The ARMED polarity is type-checked by
+# the `arm-tegra-selfup` leg of KERNEL_CFG_MATRIX in `arroyo`, never by the knob mapping.
+#
+# Default OFF => the module and its call site vanish and the tegra image is byte-identical to
+# baseline (the call site is a gated statement appended inside `tegra_early_stop`, no line moves).
+# Witness family on the wire: `[orinselfup]` (12-byte prefix — over the 8-byte LLVM
+# immediate-encoding bound, so `strings` on the artifact proves reachability). Payloads are built by
+# `./arroyo selfup-pak`. See docs/dev/OS/10_INSTALL/orin-selfupdate.md.
+selfup = []
+
 # ORINDESK RUNG 2 (TEGRADESK) — the Jetson Orin's DESKTOP SEAM: the tegra-shaped arming wrapper
 # `main.rs::tegra_desk_arm`, wired into `tegra_early_stop`'s terminus line. It is the tegra
 # counterpart of `main.rs::pidesk_activate_maybe`, which the Orin can NEVER reach: that wrapper is
