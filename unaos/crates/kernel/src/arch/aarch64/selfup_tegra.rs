@@ -242,13 +242,12 @@ fn apply_update(fs: &FatFs, pak: &fat::DirEntry) -> Result<usize, String> {
     Ok(entries.len())
 }
 
-/// S6 — THE REBOOT SEAM. The warm-reboot verb is the exec-reboot arc's deliverable, built in
-/// parallel with this one; this hook is its single agreed call site. When that verb lands, this
-/// body becomes one call into it and the witness line below is replaced by the verb's own.
+/// S6 — THE REBOOT SEAM. Wired to the ORIN-REBOOT verb (power.rs, PSCI SYSTEM_RESET via ATF);
+/// this hook remains the single agreed call site. `power::reboot()` diverges (`-> !`) — on the
+/// Orin the SMC does not return, and power.rs owns whatever refusal handling exists below it.
 fn reboot_hook() {
-    serial_println!(
-        ":: [orinselfup] S6 reboot — warm-reboot verb NOT WIRED yet (exec-reboot arc owns it); continuing this boot on the in-RAM kernel — the updated ESP takes effect at the next power cycle ::"
-    );
+    serial_println!(":: [orinselfup] S6 reboot — invoking the warm-reboot verb ::");
+    crate::power::reboot()
 }
 
 /// Read UPDATE.SHA and decode its leading 64 hex chars (the `sha256sum` line shape the SOURCE-ALONG
