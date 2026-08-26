@@ -1351,8 +1351,12 @@ win=1 either.
 
 **Whether win=1's body actually stayed filled without a click, this capture cannot say: the
 `[orinchrome]` probes ran once (14298–14304), before the console window existed, and no
-post-routing read-back of win=1 exists on the wire — the answer for boot7h is on the panel and is
-Peter's to give.**
+post-routing read-back of win=1 exists on the wire — the answer for boot7h was on the panel and
+Peter gave it (2026-08-25, operator observation of the boot7h sitting): "I did not see the ghost
+window." The rung-4 routed console removed the overdraw mechanism and the body-ghost with it —
+the §3.8.1 defect is CLOSED on operator evidence, at operator-evidence scope: no wire-side
+read-back corroborates it yet, so the win=2/win=1 glyphs-on-glass probe (§ ladder, owed) remains
+the instrument that would make this capture-provable on a future flight.**
 
 What the wire *does* carry, stated at its own scope and no further: `[dock] live … clob=0` on
 all 1,168 scan passes across the sitting (final: line 16289) — `clob=` counts *window paints over
