@@ -7027,8 +7027,8 @@ fn jd2_supstate_phase2(
     mut last_sweep: u64,
     mut sweep_tick: u64,
 ) {
-    use unaos_kernel::arch::display_tegra::{sup_install, sup_with_surface};
-    use unaos_kernel::pal::{cursor, Event, GneissPal};
+    use unaos_kernel::arch::display_tegra::sup_install;
+    use unaos_kernel::pal::{Event, GneissPal};
 
     // The pump's free-running clock, re-read here rather than passed: CNTPCT is EL-independent and
     // per-core monotonic (the JD3 timerless mechanism), and `last_sweep`/`sweep_tick` carry the
@@ -7078,96 +7078,78 @@ fn jd2_supstate_phase2(
     drop(pal); // end the view's borrow; the Screen it viewed moves into the handle next
     sup_install(screen, console);
 
-    // ——— the drive loop: legacy phase-2 loop, every surface access through the handle ———————————
+    // ——— THE SPLIT (milestone 2): the roles get separate task identities ————————————————————————
+    // Both new roles are PINNED TO CORE 0 exactly as this task is — this arc changes ownership,
+    // never placement. Spawned only now, after `sup_install`, so neither role can ever observe an
+    // uninstalled surface. This task carries on as the INPUT SOURCE below.
+    unaos_kernel::arch::sched::spawn("jd2-present", jd2_supstate_presenter, 0, 0);
+    unaos_kernel::arch::sched::spawn("jd2-dispatch", jd2_supstate_dispatcher, 0, 0);
+    serial_println!(
+        "[supstate] roles input=jd2-console presenter=jd2-present dispatcher=jd2-dispatch core=0 (pinned; ownership split, placement unchanged) -> SPLIT"
+    );
+
+    // ——— the INPUT SOURCE loop: xHCI poll + PAL drain + click routing + the sweep cadence ————————
+    // What stays here is exactly the legacy loop's input half: the controller poll, the event
+    // drain with per-frame pointer coalescing, the JD20 announce/Button lines, `orin_click`, and
+    // the ~250 ms sweep (VUGRAS + the `[orinclick]` census — the census stays AUTHORED BY THE
+    // ROUTING TASK, which is the property that makes it trustworthy; see display_tegra.rs).
+    // What left: keys go over the key seam to the dispatcher; presentation goes to the board.
     let mut announced = false;
     loop {
         if let Ok(mut x) = unaos_kernel::drivers::xhci::claim() {
             x.poll_events();
         }
-        let cursor_was_visible = cursor::visible();
-        let mut needs_render = false;
-        let mut key_repainted = false;
         // ORIN-POINTER-FIX: coalesce all pointer motion in the frame to a single cursor update —
         // per-frame cursor work is O(1) regardless of report rate (see the legacy loop's account).
         let mut pending_rel: Option<(i32, i32)> = None;
         let mut pending_abs: Option<(i32, i32)> = None;
-        while let Some(ev) = unaos_kernel::pal::next_event() {
-            match ev {
-                Event::Key(c) => {
-                    let took = sup_with_surface(|screen, console| {
-                        let mut pal = unaos_kernel::pal::TargetPal { surface: screen };
-                        // Erase the cursor BEFORE the console repaints, so the save-under stash
-                        // never captures cursor pixels (the legacy bracket, unchanged).
-                        cursor::restore(&mut pal);
-                        // Serial echo: the bench evidence line (panel + serial must agree).
-                        if (32..=126).contains(&c) {
-                            serial_println!(":: tegra: JD2 — KEY '{}' ::", c as char);
-                        } else {
-                            serial_println!(":: tegra: JD2 — KEY {:#04x} ::", c);
+        // GUI-CLICK-2's contract, honoured across the split: while a foreground command owns the
+        // screen, its own pump_and_poll is the PAL queue's consumer — this drain stands down and
+        // only the xHCI poll above keeps feeding the ring (claim() is try-based on both sides).
+        // And the key seam's bound is checked BEFORE each pop, so a key is never popped-then-lost:
+        // when the dispatcher is 64 keys behind, events wait in the PAL ring exactly as they do
+        // today while the monolithic pump is busy inside `handle_key`.
+        if !SCREEN_APP_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
+            while !unaos_kernel::arch::display_tegra::sup_key_full() {
+                let Some(ev) = unaos_kernel::pal::next_event() else { break };
+                match ev {
+                    Event::Key(c) => {
+                        // Cannot fail: the seam's bound was checked before the pop above.
+                        let _ = unaos_kernel::arch::display_tegra::sup_key_push(c);
+                    }
+                    Event::Mouse { x, y } => {
+                        let (ax, ay) = pending_rel.unwrap_or((0, 0));
+                        pending_rel = Some((ax + x, ay + y));
+                        if !announced {
+                            serial_println!(
+                                ":: tegra: JD20 — pointer live (relative mouse, cursor on scanout) ::"
+                            );
+                            announced = true;
                         }
-                        handle_key(c, console, &mut pal)
-                    })
-                    .unwrap_or(false);
-                    needs_render = true;
-                    key_repainted = true;
-                    if took {
-                        // A command took the whole screen: stop draining this frame (shared rule).
-                        break;
                     }
-                }
-                Event::Mouse { x, y } => {
-                    let (ax, ay) = pending_rel.unwrap_or((0, 0));
-                    pending_rel = Some((ax + x, ay + y));
-                    if !announced {
-                        serial_println!(
-                            ":: tegra: JD20 — pointer live (relative mouse, cursor on scanout) ::"
-                        );
-                        announced = true;
+                    Event::MouseAbsolute { x, y } => {
+                        pending_abs = Some((x, y));
+                        if !announced {
+                            serial_println!(
+                                ":: tegra: JD20 — pointer live (absolute tablet, cursor on scanout) ::"
+                            );
+                            announced = true;
+                        }
                     }
-                }
-                Event::MouseAbsolute { x, y } => {
-                    pending_abs = Some((x, y));
-                    if !announced {
-                        serial_println!(
-                            ":: tegra: JD20 — pointer live (absolute tablet, cursor on scanout) ::"
-                        );
-                        announced = true;
+                    Event::Button(mask) => {
+                        // JD20's raw line first (an event reached the PUMP), then the ORIN-CLICK
+                        // route — the same two separable claims the legacy arm keeps separable.
+                        serial_println!(":: tegra: JD20 — pointer BUTTON {:#04x} (down) ::", mask);
+                        #[cfg(feature = "orinclick")]
+                        unaos_kernel::arch::display_tegra::orin_click(mask);
                     }
+                    _ => {}
                 }
-                Event::Button(mask) => {
-                    // JD20's raw line first (an event reached the PUMP), then the ORIN-CLICK route —
-                    // the same two separable claims the legacy arm keeps separable.
-                    serial_println!(":: tegra: JD20 — pointer BUTTON {:#04x} (down) ::", mask);
-                    #[cfg(feature = "orinclick")]
-                    unaos_kernel::arch::display_tegra::orin_click(mask);
-                }
-                _ => {}
             }
         }
-        // One cursor composite for the whole frame's pointer activity (the legacy bracket).
-        sup_with_surface(|screen, _console| {
-            let mut pal = unaos_kernel::pal::TargetPal { surface: screen };
-            if pending_rel.is_some() || pending_abs.is_some() {
-                cursor::restore(&mut pal);
-                if let Some((dx, dy)) = pending_rel {
-                    cursor::move_rel(dx, dy, pal.width() as i32, pal.height() as i32);
-                }
-                if let Some((ax, ay)) = pending_abs {
-                    cursor::set_abs(ax, ay, pal.width() as i32, pal.height() as i32);
-                }
-                cursor::draw_over(&mut pal);
-                needs_render = true;
-            } else if key_repainted && cursor::visible() {
-                cursor::draw_over(&mut pal);
-            }
-            if cursor_was_visible && !cursor::visible() {
-                cursor::restore(&mut pal);
-                needs_render = true;
-            }
-            if needs_render {
-                pal.render();
-            }
-        });
+        if pending_rel.is_some() || pending_abs.is_some() {
+            unaos_kernel::arch::display_tegra::sup_frame_pointer(pending_rel, pending_abs);
+        }
         // VUGRAS writeback sweep + the ORIN-CLICK census, on the cadence phase 1 advanced.
         if cntpct().wrapping_sub(last_sweep) >= sweep_ticks {
             last_sweep = cntpct();
@@ -7175,6 +7157,103 @@ fn jd2_supstate_phase2(
             #[cfg(feature = "orinclick")]
             unaos_kernel::arch::display_tegra::orin_click_census(sweep_tick);
             sweep_tick += 1;
+        }
+        unaos_kernel::arch::sched::yield_now();
+    }
+}
+
+/// ORIN-SUPSTATE — the DISPATCHER role (`jd2-dispatch`, pinned core 0): pop keys off the seam,
+/// echo them (the bench evidence line — panel + serial must agree, and the echo lives with the
+/// task that makes the panel agree), and run `handle_key` -> `shell::dispatch_command` under the
+/// surface lock. Sequential by construction, so the per-key ordering echo -> command output that
+/// the `awk '/:: tegra: JD2 —/'` transcript reconstruction relies on is preserved exactly.
+///
+/// The one deliberate lock-discipline exception lives here: this task HOLDS the surface across
+/// `handle_key`, whose full-screen commands (`vug`, `gneiss`) yield from their own drain loops.
+/// Safe under the module's rule — every other waiter is `try_lock` + `yield_now`, so the holder's
+/// command keeps running — and identical to today's semantics, where the monolithic pump was
+/// blocked inside `handle_key` and presented nothing until the command returned.
+#[cfg(all(feature = "tegra", target_arch = "aarch64", feature = "supstate"))]
+fn jd2_supstate_dispatcher(_arg: usize) {
+    use unaos_kernel::arch::display_tegra::{sup_frame_key_repaint, sup_key_pop, sup_with_surface};
+    use unaos_kernel::pal::cursor;
+    loop {
+        let mut handled = false;
+        while let Some(c) = sup_key_pop() {
+            handled = true;
+            let took = sup_with_surface(|screen, console| {
+                let mut pal = unaos_kernel::pal::TargetPal { surface: screen };
+                // Erase the cursor BEFORE the console repaints, so the save-under stash never
+                // captures cursor pixels (the legacy bracket, unchanged).
+                cursor::restore(&mut pal);
+                if (32..=126).contains(&c) {
+                    serial_println!(":: tegra: JD2 — KEY '{}' ::", c as char);
+                } else {
+                    serial_println!(":: tegra: JD2 — KEY {:#04x} ::", c);
+                }
+                handle_key(c, console, &mut pal)
+            })
+            .unwrap_or(false);
+            if took {
+                // A command took the whole screen: stop draining this pass, exactly as the legacy
+                // frame stopped, so a queued keystroke can't paint the console back over it.
+                break;
+            }
+        }
+        if handled {
+            // The console repainted into the back buffer; the presenter re-composites the cursor
+            // on top and presents (the legacy frame's key_repainted/needs_render pair, as a mark).
+            sup_frame_key_repaint();
+        }
+        unaos_kernel::arch::sched::yield_now();
+    }
+}
+
+/// ORIN-SUPSTATE — the PRESENTER role (`jd2-present`, pinned core 0): drain the frame board and
+/// own every flush to glass — the coalesced cursor composite (R22 save-under bracket), the
+/// re-composite over a key repaint, the ~1.5 s auto-hide erase, and `pal.render()`. Nothing else
+/// presents: the dispatcher's `handle_key` draws only into the back buffer (the `pal.render`
+/// calls inside full-screen commands own the panel by definition and are unchanged).
+#[cfg(all(feature = "tegra", target_arch = "aarch64", feature = "supstate"))]
+fn jd2_supstate_presenter(_arg: usize) {
+    use unaos_kernel::arch::display_tegra::{sup_frame_take, sup_with_surface};
+    use unaos_kernel::pal::{cursor, GneissPal};
+    let mut last_visible = cursor::visible();
+    loop {
+        let board = sup_frame_take();
+        // The auto-hide transition is edge-detected across passes, exactly as the legacy frame
+        // edge-detected it across one drain (`cursor_was_visible` at frame start vs after).
+        let vis_now = cursor::visible();
+        let auto_hide_erase = last_visible && !vis_now;
+        last_visible = vis_now;
+        if board.rel.is_some() || board.abs.is_some() || board.key_repaint || auto_hide_erase {
+            sup_with_surface(|screen, _console| {
+                let mut pal = unaos_kernel::pal::TargetPal { surface: screen };
+                let mut needs_render = board.key_repaint;
+                if board.rel.is_some() || board.abs.is_some() {
+                    // One cursor composite for the board's whole pointer activity (legacy bracket).
+                    cursor::restore(&mut pal);
+                    if let Some((dx, dy)) = board.rel {
+                        cursor::move_rel(dx, dy, pal.width() as i32, pal.height() as i32);
+                    }
+                    if let Some((ax, ay)) = board.abs {
+                        cursor::set_abs(ax, ay, pal.width() as i32, pal.height() as i32);
+                    }
+                    cursor::draw_over(&mut pal);
+                    needs_render = true;
+                } else if board.key_repaint && cursor::visible() {
+                    // A key repaint erased the cursor and redrew the console; put the arrow back.
+                    cursor::draw_over(&mut pal);
+                }
+                if auto_hide_erase {
+                    // Auto-hide swept the cursor off: erase it once so no arrow is left parked.
+                    cursor::restore(&mut pal);
+                    needs_render = true;
+                }
+                if needs_render {
+                    pal.render();
+                }
+            });
         }
         unaos_kernel::arch::sched::yield_now();
     }

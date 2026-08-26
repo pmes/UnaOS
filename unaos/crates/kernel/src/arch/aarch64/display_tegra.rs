@@ -3094,3 +3094,106 @@ pub fn sup_with_surface<R>(
         crate::arch::sched::yield_now();
     }
 }
+
+// ── ORIN-SUPSTATE milestone 2: the role seams ────────────────────────────────────────────────────
+//
+// Three task identities, one surface, two hand-off seams. The INPUT SOURCE (the original
+// `jd2-console` task) pushes keys here and posts presentation work to the frame board; the
+// DISPATCHER (`jd2-dispatch`) pops keys and runs the shell under the surface lock; the PRESENTER
+// (`jd2-present`) drains the board and owns every flush to glass. Both seams are LEAF locks:
+// pushed/popped with nothing else held, never held across a yield — so on this no-preemption core
+// they are uncontended at every acquisition by construction, and the `try_lock` + `yield_now`
+// discipline below is defence, not load-bearing.
+
+/// ORIN-SUPSTATE — acquire a supstate lock under the cooperative-core rule: `try_lock`, and give
+/// the core back on failure. Never a bare `lock()` spin (see the module header's livelock note).
+#[cfg(feature = "supstate")]
+fn sup_lock<T>(m: &spin::Mutex<T>) -> impl core::ops::DerefMut<Target = T> + '_ {
+    loop {
+        if let Some(g) = m.try_lock() {
+            return g;
+        }
+        crate::arch::sched::yield_now();
+    }
+}
+
+/// ORIN-SUPSTATE — the key seam, input source -> dispatcher. Capacity mirrors the PAL event ring's
+/// depth (64): the input source checks `sup_key_full` BEFORE popping the PAL queue, so a key is
+/// never popped-then-lost — when the dispatcher is 64 keys behind, events simply stay in the PAL
+/// ring exactly as they do today while the monolithic pump is busy.
+#[cfg(feature = "supstate")]
+static SUP_KEYQ: spin::Mutex<alloc::collections::VecDeque<u8>> =
+    spin::Mutex::new(alloc::collections::VecDeque::new());
+#[cfg(feature = "supstate")]
+const SUP_KEYQ_CAP: usize = 64;
+
+/// ORIN-SUPSTATE — true when the key seam cannot take another key without exceeding its bound.
+#[cfg(feature = "supstate")]
+pub fn sup_key_full() -> bool {
+    sup_lock(&SUP_KEYQ).len() >= SUP_KEYQ_CAP
+}
+
+/// ORIN-SUPSTATE — push one key for the dispatcher. Returns false (and drops nothing the caller
+/// did not already hold) iff the bound would be exceeded — unreachable when the caller honours
+/// `sup_key_full`, kept as a hard bound rather than an assumption.
+#[cfg(feature = "supstate")]
+pub fn sup_key_push(c: u8) -> bool {
+    let mut q = sup_lock(&SUP_KEYQ);
+    if q.len() >= SUP_KEYQ_CAP {
+        return false;
+    }
+    q.push_back(c);
+    true
+}
+
+/// ORIN-SUPSTATE — pop one key as the dispatcher. FIFO; `None` when idle.
+#[cfg(feature = "supstate")]
+pub fn sup_key_pop() -> Option<u8> {
+    sup_lock(&SUP_KEYQ).pop_front()
+}
+
+/// ORIN-SUPSTATE — the frame board, input source / dispatcher -> presenter. A fixed-size
+/// COALESCING board rather than a queue: relative motion accumulates, absolute position is
+/// last-writer-wins, and the key-repaint mark is idempotent — exactly the per-frame coalescing the
+/// legacy loop's `pending_rel`/`pending_abs`/`key_repainted` locals performed, made cross-task. So
+/// the board is bounded by its own type and can never grow, drop, or reorder work.
+#[cfg(feature = "supstate")]
+#[derive(Default)]
+pub struct SupFrameBoard {
+    /// Accumulated relative pointer motion since the presenter's last pass.
+    pub rel: Option<(i32, i32)>,
+    /// Last absolute pointer position since the presenter's last pass (raw HID 0..=32767).
+    pub abs: Option<(i32, i32)>,
+    /// A key repainted the console into the back buffer; the presenter re-composites the cursor on
+    /// top and presents.
+    pub key_repaint: bool,
+}
+
+#[cfg(feature = "supstate")]
+static SUP_FRAMES: spin::Mutex<SupFrameBoard> =
+    spin::Mutex::new(SupFrameBoard { rel: None, abs: None, key_repaint: false });
+
+/// ORIN-SUPSTATE — post one input frame's coalesced pointer activity (input source side).
+#[cfg(feature = "supstate")]
+pub fn sup_frame_pointer(rel: Option<(i32, i32)>, abs: Option<(i32, i32)>) {
+    let mut b = sup_lock(&SUP_FRAMES);
+    if let Some((dx, dy)) = rel {
+        let (ax, ay) = b.rel.unwrap_or((0, 0));
+        b.rel = Some((ax + dx, ay + dy));
+    }
+    if abs.is_some() {
+        b.abs = abs;
+    }
+}
+
+/// ORIN-SUPSTATE — mark that a key repainted the console (dispatcher side).
+#[cfg(feature = "supstate")]
+pub fn sup_frame_key_repaint() {
+    sup_lock(&SUP_FRAMES).key_repaint = true;
+}
+
+/// ORIN-SUPSTATE — take the whole board (presenter side), leaving it empty.
+#[cfg(feature = "supstate")]
+pub fn sup_frame_take() -> SupFrameBoard {
+    core::mem::take(&mut *sup_lock(&SUP_FRAMES))
+}
