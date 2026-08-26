@@ -4862,9 +4862,34 @@ fn composite_inner() -> CursorTail {
     // undrawn, and an `Untouched` tail there would leave the pointer missing for as long as the
     // contention lasts.
     {
-        let fb = *super::WRITER.lock();
-        if fb.is_ready() && drain_deferred(&fb) {
-            disturbed = true;
+        // LOCKFIX — through [`super::panel_snapshot`]; a refusal skips this pass's drain, and the
+        // skip is COUNTED.
+        //
+        // A DEFERRAL, NOT A LOSS, and the queue's own shape is what makes that true:
+        //   * nothing in the skipped path consumes an entry — `drain_deferred` empties `DEFER` only
+        //     at its snapshot (`q.1 = 0`), which is AFTER all three of its own probes (`DEFER_N`,
+        //     `DRAIN_PENDING`, the staging `try_lock`). Skipping the call outright is strictly
+        //     weaker than two early returns the function already takes and already documents as
+        //     costing "nothing that is not already owed".
+        //   * nothing is dropped while it waits — on a FULL queue `defer_erase` UNIONS the new box
+        //     into the least-growth entry rather than dropping it, precisely so a box cannot be
+        //     lost (dropping "would leave a dead window's last frame on the panel for the rest of
+        //     the boot — the P61 ghost"). Overflow therefore costs repaint AREA, never coverage.
+        //   * something comes back for it — `service_damage` and the `COMP_PENDING` re-run loop both
+        //     test `DEFER_N` as "is anything OWED" and re-drive a composite, so a non-empty queue
+        //     keeps arming passes until one drains it.
+        //
+        // COUNTED via `owe_repaint`, which is the paint path's EXISTING refusal sink (`[wedge9]
+        // refused=` / `masked=`) and is already called from this file on the WCSER decline path.
+        // Deliberately NOT `[inwedge]`/`panel_census`: that census measures the INPUT path, and
+        // `panel_snapshot`'s own note says mixing the two makes both unreadable.
+        match super::panel_snapshot() {
+            Some(fb) => {
+                if fb.is_ready() && drain_deferred(&fb) {
+                    disturbed = true;
+                }
+            }
+            None => super::cursor::owe_repaint(),
         }
     }
 
@@ -4927,12 +4952,26 @@ fn composite_inner() -> CursorTail {
         let mut reserved_hit = false;
         #[cfg(all(target_arch = "aarch64", feature = "witness", feature = "baremetal"))]
         {
-            let fb = *super::WRITER.lock();
-            if fb.is_ready() {
-                let (pw, ph) = (fb.info().width, fb.info().height);
-                if let Some(boxes) = super::wcf::reserved(pw, ph) {
-                    reserved_hit = boxes.iter().any(|b| boxes_overlap(sbox, *b));
+            // LOCKFIX — through [`super::panel_snapshot`], and the refusal degrades CONSERVATIVELY.
+            //
+            // `reserved_hit` is a PERMISSIVE variable: `false` asserts "no reserved box overlaps the
+            // sprite", which licenses composing the sprite over the region. So a refusal must NOT
+            // fall through to `false` — that would trade this arc's liveness hazard for a
+            // visual-corruption one, publishing the arrow over pixels WC-F's probe is about to
+            // overwrite in the FRONT. Assume overlap and decline instead: the same "decline rather
+            // than place it wrongly" rule the `wheel_route` refusal already takes. The sprite is not
+            // lost — `reserved_hit` drives the CURSOR-3 whole-sprite bracket below and sets
+            // `disturbed`, so the tail re-establishes it from the finished front.
+            match super::panel_snapshot() {
+                Some(fb) => {
+                    if fb.is_ready() {
+                        let (pw, ph) = (fb.info().width, fb.info().height);
+                        if let Some(boxes) = super::wcf::reserved(pw, ph) {
+                            reserved_hit = boxes.iter().any(|b| boxes_overlap(sbox, *b));
+                        }
+                    }
                 }
+                None => reserved_hit = true,
             }
             hit |= reserved_hit;
         }
@@ -4983,21 +5022,37 @@ fn composite_inner() -> CursorTail {
         // 640x480, and that leg is part of this landing's battery.
         #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
         {
-            let fb = *super::WRITER.lock();
-            if fb.is_ready() {
-                let info = fb.info();
-                if let Some(b) = super::crystal::open_rect(info.width, info.height) {
-                    if b.2 != 0 && b.3 != 0 && boxes_overlap(sbox, b) {
-                        reserved_hit = true;
+            // LOCKFIX — through [`super::panel_snapshot`], refusal degrading CONSERVATIVELY, and on
+            // THIS site that matters most: the cfg above compiles this block in on `pidesk`, i.e. on
+            // exactly the aarch64 images that are wedge-capable with no tenant.
+            //
+            // `false` here would assert "the open dropdown and the dock are clear of the sprite" —
+            // the licence to open an overlay session whose save-under is taken from the LAYER while
+            // the glass holds the menu, so the next restore stamps window content over the open
+            // dropdown. That is the menu ghost commit `bf527fc8` fixed ("the mouse erases the
+            // crystal menu"), and a naive `panel_snapshot()` swap would reintroduce it. Assume
+            // overlap on refusal: the pass declines the overlay and takes the whole-sprite bracket,
+            // whose tail re-saves from the FRONT and hands the menu back its own pixels.
+            match super::panel_snapshot() {
+                Some(fb) => {
+                    if fb.is_ready() {
+                        let info = fb.info();
+                        if let Some(b) = super::crystal::open_rect(info.width, info.height) {
+                            if b.2 != 0 && b.3 != 0 && boxes_overlap(sbox, b) {
+                                reserved_hit = true;
+                            }
+                        }
+                        if let Some(b) =
+                            super::dock::Layout::for_panel(sprite_dock_tiles, info.width, info.height)
+                                .map(|l| l.rect())
+                        {
+                            if b.2 != 0 && b.3 != 0 && boxes_overlap(sbox, b) {
+                                reserved_hit = true;
+                            }
+                        }
                     }
                 }
-                if let Some(b) = super::dock::Layout::for_panel(sprite_dock_tiles, info.width, info.height)
-                    .map(|l| l.rect())
-                {
-                    if b.2 != 0 && b.3 != 0 && boxes_overlap(sbox, b) {
-                        reserved_hit = true;
-                    }
-                }
+                None => reserved_hit = true,
             }
         }
         // CURSOR-12 — the sprite was up but nothing was under it. Counted before the `hit` branch so
@@ -5166,13 +5221,24 @@ fn composite_inner() -> CursorTail {
     // focus change in flight stay silent — otherwise the steady-state present rate would bury the
     // chain.
     crate::wedge2::mark_composite("<F7>", "<f7>");
-    let fb = *super::WRITER.lock();
-    if !fb.is_ready() {
-        // WC-N — a pass that produced no pixels for any window. See `WCN_ABORTED`.
-        #[cfg(feature = "witness")]
-        wcn_note_pass(false);
-        return tail_of(disturbed, session, deferred);
-    }
+    // LOCKFIX — through [`super::panel_snapshot`] rather than a bare blocking `WRITER.lock()`. This
+    // is the F4 shape: a masked chain (EL0 `svc` → `__vec_svc`, DAIF masked at entry and never
+    // cleared) reaching here would spin, interrupts off, on a lock held by a PREEMPTIBLE
+    // `jd2-present` chain pinned to the same core — a holder that can never be rescheduled
+    // (`steal_ok: false`) against a spinner that takes no timer IRQ. `panel_snapshot` blocks only
+    // when unmasked and `try_lock`s when masked, so the masked side can no longer wedge.
+    //
+    // `None` maps onto the EXISTING `!is_ready()` arm exactly: both mean "this pass has no panel to
+    // draw through", both witness the skip, both take the same tail. Semantics are unchanged.
+    let fb = match super::panel_snapshot() {
+        Some(fb) if fb.is_ready() => fb,
+        _ => {
+            // WC-N — a pass that produced no pixels for any window. See `WCN_ABORTED`.
+            #[cfg(feature = "witness")]
+            wcn_note_pass(false);
+            return tail_of(disturbed, session, deferred);
+        }
+    };
 
     // F4 — the drain barrier. Register this composite as in-flight WHILE STILL HOLDING the table
     // lock, so the registration is ordered against any teardown that takes the lock afterwards: a
