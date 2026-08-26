@@ -50,8 +50,10 @@
 //! | clock, right | [`crate::clock::try_unix_now`], UTC `HH:MM` | [`theme::TITLE_TEXT_INACTIVE`] |
 //!
 //! **The bar's one press target is the CRYSTAL.** This module still registers nothing with the click
-//! router itself; the SHARD menu ([`super::crystal`]) claims the crystal box through the ONE shared
-//! furniture router [`strip::press_route`], which both arch routers call ahead of every window arm.
+//! router itself; the SHARD menu ([`super::crystal`]) claims the crystal's corner cell
+//! ([`crystal_corner_abs`] — FITTS-CORNER, the bar's whole upper-left corner, not just the glyph)
+//! through the ONE shared furniture router [`strip::press_route`], which both arch routers call
+//! ahead of every window arm.
 //! Every other point on the bar falls through to whatever is behind it. The witness line says so
 //! (`press=crystal`). It read `press=inert` from the arc when the bar had no press seam at all, and
 //! that stale word survived onto the Pi, where PA41's operator read it off a metal capture as "press
@@ -208,6 +210,10 @@ const _: () = {
     // The title, shifted past the crystal, must still leave room for at least one glyph before the
     // clock on the floor panel.
     assert!(TITLE_X0 + CELL_W <= FLOOR_W - strip::PAD - CLOCK_GLYPHS * CELL_W);
+    // FITTS-CORNER: the press cell (`crystal_corner_abs`, TITLE_X0 wide by the bar's height) must
+    // CONTAIN the painted glyph box, or a press on the visible mark could miss its own menu. The
+    // horizontal half is the load-bearing one; vertical containment is the bevel assert above.
+    assert!(strip::PAD + CRYSTAL_W <= TITLE_X0);
 };
 
 // ---------------------------------------------------------------------------
@@ -565,6 +571,31 @@ fn crystal_box(r: strip::Rect) -> (usize, usize, usize, usize) {
 /// alone, so the box the menu opens from is the box the painter drew.
 pub fn crystal_box_abs(pw: usize, ph: usize) -> Option<strip::Rect> {
     strip_rect(pw, ph).map(crystal_box)
+}
+
+/// FITTS-CORNER — **the crystal's PRESS cell: the bar's whole upper-left corner, or `None`.**
+///
+/// Peter, at the Orin bench (2026-08-25): *"the crystal menu took too much exact aim to open — the
+/// ENTIRE upper left corner where it lives should open the menu, not clicking directly on the
+/// crystal."* The glyph box is 16x22 with a [`strip::PAD`] inset on every side — a Fitts target that
+/// demands aim at exactly the place aim should be free: a screen corner is the one target a flick
+/// reaches with none, because the edges stop the pointer. So the PRESS target and the PAINT box part
+/// ways here: [`crystal_box_abs`] stays the painter's and the dropdown-anchor's truth, and this cell
+/// is what the click router hits against.
+///
+/// Derived, not hardcoded: anchored at the bar rect's own origin (the true panel corner — the bar is
+/// `frame_flush(Top)`, so `(0,0)` is inside by construction), spanning the crystal's whole left slot
+/// — [`TITLE_X0`] wide (`PAD + CRYSTAL_W + PAD`, everything left of the title's inset, i.e. the glyph
+/// cell with both of its margins) by the bar's full height. Every pixel of the cell is a pixel the
+/// BAR paints and composites above the windows, so widening the press target to it steals nothing: a
+/// window dragged under the corner is under the bar there, and a press on visible bar chrome routing
+/// to bar furniture is the fixed-furniture rule, not an exception to it.
+///
+/// `None` exactly when [`crystal_box_abs`] is `None` (bar disabled, or the panel cannot host it), so
+/// a press with no bar still falls through to the arms below.
+pub fn crystal_corner_abs(pw: usize, ph: usize) -> Option<strip::Rect> {
+    let (bx, by, _bw, bh) = strip_rect(pw, ph)?;
+    Some((bx, by, TITLE_X0, bh))
 }
 
 /// Half the crystal's silhouette width at box-relative row `v`, in px.

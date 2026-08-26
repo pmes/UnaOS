@@ -720,8 +720,9 @@ pub fn compose_all() -> bool {
 ///
 ///  1. **CRYSTAL first**, ahead of the dock and every window arm. An OPEN dropdown is a modal surface
 ///     composited at the pass tail, on top of everything, so its press must be judged before any
-///     layer beneath it. CLOSED, the only point it claims is the crystal box in the menu bar — which
-///     the bar owns anyway — and it declines every other point, so nothing below it is starved.
+///     layer beneath it. CLOSED, the only points it claims lie in the bar's upper-left corner cell
+///     (FITTS-CORNER, `menubar::crystal_corner_abs`) — pixels the bar owns anyway — and it declines
+///     every other point, so nothing below it is starved.
 ///  2. **DOCK second**, still ahead of every window arm, because the dock is composited on top of
 ///     them: `wm::hit_test` knows nothing of the strip, so a window lying under the dock would
 ///     otherwise take a press the operator can see landed on a tile. The dock declines every point

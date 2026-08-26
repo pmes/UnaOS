@@ -327,7 +327,8 @@ pub fn activate() -> bool {
     );
 
     // The SHARD menu is reachable from this instant: `crystal::press_at` hit-tests
-    // `menubar::crystal_box_abs`, and the aarch64 click router's furniture arm
+    // `menubar::crystal_corner_abs` (FITTS-CORNER — the bar's whole upper-left corner cell, not just
+    // the glyph), and the aarch64 click router's furniture arm
     // (`arch::aarch64::syscall::wc_click_route`, `feature = "pidesk"`) already calls
     // `strip::press_route` ahead of every window arm. Stated on the wire because "the bar is painted"
     // and "the bar is live" are two claims and a capture should not have to infer the second.

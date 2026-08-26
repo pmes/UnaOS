@@ -6767,8 +6767,9 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
         CLICK_PRESSES.fetch_add(1, Ordering::Relaxed);
         // CRYSTAL — **judged FIRST, ahead of the dock and every window arm.** The SHARD menu, when
         // open, is a modal dropdown composited on top of everything, so its press must be tested
-        // before any layer beneath it; when closed, the only point it claims is the crystal box in
-        // the menu bar, which the bar owns anyway (the bar composites above the windows). It declines
+        // before any layer beneath it; when closed, the only points it claims lie in the bar's
+        // upper-left corner cell (FITTS-CORNER, `menubar::crystal_corner_abs`), which the bar owns
+        // anyway (the bar composites above the windows). It declines
         // every other point (`false`), so the dock and window arms are not starved. Consumed with the
         // target set to DROP so the matching RELEASE is dropped rather than delivered into whatever
         // holds focus — the rule the dock, close and chrome arms below already follow.
@@ -6784,7 +6785,7 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
         // DOCK — **judged before EVERY window arm, because the dock is composited on top of them.**
         //
         // Neither side can be starved. The crystal declines every point but the open dropdown and the
-        // crystal box in the bar (which the bar owns anyway); the dock declines every point outside
+        // bar's corner cell (which the bar owns anyway); the dock declines every point outside
         // its own strip (`Layout::contains`, the same accessor its painter draws from, corners
         // included). So there is no point at which both this arm and a window arm answer "mine"; and
         // the strip is auto-sized to its tiles and drawn only when there is at least one, so a bare
