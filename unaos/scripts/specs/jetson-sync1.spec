@@ -80,6 +80,25 @@
 #     that does not publish reds through the two FORBIDs, naming the rung that stopped.
 #   The knob-gated instruments (`orindesk` / `orinclick` / `jd1dc`) never move the count in
 #     either direction; that is what their PENDING/OPTIONAL kinds are for.
+#
+# 2026-08-25 (exec-tailfold, boot7h fold): THREE NEW WITNESS FAMILIES flown on boot7h
+# (media boot7h-conwin-net4-20260825T2208Z-68c4758, SRC.SHA 68c47585; scored slice
+# capture/line-acm0/orin.log lines 13159-16290) get rows, and ONE moves the count:
+#   REQUIREs go 15 -> 16: `SCHED: load` (SMPINSTR, a50358f0) — un-gated, emitted from
+#     `run_capstone_boot_core` strictly before the drive loop, the exact reachability
+#     argument the `[el0core] rollup:` REQUIRE already carries. The row and its full
+#     justification live in the SMPINSTR block below the EL0-EL1CORE block.
+#   ORINCONWIN (rung 4, `orinconwin`, `UNAOS_ORINCONWIN=1`, default OFF) and ORIN-NET-4's
+#     NET-4F/NET-4V instruments (`net4`, `UNAOS_NET4=1`, default OFF) are BOTH knob-gated, so
+#     their healthy-terminus rows are PENDING and their verdict arms OPTIONAL — the orinwm1 /
+#     orinclick / jd1dc idiom exactly, and for the same SMPMARK reason: a REQUIRE would red
+#     every unarmed boot on CONFIGURATION. Their PENDINGs matched on boot7h and mbench will
+#     advise promotion; the advice must NOT be taken, permanently, same as TEGRA-SD.
+#   GREEN-REFERENCE CHANGE, stated rather than discovered later (the boot5c precedent above):
+#     boot7f (capture lines 10055-11541) and boot7g (11542-13151) carry ZERO `SCHED: load`
+#     hits — a50358f0 postdates both images — so replaying either against this file now reads
+#     FAIL on that one row. Correct, not a regression: a spec adjudicates the NEXT flight.
+#     boot7h (13159-) is the green reference now: 16/16, 0 forbidden.
 
 # --- boot bring-up witnesses (the JD/JB chain — all previously metal-proven) --------
 REQUIRE JD1.*scanout:.*sane=true
@@ -267,6 +286,45 @@ REQUIRE \[el0core\] el1 core MEASURED: cpu=[0-9]+ mask=0x[0-9a-f]+
 #   this is a FAULT path. A boot that works correctly never prints it, so PENDING would advise
 #   promoting a failure to REQUIRE, and REQUIRE would demand one. Present in the table, never a gate.
 OPTIONAL \[el0core\] NOT stamped:
+
+# --- SMPINSTR: the load witness finally has an emission path on this board (a50358f0) --
+# Before SMPINSTR the `:: SCHED: load ::` line had NEVER printed on the Orin: its only
+# trigger was `timer_preempt`, which no-ops unless `SCHED_ACTIVE`, whose only aarch64
+# setter is inside `main.rs`'s `baremetal` block — and `baremetal` implies `pi`, which is a
+# hard `compile_error!` with `tegra`. `load_witness_poll` is the fix: a CNTPCT-rate-limited
+# (~1 s) poll inside `run_capstone_boot_core`'s inner `while dispatch_next(cpu)`, beside
+# `el0_refusal_rollup`, PLUS one unconditional baseline emit before the loop.
+#
+# THE REQUIRE STANDS ON THE BASELINE AND ON NOTHING ELSE, and it is the el0core-rollup
+# argument verbatim: the baseline call is un-gated (no `#[cfg]`, no `cfg!`, no runtime
+# knob — sched.rs's own doc block says "NOT FEATURE-GATED, deliberately"), it runs inside
+# `run_capstone_boot_core` strictly before the drive loop, and `REQUIRE CAPSTONE COMPLETE`
+# above already demands a line that prints AFTER that point (boot7h: baseline at capture
+# line 14845, CAPSTONE COMPLETE at 14860). So every image that can pass this file has the
+# emitter linked AND reached, and the promotion adds NO new way for a healthy boot to red.
+# CAPTURED: boot7h, capture/line-acm0/orin.log:14845 —
+#   `:: SCHED: load c0=--/f=never-folded c1=0%/f=3ms … c7=--/f=never-folded (ctx +0/win nofold=0x0) ::`
+# EXPECT FEW LINES, NOT MANY, and read their stopping as the design: the poll lives inside
+# the drive loop, `jd2_console_pump` is infinite, so after the pump is dispatched the loop
+# never returns and the lines stop — boot7h carries exactly two (baseline + one poll before
+# the pump). "The poll is the loop": if the drive loop dies the lines stop, and their
+# stopping is the measurement. A REQUIRE >= 1 is therefore the right strength; a COUNT
+# would encode the pump's dispatch timing, which is not an invariant.
+# THE PATTERN KEYS ON THE `/f=` FOLD-AGE TELL, which is SMPINSTR's own wire shape: the
+# pre-SMPINSTR pi-format line (`SCHED: load c0=0% c1=54% …`, no `/f=`) cannot match, so
+# this row cannot be satisfied by the format the arc replaced. Both first-column forms are
+# covered: `c0=--/f=` (untracked) and `c0=<n>%/f=` (tracked). Pure ASCII end to end; the
+# lowercase `nofold=0x0` on the same line is a different token than the uppercase `!NOFOLD`
+# tell and neither is in this pattern.
+REQUIRE SCHED: load c0=(--|[0-9]+%)/f=
+# THE TWO DIAGNOSTICS BESIDE IT, OPTIONAL — nothing should ever be required to print a
+# state dump (the [irqel2a] rule). `[pulse5]` is the live-span line emitted with the load
+# window (boot7h 14846); `!NOFOLD` is the staleness TELL — it NAMES the condition "tracked
+# but not folded past the bound" and deliberately cannot distinguish a wedged core from a
+# genuinely compute-bound one (sched.rs says so on the emitter), so it is a lead for a
+# reader, never a verdict, and must not gate or red a flight in either direction.
+OPTIONAL \[pulse5\] live c0=[0-9]+ms
+OPTIONAL !NOFOLD
 
 # --- IRQEL-RT2: the EL1 one-shot proof adjudicates THREE ways; do not flatten it -----
 # `timer::el1_oneshot_proof` (tegra-gated, and UNCONDITIONAL on a tegra image — main.rs
@@ -626,6 +684,78 @@ OPTIONAL \[redzone\] cpu=[0-9]+ HIGH-GUARD entered task=
 # prove the row can fire; the Orin zeroes are what prove arming it costs this lane
 # nothing on a healthy boot.
 FORBID \[spin6\] cpu=[0-9]+ REFUSING corrupt switch-in: task=
+
+# =====================================================================================
+# BOOT 7h — THE CONSOLE-WINDOW / NET FLIGHT (2026-08-25). Unlike the BOOT 7e banner
+# above, everything here IS captured: boot7h (capture/line-acm0/orin.log lines
+# 13159-16290, media boot7h-conwin-net4-20260825T2208Z-68c4758, SRC.SHA 68c47585) flew
+# both families below and every PENDING in this block matched on it. They stay PENDING
+# anyway, permanently, because both families are KNOB-GATED and default OFF —
+# `orinconwin` behind `UNAOS_ORINCONWIN=1` (arroyo:922), `net4` behind `UNAOS_NET4=1`
+# (arroyo:1045) — so a REQUIRE would red every unarmed boot on CONFIGURATION rather
+# than on health: the SMPMARK/TEGRA-SD argument, permanently binding here. mbench's
+# promotion advice on these rows is to be ignored on purpose.
+# =====================================================================================
+
+# --- ORINCONWIN (rung 4): the console as a compositor window --------------------------
+# ARMED BY `orinconwin`. `orin_conwin` (display_tegra.rs) is called on `tegra_early_stop`'s
+# terminus line with no runtime knob beyond the feature. TWO unconditional lines on an
+# armed image, so both are PENDING (the orinwm1 shape):
+#   1. THE GATE — printed above every early return, so an armed boot that prints nothing
+#      else still prints it. boot7h: `[orinconwin] gate panel=1920x1200x4 stage=4194304
+#      table=1 dock=GRANTED route=UNROUTED orindesk=1 orinclick=1 rows=12` (capture 14828).
+#   2. THE TERMINUS — prints whenever the window opened, with the verdict derived from
+#      present-outcome CROSSED with the route read back. boot7h: `[orinconwin] win=2
+#      panel=1920x1200 cell=7x16 stage=4194304 table=2 present=Composited route=true
+#      live=LIVE -> ROUTED` (capture 14833).
+# Patterns are pure ASCII and stop before any prose. The `\[orinconwin\]` tag is
+# load-bearing for the same measured reason as `\[orinwm1\]`'s: the shared fbcon path
+# prints `[wc-x] console-window win=… panel=…` on the SAME boot (boot7h 14830), and an
+# untagged pattern would credit rung 4 with the x86 compositor's line.
+PENDING \[orinconwin\] gate panel=[0-9]+x[0-9]+x[0-9]+
+PENDING \[orinconwin\] win=[0-9]+ panel=[0-9]+x[0-9]+ cell=[0-9]+x[0-9]+
+# THE TWO VERDICT ARMS of the terminus, OPTIONAL on exactly the orinwm1 argument: ROUTED
+# is derived (`ok && routed`), PRESENT-DECLINED is its honest negative, and neither may
+# red a first flight.
+OPTIONAL \[orinconwin\] win=.* -> ROUTED
+OPTIONAL \[orinconwin\] win=.* -> PRESENT-DECLINED
+# THE REFUSAL ARMS under their shared token — `already-armed`, `no-panel`, `ordering-rule`
+# (§6.1 as a branch), `dock-cannot-host-full-strip`, `console-not-ready` (console-face),
+# `open-declined`. REFUSALS, not failures: `ordering-rule` is precisely what a correct
+# boot prints when `orindesk`/`orinclick` are absent from the conjunction. The pattern
+# tolerates the `console-face ` infix and stops at `reason=` — several of these lines
+# carry em dashes and a `§` later in their prose, and this file never puts a multi-byte
+# character inside a pattern that crosses UARTC.
+OPTIONAL \[orinconwin\].* DECLINE reason=
+
+# --- ORIN-NET-4 (NET-4F / NET-4V): the RTL8168 ring discriminator and the DHCP verdict --
+# ARMED BY `net4`. Two unconditional-at-window-close lines on an armed metal boot, so both
+# PENDING; every verdict arm is a MEASUREMENT about the NIC/RC or the wire, so every arm
+# is OPTIONAL — the JD1-DC rule: a spec that reds an honest negative answer is asking the
+# hardware to BE something instead of measuring what it IS. In particular the boot7h
+# conviction (`single-address latch`, buffer 17, capture 14524) is the instrument WORKING,
+# and the no-lease `NO-OFFER` verdict (capture 14529) is an answer about the wire/server,
+# not a regression in UnaOS. No FORBID in this block, deliberately: mbench's default
+# `-> FAIL` scan already covers any future arm that chooses to spell failure.
+#   THE BRING-UP TERMINUS. Prints whether the lease arrived or the static fallback bound —
+#   boot7h took the fallback and still printed it (capture 14541). Pattern stops before
+#   the em dash on the wire (`ORIN-NET-4 DONE — RTL8168 driver up …`).
+PENDING ORIN-NET-4 DONE
+#   THE RING-PASS ORACLE at window close, three mutually exclusive readings (wraps>0 |
+#   RDU-clears>0 | both zero); boot7h read `wraps=0 RDU-clears=0` — the un-serviced-latch
+#   theory REFUTED on the wire (capture 14528).
+PENDING \[net4F\] RX ring pass verdict:
+#   THE TAG-DISCRIMINATOR'S CONVICTION ARM — fires only when consecutive completions all
+#   land in ONE named wrong buffer (boot7h: buffer 17, capture 14524). A healthy NIC
+#   never prints it; a PENDING would advise promoting a defect signature to REQUIRE.
+OPTIONAL \[net4F\] VERDICT tag-proven single-address latch
+#   THE CHIP-ID CROSS-CHECK (MATCH/MISMATCH read by eye — boot7h: xid=0x541 MATCH,
+#   capture 14502). Pattern stops at the tag; the verdict brackets sit before an em dash.
+OPTIONAL \[net4F\] MAC chip id:
+#   THE ONE-LINE NO-LEASE VERDICT (NET-4V), emitted ONLY when the DHCP window closes
+#   without a lease — a leased boot legitimately never prints it, so no PENDING umbrella
+#   (the MODEL-VERDICT argument above, in the other direction).
+OPTIONAL \[net4V no-lease verdict\]
 
 # --- COMPLETE: the END-OF-RUN MARKER this file spent its whole life without ----------
 # Until 2026-08-25 this spec declared ZERO `COMPLETE` markers, so mbench's TRUNCATED
