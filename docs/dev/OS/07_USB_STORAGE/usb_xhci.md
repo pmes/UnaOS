@@ -8171,6 +8171,33 @@ Reading the retired contradictions against this table: **"6 s / 2 s"** are the x
 never a metal figure on any platform — the places that attributed it to "Pi 4" or to "metal" have
 been corrected in place.
 
+### 32.2a The quarter budget, `hw_wait_budget() / 4` — 500 ms and ~0.27 s reconciled (2026-08-25)
+
+Three code sites still divide the base by 4 — and none of them is the pre-CCS-scan settle any
+more (that has been `settle_ms × cycles_per_ms()`, 150/100 ms nominal, since BOOTPACE M4 / CCSTRIM
+— §2d): the `usbdebug`-gated ENABLE_SLOT response diagnostic (`drivers/xhci/mod.rs`, the
+`hw_wait_budget() / 4` wait after "Failed to send Enable Slot" handling), and the two BT
+uncalibrated-TSC fallbacks (`drivers/ehci/mod.rs`, `bt_l3_budget` and the L2 scan-window fallback
+— both taken **only** when `tsc_hz() == 0`). Per platform and calibration state, `base / 4` is:
+
+| platform (base — §32.1) | quarter |
+|---|---|
+| x86, calibrated (2.0 s) | **0.50 s** (`tsc_hz × HW_WAIT_SECONDS` / 4 = 2 s / 4) |
+| x86, calibration failed (2.5e9 cycles) | **625e6 cycles** — a duration only once a rate is assumed: ≈ 0.27 s at the bench part's 2.3 GHz nominal, ≈ 0.23 s at its measured 2.6938 GHz (§12), ≈ 0.13 s at 5 GHz, ≈ 0.63 s at 1 GHz |
+| Pi 4 (150e6 ticks @ 54 MHz = 2.78 s) | 37.5e6 ticks = **0.69 s** |
+| QEMU virt (150e6 ticks @ 62.5 MHz = 2.4 s) | 37.5e6 ticks = **0.60 s** |
+| Jetson Orin, `tegra` (150e6 ticks @ 31.25 MHz = 4.8 s) | 37.5e6 ticks = **1.2 s** |
+
+**Reconciliation.** Two standing figures for this one expression — `bootpace.md`'s "≈ 500 ms"
+(the M4-era settle) and the "~0.27 s" quoted beside the BT fallbacks (`drivers/ehci/mod.rs` doc
+comments; the same figure rides a WINDOW-SHORT ledger row in the rmbp tree's copy of this file) —
+sit 1.85× apart because they are DIFFERENT ROWS of this table, not because either is wrong:
+500 ms is the **calibrated-x86** quarter (2 s / 4), and ~0.27 s is the **calibration-failed x86**
+quarter (625e6 cycles read at the 2.3 GHz nominal rate — the only state in which the BT fallbacks
+take `/ 4` at all). Neither figure is portable off x86, and the uncalibrated one is not a duration
+at all until a rate is assumed. Any site quoting `hw_wait_budget()/4` states its row — platform
+AND calibration state — or cites this table.
+
 ### 32.3 The BOT-vs-block-claim inversion — known, dated, deliberate
 
 **Recorded 2026-08-25.** Provenance: surfaced by the HWBUDGET derivation arc (commit `0c7cdeb6`,
@@ -8195,12 +8222,14 @@ purpose: the 3× transaction budget is metal-earned (shortening it fails slow-bu
 base), and the 1× claim wait is what keeps the masked-side FAT RMW retry cost bounded, which is the
 point of WEDGE-8. The consequence callers must own: `Busy`/`-EAGAIN` during a healthy-but-slow
 transfer is a normal, retryable outcome, not evidence of a wedge. Two standing texts contradicted
-this before today and one still does: `xhci_concurrency.md` §"What a `Busy` costs in practice"
+this before today; both are now corrected: `xhci_concurrency.md` §"What a `Busy` costs in practice"
 claimed the bounded waits "cover" a healthy transaction (corrected 2026-08-25 — true only of
 transactions that complete in milliseconds, not of what a healthy transaction is *allowed*), and
-the `claim_xhci_for_io` doc comment (`drivers/block.rs:58–61`) still says one base budget is "long
-enough for any healthy service pass or BOT transaction" — flagged to the owning seat, not edited
-here.
+the `claim_xhci_for_io` doc comment (`drivers/block.rs:58–62`) said one base budget is "long
+enough for any healthy service pass or BOT transaction" — corrected 2026-08-25 (this arc, same
+lines, line-count-neutral): it now states the 1× wait covers a healthy SERVICE PASS, that a
+healthy BOT transaction (budgeted 3×) can outlast it, and that `Busy` is then a normal, retryable
+outcome, cross-referencing this section.
 
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
