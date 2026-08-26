@@ -8767,6 +8767,63 @@ non-regression only.
   one-hit-grepped in the `esp-jetson` artifact, which needs `UNAOS_NET4=1` on the command line — the
   documented jetson knob set alone builds a feature line with no `net4`, so the driver is not in it).
 
+- **NET-4G — the latch-SITE discriminator: NIC-internal address caching vs RC/iATU translation caching,
+  settled by one flight. `[builds on the boot7h-flown NET-4F conviction]`**
+
+  Boot7h (2026-08-25) flew the NET-4F tag instrument and it CONVICTED: `[net4F] VERDICT tag-proven
+  single-address latch` — four consecutive completions wrote ONLY buffer 17, measured by lost landing
+  tags, while ring DRAM held the correct distinct address for every slot. (The same flight REFUTED the
+  RDU-latch theory by its own discriminator: RDU never latched.) But "NIC/RC-internal" still names two
+  machines with fixes in different lanes: the **NIC** reusing a latched descriptor address (register/
+  errata work), or the **Tegra234 RC's inbound path** collapsing correctly-issued distinct addresses
+  onto one target (iATU/SMMU reprogramming). NET-4G is the instrument that names the site.
+
+  **The experiment** (`net4g_arm`/`net4g_on_pop` in `rtl8168_tegra.rs`; UNCONDITIONAL but self-gating —
+  it arms only when the `[net4F]` latch verdict fires, so a healthy NIC never runs it; one-shot per
+  boot). At verdict time, the `addr` of a still-NIC-owned descriptor `NET4G_LATCH_LEAD`(=3) slots ahead
+  (the **victim**) is rewritten mid-run to a **decoy** — a reserved, tag-stamped page in the same
+  Normal-NC DMA window as the buffers (NC window `+0x40000`, in-page offset `+0x400`; enumerated as its
+  own `[net4s]` block so its inbound reachability is proven identical to the buffers'). The in-page
+  offset is load-bearing: buffer starts sit at 0/0x800 (mod 0x1000), so no offset-preserving
+  translation can map the decoy onto a buffer start or vice versa. A third tag goes at the **C-site** =
+  latched buffer L's 4 KiB page base + 0x400 — exactly where an offset-preserving granule collapse
+  would land the decoy-addressed write. Between arm and the victim's completion, L's and the C-site's
+  tags are re-stamped after every pop (fresh attribution); the decoy tag is NEVER re-stamped (only the
+  victim's descriptor carries its address — its loss at any point is the datum). Two structural facts
+  are leaned on: descriptor writebacks land per-slot concurrently (so no RC latch on ALL inbound
+  writes), and translation structures preserve in-granule offsets.
+
+  **Verdict vocabulary** (announced up front in the `[net4G] DECOY ARMED` line; mutually exclusive by
+  decision order; emitted as `[net4G] VERDICT latch-site=…` on the victim's completion):
+  `RC-SIDE` — decoy written AND interim pops kept re-hitting L ⇒ the NIC re-fetched and issued the
+  rewritten address and the fabric delivered it while ring-addressed writes still collapsed ⇒ the NIC's
+  address path is live and the collapse is downstream: RC/iATU convicted. `NIC-SIDE` — decoy untouched,
+  L's re-stamped tag lost again (uncontaminated: next descriptor not yet complete) ⇒ the rewritten
+  address was never consumed: full-address reuse inside the NIC. `RC-PAGE` — C-site written ⇒
+  offset-preserving granule collapse: RC/SMMU/iATU page-translation caching convicted directly.
+  `PREFETCH-DEPTH` — the victim's ORIGINAL buffer written ⇒ the NIC had already fetched the victim's
+  descriptor at arm time; no site verdict, but it measures prefetch depth > lead (raise the lead, re-fly).
+  Honest arms: `UNDECIDED-CLEARED` (decoy written but no interim L re-hit — the latch may have
+  dissolved), `UNDECIDED-CONTAMINATED` (next descriptor already complete — two payloads share the
+  attribution window), `UNDECIDED-NO-LANDING` (victim completed, no tagged site anywhere lost its tag —
+  the write reached no visible DRAM; weight moves to inbound delivery loss; the ring tagged-mask is
+  printed as raw data), and `UNRESOLVED` at window close (`[net4G] latch-site status` line — the window
+  close is never silent about the experiment: concluded / arm-aborted / armed-unresolved / never-armed).
+  Cost: one frame's payload redirected out of the ring, on a boot whose RX is already convicted broken;
+  `rearm_current_rx` restores the victim's address on recycle by construction.
+
+  **Also folded (boot7h tail): the `[net4V]` ring bracket lied for a mid-pass death.** The old bracket
+  inferred wrap-ness from the popped COUNT (`popped != NUM_RX ⇒ "ring wrapped"`), so boot7h's
+  `popped=5` window printed "ring wrapped" while `[net4F] wraps=0` counted the truth one line up. The
+  bracket is now derived from the net4F wrap counter with three honest readings (WRAPPED / RING-DRY at
+  exactly one pass / died MID-PASS) plus an impossible-state flag, and the line carries `wraps=` beside
+  `popped=`.
+
+  QEMU cannot exercise the tegra path; gates prove non-regression only (`UNAOS_TEGRA=1 ./arroyo check` —
+  23 cfg legs, x86_64 + aarch64 OK, with and without `UNAOS_NET4=1`; `./arroyo test-arm` green unarmed
+  and armed; the `[net4G]` witnesses + the MID-PASS bracket one-hit-grepped in the `UNAOS_NET4=1
+  esp-jetson` `kernel.elf` and ZERO-hit in the un-armed one — the negative control).
+
 ### XCARVE-4 — the endgame (2026-07-20, boots 21/22)
 The XCARVE writer is named and fixed. XCARVE-3's unmap converted the SNOC RAS into a precise
 synchronous WRITE fault (boot-22: ESR=0x96000146, FAR=0x26b800000 = align_up(heap_hi, 8 MiB),

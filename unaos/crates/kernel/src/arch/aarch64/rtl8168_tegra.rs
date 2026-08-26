@@ -449,6 +449,71 @@
 // RxConfig-after-ChipCmd order NET-4y introduced is exonerated by the record itself — boots 32/33 wrote
 // RxConfig BEFORE ChipCmd and produced the identical one-buffer signature, so the order is not the cause.
 //
+// ## NET-4G — the latch-SITE discriminator: is the single-address latch in the NIC, or in the RC?
+//
+// Boot7h (2026-08-25) flew the NET-4F tag instrument and it CONVICTED: four consecutive completions
+// wrote ONLY buffer 17, measured by lost landing tags, while ring DRAM held the correct distinct
+// address for every slot (net4x MATCH). So the reuse is real and it is below the driver's programming
+// lane — but "NIC/RC-internal" still names TWO different machines:
+//   * NIC-internal descriptor-address caching — the RTL8168 stops consuming the per-slot `addr` it
+//     fetches (or stops fetching) and emits every payload TLP at one latched address; the RC delivers
+//     faithfully.
+//   * RC/iATU translation caching — the NIC emits the CORRECT distinct per-slot addresses and the
+//     Tegra234 RC's inbound path (iATU region / fabric write path) collapses them onto one target.
+// The fix for each lives in a different lane (NIC register/errata work vs iATU/SMMU reprogramming),
+// so the next flight must NAME the site before anyone writes a fix.
+//
+// Two structural facts already constrain the RC arm, and the instrument leans on both:
+//   * Concurrent 16-byte DESCRIPTOR WRITEBACKS land per-slot at distinct ring addresses on every pop
+//     (that is how the driver sees OWN clear and the slot advance 1:1) — so any RC collapse must be
+//     selective (payload-sized bursts only), not a latch on all inbound writes.
+//   * A translation structure (iATU region, SMMU TLB) preserves OFFSETS within its granule. Distinct
+//     buffer starts differ in their low bits (2 KiB stride inside 4 KiB pages), so an
+//     offset-preserving collapse cannot map every slot's start onto ONE buffer's start.
+//
+// The experiment (`net4g_arm` / `net4g_on_pop`; self-gating, one-shot): the moment the `[net4F]`
+// single-address-latch VERDICT fires (≥4 consecutive tag-proven landings in one buffer L), rewrite the
+// `addr` of a still-NIC-owned descriptor `NET4G_LATCH_LEAD` slots ahead (the VICTIM) to a DECOY page —
+// a reserved, tag-stamped, Normal-NC page in the same DMA window as the buffers (identical
+// reachability: same NC window, same identity-inbound coverage, enumerated as its own [net4s] block).
+// The decoy's in-page offset (+0x400) is chosen to collide with NO buffer start (those sit at 0 and
+// 0x800 mod 0x1000), and a third tag is stamped at the C-SITE = L's 4 KiB page base + 0x400 — the
+// exact spot an offset-preserving granule collapse would land the decoy-addressed write. Between arm
+// and the victim's completion, L's tag is re-stamped after every pop (so a repeat landing at L is
+// freshly attributable); the decoy tag is NEVER re-stamped (only the victim's descriptor carries its
+// address — its loss at any point is the datum).
+//
+// VERDICT VOCABULARY (announced at arm time; mutually exclusive by decision order; one is emitted on
+// the victim's completion, or UNRESOLVED at window close if the victim never completes):
+//   * `RC-SIDE`     — decoy tag LOST and the latch stayed alive on interim pops: the NIC re-fetched
+//                     and issued the rewritten address and the fabric delivered it, while
+//                     ring-buffer-addressed writes kept collapsing onto L ⇒ the NIC's address path is
+//                     LIVE and the collapse is address-selective DOWNSTREAM of it — RC/iATU territory.
+//   * `NIC-SIDE`    — decoy tag intact, L's re-stamped tag LOST again (uncontaminated): the payload
+//                     went to L although the only descriptor in flight carried the decoy address ⇒ the
+//                     rewritten address was never consumed — full-address reuse inside the NIC. (An RC
+//                     translation cannot produce this: it would have to move BOTH page and offset onto
+//                     exactly L's start while delivering per-slot descriptor writebacks.)
+//   * `RC-PAGE`     — decoy and L intact, C-SITE tag LOST: the decoy-addressed write landed at L's
+//                     granule base + the decoy's in-page offset ⇒ an offset-preserving translation
+//                     collapse — RC/SMMU/iATU page-structure caching, named directly.
+//   * `PREFETCH-DEPTH` — decoy/L/C intact, the victim's OWN ORIGINAL buffer written: the NIC used the
+//                     pre-rewrite address ⇒ it had already fetched the victim's descriptor when we
+//                     rewrote it. No site verdict, but it measures descriptor prefetch depth >
+//                     NET4G_LATCH_LEAD — raise the lead next flight.
+//   * `UNDECIDED-CLEARED`      — decoy written but NO interim pop re-hit L: the latch may have
+//                     dissolved before the victim; nothing to attribute. Honest re-fly.
+//   * `UNDECIDED-CONTAMINATED` — L lost again but the NEXT descriptor had already completed at pop
+//                     time: two payloads in the attribution window; cannot tell the victim's write
+//                     from its successor's. Honest re-fly.
+//   * `UNDECIDED-NO-LANDING`   — victim completed and NO tagged site anywhere (decoy, L, C-site, own
+//                     buffer, any still-tagged ring buffer — the tagged-mask is printed) lost its
+//                     tag: the write reached no DRAM this instrument can see. Neither latch site is
+//                     named; the weight moves to inbound delivery loss.
+// The experiment costs one frame (the victim's payload is redirected out of the ring) on a boot whose
+// RX is already convicted broken — it arms ONLY after the [net4F] latch verdict, so a healthy NIC
+// never runs it. `rearm_current_rx` restores the victim's correct address on recycle by construction.
+//
 // ## Write discipline
 //
 // The driver, being a driver, DOES the fabric writes NET-3 refused: it enables the device's
@@ -706,6 +771,51 @@ mod metal {
     const NET4F_WITNESS_N: u64 = 8;
     /// NET-4F: length of the per-buffer landing TAG stamped into every RX buffer before it is armed.
     const NET4F_TAG_LEN: usize = 16;
+
+    /// NET-4G — the latch-site discriminator (see the header § NET-4G). How many slots AHEAD of the
+    /// currently-completing one the decoy VICTIM sits: 3 leaves two full completions of margin between
+    /// the mid-run address rewrite and the victim's own fetch, without pushing the victim past the
+    /// one-pass ring death the bench record guarantees.
+    const NET4G_LATCH_LEAD: usize = 3;
+    /// NET-4G: candidate victim slots probed for OWN=1 before the arm gives up (a coalesced completion
+    /// burst can have consumed the first candidate between the verdict pop and the arm).
+    const NET4G_LATCH_TRIES: usize = 3;
+    /// NET-4G: bound on the per-pop interim probe lines between arm and the victim's completion.
+    const NET4G_PROBE_MAX: u64 = 4;
+    /// NET-4G: the DECOY page's offset inside the Normal-NC DMA window. +0x40000 is a free page (the
+    /// rings + buffers end at +0x34000, the window is 2 MiB); the +0x400 in-page offset is load-bearing:
+    /// every RX buffer start sits at 0 or 0x800 (mod 0x1000), so a landing at a buffer start can never
+    /// be an offset-preserved translation of the decoy address, and vice versa.
+    const NET4G_DECOY_PAGE_OFF: u64 = 0x40000;
+    const NET4G_DECOY_IN_PAGE: u64 = 0x400;
+    /// NET-4G: tag indices for the decoy and the C-site (L's page base + the decoy's in-page offset).
+    /// Outside 0..NUM_RX, so neither tag can ever collide with a ring buffer's landing tag.
+    const NET4G_DECOY_TAGIDX: usize = 0x44;
+    const NET4G_CSITE_TAGIDX: usize = 0x43;
+
+    /// NET-4G: does `addr` still carry the 16-byte landing tag for `tagidx`? Volatile NC-DRAM reads;
+    /// `dma_rmb` is the caller's obligation (one barrier per probe pass, not per site).
+    #[inline]
+    fn net4g_tag_intact(addr: u64, tagidx: usize) -> bool {
+        let tag = net4f_tag(tagidx);
+        let p = addr as *const u8;
+        let mut same = true;
+        for (i, t) in tag.iter().enumerate() {
+            same &= unsafe { read_volatile(p.add(i)) } == *t;
+        }
+        same
+    }
+
+    /// NET-4G: stamp the 16-byte landing tag for `tagidx` at `addr` (volatile NC-DRAM stores; the
+    /// caller orders them with `dma_wmb` once per stamping pass).
+    #[inline]
+    fn net4g_stamp_tag(addr: u64, tagidx: usize) {
+        let tag = net4f_tag(tagidx);
+        let p = addr as *mut u8;
+        for (i, t) in tag.iter().enumerate() {
+            unsafe { core::ptr::write_volatile(p.add(i), *t) };
+        }
+    }
 
     /// NET-4F — the per-buffer LANDING TAG: a distinct, never-a-valid-Ethernet-header 16-byte stamp
     /// written into RX buffer `idx` every time that descriptor is armed. A buffer the NIC filled no
@@ -1117,6 +1227,19 @@ mod metal {
         /// every recorded boot; the ring delivers one pass and goes dry. Witnessed at the wrap and
         /// verdicted at window close.
         net4f_wraps: u64,
+        /// NET-4G — latch-SITE discriminator state (header § NET-4G). `net4g_victim` is the slot whose
+        /// descriptor was rewritten to the decoy address (−1 = not armed); `net4g_latched` is L, the
+        /// buffer the [net4F] verdict proved every payload lands in; `net4g_decoy`/`net4g_csite` are
+        /// the two extra tag sites; the interim tallies carry the latch-alive evidence between arm and
+        /// the victim's completion; `net4g_done` one-shots the whole experiment per boot.
+        net4g_victim: i64,
+        net4g_latched: i64,
+        net4g_decoy: u64,
+        net4g_csite: u64,
+        net4g_interim_pops: u64,
+        net4g_interim_l_hits: u64,
+        net4g_probes: u64,
+        net4g_done: bool,
     }
 
     // The driver owns raw DMA pointers; on the single-CPU main-loop/poll discipline it is only ever
@@ -1284,11 +1407,15 @@ mod metal {
             let (num_ib, enabled) = probe_inbound_windows(self.atu_base);
             // The four DMA blocks the NIC touches, each (pa, len, tag). Rings + buffers are distinct
             // 64 KiB-aligned allocations (alloc_rx/alloc_tx).
-            let blocks: [(u64, u64, &str); 4] = [
+            // NET-4G: the decoy page rides the same enumeration as the four DMA blocks, so its inbound
+            // reachability is PROVEN identical to the buffers' (same NC window, same identity/alias
+            // treatment) — a decoy the fabric could not reach would fake an `UNDECIDED-NO-LANDING`.
+            let blocks: [(u64, u64, &str); 5] = [
                 (self.rx_ring as u64, (NUM_RX * core::mem::size_of::<Desc>()) as u64, "rx-ring"),
                 (self.rx_buffers as u64, (NUM_RX * RX_BUF_SIZE) as u64, "rx-buffers"),
                 (self.tx_ring as u64, (NUM_TX * core::mem::size_of::<Desc>()) as u64, "tx-ring"),
                 (self.tx_buffers as u64, (NUM_TX * TX_BUF_SIZE) as u64, "tx-buffers"),
+                (self.nc_base + NET4G_DECOY_PAGE_OFF, 0x1000, "net4G-decoy"),
             ];
             // Partition the blocks: which NEED an alias (their PA truncates on the wire / sits outside the
             // identity region) and which the NET-4h identity region already reaches untranslated. Accumulate
@@ -2164,6 +2291,24 @@ mod metal {
                     "one pass only, and RDU NEVER latched: the halt is NOT the un-serviced status latch (REFUTED) — the engine stops without reporting descriptor-unavailable, so it is not re-fetching the recycled descriptors at all"
                 }
             );
+            // NET-4G — latch-site experiment status, so the window close is never silent about it:
+            // the verdict fired above (repeated here as a pointer), or the arm never happened (the
+            // experiment self-gates on the [net4F] latch verdict), or the victim never completed.
+            serial_println!(
+                "{}   [net4G] latch-site status: {} (victim={} latched={} interim-pops={} interim-L-hits={}) ::",
+                P4,
+                if self.net4g_done && self.net4g_victim >= 0 {
+                    "experiment CONCLUDED — see the [net4G] VERDICT latch-site line above"
+                } else if self.net4g_done {
+                    "arm ABORTED (no NIC-owned victim available at verdict time) — UNRESOLVED, re-fly"
+                } else if self.net4g_victim >= 0 {
+                    "ARMED but the victim slot never completed before window close — verdict UNRESOLVED this window (the ring died before reaching it; the victim's address is restored on any later recycle)"
+                } else {
+                    "never ARMED — no [net4F] single-address-latch verdict fired this window (the experiment self-gates on a tag-proven latch)"
+                },
+                self.net4g_victim, self.net4g_latched,
+                self.net4g_interim_pops, self.net4g_interim_l_hits
+            );
             self.net4v_verdict();
             // NET-4E (armed-diagnostic builds only): QUENCH RX DMA at window close. The NIC's
             // misdirected payload writes (NET-4A mechanism, cause unfound) continue as long as RX
@@ -2215,8 +2360,11 @@ mod metal {
         ///
         /// The `ring` column is the second, independent fact the window-close summary has been carrying
         /// unread: `popped` has been EXACTLY `NUM_RX` in every recorded sitting — one full pass of the
-        /// ring and then permanently dry, across ~40 million polls of a 5 s window. `RING-DRY` flags
-        /// that explicitly so a boot where the ring DOES wrap is immediately distinguishable.
+        /// ring and then permanently dry, across ~40 million polls of a 5 s window. The bracket is
+        /// derived from the `[net4F]` WRAP COUNTER, never inferred from the popped count (boot7h fold:
+        /// the old `popped != NUM_RX ⇒ "ring wrapped"` inference labeled a 5-pop window "wrapped"
+        /// while `wraps=0` was the counted truth one line up): WRAPPED / RING-DRY at exactly one pass /
+        /// died MID-PASS, plus an impossible-state flag if popped exceeds NUM_RX with wraps=0.
         ///
         /// Read-only: pure tallies accumulated on paths that already ran. No device access.
         fn net4v_verdict(&self) {
@@ -2231,13 +2379,27 @@ mod metal {
             } else {
                 "NO-DISCOVER: no DHCP DISCOVER ever reached the TX path — smoltcp never dispatched, or the bind never ran"
             };
+            // NET-4G fold (boot7h): the old bracket inferred wrap-ness from the popped COUNT alone —
+            // any `popped != NUM_RX` printed "ring wrapped", so boot7h's `popped=5` (window closed
+            // before even ONE pass completed) was labeled wrapped while `[net4F] wraps=0` counted the
+            // truth one line up. Derive the bracket from the net4F wrap COUNTER (the measured fact),
+            // three honest readings + one impossible-state flag, never an inference from `popped`.
+            let ring_bracket = if self.net4f_wraps > 0 {
+                "ring WRAPPED (recycled descriptors re-consumed)"
+            } else if self.rx_count == NUM_RX as u64 {
+                "RING-DRY after exactly one pass"
+            } else if self.rx_count < NUM_RX as u64 {
+                "ring died MID-PASS (window closed before one full pass; wraps=0)"
+            } else {
+                "INCONSISTENT: popped > NUM_RX with wraps=0 — counter defect, distrust this bracket"
+            };
             serial_println!(
-                "{}   [net4V no-lease verdict] dhcp-tx: discover={} request={} | dhcp-rx: offer={} ack={} nak={} | ring: popped={}/{} zero-payload={} [{}] => {} ::",
+                "{}   [net4V no-lease verdict] dhcp-tx: discover={} request={} | dhcp-rx: offer={} ack={} nak={} | ring: popped={}/{} wraps={} zero-payload={} [{}] => {} ::",
                 P4,
                 self.dhcp_tx_discover, self.dhcp_tx_request,
                 self.dhcp_rx_offer, self.dhcp_rx_ack, self.dhcp_rx_nak,
-                self.rx_count, NUM_RX, self.rx_zero_payload,
-                if self.rx_count == NUM_RX as u64 { "RING-DRY after exactly one pass" } else { "ring wrapped" },
+                self.rx_count, NUM_RX, self.net4f_wraps, self.rx_zero_payload,
+                ring_bracket,
                 verdict
             );
         }
@@ -2335,6 +2497,9 @@ mod metal {
                         self.net4f_rx_errors
                     );
                 }
+                // NET-4G — an error-frame completion still moves the ring past the victim; the
+                // latch-site experiment must observe it BEFORE the re-arm restores the victim's addr.
+                self.net4g_on_pop();
                 self.rearm_current_rx();
                 return None;
             }
@@ -2807,6 +2972,9 @@ mod metal {
                             "{}   [net4F] VERDICT tag-proven single-address latch: {} consecutive completions (through slot {}) wrote ONLY buffer {} — measured by lost landing tags, not by content match, so the NET-4A artifact cannot produce it. Ring DRAM holds the correct distinct addr for every slot (net4x MATCH) ⇒ the reuse is NIC/RC-internal ::",
                             P4, self.net4f_run + 1, self.rx_cur, land
                         );
+                        // NET-4G — the latch is tag-proven as of THIS pop: arm the latch-site
+                        // discriminator while it is provably live (header § NET-4G).
+                        self.net4g_arm(land);
                     }
                 }
                 self.net4f_prev_land = land;
@@ -2838,6 +3006,9 @@ mod metal {
             if option_env!("UNAOS_NET4_RINGDUMP").is_some() && self.rx_count <= NET4L_AFTERRX_MAX {
                 self.net4l_ring_dump("after-rx");
             }
+            // NET-4G — latch-site experiment per-pop half: interim tally + re-stamp, or the victim's
+            // verdict. MUST precede the re-arm (it restores the victim's address + own-buffer tag).
+            self.net4g_on_pop();
             self.rearm_current_rx();
             Some(len)
         }
@@ -2888,6 +3059,139 @@ mod metal {
             }
             // Write-1-to-clear ONLY the RX latches; leave TOK/TER/LinkChg/SysErr standing.
             self.w16(REG_ISR, isr & ISR_RX_LATCHES);
+        }
+
+        /// NET-4G — ARM the latch-site experiment (header § NET-4G). Called exactly once, from the
+        /// `[net4F]` single-address-latch verdict: rewrite a still-NIC-owned descriptor
+        /// `NET4G_LATCH_LEAD` slots ahead to the DECOY address, and stamp the three tag sites the
+        /// verdict decision reads (decoy, latched buffer L, C-site = L's page base + the decoy's
+        /// in-page offset). The `addr` store is a single aligned 8-byte volatile write (offset 8 of a
+        /// 16-byte descriptor on a 256-byte-aligned NC ring), so the NIC's fetch sees either the old
+        /// or the new address whole — both outcomes are named verdict arms (PREFETCH-DEPTH vs the
+        /// site verdicts). Self-gating: no [net4F] verdict, no experiment — a healthy NIC never runs it.
+        fn net4g_arm(&mut self, latched: i64) {
+            if self.net4g_done || self.net4g_victim >= 0 || self.nc_base == 0 || latched < 0 {
+                return;
+            }
+            let decoy = self.nc_base + NET4G_DECOY_PAGE_OFF + NET4G_DECOY_IN_PAGE;
+            let l_addr = (self.rx_buffers as u64) + (latched as u64) * RX_BUF_SIZE as u64;
+            let csite = (l_addr & !0xfff) + NET4G_DECOY_IN_PAGE;
+            // A coalesced completion burst can have consumed candidates between the verdict pop and
+            // this arm; probe a few slots ahead for one the NIC still owns.
+            let mut victim: i64 = -1;
+            for t in 0..NET4G_LATCH_TRIES {
+                let v = (self.rx_cur + NET4G_LATCH_LEAD + t) % NUM_RX;
+                let d = unsafe { read_volatile(self.rx_ring.add(v)) };
+                if d.opts1 & DESC_OWN != 0 {
+                    victim = v as i64;
+                    break;
+                }
+            }
+            if victim < 0 {
+                self.net4g_done = true;
+                serial_println!(
+                    "{}   [net4G] arm ABORTED: no NIC-owned victim within {} slots of slot {} — every candidate already completed; latch-site verdict UNRESOLVED this boot (re-fly) ::",
+                    P4, NET4G_LATCH_TRIES, self.rx_cur
+                );
+                return;
+            }
+            net4g_stamp_tag(decoy, NET4G_DECOY_TAGIDX);
+            net4g_stamp_tag(csite, NET4G_CSITE_TAGIDX);
+            net4g_stamp_tag(l_addr, latched as usize);
+            dma_wmb();
+            let desc = unsafe { self.rx_ring.add(victim as usize) };
+            unsafe {
+                write_volatile(core::ptr::addr_of_mut!((*desc).addr), decoy);
+            }
+            dma_wmb();
+            self.net4g_victim = victim;
+            self.net4g_latched = latched;
+            self.net4g_decoy = decoy;
+            self.net4g_csite = csite;
+            serial_println!(
+                "{}   [net4G] DECOY ARMED: victim slot {} addr rewritten {:#x} -> {:#x} (decoy, NC window +{:#x}); latched buffer L={} @ {:#x} re-stamped; C-site @ {:#x} stamped — verdict on the victim's completion, one of: RC-SIDE (decoy written, latch alive) | NIC-SIDE (L written again, decoy untouched) | RC-PAGE (C-site written) | PREFETCH-DEPTH (victim's ORIGINAL buffer written) | UNDECIDED-CLEARED / UNDECIDED-CONTAMINATED / UNDECIDED-NO-LANDING (honest arms) | UNRESOLVED at window close if the victim never completes ::",
+                P4, victim,
+                (self.rx_buffers as u64) + (victim as u64) * RX_BUF_SIZE as u64,
+                decoy, NET4G_DECOY_PAGE_OFF + NET4G_DECOY_IN_PAGE,
+                latched, l_addr, csite
+            );
+        }
+
+        /// NET-4G — per-pop half of the latch-site experiment: between arm and the victim's completion,
+        /// tally latch-alive evidence and keep the L / C-site tags fresh (the decoy tag is NEVER
+        /// re-stamped — only the victim's descriptor carries its address, so its loss at any point is
+        /// the datum); on the victim's completion, read the four sites + the ring tag mask and emit ONE
+        /// mutually-exclusive latch-site verdict. Runs BEFORE `rearm_current_rx` (which restores the
+        /// victim's correct address and re-stamps its own tag). Read-only but for tag re-stamps.
+        fn net4g_on_pop(&mut self) {
+            if self.net4g_victim < 0 || self.net4g_done {
+                return;
+            }
+            dma_rmb(); // one read barrier per probe pass; all site reads below are NC direct DRAM
+            let l = self.net4g_latched;
+            let l_addr = (self.rx_buffers as u64) + (l as u64) * RX_BUF_SIZE as u64;
+            let decoy_lost = !net4g_tag_intact(self.net4g_decoy, NET4G_DECOY_TAGIDX);
+            let c_lost = !net4g_tag_intact(self.net4g_csite, NET4G_CSITE_TAGIDX);
+            let l_lost = !net4g_tag_intact(l_addr, l as usize);
+            if (self.rx_cur as i64) != self.net4g_victim {
+                self.net4g_interim_pops += 1;
+                if l_lost {
+                    self.net4g_interim_l_hits += 1;
+                }
+                if self.net4g_probes < NET4G_PROBE_MAX {
+                    self.net4g_probes += 1;
+                    serial_println!(
+                        "{}   [net4G] interim pop slot={} (victim={}): L-written-again={} decoy-written={} csite-written={} — L/C-site re-stamped for the next attribution window ::",
+                        P4, self.rx_cur, self.net4g_victim,
+                        l_lost as u8, decoy_lost as u8, c_lost as u8
+                    );
+                }
+                net4g_stamp_tag(l_addr, l as usize);
+                net4g_stamp_tag(self.net4g_csite, NET4G_CSITE_TAGIDX);
+                dma_wmb();
+                return;
+            }
+            // ── The victim completed: the verdict pop ──
+            self.net4g_done = true;
+            let v = self.net4g_victim as usize;
+            let v_own = (self.rx_buffers as u64) + (v * RX_BUF_SIZE) as u64;
+            let v_own_lost = !net4g_tag_intact(v_own, v);
+            // Contamination: if the NEXT descriptor already completed, two payloads share this
+            // attribution window and an L re-hit cannot be pinned on the victim's write.
+            let next = (v + 1) % NUM_RX;
+            let next_done =
+                unsafe { read_volatile(self.rx_ring.add(next)) }.opts1 & DESC_OWN == 0;
+            // Raw supporting datum: which ring buffers still carry their tags (bit k = buffer k tagged).
+            let mut tagged_mask: u32 = 0;
+            for k in 0..NUM_RX {
+                let bk = (self.rx_buffers as u64) + (k * RX_BUF_SIZE) as u64;
+                if net4g_tag_intact(bk, k) {
+                    tagged_mask |= 1 << k;
+                }
+            }
+            let latch_alive = self.net4g_interim_l_hits > 0;
+            let (site, meaning) = if decoy_lost && latch_alive {
+                ("RC-SIDE", "the NIC re-fetched and ISSUED the rewritten address and the fabric delivered it, while ring-buffer-addressed writes kept collapsing onto L — the NIC's address path is LIVE, so the single-address latch is address-selective and DOWNSTREAM of the NIC: RC/iATU translation caching convicted")
+            } else if decoy_lost {
+                ("UNDECIDED-CLEARED", "the decoy was written but NO interim pop re-hit L — the latch may have dissolved before the victim, so the honored address proves nothing about the latch's site; re-fly")
+            } else if l_lost && !next_done {
+                ("NIC-SIDE", "the payload landed at L AGAIN although the only descriptor in flight carried the decoy address — the rewritten address was never consumed: full-address reuse inside the NIC (an offset-preserving RC translation cannot map the decoy onto exactly L's start, and descriptor writebacks land per-slot concurrently): NIC-internal descriptor-address caching convicted")
+            } else if l_lost {
+                ("UNDECIDED-CONTAMINATED", "L was written again but the NEXT descriptor had already completed at pop time — two payloads share the attribution window and the victim's cannot be told from its successor's; re-fly")
+            } else if c_lost {
+                ("RC-PAGE", "the decoy-addressed write landed at L's 4 KiB page base + the decoy's in-page offset — an OFFSET-PRESERVING granule collapse: RC/SMMU/iATU page-translation caching convicted")
+            } else if v_own_lost {
+                ("PREFETCH-DEPTH", "the victim's ORIGINAL buffer was written — the NIC used the pre-rewrite address, so it had already fetched the victim's descriptor at arm time: no site verdict, but descriptor prefetch depth exceeds NET4G_LATCH_LEAD; raise the lead next flight")
+            } else {
+                ("UNDECIDED-NO-LANDING", "the victim completed and NO tagged site (decoy, L, C-site, victim's own buffer, any still-tagged ring buffer) lost its tag — the write reached no DRAM this instrument can see; neither latch site is named and the weight moves to inbound delivery loss")
+            };
+            serial_println!(
+                "{}   [net4G] VERDICT latch-site={}: victim slot {} completed; decoy-written={} L-written={} csite-written={} victim-own-written={} next-desc-already-done={} interim-pops={} interim-L-hits={} tagged-mask={:#010x} — {} ::",
+                P4, site, v,
+                decoy_lost as u8, l_lost as u8, c_lost as u8, v_own_lost as u8,
+                next_done as u8, self.net4g_interim_pops, self.net4g_interim_l_hits,
+                tagged_mask, meaning
+            );
         }
 
         /// NET-4F — re-arm the CURRENT RX descriptor and advance `rx_cur`. Lifted out of `rx_frame_raw`
@@ -4061,6 +4365,14 @@ mod metal {
             net4f_rxovw_seen: 0,
             net4f_isr_witnessed: 0,
             net4f_wraps: 0,
+            net4g_victim: -1,
+            net4g_latched: -1,
+            net4g_decoy: 0,
+            net4g_csite: 0,
+            net4g_interim_pops: 0,
+            net4g_interim_l_hits: 0,
+            net4g_probes: 0,
+            net4g_done: false,
         };
 
         // ── M2/M3 GUARD: poison-honest readback through the NEW window BEFORE any register write ──
