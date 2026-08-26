@@ -3310,6 +3310,19 @@ const LAD_CENSUS_PERIOD: u64 = 40;
 const LAD_GLASS_MAX: u32 = 32;
 #[cfg(feature = "orinladder")]
 static LAD_GLASS_TAKEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// ORIN-LADDER — how often the CENSUS takes a read-back of its own, in censuses (6 ≈ 60 s).
+///
+/// WHY THE CENSUS SAMPLES AT ALL, when the arm already took one. **Rung (a) must not depend on rung
+/// (b)'s gesture.** The arm sample is taken at the terminus, moments after `panel_console_window_open`
+/// re-rendered the console into the new surface, so it sees whatever few lines had been printed by
+/// then — and if that window happened to be near-empty the sample would read `BLANK-NO-GLYPHS` for a
+/// TIMING reason rather than a defect, with no second opinion available until somebody minimised and
+/// restored. A sample on the first census (seq 1, ~10 s later, with the boot's own tail in the
+/// window) and one a minute after that removes that ambiguity: a genuine blank stays blank across all
+/// of them, and an arm-time artefact resolves on the next line. `seq == 1` takes one by construction
+/// (`(1 - 1) % 6 == 0`), which is the sample that matters most.
+#[cfg(feature = "orinladder")]
+const LAD_GLASS_PERIOD: u32 = 6;
 
 /// ORIN-LADDER — the console face's PAPER and INK, as the values `fbcon` writes them.
 ///
@@ -3810,6 +3823,17 @@ pub fn orin_ladder_census(tick: u64) {
         .unwrap_or(false);
     let parked_now = now_vis == 2;
 
+    // Rung (a)'s own cadence, independent of any click — see `LAD_GLASS_PERIOD`. A parked row is
+    // NOT probed: its content box holds whatever is behind it, so the read-back would answer a
+    // question about the desktop and print `WIN2-NOT-ON-GLASS` for a window that is correctly hidden.
+    let glass = if now_vis == 1 && (seq - 1) % LAD_GLASS_PERIOD == 0 {
+        lad_glass_budgeted("census")
+    } else if now_vis == 2 {
+        "parked"
+    } else {
+        "skipped"
+    };
+
     let verdict = if info.is_none() {
         "DECLINE reason=no-console-row"
     } else if strip.is_none() {
@@ -3828,7 +3852,7 @@ pub fn orin_ladder_census(tick: u64) {
         "IDLE-NEVER-PARKED"
     };
     serial_println!(
-        "[orindock] census seq={} t={} up={}s win={} vis={} tiles={} tiled={} parks={} restores={} viadock={} painted={} blank={} probes={} suppressed={} dockpress={} strip={} -> {}",
+        "[orindock] census seq={} t={} up={}s win={} vis={} tiles={} tiled={} parks={} restores={} viadock={} painted={} blank={} glass={} probes={} suppressed={} dockpress={} strip={} -> {}",
         seq, tick, up,
         info.as_ref().map(|i| i.id).unwrap_or(wm::WIN_NONE),
         match now_vis {
@@ -3836,7 +3860,7 @@ pub fn orin_ladder_census(tick: u64) {
             2 => "parked",
             _ => "norow",
         },
-        tiles, tiled as u8, parks, restores, dock_restores, good, blanks,
+        tiles, tiled as u8, parks, restores, dock_restores, good, blanks, glass,
         taken.min(LAD_GLASS_MAX), suppressed,
         dock::last_press_outcome(),
         if strip.is_some() { "yes" } else { "REFUSED" },

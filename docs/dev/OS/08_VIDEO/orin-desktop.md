@@ -1657,6 +1657,16 @@ edge detector runs every tick (one `wm::info` walk, ~12 table lookups under one 
 strictly smaller footprint than the `wm::hit_test` rung 3 already takes per pointer event) and only
 the census PRINT is at the 10 s period.
 
+**Rung (a) does not depend on rung (b)'s gesture.** The census takes a read-back of its own on
+`seq == 1` (~10 s after the arm, with the boot's own tail already in the window) and every ~60 s after
+that, budgeted. The reason is an ambiguity the arm sample alone cannot resolve: the arm fires at the
+terminus, moments after `panel_console_window_open` re-rendered the console into the new surface, so a
+near-empty window would read `BLANK-NO-GLYPHS` for a TIMING reason with no second opinion available
+until somebody minimised and restored. A genuine blank stays blank across every sample; an arm-time
+artefact resolves on the next line. A PARKED row is deliberately NOT probed (`glass=parked`): its
+content box holds whatever is behind it, so a read-back there would answer a question about the
+desktop and print `WIN2-NOT-ON-GLASS` for a window that is correctly hidden.
+
 The `park` line carries whether the dock's tile model contains the row **at the moment of the park**,
 because that is the question §6.1 is about. The `restore` line derives `via=` from
 `dock::last_press_outcome()`, so a `<TAB>` back is `RESTORED-OFF-DOCK` and is **not credited** as the
@@ -1697,14 +1707,26 @@ different line from a restore that paints.
   | B2 (method control, same source, second target dir) | `0de025c1a645ee1826969b65f76705f762928d6dc3fe8038a3f6cd87150f07ec` | 1 543 316 |
   | A (`git apply -R`, baseline) | `0de025c1a645ee1826969b65f76705f762928d6dc3fe8038a3f6cd87150f07ec` | 1 543 316 |
 
-  **A == B == control — identical.** `main.rs` is 6990 lines before and after, so no panic `Location`
-  renumbers; every one of the 645 new source lines is APPENDED at the tail of `display_tegra.rs`.
-  The armed image differs by design (`5c1cdaf7…`, 1 906 984 B), so the knob is not vacuous.
-* **Witness presence, and TWO negative controls.** All 22 `[oringlass]`/`[orindock]` marks and verdict
-  strings hit in the armed flat image (`LC_ALL=C grep -a -o -F`, fragments >8 bytes throughout);
-  **zero** in the knob-off jetson default AND **zero** in the same §6.1 conjunction built with
-  `orinladder` OFF (`f55dc2d7…` — boot7h's own image shape). The second control is the sharp one: it
-  proves the marks come from this knob and not from a sibling.
+  **A == B == control — identical**, and re-measured identical again after the census read-back was
+  added (`0de025c1…`, 1 543 316 B — the third build of the B side). `main.rs` is 6990 lines before and
+  after, so no panic `Location` renumbers; every one of the 669 new source lines is APPENDED at the
+  tail of `display_tegra.rs`. The armed image differs by design (`3163206c…`, 1 907 176 B), so the
+  knob is not vacuous.
+
+  ⚠ **The Pi `kernel8.img` half was NOT measured** and is not claimed: a bare `cargo build` of the
+  `baremetal` set fails to link without `./arroyo kernel8`'s linker script (`undefined symbol:
+  __bss_end`, `__stack_top`). The structural argument is strong — `display_tegra.rs` is not compiled
+  on the Pi at all, and `main.rs`'s two edits are in-line appends that leave the file at 6990 lines —
+  but an argument is not a measurement, and this one is offered as the former.
+* **Witness presence, and TWO negative controls.** All 22 knob-exclusive `[oringlass]`/`[orindock]`
+  marks and verdict strings hit in the armed flat image, by `LC_ALL=C grep -a -o -F` on the binary AND
+  by `strings -a` (identical counts), fragments >8 bytes throughout; **zero** in the knob-off jetson
+  default AND **zero** in the same §6.1 conjunction built with `orinladder` OFF (`f55dc2d7…` —
+  boot7h's own image shape). The second control is the sharp one: it proves the marks come from this
+  knob and not from a sibling. Stated honestly: two further fragments this instrument prints,
+  `UNREADABLE` and `UNMAPPED (off-panel`, are **shared string literals with `[orinchrome]`** and are
+  deduplicated by the linker, so they hit in the negative control too and carry no discrimination.
+  That is why the proof rests on the other 22 and not on them.
 * **Reachability by disassembly, not by banner.** `tegra_early_stop -> orin_ladder_arm`
   (`bl` at `0x747a4`, immediately after `orin_conwin`'s at `0x747a0`);
   `jd2_console_pump -> orin_ladder_census` (`bl` at `0x73e84`, after `orin_click_census`'s at
@@ -1763,7 +1785,7 @@ disc on a 1920x1200 panel reports "nothing happened" when the truth was "you mis
 [dock] press at (…,…) tile=t/n win=2 owner=0xffffff01 was_hidden=true -> raised=true unhid=true
 [oringlass] phase=restore … -> GLYPHS-ON-GLASS
 [orindock] restore win=2 z=… shellz=… via=dock dockpress=raise parked=…t glass=GLYPHS-ON-GLASS t=… -> RESTORED
-[orindock] census seq=… vis=panel tiles=… tiled=1 parks=1 restores=1 viadock=1 painted=1 blank=0 … -> DOCK-ROUNDTRIP
+[orindock] census seq=… vis=panel tiles=… tiled=1 parks=1 restores=1 viadock=1 painted=1 blank=0 glass=… probes=… -> DOCK-ROUNDTRIP
 ```
 
 **Rung (b) is CLOSED iff one `park -> PARKED` is followed by one `restore … via=dock … -> RESTORED`
