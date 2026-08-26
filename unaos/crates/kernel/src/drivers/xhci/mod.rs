@@ -296,7 +296,7 @@ pub(crate) const HID_LOCK_KEYS: [(u8, u8); 3] = [
 /// Wall-clock budget for hardware handshakes, in `crate::arch::now_cycles()` units (rdtsc cycles on
 /// x86_64, CNTVCT ticks on aarch64). Resolved per-arch so the same ~wall-clock window holds despite
 /// the very different counter rates. On x86 it is an honest ~2 s once the TSC is calibrated against
-/// the ACPI PM timer (see `arch::hw_wait_budget`); a fixed guess otherwise. ~2.5 s under QEMU/TCG.
+/// the ACPI PM timer (see `arch::hw_wait_budget`); otherwise the fixed `HW_WAIT_BUDGET` = 2.5e9-CYCLE guess — a duration only once a TSC rate is assumed. (The "~2.5 s under QEMU/TCG" this line stated until 2026-08-25 back-computes to a ~1 GHz TCG-virtual TSC that nothing in this tree states or has measured — an unverified estimate of unknown provenance, retired; and under QEMU the ACPI PM timer IS present, so what actually runs there is the calibrated 2 s path. `usb_xhci.md` §32.1.)
 ///
 /// Why a cycle budget and not an iteration count: the previous `50_000_000`-*iteration* budget
 /// assumed cheap loop turns, but each turn does an uncached MMIO read (~0.5–1 µs on real silicon),
