@@ -91,7 +91,8 @@ every coherency and ring hypothesis. The root cause, witnessed on metal:
   internal firmware**, so the Pi silently dropped every register write — the entire
   enable-slot saga was writes into a not-ready controller.
 
-  The fix adds `wait_for_cnr_clear()`: a bounded (`hw_wait_budget`, ~2.5 s) poll of
+  The fix adds `wait_for_cnr_clear()`: a bounded (`hw_wait_budget` — 150 M CNTVCT ticks off-tegra,
+  2.78 s at the Pi 4's 54 MHz CNTFRQ; per-platform derivation in §32) poll of
   `USBSTS.CNR` at the *top* of `init_interrupter` — the first register programming
   after `HCRST`, immediately before ERST/CRCR/DCBAAP/CONFIG/RS. Only the pre-CNR
   halt + `HCRST` reset writes precede the wait (spec-correct). On success it emits
@@ -936,9 +937,9 @@ counter — always live, no init, no interrupt dependency) and emits exactly one
 | `m3-attach-xhci` | whole M3 | sum of the three below |
 | `m3-cap-probe` | CAP[0] ladder at the assigned BAR | see ladder cap below |
 | `m3-notify` | pre-HCRST NOTIFY + decode re-assert | mailbox + ~10 ms |
-| `m3-xhci-handoff` | `xhci::init` — halt, HCRST, CNR | **3 × `hw_wait_budget()` ≈ 8.3 s worst** |
+| `m3-xhci-handoff` | `xhci::init` — halt, HCRST, CNR | **3 × `hw_wait_budget()` = 450 M CNTVCT ticks ≈ 8.33 s worst at the Pi 4's 54 MHz (§32)** |
 | `enum-notify` / `enum-xhci-handoff` | the deferred half's reload + second handoff | as above |
-| `enum-rings-rs1` | rings, interrupter, RS=1 | CNR wait ≈ 2.8 s worst |
+| `enum-rings-rs1` | rings, interrupter, RS=1 | CNR wait = 150 M ticks ≈ 2.78 s worst at 54 MHz |
 | `enum-pump` | the bounded polled enumeration walk | 30 s backstop, early exit on armed/ready |
 | `bringup-total` / `enum-total` | the two halves end to end | — |
 
@@ -1005,9 +1006,10 @@ report for the first time. That residual is on the metal watch-list below, not c
   device-ready window and by Linux `brcm_pcie_start_link`; PIUSB-17 exists precisely because
   skipping it produced the CNR wall. Bracketed only, so the log accounts for it honestly.
 - The **100 ms PCIe config-request window** in M2 and the SCB/CNR settles from PIUSB-16/17/18.
-- The **`xhci::init` timeouts** (`m3-xhci-handoff`, ~8.3 s worst on a firmwareless controller, paid
+- The **`xhci::init` timeouts** (`m3-xhci-handoff`, ≈ 8.33 s worst on a firmwareless controller, paid
   **twice** — once early, once in the deferred half). These come from `hw_wait_budget()`
-  (150e6 CNTVCT ticks ≈ 2.8 s at the Pi's 54 MHz) in `drivers/xhci` and `arch/aarch64/mod.rs` —
+  (`HW_WAIT_BUDGET` = 150e6 CNTVCT ticks, `arch/aarch64/mod.rs:339` — ≈ 2.78 s at the Pi's 54 MHz)
+  in `drivers/xhci` and `arch/aarch64/mod.rs` —
   **shared kernel-core, outside the Pi track's lane**. This arc measures the stage instead of
   re-cutting it, so the owning lane gets evidence before a shared timeout is touched.
 
@@ -2828,7 +2830,9 @@ the hub, over 2691 pump waits across the whole storage chain:
 ```
 
 The worst single wait used **32.7 M cycles against a 14.4 G budget — ~440x
-headroom**, with the direct-attach run peaking at 35.2 M against the same budget.
+headroom** (the printed `budget=14396988690` is this QEMU x86 run's TSC ≈ 2.4 GHz ×
+`HW_WAIT_SECONDS` 2 (`arch/x86_64/mod.rs:137`) × scale 3 = 6.0 s of wall clock), with the
+direct-attach run peaking at 35.2 M against the same budget.
 Hub routing moved the worst case by *noise*, not by orders of magnitude. A budget
 with 440x headroom is not the thing that timed out on metal.
 
@@ -3178,7 +3182,8 @@ hypothesis, so this section is a read of OUR write path, in code, with the arith
 * QEMU: green, fast, every knob.
 
 TSC calibrated at ≈2.6938 GHz, so `used=1275711592` = **0.474 s** for ONE stage wait, and
-`budget=16163799966` = **6.000 s** (`hw_wait_budget()` 2 s × 3, `mod.rs` `pump_until_bot_done`).
+`budget=16163799966` = **6.000 s** (`hw_wait_budget()` = tsc_hz × `HW_WAIT_SECONDS` 2 =
+5.388 G cycles, `arch/x86_64/mod.rs:137,150–156`, × scale 3 in `mod.rs` `pump_until_bot_done`).
 The QEMU comparator from §11 is `peak=32724164` over `n=2691` — 0.012 s. Metal's *first* wait
 is 39× QEMU's *worst*.
 
@@ -3639,13 +3644,14 @@ flash controller in an erase/wear-levelling window is the usual suspect for a `W
 Deriving the dwell times from `hw_wait_budget()` would silently rescale every USB timing constant
 the day the timeout policy changed; VBUS de-energise and `bPwrOn2PwrGood` are not policy.
 
-**Budgets.** The **first** attempt keeps its ~6 s (`hw_wait_budget() × 3`, unchanged) — a real device
-can legitimately stall 1–4 s on a write, and shortening this would fail slow-but-healthy sticks.
-**Escalation retries** use ~2 s (`× 1`): by then the device has burned two full ladders without
-answering, the only question left is "did the heavy reset revive it", and a revived device answers
-in milliseconds. The extra 4 s buys no information and is paid in frozen desktop. The multiplier
-lives in `bot_budget_scale`, which is the historical `3` at all times except inside an escalation
-retry.
+**Budgets.** The **first** attempt keeps its full `hw_wait_budget() × 3` (unchanged; 2 s × 3 = 6 s
+on this capture's x86 metal, 8.33 s on the Pi 4, 14.4 s on the Orin — per-platform derivation in
+§32) — a real device can legitimately stall 1–4 s on a write, and shortening this would fail
+slow-but-healthy sticks. **Escalation retries** use the base budget (`× 1`; 2 s here): by then the
+device has burned two full ladders without answering, the only question left is "did the heavy
+reset revive it", and a revived device answers in milliseconds. The extra 2× buys no information
+and is paid in frozen desktop. The multiplier lives in `bot_budget_scale`, which is the historical
+`3` at all times except inside an escalation retry.
 
 **Rung (a) — the honest limit, recorded because the witness will show it.** Reset Device returns the
 xHC's internal slot state to the post-Address condition without touching the Root Hub Port Number or
@@ -5364,7 +5370,8 @@ to pre-USBFALL. The rule is about substitution on a platform that has a canonica
 across block I/O with "the aarch64 I/O is polled, so the span is a couple of bounded polled sector
 transfers". That premise is source-blind. On `BlockSource::Usb` the same RMW runs
 `write_block_usb → storage_write10 → scsi_write10 → bot_transfer → pump_until_bot_done`, whose deadline is
-`hw_wait_budget() * 3` = 450 M CNTVCT ticks (~8 s at 54 MHz) and whose pump body executes `wfi` under the
+`hw_wait_budget() * 3` = 450 M CNTVCT ticks (8.33 s at the Pi 4's 54 MHz; 14.4 s on the Orin — §32)
+and whose pump body executes `wfi` under the
 `PSTATE.I` this very hold masked. It is bounded and it is not a deadlock — WFI wakes on a pending physical
 interrupt with I set — but a failing transfer means a multi-second non-preemptible hold (×`num_fats`) with
 the scheduler stopped. The LOCK SPAN paragraph now states `Default` and `Usb` separately, and every `FatFs`
@@ -7085,7 +7092,8 @@ a verdict that **outlives a slot id**:
   end that ladder — it handed it its allowance back.
 
 Measured cost: a core at 99% for the whole sitting, `timeouts=` still climbing when the device was
-pulled, at ~8.3 s of pump budget (`hw_wait_budget() * BOT_BUDGET_SCALE_FIRST`) per attempt.
+pulled, at 8.33 s of pump budget per attempt (`hw_wait_budget() * BOT_BUDGET_SCALE_FIRST` =
+450 M CNTVCT ticks at this Pi 4 capture's 54 MHz; §32).
 
 ### The fix: an account keyed to the device, not the slot
 
@@ -7113,8 +7121,9 @@ surrender is untouched underneath it. Four mechanisms, in the order they bite:
      account (a healthy boot's *entire* BOT time is ~5 s, half this bound);
    * `BOT_PARK_DEAD_STREAK` (2) consecutive timeouts with a *provably idle* ring (no events, no
      foreign events, no doorbells — the [piusb40] signature) cut this device's pump budget by
-     `BOT_PARK_DEAD_DIV` (8), so the steady state after a proven wedge is ~350 ms per attempt rather
-     than ~8.3 s. Applied with `min`: it can only shorten a wait, and a healthy device never earns
+     `BOT_PARK_DEAD_DIV` (8), so the steady state after a proven wedge is ~350 ms per attempt
+     (the cut divides the *base* budget: 150 M / 8 = 18.75 M ticks ≈ 347 ms at 54 MHz) rather
+     than 8.33 s. Applied with `min`: it can only shorten a wait, and a healthy device never earns
      it.
 4. **Guaranteed teardown on disconnect, and the unpark rule.** `bot_park_note_disconnect` runs
    *before* `bot_rescue_clear` on both disposal paths. If the disposed slot is the one under the
@@ -7235,7 +7244,9 @@ back-off decline attempts. The injection now charges the wait it stands in for
 (`hw_wait_budget() * bot_budget_scale`, classified `dead` — the injected wedge IS the `[piusb40]`
 signature), and credits the same fictional span against the back-off deadline, because the ledger
 must not accrue on one clock while the gate refuses on another. Both credits are `cfg`-gated to the
-feature; on metal a real ~7.2 s wait outlasts `BOT_PARK_BACKOFF_MAX_MS` on its own.
+feature; on metal a real first-attempt wait (8.33 s on the Pi 4, 14.4 s on the Orin — the "~7.2 s"
+this line used to claim for metal is the QEMU-virt figure, 450 M ticks at 62.5 MHz, a rate no metal
+in the fleet runs at; §32) outlasts `BOT_PARK_BACKOFF_MAX_MS` (4 s) on its own.
 
 Measured, `UNAOS_BOTWEDGE=1 ./arroyo test-arm`:
 
@@ -8110,6 +8121,86 @@ collinear. With the mount first: a boot where `[botseq] ... lba0=ok` is followed
 and THEN the wedge inside the matrices convicts the probes' command mix (read12/read16/pre-sense/
 induced-stall), not sequence depth — and the desktop line gets its filesystem before the reader
 dies. A mount that still times out ahead of any matrix reopens the position/depth theory.
+
+## 32. WAITBUDGET — the wait-budget figures, derived and cited (2026-08-25)
+
+Four incompatible clock figures for the same waits had accumulated in this file and in the
+`drivers/xhci/mod.rs` doc comments — "~6 s / ~2 s", "≈ 8.3 s", "~7.2 s on Pi 4", "~7.2 s at
+62.5 MHz" (the last two naming the *same* wait), plus a "~2.5 s" for the base budget that no
+platform in the fleet actually produces. The root cause is recorded at
+`arch/aarch64/mod.rs:420–460` (the HWBUDGET tail block, folded 2026-08-25, commit `0c7cdeb6`):
+`HW_WAIT_BUDGET` is a CYCLE count that was repeatedly read as a DURATION, and a fixed cycle count
+is a different duration on every timebase. This section is the normative derivation. Every
+clock/time figure elsewhere in this file is either platform-qualified in place or points here.
+Code citations are file:line under `unaos/crates/kernel/src/` at `ca4fa538`.
+
+### 32.1 The base budget, `hw_wait_budget()`
+
+| platform | timebase and rate | derivation | base budget |
+|---|---|---|---|
+| x86, calibrated | TSC, measured (bench metal ≈ 2.6938 GHz, §12) | `tsc_hz × HW_WAIT_SECONDS`, `HW_WAIT_SECONDS = 2` (`arch/x86_64/mod.rs:137,150–156`) | **2.0 s** |
+| x86, calibration failed | TSC, unknown | fixed `HW_WAIT_BUDGET = 2_500_000_000` cycles (`arch/x86_64/mod.rs:144`) | 2.5 G cycles — a duration only once a rate is assumed |
+| Pi 4 (aarch64 off-tegra) | CNTVCT at CNTFRQ = 54 MHz (boot diag; BOTBOUND boot 11 measured `spent_ms=2779` against 150e6/54e6 = 2777.8 ms) | fixed `HW_WAIT_BUDGET = 150_000_000` ticks (`arch/aarch64/mod.rs:339,479–480`) | **150e6 / 54e6 = 2.78 s** |
+| QEMU virt (aarch64 off-tegra) | CNTVCT at CNTFRQ = 62.5 MHz | same 150e6-tick constant | **150e6 / 62.5e6 = 2.4 s** |
+| Jetson Orin (`tegra`) | CNTVCT at CNTFRQ = 31.25 MHz (capture-proven, `arch_arm64.md` JM3) | `cntfrq × HW_WAIT_MS / 1000`, `HW_WAIT_MS = 4800` (`arch/aarch64/mod.rs:461,467–472`) | **4.8 s** (31.25e6 × 4.8 = 150e6 ticks exactly) |
+| tegra with CNTFRQ_EL0 = 0 | CNTVCT, rate unprogrammed | falls back to the 150e6-tick constant (`arch/aarch64/mod.rs:467–472`) | 150e6 ticks — duration unknowable, same cycle count as shipped |
+
+The Orin's 4.8 s is **kept deliberately**, not an accident of the derivation: 31_250_000 × 4800 /
+1000 = 150_000_000 reproduces the pre-derivation cycle count to the cycle, and the 60 s xusb
+enumeration window (`arch/aarch64/xusb_tegra.rs:1791–1801`) is metal-tuned against exactly that
+pace — a 20 s window lost the keyboard on metal. Retired figures: **"~2.5 s"** for the aarch64 base
+budget (it assumed a ~60 MHz generic timer; no part in this tree runs at 60 MHz) and **19.2 MHz**
+for the Pi's CNTFRQ (that is the Pi 3 crystal; the code reads CNTFRQ_EL0 and the Pi 4 reports
+54 MHz — though Tegra silicon *has* shipped 19.2 MHz parts, which is one reason tegra derives from
+the register instead of trusting a constant).
+
+### 32.2 The derived per-wait figures
+
+All rows are `base × k` or `base / k` — nothing else in the BOT/claim paths sets its own clock.
+
+| wait | scale on base (citation) | x86 | Pi 4 | QEMU virt | Orin |
+|---|---|---|---|---|---|
+| BOT first-attempt stage wait (`pump_until_bot_done`) | × `BOT_BUDGET_SCALE_FIRST` = 3 (`drivers/xhci/mod.rs:1076`) | 6.0 s | 8.33 s | 7.2 s | **14.4 s** |
+| BOT escalation-retry stage wait | × `BOT_BUDGET_SCALE_ESCALATION` = 1 (`drivers/xhci/mod.rs:1077`) | 2.0 s | 2.78 s | 2.4 s | 4.8 s |
+| dead-ring cut budget (BOT-PARK) | ÷ `BOT_PARK_DEAD_DIV` = 8 (`drivers/xhci/mod.rs:1157,10520`) | 0.25 s | 0.35 s | 0.30 s | 0.60 s |
+| block-layer claim wait, unmasked (`claim_xhci_for_io`) | × 1 (`drivers/block.rs:63–77`) | 2.0 s | 2.78 s | 2.4 s | 4.8 s |
+| FAT/dir RMW retry wall-clock cap (WEDGE-8) | × 1, AND ≤ `RMW_BUSY_ATTEMPTS` = 64 attempts (`fs/fat.rs:1215,1263–1288`) | 2.0 s | 2.78 s | 2.4 s | 4.8 s |
+
+Reading the retired contradictions against this table: **"6 s / 2 s"** are the x86 column of rows
+1–2; **"8.3 s"** is the Pi 4 column of row 1; **"~7.2 s"** is the QEMU-virt column of row 1 and was
+never a metal figure on any platform — the places that attributed it to "Pi 4" or to "metal" have
+been corrected in place.
+
+### 32.3 The BOT-vs-block-claim inversion — known, dated, deliberate
+
+**Recorded 2026-08-25.** Provenance: surfaced by the HWBUDGET derivation arc (commit `0c7cdeb6`,
+which made the Orin's 4.8 s base visible as a duration), confirmed by the rmbp seat's independent
+review of this file's figures the same day.
+
+A **healthy** BOT transaction may hold the controller loan for up to one first-attempt stage wait —
+`hw_wait_budget() × 3` (`drivers/xhci/mod.rs:1076`): **14.4 s on the Orin**, 8.33 s on the Pi 4,
+6 s on x86. Every unmasked claimant of the same controller waits at most `hw_wait_budget() × 1`:
+`claim_xhci_for_io` bounds its `hlt` retry loop by one base budget (`drivers/block.rs:63–77`), and
+the FAT/dir RMW retry carries the same wall-clock cap (**4.8 s on the Orin**, 2.78 s Pi 4, 2 s
+x86). The transaction budget therefore exceeds the claimant's wait by a factor of 3 **on every
+platform, by construction** — the two figures are the same base times different multipliers, so no
+CNTFRQ, calibration, or platform choice can un-invert them. Concretely: a device exercising its
+legitimate stall allowance (1–4 s per write is *inside* a healthy first attempt, kept precisely so
+slow-but-healthy sticks are not failed) can hold the loan longer than any claimant will wait, and
+the claimant then surfaces `BlockError::Busy` / `-EAGAIN` with nothing wrong on the wire.
+
+This is a documented fact, not a scheduled fix, because both sides of the ratio are held on
+purpose: the 3× transaction budget is metal-earned (shortening it fails slow-but-healthy sticks —
+`drivers/xhci/mod.rs:1070–1075`; on the Orin the 60 s enumeration window is tuned against the 4.8 s
+base), and the 1× claim wait is what keeps the masked-side FAT RMW retry cost bounded, which is the
+point of WEDGE-8. The consequence callers must own: `Busy`/`-EAGAIN` during a healthy-but-slow
+transfer is a normal, retryable outcome, not evidence of a wedge. Two standing texts contradicted
+this before today and one still does: `xhci_concurrency.md` §"What a `Busy` costs in practice"
+claimed the bounded waits "cover" a healthy transaction (corrected 2026-08-25 — true only of
+transactions that complete in milliseconds, not of what a healthy transaction is *allowed*), and
+the `claim_xhci_for_io` doc comment (`drivers/block.rs:58–61`) still says one base budget is "long
+enough for any healthy service pass or BOT transaction" — flagged to the owning seat, not edited
+here.
 
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
