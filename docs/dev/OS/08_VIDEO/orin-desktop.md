@@ -1790,17 +1790,28 @@ different line from a restore that paints.
   flat image, `llvm-objcopy -O binary` on the `ehcihid,tegra,tegrasmp` build, baseline and changed tree
   BOTH `f9f95424e16ac855408e4ecd2aa89419c47ec2a844183f94087706f4655046b2` and `cmp`-identical — the
   same sha this section's baseline already carried, which is what makes the A/B the canonical one
-  rather than a private definition of it. The four new fragments (`GLYPHS-AA-ON-GLASS`,
-  `GLYPHS-AA-NO-CHROME`, `INK-OFF-COLOUR`, `" inkvals="`; 9-19 bytes) hit exactly once each in the
-  armed image by `grep -a -o -F` AND by `strings -a`, and **zero** in both negative controls — the
-  knob-off default and the same §6.1 conjunction built with `orinladder` OFF. Reachability by
-  disassembly: `tegra_early_stop -> orin_ladder_arm` (`bl` at `0x737f8`), `jd2_console_pump ->
-  orin_ladder_census` (`bl` at `0x72ed8`), `orin_ladder_arm -> orin_glass_probe` (`0xeda10`),
-  `orin_ladder_census -> orin_glass_probe` (`0xf0df8`, `0xf0e0c`); and every one of the eight verdict
-  strings is materialised by a live `adr` inside `orin_glass_probe` (the three new ones at `0x4109e`,
-  `0x410ac`, `0x410bf`), with `orin_ladder_census` itself referencing the two AA verdicts — which is
-  `lad_glass_painted` inlined, i.e. the proof that the passing set on the wire is the passing set the
-  round-trip ledger uses.
+  rather than a private definition of it. The six new fragments (`GLYPHS-AA-ON-GLASS`,
+  `GLYPHS-AA-NO-CHROME`, `INK-OFF-COLOUR`, `INK-FLAT-FILL`, `" inkvals="`, `" blevels="`; 9-19 bytes)
+  hit exactly once each in the armed image by `grep -a -o -F` AND by `strings -a`, and **zero** in
+  both negative controls — the knob-off default and the same §6.1 conjunction built with `orinladder`
+  OFF. Reachability by disassembly: `tegra_early_stop -> orin_ladder_arm` (`bl` at `0x737f8`),
+  `jd2_console_pump -> orin_ladder_census` (`bl` at `0x72ed8`), `orin_ladder_arm ->
+  orin_glass_probe` (`0x11868c`), `orin_ladder_census -> orin_glass_probe` (`0x11bba4`, `0x11bbb8`);
+  and **all ten** verdict strings are materialised by live `adr`/`adrp+add` inside
+  `orin_glass_probe`, the four new ones at `0x435a6`, `0x435b4`, `0x435c1`, `0x435d4` — with
+  `orin_ladder_census` itself referencing `GLYPHS-ON-GLASS`, `GLYPHS-NO-CHROME` and both AA verdicts,
+  which is `lad_glass_painted` inlined and therefore the proof that the passing set on the wire is
+  the passing set the round-trip ledger uses.
+* **The classifier was RUN, not argued.** `lad_chan`, `lad_classify`, `lad_hist_add`, `lad_hist_rank`
+  and `lad_glass_painted` were extracted VERBATIM from `display_tegra.rs` (`awk` on the function
+  bodies, `#[cfg]` lines stripped — a replica would have been worthless) and compiled for the host:
+  13 colour cases (exact paper/ink, 0.5%/50%/99% coverage greys, a channel exactly at the ±8
+  tolerance and one past it, white, saturated red and blue, `orin_wm1`'s magenta, a same-luma wrong-hue
+  dark red, and `PANEL_BG`), 3 histogram cases (exact counts with 3 distinct values; the appended-
+  scatter signature `inkvals=36 exact=no`; an interleaved run where the Misra-Gries count is a REAL
+  lower bound, `n1=252` against a true 300), 5 end-to-end verdict scenarios and the 12-verdict
+  `lad_glass_painted` set. All pass. **That run is what found the `PANEL_BG` hole** — it was not
+  reasoned to, and the first version of this instrument would have shipped with it.
 * **Reachability by disassembly, not by banner.** `tegra_early_stop -> orin_ladder_arm`
   (`bl` at `0x747a4`, immediately after `orin_conwin`'s at `0x747a0`);
   `jd2_console_pump -> orin_ladder_census` (`bl` at `0x73e84`, after `orin_click_census`'s at
