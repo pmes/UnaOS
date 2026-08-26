@@ -3675,6 +3675,7 @@ build_user_el0_elf_images() {
     RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-elf/user-elf.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
       cargo +nightly build --release -Z json-target-spec
     cd "$WORKSPACE_DIR"
+    mkdir -p "${WORKSPACE_DIR}/target"   # a fresh worktree has no target/ yet — two executors hit this 2026-08-25
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${WORKSPACE_DIR}/crates/user-elf/target/aarch64-base/release/user-elf" \
       "${WORKSPACE_DIR}/target/ELFHELLO.ELF"
