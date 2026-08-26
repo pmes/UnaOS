@@ -692,6 +692,22 @@ vugras = []
 # ONLY presence oracle (RIDER 1). See arch_arm64.md §ORIN-SMP.
 tegrasmp = ["tegra"]
 
+# ORIN-REBOOT (watchdog half, baton orin-6 §5.1): the `UNAOS_ORINWDT=1` Tegra234 TKE BOOT
+# WATCHDOG (arch/aarch64/wdt_tegra.rs) — WDT0 armed early in `tegra_early_stop` for a system
+# POR reset 300 s later, disarmed on the EL1 terminus line, so a WEDGED boot self-resets
+# without bench hands (there is deliberately no bench power-switch hardware) and a completed
+# boot leaves no watchdog running. Register recipe 1:1 with Linux timer-tegra186.c (the
+# documentation of record, per the pcie-tegra194/NET-3 precedent). Implies `tegra` (the TKE is
+# Tegra234 silicon — the xcarve/tegrasmp precedent), so `UNAOS_ORINWDT=1 ./arroyo check` is
+# self-sufficient. DEFAULT OFF => the module + both call sites vanish (both are statements
+# APPENDED to existing `tegra_early_stop` lines, so no panic Location shifts; the knob-off
+# image carries ZERO `[orinreboot] wdt` strings — measured — while the arc's UNCONDITIONAL
+# half, the power.rs verbs, ships in every image by design, so knob-off is NOT byte-identical
+# to the pre-arc baseline and does not claim to be). The ARMED polarity is type-checked by the
+# `arm-tegra-orinwdt` leg of KERNEL_CFG_MATRIX in `arroyo`, never by the knob mapping.
+# Witness family: `[orinreboot]` (the arch-neutral reboot VERB in power.rs shares it).
+orinwdt = ["tegra"]
+
 # JETSON-EL0 (M1b): the Jetson Orin (Tegra234) EL0/userspace chain. Through M1a the tegra path reached
 # EL1 + the scheduler (`boot_tegra`'s EL2 -> EL1 drop, `sched::run_capstone_boot_core`) and stopped
 # there: every piece of EL0 machinery — `arch::aarch64::syscall`, `arch::aarch64::bus`, and `sched`'s

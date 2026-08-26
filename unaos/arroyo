@@ -810,6 +810,18 @@ _feats=""
 # Mirrors the PORTSW-1/SMOLNET default-ON/negative-knob policy. See arch_arm64.md §ORIN-SMP.
 [ -n "${UNAOS_TEGRASMP:-}" ] && _feats="${_feats}tegrasmp,tegra,"
 [ -n "${UNAOS_TEGRA:-}" ] && [ -z "${UNAOS_NOTEGRASMP:-}" ] && _feats="${_feats}tegrasmp,tegra,"
+# ORIN-REBOOT (watchdog half): UNAOS_ORINWDT=1 arms the `orinwdt` Tegra234 TKE BOOT WATCHDOG
+# (arch/aarch64/wdt_tegra.rs) — WDT0 armed early in `tegra_early_stop` (POR reset in 300 s),
+# disarmed on the EL1 terminus, so a WEDGED Orin boot self-resets without bench hands. The
+# `orinwdt` feature implies `tegra` (the TKE is Tegra234 silicon), so the knob is self-sufficient
+# (`UNAOS_ORINWDT=1 ./arroyo esp-jetson` builds an armed jetson image). Default OFF => the module
+# + both call sites vanish (statements APPENDED to existing lines, so no Location shifts; the
+# knob-off image carries zero `[orinreboot] wdt` strings — the arc's power.rs VERBS ship
+# unconditionally, so no byte-identity-to-pre-arc claim). The ARMED polarity is type-checked by the
+# `arm-tegra-orinwdt` leg of KERNEL_CFG_MATRIX, never by this mapping. QEMU models no TKE, so the
+# reset verdict is metal-owed. Witness family: `[orinreboot]` (shared with the reboot VERB —
+# power.rs — which is always-compiled and needs no knob).
+[ -n "${UNAOS_ORINWDT:-}" ] && _feats="${_feats}orinwdt,"
 # ── ORINDESK rung 1: the DESKTOP FAMILY reaches this map at all ────────────────────────────────────
 #
 # `pidesk`, `quarry` and `livecon` are the three desktop-family knobs. Until this block they existed
@@ -2530,6 +2542,19 @@ KERNEL_CFG_MATRIX=(
   # `[features]` entry named on an arm-* leg only, so it stays out of `x86_cfg_universe` and the
   # derived mix-leg count is unchanged. `./arroyo check` prints the live counts every run.
   "arm-tegra-selfup ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,selfup"
+  # ORIN-REBOOT (watchdog half) — the ARMED-`orinwdt` polarity. WHY ITS OWN TAIL LEG rather than
+  # `,orinwdt` appended to `arm-tegra`: the standing reason from the tail legs above — `arm-tegra` is
+  # the DISARMED twin and the only leg anywhere that compiles the SHIPPED default jetson image; folding
+  # the knob in would leave the shipped polarity type-checked by no leg. Hosted on `arm-tegra`'s list
+  # verbatim + `orinwdt` (the smpmark/orindesk/jd1dc precedent; `orinwdt` implies `tegra`, all sites in
+  # tegra-gated code, so no standalone-vacuity trap). The arch-neutral reboot VERB (power.rs) needs no
+  # leg: it is unconditional code, compiled by every leg on both arches already.
+  #
+  # UNIVERSE SIDE EFFECT: none that moves a mix count. `orinwdt` is a NEW `[features]` entry named only
+  # on this arm-* leg, so `x86_cfg_universe` drops it (its sites are all inside `feature = "tegra"`
+  # items) and the derived mix-leg count is unchanged. Board legs +1; gate +1. `./arroyo check` prints
+  # the live board/mix counts every run — read them there, not here.
+  "arm-tegra-orinwdt ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,orinwdt"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────

@@ -2061,7 +2061,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // fatal path busy-spins (timer::LIVE is still false), and the IRQ entries stay dormant —
     // install()'s HCR_EL2.AMO|IMO|FMO routing changes where a physical IRQ WOULD land, but DAIF
     // stays fully masked until JM4's enable_irq below, by which point the GIC is up.
-    unaos_kernel::arch::exceptions::install();
+    unaos_kernel::arch::exceptions::install(); #[cfg(feature = "orinwdt")] unaos_kernel::arch::wdt_tegra::boot_arm(); // ORIN-REBOOT: arm the TKE boot watchdog HERE — MMU device window live (the TKE is MMIO), serial live (the witness must land), vectors healed — so every later wedge (GIC, USB, panel, the drop) sits inside the covered window. Disarmed on the terminus line; knob-off the statement vanishes (APPENDED to this line, so no panic Location shifts).
     // JM7 (video): report the GOP the firmware handed off (addr=0 = headless boot, fbcon inert).
     // With a monitor connected, fbcon has been mirroring serial output onto this framebuffer since
     // kernel_main step 0 (under the UEFI map), and mmu_tegra just mapped its GiBs into BOTH tables
@@ -2676,7 +2676,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // `el0-hello` task, and an unstamped mask would refuse it (see sched.rs `EL1_CORE_MASK`).
     unaos_kernel::arch::percpu::init(0); unaos_kernel::arch::sched::mark_el1_core();
     unaos_kernel::arch::exceptions::install();
-    unaos_kernel::arch::timer::el1_oneshot_proof(); tegra_el0_start_maybe(); #[cfg(feature = "tegradesk")] tegra_desk_arm(); #[cfg(feature = "orinconwin")] unaos_kernel::arch::display_tegra::orin_conwin(); tegra_rast_demo_maybe(); unaos_kernel::arch::sched::run_capstone_boot_core(0); // IRQEL-RT EL1 one-shot proof (first: one interrupt taken AT EL1 through the runtime-banked __vec_irq, then self-disarms — see timer.rs tail) + ORINDESK RUNG 2 desktop seam (no-op unless UNAOS_TEGRADESK=1; DESKSEAM tail block) + RAST-TEGRA demo (no-op unless UNAOS_RAST=1), all on the same line as the terminus so the wire-ins add ZERO source lines before any panic Location — the tegra knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helpers defined at file tail / timer.rs tail.
+    unaos_kernel::arch::timer::el1_oneshot_proof(); tegra_el0_start_maybe(); #[cfg(feature = "tegradesk")] tegra_desk_arm(); #[cfg(feature = "orinconwin")] unaos_kernel::arch::display_tegra::orin_conwin(); tegra_rast_demo_maybe(); #[cfg(feature = "orinwdt")] unaos_kernel::arch::wdt_tegra::boot_ok_disarm(); unaos_kernel::arch::sched::run_capstone_boot_core(0); // IRQEL-RT EL1 one-shot proof (first: one interrupt taken AT EL1 through the runtime-banked __vec_irq, then self-disarms — see timer.rs tail) + ORINDESK RUNG 2 desktop seam (no-op unless UNAOS_TEGRADESK=1; DESKSEAM tail block) + RAST-TEGRA demo (no-op unless UNAOS_RAST=1), all on the same line as the terminus so the wire-ins add ZERO source lines before any panic Location — the tegra knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helpers defined at file tail / timer.rs tail.
 }
 
 /// Handle one keyboard byte against the console: printable ASCII extends the input line, backspace

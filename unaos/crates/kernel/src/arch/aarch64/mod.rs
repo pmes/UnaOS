@@ -108,6 +108,12 @@ pub mod display_tegra;
 // tegra binary stays byte-identical to baseline). Wired into `tegra_early_stop` after JM4.
 #[cfg(all(feature = "tegra", feature = "smpprobe"))]
 pub mod smpprobe; #[cfg(all(feature = "tegra", feature = "selfup"))] pub mod selfup_tegra; // ORIN-SELFUP: the self-update core (staged whole-ESP payload -> sha256 verify -> proven FAT write -> warm-reboot hook), wired into tegra_early_stop after ORIN-INSTALL-2; appended to THIS line for knob-off byte-identity (inline fns with Location-bearing ops live below).
+// ORIN-REBOOT (watchdog half): the `UNAOS_ORINWDT=1` Tegra234 TKE boot watchdog — a wedged
+// Orin boot self-resets (POR on the 5th WDT0 expiration) instead of sitting dark for bench
+// hands. Tegra-only AND `orinwdt`-gated (`orinwdt` implies `tegra`), so it is compiled out
+// of every default image. Armed early in `tegra_early_stop`, disarmed on the EL1 terminus.
+#[cfg(all(feature = "tegra", feature = "orinwdt"))]
+pub mod wdt_tegra;
 
 // PI-V3D-1: the VideoCore VI (V3D 4.2) GPU foundation — firmware power/clock, MMIO probe, the
 // V3D-private MMU, and a minimal GPU buffer-clear. Pi bare-metal AND `v3d`-gated, so it is compiled
