@@ -3349,6 +3349,76 @@ const LAD_PAPER: u32 = 0x0000_0000;
 #[cfg(feature = "orinladder")]
 const LAD_INK: u32 = 0x00C0_C0C0;
 
+// ── ORIN-GLASSINK — why the two constants above are not enough, and what was added ───────────────
+//
+// boot7j read `paper=1001 ink=23 stem=0 -> INK-NO-STEM`, stably, across at least four censuses, with
+// all six chrome probes MATCH and `onpanel=yes`. That verdict was then read as "the text is not on
+// the glass" — and it does not support that reading. `ink` was defined as "not exactly `LAD_PAPER`"
+// and `stem` as "exactly `LAD_INK`", so `ink=23 stem=0` says only *23 samples were neither exact
+// black nor exact light-grey*. THREE different worlds produce that same pair:
+//
+//   1. **Anti-aliased text of this console's own colour**, whose sampled pixels all happen to be
+//      partial-coverage blends. The face IS anti-aliased (`c.aa = true`, note above) and CRYSTAL-HD/AA
+//      widened the edge population, so this is not hypothetical. Rung (a) should PASS here.
+//   2. **Text in a colour that is not `LAD_INK`** — the restated constant is stale, or the face was
+//      armed with another `FG`. The instrument must NAME the measured colour so the constant can be
+//      corrected as a decision, not by construction.
+//   3. **Something that is not this console's text at all** — the original `INK-NO-STEM` reading, and
+//      still the right verdict for the residue.
+//
+// The one datum that separates them was the one the probe threw away: it reported `first=`, the FIRST
+// sample (which was paper), and never what the 23 ink samples WERE. So the census below now also
+// partitions the non-paper population by GEOMETRY IN COLOUR SPACE and carries the heaviest values:
+//
+//   * `blend` — the sample lies on the straight PAPER→INK ramp (see `lad_classify`): a partial
+//     coverage blend of exactly the two documented console colours, and nothing else on a
+//     black-paper panel makes those by accident.
+//   * `off`   — non-paper, not exactly ink, and NOT on that ramp: a foreign colour.
+//   * `ink1..ink3` / `n1..n3` — the heaviest non-paper values with their counts, so a dominant
+//     foreign colour is named on the wire rather than inferred.
+//
+// ⚠ `LAD_INK` IS DELIBERATELY NOT CHANGED to whatever the board shows. A constant tuned to the
+// observation would make the probe agree with reality by construction and prove nothing; if the
+// evidence says it is wrong, `INK-OFF-COLOUR` reports the measured value and correcting it is a
+// separate decision on separate evidence.
+
+/// ORIN-GLASSINK — per-channel slack, in 8-bit levels, for "this sample is on the PAPER→INK ramp".
+///
+/// A blend at coverage `a` is `paper + a*(ink - paper)` per channel; the compositor's own rounding,
+/// and any gamma applied to the coverage, move a channel by a level or two. 8 of 192 (the ramp's span
+/// on this pair) is ~4% — wide enough that no genuine blend is called foreign, narrow enough that a
+/// saturated colour never passes: pure white fails on the dominant channel's range test, pure blue
+/// misses the ramp by 48960 against a 1536 budget (both worked in `lad_classify`'s comment).
+#[cfg(feature = "orinladder")]
+const LAD_BLEND_TOL: i32 = 8;
+
+/// ORIN-GLASSINK — slots in the ink histogram. Misra-Gries with `k` counters is guaranteed to retain
+/// every value whose true frequency exceeds `n/(k+1)`, so 6 slots cannot lose a value that is even a
+/// seventh of the ink population — and the verdict below only ever asks about a value holding a
+/// MAJORITY of it. Fixed-size, on the stack, no allocation: 48 bytes.
+#[cfg(feature = "orinladder")]
+const LAD_TOPN: usize = 6;
+
+/// ORIN-GLASSINK — the four populations a sample can fall in. Plain `u8` tags rather than an enum:
+/// they are counted into an array and printed, and an enum would buy nothing here.
+#[cfg(feature = "orinladder")]
+const LAD_CLASS_PAPER: u8 = 0;
+#[cfg(feature = "orinladder")]
+const LAD_CLASS_STEM: u8 = 1;
+#[cfg(feature = "orinladder")]
+const LAD_CLASS_BLEND: u8 = 2;
+#[cfg(feature = "orinladder")]
+const LAD_CLASS_OFF: u8 = 3;
+
+/// ORIN-GLASSINK — the ink population is RAMP-DOMINATED when blends are at least this fraction of it
+/// (3/4). Not "all of it": a caret, a cursor sprite edge or one stale pixel from the desktop behind
+/// must not demote a window full of anti-aliased text, and a supermajority is the cheapest statement
+/// that survives those without admitting a genuinely mixed field.
+#[cfg(feature = "orinladder")]
+const LAD_RAMP_NUM: usize = 3;
+#[cfg(feature = "orinladder")]
+const LAD_RAMP_DEN: usize = 4;
+
 /// ORIN-LADDER — the read-back grid: `LAD_BANDS` scanlines spread down the content box, each
 /// sampling `LAD_RUNS` CONTIGUOUS runs of `LAD_RUN` pixels. 8 x 4 x 32 = 1024 samples.
 ///
@@ -3409,6 +3479,155 @@ fn lad_on_panel(i: &crate::video::wm::WindowInfo) -> bool {
     i.z > crate::video::wm::shell_z()
 }
 
+/// ORIN-GLASSINK — one 8-bit channel of an `0x00RRGGBB` sample. `c` is 0 = R, 1 = G, 2 = B.
+#[cfg(feature = "orinladder")]
+fn lad_chan(v: u32, c: usize) -> i32 {
+    ((v >> (16 - 8 * c)) & 0xFF) as i32
+}
+
+/// **ORIN-GLASSINK — which population a read-back sample belongs to.**
+///
+/// The question this answers is the one `INK-NO-STEM` could not: *is this pixel a partial-coverage
+/// blend of the console's own two colours, or is it a foreign colour?* An anti-aliased glyph edge at
+/// coverage `a` is `paper + a*(ink - paper)` in EVERY channel with the SAME `a`, so the test is not
+/// "is it grey" (which would hard-code this particular pair's greyness) but "is it ON THE SEGMENT
+/// between the two documented constants": recover `a` from the channel with the widest span, then
+/// require the other two to agree with it.
+///
+/// Written against `LAD_PAPER`/`LAD_INK` as variables, never against black: if either constant is
+/// ever corrected the test follows it, and a `paper == ink` pair (no ramp) degrades to "everything
+/// non-paper is off-ramp" rather than to a division by zero.
+///
+/// Integer only, no division: `got ≈ span_c * a / span_d` is checked cross-multiplied, which also
+/// scales the tolerance by `|span_d|` exactly once. ~12 adds and 6 multiplies, on the NON-PAPER
+/// samples only — paper is an equality test in the caller's fast path.
+#[cfg(feature = "orinladder")]
+fn lad_classify(v: u32) -> u8 {
+    if v == LAD_PAPER {
+        return LAD_CLASS_PAPER;
+    }
+    if v == LAD_INK {
+        return LAD_CLASS_STEM;
+    }
+    // The ramp's dominant channel: the one whose paper→ink span is widest, so the recovered coverage
+    // has the most resolution available. For the documented pair all three spans are 192.
+    let mut d = 0usize;
+    let mut dspan = 0i32;
+    for c in 0..3 {
+        let s = lad_chan(LAD_INK, c) - lad_chan(LAD_PAPER, c);
+        if s.abs() > dspan.abs() {
+            dspan = s;
+            d = c;
+        }
+    }
+    if dspan == 0 {
+        // paper == ink in every channel: there is no segment, so nothing can be "between" them.
+        return LAD_CLASS_OFF;
+    }
+    let a = lad_chan(v, d) - lad_chan(LAD_PAPER, d);
+    // MONOTONE: `a` must run in the ramp's own direction and not past its far end. This is the test
+    // pure white fails (a = 255 against a span of 192) — a brighter-than-ink pixel is not a blend of
+    // anything, it is a different colour that happens to share the hue.
+    if (a ^ dspan) < 0 || a.abs() > dspan.abs() {
+        return LAD_CLASS_OFF;
+    }
+    for c in 0..3 {
+        let s = lad_chan(LAD_INK, c) - lad_chan(LAD_PAPER, c);
+        let got = lad_chan(v, c) - lad_chan(LAD_PAPER, c);
+        if (got * dspan - s * a).abs() > LAD_BLEND_TOL * dspan.abs() {
+            return LAD_CLASS_OFF;
+        }
+    }
+    LAD_CLASS_BLEND
+}
+
+/// **ORIN-GLASSINK — the ink histogram: Misra-Gries over `LAD_TOPN` fixed slots.**
+///
+/// The census must name the heaviest non-paper values, and it may not allocate, may not sort 1024
+/// samples and may not keep them. Misra-Gries is the standard answer: a value already in the table
+/// increments its counter; a new value takes a free slot; a new value with the table full decrements
+/// EVERY counter by one (freeing whatever reaches zero) and is dropped. The guarantee that matters:
+/// any value with true frequency above `n/(LAD_TOPN+1)` is still in the table at the end.
+///
+/// ⚠ THE COUNTS ARE EXACT UNTIL THE FIRST DECREMENT ROUND, AND LOWER BOUNDS AFTER IT. `evict` is
+/// carried to the wire as `exact=yes|no` for exactly that reason — a lower bound presented as a count
+/// would be the same class of overclaim this whole rung exists to remove. And `exact=no` is itself
+/// evidence: it means the box held more than `LAD_TOPN` distinct non-paper values, which is the
+/// signature of a scattered field rather than of text in one colour.
+#[cfg(feature = "orinladder")]
+fn lad_hist_add(
+    hv: &mut [u32; LAD_TOPN],
+    hc: &mut [u32; LAD_TOPN],
+    distinct: &mut u32,
+    evict: &mut u32,
+    v: u32,
+) {
+    for s in 0..LAD_TOPN {
+        if hc[s] != 0 && hv[s] == v {
+            hc[s] += 1;
+            return;
+        }
+    }
+    for s in 0..LAD_TOPN {
+        if hc[s] == 0 {
+            hv[s] = v;
+            hc[s] = 1;
+            *distinct += 1;
+            return;
+        }
+    }
+    *evict += 1;
+    for s in 0..LAD_TOPN {
+        hc[s] -= 1;
+    }
+}
+
+/// ORIN-GLASSINK — the `rank`-th heaviest slot (0-based) as `(value, count)`, or `(0, 0)` when the
+/// table holds fewer than `rank + 1` occupied slots. `LAD_PAPER` is never admitted to the table, so a
+/// `(0, 0)` answer is unambiguous on the wire: `n=0` means "no such entry".
+///
+/// A selection scan rather than a sort: `LAD_TOPN` is 6 and only three ranks are printed, so this is
+/// 18 comparisons against the cost of moving the table around. Ties break toward the lower slot,
+/// which is the earlier-first-seen value.
+#[cfg(feature = "orinladder")]
+fn lad_hist_rank(hv: &[u32; LAD_TOPN], hc: &[u32; LAD_TOPN], rank: usize) -> (u32, u32) {
+    let mut taken = [false; LAD_TOPN];
+    let mut out = (0u32, 0u32);
+    for _ in 0..=rank {
+        let mut best = LAD_TOPN;
+        for s in 0..LAD_TOPN {
+            if taken[s] || hc[s] == 0 {
+                continue;
+            }
+            if best == LAD_TOPN || hc[s] > hc[best] {
+                best = s;
+            }
+        }
+        if best == LAD_TOPN {
+            return (0, 0);
+        }
+        taken[best] = true;
+        out = (hv[best], hc[best]);
+    }
+    out
+}
+
+/// ORIN-GLASSINK — does this `orin_glass_probe` verdict mean THIS CONSOLE'S TEXT reached the glass?
+///
+/// The single place that question is answered, because rung (b)'s ledger asks it too: `restore-blank`
+/// is derived from it, and a verdict added to the passing set without updating that derivation would
+/// turn a healthy anti-aliased restore into `FAIL reason=restore-blank`. Listed explicitly rather
+/// than matched on the `GLYPHS-` prefix: an adjudicator that admits verdicts it has never seen is not
+/// an adjudicator. Adding a passing verdict means adding it HERE, and the compiler will not remind
+/// you — this note is the reminder.
+#[cfg(feature = "orinladder")]
+fn lad_glass_painted(v: &str) -> bool {
+    matches!(
+        v,
+        "GLYPHS-ON-GLASS" | "GLYPHS-NO-CHROME" | "GLYPHS-AA-ON-GLASS" | "GLYPHS-AA-NO-CHROME"
+    )
+}
+
 /// **ORIN-GLASS — rung (a): the win=2 GLYPHS-ON-GLASS read-back.**
 ///
 /// The question, stated as the error it prevents. After boot7h the console window's evidence is
@@ -3443,9 +3662,19 @@ fn lad_on_panel(i: &crate::video::wm::WindowInfo) -> bool {
 /// | `UNREADABLE` | every sample fell outside the mapped length: the row's geometry and the panel's disagree. A defect, and one no present count could show |
 /// | `WIN2-NOT-ON-GLASS` | not ONE sample is the console's background. Whatever occupies those panel coordinates, it is not this window's surface |
 /// | `BLANK-NO-GLYPHS` | every sample IS the background: the surface reached the glass and its TEXT did not. The exact shape §3.9.1 could not rule out, and the one a present count can never see |
-/// | `INK-NO-STEM` | non-paper pixels inside the box, but not one fully covered stroke of the console's own ink: something is over the content that is not this console's text |
+/// | `GLYPHS-AA-NO-CHROME` | no fully covered stroke, but the ink population is a supermajority of PAPER→INK blends: anti-aliased text of this console's own colour, with the frame overdrawn |
+/// | `GLYPHS-AA-ON-GLASS` | the same blend supermajority with the frame intact. **Rung (a) closed on anti-aliased evidence** — `stem=0` here is a property of the face, not a defect |
+/// | `INK-OFF-COLOUR` | no stroke, no blend supermajority, and ONE off-ramp value holds a majority of the ink population. Text (or a fill) in a colour that is not `LAD_INK`; `ink1=` names the measured value. A finding about the CONSTANT, reported and not silently adopted |
+/// | `INK-NO-STEM` | non-paper pixels inside the box, but not one fully covered stroke of the console's own ink, no blend supermajority and no dominant colour: scattered foreign values — something is over the content that is not this console's text |
 /// | `GLYPHS-NO-CHROME` | the console's paper and its ink strokes are both on the glass, and the FRAME is not. Text landed, the window's own chrome was overdrawn — §3.8.1's measured JD2-blit overdraw, caught in the act |
 /// | `GLYPHS-ON-GLASS` | frame and glyphs both read back at panel coordinates. **This is rung (a) closed** |
+///
+/// THE INK FIELDS, and the reading each one settles. `paper + ink == read` and
+/// `stem + blend + off == ink` hold on every line, so a line that does not balance is a defect in the
+/// instrument and not in the panel. `blend` counts samples on the PAPER→INK segment (`lad_classify`),
+/// `off` counts non-paper values that are not on it, and `ink1..ink3`/`n1..n3` are the heaviest
+/// non-paper values with their counts (`n=0` = no such entry; `inkvals`/`exact` say whether the
+/// histogram had to start decrementing — see `lad_hist_add`).
 ///
 /// SAFETY AND COST. `read_pixel` is bounds-checked against the mapped length and answers `None`
 /// off-panel. The `wm` reads all happen BEFORE `WRITER` is taken and its guard is dropped in a single
@@ -3525,6 +3754,13 @@ pub fn orin_glass_probe(phase: &str) -> &'static str {
     let mut paper = 0usize;
     let mut ink = 0usize;
     let mut stem = 0usize;
+    // ORIN-GLASSINK — the three populations `ink` used to hide, and the heaviest values in it.
+    let mut blend = 0usize;
+    let mut off = 0usize;
+    let mut hv = [0u32; LAD_TOPN];
+    let mut hc = [0u32; LAD_TOPN];
+    let mut hdistinct = 0u32;
+    let mut hevict = 0u32;
     let mut first: u32 = 0;
     let mut got_first = false;
     let mut uniform = true;
@@ -3546,18 +3782,51 @@ pub fn orin_glass_probe(phase: &str) -> &'static str {
                     } else if v != first {
                         uniform = false;
                     }
-                    if v == LAD_PAPER {
-                        paper += 1;
-                    } else {
-                        ink += 1;
-                    }
-                    if v == LAD_INK {
-                        stem += 1;
+                    // ORIN-GLASSINK — one classification per sample, and every counter derived from
+                    // it. `paper`/`ink`/`stem` keep the exact meanings the wire has always given
+                    // them (`ink` is still "not exactly paper", strokes and blends included); the
+                    // arms below only split what `ink` was already counting.
+                    match lad_classify(v) {
+                        LAD_CLASS_PAPER => paper += 1,
+                        LAD_CLASS_STEM => {
+                            ink += 1;
+                            stem += 1;
+                            lad_hist_add(&mut hv, &mut hc, &mut hdistinct, &mut hevict, v);
+                        }
+                        LAD_CLASS_BLEND => {
+                            ink += 1;
+                            blend += 1;
+                            lad_hist_add(&mut hv, &mut hc, &mut hdistinct, &mut hevict, v);
+                        }
+                        _ => {
+                            ink += 1;
+                            off += 1;
+                            lad_hist_add(&mut hv, &mut hc, &mut hdistinct, &mut hevict, v);
+                        }
                     }
                 }
             }
         }
     }
+
+    // ORIN-GLASSINK — the two readings the ink population can support on its own, computed BEFORE the
+    // ladder so each one is a named statement rather than an expression buried in an `else if`.
+    //
+    // `ramp`: blends are a supermajority of the ink (`LAD_RAMP_NUM/DEN`) and there is at least one.
+    // On a black-paper panel nothing but a coverage blend of these two colours lands on that segment,
+    // so this is positive evidence of THIS console's own anti-aliased text — not merely the absence
+    // of a counter-example.
+    //
+    // `offdom`: the single heaviest non-paper value is OFF the ramp and holds a strict majority of
+    // the whole ink population. Majority-of-ink rather than majority-of-`off` on purpose: under
+    // Misra-Gries the count is a lower bound (`exact=no`), and a bound that clears the larger
+    // denominator clears the smaller one too, so the arm can never fire on a value that merely
+    // survived the table.
+    let (i1v, i1c) = lad_hist_rank(&hv, &hc, 0);
+    let (i2v, i2c) = lad_hist_rank(&hv, &hc, 1);
+    let (i3v, i3c) = lad_hist_rank(&hv, &hc, 2);
+    let ramp = blend != 0 && blend * LAD_RAMP_DEN >= ink * LAD_RAMP_NUM;
+    let offdom = i1c != 0 && (i1c as usize) * 2 > ink && lad_classify(i1v) == LAD_CLASS_OFF;
 
     // DERIVED, never asserted — the whole point of the line.
     let verdict = if read == 0 {
@@ -3567,19 +3836,36 @@ pub fn orin_glass_probe(phase: &str) -> &'static str {
     } else if paper == read {
         "BLANK-NO-GLYPHS"
     } else if stem == 0 {
-        "INK-NO-STEM"
+        // ORIN-GLASSINK — the bucket that used to be one answer and was three. Order matters:
+        // `ramp` is checked first because a blend supermajority is a POSITIVE identification of this
+        // console's colours and outranks any statement about a dominant foreign value.
+        if ramp {
+            if fread != 0 && fhit == fread {
+                "GLYPHS-AA-ON-GLASS"
+            } else {
+                "GLYPHS-AA-NO-CHROME"
+            }
+        } else if offdom {
+            "INK-OFF-COLOUR"
+        } else {
+            "INK-NO-STEM"
+        }
     } else if fread != 0 && fhit == fread {
         "GLYPHS-ON-GLASS"
     } else {
         "GLYPHS-NO-CHROME"
     };
     serial_println!(
-        "[oringlass] phase={} win={} box={}x{} at ({},{}) content={}x{} at ({},{}) scale={} onpanel={} frame={}/{} samples={} read={} paper={} ink={} stem={} first={:#08x} uniform={} -> {}",
+        "[oringlass] phase={} win={} box={}x{} at ({},{}) content={}x{} at ({},{}) scale={} onpanel={} frame={}/{} samples={} read={} paper={} ink={} stem={} blend={} off={} ink1={:#010x} n1={} ink2={:#010x} n2={} ink3={:#010x} n3={} inkvals={} exact={} first={:#08x} uniform={} -> {}",
         phase, i.id, ow, oh, ox, oy, cwp, chp, i.x, i.y, i.scale,
         if on_panel { "yes" } else { "PARKED" },
         fhit, fread,
         LAD_BANDS * LAD_RUNS * LAD_RUN,
-        read, paper, ink, stem, first,
+        read, paper, ink, stem, blend, off,
+        i1v, i1c, i2v, i2c, i3v, i3c,
+        hdistinct,
+        if hevict == 0 { "yes" } else { "no" },
+        first,
         if got_first && uniform { "yes" } else { "no" },
         verdict
     );
@@ -3769,7 +4055,12 @@ pub fn orin_ladder_census(tick: u64) {
                 LAD_DOCK_RESTORES.fetch_add(1, Ordering::Relaxed);
             }
             let glass = lad_glass_budgeted("restore");
-            let painted = glass == "GLYPHS-ON-GLASS" || glass == "GLYPHS-NO-CHROME";
+            // ORIN-GLASSINK — through `lad_glass_painted`, the ONE place "this console's text
+            // reached the glass" is decided, so the anti-aliased verdicts cannot be read here as a
+            // restore that painted nothing. `INK-OFF-COLOUR` deliberately stays OUTSIDE the painted
+            // set: a foreign colour in the box is not a confirmation of this console's text, and the
+            // `glass=` field on the line below names which of the two shapes it was.
+            let painted = lad_glass_painted(glass);
             if painted {
                 LAD_GOOD_RESTORES.fetch_add(1, Ordering::Relaxed);
             } else if glass != "BUDGET" && glass != "DECLINE" {
