@@ -2756,6 +2756,37 @@ static TEN_REAPED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32
 #[cfg(feature = "orintenant")]
 static TEN_REAP_PENDING: [core::sync::atomic::AtomicU32; 9] =
     [const { core::sync::atomic::AtomicU32::new(0) }; 9];
+/// **ORIN-TENANTFAULT — the per-ASID "this address space died on an EL0 fault" flag** (index = asid,
+/// 0 unused), set by `orin_tenant_note_el0_fault` from the EL0 fault handler and CONSUMED by
+/// `orin_tenant_note_reap_done` on the teardown that follows.
+///
+/// WHY A FLAG AND NOT A COUNTER AT FAULT TIME. The census's question is not "did anything at EL0
+/// fault this boot" — `el0-wild-write` and the whole M6b fixture cascade fault BY DESIGN and would
+/// swamp it. The question is "did a WINDOW TENANT die on a fault", and the only site that knows an
+/// ASID owned window rows is the teardown funnel, which runs afterwards. So the fault leaves a mark
+/// keyed by ASID, and the reap — which counts the rows — decides whether that mark meant a tenant.
+/// A faulting ASID that owned no rows clears its flag and is counted by nothing, which is exactly
+/// right: `el0-hello` and every non-window fixture stay off this instrument.
+///
+/// The flag is swapped (never merely stored) at both ends so a RECYCLED ASID cannot inherit a
+/// departed program's fault — the same recycled-slot hazard `clear_input_row` and the takeover-latch
+/// CAS in `clear_handle_row` are written against.
+#[cfg(feature = "orintenant")]
+static TEN_FAULT_ASID: [core::sync::atomic::AtomicBool; 9] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; 9];
+/// ORIN-TENANTFAULT — tenants (ASIDs that owned at least one window row) whose rows were reaped
+/// after an EL0 fault. Boot-scoped and STICKY on purpose: a crash that happened is a fact about this
+/// boot, and a later well-behaved tenant must not be able to retire it. Read by the census, where it
+/// outranks `TENANT-LIVE` for that reason.
+#[cfg(feature = "orintenant")]
+static TEN_FAULTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// ORIN-TENANTFAULT — EL0 faults seen by `orin_tenant_note_el0_fault` whose ASID was out of the
+/// flag table's range (`asid >= TEN_FAULT_ASID.len()`), i.e. faults this instrument structurally
+/// CANNOT attribute. Named on the census line rather than dropped: `orin_tenant_note_reap_row` has
+/// the same bound and drops the same way, so a boot that reaches those ASIDs must say that its
+/// close/reap accounting is incomplete instead of printing a clean verdict over a blind spot.
+#[cfg(feature = "orintenant")]
+static TEN_FAULT_UNATTRIB: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// ORIN-TENANT — census bookkeeping, `orinclick`'s shape: arm latch, last-census tick, sequence,
 /// and the CNTPCT reading at arm time.
 #[cfg(feature = "orintenant")]
@@ -2923,13 +2954,106 @@ pub fn orin_tenant_note_reap_done(asid: u64) {
     if (asid as usize) >= TEN_REAP_PENDING.len() {
         return;
     }
+    // ORIN-TENANTFAULT — consume the fault flag FIRST, and unconditionally, so it is cleared even on
+    // the `n == 0` return below. A faulting ASID that owned no windows must leave the flag table
+    // clean: otherwise the next program recycled into that slot would inherit the mark and its
+    // perfectly ordinary exit would be counted as a crash.
+    let faulted = TEN_FAULT_ASID[asid as usize].swap(false, Ordering::AcqRel);
     let n = TEN_REAP_PENDING[asid as usize].swap(0, Ordering::Relaxed);
     if n == 0 {
         return;
     }
     TEN_REAPED.fetch_add(n, Ordering::Relaxed);
+    // Rows AND a fault: this ASID was a window tenant and it did not leave on its own feet. One bump
+    // per TENANT, not per row — the census's `faults=` counts crashed programs, and a program that
+    // owned three windows crashed once.
+    if faulted {
+        TEN_FAULTS.fetch_add(1, Ordering::Relaxed);
+    }
     if TEN_LOGGED.fetch_add(1, Ordering::Relaxed) < TEN_LOG_MAX {
-        serial_println!("[orintenant] reap asid={} rows={} -> TENANT-REAPED (exit-path funnel: win_close_asid unmapped + freed, wm::close_owner retires the compositor rows next)", asid, n);
+        serial_println!(
+            "[orintenant] reap asid={} rows={} faulted={} -> {}",
+            asid, n, faulted as u8,
+            if faulted {
+                "TENANT-REAPED-AFTER-FAULT (the owner took an EL0 fault and was killed; the [orintenant] fault line above names the syndrome. These rows were reclaimed BY THE KERNEL, not surrendered by the program — this is the shape TENANT-EXITED-CLEAN used to swallow)"
+            } else {
+                "TENANT-REAPED (exit-path funnel: win_close_asid unmapped + freed, wm::close_owner retires the compositor rows next)"
+            }
+        );
+    }
+}
+
+/// **ORIN-TENANTFAULT — an EL0 fault reaches the tenant wire.** Called from
+/// `exceptions::aarch64_el0_fault_handler` (same-line append, per that file's PANIC-Location rule)
+/// after `record_el0_kill` and before `sched::exit()`, which never returns.
+///
+/// THE DEFECT THIS CLOSES. `orin_tenant_census`'s `TENANT-EXITED-CLEAN` fired on `closes=0 reaped=1`,
+/// so a tenant that CRASHED and a tenant that exited without closing its window produced the same
+/// PASS. The census could not tell them apart because nothing on the fault path was wired to it:
+/// `aarch64_el0_fault_handler` prints its `:: EL0 FAULT: … ::` line and routes the kill into
+/// `record_el0_kill`, whose every arm lands in an M6b/U-series fixture counter that the tenant rung
+/// does not read and must not read (those fixtures fault by design). The syndrome was therefore on
+/// the wire but not in the verdict, and a reader had to correlate two unrelated line families by eye.
+///
+/// WHAT IT PRINTS, and why each field. The tenant (`asid`, `name`, `pid` — the pid is the number
+/// `jobs` prints and `kill` takes, KEYSTAT's argument for putting it on the fault line at all); THE
+/// EL, both halves, MEASURED rather than asserted — `from-el` off `SPSR_EL1.M[3:2]` (the EL the
+/// exception was taken FROM) and `at-el` off `CurrentEL` (the EL it was taken AT) — because this
+/// vector is reachable only from a lower EL and a line that merely repeats that assumption is worth
+/// nothing when the assumption is what broke; and the syndrome (`esr` whole, `ec`/`iss` decoded,
+/// `elr`, `far`). `far` prints `--` unless the EC makes it architecturally valid, exactly as the
+/// handler's own line does: for every other EC it holds a stale value and printing it would be an
+/// invention.
+///
+/// LOCK AND CONTEXT DISCIPLINE — this runs at EL1 with DAIF masked on the faulting task's own kernel
+/// stack. It reads three system registers, touches one atomic, and prints. It takes NO kernel lock
+/// of its own: in particular it does not ask `orin_tenant_win_stats` how many rows this ASID owns,
+/// which would be a `WINDOWS` acquisition from a fault handler against a holder that could be
+/// mid-composite on another core. The row count is not needed here — `orin_tenant_note_reap_done`
+/// has it a few microseconds later, on the teardown this fault is about to cause, and that is where
+/// the fault is converted into a tenant verdict.
+///
+/// THE ASID comes from `TTBR0_EL1[63:48]`, one register read, because that IS the identity of the
+/// address space that faulted (`mmu_tegra_el0::slot_ttbr0` composes it as `l1_pa | (asid << 48)`).
+/// The alternative — a `current_asid()` accessor on `sched::Task` — would be a new public seam in a
+/// file this arc has no reason to touch, to recover a number the hardware is already holding.
+#[cfg(feature = "orintenant")]
+#[inline(never)] // cold (fault-path only), and a `bl` in the artifact is the reachability proof this family carries
+pub fn orin_tenant_note_el0_fault(name: &str, pid: u64, esr: u64, elr: u64, far: u64, far_valid: bool) {
+    use core::sync::atomic::Ordering;
+    let (ttbr0, spsr, cur): (u64, u64, u64);
+    unsafe {
+        core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("mrs {}, SPSR_EL1", out(reg) spsr, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("mrs {}, CurrentEL", out(reg) cur, options(nomem, nostack, preserves_flags));
+    }
+    let asid = (ttbr0 >> 48) & 0xFFFF;
+    // SPSR_EL1.M[3:0]: bit 4 clear == AArch64, and M[3:2] is then the EL the exception came from.
+    let from_el = (spsr >> 2) & 0b11;
+    let at_el = (cur >> 2) & 0b11;
+    let ec = (esr >> 26) & 0x3F;
+    let iss = esr & 0x1FF_FFFF;
+    if (asid as usize) < TEN_FAULT_ASID.len() {
+        TEN_FAULT_ASID[asid as usize].store(true, Ordering::Release);
+    } else {
+        TEN_FAULT_UNATTRIB.fetch_add(1, Ordering::Relaxed);
+    }
+    // NOT under TEN_LOG_MAX: the suppression budget exists to keep a chatty create/close/reap stream
+    // off a 115200-baud wire, and a fault is neither chatty nor routine. A tenant crash that went
+    // unprinted because three windows opened first is the exact failure this function was written to
+    // end. The EL0 fault path is already a dead end for the task — it cannot recur on this ASID.
+    if far_valid {
+        serial_println!(
+            "[orintenant] fault asid={} task='{}' pid={} from-el={} at-el={} esr={:#x} ec={:#04x} iss={:#x} elr={:#x} far={:#x} attributed={} -> TENANT-EL0-FAULT",
+            asid, name, pid, from_el, at_el, esr, ec, iss, elr, far,
+            ((asid as usize) < TEN_FAULT_ASID.len()) as u8
+        );
+    } else {
+        serial_println!(
+            "[orintenant] fault asid={} task='{}' pid={} from-el={} at-el={} esr={:#x} ec={:#04x} iss={:#x} elr={:#x} far=-- attributed={} -> TENANT-EL0-FAULT",
+            asid, name, pid, from_el, at_el, esr, ec, iss, elr,
+            ((asid as usize) < TEN_FAULT_ASID.len()) as u8
+        );
     }
 }
 
@@ -2939,14 +3063,49 @@ pub fn orin_tenant_note_reap_done(asid: u64) {
 /// prints on its own core off its own CNTPCT, so it cannot report liveness it does not have;
 /// `seq=` increments by one per line so a serial gap names itself.
 ///
+/// **THE FALSE PASS THIS LADDER USED TO CARRY (ORIN-TENANTFAULT).** `TENANT-EXITED-CLEAN` was
+/// documented as *"tenants existed and every one left through close/reap"* and tested as
+/// `creates != 0` with `rows == 0` — which is not that claim at all. It fired on `closes=0 reaped=1`:
+/// a program whose window was reclaimed BY THE KERNEL'S teardown funnel, having never called
+/// `SYS_WIN_CLOSE`, was reported as a clean exit. Three different histories printed the same PASS:
+/// the tenant closed its window and exited; the tenant exited (or was killed) without closing; the
+/// tenant CRASHED. The word "clean" was doing no work, because `reaped` — the counter that says the
+/// kernel had to clean up after the program — was not in the test.
+///
+/// Two changes close it. (1) The exit arms are split by `(closes, reaped)` rather than collapsed, so
+/// a surrender and a reclamation get different names. (2) `faults` — window tenants killed by an EL0
+/// fault, wired in by `orin_tenant_note_el0_fault` + `orin_tenant_note_reap_done` — becomes an INPUT,
+/// so the crash is discriminated by evidence from the fault path instead of being inferred from a
+/// row count that cannot see it.
+///
 /// Verdict ladder (first match wins), each reachable and none constant:
 ///   * `FAIL reason=geometry-refused`  — a create was refused over the cap: the pre-parity defect
 ///     observed live; must never print on a post-parity image running the shipped fixtures.
+///   * `FAIL reason=tenant-faulted`    — at least one window tenant was killed by an EL0 fault.
+///     ABOVE `TENANT-LIVE` and above the DECLINE, deliberately: the counter is boot-scoped and
+///     sticky, a crash that happened is a fact about this boot, and a later healthy tenant must not
+///     be able to retire it. A verdict that a survivor can mask is not a crash report.
 ///   * `DECLINE reason=headless-rows`  — creates succeeded but the compositor refused rows (no
 ///     panel, or `wm` table full): verbs green, glass empty, said out loud.
 ///   * `TENANT-LIVE`                   — at least one EL0-owned row is in the table NOW.
-///   * `TENANT-EXITED-CLEAN`           — tenants existed and every one left through close/reap.
 ///   * `IDLE-NO-TENANTS`               — nobody ran an EL0 window program. **UNRUN, never PASS.**
+///   * `FAIL reason=exit-unaccounted`  — every row is gone but `closes + reaped != creates`, so rows
+///     left by a path neither witness saw. A self-check on the instrument, not a claim about the
+///     panel, and it has a KNOWN live cause: `orin_tenant_note_reap_row` and `TEN_FAULT_ASID` are
+///     both bounded at 9 ASIDs and silently drop past it. On a boot that reaches those slots the
+///     accounting IS incomplete, and this arm says so rather than printing a clean verdict over the
+///     blind spot.
+///   * `TENANT-EXITED-CLEAN`           — `closes == creates`: every window was surrendered by its
+///     own owner through `SYS_WIN_CLOSE`. The kernel reclaimed nothing. **This is the only arm that
+///     now means what the name says.**
+///   * `TENANT-EXITED-UNCLOSED`        — `closes == 0`: no owner ever closed; every row was reclaimed
+///     by the exit-path funnel. NOT a failure on its own — a program may legally exit holding a
+///     window — but not a clean exit either, and it is the shape a crash also takes. Read it beside
+///     `faults=`: with `faults=0` this is a program that left its windows behind; with `faults != 0`
+///     the ladder never reaches here, because the FAIL arm above claimed it.
+///   * `TENANT-EXITED-PARTIAL`         — both counters nonzero: some windows surrendered, some
+///     reclaimed. Its own name because averaging it into either neighbour would hide whichever half
+///     is the defect.
 #[cfg(feature = "orintenant")]
 pub fn orin_tenant_census(tick: u64) {
     use crate::arch::aarch64::syscall as sc;
@@ -2975,21 +3134,38 @@ pub fn orin_tenant_census(tick: u64) {
     let logged = TEN_LOGGED.load(Ordering::Relaxed);
     let suppressed = logged.saturating_sub(TEN_LOG_MAX.min(logged));
 
+    // ORIN-TENANTFAULT — the two new inputs. `faults` is tenants (row-owning ASIDs) killed by an EL0
+    // fault; `unattrib` is faults this instrument could not key to an ASID at all (the 9-slot bound).
+    let faults = TEN_FAULTS.load(Ordering::Relaxed);
+    let unattrib = TEN_FAULT_UNATTRIB.load(Ordering::Relaxed);
+    // Every created row ends up either surrendered by its owner (`closes`) or reclaimed by the exit
+    // funnel (`reaped`); a closed row is freed and cannot then be reaped, so with `rows == 0` the two
+    // must sum to `creates`. `saturating_add` because the sum is a verdict input, not arithmetic to
+    // be trusted — a wrap here would silently produce a PASS.
+    let accounted = closes.saturating_add(reaped);
     let verdict = if refused != 0 {
         "FAIL reason=geometry-refused"
+    } else if faults != 0 {
+        "FAIL reason=tenant-faulted"
     } else if creates != 0 && headless != 0 {
         "DECLINE reason=headless-rows"
     } else if rows != 0 {
         "TENANT-LIVE"
-    } else if creates != 0 {
-        "TENANT-EXITED-CLEAN"
-    } else {
+    } else if creates == 0 {
         "IDLE-NO-TENANTS"
+    } else if accounted != creates {
+        "FAIL reason=exit-unaccounted"
+    } else if closes == creates {
+        "TENANT-EXITED-CLEAN"
+    } else if closes == 0 {
+        "TENANT-EXITED-UNCLOSED"
+    } else {
+        "TENANT-EXITED-PARTIAL"
     };
     serial_println!(
-        "[orintenant] census seq={} t={} up={}s rows={} bound={} creates={} headless={} refused={} closes={} reaped={} presents={} suppressed={} focus={:#x} pidesk={} -> {}",
-        seq, tick, up, rows, bound, creates, headless, refused, closes, reaped, presents,
-        suppressed, sc::user_input_active(), cfg!(feature = "pidesk") as u8, verdict
+        "[orintenant] census seq={} t={} up={}s rows={} bound={} creates={} headless={} refused={} closes={} reaped={} faults={} unattrib={} presents={} suppressed={} focus={:#x} pidesk={} -> {}",
+        seq, tick, up, rows, bound, creates, headless, refused, closes, reaped, faults, unattrib,
+        presents, suppressed, sc::user_input_active(), cfg!(feature = "pidesk") as u8, verdict
     );
 }
 
@@ -4448,4 +4624,395 @@ pub fn sup_present_census(tick: u64) {
         pushed, popped, pushed.wrapping_sub(popped), SUP_KEY_BACKPRESS.load(Relaxed), dropped,
         pass, flush, verdict
     );
+}
+
+
+// =================================================================================================
+// ORIN-RASTGLASS — the RAST cube's glass read-back. `rast`-gated (no new knob), DEFAULT OFF with it.
+// =================================================================================================
+//
+// THE DEFECT THIS ADDRESSES. `main.rs::tegra_rast_demo_maybe` is the only paint path on this arch
+// with NO read-back. It prints `:: RAST: tegra — first 3D pixels on the Orin panel ::`, blits ~180
+// frames through `Screen`, and returns — and every one of those statements is about what the code
+// DID, not about what is on the panel. So when the cube did not appear on boot7j
+// (flash/orin/boot7j-desktop-rast-ladder-20260826T0325Z-f0279b5), the wire could not distinguish
+// "RAST painted and something repainted over it" from "RAST never put a pixel on the glass". Both
+// produce exactly the same capture: the success line, the fps line, and no cube. ORIN-GLASSINK
+// (`orin_glass_probe`) already established the shape for the console window; this is the same
+// instrument pointed at the demo.
+//
+// WHY ONE SAMPLE CANNOT ANSWER IT, which is the whole design constraint. Overwritten and
+// never-painted are the SAME glass state: no RAST pixel present. A probe fired once, whenever, can
+// only report the state and would have to guess the history. So the read-back is a PAIR:
+//
+//   * `post`  — fired on the terminus line the instant `rast_demo::run` returns, on the same core,
+//               with nothing dispatched in between. This establishes whether the blit ever reached
+//               the scan-out at all. It is the "did we paint" half and nothing else can answer it.
+//   * `late`  — fired from `jd2_console_pump`'s idle sweep (`orin_rast_census`), after the pump has
+//               been running. This is the "did it survive" half.
+//
+// The three verdicts the brief asks for fall straight out of the pair, and only out of the pair:
+// `post` painted + `late` painted = SURVIVED; `post` painted + `late` not = OVERWRITTEN; `post` not
+// painted = NEVER-PAINTED, and no amount of `late` sampling can change that reading.
+//
+// THE DISCRIMINATOR is `rast_demo`'s own backdrop constant. `run` paints the WHOLE panel
+// `0x0010_1018` before it draws (rast_demo.rs:96, `screen.fill_screen`), then blits a 320x240 render
+// centred on it (`DEMO_W`/`DEMO_H`, rast_demo.rs:34-35, offsets rast_demo.rs:89-90). That constant
+// appears nowhere else in this tree — it is not `video::PANEL_BG` (`0x001E_1E1E`), not the console's
+// paper, not any theme colour — so an exact-equality test against it is a positive identification of
+// RAST's own paint, and any repaint by the compositor, the console window or the desktop shows up as
+// a foreign value rather than as a near-miss.
+//
+// ⚠ THE CONSTANTS ARE RESTATED, NOT IMPORTED, and that is the house convention rather than laziness:
+// `src/rast_demo.rs` is a SHARED KERNEL-CORE file outside this track's lane, and `DEMO_W`/`DEMO_H`/
+// the backdrop are private to it — importing them would mean a `pub` edit to a file this arc has no
+// grant for. `orin_glass_probe` restates `video/fbcon.rs`'s theme constants for exactly this reason
+// (see its own note at the ladder consts). The cost is a drift risk, and it is bounded in one
+// direction only: if `rast_demo` changes its backdrop, this probe reports `NO-RAST-INK` — it goes
+// BLIND, never falsely green. A restated constant that can only produce a false FAIL is an
+// acceptable seam; one that could produce a false PASS would not be.
+//
+// ⚠ THE `blevels` LESSON (3b1c19c2, ORIN-GLASSINK), applied here in its general form. That commit
+// found that a "fraction of samples matching the expected colour family" test PASSED on the desktop
+// showing through the window, because `PANEL_BG` happened to sit on the paper->ink ramp. The lesson
+// is not about ramps: it is that a single population can satisfy a coverage test for the wrong
+// reason. This probe therefore samples TWO populations with OPPOSITE expectations and requires both:
+//
+//   * SURROUND (outside the 320x240 render box) — must be RAST's backdrop and nothing else. This is
+//     the region `fill_screen` owns outright and the cube never touches, so any foreign pixel here
+//     is a repaint, full stop.
+//   * BOX (inside the render box) — must contain at least one NON-backdrop pixel, i.e. the cube
+//     actually drew. Without this arm a surround-only test would report `CUBE-ON-GLASS` on a boot
+//     where the fill landed and the rasteriser drew nothing at all — the identical class of
+//     false-PASS `blevels` closed, arrived at from the other side.
+//
+// Neither population alone is evidence. `RAST-FILL-NO-CUBE` is the named verdict for surround-yes /
+// box-no, so that state is REPORTED rather than folded into either neighbour.
+//
+// FOOTPRINT. Sampling is `LAD`-shaped: `RG_BANDS` rows x `RG_RUNS` contiguous runs of `RG_RUN`
+// pixels, per region, so the reads are locality-friendly on a WC aperture where every unaligned
+// volatile read is its own round trip (the GR17 cost model `read_pixel` documents). `WRITER` is
+// copied out and the guard dropped in one statement — `FrameBuffer` is `Copy` — so no `wm` call can
+// ever be made under it (ORIN-WM1's acyclic WRITER->TABLE rule). The `late` sample is budgeted and
+// periodic like `lad_glass_budgeted`'s: a suppressed sample returns `BUDGET`, which is deliberately
+// NOT in the passing set, because a sample that did not happen must never look like one that passed.
+
+/// ORIN-RASTGLASS — `rast_demo`'s backdrop, restated (rast_demo.rs:96). See the ⚠ note above.
+#[cfg(feature = "rast")]
+const RG_PAPER: u32 = 0x0010_1018;
+/// ORIN-RASTGLASS — `rast_demo`'s fixed render size, restated (rast_demo.rs:34-35). The blit is
+/// centred, `off = (panel - demo) / 2` (rast_demo.rs:89-90), and `run` SKIPS entirely when the panel
+/// is smaller than this — which is one of the never-painted histories this probe must be able to
+/// report, so the same numbers have to be here to locate the box at all.
+#[cfg(feature = "rast")]
+const RG_DEMO_W: usize = 320;
+#[cfg(feature = "rast")]
+const RG_DEMO_H: usize = 240;
+/// ORIN-RASTGLASS — the sampling grid, per region: `RG_BANDS` evenly spaced rows, `RG_RUNS`
+/// contiguous runs of `RG_RUN` pixels on each. 8*4*32 = 1024 samples per region, the same budget
+/// `orin_glass_probe` settled on.
+#[cfg(feature = "rast")]
+const RG_BANDS: usize = 8;
+#[cfg(feature = "rast")]
+const RG_RUNS: usize = 4;
+#[cfg(feature = "rast")]
+const RG_RUN: usize = 32;
+/// ORIN-RASTGLASS — the latched `post` verdict, as an index into `RG_VERDICTS`. `u8::MAX` == the
+/// probe has not run, which is itself a reportable state (`RAST-UNRUN`): `tegra_rast_demo_maybe`
+/// returns before the paint site on a headless boot, so an absent `post` means RAST declined and
+/// named its own reason on its own line.
+#[cfg(feature = "rast")]
+static RG_POST: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(u8::MAX);
+/// ORIN-RASTGLASS — census bookkeeping: last-census tick, sequence, and the `late` sample budget.
+#[cfg(feature = "rast")]
+static RG_CENSUS_TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "rast")]
+static RG_CENSUS_SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "rast")]
+static RG_LATE_TAKEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// ORIN-RASTGLASS — ~2 s between census lines (the sweep cadence is ~250 ms; `TEN_CENSUS_PERIOD`'s
+/// 40 is ~10 s). **The cadence is set by the window being measured, not by house habit, and copying
+/// the tenant census's 40 here would have made this rung answer nothing.** `jd2_console_pump`'s
+/// phase 1 — the interval between RAST returning and the console taking the panel — is bounded at 8
+/// s (`CNTFRQ_EL0 * 8`, main.rs) and ends early on the first keystroke, i.e. AT MOST 32 sweeps. A
+/// 40-sweep period cannot fire inside it, so every `late` sample would have been taken after the
+/// console legitimately owned the panel and the verdict would have been a constant
+/// `RAST-SUPERSEDED-BY-CONSOLE` — an instrument that reports the same answer on a healthy boot and
+/// a broken one. 8 sweeps gives 3-4 samples inside the window where the cube is supposed to be
+/// visible, which is the only window in which "something repainted over it" means anything.
+#[cfg(feature = "rast")]
+const RG_CENSUS_PERIOD: u64 = 8;
+/// ORIN-RASTGLASS — set on `jd2_console_pump`'s phase-2 boundary, the statement at which the console
+/// takes the panel for good. It is what separates the rung's two failure readings: the console
+/// painting over the cube AFTER this point is the design working, and before it is the defect.
+#[cfg(feature = "rast")]
+static RG_CONSOLE_OWNS: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+/// ORIN-RASTGLASS — the census's terminal latch. This rung asks a question with a final answer
+/// ("did the cube survive until the console took the panel"), unlike `orin_tenant_census`, whose
+/// liveness IS its report. Once the answer cannot change, the census says so once and stops rather
+/// than reprinting a settled verdict for the rest of the boot.
+#[cfg(feature = "rast")]
+static RG_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// ORIN-RASTGLASS — at most this many `late` read-backs for the whole boot. A read-back is ~2048
+/// volatile VRAM reads, each its own non-posted round trip on a WC aperture (the GR17 cost model
+/// `read_pixel` documents), so the budget is what keeps a periodic witness from becoming a periodic
+/// cost. `RG_DONE` is what actually bounds this rung — the census stops the moment its answer is
+/// settled — so the only path that spends budget is the unsettled one (cube still on the glass,
+/// console not yet in possession), which lasts at most phase 1: 8 s at a 2 s cadence, ~4 samples.
+/// 24 is therefore slack, not a working limit; it exists so a future caller on a different cadence
+/// still cannot turn this into an unbounded per-sweep VRAM read. If it is ever reached the census
+/// says `RAST-LATE-BUDGET` out loud rather than going quietly green.
+#[cfg(feature = "rast")]
+const RG_LATE_MAX: u32 = 24;
+
+/// ORIN-RASTGLASS — the glass-state verdicts, indexed by the `u8` latched in `RG_POST`. A table
+/// rather than `&'static str` plumbing because the `post` verdict has to survive in an atomic until
+/// the census reads it, and an index that names a slot in this array cannot be a string that names
+/// nothing.
+#[cfg(feature = "rast")]
+const RG_VERDICTS: [&str; 6] = [
+    "CUBE-ON-GLASS",     // 0 — surround is all backdrop AND the box carries the cube's ink
+    "RAST-FILL-NO-CUBE", // 1 — the fill landed, the rasteriser drew nothing into the box
+    "RAST-PARTIAL",      // 2 — surround is part backdrop, part foreign: a partial repaint
+    "NO-RAST-INK",       // 3 — not one backdrop pixel in the surround
+    "UNREADABLE",        // 4 — read_pixel returned None everywhere (no panel / unmapped)
+    "BUDGET",            // 5 — the sample was suppressed; NEVER in the passing set
+];
+
+/// ORIN-RASTGLASS — the passing set, the single adjudicator, listed explicitly. `orin_glass_probe`'s
+/// `lad_glass_painted` states the rule this follows: *an adjudicator that admits verdicts it has
+/// never seen is not an adjudicator* — so no prefix match, and a verdict added to `RG_VERDICTS`
+/// without a decision made here is an omission a reader can see rather than a silent PASS.
+///
+/// `RAST-FILL-NO-CUBE` IS in the set, and the choice is load-bearing: this predicate answers *"did
+/// RAST's paint reach the scan-out"*, which is the question the SURVIVED/OVERWRITTEN split turns on.
+/// Whether the cube itself drew is a different defect, reported by the verdict string on its own
+/// line and never averaged into this one.
+#[cfg(feature = "rast")]
+fn rg_painted(v: u8) -> bool {
+    matches!(v, 0 | 1)
+}
+
+/// ORIN-RASTGLASS — sample one axis-aligned region and return `(read, paper, foreign)`.
+///
+/// `read` counts only samples `read_pixel` actually returned, so `read == 0` is a real, separable
+/// answer ("nothing was readable") and never a silent zero folded in with the others. `paper` is
+/// EXACT equality with [`RG_PAPER`] — no tolerance, because the backdrop is a flat fill written
+/// through the same `put_pixel` encoding `read_pixel` inverts, so an exact round trip is the
+/// specified behaviour and anything else is a different pixel, not a noisy one.
+///
+/// The `FrameBuffer` is borrowed from the caller's own copy: `WRITER` is already released, and
+/// nothing here may take a lock.
+#[cfg(feature = "rast")]
+fn rg_sample(
+    fb: &crate::video::FrameBuffer,
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+) -> (usize, usize, usize) {
+    let (mut read, mut paper, mut foreign) = (0usize, 0usize, 0usize);
+    if w == 0 || h == 0 {
+        return (0, 0, 0);
+    }
+    let run = RG_RUN.min(w);
+    for b in 0..RG_BANDS {
+        // Band CENTRES, so a region shorter than RG_BANDS still spreads its samples instead of
+        // stacking them all on row 0.
+        let y = y0 + (2 * b + 1) * h / (2 * RG_BANDS);
+        for r in 0..RG_RUNS {
+            let centre = x0 + (2 * r + 1) * w / (2 * RG_RUNS);
+            // Clamp the run inside the region: a run that walked out of the box would sample the
+            // neighbouring population and quietly mix the two.
+            let start = centre
+                .saturating_sub(run / 2)
+                .max(x0)
+                .min((x0 + w).saturating_sub(run));
+            for i in 0..run {
+                if let Some(v) = fb.read_pixel(start + i, y) {
+                    read += 1;
+                    if v == RG_PAPER {
+                        paper += 1;
+                    } else {
+                        foreign += 1;
+                    }
+                }
+            }
+        }
+    }
+    (read, paper, foreign)
+}
+
+/// **ORIN-RASTGLASS — read the panel back and say what is on it.** Returns the `RG_VERDICTS` index.
+///
+/// `phase` is the caller's label (`"post"` from the terminus line, `"late"` from the pump sweep) and
+/// appears on the wire, so two lines with the same verdict are never confusable for one repeated
+/// sample.
+///
+/// The verdict is DERIVED from the two populations, never asserted: the emitted line carries every
+/// count it was computed from, and `paper + foreign == read` holds for each region on every line. A
+/// line that does not balance is a defect in this instrument, not on the panel — `orin_glass_probe`'s
+/// standing rule, restated because it is the only way a reader can audit the ladder from a capture.
+#[cfg(feature = "rast")]
+pub fn orin_rast_glass(phase: &str) -> u8 {
+    // WRITER copied out and released in one statement (ORIN-WM1's rule); nothing below takes a lock.
+    let fb = *crate::video::WRITER.lock();
+    if !fb.is_ready() {
+        serial_println!("[orinrast] phase={} -> NO-RAST-INK reason=no-panel (JD1 seeded no scanout; there is no glass to read, and tegra_rast_demo_maybe named the same condition on its own line). No panel is not painted — this must never adjudicate as painted", phase);
+        return 3;
+    }
+    let i = fb.info();
+    let (pw, ph) = (i.width, i.height);
+    if pw < RG_DEMO_W || ph < RG_DEMO_H {
+        // The panel is smaller than the render, which is exactly the arm `rast_demo::run` takes when
+        // it prints "panel too small" and returns WITHOUT painting. There is no box to sample and no
+        // paint to look for; say so rather than reporting an empty surround as a repaint.
+        serial_println!("[orinrast] phase={} panel={}x{} demo={}x{} -> NO-RAST-INK reason=panel-too-small (rast_demo::run skips below this geometry and paints nothing at all — never-painted, not overwritten)", phase, pw, ph, RG_DEMO_W, RG_DEMO_H);
+        return 3;
+    }
+    let (bx, by) = ((pw - RG_DEMO_W) / 2, (ph - RG_DEMO_H) / 2);
+    // SURROUND: the full-width strip ABOVE the render box. It is entirely owned by `fill_screen` and
+    // the cube can never reach it, so it is the cleanest available witness for the backdrop — and it
+    // is one contiguous rectangle, which keeps the sampler simple enough to audit. (A panel exactly
+    // 240 rows tall has no strip; `rg_sample` returns `(0,0,0)` for a zero-height region and the
+    // `read == 0` arm below reports UNREADABLE rather than inventing a verdict.)
+    let (s_read, s_paper, s_foreign) = rg_sample(&fb, 0, 0, pw, by);
+    let (b_read, b_paper, b_foreign) = rg_sample(&fb, bx, by, RG_DEMO_W, RG_DEMO_H);
+    // DERIVED, never asserted. Order matters: UNREADABLE outranks everything (an unread panel makes
+    // no claim), then the surround decides whether RAST's fill is on the glass, and only inside the
+    // "fill is intact" arm does the box get to say whether the cube drew. Reversing those two would
+    // let a box full of foreign console pixels satisfy the "the cube drew" test.
+    let v: u8 = if s_read == 0 && b_read == 0 {
+        4 // UNREADABLE
+    } else if s_paper == 0 {
+        3 // NO-RAST-INK
+    } else if s_foreign != 0 {
+        2 // RAST-PARTIAL
+    } else if b_foreign == 0 {
+        1 // RAST-FILL-NO-CUBE
+    } else {
+        0 // CUBE-ON-GLASS
+    };
+    serial_println!(
+        "[orinrast] phase={} panel={}x{} box={}x{} at ({},{}) paper={:#010x} surround read={} paper={} foreign={} box read={} paper={} foreign={} painted={} -> {}",
+        phase, pw, ph, RG_DEMO_W, RG_DEMO_H, bx, by, RG_PAPER,
+        s_read, s_paper, s_foreign, b_read, b_paper, b_foreign,
+        rg_painted(v) as u8, RG_VERDICTS[v as usize]
+    );
+    v
+}
+
+/// ORIN-RASTGLASS — the `post` sample: fired from `tegra_rast_demo_maybe`'s terminus line the instant
+/// `rast_demo::run` returns, and LATCHED. Nothing is dispatched on this core between the last blit
+/// and this read, so it is the one measurement that can establish whether RAST's paint ever reached
+/// the scan-out — every later sample can only report the state it finds.
+#[cfg(feature = "rast")]
+pub fn orin_rast_glass_post() {
+    use core::sync::atomic::Ordering;
+    let v = orin_rast_glass("post");
+    RG_POST.store(v, Ordering::Release);
+}
+
+/// **ORIN-RASTGLASS — the ~10 s census, from `jd2_console_pump`'s idle sweep** (appended line-neutral
+/// beside `orin_tenant_census`'s call). It takes the `late` sample and combines it with the latched
+/// `post` into the lifecycle verdict — the answer to "why did the cube not appear".
+///
+/// Lifecycle ladder (first match wins), each reachable and none constant:
+///   * `RAST-UNRUN`                — no `post` sample was ever latched, so `tegra_rast_demo_maybe`
+///     returned before its paint site: a headless boot, or `rast` armed on an image with no scanout.
+///     **UNRUN, never PASS** — `orin_tenant_census`'s `IDLE-NO-TENANTS` discipline.
+///   * `RAST-NEVER-PAINTED`        — `post` says RAST's backdrop was not on the glass immediately
+///     after `run` returned. Nothing had a chance to repaint in that window, so this is not a race:
+///     the blit did not reach the scan-out. **No `late` sample can revise this**, which is why the
+///     arm sits above both survival arms rather than being combined with them.
+///   * `RAST-LATE-BUDGET`          — the `late` read-back was suppressed by the budget. Its own arm,
+///     never a passing one, for the reason `lad_glass_budgeted` states: a sample that did not happen
+///     must not look like a sample that passed.
+///   * `RAST-LATE-UNREADABLE`      — `post` painted but the `late` read returned nothing at all. NOT
+///     folded into OVERWRITTEN: an unreadable panel is a broken measurement, and reporting a broken
+///     measurement as a detected overwrite would be the same overclaim this rung exists to remove.
+///   * `RAST-PAINTED-SURVIVED`     — `post` painted and `late` still finds it, with the console not
+///     yet in possession of the panel. The cube is on the glass; if it was not SEEN, the fault is
+///     downstream of the scan-out (DCE, cable, panel), not in this kernel's paint path.
+///   * `RAST-PAINTED-OVERWRITTEN`  — `post` painted, `late` does not, and **the console had not yet
+///     taken the panel**. Something repainted the cube away inside the window where it was supposed
+///     to be visible. This is the verdict that would have named boot7j's failure, and the only arm
+///     that indicts a repainter.
+///   * `RAST-SUPERSEDED-BY-CONSOLE` — `post` painted, `late` does not, and the console HAS taken the
+///     panel (`jd2_console_pump` phase 2). The design working as specified, not a defect — and it is
+///     a separate arm precisely because folding it into `RAST-PAINTED-OVERWRITTEN` would make that
+///     verdict fire on every healthy boot and therefore mean nothing.
+#[cfg(feature = "rast")]
+pub fn orin_rast_census(tick: u64) {
+    use core::sync::atomic::Ordering;
+    // Terminal: the question has a final answer and it has been given. Checked before the cadence so
+    // a settled rung costs one relaxed load per sweep and nothing else.
+    if RG_DONE.load(Ordering::Acquire) {
+        return;
+    }
+    // Cadence decided next, off the tick alone — rung 3's footprint rule. The panel is touched only
+    // on the ~1-in-8 pass that prints, and even then only while budget remains.
+    if tick.wrapping_sub(RG_CENSUS_TICK.load(Ordering::Relaxed)) < RG_CENSUS_PERIOD {
+        return;
+    }
+    RG_CENSUS_TICK.store(tick, Ordering::Relaxed);
+    let seq = RG_CENSUS_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    let post = RG_POST.load(Ordering::Acquire);
+    let owns = RG_CONSOLE_OWNS.load(Ordering::Acquire);
+    // The `post` sample decides whether a `late` read is worth its ~2048 VRAM round trips at all: if
+    // RAST never painted, no amount of later sampling changes the verdict. Index 5 stands for "not
+    // taken" on those paths, and the ladder below never reads it there.
+    let late = if post == u8::MAX || !rg_painted(post) {
+        5
+    } else if RG_LATE_TAKEN.fetch_add(1, Ordering::Relaxed) >= RG_LATE_MAX {
+        5
+    } else {
+        orin_rast_glass(if owns { "late-console" } else { "late" })
+    };
+    let verdict = if post == u8::MAX {
+        "RAST-UNRUN"
+    } else if !rg_painted(post) {
+        "RAST-NEVER-PAINTED"
+    } else if late == 5 {
+        "RAST-LATE-BUDGET"
+    } else if late == 4 {
+        "RAST-LATE-UNREADABLE"
+    } else if rg_painted(late) {
+        "RAST-PAINTED-SURVIVED"
+    } else if owns {
+        "RAST-SUPERSEDED-BY-CONSOLE"
+    } else {
+        "RAST-PAINTED-OVERWRITTEN"
+    };
+    // The ONE non-terminal state is "still on the glass, console not yet in possession" — the only
+    // reading a later sample can still change. Everything else is settled: RAST never painted, the
+    // cube is already gone, the console has taken over, or the budget is spent.
+    if !(rg_painted(post) && !owns && rg_painted(late)) {
+        RG_DONE.store(true, Ordering::Release);
+    }
+    serial_println!(
+        "[orinrast] census seq={} t={} post={} late={} console-owns={} conwin={} pidesk={} final={} -> {}",
+        seq, tick,
+        if post == u8::MAX { "UNRUN" } else { RG_VERDICTS[post as usize] },
+        RG_VERDICTS[late as usize],
+        owns as u8,
+        cfg!(feature = "orinconwin") as u8,
+        cfg!(feature = "pidesk") as u8,
+        RG_DONE.load(Ordering::Acquire) as u8,
+        verdict
+    );
+}
+
+/// ORIN-RASTGLASS — the console has taken the panel. Called from `jd2_console_pump`'s phase-2
+/// boundary (same-line append), which is where the console stops waiting and starts owning the
+/// glass for the rest of the boot. Idempotent; one relaxed store.
+///
+/// This is the timestamp the whole rung's failure reading turns on: after it, the console painting
+/// over the cube is the specified behaviour (`RAST-SUPERSEDED-BY-CONSOLE`); before it, the same
+/// glass state is a defect (`RAST-PAINTED-OVERWRITTEN`). Without the latch the census could only
+/// report that the cube was gone, which on a healthy boot is always true eventually.
+#[cfg(feature = "rast")]
+pub fn orin_rast_console_owns() {
+    RG_CONSOLE_OWNS.store(true, core::sync::atomic::Ordering::Release);
 }

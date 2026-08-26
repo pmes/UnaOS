@@ -808,6 +808,6 @@ extern "C" fn aarch64_el0_fault_handler() -> ! {
             elr
         );
     }
-    super::syscall::record_el0_kill(name, ec, far, far_valid);
+    super::syscall::record_el0_kill(name, ec, far, far_valid); #[cfg(feature = "orintenant")] super::display_tegra::orin_tenant_note_el0_fault(name, pid, esr, elr, far, far_valid); // ORIN-TENANTFAULT: the tenant-rung witness, so a crashed WINDOW OWNER is discriminable from a graceful exit (`orin_tenant_census`'s TENANT-EXITED-CLEAN fired on closes=0 reaped=1 either way). Placed AFTER `record_el0_kill` — that call's early-return arms are what route each fixture family to its own counter, and this one must not perturb them — and BEFORE `sched::exit()`, which never returns. Reads TTBR0_EL1/SPSR_EL1/CurrentEL and one atomic; takes no lock (see its doc). Line-NEUTRAL per this file's PANIC-Location rule.
     super::sched::exit()
 }
