@@ -5106,7 +5106,7 @@ pub fn timer_preempt() {
         SCHED[cpu].quantum.store(remaining - 1, Ordering::Relaxed);
         return;
     }
-    SCHED[cpu].quantum.store(0, Ordering::Relaxed);
+    SCHED[cpu].quantum.store(0, Ordering::Relaxed); #[cfg(feature = "supstate")] crate::arch::display_tegra::sup_note_preempt(); // ORIN-SUPSOUND — count the QUANTUM EXPIRY here and nowhere else: `ctx +N/win` conflates a voluntary `yield_now` with an involuntary preemption, and the whole SUPSTATE x BSPRUN hazard argument turns on which of the two happened. Reached only past the `SCHED_ACTIVE` gate at the top, so `preempt=+0` on the `[suppresent]` census is POSITIVE proof that the flight exercised the COOPERATIVE core and tested none of the preemption hazards. One relaxed atomic add in IRQ context — no lock, no print, no allocation. APPENDED to an existing line and `supstate`-gated, so the knob-off image is byte-identical and not one panic `Location` in this file moves.
     unsafe {
         (*raw).state.store(STATE_READY, Ordering::Release);
         switch_context(
@@ -10394,3 +10394,150 @@ pub fn run_bsp_tegra(cpu: usize) -> ! {
 compile_error!(
     "ORIN-BSPRUN requires ORIN-BSPTICK: `bsprun` without `bsptick` sets SCHED_ACTIVE with no EL1 periodic tick to drive timer_preempt — arm via UNAOS_BSPRUN=1 (arroyo folds bsptick in), or add `bsptick` to the feature list."
 );
+
+// ── ORIN-SUPSOUND — the re-derivation ORIN-BSPRUN's own comment demanded ─────────────────────────
+//
+// The hazard block above ends with a condition, not a conclusion: *"on this terminus every other
+// core-0 task (`el0-hello`, `tegra-el0-verdict`, CAPSTONE) touches no video state, so there is no
+// contender to deadlock with today; the arc that adds a second video-touching task to core 0 must
+// re-derive this."* ORIN-SUPSTATE is that arc. It spawns TWO new core-0 tasks that touch video
+// state — `jd2-present` and `jd2-dispatch` (main.rs, `jd2_supstate_phase2`) — so BSPRUN's premise
+// is falsified and the argument has to be rebuilt rather than inherited. This block is that
+// rebuild, kept beside the argument it replaces so the next reader finds both. Appended at the file
+// tail behind no `#[cfg]` because it is comment only: not one byte of any image moves.
+//
+// **VERDICT: SOUND.** Not "sound-if", not "sound in QEMU": the wedge these two arcs are each afraid
+// of cannot form on this tree, and the residual is a QUANTITY (contention rate), not a property.
+// The reasoning is below, by lock, with the counter-example each step would need in order to fail.
+//
+// ── 0. FIRST, A CORRECTION TO THE CITATION THIS RE-DERIVATION WAS ASKED FOR ──────────────────────
+//
+// The bare `crate::video::WRITER.lock()` at `pal.rs:565` — cited as the presenter's exposure — is
+// inside `pal::cursor::track_routed`, which carries `#[cfg(target_arch = "x86_64")]`. It is not
+// compiled on this board and neither SUPSTATE role can reach it. The real chain is four frames
+// deeper and does not belong to SUPSTATE at all:
+//
+//     main.rs jd2_supstate_presenter -> pal.render()
+//       -> pal.rs:2161      TargetPal::render        -> self.surface.flush()
+//       -> screen.rs:1001   Screen::flush            -> wm::repaint() / wm::service_damage()
+//       -> wm.rs:3080/3471                           -> wm::composite()
+//       -> wm.rs:4232/4787  composite/composite_inner-> `let fb = *super::WRITER.lock();`
+//                                                       (wm.rs:4865, 4930, 4986, 5169)
+//
+// and, on `Screen::flush`'s cursor bracket, `video::cursor::undraw()`/`repaint()` — which take the
+// panel through `super::panel_snapshot()` (cursor.rs:1828, 2772), i.e. through LOCKFIX's own door
+// already. **The decisive fact: the LEGACY monolithic pump reaches the identical chain.** Its
+// phase-2 loop runs the same `cursor::restore` / `move_rel` / `draw_over` / `pal.render()` sequence
+// at main.rs:2949-2970. ORIN-SUPSTATE moves that code between task identities; it introduces NO new
+// `WRITER` acquisition anywhere. Whatever exposure the panel lock carries on this board is
+// ORIN-BSPRUN's alone and predates SUPSTATE by every commit in the arc.
+//
+// ── 1. WHAT PREEMPTION ACTUALLY DOES TO A HELD LOCK ──────────────────────────────────────────────
+//
+// `timer_preempt` (this file, ~:5071) does not abandon the incumbent: past the quantum countdown it
+// stores `STATE_READY` and `switch_context`s to the scheduler, which REQUEUES the task. A holder
+// caught off-CPU mid-hold is therefore a task that WILL be re-dispatched, on the next pass through
+// `run()`. So the only question a preempted holder raises is how long the machine burns before it
+// runs again — never whether it runs again.
+//
+// The failure that is NOT bounded is LOCKFIX's, stated once in `video/mod.rs` under `WRITER`: *"a
+// raw panel lock ... may not be blocked on from a context that cannot be preempted."* A MASKED
+// waiter can take no timer interrupt, so it can never be preempted off the core the holder needs;
+// holder and waiter are then permanently interlocked on one core. That is boot 8. It needs BOTH
+// halves — a preemptible holder AND a masked blocking waiter behind it.
+//
+// **The second half has no supplier in this tree, and that is measured rather than argued.** Of the
+// 86 blocking `WRITER.lock()` sites and 7 `try_lock` sites, a scan of the 25 source lines preceding
+// every one of the 86 finds not one inside an `IrqMask::new()` or `without_interrupts(` scope. Both
+// helpers that DO acquire the panel while masked — `panel_info_nonblocking` (video/mod.rs:214) and
+// `panel_snapshot`'s masked arm (video/mod.rs:239) — are `try_lock` and degrade instead of waiting.
+// And no tegra IRQ handler reaches `WRITER` at all: on this board the console is not routed through
+// `wm` (`fbcon`'s route is `all(x86_64, wc)` or `all(aarch64, pidesk)`, and neither is armed here),
+// so the IRQ-context printer's panel path does not exist. A masked spinner on `WRITER` would be a
+// NEW defect someone had to write; none is present.
+//
+// What remains is an unmasked waiter spinning on a preempted holder. Its quantum expires
+// (`QUANTUM_TICKS = 3` at ~4 ms/tick, this file :196 / :4185), `timer_preempt` requeues it, the
+// holder is re-dispatched, the lock is released. **Bounded: ~12 ms of wasted core per contention.**
+// The sibling executor's guess — "the bare-lock spin gets broken by the quantum and degrades to a
+// spin-storm rather than a livelock" — is CONFIRMED in its conclusion. Its mechanism is only half
+// the story, though: the quantum breaking the spin is what bounds the cost, but what makes the
+// LIVELOCK impossible is the separate, stronger fact that the unbreakable (masked) spin has no call
+// site. `preempt=` and `surfwait=` on the `[suppresent]` census are what put the cost on the wire.
+//
+// ── 2. LOCK BY LOCK, EVERY MUTEX THE TWO NEW TASKS CAN REACH ─────────────────────────────────────
+//
+// * `wm::TABLE` — SAFE BY CONSTRUCTION, and it was already built for this. `fn table()`
+//   (wm.rs:440) masks BEFORE the acquire and, by struct-field declaration order, releases the lock
+//   BEFORE restoring the mask. It is the ONLY acquisition path (the module documents the grep and
+//   it still holds: one `TABLE.lock()` at wm.rs:444, plus two `try_lock` sites at :3313 and :23293
+//   that never block). So no TABLE holder is ever preemptible: the masked blocking acquire can
+//   never meet a preempted holder on its own core. WEDGE-7 wrote this rule for a preemptible world
+//   that x86 already had; ORIN-BSPRUN is aarch64 arriving in it.
+// * `pal::cursor::POS` — SAFE, by POSFIX's mask-everywhere rule (pal.rs:196-224, both takers inside
+//   `without_interrupts`, both critical sections constant-time). Same property as TABLE.
+// * `video::cursor::SPRITE_FREE` / `OVERLAY_FREE` — SAFE. Every claim is masked and NON-BLOCKING
+//   (`claim`, `claim_bounded` — which refuses outright when `arch::irqs_masked()`, cursor.rs:405 —
+//   `overlay_claim`). A refusal takes `owe_repaint`, never a wait.
+// * `pal::cursor::SAVED` and `screen::PRESENT_RECTS` — the only two locks the presenter and the
+//   dispatcher can genuinely contend, and the only ones where preemption changes anything. Both are
+//   bare, unmasked, short (a bounded pixel loop; an 8-entry rect scan), and — the load-bearing
+//   part — EVERY taker is unmasked. A preempted holder therefore meets only unmasked spinners, and
+//   §1's bound applies. This is the whole of the newly-created hazard, and it is a cost, not a wedge.
+// * `SUP_SURFACE` / `SUP_KEYQ` / `SUP_FRAMES` — `try_lock` + `yield_now` at every acquisition
+//   (display_tegra.rs `sup_lock`, `sup_with_surface`, `sup_install`). Never a spin at all.
+//
+// ── 3. ORDERING: NO CYCLE, AND THE CLAIM IS CHECKED RATHER THAN ASSERTED ─────────────────────────
+//
+// SUPSTATE declares `SURFACE -> WRITER -> TABLE` and says nothing holding WRITER or TABLE ever
+// takes SURFACE. That is checkable, because SURFACE is private to one module and reached only
+// through six `pub fn`s: `grep -rn 'sup_with_surface\|sup_install\|sup_key_\|sup_frame_'` over the
+// kernel returns display_tegra.rs itself and the three role bodies in main.rs, and nothing else in
+// the tree. No `WRITER`-holding or `TABLE`-holding path can call one. The order is acyclic, and
+// ORIN-BSPRUN adds no edge to it — preemption reorders execution, it does not create acquisitions.
+//
+// ── 4. THE DIRECTION NOBODY EXPECTED: BSPRUN MAKES SUPSTATE SAFER, NOT RISKIER ────────────────────
+//
+// SUPSTATE's module header states its own precondition as plainly as BSPRUN's does: *"Core 0 has NO
+// preemption (F4), so a bare `lock()` spin against a holder that yielded would be a LIVELOCK."*
+// That is a statement about a COOPERATIVE core, and ORIN-BSPRUN falsifies it in the safe direction.
+// Two consequences, both in SUPSTATE's favour:
+//   * the `try_lock`+`yield_now` discipline SUPSTATE describes as "defence, not load-bearing"
+//     remains defence — the thing it was defending against is the failure BSPRUN removes;
+//   * BSPRUN's `drain_due_sleepers` on core 0 retires a livelock SUPSTATE ALONE could not survive:
+//     a lock holder that blocks on this core was parked forever pre-BSPRUN (sched.rs's own ":3080"
+//     complaint), so any bare-lock waiter behind it waited forever too. Under BSPRUN the sleeper
+//     wakes and the waiter is released.
+// So the two arcs' preconditions each falsify the other's, and the resolution is not symmetric: the
+// combination is strictly better than SUPSTATE alone. A flight that arms SUPSTATE WITHOUT BSPRUN is
+// the weaker configuration, and the census says which one flew (`preempt=+0` means cooperative).
+//
+// ── 5. WHAT THIS DERIVATION DOES *NOT* DISPOSE OF — WHO MAY PAINT ────────────────────────────────
+//
+// Everything above is a LIVENESS argument. `WRITER` guards the framebuffer HANDLE and nothing more:
+// `FrameBuffer` is `Copy`, and both `*WRITER.lock()` and `panel_snapshot()` copy the handle and drop
+// the guard on the spot, so from that instant the pixels are written UNSERIALISED. Routing an
+// acquisition through LOCKFIX's doors closes the wedge; it grants no exclusion. "Who may paint" is a
+// separate mechanism at a higher layer, and it is a CORRECTNESS question (torn pixels), not a
+// deadlock one.
+//
+// On this board that mechanism exists and ORIN-SUPSTATE is what built it: **`SUP_SURFACE` is the
+// paint token.** Every `TargetPal` in the armed roles is constructed INSIDE a `sup_with_surface`
+// closure (main.rs: the dispatcher's and the presenter's, and they are the only two after the lift),
+// and the lock is held across the whole paint *including* `pal.render()` — including, by the arc's
+// one deliberate exception, across `handle_key`'s full-screen commands. Presenter and dispatcher
+// therefore cannot paint concurrently, with each other or with the input source, under preemption or
+// without it. That is STRICTLY STRONGER than what the legacy pump had, which was exclusion by stack
+// locality — a property no mutex enforced and no successor could inherit. Painters outside the token
+// (the compositor's own window blits, EL0 tenants through the present seam) are ordered by the
+// pre-existing `wm` layering, which this arc does not touch.
+//
+// ── 6. THE RESIDUAL, AND WHAT METAL MUST PRINT TO CLOSE IT ───────────────────────────────────────
+//
+// UNDECIDABLE WITHOUT METAL, and it is a quantity: **how often the newly-possible contention on
+// `SAVED`/`PRESENT_RECTS` actually happens, and what it costs.** QEMU models no Tegra234 and
+// delivers no HID, so the presenter's board is empty there and the contention rate is structurally
+// zero on every gate this tree can run. The three numbers that decide it are on the `[suppresent]`
+// census: `preempt=` (is preemption even armed), `surfwait=`/`seamwait=` (did a role ever have to
+// give the core back), and `pass=`/`flush=` (did the presenter keep up). A flight reading
+// `preempt=+0` has tested the cooperative core only and decides nothing about this section.

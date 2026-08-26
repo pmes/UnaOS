@@ -7153,7 +7153,7 @@ fn jd2_supstate_phase2(
         // VUGRAS writeback sweep + the ORIN-CLICK census, on the cadence phase 1 advanced.
         if cntpct().wrapping_sub(last_sweep) >= sweep_ticks {
             last_sweep = cntpct();
-            unaos_kernel::vugras::idle_sweep(sweep_tick);
+            unaos_kernel::vugras::idle_sweep(sweep_tick); unaos_kernel::arch::display_tegra::sup_present_census(sweep_tick); // ORIN-SUPSOUND — the ~10 s presenter census, authored by the INPUT SOURCE on purpose: this board's UART is shared with the SPE's TCU and drops bytes, so a dead presenter must produce a REPEATING LINE (`pass=+0 -> DEAD`), never a silence. Appended to an existing statement, and un-`#[cfg]`ed because this whole block is already `supstate`-gated.
             #[cfg(feature = "orinclick")]
             unaos_kernel::arch::display_tegra::orin_click_census(sweep_tick);
             sweep_tick += 1;
@@ -7205,7 +7205,7 @@ fn jd2_supstate_dispatcher(_arg: usize) {
             // on top and presents (the legacy frame's key_repainted/needs_render pair, as a mark).
             sup_frame_key_repaint();
         }
-        unaos_kernel::arch::sched::yield_now();
+        unaos_kernel::arch::display_tegra::sup_dispatch_pass(); unaos_kernel::arch::sched::yield_now(); // ORIN-SUPSOUND — the dispatcher's own liveness numerator: `disp=+0` beside a live `pass=+N` says the keys stopped being drained while the panel kept presenting, which is a different defect from a dead presenter and reads identically on the wire without this.
     }
 }
 
@@ -7219,6 +7219,13 @@ fn jd2_supstate_presenter(_arg: usize) {
     use unaos_kernel::arch::display_tegra::{sup_frame_take, sup_with_surface};
     use unaos_kernel::pal::{cursor, GneissPal};
     let mut last_visible = cursor::visible();
+    // ORIN-SUPSOUND — the presenter's FIRST wire line, and the only one it prints itself: it means
+    // "this task was DISPATCHED", which `spawn`'s own `:: SCHED: task` witness cannot say on this
+    // board (that line is `#[cfg(feature = "pi")]`, a deliberate wire-cost re-gate). Everything
+    // after this is carried by the ~10 s `[suppresent] census`, which the INPUT SOURCE prints —
+    // see the ORIN-SUPSOUND header in display_tegra.rs for why a lossy UART forbids a witness
+    // whose death signal is silence.
+    unaos_kernel::arch::display_tegra::sup_present_up();
     loop {
         let board = sup_frame_take();
         // The auto-hide transition is edge-detected across passes, exactly as the legacy frame
@@ -7226,8 +7233,15 @@ fn jd2_supstate_presenter(_arg: usize) {
         let vis_now = cursor::visible();
         let auto_hide_erase = last_visible && !vis_now;
         last_visible = vis_now;
-        if board.rel.is_some() || board.abs.is_some() || board.key_repaint || auto_hide_erase {
-            sup_with_surface(|screen, _console| {
+        // ORIN-SUPSOUND — `work` (the board had something to present) and `flushed` (pixels
+        // actually reached glass) are separated deliberately: work-without-flush is the STALLED
+        // verdict, the frozen-glass failure that a happy-path-only witness cannot distinguish
+        // from health. The closure now RETURNS `needs_render` so the flush is observed rather
+        // than assumed; `unwrap_or(false)` folds the no-surface case into "did not present".
+        let work = board.rel.is_some() || board.abs.is_some() || board.key_repaint || auto_hide_erase;
+        let mut flushed = false;
+        if work {
+            flushed = sup_with_surface(|screen, _console| {
                 let mut pal = unaos_kernel::pal::TargetPal { surface: screen };
                 let mut needs_render = board.key_repaint;
                 if board.rel.is_some() || board.abs.is_some() {
@@ -7253,8 +7267,10 @@ fn jd2_supstate_presenter(_arg: usize) {
                 if needs_render {
                     pal.render();
                 }
-            });
+                needs_render
+            })
+            .unwrap_or(false);
         }
-        unaos_kernel::arch::sched::yield_now();
+        unaos_kernel::arch::display_tegra::sup_present_pass(work, flushed); unaos_kernel::arch::sched::yield_now(); // ORIN-SUPSOUND — two relaxed atomic adds on the per-frame path, no lock and no print; the ~10 s census turns them into the liveness verdict.
     }
 }

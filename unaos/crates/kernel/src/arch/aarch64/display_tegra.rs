@@ -3088,10 +3088,10 @@ pub fn sup_with_surface<R>(
         if let Some(mut guard) = SUP_SURFACE.try_lock() {
             return match guard.as_mut() {
                 Some(s) => Some(f(&mut s.screen, &mut s.console)),
-                None => None,
+                None => { SUP_NOSURF.fetch_add(1, core::sync::atomic::Ordering::Relaxed); None } // ORIN-SUPSOUND — the `None` arm is structurally unreachable from the roles (spawned after `sup_install`), so a nonzero `nosurf=` on the census is a real defect rather than a mode.
             };
         }
-        crate::arch::sched::yield_now();
+        SUP_SURF_WAIT.fetch_add(1, core::sync::atomic::Ordering::Relaxed); crate::arch::sched::yield_now(); // ORIN-SUPSOUND — count the refusal BEFORE giving the core back: `surfwait=` is the contention meter for the arc's one long hold (dispatcher across `handle_key`) and, under ORIN-BSPRUN, for a holder caught off-CPU by a quantum expiry.
     }
 }
 
@@ -3113,7 +3113,7 @@ fn sup_lock<T>(m: &spin::Mutex<T>) -> impl core::ops::DerefMut<Target = T> + '_ 
         if let Some(g) = m.try_lock() {
             return g;
         }
-        crate::arch::sched::yield_now();
+        SUP_SEAM_WAIT.fetch_add(1, core::sync::atomic::Ordering::Relaxed); crate::arch::sched::yield_now(); // ORIN-SUPSOUND — the module header argues both LEAF seams are uncontended by construction on a cooperative core; `seamwait=` is that argument's falsifier, and a preemptive terminus is exactly what can falsify it.
     }
 }
 
@@ -3130,7 +3130,9 @@ const SUP_KEYQ_CAP: usize = 64;
 /// ORIN-SUPSTATE — true when the key seam cannot take another key without exceeding its bound.
 #[cfg(feature = "supstate")]
 pub fn sup_key_full() -> bool {
-    sup_lock(&SUP_KEYQ).len() >= SUP_KEYQ_CAP
+    let full = sup_lock(&SUP_KEYQ).len() >= SUP_KEYQ_CAP;
+    if full { SUP_KEY_BACKPRESS.fetch_add(1, core::sync::atomic::Ordering::Relaxed); } // ORIN-SUPSOUND — BACKPRESSURE, not loss: the keys stay in the PAL ring. It is nonetheless the ONLY observable that the dispatcher has fallen a full 64 keys behind, and the seam had no witness of any kind before this.
+    full
 }
 
 /// ORIN-SUPSTATE — push one key for the dispatcher. Returns false (and drops nothing the caller
@@ -3140,16 +3142,20 @@ pub fn sup_key_full() -> bool {
 pub fn sup_key_push(c: u8) -> bool {
     let mut q = sup_lock(&SUP_KEYQ);
     if q.len() >= SUP_KEYQ_CAP {
+        SUP_KEY_DROPPED.fetch_add(1, core::sync::atomic::Ordering::Relaxed); // ORIN-SUPSOUND — THE DROP WITNESS. Unreachable while the caller honours `sup_key_full` before every pop, so this is a tripwire, not a mode: nonzero means a keystroke was LOST and the census raises `FAIL reason=key-dropped`.
         return false;
     }
     q.push_back(c);
+    SUP_KEY_PUSHED.fetch_add(1, core::sync::atomic::Ordering::Relaxed); // ORIN-SUPSOUND — the seam's flow numerator; `pushed - popped` on the census is its standing depth.
     true
 }
 
 /// ORIN-SUPSTATE — pop one key as the dispatcher. FIFO; `None` when idle.
 #[cfg(feature = "supstate")]
 pub fn sup_key_pop() -> Option<u8> {
-    sup_lock(&SUP_KEYQ).pop_front()
+    let c = sup_lock(&SUP_KEYQ).pop_front();
+    if c.is_some() { SUP_KEY_POPPED.fetch_add(1, core::sync::atomic::Ordering::Relaxed); } // ORIN-SUPSOUND — the seam's flow denominator; a dispatcher that stopped draining shows as a growing `depth=` long before the 64-deep bound is reached.
+    c
 }
 
 /// ORIN-SUPSTATE — the frame board, input source / dispatcher -> presenter. A fixed-size
@@ -3865,5 +3871,256 @@ pub fn orin_ladder_census(tick: u64) {
         dock::last_press_outcome(),
         if strip.is_some() { "yes" } else { "REFUSED" },
         verdict
+    );
+}
+
+
+// ── ORIN-SUPSOUND — the presenter's WIRE VOICE, and the seam counters behind it ───────────────────
+//
+// Appended at the END of this file, inside the ORIN-SUPSTATE tail block and gated on `supstate`
+// alone: knob-off every item here is `#[cfg]`-erased, nothing below it exists to be shifted, and the
+// jetson image's panic-`Location` records are untouched (the orinclick line-neutrality rule).
+//
+// THE DEFECT. `jd2_supstate_presenter` (main.rs) carried NOT ONE `serial_println!`. It is the only
+// task that flushes to glass, so a presenter that dies is FROZEN GLASS AND A PERFECTLY HEALTHY
+// SERIAL LOG: the input source keeps polling xHCI and emitting `:: tegra: JD20 —`, the dispatcher
+// keeps echoing `:: tegra: JD2 — KEY`, the `[orinclick]` census keeps printing, and the screen never
+// changes again. Every wire witness on the console path belongs to some OTHER role, so the flight
+// reads green while the operator watches a still image. An instrument that only prints on the happy
+// path cannot detect the failure it exists for.
+//
+// WHY THE CENSUS IS AUTHORED BY THE INPUT SOURCE AND NOT BY THE PRESENTER. This board's UART is a
+// synchronous polled port SHARED WITH THE SPE's TCU and it drops bytes mid-line routinely, so **no
+// verdict here may rest on a line's ABSENCE**. A census the presenter printed itself would report
+// its own death by going silent, which on this wire is indistinguishable from a dropped line, a
+// dropped ten seconds, or an operator who scrolled past it. So the census is emitted from the INPUT
+// SOURCE's existing ~250 ms sweep (`jd2_supstate_phase2`, beside `orin_click_census`) and prints the
+// presenter's counters as DELTAS. A dead presenter therefore produces a POSITIVE, REPEATING line —
+// `pass=+0 ... -> DEAD` — every ~10 s, for as long as the operator cares to watch. That is the
+// signal a lossy UART can carry: the operator confirms a verdict by seeing the SAME line twice, not
+// by failing to see one once.
+//
+// The residual, stated rather than discovered: if the INPUT SOURCE dies, this census stops too. It
+// is not silent about that either — `[orinclick] census` rides the same sweep and stops in the same
+// breath, and the input source is also the xHCI poller, so `:: tegra: JD20 —` stops with it. Three
+// correlated silences is a dead pump; one silent presenter is a `-> DEAD` line.
+//
+// FOOTPRINT. Rung 3's rule, verbatim: the cadence gate is decided FIRST off two system-register
+// reads, and everything else happens on the ~1-in-40 pass that actually prints. The per-pass hooks
+// the roles call (`sup_present_pass`, `sup_dispatch_pass`) are relaxed atomic adds and nothing else
+// — no lock, no print, no allocation — so a per-frame path pays a `ldaddal` and no more.
+
+/// ORIN-SUPSOUND — `CNTPCT_EL0` / `CNTFRQ_EL0` on the calling core. A private copy of
+/// `clk_now_freq` because that one is `orinclick`-gated and this witness must stand alone (a
+/// `supstate` boot with `UNAOS_ORINCLICK` unset is exactly the boot7k configuration).
+#[cfg(feature = "supstate")]
+fn sup_now_freq() -> (u64, u64) {
+    let (now, freq): (u64, u64);
+    unsafe {
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) now, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq, options(nomem, nostack, preserves_flags));
+    }
+    (now, freq)
+}
+
+/// ORIN-SUPSOUND — the presenter reached its first loop pass, i.e. `spawn` was followed by an actual
+/// DISPATCH. `false` at census time is the one state the deltas cannot express: a role that was
+/// announced (`[supstate] roles ... -> SPLIT`) but never ran is not the same defect as one that ran
+/// and stopped, and `spawn`'s own `:: SCHED: task` witness is `#[cfg(feature = "pi")]` and therefore
+/// silent on this board (a deliberate wire-cost re-gate; see `sched.rs`).
+#[cfg(feature = "supstate")]
+static SUP_PRES_UP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// ORIN-SUPSOUND — presenter loop passes (the liveness numerator).
+#[cfg(feature = "supstate")]
+static SUP_PRES_PASS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// ORIN-SUPSOUND — presenter passes that took a NON-EMPTY frame board (there was work to present).
+#[cfg(feature = "supstate")]
+static SUP_PRES_WORK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// ORIN-SUPSOUND — presenter passes that actually reached `pal.render()` (pixels went to glass).
+/// `work` high with `flush` flat is the frozen-glass signature the census exists to name.
+#[cfg(feature = "supstate")]
+static SUP_PRES_FLUSH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// ORIN-SUPSOUND — dispatcher loop passes (its own liveness, on the same terms).
+#[cfg(feature = "supstate")]
+static SUP_DISP_PASS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// ORIN-SUPSOUND — `sup_with_surface` calls that found NO surface installed. Structurally
+/// unreachable from the roles (they are spawned after `sup_install`), so nonzero is a real defect.
+#[cfg(feature = "supstate")]
+static SUP_NOSURF: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// ORIN-SUPSOUND — `SUP_SURFACE` acquisitions that had to give the core back (`try_lock` refused).
+/// This is the CONTENTION meter for the arc's one long hold (the dispatcher across `handle_key`)
+/// and, under ORIN-BSPRUN, for a holder caught off-CPU by a quantum expiry. Deliberately its own
+/// counter: `[inwedge]` (input-path panel refusals) and `[wedge9]` (paint-path `owe_repaint`) are
+/// separate populations by design and folding a third into either would make all three unreadable.
+#[cfg(feature = "supstate")]
+static SUP_SURF_WAIT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// ORIN-SUPSOUND — the same, for the two LEAF seams (`SUP_KEYQ` / `SUP_FRAMES`) behind `sup_lock`.
+/// The module header argues these are uncontended by construction on a cooperative core; a nonzero
+/// reading is that argument being falsified, which is exactly what a preemptive terminus can do.
+#[cfg(feature = "supstate")]
+static SUP_SEAM_WAIT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// ORIN-SUPSOUND — keys pushed onto the key seam by the input source.
+#[cfg(feature = "supstate")]
+static SUP_KEY_PUSHED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// ORIN-SUPSOUND — keys popped off the key seam by the dispatcher. `pushed - popped` is the seam's
+/// standing depth, so a dispatcher that stopped draining is visible before the bound is reached.
+#[cfg(feature = "supstate")]
+static SUP_KEY_POPPED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// ORIN-SUPSOUND — passes where `sup_key_full` answered TRUE: the 64-deep seam is at its bound and
+/// the input source stopped draining the PAL ring. BACKPRESSURE, not loss — the keys are still in
+/// the PAL ring — but it is the only observable that the dispatcher has fallen 64 keys behind.
+#[cfg(feature = "supstate")]
+static SUP_KEY_BACKPRESS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// ORIN-SUPSOUND — the seam's DROP witness: `sup_key_push` refused a key because the bound would be
+/// exceeded. Structurally unreachable while the caller honours `sup_key_full` before every pop, so
+/// this is a hard-bound tripwire: NONZERO MEANS A KEY WAS LOST, and the census says so.
+#[cfg(feature = "supstate")]
+static SUP_KEY_DROPPED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// ORIN-SUPSOUND — quantum expiries observed by `timer_preempt` while `supstate` is armed. This is
+/// the ONE number that says whether a SUPSTATE flight is testing the SUPSTATE x BSPRUN combination
+/// at all: without ORIN-BSPRUN the tegra terminus never sets `SCHED_ACTIVE`, `timer_preempt` returns
+/// at its first line, and this reads `+0` forever — a flight that reports `preempt=+0` has proven it
+/// exercised the COOPERATIVE core only, and none of the preemption hazards were in play. It also
+/// separates a quantum expiry from a voluntary `yield_now`, which the `ctx +N/win` rollup conflates.
+#[cfg(feature = "supstate")]
+static SUP_PREEMPT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// ORIN-SUPSOUND — census bookkeeping: last-printed sweep tick, sequence number, first-census
+/// CNTPCT, and the previous readings the deltas are taken against.
+#[cfg(feature = "supstate")]
+static SUP_CENSUS_TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "supstate")]
+static SUP_CENSUS_SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "supstate")]
+static SUP_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "supstate")]
+static SUP_T0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "supstate")]
+static SUP_LAST: [core::sync::atomic::AtomicU32; 5] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; 5];
+
+/// ORIN-SUPSOUND — sweeps between census lines. The input source's sweep is ~250 ms, so 40 is the
+/// ~10 s cadence `[orinclick]` and `[orintenant]` already use; one shared number would have coupled
+/// three witnesses' cadences to one another, so this one is its own.
+#[cfg(feature = "supstate")]
+const SUP_CENSUS_PERIOD: u64 = 40;
+
+/// ORIN-SUPSOUND — the presenter reached its first loop pass. Printed ONCE (an `AtomicBool` swap),
+/// before the loop, so the line means "this task was DISPATCHED", not merely "spawn returned".
+#[cfg(feature = "supstate")]
+pub fn sup_present_up() {
+    if SUP_PRES_UP.swap(true, core::sync::atomic::Ordering::Release) {
+        return;
+    }
+    serial_println!(
+        "[suppresent] up task=jd2-present core=0 — the presenter was DISPATCHED (spawn -> first loop pass), not merely announced; its liveness is now carried by the ~10 s [suppresent] census, which the INPUT SOURCE prints so that a dead presenter reads as a repeated line rather than as silence"
+    );
+}
+
+/// ORIN-SUPSOUND — one presenter loop pass. `work` = the frame board was non-empty (or the auto-hide
+/// edge fired); `flushed` = `pal.render()` actually ran. Relaxed adds only: this is a per-frame path.
+#[cfg(feature = "supstate")]
+pub fn sup_present_pass(work: bool, flushed: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    SUP_PRES_PASS.fetch_add(1, Relaxed);
+    if work {
+        SUP_PRES_WORK.fetch_add(1, Relaxed);
+    }
+    if flushed {
+        SUP_PRES_FLUSH.fetch_add(1, Relaxed);
+    }
+}
+
+/// ORIN-SUPSOUND — one dispatcher loop pass.
+#[cfg(feature = "supstate")]
+pub fn sup_dispatch_pass() {
+    SUP_DISP_PASS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// ORIN-SUPSOUND — a quantum expiry, from `timer_preempt` AFTER its `SCHED_ACTIVE` gate and its
+/// `IN_RQ_SECTION` tripwire. Called from IRQ context on the ticking core, so it is one relaxed add
+/// and NOTHING else — no lock, no print, no allocation.
+#[cfg(feature = "supstate")]
+pub fn sup_note_preempt() {
+    SUP_PREEMPT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// **ORIN-SUPSOUND — the ~10 s presenter census, from the INPUT SOURCE's idle sweep** (appended
+/// line-neutral beside `orin_click_census`'s call in `jd2_supstate_phase2`). See the block header
+/// for why the presenter does not print its own liveness on this UART.
+///
+/// Verdict ladder (first match wins), each reachable and none constant:
+///   * `UNSCHEDULED`  — `[supstate] roles ... -> SPLIT` was printed but the presenter never reached
+///     its first loop pass: spawned onto core 0's queue and never dispatched.
+///   * `DEAD`         — it ran and stopped. **THE FROZEN-GLASS VERDICT**: the panel is stuck on
+///     whatever was last presented while every other console witness keeps printing.
+///   * `FAIL reason=key-dropped`      — the 64-deep key seam refused a key (bound exceeded); a
+///     keystroke was lost, which the seam's own contract says is unreachable.
+///   * `FAIL reason=no-surface`       — `sup_with_surface` found no installed surface; the roles are
+///     spawned after `sup_install`, so this too is meant to be unreachable.
+///   * `STALLED`      — alive, taking work off the frame board, presenting nothing. The failure a
+///     happy-path-only witness cannot see and the one that looks identical to health on the wire.
+///   * `PRESENTING`   — flushes advanced in this window: pixels reached glass.
+///   * `IDLE-NO-FRAMES` — alive, nothing posted to present. **UNRUN, never PASS**: a headless or
+///     untouched console is idle by construction and this says so rather than claiming health.
+#[cfg(feature = "supstate")]
+pub fn sup_present_census(tick: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    // FOOTPRINT — cadence FIRST, off two system-register reads; nothing below runs on the other 39
+    // sweeps of every 40. No lock is taken on any pass, printing or not.
+    let (now, freq) = sup_now_freq();
+    let armed = SUP_ARMED.swap(true, Relaxed);
+    if armed && tick.wrapping_sub(SUP_CENSUS_TICK.load(Relaxed)) < SUP_CENSUS_PERIOD {
+        return;
+    }
+    if !armed {
+        SUP_T0.store(now, Relaxed);
+    }
+    SUP_CENSUS_TICK.store(tick, Relaxed);
+    let seq = SUP_CENSUS_SEQ.fetch_add(1, Relaxed) + 1;
+    let up = if freq == 0 { 0 } else { now.wrapping_sub(SUP_T0.load(Relaxed)) / freq };
+
+    let pass = SUP_PRES_PASS.load(Relaxed);
+    let work = SUP_PRES_WORK.load(Relaxed);
+    let flush = SUP_PRES_FLUSH.load(Relaxed);
+    let disp = SUP_DISP_PASS.load(Relaxed);
+    let preempt = SUP_PREEMPT.load(Relaxed);
+    let d_pass = pass.wrapping_sub(SUP_LAST[0].swap(pass, Relaxed));
+    let d_work = work.wrapping_sub(SUP_LAST[1].swap(work, Relaxed));
+    let d_flush = flush.wrapping_sub(SUP_LAST[2].swap(flush, Relaxed));
+    let d_disp = disp.wrapping_sub(SUP_LAST[3].swap(disp, Relaxed));
+    let d_preempt = preempt.wrapping_sub(SUP_LAST[4].swap(preempt, Relaxed));
+
+    let dispatched = SUP_PRES_UP.load(core::sync::atomic::Ordering::Acquire);
+    let nosurf = SUP_NOSURF.load(Relaxed);
+    let dropped = SUP_KEY_DROPPED.load(Relaxed);
+    let pushed = SUP_KEY_PUSHED.load(Relaxed);
+    let popped = SUP_KEY_POPPED.load(Relaxed);
+
+    let verdict = if !dispatched {
+        "UNSCHEDULED reason=presenter-spawned-never-dispatched"
+    } else if d_pass == 0 {
+        "DEAD reason=presenter-not-advancing (FROZEN GLASS: the panel is stuck on the last presented frame while every other console witness keeps printing)"
+    } else if dropped != 0 {
+        "FAIL reason=key-dropped (the 64-deep seam exceeded its bound; a keystroke was lost)"
+    } else if nosurf != 0 {
+        "FAIL reason=no-surface (sup_with_surface found nothing installed)"
+    } else if d_work != 0 && d_flush == 0 {
+        "STALLED reason=work-taken-nothing-presented"
+    } else if d_flush != 0 {
+        "PRESENTING"
+    } else {
+        "IDLE-NO-FRAMES"
+    };
+    serial_println!(
+        "[suppresent] census seq={} t={} up={}s dispatched={} pass=+{} work=+{} flush=+{} disp=+{} preempt=+{} nosurf={} surfwait={} seamwait={} keyq push={} pop={} depth={} full={} drop={} totals pass={} flush={} -> {}",
+        seq, tick, up, dispatched as u8, d_pass, d_work, d_flush, d_disp, d_preempt,
+        nosurf, SUP_SURF_WAIT.load(Relaxed), SUP_SEAM_WAIT.load(Relaxed),
+        pushed, popped, pushed.wrapping_sub(popped), SUP_KEY_BACKPRESS.load(Relaxed), dropped,
+        pass, flush, verdict
     );
 }
