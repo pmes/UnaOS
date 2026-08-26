@@ -8868,6 +8868,75 @@ non-zero `zero-payload`. If it prints `SOCKET-DROP` instead, the DHCP path reall
 finding is wrong — one line separates them. The tallies are pure counters on paths that already ran
 (read-only, no device access, unbounded so a REQUEST past `NET4K_TX_WITNESS_MAX` cannot be under-counted).
 
+### FLOWN 2026-08-25 (boot7h) — the latch is CONVICTED by tag, buffer 17 is NAMED, and the go-red prediction took a third arm
+
+The first flight carrying NET-4F/NET-4V (`ca80655c`; media
+`boot7h-conwin-net4-20260825T2208Z-68c4758`, SRC.SHA `68c47585`, `UNAOS_NET4=1`). Capture:
+`~/unaos-bench/capture/line-acm0/orin.log`, boot7h slice lines 13159–16290; **capture line numbers
+are the anchor**, boot id `boot7h` throughout.
+
+**The tag discriminator fired its second arm and finally NAMED the reused descriptor.** The first
+pop was healthy; every subsequent completion's own buffer was untouched while buffer 17 was
+written, four in a row:
+
+```
+14511  [net4F] rx[0] slot=0 len=60 own-buffer-written=yes buffers-written(count=1)=[0,-1,-1,-1] — the payload IS in the completed slot's own buffer -> per-descriptor addressing WORKS
+14514  [net4F] rx[1] slot=1 len=60 own-buffer-written=no buffers-written(count=1)=[17,-1,-1,-1] — the completed slot's buffer was NOT written while another buffer WAS -> a real landing at a wrong index; the listed index names the descriptor address the NIC reused
+14524  [net4F] VERDICT tag-proven single-address latch: 4 consecutive completions (through slot 4) wrote ONLY buffer 17 — measured by lost landing tags, not by content match, so the NET-4A artifact cannot produce it. Ring DRAM holds the correct distinct addr for every slot (net4x MATCH) ⇒ the reuse is NIC/RC-internal
+```
+
+(rx[2]/rx[3]/rx[4] at 14517/14520/14523 are byte-identical in shape to 14514, all `[17,…]`.) This
+is what the tag mechanism was built to separate: measured by LOST LANDING TAGS, not content match,
+so the `[net4z]` scan artifact that manufactured the NET-4A verdict cannot produce it. The
+content side corroborates from the other direction: the four wrong-index pops were delivered as
+frames whose bytes ARE the landing-tag stamp — `dst=4e:45:54:34:45:5f` is ASCII `NET4E_`
+(`[net4t] other[0] … first32B=4e455434455f01fe…`, 14512) — i.e. the completed slots' unwritten
+buffers, read back with their arm-time stamps intact. **The reuse is NIC/RC-internal; the driver's
+ring DRAM is correct for every slot.** Which mechanism *below* the driver (RC inbound path vs NIC
+descriptor cache) is the next arc's question, not this capture's answer.
+
+**The ring-pass oracle took its third reading — the un-serviced-latch theory is REFUTED on the
+wire.** Capture 14528: `[net4F] RX ring pass verdict: pops=5 NUM_RX=32 wraps=0 RDU-clears=0
+RXOVW-clears=0 CR=0x0c RxEnb=1 ISR=0x0084 — one pass only, and RDU NEVER latched … the engine
+stops without reporting descriptor-unavailable, so it is not re-fetching the recycled descriptors
+at all`. `net4f_rx_service` was live and had nothing to clear: the one-pass halt is not the ISR.RDU
+latch this entry hypothesized. That fix stays (it is an obligation regardless), but the halt's
+cause moves down the stack with the latch conviction above.
+
+**The NET-4V verdict printed a third arm, not either predicted one.** The go-red paragraph above
+named `ACK-STARVED` (this finding right) vs `SOCKET-DROP` (this finding wrong). boot7h printed
+neither — capture 14529:
+
+```
+[net4V no-lease verdict] dhcp-tx: discover=1 request=0 | dhcp-rx: offer=0 ack=0 nak=0 | ring: popped=5/32 zero-payload=4 [ring wrapped] => NO-OFFER: a DISCOVER left the NIC and no OFFER was ever delivered — wire / server / RX filter; the DHCP path above the driver was never exercised
+```
+
+`NO-OFFER` neither confirms nor refutes the ACK-starvation reading: no OFFER was delivered *at
+all* this sitting (`[net4d window-close] … arp=1 dhcp=0 … other=4`, 14527), and with the ring
+latched onto buffer 17 after pop 0, any OFFER that did arrive would have landed there as
+zero-payload garbage — the latch is upstream of the DHCP question and must fall first. The boot
+fell back and bound: `no lease within 5000 ms … falling back to static 192.168.1.2/24` (14525),
+smoltcp `Interface BOUND … link UP` (14540), `ORIN-NET-4 DONE` (14541).
+
+⚠ **One witness defect surfaced by this flight, recorded not fixed: the net4V bracket lies when
+the wire is quiet.** The line above carries `[ring wrapped]` while `[net4F] RX ring pass verdict`
+on the same boot says `wraps=0`. The bracket is a two-arm check
+(`rtl8168_tegra.rs::net4v_verdict`): `rx_count == NUM_RX` prints `RING-DRY after exactly one
+pass`, *anything else* prints `ring wrapped` — written when every recorded sitting popped exactly
+32. boot7h popped 5 (a quiet wire: one ARP + four latch-garbage pops in the 5 s window), which is
+neither dry-after-one-pass nor wrapped, and the else-arm mislabels it. `[net4F]`'s `wraps=` is the
+counted truth; the bracket needs a third arm (`window closed before one pass`) keyed on
+`rx_count < NUM_RX`.
+
+**The smaller fixes all read back clean on their first flight:** MAR all-ones readback `[MATCH]`
+(14500), chip id `TCR=0x57100f00 xid=0x541 … RTL8111H class [MATCH]` (14502) so the NET-4y RX mode
+is the right family's, and the FCS strip witness on the first writeback: `raw-len=64
+delivered-len=60 (FCS stripped)` (14508) — the four CRC bytes no longer reach smoltcp.
+
+Spec rows for `[net4F]`/`[net4V]`/`ORIN-NET-4 DONE` were added to
+`unaos/scripts/specs/jetson-sync1.spec` in this fold (PENDING/OPTIONAL — `net4` is knob-gated, so
+the healthy-terminus rows must never become REQUIREs; the argument is at the rows).
+
 ## PH-3 — is the aarch64 block-write path "fully polled emmc2"? (verdict: **premise FALSE**)
 
 An answer owed to the pi4 lane, which was deciding on the `fs/fat.rs` `FAT_MUTATION` span
@@ -9350,6 +9419,33 @@ to completion on the EL1 core: `:: TEGRA-EL0: el0-hello spawned at EL0 (boot cor
 (11411). ⚠ The shell verb `run` was **not typed on boot7f** — only `bg` was — so "`run` is
 unaffected" rests on the refusal's scope in `sched.rs` and on the `el0-hello` round trip above, not
 on a captured `run` invocation.
+
+**Reproduced on boot7h (2026-08-25, image `68c47585`), second flight, same shape:** `el1 core
+MEASURED: cpu=0 mask=0x1` (capture line 14815), rollup `el0refuse=0 el1cores=0x1` (14844), the
+typed `bg /fat/vug.elf` refused with the same paired lines (`JD2 — OUT | bg: …` 15004, `BGRUN …
+rejected` 15005), and the board ran on for ~100 further minutes of census cadence. The fail-closed
+refusal is now a two-flight result. (`run` remains untyped on both flights.)
+
+### SMPINSTR on metal (boot7h, 2026-08-25) — the load witness prints its FIRST lines on Orin silicon
+
+Before `a50358f0` the `:: SCHED: load ::` witness had never emitted a line on this board — its only
+trigger sat behind `SCHED_ACTIVE`, which nothing on a tegra build sets (the full chain is in the
+commit and in the spec's SMPINSTR block). boot7h is the first capture that carries it, and it
+carries exactly two lines, which is the designed reading, not a shortfall:
+
+| capture line | on the wire (quoted) | reading |
+| --- | --- | --- |
+| 14845 | `:: SCHED: load c0=--/f=never-folded c1=0%/f=3ms c2=0%/f=1ms c3=0%/f=2ms c4=0%/f=2ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +0/win nofold=0x0) ::` | the unconditional BASELINE, before the drive loop. All 8 accounting slots print (`NUM_CPUS`, not the hard-coded `c0..c3` the arc removed); `c6`/`c7` are the surplus slots on a 6-core part and read `never-folded` honestly rather than being hidden |
+| 14846 | `[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=5` | the live-span line beside it — the staleness that used to be invisible, sampled at the witness |
+| 14848 | `:: SCHED: load c0=100%/f=0ms c1=0%/f=0ms … (ctx +1/win nofold=0x0) ::` | one poll later: the boot core at 100% with a **zero fold age** — busy AND folding, i.e. the healthy reading the `!NOFOLD` tell exists to be distinguished from |
+
+Then the lines stop, and their stopping is the measurement working as specified: the poll lives
+inside `run_capstone_boot_core`'s drive loop, `jd2_console_pump` is dispatched and never returns,
+so no further poll runs — "the poll is the loop, not an observer of it." No `!NOFOLD` printed
+(no wedge was injected; that tell remains proven-present, never yet triggered). The spec now
+carries `REQUIRE SCHED: load c0=(--|[0-9]+%)/f=` on the baseline's reachability argument (the
+`[el0core] rollup:` precedent verbatim), go-red-proven against boot7g's slice, which predates the
+arc and reds on exactly that row.
 
 ## DARKWIN-GUARD — the 2026-08-18 trunk-merge boot hang, and the dark-window serial latch
 
@@ -10330,3 +10426,9 @@ at the point of reading.
 * **The desktop side of the same flight** — rung 3 routing on metal and the `CHROME-ON-GLASS`
   read-back — is recorded in
   [`../08_VIDEO/orin-desktop.md`](../08_VIDEO/orin-desktop.md) §3.8.1, not here.
+
+**Reproduced on boot7h (2026-08-25, image `68c47585`), second flight:** the full JX2-NVC67D pass
+ran again with every NEXTTOUCH read survived and the same verdict —
+`JX2-VERDICT=EFI-OWNED-LIVE — CHNSTATUS_CORE=0x20070000, STATE=0x07 -> EFI_OPERATION` (capture
+line 14273), `JX2-SWEEPDISABLED` (14274) and the `DECODES-NOMATCH` retraction (14276) beside it.
+The channel census is a two-flight result; both non-establishment bullets above stand unchanged.
