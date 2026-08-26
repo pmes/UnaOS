@@ -2087,6 +2087,46 @@ supstate = ["tegra"]
 # `[oringlass] phase=`, `[orindock] arm`, `[orindock] park`, `[orindock] restore`,
 # `[orindock] census`. See docs/dev/OS/08_VIDEO/orin-desktop.md §3.11.
 orinladder = ["orinconwin", "orinclick", "orindesk"]
+# ORIN-DESKFURN: `UNAOS_ORINFURN=1` — **the Orin gets FURNITURE: the menu bar is ENABLED and PAINTED,
+# and the SHARD menu becomes pressable.** `main.rs::tegra_desk_furn`, on `tegra_early_stop`'s terminus
+# line after every existing rung. DEFAULT OFF.
+#
+# WHAT IT IS NOT, and this is the whole of its safety argument. It does **NOT** call
+# `pidesk::activate()` and it does **NOT** touch `TEGRADESK_CASCADE_OK`, so orin-desktop.md §5.2's
+# stop-line is UNCROSSED and rung 5 is still blocked. `activate`'s sequence is nine steps — DESKTOP
+# CLEAR through the front buffer, the console window, the bar, the composite, `crystal::routed_selftest`,
+# `pulsewin::open`, window population, a tegra `render_service`, a filesystem walk. This knob takes
+# exactly TWO of them — `menubar::set_enabled(true)` and `wm::composite()` — because those two ARE the
+# bar, and nothing else in `activate` is. Rung 4 made the identical narrowing for the console window
+# (`orinconwin` takes `activate`'s steps 2a/2-3 and nothing else) and the argument is inherited, not
+# re-invented.
+#
+# WHY THE STACK ARGUMENT HOLDS WHERE §5.2's DOES NOT. §5.2's hazard is the CASCADE's depth, and its
+# named overflow is `quarry::open()` at click-router depth (Pi boot 11). `quarry` is not implied here,
+# so that call is the `not(feature = "quarry")` `false` stub. What this knob actually adds to the
+# terminus is one more `wm::composite()` — the same call ORIN-WM1 (rung 0), `orin_conwin`'s `create_at`
+# (rung 4) and `orin_tenant_arm` (rung 6) already make from this same line, on the boot core's own
+# entry frame, all three FLOWN on Orin metal (boot7f/7g/7h). It is not a new stack shape; it is a
+# fourth instance of a shape this board has run three times. ⚠ That is an ARGUMENT FROM THE LEDGER,
+# not a measurement: no `[u7stk]` number for this line exists, and `sched::stk_probe` cannot produce
+# one here — it returns early when `SCHED[cpu].current` is null, which is exactly the boot core before
+# the scheduler is driven. Stated because the stop-line asks for numbers this seam structurally cannot
+# take, and pretending otherwise is the failure mode this whole ladder is written against.
+#
+# IMPLIES `orinclick`. A bar whose crystal cannot be pressed is chrome, not furniture — and the SHARD
+# menu is half of what this knob exists to deliver. `orinclick = ["tegra_el0"]` (implies `tegra`) and
+# `pidesk` brings the furniture family (`strip`/`dock`/`menubar`/`crystal`, gated
+# `any(all(x86_64, wc), all(aarch64, pidesk))`), so the knob is SELF-SUFFICIENT like `tegradesk` and
+# `orinconwin` and unlike `orindesk`/`jd1dc`. It deliberately does NOT imply `orinconwin`: the bar and
+# the console window are independent furniture and each stands on its own floors.
+#
+# DEFAULT OFF => the statics, the function and the terminus statement all vanish, no line moves in any
+# file (file-tail block; the call site is appended to an existing line), and the jetson image is
+# byte-identical to baseline. The ARMED polarity is type-checked by the `arm-tegra-furn` leg of
+# KERNEL_CFG_MATRIX, never by the knob mapping. UNFLOWN — no Orin has booted it.
+# Witness on the wire: `[orinfurn] floors`, `[orinfurn] ARMED`, `[orinfurn] REFUSE`.
+# See docs/dev/OS/08_VIDEO/orin-desktop.md §3.12.
+orinfurn = ["pidesk", "orinclick"]
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
