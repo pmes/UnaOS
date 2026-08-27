@@ -1984,8 +1984,28 @@ const BT_C1_INQUIRY_LAP: [u8; 3] = [0x33, 0x8B, 0x9E];
 /// because this stage EXITS EARLY the instant the target answers (see `bt_c1_inquiry`) — the full
 /// 5.12 s is paid only on a boot that does not hear it, which is precisely the boot where the
 /// listening time has to be defensible.
+///
+/// **BTRX (gr28) RAISES THIS TO 0x08 = 10.24 s, AND THE PARAGRAPH ABOVE IS WHY IT WAS WRONG.**
+/// It reasoned about the listening time as a budget to be justified. The correct frame is the
+/// inquiry hop sequence. The 32 inquiry frequencies are split into two trains, A and B, of 16
+/// each (Core Vol 2 Part B §8.4.3 "inquiry substate"). The inquiring device transmits ONE train
+/// repeatedly for Ninquiry = 256 repetitions — 2.56 s — before switching to the other, and a peer
+/// whose inquiry-scan window happens to sit on the other train's frequencies CANNOT be heard until
+/// that switch. 5.12 s buys exactly one A-then-B pass with no margin: if the peer's scan window
+/// and our train miss each other on the single pass each train gets, the result is not "fewer
+/// responses", it is ZERO responses, deterministically, on every boot. That is the exact signature
+/// three gr27 boots produced — responses=0, read_to_term=true, Inquiry Complete on schedule.
+/// 10.24 s is four train periods (A B A B): every train gets a SECOND pass at a different phase of
+/// the peer's scan cycle, which is what turns a coin-flip into a measurement. It is also the
+/// conventional figure the paragraph above already named and then declined to spend.
+///
+/// THE COST IS BOUNDED BY THE SAME EARLY EXIT AS BEFORE: the stage returns the instant the target
+/// answers, so the extra 5.12 s is spent only on the boot that hears nothing — and a boot that
+/// hears nothing after a FULL two-pass sweep of both trains is worth vastly more than one that
+/// heard nothing after a single pass, because only the first excludes train misalignment. This is
+/// still air time in Peter's room and still spent only under `UNAOS_BTC=1`.
 #[cfg(feature = "btc")]
-const BT_C1_INQUIRY_LEN: u8 = 0x04;
+const BT_C1_INQUIRY_LEN: u8 = 0x08;
 /// BT-C1 — `Num_Responses` = **0x00 = unlimited**. Capping it would end the inquiry at the first
 /// device to answer, and the first device to answer is very unlikely to be the target: the whole
 /// diagnostic value of this stage is the FULL list of what is on the air on classic. The stage's
@@ -1994,12 +2014,22 @@ const BT_C1_INQUIRY_LEN: u8 = 0x04;
 #[cfg(feature = "btc")]
 const BT_C1_INQUIRY_MAX_RESP: u8 = 0x00;
 /// BT-C1 — bounded host window, in ms, for the inquiry to end. Sized to sit just past
-/// `BT_C1_INQUIRY_LEN` x 1280 ms (5120 ms => 5600 ms here), for the same reason `BT_C1_CONN_MS`
-/// sits past the page timeout: the controller sends `Inquiry Complete` of its own accord when the
-/// inquiry length expires, and a window that closed FIRST would report "no answer" on a boot where
-/// the controller was about to say exactly what it heard. THE TWO MOVE TOGETHER.
+/// `BT_C1_INQUIRY_LEN` x 1280 ms, for the same reason `BT_C1_CONN_MS` sits past the page timeout:
+/// the controller sends `Inquiry Complete` of its own accord when the inquiry length expires, and
+/// a window that closed FIRST would report "no answer" on a boot where the controller was about to
+/// say exactly what it heard. THE TWO MOVE TOGETHER — and BTRX moved them together: with
+/// `BT_C1_INQUIRY_LEN` now 0x08 (10240 ms) this is 10740 ms, preserving the same 480 ms of slack
+/// the 5120/5600 pair carried. Leaving this at 5600 while the length doubled would have
+/// manufactured a `NO Inquiry Complete` timeout on EVERY boot and destroyed the very measurement
+/// the longer inquiry buys, so the pairing is asserted at COMPILE TIME just below rather than left
+/// to whoever edits one of the two next.
 #[cfg(feature = "btc")]
-const BT_C1_INQUIRY_MS: u64 = 5600;
+const BT_C1_INQUIRY_MS: u64 = 10740;
+/// BTRX — the host window MUST outlast the inquiry length; see both constants above. Checked at
+/// COMPILE TIME so a future edit that moves one and not the other fails the build rather than
+/// producing a capture nobody can re-fly.
+#[cfg(feature = "btc")]
+const _: () = assert!(BT_C1_INQUIRY_MS > BT_C1_INQUIRY_LEN as u64 * 1280);
 /// BT-C1 — HCI event code 0x01 = `Inquiry Complete`. One parameter, Status(1) => 3 bytes on the
 /// wire. Enabled by bit 0 of the event mask L1 already wrote.
 #[cfg(feature = "btc")]
@@ -2360,6 +2390,51 @@ const BT_EVENT_MASK_C1: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x5F, 0x00, 0x2
 /// power-on mode; the spec's reset default (0x00) was an assumption, not a reading.
 #[cfg(feature = "btc")]
 const BT_HCI_READ_INQUIRY_MODE: u16 = 0x0C44;
+/// BTRX — `HCI_Write_Inquiry_Mode`: OGF 0x03 / OCF 0x0045 => opcode 0x0C45. One parameter,
+/// Inquiry_Mode(1); returns Status(1). Vol 4 Part E §7.3.50.
+///
+/// WHY THE MODE IS NOW WRITTEN AND NOT MERELY READ. gr27 read the mode (0x00, STANDARD) and left
+/// it — a defensible choice while the mode was the suspect. It is the wrong choice now that it is
+/// not: an UNWRITTEN mode is whatever the chip's own firmware left in the register, and this arc
+/// has no control over that value across resets, firmware states or a future patchram. Writing it
+/// makes the inquiry's result shape a property of THIS HOST rather than an inheritance, which is
+/// what lets a responses=0 verdict mean the same thing on every boot.
+#[cfg(feature = "btc")]
+const BT_HCI_WRITE_INQUIRY_MODE: u16 = 0x0C45;
+/// BTRX — the Inquiry_Mode this host WRITES: **0x01, "Inquiry Result with RSSI"**.
+///
+/// NOT 0x00, and the reason is this arc's whole question. Standard mode (0x00) delivers
+/// `Inquiry Result` (0x02), which carries BD_ADDR, PSRM, Class and Clock_Offset — everything the
+/// page needs and NOTHING about signal strength. Mode 0x01 delivers `Inquiry Result with RSSI`
+/// (0x22): the same fields plus one signed byte of RSSI. That byte is the instrument the classic
+/// side has never had. The LE side already prints `rssi=-87dBm` for this speaker, so a classic
+/// response arriving at a comparable level would say the two receivers hear the same room, and one
+/// arriving at the noise floor would say they do not. Bit 33 is already open in
+/// `BT_EVENT_MASK_C1` and the 0x22 shape is already decoded, so this costs one command and no new
+/// decode.
+///
+/// NOT 0x02 (RSSI + EIR) either, deliberately. 0x02 makes EVERY response a 258-byte Extended
+/// Inquiry Result that this event endpoint (mps=16) must reassemble from seventeen packets inside
+/// a window that is also listening — a reassembly path no real response has ever exercised here.
+/// 0x01 keeps every response inside a single 17-byte, two-packet event. The richer shape is not
+/// worth buying with the one path most likely to drop the very answer being hunted.
+#[cfg(feature = "btc")]
+const BT_C1_INQUIRY_MODE_WANTED: u8 = 0x01;
+/// BTRX — `HCI_Read_Inquiry_Response_Transmit_Power_Level`: OGF 0x03 / OCF 0x0058 => opcode
+/// 0x0C58. No parameters; returns Status(1) TX_Power(1, SIGNED, dBm, spec range -70..=+20).
+/// Vol 4 Part E §7.3.61. READ-ONLY.
+///
+/// WHAT IT DOES AND DOES NOT ANSWER, stated before the reading is taken so the capture cannot be
+/// over-read. This is the level the controller uses for the FHS and EIR packets it sends when it
+/// ANSWERS somebody else's inquiry — it is NOT the level of the inquiry ID packets this host
+/// transmits while inquiring, for which the spec exposes a write (0x0C59) and no read at all.
+/// It is taken anyway because it is the only power figure this radio hands back without a
+/// connection handle, and because it is a cheap sanity read on the RF configuration as a whole: a
+/// part whose RF tables never came up is likelier to report a nonsense or clamped power here than
+/// a correctly configured one. A plausible value proves NOTHING on its own; an out-of-range one,
+/// or an UNKNOWN-CMD refusal, is a finding. The witness says exactly that much and no more.
+#[cfg(feature = "btc")]
+const BT_HCI_READ_INQ_RSP_TX_POWER: u16 = 0x0C58;
 /// BT-C1/AGE — `HCI_Read_Page_Timeout`: OGF 0x03 / OCF 0x0017 => opcode 0x0C17. No parameters;
 /// returns Status(1) Page_Timeout(2). READ-ONLY, and it exists to close the one hole the WRITE
 /// cannot: `HCI_Write_Page_Timeout` answering status 0x00 says the command was ACCEPTED, not that
@@ -8017,6 +8092,106 @@ impl Controller {
                 self.idx
             ),
         }
+        // ---- 0c. BTRX-MODE — WRITE the mode, then READ IT BACK ---------------------------------
+        // The read at 0a says what the chip's firmware left behind; this says what THIS HOST asked
+        // for, and the read-back says which of the two is in force. A write that answers status
+        // 0x00 has been ACCEPTED, not LATCHED — the same distinction `HCI_Read_Page_Timeout` exists
+        // to close for the page, closed here for the same money. Everything below runs regardless
+        // of how this goes: a refused mode write is a fact to record, never a reason to skip the
+        // inquiry, because the mask above carries all three result shapes and the stage can decode
+        // whichever one arrives.
+        let mut mode_in_force: Option<u8> = None;
+        let mut wm = [0u8; 8];
+        let mode_written = matches!(
+            self.bt_hci_command_ex(
+                t, intf, e, toggle, BT_HCI_WRITE_INQUIRY_MODE,
+                &[BT_C1_INQUIRY_MODE_WANTED], &mut wm, armed,
+            ),
+            Some(n) if n >= 1 && wm[0] == 0x00
+        );
+        if mode_written {
+            serial_println!(
+                ":: bt-c1: [{}] BTRX-MODE — HCI_Write_Inquiry_Mode (0x0C45) mode={:#04x} status=0x00 -> ACCEPTED. Responses should now arrive as Inquiry Result with RSSI (0x22), which is the first classic reading of SIGNAL STRENGTH this project has ever asked for; the LE side already prints rssi=-87dBm for this speaker, so a classic response near that level and one at the noise floor are different findings == witness ::",
+                self.idx, BT_C1_INQUIRY_MODE_WANTED
+            );
+        } else {
+            serial_println!(
+                ":: bt-c1: [{}] BTRX-MODE — HCI_Write_Inquiry_Mode (0x0C45) mode={:#04x} -> REFUSED or UNCONFIRMED (status={:#04x}; 0x01 there means this controller's firmware has no Write_Inquiry_Mode at all). NOTHING IS SKIPPED: the mask carries all three result shapes and the inquiry below decodes whichever arrives — what is lost is only the RSSI reading, so a responses=0 verdict on this boot still stands and a responses>0 one will simply carry no dBm == witness ::",
+                self.idx, BT_C1_INQUIRY_MODE_WANTED, wm[0]
+            );
+        }
+        let mut rb = [0u8; 8];
+        match self.bt_hci_command_ex(
+            t, intf, e, toggle, BT_HCI_READ_INQUIRY_MODE, &[], &mut rb, armed,
+        ) {
+            Some(n) if n >= 2 && rb[0] == 0x00 => {
+                mode_in_force = Some(rb[1]);
+                serial_println!(
+                    ":: bt-c1: [{}] BTRX-MODE read-back — HCI_Read_Inquiry_Mode (0x0C44) status=0x00 inquiry_mode={:#04x} wanted={:#04x} -> {} == witness ::",
+                    self.idx, rb[1], BT_C1_INQUIRY_MODE_WANTED,
+                    if rb[1] == BT_C1_INQUIRY_MODE_WANTED {
+                        "LATCHED — the mode the responses below arrive in is the mode this host chose, not the one the chip's firmware left"
+                    } else {
+                        "NOT LATCHED — the controller is running a mode this host did not ask for; read every result shape below against THIS byte and not against the write above"
+                    }
+                );
+            }
+            _ => serial_println!(
+                ":: bt-c1: [{}] BTRX-MODE read-back — HCI_Read_Inquiry_Mode (0x0C44) gave no well-formed reply; the mode in force is UNKNOWN for the rest of this stage and no result shape below may be predicted from the write == witness ::",
+                self.idx
+            ),
+        }
+        // ---- 0d. BTRX-TXPWR — one read-only power figure, honestly scoped ----------------------
+        // See `BT_HCI_READ_INQ_RSP_TX_POWER`: this is the RESPONSE power, not the power of the
+        // inquiry ID packets this host is about to transmit. It is taken because it is the only
+        // power the radio yields without a connection handle, and an out-of-range value on a part
+        // whose RF tables never came up would be a real finding. A plausible value proves nothing.
+        let mut tp = [0u8; 8];
+        match self.bt_hci_command_ex(
+            t, intf, e, toggle, BT_HCI_READ_INQ_RSP_TX_POWER, &[], &mut tp, armed,
+        ) {
+            Some(n) if n >= 2 && tp[0] == 0x00 => {
+                let dbm = tp[1] as i8;
+                serial_println!(
+                    ":: bt-c1: [{}] BTRX-TXPWR — HCI_Read_Inquiry_Response_Transmit_Power_Level (0x0C58) status=0x00 tx_power={}dBm -> {}. SCOPE: this is the level used for the FHS/EIR packets this radio sends when ANSWERING an inquiry, NOT the level of the inquiry ID packets it sends while inquiring (the spec exposes no read for those). It is a sanity read on the RF configuration and nothing more == witness ::",
+                    self.idx, dbm,
+                    if (-70..=20).contains(&(dbm as i32)) {
+                        "IN SPEC RANGE (-70..=+20 dBm) — no RF-configuration finding here; this does NOT establish that the transmit path is healthy"
+                    } else {
+                        "OUT OF THE SPEC RANGE (-70..=+20 dBm) — a genuine finding: this radio is reporting a power it is not allowed to report, which is what a part whose RF tables never came up looks like"
+                    }
+                );
+            }
+            other => serial_println!(
+                ":: bt-c1: [{}] BTRX-TXPWR — HCI_Read_Inquiry_Response_Transmit_Power_Level (0x0C58) -> {} (status={:#04x}) — no power reading is claimed for this boot; the inquiry below is unaffected == witness ::",
+                self.idx,
+                if other.is_some() { "MALFORMED/NONZERO-STATUS" } else { "NO CmdComplete" },
+                tp[0]
+            ),
+        }
+        // ---- 0e. BTRX-PATCHRAM — the question this stage CANNOT answer, named before it runs ---
+        // THE HYPOTHESIS. Broadcom combo parts boot a ROM image and take a vendor patch (`.hcd`)
+        // from the host; the patch carries RF/baseband configuration as well as bug fixes. A part
+        // running unpatched can present a complete HCI command set and a complete LMP feature mask
+        // — both are ROM tables — while its BR/EDR receive path is degraded or dead, and LE, a
+        // later and more self-contained block, still works. That is the exact asymmetry this arc
+        // is chasing, so the hypothesis must be NAMED on every boot even though this boot cannot
+        // test it.
+        //
+        // WHY IT IS NOT TESTED HERE, and this is a policy refusal and not an oversight. Resolving
+        // it needs a Broadcom VENDOR opcode (OGF 0x3F) whose meaning is published in no
+        // specification this project may read: the only sources that carry it are vendor driver
+        // source, which CLEAN_ROOM_POLICY.md §2 puts off-limits to an implementer. This tree has
+        // made exactly this refusal before, at a NAMED UNKNOWN, for the B43_SHM_UCODE routing
+        // selector (see `arroyo`, WIFI-2) — the same refusal is made here rather than inventing an
+        // opcode or guessing one. And the patch BLOB itself is a proprietary asset: unaOS ships
+        // none (CLEAN_ROOM_POLICY.md §4), so if a patch is ever uploaded it must be a
+        // USER-SUPPLIED file found at runtime, riding the path the WIFI-1 loader already
+        // established — the program-source FAT volume, searched in /, /B43/ and /FIRMWARE/.
+        serial_println!(
+            ":: bt-c1: [{}] BTRX-PATCHRAM — NO VENDOR FIRMWARE PATCH WAS UPLOADED, and none was attempted. This boot issued ZERO vendor (OGF 0x3F) commands: the radio is running whatever image it powered on with, and its identity as read at bt-l0 (manufacturer/hci_rev/lmp_subver) is the only evidence of which image that is. THE UNPATCHED-ROM HYPOTHESIS FOR THIS DEAFNESS IS THEREFORE OPEN, NOT EXCLUDED, whatever the inquiry below reports. It is not tested here on purpose: the vendor opcodes are a NAMED UNKNOWN under CLEAN_ROOM_POLICY.md §2 (no readable specification carries them), and the patch blob is a proprietary asset unaOS does not ship under §4 — a user-supplied .hcd would ride the WIFI-1 path (program-source FAT volume, /, /B43/, /FIRMWARE/) and no such file is staged == witness ::",
+            self.idx
+        );
         if !self.bt_hci_send(t, intf, BT_HCI_INQUIRY, &params) {
             serial_println!(
                 ":: bt-c1: [{}] HCI_Inquiry (0x0401) NOT SENT — the EP0 control-OUT failed (its own line is above). No inquiry is running and no cancel is owed; the page below falls back to psrm={:#04x}(R2) clock_offset={:#06x}(NOT valid) and is a WEAKER experiment for it == witness ::",
@@ -8215,6 +8390,38 @@ impl Controller {
                 "THE INQUIRY HEARD NOTHING AT ALL — and the event mask above carried bits 1, 33 AND 46, so all three inquiry-result shapes were enabled and a masked-away result is EXCLUDED. Read the HCI_Read_Inquiry_Mode line above with this one: with the mode known and the mask open, silence here is the air or the BR/EDR receiver, no longer this host's event plumbing"
             }
         );
+        // ---- BTRX-ROOM — the one reading a zero cannot make on its own -------------------------
+        // THE CONFOUND, stated plainly because three boots have now been read past it. `responses=0`
+        // is consistent with TWO different worlds and this stage cannot tell them apart from inside:
+        //   (1) this host's BR/EDR receiver is deaf, or its inquiry ID packets never reach the air;
+        //   (2) the receiver is fine and NO DEVICE IN RANGE WAS INQUIRY-SCANNING during the window.
+        // World (2) is not exotic. A phone, a laptop or a headset that is merely PAIRED and idle is
+        // not discoverable — modern devices inquiry-scan only while a pairing screen is open — so a
+        // room can be full of classic radios and answer an inquiry with silence, correctly. The LE
+        // scan hearing this speaker does NOT close the gap either: it proves the peer is powered and
+        // in range, not that it is inquiry-scanning on classic.
+        //
+        // THE INSTRUMENT THAT DOES SEPARATE THEM is a second, KNOWN-DISCOVERABLE device — a phone
+        // held on its Bluetooth settings screen for the whole window. It is an operator step, not a
+        // code change, which is why this stage's contribution is to NAME it in the capture rather
+        // than to claim a verdict it has not earned. The line is printed only on the zero path; a
+        // boot that heard anything at all has already answered the question it asks.
+        if st.inq_responses == 0 && !st.blind {
+            serial_println!(
+                ":: bt-c1: [{}] BTRX-ROOM — THIS ZERO IS NOT YET A VERDICT ON THE RECEIVER. inquiry_mode_in_force={} inquiry_length={}ms(both trains, two passes each). responses=0 is equally consistent with (a) a deaf BR/EDR receiver and (b) a room in which nothing was inquiry-scanning — an idle paired device is NOT discoverable, and the LE scan hearing this speaker proves it is powered and in range, NOT that it is inquiry-scanning on classic. THE DECIDING CONTROL IS AN OPERATOR STEP: re-fly with a phone held on its Bluetooth settings screen for the whole window. Phone heard, speaker not => this receiver WORKS and the speaker is not inquiry-scanning. NEITHER heard => the receiver is deaf and BTRX-PATCHRAM above is the surviving hypothesis == witness ::",
+                self.idx,
+                match mode_in_force {
+                    Some(m) => match m {
+                        0x00 => "0x00 STANDARD(0x02)",
+                        0x01 => "0x01 WITH-RSSI(0x22)",
+                        0x02 => "0x02 RSSI+EIR(0x2F)",
+                        _ => "RESERVED-OUT-OF-RANGE",
+                    },
+                    None => "UNKNOWN (the read-back gave no well-formed reply)",
+                },
+                BT_C1_INQUIRY_LEN as u32 * 1280
+            );
+        }
         serial_println!(
             ":: bt-c1: [{}] page fields — psrm={:#04x}({}) clock_offset={:#06x}(bit15 {}) source={} == witness ::",
             self.idx, psrm,
