@@ -6536,7 +6536,7 @@ fn drag_settle_disarm() {
 /// `arch::without_interrupts`, and `video::wm`'s table guard is an `arch::IrqMask`, so neither lock
 /// can be held across a preemption in the first place.
 #[cfg(feature = "witness")]
-const SFQ_QUIESCE: bool = true;
+const SFQ_QUIESCE: bool = false;
 
 /// SELFTEST-QUIESCE — run `f` with this core's interrupts masked on the quiesced build, and
 /// unchanged on the control build.
