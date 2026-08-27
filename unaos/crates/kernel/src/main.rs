@@ -1565,7 +1565,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // RAST-1/RAST-TEGRA (x86/virt + aarch64/virt, `rast` knob): run the software-rasterizer cube demo
     // through the panel `Screen` (call-never-edit), then hand the panel back. QEMU-witnessable path —
     // GICv2 virt + ramfb reaches here (Orin panel is wired in `tegra_early_stop`). Byte-identical off.
-    #[cfg(all(feature = "rast", not(feature = "pi"), not(feature = "tegra")))]
+    #[cfg(all(feature = "rast", any(target_arch = "x86_64", all(target_arch = "aarch64", not(feature = "pi"), not(feature = "tegra")))))] // `pi`/`tegra` are AARCH64 BOARD SELECTORS and may only subtract on aarch64. This is the virt/x86 arm of three; `tegra_rast_demo_maybe` and `pi_rast_demo_maybe` are the others and BOTH carry `target_arch = "aarch64"` — this one did not, which was the defect: a build that set `pi` on x86 silently lost the demo AND kept the inline loop the `not(rast)` arm above hands off for, strictly worse than either branch. Folded onto this line to stay line-neutral (panic `Location` records embed line numbers; PARITY §5.3).
     {
         unaos_kernel::video::fbcon::detach();
         unaos_kernel::rast_demo::run(&mut screen);
