@@ -202,13 +202,37 @@ writable volume arrived.
   `(45, 43, 85)` — `wm::DESKTOP_BG`, `0x2D2B55` — and `(30, 30, 30)` is `video::PANEL_BG`,
   `0x1E1E1E`. A swapped decode would have rendered the desktop as `0x552B2D`.
 
+- **The KEY, in QEMU — through the real HID path, with the witness knob OFF.** QEMU's `send-key`
+  delivers the `print` qcode to the emulated `usb-kbd`, which the builder attaches to `ehci.0` — so
+  the report is decoded by `decode_boot_keyboard`, the same function that decodes the rMBP's
+  internal keyboard. Two presses, 30 s apart, over QMP on a `test-fat sf` run carrying **no**
+  `prtscrst` (so the key was the only possible trigger):
+
+  ```
+  :: PRTSCR: PrintScreen (HID 0x46) down on EHCI -> capture armed ::
+  :: PRTSCR: SCREEN0.PNG 1280x800 3073098 bytes -> OK ::
+  :: PRTSCR: PrintScreen (HID 0x46) down on EHCI -> capture armed ::
+  :: PRTSCR: SCREEN1.PNG 1280x800 3073098 bytes -> OK ::
+  ```
+
+  Two files, two indices — the no-overwrite rule doing its job. Both extract from the image and
+  decode cleanly (real zlib, all chunk CRCs, `800 * (1 + 1280*3)` raw bytes each). This exercises
+  the whole chain the metal will: HID report → press-edge diff → `request()` → the flag → the
+  device-service pass → `capture()` → the FAT write.
+
 - **Refusal path, in QEMU.** `UNAOS_PRTSCRST=1 ./arroyo test` attaches no FAT-bearing device and
-  prints the honest no-volume line, once, naming the handle census it inspected.
+  prints the honest lines, once each, naming the handle census it inspected — first the read-only
+  internal SD reader the ladder falls back to, then `NotFat` on the raw pattern image.
 
 - **Gate.** `UNAOS_WC=1 ./arroyo test` green with `wc` in the `⚡ kernel features:` banner;
   `./arroyo check` green on both arches, with `prtscrst` added to the `x86-all` and `arm-pi`
   cfg-coverage legs so the knob-on build is type-checked too.
 
-- **Print Screen on metal**: not proven here. A QEMU `send-key` of the `print` qcode reaches the
-  emulated `usb-kbd` and therefore the same EHCI decoder hook, but the key on the rMBP's own
-  internal keyboard is the seat's proof, at an arc boundary, on the machine.
+- **Print Screen on metal**: not proven here, and QEMU cannot prove it. What the emulated `usb-kbd`
+  proves is that the decoder hook, the deferral, the encode and the write all work on a real report.
+  What it cannot prove is that the rMBP's own internal keyboard puts usage 0x46 on the wire when
+  that key is struck — Apple keyboards are free to place the function row behind an `fn` layer or a
+  vendor usage page. That, and the timing of a 2880x1800 capture (~5.2 M `read_pixel` probes on a
+  WC-mapped GOP aperture; the QEMU panel is 1280x800), are the seat's proof at an arc boundary, on
+  the machine. If 0x46 never arrives, the census (`prtscr::census()`, and the "capture armed" line's
+  absence) says so directly, which is why the key edge announces itself before deferring.
