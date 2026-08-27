@@ -2541,7 +2541,7 @@ impl FbCon {
 /// ### Why a new knob rather than widening `pidesk`
 ///
 /// `pidesk` on this board pulls in the whole desktop cascade — `dock::focus_set` reaches
-/// `arch::aarch64::syscall`, gated `any(baremetal, tegra_el0)` — and §5.2's stop-line stands over it
+/// `arch::aarch64::syscall`, gated `aarch64_el0` (the named EL0 capability) — and §5.2's stop-line stands over it
 /// (a 16 KiB stack overflow on two consecutive Pi metal boots that no QEMU gate in this tree can
 /// reproduce). Arming a FONT must not require crossing that. `orinface` is standalone, mirroring
 /// `orindesk`/`orinclick`'s spelling: no window, no `wm` lock, no `dock`, no syscall surface. The
