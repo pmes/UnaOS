@@ -16751,7 +16751,10 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: u
 /// The `win` box is the present's box `(x, y, w, h)`; `bar` is the strip's rect from
 /// `menubar::strip_rect`. Rows outside the bar's `[y0, y1)` contribute 0 through [`span_occ`], so a
 /// window that merely touches the strip's edge and one that buries it both read honestly.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+// OCC-BAR-PAR: witness plus "the menubar exists" — x86 unconditionally (the spec leg's
+// selftest calls it there even without `wc`), aarch64 exactly when `desktop_firmware`
+// declares `video/menubar`, the sole aarch64 caller. The body is arch-neutral arithmetic.
+#[cfg(all(feature = "witness", any(target_arch = "x86_64", feature = "desktop_firmware")))]
 pub(crate) struct OccBarProbe {
     /// Window blits whose clip CARRIED the bar — the `occclip_bar` population, both runs identical.
     pub pop_prot: u64,
@@ -16763,7 +16766,7 @@ pub(crate) struct OccBarProbe {
     pub px_fault: u64,
 }
 
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(all(feature = "witness", any(target_arch = "x86_64", feature = "desktop_firmware")))]
 pub(crate) fn occ_bar_probe(
     bar: (usize, usize, usize, usize),
     win: (usize, usize, usize, usize),

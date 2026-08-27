@@ -374,25 +374,15 @@ static OCCPAR_DONE: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "witness")]
 const OCCPAR_DEADLINE_OFF_PASSES: u64 = 600;
 
-/// MENUBAR-OCC-PAR — **the READING, per arch.** `Some((pop_prot, px_prot, pop_fault, px_fault))`
-/// where the instrument exists; `None` where it does not.
-///
-/// This is the ONE place the arch difference lives, and it is a DISPATCH to the same capability rather
-/// than a capability one chip has and the other cannot. x86 delegates to [`wm::occ_bar_probe`] — the
-/// present's own span walk, never a copy of it.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+/// MENUBAR-OCC-PAR — **the READING, one body.** Delegates to [`wm::occ_bar_probe`] — the present's
+/// own span walk, never a copy of it — on BOTH arches since the probe's gate was widened to
+/// "witness plus the menubar exists" (OCC-BAR-PAR, the fold that closed this file's own ledger
+/// note about the pending two-arm dispatch). The `Option` stays: a future arch without the
+/// instrument answers `None` here rather than growing a new cfg at every caller.
+#[cfg(feature = "witness")]
 fn occ_bar_reading(bar: strip::Rect, win: strip::Rect) -> Option<(u64, u64, u64, u64)> {
     let p = wm::occ_bar_probe(bar, win);
     Some((p.pop_prot, p.px_prot, p.pop_fault, p.px_fault))
-}
-
-/// MENUBAR-OCC-PAR — the aarch64 arm of [`occ_bar_reading`]. The PROTECTION is present on this arch
-/// (see the ledger above); the READING is not, because `wm::occ_bar_probe` is
-/// `all(feature = "witness", target_arch = "x86_64")` and `video/wm.rs` is out of this lane. Deleting
-/// this arm is the whole of what widening that gate costs here.
-#[cfg(all(feature = "witness", target_arch = "aarch64"))]
-fn occ_bar_reading(_bar: strip::Rect, _win: strip::Rect) -> Option<(u64, u64, u64, u64)> {
-    None
 }
 
 /// MENUBAR-OCC-PAR — **the clip's PRECONDITION, measured, from this file alone, on both arches.**
