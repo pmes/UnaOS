@@ -9226,6 +9226,91 @@ fn comp_mark_row(y: usize) {
 #[inline]
 fn comp_mark_row(_y: usize) {}
 
+// ---- PHASE31: the `paint_window` interior breadcrumbs -----------------------------------------
+//
+// THE READING THIS EXISTS FOR. The integration image wedges at `win=N phase=31 row=0`: mark 31 is
+// stamped immediately before the band body's `FrameBuffer::init`, and marks 32/33 both follow
+// `paint_window`, so a sample frozen at 31 is INSIDE `paint_window`, on band 0, and the trace says
+// nothing further. `paint_window` is ~540 lines and paints six distinct regions; "somewhere in
+// there" is not a stall point. These constants split it so the NEXT sample names its own.
+//
+// WHY TWO BASES. `paint_window` has exactly two callers — the banded stage body (which passes
+// `dup = true`) and the direct fallback (`dup = false`) — and the coarse marks they set (31 and 34)
+// are the only thing that distinguished them. An interior mark that overwrote both would trade one
+// ambiguity for another, so the sub-phase is offset by caller: `4x` is the STAGED caller, `5x` the
+// DIRECT one. The decade names the caller, the units name the region, and `at=` spells the units
+// out for a reader who does not have this table in front of them.
+//
+// COST. One relaxed store pair per region entered (ten per call at worst) plus one relaxed store
+// per row in the three chrome row loops and the content row loop — the same `comp_mark`/
+// `comp_mark_row` primitives WCSER-H already rides at this cadence, compiled out entirely on any
+// build that is not x86_64 + `witness`. No lock, no allocation, no branch on a painted pixel: the
+// paint behaviour is byte-for-byte unchanged.
+const PW_STAGED: u32 = 40;
+const PW_DIRECT: u32 = 50;
+/// Prologue: arguments derived, nothing painted yet.
+const PW_ENTRY: u32 = 0;
+/// The chrome FACE fill — CHROMEBAND's own loop, via [`fill_rect_ceramic`]. `row=` is the box-local
+/// row the material is being machined for, so a frozen row here is a stalled span write and a
+/// crawling one is the walk itself.
+const PW_FACE: u32 = 1;
+/// The title strip's per-row gradient. `row=` is the strip row.
+const PW_STRIP: u32 = 2;
+/// Keyline + bevel: eight `fill_rect_v` calls, no loop of its own.
+const PW_FRAME: u32 = 3;
+/// The rounded top corners. `row=` is the arc row.
+const PW_CORNER: u32 = 4;
+/// The three title-bar control discs.
+const PW_CTRL: u32 = 5;
+/// The caption text.
+const PW_CAPTION: u32 = 6;
+/// Chrome done; the content extent being derived. Nothing is painted in this region, so a sample
+/// here is a stall in `dst.info()` or in the surface bounds arithmetic — i.e. essentially a report
+/// that the wedge is NOT in a paint loop at all.
+const PW_PRE: u32 = 7;
+/// The content upscale. `row=` is the SOURCE row, on both callers — see the note at the loop head.
+const PW_CONTENT: u32 = 8;
+/// Returned. Both exits stamp it, so a sample reading `pw-exit` is between `paint_window` and the
+/// caller's next mark rather than inside the painter.
+const PW_EXIT: u32 = 9;
+
+/// PHASE31 — spell a phase gauge out. The tripwire has always printed the NUMBER, which is exactly
+/// as legible as the table the reader happens to have open; this prints the table's own answer
+/// beside it so a serial capture is readable without the source.
+///
+/// `&'static str` throughout and no formatting of its own, so the cost is one match on a path that
+/// prints at most once a second and only while the gate is already overdue.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+fn comp_phase_name(phase: u32) -> &'static str {
+    match phase {
+        0 => "gate-idle",
+        1 => "shadow-pin",
+        2 => "wcg-begin",
+        3 => "draw-win",
+        4 => "post-draw",
+        30 => "stage-entry",
+        31 => "band-layer",
+        32 => "sprite-offer",
+        33 => "span-flush",
+        34 => "direct-entry",
+        35 => "cursor-tail",
+        // PHASE31 — the `paint_window` interior. Both decades map to the same region name; the
+        // NUMBER is what says whether the painter was reached from the staged band body (4x) or
+        // from the direct fallback (5x).
+        p if p == PW_STAGED + PW_ENTRY || p == PW_DIRECT + PW_ENTRY => "pw-entry",
+        p if p == PW_STAGED + PW_FACE || p == PW_DIRECT + PW_FACE => "pw-face",
+        p if p == PW_STAGED + PW_STRIP || p == PW_DIRECT + PW_STRIP => "pw-strip",
+        p if p == PW_STAGED + PW_FRAME || p == PW_DIRECT + PW_FRAME => "pw-frame",
+        p if p == PW_STAGED + PW_CORNER || p == PW_DIRECT + PW_CORNER => "pw-corner",
+        p if p == PW_STAGED + PW_CTRL || p == PW_DIRECT + PW_CTRL => "pw-ctrl",
+        p if p == PW_STAGED + PW_CAPTION || p == PW_DIRECT + PW_CAPTION => "pw-caption",
+        p if p == PW_STAGED + PW_PRE || p == PW_DIRECT + PW_PRE => "pw-pre",
+        p if p == PW_STAGED + PW_CONTENT || p == PW_DIRECT + PW_CONTENT => "pw-content",
+        p if p == PW_STAGED + PW_EXIT || p == PW_DIRECT + PW_EXIT => "pw-exit",
+        _ => "phase-unnamed",
+    }
+}
+
 /// WCSER — a pass was declined and its damage is still on the table. Cleared by the holder's re-run
 /// loop; see `composite` for the lost-wakeup close.
 #[cfg(target_arch = "x86_64")]
@@ -9422,13 +9507,18 @@ pub fn wcser_overdue_probe() {
         return; // standing repeat, paced to DEADMAN's cadence
     }
     COMP_OVERDUE_LAST_MS.store(now, Relaxed);
+    // PHASE31 — `at=` is the same gauge as `phase=`, spelled. Read ONCE into a local and both
+    // fields derived from that one load, so the number and the name can never describe two
+    // different samples of a gauge another core is still stamping.
+    let phase = COMP_PASS_PHASE.load(Relaxed);
     serial_println!(
-        ":: [wcser] PASS OVERDUE holder=c{} age_ms={} pending={} win={} phase={} row={} == tripwire ::",
+        ":: [wcser] PASS OVERDUE holder=c{} age_ms={} pending={} win={} phase={} at={} row={} == tripwire ::",
         holder,
         age,
         COMP_PENDING.load(core::sync::atomic::Ordering::Acquire),
         COMP_PASS_WIN.load(Relaxed),
-        COMP_PASS_PHASE.load(Relaxed),
+        phase,
+        comp_phase_name(phase),
         COMP_PASS_ROW.load(Relaxed),
     );
     // PCIH — root-port-at-wedge sampler, on the same cadence as the tripwire line (first
@@ -18042,6 +18132,11 @@ fn draw_window(
     // draw_window, window 7) and no finer; these stamps split phase 3 so the next tripwire
     // line names the loop: 30 stage entry, 31 band compose, 32 sprite offer, 33 span flush
     // (row= carries the panel row), 34 direct fallback, 35 cursor uncover tail.
+    //
+    // PHASE31 — 31 and 34 are now the ENTRY to their painter, not the whole of it. `paint_window`
+    // stamps its own interior over both (4x from the staged band body, 5x from the direct
+    // fallback), so a sample still reading 31 is between `comp_mark` and `FrameBuffer::init` and a
+    // sample inside the painter reads `at=pw-face`/`pw-content`/… instead. See the `PW_*` table.
     comp_mark(r.id, 30);
     let staged = stage_window(
         fb,
@@ -18623,6 +18718,11 @@ fn fill_rect_ceramic(
         // Rows above the box cannot occur (every chrome rect starts at or below `lby`), but the
         // saturating form keeps the index total rather than relying on that.
         let brow = (dy - lby).max(0) as usize;
+        // PHASE31 — the row gauge on CHROMEBAND's walk. Read under `at=pw-face`, so a wedge in the
+        // face fill reports the BOX-LOCAL row it stopped machining rather than the band origin the
+        // caller stamped on entry. Same primitive and same cadence as the content loop's stamp: one
+        // relaxed store per row, beside the `chrome_row_note` this loop already pays.
+        comp_mark_row(brow);
         fill_rect_v(dst, x, dy, w, 1, super::ceramic::shade(base, brow));
     }
 }
@@ -18660,6 +18760,12 @@ fn paint_window(
     focused: bool,
     dup: bool,
 ) {
+    // PHASE31 — which caller this is, decided once, before `dup` is narrowed below by the upscale's
+    // own preconditions. The PARAMETER is the caller's identity (`true` only from the banded stage
+    // body, `false` only from the direct fallback); the SHADOWED `dup` further down is a statement
+    // about the replication path and is not the same question. See the `PW_*` table.
+    let mk = if dup { PW_STAGED } else { PW_DIRECT };
+    comp_mark(r.id, mk + PW_ENTRY);
     let lbx = bx.saturating_sub(ox);
     // WC-M — signed: a band below the first has the box's top edge above its own row 0.
     let lby = by as isize - oy as isize;
@@ -18714,6 +18820,9 @@ fn paint_window(
         // per pixel — see `fill_rect_ceramic`.
         let border = super::theme::CHROME_FACE;
         crispy_witness();
+        // PHASE31 — CHROMEBAND's own loop begins here. `fill_rect_ceramic` stamps `row=` per
+        // machined row, so a wedge in the face fill names the row it stopped on.
+        comp_mark(r.id, mk + PW_FACE);
         if c2_cols > 0 && c2_rows > 0 {
             let cx0 = r.x.saturating_sub(ox);
             let cy0 = r.y as isize - oy as isize;
@@ -18751,8 +18860,10 @@ fn paint_window(
         // are `title_row_color`'s and are untouched; ceramic machines the result. The row index is
         // `BORDER + j`, the strip row's offset inside the box, so the title's grain is continuous
         // with the frame's around it rather than restarting at the strip.
+        comp_mark(r.id, mk + PW_STRIP);
         let strip_w = bw.saturating_sub(2 * BORDER);
         for j in 0..TITLE_H {
+            comp_mark_row(BORDER + j);
             fill_rect_v(
                 dst,
                 lbx + BORDER,
@@ -18775,6 +18886,7 @@ fn paint_window(
         // Peter's directive names the borders as a *surface*; the surface is the face above, which
         // is machined. If the taste gate wants the edges machined too, it is one `shade` call on
         // each of `kl`, `bl` and `bs`.
+        comp_mark(r.id, mk + PW_FRAME);
         let bev = super::theme::BEVEL;
         let kl = super::theme::FRAME_LINE;
         // CRISPYWIRE-REVIEW — the keyline's THICKNESS is `theme::BEVEL` too, not a literal `1`.
@@ -18837,8 +18949,10 @@ fn paint_window(
         //
         // The arc keyline below is one pixel per row by construction — it is the boundary of the
         // filled span, not a rect edge, so it has no thickness to take from `kw`.
+        comp_mark(r.id, mk + PW_CORNER);
         let rad = super::theme::CORNER_RADIUS.min(bw / 2).min(bh / 2);
         for j in 0..rad {
+            comp_mark_row(j);
             let dy = lby + j as isize;
             if dy < 0 {
                 continue;
@@ -18864,6 +18978,7 @@ fn paint_window(
         // drawn disc and the clickable disc are one set of pixels by construction. No glyph is
         // drawn inside them: the kit gives the controls a fill and no symbol, and an invented X
         // would be an invented colour.
+        comp_mark(r.id, mk + PW_CTRL);
         let ctrl_w = match controls(r) {
             Some(_) => {
                 // WMCTRL — the glyph ink is a PUNCH-OUT of the strip the disc sits on: the title
@@ -18977,6 +19092,7 @@ fn paint_window(
         // the separation from the text — so `BORDER + CTRL_RESERVE` is the first caption column, and
         // the width budget below is unchanged: the caption still ends one `GAP` inside the far
         // frame. A row with no cluster (`ctrl_w == 0`) keeps the plain `BORDER + GAP` inset it had.
+        comp_mark(r.id, mk + PW_CAPTION);
         let cap_x = lbx + BORDER + if ctrl_w > 0 { CTRL_RESERVE } else { GAP };
         draw_title(
             dst,
@@ -18991,8 +19107,10 @@ fn paint_window(
     }
 
     if r.x >= pw || r.y >= ph {
+        comp_mark(r.id, mk + PW_EXIT);
         return;
     }
+    comp_mark(r.id, mk + PW_PRE);
     // F6 — how many source rows/columns can actually land on the panel: each source pixel occupies
     // `scale` destination pixels, so `ceil(remaining_panel / scale)` source units are visible.
     let vis_cols = (pw - r.x).div_ceil(r.scale).min(r.w);
@@ -19039,13 +19157,19 @@ fn paint_window(
     // In LE memory Bgr stores `b, g, r` — the 0x00RRGGBB word unchanged — while Rgb stores
     // `r, g, b`, the same word with R and B exchanged. Mirrors `FrameBuffer::encode4` exactly.
     let swap = matches!(dinfo.pixel_format, unaos_boot_info::PixelFormat::Rgb);
+    comp_mark(r.id, mk + PW_CONTENT);
     let surf = r.surf as *const u8;
     for row in 0..rows {
-        // WCSER-H — row gauge on the DIRECT path only (`!dup` = painting the panel, not a RAM
-        // layer): a phase=34 wedge otherwise leaves `row=` stale from the last staged window.
-        if !dup {
-            comp_mark_row(row);
-        }
+        // WCSER-H stamped this gauge on the DIRECT path only, because the phase it would have been
+        // read under (34) was shared with the staged painter and a staged row would have left it
+        // stale for a direct wedge.
+        //
+        // PHASE31 retires that guard by removing its premise: the content loop now carries its own
+        // phase, and that phase is offset by CALLER (`pw-content` at 48 staged, 58 direct), so a
+        // row read under it can only have been stamped by the loop it is being read with. Marking
+        // both paths is what makes a staged wedge — the one the integration image actually
+        // produces — name a row instead of reporting the band origin it entered with.
+        comp_mark_row(row);
         // WC-M — where this source row's `scale` destination lines start, in the DESTINATION's own
         // coordinates. Negative means the row begins above `dst`'s row 0, which only a chunked
         // stage's second-or-later band can produce.
@@ -19183,6 +19307,7 @@ fn paint_window(
             dst.blit((y * dw + cx) * dbpp, line);
         }
     }
+    comp_mark(r.id, mk + PW_EXIT);
 }
 
 /// WC-H — the back-layer path: compose the window into cached RAM, then present its clipped outer
