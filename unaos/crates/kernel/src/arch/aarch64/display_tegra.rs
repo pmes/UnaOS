@@ -1108,7 +1108,7 @@ pub fn jd1_dc_probe(chan: &super::bpmp_tegra::Chan, dtb_addr: u64, dtb_size: usi
 //
 // WHY `orinclick` IMPLIES `tegra_el0`, and why that is the SHAPE OF THE CONFIGURATION rather than a
 // wider net. `wc_click_route` lives in `arch/aarch64/syscall.rs`, and `arch/aarch64/mod.rs:46` gates
-// `pub mod syscall;` on `any(feature = "baremetal", feature = "tegra_el0")`. `baremetal` implies `pi`
+// `pub mod syscall;` on `feature = "aarch64_el0"`. `baremetal` implies `pi`
 // and `pi` + `tegra` is a hard `compile_error!` (`arch/aarch64/serial.rs:22`), so on the Orin the ONLY
 // satisfiable term is `tegra_el0`. A standalone `orinclick = []` in the `orindesk`/`jd1dc`/`smpmark`
 // mould would have been a knob that compiles NOTHING unless the operator happens to also set
