@@ -43,12 +43,12 @@ pub mod sched;
 // except for the `uslots` facade (below) it now names instead of `super::boot` — the Pi keeps the
 // BCM2711 slot system in `boot.rs`, the Orin gets the tegra port in `mmu_tegra_el0.rs`, and syscall.rs
 // compiles against whichever one the active feature selects.
-#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+#[cfg(feature = "aarch64_el0")]
 pub mod syscall;
 // BANDY-1 (ROADMAP §3b arc 1): the on-UnaOS SMessage bus — v1 subset codec (wire layer of the
 // SYS_MSEND/SYS_MRECV transport in syscall.rs). Gated like syscall.rs — JETSON-EL0 (M1b) widened both
 // from `baremetal` to `any(baremetal, tegra_el0)` together, since the bus IS syscall.rs's wire layer.
-#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+#[cfg(feature = "aarch64_el0")]
 pub mod bus;
 // JM3: Jetson Orin Nano (Tegra234) kernel-owned MMU. The tegra/UEFI build maps RAM Normal-WB + the
 // Tegra device windows Device-nGnRE before touching any peripheral MMIO (the R4 UARTC-fault fix).
@@ -72,7 +72,7 @@ pub mod mmu_tegra_el0;
 // `tegra_el0` implies `tegra`, and `pi`/`tegra` are mutually exclusive), but `baremetal` is written to
 // win the arm explicitly so a nonsensical both-on build picks one deterministically instead of
 // colliding on a duplicate glob import.
-#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+#[cfg(feature = "aarch64_el0")]
 pub mod uslots {
     #[cfg(feature = "baremetal")]
     pub use super::boot::*;

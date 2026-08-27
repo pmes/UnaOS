@@ -2494,9 +2494,9 @@ fn midden_facts() -> midden_core::Facts {
     // `arch::syscall` itself is `baremetal`-gated on aarch64, so the cap must be read under the
     // SAME condition that decides whether the verbs exist — a build with no process table has no
     // storm cap to name, and 0 is the honest stand-in because `proc_verbs` is false beside it.
-    #[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
+    #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
     let (proc_verbs, proc_rows) = (true, crate::arch::syscall::proc_table_rows());
-    #[cfg(not(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64")))]
+    #[cfg(not(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64")))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
     let (proc_verbs, proc_rows) = (false, 0usize);
     midden_core::Facts {
         aarch64: cfg!(target_arch = "aarch64"),
@@ -2584,13 +2584,13 @@ impl midden_core::Volume for FatVolume {
     ///
     /// No [`EXEC_BIND`] stamp: that instrument and its `fatverb_storage_witness` reader are x86-only
     /// (they compare FAT *handles*, and this arch binds a mount table, not a handle).
-    #[cfg(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"))]
+    #[cfg(all(feature = "aarch64_el0", target_arch = "aarch64"))]
     fn is_file(&mut self, name: &str) -> bool {
         exec_resolve(name).is_some()
     }
     // No process table, no loader, so `Facts::exec` is false and the core never calls this.
     // Answering `false` keeps the promise: no behaviour change on a build that cannot launch.
-    #[cfg(not(any(target_arch = "x86_64", all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"))))]
+    #[cfg(not(any(target_arch = "x86_64", all(feature = "aarch64_el0", target_arch = "aarch64"))))]
     fn is_file(&mut self, _name: &str) -> bool {
         false
     }
@@ -2924,13 +2924,13 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             return false;
         }
         midden_core::Plan::Exec { typed, name } => {
-            #[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
+            #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
             bare_exec(console, &typed, &name);
             // BARENAME (§6.6a): the day a loader arrived on aarch64 the compiler pointed here, as
             // this comment used to promise. What is left is the build with no process table at all,
             // which never sets `Facts::exec` and so is never handed this arm; the branch stays so
             // the match is total.
-            #[cfg(not(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64")))]
+            #[cfg(not(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64")))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
             {
                 let _ = (&typed, &name);
                 console.println("Unknown command. Type 'help' for assistance.");
@@ -3464,7 +3464,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // foreign volume-level path from the same surface. `vfs <op> <path>`.
             vfs_cmd(console, &args);
         },
-        #[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
+        #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
         "run" => {
             // EXEC-1: load an ELF64 user program off the VFS namespace and execute it in user mode, reporting its
             // exit status. Rides the SAME `MountTable` the `vfs` verb uses (`/fat` = FAT boot partition,
@@ -4059,7 +4059,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("rebooting: invoking the platform firmware mechanism...");
             crate::power::reboot();
         },
-        #[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
+        #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
         "bg" => {
             // BGRUN-1: run a user program in the BACKGROUND — the shell returns to its prompt at once and
             // the program keeps running (and, if windowed, its window stays OPEN, so TAB has a ring to
@@ -4244,13 +4244,13 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 serial_println!(":: STORM: fatw REFUSED — aarch64/baremetal-only provocation, not ported to x86 ::");
             }
         },
-        #[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
+        #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
         "jobs" => {
             // BGRUN-1: list background programs and REAP the exited ones (this verb is the reaper — a
             // PEXITED row stays claimed until it is polled here, and the table is bounded). `jobs`.
             bg_jobs(console);
         },
-        #[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
+        #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
         "kill" => {
             // BGRUN-1: kill a background program by pid (SKILL-1 underneath — ASID-scoped, so ELF-2
             // sibling threads die with it; unconfirmed kills park the row PORPHANED and settle at the
@@ -4418,7 +4418,7 @@ fn parse_num(s: &str) -> Option<u64> {
 /// * **The machine check.** The aarch64 body pre-checks `e_machine == 183`; x86 wants
 ///   `EM_X86_64 = 62`. The kernel loader (`arch::x86_64::elf::validate_elf`) re-checks from scratch
 ///   either way — this pre-check only sharpens the operator's error text.
-#[cfg(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"))]
+#[cfg(all(feature = "aarch64_el0", target_arch = "aarch64"))]
 fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc::vec::Vec<u8>> {
     use crate::fs::vfs::NodeKind;
     // Cap = the kernel user window; a file at or under it may still be rejected by the loader (a flat blob
@@ -4634,7 +4634,7 @@ fn cyc_to_us(dt: u64) -> u64 {
     dt.saturating_mul(1_000_000) / hz
 }
 
-#[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
+#[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
 fn run_program(console: &mut Console, path: &str) {
     let Some(bytes) = read_el0_image(console, "run", path) else {
         return;
@@ -4698,7 +4698,7 @@ fn run_program(console: &mut Console, path: &str) {
 
 /// BGRUN-1: one shell-side background job. The PATH is copied (bounded) so `jobs` can name it — the
 /// kernel row carries only the fixed task name. The pid is the durable key; asid rides for `kill`.
-#[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
+#[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
 #[derive(Clone, Copy)]
 struct BgJob {
     pid: u64,
@@ -4737,7 +4737,7 @@ struct BgJob {
 /// progresses — the SCHED-X86 deadlock rule is about two preemptible takers on ONE core. But note
 /// that `bg_jobs` holds this lock across `console.println`, which on a `wc` build routes through the
 /// compositor: a future second cross-core caller could spin for the length of a repaint.
-#[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
+#[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
 static BG_JOBS: spin::Mutex<[Option<BgJob>; 12]> = spin::Mutex::new([None; 12]);
 
 /// BGREAP-CLOSE: claim a row in [`BG_JOBS`], reclaiming provably-finished rows when the table is
@@ -4768,7 +4768,7 @@ static BG_JOBS: spin::Mutex<[Option<BgJob>; 12]> = spin::Mutex::new([None; 12]);
 ///
 /// A `Running` row is never touched: a full table of live jobs is a genuine refusal, and the caller
 /// still kills the pid it just spawned rather than leave it untrackable.
-#[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
+#[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
 fn bg_jobs_claim(jobs: &mut [Option<BgJob>; 12]) -> Option<usize> {
     use crate::arch::syscall::BgPoll;
     if let Some(i) = jobs.iter().position(|s| s.is_none()) {
@@ -4966,7 +4966,7 @@ fn storm_fat_writer(_: usize) {
 
 /// BGRUN-1: `bg <path>` — read the image, spawn it detached, record the job. The shell prompt is
 /// back the moment this returns; the program (and its window, if it creates one) keeps running.
-#[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
+#[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
 fn bg_program(console: &mut Console, path: &str) -> bool {
     let Some(bytes) = read_el0_image(console, "bg", path) else {
         return false;
@@ -5010,7 +5010,7 @@ fn bg_program(console: &mut Console, path: &str) -> bool {
 
 /// BGRUN-1: `jobs` — list background jobs and reap the exited ones. This is the SOLE reaper for
 /// bg rows: an exited job's kernel row stays claimed (PEXITED) until it is polled here.
-#[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
+#[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
 fn bg_jobs(console: &mut Console) {
     use crate::arch::syscall::BgPoll;
     let mut jobs = BG_JOBS.lock();
@@ -5087,7 +5087,7 @@ fn bg_jobs(console: &mut Console) {
 /// already free, and the operator's record of the outcome is THIS line rather than an uninformative
 /// `gone` from a later `jobs`. The witness carries the table accounting so a boot PROVES the transition
 /// instead of implying it.
-#[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
+#[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
 fn bg_kill_cmd(console: &mut Console, pid: u64) {
     let jobs = BG_JOBS.lock();
     let Some(job) = jobs.iter().flatten().find(|j| j.pid == pid).copied() else {
@@ -5140,7 +5140,7 @@ fn bg_kill_cmd(console: &mut Console, pid: u64) {
 /// the prompt to type `bg`. Registering it here is what keeps `jobs` and `kill` TRUTHFUL —
 /// `bg_kill_cmd` resolves a pid through this table and REFUSES one it cannot find, so an
 /// unregistered launch would be a running ring-3 program the operator can neither list nor stop.
-#[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
+#[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
 pub(crate) fn adopt_bg_job(pid: u64, slot: u64, name: &str) -> bool {
     let mut jobs = BG_JOBS.lock();
     // BGREAP-CLOSE: same claim as `bg_program`'s — see `bg_jobs_claim`.
@@ -5163,7 +5163,7 @@ pub(crate) fn adopt_bg_job(pid: u64, slot: u64, name: &str) -> bool {
 /// native UnaFS and `arroyo`'s `kernel8` FAT staging puts `VUG.ELF`/`VUGC.ELF`/`VUGX.ELF`/
 /// `STAT.ELF`/`PULSE.ELF` on the SD FAT, which `vfs_mount_table` binds at `/fat`. This constant is
 /// that half of the x86 sentence, named rather than inlined.
-#[cfg(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"))]
+#[cfg(all(feature = "aarch64_el0", target_arch = "aarch64"))]
 const EXEC_ROOT: &str = "/fat";
 
 /// BARENAME (PARITY §6.6a): resolve a bare-name candidate to an absolute VFS path, or `None`.
@@ -5183,7 +5183,7 @@ const EXEC_ROOT: &str = "/fat";
 ///    /fat/VUG.ELF` still the only way in — so it is the step that makes the port a port.
 ///
 /// A directory never resolves: a bare name launches a program.
-#[cfg(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"))]
+#[cfg(all(feature = "aarch64_el0", target_arch = "aarch64"))]
 fn exec_resolve(name: &str) -> Option<String> {
     use crate::fs::vfs::NodeKind;
     let mt = vfs_mount_table();
@@ -5214,7 +5214,7 @@ fn exec_resolve(name: &str) -> Option<String> {
 /// name at all, so the spelling is recovered the only honest way available: list the parent and
 /// take the entry that matches case-insensitively. A miss (or an unreadable parent) falls back to
 /// the resolved path unchanged — a display name is never worth a refusal.
-#[cfg(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"))]
+#[cfg(all(feature = "aarch64_el0", target_arch = "aarch64"))]
 fn exec_canon(path: &str) -> String {
     let (dir, leaf) = match path.rfind('/') {
         Some(0) => ("/", &path[1..]),
@@ -5265,7 +5265,7 @@ fn bare_exec_reresolve(console: &mut Console, typed: &str, name: &str) -> Option
 /// BARENAME (PARITY §6.6a): the aarch64 twin — [`exec_resolve`] again (the same walk the probe
 /// made, one command ago, closing the same race x86's re-mount closes) plus [`exec_canon`] for the
 /// display spelling. Same two message shapes, so a Pi capture and an rMBP capture read alike.
-#[cfg(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"))]
+#[cfg(all(feature = "aarch64_el0", target_arch = "aarch64"))]
 fn bare_exec_reresolve(console: &mut Console, typed: &str, name: &str) -> Option<(String, String)> {
     let Some(path) = exec_resolve(name) else {
         console.println(&alloc::format!("{}: {} went away before it could be started", typed, name));
@@ -5335,7 +5335,7 @@ fn bare_exec_reresolve(console: &mut Console, typed: &str, name: &str) -> Option
 /// The loader is untouched: the bytes go to `spawn_user_image_bg` exactly as `bg` sends them, so the
 /// per-segment W^X mapping, the ring-3 window bound and the fault-kill net are the same ones CFU-2's
 /// write gate is built on. This adds a way to CALL the loader, never a way to relax it.
-#[cfg(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64"))]
+#[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
 fn bare_exec(console: &mut Console, typed: &str, name: &str) -> bool {
     // --- re-resolve the core's answer over the live volume ---------------------------------------
     // The core probed a moment ago; re-resolving costs one walk and closes the window where the

@@ -222,7 +222,26 @@ pi = []
 # microSD slot (no UEFI/EDK2 — which can't read the SD post-handoff). Swaps the UEFI `_start(boot_info)`
 # entry for a raw `_start` that sets up a stack, zeroes BSS, enables a minimal MMU (so atomics work),
 # builds a BootInfo, and calls kernel_main. Implies `pi`. Enable via `UNAOS_BAREMETAL=1`.
-baremetal = ["pi"]
+baremetal = ["pi", "aarch64_el0"]
+# EL0-NAMING — THE CAPABILITY, not the board: this aarch64 build has an EL0 REGIME. A process table,
+# a syscall entry (`arch::aarch64::syscall`), EL0 exception vectors (`exceptions.rs`), `sched`'s
+# `spawn_user*`/`user_task_trampoline`/slot-teardown arms, and the `arch::uslots` per-task
+# address-space facade. NONE of that is Pi-specific or Tegra-specific; only the MMU slot BACKEND is
+# (`boot.rs` for BCM2711, `mmu_tegra_el0.rs` for Tegra234), and those keep their board names because
+# they are board-specific by construction.
+#
+# NOTHING SETS THIS DIRECTLY. It is implied by `baremetal` (Pi 4) and `tegra_el0` (Orin), which are
+# the two boards that have brought an EL0 regime up; a third would add one line here instead of
+# editing a predicate in fifty-one places. There is no `UNAOS_AARCH64_EL0` knob and there should not
+# be one — arming the capability without a board to back it compiles code whose slot backend does
+# not exist.
+#
+# Why it exists: the capability was spelled `any(feature = "baremetal", feature = "tegra_el0")` at 60
+# sites across five files. When the Orin's EL0 regime landed, that predicate had to be widened in
+# place at every one of them, and five were missed — leaving `run`/`bg`/`jobs`/`kill` compiled in on
+# a `tegra_el0` build and bare-name execution not (fixed in the commit before this one). A capability
+# with sixty spellings has sixty chances to drift; with one name it has none.
+aarch64_el0 = []
 # VUG-PAR: band-parallel Screen::flush — split the damaged row-copy blit (and large clears) into
 # disjoint scanline bands dispatched to free secondary cores via sched::spawn_joinable + a JoinHandle
 # join barrier, falling back to the single-core serial flush when no free AP is scheduled. Only
@@ -802,7 +821,7 @@ orinwdt = ["tegra"]
 # sha256 of target/aarch64_esp/kernel.elf). Enable via `UNAOS_TEGRA_EL0=1`. QEMU cannot exercise it
 # (the `tegra` feature has no QEMU model — the virt gate is a different machine), so the round-trip
 # witness is metal-owed/attended. See arch_arm64.md §JETSON-EL0.
-tegra_el0 = ["tegra"]
+tegra_el0 = ["tegra", "aarch64_el0"]
 
 # JETSON-XCARVE M2: the `UNAOS_XCARVE=1` inherited-xHCI-pointer instrumentation
 # (arch/aarch64/xusb_tegra.rs::jbxc_inherited_dump), fired at the top of `jb2b_attach` BEFORE the

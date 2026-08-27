@@ -161,7 +161,7 @@ pub fn stk_probe(at: &str) {
 /// task killed OFF-CPU skips it (`retire_killed` frees the Box without passing here); the population
 /// the instrument exists for — `shell-run` and the fixture programs, which retire via `exit()` —
 /// all report. Witness-gated like every U7STK instrument: media builds carry nothing.
-#[cfg(all(feature = "witness", any(feature = "baremetal", feature = "tegra_el0")))]
+#[cfg(all(feature = "witness", feature = "aarch64_el0"))]
 fn el0_stk_report(task: &Task) {
     let base = task.stack.as_ptr() as u64 + STACK_REDZONE as u64;
     let len = task.stack.len() as u64 - (STACK_REDZONE + STACK_HIGHGUARD) as u64;
@@ -362,9 +362,9 @@ pub struct Task {
     /// at `user_entry` with SP_EL0 = `user_sp`. 0 / unused for ordinary kernel tasks. Read only by
     /// `user_task_trampoline` (baremetal-only); on the `virt` build every task is a kernel thread, so
     /// these stay 0 and unread (`spawn_inner` still initialises them for the shared struct layout).
-    #[cfg_attr(not(any(feature = "baremetal", feature = "tegra_el0")), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "baremetal", feature = "tegra_el0")), allow(dead_code))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
     user_entry: u64,
-    #[cfg_attr(not(any(feature = "baremetal", feature = "tegra_el0")), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "baremetal", feature = "tegra_el0")), allow(dead_code))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
     user_sp: u64,
     /// M6d: the TTBR0_EL1 value (`root_pa | asid << 48`) that installs this task's address space, or 0
     /// for a kernel task (no switch — kernel mappings are Global and byte-identical in every root, so a
@@ -1660,7 +1660,7 @@ extern "C" fn task_trampoline() -> ! {
 /// Placeholder `entry` for user tasks: `spawn_user` sets `Task.entry` to this, but `user_task_trampoline`
 /// never calls it (it `eret`s to EL0 instead). Panics loudly if a path ever reaches it. EL0/user machinery
 /// is baremetal-only (the `virt` JC3 path runs kernel-thread CAPSTONE, no EL0 — see the module gate).
-#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+#[cfg(feature = "aarch64_el0")]
 fn user_never(_: usize) {
     unreachable!("user task's kernel `entry` was called");
 }
@@ -1678,7 +1678,7 @@ fn user_never(_: usize) {
 /// have headroom for the SVC/IRQ frame (256 GPR + 528 FP + 32 banked + the Rust handler) — it does;
 /// this trampoline uses only a shallow prologue. The msr+eret are one `noreturn` asm block so nothing
 /// runs after the drop. Baremetal-only (EL0/user machinery — the `virt` path has no EL0 this arc).
-#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+#[cfg(feature = "aarch64_el0")]
 extern "C" fn user_task_trampoline() -> ! {
     let cpu = percpu::this_cpu().cpu_index as usize;
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
@@ -3341,9 +3341,9 @@ static EL0_ROLLUP_NEXT: AtomicU64 = AtomicU64::new(0);
 ///
 /// Gated with `el0_refuse` itself on the EL0-machinery features, matching `SPREAD4_LOG_MAX`'s `pi`
 /// gate: the `virt`/JC3 legs build no EL0 spawn path at all, so on those the pair would be dead.
-#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+#[cfg(feature = "aarch64_el0")]
 const EL0_REFUSE_LOG_MAX: u32 = 16;
-#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+#[cfg(feature = "aarch64_el0")]
 static EL0_REFUSE_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// EL0-EL1CORE — is `cpu` known to be at EL1, i.e. may an EL0 task be dispatched FROM it? See the
@@ -3380,7 +3380,7 @@ pub fn el0_placement_possible(requested: usize) -> bool {
 /// and `name`/`requested` name what was refused and where it was asked to go, so a capture can tell a
 /// `bg` refusal from a `SYS_THREAD_SPAWN` one without cross-referencing anything. Never reached on
 /// `pi`: `el1_core` is `true` there, so no candidate is ever filtered out.
-#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+#[cfg(feature = "aarch64_el0")]
 fn el0_refuse(site: &str, name: &str, requested: usize) {
     let n = EL0_REFUSALS.fetch_add(1, Ordering::Relaxed) + 1;
     let seen = EL0_REFUSE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -3447,7 +3447,7 @@ fn el0_refuse(site: &str, name: &str, requested: usize) {
 /// than the thing it reads. But a reader diffing a DEFAULT-media capture against an ARMED one will go
 /// looking for the baseline `el0refuse=0` and not find it. Absent here means "not armed", NOT "dead".
 fn el0_refusal_rollup() {
-    if !cfg!(any(feature = "baremetal", feature = "tegra_el0")) {
+    if !cfg!(any(feature = "baremetal", feature = "tegra_el0")) { // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
         return;
     }
     let n = EL0_REFUSALS.load(Ordering::Relaxed);
@@ -3526,7 +3526,7 @@ fn pick_cpu_slot(requested: usize, slot: usize) -> usize {
 /// the spawn; it must NOT substitute a core of its own, which is the redirect this shape replaced.
 ///
 /// On `pi` the filter admits every core, so this is `Some(pick_cpu_slot(..))` and can never be `None`.
-#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+#[cfg(feature = "aarch64_el0")]
 fn el0_pick_cpu_slot(requested: usize, slot: usize) -> Option<usize> {
     pick_cpu_filtered(requested, slot, true)
 }
@@ -3773,7 +3773,7 @@ pub fn spawn_auto(name: &'static str, entry: fn(usize), arg: usize) -> u64 {
 ///
 /// EL0/user spawn machinery (this and `spawn_user_slot`/`spawn_user_inner`) is baremetal-only: it reaches
 /// into `super::boot` (the Pi-gated user MMU), and the `virt` JC3 path runs kernel-thread CAPSTONE only.
-#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+#[cfg(feature = "aarch64_el0")]
 pub fn spawn_user(name: &'static str, user_entry: u64, user_sp: u64, cpu: usize) -> u64 {
     spawn_user_inner(name, user_entry, user_sp, super::uslots::boot_ttbr0(), cpu, TASK_STACK_SIZE)
 }
@@ -3782,7 +3782,7 @@ pub fn spawn_user(name: &'static str, user_entry: u64, user_sp: u64, cpu: usize)
 /// slot root `slot_l1_pa | (asid << 48)` from `boot::slot_ttbr0`. `dispatch_next` installs it on
 /// dispatch; `exit` tears the slot down. This is what lets an EL0 program write its own (slot-private)
 /// stack without disturbing any other task.
-#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+#[cfg(feature = "aarch64_el0")]
 pub fn spawn_user_slot(
     name: &'static str,
     user_entry: u64,
@@ -3803,7 +3803,7 @@ pub fn spawn_user_slot(
 /// would pay for every task in the system to cover one"), and that law applies verbatim here.
 ///
 /// The size MUST come with its measurement — see the `run_user_image` spawn site for the shape.
-#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+#[cfg(feature = "aarch64_el0")]
 pub fn spawn_user_slot_stack(
     name: &'static str,
     user_entry: u64,
@@ -3815,7 +3815,7 @@ pub fn spawn_user_slot_stack(
     spawn_user_inner(name, user_entry, user_sp, user_ttbr0, cpu, stack_bytes)
 }
 
-#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+#[cfg(feature = "aarch64_el0")]
 fn spawn_user_inner(
     name: &'static str,
     user_entry: u64,
@@ -3937,7 +3937,7 @@ fn spawn_user_inner(
 /// cores run under the same root/ASID; nG user leaves are ASID-tagged and TLB maintenance is Inner-Shareable
 /// broadcast; and `teardown_user_slot` now repoints EACH exiting thread's core off the slot root, so the
 /// final ASID flush races no live root on any other core. Baremetal-only (reaches the Pi-gated user MMU).
-#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+#[cfg(feature = "aarch64_el0")]
 pub fn spawn_user_thread(
     name: &'static str,
     user_entry: u64,
@@ -4639,7 +4639,7 @@ static ASID_THREADS: [AtomicU32; KILL_ASID_SLOTS] =
 /// Count a freshly spawned EL0 task against its slot. Called from both user-task spawn paths BEFORE the
 /// run-queue push, so the task is countable before it can ever be dispatched. Kernel tasks (ASID 0) and
 /// out-of-range ASIDs are ignored, which makes this inert on `virt` (every task there is a kernel thread).
-#[cfg_attr(not(any(feature = "baremetal", feature = "tegra_el0")), allow(dead_code))] // both user-spawn paths are baremetal-only
+#[cfg_attr(not(any(feature = "baremetal", feature = "tegra_el0")), allow(dead_code))] // both user-spawn paths are baremetal-only — EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
 fn asid_thread_enter(user_ttbr0: u64) {
     let asid = (user_ttbr0 >> 48) as usize;
     if asid != 0 && asid < KILL_ASID_SLOTS {
@@ -4713,7 +4713,7 @@ fn kill_settle(idx: usize, tid: u64, remaining: u32) {
     if remaining > 0 {
         return; // siblings still live under this ASID — the request stays armed for them
     }
-    #[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+    #[cfg(feature = "aarch64_el0")]
     super::syscall::note_killed_task_retired(tid);
     #[cfg(not(feature = "baremetal"))]
     let _ = tid;
@@ -4966,7 +4966,7 @@ fn retire_killed(idx: usize, task: Box<Task>) {
     // M6d: the same slot retirement `exit()` performs, executed on the scheduler stack. Legal here for
     // the same reason it is legal there — the kernel half of every root is Global and identical, so
     // repointing TTBR0 to the boot root pulls nothing out from under the running (scheduler) context.
-    #[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+    #[cfg(feature = "aarch64_el0")]
     {
         let asid = task.user_ttbr0 >> 48;
         if asid != 0 {
@@ -5014,7 +5014,7 @@ pub fn exit() -> ! {
         // root does not pull the stack out from under us. Shared-window (ASID 0) and kernel (ttbr0 = 0)
         // tasks skip it. On `virt` (JC3) every task is a kernel thread (user_ttbr0 == 0), so there is no
         // slot to retire and the whole block is compiled out (it reaches into the Pi-gated `super::boot`).
-        #[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+        #[cfg(feature = "aarch64_el0")]
         {
             let asid = (*raw).user_ttbr0 >> 48;
             if asid != 0 {
@@ -5051,7 +5051,7 @@ pub fn exit() -> ! {
             // EL0STK: the retirement-time stack reading — this task's kernel stack is still live
             // (we are executing on it, at shallow depth) and about to be freed, so this is the last
             // and the honest moment to read the paint. See `el0_stk_report`.
-            #[cfg(all(feature = "witness", any(feature = "baremetal", feature = "tegra_el0")))]
+            #[cfg(all(feature = "witness", feature = "aarch64_el0"))]
             el0_stk_report(&*raw);
         }
         // Settle any kill request naming this task (by tid, or by ASID for a whole-process kill). Placed
@@ -5653,13 +5653,13 @@ fn drain_due_sleepers(cpu: usize) {
 /// tightest liveness bound it has to satisfy (UVUG-8r2's 2 s takeover heartbeat) and far below what a load
 /// meter can resolve, which is the whole point: the vug keeps its old "I am still polling" contract with
 /// the watchdogs while costing effectively nothing.
-#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+#[cfg(feature = "aarch64_el0")]
 const INPUT_WAIT_BACKSTOP_TICKS: u64 = 64;
 
 /// VUGPAUSE-2: the tick at which the next backstop pass is due. Global rather than per-CPU, and claimed by
 /// CAS, so the cadence is ONE pass per period across the whole machine and not one per core — six cores
 /// each waking every parked vug would be six times the work for exactly the same effect.
-#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+#[cfg(feature = "aarch64_el0")]
 static INPUT_WAIT_BACKSTOP_DUE: AtomicU64 = AtomicU64::new(0);
 
 /// VUGPAUSE-2: run the input-wait backstop if its period has elapsed. Called from the scheduler loop top,
@@ -5676,15 +5676,15 @@ static INPUT_WAIT_BACKSTOP_DUE: AtomicU64 = AtomicU64::new(0);
 /// input ring, nothing can park on one, and the backstop has nothing to do.
 #[inline]
 fn input_wait_backstop() {
-    #[cfg(not(any(feature = "baremetal", feature = "tegra_el0")))]
+    #[cfg(not(any(feature = "baremetal", feature = "tegra_el0")))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
     return;
-    #[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+    #[cfg(feature = "aarch64_el0")]
     {
         input_wait_backstop_inner();
     }
 }
 
-#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+#[cfg(feature = "aarch64_el0")]
 #[inline]
 fn input_wait_backstop_inner() {
     let now = super::timer::ticks();
@@ -7316,7 +7316,7 @@ pub fn fluid3_drain() -> (u64, u64, u64, [u32; FL3_BUCKETS]) {
 /// `note_killed_task_retired` already uses.
 fn kill_wake_parked() -> u32 {
     let mut n = futex_wake_killed();
-    #[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+    #[cfg(feature = "aarch64_el0")]
     {
         n += super::syscall::kill_wake_parked_semaphores();
     }

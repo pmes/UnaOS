@@ -47,19 +47,19 @@ static BOOT_EL: AtomicU8 = AtomicU8::new(0);
 // baremetal AND tegra_el0 (recovered boot-2 capture 2026-08-18: el0-hello's first `svc #0` hit the
 // fault logger, ESR=0x56000000 EC=0x15 ELR=0x7800000014 — JETSON-EL0 widened syscall.rs but not this
 // vector). Elsewhere it stays the halting __vec_sync, and svc_stub!() emits nothing.
-#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+#[cfg(feature = "aarch64_el0")]
 macro_rules! svc_vec {
     () => {
         "__vec_svc"
     };
 }
-#[cfg(not(any(feature = "baremetal", feature = "tegra_el0")))]
+#[cfg(not(any(feature = "baremetal", feature = "tegra_el0")))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
 macro_rules! svc_vec {
     () => {
         "__vec_sync"
     };
 }
-#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+#[cfg(feature = "aarch64_el0")]
 macro_rules! svc_stub {
     () => {
         r#"
@@ -103,7 +103,7 @@ __vec_svc_fault:
 "#
     };
 }
-#[cfg(not(any(feature = "baremetal", feature = "tegra_el0")))]
+#[cfg(not(any(feature = "baremetal", feature = "tegra_el0")))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
 macro_rules! svc_stub {
     () => {
         ""
@@ -750,7 +750,7 @@ extern "C" fn aarch64_fault_handler(kind: u64) -> u64 {
 ///
 /// FAR_EL1 is architecturally valid only for instruction/data aborts (EC 0x20/0x24) with ISS.FnV=0
 /// and for PC-alignment faults (0x22); for every other EC it holds a stale value, so print `--`.
-#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+#[cfg(feature = "aarch64_el0")]
 #[unsafe(no_mangle)]
 extern "C" fn aarch64_el0_fault_handler() -> ! {
     let (esr, elr, far): (u64, u64, u64);
