@@ -3234,7 +3234,7 @@ KERNEL_CFG_MATRIX=(
   # entries named only on this arm-* leg, so `x86_cfg_universe` drops them. Board legs +1; gate +1.
   # `./arroyo check` prints the live board/mix counts every run — read them there, not here.
   "arm-tegra-fbconpar ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,orinface,orindefer"
-  "arm-tegra-fbconpar-cross ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,orinconwin,orindesk,orinclick,orinface,orindefer"
+  "arm-tegra-fbconpar-cross ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,orinconwin,orindesk,orinclick,orinface,orindefer,orinvpar"
 
 
   # FBCONPAR CROSS (appended 2026-08-26) — the same two knobs on the FULL `pidesk` conjunction.
@@ -3465,6 +3465,48 @@ check_kernel_cfg() {
         echo -e "${COLOR_RED}❌ kernel cfg coverage FAILED (crate unaos-kernel), legs:${_failed}${COLOR_RESET}"
         return 1
     fi
+    # ── KNOB→LEG COVERAGE CHECK (2026-08-27, rmbp 7) ────────────────────────────────────────────
+    # Replaces the census comment's count invariant, which was asserted and rotted THREE times
+    # (2026-08-07 "sole gap" → GR21 "still the sole gap" → 2026-08-19 "STALE AGAIN, eight" →
+    # 2026-08-27 ten). The failure mode is silent, so it is now a CHECK, not a sentence.
+    #
+    # Rule: a declared feature named by NO leg is fine when the assumed-x86 mix inheritance
+    # genuinely compiles it (pure-x86 sites, or expression-only `cfg!` reads — both type-check on
+    # the derived legs). It is a REAL HOLE when the feature has aarch64-qualified `#[cfg]` sites:
+    # the x86 legs then compile it GREEN AND VACUOUS (the tegra_el0/EXECGATE precedent — a hole
+    # wearing a green verdict). Those FAIL here unless allowlisted below.
+    #
+    # Allowlist — KNOWN holes, each pre-assigned to the track that owns it (census block above):
+    #   vugdemo                          Pi lane   (module-decl gate; ~1.3 kloc compiled by no leg)
+    #   v3d_hubcm v3d_pmcycle v3d_ptbbracket  Pi lane   (armed polarity checked by no leg)
+    # Removing an entry here without adding the leg reintroduces a silent hole — don't.
+    #
+    # Control probe (parser tripwire): `vugpar` is named by arm-pi. If THIS check reports it
+    # uncovered, the parser has silently dropped leg rows (both seats hit exactly that bug via a
+    # character class that excluded `bcmaS1`'s uppercase) — the check then fails ITSELF, loudly.
+    local _kl_declared _kl_covered="," _kl_f _kl_miss=""
+    _kl_declared="$(awk '/^\[features\]/{f=1;next} /^\[/{f=0} f && /^[A-Za-z0-9_-]+[ \t]*=/{sub(/[ \t]*=.*/,"");print}' "$WORKSPACE_DIR/crates/kernel/Cargo.toml" | grep -v '^default$')"
+    for _row in "${_rows[@]}"; do
+        read -r _ _ _feats <<< "$_row"
+        _kl_covered="${_kl_covered}${_feats},"
+    done
+    case "$_kl_covered" in
+        *",vugpar,"*) : ;;
+        *) echo -e "${COLOR_RED}❌ knob→leg coverage: control probe FAILED — vugpar not seen on any leg; the leg parser itself is broken (uppercase/odd-char drop?). No coverage verdict from this run.${COLOR_RESET}"; return 1 ;;
+    esac
+    for _kl_f in $_kl_declared; do
+        case "$_kl_covered" in *",${_kl_f},"*) continue ;; esac
+        case "$_kl_f" in vugdemo|v3d_hubcm|v3d_pmcycle|v3d_ptbbracket) continue ;; esac
+        if grep -rlq "feature = \"${_kl_f}\"" "$WORKSPACE_DIR/crates/kernel/src/arch/aarch64/" 2>/dev/null \
+           || grep -rn "feature = \"${_kl_f}\"" "$WORKSPACE_DIR/crates/kernel/src/" 2>/dev/null | grep -q 'target_arch = "aarch64"'; then
+            _kl_miss="${_kl_miss} ${_kl_f}"
+        fi
+    done
+    if [ -n "$_kl_miss" ]; then
+        echo -e "${COLOR_RED}❌ knob→leg coverage:${_kl_miss} — aarch64-qualified feature(s) named by NO leg. The x86 mix legs compile these green and VACUOUS; add each to the arm-* leg that owns its sites (or, for a hole another track must claim, to the allowlist above WITH its owner).${COLOR_RESET}"
+        return 1
+    fi
+    echo -e "${COLOR_GREEN}✅ knob→leg coverage OK (every aarch64-qualified feature is named by a leg; known holes allowlisted with owners)${COLOR_RESET}"
     echo -e "${COLOR_GREEN}✅ kernel cfg coverage OK (${_n} legs)${COLOR_RESET}"
 }
 
