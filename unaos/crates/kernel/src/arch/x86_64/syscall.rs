@@ -6529,8 +6529,14 @@ fn drag_settle_disarm() {
 /// the legs still terminate with the mask held.
 ///
 /// Flipped by hand between the two builds of the experiment (control = `false`).
+///
+/// SAFE AGAINST THE OBVIOUS DEADLOCK, checked rather than assumed: the danger of masking around a
+/// span that takes a lock is a holder on THIS core that was preempted mid-critical-section and can
+/// no longer be rescheduled. `pal::push_event` / `pal::pop_event` both take `EVENT_QUEUE` INSIDE
+/// `arch::without_interrupts`, and `video::wm`'s table guard is an `arch::IrqMask`, so neither lock
+/// can be held across a preemption in the first place.
 #[cfg(feature = "witness")]
-const SFQ_QUIESCE: bool = false;
+const SFQ_QUIESCE: bool = true;
 
 /// SELFTEST-QUIESCE — run `f` with this core's interrupts masked on the quiesced build, and
 /// unchanged on the control build.
@@ -6560,6 +6566,21 @@ fn evq_pops() -> u64 {
 fn evq_pushes() -> u64 {
     let s = crate::pal::event_queue_stats();
     s.0 + s.1
+}
+
+/// SELFTEST-QUIESCE — this core's index and its LOCAL tick count, as one sample.
+///
+/// The local tick is the leak detector for the quiesce. `percpu::note_tick` is called from this
+/// core's own APIC timer ISR, so a span that believes it is masked and comes back with a nonzero
+/// tick delta was NOT masked for the whole span — either something inside re-enabled `IF`, or the
+/// task yielded and the mask was restored to whatever the next task's `RFLAGS` carried. The cpu
+/// index catches the other way the quiesce can be void: the fixture and the competing drain ending
+/// up on DIFFERENT cores, where a local mask means nothing at all.
+#[cfg(feature = "witness")]
+#[inline]
+fn sfq_cpu_tick() -> (u32, u64) {
+    let p = crate::arch::percpu::this_cpu();
+    (p.cpu_index, p.ticks.load(Ordering::Relaxed))
 }
 
 #[cfg(feature = "witness")]
@@ -7792,6 +7813,7 @@ pub fn wmdirect_selftest() {
             // was taken by a competing drain, and any push beyond 3 was injected by one.
             let pop0 = evq_pops();
             let push0 = evq_pushes();
+            let (cpu0, tick0) = sfq_cpu_tick();
             crate::pal::cursor::set_abs(hid(px, pw), hid(py, ph), pw as i32, ph as i32);
             crate::pal::cursor::set_button_level(true);
             // The PRESS goes through `push_event` too, and it has to: `pal` tracks its own previous
@@ -7851,6 +7873,8 @@ pub fn wmdirect_selftest() {
             let rest = wm::info(w).map(|r| (r.x, r.y)) == Some((i.x + 24, i.y + 24));
             let fpop = (evq_pops() - pop0) as i64 - own_pops as i64;
             let fpush = (evq_pushes() - push0) as i64 - 3;
+            let (cpu1, tick1) = sfq_cpu_tick();
+            let masked = crate::arch::irqs_masked();
             // This gesture has exactly one queued motion and it is the LIFT, which the reorder puts
             // BEHIND the edge — so a clean run steers no lead motions at all. A nonzero count means
             // the lift was routed while the edge was still counted as queued, i.e. two routers
@@ -7861,18 +7885,21 @@ pub fn wmdirect_selftest() {
             // unexpected lead count evidence of the router interleave rather than of the fix.
             if swap_ok && drag_last_lead() != 0 {
                 serial_println!(
-                    "[wm-act] settle -> SKIP (routing interleaved: lead={} on a gesture with none) fpop={} fpush={} quiesced={}",
+                    "[wm-act] settle -> SKIP (routing interleaved: lead={} on a gesture with none) fpop={} fpush={} quiesced={} cpu={}->{} dtick={}",
                     drag_last_lead(),
                     fpop,
                     fpush,
-                    SFQ_QUIESCE
+                    SFQ_QUIESCE,
+                    cpu0,
+                    cpu1,
+                    tick1 - tick0
                 );
                 None
             } else {
                 let verdict = grabbed && swap_ok && ended && rest;
                 if !verdict {
                     serial_println!(
-                        "[wm-act] settle detail: grabbed={} swap={} ended={} rest={} at={:?} want=({},{}) lead={} fpop={} fpush={} quiesced={}",
+                        "[wm-act] settle detail: grabbed={} swap={} ended={} rest={} at={:?} want=({},{}) lead={} fpop={} fpush={} quiesced={} cpu={}->{} dtick={} masked={} svc={:?}",
                         grabbed,
                         swap_ok,
                         ended,
@@ -7883,7 +7910,12 @@ pub fn wmdirect_selftest() {
                         drag_last_lead(),
                         fpop,
                         fpush,
-                        SFQ_QUIESCE
+                        SFQ_QUIESCE,
+                        cpu0,
+                        cpu1,
+                        tick1 - tick0,
+                        masked,
+                        crate::arch::smp::service_cpu()
                     );
                 }
                 Some(verdict)
@@ -7958,6 +7990,7 @@ pub fn wmdirect_selftest() {
             // +12 motion, then the lift+edge pair).
             let pop0 = evq_pops();
             let push0 = evq_pushes();
+            let (cpu0, tick0) = sfq_cpu_tick();
             crate::pal::cursor::set_abs(hid(px, pw), hid(py, ph), pw as i32, ph as i32);
             crate::pal::cursor::set_button_level(true);
             crate::pal::push_event(Event::Button(1));
@@ -7994,6 +8027,8 @@ pub fn wmdirect_selftest() {
             let rest = wm::info(w).map(|r| (r.x, r.y)) == Some((i.x + 12, i.y + 12));
             let fpop = (evq_pops() - pop0) as i64 - own_pops as i64;
             let fpush = (evq_pushes() - push0) as i64 - 4;
+            let (cpu1, tick1) = sfq_cpu_tick();
+            let masked = crate::arch::irqs_masked();
             crate::pal::cursor::set_button_level(false);
             // Exactly ONE lead motion is the shape this leg drives: the +12, with the +24 lift
             // behind the edge. Two means the lift was routed as a lead as well — the two-router
@@ -8003,18 +8038,21 @@ pub fn wmdirect_selftest() {
             // a lead motion as well, and skipping on that would hide the producer half's failure.
             if swap_ok && drag_last_lead() > 1 {
                 serial_println!(
-                    "[wm-act] lead -> SKIP (routing interleaved: lead={} on a one-lead gesture) fpop={} fpush={} quiesced={}",
+                    "[wm-act] lead -> SKIP (routing interleaved: lead={} on a one-lead gesture) fpop={} fpush={} quiesced={} cpu={}->{} dtick={}",
                     drag_last_lead(),
                     fpop,
                     fpush,
-                    SFQ_QUIESCE
+                    SFQ_QUIESCE,
+                    cpu0,
+                    cpu1,
+                    tick1 - tick0
                 );
                 None
             } else {
                 let verdict = grabbed && swap_ok && ended && rest;
                 if !verdict {
                     serial_println!(
-                        "[wm-act] lead detail: grabbed={} swap={} ended={} rest={} at={:?} want=({},{}) lead={} fpop={} fpush={} quiesced={}",
+                        "[wm-act] lead detail: grabbed={} swap={} ended={} rest={} at={:?} want=({},{}) lead={} fpop={} fpush={} quiesced={} cpu={}->{} dtick={} masked={} svc={:?}",
                         grabbed,
                         swap_ok,
                         ended,
@@ -8025,7 +8063,12 @@ pub fn wmdirect_selftest() {
                         drag_last_lead(),
                         fpop,
                         fpush,
-                        SFQ_QUIESCE
+                        SFQ_QUIESCE,
+                        cpu0,
+                        cpu1,
+                        tick1 - tick0,
+                        masked,
+                        crate::arch::smp::service_cpu()
                     );
                 }
                 Some(verdict)
