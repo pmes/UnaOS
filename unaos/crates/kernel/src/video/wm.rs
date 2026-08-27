@@ -3887,24 +3887,12 @@ static PAYGO_SVC_TRIES: [core::sync::atomic::AtomicU32; WCD_IDS] =
 /// chunk banks and advances its cursor; the counter lives here beside the taker that reads it.
 ///
 /// ARCH-PARITY (rmbp-7) — THE ONE PAYGO SYMBOL IN THIS FILE THAT KEEPS ITS ARCH TERM, and the
-/// keep is STRUCTURAL: it is pinned by its caller, not by this body.
-///
-/// This function has exactly one call site, `wcg::end`'s silent-clean-chunk arm
-/// (`video/wcg.rs`, at the `WCG_CUR` advance), and that call carries its own
-/// `#[cfg(target_arch = "x86_64")]` — placed there by the WCG lane with the reason written at it.
-/// `wcg.rs` is a different lane's file and read-only from here, so this gate cannot move on its
-/// own: dropping it would leave a symbol whose only caller is still gated, i.e. exactly the
-/// dead-code marker this arc exists to clear, pointing the other way.
-///
-/// The consequence is bounded and worth stating plainly, because it is the thing to re-check when
-/// the pair does move. What this clears is [`PAYGO_SVC_TRIES`], the liveness bound of
-/// [`paygo_service_pass`]. That taker is now built wherever the knob is, but it is REACHED only
-/// through `bootpace::service_dump`, whose `wm::paygo_service()` call is itself arch-gated in
-/// `bootpace.rs` — another lane again. So there is today no build in which the taker runs and this
-/// re-arm is missing, and the counter it would clear is never incremented there either. The two
-/// gates — this one and `wcg.rs`'s — must drop in the same change as `bootpace.rs`'s, and the
-/// order matters: the hook first, or the taker gains a cap it cannot have re-armed.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+/// The three-gate pair-drop this doc used to mandate happened, all in one fold (PAYGO-HOOKS /
+/// ROUTED-WIDEN, 2026-08-27): `bootpace.rs`'s hook opened first, `wcg.rs`'s call and this
+/// definition dropped their arch terms together. What this clears is [`PAYGO_SVC_TRIES`], the
+/// liveness bound of [`paygo_service_pass`] — taker, hook, re-arm and counter now all exist
+/// wherever the knob does, so the cap can always be re-armed by chunk progress.
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 pub(super) fn paygo_svc_progress(i: usize) {
     if i < WCD_IDS {
         PAYGO_SVC_TRIES[i].store(0, core::sync::atomic::Ordering::Relaxed);
