@@ -3582,18 +3582,13 @@ pub fn end(
         } else {
             // Silent clean chunk: bank, advance, hand the budget back. No line, no verdict count.
             WCG_CUR[wi].store((rows_done * stride) as u64, Ordering::Relaxed);
-            // ARCH-PARITY (rmbp-7) — the ONE paygo site in this file that KEPT its arch term, and
-            // it is not a redundancy. `wm::paygo_svc_progress` is itself gated
-            // `all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo")` at
-            // `video/wm.rs:3864`; that file is another lane, so the call cannot follow the rest of
-            // the family across without a coordinated edit there.
-            //
-            // Skipping it on aarch64 is also the CORRECT reading rather than a compile expedient:
-            // what it clears is `wm::PAYGO_SVC_TRIES`, the liveness bound of wc-d's service-pass
-            // TAKER — and the taker, its counter and its STOP-NOTE are all x86-gated in `wm.rs`
-            // too. There is nothing on aarch64 for a progress report to re-arm. When `wm.rs`'s
-            // paygo half is ported, this gate goes with it and nothing else here has to move.
-            #[cfg(target_arch = "x86_64")]
+            // ARCH-PARITY (rmbp-7, closed by WMPAYGO in the same fold that opened the bootpace
+            // hook): the prediction the old comment made here came true — `wm.rs`'s paygo half is
+            // ported, the taker/counter/STOP-NOTE ride the feature terms alone, and this call
+            // follows the rest of the family across. What it clears is `wm::PAYGO_SVC_TRIES`, the
+            // liveness bound of wc-d's service-pass taker, which now exists wherever this caller
+            // does. The hook and this progress report moved TOGETHER, deliberately: a taker whose
+            // cap fills with no progress able to re-arm it trips its own STOP-NOTE.
             super::wm::paygo_svc_progress(wi);
             WCG_BUSY[wi].store(0, Ordering::Release);
             return;
@@ -3669,21 +3664,14 @@ pub fn end(
             // both knowable and load-bearing is the rollup withholding the one fact the line exists
             // to attribute.
             //
-            // AVAILABILITY is what blocks it, and it was measured rather than argued: the QUERY
-            // (`fbcon::console_is_routed`) is itself still compiled under this same narrow
-            // condition, so widening the caller ahead of the callee is a build break and not a
-            // widening — E0425 at the sibling site below, with the callee's own "configured out"
-            // note attached to it.
-            //
-            // THE SUCCESSOR IS THE CALLEE'S OWN GATE, AND IT IS ALREADY VERIFIED. When
-            // `console_is_routed` takes `CONSOLE_WIN`'s condition, give BOTH copies in this file
-            // that identical condition, in lockstep — a `no` printed by one and a `?` by the other
-            // on the same boot would read as a route that came and went. Verified by construction,
-            // not proposed: with the callee widened, both copies widened compile clean with the
-            // seam's paygo reshape armed and disarmed alike.
-            #[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))]
+            // AVAILABILITY was what blocked it, and the blocker is gone: PARFB widened the query
+            // (`fbcon::console_is_routed`) to the route's own condition, and this fold widens BOTH
+            // copies in this file to that identical condition, in lockstep — a `no` printed by one
+            // and a `?` by the other on the same boot would read as a route that came and went.
+            // The `?` arm remains for builds where no route can exist at all.
+            #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
             let routed = if super::fbcon::console_is_routed() { "yes" } else { "no" };
-            #[cfg(not(all(target_arch = "aarch64", feature = "desktop_firmware")))]
+            #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
             let routed = "?";
             serial_println!(
                 "[wcgseam] win={} seq={} verdict={} routed={} glyphs={} delta={} locked={} last_age_us={} -> {} rb_delta={} refunded={}/{}",
@@ -3796,9 +3784,9 @@ pub fn end(
         // PARWCG — the second of the two copies. Ruling, evidence and the verified successor gate
         // are at the sibling site in the refund arm above; this one carries no separate reasoning
         // and must never acquire any. Widen the two together or not at all.
-        #[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))]
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
         let routed = if super::fbcon::console_is_routed() { "yes" } else { "no" };
-        #[cfg(not(all(target_arch = "aarch64", feature = "desktop_firmware")))]
+        #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
         let routed = "?";
         serial_println!(
             "[wcgseam] win={} seq={} verdict={} routed={} glyphs={} delta={} locked={} last_age_us={} -> {}",
