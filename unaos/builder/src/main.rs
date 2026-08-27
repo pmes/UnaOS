@@ -114,6 +114,12 @@ fn main() {
     // knobs above state: a knob wired into arroyo alone never reaches the ESP media the metal boot
     // actually runs. Requires witness to reach anything; default OFF => byte-identical.
     if std::env::var("UNAOS_WCDVALVE").is_ok() { feats.push("wcdvalve"); }
+    // LIVECON / QUARRY: the x86 desktop's live console window and file manager. Both were mapped
+    // in `arroyo` alone — the two-place trap the KNOB→BUILDER check in arroyo now polices: a knob
+    // this map does not read banners in the check while the boot media carries nothing. Default
+    // OFF => byte-identical either way.
+    if std::env::var("UNAOS_LIVECON").is_ok() { feats.push("livecon"); }
+    if std::env::var("UNAOS_QUARRY").is_ok() { feats.push("quarry"); }
     // VPERF: x86 video-path bench instrumentation (scroll/VRAM-read counters, fbmem readout,
     // display-BAR probe, scripted scroll scenario). x86_64-only module; default OFF.
     if std::env::var("UNAOS_VIDEOBENCH").is_ok() { feats.push("videobench"); }

@@ -3246,6 +3246,13 @@ KERNEL_CFG_MATRIX=(
   # `./arroyo check` prints the live board/mix counts every run — read them there, not here.
   "arm-tegra-fbconpar ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,orinface,orindefer"
   "arm-tegra-fbconpar-cross ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,orinconwin,orindesk,orinclick,orinface,orindefer,orinvpar"
+  # DESK-NOEL0 (2026-08-27, rmbp 7): the THIRD polarity of the aarch64 desktop — desktop_firmware
+  # WITHOUT baremetal or tegra_el0 (a ringless desktop). Every other aarch64 leg carrying
+  # desktop_firmware also carries an EL0 layer, which is how dock.rs shipped E0433 reachable from
+  # the DOCUMENTED knob combo UNAOS_WITNESS=1 UNAOS_ORINVPAR=1 (exit 101 before ba3e9b62, 0 after
+  # — this leg is proven non-vacuous by that measurement). `quarry` joins once its own ringless
+  # arms land (video/quarry/live.rs has the same defect, in repair).
+  "arm-desk-noel0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,desktop_firmware,livecon,wcg-paygo"
 
 
   # FBCONPAR CROSS (appended 2026-08-26) — the same two knobs on the FULL `pidesk` conjunction.
@@ -3526,6 +3533,41 @@ check_kernel_cfg() {
         return 1
     fi
     echo -e "${COLOR_GREEN}✅ knob→leg coverage OK (every aarch64-qualified feature is named by a leg; known holes allowlisted with owners)${COLOR_RESET}"
+    # ── KNOB→BUILDER WIRING CHECK (2026-08-27, rmbp 7) — the two-place trap, executable ────────
+    # x86 MEDIA features are rebuilt by builder/src/main.rs from its OWN env map; a knob mapped
+    # here alone lights the banner while the kernel the metal boot runs carries nothing. This file
+    # already warned about that in prose four times (and builder:59 names a past victim) and the
+    # warnings still produced a fifth victim (rastmc, 2026-08-27) — so, like the census above, the
+    # invariant is now a CHECK. Scope: knobs whose feature a LITERAL x86 leg names (mix legs
+    # excluded — the derived universe holds features media never arms, whose absence from the
+    # builder is correct). aarch64 needs no twin: its build invokes cargo directly and prints the
+    # effective-features line when it differs from the banner — the stronger mechanism x86 lacks.
+    local _kb_x86="," _kb_miss="" _kb_var _kb_feats _kb_f
+    for _row in "${_rows[@]}"; do
+        read -r _leg _ _feats <<< "$_row"
+        case "$_leg" in x86-mix-*) : ;; x86-*) _kb_x86="${_kb_x86}${_feats}," ;; esac
+    done
+    local _kb_map
+    _kb_map="$(sed -n 's/^\[ -n "\${\(UNAOS_[A-Z0-9_]*\):-}" \] && _feats="\${_feats}\([A-Za-z0-9_,-]*\),"$/\1 \2/p' "${BASH_SOURCE[0]}")"
+    case "$_kb_map" in
+        *"UNAOS_WC wc"*) : ;;
+        *) echo -e "${COLOR_RED}❌ knob→builder wiring: control probe FAILED — UNAOS_WC->wc not parsed from this file's knob map; the map parser is broken. No wiring verdict from this run.${COLOR_RESET}"; return 1 ;;
+    esac
+    while read -r _kb_var _kb_feats; do
+        [ -n "$_kb_var" ] || continue
+        for _kb_f in ${_kb_feats//,/ }; do
+            case "$_kb_x86" in *",${_kb_f},"*) : ;; *) continue ;; esac
+            if ! grep -q "\"${_kb_var}\"" "$WORKSPACE_DIR/builder/src/main.rs"; then
+                _kb_miss="${_kb_miss} ${_kb_var}->${_kb_f}"
+            fi
+            break
+        done
+    done <<< "$_kb_map"
+    if [ -n "$_kb_miss" ]; then
+        echo -e "${COLOR_RED}❌ knob→builder wiring:${_kb_miss} — mapped in arroyo, named by a literal x86 leg, and UNREAD by builder/src/main.rs. Arming it for x86 media banners without building (the rastmc failure). Wire it in the builder's env map too.${COLOR_RESET}"
+        return 1
+    fi
+    echo -e "${COLOR_GREEN}✅ knob→builder wiring OK (every x86-leg-named knob is read by the media builder)${COLOR_RESET}"
     echo -e "${COLOR_GREEN}✅ kernel cfg coverage OK (${_n} legs)${COLOR_RESET}"
 }
 
