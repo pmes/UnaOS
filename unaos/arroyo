@@ -3484,6 +3484,14 @@ check_kernel_cfg() {
     # Control probe (parser tripwire): `vugpar` is named by arm-pi. If THIS check reports it
     # uncovered, the parser has silently dropped leg rows (both seats hit exactly that bug via a
     # character class that excluded `bcmaS1`'s uppercase) — the check then fails ITSELF, loudly.
+    #
+    # ⚠ Do NOT "improve" the grep below into attr-binding logic ("the #[cfg] above the call").
+    # This tree does LINE-NEUTRAL APPENDS: a `#[cfg]` attribute can share a line with an
+    # UNRELATED preceding statement (e.g. main.rs `vugras::idle_sweep(...); #[cfg(feature =
+    # "rast")] ...`), so positional binding misattributes gates. The same-line-conjunction rule
+    # used here is binding-agnostic on purpose — it classifies the FEATURE by whether any of its
+    # cfg sites is aarch64-conjoined, never which item an attribute decorates. (orin 9 hit the
+    # positional trap 2026-08-27; this comment is why the next reader doesn't.)
     local _kl_declared _kl_covered="," _kl_f _kl_miss=""
     _kl_declared="$(awk '/^\[features\]/{f=1;next} /^\[/{f=0} f && /^[A-Za-z0-9_-]+[ \t]*=/{sub(/[ \t]*=.*/,"");print}' "$WORKSPACE_DIR/crates/kernel/Cargo.toml" | grep -v '^default$')"
     for _row in "${_rows[@]}"; do
