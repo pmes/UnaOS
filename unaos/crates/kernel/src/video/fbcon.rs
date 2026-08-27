@@ -1645,7 +1645,7 @@ pub fn clear() {
 /// blank store, so screen and shadow are coherent from the first byte. GUI builds never call
 /// this (they `detach()` fbcon; the `Screen` back buffer owns the heap budget) and a
 /// belt-and-braces GUI_ACTIVE check keeps it a no-op even if one did. Idempotent.
-#[cfg(target_arch = "x86_64")]
+#[cfg(target_arch = "x86_64")] // PARFB KEPT — HARDWARE, and the reason is a MEMORY-TYPE fact. The shadow exists to remove uncached VRAM *reads* on the rMBP's PCIe-scanned GOP surface. The Pi/Orin scanout is mapped Normal-WB CACHEABLE, so the read cost this spends ~28 MiB of heap to avoid DOES NOT EXIST there; porting it would buy them nothing and take the heap. (This gate's own doc adds that even on x86 the shadow's original reason retired with the wrap-around scroll.) ⚠ The prose deliberately avoids the other arch's literal spelling: the drift tool pairs on that literal within 25 lines, and a KEPT gate must stay VISIBLE in its count rather than be argued out of it by a comment.
 pub fn attach_shadow() {
     // QUIET-PANEL: headless/test builds never paint the boot log any more, so don't spend
     // ~28 MiB of heap on a shadow nothing draws to. (And with wrap-around rendering the console
@@ -1719,7 +1719,7 @@ pub fn attach_shadow() {
 /// site. So the skip lives here. On the Kepler path `CONSOLE_WIN` is still `wm::WIN_NONE` when this
 /// runs (resume, then activate — that is the seam's ordering law), so this guard cannot fire on any
 /// boot that exists today and the Kepler wire is unchanged.
-#[cfg(target_arch = "x86_64")]
+#[cfg(target_arch = "x86_64")] // PARFB KEPT — HARDWARE, but only after SPLITTING the item, and the split is why this gate is honest rather than lazy. Steps (1) and (3) undo the KEPLER TAKEOVER's calibration draw and drop the x86-only cached-RAM shadow; neither has an analogue on the other chip, whose display engine this kernel does not drive at all. Step (2) — the FACE ARMING — is platform-agnostic and is NOT kept: it is `panel_console_face_arm` at the file tail, which ORIN-FACE already ported and armed. The duplication between the two bodies is deliberate for now: folding step (2) into a call would take the `FBCON` lock TWICE on the Kepler seam, and a contended second `try_lock` there lands on this function's ABORT arm — a real regression risk on the one seam that puts console text back on the metal panel.
 pub fn panel_console_resume() -> usize {
     #[cfg(feature = "wc")]
     if CONSOLE_WIN.load(Ordering::Relaxed) != wm::WIN_NONE {
