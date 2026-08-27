@@ -164,7 +164,12 @@ const MAX_CACHE: usize = 16;
 /// shell's `jobs` verb cannot be: `BG_JOBS` is `shell.rs`-private and that file is compiled into the
 /// knob-off image, where an added line is a byte-identity break). This is the ceiling on rows this
 /// window can have outstanding; the 9th launch reaps first and then declines out loud.
-#[cfg(target_arch = "aarch64")]
+///
+/// ARCH-NEUTRAL (rmbp-7 QUARRY): this is a ceiling on QUARRY'S OWN table, not a property of a chip,
+/// and the seam it protects (`arch::syscall::spawn_user_image_bg` / `bg_poll`) exists on both
+/// arches. It was gated to aarch64 only because its one reader sat inside the aarch64 half of
+/// [`launch`]; the check now lives in the arch-neutral [`run_act`], so the ceiling means the same
+/// thing on both arches and the x86 VFS adoption inherits it for free.
 const MAX_JOBS: usize = 8;
 /// Entries the open-time census prints by name.
 const CENSUS_MAX: usize = 12;
@@ -1014,10 +1019,15 @@ impl Model {
 // the VFS mount table (never `fat::mount()` — this arc's standing law), the loader does every real
 // check, and its refusal is what the operator is shown.
 
-/// One program this window started. Gated with [`launch`] and for its reason, not for a second one:
-/// the arch that cannot spawn cannot have a job to track, and a table that could only ever be empty
-/// is not honest scaffolding — it is dead weight the compiler is right to name.
-#[cfg(target_arch = "aarch64")]
+/// One program this window started.
+///
+/// ARCH-NEUTRAL (rmbp-7 QUARRY). This row was gated to aarch64 on the premise that "the arch that
+/// cannot spawn cannot have a job to track" — but that premise was wrong about the seam: x86 has
+/// `arch::syscall::spawn_user_image_bg` and `bg_poll` with the same signatures (see
+/// `arch/x86_64/syscall.rs`), so the SPAWN half is not what is missing. What is missing on x86 is
+/// the VFS mount table that resolves a path to bytes, which is one cross-file gate in `fs/vfs.rs`
+/// / `shell.rs` (vfs.md §12.4) and is not this file's to close. Keeping the table, the ceiling and
+/// the reaper arch-neutral means the day that gate lifts, only [`launch`]'s body changes.
 struct Job {
     pid: u64,
     asid: u64,
@@ -1025,8 +1035,7 @@ struct Job {
 }
 
 /// The jobs Quarry has outstanding. Small, bounded, and Quarry's OWN — see [`MAX_JOBS`] for why it
-/// cannot be the shell's table.
-#[cfg(target_arch = "aarch64")]
+/// cannot be the shell's table. Arch-neutral for the reason stated on [`Job`].
 static JOBS: spin::Mutex<Vec<Job>> = spin::Mutex::new(Vec::new());
 
 /// Poll every outstanding job and free the kernel rows of the ones that have finished.
@@ -1035,7 +1044,11 @@ static JOBS: spin::Mutex<Vec<Job>> = spin::Mutex::new(Vec::new());
 /// program's row is released by exactly the mechanism a `bg`-launched one's is. Called on every
 /// input gesture and every [`service`] pass, which is often enough that the [`MAX_JOBS`] ceiling is
 /// a bound on CONCURRENT programs rather than on launches per boot.
-#[cfg(target_arch = "aarch64")]
+///
+/// ARCH-NEUTRAL (rmbp-7 QUARRY): this was an aarch64 body plus an x86 no-op stub. `bg_poll` is
+/// `pub` on both arches with the same signature, so the reaper is the SAME code on both — an x86
+/// table that is empty today simply reaps nothing, and no stub has to be kept in step with the
+/// real one.
 fn reap_jobs() {
     use crate::arch::syscall::BgPoll;
     let mut jobs = JOBS.lock();
@@ -1048,6 +1061,14 @@ fn reap_jobs() {
             }
             BgPoll::Exited(st) => alloc::format!("exited status={}", st),
             BgPoll::Faulted => String::from("faulted (contained)"),
+            // The ONE genuinely per-arch line in this function, and it is not a hardware fact: the
+            // `BgPoll` enum itself differs. `arch/aarch64/syscall.rs` has a `Closed` variant
+            // (CLOSE-CLEAN — closed by the operator via a window's close box); `arch/x86_64/
+            // syscall.rs`'s `BgPoll` (declared near its `bg_poll`) has only Running/Exited/Faulted/
+            // Gone, so naming `Closed` unconditionally would not COMPILE on x86. Closing this
+            // properly means adding the variant to the x86 enum, which is outside this file's lane;
+            // until then the arm is gated so the aarch64 verdict text is not lost.
+            #[cfg(target_arch = "aarch64")]
             BgPoll::Closed => String::from("closed by its window"),
             BgPoll::Gone => String::from("gone (already reaped)"),
         };
@@ -1055,9 +1076,6 @@ fn reap_jobs() {
         serial_println!("[quarry] reaped pid={} asid={} name={} — {}", j.pid, j.asid, j.name, verdict);
     }
 }
-
-#[cfg(not(target_arch = "aarch64"))]
-fn reap_jobs() {}
 
 /// Read `path` through the VFS seam and spawn it detached. Returns the one line the path bar shows.
 ///
@@ -1072,6 +1090,12 @@ fn reap_jobs() {}
 /// — a file compiled into the knob-off `kernel8.img`, where splitting out a console-free core would
 /// ADD lines and break the byte-identity proof (PARITY.md §5.3). The shared thing is the seam that
 /// matters — the mount table for the read, `spawn_user_image_bg` for the spawn — not the printing.
+///
+/// This is HALF of a per-arch dispatch: the x86_64 arm is the `cfg(not(target_arch = "aarch64"))`
+/// `launch` at the end of this section, and it declines because there is no mount table to resolve
+/// against — NOT because the spawn seam is missing (x86 has `spawn_user_image_bg` and `bg_poll`
+/// too). The counterpart is named here because this body is longer than a reader — or the parity
+/// detector's window — will scan before concluding the other arch has nothing.
 #[cfg(target_arch = "aarch64")]
 fn launch(path: &str) -> String {
     use crate::fs::vfs::{NodeKind as NK, VfsError};
@@ -1087,12 +1111,9 @@ fn launch(path: &str) -> String {
         }
     }
     const CAP: u64 = crate::arch::aarch64::uslots::USER_REGION_SIZE as u64; // JETSON-EL0: uslots facade (boot.rs on pi / mmu_tegra_el0.rs on tegra)
-    reap_jobs();
-    if JOBS.lock().len() >= MAX_JOBS {
-        let s = alloc::format!("{} live jobs — kill one first", MAX_JOBS);
-        serial_println!("[quarry] launch REFUSED path={} reason=job-table-full ({})", path, s);
-        return s;
-    }
+    // The reap-then-ceiling pre-check moved to [`run_act`] (rmbp-7 QUARRY) — same two steps, same
+    // order, same refusal line, but arch-neutral, because the ceiling is Quarry's table's and not
+    // this arch's. By the time this body runs the table is reaped and has a free slot.
     let mt = crate::shell::vfs_mount_table();
     let st = match mt.stat(path) {
         Ok(s) => s,
@@ -1167,9 +1188,20 @@ fn run_act(act: Act) {
     let line = match act {
         Act::None => return,
         Act::Launch(p) => {
-            let r = launch(&p);
+            // Reap first, then test the ceiling — the two steps that used to open the aarch64
+            // [`launch`] body, hoisted here (rmbp-7 QUARRY) so [`MAX_JOBS`] and [`JOBS`] have an
+            // arch-neutral reader and mean the same thing on both chips. Order and wording are
+            // unchanged, so the aarch64 serial line is byte-for-byte what it was.
             reap_jobs();
-            r
+            if JOBS.lock().len() >= MAX_JOBS {
+                let s = alloc::format!("{} live jobs — kill one first", MAX_JOBS);
+                serial_println!("[quarry] launch REFUSED path={} reason=job-table-full ({})", p, s);
+                s
+            } else {
+                let r = launch(&p);
+                reap_jobs();
+                r
+            }
         }
         Act::NoOpener(p) => {
             // The honest census the brief asks for. Nothing in this tree opens a document: there is
