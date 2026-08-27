@@ -64,6 +64,17 @@ figure is 95 and the command that produces it is `grep -c target_arch wcg.rs`.
 | **UNKNOWN** | **2** | the blocker is in another file and another lane; not ported, listed for the seat |
 | total | 95 | |
 
+**Milestone 2 outcome against that plan: 80 of the 81 PORT verdicts applied.** One was held
+back by a cross-file blocker the survey did not predict and the compiler did — see §3c. The
+file went from **95 `target_arch` gate sites to 15**.
+
+| after the port | sites |
+|---|---:|
+| HARDWARE, unchanged | 12 |
+| PORT held for a cross-file blocker (§3c) | 1 |
+| UNKNOWN, unported (§5) | 2 |
+| **total remaining** | **15** |
+
 ---
 
 ## 3. PORT — 81 sites
@@ -177,11 +188,47 @@ convicting.
 
 Verdict **PORT**, and it is the highest-value finding of the survey.
 
+### 3c. The one PORT held back — `wcg.rs:3549`, `wm::paygo_svc_progress`
+
+Predicted by no part of the survey; found by the aarch64 compiler on the first armed build
+after the port:
+
+```
+error[E0425]: cannot find function `paygo_svc_progress` in module `super::wm`
+    --> crates/kernel/src/video/wcg.rs:3538:24
+```
+
+`wm::paygo_svc_progress` is gated `all(feature = "witness", target_arch = "x86_64",
+feature = "wcg-paygo")` at **`wm.rs:3864`** — another file, another lane. The call therefore
+keeps an explicit `#[cfg(target_arch = "x86_64")]`, with the reason written at the site.
+
+**And skipping it on aarch64 is the correct reading, not a compile expedient.** What the call
+clears is `wm::PAYGO_SVC_TRIES` — the liveness bound of wc-d's service-pass taker — and the
+taker, its counter and its STOP-NOTE are all x86-gated in `wm.rs` too. There is nothing on
+aarch64 for a progress report to re-arm. When `wm.rs`'s paygo half is ported this gate goes
+with it and nothing else in `wcg.rs` has to move.
+
+This is also the survey's own lesson: **a symbol-availability audit of the gated code is not
+sufficient — the audit has to cover what the gated code CALLS.** The other 78 paygo sites
+survived because their dependencies were traced (§3a); this one was a call into the very file
+whose call sites were listed in §6 as owed, and it was missed because it is a call FROM
+`wcg.rs` INTO `wm.rs` rather than the reverse.
+
 **Flagged, because unlike §3a this one CHANGES THE aarch64 WIRE.** It is a behaviour change on
 Pi `witness` builds with no feature knob in front of it: occluded probes stop being charged to
-`bad`, and `occluded=` starts reporting non-zero. `./arroyo test-arm` is in this arc's DONE
-gate for precisely this reason and is the check that decides it. If test-arm reddens, this is a
-STOP and the port is reverted, not argued with.
+`bad`, and `occluded=` may report non-zero. It is also, therefore, the ONLY change in this arc
+that a Pi run can observe at all — every one of the 79 paygo ports is behind `wcg-paygo`, which
+no aarch64 build sets.
+
+**`./arroyo test-arm` does not decide it, and finding that out is part of the result.** The
+DONE gate's `test-arm` passes (exit 0), but its serial log carries **zero `[wc-g]` lines** —
+`test-arm` auto-arms `witness` (`arroyo:43-45`) so the module compiles, but the QEMU-virt
+target never brings up a window the compositor composites, so `wcg::begin`/`end` are never
+reached. Only `[wc-w]` fires there (12 lines).
+
+The aarch64 path that DOES reach this code is `UNAOS_PIDESK=1 ./arroyo kernel8-test` — Pi 4
+bare-metal under QEMU raspi4b, with the desktop furniture that actually opens windows. That was
+run on this branch and, as a control, in a throwaway worktree at the base sha. See §7.
 
 ---
 
@@ -268,3 +315,60 @@ cargo +nightly check --release -Z json-target-spec \
 
 Confirmed green at base `44c69738` (19.69 s, 38 warnings, none from `wcg.rs`) — so the port has
 a before-picture to be judged against and not merely an after one.
+
+### Results
+
+| gate | before | after |
+|---|---|---|
+| `./arroyo check` | green, 14 cfg legs | **green, 14 cfg legs** |
+| `./arroyo test-arm` | — | **exit 0** |
+| aarch64 + `wcg-paygo`, by hand | green, 38 warnings | **green, 41 warnings** (+6 dead-code, +1 unrelated) |
+| `parity-arch-gates.sh`, `wcg.rs` x86-only | **52** | **2** |
+| `parity-arch-gates.sh`, `wcg.rs` aarch64-only | 1 | 1 |
+| `parity-arch-gates.sh`, tree UNPAIRED x86-only | **471** (bare 84 · arch+feature 387) | **421** (bare 84 · arch+feature **337**) |
+| `grep -c target_arch wcg.rs` | 95 | 19 (15 gates + 4 prose mentions) |
+
+The 6 added warnings are `paygo_recycle`, `paygo_seal_closed`, `paygo_pending`, `paygo_ripe`,
+`paygo_force` and `paygo_closed` — "never used" on aarch64, because their `wm.rs` callers are
+still arch-gated. That is §6 item 3 made visible. They are deliberately NOT silenced with an
+`#[allow(dead_code)]`: the warning is the marker for the owed half, and it appears in no leg
+`arroyo` currently runs.
+
+### The x86 side is unchanged by construction, not by test
+
+Every one of the 79 paygo edits rewrites `all(target_arch = "x86_64", feature = "wcg-paygo")`
+to `feature = "wcg-paygo"`. On an x86 build the first conjunct is true, so the two predicates
+select identically. The occlusion edit removes a `#[cfg(target_arch = "x86_64")]` from a block
+and deletes its `not` arm — on x86, also identical. The diff contains no other executable
+change. So no x86 behaviour can have moved, and `check`'s `x86-all` leg (which carries
+`wcg-paygo`) type-checks the result.
+
+### The aarch64 wire: what actually runs it, and what it showed
+
+`test-arm` passes but never reaches this module (§3b). The path that does is
+`UNAOS_PIDESK=1 ./arroyo kernel8-test`. Run on this branch, it produced 44 `[wc-g]` lines under
+the feature banner:
+
+```
+⚡ kernel features: baremetal,skip_xhci,witness,pidesk
+```
+
+**No `wcg-paygo`** — so all 79 paygo ports are compiled out on that image and cannot have
+affected it. The only live change on any aarch64 build is the occlusion attribution.
+
+And on that run it did not fire: every `[wc-g]` line reports `occluded=0`, including the ten
+with a live occluder box (`occ=1/1`, `occ=2/2`). `occluded` increments exactly when a probe
+both mismatches AND lies under an occluder; `occluded=0` throughout means that branch was never
+taken and every probe went down the same `bad += 1` path the old code had. The wire is
+therefore unmoved by this port on this run — the fix is proven safe here, and its BENEFIT is
+unexercised, because the QEMU raspi4b geometry never put a mismatching probe under a higher
+window. (The two non-zero `occluded=` values in the log, 20736 and 4472, are on `[wc-d]` lines
+— `wm.rs`'s own attribution, which was already arch-neutral and which this arc did not touch.)
+
+**The run also reports `❌ MBENCH FAIL — 49/117 required witnesses, 6 forbidden hit(s)`, and
+that is NOT this arc's doing.** The six FORBID hits are `-> RACE-BLIT`, `-> COHER`, two
+`[wc-d] … -> FAIL` and `-> AT-RISK`, all on a 640x480 QEMU raspi4b run with `slow=yes` and
+per-pass times of 17–126 ms. Two independent reasons it cannot be the port: the image carries
+no `wcg-paygo`, and the one live change provably never executed its new branch (above).
+`kernel8-test` is outside this arc's DONE gate and was run as extra diligence; the failure is
+reported here so the Pi seat has it, not claimed as a regression this arc introduced.
