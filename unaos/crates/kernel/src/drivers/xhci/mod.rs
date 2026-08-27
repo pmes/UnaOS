@@ -292,6 +292,40 @@ pub(crate) const HID_LOCK_KEYS: [(u8, u8); 3] = [
     (0x47, 0x04), // Scroll Lock-> LED bit 2
 ];
 
+/// PRTSCR — HID usage 0x46, "Keyboard PrintScreen" (HUT 1.12 §10, Keyboard/Keypad page).
+///
+/// It sits at `(0, 0)` in [`HID_SCANCODE_TO_ASCII`] and stays there: PrintScreen types nothing, and
+/// the table's contract is "the character this key types". It is a COMMAND, like Application and
+/// Power beside it.
+pub(crate) const HID_USAGE_PRINT_SCREEN: u8 = 0x46;
+
+/// PRTSCR — **did PrintScreen go DOWN in this report?** The shared press-edge predicate both
+/// decoders ask, so a key is a key whichever controller carried it.
+///
+/// WHY THE EDGE LIVES HERE AND NOT IN THE ROUTING CHAIN. `pal::Event::Key` is a single `u8` with no
+/// modifier field, and the fold above returns 0 for usage 0x46, so PrintScreen never becomes an
+/// event and is invisible above the driver. There were two ways to change that. Giving 0x46 a byte
+/// in the table was rejected: the doc block on [`hid_key_ascii`] is a catalogue of why that byte
+/// space has no free entries a consumer could disambiguate — it is the reason the Ctrl folds at
+/// 0x08/0x09/0x0A/0x0D and the arrows at 0x1C..0x1F were carved out — and a screenshot key that
+/// occasionally forges a Tab or a Backspace is worse than no screenshot key. So the edge is taken
+/// at the usage level, exactly where [`HID_LOCK_KEYS`] and EHCI's Ctrl+Alt+B pairing chord already
+/// take theirs: the established seam for "a non-character key triggers a kernel action". It is also
+/// the ONLY seam that reaches the rMBP's INTERNAL keyboard, which rides EHCI rather than xHCI.
+///
+/// LEVEL, DIFFED — the same test the lock keys use. A boot report carries the set of keys HELD, so
+/// "present now and absent from the previous report" is exactly one press. Without the diff a key
+/// held for half a second would re-arm a capture on every restated report (DBLSTROKE's defect,
+/// which doubled characters on metal), and the operator would get a volume full of screenshots.
+///
+/// The caller does nothing but `prtscr::request()`, which is one atomic store: this runs inside the
+/// controller's service pass, holding its lock, and a filesystem write from in there would hold the
+/// internal keyboard and trackpad hostage for the whole encode. See `video::prtscr`.
+#[inline]
+pub(crate) fn hid_print_screen_edge(cur_keys: &[u8; 6], prev_keys: &[u8; 6]) -> bool {
+    cur_keys.contains(&HID_USAGE_PRINT_SCREEN) && !prev_keys.contains(&HID_USAGE_PRINT_SCREEN)
+}
+
 
 /// Wall-clock budget for hardware handshakes, in `crate::arch::now_cycles()` units (rdtsc cycles on
 /// x86_64, CNTVCT ticks on aarch64). Resolved per-arch so the same ~wall-clock window holds despite
@@ -4882,6 +4916,20 @@ impl XhciController {
                                             }
 
                                             self.slots[slot_id as usize].keyboard_prev_keys = cur_keys;
+
+                                            // PRTSCR: the Print Screen press edge. `prev_keys` is the
+                                            // LOCAL copy taken before the loops above, so the store on
+                                            // the line above has not disturbed it — the same value the
+                                            // lock-key loop below diffs against. Sets a flag and
+                                            // returns; the capture happens on the device-service pass,
+                                            // because a filesystem write from inside this pass would
+                                            // hold the keyboard hostage for its whole duration.
+                                            if hid_print_screen_edge(&cur_keys, &prev_keys) {
+                                                serial_println!(
+                                                    ":: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::"
+                                                );
+                                                crate::video::prtscr::request();
+                                            }
 
                                             // HID-LED: lock-key press edges. A lock key present in this
                                             // report but absent last report is a fresh press — toggle the

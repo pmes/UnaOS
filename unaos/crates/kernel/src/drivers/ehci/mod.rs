@@ -16183,6 +16183,20 @@ unsafe fn decode_boot_keyboard(
         }
     }
 
+    // PRTSCR: the Print Screen press edge — the SAME shared predicate the xHCI decoder asks, for the
+    // same reason the lock keys share a table: a key is a key whichever controller carried it. This
+    // is the path that matters on the bench, because the rMBP's INTERNAL keyboard is on EHCI.
+    //
+    // Asked here, BEFORE `*prev_keys = cur_keys` below, so the diff is against the previous report.
+    // We are inside `service()` holding `EHCI_HID`, so this does exactly one thing — set a flag. The
+    // capture runs on the device-service pass; a filesystem write from in here would contend the
+    // xHCI storage loan from inside the EHCI pass and hold the keyboard and trackpad hostage for
+    // seconds, which is the argument `holocron`'s deferred write already makes at its call site.
+    if super::xhci::hid_print_screen_edge(&cur_keys, prev_keys) {
+        serial_println!(":: PRTSCR: PrintScreen (HID 0x46) down on EHCI -> capture armed ::");
+        crate::video::prtscr::request();
+    }
+
     *prev_keys = cur_keys;
     // ALLKEYS: remember this accepted report's modifier byte, so a later endpoint-death flush can
     // resolve each stranded key to the same shifted ascii its press produced. Updated ONLY here —
