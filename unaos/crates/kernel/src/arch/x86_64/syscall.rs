@@ -6511,13 +6511,69 @@ fn drag_settle_disarm() {
 /// Self-cleaning: it empties the ring before it starts (witnessed, because on metal that discards
 /// whatever the hand was doing at boot), drains everything it pushed, and puts the producer's button
 /// mask and the release-edge count back where it found them.
+/// SELFTEST-QUIESCE — **experiment scaffolding for the intermittent x86 selftest family
+/// (`exec-r7-selftest`, 2026-08-27). Not a shipping seam; the control build has it OFF.**
+///
+/// The falsification this arc runs asks whether `[ptrdead] order` and `[wm-act] settle`/`lead` fail
+/// because the CODE UNDER TEST is wrong or because the ASSERTIONS are racy. The mechanism under
+/// suspicion is named and local: on the SCHED-X86 split, the fixture ladder runs inside
+/// `x86_usb_pump` (main.rs) and `x86_input_service` runs as a preemptible peer AT THE SAME PRIORITY
+/// ON THE SAME CORE (`svc_cpu` — both `spawn`ed there in main.rs), and that peer's job is to drain
+/// `pal::EVENT_QUEUE` **to exhaustion** every pass. A timer preemption anywhere inside a fixture's
+/// push→pop window therefore hands the fixture's own queued events to the input service, which
+/// forwards them down `GUI_CHANNEL_X86` and out of the fixture's reach.
+///
+/// So the quiesce is a LOCAL interrupt mask, and it is sound only because of that placement: the
+/// competing drain is on THIS core, so masking `IF` here is enough to serialise the window. The
+/// global ms-clock is advanced by the BSP (see `apic::ticks`), so the bounded `ticks()` waits inside
+/// the legs still terminate with the mask held.
+///
+/// Flipped by hand between the two builds of the experiment (control = `false`).
+#[cfg(feature = "witness")]
+const SFQ_QUIESCE: bool = false;
+
+/// SELFTEST-QUIESCE — run `f` with this core's interrupts masked on the quiesced build, and
+/// unchanged on the control build.
+#[cfg(feature = "witness")]
+#[inline]
+fn sfq<R>(f: impl FnOnce() -> R) -> R {
+    if SFQ_QUIESCE {
+        crate::arch::without_interrupts(f)
+    } else {
+        f()
+    }
+}
+
+/// SELFTEST-QUIESCE — total SUCCESSFUL pops from `pal::EVENT_QUEUE` since boot (the 5th field of
+/// `pal::event_queue_stats`). A fixture that knows how many pops it made itself can subtract, and
+/// the remainder is the number of its own events some OTHER drain took — the direct evidence the
+/// hypothesis needs, rather than an inference from a failed predicate.
+#[cfg(feature = "witness")]
+#[inline]
+fn evq_pops() -> u64 {
+    crate::pal::event_queue_stats().4
+}
+
+/// SELFTEST-QUIESCE — total pushes into `pal::EVENT_QUEUE` since boot (pointer + key).
+#[cfg(feature = "witness")]
+#[inline]
+fn evq_pushes() -> u64 {
+    let s = crate::pal::event_queue_stats();
+    s.0 + s.1
+}
+
 #[cfg(feature = "witness")]
 pub fn ptrdead_selftest() {
-    use crate::pal::Event;
     static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
         return;
     }
+    sfq(ptrdead_selftest_body);
+}
+
+#[cfg(feature = "witness")]
+fn ptrdead_selftest_body() {
+    use crate::pal::Event;
     // Empty the ring, bounded by its own capacity, and say so: this fixture asserts an EXACT entry
     // count, so anything a boot selftest or a real HID report left standing would be counted as part
     // of the run. On metal the discard eats real operator input, which is worth a line.
@@ -6536,6 +6592,10 @@ pub fn ptrdead_selftest() {
     let n = crate::pal::QUEUE_SIZE_PUB * 3;
     let (_, _, drop0, _, _) = crate::pal::event_queue_stats();
     let fold0 = crate::pal::pointer_motion_coalesced();
+    // SELFTEST-QUIESCE instrumentation: the ledger's own pop counter, sampled either side of the
+    // window this leg believes it owns. Anything it counts beyond this leg's OWN successful pops
+    // was taken by a different drain.
+    let pop0 = evq_pops();
     for _ in 0..n {
         crate::pal::push_pointer_report(Some(Event::Mouse { x: 1, y: -1 }), None);
     }
@@ -6552,6 +6612,7 @@ pub fn ptrdead_selftest() {
         }
     }
     let (_, _, drop1, _, _) = crate::pal::event_queue_stats();
+    let foreign12 = (evq_pops() - pop0) as i64 - entries as i64;
     let whole = entries == 1 && sx == n as i32 && sy == -(n as i32);
     let nodrop = drop1 == drop0;
 
@@ -6563,14 +6624,40 @@ pub fn ptrdead_selftest() {
             break;
         }
     }
+    // SELFTEST-QUIESCE instrumentation: the four pops are taken UNCONDITIONALLY and judged
+    // afterwards, where the original `&&` chain short-circuited. Two reasons, neither of them a
+    // change to what `order` MEANS: a short-circuited run leaves the events it never popped in the
+    // ring for the next fixture, and — the point here — the observed shape cannot be reported if it
+    // was never read. `order` is the same conjunction over the same four observations.
+    let pop2 = evq_pops();
+    let push2 = evq_pushes();
     crate::pal::push_pointer_report(Some(Event::Mouse { x: 1, y: 0 }), None);
     crate::pal::push_pointer_report(None, Some(Event::Button(1)));
     crate::pal::push_pointer_report(Some(Event::Mouse { x: 1, y: 0 }), None);
     crate::pal::push_pointer_report(Some(Event::Mouse { x: 1, y: 0 }), None);
-    let order = matches!(crate::pal::next_event(), Some(Event::Mouse { x: 1, y: 0 }))
-        && matches!(crate::pal::next_event(), Some(Event::Button(1)))
-        && matches!(crate::pal::next_event(), Some(Event::Mouse { x: 2, y: 0 }))
-        && crate::pal::next_event().is_none();
+    let g = [
+        crate::pal::next_event(),
+        crate::pal::next_event(),
+        crate::pal::next_event(),
+        crate::pal::next_event(),
+    ];
+    let own3 = g.iter().filter(|e| e.is_some()).count() as u64;
+    let foreign3 = (evq_pops() - pop2) as i64 - own3 as i64;
+    // This leg pushes four reports, each carrying exactly one event, so four is its own push count.
+    let fpush3 = (evq_pushes() - push2) as i64 - 4;
+    let order = matches!(g[0], Some(Event::Mouse { x: 1, y: 0 }))
+        && matches!(g[1], Some(Event::Button(1)))
+        && matches!(g[2], Some(Event::Mouse { x: 2, y: 0 }))
+        && g[3].is_none();
+    if !order {
+        serial_println!(
+            "[ptrdead] order detail: got={:?} fpop={} fpush={} quiesced={}",
+            g,
+            foreign3,
+            fpush3,
+            SFQ_QUIESCE
+        );
+    }
 
     // Put the producer back: a `Button(0)` closes the mask this leg opened (the producer tracks the
     // primary transition, so leaving it SET would make the next real release a 1 -> 0 this fixture
@@ -6589,7 +6676,7 @@ pub fn ptrdead_selftest() {
     }
 
     serial_println!(
-        "[ptrdead] backlog whole={} nodrop={} order={} pushed={} entries={} travel=({},{}) folded={} dropped={} -> {}",
+        "[ptrdead] backlog whole={} nodrop={} order={} pushed={} entries={} travel=({},{}) folded={} dropped={} fpop12={} fpop3={} quiesced={} -> {}",
         whole,
         nodrop,
         order,
@@ -6599,6 +6686,9 @@ pub fn ptrdead_selftest() {
         sy,
         crate::pal::pointer_motion_coalesced() - fold0,
         drop1 - drop0,
+        foreign12,
+        foreign3,
+        SFQ_QUIESCE,
         if whole && nodrop && order { "PASS" } else { "FAIL" }
     );
 }
@@ -7313,16 +7403,23 @@ static WMD_SURF: WmdSurf = WmdSurf([0x0030_70A0; crate::video::wm::FIX_W * crate
 /// assert what no competing consumer can change: the latch `pal` set at PUSH time, and the state the
 /// window system is left in once the events have been routed — by whoever routed them.
 #[cfg(all(feature = "witness", feature = "wc"))]
-fn drain_and_route(max: usize) {
+///
+/// SELFTEST-QUIESCE instrumentation: returns how many events it actually took, so a leg can subtract
+/// its own pops from `pal`'s ledger and report the remainder — the events a COMPETING drain took.
+#[cfg(all(feature = "witness", feature = "wc"))]
+fn drain_and_route(max: usize) -> u64 {
+    let mut took = 0u64;
     for _ in 0..max {
         match crate::pal::next_event() {
             Some(e) => {
+                took += 1;
                 let _ = wc_route_event(e);
                 wc_route_tail(e);
             }
             None => break,
         }
     }
+    took
 }
 
 /// WMDIRECT — drain until the live gesture is over, bounded by a DEADLINE rather than a spin count.
@@ -7352,15 +7449,21 @@ fn drain_and_route(max: usize) {
 /// particular way of stranding a drag no longer exists. The wait is still needed, for the reason
 /// above it.)
 #[cfg(all(feature = "witness", feature = "wc"))]
-fn drain_until_drag_ends() {
+///
+/// SELFTEST-QUIESCE instrumentation: returns how many events this leg's own drain took. `ticks()` is
+/// advanced by the BSP (`apic::ticks`), so the deadline still expires with this core's interrupts
+/// masked — which is what makes the quiesced variant safe to wrap around this wait.
+#[cfg(all(feature = "witness", feature = "wc"))]
+fn drain_until_drag_ends() -> u64 {
     let start = crate::arch::ticks();
+    let mut took = 0u64;
     loop {
-        drain_and_route(8);
+        took += drain_and_route(8);
         if crate::video::wm::drag_active() == crate::video::wm::WIN_NONE {
-            return;
+            return took;
         }
         if crate::arch::ticks().wrapping_sub(start) >= WMD_DRAIN_MS {
-            return;
+            return took;
         }
         core::hint::spin_loop();
     }
@@ -7647,7 +7750,7 @@ pub fn wmdirect_selftest() {
         wm::move_to(w, ox, oy);
         wm::info(w)
     } {
-        Some(i) => {
+        Some(i) => sfq(|| {
             let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
             user_input_set_active(OWNER_O);
             wm::focus_changed(OWNER_O);
@@ -7683,6 +7786,12 @@ pub fn wmdirect_selftest() {
                     discarded
                 );
             }
+            // SELFTEST-QUIESCE instrumentation: the ledger either side of the gesture window. This
+            // leg pushes 3 events (the press, then the lift+edge pair) and pops them through
+            // `next_event` once plus `drain_until_drag_ends`; anything the ledger counts beyond that
+            // was taken by a competing drain, and any push beyond 3 was injected by one.
+            let pop0 = evq_pops();
+            let push0 = evq_pushes();
             crate::pal::cursor::set_abs(hid(px, pw), hid(py, ph), pw as i32, ph as i32);
             crate::pal::cursor::set_button_level(true);
             // The PRESS goes through `push_event` too, and it has to: `pal` tracks its own previous
@@ -7703,7 +7812,9 @@ pub fn wmdirect_selftest() {
             // So: take the press if it is still there, and if no drag is live afterwards — whoever
             // popped it, however it rounded — re-assert with the EXACT pixel. The claim is that a
             // title-strip press leaves a live drag on `w`, and it must not turn on who won a race.
-            if matches!(crate::pal::next_event(), Some(Event::Button(1))) {
+            let press_ev = crate::pal::next_event();
+            let mut own_pops = u64::from(press_ev.is_some());
+            if matches!(press_ev, Some(Event::Button(1))) {
                 let _ = wc_click_route_at(Event::Button(1), px, py);
             }
             if wm::drag_active() != w {
@@ -7735,9 +7846,11 @@ pub fn wmdirect_selftest() {
                 Some(Event::Button(0)),
             );
             let swap_ok = crate::pal::release_edge_reordered();
-            drain_until_drag_ends();
+            own_pops += drain_until_drag_ends();
             let ended = wm::drag_active() == wm::WIN_NONE;
             let rest = wm::info(w).map(|r| (r.x, r.y)) == Some((i.x + 24, i.y + 24));
+            let fpop = (evq_pops() - pop0) as i64 - own_pops as i64;
+            let fpush = (evq_pushes() - push0) as i64 - 3;
             // This gesture has exactly one queued motion and it is the LIFT, which the reorder puts
             // BEHIND the edge — so a clean run steers no lead motions at all. A nonzero count means
             // the lift was routed while the edge was still counted as queued, i.e. two routers
@@ -7748,14 +7861,34 @@ pub fn wmdirect_selftest() {
             // unexpected lead count evidence of the router interleave rather than of the fix.
             if swap_ok && drag_last_lead() != 0 {
                 serial_println!(
-                    "[wm-act] settle -> SKIP (routing interleaved: lead={} on a gesture with none)",
-                    drag_last_lead()
+                    "[wm-act] settle -> SKIP (routing interleaved: lead={} on a gesture with none) fpop={} fpush={} quiesced={}",
+                    drag_last_lead(),
+                    fpop,
+                    fpush,
+                    SFQ_QUIESCE
                 );
                 None
             } else {
-                Some(grabbed && swap_ok && ended && rest)
+                let verdict = grabbed && swap_ok && ended && rest;
+                if !verdict {
+                    serial_println!(
+                        "[wm-act] settle detail: grabbed={} swap={} ended={} rest={} at={:?} want=({},{}) lead={} fpop={} fpush={} quiesced={}",
+                        grabbed,
+                        swap_ok,
+                        ended,
+                        rest,
+                        wm::info(w).map(|r| (r.x, r.y)),
+                        i.x + 24,
+                        i.y + 24,
+                        drag_last_lead(),
+                        fpop,
+                        fpush,
+                        SFQ_QUIESCE
+                    );
+                }
+                Some(verdict)
             }
-        }
+        }),
         None => Some(false),
     };
 
@@ -7789,7 +7922,7 @@ pub fn wmdirect_selftest() {
         wm::move_to(w, ox, oy);
         wm::info(w)
     } {
-        Some(i) => {
+        Some(i) => sfq(|| {
             let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
             user_input_set_active(OWNER_O);
             wm::focus_changed(OWNER_O);
@@ -7821,11 +7954,17 @@ pub fn wmdirect_selftest() {
                     discarded
                 );
             }
+            // SELFTEST-QUIESCE instrumentation — see leg 9. This leg pushes 4 events (press, the
+            // +12 motion, then the lift+edge pair).
+            let pop0 = evq_pops();
+            let push0 = evq_pushes();
             crate::pal::cursor::set_abs(hid(px, pw), hid(py, ph), pw as i32, ph as i32);
             crate::pal::cursor::set_button_level(true);
             crate::pal::push_event(Event::Button(1));
             // Best-effort pop, then re-assert with the exact pixel if no drag came of it (see leg 9).
-            if matches!(crate::pal::next_event(), Some(Event::Button(1))) {
+            let press_ev = crate::pal::next_event();
+            let mut own_pops = u64::from(press_ev.is_some());
+            if matches!(press_ev, Some(Event::Button(1))) {
                 let _ = wc_click_route_at(Event::Button(1), px, py);
             }
             if wm::drag_active() != w {
@@ -7850,9 +7989,11 @@ pub fn wmdirect_selftest() {
                 Some(Event::Button(0)),
             );
             let swap_ok = crate::pal::release_edge_reordered();
-            drain_until_drag_ends();
+            own_pops += drain_until_drag_ends();
             let ended = wm::drag_active() == wm::WIN_NONE;
             let rest = wm::info(w).map(|r| (r.x, r.y)) == Some((i.x + 12, i.y + 12));
+            let fpop = (evq_pops() - pop0) as i64 - own_pops as i64;
+            let fpush = (evq_pushes() - push0) as i64 - 4;
             crate::pal::cursor::set_button_level(false);
             // Exactly ONE lead motion is the shape this leg drives: the +12, with the +24 lift
             // behind the edge. Two means the lift was routed as a lead as well — the two-router
@@ -7862,14 +8003,34 @@ pub fn wmdirect_selftest() {
             // a lead motion as well, and skipping on that would hide the producer half's failure.
             if swap_ok && drag_last_lead() > 1 {
                 serial_println!(
-                    "[wm-act] lead -> SKIP (routing interleaved: lead={} on a one-lead gesture)",
-                    drag_last_lead()
+                    "[wm-act] lead -> SKIP (routing interleaved: lead={} on a one-lead gesture) fpop={} fpush={} quiesced={}",
+                    drag_last_lead(),
+                    fpop,
+                    fpush,
+                    SFQ_QUIESCE
                 );
                 None
             } else {
-                Some(grabbed && swap_ok && ended && rest)
+                let verdict = grabbed && swap_ok && ended && rest;
+                if !verdict {
+                    serial_println!(
+                        "[wm-act] lead detail: grabbed={} swap={} ended={} rest={} at={:?} want=({},{}) lead={} fpop={} fpush={} quiesced={}",
+                        grabbed,
+                        swap_ok,
+                        ended,
+                        rest,
+                        wm::info(w).map(|r| (r.x, r.y)),
+                        i.x + 12,
+                        i.y + 12,
+                        drag_last_lead(),
+                        fpop,
+                        fpush,
+                        SFQ_QUIESCE
+                    );
+                }
+                Some(verdict)
             }
-        }
+        }),
         None => Some(false),
     };
 
