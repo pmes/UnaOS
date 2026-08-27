@@ -3654,6 +3654,33 @@ pub fn end(
                     .saturating_add(readback_us),
                 Ordering::Relaxed,
             );
+            // PARWCG — RULED: this gate SHOULD be the route's own condition, and the only thing
+            // holding it narrow is availability, not meaning.
+            //
+            // MEANING first, because that is the part that is settled. "Is the console routed right
+            // now?" is the routed console's question, not this gate's. The cell the answer is read
+            // out of (`fbcon::CONSOLE_WIN`) already carries the ROUTE's own condition, and this
+            // witness's own seam census is fed by the routed glyph writes of every build that HAS a
+            // route — `seam_glyph_note` is called from the console's paint paths under exactly that
+            // condition. So the rollup CAN carry `routed=` truthfully wherever a route can exist,
+            // and it is not derivable from the guard above either: reaching this print proves a
+            // route existed when the glyphs were charged, never that one is live now (a panic
+            // backdrop and a furniture close each clear the cell). Printing `?` where the answer is
+            // both knowable and load-bearing is the rollup withholding the one fact the line exists
+            // to attribute.
+            //
+            // AVAILABILITY is what blocks it, and it was measured rather than argued: the QUERY
+            // (`fbcon::console_is_routed`) is itself still compiled under this same narrow
+            // condition, so widening the caller ahead of the callee is a build break and not a
+            // widening — E0425 at the sibling site below, with the callee's own "configured out"
+            // note attached to it.
+            //
+            // THE SUCCESSOR IS THE CALLEE'S OWN GATE, AND IT IS ALREADY VERIFIED. When
+            // `console_is_routed` takes `CONSOLE_WIN`'s condition, give BOTH copies in this file
+            // that identical condition, in lockstep — a `no` printed by one and a `?` by the other
+            // on the same boot would read as a route that came and went. Verified by construction,
+            // not proposed: with the callee widened, both copies widened compile clean with the
+            // seam's paygo reshape armed and disarmed alike.
             #[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))]
             let routed = if super::fbcon::console_is_routed() { "yes" } else { "no" };
             #[cfg(not(all(target_arch = "aarch64", feature = "desktop_firmware")))]
@@ -3766,6 +3793,9 @@ pub fn end(
     // in `begin`. A new tag deliberately: no pi4 FORBID matches `\[wcgseam\]`, and none may be
     // taught to until the discriminator has spoken on the bench.
     if verdict != "CLEAN" && p.id != 0 && p.id == SEAM_WIN.load(Ordering::Relaxed) {
+        // PARWCG — the second of the two copies. Ruling, evidence and the verified successor gate
+        // are at the sibling site in the refund arm above; this one carries no separate reasoning
+        // and must never acquire any. Widen the two together or not at all.
         #[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))]
         let routed = if super::fbcon::console_is_routed() { "yes" } else { "no" };
         #[cfg(not(all(target_arch = "aarch64", feature = "desktop_firmware")))]
