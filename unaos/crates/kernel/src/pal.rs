@@ -2160,15 +2160,43 @@ impl<'a> GneissPal for TargetPal<'a> {
     ///
     /// Nothing is left unbracketed. `self.surface` is a [`crate::video::screen::Screen`] for every
     /// construction of this type on every target, so `flush` is always the CURSOR-13 body; and that
-    /// body closes UNCONDITIONALLY with a cursor draw, before the composite, so a present that
+    /// body closed UNCONDITIONALLY with a cursor draw, before the composite, so a present that
     /// composites nothing at all (`wm::service_damage` early-returns on an undamaged table) still
     /// leaves the arrow on glass. The function is now arch-neutral in shape as well as in effect.
+    /// (FLICKER-3, below, made that close CONDITIONAL. The conclusion is unchanged and the argument
+    /// for it is not; read the next section before relying on the word "unconditionally" here.)
     ///
-    /// FLICKER-3 — the closing verb is `repaint()` when the bracket was taken and `ensure_drawn()`
-    /// when it was skipped, because the bracket itself is now gated on the present's damage
-    /// actually meeting the sprite. The guarantee this paragraph asserts is unchanged — both verbs
-    /// leave the arrow on glass — and `ensure_drawn` is the cheaper of the two precisely on the
-    /// path where nothing disturbed the sprite. See `Screen::flush`.
+    /// FLICKER-3 — the bracket is now GATED on the present's damage actually meeting the sprite
+    /// ([`crate::video::screen::Screen::flush`] asks `bracket_needed` first), so `flush` does NOT
+    /// close with a cursor verb on every path: it calls `repaint()` when the bracket was taken and
+    /// nothing at all when it was skipped. The guarantee the paragraph above asserts survives that,
+    /// but it is now carried by the GATE rather than by a closing verb. `bracket_needed` returns
+    /// `true` for every class in which the arrow could be off the panel — `cursor::sprite_box()`
+    /// answers `None` unless `sp.drawn`, and a lapsed `pal::cursor::visible()` is its own arm — so
+    /// the skip is reachable only for a sprite that is already drawn and visible with every damage
+    /// rect (and, since BRACKETQ, every queued present rect) disjoint from its box. A skipped
+    /// bracket leaves an arrow that was never taken down.
+    ///
+    /// An `ensure_drawn()` on that skip path would be dead code rather than insurance, and it is
+    /// worth writing down why, because the absence looks like an omission. `ensure_drawn` returns
+    /// immediately while `sp.drawn` holds — which is precisely the state the skip is conditioned on
+    /// — and `drawn` stays true even through the one race the gate can lose: a desktop blit that
+    /// lands on a sprite which moved into the damage after the decision overwrites the arrow's
+    /// pixels without clearing the flag. That race is a MISSED BRACKET, repaired by widening the
+    /// predicate, not by adding a tail; see BRACKETQ (`80b9aab0`), which taught `bracket_needed` to
+    /// peek `PRESENT_RECTS`, and `cursor::note_desktop_over_sprite`, which counts the residue and
+    /// deliberately arms no repair. `wm`'s composite tail keeps its `ensure_drawn` on the false
+    /// branch for the opposite reason: `wm::erase` clears `drawn` there, so that branch really can
+    /// owe a draw.
+    ///
+    /// The history, because this paragraph used to claim the opposite and a reader is owed the
+    /// reason. Two FLICKER-3 implementations existed. The x86 lift (`46f8f37e`) gated on
+    /// `Screen::damage_meets`, treated `sprite_box() == None` as "no bracket owed", and therefore
+    /// did need an `else { ensure_drawn() }` — that is the code this text was written against, in
+    /// the same commit. The Pi implementation (`cb837f69`) put the recovery classes inside the
+    /// predicate instead and needed no tail. The trunk unification merge (`47f955a3`, "pi video
+    /// stack as baseline") kept the Pi shape and dropped `damage_meets` with it; `pal.rs` was not
+    /// part of that resolution, so this text outlived its subject. See `Screen::flush`.
     fn render(&mut self) {
         self.surface.flush();
     }
