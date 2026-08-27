@@ -53,8 +53,8 @@ nvidia-kepler = []
 # LNKCTL[1:0] — endpoint first, then root port, the disable order the spec asks for — and one
 # `[pcih] aspm cleared ...` witness line. Implies `nvidia-kepler` (the clear runs at kepler
 # init and nowhere else). DEFAULT OFF => the clear is not linked and unarmed builds are
-# byte-identical. Kept in sync with arroyo (builder/src/main.rs mapping is a flagged follow-up
-# — out of this arc's lane).
+# byte-identical. Kept in sync with arroyo AND builder/src/main.rs (the mapping this note used
+# to flag as an outstanding follow-up landed).
 noaspm = ["nvidia-kepler"]
 nvidia-kepler-takeover = []
 nvidia-kepler-fifo = []

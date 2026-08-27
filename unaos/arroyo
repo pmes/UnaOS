@@ -632,8 +632,8 @@ _feats=""
 # RMW confined to LNKCTL[1:0]; prints one '[pcih] aspm cleared rp XXXX->XXXX ep XXXX->XXXX' witness
 # line. Implies nvidia-kepler (Cargo-side). The unconditional census + wedge sampler ride EVERY
 # kepler boot regardless of this knob; the knob arms only the clear. Default OFF => the clear is not
-# linked, unarmed media byte-identical. ⚠ NOT yet mapped in builder/src/main.rs (out of this arc's
-# lane) — until that one-liner lands, esp-x86 metal media cannot arm it; flagged in the arc NOTES.
+# linked, unarmed media byte-identical. Kept in sync with builder/src/main.rs (the follow-up this
+# note used to flag as outstanding landed — esp-x86 metal media arm it like any other knob).
 [ -n "${UNAOS_NOASPM:-}" ] && _feats="${_feats}noaspm,"
 # CE-LADDER: UNAOS_KEPLER_CE=1 arms the read-only copy-engine reconnaissance
 # (drivers/gpu/kepler_ce.rs) — R1 PTOP sweep, R2 CE PRI probe, R3 wide runlist scan, R5
