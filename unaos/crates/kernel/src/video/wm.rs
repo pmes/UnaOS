@@ -3880,7 +3880,7 @@ static PAYGO_SVC_TRIES: [core::sync::atomic::AtomicU32; WCD_IDS] =
 /// fixed cap of 16 while doing exactly what it was asked to. Called by `wcg::end` when a clean
 /// chunk banks and advances its cursor; the counter lives here beside the taker that reads it.
 ///
-/// ARCH-PARITY (rmbp-7) — THE ONE PAYGO SYMBOL IN THIS FILE THAT KEEPS ITS ARCH TERM, and the
+/// ARCH-PARITY (rmbp-7) — this symbol's arch term is GONE, on purpose.
 /// The three-gate pair-drop this doc used to mandate happened, all in one fold (PAYGO-HOOKS /
 /// ROUTED-WIDEN, 2026-08-27): `bootpace.rs`'s hook opened first, `wcg.rs`'s call and this
 /// definition dropped their arch terms together. What this clears is [`PAYGO_SVC_TRIES`], the
