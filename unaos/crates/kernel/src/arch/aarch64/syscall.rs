@@ -11888,7 +11888,7 @@ fn set_detached(asid: u64, on: bool) {
 /// VUG-BG — clear ASID `asid`'s detached bit. Called from `boot::teardown_user_slot`'s FINAL-release arm
 /// (beside `clear_handle_row`, and before `SLOT_USED` is released for the same ordering reason), so every
 /// address space starts its life not-detached regardless of which launcher created it.
-#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+#[cfg(feature = "aarch64_el0")]
 pub fn clear_detached(asid: u64) {
     set_detached(asid, false);
 }
@@ -11985,7 +11985,7 @@ pub fn set_hidden(asid: u64, on: bool) {
 /// bit to the next tenant — which would come up already idling, having never been hidden at all. That is
 /// the worse of the two failure directions (a window that draws nothing), so it is the one closed here
 /// at the funnel rather than at each launcher.
-#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+#[cfg(feature = "aarch64_el0")]
 pub fn clear_hidden(asid: u64) {
     set_hidden(asid, false);
 }

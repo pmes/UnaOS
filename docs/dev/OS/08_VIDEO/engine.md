@@ -9631,6 +9631,59 @@ lines below are what it CAN read.
   the box height, `banded=0` with `minspan=0 minspan_bytes=0`, and never a `scope=window-band`
   rollup. A band-carrying field with any other value on aarch64 is itself the finding.
 
+### CHROMEBAND — the chrome painter walked the box once per band (x86 `wc`, 2026-08-25)
+
+Reported by the pi track as "chrome repainted once per band, 3x at 1920-wide". The count is real —
+`stage_window` calls `paint_window` once per band and always did — but the cost is x86's, and the
+reason is not in `wm.rs` at all.
+
+`FrameBuffer::fill_rect` has two arms. The aarch64 arm clamps `y1` to the surface height and then
+walks; **the x86_64 arm is the per-pixel loop with no height pre-clip**, so every row past the
+destination's last was still walked and every pixel of it still paid a call and four bounds checks
+to be rejected. `fill_rect_v` clipped only the TOP edge (WC-M's concern), and `fill_rect_ceramic`
+clipped neither — it is an explicit row loop that paid a `ceramic::shade` (a table lookup, three
+multiplies, a clamp per channel) to produce a colour for a row the destination then threw away. The
+side-border rects are the content's full height, so a five-band present walked them five times over.
+
+`clip_rows` now states the arithmetic once and both callers use it. **The pixel set does not move**:
+for `y >= 0` the old call filled `[y, min(y + h, dh))` after `put_pixel`'s rejections, and for
+`y < 0` it filled `[0, min(h - skip, dh))` — exactly what `clip_rows` returns. `shade` is a pure
+function of the box-local row, which the clip does not move, so the grain still anchors to the
+window and still runs continuously across a band seam.
+
+**Measured, on both paths, at bench geometry:**
+
+```
+before  [wc-b] fixture geom=2880x1800 chunk_rows=364 bands=5 chrome_rows=10280 chrome_rows_used=2056 amp=5.00x -> AMPLIFIED
+after   [wc-b] fixture geom=2880x1800 chunk_rows=364 bands=5 chrome_rows=2056  chrome_rows_used=2056 amp=1.00x -> CLEAN
+```
+
+`chrome_rows=` counts loop iterations executed; `chrome_rows_used=` is an INDEPENDENT test of each
+iteration's row against the destination's own height. Neither is derived from the other, so `1.00x`
+is a measurement and not a tautology, and a regression that widens the walk separates them again.
+
+#### The gate cannot reach this path, and that is why the fixture exists
+
+Banding needs `bw * span > 1 048 576` px (`MAX_STAGE_BYTES / 4`). Measured on this track:
+
+| panel | largest box the gate builds | banded? |
+|---|---|---|
+| 1280x800 (QEMU default) | the whole panel is 1 024 000 px — **24 576 short** | never, in principle |
+| 1920x1200 (forced) | 522x556 = 290 232 px | never |
+
+Both runs printed `banded=0 maxbands=1` over every present. **`UNAOS_FBW`/`UNAOS_FBH` do not help:
+they are read with `option_env!` by `arch/aarch64/mailbox.rs` and have no effect on x86** — the x86
+panel comes from the bootloader's GOP mode selection, which takes EDID or the firmware's current
+mode. (`UNAOS_QEMU_EXTRA="-vga none -device VGA,edid=on,xres=…,yres=…"` does move it, and is how the
+1920x1200 row above was taken.) Even at bench width the gate has no full-panel-width window: the
+banded present on the bench is the console-as-a-window, which this gate does not route.
+
+So a green gate over the shipped path would have certified nothing about banding. `chromeband_fixture`
+drives the band loop's own `paint_window` call at 2880x1800 against a one-band scratch buffer — never
+touching the panel, so it cannot disturb `[wc-d]`'s read-back — and puts `bands=5` on the wire of
+every x86 witness boot. It is labelled `fixture` on that wire, and reads `-> NOT-BANDED` if the
+geometry ever stops exercising the defect.
+
 ## CURSOR-VUG — a focused app was swallowing the pointer, and the arrow with it (2026-08-08)
 
 Peter, Boots AL and AO: *"vug blocks mouse cursor" / "vug covers mouse"* — the arrow disappears over
@@ -13544,6 +13597,67 @@ the usual discipline regardless: `arch/aarch64/syscall.rs` and `main.rs` are bot
 **line-neutral** (22504 and 5032 lines, unchanged), each added line paid for by a line of prose
 compressed in the same file, so the gated arm cannot shift a panic `Location` in the knob-off build.
 
+### DRAGWIDE — M1's narrowing was undone in the same breath it was taken (x86 `wc`, 2026-08-25)
+
+Convicted independently on both tracks, at the same site. M1 narrowed `move_to_inner` from
+`request_full_present()` to the old box and the new one. But `move_to_inner` ends in `composite()`,
+`composite_inner` opens by calling `drain_deferred`, and `drain_deferred` ended with
+
+```rust
+if painted { super::screen::request_full_present(); }
+```
+
+so on every move whose vacated sliver was non-empty — every drag step — `FULL_PRESENT` was re-armed
+**after** M1's two rect requests. `present_background` then took the `mark_full()` branch, threw the
+queue away, and republished the panel. The narrowing was defeated on precisely the path it was
+written for.
+
+**The widening was deliberate in purpose and wrong in extent**, so the guard was scoped, not removed.
+WC-J's duty is real: only the desktop can put its own content (console text, status strip) back under
+a departed window, since the erase can only paint `DESKTOP_BG`. But the content needing restoration
+is the content the erase just covered — this box, and nothing outside it. That is M1's own argument,
+applied where M1 stopped. Overflow is safe: `request_present_rect` merges into the least-growth slot
+when the queue is full and disjoint, so the result is always a superset of what was owed. No rect is
+dropped; the failure mode is a slower present, not a wrong one.
+
+**Measured on x86 (gate panel 1280x800):**
+
+```
+before  [wc-w] rollup presents=49 requested_px=430548  presented_px=4096000 amp=9.51x full_presents=3 -> WIDENED
+after   [wc-w] rollup presents=57 requested_px=1086744 presented_px=3072000 amp=2.82x full_presents=2 -> WIDENED
+```
+
+Exactly one whole panel (1 024 000 px) leaves the present budget and the drain's escalation is gone.
+`requested_px` RISES because the drain's boxes now appear as honest requests instead of being
+replaced. The two surviving full presents are `focus_changed` and the menu's `repaint_vacated`, which
+are not this path's — the line still reads `WIDENED` because that verdict is about the panel-escalation
+count, not about this arc, and suppressing it would be the instrument lying about traffic it can see.
+
+#### Why no instrument caught it, and what does now
+
+`[dragperf] px_per_move=` is charged at the REQUEST site, in `move_to_inner`. It therefore reported
+M1's `extent_speedup` faithfully while the drain behind it republished the panel — a witness sitting
+directly beside the defect it could not see. The presented side is now counted in
+`present_background`, from the damage set, at the same instant the requested side is read from the
+queue it drained. `[wc-w] rollup` is the **x86** reader: without it these counters would be a census
+nobody prints, since `[dragperf]` is driven only from `arch/aarch64`.
+
+#### The general shape: motion rate vs event rate
+
+The class this belongs to is *"an always-on maintenance path escalating to full-surface at MOTION
+rate rather than EVENT rate."* Audited on x86 after the fix, the surviving `request_full_present()`
+callers are `focus_changed` (asid 0), `minimise`, `zoom`, `reclaim`, and `crystal::repaint_vacated` —
+**all event rate**, one per user action. `drain_deferred` was the only motion-rate member, and it is
+gone. The cursor bracket and the deferred erase were already off this path (FLICKER-2 removed the
+bracket from the drain, FLICKER-3 from `Screen::flush`, and WC-K2 made `erase` queue rather than
+paint). `screen.rs`'s other `mark_full` callers — `fill_screen`, `paint_desktop_scene`, `scroll_up` —
+are startup or event rate likewise.
+
+The two defects on this arc do compound in the stated direction — an inflated publish is what pushes
+`span` past `chunk_rows` — but they are not one cause: DRAGWIDE inflates the DESKTOP's damage set,
+while banding is a function of a WINDOW's own box, and the gate's windows are two orders of magnitude
+short of the threshold either way.
+
 ## CONSWIN-PI / MENUBAR-PI — the console gets a window and the bar gets turned on (aarch64 `pidesk`, 2026-08-13)
 
 Two pieces of the desktop-parity campaign, both of which were x86-gated in the EXPERIENCE layer
@@ -16246,6 +16360,13 @@ measurably not running, and **the machine wedged anyway.** Boot 13 could not del
 because its threshold was unreachable (below); boot 16 delivered it, and it is the answer the
 WCDVALVE experiment was built to get.
 
+> **Correction to this paragraph's FOOTING, not to its conclusion (WCDVALVE-LOOP, 2026-08-25).**
+> The `wcd~0%` above is not independent evidence and never was: closing the valve is precisely what
+> stops `verify_window` from running, and `verify_window`'s drop guard is the only writer of
+> `C2_WCD_CYC`, so `wcd` reads 0 *because* the valve is shut. The refutation rests entirely on
+> `state=CLOSED` and `suspended=` — the suppression itself — which is sound, and on those terms it
+> stands. The field now prints `wcd~?` while closed for exactly this reason. See §WCDVALVE-LOOP.
+
 **What the refutation rules out, and what it does not.** It rules out the read-back as the *site* of
 the hang and as its *trigger*. It does not exonerate write-combine pressure generally — a saturated
 drain remains the measured precursor to these holds (`declined_pct` climbing 69 → 98 over ~17 s,
@@ -16342,6 +16463,11 @@ rather than about us: it would mean a stuck BAR store *does* eventually retire.
 > is weaker than a reading. This is a **fifth** instance of the law one subsection up, found while
 > writing this section: appending both to the `[wcser]` rollup — the standing tail-insertion rule,
 > no existing key moves — is one line each and is owed.
+>
+> **PAID 2026-08-25 (WCSER-READER, `acf5d175`).** The rollup now carries `steals=` and `revenants=`
+> ahead of `span=`, loaded and never swapped, and printing a zero rather than omitting one. The
+> statement above stands as the record of what boot 16's claim actually rested on. See
+> §WCSER-READER below, which also records the residual the fix could not close from `wm.rs`.
 
 **What this does NOT do, stated here as it is stated in the commit rather than left to be
 discovered:** the parked core is not recovered, its window is not recovered, and the non-returning
@@ -16399,10 +16525,16 @@ rate steps down at the steal and stays down:
 | pre-wedge steady, `up=20..76` | 57 | **818** | 0 | 1008 |
 | post-steal, `up=88..579` | 492 | **140** | 48 | 396 |
 
-A ~5.8x sustained step, taken at the steal and held for 492 consecutive samples. The likely cause is
-plain oversubscription rather than anything subtle: `usb-pump` and `input` were both dispatched on
-c7, and after the steal c7 also carries the compositor passes it took from c1. That is a hypothesis,
-not a measurement — nothing on the wire attributes the step — and it is recorded here as one.
+A ~5.8x sustained step, taken at the steal and held for 492 consecutive samples.
+
+**The mechanism is settled and it is NOT scheduler oversubscription** — see *Finding 1 — the `pmp`
+collapse is the pump core becoming the compositor*, below, which supersedes the oversubscription
+guess this paragraph originally carried. In short: `x86_usb_pump`'s own loop body composites on the
+calling core, so once the steal made the gate acquirable, the pump core started running full passes
+instead of being refused at the CAS in nanoseconds. `gate=` names **c7 in 383 of the 492 post-steal
+samples** (88% of those naming any core), and a core inside a pass for 88% of wall-clock runs its
+pump loop at roughly 12% of its rate: 818 x 0.12 is about 98, against a measured median of 140.
+The step is the compositor's cost, charged to the device core.
 
 **What does NOT follow from the step, and is the actual point:** the poll is degraded, not dead. It
 runs at ~140 passes/s for the remaining 510 seconds, which is two orders of magnitude more than
@@ -16503,3 +16635,397 @@ and ours is not. Same fate, different provenance.
 invisible to every guard we own, on both architectures — and that value evaporates the moment
 someone treats a shared shape as a shared cause and goes looking for one fix. If a common cause is
 ever found, it will be found by evidence, and this line will be the thing it overturns.
+
+## WCSER-STEAL / INPUT-UNGATE / WCSER-REHOME — the steal recovered the panel and abandoned the keyboard (x86, 2026-08-22)
+
+Boots 13–16 (`~/unaos-bench/capture/rmbp4-boot13/`, split by the byte offsets in that directory's
+`BOOT-OFFSETS.md`) wedged the same way four times: core 1 enters `stage_window`'s present blit and
+stops inside ONE store into the Kepler BAR1. Boot 15's ISR-driven row trace is what makes that exact
+rather than inferred — 99 consecutive one-second samples reading `win=9 phase=33 row=897`, the row
+never once advancing. A crawling loop moves; this does not.
+
+WCSER-STEAL (`8e91b952`) declared such a holder dead and took `COMP_GATE` from it. It worked, and
+boot 16 proves it worked: 510 further seconds of live desktop, zero `WEDGED` rollups, `comp_ms` p50
+5 ms. **And boot 16 also proves it was only half a recovery.**
+
+### What boot 16 measured
+
+| t | reading |
+|---|---|
+| 83.8 s | c1 parks in phase 33 (`win=9 row=946`). The render task lives on c1 and dies with it. |
+| 83.8–87.8 s | gate held by the corpse; every composite call is declined instantly. `pmp≈985`. |
+| 87.829 s | `[wcser] GATE STOLEN from c1 by c7 after 4006ms`. |
+| 87.8 s onward | `pmp` steps down and never recovers — median **140** over 492 samples (min 48, max 396), against a pre-wedge median of 818. See the distribution table above; "~110" was an early reading off the extremes. |
+| 97 s | the operator touches the pad; HID flows again. |
+| 97 → 101.6 s | `hq` climbs 2 → 9 → 14 → 24 → **25**. |
+| 101.6–598 s | `hq` pinned at 25, unmoving, for **497 seconds**. `hid_ms` climbs to 433076. |
+
+### Finding 1 — the `pmp` collapse is the pump core becoming the compositor
+
+`pmp` counts `service_ehci_hid()` entries per second, i.e. the `x86_usb_pump` loop's own rate. The
+pump and the input service both run on the SERVICE core (c7); the render task ran on c1.
+
+The pump's loop body calls `wcx::desktop_app_service()` → `wm::pace_service()` and
+`fbcon::console_service()` → `route_present_banded()`, and **both of those composite on the calling
+core**. Before the steal every one of those calls was refused at the `COMP_GATE` compare-exchange in
+nanoseconds, because the corpse held the gate — so the pump free-ran at ~985 passes/s. After the
+steal the gate became acquirable and those same calls started running FULL passes on the device core.
+
+The deadman line settles it without inference. `gate=` is an ISR-sampled reading of who holds the
+gate, and across the 494 post-steal samples it names **c7 in 437 of them (88 %)**; only 6 name any
+other core. `[wcser]` reports `entered≈332` per 5 s (~66 real passes/s) at `held_ms` 0–9. A core
+inside a composite pass 88 % of wall-clock runs its pump loop at ~12 % of its former rate:
+985 × 0.12 ≈ 118, against a measured post-steal mean of 154.
+
+**So it is not scheduler oversubscription. The steal re-homed the compositor onto the one core the
+SCHED-X86 placement rules exist to keep composite work off.** Stated as the general lesson: a steal
+that hands a resource to whoever asks next will hand it to the busiest core in the system, because
+the busiest core asks most often.
+
+### Finding 2 — input was gated behind the compositor by construction
+
+`GUI_CHANNEL_X86` is a 64-slot `Channel` whose **only** consumer is the render task. `Channel::send`
+blocks while full. When the render task died the channel acquired no consumer ever again;
+`x86_input_service` filled the 64 slots and parked in `send` permanently. Because that task is also
+the sole drain of `pal::EVENT_QUEUE`, the ring stopped draining — which is the `hq=25` pinned for 497
+seconds. The desktop repainted the whole time. The keyboard and trackpad were gone the whole time.
+
+Blocking is correct backpressure against a consumer that is SLOW and catastrophic against one that is
+DEAD, and nothing in the compositor's repair addresses it.
+
+### The two-part cure
+
+**INPUT-UNGATE (`arch/x86_64/sched.rs`, `main.rs`).** `Channel::try_send` mirrors `try_recv`'s
+discipline (non-parking `try_wait`, permit taken only on success, `Err(value)` hands the value back
+rather than dropping it). `x86_input_service` never parks on the channel, and decides what to do with
+a refusal per class, because the classes are not equally recoverable:
+
+* **relative `Event::Mouse` — COALESCED, never dropped.** Deltas are additive, so a summed run steers
+  the arrow and any live drag to the identical place. This is `GUI_FOLD_X86`'s consumer-side fold
+  moved to the producer, and it inherits that ledger's conservation rule: a coalesced report is
+  counted in its own term and never netted out of `GUI_SENT_X86`.
+* **`Key` / `KeyUp` / `Button` / `Wheel` / `MouseAbsolute` — MUST SURVIVE.** A refused one is held in
+  one slot and the task **stops taking from `pal::EVENT_QUEUE`**, returning to the top of the loop
+  rather than parking. The ring is the backpressure; it is bounded and its overflow is already
+  counted. Dropping here would trade a visible hang for invisible loss, which looks healthy.
+* **`Event::Timer` — dropped freely.** Loss-tolerant filler by contract; counted anyway.
+
+Order is preserved: owed items retire before anything new is taken, folded motion ahead of the held
+event, and a heartbeat never jumps the queue.
+
+**WCSER-REHOME (`video/wm.rs`, `main.rs`).** `try_send` alone would convert a hang into permanent
+silent input loss, because a non-parking producer facing a channel with no consumer just coalesces
+forever. So the steal now publishes the identity of the core it declared dead (`COMP_DEAD_CORE`, a
+latched mailbox claimed once by `comp_dead_core_take`), and `x86_usb_pump`'s service pass re-spawns
+the render service on a live core. The general statement, which is the fix:
+
+> A core declared dead by the steal has its singleton roles reassigned, and any role that is NOT
+> reassigned is named explicitly as a known-abandoned trade.
+
+For this kernel: **re-homed** — the render service (the `GUI_CHANNEL_X86` drain, the dispatch, the
+present). **Abandoned, and accepted** — the dead core, and the ring-3 window whose present was in
+flight. **Not at risk** — the pump and input service, which share the service core, not the render
+core.
+
+The rescue core comes from `smp::xhci_worker_cpu`, which already excludes both the render and the
+service core — co-locating the render role with the pump is the `XHCI_CONTROLLER` deadlock SCHED-X86
+rule 1 forbids, so a machine with no eligible core DECLINES out loud rather than trading a dead
+channel for a dead machine. A rescue instance skips `open_shell_window`: the dead instance's row is
+still registered and its surface still mapped, so that window composites its last contents and
+nothing types into it — named here rather than left to be discovered.
+
+### Three hazards a naive re-home walks into, and where each is closed
+
+Raised by the aarch64 seat, which hit this class twice; each verified against the x86 tree rather
+than ported.
+
+**1. The corpse never releases its locks.** `arch::x86_64::sched::Mutex` is `{ sem, data }` — a bare
+semaphore permit with **no owner record** — and nothing in task teardown walks a dying task's held
+locks (`reap_killed` handles an explicit `kill`; a core parked on an instruction is never reaped at
+all). A replacement that takes a lock the corpse still holds parks forever: a second freeze, quieter
+than the first, with nothing on the wire. So the census is done before the spawn, not after. At the
+phase-33 blit the corpse holds `COMP_GATE` (stolen, with an identity-checked release) and
+`STAGE[stage_pool_index()]` — which is `meter_current_cpu()`, i.e. **per-core**, so the replacement
+composes into a structurally disjoint entry. It does **not** hold `TABLE`: `composite_inner` takes it
+in a scoped block that yields the row snapshot and drops the guard well before the draw loop, and
+boot 16 confirms it independently — ~66 passes/s completed for the 510 s after the steal, and every
+one of them takes `TABLE`. Nor `WRITER` (copied and dropped on one line), nor the heap lock (the row
+loop allocates nothing). *Known residual:* the corpse's `BlitGuard` is never dropped, so its
+`BLIT_ACTIVE` registration stands for the boot. Nothing waits on that count reaching zero — a raised
+`DRAIN_PENDING` makes a pass SKIP, not block — so it costs a leaked count, not a hang. It predates
+this arc and boot 16 ran 510 s with it standing.
+
+**2. A full channel is not evidence of a dead consumer.** `x86_input_service`'s `SCREEN_APP_ACTIVE`
+arm exists precisely because a full-screen command legitimately owns the panel while the render task
+cannot drain. Inferring death from `sent - recv` depth would fire during ordinary full-screen use and
+give the machine two channel consumers and two present owners — the split-brain `fbcon::detach()`
+exists to prevent. The trigger here is the **steal's own positive declaration about a specific core**
+(`COMP_DEAD_CORE`, claimed once), never a depth inference.
+
+**3. A revenant must retire itself.** `RENDER_ROLE_EPOCH_X86` is bumped once per re-home, ahead of
+the spawn; each instance captures it at entry and re-checks it at the top of every pass. This is
+`comp_gate_release`'s identity check generalised from a *resource* to a *role*. "The dead core never
+comes back" is an observation — boot 16's `dec=` nibble at 0 across 494 samples is evidence, not a
+guarantee that a stuck BAR store cannot eventually retire — and `COMP_REVENANTS` exists because this
+tree already declined to build on it once. A superseded instance **retires rather than returns**:
+`wm` rows hold raw pointers into the render function's locals, so the frame must stay on the stack
+forever; it sleeps out of the way holding nothing.
+
+Related, and verified rather than assumed: `smp::ONLINE_APS` is written once at `start_aps` and
+**never has a core removed**, so a dead core stays a placement candidate forever. Placement is
+therefore explicit — ask `xhci_worker_cpu`, then reject any answer `DEAD_CORES_X86` knows to be a
+corpse. Without that guard the "recovery" could spawn onto the core that just died, silently.
+
+This is deliberately the **one-off fix for the render drain**, the instance actually measured — not a
+general role-migration framework. A general mechanism needs per-role owner epochs, positive liveness
+proof, a way to retire a core from the online set, and an answer for the corpse's locks; that is a
+programme, not this arc.
+
+### The witness, and where it lives
+
+`[deadman]` gains `in=coalesced/declined/timerdrop` and `rh=`. That placement is the point: every
+other x86 instrument is emitted by the render-service pass, so `[schedx86] depth` — the existing
+`GUI_SENT_X86`/`GUI_RECV_X86` ledger — printed nothing at all for the 497 seconds this arc is about.
+The timer ISR is the only emitter proven to survive the wedge.
+
+* `in=0/0/0` — the channel took everything offered. The normal desktop.
+* `in=N/M/T` with `hq` FALLING — the render task is behind but alive; the designed degradation.
+* `in=N/M/T` with `hq` PINNED and `rh=0` — the consumer is GONE and was not re-homed. Boot 16.
+* `rh>0` with `hq` returning to 0 — the recovery completed.
+
+`in=` is drained per second (a rate); `rh=` is standing (a count), so a one-second burst of declines
+cannot be mistaken for a permanent one. `in=`'s middle field counts ATTEMPTS refused, not events
+lost — one owed event is re-offered every ~1 ms pass, so a channel full for a whole second reads near
+the producer's pass rate rather than near the number of events behind it.
+
+### WEDGEINJ — the fault, on demand
+
+The wedge has been observed four times on one machine and never once in QEMU, so both recovery paths
+would otherwise be gated by compilation rather than by execution — which this tree does not accept.
+`UNAOS_WEDGEINJ=1` (feature `wedgeinj`, default off, x86-only, stripped from aarch64 media) arms an
+injected park: at 30 s the render task, on the core `smp::render_cpu()` names, takes `COMP_GATE` the
+way a pass takes it, stamps boot 15's own `phase=33 row=897` gauges, clears IF and spins forever.
+
+**Why it synthesises the held state instead of riding a real pass.** The first version hooked the
+phase-33 blit itself, one call per row — maximum fidelity, and useless, because **the x86 QEMU gate
+composites almost nothing**. Measured on the 60 s leg: `[wcser] scope=live entered=3 … span=12846ms`,
+all three inside the ring-3 window fixtures, and once those tear down at ~14 s the desktop is static
+— `comp_ms` climbs by exactly 1000 every second for the rest of the run, the deadman saying no pass
+has COMPLETED since. There is no window, no damage and no pass at 30 s, so a park that can only fire
+from inside a pass never fires, and the recovery stays as unproven as before the injector existed.
+
+Taking the gate directly reproduces the two properties — and they are the only two — the recovery is
+a function of: the core carrying the render role stops executing permanently, and it is holding
+`COMP_GATE` with `COMP_HOLDER_CORE`/`COMP_HOLD_T0_MS` set, so the steal fires on its own unmodified
+timer. What is NOT reproduced, stated rather than assumed: the stuck store, the half-written window,
+and whatever cache/BAR state the real fault leaves behind. Those are properties of the DEVICE, and
+the recovery reads none of them — it reads the gate, the holder and the clock.
+
+It weakens no protection, adds no path to an unarmed build (the call site is an empty inline shim),
+and costs one AP for the rest of the run by design. **Never arm it on bench media.**
+
+### WCSER-PICK — the steal handed the gate to the worst possible core, and it did so by design
+
+WCSER-STEAL declared a dead holder's gate free and let **the next core to ask** win it. Boot 16
+measured the consequence: `[deadman] gate=` names **c7 in 383 of the 492 post-steal samples** — 88 %
+of those naming any core — and c7 is the **device-service core**, carrying `x86_usb_pump` and
+`x86_input_service`. *Finding 1* above establishes the mechanism; what was never stated is that this
+outcome is **structural, not luck**, and therefore fixable at the acquisition site.
+
+`x86_usb_pump`'s loop body composites on the calling core (`wcx::desktop_app_service` →
+`wm::pace_service`, `fbcon::console_service` → `route_present_banded`). Before the steal every one of
+those calls was refused at the `COMP_GATE` compare-exchange in nanoseconds, because the corpse held
+the gate. After the steal they ran full passes on the device core. The whole 5.8x `pmp` step is the
+compositor's cost, charged to the one core the SCHED-X86 placement rules exist to keep it off.
+
+> **A steal that hands a resource to WHOEVER ASKS NEXT hands it to the BUSIEST core, because the
+> busiest core asks most often.** A free-for-all acquisition is not neutral with respect to
+> placement; it is biased against it, in proportion to exactly the property placement exists to
+> protect.
+
+`main.rs` already published the right answer. `smp::publish_sched_split(render, service)` exists to
+keep composite work off the service core, and `smp` exposes `render_cpu()`/`service_cpu()` so callers
+**ask** rather than re-derive. The steal was the one acquisition site in the compositor that never
+asked. It asks now (`1d04b3df`), and no `smp` or `main.rs` change was needed to make it ask.
+
+**The acquirer cannot literally be chosen, and the shape follows from that.** `composite()` runs *on*
+the acquirer and the acquirer then runs the pass, so the only lever available inside `wm` is whether
+*this* caller is admitted to steal. The preference is therefore a **time-staged admission**, and it
+must be bounded: a preferred core that never calls `composite()` would otherwise hold the desktop
+dead forever.
+
+| rung | admits | from | why it exists |
+|---|---|---|---|
+| `unpublished` | the first asker | the 4 s bound | No split published, so no preference exists and there is nothing to wait for. Mirrors `smp::worker_cpu`'s `PlaceTier::Unpublished`. |
+| `render` | `me == render_cpu()` | the 4 s bound | The placement answer. Composite work belongs on the core the split named for it, and the render service's own channel drain lives there. |
+| `pool` | any core that is neither the corpse nor `service_cpu()` | +1 grace | **The rung that fires on the measured fault.** |
+| `any` | anyone, including the service core | +2 graces | The floor. A desktop on the wrong core still beats a dead desktop — WCSER-STEAL's trade, not reversed — and `pick=any` says so on the wire. |
+
+Two details carry most of the value:
+
+* **Rung `render` is skipped, not waited out, when the corpse IS the render core.** That is not an
+  edge case, it is the only case ever measured: `holder=c1` on boots 11, 13, 14, 15 and 16, against
+  `:: SCHED-X86: RENDER on core 1 … ::` on every one of them. An unsatisfiable rung is answered, not
+  slept on — the same discipline `xhci_worker_cpu` applies when it returns `None` instead of
+  degrading. So the measured fault pays one grace, not two.
+* **Liveness of the acquirer needs no test.** It is `meter_current_cpu()`, so "is the chosen core
+  alive?" is answered by the fact that it is asking. The pre-existing `dead != me` term is the whole
+  of it.
+
+`COMP_STEAL_GRACE_MS` is **250 ms**, sized off a measurement rather than guessed: boot 16's
+`dec=f0ffffff` roster saturates its per-core nibble at `f`, so every core but the corpse arrived at
+the gate at least 15 times a second, and 250 ms is at least three arrivals per candidate *at that
+floor*. Worst case the two graces add 500 ms to a 4 s recovery bound — 12.5 % more frozen glass on a
+panel frozen for four seconds.
+
+**What the QEMU gate can and cannot show.** With `UNAOS_WC=1 UNAOS_DEADMAN=1 UNAOS_WEDGEINJ=1`:
+
+```
+:: [wcser] GATE STOLEN from c1 by c5 after 4251ms — the holder was in phase 33 row 897 and had
+   not moved. The acquirer was CHOSEN, not next in line: pick=any render=1 svc=5; desktop resumes
+   on this core, c1 is DEAD and its singleton roles are owed a re-home == tripwire ::
+```
+
+Read that honestly: `pick=any` is **the fallback firing**, because the x86 QEMU gate composites
+almost nothing and the service core is the only core that asks — the same property WEDGEINJ's own
+ledger records. The picker withheld the gate from the pump for the full 250 ms grace and then handed
+it over rather than leaving the desktop dead, which is correct, and the `4251ms` against
+WCSER-STEAL's `4006ms` is the stated cost appearing on the wire. **QEMU cannot demonstrate the `pool`
+rung; metal can, and boot 16's decline roster says it would have.** That is the reading a metal boot
+should be checked against: `pick=pool` with `pmp` holding near its pre-wedge median is the win this
+arc is claiming.
+
+### WCSER-READER — the two counters that had no reader
+
+`COMP_REVENANTS` and `COMP_STEALS` were incremented from the moment WCSER-STEAL landed and appeared
+on **no serial line anywhere in the tree**. The grep is the whole finding: two declarations, two
+`fetch_add`s, two prose mentions in comments, no reader. Boot 16's operator playbook asked Peter to
+watch `COMP_REVENANTS`, and **he could not have seen it however hard he looked.**
+
+`revenants` is not decoration. It counts cores that came back from the dead and correctly declined to
+release a gate a live core now owns, so a nonzero reading is **news about the device, not about us**:
+a stuck BAR1 store eventually *completed*. WCSER-STEAL's safety argument rests on "the parked core
+never comes back" being an **observation** rather than an invariant, and this field is the only thing
+in the tree that could ever contradict it.
+
+Both are now on the `[wcser]` rollup ahead of `span=`, where `exbusy=` went in and for the same
+reason (`acf5d175`):
+
+```
+[wcser] scope=live entered=3 declined=0 reruns=0 declined_pct=0 holder=-1 held_ms=0 exbusy=0
+        steals=0 revenants=0 span=11597ms -> SOLO
+```
+
+**Loaded, never swapped — and not merely because they are boot-cumulative gauges.** `wcser_emit`
+*self-silences* on a period with no compositing. A drained steal counter would therefore be destroyed
+by any silent period following a steal: the steal counted, the rollup declining to print, and the
+swap that never ran leaving the evidence nowhere. Cumulative reading makes the self-silencing
+harmless. The one thing it gives up — which 5 s window a steal fell in — is already carried, with its
+own timestamp, by the `GATE STOLEN == tripwire ::` line.
+
+**A zero is printed, not omitted.** A counter that appears only when nonzero cannot distinguish *"no
+revenants"* from *"the reader is dead"*.
+
+> **The residual, named rather than left to be discovered — and it is a SEVENTH instance of the
+> absent-instrument law.** `[wcser]`'s rollup is paced by **presents, not by passes**: `wcn_tick()`
+> is called only from `present()`, so a desktop that composites without any window presenting emits
+> no rollup at all. The `wedgeinj` gate shows it — one `[wcn] rollup` at 11.7 s and never again,
+> while `[deadman] comp_ms` reads 62–100 ms at `up=41..57`, i.e. passes completing at 10+/s for the
+> whole post-steal half of the run, reported by nothing. So in QEMU the new fields can be shown
+> printing a measured **zero** but not a measured **one**. On metal the reader works — boot 16
+> printed `[wcser] -> SERIAL` rollups continuously for 510 s after its steal at `entered` averaging
+> 261 per 5 s window — so this is QEMU-gate blindness rather than a metal defect. **The
+> structurally stronger home for both counters is the `[deadman]` timer-ISR line**, the one emitter
+> this section has already established survives the wedge; `deadman.rs` was held by a concurrent
+> executor during this arc and the move is owed.
+
+### WCDVALVE-LOOP — the valve measures a quantity that only exists while it is open
+
+Boot 16 flapped the WC-D valve on a ~5.2 s period for the whole pre-wedge session:
+
+```
+[ 40630ms] [wc-d] valve READ util~0% wcd~0% span=51ms close_at=util12%/wcd8% state=CLOSED
+[ 40630ms] [wc-d] valve OPEN resumed suspended=380
+[ 40699ms] [wc-d] valve CLOSED util~7% wcd~12% suspended=1
+```
+
+repeating with `suspended=` 380, 235, 234, 471, 233, 477 — each cycle releasing hundreds of suspended
+admissions and reclosing 43–69 ms later. **The thresholds are not the defect and re-pricing them
+cannot fix it.** Traced through the source rather than inferred from the wire:
+
+1. `wcdvalve_closed() == true` makes `verify_reference` return `None`.
+2. `None` means `wcd_ref` is `None`, so the composite loop's `if let Some(vr)` never calls
+   `verify_window`.
+3. `verify_window`'s `WcdClock` drop guard is the **one and only** `fetch_add` on `C2_WCD_CYC` in the
+   module.
+
+So `wcd` is not measured-zero while CLOSED, it is **unmeasurable**. It is an observable of the
+valve's own open state, not of the load.
+
+**The sharpest statement, and why no threshold fixes it.** Close is `util >= 12 OR wcd >= 8`; reopen
+is `util < 8 AND wcd < 5`. Every closure boot 16 recorded was taken on the `wcd` term alone — `wcd`
+9–29 % while `util` sat at 7–9 %, *below its own 12*. Such a closure has, at the instant it is taken,
+a reopen predicate **already satisfied on every term that remains measurable**, because `util < 8` is
+precisely the condition under which the `util` term declined to close it.
+
+> **A `wcd`-driven closure is self-cancelling by construction.** No pair of numbers changes that: 0
+> is below every positive reopen threshold.
+
+**A second, independent defect set the observed period.** `comp2_emit` swaps both `C2_INSPAN_CYC` and
+`C2_WCD_CYC` to zero and restamps `C2_EPOCH_CYC` every ~5 s; `WCDVALVE_MIN_SPAN_US` then admits a
+judgement 50 ms later — **1 % of the epoch, immediately after a drain that zeroed both numerators.**
+That is why every `valve READ` in the flapping epochs reads `util~0% wcd~0%` at `span=51ms` while the
+same boot's `[comp2]` reports real duty. The reopen was being decided by the rollup drain, which is
+also why the period was the *rollup's* and not the valve's.
+
+**The fix is not to stop the cycle.** A valve that suppresses the very quantity it closes on cannot be
+a level-triggered gate — it can never learn the pressure went away without opening to look. It must
+be a **duty-cycled sampler**: shut for a stated dwell, then a bounded trial open to re-measure. Boot
+16's valve was already doing exactly that, one ~60 ms trial per ~5.2 s, but *by accident*. So the
+cycle is made deliberate rather than removed (`a4e7cd9c`):
+
+* **`wcd` while CLOSED is UNKNOWN.** Dropped from the reopen predicate, where it was a tautology, and
+  printed `wcd~?`, where it was a lie on the wire.
+* **`WCDVALVE_DWELL_US` = 2 s** — the minimum closed dwell, and the load-bearing constant. 30–45x the
+  measured 43–69 ms reclose, and deliberately *not* a divisor or multiple of the ~5 s rollup epoch:
+  the aliasing is what made the old behaviour read as a mysterious 5.2 s cycle, so the two cadences
+  are now tellable apart.
+* **`WCDVALVE_REOPEN_SPAN_US` = 1 s** — a reopen may only be judged on a span old enough to *be* a
+  sample.
+* **`WCDVALVE_WCD_OPEN_PCT` = 5 is deleted**, not kept. A reopen threshold on a quantity that is
+  structurally 0 whenever the valve is shut is not a conservative setting; it is a term that is
+  unconditionally true. It never governed anything and read on the wire as if it did.
+* **The close path is untouched.** Same 50 ms floor, same `util >= 12 OR wcd >= 8`. Both floors err
+  the same way — toward the valve being **shut** — because a shut valve defers a verdict and never
+  drops one.
+
+**The control this must not break, and why it does not.** After ~77.5 s boot 16's valve stayed closed
+through the wedge, which is the experimental refutation of the read-back theory, and a future boot
+must still be able to demonstrate that. It can: that boot read `util~98%` and `util~79%` across the
+wedge, an order of magnitude above `WCDVALVE_OPEN_PCT`, so the reopen fails on the `util` term with
+or without this change, and a dwell can only ever **extend** a closure. The QEMU gate demonstrates
+the same shape directly — `util~68%`, valve closes at 175 ms, never reopens.
+
+**What it costs.** The valve can now reopen *mid-epoch* where before it could only reopen at an epoch
+top. That is the entire cost, bounded by construction: at most one trial per dwell, so the trial rate
+goes from ~1 per 5.2 s to ~1 per ~2.06 s and admitted read-back duty roughly 2.4x, ~1.2 % of wall
+clock to ~2.9 %. Episodes get shorter, so `suspended=` per episode falls below boot 16's 233–477
+range; a harvest keyed to those magnitudes reads differently and is meant to.
+
+**What QEMU cannot show, stated so no one reads the green as more than it is.** QEMU cannot reproduce
+the oscillation: it needs `util` in the 7–9 % band that only a metal desktop produces, and QEMU's
+composite duty is ~68 %. It also cannot print `wcd~?`, because the `[comp2]` epoch only advances from
+the `[wcn]` pump, which needs a window to present — the same blindness §WCSER-READER records. Both new
+witnesses were confirmed present in the artifact by `strings` instead.
+
+> **A standing red on the `wcdvalve` knob, established by A/B and NOT caused by this arc.**
+> `UNAOS_WC=1 UNAOS_WCDVALVE=1 ./arroyo test` fails `[dmgovlp] … adopt_stretch=0/4 -> FAIL`; the
+> same run without the knob reads `adopt_stretch=4/4 -> PASS`. It reproduces identically at the arc
+> baseline `f8210a6a` (diff snapshotted, `git apply -R`, re-run, re-applied — never stashed), so it
+> predates WCDVALVE-LOOP. Mechanism, partially known: arming the valve suppresses `verify_window`
+> from 175 ms onward and the CURSTICK stretch stops carrying, but `CUR3_TAKEN` moves in
+> `note_cursor_overlay` from `stage_window`, so the coupling is **indirect** and is its own arc. Two
+> acceptable outcomes there: the fixture is legitimately incompatible with a suppressed read-back
+> and should SKIP with a stated reason rather than FAIL, or the valve is suppressing something the
+> compositor's correctness depends on — which would be far more interesting. Decide by evidence, not
+> by relaxing the threshold.

@@ -1457,7 +1457,7 @@ impl PanelSink {
             // deferring it: the glyphs are in cached RAM that only the compositor reads, `finish` runs
             // before `_print` returns, and the band accumulated here is exactly what the compositor
             // is then told.
-            self.routed = true; #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] super::wcg::seam_glyph_note(false, CONSOLE_WIN.load(Ordering::Relaxed)); // WCGSEAM — charge the routed glyph write (unlocked split path). ⚠ ONE LINE, line-NEUTRAL, per `draw_fb`'s standing note.
+            self.routed = true; #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] super::wcg::seam_glyph_note(false, CONSOLE_WIN.load(Ordering::Relaxed)); // WCGSEAM — charge the routed glyph write (unlocked split path). PARFB: `all(witness, x86_64, wc)` was never a legitimate pair, and ORIN-DEFER turned that from cosmetic into a LIVE UNDERCOUNT. The sibling charge in `write_byte` (the LOCKED path) already carries the widened predicate, and so does the `routed` test twelve lines up — so on a `witness` + `desktop_firmware` + `orindefer` build the console reaches THIS branch, paints, and charges nothing, while the classic path it no longer takes still charges. The gate is now the same predicate as the `routed` flag it sits under. ⚠ ONE LINE, line-NEUTRAL, per `draw_fb`'s standing note.
             self.note(band);
             return;
         }
@@ -1645,7 +1645,7 @@ pub fn clear() {
 /// blank store, so screen and shadow are coherent from the first byte. GUI builds never call
 /// this (they `detach()` fbcon; the `Screen` back buffer owns the heap budget) and a
 /// belt-and-braces GUI_ACTIVE check keeps it a no-op even if one did. Idempotent.
-#[cfg(target_arch = "x86_64")]
+#[cfg(target_arch = "x86_64")] // PARFB KEPT — HARDWARE, and the reason is a MEMORY-TYPE fact. The shadow exists to remove uncached VRAM *reads* on the rMBP's PCIe-scanned GOP surface. The Pi/Orin scanout is mapped Normal-WB CACHEABLE, so the read cost this spends ~28 MiB of heap to avoid DOES NOT EXIST there; porting it would buy them nothing and take the heap. (This gate's own doc adds that even on x86 the shadow's original reason retired with the wrap-around scroll.) ⚠ The prose deliberately avoids the other arch's literal spelling: the drift tool pairs on that literal within 25 lines, and a KEPT gate must stay VISIBLE in its count rather than be argued out of it by a comment.
 pub fn attach_shadow() {
     // QUIET-PANEL: headless/test builds never paint the boot log any more, so don't spend
     // ~28 MiB of heap on a shadow nothing draws to. (And with wrap-around rendering the console
@@ -1719,7 +1719,7 @@ pub fn attach_shadow() {
 /// site. So the skip lives here. On the Kepler path `CONSOLE_WIN` is still `wm::WIN_NONE` when this
 /// runs (resume, then activate — that is the seam's ordering law), so this guard cannot fire on any
 /// boot that exists today and the Kepler wire is unchanged.
-#[cfg(target_arch = "x86_64")]
+#[cfg(target_arch = "x86_64")] // PARFB KEPT — HARDWARE, but only after SPLITTING the item, and the split is why this gate is honest rather than lazy. Steps (1) and (3) undo the KEPLER TAKEOVER's calibration draw and drop the x86-only cached-RAM shadow; neither has an analogue on the other chip, whose display engine this kernel does not drive at all. Step (2) — the FACE ARMING — is platform-agnostic and is NOT kept: it is `panel_console_face_arm` at the file tail, which ORIN-FACE already ported and armed. The duplication between the two bodies is deliberate for now: folding step (2) into a call would take the `FBCON` lock TWICE on the Kepler seam, and a contended second `try_lock` there lands on this function's ABORT arm — a real regression risk on the one seam that puts console text back on the metal panel.
 pub fn panel_console_resume() -> usize {
     #[cfg(feature = "wc")]
     if CONSOLE_WIN.load(Ordering::Relaxed) != wm::WIN_NONE {
@@ -2157,7 +2157,12 @@ fn pace_clock_hz() -> u64 {
 /// not ready, allocation refused, geometry unavailable, create failed, install contended), and the
 /// caller then detaches exactly as it always did. `desktop_firmware` off is a compile-time absence, so the
 /// knob-off image never contains this at all.
-#[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))]
+///
+/// PARFB — widened from `all(aarch64, desktop_firmware)` to the ROUTE's OWN condition on both arches.
+/// "Is the console routed right now?" is not a Pi question; it is the routed console's question, and
+/// x86's `wc` desktop has the same route and reads it from the same `CONSOLE_WIN` cell. The gate now
+/// names exactly where a route can exist, which is the only honest gate for a query about the route.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] // PARFB
 pub fn console_is_routed() -> bool {
     CONSOLE_WIN.load(Ordering::Relaxed) != wm::WIN_NONE
 }
@@ -2275,11 +2280,24 @@ pub fn panel_console_face_arm() -> Option<(usize, usize)> {
 /// THE PANIC OVERRIDE IS EXPLICIT: a held mirror is ignored while `PANIC_MIRROR` is set, so
 /// `panic_screen`'s red backdrop and its text reach the panel whatever the desktop had claimed. That
 /// is the same belt-and-braces `_print`'s x86 mute gate keeps, for the same reason.
-#[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))]
+///
+/// PARFB — BOTH GATE TERMS WERE INCIDENTAL, on ORIN-FACE's own argument. The `feature` term is the
+/// one that costs: `desktop_firmware` was never the only desk. The Orin comes up through `orindesk`,
+/// and the two-writer window this closes — a desk clears the glass, and `_print` keeps painting on it
+/// until the glyph route installs — is that desk's window too, verbatim. With the knob term in place
+/// the mechanism could not be armed there at all, because it did not exist to arm. The `target_arch`
+/// term went with it: this body names `FBCON` and one `AtomicBool`, and x86 has both. On x86 the
+/// QUIET-PANEL gate still makes the hold redundant on every path that exists today, so the widening
+/// buys x86 an ARMABLE mechanism and changes no x86 boot — nothing calls `panel_mirror_hold`, so the
+/// flag reads false forever and `_print`'s test short-circuits on its first relaxed load.
+///
+/// ⚠ ARMING IT IS A CALL SITE, AND THE CALL SITE IS NOT IN THIS FILE. See the report's out-of-lane
+/// coordinates for the `orindesk` DESKTOP-CLEAR seam that has to call `panel_mirror_hold(true)`.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))] // PARFB
 static PANEL_MIRROR_HOLD: AtomicBool = AtomicBool::new(false);
 
 /// DESKHOLD — arm the hold described above. Called by `desktop_firmware::activate`'s DESKTOP-CLEAR.
-#[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))] // PARFB
 pub fn panel_mirror_hold(on: bool) {
     PANEL_MIRROR_HOLD.store(on, Ordering::Relaxed);
 }
@@ -2293,15 +2311,15 @@ pub fn panel_mirror_hold(on: bool) {
 /// WINDOW blank for the rest of the boot, which is the one outcome worse than the defect. The hold
 /// therefore lifts exactly when the route makes it redundant, and stays armed forever on the decline
 /// path, where there is no window and the panel is the only thing a print could reach.
-#[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))] // PARFB — see the static's note.
 fn panel_mirror_held() -> bool {
-    PANEL_MIRROR_HOLD.load(Ordering::Relaxed)
-        && !PANIC_MIRROR.load(Ordering::Relaxed)
-        && CONSOLE_WIN.load(Ordering::Relaxed) == wm::WIN_NONE
+    #[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))] let overridden = PANIC_MIRROR.load(Ordering::Relaxed); #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware"))))] let overridden = false; // PARFB — `PANIC_MIRROR`'s OWN predicate, quoted rather than assumed. Where the flag does not exist there is no panic mirror that could override the hold, so the term is a compile-time `false`. ⚠ SAME-LINE fold, line-NEUTRAL.
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] let unrouted = CONSOLE_WIN.load(Ordering::Relaxed) == wm::WIN_NONE; #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] let unrouted = true; // PARFB — `CONSOLE_WIN`'s own predicate. A build with no glyph ROUTE has no window for the hold to become redundant against, so the third term is a compile-time `true` there rather than a missing static. ⚠ SAME-LINE fold, line-NEUTRAL.
+    PANEL_MIRROR_HOLD.load(Ordering::Relaxed) && !overridden && unrouted
 }
 
-/// DESKHOLD — the absent-feature arm. See the sibling above.
-#[cfg(not(all(target_arch = "aarch64", feature = "desktop_firmware")))]
+/// DESKHOLD — the arm for an arch this kernel does not build. See the sibling above.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn panel_mirror_held() -> bool {
     false
 }
@@ -2523,7 +2541,7 @@ impl FbCon {
 /// ### Why a new knob rather than widening `pidesk`
 ///
 /// `pidesk` on this board pulls in the whole desktop cascade — `dock::focus_set` reaches
-/// `arch::aarch64::syscall`, gated `any(baremetal, tegra_el0)` — and §5.2's stop-line stands over it
+/// `arch::aarch64::syscall`, gated `aarch64_el0` (the named EL0 capability) — and §5.2's stop-line stands over it
 /// (a 16 KiB stack overflow on two consecutive Pi metal boots that no QEMU gate in this tree can
 /// reproduce). Arming a FONT must not require crossing that. `orinface` is standalone, mirroring
 /// `orindesk`/`orinclick`'s spelling: no window, no `wm` lock, no `dock`, no syscall surface. The

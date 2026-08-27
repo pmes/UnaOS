@@ -11,7 +11,7 @@
 #   ./arroyo check         Syntax check: kernel (both targets, default + cfg-gated feature legs,
 #                          including the x86 pairwise-mix legs — see GATE-CFG-MIX below)
 #                          + the ring-3 user-* crates
-#                          UNAOS_CFG_SWEEP=1 adds the per-feature x86 sweep (+78 legs, ~220 s)
+#                          UNAOS_CFG_SWEEP=1 adds the per-feature x86 sweep (+2N legs, 150 today)
 #   ./arroyo build         Build both targets (no QEMU)
 #   ./arroyo clean         Purge all build artifacts
 
@@ -255,6 +255,12 @@ _feats=""
 # Cross-arch knob now: x86/virt + aarch64/virt (QEMU ramfb witness) + aarch64/tegra (the Orin panel).
 # Knob-off is byte-identical on BOTH arches (module + `rast` dep unlinked).
 [ -n "${UNAOS_RAST:-}" ] && _feats="${_feats}rast,"
+# RASTPORT: UNAOS_RASTMC=1 adds the x86 MULTI-CORE rung — `rast_demo::run_mc`, the frame-pipelined
+# pass RAST-MC built for the Orin, now reaching x86's APs. Implies `rast` (Cargo), so setting this
+# alone is enough. Runs a 1-core baseline and then the pipelined pass in the SAME boot and reports
+# the measured ratio; the paced single-core spin still runs after it, unchanged. Default OFF =>
+# every MC site is unlinked and the x86 image is byte-identical to a plain `rast` build.
+[ -n "${UNAOS_RASTMC:-}" ] && _feats="${_feats}rastmc,"
 # PORTSW-1: DEFAULT-ON Panther Point EHCI->xHCI port switchover (route the shared USB2 ports + enable
 # SuperSpeed) so the 2012 rMBP internal keyboard/trackpad re-enumerate on the xHCI+HID stack. Applied
 # BEFORE enumeration with mask-read-before-write discipline (writes only advertised bits). Metal-gated
@@ -455,6 +461,36 @@ _feats=""
 # sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature disabled
 # while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson).
 [ -n "${UNAOS_BTC:-}" ] && _feats="${_feats}btc,"
+# BT-DIR: UNAOS_BTDIR=1 arms THE DIRECTION TEST. Every BR/EDR attempt this project has ever made
+# tested ONE direction — this host paging the speaker — and all of them ended at Connection Complete
+# status=0x04 PAGE TIMEOUT with the controller certifying the full train. Answering an inquiry only
+# proves the peer is INQUIRY-scanning; page scan is a separate enable (Core Vol 4 Part E §7.3.18),
+# and "discoverable but not connectable" is the ordinary resting state of a speaker already bonded
+# elsewhere. So this knob asks the other way: after the outbound page stage has finished and printed
+# its tally, write HCI_Write_Scan_Enable (0x0C1A) = 0x03 (inquiry scan + page scan), hold ONE page
+# window (6400 ms, sized against the controller's own page-scan interval, which is READ), report
+# what arrived, then write 0x00 back and READ IT BACK.
+# AIR-SIDE POSTURE, stated plainly as the UNAOS_BTC paragraph above states its own: a UNAOS_BTDIR=1
+# boot makes this machine DISCOVERABLE AND CONNECTABLE for the length of that one window. It is a
+# private bench machine and the window is bounded and restored, but the posture is real and belongs
+# in this list rather than in a source comment.
+# NO ACCEPT PATH: the reading wanted is the Connection Request EVENT arriving. Accept/Reject
+# (0x0409/0x040A), Set_Event_Filter, SDP, RFCOMM, a local name and a written Class of Device exist
+# nowhere in this tree, so nothing would meet an inbound connection and the controller's own accept
+# timeout resolves it. That is the measurement, not a gap.
+# TWO PHASES, NEVER CONCURRENT, and that is the whole design: a controller with page scan enabled
+# time-slices between inbound scan windows and an outbound train, so running both at once would
+# confound the very measurement UNAOS_BTC spent four boots taking. Every byte is btdir-gated and
+# sits strictly AFTER the C1 tally, which is what keeps a plain UNAOS_BTC=1 build byte-identical to
+# the builds its control was measured on — and is also this arc's `strings` control.
+# Implies `btdir = ["btc"]` in Cargo.toml (phase 1 IS the control and must run), so setting this
+# alone arms the whole BT stack and the page. Costs an armed boot one 6400 ms window plus four HCI
+# commands, once, and only when phase 1 ended without a live link or an unresolved page.
+# x86_64 only; stripped from aarch64 builds by `arm_features` below. Default OFF => bt_dir_probe,
+# its constants and its call site unlinked, media byte-identical. Kept in sync with
+# builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature disabled while the
+# banner claims it is on (the s42/INSTGUI and WXN-M3b lesson).
+[ -n "${UNAOS_BTDIR:-}" ] && _feats="${_feats}btdir,"
 # BT-BOND M1 / HOLOCRON: UNAOS_HOLOCRON=1 arms the kernel-side classed-record store — one CRC'd file
 # (`/HCRON/BTBOND.DAT`) on the writable FAT volume, a fixed in-RAM table, and the load/flush pair that
 # lets a record be PRODUCED under a driver lock (`EHCI_HID`, where the Bluetooth link key arrives) and
@@ -480,6 +516,18 @@ _feats=""
 # sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature disabled
 # while the banner claims it is on (s42/INSTGUI, WXN-M3b).
 [ -n "${UNAOS_HCRONST:-}" ] && _feats="${_feats}hcronst,"
+# PRTSCR-ST: UNAOS_PRTSCRST=1 arms the screen capture's BOOT-TIME-WRITE witness — one real capture
+# to SCREEN<n>.PNG at the volume root, then a read-back of what landed on the medium. Its own knob,
+# and NOT part of any other, by the rule stated for UNAOS_HCRONST above: a boot that did not ask to
+# WRITE the boot medium must be incapable of doing so. The capture mechanism (`screenshot`, the
+# Print Screen key) is ungated and always present — only this UNATTENDED write is behind the knob,
+# because nothing else can drive a verb on a headless boot. Pair it with the FAT leg for the real
+# proof: `UNAOS_PRTSCRST=1 ./arroyo test-fat sf` leaves a genuine PNG in builder/fat-sf.img that a
+# host decoder can open. Like `hcronst` it does NOT clean up after itself — the file IS the
+# deliverable. Default OFF => the selftest and its call sites vanish. Kept in sync with
+# builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature disabled while the
+# banner claims it is on (s42/INSTGUI, WXN-M3b).
+[ -n "${UNAOS_PRTSCRST:-}" ] && _feats="${_feats}prtscrst,"
 # INSTALL-CORE: UNAOS_INSTALLDEMO=1 arms the installer engine + its x86 boot witness (GPT writer +
 # FAT32 formatter + extent content-verify). The builder attaches a dedicated BLANK scratch disk over
 # the usb-storage slot under this knob (see builder/src/main.rs), against which the engine writes a
@@ -602,8 +650,8 @@ _feats=""
 # RMW confined to LNKCTL[1:0]; prints one '[pcih] aspm cleared rp XXXX->XXXX ep XXXX->XXXX' witness
 # line. Implies nvidia-kepler (Cargo-side). The unconditional census + wedge sampler ride EVERY
 # kepler boot regardless of this knob; the knob arms only the clear. Default OFF => the clear is not
-# linked, unarmed media byte-identical. ⚠ NOT yet mapped in builder/src/main.rs (out of this arc's
-# lane) — until that one-liner lands, esp-x86 metal media cannot arm it; flagged in the arc NOTES.
+# linked, unarmed media byte-identical. Kept in sync with builder/src/main.rs (the follow-up this
+# note used to flag as outstanding landed — esp-x86 metal media arm it like any other knob).
 [ -n "${UNAOS_NOASPM:-}" ] && _feats="${_feats}noaspm,"
 # CE-LADDER: UNAOS_KEPLER_CE=1 arms the read-only copy-engine reconnaissance
 # (drivers/gpu/kepler_ce.rs) — R1 PTOP sweep, R2 CE PRI probe, R3 wide runlist scan, R5
@@ -655,6 +703,17 @@ _feats=""
 # inline shim). DEFAULT OFF => every hook is an empty inline shim, so an unarmed kernel carries no
 # counter and no `[deadman]` string. Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_DEADMAN:-}" ] && _feats="${_feats}deadman,"
+# WEDGEINJ: UNAOS_WEDGEINJ=1 arms THE FAULT UNDER TEST. At 30 s of uptime the published RENDER core
+# clears IF and spins forever from inside the phase-33 present blit — indistinguishable to every other
+# core from the non-returning Kepler BAR1 store that wedged metal boots 13/14/15/16, which is the
+# property the recovery is tested against. It exists so WCSER-STEAL (gate re-home) and WCSER-REHOME
+# (render-role re-home) are gated by EXECUTION rather than by compilation; neither has ever run in
+# QEMU, and a recovery path that has never run is a claim. Pairs with UNAOS_WC=1 UNAOS_DEADMAN=1 and a
+# run long enough to see the 4 s steal plus the recovery (`./arroyo test 60`). COSTS ONE AP for the rest
+# of the run, on purpose. DEFAULT OFF => the per-row call site is an empty inline shim and an unarmed
+# kernel carries no `[wedgeinj]` string. ⚠ NEVER arm it on bench media. Kept in sync with
+# builder/src/main.rs.
+[ -n "${UNAOS_WEDGEINJ:-}" ] && _feats="${_feats}wedgeinj,"
 # R1 / RTPI: UNAOS_RTPI=1 arms PRIORITY INHERITANCE on the x86 sleeping `Mutex` (arch::x86_64::sched)
 # plus its `[rtpi]` witness. Unlike RTWIT (a pure ruler), this CHANGES scheduling: while a strictly-
 # higher task blocks on a `Mutex`, the holder inherits the blocker's priority (transitively) until
@@ -1531,6 +1590,18 @@ arm_features() {
     # ARCH-NEUTRAL call sites, so the shim half has to compile armed on aarch64 or the seam is
     # covered on neither arch.
     f="${f//,deadman,/,}"
+    # WCG-PAYGO is deliberately NOT in this strip, and must not join it by analogy with the
+    # entries above: since the 2026-08-27 parity port (WCGPAR) the feature emits REAL aarch64
+    # code — the glass-witness paygo half including the occlusion attribution — so stripping it
+    # would change behaviour, not just the fingerprint. It is also named on the `arm-pi`
+    # type-check leg above so that half compiles armed. (Whether Pi MEDIA ships it armed is the
+    # pi track's call; this function only strips what is provably codeless on aarch64.)
+    # WEDGEINJ rides the same strip, and more strictly than the others: its whole implementation is
+    # `all(target_arch = "x86_64", feature = "wedgeinj")`-gated (the aarch64 half is the empty
+    # `#[inline(always)]` shim), so it emits not one byte of aarch64 code — and it is a DELIBERATE
+    # FAULT INJECTOR, which has no business anywhere near a media path it cannot fire on. Stripped =>
+    # aarch64 media stay byte-identical whether or not the x86 track is reproducing its wedge.
+    f="${f//,wedgeinj,/,}"
     # SDHC-4a rides the same strip, for the same reason: `drivers/sdhc.rs` is reached only from
     # `arch/x86_64/pci.rs`, so `sdw` emits not one byte of aarch64 CODE — but leaving it enabled would
     # shift every aarch64 media hash between a default build and a `UNAOS_SDW=1` one for zero
@@ -1624,6 +1695,14 @@ arm_features() {
     # observable change. Stripped => the x86 track can page a speaker without touching Pi or Jetson
     # media at all.
     f="${f//,btc,/,}"
+    # BT-DIR rides the same strip, for the same reason and as a consequence of the same fact:
+    # `btdir` implies `btc` implies `bt`, whose only code is inside the x86-gated
+    # `drivers/ehci/mod.rs`, so `btdir` emits not one byte of aarch64 CODE — but an enabled feature
+    # is hashed into cargo's `-Cmetadata` fingerprint, so leaving it in (or either of the two
+    # implied features stripped just above) would shift every aarch64 media hash between a default
+    # build and a `UNAOS_BTDIR=1` one for zero observable change. Stripped => the x86 track can run
+    # the direction test without touching Pi or Jetson media at all.
+    f="${f//,btdir,/,}"
     # VSYNC-PACE (GR22, polarity inverted GR25) rides the same strip, for the same reason: every line
     # `vsyncpace` gates lives in `arch/x86_64/syscall.rs` and is additionally `wc`-gated (an x86-only
     # feature), so `vsyncpace` emits not one byte of aarch64 CODE — but an enabled feature is hashed into
@@ -2355,7 +2434,11 @@ check_user_arch() {
 }
 
 # GATE-CFG: the DEFAULT feature set is a tiny fraction of this kernel. `[features]` in
-# crates/kernel/Cargo.toml carries 98 knobs plus `default = []` (RE-COUNTED with the awk one-liner below on the PCIH tree, 2026-08-19: the 87 recorded on GR21 had gone stale by ten other-lane knobs before `noaspm` — the 98th, and on `x86-all` below — landed), so the two legs below compile only
+# crates/kernel/Cargo.toml carries 147 knobs plus `default = []` (RE-COUNTED 2026-08-27 on tree
+# 948f7859; the 98 recorded here on 2026-08-19 was itself a re-count of GR21's 87, which had gone
+# stale by ten other-lane knobs before `noaspm` — the 98th, and on `x86-all` below — landed. The
+# history is kept because the DRIFT is the point: this number has never once been right for long,
+# so read it as "run the awk one-liner", not as a fact), so the two legs below compile only
 # (this count was stale at 78 when GR20's `bcmarecon` was added — the real count was already 82,
 # four other-lane knobs having landed without it being bumped; and it was stale AGAIN at 84 for
 # `sdhcblk` — the real count at that base was 85, `wxnro` having landed on `x86-all` without the
@@ -2399,32 +2482,87 @@ check_user_arch() {
 # the BCMA-S1 tree, 2026-08-07; and AGAIN on the BT-L0 tree, GR21, where the table holds 87 and the
 # union 86, with `nvidia-kepler-kdisp-hold` still the sole gap): compare the `[features]` table
 # (minus `default`) against the union of the three leg feature lists below. `sdhcblk` (SDHC-4b),
-# `bcmaS1` (BCMA-S1) and `bt` (BT-L0) are all on `x86-all`, so no arc widens the gap.
+# `bcmaS1` (BCMA-S1) and `bt` (BT-L0) are all on `x86-all`, so no arc widens the gap. `btdir`
+# (BT-DIR, the direction test) is appended to `x86-all` for the same reason: it is x86-family and
+# would otherwise ride the derived mix legs as an unclaimed knob, which type-checks it but does not
+# say so — and this one MUST be visibly checked, because a `btdir` build whose code failed to
+# compile is indistinguishable at the bench from a radio that heard nothing.
 #
-# ⚠ RE-COUNTED 2026-08-19 (GR26, the tegra_el0 leg) AND STALE AGAIN, by a wide margin: the table holds
-# 100 knobs and the board legs' union 92. EIGHT are named by no board leg, and they do NOT all mean the
-# same thing — the distinction is what the count alone hides:
-#   * `nvidia-kepler-kdisp-hold`, `rtpi`, `rtwit`, `selfhost` — x86-family (their `#[cfg]` sites are in
-#     `arch/x86_64/`, or in `lib.rs`/`main.rs` under `target_arch = "x86_64"`). `x86_cfg_universe`
-#     inherits every unnamed feature as "unclaimed => assume x86", so these ride the 8 derived mix legs
-#     and are GENUINELY compiled. Not holes; just not board-named.
-#   * `simmer_test` (arch/aarch64/sched.rs), `xusbfw` (arch/aarch64/xusb_tegra.rs) and — until the leg
-#     appended below — `tegra_el0`: aarch64-only, inherited by the SAME rule onto x86 legs, where they
-#     compile GREEN and VACUOUS. Real holes wearing a green verdict.
-#   * `vugras` — split: `pub mod vugras;` is declared unconditionally so the module's own body rides the
-#     x86 legs, while its sweep CALL SITES are tegra-lane and ride nothing.
-# THE FAILURE MODE IS SILENT, which is why the count drifted this far unnoticed. The forcing function
-# the GATE-CFG-MIX note below promises ("the gate will go red naming it") fires only for a feature that
+# ⚠ RE-COUNTED 2026-08-27 (rmbp arc 7, on the post-merge tree 948f7859). SUPERSEDES the 2026-08-19
+# (GR26) count of "100 knobs / union 92 / EIGHT unnamed", which had gone stale by a wide margin. The
+# LIVE measurement:
+#
+#     table    147 knobs (`[features]` minus `default`)
+#     board legs' union   137, over the 27 rows of KERNEL_CFG_MATRIX
+#     named by no board leg   TEN
+#     derived x86 mix legs    9, over an `x86_cfg_universe` of 74
+#
+# Reproduce it, do not increment it — that is how this note went stale twice:
+#   knobs   awk '/^\[features\]/{f=1;next} /^\[/{f=0} f && /^[A-Za-z0-9_-]+ *=/{print $1}' \
+#             crates/kernel/Cargo.toml   (drop `default`)
+#   union   the third field of every KERNEL_CFG_MATRIX row, split on commas, sorted unique
+#   unnamed the first set minus the second
+# The mix numbers come from the machinery itself: `x86_cfg_universe` = the table minus what the arm-*
+# legs name and `x86-all` does not; `build_cfg_legs` then picks the smallest n with C(n, n/2) >= N,
+# which for N = 74 is n = 9. (The GATE-CFG-MIX note below still narrates "N = 39 ... n = 8" — see the
+# dated correction there. The DERIVATION is unchanged; only the numbers moved.)
+#
+# THREE knobs the 2026-08-19 list called holes have since been CLAIMED and are no longer unnamed:
+# `simmer_test` (arm-tegra-simmer), `xusbfw` (arm-tegra-xusbfw) and `tegra_el0` (arm-tegra-el0 and
+# eight legs after it); `wcdvalve` is now on `x86-all`. The ten that remain do NOT all mean the same
+# thing, and the count alone hides the distinction — so each one is classified:
+#
+#   NOT HOLES — genuinely compiled, just not board-named (5). `x86_cfg_universe` inherits every
+#   unnamed feature as "unclaimed => assume x86", so these ride the 9 derived mix legs, and their
+#   `#[cfg]` sites are ones an x86 compile actually reaches:
+#     * `nvidia-kepler-kdisp-hold` — three sites in `drivers/gpu/kepler_display.rs`, which is
+#       `nvidia-kepler` + x86_64-gated. Mix legs 1, 2 and 3 carry BOTH knobs, so the armed arms are
+#       compiled; this closes the long-standing gap the GATE-CFG-MIX note below still cites as its
+#       motivating example.
+#     * `rtpi` — `#[cfg(feature = "rtpi")] pub mod rtpi;` plus sites in `arch/x86_64/sched.rs`; the
+#       module's own items are `all(feature = "rtpi", target_arch = "x86_64")`. Mix legs 0, 2, 3, 4.
+#     * `rtwit` — module always declared, internals `all(feature = "rtwit", target_arch = "x86_64")`,
+#       sites in `arch/x86_64/{mod,syscall}.rs`. Mix legs 0, 1, 3, 4.
+#     * `selfhost` — `#[cfg(feature = "selfhost")] pub mod selfhost;`, arch-neutral body, x86-only
+#       call sites in `main.rs`. Mix legs 1, 2, 3, 6.
+#     * `vugras` — RECLASSIFIED. The 2026-08-19 note called it "split"; today it has NO `#[cfg]` item
+#       gate anywhere. `pub mod vugras;` is unconditional and the knob is read exactly once, as an
+#       EXPRESSION (`pub const ARMED: bool = cfg!(feature = "vugras");` — vugras.rs:55). A `cfg!`
+#       type-checks both polarities on every leg, so this knob is covered by construction and cannot
+#       be a hole while that stays true. Re-check if an item gate is ever added.
+#
+#   REAL HOLES — swept onto the x86 mix legs by the "assume x86" rule, where every site is behind an
+#   aarch64 qualifier and compiles GREEN and VACUOUS; named by no arm-* leg either, so the armed
+#   polarity is type-checked by NOTHING (5):
+#     * `vugdemo` — the worst of them, because the gate is a MODULE declaration:
+#       `#[cfg(all(target_arch = "aarch64", feature = "vugdemo"))] pub mod vug;` (lib.rs), with the
+#       matching `use` and the two shell verb arms in `shell.rs`. No leg compiles `src/vug.rs` at all
+#       — roughly 1.3 kloc of Ring-0 renderer, plus its `vugras::frame_sweep` call, checked by no
+#       gate in this repo. (Its `cfg!(feature = "vugdemo")` EXPRESSION sites in `shell.rs` are fine,
+#       for the same reason `vugras` is.) Pi lane.
+#     * `orinvpar` — every site is `all(target_arch = "aarch64", feature = "witness", feature =
+#       "orinvpar")` in `video/menubar.rs`, or `all(feature = "orinvpar", target_arch = "aarch64")` in
+#       `video/screen.rs`. The arm-tegra-* legs already carry `witness`, so ONE leg naming this knob
+#       closes it. Jetson lane. Note it implies `desktop_firmware` in Cargo.toml, so arming it on an
+#       x86 mix leg drags an arm-named knob onto x86 today — harmless (it type-checks) but worth
+#       knowing before anyone reads the mix legs' feature strings.
+#     * `v3d_hubcm`, `v3d_pmcycle`, `v3d_ptbbracket` — all sites in `arch/aarch64/v3d.rs`, which is
+#       `all(feature = "baremetal", feature = "v3d")`. `arm-pi` carries both, so the DISARMED
+#       polarity of all three is checked; the ARMED polarity is not. Pi lane.
+#
+# THE FAILURE MODE IS SILENT, which is why the count keeps drifting. The forcing function the
+# GATE-CFG-MIX note below promises ("the gate will go red naming it") fires only for a feature that
 # names an aarch64 MODULE from unqualified code; one whose sites all sit under `src/arch/aarch64/` or
-# carry a `target_arch` qualifier passes quietly. `tegra_el0` is the proven case: swept onto 8 x86 legs,
-# type-checked by none of them, and the armed Orin build broke anyway (EXECGATE — see the leg below).
-# The other three-and-a-half are the same shape and are NOT fixed here: out of this arc's lane, recorded
-# so the pi/jetson arc that owns each one can claim it.
+# carry a `target_arch` qualifier passes quietly. `tegra_el0` was the proven case: swept onto the x86
+# legs, type-checked by none of them, and the armed Orin build broke anyway (EXECGATE) — it has since
+# been claimed by the leg below. The five above are the same shape and are NOT fixed here: each needs
+# one leg on the board that owns it, and that is the pi/jetson lane, not this arc's.
 #
 # And the DEFAULT legs already compile the all-off state for both arches — so for every feature BOTH polarities of its `#[cfg]` are
-# type-checked, which is what makes the 61
-# `not(feature = "pi")` / 21 `not(feature = "tegra")` / 14 `not(feature = "baremetal")` sites in the
-# tree real coverage rather than an accident. The three default-ON features (`ehcihid`, `kbdwit`,
+# type-checked, which is what makes the 73
+# `not(feature = "pi")` / 32 `not(feature = "tegra")` / 12 `not(feature = "baremetal")` sites in the
+# tree real coverage rather than an accident (re-counted 2026-08-27; they were recorded as 61/21/14
+# on 2026-08-19 and drifted with the same silence as the knob census). The three default-ON features (`ehcihid`, `kbdwit`,
 # `smolnet`) and the negative knob `noportsw` are the one asymmetry worth stating: their opt-OUT state
 # has no `#[cfg(not(...))]` site anywhere in src/ (verified), so nothing is left unchecked.
 #
@@ -2446,6 +2584,11 @@ KERNEL_CFG_MATRIX=(
   # CONSOLE-WINDOW route (wc), instgui, the Kepler trio, IVB/GMUX, VPERF (videobench/videocap), the
   # EHCI family + KBDWIT, MTRAW + its inject sub-knob, STOR-1 (irqstorage), the BOT fault/ring
   # experiments, BENCH-RIDE (therm/pcilink/vrom), SMC, the rasterizer and the installer engine.
+  # RASTPORT: `rastmc` is carried HERE and only here, on the `sdw`/`pfwire_selftest` argument above —
+  # its 21 `#[cfg]` sites and the x86 `run_mc` call site are type-checked by this leg alone, since
+  # `rast` on its own leaves every one of them compiled out. The default legs cover the disarmed
+  # polarity. (This leg carries `rast` AND `wc`, so it is also a build in which the SCHED-X86
+  # render/service handoff is compiled out — see `main.rs`'s `not(feature = "rast")` gate.)
   # SDHC-4a: `sdw` is carried HERE and only here. Its gate is a real `#[cfg(feature = "sdw")]` on
   # `drivers::sdhc::write_block_512` and on the armed half of the self-test, so without a leg that
   # enables it the entire CMD24 ladder would be type-checked by nothing — the exact blind spot the
@@ -2486,7 +2629,7 @@ KERNEL_CFG_MATRIX=(
   # -Cmetadata note there) precisely because it emits not one byte of aarch64 code.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the
@@ -2502,7 +2645,7 @@ KERNEL_CFG_MATRIX=(
   # not have caught an aarch64 regression in the very file the "do not strip" decision exists to
   # protect. It is a type-check leg, so it shifts no Pi or Jetson MEDIA: `arm_features` (which media
   # builds go through) is untouched, and `kernel8` builds from its own curated K8_FEATS.
-  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman"
+  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo,prtscrst"
   # aarch64 board leg 2 — Jetson Orin Nano (Tegra234), plus the board-neutral aarch64 features that
   # would otherwise ride nothing: ORIN-SMP (tegrasmp/smpprobe), the four XCARVE levers, ORIN-NET-1..4
   # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET
@@ -2564,12 +2707,13 @@ KERNEL_CFG_MATRIX=(
   #
   # SIDE EFFECT, deliberate and correct: naming `tegra_el0` on an arm-* leg also REMOVES it from the
   # x86 mix universe (`x86_cfg_universe` = the feature table minus what the arm legs name and `x86-all`
-  # does not). It had been riding the 8 x86 pairwise legs as an unclaimed "assume x86" feature, where
+  # does not). It had been riding the x86 pairwise legs as an unclaimed "assume x86" feature, where
   # it is vacuous: every one of its cfg sites is either under `src/arch/aarch64/` or explicitly
   # `target_arch = "aarch64"`-qualified in `main.rs`, so those legs were compiling a knob that emits
-  # nothing. The universe goes 60 -> 59 features, the leg count stays 8 (C(8,4) = 70 >= 59) and the
-  # pairwise guarantee is unaffected — it is a property of the mask construction, not of which
-  # features are in the set.
+  # nothing. Removing one feature from the universe (60 -> 59 when this leg was written; 75 today)
+  # leaves the leg count wherever the C(n, n/2) >= N search puts it — 8 then, 9 now — and the
+  # pairwise guarantee is unaffected either way: it is a property of the mask construction, not of
+  # which features are in the set.
   "arm-tegra-el0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0"
   # ORIN-EL1AP armed (baton orin-8 item 1) — the arm-tegra-el0 row verbatim + `orinel1ap`, the literal
   # precedent one leg above (the feature implies `tegrasmp` + `tegra_el0` -> `tegra`; every site is
@@ -3113,7 +3257,15 @@ KERNEL_CFG_MATRIX=(
   # entries named only on this arm-* leg, so `x86_cfg_universe` drops them. Board legs +1; gate +1.
   # `./arroyo check` prints the live board/mix counts every run — read them there, not here.
   "arm-tegra-fbconpar ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,orinface,orindefer"
-  "arm-tegra-fbconpar-cross ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,orinconwin,orindesk,orinclick,orinface,orindefer"
+  "arm-tegra-fbconpar-cross ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,orinconwin,orindesk,orinclick,orinface,orindefer,orinvpar"
+  # DESK-NOEL0 (2026-08-27, rmbp 7): the THIRD polarity of the aarch64 desktop — desktop_firmware
+  # WITHOUT baremetal or tegra_el0 (a ringless desktop). Every other aarch64 leg carrying
+  # desktop_firmware also carries an EL0 layer, which is how dock.rs shipped E0433 reachable from
+  # the DOCUMENTED knob combo UNAOS_WITNESS=1 UNAOS_ORINVPAR=1 (exit 101 before ba3e9b62, 0 after
+  # — this leg is proven non-vacuous by that measurement). `quarry` joined 2026-08-27 (rmbp 8):
+  # its ringless arms landed with 98be87ad, which pre-measured this leg green with `quarry` and
+  # deferred the edit here to the seat.
+  "arm-desk-noel0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,desktop_firmware,livecon,wcg-paygo,quarry"
 
 
   # FBCONPAR CROSS (appended 2026-08-26) — the same two knobs on the FULL `pidesk` conjunction.
@@ -3144,9 +3296,10 @@ KERNEL_CFG_MATRIX=(
 # which Y is ON and X is OFF. The ungated case (Y = nothing) is already covered — the DEFAULT legs
 # compile the all-off state. What was missing is the feature-vs-feature case.
 #
-# THE LEG-SELECTION RULE (why this many legs and not more). The full powerset is 2^39 and absurd.
-# Per-feature sweeps (each ON alone; each dropped from the full set) are linear — 2N = 78 legs, ~220 s
-# measured — which is too slow to sit in `check` on every edit. But complete coverage of the defect
+# THE LEG-SELECTION RULE (why this many legs and not more). The full powerset is 2^N and absurd.
+# Per-feature sweeps (each ON alone; each dropped from the full set) are linear — 2N legs, which at
+# today's N = 75 is 150 (~220 s was measured back when N was 39, so budget well over that today)
+# — which is too slow to sit in `check` on every edit. But complete coverage of the defect
 # class does not need N legs at all, it needs an ORDERED-PAIR covering array, and that is LOGARITHMIC:
 #
 #   Give feature i a distinct n-bit mask M_i, all masks of the SAME popcount n/2 (an antichain), and
@@ -3154,26 +3307,40 @@ KERNEL_CFG_MATRIX=(
 #   M_Y are distinct sets of equal size, so neither contains the other, so some bit j is set in M_Y
 #   and clear in M_X. Leg j therefore has Y ON and X OFF. Every ordered pair is covered, by
 #   construction, with n legs — and n is the smallest integer with C(n, n/2) >= N, i.e. the PROVABLY
-#   MINIMAL number of legs for which such a family of masks exists at all. For today's N = 39 x86
-#   features that is n = 8. Verified empirically at authoring time: 0 uncovered ordered pairs of 1482.
+#   MINIMAL number of legs for which such a family of masks exists at all. For today's N = 75 x86
+#   features that is n = 9, because C(8,4) = 70 < 75 <= C(9,4) = 126. Verified empirically at
+#   authoring time, when N was 39 and n was 8: 0 uncovered ordered pairs of 1482.
 #
-# So the default gate pays 8 compiles (~23 s cold, measured) for complete pairwise cfg coverage of
-# the x86 feature cube. The `gmux_igd`/`intel-ivb` pair above is covered several times over.
+#   THE LEG COUNT IS DERIVED, NOT CONFIGURED: build_cfg_legs searches for that smallest n on every
+#   run, so it moves on its own as the feature table grows. Every count written in prose below is
+#   therefore a re-count hazard — read `${#KERNEL_CFG_MIX[@]}` on the gate's own summary line for the
+#   live number, and re-count these comments when the universe crosses a C(n, n/2) boundary.
+#
+# So the default gate pays 9 compiles (~23 s cold was measured when it was 8) for complete pairwise
+# cfg coverage of the x86 feature cube. The `gmux_igd`/`intel-ivb` pair is covered several times over.
+#
+# ⚠ NUMBERS ONLY, corrected 2026-08-27 (rmbp arc 7, tree 948f7859): the derivation above is exact and
+# unchanged, but "N = 39 ... n = 8" and every "39 legs"/"8 legs"/"1482 pairs"/timing figure in this
+# note is the authoring-time measurement and is now stale. Live: `x86_cfg_universe` holds N = 74, so
+# `build_cfg_legs` picks n = 9 (C(9,4) = 126 >= 74; C(8,4) = 70 < 74) and UNAOS_CFG_SWEEP=1 adds
+# 74 + 74 legs, not 39 + 39. Nothing here needs editing to stay correct — the code derives all of it
+# — but do not quote these figures. The knob census above KERNEL_CFG_MATRIX carries the live counts
+# and the per-knob classification of what the universe does and does not actually cover.
 #
 # WHAT THIS DOES NOT COVER, stated honestly. Strength 2. A symbol under X referenced from code gated
 # on `all(feature = "Y", feature = "Z")` needs a leg with Y and Z on and X off; the covering array
 # guarantees that only for pairs, not triples. The `x86-drop-<feat>` sweep legs behind
-# UNAOS_CFG_SWEEP=1 close exactly that direction — each drops ONE feature with all 38 others ON, so
-# every conjunction of other features is compiled — at the cost of 39 more compiles.
+# UNAOS_CFG_SWEEP=1 close exactly that direction — each drops ONE feature with all N-1 others ON, so
+# every conjunction of other features is compiled — at the cost of N more compiles.
 #
-# UNAOS_CFG_SWEEP=1 adds, on top of the 8 default mix legs:
-#   * `x86-only-<feat>`  — that feature ALONE (39 legs). Answers "does this feature stand up by
-#                          itself", and localizes: the mix legs prove a defect EXISTS but name a leg
-#                          carrying ~20 features; this names one.
-#   * `x86-drop-<feat>`  — the full x86 set MINUS that feature (39 legs). The strength-unbounded
-#                          direction described above.
-# Measured on the clean tree at authoring time: on-alone 39/39 green, leave-one-out 39/39 green,
-# ~220 s for the pair.
+# UNAOS_CFG_SWEEP=1 adds, on top of the 9 default mix legs:
+#   * `x86-only-<feat>`  — that feature ALONE (N legs, 75 today). Answers "does this feature stand up
+#                          by itself", and localizes: the mix legs prove a defect EXISTS but name a
+#                          leg carrying ~35 features; this names one.
+#   * `x86-drop-<feat>`  — the full x86 set MINUS that feature (N legs, 75 today). The
+#                          strength-unbounded direction described above.
+# Measured on the clean tree at authoring time, when N was 39: on-alone 39/39 green, leave-one-out
+# 39/39 green, ~220 s for the pair.
 #
 # THE FEATURE LIST IS DERIVED, NOT COPIED. A second hardcoded list would drift out of `[features]` —
 # and already had: `nvidia-kepler-kdisp-hold` is declared in crates/kernel/Cargo.toml and appears in
@@ -3329,6 +3496,91 @@ check_kernel_cfg() {
         echo -e "${COLOR_RED}❌ kernel cfg coverage FAILED (crate unaos-kernel), legs:${_failed}${COLOR_RESET}"
         return 1
     fi
+    # ── KNOB→LEG COVERAGE CHECK (2026-08-27, rmbp 7) ────────────────────────────────────────────
+    # Replaces the census comment's count invariant, which was asserted and rotted THREE times
+    # (2026-08-07 "sole gap" → GR21 "still the sole gap" → 2026-08-19 "STALE AGAIN, eight" →
+    # 2026-08-27 ten). The failure mode is silent, so it is now a CHECK, not a sentence.
+    #
+    # Rule: a declared feature named by NO leg is fine when the assumed-x86 mix inheritance
+    # genuinely compiles it (pure-x86 sites, or expression-only `cfg!` reads — both type-check on
+    # the derived legs). It is a REAL HOLE when the feature has aarch64-qualified `#[cfg]` sites:
+    # the x86 legs then compile it GREEN AND VACUOUS (the tegra_el0/EXECGATE precedent — a hole
+    # wearing a green verdict). Those FAIL here unless allowlisted below.
+    #
+    # Allowlist — KNOWN holes, each pre-assigned to the track that owns it (census block above):
+    #   vugdemo                          Pi lane   (module-decl gate; ~1.3 kloc compiled by no leg)
+    #   v3d_hubcm v3d_pmcycle v3d_ptbbracket  Pi lane   (armed polarity checked by no leg)
+    # Removing an entry here without adding the leg reintroduces a silent hole — don't.
+    #
+    # Control probe (parser tripwire): `vugpar` is named by arm-pi. If THIS check reports it
+    # uncovered, the parser has silently dropped leg rows (both seats hit exactly that bug via a
+    # character class that excluded `bcmaS1`'s uppercase) — the check then fails ITSELF, loudly.
+    #
+    # ⚠ Do NOT "improve" the grep below into attr-binding logic ("the #[cfg] above the call").
+    # This tree does LINE-NEUTRAL APPENDS: a `#[cfg]` attribute can share a line with an
+    # UNRELATED preceding statement (e.g. main.rs `vugras::idle_sweep(...); #[cfg(feature =
+    # "rast")] ...`), so positional binding misattributes gates. The same-line-conjunction rule
+    # used here is binding-agnostic on purpose — it classifies the FEATURE by whether any of its
+    # cfg sites is aarch64-conjoined, never which item an attribute decorates. (orin 9 hit the
+    # positional trap 2026-08-27; this comment is why the next reader doesn't.)
+    local _kl_declared _kl_covered="," _kl_f _kl_miss=""
+    _kl_declared="$(awk '/^\[features\]/{f=1;next} /^\[/{f=0} f && /^[A-Za-z0-9_-]+[ \t]*=/{sub(/[ \t]*=.*/,"");print}' "$WORKSPACE_DIR/crates/kernel/Cargo.toml" | grep -v '^default$')"
+    for _row in "${_rows[@]}"; do
+        read -r _ _ _feats <<< "$_row"
+        _kl_covered="${_kl_covered}${_feats},"
+    done
+    case "$_kl_covered" in
+        *",vugpar,"*) : ;;
+        *) echo -e "${COLOR_RED}❌ knob→leg coverage: control probe FAILED — vugpar not seen on any leg; the leg parser itself is broken (uppercase/odd-char drop?). No coverage verdict from this run.${COLOR_RESET}"; return 1 ;;
+    esac
+    for _kl_f in $_kl_declared; do
+        case "$_kl_covered" in *",${_kl_f},"*) continue ;; esac
+        case "$_kl_f" in vugdemo|v3d_hubcm|v3d_pmcycle|v3d_ptbbracket) continue ;; esac
+        if grep -rlq "feature = \"${_kl_f}\"" "$WORKSPACE_DIR/crates/kernel/src/arch/aarch64/" 2>/dev/null \
+           || grep -rn "feature = \"${_kl_f}\"" "$WORKSPACE_DIR/crates/kernel/src/" 2>/dev/null | grep -q 'target_arch = "aarch64"'; then
+            _kl_miss="${_kl_miss} ${_kl_f}"
+        fi
+    done
+    if [ -n "$_kl_miss" ]; then
+        echo -e "${COLOR_RED}❌ knob→leg coverage:${_kl_miss} — aarch64-qualified feature(s) named by NO leg. The x86 mix legs compile these green and VACUOUS; add each to the arm-* leg that owns its sites (or, for a hole another track must claim, to the allowlist above WITH its owner).${COLOR_RESET}"
+        return 1
+    fi
+    echo -e "${COLOR_GREEN}✅ knob→leg coverage OK (every aarch64-qualified feature is named by a leg; known holes allowlisted with owners)${COLOR_RESET}"
+    # ── KNOB→BUILDER WIRING CHECK (2026-08-27, rmbp 7) — the two-place trap, executable ────────
+    # x86 MEDIA features are rebuilt by builder/src/main.rs from its OWN env map; a knob mapped
+    # here alone lights the banner while the kernel the metal boot runs carries nothing. This file
+    # already warned about that in prose four times (and builder:59 names a past victim) and the
+    # warnings still produced a fifth victim (rastmc, 2026-08-27) — so, like the census above, the
+    # invariant is now a CHECK. Scope: knobs whose feature a LITERAL x86 leg names (mix legs
+    # excluded — the derived universe holds features media never arms, whose absence from the
+    # builder is correct). aarch64 needs no twin: its build invokes cargo directly and prints the
+    # effective-features line when it differs from the banner — the stronger mechanism x86 lacks.
+    local _kb_x86="," _kb_miss="" _kb_var _kb_feats _kb_f
+    for _row in "${_rows[@]}"; do
+        read -r _leg _ _feats <<< "$_row"
+        case "$_leg" in x86-mix-*) : ;; x86-*) _kb_x86="${_kb_x86}${_feats}," ;; esac
+    done
+    local _kb_map
+    _kb_map="$(sed -n 's/^\[ -n "\${\(UNAOS_[A-Z0-9_]*\):-}" \] && _feats="\${_feats}\([A-Za-z0-9_,-]*\),"$/\1 \2/p' "${BASH_SOURCE[0]}")"
+    case "$_kb_map" in
+        *"UNAOS_WC wc"*) : ;;
+        *) echo -e "${COLOR_RED}❌ knob→builder wiring: control probe FAILED — UNAOS_WC->wc not parsed from this file's knob map; the map parser is broken. No wiring verdict from this run.${COLOR_RESET}"; return 1 ;;
+    esac
+    while read -r _kb_var _kb_feats; do
+        [ -n "$_kb_var" ] || continue
+        for _kb_f in ${_kb_feats//,/ }; do
+            case "$_kb_x86" in *",${_kb_f},"*) : ;; *) continue ;; esac
+            if ! grep -q "\"${_kb_var}\"" "$WORKSPACE_DIR/builder/src/main.rs"; then
+                _kb_miss="${_kb_miss} ${_kb_var}->${_kb_f}"
+            fi
+            break
+        done
+    done <<< "$_kb_map"
+    if [ -n "$_kb_miss" ]; then
+        echo -e "${COLOR_RED}❌ knob→builder wiring:${_kb_miss} — mapped in arroyo, named by a literal x86 leg, and UNREAD by builder/src/main.rs. Arming it for x86 media banners without building (the rastmc failure). Wire it in the builder's env map too.${COLOR_RESET}"
+        return 1
+    fi
+    echo -e "${COLOR_GREEN}✅ knob→builder wiring OK (every x86-leg-named knob is read by the media builder)${COLOR_RESET}"
     echo -e "${COLOR_GREEN}✅ kernel cfg coverage OK (${_n} legs)${COLOR_RESET}"
 }
 

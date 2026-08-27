@@ -233,3 +233,17 @@ where
         x86_64::instructions::interrupts::without_interrupts(f)
     }
 }
+
+/// [`flush_framebuffer_range`]'s STRIDED twin, for a damage-tracked present that wants to drain a
+/// RECT rather than the full-width scanlines it sits in. On x86 the two are the same instruction:
+/// the drain is `SFENCE`, which is range-INDEPENDENT (it flushes every pending WC store, wherever
+/// it was written), so the rect geometry is nothing this arch can act on and every argument is
+/// ignored. The parameters exist because the CALLER's question — "make these rows visible to the
+/// scan-out" — is arch-neutral; only the answer is not.
+///
+/// Appended at the file tail for the reason its aarch64 twin states.
+#[inline]
+pub fn flush_framebuffer_rows(_addr: usize, _row_len: usize, _rows: usize, _stride: usize) {
+    // SAFETY: SFENCE has no preconditions; it only orders/drains stores.
+    unsafe { core::arch::asm!("sfence", options(nostack, preserves_flags)) };
+}

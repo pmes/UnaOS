@@ -3106,6 +3106,40 @@ fn cpu_dispatching(cpu: usize) -> bool {
     cpu < MAX_CPUS && ONLINE_MASK[cpu].load(Ordering::Acquire)
 }
 
+/// RASTPORT — how many cores are registered online + dispatching. Signature-matched twin of
+/// `arch::aarch64::sched::online_cpu_count`, placed here beside the mask it reads rather than
+/// derived by a caller, so both arches answer the same question from the same state.
+///
+/// The bridging direction is the reverse of SCHEDPAR's (which grew aarch64 twins for x86
+/// accessors); the rule it set — match the signature exactly, do not "improve" it on the way
+/// across — is followed here.
+///
+/// **WHAT IT COUNTS, AND THE ONE ASYMMETRY A CALLER MUST KNOW.** [`ONLINE_MASK`] is set at the
+/// top of `run()`, which *every* core passes through — APs via `wait_and_run`, **and the BSP via
+/// `run_bsp`**. On aarch64 the boot core is NOT in its mask (`run_capstone_boot_core` never calls
+/// `mark_online`), so there `online_cpu_count()` reads as "secondaries". On x86 that difference is
+/// carried by the BUILD, not by the accessor: a build that reaches `run_bsp` counts core 0, and a
+/// build that does not, does not. In particular the `rast` build — the one caller today — compiles
+/// the SCHED-X86 handoff out entirely (`main.rs`'s `not(feature = "rast")` gate), leaves the BSP
+/// inline, and so never marks core 0. A caller that wants "secondaries" specifically must either
+/// know it is on such a build or subtract the boot core itself; this function reports the honest
+/// mask and does not guess which the caller meant.
+pub fn online_cpu_count() -> usize {
+    (0..MAX_CPUS).filter(|&c| ONLINE_MASK[c].load(Ordering::Acquire)).count()
+}
+
+/// RASTPORT — how many CPU slots the scheduler's per-CPU arrays are sized for, as a
+/// platform-neutral name. The arch-neutral answer to "what is the largest core index a pinned
+/// `spawn` may name without indexing a run queue out of range": here that bound is
+/// [`MAX_CPUS`] ([`RUN_QUEUES`], [`ONLINE_MASK`], `SCHED` are all sized by it); the aarch64 twin
+/// answers `percpu::NUM_CPUS` for the same reason.
+///
+/// Exists so shared code can size a per-CPU array without either spelling — the brief's "prefer a
+/// neutral accessor over renaming either". `const fn`, so it still serves as an array length.
+pub const fn sched_cpu_slots() -> usize {
+    MAX_CPUS
+}
+
 /// SMPBAL-X86: rate limit for the one-shot `SCHEDPLACE-X86` witness — the first `PLACE_LOG_MAX`
 /// auto-placements are named on the wire, then it goes quiet. Enough to cover a six-vug launch at the
 /// bench without a busy desktop flooding the log.
@@ -4872,6 +4906,41 @@ impl<T> Channel<T> {
         let value = self.buffer.lock().pop_front().expect("channel buffer empty after items.try_wait");
         self.slots.post();
         Some(value)
+    }
+
+    /// Non-blocking `send`: take a free slot if one is available RIGHT NOW, else hand the value back.
+    ///
+    /// INPUT-UNGATE: this exists because `send`'s block is not backpressure when the consumer can
+    /// DIE. `GUI_CHANNEL_X86` has exactly one consumer — the x86 render task — and boot 16 proved a
+    /// consumer can be lost outright: core 1 parked inside a non-returning MMIO store at 83.8 s, the
+    /// render task went with it, and nothing was ever going to drain the channel again. The producer,
+    /// `x86_input_service`, filled all 64 slots and then parked in `send` FOREVER. It therefore
+    /// stopped draining `pal::EVENT_QUEUE` too, and the machine's whole input path died behind a
+    /// compositor it has no business depending on — `[deadman] hq=25` pinned, unmoving, for the last
+    /// 497 seconds of the boot.
+    ///
+    /// A producer that must keep serving something else (here: the event ring, whose drain is what
+    /// keeps the USB pump's decode from backing up) cannot afford an unbounded park on a peer it does
+    /// not control the liveness of. So it asks instead of committing, and decides what to do with the
+    /// refusal itself — which is a decision only the caller can make correctly, because it is a
+    /// question about the VALUE (a coalescable delta, a keystroke that must survive, a heartbeat that
+    /// may be dropped) and not about the channel.
+    ///
+    /// `Err(value)` hands the value straight back rather than dropping it: a `try_send` that consumed
+    /// its argument on failure would make silent loss the DEFAULT and force every caller to opt out
+    /// of it. The refusal is lossless by type.
+    ///
+    /// Like `try_recv` this never parks, so it is safe where blocking would be wrong — but it still
+    /// takes the buffer mutex, so it must run on a scheduled task like the rest of the type.
+    /// `try_wait` takes a permit only when it succeeds, so the `slots`/`items` accounting is
+    /// identical to `send`'s on the `Ok` path and untouched on the `Err` path.
+    pub fn try_send(&self, value: T) -> Result<(), T> {
+        if !self.slots.try_wait() {
+            return Err(value);
+        }
+        self.buffer.lock().push_back(value); // mutex held only across the push (never across a wait)
+        self.items.post();
+        Ok(())
     }
 }
 

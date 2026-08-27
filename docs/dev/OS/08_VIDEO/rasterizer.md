@@ -452,9 +452,41 @@ core count. Full accounting, including the per-core heap footprint and the
 witness lines, is in
 [`orin-3d.md`](../../../../unaos/docs/dev/OS/09_PLATFORM/orin-3d.md) §3.1.
 
-> **Status.** RAST-MC's witness lines are **PENDING** — it has not run on Orin
-> silicon as of 2026-08-18, and QEMU cannot stand in for the `tegra` path. That
-> pending status is a property of the wire-in, not of this crate.
+> **Status.** RAST-MC's witness lines are **PENDING on Orin silicon** — it had
+> not run on the Jetson as of 2026-08-18, and QEMU cannot stand in for the
+> `tegra` path. That pending status is a property of the wire-in, not of this
+> crate. It is **no longer pending as a mechanism**, though: see §5.2a.
+
+### 5.2a RASTPORT — the same rung on x86 (`UNAOS_RASTMC=1`)
+
+RAST-MC is no longer aarch64-only. Its 21 `#[cfg]` sites moved from
+`all(feature = "tegra", target_arch = "aarch64")` to
+`any(that, all(feature = "rastmc", target_arch = "x86_64"))`, and the rung ran
+end to end under QEMU on x86 with **verdict PASS, 2.090x vs a same-boot 1-core
+baseline**, 5 render cores each rendering exactly 18 of 90 frames. That number
+sits on the Amdahl ceiling the section above predicts a priori.
+
+Three bridges were needed, not the two the triage expected — `percpu::NUM_CPUS`
+→ a neutral `sched::sched_cpu_slots()` (`gdt::MAX_CPUS` on x86), a new x86
+`sched::online_cpu_count()` twin, and a shim for `sched::spawn`, whose x86
+signature takes a fifth `priority` argument. Crate changes: **still zero.**
+
+Two facts a reader of this section needs:
+
+- **Arming `rast` on x86 compiles the SCHED-X86 render/service handoff out of
+  the boot** (`main.rs`'s `not(feature = "rast")` gate). The BSP stays inline,
+  which is why the demo's call site is reachable at all and why the presenter
+  has no render-lane peer. There is correspondingly no scheduled render lane on
+  such a build, so nothing here says anything about coexisting with one.
+- **Under `wc` with a real Kepler takeover the pixels do not reach the glass.**
+  `desktop_uefi::activate()` opens a centred console window;
+  `Screen::present_background` subtracts occluder boxes *before* copying to the
+  framebuffer, so a centred demo blit is discarded and `flush()` reports success
+  anyway. Timings and serial witnesses stay honest. **QEMU has no Kepler, so
+  QEMU shows the cube and the bench rMBP will not** — making this demo visible
+  on x86 under the compositor means rendering into a window instead of poking
+  panel coordinates, which is a design change to a `call-never-edit` path and
+  was deliberately not attempted.
 
 ### 5.3 The Pi consumer
 

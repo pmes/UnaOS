@@ -648,17 +648,31 @@ pub fn clear() {
 //
 // NAMED-PATH DIVERGENCE, recorded here because it is the one place the BT-BOND design does not
 // match the tree. The design specifies the whole-file rewrite "through the VFS/FAT write path
-// (`fs/vfs.rs` `create`/`write`)". In this tree `impl VfsBackend for FatBackend` — along with
-// `resolve_parent`, `fat_err` and `fat_create_err` — is `#[cfg(target_arch = "aarch64")]`. On
-// x86_64, which is the platform this whole arc is FOR, `FatBackend` is a struct with no backend
-// impl and cannot be mounted into a `MountTable` at all.
+// (`fs/vfs.rs` `create`/`write`)". The write below goes to `fs::fat`'s dir-aware twins directly
+// instead: `locate_in_dir` / `create_dir` / `create_in_dir` / `delete_located` / `write_grow`.
 //
-// So the write below goes to `fs::fat`'s dir-aware twins directly: `locate_in_dir` / `create_dir` /
-// `create_in_dir` / `delete_located` / `write_grow`. That is not a substitute MECHANISM — it is the
-// exact set of primitives the aarch64 `FatBackend` adapter wraps, reached the way the arch-neutral
-// `shell.rs` file verbs and `flight_recorder.rs` already reach them, and it lands on the same
-// `block::write_block_usb` BOT WRITE(10) path the design names. Adding an x86 arm to `fs/vfs.rs`
-// would be the alternative, and it is out of this arc's lane.
+// WHY IT STILL DIVERGES — RE-STATED 2026-08-27, BECAUSE THE ORIGINAL REASON EXPIRED. This note used
+// to say the seam did not exist here: `impl VfsBackend for FatBackend` — along with
+// `resolve_parent`, `fat_err` and `fat_create_err` — was `#[cfg(target_arch = "aarch64")]`, so on
+// x86_64 `FatBackend` was a struct with no backend impl and could not be mounted into a `MountTable`
+// at all. VFSX86 (`fs/vfs.rs`, 2026-08-21) DELETED that gate. The impl and those three helpers are
+// arch-neutral today and mounting `FatBackend` on x86_64 compiles, so the divergence is no longer an
+// impossibility — it is a deliberate non-migration, and VFSX86 says so in its own note: moving the
+// three existing direct callers (`shell.rs`, `fs/flight_recorder.rs`, and this bond store) onto the
+// VFS verbs was explicitly NOT part of that change.
+//
+// What the direct path is and is not. It is not a substitute MECHANISM — it is the exact set of
+// primitives the `FatBackend` adapter wraps, reached the way the arch-neutral `shell.rs` file verbs
+// and `flight_recorder.rs` already reach them, and it lands on the same `block::write_block_usb`
+// BOT WRITE(10) path the design names. What it does skip is the adapter's `authorize_write`: the
+// read-only-volume veto AND the volume-principal ACL. Per the note on `impl VfsBackend for
+// FatBackend`, the direct callers reproduce the first check and not the second.
+//
+// A migration is therefore a roster question now, not a one-line swap: this store is row 9 of the
+// "X86 FAT-MUTATOR ROSTER" documented on `fat::with_fat_lock`, and that row's serialization argument
+// is written against THESE call sites and their three storage-ready passes. Routing them through the
+// VFS seam re-opens that argument, and the seam's own note requires any x86 consumer of those verbs
+// to enroll in the roster.
 
 /// Read `/HCRON/<leaf>` off the writable FAT volume into `out`.
 fn read_store_file(leaf: &str, out: &mut alloc::vec::Vec<u8>) -> Result<(), HcronError> {

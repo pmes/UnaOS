@@ -43,12 +43,12 @@ pub mod sched;
 // except for the `uslots` facade (below) it now names instead of `super::boot` — the Pi keeps the
 // BCM2711 slot system in `boot.rs`, the Orin gets the tegra port in `mmu_tegra_el0.rs`, and syscall.rs
 // compiles against whichever one the active feature selects.
-#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+#[cfg(feature = "aarch64_el0")]
 pub mod syscall;
 // BANDY-1 (ROADMAP §3b arc 1): the on-UnaOS SMessage bus — v1 subset codec (wire layer of the
 // SYS_MSEND/SYS_MRECV transport in syscall.rs). Gated like syscall.rs — JETSON-EL0 (M1b) widened both
 // from `baremetal` to `any(baremetal, tegra_el0)` together, since the bus IS syscall.rs's wire layer.
-#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+#[cfg(feature = "aarch64_el0")]
 pub mod bus;
 // JM3: Jetson Orin Nano (Tegra234) kernel-owned MMU. The tegra/UEFI build maps RAM Normal-WB + the
 // Tegra device windows Device-nGnRE before touching any peripheral MMIO (the R4 UARTC-fault fix).
@@ -72,7 +72,7 @@ pub mod mmu_tegra_el0;
 // `tegra_el0` implies `tegra`, and `pi`/`tegra` are mutually exclusive), but `baremetal` is written to
 // win the arm explicitly so a nonsensical both-on build picks one deterministically instead of
 // colliding on a duplicate glob import.
-#[cfg(any(feature = "baremetal", feature = "tegra_el0"))]
+#[cfg(feature = "aarch64_el0")]
 pub mod uslots {
     #[cfg(feature = "baremetal")]
     pub use super::boot::*;
@@ -484,4 +484,22 @@ fn hw_wait_budget_derived() -> u64 {
 #[inline]
 fn hw_wait_budget_derived() -> u64 {
     HW_WAIT_BUDGET
+}
+
+/// [`flush_framebuffer_range`]'s STRIDED twin: clean `rows` runs of `row_len` bytes, each `stride`
+/// apart, for the same reason and to the same Point of Coherency — the RECT form a damage-tracked
+/// present wants, where cleaning the full-width scanlines the rect sits in would touch several times
+/// the bytes the caller actually wrote. aarch64 answers with `cache::clean_rows`: a per-row
+/// `DC CVAC` sweep with ONE trailing `DSB` for the whole rect rather than one per row.
+///
+/// This is the facade `video::framebuffer::flush_rect`'s doc comment has named since it was written;
+/// until now it did not exist and that call site open-coded a `#[cfg(target_arch)]` pair instead.
+///
+/// APPENDED AT THE FILE TAIL, deliberately: this module is compiled into the knob-off `kernel8.img`
+/// whose byte-identity is a standing proof, and panic `Location` records embed line numbers, so a
+/// function inserted mid-file would move every record below it (PARITY.md 5.3). Nothing is below
+/// this, so nothing moves — the same reasoning `video/mod.rs` gives for its own tail block.
+#[inline]
+pub fn flush_framebuffer_rows(addr: usize, row_len: usize, rows: usize, stride: usize) {
+    cache::clean_rows(addr, row_len, rows, stride);
 }

@@ -153,6 +153,14 @@ pub mod knurl;
 #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "instgui"))]
 pub mod instgui;
 
+// PRTSCR — the screen capture. `png` is the pure, kernel-dependency-free stored-deflate encoder (so
+// it is testable as a function on the host); `prtscr` is the panel read, the free-name search, the
+// FAT write, and the Print Screen key's deferred-work flag. Both are arch-neutral and ungated: the
+// capture and the `screenshot` verb work wherever there is a panel and a writable FAT volume, with
+// or without the compositor. Only the KEY hook is x86 today — see `prtscr`'s module note.
+pub mod png;
+pub mod prtscr;
+
 pub use framebuffer::FrameBuffer;
 pub use screen::Screen;
 

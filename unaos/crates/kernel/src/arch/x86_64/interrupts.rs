@@ -41,6 +41,11 @@ pub const NIC_MSI_VECTOR: u8 = 0x41;
 /// Inter-processor interrupt vector (reschedule/wake; scheduler foundation). 0x41 is reserved
 /// for the NIC, so IPIs use 0x42.
 pub const IPI_VECTOR: u8 = 0x42;
+/// EHCI HID completion interrupt (ISRARM). 0x40-0x42 are taken by the xHCI, the NIC and IPIs, so
+/// the EHCI functions share 0x43 — both of them, deliberately: MSI carries no cause, the handler
+/// acknowledges every armed controller's USBSTS anyway, and a second vector would buy nothing but
+/// another IDT entry. See `drivers::ehci`'s ISRARM block.
+pub const EHCI_MSI_VECTOR: u8 = 0x43;
 pub const SPURIOUS_VECTOR: u8 = 0xFF;
 
 lazy_static! {
@@ -97,6 +102,11 @@ lazy_static! {
         idt[TIMER_VECTOR].set_handler_fn(timer_interrupt_handler);
         idt[XHCI_MSI_VECTOR].set_handler_fn(xhci_msi_handler);
         idt[NIC_MSI_VECTOR].set_handler_fn(nic_msi_handler);
+        // ISRARM: the EHCI HID completion vector. Gated on the same feature as the driver that
+        // arms it, so a build without `ehcihid` carries neither the entry nor the handler — and
+        // therefore cannot be handed an interrupt it has no driver to service.
+        #[cfg(feature = "ehcihid")]
+        idt[EHCI_MSI_VECTOR].set_handler_fn(ehci_msi_handler);
         idt[IPI_VECTOR].set_handler_fn(ipi_handler);
         idt[SPURIOUS_VECTOR].set_handler_fn(spurious_handler);
         idt
@@ -538,6 +548,28 @@ extern "x86-interrupt" fn xhci_msi_handler(_stack_frame: InterruptStackFrame) {
 /// deadlock. The interrupt's purpose is to wake the CPU from `hlt` so RX is serviced promptly.
 extern "x86-interrupt" fn nic_msi_handler(_stack_frame: InterruptStackFrame) {
     crate::drivers::e1000::interrupt_ack();
+    crate::arch::apic::eoi();
+}
+
+/// EHCI HID completion handler (ISRARM, IDT vector 0x43). **This one does real work, and that is
+/// the difference between it and the two handlers above** — the xHCI and NIC handlers exist only to
+/// wake the CPU from `hlt` and leave the ring to the polled context. Here the polled context IS the
+/// defect: an armed HID interrupt-IN endpoint holds exactly one report, so between the completion
+/// and the next service pass the endpoint is dark and the trackpad's reports are lost on the wire —
+/// up to 2390 of them in one metal boot, measured by EHCIDARK. Re-arming from the completion itself
+/// is the only place that window can be closed, so `interrupt_ack` lifts the report out and re-arms.
+///
+/// It is still bounded and still lock-free: no allocation, no printing, no `EHCI_HID` (the pass
+/// holds that `Mutex` across a `hw_wait_budget()` control transfer, so taking it here would
+/// self-deadlock exactly as the xHCI handler's comment warns), at most `ISR_MAX_EPS` endpoints, and
+/// a per-endpoint claim that is TRY-only in both directions and spins in neither. The full safety
+/// argument, field by field, is the ISRARM block in `drivers/ehci/mod.rs`.
+///
+/// EOI last, mirroring the other MSI handlers: the driver half must complete before the in-service
+/// bit is cleared, or a second completion could re-enter it on the same core mid-walk.
+#[cfg(feature = "ehcihid")]
+extern "x86-interrupt" fn ehci_msi_handler(_stack_frame: InterruptStackFrame) {
+    crate::drivers::ehci::interrupt_ack();
     crate::arch::apic::eoi();
 }
 

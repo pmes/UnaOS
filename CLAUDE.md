@@ -84,6 +84,20 @@ several sessions can work in parallel without stepping on each other.
   `git log --oneline -1 <sha>` — a sha the peer cannot fetch is not a
   deliverable. And re-run `git fetch` before ever reporting a push as still
   outstanding.
+- **THE FOCUS ROTATES WITH WHERE PETER IS, AND THE rMBP TRAVELS (Peter, 2026-08-26).** ONE track
+  holds the FOCUS; the focus track is the only track running, and **the focus seat runs NINE
+  executors**. The other seats are online only to answer its questions — no arc, therefore no
+  fleet. **One platform holds the focus EACH WEEK — orin has it the week of 2026-08-26, and that is a
+  weekly assignment, not a permanent home.** Within a week the focus pivots to `hw-rmbp` whenever
+  Peter leaves the bench (cafe trip or anything else) and back to THAT WEEK'S focus track when he
+  returns. Nine belongs to whoever holds the focus; it is not any track's number. **Only Peter says
+  whose week it is.**
+  **THE REASON, which decides what a round may contain: the 2012 rMBP is a LAPTOP and goes with
+  him, so x86 metal — boots, serial capture, card writes, staged media — is LIVE wherever he is.
+  The Orin and the Pi are bench boxes and stay home, so aarch64 metal waits for his return.**
+  A trip round is therefore NOT a code-only round: it is the full x86 track, metal included, plus
+  the platform-agnostic backlog. On his return all three platforms resync — land merge-ready,
+  never boot-pending.
 - **Tracks run independently, at their own pace.** No track waits for another.
   Standing cap unchanged: **one unmerged arc per track** — a fresh session per
   arc; don't stack a second arc on an unreviewed one within the same track.

@@ -164,7 +164,12 @@ const MAX_CACHE: usize = 16;
 /// shell's `jobs` verb cannot be: `BG_JOBS` is `shell.rs`-private and that file is compiled into the
 /// knob-off image, where an added line is a byte-identity break). This is the ceiling on rows this
 /// window can have outstanding; the 9th launch reaps first and then declines out loud.
-#[cfg(target_arch = "aarch64")]
+///
+/// ARCH-NEUTRAL (rmbp-7 QUARRY): this is a ceiling on QUARRY'S OWN table, not a property of a chip,
+/// and the seam it protects (`arch::syscall::spawn_user_image_bg` / `bg_poll`) exists on both
+/// arches. It was gated to aarch64 only because its one reader sat inside the aarch64 half of
+/// [`launch`]; the check now lives in the arch-neutral [`run_act`], so the ceiling means the same
+/// thing on both arches and the x86 VFS adoption inherits it for free.
 const MAX_JOBS: usize = 8;
 /// Entries the open-time census prints by name.
 const CENSUS_MAX: usize = 12;
@@ -1014,10 +1019,15 @@ impl Model {
 // the VFS mount table (never `fat::mount()` — this arc's standing law), the loader does every real
 // check, and its refusal is what the operator is shown.
 
-/// One program this window started. Gated with [`launch`] and for its reason, not for a second one:
-/// the arch that cannot spawn cannot have a job to track, and a table that could only ever be empty
-/// is not honest scaffolding — it is dead weight the compiler is right to name.
-#[cfg(target_arch = "aarch64")]
+/// One program this window started.
+///
+/// ARCH-NEUTRAL (rmbp-7 QUARRY). This row was gated to aarch64 on the premise that "the arch that
+/// cannot spawn cannot have a job to track" — but that premise was wrong about the seam: x86 has
+/// `arch::syscall::spawn_user_image_bg` and `bg_poll` with the same signatures (see
+/// `arch/x86_64/syscall.rs`), so the SPAWN half is not what is missing. What is missing on x86 is
+/// the VFS mount table that resolves a path to bytes, which is one cross-file gate in `fs/vfs.rs`
+/// / `shell.rs` (vfs.md §12.4) and is not this file's to close. Keeping the table, the ceiling and
+/// the reaper arch-neutral means the day that gate lifts, only [`launch`]'s body changes.
 struct Job {
     pid: u64,
     asid: u64,
@@ -1025,8 +1035,7 @@ struct Job {
 }
 
 /// The jobs Quarry has outstanding. Small, bounded, and Quarry's OWN — see [`MAX_JOBS`] for why it
-/// cannot be the shell's table.
-#[cfg(target_arch = "aarch64")]
+/// cannot be the shell's table. Arch-neutral for the reason stated on [`Job`].
 static JOBS: spin::Mutex<Vec<Job>> = spin::Mutex::new(Vec::new());
 
 /// Poll every outstanding job and free the kernel rows of the ones that have finished.
@@ -1035,7 +1044,34 @@ static JOBS: spin::Mutex<Vec<Job>> = spin::Mutex::new(Vec::new());
 /// program's row is released by exactly the mechanism a `bg`-launched one's is. Called on every
 /// input gesture and every [`service`] pass, which is often enough that the [`MAX_JOBS`] ceiling is
 /// a bound on CONCURRENT programs rather than on launches per boot.
-#[cfg(target_arch = "aarch64")]
+///
+/// ARCH-NEUTRAL (rmbp-7 QUARRY): this was an aarch64 body plus an x86 no-op stub. `bg_poll` is
+/// `pub` on both arches with the same signature, so the reaper is the SAME code on both — an x86
+/// table that is empty today simply reaps nothing, and no stub has to be kept in step with the
+/// real one.
+///
+/// ⚠ **"ARCH-NEUTRAL" WAS THE WRONG AXIS — THERE ARE THREE STATES, NOT TWO (rmbp-7 QUARRY2).**
+/// `arch::syscall` is not a property of the *arch*; it is a property of the **EL0 layer**. On x86 the
+/// module is unconditional (`arch/x86_64/mod.rs:11`), but `arch/aarch64/mod.rs:47` gates
+/// `pub mod syscall;` behind `any(feature = "baremetal", feature = "tegra_el0")` — the rings, the
+/// process table and `bg_poll` all belong to that layer. So an aarch64 build carrying
+/// `desktop_firmware` (this window's own gate) with NEITHER of those two features named a module that
+/// does not exist, and this function failed E0432/E0433 at the `use` and at the `bg_poll` call. No
+/// coverage leg reached the combination: `arm-pi` always carries `baremetal`, `arm-tegra-desk` always
+/// carries `tegra_el0`, and the third polarity was named nowhere — which is how it shipped. The same
+/// defect, from the same premise, was fixed one file over in [`super::super::dock`]'s focus seam
+/// (`ba3e9b62`); this is that fix's shape applied to Quarry's spawn seam.
+///
+/// The ringless arm below is a genuine no-op rather than a placeholder, and the reason is a
+/// *measurable* property of this file rather than an assumption: [`JOBS`] has exactly ONE push site
+/// — the one inside the EL0 [`launch`] — and that body is not compiled in a ringless build. The table
+/// is therefore provably empty, and "poll every outstanding job" over an empty table is precisely
+/// nothing. Nothing is silently swallowed: the launch that would have filled it refuses out loud,
+/// with a reason, in the arm below.
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra_el0"))
+))]
 fn reap_jobs() {
     use crate::arch::syscall::BgPoll;
     let mut jobs = JOBS.lock();
@@ -1048,6 +1084,14 @@ fn reap_jobs() {
             }
             BgPoll::Exited(st) => alloc::format!("exited status={}", st),
             BgPoll::Faulted => String::from("faulted (contained)"),
+            // The ONE genuinely per-arch line in this function, and it is not a hardware fact: the
+            // `BgPoll` enum itself differs. `arch/aarch64/syscall.rs` has a `Closed` variant
+            // (CLOSE-CLEAN — closed by the operator via a window's close box); `arch/x86_64/
+            // syscall.rs`'s `BgPoll` (declared near its `bg_poll`) has only Running/Exited/Faulted/
+            // Gone, so naming `Closed` unconditionally would not COMPILE on x86. Closing this
+            // properly means adding the variant to the x86 enum, which is outside this file's lane;
+            // until then the arm is gated so the aarch64 verdict text is not lost.
+            #[cfg(target_arch = "aarch64")]
             BgPoll::Closed => String::from("closed by its window"),
             BgPoll::Gone => String::from("gone (already reaped)"),
         };
@@ -1056,7 +1100,18 @@ fn reap_jobs() {
     }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+/// The ringless counterpart of [`reap_jobs`] — an aarch64 desktop build with no EL0 layer, hence no
+/// `arch::syscall` and no `bg_poll` to poll with.
+///
+/// Empty by proof, not by convenience: see the gated twin's doc comment. [`JOBS`]'s sole `push` lives
+/// in the EL0 [`launch`], which this configuration does not compile, so the table this would iterate
+/// cannot be non-empty. Kept as a real function rather than folded into its callers' `cfg`s because
+/// it has FIVE call sites (the ceiling pre-check, the post-launch pass, and three service/gesture
+/// passes) and gating each of them would put the same conjunct in five places to drift out of step.
+#[cfg(not(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra_el0"))
+)))]
 fn reap_jobs() {}
 
 /// Read `path` through the VFS seam and spawn it detached. Returns the one line the path bar shows.
@@ -1072,7 +1127,30 @@ fn reap_jobs() {}
 /// — a file compiled into the knob-off `kernel8.img`, where splitting out a console-free core would
 /// ADD lines and break the byte-identity proof (PARITY.md §5.3). The shared thing is the seam that
 /// matters — the mount table for the read, `spawn_user_image_bg` for the spawn — not the printing.
-#[cfg(target_arch = "aarch64")]
+///
+/// This is ONE OF THREE arms (it was written as one of two — see the warning below): the x86_64 arm
+/// is the `cfg(not(target_arch = "aarch64"))`
+/// `launch` at the end of this section, and it declines because there is no mount table to resolve
+/// against — NOT because the spawn seam is missing (x86 has `spawn_user_image_bg` and `bg_poll`
+/// too). The counterpart is named here because this body is longer than a reader — or the parity
+/// detector's window — will scan before concluding the other arch has nothing.
+///
+/// ⚠ **THE DISPATCH IS THREE-WAY, NOT TWO-WAY (rmbp-7 QUARRY2).** This body needs BOTH halves of the
+/// seam — `uslots::USER_REGION_SIZE` for the ceiling and `arch::syscall::spawn_user_image_bg` for the
+/// spawn — and `arch/aarch64/mod.rs` gates both modules behind
+/// `any(feature = "baremetal", feature = "tegra_el0")`, because the user address space and the
+/// process table belong to the EL0 layer rather than to the chip. `target_arch = "aarch64"` alone
+/// therefore over-claimed: it named this body for a ringless `desktop_firmware` build that has
+/// neither module, and it failed E0433 at the `CAP` const and again at the spawn call. The conjunct
+/// added here is those modules' own gate, VERBATIM, so `arm-pi` and every tegra-EL0 leg emit exactly
+/// the code they emitted before; the third arm below is the configuration that used to land here and
+/// could not compile. Keep this predicate identical to `arch/aarch64/mod.rs`'s gate on
+/// `pub mod syscall;` / `pub mod uslots` — a narrower copy silently stops Quarry launching on a board
+/// that HAS an EL0 layer, and a wider one is the E0433 back again.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "baremetal", feature = "tegra_el0")
+))]
 fn launch(path: &str) -> String {
     use crate::fs::vfs::{NodeKind as NK, VfsError};
     fn why(e: VfsError) -> String {
@@ -1087,12 +1165,9 @@ fn launch(path: &str) -> String {
         }
     }
     const CAP: u64 = crate::arch::aarch64::uslots::USER_REGION_SIZE as u64; // JETSON-EL0: uslots facade (boot.rs on pi / mmu_tegra_el0.rs on tegra)
-    reap_jobs();
-    if JOBS.lock().len() >= MAX_JOBS {
-        let s = alloc::format!("{} live jobs — kill one first", MAX_JOBS);
-        serial_println!("[quarry] launch REFUSED path={} reason=job-table-full ({})", path, s);
-        return s;
-    }
+    // The reap-then-ceiling pre-check moved to [`run_act`] (rmbp-7 QUARRY) — same two steps, same
+    // order, same refusal line, but arch-neutral, because the ceiling is Quarry's table's and not
+    // this arch's. By the time this body runs the table is reaped and has a free slot.
     let mt = crate::shell::vfs_mount_table();
     let st = match mt.stat(path) {
         Ok(s) => s,
@@ -1155,10 +1230,47 @@ fn launch(path: &str) -> String {
 /// `fat::mount()` — the raw-backend path this arc is forbidden to take. The layout, the gesture, the
 /// double-click predicate and the launchability test all compile and are witnessed on this arch; the
 /// day the x86 VFS adoption lands, this shim collapses into the one above.
+///
+/// This arm's `cfg` is left EXACTLY as written (`not(target_arch = "aarch64")`) by the QUARRY2 fix,
+/// rather than narrowed to `target_arch = "x86_64"`: the third arm below carves its configuration out
+/// of the aarch64 side only, so these three predicates stay disjoint and exhaustive while this one's
+/// emitted code is untouched in every configuration that already compiled.
 #[cfg(not(target_arch = "aarch64"))]
 fn launch(path: &str) -> String {
     serial_println!("[quarry] launch DECLINE path={} reason=no-vfs-on-this-arch (vfs.md 12.4)", path);
     String::from("no VFS mount table on this arch yet (vfs.md 12.4)")
+}
+
+/// The THIRD arm (rmbp-7 QUARRY2): aarch64 with `desktop_firmware` but **no EL0 layer** — neither
+/// `baremetal` nor `tegra_el0`. Quarry's window, tree, list, scrolling and gestures all compile and
+/// work here; what is absent is the ring-3 machinery underneath the launch seam, so there is no
+/// `arch::syscall::spawn_user_image_bg` to spawn with and no `uslots::USER_REGION_SIZE` to size the
+/// refusal against.
+///
+/// It REFUSES, out loud, naming the missing layer — it does not silently no-op, and it does not fake
+/// a pid. That is Quarry's own idiom rather than a new one: every other impossible launch in this file
+/// prints `[quarry] launch REFUSED path=… reason=…` and hands the same sentence back to the path bar
+/// (`reason=stat`, `reason=empty`, `reason=oversize`, `reason=job-table-full`, `reason=spawn`), so an
+/// operator who double-clicks a program on a ringless board reads *why* in the window and the serial
+/// log carries the matching line. `REFUSED` rather than the x86 arm's `DECLINE` because the two are
+/// genuinely different findings: x86 has the spawn seam and lacks the *mount table* (a cross-file gate
+/// in `fs/vfs.rs`, vfs.md §12.4), whereas this build has the mount table and lacks the *rings*. Both
+/// are stated in the terms the reader can act on — the feature to turn on is named.
+///
+/// No facade is invented. `arch/aarch64/mod.rs` declines to publish `syscall`/`uslots` outside the EL0
+/// features deliberately, and a `crate::arch::spawn_user_image_bg` shim that answered `Err` here would
+/// be exactly the fiction that preamble refuses; the dispatch is kept at the call site instead, which
+/// is also what [`super::super::dock`]'s focus seam does one file over (`ba3e9b62`).
+#[cfg(all(
+    target_arch = "aarch64",
+    not(any(feature = "baremetal", feature = "tegra_el0"))
+))]
+fn launch(path: &str) -> String {
+    serial_println!(
+        "[quarry] launch REFUSED path={} reason=no-el0-layer (this aarch64 build has neither `baremetal` nor `tegra_el0`, so `arch::syscall`/`uslots` are not compiled)",
+        path
+    );
+    String::from("no EL0 layer in this build (needs `baremetal` or `tegra_el0`)")
 }
 
 /// Perform an [`Act`] decided inside the model lock, with that lock RELEASED, then record its
@@ -1167,9 +1279,20 @@ fn run_act(act: Act) {
     let line = match act {
         Act::None => return,
         Act::Launch(p) => {
-            let r = launch(&p);
+            // Reap first, then test the ceiling — the two steps that used to open the aarch64
+            // [`launch`] body, hoisted here (rmbp-7 QUARRY) so [`MAX_JOBS`] and [`JOBS`] have an
+            // arch-neutral reader and mean the same thing on both chips. Order and wording are
+            // unchanged, so the aarch64 serial line is byte-for-byte what it was.
             reap_jobs();
-            r
+            if JOBS.lock().len() >= MAX_JOBS {
+                let s = alloc::format!("{} live jobs — kill one first", MAX_JOBS);
+                serial_println!("[quarry] launch REFUSED path={} reason=job-table-full ({})", p, s);
+                s
+            } else {
+                let r = launch(&p);
+                reap_jobs();
+                r
+            }
         }
         Act::NoOpener(p) => {
             // The honest census the brief asks for. Nothing in this tree opens a document: there is
