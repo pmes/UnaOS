@@ -4927,7 +4927,17 @@ fn composite_inner() -> CursorTail {
                     disturbed = true;
                 }
             }
-            None => super::cursor::owe_repaint(),
+            None => {
+                super::cursor::owe_repaint();
+                // LOCKFIX/CENSUS — and counted HERE as well, per site. `owe_repaint` is a
+                // behavioural call first and a counter second: it also tells the tail to
+                // re-establish the sprite, and `[wedge9]` mixes every paint-path refusal in the
+                // module into one number. That number cannot answer "which of `composite_inner`'s
+                // four doors refused", which is the question a bench capture asks. See
+                // [`LOCKFIX_DRAIN_SKIP`].
+                #[cfg(feature = "witness")]
+                LOCKFIX_DRAIN_SKIP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 
@@ -5009,7 +5019,13 @@ fn composite_inner() -> CursorTail {
                         }
                     }
                 }
-                None => reserved_hit = true,
+                None => {
+                    reserved_hit = true;
+                    // LOCKFIX/CENSUS — the conservative assumption, counted. Uncounted it is
+                    // invisible: the pass looks like any other CURSOR-3 bracket, and
+                    // `[cursor12] reserved=` cannot tell a real overlap from an assumed one.
+                    LOCKFIX_RESERVED_ASSUMED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
             }
             hit |= reserved_hit;
         }
@@ -5090,7 +5106,15 @@ fn composite_inner() -> CursorTail {
                         }
                     }
                 }
-                None => reserved_hit = true,
+                None => {
+                    reserved_hit = true;
+                    // LOCKFIX/CENSUS — the MENU-UNDER assumption, counted. Same field as the WC-F
+                    // arm above: both answer "how often did a pass decline the overlay because it
+                    // could not READ the furniture", which is the number that says whether the
+                    // conservative degrade is costing bracket duty cycle on this machine.
+                    #[cfg(feature = "witness")]
+                    LOCKFIX_RESERVED_ASSUMED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
         // CURSOR-12 — the sprite was up but nothing was under it. Counted before the `hit` branch so
@@ -5270,10 +5294,20 @@ fn composite_inner() -> CursorTail {
     // draw through", both witness the skip, both take the same tail. Semantics are unchanged.
     let fb = match super::panel_snapshot() {
         Some(fb) if fb.is_ready() => fb,
-        _ => {
+        _other => {
             // WC-N — a pass that produced no pixels for any window. See `WCN_ABORTED`.
             #[cfg(feature = "witness")]
-            wcn_note_pass(false);
+            {
+                // LOCKFIX/CENSUS — this arm folds TWO causes into one abort: no panel at all
+                // (`Some(fb)` not ready, the boot-time and headless case) and a panel that was
+                // busy while we were masked. `aborted=` cannot separate them, and they call for
+                // opposite responses — the first is scene, the second is contention. See
+                // [`LOCKFIX_PASS_SKIP`].
+                if _other.is_none() {
+                    LOCKFIX_PASS_SKIP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+                wcn_note_pass(false);
+            }
             return tail_of(disturbed, session, deferred);
         }
     };
@@ -10966,6 +11000,82 @@ pub fn wci_rollup() {
     wci_rollup_scoped("fixture");
 }
 
+// ---- LOCKFIX witnesses -------------------------------------------------------------------------
+//
+// LOCKFIX routed `composite_inner`'s four panel acquisitions through `super::panel_snapshot`, which
+// refuses rather than blocks when the caller is IRQ-MASKED and the lock is held elsewhere. The
+// MECHANISM is complete without these counters; what it lacks is a way to READ the refusals, and
+// the two sinks it inherited cannot supply one:
+//
+//  * `cursor::owe_repaint` (the drain site's degrade) is the paint path's shared refusal sink. It
+//    is a behavioural call first — it also tells the tail to re-establish the sprite — and
+//    `[wedge9]` mixes every paint-path refusal in the module into one figure. It cannot say WHICH
+//    door refused.
+//  * `wcn_note_pass(false)` (the pass-level degrade) counts the abort, but that arm folds "no panel
+//    at all" together with "panel busy while masked" — scene and contention, which want opposite
+//    responses.
+//  * the two furniture arms had NO sink at all: a pass that assumed an overlap it could not read
+//    was indistinguishable from a pass that measured one.
+//
+// Three counters, split by what each site DOES with a refusal, close that. Deliberately NOT folded
+// into `super::panel_census`: that census is the INPUT path's and `[inwedge]` reads it as a rate
+// against its own denominator — the argument `panel_snapshot`'s own doc makes.
+
+/// LOCKFIX — deferred-erase drains skipped because the panel was masked-and-contended.
+///
+/// A LATENESS count, not a loss count: the queue survives a skipped drain (`DEFER`/`DEFER_N` are
+/// static and only `drain_deferred` consumes them, behind four early returns that each leave the
+/// queue untouched; `deferred_owed` is a term in both gate-holder tests; and `service_damage`
+/// re-drives a composite from UNMASKED context, where `panel_snapshot` cannot refuse). Nonzero
+/// means the boot-8 window was entered and survived.
+#[cfg(feature = "witness")]
+static LOCKFIX_DRAIN_SKIP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// LOCKFIX — passes that ASSUMED a reserved-box overlap because the panel refused, rather than
+/// measuring one. Both furniture arms feed it (WC-F's probe on aarch64 witness+baremetal,
+/// MENU-UNDER's dropdown and dock on `wc`/`pidesk`).
+///
+/// The assumption is the conservative one and is never wrong in the unsafe direction — it declines
+/// the overlay and takes CURSOR-3's whole-sprite bracket, which is correct and merely more
+/// expensive. This field is what prices that expense. Read it against `[cursor12] reserved=`, the
+/// declines it contributes to: `reserved_assumed` approaching `reserved` says the bracket is being
+/// paid for contention rather than for furniture.
+#[cfg(feature = "witness")]
+static LOCKFIX_RESERVED_ASSUMED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// LOCKFIX — composite passes abandoned at the pass-level panel read because the lock was held,
+/// as opposed to because the framebuffer was not ready. Both are counted by WC-N's `aborted=`;
+/// this field is the half of that number contention is responsible for.
+#[cfg(feature = "witness")]
+static LOCKFIX_PASS_SKIP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// LOCKFIX — the refusal census, printed behind `[wc-i]` on the same scopes.
+///
+/// A line of its own rather than three more fields on `[wc-i] rollup`: these count a LOCK policy,
+/// not the cursor mechanism that line reports on, and no existing spec parser is disturbed by a new
+/// line where one might be by new fields on an old one.
+///
+/// No verdict token here is a defect — every one of these is the wedge being AVOIDED. `QUIET` says
+/// the masked-and-contended window was never entered on this boot; `DEGRADED` says it was, and the
+/// machine took its documented degradation instead of spinning.
+#[cfg(feature = "witness")]
+fn lockfix_rollup(scope: &str) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let drain = LOCKFIX_DRAIN_SKIP.load(Relaxed);
+    let reserved = LOCKFIX_RESERVED_ASSUMED.load(Relaxed);
+    let pass = LOCKFIX_PASS_SKIP.load(Relaxed);
+    let verdict = if drain + reserved + pass == 0 {
+        "QUIET"
+    } else {
+        "DEGRADED"
+    };
+    serial_println!(
+        "[lockfix] composite scope={} drain_skip={} reserved_assumed={} pass_skip={} -> {}",
+        scope, drain, reserved, pass, verdict
+    );
+}
+
 /// CURSOR-12 — the same block, on the LIVE scope, for a bench sitting rather than a boot fixture.
 ///
 /// ### Why this entry point had to exist before any of it could be read
@@ -11013,6 +11123,8 @@ fn wci_rollup_scoped(scope: &str) {
         "[wc-i] rollup scope={} windowed_flushes={} stale={} intrusions={} cursor_passes={} cursor_brackets={} -> {}",
         scope, windowed, stale, intrusions, passes, brackets, verdict
     );
+    // LOCKFIX — the panel-refusal census rides the same scopes: it measures the same passes.
+    lockfix_rollup(scope);
     cursor3_rollup(scope);
 }
 
