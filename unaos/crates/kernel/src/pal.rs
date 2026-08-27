@@ -29,8 +29,19 @@ pub enum Event {
     KeyUp(u8),
     Mouse { x: i32, y: i32 },
     MouseAbsolute { x: i32, y: i32 },
-    /// CLICK-1: a pointer button-DOWN edge (payload = the report's button bitmask, bit 0 = primary).
-    /// Emitted by the HID decoders on ANY button-mask CHANGE — press edge AND release edge (GUI-CLICK-2).
+    /// CLICK-1 / GUI-CLICK-2 / HID-KEYS: a pointer button EDGE — BOTH directions. Payload is the report's CURRENT
+    /// button bitmask (bit 0 = primary), so a press carries the newly-set bit and the matching
+    /// release carries the mask with that bit cleared, usually 0.
+    ///
+    /// The HID decoders (xhci, ehci) edge-detect against the previous report's mask and emit on any
+    /// CHANGE; an unchanged mask — a held button — does not re-fire. HID-KEYS added the release edge
+    /// the press-only decode used to swallow, so the doc that said "release emits nothing" no longer
+    /// describes any path.
+    ///
+    /// Press-only consumers stay correct without a change: they test the mask (`m & 0x01 != 0`) and
+    /// fall through on the release. Held-state and drag consumers pair the two edges — see
+    /// `pal::cursor`'s drag seam and `CLICK1_PREV_MASK`, which does its OWN press-edge filtering on
+    /// the consumer side precisely because this event is now both edges.
     Button(u8),
     /// WHEEL: one scroll-wheel report, carrying the HID boot-mouse wheel byte as a SIGNED delta —
     /// POSITIVE is scroll-up / away from the user, negative is scroll-down. This is a DELTA, not an

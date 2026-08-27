@@ -2716,12 +2716,18 @@ pub struct DeviceSlot {
     /// mouse-witness (first report + every Nth), never one-line-per-report.
     pub mouse_report_count: u32,
     /// GUI-CLICK-2 (== hw-jetson's CLICK-1, unified at the 2026-08-18 sync): previous
-    /// pointer-button bitmask for this slot, so the decode emits a `pal::Event::Button` on the
-    /// ANY button-mask change — press edge (0→1) AND release edge (1→0), per GUI-CLICK-2. Byte 0 of every
-    /// HID pointer report (boot mouse AND usb-tablet) carries the same button bits, so this is
-    /// shared by both decode paths. Mirrors the EHCI press-edge idiom (ehci/mod.rs) and
-    /// `CLICK1_PREV_MASK`. 0 = no button held. Shared xHCI code: x86 xHCI mice track this
-    /// identically.
+    /// pointer-button bitmask for this slot, so the decode can edge-detect against the last report.
+    ///
+    /// HID-KEYS widened that edge: the decode emits a `pal::Event::Button` on ANY mask CHANGE — the
+    /// press (a bit going 0→1) AND the matching release (1→0) — carrying the CURRENT mask as the
+    /// payload. A held button (unchanged mask) still does not re-fire. This field is what tells the
+    /// two apart; see the emit site in `poll_events`, which documents the polarity in full.
+    ///
+    /// Byte 0 of every HID pointer report (boot mouse AND usb-tablet) carries the same button bits,
+    /// so this is shared by both decode paths. EHCI reaches the same both-edges behaviour through
+    /// its own `note_buttons` press/release pair (ehci/mod.rs); `CLICK1_PREV_MASK` is a CONSUMER-side
+    /// press-only filter and is deliberately not the same thing. 0 = no button held. Shared xHCI
+    /// code: x86 xHCI mice track this identically.
     pub mouse_prev_buttons: u8,
 
     pub is_keyboard: bool,
