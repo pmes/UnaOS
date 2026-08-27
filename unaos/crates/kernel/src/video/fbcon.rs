@@ -1457,7 +1457,7 @@ impl PanelSink {
             // deferring it: the glyphs are in cached RAM that only the compositor reads, `finish` runs
             // before `_print` returns, and the band accumulated here is exactly what the compositor
             // is then told.
-            self.routed = true; #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] super::wcg::seam_glyph_note(false, CONSOLE_WIN.load(Ordering::Relaxed)); // WCGSEAM — charge the routed glyph write (unlocked split path). ⚠ ONE LINE, line-NEUTRAL, per `draw_fb`'s standing note.
+            self.routed = true; #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] super::wcg::seam_glyph_note(false, CONSOLE_WIN.load(Ordering::Relaxed)); // WCGSEAM — charge the routed glyph write (unlocked split path). PARFB: `all(witness, x86_64, wc)` was never a legitimate pair, and ORIN-DEFER turned that from cosmetic into a LIVE UNDERCOUNT. The sibling charge in `write_byte` (the LOCKED path) already carries the widened predicate, and so does the `routed` test twelve lines up — so on a `witness` + `desktop_firmware` + `orindefer` build the console reaches THIS branch, paints, and charges nothing, while the classic path it no longer takes still charges. The gate is now the same predicate as the `routed` flag it sits under. ⚠ ONE LINE, line-NEUTRAL, per `draw_fb`'s standing note.
             self.note(band);
             return;
         }
