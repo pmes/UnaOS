@@ -337,8 +337,9 @@ pub fn service_dump() {
     // event channel, and the console window sat `state=waiting` for the remaining 210 s. This is the
     // hook that reaches every x86 service lane ungated, so a matured deferral gets taken whether or
     // not anything is presenting. Self-throttled to 4 Hz; one relaxed load per pass otherwise. Folds
-    // to an empty fn without `witness` + `wcg-paygo`, and does not exist on aarch64.
-    #[cfg(target_arch = "x86_64")]
+    // to an empty fn without `witness` + `wcg-paygo` — on either arch, since WMPAYGO dropped the
+    // taker's arch term (this hook opened in the same fold; a taker that builds where the knob is
+    // must also RUN there, or its PAYGO_SVC_MAX cap fills with nothing able to re-arm it).
     crate::video::wm::paygo_service();
 
     let mut buf = [(0u64, ""); CAP];
