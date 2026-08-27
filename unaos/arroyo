@@ -255,6 +255,12 @@ _feats=""
 # Cross-arch knob now: x86/virt + aarch64/virt (QEMU ramfb witness) + aarch64/tegra (the Orin panel).
 # Knob-off is byte-identical on BOTH arches (module + `rast` dep unlinked).
 [ -n "${UNAOS_RAST:-}" ] && _feats="${_feats}rast,"
+# RASTPORT: UNAOS_RASTMC=1 adds the x86 MULTI-CORE rung — `rast_demo::run_mc`, the frame-pipelined
+# pass RAST-MC built for the Orin, now reaching x86's APs. Implies `rast` (Cargo), so setting this
+# alone is enough. Runs a 1-core baseline and then the pipelined pass in the SAME boot and reports
+# the measured ratio; the paced single-core spin still runs after it, unchanged. Default OFF =>
+# every MC site is unlinked and the x86 image is byte-identical to a plain `rast` build.
+[ -n "${UNAOS_RASTMC:-}" ] && _feats="${_feats}rastmc,"
 # PORTSW-1: DEFAULT-ON Panther Point EHCI->xHCI port switchover (route the shared USB2 ports + enable
 # SuperSpeed) so the 2012 rMBP internal keyboard/trackpad re-enumerate on the xHCI+HID stack. Applied
 # BEFORE enumeration with mask-read-before-write discipline (writes only advertised bits). Metal-gated
@@ -2566,6 +2572,11 @@ KERNEL_CFG_MATRIX=(
   # CONSOLE-WINDOW route (wc), instgui, the Kepler trio, IVB/GMUX, VPERF (videobench/videocap), the
   # EHCI family + KBDWIT, MTRAW + its inject sub-knob, STOR-1 (irqstorage), the BOT fault/ring
   # experiments, BENCH-RIDE (therm/pcilink/vrom), SMC, the rasterizer and the installer engine.
+  # RASTPORT: `rastmc` is carried HERE and only here, on the `sdw`/`pfwire_selftest` argument above —
+  # its 21 `#[cfg]` sites and the x86 `run_mc` call site are type-checked by this leg alone, since
+  # `rast` on its own leaves every one of them compiled out. The default legs cover the disarmed
+  # polarity. (This leg carries `rast` AND `wc`, so it is also a build in which the SCHED-X86
+  # render/service handoff is compiled out — see `main.rs`'s `not(feature = "rast")` gate.)
   # SDHC-4a: `sdw` is carried HERE and only here. Its gate is a real `#[cfg(feature = "sdw")]` on
   # `drivers::sdhc::write_block_512` and on the armed half of the self-test, so without a leg that
   # enables it the entire CMD24 ladder would be type-checked by nothing — the exact blind spot the
@@ -2606,7 +2617,7 @@ KERNEL_CFG_MATRIX=(
   # -Cmetadata note there) precisely because it emits not one byte of aarch64 code.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the

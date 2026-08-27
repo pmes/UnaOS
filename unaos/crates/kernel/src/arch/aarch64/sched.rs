@@ -4071,6 +4071,18 @@ pub fn online_cpu_count() -> usize {
     (0..NUM_CPUS).filter(|&c| ONLINE_MASK[c].load(Ordering::Acquire)).count()
 }
 
+/// RASTPORT — how many CPU slots the scheduler's per-CPU arrays are sized for, as a
+/// platform-neutral name. The arch-neutral answer to "what is the largest core index a pinned
+/// `spawn` may name without indexing a run queue out of range": here that bound is
+/// [`NUM_CPUS`] (`SCHED`, `ONLINE_MASK`, `CPU_BUSY` are all sized by it); the x86 twin answers
+/// `gdt::MAX_CPUS` for the same reason.
+///
+/// Exists so shared code can size a per-CPU array without either spelling. `const fn`, so it
+/// still serves as an array length. Introduces no new bound — it *is* `NUM_CPUS`, named neutrally.
+pub const fn sched_cpu_slots() -> usize {
+    NUM_CPUS
+}
+
 /// ELF-2 — pick an online scheduling core DIFFERENT from `not`, for placing a thread on a sibling core (the
 /// `SYS_THREAD_SPAWN` "spread" hint). Returns the least-loaded such core, or `not` itself if no other core is
 /// online (uniprocessor / early staging). Lets a thread demonstrate genuine cross-core parallelism without

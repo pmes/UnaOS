@@ -120,6 +120,14 @@ fn main() {
     // RAST-1: software-rasterizer spinning-cube demo through the x86/virt panel path. x86_64-only
     // knob; default OFF => byte-identical media (the `rast` dep + demo module are unlinked).
     if std::env::var("UNAOS_RAST").is_ok() { feats.push("rast"); }
+    // RASTPORT: the x86 MULTI-CORE rung (`rast_demo::run_mc`). Implies `rast` in Cargo, so this
+    // alone arms both. MUST be listed here and not only in `arroyo`: this list is the one the x86
+    // kernel that actually BOOTS is built from — `arroyo`'s `$KERNEL_FEATURES` does not reach it,
+    // and a knob added there alone shows up in the banner while being absent from the image (which
+    // is exactly how this was found: `rastmc` printed in the feature banner, `strings` on the ELF
+    // had no `RAST-MC` in it, and the boot took the SCHED-X86 handoff that `rast` is supposed to
+    // compile out). x86_64-only knob; default OFF => byte-identical media.
+    if std::env::var("UNAOS_RASTMC").is_ok() { feats.push("rastmc"); }
     // PORTSW-1: the Panther Point EHCI->xHCI port switchover runs BY DEFAULT (metal-gated policy
     // 2026-07-16: the no-routing boot dropped ALL external USB on the 2012 rMBP). UNAOS_NOPORTSW=1
     // OPTS OUT (never-run no-routing experiment) => zero config-space writes, byte-identical no-routing

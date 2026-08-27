@@ -1687,6 +1687,28 @@ rast = ["dep:rast"]
 # byte-identical to baseline. See docs/dev/OS/08_VIDEO/rasterizer.md §4.
 pirast = ["rast"]
 
+# RASTPORT: the x86 wire-in of the MULTI-CORE rung, `rast_demo::run_mc` (UNAOS_RASTMC=1). A THIN
+# feature on exactly `pirast`'s terms — it pulls in no dependency and declares no module; it only
+# IMPLIES `rast`, so the dep gate and the `rast_demo` module gate are untouched. What it gates is
+# (a) the x86 half of the 21 RAST-MC `#[cfg]` sites, which were `all(feature = "tegra",
+# target_arch = "aarch64")` and are now `any(that, all(feature = "rastmc", target_arch =
+# "x86_64"))`, and (b) the single x86 call site, which sits on the SAME SOURCE LINE as the existing
+# `rast_demo::run` call in `main.rs` (zero added lines ahead of any `panic::Location` — the
+# PI-V3D-1 byte-identity convention).
+#
+# Kept SEPARATE from `rast` on purpose rather than widening that gate: `rast` alone is a
+# metal-witnessed path (RAST-1's 90 frames in 4115 ms — 21.871 fps on the x86 panel), and folding a
+# second, longer, multi-core pass into it would move a number the ledger is measured against.
+# Default OFF => the MC statics, workers and call site are unlinked and an x86 `rast` build is
+# byte-identical to what RAST-1 shipped.
+#
+# NOTE what an x86 run can and cannot show: with `wc` armed AND a real Kepler takeover the
+# compositor's centred console window OCCLUDES the demo region, and `Screen::present_background`
+# subtracts occluders before writing the panel — so the pixels never reach glass while every serial
+# witness and every timing remains honest. QEMU has no Kepler, so QEMU shows the cube and metal does
+# not. See the RAST-MC header in `rast_demo.rs`.
+rastmc = ["rast"]
+
 # PI-DESK: the desktop FURNITURE family on the Pi 4 panel (UNAOS_PIDESK=1). Deliberately a THIN
 # feature on `pirast`'s own terms — it pulls in no dependency and declares no module of its own. What
 # it gates is the aarch64 half of four gates that were `all(target_arch = "x86_64", feature = "wc")`

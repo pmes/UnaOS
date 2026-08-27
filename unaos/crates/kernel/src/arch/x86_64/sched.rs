@@ -3106,6 +3106,40 @@ fn cpu_dispatching(cpu: usize) -> bool {
     cpu < MAX_CPUS && ONLINE_MASK[cpu].load(Ordering::Acquire)
 }
 
+/// RASTPORT — how many cores are registered online + dispatching. Signature-matched twin of
+/// `arch::aarch64::sched::online_cpu_count`, placed here beside the mask it reads rather than
+/// derived by a caller, so both arches answer the same question from the same state.
+///
+/// The bridging direction is the reverse of SCHEDPAR's (which grew aarch64 twins for x86
+/// accessors); the rule it set — match the signature exactly, do not "improve" it on the way
+/// across — is followed here.
+///
+/// **WHAT IT COUNTS, AND THE ONE ASYMMETRY A CALLER MUST KNOW.** [`ONLINE_MASK`] is set at the
+/// top of `run()`, which *every* core passes through — APs via `wait_and_run`, **and the BSP via
+/// `run_bsp`**. On aarch64 the boot core is NOT in its mask (`run_capstone_boot_core` never calls
+/// `mark_online`), so there `online_cpu_count()` reads as "secondaries". On x86 that difference is
+/// carried by the BUILD, not by the accessor: a build that reaches `run_bsp` counts core 0, and a
+/// build that does not, does not. In particular the `rast` build — the one caller today — compiles
+/// the SCHED-X86 handoff out entirely (`main.rs`'s `not(feature = "rast")` gate), leaves the BSP
+/// inline, and so never marks core 0. A caller that wants "secondaries" specifically must either
+/// know it is on such a build or subtract the boot core itself; this function reports the honest
+/// mask and does not guess which the caller meant.
+pub fn online_cpu_count() -> usize {
+    (0..MAX_CPUS).filter(|&c| ONLINE_MASK[c].load(Ordering::Acquire)).count()
+}
+
+/// RASTPORT — how many CPU slots the scheduler's per-CPU arrays are sized for, as a
+/// platform-neutral name. The arch-neutral answer to "what is the largest core index a pinned
+/// `spawn` may name without indexing a run queue out of range": here that bound is
+/// [`MAX_CPUS`] ([`RUN_QUEUES`], [`ONLINE_MASK`], `SCHED` are all sized by it); the aarch64 twin
+/// answers `percpu::NUM_CPUS` for the same reason.
+///
+/// Exists so shared code can size a per-CPU array without either spelling — the brief's "prefer a
+/// neutral accessor over renaming either". `const fn`, so it still serves as an array length.
+pub const fn sched_cpu_slots() -> usize {
+    MAX_CPUS
+}
+
 /// SMPBAL-X86: rate limit for the one-shot `SCHEDPLACE-X86` witness — the first `PLACE_LOG_MAX`
 /// auto-placements are named on the wire, then it goes quiet. Enough to cover a six-vug launch at the
 /// bench without a busy desktop flooding the log.
