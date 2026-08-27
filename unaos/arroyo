@@ -1572,6 +1572,12 @@ arm_features() {
     # ARCH-NEUTRAL call sites, so the shim half has to compile armed on aarch64 or the seam is
     # covered on neither arch.
     f="${f//,deadman,/,}"
+    # WCG-PAYGO is deliberately NOT in this strip, and must not join it by analogy with the
+    # entries above: since the 2026-08-27 parity port (WCGPAR) the feature emits REAL aarch64
+    # code — the glass-witness paygo half including the occlusion attribution — so stripping it
+    # would change behaviour, not just the fingerprint. It is also named on the `arm-pi`
+    # type-check leg above so that half compiles armed. (Whether Pi MEDIA ships it armed is the
+    # pi track's call; this function only strips what is provably codeless on aarch64.)
     # WEDGEINJ rides the same strip, and more strictly than the others: its whole implementation is
     # `all(target_arch = "x86_64", feature = "wedgeinj")`-gated (the aarch64 half is the empty
     # `#[inline(always)]` shim), so it emits not one byte of aarch64 code — and it is a DELIBERATE
@@ -2561,7 +2567,7 @@ KERNEL_CFG_MATRIX=(
   # not have caught an aarch64 regression in the very file the "do not strip" decision exists to
   # protect. It is a type-check leg, so it shifts no Pi or Jetson MEDIA: `arm_features` (which media
   # builds go through) is untouched, and `kernel8` builds from its own curated K8_FEATS.
-  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman"
+  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo"
   # aarch64 board leg 2 — Jetson Orin Nano (Tegra234), plus the board-neutral aarch64 features that
   # would otherwise ride nothing: ORIN-SMP (tegrasmp/smpprobe), the four XCARVE levers, ORIN-NET-1..4
   # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET
