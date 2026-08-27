@@ -234,10 +234,22 @@ pub(crate) fn set_headers() -> Vec<StagedHeader> {
     out
 }
 
-/// Short human reason for a [`FatError`] in the witness lines. A local twin of `fat::fat_reason`,
-/// which is `#[cfg(target_arch = "aarch64")]` — this path is x86-only, and widening that gate would
-/// be an edit to a shared file for no functional gain. Exhaustive by construction: a new `FatError`
-/// variant makes this fail to compile rather than silently printing the wrong reason.
+/// Short human reason for a [`FatError`] in the witness lines. A local twin of `fat::fat_reason`.
+///
+/// The old justification — "which is `#[cfg(target_arch = "aarch64")]`", so an x86-only path would
+/// have to widen a shared file's gate to reuse it — is FALSE and has been struck (2026-08-27):
+/// VFSX86 (`fs/vfs.rs`, 2026-08-21) un-gated `fat_reason`, which is arch-neutral today. Two real
+/// reasons keep the twin:
+/// 1. EXHAUSTIVE BY CONSTRUCTION — every `FatError` variant is named here, so a new variant makes
+///    this fail to compile rather than silently printing the wrong reason. `fat_reason` ends in a
+///    catchall (`_ => "mount failed"`) that would absorb it, and today that catchall already
+///    swallows `NoSpace`, `OutOfVolume` and `Busy` — of which `Busy` at least is a documented
+///    outcome of a mount here (see the storage-loan note at the top of this file).
+/// 2. DIVERGENT WORDING — "no block device" (not "no USB block device": `stage_volume` walks
+///    several `BlockSource`s through `fat::mount_source`, so naming USB would be wrong),
+///    "unsupported FAT variant/geometry", "entry is a directory".
+///
+/// Calling `fat_reason` here would change the witness strings AND give up the compile-time check.
 fn reason(e: FatError) -> &'static str {
     match e {
         FatError::NoDisk => "no block device",
