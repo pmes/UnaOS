@@ -148,13 +148,67 @@ produced no file and a key press that never happened are different failures.
 Two sinks, two lengths (FATVERB's rule): the console gets one sentence, serial gets the census.
 The panel clips at 128-180 columns and the census tail is the whole diagnostic.
 
-## 8. Verification status
+## 8. The boot-time witness — `UNAOS_PRTSCRST=1`
 
-- **Encoder**: proven as a pure function on the host. A harness `#[path]`-includes `video/png.rs`
-  itself, checks CRC-32 and Adler-32 against their published check values, and writes two images —
-  one single-block, one spanning eleven stored blocks. Python's real `zlib` decompresses both, every
-  chunk CRC validates, and the decoded pixels are byte-identical to the source rows. `file` reports
-  `PNG image data, ..., 8-bit/color RGB, non-interlaced`.
-- **Kernel path**: `UNAOS_WC=1 ./arroyo test` green with `wc` in the feature banner; the plain test
-  leg attaches no block device, so the honest no-volume refusal is what it prints.
-- **Print Screen on metal**: the seat's proof, at an arc boundary, on the rMBP.
+Nothing on a headless x86 boot can drive a shell verb: there is no serial RX on x86, no autoexec, and
+no `UNAOS_K8_SCRIPT` analogue (the aarch64 `kernel8-test` typist has no x86 twin). So the capture
+gets a witness in the shape this tree already uses for unattended writes.
+
+`prtscr::selftest_once()` drives the **real** `capture()` — the same function the verb and the key
+call, never a transcription — once at boot, then reads back what landed on the medium through the
+block layer and checks the directory size against what was written, the PNG signature, the IHDR
+geometry and colour type, and the trailing IEND. Head and tail rather than the whole file: at
+2880x1800 the file is 15.5 MiB and the three facts that matter are structural, and a truncated write
+cannot pass all three.
+
+**Its own knob, default OFF**, by the rule that gave `hcronst` one apart from `holocron` and `sdw`
+one apart from `sdhcblk`: *a boot that did not ask to WRITE the boot medium must be incapable of
+doing so.* Off the knob the function and its call sites vanish, so the gate run and every shipped
+image are byte-alike. The capture mechanism itself — the verb, the key — is ungated and always
+present; only this unattended write is behind the knob. It does not clean up after itself
+(`btbond::selftest_once`'s precedent): the written file **is** the deliverable.
+
+It latches only on a pass that reached a **writable** volume. Two states precede one and neither is
+a verdict: no volume at all (storage enumerates asynchronously), and a volume that vetoes writes —
+on x86 the program-source ladder falls back to the internal SD reader, which SDHC-4c mounts
+read-only, until the USB stick registers. Both are announced once and waited through. Latching on
+the veto is exactly what the first run of this witness did, and it gave up about a second before the
+writable volume arrived.
+
+## 9. Verification status
+
+- **Encoder, host-side.** A harness `#[path]`-includes `video/png.rs` itself — the same source the
+  kernel compiles. CRC-32 and Adler-32 match their published check values; python's real `zlib`
+  decompresses the output; every chunk CRC validates; decoded pixels are byte-identical to the
+  source rows, in a single-block case and in an eleven-stored-block case; the refusal paths
+  (`EmptyImage`, `BadRowLength`, `RowCountMismatch`) answer as specified; `encoded_len` is exact.
+
+- **Whole chain, in QEMU — a real PNG on a real FAT volume.**
+  `UNAOS_WC=1 UNAOS_PRTSCRST=1 ./arroyo test-fat sf 240` prints:
+
+  ```
+  :: PRTSCR-ST: program source is sdhc and vetoes writes (...) — still waiting for a writable volume ::
+  :: PRTSCR: SCREEN0.PNG 1280x800 3073098 bytes -> OK ::
+  :: PRTSCR-ST: SCREEN0.PNG on the medium — 3073098 bytes, PNG signature OK, IHDR 1280x800 depth 8 colour 2 non-interlaced, IEND OK -> PASS ::
+  ```
+
+  `mcopy -i builder/fat-sf.img ::SCREEN0.PNG` pulls the file off the image host-side. `file` reports
+  `PNG image data, 1280 x 800, 8-bit/color RGB, non-interlaced`; python's `zlib` decompresses the
+  IDAT (which validates all 47 stored blocks and the Adler-32); every chunk CRC checks; the raw
+  stream is exactly `800 * (1 + 1280*3)` bytes with a zero filter byte on every scanline. 3,073,098
+  is byte-for-byte what the host harness's `encoded_len(1280, 800)` predicts.
+
+  **The pixels are the real screen, decoded in the right channel order.** The dominant colour is
+  `(45, 43, 85)` — `wm::DESKTOP_BG`, `0x2D2B55` — and `(30, 30, 30)` is `video::PANEL_BG`,
+  `0x1E1E1E`. A swapped decode would have rendered the desktop as `0x552B2D`.
+
+- **Refusal path, in QEMU.** `UNAOS_PRTSCRST=1 ./arroyo test` attaches no FAT-bearing device and
+  prints the honest no-volume line, once, naming the handle census it inspected.
+
+- **Gate.** `UNAOS_WC=1 ./arroyo test` green with `wc` in the `⚡ kernel features:` banner;
+  `./arroyo check` green on both arches, with `prtscrst` added to the `x86-all` and `arm-pi`
+  cfg-coverage legs so the knob-on build is type-checked too.
+
+- **Print Screen on metal**: not proven here. A QEMU `send-key` of the `print` qcode reaches the
+  emulated `usb-kbd` and therefore the same EHCI decoder hook, but the key on the rMBP's own
+  internal keyboard is the seat's proof, at an arc boundary, on the machine.

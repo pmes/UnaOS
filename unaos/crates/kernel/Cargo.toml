@@ -698,6 +698,15 @@ holocron = []
 # DEFAULT OFF => both selftests and their call sites vanish. Kept in sync with arroyo and
 # builder/src/main.rs.
 hcronst = ["holocron"]
+# PRTSCR-ST: the screen capture's BOOT-TIME-WRITE witness (`video::prtscr::selftest_once`) — one
+# real capture through the same `capture()` the `screenshot` verb and the Print Screen key call,
+# then a read-back of what landed on the medium (directory size, PNG signature, IHDR geometry and
+# colour type, IEND). ITS OWN KNOB, by the rule that gave `hcronst` one apart from `holocron` and
+# `sdw` one apart from `sdhcblk`: a boot that did not ask to WRITE the boot medium must be
+# incapable of doing so. The capture mechanism itself is ungated and always present — only this
+# unattended write is behind the knob. DEFAULT OFF => the selftest and its call sites vanish and
+# every shipped image is byte-alike. Kept in sync with arroyo and builder/src/main.rs.
+prtscrst = []
 # SMOLNET-DEFAULT (2026-07-17): the mature smoltcp TCP/IP stack (ROADMAP §1b) is the DEFAULT x86 net
 # path — the shell's ping/arp/netinfo, the socket syscall family (SOCK-2..7), the DNS sinkhole
 # (zeolite), and the boot witnesses. Pulls in the x86-only smoltcp optional dependency and compiles

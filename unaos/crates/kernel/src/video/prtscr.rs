@@ -380,3 +380,132 @@ pub fn capture() -> Result<Shot, Refusal> {
     }
     Ok(Shot { name, width, height, bytes: written })
 }
+
+// ================================ PRTSCR-ST — THE BOOT-TIME WITNESS ================================
+//
+// A capture is not provable from a `check` and not provable from a plain `./arroyo test`, because
+// the verb needs an operator at a prompt and the key needs a finger. This drives the REAL
+// [`capture`] — the same function the verb and the Print Screen edge call, never a transcription of
+// it — once, at boot, and then reads back what landed ON THE MEDIUM through the block layer.
+//
+// **Its own knob, default OFF** (`UNAOS_PRTSCRST=1`), by the rule that gave `hcronst` a knob apart
+// from `holocron` and `sdw` one apart from `sdhcblk`: *a boot that did not ask to WRITE the boot
+// medium must be incapable of doing so.* Off the knob this function and its call sites vanish
+// entirely, so the gate run (`UNAOS_WC=1 ./arroyo test`) and every shipped image are byte-alike.
+//
+// It does NOT clean up after itself, and that is deliberate — `btbond::selftest_once` sets the same
+// precedent. The written file is the deliverable: `./arroyo test-fat sf` leaves a real `SCREEN0.PNG`
+// in `builder/fat-sf.img`, which a host can extract with `mcopy` and decode with a real zlib. A
+// kernel that says PASS is evidence; a PNG a foreign decoder opens is proof.
+//
+// Re-running it on an image that already holds captures is safe and is itself a demonstration: the
+// free-name search takes the next index, and a hundredth run refuses rather than overwriting.
+
+/// PRTSCR-ST — drive one real capture at boot and verify what reached the medium.
+///
+/// One-shot, and **the latch is taken only on a pass that reached a WRITABLE volume.** Both of the
+/// states that precede one are transient and neither is a verdict:
+///
+///  * *No volume at all* — storage enumerates asynchronously, so the early passes have none.
+///  * *A volume that vetoes writes* — on x86 the program-source ladder falls back to the internal
+///    SD reader (mounted read-only by SDHC-4c) until the USB stick registers, and only THEN does it
+///    prefer the global handle. Latching on that veto gives up a second before the writable volume
+///    arrives, which is exactly what the first run of this witness did.
+///
+/// So both are announced ONCE, for the log's sake, and then waited through. A boot that never gets
+/// a writable volume (a plain `./arroyo test`, which attaches no FAT-bearing device) leaves exactly
+/// one honest line and never a false FAIL.
+#[cfg(feature = "prtscrst")]
+pub fn selftest_once() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    static SAID_NO_VOLUME: AtomicBool = AtomicBool::new(false);
+    static SAID_READ_ONLY: AtomicBool = AtomicBool::new(false);
+    if DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    let fs = match crate::fs::fat::mount_program_source() {
+        Ok(fs) => fs,
+        Err(e) => {
+            if !SAID_NO_VOLUME.swap(true, Ordering::Relaxed) {
+                serial_println!(
+                    ":: PRTSCR-ST: no FAT volume on any program-source handle ({:?}; handles={}) — still waiting; a boot that never gets one leaves the capture selftest SKIPPED ::",
+                    e,
+                    crate::drivers::block::source_census()
+                );
+            }
+            return;
+        }
+    };
+    if let Some(why) = fs.write_veto() {
+        if !SAID_READ_ONLY.swap(true, Ordering::Relaxed) {
+            serial_println!(
+                ":: PRTSCR-ST: program source is {} and vetoes writes ({}) — still waiting for a writable volume ::",
+                fs.source_name(),
+                why
+            );
+        }
+        return;
+    }
+    DONE.store(true, Ordering::Relaxed);
+
+    let shot = match capture() {
+        Ok(shot) => shot,
+        Err(why) => {
+            why.report();
+            serial_println!(":: PRTSCR-ST: FAIL — the capture itself refused (line above) ::");
+            return;
+        }
+    };
+    serial_println!(
+        ":: PRTSCR: {} {}x{} {} bytes -> OK ::",
+        shot.name, shot.width, shot.height, shot.bytes
+    );
+
+    // Read back through the block layer — the directory entry the volume actually holds, and the
+    // file's own first and last bytes. Head and tail rather than the whole file: at 2880x1800 the
+    // whole file is 15.5 MiB, and the three facts that matter are structural. A truncated write
+    // cannot pass all three, because the size is the directory's own and the IEND is at the end.
+    let (de, _, _) = match fs.locate_in_dir(0, &shot.name) {
+        Ok(hit) => hit,
+        Err(e) => {
+            serial_println!(
+                ":: PRTSCR-ST: FAIL — {} is not in the root after the write ({:?}) ::", shot.name, e
+            );
+            return;
+        }
+    };
+    if de.size as usize != shot.bytes {
+        serial_println!(
+            ":: PRTSCR-ST: FAIL — {} is {} bytes on disk, {} were written ::",
+            shot.name, de.size, shot.bytes
+        );
+        return;
+    }
+    let mut head: Vec<u8> = Vec::new();
+    let mut tail: Vec<u8> = Vec::new();
+    if fs.read_at(de.first_cluster(), de.size, 0, &mut head, 33).is_err()
+        || fs.read_at(de.first_cluster(), de.size, de.size - 12, &mut tail, 12).is_err()
+    {
+        serial_println!(":: PRTSCR-ST: FAIL — {} could not be read back ::", shot.name);
+        return;
+    }
+    let sig_ok = head.len() >= 33 && head[..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    let ihdr_ok = sig_ok && &head[12..16] == b"IHDR";
+    let w = if ihdr_ok { u32::from_be_bytes([head[16], head[17], head[18], head[19]]) } else { 0 };
+    let h = if ihdr_ok { u32::from_be_bytes([head[20], head[21], head[22], head[23]]) } else { 0 };
+    let colour_ok = ihdr_ok && head[24] == 8 && head[25] == 2 && head[26] == 0 && head[28] == 0;
+    let iend_ok = tail.len() == 12 && &tail[4..8] == b"IEND";
+    let dims_ok = w == shot.width && h == shot.height;
+
+    if sig_ok && ihdr_ok && colour_ok && dims_ok && iend_ok {
+        serial_println!(
+            ":: PRTSCR-ST: {} on the medium — {} bytes, PNG signature OK, IHDR {}x{} depth 8 colour 2 non-interlaced, IEND OK -> PASS ::",
+            shot.name, de.size, w, h
+        );
+    } else {
+        serial_println!(
+            ":: PRTSCR-ST: FAIL — {} sig={} ihdr={} colour={} dims={}x{} (want {}x{}) iend={} ::",
+            shot.name, sig_ok, ihdr_ok, colour_ok, w, h, shot.width, shot.height, iend_ok
+        );
+    }
+}

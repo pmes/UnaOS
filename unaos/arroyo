@@ -516,6 +516,18 @@ _feats=""
 # sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature disabled
 # while the banner claims it is on (s42/INSTGUI, WXN-M3b).
 [ -n "${UNAOS_HCRONST:-}" ] && _feats="${_feats}hcronst,"
+# PRTSCR-ST: UNAOS_PRTSCRST=1 arms the screen capture's BOOT-TIME-WRITE witness — one real capture
+# to SCREEN<n>.PNG at the volume root, then a read-back of what landed on the medium. Its own knob,
+# and NOT part of any other, by the rule stated for UNAOS_HCRONST above: a boot that did not ask to
+# WRITE the boot medium must be incapable of doing so. The capture mechanism (`screenshot`, the
+# Print Screen key) is ungated and always present — only this UNATTENDED write is behind the knob,
+# because nothing else can drive a verb on a headless boot. Pair it with the FAT leg for the real
+# proof: `UNAOS_PRTSCRST=1 ./arroyo test-fat sf` leaves a genuine PNG in builder/fat-sf.img that a
+# host decoder can open. Like `hcronst` it does NOT clean up after itself — the file IS the
+# deliverable. Default OFF => the selftest and its call sites vanish. Kept in sync with
+# builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature disabled while the
+# banner claims it is on (s42/INSTGUI, WXN-M3b).
+[ -n "${UNAOS_PRTSCRST:-}" ] && _feats="${_feats}prtscrst,"
 # INSTALL-CORE: UNAOS_INSTALLDEMO=1 arms the installer engine + its x86 boot witness (GPT writer +
 # FAT32 formatter + extent content-verify). The builder attaches a dedicated BLANK scratch disk over
 # the usb-storage slot under this knob (see builder/src/main.rs), against which the engine writes a
@@ -2617,7 +2629,7 @@ KERNEL_CFG_MATRIX=(
   # -Cmetadata note there) precisely because it emits not one byte of aarch64 code.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the
@@ -2633,7 +2645,7 @@ KERNEL_CFG_MATRIX=(
   # not have caught an aarch64 regression in the very file the "do not strip" decision exists to
   # protect. It is a type-check leg, so it shifts no Pi or Jetson MEDIA: `arm_features` (which media
   # builds go through) is untouched, and `kernel8` builds from its own curated K8_FEATS.
-  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo"
+  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo,prtscrst"
   # aarch64 board leg 2 — Jetson Orin Nano (Tegra234), plus the board-neutral aarch64 features that
   # would otherwise ride nothing: ORIN-SMP (tegrasmp/smpprobe), the four XCARVE levers, ORIN-NET-1..4
   # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET

@@ -1197,6 +1197,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // THREE storage-ready passes this file carries, because which pass a given build reaches
             // depends on its knobs. Idle cost: one relaxed atomic load per iteration.
             unaos_kernel::video::prtscr::service();
+            // PRTSCR-ST (prtscrst knob, default OFF): the capture's BOOT-TIME-WRITE witness — one
+            // real capture through the same `capture()` the verb and the key call, then a read-back
+            // of what landed on the medium. Here for the same reason `service` is here: it writes the
+            // FAT volume and must do so with no driver lock held. It latches only on a pass that HAD
+            // a volume, so an early pass before storage enumerates does not burn the one attempt.
+            #[cfg(feature = "prtscrst")]
+            unaos_kernel::video::prtscr::selftest_once();
             // SELFHOST-2 (x86, selfhost knob): verify the medium's own SRC.TGZ against SRC.SHA and
             // walk the tar, one-shot. It belongs beside `probe_once` for the same reason that one
             // does: it needs storage up and the volume lock free. Read-only throughout. Like the
@@ -1680,6 +1687,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // THREE storage-ready passes this file carries, because which pass a given build reaches
         // depends on its knobs. Idle cost: one relaxed atomic load per iteration.
         unaos_kernel::video::prtscr::service();
+        // PRTSCR-ST (prtscrst knob, default OFF): the capture's BOOT-TIME-WRITE witness — one
+        // real capture through the same `capture()` the verb and the key call, then a read-back
+        // of what landed on the medium. Here for the same reason `service` is here: it writes the
+        // FAT volume and must do so with no driver lock held. It latches only on a pass that HAD
+        // a volume, so an early pass before storage enumerates does not burn the one attempt.
+        #[cfg(feature = "prtscrst")]
+        unaos_kernel::video::prtscr::selftest_once();
         // SELFHOST-2 (x86, selfhost knob): the source-verify + tar walk, one-shot — see the note at
         // the first loop site. This is the pass a headless `test`/`test-fat` boot reaches.
         #[cfg(all(target_arch = "x86_64", feature = "selfhost"))]
@@ -5919,6 +5933,13 @@ fn x86_usb_pump(cpu: usize) {
         // THREE storage-ready passes this file carries, because which pass a given build reaches
         // depends on its knobs. Idle cost: one relaxed atomic load per iteration.
         unaos_kernel::video::prtscr::service();
+        // PRTSCR-ST (prtscrst knob, default OFF): the capture's BOOT-TIME-WRITE witness — one
+        // real capture through the same `capture()` the verb and the key call, then a read-back
+        // of what landed on the medium. Here for the same reason `service` is here: it writes the
+        // FAT volume and must do so with no driver lock held. It latches only on a pass that HAD
+        // a volume, so an early pass before storage enumerates does not burn the one attempt.
+        #[cfg(feature = "prtscrst")]
+        unaos_kernel::video::prtscr::selftest_once();
         // SELFHOST-2 (x86, selfhost knob): the source-verify + tar walk, one-shot — see the note at
         // the first loop site. This is the pass the GUI/desktop boot reaches, i.e. the metal boot.
         #[cfg(all(target_arch = "x86_64", feature = "selfhost"))]

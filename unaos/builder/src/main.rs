@@ -369,6 +369,10 @@ fn main() {
     // compiled OUT (the s42/INSTGUI and WXN-M3b failure). Default OFF => both selftests and their
     // call sites unlinked. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_HCRONST").is_ok() { feats.push("hcronst"); }
+    // PRTSCR-ST: UNAOS_PRTSCRST=1 arms the screen capture's BOOT-TIME-WRITE witness — see the knob's
+    // note in arroyo. Mapped here as well as there, because a knob mapped in only one of the two
+    // ships the feature disabled while the banner claims it is on (s42/INSTGUI, WXN-M3b).
+    if std::env::var("UNAOS_PRTSCRST").is_ok() { feats.push("prtscrst"); }
     // K-GPU: UNAOS_KEPLER=1 arms the GK107 (GT 650M) driver — probe/EVO-decode/PFIFO are further
     // gated by UNAOS_KEPLER_TAKEOVER / UNAOS_KEPLER_FIFO (option_env!, compile-time). Kept in sync
     // with arroyo's mapping. (The builder rebuilds the kernel, so this MUST be here or the feature
