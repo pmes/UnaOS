@@ -3262,9 +3262,10 @@ KERNEL_CFG_MATRIX=(
   # WITHOUT baremetal or tegra_el0 (a ringless desktop). Every other aarch64 leg carrying
   # desktop_firmware also carries an EL0 layer, which is how dock.rs shipped E0433 reachable from
   # the DOCUMENTED knob combo UNAOS_WITNESS=1 UNAOS_ORINVPAR=1 (exit 101 before ba3e9b62, 0 after
-  # — this leg is proven non-vacuous by that measurement). `quarry` joins once its own ringless
-  # arms land (video/quarry/live.rs has the same defect, in repair).
-  "arm-desk-noel0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,desktop_firmware,livecon,wcg-paygo"
+  # — this leg is proven non-vacuous by that measurement). `quarry` joined 2026-08-27 (rmbp 8):
+  # its ringless arms landed with 98be87ad, which pre-measured this leg green with `quarry` and
+  # deferred the edit here to the seat.
+  "arm-desk-noel0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,desktop_firmware,livecon,wcg-paygo,quarry"
 
 
   # FBCONPAR CROSS (appended 2026-08-26) — the same two knobs on the FULL `pidesk` conjunction.
