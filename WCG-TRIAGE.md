@@ -356,19 +356,60 @@ the feature banner:
 **No `wcg-paygo`** — so all 79 paygo ports are compiled out on that image and cannot have
 affected it. The only live change on any aarch64 build is the occlusion attribution.
 
-And on that run it did not fire: every `[wc-g]` line reports `occluded=0`, including the ten
-with a live occluder box (`occ=1/1`, `occ=2/2`). `occluded` increments exactly when a probe
-both mismatches AND lies under an occluder; `occluded=0` throughout means that branch was never
-taken and every probe went down the same `bad += 1` path the old code had. The wire is
-therefore unmoved by this port on this run — the fix is proven safe here, and its BENEFIT is
-unexercised, because the QEMU raspi4b geometry never put a mismatching probe under a higher
-window. (The two non-zero `occluded=` values in the log, 20736 and 4472, are on `[wc-d]` lines
-— `wm.rs`'s own attribution, which was already arch-neutral and which this arc did not touch.)
+And on that run it did not fire: every `[wc-g]` line reports `occluded=0`, including the five
+with a live occluder box (`occ=1/1`). `occluded` increments exactly when a probe both
+mismatches AND lies under an occluder; `occluded=0` throughout means that branch was never
+taken and every probe went down the same `bad += 1` path the old code had.
 
-**The run also reports `❌ MBENCH FAIL — 49/117 required witnesses, 6 forbidden hit(s)`, and
-that is NOT this arc's doing.** The six FORBID hits are `-> RACE-BLIT`, `-> COHER`, two
-`[wc-d] … -> FAIL` and `-> AT-RISK`, all on a 640x480 QEMU raspi4b run with `slow=yes` and
-per-pass times of 17–126 ms. Two independent reasons it cannot be the port: the image carries
-no `wcg-paygo`, and the one live change provably never executed its new branch (above).
-`kernel8-test` is outside this arc's DONE gate and was run as extra diligence; the failure is
-reported here so the Pi seat has it, not claimed as a regression this arc introduced.
+**A control run at the base sha confirms that rather than leaving it argued.** A throwaway
+worktree at `44c69738` (`~/unaos-bench/scratch/rmbp7/wcg-base`) was given the identical command.
+Filtered to this module's own lines, the two runs agree exactly:
+
+| `[wc-g]` lines | base `44c69738` | branch `9f1c9d8f` |
+|---|---:|---:|
+| `occluded=0 occ=0/0` | 15 | 15 |
+| `occluded=0 occ=1/1` | 5 | 5 |
+| any `occluded=` > 0 | 0 | 0 |
+
+So the wc-g wire is **measurably unmoved** by this port. The fix is proven safe, and its
+BENEFIT is unexercised: the 640x480 QEMU raspi4b geometry never put a mismatching probe under a
+higher window, so the corrected branch had no occasion to run.
+
+The two non-zero `occluded=` values in the log (20736 and 4472) are on `[wc-d]` lines and
+**appear identically in the baseline** — `wm.rs`'s own attribution, already arch-neutral, which
+this arc did not touch. Their presence on both sides is what rules them out as an effect of
+this change.
+
+⚠ A METHOD NOTE, because it nearly became a wrong claim. The first reading of the after-run
+grepped `occluded=… occ=…` across the WHOLE serial log and reported 29/9/1 for `[wc-g]` — those
+were `[wc-g]` and `[wc-d]` lines summed. Filtered to `[wc-g]`, the figures are 15/5. The
+conclusion did not change, but the number supporting it was wrong until the control forced both
+sides to be counted the same way. A comparison is what caught it; neither run alone would have.
+
+**Both runs also report `❌ MBENCH FAIL`, and the CONTROL is what settles whose it is: the base
+sha fails too, harder.**
+
+The verdict `kernel8-test` printed live for the branch (`49/117 witnesses, 6 forbidden,
+396 lines scanned`) is not usable for comparison — the spec read the log while QEMU was still
+writing it, catching 396 of the 2923 lines it ended with. Both logs were therefore re-asserted
+against the same spec afterwards, complete, with `scripts/mbench.py --replay`:
+
+| `mbench.py --replay … --spec pi4-regression.spec --platform pi` | base `44c69738` | branch `9f1c9d8f` |
+|---|---|---|
+| verdict | ❌ FAIL | ❌ FAIL |
+| required witnesses | 116/117 | 103/117 |
+| forbidden hits | **21** | **14** |
+| lines scanned | 3058 | 2923 |
+| hit classes | `-> FAIL` ×4, `-> AT-RISK` ×2, `-> COHER`, `-> BLIT` | `-> FAIL` ×2, `-> AT-RISK`, `-> COHER`, `-> BLIT`, `-> RACE-BLIT` |
+
+Same failure, same classes of verdict, **more of them at the base sha than on the branch**. So
+`UNAOS_PIDESK=1 ./arroyo kernel8-test` is failing before this arc touched anything — a 640x480
+QEMU raspi4b run with `slow=yes` and per-pass times of 17–126 ms, which is the regime these
+timing and race verdicts fire in. The run-to-run spread (21 vs 14) is that nondeterminism, not
+a signal in either direction.
+
+Three independent reasons the port cannot be the cause: the image carries no `wcg-paygo`; the
+one live change provably never executed its new branch (the `occluded=` table above); and the
+baseline fails the same way without it. `kernel8-test` is outside this arc's DONE gate and was
+run as extra diligence — the failure is reported here so the Pi seat has it, not claimed as a
+regression this arc introduced, and not claimed as fixed either.
