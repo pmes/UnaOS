@@ -3800,16 +3800,10 @@ fn paygo_service_pass() {
             // NOATT — the attribution half of the discriminator, counted at the ONE site that makes
             // this class of mark. See the ledger above [`NOATT_SEQ`].
             //
-            // ARCH-PARITY (rmbp-7) — the gate is the NOATT WIRE's, not the taker's, and it travels
-            // with the counter rather than with this function. The whole `[wcn]` no-attach
-            // discriminator — `NOATT_SEQ`, `NOATT_SEEN`, `NOATT_PASSES`, `NOATT_SEEDS`,
-            // `NOATT_ROWS`, `NOATT_KPX`, `NOATT_TAKER` and the rollup that divides them — carries
-            // `all(feature = "witness", target_arch = "x86_64")` by its own ledger above
-            // [`NOATT_SEQ`], and none of that is paygo. Where the counter is not built there is
-            // nothing to attribute a mark to, and bumping a cell no rollup reads would be a
-            // measurement with no reader. Porting the NOATT wire is its own item; this call follows
-            // the wire the day it moves and needs no edit here.
-            #[cfg(target_arch = "x86_64")]
+            // ARCH-PARITY (rmbp-7) — PORTED with the wire, exactly as this note said it would be:
+            // the discriminator rides `witness` and nothing else now, so this call needs no term
+            // beyond the one its own function already carries. `noatt_note_taker` keeps the
+            // `wcg-paygo` term, which is load-bearing — no service pass, no mark to attribute.
             noatt_note_taker();
             marked = Some(r.id);
             break;
@@ -4697,7 +4691,7 @@ fn composite_pass_half() -> Owed {
     let c2_t0 = crate::arch::now_cycles();
     // DROPWAKE — the pass hook: refresh the pass stamp, count the pass against an armed drop, and
     // fire the quarter-second audit if the drop has waited that long. Same clock read as `c2_t0`.
-    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    #[cfg(feature = "witness")]
     dropwake_pass_tick(c2_t0);
     let mut tail = composite_inner();
     // DOCK — the strip is the pass's LAST layer under the sprite: after every window, before the
@@ -5508,7 +5502,7 @@ fn composite_inner() -> CursorTail {
     // so every row in it was marked by something OUTSIDE this pass, and `bands` still holds each
     // row's OWN declared extent (the closure below only ever widens rows ABOVE a dragger). Both facts
     // are gone one loop later. See [`noatt_emit`] for what the reading means.
-    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    #[cfg(feature = "witness")]
     noatt_note_pass(&rows, &seed, &bands);
     for oi in 0..MAX_WINDOWS {
         let i = order[oi];
@@ -12710,7 +12704,8 @@ fn wcn_note_present(id: WinId, hidden: bool) {
     // for `att`'s own reason: an attempt is what the owner did). Before the slot lookup's early
     // return would be wrong — an out-of-range id has no census row and no seed row either — so it
     // rides the same `Some` the census does.
-    #[cfg(target_arch = "x86_64")]
+    // ARCH-PARITY (rmbp-7) — no term of its own: the counter it bumps is `witness`-gated, like
+    // this function, so the bump is built exactly where the rollup that reads it is.
     if let Some(i) = (id as usize).checked_sub(1) {
         if i < MAX_WINDOWS {
             NOATT_SEQ[i].fetch_add(1, Relaxed);
@@ -12851,50 +12846,65 @@ fn wcn_note_relay(id: WinId) {
 // leak reads `passes=115 seeds=115 noatt=18 noatt_kpx=~13300 taker=18 -> TAKER`. A cursor path
 // re-damaging a still pointer would read `taker=0 -> UNATTRIBUTED` with `noatt` near the pass count.
 //
-// x86 only, like `[wcser]`/`[wcpar]`. ARCH-PARITY (rmbp-7): the taker it attributes to is no longer
-// arch-gated — the gate that stays is this WIRE's, and it is the whole discriminator's, not paygo's.
-// See the note on `noatt_note_taker` for the keep and for what porting the wire would take.
+// ### ARCH-PARITY (rmbp-7) — PORTED. Read this before the first capture on new silicon.
+//
+// The wire was built only where `[wcser]`/`[wcpar]` are, while every site that FEEDS it is
+// written once and compiled everywhere: `wcn_note_present`'s attach bump, `composite_inner`'s
+// seed snapshot, and the `[wcn]` rollup that drains it. The protection ran; the proof that it
+// ran did not, so a regression on the silicon without the wire read green because it read
+// nothing. Every cell below now carries `feature = "witness"` and nothing else.
+//
+// THE FIRST PI/ORIN CAPTURE AFTER THIS PORT IS A NEW MEASUREMENT, NOT A REGRESSION CHECK.
+// This is a state machine fed from many sites, and no capture on that silicon has ever printed
+// a `[noatt]` line. Its first reading ESTABLISHES the baseline that later boots are read
+// against; a nonzero `noatt=` there is a finding to open, not a regression this port caused.
+//
+// `taker=` is the one term that is not universal, and by knob rather than by silicon: it counts
+// marks made by [`paygo_service_pass`], so a build without `wcg-paygo` reads `taker=0` and the
+// verdict falls to `UNATTRIBUTED` — the correct reading there, since the taker that arm names
+// does not exist to be convicted.
 
 /// NOATT — per-id monotone attach sequence. Bumped by [`wcn_note_present`] for every present the
 /// owner attempted, and NEVER drained: the reading is a DIFFERENCE against [`NOATT_SEEN`], so a
 /// counter the rollup swapped would manufacture a fresh "no attach" the instant it fired.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 static NOATT_SEQ: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
 
 /// NOATT — per-id: [`NOATT_SEQ`] as the PREVIOUS composite pass saw it. Stamped for every slot on
 /// every pass, so "since the previous pass" is literal and a row that sat out a pass does not
 /// accumulate a spurious quiet interval.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 static NOATT_SEEN: [core::sync::atomic::AtomicU64; MAX_WINDOWS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS];
 
 /// NOATT — per-span: passes that reached the seed snapshot.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 static NOATT_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// NOATT — per-span: seed rows, all causes. The denominator `noatt` is read against.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 static NOATT_SEEDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// NOATT — per-span: seed rows with no attach since the previous pass.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 static NOATT_ROWS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// NOATT — per-span: what those rows charged, in kilopixels (`[wcn] dkpx=`'s unit).
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 static NOATT_KPX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// NOATT — per-span: marks made by [`paygo_service_pass`]. The attribution half.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 static NOATT_TAKER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// NOATT — the pay-as-you-go taker's mark, counted where it is made. Called under no lock, one
 /// relaxed increment; compiled out with the taker itself.
 ///
-/// ARCH-PARITY (rmbp-7) — the arch term is the NOATT WIRE's, not the taker's, and it stays with the
-/// counter it writes. Every cell of the discriminator above ([`NOATT_SEQ`] and its five siblings)
-/// and the `[wcn]` rollup that divides them carry `all(feature = "witness", target_arch = "x86_64")`
-/// and none of it is a paygo item. Bumping a counter no rollup is built to read would be a
-/// measurement with no reader; the taker's own call site is gated to match, with the same reason
-/// written at it. Porting the NOATT wire is its own item, and this pair follows it unchanged.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+/// ARCH-PARITY (rmbp-7) — PORTED with the wire. The discriminator above rides `witness` and
+/// nothing else now, so a rollup exists to read this cell wherever the counter is built, and the
+/// "measurement with no reader" objection that kept this pair narrow is discharged.
+///
+/// The `wcg-paygo` term STAYS, and it is load-bearing rather than incidental: this function
+/// counts marks made by the pay-as-you-go service pass, so where that pass is not compiled there
+/// is no mark to attribute and the symbol is dead code. That term is a knob, not silicon.
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 fn noatt_note_taker() {
     NOATT_TAKER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
@@ -12905,7 +12915,7 @@ fn noatt_note_taker() {
 /// mean the previous pass, or a window that presents once every ten passes would read as unattached
 /// on nine of them. The `swap` is the stamp and the read in one operation, so two cores compositing
 /// concurrently cannot both claim the same quiet interval.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 fn noatt_note_pass(
     rows: &[Window; MAX_WINDOWS],
     seed: &[bool; MAX_WINDOWS],
@@ -12942,7 +12952,7 @@ fn noatt_note_pass(
 /// nobody asked for, and its absence is the healthy reading rather than an absent instrument. The
 /// per-span counters are still drained on a silent period, so a leak cannot bank quiet spans and
 /// then report them all against one noisy one.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 fn noatt_emit(scope: &str, span: u64) {
     use core::sync::atomic::Ordering::Relaxed;
     let passes = NOATT_PASSES.swap(0, Relaxed);
@@ -13231,8 +13241,8 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
     // NOATT — the discriminator rides the same cadence and span, directly under `[wcser]` because it
     // answers the question `[wcser]` cannot: a `comp_rate` far above `att_rate` with `declined_pct`
     // in single figures is not contention, and this line says whether it was work anybody asked for.
-    // Self-silencing, so a healthy desktop is as quiet as it was before. x86 only, like `[wcser]`.
-    #[cfg(target_arch = "x86_64")]
+    // Self-silencing, so a healthy desktop is as quiet as it was before. ARCH-PARITY (rmbp-7):
+    // ported — this rides `witness`, like every counter it drains, and no longer the silicon.
     noatt_emit(scope, span);
     // WPACE-PANEL — the present pacer's ledger rides the same cadence, directly under `[wcser]`
     // whose `declined=` it is the cure for: `coalesced=` climbing while `declined=` falls is the
@@ -14852,60 +14862,81 @@ static DRAG_FLASH_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 // names which piece of drag state survived the release. One boot with it discriminates present-lag
 // (`[dropwake] -> LAG` with `[dropres] stale=+vacfill`) from residual drag state (`[dropwake]`
 // CLEAN beside a seen ghost, with `[dropres]` naming the survivor).
+//
+// ### ARCH-PARITY (rmbp-7) — PORTED. Read this before the first capture on new silicon.
+//
+// Every cell and hook below was built on one target only, while the sites that feed them are
+// compiled everywhere: `drag_note_move` publishes the vacated box under `witness`, `drag_end`
+// and `drag_cancel` release under `witness`, and `composite_pass_half` and `drain_deferred`
+// carry no term of their own at all. The trace now rides `witness` and nothing else.
+//
+// THE FIRST PI/ORIN CAPTURE AFTER THIS PORT IS A NEW MEASUREMENT, NOT A REGRESSION CHECK.
+// This is a state machine fed from many sites, and no capture on that silicon has ever printed
+// a `[dropwake]` or `[dropres]` line. Its first reading ESTABLISHES the baseline that later
+// boots are read against; a `-> LAG` verdict there is a finding to open, not a regression this
+// port caused.
+//
+// THREE TERMS ARE NOT UNIVERSAL, and each names a mechanism that belongs to another witness or
+// to the composite gate rather than to this one. `comppend` and `dragocc` are dispatches with a
+// constant-`false` arm inside [`dropres_audit`], not gates on the audit; `declined=` is fed from
+// inside [`composite`]'s gate-decline path, so where there is no such gate it reads 0 — which is
+// the honest statement that no pass was ever turned away, not a hole in the trace.
 /// DROPWAKE — the window whose drop is being timed, or [`WIN_NONE`] when no drop is in flight.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 static DW_ARMED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(WIN_NONE);
 /// DROPWAKE — `now_cycles` at the release ([`drag_end`]/[`drag_cancel`], after `drag_report`).
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 static DW_REL_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// DROPWAKE — `now_cycles` when the LAST motion published its erase slivers (the damage). Zero
 /// means the gesture never moved, and the drop is not worth a line. Published LAST in
 /// [`drag_note_move`]'s stamp block so a reader that sees it nonzero sees the box it covers.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 static DW_DMG_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// DROPWAKE — `now_cycles` when a drained fill overlapping [`DW_VAC`] was flushed to the panel.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 static DW_GLASS_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// DROPWAKE — entry stamp of the composite pass whose drain reached the glass ([`DW_PASS_T0`] at
 /// glass time), so the trace splits "waiting for a pass" from "inside the pass".
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 static DW_COMP_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// DROPWAKE — entry stamp of the most recent composite pass, refreshed at [`composite_once`]'s
 /// `c2_t0` read.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 static DW_PASS_T0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// DROPWAKE — `COMP_GATE` declines observed while a drop was armed: passes that WOULD have run and
-/// were bounced to `COMP_PENDING` instead.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+/// were bounced to `COMP_PENDING` instead. Its ONE feed sits inside [`composite`]'s gate-decline
+/// path — a mechanism not every build has — so a build without that gate reads 0 here and means
+/// it: nothing was ever turned away. See the family header above.
+#[cfg(feature = "witness")]
 static DW_DECLINED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// DROPWAKE — composite passes that RAN while the drop was armed and still did not put the vacated
 /// slivers on the glass.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 static DW_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// DROPWAKE — union box (`x`, `y`, `w`, `h`) of the LAST motion's erase slivers. `w == 0` means no
 /// box is held. This is what the glass hook and the audit test overlap against.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 static DW_VAC: [core::sync::atomic::AtomicUsize; 4] =
     [const { core::sync::atomic::AtomicUsize::new(0) }; 4];
 /// DROPWAKE — one bounded budget shared by `[dropwake]` and `[dropres]`, so a pathological boot
 /// cannot turn the drop witness into a serial storm.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 static DW_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 const DW_LOG_MAX: u64 = 128;
 /// DROPWAKE — the deadline that turns a drop's `rel->glass` into a LAG verdict: two 60 Hz frames.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 const DROPWAKE_LAG_US: u64 = 33_000;
 /// DROPRES — how long an armed drop may wait for its glass before the audit fires and the trace
 /// gives up on it.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 const DROPRES_MS: u64 = 250;
 
 /// DROPWAKE — emit the finished drop's erase-latency trace and retire its state.
 ///
 /// `glass_known == false` is the timeout arm: the fill never reached the glass inside
 /// [`DROPRES_MS`], so the comp/glass terms print 0 and the verdict is LAG by construction.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 fn dropwake_emit(win: WinId, glass_known: bool) {
     use core::sync::atomic::Ordering::Relaxed;
     // Retire the drop FIRST, so a budget-exhausted boot still disarms cleanly.
@@ -14943,7 +14974,7 @@ fn dropwake_emit(win: WinId, glass_known: bool) {
 /// Silent for a gesture that never moved (`DW_DMG_CYC == 0`). If the drained fill already reached
 /// the glass BEFORE the release — the queue drained mid-drag and nothing is owed — the trace is
 /// emitted CLEAN right here rather than armed, because there is nothing left to wait for.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 fn dropwake_arm(id: WinId) {
     use core::sync::atomic::Ordering::Relaxed;
     if DW_DMG_CYC.load(Relaxed) == 0 {
@@ -14962,7 +14993,7 @@ fn dropwake_arm(id: WinId) {
 /// Refreshes [`DW_PASS_T0`] unconditionally (one relaxed store on an idle boot); while a drop is
 /// armed it counts the pass and, past [`DROPRES_MS`], fires the [`dropres_audit`] and retires the
 /// drop as LAG — a drop that old is not going to resolve into a latency number worth waiting for.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 fn dropwake_pass_tick(t0: u64) {
     use core::sync::atomic::Ordering::Relaxed;
     DW_PASS_T0.store(t0, Relaxed);
@@ -14983,7 +15014,7 @@ fn dropwake_pass_tick(t0: u64) {
 /// erase reaching the panel: stamp comp+glass, and if the release has already happened, emit and
 /// disarm. (Un-armed stamping is deliberate — a queue that drains mid-drag is what lets
 /// [`dropwake_arm`] emit CLEAN at the release itself.)
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 fn dropwake_glass_note(x: usize, y: usize, w: usize, h: usize) {
     use core::sync::atomic::Ordering::Relaxed;
     if DW_DMG_CYC.load(Relaxed) == 0 || DW_GLASS_CYC.load(Relaxed) != 0 {
@@ -15023,7 +15054,7 @@ fn dropwake_glass_note(x: usize, y: usize, w: usize, h: usize) {
 ///   ([`crate::pal::release_edge_in_ring`] / [`crate::pal::release_edge_pending`]).
 /// * `sprite-vac` — the cursor sprite's live box sits on the vacated slivers: the ghost could be a
 ///   sprite save-under.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")]
 fn dropres_audit(win: WinId) {
     use core::sync::atomic::Ordering::Relaxed;
     if DW_LOG.fetch_add(1, Relaxed) >= DW_LOG_MAX {
@@ -15044,8 +15075,21 @@ fn dropres_audit(win: WinId) {
                 .any(|&b| b.2 != 0 && b.3 != 0 && boxes_overlap(b, vac));
         }
     }
+    // ARCH-PARITY (rmbp-7) — TWO TERMS, TWO DISPATCHES, NOT A GATE ON THE AUDIT. Neither of the
+    // mechanisms these read belongs to this witness: `COMP_PENDING` is the composite gate's
+    // wakeup word and `DO_BOX` is WC-K3's dragged-window box, and each carries whatever gate its
+    // OWN family carries. So the audit follows them rather than asserting a gate of its own —
+    // where the mechanism is built the term reports it, and where it is not the term is a
+    // constant `false` and the line simply never names it. Both arms will collapse to one the
+    // day those two families port; neither is this lane's to move.
+    #[cfg(target_arch = "x86_64")]
     let comppend = COMP_PENDING.load(core::sync::atomic::Ordering::Acquire);
+    #[cfg(not(target_arch = "x86_64"))]
+    let comppend = false;
+    #[cfg(target_arch = "x86_64")]
     let dragocc = DO_BOX[2].load(Relaxed) != 0;
+    #[cfg(not(target_arch = "x86_64"))]
+    let dragocc = false;
     let ring = crate::pal::release_edge_in_ring() > 0;
     let pend = crate::pal::release_edge_pending() > 0;
     let sprite = vac.2 != 0
@@ -15563,7 +15607,7 @@ fn drag_note_move(
     // DROPWAKE — this motion's erase slivers are the box the drop will be timed against. Clear the
     // glass stamp FIRST (the previous motion's fill no longer answers for this one), then the union,
     // then publish `DW_DMG_CYC` LAST so a reader that sees the stamp sees the box it covers.
-    #[cfg(target_arch = "x86_64")]
+    // ARCH-PARITY (rmbp-7) — no term: the cells stamped here ride this function's `witness`.
     {
         DW_GLASS_CYC.store(0, Relaxed);
         DW_COMP_CYC.store(0, Relaxed);
@@ -15899,7 +15943,7 @@ pub fn drag_begin(id: WinId, x: i32, y: i32) -> bool {
         DRAG_FLASH_PX.store(0, Ordering::Relaxed);
         // DROPWAKE — a superseding begin invalidates the previous drop's trace: whatever it was
         // waiting for now belongs to a gesture that no longer describes the panel.
-        #[cfg(target_arch = "x86_64")]
+        // ARCH-PARITY (rmbp-7) — no term: these cells ride the enclosing `witness` block.
         {
             DW_ARMED.store(WIN_NONE, Ordering::Relaxed);
             DW_DMG_CYC.store(0, Ordering::Relaxed);
@@ -16176,7 +16220,7 @@ pub fn drag_end() -> WinId {
         drag_report(id, owner, "placed", n);
         // DROPWAKE — start the drop clock, after the gesture report so the pair reads
         // budget-then-drop in a capture.
-        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+        #[cfg(feature = "witness")]
         dropwake_arm(id);
     }
     id
@@ -16204,7 +16248,7 @@ pub fn drag_cancel(why: &str) {
         drag_report(id, owner, why, n);
         // DROPWAKE — a cancelled drop ghosts exactly like a placed one, and most of the bench's
         // real releases end here, so the drop clock starts on this arm too.
-        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+        #[cfg(feature = "witness")]
         dropwake_arm(id);
         #[cfg(not(feature = "witness"))]
         let _ = n;
@@ -17624,8 +17668,9 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
             fb.flush_rect(x, y0, w, y1 - y0);
             // DROPWAKE — the glass stamp: this flush is the moment a drained fill becomes panel
             // pixels, so if it covers the drop's vacated slivers the drop is resolved here.
-            // `drain_deferred` is arch-neutral, so the hook carries the full witness+x86 gate.
-            #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+            // ARCH-PARITY (rmbp-7): `drain_deferred` is compiled everywhere and so is the hook
+            // now — `witness` and nothing else, matching the cells it stamps.
+            #[cfg(feature = "witness")]
             dropwake_glass_note(x, y0, w, y1 - y0);
         }
         damage_intersecting(x, y, w, h);
