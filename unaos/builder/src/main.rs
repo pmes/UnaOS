@@ -93,6 +93,18 @@ fn main() {
     // UNAOS_BOTCBWIOC is DELETED (2026-07-30): the CBW is awaited as its own stage in every build,
     // unconditionally, and no media can be produced with it off (usb_xhci.md §17).
     if std::env::var("UNAOS_BOTRING64").is_ok() { feats.push("botring64"); }
+    // BOT-PARK: UNAOS_BOTWEDGE=1 injects a SYNTHETIC transport wedge on the storage slot once its
+    // first 24 transactions have completed — every later BOT attempt fails `Timeout` with nothing
+    // put on the wire. It exists because QEMU's usb-storage cannot wedge, so the retry ladder's
+    // global floor (escalating back-off, the per-device retry budget, the park) is otherwise
+    // walkable only on metal. Under it a boot reaches `:: BOT: PARKED … ::` and STOPS retrying,
+    // which is the arc's whole claim. MAPPED HERE AS WELL AS IN `arroyo` for the reason BOTRING64
+    // gives two knobs above, and it is not academic here: `arroyo test` compiles the booted x86
+    // kernel THROUGH this builder, so while this line was missing `UNAOS_BOTWEDGE=1` armed nothing
+    // and no run could reach the PARKED line the knob exists to produce.
+    // TEST ONLY, never on media: it makes storage permanently unusable by design. Default OFF =>
+    // fully cfg-compiled out and the artifact is byte-identical.
+    if std::env::var("UNAOS_BOTWEDGE").is_ok() { feats.push("botwedge"); }
     // GR17 pay-as-you-go wc-g battery (video/wcg.rs): lattice-sampled first pass + deferred full
     // passes, x86-only paths, default OFF => byte-identical. Mapped here as well as in `arroyo`
     // for the same reason as BOTRING64 above: a knob arroyo alone sets never reaches boot media.

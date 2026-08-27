@@ -354,7 +354,9 @@ botring64 = []
 # the whole claim of the arc.
 # ATTENDED/TEST ONLY: never enable on boot media — it makes storage permanently unusable by design.
 # Default OFF => fully cfg-compiled out and the artifact is byte-identical. Enable via
-# `UNAOS_BOTWEDGE=1`.
+# `UNAOS_BOTWEDGE=1`. Kept in sync with arroyo AND builder/src/main.rs — this knob shipped for a
+# while wired into arroyo alone, which is the failure mode BOTRING64's own note warns about: the
+# booted x86 kernel is compiled through the builder, so the knob armed nothing.
 botwedge = []
 # (`botcbwioc` lived here. DELETED 2026-07-30: awaiting the CBW as its own stage is now
 # unconditional — see usb_xhci.md §17 and the BOT-CBW block in drivers/xhci/mod.rs. It graduated
