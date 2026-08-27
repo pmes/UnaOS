@@ -2204,7 +2204,7 @@ pub fn close(id: WinId) -> bool {
     //
     // Ahead of the WEDGE token deliberately: the composites it may run are ordinary passes and must
     // not be threaded into the death chain the token opens.
-    #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+    #[cfg(all(feature = "witness", feature = "wcg-paygo"))]
     paygo_at_close(id);
     // WMDIRECT — the drag does not survive the window. Ahead of the row free (and of the WEDGE
     // token) so the gesture is cancelled while the id still means something; after this point the
@@ -3573,7 +3573,21 @@ pub fn service_damage() {
 /// live desktop; the taker pays it on a schedule whether or not the desktop is live, so any BPACE tag
 /// landing after 15 s absorbs it. `storage ~11.4 s` and the `gui ~3408` band complete before the
 /// threshold and are unaffected.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+///
+/// ### ARCH-PARITY (rmbp-7) — BUILT EVERYWHERE THE KNOB IS; REACHED WHERE THE HOOK IS
+///
+/// The arch term is gone from this function and from the whole battery behind it. What has NOT
+/// moved is the HOOK: `bootpace::service_dump` calls this under its own `#[cfg(target_arch)]`, in
+/// `bootpace.rs`, which is not this file's lane. So the taker now type-checks and links on every
+/// build carrying `witness` + `wcg-paygo`, and still RUNS only where that hook is compiled in.
+///
+/// Stated rather than left to be discovered, because the two facts read differently: a battery that
+/// is owed and never taken is not the same as one that is not built. Where the hook is absent the
+/// deferral still closes — [`paygo_at_close`] settles it at teardown with an honest `-> UNSPENT`,
+/// which is Boot V's failure mode answered, just without the 4 Hz rescue in between. Opening that
+/// hook is a one-line edit in `bootpace.rs` and belongs to whoever owns that file; nothing here has
+/// to change when it lands, and [`paygo_svc_progress`]'s note says which gate must go with it.
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 pub fn paygo_service() {
     // Rate gate first: this runs on a ~1 ms lane and the scan below takes the table lock.
     let now = crate::arch::now_cycles();
@@ -3612,7 +3626,7 @@ pub fn paygo_service() {
 /// PAYGO-TERM — one service pass, run with [`PAYGO_SVC_BUSY`] held. Split out of [`paygo_service`] so
 /// the flag has exactly one release site: every early return below is a return from HERE, and the
 /// caller's release runs on all of them.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 fn paygo_service_pass() {
     // Nothing is payable before the threshold, whatever the table holds. One shared read, from the
     // same definition the two gates defer on.
@@ -3785,6 +3799,17 @@ fn paygo_service_pass() {
             }
             // NOATT — the attribution half of the discriminator, counted at the ONE site that makes
             // this class of mark. See the ledger above [`NOATT_SEQ`].
+            //
+            // ARCH-PARITY (rmbp-7) — the gate is the NOATT WIRE's, not the taker's, and it travels
+            // with the counter rather than with this function. The whole `[wcn]` no-attach
+            // discriminator — `NOATT_SEQ`, `NOATT_SEEN`, `NOATT_PASSES`, `NOATT_SEEDS`,
+            // `NOATT_ROWS`, `NOATT_KPX`, `NOATT_TAKER` and the rollup that divides them — carries
+            // `all(feature = "witness", target_arch = "x86_64")` by its own ledger above
+            // [`NOATT_SEQ`], and none of that is paygo. Where the counter is not built there is
+            // nothing to attribute a mark to, and bumping a cell no rollup reads would be a
+            // measurement with no reader. Porting the NOATT wire is its own item; this call follows
+            // the wire the day it moves and needs no edit here.
+            #[cfg(target_arch = "x86_64")]
             noatt_note_taker();
             marked = Some(r.id);
             break;
@@ -3825,20 +3850,20 @@ fn paygo_service_pass() {
 ///
 /// Not tied to `wcg::CENSUS_PERIOD_US`: that one paces a PRINT, this one paces WORK, and pinning them
 /// together would make either number un-tunable without moving the other.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 const PAYGO_SVC_PERIOD_US: u64 = 250_000;
 
 /// PAYGO-TERM — the taker's own liveness bound. See the note at the `fetch_add` that reads it.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 const PAYGO_SVC_MAX: u32 = 16;
 
 /// PAYGO-TERM — `now_cycles()` as of the END of the last taken pass; `0` = never. The rate gate.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 static PAYGO_SVC_LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// PAYGO-TERM — a take is running RIGHT NOW. The taker's mutual exclusion; see the pacing note on
 /// [`paygo_service`] for why the rate gate could not serve as one.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 static PAYGO_SVC_BUSY: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -3851,7 +3876,7 @@ static PAYGO_SVC_BUSY: core::sync::atomic::AtomicBool =
 /// the count, and after ~16 cumulative ripe passes across the slot's life the taker was capped for
 /// every future tenant of it — capped SILENTLY, because [`PAYGO_SVC_NOTED`]'s one-shot had been spent
 /// by an earlier tenant. Re-armed where the id demonstrably names a new window, beside the batteries.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 static PAYGO_SVC_TRIES: [core::sync::atomic::AtomicU32; WCD_IDS] =
     [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
 
@@ -3860,6 +3885,25 @@ static PAYGO_SVC_TRIES: [core::sync::atomic::AtomicU32; WCD_IDS] =
 /// purpose), and a wc-g sample that now takes the console box in hundreds of chunks would exhaust a
 /// fixed cap of 16 while doing exactly what it was asked to. Called by `wcg::end` when a clean
 /// chunk banks and advances its cursor; the counter lives here beside the taker that reads it.
+///
+/// ARCH-PARITY (rmbp-7) — THE ONE PAYGO SYMBOL IN THIS FILE THAT KEEPS ITS ARCH TERM, and the
+/// keep is STRUCTURAL: it is pinned by its caller, not by this body.
+///
+/// This function has exactly one call site, `wcg::end`'s silent-clean-chunk arm
+/// (`video/wcg.rs`, at the `WCG_CUR` advance), and that call carries its own
+/// `#[cfg(target_arch = "x86_64")]` — placed there by the WCG lane with the reason written at it.
+/// `wcg.rs` is a different lane's file and read-only from here, so this gate cannot move on its
+/// own: dropping it would leave a symbol whose only caller is still gated, i.e. exactly the
+/// dead-code marker this arc exists to clear, pointing the other way.
+///
+/// The consequence is bounded and worth stating plainly, because it is the thing to re-check when
+/// the pair does move. What this clears is [`PAYGO_SVC_TRIES`], the liveness bound of
+/// [`paygo_service_pass`]. That taker is now built wherever the knob is, but it is REACHED only
+/// through `bootpace::service_dump`, whose `wm::paygo_service()` call is itself arch-gated in
+/// `bootpace.rs` — another lane again. So there is today no build in which the taker runs and this
+/// re-arm is missing, and the counter it would clear is never incremented there either. The two
+/// gates — this one and `wcg.rs`'s — must drop in the same change as `bootpace.rs`'s, and the
+/// order matters: the hook first, or the taker gains a cap it cannot have re-armed.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
 pub(super) fn paygo_svc_progress(i: usize) {
     if i < WCD_IDS {
@@ -3876,12 +3920,12 @@ pub(super) fn paygo_svc_progress(i: usize) {
 ///
 /// Per TENANT, cleared in `create_inner` with [`PAYGO_SVC_TRIES`]: the budget the note reports on is
 /// re-armed there, so a note left standing would make the next tenant's own give-up silent.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 static PAYGO_SVC_NOTED: [core::sync::atomic::AtomicU32; WCD_IDS] =
     [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
 
-/// Knob off, or not x86: there is no deferral, so there is nothing to take. Folds away entirely.
-#[cfg(not(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo")))]
+/// Knob off: there is no deferral, so there is nothing to take. Folds away entirely.
+#[cfg(not(all(feature = "witness", feature = "wcg-paygo")))]
 #[inline]
 pub fn paygo_service() {}
 
@@ -6122,11 +6166,17 @@ fn verify_window(
     let info = fb.info();
     let VerifyRef { row0, row1, cols, banded, cksum_pre, want, step, running,
         #[cfg(target_arch = "x86_64")] seq,
+        // ARCH-PARITY (rmbp-7) — the arch term is KEPT here: this is the read-back CHUNKING, not the
+        // battery. See the ledger at `let chunked` in [`verify_window`] for what the interlock buys and
+        // why deleting the term would bank partial verdicts with the protection removed.
         #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))] full_rows } = vr;
     let wi = r.id as usize;
     // WCD-CHUNK — the chunk's gate-held wall clock opens here, before the first probe, so
     // `hold_max_us=` on the terminal line bounds everything a launch-instant present paid for this
     // witness: both read-back passes plus the attribution walks between them.
+    // ARCH-PARITY (rmbp-7) — the arch term is KEPT here: this is the read-back CHUNKING, not the
+    // battery. See the ledger at `let chunked` in [`verify_window`] for what the interlock buys and
+    // why deleting the term would bank partial verdicts with the protection removed.
     #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
     let t_chunk0 = crate::arch::now_cycles();
     // GR21/WCD-OCC — the occluder set as of the READ-BACK (post-blit). PARITY §6.2: both arches.
@@ -6222,9 +6272,13 @@ fn verify_window(
     // WCD-CHUNK — `r1` is the one-past-last row THIS invocation may walk, and `bounded` arms the
     // time stop. The first read-back runs bounded and reports how far it actually got (`rows_done`);
     // the second re-walks EXACTLY those rows unbounded, so the two passes always adjudicate the same
-    // rect. On every build without the chunking (aarch64, x86 without `wcg-paygo`) `bounded` is dead
-    // and `rows_done == r1` by construction — the closure is the old whole-range walk, byte for byte.
+    // rect. On every build without the chunking — the knob off, or no panel-write interlock to bank a
+    // partial verdict against — `bounded` is dead and `rows_done == r1` by construction, so the
+    // closure is the old whole-range walk, byte for byte.
     let pass = |fb: &super::FrameBuffer, r1: usize, bounded: bool| {
+        // ARCH-PARITY (rmbp-7) — the arch term is KEPT here: this is the read-back CHUNKING, not the
+        // battery. See the ledger at `let chunked` in [`verify_window`] for what the interlock buys and
+        // why deleting the term would bank partial verdicts with the protection removed.
         #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
         let t_pass0 = crate::arch::now_cycles();
         #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
@@ -6257,6 +6311,9 @@ fn verify_window(
             // a chunk stops after a row or two; under QEMU the same probes are RAM reads and one
             // chunk closes a whole box — so the gates never wait on the drip and the bench never
             // holds `COMP_GATE` past [`WCD_CHUNK_US`] per pass.
+            // ARCH-PARITY (rmbp-7) — the arch term is KEPT here: this is the read-back CHUNKING, not the
+            // battery. See the ledger at `let chunked` in [`verify_window`] for what the interlock buys and
+            // why deleting the term would bank partial verdicts with the protection removed.
             #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
             if bounded
                 && row > row0
@@ -6360,6 +6417,34 @@ fn verify_window(
     // 15 s of uptime, or a `paygo_service` whole-box mark / pay-at-close forces it earlier. That is
     // the price of not holding `COMP_GATE` for a third of a second; it is the same deferral WC-D's
     // stage split already accepted for the FULL verdict, now extended to the top-of-box rows too.
+    // ### ARCH-PARITY (rmbp-7) — THE CHUNKING KEEPS ITS ARCH TERM. THE LEDGER FOR THE WHOLE FAMILY.
+    //
+    // The `wcg-paygo` BATTERY — the deferral gate, the two-stage FIRST/FULL state machine, the
+    // `[wc-d] paygo` census, the terminal, the service-pass taker and pay-at-close — lost its arch
+    // term in this arc and is now `feature = "wcg-paygo"` everywhere the knob is named. The READ-BACK
+    // CHUNKING did not, and the reason is a protection boundary rather than a scoping convenience.
+    //
+    // A chunk is a PARTIAL verdict banked and handed back mid-box. Banking one honestly requires
+    // knowing that nothing wrote the panel under the probe between the reference snapshot and the
+    // chunk's last row — otherwise a foreign write is folded into `WCD_ACC_*` and the closing chunk
+    // reports the whole box as clean on the strength of rows that were never adjudicated. That
+    // question is answered by exactly one instrument: the WCD-TEARDOWN panel-write interlock
+    // (`panel_seq`, `panel_seq_close`, `panel_stable`, `wcd_release`), which is
+    // `all(feature = "witness", target_arch = "x86_64")` and is NOT a paygo item. The accumulator
+    // below consumes its `stable` verdict directly and hands the reference back through
+    // `wcd_release`; neither has a counterpart to fall back on. Removing the arch term here would
+    // not port the chunking, it would bank partial verdicts with the interlock deleted — which is
+    // the "workaround that weakens a protection" shape, not a parity fix.
+    //
+    // What the knob therefore buys where the interlock is absent: the full battery, with stage 2
+    // walking the box in ONE pass. `chunked` is false, so no time stop, no cursor, no accumulator —
+    // `WCD_CUR` stays 0 for the row's life and `wcd_commit`'s `step == 1 && full` arm fires
+    // `wcd_complete` at the end of stage 2, so the `-> PAID` terminal still speaks once per battery.
+    // The taker's PAYGOBAND banded mark reads the same `WCD_CUR`, finds 0, and takes its whole-box
+    // arm — the pre-PAYGOBAND behaviour, which is the conservative direction by construction.
+    //
+    // Porting the interlock is its own item and its own lane. The day it lands, every gate in this
+    // family drops its arch term together and nothing else here has to move.
     #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
     let chunked = running == WCD_ST_FULL_RUN;
     #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
@@ -6447,8 +6532,8 @@ fn verify_window(
     let _ = (firstmv_cache, firstmv_ram);
     let band = BandFmt(if banded { Some((row0, row1)) } else { None });
     // WC-D/PAYGO — `checked` is the honest denominator and always was, but a denominator does not say WHY
-    // it is small. This does, positionally, right beside the count it qualifies. Empty on every build but
-    // an x86 `wcg-paygo` one, so the three lines below stay byte-identical elsewhere.
+    // it is small. This does, positionally, right beside the count it qualifies. Empty on every build
+    // without the `wcg-paygo` knob, so the three lines below stay byte-identical elsewhere.
     // WCD-CLIP1 — `clipped` is part of the derivation now: a collapsed lattice (`step == 1`) whose
     // walk the stop CUT did not reach full coverage, so it must not print `coverage=full`. See
     // [`wcd_coverage_note`].
@@ -6573,9 +6658,13 @@ fn verify_window(
     // above) keeps today's immediate shape: it prints chunk-local, `band=` naming the rows it
     // actually walked, and closes the battery the way one bad verdict always has.
     //
-    // No repair redraw on the silent path, deliberately: the redraw below exists to restore what the
-    // aarch64 `IVAC` may have dropped, and the chunking (this whole block) compiles only on x86,
-    // where there is no invalidate to repair after. The closing chunk still runs it, as today.
+    // No repair redraw on the silent path, deliberately: the redraw below exists to restore what a
+    // cache-maintenance `IVAC` may have dropped, and that is a repair only the builds WITHOUT this
+    // block ever need — the chunking compiles exactly where the panel-write interlock does, and
+    // there is no invalidate to repair after there. The closing chunk still runs it, as today.
+    // ARCH-PARITY (rmbp-7) — the arch term is KEPT here: this is the read-back CHUNKING, not the
+    // battery. See the ledger at `let chunked` in [`verify_window`] for what the interlock buys and
+    // why deleting the term would bank partial verdicts with the protection removed.
     #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
     let (checked, nonzero, occluded, sprite_px, moved, live, stable, band) = if !chunked {
         (checked, nonzero, occluded, sprite_px, moved, live, stable, band)
@@ -6727,7 +6816,7 @@ fn verify_window(
     // reads. After the print, so a `[wc-a]`-ordering reader sees verdict-then-transition.
     let full = !(clipped && running == WCD_ST_FIRST_RUN && step == 1);
     wcd_commit(wi, running, step, full);
-    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    #[cfg(feature = "wcg-paygo")]
     if step == 1 && full {
         wcd_complete(r.id, wi);
     }
@@ -6788,7 +6877,7 @@ struct VerifyRef {
     /// the reference.
     want: alloc::vec::Vec<u32>,
     /// WC-D/PAYGO — the SOURCE-column stride this verdict's read-back walks at, and the one the `coverage=`
-    /// marker is derived from. Always 1 (full coverage) on aarch64 and on any x86 build without the
+    /// marker is derived from. Always 1 (full coverage) on any build without the
     /// `wcg-paygo` knob, which is what makes the lattice arithmetic in [`verify_window`] fold away to the
     /// `for col in 0..cols` loop it has always been. Carried in the reference rather than recomputed at the
     /// read-back so the walk and its marker cannot disagree — the same rule `wcg` applies to `PAYGO_STEP`.
@@ -6798,12 +6887,16 @@ struct VerifyRef {
     running: u32,
     /// WCD-TEARDOWN — both panel-write detectors as of the instant the blit was about to run.
     /// Compared against a closing read after the last probe; see [`PANEL_DESK_EPOCH`]. x86 only —
-    /// aarch64 has no interlock at all (the arch gate is a protection boundary; see WCD-TEARDOWN).
+    /// nowhere else is there an interlock at all, so there is nothing for this field to carry (the
+    /// arch gate is a protection boundary, not a scoping convenience; see WCD-TEARDOWN).
     #[cfg(target_arch = "x86_64")]
     seq: PanelSeq,
     /// WCD-CHUNK — the box's whole visible row extent at admission, so the read-back can tell "this
     /// chunk closed the BOX" (the cursor reached this) from "this chunk closed its band". Chunking
     /// exists only where the deferral policy does.
+    // ARCH-PARITY (rmbp-7) — the arch term is KEPT here: this is the read-back CHUNKING, not the
+    // battery. See the ledger at `let chunked` in [`verify_window`] for what the interlock buys and
+    // why deleting the term would bank partial verdicts with the protection removed.
     #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
     full_rows: usize,
 }
@@ -7157,8 +7250,8 @@ fn verify_reference(
         return None;
     }
     // WC-D — which verdict does this window still owe, and may it be taken NOW? `step` is the
-    // SOURCE-column stride the admitted pass runs at (`1` is full coverage, and the only answer any
-    // build but an x86 `wcg-paygo` one ever gives) and `running` is the state token the commit or the
+    // SOURCE-column stride the admitted pass runs at (`1` is full coverage, and the only answer a
+    // build without the `wcg-paygo` knob ever gives) and `running` is the state token the commit or the
     // release owes its transition to. `None` declines — battery closed, another core already holds
     // the ONE reference, or (PAYGO) the deferral gate is shut, in which case the decline has already
     // been counted and, on cadence, printed. See [`WCD_STATE`].
@@ -7252,6 +7345,9 @@ fn verify_reference(
     // 128x128 window; a panel-scale window's stage-1 lattice verdict is 300-760 ms under
     // `COMP_GATE`, paid on every window create and every dock reopen, and was Boot B's 20x
     // "panel bandwidth collapse" in `[comp2]`.
+    // ARCH-PARITY (rmbp-7) — the arch term is KEPT here: this is the read-back CHUNKING, not the
+    // battery. See the ledger at `let chunked` in [`verify_window`] for what the interlock buys and
+    // why deleting the term would bank partial verdicts with the protection removed.
     #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
     let (row0, row1, banded) = if running != WCD_ST_FULL_RUN {
         (row0, row1, banded)
@@ -7399,6 +7495,9 @@ fn verify_reference(
     // `cksum` and not `cksum_pre`), and the teardown abort prints neither. `row1 == rows` is the
     // closing chunk's ask, so a skipped checksum is a checksum no format string can reach. Stage 1
     // and every unchunked build take it as before, byte-identical.
+    // ARCH-PARITY (rmbp-7) — the arch term is KEPT here: this is the read-back CHUNKING, not the
+    // battery. See the ledger at `let chunked` in [`verify_window`] for what the interlock buys and
+    // why deleting the term would bank partial verdicts with the protection removed.
     #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
     let cksum_pre = if running == WCD_ST_FULL_RUN && row1 < rows {
         0
@@ -7419,6 +7518,9 @@ fn verify_reference(
     // unchanged — the loop takes it immediately before calling this function.
     Some(VerifyRef { row0, row1, cols, banded, cksum_pre, want, step, running,
         #[cfg(target_arch = "x86_64")] seq,
+        // ARCH-PARITY (rmbp-7) — the arch term is KEPT here: this is the read-back CHUNKING, not the
+        // battery. See the ledger at `let chunked` in [`verify_window`] for what the interlock buys and
+        // why deleting the term would bank partial verdicts with the protection removed.
         #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))] full_rows: rows })
 }
 
@@ -7451,7 +7553,7 @@ fn yn(b: bool) -> &'static str {
 /// PASS, FAIL, LIVE, or `-> SKIP` with a reason. A future early return added without a line would burn the
 /// latch silently and leave the spec's REQUIRE failing with nothing to explain why.
 ///
-/// WC-D/PAYGO splits what this latch means on an x86 `wcg-paygo` build: it becomes the FIRST
+/// WC-D/PAYGO splits what this latch means on a `wcg-paygo` build: it becomes the FIRST
 /// verdict's latch, and [`VERIFIED_FULL`] becomes the terminal one. On every other build there is
 /// one verdict and this is still it.
 #[cfg(feature = "witness")]
@@ -7847,7 +7949,7 @@ const WCD_ABORT_MAX: u32 = 6;
 /// is a global one-shot, so it still fires on the first window to reach it, unmoved — with the
 /// consequence, stated because it is a real narrowing, that the direct-path present it forces is now
 /// verified at lattice coverage rather than in full.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 static VERIFIED_FULL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// WC-D — per-id state width for every per-window array in this witness. The same 32 [`VERIFIED`]'s
@@ -7871,10 +7973,10 @@ const _: () = assert!(WCD_IDS == 32, "WCD_IDS must match verify_reference's `id 
 /// policy under one knob should not be two constants. Pinned to the `coverage=lattice16` literal at
 /// compile time — a marker whose wire says something its code does not do is the exact class of
 /// instrument this file keeps convicting.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 const WCD_LATTICE_N: usize = super::wcg::PAYGO_LATTICE_N;
 
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 const _: () = assert!(
     WCD_LATTICE_N == 16,
     "the `coverage=lattice16` literal must track wcg::PAYGO_LATTICE_N"
@@ -7890,7 +7992,7 @@ const _: () = assert!(
 /// occupies three, five never-spendable ones holding the gate permanently open for every window — and
 /// the fix was to close it per window. Nothing here can be wrong in that way because there is nothing
 /// here that reads across ids.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 static WCD_DEFERRED: [core::sync::atomic::AtomicU32; WCD_IDS] =
     [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
 
@@ -7898,7 +8000,7 @@ static WCD_DEFERRED: [core::sync::atomic::AtomicU32; WCD_IDS] =
 /// one-based. The reader's rule is `wcg`'s standing one: for any `win=`, the greatest `emit=`
 /// supersedes every earlier line, and these lines are never summed — they are snapshots of a monotone
 /// total, not deltas.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 static WCD_EMIT: [core::sync::atomic::AtomicU32; WCD_IDS] =
     [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
 
@@ -7911,7 +8013,7 @@ static WCD_EMIT: [core::sync::atomic::AtomicU32; WCD_IDS] =
 /// ~1.9 h of machine uptime — which could hand the gate a small reading and silently swallow the line
 /// that opens the census. `wcg::paygo_flush` never meets this because its first line comes off
 /// `PAYGO_PEND` rather than off the cadence; this is the same guarantee reached from the other end.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 static WCD_SAID: [core::sync::atomic::AtomicU32; WCD_IDS] =
     [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
 
@@ -7920,7 +8022,7 @@ static WCD_SAID: [core::sync::atomic::AtomicU32; WCD_IDS] =
 /// module: two cores declining the same window at once both observe this value, and only the one
 /// whose `compare_exchange` succeeds prints. Re-armed after the serial write, so
 /// `wcg::CENSUS_PERIOD_US` bounds the duty cycle and not merely the gap between line starts.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 static WCD_LASTROLL: [core::sync::atomic::AtomicU64; WCD_IDS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; WCD_IDS];
 
@@ -7953,6 +8055,9 @@ static WCD_LASTROLL: [core::sync::atomic::AtomicU64; WCD_IDS] =
 /// always has. 2 000 us: an eighth of a 60 Hz frame per pass, twice per chunk (plus one source
 /// row's overshoot — the stop is checked between rows), so a launch-instant present pays ~4-10 ms
 /// of witness instead of ~1.26 s, and the `[rtwit]` tail stops being a picture of this instrument.
+// ARCH-PARITY (rmbp-7) — the arch term is KEPT here: this is the read-back CHUNKING, not the
+// battery. See the ledger at `let chunked` in [`verify_window`] for what the interlock buys and
+// why deleting the term would bank partial verdicts with the protection removed.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
 const WCD_CHUNK_US: u64 = 2_000;
 
@@ -7960,13 +8065,13 @@ const WCD_CHUNK_US: u64 = 2_000;
 /// bounds the `want` copy that precedes it (see the cap note in [`verify_reference`]) and, on hosts
 /// where probes are RAM-fast and the time stop never fires (QEMU), it is what sets the chunk size:
 /// a 736-row console closes in a dozen takes instead of one, each still a bounded hold.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 const WCD_CHUNK_ROWS_MAX: usize = 64;
 
 /// WCD-CHUNK — per-id: the next SOURCE row the running stage's read-back resumes at. Advanced only
 /// by a clean banked chunk; an aborted or declined chunk re-walks the same rows. Reset by the
 /// stage-1 -> stage-2 transition in [`wcd_commit`] and by the recycle in `create_inner`.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 static WCD_CUR: [core::sync::atomic::AtomicU32; WCD_IDS] =
     [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
 
@@ -7982,10 +8087,10 @@ static WCD_CUR: [core::sync::atomic::AtomicU32; WCD_IDS] =
 /// bounded by [`WCD_CHUNK_ROWS_MAX`] x `cols` x 4 bytes (~336 KB worst case, tens of microseconds),
 /// two orders below the number this field exists to falsify; it is excluded because the same
 /// snapshot cost is paid by UNCHUNKED verdicts too and folding it in would blur what shrank.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 static WCD_CHUNKS: [core::sync::atomic::AtomicU32; WCD_IDS] =
     [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 static WCD_HOLD_MAX_US: [core::sync::atomic::AtomicU64; WCD_IDS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; WCD_IDS];
 
@@ -7995,24 +8100,42 @@ static WCD_HOLD_MAX_US: [core::sync::atomic::AtomicU64; WCD_IDS] =
 /// AND for the PASS line's `stable=`: any chunk whose interlock read unstable makes the cumulative
 /// line say so. Single-writer by construction (one outstanding reference per id), so `Relaxed`
 /// throughout; reset by the first chunk of each stage (cursor at 0).
+// ARCH-PARITY (rmbp-7) — the arch term is KEPT here: this is the read-back CHUNKING, not the
+// battery. See the ledger at `let chunked` in [`verify_window`] for what the interlock buys and
+// why deleting the term would bank partial verdicts with the protection removed.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
 static WCD_ACC_CHECKED: [core::sync::atomic::AtomicU32; WCD_IDS] =
     [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+// ARCH-PARITY (rmbp-7) — the arch term is KEPT here: this is the read-back CHUNKING, not the
+// battery. See the ledger at `let chunked` in [`verify_window`] for what the interlock buys and
+// why deleting the term would bank partial verdicts with the protection removed.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
 static WCD_ACC_NONZERO: [core::sync::atomic::AtomicU32; WCD_IDS] =
     [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+// ARCH-PARITY (rmbp-7) — the arch term is KEPT here: this is the read-back CHUNKING, not the
+// battery. See the ledger at `let chunked` in [`verify_window`] for what the interlock buys and
+// why deleting the term would bank partial verdicts with the protection removed.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
 static WCD_ACC_OCC: [core::sync::atomic::AtomicU32; WCD_IDS] =
     [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+// ARCH-PARITY (rmbp-7) — the arch term is KEPT here: this is the read-back CHUNKING, not the
+// battery. See the ledger at `let chunked` in [`verify_window`] for what the interlock buys and
+// why deleting the term would bank partial verdicts with the protection removed.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
 static WCD_ACC_SPRITE: [core::sync::atomic::AtomicU32; WCD_IDS] =
     [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
 /// WCD-CHUNK (review N3) — `moved` accumulates too, because a moved-under chunk CONTINUES instead
 /// of closing: the closing chunk speaks LIVE iff this is nonzero, so a busy surface still gets its
 /// whole box walked and one line, not a whole-box verdict off two rows or a hundred LIVE lines.
+// ARCH-PARITY (rmbp-7) — the arch term is KEPT here: this is the read-back CHUNKING, not the
+// battery. See the ledger at `let chunked` in [`verify_window`] for what the interlock buys and
+// why deleting the term would bank partial verdicts with the protection removed.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
 static WCD_ACC_MOVED: [core::sync::atomic::AtomicU32; WCD_IDS] =
     [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+// ARCH-PARITY (rmbp-7) — the arch term is KEPT here: this is the read-back CHUNKING, not the
+// battery. See the ledger at `let chunked` in [`verify_window`] for what the interlock buys and
+// why deleting the term would bank partial verdicts with the protection removed.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
 static WCD_ACC_UNSTABLE: [core::sync::atomic::AtomicU32; WCD_IDS] =
     [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
@@ -8053,10 +8176,10 @@ const WCD_ST_FIRST: u32 = 0;
 const WCD_ST_FIRST_RUN: u32 = 1;
 /// Resting: the first verdict is published and the FULL one is owed. PAYGO builds only — a
 /// single-verdict build goes `FIRST_RUN` straight to `DONE`.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 const WCD_ST_FULL: u32 = 2;
 /// Running: a reference for the full verdict is outstanding.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 const WCD_ST_FULL_RUN: u32 = 3;
 /// Terminal: this window owes nothing.
 #[cfg(feature = "witness")]
@@ -8064,7 +8187,7 @@ const WCD_ST_DONE: u32 = 4;
 
 /// WC-D — how many verdicts this window has PUBLISHED, read off the one cell that knows. `taken=` on
 /// the wire. Recycle-safe because the recycle resets the same cell it reads.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 fn wcd_taken(i: usize) -> u32 {
     match WCD_STATE[i].load(core::sync::atomic::Ordering::Relaxed) {
         WCD_ST_FIRST | WCD_ST_FIRST_RUN => 0,
@@ -8083,7 +8206,7 @@ fn wcd_taken(i: usize) -> u32 {
 ///
 /// **The gate sits above everything the pass would spend.** A declined composite takes no reference,
 /// allocates no snapshot, touches no glass and moves no state.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 fn wcd_admit(id: u32, i: usize) -> Option<(usize, u32)> {
     loop {
         match WCD_STATE[i].load(core::sync::atomic::Ordering::Acquire) {
@@ -8152,7 +8275,7 @@ fn wcd_admit(id: u32, i: usize) -> Option<(usize, u32)> {
 /// Kept as a separate cell rather than read out of `wcg` because the two batteries have independent
 /// budgets (wc-d has two STAGES, wc-g four SAMPLES) and one can close while the other is still owed;
 /// a shared latch would make the first to finish disarm the second.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 static WCD_FORCE: [core::sync::atomic::AtomicU32; WCD_IDS] =
     [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
 
@@ -8169,7 +8292,7 @@ static WCD_FORCE: [core::sync::atomic::AtomicU32; WCD_IDS] =
 /// terminal: no DEFERRED, no PAID, no UNSPENT — the silent shape this module's own ledger forbids.
 /// `WCD_CUR != 0` is precisely "a chunk banked without closing", so the taker's whole-box mark now
 /// reaches every part-paid battery and drives its cursor home.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 fn wcd_pending(i: usize) -> bool {
     i < WCD_IDS
         && WCD_STATE[i].load(core::sync::atomic::Ordering::Acquire) == WCD_ST_FULL
@@ -8179,13 +8302,13 @@ fn wcd_pending(i: usize) -> bool {
 
 /// WC-D/PAYGO-TERM — owed AND payable now. Read from `wcg::paygo_clock`, the same one definition
 /// [`wcd_admit`] defers on, so the taker cannot mark a window the admit would then decline.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 fn wcd_ripe(i: usize) -> bool {
     wcd_pending(i) && super::wcg::paygo_clock().2
 }
 
 /// WC-D/PAYGO-TERM — arm/disarm the pay-at-close override. Paired by [`close`].
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 fn wcd_force(i: usize, on: bool) {
     if i < WCD_IDS {
         WCD_FORCE[i].store(u32::from(on), core::sync::atomic::Ordering::Relaxed);
@@ -8214,7 +8337,7 @@ fn wcd_force(i: usize, on: bool) {
 ///
 /// It is also the wc-d wire's "the terminal was the last word" state: [`wcd_decline`] reads it and
 /// declines to re-open the census behind a terminal, the way `wcg::PAYGO_CLOSED` does for wc-g.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 static PAYGO_CLOSE_SAID: [core::sync::atomic::AtomicU32; WCD_IDS] =
     [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
 
@@ -8223,7 +8346,7 @@ static PAYGO_CLOSE_SAID: [core::sync::atomic::AtomicU32; WCD_IDS] =
 /// `wcg` budgets four SAMPLES and `wc-d` two STAGES, and each pass spends at most one of each, so a
 /// window at Boot V's `taken=1` needs three passes; eight is that with headroom and a hard stop. It
 /// bounds a teardown path, which is the one place in this module an unbounded loop would be worst.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 const PAYGO_CLOSE_MAX: u32 = 8;
 
 /// PAYGO-TERM — PAY AT CLOSE, and the one case where it declines to pay.
@@ -8290,7 +8413,7 @@ const PAYGO_CLOSE_MAX: u32 = 8;
 /// at ~13.6–13.8 s and cost the boot nothing; no window closes with `state=waiting` as its last line,
 /// and the count of `[wc-a] close win=N` lines for a recycling slot equals the count of
 /// `paygo win=N state=closed` lines for it — one terminal per tenant, not one per slot.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 fn paygo_at_close(id: WinId) {
     let i = id as usize;
     if i >= WCD_IDS {
@@ -8384,7 +8507,7 @@ fn paygo_at_close(id: WinId) {
 }
 
 /// Knob off: one verdict per window at full coverage. Same one-reference guarantee, two states.
-#[cfg(all(feature = "witness", not(all(target_arch = "x86_64", feature = "wcg-paygo"))))]
+#[cfg(all(feature = "witness", not(feature = "wcg-paygo")))]
 #[inline]
 fn wcd_admit(_id: u32, i: usize) -> Option<(usize, u32)> {
     if wcd_cas(i, WCD_ST_FIRST, WCD_ST_FIRST_RUN) {
@@ -8427,7 +8550,7 @@ fn wcd_cas(i: usize, from: u32, to: u32) -> bool {
 fn wcd_commit(i: usize, running: u32, step: usize, full: bool) {
     let bit = 1u32 << i;
     VERIFIED.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
-    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    #[cfg(feature = "wcg-paygo")]
     {
         if step == 1 && full {
             VERIFIED_FULL.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
@@ -8442,7 +8565,7 @@ fn wcd_commit(i: usize, running: u32, step: usize, full: bool) {
         }
         let _ = running;
     }
-    #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
+    #[cfg(not(feature = "wcg-paygo"))]
     {
         // No chunking on this build, so no time stop and no clip: `full` is always true here.
         let _ = (running, step, full);
@@ -8460,7 +8583,7 @@ fn wcd_commit(i: usize, running: u32, step: usize, full: bool) {
 fn wcd_seal(i: usize) {
     let bit = 1u32 << i;
     VERIFIED.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
-    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    #[cfg(feature = "wcg-paygo")]
     VERIFIED_FULL.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
     WCD_STATE[i].store(WCD_ST_DONE, core::sync::atomic::Ordering::Release);
 }
@@ -8473,9 +8596,9 @@ fn wcd_seal(i: usize) {
 /// an interlock.
 #[cfg(feature = "witness")]
 fn wcd_unwind(i: usize, running: u32) {
-    #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+    #[cfg(feature = "wcg-paygo")]
     let resting = if running == WCD_ST_FULL_RUN { WCD_ST_FULL } else { WCD_ST_FIRST };
-    #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
+    #[cfg(not(feature = "wcg-paygo"))]
     let resting = {
         let _ = running;
         WCD_ST_FIRST
@@ -8506,7 +8629,7 @@ fn wcd_release(i: usize, running: u32) {
 ///
 /// A window that stops compositing stops refreshing, which is not a gap: its last line describes its
 /// last active state and `since_entry_ms=` says when that was.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 fn wcd_decline(id: u32, i: usize, since_ms: u64, clock: &'static str) {
     // THE TERMINAL IS THE LAST WORD on this wire too. Once [`paygo_at_close`] has shut this tenant's
     // wc-d half, nothing may print behind it at a higher `emit=` — the reader's supersession rule
@@ -8557,7 +8680,7 @@ fn wcd_decline(id: u32, i: usize, since_ms: u64, clock: &'static str) {
 /// REQUIRE ends at `-> PAID` — so a suffix is invisible to both existing consumers, where the
 /// first cut's insertion between `clock=` and `taken=` broke the analyzer's PAID accounting and
 /// would have false-fired its "DEFERRAL THAT NEVER PAID" WARN on the falsifier boot itself.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 fn wcd_paygo_note(
     id: u32,
     i: usize,
@@ -8610,7 +8733,7 @@ fn wcd_paygo_note(
 /// WC-D/PAYGO — the battery's terminal line, emitted beside the verdict that closed it so the
 /// `deferred=` census is read at the moment full coverage is claimed and not only at the moment the
 /// waiting began. `deferred=0` here says the gate never declined this window at all.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 fn wcd_complete(id: u32, i: usize) {
     let (since_ms, clock, _) = super::wcg::paygo_clock();
     // WCD-CHUNK — the falsifier rides the terminal: how many chunks the battery took and the worst
@@ -8622,7 +8745,7 @@ fn wcd_complete(id: u32, i: usize) {
 
 /// WC-D/PAYGO — the `coverage=` marker, inserted between `checked=` and `bad_cache=`: an INSERTION,
 /// which leaves the pi4 gate's `.*` spans and its `-> PASS` / `-> FAIL` terminals matching exactly
-/// what they matched before. The empty string on every build but an x86 `wcg-paygo` one, so those
+/// what they matched before. The empty string on every build without the `wcg-paygo` knob, so those
 /// lines stay byte-identical.
 ///
 /// Derived from the step the walk ACTUALLY used, never from the step that was asked for — see
@@ -8638,7 +8761,7 @@ fn wcd_complete(id: u32, i: usize) {
 /// but the type system allows it and an honest marker costs one branch. A lattice pass (`step > 1`)
 /// that clips keeps `coverage=lattice16`: it was already partial-by-design and `band=` carries the
 /// row extent, so nothing there misreports.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
+#[cfg(all(feature = "witness", feature = "wcg-paygo"))]
 #[inline]
 fn wcd_coverage_note(step: usize, clipped: bool) -> &'static str {
     if step > 1 {
@@ -8650,7 +8773,7 @@ fn wcd_coverage_note(step: usize, clipped: bool) -> &'static str {
     }
 }
 
-#[cfg(all(feature = "witness", not(all(target_arch = "x86_64", feature = "wcg-paygo"))))]
+#[cfg(all(feature = "witness", not(feature = "wcg-paygo")))]
 #[inline]
 fn wcd_coverage_note(_step: usize, _clipped: bool) -> &'static str {
     ""
@@ -12740,8 +12863,9 @@ fn wcn_note_relay(id: WinId) {
 // leak reads `passes=115 seeds=115 noatt=18 noatt_kpx=~13300 taker=18 -> TAKER`. A cursor path
 // re-damaging a still pointer would read `taker=0 -> UNATTRIBUTED` with `noatt` near the pass count.
 //
-// x86 only, like `[wcser]`/`[wcpar]`: the taker it attributes to is x86 + `wcg-paygo`, and the
-// aarch64 wire gains no line.
+// x86 only, like `[wcser]`/`[wcpar]`. ARCH-PARITY (rmbp-7): the taker it attributes to is no longer
+// arch-gated — the gate that stays is this WIRE's, and it is the whole discriminator's, not paygo's.
+// See the note on `noatt_note_taker` for the keep and for what porting the wire would take.
 
 /// NOATT — per-id monotone attach sequence. Bumped by [`wcn_note_present`] for every present the
 /// owner attempted, and NEVER drained: the reading is a DIFFERENCE against [`NOATT_SEEN`], so a
@@ -12775,6 +12899,13 @@ static NOATT_TAKER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 
 /// NOATT — the pay-as-you-go taker's mark, counted where it is made. Called under no lock, one
 /// relaxed increment; compiled out with the taker itself.
+///
+/// ARCH-PARITY (rmbp-7) — the arch term is the NOATT WIRE's, not the taker's, and it stays with the
+/// counter it writes. Every cell of the discriminator above ([`NOATT_SEQ`] and its five siblings)
+/// and the `[wcn]` rollup that divides them carry `all(feature = "witness", target_arch = "x86_64")`
+/// and none of it is a paygo item. Bumping a counter no rollup is built to read would be a
+/// measurement with no reader; the taker's own call site is gated to match, with the same reason
+/// written at it. Porting the NOATT wire is its own item, and this pair follows it unchanged.
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wcg-paygo"))]
 fn noatt_note_taker() {
     NOATT_TAKER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -17902,7 +18033,7 @@ fn stage_worst_case(info: &unaos_boot_info::FrameBufferInfo) -> usize {
 
 /// WEDGE-12 (M2) — rows of a SECONDARY core's pre-sized band on the small-heap arch. 64 is
 /// `WCD_CHUNK_ROWS_MAX`'s value, taken as precedent rather than as a reference: that constant is
-/// `x86_64` + `witness` + `wcg-paygo`-gated and does not exist on this build, but it is the same
+/// `witness` + `wcg-paygo`-gated and does not exist on this build, but it is the same
 /// question answered for the same reason — how many rows of a panel are a bounded bite. See
 /// [`stage_secondary_target`] for why a secondary is pre-sized to a band and not to a panel.
 const STAGE_SECONDARY_ROWS: usize = 64;
@@ -22065,7 +22196,7 @@ fn create_inner(
         // The `deferred=`/`emit=` census deliberately does NOT reset: it is a per-ID total for the whole
         // boot, and `emit=` has to stay monotone or the reader's "greatest `emit=` per `win=` supersedes"
         // rule breaks across a recycle.
-        #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+        #[cfg(feature = "wcg-paygo")]
         VERIFIED_FULL.fetch_and(!(1u32 << id), core::sync::atomic::Ordering::Relaxed);
         // WC-D — the STATE cell is the one that actually re-arms the window; the two bitmasks above
         // are published flags derived from it. Reset last, so no core can observe a cleared mask
@@ -22077,7 +22208,7 @@ fn create_inner(
         // the first decline always speaks. The census totals (`WCD_DEFERRED`, `WCD_EMIT`) are NOT
         // reset: `emit=` must stay monotone per id or the reader's "greatest `emit=` supersedes" rule
         // breaks across a recycle.
-        #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+        #[cfg(feature = "wcg-paygo")]
         WCD_SAID[id as usize].store(0, core::sync::atomic::Ordering::Relaxed);
         // WCH-CUSTODY — the wc-g/wc-h MEASUREMENTS travel with the tenant (age_ms= measured the
         // SLOT's age before this, so a recycled id inherited its predecessor's torn/maxpres/whole
@@ -22096,7 +22227,7 @@ fn create_inner(
         // s73 capture. That is the same argument the `WCD_SAID` note makes one line up, and the
         // opposite of the `WCD_ABORTS` argument one line down: the budget is per boot, the verdict
         // is per tenant — and so is the last word.
-        #[cfg(all(target_arch = "x86_64", feature = "wcg-paygo"))]
+        #[cfg(feature = "wcg-paygo")]
         {
             PAYGO_CLOSE_SAID[id as usize].store(0, core::sync::atomic::Ordering::Relaxed);
             // WCD-CHUNK — the cursor and its telemetry travel with the battery they describe: a new
