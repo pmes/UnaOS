@@ -3277,6 +3277,254 @@ the residency reads and the ledger are wired.
 
 ---
 
+### 2.x Kernel stack sizing — SPIN-6's three convictions, and what the refusal does NOT mean
+
+Kernel task stacks are **individual heap allocations**, not a pool:
+`alloc::vec![0u8; stack_bytes].into_boxed_slice()` (`sched.rs:3088`, and likewise
+3233, 3320, 8494). Growing one allocation cannot shrink another. This matters
+because SPIN-6's refusal text asks `(neighboring stack overflow?)` and that
+suspect has now been **wrong three times running**.
+
+**What the refusal actually proves.** `ctx_sp` is a field of the heap-allocated
+`Task`, and SPIN-6 tests exactly that field (`sched.rs:4657-4660`). A neighbour
+overflowing *into* this stack corrupts the parked **frame** — bytes inside
+`[base, top)` — and leaves `ctx_sp` in range, so it cannot produce the line at
+all. `ctx_sp < base` is reachable **only by the task's own SP**. Every SPIN-6
+refusal to date has been self-overflow.
+
+| task | observed | overrun | cure |
+|---|---|---|---|
+| `u7-launch` | `ctx_sp=0x20c9e70` vs `[0x20ca000,0x20ce000)` | 400 B | 32 KiB |
+| `render` (boot 10, both flights) | `ctx_sp=0x2089f80` vs `[0x208a000,0x208e000)` | 128 B / 96 B | `RENDER_STACK_SIZE` |
+| `usb-pump` (boot 11) | `ctx_sp=0x207df00` vs `[0x207e000,0x2082000)` | 256 B | `PUMP_PATH_STACK_SIZE` |
+
+**The pump path.** Boot 11's fault was Peter's quarry close/reopen on glass.
+`quarry::open()` — panel read, two VFS `read_dir` calls, surface allocation, a
+full paint and `wm::create_at` — runs **synchronously at click-router depth** on
+the input-drain task: `usb_pump` → `pump_usb_into_gui` → `wc_click_route`
+(`syscall.rs:13731`, where `strip`/`dock::press_route` inline) → `quarry::service`
+→ `open`. The dock latches the open rather than performing it, but the drain is
+called on the same source line, one frame below — **the latch defers nothing**.
+The boot-time open ran identical work on the BSP's 512 KiB boot stack, ~24 lines
+before `usb-pump` exists, which is why only the reopen faulted.
+
+The routing is nonetheless **correct and deliberate** (`dock.rs:929-932`): a
+volume read belongs on the input-drain band, not on the compositor pass owner.
+What was never done is sizing the task the design handed the work to. `input` is
+sized with the same constant, because `input_service`'s poll-nap branch calls the
+same `pump_usb_into_gui()` (`main.rs:4301`) and is the *only* caller under QEMU.
+
+**⚠ `[u7stk]`'s `headroom` SATURATES — it cannot go negative.** The high-water
+scan starts at `base` (`sched.rs:108-131`), so `hw <= len` and
+`headroom = len - hw >= 0` always. A chain that ran 256 B past its floor and one
+that stopped exactly at it print the identical `hw=16384 headroom=0`. Any stack
+size chosen from a reading at or near `headroom=0` is chosen from a **saturated
+instrument**, and every depth it reports is a *lower bound*. Sizing evidence must
+say so. (The doc comment above the probe claimed the opposite until this arc.)
+
+**The residual: SPIN-6 validates the pointer, not the frame.** This is why
+boot 10 merely lost a task where boot 11 wedged a core. The overrunning task's
+preemption frame lands in the slab *below* it, smashing that task's parked
+callee-saved registers — including its saved `x30`. SPIN-6 refuses the
+overflower (its `ctx_sp` is out of bounds) but **passes the victim**, whose
+`ctx_sp` is an untouched heap field; `switch_context` then restores the smashed
+`x30` and returns into it. Boot 11 landed at `ELR=0x1228` — below the kernel's
+first byte (`pi-baremetal.ld` links at `0x80000`) — with `EC=0x00`/`FAR=0x0`,
+i.e. the fetch *succeeded* and decoded as UNDEFINED, then `hlt_loop()`. The core
+died holding the `input` router, which is the on-glass wedge. The fix shape is a
+**redzone below each stack whose first touch faults**; it is not this arc —
+§2.y below is that follow-up, and it revises one premise stated here.
+
+`FORBID REFUSING corrupt switch-in: task=` and `FORBID AARCH64 EXCEPTION` both
+already exist in `pi4-regression.spec` — replaying a metal capture against the
+spec convicts this class without a new rule.
+
+### 2.y REDZONE — the absorber below each stack and the sentinel above it (aarch64, `exec-redzone`)
+
+§2.x closed on a residual: SPIN-6 validates the *pointer*, not the *frame*. This
+section is that follow-up. It ships two guard spans per kernel stack, and it
+**revises one premise of §2.x** — see "where the victim actually gets hit" below.
+
+**1. Guard page or poison sentinel? The allocator decides, and it says sentinel.**
+Kernel stacks come from `linked_list_allocator` 0.10.6 (`#[global_allocator]` at
+`allocator.rs:83-84`) through `alloc::vec![0u8; N]`, i.e. `Layout { align: 1 }`.
+The crate preserves `layout.align()` verbatim (`hole.rs:368-375`), and
+`split_current` hands back the raw hole start whenever
+`align_up(addr, align) == addr` — which is *always* true for align 1
+(`hole.rs:88-91`). The only alignment ever enforced is `align_of::<Hole>()` =
+**8 bytes**. The page-shaped bounds in the SPIN-6 captures are luck, not contract:
+`usb-pump`'s `0x207e000` is only 8 KiB-aligned.
+
+And the map has no page to take away. Pi 4 baremetal maps kernel RAM with **2 MiB
+block descriptors** (`boot.rs:284-302`, `ram_block`); the heap at `0x0200_0000`
++64 MiB sits in L2 indices 16..39, all plain blocks. Exactly one 2 MiB block in
+the system is broken down to 4 KiB leaves — the `USER_REGION` block (`boot.rs:268`),
+which lives in `.bss`, not the heap. A true guard page therefore needs four pieces
+that do not exist: a page-aligned stack allocator; a 2 MiB→L3 split of a *live,
+SMP-shared* mapping with break-before-make; a broadcast TLBI; and mirroring of that
+kernel-mapping edit into all 8 `SLOT_L1/L2/L3` copies, per the standing STOP
+TRIPWIRE at `boot.rs:556-561`. There is no kernel-half 4 KiB permission or unmap
+API at all — TCR sets `EPD1=1` (`boot.rs:157`) and every runtime page-table mutator
+in `boot.rs` is user-window only.
+
+**So this is a poison sentinel, and for the span it watches it is detection after
+the fact, not prevention of the write.** Said plainly: nothing here traps on the
+offending store. What it does do is make the store land somewhere harmless — which
+is the part that actually mattered, and is argued next.
+
+**Layout.** Every stack allocation grows by `STACK_REDZONE + STACK_HIGHGUARD`; the
+*usable* span is byte-for-byte the size the caller asked for, so every sizing
+decision STACKPOOL and SHELLUP measured is preserved unchanged:
+
+```
+[alloc,                    alloc+1024)          LOW REDZONE   — absorbs this task's OWN overrun
+[alloc+1024,               top)                 usable stack  — exactly `stack_bytes`, the span SPIN-6 always policed
+[top,                      top+512)             HIGH GUARD    — catches a NEIGHBOUR's overrun arriving from the slab above
+```
+
+Both spans are painted `GUARD_FILL = 0x5A` in `build_initial_frame`, the single
+choke point all four allocation sites already call. The paint is **unconditional**
+— not `witness`-gated — because a protection that only exists on witness builds
+does not protect the media build, which is the build that dies at the bench.
+`STACK_POISON` (`0xAB`, witness-only) is a different byte for a different job, and
+`stk_probe` is retargeted at the *usable* span (`base + STACK_REDZONE`,
+`len - REDZONE - HIGHGUARD`) so its `hw`/`headroom` readings stay directly
+comparable with §2.x's table and its `:82-83` doc stays true verbatim.
+
+**SPIN-6 is strictly strengthened, never weakened.** Its window becomes
+`[alloc+REDZONE, top)` — the *same span in bytes* as before, just shifted up, with
+the absorber underneath it instead of the neighbour's stack. Had the floor been
+left at `alloc`, the redzone would have silently become 1 KiB of extra headroom and
+SPIN-6 would have fired 1 KiB *later* than it does today. Keeping the floor at the
+caller's declared bound is what makes the redzone containment rather than a raise.
+
+**2. Where to check — and where the victim actually gets hit.** §2.x proposed
+checking the victim's sentinel at switch-in. That is right, but only for a guard
+*above* the stack, and the reason is a direction argument: task A overruns
+**downward** past its own base into the slab below, so the first bytes it writes
+there are the **highest** addresses of that slab — i.e. the victim's **top**, which
+is exactly where a parked frame lives. A low redzone under the victim is never
+touched by the overflower. Indeed the low redzone is **single-writer**: only its
+owner's SP can reach it, so checking it at switch-in and at switch-out sample the
+same fact, and switch-out samples it first. Hence one check at each boundary, each
+watching a *different* span:
+
+- **Switch-out** — the outgoing task's **LOW** redzone, at `dispatch_next`'s return
+  from `switch_context`. That one site covers every switch-out path in the file
+  (`yield_now`, `sleep_ticks`, `timer_preempt`, `exit` all switch to
+  `scheduler_sp` and land there), and it names the overflower at the hop it
+  offended.
+- **Switch-in** — the incoming task's **HIGH** guard, inside SPIN-6's existing
+  block. This is the direct fix for the blind spot: it is the only check that can
+  see damage done *to* a parked task by somebody else.
+
+**3. What happens on detection.** Graduated, because the two ends of a guard span
+mean different things. `guard_state` returns bit 0 if the span's high end is no
+longer fill (something crossed *into* it) and bit 1 if its low end is gone too (the
+span was *traversed*). Both spans are entered from their high address, so one
+encoding serves both.
+
+| condition | meaning | action |
+|---|---|---|
+| LOW bit 0 | the task dipped below its floor; the absorber caught it | `[redzone] LOW-REDZONE entered` — **task continues**. Its parked frame is intact (SPIN-6 proves that separately) and no neighbour was reached. This is a *sizing* alarm, not a corruption proof; dropping a healthy task here would trade availability for nothing. |
+| LOW bit 1 | the absorber was traversed — an escape is likely | `[redzone] LOW-REDZONE TRAVERSED`, naming the task to grow and warning that the slab below may already hold a smashed frame. |
+| HIGH bit 0 | a neighbour crossed into this stack's slab; the 512 B guard absorbed it | `[redzone] HIGH-GUARD entered` — **task resumed**, frame provably untouched. |
+| HIGH bit 1 | a neighbour traversed the guard and reached the parked frame | **refuse + drop**, through SPIN-6's existing arm. |
+
+That last row is the answer to "what do you do with a smashed victim": **dropping
+it is right and returning into it is wrong**, so it joins SPIN-6's refusal and
+reuses that path verbatim — including the EL0 residency/`slot_res` bookkeeping and
+the `EL0_REAPED.corrupt` counter, which a second bespoke drop path would have had
+to duplicate and could have got wrong. The existing refusal is never bypassed or
+loosened; the condition only gains a disjunct. Its message gains a `higuard={}`
+field and changes `outside its stack` to `vs its stack`, because with the new arm
+the old phrasing would assert something false on a high-guard refusal; the
+`REFUSING corrupt switch-in: task=` substring that `pi4-regression.spec:1580`
+forbids is preserved verbatim. The parenthetical `(neighboring stack overflow?)`
+is gone on purpose — `higuard` now *answers* that question instead of asking it.
+Both `[redzone]` report paths are capped at 16 lines each by their own counters, so
+a chronically undersized task cannot become the next serial storm (STORM-R3). The
+counter alone was **not** enough, and the first armed run proved it: a breached
+guard is *persistent state*, not an event — nothing re-paints it — so the same task
+re-reported on every subsequent switch and burned the whole cap on 16 identical
+lines. Each side therefore also keeps a `GUARD_*_LAST` task-id, and a report is
+emitted only when the offending id differs from the last one reported. Runs of the
+same task collapse to one line; a *different* task still reports immediately.
+
+**It found a fourth mis-sized task on its first armed run — and one SPIN-6 cannot
+see.** `kernel8-test` prints
+`[redzone] cpu=2 LOW-REDZONE entered task=114:shell-run`, with **zero** `[spin6]`
+lines in the same boot. That combination is the whole point of the mechanism:
+`shell-run` dips below its floor *transiently* and returns, so its parked `ctx_sp`
+is always in range and SPIN-6 — which samples SP only at park time — is
+structurally blind to it. Before this arc that dip landed in the neighbouring heap
+slab silently; now it lands in the task's own absorber and says so. `shell-run` is
+an EL0 task spawned through `run_user_image` (`arch/aarch64/syscall.rs:10438`,
+`:10832`), so its EL1 kernel stack is the blanket `TASK_STACK_SIZE` that
+`spawn_user_inner` hard-codes — there is no `spawn_user` variant that takes a size,
+which is why the STACKPOOL/SHELLUP cure (a right-sized constant at the spawn site)
+has no EL0 equivalent to apply. **Sizing it is out of this arc's lane** (`syscall.rs`,
+or a new sized EL0 spawn entry point) and is left as the named follow-up, per
+§2.x's diagnostic order: probe first, right-size second.
+
+**4. Cost, and why it is not `witness`-gated.** Four `read_volatile` byte loads per
+full switch cycle: two at switch-out (both ends of the low redzone), two at
+switch-in (both ends of the high guard), plus two compares each and a
+never-taken branch. **Byte** loads, not `u64` — the allocator guarantees only
+8-byte alignment and only for the allocation *base*, so a word load at
+`top + HIGHGUARD - 8` would carry an alignment precondition nothing here can
+enforce. The dominant cost is not the loads but the **cache**: the guard bytes are
+cold by construction, so this touches ~3–4 cold lines per switch. That is precisely
+why the check is two bytes at each end rather than a scan of the span — scanning
+1 KiB would drag 16 cold lines through L1 on every context switch, and the paint
+already guarantees the interior is fill. Against a switch that already pays a
+`TTBR0_EL1` write plus `ISB`, several atomics and a 176-byte register
+save/restore, this is noise. It runs **always**, on the media build: the boot-11
+class of fault appears on unattended metal boots, which is exactly the build a
+witness gate would exclude, and the memory price is 1.5 KiB per task (~9% on a
+16 KiB stack, ~60 KiB fleet-wide against a 48 MiB heap).
+
+**Residual, stated honestly.** An overrun larger than `STACK_REDZONE + HIGHGUARD`
+combined still escapes and still smashes a frame; the guards make that loud rather
+than silent, but they do not stop it. All four recorded overruns — `u7-launch`
+400 B, `render` 128 B / 96 B, `usb-pump` 256 B — fit inside the 1 KiB absorber with
+2.5x margin, so for the entire observed fault population the victim is not merely
+detected but **never created**. A write landing strictly inside a guard span without
+touching either end byte is invisible to the fast path; such a write did not leave
+the allocation, and SPIN-6's exact `ctx_sp` test still covers the parked case.
+Overrun *magnitude* for a parked task comes from `base - ctx_sp` at the refusal
+site, never from `[u7stk]`'s `headroom`, which saturates at 0 (§2.x).
+
+**What QEMU can and cannot show — a prediction this arc got wrong, and the
+correction.** The expectation going in was that neither `[redzone]` line could fire
+under QEMU raspi4b "by construction", on the §2.x reasoning that no Group-1 timer
+IRQ is delivered on these paths so no preemption frame ever lands. **That is true
+of the boot-11 *death* and false of the *low redzone*.** The two are different
+events. Banking a preemption frame below the floor needs the timer; simply
+*running* below the floor needs only depth, and depth is architecture-independent —
+so `kernel8-test` exercises the low redzone for real, and did, on `shell-run`. The
+honest split is therefore:
+
+- **Low redzone — LIVE under QEMU.** It is a depth instrument and the gate is a
+  genuine test of it, not a smoke check.
+- **High guard — inert under QEMU.** It can only fire once an overrun actually
+  escapes an allocation, which on the recorded evidence takes a preemption frame
+  the emulator never delivers. The QEMU legs prove it is non-regressive; they
+  cannot prove it fires.
+
+**What the next metal boot must print.** On a healthy boot: zero `[spin6]` lines,
+zero `higuard=` refusals, and at most the known `shell-run` low-redzone line until
+that task is sized. If the boot-11 chain recurs, the expected evidence is
+`[redzone] cpu=N LOW-REDZONE entered task=<id>:usb-pump` (or `input`) *instead of*
+the old `[spin6] … ctx_sp=0x207df00 outside its stack`, with the machine still
+running and the panel still alive — the overrun absorbed and named rather than
+banked into a neighbour. A `LOW-REDZONE TRAVERSED`, or any refusal carrying
+`higuard=2`, means the 1 KiB absorber was not enough: that is the reading that
+sends the sizes up again, and `higuard=2` is additionally the first direct
+identification of a *victim* this kernel has ever been able to make.
+
+---
+
 ## 3. Blocking and synchronization primitives
 
 All primitives live in `sched.rs` and are built to be **lost-wakeup-safe** (the

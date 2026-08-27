@@ -376,6 +376,11 @@ static W_MAXUS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 /// sample line, and now the `prof` line — sit outside every bracket that feeds this sum, by the same
 /// rule that keeps `stage_flush`'s print outside WC-G's clock. So `wit_us=` is the measurement cost,
 /// not the reporting cost, and the reporting cost is stated separately at [`end`].
+///
+/// WCGSEAM-HB — REFUNDED passes are included: a refunded sample's four phases were paid in full
+/// before the refund decision existed, so the ledger charges them exactly as it charges an
+/// adjudicated pass. `wit_us=` therefore reads "what the instrument cost this window", not "what
+/// the samples= population cost", whenever `refunded=` lines precede the rollup.
 static W_WITUS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 
 // ---- WCGSEAM — the boot-seam writer census (a DISCRIMINATOR, not a remedy) ---------------------
@@ -394,6 +399,23 @@ static W_WITUS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 // relaxed atomic stores, no lock, no branch on the render or input path. `begin` snapshots the
 // counter above `t0` (one relaxed load, paid before the clock starts, per the ordering law on the
 // `Probe` literal); a convicting `end` reads it again and prints `[wcgseam]` with the bracket delta.
+//
+// THE CENSUS HAS SPOKEN (exec-wcg, 2026-08-25, QEMU raspi4b at bench geometry —
+// `UNAOS_PIDESK=1 UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 150`, PARITY §6.14's own
+// A/B configuration). All three convictions of the armed boot carried `-> GLYPH-RASTER` with
+// `delta=149/216/325` and `routed=yes` — the writer caught INSIDE the bracket, every time; the
+// pre-registered exoneration branch (`delta=0` with a large age) did not occur. The attribution
+// above is CONFIRMED, not artefact: fbcon's glyph raster is the concurrent writer. `locked=`
+// tracked the census total exactly — on aarch64 the split path does not exist, so 100% of the
+// writers take the FBCON lock, which per the pre-registered reading makes remedy (a) sufficient
+// in REACH and leaves the choice against it a question of COST (an FBCON spinlock held across a
+// ~10-29 ms bracket, waited on from print context with interrupts masked). The remedy taken is
+// neither (a) nor (b) but the granting seats' preferred shape — the HONEST BRACKET below
+// (WCGSEAM-HB): a convicting sample whose full adjudication span the census marks dirty is
+// REFUNDED and re-armed rather than adjudicated, bounded by [`REARM_MAX`]; a quiet-bracket
+// conviction still convicts, so every spec FORBID keeps its teeth. x86 QEMU cannot fire any of
+// this at runtime (`:: kepler: no-device ::` — no takeover, no routed console, `SEAM_WIN` never
+// written); x86 metal has never convicted (x86-witness.spec: zero hits, boots 7/8).
 
 /// WCGSEAM — glyph-raster paint batches fbcon has landed in the ROUTED console-window surface, for
 /// the whole boot. One count per `write_byte` on the classic path (a glyph or a newline's fills),
@@ -412,6 +434,24 @@ static SEAM_LOCKED: AtomicU64 = AtomicU64::new(0);
 /// first routed glyph write. The `[wcgseam]` line prints only for THIS window: a conviction on an
 /// app window has nothing to learn from a console census.
 static SEAM_WIN: AtomicU32 = AtomicU32::new(0);
+
+/// WCGSEAM-HB — per-id: samples this window has REFUNDED under the honest bracket (see the refund
+/// block in [`end`]). Deliberately NOT reset by [`wch_recycle`], by exactly `TAKEN`'s rule: the cap
+/// is a per-boot serial/time bound, and a recycle that re-armed it would unbound both. Compiled out
+/// wherever the refund is (the x86 `wcg-paygo` chunk machinery banks part-paid samples, and a
+/// refund mid-battery would desync the paygo ledger — on that build a dirty-bracket conviction
+/// adjudicates as before, with the `[wcgseam]` line beside it).
+#[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
+static W_REARM: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+
+/// WCGSEAM-HB — how many dirty-bracket convictions a window may refund before the instrument
+/// adjudicates anyway. The bound is what keeps the four spec FORBIDs live even against a writer
+/// that NEVER quiets (the `livecon` steady state §6.14 left unmeasured): 16 refunds at the bench
+/// geometry's ~43 ms per pass is ≤ ~0.7 s of witness time and ≤ ~2.4 KB of `[wcgseam]` serial,
+/// and then convictions resume. The boot-seam writer this remedy excuses goes quiet at
+/// `fbcon::detach()`, well inside the bound on every capture read so far.
+#[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
+const REARM_MAX: u32 = 16;
 
 /// WCGSEAM — fbcon's charge point: one routed glyph-raster write event landed in the console
 /// window's surface. `locked` says the FBCON lock was held (classic path) or not (split path);
@@ -3406,6 +3446,13 @@ pub fn end(
     let readback_us = cycles_to_us(now_cycles().saturating_sub(tp2));
     #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
     let _ = (rows_done, rows_total);
+    // WCGSEAM-HB — the honest bracket's SECOND census read, the instant the read-back bracket
+    // closes. The refund test below must cover the FULL adjudication span — blit → civac → after →
+    // read-back — because a `BLIT` verdict convicts on `fbbad`, and glyphs stored during the walk
+    // (after `seam_now` was taken) are invisible to the checksum-span delta the `[wcgseam]` line
+    // prints. One relaxed load, outside every timing bracket.
+    #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
+    let seam_rb = SEAM_WRITES.load(Ordering::Relaxed);
 
     // WCG-CHUNK — bank this chunk, and decide whether it CLOSES the sample.
     //
@@ -3517,22 +3564,89 @@ pub fn end(
     // BLIT rather than being reported alongside it — `fbbad` is still printed, so the raw number is
     // never hidden by the verdict drawn from it.
     let w = p.id as usize;
+    // WCGSEAM-HB — classification is now PURE (no counter moves), because the honest bracket below
+    // may decline to adjudicate this sample at all. The counting happens after the refund gate, and
+    // exactly once per ADJUDICATED sample, same precedence, same tokens.
     let verdict = if p.cks_blit != p.cks_civac {
-        W_COHER[w].fetch_add(1, Ordering::Relaxed);
         "COHER"
     } else if p.cks_blit != cks_after {
-        W_RACE[w].fetch_add(1, Ordering::Relaxed);
         "RACE-BLIT"
     } else if p.own && p.cks_app != p.cks_blit {
-        W_RACE[w].fetch_add(1, Ordering::Relaxed);
         "RACE-PRESENT"
     } else if bad != 0 {
-        W_BLIT[w].fetch_add(1, Ordering::Relaxed);
         "BLIT"
     } else {
-        W_CLEAN[w].fetch_add(1, Ordering::Relaxed);
         "CLEAN"
     };
+    // WCGSEAM-HB — THE HONEST BRACKET: bracket the hash against owner progress. A convicting
+    // sample of the ROUTED CONSOLE'S window whose full adjudication span the census marks dirty
+    // (`rb_delta > 0`: fbcon's glyph raster stored into the source while this pass was reading it)
+    // is REFUNDED — the budget spend is undone so a later present re-arms the sample — instead of
+    // adjudicated. The 2026-08-25 bench-geometry reading (header note above) caught the writer
+    // inside the bracket on ALL THREE convictions of the armed boot; convicting a source that is
+    // known-mutable by design during the boot seam measures the bracket's width, not the
+    // compositor's correctness. What this deliberately does NOT do: it never excuses a quiet
+    // bracket (metal cache incoherence, a non-fbcon writer, a deterministic blit defect — all still
+    // convict, which is what keeps every `-> COHER`/`RACE`/`BLIT` FORBID load-bearing), it never
+    // excuses any window but the census's own, it stops excusing after [`REARM_MAX`] refunds, and
+    // it hides nothing: the refunded pass prints its `[wcgseam]` line — sole line of the pass, with
+    // the verdict it declined to adjudicate and the refund tally as a suffix AFTER the terminal
+    // (the standing insertion rule; the adjudicated line's pre-registered grammar is untouched).
+    // The refund REDUCES serial per pass (one `[wcgseam]` line instead of sample + prof), and the
+    // witness time it spent still lands in `wit_us=` — the cost was paid, so the ledger says so.
+    #[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]
+    if verdict != "CLEAN" && p.id != 0 && p.id == SEAM_WIN.load(Ordering::Relaxed) {
+        let rb_delta = seam_rb.saturating_sub(p.seam0);
+        // Single-compositor-context load/store, like every W_* pattern in this file.
+        let used = W_REARM[w].load(Ordering::Relaxed);
+        if rb_delta > 0 && used < REARM_MAX {
+            W_REARM[w].store(used + 1, Ordering::Relaxed);
+            // Undo `begin`'s spend. Admission declines at `>= SAMPLES` post-add, so the counter is
+            // in `1..=SAMPLES` here and the sub cannot underflow.
+            TAKEN[w].fetch_sub(1, Ordering::Relaxed);
+            W_WITUS[w].fetch_add(
+                p.cks_blit_us
+                    .saturating_add(p.civac_us)
+                    .saturating_add(cks_after_us)
+                    .saturating_add(readback_us),
+                Ordering::Relaxed,
+            );
+            #[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))]
+            let routed = if super::fbcon::console_is_routed() { "yes" } else { "no" };
+            #[cfg(not(all(target_arch = "aarch64", feature = "desktop_firmware")))]
+            let routed = "?";
+            serial_println!(
+                "[wcgseam] win={} seq={} verdict={} routed={} glyphs={} delta={} locked={} last_age_us={} -> {} rb_delta={} refunded={}/{}",
+                p.id,
+                p.seq,
+                verdict,
+                routed,
+                seam_now,
+                seam_now.saturating_sub(p.seam0),
+                SEAM_LOCKED.load(Ordering::Relaxed),
+                cycles_to_us(now_cycles().saturating_sub(seam_last)),
+                if seam_now > p.seam0 { "GLYPH-RASTER" } else { "QUIET-BRACKET" },
+                rb_delta,
+                used + 1,
+                REARM_MAX
+            );
+            return;
+        }
+    }
+    match verdict {
+        "COHER" => {
+            W_COHER[w].fetch_add(1, Ordering::Relaxed);
+        }
+        "RACE-BLIT" | "RACE-PRESENT" => {
+            W_RACE[w].fetch_add(1, Ordering::Relaxed);
+        }
+        "BLIT" => {
+            W_BLIT[w].fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {
+            W_CLEAN[w].fetch_add(1, Ordering::Relaxed);
+        }
+    }
     // The tearing criterion. NOT "longer than a frame" — that threshold is arbitrary and sits on a
     // knife edge. The beam only has to cross THIS WINDOW'S rows for the copy to be latched
     // part-old/part-new, so the honest threshold is the time the HVS spends scanning the window's
@@ -3607,9 +3721,9 @@ pub fn end(
     // in `begin`. A new tag deliberately: no pi4 FORBID matches `\[wcgseam\]`, and none may be
     // taught to until the discriminator has spoken on the bench.
     if verdict != "CLEAN" && p.id != 0 && p.id == SEAM_WIN.load(Ordering::Relaxed) {
-        #[cfg(all(target_arch = "aarch64", feature = "pidesk"))]
+        #[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))]
         let routed = if super::fbcon::console_is_routed() { "yes" } else { "no" };
-        #[cfg(not(all(target_arch = "aarch64", feature = "pidesk")))]
+        #[cfg(not(all(target_arch = "aarch64", feature = "desktop_firmware")))]
         let routed = "?";
         serial_println!(
             "[wcgseam] win={} seq={} verdict={} routed={} glyphs={} delta={} locked={} last_age_us={} -> {}",

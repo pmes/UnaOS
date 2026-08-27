@@ -31,7 +31,7 @@ const MAX_TOKENS: usize = 400_000;
 /// Depth cap for the node-name stack (real trees are < 10 deep).
 const MAX_DEPTH: usize = 16;
 /// Longest node-name path we keep (bytes, '/'-joined).
-const MAX_PATH: usize = 160;
+pub const MAX_PATH: usize = 160;
 /// Most raw u32 words we capture from one property (the XUSB `clocks` list is 9 [phandle, id]
 /// pairs = 18 words — keep headroom above that).
 const MAX_WORDS: usize = 20;
@@ -375,7 +375,7 @@ pub struct XusbIds {
 /// Every abandon rung names itself on serial (`JB1c-IDS STOP`): the caller's line is the generic
 /// "no usb@3610000 ids in DTB; SKIP", which cannot say whether the DTB was absent, unmapped,
 /// malformed, node-less, or merely id-less — and without ids the whole XUSB ungate is skipped.
-pub fn xusb_ids(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<XusbIds> {
+pub fn xusb_ids(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<XusbIds> { #[cfg(feature = "jd1dc")] if let Some(ids) = node_ids(dtb_addr, dtb_size, ram_gib_mask, b"usb@3610000") { return Some(ids); } // JD1-DC: on an ARMED build these ids come from the GENERALISED reader at this file's tail — the same walk with the node name lifted into a parameter, which is what lets the nvdisplay probe's MRQ_PG guard read `display@13800000`'s power-domains with this code instead of a second copy of it. APPENDED to this line, never a new one, so every `core::panic::Location` below keeps its line number and the disarmed image is untouched. FALL-THROUGH, not replacement: `None` drops into the original body below, so a bug in the generic reader can cost an armed flight one extra STOP line and never its keyboard.
     if dtb_addr == 0 || dtb_size == 0 {
         return ids_stop("no DTB handed off", dtb_addr, dtb_size as u64);
     }
@@ -1477,7 +1477,7 @@ pub fn nvdisplay_base(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Opti
     if plen == 0 {
         return None;
     }
-    let reg = fdt.prop_at(&path[..plen], b"reg");
+    let reg = fdt.prop_at(&path[..plen], b"reg"); #[cfg(feature = "jd1dc")] nvdisplay_reg_census(&fdt, &path[..plen], &reg); // JD1-DC-REG: `reg` on this node is MULTI-ENTRY (the DRIVE OS T234 binding declares four — nvdisplay, dpaux0, hdacodec, mipical) and the two lines below take entry[0] and never say so, while `total_len` — the property's TRUE byte length, captured at `PropWords::capture` and the one datum that would reveal it — is discarded silently. This gated call prints total_len, the entry count it implies, every captured (addr,size) pair and the `reg-names` byte list, so a capture PROVES entry[0] is `nvdisplay` instead of assuming it. APPENDED to this line, never a new one: knob-off it is cfg-erased and not one `core::panic::Location` below moves.
     if reg.n < 4 {
         return None;
     }
@@ -1559,4 +1559,298 @@ pub fn cpu_affinities(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64, out: &m
         n += 1;
     });
     n
+}
+
+// =================================================================================================
+// JD1-DC — the DTB resource-id reader, GENERALISED off its one node name. `jd1dc`, DEFAULT OFF.
+// =================================================================================================
+//
+// WHAT THIS IS. `xusb_ids` above is a perfectly good `clocks`/`resets`/`power-domains` reader that
+// happens to have ONE thing hardcoded to XUSB: the node-name literal `b"usb@3610000"` it matches on.
+// The JD1-DC nvdisplay probe needs exactly the same three lists off a DIFFERENT node
+// (`display@13800000`), because its MRQ_PG guard cannot prove a power domain is ON without the
+// domain's id, and the id lives in the firmware's own tree (verify-don't-assume — never a header
+// guess, the JB1c rule). So the reader is parameterised by node name here, and `xusb_ids` routes
+// THROUGH it on an armed build.
+//
+// WHY IT IS AN APPENDED, FEATURE-GATED COPY OF THE WALK RATHER THAN AN IN-PLACE EDIT OF `xusb_ids`.
+// The arc's hard constraint is that the DISARMED jetson image is byte-identical to baseline, and
+// that constraint is stronger than it first looks: ANY edit to source the disarmed build compiles
+// changes the image. Not just code — the two `ids_stop` message literals in `xusb_ids` say
+// "usb@3610000", and a generalised reader must not print that when it was asked for a display node,
+// so an in-place parameterisation necessarily rewrites .rodata. Worse, inserting or deleting a
+// LINE anywhere above an existing panic site in this file shifts that site's `core::panic::Location`
+// (file/line/col is baked into the image), which moves bytes for free. Hence the shape below: the
+// generic walk is `#[cfg(feature = "jd1dc")]` and lives at the file TAIL where it shifts nothing,
+// and the single edit to `xusb_ids` is a `#[cfg]`-erased statement APPENDED to its existing opening
+// line. Knob off => not one byte of this block, and not one moved line, reaches the image.
+//
+// THE ONE DELIBERATE BEHAVIOURAL DIFFERENCE from `xusb_ids`: the "found the node but it carries
+// nothing" abandon also requires `n_pds == 0`. `xusb_ids` abandons on `n_clocks == 0 && n_resets == 0`
+// because for XUSB a node with no clocks and no resets cannot be ungated — but a display node whose
+// only BPMP resource in this firmware's tree is `power-domains` is EXACTLY the node the guard wants,
+// and abandoning it would refuse the probe for the wrong reason. For `usb@3610000` the two
+// conditions cannot disagree (that node carries nine clocks — JB5, metal-proven), which is why
+// routing `xusb_ids` through here is safe.
+//
+// FALL-THROUGH, NOT REPLACEMENT. `xusb_ids`'s armed-build delegation returns only on `Some`: if this
+// reader ever answered `None` where the original body would have answered `Some`, the original body
+// still runs and the XUSB ungate is unharmed. An armed JD1-DC flight therefore cannot lose its
+// keyboard to a bug in this function — the worst case is one extra STOP line on the wire. That
+// fall-through is also the self-test: on an armed boot the `JB1c — XUSB ids from DTB: 9 clocks,
+// 4 resets, 1 power-domains` line is produced BY this reader, against a node whose answer is known.
+
+/// JD1-DC: `xusb_ids`'s walk with the node name lifted into a parameter — read one DTB node's
+/// `clocks` / `resets` / `power-domains` id lists (the odd-index word of each [phandle, id] pair).
+///
+/// `node_name` is matched as a SUBSTRING of the node path, identically to `xusb_ids` and to
+/// `nvdisplay_base` — so passing `b"display@"` here resolves the SAME node `nvdisplay_base` resolves
+/// (same predicate, same `for_each_prop` order, first match wins). That identity is load-bearing for
+/// the probe: the power domain the guard proves ON must be the domain that owns the aperture the
+/// sweep reads, and matching on the same string is what makes that true by construction rather than
+/// by assumption.
+///
+/// Read-only RAM walk — no MMIO, no allocation. Every abandon names itself on the wire
+/// (`JD1-DC-IDS STOP`) with the node it was asked for.
+#[cfg(feature = "jd1dc")]
+pub fn node_ids(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64, node_name: &[u8]) -> Option<XusbIds> {
+    if node_name.is_empty() || node_name.len() > MAX_PATH {
+        // `windows(0)` panics and a name longer than a path can never match; refuse both up front.
+        return node_ids_stop(node_name, "node name length out of range (len / MAX_PATH)", node_name.len() as u64, MAX_PATH as u64);
+    }
+    if dtb_addr == 0 || dtb_size == 0 {
+        return node_ids_stop(node_name, "no DTB handed off (addr / size)", dtb_addr, dtb_size as u64);
+    }
+    let g_lo = dtb_addr >> 30;
+    let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
+    let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
+    if !mapped(g_lo) || !mapped(g_hi) {
+        return node_ids_stop(node_name, "DTB GiB unmapped (GiB lo / RAM-GiB-mask)", g_lo, ram_gib_mask);
+    }
+    let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
+    let Some(fdt) = Fdt::new(blob) else {
+        return node_ids_stop(
+            node_name,
+            "bad DTB header (magic/bounds) at Fdt::new; first two words",
+            be32(blob, 0).unwrap_or(0) as u64,
+            be32(blob, 4).unwrap_or(0) as u64,
+        );
+    };
+    let mut path = [0u8; MAX_PATH];
+    let mut plen = 0usize;
+    fdt.for_each_prop(|e| {
+        if plen == 0 && e.path.windows(node_name.len()).any(|w| w == node_name) {
+            let l = e.path.len().min(MAX_PATH);
+            path[..l].copy_from_slice(&e.path[..l]);
+            plen = l;
+        }
+    });
+    if plen == 0 {
+        return node_ids_stop(node_name, "no node whose path contains this name", 0, 0);
+    }
+    let node = &path[..plen];
+    // [phandle, id] pairs -> collect the odd-index words. Verbatim from `xusb_ids`.
+    let pick = |p: &PropWords, out: &mut [u32], n: &mut usize| {
+        let mut i = 1;
+        while i < p.n && *n < out.len() {
+            out[*n] = p.words[i];
+            *n += 1;
+            i += 2;
+        }
+    };
+    let mut ids = XusbIds { clocks: [0; 9], n_clocks: 0, resets: [0; 4], n_resets: 0, pds: [0; 4], n_pds: 0 };
+    let clocks = fdt.prop_at(node, b"clocks");
+    let resets = fdt.prop_at(node, b"resets");
+    let pds = fdt.prop_at(node, b"power-domains");
+    pick(&clocks, &mut ids.clocks, &mut ids.n_clocks);
+    pick(&resets, &mut ids.resets, &mut ids.n_resets);
+    pick(&pds, &mut ids.pds, &mut ids.n_pds);
+    // JD1-DC — TRUNCATION IS LOUD, AND FOR power-domains IT IS FATAL TO THE FLIGHT.
+    //
+    // `pick` above drops silently at TWO caps and neither is visible in its output: `PropWords`
+    // stops capturing at `MAX_WORDS` (= 20 words = 10 [phandle,id] pairs, whatever the property),
+    // and the loop stops again at `out.len()` (9 clocks / 4 resets / 4 power-domains). Only
+    // `p.total_len` — the property's TRUE byte length, kept by `PropWords::capture` — knows how many
+    // entries the DTB actually declared. This project has already been bitten by exactly this class
+    // in exactly this function: the `XusbIds.clocks` comment above records the JB5 finding, where an
+    // 8-slot cap dropped `usb@3610000`'s ninth clock without a word on the wire.
+    //
+    // The two properties are NOT treated alike, and the asymmetry is the point. A truncated
+    // `clocks`/`resets` list costs this rung NOTHING — JD1-DC never enables a clock and never
+    // deasserts a reset; it reads MMIO. A truncated `power-domains` list, by contrast, destroys the
+    // ONE claim the guard exists to make: "every domain this node lists answered ON". With entries
+    // dropped, `jd1_dc_probe` would print `GUARD PASSED: all 4 display@ power domain(s) ON` and read
+    // a block whose 5th domain was never asked about — a read of a gated Tegra block is EL3-FATAL
+    // (JX1). So clocks/resets get a loud line and the walk continues; power-domains gets the loud
+    // line and then `None`, which the caller already renders as `VERDICT=REFUSED reason=no-ids` and
+    // NOT ONE nvdisplay register is read.
+    //
+    // `total_len % 8 != 0` is checked separately and is a DIFFERENT defect: it means the property is
+    // not a whole number of [phandle,id] pairs at all — a provider with `#power-domain-cells = <0>`
+    // yields 1-word entries, and `pick`'s odd-index extraction would then harvest phandles as ids.
+    // That is silent corruption rather than silent loss, so it is named as its own reason.
+    let trunc = |what: &str, p: &PropWords, taken: usize, cap: usize| -> bool {
+        if !p.found {
+            return false; // absent is not truncated — `n_* == 0` already says so on the census line.
+        }
+        let declared = p.total_len / 8; // [phandle, id] pairs the DTB declares, from the TRUE length
+        let ragged = p.total_len % 8 != 0;
+        if !ragged && declared <= taken {
+            return false;
+        }
+        serial_println!(
+            ":: tegra: JD1-DC-IDS TRUNCATED — '{}' on this node: total_len={} B => {} [phandle,id] pair(s) declared{}, but this reader kept {} id(s). Caps: PropWords MAX_WORDS={} words = {} pairs (captured n={}), destination array = {} ids. {} ::",
+            what,
+            p.total_len,
+            declared,
+            if ragged { " (RAGGED — total_len is not a multiple of 8, so this property is NOT a list of [phandle,id] pairs and the odd-index extraction below is reading the WRONG cells)" } else { "" },
+            taken,
+            MAX_WORDS,
+            MAX_WORDS / 2,
+            p.n,
+            cap,
+            if what == "power-domains" {
+                "The guard's 'all domains ON' claim cannot be made over a list this reader did not fully see, so the ids are REFUSED (None) and JD1-DC will read no nvdisplay register this boot"
+            } else {
+                "JD1-DC enables no clock and deasserts no reset, so the walk CONTINUES — this line exists so the capture records what was dropped, not to stop the flight"
+            },
+        );
+        true
+    };
+    let pds_trunc = trunc("power-domains", &pds, ids.n_pds, ids.pds.len());
+    let _ = trunc("clocks", &clocks, ids.n_clocks, ids.clocks.len());
+    let _ = trunc("resets", &resets, ids.n_resets, ids.resets.len());
+    if pds_trunc {
+        return node_ids_stop(
+            node_name,
+            "power-domains TRUNCATED or RAGGED (see the JD1-DC-IDS TRUNCATED line above); the guard cannot prove every listed domain is ON, and a read of a gated block is EL3-fatal — declared pair count / ids kept",
+            (pds.total_len / 8) as u64,
+            ids.n_pds as u64,
+        );
+    }
+    if ids.n_clocks == 0 && ids.n_resets == 0 && ids.n_pds == 0 {
+        return node_ids_stop(
+            node_name,
+            "node found but carries NO clocks, NO resets and NO power-domains (raw prop cell counts clocks.n / resets.n)",
+            clocks.n as u64,
+            resets.n as u64,
+        );
+    }
+    // Two lines rather than one with conditional fragments: a format that splices "" and 0 together
+    // when there are no power-domains reads as `...0 power-domains0 ::` on the wire, and a capture a
+    // decision rests on may not contain a number that means nothing.
+    serial_println!(
+        ":: tegra: JD1-DC-IDS — node '{}' (path '{}'): {} clocks, {} resets, {} power-domains ::",
+        core::str::from_utf8(node_name).unwrap_or("?"),
+        core::str::from_utf8(node).unwrap_or("?"),
+        ids.n_clocks,
+        ids.n_resets,
+        ids.n_pds,
+    );
+    for i in 0..ids.n_pds {
+        serial_println!(":: tegra: JD1-DC-IDS —   power-domain[{}] id = {} ({:#x}) ::", i, ids.pds[i], ids.pds[i]);
+    }
+    Some(ids)
+}
+
+/// One named JD1-DC-IDS abandon witness + the `None` the rung returns (tail-helper convention: each
+/// abandon stays a single `return` line, so no call-site `Location` moves). Names the node it was
+/// asked for — the whole reason the generalised reader could not reuse `ids_stop`, whose two
+/// messages say "usb@3610000" and whose text may not change without moving the disarmed image.
+#[cfg(feature = "jd1dc")]
+#[inline(never)]
+fn node_ids_stop(node_name: &[u8], why: &str, a: u64, b: u64) -> Option<XusbIds> {
+    serial_println!(
+        ":: tegra: JD1-DC-IDS STOP — node '{}': {} = {:#x} / {:#x}; resource ids unresolved ::",
+        core::str::from_utf8(node_name).unwrap_or("?"),
+        why,
+        a,
+        b,
+    );
+    None
+}
+
+/// JD1-DC-REG — say out loud what `nvdisplay_base` silently assumes about the `display@` node's
+/// `reg`, so a capture can CHECK the assumption instead of inheriting it.
+///
+/// The assumption: `nvdisplay_base` takes `reg.words[0..4]` — entry[0] — as the nvdisplay aperture.
+/// The DRIVE OS Tegra234 binding declares FOUR entries on this node, `reg-names =
+/// "nvdisplay", "dpaux0", "hdacodec", "mipical"`, and entry[0] IS the nvdisplay one — so the reader
+/// is right, but right by luck of ordering rather than by design, and nothing on the wire has ever
+/// said which entry was taken or how many there were. **Whether the L4T DTB this board actually
+/// hands us matches that binding — same order, same names — is UNMEASURED.** This is the instrument
+/// that would measure it.
+///
+/// Read-only RAM walk; prints, decides nothing, returns nothing. Every value here is a DTB datum —
+/// no MMIO is touched by this function and none may be: it runs long before the BPMP power guard.
+#[cfg(feature = "jd1dc")]
+fn nvdisplay_reg_census(fdt: &Fdt<'_>, node: &[u8], reg: &PropWords) {
+    // `reg` on this wrapper is (addr:2, size:2) cells = 16 bytes per entry. `total_len` is the
+    // property's TRUE byte length; `n` is how many words `PropWords` managed to capture (cap
+    // MAX_WORDS = 20 words = 5 entries). The two disagreeing is itself a finding.
+    let entries = reg.total_len / 16;
+    let ragged = reg.total_len % 16 != 0;
+    let captured = reg.n / 4;
+    serial_println!(
+        ":: tegra: JD1-DC-REG — node '{}': reg total_len={} B => {} entry/entries of (addr:2,size:2) cells{}; PropWords captured n={} words = {} whole entry/entries (cap MAX_WORDS={}). nvdisplay_base USES ENTRY[0] AND ONLY ENTRY[0]{} ::",
+        core::str::from_utf8(node).unwrap_or("?"),
+        reg.total_len,
+        entries,
+        if ragged { " (RAGGED — total_len is not a multiple of 16, so this is NOT a clean (addr:2,size:2) list and the decode below is unreliable)" } else { "" },
+        reg.n,
+        captured,
+        MAX_WORDS,
+        if entries > captured {
+            " — and MORE ENTRIES EXIST THAN WERE CAPTURED, so the list below is incomplete"
+        } else if entries > 1 {
+            " — the other entries are NOT dpaux/hdacodec/mipical by proof, only by the vendor binding; check reg-names below"
+        } else {
+            ""
+        },
+    );
+    // Every captured entry, so a reader can see for themselves which one is 0x13800000-shaped.
+    let mut e = 0usize;
+    while e < captured {
+        let a = ((reg.words[e * 4] as u64) << 32) | reg.words[e * 4 + 1] as u64;
+        let s = ((reg.words[e * 4 + 2] as u64) << 32) | reg.words[e * 4 + 3] as u64;
+        serial_println!(
+            ":: tegra: JD1-DC-REG —   entry[{}] addr={:#x} size={:#x}{} ::",
+            e,
+            a,
+            s,
+            if e == 0 { "  <== THIS is the aperture JD1-DC reads" } else { "" },
+        );
+        e += 1;
+    }
+    // `reg-names` is a NUL-separated string list, not cells. `PropWords` holds it as big-endian
+    // words, so rebuild the bytes and print them with NUL shown as '|' — this is what turns
+    // "entry[0] is nvdisplay" from an assumption into a wire fact. A missing `reg-names` is itself
+    // reported, because then the ordering claim has NO evidence on this board at all.
+    let names = fdt.prop_at(node, b"reg-names");
+    if !names.found {
+        serial_println!(
+            ":: tegra: JD1-DC-REG —   reg-names ABSENT on this node: nothing on this board identifies entry[0] as the nvdisplay aperture. The identification rests ENTIRELY on the vendor binding and on entry[0] being 0x13800000-shaped ::"
+        );
+        return;
+    }
+    let mut buf = [b'?'; MAX_WORDS * 4];
+    let mut w = 0usize;
+    while w < names.n && w * 4 < buf.len() {
+        let b = names.words[w].to_be_bytes();
+        let mut k = 0usize;
+        while k < 4 {
+            let c = b[k];
+            buf[w * 4 + k] = if c == 0 { b'|' } else if (0x20..0x7f).contains(&c) { c } else { b'.' };
+            k += 1;
+        }
+        w += 1;
+    }
+    let shown = (names.total_len).min(w * 4);
+    serial_println!(
+        ":: tegra: JD1-DC-REG —   reg-names total_len={} B, showing {} B ('|' = NUL): '{}'{} ::",
+        names.total_len,
+        shown,
+        core::str::from_utf8(&buf[..shown]).unwrap_or("<non-utf8>"),
+        if names.total_len > w * 4 { " (TRUNCATED by the PropWords word cap — more names exist)" } else { "" },
+    );
 }

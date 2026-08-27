@@ -256,7 +256,7 @@ static ALT_ACTIVE: AtomicBool = AtomicBool::new(false);
 ///
 /// (Ordering note for the statics above: single-writer throughout — `service()` is called from the
 /// main loop's device-service pass, one core, one call site per boot path. `Relaxed` is the same
-/// ordering `wcx`'s storage wait uses for the same reason, and no other module reads them.)
+/// ordering `desktop_uefi`'s storage wait uses for the same reason, and no other module reads them.)
 fn now_ms() -> u64 {
     crate::arch::ticks()
 }
@@ -521,7 +521,7 @@ fn wait_for_volume() {
     let now = now_ms();
     if !DEFER_ANNOUNCED.swap(true, Ordering::Relaxed) {
         // `.max(1)` keeps `0` meaning "not started" even in the vanishing case where `ticks()` reads
-        // 0 on the pass that defers — the same guard `wcx`'s storage wait uses.
+        // 0 on the pass that defers — the same guard `desktop_uefi`'s storage wait uses.
         DEFER_SINCE_MS.store(now.max(1), Ordering::Relaxed);
         NEXT_SPEAK_MS.store(now.saturating_add(WAIT_SPEAK_MS), Ordering::Relaxed);
         // Unchanged from arc 1 except for the tail: this is the line Boot D flew, and the tail is

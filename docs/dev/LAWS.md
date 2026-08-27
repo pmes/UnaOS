@@ -5,6 +5,26 @@ they are versioned and reviewable. Session memory keeps only pointers.
 `CLAUDE.md` covers layout, lanes, and arc discipline; this file records the
 laws minted at the bench and at the seat. Each entry names its origin date.
 
+
+## /tmp — NEVER. Peter's standing ruling.
+
+**Do not write anything to `/tmp` in this project: no scratch files, no diffs, no
+build output, no disassembly, no scratchpads.** Use `~/unaos-bench/scratch/<arc>/`.
+
+**Why, and the second reason is the serious one.** `/tmp` is cleared at 3 days,
+so a snapshot taken there is a snapshot with an expiry nobody records — the rmbp
+seat lost its executor scratchpads to exactly this and only the git worktrees
+survived. But `/tmp` here is also **RAM-backed**, and building under it
+**OOM-killed the harness** once. That is not a lost file; that is a dead session.
+
+**Why this is in LAWS.md and not a resume.** This ruling existed since at least
+2026-08-19 and was recorded ONLY in `unaos-pi4-resume.md` — one track's private
+file. The other two seats never saw it, and both broke it: rmbp lost work to the
+3-day clear, and orin wrote a 15 MB disassembly into `/tmp` and then reported the
+consequence upward as a discovery. **A standing ruling that lives in one track's
+resume is not a rule, it is a local habit.** If a ruling binds every seat, it
+belongs here, on the day it is made.
+
 ## Verification
 
 - **Verify before claiming owed** (2026-07-17). Never write an "owed /

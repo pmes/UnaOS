@@ -15,7 +15,7 @@
 #
 # Default off means a REQUIRE for a typed line, placed in the base spec, would red the
 # classic gate for doing exactly what it is supposed to do — the identical argument the
-# `[dragperf]` and `[dragwedge]` families make in pi4-regression.spec about `pidesk`-gated
+# `[dragperf]` and `[dragwedge]` families make in pi4-regression.spec about `desktop_firmware`-gated
 # fixtures, where the conclusion was "FORBID, not REQUIRE, and the REQUIRED COUNT MUST NOT
 # MOVE". Same conclusion here, one step further: those families were stuck with a FORBID
 # because there was one spec and one battery. A second spec, asserted ADDITIONALLY and only

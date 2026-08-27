@@ -2,7 +2,7 @@
 // Copyright (C) 2026 The Architect & Una
 //
 //! QUARRY — the file manager's KNOB SEAM. The module itself is compiled with the desktop furniture
-//! family (x86 `wc` **or** aarch64 `pidesk`, the same gate `dock`/`strip`/`menubar`/`crystal` carry),
+//! family (x86 `wc` **or** aarch64 `desktop_firmware`, the same gate `dock`/`strip`/`menubar`/`crystal` carry),
 //! but the implementation behind it is armed by `UNAOS_QUARRY=1` (the `quarry` feature) and nothing
 //! else.
 //!
@@ -12,14 +12,14 @@
 //! and that file is compiled into the **knob-off `kernel8.img`**, whose byte-identity proof a single
 //! ADDED line breaks (panic `Location` records embed file line numbers; PI-DESK measured a `cfg`-only
 //! `wm.rs` edit moving the knob-off hash for exactly this reason). So the hooks had to be folded into
-//! the `#[cfg(feature = "pidesk")]` one-liners that were already there, and a folded call cannot carry
+//! the `#[cfg(feature = "desktop_firmware")]` one-liners that were already there, and a folded call cannot carry
 //! a second `cfg` of its own without becoming a second line.
 //!
-//! The seam resolves that: the NAME `video::quarry::key_route` exists whenever `pidesk` does, and this
+//! The seam resolves that: the NAME `video::quarry::key_route` exists whenever `desktop_firmware` does, and this
 //! file decides whether it reaches [`live`] or a `false`. With `UNAOS_QUARRY` off the stubs below are
 //! `#[inline(always)] false` / no-ops, the implementation is not compiled at all, and the two edited
 //! router lines are the same length they were — so knob-off byte-identity is untouched and a
-//! `pidesk`-only build carries no file manager.
+//! `desktop_firmware`-only build carries no file manager.
 
 /// The implementation. Compiled only when `UNAOS_QUARRY=1` armed the `quarry` feature.
 #[cfg(feature = "quarry")]

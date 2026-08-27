@@ -24,7 +24,7 @@ extended by that seat.
   - **WC-BBSYNC re-landed** (x86 seat, 2026-08-03, hand port of `9a68d99d` onto the merged
     anchors — the origin commit is an ancestor of trunk, so its content was overwritten rather
     than reverted and it cannot be cherry-picked). `screen::adopt_desktop_bg` + `DESKTOP_BG_SEED`
-    are back and `wcx::activate` arms the latch, so the ghost-box hazard on the wc path is
+    are back and `desktop_uefi::activate` arms the latch, so the ghost-box hazard on the wc path is
     CLOSED. The witness flips `ABSENT` -> `[wc-x] backbuffer resync ARMED bg=… (desktop layer
     not yet constructed)` at activation, and the desktop layer answers with
     `[wc-x] backbuffer resync WxH (desktop bg …)` when its `Screen` is constructed. `ABSENT` no
@@ -91,7 +91,7 @@ extended by that seat.
 - Video-stack checks carry `UNAOS_WC=1`; banner must list `wc`.
 - Feature-proof hierarchy: **executed witness > strings-with-positive-control > banner**.
   Banner = compiled; strings = survived codegen; only an executed witness = reachable.
-- x86 compositor ignition: `wcx::activate` is called only from `kepler_display.rs` — x86 video
+- x86 compositor ignition: `desktop_uefi::activate` is called only from `kepler_display.rs` — x86 video
   gating needs the kepler knob set (`UNAOS_IVB/KEPLER/KEPLER_TAKEOVER/KEPLER_FIFO/SMC`), not
   `UNAOS_WC` alone. pi activation is default-path (metal-proven).
 - No QEMU suite on an unchanged tree — `mbench.py --replay` the existing capture.

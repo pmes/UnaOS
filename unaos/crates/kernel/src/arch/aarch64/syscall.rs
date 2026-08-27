@@ -4555,7 +4555,7 @@ pub fn clear_handle_row(asid: u64) {
     // and for the same reason: a window row outliving its owner would name a surface inside a backing
     // frame the slot's NEXT tenant gets, so the next program's private memory would be composited to the
     // panel. Unmaps the surfaces too, so the reused ASID starts with the reserved EL1-only leaves.
-    win_close_asid(asid);
+    win_close_asid(asid); #[cfg(feature = "orintenant")] super::display_tegra::orin_tenant_note_reap_done(asid); // ORIN-TENANT: the exit-path reap's wire witness — WINDOWS released by now; silent when the dying ASID owned no windows. Line-NEUTRAL.
     // WC-INT: the COMPOSITOR-side teardown, after WC-B's table teardown above and never before it. Order is
     // load-bearing in both directions:
     //   * WC-B first — `win_close_asid` unmaps the surfaces and frees the rows while holding `WINDOWS`, then
@@ -7807,6 +7807,26 @@ const EXEC_KILLED_STATUS: i32 = i32::MIN;
 /// with a real exit code for the same reason the kill sentinel does not.
 const EXEC_CLOSED_STATUS: i32 = i32::MIN + 1;
 
+/// EL0STACK — the `run` task's KERNEL stack size, and the measurement the U7STK law demands with it.
+///
+/// This is the stack the program's SYSCALL CHAINS run on, and those chains carry the largest frames in
+/// the kernel (`wm::composite` 6640 B; the `fbcon::__print -> composite` subtree 5520 B on its own) on
+/// behalf of whatever the EL0 program asks for. The blanket 16 KiB was measured EXHAUSTED on the very
+/// first armed reading (kernel8-test QEMU raspi4b, 2026-08-25, the EXEC-UVUG 300-frame vug run):
+///
+///   [el0stkhw] task=114:shell-run len=16384 hw=16384 headroom=0 loguard=1
+///   [redzone] cpu=2 LOW-REDZONE entered task=114:shell-run — … ABSORBED … grow this task's stack
+///
+/// `hw=16384` is SATURATING (a lower bound, never a depth) and `loguard=1` says the dip went past the
+/// floor into the 1024 B absorber — transiently: the run exited 0 and SPIN-6 saw nothing, which is
+/// exactly pi's finding (a parked task's ctx_sp is always in range; the dip happens between parks).
+/// The rest of the GUI-app class reads within a few hundred bytes of the same floor on the same boot
+/// (el0-fb headroom=1408, el0-wcb 344, el0-midden 344, one bg-user 344), and the U7STK conviction
+/// showed metal adds ~5.5 KiB of xHCI/fbcon subtree under chains QEMU never takes. 2x the blanket
+/// clears the measured (saturated) 16.4+ KiB with metal margin — the same figure the u7-launch and
+/// input tasks were sized to from their own converging lower bounds.
+const RUN_IMAGE_KSTACK_SIZE: usize = 32 * 1024;
+
 /// EXEC-1: load an already-read program IMAGE (flat or ELF64) into a fresh EL0 slot, run it to completion
 /// on THIS core, and return its exit status. The synchronous shell `run <path>` entry: the EL1/ASID-0 panel
 /// shell reads the bytes off the VFS and hands them here. We map (via the shared `map_image_into_slot`),
@@ -7826,6 +7846,15 @@ pub fn run_user_image(
     // re-bounds the flat path to one code page and each ELF segment to the window.
     if bytes.len() > super::uslots::USER_REGION_SIZE {
         return Err("image larger than the 16 KiB user window");
+    }
+    // EL0-EL1CORE — the same pre-check `spawn_user_image_bg` makes, asked about the core THIS launcher
+    // pins to (`this_cpu()`, the sys_spawn co-location invariant) rather than about `CPU_AUTO`. On the
+    // Orin that core is the BSP, which JM6 drops to EL1, so `run` passes the filter verbatim and is
+    // unaffected — which is the whole reason the fix filters instead of clamping. The check is here so
+    // that if `run` is ever reached from a task running on an EL2 AP, the operator is told so on the
+    // console instead of being handed a pid of 0 and a program that never ran.
+    if !super::sched::el0_placement_possible(super::percpu::this_cpu().cpu_index as usize) {
+        return Err("this core is not at EL1; an EL0 program cannot be dispatched here (EL0-EL1CORE)");
     }
     // Claim the Proc entry FIRST so a failed map frees nothing but the entry (no slot is allocated on any
     // map-failure path), and so the pid slot exists before the co-located task can be dispatched.
@@ -7887,7 +7916,14 @@ pub fn run_user_image(
     // wide with no UART write inside, which is why only this launcher ever failed on metal. See
     // `proc_find_unpublished` for the full accounting of which publishers can match and why.
     PROCS[pi].asid.store(asid, Ordering::Release);
-    let pid = super::sched::spawn_user_slot(name, mapped.base, mapped.sp, mapped.ttbr0, cpu);
+    let pid = super::sched::spawn_user_slot_stack(
+        name,
+        mapped.base,
+        mapped.sp,
+        mapped.ttbr0,
+        cpu,
+        RUN_IMAGE_KSTACK_SIZE,
+    );
     // Publish the pid. The row may ALREADY be `PEXITED` by now (the late-publish rescue fired inside the
     // window); storing the pid onto a reaped-but-not-yet-freed row is harmless — the row is not recycled
     // until `proc_free`, and the wait loop below observes `PEXITED` on its very first pass.
@@ -7907,6 +7943,12 @@ pub fn run_user_image(
     // Timeout path (task still alive, no teardown yet). Setting a focus RESETS the ring, so a fresh program
     // starts with an empty input queue.
     user_input_set_active(asid);
+    // ORIN-INPUT: zero the per-run input counters so the rollup below reports THIS tenant's input rather
+    // than the boot's running total. See `xusb_tegra`'s ORIN-INPUT block for why the tegra path needs a
+    // pump of its own: no `baremetal` => no `usb_pump` task and no `route_input_to_active_el0`, and the
+    // Orin's only HID pump (`jd2_console_pump`) is parked in this very call stack for the whole run.
+    #[cfg(feature = "orininput")]
+    super::xusb_tegra::oi_reset();
     // Deadline-bounded cooperative wait: yield so the co-located task runs; its SYS_EXIT (or the fault-kill
     // path) marks PROCS[pi] EXITED and records the status via the GENERIC child-reap short-circuit.
     //
@@ -8033,6 +8075,14 @@ pub fn run_user_image(
         if run_deadline_timed_out(in_takeover, now, budget_start, deadline_ticks) {
             break;
         }
+        // ORIN-INPUT: the tegra input pump. This wait loop is the ONE context that runs for exactly as
+        // long as the tenant does — the shell task is parked here, so on the Orin nothing else is polling
+        // the controller (`jd2_console_pump`, the board's only pump, is blocked further down this same
+        // call stack, which is also why its `[orinclick]`/`[orintenant]` censuses cannot emit during a
+        // run). Harvest xHCI, then route through the shared `user_input_enqueue` seam. Placed AFTER the
+        // deadline check and BEFORE the yield so a run about to end does not take a fresh claim.
+        #[cfg(feature = "orininput")]
+        super::xusb_tegra::oi_pump();
         super::sched::yield_now();
     }
     let outcome = if PROCS[pi].state.load(Ordering::Acquire) == PEXITED {
@@ -8044,6 +8094,12 @@ pub fn run_user_image(
     } else {
         RunOutcome::Timeout
     };
+    // ORIN-INPUT: the per-run input rollup, emitted UNCONDITIONALLY — a run that delivered nothing must
+    // say so with a named verdict, because a silent hop is indistinguishable from a hop that never ran.
+    // Printed BEFORE the focus clear just below so its `focus=` field still shows the ASID this run
+    // actually held, not the 0 the clear is about to install.
+    #[cfg(feature = "orininput")]
+    super::xusb_tegra::oi_rollup("final");
     // INPUT-WIRE: drop input focus so the shell regains the keyboard the instant this program returns.
     // Belt-and-suspenders with `clear_handle_row`'s teardown clear (which fired already if the program
     // exited/was killed and its slot was torn down) — and the SOLE clear on the Timeout path, where the
@@ -8261,6 +8317,23 @@ pub enum BgPoll {
 pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str> {
     if bytes.len() > super::uslots::USER_REGION_SIZE {
         return Err("image larger than the 16 KiB user window");
+    }
+    // EL0-EL1CORE — REFUSE BEFORE ANYTHING IS CLAIMED. `sched::spawn_user_slot` filters the EL0
+    // candidate set down to cores that are at EL1 and REFUSES (returns task id 0) when that set is
+    // empty; on the Orin today it always is, because `ONLINE_MASK[0]` is false and cores 1-5 all
+    // replay the BSP's EL2 regime, so EVERY `bg` is refused. Asking here — before `proc_reserve`,
+    // before the image is mapped into a slot — means the refusal costs no unwinding, and (the point)
+    // it takes the `Err` arm, which `shell.rs`'s `bg_program` already prints to the CONSOLE. Without
+    // it the shell would report `bg: /fat/vug.elf started — pid 0` and read as a win: task id 0 is a
+    // sentinel nobody at a bench knows, and a refusal that reports success is worse than the board
+    // kill it replaces, which was at least unambiguous.
+    //
+    // Placed on the `CPU_AUTO` request this launcher actually makes, so it answers the same question
+    // the spawn will. It is advisory only — the spawn re-checks and refuses on its own — and it can
+    // only ever be stale in the safe direction: `mark_online` is one-way, so a core can join the
+    // candidate set between the two points but never leave it.
+    if !super::sched::el0_placement_possible(super::sched::CPU_AUTO) {
+        return Err("no core is at EL1 to host a background EL0 task on this platform (EL0-EL1CORE)");
     }
     let Some(pi) = proc_reserve() else {
         return Err(proc_table_full_reason());
@@ -10936,6 +11009,25 @@ fn sys_thread_spawn(entry: u64, sp: u64, arg: u64, place: u64) -> i64 {
     }
     let caller = super::percpu::this_cpu().cpu_index as usize;
     let cpu = if place == 1 { super::sched::other_online_cpu(caller) } else { caller };
+    // EL0-EL1CORE — REFUSE BEFORE THE RETAIN. `spawn_user_thread` filters the EL0 candidate set to
+    // cores at EL1 and refuses when it is empty, returning a `JoinHandle` with id 0; the retain below
+    // is taken BEFORE that call and its balancing release is the new thread's own `exit()`, so a
+    // refusal discovered after the retain would leak a slot reference permanently. Asking here costs
+    // nothing and keeps the failure a defined syscall return the EL0 program can read.
+    //
+    // `other_online_cpu` already applies the same filter to the `place == 1` sibling HINT and falls
+    // back to `caller` when no EL1 sibling qualifies, so on the Orin a threaded program keeps working
+    // — co-placed with its parent rather than refused. This arm therefore fires only if the CALLER's
+    // own core is not at EL1, which for a live EL0 task is impossible by construction (nothing could
+    // have placed it there). It is the fail-closed backstop for that "impossible".
+    //
+    // EAGAIN is reused rather than given a code of its own, and that is a KNOWN CONFLATION worth
+    // naming: it already means "the thread table is full, try later", which is transient, while this
+    // condition is a standing platform limitation until the secondaries drop to EL1. The serial line
+    // `spawn_user_thread` emits is what distinguishes them today.
+    if !super::sched::el0_placement_possible(cpu) {
+        return EAGAIN;
+    }
     // Claim a tracking slot, retain the shared address space for the new thread, then spawn it. The retain
     // precedes the spawn so the slot cannot be torn down between here and the thread's first dispatch; the
     // thread's own exit balances it (`teardown_user_slot`). The lock spans the spawn (a brief critical
@@ -11493,46 +11585,46 @@ fn spinhunt_witness() {
 }
 
 /// BG-SPREAD — the regression leg for the P62 stacking. Launches `NBG` background programs and
-/// REQUIREs that their parent tasks did not all land on the same core.
+/// REQUIREs that each parent was PLACED on a core holding the minimum runnable-EL0-resident count
+/// (`el0_active`) at the instant of its own launch — the actual `CPU_AUTO` placement contract.
 ///
-/// WHAT THE EXISTING LEGS COULD NOT CATCH. Every `bg` leg in this file launches ONE program at a
-/// time, so none of them can observe a relationship BETWEEN launches — and stacking is only visible
-/// as a relationship. The `:: SCHED: task 'bg-user' -> core N ::` placement line has always carried
-/// the raw fact, but a spec REQUIRE matches one line at a time and cannot count distinct cores
-/// across several; this leg does the counting in the kernel and states the result in one assertable
-/// line. (The `SCHED: load` row cannot substitute: attended P62 showed it reading a flat
-/// `c0=51 c1=99 c2=52 c3=0` while four bg vugs each visibly slowed — the meter was correct and the
-/// placement was the fault, which is exactly why the assertion has to be on placement.)
+/// WHAT THE EXISTING LEGS COULD NOT CATCH. Every other `bg` leg launches ONE program at a time, so
+/// none can observe a relationship BETWEEN launches — and stacking is only visible as one (attended
+/// P62: four bg vugs slowed while `SCHED: load` read flat — the PLACEMENT was the fault).
 ///
-/// THE LEG. Spawn `NBG` copies of the BGSPREAD fixture back to back, reading each one's chosen core
-/// from `sched::last_user_placement()` immediately after its own spawn; then kill and reap all of
-/// them so the process table is left exactly as it was found (the KILLBOUND/SPINHUNT courtesy — this
-/// leg runs inside the same battery). The assertion is `distinct >= 2`.
+/// THE LEG. Immediately before each of `NBG` back-to-back spawns, snapshot every online core's
+/// `el0_active` (`sched::el0_active_snapshot` — `pick_cpu`'s PRIMARY key); spawn; read the chosen
+/// core from `sched::last_user_placement()`; REQUIRE the chosen core's snapshotted count to equal
+/// the minimum (argmin membership). Then kill + reap every launch (KILLBOUND/SPINHUNT courtesy).
 ///
-/// WHY `>= 2` AND NOT `== NBG`. The property under test is that placement is a function of LOAD, not
-/// of the launcher's core. A load-balanced policy is *allowed* to reuse a core — if two cores are
-/// genuinely the least loaded and one drains first, landing twice on it is correct behaviour, and a
-/// `== NBG` assertion would make a correct scheduler flap. `>= 2` is the strongest claim that is
-/// true for every legal execution, and it is still fatal to the bug: co-location can only ever
-/// produce 1.
+/// WHY ARGMIN MEMBERSHIP AND NOT "DISTINCT CORES". The first cut asserted `distinct >= 2`, and
+/// boot 12 redded it while the scheduler was CORRECT: SPINHUNT residue held cores 0/2/3
+/// (`load settled c0=8 c1=0 c2=38 c3=99`), core 1 was the strict key-1 minimum, and winning all
+/// three launches was right — the same code read `cores 3,0,1 distinct=3 PASS` on a clean boot. A
+/// distinct count claims a LOAD PATTERN; argmin membership is the policy itself, and residual
+/// load only shrinks the argmin set. Ties legal; keys 2-4 pick among them, deliberately unasserted.
 ///
-/// TEETH (the A/B). On the pre-arc code `spawn_user_image_bg` passed `this_cpu()`, and all `NBG`
-/// launches run from this one witness task on one core, so `distinct` is 1 BY CONSTRUCTION and the
-/// leg fails on every boot — it cannot pass for a lucky reason. With `CPU_AUTO`, spread is
-/// STRUCTURAL, not atmospheric (corrected 2026-07-26 after the U7FIX composition false-red): each
-/// fixture busy-spins boundedly before parking, so it still occupies its core's ready queue while
-/// the next placement is decided, and `pick_cpu`'s FIRST tiebreak (queue depth) avoids used cores
-/// by construction. The original claim leaned on the rotating tie-break, which only breaks FULL
-/// ties — the busy-fraction criterion almost never fully ties, and on a calm boot one strictly-least
-/// core legally won all three placements (`distinct=1`, correct policy, red leg).
+/// TIEBREAK ORDER, CORRECTED. An earlier revision of this block claimed queue depth was
+/// `pick_cpu`'s FIRST tiebreak. It is KEY 2: the PRIMARY key is `el0_active` (SPREAD-3/SPREAD-4,
+/// committed minus parked), then queue depth, then busy fraction, then the rotating cursor. The
+/// SPREAD-10 half-resident bonus only decides ties WITHIN the argmin set — never beats a resident.
 ///
-/// An honest skip on a boot with fewer than 2 online cores (the metal 3-of-4 variance in the spec
-/// header has a uniprocessor tail): with one candidate core there is no spread to observe, and a
-/// `distinct=1` there would be correct rather than a regression.
+/// TEETH (the A/B). On the pre-arc code `spawn_user_image_bg` passed `this_cpu()`, so launch 2
+/// lands back on the launcher's core while it still carries launch 1's committed resident (each
+/// fixture busy-spins boundedly before parking, so a back-to-back launch observes it) — count 1
+/// against a 0 elsewhere, outside the argmin set: the leg fails BY CONSTRUCTION, not by luck.
+///
+/// HONEST WINDOW. The snapshot precedes its own spawn with no yield between, and the battery runs
+/// no other slot spawner (`last_user_placement`'s argument). A PARK in the window could drop the
+/// true argmin below the recorded one — but the fixture's bounded busy-spin outlives the launch
+/// loop by design, and battery residue that is runnable (yield-polling) never parks.
+///
+/// An honest skip below 2 online cores (the metal 3-of-4 variance has a uniprocessor tail).
 fn bgspread_witness() {
-    /// Launches. Three is the smallest count that distinguishes "spread" from "alternates with the
-    /// launcher's core" — with two, a policy that merely bounced to the sibling would also pass.
+    /// Launches. Three preserved from the first cut: launch i's committed resident is on the board
+    /// when launch i+1 is placed, so the leg watches placement REACT to load it created itself.
     const NBG: usize = 3;
+    const NC: usize = super::percpu::NUM_CPUS; // snapshot width; offline cores read `usize::MAX`
 
     let online = super::sched::online_cpu_count();
     if online < 2 {
@@ -11549,33 +11641,38 @@ fn bgspread_witness() {
 
     let mut live: [(u64, u64); NBG] = [(0, 0); NBG]; // (pid, asid)
     let mut cores = [usize::MAX; NBG];
+    let mut loads = [usize::MAX; NBG]; // the chosen core's snapshotted el0_active, per launch
+    let mut mins = [usize::MAX; NBG]; // the snapshot minimum over online cores, per launch
+    let mut inmin = 0usize;
     let mut launched = 0usize;
     let mut first_fail = "";
+    #[cfg(feature = "witness")] let key1 = super::sched::el0_active_snapshot; // key-1 reader; the accessor itself is `witness`-gated in sched.rs so the knob-off image carries no extra item
+    #[cfg(not(feature = "witness"))] let key1 = |_c: usize| usize::MAX; // knob-off stub: this leg is UNREACHABLE without `witness` (`u7-launch` is gated at its main.rs spawn) — the stub only keeps the token stream compiling
     for i in 0..NBG {
+        // Key-1 snapshot FIRST: after the spawn the chosen core carries this launch's own resident.
+        let mut snap = [usize::MAX; NC];
+        let mut minv = usize::MAX;
+        for c in 0..NC {
+            snap[c] = key1(c); // `usize::MAX` when offline
+            if snap[c] < minv { minv = snap[c]; } // one line — this region is line-budgeted (see ⚠ below)
+        }
         match spawn_user_image_bg(blob) {
             Ok((pid, asid, _)) => {
                 // Read the placement the spawn just made. Sound here for the reason
                 // `last_user_placement` documents: this task made the call and reads it back before
                 // yielding, and the fixture-battery context has no other slot spawner running.
-                cores[i] = super::sched::last_user_placement();
+                let core = super::sched::last_user_placement();
+                cores[i] = core;
+                loads[i] = if core < NC { snap[core] } else { usize::MAX };
+                mins[i] = minv;
+                if loads[i] == minv { inmin += 1; } // ⚠ folded: knob-off line numbers are load-bearing in this file
                 live[i] = (pid, asid);
                 launched += 1;
             }
             Err(why) => {
-                if first_fail.is_empty() {
-                    first_fail = why;
-                }
+                if first_fail.is_empty() { first_fail = why; } // ⚠ folded, same budget
                 break;
             }
-        }
-    }
-
-    // Distinct cores among the launches that actually happened. NBG is 3, so an O(n^2) scan is the
-    // clearest way to say it and needs no allocation.
-    let mut distinct = 0usize;
-    for i in 0..launched {
-        if !cores[..i].contains(&cores[i]) {
-            distinct += 1;
         }
     }
 
@@ -11587,26 +11684,21 @@ fn bgspread_witness() {
         let t0 = super::timer::cntpct();
         let budget = super::timer::cntfrq().saturating_mul(5);
         loop {
-            if matches!(bg_poll(pid, true), BgPoll::Gone) {
-                settled += 1;
-                break;
-            }
-            if super::timer::cntpct().wrapping_sub(t0) >= budget {
-                break;
-            }
+            if matches!(bg_poll(pid, true), BgPoll::Gone) { settled += 1; break; } // ⚠ folded, same budget
+            if super::timer::cntpct().wrapping_sub(t0) >= budget { break; } // ⚠ folded, same budget
             super::sched::yield_now();
         }
     }
 
-    if launched == NBG && distinct >= 2 && settled == NBG {
+    if launched == NBG && inmin == NBG && settled == NBG {
         serial_println!(
-            ":: BGSPREAD: {} bg launches over {} online cores -> cores {},{},{} distinct={} (want >= 2) PASS ::",
-            launched, online, cores[0], cores[1], cores[2], distinct
+            ":: BGSPREAD: {} bg launches over {} online cores -> cores {},{},{} el0min {}/{},{}/{},{}/{} inmin={} (want == 3) PASS ::",
+            launched, online, cores[0], cores[1], cores[2], loads[0], mins[0], loads[1], mins[1], loads[2], mins[2], inmin
         );
     } else {
         serial_println!(
-            ":: BGSPREAD: launched={}/{} distinct={} settled={} first_fail='{}' -> FAIL ::",
-            launched, NBG, distinct, settled, first_fail
+            ":: BGSPREAD: launched={}/{} inmin={} cores={},{},{} el0min={}/{},{}/{},{}/{} settled={} first_fail='{}' -> FAIL ::",
+            launched, NBG, inmin, cores[0], cores[1], cores[2], loads[0], mins[0], loads[1], mins[1], loads[2], mins[2], settled, first_fail
         );
     }
 }
@@ -12299,7 +12391,7 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     // Reject BEFORE any truncation could hide an out-of-range request (a 64-bit arg cast to u32 could
     // otherwise wrap a huge value into a legal one).
     if w > super::uslots::FB_WIN_MAX_W as u64 || h > super::uslots::FB_WIN_MAX_H as u64 {
-        return EINVAL;
+        { #[cfg(feature = "orintenant")] super::display_tegra::orin_tenant_note_refuse(w, h); return EINVAL; } // ORIN-TENANT: name the over-cap refusal on the wire (unheld — no lock is taken yet). Line-NEUTRAL per this file's PANIC-Location rule.
     }
     let pages = match win_pages_for(w32, h32) {
         Some(p) => p,
@@ -12371,7 +12463,7 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
         }
     }
     fb_info_write_win(slot, id, &e);
-    id as i64
+    { #[cfg(feature = "orintenant")] super::display_tegra::orin_tenant_note_create(asid, id as u64, w32, h32, e.wm_id != crate::video::wm::WIN_NONE); id as i64 } // ORIN-TENANT: the create's wire witness. Printed UNDER the WINDOWS hold deliberately — global order WINDOWS ⊃ wm::TABLE ⊃ WRITER, a routed console's println descends exactly that way, and a create is program-rate (the same masked-hold class sys_win_present takes per frame). Line-NEUTRAL per this file's PANIC-Location rule.
 }
 
 /// SYS_WIN_PRESENT(win): damage-mark + composite the caller's window. Ownership-gated (`-EBADF`/`-EACCES`).
@@ -12614,7 +12706,7 @@ fn sys_win_close(win: u64) -> i64 {
     // that spins until in-flight composites finish, and the surface it is draining has just been unmapped
     // above, so the drain must not be nested inside the lock a racing presenter may be waiting on.
     wc_shim::destroy(wm_id);
-    0
+    { #[cfg(feature = "orintenant")] super::display_tegra::orin_tenant_note_close(asid, win); 0 } // ORIN-TENANT: the owner-close wire witness, after the WINDOWS release and the wm drain above. Line-NEUTRAL per this file's PANIC-Location rule.
 }
 
 /// WC-B: close every window still owned by `asid` — the teardown half, called from `clear_handle_row`
@@ -12639,7 +12731,7 @@ pub fn win_close_asid(asid: u64) {
             unsafe { super::uslots::unmap_slot_fb_win(slot, e.rslot as usize, e.pages as usize) };
             fb_info_clear_win(slot, e.rslot as usize);
             t[id] = WinEntry::FREE;
-            closed[id] = e.wm_id;
+            closed[id] = e.wm_id; #[cfg(feature = "orintenant")] super::display_tegra::orin_tenant_note_reap_row(asid); // ORIN-TENANT: bump only — inside the WINDOWS hold a print would be a gratuitous hold extension; note_reap_done prints the total past the lock. Line-NEUTRAL.
         }
     }
     // WC-INT: outside the `WINDOWS` hold, for the drain-barrier reason spelled out in `sys_win_close`.
@@ -13091,7 +13183,7 @@ pub fn user_input_enqueue(ev: crate::pal::Event) -> bool {
     //
     // Reserved only while there is somewhere to go: with fewer than two windows in the focus ring the key
     // falls through and is delivered as an ordinary TAB, so a single-window app keeps a normal keyboard.
-    #[cfg(feature = "pidesk")] if crate::video::crystal::key_escape(ev) || crate::video::quarry::key_route(ev) { return true; } if wc_focus_key(ev) { // MENUBAR-PI: <Esc> dismisses an OPEN SHARD menu, asked FIRST — x86 asks the identical question in the identical position (`wc_route_event`, ahead of `wc_focus_key`), because a modal surface must get the key before the focus ring does or Escape would TAB the desktop out from under an open menu. `key_escape` consumes ESC only while the menu is open, so every other boot is byte-alike. ⚠ ONE LINE, folded onto the `if` below: a line ADDED to this file renumbers every panic `Location` under it and breaks the knob-off `kernel8.img` byte-identity proof (PI-DESK's rule, and this file is named in it).
+    #[cfg(feature = "desktop_firmware")] if crate::video::crystal::key_escape(ev) || crate::video::quarry::key_route(ev) { return true; } if wc_focus_key(ev) { // MENUBAR-PI: <Esc> dismisses an OPEN SHARD menu, asked FIRST — x86 asks the identical question in the identical position (`wc_route_event`, ahead of `wc_focus_key`), because a modal surface must get the key before the focus ring does or Escape would TAB the desktop out from under an open menu. `key_escape` consumes ESC only while the menu is open, so every other boot is byte-alike. ⚠ ONE LINE, folded onto the `if` below: a line ADDED to this file renumbers every panic `Location` under it and breaks the knob-off `kernel8.img` byte-identity proof (PI-DESK's rule, and this file is named in it).
         return true;
     }
     // CLICK-ROUTE: the pointer's twin of the line above, and in the same place for the same reason —
@@ -13728,7 +13820,7 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
     if mask & !prev != 0 {
         // PRESS edge.
         let (x, y) = click_pointer_pos();
-        #[cfg(feature = "pidesk")] if crate::video::strip::press_route(x, y) { crate::video::quarry::service(); CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); return true; } else if crate::video::pulsewin::press_route(x, y) || crate::video::quarry::press_route(x, y) { CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); return true; } // PI-DESK: furniture before every window arm — see this fn's header. Order: the strips first (they composite on top); on a strip-consumed press quarry::service() drains the dock tile's reopen latch HERE (a router does no disk I/O; this input-drain context is where the shell's own ls reads volumes). PULSEWIN and QUARRY then claim ONLY their own window's discs/menus, each re-asking wm::hit_test so an occluding window keeps every press; everything else falls to the arms below (keeps both draggable/parkable). ⚠ folded IN PLACE, never added lines: knob-off line numbers are load-bearing — PARITY.md §5.3.
+        #[cfg(feature = "desktop_firmware")] if crate::video::strip::press_route(x, y) { crate::video::quarry::service(); CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); return true; } else if crate::video::pulsewin::press_route(x, y) || crate::video::quarry::press_route(x, y) { CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); return true; } // PI-DESK: furniture before every window arm — see this fn's header. Order: the strips first (they composite on top); on a strip-consumed press quarry::service() drains the dock tile's reopen latch HERE (a router does no disk I/O; this input-drain context is where the shell's own ls reads volumes). PULSEWIN and QUARRY then claim ONLY their own window's discs/menus, each re-asking wm::hit_test so an occluding window keeps every press; everything else falls to the arms below (keeps both draggable/parkable). ⚠ folded IN PLACE, never added lines: knob-off line numbers are load-bearing — PARITY.md §5.3.
         match crate::video::wm::hit_test(x, y) {
             // CLOSE-BOX (P79) — checked FIRST, so the close box beats select. This is the ONE
             // point in the click grammar where a click ACTS: the box is explicit window FURNITURE
@@ -13823,8 +13915,8 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
                 true
             }
             // DRAG-PI M3 — CHROME (title strip / border) is judged AFTER the three controls and BEFORE every app arm, exactly as the x86 twin orders it: a press on kernel-drawn chrome is an instruction to the WINDOW SYSTEM and is consumed here, a press on content is the app's input and falls through. Neither starves the other — `chrome_hit` is `outer_box` MINUS `content_box`, a region the app's surface does not cover a pixel of, and it declines COMPAT rows so a full-screen app keeps its whole panel. FURNITURE follows x86's rule rather than inventing a Pi one: a kernel-band row (the console) IS draggable — its title bar is a grip like any other — but the KEYBOARD goes to the shell, because there is no ring behind a kernel owner to hand it to. `drag_begin` self-guards on `title_bar_hit`, so a press on a BORDER raises and consumes without minting a grab the geometry does not support; the gesture is steered by `wm::drag_route_tail` from the two drains and ended by the release edge below. The click grammar is untouched: this arm SELECTS and grabs, it stops nothing and starts nothing. ⚠ ONE-LINE shape and long prose are not style — this file is compiled into the knob-off `kernel8.img` and a line ADDED anywhere in it breaks that image's byte-identity proof (panic `Location` records embed line numbers), so this arm is 2 lines paid for by 2 removed below; the diff is line-NEUTRAL and must stay so.
-            #[cfg(feature = "pidesk")] Some((win, owner, _z)) if crate::video::wm::chrome_hit(win, x, y) => { if crate::video::wm::is_kernel_owner(owner) { user_input_set_active(0); } else if owner != cur { user_input_set_active(owner); } crate::video::wm::focus_changed(owner); let how = if crate::video::wm::drag_begin(win, x, y) { "drag" } else { "chrome" }; if CLOSE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX { serial_println!("[clickroute] press chrome win={} owner={} at ({},{}) -> {}", win, owner, x, y, how); } CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); true }
-            #[cfg(feature = "pidesk")] Some((win, owner, _z)) if crate::video::wm::is_kernel_owner(owner) => { serial_println!("[clickroute] press hit furniture asid={} win={} (was {}) consume -> shell focus", owner, win, cur); user_input_set_active(0); crate::video::wm::focus_changed(owner); CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); true } // SHELLWIN-PI: KERNEL FURNITURE, on its CONTENT — raise it, hand the keyboard to the SHELL (asid 0), consume the press. Exact parity with the x86 arm of the same name (`arch/x86_64/syscall.rs`, "KERNEL FURNITURE — raise it, hand the keyboard to the shell"), including its POSITION: there the chrome block answers a furniture press on the title strip/border and this `hit_test` arm answers one on the content, and DRAG-PI's chrome arm directly above is that same first half on this arch. Without this second half the shell window is a trap — a press on its TEXT (chrome_hit is `outer_box` MINUS `content_box`, so the text is not chrome) would fall to the `owner != cur` arm below and `user_input_set_active(KERNEL_OWNER_DESKTOP)`, an "ASID" with no ring: clicking your own shell would take the keyboard AWAY from it, the SHELLWIN defect re-entered through the pointer. Below the close/minimise/zoom arms rather than above them as on x86, deliberately: those arms are where PA38's refused-close ruling lives on this arch, and this arc rides that path instead of diverting it. ⚠ ONE LINE, paid for by one line merged in this fn's header — panic `Location` records embed line numbers, so the knob-off `kernel8.img` byte-identity proof requires this diff to stay line-NEUTRAL.
+            #[cfg(feature = "desktop_firmware")] Some((win, owner, _z)) if crate::video::wm::chrome_hit(win, x, y) => { if crate::video::wm::is_kernel_owner(owner) { user_input_set_active(0); } else if owner != cur { user_input_set_active(owner); } crate::video::wm::focus_changed(owner); let how = if crate::video::wm::drag_begin(win, x, y) { "drag" } else { "chrome" }; if CLOSE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX { serial_println!("[clickroute] press chrome win={} owner={} at ({},{}) -> {}", win, owner, x, y, how); } CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); true }
+            #[cfg(feature = "desktop_firmware")] Some((win, owner, _z)) if crate::video::wm::is_kernel_owner(owner) => { serial_println!("[clickroute] press hit furniture asid={} win={} (was {}) consume -> shell focus", owner, win, cur); user_input_set_active(0); crate::video::wm::focus_changed(owner); CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); true } // SHELLWIN-PI: KERNEL FURNITURE, on its CONTENT — raise it, hand the keyboard to the SHELL (asid 0), consume the press. Exact parity with the x86 arm of the same name (`arch/x86_64/syscall.rs`, "KERNEL FURNITURE — raise it, hand the keyboard to the shell"), including its POSITION: there the chrome block answers a furniture press on the title strip/border and this `hit_test` arm answers one on the content, and DRAG-PI's chrome arm directly above is that same first half on this arch. Without this second half the shell window is a trap — a press on its TEXT (chrome_hit is `outer_box` MINUS `content_box`, so the text is not chrome) would fall to the `owner != cur` arm below and `user_input_set_active(KERNEL_OWNER_DESKTOP)`, an "ASID" with no ring: clicking your own shell would take the keyboard AWAY from it, the SHELLWIN defect re-entered through the pointer. Below the close/minimise/zoom arms rather than above them as on x86, deliberately: those arms are where PA38's refused-close ruling lives on this arch, and this arc rides that path instead of diverting it. ⚠ ONE LINE, paid for by one line merged in this fn's header — panic `Location` records embed line numbers, so the knob-off `kernel8.img` byte-identity proof requires this diff to stay line-NEUTRAL.
             Some((win, owner, _z)) if owner != cur => {
                 // The ONLY line this arc adds to serial, and only on the arm that changes behaviour:
                 // a click that MOVED focus. Human-rate by construction (one line per click that lands
@@ -13873,7 +13965,7 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
     } else if prev & !mask != 0 {
         // RELEASE edge — follow the press, or drop. Never hit-tested: the release belongs to whoever
         // received the press, not to whatever the pointer has since been dragged over.
-        #[cfg(feature = "pidesk")] if crate::video::wm::drag_active() != crate::video::wm::WIN_NONE { crate::video::wm::drag_end(); } // DRAG-PI M3 — the button coming up ENDS the grab, and this is the primary end: it carries the delivered edge, so the window rests where the operator let go and `[drag]`/`[wm-act] drag-end` name the gesture's cost and outcome on the wire exactly as they do on x86. No belt against a LOST release here (x86's `release-level` tail exists for an EHCI endpoint that can supersede a report before it is read); the Pi's xHCI drain has not shown that loss, and inventing a second ending for a failure this arch has not demonstrated would be machinery with no evidence behind it. `drag_forget` still cancels on close, so a grab cannot outlive its window.
+        #[cfg(feature = "desktop_firmware")] if crate::video::wm::drag_active() != crate::video::wm::WIN_NONE { crate::video::wm::drag_end(); } // DRAG-PI M3 — the button coming up ENDS the grab, and this is the primary end: it carries the delivered edge, so the window rests where the operator let go and `[drag]`/`[wm-act] drag-end` name the gesture's cost and outcome on the wire exactly as they do on x86. No belt against a LOST release here (x86's `release-level` tail exists for an EHCI endpoint that can supersede a report before it is read); the Pi's xHCI drain has not shown that loss, and inventing a second ending for a failure this arch has not demonstrated would be machinery with no evidence behind it. `drag_forget` still cancels on close, so a grab cannot outlive its window.
         let target = CLICK_PRESS_TARGET.load(Ordering::Acquire);
         target == CLICK_TARGET_DROP || target != cur
     } else {
@@ -14886,10 +14978,10 @@ fn wcb_launcher(_demo_cpu: usize) {
     crate::video::wm::ctrldecline_selftest();
     // DRAG-PI M4: the drag COST witness, after the control battery for the same reason it sits after
     // the hit-test one — it mints a row, drives it edge to edge twice and reaps it, so it must not run while another fixture's one-shots are still owed. It restores nothing because it takes nothing: `move_to` on its own row, and a grab it cancels itself.
-    #[cfg(all(feature = "witness", feature = "pidesk"))]
+    #[cfg(all(feature = "witness", feature = "desktop_firmware", feature = "baremetal"))]
     crate::video::wm::dragperf_selftest();
     // DRAGWEDGE: the PA41 freeze fixture, immediately after the drag COST witness because it is the same shape of scene one hazard over — it mints a KERNEL-BAND row, presses its title strip through this file's own router, then holds a `BlitGuard` open to reproduce the metal's `blit_active=1` and proves the drag path is BOUNDED, that the grab it could not service is RELEASED, that a fresh grab is REFUSED while the stall stands, and that the refusal LIFTS when the compositor recovers. It runs AFTER `dragperf` deliberately: that fixture measures a healthy drag path and this one deliberately stalls the compositor for a bounded interval, so the order keeps the measurement out of the stall's shadow.
-    #[cfg(all(feature = "witness", feature = "pidesk"))]
+    #[cfg(all(feature = "witness", feature = "desktop_firmware", feature = "baremetal"))]
     crate::video::wm::dragwedge_selftest();
     // PAPER: the kit texture's determinism fixture, LAST — it neither mints a window nor reads the
     // panel, so it perturbs nothing above it, and its only side effect is generating the one tile
@@ -15568,7 +15660,7 @@ fn u7_release_go(slot: usize) {
 // U7STK (PARITY §6.1b) — THE CONVICTED FRAME, and why the fix is `#[inline(never)]`.
 //
 // THE DEFECT. On Pi metal `u7-launch` is dropped between `wcb_launcher` and
-// `video::pidesk::arm()` by the SPIN-6 refusal in `arch/aarch64/sched.rs`:
+// `video::desktop_firmware::arm()` by the SPIN-6 refusal in `arch/aarch64/sched.rs`:
 //
 //   [spin6] cpu=2 REFUSING corrupt switch-in: task=70:u7-launch ctx_sp=0x20c9e70
 //   outside its stack [0x20ca000,0x20ce000) — the parked frame was OVERWRITTEN
@@ -15756,7 +15848,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     // uncounted `:: EL0: window verbs — … ::` line.
     wcb_launcher(demo_cpu);
     u7stk!("after:wcb");
-    #[cfg(feature = "pidesk")] crate::video::pidesk::arm(); // SHELLWIN-PI: the last panel-READING fixture has returned, however it returned, so the desktop may now place furniture on the glass. At the CALLER rather than inside `wcb_launcher` deliberately: that fn has three early SKIP returns (blob oversize, no free slot, already-done), and arming from its tail would let a skipped fixture leave the Pi desktop with no shell window at all and no line saying why. This is the SECOND of the Pi's two desktop questions and it is not `pidesk::activate`'s: that one runs at the GUI handoff and asks "is this a desktop yet?", while the cascade it was called from is still running on the APs. x86 gets the ordering for free because its Kepler takeover happens after the cascade. Minting the shell window ahead of this point put a half-panel row across `[wc-j]`'s vacated-box read-backs, `[wc-f]`'s probe strip and `[clickroute]`'s hit-test: measured, `MBENCH FAIL — 104/108`. ⚠ ONE LINE, paid for by one merged in `wcb_launcher`'s tail commentary.
+    #[cfg(feature = "desktop_firmware")] crate::video::desktop_firmware::arm(); // SHELLWIN-PI: the last panel-READING fixture has returned, however it returned, so the desktop may now place furniture on the glass. At the CALLER rather than inside `wcb_launcher` deliberately: that fn has three early SKIP returns (blob oversize, no free slot, already-done), and arming from its tail would let a skipped fixture leave the Pi desktop with no shell window at all and no line saying why. This is the SECOND of the Pi's two desktop questions and it is not `desktop_firmware::activate`'s: that one runs at the GUI handoff and asks "is this a desktop yet?", while the cascade it was called from is still running on the APs. x86 gets the ordering for free because its Kepler takeover happens after the cascade. Minting the shell window ahead of this point put a half-panel row across `[wc-j]`'s vacated-box read-backs, `[wc-f]`'s probe strip and `[clickroute]`'s hit-test: measured, `MBENCH FAIL — 104/108`. ⚠ ONE LINE, paid for by one merged in `wcb_launcher`'s tail commentary.
     u7stk!("after:pidesk_arm");
     // BGRUN-ST: the background-run contract, headless — bg spawn -> exit -> reap (ELFHELLO), then a
     // kill mid-run (UVUG) proving the confirmed-kill arm reaps the row in place. Placed AFTER the UVUG
@@ -23187,4 +23279,30 @@ pub fn tegra_el0_verdict(_: usize) {
             unexp
         );
     }
+}
+
+/// ORIN-TENANT (rung 6) — the census's read of the WC-B window table, for
+/// `display_tegra::orin_tenant_census`. Returns `(live_rows, wm_bound_rows, presents)`: rows a real
+/// EL0 ASID owns right now, how many of those hold a compositor row (`wm_id != WIN_NONE` — the
+/// difference is the HEADLESS shape the census names), and the lifetime `FB_PRESENT_COUNT` (bumped
+/// by the ONE shared present body all three present verbs run, so it counts tenant frames without
+/// this rung touching any present path). A masked micro-hold — count and fold only, the same class
+/// as `sys_win_move`'s re-check hold; called ~1/10 s from the pump's sweep, never nested inside any
+/// other lock. FILE-TAIL on purpose: `syscall.rs` compiles into the knob-off Pi `kernel8.img`, and
+/// this file's standing PANIC-Location rule means new lines may land only at the tail (or inside
+/// existing lines) — `#[cfg(orintenant)]` keeps even that out of every non-tenant build.
+#[cfg(feature = "orintenant")]
+pub fn orin_tenant_win_stats() -> (u32, u32, u64) {
+    let _irq = IrqGuard::mask_save();
+    let t = WINDOWS.lock();
+    let (mut rows, mut bound) = (0u32, 0u32);
+    for e in t.iter() {
+        if e.owner != 0 {
+            rows += 1;
+            if e.wm_id != crate::video::wm::WIN_NONE {
+                bound += 1;
+            }
+        }
+    }
+    (rows, bound, FB_PRESENT_COUNT.load(Ordering::Acquire))
 }

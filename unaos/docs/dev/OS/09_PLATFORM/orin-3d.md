@@ -110,7 +110,7 @@ The claim is **true as stated, and narrower than it sounds.** Precisely:
 | vug renderer | `unaos/crates/kernel/src/vug.rs` | **Links unconditionally.** `pub mod vug;` at `lib.rs:92` — no `cfg`, no feature, no arch gate. Compiled into every kernel build on both arches, tegra included. |
 | PAL | `unaos/crates/kernel/src/pal.rs` (`GneissPal` / `TargetPal`) | Arch-neutral; `TargetPal` is always `Screen`-backed. The only `cfg` in the event path is the input source. |
 | Panel surface | `video/{screen,framebuffer,fbcon}.rs` + JD1 | Present and metal-proven. One `PixelFormat` contract above three display paths. |
-| Window manager | `video/wm.rs`, `strip.rs`, `dock.rs`, `pidesk.rs`, … | **Absent on this branch.** See PARITY §8.0/§8.1 — arrives at trunk sync, not owed a port. |
+| Window manager | `video/wm.rs`, `strip.rs`, `dock.rs`, `desktop_firmware.rs`, … | **Absent on this branch.** See PARITY §8.0/§8.1 — arrives at trunk sync, not owed a port. |
 
 So: *the renderer links and the renderer runs.* What does **not** exist is
 everything that would make it an application rather than a full-screen takeover.

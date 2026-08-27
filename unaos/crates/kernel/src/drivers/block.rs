@@ -57,9 +57,9 @@ pub enum BlockError {
 ///
 /// Unmasked callers keep the old effectively-blocking semantics, honestly bounded: retry the claim
 /// with a `hlt` between attempts (each wakes on the next IRQ, letting the scheduler run the loan
-/// holder) up to `hw_wait_budget()` wall-clock — long enough for any healthy service pass or BOT
-/// transaction, short enough that a wedged 25 s failing-transfer hold surfaces as `Busy` instead of
-/// hanging the caller forever.
+/// holder) up to `hw_wait_budget()` wall-clock — long enough for any healthy SERVICE PASS, but NOT for
+/// every healthy BOT transaction: the driver itself budgets a first attempt at 3× this wait (`BOT_BUDGET_SCALE_FIRST` in `xhci/mod.rs`), so a slow-but-healthy transfer can hold the loan past this whole wait, and `Busy` is then a NORMAL, RETRYABLE outcome — not a wedge verdict (`usb_xhci.md` §32.3).
+/// Still short enough that a wedged 25 s failing-transfer hold surfaces as `Busy` instead of hanging the caller forever.
 fn claim_xhci_for_io() -> Result<XhciLoan, BlockError> {
     match xhci::claim() {
         Ok(l) => return Ok(l),
@@ -242,7 +242,7 @@ pub fn usb_info() -> Option<BlockDeviceInfo> {
 // x86 is fixed: `register_sdhc` runs synchronously inside `pci::init` (`sdhc::probe` -> `bring_up`),
 // while `publish_usb_geometry` runs from the main loop's deferred SCSI bring-up
 // (`xhci::service_storage`, held until the enumeration queue drains). So the card is always
-// registered FIRST, and every poll-until-present consumer — `wifi::service`, `wcx::desktop_app_service`,
+// registered FIRST, and every poll-until-present consumer — `wifi::service`, `desktop_uefi::desktop_app_service`,
 // `shell::fatverb_storage_witness` — resolved and parked on `Sdhc` at the first main-loop pass, long
 // before any stick arrives. What remains is the INTRA-PASS window on the one pass where a stick
 // claims the global: `service_storage` resets the verdict to `BM_UNKNOWN` near the top of the pass

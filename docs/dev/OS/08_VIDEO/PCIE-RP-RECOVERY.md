@@ -130,8 +130,8 @@ the kernel is not starting from nothing: there is a demonstrated-live service bo
 detection off, which makes that rung considerably cheaper than it first looked.
 
 One caution against reading too much into the pump's survival: it is **not structurally immune**.
-`x86_usb_pump` reaches `composite()` twice — via `wcx::desktop_app_service()` →
-`wm::pace_service()` (`video/wcx.rs:634-644`, `wm.rs:1531`) and via `bootpace::service_dump()` →
+`x86_usb_pump` reaches `composite()` twice — via `desktop_uefi::desktop_app_service()` →
+`wm::pace_service()` (`video/desktop_uefi.rs:634-644`, `wm.rs:1531`) and via `bootpace::service_dump()` →
 `wm::paygo_service()` (`wm.rs:3458`). It survived boot 11 because the decline path returns
 cleanly, but on a different interleaving it could win the CAS and become the wedged holder
 itself. A recovery task must therefore be immune **by construction — never entering `wm` at all**
@@ -139,8 +139,8 @@ itself. A recovery task must therefore be immune **by construction — never ent
 
 There is a further sharp edge: `svc_cpu` is **not** a core the compositor never runs on, despite
 the probe docstring saying so. `x86_usb_pump` shares `svc_cpu` (`main.rs:1463`) and reaches
-`composite()` twice — `wcx::desktop_app_service()` → `wm::pace_service()` → `composite()`
-(`video/wcx.rs:634-644`, `wm.rs:1531`), and `bootpace::service_dump()` → `wm::paygo_service()` →
+`composite()` twice — `desktop_uefi::desktop_app_service()` → `wm::pace_service()` → `composite()`
+(`video/desktop_uefi.rs:634-644`, `wm.rs:1531`), and `bootpace::service_dump()` → `wm::paygo_service()` →
 `composite()` (`wm.rs:3458`). The probe's core can therefore be the wedged holder's core.
 
 ### 1.3 `secsta=0x2000` may be boot residue, and until this arc nothing could tell
@@ -185,11 +185,11 @@ it names (`0x640460`, `0x6101E0`, `0x61D1E0`, `0x640080`, lines 271-278) are rea
 2. re-derive BAR1 from config space and compute `gop_vram_offset = gop_fb_phys - vram_base`,
 3. read-only recon of four heads,
 4. **blit pixels through the BAR1 aperture** at `(bar1 + gop_vram_offset)`,
-5. resume the panel console and call `video::wcx::activate()`.
+5. resume the panel console and call `video::desktop_uefi::activate()`.
 
 The scanout is alive because **Apple's EFI GOP driver programmed it at boot** — PLLs, output
 resource, panel link, timings, scanout base — and this kernel has inherited that state without
-ever touching it. `video/wcx.rs:394-402` says as much: the takeover "keeps the scan-out there",
+ever touching it. `video/desktop_uefi.rs:394-402` says as much: the takeover "keeps the scan-out there",
 and `WRITER` was seeded from the same `BootInfo` triple, so the surface is adopted as
 already-live.
 
@@ -202,9 +202,9 @@ Three corollaries, all load-bearing:
 * **SBR on this machine is, today, a one-way trip to a dark panel.** Not a risk to be managed —
   the expected outcome.
 * Re-running the takeover after a reset would blit into an aperture nothing scans out, and would
-  be refused anyway: `wcx::ACTIVATED` is a consumed one-shot (`video/wcx.rs:254, 365`) that
+  be refused anyway: `desktop_uefi::ACTIVATED` is a consumed one-shot (`video/desktop_uefi.rs:254, 365`) that
   prints `activate REFUSE reason=already-active` on a second call, and adopting a fresh surface
-  is a hard refusal (`wcx.rs:403-412`) partly because `FB_WC_DONE` is itself a consumed one-shot
+  is a hard refusal (`desktop_uefi.rs:403-412`) partly because `FB_WC_DONE` is itself a consumed one-shot
   (`arch/x86_64/memory.rs:3528, 3620`), so a new aperture would come up uncached.
 * There is **no separate framebuffer to fall back to**. `WRITER` (`video/mod.rs:153`) and `FBCON`
   (`video/fbcon.rs:262`) are two handles over the *same* physical GOP framebuffer, reached
@@ -427,7 +427,7 @@ consumed WC one-shot at `arch/x86_64/memory.rs:3528`.)
 | Root port secondary status / Bridge Control | Restored and cleared |
 | **Display pipe, PLLs, output resource, panel link, scanout base** | **Gone. Nothing in this kernel can restore them.** (§2) |
 | In-flight compositor state | Discarded — the gate is sealed and the panel condemned; damage is never replayed |
-| `wcx` activation | Cannot be re-run (consumed one-shot, `wcx.rs:254/365`) |
+| `wcx` activation | Cannot be re-run (consumed one-shot, `desktop_uefi.rs:254/365`) |
 
 ### 6.4 Then why do it at all?
 
@@ -552,8 +552,8 @@ not survive contact with the code.
 1. **"re-run the kepler takeover to repoint scan-out, since the reset destroys all device state
    including the display controller's."** The takeover does not point the scanout. It writes no
    display register at all (§2) — the scanout belongs to Apple's EFI. Re-running it would blit
-   into a dead aperture, and `wcx::activate()` would refuse regardless (consumed one-shot,
-   `wcx.rs:254/365`). This is the most consequential correction: the note names a restore step
+   into a dead aperture, and `desktop_uefi::activate()` would refuse regardless (consumed one-shot,
+   `desktop_uefi.rs:254/365`). This is the most consequential correction: the note names a restore step
    that does not exist, and with it goes the assumption that SBR can give the picture back.
 
 2. **"restore the BARs the firmware assigned (already known from kepler init)."** They are not

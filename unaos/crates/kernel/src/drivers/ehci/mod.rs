@@ -13963,7 +13963,7 @@ const EHCIDARK_ROLLUP_MS: u64 = 5000;
 // The obvious alternative — a chained ring of qTDs behind the same QH — CANNOT BE BUILT ON THIS
 // SILICON, and the refusal is recorded here rather than in a session log because the next reader of
 // `IntEp`'s "single re-armed qTD" doc-comment will otherwise reach for it. See
-// `docs/dev/OS/07_USB_STORAGE/usb_xhci.md` §32b ("The ring that cannot be built") for the full
+// `docs/dev/OS/07_USB_STORAGE/usb_xhci.md` §33b ("The ring that cannot be built") for the full
 // argument; the short form is `Controller::overlay_mode`. Both EHCI functions on the 2012 rMBP run
 // OVERLAY-DIRECT — the controller master-aborts (HSE) on the qTD fetch, which is what probe-14
 // found and what every metal boot re-witnesses:

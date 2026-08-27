@@ -950,9 +950,9 @@ pub fn handle_irq() {
 }
 
 /// GICv3 IRQ acknowledge/dispatch/EOI via the system-register CPU interface (ICC_IAR1_EL1 /
-/// ICC_EOIR1_EL1). This is the QEMU virt/Orin (non-baremetal) path: the scheduler, the PL011 RX SPI
-/// and timer preemption are all baremetal(pi)-only, so the v3 dispatch tree is just the SGI counter
-/// and the generic timer. INTID 1020-1023 are spurious/special and take no EOI (as on v2).
+/// ICC_EOIR1_EL1). This is the QEMU virt/Orin (non-baremetal) path: the scheduler and the PL011 RX
+/// SPI are baremetal(pi)-only, so the v3 tree is the SGI counter, the generic timer, and — under
+/// `all(tegra,bsprun)` ONLY — the post-EOI `timer_preempt` arm. 1020-1023 spurious, take no EOI.
 #[cfg(not(feature = "pi"))]
 fn handle_irq_v3() {
     let iar: u64;
@@ -964,10 +964,21 @@ fn handle_irq_v3() {
     if intid < 16 {
         crate::arch::percpu::count_ipi();
     } else if intid == crate::arch::timer::TIMER_INTID {
+        // IRQEL-RT (tegra, M1 item 4): while the post-JM6 EL1 one-shot proof window is armed, this
+        // delivery IS the proof — the intercept consumes it (disarms CNTP + isb, deasserting the
+        // level-sensitive PPI before the EOI below, and prints the EL1 witness) and `on_tick` is
+        // SKIPPED, so the cooperative post-drop scheduler gains no periodic tick. Unarmed (every
+        // other delivery, and the whole EL2 boot stretch) the pre-existing flow runs unchanged;
+        // off tegra this statement does not exist and the arm below it is the original line.
+        #[cfg(feature = "tegra")]
+        if !crate::arch::timer::el1_proof_intercept() {
+            crate::arch::timer::on_tick();
+        }
+        #[cfg(not(feature = "tegra"))]
         crate::arch::timer::on_tick();
     }
     // ICC_EOIR1_EL1: writing the acked value drops priority and (EOImode=0) deactivates.
-    unsafe { core::arch::asm!("msr S3_0_C12_C12_1, {}", in(reg) iar, options(nomem, nostack, preserves_flags)) };
+    unsafe { core::arch::asm!("msr S3_0_C12_C12_1, {}", in(reg) iar, options(nomem, nostack, preserves_flags)) }; #[cfg(all(feature = "tegra", feature = "bsprun"))] if intid == crate::arch::timer::TIMER_INTID { crate::arch::sched::timer_preempt(); } // ORIN-BSPRUN — the v3 dispatch's preemption arm, appended ON THIS LINE (knob-off byte-identity: zero source lines added before any panic Location). Post-EOI, the v2/`baremetal` path's proven ordering (on_tick re-arms + deasserts the level -> EOI deactivates -> preempt may context-switch; switching BEFORE the EOI would leave the PPI active on this CPU interface across the switch, blocking equal/lower-priority IRQs until the preempted context resumes). IRQEL-CORE audit for the five EL2 APs that reach this dispatch ~1250x/s with their own PPI 30: `timer_preempt` first gates on `SCHED_ACTIVE` (off = today's exact flow), then indexes ONLY per-cpu words by the caller's own `cpu_index` (quantum, current, IN_RQ_SECTION) — an AP with an empty queue takes the null-`current` early return; the one shared word it touches, the `load_witness_tick` cadence counter, is the witness's DESIGNED multi-core aggregate (fetch_add hands each window boundary to exactly one core — the Pi runs it from all 4 cores the same way), so an AP tick advances the cadence instead of consuming another core's window. Preemption on an EL2 AP, should placement ever put a task there, rides the EL-neutral `switch_context` through the runtime-banked `__vec_irq` — but on this board nothing is placeable there (EL1 filter) and AP queues are empty by construction. See sched.rs tail §ORIN-BSPRUN.
 }
 
 // ── GIC-WAIT witness (tail-defined per the Location-shift convention; `tegra`-gated so the pi and

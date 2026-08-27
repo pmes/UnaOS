@@ -253,7 +253,7 @@ unsafe fn enable_mmu_virt() {
 extern "C" fn __secondary_rust_virt(_advisory: u64) -> ! {
     // MMU on FIRST (replaying the BSP's EL2 regime), before any lock/atomic/FP. `serial_println!` below
     // takes a spinlock, so nothing may print before this. (HCR_EL2/CPTR_EL2 were replayed in the stub.)
-    unsafe { enable_mmu_virt() };
+    unsafe { enable_mmu_virt() }; #[cfg(feature = "smpmark")] serial_print!(":A:"); // SMPMARK :A: (tail block)
     // Re-derive this core's linear index from MPIDR affinity with the MMU ON — the structural fix for the
     // CORE3-class stale-line hazard. `this_affinity()` reads MPIDR_EL1 live (at EL2 it returns the
     // physical affinity — VMPIDR only redirects EL1 reads), so this and every use of the derived index
@@ -325,6 +325,44 @@ extern "C" fn __secondary_rust_virt(_advisory: u64) -> ! {
     // per-CPU `percpu.ticks` and never the shared `TICKS`/`ms()` wall-clock (the double-count that held
     // this back). The tick does not preempt here (the `virt`/tegra `run()` path leaves `SCHED_ACTIVE`
     // false and `handle_irq_v3` calls only `on_tick`) — it just breaks the idle WFI so the loop re-polls.
+    //
+    // ORIN-EL1AP (baton orin-8 item 1, Candidate C) — the EL2 -> EL1 drop for ONE AP goes HERE, in the
+    // window between "this core is fully brought up at EL2" and "this core arms its tick and enters
+    // `run()` forever", and the boundaries of that window are what fix the position:
+    //
+    //   * AFTER `gic::init_secondary_v3()`, because `init_cpu_interface_v3` programs ICC_SRE_EL2 and
+    //     is guarded on `current_el() >= 2` — run it after the drop and the CPU interface is never
+    //     set up. The redistributor/PMR/CTLR/IGRPEN1 state it leaves is per-core banked and survives
+    //     the drop, so EL1 inherits a live Group-1 interface.
+    //   * BEFORE `timer::arm_this_core_ap()`, because the drop's asm ends the physical timer
+    //     (`msr cntp_ctl_el0, xzr`) — correct for the BSP's cooperative CAPSTONE, fatal for an AP
+    //     that idles in WFI. Arming AFTER re-enables CNTP from EL1, which CNTHCTL_EL2.EL1PCEN|EL1PCTEN
+    //     (set by the same drop) is what makes legal.
+    //   * BEFORE `sched::secondary_run(core)`, which never returns.
+    //
+    // Knob-off this whole block does not exist and the AP path is the untouched EL2 one.
+    #[cfg(feature = "orinel1ap")]
+    if unsafe { super::boot_tegra::drop_ap_to_el1(core) } {
+        // At EL1 now, DAIF masked, TPIDR_EL1 UNKNOWN, VBAR_EL1 unset. These four statements are the
+        // BSP's own post-drop terminus (`main.rs`), for the same reasons and in the same order.
+        percpu::init(core); // re-seed: the pre-drop init seeded TPIDR_EL2
+        exceptions::install(); // VBAR_EL1 (at EL1 this arm touches no HCR_EL2 — the drop already set it)
+        // EL0-EL1CORE — stamp. Sound on an AP precisely because `core` came from the MPIDR-affinity
+        // re-derivation above, not from a literal: `mark_el1_core` re-measures `CurrentEL` itself and
+        // stamps NOTHING if it is not EL1, so a broken drop leaves the mask (and the refusal) as-is.
+        let stamped = sched::mark_el1_core();
+        // The drop landed with DAIF masked. An AP that stays masked would idle in `run()` with its
+        // tick and the reschedule SGI both undeliverable — WFI would still wake on a pending IRQ, but
+        // the IRQ would never be TAKEN, so `on_tick` would never re-arm and EOI would never issue.
+        exceptions::enable_irq();
+        serial_println!(
+            ":: AARCH64 SMP: [el1ap] cpu={} LANDED at EL{} — stamped={} el1cores={:#x} irq=unmasked (EL0-EL1CORE) ::",
+            core,
+            exceptions::current_el(),
+            stamped,
+            sched::el1_core_mask()
+        );
+    }
     timer::arm_this_core_ap();
 
     // ORIN-SMP-RUN: enter the preemptive scheduler `run()` loop instead of the old `note_core_idle`
@@ -867,10 +905,10 @@ pub fn start_secondaries_tegra(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64
     // Start each `/cpus`-named secondary. Target = its real MPIDR affinity; context id = its linear
     // index (advisory past the MMU turn-on). Entry PA = the identity-mapped stub. A CPU_ON error is
     // logged + skipped, never a hang. NO AFFINITY_INFO gate — the DTB already IS the presence gate.
-    let entry = _secondary_start_virt as *const () as usize as u64;
+    let entry = _secondary_start_virt as *const () as usize as u64; #[cfg(feature = "smpmark")] serial_print!(":P:"); // SMPMARK :P: (tail block)
     for idx in 1..n_cores {
         let aff = aff_by_index[idx];
-        let ret = psci_cpu_on(affinity_to_mpidr(aff), entry, idx as u64);
+        let ret = psci_cpu_on(affinity_to_mpidr(aff), entry, idx as u64); #[cfg(feature = "smpmark")] serial_print!(":R{}:", idx); // SMPMARK :R<idx>: (tail block)
         if ret == 0 {
             serial_println!(
                 ":: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP {} (aff={:#010x}) -> SUCCESS (entry={:#x}) ::",
@@ -994,3 +1032,86 @@ pub fn probe_publish_real_path(aff_by_index: &[u32]) -> u64 {
 pub fn probe_core_online(idx: usize) -> bool {
     idx < MAX_CORES && CORE_READY[idx].load(Ordering::Acquire)
 }
+
+// ── SMPMARK (orin 3) — the one-flight discriminator for the intermittent ORIN-SMP-3 park ─────────
+//
+// THE PARK. On roughly 30% of SMP-armed Orin boots the board dies during secondary bring-up. The
+// code and the load addresses are NOT the variable: boot5c flights #1 (park) and #2 (clean) shared
+// `VBAR_EL2 = 0x25b115800` and `TTBR0 = 0x25b26a000` — same binary, same physical base, minutes
+// apart, opposite outcomes. So an image-layout theory cannot explain it and a timing/attribute
+// theory must.
+//
+// THE UNREAD EVIDENCE. ATF prints `Exception reason=1 syndrome=0x82000010`, which decodes as
+// EC = 0x20 (INSTRUCTION Abort from a LOWER EL), IL = 1, IFSC = 0x10 (synchronous external abort,
+// NOT on a translation-table walk). An instruction-FETCH external abort — not a data abort, not a
+// translation fault.
+//
+// H1, the leading hypothesis this instrument exists to test. A PSCI-woken AP resets with
+// `SCTLR_EL2.M = 0` and `SCTLR_EL2.I = 0`. Per ARM ARM D5.2.9, with stage-1 translation disabled,
+// data accesses are Device-nGnRnE and INSTRUCTION accesses are Device-nGnRnE while
+// `SCTLR_ELx.I == 0`. So the AP's ~40 instructions between its PSCI reset and the `msr SCTLR_EL2`
+// inside `enable_mmu_virt` are Device-nGnRnE instruction fetches — one fabric transaction each,
+// spread over two pages ~28 KiB apart — plus ~10 Device loads and 1 Device store: ≈51 I/O-routed
+// transactions per woken core. That is the ONLY Device-typed instruction fetch anywhere in the
+// boot, and it is the only construct in the boot that matches EC = 0x20.
+//
+// WHY MARKS AND NOT MORE LOGGING. The existing per-core `CPU_ON -> SUCCESS` line is ~95 chars ≈
+// 8.2 ms of UART at 115200 8N1. The AP powers up and (under H1) faults well inside that window, so
+// a capture that ends mid-line cannot distinguish "the SMC never returned" from "the SMC returned
+// and the AP killed the box while the BSP was still printing". Three short tags, emitted with
+// `serial_print!` (no newline, minimal format work, minimal lock hold) collapse that ambiguity:
+//
+//   `:A:`      AP crossed MMU-off -> MMU-on (`__secondary_rust_virt`, immediately post-`enable_mmu_virt`)
+//   `:P:`      BSP finished the publication block (ctx capture + `SEC_CTX` clean + stack `DC CIVAC` sweep)
+//   `:R<idx>:` the `CPU_ON` SMC RETURNED to the BSP for linear index <idx>
+//
+// PLACEMENT — the Location-shift convention, and it is LOAD-BEARING here. All three marks are appended
+// to a PRE-EXISTING line rather than given lines of their own, and all the prose lives in this tail
+// block. Written the natural way (each mark on its own `#[cfg]` + statement pair with a comment above
+// it) the disarmed tegra build is NOT byte-identical to baseline: MEASURED, the loadable image differed
+// in exactly 8 bytes, every one of them a panic `Location` line-number constant belonging to code
+// FURTHER DOWN this file, shifted by the inserted lines. Same defect the DARKWIN-GUARD tail mod in
+// `serial.rs` and the VUGFIX one-liner in `sched.rs` are written the way they are to avoid. Appending
+// to the existing line adds no line and changes no existing column, so the disarmed image is byte-clean
+// — MEASURED at 0 differing bytes, `llvm-objcopy -O binary` + `cmp`, baseline worktree vs this tree.
+// If you edit a mark, keep it on its host line.
+//
+// HONEST CAVEAT on `:A:`, deliberately preserved: it runs BEFORE `exceptions::install()`, so the AP's
+// `VBAR_EL2` is still the FIRMWARE's. An abort taken between the PSCI reset and that point — including
+// one taken by `serial_print!` itself — is reported by ATF/UEFI, not by us. That is exactly the
+// ORIN-SMP-3 park's own signature, and it is why the mark is a presence/absence oracle and not a
+// handler. It sits at the first instruction where a spinlock is legal at all (the MMU is on; `ldxr`/
+// `stxr` with the MMU off is CONSTRAINED UNPREDICTABLE), i.e. the earliest an AP can say anything.
+//
+// READING A PARKED CAPTURE — what each possible tail proves:
+//
+//   … enumerated core 5 …   then RAS   The publication block itself died. Nothing to do with an AP:
+//                                      no `CPU_ON` was ever issued. Suspect the `DC CIVAC` sweep over
+//                                      `SECONDARY_STACKS` or `capture_secondary_ctx`. REFUTES H1.
+//   `:P:`                   then RAS   Publication survived; the very first `CPU_ON` SMC did not
+//                                      return. The fault is inside PSCI/ATF or in the SMC path, on
+//                                      the BSP. NOT our AP entry code. REFUTES H1.
+//   `:P::R1:`               then RAS,  The SMC returned cleanly AND the AP never reached the far side
+//   with no `:A:`                      of `enable_mmu_virt`. The AP died in its MMU-OFF window — the
+//                                      ~51 Device-nGnRnE transactions of the entry stub. This is the
+//                                      CONVICTION for H1, and it also localises the fault to the
+//                                      stub + `enable_mmu_virt`, ~40 instructions of known text.
+//   `:P::R1::A:`            then RAS   The AP got the MMU on and died AFTER. H1 is REFUTED as the
+//                                      cause of the park (the Device-fetch window was survived);
+//                                      look downstream — `exceptions::install`, `percpu::init`,
+//                                      `gic::init_secondary_v3` (the first non-BSP redistributor
+//                                      touch), or the AP's first cacheable access.
+//
+// A CLEAN flight is expected to read `:P::R1::A::R2::A:…` with the tags interleaved: the ordering of
+// `:R<n>:` against `:A:` from an earlier core is a race by construction (two cores, one UART lock)
+// and carries no meaning. Only the PRESENCE and the LAST tag before the park are evidence.
+//
+// GATING. Every mark is `#[cfg(feature = "smpmark")]`, armed by `UNAOS_SMPMARK=1` (see `arroyo`).
+// Default OFF => the marks vanish and the tegra image is byte-identical to baseline. The ARMED
+// configuration is type-checked by the `arm-tegra-smpmark` leg of `KERNEL_CFG_MATRIX`, per the
+// standing law that a cfg widen's gates must compile the configuration the widen turns ON.
+//
+// DARKWIN. Both BSP-side marks run inside `start_secondaries_tegra`, which `tegra_early_stop` calls
+// (main.rs:2494) long after it arms the UARTC latch (main.rs:1906, immediately on `mmu_tegra::init`
+// returning), and the AP-side `:A:` runs later still. No mark can be dropped or counted by
+// `serial::tegra_guard`, and none can touch UARTC before the device window is mapped.

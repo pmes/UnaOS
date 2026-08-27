@@ -1086,7 +1086,7 @@ fn launch(path: &str) -> String {
             VfsError::Backend(s) => alloc::format!("backend: {}", s),
         }
     }
-    const CAP: u64 = crate::arch::aarch64::boot::USER_REGION_SIZE as u64;
+    const CAP: u64 = crate::arch::aarch64::uslots::USER_REGION_SIZE as u64; // JETSON-EL0: uslots facade (boot.rs on pi / mmu_tegra_el0.rs on tegra)
     reap_jobs();
     if JOBS.lock().len() >= MAX_JOBS {
         let s = alloc::format!("{} live jobs — kill one first", MAX_JOBS);
@@ -1549,7 +1549,7 @@ pub fn open() {
     }
     // POSFIX — the panel read on the dock-click path, through LOCKFIX's one door.
     //
-    // WHY THIS ONE WAS STILL BLOCKING. `open()` looks like boot furniture — `pidesk` calls it once
+    // WHY THIS ONE WAS STILL BLOCKING. `open()` looks like boot furniture — `desktop_firmware` calls it once
     // while the desktop is being built — but it has a SECOND caller and that one is an input event:
     // the dock's pinned tile latches `request_open()`, and `service()` drains the latch from
     // `syscall.rs`'s strip-press arm, i.e. from the preemptible `usb-pump`/`input` band, the exact
@@ -1597,7 +1597,7 @@ pub fn open() {
         );
         return;
     };
-    // CONSOLEWIN, applied to a second tenant — `wcx`'s law, unchanged in substance and unchanged in
+    // CONSOLEWIN, applied to a second tenant — `desktop_uefi`'s law, unchanged in substance and unchanged in
     // reason. Quarry is an ordinary `wm` row, so the kernel draws it the ordinary control cluster,
     // including a MINIMISE disc. Minimise is a position: the row drops below `SHELL_Z`, stops
     // compositing, and the only gesture that brings it back is the dock — including its own pinned

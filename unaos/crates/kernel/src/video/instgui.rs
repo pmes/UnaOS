@@ -439,7 +439,7 @@ fn repaint() {
 
 // ------------------------------------------------------------------- verbs --
 
-/// Open the installer window (called from `wcx::activate` when the `instgui`
+/// Open the installer window (called from `desktop_uefi::activate` when the `instgui`
 /// feature is armed). Spawn-place discipline: geometry settled before the row.
 pub fn open() {
     let mut st = STATE.lock();

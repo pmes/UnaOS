@@ -30,7 +30,7 @@ pub enum Event {
     Mouse { x: i32, y: i32 },
     MouseAbsolute { x: i32, y: i32 },
     /// CLICK-1: a pointer button-DOWN edge (payload = the report's button bitmask, bit 0 = primary).
-    /// Emitted once per press by the HID decoders (edge-detected there); release emits nothing.
+    /// Emitted by the HID decoders on ANY button-mask CHANGE — press edge AND release edge (GUI-CLICK-2).
     Button(u8),
     /// WHEEL: one scroll-wheel report, carrying the HID boot-mouse wheel byte as a SIGNED delta —
     /// POSITIVE is scroll-up / away from the user, negative is scroll-down. This is a DELTA, not an
@@ -1358,7 +1358,7 @@ pub fn push_pointer_report(motion: Option<Event>, button: Option<Event>) {
 // These three counters separate those cases at a glance. They are plain relaxed atomics on a path
 // that already does MMIO and DMA, bumped only when a wheel is actually in play (`note_decoded` is
 // called for nonzero deltas only), so an idle boot and a boot with no wheel at all pay nothing. The
-// PRINTING is knob-gated at the call site (`pidesk`); the COUNTING is unconditional, so a metal
+// PRINTING is knob-gated at the call site (`desktop_firmware`); the COUNTING is unconditional, so a metal
 // capture can read the census from any build that can reach a witness.
 
 /// Nonzero wheel deltas decoded out of HID pointer reports since boot.

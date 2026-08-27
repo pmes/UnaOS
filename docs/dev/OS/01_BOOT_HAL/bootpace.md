@@ -123,7 +123,7 @@ strings unaos/target/x86_64_esp/kernel.elf | grep -c 'BPACE'      # must be >= 1
 | `xhci-ptrs` | after `init_pointers`, before `start()` | command/event ring allocation, `init_interrupter` (a second CNR wait), MSI-X, DCBAAP/CRCR |
 | `xhci-run` | after the `USBSTS.HCH=0` wait in `start()` | `CONFIG.MaxSlotsEn` + the RS=1 run handshake |
 | `xhci-portpwr` | after the port-power loop in `start()` | one PORTSC read and at most one PP write per root port |
-| `xhci-settle` | after the pre-CCS-scan settle | **that one constant alone** — `hw_wait_budget()/4`; see §6a |
+| `xhci-settle` | after the pre-CCS-scan settle | **that one settle wait alone** — `settle_ms × cycles_per_ms()` (150/100 ms nominal) since M4/CCSTRIM; at M4 time it was `hw_wait_budget()/4`, which is a per-platform quantity, not a universal 500 ms: **0.50 s calibrated x86 (2 s/4) / 0.69 s Pi 4 (2.78 s/4) / 1.2 s Orin (4.8 s/4)** — derivation in `usb_xhci.md` §32.2a; see §6a |
 | `pci-usb` | after `pci::init` returns | the `start_next_port` tail + the BENCH-RIDE probes + the GPU dispatch + the SDHC probe + the NIC block (NOT the xHCI bring-up — see §6a) — subdivided by the GPACE lines (§9) |
 | `enum:p<N>` | `start_next_port`, at the `=== Enumerating Port N ===` line | — |
 | `enum:p<N>-done` | top of `start_next_port`, for the port being left | with the pair above: this port's enumeration cost |
@@ -252,10 +252,16 @@ silently contained:
   `DCBAAP`/`CRCR`, the RS=1 run handshake, the port-power loop,
 - and, last, the settle itself.
 
-The settle's own budget is `hw_wait_budget()/4` ≈ **500 ms** — 1/14th of the
-bucket. Whatever else the 7.3 s is, it is overwhelmingly *not* this constant, and
-a trim aimed at the constant on the strength of that number would have been aimed
-at the wrong thing.
+The settle's own budget was `hw_wait_budget()/4` ≈ **500 ms on this boot** — a
+**calibrated-x86** figure, not a universal one: the base is `tsc_hz ×
+HW_WAIT_SECONDS` = 2 s (`HW_WAIT_SECONDS = 2`, `arch/x86_64/mod.rs`; this boot's
+`hz=2693848854`), and 2 s / 4 = 0.50 s. The same expression is **0.69 s on the
+Pi 4** (150e6-tick base at 54 MHz = 2.78 s, / 4) and **1.2 s on the Orin**
+(4.8 s base, / 4) — full per-platform table in `usb_xhci.md` §32.2a. On any of
+those platforms it is at most ~1/14th of a bucket like this one: whatever else
+the 7.3 s is, it is overwhelmingly *not* this constant, and a trim aimed at the
+constant on the strength of that number would have been aimed at the wrong
+thing.
 
 The source comment beside the stamp compounded it, claiming `d=` was "measured
 from `pci-usb`". `pci-usb` is recorded **later** — after `pci::init` returns —
@@ -1864,7 +1870,7 @@ lane's decomposition instrument, merged in `505a129e`, replaced that single phas
 macro and cannot leave a silent remainder. Boot Z reads those five, not this one; §10j gives
 them, and `kdisp_takeover` inherits 328 of the 331. **Note before quoting them:**
 `kdisp_takeover` spans more than the calibration blit — `panel_console_resume`
-does a second full-surface pass over the same framebuffer, and `wcx::activate()`, a 2 M-iteration
+does a second full-surface pass over the same framebuffer, and `desktop_uefi::activate()`, a 2 M-iteration
 `spin_loop`, and 4096 uncached BAR0 reads are all inside it — so that number alone cannot
 attribute the cost to the blit. Inner bounds are assigned.)
 and nothing inside it is a deliberate wait: the span contains no spin loop at all. It is MMIO
@@ -1968,7 +1974,7 @@ longer appears on the wire.
 quoted as though it did.** The stamp charges everything between the pre-takeover mirror dump and the
 return from `takeover_display()`, and besides the calibration blit that span contains
 `panel_console_resume()`'s **second** full-surface pass over the same framebuffer
-(`kepler_display.rs:448`), `wcx::activate()` (`:458`), a 2,000,000-iteration `spin_loop` between the
+(`kepler_display.rs:448`), `desktop_uefi::activate()` (`:458`), a 2,000,000-iteration `spin_loop` between the
 two EVO-core passes (`:195`), and 4096 uncached BAR0 reads. Any of those can carry tens of
 milliseconds on this panel and this bus. **328 is an upper bound on the blit and nothing more until
 the inner bounds land** — they are assigned to the kepler lane, and the number is not evidence for
@@ -2260,7 +2266,7 @@ kernel leaf is M3b's to create, and when it lands WP is already waiting for it.
 
 **Separately, §10j's `kdisp_takeover=328` decomposed under adversarial replay**
 (`scratch/gr20/verify-kdisp-gaps.md`, Boots Y and Z, both reconciling to the millisecond):
-blit **50 ms**, `panel_console_resume` **15 ms**, `wcx::activate` **259–260 ms** — and
+blit **50 ms**, `panel_console_resume` **15 ms**, `desktop_uefi::activate` **259–260 ms** — and
 ~190 ms of the 260 (73%) is **witness instrumentation reading the framebuffer back** at
 the uncached-read rate (~1.7–2.3 µs/read vs 2.7–6.8 ns/px for writes; four independent
 instruments agree on the ratio). The next pace target in this window is the probe
