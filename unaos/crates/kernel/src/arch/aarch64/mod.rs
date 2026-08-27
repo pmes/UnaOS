@@ -485,3 +485,21 @@ fn hw_wait_budget_derived() -> u64 {
 fn hw_wait_budget_derived() -> u64 {
     HW_WAIT_BUDGET
 }
+
+/// [`flush_framebuffer_range`]'s STRIDED twin: clean `rows` runs of `row_len` bytes, each `stride`
+/// apart, for the same reason and to the same Point of Coherency — the RECT form a damage-tracked
+/// present wants, where cleaning the full-width scanlines the rect sits in would touch several times
+/// the bytes the caller actually wrote. aarch64 answers with `cache::clean_rows`: a per-row
+/// `DC CVAC` sweep with ONE trailing `DSB` for the whole rect rather than one per row.
+///
+/// This is the facade `video::framebuffer::flush_rect`'s doc comment has named since it was written;
+/// until now it did not exist and that call site open-coded a `#[cfg(target_arch)]` pair instead.
+///
+/// APPENDED AT THE FILE TAIL, deliberately: this module is compiled into the knob-off `kernel8.img`
+/// whose byte-identity is a standing proof, and panic `Location` records embed line numbers, so a
+/// function inserted mid-file would move every record below it (PARITY.md 5.3). Nothing is below
+/// this, so nothing moves — the same reasoning `video/mod.rs` gives for its own tail block.
+#[inline]
+pub fn flush_framebuffer_rows(addr: usize, row_len: usize, rows: usize, stride: usize) {
+    cache::clean_rows(addr, row_len, rows, stride);
+}
