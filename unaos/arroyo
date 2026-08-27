@@ -11,7 +11,7 @@
 #   ./arroyo check         Syntax check: kernel (both targets, default + cfg-gated feature legs,
 #                          including the x86 pairwise-mix legs — see GATE-CFG-MIX below)
 #                          + the ring-3 user-* crates
-#                          UNAOS_CFG_SWEEP=1 adds the per-feature x86 sweep (+78 legs, ~220 s)
+#                          UNAOS_CFG_SWEEP=1 adds the per-feature x86 sweep (+2N legs, 150 today)
 #   ./arroyo build         Build both targets (no QEMU)
 #   ./arroyo clean         Purge all build artifacts
 
@@ -2465,7 +2465,7 @@ check_user_arch() {
 # same thing — the distinction is what the count alone hides:
 #   * `nvidia-kepler-kdisp-hold`, `rtpi`, `rtwit`, `selfhost` — x86-family (their `#[cfg]` sites are in
 #     `arch/x86_64/`, or in `lib.rs`/`main.rs` under `target_arch = "x86_64"`). `x86_cfg_universe`
-#     inherits every unnamed feature as "unclaimed => assume x86", so these ride the 8 derived mix legs
+#     inherits every unnamed feature as "unclaimed => assume x86", so these ride the 9 derived mix legs
 #     and are GENUINELY compiled. Not holes; just not board-named.
 #   * `simmer_test` (arch/aarch64/sched.rs), `xusbfw` (arch/aarch64/xusb_tegra.rs) and — until the leg
 #     appended below — `tegra_el0`: aarch64-only, inherited by the SAME rule onto x86 legs, where they
@@ -2475,7 +2475,7 @@ check_user_arch() {
 # THE FAILURE MODE IS SILENT, which is why the count drifted this far unnoticed. The forcing function
 # the GATE-CFG-MIX note below promises ("the gate will go red naming it") fires only for a feature that
 # names an aarch64 MODULE from unqualified code; one whose sites all sit under `src/arch/aarch64/` or
-# carry a `target_arch` qualifier passes quietly. `tegra_el0` is the proven case: swept onto 8 x86 legs,
+# carry a `target_arch` qualifier passes quietly. `tegra_el0` is the proven case: swept onto every x86 leg,
 # type-checked by none of them, and the armed Orin build broke anyway (EXECGATE — see the leg below).
 # The other three-and-a-half are the same shape and are NOT fixed here: out of this arc's lane, recorded
 # so the pi/jetson arc that owns each one can claim it.
@@ -2623,12 +2623,13 @@ KERNEL_CFG_MATRIX=(
   #
   # SIDE EFFECT, deliberate and correct: naming `tegra_el0` on an arm-* leg also REMOVES it from the
   # x86 mix universe (`x86_cfg_universe` = the feature table minus what the arm legs name and `x86-all`
-  # does not). It had been riding the 8 x86 pairwise legs as an unclaimed "assume x86" feature, where
+  # does not). It had been riding the x86 pairwise legs as an unclaimed "assume x86" feature, where
   # it is vacuous: every one of its cfg sites is either under `src/arch/aarch64/` or explicitly
   # `target_arch = "aarch64"`-qualified in `main.rs`, so those legs were compiling a knob that emits
-  # nothing. The universe goes 60 -> 59 features, the leg count stays 8 (C(8,4) = 70 >= 59) and the
-  # pairwise guarantee is unaffected — it is a property of the mask construction, not of which
-  # features are in the set.
+  # nothing. Removing one feature from the universe (60 -> 59 when this leg was written; 75 today)
+  # leaves the leg count wherever the C(n, n/2) >= N search puts it — 8 then, 9 now — and the
+  # pairwise guarantee is unaffected either way: it is a property of the mask construction, not of
+  # which features are in the set.
   "arm-tegra-el0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0"
   # ORIN-EL1AP armed (baton orin-8 item 1) — the arm-tegra-el0 row verbatim + `orinel1ap`, the literal
   # precedent one leg above (the feature implies `tegrasmp` + `tegra_el0` -> `tegra`; every site is
@@ -3203,9 +3204,10 @@ KERNEL_CFG_MATRIX=(
 # which Y is ON and X is OFF. The ungated case (Y = nothing) is already covered — the DEFAULT legs
 # compile the all-off state. What was missing is the feature-vs-feature case.
 #
-# THE LEG-SELECTION RULE (why this many legs and not more). The full powerset is 2^39 and absurd.
-# Per-feature sweeps (each ON alone; each dropped from the full set) are linear — 2N = 78 legs, ~220 s
-# measured — which is too slow to sit in `check` on every edit. But complete coverage of the defect
+# THE LEG-SELECTION RULE (why this many legs and not more). The full powerset is 2^N and absurd.
+# Per-feature sweeps (each ON alone; each dropped from the full set) are linear — 2N legs, which at
+# today's N = 75 is 150 (~220 s was measured back when N was 39, so budget well over that today)
+# — which is too slow to sit in `check` on every edit. But complete coverage of the defect
 # class does not need N legs at all, it needs an ORDERED-PAIR covering array, and that is LOGARITHMIC:
 #
 #   Give feature i a distinct n-bit mask M_i, all masks of the SAME popcount n/2 (an antichain), and
@@ -3213,26 +3215,32 @@ KERNEL_CFG_MATRIX=(
 #   M_Y are distinct sets of equal size, so neither contains the other, so some bit j is set in M_Y
 #   and clear in M_X. Leg j therefore has Y ON and X OFF. Every ordered pair is covered, by
 #   construction, with n legs — and n is the smallest integer with C(n, n/2) >= N, i.e. the PROVABLY
-#   MINIMAL number of legs for which such a family of masks exists at all. For today's N = 39 x86
-#   features that is n = 8. Verified empirically at authoring time: 0 uncovered ordered pairs of 1482.
+#   MINIMAL number of legs for which such a family of masks exists at all. For today's N = 75 x86
+#   features that is n = 9, because C(8,4) = 70 < 75 <= C(9,4) = 126. Verified empirically at
+#   authoring time, when N was 39 and n was 8: 0 uncovered ordered pairs of 1482.
 #
-# So the default gate pays 8 compiles (~23 s cold, measured) for complete pairwise cfg coverage of
-# the x86 feature cube. The `gmux_igd`/`intel-ivb` pair above is covered several times over.
+#   THE LEG COUNT IS DERIVED, NOT CONFIGURED: build_cfg_legs searches for that smallest n on every
+#   run, so it moves on its own as the feature table grows. Every count written in prose below is
+#   therefore a re-count hazard — read `${#KERNEL_CFG_MIX[@]}` on the gate's own summary line for the
+#   live number, and re-count these comments when the universe crosses a C(n, n/2) boundary.
+#
+# So the default gate pays 9 compiles (~23 s cold was measured when it was 8) for complete pairwise
+# cfg coverage of the x86 feature cube. The `gmux_igd`/`intel-ivb` pair is covered several times over.
 #
 # WHAT THIS DOES NOT COVER, stated honestly. Strength 2. A symbol under X referenced from code gated
 # on `all(feature = "Y", feature = "Z")` needs a leg with Y and Z on and X off; the covering array
 # guarantees that only for pairs, not triples. The `x86-drop-<feat>` sweep legs behind
-# UNAOS_CFG_SWEEP=1 close exactly that direction — each drops ONE feature with all 38 others ON, so
-# every conjunction of other features is compiled — at the cost of 39 more compiles.
+# UNAOS_CFG_SWEEP=1 close exactly that direction — each drops ONE feature with all N-1 others ON, so
+# every conjunction of other features is compiled — at the cost of N more compiles.
 #
-# UNAOS_CFG_SWEEP=1 adds, on top of the 8 default mix legs:
-#   * `x86-only-<feat>`  — that feature ALONE (39 legs). Answers "does this feature stand up by
-#                          itself", and localizes: the mix legs prove a defect EXISTS but name a leg
-#                          carrying ~20 features; this names one.
-#   * `x86-drop-<feat>`  — the full x86 set MINUS that feature (39 legs). The strength-unbounded
-#                          direction described above.
-# Measured on the clean tree at authoring time: on-alone 39/39 green, leave-one-out 39/39 green,
-# ~220 s for the pair.
+# UNAOS_CFG_SWEEP=1 adds, on top of the 9 default mix legs:
+#   * `x86-only-<feat>`  — that feature ALONE (N legs, 75 today). Answers "does this feature stand up
+#                          by itself", and localizes: the mix legs prove a defect EXISTS but name a
+#                          leg carrying ~35 features; this names one.
+#   * `x86-drop-<feat>`  — the full x86 set MINUS that feature (N legs, 75 today). The
+#                          strength-unbounded direction described above.
+# Measured on the clean tree at authoring time, when N was 39: on-alone 39/39 green, leave-one-out
+# 39/39 green, ~220 s for the pair.
 #
 # THE FEATURE LIST IS DERIVED, NOT COPIED. A second hardcoded list would drift out of `[features]` —
 # and already had: `nvidia-kepler-kdisp-hold` is declared in crates/kernel/Cargo.toml and appears in
