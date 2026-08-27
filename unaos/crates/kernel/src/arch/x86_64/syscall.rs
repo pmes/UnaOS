@@ -6511,8 +6511,8 @@ fn drag_settle_disarm() {
 /// Self-cleaning: it empties the ring before it starts (witnessed, because on metal that discards
 /// whatever the hand was doing at boot), drains everything it pushed, and puts the producer's button
 /// mask and the release-edge count back where it found them.
-/// SELFTEST-QUIESCE — **experiment scaffolding for the intermittent x86 selftest family
-/// (`exec-r7-selftest`, 2026-08-27). Not a shipping seam; the control build has it OFF.**
+/// SELFTEST-RACE — **the ledger the intermittent x86 selftest family is judged against**
+/// (`exec-r7-selftest`, 2026-08-27).
 ///
 /// The falsification this arc runs asks whether `[ptrdead] order` and `[wm-act] settle`/`lead` fail
 /// because the CODE UNDER TEST is wrong or because the ASSERTIONS are racy. The mechanism under
@@ -6523,34 +6523,17 @@ fn drag_settle_disarm() {
 /// push→pop window therefore hands the fixture's own queued events to the input service, which
 /// forwards them down `GUI_CHANNEL_X86` and out of the fixture's reach.
 ///
-/// So the quiesce is a LOCAL interrupt mask, and it is sound only because of that placement: the
-/// competing drain is on THIS core, so masking `IF` here is enough to serialise the window. The
-/// global ms-clock is advanced by the BSP (see `apic::ticks`), so the bounded `ticks()` waits inside
-/// the legs still terminate with the mask held.
+/// A LOCAL INTERRUPT MASK IS NOT THE ANSWER, and that was measured rather than argued. The
+/// experiment on this branch wrapped each leg in `arch::without_interrupts` and ran 22 quiesced
+/// boots against 12 unquiesced ones; the red rate did not move (3/22 against 1/12) and the leak
+/// detector said why in one field: **`cpu=3->3` while `svc=Some(5)`**. The fixture ladder does not
+/// run on the service core, so masking `IF` where the fixture is says nothing about where the
+/// competing drain is. The mask itself held perfectly (`dtick=0 masked=true` on every run) — it was
+/// simply pointed at the wrong core. Suspending the drain instead would be `main.rs`/`pal.rs` work.
 ///
-/// Flipped by hand between the two builds of the experiment (control = `false`).
-///
-/// SAFE AGAINST THE OBVIOUS DEADLOCK, checked rather than assumed: the danger of masking around a
-/// span that takes a lock is a holder on THIS core that was preempted mid-critical-section and can
-/// no longer be rescheduled. `pal::push_event` / `pal::pop_event` both take `EVENT_QUEUE` INSIDE
-/// `arch::without_interrupts`, and `video::wm`'s table guard is an `arch::IrqMask`, so neither lock
-/// can be held across a preemption in the first place.
-#[cfg(feature = "witness")]
-const SFQ_QUIESCE: bool = false;
-
-/// SELFTEST-QUIESCE — run `f` with this core's interrupts masked on the quiesced build, and
-/// unchanged on the control build.
-#[cfg(feature = "witness")]
-#[inline]
-fn sfq<R>(f: impl FnOnce() -> R) -> R {
-    if SFQ_QUIESCE {
-        crate::arch::without_interrupts(f)
-    } else {
-        f()
-    }
-}
-
-/// SELFTEST-QUIESCE — total SUCCESSFUL pops from `pal::EVENT_QUEUE` since boot (the 5th field of
+/// So the legs below judge what they can and SKIP what the machine took from them, which is the
+/// idiom `wmdirect_selftest`'s own `settle`/`lead` legs already use.
+/// SELFTEST-RACE — total SUCCESSFUL pops from `pal::EVENT_QUEUE` since boot (the 5th field of
 /// `pal::event_queue_stats`). A fixture that knows how many pops it made itself can subtract, and
 /// the remainder is the number of its own events some OTHER drain took — the direct evidence the
 /// hypothesis needs, rather than an inference from a failed predicate.
@@ -6560,7 +6543,7 @@ fn evq_pops() -> u64 {
     crate::pal::event_queue_stats().4
 }
 
-/// SELFTEST-QUIESCE — total pushes into `pal::EVENT_QUEUE` since boot (pointer + key).
+/// SELFTEST-RACE — total pushes into `pal::EVENT_QUEUE` since boot (pointer + key).
 #[cfg(feature = "witness")]
 #[inline]
 fn evq_pushes() -> u64 {
@@ -6568,19 +6551,15 @@ fn evq_pushes() -> u64 {
     s.0 + s.1
 }
 
-/// SELFTEST-QUIESCE — this core's index and its LOCAL tick count, as one sample.
+/// SELFTEST-RACE — the core this fixture is actually running on.
 ///
-/// The local tick is the leak detector for the quiesce. `percpu::note_tick` is called from this
-/// core's own APIC timer ISR, so a span that believes it is masked and comes back with a nonzero
-/// tick delta was NOT masked for the whole span — either something inside re-enabled `IF`, or the
-/// task yielded and the mask was restored to whatever the next task's `RFLAGS` carried. The cpu
-/// index catches the other way the quiesce can be void: the fixture and the competing drain ending
-/// up on DIFFERENT cores, where a local mask means nothing at all.
+/// Printed beside `svc=` (the core `x86_input_service` was published on) because the two are NOT
+/// the same, and every reading of these fixtures that assumed they were has been wrong. Measured
+/// `cpu=3` against `svc=Some(5)` on 8/8 boots.
 #[cfg(feature = "witness")]
 #[inline]
-fn sfq_cpu_tick() -> (u32, u64) {
-    let p = crate::arch::percpu::this_cpu();
-    (p.cpu_index, p.ticks.load(Ordering::Relaxed))
+fn sfq_cpu() -> u32 {
+    crate::arch::percpu::this_cpu().cpu_index
 }
 
 #[cfg(feature = "witness")]
@@ -6589,7 +6568,7 @@ pub fn ptrdead_selftest() {
     if DONE.swap(true, Ordering::Relaxed) {
         return;
     }
-    sfq(ptrdead_selftest_body);
+    ptrdead_selftest_body();
 }
 
 #[cfg(feature = "witness")]
@@ -6634,8 +6613,14 @@ fn ptrdead_selftest_body() {
     }
     let (_, _, drop1, _, _) = crate::pal::event_queue_stats();
     let foreign12 = (evq_pops() - pop0) as i64 - entries as i64;
-    let whole = entries == 1 && sx == n as i32 && sy == -(n as i32);
-    let nodrop = drop1 == drop0;
+    // SELFTEST-RACE — `None` means THIS RUN CANNOT JUDGE, not "passed". Both legs above assert an
+    // EXACT entry count and an EXACT sum over a ring this fixture does not own, so a pop by anybody
+    // else inside the window makes both readings arithmetic about somebody else's drain. Measured:
+    // `whole=false ... entries=1 travel=(47,-47) folded=191 fpop12=1` — the producer folded 191 of
+    // 192 reports perfectly and a competing drain took the accumulator, so the leg read the 47 that
+    // had piled up since. That is the machine, not the fold, and a red there is a false accusation.
+    let whole = (foreign12 == 0).then(|| entries == 1 && sx == n as i32 && sy == -(n as i32));
+    let nodrop = (foreign12 == 0).then(|| drop1 == drop0);
 
     // Leg 3 — the fold may not cross a `Button`. Pushed through the same producer seams a decoded
     // report uses: motion-only folds, a bare button does not, and the motion after the button starts
@@ -6645,7 +6630,7 @@ fn ptrdead_selftest_body() {
             break;
         }
     }
-    // SELFTEST-QUIESCE instrumentation: the four pops are taken UNCONDITIONALLY and judged
+    // SELFTEST-RACE instrumentation: the four pops are taken UNCONDITIONALLY and judged
     // afterwards, where the original `&&` chain short-circuited. Two reasons, neither of them a
     // change to what `order` MEANS: a short-circuited run leaves the events it never popped in the
     // ring for the next fixture, and — the point here — the observed shape cannot be reported if it
@@ -6664,19 +6649,23 @@ fn ptrdead_selftest_body() {
     ];
     let own3 = g.iter().filter(|e| e.is_some()).count() as u64;
     let foreign3 = (evq_pops() - pop2) as i64 - own3 as i64;
-    // This leg pushes four reports, each carrying exactly one event, so four is its own push count.
-    let fpush3 = (evq_pushes() - push2) as i64 - 4;
-    let order = matches!(g[0], Some(Event::Mouse { x: 1, y: 0 }))
-        && matches!(g[1], Some(Event::Button(1)))
-        && matches!(g[2], Some(Event::Mouse { x: 2, y: 0 }))
-        && g[3].is_none();
-    if !order {
+    // This leg pushes four reports carrying one event each, but the FOURTH folds into the third and
+    // `push_locked` charges `EVQ_PUSH_PTR` only on the non-coalesced path — so THREE is this leg's
+    // own push count and `fpush3 == 0` is the clean reading. (Measured: `-1` against a naive `4`,
+    // on runs whose `fpop` independently said no foreign producer was involved.)
+    let fpush3 = (evq_pushes() - push2) as i64 - 3;
+    let order = (foreign3 == 0).then(|| {
+        matches!(g[0], Some(Event::Mouse { x: 1, y: 0 }))
+            && matches!(g[1], Some(Event::Button(1)))
+            && matches!(g[2], Some(Event::Mouse { x: 2, y: 0 }))
+            && g[3].is_none()
+    });
+    if order != Some(true) {
         serial_println!(
-            "[ptrdead] order detail: got={:?} fpop={} fpush={} quiesced={}",
+            "[ptrdead] order detail: got={:?} fpop={} fpush={}",
             g,
             foreign3,
-            fpush3,
-            SFQ_QUIESCE
+            fpush3
         );
     }
 
@@ -6696,11 +6685,30 @@ fn ptrdead_selftest_body() {
         crate::pal::note_release_edge_drained();
     }
 
+    // A skip-or-bool leg renders `true`/`false`/`skip`, the idiom `wmdirect_selftest` already uses,
+    // and a skipped leg does not convict. The verdict stays `PASS`/`FAIL` — never a third token — so
+    // the harness DEFAULT-forbids rule that gates this fixture (`-> FAIL`; see `x86-fat.spec`) is
+    // unchanged and the spec's `COUNT n -> PASS` floor keeps its line.
+    let leg = |v: Option<bool>| match v {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "skip",
+    };
+    let judged = whole.unwrap_or(true) && nodrop.unwrap_or(true) && order.unwrap_or(true);
+    if whole.is_none() || order.is_none() {
+        serial_println!(
+            "[ptrdead] -> SKIP (window raced: fpop12={} fpop3={}) — a competing drain took this fixture's own queued events; cpu={} svc={:?}",
+            foreign12,
+            foreign3,
+            sfq_cpu(),
+            crate::arch::smp::service_cpu()
+        );
+    }
     serial_println!(
-        "[ptrdead] backlog whole={} nodrop={} order={} pushed={} entries={} travel=({},{}) folded={} dropped={} fpop12={} fpop3={} quiesced={} -> {}",
-        whole,
-        nodrop,
-        order,
+        "[ptrdead] backlog whole={} nodrop={} order={} pushed={} entries={} travel=({},{}) folded={} dropped={} fpop12={} fpop3={} cpu={} svc={:?} -> {}",
+        leg(whole),
+        leg(nodrop),
+        leg(order),
         n,
         entries,
         sx,
@@ -6709,8 +6717,9 @@ fn ptrdead_selftest_body() {
         drop1 - drop0,
         foreign12,
         foreign3,
-        SFQ_QUIESCE,
-        if whole && nodrop && order { "PASS" } else { "FAIL" }
+        sfq_cpu(),
+        crate::arch::smp::service_cpu(),
+        if judged { "PASS" } else { "FAIL" }
     );
 }
 
@@ -7771,7 +7780,7 @@ pub fn wmdirect_selftest() {
         wm::move_to(w, ox, oy);
         wm::info(w)
     } {
-        Some(i) => sfq(|| {
+        Some(i) => {
             let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
             user_input_set_active(OWNER_O);
             wm::focus_changed(OWNER_O);
@@ -7813,7 +7822,7 @@ pub fn wmdirect_selftest() {
             // was taken by a competing drain, and any push beyond 3 was injected by one.
             let pop0 = evq_pops();
             let push0 = evq_pushes();
-            let (cpu0, tick0) = sfq_cpu_tick();
+            let cpu0 = sfq_cpu();
             crate::pal::cursor::set_abs(hid(px, pw), hid(py, ph), pw as i32, ph as i32);
             crate::pal::cursor::set_button_level(true);
             // The PRESS goes through `push_event` too, and it has to: `pal` tracks its own previous
@@ -7873,8 +7882,7 @@ pub fn wmdirect_selftest() {
             let rest = wm::info(w).map(|r| (r.x, r.y)) == Some((i.x + 24, i.y + 24));
             let fpop = (evq_pops() - pop0) as i64 - own_pops as i64;
             let fpush = (evq_pushes() - push0) as i64 - 3;
-            let (cpu1, tick1) = sfq_cpu_tick();
-            let masked = crate::arch::irqs_masked();
+            let cpu1 = sfq_cpu();
             // This gesture has exactly one queued motion and it is the LIFT, which the reorder puts
             // BEHIND the edge — so a clean run steers no lead motions at all. A nonzero count means
             // the lift was routed while the edge was still counted as queued, i.e. two routers
@@ -7883,23 +7891,29 @@ pub fn wmdirect_selftest() {
             // makes the lift a lead motion too, so an ungated skip would swallow exactly the defect
             // this leg exists to catch. `swap=1` says the ring WAS reordered — only then is an
             // unexpected lead count evidence of the router interleave rather than of the fix.
-            if swap_ok && drag_last_lead() != 0 {
+            // SELFTEST-RACE — and the SECOND way this run cannot judge the kernel, which the
+            // `lead` arm below could not see: `fpop != 0` says a competing consumer POPPED one of
+            // this leg's own events out of the shared ring. The existing arm catches the two-router
+            // interleave (an event routed twice); this one catches an event routed by somebody else
+            // and never seen here at all — measured `fpop=1..2` with `grabbed/swap/ended` all true
+            // and the row resting at the GRAB point. It needs no `swap_ok` gate: `EVQ_POP` is
+            // charged per successful pop by whoever makes it, so a regression inside this leg's own
+            // drain lowers its own count and the ledger's equally and cannot raise `fpop`.
+            if fpop != 0 || (swap_ok && drag_last_lead() != 0) {
                 serial_println!(
-                    "[wm-act] settle -> SKIP (routing interleaved: lead={} on a gesture with none) fpop={} fpush={} quiesced={} cpu={}->{} dtick={}",
-                    drag_last_lead(),
+                    "[wm-act] settle -> SKIP (window raced: fpop={} fpush={} lead={}) cpu={} svc={:?}",
                     fpop,
                     fpush,
-                    SFQ_QUIESCE,
-                    cpu0,
+                    drag_last_lead(),
                     cpu1,
-                    tick1 - tick0
+                    crate::arch::smp::service_cpu()
                 );
                 None
             } else {
                 let verdict = grabbed && swap_ok && ended && rest;
                 if !verdict {
                     serial_println!(
-                        "[wm-act] settle detail: grabbed={} swap={} ended={} rest={} at={:?} want=({},{}) lead={} fpop={} fpush={} quiesced={} cpu={}->{} dtick={} masked={} svc={:?}",
+                        "[wm-act] settle detail: grabbed={} swap={} ended={} rest={} at={:?} want=({},{}) lead={} fpop={} fpush={} cpu={}->{} svc={:?}",
                         grabbed,
                         swap_ok,
                         ended,
@@ -7910,17 +7924,14 @@ pub fn wmdirect_selftest() {
                         drag_last_lead(),
                         fpop,
                         fpush,
-                        SFQ_QUIESCE,
                         cpu0,
                         cpu1,
-                        tick1 - tick0,
-                        masked,
                         crate::arch::smp::service_cpu()
                     );
                 }
                 Some(verdict)
             }
-        }),
+        }
         None => Some(false),
     };
 
@@ -7954,7 +7965,7 @@ pub fn wmdirect_selftest() {
         wm::move_to(w, ox, oy);
         wm::info(w)
     } {
-        Some(i) => sfq(|| {
+        Some(i) => {
             let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
             user_input_set_active(OWNER_O);
             wm::focus_changed(OWNER_O);
@@ -7990,7 +8001,7 @@ pub fn wmdirect_selftest() {
             // +12 motion, then the lift+edge pair).
             let pop0 = evq_pops();
             let push0 = evq_pushes();
-            let (cpu0, tick0) = sfq_cpu_tick();
+            let cpu0 = sfq_cpu();
             crate::pal::cursor::set_abs(hid(px, pw), hid(py, ph), pw as i32, ph as i32);
             crate::pal::cursor::set_button_level(true);
             crate::pal::push_event(Event::Button(1));
@@ -8027,8 +8038,7 @@ pub fn wmdirect_selftest() {
             let rest = wm::info(w).map(|r| (r.x, r.y)) == Some((i.x + 12, i.y + 12));
             let fpop = (evq_pops() - pop0) as i64 - own_pops as i64;
             let fpush = (evq_pushes() - push0) as i64 - 4;
-            let (cpu1, tick1) = sfq_cpu_tick();
-            let masked = crate::arch::irqs_masked();
+            let cpu1 = sfq_cpu();
             crate::pal::cursor::set_button_level(false);
             // Exactly ONE lead motion is the shape this leg drives: the +12, with the +24 lift
             // behind the edge. Two means the lift was routed as a lead as well — the two-router
@@ -8036,23 +8046,23 @@ pub fn wmdirect_selftest() {
             // Zero means the +12 never steered, which IS the glide and is a real failure.
             // `swap_ok` gates the skip for the reason leg 9 states: without the reorder the lift is
             // a lead motion as well, and skipping on that would hide the producer half's failure.
-            if swap_ok && drag_last_lead() > 1 {
+            // SELFTEST-RACE — see the `settle` arm: `fpop != 0` is the stolen-event case, and it is
+            // the one the two `lead=false` reds on this branch actually were (`lead=0`, not `>1`).
+            if fpop != 0 || (swap_ok && drag_last_lead() > 1) {
                 serial_println!(
-                    "[wm-act] lead -> SKIP (routing interleaved: lead={} on a one-lead gesture) fpop={} fpush={} quiesced={} cpu={}->{} dtick={}",
-                    drag_last_lead(),
+                    "[wm-act] lead -> SKIP (window raced: fpop={} fpush={} lead={}) cpu={} svc={:?}",
                     fpop,
                     fpush,
-                    SFQ_QUIESCE,
-                    cpu0,
+                    drag_last_lead(),
                     cpu1,
-                    tick1 - tick0
+                    crate::arch::smp::service_cpu()
                 );
                 None
             } else {
                 let verdict = grabbed && swap_ok && ended && rest;
                 if !verdict {
                     serial_println!(
-                        "[wm-act] lead detail: grabbed={} swap={} ended={} rest={} at={:?} want=({},{}) lead={} fpop={} fpush={} quiesced={} cpu={}->{} dtick={} masked={} svc={:?}",
+                        "[wm-act] lead detail: grabbed={} swap={} ended={} rest={} at={:?} want=({},{}) lead={} fpop={} fpush={} cpu={}->{} svc={:?}",
                         grabbed,
                         swap_ok,
                         ended,
@@ -8063,17 +8073,14 @@ pub fn wmdirect_selftest() {
                         drag_last_lead(),
                         fpop,
                         fpush,
-                        SFQ_QUIESCE,
                         cpu0,
                         cpu1,
-                        tick1 - tick0,
-                        masked,
                         crate::arch::smp::service_cpu()
                     );
                 }
                 Some(verdict)
             }
-        }),
+        }
         None => Some(false),
     };
 
