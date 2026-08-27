@@ -511,6 +511,98 @@ const MAX_PRESENT_RECTS: usize = 8;
 static PRESENT_RECTS: Mutex<([(usize, usize, usize, usize); MAX_PRESENT_RECTS], usize)> =
     Mutex::new(([(0, 0, 0, 0); MAX_PRESENT_RECTS], 0));
 
+/// BRACKETQ — brackets this arm RESCUED: a queued rect met the sprite box on a present whose
+/// `FULL_PRESENT` flag was clear and whose `damage` set was disjoint from the arrow. Every one of
+/// these is a bracket the pre-BRACKETQ `bracket_needed` would have SKIPPED, and therefore a desktop
+/// blit that would have landed on the arrow with no handback and no repair. Zero on a boot that
+/// never moved a window or closed one; nonzero is the fix working, not a fault.
+#[cfg(feature = "witness")]
+static BRACKETQ_MET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// BRACKETQ — peeks that found the queue locked and took the conservative answer. A spurious
+/// bracket costs one restore/save/draw; a missed one costs the arrow. Expected to be ~0 (see the
+/// contention analysis on [`present_rects_meet`]); a large reading would mean the peek is racing the
+/// request site far more than the lock's own hold time can explain.
+#[cfg(feature = "witness")]
+static BRACKETQ_BUSY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// BRACKETQ — **does the rect queue owe this present a repaint that lands on the sprite?**
+///
+/// ### The hole this closes
+///
+/// [`Screen::flush`] decides the CURSOR-13 bracket with [`Screen::bracket_needed`] and then calls
+/// [`Screen::present_background`] on the very next line — and `present_background` is where
+/// [`PRESENT_RECTS`] is drained into `self.damage`. So the damage set `bracket_needed` scans is the
+/// set as it stood BEFORE the queue was applied, and the queue was the one input it could not see.
+///
+/// DRAG-PI M1 opened that gap by introducing this queue without teaching the bracket about it, and
+/// while the only writer was `move_to_inner` it stayed narrow: a move is a drag, the pointer is
+/// moving, and the mover's own `repaint` re-established the arrow. DRAGWIDE moved the ENTIRE
+/// deferred-erase drain onto the same queue (`wm::drain_deferred` asks per box instead of arming
+/// `request_full_present`), which is what made the gap reachable with a STATIONARY pointer: the
+/// drain's boxes are close, hide, park, zoom-restore and reclaim, none of which move the cursor.
+/// The old code took the bracket on those presents for an incidental reason — `request_full_present`
+/// armed `FULL_PRESENT`, and `bracket_needed`'s documented "`FULL_PRESENT` pending" arm fired. Take
+/// the flag away and the arm goes with it.
+///
+/// Uncovered, the failure is silent: `cursor::note_desktop_over_sprite` counts a desktop blit that
+/// lands on a live arrow but arms no repair (unlike `note_present_over_sprite`, which sets
+/// `PRESENT_DIRTY`), so the arrow simply carries a desktop-coloured bite until something else
+/// disturbs it.
+///
+/// ### Why `try_lock`, and why `true` on contention
+///
+/// `try_lock`, not `lock`, and the reason is a rule rather than a measurement: this is a PEEK on a
+/// decision path, and a peek must never be able to block the present it is deciding for. The lock
+/// order question is answered the same way — `try_lock` cannot participate in a cycle, so there is
+/// no order to reason about. (For the record there is no cycle to avoid either: `PRESENT_RECTS` is
+/// taken by exactly two writers, [`request_present_rect`] and `present_background`'s drain block,
+/// neither of which calls `flush`, and `present_background` runs strictly AFTER this. A `spin::Mutex`
+/// is not reentrant, so had this been `lock()` an ISR-borne `request_present_rect` interrupting a
+/// holder would have been a hard hang; `try_lock` makes that unreachable by construction.)
+///
+/// `true` on contention is the conservative answer in the only direction that matters: a spurious
+/// bracket costs one restore/save/draw of a 12x20 sprite, a missed one costs the arrow. It also
+/// cannot livelock — there is no retry, no loop and no wait; the peek answers immediately and the
+/// caller proceeds to bounded work (`cursor::undraw` … `cursor::repaint`, both of which take their
+/// own locks and neither of which re-enters this function).
+///
+/// ### Why this does not undo FLICKER-3
+///
+/// FLICKER-3 exists to stop the STATUS STRIP's once-a-second band from bracketing an arrow it can
+/// never touch (P80, "the core idle bars cause mouse to flicker"). The strip's damage arrives
+/// through `Screen::mark`, i.e. through `self.damage`, which `bracket_needed` already scanned and
+/// which this function does not touch. Nothing reaches [`PRESENT_RECTS`] except a window MOVE
+/// (`move_to_inner`) or a deferred ERASE (`drain_deferred`) — both of which genuinely paint desktop
+/// over the region they queue. So the new arm fires only where a bracket was always owed, and P80's
+/// population is untouched.
+///
+/// The rect is clipped exactly as [`Screen::mark`] will clip it when `present_background` applies it
+/// — `min` against the panel's width/height, empty rects dropped — so the peek answers about the
+/// rect the present will actually publish rather than about the request as written.
+fn present_rects_meet(sx: usize, sy: usize, sw: usize, sh: usize, pw: usize, ph: usize) -> bool {
+    let Some(q) = PRESENT_RECTS.try_lock() else {
+        #[cfg(feature = "witness")]
+        BRACKETQ_BUSY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return true;
+    };
+    let n = q.1;
+    let met = (0..n).any(|i| {
+        let (x, y, w, h) = q.0[i];
+        // `Screen::mark`'s clamp, verbatim: `x1`/`y1` against the panel, and an empty rect is
+        // dropped rather than marked. Overlap is then the same half-open test the damage scan
+        // above makes against the same sprite box.
+        let x1 = x.saturating_add(w).min(pw);
+        let y1 = y.saturating_add(h).min(ph);
+        x < x1 && y < y1 && x < sx + sw && sx < x1 && y < sy + sh && sy < y1
+    });
+    drop(q);
+    #[cfg(feature = "witness")]
+    if met {
+        BRACKETQ_MET.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    met
+}
+
 // ---- DRAGWIDE: the desktop present's amplification census --------------------------------------
 //
 // DRAG-PI M1 narrowed `move_to_inner` from a whole-panel present to the old box and the new one, and
@@ -604,14 +696,21 @@ fn desk_amp_flush() {
         return;
     }
     let a = desk_amp_x100(req, pres);
+    // BRACKETQ — the rescued-bracket pair rides THIS line rather than `[flick2]`'s, for two
+    // reasons. It belongs to DRAGWIDE's arc (the queue this census already reports on is the queue
+    // the peek reads), and `[flick2]` lives in `cursor`, which is read-only to this change.
+    // Monotone totals, not drained: the question they answer is "did this arm ever fire on this
+    // boot", and a per-interval reading would make a rare event look like an absent one.
     serial_println!(
-        "[wc-w] rollup presents={} requested_px={} presented_px={} amp={}.{:02}x full_presents={} -> {}",
+        "[wc-w] rollup presents={} requested_px={} presented_px={} amp={}.{:02}x full_presents={} bracketq_met={} bracketq_busy={} -> {}",
         n,
         req,
         pres,
         a / 100,
         a % 100,
         full,
+        BRACKETQ_MET.load(Relaxed),
+        BRACKETQ_BUSY.load(Relaxed),
         if full > 0 { "WIDENED" } else { "HONOURED" }
     );
 }
@@ -1301,6 +1400,15 @@ impl Screen {
     /// * **`FULL_PRESENT` pending** — the present's paint set is the whole panel; every sprite
     ///   pixel is in it. Read with `load`, not `swap`: consuming the flag is `present_background`'s
     ///   job and it must still see it.
+    /// * **BRACKETQ — a queued PRESENT RECT meets the sprite.** The paint set of this present is
+    ///   `self.damage` PLUS whatever [`present_background`] is about to drain out of
+    ///   [`PRESENT_RECTS`] one line below, and until now this function scanned only the first half.
+    ///   That was sound while `request_full_present` was what a deferred erase armed — the flag's
+    ///   arm above covered it — and stopped being sound when DRAGWIDE moved the drain onto the rect
+    ///   queue. `present_rects_meet` peeks the queue (never consumes it: draining is
+    ///   `present_background`'s job, exactly as the flag's `load`-not-`swap` above) and is the
+    ///   authority on why. Read LAST of the three, so the two lock-free tests short-circuit it
+    ///   whenever the bracket is already owed.
     ///
     /// Only the live-sprite decision is counted (`[flick2] flush_undraw=`/`flush_skip=`): the
     /// legacy classes cannot blink an arrow the operator can see, and counting them would bury the
@@ -1323,7 +1431,12 @@ impl Screen {
                     && sx < x1
                     && d.y0 < sy + sh
                     && sy < y1
-            });
+            })
+            // BRACKETQ — the OTHER half of this present's paint set. Last in the chain so it is
+            // reached only when the flag is clear and the damage set is disjoint, which makes
+            // `BRACKETQ_MET` exactly "brackets this arm rescued" rather than "presents that had a
+            // rect queued".
+            || present_rects_meet(sx, sy, sw, sh, self.info.width, self.info.height);
         super::cursor::note_flush_bracket(taken);
         taken
     }
