@@ -3906,29 +3906,42 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             crate::selftest::run(console, pal);
         },
         "sched" | "ps" => {
+            // SCHEDPAR: one table body for both arches. `current_task_id`/`run_queue_len` are
+            // signature-matched twins (the aarch64 pair authored by the orin seat, folded under
+            // the 2026-08-27 cross-lane grant); only the core census and the demo line stay
+            // per-arch. The aarch64 census walks the full percpu range rather than
+            // `online_cpu_count()` — the online set is a MASK and may be sparse (metal has
+            // brought up 3 of 4), and a count-bounded loop would silently drop the highest core.
             #[cfg(target_arch = "x86_64")]
-            {
-                let count = core::cmp::min(
-                    crate::arch::acpi::cpu_count().max(1),
-                    crate::arch::gdt::MAX_CPUS,
-                );
-                console.println("CPU  role  current  run-queue");
-                for cpu in 0..count {
-                    let role = if cpu == 0 { "bsp" } else { "ap " };
-                    let cur = match crate::arch::sched::current_task_id(cpu) {
-                        Some(id) => alloc::format!("tid {}", id),
-                        None => "-".into(),
-                    };
-                    console.println(&alloc::format!(
-                        "{:>3}  {}   {:<8} {}",
-                        cpu, role, cur, crate::arch::sched::run_queue_len(cpu)
-                    ));
-                }
+            let count = core::cmp::min(
+                crate::arch::acpi::cpu_count().max(1),
+                crate::arch::gdt::MAX_CPUS,
+            );
+            #[cfg(target_arch = "aarch64")]
+            let count = crate::arch::percpu::NUM_CPUS;
+            console.println("CPU  role  current  run-queue");
+            for cpu in 0..count {
+                let role = if cpu == 0 { "bsp" } else { "ap " };
+                let cur = match crate::arch::sched::current_task_id(cpu) {
+                    Some(id) => alloc::format!("tid {}", id),
+                    None => "-".into(),
+                };
                 console.println(&alloc::format!(
-                    "demo tasks finished: {}", crate::arch::sched::demo_done()));
+                    "{:>3}  {}   {:<8} {}",
+                    cpu, role, cur, crate::arch::sched::run_queue_len(cpu)
+                ));
             }
-            #[cfg(not(target_arch = "x86_64"))]
-            console.println("sched: x86_64 only");
+            #[cfg(target_arch = "x86_64")]
+            console.println(&alloc::format!(
+                "demo tasks finished: {}", crate::arch::sched::demo_done()));
+            // Not an apology: the aarch64 demo paths are the wrong shape for a counter. The
+            // cooperative demo completes synchronously before preemption enables and before this
+            // shell exists (a count here would read the same constant forever), and the
+            // `sched_demo` burst is a balancer exercise with its own serial witness.
+            #[cfg(target_arch = "aarch64")]
+            console.println(
+                "demo tasks: n/a — the cooperative demo completes before this shell exists; \
+                 the sched_demo burst reports on serial as ':: AARCH64 SCHED-BAL:'");
         },
         "burst" => {
             // ORIN-BURST: fire the SCHED-BAL multi-hot-thread burst live from the tegra shell so the

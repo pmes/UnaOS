@@ -4466,6 +4466,54 @@ pub fn current_id() -> Option<u64> {
     if raw.is_null() { None } else { Some(unsafe { (*raw).id }) }
 }
 
+/// The id of the task currently dispatched on **any** core, or None if that core is idle (in the
+/// scheduler/idle context) or out of range. The cross-core twin of [`current_id`], which reports
+/// only the calling core.
+///
+/// SCHEDPAR (2026-08-27): written to close the `sched`/`ps` shell verb, which was
+/// `#[cfg(target_arch = "x86_64")]` and printed "sched: x86_64 only" on this arch — a capability
+/// asymmetry with no hardware reason, the class `parity-arch-gates.sh` exists to find. x86's twin is
+/// `arch::x86_64::sched::current_task_id`, and this deliberately matches its signature so the shell
+/// arm is one body, not two.
+///
+/// BEST-EFFORT BY CONSTRUCTION, and that is the honest word: the target core may switch between this
+/// load and its use. A `Relaxed` load is therefore the right strength — an `Acquire` would buy
+/// ordering against a *publication* this reader never dereferences past the id. Deliberately NOT
+/// reading `(*raw).name`: the `&'static str` name stays valid after the Box is reclaimed but the
+/// `Task` body does not, and one field read off a foreign core's `current` is the smallest window
+/// this can be given. For a name, read [`core_load`]'s `last_task`, which is published by the owning
+/// core into `ACCT` precisely so cross-core readers never chase a `Task` pointer.
+pub fn current_task_id(cpu: usize) -> Option<u64> {
+    if cpu >= NUM_CPUS {
+        return None;
+    }
+    let raw = SCHED[cpu].current.load(Ordering::Relaxed) as *const Task;
+    if raw.is_null() { None } else { Some(unsafe { (*raw).id }) }
+}
+
+/// Number of READY tasks queued on `cpu` across all priority levels (best-effort snapshot; backs the
+/// `sched`/`ps` shell verb). Zero for an out-of-range core.
+///
+/// SCHEDPAR (2026-08-27): the aarch64 twin of `arch::x86_64::sched::run_queue_len`, same signature.
+///
+/// This is [`RunQueue::len`] under the run-queue lock — the operation that method's own doc sanctions
+/// as "introspection under the run-queue lock, never on the switch path", and the same `rq(c).len()`
+/// the SCHED-3 balancer already performs on foreign cores when placing work. It therefore adds no new
+/// lock-ordering or IRQ-discipline claim: [`rq`] masks IRQs for the span and asserts run-queue
+/// sections do not nest, so the constraint on callers is only that they must not already hold a
+/// run-queue section. The shell (task context, no section held) satisfies that; a caller on the
+/// dispatch path would not, and must not use this.
+///
+/// The count is stale the instant the lock drops. It is a human-readable depth for an operator
+/// table, not a scheduling input — the balancer reads its own `rq(c).len()` at the decision point
+/// rather than anything cached from here.
+pub fn run_queue_len(cpu: usize) -> usize {
+    if cpu >= NUM_CPUS {
+        return 0;
+    }
+    rq(cpu).len()
+}
+
 // =============================================================================================
 // SKILL-1 — the ASYNCHRONOUS KILL primitive.
 //
