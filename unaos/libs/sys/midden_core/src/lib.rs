@@ -257,6 +257,11 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     ("cp", Avail::Always), ("copy", Avail::Always), ("mv", Avail::Always),
     ("move", Avail::Always), ("ren", Avail::Always), ("rename", Avail::Always),
     ("sync", Avail::Always), ("write", Avail::Always),
+    // PRTSCR: capture the panel to `SCREEN<n>.PNG` at the volume root. Always — the VERB is one
+    // word on every UnaOS (the ONE-OS law `reboot` is registered under), and the per-platform panel
+    // decides what it can capture, never whether the word exists. The ring arm refuses honestly and
+    // by name when there is no panel, no writable volume, or no free index.
+    ("screenshot", Avail::Always),
     // native unafs — aarch64 only
     ("uls", Avail::Aarch64), ("ucat", Avail::Aarch64), ("utouch", Avail::Aarch64),
     ("uwrite", Avail::Aarch64), ("umkdir", Avail::Aarch64), ("urm", Avail::Aarch64),
@@ -538,6 +543,10 @@ pub fn help(facts: &Facts) -> String {
     say!("TREE:     find [root] <pattern>  (recursive glob search), du [dir]  (recursive size tally)");
     say!("          uptime  (seconds since boot; shows the wall clock when set)");
     say!("INSPECT:  stat <path>  (full on-disk detail), xd <path> [off] [len]  (bounded hexdump)");
+    // PRTSCR: advertised unconditionally, like the verb itself — the word exists on every UnaOS
+    // and the ring arm says honestly what this panel and this volume could not do.
+    say!("CAPTURE:  screenshot  (panel -> SCREEN<n>.PNG at the volume root; n = first free 0-99)");
+    say!("          the Print Screen key does the same thing (x86)");
     if facts.aarch64 {
         say!("UNAFS:    uls [path], ucat <path>  (native unafs volume, absolute paths)");
         say!("          utouch <path>, uwrite <path> <text>, umkdir <path>, urm <path>  (write-through)");

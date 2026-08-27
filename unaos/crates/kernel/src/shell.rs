@@ -3533,6 +3533,32 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // write-back cache to flush. `sync` is the honest confirmation of that (a no-op by design).
             console.println("sync: write-through storage — every write is already durable on the card");
         },
+        "screenshot" => {
+            // PRTSCR: capture the panel to `SCREEN<n>.PNG` at the volume root. The whole mechanism
+            // lives in `video::prtscr` because the Print Screen KEY reaches the same function from
+            // the device-service pass — a verb that reimplemented any of it would be a second
+            // capture path to keep in step, which is exactly what MIDDEN-M1 removed from this file.
+            //
+            // Two sinks, two lengths, one verdict word — FATVERB's rule. The operator gets a
+            // sentence; the capture gets the census line `Refusal::report` writes to serial. Both
+            // are emitted for a refusal, and the OK line is emitted here for the same reason: a
+            // headless `test-fat` boot must be able to prove the write from the log alone.
+            match crate::video::prtscr::capture() {
+                Ok(shot) => {
+                    serial_println!(
+                        ":: PRTSCR: {} {}x{} {} bytes -> OK ::",
+                        shot.name, shot.width, shot.height, shot.bytes
+                    );
+                    console.println(&alloc::format!(
+                        "wrote {} ({}x{}, {} bytes)", shot.name, shot.width, shot.height, shot.bytes
+                    ));
+                }
+                Err(why) => {
+                    why.report();
+                    console.println(&why.sentence());
+                }
+            }
+        },
         "diskinfo" => {
             // PI-FS-5: on the Pi report BOTH storage devices — the SD card (emmc2, the global block device that
             // hosts unafs + the FAT boot partition) AND, when present, the USB stick (its own geometry from
