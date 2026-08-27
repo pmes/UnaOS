@@ -1049,6 +1049,29 @@ static JOBS: spin::Mutex<Vec<Job>> = spin::Mutex::new(Vec::new());
 /// `pub` on both arches with the same signature, so the reaper is the SAME code on both — an x86
 /// table that is empty today simply reaps nothing, and no stub has to be kept in step with the
 /// real one.
+///
+/// ⚠ **"ARCH-NEUTRAL" WAS THE WRONG AXIS — THERE ARE THREE STATES, NOT TWO (rmbp-7 QUARRY2).**
+/// `arch::syscall` is not a property of the *arch*; it is a property of the **EL0 layer**. On x86 the
+/// module is unconditional (`arch/x86_64/mod.rs:11`), but `arch/aarch64/mod.rs:47` gates
+/// `pub mod syscall;` behind `any(feature = "baremetal", feature = "tegra_el0")` — the rings, the
+/// process table and `bg_poll` all belong to that layer. So an aarch64 build carrying
+/// `desktop_firmware` (this window's own gate) with NEITHER of those two features named a module that
+/// does not exist, and this function failed E0432/E0433 at the `use` and at the `bg_poll` call. No
+/// coverage leg reached the combination: `arm-pi` always carries `baremetal`, `arm-tegra-desk` always
+/// carries `tegra_el0`, and the third polarity was named nowhere — which is how it shipped. The same
+/// defect, from the same premise, was fixed one file over in [`super::super::dock`]'s focus seam
+/// (`ba3e9b62`); this is that fix's shape applied to Quarry's spawn seam.
+///
+/// The ringless arm below is a genuine no-op rather than a placeholder, and the reason is a
+/// *measurable* property of this file rather than an assumption: [`JOBS`] has exactly ONE push site
+/// — the one inside the EL0 [`launch`] — and that body is not compiled in a ringless build. The table
+/// is therefore provably empty, and "poll every outstanding job" over an empty table is precisely
+/// nothing. Nothing is silently swallowed: the launch that would have filled it refuses out loud,
+/// with a reason, in the arm below.
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra_el0"))
+))]
 fn reap_jobs() {
     use crate::arch::syscall::BgPoll;
     let mut jobs = JOBS.lock();
@@ -1077,6 +1100,20 @@ fn reap_jobs() {
     }
 }
 
+/// The ringless counterpart of [`reap_jobs`] — an aarch64 desktop build with no EL0 layer, hence no
+/// `arch::syscall` and no `bg_poll` to poll with.
+///
+/// Empty by proof, not by convenience: see the gated twin's doc comment. [`JOBS`]'s sole `push` lives
+/// in the EL0 [`launch`], which this configuration does not compile, so the table this would iterate
+/// cannot be non-empty. Kept as a real function rather than folded into its callers' `cfg`s because
+/// it has FIVE call sites (the ceiling pre-check, the post-launch pass, and three service/gesture
+/// passes) and gating each of them would put the same conjunct in five places to drift out of step.
+#[cfg(not(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra_el0"))
+)))]
+fn reap_jobs() {}
+
 /// Read `path` through the VFS seam and spawn it detached. Returns the one line the path bar shows.
 ///
 /// Every gate here is the one `shell::read_el0_image` applies, in the same order and with the same
@@ -1091,12 +1128,29 @@ fn reap_jobs() {
 /// ADD lines and break the byte-identity proof (PARITY.md §5.3). The shared thing is the seam that
 /// matters — the mount table for the read, `spawn_user_image_bg` for the spawn — not the printing.
 ///
-/// This is HALF of a per-arch dispatch: the x86_64 arm is the `cfg(not(target_arch = "aarch64"))`
+/// This is ONE OF THREE arms (it was written as one of two — see the warning below): the x86_64 arm
+/// is the `cfg(not(target_arch = "aarch64"))`
 /// `launch` at the end of this section, and it declines because there is no mount table to resolve
 /// against — NOT because the spawn seam is missing (x86 has `spawn_user_image_bg` and `bg_poll`
 /// too). The counterpart is named here because this body is longer than a reader — or the parity
 /// detector's window — will scan before concluding the other arch has nothing.
-#[cfg(target_arch = "aarch64")]
+///
+/// ⚠ **THE DISPATCH IS THREE-WAY, NOT TWO-WAY (rmbp-7 QUARRY2).** This body needs BOTH halves of the
+/// seam — `uslots::USER_REGION_SIZE` for the ceiling and `arch::syscall::spawn_user_image_bg` for the
+/// spawn — and `arch/aarch64/mod.rs` gates both modules behind
+/// `any(feature = "baremetal", feature = "tegra_el0")`, because the user address space and the
+/// process table belong to the EL0 layer rather than to the chip. `target_arch = "aarch64"` alone
+/// therefore over-claimed: it named this body for a ringless `desktop_firmware` build that has
+/// neither module, and it failed E0433 at the `CAP` const and again at the spawn call. The conjunct
+/// added here is those modules' own gate, VERBATIM, so `arm-pi` and every tegra-EL0 leg emit exactly
+/// the code they emitted before; the third arm below is the configuration that used to land here and
+/// could not compile. Keep this predicate identical to `arch/aarch64/mod.rs`'s gate on
+/// `pub mod syscall;` / `pub mod uslots` — a narrower copy silently stops Quarry launching on a board
+/// that HAS an EL0 layer, and a wider one is the E0433 back again.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "baremetal", feature = "tegra_el0")
+))]
 fn launch(path: &str) -> String {
     use crate::fs::vfs::{NodeKind as NK, VfsError};
     fn why(e: VfsError) -> String {
@@ -1176,10 +1230,47 @@ fn launch(path: &str) -> String {
 /// `fat::mount()` — the raw-backend path this arc is forbidden to take. The layout, the gesture, the
 /// double-click predicate and the launchability test all compile and are witnessed on this arch; the
 /// day the x86 VFS adoption lands, this shim collapses into the one above.
+///
+/// This arm's `cfg` is left EXACTLY as written (`not(target_arch = "aarch64")`) by the QUARRY2 fix,
+/// rather than narrowed to `target_arch = "x86_64"`: the third arm below carves its configuration out
+/// of the aarch64 side only, so these three predicates stay disjoint and exhaustive while this one's
+/// emitted code is untouched in every configuration that already compiled.
 #[cfg(not(target_arch = "aarch64"))]
 fn launch(path: &str) -> String {
     serial_println!("[quarry] launch DECLINE path={} reason=no-vfs-on-this-arch (vfs.md 12.4)", path);
     String::from("no VFS mount table on this arch yet (vfs.md 12.4)")
+}
+
+/// The THIRD arm (rmbp-7 QUARRY2): aarch64 with `desktop_firmware` but **no EL0 layer** — neither
+/// `baremetal` nor `tegra_el0`. Quarry's window, tree, list, scrolling and gestures all compile and
+/// work here; what is absent is the ring-3 machinery underneath the launch seam, so there is no
+/// `arch::syscall::spawn_user_image_bg` to spawn with and no `uslots::USER_REGION_SIZE` to size the
+/// refusal against.
+///
+/// It REFUSES, out loud, naming the missing layer — it does not silently no-op, and it does not fake
+/// a pid. That is Quarry's own idiom rather than a new one: every other impossible launch in this file
+/// prints `[quarry] launch REFUSED path=… reason=…` and hands the same sentence back to the path bar
+/// (`reason=stat`, `reason=empty`, `reason=oversize`, `reason=job-table-full`, `reason=spawn`), so an
+/// operator who double-clicks a program on a ringless board reads *why* in the window and the serial
+/// log carries the matching line. `REFUSED` rather than the x86 arm's `DECLINE` because the two are
+/// genuinely different findings: x86 has the spawn seam and lacks the *mount table* (a cross-file gate
+/// in `fs/vfs.rs`, vfs.md §12.4), whereas this build has the mount table and lacks the *rings*. Both
+/// are stated in the terms the reader can act on — the feature to turn on is named.
+///
+/// No facade is invented. `arch/aarch64/mod.rs` declines to publish `syscall`/`uslots` outside the EL0
+/// features deliberately, and a `crate::arch::spawn_user_image_bg` shim that answered `Err` here would
+/// be exactly the fiction that preamble refuses; the dispatch is kept at the call site instead, which
+/// is also what [`super::super::dock`]'s focus seam does one file over (`ba3e9b62`).
+#[cfg(all(
+    target_arch = "aarch64",
+    not(any(feature = "baremetal", feature = "tegra_el0"))
+))]
+fn launch(path: &str) -> String {
+    serial_println!(
+        "[quarry] launch REFUSED path={} reason=no-el0-layer (this aarch64 build has neither `baremetal` nor `tegra_el0`, so `arch::syscall`/`uslots` are not compiled)",
+        path
+    );
+    String::from("no EL0 layer in this build (needs `baremetal` or `tegra_el0`)")
 }
 
 /// Perform an [`Act`] decided inside the model lock, with that lock RELEASED, then record its
