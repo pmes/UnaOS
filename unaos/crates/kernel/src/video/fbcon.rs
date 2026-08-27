@@ -2157,7 +2157,12 @@ fn pace_clock_hz() -> u64 {
 /// not ready, allocation refused, geometry unavailable, create failed, install contended), and the
 /// caller then detaches exactly as it always did. `desktop_firmware` off is a compile-time absence, so the
 /// knob-off image never contains this at all.
-#[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))]
+///
+/// PARFB — widened from `all(aarch64, desktop_firmware)` to the ROUTE's OWN condition on both arches.
+/// "Is the console routed right now?" is not a Pi question; it is the routed console's question, and
+/// x86's `wc` desktop has the same route and reads it from the same `CONSOLE_WIN` cell. The gate now
+/// names exactly where a route can exist, which is the only honest gate for a query about the route.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] // PARFB
 pub fn console_is_routed() -> bool {
     CONSOLE_WIN.load(Ordering::Relaxed) != wm::WIN_NONE
 }
@@ -2275,11 +2280,24 @@ pub fn panel_console_face_arm() -> Option<(usize, usize)> {
 /// THE PANIC OVERRIDE IS EXPLICIT: a held mirror is ignored while `PANIC_MIRROR` is set, so
 /// `panic_screen`'s red backdrop and its text reach the panel whatever the desktop had claimed. That
 /// is the same belt-and-braces `_print`'s x86 mute gate keeps, for the same reason.
-#[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))]
+///
+/// PARFB — BOTH GATE TERMS WERE INCIDENTAL, on ORIN-FACE's own argument. The `feature` term is the
+/// one that costs: `desktop_firmware` was never the only desk. The Orin comes up through `orindesk`,
+/// and the two-writer window this closes — a desk clears the glass, and `_print` keeps painting on it
+/// until the glyph route installs — is that desk's window too, verbatim. With the knob term in place
+/// the mechanism could not be armed there at all, because it did not exist to arm. The `target_arch`
+/// term went with it: this body names `FBCON` and one `AtomicBool`, and x86 has both. On x86 the
+/// QUIET-PANEL gate still makes the hold redundant on every path that exists today, so the widening
+/// buys x86 an ARMABLE mechanism and changes no x86 boot — nothing calls `panel_mirror_hold`, so the
+/// flag reads false forever and `_print`'s test short-circuits on its first relaxed load.
+///
+/// ⚠ ARMING IT IS A CALL SITE, AND THE CALL SITE IS NOT IN THIS FILE. See the report's out-of-lane
+/// coordinates for the `orindesk` DESKTOP-CLEAR seam that has to call `panel_mirror_hold(true)`.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))] // PARFB
 static PANEL_MIRROR_HOLD: AtomicBool = AtomicBool::new(false);
 
 /// DESKHOLD — arm the hold described above. Called by `desktop_firmware::activate`'s DESKTOP-CLEAR.
-#[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))] // PARFB
 pub fn panel_mirror_hold(on: bool) {
     PANEL_MIRROR_HOLD.store(on, Ordering::Relaxed);
 }
@@ -2293,15 +2311,15 @@ pub fn panel_mirror_hold(on: bool) {
 /// WINDOW blank for the rest of the boot, which is the one outcome worse than the defect. The hold
 /// therefore lifts exactly when the route makes it redundant, and stays armed forever on the decline
 /// path, where there is no window and the panel is the only thing a print could reach.
-#[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))] // PARFB — see the static's note.
 fn panel_mirror_held() -> bool {
-    PANEL_MIRROR_HOLD.load(Ordering::Relaxed)
-        && !PANIC_MIRROR.load(Ordering::Relaxed)
-        && CONSOLE_WIN.load(Ordering::Relaxed) == wm::WIN_NONE
+    #[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))] let overridden = PANIC_MIRROR.load(Ordering::Relaxed); #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware"))))] let overridden = false; // PARFB — `PANIC_MIRROR`'s OWN predicate, quoted rather than assumed. Where the flag does not exist there is no panic mirror that could override the hold, so the term is a compile-time `false`. ⚠ SAME-LINE fold, line-NEUTRAL.
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] let unrouted = CONSOLE_WIN.load(Ordering::Relaxed) == wm::WIN_NONE; #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] let unrouted = true; // PARFB — `CONSOLE_WIN`'s own predicate. A build with no glyph ROUTE has no window for the hold to become redundant against, so the third term is a compile-time `true` there rather than a missing static. ⚠ SAME-LINE fold, line-NEUTRAL.
+    PANEL_MIRROR_HOLD.load(Ordering::Relaxed) && !overridden && unrouted
 }
 
-/// DESKHOLD — the absent-feature arm. See the sibling above.
-#[cfg(not(all(target_arch = "aarch64", feature = "desktop_firmware")))]
+/// DESKHOLD — the arm for an arch this kernel does not build. See the sibling above.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn panel_mirror_held() -> bool {
     false
 }
