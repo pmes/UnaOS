@@ -20,6 +20,12 @@
 // log (or a red panic screen) stays up.
 
 use crate::video::FrameBuffer;
+// PANELOWN — the panel's owner of record lives beside `WRITER` in the parent module, because the
+// invariant it publishes is about the TWO handles onto one framebuffer and neither file owns both.
+// Unconditional import on purpose: the STORE is unconditional on every build and both arches (only
+// the `witness` emit is gated), so a `cfg` here would be the arch gate that constraint exists to
+// avoid. See the PANELOWN block in `video/mod.rs`.
+use crate::video::{PanelOwner, publish_panel_owner};
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 use crate::video::wm;
 #[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))] // CONSWIN-PI: the routed console's surface store is a `Vec` on the Pi too
@@ -544,7 +550,21 @@ pub fn init(fb_addr: u64, fb_len: usize, info: FrameBufferInfo) {
         c.ready = true;
         c.full_fb().fill_screen(BG_DEFAULT);
         c.full_fb().flush_all();
-    }); #[cfg(all(target_arch = "aarch64", feature = "orinface"))] orin_face_arm(); // ORIN-FACE — THE SEAM. Here and not the terminus line, because `init` is what RESETS the cell to font8x8 (`c.aa = false; c.cell_w = CELL_W;` twelve lines up) and everything an Orin operator reads is printed AFTER it: arming at the terminus would leave the whole boot log at ~0.8 mm. OUTSIDE the mask and OUTSIDE the lock the block above just released, because `panel_console_face_arm` takes `FBCON.try_lock()` itself and this wrapper prints its verdict (which mirrors back through `_print`). ⚠ SAME-LINE append to an existing statement's closing line: knob-off it is cfg-erased, no line moves, and no panic `Location` below renumbers.
+    });
+    // PANELOWN — fbcon CLAIMS the panel. The whole-panel `fill_screen(BG_DEFAULT)` twelve lines up
+    // is the claim itself: every pixel of the glass is now fbcon's, drawn through fbcon's own
+    // handle, and `c.ready = true` opens the console's writers on it.
+    //
+    // OUTSIDE the mask and OUTSIDE the `FBCON` lock the block above just released — the caller's
+    // obligation `publish_panel_owner` documents. Publishing from inside that scope would put a
+    // witness build's `serial_println!` through fbcon's own `_print` mirror, which reaches
+    // `FBCON.try_lock()`, while this very function holds it.
+    //
+    // Re-entrant by design: `init` can run twice (a re-home resets the cell and drops the console
+    // route at the head of this function), and the second pass publishes `Fbcon` over `Fbcon`. The
+    // helper's prev/next test makes that silent on the wire — one line per transition, not per call.
+    publish_panel_owner(PanelOwner::Fbcon, "fbcon::init");
+    #[cfg(all(target_arch = "aarch64", feature = "orinface"))] orin_face_arm(); // ORIN-FACE — THE SEAM. Here and not the terminus line, because `init` is what RESETS the cell to font8x8 (`c.aa = false; c.cell_w = CELL_W;` twelve lines up) and everything an Orin operator reads is printed AFTER it: arming at the terminus would leave the whole boot log at ~0.8 mm. OUTSIDE the mask and OUTSIDE the lock the block above just released, because `panel_console_face_arm` takes `FBCON.try_lock()` itself and this wrapper prints its verdict (which mirrors back through `_print`). ⚠ WAS a SAME-LINE append to the `});` above, so that knob-off it was cfg-erased, no line moved, and no panic `Location` below renumbered. PANELOWN broke that property deliberately and states so rather than leaving the claim standing: its owner-word store is UNCONDITIONAL on every build and both arches (an arch- or feature-gated store would be the unpaired arch gate that constraint exists to avoid), so this file's knob-off `kernel8.img` is no longer byte-identical to its pre-PANELOWN twin whatever the line numbering does. With the byte-identity claim already surrendered, the statement is on its own line where it can be read. The CONSWIN-PI note at the file's tail carries the same caveat.
 
     // VPERF-WC (x86, ALL builds — GUI blits benefit too): mark the framebuffer mapping
     // Write-Combining now that its range is known. The M3 shadow already made VRAM traffic
@@ -1589,6 +1609,17 @@ impl core::fmt::Write for Sink<'_> {
 pub fn detach() {
     console_flush();
     GUI_ACTIVE.store(true, Ordering::Relaxed);
+    // PANELOWN — THE ONE HANDOVER THE PROSE AT THE HEAD OF `video/mod.rs` IS ABOUT: "fbcon during
+    // boot, the GUI after a successful boot repaints over it". This is the instant that sentence
+    // names, and until now it passed with nothing on the wire from the DEPARTING side — `GUI_ACTIVE`
+    // went true and fbcon simply stopped, privately, in an `AtomicBool` with no public getter.
+    //
+    // After the `GUI_ACTIVE` store on purpose. From that store onwards `_print` returns at its first
+    // test, so the emit below cannot mirror onto the glass the GUI has just taken — the handover
+    // line goes to serial and nowhere else, which is the only place it is wanted.
+    //
+    // No lock is held: `console_flush` has returned and this function takes nothing of its own.
+    publish_panel_owner(PanelOwner::Gui, "fbcon::detach");
 }
 
 /// Clear the framebuffer console to the default background and home the cursor. Used to give the
@@ -1987,6 +2018,17 @@ pub fn panel_console_window_open() -> wm::WinId {
     }
 
     CONSOLE_WIN.store(id, Ordering::Relaxed);
+    // PANELOWN — the console's glyphs LEAVE THE PANEL for a window surface. From the store above,
+    // `draw_fb` lands every cell in `win_fb` (cached RAM) and the compositor decides which of those
+    // pixels reach the glass, so the console has stopped being a panel writer entirely. That is a
+    // regime of its own and not `Gui`: the console is live here, merely indirect, where under `Gui`
+    // it is silent. A capture that cannot tell the two apart cannot tell a routed console from a
+    // detached one, which is the difference between text that is being composited and text that is
+    // being dropped.
+    //
+    // The `without_interrupts` install block above has closed and this line holds no lock, which is
+    // also why the two `[wc-x]` lines that follow are safe here — same context, same rule.
+    publish_panel_owner(PanelOwner::ConsoleWindow, "fbcon::panel_console_window_open");
     let (gcols, grows) = ((cw / cell_w).max(1), (ch / cell_h).max(1));
     serial_println!(
         "[wc-x] console-window win={} panel={}x{} surf={}x{} box={}x{} at ({},{}) cell={}x{} cols={} rows={}",
@@ -2028,9 +2070,26 @@ pub fn panel_console_window_closed(id: wm::WinId) -> bool {
     if id == wm::WIN_NONE {
         return false;
     }
-    CONSOLE_WIN
+    let unrouted = CONSOLE_WIN
         .compare_exchange(id, wm::WIN_NONE, Ordering::AcqRel, Ordering::Relaxed)
-        .is_ok()
+        .is_ok();
+    // PANELOWN — the route is TORN DOWN, so the `ConsoleWindow` regime ends and the compositor is
+    // left holding the panel alone: `Gui`. Only on a SUCCESSFUL exchange — a stale or foreign id
+    // did not unroute anything and must not be allowed to announce a handover that did not happen.
+    // A false line here is worse than no line, because the word's only value is that it can be
+    // trusted against the paint.
+    //
+    // ⚠ THIS SITE IS ON THE INPUT PATH — it is called from x86's `wc_close_furniture`, i.e. from a
+    // pointer press on the console window's close disc. That is exactly the preemptible band the
+    // LOCKFIX rule governs, so the publish is a bare atomic RMW and takes NO panel lock: not
+    // `WRITER` (the boot-8 wedge is a blocking acquire from this band) and not `FBCON`. The emit
+    // that follows is `witness`-gated, so a default build adds not one byte of serial traffic to a
+    // click; and on a witness build `GUI_ACTIVE` is true here, so `_print` returns at its first test
+    // and never reaches the mirror's `FBCON.try_lock()` at all.
+    if unrouted {
+        publish_panel_owner(PanelOwner::Gui, "fbcon::panel_console_window_closed");
+    }
+    unrouted
 }
 
 /// Repaint the screen as a panic backdrop (dark red) and home the cursor, so the panic message
@@ -2038,6 +2097,11 @@ pub fn panel_console_window_closed(id: wm::WinId) -> bool {
 /// was held when the panic fired. Re-enables the serial mirror first (the GUI may have detached
 /// it) so the panic text that `serial_println!` emits next lands on this red backdrop.
 pub fn panic_screen() {
+    // PANELOWN — the panic RECLAIMS the panel, stated before anything else is attempted: everything
+    // below is best-effort on a dying machine (`FBCON.try_lock()`), so a capture reads the seizure
+    // even from a boot whose backdrop never painted. One added statement, no lock held, no
+    // restructuring of this function — the `without_interrupts` block is below, untouched.
+    publish_panel_owner(PanelOwner::Panic, "fbcon::panic_screen");
     GUI_ACTIVE.store(false, Ordering::Relaxed);
     // Re-arm the full mirror on quiet-panel builds: the panic text must paint whatever the build.
     #[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))] // PANICARM — the store now matches `PANIC_MIRROR`'s OWN declaration predicate (line 44), which the CONSWIN-PI arc widened without widening this writer. The bare `x86_64` term left the flag DECLARED-BUT-UNWRITABLE on every aarch64 `desktop_firmware` build — permanently `false`, with four readers compiled there reading it: `draw_fb`'s belt, `pace_due`, `panel_mirror_held`'s `overridden`, `present_deferred`. THE ONE THAT BIT: `desktop_firmware::activate` arms `PANEL_MIRROR_HOLD` at DESKTOP-CLEAR and never clears it, and the `CONSOLE_WIN` store on the line below flips `panel_mirror_held()`'s `unrouted` term back TRUE — so on a routed desk boot every panic line was suppressed in `_print` before it touched the console lock. Red backdrop, no words, on the one path that has to work. No lock and no compositor is added here: one relaxed store on the panicking core, ahead of the `try_lock`, so the PANIC PATH LAW and LOCKFIX both stand. `defer_route_open`'s aarch64 arm deliberately stays on `in_panic_mode()` — set EARLIER, in the `#[panic_handler]` before this call, and it also covers a panic that never reaches `panic_screen`. ⚠ SAME-LINE fold, line-NEUTRAL: a line added to this file renumbers every panic `Location` below it.
@@ -2098,6 +2162,18 @@ pub fn panic_screen() {
 // That is not style. `wm.rs` proved this track that panic `Location` RECORDS EMBED LINE NUMBERS, so a
 // line added to any file in the knob-off `kernel8.img` breaks its byte-identity proof; this file is
 // one of them. Everything genuinely NEW therefore lives HERE, at the tail, where nothing is below it.
+//
+// ⚠ PANELOWN (this commit) DELIBERATELY BREAKS THAT PROPERTY FOR THIS FILE, and says so rather than
+// quietly leaving the claim to be believed. Its panel-owner publishes are five ordinary statements
+// in five function bodies above, each with its comment on its own lines, and its store carries no
+// `cfg` on either arch or in either polarity of the `witness` knob — an arch- or feature-gated store
+// would make the default image structurally different from the witness image at exactly those five
+// sites, which is precisely the unpaired arch gate this directory has too many of already. So the
+// knob-off `kernel8.img` built from this file is no longer byte-identical to its pre-PANELOWN twin,
+// by the STORE and not merely by the line numbering; with that identity already surrendered on
+// purpose, preserving the numbering would buy nothing and cost every reader of these five sites.
+// The tail-only rule still stands for any arc that DOES want byte-identity; it just no longer has
+// anything to protect in this particular file's default aarch64 image.
 //
 // What the widening buys, and what it does not. The Pi now has the same three things x86 has: a
 // cached-RAM ARGB8888 console surface, a `wm` row over it (`KERNEL_OWNER_CONSOLE`), and the damage

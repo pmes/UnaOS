@@ -29,6 +29,12 @@
 //! `WRITER` and `fbcon` are handles to the *same* physical framebuffer; they are used at
 //! different times (fbcon during boot, the GUI after a successful boot repaints over it) and
 //! each is serialised by its own lock.
+//!
+//! PANELOWN — read that paragraph as what it is: the locks serialise WITHIN a handle and not
+//! BETWEEN them, so "used at different times" is a convention, not an invariant. [`PanelOwner`] is
+//! the word that says which regime holds the glass, [`panel_owner`] reads it, and every handover
+//! publishes it through [`publish_panel_owner`] — announced on both sides under `witness`. It
+//! PUBLISHES ONLY: nothing consults it before painting and no writer refuses on it.
 
 pub mod fbcon;
 // FONT (GR27) — the shared anti-aliased text face: the Noto Sans Mono alpha atlas plus the
@@ -164,13 +170,200 @@ pub mod prtscr;
 pub use framebuffer::FrameBuffer;
 pub use screen::Screen;
 
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, Ordering};
 use spin::Mutex;
 use unaos_boot_info::FrameBufferInfo;
 
 /// The primary display surface. The GUI renderer (`pal::TargetPal` → `console`) draws here.
 /// Initialised once in `kernel_main` from `BootInfo` (UEFI GOP, or the Pi mailbox framebuffer).
 pub static WRITER: Mutex<FrameBuffer> = Mutex::new(FrameBuffer::new());
+
+// ── PANELOWN — who owns the panel, as a word rather than as a sentence ───────────────────────────
+//
+// The module header above states the panel-ownership discipline as PROSE: `WRITER` and `fbcon` are
+// two handles onto one physical framebuffer, "used at different times", "each serialised by its own
+// lock". Both halves of that are true and neither is an invariant. The locks give mutual exclusion
+// WITHIN a handle and none BETWEEN them; the only thing keeping two writers off the glass is the
+// temporal convention, which nothing enforces and — until this word existed — nothing witnessed.
+//
+// A survey of the Orin panel path found 16 distinct panel writers across 14 transitions where the
+// writer changes. Exactly ONE of the 14 announced itself in both directions; the rest announced the
+// ARRIVING writer only (the departing one fell silent silently) or said nothing at all. So a serial
+// capture of a boot that painted over itself could not be read for WHO painted over WHOM.
+//
+// This is that word, and nothing more. **It PUBLISHES; it does not REFUSE.** No writer consults it
+// before painting, no path declines, defers or asserts on it, and no pixel moves because of it. A
+// refusal is a change to x86 paint order and belongs to a design that gets reviewed before it is
+// written; what is here is the statement of record that such a design would need, plus the read
+// point ([`panel_owner`]) it would consult.
+//
+// THREE PROPERTIES, EACH LOAD-BEARING:
+//
+//  1. **The STORE is unconditional; only the EMIT is gated.** [`publish_panel_owner`] carries no
+//     `cfg` at all — every build, both arches, knob on or off, stores the word. Only the
+//     `serial_println!` sits behind `feature = "witness"`. An arch- or feature-gated STORE would
+//     make the default image structurally different from the witness image at exactly this site,
+//     which is a fresh unpaired arch gate in a directory that already carries ~224 x86-only gates
+//     against 63 aarch64-only. An atomic RMW costs a handful of cycles; pay it everywhere and keep
+//     the two images the same shape.
+//
+//  2. **ATOMIC ONLY — never published under a panel lock.** See the LOCKFIX block immediately
+//     below. Panel handovers can and do fire ON the input path (a click that raises a window, a
+//     console takeover racing a repaint), and that band runs preemptible on the core that also
+//     carries the IRQ-context printer: a *blocking* panel acquire there can be preempted while
+//     holding, and the next MASKED acquirer on that core spins forever. That is the boot-8 wedge.
+//     So this word is a bare `AtomicU8` and every publish site sits OUTSIDE both `WRITER` and
+//     `FBCON`. Nothing here takes a lock, and nothing here extends an existing hold.
+//
+//  3. **`Unknown` is a real state, not a default.** A boot that never reaches a publish site must
+//     be distinguishable from one that published a real owner. Absence and a default looking alike
+//     is the exact ambiguity this word exists to remove, so the initial value names itself as
+//     never-published and NO SITE EVER STORES IT BACK.
+//
+// AND THE WORD EARNED ITS KEEP BEFORE THE COMMIT THAT ADDED IT WAS FINISHED. A sixth state,
+// `Firmware`, was written first — `init_panel` was assumed to be the kernel taking the firmware's
+// surface ahead of any console. The first armed boot's wire refuted it: `fbcon::init` claims the
+// panel from `main.rs:120` and `init_panel` does not run until `main.rs:1335`, so the "firmware"
+// claim was landing on a console that had owned the glass for an entire boot log — and it corrupted
+// the departing side of `fbcon::detach`, the one transition the module header's prose is about.
+// The state was deleted and that site is now an OVER-PAINT note instead ([`note_panel_overpaint`]).
+// The full refutation is recorded at the site, in `init_panel`, where the next person to reach for
+// a `Firmware` state will read it before writing one.
+
+/// PANELOWN — the panel's owner of record: which of the tree's panel writers is entitled to the
+/// glass right now.
+///
+/// Deliberately COARSER than the writer census: these are the ownership REGIMES a capture needs to
+/// tell apart, not the 16 functions that paint. Two writers inside one regime (fbcon's `draw_fb`
+/// and its scroll memmove, say) are serialised by that regime's own lock and were never the
+/// problem; the problem is a writer from regime A landing pixels while regime B believes it holds
+/// the panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PanelOwner {
+    /// Never published on this boot. This is the state's ONLY meaning: no publish site has run.
+    /// It is not a stand-in for "the firmware's panel", it is not a default answer, and nothing
+    /// ever stores it back — reading `owner-unknown` at a paint means the publish site for that
+    /// path is MISSING, full stop.
+    ///
+    /// ⚠ DO NOT GIVE THIS A PUBLISHER, and do not fold it into whichever owner happens to be first
+    /// on the board you are looking at. The moment something stores `Unknown`, "the instrument
+    /// never ran" and "the instrument ran and reported its default" print the same word, and an
+    /// instrument that cannot distinguish its own absence from its own answer is the exact failure
+    /// this arc exists to remove. It is the same failure an unconditional entry print in
+    /// `tegra_desk_furn` caught, where a MEASURED conviction that the furniture faulted at the
+    /// terminus turned out to be the function never having been called at all. The state costs one
+    /// byte and one match arm; the ambiguity costs a wrong conviction in a ladder document.
+    Unknown = 0,
+    /// The boot/panic text console owns panel rows directly, drawing through its own `FrameBuffer`
+    /// handle. The GUI is not up (or has been torn back down by a panic).
+    ///
+    /// THE FIRST OWNER OF EVERY BOOT, measured rather than assumed — see the note on the absent
+    /// `Firmware` state under [`init_panel`].
+    Fbcon = 1,
+    /// The GUI's `Screen` / the compositor owns the panel; fbcon has detached and mirrors nothing.
+    Gui = 2,
+    /// The compositor owns the panel AND the console is live but INDIRECT: its glyphs are routed
+    /// into a window surface (`CONSOLE_WIN`), so the console is no longer a panel writer at all.
+    /// Distinct from [`PanelOwner::Gui`], where the console is simply silent.
+    ConsoleWindow = 3,
+    /// The panic path has RECLAIMED the panel: the compositor is out of the loop by law, the route
+    /// is torn down, and fbcon paints the backdrop straight to the glass.
+    Panic = 4,
+}
+
+impl PanelOwner {
+    /// The wire name. Every token is deliberately LONGER THAN 8 BYTES: a shorter mark can be
+    /// LLVM-immediate-encoded — present in the code, reachable at run time, and ABSENT from
+    /// `.rodata` — which makes it invisible to an artifact grep while appearing to work.
+    pub const fn name(self) -> &'static str {
+        match self {
+            PanelOwner::Unknown => "owner-unknown",
+            PanelOwner::Fbcon => "owner-fbcon-panel",
+            PanelOwner::Gui => "owner-gui-screen",
+            PanelOwner::ConsoleWindow => "owner-console-window",
+            PanelOwner::Panic => "owner-panic-screen",
+        }
+    }
+
+    /// Total on the stored byte: an unrecognised word reads back as [`PanelOwner::Unknown`] rather
+    /// than trapping. The word is instrumentation; it may never be the thing that kills a boot.
+    const fn from_u8(v: u8) -> Self {
+        match v {
+            1 => PanelOwner::Fbcon,
+            2 => PanelOwner::Gui,
+            3 => PanelOwner::ConsoleWindow,
+            4 => PanelOwner::Panic,
+            _ => PanelOwner::Unknown,
+        }
+    }
+}
+
+/// PANELOWN — the owner word itself. Initialised to [`PanelOwner::Unknown`], which no publish site
+/// ever stores back, so reading it means "no handover has been announced on this boot".
+static PANEL_OWNER: AtomicU8 = AtomicU8::new(PanelOwner::Unknown as u8);
+
+/// PANELOWN — read the panel's owner of record.
+///
+/// `Acquire`, paired with the `AcqRel` swap in [`publish_panel_owner`]: a reader that sees an owner
+/// also sees the writes the publishing side made before announcing it. Free of every lock in the
+/// video subsystem, so it is callable from a masked context, from an ISR, and from the input path.
+///
+/// The counterpart to fbcon's `GUI_ACTIVE`, which is a private `AtomicBool` with no public getter
+/// anywhere in the tree — the closest thing to an owner bit before this, and unreadable from
+/// outside the file that declares it.
+pub fn panel_owner() -> PanelOwner {
+    PanelOwner::from_u8(PANEL_OWNER.load(Ordering::Acquire))
+}
+
+/// PANELOWN — publish a handover, and (with `witness`) state BOTH of its sides on the wire.
+///
+/// `swap`, not `store`, and the reason is the emit's contract rather than taste: a bare store
+/// cannot name the DEPARTING owner, and a `load`-then-`store` pair can be interleaved by a second
+/// publisher into a line that names a side that never held the panel. One `AcqRel` RMW gets the
+/// previous owner and the release publication in a single lock-free instruction (`xchg` on x86,
+/// `swpalb` / an LL-SC pair on aarch64). It is not a lock, it cannot block, and it is bounded — so
+/// it is legal everywhere the LOCKFIX rule below forbids a panel acquire.
+///
+/// The emit fires only on an ACTUAL change of owner. Re-publishing the sitting owner (a second
+/// `fbcon::init`, say) is a no-op on the wire: "one line per transition" means transitions.
+///
+/// CALLER'S OBLIGATION, and it is the whole hazard: **call this with no panel lock held.** Not
+/// `WRITER`, not `FBCON`. The store itself could not care, but the emit is a `serial_println!` and
+/// fbcon's `_print` mirror reaches `FBCON.try_lock()` — so a publish made from inside the `FBCON`
+/// critical section would put a witness build's serial line through a lock its own caller holds.
+/// Every site in this arc publishes after the relevant `without_interrupts`/lock scope has closed.
+pub(crate) fn publish_panel_owner(next: PanelOwner, site: &'static str) {
+    // UNCONDITIONAL. No `cfg` on this line, on either arch, in either polarity of the knob.
+    let prev = PANEL_OWNER.swap(next as u8, Ordering::AcqRel);
+    #[cfg(feature = "witness")]
+    if prev != next as u8 {
+        serial_println!(
+            "[panel-owner] panel-ownership-handover from={} to={} site={}",
+            PanelOwner::from_u8(prev).name(),
+            next.name(),
+            site
+        );
+    }
+    #[cfg(not(feature = "witness"))]
+    let _ = (prev, site);
+}
+
+/// PANELOWN — **a whole-panel paint by something that is not the owner.** Not a handover: it stores
+/// nothing and changes nothing, it only names who was holding the glass when the paint landed.
+///
+/// Deliberately a SEPARATE line kind from `panel-ownership-handover`, because the two say opposite
+/// things — a handover is the discipline working, an over-paint is the discipline being ignored —
+/// and folding them into one tag would make a capture read as if the panel had changed hands when
+/// it did not. The reader wants to count these, not skim past them.
+#[cfg(feature = "witness")]
+pub(crate) fn note_panel_overpaint(site: &'static str) {
+    serial_println!(
+        "[panel-owner] panel-repaint-over-owner owner={} site={} (whole-surface fill; the owner word is NOT changed)",
+        panel_owner().name(),
+        site
+    );
+}
 
 // ── LOCKFIX — the two ways to take [`WRITER`] without becoming the boot-8 wedge ─────────────────
 //
@@ -242,6 +435,14 @@ pub fn panel_info_nonblocking() -> Option<FrameBufferInfo> {
 /// Not counted in [`panel_census`]: that census measures the INPUT path's refusals, which is what
 /// the `[inwedge]` witness reports on. Paint-path refusals are already counted by `[wedge9]`
 /// (`owe_repaint` is their sink), and mixing the two would make both unreadable.
+///
+/// PANELOWN — **this is the READ point.** Every compositor and cursor writer that reaches the panel
+/// comes through here, so this is the one place a panel-ownership CHECK would ever need to live,
+/// and [`panel_owner`] is the call it would make. It is deliberately not made here: this arc
+/// publishes the word and does not refuse on it, and a refusal added at this line would change x86
+/// paint order (the compositor's masked present chains reach `cursor`'s locked helpers through this
+/// function) without a pixel of the design having been reviewed. Nothing below this comment
+/// consults [`PanelOwner`]; the body is byte-for-byte the pre-PANELOWN body.
 pub(crate) fn panel_snapshot() -> Option<FrameBuffer> {
     if crate::arch::irqs_masked() {
         WRITER.try_lock().map(|fb| *fb)
@@ -272,6 +473,41 @@ pub fn init_panel(base: usize, len: usize, info: FrameBufferInfo) {
     surface.fill_screen(PANEL_BG);
 
     serial_println!(":: Framebuffer painted #1E1E1E ::");
+
+    // PANELOWN — THIS SITE IS AN OVER-PAINT, NOT A HANDOVER, AND THE FIRST THING THE OWNER WORD
+    // MEASURED WAS THAT THE OPPOSITE ASSUMPTION IS FALSE.
+    //
+    // The word was first written here as a `Firmware` claim, on the reading that `init_panel` is
+    // where the kernel takes the firmware's surface before any console or GUI exists. The aarch64
+    // QEMU wire refuted it on the first armed boot:
+    //
+    //     [panel-owner] ... from=owner-unknown      to=owner-fbcon-panel site=fbcon::init
+    //     [panel-owner] ... from=owner-fbcon-panel  to=owner-firmware    site=video::init_panel
+    //     [panel-owner] ... from=owner-firmware     to=owner-gui-screen  site=fbcon::detach
+    //
+    // `fbcon::init` runs from `main.rs:120` and this function from `main.rs:1335` — 1215 lines and
+    // an entire boot log later. So there is no firmware-owned epoch to claim: by the time the fill
+    // above runs, fbcon has owned the glass since before the heap existed, and the fill overwrites
+    // every pixel of the boot log it has been printing. Worse for the record, publishing `Firmware`
+    // here made the handover that MATTERS — `fbcon::detach`, the one the module header's prose is
+    // actually about — report its departing side as `owner-firmware` when the writer that departed
+    // was fbcon. An instrument that corrupts the one transition it exists to describe is worse than
+    // no instrument, so the claim was deleted and the `Firmware` state with it.
+    //
+    // What is left is the truth: a whole-surface fill landing on a panel somebody else owns. It
+    // publishes NOTHING (the owner word is untouched — fbcon still owns the panel after this line,
+    // and keeps printing to it) and it changes no pixel that was not already being changed. It just
+    // says whose pixels those were. If a board ever does seed the panel before the console, this
+    // same line reports `owner-unknown` and says so — no state has to be invented for that case.
+    //
+    // Not reached on the Orin at all: the tegra path seeds its panel from `display_tegra` and never
+    // calls `init_panel` (that file's own note at its line 313 says so, and the whole function is
+    // absent from a `tegra` artifact — `:: FB Init ::` greps zero there).
+    //
+    // No lock is held: `surface` is a private `FrameBuffer` handle, not `WRITER` (LOCKFIX, and
+    // property 2 of the PANELOWN block above).
+    #[cfg(feature = "witness")]
+    note_panel_overpaint("video::init_panel");
 
     // WEDGE-12 (F6) — size the compositor's staging buffer HERE, where the panel's geometry has just
     // become known, IRQs are live and no composite pass exists yet. `wm`'s staged presents run inside
