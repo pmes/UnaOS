@@ -190,6 +190,17 @@ wcg-paygo = []
 # Requires `witness` (the WC-D machinery it throttles is witness-gated); x86_64 only. DEFAULT OFF =>
 # every valve item is compiled out and the build is byte-identical. Enable via `UNAOS_WCDVALVE=1`.
 wcdvalve = []
+# PHASE31ROOT (BAR1 wedge experiment, arm 1): retype the panel-aperture leaves UC (PAT PA3,
+# PCD=1 PWT=1 PAT=0) instead of WC (PAT PA4) at the one site that types them
+# (`arch/x86_64/memory.rs set_framebuffer_wc`). Memory TYPE only — no permission bit, no MTRR.
+# The M1-vs-{M2,M3} discriminator of docs/dev/OS/08_VIDEO/phase31-root.md §6: a wedge-free armed
+# flight (>=32M retired blits) convicts the WC drain; a strike under UC exonerates memory type and
+# points at PCIe credits / the GPU window path. Expected cost while armed: ~6.8x slower aperture
+# writes (1.11 GB/s -> ~162 MB/s measured), single-digit fps — an experiment, not a shipping mode.
+# x86_64 only (its sole cfg sites are in arch/x86_64/memory.rs). DEFAULT OFF => the armed tokens
+# are not compiled and the baseline path is the pre-arc bytes. Enable via `UNAOS_BAR1EXP=uc`.
+# Kept in sync with arroyo and builder/src/main.rs (both refuse unknown modes loudly).
+bar1exp-uc = []
 # Skip xHCI/USB bring-up entirely (`pci::init`). For real-hardware video bring-up where the
 # firmware/SMM may still own the xHCI controller (this branch has no BIOS->OS handoff) and wedge
 # its reset handshake — the controller's status bits never flip, so the bounded-but-slow timeout

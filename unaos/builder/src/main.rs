@@ -396,6 +396,22 @@ fn main() {
     // module; DEFAULT OFF => module + call site unlinked => byte-identical media. Needs
     // UNAOS_KEPLER + UNAOS_KEPLER_TAKEOVER to reach its seam. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_WC").is_ok() { feats.push("wc"); }
+    // PHASE31ROOT: UNAOS_BAR1EXP=<mode> selects a BAR1-wedge experiment arm
+    // (docs/dev/OS/08_VIDEO/phase31-root.md). One mode exists: `uc` -> `bar1exp-uc`, retyping the
+    // panel-aperture leaves UC (PAT PA3) instead of WC at `set_framebuffer_wc`. Memory TYPE only.
+    // MEDIA builds re-derive the x86 feature set HERE, so the knob must be mapped here or a metal
+    // boot ships the arm disabled while the banner claims it is armed (the s42/INSTGUI and rastmc
+    // failure — this is the builder half of the two-place trap the arroyo CHECK now enforces).
+    // Unknown modes are refused loudly, mirroring arroyo: an experiment knob that half-parses is
+    // worse than one that stops the build. DEFAULT (unset) => feature unlinked => today's mapping.
+    match std::env::var("UNAOS_BAR1EXP") {
+        Ok(m) if m == "uc" => feats.push("bar1exp-uc"),
+        Ok(m) => {
+            eprintln!("UNAOS_BAR1EXP='{m}' is not a known mode (known: uc) — refusing to guess which experiment you meant.");
+            std::process::exit(1);
+        }
+        Err(_) => {}
+    }
     // PCIH: UNAOS_NOASPM=1 clears ASPM (LNKCTL[1:0]) on the Kepler link at init — the boot-8
     // endpoint-hang discriminator. DEFAULT OFF => feature unlinked => byte-identical media.
     // Kept in sync with arroyo's mapping.

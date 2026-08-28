@@ -3634,6 +3634,12 @@ unsafe fn invlpg(va: u64) {
 /// framebuffer's mapping" is exactly what changes; no unrelated mapping is touched. `wbinvd` is NOT
 /// issued: the fb was effective-UC before this (metal-confirmed + firmware default), so no cache line
 /// holds fb data that would need writing back.
+///
+/// PHASE31ROOT (`feature = "bar1exp-uc"`, knob `UNAOS_BAR1EXP=uc`, DEFAULT OFF): the armed build
+/// types these same leaves PAT index 3 = UC instead of index 4 = WC — the BAR1-wedge experiment's
+/// first arm (docs/dev/OS/08_VIDEO/phase31-root.md). Same walk, same selector-bits-only writes,
+/// same invlpg sweep; only the index the selector points at changes, and the witness line says
+/// which build this is. The default build compiles none of the armed tokens.
 pub fn set_framebuffer_wc(fb_base: u64, fb_len: u64) {
     if fb_base == 0 || fb_len == 0 {
         return;
@@ -3667,7 +3673,20 @@ pub fn set_framebuffer_wc(fb_base: u64, fb_len: u64) {
                     unsafe {
                         let e = *entry;
                         // Select PAT index 4 = (PAT=1, PCD=0, PWT=0). Memory type only.
+                        #[cfg(not(feature = "bar1exp-uc"))]
                         let ne = (e | pat_bit) & !(PTE_PCD | PTE_PWT);
+                        // PHASE31ROOT arm 1 (`UNAOS_BAR1EXP=uc`): select PAT index 3 =
+                        // (PAT=0, PCD=1, PWT=1) = UC instead — the M1-vs-{M2,M3} wedge
+                        // discriminator (docs/dev/OS/08_VIDEO/phase31-root.md §6). Memory type
+                        // only, same as the baseline: the same selector bits, pointed the other
+                        // way. Because the PAT bit ends up CLEAR, the `FB_WC_LO/HI` latch below
+                        // never records a hull (its guard tests `pat_bit`), so `leaf_is_fb_wc`
+                        // stays constant-false and a later BAR1 `map_mmio_window` re-types these
+                        // leaves to the SAME UC — idempotent, no special case needed.
+                        // `ensure_pat_wc` above still ran: PA4 stays programmed WC on every core,
+                        // but no PTE selects it — one fewer divergence from the baseline.
+                        #[cfg(feature = "bar1exp-uc")]
+                        let ne = (e | PTE_PCD | PTE_PWT) & !pat_bit;
                         if ne != e {
                             *entry = ne;
                             leaves += 1;
@@ -3694,8 +3713,20 @@ pub fn set_framebuffer_wc(fb_base: u64, fb_len: u64) {
         unsafe { invlpg(va) };
         va = va.saturating_add(1 << 12);
     }
+    #[cfg(not(feature = "bar1exp-uc"))]
     serial_println!(
         ":: x86 fb-wc: retyped {} leaf(s) WC (PAT PA4) over {:#x}..{:#x} ::",
+        leaves,
+        fb_base,
+        fb_end
+    );
+    // PHASE31ROOT — the armed witness. A flight log carrying THIS line and not the `fb-wc` line
+    // is the UC arm; a log carrying the `fb-wc` line is the baseline. The string below is the
+    // strings-verifiable proof the image is armed (gate law: an instrument that is not in the
+    // image proves nothing).
+    #[cfg(feature = "bar1exp-uc")]
+    serial_println!(
+        ":: x86 bar1exp: UC arm ARMED — retyped {} leaf(s) UC (PAT PA3) over {:#x}..{:#x}; panel write-combining SUPPRESSED (PHASE31ROOT) ::",
         leaves,
         fb_base,
         fb_end

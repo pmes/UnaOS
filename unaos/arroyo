@@ -684,6 +684,20 @@ _feats=""
 # Needs UNAOS_KEPLER + UNAOS_KEPLER_TAKEOVER to reach the activation seam.
 # Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_WC:-}" ] && _feats="${_feats}wc,"
+# PHASE31ROOT: UNAOS_BAR1EXP=<mode> selects a BAR1-wedge experiment arm (design + evidence:
+# docs/dev/OS/08_VIDEO/phase31-root.md). ONE mode exists today: `uc` -> feature `bar1exp-uc`,
+# which retypes the panel-aperture leaves UC (PAT PA3) instead of WC (PAT PA4) at
+# `set_framebuffer_wc` — the M1-vs-{M2,M3} discriminator. Memory TYPE only; no permission bit,
+# no MTRR. Armed boots print `:: x86 bar1exp: UC arm ARMED ... ::` in place of the `fb-wc` line
+# (strings-verifiable) and run the panel ~6.8x slower by design. DEFAULT OFF => the armed tokens
+# are not compiled and the mapping is today's. Unknown modes are REFUSED here rather than
+# silently arming the wrong experiment. Kept in sync with builder/src/main.rs (the two-place
+# trap; the map line below is parser-conformant so the KNOB→BUILDER WIRING CHECK covers it).
+if [ -n "${UNAOS_BAR1EXP:-}" ] && [ "${UNAOS_BAR1EXP}" != "uc" ]; then
+    echo "❌ UNAOS_BAR1EXP='${UNAOS_BAR1EXP}' is not a known mode (known: uc) — refusing to guess which experiment you meant." >&2
+    exit 1
+fi
+[ -n "${UNAOS_BAR1EXP:-}" ] && _feats="${_feats}bar1exp-uc,"
 # R0 / RTWIT: UNAOS_RTWIT=1 arms the WORST-CASE RULER (`rtwit`) — the `[rtwit]` tail instruments
 # (input→present latency, per-lock max hold, max interrupt-mask span). MAXes only, never a mean; pure
 # measurement, changes no scheduling/locking/present behaviour. x86_64-only in effect (the real impl is
@@ -2627,9 +2641,14 @@ KERNEL_CFG_MATRIX=(
   # `./arroyo check` prints the live board/mix counts every run — read them there, not here. The
   # aarch64 half needs no leg: `arm_features` strips `wcdvalve` from arm media builds (see the
   # -Cmetadata note there) precisely because it emits not one byte of aarch64 code.
+  # PHASE31ROOT (appended 2026-08-27): `bar1exp-uc` — the BAR1-wedge UC experiment arm
+  # (arch/x86_64/memory.rs, docs/dev/OS/08_VIDEO/phase31-root.md). x86-only cfg sites; this leg
+  # carries the ARMED polarity under type-check (every default leg carries the disarmed one), and
+  # naming it on a literal x86 leg is what puts the `UNAOS_BAR1EXP` knob under the KNOB→BUILDER
+  # WIRING CHECK below.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the
