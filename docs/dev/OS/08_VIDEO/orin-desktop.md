@@ -1223,11 +1223,15 @@ the dock as a way back now exists, at capture line 13085.
   (capture lines 12930-12949) — every AP reached the far side of `enable_mmu_virt`, **no park**.
   The shell came up: `JD2 — OUT | JD2: interactive shell on the inherited scanout. Type 'help'.`,
   capture line 12998.
-* **Spec replay: PASS.** `unaos/scripts/mbench.py --replay` of the slice against
+* ~~**Spec replay: PASS.** `unaos/scripts/mbench.py --replay` of the slice against
   `unaos/scripts/specs/jetson-sync1.spec` reports
   `✅ MBENCH PASS — 15/15 required witnesses, 0 forbidden hit(s), 1612 lines scanned, pending 5/6 matched`.
   The one unmatched PENDING is `TEGRA-SD.*block backend published`, which this flight does not
-  exercise.
+  exercise.~~ ⚠ **SUPERSEDED 2026-08-28 (SPECGATE, `0ea79938`) — THIS SLICE IS NO LONGER A GREEN
+  REFERENCE.** The PASS was true against the spec as it stood; the spec now carries FORBIDs on the
+  discriminated takeover tokens, and boot7f/7g/7h all pre-date them, so all three replay FAIL. That
+  is correct, not a regression: these captures came from images that could not say which phase 2 had
+  printed. See §3.13. Do not weaken the rows to recover a green — fly the fold.
 
 ##### What this flight still did NOT establish
 
@@ -1317,6 +1321,20 @@ Codegen, in the armed `kernel.elf` inside `jd2_console_pump`:
 Fail-closed by construction: `console_is_routed()` answers `false` for every decline arm the open
 path has AND for every arm `orin_conwin` itself takes, so a rung that refused anywhere leaves the
 detach taken, unchanged.
+
+⚠ **AMENDED 2026-08-28 — this subsection was true of the site it quotes and FALSE of the image.**
+The codegen above is `jd2_console_pump`'s detach, and it was correct. It was not the only detach on
+the terminus line. `tegra_rast_demo_maybe` carried a **second, unguarded** `fbcon::detach()`
+(`main.rs:6964`) that runs AFTER `orin_conwin()` on the same line (`main.rs:2717`), so on every
+image carrying **both** `orinconwin` and `rast` the route was installed and then silenced two
+statements later. ⚠ Scope it exactly: without `rast` the whole helper is the `#[inline(always)]`
+empty stub at `main.rs:6983`, so boot7h — knobs `UNAOS_ORINCONWIN=1 UNAOS_ORINDESK=1
+UNAOS_ORINCLICK=1 UNAOS_NET4=1`, no `UNAOS_RAST` — was never exposed. What WAS exposed is every
+`orinconwin` check leg, all five of which carry `rast`, and any future flight that arms both. ~~"the detach guard is the whole of the LIVE claim"~~ was
+therefore a claim about one call site read as a claim about the boot. Both halves are fixed in
+§3.13 (`d33b6c3e`): the twin takes the same guard, and `live=` stopped being a compile-time literal.
+**boot7h's `live=LIVE` (below, and in the §6 ladder table) was an ASSERTION about the build, not a
+measurement** — it would have printed `LIVE` on an image whose window never received another glyph.
 
 #### §7's open question, answered in SOURCE only
 
@@ -2118,7 +2136,11 @@ But the SP itself is readable in three instructions with no scheduler, no `Task`
 linker symbol, and the exact pattern **already exists in this tree twice** —
 `arch/aarch64/mmu_tegra.rs:749-752` and `arch/aarch64/sched.rs:91-94`. Two reads on the
 same frame chain subtract to an exact **depth consumed**. `TERMINUS` D4 takes that
-measurement at the `[orinfurn] arm` line and publishes `[orinstkdepth] depth-consumed=`.
+measurement at the `[orinfurn] arm` line and publishes `[orinstkdepth] depth-consumed=`. The
+instrument itself — wire format, both failure arms, and the full argument for why no headroom number
+is derivable — is documented in
+[`docs/dev/OS/01_BOOT_HAL/arch_arm64.md`](../01_BOOT_HAL/arch_arm64.md) §ORIN-STKDEPTH; §3.13 D4
+carries the ladder-side summary.
 
 **What is still genuinely unavailable is HEADROOM, and the reason is not the scheduler.**
 The Orin's boot stack is the one UEFI handed the loader and is never switched:
@@ -2375,14 +2397,354 @@ compile-time literal; the comment immediately below it says the value is "read f
 not from this function". Meanwhile `main.rs:6973` calls `fbcon::detach()` unguarded on the RAST
 demo path, which runs *after* `orin_conwin()` on the same terminus line (`main.rs:2717`), so a
 build carrying both knobs tears the route down immediately after installing it while the
-instrument still reports it live. That is a false PASS on the wire. A sibling arc owns the fix;
-it is named here for the rule, not claimed as repaired.
+instrument still reports it live. That is a false PASS on the wire. ~~A sibling arc owns the fix;
+it is named here for the rule, not claimed as repaired.~~ **UPDATED 2026-08-28: both halves LANDED
+the same day — see §3.13 D1.** `live=` is now a read-back of `fbcon::console_is_routed()` at print
+time (`display_tegra.rs:2697`) and the RAST-path detach takes the phase-2 guard
+(`main.rs:6973`). The rule stated above is unchanged by the repair, and §3.13.1 (PANELOWN) is the
+same rule demonstrated in the other direction: an instrument published rather than asserted refuted
+one of its own author's states within an hour of existing.
 
 The general form: **an instrument reports either what the author intended or what the machine
 did, and only the second is evidence.** `orinfurn`'s own `owns_pixels()` read-back — §3.12,
 "never inferred from having called `composite`" — is already the correct shape. Apply both halves
 to every new seam on this ladder: print on entry, before any branch; and read every reported
 state back out of the subsystem that owns it.
+
+### §3.13 LANDED 2026-08-28 — the TERMINUS fold plus PANELOWN: five instruments that reported the state their author intended. UNFLOWN
+
+Fold `405b21f6` (`d33b6c3e`, `e1bb9b49`, `a4b1b338`, `81f304d2`) and fold `63b86488` (`52137ffc`).
+Four defects on the tegra terminus and one unenforced invariant in `video/`, all found by
+measurement rather than by review. Nothing below has runtime evidence: **no Orin boot has flown any
+of it.** Every file:line citation below was re-verified against the tree at `31129232`.
+
+#### ⚠ NO CHECK LEG IN THIS TREE CAN SCORE TEGRA BEHAVIOUR — proven by doing it, not argued
+
+Read this before the five instruments, because it bounds what every gate result below is worth.
+
+D1(b) and D2 are both behaviour changes in a **type-identical** program. The defects were
+deliberately re-introduced and the gate re-run: `arm-tegra-furn` and `arm-tegra-supstate` **both
+returned exit 0**. That is not a gap in the fold's diligence; it is the structure of the suite:
+
+* every leg of `KERNEL_CFG_MATRIX` is `cargo +nightly check --release --target … --features …`
+  (`unaos/arroyo:3482`) — a type-check that neither links nor runs anything. `arm-tegra-furn` is
+  `arroyo:3226`.
+* **no QEMU regression in this tree compiles `tegra` at all.** `./arroyo test` is x86; `./arroyo
+  test-arm` is the plain `virt` image, and `tegra` is forced on only by the `esp-jetson` media path
+  (`arroyo:4046-4056`). QEMU models no Tegra234, so there is nothing to boot.
+
+The fold's fallback was an artifact proof — `llvm-objdump` showing `bl console_is_routed` + `tbnz`
+ahead of `bl detach` where the defect had an unconditional call, and `orin_rast_console_owns` absent
+from the supstate symbol table before the fix and called after it. **That is the right evidence for
+a commit and it does not carry forward.** A disassembly proves one build at one sha; it re-runs on
+nobody's next edit.
+
+**The mitigation, and what it costs.** SPECGATE (fold `0ea79938`, landed 2026-08-28) makes the four
+TERMINUS instruments scorable against a *metal capture*, which is the only place a tegra behavioural
+regression can be caught in this tree. `unaos/scripts/specs/jetson-sync1.spec` gains **five failable
+rules, three PENDING arming lines and six OPTIONAL readouts**; `jetson-jd5.spec` is deliberately
+untouched (a frozen 43-line historical spec validated against one 2026-07-10 capture).
+
+Every failable row is a **FORBID on a failure literal**, which is the one shape that is
+unconditionally safe here: three of the four families are knob-gated and default OFF, so the token
+exists only in an image that compiled the instrument. An unarmed boot cannot trip it, and its
+silence is never read as a pass — each FORBID is paired with a PENDING arming row so "did not fire"
+is distinguishable from "was not armed".
+
+| row | fails when |
+| --- | --- |
+| `FORBID \[orinconwin\] win=.* live=FROZEN` (`jetson-sync1.spec:1449`) | an `orinconwin` boot reaches the terminus with the route not installed at print time |
+| `FORBID console OWNS the panel \(Screen back buffer live\); first key` and `…; screen-on-boot` (`:1490-1491`) | a takeover line carries **no** `path=` token — a stale pre-fold image was flown, or the discriminator was reverted. These key on the PRE-FOLD byte sequence, in which `live);` is followed directly by ` first key` / ` screen-on-boot`; the post-fold line interposes `; path=jd2-…;` and no longer matches |
+| `OPTIONAL path=jd2-console-pump;` / `path=jd2-supstate-phase2;` (`:1512-1513`) | readouts, not rules — they say WHICH site printed. The conditional arm ("on a supstate image, forbid `path=jd2-console-pump`") is the grammar limit below |
+| `FORBID \[orinstkdepth\] DEPTH-UNAVAILABLE` (`:1572`) | an `orinfurn` boot reaches the furniture seam with no derivable depth |
+| `FORBID \[orinrast\] census .* -> RAST-PAINTED-OVERWRITTEN` (`:1601`) | a `rast` boot finds the cube painted at `post`, gone at `late`, latch not set. Not a new string — what changed is that a supstate boot can now reach the correct arm |
+
+**The takeover pair is the only rule in the set whose reachability is guaranteed by the spec
+itself**: it sits on the line the existing `REQUIRE JD4.*console OWNS the panel` already demands of
+every scored flight, so its silence can never be dismissed as an undriven path.
+
+`live=LIVE` was deliberately **not** keyed on: boot7h's `live=LIVE` is the old compile-time literal,
+so such a row would be satisfied by every pre-fold capture and prove nothing. `FROZEN` is the half
+that could not print before the fold.
+
+⚠ **The green reference moved, and this is the largest such change the spec file has taken.**
+boot7f, boot7g and boot7h all now replay **FAIL** — the delta is exactly the 13 pre-fold takeover
+lines and nothing else, so the reds are for the right reason. **There is no green reference for this
+ladder until a post-`405b21f6` image flies.** Do not weaken the rows to recover a green.
+
+⚠ **Two limits that remain.** First, a grammar limit named in the spec itself: only
+`REQUIRE`/`COUNT`/`FORBID` can fail, and the takeover-path defect is inherently *conditional* — on a
+supstate image `path=jd2-console-pump` is a defect, on a default image it is correct. `mbench` has no
+`WHEN <guard> FORBID <rx>`, so that arm is a reading table rather than a rule. Second, **PANELOWN
+(§3.13.1) has no spec row at all**; SPECGATE covers the four TERMINUS families only. And none of
+this changes the finding above: a spec scores a *capture*, and no capture exists.
+
+#### D1 — the console window was detached the instant it was installed, and `live=` could not see it
+
+**The behaviour.** The terminus line (`main.rs:2717`) runs `orin_conwin()` **before**
+`tegra_rast_demo_maybe()`. The phase-2 detach in `jd2_console_pump` has been guarded since rung 4
+(`main.rs:2873`, `if !tegra_conwin_live() { … }`), but the twin inside `tegra_rast_demo_maybe`
+(`main.rs:6964`) was **bare**. So on every image carrying both knobs, rung 4 installed the
+console-window route, printed `live=LIVE`, and then reached the unguarded `fbcon::detach()` two
+statements later: `GUI_ACTIVE` set, `fbcon::_print` returning at its first test, and the "LIVE"
+console window receiving no further glyph for the rest of the boot. **All five legs that carry
+`orinconwin` also carry `rast`** — `arm-tegra-conwin`, `arm-tegra-conwin-tenant`,
+`arm-tegra-ladder`, `arm-tegra-furn`, `arm-tegra-fbconpar-cross` (verified against
+`KERNEL_CFG_MATRIX` at `63b86488`).
+
+⚠ **Scope it exactly, because a metal reader will ask.** Without `rast` the whole helper is the
+`#[inline(always)]` empty stub at `main.rs:6983`, so the defect never existed on a knob-off or
+`rast`-off image. **No flight taken so far was exposed** — boot7h armed
+`UNAOS_ORINCONWIN=1 UNAOS_ORINDESK=1 UNAOS_ORINCLICK=1 UNAOS_NET4=1` and no `UNAOS_RAST`. What was
+exposed is every `orinconwin` check leg, and any future flight that arms both knobs. ⚠ Note that
+§3.12's stated bench image (`UNAOS_ORINFURN=1 UNAOS_ORINCONWIN=1 UNAOS_ORINDESK=1`) does **not**
+carry `UNAOS_RAST`, so the fix is a precondition for a conwin+rast flight rather than a repair to
+any flight already planned.
+
+Fixed at `main.rs:6973`: the same `if !tegra_conwin_live() { … }` guard its twin already carried,
+folded in place so no source line moves. `tegra_conwin_live()` answers true only when
+`fbcon::console_is_routed()` does, and a routed console does not write the panel (`FbCon::draw_fb`
+hands back `win_fb`), so the single-writer guarantee the detach exists for is already true of the
+mirror path.
+
+**⚠ What the guard costs at THIS site is not what it costs at the phase-2 site,** and the code says
+so rather than inheriting the argument. This site's stated purpose is "a straggler can't paint over
+the demo frames", and a routed console still reaches glass through `wm`'s paced composite. So a
+straggler line printed while the cube spins can now composite over it inside the console window's
+rect, and because `orin_rast_console_owns()` is not latched until phase 2 the census would score
+that `RAST-PAINTED-OVERWRITTEN`. **That is a true reading of a genuine second writer**, not a false
+one, and it is the same trade the phase-2 line already took when it chose a live console over a
+frozen one. `d33b6c3e` reverts cleanly on its own if the bench disagrees.
+
+**The instrument half.** `[orinconwin]`'s `live=` field
+(`arch/aarch64/display_tegra.rs:2677`) was the compile-time literal `"LIVE"` — an assertion about
+the build, on the one line whose own comment four lines above demands every field be "DERIVED from
+the outcome CROSSED with the route read back, never asserted". It is now a read-back:
+`if fbcon::console_is_routed() { "LIVE" } else { "FROZEN" }` (`display_tegra.rs:2697`), taken at
+print time. Not redundant with `route=`, which was sampled before `present_outcome` and `composite`
+ran.
+
+**⚠ THE HONEST LIMIT, stated at the site (`display_tegra.rs:2679-2696`) and repeated here so nobody
+re-derives it.** `fbcon::detach()` sets `GUI_ACTIVE` and does **not** clear `CONSOLE_WIN`, so after
+a detach `console_is_routed()` still answers `true` while `_print` returns at its first test and no
+glyph reaches the window. The sample is taken before any terminus detach can have run, so the
+strongest thing this field can say is **"the route is installed at this instant"** — never "live",
+and never "no later detach freezes it". That second half is a behavioural guarantee owned by the
+guards on the two detach sites, not by this field. Closing the gap needs `GUI_ACTIVE` exposed from
+`video/fbcon.rs`, which was outside that arc's lane.
+
+#### D2 — the supstate copy of phase 2 dropped the console-owns latch and the rast census
+
+`jd2_supstate_phase2` (`main.rs:7524`) is a verbatim copy of `jd2_console_pump`'s phase 2, **except
+for two appends it did not copy, and both are instruments.** It never returns (its drive loop is
+non-breaking), so on a `supstate` image the legacy phase 2 is unreachable and neither append ran.
+
+* **The latch.** The legacy line ends with `#[cfg(feature = "rast")] orin_rast_console_owns()`
+  (`main.rs:2873`), placed outside the conwin guard because the console takes the panel on both
+  routes. The supstate copy had no such append, so `RG_CONSOLE_OWNS` was **never set at all** on a
+  supstate image. Read that off the census (`display_tegra.rs:4960`, arms at `:4995-5000`): with
+  `owns` false, a console that has taken the panel and repainted the cube away scores
+  `RAST-PAINTED-OVERWRITTEN` — which that census's own doc calls "the only arm that indicts a
+  repainter" (`display_tegra.rs:4951-4957`) — instead of `RAST-SUPERSEDED-BY-CONSOLE`. **A healthy
+  supstate+rast boot was being scored as a defect.** Restored at `main.rs:7550`.
+* **The census.** The supstate drive loop swept `vugras::idle_sweep`, `sup_present_census` and
+  `orin_click_census` but **not** `orin_rast_census`, so the rast census stopped dead at the phase-1
+  boundary and the rung's verdict froze at whatever the last phase-1 sweep said — which, with the
+  latch never set, was permanently pre-takeover. Restored at `main.rs:7657`, on the same statement
+  and at the same cadence phase 1 advances. The census self-terminates on `RG_DONE`
+  (`display_tegra.rs:5005`), so it costs one relaxed load per sweep once the question is answered.
+
+Both appends are line-neutral, matching the shape of the sites they mirror. The `[orinrast]` census
+line's `console-owns=` field (`display_tegra.rs:5008`) is what a capture reads to tell the two
+states apart.
+
+#### D3 — ORINPATH: two byte-identical takeover literals, and a single `.rodata` run that read as confirmation
+
+`jd2_console_pump` and `jd2_supstate_phase2` emitted **byte-identical** JD2/JD4
+`console OWNS the panel` literals. Both copies pass `#[cfg]` on a `supstate` build, so neither a
+serial capture nor a grep of the artifact could attribute the line to a site — on the one transition
+whose whole purpose is to be adjudicable from the wire.
+
+**⚠ MEASURED at `0ed6fee2`, and the shape is worse than that description.** `LC_ALL=C grep -a -o` on
+the `arm-tegra-supstate` `kernel.elf` found **exactly ONE** `.rodata` run for each literal, not two:
+`jd2_supstate_phase2` never returns, so LLVM drops the legacy phase 2 as unreachable. **A single
+unattributable run reads as confirmation** — one copy is in the image, one site prints it, and
+nothing says which.
+
+Each site now names itself: `path=jd2-console-pump` (`main.rs:2889-2898`) and
+`path=jd2-supstate-phase2` (`main.rs:7565-7574`). With the token in place the same grep answers the
+question. Two placement constraints, both deliberate:
+
+* **Longer than 8 bytes on purpose.** A witness mark of 8 bytes or fewer can be LLVM-immediate-
+  encoded and never reach `.rodata` at all, which would defeat the artifact-grep law this tree runs
+  on.
+* **Placed AFTER `console OWNS the panel`**, so `scripts/specs/jetson-sync1.spec` and
+  `jetson-jd5.spec`'s `REQUIRE JD4.*console OWNS the panel` still matches.
+
+⚠ This deliberately breaks the "must read identically knob-on vs knob-off" transcript property
+`jd2_supstate_phase2`'s doc comment named as its behavioural falsifier. That property is retired in
+`arch_arm64.md` §ORIN-SUPSTATE rather than silently violated: **being unable to tell the two
+transcripts apart was never evidence that they were equivalent; it was the absence of evidence
+either way.**
+
+#### D4 — ORIN-STKDEPTH: a boot-core stack DEPTH, and the headroom it refuses to invent
+
+Two SP reads on one descending frame chain — the anchor appended to `kernel_main`'s
+`bootpace::record("entry")` statement (`main.rs:88`) and the seam read beside `tegra_desk_furn`'s
+unconditional `[orinfurn] arm` line (`main.rs:7896-7899`) — subtract to the exact bytes of boot-core
+stack that `kernel_main -> tegra_early_stop -> tegra_desk_furn` has consumed. It publishes
+`[orinstkdepth] depth-consumed=… -> DEPTH-CONSUMED`, and `[orinstkdepth] DEPTH-UNAVAILABLE` with a
+named reason when the anchor is unset or the two reads are not on one descending chain
+(`main.rs:7900-7912`).
+
+**DEPTH is not HEADROOM, and the distinction is the instrument.** Headroom is genuinely unavailable
+on this board: the Orin boot stack is UEFI's and is never switched, `aarch64-unaos.json` names no
+linker script so no `__stack_top` is linked into the jetson image, and the `MemoryRegion` slice that
+would bound the region is discarded with `boot_info` by `memory::init`. The instrument prints
+`DEPTH-UNAVAILABLE` rather than inventing a number.
+
+§3.12's AMENDED subsection above records the argument against §5.2's clearing condition; **the
+instrument itself is documented in
+[`docs/dev/OS/01_BOOT_HAL/arch_arm64.md`](../01_BOOT_HAL/arch_arm64.md) §ORIN-STKDEPTH**, with the
+wire format, the `#[inline(always)]` floor property, and the full "why no headroom number" argument.
+⚠ One correction that must not be re-broken: `__stack_top` **does** appear in Rust source in this
+tree, at `main.rs:51-52` inside a `global_asm!` block gated
+`all(target_arch = "aarch64", feature = "baremetal")` — the Pi's bare-metal link, which the Orin
+never takes. The claim is "not on the jetson link", never "nowhere in the tree".
+
+#### §3.13.1 PANELOWN — an owner word for the panel, and the state it refuted in its first hour
+
+Fold `63b86488` (commit `52137ffc`), `video/mod.rs` + `video/fbcon.rs`, +316 lines. Cross-lane work
+in the x86 seat's files, taken under an explicit grant.
+
+**The defect it names is an UNENFORCED INVARIANT, not an instrument gap, and that distinction is the
+point.** `video/mod.rs:29-31` states the whole panel-ownership discipline as prose: `WRITER` and
+`fbcon` are two handles onto **one** physical framebuffer, "used at different times", "each
+serialised by its own lock". Both halves are true and neither is an invariant — the locks give
+mutual exclusion WITHIN a handle and none BETWEEN them, so the only thing keeping two writers off
+the glass was a temporal convention that nothing enforced and nothing witnessed. A survey of the
+Orin panel path found **16 distinct panel writers across 14 transitions where the writer changes;
+exactly one announced itself in both directions.** The closest thing to an owner bit, fbcon's
+`GUI_ACTIVE`, was a private `AtomicBool` with no public getter anywhere in the tree. ⚠ The 16/14
+figures are the authoring arc's survey; this section relays them and has not re-counted them.
+
+**What landed.** `PanelOwner` + `PANEL_OWNER` beside `WRITER` (`video/mod.rs:243`, `:304`),
+`panel_owner()` to read it (`:315`), `publish_panel_owner()` to announce a handover naming **both**
+sides (`:336`), `note_panel_overpaint()` for a whole-surface paint that is not a handover (`:360`),
+and five publish sites in `fbcon.rs`: `init` (`:566`), `detach` (`:1622`),
+`panel_console_window_open` (`:2031`), `panel_console_window_closed` (`:2090`, on a successful CAS
+only) and `panic_screen` (`:2104`). **It PUBLISHES ONLY.** Nothing consults it before painting, no
+writer declines or defers on it, and no pixel moves. A refusal is a change to x86 paint order and is
+a separate commit the x86 seat reviews first.
+
+Three constraints from the cross-lane grant, each with a reason worth keeping:
+
+1. **The STORE is unconditional on both arches, no `cfg`; only the EMIT is `witness`-gated**
+   (`video/mod.rs:202-209`, `:336-349`). A feature-gated store would make the default image
+   structurally differ from the witness image at exactly one site — a fresh unpaired arch gate, on
+   the very census §1.2/§1.2.1 spent that day repairing. Proven by disassembling the **knob-off**
+   images: x86 `detach` is `movb $1,GUI_ACTIVE / mov $2,%al / xchg %al,PANEL_OWNER / ret`; aarch64
+   is an `ldaxrb`/`stlxrb`/`cbnz` pair.
+2. **Atomic only, never under a panel lock** (`video/mod.rs:210-217`, the LOCKFIX rule at `:368`).
+   LOCKFIX (`7847ceea`) forbids blocking on a raw panel lock from the preemptible input band,
+   because that band runs on the same core as the IRQ-context printer and a blocking acquire
+   preempted while holding leaves the next masked acquirer spinning forever — the boot-8 wedge.
+   Panel handovers fire there: `panel_console_window_closed` is reached from a click on the console
+   window's close disc.
+3. **`swap(next, AcqRel)` rather than a plain store** (`video/mod.rs:319-336`). A bare store cannot
+   name the DEPARTING owner, and a load-then-store pair can be interleaved by a second publisher
+   into a line naming a side that never held the panel. One `AcqRel` RMW gets both in a single
+   lock-free instruction that cannot block.
+
+The emit fires only on an actual change of owner, so one line per transition rather than per call.
+`Unknown` keeps no publisher on purpose: the moment something stores it, "the instrument never ran"
+and "the instrument ran and reported its default" print the same word (`video/mod.rs:218-232`).
+
+##### ⚠ THE INSTRUMENT REFUTED ITS OWN AUTHOR, on the arch the word was not written for
+
+A sixth state, `Firmware`, was published at `init_panel` on the reading that this is where the
+kernel takes the firmware's surface ahead of any console. **The first armed boot killed it on the
+wire** — the aarch64 QEMU wire, per the site's own record, i.e. the arch this `video/` word was not
+written for:
+
+```
+[panel-owner] ... from=owner-unknown      to=owner-fbcon-panel site=fbcon::init
+[panel-owner] ... from=owner-fbcon-panel  to=owner-firmware    site=video::init_panel
+[panel-owner] ... from=owner-firmware     to=owner-gui-screen  site=fbcon::detach
+```
+
+There is no firmware-owned epoch. `fbcon::init` runs from `main.rs:120` and `init_panel` from
+`main.rs:1335` — **1215 lines and an entire boot log later** — so `init_panel`'s whole-surface
+`fill_screen(PANEL_BG)` (`video/mod.rs:466`, the fill at `:473`) lands on a console that has owned
+the glass since before the heap existed, and overwrites every pixel of the boot log it has been
+printing. Worse for the record, publishing `Firmware` there **corrupted the DEPARTING side of
+`fbcon::detach`** — the one transition the instrument exists to describe. The state was deleted;
+that site now stores nothing and emits `panel-repaint-over-owner` instead (`video/mod.rs:360-366`),
+naming whoever was holding the glass. The refutation is recorded at the site
+(`video/mod.rs:477-507`) so the next person to reach for a `Firmware` state reads it first.
+
+**This is not Orin-only, and it now has x86 wire evidence.** [CLAIM, rmbp 9 — the rmbp seat's
+measurement on their board, relayed here, not re-derived] the seat verified the shape in their tree
+and measured the window on a flight capture taken 2026-08-28:
+
+```
+[ 25662ms] :: fbcon: glyphs-active base=90020000 pitch=16384 cell=7x16 cols=411 rows=112 ::
+[ 26030ms] :: FB Init ::
+[ 26043ms] :: Framebuffer painted #1E1E1E ::
+[ 26094ms] :: SERWIT-2 tap fbcon: submitted=2642 absorbed=466 ... ::
+```
+
+The console owns the glass for 368 ms having submitted 2642 lines, and then every pixel is
+overwritten. **The operational cost the rmbp seat named: a boot that dies AFTER `init_panel` leaves
+an operator staring at a blank #1E1E1E panel instead of the console text that would say why.**
+
+**The general lesson, stated plainly because it generalises past this instrument: an instrument that
+refutes one of its own states in its first hour is working; one that never contradicts its author is
+decoration.** Publishing beat asserting, and it did so on the arch the word was not written for.
+This is the same rule §3.12.2 states from the other direction, and it is now demonstrated rather
+than only argued.
+
+##### Two gaps found on the way, both real, neither fixed
+
+* **`video::init_panel` is never called on tegra.** The Orin seeds `video::WRITER` directly in
+  `tegra_early_stop`'s JD1 block; the tree already says so at
+  `arch/aarch64/display_tegra.rs:313`. Confirmed by artifact absence **with a control** — that
+  function's own older strings `:: FB Init ::` and `:: Framebuffer painted #1E1E1E ::` are absent
+  from a tegra artifact too, so the absence is the function's and not the new token's. ⚠ Relayed
+  from the authoring arc; this section did not rebuild the artifact.
+* **`fbcon::panel_console_window_closed` has exactly ONE caller tree-wide** —
+  `arch/x86_64/syscall.rs:5942` — and none on aarch64 (verified by `grep` over `--include=*.rs` at
+  `63b86488`). **The Orin can OPEN a console window under `orinconwin` and has no close path that
+  calls it.** A real gap on this board; outside that arc, and owed.
+
+##### One deliberate surrender, stated rather than buried
+
+`video/fbcon.rs:567` (the ORIN-FACE arm) carried a same-line append whose **stated purpose** was
+preserving line numbering for a knob-off `kernel8.img` byte-identity proof. An unconditional store
+surrenders that identity by construction — the default image now contains an instruction it did not
+before, whatever the line numbering does. The statement was split onto its own line and both stale
+notes corrected in place.
+
+The grantor's ruling, recorded because the reasoning generalises: **a feature-gated store is a
+permanent artifact on a census under active repair, while this is a one-time re-baseline of a
+proof, and a cost that ends is cheaper than a cost that compounds.** And: **a stale proof claim left
+standing is worse than a voided proof, because the next reader trusts it.**
+
+#### Evidence status for §3.13, stated once
+
+* **Gates (build only), as recorded in the fold commit messages — this documentation arc ran no
+  gate of its own and re-derived none of these numbers:** `./arroyo check` `CHECK_EXIT=0` both
+  arches across the TERMINUS fold, against a baseline run at `0ed6fee2` that was also 0, so the
+  delta is attributable; the five `orinconwin` legs and `arm-tegra-supstate` green; PANELOWN green
+  both arches in both `witness` polarities, go-red proven four ways.
+* **Artifacts:** every new instrument confirmed one-hit in the built `kernel.elf` with
+  `LC_ALL=C grep -a -o`; every new token longer than 8 bytes so none can hide as an LLVM immediate.
+* **⚠ Runtime: NONE.** No Orin has booted any of the five instruments. `live=FROZEN` has never been
+  observed, no `[orinstkdepth]` number exists, no `[orinrast] census … console-owns=1` line has been
+  captured from a supstate image, and no `[panel-owner]` line has been seen on Orin metal. Every
+  claim in this section is a source or artifact reading.
+* **⚠ And no leg can score any of it** — see the finding at the head of this section. The gate
+  results above bound compilation, not behaviour.
 
 ---
 
@@ -2588,7 +2950,12 @@ structural gap §3.12 records as making §5.2's own clearing condition unsatisfi
 inference is not.** An unavailable measurement is an instrument gap; it is not evidence for the
 value the measurement would have returned. The stop-line stands on the Pi's two boots and on
 §5.1's inventory, and it needs the boot-stack high-water probe §3.12 names before any rung can
-claim to have cleared it.
+claim to have cleared it. ⚠ **PARTIALLY ADDRESSED 2026-08-28:** ORIN-STKDEPTH
+(§3.13 D4, and `arch_arm64.md` §ORIN-STKDEPTH) now takes the DEPTH half at the `[orinfurn] arm`
+line and prints `DEPTH-UNAVAILABLE` for HEADROOM. That instrument is **UNFLOWN** — no number
+exists — and a depth is not the high-water probe this paragraph asks for, so nothing here is
+cleared. What has changed is that the clearing condition can now be restated in terms something in
+this tree can supply.
 
 ---
 
@@ -2603,7 +2970,7 @@ names the seat that owns the files under the parallel-arc rules in `CLAUDE.md`.
 | **1** | **The cfg leg** — ✅ **LANDED 2026-08-22, less `quarry`** (§3.5.1) | `arm-tegra-desk` leg added (gate 18 → 19 legs); `pidesk`/`quarry`/`livecon` mapped in arroyo's env map; two of the three gate mismatches fixed | `UNAOS_TEGRA=1 ./arroyo check` green 19/19, and green again under `UNAOS_TEGRA_EL0=1 UNAOS_PIDESK=1 UNAOS_LIVECON=1`; the new leg proven to go red on a re-introduced mismatch | jetson (arroyo + `arch/aarch64/syscall.rs`); the `quarry` line is a `video/` edit and is **held** in §3.5.2 |
 | **2** | **The desktop seam** — ✅ **LANDED 2026-08-25, and it REFUSES** (§3.2.1) | `tegradesk` feature + `main.rs::tegra_desk_arm` on `tegra_early_stop`'s terminus line + `UNAOS_TEGRADESK` env map + the `arm-tegra-seam` leg (11 → 12 board legs). The seam evaluates its floors and declines at two named stop-lines | **the floors half is UNFLOWN**: `[deskseam] floors …` + `REFUSE reason=…` print on an armed Orin boot, and nobody has taken one. **The `activate()` half is WITHDRAWN, not owed**: `desktop_firmware::activate()` opens the console window and enables the bar, so running it crosses §6.1 *and* §5.2 — it belongs to rungs 3/5, and this row previously asked for something the same document forbids | jetson |
 | **3** | **Input routing** — ✅ **LANDED 2026-08-25 as a DEFAULT-OFF knob; FLOWN, ARMED, and ROUTING ON METAL** (§3.7, §3.8, §3.8.1) | `orinclick` (implies `tegra_el0`) wires `jd2_console_pump`'s `Event::Button` arm into `wc_click_route` (§3.4) and adds the `[orinclick]` instrument at the tail of `display_tegra.rs`. **⚠ HANDSHAKE WITH RUNG 2, DISCHARGED IN THIS ARC:** `main.rs`'s `TEGRADESK_CLICK_ROUTED` no longer reads `false` — it reads `cfg!(feature = "orinclick")`, **not** a literal `true`, because `tegradesk` does not imply `orinclick` and a hard `true` would assert a route back on an image that has none: the one-way trip re-entered through the constant meant to prevent it. `arm-tegra-seam` now carries `orinclick` so the assertion is type-checked. COMPILES: gate green 21/21 knob off and on; the new `arm-tegra-orinclick` leg proven to go red. No gate in this tree can boot it — QEMU models no Tegra234 | ✅ **DISCHARGED, boot7g 2026-08-25** (§3.8.1): `[clickroute] press hit asid=4294967042 win=1 (was 0) delivered` (capture line 13084) and `[orinclick] edge=press btn=0x01 at (1009,546) geom=yes hit=yes win=1 owner=0xffffff02 focus 0x0->0xffffff02 consumed=0 -> RAISED` (capture line 13085); release `-> RELEASE-DELIVERED` (13087); census `IDLE-NO-CLICKS -> ROUTING` (13089); a second press on the focused row `-> HIT-SAME` (13092), plus `CONSUMED` (13125), `MISS-SHELL` (13133) and `RELEASE-DROPPED` (13135). Six press/release pairs with `stuck=0 nogeom=0 dropped=0`. **The prior owed item — boot7f's armed-but-unclicked state (`-> ARMED`, capture line 11424, then 48 `IDLE-NO-CLICKS`) — is closed.** Still owed: nothing on the wire; stack cost on this path (§5) is still a Pi number | jetson |
-| **4** | **Console as a window** — ✅ **LANDED 2026-08-25 as a DEFAULT-OFF knob; FLOWN AND ROUTED the same day** (§3.9, §3.9.1) | `orinconwin` (implies `pidesk` + `tegra_el0`, and deliberately NOT `orindesk`/`orinclick`) calls the SHARED console-window machinery from `display_tegra::orin_conwin` on `tegra_early_stop`'s terminus line — `panel_console_face_arm` → `panel_console_window_open` → `console_is_routed` — and folds `jd2_console_pump`'s phase-2 `fbcon::detach()` to `if !tegra_conwin_live() { … }` so a routed console stays LIVE. **§6.1 IS NOW A BRANCH:** both ordering terms are read through `cfg!()` and an image missing either gets `[orinconwin] DECLINE reason=ordering-rule held=…` and NO window — measured on the artifact both ways. No `video/` edit; no `desktop_firmware::activate()`, so §5.2 is untouched. Gate green 23/23 knob off and on; `arm-tegra-conwin` proven to go red; knob-off loadable image byte-identical | ✅ **DISCHARGED, boot7h 2026-08-25** (§3.9.1): `[orinconwin] gate … dock=GRANTED … orindesk=1 orinclick=1` (capture line 14828), then `[orinconwin] win=2 panel=1920x1200 cell=7x16 stage=4194304 table=2 present=Composited route=true live=LIVE -> ROUTED` (14833) with the `[wc-x] console-window / console-route first-paint / panic-fallback armed` trio beside it (14830–14832). The route stayed LIVE for a ~107-minute sitting — shell banner, keystroke echoes and verb output all landed through the window path; chrome clicks CONSUMED and the close control `REFUSED furniture` (14926–14927). **Still owed:** the dock round-trip (`presses=0` on every `[dock]` line — the minimise disc was never clicked) and a win=2 glyphs-on-glass read-back — ⚠ **both INSTRUMENTED 2026-08-25 under `orinladder`, both still UNFLOWN: see §3.11 for the two flight cards and every broken shape each one reads as** | jetson |
+| **4** | **Console as a window** — ✅ **LANDED 2026-08-25 as a DEFAULT-OFF knob; FLOWN AND ROUTED the same day** (§3.9, §3.9.1) | `orinconwin` (implies `pidesk` + `tegra_el0`, and deliberately NOT `orindesk`/`orinclick`) calls the SHARED console-window machinery from `display_tegra::orin_conwin` on `tegra_early_stop`'s terminus line — `panel_console_face_arm` → `panel_console_window_open` → `console_is_routed` — and folds `jd2_console_pump`'s phase-2 `fbcon::detach()` to `if !tegra_conwin_live() { … }` so a routed console stays LIVE. **§6.1 IS NOW A BRANCH:** both ordering terms are read through `cfg!()` and an image missing either gets `[orinconwin] DECLINE reason=ordering-rule held=…` and NO window — measured on the artifact both ways. No `video/` edit; no `desktop_firmware::activate()`, so §5.2 is untouched. Gate green 23/23 knob off and on; `arm-tegra-conwin` proven to go red; knob-off loadable image byte-identical | ✅ **DISCHARGED, boot7h 2026-08-25** (§3.9.1): `[orinconwin] gate … dock=GRANTED … orindesk=1 orinclick=1` (capture line 14828), then `[orinconwin] win=2 panel=1920x1200 cell=7x16 stage=4194304 table=2 present=Composited route=true live=LIVE -> ROUTED` (14833) with the `[wc-x] console-window / console-route first-paint / panic-fallback armed` trio beside it (14830–14832). ⚠ **`live=LIVE` there was a COMPILE-TIME LITERAL, not a measurement** (§3.13 D1) — it would have printed `LIVE` whatever the route did. It became a read-back on 2026-08-28. This flight's image carried no `UNAOS_RAST`, so the unguarded second detach §3.13 D1 describes was the empty stub here and did not affect the capture; the 107-minute sitting, not the field, is what evidences the route staying live. The route stayed LIVE for a ~107-minute sitting — shell banner, keystroke echoes and verb output all landed through the window path; chrome clicks CONSUMED and the close control `REFUSED furniture` (14926–14927). **Still owed:** the dock round-trip (`presses=0` on every `[dock]` line — the minimise disc was never clicked) and a win=2 glyphs-on-glass read-back — ⚠ **both INSTRUMENTED 2026-08-25 under `orinladder`, both still UNFLOWN: see §3.11 for the two flight cards and every broken shape each one reads as** | jetson |
 | **5** | **The real desktop** — ⚠ **PARTIALLY LANDED 2026-08-26 as `orinfurn`: the MENU BAR half only** (§3.12) | the full row is unchanged: dock, strip, menubar, crystal armed; the full `pidesk` cascade; a tegra `render_service` (§3.6). What `orinfurn` takes is TWO of `activate`'s nine steps — `menubar::set_enabled(true)` + `wm::composite()` + the `owns_pixels` read-back — on the terminus line, DEFAULT OFF, with `desktop_firmware::activate()` NOT called and `TEGRADESK_CASCADE_OK` NOT touched. The cascade, the DESKTOP-CLEAR, `crystal::routed_selftest`, window population and the render service are all still owed | the Orin comes up to a desktop. **`orinfurn`'s own half is UNFLOWN**: `[orinfurn] ARMED … -> BAR-ON-GLASS` and a crystal press consumed by the menu band are both Orin-metal verdicts nobody has taken | jetson — the CASCADE is still **blocked by §5.2**; ⚠ and see §3.12 for why §5.2's `[u7stk]` evidence requirement is *structurally unsatisfiable at the terminus* (`stk_probe` returns early with no current task), which is a defect in the stop-line's clearing condition, not a reason to step over it |
 | **6** | **EL0 tenants** — ✅ **LANDED 2026-08-25 as the CRYSTAL-HD parity fix + a DEFAULT-OFF instrument knob; UNFLOWN** (§3.10) | the `SYS_WIN_*` surface needed NO new verb — the gap was `mmu_tegra_el0.rs` carrying the pre-CRYSTAL-HD FB geometry (128x128 cap, 0x1_0000 slot stride), which refused the shipped vug's `SYS_WIN_CREATE(288,288)` with `-EINVAL` and mis-mapped the WC-B fixture's slot 1. Parity restored (4 slots x 0x51000, 288x288, unconditional under `tegra_el0`); `orintenant = ["tegra_el0"]` arms the terminus `reserve_stage` + the `[orintenant]` arm/create/close/reap/census instrument. Tenant close policy: CLOSE-CLEAN (tenants close; furniture refuses). Gate green 24/24; `arm-tegra-tenant` + the `arm-tegra-conwin-tenant` conjunction cross both go-red-proven; knob-off jetson AND Pi loadable images byte-identical | an EL0 program owns a window on the Orin panel: `run /fat/vug.elf` on the four-knob conjunction image -> `[orintenant] create … surf=288x288 wm-bound=1 -> TENANT-WINDOW`, census `IDLE-NO-TENANTS -> TENANT-LIVE`, and a clean exit reaps (§3.10 flight card) | jetson |
 

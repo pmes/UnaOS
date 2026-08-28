@@ -10742,6 +10742,124 @@ point. What this arc deliberately does not do: no AP EL1 drop (Candidate C), no 
 (F1 stays empty by design until C), no supervisor (Candidate A), no change to how many cores wake.
 
 
+## §ORIN-STKDEPTH — a boot-core stack DEPTH at the tegra terminus (`orinfurn`, DEFAULT OFF)
+
+Landed 2026-08-28 in the TERMINUS fold (`405b21f6`, commit `81f304d2`). The section it argues
+with is `docs/dev/OS/08_VIDEO/orin-desktop.md` §3.12 / §5.2; the instrument itself is a boot/HAL
+measurement and is recorded here.
+
+### What it measures, and the record it corrects
+
+`orin-desktop.md` §5.2 gates the desktop cascade on `[u7stk]`/`[redzone]` stack evidence, and §3.12
+recorded that requirement as *structurally unsatisfiable at the terminus*. That record is right
+about `sched::stk_probe` and overstated about the machine, and the distinction is the whole of this
+instrument.
+
+`stk_probe` loads `SCHED[cpu].current` and returns early when it is null, which is every rung on
+`tegra_early_stop`'s terminus line: the boot core has not entered `run_capstone_boot_core` and owns
+no `Task`. Everything it reports (`base`, `len`) is derived from `task.stack`, so it is not
+adaptable to this seam. The SP itself needs none of that — it is three instructions, and the same
+read already exists twice in tree (`arch/aarch64/mmu_tegra.rs`'s pre-switch PC/SP check;
+`stk_probe`'s own first statement).
+
+ORIN-STKDEPTH takes two SP reads on one descending frame chain and subtracts them:
+
+* the **anchor**, `tegra_stk_anchor()`, appended to `kernel_main`'s `bootpace::record("entry")`
+  statement — `main.rs:88`, the earliest stable point on the chain;
+* the **seam** read, inside `tegra_desk_furn` beside its unconditional `[orinfurn] arm` line —
+  `main.rs:7896-7899`.
+
+The difference is the number of bytes of boot-core stack the chain
+`kernel_main -> tegra_early_stop -> tegra_desk_furn` has consumed at that instant. No linker
+symbol, no `Task`, no poison fill, no memory map.
+
+The anchor helper is `#[inline(always)]` (`main.rs:8082-8094`) and that is load-bearing rather than
+cosmetic: the read must land in `kernel_main`'s own frame, not a callee's. Were it ever out-of-lined
+the anchor would sit one leaf frame lower and the number would shrink — so the published depth is a
+**floor with respect to its anchor** and cannot overstate consumption.
+
+### Wire format
+
+```
+[orinstkdepth] depth-consumed=<n> bytes anchor-sp=<hex> seam-sp=<hex> at=orinfurn-arm chain=kernel_main->tegra_early_stop->tegra_desk_furn -> DEPTH-CONSUMED
+[orinstkdepth] DEPTH-UNAVAILABLE anchor-sp=<hex> seam-sp=<hex> at=orinfurn-arm reason=<anchor-never-ran | anchor-below-seam>
+```
+
+`main.rs:7900-7912`. **Fails closed:** the guard is `stk_anchor != 0 && stk_anchor >= stk_here`, so
+an anchor that never ran (zero) or a pair that is not on one descending chain prints
+`DEPTH-UNAVAILABLE` with the reason named, never a number derived from a null.
+
+### ⚠ DEPTH CONSUMED IS NOT HEADROOM, and no headroom number is derivable in-kernel today
+
+Stated in the code comment, in the tail block (`main.rs:8028-8080`) and **on the wire**, so a
+capture cannot be read as clearing §5.2 by itself. Three independent reasons, each verified in this
+tree:
+
+1. **The Orin boot stack is the firmware's and is never switched.** The JM6 drop in
+   `arch/aarch64/boot_tegra.rs` does `mov x0, sp; msr sp_el1, x0` precisely so SP is continuous
+   across EL2 → EL1 — which is also what makes the two reads subtractable at all.
+   `arch/aarch64/mmu_tegra.rs` states the same in its EL1-twin argument.
+2. **No `__stack_top` is linked into the jetson image.** `unaos/aarch64-unaos.json` names no linker
+   script — its `pre-link-args` carry only `--fix-cortex-a53-843419` — so no such symbol exists on
+   this link and no `extern` could resolve to one. ⚠ **The symbol DOES appear in Rust source in this
+   tree**, at `main.rs:51-52` inside the `global_asm!` whose `_start` sets SP from it, and
+   `crates/kernel/pi-baremetal.ld` defines it. That block is
+   `#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]` — the Pi's bare-metal link, which
+   the Orin never takes, and no tegra leg carries `baremetal`. Do not restate this as "the symbol
+   appears nowhere in the tree"; that overstatement has already been corrected once.
+3. **The one runtime description of the region is gone before anything could ask.** The UEFI
+   `MemoryRegion` slice that would say how far the firmware stack extends is consumed with
+   `boot_info` by `arch::memory::init` on `tegra_early_stop`'s heap line, long before the terminus.
+
+So the instrument publishes a depth and prints `DEPTH-UNAVAILABLE` for the other half. A depth is a
+measurement; a headroom would be a guess wearing a measurement's clothes. Closing the headroom half
+needs one of: a linker script for the aarch64 kernel target, the `MemoryRegion` slice retained past
+`memory::init`, or the cascade moved off the boot stack. All three are real arcs; none is a comment
+change.
+
+### Gating and verification status
+
+Every item is `#[cfg(all(target_arch = "aarch64", feature = "orinfurn"))]`-erased. The call site is
+a line-neutral append to an existing `kernel_main` statement; the statics and helper are `main.rs`'s
+last block with nothing below to renumber; the seam's added lines sit inside `tegra_desk_furn`,
+itself the file's last item. The knob-off jetson image's panic `Location` records are therefore
+untouched.
+
+Verified at `81f304d2` (fold `405b21f6`), build and artifact only:
+
+* `./arroyo check` green both arches;
+* `[orinstkdepth] depth-consumed=` and `[orinstkdepth] DEPTH-UNAVAILABLE` each one-hit in the
+  `arm-tegra-furn` `kernel.elf` (`LC_ALL=C grep -a -o`). The leg is `arroyo:3226`.
+
+⚠ **UNFLOWN — no depth number exists.** No Orin has booted an `orinfurn` image that reached the
+seam; the two 2026-08-26 desk flights died 96 source lines earlier (`orin-desktop.md` §3.12.1).
+Every claim above is a source and artifact reading. The depth itself has never been measured on
+hardware, and the `DEPTH-UNAVAILABLE` arm has never been observed firing either.
+
+⚠ And see `orin-desktop.md` §3.13: **no check leg in this tree can score tegra behaviour.**
+`arm-tegra-furn` going green means this instrument compiles, not that it prints anything. The
+mitigation is SPECGATE (fold `0ea79938`, 2026-08-28), which scores a metal CAPTURE instead:
+`unaos/scripts/specs/jetson-sync1.spec:1571-1572` carries
+`PENDING \[orinstkdepth\] depth-consumed=[0-9]+ bytes` beside
+`FORBID \[orinstkdepth\] DEPTH-UNAVAILABLE`, read as a pair with the `[orinfurn] arm` PENDING at
+`:1565` so "did not fire" is distinguishable from "was not armed". Two notes the spec makes and
+this section endorses:
+
+* **The instrument cannot come up short on CONFIGURATION.** The anchor and the seam read share one
+  `#[cfg(all(target_arch = "aarch64", feature = "orinfurn"))]`, so there is no image in which the
+  reader is compiled and the anchor is not. `DEPTH-UNAVAILABLE` therefore always means something
+  happened, never that something was missing from the build — which is why this family gets a
+  FORBID where the other three get weaker rows.
+* **The `depth-consumed=` pattern deliberately stops at `bytes`** and never reaches `anchor-sp=` /
+  `seam-sp=`, because §ORIN-RAS-ADDR forbids keying any spec row on an ADDR value. The depth is the
+  measurement; the two addresses are context for a human reading the quoted line.
+
+⚠ If a future arc legitimately switches stacks between `kernel_main` and the seam, the
+`reason=anchor-below-seam` arm will red while the instrument is telling the truth. The right
+response then is to RETIRE the row, because the depth number it guards would have become
+meaningless at the same moment.
+
+
 ## §ORIN-SUPSTATE — the console-surface state lift + role split (SMP-redesign Candidate A, arc 1; `supstate`, DEFAULT OFF)
 
 ### The defect this arc addresses
@@ -10805,6 +10923,21 @@ Knob-off there are none (byte-identity below). Knob-on, on the serial wire:
    which the dispatcher marks `SCREEN_APP_ACTIVE` goes to the shell after the command returns
    rather than to the command's own pump — today's typed-ahead semantics, but the window is now one
    input pass instead of zero. Human-rate keys; benign.
+6. **The JD2/JD4 takeover literals now name their site (ORINPATH, `a4b1b338`, 2026-08-28).** Both
+   copies print `path=jd2-supstate-phase2` here (`main.rs:7565-7574`) against
+   `path=jd2-console-pump` in the legacy phase 2 (`main.rs:2889-2898`). ⚠ **This deliberately breaks
+   the "reads identically knob-on vs knob-off" property** stated as this arc's behavioural falsifier
+   below, and the break is the point: being unable to tell the two transcripts apart was never
+   evidence that they were equivalent, it was the absence of evidence either way. The token is
+   deliberately longer than 8 bytes — a shorter witness mark can be LLVM-immediate-encoded and never
+   reach `.rodata`, defeating the artifact-grep law this tree runs on — and is placed AFTER
+   `console OWNS the panel` so `scripts/specs/jetson-sync1.spec` and `jetson-jd5.spec`'s
+   `REQUIRE JD4.*console OWNS the panel` still matches. See `orin-desktop.md` §3.13.
+7. **The ORIN-RASTGLASS latch and census, restored to this copy (`e1bb9b49`, 2026-08-28).** On a
+   `rast` image `[orinrast] census` lines now continue past the phase-1 boundary
+   (`main.rs:7657`) and `console-owns=1` appears from the phase-2 boundary (`main.rs:7550`).
+   Knob-on captures taken before that commit scored a healthy boot `RAST-PAINTED-OVERWRITTEN`;
+   see `orin-desktop.md` §3.13 for the defect.
 
 While `SCREEN_APP_ACTIVE` is set the input source leaves the PAL queue alone (GUI-CLICK-2's
 contract: the command's own `pump_and_poll` is the consumer), and it keeps polling the xHCI —
@@ -10878,7 +11011,10 @@ list above and the one place a knob-on capture must differ.
 
 What the metal flight must show: the `[supstate] lift` and `[supstate] roles` lines at phase-2
 entry, then a JD2 interactive session and an `[orinclick]` census transcript that read identically
-to a knob-off boot apart from the deltas enumerated above. What this arc deliberately does not do:
+to a knob-off boot apart from the deltas enumerated above. ⚠ **AMENDED 2026-08-28:** the
+"read identically" half is retired as a falsifier — ORINPATH (delta 6) makes the two transcripts
+differ on purpose at the JD2/JD4 takeover lines, and the correct knob-on reading is now
+`path=jd2-supstate-phase2` present with `path=jd2-console-pump` absent. What this arc deliberately does not do:
 no supervisor, no reap, no restart, no heartbeat records (arc 2, gated on B's clock); no EL
 changes, no core wakes, no `steal_ok`, no migration — a role still dies on the core it lived on;
 the lift's whole point is that its STATE no longer dies with it.
