@@ -2886,8 +2886,8 @@ fn jd2_console_pump(_arg: usize) {
     pal.render();
     match first_key {
         Some(c) => {
-            serial_println!(
-                ":: tegra: JD2 — console OWNS the panel (Screen back buffer live); first key {:#04x} ::",
+            serial_println!( // ORINPATH — `path=` names WHICH phase-2 printed this, and until this arc nothing did. `jd2_supstate_phase2` carries a verbatim copy of these two literals; on a `supstate` build both copies pass `#[cfg]`, so neither a serial capture nor a grep of the artifact could attribute the line to a site. See the twin's comment for the MEASURED shape of that ambiguity at 0ed6fee2. Token deliberately longer than 8 bytes — a shorter mark can be LLVM-immediate-encoded and never appear in `.rodata`, defeating the artifact grep. Placed AFTER "console OWNS the panel" so `scripts/specs/jetson-sync1.spec` / `jetson-jd5.spec`'s `REQUIRE JD4.*console OWNS the panel` still matches.
+                ":: tegra: JD2 — console OWNS the panel (Screen back buffer live); path=jd2-console-pump; first key {:#04x} ::",
                 c
             );
             // The wake-up keystroke is a real keystroke: feed it through, don't swallow it.
@@ -2895,7 +2895,7 @@ fn jd2_console_pump(_arg: usize) {
             pal.render();
         }
         None => serial_println!(
-            ":: tegra: JD4 — console OWNS the panel (Screen back buffer live); screen-on-boot (no key, ~8 s) ::"
+            ":: tegra: JD4 — console OWNS the panel (Screen back buffer live); path=jd2-console-pump; screen-on-boot (no key, ~8 s) ::"
         ),
     }
 
@@ -7562,8 +7562,8 @@ fn jd2_supstate_phase2(
     pal.render();
     match first_key {
         Some(c) => {
-            serial_println!(
-                ":: tegra: JD2 — console OWNS the panel (Screen back buffer live); first key {:#04x} ::",
+            serial_println!( // ORINPATH — `path=` DISCRIMINATES THIS COPY FROM THE LEGACY ONE, and until this arc it did not: `jd2_console_pump`'s two takeover literals and these two were BYTE-IDENTICAL, so neither a serial capture nor a grep of the artifact could say which site a boot had printed — the one question the state-lift's own falsifier turns on. ⚠ MEASURED, not argued (arm-tegra-supstate kernel.elf at 0ed6fee2): `LC_ALL=C grep -a -o` found exactly ONE `.rodata` run for each of the two literals, not two — both copies pass `#[cfg]`, but `jd2_supstate_phase2` never returns, so LLVM drops the legacy phase 2 as unreachable. That is WORSE than the two-run case it looked like, because a single unattributable run reads as confirmation: the one surviving copy was the one this function prints, and nothing in the image said so. With the token in place the same grep answers it — `path=jd2-supstate-phase2` present, `path=jd2-console-pump` absent. The token is deliberately longer than 8 bytes: a witness mark of 8 or fewer can be LLVM-immediate-encoded and never reach `.rodata` at all, which would defeat the artifact-grep law this tree runs on. Placed AFTER "console OWNS the panel" on purpose: `scripts/specs/jetson-sync1.spec` and `jetson-jd5.spec` both `REQUIRE JD4.*console OWNS the panel`, and that regex still matches. ⚠ This deliberately BREAKS the "must read identically knob-on vs knob-off" property this function's doc comment names as its behavioural falsifier — being unable to tell the two transcripts apart was never evidence that they were equivalent, it was the absence of evidence either way.
+                ":: tegra: JD2 — console OWNS the panel (Screen back buffer live); path=jd2-supstate-phase2; first key {:#04x} ::",
                 c
             );
             // The wake-up keystroke is a real keystroke: feed it through, don't swallow it.
@@ -7571,7 +7571,7 @@ fn jd2_supstate_phase2(
             pal.render();
         }
         None => serial_println!(
-            ":: tegra: JD4 — console OWNS the panel (Screen back buffer live); screen-on-boot (no key, ~8 s) ::"
+            ":: tegra: JD4 — console OWNS the panel (Screen back buffer live); path=jd2-supstate-phase2; screen-on-boot (no key, ~8 s) ::"
         ),
     }
 
