@@ -18826,8 +18826,8 @@ fn band_flush(id: u32) {
 ///
 /// **It is a fixture and says so on the wire.** It composes into scratch and never touches the
 /// panel, so it cannot disturb `[wc-d]`'s read-back or any other pass. One-shot per boot, on the
-/// `FALLBACK_FIXTURE` latch's precedent one screen down. x86-only: the 4 MiB scratch is a fifth of
-/// the aarch64 heap, and taking it there to close an x86 question would be the GR27 famine again.
+/// `FALLBACK_FIXTURE` latch's precedent one screen down. **x86-only for a HARDWARE reason, and WMPAR (orin-10) examined this gate against the arch-neutrality law and DECLINED to port it on exactly that ground.** The scratch is
+/// `MAX_STAGE_BYTES` = 4 MiB — one TWELFTH of aarch64's 48 MiB hand-placed heap (`allocator::HEAP_SIZE`, and the earlier "a fifth" here was arithmetic that did not hold) against one sixty-fourth of x86's 256 MiB. GR27 Boot A is the recorded end state of exactly that squeeze on a 48 MiB heap: `try_reserve` declining thousands of times a boot, every present falling to the UNCLIPPED direct path, windows visibly bleeding through their occluders. The geometry is an x86 bench fact besides (2880x1800, the rMBP Retina panel), so porting this would spend a twelfth of the Orin's heap to answer a question about another board — the GR27 famine again, bought with nothing.
 #[cfg(all(feature = "witness", target_arch = "x86_64"))]
 static CB_FIXTURE_DONE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
