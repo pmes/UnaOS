@@ -468,6 +468,22 @@ struct SchedCpu {
     /// on switch-back. Read (best-effort, Acquire) by a waker/spawner on another CPU to decide
     /// whether the newly-ready task outranks what's running and should preempt it.
     current_prio: AtomicU8,
+    /// SCHEDUAF (2026-08-27) — the ID of the task currently running here, or 0 for "no task" (task
+    /// ids start at 1, so 0 is never a live id). The tid twin of [`Self::current_prio`], and the x86
+    /// mirror of aarch64's `CUR_TID`: published by the OWNING core at the dispatch site beside the
+    /// `current_prio` store, cleared beside the `PRIO_IDLE` reset — BEFORE the `Box::from_raw` +
+    /// drop that may follow — so a cross-core reader can name the running task WITHOUT dereferencing
+    /// `current`.
+    ///
+    /// WHY: [`current_task_id`] originally loaded `current` and dereferenced `.id` from an arbitrary
+    /// caller-named CPU. `current` is a raw `*mut Task` whose Box `run()` reclaims on switch-back;
+    /// nothing synchronizes a foreign reader against that free, and the `sched`/`ps` shell caller
+    /// runs preemptible — a use-after-free read with a preemption-widened window, found by the
+    /// 2026-08-27 adversarial landing panel (the aarch64 twin had the identical defect). Racy by
+    /// construction and benign, exactly as `current_prio` is: at worst a reader catches a core
+    /// between dispatch and clear and reports a tid that has just stopped running — a bounded wrong
+    /// number in one operator table, never a read of freed memory.
+    current_tid: AtomicU64,
     /// "Park action" for a task switching back BLOCKED: `PARK_*`. Set by the blocking primitive
     /// before its switch, read-and-cleared by `run()` after. Same-CPU sequential, so `Relaxed`
     /// is sufficient (`switch_context` is the memory barrier between writer and reader).
@@ -533,6 +549,7 @@ impl SchedCpu {
             quantum: AtomicU32::new(0),
             need_resched: AtomicBool::new(false),
             current_prio: AtomicU8::new(PRIO_IDLE),
+            current_tid: AtomicU64::new(0),
             park_kind: AtomicU8::new(PARK_NONE),
             park_waiters: AtomicU64::new(0),
             park_lock: AtomicU64::new(0),
@@ -6142,6 +6159,11 @@ fn run() -> ! {
                 SCHED[cpu].current_prio.store(sched_prio(&task), Ordering::Release);
                 #[cfg(not(feature = "rtpi"))]
                 SCHED[cpu].current_prio.store(task.priority, Ordering::Release);
+                // SCHEDUAF: publish the running task's ID beside its priority, from the core that
+                // owns it, so a cross-core reader never has to touch `current`. See
+                // [`SchedCpu::current_tid`]. (The rtpi mid-run re-publishes above touch only the
+                // priority; the tid never changes while a task runs, so this single site suffices.)
+                SCHED[cpu].current_tid.store(task.id, Ordering::Relaxed);
                 // SPREADSETTLE: this core has work, so its continuous-idle clock stops. Cleared here
                 // — the single dispatch site — rather than in the empty-queue arm's success path, so
                 // a task arriving by ANY route (own pop, wake, spawn, or a steal that fell through
@@ -6271,6 +6293,10 @@ fn run() -> ! {
                 // --- The task switched back to us (yield / preempt / block / exit). IF=0. ---
                 SCHED[cpu].current.store(0, Ordering::Release);
                 SCHED[cpu].current_prio.store(PRIO_IDLE, Ordering::Release);
+                // SCHEDUAF: clear the published ID in the same breath, and BEFORE the
+                // `Box::from_raw` below whose drop may free the Task — so no cross-core reader can
+                // name a task this core is about to free. See [`SchedCpu::current_tid`].
+                SCHED[cpu].current_tid.store(0, Ordering::Relaxed);
                 // Consume the park action exactly once: read it and immediately reset to NONE, so a
                 // stale action can never leak into the next task's switch-back. Only a task that
                 // switched back BLOCKED has a meaningful action.
@@ -6695,15 +6721,34 @@ pub fn current_user_cr3() -> Option<u64> {
 }
 
 /// Id of the task currently running on a CPU, if any (best-effort; for introspection only).
+///
+/// SCHEDUAF (2026-08-27) — THIS FUNCTION WAS A USE-AFTER-FREE READ. It loaded `SCHED[cpu].current`
+/// and dereferenced `.id` — but `cpu` is caller-named, so this ran as a cross-core dereference of a
+/// raw `*mut Task` whose Box the owning core's `run()` reclaims on switch-back, with nothing
+/// synchronizing the foreign reader against that free. The `sched`/`ps` shell caller runs
+/// preemptible, so a timer preempt between the load and the deref stretched the window from two
+/// instructions to milliseconds. Found by the 2026-08-27 adversarial landing panel; the aarch64
+/// twin (`arch::aarch64::sched::current_task_id`) had the identical defect and carries the same
+/// fix, authored by the orin seat.
+///
+/// Now reads [`SchedCpu::current_tid`], the word the owning core publishes at dispatch and clears
+/// before the free — **zero pointer chase, zero `unsafe`**. Unlike [`current_name`] and
+/// [`current_user_cr3`], which stay on the deref because they are keyed to the CALLING cpu (a
+/// same-core read cannot race its own scheduler's IF=0 reclaim), this function's whole purpose is
+/// the foreign read, so it must go through the published word.
+///
+/// STILL RACY, AND THAT IS FINE — bounded, not eliminated: a reader can catch a core between
+/// dispatch and clear and get an id that has just stopped running, a stale tid in one operator
+/// table. `Relaxed` is the right strength for exactly that reason — there is no publication to
+/// order against any more, only a word to sample. 0 means "no task" and is never a live id
+/// (`NEXT_TID` starts at 1), so the `None` contract is unchanged.
 pub fn current_task_id(cpu: usize) -> Option<u64> {
     if cpu >= MAX_CPUS {
         return None;
     }
-    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
-    if raw.is_null() {
-        None
-    } else {
-        Some(unsafe { (*raw).id })
+    match SCHED[cpu].current_tid.load(Ordering::Relaxed) {
+        0 => None,
+        id => Some(id),
     }
 }
 
