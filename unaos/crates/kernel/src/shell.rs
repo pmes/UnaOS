@@ -4016,13 +4016,24 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("simmer: per-core load animator is aarch64 only");
         },
         "top" => {
-            // SCHED-2: per-core scheduler load table (aarch64). Recent busy% (rolling window),
-            // cumulative context switches, and the last task dispatched on each core. On-demand read
-            // of `sched::core_load` — introspection only, no scheduling-path effect.
-            #[cfg(target_arch = "aarch64")]
+            // TOPPORT: per-core scheduler load table, BOTH arches. `load_table` is a signature-matched
+            // twin on each side (SCHEDPAR's shape for `sched`/`ps`), so there is one body here and no
+            // `#[cfg]` at all: the apology this arm used to print on x86 was never about missing data
+            // — `arch::x86_64::sched::core_load` has been returning a richer struct than aarch64's the
+            // whole time — it was a missing FORMATTER.
+            //
+            // The census and the columns stay inside each arch's `load_table`, which is where they
+            // genuinely differ and where each can be documented against its own accounting: x86 walks
+            // `min(acpi::cpu_count(), MAX_CPUS)` and prints two columns aarch64 does not have — a `*`
+            // marking a percent that was INFERRED rather than measured (its `CoreLoad::pegged`, which
+            // its own docs say must be read together with the percent or not at all), and a fold-age
+            // in MILLISECONDS; aarch64 walks the full `percpu::NUM_CPUS` range and its fold age is in
+            // cycles. Neither table converts into the other's unit — each header names its own — and
+            // neither pretends to a symmetry the two schedulers do not have.
+            //
+            // On-demand read of `sched::core_load` on both sides: introspection only, no
+            // scheduling-path effect.
             crate::arch::sched::load_table(|row| console.println(row));
-            #[cfg(not(target_arch = "aarch64"))]
-            console.println("top: aarch64 only");
         },
         "batmon" => {
             // NATIVE-MIDDEN M1b: one honest SMC battery line. A one-shot human command, so it does a

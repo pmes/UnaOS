@@ -169,7 +169,10 @@ last_task_id, last_task }` — is allocation-free and callable from any core;
 strictly introspection (never consulted on a scheduling decision).
 
 **Surfaces.** The `top` shell verb prints the per-core table on demand (recent
-busy %, ctx-switches, last task). On metal, `timer_preempt` drives a periodic,
+busy %, ctx-switches, last task). x86 has a signature-matched `load_table` twin of
+its own since TOPPORT — the shell arm is one body for both arches, and the columns
+that differ (x86's inferred-percent marker, its millisecond fold age) are documented
+with the x86 accounting they come from, under SCHEDLOAD-X86 below. On metal, `timer_preempt` drives a periodic,
 change-only serial heartbeat
 `:: SCHED: load c0=..% c1=..% c2=..% c3=..% (ctx +N/win) ::` (one emitter per
 window via an atomic boundary election; metal-only, since QEMU delivers no timer
@@ -1914,6 +1917,49 @@ section. `ui_status::live_permille`'s x86 arm still returns `None` and falls bac
 the event meter — wiring it to this feed so the panel strip and the serial line read
 one source is the survey's Arc-0 scope item 4, **deferred by the implementing session
 and awaiting the integrator's explicit accept**, not silently dropped.
+
+#### The `top` verb, on both arches (TOPPORT)
+
+Between SCHED-2 and this arc the `top` shell verb printed the aarch64 load table and
+answered `top: aarch64 only` on x86. That apology was never about the DATA — x86's
+`core_load` has returned a *richer* struct than aarch64's since SCHEDLOAD-X86 landed,
+and the always-on `[schedx86] load` line has been rendering it every ~5 s. What was
+missing was a FORMATTER. x86 now has `load_table(mut line: impl FnMut(&str))`, the
+signature-matched twin of aarch64's, so the shell arm is ONE body with no `#[cfg]` at
+all — SCHEDPAR's shape for `sched`/`ps`, applied to the verb above it:
+
+```
+core   busy%   ctx-switches   fold-age(ms)   last-task
+   0     0%          34481377             12   jd2_console_pump (tid 4)
+   1   100%*             20            731   zeolite-resolver (tid 19)
+   2     --                0          never   - (tid 0)
+-- = no live measurement (core not dispatching); * = inferred, not measured
+```
+
+The census is `meter_cpu_count()` — `min(acpi::cpu_count(), MAX_CPUS)`, the same span
+the shell's `sched`/`ps` arm and `emit_load_witness` walk, so the three views of the
+machine agree on how many cores it has; when ACPI reports more than `MAX_CPUS`, the cap
+is printed rather than silently truncating the table (R1/L4). Rows are snapshotted under
+`without_interrupts` and formatted afterwards, so every column of a row describes one
+instant and the allocation stays outside the mask.
+
+**The two tables are not symmetric, and the x86 one must not pretend they are.**
+
+* **`pegged` is surfaced, as a `*` on the percent.** `CoreLoad::pegged` is documented
+  as "read the two together or not at all" — the provenance is part of the number, and
+  the token table above says why an inferred `100%` printed as a measured one is the
+  worst case of the collapse this instrument exists to refuse. The marker is
+  `emit_load_witness`'s rather than a new column, deliberately: `top` and
+  `[schedx86] load` say `100%*` with one meaning, so an operator reading either is
+  reading one vocabulary. aarch64 has no such column because it has no such field.
+* **The freshness column is milliseconds on x86 and would be cycles on aarch64**, and
+  NEITHER side converts — `fold_age_ms` is milliseconds because the ms clock is the
+  globally-coherent one here while `rdtsc` is per-core, and aarch64's `fold_age_cyc` is
+  CNTPCT. Converting either into the other's unit needs a rate this code does not
+  honestly hold. Each header names its own unit instead.
+* **SCHED-8's honesty rule is aarch64's, kept in behaviour**: an untracked core renders
+  `--`, never a percent and never a `0` that could be read as idle. `ACCT_MS_NEVER` in
+  the fold-age column prints `never`, not `u64::MAX` as a duration.
 
 ### Load-balanced placement + work stealing (x86_64, SMPBAL-X86)
 
