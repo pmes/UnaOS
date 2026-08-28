@@ -497,6 +497,28 @@ static CPU_IDLE: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS]
 /// Read by [`preempt_hint`]; never read on the switch path itself.
 static CUR_PRIO: [AtomicU8; NUM_CPUS] = [const { AtomicU8::new(PRIO_NONE) }; NUM_CPUS];
 
+/// SCHEDUAF (2026-08-27) — the ID of the task currently dispatched on each core, or 0 for "no task
+/// running here". The exact twin of [`CUR_PRIO`]: published and cleared at the same two sites, for
+/// the reason its doc states one paragraph above — `SCHED[cpu].current` is a raw `*mut Task` whose
+/// Box the owning core may reclaim at any moment, **so it may never be dereferenced from another
+/// core.** One relaxed word can.
+///
+/// WHY THIS EXISTS, recorded so the mistake is not re-made. [`current_task_id`] originally read the
+/// id by loading `SCHED[cpu].current` and dereferencing `.id` — a cross-core dereference of exactly
+/// the pointer the line above forbids. That is a USE-AFTER-FREE, not staleness: `dispatch_next`'s
+/// epilogue stores 0 to `current` and then `Box::from_raw` + `drop`s the `Task` a few lines later,
+/// and nothing synchronizes a foreign reader against that free. Its sole caller — the `sched`/`ps`
+/// shell verb — runs preemptible with IRQs unmasked, so a timer preempt landing between the load and
+/// the deref stretches the window from two instructions to milliseconds. Found by rmbp 8's
+/// adversarial review panel; the original author's claim that the deref was "the smallest window
+/// this can be given" was false, and this word is the counter-example it missed.
+///
+/// Racy by construction and benign, exactly as `CUR_PRIO` is: a reader may catch a core between
+/// dispatch and clear and print an id that has just stopped running. The consequence is a stale tid
+/// in one operator table — **no pointer chase, no `unsafe`** — a bounded wrong number instead of a
+/// read of freed memory.
+static CUR_TID: [AtomicU64; NUM_CPUS] = [const { AtomicU64::new(0) }; NUM_CPUS];
+
 /// SCHED-PRIO — "no task running here". `u8::MAX` outranks every real level, so an idle core is
 /// never a preemption candidate: the poke/reschedule SGI already wakes it, and there is nothing to
 /// take the CPU away from.
@@ -4488,19 +4510,37 @@ pub fn current_id() -> Option<u64> {
 /// `arch::x86_64::sched::current_task_id`, and this deliberately matches its signature so the shell
 /// arm is one body, not two.
 ///
-/// BEST-EFFORT BY CONSTRUCTION, and that is the honest word: the target core may switch between this
-/// load and its use. A `Relaxed` load is therefore the right strength — an `Acquire` would buy
-/// ordering against a *publication* this reader never dereferences past the id. Deliberately NOT
-/// reading `(*raw).name`: the `&'static str` name stays valid after the Box is reclaimed but the
-/// `Task` body does not, and one field read off a foreign core's `current` is the smallest window
-/// this can be given. For a name, read [`core_load`]'s `last_task`, which is published by the owning
-/// core into `ACCT` precisely so cross-core readers never chase a `Task` pointer.
+/// SCHEDUAF (2026-08-27) — THIS FUNCTION WAS A USE-AFTER-FREE READ AND ITS DOC SAID OTHERWISE.
+/// It loaded `SCHED[cpu].current` and dereferenced `.id`, which is a cross-core dereference of the
+/// pointer [`CUR_PRIO`]'s doc explicitly forbids touching ("it may never be dereferenced from another
+/// core"). `dispatch_next`'s epilogue stores 0 to `current` and then `Box::from_raw` + `drop`s the
+/// `Task` a few lines later; nothing synchronizes a foreign reader against that free, and the sole
+/// caller — the `sched`/`ps` shell verb — runs preemptible with IRQs unmasked, so a timer preempt
+/// between the load and the deref stretched the window from two instructions to milliseconds.
+///
+/// The old doc claimed one field read was "the smallest window this can be given". **That was
+/// false**, and it named its own counter-example in the next sentence: the owning core already
+/// publishes into `ACCT` "precisely so cross-core readers never chase a `Task` pointer". This now
+/// reads [`CUR_TID`], published and cleared by the owning core at the same two sites as `CUR_PRIO`.
+/// **Zero pointer chase, zero `unsafe`.** Found by rmbp 8's adversarial review panel; recorded here
+/// rather than quietly fixed, because a comment asserting a window cannot shrink is what stops the
+/// next reader from shrinking it.
+///
+/// STILL RACY, AND THAT IS FINE — the honest word is now bounded, not smallest. A reader can catch a
+/// core between dispatch and clear and get an id that has just stopped running: a stale tid in one
+/// operator table. `Relaxed` is the right strength for exactly that reason — there is no publication
+/// to order against any more, only a word to sample.
+///
+/// x86's `arch::x86_64::sched::current_task_id` is the same load-then-deref shape and has the same
+/// defect; the twin fix is owed there and is NOT made here (different lane).
 pub fn current_task_id(cpu: usize) -> Option<u64> {
     if cpu >= NUM_CPUS {
         return None;
     }
-    let raw = SCHED[cpu].current.load(Ordering::Relaxed) as *const Task;
-    if raw.is_null() { None } else { Some(unsafe { (*raw).id }) }
+    match CUR_TID[cpu].load(Ordering::Relaxed) {
+        0 => None,
+        id => Some(id),
+    }
 }
 
 /// Number of READY tasks queued on `cpu` across all priority levels (best-effort snapshot; backs the
@@ -5376,6 +5416,9 @@ fn dispatch_next(cpu: usize) -> bool {
         PRIO_EL0_DISPATCH[cpu].fetch_add(1, Ordering::Relaxed);
     }
     CUR_PRIO[cpu].store(task.priority, Ordering::Relaxed);
+    // SCHEDUAF: publish the running task's ID beside its priority, from the core that owns it, so a
+    // cross-core reader never has to touch `SCHED[cpu].current`. See [`CUR_TID`].
+    CUR_TID[cpu].store(task.id, Ordering::Relaxed);
     // SPREAD-7: consume the wake stamp — this dispatch is the woken task first RUNNING, so the span
     // since `make_ready` is exactly the run-queue wait the wake paid (the quantity the quantized arm
     // of `preempt_hint` leaves unbounded below one quantum). Zeroed so a later preempt/requeue cycle
@@ -5421,6 +5464,15 @@ fn dispatch_next(cpu: usize) -> bool {
                 // counter to tell it that the fleet was dropped rather than descheduled.
                 EL0_REAPED.corrupt.fetch_add(1, Ordering::Relaxed);
             }
+            // SCHEDUAF (fold review, rmbp seat): this is the ONE free that happens AFTER the
+            // publication above — `CUR_TID`/`CUR_PRIO` were stored for this task a page up, and
+            // the refusal drops its Box right here without passing the epilogue's clears. Without
+            // these two stores, a core that refuses a corrupt switch-in and then goes idle would
+            // report the FREED task's tid (and its priority to `preempt_hint`) indefinitely.
+            // Still no pointer chase — `SCHED[cpu].current` was never published for it — but
+            // clear-before-free is the invariant, so clear before the free, here too.
+            CUR_TID[cpu].store(0, Ordering::Relaxed);
+            CUR_PRIO[cpu].store(PRIO_NONE, Ordering::Relaxed);
             drop(task);
             return true;
         }
@@ -5495,6 +5547,10 @@ fn dispatch_next(cpu: usize) -> bool {
     // SCHED-PRIO: back on the scheduler stack — nothing is running here, so nothing is preemptible.
     // Published alongside the `current` clear it mirrors, and for the same reason.
     CUR_PRIO[cpu].store(PRIO_NONE, Ordering::Relaxed);
+    // SCHEDUAF: clear the published ID in the same breath, and BEFORE the `current` clear that the
+    // `Box::from_raw` + `drop` below follows — so no cross-core reader can name a task this core is
+    // about to free. See [`CUR_TID`].
+    CUR_TID[cpu].store(0, Ordering::Relaxed);
     SCHED[cpu].current.store(0, Ordering::Release);
     // Consume the park action exactly once: read it and immediately reset to NONE, so a stale action
     // can never leak into the next task's switch-back. Only a task that switched back BLOCKED carries
