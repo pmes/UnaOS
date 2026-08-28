@@ -7891,20 +7891,24 @@ pub fn wmdirect_selftest() {
             // makes the lift a lead motion too, so an ungated skip would swallow exactly the defect
             // this leg exists to catch. `swap=1` says the ring WAS reordered — only then is an
             // unexpected lead count evidence of the router interleave rather than of the fix.
-            // SELFTEST-RACE — and the SECOND way this run cannot judge the kernel, which the
-            // `lead` arm below could not see: `fpop != 0` says a competing consumer POPPED one of
-            // this leg's own events out of the shared ring. The existing arm catches the two-router
-            // interleave (an event routed twice); this one catches an event routed by somebody else
-            // and never seen here at all — measured `fpop=1..2` with `grabbed/swap/ended` all true
-            // and the row resting at the GRAB point. It needs no `swap_ok` gate: `EVQ_POP` is
-            // charged per successful pop by whoever makes it, so a regression inside this leg's own
-            // drain lowers its own count and the ledger's equally and cannot raise `fpop`.
-            if fpop != 0 || (swap_ok && drag_last_lead() != 0) {
+            // SELFTEST-RACE, NARROWED ON REVIEW — `fpop` is EVIDENCE on this leg, never a gate.
+            // This leg's claims are all OUTCOME-shaped (grabbed/swap/ended/rest), and the thief is
+            // not a shredder: `x86_input_service` routes what it takes through the same
+            // `wc_route_event` chain this leg drains through, so a stolen event still steers the
+            // same window table and the gesture still comes to rest at +24. Measured when the first
+            // cut of this arm gated on `fpop != 0`: 3 skips in 5 boots, the leg green and the row
+            // at its exact resting coordinate on every one — a skip keyed on `fpop` retires this
+            // leg on most boots and leaves a fixture that silently tests nothing, which is worse
+            // than the flake it was meant to absorb. The one steal that DOES perturb the outcome —
+            // the lift routed while the edge is still queued — is exactly what
+            // `drag_last_lead() != 0` already detects, so the arm below is the only race gate this
+            // leg needs. `fpop`/`fpush` stay on both lines as the attribution when it does go red.
+            if swap_ok && drag_last_lead() != 0 {
                 serial_println!(
-                    "[wm-act] settle -> SKIP (window raced: fpop={} fpush={} lead={}) cpu={} svc={:?}",
+                    "[wm-act] settle -> SKIP (routing interleaved: lead={} on a gesture with none) fpop={} fpush={} cpu={} svc={:?}",
+                    drag_last_lead(),
                     fpop,
                     fpush,
-                    drag_last_lead(),
                     cpu1,
                     crate::arch::smp::service_cpu()
                 );
@@ -8046,14 +8050,26 @@ pub fn wmdirect_selftest() {
             // Zero means the +12 never steered, which IS the glide and is a real failure.
             // `swap_ok` gates the skip for the reason leg 9 states: without the reorder the lift is
             // a lead motion as well, and skipping on that would hide the producer half's failure.
-            // SELFTEST-RACE — see the `settle` arm: `fpop != 0` is the stolen-event case, and it is
-            // the one the two `lead=false` reds on this branch actually were (`lead=0`, not `>1`).
-            if fpop != 0 || (swap_ok && drag_last_lead() > 1) {
+            // SELFTEST-RACE, NARROWED ON REVIEW — this leg gets the `fpop` gate the `settle` leg
+            // must NOT have, and only on one shape. `lead > 1` is an event routed TWICE — the
+            // two-router interleave, the arm that was already here. `lead == 0 && fpop != 0` is
+            // this leg's steering motion routed by SOMEBODY ELSE before its own drain could steer
+            // with it, which is what both `lead=false` reds of the 34-boot experiment were:
+            // `lead=0` (not `>1`), `fpop=1..2`, `grabbed/swap/ended` all true, the row resting at
+            // the GRAB point. Both conjuncts are load-bearing: `lead == 0` with `fpop == 0` means
+            // nothing was stolen and the +12 truly never steered — the DRAGGLIDE regression this
+            // leg exists to catch, still a red. And `fpop` cannot be forged from inside this leg:
+            // `EVQ_POP` is charged per successful pop by whoever makes it, so a regression in this
+            // leg's own drain lowers its own count and the ledger's equally, leaving the
+            // difference alone. An UNGATED `fpop != 0` skip is the settle-leg mistake pointed the
+            // other way: benign steals (the press pop, post-edge routing) are common here too and
+            // would retire healthy `lead == 1` runs along with the raced ones.
+            if swap_ok && (drag_last_lead() > 1 || (drag_last_lead() == 0 && fpop != 0)) {
                 serial_println!(
-                    "[wm-act] lead -> SKIP (window raced: fpop={} fpush={} lead={}) cpu={} svc={:?}",
+                    "[wm-act] lead -> SKIP (routing interleaved: lead={} fpop={} fpush={}) cpu={} svc={:?}",
+                    drag_last_lead(),
                     fpop,
                     fpush,
-                    drag_last_lead(),
                     cpu1,
                     crate::arch::smp::service_cpu()
                 );
