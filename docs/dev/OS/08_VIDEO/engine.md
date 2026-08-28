@@ -2486,6 +2486,59 @@ green both arches; `UNAOS_WC=1 ./arroyo esp-x86` then
 (reachable, not merely compiled). aarch64 / wc-off fold away: `dock.rs` is not compiled there and
 the reopen arm is `#[cfg(feature = "wc")]` inside the x86-only render service.
 
+#### SHELLWIN RE-MINT (WCSER-REMINT) — the shell window does not stay a corpse across a rehome (2026-08-27)
+
+**The gap (flight 3, rmbp7).** WCSER-REHOME's census accepted the trade *"the rescued desktop's
+shell window is a corpse — it composites, and nothing types into it."* Flight 3 priced it: five
+steals, five rehomes (c1→c2→c3→c4→c5→c6), and the shell was a corpse from the first steal at 95 s to
+power-off at 1144 s — the operator read it as "keyboard gone". The one shell re-mint that flight
+(`[shellwin] reopen win=2 route=dock`, 374 088 ms) proves the mint path works from a rescue
+instance, but that route needs the row CLOSED first (the wedge-abandon teardown had closed it;
+`pin_shell` offers the dock tile only when no live `KERNEL_OWNER_DESKTOP` row exists). A rehome
+leaves the corpse row LIVE — so after a rehome the operator had no route at all.
+
+* **Adoption, not close-and-recreate.** The rescue render instance repoints the corpse's own row at
+  a fresh store (`wm::shell_remint`: owner-fenced, dims-checked, whole-box damage, under one table
+  acquisition) and binds a fresh `Console`/`Screen::direct` tuple to it. Three reasons, all
+  load-bearing: `close` runs the F4 drain barrier, and the corpse's leaked `BlitGuard` is exactly
+  the debt flight 3's `[wedge1] DRAIN STALLED` spun 21 s against; adoption re-targets the SAME
+  singleton row every time, so five rehomes leave one shell window (the idempotence bar);
+  and D-7's corpse-window retirement lane (CORPSEGLASS) can later sweep dead-core windows without a
+  shell carve-out, because the shell row is live-owned again the moment the rescue comes up.
+* **The row-gone arm.** If the corpse row was already closed (wedge abandonment, operator close-box)
+  the rescue mints fresh through the SAME fallible `open_shell_window` path the dock reopen arm uses
+  — run at bring-up instead of waiting for an operator to find the dock tile.
+* **Focus (flight 3 D-7).** A successful re-mint hands the keyboard back —
+  `user_input_set_active(0)` + `focus_changed(KERNEL_OWNER_DESKTOP)`, the dock reopen pair — so
+  focus is never left parked on a corpse that consumes nothing. One focus steal per rehome, priced
+  against 17 minutes of dead shell.
+* **The corpse's old store is deliberately not reclaimed:** it lives in the dead task's locals, a
+  parked core frees nothing, and a superseded revenant retires by sleeping with its frame intact —
+  so in-flight composites that snapshotted the old pointer read valid bytes forever. One
+  surface-sized leak per rehome, same ledger entry as the parked core itself. A revenant resuming
+  mid-pass writes only its own off-glass store; its owner-fenced present passes benignly (same id,
+  same owner) until the epoch check retires it at the next pass top.
+* **QEMU exercisability (wedgeinj).** `desktop_uefi::activate` never runs under QEMU (no Kepler
+  takeover), so the gate would otherwise prove the re-mint by compiling. The wedgeinj injector
+  therefore mints a synthetic `KERNEL_OWNER_DESKTOP` row (static surface, on the render task, only
+  if none exists) immediately before parking the core — the park orphans it exactly as the metal
+  fault orphans the real one, and the rescue's adoption arm is the code under test, unmodified.
+* **Witness.** `:: [wcser] shell re-minted win=<id> — corpse row adopted in place … == witness ::`
+  (adoption), `… fresh row (the corpse was already closed before the rehome) == witness ::`
+  (row-gone arm), `[wcser] shell re-mint DECLINE reason=alloc|row-changed … == tripwire ::` on the
+  named declines; the rescue banner now reads *"the previous instance's shell window is owed a
+  re-mint"*.
+
+**Gate results (2026-08-27).** `./arroyo check` green both arches (including the wedgeinj-without-wc
+mix legs — the fixture is `wc`-gated on top of `wedgeinj`). `UNAOS_WC=1 UNAOS_WEDGEINJ=1
+./arroyo test 60`: the full chain on the wire, in order — fixture mint (`[wedgeinj] synthetic shell
+row win=1 minted on c1`), park, `GATE STOLEN from c1 by c5 after 4305ms`, `REHOMED … c1 to c2`,
+rescue banner, `[wcser] shell re-minted win=1 — corpse row adopted in place == witness ::` — with
+exactly ONE `create win … asid=0xffffff02` in the whole run (the fixture; the rescue created
+nothing, it adopted) and the row live and compositing after (`[wcn] win=1 asid=0xffffff02 live=yes`);
+73 PASS / 0 FAIL. `UNAOS_WC=1 ./arroyo test 150` (`wc` in the features banner): 68 PASS / 0 FAIL /
+0 panic, and no `[wedgeinj]`/re-mint lines — the knob-off build carries none of it.
+
 #### SHELLWIN-PI — the same shell window, on the other chip (2026-08-13, landed 2026-08-17 on the CONSWIN-PI tip)
 
 **The ruling this closes.** *"THIS IS ONE OS. THE X86 PART IS NOT SEPARATE, IT JUST RUNS ON A

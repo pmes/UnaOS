@@ -9209,6 +9209,31 @@ pub fn wedgeinj_park_maybe() {
     if WEDGEINJ_FIRED.swap(true, SeqCst) {
         return;
     }
+    // WCSER-REMINT fixture — give the park a SHELL WINDOW to orphan, so the re-mint has a corpse to
+    // adopt. On metal the row exists (the crispy desktop minted it at bring-up); on the QEMU gate
+    // `desktop_uefi::activate` never runs (no Kepler takeover), so without this the rescue instance
+    // would find no `KERNEL_OWNER_DESKTOP` row and the re-mint arm would be exercised by no gate
+    // anywhere — a recovery proven by compiling, which the standing law rejects. Minted HERE, on the
+    // render task at fire time, because that is exactly where the real row's owner dies: the row this
+    // creates is orphaned by the very park below, the state the re-mint is a function of. Skipped if
+    // a row already exists (metal, or a future QEMU desktop route), so the band's singleton invariant
+    // holds in every configuration. The surface is a static — nothing ever writes it, the compositor
+    // only reads it, and after the re-mint repoints the row it is off-glass entirely. `wc`-gated on
+    // top of the enclosing fn's `wedgeinj`: the re-mint arm lives in the `wc` tuple init, so on a
+    // wedgeinj-without-wc mix leg the fixture would mint a corpse nothing ever adopts.
+    #[cfg(feature = "wc")]
+    if shell_row_geometry().is_none() {
+        static WEDGEINJ_SHELL_SURF: [u32; 64 * 40] = [DESKTOP_BG; 64 * 40];
+        let surf = WEDGEINJ_SHELL_SURF.as_ptr() as usize;
+        let len = core::mem::size_of_val(&WEDGEINJ_SHELL_SURF);
+        let wid = create_at(KERNEL_OWNER_DESKTOP, surf, len, 64, 40, 64 * 4, b"shell", 24, 64);
+        serial_println!(
+            ":: [wedgeinj] synthetic shell row win={} minted on c{} — the corpse-to-be the re-mint \
+             must adopt ::",
+            wid,
+            me
+        );
+    }
     // Take the gate exactly as `composite` does. Spin rather than decline: an injector that gave up
     // because some other core happened to be mid-pass would fire on some boots and not others, and a
     // gate that is only sometimes armed is worse than none. The wait is bounded by one honest pass.
@@ -9321,6 +9346,102 @@ pub fn comp_dead_core_take() -> Option<usize> {
         .compare_exchange(dead, usize::MAX, AcqRel, Relaxed)
         .ok()
         .map(|_| dead)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// WCSER-REMINT — THE SHELL WINDOW DOES NOT STAY A CORPSE ACROSS A REHOME.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+//
+// WCSER-REHOME's census named the trade out loud: *"the rescued desktop's shell window is a corpse
+// — it composites, and nothing types into it."* Flight 3 (rmbp7, 2026-08-27) priced that trade:
+// FIVE steals, five rehomes, and the operator's shell was a corpse from the first steal at 95 s to
+// power-off at 1144 s — read from the chair as "keyboard gone". The one shell re-mint that DID
+// happen that flight (`[shellwin] reopen win=2 route=dock` at 374 088 ms) proves the mint machinery
+// works from a rescue instance — but that route is reachable ONLY after something CLOSES the row
+// (`dock::pin_shell` appends the pinned shell tile iff no live `KERNEL_OWNER_DESKTOP` row exists),
+// and a rehome leaves the corpse row LIVE. So after a rehome the operator has no route at all:
+// the corpse composites, the dock shows no shell tile, and every keystroke lands in a console whose
+// task is parked on a dead core.
+//
+// The fix is ADOPTION, not close-and-recreate, and the difference is load-bearing three ways:
+//
+//  * **The drain barrier.** `close` runs the F4 drain barrier, and the corpse's `BlitGuard` is the
+//    KNOWN RESIDUAL that never drops — flight 3's `[wedge1] DRAIN STALLED` spun 21 s against blit
+//    debt owed by cores dead for ~250 s before ABANDONING. A close from the rescue path could buy
+//    that same unwinnable spin at bring-up. The repoint below takes the table lock for a few loads
+//    and stores and touches no blit accounting.
+//  * **Idempotence by construction.** Five rehomes must not stack five windows. Adoption re-targets
+//    the SAME singleton row every time — the `KERNEL_OWNER_DESKTOP` band has exactly one producer
+//    (`open_shell_window`, plus the wedgeinj fixture below on QEMU), and this path never creates —
+//    so N rehomes leave exactly one shell row, whatever N is.
+//  * **CORPSEGLASS compatibility (D-7).** The corpse-window retirement lane can sweep dead-core
+//    windows by owner/task without a carve-out: after adoption the shell row is live-owned by the
+//    incumbent render instance, so it is simply not in that sweep's set.
+//
+// What is deliberately NOT reclaimed: the corpse's old surface store. It lives in the dead render
+// task's locals, a parked core frees nothing, and a superseded revenant retires by sleeping with its
+// frame intact for exactly this reason — so an in-flight composite that snapshotted the old pointer
+// reads valid bytes forever. One ~surface-sized allocation leaks per rehome, which is the same
+// already-accepted price the parked core itself costs. A revenant that resumes mid-pass writes into
+// its OWN old store (off-glass after the repoint — its pixels can no longer reach the panel) and its
+// owner-fenced present still passes (same id, same owner), costing one benign extra composite of the
+// NEW surface before the epoch check retires it at the next pass top.
+
+/// WCSER-REMINT — identity and geometry of the live shell-window row: `(id, w, h, stride)` of the
+/// unique [`KERNEL_OWNER_DESKTOP`] row, or `None` when no such row exists (never minted, or closed
+/// by the wedge-abandon teardown / the operator's close box — the dock-reopen states).
+///
+/// By OWNER, not by a published id: ids are slot aliases with no generation (the F2 lesson), so a
+/// cached id could name a recycled row, while an owner scan under the lock is current truth — and
+/// the band has one row by construction (see the WCSER-REMINT ledger above).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn shell_row_geometry() -> Option<(WinId, usize, usize, usize)> {
+    let t = table();
+    t.rows
+        .iter()
+        .find(|r| r.used && r.owner_asid == KERNEL_OWNER_DESKTOP)
+        .map(|r| (r.id, r.w, r.h, r.stride))
+}
+
+/// WCSER-REMINT — repoint the shell row's surface to the rescue instance's fresh store, in place.
+///
+/// The row keeps its id, box, z and title; only the surface binding changes, plus a whole-box
+/// damage mark so the fresh content composites. Verified under the table lock against everything
+/// [`shell_row_geometry`] reported — owner (the recycled-id fence, [`present_outcome_owned`]'s
+/// rule), dimensions, and the same pixels-fit-stride / rows-fit-slot bounds [`create`] enforces —
+/// so a row that closed or changed in the gap declines (`false`) instead of being clobbered. The
+/// caller owns `surf` for the row's remaining life, exactly as it would after [`create_at`].
+///
+/// Deliberately does NOT composite, raise, or focus: the caller presents through the owner-fenced
+/// verb and decides focus policy itself (`main.rs` hands the keyboard back, the same pair the dock
+/// reopen arm uses).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn shell_remint(
+    id: WinId,
+    surf: usize,
+    surf_len: usize,
+    w: usize,
+    h: usize,
+    stride: usize,
+) -> bool {
+    let mut t = table();
+    let Some(r) = row_mut(&mut t, id) else {
+        return false;
+    };
+    if r.owner_asid != KERNEL_OWNER_DESKTOP
+        || r.w != w
+        || r.h != h
+        || r.stride != stride
+        || w.saturating_mul(4) > stride
+        || h.saturating_mul(stride) > surf_len
+    {
+        return false;
+    }
+    r.surf = surf;
+    r.surf_len = surf_len;
+    r.damage_all();
+    r.presented = true;
+    true
 }
 
 /// WCSER-STEAL — cores that came back from the dead and correctly declined to release. Zero is the
