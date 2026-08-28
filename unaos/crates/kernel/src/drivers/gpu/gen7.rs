@@ -298,30 +298,29 @@ pub mod g7regs {
     pub const HYP_RENFW_REQ: usize = 0x1300B0;
     pub const HYP_RENFW_ACK: usize = 0x1300B4;
 
-    // ---- [EXT-UNPINNED] — R6's GGTT TLB-invalidation candidate ----------------------
+    // ---- [PINNED] — R6's GGTT TLB-invalidation register -----------------------------
     //
-    // ⚠ CLASS STATED HONESTLY, BECAUSE IT CANNOT BE PINNED FROM THE DOCUMENTS THIS MODULE
-    // OPENS. R5 leaks two 4 KiB pages per run with the note
-    // `pages-leaked-no-GGTT-TLB-invalidation-rung-exists-yet`, and R6's third deliverable is
-    // to close that. The mechanism a GGTT write needs, per the general shape of the problem,
-    // is a *global GTT flush* — a register the driver pokes after editing PTEs so the GT
-    // drops any cached translation.
+    // [PINNED — IVB PRM Vol1 Part3 "Memory Interface and Commands for the Render Engine"
+    // (IHD-OS-V1 Pt 3 – 05 12), §1.2.21 MI_UPDATE_GTT, p.191]. Pinned 2026-08-27 against
+    // Intel's official PDF (cdrdv2-public.intel.com/690900/ivb-ihd-os-vol1-part3.pdf; x.org
+    // mirror docs/intel/IVB/IHD_OS_Vol1_Part3.pdf). The MI_UPDATE_GTT programming note reads:
+    // if the driver updates CPU-used pages, "it needs to write any value to MMIO address
+    // 0x101008" to ensure system-agent TLBs are invalidated before the new pages are used.
+    // That pins the ADDRESS and the WRITE-ANY-VALUE semantic — exactly the use R6/R7 put it
+    // to (write 1, restore the captured value; both are "any value", so the restore is itself
+    // a second flush, not an un-flush). The offset was carried as [EXT-UNPINNED] recollection
+    // from R6 until this pin; the R0.1 PRM search had never looked for a GTT-flush register.
     //
-    // **It is not in the IVB PRM set R0.1 searched.** That search (draft §3.1 P3) covered
-    // FORCEWAKE / GTFIFO / the 0xA18x and 0x1300xx offsets and `power well` / `power gat`;
-    // it did **not** search for a GTT-flush register, and re-searching sixteen volumes is
-    // outside this rung. The offset below is therefore **recollection, unverified** — the
-    // module's `[EXT-UNPINNED]` class exactly — and §0's rule for that class is the rule R3
-    // already flies under: it may be TESTED as a hypothesis on our own silicon, under
-    // capture/restore/re-read, never *implemented* as though it were spec.
-    //
-    // What R6 does with it is correspondingly bounded, and this is the load-bearing part:
+    // What the PRM does NOT give: a register name (the `GFX_FLSH_CNTL` in this const's name
+    // is our label, not Intel's), a field format, or any statement of what a READ returns —
+    // so the three-way `r6 tlb verdict=` (decodes / write-silent / allones) keeps its value,
+    // and the bounded use below stands unchanged:
     // **the page reclaim is NOT gated on this register working.** It is gated on the rung's
     // own verdict (`r6 tlb verdict=`) *or* on the independent structural leg that the GT was
     // never given a chance to cache a translation at all (`never-fetched`: no candidate's
     // RING_CTL enable ever read back set, the head never moved, no sentinel ever landed — so
-    // no engine access was ever issued through either GGTT address). A register whose
-    // decode we cannot prove is not allowed to be the reason a page goes back to the heap.
+    // no engine access was ever issued through either GGTT address). A register whose read
+    // decode is unspecified is not allowed to be the sole reason a page goes back to the heap.
     pub const HYP_GFX_FLSH_CNTL: usize = 0x101008;
 }
 
@@ -4867,26 +4866,46 @@ pub unsafe fn blit(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, w
     }
 
     // ---- The command-stream encodings ------------------------------------------------
-    // ⚠ [EXT-UNPINNED -> pin-before-flight vs IVB PRM Vol1 Part5 "Blitter Engine Command
-    //    Streamer"]. The docs/ tree carries no local extract of the 2D command block for Gen7
-    //    (searched docs/dev this session: only prose references to XY_SRC_COPY_BLT, no field
-    //    encodings), so these four constants are carried as HYPOTHESES this rung tests on our own
-    //    silicon, exactly as R2's forcewake offsets are — a wrong bit here fails the copy, it does
-    //    not touch a display register. Before any hardware flight they MUST be pinned against IVB
-    //    PRM Vol1 Part5 (BLT: XY_SRC_COPY_BLT / BR00 / BR13).
-    //   BR00 (XY_SRC_COPY_BLT DW0): client 2D (0x2<<29) | opcode 0x53<<22 | 32bpp-both bits
-    //     (0x3<<20, dst+src write-RGB / color-depth select per the 2D header) | DWord-length 6
-    //     (== total 8 DWords - 2). = 0x54F00006.
+    // [PINNED — IVB PRM Vol1 Part4 "Blitter Engine" (IHD-OS-V1 Pt 4 – 05 12, May 2012),
+    //    §1.9.14 XY_SRC_COPY_BLT, pp.62–63]. Pinned 2026-08-27 field-by-field against Intel's
+    //    official PDF (cdrdv2-public.intel.com/690901/ivb-ihd-os-vol1-part4.pdf; x.org mirror
+    //    docs/intel/IVB/IHD_OS_Vol1_Part4.pdf). VOLUME-NUMBER CORRECTION: in the IVB PRM set
+    //    the blitter is Vol1 *Part4* — Part5 is the video-codec engine command streamer. The
+    //    earlier "Vol1 Part5" pointer in this comment was the recollection erring (it was the
+    //    SNB set's numbering), not the PRM moving.
+    //   BR00 (XY_SRC_COPY_BLT DW0), every field vs the §1.9.14 layout, pp.62–63:
+    //     [31:29] Client = 02h 2D Processor | [28:22] Opcode = 53h | [21:20] 32bpp Byte Mask
+    //     = 11b (1xb Write Alpha Channel + x1b Write RGB Channel — both) | [19:16], [14:12],
+    //     [10:8] Reserved MBZ = 0 | [15] Src Tiling Enable = 0 (linear) | [11] Dest Tiling
+    //     Enable = 0 (linear) | [7:0] DWord Length = 06h, the table's listed value (length
+    //     bias 2; 8 DWords total). = 0x54F00006, all 32 bits accounted for.
     const XY_SRC_COPY_BLT_DW0: u32 = (0x2 << 29) | (0x53 << 22) | (0x3 << 20) | 6; // 0x54F00006
-    //   BR13: 32bpp color depth (0x3<<24) | ROP=SRCCOPY (0xCC<<16) | dest pitch 64 bytes.
+    //   BR13 (DW1, §1.9.14 p.63): [31] Reserved MBZ | [30] Clipping Enabled = 0 | [29:26]
+    //     Reserved MBZ | [25:24] Color Depth = 11b "32 Bit Color" | [23:16] Raster Operation
+    //     = CCh — §1.2.1.3's 256-entry bit-wise-op table (p.11) lists code CC as "S" (dest :=
+    //     source), and the §1.2.2 worked example (p.28) programs CCh for the operation that
+    //     simply copies source to destination — SRCCOPY confirmed from Intel's own table |
+    //     [15:0] Destination Pitch = 64 BYTES. PITCH-UNIT NOTE: §1.9.14's DW1 row header says
+    //     "Destination Pitch in DWords", but the PRM's own register pages contradict that
+    //     phrase for the linear case and bytes wins on three legs: §1.10.7 BR11 (p.91) — for
+    //     linear (non-tiled) XY blits the 16-bit field is a "byte specification"; §1.10.9
+    //     BR13 (pp.92–93) — the field is the memory-address offset added per scan line; the
+    //     §1.2.2 worked examples (pp.27–28) — 1024 px at 8bpp programs 400h = 1024 BYTES.
+    //     ("in DWords" describes the tiled encodings, per BR11's granularity note.)
     const BR13: u32 = (0x3 << 24) | (0xCC << 16) | 64; // 0x03CC0040
     const DST_PITCH: u32 = 64; // bytes; 16 px * 4 B
-    const SRC_PITCH: u32 = 64;
+    const SRC_PITCH: u32 = 64; // bytes — BR11 = DW6[15:0] (§1.10.7 p.91: linear = bytes); DW6[31:16] MBZ
+    //   Rect-block DWord ordering pinned by the same §1.9.14 table (p.63): DW2 = dst
+    //     Y1[31:16]|X1[15:0] (BR22), DW3 = dst Y2[31:16]|X2[15:0] (BR23, Y2=Bottom X2=Right),
+    //     DW4 = dst base (BR09), DW5 = src Y1|X1 (BR26), DW6 = src pitch (BR11), DW7 = src
+    //     base (BR12) — exactly the add(0..7) order below. The PRM does not state whether
+    //     X2/Y2 are inclusive or exclusive; the dst_match witness discriminates that on metal.
     const RECT_WH: u32 = (16 << 16) | 16; // X2Y2 = (bottom<<16)|right, 16x16
     const RECT_00: u32 = 0; // X1Y1 = top-left (0,0)
     // MI_STORE_DATA_IMM reuses the R5/R6 header const (§1.2.17 p.186, IVB-PINNED).
     //
-    // ⚠ [EXT-UNPINNED -> pin-before-flight vs IVB PRM Vol1 Part3 "MI_FLUSH_DW"]. THE ORDERING
+    // [PINNED — IVB PRM Vol1 Part4 "Blitter Engine" (IHD-OS-V1 Pt 4 – 05 12), §2.2.5
+    //    MI_FLUSH_DW, pp.137–139; "Source: BlitterCS", Length Bias 2]. THE ORDERING
     //    BARRIER (G2). R6's ring held ONE command, so retirement and effect were the same event.
     //    R7's ring holds two, and the second is the witness for the first: without a flush between
     //    XY_SRC_COPY_BLT and MI_STORE_DATA_IMM nothing in the architecture stops the sentinel store
@@ -4894,20 +4913,26 @@ pub unsafe fn blit(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, w
     //    `dst_match` short of 256 read identically to a wrong BR00/BR13 field — destroying the ONE
     //    discrimination this rung exists to make, and pointing the reader's `next=` line at the
     //    wrong suspect. So the flush goes in.
-    //    What IS pinned is the MI *header format* (§1.2.17 p.186, quoted above): Command
-    //    Type[31:29]=0, MI Command Opcode[28:23], DWord Length[9:0] = "Total Length - 2". What is
-    //    NOT pinned is MI_FLUSH_DW's OPCODE and its TOTAL LENGTH — the module holds no extract of
-    //    that section, and this rung does not take them from Linux `i915` or Mesa `i965` (the §0
-    //    clean-room line). They are carried as two NAMED hypotheses on exactly the same footing as
-    //    BR00/BR13, and `gen7.md` lists them under "still unpinned". No post-sync operation is
-    //    requested: DW1..DW3 are zero, because the sentinel store is already the retirement
-    //    witness and a second one would only add a second unpinned field.
-    //    METAL WATCH: a wrong TOTAL length here mis-frames the store that follows it, so R7 would
-    //    come back `r7-head-stuck`/`r7-sentinel-miss` where R6 (same ring, same hold, one command)
-    //    came back `r6-sentinel-hit`. That delta — R6 hits, R7 does not — is the signature of the
-    //    flush encoding, NOT of the 2D block, and is the first thing to suspect on the boot.
-    const MI_FLUSH_DW_OPCODE: u32 = 0x26; // EXT-UNPINNED
-    const MI_FLUSH_DW_TOTAL_DW: u32 = 4; // EXT-UNPINNED — DW0 header, DW1 addr, DW2/3 imm QWord
+    //    Pinned 2026-08-27 vs the §2.2.5 layout: DW0 [31:29] Command Type = 0h MI_COMMAND |
+    //    [28:23] MI Command Opcode = 26h MI_FLUSH_DW | [21] Store Data Index = 0 (only valid
+    //    with post-sync != 0 anyway) | [18] TLB Invalidate = 0 | [15:14] Post-Sync Operation
+    //    = 0h "No write occurs" | [5:0] DWord Length = Total Length − 2, listed default 2h
+    //    ("2 for QWord") — the PRM's own layout is DW0 header, DW1 address, DW2..3 immediate
+    //    QWord = 4 DWords total, so TOTAL_DW = 4 and the header length field = 2 = the
+    //    documented default. (In this command the length field is [5:0] with [7:6] MBZ; the
+    //    generic §1.2.17 header's [9:0] arithmetic lands the same value in the same bits.)
+    //    DW1..DW3 = 0 is valid per the DW1 note — address and immediate are ignored when
+    //    post-sync is "No write". NOTE the volume: MI_FLUSH_DW is documented with the blitter
+    //    CS in Vol1 *Part4* — Vol1 Part3 carries the render engine's MI_FLUSH and states the
+    //    other engines use MI_FLUSH_DW. The earlier "Vol1 Part3" pointer here was off by one
+    //    volume, like the Part5 pointer above.
+    //    METAL WATCH (kept, now testing implementation rather than recollection): a mis-framed
+    //    store would come back `r7-head-stuck`/`r7-sentinel-miss` where R6 (same ring, same
+    //    hold, one command) came back `r6-sentinel-hit`. With the encoding pinned, that delta
+    //    now points at the store's privilege/address or at a pin misread — re-derive from the
+    //    Part4 PDF before touching code.
+    const MI_FLUSH_DW_OPCODE: u32 = 0x26; // PINNED — Vol1 Part4 §2.2.5 p.137, DW0[28:23] = 26h
+    const MI_FLUSH_DW_TOTAL_DW: u32 = 4; // PINNED — §2.2.5 pp.138–139: QWord form = 4 DW, length field 2h (default)
     const MI_FLUSH_DW_DW0: u32 = (0x0 << 29) | (MI_FLUSH_DW_OPCODE << 23) | (MI_FLUSH_DW_TOTAL_DW - 2);
     // Sentinel destination GGTT address: dst base + 0x800, well clear of the 1 KiB copied rect.
     let sentinel_gtt_addr = dst_gtt_addr + 0x800;

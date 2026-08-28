@@ -234,9 +234,13 @@ hypothesis, a different and worse class of act than testing a documented handsha
 R5 leaked two pages per run for a stated reason: with no invalidation, a translation the GT
 cached during the hold could outlive a free and DMA into reused kernel heap. R6 adds the rung.
 
-The flush register is `0x101008` and it is **[EXT-UNPINNED]** — the R0.1 PRM search never
-looked for a GTT-flush register, and re-searching sixteen volumes is outside this rung. It is
-written under full capture / restore / re-read and gets its own three-way verdict:
+The flush register is `0x101008`, and as of 2026-08-27 it is **[PINNED]** — IVB PRM Vol1
+Part3 (IHD-OS-V1 Pt 3 – 05 12) §1.2.21 `MI_UPDATE_GTT`, p.191: after CPU-side GTT updates
+the driver must "write any value to MMIO address 0x101008" so system-agent TLBs are
+invalidated before the pages are used. That pins the address and the write-any-value
+semantic (so the capture/restore write-back is itself a second flush, not an un-flush). The
+PRM gives **no** register name, format, or read decode — `GFX_FLSH_CNTL` is our label — so
+the write stays under full capture / restore / re-read and keeps its own three-way verdict:
 
 | `r6 tlb verdict=` | Meaning |
 | --- | --- |
@@ -249,8 +253,9 @@ written under full capture / restore / re-read and gets its own three-way verdic
 proof: no candidate's `RING_CTL` enable ever read back set, the head never moved, and no
 sentinel ever landed — so no engine access was ever issued through either GGTT address and
 there is no cached translation to invalidate. On the machine R5 flew on, `never-fetched` is
-the leg that fires, and it is the stronger of the two. **An [EXT-UNPINNED] register is never
-the sole reason a page goes back to the heap.**
+the leg that fires, and it is the stronger of the two. **A register whose read decode is
+unspecified — pinned write semantic or not — is never the sole reason a page goes back to
+the heap.**
 
 #### Cycle bounds
 
@@ -299,8 +304,10 @@ Three pages instead of two: `ring`, `src`, `dst`. Three GGTT slots (`0x10000`, `
 
 #### R7 is DARK, and dark means writes-nothing, not does-nothing
 
-The 2D encodings are **[EXT-UNPINNED]** (below), so R7 must not fly until they are pinned. It
-is held dark by the same `write_ok()` gate R4/R5/R6 use — but on any `UNAOS_IVB3D=1` boot
+The 2D encodings were **[EXT-UNPINNED]** when R7 was built; as of 2026-08-27 every one of
+them is **[PINNED]** against the IVB PRM (the table at the end of this section). R7 is still
+held dark by the same `write_ok()` gate R4/R5/R6 use — opening it for a metal flight is the
+seat's call, now made with the pins in hand — and on any `UNAOS_IVB3D=1` boot
 `blit()` still performs its full read-only census before that gate: ~130 MMIO reads (the entry
 battery, the BCS ring-register images, the GGTT window and its neighbours, the six far probes,
 `GTFIFOCTL` twice) plus one PCI config read of the host bridge's `BDSM`. That census is the
@@ -335,8 +342,9 @@ rung exists to make. The ring tail is unchanged at `0x40`: the flush occupies ex
 `MI_NOOP` dwords the previous layout used as padding, so the tail stays QWord-aligned
 (§1.1.11.1 p.75).
 
-Because the flush's own encoding is [EXT-UNPINNED], the rung does not rest the discrimination
-on it alone. The pixel witness is sampled **twice** and both readings go on the wire:
+The flush's encoding was [EXT-UNPINNED] when this barrier was designed and is now pinned
+(Vol1 Part4 §2.2.5, pp.137–139), but the rung still does not rest the discrimination on any
+single encoding. The pixel witness is sampled **twice** and both readings go on the wire:
 
 | Column | When | Reading |
 | --- | --- | --- |
@@ -397,23 +405,52 @@ The last two dominate every exec reading. `r7-blit-verified-head-stuck`,
 were previously collapsed into `r7-blit-partial` and `r7-sentinel-miss`, and the third was
 invisible — a drain timeout freed the pages.
 
-#### What is still unpinned
+#### What was unpinned, and is now pinned
 
-Nothing below may fly on metal until it is pinned against the Intel IVB PRM. The clean-room
-line stands: `i915` and `i965` are not a source.
+All six R7 hypotheses were verified 2026-08-27 against Intel's official IVB PRM PDFs
+(intel.com `cdrdv2-public` / the x.org `docs/intel/IVB` mirror of the same documents). The
+clean-room line stood throughout: `i915` and `i965` were not opened. **Every constant was
+CONFIRMED as coded — no value changed.** Two of the old table's *volume pointers* were wrong
+and are corrected below: in the IVB PRM set the blitter is Vol1 **Part4** (Part5 is the
+video-codec engine CS — the Part5 recollection was SNB's numbering), and `MI_FLUSH_DW` for
+the BCS lives in Part4 with the blitter, not Part3 (Part3's render-engine `MI_FLUSH` section
+itself notes the other engines use `MI_FLUSH_DW`).
 
-| Constant | Value | Needs |
-| --- | --- | --- |
-| `XY_SRC_COPY_BLT_DW0` (BR00) | `0x54F00006` | IVB PRM Vol1 Part5, BLT — opcode `0x53`, the two 32bpp bits, DWord length. The `0x2<<29` client field **is** present and verified. |
-| `BR13` | `0x03CC0040` | same — colour-depth select, `ROP=SRCCOPY`, dest pitch |
-| `SRC_PITCH` / `RECT_WH` / `RECT_00` | `64` / `16x16` / `0` | same — DW ordering of the src/dst rect block |
-| `MI_FLUSH_DW_OPCODE` | `0x26` | IVB PRM Vol1 Part3, MI — the opcode itself |
-| `MI_FLUSH_DW_TOTAL_DW` | `4` | same — total DWord count, which sets the header's length field |
-| `HYP_GFX_FLSH_CNTL` | `0x101008` | inherited [EXT-UNPINNED] from R6; never the sole reason a page is freed |
+| Constant | Value | Verdict | Pin |
+| --- | --- | --- | --- |
+| `XY_SRC_COPY_BLT_DW0` (BR00) | `0x54F00006` | **CONFIRMED**, all 32 bits | Vol1 Part4 §1.9.14 pp.62–63: Client[31:29]=02h, Opcode[28:22]=53h, 32bpp Byte Mask[21:20]=11b (alpha+RGB), [19:16]/[14:12]/[10:8] MBZ, [15]=0 src linear, [11]=0 dst linear, DWord Length[7:0]=06h (bias 2, 8 DW total) |
+| `BR13` | `0x03CC0040` | **CONFIRMED** | Vol1 Part4 §1.9.14 p.63: [31] MBZ, [30] clip=0, [29:26] MBZ, Color Depth[25:24]=11b 32-bit, ROP[23:16]=CCh — code CC = "S" in the §1.2.1.3 table (p.11), the source-copy op (§1.2.2 example, p.28) — pitch[15:0]=64 bytes (see note) |
+| `SRC_PITCH` / `RECT_WH` / `RECT_00` | `64` / `16x16` / `0` | **CONFIRMED** | Vol1 Part4 §1.9.14 p.63: DW2=dstY1\|X1, DW3=dstY2\|X2 (Y2=Bottom[31:16], X2=Right[15:0]), DW4=dst base, DW5=srcY1\|X1, DW6=src pitch[15:0] ([31:16] MBZ), DW7=src base — exactly the ring's `add(0..7)` order |
+| `MI_FLUSH_DW_OPCODE` | `0x26` | **CONFIRMED** | Vol1 Part4 §2.2.5 p.137 ("Source: BlitterCS"): DW0[28:23] default 26h `MI_FLUSH_DW`; Command Type[31:29]=0h |
+| `MI_FLUSH_DW_TOTAL_DW` | `4` | **CONFIRMED** | Vol1 Part4 §2.2.5 pp.138–139: DWord Length[5:0] = Total−2, listed default 2h ("2 for QWord"); layout = DW0 header, DW1 address, DW2..3 imm QWord = 4 DW. DW1..3=0 valid — address/imm ignored when post-sync[15:14]=0h "No write" |
+| `HYP_GFX_FLSH_CNTL` | `0x101008` | **PINNED** (address + write semantic) | Vol1 Part3 §1.2.21 `MI_UPDATE_GTT` p.191: "write any value to MMIO address 0x101008" to invalidate system-agent TLBs after CPU-side GTT updates. No name/format/read-decode in the PRM — the reclaim invariant (§2.6) stands |
 
-The MI **header format** used to build `MI_FLUSH_DW_DW0` is pinned (§1.2.17 p.186: Type[31:29],
-Opcode[28:23], DWord Length = *Total Length − 2*); only the opcode and the total length are
-hypotheses.
+**The pitch-unit note.** §1.9.14's DW1 row header reads "Destination Pitch in DWords" —
+taken alone it would make `64` wrong (16 px × 4 B = 16 DWords). The PRM's own register pages
+contradict that phrase for the linear case, and *bytes* wins on three independent legs:
+§1.10.7 `BR11` (p.91) says the linear XY-blit pitch field is a byte specification; §1.10.9
+`BR13` (pp.92–93) defines the field as the memory-address offset added per scan line; and the
+§1.2.2 worked examples (pp.27–28) program `400h` = 1024 **bytes** for a 1024-px 8bpp surface.
+The "in DWords" phrase belongs to the tiled encodings (BR11's granularity note). `64` stands.
+If metal ever returns `r7-blit-partial` with row-wrapped `dst_match` geometry, re-open this
+note before touching the constant.
+
+**Residuals, named so they are not mistaken for pins left undone:**
+
+- The PRM does not state whether X2/Y2 are inclusive or exclusive; the `dst_match` witness
+  discriminates that on metal. Not an encoding pin — both readings are built from the same
+  pinned DW layout.
+- The on-wire provenance labels (`witnessed_write(..., "EXT-UNPINNED")` for `GFX_FLSH_CNTL`,
+  and the one `next=` STOP string that cites "Vol1-Part5") are **serial-output strings**, out
+  of scope for a doc-and-comment pin pass; relabelling them is the seat's one-line follow-up.
+
+The MI **header format** used to build `MI_FLUSH_DW_DW0` was already pinned (§1.2.17 p.186:
+Type[31:29], Opcode[28:23], DWord Length = *Total Length − 2*); the §2.2.5 layout confirms
+the same arithmetic with the length field at [5:0] and [7:6] MBZ — identical bits for the
+value 2.
+
+**Nothing remains unpinned — R7 is flight-eligible.** The `write_ok()` gate stays closed
+until the seat opens it; that is a launch decision, not a missing pin.
 
 #### The metal falsifier, and the watch lines
 
@@ -426,10 +463,11 @@ Three things silicon must confirm that no host gate can:
    `all_ring_idle=1 engine_quiesced=1` and `reclaim=freed`. An `r7-ring-drain-timeout` on a run
    that otherwise looks clean means `DRAIN_BUDGET_CYC` (≈8 ms) is too short for a 1 KiB blit on
    this part — raise the budget, do **not** relax the gate.
-2. **The flush encoding.** If R7 returns `r7-head-stuck` or `r7-sentinel-miss` where R6 — same
-   hold, same ring, one command — returned `r6-sentinel-hit`, the delta is the
-   [EXT-UNPINNED] `MI_FLUSH_DW` mis-framing the store that follows it, **not** the 2D block.
-   Suspect `MI_FLUSH_DW_TOTAL_DW` first.
+2. **The flush framing.** If R7 returns `r7-head-stuck` or `r7-sentinel-miss` where R6 — same
+   hold, same ring, one command — returned `r6-sentinel-hit`, the delta is the `MI_FLUSH_DW`
+   block mis-framing the store that follows it, **not** the 2D block. The encoding is now
+   pinned (Vol1 Part4 §2.2.5), so that signature would mean the store's privilege/address or
+   a misread of the pin — re-derive from the Part4 PDF before touching code.
 3. **`settled=`.** `settled=0` with `col=drain` at 256 is the barrier doing its job late and is
    informative, not a failure. `settled=0` with `col=drain` *below* `col=exec` would mean the
    engine wrote `dst_page` after we thought it was idle — that is the G1 hazard observed live,
@@ -500,7 +538,9 @@ R2's `INSTPM` did not latch, R5's `RING_CTL` did not latch. R6 is the rung that 
 whether that refusal is the absence of a held wake or a property of the part. Either answer
 moves the GEN7-vs-Kepler decision; only one of them keeps the ladder alive.
 
-R7 is built and **held dark** behind the unpinned 2D encodings. Its teardown safety and its
-witness logic are now correct independently of that pin — the work that had to happen before
-the encodings are pinned, so that pinning them is the only thing left between R7 and a metal
-flight. Its read-only census runs on every armed boot in the meantime.
+R7 is built and **held dark** — but no longer behind unpinned encodings: as of 2026-08-27
+every R7 constant is pinned against the IVB PRM (§2.7), all six confirmed exactly as coded.
+Its teardown safety and its witness logic were already correct independently of that pin, so
+opening the `write_ok()` gate for a metal flight is the only thing left between R7 and its
+falsifier. That opening is the seat's launch decision. Its read-only census runs on every
+armed boot in the meantime.
