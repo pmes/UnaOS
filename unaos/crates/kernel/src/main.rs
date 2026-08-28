@@ -85,7 +85,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Approximately: the TSC's zero is the last processor reset, which on a warm boot need not be
     // the moment power was applied. Read the number as an upper bound on pre-kernel time, not as a
     // measurement of firmware. Heap-free and lock-light, so it is safe this early.
-    unaos_kernel::bootpace::record("entry");
+    unaos_kernel::bootpace::record("entry"); #[cfg(all(target_arch = "aarch64", feature = "orinfurn"))] tegra_stk_anchor(); // ORIN-STKDEPTH — the FIRST of two SP reads whose difference is a boot-core stack DEPTH in bytes. Anchored on the same statement `bootpace` calls "the FIRST instruction of the kernel proper", which is the earliest stable point on the frame chain `kernel_main -> tegra_early_stop -> tegra_desk_furn`; the second read is beside `tegra_desk_furn`'s `[orinfurn] arm` line. See the ORIN-STKDEPTH block at this file's tail for what the number is and — at length — what it is NOT. ⚠ LINE-NEUTRAL append, and `#[cfg]`-erased on every arch and every build without `orinfurn`, so no panic `Location` moves and the knob-off image is untouched.
 
     // 0-WC. VPERF-WC HOIST (bootpace.md §11). Retype the framebuffer's identity-map leaves to
     //     Write-Combining BEFORE the console's first paint instead of after it.
@@ -7885,6 +7885,32 @@ fn tegra_desk_furn() -> bool {
         cfg!(feature = "tegradesk") as u8
     );
 
+    // ORIN-STKDEPTH — THE SECOND SP READ, beside the arm line and unconditional with it. Subtracted
+    // from the anchor latched on `kernel_main`'s first statement, it is the exact number of bytes of
+    // boot-core stack the chain `kernel_main -> tegra_early_stop -> tegra_desk_furn` has CONSUMED at
+    // this instant. ⚠ DEPTH CONSUMED, NOT HEADROOM — the wire says so too, and the ORIN-STKDEPTH block
+    // at this file's tail gives the full reason no headroom number is derivable on the Orin's UEFI
+    // path (firmware stack, never switched; no `__stack_top` on this link; the bounding `MemoryRegion`
+    // slice consumed by `memory::init`). §5.2 asks for BOTH; this clears the half that is takeable and
+    // names the half that is not, which is the opposite of clearing the stop-line by argument.
+    let stk_here: u64;
+    unsafe {
+        core::arch::asm!("mov {}, sp", out(reg) stk_here, options(nomem, nostack, preserves_flags));
+    }
+    let stk_anchor = ORINSTK_ANCHOR_SP.load(Ordering::Relaxed);
+    if stk_anchor != 0 && stk_anchor >= stk_here {
+        serial_println!(
+            "[orinstkdepth] depth-consumed={} bytes anchor-sp={:#x} seam-sp={:#x} at=orinfurn-arm chain=kernel_main->tegra_early_stop->tegra_desk_furn -> DEPTH-CONSUMED (this is stack CONSUMED between the two reads and is NOT headroom: the Orin boot stack is UEFI's and is never switched, this link defines no __stack_top, and the MemoryRegion slice that would bound it is consumed by memory::init — so no remaining-headroom number is derivable in-kernel today and none is claimed here)",
+            stk_anchor - stk_here, stk_anchor, stk_here
+        );
+    } else {
+        serial_println!(
+            "[orinstkdepth] DEPTH-UNAVAILABLE anchor-sp={:#x} seam-sp={:#x} at=orinfurn-arm reason={} (no number is printed rather than a number derived from an unset or non-monotonic anchor — an instrument that cannot fire in the state it exists for must say so, not guess)",
+            stk_anchor, stk_here,
+            if stk_anchor == 0 { "anchor-never-ran" } else { "anchor-below-seam (the two reads are not on one descending frame chain — the stack was switched between them)" }
+        );
+    }
+
     if ORINFURN_ENTERED.swap(true, Ordering::AcqRel) {
         serial_println!("[orinfurn] REFUSE reason=already-armed (the seam is one-shot; a second pass would re-toggle ENABLED, bump menubar's TOGGLES counter and make its DEFAULT_LATCH witness read a history that did not happen)");
         return false;
@@ -7997,4 +8023,72 @@ fn tegra_desk_furn() -> bool {
         menubar::crystal_corner_abs(pw, ph)
     );
     true
+}
+
+// ── ORIN-STKDEPTH ───────────────────────────────────────────────────────────────────────────────
+// ⚠ APPEND-ONLY FILE TAIL, and it is the LAST block in the file. Every item below is `#[cfg]`-erased
+// in any build without `orinfurn` (and on every arch but aarch64), and nothing exists beneath it to
+// be renumbered, so the knob-off jetson image's panic `Location` records are untouched — the
+// orinclick line-neutrality rule. The one call site outside this block is a `#[cfg]`-erased append to
+// an existing line in `kernel_main`.
+//
+// **WHAT THIS PUBLISHES: A BOOT-CORE STACK DEPTH, IN BYTES. NOT HEADROOM.** Say it that way on the
+// wire and in review, because the two are not the same claim and only one of them is available on
+// this board.
+//
+// THE MEASUREMENT. Two reads of SP, taken in the same frame chain, subtracted:
+//   * the ANCHOR, `tegra_stk_anchor()`, on `kernel_main`'s `bootpace::record("entry")` line — the
+//     earliest stable point on the terminus path, before any subsystem exists;
+//   * the SEAM read, beside `tegra_desk_furn`'s unconditional `[orinfurn] arm` line, i.e. inside the
+//     deepest frame the desktop-furniture rung reaches on the boot core's own stack.
+// The chain between them is `kernel_main -> tegra_early_stop -> tegra_desk_furn`, and the difference
+// is exactly the stack those frames plus their spilled locals have CONSUMED at that instant. It needs
+// no linker symbol, no `Task`, no poison fill and no memory map — three instructions and a
+// subtraction. `#[inline(always)]` puts the anchor's read in `kernel_main`'s own frame; were it ever
+// out-of-lined the anchor would sit one leaf frame lower and the printed depth would be SMALLER, so
+// the number is a floor with respect to its anchor and can never overstate.
+//
+// WHY THIS EXISTS AT ALL. `docs/dev/OS/08_VIDEO/orin-desktop.md` §3.12 records that §5.2's stop-line
+// asks for `[u7stk]` evidence that is "structurally unsatisfiable at the terminus". That is exactly
+// right about `sched::stk_probe` — it loads `SCHED[cpu].current` and returns early when it is null
+// (`arch/aarch64/sched.rs`, the guard right after its own `mov {}, sp`), which is every rung on the
+// terminus line, because the boot core has not yet entered `run_capstone_boot_core` and owns no
+// `Task`. It is OVERSTATED about the machine: `stk_probe` needs a `Task` only for the BOUNDS it
+// prints (`low`/`top`/`hw`/`headroom`), not for the SP read, and this file already contains that same
+// three-instruction read twice — `arch/aarch64/mmu_tegra.rs`'s pre-switch PC/SP GiB check and
+// `stk_probe`'s own first statement. A DEPTH does not need bounds. So the depth number is takeable
+// here and is taken; the stop-line's other half is not, and this block does not pretend otherwise.
+//
+// ⚠ WHY THERE IS NO HEADROOM NUMBER, and why inventing one would be worse than the silence it
+// replaces. Headroom is `depth` measured against the stack's far end, and on the Orin's UEFI path
+// nothing in this kernel knows where that end is:
+//   * the boot stack is the FIRMWARE'S and is never switched. `crates/bootloader` calls the kernel
+//     entry as an ordinary function on the UEFI stack; `arch/aarch64/mmu_tegra.rs` states in its own
+//     EL1-twin argument that "the boot stack is never switched on this path"; and the JM6 drop in
+//     `arch/aarch64/boot_tegra.rs` does `mov x0, sp; msr sp_el1, x0` precisely so SP is CONTINUOUS
+//     across EL2 -> EL1 (which is also what makes the two reads above subtractable at all).
+//   * there is no `__stack_top` on this link. The symbol DOES exist in this tree — `pi-baremetal.ld`
+//     defines it and the `baremetal` `_start` in this file sets SP from it — but that is the Pi's
+//     bare-metal image. The Orin builds through `aarch64-unaos.json`, which names no linker script,
+//     so no such symbol is present in the jetson image and no `extern` could resolve to one.
+//   * the one runtime description of the region is gone by the time anything could ask. The UEFI
+//     `MemoryRegion` slice that would say how far the firmware stack extends is consumed with
+//     `boot_info` by `arch::memory::init` on `tegra_early_stop`'s heap line, long before the terminus.
+// So: a depth is a measurement, a headroom would be a guess wearing a measurement's clothes. The gap
+// is stated on the wire as well as here, so a capture cannot be read as clearing §5.2 by itself.
+#[cfg(all(target_arch = "aarch64", feature = "orinfurn"))]
+static ORINSTK_ANCHOR_SP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// ORIN-STKDEPTH — latch SP at the caller's frame. `#[inline(always)]` is load-bearing, not cosmetic:
+/// the read must land in `kernel_main`'s frame, not in a callee's. Zero is the "never ran" value and
+/// the seam treats it as such, so a build that somehow reached the seam without the anchor prints
+/// `DEPTH-UNAVAILABLE` rather than a number derived from a null.
+#[cfg(all(target_arch = "aarch64", feature = "orinfurn"))]
+#[inline(always)]
+fn tegra_stk_anchor() {
+    let sp: u64;
+    unsafe {
+        core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    ORINSTK_ANCHOR_SP.store(sp, core::sync::atomic::Ordering::Relaxed);
 }
