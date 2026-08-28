@@ -85,6 +85,64 @@ line show the machine was pumping USB throughout, i.e. it was making progress, j
 it. The FAT chain-walk cost is a real defect and is **not** fixed here; this change is payload
 composition only.
 
+### 3.1 CHAINGROW — the chain-walk constant, measured and cut (orin 10)
+
+The §3 defect above was re-derived rather than inherited. It **survives**, with one correction and
+one number the original account did not have.
+
+**The correction: the quadratic term is the CALLER's, not `write_grow`'s.** `write_grow` walks the
+chain exactly ONCE per call, to find the tail. What is quadratic is that its streaming callers —
+`selfup_tegra.rs` `stage_one` (`CHUNK`) and `shell.rs` `cp` (`CP_WINDOW`), both 32 KiB — call
+`write_grow` once per window, so an `n`-window file pays `Σ` chain length ≈ `n²/2` hops. **Both
+callers live outside `fs/fat.rs`**, so hoisting the walk out of the loop was declined as out of lane
+and remains open.
+
+**The number.** Each hop was one *uncached* 512-byte FAT read: `chain_clusters` walked via
+`fat_entry`, while its sibling `collect_chain` — same file, same job — has cached the FAT sector
+since MULTIBLK. There is no block cache under either, so every hop was a real device transaction.
+On the Orin's measured geometry (`spc=32` → 16 KiB clusters; `capture/orin-r23s1`,
+`orin2-boot5c-gui.log`) with `C = 32 KiB`:
+
+| member | windows | walk reads before | after | other block ops | total before → after |
+|---|---|---|---|---|---|
+| `kernel.elf` 2 635 576 B (shipped pair) | 81 | 6 480 | 96 | ~1 701 | 8 181 → 1 797 (**4.6x**) |
+| `UPD4.TMP` 4 423 680 B (what actually ran) | 135 | 18 090 | 210 | ~2 835 | 20 925 → 3 045 (**6.9x**) |
+| `SRC.TGZ` 11 523 546 B (the member that died) | 352 | 123 552 | 1 146 | ~7 392 | 130 944 → 8 538 (**15.3x**) |
+
+**The chain walk was 94% of every block transaction `SRC.TGZ` issued**, and 86% of the 135 windows
+that completed. That share is medium-independent and needs no B/s — which matters, because §3 is
+right that the capture carries no per-line timestamps.
+
+`UPD4.TMP` is the sharpest witness in the capture set: the harvested file is **4 423 680 B =
+135 × 32 768 exactly** — 135 whole `write_grow` windows, then a POR reset mid-write. Independent
+physical confirmation that the windowed loop is what the watchdog interrupted.
+
+**The fix** (`fat.rs` `chain_clusters`): give that walk the one-sector FAT cache `collect_chain`
+already had. Visit order, every guard, the guard order, the returned `Vec` and every `FatError` are
+unchanged; a hop landing in the sector already in hand simply does not re-read it. A FAT32 sector
+holds 128 entries, so a formatter-laid contiguous chain costs ~1 read instead of ~128. **No format,
+layout or written-bytes change** — `chain_clusters` issues no writes at all. The orphaned private
+`fat_entry` accessor was removed with its last caller.
+
+**SDHC-4c / FRGUARD obligation, discharged.** `chain_clusters` is read-only, and the cluster-claim
+sequence in `write_grow` step 2 depends on the returned `Vec` through exactly two expressions —
+`chain.len()` (claim count) and `chain.last()` (link target). A differential replay of the full
+windowed loop against both walkers emits an **identical `(alloc_cluster, set_fat_entry)` event
+sequence** at every size tested, so `note_fat_mutation` and `permit_write`/`permit_span` observe the
+same calls in the same order. `sdhc4c_reserve` walks via `collect_chain` and is untouched. The
+closed writable set is neither widened nor weakened.
+
+**Not fixed, deliberately:** the `n²/2` term itself. The constant is ~128x smaller, which is why the
+table shows 15x and not 352x. A single-pass copy primitive, or hoisting the walk into the caller,
+is the structural fix and needs the caller's lane.
+
+**Reconciling the 15.5 MB PRTSCR success** (rmbp flight 5 — `15 555 053` bytes written through this
+same FAT write path, completed): `video/prtscr.rs` calls `write_grow` **once**, with
+`first_cluster = 0`, for the whole buffer, so `chain_clusters` returns immediately and the walk
+costs **zero** reads (950 cluster claims in a single call). Streamed in 32 KiB windows it would have
+paid ~112 000 walk reads. The two observations were never in tension: they are the same function on
+opposite sides of one `if`.
+
 ## 4. UPK1 container
 
 Little-endian throughout; all sizes `u32` (a FAT file size is a `u32` — nothing bigger can land on
