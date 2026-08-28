@@ -2580,6 +2580,17 @@ keyboard from a working app into a sink that drains nothing.
   focus, and asserts consumed + keyboard kept + the previous owner's ring still draining + the
   release dropped; the real sink state is saved/restored around the probe.
 
+**Gate results (2026-08-27).** `./arroyo check` green both arches (all cfg legs). `UNAOS_WC=1
+./arroyo test 150` (`wc` in the features banner): 68 PASS / 0 FAIL / 0 panic;
+`[clickroute] route … deflect=true -> PASS` and exactly one
+`[clickroute] furniture deflect owner=0xffffff7f keep=0x1 sink=dead` line (the fixture's budget
+burn); CLICK-BAND, the wm-act family and the wc-d verify legs unchanged. `UNAOS_WC=1
+UNAOS_WEDGEINJ=1 ./arroyo test 60` (the rehome-focus seam this arc touches): 74 PASS / 0 FAIL /
+0 panic, the full REMINT chain on the wire — fixture mint, park, `GATE STOLEN`, `REHOMED`,
+`[wcser] shell re-minted win=1 — corpse row adopted in place … keyboard handed to the shell` —
+with exactly ONE `create win … asid=0xffffff02` in the run (the fixture's; the adoption created
+nothing), so REMINT's idempotence bar and its focus hand-back are intact under the deflection.
+
 #### SHELLWIN-PI — the same shell window, on the other chip (2026-08-13, landed 2026-08-17 on the CONSWIN-PI tip)
 
 **The ruling this closes.** *"THIS IS ONE OS. THE X86 PART IS NOT SEPARATE, IT JUST RUNS ON A
