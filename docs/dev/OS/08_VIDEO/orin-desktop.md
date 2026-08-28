@@ -154,6 +154,64 @@ needs a real cfg-expression parser. Most name both arches and land in PAIRED
 anyway. Triage the report — do not trust the direction label on a `not(all(..))`
 line.
 
+#### §1.2.1 AMENDED SAME DAY — v4 was itself a floor. Two more defects, and the numbers moved again
+
+The v4 figures above were superseded within hours by triage work that used them. Recorded rather
+than silently replaced, because the *sequence* is the lesson: each fix made the next defect
+visible, and every intermediate number was published as if it were a total.
+
+**Defect 4 — CROSS-ITEM PAIRING (a false negative).** v4 correctly stopped pairing against
+comments, but still paired on PROXIMITY ALONE: any counterpart-arch gate inside the ±25 window,
+even one guarding a completely different item. Canonical case, found by hand during a
+`fbcon.rs` triage and confirmed with a live control: `video/fbcon.rs:2043` is a real, effective,
+one-sided bare x86 gate on `PANIC_MIRROR.store(true, …)` inside an **ungated** `panic_screen()`.
+It scored PAIRED because the two-armed `CONSOLE_WIN` gate at `:2050` — a *different statement* —
+sits seven lines away. Two more archetypes: `main.rs:1235` (a WiFi firmware load) was paired
+against `main.rs:1239` (a USB FAT mount), and `drivers/mod.rs:13` (the rMBP battery monitor `smc`)
+against `drivers/mod.rs:31` (the Pi microSD `emmc2`) — hiding seven rows in that file alone.
+Different capabilities, not per-arch dispatch.
+
+**Defect 5 — SUB-LINE PHANTOM.** v4 skipped a line only when it *started* with a comment marker,
+so cfg syntax quoted in a **trailing** comment on a live code line was still parsed as a gate.
+`video/fbcon.rs:703` is a real instance. Comment text is now blanked at character granularity,
+with string and raw-string literals respected. This had to land first: under a stricter pairing
+rule it would have surfaced as a bogus new finding.
+
+v5 also stops counting `cfg!()` const-bool expressions as gates. A `cfg!()` type-checks in BOTH
+polarities wherever the code compiles, so it can never make code absent on an arch — this project
+already retracted a coverage finding for exactly that reason. They are now reported in a separate
+NOT-GATES category.
+
+| ruler | PAIRED | UNPAIRED x86-only | UNPAIRED aarch64-only |
+| --- | :-: | :-: | :-: |
+| v3 (blind) | 722 | 344 | 245 |
+| v4 | 708 | 459 | 285 |
+| **v5** | **586** | **516** (bare 138 · 378) | **342** (bare 105 · 237) |
+
+Video scope under v5: PAIRED 328 · x86-only 229 · aarch64-only 67, plus 9 `cfg!()` expressions
+tree-wide excluded from the census.
+
+**Against v3, x86-only drift was under-reported by 172 gates — exactly half again as many as it
+reported.** Three of v5's 342 aarch64-only rows are this session's own `[orinstkdepth]` instrument
+(`main.rs:88`, `:8079`, `:8086`), attributed by diffing the report across the fold; the census
+tool and the code it measures moved in the same session, and saying so is cheaper than letting a
+later reader discover an unexplained +3.
+
+**v5's rule, stated so it can be argued with.** A gate is PAIRED only if its own attribute carries
+both arms; or an exact `#[cfg(X)]`/`#[cfg(not(X))]` complement exists on the same-named item or
+adjacent block; or a counterpart in the window names the other arch, **does not name this one**,
+and gates an item with the same key. It deliberately OVER-reports adjacent gates on different
+items, and that bias is the source of most of the new rows. The bias is intentional: an
+over-report is triaged in seconds, an under-report is invisible forever — which is precisely how
+prose-pairing survived for months.
+
+**Still unseen by v5, stated so nobody rediscovers it as a finding:** renamed cross-arch twins,
+same-name pairs more than 25 lines apart, reordered complement predicates, and the `not(all(..))`
+direction-label residual. A control probe now guards the tool itself —
+`~/unaos-bench/scratch/orin10/ctrl-expect.sh`, 12 hand-built cases and 21 assertions including the
+uppercase-feature (`bcmaS1`) parser-rot mode. It passes 21/21 on v5 and **fails 12 against v4**,
+so it discriminates rather than rubber-stamps. Re-run it after any edit to the tool.
+
 ⚠ **Numbers published elsewhere with the v3 ruler are not comparable to these.**
 `WCG-TRIAGE.md` §1 and §7 quote tree totals taken with it (x86-only 471 → 421 for
 the `wcg.rs` port). That *delta* is ruler-consistent — both sides were measured
@@ -2032,6 +2090,43 @@ the cascade would run. That is not a licence to step over it; it is a note that
 clearing §5.2 needs an instrument this ladder does not yet have (a boot-stack
 high-water probe, or the cascade moved off the boot stack), and that no rung should
 claim to have cleared it by argument.
+
+##### ⚠ AMENDED 2026-08-28 — the DEPTH half is now taken; only HEADROOM is still blocked
+
+The paragraph above is correct about `stk_probe` and **overstated about the machine**, and
+the distinction decides what §5.2 can still legitimately ask for.
+
+`stk_probe`'s early return is real and quoted correctly — `arch/aarch64/sched.rs:96-99`
+returns when `SCHED[cpu].current` is null, and everything it reports (`base`, `len`) is
+derived from `task.stack`, which does not exist on the boot core. It is not adaptable to
+this seam.
+
+But the SP itself is readable in three instructions with no scheduler, no `Task` and no
+linker symbol, and the exact pattern **already exists in this tree twice** —
+`arch/aarch64/mmu_tegra.rs:749-752` and `arch/aarch64/sched.rs:91-94`. Two reads on the
+same frame chain subtract to an exact **depth consumed**. `TERMINUS` D4 takes that
+measurement at the `[orinfurn] arm` line and publishes `[orinstkdepth] depth-consumed=`.
+
+**What is still genuinely unavailable is HEADROOM, and the reason is not the scheduler.**
+The Orin's boot stack is the one UEFI handed the loader and is never switched:
+`crates/bootloader/src/main.rs:1045` calls `kernel_entry` through a transmuted pointer with
+no SP manipulation, `arch/aarch64/mmu_tegra.rs:789` states "the boot stack is never switched
+on this path", and `arch/aarch64/boot_tegra.rs:186-189` sets `SP_EL1 = SP` so the stack is
+continuous across the EL2→EL1 drop. There is no linker script for the `aarch64-unaos.json`
+target, so no `__stack_top` is linked into the jetson image. (The symbol *does* appear in
+Rust source, at `main.rs:51-52` inside the `global_asm!` — but that block is
+`all(aarch64, baremetal)`, i.e. the Pi, and no tegra leg carries `baremetal`.) The
+`MemoryRegion` slice that *would* bound it survives `exit_boot_services` and is passed
+through, then discarded: `memory::init(boot_info)` at `main.rs:2311` consumes the
+`&'static mut BootInfo` and `arch/aarch64/memory.rs` stashes nothing.
+
+So the instrument prints `depth-consumed=` and, for the other half, `DEPTH-UNAVAILABLE`
+rather than inventing a number. **A depth that is honest about not being headroom is worth
+more than a headroom figure derived from an assumed bound**, and §5.2's clearing condition
+should be restated in those terms rather than left asking for something no rung can supply.
+Closing the headroom half needs one of: a linker script for the aarch64 kernel target, or
+the `MemoryRegion` slice retained past `memory::init`, or the cascade moved off the boot
+stack. All three are real arcs; none is a comment change.
 
 #### What landed instead
 
