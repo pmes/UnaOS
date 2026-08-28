@@ -3238,6 +3238,16 @@ fn render_rehome_service() {
         DEAD_CORES_X86.fetch_or(1u64 << dead, Relaxed);
     }
 
+    // DEBTCLEAR (flight 3, Q1) — settle the corpse's blit ledger BEFORE the role check: every dead
+    // core owes its debt back, whether or not it carried a singleton role. A parked core never runs
+    // its `BlitGuard` drop, so without this every later F4 drain that waits for global blit-exit
+    // parity spins its full bound against a ledger nothing can ever pay down — flight 3's [wedge1]
+    // wedge (1 GiB of spins against blits owed by cores dead for ~250 s). The settle forgives the
+    // count, banks per-core credits so a migrated or revenant holder's late drop cannot double-book,
+    // and latches a taint that buys one full present against the zombie-store hazard. See the
+    // DEBTCLEAR ledger in `video/wm.rs`.
+    let _ = unaos_kernel::video::wm::blit_debt_forgive(dead);
+
     // Did this core carry the one role we re-home? A `no` is still worth a line: the census is the
     // deliverable, and a silent return would make "nothing was owed" and "we forgot" identical.
     if RENDER_ROLE_CPU_X86.load(Relaxed) != dead {

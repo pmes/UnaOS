@@ -16992,6 +16992,63 @@ revenants"* from *"the reader is dead"*.
 > this section has already established survives the wedge; `deadman.rs` was held by a concurrent
 > executor during this arc and the move is owed.
 
+### DEBTCLEAR — a dead core's blit debt is settled at rehome, not inherited by every later drain
+
+Flight 3 (rmbp7, 2026-08-27) closed the question of what the `[wedge1]` wedge actually waits on:
+`BLITWHO active=2 net=[0,1,1,0,0,0,0,0]` at the 363 s abandonment — the drain on c3 was waiting for
+blit-exits owed by **c1 and c2, dead since the 95 s / 100 s steals**. A parked core never runs its
+`BlitGuard` drop, so its `BLIT_ACTIVE` registration stands for the rest of the boot, and every F4
+drain that waits for `BLIT_ACTIVE == 0` spins its full bound (1 GiB of spins, measured) unwinnably
+by construction. Each steal plants the debt that wedges the next holder — the degradation
+staircase's amplifying feedback (postmortem §5 Q1).
+
+**The settle** (`wm::blit_debt_forgive`, called from `render_rehome_service` for every death the
+mailbox delivers, *before* the singleton-role check): the dead core's `BLIT_NET_CORE` slot is
+drained unit-by-unit into `BLIT_ACTIVE` decrements, and a **forgiveness credit** is banked per unit.
+The credit is the exactness mechanism against the migration caveat: a guard is charged by
+ENTER-core, so a holder that entered on the corpse may be live elsewhere — its later drop consumes a
+credit instead of decrementing a second time, and the same absorption re-balances the books if a
+revenant's stuck store ever retires and its guard drops seconds later. Credit is published before
+each net claim and retracted (guarded) on a failed claim, so every interleaving with concurrent
+drops balances; live cores' debt is untouched and every drain still waits on the full
+`BLIT_ACTIVE`, live guards included.
+
+**The zombie-store latch.** Forgiving the count must not certify quiescence the device cannot
+promise: the corpse's in-flight blit may be the stuck BAR1 store itself, and its writes can land
+whenever the store buffer drains. So a nonzero settle latches `BLIT_DEBT_TAINT`, and the next gate
+holder (`blit_debt_heal_maybe`, ahead of its `composite_once`) re-damages every live row and queues
+a whole-panel fill through the WC-K2 deferred-erase route — one full present, healing every zombie
+pixel that landed before it. A store landing later is bounded by the standing revenant discipline
+(one pass, clipped to its own box, then `comp_gate_release` declines and the role epoch retires it)
+and costs the same one-frame stale rectangle the DRAINSTALL abandon arm already prices. The WC-B
+revisit note on that arm applies to this path identically. The one shape this seam cannot reach,
+named: a core that dies *spinning in a drain* holds `DRAIN_PENDING`, not `COMP_GATE`, is never
+convicted by the steal, and remains DRAINRESCUE's business.
+
+**Witnesses** (own lines, one hit per steal — the `[wedge1]` tripwire report line is deliberately
+untouched):
+
+```
+:: [wcser] blit debt forgiven core=1 owed=1 active_now=0 taint=armed == debt-clear ::
+:: [wcser] blit debt heal: full present queued — every row re-damaged, whole-panel fill owed == debt-clear ::
+```
+
+**The gate** — the WEDGEINJ fixture now mints the debt the park strands (`BlitGuard::enter` +
+`mem::forget`, the software twin of the stuck store) and runs a **DEBT LEG** 15 s after the park: it
+reads the parked core's net (nonzero ⇒ `-> FAIL` without draining — a close against unsettled debt
+would spin the abandon bound past the end of the capture, a silent false green refused), then
+creates and closes a probe window, which runs the exact F4 drain flight 3 could only abandon.
+Measured on `UNAOS_WC=1 UNAOS_WEDGEINJ=1 ./arroyo test 60`:
+
+```
+:: [wedgeinj] blit debt minted on c1 active=1 — the ledger the steal must settle ::
+:: [wedgeinj] DEBT LEG core=1 net=0 close_ms=2 abandoned_delta=0 scskip_delta=0 active_now=0
+   — the drain that flight 3 could only abandon now completes -> PASS ::
+```
+
+`close_ms=2` against the pre-fix reading — the same drain spinning `spins=1073741824` for 21 s and
+abandoning — is the whole claim on the wire.
+
 ### WCDVALVE-LOOP — the valve measures a quantity that only exists while it is open
 
 Boot 16 flapped the WC-D valve on a ~5.2 s period for the whole pre-wedge session:
