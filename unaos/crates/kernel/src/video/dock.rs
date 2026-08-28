@@ -198,8 +198,10 @@ use super::{ceramic, strip, theme, wm};
 // ⚠ **THERE ARE THREE STATES HERE, NOT TWO — and writing only two is what broke the build (SMALLS3).**
 // The seam was written as an exhaustive `x86_64` / `aarch64` pair on the unstated premise that every
 // build of one of those arches HAS a `syscall` module. On aarch64 that is false: `arch/aarch64/mod.rs`
-// gates `pub mod syscall;` behind `any(feature = "baremetal", feature = "tegra_el0")` — the input rings
-// belong to the EL0 layer, and a build without it has no ring table to designate into. So this module's
+// gates `pub mod syscall;` behind the EL0 capability — spelled `any(feature = "baremetal",
+// feature = "tegra_el0")` when this broke, `aarch64_el0` (which both terms imply) since the
+// EL0-NAMING series — the input rings belong to the EL0 layer, and a build without it has no ring
+// table to designate into. So this module's
 // own gate (`desktop_firmware`) armed with NEITHER of those two features named the module path in a
 // build where the module does not exist, and both functions failed E0433. No coverage leg reached the
 // combination (`arm-pi` always carries `baremetal`, `arm-tegra-desk` always carries `tegra_el0`), which
@@ -218,9 +220,11 @@ use super::{ceramic, strip, theme, wm};
 // build is byte-identical.
 
 // The conjunct is spelled out twice below rather than aliased — `cfg` attributes cannot be given a
-// name — so keep the two copies identical to `arch/aarch64/mod.rs`'s gate on `pub mod syscall;`. A
-// narrower copy silently stops designating focus on a board that has a ring table; a wider one is the
-// E0433 above, back again.
+// name — and the two copies must stay identical to EACH OTHER. `arch/aarch64/mod.rs` now gates
+// `pub mod syscall;` behind `aarch64_el0`, which BOTH longhand terms imply, so the spelling here can
+// only under-claim the module's presence, never name a module that is absent. A narrower copy
+// silently stops designating focus on a board that has a ring table; a wider one is the E0433
+// above, back again.
 
 /// Designate `asid` as the keyboard's destination (`0` = the shell).
 #[inline]
@@ -229,7 +233,7 @@ fn focus_set(asid: u64) {
     crate::arch::x86_64::syscall::user_input_set_active(asid);
     #[cfg(all(
         target_arch = "aarch64",
-        any(feature = "baremetal", feature = "tegra_el0")
+        any(feature = "baremetal", feature = "tegra_el0") // EL0-NAMING: POSITIVE LEG PAIRED WITH A NEGATED TWIN — KEPT LONGHAND ON PURPOSE. The negated three-state twin below must stay longhand (Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from that predicate for anyone who enabled `aarch64_el0` ALONE), and this pair's correctness rests on the two spellings staying byte-identical — renaming this leg alone would split them. So it follows its twin, not the rename.
     ))]
     crate::arch::aarch64::syscall::user_input_set_active(asid);
     // No ring table in this build: nothing to designate into, and the argument still has to be consumed.
@@ -237,7 +241,7 @@ fn focus_set(asid: u64) {
         target_arch = "x86_64",
         all(
             target_arch = "aarch64",
-            any(feature = "baremetal", feature = "tegra_el0")
+            any(feature = "baremetal", feature = "tegra_el0") // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
         )
     )))]
     let _ = asid;
@@ -254,7 +258,7 @@ fn focus_get() -> u64 {
     }
     #[cfg(all(
         target_arch = "aarch64",
-        any(feature = "baremetal", feature = "tegra_el0")
+        any(feature = "baremetal", feature = "tegra_el0") // EL0-NAMING: POSITIVE LEG PAIRED WITH A NEGATED TWIN — KEPT LONGHAND ON PURPOSE. The negated three-state twin below must stay longhand (Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from that predicate for anyone who enabled `aarch64_el0` ALONE), and this pair's correctness rests on the two spellings staying byte-identical — renaming this leg alone would split them. So it follows its twin, not the rename.
     ))]
     {
         crate::arch::aarch64::syscall::user_input_active()
@@ -266,7 +270,7 @@ fn focus_get() -> u64 {
         target_arch = "x86_64",
         all(
             target_arch = "aarch64",
-            any(feature = "baremetal", feature = "tegra_el0")
+            any(feature = "baremetal", feature = "tegra_el0") // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
         )
     )))]
     {
